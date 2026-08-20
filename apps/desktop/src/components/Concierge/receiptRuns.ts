@@ -37,8 +37,8 @@
 //     failure as an OK reply carrying counts, so keying on `ok` alone would swallow the failures
 //     into a number that claims flat delivery;
 //   • and neither does a success carrying DETAIL (`hasDetail`) — a spawn that came up but could not
-//     be BRIEFED reports `ok: true` and says so in a second sentence, so folding it to "Spawned 5
-//     agents." deletes the only place the reader learns an agent is sitting there doing nothing.
+//     be BRIEFED reports `ok: true` and says so in a second sentence, so folding it to "The concierge spawned
+//     5 agents." deletes the only place the reader learns an agent is sitting there doing nothing.
 //
 // Those last two are the reason `ok` alone is not the rule: an actionable receipt is not always a
 // refusal, and two of the three guards live on the success side.
@@ -48,13 +48,39 @@
 // rejected for a bad argument and the founder saw six alarming cards for an already-fixed problem —
 // exactly the population that must stay individually visible.
 //
+// ══ A TURN'S SUCCESSES ARE ONE LINE, ACROSS KINDS ═══════════════════════════════════════════════
+// Successes used to fold only with their OWN bucket — `spawned` with `spawned`, `closed` with
+// `closed` — so a turn that spawned an agent, filed a bead and wrote to four agents was still three
+// rows. The founder's ruling is that a turn's successes are ONE expandable line, so a consecutive
+// run of successes of DIFFERING buckets now folds under `MIXED_SUCCESS_KEY`.
+//
+// THE SENTENCE CLAIMS NO KIND. It states how many actions there were and then names the parts —
+// "The concierge took 6 actions — spawned 1 agent, filed 1 bead, relayed 4 messages." — each part
+// counted from the members that produced it, so the stated numbers partition `members.length` by
+// construction. A run whose parts cannot be phrased is not folded: `MIXED_PARTS` is the eligibility
+// test AND the phrasing, one lookup, so no bucket can enter a run the sentence has no words for.
+//
+// NOTHING ABOVE IS WEAKENED BY IT. Every never-fold guard is inherited rather than restated, a
+// refusal has no part phrase and so ENDS a run rather than joining it, and the two kinds whose row
+// is their only witness (`merged`, `retired`) have no bucket at all. `filed` is the one seam: it
+// joins a MIXED run as a named part but still never folds with its own twins, because a count
+// cannot say three bead ids. See `foldKeyOf`, `mixedBucketOf` and `MIXED_PARTS`.
+//
+// ══ AND THE VOICE IS THE APP'S, NOT THE CONCIERGE'S (bead `sparkle-4kgpb3`) ══════════════════════
+// These lines read in the concierge chat column as if the CONCIERGE were speaking to the founder.
+// They are not: they are the APP reporting to the CONCIERGE about a call the concierge made. So
+// every sentence here is THIRD PERSON about the concierge — a success is "The concierge <verb>…",
+// a refusal is "Refused the concierge's <noun>…" — and none of them addresses the reader as "you".
+// A tool's verbatim reason may say "you", because that text is addressed to the concierge and
+// repeating it word for word is the rule; our half of the sentence never does.
+//
 // ══ AND THE COUNT ITSELF MUST BE HONEST ═════════════════════════════════════════════════════════
 // `members.length` IS the count — the folded line is built FROM the members it stands for, never
 // from a number carried alongside them, so the two cannot drift (the convention `buildDigest`'s
 // `memberIds.length === count` establishes for the unmerged group). And because two sends can go to
 // ONE agent, the sentence counts DISTINCT SUBJECTS for the agent noun and says so separately when
-// the number of sends exceeds it: "Sent to 12 agents' terminals" is a different claim from "Sent 16
-// messages to 12 agents' terminals", and only one of them is true at a time.
+// the number of sends exceeds it: "The concierge sent to 12 agents' terminals" is a different claim
+// from "The concierge sent 16 messages to 12 agents' terminals", and only one of them is true at a time.
 import {
   ANONYMOUS_SUBJECT,
   line,
@@ -62,6 +88,7 @@ import {
   ref,
   type Line,
 } from "./conciergeLine";
+import { isUsableMark } from "./noticeRecipient";
 import type {
   ConciergeMessage,
   ConciergeReceiptMark,
@@ -131,10 +158,32 @@ export const MIN_RUN = 2;
  *   5. Is the disclosure mandatory? Yes — a run always renders its toggle; there is no path on which
  *      members exist with no way to reach them.
  */
-export function foldKeyOf(
+function receiptBucketOf(
   mark: ConciergeReceiptMark | undefined,
 ): string | null {
   if (!mark) return null;
+  // ══ A MARK TOO DAMAGED TO ATTRIBUTE IS TOO DAMAGED TO FOLD (roborev 65819, Medium) ════════════
+  //
+  // ONE PREDICATE, SHARED, because the alternative is two modules disagreeing about the same mark —
+  // which is not hypothetical, it is the bug this line fixes. `noticeRecipient` requires `ok` to be
+  // a BOOLEAN before it will attribute a line to the concierge; the refusal arm below tests
+  // `mark.ok !== true`, which `undefined` satisfies. So `{ kind: "sent", gist: "…" }` — the shape
+  // produced by exactly the localStorage truncation that validation was written for — was FOLDABLE
+  // but NOT ATTRIBUTABLE.
+  //
+  // The rendering that came out of that disagreement is incoherent in a way no single component
+  // could catch: one such message stands alone and paints founder-addressed at full weight, while
+  // TWO consecutive ones fold into a `ReceiptRunRow` that stamps `data-recipient="concierge"` and
+  // the grey unconditionally — and expanding it paints ungreyed members inside a grey container.
+  // `ReceiptRunRow`'s own comment justifies that hard-coding with "a run is built only from messages
+  // carrying an actionReceipt, and carrying one is exactly what noticeRecipient calls
+  // concierge-addressed". This line is what makes that sentence true again.
+  //
+  // Gating HERE rather than loosening `isUsableMark` is deliberate, and it is the fail-safe
+  // direction for both modules at once: an unusable mark now yields `null`, so it never folds, and
+  // an unfolded row is attributed to the FOUNDER — the direction that costs an un-attributed row
+  // rather than one wrongly captioned as not being for him.
+  if (!isUsableMark(mark)) return null;
   // ══ THE REFUSAL ARM, FIRST — mirroring actionReceiptLine, which checks `ok` before every success
   // wording for the same reason. Everything below this line describes something that HAPPENED.
   //
@@ -175,13 +224,13 @@ export function foldKeyOf(
   // this whole function is to surface the row.
   // AN ALREADY-PLURAL RECEIPT DOES NOT FOLD, AND THIS TEST SITS **ABOVE** THE REFUSAL ARM (roborev
   // 63747, Medium). A broadcast line already reads "Left a message for N agents" — or, refused,
-  // "Not sent to those agents" — so folding several of them would need a COUNT OF COUNTS, and no
+  // "Refused the concierge's message to those agents" — so folding several of them would need a COUNT OF COUNTS, and no
   // arm below has an honest way to say that.
   //
   // It used to sit under the refusal arm, which was harmless only while refusals needed a gist (no
   // `INTERNAL_GATES` entry matches a broadcast's refusal). The verbatim door made it reachable: two
-  // consecutive `inbox_broadcast` refusals sharing one reason would have folded to "Not sent, 2
-  // times" over what was really two fan-outs of N recipients each — a number that is wrong in the
+  // consecutive `inbox_broadcast` refusals sharing one reason would have folded to "Refused the
+  // concierge's message, 2 times" over what was really two fan-outs of N recipients each — a number that is wrong in the
   // one direction this module is forbidden to be wrong in, understating how many agents missed the
   // message. Ordering is the whole fix, so it is stated rather than left to the reader to notice.
   if (mark.fanout === true) return null;
@@ -198,7 +247,7 @@ export function foldKeyOf(
   // `ok: true` and carries the shortfall as a second sentence ("its terminal didn't start … its
   // opening brief hasn't gone in yet") — an agent sitting there doing nothing, which is the whole
   // of the founder's "every agent I spawn starts dead until I go type into it". Replacing that
-  // sentence with "Spawned 5 agents." deletes it, which is the same failure as folding a refusal
+  // sentence with "The concierge spawned 5 agents." deletes it, which is the same failure as folding a refusal
   // wearing a success's clothes. See ConciergeReceiptMark.hasDetail.
   if (mark.hasDetail === true) return null;
 
@@ -217,7 +266,7 @@ export function foldKeyOf(
       //
       // ══ AND SO IS WHOSE WORDS WENT (bead `sparkle-p9s5q`) ═══════════════════════════════════
       // Same rule one level in: a relay of the founder's words and a brief the concierge composed
-      // say DIFFERENT SENTENCES ("Sent to X's terminal" vs "Concierge wrote to X"), so one count
+      // say DIFFERENT SENTENCES ("Sent to X's terminal" vs "The concierge wrote to X"), so one count
       // over a mixture is true of neither — and the sentence it would land on is the stronger claim,
       // that his private words reached the fleet. Exactly the false claim this change removes, back
       // through the fold.
@@ -241,14 +290,14 @@ export function foldKeyOf(
     // `filed`, `merged` AND `retired` NEVER FOLD **AS SUCCESSES**, and it is not an oversight to
     // revisit. Each of their lines carries a DISTINCT identifier the reader came for — a bead pill,
     // a PR number — so an honest folded sentence would have to enumerate exactly what folding was
-    // meant to save. And a merge is high-consequence: "Merged 3 PRs" hides which three, which is the
+    // meant to save. And a merge is high-consequence: "The concierge merged 3 PRs" hides which three, which is the
     // same class of omission as hiding a refusal.
     //
     // `retired` is the strongest case of the three, and it is listed EXPLICITLY rather than left to
     // the `default` arm so that it reads as a decision. Its distinguishing detail is not an id but
     // the REASON, and unlike every other kind here the founder was not present for the act: nobody
     // watched it happen and nobody will remember asking for it, so the line is the only account of
-    // why an agent is gone. "Retired 6 agents." is precisely the sentence that would make an
+    // why an agent is gone. "The concierge retired 6 agents." is precisely the sentence that would make an
     // unattended verb unauditable — it hides the six judgements the reason field exists to expose.
     //
     // SCOPED TO SUCCESSES, and that scoping is load-bearing rather than pedantic (roborev 63364).
@@ -260,16 +309,128 @@ export function foldKeyOf(
     //
     // THE IDENTIFIER CAVEAT SURVIVES THE CARVE-OUT, and is the known cost: `ConciergeReceiptMark`
     // carries no `prNumber`/`beadId`, so three refusals against three different PRs collapse into
-    // one "Didn't merge, 3 times" whose expansion shows three identical sentences. That is tolerable
+    // one "Refused the concierge's merge, 3 times" whose expansion shows three identical sentences. That is tolerable
     // only because the individual refusal line carries no PR number either — the fold loses nothing
     // the rows had. Carrying the identifier into the mark is the fix if that ever stops being true.
+    // `filed` GETS A BUCKET AND STILL NEVER FOLDS WITH ITS OWN TWINS. The two facts are separated
+    // by {@link foldKeyOf}, which nulls this bucket out, and joined again by {@link mixedBucketOf},
+    // which admits it to a MIXED run. See both.
     case "filed":
+      return FILED_BUCKET;
     case "merged":
     case "retired":
       return null;
     default:
       return null;
   }
+}
+
+/** The bucket `filed` reports — never a fold key of its own, only a MIXED-run part. */
+const FILED_BUCKET = "filed";
+
+/**
+ * The FOLD KEY for one receipt — the key it folds with its OWN TWINS under, or `null` when this
+ * receipt must stand alone in a same-kind run.
+ *
+ * UNCHANGED CONTRACT (`actionReceiptLine.test.ts` reads this too). `filed` still returns `null`
+ * here: three filings in a row are three bead pills, and one count cannot say three ids — the
+ * reasoning in {@link receiptBucketOf}'s `merged`/`retired` arm applies to it in full. What changed
+ * is that `filed` may now be a PART of a mixed run, where the sentence names it beside the other
+ * kinds and never stands in for the id; see {@link mixedBucketOf}.
+ */
+export function foldKeyOf(
+  mark: ConciergeReceiptMark | undefined,
+): string | null {
+  const bucket = receiptBucketOf(mark);
+  return bucket === FILED_BUCKET ? null : bucket;
+}
+
+/** The key a MIXED SUCCESS RUN folds under. Not produced by {@link receiptBucketOf} — it is the
+ *  label {@link foldReceiptRuns} stamps on a run whose members' buckets DIFFER. */
+export const MIXED_SUCCESS_KEY = "mixed:success";
+
+/** `1 agent` / `3 agents` — the mixed sentence's parts count MEMBERS, so each agrees with itself. */
+function count(n: number, noun: string): string {
+  return `${n} ${noun}${n === 1 ? "" : "s"}`;
+}
+
+/**
+ * THE PART PHRASE each success bucket contributes to a MIXED run's sentence — and, by being absent,
+ * the way a bucket declines to join one at all.
+ *
+ * ══ WHY THIS TABLE **IS** THE ELIGIBILITY RULE ══════════════════════════════════════════════════
+ * The founder's ruling is that a turn's successes are ONE expandable line: a turn that spawned an
+ * agent, filed a bead and wrote to four agents produced three rows, and he wanted one. The hazard is
+ * the same one the whole module is built around — a folded line is a claim about several actions at
+ * once — so the mixed sentence never says a KIND happened. It says how many actions there were and
+ * then names the parts, each part counted from the members that produced it.
+ *
+ * A bucket with no entry here CANNOT ENTER A MIXED RUN. That is deliberate and it is the cheap way
+ * to hold "if you cannot phrase a combination honestly, do not fold it": the eligibility test and
+ * the phrasing are ONE lookup, so no bucket can be admitted to a run the sentence has no words for.
+ * Three populations are missing on purpose:
+ *
+ *   • EVERY REFUSAL. Their keys (`refusal:…`, `verbatim:…`) are not in this table and never will be
+ *     — a refusal absorbed into a success roll-up is the one thing this module is forbidden to do,
+ *     and the count-shaped sentence above cannot repeat a reason. A refusal standing between two
+ *     successes breaks the run and keeps its own row, exactly as it already did.
+ *   • `sent:inbox` AND `sent:held`. Their folded sentences state a DELAY — "each delivers at that
+ *     agent's next turn", "each goes in when that terminal is ready" — and that delay is the whole
+ *     difference between those channels and the terminal (RULE 2 of `actionReceiptLine`). A part
+ *     phrase counting them has nowhere to put it, so an honest un-folded row wins.
+ *   • `merged` AND `retired`, which have no bucket at all (see {@link receiptBucketOf}). A merge
+ *     hides WHICH PRs and a retirement hides the judgement its reason is the only witness to;
+ *     neither becomes safer for being one part of a longer sentence.
+ */
+const MIXED_PARTS: Readonly<Record<string, (n: number) => string>> = {
+  // The founder's OWN words, relayed — "relayed", not "sent", so the part cannot be read as the
+  // concierge having composed them. The relay/composition split (`sparkle-p9s5q`) survives the
+  // mixed run as two SEPARATE parts rather than as two rows.
+  "sent:terminal": (n) => `relayed ${count(n, "message")}`,
+  // ── EVERY NOUN HERE COUNTS WHAT IT NAMES (roborev 65825, High) ────────────────────────────────
+  //
+  // These parts count MEMBERS, so a noun naming a distinct RESOURCE states a number that is false
+  // the moment a bucket repeats a subject — and the residue chips beneath the sentence come from
+  // `namedMembers`, so the reader counting chips gets a number the sentence contradicts. That is
+  // the roborev 59145 defect, which the same-kind arms were already fixed for, reappearing on the
+  // new mixed arm.
+  //
+  // This one was `wrote to ${count(n, "terminal")}`, and the repeat it gets wrong is the ordinary
+  // case rather than an exotic one: two consecutive concierge briefs to the SAME pinned agent are
+  // "an ordinary shape" by this file's own account, and they rendered "wrote to 2 terminals" over
+  // one terminal. Phrased message-shaped it counts the writes, which IS the member count, so the
+  // part, the total and the chips can no longer disagree.
+  //
+  // The other entries are safe BY CONSTRUCTION, and the reasons are worth stating so the next edit
+  // does not have to re-derive them: `relayed`/`wrote`/`answered`/`set`/`filed` already name the
+  // ACTION (n writes, n prompts answered, n goals set, n beads filed — each 1:1 with a member);
+  // `spawned` mints a NEW agent per call, so n spawns is n agents; and closing an already-closed
+  // agent refuses, so it arrives as `ok: false` and never reaches a success run at all.
+  "sent:terminal:concierge": (n) => `wrote ${count(n, "message")}`,
+  "sent:picker": (n) => `answered ${count(n, "prompt")}`,
+  spawned: (n) => `spawned ${count(n, "agent")}`,
+  closed: (n) => `closed ${count(n, "agent")}`,
+  goal: (n) => `set ${count(n, "goal")}`,
+  [FILED_BUCKET]: (n) => `filed ${count(n, "bead")}`,
+};
+
+/**
+ * The bucket this receipt contributes to a MIXED SUCCESS RUN, or `null` when it may not join one.
+ *
+ * EVERY NEVER-FOLD GUARD IS INHERITED, NOT RESTATED. This reads {@link receiptBucketOf}, so
+ * `fanout`, `failed > 0`, `hasDetail`, `ok !== true` and an unknown kind each keep a receipt out of
+ * a mixed run for the same reason and by the same line of code that keeps it out of a same-kind one.
+ * Restating them here is how the two would drift, and the direction they would drift in is the one
+ * this module may not be wrong in.
+ */
+export function mixedBucketOf(
+  mark: ConciergeReceiptMark | undefined,
+): string | null {
+  const bucket = receiptBucketOf(mark);
+  if (bucket === null) return null;
+  // THE TABLE IS THE ALLOWLIST — see MIXED_PARTS. `Object.hasOwn` rather than a truthiness test on
+  // the lookup, so a key like `constructor` cannot borrow a phrase off the prototype.
+  return Object.hasOwn(MIXED_PARTS, bucket) ? bucket : null;
 }
 
 /** A receipt-marked sparkle message — the members of a run are always these. */
@@ -300,6 +461,13 @@ function keyOf(m: ConciergeMessage): string | null {
   return foldKeyOf(m.actionReceipt);
 }
 
+/** This message may join a MIXED success run, and under which part — `null` for everything else.
+ *  The message-level twin of {@link mixedBucketOf}, exactly as {@link keyOf} is of {@link foldKeyOf}. */
+function mixedKeyOf(m: ConciergeMessage): string | null {
+  if (m.kind !== "sparkle") return null;
+  return mixedBucketOf(m.actionReceipt);
+}
+
 /**
  * Fold every maximal run of CONSECUTIVE same-key receipts into one row.
  *
@@ -313,10 +481,112 @@ export function foldReceiptRuns(
   messages: readonly ConciergeMessage[],
 ): ThreadRow[] {
   const rows: ThreadRow[] = [];
+  /** A run that did not earn a folded row is emitted as the plain rows it always was — NOT dropped,
+   *  and not wrapped in a group of one. */
+  const unfolded = (run: readonly ReceiptMessage[]) => {
+    for (const m of run) rows.push({ type: "message", message: m });
+  };
   let i = 0;
   while (i < messages.length) {
     const head = messages[i];
     if (head === undefined) break;
+    // ══ THE MIXED-SUCCESS PATH, FIRST ═══════════════════════════════════════════════════════════
+    //
+    // A consecutive stretch of MIXED-ELIGIBLE successes is gathered whatever their buckets, then
+    // asked what it turned out to be. `mixedKeyOf` is the gate, so nothing a refusal, a fan-out, a
+    // partial, a detail-carrying success or an unknown kind could reach is in here — each of those
+    // returns null and ENDS the stretch, which is what keeps a refusal standing in its own row
+    // between the successes on either side of it rather than being counted into them.
+    const mixed = mixedKeyOf(head);
+    if (mixed !== null) {
+      let j = i + 1;
+      const buckets = new Set<string>([mixed]);
+      while (j < messages.length) {
+        const next = messages[j];
+        if (next === undefined) break;
+        const b = mixedKeyOf(next);
+        if (b === null) break;
+        buckets.add(b);
+        j += 1;
+      }
+      const run = messages.slice(i, j) as ReceiptMessage[];
+      const first = run[0];
+      if (run.length >= MIN_RUN && first !== undefined) {
+        // ══ A MIXED RUN MAY NOT ABSORB A SECOND FILING (roborev 65825, Medium) ══════════════════
+        //
+        // `filed` is barred from folding with its own twins — "a count cannot say three bead ids",
+        // and `foldKeyOf` nulls its bucket out to enforce it. A NEIGHBOURING SUCCESS defeated that:
+        // `[spawn, filed, filed, filed]` has `buckets.size > 1`, so it folded to "The concierge took
+        // 4 actions — spawned 1 agent, filed 3 beads" — one count standing for three bead ids, with
+        // all three bead pills moved behind the chevron, because `filed` marks name nobody and
+        // `namedMembers` drops them from the residue. Three filings ALONE still rendered three rows;
+        // prefixing one spawn collapsed them. The guard was bypassable by an unrelated line.
+        //
+        // CUT THE RUN AT THE FILINGS — DO NOT ABANDON IT (roborev 65839, Medium).
+        //
+        // The first attempt at this guard unfolded the WHOLE stretch, and that over-correction was
+        // strictly worse than the behaviour it replaced: `[16 briefs to one pinned agent, filed,
+        // filed]` rendered EIGHTEEN rows carrying sixteen identical `@Alpha` chips — the exact
+        // identical-chip wall roborev 59145 removed — where the pre-roll-up code would have folded
+        // the sixteen sends into one same-kind row and left the two filings alone. Since the
+        // concierge files beads in batches, that silently undid the founder's "a turn's successes
+        // are ONE line" ruling for every turn that files twice.
+        //
+        // The rule only ever needed to protect the BEAD IDS. So each filing is emitted as its own
+        // row — keeping its pill, which is the whole point — and the segments between them re-enter
+        // this same function and fold exactly as they would have on their own. Nothing else about
+        // the stretch is punished for the filings' company.
+        //
+        // TERMINATES: each segment is built by EXCLUDING every `filed` member, so its filing count
+        // is zero and this arm cannot fire again on the recursive call. Segments are also strictly
+        // shorter than `run`, since at least the two filings are removed.
+        const filings = run.filter((m) => mixedKeyOf(m) === FILED_BUCKET).length;
+        if (filings > 1) {
+          let segment: ReceiptMessage[] = [];
+          const flushSegment = () => {
+            // ONE MEMBER IS NOT A RUN — `foldReceiptRuns` already declines to wrap a lone receipt in
+            // a group of one, so this needs no special case of its own.
+            if (segment.length > 0) rows.push(...foldReceiptRuns(segment));
+            segment = [];
+          };
+          for (const m of run) {
+            if (mixedKeyOf(m) === FILED_BUCKET) {
+              flushSegment();
+              rows.push({ type: "message", message: m });
+              continue;
+            }
+            segment.push(m);
+          }
+          flushSegment();
+          i = j;
+          continue;
+        }
+        if (buckets.size > 1) {
+          // DIFFERING KINDS — one line for the turn, with its parts named. The key is a LABEL, not
+          // a bucket: `receiptRunLine` re-derives every part from the members themselves.
+          rows.push({
+            type: "receipt-run",
+            id: first.id,
+            key: MIXED_SUCCESS_KEY,
+            members: run,
+          });
+          i = j;
+          continue;
+        }
+        // ONE BUCKET — this is an ordinary same-kind run, so it folds only if that kind folds with
+        // its own twins. `filed` does not (see foldKeyOf), and this is where that stays true.
+        const same = keyOf(first);
+        if (same !== null) {
+          rows.push({ type: "receipt-run", id: first.id, key: same, members: run });
+          i = j;
+          continue;
+        }
+      }
+      unfolded(run);
+      i = j;
+      continue;
+    }
+    // ══ THE SAME-KEY PATH — refusals, and the success buckets a mixed run may not admit ══════════
     const key = keyOf(head);
     if (key === null) {
       rows.push({ type: "message", message: head });
@@ -334,9 +604,7 @@ export function foldReceiptRuns(
     if (run.length >= MIN_RUN && first !== undefined) {
       rows.push({ type: "receipt-run", id: first.id, key, members: run });
     } else {
-      // A run below the threshold is emitted as the plain rows it always was — NOT dropped, and not
-      // wrapped in a group of one.
-      for (const m of run) rows.push({ type: "message", message: m });
+      unfolded(run);
     }
     i = j;
   }
@@ -389,7 +657,7 @@ function subjectSlot(mark: ConciergeReceiptMark) {
  *
  * ONE definition, because the COUNT and the PILLS must not be able to disagree (roborev 59145). The
  * sentence said "1 agent" from `distinctSubjects` while the pill residue iterated MEMBERS, so a run
- * of sixteen sends to one pinned agent read "Sent 16 messages to 1 agent's terminal." and then drew
+ * of sixteen sends to one pinned agent read "The concierge sent 16 messages to 1 agent's terminal." and then drew
  * sixteen identical `@Alpha` chips — a reader counting chips gets a number the sentence contradicts,
  * and the identical-chip wall is the exact thing this fold exists to remove. Two derivations of "who"
  * is how that happened; there is now one.
@@ -510,8 +778,8 @@ export function receiptRunLine(run: ReceiptRun): Line {
   // `agents` CAN BE 1 IN EVERY REPEATS BRANCH, which is why these are helpers and not `String(a)`
   // spliced in front of a hard-coded "agents". A run is at least {@link MIN_RUN} long, but two
   // consecutive sends to the same pinned agent — or two goals set on one — is an ordinary shape, and
-  // it makes `repeats` true with ONE distinct subject. Splicing produced "Sent 2 messages to 1
-  // agents' terminals.", in the module whose entire claim is that the folded sentence is true.
+  // it makes `repeats` true with ONE distinct subject. Splicing produced "The concierge sent 2 messages
+  // to 1 agents' terminals.", in the module whose entire claim is that the folded sentence is true.
   const many = agents !== 1;
   /** `1 agent` / `3 agents`. */
   const who = plain(`${agents} agent${many ? "s" : ""}`);
@@ -521,12 +789,55 @@ export function receiptRunLine(run: ReceiptRun): Line {
   const theirs = (word: string) => plain(many ? `${word}s` : word);
   const repeats = total > agents;
 
+  // ══ A MIXED RUN OF SUCCESSES — ONE LINE FOR THE TURN (the founder's ruling) ══════════════════
+  //
+  // Handled before everything else because its key is a LABEL rather than a bucket: the run holds
+  // several kinds and no single arm below could speak for it. The sentence therefore claims NO KIND
+  // — it states how many actions there were and then names the parts.
+  //
+  // EVERY NUMBER IN IT IS DERIVED FROM THE MEMBERS, and the parts partition them, so the stated
+  // numbers sum to `members.length` by construction rather than by a second count kept in step. That
+  // is the same invariant the header states for `total`, one level in: there is no place for a
+  // carried number to drift because there is no carried number.
+  //
+  // AND IT FAILS TO THE BARE TRUTH. If any member has no part phrase — which `foldReceiptRuns`
+  // cannot produce, so it means this module and that one have drifted — the parts would UNDER-SUM
+  // and the sentence would state a breakdown that does not add up. It drops the breakdown instead
+  // and says only the count, which is still true.
+  if (run.key === MIXED_SUCCESS_KEY) {
+    const order: string[] = [];
+    const counts = new Map<string, number>();
+    let complete = true;
+    for (const m of run.members) {
+      const bucket = mixedBucketOf(m.actionReceipt);
+      if (bucket === null) {
+        complete = false;
+        continue;
+      }
+      if (!counts.has(bucket)) order.push(bucket);
+      counts.set(bucket, (counts.get(bucket) ?? 0) + 1);
+    }
+    const parts = order
+      .map((bucket) => MIXED_PARTS[bucket]?.(counts.get(bucket) ?? 0) ?? "")
+      .filter((part) => part !== "");
+    const sentence =
+      complete && parts.length > 0
+        ? line`The concierge took ${n} actions — ${plain(parts.join(", "))}.`
+        : line`The concierge took ${n} actions.`;
+    // COUNT-SHAPED, so the residue is FILTERED to the members that actually named someone — the
+    // same rule the count-shaped refusal arms follow, and for the same reason: the parts count
+    // MEMBERS, never `distinctSubjects`, so a filtered list cannot contradict them, while an
+    // unfiltered one would mint a `that agent` chip for every bead and every PR in the run.
+    const named = namedMembers(run.members);
+    return named.length > 0 ? withSubjects(sentence, named) : sentence;
+  }
+
   // ══ A FOLDED RUN OF INTERNAL-GATE REFUSALS (roborev 63295) ══════════════════════════════════
   //
   // Handled before the switch because its key carries DATA — the gist — rather than being one of a
   // closed set. The sentence keeps the individual row's verb, so the fold reads as the same fact
-  // said once: "Didn't merge — waiting on checks" becomes "Didn't merge, 6 times — waiting on
-  // checks". It never claims the action happened, and it never drops the reason.
+  // said once: the individual row's "Refused the concierge's merge — waiting on checks" becomes
+  // "Refused the concierge's merge, 6 times — waiting on checks". It never claims the action happened, and it never drops the reason.
   //
   // The gist comes off a MEMBER, not off the key, so nothing has to parse a delimiter back out of a
   // string that contains free text. Every member of a run shares the key by construction, so any
@@ -561,7 +872,7 @@ export function receiptRunLine(run: ReceiptRun): Line {
      * is why the rule below keys on the sentence's shape rather than on what resolved. So a run of
      * three gated merge refusals rendered:
      *
-     *     Didn't merge, 3 times — waiting on checks — that agent, that agent, that agent
+     *     Refused the concierge's merge, 3 times — waiting on checks — that agent, that agent, that agent
      *
      * naming three agents the rows it replaced never named — breaking this module's own invariant
      * ("a folded row can never name an agent the row it replaced did not") and rebuilding the
@@ -580,7 +891,7 @@ export function receiptRunLine(run: ReceiptRun): Line {
      * refusals on the same gist folds together — a single named member flips the guard and the
      * residue comes back for the other two:
      *
-     *     Didn't merge, 3 times — waiting on checks — @Alpha, that agent, that agent
+     *     Refused the concierge's merge, 3 times — waiting on checks — @Alpha, that agent, that agent
      *
      * The same invariant break, one member short of the case the tests covered.
      *
@@ -602,22 +913,22 @@ export function receiptRunLine(run: ReceiptRun): Line {
     let sentence: Line;
     switch (kind) {
       case "merged":
-        sentence = line`Didn't merge, ${times}${tail}`;
+        sentence = line`Refused the concierge's merge, ${times}${tail}`;
         break;
       case "spawned":
         // WHO-SHAPED: the sentence counts agents, so its chips must come from the same members.
-        sentence = line`Couldn't spawn ${who}${tail}`;
+        sentence = line`Refused the concierge's spawn of ${who}${tail}`;
         subjectShaped = true;
         break;
       case "sent":
-        sentence = line`Not sent, ${times}${tail}`;
+        sentence = line`Refused the concierge's message, ${times}${tail}`;
         break;
       case "closed":
-        sentence = line`Couldn't close ${who}${tail}`;
+        sentence = line`Refused the concierge's close of ${who}${tail}`;
         subjectShaped = true;
         break;
       case "goal":
-        sentence = line`Couldn't set a goal on ${who}${tail}`;
+        sentence = line`Refused the concierge's goal for ${who}${tail}`;
         subjectShaped = true;
         break;
       // RETIRED — ADDED WITH THE VERBATIM DOOR, WHICH IS WHAT MADE IT REACHABLE (roborev 63747,
@@ -625,7 +936,7 @@ export function receiptRunLine(run: ReceiptRun): Line {
       // gist to fold this arm could never run and its absence cost nothing. A gist-less refusal now
       // folds, and `retire_agent` is a per-agent op the concierge issues in BATCHES on its own
       // initiative — so two refused retirements sharing a reason went straight to the `default` arm
-      // and rendered "2 actions didn't go through", dropping the verb both rows carried.
+      // and rendered "Refused 2 of the concierge's actions", dropping the verb both rows carried.
       //
       // That is the worst kind to drop it on. `foldKeyOf`'s success side singles `retired` out
       // precisely because the founder was not present for the act: nobody watched it happen and
@@ -636,15 +947,15 @@ export function receiptRunLine(run: ReceiptRun): Line {
       // WHO-SHAPED like `closed`, its nearest neighbour: the sentence counts agents, so its residue
       // goes out whole.
       case "retired":
-        sentence = line`Couldn't retire ${who}${tail}`;
+        sentence = line`Refused the concierge's retirement of ${who}${tail}`;
         subjectShaped = true;
         break;
       case "filed":
-        sentence = line`Couldn't file, ${times}${tail}`;
+        sentence = line`Refused the concierge's filing, ${times}${tail}`;
         break;
       default:
         // Same rule as the switch's own default: state the bare truth rather than guess a verb.
-        sentence = line`${n} actions didn't go through${tail}`;
+        sentence = line`Refused ${n} of the concierge's actions${tail}`;
         break;
     }
     // WHO-SHAPED: chips and count come from the same members, so the list goes out whole.
@@ -655,7 +966,7 @@ export function receiptRunLine(run: ReceiptRun): Line {
     // carry a real subject — `subjectOf` reads `agentId`/`agentName` off the args for every
     // non-`spawned` kind — and a per-recipient fan-out refusing on one shared gist folds under
     // `refusal:sent:<gist>`, which is exactly the shape this fold was built for. Suppressing there
-    // rendered `Not sent, 3 times — no free agent slot right now` and threw away three genuine
+    // rendered `Refused the concierge's message, 3 times — no free agent slot right now` and threw away three genuine
     // `@Alpha, @Beta, @Gamma` pills the unfolded rows had shown: it loses WHICH agents never got the
     // message, and costs the navigation `subjectList` exists to preserve. The invariant is "never
     // name an agent the row it replaced did NOT" — and those rows did name them.
@@ -671,8 +982,8 @@ export function receiptRunLine(run: ReceiptRun): Line {
     case "sent:terminal":
       return withSubjects(
         repeats
-          ? line`Sent ${n} messages to ${whose} ${theirs("terminal")}.`
-          : line`Sent to ${whose} ${theirs("terminal")}.`,
+          ? line`The concierge sent ${n} messages to ${whose} ${theirs("terminal")}.`
+          : line`The concierge sent to ${whose} ${theirs("terminal")}.`,
         run.members,
       );
     // THE CONCIERGE'S OWN BRIEFS, folded — and still ATTRIBUTED (bead `sparkle-p9s5q`). The founder
@@ -688,8 +999,8 @@ export function receiptRunLine(run: ReceiptRun): Line {
     case "sent:terminal:concierge":
       return withSubjects(
         repeats
-          ? line`Concierge wrote ${n} messages to ${who}.`
-          : line`Concierge wrote to ${who}.`,
+          ? line`The concierge wrote ${n} messages to ${who}.`
+          : line`The concierge wrote to ${who}.`,
         run.members,
       );
     case "sent:inbox":
@@ -698,8 +1009,8 @@ export function receiptRunLine(run: ReceiptRun): Line {
       // does — it is the whole difference between this channel and the terminal.
       return withSubjects(
         repeats
-          ? line`Left ${n} messages for ${who} — each delivers at that agent's next turn.`
-          : line`Left a message for ${who} — it delivers at each one's next turn.`,
+          ? line`The concierge left ${n} messages for ${who} — each delivers at that agent's next turn.`
+          : line`The concierge left a message for ${who} — it delivers at each one's next turn.`,
         run.members,
       );
     case "sent:held":
@@ -707,36 +1018,42 @@ export function receiptRunLine(run: ReceiptRun): Line {
       // is not up yet and can still expire.
       return withSubjects(
         repeats
-          ? line`Holding ${n} messages for ${who} — each goes in when that terminal is ready.`
-          : line`Holding a message for ${who} — each goes in when its terminal is ready.`,
+          ? line`The concierge is holding ${n} messages for ${who} — each goes in when that terminal is ready.`
+          : line`The concierge is holding a message for ${who} — each goes in when its terminal is ready.`,
         run.members,
       );
     case "sent:picker":
       return withSubjects(
         repeats
-          ? line`Answered ${n} prompts across ${who}.`
-          : line`Answered ${whose} prompts.`,
+          ? line`The concierge answered ${n} prompts across ${who}.`
+          : line`The concierge answered ${whose} prompts.`,
         run.members,
       );
     case "spawned":
       return withSubjects(
-        repeats ? line`Spawned ${who}, in ${n} calls.` : line`Spawned ${who}.`,
+        repeats
+          ? line`The concierge spawned ${who}, in ${n} calls.`
+          : line`The concierge spawned ${who}.`,
         run.members,
       );
     case "closed":
       return withSubjects(
-        repeats ? line`Closed ${who}, in ${n} calls.` : line`Closed ${who}.`,
+        repeats
+          ? line`The concierge closed ${who}, in ${n} calls.`
+          : line`The concierge closed ${who}.`,
         run.members,
       );
     case "goal":
       return withSubjects(
-        repeats ? line`Set ${n} goals on ${who}.` : line`Set goals on ${who}.`,
+        repeats
+          ? line`The concierge set ${n} goals on ${who}.`
+          : line`The concierge set goals on ${who}.`,
         run.members,
       );
     default:
       // A key with no sentence must not fold at all — `foldKeyOf` is the only producer of keys and
       // every key it returns has an arm above. Reaching here means the two drifted, and the safe
       // failure is the bare truth rather than a guess at what happened.
-      return withSubjects(line`${n} actions.`, run.members);
+      return withSubjects(line`The concierge took ${n} actions.`, run.members);
   }
 }

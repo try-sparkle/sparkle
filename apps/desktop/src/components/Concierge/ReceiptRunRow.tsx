@@ -18,6 +18,7 @@ import { useState } from "react";
 import { FiChevronDown, FiChevronRight } from "react-icons/fi";
 
 import { Markdown } from "../Markdown";
+import { NoticeAttribution, NOTICE_INK_VARS } from "./NoticeAttribution";
 import { C } from "../../theme/colors";
 import { TYPE } from "../../theme/scale";
 import { receiptRunLine, type ReceiptRun } from "./receiptRuns";
@@ -47,8 +48,24 @@ export function ReceiptRunRow({
       data-count={run.members.length}
       data-run-key={run.key}
       data-open={open ? "yes" : "no"}
-      style={{ maxWidth: "92%", alignSelf: "flex-start", minWidth: 0 }}
+      // A FOLDED RUN IS ALWAYS CONCIERGE-ADDRESSED, unconditionally, and that needs no test on the
+      // members: a run is built only from messages carrying an `actionReceipt`, and carrying one is
+      // exactly what ./noticeRecipient calls concierge-addressed. So the treatment is applied here
+      // rather than derived per member — deriving it would invite a mixed run, which cannot exist.
+      data-recipient="concierge"
+      style={{
+        maxWidth: "92%",
+        alignSelf: "flex-start",
+        minWidth: 0,
+        // The same re-inking the individual rows get. It reaches the MEMBERS too when expanded,
+        // which is correct and is the reason it sits on this container rather than on the summary
+        // line: a receipt does not become founder-addressed by being disclosed.
+        ...NOTICE_INK_VARS,
+      }}
     >
+      {/* The same header the unfolded rows carry. A fold must not be the one place the attribution
+          goes missing — it is the row he sees FIRST, and the individual ones only after a click. */}
+      <NoticeAttribution />
       <div style={{ display: "flex", alignItems: "flex-start", gap: 6 }}>
         <button
           type="button"

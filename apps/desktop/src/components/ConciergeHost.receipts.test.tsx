@@ -179,7 +179,7 @@ describe("ConciergeHost — action receipts reach the thread", () => {
     // THE SIDE EFFECT: the sentence is on screen. Asserting that a listener was registered would
     // prove nothing — that is exactly the shape of test that let the missing subscriber ship.
     await waitFor(() => {
-      expect(within(thread()).getByText(/Spawned/)).toBeTruthy();
+      expect(within(thread()).getByText(/The concierge spawned/)).toBeTruthy();
     });
   });
 
@@ -194,7 +194,7 @@ describe("ConciergeHost — action receipts reach the thread", () => {
     });
 
     await waitFor(() => {
-      expect(within(thread()).getByText(/Couldn't close/)).toBeTruthy();
+      expect(within(thread()).getByText(/Refused the concierge's close of/)).toBeTruthy();
     });
   });
 
@@ -240,7 +240,7 @@ describe("ConciergeHost — action receipts reach the thread", () => {
     // between. The number stays in the assertion: a line that posted without it would be the
     // "Merged." fallback, which is a different receipt.
     await waitFor(() => {
-      expect(thread().textContent).toContain("Merged PR #1184.");
+      expect(thread().textContent).toContain("The concierge merged PR #1184.");
     });
   });
 
@@ -250,7 +250,9 @@ describe("ConciergeHost — action receipts reach the thread", () => {
     act(() => {
       recordConciergeActionReceipt(receipt({ kind: "goal" }));
     });
-    await waitFor(() => expect(within(thread()).getAllByText(/Set a goal on/).length).toBe(1));
+    await waitFor(() =>
+      expect(within(thread()).getAllByText(/The concierge set a goal on/).length).toBe(1),
+    );
 
     // Remount: the replay re-delivers the same receipt, and the id dedupe is what stops one action
     // becoming two lines. This is the assertion that makes `ConciergeActionReceipt.id` load-bearing.
@@ -258,6 +260,6 @@ describe("ConciergeHost — action receipts reach the thread", () => {
     render(<ConciergeHost feed={feed()} />);
     await flush();
 
-    expect(within(thread()).getAllByText(/Set a goal on/).length).toBe(1);
+    expect(within(thread()).getAllByText(/The concierge set a goal on/).length).toBe(1);
   });
 });

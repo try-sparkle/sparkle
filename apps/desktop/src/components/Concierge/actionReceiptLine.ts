@@ -39,6 +39,33 @@
 //    arms wrote `#${plain(String(n))}`, i.e. the explicitly NON-clickable slot, so the module that
 //    quotes that complaint in its own header was still producing it (bead `sparkle-e9ziie`). Both
 //    arms now go through `pr()`, which degrades the same way `ref()` does.
+//
+// 4. EVERY SENTENCE IS THIRD PERSON ABOUT THE CONCIERGE — never second person to the reader
+//    (bead `sparkle-4kgpb3`). These lines are the APP reporting to the CONCIERGE about a call the
+//    concierge made; the founder is reading over its shoulder. See ./noticeRecipient, which owns the
+//    recipient axis and states the report: he was reading them as the concierge talking to HIM.
+//
+//    THE BUG WAS GRAMMATICAL BEFORE IT WAS VISUAL, which is why it needs a rule here and not just a
+//    colour in the renderer. The old refusal wording — "Not sent to @X — that text carries the
+//    founder's own words, and he did not name this agent" — pairs an implied-"you" verb ("[I] did
+//    not send") with a third-person "he", so the only reading left is the concierge addressing the
+//    founder. Greying the row cannot repair a sentence whose grammar says otherwise.
+//
+//    SO: NAME THE ACTOR, AND NAME IT IN THE THIRD PERSON. Every success arm opens with
+//    "The concierge …" and every refusal arm says "Refused the concierge's …". The header above the
+//    row now reads "Sparkle → Concierge" (`NOTICE_SENDER_LABEL`), and the sentence beneath it has to
+//    agree with that header rather than fight it: Sparkle is speaking, the concierge is being spoken
+//    to, and the founder is a third party to both.
+//
+//    WHAT THIS RULE DOES NOT REACH: the tool's own verbatim tail. `why()` splices the producer's
+//    words unedited because they are the audit record (rule 1), and those words ARE addressed to the
+//    concierge — a "you" inside a tail is correct and must not be rewritten. Only the verb layer
+//    this module authors is third person, which is exactly what the pronoun test below asserts on:
+//    receipts built with no reason at all, so the assertion sees our words and nothing else.
+//
+//    AND THE FOLD MUST SAY THE SAME THING. ./receiptRuns renders a run of identical receipts as one
+//    sentence, from the same wording table — a fold that still spoke in the old voice would put two
+//    accounts of one event in the column, differing in who is talking.
 
 import {
   ANONYMOUS_SUBJECT,
@@ -250,23 +277,23 @@ export function actionReceiptLine(
         // arm guards against is real but SEQUENTIAL: it bites the first producer to pair a subject
         // with a gate-phrased reason, not any receipt shipping today. `receiptMark` reads the same
         // `resolve` for `subjectId`, so that day the row and the fold already agree.
-        return line`Couldn't spawn ${subject}${tail}`;
+        return line`Refused the concierge's spawn of ${subject}${tail}`;
       case "sent":
         // THE REFUSAL ARM NEEDS THE PLURAL TOO (roborev 57888). `inboxBroadcast` refuses with
         // `no-recipients` and `broadcast-failed`, both subject-less — so this rendered "Not sent to
         // that agent", the identical misstatement the success arm was fixed for, still live on the
         // path where the message did NOT go out.
         return fanout
-          ? line`Not sent to those agents${tail}`
-          : line`Not sent to ${subject}${tail}`;
+          ? line`Refused the concierge's message to those agents${tail}`
+          : line`Refused the concierge's message to ${subject}${tail}`;
       case "closed":
-        return line`Couldn't close ${subject}${tail}`;
+        return line`Refused the concierge's close of ${subject}${tail}`;
       case "retired":
-        return line`Couldn't retire ${subject}${tail}`;
+        return line`Refused the concierge's retirement of ${subject}${tail}`;
       case "goal":
-        return line`Couldn't set a goal on ${subject}${tail}`;
+        return line`Refused the concierge's goal for ${subject}${tail}`;
       case "filed":
-        return line`Couldn't file that${tail}`;
+        return line`Refused the concierge's filing${tail}`;
       case "merged": {
         // NAMING IT IS THE WHOLE POINT OF KEEPING THE NUMBER. `prNumberOf` falls back to the
         // ARGUMENT specifically for this arm — its own comment says "a refusal carries no `data` at
@@ -279,8 +306,8 @@ export function actionReceiptLine(
         // resolves the repo live. Clickable either way.
         const n = receipt.prNumber;
         return n !== undefined && Number.isFinite(n)
-          ? line`Didn't merge PR ${pr({ number: n })}${tail}`
-          : line`Didn't merge${tail}`;
+          ? line`Refused the concierge's merge of PR ${pr({ number: n })}${tail}`
+          : line`Refused the concierge's merge${tail}`;
       }
       default:
         return null;
@@ -300,8 +327,8 @@ export function actionReceiptLine(
       // broken copy in the one module whose output is meant to be trusted at a glance.
       const shortfall = receipt.reason?.trim();
       return shortfall
-        ? line`Spawned ${subject}. ${plain(shortfall)}`
-        : line`Spawned ${subject}.`;
+        ? line`The concierge spawned ${subject}. ${plain(shortfall)}`
+        : line`The concierge spawned ${subject}.`;
     }
 
     case "sent": {
@@ -317,33 +344,35 @@ export function actionReceiptLine(
         // holding `{queued, failed}` even when some inboxes rejected the message, so keying only on
         // `ok` claimed delivery the tool never reported — the "Merged PR #753" shape again.
         if (failed > 0) {
-          return line`Left a message for ${plain(String(queued))} agent${plain(queued === 1 ? "" : "s")} — ${plain(String(failed))} couldn't be reached.`;
+          return line`The concierge left a message for ${plain(String(queued))} agent${plain(queued === 1 ? "" : "s")} — ${plain(String(failed))} couldn't be reached.`;
         }
-        return line`Left a message for ${plain(String(queued))} agent${plain(queued === 1 ? "" : "s")} — it delivers at each one's next turn.`;
+        return line`The concierge left a message for ${plain(String(queued))} agent${plain(queued === 1 ? "" : "s")} — it delivers at each one's next turn.`;
       }
       // A broadcast with NO counts — its refusal arms carry no data — still reads plural, because
       // `fanout` came from the op rather than from the absent subject. A single `inbox_send` whose
       // args were refused is subject-less too, and it correctly stays singular (roborev 57905).
       // A PICKER PRESS IS NOT A MESSAGE. It really did write to the PTY, so it gets a receipt — but
-      // "Sent to X's terminal" would describe something the concierge did not do.
+      // "The concierge sent the founder's words to X's terminal" would describe something the
+      // concierge did not do — it pressed a button in a picker he never read.
       if (receipt.viaPicker) {
-        return line`Answered ${subject}'s prompt.`;
+        return line`The concierge answered ${subject}'s prompt.`;
       }
       // HELD, not delivered: the PTY was not up, so the message is queued and will go in when the
-      // agent is ready — or expire. Saying "Sent to X's terminal" here is the sent-versus-visible
-      // ambiguity the channel field exists to remove (roborev 57862).
+      // agent is ready — or expire. Claiming a terminal send here is the sent-versus-visible
+      // ambiguity the channel field exists to remove (roborev 57862). Present tense on purpose: the
+      // holding is still going on as he reads, which no past-tense verb can say.
       if (receipt.channel === "held") {
-        return line`Holding a message for ${subject} — it goes in when its terminal is ready.`;
+        return line`The concierge is holding a message for ${subject} — it goes in when its terminal is ready.`;
       }
       if (receipt.channel === "inbox") {
         // RULE 2. The inbox arm states the DELAY, because the delay is the whole reason the founder
         // could not find the message he had been told about.
         return fanout
-          ? line`Left a message for several agents — it delivers at each one's next turn.`
-          : line`Left ${subject} a message — it delivers at their next turn.`;
+          ? line`The concierge left a message for several agents — it delivers at each one's next turn.`
+          : line`The concierge left ${subject} a message — it delivers at their next turn.`;
       }
       // ══ WHOSE WORDS WENT? — the founder's, or the concierge's own (bead `sparkle-p9s5q`) ══════
-      // "Sent to X's terminal" is silent about authorship, and that silence is what let the column
+      // "Sent to X's terminal" was silent about authorship, and that silence is what let the column
       // read as though his message had been forwarded. The badge on his bubble is now gated on the
       // answer (ConciergeHost's `stampRelayReceipt`), and this row states it, so the two surfaces
       // cannot be read against each other and reach different conclusions.
@@ -353,21 +382,26 @@ export function actionReceiptLine(
       // would fix the misattribution by removing his visibility, which is a worse trade." So a
       // concierge-composed send keeps its row and gains an author.
       //
-      // NAMED "Concierge", first-person-avoidant on purpose: this line sits in a thread where the
-      // concierge is also the narrator, and "I wrote to X" is one voice for two different claims —
-      // the sentence has to be readable as a statement about WHO acted, at a glance, in a column he
-      // is scanning rather than reading.
-      if (!receipt.relayedFounderWords) return line`Concierge wrote to ${subject}.`;
-      return line`Sent to ${subject}'s terminal.`;
+      // BOTH ARMS NAME THE CONCIERGE, AND THE RELAY ARM ALSO NAMES WHOSE WORDS WENT (rule 4). This
+      // line sits in a thread where the concierge is also the narrator, so "I wrote to X" would be
+      // one voice for two different claims — the sentence has to be readable as a statement about
+      // WHO acted, at a glance, in a column he is scanning rather than reading.
+      //
+      // "…sent the founder's words to X's terminal" rather than a bare "sent to X's terminal": the
+      // authorship is the entire distinction between these two arms, and leaving it implicit is what
+      // made the pair readable as one claim in the first place. Stated on both sides, the reader
+      // never has to infer it from which sentence he got.
+      if (!receipt.relayedFounderWords) return line`The concierge wrote to ${subject}.`;
+      return line`The concierge sent the founder's words to ${subject}'s terminal.`;
     }
 
     case "closed":
-      return line`Closed ${subject}.`;
+      return line`The concierge closed ${subject}.`;
 
     // NOT folded into `closed`, and the reason is the whole point of the kind: a close is something
     // the founder asked for while watching, a RETIREMENT is the concierge deciding on its own —
-    // typically overnight — that a finished agent is done with. Reading "Closed X" in the morning he
-    // cannot tell whether he asked for it and forgot.
+    // typically overnight — that a finished agent is done with. Reading "The concierge closed X" in
+    // the morning he cannot tell whether he asked for it and forgot.
     //
     // It is also the ONE success line that carries a reason. Every other kind here describes an act
     // he requested, so the act is its own explanation; this one describes a judgement he was not
@@ -377,17 +411,21 @@ export function actionReceiptLine(
       // `plain()`, not a bare string: the reason is model-authored prose that routinely contains
       // brackets, and only a wrapped slot gets escaped. The module's rule is that the absence of a
       // pill is a decision someone made rather than one they forgot.
-      return why ? line`Retired ${subject} — ${plain(why)}` : line`Retired ${subject}.`;
+      return why
+        ? line`The concierge retired ${subject} — ${plain(why)}`
+        : line`The concierge retired ${subject}.`;
     }
 
     case "goal":
-      return line`Set a goal on ${subject}.`;
+      return line`The concierge set a goal on ${subject}.`;
 
     case "filed": {
       // `bead()` degrades to plain text on a malformed id, so an unusable id costs the pill and not
       // the line — the receipt still records that something was filed.
       const id = receipt.beadId?.trim();
-      return id ? line`Filed ${bead({ id })}.` : line`Filed a task.`;
+      return id
+        ? line`The concierge filed ${bead({ id })}.`
+        : line`The concierge filed a task.`;
     }
 
     case "merged": {
@@ -401,8 +439,8 @@ export function actionReceiptLine(
       // as it always did and the live region hears the identical words.
       const n = receipt.prNumber;
       return n !== undefined && Number.isFinite(n)
-        ? line`Merged PR ${pr({ number: n, url: receipt.prUrl })}.`
-        : line`Merged.`;
+        ? line`The concierge merged PR ${pr({ number: n, url: receipt.prUrl })}.`
+        : line`The concierge merged.`;
     }
 
     default:

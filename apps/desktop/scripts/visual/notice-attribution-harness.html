@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Concierge notices — attribution and de-emphasis probe</title>
+  </head>
+  <body>
+    <!--
+      Served by the app's own vite dev server so this renders the REAL ConciergeThread with the REAL
+      stylesheet, the REAL fonts and the REAL theme tokens. It exists because jsdom has no
+      stylesheet and no computed colour: the unit suite can assert that `--c-cream` is REDEFINED on
+      a notice row, and nothing at all about what that row is actually painted.
+
+      The founder's question is a comparison — "can I tell at a glance that this line is not
+      addressed to me" — so the fixture deliberately puts all four treatments in one column:
+      an ordinary concierge reply, a concierge-addressed refusal, a folded run, and an app-authored
+      line that IS addressed to him. See notice-attribution-probe.mjs for what is measured.
+    -->
+    <div id="root"></div>
+    <script type="module" src="./notice-attribution-harness.jsx"></script>
+  </body>
+</html>

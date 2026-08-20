@@ -36,6 +36,8 @@ import { BeadAutoExpandProvider, BeadPill } from "./BeadPill";
 import { bandColor } from "../../engine/statusBandLabels";
 import { CopyAnswerButton } from "./CopyAnswerButton";
 import { MessageStatusLive, type ConciergeMessageStatusText } from "./MessageStatus";
+import { NoticeAttribution, NOTICE_INK_VARS, NOTICE_ROW_TESTID } from "./NoticeAttribution";
+import { isConciergeAddressed } from "./noticeRecipient";
 import { NudgeCard } from "./NudgeCard";
 import { RecapCard } from "./RecapCard";
 import { RoutingReceipt } from "./RoutingReceipt";
@@ -895,6 +897,24 @@ export const ConciergeMessageRow = memo(function ConciergeMessageRow({
         <LintMark marks={m.lint} />
       </div>
     );
+  // ══ IS THIS LINE EVEN ADDRESSED TO HIM? (bead sparkle-4kgpb3) ═══════════════════════════════
+  // The app's own tool layer posts its results into this same thread — "Refused the concierge's
+  // message to @X — …", "The concierge filed ." Those are the app reporting to the
+  // CONCIERGE about a call the concierge made, and the founder is reading over its shoulder. Drawn
+  // in the same full-weight ink as a reply, with no attribution, he read them as the concierge
+  // talking to HIM — which is the bug this answers.
+  //
+  // THE TEST IS RECIPIENT, NOT AUTHOR, and that distinction is the whole design. Roughly thirty
+  // app-authored lines in this feed ARE addressed to him ("your words are back in the box", "say
+  // them again and I'll pick them up") and several end in an instruction only he can carry out.
+  // Greying those would be strictly worse than the bug. See ./noticeRecipient for the rule and for
+  // why it reads the receipt mark rather than a new field.
+  //
+  // NOT A SEPARATE ARM. Everything below — the copy glyph, the collapsed payload, the lint marks,
+  // the reply-anchor stubs — applies identically to a receipt, so forking a parallel prose arm
+  // would be two branches to keep honest and a third one forgotten. It is the same row, re-inked,
+  // with a header in front.
+  const conciergeAddressed = isConciergeAddressed(m);
   return (
     <div
       data-message-id={m.id}
@@ -903,8 +923,28 @@ export const ConciergeMessageRow = memo(function ConciergeMessageRow({
       // answers he wants to reply to one claim inside.
       data-quote-source="sparkle"
       data-highlighted={highlighted ? "yes" : "no"}
-      style={{ ...PROSE_ROW, minWidth: 0, ...flash }}
+      // ON THE ELEMENT, so a test can assert WHICH TREATMENT this row got without reading a colour
+      // back out of a style attribute — the convention every other variant here follows
+      // (`data-stale`, `data-tone`, `data-band`, `data-sent-to-agent`). A colour assertion would
+      // pin the palette; this pins the decision.
+      data-recipient={conciergeAddressed ? "concierge" : "founder"}
+      data-testid={conciergeAddressed ? NOTICE_ROW_TESTID : undefined}
+      style={{
+        ...PROSE_ROW,
+        minWidth: 0,
+        ...flash,
+        // ⚠ MUST COME AFTER `flash`: a spread later in the literal wins, and a highlight flash sets
+        // its own background rather than ink, so the two do not fight. See NOTICE_INK_VARS for why
+        // this is BOTH a token redefinition and a `color`.
+        ...(conciergeAddressed ? NOTICE_INK_VARS : {}),
+      }}
     >
+      {/* WHO IS SPEAKING AND TO WHOM — first, above the sentence, so the attribution is read before
+          the words it governs. This is also what makes the tool's own second person legible: the
+          relay refusal literally says "His message went to you, not to the fleet", and that "you"
+          is correct once the line above it has established that the app is addressing the
+          concierge. Without the header that sentence is simply wrong from where he is sitting. */}
+      {conciergeAddressed && <NoticeAttribution />}
       {/* WHAT THIS REPLY IS ANSWERING, above its own words — the iMessage idiom, and the reason this
           component exists (see ./replyAnchors). One quoted stub per message it covers, in the order
           they were sent, so a single reply to a burst of five is legible as five answers rather than

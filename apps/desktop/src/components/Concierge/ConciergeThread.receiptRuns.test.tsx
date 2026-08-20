@@ -94,7 +94,9 @@ describe("the wall of receipts becomes one row", () => {
 
   it("states the count HONESTLY, and the count is the rows it stands for", () => {
     thread(wall());
-    expect(runRow().textContent).toContain("Sent to 16 agents' terminals.");
+    expect(runRow().textContent).toContain(
+      "The concierge sent to 16 agents' terminals.",
+    );
     // The claim on the element and the claim in the sentence come from one place — see receiptRuns
     // for why there is no separate `count` field that could disagree.
     expect(runRow().getAttribute("data-count")).toBe("16");

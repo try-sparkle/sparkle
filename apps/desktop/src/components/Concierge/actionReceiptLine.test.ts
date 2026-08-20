@@ -34,12 +34,16 @@ describe("actionReceiptLine", () => {
   // has to carry that, or it reproduces the complaint.
   it("says an inbox message is DELAYED, and a terminal send is not", () => {
     const inbox = actionReceiptLine(receipt({ channel: "inbox" }), resolve);
-    expect(inbox?.spoken).toBe("Left Left Pair a message — it delivers at their next turn.");
+    expect(inbox?.spoken).toBe(
+      "The concierge left Left Pair a message — it delivers at their next turn.",
+    );
 
     // The positive control: the terminal arm must NOT carry the delay clause, or the distinction
     // this test exists for is cosmetic.
     const terminal = actionReceiptLine(receipt({ channel: "terminal" }), resolve);
-    expect(terminal?.spoken).toBe("Sent to Left Pair's terminal.");
+    expect(terminal?.spoken).toBe(
+      "The concierge sent the founder's words to Left Pair's terminal.",
+    );
     expect(terminal?.spoken).not.toContain("next turn");
   });
 
@@ -53,7 +57,9 @@ describe("actionReceiptLine", () => {
     // worse than no pill. The name still shows because the tool call reported it.
     const l = actionReceiptLine(receipt(), noneResolve);
     expect(l?.md).not.toContain("sparkle-agent:");
-    expect(l?.spoken).toBe("Sent to Left Pair's terminal.");
+    expect(l?.spoken).toBe(
+      "The concierge sent the founder's words to Left Pair's terminal.",
+    );
   });
 
   // ══ THE BROADCAST ARM (roborev 57866) ═════════════════════════════════════════════════════════
@@ -72,7 +78,9 @@ describe("actionReceiptLine", () => {
         receipt({ channel: "inbox", agentId: undefined, agentName: undefined, fanout: true, queued: 5, failed: 0 }),
         noneResolve,
       );
-      expect(l?.spoken).toBe("Left a message for 5 agents — it delivers at each one's next turn.");
+      expect(l?.spoken).toBe(
+        "The concierge left a message for 5 agents — it delivers at each one's next turn.",
+      );
     });
 
     // roborev 57888: `inboxBroadcast` reports a PARTIAL failure as an OK reply carrying
@@ -82,14 +90,14 @@ describe("actionReceiptLine", () => {
         receipt({ channel: "inbox", agentId: undefined, agentName: undefined, fanout: true, queued: 3, failed: 2 }),
         noneResolve,
       );
-      expect(l?.spoken).toBe("Left a message for 3 agents — 2 couldn't be reached.");
+      expect(l?.spoken).toBe("The concierge left a message for 3 agents — 2 couldn't be reached.");
       expect(l?.spoken).not.toContain("delivers at each");
     });
 
     it("says a bare SEVERAL when there are no counts — the refusal shape", () => {
       const l = actionReceiptLine(broadcast("inbox"), noneResolve);
       expect(l?.spoken).toBe(
-        "Left a message for several agents — it delivers at each one's next turn.",
+        "The concierge left a message for several agents — it delivers at each one's next turn.",
       );
       expect(l?.spoken).not.toContain("that agent");
     });
@@ -109,7 +117,7 @@ describe("actionReceiptLine", () => {
         noneResolve,
       );
       expect(l?.spoken).toBe(
-        "Not sent to those agents — Name at least one agentId to broadcast to.",
+        "Refused the concierge's message to those agents — Name at least one agentId to broadcast to.",
       );
     });
 
@@ -130,7 +138,9 @@ describe("actionReceiptLine", () => {
         }),
         noneResolve,
       );
-      expect(l?.spoken).toBe("Not sent to that agent — agentId is required.");
+      expect(l?.spoken).toBe(
+        "Refused the concierge's message to that agent — agentId is required.",
+      );
       expect(l?.spoken).not.toContain("those agents");
     });
 
@@ -138,30 +148,32 @@ describe("actionReceiptLine", () => {
       // Without this, the assertions above would pass against a module that had simply stopped
       // naming anyone at all.
       expect(actionReceiptLine(receipt({ channel: "inbox" }), resolve)?.spoken).toBe(
-        "Left Left Pair a message — it delivers at their next turn.",
+        "The concierge left Left Pair a message — it delivers at their next turn.",
       );
     });
   });
 
   it("falls back to 'that agent' when there is no name either", () => {
     const l = actionReceiptLine(receipt({ agentName: undefined }), noneResolve);
-    expect(l?.spoken).toBe("Sent to that agent's terminal.");
+    expect(l?.spoken).toBe(
+      "The concierge sent the founder's words to that agent's terminal.",
+    );
   });
 
   describe("each kind reads as what happened", () => {
     it("spawned", () => {
       expect(actionReceiptLine(receipt({ kind: "spawned" }), resolve)?.spoken).toBe(
-        "Spawned Left Pair.",
+        "The concierge spawned Left Pair.",
       );
     });
     it("closed", () => {
       expect(actionReceiptLine(receipt({ kind: "closed" }), resolve)?.spoken).toBe(
-        "Closed Left Pair.",
+        "The concierge closed Left Pair.",
       );
     });
     it("goal", () => {
       expect(actionReceiptLine(receipt({ kind: "goal" }), resolve)?.spoken).toBe(
-        "Set a goal on Left Pair.",
+        "The concierge set a goal on Left Pair.",
       );
     });
     it("filed, with the bead as a pill", () => {
@@ -169,12 +181,12 @@ describe("actionReceiptLine", () => {
         receipt({ kind: "filed", beadId: "sparkle-kr2jz", agentId: undefined }),
         resolve,
       );
-      expect(l?.spoken).toBe("Filed sparkle-kr2jz.");
+      expect(l?.spoken).toBe("The concierge filed sparkle-kr2jz.");
       expect(l?.md).toContain("sparkle-bead:sparkle-kr2jz");
     });
     it("filed with an unusable bead id keeps the line and loses only the pill", () => {
       const l = actionReceiptLine(receipt({ kind: "filed", beadId: "  " }), resolve);
-      expect(l?.spoken).toBe("Filed a task.");
+      expect(l?.spoken).toBe("The concierge filed a task.");
     });
     it("merged, with the PR number", () => {
       // The `#` moved out of the STATIC text and into the pill's label, so the announcement drops
@@ -182,7 +194,7 @@ describe("actionReceiptLine", () => {
       // Pair". A live region read the old form aloud as "Merged PR hash 1175".
       expect(
         actionReceiptLine(receipt({ kind: "merged", prNumber: 1175 }), resolve)?.spoken,
-      ).toBe("Merged PR 1175.");
+      ).toBe("The concierge merged PR 1175.");
     });
 
     // ══ THE NUMBER IS A PILL — bead `sparkle-e9ziie` ════════════════════════════════════════════
@@ -209,7 +221,7 @@ describe("actionReceiptLine", () => {
       );
       expect(l?.md).toContain("[#1175](sparkle-pr:drodio/sparkle#1175)");
       // The sentence a listener hears is unaffected by which form the eye gets.
-      expect(l?.spoken).toBe("Merged PR 1175.");
+      expect(l?.spoken).toBe("The concierge merged PR 1175.");
     });
 
     it("degrades to the plain sentence when a url names no repository we recognise", () => {
@@ -228,7 +240,7 @@ describe("actionReceiptLine", () => {
 
     it("still says plain 'Merged.' when there is no number to name", () => {
       const l = actionReceiptLine(receipt({ kind: "merged" }), resolve);
-      expect(l?.spoken).toBe("Merged.");
+      expect(l?.spoken).toBe("The concierge merged.");
       expect(l?.md).not.toContain("sparkle-pr:");
     });
   });
@@ -240,10 +252,13 @@ describe("actionReceiptLine", () => {
         receipt({ ok: false, reason: "its terminal is showing a full-screen app" }),
         resolve,
       );
-      expect(l?.spoken).toBe("Not sent to Left Pair — its terminal is showing a full-screen app");
+      expect(l?.spoken).toBe(
+        "Refused the concierge's message to Left Pair — its terminal is showing a full-screen app",
+      );
       // The regression this guards: a settle that assumed success once reported a REFUSED merge as
-      // "Merged PR #753". A refusal must not read like the thing having happened.
-      expect(l?.spoken).not.toMatch(/^Sent to/);
+      // "Merged PR #753". A refusal must not read like the thing having happened — and the success
+      // wording it must not borrow is now "The concierge sent the founder's words to X's terminal."
+      expect(l?.spoken).not.toMatch(/^The concierge sent/);
     });
 
     it("a refused merge does not say 'Merged'", () => {
@@ -260,14 +275,14 @@ describe("actionReceiptLine", () => {
         resolve,
       );
       expect(l?.spoken).toBe(
-        "Didn't merge PR 753 — you do not have permission to merge in this repository",
+        "Refused the concierge's merge of PR 753 — you do not have permission to merge in this repository",
       );
-      expect(l?.spoken).not.toMatch(/^Merged/);
+      expect(l?.spoken).not.toMatch(/^The concierge merged/);
     });
 
     it("a refusal with no stated reason still posts, just without the tail", () => {
       const l = actionReceiptLine(receipt({ kind: "closed", ok: false, reason: "  " }), resolve);
-      expect(l?.spoken).toBe("Couldn't close Left Pair");
+      expect(l?.spoken).toBe("Refused the concierge's close of Left Pair");
     });
 
     it("covers every kind, so no refusal can fall through to silence", () => {
@@ -293,11 +308,11 @@ describe("actionReceiptLine", () => {
       const cases: [string, string][] = [
         [
           'Refused: roborev is the review gate on this machine and its state for sparkle/x could not be read. That is "I could not find out", not "it is clean". roborev row(s) 59204, 59203, 59177 carry no branch.',
-          "Didn't merge — the review gate has records to repair",
+          "Refused the concierge's merge — the review gate has records to repair",
         ],
         [
           "Refused: Checks running (2): Node — shell and Node — coverage — merging now is merging blind.",
-          "Didn't merge — waiting on checks",
+          "Refused the concierge's merge — waiting on checks",
         ],
       ];
       for (const [reason, expected] of cases) {
@@ -332,8 +347,8 @@ describe("actionReceiptLine", () => {
         }),
         resolve,
       );
-      expect(l?.spoken).toMatch(/^Didn't merge/);
-      expect(l?.spoken).not.toMatch(/^Merged/);
+      expect(l?.spoken).toMatch(/^Refused the concierge's merge/);
+      expect(l?.spoken).not.toMatch(/^The concierge merged/);
     });
 
     it("a refused merge NAMES the PR, and names it as a reference", () => {
@@ -345,7 +360,9 @@ describe("actionReceiptLine", () => {
         receipt({ kind: "merged", ok: false, prNumber: 753, reason: "GraphQL: unauthorized" }),
         resolve,
       );
-      expect(l?.spoken).toBe("Didn't merge PR 753 — GraphQL: unauthorized");
+      expect(l?.spoken).toBe(
+        "Refused the concierge's merge of PR 753 — GraphQL: unauthorized",
+      );
       expect(l?.md).toContain("[#753](sparkle-pr:753)");
     });
 
@@ -355,14 +372,14 @@ describe("actionReceiptLine", () => {
         receipt({ kind: "merged", ok: false, reason: "GraphQL: unauthorized" }),
         resolve,
       );
-      expect(l?.spoken).toBe("Didn't merge — GraphQL: unauthorized");
+      expect(l?.spoken).toBe("Refused the concierge's merge — GraphQL: unauthorized");
     });
 
     it("still posts a refusal that stated no reason", () => {
       // Absence is not evidence of an internal gate, and the existing line is already quiet.
       expect(
         actionReceiptLine(receipt({ kind: "closed", ok: false, reason: "  " }), resolve)?.spoken,
-      ).toBe("Couldn't close Left Pair");
+      ).toBe("Refused the concierge's close of Left Pair");
     });
 
     it("leaves SUCCESS receipts alone, whatever their reason says", () => {
@@ -402,7 +419,7 @@ describe("the spawn shortfall reads as prose, not a spliced clause", () => {
       receipt({ kind: "spawned", ok: true, reason: LAUNCH_FAILED }),
       resolve,
     );
-    expect(l?.spoken).toBe(`Spawned Left Pair. ${LAUNCH_FAILED}`);
+    expect(l?.spoken).toBe(`The concierge spawned Left Pair. ${LAUNCH_FAILED}`);
     // The specific regression: "— but I created the agent, but its terminal didn't start" is not a
     // sentence, and it is the shape the previous template produced.
     expect(l?.spoken).not.toContain("— but I created");
@@ -410,7 +427,7 @@ describe("the spawn shortfall reads as prose, not a spliced clause", () => {
 
   it("a clean spawn is still one short sentence — the positive control", () => {
     expect(actionReceiptLine(receipt({ kind: "spawned" }), resolve)?.spoken).toBe(
-      "Spawned Left Pair.",
+      "The concierge spawned Left Pair.",
     );
   });
 
@@ -448,8 +465,10 @@ describe("a picker press is not described as a message", () => {
       receipt({ channel: "terminal", viaPicker: true }),
       resolve,
     );
-    expect(l?.spoken).toBe("Answered Left Pair's prompt.");
-    expect(l?.spoken).not.toContain("Sent to");
+    expect(l?.spoken).toBe("The concierge answered Left Pair's prompt.");
+    // NOT the terminal-relay wording: a picker press moved a button the founder never read, so a
+    // sentence claiming his words went to that terminal would be the rule-1 overstatement.
+    expect(l?.spoken).not.toMatch(/sent the founder's words/i);
   });
 });
 
@@ -463,7 +482,9 @@ describe("the terminal channel is never pluralised", () => {
       receipt({ channel: "terminal", queued: 5, failed: 0 }),
       resolve,
     );
-    expect(l?.spoken).toBe("Sent to Left Pair's terminal.");
+    expect(l?.spoken).toBe(
+      "The concierge sent the founder's words to Left Pair's terminal.",
+    );
     expect(l?.spoken).not.toContain("agents");
   });
 });
@@ -478,7 +499,7 @@ describe("a retirement is reported as its own act, with its reason", () => {
 
   it("says WHY, verbatim", () => {
     const l = actionReceiptLine(retired({ reason: "its PR merged four hours ago" }), resolve);
-    expect(l?.spoken).toContain("Retired");
+    expect(l?.spoken).toMatch(/\bretired\b/);
     expect(l?.spoken).toContain("Left Pair");
     // NOT a gist. A shortened reason leaves him unable to check a decision nobody watched.
     expect(l?.spoken).toContain("its PR merged four hours ago");
@@ -488,22 +509,22 @@ describe("a retirement is reported as its own act, with its reason", () => {
     // "Closed X" reads as something he asked for and might have forgotten; a retirement is the app
     // deciding on its own. That ambiguity is the whole reason `retired` is a separate kind.
     const l = actionReceiptLine(retired({ reason: "idle with a met goal" }), resolve);
-    expect(l?.spoken).not.toMatch(/^Closed /);
+    expect(l?.spoken).not.toMatch(/^The concierge closed /);
     // Positive control: the `closed` kind still produces exactly that wording.
     const closed = actionReceiptLine(receipt({ kind: "closed", channel: undefined }), resolve);
-    expect(closed?.spoken).toBe("Closed Left Pair.");
+    expect(closed?.spoken).toBe("The concierge closed Left Pair.");
   });
 
   it("still names the agent when no reason came through", () => {
     const l = actionReceiptLine(retired(), resolve);
-    expect(l?.spoken).toContain("Retired");
+    expect(l?.spoken).toMatch(/\bretired\b/);
     expect(l?.spoken).toContain("Left Pair");
   });
 
   it("reports a refusal as a refusal, never as a retirement that happened", () => {
     const l = actionReceiptLine(retired({ ok: false, reason: "it has uncommitted changes" }), resolve);
-    expect(l?.spoken).toMatch(/couldn't retire/i);
-    expect(l?.spoken).not.toMatch(/^Retired /);
+    expect(l?.spoken).toMatch(/refused the concierge's retirement/i);
+    expect(l?.spoken).not.toMatch(/^The concierge retired /);
   });
 
   it("NEVER FOLDS into a count, however many there are", () => {
@@ -532,13 +553,18 @@ describe("a concierge-composed send says so", () => {
     receipt({ relayedFounderWords: undefined, ...over });
 
   it("attributes the concierge's own brief to the concierge", () => {
-    expect(actionReceiptLine(composed(), resolve)?.spoken).toBe("Concierge wrote to Left Pair.");
+    expect(actionReceiptLine(composed(), resolve)?.spoken).toBe(
+      "The concierge wrote to Left Pair.",
+    );
   });
 
   it("does NOT claim the founder's message was sent anywhere", () => {
     // The exact wording the founder read as a forward. It must not appear over text he never wrote.
     const spoken = actionReceiptLine(composed(), resolve)!.spoken;
-    expect(spoken).not.toContain("Sent to");
+    // Asserted on the AUTHORSHIP CLAUSE, not on the verb: both arms now open "The concierge …", so a
+    // `not.toContain("Sent to")` would pass against a module that had stopped drawing the
+    // distinction at all. The relay arm is the only one that names whose words went.
+    expect(spoken).not.toContain("the founder's words");
   });
 
   it("still RENDERS — his visibility into the fleet is not what was wrong", () => {
@@ -552,7 +578,9 @@ describe("a concierge-composed send says so", () => {
   it("keeps the RELAY wording when the send really did carry his words", () => {
     // The positive control, and the reason this pair is not vacuous: the same fixture with the flag
     // set takes the other arm, so these tests pin the FLAG rather than the fixture.
-    expect(actionReceiptLine(receipt(), resolve)?.spoken).toBe("Sent to Left Pair's terminal.");
+    expect(actionReceiptLine(receipt(), resolve)?.spoken).toBe(
+      "The concierge sent the founder's words to Left Pair's terminal.",
+    );
   });
 
   it("folds in its OWN bucket, so a count can never span both claims", () => {
@@ -567,15 +595,161 @@ describe("a concierge-composed send says so", () => {
 
   it("leaves the inbox and held channels alone — their wording never claimed authorship", () => {
     expect(actionReceiptLine(composed({ channel: "inbox" }), resolve)?.spoken).toBe(
-      "Left Left Pair a message — it delivers at their next turn.",
+      "The concierge left Left Pair a message — it delivers at their next turn.",
     );
     expect(actionReceiptLine(composed({ channel: "held" }), resolve)?.spoken).toBe(
-      "Holding a message for Left Pair — it goes in when its terminal is ready.",
+      "The concierge is holding a message for Left Pair — it goes in when its terminal is ready.",
     );
   });
 
   it("leaves a REFUSED send alone — nothing was written, by anyone", () => {
     const l = actionReceiptLine(composed({ ok: false, reason: "that agent is mid-turn" }), resolve);
-    expect(l?.spoken).not.toContain("Concierge wrote to");
+    expect(l?.spoken).not.toMatch(/concierge's wrote|concierge wrote to/i);
+  });
+});
+
+// ══ THIRD PERSON, ABOUT THE CONCIERGE — bead `sparkle-4kgpb3` ═══════════════════════════════════
+//
+// The founder read these rows as the concierge talking to HIM. They are not: they are the app
+// reporting to the CONCIERGE about a call the concierge made, and he is reading over its shoulder.
+// The bug was grammatical before it was visual — "Not sent to @X — that text carries the founder's
+// own words, and he did not name this agent" pairs an implied-"you" verb with a third-person "he",
+// so the only reading left is the concierge addressing him. Greying the row (./noticeRecipient)
+// cannot repair a sentence whose grammar says otherwise.
+//
+// EVERY ARM IS DRIVEN, not a sample. A wording rule that holds for the arms someone remembered to
+// list is the shape this file already had — "Spawned Left Pair." passed a suite of exact-string
+// assertions for months, because nothing ever asked the question these three tests ask.
+describe("every sentence is third person about the concierge", () => {
+  /** A stand-in for the TOOL's own verbatim words, and the reason it says "you".
+   *
+   *  Two arms cannot be reached without a reason at all — a spawn shortfall and a retirement's
+   *  judgement — so those cases carry this, and the pronoun assertion below SLICES IT OUT before
+   *  looking. The audit tail is addressed to the concierge and may legitimately be second person
+   *  (rule 4 in the module header); rewriting it would destroy the record. Only the verb layer this
+   *  module authors is under the rule, so only that is what gets asserted on. It is deliberately
+   *  full of the exact pronouns being banned: if the slice ever stopped working, these tests would
+   *  go red rather than quietly widening what they permit. */
+  const TOOL_WORDS = "your gate is closed and you know it";
+
+  type Arm = { readonly label: string; readonly receipt: ConciergeActionReceipt };
+
+  /** Every SUCCESS return in the module, in source order. */
+  const SUCCESS_ARMS: readonly Arm[] = [
+    { label: "spawned, with a shortfall", receipt: receipt({ kind: "spawned", reason: TOOL_WORDS }) },
+    { label: "spawned", receipt: receipt({ kind: "spawned" }) },
+    {
+      label: "broadcast with a partial failure",
+      receipt: receipt({ channel: "inbox", agentId: undefined, agentName: undefined, fanout: true, queued: 3, failed: 2 }),
+    },
+    {
+      label: "broadcast, all delivered",
+      receipt: receipt({ channel: "inbox", agentId: undefined, agentName: undefined, fanout: true, queued: 5, failed: 0 }),
+    },
+    { label: "picker press", receipt: receipt({ channel: "terminal", viaPicker: true }) },
+    { label: "held", receipt: receipt({ channel: "held" }) },
+    {
+      label: "inbox broadcast with no counts",
+      receipt: receipt({ channel: "inbox", agentId: undefined, agentName: undefined, fanout: true }),
+    },
+    { label: "inbox, singular", receipt: receipt({ channel: "inbox" }) },
+    { label: "terminal, concierge-composed", receipt: receipt({ relayedFounderWords: undefined }) },
+    { label: "terminal, relaying his words", receipt: receipt({ relayedFounderWords: true }) },
+    { label: "closed", receipt: receipt({ kind: "closed" }) },
+    { label: "retired, with its reason", receipt: receipt({ kind: "retired", reason: TOOL_WORDS }) },
+    { label: "retired", receipt: receipt({ kind: "retired" }) },
+    { label: "goal", receipt: receipt({ kind: "goal" }) },
+    { label: "filed, with a bead", receipt: receipt({ kind: "filed", beadId: "sparkle-kr2jz" }) },
+    { label: "filed", receipt: receipt({ kind: "filed" }) },
+    { label: "merged, with a PR", receipt: receipt({ kind: "merged", prNumber: 1175 }) },
+    { label: "merged", receipt: receipt({ kind: "merged" }) },
+  ];
+
+  /** Every REFUSAL return in the module, in source order. None carries a reason: a refusal renders
+   *  its tail only when one is present, so this is the shape in which the sentence is OURS alone. */
+  const REFUSAL_ARMS: readonly Arm[] = [
+    { label: "spawn", receipt: receipt({ kind: "spawned", ok: false }) },
+    {
+      label: "message to several agents",
+      receipt: receipt({ kind: "sent", ok: false, agentId: undefined, agentName: undefined, fanout: true }),
+    },
+    { label: "message to one agent", receipt: receipt({ kind: "sent", ok: false }) },
+    { label: "close", receipt: receipt({ kind: "closed", ok: false }) },
+    { label: "retirement", receipt: receipt({ kind: "retired", ok: false }) },
+    { label: "goal", receipt: receipt({ kind: "goal", ok: false }) },
+    { label: "filing", receipt: receipt({ kind: "filed", ok: false }) },
+    { label: "merge of a named PR", receipt: receipt({ kind: "merged", ok: false, prNumber: 753 }) },
+    { label: "merge", receipt: receipt({ kind: "merged", ok: false }) },
+  ];
+
+  // ── THE ONE THAT PINS THE VOICE ───────────────────────────────────────────────────────────────
+  // "Spawned Left Pair." names no actor, so the reader supplies one — and the only speaker on the
+  // screen is the concierge. Naming it is what makes the sentence a REPORT rather than a claim in
+  // the concierge's own voice. Asserted at the START of the sentence, because an actor buried mid-
+  // clause is one the eye scanning a column never reaches.
+  it("every SUCCESS arm names the concierge as the actor", () => {
+    for (const { label, receipt: r } of SUCCESS_ARMS) {
+      const l = actionReceiptLine(r, resolve);
+      expect(l, `${label} must produce a line`).not.toBeNull();
+      expect(l!.spoken, label).toMatch(/^the concierge /i);
+    }
+    // NOT A SAMPLE, and the count alone would not prove that — eighteen receipts that all landed on
+    // the same arm would satisfy it. Distinctness is what makes the list a COVER: the module has
+    // exactly 18 success returns, and 18 different sentences means each one was reached.
+    const spoken = SUCCESS_ARMS.map((a) => actionReceiptLine(a.receipt, resolve)!.spoken);
+    expect(new Set(spoken).size).toBe(18);
+  });
+
+  it("every REFUSAL arm names the concierge as the actor", () => {
+    for (const { label, receipt: r } of REFUSAL_ARMS) {
+      const l = actionReceiptLine(r, resolve);
+      expect(l, `${label} must produce a line`).not.toBeNull();
+      // POSSESSIVE, not "the concierge refused": the app is the refuser and the concierge is the one
+      // refused, which is the whole direction the header "Sparkle → Concierge" states.
+      expect(l!.spoken, label).toMatch(/the concierge's/i);
+    }
+    // Same cover argument as above: 9 distinct sentences from 9 receipts, against the module's 9
+    // refusal returns. The `default` arm is deliberately absent — it returns null, which the
+    // "posts NOTHING for an unrecognized kind" test owns.
+    const spoken = REFUSAL_ARMS.map((a) => actionReceiptLine(a.receipt, resolve)!.spoken);
+    expect(new Set(spoken).size).toBe(9);
+  });
+
+  // ── AND NO SECOND PERSON, IN EITHER RENDERING ─────────────────────────────────────────────────
+  // The reader of this column is a third party to the exchange, so a "you" in OUR words is always
+  // addressed to somebody who is not looking at it. Run over `md` as well as `spoken` because the
+  // two are built from the same slots but not from the same static chunks — a pill's label is not
+  // the word the live region hears, and only asserting on one of them leaves the other unguarded.
+  it("no arm speaks to the reader in the second person", () => {
+    for (const { label, receipt: r } of [...SUCCESS_ARMS, ...REFUSAL_ARMS]) {
+      const l = actionReceiptLine(r, resolve);
+      expect(l, `${label} must produce a line`).not.toBeNull();
+      for (const [field, text] of [["spoken", l!.spoken], ["md", l!.md]] as const) {
+        // THE TOOL'S WORDS ARE NOT OURS. Sliced, not permitted: the rest of the sentence is still
+        // held to the rule, so an arm cannot escape it by growing a tail.
+        const ours = text.split(TOOL_WORDS).join("");
+        expect(ours, `${label} (${field})`).not.toMatch(/\byou\b/i);
+        expect(ours, `${label} (${field})`).not.toMatch(/\byour\b/i);
+        // The first person is the same failure wearing the other hat: "I couldn't spawn X" is the
+        // concierge's voice, which is exactly what these rows must not be read as.
+        expect(ours, `${label} (${field})`).not.toMatch(/\bI\b/);
+        expect(ours, `${label} (${field})`).not.toMatch(/\bmy\b/i);
+      }
+    }
+  });
+
+  // ── THE NEGATIVE CONTROL FOR THE SLICE ────────────────────────────────────────────────────────
+  // Without this, the test above would also pass if `TOOL_WORDS` never reached the sentence at all —
+  // and then it would be asserting that a tail we simply dropped contains no pronouns. The tail is
+  // the audit record (rule 1) and it must arrive verbatim, second person and all.
+  it("the tool's own words REACH the line unedited, pronouns included", () => {
+    const spawned = actionReceiptLine(receipt({ kind: "spawned", reason: TOOL_WORDS }), resolve);
+    expect(spawned?.spoken).toBe(`The concierge spawned Left Pair. ${TOOL_WORDS}`);
+
+    const refused = actionReceiptLine(
+      receipt({ kind: "closed", ok: false, reason: TOOL_WORDS }),
+      resolve,
+    );
+    expect(refused?.spoken).toBe(`Refused the concierge's close of Left Pair — ${TOOL_WORDS}`);
   });
 });
