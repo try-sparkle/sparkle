@@ -831,7 +831,14 @@ export const useUiStore = create<UiState>()(
           if (
             cur.priority === filter.priority &&
             cur.dateField === filter.dateField &&
-            cur.dateWindow === filter.dateWindow
+            cur.dateWindow === filter.dateWindow &&
+            // ── EVERY FIELD OF `BoardFilter` MUST BE LISTED HERE ────────────────────────────────
+            // This is a hand-written equality over a struct, so a field ADDED to `BoardFilter` and
+            // not added here is silently swallowed: the setter reads the change as a no-op and
+            // returns `{}`, and the control that wrote it appears inert with nothing failing.
+            // `sortBy` cost exactly that — picking a sort in the chip menu wrote nothing at all
+            // until this line existed. If you add a fifth field, add it here too.
+            cur.sortBy === filter.sortBy
           ) {
             return {};
           }

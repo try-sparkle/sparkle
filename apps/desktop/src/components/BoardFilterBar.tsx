@@ -16,12 +16,17 @@ import { CHIP } from "./labelTreatment";
 import { useUiStore } from "../stores/uiStore";
 import type { PairSide } from "../engine/cable";
 import {
-  NO_BOARD_FILTER,
   boardFilterIsActive,
+  clearBoardFilter,
+  isDateSort,
   FILTERABLE_PRIORITIES,
   PRIORITY_LABEL,
+  SORT_CHIP_LABEL,
+  SORT_LABEL,
+  SORT_OPTIONS,
   WINDOW_LABEL,
   type BoardFilter,
+  type BoardSort,
   type DateField,
   type DateWindow,
 } from "../services/boardFilters";
@@ -203,6 +208,14 @@ const FIELD_OPTIONS: { value: DateField; label: string }[] = [
   { value: "created", label: "By created" },
 ];
 
+/** The sort menu, DERIVED from `SORT_OPTIONS` + `SORT_LABEL` rather than restated here — the
+ *  founder gave exact wording for all four rows, and a second hand-maintained copy of it is how a
+ *  menu ends up naming an order the comparator does not implement. */
+const SORT_MENU_OPTIONS: { value: BoardSort; label: string }[] = SORT_OPTIONS.map((value) => ({
+  value,
+  label: SORT_LABEL[value],
+}));
+
 export function BoardFilterBar({ side }: { side: PairSide }) {
   const filter = useUiStore((s) => s.boardFilterBySide[side]);
   const setBoardFilter = useUiStore((s) => s.setBoardFilter);
@@ -243,8 +256,15 @@ export function BoardFilterBar({ side }: { side: PairSide }) {
       />
       {/* The created/updated switch is only meaningful once a window is chosen — with "Any date" it
           selects which date a filter that is not running would measure. Hiding it then keeps the bar
-          from offering a control that cannot do anything. */}
-      {filter.dateWindow !== "all" && (
+          from offering a control that cannot do anything.
+
+          ── A DATE SORT MAKES IT MEANINGFUL WITH NO WINDOW AT ALL ────────────────────────────────
+          The founder's call is that "Date: Newest First" orders by whichever of created/updated
+          this chip selects, so the board holds ONE date concept rather than two that can disagree.
+          That makes this control load-bearing the moment a date sort is picked — and gating it on
+          the WINDOW alone would leave the sort reading a field the user can neither see nor change.
+          Either reason shows it; neither alone is sufficient. */}
+      {(filter.dateWindow !== "all" || isDateSort(filter.sortBy)) && (
         <ChipMenu
           testId="board-filter-field"
           label={filter.dateField === "created" ? "Created" : "Updated"}
@@ -254,12 +274,29 @@ export function BoardFilterBar({ side }: { side: PairSide }) {
           onPick={(dateField) => set({ dateField })}
         />
       )}
+      {/* SORT SITS RIGHTMOST, after both date controls — it is the founder's placement ("to the
+          right of the existing Priority and Date dropdowns") and it reads correctly: the chips to
+          its left decide WHICH cards, this one decides in what ORDER.
+
+          ALWAYS ACTIVE-STYLED, unlike every chip beside it. The others have an off position and
+          render muted in it; a sort does not — the board is always in one of the four orders, so a
+          muted "Sort: Priority" would suggest an order that is not currently applied. */}
+      <ChipMenu
+        testId="board-filter-sort"
+        label={SORT_CHIP_LABEL[filter.sortBy]}
+        active
+        options={SORT_MENU_OPTIONS}
+        value={filter.sortBy}
+        onPick={(sortBy) => set({ sortBy })}
+      />
       {active && (
         <button
           type="button"
           data-testid="board-filter-clear"
           title="Clear filters"
-          onClick={() => setBoardFilter(side, NO_BOARD_FILTER)}
+          // CLEARS THE FILTERS, KEEPS THE ORDER. The button says "Clear filters" and a sort is not
+          // a filter — see `clearBoardFilter` for why `dateField` survives it too.
+          onClick={() => setBoardFilter(side, clearBoardFilter(filter))}
           style={{
             display: "inline-flex",
             alignItems: "center",

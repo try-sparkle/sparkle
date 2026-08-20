@@ -2742,6 +2742,254 @@ describe("BoardView — the bead card's Chat button follows onBeadChat, nothing 
   });
 });
 
+// ══ CARD ORDER — THE FOUNDER'S "I'M NOT SEEING EPICS" (bead sparkle-hhb5re) ═══════════════════
+//
+// THE BOARD HAD NO COMPARATOR AT ALL BEFORE THIS. `bucketBeads` pushes each bead into a column in
+// INPUT ORDER and `Column` renders `beads.slice(0, cap)` verbatim; `beadsStore` states it outright
+// ("bucketBeads preserves input order within each column and the board RENDERS that order"). The
+// P0-first board the founder sees is `bd`'s own default output leaking through — measured over a
+// 7,779-row store, priorities are non-decreasing with zero inversions, while WITHIN a band the
+// order is arbitrary. So there was nothing in this repo that went red if bd changed its mind.
+//
+// EVERY FIXTURE BELOW IS FED IN DELIBERATELY SCRAMBLED ORDER for that reason. A suite that handed
+// the board a pre-sorted column would go green against a board that does no sorting whatsoever —
+// the assertion would have been true before the change, which is the vacuous shape AGENTS.md names
+// as this fleet's number-one finding.
+describe("BoardView — column order", () => {
+  // Both epic ENCODINGS the shared resolver accepts, in one fixture:
+  //   `p1-e0` is a STRUCTURAL epic (`p1-kid` names it as parent), typed `task`.
+  //   `p1-e1` / `p1-e2` are TYPED epics with no children at all.
+  // Mixing them is the point. `Card` paints the orange EPIC pill through `isEpicIndexed`, so a
+  // sort that understood only one encoding would promote a strict SUBSET of the chipped cards and
+  // leave the rest sorting like tasks — a card that visually says EPIC and sorts like a task,
+  // which is worse than the interleaving this bead is about.
+  const cards = [
+    bead({ id: "p1-e0", title: "Structural epic", priority: 0, updatedAt: "2026-01-01T00:00:00Z" }),
+    bead({ id: "p1-e1", title: "Typed epic one", priority: 1, type: "epic", updatedAt: "2026-02-01T00:00:00Z" }),
+    bead({ id: "p1-e2", title: "Typed epic two", priority: 2, type: "epic", updatedAt: "2026-03-01T00:00:00Z" }),
+    bead({ id: "p1-t0", title: "Task zero", priority: 0, updatedAt: "2026-04-01T00:00:00Z" }),
+    bead({ id: "p1-t1", title: "Task one", priority: 1, updatedAt: "2026-05-01T00:00:00Z" }),
+    bead({ id: "p1-t2", title: "Task two", priority: 2, updatedAt: "2026-06-01T00:00:00Z" }),
+    bead({ id: "p1-kid", title: "Child task", priority: 3, parent: "p1-e0", updatedAt: "2026-07-01T00:00:00Z" }),
+  ];
+  /** NOT in priority order, and not in epic-then-task order either — and note the P1 PAIR arrives
+   *  task-BEFORE-epic (`p1-t1` at index 1, `p1-e1` last). That is deliberate: the priority-filter
+   *  test below narrows to exactly that pair, and with the two in the other order it would assert
+   *  an order the board already had, going green against a board that does no sorting at all. */
+  const SCRAMBLED = ["p1-t2", "p1-t1", "p1-t0", "p1-e2", "p1-kid", "p1-e0", "p1-e1"];
+  const scrambled = () => SCRAMBLED.map((id) => cards.find((c) => c.id === id)!);
+
+  /** The same seven cards in EVERY column, each column's copy independently scrambled. Status is
+   *  irrelevant here — the columns are seeded directly rather than through `columnFor`, which is
+   *  what lets one fixture assert "each column" without inventing five different bead states. */
+  function orderBoard(): Board {
+    return {
+      backlog: scrambled(),
+      blocked: scrambled(),
+      inProgress: scrambled(),
+      done: scrambled(),
+      delivered: scrambled(),
+      archived: [],
+    };
+  }
+
+  /** The five columns the founder named. Archived is excluded because it renders COLLAPSED by
+   *  default — it mounts no cards, so asserting an order in it would assert on an empty list. */
+  const COLUMNS = ["backlog", "blocked", "inProgress", "done", "delivered"] as const;
+
+  /** One column's cards, top to bottom, as `{ id, epic }` — `epic` read from the ORANGE PILL the
+   *  founder actually looks at, not from the card's own testid. */
+  function column(key: string): { id: string; epic: boolean }[] {
+    const col = document.querySelector(`[data-board-column="${key}"]`);
+    if (!col) throw new Error(`no column ${key} on screen`);
+    return Array.from(col.querySelectorAll('[data-testid^="board-card-"]')).map((el) => {
+      const id = cards.find((c) => el.textContent?.includes(c.id))?.id;
+      if (!id) throw new Error("a rendered card matched no fixture id");
+      return { id, epic: el.querySelector('[data-testid="epic-pill"]') !== null };
+    });
+  }
+
+  const ids = (key: string) => column(key).map((c) => c.id);
+
+  beforeEach(() => {
+    // `beads` is the UNFILTERED store the epic index is built from, and it must be seeded: with
+    // the harness default of `[]` nothing points at `p1-e0`, so the structural epic silently
+    // resolves as a task and half this fixture stops testing what it names.
+    snapshot = { beads: cards, board: orderBoard(), loadedAt: Date.now() };
+    useUiStore.getState().setBoardFilter("right", NO_BOARD_FILTER);
+  });
+
+  afterEach(() => {
+    useUiStore.getState().setBoardFilter("right", NO_BOARD_FILTER);
+  });
+
+  // ── THE DEFAULT ORDER, IN EVERY COLUMN ──────────────────────────────────────────────────────
+  // The founder, verbatim: "we should have p zero epics show first and then all the p zero tasks
+  // and then p one epics would show below that. Each column, and then all the p one tasks,
+  // etcetera. So epics basically show at the beginning of the priority list."
+  it("interleaves P0 epic, P0 task, P1 epic, P1 task … in every column", () => {
+    render(<BoardView project={project} side="right" />);
+    for (const key of COLUMNS) {
+      expect(ids(key)).toEqual([
+        "p1-e0", // P0 epic
+        "p1-t0", // P0 task
+        "p1-e1", // P1 epic
+        "p1-t1", // P1 task
+        "p1-e2", // P2 epic
+        "p1-t2", // P2 task
+        "p1-kid", // P3 task
+      ]);
+    }
+  });
+
+  // ── THE PILL AND THE SORT MUST NAME THE SAME SET ────────────────────────────────────────────
+  // The failure this guards is the one the bead calls worse than today's behaviour: a card that
+  // renders the orange EPIC pill and sorts like a task. Asserted POSITIONALLY under the Type sort
+  // — every pilled card must be in the LEADING RUN — so it cannot pass by both facts happening to
+  // be read off the same variable: a sort that understood only `type === "epic"` would leave the
+  // structural epic `p1-e0` pilled but stranded below the tasks.
+  it("promotes exactly the cards that show the orange EPIC pill (Type sort)", () => {
+    useUiStore.getState().setBoardFilter("right", { ...NO_BOARD_FILTER, sortBy: "type" });
+    render(<BoardView project={project} side="right" />);
+    for (const key of COLUMNS) {
+      const col = column(key);
+      const pilled = col.filter((c) => c.epic).map((c) => c.id);
+      const leading = col.slice(0, pilled.length).map((c) => c.id);
+      expect(pilled.length).toBe(3); // both encodings resolved, not just the typed pair
+      expect(leading).toEqual(pilled);
+      // And the leading run really is every epic, in priority order.
+      expect(pilled).toEqual(["p1-e0", "p1-e1", "p1-e2"]);
+    }
+  });
+
+  it("puts a P0 TASK above a P2 EPIC by default, and the other way round under Type", () => {
+    render(<BoardView project={project} side="right" />);
+    const dflt = ids("backlog");
+    expect(dflt.indexOf("p1-t0")).toBeLessThan(dflt.indexOf("p1-e2"));
+
+    cleanup();
+    useUiStore.getState().setBoardFilter("right", { ...NO_BOARD_FILTER, sortBy: "type" });
+    render(<BoardView project={project} side="right" />);
+    const byType = ids("backlog");
+    expect(byType.indexOf("p1-e2")).toBeLessThan(byType.indexOf("p1-t0"));
+  });
+
+  it("orders by date, newest and oldest, following the Created/Updated field", () => {
+    useUiStore.getState().setBoardFilter("right", { ...NO_BOARD_FILTER, sortBy: "newest" });
+    render(<BoardView project={project} side="right" />);
+    expect(ids("backlog")).toEqual(["p1-kid", "p1-t2", "p1-t1", "p1-t0", "p1-e2", "p1-e1", "p1-e0"]);
+
+    cleanup();
+    useUiStore.getState().setBoardFilter("right", { ...NO_BOARD_FILTER, sortBy: "oldest" });
+    render(<BoardView project={project} side="right" />);
+    expect(ids("backlog")).toEqual(["p1-e0", "p1-e1", "p1-e2", "p1-t0", "p1-t1", "p1-t2", "p1-kid"]);
+  });
+
+  // ── THE ORDER SURVIVES THE FILTER CHIPS ─────────────────────────────────────────────────────
+  // The Priority and Date controls NARROW the board; they must re-sort what survives rather than
+  // dissolving the order. Asserted with a filter that removes cards from the middle of the
+  // sequence, so an implementation that sorted BEFORE filtering and an implementation that never
+  // sorted at all are both distinguishable from a correct one.
+  it("keeps the order under an active Priority filter", () => {
+    useUiStore.getState().setBoardFilter("right", { ...NO_BOARD_FILTER, priority: 1 });
+    render(<BoardView project={project} side="right" />);
+    // Only the P1 pair survives, epic first.
+    expect(ids("backlog")).toEqual(["p1-e1", "p1-t1"]);
+  });
+
+  it("keeps the order under an active Date-window filter", () => {
+    // `now` sits inside the fixture's own span so the window cuts it in half: a 30-day window
+    // ending 2026-03-15 drops `p1-e0` (Jan 1) and `p1-e1` (Feb 1) and keeps everything from Mar 1
+    // on. What survives is a MIX — one epic and four tasks — which is what makes this assert
+    // ordering rather than mere survival.
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-03-15T00:00:00Z"));
+    try {
+      useUiStore
+        .getState()
+        .setBoardFilter("right", { ...NO_BOARD_FILTER, dateWindow: "30d", dateField: "updated" });
+      render(<BoardView project={project} side="right" />);
+      expect(ids("backlog")).toEqual([
+        "p1-t0", // P0 task  — the two P0/P1 epics were filtered out …
+        "p1-t1", // P1 task
+        "p1-e2", // P2 EPIC  — … and the surviving one still sorts above its band's task,
+        "p1-t2", // P2 task  —     which is the property the filter must not dissolve.
+        "p1-kid", // P3 task
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // ── THE LIVE GESTURE: THE SORT CHANGES WHILE THE BOARD IS MOUNTED ───────────────────────────
+  // Every case above seeds the sort BEFORE the first render, which tests the ordering but NOT the
+  // transition. The user's actual gesture is picking a sort on a board that is already on screen,
+  // and that is a SEAM: `BoardFilterBar` writes the store, `BoardView` reads it. Both halves were
+  // green while the seam was broken — `setBoardFilter`'s hand-written no-op guard did not compare
+  // `sortBy`, so the write was discarded and the control was completely inert with nothing failing
+  // anywhere. This drives the store the way the chip does and asserts the CARDS MOVED.
+  it("re-sorts a board that is already on screen when the sort changes", () => {
+    render(<BoardView project={project} side="right" />);
+    const before = ids("backlog");
+    expect(before).toEqual(["p1-e0", "p1-t0", "p1-e1", "p1-t1", "p1-e2", "p1-t2", "p1-kid"]);
+
+    // Exactly what the chip's `onPick` does — no remount, no re-seed.
+    act(() => {
+      useUiStore.getState().setBoardFilter("right", { ...NO_BOARD_FILTER, sortBy: "type" });
+    });
+
+    const after = ids("backlog");
+    // Asserted as an inequality FIRST: a board that ignored the change entirely would still satisfy
+    // a bare `toEqual` against whichever order happened to be right.
+    expect(after).not.toEqual(before);
+    expect(after).toEqual(["p1-e0", "p1-e1", "p1-e2", "p1-t0", "p1-t1", "p1-t2", "p1-kid"]);
+
+    // …and BACK, so this cannot pass for a board that reorders once and then latches.
+    act(() => {
+      useUiStore.getState().setBoardFilter("right", { ...NO_BOARD_FILTER, sortBy: "priority" });
+    });
+    expect(ids("backlog")).toEqual(before);
+  });
+
+  // ── BOTH MODES ──────────────────────────────────────────────────────────────────────────────
+  // Epics-only swaps the whole column set for the seven-stage ladder via `bucketEpics`, which does
+  // its own filtering and also does not sort. One comparator has to serve both, so the mode that
+  // is NOT the default is asserted directly rather than assumed.
+  it("orders the Epics-only ladder too", () => {
+    useUiStore.setState({
+      planKindsBySide: {
+        left: { tasks: true, epics: true },
+        right: { tasks: false, epics: true },
+      },
+    } as never);
+    // SEEDED REVERSED, on purpose. `bucketEpics` routes an epic that HAS children to the ladder's
+    // Planning stage, so the ladder's Backlog holds only the two childless typed epics — and in
+    // the shared fixture they already arrive P1-then-P2. Asserting that order would be vacuous:
+    // it is the input order. Handing the column P2-then-P1 is what makes a green here mean the
+    // comparator ran on this mode's path too.
+    snapshot = {
+      beads: cards,
+      board: { ...orderBoard(), backlog: [cards[2]!, cards[1]!, cards[0]!] },
+      loadedAt: Date.now(),
+    };
+    try {
+      useUiStore.getState().setBoardFilter("right", { ...NO_BOARD_FILTER, sortBy: "type" });
+      render(<BoardView project={project} side="right" />);
+      expect(ids("backlog")).toEqual(["p1-e1", "p1-e2"]);
+      // The structural epic is not lost — it is in Planning, which is the ladder column the task
+      // board has no bucket for and the one a `Board`-shaped loop would silently skip.
+      expect(ids("planning")).toEqual(["p1-e0"]);
+    } finally {
+      useUiStore.setState({
+        planKindsBySide: {
+          left: { tasks: true, epics: true },
+          right: { tasks: true, epics: true },
+        },
+      } as never);
+    }
+  });
+});
+
 // ══ THE STATUS CHIP SAYS THE STAGE THE CARD IS SITTING IN (bead sparkle-az6di8) ═══════════════
 //
 // The founder, verbatim: *"I want them to have the actual status. So instead of saying open, it

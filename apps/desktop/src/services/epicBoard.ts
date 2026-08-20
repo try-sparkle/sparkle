@@ -230,48 +230,25 @@ export function ladderKeyOf(board: Board | EpicBoard, beadId: string): EpicLadde
   return null;
 }
 
-/** BOTH KINDS ON: epics rise to the top of every column, tasks keep their order beneath them.
+/* `epicsFirst` LIVED HERE AND IS NOW `services/boardSort.ts`'s `sortBy: "type"`.
  *
- *  WHY THIS EXISTS. With both toggles on, the board is the six task columns and an epic is bucketed
- *  by its own status like anything else — so it lands in Backlog among however many tasks are
- *  there. The founder reported this as "I don't see any epics when I have tasks turned on", and he
- *  was reading it correctly: on a store with thousands of open beads an epic is on the board and
- *  unfindable, which is the same thing as absent. Epics-only worked, which is what made it look
- *  like a filter bug rather than an ordering one.
+ * It hoisted every epic above every task, in bd's arbitrary order within each group — the
+ * founder's ORIGINAL spec for "I'm not seeing epics". He then corrected it: "we should have p
+ * zero epics show first and then all the p zero tasks and then p one epics would show below
+ * that … epics basically show at the beginning of the priority list", i.e. interleaved BY
+ * PRIORITY BAND. The hoisting reading survives verbatim as one of the four Sort by options —
+ * "Type (All Epics, then Tasks; In priority order)" — so no behaviour was dropped, it moved and
+ * gained a priority order within each group.
  *
- *  It does NOT re-bucket. An epic stays in the column its status puts it in — moving it would make
- *  the same bead sit in different columns depending on a toggle, and the Epics rail's own ladder is
- *  where an epic-shaped view belongs. This only decides ORDER WITHIN a column.
+ * Its private helper `mapPiles` went with it — it had exactly one caller and became unused the
+ * moment `epicsFirst` did, which CI caught as a lint error (`'mapPiles' is defined but never
+ * used`). `mapBoard` below is the FILTERING twin and is still live; do not confuse them.
  *
- *  STABLE, and that is load-bearing rather than incidental: the piles arrive in the order
- *  `bucketBeads` preserved, and both groups have to keep it. A comparator returning ±1 on an
- *  epic/epic or task/task pair would reshuffle each group on every render.
+ * Removed rather than left exported-and-unused: two functions answering "what order do board
+ * cards go in" is the drift this file's own header is about, and this one had no caller and no
+ * test once the comparator landed. See `boardSort.ts`.
  */
-export function epicsFirst(board: Board, allBeads: readonly Bead[]): Board {
-  // CACHED, not `buildEpicIndex` — same reason as `epicsOnly` above. main replaced the uncached
-  // walk here (the 43.5s -> 92ms epic-index wiring); this branch predates that, and the merge took
-  // main's import list while keeping this call site, so it referenced a name no longer imported.
-  // Re-importing `buildEpicIndex` would have compiled and silently undone the perf fix.
-  const index = epicIndexOf(allBeads);
-  const split = (pile: Bead[]): Bead[] => {
-    const epics = pile.filter((b) => isEpicIndexed(index, b));
-    // Nothing to reorder — hand the SAME array back so React sees an unchanged reference.
-    if (epics.length === 0 || epics.length === pile.length) return pile;
-    return [...epics, ...pile.filter((b) => !isEpicIndexed(index, b))];
-  };
-  return mapPiles(board, split);
-}
 
-function mapPiles(board: Board, f: (pile: Bead[]) => Bead[]): Board {
-  return {
-    backlog: f(board.backlog),
-    blocked: f(board.blocked),
-    inProgress: f(board.inProgress),
-    done: f(board.done),
-    delivered: f(board.delivered),
-    archived: f(board.archived),
-  };
-}
 
 function mapBoard(board: Board, keep: (b: Bead) => boolean): Board {
   return {

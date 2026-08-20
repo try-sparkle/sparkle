@@ -3,7 +3,7 @@ import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
 import { BoardFilterBar } from "./BoardFilterBar";
 import { useUiStore } from "../stores/uiStore";
-import { NO_BOARD_FILTER } from "../services/boardFilters";
+import { NO_BOARD_FILTER, SORT_LABEL } from "../services/boardFilters";
 import { dismissibleSurfaceOpen, isInsideCircuit } from "../engine/cable";
 
 afterEach(() => {
@@ -63,20 +63,74 @@ describe("BoardFilterBar — the controls reflect and clear state", () => {
     expect(screen.getByTestId("board-filter-field")).toBeTruthy();
   });
 
-  it("shows Clear only while something is filtered, and Clear resets every axis", () => {
+  // ── CLEAR RESETS THE FILTERS AND KEEPS THE ORDER ────────────────────────────────────────────
+  // The button says "Clear filters", and `sortBy` is not one: it hides nothing, it reorders. A
+  // Clear that silently reset it would throw away a choice the button does not name. `dateField`
+  // rides along for the same reason and it is the sharper case — with a date sort selected that
+  // field decides the ORDER, so resetting it would reverse the board out from under a button
+  // labelled Clear. Neither survivor changes what is FILTERED: `dateWindow` goes back to "all",
+  // which makes the field inert for filtering.
+  it("shows Clear only while something is filtered, and Clear resets the FILTER axes only", () => {
     render(<BoardFilterBar side="right" />);
     expect(screen.queryByTestId("board-filter-clear")).toBeNull();
 
     cleanup();
     useUiStore
       .getState()
-      .setBoardFilter("right", { priority: 1, dateField: "created", dateWindow: "30d" });
+      .setBoardFilter("right", {
+        priority: 1,
+        dateField: "created",
+        dateWindow: "30d",
+        sortBy: "type",
+      });
     render(<BoardFilterBar side="right" />);
 
     fireEvent.click(screen.getByTestId("board-filter-clear"));
-    expect(filter()).toEqual(NO_BOARD_FILTER);
+    // The two narrowing axes are off …
+    expect(filter().priority).toBeNull();
+    expect(filter().dateWindow).toBe("all");
+    // … and the two ordering ones are exactly as the user left them. Asserted against values that
+    // DIFFER from `NO_BOARD_FILTER`'s, so a Clear that reset them cannot pass this by coincidence.
+    expect(filter().sortBy).toBe("type");
+    expect(filter().dateField).toBe("created");
     // And the affordance goes away with the filter it cleared.
     expect(screen.queryByTestId("board-filter-clear")).toBeNull();
+  });
+
+  // ── THE FOURTH CHIP ─────────────────────────────────────────────────────────────────────────
+  it("writes the chosen sort, and offers exactly the founder's four orders", () => {
+    render(<BoardFilterBar side="right" />);
+    // Always present and always active — a sort has no off position, so the chip is never muted.
+    expect(screen.getByTestId("board-filter-sort").textContent).toContain("Sort: Priority");
+
+    const menu = openMenu("board-filter-sort");
+    for (const label of Object.values(SORT_LABEL)) {
+      expect(menu.textContent).toContain(label);
+    }
+    fireEvent.click(within(menu, SORT_LABEL.type));
+    expect(filter().sortBy).toBe("type");
+    expect(screen.getByTestId("board-filter-sort").textContent).toContain("Sort: Type");
+  });
+
+  // The created/updated chip used to appear only once a DATE WINDOW was chosen. A date SORT reads
+  // the same field, so gating on the window alone would leave "Date: Newest First" ordering by a
+  // field the user can neither see nor change. Asserted with `dateWindow: "all"` so the window
+  // cannot be what is revealing it.
+  it("reveals the created/updated switch for a DATE SORT even with no window", () => {
+    useUiStore
+      .getState()
+      .setBoardFilter("right", { ...NO_BOARD_FILTER, dateWindow: "all", sortBy: "newest" });
+    render(<BoardFilterBar side="right" />);
+    expect(screen.getByTestId("board-filter-field")).toBeTruthy();
+
+    // …and a NON-date sort with no window hides it again — otherwise the assertion above would
+    // pass for a chip that had simply stopped being conditional at all.
+    cleanup();
+    useUiStore
+      .getState()
+      .setBoardFilter("right", { ...NO_BOARD_FILTER, dateWindow: "all", sortBy: "type" });
+    render(<BoardFilterBar side="right" />);
+    expect(screen.queryByTestId("board-filter-field")).toBeNull();
   });
 
   // ── P4 IS REAL, AND THE FILTER HAS TO REACH IT ──────────────────────────────────────────────

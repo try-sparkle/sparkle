@@ -10,6 +10,7 @@ import {
   COMPOSER_DEFAULT,
   REVEAL_REQUEST_TTL_MS,
 } from "./uiStore";
+import { NO_BOARD_FILTER, type BoardFilter } from "../services/boardFilters";
 
 describe("uiStore theme", () => {
   // The store is a module-level singleton; the rehydrate test below mutates global fields
@@ -898,5 +899,46 @@ describe("uiStore rehydrate — a retired persisted value is repaired at the CUR
     for (const b of STATUS_BANDS) expect(filter[b.id]).toBe(true);
     // Not a pass by the blob having been skipped: a persisted sibling did come through.
     expect(useUiStore.getState().themePref).toBe("dark");
+  });
+});
+
+// ══ setBoardFilter's NO-OP GUARD IS A HAND-WRITTEN EQUALITY OVER A STRUCT ═════════════════════
+//
+// It compares `BoardFilter` field by field so a control that re-asserts its current value on every
+// render does not mint a new object and re-narrow the whole board. The cost of that shape is that
+// a field ADDED to the type and not added to the comparison is silently SWALLOWED — the setter
+// reads a real change as a no-op and returns `{}`, so the control appears inert with nothing
+// failing anywhere. `sortBy` did exactly that: picking a sort in the chip menu wrote nothing.
+//
+// Asserted by CHANGING ONE FIELD AT A TIME. A fixture that varied two at once would pass on the
+// strength of whichever field the guard already knew about, which is the bug itself.
+describe("uiStore boardFilter — every field of BoardFilter reaches the store", () => {
+  afterEach(() => {
+    useUiStore.getState().setBoardFilter("right", NO_BOARD_FILTER);
+  });
+
+  const axes: { name: keyof BoardFilter; value: BoardFilter[keyof BoardFilter] }[] = [
+    { name: "priority", value: 2 },
+    { name: "dateWindow", value: "7d" },
+    { name: "dateField", value: "created" },
+    { name: "sortBy", value: "type" },
+  ];
+
+  for (const axis of axes) {
+    it(`writes a change to ${axis.name} alone`, () => {
+      useUiStore.getState().setBoardFilter("right", NO_BOARD_FILTER);
+      const next = { ...NO_BOARD_FILTER, [axis.name]: axis.value } as BoardFilter;
+      useUiStore.getState().setBoardFilter("right", next);
+      expect(useUiStore.getState().boardFilterBySide.right[axis.name]).toEqual(axis.value);
+    });
+  }
+
+  // The guard's REASON, kept honest beside the bug it caused: re-asserting the same value must
+  // still hand back the same object, or the board re-narrows and every card re-renders on a no-op.
+  it("stays identity-stable when nothing changed", () => {
+    useUiStore.getState().setBoardFilter("right", NO_BOARD_FILTER);
+    const before = useUiStore.getState().boardFilterBySide.right;
+    useUiStore.getState().setBoardFilter("right", { ...before });
+    expect(useUiStore.getState().boardFilterBySide.right).toBe(before);
   });
 });

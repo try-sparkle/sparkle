@@ -30,7 +30,6 @@ import {
   ladderKeyOf,
   tasksOnly,
   withPlanning,
-  epicsFirst,
   type EpicBoard,
   type EpicLadderKey,
 } from "../services/epicBoard";
@@ -52,7 +51,13 @@ import { WorkflowLine } from "./WorkflowLine";
 import { FiUsers, FiChevronRight, FiCheck, FiCircle } from "react-icons/fi";
 import { stageMeta, stageLineColor, type WorkflowStageId } from "../engine/workflowStage";
 import { agentDisplayName } from "../engine/agentDisplayName";
-import { boardFilterIsActive, matchesBoardFilter, NO_BOARD_FILTER } from "../services/boardFilters";
+import {
+  boardFilterIsActive,
+  isDateSort,
+  matchesBoardFilter,
+  NO_BOARD_FILTER,
+} from "../services/boardFilters";
+import { sortEpicBoard } from "../services/boardSort";
 import type { AgentTab } from "../types";
 import { getConfig, onConfigChanged } from "../services/config";
 import { readStageDef, isDefined, type StageKey, type StageDefinition } from "../services/stageDefs";
@@ -535,22 +540,53 @@ export function BoardView({
    * you whether anything points at it), so asking them against a filtered list would demote an epic
    * whose children a filter happened to hide.
    */
+  // The two fields of `boardFilter` that decide ORDER rather than membership. Read as scalars so
+  // the sort memo below depends on them and not on the whole filter object.
+  const sortBy = boardFilter.sortBy;
+  const dateField = boardFilter.dateField;
   const { columns, viewBoard } = useMemo((): {
     columns: readonly { key: EpicLadderKey; label: string }[];
     viewBoard: EpicBoard | null;
   } => {
+    // ── THE ORDER IS APPLIED ONCE, TO WHATEVER THE MODE PRODUCED ─────────────────────────────
+    // Every branch below builds a differently-shaped board and NONE of them sorts: `bucketEpics`
+    // filters in input order and `withPlanning` just widens the shape. Ordering the finished
+    // `EpicBoard` here — rather than inside each branch — is what makes ONE comparator serve both
+    // modes, which is the requirement: the founder's order must hold on the Epics-only ladder
+    // exactly as it does on the default Tasks+Epics board.
+    const ordered = (b: EpicBoard) => sortEpicBoard(b, sortBy, dateField, allBeads);
     if (!displayBoard) return { columns: COLUMNS, viewBoard: null };
     if (!planKinds.tasks && !planKinds.epics)
       return { columns: COLUMNS, viewBoard: emptyEpicBoard() };
     if (!planKinds.tasks)
-      return { columns: EPIC_LADDER_COLUMNS, viewBoard: bucketEpics(displayBoard, allBeads) };
+      return {
+        columns: EPIC_LADDER_COLUMNS,
+        viewBoard: ordered(bucketEpics(displayBoard, allBeads)),
+      };
     if (!planKinds.epics)
-      return { columns: COLUMNS, viewBoard: withPlanning(tasksOnly(displayBoard, allBeads)) };
-    // BOTH KINDS ON. Same six columns and the same bucketing as before either toggle existed —
-    // only the ORDER within each column changes, so epics read as a band at the top instead of
-    // being scattered among the tasks. See `epicsFirst` for why re-bucketing would be wrong.
-    return { columns: COLUMNS, viewBoard: withPlanning(epicsFirst(displayBoard, allBeads)) };
-  }, [displayBoard, planKinds, allBeads]);
+      return {
+        columns: COLUMNS,
+        viewBoard: ordered(withPlanning(tasksOnly(displayBoard, allBeads))),
+      };
+    // ── BOTH KINDS ON — AND THIS REPLACES `epicsFirst`, WHICH THE COMPARATOR SUBSUMES ──────────
+    // `main` reached this line via `withPlanning(epicsFirst(displayBoard, allBeads))`: every epic
+    // hoisted above every task, in bd's arbitrary order within each group. That is the founder's
+    // ORIGINAL spec, which he then corrected — "we should have p zero epics show first and then
+    // all the p zero tasks and then p one epics would show below that … epics basically show at
+    // the beginning of the priority list" — i.e. INTERLEAVED by priority band, not epics-above-
+    // everything. He was explicit that the hoisting reading survives as ONE option of four:
+    // "Type IS the epics-above-everything behaviour I originally specced — it is one option among
+    // four, not the default."
+    //
+    // So `epicsFirst`'s exact behaviour is preserved as `sortBy: "type"`, and the DEFAULT becomes
+    // the corrected interleave. Keeping both mechanisms would be two answers to one question —
+    // the drift this codebase fights everywhere else — so the call site goes and the comparator
+    // owns board order outright.
+    return { columns: COLUMNS, viewBoard: ordered(withPlanning(displayBoard)) };
+    // `sortBy`/`dateField` are read off `boardFilter` OUTSIDE this memo (see above) so the deps are
+    // the two scalars that actually change the order — depending on `boardFilter` itself would
+    // re-sort the whole board every time the user touched the priority or date-window filter.
+  }, [displayBoard, planKinds, allBeads, sortBy, dateField]);
 
   /**
    * EVERY USER-DRIVEN CONTROL THAT SWAPS A COLUMN'S DATASET, as one string.
@@ -569,7 +605,13 @@ export function BoardView({
   const datasetKey =
     `${planKinds.tasks ? "t" : ""}${planKinds.epics ? "e" : ""}` +
     `|${boardAgentFilter ?? ""}` +
-    `|${filterActive ? JSON.stringify(boardFilter) : ""}`;
+    `|${filterActive ? JSON.stringify(boardFilter) : ""}` +
+    // THE SORT BELONGS HERE TOO, and it is deliberately NOT covered by the line above: a sort
+    // narrows nothing, so `filterActive` is false for a board whose order the user just changed —
+    // and a Done column paged out to 500 cards would then be handed a completely reordered dataset
+    // while keeping the old column's `pages`. `dateField` only participates when a date sort reads
+    // it, so flipping Created/Updated with no window and no date sort does not reset paging.
+    `|${sortBy}${isDateSort(sortBy) ? `:${dateField}` : ""}`;
 
   /**
    * How many cards the PRIORITY/DATE filter removed — and only when it removed all of them.

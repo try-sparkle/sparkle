@@ -13,19 +13,85 @@ export type DateField = "created" | "updated";
 /** The date windows offered. `all` is the off position, not a 100-year window. */
 export type DateWindow = "24h" | "7d" | "30d" | "all";
 
+/**
+ * WHICH ORDER a column's cards are rendered in — the founder's four, verbatim from his spec.
+ *
+ * ══ THERE WAS NO SORT AT ALL BEFORE THIS ══════════════════════════════════════════════════════
+ * `bucketBeads` pushes each bead into a column in INPUT ORDER and `BoardView` renders that order
+ * verbatim. The P0-first board the founder sees is `bd`'s own default output leaking through:
+ * measured against a 7,779-row store, priorities are non-decreasing with ZERO inversions, but
+ * WITHIN a band the order is arbitrary — `updated_at` is neither ascending nor descending. So the
+ * ordering he likes was real and completely UNDEFENDED: nothing here went red if bd changed its
+ * default. These comparators own the priority ordering outright rather than inheriting it.
+ *
+ *   - `priority` — P0 epics, P0 tasks, P1 epics, P1 tasks, … The DEFAULT, and the founder's words:
+ *     "we should have p zero epics show first and then all the p zero tasks and then p one epics
+ *     would show below that. Each column … So epics basically show at the beginning of the
+ *     priority list." Note this is NOT epics-above-everything — it INTERLEAVES by priority band.
+ *   - `type` — every epic first (in priority order), then every task (in priority order). This is
+ *     the epics-above-everything reading, offered as ONE option rather than as the default.
+ *   - `newest` / `oldest` — by date, and by date alone. See {@link isDateSort}.
+ */
+export type BoardSort = "priority" | "type" | "newest" | "oldest";
+
+/** The founder's own wording for each option, used by the chip menu so the control and this
+ *  module cannot drift into describing the order two different ways. */
+export const SORT_LABEL: Record<BoardSort, string> = {
+  priority: "Priority (P0 at top; Epics before Tasks)",
+  type: "Type (All Epics, then Tasks; In priority order)",
+  newest: "Date: Newest First",
+  oldest: "Date: Oldest First",
+};
+
+/** The short form for the collapsed chip — the menu row above is a sentence, and a sentence does
+ *  not fit on a chip beside three others. Prefixed "Sort:" because the board already has a
+ *  PRIORITY chip that filters, and a bare "Priority" on two adjacent chips means two things. */
+export const SORT_CHIP_LABEL: Record<BoardSort, string> = {
+  priority: "Sort: Priority",
+  type: "Sort: Type",
+  newest: "Sort: Newest",
+  oldest: "Sort: Oldest",
+};
+
+/** The options in menu order, DERIVED from the labels above rather than written out a second time
+ *  — two hand-maintained copies of one list is how a menu ends up offering an order nothing
+ *  implements. */
+export const SORT_OPTIONS: readonly BoardSort[] = ["priority", "type", "newest", "oldest"];
+
+/**
+ * Does this sort read a TIMESTAMP, and therefore care which of created/updated is selected?
+ *
+ * The founder's call: the date sorts follow the existing Created/Updated chip rather than pinning
+ * their own field, so the header holds ONE date concept instead of two that can disagree. The
+ * consequence is that the chip has to be REACHABLE whenever a date sort is on — it used to appear
+ * only once a date window was chosen, which would have left "Date: Newest First" silently ordering
+ * by a field the user could not see or change.
+ */
+export function isDateSort(s: BoardSort): boolean {
+  return s === "newest" || s === "oldest";
+}
+
 export interface BoardFilter {
   /** A bd priority 0-4, or null for "any priority". */
   priority: number | null;
   dateField: DateField;
   dateWindow: DateWindow;
+  /** WHICH ORDER, not which beads. Deliberately part of this object rather than a store key of its
+   *  own: it is per-side, it lives on the same chip row, and the date sorts read `dateField`, so
+   *  splitting them would put two halves of one control in two places. */
+  sortBy: BoardSort;
 }
 
 /** The off position for every axis. `updated` is the default field: "what has been touched lately"
- *  is the question a board answers, and created-at buries long-running work that is still moving. */
+ *  is the question a board answers, and created-at buries long-running work that is still moving.
+ *
+ *  `sortBy` is the ONE field here whose default is not an off position — there is no "unsorted".
+ *  `priority` is the founder's specified default order. */
 export const NO_BOARD_FILTER: BoardFilter = {
   priority: null,
   dateField: "updated",
   dateWindow: "all",
+  sortBy: "priority",
 };
 
 const WINDOW_MS: Record<Exclude<DateWindow, "all">, number> = {
@@ -84,7 +150,24 @@ export const FILTERABLE_PRIORITIES = [0, 1, 2, 3, 4] as const;
 /** Is anything actually narrowed? Drives whether the board shows a "filtered" banner at all — an
  *  inert filter must not put a banner on screen claiming the board is narrowed when it is not. */
 export function boardFilterIsActive(f: BoardFilter): boolean {
+  // `sortBy` IS DELIBERATELY NOT PART OF THIS. A sort hides nothing, so counting it as "active"
+  // would put a "cards are hidden by your filter" banner and a Clear button on screen for a board
+  // that shows every card it always did — and would route the whole board through the filtering
+  // pass in BoardView for no reason. Reordering is not narrowing.
   return f.priority !== null || f.dateWindow !== "all";
+}
+
+/**
+ * The filter, cleared — but keeping the order the user chose.
+ *
+ * Clear says "Clear FILTERS", and a sort is not a filter: resetting it would silently throw away a
+ * choice the button does not name. `dateField` is kept for the same reason and it is now
+ * load-bearing rather than cosmetic — with a date sort on it decides the ORDER, so resetting it
+ * would reverse the board out from under a button labelled Clear. Keeping it changes nothing about
+ * what is filtered: `dateWindow` goes back to "all", which makes the field inert for filtering.
+ */
+export function clearBoardFilter(f: BoardFilter): BoardFilter {
+  return { ...NO_BOARD_FILTER, sortBy: f.sortBy, dateField: f.dateField };
 }
 
 /**
