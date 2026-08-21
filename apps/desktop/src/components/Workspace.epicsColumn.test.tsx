@@ -116,6 +116,7 @@ import { resetVisitedProjects } from "../services/sessionProjects";
 import { resetCable } from "../stores/cableStore";
 import { useBeadsStore } from "../stores/beadsStore";
 import { bucketBeads, type Bead } from "../services/beads";
+import { newEpicGoal } from "../engine/epicGoal";
 import type { AgentTab, Project } from "../types";
 
 function mkAgent(id: string): AgentTab {
@@ -500,5 +501,117 @@ describe("clicking an epic opens its card inline", () => {
     // narrowing lifts with it, because they are the same piece of state.
     expect(document.querySelector('[data-testid="epic-inline-card"]')).toBeNull();
     expect(useUiStore.getState().epicFocusBySide.right).toBeNull();
+  });
+});
+
+// ══ A GOAL ON THE EPIC MUST NOT CHANGE WHAT A CLICK DOES ═══════════════════════════════════════
+//
+// The bug the founder hit live (bead `sparkle-huw924.3`, transcript 01:59-02:33): "looking at an
+// epic we'll open the card, which is good. But if I have given it a goal, it seems like it has a
+// different behavior… instead of opening up the card, it opens up the goal."
+//
+// The mechanism: `EpicRow` is one `<button>`, and the goal painted INSIDE it as a `role="button"`
+// span whose handler called `stopPropagation()` and opened the goal editor. With a goal, that span
+// took `flex: 1 1 auto` and covered most of the row, so most clicks never reached the row. With no
+// goal it was only the words "Set a goal" — a small target — so the same defect was there but
+// rarely hit. Same gesture, different result purely from what data the epic carried.
+//
+// The fix the founder chose when asked ("No goal should show in the row at all"), which the
+// transcript states three times — 02:33 "let's not have the goals showing on the build rows",
+// 04:29 "we're not gonna show the goal in the row… we should, however, be showing the goal in the
+// epic when it's opened up", 14:13 "we're not gonna show 'set a goal' on here" — is to take the
+// goal off the row entirely. The row is then one undivided click target again.
+//
+// ── WHY THE ASSERTION IS "EVERY DESCENDANT", NOT "THE ROW" ────────────────────────────────────
+// `fireEvent.click(row)` dispatches on the `<button>` itself, so it opens the card whether or not
+// anything inside the row swallows clicks — it passed throughout the bug and proves nothing here.
+// A person clicks PIXELS, and every pixel of that row belongs to one of its children. So each
+// descendant is clicked in turn and judged on its own. That is what reds on the old code (the goal
+// span is one of them) and what keeps reding if any future child re-swallows the row's click.
+//
+// The row's other children are read-only by design and must stay that way for this to hold:
+// `BeadPriorityChip` is documented as "no title/click: it is a readout". If item 7 of the epic
+// (a clickable STAGE name) ever lands ON THE ROW rather than on the card, this test is the place
+// that decides what a click on it means — that is the point of it, not a reason to weaken it.
+describe("an epic that HAS a goal opens its card, exactly like one that does not", () => {
+  const GOAL = "Land the epics cockpit the founder asked for";
+  // BOTH CASES MOUNTED AT ONCE, in one stage group. Testing the goal-bearing epic alone could not
+  // tell "the goal broke the click" apart from "clicks are broken for every epic", and testing the
+  // plain one alone is the branch that already worked (AGENTS.md, the N-targets rule).
+  const PAIR: Bead[] = [
+    bead("ep-goal"),
+    bead("ep-goal.a", { status: "in_progress" }),
+    bead("ep-plain"),
+    bead("ep-plain.a", { status: "in_progress" }),
+  ];
+  const rowFor = (id: string) => document.querySelector<HTMLElement>(`[data-epic-id="${id}"]`);
+  const cardUnder = (id: string) => {
+    const next = rowFor(id)?.nextElementSibling;
+    return next instanceof HTMLElement && next.dataset.testid === "epic-inline-card" ? next : null;
+  };
+
+  beforeEach(() => {
+    useBeadsStore.setState({
+      byProject: {
+        p1: { beads: PAIR, board: bucketBeads(PAIR), polledAt: 0 },
+        p2: { beads: PAIR, board: bucketBeads(PAIR), polledAt: 0 },
+      },
+      error: {},
+    } as never);
+    // THE GOAL IS BUILT BY THE REAL CONSTRUCTOR, not hand-assembled. A literal shaped to whatever
+    // the reader happens to check is the fixture that already carries the field under test, and it
+    // makes the premise pass for the wrong reason (AGENTS.md).
+    useProjectStore.setState({
+      projects: [
+        { ...mkProject("p1", "Alpha", [mkAgent("a1")]), epicGoals: { "ep-goal": newEpicGoal(GOAL, 0, "human") } },
+      ],
+      selectedProjectId: "p1",
+    } as never);
+  });
+
+  // THE PREMISE. Without this, every assertion below passes for an epic that simply has no goal —
+  // which is the exact shape of a vacuous test, since "no goal is shown" is trivially true then.
+  it("really does hold a goal for the one epic, and not for the other", () => {
+    const p = useProjectStore.getState().projects.find((x) => x.id === "p1")!;
+    expect(p.epicGoals?.["ep-goal"]?.text).toBe(GOAL);
+    expect(p.epicGoals?.["ep-plain"]).toBeUndefined();
+  });
+
+  it("opens the card for the epic WITH a goal and the one WITHOUT — same gesture, same result", () => {
+    render(<Workspace />);
+    for (const id of ["ep-goal", "ep-plain"]) {
+      fireEvent.click(rowFor(id)!);
+      expect(cardUnder(id)).toBeTruthy();
+      fireEvent.click(rowFor(id)!); // toggles shut, so each epic is judged on its own
+      expect(cardUnder(id)).toBeNull();
+    }
+  });
+
+  it("shows NO goal anywhere in either row — not the text, not the 'Set a goal' placeholder", () => {
+    render(<Workspace />);
+    for (const id of ["ep-goal", "ep-plain"]) {
+      const row = rowFor(id)!;
+      expect(row.querySelector('[data-testid="epic-goal-row"]')).toBeNull();
+      expect(row.querySelector('[data-testid="epic-goal"]')).toBeNull();
+      expect(row.querySelector('[data-testid="epic-goal-empty"]')).toBeNull();
+      expect(row.textContent).not.toContain(GOAL);
+      expect(row.textContent).not.toContain("Set a goal");
+    }
+    // ...and the row still says what it is for. An empty row would satisfy every line above.
+    expect(rowFor("ep-goal")!.textContent).toContain("ep-goal");
+  });
+
+  it("opens the card wherever inside the row the click lands", () => {
+    render(<Workspace />);
+    for (const id of ["ep-goal", "ep-plain"]) {
+      const parts = Array.from(rowFor(id)!.querySelectorAll<HTMLElement>("*"));
+      expect(parts.length).toBeGreaterThan(0); // the premise: there are children to click
+      for (const [i, part] of parts.entries()) {
+        fireEvent.click(part);
+        expect(cardUnder(id), `${id}: click on child #${i} <${part.tagName.toLowerCase()}> did not open the card`).toBeTruthy();
+        fireEvent.click(rowFor(id)!);
+        expect(cardUnder(id)).toBeNull();
+      }
+    }
   });
 });

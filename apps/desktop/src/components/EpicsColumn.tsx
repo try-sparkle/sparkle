@@ -42,7 +42,6 @@ import { FONT_UI, TYPE } from "../theme/scale";
 import { ZOOM_COLUMN_ATTR, zoomColumnFor } from "../engine/columnZoom";
 import { PAIR_COLUMN_ATTR } from "../engine/pairColumns";
 import { ColumnPullTab, HEADER_H, TAB_TOP } from "./ColumnPullTab";
-import { EpicGoalRowForEpic } from "./EpicGoalRow";
 import { HeaderLink } from "./HeaderLink";
 import { EpicInlineCard } from "./EpicInlineCard";
 // REUSED, never re-derived. This is the same read-only chip the board cards wear
@@ -665,16 +664,45 @@ function EpicRow({
           title is already ellipsised at `flex: 1` in a 280px column, so a long epic name truncates
           slightly sooner. That is the trade the founder asked for. */}
       <BeadPriorityChip priority={epic.priority} testId="epic-row-priority" />
-      {/* ── BOTH SIDES OF A MERGE, AND THE ORDER IS THE FOUNDER'S ────────────────────────────────
-          `main` added `EpicGoalRowForEpic` (PR #2244, epic-goal laddering) at exactly this
-          insertion point while this branch was adding the chiclet. Neither replaces the other, so
-          both are kept.
+      {/* ── THE GOAL IS NOT ON THE ROW, AND ITS ABSENCE IS THE FIX ──────────────────────────────
+          `EpicGoalRowForEpic` (PR #2244) used to mount here, between the chiclet and the count.
+          It is gone, and this comment stands in its place because putting it back would restore a
+          bug the founder hit live (`sparkle-huw924.3`).
 
-          THE CHICLET GOES FIRST because the founder placed it against the NAME, not against the
-          count: "a little priority chicklet pill to the right of the epic name, before the count
-          like, the 9/10". Putting the goal row first would satisfy "before the count" while
-          breaking "to the right of the epic name", which is the half that names an anchor. */}
-      <EpicGoalRowForEpic epicId={epic.id} beads={allBeads} />
+          WHY IT BROKE THE CLICK. This row is ONE `<button>`, and the goal painted inside it as a
+          `role="button"` span that called `stopPropagation()` to open the goal editor. With a goal
+          set, that span took `flex: 1 1 auto` and covered most of the row, so most clicks never
+          reached the row at all: "instead of opening up the card, it opens up the goal". With no
+          goal it was only the words "Set a goal", a target too small to hit often — so the SAME
+          defect looked like two different behaviours decided by what data the epic carried.
+
+          WHY REMOVAL RATHER THAN A QUIETER TRIGGER. Asked which he wanted, the founder said "no
+          goal should show in the row at all", and the interview says it three times: 02:33 "let's
+          not have the goals showing on the build rows", 04:29 "we're not gonna show the goal in the
+          row... we should, however, be showing the goal in the epic when it's opened up", 14:13
+          "we're not gonna show 'set a goal' on here". The row is the epic's NAME; the goal belongs
+          to the opened card.
+
+          THE COMPONENT IS NOT DELETED. `EpicGoalRow` keeps its editor, validation, portal and
+          suite, because the card is where it is going next (item 12 of `sparkle-huw924`, bead
+          `sparkle-huw924.4`).
+
+          BUT UNTIL THAT LANDS, THE EPIC GOAL IS LIVE STATE WITH NO SURFACE — and that is a wider
+          gap than "you cannot edit it" (roborev 66336). The goal is not a readout: it is an INPUT
+          TO DISPATCH. `workerSpawn.ladderGoalFor` injects its text into every spawned worker's
+          goal, and `sendToBuild.epicGoalLadder` pastes it verbatim into the handoff prompt ("THIS
+          TASK LADDERS UP TO EPIC …, whose goal, verbatim, is:"). `conciergeTools/plans.ts`
+          auto-generates it at epic creation. So a wrong or stale auto-written goal now steers
+          every dispatch under that epic while being readable nowhere in the app, and the only way
+          back is asking the concierge to regenerate. THIS ROW IS NOT THE PLACE TO FIX THAT — the
+          founder ruled the goal off the row three times — so the fix is to land the card field,
+          not to re-mount here.
+
+          IF YOU MOUNT ANYTHING CLICKABLE HERE, read `Workspace.epicsColumn.test.tsx`'s "opens the
+          card wherever inside the row the click lands" first. It clicks every descendant of this
+          row in turn, so a child that swallows the row's click reds immediately — which is exactly
+          what the goal span did. `BeadPriorityChip` above is safe because it is a readout with no
+          handler, by its own documented design. */}
       {total > 0 && (
         <span data-testid="epic-row-children" style={{ flex: "0 0 auto", color: C.muted }}>
           {open}/{total}

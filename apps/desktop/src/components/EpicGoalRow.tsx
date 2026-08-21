@@ -531,6 +531,14 @@ export function EpicGoalRowForEpic({ epicId, beads }: { epicId: string; beads: r
       goal={project.epicGoals?.[epicId]}
       rollup={rollup}
       onSetGoal={(text, source) => setEpicGoal(projectId, epicId, text, source)}
+      // NOT CURRENTLY MOUNTED ANYWHERE. This wrapper's only call site was `EpicsColumn`'s
+      // `EpicRow`, and that mount was removed (bead `sparkle-huw924.3`) because the goal was
+      // swallowing the click that opens the epic card. Everything below still describes what this
+      // button does and why it must exist — it is re-mounted on the epic CARD by bead
+      // `sparkle-huw924.4` — but until then a failed generation has NO way back in the UI at all,
+      // which is strictly worse than what this paragraph was written to prevent. Do not read the
+      // next sentence as a description of shipped behaviour.
+      //
       // THE ONLY SHIPPED WAY BACK FROM A FAILED GENERATION (roborev 65858). Every failure —
       // including a purely transient one: the provider down, a rate limit, the 25s timeout, a `bd`
       // read that lost the Dolt lock — records `generationFailedAt`, and `mayAutoGenerate` then

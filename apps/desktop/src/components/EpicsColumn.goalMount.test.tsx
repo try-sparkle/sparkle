@@ -1,23 +1,44 @@
 // @vitest-environment jsdom
 //
-// DOES THE EPIC GOAL ACTUALLY REACH THE SCREEN?
+// WHERE THE EPIC GOAL IS ALLOWED TO REACH THE SCREEN — and the epic ROW is not it.
 //
-// The whole epic-goal feature (bead `sparkle-wab4lm`) hangs off ONE line in `EpicsColumn` — the
-// `<EpicGoalRowForEpic …/>` mount inside `EpicRow`, plus its import. Everything else is covered:
-// `EpicGoalRow.test.tsx` drives the presentational component with injected props,
-// `EpicGoalRow.container.test.tsx` renders the connected wrapper directly, and
-// `epicLadder.composed.test.ts` is engine-level. NONE of them renders `EpicsColumn`.
+// ══ THIS FILE WAS INVERTED, NOT WEAKENED (bead `sparkle-huw924.3`) ═════════════════════════════
+// It landed (PR #2251, bead `sparkle-wab4lm`) asserting that `<EpicGoalRowForEpic …/>` IS mounted
+// inside `EpicRow`, because that one line was the whole epic-goal feature and nothing rendered
+// `EpicsColumn` to prove it survived a merge. That reasoning was right and is kept below — what
+// changed is the ANSWER, not the question.
 //
-// So the mount site itself was asserted by nothing, and that is not a theoretical gap: those two
-// lines sat in a merge conflict when the Epics-cockpit work restructured this file (roborev 65899).
-// Had the hand resolution dropped them — the exact failure a hand-resolved conflict produces — the
-// entire feature would have vanished from the app with the whole suite still green, and a
-// mutation-check on the wrapper cannot see it, because the wrapper would still be perfectly correct
-// and simply never rendered.
+// The founder hit the mount as a BUG in the 2026-08-20 self-interview: the row is one `<button>`
+// and the goal painted inside it as a `role="button"` span calling `stopPropagation()`, so an epic
+// WITH a goal opened the GOAL and one WITHOUT opened the CARD — the same gesture giving two results
+// purely from what data the epic carried. He ruled the goal off the row three times (02:33 "let's
+// not have the goals showing on the build rows"; 04:29 "we're not gonna show the goal in the row…
+// we should, however, be showing the goal in the epic when it's opened up"; 14:13 "we're not gonna
+// show 'set a goal' on here") and answered "No goal should show in the row at all" when asked
+// directly. So the mount is gone, and a guard demanding it back would pin the defect.
 //
-// This file is the guard for that one inch. Delete the mount line and it goes red.
+// ══ WHAT IT GUARDS NOW ════════════════════════════════════════════════════════════════════════
+// The same one inch, from the other side: NO goal-bearing element is mounted in the epics column,
+// and — this is the half that gives it force — that is true even for an epic whose store REALLY
+// HOLDS a goal. Re-add the mount and this file goes red, which is exactly what should happen until
+// the goal is re-mounted where it belongs.
+//
+// ══ THE ABSENCE TRAP THIS FILE'S ORIGINAL AUTHOR WARNED ABOUT, NOW LOAD-BEARING ════════════════
+// Their `seed()` docstring flagged it: the connected wrapper resolves its project by REFERENCE
+// IDENTITY against `beadsStore.byProject[id].beads`, so a COPY resolves to no project and the row
+// renders nothing — which would make an absence assertion pass for the wrong reason. Now that the
+// assertions ARE absence assertions, that is no longer a footnote, so every case here pairs the
+// absence with a POSITIVE CONTROL: the epic row itself must be on screen, and the store must
+// actually hold the goal. Absence beside a column that rendered nothing proves nothing at all
+// (AGENTS.md, the "N targets" rule).
+//
+// ══ WHERE THE GOAL IS GOING ═══════════════════════════════════════════════════════════════════
+// Onto the opened epic CARD, as an editable field (item 12 of `sparkle-huw924`, bead
+// `sparkle-huw924.4`). `EpicGoalRowForEpic` is intact and unmounted for exactly that reason, and
+// its container suite is kept green so the re-mount is safe. When that lands, the right move is to
+// ADD the card-side mount guard here — the original argument, re-aimed — not to delete this file.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, render, screen, within } from "@testing-library/react";
+import { cleanup, render, screen } from "@testing-library/react";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: () => Promise.resolve(null) }));
 
@@ -44,10 +65,10 @@ function bead(id: string, over: Partial<Bead> = {}): Bead {
 
 /** Seed the bead snapshot AND a matching project.
  *
- *  ⚠️ The connected wrapper resolves its project by REFERENCE IDENTITY against
- *  `beadsStore.byProject[id].beads`, so the array handed to the column has to be the very one in
- *  the store — a copy resolves to no project and the row renders nothing, which would make this
- *  test pass for the wrong reason if it asserted absence. */
+ *  THE ARRAY HANDED TO THE COLUMN MUST BE THE VERY ONE IN THE STORE. The connected wrapper resolves
+ *  its project by REFERENCE IDENTITY against `beadsStore.byProject[id].beads`; a copy resolves to no
+ *  project and renders nothing. Carried over verbatim from this file's original author, and it
+ *  matters MORE now than it did then — see the header. */
 function seed(beads: Bead[], project: Project = PROJECT) {
   useBeadsStore.setState((prev) => ({
     ...prev,
@@ -59,6 +80,9 @@ function seed(beads: Bead[], project: Project = PROJECT) {
   }) as never);
   useProjectStore.setState({ projects: [project] } as never);
 }
+
+/** Every testid the goal has ever painted under, so a rename cannot quietly re-admit it. */
+const GOAL_TESTIDS = ["epic-goal-row", "epic-goal", "epic-goal-empty", "epic-goal-input"] as const;
 
 beforeEach(() => {
   // Neutralise the poller, not the data — a real one shells out to `bd` and would clobber the
@@ -72,56 +96,54 @@ afterEach(() => {
   localStorage.clear();
 });
 
-describe("the epic goal is mounted on the epic's row", () => {
-  it("renders the goal row INSIDE the epic's row button, keyed to that epic", () => {
-    const beads = [bead("ep-1")];
-    seed(beads);
-    render(<EpicsColumn project={PROJECT} side="right" />);
-
-    // ⚠️ CONTAINMENT, not just existence (roborev 65967). A global `screen` query is satisfied
-    // wherever in the column the mount lives, so asserting only the testid and the count left the
-    // most plausible bad merge resolution unguarded: hoisting `<EpicGoalRowForEpic/>` out of
-    // `EpicRow`'s <button> into a per-epic sibling keeps the id and the count correct while
-    // breaking the design contract. `EpicGoalRow.tsx`'s own header explains why that matters — the
-    // row is built from inline <span>s with stopPropagation PRECISELY because it lives inside the
-    // epic row's button; outside it, the goal paints on its own line and the click-swallow contract
-    // is moot. This suite exists to survive a hand-resolved conflict in this file, so the
-    // resolution that MISPLACES the mount is squarely in scope.
-    const epicRow = screen.getByTestId("epic-row");
-    const goalRow = screen.getByTestId("epic-goal-row");
-    expect(epicRow.contains(goalRow)).toBe(true);
-    expect(goalRow.getAttribute("data-epic-id")).toBe("ep-1");
-  });
-
-  it("shows the goal TEXT the store holds, not just an empty affordance", () => {
-    // The end-to-end claim the feature exists for: a goal written anywhere reaches the column.
+describe("the epic goal is NOT mounted on the epic's row", () => {
+  it("renders no goal for an epic that HAS one — the case that used to swallow the click", () => {
     const beads = [bead("ep-1")];
     seed(beads);
     useProjectStore.getState().setEpicGoal("p1", "ep-1", GOAL, "human");
     render(<EpicsColumn project={PROJECT} side="right" />);
 
-    expect(screen.getByTestId("epic-goal").textContent).toBe(GOAL);
+    // POSITIVE CONTROLS FIRST. Without both of these the absence below is worthless: it would hold
+    // just as well for a column that rendered nothing, or for an epic that never had a goal.
+    expect(screen.getByTestId("epic-row").getAttribute("data-epic-id")).toBe("ep-1");
+    expect(useProjectStore.getState().projects[0]!.epicGoals?.["ep-1"]?.text).toBe(GOAL);
+
+    for (const id of GOAL_TESTIDS) expect(screen.queryByTestId(id)).toBeNull();
+    // ...and not merely unlabelled: the words themselves are off the row.
+    expect(screen.getByTestId("epic-row").textContent).not.toContain(GOAL);
   });
 
-  it("mounts ONE goal row per epic, each keyed to its own", () => {
-    // The paired direction: a mount hoisted out of `EpicRow` would render one row for the column
-    // rather than one per epic, and the single-epic test above could not tell the difference.
-    const beads = [bead("ep-1"), bead("ep-2")];
+  it("offers no 'Set a goal' affordance for an epic that has none", () => {
+    // The founder, 14:13: "we're not gonna show 'set a goal' on here." The empty-state placeholder
+    // was the other half of the same defect — a smaller click target, the identical swallow.
+    const beads = [bead("ep-1")];
     seed(beads);
     render(<EpicsColumn project={PROJECT} side="right" />);
 
-    // Each goal row must sit inside ITS OWN epic's button — the per-epic-sibling hoist produces the
-    // right ids and the right count and would pass an id-only assertion.
-    const pairs = screen
+    expect(screen.getByTestId("epic-row").getAttribute("data-epic-id")).toBe("ep-1"); // control
+    expect(useProjectStore.getState().projects[0]!.epicGoals?.["ep-1"]).toBeUndefined();
+
+    for (const id of GOAL_TESTIDS) expect(screen.queryByTestId(id)).toBeNull();
+    expect(screen.getByTestId("epic-row").textContent).not.toContain("Set a goal");
+  });
+
+  it("holds for EVERY epic in the column, not just the first", () => {
+    // The paired direction, kept from the original: a mount hoisted out of `EpicRow` would render
+    // one row for the whole column rather than one per epic, and a single-epic case could not tell
+    // the difference. Both epics are mounted at once and one of them carries a goal, so neither
+    // "no epics rendered" nor "no goals exist" can explain the absence.
+    const beads = [bead("ep-1"), bead("ep-2")];
+    seed(beads);
+    useProjectStore.getState().setEpicGoal("p1", "ep-2", GOAL, "human");
+    render(<EpicsColumn project={PROJECT} side="right" />);
+
+    const rowIds = screen
       .queryAllByTestId("epic-row")
-      .map((r) => [
-        r.getAttribute("data-epic-id"),
-        within(r).queryByTestId("epic-goal-row")?.getAttribute("data-epic-id") ?? null,
-      ])
+      .map((r) => r.getAttribute("data-epic-id"))
       .sort();
-    expect(pairs).toEqual([
-      ["ep-1", "ep-1"],
-      ["ep-2", "ep-2"],
-    ]);
+    expect(rowIds).toEqual(["ep-1", "ep-2"]); // control: both really are on screen
+    expect(useProjectStore.getState().projects[0]!.epicGoals?.["ep-2"]?.text).toBe(GOAL);
+
+    for (const id of GOAL_TESTIDS) expect(screen.queryAllByTestId(id)).toEqual([]);
   });
 });

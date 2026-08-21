@@ -1,7 +1,15 @@
 // @vitest-environment jsdom
 //
-// THE PRODUCTION SEAM — `EpicGoalRowForEpic`, the connected wrapper the Epics column actually
-// mounts. `EpicGoalRow.test.tsx` drives the presentational component with its own injected props,
+// THE PRODUCTION SEAM — `EpicGoalRowForEpic`, the connected wrapper that supplies the real props.
+//
+// IT IS MOUNTED NOWHERE RIGHT NOW. It used to mount in `EpicsColumn`'s `EpicRow`; that mount was
+// removed (bead `sparkle-huw924.3`) because the goal swallowed the click that opens the epic card,
+// and the goal moves to the CARD in bead `sparkle-huw924.4`. So this suite currently guards a seam
+// with no production call site — deliberately kept green rather than deleted, because the wrapper
+// is what the card will mount and its coverage is the thing that makes that re-mount safe. Do not
+// read a pass here as evidence that anything renders in the app today.
+//
+// `EpicGoalRow.test.tsx` drives the presentational component with its own injected props,
 // which leaves the lines that SUPPLY those props covered by nothing: delete the whole `onGenerate`
 // block and that suite stays green while the button — the only shipped way back from a failed
 // generation — silently stops rendering, because it is gated on `onGenerate !== undefined`
