@@ -32,10 +32,12 @@ import { FONT_MONO, FONT_UI, RADIUS, TYPE } from "../../theme/scale";
 import { severityOf, type Bead } from "../../services/beads";
 import type { BeadComment } from "../../services/beadsCommands";
 import type { WorkflowStageId } from "../../engine/workflowStage";
+import type { EpicGoal, EpicGoalSource } from "../../engine/epicGoal";
 import type { EpicLadderKey } from "../../services/epicBoard";
 import { PriorityPill } from "./PriorityPill";
 import { BeadSeverityBadge } from "./BeadSeverityBadge";
 import { CommentThread } from "./CommentThread";
+import { EpicCardGoal } from "./EpicCardGoal";
 import { StageLine } from "./StageLine";
 import { stageLabel, statusDot } from "./beadStatus";
 
@@ -134,6 +136,18 @@ export interface BeadCardProps {
   /** Post a comment. Like every other callback here, its PRESENCE is the switch for the compose box:
    *  a surface that cannot write (no project path) passes nothing and shows a read-only thread. */
   onComment?: (text: string) => Promise<void>;
+  /**
+   * THE EPIC'S GOAL. Callback-is-the-switch, exactly like `onChat` and `onComment` above: a surface
+   * that cannot write a goal — or a bead that is not an epic — passes nothing and the field is not
+   * drawn at all.
+   *
+   * THIS DOES NOT BREAK THE "chrome NEVER CHANGES WHAT IS SHOWN" RULE at the top of this file. The
+   * switch is a PROP THE CALLER SUPPLIES, not a branch on `chrome` — the board's epic overlay can
+   * pass it and get the identical field. What must never happen is this component deciding, from
+   * the surface it is on, that an epic's goal is worth showing here and not there.
+   */
+  goal?: EpicGoal;
+  onSetGoal?: (text: string, source: EpicGoalSource) => void | Promise<void>;
   /** A sentence the caller wants under the controls — today, "that board could not be opened". */
   notice?: string;
   /** Bumped by the caller so a REPEAT of the same notice re-registers as a live-region update
@@ -159,6 +173,8 @@ function Field({ label, children }: { label: string; children: ReactNode }) {
 export function BeadCard({
   bead,
   chrome,
+  goal,
+  onSetGoal,
   stage,
   placedIn,
   workers,
@@ -411,6 +427,18 @@ export function BeadCard({
           </button>
         )}
       </span>
+
+      {/* ── THE GOAL ───────────────────────────────────────────────────────────────────────────
+          DIRECTLY UNDER THE TITLE, which is where the founder put it: [05:44] "the title is gonna
+          go down one row… and then where the bead name currently is right now, we would have the
+          goal." The title moves down as the id and the chat button take the top-right corner
+          (bead sparkle-huw924.5), and the goal takes the line beneath it.
+
+          ABOVE THE ID, not below, so the two things a person reads about an epic — what it is
+          called and what it is FOR — are adjacent. The id is a handle you copy, not prose. */}
+      {onSetGoal !== undefined && (
+        <EpicCardGoal goal={goal} onSetGoal={onSetGoal} testId={t} />
+      )}
 
       {/* ── THE ID ─────────────────────────────────────────────────────────────────────────────
           Mono, because a bead id is what the founder types, greps and asks other agents about. The

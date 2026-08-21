@@ -141,6 +141,20 @@ export function inferEpicVerify(text: string): GoalVerify | undefined {
  * treat a refusal from the generator as a FAILURE (no goal written), never as something to save
  * anyway — an empty field is honest, a bad one is worse than nothing.
  */
+/**
+ * The goal text, normalised the way {@link newEpicGoal} normalises it, so an edit that changes only
+ * whitespace is recognised as a no-op instead of costing a write and a poll round-trip.
+ *
+ * CANONICAL, and it lives beside {@link epicGoalTextRejection} because the two have to agree: the
+ * rejection measures `trim().replace(/\s+/g, " ")` and then something else writes a DIFFERENT
+ * string, which is how a value passes validation at one length and is stored at another.
+ * `EpicGoalRow.tsx` still carries a private copy of this; it is byte-identical and should be
+ * replaced by this import once PR #2285 (which is editing that file right now) has landed.
+ */
+export function normalizeEpicGoalText(text: string): string {
+  return text.trim().replace(/\s+/g, " ");
+}
+
 export function epicGoalTextRejection(text: string): string | null {
   const trimmed = text.trim().replace(/\s+/g, " ");
   if (trimmed.length === 0) return "empty";

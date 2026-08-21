@@ -25,7 +25,7 @@ import { useShallow } from "zustand/react/shallow";
 import { BeadCard } from "./BeadCard/BeadCard";
 import { beadsComment, beadsDetail, type BeadComment } from "../services/beadsCommands";
 import { beadStage, workersInEpic } from "../services/planView";
-import { DELIVERED_LABEL, type Bead } from "../services/beads";
+import { DELIVERED_LABEL, isEpic, type Bead } from "../services/beads";
 import { setBeadPriority } from "./BeadCard/beadPriority";
 import { useBeadBuildActions } from "./BeadCard/useBeadBuildActions";
 import { useProjectStore } from "../stores/projectStore";
@@ -53,6 +53,12 @@ export function EpicInlineCard({
   const agents = useProjectStore(
     (s) => s.projects.find((p) => p.id === projectId)?.agents ?? NO_AGENTS,
   );
+  // THE GOAL, READ AND WRITTEN THROUGH THE SAME STORE `EpicGoalRow` USES. Two surfaces reading one
+  // record, not two records — `setEpicGoal` is the only writer either of them has.
+  const goal = useProjectStore(
+    (s) => s.projects.find((p) => p.id === projectId)?.epicGoals?.[bead.id],
+  );
+  const setEpicGoal = useProjectStore((s) => s.setEpicGoal);
   const workerIds = agents.filter((a) => a.kind === "worker" && a.beadId === bead.id).map((a) => a.id);
   // ONLY this bead's workers' stages, shallow-compared — the same narrowing the concierge card uses,
   // so a stage tick on an unrelated agent does not repaint the open card on every poll.
@@ -61,6 +67,28 @@ export function EpicInlineCard({
   );
   const stage = beadStage(bead.status, bead.labels.includes(DELIVERED_LABEL), workerStages);
   const build = useBeadBuildActions({ bead, projectId, allBeads });
+
+  // EPIC-NESS COMES FROM `isEpic`, NEVER FROM A TYPE-FIELD EQUALITY TEST WRITTEN OUT HERE. That
+  // predicate has one owner (`services/beads.ts`) and `scripts/lib/epic-membership-guard.sh` fails
+  // CI on a second copy — which is exactly what the two inline type tests here were, and they
+  // reddened `Node — shell` on this branch's first commit.
+  //
+  // The forbidden comparison is DESCRIBED rather than quoted, on purpose: the guard's pattern is
+  // deliberately broad and does not skip comment lines, so writing the literal out — even inside a
+  // sentence telling you not to write it — reds the guard. It did, one edit ago. Same convention as
+  // `services/planView.ts` and as `EpicsColumn.tsx` for the label-treatment ratchet. Do not
+  // "restore" the example.
+  //
+  // IT IS ALSO THE WRONG ANSWER, not merely a duplicated one. `isEpic` is `isTypedEpic(bead) ||
+  // has children`: structure first, because `issue_type` is a label someone did or did not remember
+  // to set while a parent edge is a fact another bead asserted. A raw type test therefore denies the
+  // goal field to every epic that was never typed but has children — and those render in this very
+  // column, so the card would show no goal on a card the Epics column had already called an epic.
+  //
+  // Computed ONCE rather than at each of the two props below: `isEpic` walks the memoised epic index
+  // per call, and two identical reads per render is the shape that later drifts into two different
+  // answers.
+  const beadIsEpic = isEpic(allBeads, bead);
 
   // ── THE COMMENT THREAD, READ PER-OPEN ───────────────────────────────────────────────────────
   // `beads_detail` carries `--include-comments`, and this effect runs when a card is OPENED rather
@@ -103,6 +131,22 @@ export function EpicInlineCard({
         // the column's list, so an uncapped description would push the whole ladder off screen.
         descMaxHeight={160}
         onClose={onClose}
+        // ONLY FOR AN EPIC, and gated on being able to WRITE. `canWrite` is the same `rootPath`
+        // test every other control here takes: a card with no project path shows a read-only bead
+        // rather than a field whose save can only fail.
+        //
+        // WHY THIS MATTERS RIGHT NOW: PR #2285 removes the goal from the epic ROW, which was its
+        // only editing surface anywhere in the app — and the epic goal is not a readout. It is a
+        // live input to dispatch (`workerSpawn.ladderGoalFor` injects it into every spawned
+        // worker's goal; `sendToBuild.epicGoalLadder` pastes it verbatim into the build handoff).
+        // Until this field exists, an auto-written goal steers real work with nothing able to
+        // correct it.
+        goal={beadIsEpic ? goal : undefined}
+        onSetGoal={
+          canWrite && beadIsEpic
+            ? (text, source) => setEpicGoal(projectId, bead.id, text, source)
+            : undefined
+        }
         onSetPriority={canWrite ? (p) => setBeadPriority(rootPath, bead.id, p) : undefined}
         onBuildIt={canWrite ? (build.buildIt ?? undefined) : undefined}
         onBuildAllPrd={canWrite ? (build.buildAllPrd ?? undefined) : undefined}
