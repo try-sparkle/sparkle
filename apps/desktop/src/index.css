@@ -60,6 +60,9 @@
   --c-muted: #8ba3c8;
   --c-agent-idle: #8ba3c8;
   --c-cream: #dce8fc;
+  /* Same value as --c-cream on purpose. A separate token so a row that re-inks its
+     subtree can move prose without moving a clickable pill's label. See C.pillInk. */
+  --c-pill-ink: #dce8fc;
   --c-hairline: #24406a;
   --c-pill-fill: #21395c;
   --c-chat-bubble: #14294a;
@@ -99,6 +102,7 @@
   --c-muted: #4f6284;
   --c-agent-idle: #4f6284;
   --c-cream: #0a1b33;
+  --c-pill-ink: #0a1b33;
   --c-hairline: #c3d1e6;
   --c-pill-fill: #cbd8ea;
   --c-chat-bubble: #e8f0fd;

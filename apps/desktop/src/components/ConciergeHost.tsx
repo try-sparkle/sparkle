@@ -2097,72 +2097,6 @@ export function ConciergeHost({
     onAnnounce: announce,
   });
 
-  /** A pill in one of the concierge's OWN replies was clicked: reveal that agent.
-   *
-   *  Stable identity (no deps) because it feeds a context value — a fresh closure per render would
-   *  invalidate that context every render and re-render every pill in the thread, defeating the
-   *  point of memoizing it. `openProjectTab` reads the stores itself, so nothing needs closing over.
-   *
-   *  Unlike a MENTION SEND, this is a pure navigation: no intent is armed, no countdown runs, and
-   *  nothing is written to a PTY. Revealing an agent is reversible in a way a delivery is not, so
-   *  it needs no gate. */
-  const openAgentFromPill = useCallback(
-    ({
-      agentId,
-      projectId,
-      anchorY,
-    }: {
-      agentId: string;
-      projectId: string;
-      anchorY?: number;
-    }) => {
-      // Destructured by NAME on both sides, so the order flip into `openProjectTab(projectId,
-      // agentId)` — two strings, silently swappable — cannot happen here (roborev 54894).
-      // ASK FIRST, THEN ACT. `openProjectTab` reports the miss only AFTER it has opened and
-      // selected the project (and possibly dropped the Sparkle pane), so calling it blind would
-      // yank the reader to another tab and then tell them the click accomplished nothing — a
-      // notice that contradicts what just happened on screen (roborev 55548). Checking up front is
-      // also the established pattern for this exact decision (paletteJump, useAttentionNotifications).
-      //
-      // IT ALSO HAS TO BE ASKED FIRST, not merely SHOULD (bead sparkle-ixsb3). The question is no
-      // longer just "is it there" but "would revealing it CHANGE anything", and that one is
-      // unanswerable afterwards: every write on the reveal path is idempotent, so once it has run,
-      // "the tab was already selected" and "I just selected it" look identical from the store. The
-      // prediction has to be taken before the writes collapse the difference. `revealOutcomeFor`
-      // subsumes the `agentExists` check this line used to make — a missing agent is `"gone"`.
-      const planned = revealOutcomeFor(projectId, agentId);
-      if (planned === "gone") return "gone";
-      // RETURNED, not discarded: both of that path's early exits are silent, and the pill turns a
-      // `"gone"` into "…is closed" rather than leaving the reader looking at an unchanged screen.
-      const landed = openProjectTab(projectId, agentId);
-      // SELECTING IS NOT FINDING. `openProjectTab` selects the agent — which highlights its row and
-      // opens its pane — but the builder column is longer than a screen, so the row that answered
-      // the click can be anywhere in it, including off screen. The reader who just clicked then has
-      // to hunt for the thing they asked for, which is the half of "the pill works" that was
-      // missing.
-      //
-      // Asked for ONLY on a landed open: a reveal for an agent that did not open would scroll the
-      // column toward a row that is not going to be there.
-      //
-      // The anchor rides along so the row comes to the CURSOR (see components/anchoredScroll). A
-      // keyboard activation sends no anchor and keeps the old get-it-on-screen behaviour.
-      if (landed) useUiStore.getState().requestRevealAgent(agentId, { anchorY });
-      // THE PREDICTION IS ONLY TRUSTED ONCE THE ATTEMPT AGREES WITH IT. `landed === false` means the
-      // agent went away between the read above and the write — the race this path has always had to
-      // believe the OUTCOME over the roster for — and it outranks a `"already-showing"` prediction
-      // taken a microtask earlier.
-      //
-      // `requestRevealAgent` above is deliberately NOT counted as "something moved". It scrolls the
-      // agent's row into view in ITS OWN column's sidebar, which is (a) nothing at all when the row
-      // is already on screen, and (b) on the other pair entirely from the reader whenever the pill's
-      // project is not the one they are watching. Treating it as a visible result is exactly the
-      // over-claim that let this click be invisible.
-      if (!landed) return "gone";
-      return planned;
-    },
-    [],
-  );
-
   /**
    * The destination that replaces a dead pill: a closed agent's PROMPTS outlive the agent.
    *
@@ -3814,9 +3748,15 @@ export function ConciergeHost({
    * for them left a `done` agent undrawn while the caller announced it was already open.
    */
   const revealAgent = useCallback((a: ConciergeAgent): RevealOutcome => {
-    // TAKEN FIRST, before anything below writes. Same reason `openAgentFromPill` takes it first:
-    // every write on this path is idempotent, so afterwards "it was already like that" and "I just
-    // made it so" are indistinguishable from the store (bead sparkle-ixsb3).
+    // TAKEN FIRST, before anything below writes: every write on this path is idempotent, so
+    // afterwards "it was already like that" and "I just made it so" are indistinguishable from the
+    // store (bead sparkle-ixsb3).
+    //
+    // THIS IS NOW THE ONLY REVEAL PATH FOR A PILL. `openAgentFromPill` used to take its own
+    // prediction and call `openProjectTab` itself; it delegates here instead, because selecting an
+    // agent is not the same as making its ROW DRAWABLE and only this function does the second half
+    // (bead sparkle-s6gonk). Anything added below is therefore on the thread's critical path, not
+    // just the two cards'.
     const planned = revealOutcomeFor(a.projectId, a.id);
     // …AND THE ROW-SURFACING COUNTS AS A VISIBLE CHANGE. `revealOutcomeFor` models the reveal
     // path's writes, not these two, so a worker whose band was filtered out or whose orchestrator
@@ -3856,18 +3796,36 @@ export function ConciergeHost({
       rowBand === undefined ||
       !ui.statusFilter[rowBand] ||
       (a.parentRowId != null && (ui.collapsedOrchestrators[a.parentRowId] ?? true));
-    // UNCONDITIONAL, because top-level rows are band-filtered too — that is the population
-    // `groupAgentsByStage` filters. Guarding this behind `parentRowId != null` left a `done`
+    // ── CLEARED ONLY WHEN THE FILTER IS WHAT WAS HIDING THE ROW (roborev 66521) ────────────────
+    // NOT gated on `parentRowId != null` — top-level rows are band-filtered too (that is exactly
+    // the population `groupAgentsByStage` filters), and guarding it that way left a `done`
     // top-level agent undrawn while the caller said it was already open (roborev 58713).
-    ui.showAllStatusBands();
+    //
+    // But it is no longer UNCONDITIONAL either, and the reason is that this function moved onto the
+    // main navigation path: since `openAgentFromPill` delegates here, EVERY pill click in the
+    // concierge thread runs this line, where before a thread pill never touched filters at all.
+    // `showAllStatusBands()` hard-writes all four bands true over the reader's PERSISTED
+    // `statusFilter`, so unconditionally it would throw away a band the reader had isolated — on
+    // every click, including clicks on an agent whose row was already fully visible and where
+    // nothing needed surfacing.
+    //
+    // The condition is the band half of the `surfaced` test computed just above, so this is a
+    // narrowing to exactly the case that justifies the write, not a new rule: the filter is cleared
+    // when the filter is what was hiding the row, and left alone when it was not. `undefined` (a
+    // nested agent whose head is not in the feed) keeps the clearing — it reads as hidden
+    // everywhere else in this function, and staying consistent with `surfaced` matters more than
+    // saving a write in a case that cannot be drawn anyway.
+    if (rowBand === undefined || !ui.statusFilter[rowBand]) ui.showAllStatusBands();
     // …whereas EXPANDING only means anything for a row that nests under another one.
     if (a.parentRowId != null) ui.expandOrchestrators([a.parentRowId]);
-    // NO UP-FRONT BAIL ON A `"gone"` PREDICTION, unlike `openAgentFromPill`. That guard exists there
-    // because a doomed `openProjectTab` would yank the reader to another project's tab and only then
-    // report the miss (roborev 55548) — a notice contradicting what just happened on screen. This
-    // path has never had it, its callers report the miss from the boolean below, and adding one here
-    // would change which of the two sources of truth decides an agent is gone. The prediction is
-    // consulted for ONE thing: telling `"already-showing"` apart from a real reveal.
+    // NO UP-FRONT BAIL ON A `"gone"` PREDICTION. The concern that guard answers — a doomed
+    // `openProjectTab` yanking the reader to another project's tab and only then reporting the miss
+    // (roborev 55548) — is handled by the CALLERS instead: both `revealAgentById` and
+    // `openAgentFromPill` bail before ever reaching here — the first on the feed, and
+    // `openAgentFromPill` additionally on this same prediction, precisely so a doomed reveal cannot
+    // move the screen on its way to reporting a miss. Adding one here as well would change which of the two sources of truth decides
+    // an agent is gone. The prediction is consulted for ONE thing: telling `"already-showing"` apart
+    // from a real reveal.
     //
     // RETURNED, not discarded. `openProjectTab` reports a miss (unknown project, or an agent that
     // closed between the render and the click) by returning false, silently — and every caller that
@@ -4012,6 +3970,93 @@ export function ConciergeHost({
     },
     [resolveAgent, revealAgent, postSparkle],
   );
+
+  /** A pill in the concierge thread was clicked: reveal that agent.
+   *
+   *  ══ IT GOES THROUGH `revealAgent`, AND THAT IS THE WHOLE FIX (bead sparkle-s6gonk) ═══════════
+   *  This used to call `openProjectTab` directly. `openProjectTab` SELECTS an agent — it opens the
+   *  project tab, marks the agent selected, mounts its pane — and then returns true. What it does
+   *  NOT do is make the agent's ROW DRAWABLE, and two ordinary pieces of sidebar state can stop it
+   *  being drawn at all:
+   *
+   *    • A BAND FILTER. The sidebar filters top-level rows by rolled-up band, so a head the reader
+   *      filtered out earlier is simply not in the list.
+   *    • A COLLAPSED ORCHESTRATOR. A worker renders under its head only while that head is
+   *      expanded — and `collapsedOrchestrators[id] ?? true` DEFAULTS TO COLLAPSED, so a head the
+   *      reader has never touched hides every worker beneath it.
+   *
+   *  So the click "landed", this returned `"revealed"`, and `AgentPill` renders NO notice for
+   *  `"revealed"` on the stated grounds that *the screen already answered*. It had not: the agent
+   *  was nowhere on screen and nothing said so. That is a click that is invisible AND silent, which
+   *  is the exact dead end `AgentPill.deadEnd.test.tsx` exists to forbid — reintroduced one layer
+   *  below the component that forbids it.
+   *
+   *  `revealAgent` already closes both gates (`showAllStatusBands`, `expandOrchestrators`) and
+   *  already models the surfacing as a visible change, which is why `NudgeCard` and `PreviewCards`
+   *  were given it through `AgentPill`'s `onOpen` escape hatch. That left the THREAD — the pills in
+   *  every concierge reply, every refusal line, every receipt, i.e. the founder's primary navigation
+   *  into the fleet — on the weak path. The escape hatch was closing the hole for two cards while
+   *  the main road stayed open.
+   *
+   *  ══ WHY NOT JUST POINT THE CONTEXT AT `revealAgentById` ═════════════════════════════════════
+   *  Because the two report differently, and `AgentPill` needs THIS one's report. `revealAgentById`
+   *  is for callers that supply `onOpen`, which SUPPRESSES the pill's own notice — so it speaks the
+   *  outcome itself, into the transcript. The context opener must instead RETURN a `RevealOutcome`
+   *  and let the pill speak it, which is what keeps the miss-ladder ("…is still closed.") and the
+   *  "See what it did" history route alive. Wiring the thread to `revealAgentById` would post a
+   *  duplicate transcript line for every already-showing click AND leave the pill silent.
+   *
+   *  Resolving through `resolveAgent` first also preserves the up-front bail this function has
+   *  always had: an id that is no longer in the feed returns `"gone"` before anything is written, so
+   *  a doomed reveal never yanks the reader to another project's tab and only then admits it
+   *  accomplished nothing (roborev 55548). The feed's own `projectId` is used rather than the
+   *  roster's for the same reason `revealAgentById` does it — one source of truth for where an agent
+   *  lives.
+   *
+   *  Unlike a MENTION SEND, this is a pure navigation: no intent is armed, no countdown runs, and
+   *  nothing is written to a PTY. Revealing an agent is reversible in a way a delivery is not, so it
+   *  needs no gate. */
+  const openAgentFromPill = useCallback(
+    ({
+      agentId,
+      anchorY,
+    }: {
+      agentId: string;
+      projectId: string;
+      anchorY?: number;
+    }): RevealOutcome => {
+      // Destructured by NAME, so the order flip into `openProjectTab(projectId, agentId)` — two
+      // strings, silently swappable — cannot happen here (roborev 54894). `projectId` is accepted
+      // and deliberately unused: the feed record below is the authority on where the agent lives,
+      // and the pill's roster copy can only ever be a second, staler answer to the same question.
+      const a = resolveAgent(agentId);
+      if (!a) return "gone";
+      // ── THE SECOND HALF OF THE BAIL, AND IT IS NOT REDUNDANT ────────────────────────────────
+      // `resolveAgent` asks the FEED; this asks the local stores the reveal actually writes, and
+      // the two disagree in exactly the case that matters. An agent can still be in the feed while
+      // `projectStore` no longer holds it — the ordinary race where it is closed between the render
+      // that drew this pill and the click that lands on it. `revealAgent` has NO up-front bail by
+      // design (its docstring says so), so delegating on a feed hit alone let a doomed reveal run
+      // `showAllStatusBands()` and `openProjectTab` FIRST and report the miss afterwards: the
+      // reader was dragged to another project's tab and only then told the click accomplished
+      // nothing (roborev 55548). Dropping this is a regression `ConciergeHost.pillDeadEnd`'s case
+      // (b) and `ConciergeHost.appAuthoredPill` both catch — it was dropped here once, and both
+      // went red with `expected 'p2' to be 'p1'`.
+      //
+      // CONSULTED FOR `"gone"` ONLY. The `"already-showing"` vs `"revealed"` distinction is
+      // `revealAgent`'s to make, because it is the one that knows whether a row was SURFACED.
+      if (revealOutcomeFor(a.projectId, a.id) === "gone") return "gone";
+      const outcome = revealAgent(a);
+      // WHERE THE READER IS LOOKING. `revealAgent` makes the row DRAWABLE; this brings it to the
+      // cursor rather than to whatever edge `scrollIntoView` would pick (components/anchoredScroll).
+      // Asked for only when something is actually there to scroll to — a reveal that reported
+      // `"gone"` would be scrolling toward a row that is not going to exist.
+      if (outcome !== "gone") useUiStore.getState().requestRevealAgent(agentId, { anchorY });
+      return outcome;
+    },
+    [resolveAgent, revealAgent],
+  );
+
 
   // ── Return-from-Away recap (design §3 A5) ────────────────────────────────────────────────────
   // Snapshot the fleet's statuses the moment presence goes Away; on the way back, diff and post one

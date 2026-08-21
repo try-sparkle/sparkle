@@ -814,7 +814,8 @@ export function BeadPill({ beadId }: { beadId: string }) {
           // written to stop, and a shade of difference between a bead pill and an agent pill in the
           // same sentence fails no test while breaking the founder's "make mentions symmetrical" ask.
           background: MENTION_PILL_FILL,
-          color: C.cream,
+          // See C.pillInk: a clickable chip's label is neutral, never de-emphasised with its row.
+          color: C.pillInk,
           // A bead id is an identifier the founder greps for, so it is set in the mono face. The
           // SIZE stays `inherit` (from `base`): an `em`-relative nudge here is off-scale sprawl, and
           // theme/scale.test.ts ratchets exactly that — there is no scale step between body and

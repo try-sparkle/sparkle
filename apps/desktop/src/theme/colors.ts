@@ -189,6 +189,9 @@ export const THEME_HEX = {
     // grey (3.68 on the concierge column, 2.85 on the terminal plane) and fails AA at every one
     // of those sites. `muted` is the spec's readable secondary ink; that is the right tier here.
     agentIdle: BLUEPRINT.dark.muted, cream: BLUEPRINT.dark.ink,
+    // THE LABEL INK OF A CLICKABLE PILL. Same value as `cream` — deliberately, and it is a
+    // SEPARATE TOKEN precisely so it can be overridden separately. See `C.pillInk`.
+    pillInk: BLUEPRINT.dark.ink,
     hairline: BLUEPRINT.dark.seam, pillFill: BLUEPRINT.dark.hairSolid,
     chatBubble: BLUEPRINT.dark.bubble, chatBubbleActive: BLUEPRINT.dark.sel,
     // A LITERAL, not a BLUEPRINT slot, and deliberately so: the direction has no "black" register —
@@ -215,6 +218,7 @@ export const THEME_HEX = {
     conciergeSurfaceLifted: BLUEPRINT.light.assistLift,
     conciergeMuted: BLUEPRINT.light.muted, muted: BLUEPRINT.light.muted,
     agentIdle: BLUEPRINT.light.muted, cream: BLUEPRINT.light.ink,
+    pillInk: BLUEPRINT.light.ink,
     hairline: BLUEPRINT.light.seam, pillFill: BLUEPRINT.light.hairSolid,
     chatBubble: BLUEPRINT.light.bubble, chatBubbleActive: BLUEPRINT.light.sel,
     // THE SAME BLACK IN BOTH THEMES — not an oversight. The founder asked for a black card, and a
@@ -353,6 +357,35 @@ export const C = {
   // stated exception in THE NEUTRAL LADDER above).
   pillFill: "var(--c-pill-fill)",
   cream: "var(--c-cream)",
+  /**
+   * ══ THE LABEL INK OF A CLICKABLE PILL — AND WHY IT IS NOT `cream` ═════════════════════════════
+   *
+   * Identical in value to `cream` in both themes. It exists as its OWN token for one reason: a row
+   * can redefine the ink of its whole subtree, and the two rows in this app that do so want
+   * OPPOSITE things from a pill.
+   *
+   *   • `SentToAgentRow.SENT_CARD_INK_VARS` changes the GROUND — a card that is black in both
+   *     themes. A pill on it MUST follow, or in light mode its label is near-black on black. That
+   *     row therefore pins `--c-pill-ink` too.
+   *   • `NoticeAttribution.NOTICE_INK_VARS` changes only the EMPHASIS — an app-authored line
+   *     addressed to the concierge, drawn in secondary ink because the founder is reading over its
+   *     shoulder. A pill inside it must NOT follow, and that row leaves this token alone.
+   *
+   * THE BUG THAT SPLIT THEM (bead sparkle-s6gonk). Every pill painted `C.cream`, so the de-emphasis
+   * reached the pill's label while the STATUS DOT beside it — which resolves `bandColor(band)`,
+   * an entirely different token — kept its colour. A live, working agent therefore rendered as a
+   * GREEN DOT next to a GREY NAME, and the founder read the grey as "this agent is no longer
+   * relevant" and stopped believing the pill was clickable. His words: *"is it grayed out because
+   * it's no longer relevant? Is that what's going on?"*
+   *
+   * THE RULE THIS TOKEN ENCODES, chosen by the founder on 2026-08-20 and applied everywhere a pill
+   * renders: **the DOT alone carries status; the LABEL is plainly neutral.** A pill's label never
+   * varies with the agent's band and never varies with the surrounding row's emphasis, so a pill
+   * always reads as the live control it is. The one exception is deliberate and is not a status
+   * colour at all: a pill whose target is genuinely gone (`AgentPill`'s `quiet` form) is not a live
+   * control, and says so in muted ink.
+   */
+  pillInk: "var(--c-pill-ink)",
   muted: "var(--c-muted)",
   // Cyan (brand accent) is legible as TEXT only on dark backgrounds. As text it must flip to
   // dark ink in light mode — so this themed token is cyan in dark, navy in light. Use it for

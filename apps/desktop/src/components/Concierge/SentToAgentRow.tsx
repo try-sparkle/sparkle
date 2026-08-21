@@ -60,6 +60,13 @@ export const SENT_TO_AGENT_TESTID = "sent-to-agent";
  */
 export const SENT_CARD_INK_VARS = {
   "--c-cream": CHAT_SENT_INK,
+  // ⚠ PINNED TOO, AND FOR THIS CARD ONLY. `--c-pill-ink` is what a clickable pill's LABEL resolves
+  // (see C.pillInk); it was split off `--c-cream` so that the OTHER row which re-inks its subtree —
+  // NoticeAttribution's NOTICE_INK_VARS — could stop greying pills. This card wants the opposite,
+  // because it changes the GROUND rather than the emphasis: it is black in both themes, so a pill
+  // left on the themed ink is near-black on black in light mode — exactly the failure the rest of
+  // this object exists to prevent. A ground change pins this token; a de-emphasis must not.
+  "--c-pill-ink": CHAT_SENT_INK,
   "--c-concierge-muted": CHAT_SENT_MUTED,
   "--c-muted": CHAT_SENT_MUTED,
   // THE ONE FILL THE SUBTREE PAINTS FOR ITSELF, pinned for the same reason and by the same

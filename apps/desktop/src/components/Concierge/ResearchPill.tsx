@@ -111,7 +111,8 @@ export function ResearchPill({
         // The mention vocabulary's teal wash, from the shared constant rather than re-spelled — the
         // same fill the agent and bead pills take, so all three read as one thing.
         background: MENTION_PILL_FILL,
-        color: C.cream,
+        // See C.pillInk: a clickable chip's label is neutral, never de-emphasised with its row.
+        color: C.pillInk,
       }}
     >
       <StatusDot status={st} size={7} label={task.status} />

@@ -56,6 +56,29 @@ export const NOTICE_ATTRIBUTION_TESTID = "concierge-notice-attribution";
 export const NOTICE_INK_VARS = {
   "--c-cream": "var(--c-concierge-muted)",
   color: "var(--c-concierge-muted)",
+  // ── AND `--c-pill-ink` IS DELIBERATELY ABSENT (bead sparkle-s6gonk) ───────────────────────────
+  //
+  // A CLICKABLE PILL INSIDE ONE OF THESE ROWS KEEPS ITS FULL-WEIGHT LABEL. That is not an oversight
+  // and it is not a third declaration someone forgot: it is the distinction between this object and
+  // `SentToAgentRow.SENT_CARD_INK_VARS`, which DOES pin that token.
+  //
+  //   • That card changes the GROUND (black in both themes), so a pill on it must re-ink or its
+  //     label goes near-black on black in light mode.
+  //   • This row changes only the EMPHASIS. The sentence recedes; the controls inside it do not.
+  //
+  // WHAT WENT WRONG WHEN THERE WAS ONE TOKEN. Every pill painted `C.cream`, so this row's
+  // de-emphasis reached the pill's LABEL — while the status dot beside it resolves `bandColor()`,
+  // an unrelated token, and kept its colour. A live, actively-working agent therefore rendered as a
+  // GREEN DOT next to a GREY NAME, in a chip that still had its teal wash and was still a real
+  // `<button>`. The founder read the grey as a disabled state and asked whether the agent was
+  // "grayed out because it's no longer relevant"; it was not, and the dot a few pixels away was
+  // already saying so. Two adjacent signals contradicting each other is worse than either alone.
+  //
+  // THE RULE, chosen by the founder on 2026-08-20: the DOT alone carries status, and a pill's label
+  // is plainly neutral everywhere it renders. `theme/colors.C.pillInk` is where that lives; leaving
+  // it out here is what applies it. `NoticeAttribution.pillInk.test.tsx` asserts the absence, so a
+  // future edit that "completes" this object by adding the token fails rather than silently
+  // restoring the bug.
 } as CSSProperties;
 
 /**

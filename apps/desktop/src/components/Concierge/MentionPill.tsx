@@ -34,7 +34,9 @@ export const MENTION_PILL_FILL = `color-mix(in srgb, ${C.teal} 18%, transparent)
  */
 export const MENTION_PILL_STYLE: CSSProperties = {
   background: MENTION_PILL_FILL,
-  color: C.cream,
+  // `pillInk`, NOT `cream` — a pill's label is neutral and never follows a row's de-emphasis.
+  // See C.pillInk for the rule and the bug that produced it (bead sparkle-s6gonk).
+  color: C.pillInk,
   borderRadius: 4,
   padding: "1px 4px",
   whiteSpace: "nowrap",

@@ -682,7 +682,21 @@ export function AgentPill({
                 // shade of drift between them fails nothing and is exactly what the founder's "make
                 // mentions symmetrical" ask rules out.
                 background: MENTION_PILL_FILL,
-                color: C.cream,
+                // ── THE LABEL IS NEUTRAL; THE DOT ALONE CARRIES STATUS (bead sparkle-s6gonk) ──
+                // `pillInk`, NOT `cream`, and the difference is the whole fix. `cream` is the app's
+                // prose INK, and a concierge-addressed notice row (NoticeAttribution's
+                // NOTICE_INK_VARS) deliberately redefines it to the muted secondary so its sentence
+                // reads as the app talking to the concierge. That de-emphasis reached straight
+                // through to this label — while the dot two flex items away resolves `bandColor()`,
+                // an unrelated token, and stayed GREEN. So a live, working agent rendered as a green
+                // dot beside a grey name, and the founder read the grey as "no longer relevant" and
+                // stopped believing the pill was clickable.
+                //
+                // `pillInk` is the same value as `cream` and exists solely to be overridable
+                // separately: the SENT CARD (a black ground in both themes) pins it, because a pill
+                // there MUST re-ink or vanish; the notice row does not, because it is changing
+                // emphasis rather than ground. See C.pillInk.
+                color: C.pillInk,
               }
         }
       >

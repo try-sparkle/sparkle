@@ -35,7 +35,8 @@
     "test:coverage": "vitest run --coverage",
     "tauri": "tauri",
     "tauri:build:fresh": "cargo clean -p sparkle --manifest-path src-tauri/Cargo.toml && tauri build",
-    "visual:concierge-header": "node scripts/visual/concierge-header-probe.mjs"
+    "visual:concierge-header": "node scripts/visual/concierge-header-probe.mjs",
+    "visual:notice-attribution": "node scripts/visual/notice-attribution-probe.mjs"
   },
   "dependencies": {
     "@sparkle/core": "workspace:*",

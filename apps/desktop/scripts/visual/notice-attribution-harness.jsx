@@ -14,9 +14,15 @@ const params = new URLSearchParams(location.search);
 const WIDTH = Number(params.get("w") ?? 420);
 document.documentElement.dataset.theme = params.get("theme") === "light" ? "light" : "dark";
 
+// ⚠ `band` IS A StatusBand — one of `needs_you` | `questions` | `running` | `done`. NOT a status.
+// `bandColor` looks the value up in STATUS_BANDS and falls back to STATUS_BANDS[0] (`needs_you`,
+// which paints RED) for anything it does not recognise — silently. Two of these said "working",
+// which is an AgentTabStatus rather than a band, so this fixture had been photographing red dots
+// while describing them as working agents. `running` is the band whose dot is GREEN, and green on a
+// live agent is precisely the state bead sparkle-s6gonk is about.
 const ROSTER = [
-  { id: "a1", name: "Agents Header", projectId: "p1", projectName: "sparkle", band: "working", canAcceptInput: true },
-  { id: "a2", name: "Retry Backoff", projectId: "p1", projectName: "sparkle", band: "working", canAcceptInput: true },
+  { id: "a1", name: "Agents Header", projectId: "p1", projectName: "sparkle", band: "running", canAcceptInput: true },
+  { id: "a2", name: "Retry Backoff", projectId: "p1", projectName: "sparkle", band: "running", canAcceptInput: true },
   { id: "a3", name: "OG Images", projectId: "p1", projectName: "sparkle", band: "done", canAcceptInput: true },
 ];
 
@@ -32,7 +38,11 @@ const MESSAGES = [
   {
     id: "reply-1",
     kind: "sparkle",
-    text: "I've started three agents on the retry work, and I'll bring back whichever finishes first.",
+    // NAMES A PILL, and that is load-bearing rather than flavour (bead sparkle-s6gonk). The pill's
+    // label rule is a COMPARISON — "does a pill inside a de-emphasised row read the same as one in
+    // ordinary prose" — and a comparison needs both sides MOUNTED. With a pill only in the notice
+    // row the probe could read its colour and have nothing to call it right or wrong against.
+    text: "I've started [@Agents Header](sparkle-agent:a1) on the retry work, and I'll bring back whichever finishes first.",
     settled: true,
   },
   // 2. A CONCIERGE-ADDRESSED REFUSAL — the class from the report. Grey + attributed, words intact.
