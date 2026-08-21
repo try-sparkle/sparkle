@@ -813,6 +813,123 @@ fn import_default_at(
     Ok(acct)
 }
 
+/// The nickname a RETAINED-EXPIRED account is adopted under. Its dir was signed in once but the
+/// login is gone (Claude Code deletes `oauthAccount` from `.claude.json` when the OAuth session
+/// expires or is logged out), so no email can be read from disk to label it. The real identity
+/// returns the moment the founder re-authenticates it; until then this generic alias sits in the
+/// secondary slot while the identity slot honestly reads "Not signed in" / "Login expired". It is
+/// deliberately NOT an email guess — a wrong identity is worse than none.
+pub(crate) const EXPIRED_LOGIN_NICKNAME: &str = "Login expired — reconnect";
+
+/// What a config dir's `.claude.json` reveals about whether a completed login ever lived there.
+///
+/// The three cases are exactly what [`adopt_orphan_dirs_at`] must tell apart. Claude Code clears
+/// `oauthAccount` from `.claude.json` when a session expires, so a dir the founder logged into
+/// months ago and never re-authed looks — to [`read_oauth_identity_at`] alone — identical to a dir
+/// nobody ever touched. That collapse is the whole reason the founder's expired accounts vanished
+/// from the list: the recovery scan skipped them as "empty". This restores the distinction.
+enum LoginEvidence {
+    /// A live `oauthAccount.emailAddress`: a usable identity, adopted with the email as its label.
+    SignedIn(OauthIdentity),
+    /// No usable `oauthAccount`, but the dir carries proof a real login once lived here — a Claude
+    /// Code `userID`, a completed onboarding, or a `history.jsonl` of past prompts. This is the
+    /// EXPIRED case: RETAIN it so the founder can re-authenticate, never drop it to an empty list.
+    SignedOutButUsed,
+    /// Nothing but Claude Code's own first-run footprint (`projects/`, telemetry) with no completed
+    /// login. Adopting one would hand the auto-picker a zero-usage account that wins every spawn and
+    /// lands each agent at a login prompt — bead `sparkle-gms0`. Skipped, exactly as before.
+    NeverLoggedIn,
+}
+
+/// Classify a config dir by its login evidence (see [`LoginEvidence`]). Pure over the filesystem it
+/// reads, and unit-tested against all three shapes so the RETAIN-on-expiry branch cannot be deleted
+/// without reddening the suite. Reads `.claude.json` once via the SAME [`identity_json_path`]
+/// resolution the identity badge uses, so an explicit dir and the default account agree.
+fn read_login_evidence(dir: &Path) -> LoginEvidence {
+    // A live login is unambiguous — reuse the identity read the badge trusts.
+    if let Some(id) = read_oauth_identity_at(Some(dir), None) {
+        return LoginEvidence::SignedIn(id);
+    }
+    // No live `oauthAccount`. Did a real login ever live here, or is this bare footprint?
+    let json_evidence = identity_json_path(Some(dir), None)
+        .and_then(|p| std::fs::read(p).ok())
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .is_some_and(|v| {
+            let has_user_id = v
+                .get("userID")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|s| !s.is_empty());
+            let onboarded =
+                v.get("hasCompletedOnboarding").and_then(serde_json::Value::as_bool) == Some(true);
+            has_user_id || onboarded
+        });
+    // `history.jsonl` is Claude Code's interactive prompt history — its presence is independent
+    // proof the dir was USED, catching a login whose `.claude.json` was reset to bare footprint.
+    if json_evidence || dir.join("history.jsonl").exists() {
+        LoginEvidence::SignedOutButUsed
+    } else {
+        LoginEvidence::NeverLoggedIn
+    }
+}
+
+/// Record `email` as this config dir's Claude identity by filling `oauthAccount.emailAddress` in its
+/// `.claude.json`. This is what makes a TOKEN-authenticated account ROUTABLE: a pasted-token account
+/// has a `.credentials.json` but no `oauthAccount`, so `read_oauth_identity_at` → `getIdentities`
+/// reports `email: null`, `isSignedIn` is false, and `pickAccount` can never route a spawn to it —
+/// the account renders "not signed in" despite a working credential. The token form calls this ONLY
+/// after `claude auth status` confirms a live CLI login, so the email it records is one the CLI just
+/// authenticated with, never a guess.
+///
+/// Pure over the path it is handed, and CONSERVATIVE: it fills `emailAddress` only when absent/empty
+/// and preserves every other key and every other `oauthAccount` field, so a real login's richer
+/// identity (accountUuid, org) is never clobbered by this bridge value, and it is idempotent (a
+/// second call on an already-identified file rewrites nothing).
+fn record_oauth_email_at(claude_json_path: &Path, email: &str) -> Result<(), String> {
+    let email = email.trim();
+    if email.is_empty() {
+        return Err("refusing to record an empty account email".into());
+    }
+    let mut obj = match std::fs::read_to_string(claude_json_path) {
+        Ok(s) => match serde_json::from_str::<serde_json::Value>(&s) {
+            Ok(serde_json::Value::Object(m)) => m,
+            _ => {
+                return Err(format!(
+                    "account {CLAUDE_JSON} is not a JSON object, leaving it untouched: {}",
+                    claude_json_path.display()
+                ))
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::Map::new(),
+        Err(e) => return Err(format!("cannot read {}: {e}", claude_json_path.display())),
+    };
+    let oauth = obj
+        .entry("oauthAccount")
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    let serde_json::Value::Object(oauth_map) = oauth else {
+        return Err(format!(
+            "oauthAccount in {CLAUDE_JSON} is not an object, leaving it untouched: {}",
+            claude_json_path.display()
+        ));
+    };
+    let already = oauth_map
+        .get("emailAddress")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|s| !s.is_empty());
+    if already {
+        return Ok(()); // already identified — never overwrite a real login's email
+    }
+    oauth_map.insert("emailAddress".into(), serde_json::json!(email));
+    if let Some(parent) = claude_json_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("mkdir account dir: {e}"))?;
+    }
+    let json = serde_json::to_string(&serde_json::Value::Object(obj))
+        .map_err(|e| format!("serialize {CLAUDE_JSON}: {e}"))?;
+    crate::hooks::atomic_write_settings(claude_json_path, &json)
+        .map_err(|e| format!("write account {CLAUDE_JSON}: {e}"))?;
+    tighten_mode(claude_json_path, 0o600);
+    Ok(())
+}
+
 /// Re-register config dirs that hold a REAL login but have no `accounts.json` record.
 ///
 /// ══ WHY ORPHANS EXIST AT ALL ═══════════════════════════════════════════════════════════════════
@@ -828,15 +945,24 @@ fn import_default_at(
 /// issue". The ADD path seeds a dir correctly; there was simply no path that ever looked at a dir
 /// again afterwards.
 ///
-/// ══ ADOPT ONLY A COMPLETED LOGIN ═══════════════════════════════════════════════════════════════
-/// The signed-in test is [`read_oauth_identity_at`], the same one the identity badge uses: a real
-/// `oauthAccount.emailAddress`. A dir WITHOUT one is deliberately left alone, and that exclusion is
-/// load-bearing rather than tidiness. An un-logged-in dir has no transcripts, so its usage tally is
-/// zero — the most headroom there is — and adopting it would hand the auto-picker an account that
-/// wins every spawn and drops each agent at a login prompt. That is bead `sparkle-gms0`, and
-/// adopting empty dirs would re-open it from a new direction. Two such dirs existed on the founder's
-/// machine (Claude Code's own `projects/` + `file-history/` footprint, no `.claude.json`), so this
-/// is the common case, not a corner.
+/// ══ RETAIN A USED LOGIN, SKIP AN EMPTY DIR ═════════════════════════════════════════════════════
+/// Classification is [`read_login_evidence`], which distinguishes THREE cases where this once saw
+/// two. A live `oauthAccount.emailAddress` ([`read_oauth_identity_at`], the identity badge's test)
+/// is adopted under its email. A dir with NO live `oauthAccount` but real proof of past use — a
+/// Claude Code `userID`, a completed onboarding, or a `history.jsonl` — is an EXPIRED login (Claude
+/// Code deletes `oauthAccount` on expiry) and is RETAINED under [`EXPIRED_LOGIN_NICKNAME`] so it
+/// never vanishes from the list; this is the founder's #1 ask — an expired account must stay
+/// visible with a re-login path, not silently disappear.
+///
+/// A dir with neither — bare `projects/` + telemetry footprint, never logged in — is still left
+/// alone, and that exclusion is load-bearing rather than tidiness. An un-logged-in dir has no
+/// transcripts, so its usage tally is zero — the most headroom there is — and adopting it would hand
+/// the auto-picker an account that wins every spawn and drops each agent at a login prompt (bead
+/// `sparkle-gms0`). The retained-expired account is SAFE from that trap for the same reason it is
+/// visible: with no readable email it fails `isSignedIn`, so `rotationReadiness`/`pickAccount`
+/// exclude it from routing while the list still shows it. Two never-logged dirs existed on the
+/// founder's machine (Claude Code's own footprint, no completed login), so the skip is the common
+/// case, not a corner.
 ///
 /// Keyed by the DIR NAME as the account id, which preserves the `account_config_dir` invariant that
 /// an account's dir is `accounts/<its id>`. Idempotent: a dir already referenced by a record is
@@ -866,9 +992,15 @@ fn adopt_orphan_dirs_at(
             continue;
         }
         let Some(name) = dir.file_name().and_then(|n| n.to_str()) else { continue };
-        // A completed login, or nothing. See the header — adopting an empty dir would give the
-        // picker a zero-usage account that wins every spawn and lands agents in a login prompt.
-        let Some(identity) = read_oauth_identity_at(Some(&dir), None) else { continue };
+        // Classify by login evidence: adopt a live login under its email, RETAIN an expired login
+        // (used once, `oauthAccount` since cleared by Claude Code) under a generic label so it never
+        // vanishes from the list, and skip a dir that never held a login. Adopting the last would
+        // give the picker a zero-usage account that wins every spawn (bead `sparkle-gms0`).
+        let nickname = match read_login_evidence(&dir) {
+            LoginEvidence::SignedIn(identity) => identity.email,
+            LoginEvidence::SignedOutButUsed => EXPIRED_LOGIN_NICKNAME.to_string(),
+            LoginEvidence::NeverLoggedIn => continue,
+        };
         // Id collision with an existing record would break the dir↔id invariant; skip rather than
         // mint a second record for one id.
         if accounts.iter().any(|a| a.id == name) {
@@ -876,7 +1008,7 @@ fn adopt_orphan_dirs_at(
         }
         adopted.push(Account {
             id: name.to_string(),
-            nickname: identity.email.clone(),
+            nickname,
             config_dir: dir.to_string_lossy().into_owned(),
             is_default: false,
             created_at: now,
@@ -3286,6 +3418,26 @@ pub fn accounts_add(
         id,
         now_secs(),
     )
+}
+
+/// Record the Claude identity (email) for a token-authenticated account so it becomes routable.
+///
+/// Called by the paste-a-token flow AFTER `claude auth status` confirms a live CLI login: the token
+/// works, so `email` is the account the CLI authenticated as. Writes `oauthAccount.emailAddress` into
+/// the dir's `.claude.json` (see [`record_oauth_email_at`]) — the sole signal behind
+/// `read_oauth_identity_at`/`isSignedIn`/`pickAccount`, without which a valid pasted token can never
+/// receive a spawn. `config_dir` empty resolves to the default account's `$HOME/.claude.json`.
+#[tauri::command]
+pub fn account_record_oauth_identity(
+    lock: State<'_, AccountsLock>,
+    config_dir: String,
+    email: String,
+) -> Result<(), String> {
+    let _guard = lock.guard();
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let path = identity_json_path(Some(Path::new(&config_dir)), home.as_deref())
+        .ok_or_else(|| "cannot resolve the account's config path (no HOME?)".to_string())?;
+    record_oauth_email_at(&path, &email)
 }
 
 /// Rename an account.
@@ -6450,6 +6602,140 @@ mod tests {
             !on_disk.iter().any(|a| a.id == "bbb222"),
             "adopted a dir with no login — it would win every auto-pick and prompt each agent: {on_disk:?}"
         );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// THE FOUNDER'S #1 ASK, PINNED: an account whose OAuth login EXPIRED — Claude Code has since
+    /// deleted `oauthAccount` from its `.claude.json` — is RETAINED, not dropped. Before this it
+    /// looked identical to a never-used dir and vanished, leaving the founder with an empty accounts
+    /// modal while the credentialed dir sat on disk. Paired with a bare-footprint dir in the SAME
+    /// sweep, so the test proves the DISTINCTION (retain the used one, skip the empty one) rather
+    /// than "adopt everything". Deleting the `SignedOutButUsed` retain branch fails the retain
+    /// assertion — the mutation guard the retain-on-expiry requirement rides on.
+    #[test]
+    fn adoption_retains_an_expired_login_that_lost_its_oauth_account() {
+        let tmp = unique_dir("adopt-expired");
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // Was signed in (a Claude Code userID + completed onboarding + prompt history) but the
+        // `oauthAccount` block is gone — exactly the shape an expired login leaves on disk.
+        let expired = tmp.join("accounts").join("ccc333");
+        std::fs::create_dir_all(&expired).unwrap();
+        std::fs::write(
+            expired.join(".claude.json"),
+            r#"{"userID":"u-123","hasCompletedOnboarding":true}"#,
+        )
+        .unwrap();
+        std::fs::write(expired.join("history.jsonl"), "{\"display\":\"hi\"}\n").unwrap();
+
+        // Never logged in — bare footprint. Must STILL be skipped (sparkle-gms0), so the retain
+        // above cannot be "adopt any dir".
+        let empty = tmp.join("accounts").join("ddd444");
+        std::fs::create_dir_all(empty.join("projects")).unwrap();
+
+        let accounts_path = tmp.join("accounts.json");
+        let adopted = adopt_orphan_dirs_at(&tmp, &accounts_path, 1_700_000_000).unwrap();
+
+        // Retained, under the generic reconnect label (no email is readable from an expired dir).
+        let retained = adopted.iter().find(|a| a.id == "ccc333");
+        assert!(retained.is_some(), "expired login was dropped, not retained: {adopted:?}");
+        assert_eq!(retained.unwrap().nickname, EXPIRED_LOGIN_NICKNAME);
+        // SIDE EFFECT on disk — the row a "Renew Login" control attaches to must actually persist.
+        let on_disk = read_accounts_at(&accounts_path).unwrap();
+        assert!(on_disk.iter().any(|a| a.id == "ccc333"), "not persisted: {on_disk:?}");
+        // The distinction holds: the bare dir is still skipped.
+        assert!(
+            !adopted.iter().any(|a| a.id == "ddd444"),
+            "adopted a never-logged dir — it would win every auto-pick: {adopted:?}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// `read_login_evidence` tells the three cases apart — the classifier the retain/skip decision
+    /// rides on. Flipping an input (drop the `oauthAccount`, or strip the use-evidence) moves the
+    /// verdict, which is what keeps the adoption test above non-vacuous.
+    #[test]
+    fn login_evidence_distinguishes_signed_in_expired_and_empty() {
+        let tmp = unique_dir("login-evidence");
+
+        let signed_in = tmp.join("s");
+        std::fs::create_dir_all(&signed_in).unwrap();
+        std::fs::write(
+            signed_in.join(".claude.json"),
+            r#"{"oauthAccount":{"emailAddress":"live@example.com"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(read_login_evidence(&signed_in), LoginEvidence::SignedIn(_)));
+
+        // A `userID` alone (oauthAccount cleared) is enough to prove past use.
+        let expired = tmp.join("e");
+        std::fs::create_dir_all(&expired).unwrap();
+        std::fs::write(expired.join(".claude.json"), r#"{"userID":"u-1"}"#).unwrap();
+        assert!(matches!(read_login_evidence(&expired), LoginEvidence::SignedOutButUsed));
+
+        // history.jsonl alone also proves it, even with a bare `.claude.json`.
+        let expired2 = tmp.join("e2");
+        std::fs::create_dir_all(&expired2).unwrap();
+        std::fs::write(expired2.join(".claude.json"), r#"{"machineID":"m"}"#).unwrap();
+        std::fs::write(expired2.join("history.jsonl"), "{}\n").unwrap();
+        assert!(matches!(read_login_evidence(&expired2), LoginEvidence::SignedOutButUsed));
+
+        // Bare footprint, no login evidence → never adopted.
+        let empty = tmp.join("n");
+        std::fs::create_dir_all(empty.join("projects")).unwrap();
+        std::fs::write(empty.join(".claude.json"), r#"{"machineID":"m"}"#).unwrap();
+        assert!(matches!(read_login_evidence(&empty), LoginEvidence::NeverLoggedIn));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A token-authenticated account becomes ROUTABLE: recording its email fills
+    /// `oauthAccount.emailAddress`, which is exactly what `read_oauth_identity_at` (the signal behind
+    /// `isSignedIn`/`pickAccount`) reads back. Before this a valid pasted token had `email: null` and
+    /// could never receive a spawn. Deleting the `emailAddress` insert makes the readback None and
+    /// reddens this — the mutation guard for "the pasted token can actually be used".
+    #[test]
+    fn recording_an_email_makes_a_token_account_routable() {
+        let tmp = unique_dir("record-email");
+        let dir = tmp.join("acct");
+        std::fs::create_dir_all(&dir).unwrap();
+        // A token-only dir: some footprint but NO oauthAccount, so it is not identifiable yet.
+        std::fs::write(dir.join(".claude.json"), r#"{"userID":"u-1"}"#).unwrap();
+        assert!(
+            read_oauth_identity_at(Some(&dir), None).is_none(),
+            "precondition: no identity before recording"
+        );
+
+        record_oauth_email_at(&dir.join(".claude.json"), "me@example.com").unwrap();
+
+        // SIDE EFFECT: the identity the router keys on now resolves.
+        let id = read_oauth_identity_at(Some(&dir), None).expect("must be identifiable now");
+        assert_eq!(id.email, "me@example.com");
+        // Conservative merge: the pre-existing key survived (not a clobber of the whole file).
+        let back: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join(".claude.json")).unwrap()).unwrap();
+        assert_eq!(back.get("userID").and_then(serde_json::Value::as_str), Some("u-1"));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Never overwrites a REAL login's identity — idempotent and conservative, so a renew that lands
+    /// on an already-signed-in dir can't downgrade its richer identity to a bare email.
+    #[test]
+    fn recording_an_email_never_overwrites_an_existing_identity() {
+        let tmp = unique_dir("record-email-noclobber");
+        let dir = tmp.join("acct");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(".claude.json"),
+            r#"{"oauthAccount":{"emailAddress":"real@example.com","accountUuid":"uuid-x"}}"#,
+        )
+        .unwrap();
+
+        record_oauth_email_at(&dir.join(".claude.json"), "bridge@example.com").unwrap();
+
+        let id = read_oauth_identity_at(Some(&dir), None).unwrap();
+        assert_eq!(id.email, "real@example.com", "must not overwrite the real login email");
+        assert_eq!(id.account_uuid.as_deref(), Some("uuid-x"), "must preserve the uuid");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

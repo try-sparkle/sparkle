@@ -55,6 +55,11 @@ import {
 } from "../services/accountUsage";
 import { checkSpendGateForAccounts } from "../services/advisor/spendGate";
 import {
+  checkClaudeAuthStatus,
+  authIsDefinitelyExpired,
+  type ClaudeAuthStatus,
+} from "../preflight";
+import {
   orderBySpace,
   usageColor,
   USAGE_COLOR_HEX,
@@ -98,6 +103,12 @@ const DEPS = {
   // reset time. Injectable/mockable like every other IO; a per-account failure degrades that row to
   // "usage unavailable" and never blocks the screen (the local-tally `getUsage` stays the fallback).
   getUsageLive: getAccountUsageLive,
+  // LIVE per-account login health: `claude auth status --json` for one config dir. This is what
+  // tells an EXPIRED login (was signed in, the CLI now says no — `authIsDefinitelyExpired`) apart
+  // from one that was NEVER signed in, so the card can say "reconnect" honestly instead of "never
+  // completed" and offer a Renew Login control. NOT the stale recorded flag. Injectable like the
+  // rest; a per-account failure degrades that row to its recorded state and never blocks the screen.
+  getAuthStatus: checkClaudeAuthStatus,
   addAccount,
   setNickname,
   removeAccount,
@@ -665,6 +676,33 @@ function isSignedIn(identity: Identity | undefined): boolean {
   return !!(identity?.accountUuid || identity?.email);
 }
 
+/** The row's effective login health, folding the LIVE `claude auth status` probe over the recorded
+ *  identity. `signedIn` is the identity read (a live `oauthAccount` in the config dir). `auth` is
+ *  the CLI probe: an answer, `"error"` (couldn't run), or `undefined` (not probed yet).
+ *
+ *  The probe is authoritative only where it is DECISIVE, and only to make things worse, never better:
+ *  it can flag an account that reads "signed in" as actually EXPIRED — the case the recorded identity
+ *  misses, and the whole reason this exists (a dead OAuth session whose `.claude.json` still names an
+ *  email). A probe that errored or is pending defers to `signedIn`, so a flaky `claude auth status`
+ *  can never manufacture a false EXPIRED and never downgrade a genuinely healthy account.
+ *
+ *   • "healthy"   — usable now;
+ *   • "expired"   — was signed in, the CLI now says the session is dead (`authIsDefinitelyExpired`);
+ *   • "signedOut" — no live login and the probe didn't contradict it (never completed, or expired
+ *                   and Claude Code already cleared `oauthAccount`). */
+export type RowLogin = "healthy" | "expired" | "signedOut";
+export function deriveRowLogin(
+  signedIn: boolean,
+  auth: ClaudeAuthStatus | "error" | undefined,
+): RowLogin {
+  const probed = auth && auth !== "error" ? auth : null;
+  // The one thing the probe adds over identity: catching a "signed-in"-looking but dead session.
+  if (probed && authIsDefinitelyExpired(probed)) return "expired";
+  if (signedIn) return "healthy";
+  // Not signed in per the live identity read — decisive on its own; the probe only refines WHY.
+  return "signedOut";
+}
+
 /** What the identity slot says for a login that IS real (it has an `accountUuid`) but carries no
  *  readable email. It is neither the email (there isn't one) nor "Not signed in" (that would be a
  *  lie in the other direction) nor the nickname (never evidence of anything).
@@ -730,6 +768,12 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
   // MISSING entry is "not fetched yet". Kept separate from the token-tally `usage` above because it
   // fetches per account and each account can fail independently without blanking the others.
   const [liveUsage, setLiveUsage] = useState<Record<string, AccountUsageLive | "error">>({});
+  // LIVE login health per account id, from `claude auth status --json` for that config dir. This is
+  // the signal that catches the case the recorded identity CANNOT: an account whose `.claude.json`
+  // still shows an email (so it reads "signed in") while its OAuth session is actually dead. A value
+  // is the CLI's own answer; "error" means the probe couldn't run (degrade to the recorded identity,
+  // never a false alarm); a MISSING entry is "not probed yet". Fed through `deriveRowLogin` below.
+  const [authStatus, setAuthStatus] = useState<Record<string, ClaudeAuthStatus | "error">>({});
   // Bumped after every completed `onLogin` (handleAdd / handleLogin) to re-drive the live-usage
   // effect — the trigger a login provides that the account SET does not (see the effect below).
   const [liveNonce, setLiveNonce] = useState(0);
@@ -747,6 +791,15 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
   // ids whose running-agents list is currently expanded to the full comma list.
   const [expandedRunning, setExpandedRunning] = useState<Record<string, boolean>>({});
   const [error, setError] = useState<string | null>(null);
+  // ── LOADING vs LOADED-EMPTY, kept DISTINCT so the modal never flashes a false "No accounts yet" ──
+  // `accounts` starts `[]` and stays `[]` until the first `refresh()` resolves, and a transient read
+  // failure leaves it `[]` too — so gating the empty CTA on `accounts.length === 0` alone renders
+  // "No accounts yet" mid-load and on error, the intermittent empty flicker the founder hits (opens
+  // the modal, sees nothing; reopens, sees all six). `loaded` flips true ONLY after a read that
+  // DEFINITIVELY completed, so three states are separable: not-yet-loaded → a skeleton; loaded with
+  // rows → the list; loaded with zero → the empty CTA, the one case it is honest. It never flips back
+  // to false, so a later transient error keeps the last-known list rather than blanking to empty.
+  const [loaded, setLoaded] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [draftName, setDraftName] = useState("");
   // Synchronous mirror of the active rename id. The state closures captured by the
@@ -794,6 +847,7 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
   const getIdentitiesFn = deps?.getIdentities ?? DEPS.getIdentities;
   const listCeilingsFn = deps?.listCeilings ?? DEPS.listCeilings;
   const getUsageLiveFn = deps?.getUsageLive ?? DEPS.getUsageLive;
+  const getAuthStatusFn = deps?.getAuthStatus ?? DEPS.getAuthStatus;
   // ── REMOVED IDS, SO A STALE RE-READ CANNOT RESURRECT A ROW ──────────────────────────────────
   //
   // `refresh()` writes `setAccounts(a)` unconditionally, and six things call it (the mount effect,
@@ -828,6 +882,10 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
       setAccounts(a.filter((x) => !removingRef.current.has(x.id)));
       setIdentities(ids);
       setCeilings(cs);
+      // The read DEFINITIVELY completed — from here the empty CTA is honest and the skeleton stops.
+      // Set only on success: a first-load rejection lands in `catch` below and must NOT unlock the
+      // empty state. Never reset to false, so a later transient failure can't blank a known list.
+      setLoaded(true);
       // ══ THE LOCAL TALLY IS NO LONGER AWAITED — THIS IS THE TEN-SECOND LOAD ═══════════════════
       // `accounts_usage` walks EVERY account's `projects/**/*.jsonl` and sums tokens. On the
       // founder's machine that is 17,316 files and 5.7 GB for the default account alone, which is
@@ -892,6 +950,29 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
     // doesn't re-fire); `liveNonce` re-fires after any login. `accounts`/`getUsageLiveFn` read inside.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [accountsKey, liveNonce, getUsageLiveFn]);
+
+  // ── LIVE login health, best-effort, per account ────────────────────────────────────────────────
+  // Same shape as the live-usage effect: fetch `claude auth status` per config dir, write per-id as
+  // each settles (one hung/failed probe never blanks the column), guard stale batches with a
+  // generation ref. Re-fires on the account SET and after any login (`liveNonce`) — a just-renewed
+  // account must re-probe or it would keep showing EXPIRED. A probe failure records "error", which
+  // `deriveRowLogin` treats as "no decisive signal" and falls back to the recorded identity, so a
+  // flaky `claude auth status` can never manufacture a false EXPIRED.
+  const authGenRef = useRef(0);
+  useEffect(() => {
+    if (accounts.length === 0) return;
+    const gen = ++authGenRef.current;
+    for (const acct of accounts) {
+      getAuthStatusFn(acct.configDir)
+        .then((s) => {
+          if (authGenRef.current === gen) setAuthStatus((prev) => ({ ...prev, [acct.id]: s }));
+        })
+        .catch(() => {
+          if (authGenRef.current === gen) setAuthStatus((prev) => ({ ...prev, [acct.id]: "error" }));
+        });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [accountsKey, liveNonce, getAuthStatusFn]);
 
   // ── "Check usage levels" — per-card, on-demand true-up of ONE account's REAL usage (item 14) ─────
   // The founder's ask, now surfaced from each card's ⋮ menu instead of a global button. Force-fetches
@@ -1481,12 +1562,16 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
       </div>
 
       {/* THE GLANCE. How many accounts can actually receive a spawn, and what that means — stated
-          before anything else on the screen, because the row count is not that number. */}
-      <RotationBanner
-        readiness={readiness}
-        nameOf={(a) => displayFor(a).primary}
-        onAdd={() => setAdding(true)}
-      />
+          before anything else on the screen, because the row count is not that number. Gated on
+          `loaded`: before the first read resolves this would read "No account is signed in", the
+          same false-empty flash the CTA below guards against. */}
+      {loaded && (
+        <RotationBanner
+          readiness={readiness}
+          nameOf={(a) => displayFor(a).primary}
+          onAdd={() => setAdding(true)}
+        />
+      )}
 
       {/* AC8 — every usable account is out of room. Deliberately does NOT claim spawns are blocked:
           `pickAccount` still returns an account rather than refusing, so promising a block would be
@@ -1603,8 +1688,25 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
         </div>
       ))}
 
-      {accounts.length === 0 && !adding && (
-        <div style={{ ...card, color: C.muted, fontSize: 13 }}>No accounts yet. Add one to get started.</div>
+      {/* THREE EXPLICIT STATES, never collapsed (the intermittent false-empty the founder hit):
+          • not yet loaded, no error → a skeleton, NEVER the empty CTA;
+          • loaded with zero accounts → the empty CTA, the one case it is honest;
+          • loaded with accounts → the rows below.
+          A first-load error shows the error banner above, not the CTA (`loaded` is still false). */}
+      {!loaded && !error && !adding && (
+        <div
+          data-testid="accounts-loading"
+          style={{ ...card, color: C.muted, fontSize: 13 }}
+          role="status"
+          aria-busy="true"
+        >
+          Loading your accounts…
+        </div>
+      )}
+      {loaded && accounts.length === 0 && !adding && (
+        <div data-testid="accounts-empty" style={{ ...card, color: C.muted, fontSize: 13 }}>
+          No accounts yet. Add one to get started.
+        </div>
       )}
 
       {/* The "lists below cover agents with an open tab in this window…" coverage caption was
@@ -1632,6 +1734,11 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
         // pointed the other way — it gets its own honest string instead.
         const display = accountDisplay(a, identity);
         const signedIn = isSignedIn(identity);
+        // Effective login health, folding the live `claude auth status` probe over the identity read
+        // (see `deriveRowLogin`). Drives the EXPIRED card below — including the case an account reads
+        // signed-in but its session is actually dead.
+        const rowLogin = deriveRowLogin(signedIn, authStatus[a.id]);
+        const loginExpired = rowLogin === "expired";
         // Can this account be made PRIMARY? Narrower than `signedIn` on purpose — see the Activate
         // button below: `usablePreferredAccount` gates on `signedInAccountIds`, which keys on email.
         const canBePrimary = display.signedIn;
@@ -1977,9 +2084,16 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
                 }}
               >
                 <FiSlash size={13} aria-hidden />
+                {/* The FIRST sentence is unchanged (kept honest for a never-signed-in dir and the
+                    established copy). Only the second sentence was softened: this card now ALSO
+                    covers a recovered account whose login EXPIRED — Claude Code cleared its
+                    `oauthAccount`, so it reads not-signed-in but a login really did live here — for
+                    which "no login was ever completed" would be a lie. "No active Claude login" is
+                    true of both, and the button opens the login modal, which offers both the browser
+                    sign-in AND a pasted long-lived `claude setup-token` (the durable renew path). */}
                 <span style={{ flex: 1, minWidth: 160 }}>
                   <strong>Not signed in — this account cannot receive agents.</strong> Its config
-                  folder exists, but no Claude login was ever completed in it.
+                  folder is here, but it has no active Claude login. Sign in to give it one.
                 </span>
                 <button
                   type="button"
@@ -1987,6 +2101,49 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
                   onClick={() => void handleLogin(a)}
                 >
                   Finish sign-in
+                </button>
+              </div>
+            )}
+
+            {/* THE CASE THE RECORDED FLAG MISSES: the row READS signed in (its `.claude.json` still
+                names an email), but `claude auth status` says the OAuth session is dead. Without the
+                live probe this account looks perfectly healthy while every agent it runs fails at
+                auth — the exact silent expiry the founder hits. Additive to the card above (they are
+                mutually exclusive: that one needs `!signedIn`, this one needs a signed-in identity). */}
+            {signedIn && loginExpired && (
+              <div
+                data-testid={`account-expired-${a.id}`}
+                role="alert"
+                style={{
+                  marginTop: 8,
+                  padding: 8,
+                  borderRadius: 6,
+                  border: `1px solid ${C.dangerInk}`,
+                  color: C.dangerInk,
+                  fontSize: 12,
+                  lineHeight: 1.5,
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 8,
+                  flexWrap: "wrap",
+                }}
+              >
+                <FiAlertTriangle size={13} aria-hidden />
+                <span style={{ flex: 1, minWidth: 160 }}>
+                  <strong>Login expired.</strong> This account still shows its email, but Claude says
+                  its session is no longer valid — agents on it will fail to authenticate until you
+                  reconnect it.
+                </span>
+                <button
+                  type="button"
+                  data-testid={`account-renew-${a.id}`}
+                  style={{ ...primaryBtn, borderColor: C.dangerInk, background: C.dangerInk }}
+                  onClick={() => {
+                    if (a.isDefault) setConfirmLogin(a.id);
+                    else void handleLogin(a);
+                  }}
+                >
+                  Renew Login
                 </button>
               </div>
             )}

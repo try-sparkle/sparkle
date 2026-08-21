@@ -14,6 +14,7 @@ import {
 } from "../services/accountStore";
 import type { Ceiling } from "../services/headroom";
 import type { AccountUsageLive } from "../services/accountUsage";
+import type { ClaudeAuthStatus } from "../preflight";
 
 /** A neutral live-usage payload for the effect tests. */
 function liveUsage(fiveHourPercent: number, sevenDayPercent: number): AccountUsageLive {
@@ -56,6 +57,12 @@ function makeDeps(
     // Tests that need a bar override this per case.
     getUsageLive: vi.fn(async () => {
       throw new Error("live usage unavailable in test");
+    }),
+    // Default: the live auth probe errors (no Tauri bridge), which `deriveRowLogin` treats as "no
+    // decisive signal" — every row falls back to its recorded identity, exactly as before this probe
+    // existed. Tests that need an EXPIRED reading override this per case.
+    getAuthStatus: vi.fn(async (): Promise<ClaudeAuthStatus> => {
+      throw new Error("auth status unavailable in test");
     }),
     addAccount: vi.fn(async (nickname: string) => acct("new", { nickname })),
     setNickname: vi.fn(async () => {}),
@@ -2752,5 +2759,114 @@ describe("AccountsScreen — the sticky consumers", () => {
     expect(screen.getByTestId("account-routing-a").textContent).toContain("Concierge");
     expect(screen.getByTestId("account-routing-b").textContent).not.toContain("Concierge");
     expect(deps.setPin).not.toHaveBeenCalled();
+  });
+
+  // ── LOADING vs LOADED-EMPTY: the intermittent false "No accounts yet" flicker ──────────────────
+  describe("load state never flashes a false empty", () => {
+    it("shows a LOADING skeleton while the account read is pending, NOT the empty CTA", async () => {
+      // A read that never resolves during this assertion window models the mid-load frame.
+      let release!: (a: Account[]) => void;
+      const pending = new Promise<Account[]>((r) => {
+        release = r;
+      });
+      const deps = makeDeps([]);
+      deps.listAccounts = vi.fn(() => pending);
+
+      render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
+
+      // The distinction the fix exists for: skeleton yes, empty CTA no, WHILE loading.
+      await screen.findByTestId("accounts-loading");
+      expect(screen.queryByTestId("accounts-empty")).toBeNull();
+
+      // Now the read resolves with accounts → they render and the skeleton is gone.
+      release([acct("a", { nickname: "Personal" })]);
+      await screen.findByTestId("account-row-a");
+      expect(screen.queryByTestId("accounts-loading")).toBeNull();
+      expect(screen.queryByTestId("accounts-empty")).toBeNull();
+    });
+
+    it("shows the empty CTA ONLY after a read that definitively completed with zero accounts", async () => {
+      const deps = makeDeps([]); // resolves to [] immediately
+      render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
+
+      // Once the read completes with zero, the CTA is honest and appears; the skeleton is gone.
+      await screen.findByTestId("accounts-empty");
+      expect(screen.queryByTestId("accounts-loading")).toBeNull();
+    });
+
+    it("a FAILED account read shows neither the empty CTA nor a stuck skeleton — it shows the error", async () => {
+      const deps = makeDeps([]);
+      deps.listAccounts = vi.fn(async () => {
+        throw new Error("ledger read failed");
+      });
+      render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
+
+      await screen.findByText("ledger read failed");
+      // The false-empty must NOT appear on a transient read failure (the founder's flicker).
+      expect(screen.queryByTestId("accounts-empty")).toBeNull();
+      expect(screen.queryByTestId("accounts-loading")).toBeNull();
+    });
+  });
+
+  // ── EXPIRED login surfaced from the LIVE probe, and the Renew control ──────────────────────────
+  describe("expired-login visibility and Renew", () => {
+    it("flags a signed-in account whose LIVE session is dead as EXPIRED with a Renew control", async () => {
+      // Identity reads signed-in (email present) — the recorded flag says "fine". The live probe
+      // says the CLI session is dead. Without the probe this row would look healthy.
+      const deps = makeDeps([acct("a", { nickname: "Build" })], [], [signedIn("a")]);
+      deps.getAuthStatus = vi.fn(async (): Promise<ClaudeAuthStatus> => ({
+        loggedIn: false,
+        source: "cli",
+        email: "a@example.invalid",
+        authMethod: "oauth",
+        subscriptionType: "max",
+      }));
+
+      render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
+
+      const expired = await screen.findByTestId("account-expired-a");
+      expect(expired.textContent).toContain("Login expired");
+      // The probe was made against THIS account's config dir.
+      expect(deps.getAuthStatus).toHaveBeenCalledWith("/cfg/a");
+      expect(within(expired).getByText("Renew Login")).toBeTruthy();
+    });
+
+    it("clicking Renew opens the login flow for THAT account (asserts the call + args, not just a handler)", async () => {
+      const onLogin = vi.fn();
+      const deps = makeDeps([acct("a", { nickname: "Build" })], [], [signedIn("a")]);
+      deps.getAuthStatus = vi.fn(async (): Promise<ClaudeAuthStatus> => ({
+        loggedIn: false,
+        source: "cli",
+        email: "a@example.invalid",
+        authMethod: "oauth",
+        subscriptionType: "max",
+      }));
+
+      render(<AccountsScreen onLogin={onLogin} deps={deps} />);
+
+      fireEvent.click(await screen.findByTestId("account-renew-a"));
+      // The SIDE EFFECT: re-auth is initiated for exactly this account (config dir /cfg/a).
+      await waitFor(() => expect(onLogin).toHaveBeenCalledTimes(1));
+      expect(onLogin.mock.calls[0]![0]).toMatchObject({ id: "a", configDir: "/cfg/a" });
+    });
+
+    it("does NOT flag a healthy signed-in account as expired (the paired negative)", async () => {
+      const deps = makeDeps([acct("a", { nickname: "Build" })], [], [signedIn("a")]);
+      deps.getAuthStatus = vi.fn(async (): Promise<ClaudeAuthStatus> => ({
+        loggedIn: true,
+        source: "cli",
+        email: "a@example.invalid",
+        authMethod: "oauth",
+        subscriptionType: "max",
+      }));
+
+      render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
+
+      await screen.findByTestId("account-row-a");
+      // Give the probe a tick to resolve, then confirm no expired card and no blocked card.
+      await waitFor(() => expect(deps.getAuthStatus).toHaveBeenCalled());
+      expect(screen.queryByTestId("account-expired-a")).toBeNull();
+      expect(screen.queryByTestId("account-blocked-a")).toBeNull();
+    });
   });
 });

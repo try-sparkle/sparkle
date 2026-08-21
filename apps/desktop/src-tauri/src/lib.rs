@@ -1108,6 +1108,8 @@ pub fn run() {
             account_ledger::accounts_record_spawn,
             account_ledger::accounts_spawn_log,
             account_usage::account_usage_live,
+            account_usage::account_set_oauth_token,
+            accounts::account_record_oauth_identity,
             trial::trial_status,
             trial::trial_start,
             // The hot path. `trial_increment` (a device-local bump) is deliberately GONE: the

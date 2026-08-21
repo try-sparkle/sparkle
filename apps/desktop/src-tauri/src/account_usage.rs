@@ -895,9 +895,166 @@ fn fetch_usage_with(
     }
 }
 
+// ---- Add / renew an account by a pasted long-lived token -----------------------------------------
+
+/// Build the `.credentials.json` blob a pasted long-lived token is stored as. Shaped exactly like
+/// the credential Claude Code writes and [`extract_credentials`] reads: `claudeAiOauth.accessToken`
+/// is the pasted token; `refreshToken` is null (a `claude setup-token` carries none); `expiresAt` is
+/// `0` = UNKNOWN. The `0` is deliberate honesty — a setup-token lasts ≈1 year but we cannot read its
+/// real expiry from the string, so we do NOT fabricate one: `cache_is_fresh` treats `0` as stale (a
+/// harmless extra file read) and any nearing-expiry UI stays silent rather than warning on a guess.
+/// Pure — never logs the token.
+fn credentials_blob(token: &str) -> String {
+    serde_json::json!({
+        "claudeAiOauth": {
+            "accessToken": token,
+            "refreshToken": serde_json::Value::Null,
+            "expiresAt": 0,
+        }
+    })
+    .to_string()
+}
+
+/// Trim a pasted token and reject an empty/whitespace-only one. Extracted as a pure helper so BOTH
+/// branches are unit-testable — the guard is load-bearing: without it a blank paste writes an
+/// `{"accessToken":""}` blob over a working credential. Never logs the token.
+fn validated_token(raw: &str) -> Result<String, String> {
+    let t = raw.trim();
+    if t.is_empty() {
+        return Err("Paste a token first — the field was empty.".to_string());
+    }
+    Ok(t.to_string())
+}
+
+/// Write `bytes` to `path` at mode 0600 (owner-only). Unlike [`write_cache_file`] it RETURNS the
+/// error instead of swallowing it, because it backs a user action whose failure the UI must surface.
+/// Never logs the contents.
+///
+/// It writes to a sibling temp file CREATED at 0600 and renames it into place, rather than truncating
+/// `path` directly. That closes a real window: `OpenOptions::mode` applies only at *creation*, so
+/// truncating a PRE-EXISTING `.credentials.json` (the renew path — a file Claude Code may have written
+/// 0644, or a looser leftover) would fully write the new token while the OLD mode was still in effect,
+/// and only chmod it afterward. A create-at-0600 temp + atomic rename never exposes the credential at
+/// a looser mode and replaces the target atomically.
+fn write_secret_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let tmp = path.with_extension("json.tmp");
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)
+            .map_err(|e| format!("open {}: {e}", tmp.display()))?;
+        f.write_all(bytes)
+            .map_err(|e| format!("write {}: {e}", tmp.display()))?;
+        // Re-assert 0600 in case the temp pre-existed (a prior crashed write) with a looser mode.
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("chmod {}: {e}", tmp.display()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(&tmp, bytes).map_err(|e| format!("write {}: {e}", tmp.display()))?;
+    }
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("install {}: {e}", path.display())
+    })
+}
+
+/// Store a pasted long-lived OAuth token (`claude setup-token`, ≈1 year, keeps SUBSCRIPTION billing)
+/// as `<config_dir>/.credentials.json` at 0600, so an agent spawned with
+/// `CLAUDE_CONFIG_DIR=<config_dir>` authenticates with it — the same file Claude Code reads natively
+/// and [`read_access_token_cached`] reads first (step 1). This is the durable answer to the 8–12h
+/// interactive-OAuth churn: add or RENEW an account without a browser login.
+///
+/// The token never leaves Rust in a log and is written owner-only. Sparkle's own token cache for the
+/// dir is invalidated so a previously-cached expired token cannot shadow the new one. This command
+/// only WRITES the credential; the frontend re-probes `claude auth status` afterward to confirm the
+/// token actually authenticates before it reports success — so a token the CLI rejects surfaces as a
+/// failure to the user rather than a silent inert "added".
+#[tauri::command]
+pub async fn account_set_oauth_token(config_dir: String, token: String) -> Result<(), String> {
+    let token = validated_token(&token)?;
+    tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
+        let home = std::env::var("HOME").ok();
+        let dir = resolve_config_dir_with(&config_dir, home.as_deref())?;
+        std::fs::create_dir_all(&dir).map_err(|e| format!("create config dir: {e}"))?;
+        let path = Path::new(&dir).join(".credentials.json");
+        write_secret_file(&path, credentials_blob(&token).as_bytes())?;
+        // A stale cached token would otherwise be served ahead of the file we just wrote.
+        invalidate_cache(&config_dir);
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("set token task failed: {e}"))?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A pasted token round-trips through the SAME reader an agent spawn uses: what we write as the
+    /// credential is exactly the token the bearer read hands back. Mutation guard — write the wrong
+    /// field in `credentials_blob` and `extract_access_token` returns None, reddening this.
+    #[test]
+    fn a_pasted_token_is_stored_where_the_spawn_reads_it() {
+        let blob = credentials_blob("sk-ant-oat01-EXAMPLE");
+        let creds = extract_credentials(&blob).expect("must parse as a credential");
+        assert_eq!(creds.access_token, "sk-ant-oat01-EXAMPLE");
+        assert_eq!(creds.refresh_token, None, "a setup-token carries no refresh token");
+        assert_eq!(creds.expires_at, 0, "unknown expiry is stored as 0, not fabricated");
+        // The bearer read the agent authenticates with returns exactly the pasted token.
+        assert_eq!(
+            extract_access_token(&blob).as_deref(),
+            Some("sk-ant-oat01-EXAMPLE"),
+        );
+    }
+
+    /// The credential file is written owner-only (0600) and reads back as the same token — the
+    /// on-disk SIDE EFFECT the add-via-token path depends on.
+    #[test]
+    fn write_secret_file_is_owner_only_and_reads_back() {
+        let tmp = std::env::temp_dir().join(format!(
+            "-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let path = tmp.join(".credentials.json");
+        write_secret_file(&path, credentials_blob("tok-XYZ").as_bytes()).unwrap();
+
+        let back = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(extract_access_token(&back).as_deref(), Some("tok-XYZ"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "a credential file must be owner-only");
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The empty-token guard the command rides on — asserted on the REAL helper, both branches, so
+    /// deleting `if t.is_empty()` reddens this (a blank paste would otherwise write `{"accessToken":""}`
+    /// over a working credential).
+    #[test]
+    fn validated_token_rejects_blank_and_trims_a_real_one() {
+        assert!(validated_token("   \n\t  ").is_err(), "whitespace must be rejected");
+        assert!(validated_token("").is_err(), "empty must be rejected");
+        assert_eq!(
+            validated_token("  sk-ant-oat01-REAL  ").unwrap(),
+            "sk-ant-oat01-REAL",
+            "a real token is trimmed and accepted",
+        );
+    }
 
     /// The confirmed-live response shape, with NEUTRAL values (never a real account's numbers).
     const FIXTURE: &str = r#"{

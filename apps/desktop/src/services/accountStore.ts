@@ -166,6 +166,27 @@ export function getIdentities(): Promise<Identity[]> {
   return invoke<Identity[]>("accounts_identities");
 }
 
+/** Add or RENEW an account by a pasted long-lived token — a `claude setup-token` value (a
+ *  `sk-ant-oat…` string that lasts ≈1 year and keeps SUBSCRIPTION billing), stored as
+ *  `<configDir>/.credentials.json` (0600) by the Rust side so an agent spawned with
+ *  `CLAUDE_CONFIG_DIR=configDir` authenticates with it — no interactive browser login, no 8–12h
+ *  churn. The token is passed straight to Rust and never persisted on this side. The CALLER must
+ *  re-probe {@link checkClaudeAuthStatus} afterwards to confirm the token actually authenticates
+ *  before reporting success — this only writes the credential. */
+export function setOauthToken(configDir: string, token: string): Promise<void> {
+  return invoke("account_set_oauth_token", { configDir, token });
+}
+
+/** Record a token-authenticated account's identity (its `email`) so it becomes ROUTABLE. A pasted
+ *  token writes only `.credentials.json`, which has no `oauthAccount.emailAddress` — the sole signal
+ *  behind {@link getIdentities}/`isSignedIn`/`pickAccount` — so without this a valid token account
+ *  reads "not signed in" and can never receive a spawn. Call ONLY after a live `claude auth status`
+ *  confirms the login (`loggedIn && source === "cli"`), so the recorded email is one the CLI just
+ *  authenticated with, never a guess. */
+export function recordOauthIdentity(configDir: string, email: string): Promise<void> {
+  return invoke("account_record_oauth_identity", { configDir, email });
+}
+
 // NO TypeScript binding for the Rust `accounts_spend` command lives here any more. It backed the
 // concierge SPEND pill — a trailing-24h estimate of cross-project token value at Anthropic LIST
 // price, in dollars, that only ever counted UP and was never billed. It sat 8px from the remaining

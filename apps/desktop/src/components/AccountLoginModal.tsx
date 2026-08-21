@@ -2,6 +2,7 @@ import { C, MODAL_SHADOW, SCRIM } from "../theme/colors";
 import { FONT_UI, RADIUS } from "../theme/scale";
 import type { Account } from "../services/accountStore";
 import { ClaudeSignIn } from "./ClaudeSignIn";
+import { AccountTokenForm } from "./AccountTokenForm";
 import { ModalLayer } from "./ModalLayer";
 
 // The integrator seam for AccountsScreen's `onLogin` (multi Claude Max design, Task 4). After
@@ -114,6 +115,10 @@ export function AccountLoginModal({ account, onClose }: { account: Account; onCl
               ? `Signing in here changes the Claude login Sparkle uses for this account, stored in ${account.configDir || "~/.claude.json"}. If that is also the config your terminal uses, it changes there too.`
               : "Credentials are stored in this account’s own config folder, separate from your other accounts."}
           </p>
+          {/* The durable alternative to the browser login below: a pasted `claude setup-token`
+              (≈1-year, subscription billing). Closes the modal on a CONFIRMED login, same as the
+              PTY path. Offered for BOTH "Add account" and "Renew Login" (this modal serves both). */}
+          <AccountTokenForm configDir={account.configDir} onSaved={onClose} />
           </div>
           <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column" }}>
             {/* Closes on a CONFIRMED sign-in rather than on the PTY exiting. The old wiring closed
