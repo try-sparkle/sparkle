@@ -55,6 +55,8 @@ import {
 // so the stub that draws an anchor reads the same declaration the host writes.
 import { anchorQuote, pendingAnchors, type ReplyAnchor } from "./Concierge/replyAnchors";
 import { quoteFace, quotePrompt } from "./Concierge/composeQuote";
+// The thread scrubber rail's whole data half — backlog subscription, controller, jump seq counter.
+import { useConciergeScrubberWiring } from "./Concierge/useThreadScrubber";
 import { rememberSentText, SENT_TEXT_LIMIT } from "./Concierge/sentTextLedger";
 // RE-EXPORTED, not just imported: `SENT_TEXT_LIMIT` and `rememberSentText` were exported from this
 // file before they moved, so every existing importer keeps resolving them here.
@@ -7478,6 +7480,8 @@ export function ConciergeHost({
    * moves.
    */
   const messageStatuses = useConciergeMessageStatuses(awaitingId, typing, turnFloor, turnQueue);
+  // The thread scrubber rail's data half, in one call — see the props on <ConciergeColumn> below.
+  const scrubberWiring = useConciergeScrubberWiring();
   const modelWithStatuses: ConciergeViewModel = useMemo(
     () => ({ ...model, statuses: messageStatuses, turnFloor }),
     [model, messageStatuses, turnFloor],
@@ -7492,6 +7496,15 @@ export function ConciergeHost({
         model={modelWithStatuses}
         controller={controller}
         width={width}
+        // ── THE THREAD SCRUBBER RAIL (bead sparkle-7m719) ────────────────────────────────────────
+        // Three props, one hook, and no logic in this file: `useConciergeScrubberWiring` owns the
+        // backlog subscription, the rail's controller and the jump's SEQ COUNTER, so all of that is
+        // testable without mounting this 7,000-line host (see useThreadScrubber's header).
+        // `scrubber` is exposed on the column so mounting <ThreadScrubber> is a one-liner once the
+        // peer branch's view lands.
+        backlog={scrubberWiring.backlog}
+        jumpRequest={scrubberWiring.jumpRequest}
+        scrubber={scrubberWiring.scrubber}
         // THE CABLE. `ConciergeColumn` has carried the flood and the lift since the cockpit landed,
         // keyed off this prop — and NOTHING PASSED IT, so it defaulted to "off" and both treatments
         // were dead code. Wiring an agent changed the shell root's `data-wired` and the two CSS

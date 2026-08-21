@@ -1,7 +1,7 @@
 // The long chat thread: right-aligned user bubbles, left plain Sparkle replies (no
 // "You"/"Sparkle" labels, no left-side glow — alignment and chrome carry authorship), batch
 // dividers, and nudge cards. Auto-follows the newest message.
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { FiCheck } from "react-icons/fi";
 import { useAutoFollow } from "../../hooks/useAutoFollow";
 import { C } from "../../theme/colors";
@@ -35,6 +35,12 @@ import type {
   ConciergeMessage,
   ConciergeNudge,
 } from "./types";
+
+/** The "Earlier — loaded from history" seam between paged-in turns and the live window. */
+export const BACKLOG_DIVIDER_TESTID = "concierge-backlog-divider";
+
+/** The column to the right of the scroller that the caller fills (the scrubber rail lands here). */
+export const THREAD_RAIL_TESTID = "concierge-thread-rail";
 
 // Re-exported: these ids named this module before the per-message rendering moved into its own
 // component, and the thread is still where a reader looks for them.
@@ -72,8 +78,39 @@ export function ConciergeThread({
   wired = false,
   statuses,
   turnFloor,
+  backlog,
+  rail,
+  jumpRequest,
 }: {
   messages: ConciergeMessage[];
+  /**
+   * Older turns paged in from durable history, rendered ABOVE `messages` with a quiet divider
+   * ("Earlier — loaded from history") so the reader can see where the live window begins.
+   *
+   * WHY IT IS A SEPARATE PROP RATHER THAN PREPENDED INTO `messages` BY THE HOST. Three things here
+   * read `messages` and would be wrong if it silently grew by a few hundred paged-in entries: the
+   * auto-follow `contentKey` (a prepend is not new content and must not scroll anyone), the reply-
+   * anchor index (a restored-window anchor would start claiming backlog bubbles), and
+   * `useSelectionStableThread`'s structure hold. Keeping the two arrays apart means every existing
+   * rule keeps applying to exactly the set it was written for.
+   *
+   * OPTIONAL, and absent means nothing changes — every existing caller and suite renders what it did
+   * before, which is the same contract `statuses` has.
+   */
+  backlog?: ConciergeMessage[];
+  /** A fixed-width column rendered to the RIGHT of the scroller, full height. The thread owns the
+   *  layout; the caller owns what goes in it. (The scrubber rail lands here.) */
+  rail?: ReactNode;
+  /**
+   * Scroll to this message id.
+   *
+   * `{ id, seq }` RATHER THAN A BARE ID BECAUSE PICKING THE SAME DOT TWICE MUST SCROLL TWICE. A
+   * second pick of the same marker sets state to an `Object.is`-equal value, which React bails out
+   * of — no re-render, no effect, no scroll — so the reader clicks a dot, scrolls away, clicks it
+   * again and nothing happens. That is the exact bug `ConciergeAnnouncement`'s seq counter exists to
+   * prevent in `ConciergeHost`; the same counter is the same fix here.
+   */
+  jumpRequest?: { id: string; seq: number };
   typing?: boolean;
   /** What the concierge is doing about each message the user sent, KEYED BY MESSAGE ID and already
    *  phrased by the producer (see ./MessageStatus).
@@ -380,11 +417,44 @@ export function ConciergeThread({
   // user has ever typed in contains a `you` bubble forever, and the host hands this component a fresh
   // array several times a second; a presence test would re-arm on every feed tick and restore bead
   // sparkle-y4ft's "clicking an item scrolls the column" in full.
-  const { onScroll } = useAutoFollow({
+  //
+  // `backlog` IS DELIBERATELY ABSENT FROM BOTH KEYS. Paging older turns in is a PREPEND — it adds
+  // nothing below the reader and answers a request they just made — so folding its length into
+  // `contentKey` would fire the follow and slam the column to the bottom at the exact moment the
+  // scrubber was taking them three days back. That is the most likely way this whole feature ships
+  // looking broken, and it is asserted in ConciergeThread.scrubber.test.tsx.
+  const { onScroll, releaseFollow } = useAutoFollow({
     contentKey,
     rearmKey: newestUserMessageId(visible),
     scrollRef,
   });
+
+  /**
+   * THE RAIL'S PICK, ROUTED THROUGH THE EXISTING `jumpTo`.
+   *
+   * There is exactly one scroll-to-message path in this component and this is not a second one: a
+   * reply anchor and a scrubber dot are the same gesture ("take me to that message") and must land
+   * the same way, flash included.
+   *
+   * KEYED ON `seq`, NOT ON `id` — see the prop's doc. And the follow is RELEASED as part of the
+   * jump: the reader asked to be moved, so new content must not undo it before their own scroll
+   * event has had a chance to demote anything (see useAutoFollow's `releaseFollow`).
+   *
+   * A plain effect, so it runs AFTER the commit that painted the backlog. The host awaits `loadBack`
+   * before it bumps `seq`, but both updates can still batch into one render — and `jumpTo` scans the
+   * DOM, so a jump issued before that paint would find nothing and silently do nothing.
+   */
+  const jumpSeq = jumpRequest?.seq;
+  const jumpId = jumpRequest?.id;
+  useEffect(() => {
+    if (jumpSeq === undefined || jumpId === undefined) return;
+    releaseFollow();
+    jumpTo(jumpId);
+    // `jumpId` is read, not depended on: a repeat pick of the SAME dot must re-run this, and the seq
+    // is what says so. Listing the id as well would be harmless today and wrong the moment two
+    // requests share a seq.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [jumpSeq]);
 
   // ONE MESSAGE, DRAWN — extracted so the transcript and a folded run's expanded members go through
   // the SAME call rather than two prop lists that drift. A receipt inside a fold must render exactly
@@ -436,6 +506,12 @@ export function ConciergeThread({
         flexDirection: "column",
       }}
     >
+      {/* THE ROW. The rail sits BESIDE the scroller, full height, so a drag on it is never a scroll
+          of the transcript. This wrapper takes the `flex: 1` the scroller had and hands it back, so
+          the column's geometry is unchanged — and `CONCIERGE_THREAD_TESTID` /
+          `data-concierge-scroller` stay on the SCROLLER itself, where ComposeBox measures its drag
+          ceiling and `threadScrollerMarker.test.tsx` looks for them. */}
+      <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "row" }}>
       <div
         ref={scrollRef}
         data-testid={CONCIERGE_THREAD_TESTID}
@@ -461,6 +537,35 @@ export function ConciergeThread({
           gap: 12,
         }}
       >
+        {/* PAGED-IN HISTORY, ABOVE THE LIVE WINDOW. Older turns the live thread no longer holds —
+            `conciergeThreadStore` caps it at 200 and trims from the front — fetched back out of
+            SQLite by the scrubber rail. Drawn with the SAME `renderRow` as everything else, because
+            a turn from three days ago is not a different kind of message; only the divider says
+            where the live window begins. Rendered outside the receipt fold on purpose: folding is a
+            display grouping over the CURRENT conversation, and a run spanning the seam between
+            history and live would be a group that changes shape as the backlog grows. */}
+        {backlog && backlog.length > 0 && (
+          <>
+            {backlog.map((m) => renderRow(m))}
+            <div
+              data-testid={BACKLOG_DIVIDER_TESTID}
+              aria-hidden
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 8,
+                margin: "4px 0",
+                fontSize: TYPE.small,
+                color: C.muted,
+                whiteSpace: "nowrap",
+              }}
+            >
+              <span style={{ flex: 1, height: 1, background: C.hairline }} />
+              Earlier — loaded from history
+              <span style={{ flex: 1, height: 1, background: C.hairline }} />
+            </div>
+          </>
+        )}
         {/* FOLDED FIRST, DRAWN SECOND. `foldReceiptRuns` decides which rows collapse; every message
             it does not fold comes through exactly as it always did, and the folded ones are the
             SAME rows rendered inside a disclosure rather than different ones. A refused or partly
@@ -485,6 +590,17 @@ export function ConciergeThread({
           floor={turnFloor ?? Number.POSITIVE_INFINITY}
           activityClaimed={activityClaimed}
         />
+      </div>
+        {/* The caller's column. Not rendered at all when there is nothing to put in it, so a thread
+            with no rail has exactly the DOM it had before this prop existed. */}
+        {rail !== undefined && rail !== null && (
+          <div
+            data-testid={THREAD_RAIL_TESTID}
+            style={{ flexShrink: 0, display: "flex", alignItems: "stretch" }}
+          >
+            {rail}
+          </div>
+        )}
       </div>
       {/* "It's on your clipboard." A check mark, no words, gone in ~1.2s.
           THREE THINGS IT MUST NOT DO, all of them structural rather than stylistic:

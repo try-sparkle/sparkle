@@ -50,6 +50,44 @@ pub struct Hit {
     pub created_at: i64,
 }
 
+/// One dot on the thread scrubber rail (bead `sparkle-7m719`).
+///
+/// PREFIX, NOT TEXT, and that is the whole reason this is a separate row type from [`Hit`]. The rail
+/// draws a dot per prompt across a window that can be a YEAR wide; at the founder's measured rate
+/// (1,234 prompts on 2026-08-05 alone, avg 573 chars) pulling full text for a 1y rail would move
+/// tens of megabytes to render tooltips the reader may never hover. `substr(text, 1, 160)` is done
+/// in SQL so the bytes never leave the database.
+///
+/// EVERY FIELD IS NON-OPTIONAL, deliberately. serde's derive emits `Option::None` as an explicit
+/// `null` rather than omitting the key, and a hand-written TS parser typed `field?: T` describes a
+/// shape the wire cannot produce — an all-or-nothing parser then discards the WHOLE payload and the
+/// feature is silently inert (AGENTS.md records this costing two agents a full parallel build).
+/// Nothing here can be absent, so the seam has no null to disagree about.
+#[derive(Debug, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PromptMarker {
+    /// The frontend's own id for the row. For `source = 'concierge'` this IS the concierge message
+    /// id — `conciergeHistoryCapture.conversationEntry` writes `m.id` straight through — which is
+    /// what lets the rail hand an id back to the thread and have it scroll to that exact bubble.
+    pub id: String,
+    pub created_at: i64,
+    pub text_prefix: String,
+}
+
+/// A full history row inside a time range — what the thread pages IN when the rail is dragged past
+/// the live window (`CONCIERGE_THREAD_MAX = 200` in `stores/conciergeThreadStore.ts`).
+///
+/// Carries whole `text`, unlike [`PromptMarker`]: these become rendered bubbles, so a prefix would
+/// be a truncated message presented as the whole thing. Bounded by the caller's `limit`.
+#[derive(Debug, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct RangeRow {
+    pub id: String,
+    pub kind: String,
+    pub created_at: i64,
+    pub text: String,
+}
+
 impl HistoryDb {
     /// Open `<app_data>/history/history.db` (creating dirs), enable WAL, and ensure the schema.
     pub fn new(app_data_dir: &std::path::Path) -> Result<Self, String> {
@@ -195,6 +233,90 @@ pub(crate) fn search_in(conn: &Connection, query: &str, limit: u32) -> rusqlite:
         })
     })?;
     rows.collect()
+}
+
+/// The longest prompt prefix a rail tooltip ever needs. Chosen to fill the hover card in the
+/// founder's mockup ("Prompt 2: Search public data sources to find me 20 people that are most like
+/// Zoe: linkedin.com/in/siegelzoe -- I'm looking for…") and stop there.
+pub(crate) const PROMPT_PREFIX_CHARS: i64 = 160;
+
+/// Dots for the scrubber rail: the prompts of one `source` inside `[from_ms, to_ms]`, oldest-first.
+///
+/// ── WHY THE LIMIT IS APPLIED NEWEST-FIRST AND THE RESULT THEN REVERSED ────────────────────────
+/// The obvious spelling — `ORDER BY created_at ASC LIMIT ?` — silently truncates the NEWEST end of
+/// a busy window, so a 1y rail would draw last January and nothing since, which reads as "the rail
+/// is broken" rather than "the rail is capped". Taking the newest `limit` rows and reversing them
+/// in Rust keeps the recent end intact, which is the end a reader is actually near.
+///
+/// `deleted_at IS NULL` matches `search_in`: a tombstoned row is not live history. Concierge rows
+/// are never age-tombstoned (see `prune_in_with_max`), but this query is source-agnostic and
+/// `build` rows very much are.
+pub(crate) fn prompts_in_range_in(
+    conn: &Connection,
+    from_ms: i64,
+    to_ms: i64,
+    source: &str,
+    limit: u32,
+) -> rusqlite::Result<Vec<PromptMarker>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, created_at, substr(text, 1, ?5) AS text_prefix
+         FROM entries
+         WHERE source = ?3
+           AND kind = 'prompt'
+           AND deleted_at IS NULL
+           AND created_at >= ?1 AND created_at <= ?2
+         ORDER BY created_at DESC, rowid DESC
+         LIMIT ?4",
+    )?;
+    let rows = stmt.query_map(
+        rusqlite::params![from_ms, to_ms, source, limit, PROMPT_PREFIX_CHARS],
+        |r| {
+            Ok(PromptMarker {
+                id: r.get(0)?,
+                created_at: r.get(1)?,
+                text_prefix: r.get(2)?,
+            })
+        },
+    )?;
+    let mut out: Vec<PromptMarker> = rows.collect::<rusqlite::Result<_>>()?;
+    // Newest-first came out of SQL so the LIMIT kept the right end; the rail wants a time axis.
+    out.reverse();
+    Ok(out)
+}
+
+/// Full rows inside `[from_ms, to_ms]`, oldest-first — the thread's backlog page.
+///
+/// Both kinds (`prompt` and `response`), because a paged-in window that showed only the questions
+/// would be half a conversation. Same newest-first-then-reverse limiting as
+/// [`prompts_in_range_in`], and for the same reason: dragging to an old prompt pages the window
+/// ENDING at that prompt, so the rows nearest it are the ones that must survive the cap.
+pub(crate) fn entries_in_range_in(
+    conn: &Connection,
+    from_ms: i64,
+    to_ms: i64,
+    source: &str,
+    limit: u32,
+) -> rusqlite::Result<Vec<RangeRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, kind, created_at, text
+         FROM entries
+         WHERE source = ?3
+           AND deleted_at IS NULL
+           AND created_at >= ?1 AND created_at <= ?2
+         ORDER BY created_at DESC, rowid DESC
+         LIMIT ?4",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![from_ms, to_ms, source, limit], |r| {
+        Ok(RangeRow {
+            id: r.get(0)?,
+            kind: r.get(1)?,
+            created_at: r.get(2)?,
+            text: r.get(3)?,
+        })
+    })?;
+    let mut out: Vec<RangeRow> = rows.collect::<rusqlite::Result<_>>()?;
+    out.reverse();
+    Ok(out)
 }
 
 /// How many `source = 'concierge'` rows we keep, newest-first.
@@ -358,6 +480,63 @@ pub async fn history_prune(app: AppHandle, cutoff_ms: Option<i64>) -> Result<usi
     })
     .await
     .map_err(|e| format!("history_prune task failed: {e}"))?
+}
+
+/// Default dot budget for one rail. Above this the rail is denser than pixels anyway — the
+/// frontend clusters dots that land within ~6px of each other — so more rows would be drawn on top
+/// of one another at real cost.
+const PROMPTS_IN_RANGE_DEFAULT_LIMIT: u32 = 4_000;
+
+/// Default backlog page. ~20x the live thread's `CONCIERGE_THREAD_MAX` of 200, which is a deep
+/// enough scrollback around one jump target without rendering a day of conversation at once.
+const ENTRIES_IN_RANGE_DEFAULT_LIMIT: u32 = 400;
+
+#[tauri::command]
+pub async fn history_prompts_in_range(
+    app: AppHandle,
+    from_ms: i64,
+    to_ms: i64,
+    source: String,
+    limit: Option<u32>,
+) -> Result<Vec<PromptMarker>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let db = history_db(&app)?;
+        let conn = db.conn.lock().unwrap_or_else(|e| e.into_inner());
+        prompts_in_range_in(
+            &conn,
+            from_ms,
+            to_ms,
+            &source,
+            limit.unwrap_or(PROMPTS_IN_RANGE_DEFAULT_LIMIT),
+        )
+        .map_err(|e| format!("prompts_in_range: {e}"))
+    })
+    .await
+    .map_err(|e| format!("history_prompts_in_range task failed: {e}"))?
+}
+
+#[tauri::command]
+pub async fn history_entries_in_range(
+    app: AppHandle,
+    from_ms: i64,
+    to_ms: i64,
+    source: String,
+    limit: Option<u32>,
+) -> Result<Vec<RangeRow>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let db = history_db(&app)?;
+        let conn = db.conn.lock().unwrap_or_else(|e| e.into_inner());
+        entries_in_range_in(
+            &conn,
+            from_ms,
+            to_ms,
+            &source,
+            limit.unwrap_or(ENTRIES_IN_RANGE_DEFAULT_LIMIT),
+        )
+        .map_err(|e| format!("entries_in_range: {e}"))
+    })
+    .await
+    .map_err(|e| format!("history_entries_in_range task failed: {e}"))?
 }
 
 #[cfg(test)]
@@ -721,5 +900,191 @@ mod tests {
             record_into(&conn, &entry(&format!("{i}"), "prompt", "rust", 1000 + i)).unwrap();
         }
         assert_eq!(search_in(&conn, "rust", 2).unwrap().len(), 2);
+    }
+
+    // ── SCRUBBER RAIL RANGE QUERIES (bead sparkle-7m719) ─────────────────────────────────────
+
+    /// A `source = 'concierge'` response row — the rail must NOT draw a dot for one, and the
+    /// backlog page MUST include it.
+    fn concierge_response(id: &str, text: &str, created_at: i64) -> EntryInput {
+        sourced_entry("concierge", id, "response", text, created_at)
+    }
+
+    fn marker_ids(rows: &[PromptMarker]) -> Vec<&str> {
+        rows.iter().map(|m| m.id.as_str()).collect()
+    }
+
+    #[test]
+    fn prompts_in_range_returns_concierge_prompts_oldest_first() {
+        let conn = mem();
+        // Deliberately inserted out of order, so passing this cannot be an accident of insert order.
+        record_into(&conn, &concierge("c3", "third", 3_000)).unwrap();
+        record_into(&conn, &concierge("c1", "first", 1_000)).unwrap();
+        record_into(&conn, &concierge("c2", "second", 2_000)).unwrap();
+
+        let got = prompts_in_range_in(&conn, 0, 10_000, "concierge", 100).unwrap();
+        assert_eq!(marker_ids(&got), vec!["c1", "c2", "c3"]);
+        assert_eq!(got[0].created_at, 1_000);
+        assert_eq!(got[0].text_prefix, "first");
+    }
+
+    #[test]
+    fn prompts_in_range_excludes_responses_other_sources_and_tombstones() {
+        let conn = mem();
+        record_into(&conn, &concierge("keep", "a question", 1_000)).unwrap();
+        record_into(&conn, &concierge_response("resp", "an answer", 1_100)).unwrap();
+        record_into(&conn, &entry("build", "prompt", "a build prompt", 1_200)).unwrap();
+        record_into(&conn, &concierge("dead", "tombstoned", 1_300)).unwrap();
+        conn.execute("UPDATE entries SET deleted_at = 9 WHERE id = 'dead'", []).unwrap();
+
+        // Every excluded row IS in the table and IS inside the window — so this asserts the WHERE
+        // clause, not an empty database.
+        assert_eq!(count(&conn), 4);
+        assert_eq!(marker_ids(&prompts_in_range_in(&conn, 0, 10_000, "concierge", 100).unwrap()), vec!["keep"]);
+    }
+
+    #[test]
+    fn prompts_in_range_window_bounds_are_inclusive_and_exclude_outside() {
+        let conn = mem();
+        record_into(&conn, &concierge("before", "too old", 999)).unwrap();
+        record_into(&conn, &concierge("lo", "on the lower bound", 1_000)).unwrap();
+        record_into(&conn, &concierge("hi", "on the upper bound", 2_000)).unwrap();
+        record_into(&conn, &concierge("after", "too new", 2_001)).unwrap();
+
+        let got = prompts_in_range_in(&conn, 1_000, 2_000, "concierge", 100).unwrap();
+        assert_eq!(marker_ids(&got), vec!["lo", "hi"]);
+    }
+
+    /// THE LIMIT KEEPS THE NEWEST ROWS, NOT THE OLDEST — the whole reason the query orders DESC and
+    /// the result is reversed in Rust. Written against a window that is deliberately WIDER than the
+    /// data: `ORDER BY created_at ASC LIMIT 2` would answer c1,c2 here, which is a rail showing the
+    /// distant past and nothing recent. Mutating the DESC (or dropping the `reverse`) reds this.
+    #[test]
+    fn prompts_in_range_limit_keeps_the_newest_rows_still_oldest_first() {
+        let conn = mem();
+        for i in 1..=5 {
+            record_into(&conn, &concierge(&format!("c{i}"), "q", i * 1_000)).unwrap();
+        }
+        let got = prompts_in_range_in(&conn, 0, 100_000, "concierge", 2).unwrap();
+        assert_eq!(marker_ids(&got), vec!["c4", "c5"], "the limit must drop the OLDEST end");
+    }
+
+    #[test]
+    fn prompts_in_range_truncates_long_text_to_the_prefix_cap() {
+        let conn = mem();
+        let long = "x".repeat(500);
+        record_into(&conn, &concierge("long", &long, 1_000)).unwrap();
+        record_into(&conn, &concierge("short", "hi", 1_100)).unwrap();
+
+        let got = prompts_in_range_in(&conn, 0, 10_000, "concierge", 100).unwrap();
+        assert_eq!(got[0].text_prefix.chars().count(), PROMPT_PREFIX_CHARS as usize);
+        // …and a short prompt is returned whole, not padded or clipped to something shorter.
+        assert_eq!(got[1].text_prefix, "hi");
+    }
+
+    #[test]
+    fn entries_in_range_returns_both_kinds_with_full_text_oldest_first() {
+        let conn = mem();
+        let long = "y".repeat(500);
+        record_into(&conn, &concierge("q", &long, 1_000)).unwrap();
+        record_into(&conn, &concierge_response("a", "an answer", 1_100)).unwrap();
+        record_into(&conn, &entry("build", "prompt", "not mine", 1_050)).unwrap();
+
+        let got = entries_in_range_in(&conn, 0, 10_000, "concierge", 100).unwrap();
+        assert_eq!(got.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(), vec!["q", "a"]);
+        assert_eq!(got[0].kind, "prompt");
+        assert_eq!(got[1].kind, "response");
+        // FULL text, unlike the rail's prefix — a paged-in bubble must not be a truncated message
+        // presented as the whole thing.
+        assert_eq!(got[0].text.chars().count(), 500);
+    }
+
+    /// THE SEAM PIN. Both halves of this wire are separately green even when they disagree — the
+    /// Rust suite never sees the TS types and vice versa — which is exactly how a feature ships
+    /// completely inert. So the field NAMES are asserted against the one fixture the TypeScript
+    /// suite also parses (`services/history.wire.test.ts`): rename a field on either side and BOTH
+    /// suites go red, rather than neither.
+    #[test]
+    fn range_row_shapes_match_the_shared_wire_fixture() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("shared")
+            .join("history-range-wire.json");
+        let raw = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let fixture: serde_json::Value = serde_json::from_str(&raw).expect("fixture is valid JSON");
+        assert_eq!(fixture["version"].as_i64(), Some(1), "wire version is frozen at 1");
+
+        let marker = PromptMarker {
+            id: "you-42".into(),
+            created_at: 1_754_400_000_000,
+            text_prefix: "Search public data sources to find me 20 people that are most like Zoe"
+                .into(),
+        };
+        assert_eq!(
+            serde_json::to_value(&marker).unwrap(),
+            fixture["promptMarker"],
+            "PromptMarker drifted from apps/desktop/shared/history-range-wire.json"
+        );
+
+        let row = RangeRow {
+            id: "you-42".into(),
+            kind: "prompt".into(),
+            created_at: 1_754_400_000_000,
+            text: "Search public data sources to find me 20 people that are most like Zoe: I'm looking for..."
+                .into(),
+        };
+        assert_eq!(
+            serde_json::to_value(&row).unwrap(),
+            fixture["rangeRow"],
+            "RangeRow drifted from apps/desktop/shared/history-range-wire.json"
+        );
+    }
+
+    /// `entries_in_range_in`'s OWN filters, not `prompts_in_range_in`'s (roborev 66374).
+    ///
+    /// The two are independent SQL strings, not a shared clause, so the coverage on one says
+    /// nothing about the other: deleting `AND deleted_at IS NULL` from THIS query left the whole
+    /// suite green. The user-visible consequence is a retention hole — a pruned or tombstoned row
+    /// would reappear as a rendered bubble the moment the rail pages that window in, and this
+    /// backlog read is the only place that happens.
+    #[test]
+    fn entries_in_range_excludes_tombstones_other_sources_and_out_of_window_rows() {
+        let conn = mem();
+        record_into(&conn, &concierge("keep", "in window", 1_500)).unwrap();
+        record_into(&conn, &concierge_response("keep-a", "its answer", 1_600)).unwrap();
+        record_into(&conn, &concierge("dead", "tombstoned", 1_700)).unwrap();
+        conn.execute("UPDATE entries SET deleted_at = 9 WHERE id = 'dead'", []).unwrap();
+        record_into(&conn, &entry("build", "prompt", "another source", 1_800)).unwrap();
+        record_into(&conn, &concierge("before", "too old", 999)).unwrap();
+        record_into(&conn, &concierge("after", "too new", 2_001)).unwrap();
+
+        // Every excluded row IS in the table, so this asserts the WHERE clause and not an empty DB.
+        assert_eq!(count(&conn), 6);
+        let got = entries_in_range_in(&conn, 1_000, 2_000, "concierge", 100).unwrap();
+        assert_eq!(
+            got.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec!["keep", "keep-a"]
+        );
+    }
+
+    /// The window bounds are INCLUSIVE at both ends, asserted for this query in its own right.
+    #[test]
+    fn entries_in_range_window_bounds_are_inclusive() {
+        let conn = mem();
+        record_into(&conn, &concierge("lo", "on the lower bound", 1_000)).unwrap();
+        record_into(&conn, &concierge("hi", "on the upper bound", 2_000)).unwrap();
+        let got = entries_in_range_in(&conn, 1_000, 2_000, "concierge", 100).unwrap();
+        assert_eq!(got.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(), vec!["lo", "hi"]);
+    }
+
+    #[test]
+    fn entries_in_range_limit_keeps_the_newest_rows_still_oldest_first() {
+        let conn = mem();
+        for i in 1..=5 {
+            record_into(&conn, &concierge(&format!("c{i}"), "q", i * 1_000)).unwrap();
+        }
+        let got = entries_in_range_in(&conn, 0, 100_000, "concierge", 2).unwrap();
+        assert_eq!(got.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(), vec!["c4", "c5"]);
     }
 }

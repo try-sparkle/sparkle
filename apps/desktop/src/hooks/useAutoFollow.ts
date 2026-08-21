@@ -62,6 +62,33 @@ export interface AutoFollow {
    *  a backwards page yanks the view down by the height of everything just inserted, which reads as
    *  the app throwing away your place the moment you scroll up. */
   restoreAfterPrepend: (previousHeight: number) => void;
+  /**
+   * Disarm the follow NOW, synchronously — for a caller that is about to scroll the reader somewhere
+   * DELIBERATE and must not be undone (beads `sparkle-1wqls`, `sparkle-7m719`).
+   *
+   * The one case that is neither of the two this hook already knows about: not new content
+   * arriving, and not the reader scrolling. It is the reader ASKING to be moved — picking a dot on
+   * the scrubber rail from three days ago — and `scrollIntoView` is how they get there.
+   *
+   * ── WHY A SCROLL IS NOT ENOUGH, WHICH IS THE WHOLE BUG ────────────────────────────────────────
+   * Everything else here demotes the follow from the reader's own scroll EVENT, and that is right:
+   * new content must never move anyone. But a programmatic jump — `ConciergeThread.jumpTo`, the
+   * scrubber rail, a reply anchor — scrolls with `behavior: "smooth"`, and the browser dispatches
+   * that event ASYNCHRONOUSLY, one eased frame at a time. {@link FOLLOW_THRESHOLD_PX} is 24, so the
+   * opening frames of the animation still read `atBottom === true` and `followRef` stays ARMED for
+   * the first tens of milliseconds.
+   *
+   * Any `contentKey` change inside that window runs the follow effect, which writes
+   * `el.scrollTop = el.scrollHeight` and slams the reader back to the bottom — cancelling the jump.
+   * And `contentKey` folds in TOTAL TEXT LENGTH, so a streaming reply changes it once per delta:
+   * the window is most likely to be hit exactly when the column is busy, which is exactly when
+   * someone reaches for a jump. The reader sees the target bubble flash its highlight OFF SCREEN
+   * while they sit at the bottom wondering why the click did nothing.
+   *
+   * Not a one-way door: reaching the bottom re-arms through `onScroll` as normal, and so does the
+   * reader's own submit through `rearmKey`. This only says "not right now".
+   */
+  releaseFollow: () => void;
 }
 
 export function useAutoFollow({
@@ -209,5 +236,18 @@ export function useAutoFollow({
     lastTopRef.current = el.scrollTop;
   }, [scrollRef]);
 
-  return { scrollRef, onScroll, measureBeforePrepend, restoreAfterPrepend };
+  // See the interface doc for why a jump cannot rely on its own scroll event to demote the follow.
+  //
+  // ONE LINE, DELIBERATELY. The first draft also resynced `lastTopRef` to the current position, on
+  // the reasoning that a stale baseline would make an eased frame read as `readerMoved === false`
+  // and silently re-arm. `mutation-check --line` refuted that: blanking the resync left every test
+  // green, and reading `onScroll` back shows why it must — `atBottom` re-arms UNCONDITIONALLY and is
+  // the only thing that sets `followRef` true, so `readerMoved` cannot affect the follow state in
+  // any branch. It was an inert line with a confident comment on it, which is worse than no line.
+  // Do not add it back without a test that goes red without it.
+  const releaseFollow = useCallback(() => {
+    followRef.current = false;
+  }, []);
+
+  return { scrollRef, onScroll, measureBeforePrepend, restoreAfterPrepend, releaseFollow };
 }

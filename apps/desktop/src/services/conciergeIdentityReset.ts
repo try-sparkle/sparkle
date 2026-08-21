@@ -61,6 +61,7 @@ import { resetConciergeSession } from "./concierge";
 import { clearConciergeApprovals } from "../stores/conciergeApprovals";
 import { clearConciergeEventLog } from "../stores/conciergeEventLog";
 import { clearConciergeThread } from "../stores/conciergeThreadStore";
+import { clearConciergeBacklog } from "../stores/conciergeBacklogStore";
 import { clearConciergeReceiptBacklog, clearPostedReceiptIds } from "./conciergeReceipts";
 import { clearPromiseLedger } from "./conciergePromiseLedger";
 
@@ -76,6 +77,14 @@ export function resetConciergeIdentityState(): void {
   clearConciergeApprovals();
   clearConciergeEventLog();
   clearConciergeThread();
+  // ITS PAGED-IN OTHER HALF (bead sparkle-7m719). The thread scrubber rail loads turns OLDER than
+  // the live 200-message window back out of SQLite and holds them here, so this store contains the
+  // same class of content `clearConciergeThread` above exists for — the human's own words, verbatim
+  // — and more of it than the visible thread ever holds. It is not `persist`ed, so it does not
+  // survive a relaunch; it does survive a sign-out on a live process, which is the only moment this
+  // module is about. Registered in the commit that created the store rather than a roborev round
+  // later, which is the one thing every previous instance in this header got wrong.
+  clearConciergeBacklog();
   // AND THE FIFTH (roborev 57888). The receipt REPLAY BUFFER holds agent names, PR numbers, bead ids
   // and the tool's verbatim refusal text — an index of what the previous human's concierge did — and
   // its whole purpose is a replay path into the next subscriber's thread. A receipt never posted

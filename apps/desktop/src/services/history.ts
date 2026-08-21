@@ -82,3 +82,81 @@ export async function searchHistory(query: string, limit?: number): Promise<Hist
 export async function pruneHistory(cutoffMs: number | null): Promise<number> {
   return await invoke<number>("history_prune", { cutoffMs });
 }
+
+// ── THE THREAD SCRUBBER RAIL'S TWO TIME-INDEXED READS (bead `sparkle-7m719`) ──────────────────────
+//
+// The rail is a ZOOM over a time axis, not a filter over the visible thread, so it needs history by
+// TIME rather than by relevance — `searchHistory` above cannot answer it at any scope. Both of these
+// go through the `idx_entries_created` index that has existed since the store was built.
+//
+// EVERY FIELD BELOW IS NON-OPTIONAL, and that is a deliberate property of the seam rather than a
+// happy accident. A Rust `Option` crosses the wire as an explicit `null` (serde's derive emits the
+// key), which `field?: T` does not include — a hand-written TS type in that shape describes a
+// payload the wire cannot produce, and an all-or-nothing parser then throws the WHOLE response away
+// and the feature is silently inert forever. The Rust structs (`PromptMarker` / `RangeRow` in
+// src-tauri/src/history.rs) carry no `Option` at all, so there is no null for the two halves to
+// disagree about. Keep it that way: if one of these ever needs an absent value, write `T | null`
+// here, never `?: T`.
+
+/** One dot on the rail: a prompt, its instant, and enough text for the hover card. */
+export interface PromptMarkerRow {
+  /** The id the frontend minted for this row. For `source: "concierge"` it IS the concierge message
+   *  id — `conciergeHistoryCapture` writes `m.id` straight through — which is what lets the rail
+   *  hand an id back to the thread and have it scroll to that exact bubble. */
+  id: string;
+  createdAt: number; // epoch ms
+  /** First 160 chars of the prompt, truncated in SQL. A 1y rail over the founder's measured volume
+   *  would otherwise move tens of MB to draw tooltips nobody hovers. */
+  textPrefix: string;
+}
+
+/** A full history row inside a window — what the thread pages IN behind the live 200-message cap. */
+export interface HistoryRangeRow {
+  id: string;
+  kind: HistoryKind;
+  createdAt: number;
+  /** WHOLE text, unlike {@link PromptMarkerRow.textPrefix}: these become rendered bubbles, and a
+   *  prefix would be a truncated message presented as the whole thing. */
+  text: string;
+}
+
+/**
+ * Dots for the rail: prompts of one source inside `[fromMs, toMs]`, OLDEST-FIRST.
+ *
+ * `limit` caps the dots (Rust default 4,000) and drops from the OLDEST end, never the newest — a
+ * capped rail showing last January and nothing since would read as broken rather than as capped.
+ */
+export async function promptsInRange(
+  fromMs: number,
+  toMs: number,
+  source: HistorySource,
+  limit?: number,
+): Promise<PromptMarkerRow[]> {
+  return await invoke<PromptMarkerRow[]>("history_prompts_in_range", {
+    fromMs,
+    toMs,
+    source,
+    limit,
+  });
+}
+
+/**
+ * A backlog page: every live row of one source inside `[fromMs, toMs]`, OLDEST-FIRST, both kinds.
+ *
+ * Both kinds on purpose — a paged-in window showing only the questions would be half a
+ * conversation. Same oldest-end capping as {@link promptsInRange} (Rust default 400, ~20x the live
+ * thread's `CONCIERGE_THREAD_MAX`).
+ */
+export async function entriesInRange(
+  fromMs: number,
+  toMs: number,
+  source: HistorySource,
+  limit?: number,
+): Promise<HistoryRangeRow[]> {
+  return await invoke<HistoryRangeRow[]>("history_entries_in_range", {
+    fromMs,
+    toMs,
+    source,
+    limit,
+  });
+}

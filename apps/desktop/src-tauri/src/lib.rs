@@ -1054,6 +1054,20 @@ pub fn run() {
             history::history_record,
             history::history_search,
             history::history_prune,
+            // The thread scrubber rail's two time-indexed reads (bead sparkle-7m719): the dots for
+            // the rail, and the backlog page the thread loads when the rail is dragged past the
+            // live 200-message window.
+            //
+            // DROPPING A LINE HERE IS CAUGHT BY NOTHING AT COMPILE TIME. `generate_handler!` does
+            // not call the fn; it invokes a macro emitted beside the definition, so an unregistered
+            // command is still a valid `pub fn`, the crate builds with zero errors and zero
+            // warnings, and the frontend's `invoke()` fails only at RUNTIME with "command not
+            // found". These two were in fact missing for four commits of this branch — every rail
+            // query rejected, and both callers turn a rejection into an empty result, which is
+            // indistinguishable from "no history". `scripts/lib/tauri-handler-guard.sh` is the
+            // check; run it rather than trusting a green build.
+            history::history_prompts_in_range,
+            history::history_entries_in_range,
             transcript::read_transcript_last_assistant,
             // Mounted-agent conversation: bounded backwards paging + incremental tailing of the
             // agent's own Claude Code JSONL transcripts.

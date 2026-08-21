@@ -12,7 +12,7 @@
 // exactly as they did there. Routing them through the view-model would have meant teaching the
 // concierge's data layer about the mic and the entitlement for no gain; the column stays a pure
 // renderer of everything it is actually GIVEN.
-import { useMemo } from "react";
+import { useMemo, type ReactNode } from "react";
 import { CONCIERGE_COLUMN_DND_TARGET } from "../../services/dndTargets";
 import { BLUEPRINT } from "../../theme/blueprintSpec";
 import { C } from "../../theme/colors";
@@ -31,6 +31,8 @@ import { ConciergeAiLocked } from "./ConciergeAiLocked";
 import { ConciergeUnavailable } from "./ConciergeUnavailable";
 import { useConciergeAiLock } from "./conciergeAiLock";
 import { ConciergeThread } from "./ConciergeThread";
+import { ThreadScrubber } from "./ThreadScrubber";
+import type { ThreadScrubberController } from "./useThreadScrubber";
 import { MountedAgentThread } from "./MountedAgentThread";
 import { MountedNotice } from "./MountedNotice";
 import { MountedAgentNotices } from "./MountedAgentNotices";
@@ -44,7 +46,12 @@ import { formatBinding } from "../../keyboardHints/keybindings";
 import { useKeybindingsStore } from "../../stores/keybindingsStore";
 import { pillStyle } from "./pillStyle";
 import { wordmarkRamp } from "./wordmarkRamp";
-import type { ConciergeAnnouncement, ConciergeColumnProps, ConciergeNudge } from "./types";
+import type {
+  ConciergeAnnouncement,
+  ConciergeColumnProps,
+  ConciergeMessage,
+  ConciergeNudge,
+} from "./types";
 import { FONT_UI, TYPE } from "../../theme/scale";
 // The SAME dot the sidebar row draws, so the chip and the row cannot disagree about what
 // green/gray/red mean — the chip exists to report how that agent is doing (bead sparkle-wj3ya).
@@ -173,6 +180,36 @@ function ConciergeGrip({ onMoveSide }: { onMoveSide: () => void }) {
   );
 }
 
+/**
+ * THE SCRUBBER RAIL'S PASS-THROUGH — declared HERE rather than added to `ConciergeColumnProps`.
+ *
+ * `Concierge/types.ts` is the shared contract file and is edited on several branches at once; three
+ * optional props that this column only forwards do not need to be in it, and putting them there
+ * would put a merge conflict between this feature and every sibling branch that touches the model.
+ * Everything below is straight through — the column composes none of it.
+ */
+export interface ConciergeScrubberProps {
+  /** Older turns paged in from durable history, rendered above the live thread (ConciergeThread). */
+  backlog?: ConciergeMessage[];
+  /** The rail itself. The ORCHESTRATOR mounts `<ThreadScrubber>` here once both halves of bead
+   *  sparkle-7m719 have merged; this column only reserves the slot and hands it down. */
+  rail?: ReactNode;
+  /** Scroll the thread to this message id. `{ id, seq }` so the same dot picked twice scrolls
+   *  twice — see ConciergeThread's prop doc. */
+  jumpRequest?: { id: string; seq: number };
+  /**
+   * The rail's controller — markers, scope, position, `onSeek`/`onPick`.
+   *
+   * MOUNTED at the `rail` prop below. Carried as a prop rather than reached for with
+   * `useThreadScrubber()` here so there is exactly ONE controller instance for the column and the
+   * host — two would fetch twice and disagree about `position` and `now`.
+   *
+   * `rail` still wins when given, so a test (or a future surface) can put its own thing in the
+   * gutter without going through the controller.
+   */
+  scrubber?: ThreadScrubberController;
+}
+
 export function ConciergeColumn({
   model,
   controller,
@@ -206,7 +243,12 @@ export function ConciergeColumn({
   registerSubmit,
   onOpenAgent,
   onSeeAgentHistory,
-}: ConciergeColumnProps) {
+  backlog,
+  rail,
+  jumpRequest,
+  // Spread into `<ThreadScrubber>` at the `rail` prop below.
+  scrubber,
+}: ConciergeColumnProps & ConciergeScrubberProps) {
   // Why the paid half isn't running, or null when it is. Like the two brand-chrome pieces in the
   // header, this reaches for its own stores rather than the view-model (see ./conciergeAiLock).
   const aiLock = useConciergeAiLock();
@@ -762,6 +804,36 @@ export function ConciergeColumn({
               // — the host owns which message is being worked on, and the row owns how it reads.
               statuses={model.statuses}
               turnFloor={model.turnFloor}
+              // ── THE SCRUBBER RAIL, STRAIGHT THROUGH (bead sparkle-7m719) ──────────────────────
+              // Not composed here and not conditioned on anything: the host owns which turns have
+              // been paged in and which message the rail asked for, and the thread owns the layout.
+              // MOUNTED-AGENT MODE DELIBERATELY GETS NONE OF IT — the sibling above is a different
+              // agent's transcript, and a rail over the concierge's history sitting beside it would
+              // be a control that scrolls a conversation that is not on screen.
+              backlog={backlog}
+              /* THE RAIL ITSELF (bead sparkle-7m719) — the founder's "vertical slider bar that
+                 makes it easy to scroll up and down the chat page", asked for four times over
+                 sixteen days. The view is presentational and the controller holds every decision,
+                 so this is a spread of the controller's fields and nothing more. An explicit
+                 `rail` prop still wins, which is what keeps the gutter injectable. */
+              rail={
+                rail ??
+                (scrubber ? (
+                  <ThreadScrubber
+                    markers={scrubber.markers}
+                    scope={scrubber.scope}
+                    onScopeChange={scrubber.setScope}
+                    now={scrubber.now}
+                    position={scrubber.position}
+                    onSeek={scrubber.onSeek}
+                    onPick={scrubber.onPick}
+                    /* So a rejected history query cannot read as a quiet week — both draw zero
+                       dots, and only the rail can say which one this is (roborev 66429). */
+                    failed={scrubber.failed}
+                  />
+                ) : undefined)
+              }
+              jumpRequest={jumpRequest}
               onNudgeClick={controller.onNudgeClick}
               onRevealAgent={controller.onRevealAgent}
               onNudgeAction={controller.onNudgeAction}

@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "_why": [
+    "ONE fixture, parsed by BOTH halves of the scrubber rail's Rust->TS seam (bead sparkle-7m719).",
+    "The Rust suite asserts that serde's derive produces exactly these objects for PromptMarker and",
+    "RangeRow (src-tauri/src/history.rs); the TypeScript suite asserts that PromptMarkerRow and",
+    "HistoryRangeRow (src/services/history.ts) read exactly these keys. A field renamed on one side",
+    "reds a test on BOTH, which is the point: two green suites either side of a wire that disagrees",
+    "is the measured way a feature ships completely inert (AGENTS.md, 'A Rust Option crosses the",
+    "wire as null'). Every field here is non-optional by construction, so there is no null case.",
+    "The ids look like concierge message ids on purpose: for source='concierge' the history row id",
+    "IS the message id, which is what lets the rail scroll the thread to a specific bubble."
+  ],
+  "promptMarker": {
+    "id": "you-42",
+    "createdAt": 1754400000000,
+    "textPrefix": "Search public data sources to find me 20 people that are most like Zoe"
+  },
+  "rangeRow": {
+    "id": "you-42",
+    "kind": "prompt",
+    "createdAt": 1754400000000,
+    "text": "Search public data sources to find me 20 people that are most like Zoe: I'm looking for..."
+  }
+}
