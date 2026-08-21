@@ -210,10 +210,28 @@ pub struct StaleDiagnosis {
     /// Absolute path of the OTHER worktree holding `default_branch`; empty when none does — or when
     /// this root is itself the holder, which is not a conflict.
     pub held_by: String,
-    /// Lines of `status --porcelain --untracked-files=all`.
+    /// Entries in `status --porcelain -z --untracked-files=all` — one per changed path, and one
+    /// (not two) for a rename, which nonetheless contributes BOTH of its paths to the dirt list
+    /// that `blocking_paths` is computed from.
     pub dirty_count: u32,
     /// Up to 5 of those paths, path only — enough for the panel to show what is at stake.
     pub dirty_sample: Vec<String>,
+    /// THE PATHS THAT WOULD ACTUALLY STOP THE FAST-FORWARD, and nothing else.
+    ///
+    /// `dirty_count > 0` is NOT a reason to refuse: git only declines a fast-forward over dirt it
+    /// would itself touch. This is the intersection that decides it — the dirty paths that are also
+    /// changed between `HEAD` and `base`. Empty (with `blockers_known`) means `merge --ff-only`
+    /// provably cannot refuse and provably cannot lose anything, whatever `dirty_count` says.
+    ///
+    /// Measured on the founder's shared checkout (bead sparkle-v38y1n): of five dirty entries
+    /// exactly ONE was a true blocker, and the whole-tree `dirty_count == 0` rule had therefore
+    /// been declining a provably-safe fast-forward every 60 seconds for ten days — 1,175 commits
+    /// of drift, silently. Named rather than counted because "dirty tree" is the useless string the
+    /// escalation must never show: the person needs the path.
+    pub blocking_paths: Vec<String>,
+    /// Whether `blocking_paths` could be computed AT ALL. False means WE DO NOT KNOW — never
+    /// "there are none". Fail-closed, exactly like `dirty_count`'s unreadable-tree case.
+    pub blockers_known: bool,
     /// HEAD is a STRICT ancestor of `base`, so a fast-forward cannot lose anything.
     pub can_fast_forward: bool,
     /// The only action worth offering for this shape.
@@ -241,35 +259,140 @@ pub struct RemedyOutcome {
     pub after_behind: u32,
 }
 
-/// Uncommitted work in `root`: the line count, and up to 5 paths.
+/// Uncommitted work in `root`: the number of status ENTRIES, and EVERY path each one touches.
 ///
-/// Parsed defensively rather than by fixed offset: `git()` trims the whole output, so the leading
-/// space of an unstaged `" M path"` is gone from the FIRST line only. A 3-char strip would eat a
-/// character of that one path and leave every other line correct — exactly the kind of bug a
-/// "sample is non-empty" assertion hides.
-/// `None` means THE PROBE FAILED — never "clean". This returned `(0, vec![])` on error once, which
-/// is byte-identical to a clean tree, and that value feeds `auto_safe`: a failed `git status`
-/// (`index.lock` contention is the realistic trigger here, where a fleet and a 60s poll run git
-/// constantly) would have produced `FastForward` + `auto_safe`, and a tree whose cleanliness was
-/// never established would be advanced with no click. Every other probe in this module fails closed
-/// to `unknown`; this one now does too (roborev 59436).
+/// Every path, not a sample: `blocking_paths_at` intersects this with what the fast-forward
+/// changes, and an intersection computed against the first five entries would call the sixth
+/// blocker "no blocker" — the unsafe direction. The panel's 5-item `dirty_sample` is taken from
+/// the head of this list instead.
+///
+/// NUL-DELIMITED, AND THAT IS THE WHOLE POINT (roborev 66791). `git status --porcelain` C-QUOTES
+/// any path git considers special — `"src/a\"b.rs"`, `"caf\303\251.rs"`, and under the default
+/// `core.quotePath` a plain space too — while the `git diff --name-only` on the other side of
+/// `blocking_paths_at`'s intersection quotes by its own rules. Two spellings of ONE path do not
+/// intersect: the collision goes unreported and `auto_safe` reads TRUE for a tree that genuinely
+/// collides. `-z` disables C-quoting outright, on both sides, which removes the whole class rather
+/// than unquoting after the fact — an unquoter is one more parser that can be wrong in the
+/// fail-OPEN direction.
+///
+/// BOTH HALVES OF A RENAME ARE DIRTY. In `-z` a rename is `XY <to>\0<from>\0`: two NUL-terminated
+/// fields, the `->` omitted and the order REVERSED from the human format's `R  old -> new`
+/// (verified against real git rather than assumed). The old parser kept only the destination, so a
+/// rename whose SOURCE the base also changes read as no blocker at all — even though the merge
+/// would have to remove that source out from under the rename.
+///
+/// `None` means THE PROBE FAILED OR WE COULD NOT READ IT — never "clean". This returned
+/// `(0, vec![])` on error once, which is byte-identical to a clean tree, and that value feeds
+/// `auto_safe`: a failed `git status` (`index.lock` contention is the realistic trigger here, where
+/// a fleet and a 60s poll run git constantly) would have produced `FastForward` + `auto_safe`, and
+/// a tree whose cleanliness was never established would be advanced with no click. Every other
+/// probe in this module fails closed to `unknown`; this one does too (roborev 59436). A record we
+/// cannot parse takes the same exit, for the same reason.
 fn dirty_at(root: &str) -> Option<(u32, Vec<String>)> {
-    let Ok(out) = git(root, &["status", "--porcelain", "--untracked-files=all"]) else {
+    let Ok(out) = git(root, &["status", "--porcelain", "-z", "--untracked-files=all"]) else {
         return None;
     };
+    if !decodable(&out) {
+        return None;
+    }
     let mut count = 0u32;
-    let mut sample = Vec::new();
-    for line in out.lines().filter(|l| !l.trim().is_empty()) {
+    let mut paths = Vec::new();
+    // The trailing NUL leaves one empty piece; a genuine field is never empty.
+    let mut fields = out.split('\0').filter(|f| !f.is_empty());
+    while let Some(rec) = fields.next() {
+        let (xy, path) = split_status_record(rec)?;
         count = count.saturating_add(1);
-        if sample.len() < 5 {
-            // "XY <path>" — drop the status field, then the rename arrow if there is one.
-            let rest = line.trim_start();
-            let path = rest.split_once(' ').map(|(_, p)| p.trim_start()).unwrap_or(rest);
-            let path = path.rsplit(" -> ").next().unwrap_or(path);
-            sample.push(path.to_string());
+        paths.push(path.to_string());
+        if xy.contains('R') || xy.contains('C') {
+            // The origin half: its own NUL field, carrying no status prefix. Missing means a shape
+            // we do not understand, and dropping it silently is exactly the fail-open this fixes.
+            paths.push(fields.next()?.to_string());
         }
     }
-    Some((count, sample))
+    Some((count, paths))
+}
+
+/// Whether `git()`'s lossy UTF-8 decode gave us the bytes git actually printed.
+///
+/// A path with non-UTF-8 bytes in it arrives as U+FFFD, and a mangled path cannot be compared with
+/// the other side of the intersection — so it would silently MISS, which is a blocker reported as
+/// no blocker. U+FFFD in a real filename is vanishingly rare and refusing to auto-advance over one
+/// costs a click; the other direction costs the work in the tree.
+fn decodable(out: &str) -> bool {
+    !out.contains('\u{FFFD}')
+}
+
+/// `XY <path>` out of ONE `-z` status field: the two status columns, then the path.
+///
+/// NOT a fixed 3-byte strip. `git()` trims the WHOLE output, so an unstaged `" M path"` loses its
+/// leading space on the FIRST record only, and a blind 3-byte strip would eat a character of that
+/// one path while leaving every other record correct — the kind of bug a "the sample is non-empty"
+/// assertion hides. `None` = a shape we cannot read, which every caller turns into
+/// `blockers_known: false`.
+fn split_status_record(rec: &str) -> Option<(&str, &str)> {
+    let b = rec.as_bytes();
+    // Bytes 0..=2 of a status record are ASCII, so these slices are always char boundaries.
+    if b.len() > 3 && b[2] == b' ' {
+        Some((&rec[..2], &rec[3..]))
+    } else if b.len() > 2 && b[1] == b' ' {
+        // The first record, with its leading space already trimmed off by `git()`.
+        Some((&rec[..1], &rec[2..]))
+    } else {
+        None
+    }
+}
+
+/// The spelling both sides of the intersection are compared in.
+///
+/// `git()` trims the whole output, so a path that begins with a space loses it on whichever side
+/// prints that path first — `status` hides it behind the `XY ` columns, `diff --name-only` does
+/// not. Normalising the leading space away on BOTH sides makes such a path over-match rather than
+/// under-match, and over-reporting a blocker is the only direction this predicate is allowed to be
+/// wrong in.
+fn cmp_key(p: &str) -> &str {
+    p.trim_start_matches(' ')
+}
+
+/// The dirty paths this fast-forward would ACTUALLY collide with, or `None` if we could not tell.
+///
+/// WHY AN INTERSECTION IS THE RIGHT PREDICATE, and a count is not. `git merge --ff-only` is
+/// `read-tree -m -u HEAD <base>` underneath, and read-tree walks only the paths that DIFFER between
+/// the two trees. Dirt anywhere else is invisible to it. Verified against real git on eight shapes
+/// (bead sparkle-v38y1n) — a modified tracked file the base also changes, a staged one, an
+/// untracked file at a path the base creates: all refused. A stray untracked file, an untracked
+/// subdirectory, a modified or staged tracked file the base leaves alone: all fast-forwarded
+/// cleanly. This set matched git's verdict on every one of them.
+///
+/// ONE set covers both tracked and untracked dirt, because a path the base CREATES is by definition
+/// a path that differs between `HEAD` and `base`. `--no-renames` is load-bearing: with rename
+/// detection on, `--name-only` prints only the destination of a rename, so the vanished source path
+/// would not be listed and dirt sitting on it would read as safe.
+///
+/// `-z` HERE FOR THE SAME REASON IT IS ON THE OTHER SIDE (roborev 66791). An intersection is only
+/// as good as the two spellings it compares, so both probes have to be in the SAME representation —
+/// and NUL-delimited is the only one neither side can quote. Reading this side unquoted while
+/// `dirty_at` read the other side C-quoted is precisely how a real collision went unmatched and
+/// `auto_safe` went true over it.
+///
+/// `None` is NOT "no blockers" — it is "we could not look", and the caller must treat it as
+/// blocking. Same posture as `dirty_at`.
+fn blocking_paths_at(root: &str, base: &str, dirty_paths: &[String]) -> Option<Vec<String>> {
+    // No dirt at all: nothing to intersect, and no reason to pay for a whole-repo diff on the
+    // clean path this runs on most often.
+    if dirty_paths.is_empty() {
+        return Some(Vec::new());
+    }
+    let changed = git(root, &["diff", "--name-only", "-z", "--no-renames", "HEAD", base]).ok()?;
+    if !decodable(&changed) {
+        return None;
+    }
+    let changed: std::collections::HashSet<&str> =
+        changed.split('\0').map(cmp_key).filter(|p| !p.is_empty()).collect();
+    let mut hit: Vec<String> =
+        dirty_paths.iter().filter(|p| changed.contains(cmp_key(p))).cloned().collect();
+    hit.sort();
+    hit.dedup();
+    Some(hit)
 }
 
 /// The OTHER worktree holding `branch`, or empty when none does — or when it is this root itself.
@@ -318,6 +441,9 @@ pub fn diagnose_at(root: &str, default_branch: &str, threshold: u32) -> StaleDia
             held_by: String::new(),
             dirty_count: 0,
             dirty_sample: Vec::new(),
+            blocking_paths: Vec::new(),
+            // We never got as far as looking, so this is "unknown", not "none".
+            blockers_known: false,
             can_fast_forward: false,
             remedy: StaleRemedy::Unknown,
             cause,
@@ -332,7 +458,14 @@ pub fn diagnose_at(root: &str, default_branch: &str, threshold: u32) -> StaleDia
     // UI has no honest number to show) while `dirty_known` keeps it out of the auto-advance path.
     let dirty = dirty_at(root);
     let dirty_known = dirty.is_some();
-    let (dirty_count, dirty_sample) = dirty.unwrap_or((0, Vec::new()));
+    let (dirty_count, dirty_paths) = dirty.unwrap_or((0, Vec::new()));
+    let dirty_sample: Vec<String> = dirty_paths.iter().take(5).cloned().collect();
+    // Which of that dirt the fast-forward would actually collide with. `None` = could not tell,
+    // which is treated as blocking — a checkout whose collisions we never established is not one
+    // an unattended timer may advance.
+    let blockers = blocking_paths_at(root, &s.base, &dirty_paths);
+    let blockers_known = dirty_known && blockers.is_some();
+    let blocking_paths = blockers.unwrap_or_default();
     let mut d = StaleDiagnosis {
         behind: s.behind,
         base: s.base.clone(),
@@ -344,6 +477,8 @@ pub fn diagnose_at(root: &str, default_branch: &str, threshold: u32) -> StaleDia
         held_by: held_by_at(root, default_branch),
         dirty_count,
         dirty_sample,
+        blocking_paths,
+        blockers_known,
         can_fast_forward: false,
         remedy: StaleRemedy::None,
         cause: String::new(),
@@ -418,13 +553,36 @@ pub fn diagnose_at(root: &str, default_branch: &str, threshold: u32) -> StaleDia
             d.behind, d.base
         );
     } else if d.dirty_count > 0 {
-        // 7a. On a branch and fast-forwardable, but there is local work in the way.
+        // 7a. On a branch and fast-forwardable, WITH local work present — which is not by itself a
+        // reason to refuse. `blocking_paths` is what decides, and the sentence has to carry the
+        // paths: "dirty tree" is exactly the string that let ten days of drift go unexplained.
         d.remedy = StaleRemedy::FastForwardDirty;
-        d.cause = format!(
-            "{} commit(s) behind {}, with {} uncommitted change(s) here; a fast-forward will be \
-             attempted and git will refuse it if it would clobber one",
-            d.behind, d.base, d.dirty_count
-        );
+        d.cause = if !d.blockers_known {
+            format!(
+                "{} commit(s) behind {}, with {} uncommitted change(s) here — and we could not work \
+                 out which of them this fast-forward would touch, so it is not treated as safe. A \
+                 fast-forward will be attempted and git will refuse it if it would clobber one",
+                d.behind, d.base, d.dirty_count
+            )
+        } else if d.blocking_paths.is_empty() {
+            format!(
+                "{} commit(s) behind {}, with {} uncommitted change(s) here — none of which this \
+                 fast-forward touches, so it cannot clobber any of them",
+                d.behind, d.base, d.dirty_count
+            )
+        } else {
+            format!(
+                "{} commit(s) behind {}; the fast-forward is blocked by {} of the {} uncommitted \
+                 change(s) here, because {} also changes {}: {}",
+                d.behind,
+                d.base,
+                d.blocking_paths.len(),
+                d.dirty_count,
+                d.base,
+                if d.blocking_paths.len() == 1 { "it" } else { "them" },
+                d.blocking_paths.join(", "),
+            )
+        };
     } else {
         // 7b. The clean case.
         d.remedy = StaleRemedy::FastForward;
@@ -437,12 +595,27 @@ pub fn diagnose_at(root: &str, default_branch: &str, threshold: u32) -> StaleDia
 
     // Auto-advance ONLY the provably-safe shape. A feature branch is never auto-advanced: the user
     // chose to be on it, and moving it under them is a surprise even when it is technically safe.
-    // `dirty_known` is load-bearing, not belt-and-braces: without it a FAILED `git status` reads as
-    // a clean tree and this predicate advances a checkout nobody verified (roborev 59436).
-    d.auto_safe = d.remedy == StaleRemedy::FastForward
+    //
+    // "PROVABLY SAFE" IS ABOUT COLLISIONS, NOT ABOUT CLEANLINESS (bead sparkle-v38y1n). This used to
+    // read `d.dirty_count == 0`, which treats any dirt anywhere as blocking — and git does not: it
+    // refuses a fast-forward only over paths it would itself touch. On the founder's shared checkout
+    // that cost 1,175 commits of drift over ten days, because a stray `NOTES.md` and an untracked
+    // `images/` subdirectory that block precisely nothing kept the 60-second timer declining a merge
+    // git would have taken every single time. `blocking_paths` is the same question asked precisely,
+    // and it agreed with real git on all eight shapes it was measured against.
+    //
+    // THE FAIL-CLOSED CLAUSES. `blockers_known`: an intersection we could not compute is not one
+    // that found nothing — and it is false whenever `git status` did not answer, so a FAILED status
+    // still cannot read as a clean tree (roborev 59436). `dirty_known` is therefore REDUNDANT with
+    // it today, measured: removing this line alone leaves the suite green. It stays anyway, and the
+    // redundancy is the point — it is the rule stated where the rule is decided, so a later change
+    // to how `blockers_known` is derived cannot quietly take the status probe out of the predicate.
+    // `head_branch == default_branch`: a feature branch is never auto-advanced.
+    d.auto_safe = matches!(d.remedy, StaleRemedy::FastForward | StaleRemedy::FastForwardDirty)
         && d.head_branch == d.default_branch
         && dirty_known
-        && d.dirty_count == 0
+        && d.blockers_known
+        && d.blocking_paths.is_empty()
         && d.can_fast_forward
         && !d.unknown;
     d
@@ -501,7 +674,9 @@ pub fn remedy_at(
     //
     // Checked against `auto_safe` rather than the remedy kind so this cannot drift from the rule:
     // `auto_safe` is the one definition of "cannot possibly lose anything", and it already means
-    // clean + on the default branch + a strict ancestor.
+    // NO BLOCKING PATH + on the default branch + a strict ancestor. Note what it no longer means:
+    // "clean". Dirt the fast-forward would not touch stops nothing, so a `FastForwardDirty` verdict
+    // with an empty (and KNOWN) blocking set is automatic — see the predicate above.
     if unattended && !d.auto_safe {
         return refuse(d.cause.clone());
     }
@@ -828,6 +1003,49 @@ mod tests {
         (d, up, pusher, root)
     }
 
+    /// Advance `origin/main` by one commit that CREATES `name`, without moving the local checkout.
+    ///
+    /// `advance_origin` only ever rewrites `f.txt`, so it cannot express the one shape a naive
+    /// "just ignore untracked files" implementation gets wrong: an UNTRACKED file sitting exactly
+    /// where the base is about to put a tracked one. Same throwaway-clone mechanism, one different
+    /// path.
+    fn advance_origin_creating(origin_path: &str, name: &str) -> tempfile::TempDir {
+        let wc = unique_root("pusher-create");
+        let w = wc.path().to_str().unwrap().to_string();
+        git(&w, &["clone", "-q", origin_path, "."]).unwrap();
+        git(&w, &["config", "user.email", "t@t"]).unwrap();
+        git(&w, &["config", "user.name", "t"]).unwrap();
+        std::fs::write(format!("{w}/{name}"), "from the base\n").unwrap();
+        git(&w, &["add", "-A"]).unwrap();
+        git(&w, &["commit", "-q", "-m", &format!("create {name}")]).unwrap();
+        git(&w, &["push", "-q", "origin", "main"]).unwrap();
+        wc
+    }
+
+    /// Advance `origin/main` by one commit creating EVERY named path, parent dirs and all.
+    ///
+    /// The singular version above cannot express the C-quoting fixture: that needs several paths
+    /// whose names git would escape, all created by the SAME base commit, so the assertion is about
+    /// the whole intersection rather than about one lucky match.
+    fn advance_origin_creating_many(origin_path: &str, names: &[&str]) -> tempfile::TempDir {
+        let wc = unique_root("pusher-create-many");
+        let w = wc.path().to_str().unwrap().to_string();
+        git(&w, &["clone", "-q", origin_path, "."]).unwrap();
+        git(&w, &["config", "user.email", "t@t"]).unwrap();
+        git(&w, &["config", "user.name", "t"]).unwrap();
+        for name in names {
+            let path = std::path::Path::new(&w).join(name);
+            if let Some(dir) = path.parent() {
+                std::fs::create_dir_all(dir).unwrap();
+            }
+            std::fs::write(&path, "from the base\n").unwrap();
+        }
+        git(&w, &["add", "-A"]).unwrap();
+        git(&w, &["commit", "-q", "-m", "create many"]).unwrap();
+        git(&w, &["push", "-q", "origin", "main"]).unwrap();
+        wc
+    }
+
     fn canon(p: &str) -> String {
         std::fs::canonicalize(p).unwrap().to_string_lossy().to_string()
     }
@@ -1068,22 +1286,25 @@ mod tests {
 
     // 11. THE UNATTENDED POLICY, asserted as the side effect it prevents.
     //
-    // A tree that goes dirty AFTER the caller's `auto_safe` check re-classifies here as
-    // `FastForwardDirty` — which the automation rule says is offerable on a click and never
-    // automatic. Before the policy flag, `remedy_at` could not tell the two callers apart and ran
-    // the merge either way, so a 60-second timer could write to a tree the user had just started
-    // editing (knightwatch 5207191879#1, 5209038072#1).
+    // A tree that goes BLOCKING-dirty after the caller's `auto_safe` check re-classifies here as
+    // not-auto-safe, and the merge must not run. Before the policy flag, `remedy_at` could not tell
+    // the two callers apart and ran the merge either way, so a 60-second timer could write to a tree
+    // the user had just started editing (knightwatch 5207191879#1, 5209038072#1).
     //
-    // Note this is a tree git would ACCEPT: the local edit is in a file origin did not touch, so
-    // `merge --ff-only` succeeds and the assertion below is about our refusal, not git's. Using the
-    // clobbering shape above would have passed no matter what this function did.
+    // WHY THE EDIT IS IN `f.txt` AND NOT A SCRATCH FILE. It used to be an untracked `scratch.txt`,
+    // and that shape is now legitimately automatic (see the blocking-set tests above) — the timer is
+    // SUPPOSED to take it. The policy this test guards is about dirt that would actually be
+    // clobbered, so the fixture has to carry some. The refusal asserted here is OURS, not git's:
+    // `action` is empty, meaning the merge was never attempted.
     #[test]
     fn an_unattended_remedy_refuses_a_tree_that_went_dirty_after_the_callers_check() {
         let (_d, _up, _p, root) = behind_by("remedy-unattended-dirty", 2);
-        std::fs::write(format!("{root}/scratch.txt"), "started typing\n").unwrap();
+        // `advance_origin` rewrites f.txt, so this edit is a genuine collision.
+        std::fs::write(format!("{root}/f.txt"), "started typing\n").unwrap();
         let d = diagnose_at(&root, "main", 25);
         assert_eq!(d.remedy, StaleRemedy::FastForwardDirty);
-        assert!(!d.auto_safe, "a dirty tree is never the automatic shape");
+        assert_eq!(d.blocking_paths, vec!["f.txt".to_string()]);
+        assert!(!d.auto_safe, "a tree with a real collision is never the automatic shape");
         let before_head = git(&root, &["rev-parse", "HEAD"]).unwrap();
 
         let out = remedy_at(&root, "main", 25, true);
@@ -1096,15 +1317,291 @@ mod tests {
             "THE POINT: no timer-driven commit moved this checkout",
         );
 
-        // The same tree, same instant, on a CLICK: allowed, and it actually advances. Without this
-        // half the test would pass against a `remedy_at` that had simply stopped working.
-        let out = remedy_at(&root, "main", 25, false);
-        assert!(out.ok, "a click may still take the dirty fast-forward: {}", out.reason);
+        // Now clear the collision and leave the tree dirty in a way that blocks nothing. The SAME
+        // unattended call now advances it — without this half the test would stay green against a
+        // `remedy_at` that had simply stopped working, or against a predicate that had gone back to
+        // refusing every dirty tree.
+        std::fs::write(format!("{root}/f.txt"), "one\n").unwrap();
+        std::fs::write(format!("{root}/scratch.txt"), "still typing\n").unwrap();
+        let out = remedy_at(&root, "main", 25, true);
+        assert!(out.ok, "non-blocking dirt is automatic: {}", out.reason);
         assert_ne!(git(&root, &["rev-parse", "HEAD"]).unwrap(), before_head);
         assert_eq!(
             std::fs::read_to_string(format!("{root}/scratch.txt")).unwrap(),
-            "started typing\n",
+            "still typing\n",
             "and the local work is still there",
         );
     }
+
+    // ── THE PRECISE BLOCKING SET (bead sparkle-v38y1n) ────────────────────────────────────────
+    //
+    // These four are the arms of one predicate. `dirty_count == 0` collapsed all of them into
+    // "refuse", which is why the founder's shared checkout sat 1,175 commits behind for ten days
+    // while a 60-second timer declined, every minute, a merge git would have taken every time.
+
+    // (a) THE HEADLINE BEHAVIOUR CHANGE. A stray untracked file the base does not create blocks
+    //     NOTHING — git fast-forwards straight over it — so the unattended path must now take it.
+    //     Under the old `dirty_count == 0` rule this diagnosed as `!auto_safe` and the merge never
+    //     ran. Asserted as the SIDE EFFECT (HEAD actually moved) rather than as a flag.
+    #[test]
+    fn a_stray_untracked_file_the_base_does_not_create_blocks_nothing() {
+        let (_d, _up, _p, root) = behind_by("blockers-stray", 3);
+        // origin advanced `f.txt`; this file exists nowhere in either tree.
+        std::fs::write(format!("{root}/NOTES.md"), "scratch notes\n").unwrap();
+        std::fs::create_dir(format!("{root}/images")).unwrap();
+        std::fs::write(format!("{root}/images/a.png"), "binary-ish\n").unwrap();
+
+        let d = diagnose_at(&root, "main", 25);
+        assert_eq!(d.dirty_count, 2, "the tree really is dirty: {:?}", d.dirty_sample);
+        assert!(d.blockers_known, "the HEAD..base diff ran");
+        assert_eq!(d.blocking_paths, Vec::<String>::new(), "none of that dirt is in the way");
+        assert!(d.auto_safe, "a fast-forward here cannot refuse and cannot lose anything");
+        assert!(
+            d.cause.contains("none of which"),
+            "the sentence has to say the dirt is irrelevant: {}",
+            d.cause
+        );
+
+        // THE POINT: the unattended timer now advances it, and the stray files are untouched.
+        let base_sha = git(&root, &["rev-parse", "origin/main"]).unwrap();
+        let out = remedy_at(&root, "main", 25, true);
+        assert!(out.ok, "unattended must take this one now: {}", out.reason);
+        assert_eq!(out.action, "merge --ff-only origin/main");
+        assert_eq!(out.after_behind, 0, "the drift actually closed");
+        assert_eq!(git(&root, &["rev-parse", "HEAD"]).unwrap(), base_sha);
+        assert_eq!(
+            std::fs::read_to_string(format!("{root}/NOTES.md")).unwrap(),
+            "scratch notes\n",
+            "and the local scratch file survived",
+        );
+    }
+
+    // (b) A tracked modification to a file the base ALSO changes is a real blocker, it still
+    //     refuses, and the refusal NAMES THAT EXACT PATH. "dirty tree" is the useless string this
+    //     whole change exists to replace.
+    #[test]
+    fn a_modification_to_a_file_the_base_also_changes_is_named_as_the_blocker() {
+        let (_d, _up, _p, root) = behind_by("blockers-collide", 2);
+        // `advance_origin` rewrites f.txt, so editing it locally collides.
+        std::fs::write(format!("{root}/f.txt"), "LOCAL EDIT\n").unwrap();
+        // ...alongside dirt that does NOT collide, so the assertion is about the INTERSECTION and
+        // not merely about "something is dirty".
+        std::fs::write(format!("{root}/NOTES.md"), "scratch\n").unwrap();
+
+        let d = diagnose_at(&root, "main", 25);
+        assert_eq!(d.dirty_count, 2);
+        assert!(d.blockers_known);
+        assert_eq!(d.blocking_paths, vec!["f.txt".to_string()], "ONLY the colliding path");
+        assert!(!d.auto_safe, "a real collision is never advanced unattended");
+        assert!(d.cause.contains("f.txt"), "the cause names the blocker: {}", d.cause);
+        assert!(
+            !d.cause.contains("NOTES.md"),
+            "and does not blame a file that blocks nothing: {}",
+            d.cause
+        );
+
+        let before = git(&root, &["rev-parse", "HEAD"]).unwrap();
+        let out = remedy_at(&root, "main", 25, true);
+        assert!(!out.ok, "unattended must still refuse this");
+        assert_eq!(out.action, "", "and must not even attempt the merge");
+        assert!(out.reason.contains("f.txt"), "the refusal names the path: {}", out.reason);
+        assert_eq!(git(&root, &["rev-parse", "HEAD"]).unwrap(), before, "HEAD must not move");
+        assert_eq!(std::fs::read_to_string(format!("{root}/f.txt")).unwrap(), "LOCAL EDIT\n");
+    }
+
+    // (c) THE ARM A NAIVE "IGNORE UNTRACKED FILES" IMPLEMENTATION GETS WRONG. An untracked file at
+    //     a path the base CREATES is overwritten by the merge, so it is a blocker even though it is
+    //     untracked and even though nothing tracked is dirty. Verified against real git: it refuses
+    //     with "The following untracked working tree files would be overwritten by merge".
+    #[test]
+    fn an_untracked_file_where_the_base_creates_one_is_a_blocker() {
+        let (_d, up, root) = repo_with_origin("blockers-untracked-collide");
+        let _p = advance_origin_creating(up.path().to_str().unwrap(), "brand-new.txt");
+        git(&root, &["fetch", "-q", "origin"]).unwrap();
+        std::fs::write(format!("{root}/brand-new.txt"), "MINE, written first\n").unwrap();
+
+        let d = diagnose_at(&root, "main", 25);
+        assert!(d.behind > 0, "the drift is real, so the classification means something");
+        assert_eq!(d.dirty_count, 1);
+        assert!(d.blockers_known);
+        assert_eq!(
+            d.blocking_paths,
+            vec!["brand-new.txt".to_string()],
+            "an untracked file the base would overwrite IS in the way",
+        );
+        assert!(!d.auto_safe, "untracked does not mean harmless");
+        assert!(d.cause.contains("brand-new.txt"), "cause names it: {}", d.cause);
+
+        let before = git(&root, &["rev-parse", "HEAD"]).unwrap();
+        let out = remedy_at(&root, "main", 25, true);
+        assert!(!out.ok);
+        assert_eq!(out.action, "", "refused before git was asked");
+        assert_eq!(git(&root, &["rev-parse", "HEAD"]).unwrap(), before);
+        // The file the user wrote is still theirs.
+        assert_eq!(
+            std::fs::read_to_string(format!("{root}/brand-new.txt")).unwrap(),
+            "MINE, written first\n",
+        );
+    }
+
+    // (d) FAIL-CLOSED, at the predicate AND at the remedy. A `git status` that does not answer
+    //     leaves us with no dirt list, so the intersection is meaningless — and an EMPTY
+    //     `blocking_paths` there must never be read as "no blockers". Deliberately paired with a
+    //     BEFORE assertion so this cannot pass vacuously against a tree that was refusing anyway.
+    #[test]
+    fn an_unreadable_status_makes_the_blocking_set_unknown_not_empty() {
+        let (_d, _up, _p, root) = behind_by("blockers-statusfail", 3);
+        // A stray untracked file — i.e. the shape that IS auto-safe once the probe works, so the
+        // assertion below is a real change and not a state this fixture was already in.
+        std::fs::write(format!("{root}/NOTES.md"), "scratch\n").unwrap();
+        let ok = diagnose_at(&root, "main", 25);
+        assert!(ok.auto_safe, "sanity: with a working status this tree IS auto-safe");
+        assert!(ok.blockers_known);
+
+        // Replacing `.git/index` with a DIRECTORY breaks `git status` only — `rev-parse`,
+        // `rev-list` and `merge-base` never read the index. (An `index.lock` does NOT do this.)
+        std::fs::remove_file(format!("{root}/.git/index")).unwrap();
+        std::fs::create_dir(format!("{root}/.git/index")).unwrap();
+
+        let d = diagnose_at(&root, "main", 25);
+        assert!(!d.blockers_known, "no dirt list means no trustworthy intersection");
+        assert!(d.blocking_paths.is_empty(), "and the empty vec must NOT be read as 'none'");
+        assert!(!d.auto_safe, "an unverifiable tree is never advanced by a timer");
+
+        let before = git(&root, &["rev-parse", "HEAD"]).unwrap();
+        let out = remedy_at(&root, "main", 25, true);
+        assert!(!out.ok, "the remedy fails closed too");
+        assert_eq!(out.action, "", "nothing was run");
+        assert_eq!(git(&root, &["rev-parse", "HEAD"]).unwrap(), before, "HEAD must not move");
+    }
+
+    // (e) THE QUOTING MISMATCH — the headline fail-OPEN this predicate had (roborev 66791).
+    //
+    //     `git status --porcelain` C-quotes a path with a quote, a backslash or a non-ASCII byte in
+    //     it (`"src/a\"b.rs"`, `"caf\303\251.rs"`); `git diff --name-only` on the other side of the
+    //     intersection did not print the same spelling back. So the two sides compared DIFFERENT
+    //     strings for one path, the match missed, and a tree that genuinely collides read as
+    //     `auto_safe` — a timer merging over work it had just told itself was not there.
+    //
+    //     Asserted through `diagnose_at`, i.e. the real production entry point, and paired with a
+    //     plain-ASCII sibling in the SAME fixture: without the pair a `blocking_paths` that had
+    //     stopped working entirely would look identical to one that only mishandled quoting.
+    #[cfg(unix)]
+    #[test]
+    fn a_dirty_path_whose_name_git_would_c_quote_is_still_a_blocker() {
+        let (_d, up, root) = repo_with_origin("blockers-quoted");
+        // A quote, a backslash, a non-ASCII name — and one ordinary path as the control.
+        let names = ["src/a\"b.rs", "back\\slash.rs", "café.rs", "plain.rs"];
+        let _p = advance_origin_creating_many(up.path().to_str().unwrap(), &names);
+        git(&root, &["fetch", "-q", "origin"]).unwrap();
+        for name in names {
+            let path = std::path::Path::new(&root).join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "MINE, written first\n").unwrap();
+        }
+
+        // THE FIXTURE HAS TO ACTUALLY EXERCISE THE BUG. Without this the test could pass on a git
+        // that quotes nothing, proving the normalisation guards a case it never sees.
+        let human = git(&root, &["status", "--porcelain", "--untracked-files=all"]).unwrap();
+        assert!(
+            human.contains("\\303\\251") && human.contains('"'),
+            "the fixture must produce C-quoted output, or it is not testing this: {human}",
+        );
+
+        let d = diagnose_at(&root, "main", 25);
+        assert!(d.behind > 0, "the drift is real, so the classification means something");
+        assert!(d.blockers_known, "the HEAD..base diff ran");
+        let mut want: Vec<String> = names.iter().map(|n| n.to_string()).collect();
+        want.sort();
+        assert_eq!(
+            d.blocking_paths, want,
+            "EVERY path the base creates is in the way, quoted or not",
+        );
+        assert!(!d.auto_safe, "THE POINT: unnormalised, these silently read as a safe tree");
+
+        let before = git(&root, &["rev-parse", "HEAD"]).unwrap();
+        let out = remedy_at(&root, "main", 25, true);
+        assert!(!out.ok, "unattended must refuse this");
+        assert_eq!(out.action, "", "and must not even attempt the merge");
+        assert_eq!(git(&root, &["rev-parse", "HEAD"]).unwrap(), before, "HEAD must not move");
+        assert_eq!(
+            std::fs::read_to_string(std::path::Path::new(&root).join("café.rs")).unwrap(),
+            "MINE, written first\n",
+            "and the work at the awkward path is still theirs",
+        );
+    }
+
+    // (f) A RENAME'S SOURCE IS DIRT TOO. `status` reports a rename as one entry naming two paths,
+    //     and keeping only the destination lost the fact that the merge would have to REMOVE the
+    //     source. Here the base rewrites `f.txt` and the tree has renamed `f.txt` away, so the
+    //     source is the collision and the destination is not.
+    #[test]
+    fn a_rename_whose_source_the_base_also_changes_is_a_blocker() {
+        let (_d, _up, _p, root) = behind_by("blockers-rename", 2);
+        // `advance_origin` rewrites `f.txt`, so renaming it locally collides on the SOURCE side.
+        git(&root, &["mv", "f.txt", "moved.txt"]).unwrap();
+
+        // The fixture must really be a rename, or this tests the ordinary modified-file path.
+        let human = git(&root, &["status", "--porcelain", "--untracked-files=all"]).unwrap();
+        assert!(human.starts_with('R'), "fixture must produce a rename entry: {human}");
+
+        let d = diagnose_at(&root, "main", 25);
+        assert_eq!(d.dirty_count, 1, "one status ENTRY, even though it names two paths");
+        assert!(d.blockers_known);
+        assert_eq!(
+            d.blocking_paths,
+            vec!["f.txt".to_string()],
+            "the rename SOURCE is what the merge would have to remove",
+        );
+        assert!(!d.auto_safe, "so this is never the automatic shape");
+        assert!(d.cause.contains("f.txt"), "and the cause names it: {}", d.cause);
+
+        let before = git(&root, &["rev-parse", "HEAD"]).unwrap();
+        let out = remedy_at(&root, "main", 25, true);
+        assert!(!out.ok, "unattended must refuse a rename off a path the base rewrites");
+        assert_eq!(out.action, "", "and must not even attempt the merge");
+        assert_eq!(git(&root, &["rev-parse", "HEAD"]).unwrap(), before, "HEAD must not move");
+
+        // THE PAIR, and without it this test passes for a `blocking_paths` that simply refuses
+        // every rename. Here the base creates an unrelated file and leaves `f.txt` alone, so the
+        // SAME local rename collides with nothing and the tree stays automatic.
+        let (_d2, up2, root2) = repo_with_origin("blockers-rename-free");
+        let _p2 = advance_origin_creating_many(up2.path().to_str().unwrap(), &["elsewhere.txt"]);
+        git(&root2, &["fetch", "-q", "origin"]).unwrap();
+        git(&root2, &["mv", "f.txt", "moved.txt"]).unwrap();
+        let free = diagnose_at(&root2, "main", 25);
+        assert!(free.behind > 0, "the pair has to be behind too, or it classifies as None");
+        assert!(free.blockers_known);
+        assert_eq!(
+            free.blocking_paths,
+            Vec::<String>::new(),
+            "a rename off a path the base never touches is in nobody's way: {free:?}",
+        );
+        assert!(free.auto_safe, "and is therefore still automatic");
+    }
+
+    // (g) THE PARSER FAILS CLOSED ON A SHAPE IT CANNOT READ.
+    //
+    //     `split_status_record` is the one place a malformed record can be silently dropped, and a
+    //     dropped record is a dirty path that never reaches the intersection — a blocker reported
+    //     as no blocker. `None` is what turns into `blockers_known: false` and then `auto_safe:
+    //     false`; the end-to-end half of that is `an_unreadable_status_...` below.
+    #[test]
+    fn an_unparseable_status_record_is_none_rather_than_a_guess() {
+        // The ordinary shape: two status columns, a space, the path.
+        assert_eq!(split_status_record("?? café.rs"), Some(("??", "café.rs")));
+        assert_eq!(split_status_record(" M plain.rs"), Some((" M", "plain.rs")));
+        assert_eq!(split_status_record("R  moved.txt"), Some(("R ", "moved.txt")));
+        // THE FIRST RECORD, whose leading space `git()` has already trimmed away. A fixed 3-byte
+        // strip would return "lain.rs" here and every other record correctly.
+        assert_eq!(split_status_record("M plain.rs"), Some(("M", "plain.rs")));
+        // ...and anything else is unreadable, not a best guess.
+        for bad in ["", "?", "??", "??x", "xy", "  "] {
+            assert_eq!(split_status_record(bad), None, "must not guess at {bad:?}");
+        }
+        // A path we could not decode is unusable for the same reason: it cannot be compared.
+        assert!(!decodable("?? bad-\u{FFFD}-name.txt"));
+        assert!(decodable("?? café.rs"));
+    }
+
 }

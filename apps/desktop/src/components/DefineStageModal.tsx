@@ -3,7 +3,7 @@
 // A small chat-style modal that lets a project define what "Done"/"Delivered" mean for itself.
 // It opens on a smart default (Yes/No); "No" (or "Edit the instructions") drops into a light
 // Haiku-backed chat that turns free text into a strict `StageDefinition`, which is persisted to
-// the project's `.sparkle/config.toml` via `writeStageDef`. For Delivered it first runs the
+// the project's gitignored `.sparkle/local.toml` via `writeStageDef`. For Delivered it first runs the
 // Delivery Detector (`detectDelivery`) so the default proposal reflects how THIS project ships,
 // and it stays honest when it can't tell. Spec:
 //   docs/superpowers/specs/2026-07-02-definable-done-delivered-design.md  (UX → Define/Edit modal)

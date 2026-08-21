@@ -34,6 +34,13 @@ import { ModalLayer } from "./ModalLayer";
 import { panelPlacement, type PanelPlacement } from "./OpenPrMenu";
 import { C, FONT_WEIGHT } from "../theme/colors";
 import {
+  noteStaleResolved,
+  stalenessNotice,
+  subscribeStalenessNotices,
+  subscribeStalenessResolved,
+  type StalenessNotice,
+} from "../services/stalenessEscalation";
+import {
   diagnoseStale,
   remedyStale,
   type RemedyOutcome,
@@ -232,7 +239,14 @@ export function StaleCheckoutPanel({
 
   /** Apply one row's remedy, then RE-DIAGNOSE it — whether it succeeded or not. A row that still
    *  says "1,935 behind" after a successful fast-forward is a panel lying about the thing it just
-   *  did, and a row that failed needs the diagnosis that failure produced, not the one before it. */
+   *  did, and a row that failed needs the diagnosis that failure produced, not the one before it.
+   *
+   *  A SUCCESS ALSO ENDS THE DECLINE STREAK (roborev 66891). This button is the remedy the
+   *  escalation tells the reader to press, and pressing it used to leave the counter at its old
+   *  value: the notice stayed on screen describing a wedge that had just been cleared, and the very
+   *  next unattended decline — for any reason at all — re-escalated instantly instead of serving
+   *  out the three checks that make a streak mean something. Cleared on `outcome.ok` only; a remedy
+   *  that FAILED is the streak continuing, not ending. */
   const runRemedy = useCallback(
     async (t: StaleTarget) => {
       setBusy((prev) => new Set(prev).add(t.id));
@@ -244,6 +258,10 @@ export function StaleCheckoutPanel({
       });
       try {
         const outcome = await remedyStale(t.rootPath);
+        // Reported BEFORE the alive check: the streak is module state, not this component's, and a
+        // panel closed between the merge and its re-render must not leave a counter primed behind a
+        // fast-forward that actually landed.
+        if (outcome.ok) noteStaleResolved(t.rootPath);
         if (!aliveRef.current) return;
         setOutcomes((prev) => ({ ...prev, [t.id]: outcome }));
         await diagnoseOne(t);
@@ -507,6 +525,37 @@ export function StaleCheckoutPanel({
   );
 }
 
+/**
+ * The escalation standing against `root` right now, or null.
+ *
+ * Subscribes rather than polls, and seeds from `stalenessNotice(root)` on mount — a streak that
+ * escalated before this panel was opened is exactly the case the panel exists to surface, so
+ * waiting for the NEXT escalation (which by design never comes: one per streak) would show nothing.
+ */
+function useStalenessEscalation(root: string): StalenessNotice | null {
+  const [notice, setNotice] = useState<StalenessNotice | null>(null);
+  useEffect(() => {
+    setNotice(stalenessNotice(root));
+    const offEscalated = subscribeStalenessNotices((n) => {
+      if (n.root === root) setNotice(n);
+    });
+    // …and stop showing it the moment the streak ends. BOTH writers reach this: the background poll
+    // (a successful unattended fast-forward, or a reading that came back not-stale), and this
+    // panel's own Fast-forward button, which clears the streak on success in `runRemedy` above —
+    // it did not until roborev 66891, so this sentence used to describe a caller that was not
+    // there. A panel still warning about a wedge that is gone is the same class of lie as the
+    // silence, pointing the other way.
+    const offResolved = subscribeStalenessResolved((r) => {
+      if (r === root) setNotice(null);
+    });
+    return () => {
+      offEscalated();
+      offResolved();
+    };
+  }, [root]);
+  return notice;
+}
+
 function StaleRow({
   target,
   state,
@@ -529,6 +578,12 @@ function StaleRow({
 }) {
   const diag = state?.kind === "ready" ? state.diag : null;
   const action = diag ? remedyAction(diag) : null;
+  // HAS THE UNATTENDED PATH BEEN QUIETLY FAILING ON THIS ROOT? The panel is where a person comes
+  // when the badge bothers them, and until now it could show a perfectly reasonable-looking
+  // diagnosis while the 60-second poll had been refusing the same merge for a week. That gap is the
+  // whole of bead sparkle-v38y1n. Read once on mount and then on every escalation, rather than
+  // polled: the streak only changes when the poll declines, and the poll tells us when it does.
+  const escalation = useStalenessEscalation(target.rootPath);
   // The diagnosis's own count once it lands, the badge's reading until then — so the row never
   // renders a blank where a number belongs, and never a number the backend has since revised.
   const behind = diag ? diag.behind : target.behind;
@@ -596,14 +651,34 @@ function StaleRow({
             : state.diag.cause}
       </div>
 
-      {/* WHAT A FAST-FORWARD WOULD BE STEPPING OVER. Offered anyway (the founder's ruling is that a
-          dirty tree is the user's call, not the app's), but never silently: git may still refuse,
-          and if it does the refusal lands in the outcome line below. */}
+      {/* WHAT A FAST-FORWARD WOULD BE STEPPING OVER — and whether any of it is actually in the way.
+          "git may refuse" was true of every dirty tree back when any dirt at all blocked; now the
+          backend knows which paths collide, so saying it unconditionally would be the same useless
+          warning that let ten days of drift go unexplained (bead sparkle-v38y1n). With blockers, we
+          NAME them; without, we say so, because that is the difference between a wait and a chore. */}
       {diag?.remedy === "fast-forward-dirty" && diag.dirtyCount > 0 && (
         <div data-testid={`stale-dirty-${target.id}`} style={{ color: C.amber, lineHeight: 1.4 }}>
           {diag.dirtyCount} uncommitted change{diag.dirtyCount === 1 ? "" : "s"} in this checkout
-          {diag.dirtySample.length > 0 ? `: ${diag.dirtySample.join(", ")}` : ""} — git may refuse
-          the fast-forward.
+          {diag.dirtySample.length > 0 ? `: ${diag.dirtySample.join(", ")}` : ""}
+          {!diag.blockersKnown
+            ? " — which of them the fast-forward would touch could not be worked out, so git may refuse it."
+            : diag.blockingPaths.length === 0
+              ? " — none of which this fast-forward touches, so it cannot clobber any of them."
+              : ` — git will refuse until ${diag.blockingPaths.join(", ")} ${
+                  diag.blockingPaths.length === 1 ? "is" : "are"
+                } committed, stashed or reverted.`}
+        </div>
+      )}
+
+      {/* THE FACT THE PANEL COULD NOT PREVIOUSLY SHOW: something has been trying, on its own, and
+          failing — for this long, for this reason, on this path. Rendered VERBATIM from the
+          escalation, which is the same text the log carries, so the two cannot drift. */}
+      {escalation && (
+        <div
+          data-testid={`stale-escalation-${target.id}`}
+          style={{ color: C.dangerInk, lineHeight: 1.4, whiteSpace: "pre-wrap" }}
+        >
+          {escalation.message}
         </div>
       )}
 

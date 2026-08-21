@@ -76,8 +76,9 @@ function approvalPath(category: ApprovalCategory): string {
 
 /**
  * Set a category rule ("always"/"never") at the given scope: optimistic store update, then persist
- * to the correct config.toml (global vs the project's `.sparkle/config.toml`). A project write needs
- * `projectRoot`; without one it falls back to the global scope so the rule is never silently dropped.
+ * to the correct file (the global config.toml vs the project's gitignored `.sparkle/local.toml`).
+ * A project write needs `projectRoot`; without one it falls back to the global scope so the rule is
+ * never silently dropped.
  */
 export async function setApprovalRule(
   category: ApprovalCategory,

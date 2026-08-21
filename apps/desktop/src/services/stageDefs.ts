@@ -3,7 +3,9 @@
 // camelCase-facing layer the rest of the app uses. `readStageDef` maps an EffectiveConfig section
 // into a `StageDefinition`; `writeStageDef` maps back and invokes the `set_stage_definition`
 // command (which insert-or-replaces the whole `[done]`/`[delivered]` table in the project's
-// .sparkle/config.toml). Spec: docs/superpowers/specs/2026-07-02-definable-done-delivered-design.md
+// gitignored .sparkle/local.toml — NOT the tracked .sparkle/config.toml, which a human commits as
+// repo policy and the app must never dirty; sparkle-5ur8s).
+// Spec: docs/superpowers/specs/2026-07-02-definable-done-delivered-design.md
 import { invoke } from "@tauri-apps/api/core";
 import type { SparkleConfig, StageCriterion as ConfigStageCriterion } from "./config";
 
@@ -102,9 +104,11 @@ function toConfigShape(key: StageKey, def: StageDefinition): Record<string, unkn
   return out;
 }
 
-/** Persist a stage definition to the project's `.sparkle/config.toml` (insert-or-replace the whole
- *  `[done]`/`[delivered]` section, comments preserved). Maps camelCase → snake_case and invokes the
- *  Rust `set_stage_definition` command. */
+/** Persist a stage definition to the project's gitignored `.sparkle/local.toml` (insert-or-replace
+ *  the whole `[done]`/`[delivered]` section, comments preserved). Maps camelCase → snake_case and
+ *  invokes the Rust `set_stage_definition` command. A `[done]`/`[delivered]` block committed to the
+ *  tracked `.sparkle/config.toml` is repo policy and is left untouched; this overrides it for this
+ *  machine. */
 export async function writeStageDef(
   projectRoot: string,
   key: StageKey,

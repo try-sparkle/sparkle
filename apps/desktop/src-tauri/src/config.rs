@@ -2366,6 +2366,30 @@ struct PartialBuilderIndex {
     skills_exclude: Option<toml::Value>,
 }
 
+/// `[cleared]` in a `.sparkle/local.toml` — the SHADOW-UNSET list. Each entry is a dotted key that
+/// the app was asked to clear and that is still SET in the tracked `.sparkle/config.toml`; the
+/// tracked layer's value for it is dropped before the layers merge, so the resolved value falls
+/// back exactly as if the tracked file had never carried the key.
+///
+/// It exists because the split gave "unset" nowhere to write. Removing a key from `local.toml`
+/// cannot clear one that lives in the TRACKED file, and the writers may not touch that file — so
+/// without this, clearing a pre-existing project rule wrote nothing, returned success, and the UI
+/// re-pulled the tracked value and snapped the toggle back (roborev 66889). The rule was
+/// unclearable from the UI, permanently, on every install that predates the split — which is every
+/// install, since `.sparkle/config.toml` is simply where these values used to be written.
+///
+/// It is a LOCAL-layer mechanism only. In the tracked file it would be a repo asking to erase its
+/// own keys, which is spelled "delete the line"; `apply_project_layer` warns and ignores it there.
+#[derive(Debug, Default, Deserialize)]
+struct PartialCleared {
+    keys: Option<Vec<String>>,
+}
+
+/// The table name behind [`PartialCleared`]. Named once so the reader (serde, via the field above)
+/// and the two writers cannot drift onto different spellings — a mismatch there is silent, and its
+/// symptom is the original defect: a clear that writes a file and changes nothing.
+const CLEARED_TABLE: &str = "cleared";
+
 #[derive(Debug, Default, Deserialize)]
 struct PartialConfig {
     workflow: Option<PartialWorkflow>,
@@ -2395,6 +2419,7 @@ struct PartialConfig {
     delivered: Option<PartialDelivered>,
     builder_index: Option<PartialBuilderIndex>,
     fleet: Option<PartialFleet>,
+    cleared: Option<PartialCleared>,
 }
 
 /// Parse one layer's TOML text into a partial config. Err carries a human-readable reason —
@@ -2519,13 +2544,28 @@ fn apply_worktree_pool(into: &mut WorktreePoolConfig, p: Option<PartialWorktreeP
     }
 }
 
-/// Which config file a partial came from. Only `[preview]` needs to know so far — most sections are
-/// either fully project-overridable or refused outright, and this is the first one whose authority
-/// is asymmetric (a project may narrow it, never widen it).
+/// Which config file a partial came from. Two of the three are per-project and are treated
+/// IDENTICALLY on authority — `Project` is the tracked `.sparkle/config.toml` (repo policy) and
+/// `Local` the gitignored `.sparkle/local.toml` the app writes at runtime. Nothing keys off
+/// `Local` to widen anything; it exists so a warning can name the file the user must actually edit,
+/// and so `[preview]`'s asymmetric rule (a project may narrow it, never widen it) covers both.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Layer {
     Global,
     Project,
+    Local,
+}
+
+impl Layer {
+    /// The path, as a user sees it in a warning, of the per-project file this layer came from.
+    /// `Global` never reaches a per-project warning arm; it answers with the tracked file rather
+    /// than panicking, because a wrong string in a remedy is better than a crashed config load.
+    fn project_file(self) -> &'static str {
+        match self {
+            Layer::Local => ".sparkle/local.toml",
+            _ => ".sparkle/config.toml",
+        }
+    }
 }
 
 /// `layer` says which file this partial came from. It exists for ONE field — see below.
@@ -2577,12 +2617,12 @@ fn apply_preview(
             // [pushers]): a hand-edited project file is the ONE path that still reaches here, and
             // silence would leave it with no feedback. The concierge refusal covers only the tool
             // path, which no longer reaches the config layer.
-            warnings.push(
-                "[preview].enabled = true in a project's .sparkle/config.toml is ignored because \
-                 the preview is disabled globally; a project may turn it off for itself but not \
-                 back on — set it in the global config.toml"
-                    .to_string(),
-            );
+            warnings.push(format!(
+                "[preview].enabled = true in a project's {} is ignored because the preview is \
+                 disabled globally; a project may turn it off for itself but not back on — set it \
+                 in the global config.toml",
+                layer.project_file()
+            ));
         }
     }
     if let Some(v) = p.idle_grace_min {
@@ -4215,15 +4255,268 @@ fn validate(cfg: &mut SparkleConfig, warnings: &mut Vec<String>) {
     }
 }
 
-/// Build the effective config from optional layer texts. `is_global` distinguishes the two
-/// callers' warning wording and enforces the "per-project `[workers]`/`[ai]` are ignored" rule.
+/// Apply ONE per-project layer on top of `cfg`.
 ///
-/// Returns `(config, warnings, hard_error)`. `hard_error` is true when a *provided* layer failed
-/// to parse — the watcher uses it to keep the last-good config live instead of swapping.
+/// There are TWO such layers and they are the SAME KIND of file, which is the whole point of
+/// sharing this code: the tracked `.sparkle/config.toml` (repo policy, checked in, applies to
+/// everyone who clones) and the gitignored `.sparkle/local.toml` (this machine's runtime writes —
+/// see `local_path`). `local.toml` wins where both set a key, because it is applied second.
+///
+/// EVERY global-only refusal applies to BOTH, and that is the load-bearing property here. A
+/// per-project file may not set `[workers]`, `[memory]`, `[ai]`, `[tools]`, `[roborev]`,
+/// `[builder_index]`, `[fleet]`, `[improvement]`, `[onepassword]`, `[capture]`, `[ui]`,
+/// `[publish]`, `[voice]`, `[concierge]` or `[pushers]`; `local.toml` is per-project too, so
+/// routing the app's writes there must not quietly re-grant any of them. Sharing ONE body is what
+/// keeps that true — a second copy of these arms would drift.
+///
+/// `layer` changes exactly two things: WHICH FILE each warning names (a remedy string is an
+/// instruction the user will follow, so it has to name the file they actually edit), and the
+/// asymmetric `[preview].enabled` narrowing, which `apply_preview` applies to any non-Global layer.
+fn apply_project_layer(
+    cfg: &mut SparkleConfig,
+    text: &str,
+    layer: Layer,
+    warnings: &mut Vec<String>,
+    hard_error: &mut bool,
+    rejected_plugins: &mut Vec<(String, String)>,
+) {
+    let file = layer.project_file();
+    match parse_layer(text) {
+        Ok(p) => {
+            if p.workers.is_some() {
+                warnings.push(format!(
+                    "[workers] in a per-project {file} is ignored — it is a \
+                     machine-wide setting; set it in the global config.toml"
+                ));
+            }
+            if p.memory.is_some() {
+                // Same rule and same reason as [workers]: memory is a property of the MACHINE,
+                // and one repo must not be able to arm auto-kill (or disarm the gate) for every
+                // other project sharing the same RAM.
+                warnings.push(format!(
+                    "[memory] in a per-project {file} is ignored — it is a \
+                     machine-wide setting; set it in the global config.toml"
+                ));
+            }
+            if p.ai.is_some() {
+                warnings.push(format!(
+                    "[ai] in a per-project {file} is ignored — it is a \
+                     machine-wide setting; set it in the global config.toml"
+                ));
+            }
+            if p.tools.is_some() {
+                warnings.push(format!(
+                    "[tools] in a per-project {file} is ignored — it is a \
+                     machine-wide setting; set it in the global config.toml"
+                ));
+            }
+            if p.roborev.is_some() {
+                warnings.push(format!(
+                    "[roborev] in a per-project {file} is ignored — it is a \
+                     machine-wide setting; set it in the global config.toml"
+                ));
+            }
+            if p.builder_index.is_some() {
+                // Machine-wide in BOTH directions, which is the point: a cloned repo must not
+                // be able to un-exclude a skill its owner withheld from a public profile, any
+                // more than it can flip [tools].builder_index on.
+                warnings.push(format!(
+                    "[builder_index] in a per-project {file} is ignored — what \
+                     this machine publishes about you is machine-wide, not something a repo \
+                     gets to set; put it in the global config.toml"
+                ));
+            }
+            if p.fleet.is_some() {
+                // Same rule and reason as [workers]: the fleet's CI budget protects one SHARED
+                // runner pool, so a cloned repo must not be able to raise (or disable) the cap for
+                // every other project's agents pushing against the same pool.
+                warnings.push(format!(
+                    "[fleet] in a per-project {file} is ignored — it is a \
+                     machine-wide setting; set it in the global config.toml"
+                ));
+            }
+            if p.improvement.is_some() {
+                warnings.push(format!(
+                    "[improvement] in a per-project {file} is ignored — your \
+                     improvement-sharing consent is a machine-wide preference, not something a \
+                     repo gets to set; change it in the app or the global config.toml"
+                ));
+            }
+            if p.onepassword.is_some() {
+                warnings.push(format!(
+                    "[onepassword] in a per-project {file} is ignored — the \
+                     vault belongs to your 1Password account, not to one repo; set it in the \
+                     global config.toml"
+                ));
+            }
+            if p.capture.is_some() {
+                warnings.push(format!(
+                    "[capture] in a per-project {file} is ignored — the \
+                     global shortcut is a machine-wide setting; set it in the global \
+                     config.toml"
+                ));
+            }
+            if p.ui.is_some() {
+                warnings.push(format!(
+                    "[ui] in a per-project {file} is ignored — how a bead card \
+                     renders belongs to the person reading the concierge column, not to one \
+                     repo; set it in the global config.toml"
+                ));
+            }
+            // A SECURITY boundary, the same one [concierge] draws. A publish destination is a
+            // network egress target Sparkle sends a bearer token to; a repo that could set one
+            // would point the user's publishing at a host of its choosing merely by being
+            // cloned with a block in its checked-in config. The token itself never leaves the
+            // keychain, but the URL it is sent TO is exactly the thing worth stealing.
+            if p.publish.is_some() {
+                warnings.push(format!(
+                    "[publish] in a per-project {file} is ignored — where \
+                     Sparkle may post on YOUR behalf, and which host it sends your token to, \
+                     are not something a repo gets to set; set them in the global config.toml"
+                ));
+            }
+            if p.voice.is_some() {
+                warnings.push(format!(
+                    "[voice] in a per-project {file} is ignored — the \
+                     microphone Sparkle captures from is a machine-wide setting, not a \
+                     repo-scoped one; set it in the global config.toml"
+                ));
+            }
+            // A SECURITY boundary, not just tidiness. [concierge.tools] grants the concierge
+            // standing authority over the whole app — quit_app, remove_project, discard_agent —
+            // so a repo could otherwise hand itself that authority over the user's machine
+            // merely by being cloned with a rule in its checked-in config.
+            //
+            // [concierge.checks] inherits the boundary for a STRONGER reason: those are the
+            // deterministic checks run over every concierge reply, so a repo that could edit
+            // them could disable the linter that governs what the human is told about that very
+            // repo. One `if` covers both because both live under the same `[concierge]` table.
+            //
+            // The remedy names the GLOBAL FILE, not a pane. "⋯ Settings → Concierge tools"
+            // lists tools with their risk and has no check rows at all, so pointing a
+            // [concierge.checks] override there sends the user somewhere the setting is absent —
+            // a remedy string is an instruction they will follow, so it gets scoped to the half
+            // it actually covers.
+            if p.concierge.is_some() {
+                warnings.push(format!(
+                    "[concierge] in a per-project {file} is ignored — how \
+                     autonomous the concierge is over YOUR machine, and which checks run over \
+                     its replies, are not something a repo gets to set; set them in the global \
+                     config.toml (the tools half is also editable in ⋯ Settings → \"Concierge \
+                     tools\")"
+                ));
+            }
+            // The same boundary [concierge] draws, for the same kind of reason: [pushers]
+            // decides how often the agents on THIS machine get interrupted and challenged, and
+            // how much they may be spent on doing it. A repo could otherwise crank its own
+            // Pushers up — or switch them off — merely by being cloned with a block in its
+            // checked-in config, on a machine whose owner never asked for either.
+            if p.pushers.is_some() {
+                warnings.push(format!(
+                    "[pushers] in a per-project {file} is ignored — how much \
+                     Sparkle challenges the agents on YOUR machine is a machine-wide setting, \
+                     not something a repo gets to set; set it in the global config.toml"
+                ));
+            }
+            // `[cleared]` is a LOCAL-layer mechanism (see `PartialCleared`): it drops keys from
+            // the layer BELOW it. In the tracked file that would be a repo asking to erase its own
+            // keys — spelled "delete the line" — and nothing applies it there, so say so rather
+            // than leaving a hand-written block silently inert.
+            if p.cleared.is_some() && layer == Layer::Project {
+                warnings.push(format!(
+                    "[cleared] in a per-project {file} is ignored — it is how the app records a \
+                     setting you cleared in the UI that this file still sets, so it is only read \
+                     from .sparkle/local.toml; to drop a key from this file, delete the line"
+                ));
+            }
+            // Per-project layer: [workflow], [freshness], [review], [approvals], [plugins], and the
+            // [done]/[delivered] stage definitions are repo-scoped and may override. [approvals]
+            // is honored here so "this project" auto-approve rules actually take effect (per
+            // category, project beats global). [plugins] is repo-scoped because which agent
+            // plugins a codebase wants is a property of the codebase (a frontend repo wants
+            // frontend-design; a firmware one may not), and it travels with the repo for the
+            // team. [ai].auto_approve stays global-only (it's the machine-wide master toggle,
+            // ignored per-project like the rest of [ai] above).
+            apply_workflow(&mut cfg.workflow, p.workflow);
+            rejected_plugins.extend(apply_plugins(&mut cfg.plugins, p.plugins));
+            apply_freshness(&mut cfg.freshness, p.freshness);
+            apply_mention(&mut cfg.mention, p.mention);
+            apply_review(&mut cfg.review, p.review);
+            apply_worktree_pool(&mut cfg.worktree_pool, p.worktree_pool);
+            apply_preview(&mut cfg.preview, p.preview, layer, warnings);
+            apply_approvals(&mut cfg.approvals, p.approvals);
+            apply_done(&mut cfg.done, p.done);
+            apply_delivered(&mut cfg.delivered, p.delivered);
+        }
+        Err(e) => {
+            warnings.push(format!(
+                "per-project {file} has a syntax error and was ignored: {e}"
+            ));
+            *hard_error = true;
+        }
+    }
+}
+
+/// The dotted keys a `.sparkle/local.toml` asks to erase from the tracked layer — `[cleared].keys`.
+///
+/// An unparseable local file answers with an EMPTY list rather than an error: the layer itself is
+/// about to be handed to `apply_project_layer`, which reports the syntax error and names the file.
+/// Erasing nothing is the conservative direction — it leaves the tracked policy standing, which is
+/// what a reader who cannot be told what to erase should do.
+fn cleared_keys(local_text: &str) -> Vec<String> {
+    parse_layer(local_text)
+        .ok()
+        .and_then(|p| p.cleared)
+        .and_then(|c| c.keys)
+        .unwrap_or_default()
+}
+
+/// Remove every dotted key in `keys` from one layer's TOML `text`, returning the re-rendered text.
+///
+/// `None` when the text does not parse — the caller then passes the ORIGINAL through, so the layer
+/// still reaches `apply_project_layer` and produces its "syntax error and was ignored" warning. A
+/// silent empty layer here would turn a typo in a repo's committed policy into a config that quietly
+/// resolves to defaults with nothing said.
+///
+/// An individual key that cannot be removed (a path descending through a scalar) is SKIPPED, not
+/// fatal: `[cleared]` is machine-local bookkeeping about a file it does not control, so a tracked
+/// file reshaped by a human under a stale entry must not break the whole layer.
+fn strip_cleared_keys(text: &str, keys: &[String]) -> Option<String> {
+    let mut doc = text.parse::<toml_edit::DocumentMut>().ok()?;
+    for key in keys {
+        let _ = unset_dotted(&mut doc, key);
+    }
+    Some(doc.to_string())
+}
+
+/// Build the effective config from optional layer texts, with NO local layer. Kept as the
+/// three-argument shape because most callers (and every test that predates the local layer) have
+/// nothing local to pass — and "a repo with no `.sparkle/local.toml` behaves exactly as before" is
+/// a property worth being able to state by construction rather than by inspection.
 fn build_effective(
     base: SparkleConfig,
     global: Option<&str>,
     project: Option<&str>,
+) -> (SparkleConfig, Vec<String>, bool) {
+    build_effective_layered(base, global, project, None)
+}
+
+/// Build the effective config from optional layer texts. Precedence, weakest first:
+///
+///   defaults -> global `config.toml` -> project `.sparkle/config.toml` -> `.sparkle/local.toml`
+///
+/// The last two are BOTH per-project and carry identical authority (see `apply_project_layer`);
+/// they are two files only so that the half a human checks in and the half the app writes at
+/// runtime cannot collide. Local wins, because it is the more specific statement about THIS
+/// machine.
+///
+/// Returns `(config, warnings, hard_error)`. `hard_error` is true when a *provided* layer failed
+/// to parse — the watcher uses it to keep the last-good config live instead of swapping.
+fn build_effective_layered(
+    base: SparkleConfig,
+    global: Option<&str>,
+    project: Option<&str>,
+    local: Option<&str>,
 ) -> (SparkleConfig, Vec<String>, bool) {
     let mut cfg = base;
     let mut warnings = Vec::new();
@@ -4280,185 +4573,58 @@ fn build_effective(
         }
     }
 
-    if let Some(text) = project {
-        match parse_layer(text) {
-            Ok(p) => {
-                if p.workers.is_some() {
-                    warnings.push(
-                        "[workers] in a per-project .sparkle/config.toml is ignored — it is a \
-                         machine-wide setting; set it in the global config.toml"
-                            .to_string(),
-                    );
-                }
-                if p.memory.is_some() {
-                    // Same rule and same reason as [workers]: memory is a property of the MACHINE,
-                    // and one repo must not be able to arm auto-kill (or disarm the gate) for every
-                    // other project sharing the same RAM.
-                    warnings.push(
-                        "[memory] in a per-project .sparkle/config.toml is ignored — it is a \
-                         machine-wide setting; set it in the global config.toml"
-                            .to_string(),
-                    );
-                }
-                if p.ai.is_some() {
-                    warnings.push(
-                        "[ai] in a per-project .sparkle/config.toml is ignored — it is a \
-                         machine-wide setting; set it in the global config.toml"
-                            .to_string(),
-                    );
-                }
-                if p.tools.is_some() {
-                    warnings.push(
-                        "[tools] in a per-project .sparkle/config.toml is ignored — it is a \
-                         machine-wide setting; set it in the global config.toml"
-                            .to_string(),
-                    );
-                }
-                if p.roborev.is_some() {
-                    warnings.push(
-                        "[roborev] in a per-project .sparkle/config.toml is ignored — it is a \
-                         machine-wide setting; set it in the global config.toml"
-                            .to_string(),
-                    );
-                }
-                if p.builder_index.is_some() {
-                    // Machine-wide in BOTH directions, which is the point: a cloned repo must not
-                    // be able to un-exclude a skill its owner withheld from a public profile, any
-                    // more than it can flip [tools].builder_index on.
-                    warnings.push(
-                        "[builder_index] in a per-project .sparkle/config.toml is ignored — what \
-                         this machine publishes about you is machine-wide, not something a repo \
-                         gets to set; put it in the global config.toml"
-                            .to_string(),
-                    );
-                }
-                if p.fleet.is_some() {
-                    // Same rule and reason as [workers]: the fleet's CI budget protects one SHARED
-                    // runner pool, so a cloned repo must not be able to raise (or disable) the cap for
-                    // every other project's agents pushing against the same pool.
-                    warnings.push(
-                        "[fleet] in a per-project .sparkle/config.toml is ignored — it is a \
-                         machine-wide setting; set it in the global config.toml"
-                            .to_string(),
-                    );
-                }
-                if p.improvement.is_some() {
-                    warnings.push(
-                        "[improvement] in a per-project .sparkle/config.toml is ignored — your \
-                         improvement-sharing consent is a machine-wide preference, not something a \
-                         repo gets to set; change it in the app or the global config.toml"
-                            .to_string(),
-                    );
-                }
-                if p.onepassword.is_some() {
-                    warnings.push(
-                        "[onepassword] in a per-project .sparkle/config.toml is ignored — the \
-                         vault belongs to your 1Password account, not to one repo; set it in the \
-                         global config.toml"
-                            .to_string(),
-                    );
-                }
-                if p.capture.is_some() {
-                    warnings.push(
-                        "[capture] in a per-project .sparkle/config.toml is ignored — the \
-                         global shortcut is a machine-wide setting; set it in the global \
-                         config.toml"
-                            .to_string(),
-                    );
-                }
-                if p.ui.is_some() {
-                    warnings.push(
-                        "[ui] in a per-project .sparkle/config.toml is ignored — how a bead card \
-                         renders belongs to the person reading the concierge column, not to one \
-                         repo; set it in the global config.toml"
-                            .to_string(),
-                    );
-                }
-                // A SECURITY boundary, the same one [concierge] draws. A publish destination is a
-                // network egress target Sparkle sends a bearer token to; a repo that could set one
-                // would point the user's publishing at a host of its choosing merely by being
-                // cloned with a block in its checked-in config. The token itself never leaves the
-                // keychain, but the URL it is sent TO is exactly the thing worth stealing.
-                if p.publish.is_some() {
-                    warnings.push(
-                        "[publish] in a per-project .sparkle/config.toml is ignored — where \
-                         Sparkle may post on YOUR behalf, and which host it sends your token to, \
-                         are not something a repo gets to set; set them in the global config.toml"
-                            .to_string(),
-                    );
-                }
-                if p.voice.is_some() {
-                    warnings.push(
-                        "[voice] in a per-project .sparkle/config.toml is ignored — the \
-                         microphone Sparkle captures from is a machine-wide setting, not a \
-                         repo-scoped one; set it in the global config.toml"
-                            .to_string(),
-                    );
-                }
-                // A SECURITY boundary, not just tidiness. [concierge.tools] grants the concierge
-                // standing authority over the whole app — quit_app, remove_project, discard_agent —
-                // so a repo could otherwise hand itself that authority over the user's machine
-                // merely by being cloned with a rule in its checked-in config.
-                //
-                // [concierge.checks] inherits the boundary for a STRONGER reason: those are the
-                // deterministic checks run over every concierge reply, so a repo that could edit
-                // them could disable the linter that governs what the human is told about that very
-                // repo. One `if` covers both because both live under the same `[concierge]` table.
-                //
-                // The remedy names the GLOBAL FILE, not a pane. "⋯ Settings → Concierge tools"
-                // lists tools with their risk and has no check rows at all, so pointing a
-                // [concierge.checks] override there sends the user somewhere the setting is absent —
-                // a remedy string is an instruction they will follow, so it gets scoped to the half
-                // it actually covers.
-                if p.concierge.is_some() {
-                    warnings.push(
-                        "[concierge] in a per-project .sparkle/config.toml is ignored — how \
-                         autonomous the concierge is over YOUR machine, and which checks run over \
-                         its replies, are not something a repo gets to set; set them in the global \
-                         config.toml (the tools half is also editable in ⋯ Settings → \"Concierge \
-                         tools\")"
-                            .to_string(),
-                    );
-                }
-                // The same boundary [concierge] draws, for the same kind of reason: [pushers]
-                // decides how often the agents on THIS machine get interrupted and challenged, and
-                // how much they may be spent on doing it. A repo could otherwise crank its own
-                // Pushers up — or switch them off — merely by being cloned with a block in its
-                // checked-in config, on a machine whose owner never asked for either.
-                if p.pushers.is_some() {
-                    warnings.push(
-                        "[pushers] in a per-project .sparkle/config.toml is ignored — how much \
-                         Sparkle challenges the agents on YOUR machine is a machine-wide setting, \
-                         not something a repo gets to set; set it in the global config.toml"
-                            .to_string(),
-                    );
-                }
-                // Per-project layer: [workflow], [freshness], [review], [approvals], [plugins], and the
-                // [done]/[delivered] stage definitions are repo-scoped and may override. [approvals]
-                // is honored here so "this project" auto-approve rules actually take effect (per
-                // category, project beats global). [plugins] is repo-scoped because which agent
-                // plugins a codebase wants is a property of the codebase (a frontend repo wants
-                // frontend-design; a firmware one may not), and it travels with the repo for the
-                // team. [ai].auto_approve stays global-only (it's the machine-wide master toggle,
-                // ignored per-project like the rest of [ai] above).
-                apply_workflow(&mut cfg.workflow, p.workflow);
-                rejected_plugins.extend(apply_plugins(&mut cfg.plugins, p.plugins));
-                apply_freshness(&mut cfg.freshness, p.freshness);
-                apply_mention(&mut cfg.mention, p.mention);
-                apply_review(&mut cfg.review, p.review);
-                apply_worktree_pool(&mut cfg.worktree_pool, p.worktree_pool);
-                apply_preview(&mut cfg.preview, p.preview, Layer::Project, &mut warnings);
-                apply_approvals(&mut cfg.approvals, p.approvals);
-                apply_done(&mut cfg.done, p.done);
-                apply_delivered(&mut cfg.delivered, p.delivered);
-            }
-            Err(e) => {
-                warnings.push(format!(
-                    "per-project .sparkle/config.toml has a syntax error and was ignored: {e}"
-                ));
-                hard_error = true;
-            }
-        }
+    // SHADOW-UNSET, applied to the TRACKED layer's TEXT before it is parsed as a layer.
+    //
+    // The overlay direction is one-way — every `apply_*` arm writes a value or leaves the lower
+    // layer's alone — so no value the local layer can hold makes a key ABSENT. That is fine for a
+    // key the app itself wrote (the writer removes it from `local.toml`) and impossible for one
+    // that lives in the tracked file, which the writers may not touch. So `unset_project_value`
+    // records the key in `[cleared]` and the erasure happens HERE, by deleting it from the tracked
+    // text — which makes the resolved value fall back exactly as it did before the split, when
+    // there was one file and unset simply removed the line (roborev 66889, `PartialCleared`).
+    //
+    // Doing it on the text, with `unset_dotted`, is what keeps the two halves honest: the string
+    // the UI unsets is removed by the SAME dotted-path parser that wrote it, so a key that can be
+    // set is removable by the name it was set under, quoted segments and all.
+    let cleared = local.map(cleared_keys).unwrap_or_default();
+    // Owned, because `project` below borrows it. `None` when there is nothing to clear (the
+    // overwhelmingly common case — no re-render, no reparse) and also when the tracked text does
+    // not parse, so that layer still reaches `apply_project_layer` and produces its own syntax
+    // warning rather than vanishing.
+    let stripped: Option<String> = if cleared.is_empty() {
+        None
+    } else {
+        project.and_then(|text| strip_cleared_keys(text, &cleared))
+    };
+    if let Some(text) = stripped.as_deref().or(project) {
+        apply_project_layer(
+            &mut cfg,
+            text,
+            Layer::Project,
+            &mut warnings,
+            &mut hard_error,
+            &mut rejected_plugins,
+        );
+    }
+
+    // The LOCAL layer, applied LAST so it WINS. Same kind of file, different job:
+    // `.sparkle/local.toml` is gitignored and is where the app's own runtime writers land
+    // (`set_project_value`, `unset_project_value`, `write_stage_definition`), so a UI toggle can no
+    // longer dirty the TRACKED `.sparkle/config.toml` that carries repo policy — which is what
+    // wedged the shared main checkout's fast-forward for ten days (sparkle-5ur8s, sparkle-v38y1n).
+    //
+    // It is NOT a wider grant. `apply_project_layer` refuses every global-only section here exactly
+    // as it does for the tracked file, so `local.toml` cannot become a back door to `[workers]` or
+    // `[concierge]` merely because the app writes it.
+    if let Some(text) = local {
+        apply_project_layer(
+            &mut cfg,
+            text,
+            Layer::Local,
+            &mut warnings,
+            &mut hard_error,
+            &mut rejected_plugins,
+        );
     }
 
 
@@ -4480,9 +4646,34 @@ pub fn global_path(app_data: &Path) -> PathBuf {
     app_data.join("config.toml")
 }
 
-/// Per-project config file: `<repo>/.sparkle/config.toml`.
+/// Per-project config file: `<repo>/.sparkle/config.toml`. TRACKED in this repo (and meant to be
+/// tracked in any repo that wants Sparkle policy to travel with a clone), so nothing that runs at
+/// runtime may write it — see `local_path`.
 pub fn project_path(repo_root: &str) -> PathBuf {
     Path::new(repo_root).join(".sparkle").join("config.toml")
+}
+
+/// Per-project LOCAL settings: `<repo>/.sparkle/local.toml`. Gitignored, and the ONLY per-project
+/// file the app writes at runtime.
+///
+/// WHY IT EXISTS. `.sparkle/config.toml` became tracked so `[review].pr_reviewer` and the
+/// `[done]`/`[delivered]` stage definitions could be repo POLICY. That inverted a property that
+/// used to hold by construction: while the whole directory was ignored, the app's writes were
+/// machine-local no matter where they landed. Once one file inside is tracked, every UI toggle —
+/// a "this project" auto-approve rule, a Define Stage save — shows up as a modification to a
+/// TRACKED file, with two consequences that were measured, not hypothesized:
+///
+///   * a `git add -A` sweeps one machine's `[approvals]`/`[plugins]` choices into repo policy for
+///     everyone who clones; and
+///   * the file is not in `TOOLING_CHURN_PATHS`, so a pending local edit reads as real
+///     work-in-progress: `DirtyPolicy::Decline` refuses the park and `git merge --ff-only` aborts.
+///     The shared main checkout sat 1,175 commits behind `origin/main` for ten days on exactly one
+///     blocking path, and it was this file (sparkle-v38y1n).
+///
+/// Splitting the written half off is the fix: reads of the tracked file are unchanged, writes go
+/// here, and `build_effective_layered` lays this on top so the resolved settings are the same.
+pub fn local_path(repo_root: &str) -> PathBuf {
+    Path::new(repo_root).join(".sparkle").join("local.toml")
 }
 
 fn read_if_exists(path: &Path) -> Option<String> {
@@ -4589,6 +4780,12 @@ pub fn current_effective() -> EffectiveConfig {
 struct ProjectCacheEntry {
     mtime_ms: u128,
     len: u64,
+    /// The `.sparkle/local.toml` stamp, keyed SEPARATELY from the tracked file's for the same
+    /// reason the two files exist at all: it is the one that moves at runtime. Folding it into the
+    /// tracked file's stamp would leave the memo valid across every UI write — an auto-approve
+    /// toggle or a Define Stage save would land on disk and never reach a reader.
+    local_mtime_ms: u128,
+    local_len: u64,
     /// The global layer this result was merged against; when it changes (watcher reload) the memo
     /// is invalidated so a global edit still propagates into the per-project view.
     global_config: SparkleConfig,
@@ -4641,12 +4838,18 @@ pub fn for_project(repo_root: &str) -> EffectiveConfig {
     let global = current_effective();
     let path = project_path(repo_root);
     let (mtime_ms, len) = file_stamp(&path);
+    // The local layer is stamped too, and a MISSING file is a stable, valid key — (0, 0) — so a
+    // repo that has never had one memoizes exactly as it did before this layer existed.
+    let lpath = local_path(repo_root);
+    let (local_mtime_ms, local_len) = file_stamp(&lpath);
 
-    // Fast path: the project file and the global layer are both unchanged since we last computed.
+    // Fast path: BOTH project files and the global layer are unchanged since we last computed.
     if let Ok(cache) = project_cache().lock() {
         if let Some(e) = cache.get(repo_root) {
             if e.mtime_ms == mtime_ms
                 && e.len == len
+                && e.local_mtime_ms == local_mtime_ms
+                && e.local_len == local_len
                 && e.global_config == global.config
                 && e.global_warnings == global.warnings
             {
@@ -4659,15 +4862,29 @@ pub fn for_project(repo_root: &str) -> EffectiveConfig {
     // the project's auto-approve rules and [done]/[delivered] stage definitions vanish silently.
     // There is no last-good project layer to keep, so the honest result is the global layer plus a
     // warning naming the file — never a quiet fallback to "this project configures nothing".
+    //
+    // The LOCAL file gets the identical treatment, and it earns it: it is where every runtime write
+    // lands, so reading an unreadable one as absent would silently drop the very settings the user
+    // just changed in the UI.
     let mut read_failed = false;
-    let (cfg, mut warnings, _) = match read_layer_for_runtime(&path) {
-        Ok(project_text) => {
-            // `global.config` already has defaults+global folded in, so pass only the project layer.
-            build_effective(global.config.clone(), None, project_text.as_deref())
+    let (cfg, mut warnings, _) = match (read_layer_for_runtime(&path), read_layer_for_runtime(&lpath))
+    {
+        (Ok(project_text), Ok(local_text)) => {
+            // `global.config` already has defaults+global folded in, so pass only the two
+            // per-project layers; local is applied last and wins.
+            build_effective_layered(
+                global.config.clone(),
+                None,
+                project_text.as_deref(),
+                local_text.as_deref(),
+            )
         }
-        Err(msg) => {
+        // Either file being unreadable is reported and neither is guessed at. Both are named when
+        // both failed, rather than the first one silently standing in for the pair.
+        (a, b) => {
             read_failed = true;
-            (global.config.clone(), vec![msg], true)
+            let msgs = [a.err(), b.err()].into_iter().flatten().collect::<Vec<_>>();
+            (global.config.clone(), msgs, true)
         }
     };
     // Carry forward any standing global warnings so the UI sees them in a project context too.
@@ -4721,6 +4938,8 @@ pub fn for_project(repo_root: &str) -> EffectiveConfig {
                 ProjectCacheEntry {
                     mtime_ms,
                     len,
+                    local_mtime_ms,
+                    local_len,
                     global_config: global.config,
                     global_warnings,
                     effective: effective.clone(),
@@ -4742,15 +4961,39 @@ pub const DEFAULT_TEMPLATE: &str = r#"# ========================================
 # from and writes back to this same file, and any comments or formatting you add here are
 # preserved when the app changes a value.
 #
-# WHERE THIS LIVES (two layers, both optional):
+# WHERE THIS LIVES (three layers, all optional):
 #   • Global  — this file, in Sparkle's app-data dir. Applies to every project. Holds your
 #               machine-wide preferences ([workers], [memory], [ai]) plus default rules.
-#   • Project — a `.sparkle/config.toml` checked into a repo. Overrides ONLY the repo-scoped
-#               rules ([workflow], [freshness], [approvals], [plugins]) for that one project, and
-#               travels with the repo so a team shares them. [workers]/[memory]/[ai]/[tools] there
-#               are ignored (they're per-machine).
+#   • Project — a `.sparkle/config.toml` CHECKED INTO a repo. Overrides ONLY the repo-scoped
+#               rules ([workflow], [freshness], [review], [approvals], [plugins],
+#               [worktree_pool], [preview], [done], [delivered]) for that one project, and
+#               travels with the repo so a team shares them. [workers]/[memory]/[ai]/[tools]
+#               there are ignored (they're per-machine).
+#   • Local   — a `.sparkle/local.toml` NEXT TO IT, gitignored. Same rules, same refusals; it
+#               just isn't shared. This is where Sparkle writes when YOU change a per-project
+#               setting in the app — a "this project" auto-approve rule, a Define Stage save.
 #
-# PRECEDENCE: built-in defaults  →  this global file  →  a project's .sparkle/config.toml.
+# WHY THE PROJECT LAYER IS TWO FILES. `.sparkle/config.toml` is tracked, so if the app wrote
+# it, every click in the UI would leave a modified tracked file in your working tree: a
+# `git add -A` would sweep one machine's choices into repo policy for everyone who clones,
+# and `git merge --ff-only` would abort on a checkout that had done nothing but be used.
+# Splitting them keeps the half a human commits and the half the app writes apart. Reads see
+# both, so the resolved settings are the same — WITH ONE EXCEPTION, below.
+#
+# THE EXCEPTION: [preview]'s `command`, `args`, `path` and `port` are read STRAIGHT OFF a
+# worktree's own `.sparkle/config.toml`, not from the merged config, because preview detection
+# runs against an arbitrary worktree that is not necessarily the project this config was merged
+# for. Put those FOUR KEYS IN THE TRACKED `.sparkle/config.toml`; in `local.toml` they are
+# silently ignored. `[preview].enabled` is NOT affected — it goes through the merge like
+# everything else (and a project may only turn preview off, never back on).
+#
+# CLEARING A SETTING: when you clear a per-project setting in the app that the repo's tracked
+# `.sparkle/config.toml` sets, Sparkle records the key under `[cleared]` in `local.toml` rather
+# than editing the tracked file. The repo's value is then ignored on THIS machine only. Delete
+# the line from `[cleared].keys` to get it back.
+#
+# PRECEDENCE: built-in defaults → this global file → a project's .sparkle/config.toml →
+# that project's .sparkle/local.toml (the most specific statement wins).
 #
 # SAFETY: a missing file just uses the defaults below. A typo that makes the file invalid is
 # rejected with a message (in the in-app editor) and your last good settings keep running —
@@ -5958,59 +6201,176 @@ pub fn unset_value(app_data: &Path, path: &str) -> Result<(), String> {
     write_atomic(&global_path(app_data), &text)
 }
 
-/// Read the per-project `.sparkle/config.toml` as an editable document, preserving its comments +
+/// Read the per-project `.sparkle/local.toml` as an editable document, preserving its comments +
 /// other sections. Refuses to clobber an existing-but-unparseable file (matches
 /// `write_stage_definition`); an absent file starts from an empty document.
+///
+/// THE TRACKED `.sparkle/config.toml` IS NEVER OPENED HERE, and that is the point of the split:
+/// this is the write path, and writing repo policy at runtime is what dirties a tracked file and
+/// wedges a checkout's fast-forward (see `local_path`). Reads still see both files — the layering
+/// happens in `build_effective_layered`, not here.
+///
 /// ONLY `NotFound` MAY START FROM AN EMPTY DOCUMENT — the same rule as `load_document_for_write`,
 /// and it matters MORE here. The absent branch on this side is an *empty* document, not the default
 /// template, so a write that reaches it renders a file holding only the key just set. An unreadable
-/// `.sparkle/config.toml` (invalid UTF-8 from a hand-edit, a truncated write, `EACCES`, `EIO`) would
-/// therefore be replaced by a one-key file: every project setting and every `[done]`/`[delivered]`
-/// stage definition gone, along with the bytes needed to repair it. `read_if_exists` collapses all
-/// of those into `None`, which is why this reads the error kind directly.
+/// `.sparkle/local.toml` (invalid UTF-8 from a hand-edit, a truncated write, `EACCES`, `EIO`) would
+/// therefore be replaced by a one-key file: every local setting and every locally-defined
+/// `[done]`/`[delivered]` stage gone, along with the bytes needed to repair it. `read_if_exists`
+/// collapses all of those into `None`, which is why this reads the error kind directly.
 fn load_project_document(project_root: &str) -> Result<toml_edit::DocumentMut, String> {
-    let path = project_path(project_root);
+    let path = local_path(project_root);
     match std::fs::read_to_string(&path) {
         Ok(text) => text.parse::<toml_edit::DocumentMut>().map_err(|e| {
-            format!("existing .sparkle/config.toml is not valid TOML; fix it before editing it: {e}")
+            format!("existing .sparkle/local.toml is not valid TOML; fix it before editing it: {e}")
         }),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(toml_edit::DocumentMut::new()),
         Err(e) => Err(format!(
-            "existing .sparkle/config.toml could not be read, so it will not be overwritten: {e}"
+            "existing .sparkle/local.toml could not be read, so it will not be overwritten: {e}"
         )),
     }
 }
 
-/// Set one dotted key in the PER-PROJECT `.sparkle/config.toml` (comment-preserving), validating the
+/// Set one dotted key in the PER-PROJECT `.sparkle/local.toml` (comment-preserving), validating the
 /// rendered result first. Used for "this project" auto-approve rules.
+///
+/// Lands in `local.toml`, NOT the tracked `.sparkle/config.toml` — see `local_path` for why. The
+/// resolved value is unchanged, because the local layer sits directly above the tracked one — so a
+/// key the tracked file also sets resolves to the value written here.
+///
+/// It also DROPS any `[cleared]` entry for the same key, so setting and clearing are exact inverses
+/// on this file. Leaving one would be inert today (the value written here is applied after the
+/// erasure and wins), but it would mean a later hand-edit that deletes this key resolves past the
+/// tracked file instead of back to it — a stale tombstone deciding an outcome nobody asked it to.
 pub fn set_project_value(project_root: &str, path: &str, value: &serde_json::Value) -> Result<(), String> {
     let v = json_to_toml_value(value)?;
     let mut doc = load_project_document(project_root)?;
     set_dotted(&mut doc, path, v)?;
+    discard_cleared_key(&mut doc, path);
     let text = doc.to_string();
     parse_layer(&text)
-        .map_err(|e| format!("rejected: that change would make .sparkle/config.toml invalid: {e}"))?;
-    write_atomic(&project_path(project_root), &text)
+        .map_err(|e| format!("rejected: that change would make .sparkle/local.toml invalid: {e}"))?;
+    write_atomic(&local_path(project_root), &text)
 }
 
-/// Remove one dotted key from the PER-PROJECT `.sparkle/config.toml`. No-op when the file (or key)
-/// is absent — but a present-but-unparseable file is refused rather than clobbered.
+/// Clear one dotted key for a project: remove it from `.sparkle/local.toml` AND, when the tracked
+/// `.sparkle/config.toml` still sets it, record a `[cleared]` tombstone so the resolved value
+/// actually changes. A present-but-unparseable local file is refused rather than clobbered.
+///
+/// WHY THE TOMBSTONE, given that this file is a pure override stack: because "remove the key from
+/// the top layer" does not clear a key set in the layer BELOW it, and this writer may not touch
+/// that layer — it is tracked, and writing it is what wedged the shared checkout (`local_path`).
+/// Without the tombstone the common case wrote nothing, returned Ok, and the UI's re-pull resolved
+/// the tracked value and snapped the toggle back: the rule could not be cleared from the UI at all,
+/// on every install predating the split, since `.sparkle/config.toml` is simply where these values
+/// used to be written (roborev 66889). That is the "report a removal that never happened" failure
+/// the `NotFound` note below argues against, arrived at from the other side.
+///
+/// The tracked file is still never written. What is recorded is this machine's statement that the
+/// key does not apply here — gitignored, and no different in kind from any other local override.
+///
+/// NO-OP MEANS NO WRITE, not an empty file: when neither layer holds the key the rendered document
+/// is unchanged and nothing is written, so a repo that has never had a `local.toml` still does not
+/// get one from a stray clear.
 pub fn unset_project_value(project_root: &str, path: &str) -> Result<(), String> {
-    let path_buf = project_path(project_root);
-    // Nothing to remove from a file that doesn't exist yet. Checked on the error KIND, not on
-    // `read_if_exists`: an unreadable-but-present file would otherwise return Ok(()) here and
-    // report a removal that never happened. It falls through to `load_project_document`, which
-    // refuses it loudly.
-    match std::fs::metadata(&path_buf) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        _ => {}
-    }
+    // NOT gated on the local file existing. It used to be — and that early return is exactly the
+    // defect above, because the tombstone this may now need to record lives in a file that, on a
+    // pre-split install, does not exist yet. `load_project_document` still splits the cases the
+    // gate got right: `NotFound` starts from an empty document, and an unreadable-but-PRESENT file
+    // is refused loudly rather than reporting a removal that never happened.
     let mut doc = load_project_document(project_root)?;
+    let before = doc.to_string();
     unset_dotted(&mut doc, path)?;
+    if tracked_layer_sets(project_root, path) {
+        record_cleared_key(&mut doc, path)?;
+    }
     let text = doc.to_string();
+    if text == before {
+        return Ok(());
+    }
     parse_layer(&text)
-        .map_err(|e| format!("rejected: that change would make .sparkle/config.toml invalid: {e}"))?;
-    write_atomic(&path_buf, &text)
+        .map_err(|e| format!("rejected: that change would make .sparkle/local.toml invalid: {e}"))?;
+    write_atomic(&local_path(project_root), &text)
+}
+
+/// Does the TRACKED `.sparkle/config.toml` set this dotted key? Asked so a tombstone is recorded
+/// only when it would do something — `[cleared]` in a repo whose tracked file never mentions the
+/// key would be noise in a file the user reads.
+///
+/// FALSE for a file that is absent, unreadable, or unparseable, and those collapse together on
+/// purpose: each means the tracked LAYER contributes nothing to the resolved config (an unparseable
+/// one is refused wholesale by `apply_project_layer`), so there is nothing for a tombstone to erase.
+fn tracked_layer_sets(project_root: &str, path: &str) -> bool {
+    let Ok(text) = std::fs::read_to_string(project_path(project_root)) else {
+        return false;
+    };
+    let Ok(doc) = text.parse::<toml_edit::DocumentMut>() else {
+        return false;
+    };
+    let Ok(parts) = split_dotted_path(path) else {
+        return false;
+    };
+    let mut item = doc.as_item();
+    for part in &parts {
+        match item.get(part.as_str()) {
+            Some(next) => item = next,
+            None => return false,
+        }
+    }
+    !item.is_none()
+}
+
+/// The `[cleared]` table as a mutable array, created on demand. `Err` when the file already carries
+/// a `[cleared]` of the wrong shape (a hand-edit, or a name collision with something a future
+/// Sparkle adds) — refusing beats overwriting a user's bytes on a path whose whole job is bookkeeping.
+fn cleared_array<'a>(doc: &'a mut toml_edit::DocumentMut) -> Result<&'a mut toml_edit::Array, String> {
+    if !doc.contains_key(CLEARED_TABLE) {
+        let mut t = toml_edit::Table::new();
+        // A user opens this file. Say what the block is for, next to it — a bare list of dotted
+        // strings under an unexplained header reads like corruption.
+        t.decor_mut().set_prefix(
+            "\n# Settings you cleared in Sparkle that the repo's tracked .sparkle/config.toml still\n\
+             # sets. Each entry is a dotted key; that file's value for it is ignored on THIS machine,\n\
+             # so the setting falls back as if the repo never set it. Delete a line to get it back.\n",
+        );
+        doc.insert(CLEARED_TABLE, toml_edit::Item::Table(t));
+    }
+    let table = doc[CLEARED_TABLE]
+        .as_table_mut()
+        .ok_or_else(|| format!("existing [{CLEARED_TABLE}] in .sparkle/local.toml is not a table"))?;
+    table
+        .entry("keys")
+        .or_insert(toml_edit::value(toml_edit::Array::new()))
+        .as_array_mut()
+        .ok_or_else(|| format!("existing [{CLEARED_TABLE}].keys in .sparkle/local.toml is not an array"))
+}
+
+/// Record `path` in `[cleared].keys`, idempotently — clearing an already-cleared key must not grow
+/// the list, or a UI that re-sends the same clear (a re-render, a retry) appends forever.
+fn record_cleared_key(doc: &mut toml_edit::DocumentMut, path: &str) -> Result<(), String> {
+    let arr = cleared_array(doc)?;
+    if !arr.iter().any(|v| v.as_str() == Some(path)) {
+        arr.push(path);
+    }
+    Ok(())
+}
+
+/// Drop `path` from `[cleared].keys`, removing the table once it is empty so the file does not keep
+/// an explanatory comment about a list with nothing in it. Silent when there is nothing to drop, and
+/// silent on a malformed `[cleared]`: this runs inside a SET, and a set must not fail because of
+/// bookkeeping it did not need.
+fn discard_cleared_key(doc: &mut toml_edit::DocumentMut, path: &str) {
+    let Some(table) = doc.get_mut(CLEARED_TABLE).and_then(|i| i.as_table_mut()) else {
+        return;
+    };
+    if let Some(arr) = table.get_mut("keys").and_then(|i| i.as_array_mut()) {
+        arr.retain(|v| v.as_str() != Some(path));
+        if arr.is_empty() {
+            table.remove("keys");
+        }
+    }
+    if table.is_empty() {
+        doc.remove(CLEARED_TABLE);
+    }
 }
 
 /// Validate then overwrite the whole global file (the raw-editor Save). Rejects invalid TOML
@@ -6028,8 +6388,15 @@ pub fn reset(app_data: &Path) -> Result<(), String> {
 // ---- per-project stage-definition writer (Definable Done & Delivered) --------------------------
 // Unlike the scalar dotted setter, a stage definition is an ENTIRE `[done]`/`[delivered]` table
 // with a `[[<key>.criteria]]` array-of-tables — not expressible as a dotted scalar. This writes the
-// whole section into the PER-PROJECT `.sparkle/config.toml` (the stage definitions are repo-scoped),
-// insert-or-replacing it while preserving the rest of the file (comments + other sections).
+// whole section into the PER-PROJECT `.sparkle/local.toml`, insert-or-replacing it while preserving
+// the rest of the file (comments + other sections).
+//
+// LOCAL, NOT THE TRACKED FILE, and this writer is the reason the split exists at all: a Define
+// Stage save landed in the tracked `.sparkle/config.toml`, uncommitted, and that ONE dirty path
+// aborted `git merge --ff-only` in the shared main checkout for ten days (sparkle-v38y1n). A stage
+// definition is still repo-scoped and a team still wants it checked in — that is a human committing
+// a `[done]` block to `config.toml`, which keeps applying. What the UI writes is this machine's
+// override of it.
 
 /// Build the `[[<key>.criteria]]` array-of-tables from parsed partial criteria. A `manual`
 /// criterion carries no `signal`, so it's emitted only when present.
@@ -6083,7 +6450,7 @@ fn delivered_table(p: &PartialDelivered) -> toml_edit::Table {
 }
 
 /// Insert-or-replace the `[done]`/`[delivered]` stage definition in `<project_root>/.sparkle/
-/// config.toml`, preserving the rest of the file (comments + unrelated sections). `definition` is
+/// local.toml`, preserving the rest of the file (comments + unrelated sections). `definition` is
 /// the snake_case config shape (see `PartialDone`/`PartialDelivered`); it is validated against the
 /// typed layer both up front (rejecting wrong types) and after rendering (so a malformed result can
 /// never be persisted). Written atomically. Pure over the filesystem so it's unit-testable.
@@ -6111,19 +6478,19 @@ fn write_stage_definition(
         }
     };
 
-    let path = project_path(project_root);
-    // Preserve the existing project file (comments + other sections). If it exists but is
+    let path = local_path(project_root);
+    // Preserve the existing local file (comments + other sections). If it exists but is
     // unparseable, refuse rather than clobber a hand-edited file; if absent, start from empty.
     // Only NotFound starts from empty; an unreadable file is refused rather than replaced by a
     // document holding just this stage. Same rule and same reason as `load_project_document`.
     let mut doc = match std::fs::read_to_string(&path) {
         Ok(text) => text.parse::<toml_edit::DocumentMut>().map_err(|e| {
-            format!("existing .sparkle/config.toml is not valid TOML; fix it before defining a stage: {e}")
+            format!("existing .sparkle/local.toml is not valid TOML; fix it before defining a stage: {e}")
         })?,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => toml_edit::DocumentMut::new(),
         Err(e) => {
             return Err(format!(
-                "existing .sparkle/config.toml could not be read, so it will not be overwritten: {e}"
+                "existing .sparkle/local.toml could not be read, so it will not be overwritten: {e}"
             ))
         }
     };
@@ -6135,7 +6502,7 @@ fn write_stage_definition(
     // Round-trip validation: the rendered file must parse cleanly through the typed layer before we
     // persist it (matches the write_text / set_value contract — never write an invalid config).
     parse_layer(&text).map_err(|e| {
-        format!("rejected: that stage definition would make config.toml invalid: {e}")
+        format!("rejected: that stage definition would make local.toml invalid: {e}")
     })?;
     write_atomic(&path, &text)
 }
@@ -6220,8 +6587,8 @@ pub fn unset_config_value(app: AppHandle, path: String) -> Result<(), String> {
     Ok(())
 }
 
-/// Set one dotted key in a PROJECT's `.sparkle/config.toml` (comment-preserving). Used for a
-/// "this project" auto-approve rule. Emits a fresh GLOBAL `config-changed` so listeners re-pull —
+/// Set one dotted key in a PROJECT's gitignored `.sparkle/local.toml` (comment-preserving). Used
+/// for a "this project" auto-approve rule; the tracked `.sparkle/config.toml` is never written. Emits a fresh GLOBAL `config-changed` so listeners re-pull —
 /// per-project consumers re-read `get_config(project_root)` themselves, and emitting the global
 /// layer (rather than the project-merged one) keeps the global settings mirror uncontaminated by a
 /// project-scoped value.
@@ -6238,8 +6605,9 @@ pub fn set_project_config_value(
     Ok(())
 }
 
-/// Remove one dotted key from a PROJECT's `.sparkle/config.toml`. Used to clear a "this project"
-/// auto-approve rule (or un-mute a `never`). See `set_project_config_value` for the emit rationale.
+/// Remove one dotted key from a PROJECT's gitignored `.sparkle/local.toml`. Used to clear a "this
+/// project" auto-approve rule (or un-mute a `never`); a rule set in the tracked
+/// `.sparkle/config.toml` is repo policy and is not removable from the UI. See `set_project_config_value` for the emit rationale.
 #[tauri::command]
 pub fn unset_project_config_value(
     app: AppHandle,
@@ -6301,7 +6669,7 @@ fn read_editor_text(path: &Path) -> Result<String, String> {
 }
 
 /// Insert-or-replace a per-project `[done]`/`[delivered]` stage definition in the project's
-/// `.sparkle/config.toml`, preserving comments + other sections. `key` must be "done" or
+/// gitignored `.sparkle/local.toml`, preserving comments + other sections. `key` must be "done" or
 /// "delivered"; `definition` is the snake_case config shape (description, criteria[{text,kind,
 /// signal}], and for delivered: detected_method, confidence, confidence_note, learned). Emits a
 /// `config-changed` carrying the fresh per-project effective config so the board/modal re-render.
@@ -10039,14 +10407,20 @@ mesages_per_hour = 9
         set_project_value(&root, "approvals.bash", &serde_json::json!("never")).unwrap();
 
         let g_text = read_if_exists(&global_path(&dir));
-        let p_text = read_if_exists(&project_path(&root));
-        let (cfg, _, _) = build_effective(SparkleConfig::default(), g_text.as_deref(), p_text.as_deref());
+        // Read back from `local.toml`, which is where the project writer now lands, and layer it as
+        // the LOCAL layer — the resolved precedence is what this test is about, and it is unchanged.
+        // The tracked `config.toml` is asserted absent, so this cannot pass by reading the old file.
+        assert!(!project_path(&root).exists(), "the tracked file must not be written at runtime");
+        let p_text = read_if_exists(&local_path(&root));
+        let (cfg, _, _) =
+            build_effective_layered(SparkleConfig::default(), g_text.as_deref(), None, p_text.as_deref());
         assert_eq!(cfg.approvals.bash.as_deref(), Some("never"), "project overrides global");
 
         // Clear the project rule → falls back to the global rule.
         unset_project_value(&root, "approvals.bash").unwrap();
-        let p_text = read_if_exists(&project_path(&root));
-        let (cfg, _, _) = build_effective(SparkleConfig::default(), g_text.as_deref(), p_text.as_deref());
+        let p_text = read_if_exists(&local_path(&root));
+        let (cfg, _, _) =
+            build_effective_layered(SparkleConfig::default(), g_text.as_deref(), None, p_text.as_deref());
         assert_eq!(cfg.approvals.bash.as_deref(), Some("always"), "falls back to global");
 
         // Clear the global rule too → no file layer left, so the built-in default answers (which
@@ -10854,7 +11228,9 @@ merge_pr = "deny"
         // [done]/[delivered] stage definition gone, along with the bytes needed to repair it.
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_string_lossy().to_string();
-        let path = project_path(&root);
+        // `local.toml`, because that is the file the project writers open. The tracked
+        // `config.toml` is never opened by a writer at all, so it has no such branch to test.
+        let path = local_path(&root);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let raw: &[u8] = b"# hand-written\n[workflow]\nrequire_pr = fa\xfflse\n";
         std::fs::write(&path, raw).unwrap();
@@ -11200,9 +11576,9 @@ merge_pr = "deny"
     fn set_stage_definition_round_trips_and_replaces_preserving_other_sections() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_string_lossy().to_string();
-        let path = project_path(&root);
-        // Pre-existing per-project file with an UNRELATED [workflow] section + a comment, which the
-        // stage-definition write must leave byte-intact.
+        let path = local_path(&root);
+        // Pre-existing per-project LOCAL file with an UNRELATED [workflow] section + a comment,
+        // which the stage-definition write must leave byte-intact.
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, "# keep this comment\n[workflow]\nrequire_pr = false\n").unwrap();
 
@@ -11282,13 +11658,692 @@ merge_pr = "deny"
             ]
         });
         write_stage_definition(&root, "done", &def).unwrap();
-        let ptext = std::fs::read_to_string(project_path(&root)).unwrap();
+        let ptext = std::fs::read_to_string(local_path(&root)).unwrap();
         let (cfg, _, hard) = build_effective(SparkleConfig::default(), None, Some(&ptext));
         assert!(!hard);
         assert_eq!(cfg.done.description.as_deref(), Some("Merged into origin/main."));
         assert_eq!(cfg.done.criteria.len(), 2);
         assert_eq!(cfg.done.criteria[0].signal.as_deref(), Some("merged_to_main"));
         assert_eq!(cfg.done.criteria[1].kind, "manual");
+    }
+
+    // ---- the tracked/local split (sparkle-5ur8s) ------------------------------------------------
+    //
+    // The property under test is NEGATIVE and is about a file nobody names in the call: a runtime
+    // write must leave `.sparkle/config.toml` untouched. Every assertion below therefore compares
+    // that file's BYTES before and after. Asserting merely that `local.toml` appeared would be the
+    // vacuous shape — it is satisfied by a writer that wrote BOTH files.
+
+    /// A repo policy file with the shapes that actually matter: comments (which a comment-preserving
+    /// writer would rewrite), a scalar the write also sets, and a `[done]` table the stage writer
+    /// would replace. If a writer touches this file at all, its bytes move.
+    ///
+    /// `resume` is here for the CLEAR tests, and the reason is worth stating so nobody "simplifies"
+    /// them back onto `bash`. Every permission category defaults to `"always"`, so a cleared `bash`
+    /// resolving to `"always"` is indistinguishable from a local `"always"` that was never removed
+    /// — the assertion would pass against the defect. `resume` has three distinct values in play
+    /// (tracked `"full"`, a global `"summary"`, default `"ask"`), so each outcome names exactly one
+    /// layer.
+    const TRACKED_POLICY: &str = "# repo policy — checked in\n\
+                                  [approvals]\n\
+                                  bash = \"never\"\n\
+                                  resume = \"full\"\n\
+                                  \n\
+                                  [done]\n\
+                                  description = \"Merged into the remote main branch.\"\n";
+
+    fn seed_tracked_policy(root: &str) -> std::path::PathBuf {
+        let path = project_path(root);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, TRACKED_POLICY).unwrap();
+        path
+    }
+
+    #[test]
+    fn a_project_value_write_lands_in_local_toml_and_leaves_the_tracked_file_byte_identical() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_string_lossy().to_string();
+        let tracked = seed_tracked_policy(&root);
+        let before = std::fs::read(&tracked).unwrap();
+
+        set_project_value(&root, "approvals.bash", &serde_json::json!("always")).unwrap();
+
+        // THE ASSERTION THIS TEST EXISTS FOR. Bytes, not "did it parse the same": a
+        // comment-preserving rewrite that happens to be semantically equal is still a tracked-file
+        // modification, and a tracked-file modification is what aborts `git merge --ff-only` in the
+        // shared checkout. Equality of MEANING is not the property; equality of BYTES is.
+        assert_eq!(
+            std::fs::read(&tracked).unwrap(),
+            before,
+            "a runtime write must not touch the tracked .sparkle/config.toml"
+        );
+
+        // ...and the write really happened, in the other file, with the effect it is supposed to
+        // have: the local value WINS over the tracked one through the real resolver.
+        let ltext = std::fs::read_to_string(local_path(&root)).unwrap();
+        let (cfg, _, hard) = build_effective_layered(
+            SparkleConfig::default(),
+            None,
+            Some(TRACKED_POLICY),
+            Some(&ltext),
+        );
+        assert!(!hard);
+        assert_eq!(cfg.approvals.bash.as_deref(), Some("always"));
+
+        // The remover is the same path and gets the same guarantee — aimed at `resume`, a key this
+        // machine never set, so it can only be cleared by reaching past the tracked file.
+        unset_project_value(&root, "approvals.resume").unwrap();
+        assert_eq!(
+            std::fs::read(&tracked).unwrap(),
+            before,
+            "clearing a rule must not touch the tracked file either"
+        );
+        let ltext = std::fs::read_to_string(local_path(&root)).unwrap();
+        let (cfg, _, _) = build_effective_layered(
+            SparkleConfig::default(),
+            None,
+            Some(TRACKED_POLICY),
+            Some(&ltext),
+        );
+        // THIS ASSERTION USED TO READ "the tracked repo policy answers again" AND THAT WAS THE
+        // DEFECT (roborev 66889). It is what the UI shows: clearing a rule and watching the toggle
+        // come back with the value you just cleared is indistinguishable from the clear having
+        // failed — which, for a rule living only in the tracked file, is what it had. Clear means
+        // cleared, on this machine, wherever the value came from; the tracked file keeps its bytes
+        // and keeps applying to everyone else.
+        assert_eq!(
+            cfg.approvals.resume.as_deref(),
+            Some("ask"),
+            "clearing must clear — a rule the tracked file sets falls through to the default, not \
+             back to the tracked value"
+        );
+        // The local write from the first half is untouched by the clear of a different key.
+        assert_eq!(cfg.approvals.bash.as_deref(), Some("always"));
+    }
+
+    #[test]
+    fn a_stage_definition_write_lands_in_local_toml_and_leaves_the_tracked_file_byte_identical() {
+        // The Define Stage modal's writer — the one whose uncommitted write actually wedged the
+        // shared main checkout. It insert-or-REPLACES a whole table, so aimed at the tracked file it
+        // would rewrite the committed `[done]`/`[delivered]` policy block wholesale.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_string_lossy().to_string();
+        let tracked = seed_tracked_policy(&root);
+        let before = std::fs::read(&tracked).unwrap();
+
+        let def = serde_json::json!({
+            "description": "Shipped to production.",
+            "detected_method": "release_tag",
+            "confidence": "high",
+            "criteria": [ { "text": "In a cut release", "kind": "auto", "signal": "in_release" } ]
+        });
+        write_stage_definition(&root, "delivered", &def).unwrap();
+
+        assert_eq!(
+            std::fs::read(&tracked).unwrap(),
+            before,
+            "Define Stage must not touch the tracked .sparkle/config.toml"
+        );
+
+        // A `[done]` write is the sharper case: the tracked file ALREADY HAS a `[done]` table, so a
+        // writer aimed at it would replace a committed policy block rather than merely append.
+        let done = serde_json::json!({
+            "description": "Locally redefined.",
+            "criteria": [ { "text": "x", "kind": "manual" } ]
+        });
+        write_stage_definition(&root, "done", &done).unwrap();
+        assert_eq!(std::fs::read(&tracked).unwrap(), before, "the committed [done] block survives");
+
+        let ltext = std::fs::read_to_string(local_path(&root)).unwrap();
+        let (cfg, _, hard) = build_effective_layered(
+            SparkleConfig::default(),
+            None,
+            Some(TRACKED_POLICY),
+            Some(&ltext),
+        );
+        assert!(!hard);
+        assert_eq!(cfg.delivered.description.as_deref(), Some("Shipped to production."));
+        assert_eq!(
+            cfg.done.description.as_deref(),
+            Some("Locally redefined."),
+            "the local [done] overrides the tracked one"
+        );
+    }
+
+    #[test]
+    fn the_local_layer_wins_over_the_tracked_project_layer() {
+        // Precedence: defaults -> global -> tracked project -> local. Every pair is asserted in the
+        // SAME resolve, so an implementation that applied local FIRST (or dropped it) fails here.
+        let g = "[approvals]\nbash = \"summary\"\nresume = \"summary\"\n";
+        let project = "[approvals]\nbash = \"never\"\n[workflow]\nrequire_pr = false\n";
+        let local = "[approvals]\nbash = \"always\"\n";
+        let (cfg, _, hard) =
+            build_effective_layered(SparkleConfig::default(), Some(g), Some(project), Some(local));
+        assert!(!hard);
+        // set in all three → local wins
+        assert_eq!(cfg.approvals.bash.as_deref(), Some("always"), "local beats project beats global");
+        // set in global only → survives, so "local wins" is an override, not a wipe of the stack
+        assert_eq!(cfg.approvals.resume.as_deref(), Some("summary"));
+        // set in the tracked project file only → still applies with a local layer present
+        assert!(!cfg.workflow.require_pr, "tracked repo policy keeps applying");
+    }
+
+    #[test]
+    fn a_repo_with_no_local_toml_resolves_exactly_as_it_did_before() {
+        // THE REGRESSION GUARD. Reads of the tracked file are supposed to be untouched by this
+        // change, so a repo that has no `.sparkle/local.toml` must resolve to the identical config
+        // AND the identical warning list as the pre-split three-layer path.
+        let g = "[workers]\nmax_concurrent = 3\n[approvals]\nresume = \"summary\"\n";
+        // Deliberately carries a refused section so the WARNINGS are non-empty and comparable —
+        // an all-green pair would be equal for uninteresting reasons.
+        let project = "[approvals]\nbash = \"never\"\n[workflow]\nrequire_pr = false\n[roborev]\nenabled = true\n";
+
+        let (before, w_before, h_before) =
+            build_effective(SparkleConfig::default(), Some(g), Some(project));
+        let (after, w_after, h_after) =
+            build_effective_layered(SparkleConfig::default(), Some(g), Some(project), None);
+
+        assert_eq!(before, after, "no local.toml → byte-for-byte the same effective config");
+        assert_eq!(w_before, w_after, "…and the same warnings, in the same order");
+        assert_eq!(h_before, h_after);
+        assert!(
+            w_before.iter().any(|w| w.contains("[roborev]") && w.contains(".sparkle/config.toml")),
+            "the tracked file's refusal must still name the TRACKED file: {w_before:?}"
+        );
+    }
+
+    #[test]
+    fn a_global_only_section_in_local_toml_is_ignored_and_warns_naming_local_toml() {
+        // `local.toml` is per-project too, so it must not become a back door that re-grants a
+        // machine-wide section to a repo. `[workers]` is the canonical one: it decides how many
+        // agents run on THIS machine.
+        let local = "[workers]\nmax_concurrent = 99\n";
+        let (cfg, warns, hard) =
+            build_effective_layered(SparkleConfig::default(), None, None, Some(local));
+        assert!(!hard);
+        // THE SIDE EFFECT, not the precondition: the value did not take.
+        assert_eq!(cfg.workers.max_concurrent, None, "[workers] in local.toml must not apply");
+        assert!(
+            warns.iter().any(|w| w.contains("[workers]") && w.contains(".sparkle/local.toml")),
+            "the warning must name local.toml, the file the user has to edit: {warns:?}"
+        );
+        // And it must not accidentally name the tracked file, which the user would then edit in
+        // vain — a remedy string is an instruction they will follow.
+        assert!(
+            !warns.iter().any(|w| w.contains("[workers]") && w.contains(".sparkle/config.toml")),
+            "a local-layer refusal must not send the user to the tracked file: {warns:?}"
+        );
+    }
+
+    #[test]
+    fn every_global_only_refusal_covers_the_local_layer_too() {
+        // The back door would not be `[workers]` — it would be whichever section someone forgot
+        // when copying the arms. Sweep ALL of them through the local layer at once. This is what
+        // makes sharing ONE body (`apply_project_layer`) load-bearing rather than tidy.
+        let cases: &[(&str, &str)] = &[
+            ("[workers]", "[workers]\nmax_concurrent = 99\n"),
+            ("[memory]", "[memory]\nauto_kill = true\n"),
+            ("[ai]", "[ai]\nauto_approve = true\n"),
+            ("[tools]", "[tools]\nbuilder_index = true\n"),
+            ("[roborev]", "[roborev]\nenabled = true\n"),
+            ("[builder_index]", "[builder_index]\nskills_exclude = [\"x\"]\n"),
+            ("[fleet]", "[fleet]\nci_budget = 99\n"),
+            ("[improvement]", "[improvement]\nconsent = \"always\"\n"),
+            ("[onepassword]", "[onepassword]\nvault = \"x\"\n"),
+            ("[capture]", "[capture]\nshortcut = \"cmd+x\"\n"),
+            ("[ui]", "[ui]\nbead_card_density = \"compact\"\n"),
+            ("[publish]", "[publish]\nbase_url = \"https://evil.example\"\n"),
+            ("[voice]", "[voice]\ninput_device_uid = \"x\"\n"),
+            ("[concierge]", "[concierge.tools]\nquit_app = \"allow\"\n"),
+            ("[pushers]", "[pushers]\nenabled = true\n"),
+        ];
+        for (section, toml) in cases {
+            let (_, warns, hard) =
+                build_effective_layered(SparkleConfig::default(), None, None, Some(toml));
+            assert!(!hard, "{section} in local.toml must not be a hard error");
+            assert!(
+                warns.iter().any(|w| w.starts_with(section) && w.contains(".sparkle/local.toml")),
+                "{section} in local.toml was not refused with a local-named warning: {warns:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_local_layer_cannot_widen_preview_enabled_either() {
+        // `[preview].enabled` is the asymmetric one: a project may turn it OFF for itself, never
+        // back ON, because it gates spawning a long-lived process whose command line comes from the
+        // repo. Routing the app's writes into `local.toml` must not hand a repo that re-enable.
+        let g = "[preview]\nenabled = false\n";
+        let (cfg, warns, _) =
+            build_effective_layered(SparkleConfig::default(), Some(g), None, Some("[preview]\nenabled = true\n"));
+        assert!(!cfg.preview.enabled, "local.toml must not re-enable a globally disabled preview");
+        assert!(
+            warns.iter().any(|w| w.contains("[preview].enabled") && w.contains(".sparkle/local.toml")),
+            "{warns:?}"
+        );
+        // The narrowing direction still works from local.
+        let (cfg, _, _) =
+            build_effective_layered(SparkleConfig::default(), None, None, Some("[preview]\nenabled = false\n"));
+        assert!(!cfg.preview.enabled, "local.toml may still turn preview OFF");
+    }
+
+    // ---- shadow-unset: clearing a rule that lives in the TRACKED file (roborev 66889) ----------
+    //
+    // The defect these pin is the one the split created and nothing caught: `unset_project_value`
+    // could only remove keys from `local.toml`, so clearing a rule that lives in the tracked
+    // `.sparkle/config.toml` wrote nothing, returned success, and left the resolved value exactly
+    // as it was. In THIS repo the tracked file is curated policy; in every other repo on every
+    // pre-split install it is simply where these values used to be written — so the unclearable
+    // case was the DEFAULT one, not an edge.
+    //
+    // Every assertion below is on the RESOLVED value, through the real resolver. Asserting that a
+    // file was written is asserting the precondition: the whole failure was a write that happened
+    // and changed nothing.
+
+    #[test]
+    fn clearing_a_rule_that_lives_only_in_the_tracked_file_changes_the_resolved_value() {
+        // THE REPORTED BUG, at the smallest scale that can show it: no `local.toml` at all, the
+        // rule in the tracked file, one clear.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_string_lossy().to_string();
+        let tracked = seed_tracked_policy(&root);
+        let before = std::fs::read(&tracked).unwrap();
+        assert!(!local_path(&root).exists(), "fixture: a pre-split install has no local.toml");
+
+        // A global rule to fall BACK to, distinct from BOTH the tracked value ("full") and the
+        // built-in default ("ask"), so the outcome names one layer. A fallback that happened to
+        // equal the default would pass just as well against a clear that did nothing at all.
+        let g = "[approvals]\nresume = \"summary\"\n";
+        let resolve = |root: &str| {
+            let ltext = std::fs::read_to_string(local_path(root)).ok();
+            build_effective_layered(
+                SparkleConfig::default(),
+                Some(g),
+                Some(TRACKED_POLICY),
+                ltext.as_deref(),
+            )
+        };
+
+        let (cfg, _, _) = resolve(&root);
+        assert_eq!(
+            cfg.approvals.resume.as_deref(),
+            Some("full"),
+            "fixture: the tracked rule applies"
+        );
+
+        unset_project_value(&root, "approvals.resume").unwrap();
+
+        let (cfg, warns, hard) = resolve(&root);
+        assert!(!hard, "the tombstone must not break the layer: {warns:?}");
+        assert_eq!(
+            cfg.approvals.resume.as_deref(),
+            Some("summary"),
+            "clearing a tracked rule must resolve past it to the global one, not report success \
+             and leave the value standing"
+        );
+
+        // ...and the property the entire split exists for is intact. BYTES, not meaning: a
+        // semantically-equal rewrite is still a modified tracked file, and a modified tracked file
+        // is what aborts `git merge --ff-only` in the shared checkout.
+        assert_eq!(
+            std::fs::read(&tracked).unwrap(),
+            before,
+            "clearing a tracked rule must not write the tracked file"
+        );
+
+        // Everything else the tracked file says still applies — a tombstone erases ONE key, not a
+        // layer. `[done]` is the sharper witness: it is repo policy nobody asked to clear.
+        assert_eq!(
+            cfg.done.description.as_deref(),
+            Some("Merged into the remote main branch."),
+            "the rest of the tracked policy must survive the erasure"
+        );
+    }
+
+    #[test]
+    fn clearing_a_rule_that_lives_only_in_local_toml_still_works_and_writes_no_tombstone() {
+        // THE PAIRED POSITIVE. One test showing a value became absent is ambiguous — it passes for
+        // an implementation that erases too much. This is the same call on the same key with the
+        // rule in the OTHER layer: it must still resolve back to the layer below, and it must not
+        // leave `[cleared]` behind, because there is nothing in the tracked file to shadow.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_string_lossy().to_string();
+        // A tracked file that is PRESENT but silent on this key — so a tombstone written anyway
+        // would be visible here, rather than the test passing because nothing was tracked at all.
+        let tracked_without_the_key = "[done]\ndescription = \"Merged.\"\n";
+        std::fs::create_dir_all(project_path(&root).parent().unwrap()).unwrap();
+        std::fs::write(project_path(&root), tracked_without_the_key).unwrap();
+
+        let g = "[approvals]\nresume = \"summary\"\n";
+        set_project_value(&root, "approvals.resume", &serde_json::json!("full")).unwrap();
+        let ltext = std::fs::read_to_string(local_path(&root)).unwrap();
+        let (cfg, _, _) = build_effective_layered(
+            SparkleConfig::default(),
+            Some(g),
+            Some(tracked_without_the_key),
+            Some(&ltext),
+        );
+        assert_eq!(cfg.approvals.resume.as_deref(), Some("full"), "fixture: the local rule applies");
+
+        unset_project_value(&root, "approvals.resume").unwrap();
+        let ltext = std::fs::read_to_string(local_path(&root)).unwrap();
+        assert!(
+            !ltext.contains(CLEARED_TABLE),
+            "no tombstone when the tracked file does not set the key: {ltext}"
+        );
+        let (cfg, _, _) = build_effective_layered(
+            SparkleConfig::default(),
+            Some(g),
+            Some(tracked_without_the_key),
+            Some(&ltext),
+        );
+        assert_eq!(
+            cfg.approvals.resume.as_deref(),
+            Some("summary"),
+            "with the local override gone the global rule answers, exactly as it did pre-split — \
+             not the default, which is what an over-eager tombstone would give"
+        );
+    }
+
+    #[test]
+    fn setting_a_value_the_tracked_file_already_sets_resolves_to_the_new_value() {
+        // Layering is supposed to give this for free — local is applied after the tracked layer —
+        // but "supposed to" is what the unset half also was. Pinned through the real writer and the
+        // real resolver, including the awkward order: clear first, then set the SAME key, which is
+        // what a user does when they change their mind. A tombstone left standing must not erase
+        // the value they just chose.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_string_lossy().to_string();
+        let tracked = seed_tracked_policy(&root);
+        let before = std::fs::read(&tracked).unwrap();
+
+        // Tracked says `resume = "full"`; every value below is distinct from it and from the
+        // default, so no assertion can be satisfied by a layer that failed to apply.
+        set_project_value(&root, "approvals.resume", &serde_json::json!("summary")).unwrap();
+        let ltext = std::fs::read_to_string(local_path(&root)).unwrap();
+        let (cfg, _, _) =
+            build_effective_layered(SparkleConfig::default(), None, Some(TRACKED_POLICY), Some(&ltext));
+        assert_eq!(cfg.approvals.resume.as_deref(), Some("summary"), "the local value wins");
+
+        unset_project_value(&root, "approvals.resume").unwrap();
+        set_project_value(&root, "approvals.resume", &serde_json::json!("summary")).unwrap();
+        let ltext = std::fs::read_to_string(local_path(&root)).unwrap();
+        assert!(
+            !ltext.contains(CLEARED_TABLE),
+            "setting a key must retire its tombstone, so set/clear are inverses: {ltext}"
+        );
+        let (cfg, _, _) =
+            build_effective_layered(SparkleConfig::default(), None, Some(TRACKED_POLICY), Some(&ltext));
+        assert_eq!(
+            cfg.approvals.resume.as_deref(),
+            Some("summary"),
+            "a value set after a clear must resolve to the value that was set"
+        );
+        assert_eq!(std::fs::read(&tracked).unwrap(), before, "and none of it touched the tracked file");
+    }
+
+    #[test]
+    fn a_clear_with_nothing_to_clear_writes_no_file_at_all() {
+        // The old early return ("no local.toml → Ok(())") was the defect, so its ONE correct
+        // consequence has to be re-established deliberately rather than assumed: a repo that has
+        // never had a `local.toml` must not acquire one — an empty file is a `??` entry in a
+        // gitignored path today, and tomorrow it is a file someone has to explain.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_string_lossy().to_string();
+        std::fs::create_dir_all(project_path(&root).parent().unwrap()).unwrap();
+        std::fs::write(project_path(&root), "[done]\ndescription = \"Merged.\"\n").unwrap();
+
+        unset_project_value(&root, "approvals.bash").unwrap();
+        assert!(
+            !local_path(&root).exists(),
+            "clearing a key neither layer sets must not create .sparkle/local.toml"
+        );
+    }
+
+    #[test]
+    fn a_tombstone_is_recorded_once_and_erases_only_its_own_key() {
+        // Two properties one call cannot show: repeated clears (a re-render, a retry) must not grow
+        // the list, and the erasure must be keyed on the exact dotted path — including a quoted
+        // segment, where the writer and the reader agreeing on how to split it is the whole risk.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_string_lossy().to_string();
+        let tracked = "[approvals]\nbash = \"never\"\nedit = \"never\"\n\
+                       [plugins]\n\"frontend-design\" = true\n";
+        std::fs::create_dir_all(project_path(&root).parent().unwrap()).unwrap();
+        std::fs::write(project_path(&root), tracked).unwrap();
+
+        unset_project_value(&root, "approvals.bash").unwrap();
+        unset_project_value(&root, "approvals.bash").unwrap();
+        unset_project_value(&root, "plugins.\"frontend-design\"").unwrap();
+        let ltext = std::fs::read_to_string(local_path(&root)).unwrap();
+        assert_eq!(
+            ltext.matches("approvals.bash").count(),
+            1,
+            "clearing twice must not append twice: {ltext}"
+        );
+
+        let (cfg, _, hard) =
+            build_effective_layered(SparkleConfig::default(), None, Some(tracked), Some(&ltext));
+        assert!(!hard);
+        // The tracked file says "never" and the built-in default is "always", so this can only be
+        // "always" if the tracked line was actually erased.
+        assert_eq!(cfg.approvals.bash.as_deref(), Some("always"), "the cleared key is gone");
+        assert!(
+            !cfg.plugins.is_enabled("frontend-design"),
+            "a quoted segment must be erased under the same name it was written with"
+        );
+        assert_eq!(
+            cfg.approvals.edit.as_deref(),
+            Some("never"),
+            "its sibling in the same table must be untouched"
+        );
+    }
+
+    #[test]
+    fn a_cleared_block_in_the_tracked_file_is_ignored_and_says_so() {
+        // `[cleared]` erases the layer BELOW it, so in the tracked file it would ask a repo to
+        // erase its own keys — and, worse, would read as a way for repo policy to reach past itself
+        // into the global config. It applies from `local.toml` only. A hand-written block that
+        // silently does nothing is the shape this repo keeps paying for, so it warns.
+        let rule = "[approvals]\nresume = \"full\"\n";
+        let block = "[cleared]\nkeys = [\"approvals.resume\"]\n";
+        let g = "[approvals]\nresume = \"summary\"\n";
+
+        // The block in the TRACKED file, alongside the very rule it names.
+        let tracked = format!("{block}{rule}");
+        let (cfg, warns, hard) =
+            build_effective_layered(SparkleConfig::default(), Some(g), Some(&tracked), None);
+        assert!(!hard);
+        // THE SIDE EFFECT, not the warning: nothing was erased.
+        assert_eq!(
+            cfg.approvals.resume.as_deref(),
+            Some("full"),
+            "[cleared] in the tracked file must not erase anything"
+        );
+        assert!(
+            warns.iter().any(|w| w.starts_with("[cleared]") && w.contains(".sparkle/config.toml")),
+            "and the user must be told the block is inert: {warns:?}"
+        );
+
+        // The IDENTICAL block from local.toml, against the same tracked rule, DOES erase it —
+        // otherwise the assertion above would pass just as well against an implementation that
+        // never reads `[cleared]` anywhere.
+        let (cfg, _, _) =
+            build_effective_layered(SparkleConfig::default(), Some(g), Some(rule), Some(block));
+        assert_eq!(
+            cfg.approvals.resume.as_deref(),
+            Some("summary"),
+            "the same block in local.toml must erase the tracked rule"
+        );
+
+        // AND ITS REACH STOPS THERE. A tombstone drops the key from the layer directly below it,
+        // which is what "clear this project's rule" means; it is not a way for one machine to
+        // delete a GLOBAL setting through a per-project file. Pinned because the strip is applied
+        // to text, and applying it one layer further down would be a one-line change nothing else
+        // here would notice.
+        let (cfg, _, _) = build_effective_layered(SparkleConfig::default(), Some(g), None, Some(block));
+        assert_eq!(
+            cfg.approvals.resume.as_deref(),
+            Some("summary"),
+            "a per-project tombstone must not reach into the global layer"
+        );
+    }
+
+    #[test]
+    fn an_unparseable_tracked_file_still_warns_when_a_tombstone_is_present() {
+        // The strip runs on the tracked layer's TEXT. If a syntax error made it return an empty
+        // layer instead of the original, a typo in a repo's committed policy would resolve to
+        // defaults with NOTHING said — the layer would vanish rather than be refused. Pinned
+        // because the failure is silent and only reachable with a `[cleared]` entry present.
+        let tracked = "[approvals]\nbash = \"never\"\n[[[ oops";
+        let local = "[cleared]\nkeys = [\"approvals.bash\"]\n";
+        let (_, warns, hard) =
+            build_effective_layered(SparkleConfig::default(), None, Some(tracked), Some(local));
+        assert!(hard, "a broken tracked file is still a hard error with a tombstone present");
+        assert!(
+            warns.iter().any(|w| w.contains("syntax error") && w.contains(".sparkle/config.toml")),
+            "…and still names the tracked file: {warns:?}"
+        );
+    }
+
+    #[test]
+    fn clearing_refuses_an_unreadable_local_file_rather_than_reporting_a_removal() {
+        // The `NotFound` split in `load_project_document`, from the side that matters here: an
+        // unreadable-but-PRESENT local.toml must not be treated as absent. Treating it as absent
+        // would start from an empty document and render a file holding one `[cleared]` block —
+        // every local setting and locally-defined stage gone — while returning Ok.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_string_lossy().to_string();
+        std::fs::create_dir_all(local_path(&root).parent().unwrap()).unwrap();
+        std::fs::write(local_path(&root), "[approvals]\nbash = \"always\"\n[[[ oops").unwrap();
+
+        let err = unset_project_value(&root, "approvals.bash").unwrap_err();
+        assert!(err.contains("local.toml"), "the refusal must name the file: {err}");
+        assert_eq!(
+            std::fs::read_to_string(local_path(&root)).unwrap(),
+            "[approvals]\nbash = \"always\"\n[[[ oops",
+            "and the bytes needed to repair it must survive"
+        );
+    }
+
+    // ---- for_project actually READS the local layer -------------------------------------------
+    //
+    // Every other test in this section calls `build_effective_layered` directly or reads the
+    // writers' output files. Nothing drove the production reader, which is how BOTH halves of the
+    // wiring — passing `local` to the resolver, and keying the memo on the local file's stamp —
+    // could be deleted with the whole suite still green. These two mount the real path.
+
+    #[test]
+    fn for_project_resolves_the_local_layer_over_the_tracked_one() {
+        // Pins the CALL SITE: drop the `local` argument inside `for_project` and this goes red.
+        let _guard = CONFIG_GLOBAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // A known-empty global layer, so the assertion is about the two project files and not
+        // about whatever a sibling test last loaded into the process-wide cell.
+        let gdir = tempfile::tempdir().unwrap();
+        let _ = reload_global(gdir.path());
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_string_lossy().to_string();
+        seed_tracked_policy(&root);
+        std::fs::write(local_path(&root), "[approvals]\nbash = \"always\"\n").unwrap();
+
+        let eff = for_project(&root);
+        assert_eq!(
+            eff.config.approvals.bash.as_deref(),
+            Some("always"),
+            "for_project must apply .sparkle/local.toml over the tracked file"
+        );
+        // The tracked layer still reaches it — so a green here cannot mean "read local instead of".
+        assert_eq!(
+            eff.config.done.description.as_deref(),
+            Some("Merged into the remote main branch."),
+            "…without dropping the tracked layer it sits on"
+        );
+    }
+
+    #[test]
+    fn for_project_invalidates_its_memo_when_only_local_toml_changes() {
+        // Pins the MEMO KEY: delete `e.local_mtime_ms == local_mtime_ms && e.local_len == local_len`
+        // from the fast-path guard and this goes red. That guard is the difference between a UI
+        // write reaching a reader and landing on disk to be ignored for the process lifetime —
+        // every per-project write goes to this file, and nothing else about the project moves when
+        // it does: the tracked file's stamp does not change, and neither does the global layer.
+        let _guard = CONFIG_GLOBAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let gdir = tempfile::tempdir().unwrap();
+        let _ = reload_global(gdir.path());
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_string_lossy().to_string();
+        seed_tracked_policy(&root);
+
+        // Warm the memo with NO local file. (0, 0) is a valid stamp, so this is a real cache entry.
+        // `resume` again: tracked "full", written "summary", cleared "ask" — three distinct values,
+        // so a stale memo cannot be mistaken for a fresh read at any step.
+        assert_eq!(
+            for_project(&root).config.approvals.resume.as_deref(),
+            Some("full"),
+            "fixture: the tracked rule resolves first"
+        );
+
+        // The exact production event: a per-project write, through the real writer.
+        set_project_value(&root, "approvals.resume", &serde_json::json!("summary")).unwrap();
+
+        assert_eq!(
+            for_project(&root).config.approvals.resume.as_deref(),
+            Some("summary"),
+            "a write to local.toml must invalidate the memo — nothing else about the project moved"
+        );
+
+        // And the clear, which is the case that has to travel the whole path: writer → tombstone →
+        // strip → memo. Same call the UI makes, read back through the same reader it re-pulls with.
+        unset_project_value(&root, "approvals.resume").unwrap();
+        assert_eq!(
+            for_project(&root).config.approvals.resume.as_deref(),
+            Some("ask"),
+            "…and so must a clear, or the toggle snaps back to the tracked value"
+        );
+    }
+
+    #[test]
+    fn every_copy_of_the_split_names_the_preview_exception() {
+        // USER-FACING COPY IS CODE, and this copy was WRONG (roborev 66889, Medium). All three
+        // places said the split changes nothing about the resolved settings — "same rules, same
+        // refusals", "reads see both". That is false for exactly one section: `read_preview_override`
+        // in preview.rs reads `[preview]`'s command/args/path/port straight off a worktree's own
+        // `.sparkle/config.toml`, deliberately bypassing the merged config, because detection runs
+        // against an arbitrary worktree that is not necessarily the project the config was merged
+        // for. Those four keys written into `local.toml` are silently INERT.
+        //
+        // A refusal or a remedy is an instruction the user will follow, so copy that sends them to
+        // the wrong file costs them the setting and gives them no way to find out. preview.rs's
+        // behaviour is deliberate and stays; the docs stop contradicting it.
+        //
+        // This is a DRIFT guard, not a proof: it pins that each copy still names the exception and
+        // all four keys. Reword the marker and it fails on purpose — update it, don't delete it.
+        let repo_root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../..");
+        let gitignore = std::fs::read_to_string(format!("{repo_root}/.gitignore"))
+            .expect("the repo's .gitignore must be readable");
+        let repo_policy = std::fs::read_to_string(format!("{repo_root}/.sparkle/config.toml"))
+            .expect("the repo's tracked .sparkle/config.toml must be readable");
+
+        for (what, text, marker) in [
+            ("DEFAULT_TEMPLATE", DEFAULT_TEMPLATE, "THE EXCEPTION"),
+            (".sparkle/config.toml", repo_policy.as_str(), "ONE SECTION IS NOT LAYERED"),
+            (".gitignore", gitignore.as_str(), "EXACTLY ONE EXCEPTION"),
+        ] {
+            let at = text
+                .find(marker)
+                .unwrap_or_else(|| panic!("{what} no longer marks the [preview] exception ({marker})"));
+            // Bounded to the paragraph that raises it, so the four key names cannot be satisfied by
+            // unrelated prose elsewhere in a long file.
+            let para = &text[at..(at + 900).min(text.len())];
+            for needle in ["command", "args", "path", "port", "local.toml"] {
+                assert!(
+                    para.contains(needle),
+                    "{what}'s [preview] exception does not name `{needle}`"
+                );
+            }
+        }
     }
 
     #[test]

@@ -518,7 +518,9 @@ export function unsetConfigValue(path: string): Promise<void> {
   return invoke("unset_config_value", { path });
 }
 
-/** Set one dotted key in a PROJECT's `.sparkle/config.toml` (comment-preserving). */
+/** Set one dotted key in a PROJECT's gitignored `.sparkle/local.toml` (comment-preserving). The
+ *  tracked `.sparkle/config.toml` is repo policy and is never written at runtime (sparkle-5ur8s);
+ *  the local layer sits directly above it, so the resolved value is the same. */
 export function setProjectConfigValue(
   projectRoot: string,
   path: string,
@@ -527,7 +529,9 @@ export function setProjectConfigValue(
   return invoke("set_project_config_value", { projectRoot, path, value });
 }
 
-/** Remove one dotted key from a PROJECT's `.sparkle/config.toml`. No-op if the file/key is absent. */
+/** Clear one dotted key for a PROJECT. Removes it from `.sparkle/local.toml` and, when the tracked
+ *  `.sparkle/config.toml` still sets it, records a `[cleared]` tombstone there so the RESOLVED value
+ *  actually changes — the tracked file is never written. No-op if neither layer sets the key. */
 export function unsetProjectConfigValue(projectRoot: string, path: string): Promise<void> {
   return invoke("unset_project_config_value", { projectRoot, path });
 }

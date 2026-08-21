@@ -14,8 +14,9 @@
 // runtime — `invoke` of an unknown command rejects, which this hook deliberately swallows as
 // "unknown". Pinning both here is what makes that rename fail loudly in CI instead of quietly
 // removing the badge.
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { renderHook, waitFor } from "@testing-library/react";
+import { resetStalenessEscalation } from "../services/stalenessEscalation";
 
 const invokeMock = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...a: unknown[]) => invokeMock(...a) }));
@@ -23,9 +24,20 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke: (...a: unknown[]) => invokeMock
 // Imported AFTER the mock is registered so the hook binds to it.
 const { useProjectStaleness } = await import("./useProjectStaleness");
 
+// This file drives the REAL `services/staleness` (only the Tauri boundary is mocked), so a poll
+// against a stale root reaches the real escalation counter — module state that would otherwise carry
+// one test's declines into the next, and print a genuine escalation to stderr partway through an
+// unrelated assertion.
+beforeEach(() => {
+  resetStalenessEscalation();
+  vi.spyOn(console, "error").mockImplementation(() => {});
+});
+
 afterEach(() => {
   invokeMock.mockReset();
   vi.useRealTimers();
+  resetStalenessEscalation();
+  vi.restoreAllMocks();
 });
 
 const STALE = {

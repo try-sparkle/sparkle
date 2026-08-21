@@ -27,11 +27,16 @@ import { invoke } from "@tauri-apps/api/core";
  *
  * - `none` — nothing to do (not stale, or already current).
  * - `fast-forward` — clean tree, on the default branch, a strict ancestor of the base. `git merge
- *   --ff-only` cannot lose anything here, which is why this is also the only shape that may be
- *   fixed with no click at all (see {@link StaleDiagnosis.autoSafe}).
+ *   --ff-only` cannot lose anything here. It is NOT the only automatic shape, though it reads that
+ *   way in older comments: `fast-forward-dirty` with an empty and KNOWN blocking set is automatic
+ *   too, for the same reason — see the next bullet, and branch on
+ *   {@link StaleDiagnosis.autoSafe} rather than on the remedy kind.
  * - `fast-forward-dirty` — the same fast-forward, but with uncommitted changes in the tree. Offered
  *   with a warning naming the files, because git may still refuse it and the person should know
- *   what is at stake before pressing.
+ *   what is at stake before pressing. NOTE this does NOT imply `autoSafe: false` any more: dirt the
+ *   fast-forward would not touch blocks nothing, so a `fast-forward-dirty` with an empty
+ *   {@link StaleDiagnosis.blockingPaths} is still automatic. `autoSafe` is the field to branch on,
+ *   never the remedy kind.
  * - `blocked-detached` — HEAD is on no branch. NO BUTTON, deliberately: the fast-forwardability we
  *   measured was against the DETACHED head, so a "check out the branch, then fast-forward" action
  *   would move a commit the check never covered — and a diverged local branch would let the
@@ -74,6 +79,20 @@ export interface StaleDiagnosis {
   dirtyCount: number;
   /** A sample of those paths — enough to recognise what is at risk, not the whole list. */
   dirtySample: string[];
+  /**
+   * THE PATHS THAT WOULD ACTUALLY STOP THE FAST-FORWARD — dirty AND changed between HEAD and base.
+   *
+   * `dirtyCount > 0` is not a reason to refuse: git declines a fast-forward only over paths it
+   * would itself touch. Empty (with {@link blockersKnown}) means `merge --ff-only` provably cannot
+   * refuse. This is what an escalation names, because "dirty tree" is not something anyone can act
+   * on — measured on the founder's shared checkout, where one of five dirty entries was a real
+   * blocker and the other four had been declining a safe merge every 60s for ten days
+   * (bead sparkle-v38y1n).
+   */
+  blockingPaths: string[];
+  /** Whether {@link blockingPaths} could be computed at all. False means WE DO NOT KNOW — never
+   *  "there are none". An empty list under `blockersKnown: false` is fail-closed, not a green light. */
+  blockersKnown: boolean;
   /** Whether a `--ff-only` merge would succeed on the tree as it stands. */
   canFastForward: boolean;
   /** Which control to draw. See {@link StaleRemedy}. */
@@ -89,10 +108,13 @@ export interface StaleDiagnosis {
   /**
    * May this be fixed with NO CLICK AT ALL?
    *
-   * True only for the provably-lossless shape: clean tree, on the default branch, a strict ancestor
-   * of the base. The founder's ruling is that automation is allowed exactly where it cannot destroy
-   * anything and nowhere else — so this is a SEPARATE field from `remedy` rather than being inferred
-   * from it, because `fast-forward-dirty` is offerable-on-click and must never be auto-safe.
+   * True only for the provably-lossless shape: on the default branch, a strict ancestor of the
+   * base, and with NO {@link blockingPaths} — i.e. no dirt the fast-forward would actually touch.
+   * The founder's ruling is that automation is allowed exactly where it cannot destroy anything and
+   * nowhere else, and "cannot destroy anything" is a question about collisions, not about whether
+   * the tree is pristine. This stays a SEPARATE field from `remedy` rather than being inferred from
+   * it, because the same `fast-forward-dirty` verdict can be automatic or not depending on where
+   * the dirt sits.
    */
   autoSafe: boolean;
   /**

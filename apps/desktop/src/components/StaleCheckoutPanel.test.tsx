@@ -31,6 +31,14 @@ vi.mock("../services/staleness", () => ({
   autoFastForwardEnabled: () => Promise.resolve(false),
 }));
 
+import {
+  DECLINES_BEFORE_ESCALATION,
+  noteStaleDecline,
+  noteStaleResolved,
+  resetStalenessEscalation,
+  stalenessDeclines,
+} from "../services/stalenessEscalation";
+
 import { StaleCheckoutPanel, remedyAction, type StaleTarget } from "./StaleCheckoutPanel";
 
 function diag(over: Partial<StaleDiagnosis> = {}): StaleDiagnosis {
@@ -44,6 +52,8 @@ function diag(over: Partial<StaleDiagnosis> = {}): StaleDiagnosis {
     heldBy: "",
     dirtyCount: 0,
     dirtySample: [],
+    blockingPaths: [],
+    blockersKnown: true,
     canFastForward: true,
     remedy: "fast-forward",
     cause: "This checkout is clean and on main, so it can be fast-forwarded to origin/main.",
@@ -81,9 +91,16 @@ function byRoot(table: Record<string, StaleDiagnosis>) {
 beforeEach(() => {
   diagnoseStale.mockReset();
   remedyStale.mockReset();
+  // Escalation streaks are module state and outlive a test file otherwise, so one test's wedge
+  // would be another's standing notice.
+  resetStalenessEscalation();
 });
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  resetStalenessEscalation();
+  vi.restoreAllMocks();
+});
 
 /** The panel diagnoses on mount, so every test waits for the first row's cause to land. */
 async function renderPanel(targets: StaleTarget[], onClose = () => {}) {
@@ -168,6 +185,111 @@ describe("StaleCheckoutPanel rows", () => {
     expect(warn).toContain("src/b.ts");
     expect(screen.getByTestId("stale-remedy-sparkle")).toBeTruthy();
   });
+
+  // ── WHICH DIRT IS ACTUALLY IN THE WAY (bead sparkle-v38y1n) ─────────────────────────────────
+  // "git may refuse" was true of every dirty tree when any dirt at all blocked. It no longer is,
+  // and an unconditional warning is the useless string this whole change exists to replace — so
+  // the three arms are asserted separately, on the TEXT the person reads.
+
+  it("names the blocking paths, and only those, when the fast-forward would collide", async () => {
+    byRoot({
+      "/repos/sparkle": diag({
+        remedy: "fast-forward-dirty",
+        autoSafe: false,
+        dirtyCount: 3,
+        dirtySample: ["NOTES.md", ".sparkle/config.toml", "images/a.png"],
+        blockingPaths: [".sparkle/config.toml"],
+        blockersKnown: true,
+      }),
+    });
+    await renderPanel([target()]);
+    const warn = screen.getByTestId("stale-dirty-sparkle").textContent ?? "";
+    expect(warn).toContain("git will refuse until .sparkle/config.toml is committed");
+    // The dirt that blocks nothing must not be presented as the thing to go and fix. It is still
+    // listed in the sample above, which is a different claim: "present" vs "in the way".
+    expect(warn).not.toContain("git will refuse until NOTES.md");
+  });
+
+  it("says the dirt is harmless when nothing collides, rather than warning about a refusal that cannot happen", async () => {
+    byRoot({
+      "/repos/sparkle": diag({
+        remedy: "fast-forward-dirty",
+        autoSafe: true,
+        dirtyCount: 2,
+        dirtySample: ["NOTES.md", "images/a.png"],
+        blockingPaths: [],
+        blockersKnown: true,
+      }),
+    });
+    await renderPanel([target()]);
+    const warn = screen.getByTestId("stale-dirty-sparkle").textContent ?? "";
+    expect(warn).toContain("none of which this fast-forward touches");
+    expect(warn).not.toContain("git will refuse");
+  });
+
+  // Fail-closed reaches the copy too: an intersection we could not compute must not be shown as
+  // "nothing is in the way".
+  // ── WHAT THE PANEL COULD NOT PREVIOUSLY SHOW (bead sparkle-v38y1n) ──────────────────────────
+  //
+  // The 60-second poll refused this same fast-forward for ten days and left the panel showing a
+  // perfectly ordinary diagnosis the whole time. A person opening it learned how far behind the
+  // checkout was — which the badge had already told them — and nothing about the fact that
+  // something had been TRYING. These pin the second fact onto the row.
+
+  it("surfaces a standing escalation, naming the path, on a row opened after the streak started", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    // The streak escalated BEFORE this panel was opened, which is the realistic case: the poll runs
+    // whether the panel is on screen or not, and one-per-streak means the next escalation never
+    // comes. A panel that only listened forward would show nothing here.
+    for (let i = 0; i < DECLINES_BEFORE_ESCALATION; i++) {
+      noteStaleDecline("/repos/sparkle", {
+        diagnosis: diag({
+          autoSafe: false,
+          remedy: "fast-forward-dirty",
+          dirtyCount: 5,
+          blockingPaths: [".sparkle/config.toml"],
+        }),
+      });
+    }
+    byRoot({ "/repos/sparkle": diag({ remedy: "fast-forward-dirty", autoSafe: false, dirtyCount: 5 }) });
+    await renderPanel([target()]);
+
+    const text = (await screen.findByTestId("stale-escalation-sparkle")).textContent ?? "";
+    expect(text).toContain("has not been able to fast-forward");
+    expect(text).toContain(".sparkle/config.toml");
+    expect(text.toLowerCase()).not.toContain("dirty tree");
+  });
+
+  // The mirror image of the bug, and just as misleading: a panel still warning about a wedge that
+  // has cleared. Nothing renders when no streak is standing.
+  it("shows nothing when this checkout has no standing escalation", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    for (let i = 0; i < DECLINES_BEFORE_ESCALATION; i++) {
+      noteStaleDecline("/repos/sparkle", { diagnosis: diag({ autoSafe: false }) });
+    }
+    noteStaleResolved("/repos/sparkle");
+    byRoot({ "/repos/sparkle": diag() });
+    await renderPanel([target()]);
+
+    expect(screen.queryByTestId("stale-escalation-sparkle")).toBeNull();
+  });
+
+  it("says so when it could not work out which changes are in the way", async () => {
+    byRoot({
+      "/repos/sparkle": diag({
+        remedy: "fast-forward-dirty",
+        autoSafe: false,
+        dirtyCount: 1,
+        dirtySample: ["src/a.ts"],
+        blockingPaths: [],
+        blockersKnown: false,
+      }),
+    });
+    await renderPanel([target()]);
+    const warn = screen.getByTestId("stale-dirty-sparkle").textContent ?? "";
+    expect(warn).toContain("could not be worked out");
+    expect(warn).not.toContain("none of which this fast-forward touches");
+  });
 });
 
 describe("running a remedy", () => {
@@ -210,6 +332,72 @@ describe("running a remedy", () => {
       expect(screen.getByTestId("stale-behind-sparkle").textContent).toBe("0 behind origin/main"),
     );
     expect(diagnoseStale).toHaveBeenCalledTimes(2);
+  });
+
+  // A SUCCESSFUL REMEDY ENDS THE STREAK (roborev 66891). This button IS the remedy the escalation
+  // tells the reader to press, and it used to leave the counter exactly where it was: the standing
+  // notice went on describing a wedge that had just been cleared, and the next unattended decline —
+  // for any reason at all — re-escalated on the spot instead of waiting out three checks.
+  //
+  // Written as the brief describes it: escalate, press the button, then decline ONCE more and
+  // assert the silence. The lone extra decline is what makes this non-vacuous — against the old
+  // code the counter is still at N and `escalated` is still set, so the notice never came back
+  // either; only a counter that actually RESET produces both the disappearance AND the silence.
+  it("clears the decline streak on a successful fast-forward, so one later decline is quiet again", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const wedged = diag({
+      autoSafe: false,
+      remedy: "fast-forward-dirty",
+      dirtyCount: 5,
+      blockingPaths: [".sparkle/config.toml"],
+    });
+    for (let i = 0; i < DECLINES_BEFORE_ESCALATION; i++) {
+      noteStaleDecline("/repos/sparkle", { diagnosis: wedged });
+    }
+    expect(stalenessDeclines("/repos/sparkle")).toBe(DECLINES_BEFORE_ESCALATION);
+
+    byRoot({ "/repos/sparkle": diag({ remedy: "fast-forward-dirty", autoSafe: false, dirtyCount: 5 }) });
+    remedyStale.mockResolvedValue(outcome());
+    await renderPanel([target()]);
+    // The standing notice is on screen — the state this test is about clearing.
+    await screen.findByTestId("stale-escalation-sparkle");
+
+    fireEvent.click(screen.getByTestId("stale-remedy-sparkle"));
+
+    // The counter is back to zero and the panel has stopped warning about it.
+    await waitFor(() => expect(stalenessDeclines("/repos/sparkle")).toBe(0));
+    await waitFor(() => expect(screen.queryByTestId("stale-escalation-sparkle")).toBeNull());
+
+    // ONE more decline. On a cleared streak that is the FIRST of a new one, so it says nothing; on
+    // the old code it was the (N+1)th of a streak that had already spoken, which also says nothing
+    // — the counter is what tells them apart, hence the assertion on the count either side.
+    expect(noteStaleDecline("/repos/sparkle", { diagnosis: wedged })).toBeNull();
+    expect(stalenessDeclines("/repos/sparkle")).toBe(1);
+    expect(screen.queryByTestId("stale-escalation-sparkle")).toBeNull();
+  });
+
+  // THE PAIR, and it is the one that keeps the clause honest. A remedy that FAILED is the streak
+  // CONTINUING — clearing on every press regardless of outcome would silence a wedge that is still
+  // there, which is the original bug wearing the fix's clothes.
+  it("does NOT clear the streak when the remedy failed", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const wedged = diag({
+      autoSafe: false,
+      remedy: "fast-forward-dirty",
+      dirtyCount: 5,
+      blockingPaths: [".sparkle/config.toml"],
+    });
+    for (let i = 0; i < DECLINES_BEFORE_ESCALATION; i++) {
+      noteStaleDecline("/repos/sparkle", { diagnosis: wedged });
+    }
+    byRoot({ "/repos/sparkle": diag({ remedy: "fast-forward-dirty", autoSafe: false, dirtyCount: 5 }) });
+    remedyStale.mockResolvedValue(outcome({ ok: false, reason: "error: would be overwritten" }));
+    await renderPanel([target()]);
+
+    fireEvent.click(screen.getByTestId("stale-remedy-sparkle"));
+    await screen.findByTestId("stale-outcome-sparkle");
+    expect(stalenessDeclines("/repos/sparkle")).toBe(DECLINES_BEFORE_ESCALATION);
+    expect(screen.queryByTestId("stale-escalation-sparkle")).not.toBeNull();
   });
 });
 

@@ -1,5 +1,6 @@
 // Per-project EFFECTIVE auto-approve rules, keyed by project root path. `get_config(root)` already
-// merges global + that project's `.sparkle/config.toml [approvals]` (project wins per category), so
+// merges global + that project's `.sparkle/config.toml` + `.sparkle/local.toml` `[approvals]`
+// (project wins per category, local wins over both), so
 // each entry here is the fully-resolved effective map for one project. Populated + kept fresh by
 // `useSyncProjectApprovals` (services/suggestions/approvalsRuntime). NOT persisted — config.toml is
 // the source of truth; this is a live cache. See the design spec.

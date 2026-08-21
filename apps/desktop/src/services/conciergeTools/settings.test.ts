@@ -489,7 +489,7 @@ describe("setProjectConfig", () => {
     // re-parses it, so a TYPE mismatch is caught (a string into a bool). An unknown KEY is not —
     // `parse_layer` ignores those, which is why the allowlist above exists instead.
     setProject.mockRejectedValue(
-      "rejected: that change would make .sparkle/config.toml invalid: invalid type: string, expected a boolean",
+      "rejected: that change would make .sparkle/local.toml invalid: invalid type: string, expected a boolean",
     );
     const res = await setProjectConfig(ROOT, "workflow.require_pr", "yes", {}, deps);
     expect(res.ok).toBe(false);

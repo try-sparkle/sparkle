@@ -53,6 +53,8 @@ function diag(over: Partial<StaleDiagnosis> = {}): StaleDiagnosis {
     heldBy: "",
     dirtyCount: 0,
     dirtySample: [],
+    blockingPaths: [],
+    blockersKnown: true,
     canFastForward: true,
     remedy: "fast-forward",
     cause: "This checkout is clean and on main, so it can be fast-forwarded.",

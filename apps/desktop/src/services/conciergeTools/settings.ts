@@ -350,8 +350,10 @@ function isApprovalKey(path: string): boolean {
 }
 
 /**
- * The ONLY sections a per-project `.sparkle/config.toml` actually takes effect in — the exact set
- * the Rust merge applies in its project arm (config.rs, `if let Some(text) = project`).
+ * The ONLY sections a per-project config file actually takes effect in — the exact set the Rust
+ * merge applies in its project arm (config.rs, `apply_project_layer`). There are two such files
+ * and this list governs BOTH: the tracked `.sparkle/config.toml` a human commits, and the
+ * gitignored `.sparkle/local.toml` that every runtime write — including this tool's — lands in.
  *
  * An ALLOWLIST rather than a denylist, and that is the load-bearing choice. The Rust side does not
  * validate what it is handed: `set_project_value` renders the edited document and runs it through
@@ -463,7 +465,7 @@ function projectSectionProblem(path: string, value?: unknown): string | null {
   // a project file cannot RAISE `preview.enabled`, so writing `true` there is a no-op at any global
   // setting.
   if (key === "preview.enabled" && value === true) {
-    return "preview.enabled = true is a no-op in a project's .sparkle/config.toml — a project file can only turn the preview OFF for itself, never on, so writing true there would land in the file and change nothing. If the preview is already enabled globally (the default), this project already has it.";
+    return "preview.enabled = true is a no-op at project scope — a project file can only turn the preview OFF for itself, never on, so writing true there would land in the file (.sparkle/local.toml) and change nothing. If the preview is already enabled globally (the default), this project already has it.";
   }
   const section = key.split(".")[0] ?? "";
   if (section === "approvals" && !isApprovalKey(key)) {
@@ -491,9 +493,9 @@ function projectSectionProblem(path: string, value?: unknown): string | null {
     ? PROJECT_IGNORED_SECTIONS[section]
     : undefined;
   if (why) {
-    return `[${section}] is ignored in a project's .sparkle/config.toml — ${why}. Set ${key} in the global config instead.`;
+    return `[${section}] is ignored at project scope — ${why}. Set ${key} in the global config instead.`;
   }
-  return `[${section}] is not honored in a project's .sparkle/config.toml — the key would be written, silently skipped, and change nothing. Project-scoped sections are: ${PROJECT_HONORED_SECTIONS.join(", ")}.`;
+  return `[${section}] is not honored at project scope — the key would be written to .sparkle/local.toml, silently skipped, and change nothing. Project-scoped sections are: ${PROJECT_HONORED_SECTIONS.join(", ")}.`;
 }
 
 /**
@@ -630,8 +632,10 @@ export interface ProjectConfigWrite {
 }
 
 /**
- * Write one dotted key into a project's `.sparkle/config.toml` — the "this project" scope the
- * Approvals pane has always had and no caller could reach.
+ * Write one dotted key into a project's gitignored `.sparkle/local.toml` — the "this project" scope
+ * the Approvals pane has always had and no caller could reach. NOT the tracked
+ * `.sparkle/config.toml`: that file is repo policy a human commits, and writing it at runtime is
+ * what left a modified tracked file in every working tree (sparkle-5ur8s).
  *
  * A façade over services/config's `setProjectConfigValue`, which is the same comment-preserving
  * Rust write services/configActions performs when a human clicks the pane. Nothing here re-derives
@@ -648,7 +652,7 @@ export interface ProjectConfigWrite {
  * NOT updated here: the optimistic `approvalsStore` cache that configActions writes before its own
  * round-trip. That cache is kept fresh from the file by `useSyncProjectApprovals`, and writing it
  * from a tool call would put a second, unsynchronized author on a store whose whole contract is
- * "config.toml is the source of truth". The file is written; the app re-reads it.
+ * "the config files are the source of truth". The file is written; the app re-reads it.
  */
 export async function setProjectConfig(
   projectRoot: string,
@@ -688,18 +692,28 @@ export async function setProjectConfig(
 }
 
 /**
- * Remove one dotted key from a project's `.sparkle/config.toml`, so the project falls back to the
- * global value. A no-op when the file or the key is absent — that is the Rust command's own
- * contract, and it is the right one: "make this project stop overriding X" succeeds when there was
- * no override.
+ * Clear one dotted key for a project, so it falls back to the global value. It removes the key from
+ * `.sparkle/local.toml` and, when the tracked `.sparkle/config.toml` still sets it, records a
+ * `[cleared]` tombstone there — the tracked file's bytes are never written, but its value for that
+ * key stops applying on this machine. A no-op when neither layer sets the key — that is the Rust
+ * command's own contract, and it is the right one: "make this project stop overriding X" succeeds
+ * when there was no override.
+ *
+ * REACHING PAST THE TRACKED FILE IS THE POINT, not an overreach. Without it, clearing a rule that
+ * lives in `.sparkle/config.toml` wrote nothing and returned success, and the UI's re-pull resolved
+ * the tracked value straight back over the change — the rule could not be cleared at all on any
+ * install predating the tracked/local split, which is where these values used to be written
+ * (roborev 66889).
  *
  * GATED FOR APPROVALS, and this is the case that is easy to get wrong. Dropping an override is
  * usually the safe direction, but not here: a project sitting on `approvals.bash = "never"` to hold
  * a repo back is relying on the override, and removing it hands the repo whatever the global rule
  * says — which may well be `"always"`. Losing a restriction is a widening even though the call
  * looks like a deletion, so any `approvals.*` unset reports as `widen_approvals` and needs
- * `confirm: true`. We do not read the global rule first to decide: that would make the gate depend
- * on a value that can change between the check and the write.
+ * `confirm: true`. The gate is now MORE load-bearing, not less: the restriction being dropped may
+ * be one the REPO committed, not one this machine set. We do not read the global rule first to
+ * decide — that would make the gate depend on a value that can change between the check and the
+ * write.
  */
 export async function unsetProjectConfig(
   projectRoot: string,
