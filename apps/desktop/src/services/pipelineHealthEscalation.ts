@@ -22,7 +22,13 @@
 //   • WARNING  — escalates, but DEBOUNCED per component: a second warning edge for the same
 //                component within WARNING_DEBOUNCE_MS is suppressed, so a flapping warning cannot
 //                spam. (A steady warning is already silent via the edge rule; the debounce guards
-//                the flap green→warning→green→warning.)
+//                the flap green→warning→green→warning.) The window is measured from the last
+//                warning DELIVERED and an intervening recovery does not reset it — otherwise the
+//                debounce is vacuous for the exact flap it names, since that flap crosses a
+//                recovery every cycle. `passesGate` carries the measurement.
+//   • RECOVERY — fires for an alarm that was ANNOUNCED. One whose warning the debounce swallowed is
+//                swallowed too: an all-clear for an alarm the reader never heard is pure noise, and
+//                delivering it would leave the flap half-loud.
 //   • UNKNOWN  — NEVER alarms. "I could not read this meter" is not a proven outage (the same rule
 //                the chip paints amber, not red, and pipeline_health.rs classifies an unreadable
 //                source UNKNOWN not blocking). A crossing INTO unknown produces no event at all.
@@ -221,22 +227,57 @@ export interface EscalationDeps {
 const lastWarningAt = new Map<string, number>();
 
 /**
+ * Components whose most recent WARNING edge was SUPPRESSED by the debounce — i.e. an alarm is
+ * outstanding that nobody was ever told about. The recovery that clears such an alarm is suppressed
+ * too, and consumes the flag. See `passesGate` for why both halves are needed.
+ */
+const unannouncedAlarm = new Set<string>();
+
+/**
  * Should this event be delivered right now? Applies the severity gate:
  *   • blocking → always.
  *   • warning  → only outside the per-component debounce window; records the time when it passes.
- *   • recovery → always, and clears the component's debounce so a later warning is not swallowed.
+ *   • recovery → unless it clears an alarm that was itself suppressed (see below).
  * (Unknown never reaches here — `detectEscalations` emits no event for it.)
+ *
+ * ── THE DEBOUNCE MUST SURVIVE THE RECOVERY, or it cannot guard the flap it exists for ────────────
+ * This gate used to `lastWarningAt.delete(...)` on every recovery, on the reasoning that a settled
+ * component's next warning should not be swallowed. That reasoning defeats the debounce ENTIRELY,
+ * because the flap this module's header names — green→warning→green→warning — *necessarily passes
+ * through a recovery on each cycle*. Every recovery re-armed the component, so the very next warning
+ * edge always found an empty map and always delivered. The 30-minute window could never elapse
+ * during the one condition it was written for; a steady warning was already silent via the edge
+ * rule, so the debounce guarded nothing at all.
+ *
+ * Observed: one component crossing warning↔green on the 60s poll produced an unbroken alternating
+ * stream of alarm and recovery escalations 61 SECONDS apart, every one delivered to both channels,
+ * each waking a full agent turn — inside a window advertised as suppressing exactly that.
+ *
+ * So the warning timestamp is now measured from the last warning actually DELIVERED and nothing
+ * clears it early. That alone would leave the flap half-loud: warnings would fall silent while their
+ * recoveries kept firing, announcing the all-clear for alarms the reader never heard. Hence the
+ * second half — a recovery is delivered only when the alarm it clears WAS announced. Net effect per
+ * component per window: at most one warning and one recovery.
+ *
+ * A recovery with no suppressed warning behind it still always fires. That is the case that matters
+ * on startup: the first poll establishes a baseline without alerting, so a component already warning
+ * at launch has no delivered alarm — and its recovery is what tells a reader (and the improvement
+ * pass) that an open pipeline-health bead can be closed.
  */
 function passesGate(ev: EscalationEvent, now: number): boolean {
   if (ev.severity === "recovery") {
-    lastWarningAt.delete(ev.componentId);
-    return true;
+    // Consume the flag either way: the outstanding alarm is over, announced or not.
+    return !unannouncedAlarm.delete(ev.componentId);
   }
   if (ev.severity === "blocking") return true;
   // warning
   const last = lastWarningAt.get(ev.componentId);
-  if (last !== undefined && now - last < WARNING_DEBOUNCE_MS) return false;
+  if (last !== undefined && now - last < WARNING_DEBOUNCE_MS) {
+    unannouncedAlarm.add(ev.componentId);
+    return false;
+  }
   lastWarningAt.set(ev.componentId, now);
+  unannouncedAlarm.delete(ev.componentId);
   return true;
 }
 
@@ -389,6 +430,7 @@ export function __setPipelineEscalationDepsForTests(deps: EscalationDeps): void 
 export function __resetPipelineEscalationForTests(): void {
   depsOverride = null;
   lastWarningAt.clear();
+  unannouncedAlarm.clear();
 }
 
 /**

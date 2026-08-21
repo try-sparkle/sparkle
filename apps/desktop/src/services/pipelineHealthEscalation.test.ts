@@ -170,7 +170,9 @@ describe("escalatePipelineHealth — routing + gating side effects", () => {
     await escalatePipelineHealth(snap("healthy"), snap("warning"), r.deps);
     expect(r.woke).toHaveLength(1);
 
-    // Component flaps back to green then to warning again, still inside the debounce window.
+    // A second warning edge for the same component, still inside the debounce window. (No recovery
+    // is driven here on purpose — the flap that crosses one is the separate test below, and it is
+    // the case this one used to CLAIM in a comment while never exercising it.)
     r.now += WARNING_DEBOUNCE_MS - 1;
     const res = await escalatePipelineHealth(snap("healthy"), snap("warning"), r.deps);
     expect(res.delivered).toHaveLength(0);
@@ -209,14 +211,88 @@ describe("escalatePipelineHealth — routing + gating side effects", () => {
     expect(r.beads).toHaveLength(0); // recovery never files a bead
   });
 
-  it("a recovery CLEARS the warning debounce, so a warning right after is not swallowed", async () => {
+  // ── THE FLAP: green→warning→green→warning on the poll interval ────────────────────────────────
+  // This is the condition WARNING_DEBOUNCE_MS exists for, and the one the gate could not suppress:
+  // the flap crosses a RECOVERY every cycle, and the recovery used to clear the debounce, so the
+  // next warning always re-fired. Both channels alternated alarm/all-clear 61s apart in production,
+  // each wake costing a full agent turn. Drive the real edges, on the real cadence.
+  const POLL_MS = 61_000;
+
+  it("a flapping component goes SILENT after its first announced cycle — both channels", async () => {
     const r = recorder();
-    await escalatePipelineHealth(snap("healthy"), snap("warning"), r.deps); // arms debounce
-    r.now += 100;
-    await escalatePipelineHealth(snap("warning"), snap("healthy"), r.deps); // recovery clears it
-    r.now += 100; // still inside the original window
+    // Cycle 1: announced in full, so a reader learns of the degradation and its clearing.
     await escalatePipelineHealth(snap("healthy"), snap("warning"), r.deps);
-    // 2 warning wakes + 1 recovery wake = 3
+    r.now += POLL_MS;
+    await escalatePipelineHealth(snap("warning"), snap("healthy"), r.deps);
+    expect(r.woke).toHaveLength(2); // 1 warning + 1 recovery
+    expect(r.concierge).toHaveLength(2);
+
+    // Cycles 2..10, all well inside the 30-minute window: NOTHING more is delivered. Neither the
+    // warning (debounced) nor its recovery (an all-clear for an alarm nobody was told about).
+    for (let i = 0; i < 9; i++) {
+      r.now += POLL_MS;
+      const up = await escalatePipelineHealth(snap("healthy"), snap("warning"), r.deps);
+      expect(up.delivered).toHaveLength(0);
+      expect(up.debounced).toHaveLength(1);
+      r.now += POLL_MS;
+      const down = await escalatePipelineHealth(snap("warning"), snap("healthy"), r.deps);
+      expect(down.delivered).toHaveLength(0);
+    }
+    expect(r.woke).toHaveLength(2); // still just the first cycle
+    expect(r.concierge).toHaveLength(2);
+    expect(r.beads).toHaveLength(0); // a debounced alarm is not a failed delivery
+  });
+
+  it("a warning fires again once the window elapses, even though recoveries intervened", async () => {
+    const r = recorder();
+    await escalatePipelineHealth(snap("healthy"), snap("warning"), r.deps);
+    // Flap through the whole window; every cycle after the first is silent.
+    for (let i = 0; i < 5; i++) {
+      r.now += POLL_MS;
+      await escalatePipelineHealth(snap("warning"), snap("healthy"), r.deps);
+      r.now += POLL_MS;
+      await escalatePipelineHealth(snap("healthy"), snap("warning"), r.deps);
+    }
+    expect(r.woke).toHaveLength(2); // the first warning + the first recovery, nothing since
+
+    // Past the window, a genuinely new warning is NOT swallowed.
+    r.now += WARNING_DEBOUNCE_MS;
+    const res = await escalatePipelineHealth(snap("healthy"), snap("warning"), r.deps);
+    expect(res.delivered).toHaveLength(1);
+    expect(res.delivered[0]!.severity).toBe("warning");
+    expect(r.woke).toHaveLength(3);
+  });
+
+  it("a recovery with no SUPPRESSED warning behind it always fires — the startup baseline case", async () => {
+    // The first poll establishes a baseline without alerting, so a component already warning at
+    // launch has no delivered alarm. Its recovery is what tells the improvement pass that an open
+    // pipeline-health bead can be closed, so it must not be swallowed.
+    const r = recorder();
+    const res = await escalatePipelineHealth(snap("warning"), snap("healthy"), r.deps);
+    expect(res.delivered).toHaveLength(1);
+    expect(res.delivered[0]!.severity).toBe("recovery");
+    expect(r.woke[0]).toContain("RECOVERED");
+  });
+
+  it("the debounce is PER COMPONENT: one flapping component does not silence another's alarm", async () => {
+    const r = recorder();
+    // roborev flaps into its debounce.
+    await escalatePipelineHealth(twoSnap("healthy", "healthy"), twoSnap("warning", "healthy"), r.deps);
+    r.now += POLL_MS;
+    await escalatePipelineHealth(twoSnap("warning", "healthy"), twoSnap("healthy", "healthy"), r.deps);
+    r.now += POLL_MS;
+    await escalatePipelineHealth(twoSnap("healthy", "healthy"), twoSnap("warning", "healthy"), r.deps);
+    expect(r.woke).toHaveLength(2); // roborev's first warning + first recovery only
+
+    // ci_runners' FIRST warning still gets through, inside roborev's window.
+    r.now += POLL_MS;
+    const res = await escalatePipelineHealth(
+      twoSnap("warning", "healthy"),
+      twoSnap("warning", "warning"),
+      r.deps,
+    );
+    expect(res.delivered).toHaveLength(1);
+    expect(res.delivered[0]!.componentId).toBe("ci_runners");
     expect(r.woke).toHaveLength(3);
   });
 
