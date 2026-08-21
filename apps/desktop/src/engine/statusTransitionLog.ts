@@ -87,7 +87,11 @@ export type StatusTransitionTrigger =
  *  made "the classifier read a real screen and found no question" indistinguishable from "there was
  *  no screen" — and a blank snapshot is a leading suspect for the false-GRAY bug this line was added
  *  to diagnose, so the log was hiding its own subject (roborev 54741). */
-export type ScreenVerdict = "awaiting" | "calm" | "blank";
+// `working` = the LIVE STATUS LINE was still painted on the viewport when a settle fired. It is
+// distinct from `calm` on purpose: both mean "no prompt on screen", but `calm` is a settled turn
+// and `working` is a settle REFUSED because the agent is visibly still going. Telling them apart
+// in the log is what makes a false-gray report answerable.
+export type ScreenVerdict = "awaiting" | "calm" | "blank" | "working";
 
 export interface StatusTransitionEvent {
   agentId: string;

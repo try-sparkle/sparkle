@@ -1,0 +1,95 @@
+{
+  "contract": [
+    "THE WIRE SHAPE OF A MOUNT-INDEPENDENT ATTENTION VERDICT, frozen here so the Rust producer and",
+    "the TypeScript consumer fail TOGETHER rather than silently agreeing to disagree.",
+    "",
+    "WHY A SHARED FIXTURE AT ALL. AGENTS.md records the measured failure this exists to prevent: two",
+    "agents built the two halves of a Rust->TS payload in parallel against a frozen field list, both",
+    "suites passed, the merge was clean, and the shipped feature never once ran. An all-or-nothing",
+    "parser that rejects one field discards the WHOLE payload and falls back to its 'we did not look'",
+    "default -- with nothing logged. So: src-tauri asserts its serializer PRODUCES these bytes, and",
+    "the TS parser asserts it ACCEPTS these bytes. One file, two suites, no drift.",
+    "",
+    "NO OPTIONAL FIELDS, DELIBERATELY. A Rust `Option::None` crosses the wire as `null`, never as an",
+    "absent key, and TypeScript's `field?: T` means `T | undefined` -- which does not include null.",
+    "Every field here is unconditionally present so that trap has nowhere to live. Keep it that way:",
+    "a new field owes a value in every sample below, not an `Option`.",
+    "",
+    "THE THREE VERDICTS, and the boundary between them is the whole point:",
+    "  awaiting   -- a human is owed an answer. The rendered grid carries a prompt the classifier",
+    "                recognises (nudge_gate::screen_awaits_input).",
+    "  unreadable -- WE COULD NOT TELL. A full-screen app owns the buffer and it is not Claude Code's",
+    "                own prompt, so no claim about this agent can be made. This is NOT 'calm'.",
+    "                Reporting an unreadable screen as calm is the founder's bug: an agent that needs",
+    "                him renders as fine because nothing could see it.",
+    "  calm       -- the grid was read and carries no prompt. A POSITIVE reading, not an absence.",
+    "  gone       -- THIS AGENT'S TERMINAL NO LONGER EXISTS. Not a statement about a screen; there",
+    "                is no screen. Discard any reading held for this agent. It exists because the",
+    "                producer emits on CHANGE, and 'the agent stopped existing' is a change the",
+    "                other three cannot carry -- without it a spun-down agent whose last reading",
+    "                was `awaiting` stays RAISED forever against a terminal that is gone, with",
+    "                nothing on the wire able to retract it. `alternate` is always false here.",
+    "",
+    "`alternate` travels alongside the verdict rather than being folded into it, because 'Claude Code",
+    "is on the alternate buffer showing its own picker' is `awaiting` WITH `alternate: true` -- the",
+    "consumer must not have to re-derive that from the verdict alone.",
+    "",
+    "`atMs` IS THE ONSET OF THE CURRENT VERDICT -- when it STARTED holding, not when it was last",
+    "observed. NO NEWS MEANS IT STILL HOLDS. This is the only meaning both channels can express: the",
+    "producer emits on CHANGE, so an unchanged reading sends nothing and the event stream can carry",
+    "nothing but onset. Making the stored row as-of was tried and reverted, because it left `list()`",
+    "(the startup seed) disagreeing with the stream for the same agent, with nothing on the wire to",
+    "tell the two meanings apart. Samples below carry DIFFERENT values so a consumer that ignores",
+    "the field cannot be told apart from one that honours it.",
+    "",
+    "SO DO NOT KEY A STALENESS RULE ON `atMs`. An old stamp means the verdict has held for a long",
+    "time, which for `awaiting` is the row that most needs attention, not the least. Reading it as",
+    "decay discards precisely the agent who has been waiting longest.",
+    "",
+    "NO VERDICT EXPIRES ON THE CONSUMER'S CLOCK, and that is a decision rather than an omission. The",
+    "producer ticks once a second per live session and retracts with `gone`, so a reading that stops",
+    "arriving means the app is down -- in which case every row is stale and a per-row rule buys",
+    "nothing. A consumer-side expiry would ALSO re-create the bug this channel exists to fix: it",
+    "would silently drop the `awaiting` of an agent that has been waiting longest.",
+    "",
+    "THERE IS NO `no-viewport` VERDICT, deliberately. `nudge_gate::write_refusal` has that arm for a",
+    "screen it was handed as `None`; this producer never asks about an agent it has no observer for,",
+    "because the observer registry IS the population. No PTY means no event -- not an event saying",
+    "there is no PTY. The `gone` retraction is what covers a PTY that goes away after being observed.",
+    "",
+    "AN UNPARSEABLE OR UNKNOWN-VERDICT PAYLOAD MUST NEVER RESOLVE TO `calm`. A newer producer can",
+    "always emit a token an older consumer does not know, and reading that as 'fine' reproduces the",
+    "founder's bug through the parser instead of through the mount. The consumer drops the payload",
+    "for that ONE agent (leaving whatever it already held), warns once, and never lets one bad",
+    "payload discard the others -- which is the all-or-nothing failure named above. Dropping is safe",
+    "here precisely BECAUSE `unreadable` is itself inert: there is no state an unknown token could",
+    "have reached that says more than 'no opinion'."
+  ],
+  "event": "attention://observed",
+  "samples": [
+    {
+      "why": "An ordinary Claude Code question menu on the normal buffer. The classic red case.",
+      "payload": { "agentId": "a1", "verdict": "awaiting", "alternate": false, "atMs": 1787251205196 }
+    },
+    {
+      "why": "Claude Code's own picker on the ALTERNATE buffer -- readable, so a real claim is made.",
+      "payload": { "agentId": "a2", "verdict": "awaiting", "alternate": true, "atMs": 1787251209400 }
+    },
+    {
+      "why": "A full-screen app we cannot parse. The founder's 'unknown-and-therefore-needs-attention'.",
+      "payload": { "agentId": "a3", "verdict": "unreadable", "alternate": true, "atMs": 1787251263118 }
+    },
+    {
+      "why": "UNREADABLE ON THE NORMAL BUFFER -- the PTY reader is parked by flow control, so the grid is arbitrarily stale. Present so a consumer cannot key its unreadable handling on `alternate`.",
+      "payload": { "agentId": "a6", "verdict": "unreadable", "alternate": false, "atMs": 1787251281777 }
+    },
+    {
+      "why": "Read the grid, found no prompt. The ONLY verdict that may lower a row.",
+      "payload": { "agentId": "a4", "verdict": "calm", "alternate": false, "atMs": 1787251270002 }
+    },
+    {
+      "why": "The agent's PTY was swept. The retraction, so a held verdict cannot outlive its terminal.",
+      "payload": { "agentId": "a5", "verdict": "gone", "alternate": false, "atMs": 1787251299931 }
+    }
+  ]
+}

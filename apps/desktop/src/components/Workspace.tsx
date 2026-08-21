@@ -123,6 +123,7 @@ import { startPresenceTracking } from "../stores/presenceStore";
 import { startOrchestrationListener } from "../services/orchestrationListener";
 import { startControlListener } from "../services/controlListener";
 import { startAiServiceHealthListener } from "../services/aiServiceHealthListener";
+import { startObservedAttentionListener } from "../services/observedAttentionListener";
 import { listPreviews, startPreviewListener } from "../services/preview";
 import { startPreviewIdleGraceWatcher } from "../services/previewIdleGrace";
 import { closeScopeProjectNames, planWindowClose, stopAgentsForClose } from "../services/windowClose";
@@ -944,6 +945,35 @@ export function Workspace() {
       cleanup?.();
     };
   }, [isMainWindow]);
+
+  // THE MOUNT-INDEPENDENT ATTENTION VERDICT. `runtimeStore.status` is written by a MOUNTED
+  // `AgentPane` and by essentially nothing else, and panes mount lazily, per project, on first
+  // visit — so for an agent nobody has opened, the row colour is a frozen last reading with no
+  // writer that can move it. That is the founder's "it was green when I first clicked on it… I
+  // guess it turned red AFTER I clicked": the click created the writer, it did not change the fact.
+  // The Rust nudger reads every live session's grid once a second without the frontend being alive
+  // at all; this is the subscription that brings its verdict back. See
+  // `engine/observedAttention.ts` for the contract it applies.
+  //
+  // NOT gated on `isMainWindow`, unlike the listener above: every window keeps its OWN
+  // `runtimeStore` and paints its own sidebar, so a satellite that never armed this would show
+  // exactly the stale colours this fixes. Tauri's `emit` broadcasts to all of them.
+  useEffect(() => {
+    let cleanup: (() => void) | undefined;
+    let unmounted = false;
+    void startObservedAttentionListener()
+      .then((c) => {
+        if (unmounted) c();
+        else cleanup = c;
+      })
+      .catch((e: unknown) =>
+        console.error("[observed-attention] listener failed to start:", e),
+      );
+    return () => {
+      unmounted = true;
+      cleanup?.();
+    };
+  }, []);
 
   // SUBSCRIBE TO PREVIEW STATE, NEVER POLL. Rust emits `preview:state` on every transition, and the
   // interesting moments of a dev server's life — bound a port, finished the first compile, crashed —

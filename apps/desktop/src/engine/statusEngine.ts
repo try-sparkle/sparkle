@@ -270,6 +270,34 @@ export function isSpinnerFrame(frame: string): boolean {
   return SPINNER_GLYPH.test(frame) && WORKING_PATTERNS.some((re) => re.test(frame));
 }
 
+/** How many trailing viewport rows count as the LIVE status region. Claude Code paints its spinner
+ *  immediately above the input box, so the live frame is always within a few rows of the bottom. */
+const LIVE_TAIL_ROWS = 6;
+
+/**
+ * Is Claude's live status line STILL PAINTED on this viewport snapshot?
+ *
+ * ── WHY THIS EXISTS, AND WHY IT IS NOT `hasSpinnerFrame(snapshot)` ──────────────────────────────
+ * `hasSpinnerFrame` is for INGESTED CHUNKS — a stream of redraw frames. Applied to a whole rendered
+ * viewport it also matches the TRANSCRIPT: a spinner line from a finished turn, still scrolled
+ * above, would report "working" indefinitely. So this is bottom-anchored, exactly as
+ * `isSessionLimitPicker` is and for the reason its header gives — scrollback has no bottom.
+ *
+ * Trailing blank rows are dropped before the tail is taken: a viewport is a fixed-height grid, so
+ * the status line sits well above the last ROW even when it is the last CONTENT.
+ */
+export function liveTail(snapshot: string | undefined): string {
+  if (!snapshot || !snapshot.trim()) return "";
+  const rows = snapshot.split("\n");
+  let end = rows.length;
+  while (end > 0 && !rows[end - 1]!.trim()) end--;
+  return rows.slice(Math.max(0, end - LIVE_TAIL_ROWS), end).join("\n");
+}
+
+export function screenShowsLiveSpinner(snapshot: string | undefined): boolean {
+  return liveTail(snapshot).split("\n").some((row) => isSpinnerFrame(row));
+}
+
 /** Does this cleaned chunk contain a live status-line redraw? The spinner redraws in place with
  *  carriage returns, so one chunk holds several frames plus ordinary prose; we split and ask
  *  per-frame rather than testing the whole chunk, which is what keeps the persistent footer — and
@@ -348,6 +376,11 @@ const IDLE_MS = 2500;
 const SCREEN_RECHECK_MS = 25000;
 // Spinner ticks ~1/s; if we don't see it for this long the turn has ended.
 const SPINNER_GRACE_MS = 2000;
+/** Backstop on consecutive spinner holds, in case a grid somehow changes on every read without the
+ *  turn making progress. 150 holds is ~5 minutes at `SPINNER_GRACE_MS`, far longer than any real
+ *  gap between redraws and far shorter than "forever". The progress check above is the real guard;
+ *  this is what keeps a bug in it bounded. */
+const MAX_SPINNER_HOLDS = 150;
 // How many ingested lines the "the user just submitted a message" echo-suppression window lasts
 // (Fix 2). Bounded so it can't permanently mask a LATER genuine wedge: after this many lines with
 // no further user input (and no progress event, which also clears it), detection re-arms fully.
@@ -480,6 +513,11 @@ export class StatusEngine {
   // picker that returns after a failed resume announces again.
   private sawSessionLimitPicker = false;
   private idleTimer: ReturnType<typeof setTimeout> | null = null;
+  /** The viewport tail seen at the last settle that REFUSED to go gray, and how many such refusals
+   *  have run back to back. Both exist so the refusal needs EVIDENCE OF CHANGE rather than mere
+   *  presence — see the `settle` guard. */
+  private heldSpinnerTail: string | null = null;
+  private spinnerHolds = 0;
   private recheckTimer: ReturnType<typeof setTimeout> | null = null;
   // Latched by dispose(). A disposed engine must go completely silent: its PTY listener is torn
   // down over an ASYNC Tauri unlisten, so a `pty:exit` from its own kill can still arrive after the
@@ -957,6 +995,70 @@ export class StatusEngine {
   // doesn't pass it, and leaving that line untouched keeps this instrumentation out of the way of
   // the SCREEN_RECHECK_MS work landing on a sibling branch, which rewrites that method.
   private settle(trigger: StatusTransitionTrigger = "quiet-settle"): void {
+    // ── GRAY MEANS INACTIVE. DO NOT PAINT IT OVER AN AGENT THAT IS VISIBLY WORKING ──────────────
+    // The founder's rule, in his words: "If it's still active … it should be green if it's happy,
+    // amber if it's got issues, red if it's blocked, but not gray. GRAY MEANS IT'S INACTIVE."
+    //
+    // This settle is armed by a 2-SECOND silence on the INGEST path (`SPINNER_GRACE_MS`), and
+    // silence on that path is not the same fact as an idle agent. PTY read backpressure
+    // (`terminalFlow.ts`) pauses the reader past its high-water mark, so a verbose shell command —
+    // exactly the reported case — stops chunks reaching `ingest` while the spinner stays painted on
+    // the grid. The old code then read the viewport ONLY to ask `screenAwaitsInput`, never "is it
+    // still working", and emitted `idle`: gray, on an agent the founder could watch running.
+    //
+    // It bites the Improve Sparkle row hardest because that pane is the one with NO defence.
+    // `SparkleAgentPane` installs no hooks and builds no `createStatusRouter`, so unlike every build
+    // row there is no `hook !== "idle"` mask to outrank a false screen guess — the raw verdict lands
+    // on the dot. And `set()` dedups on its own field, so a steadily-working pane emits nothing
+    // further: one gray write pins the row for the rest of the turn.
+    //
+    // ⚠️ ORDER: this runs BEFORE the awaiting check, but is gated so it can only ever prevent GRAY,
+    // never a red. A live spinner and a live prompt do not coexist — the prompt replaces the status
+    // line — so a snapshot carrying both is scrollback, and the tail-anchoring in
+    // `screenShowsLiveSpinner` is what keeps that out. Should one slip through anyway, suppressing
+    // a `waiting` would be far worse than a late gray, which is why the re-arm below re-settles
+    // rather than latching `working` forever: the NEXT settle re-reads the screen, and once the
+    // spinner really is gone it proceeds normally.
+    // Every other timer callback in this class opens with this, and the hold below is the one that
+    // would MATTER without it: it re-arms itself, so an orphaned chain would keep calling
+    // `onStatus` on a torn-down engine indefinitely (the roborev-55094 shape).
+    if (this.disposed) return;
+    const live = this.opts.getScreen?.() ?? "";
+    const tail = liveTail(live);
+    if (screenShowsLiveSpinner(live) && !screenAwaitsInput(live)) {
+      // ⚠️ PRESENCE IS NOT ENOUGH — THE SPINNER MUST HAVE MOVED.
+      //
+      // Holding on presence alone re-arms off a STATIC read of the same grid, so anything in the
+      // tail that `isSpinnerFrame` matches pins the row `working` permanently, with no path back.
+      // A real spinner redraws its clock every ~100ms, so consecutive reads 2s apart always differ;
+      // a FROZEN one — a backpressured reader that never resumes, a hung TUI, a pane whose last
+      // painted frame happened to be a status line — reads identically, and so does a false match.
+      // `isSpinnerFrame` was tuned for redraw FRAMES and is being applied here to rendered
+      // transcript rows, where `SPINNER_GLYPH` admits `*`/`+`/`·` and the tails include a bare
+      // `N tokens` and `esc to interrupt` — so a wrapped footer or a markdown bullet is enough.
+      //
+      // And a latched `working` is NOT the cheap direction this commit first claimed. It is not a
+      // resting status, so `goalContinuation` refuses the row as `not-idle` (auto-continue dead),
+      // `sawRecentError` is never cleared so a later `exit()` mislabels it `errored`, and the
+      // background-task and session-limit reads never run again. This file's own header calls a
+      // false green "the more dangerous direction … it hides a real question behind a healthy-
+      // looking dot" (roborev 67220).
+      //
+      // So: hold only while the tail CHANGES, and cap the run as a backstop. When the spinner
+      // stops moving we fall through and settle normally — which is the correct reading, because a
+      // spinner that has stopped redrawing is exactly what a finished or wedged turn looks like.
+      const moved = tail !== this.heldSpinnerTail;
+      if (moved && this.spinnerHolds < MAX_SPINNER_HOLDS) {
+        this.heldSpinnerTail = tail;
+        this.spinnerHolds += 1;
+        this.set("working", trigger, "working", null);
+        if (this.idleTimer) clearTimeout(this.idleTimer);
+        this.idleTimer = setTimeout(() => this.settle(trigger), SPINNER_GRACE_MS);
+        return;
+      }
+    }
+    this.heldSpinnerTail = null;
+    this.spinnerHolds = 0;
     this.idleTimer = null;
     this.sawRecentError = false;
     // The turn is over; the next one's spinner counter starts from zero, so drop the baseline rather

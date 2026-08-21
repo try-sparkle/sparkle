@@ -137,6 +137,7 @@ import {
   withUnstartedWorkerAttention,
   withRedWorkerAttention,
 } from "../engine/workerAttention";
+import { withObservedAttention } from "../engine/observedAttention";
 import { attentionWorkersOf } from "../engine/workerExpansion";
 import { withDismissedAlerts, alertControlKind } from "../engine/alertDismissal";
 import { withUnmergedWork } from "../engine/unmergedAttention";
@@ -336,6 +337,10 @@ export function AgentSidebar({
   const liveStatus = useRuntimeStore((s) => s.status);
   const openAgentIds = useRuntimeStore((s) => s.openAgentIds);
   const lastObserved = useRuntimeStore((s) => s.lastObserved);
+  // The mount-independent attention verdict, pushed by `services/observedAttentionListener` off the
+  // Rust nudger's once-a-second read of every live grid. This is the writer that exists for agents
+  // whose pane has never been mounted — see engine/observedAttention.
+  const observedAttention = useRuntimeStore((s) => s.observedAttention);
   // The open set, built once: the strand overlay below and the peek both
   // ask it, and two Sets from one array is two allocations per render for the same answer.
   const openIds = useMemo(() => new Set(openAgentIds), [openAgentIds]);
@@ -351,7 +356,31 @@ export function AgentSidebar({
   // a deadline and an `errored` agent emits no further status writes, so a bare
   // `useMemo(… Date.now() …)` here would hold such a row gray forever (roborev 54743, finding 1).
   // Same position in the chain as before — see the comment inside the memo.
-  const s0 = useNewAgentCalm(project?.agents ?? NO_AGENTS, liveStatus, interactionAt);
+  // (0z) THE MOUNT-INDEPENDENT VERDICT, on the RAW map and BEFORE step (0) — the same position
+  // `useAttentionNotifications.composeRollup` applies it at, and it MUST be the same one.
+  //
+  // It was applied to `s0` (i.e. AFTER `useNewAgentCalm`) for one commit, with a comment claiming
+  // parity that was simply false, and the divergence was real rather than theoretical: a briefless
+  // agent inside NEW_AGENT_GRACE_MS with status `errored` and verdict `awaiting` came out `new`
+  // (gray, calm band) from `composeRollup` — which leaves `errored` alone, then lets `calmNewAgent`'s
+  // red backstop gray it — and `waiting` (red, needs_you) here, because calming it to `new` FIRST
+  // handed `applyVerdict` a status it does rewrite. The Build column would band the row red while
+  // the dock badge, the TopBar cluster and the concierge feed called it calm (roborev 67199).
+  //
+  // `publishedRollupAgreement.test.ts` is structurally blind to this — both maps it compares come
+  // out of the one `composeRollup`, so it can never see this parallel copy. Keeping the two calls
+  // at the same position is the only thing that holds them equal.
+  const observedCorrected = useMemo(
+    () =>
+      withObservedAttention(
+        project?.agents ?? NO_AGENTS,
+        liveStatus,
+        observedAttention,
+        (id) => openIds.has(id),
+      ),
+    [project, liveStatus, observedAttention, openIds],
+  );
+  const s0 = useNewAgentCalm(project?.agents ?? NO_AGENTS, observedCorrected, interactionAt);
   // The same wake-up, exposed as a value so the rollup memo far below can depend on it too.
   const graceTick = useNewAgentGraceTick(project?.agents ?? NO_AGENTS, liveStatus, interactionAt);
   const status = useMemo(() => {

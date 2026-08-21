@@ -822,6 +822,43 @@ fn rebaseline_after_suspend(tracked: &mut HashMap<String, Tracked>, now: u64) {
     }
 }
 
+/// Classify one agent's grid and emit the verdict WHEN IT CHANGED.
+///
+/// ── WHY THIS LIVES IN THE NUDGER'S LOOP AND NOT IN THE FRONTEND ─────────────────────────────────
+/// `runtimeStore.status` — the map the row colour reads — is written only by a MOUNTED
+/// `AgentPane`, and panes mount lazily, per project, on first visit. For an agent nobody has
+/// opened, the colour is a frozen last reading with no writer that can move it, which is the
+/// founder's "it was green when I first clicked on it". This loop already renders every live
+/// session's grid once a second without the frontend being alive at all, so it is the writer that
+/// was missing. See `observed_attention`'s header for the full derivation.
+///
+/// Failure is silent BY DESIGN, twice over: no managed state means the app is mid-teardown, and a
+/// failed `emit` means no window is listening. Neither is a reason to disturb the ladder below.
+fn observe_attention<R: Runtime>(
+    app: &AppHandle<R>,
+    agent_id: &str,
+    observer: &PtyObserver,
+    now: u64,
+) {
+    let Some(state) = app.try_state::<crate::observed_attention::ObservedAttentionState>() else {
+        return;
+    };
+    let (text, alternate) = observer.render();
+    let verdict =
+        crate::observed_attention::classify(&text, alternate, observer.reader_is_parked());
+    if let Some(payload) = state.record(crate::observed_attention::ObservedAttention {
+        agent_id: agent_id.to_string(),
+        verdict,
+        alternate,
+        at_ms: now,
+    }) {
+        let _ = app.emit(
+            crate::observed_attention::OBSERVED_ATTENTION_EVENT,
+            &payload,
+        );
+    }
+}
+
 fn tick<R: Runtime>(app: &AppHandle<R>, tracked: &mut HashMap<String, Tracked>, now: u64) {
     let Some(observers) = app.try_state::<Observers>() else {
         return;
@@ -839,10 +876,33 @@ fn tick<R: Runtime>(app: &AppHandle<R>, tracked: &mut HashMap<String, Tracked>, 
         sweep_dead_flags(&flags, &live_ids);
     }
     tracked.retain(|id, _| live_ids.contains(id.as_str()));
+    // A verdict must not outlive the terminal it described, for the same reason a flag must not —
+    // and the drop must be ANNOUNCED, not merely performed. The consumer is fed change-events, so a
+    // silent prune leaves it holding the last verdict for an agent whose PTY is gone: a spun-down
+    // agent whose final reading was `awaiting` would stay raised forever, which is this module's own
+    // bug one layer up. `sweep` hands back the retractions to emit.
+    if let Some(observed) = app.try_state::<crate::observed_attention::ObservedAttentionState>() {
+        for gone in observed.sweep(&live_ids, now) {
+            let _ = app.emit(
+                crate::observed_attention::OBSERVED_ATTENTION_EVENT,
+                &gone,
+            );
+        }
+    }
 
     let statuses = status_map(app);
 
     for (agent_id, observer) in &live {
+        // ── THE ATTENTION VERDICT RUNS ABOVE THE LADDER'S `due_at_ms` GATE, ON PURPOSE ─────────
+        // Everything below that gate runs only when an agent is DUE, and the rungs reach 600s — so
+        // a verdict emitted down there would be up to ten minutes stale, which is most of the
+        // window in which a human is standing at a prompt wondering why the row is green. The two
+        // clocks are unrelated: the ladder's cadence is about how often we may WRITE to an agent,
+        // and this is about how quickly we may TELL someone. Reading the grid is a lock and a
+        // render, and the emit is gated on the verdict having CHANGED, so the cost of running it
+        // every tick is a no-op in the overwhelmingly common case.
+        observe_attention(app, agent_id, observer, now);
+
         let entry = tracked.entry(agent_id.clone()).or_insert_with(|| Tracked {
             state: AgentState::default(),
             due_at_ms: now,
@@ -2596,6 +2656,76 @@ mod tests {
     /// `tick` is otherwise the ONE function here with no coverage — it needs an `AppHandle` — and it
     /// is where the outcome→state wiring lives, which is why that wiring shipped deletable with
     /// every test still green (roborev 57738). A mock app costs nothing and closes it.
+    /// THE SEAM, not the pure module. Every other test of the attention verdict is against
+    /// `observed_attention`, which cannot see whether `tick` calls it at all — and the commit's
+    /// load-bearing claim is about WHERE in `tick` the call sits.
+    ///
+    /// This is the test that fails if `observe_attention(...)` moves BELOW the `due_at_ms` gate.
+    /// The agent below is deliberately NOT due, so a call placed under the gate never runs and the
+    /// state stays empty. Without this the ladder's rungs (up to 600s) could be silently
+    /// reintroduced into a signal that is supposed to be current within a second (roborev 67180).
+    #[test]
+    fn the_attention_verdict_is_recorded_even_when_the_agent_is_not_due_for_a_look() {
+        let app = tauri::test::mock_app();
+        let handle = app.handle().clone();
+        handle.manage(Observers::default());
+        handle.manage(NudgeFlags::default());
+        handle.manage(crate::observed_attention::ObservedAttentionState::default());
+
+        let observer = handle.state::<Observers>().attach("agent-1", 120, 40);
+        // A picker on the normal buffer — a screen the classifier reads as `awaiting`.
+        observer.ingest("\x1b[2J\x1b[HDo you want to proceed?\r\n❯ 1. Yes\r\n  2. No");
+
+        let mut tracked: HashMap<String, Tracked> = HashMap::new();
+        let now = now_ms();
+        // FIRST tick establishes the ladder entry and sets `due_at_ms` into the future.
+        tick(&handle, &mut tracked, now);
+        let due = tracked.get("agent-1").expect("tracked").due_at_ms;
+        assert!(due > now, "the agent must be NOT due for this test to prove anything");
+
+        // A SECOND tick one second later — still not due. A verdict must be recorded anyway.
+        tick(&handle, &mut tracked, now + 1_000);
+
+        let state = handle.state::<crate::observed_attention::ObservedAttentionState>();
+        let rows = state.list();
+        assert_eq!(rows.len(), 1, "the tick must classify every live observer");
+        assert_eq!(rows[0].agent_id, "agent-1");
+        assert_eq!(
+            rows[0].verdict,
+            crate::observed_attention::Verdict::Awaiting,
+            "a picker on screen must read as `awaiting`"
+        );
+        assert_eq!(rows[0].at_ms, now + 1_000, "at_ms is AS OF this tick, not onset");
+    }
+
+    /// The PAIRED case for the sweep: the tick must drop a verdict whose PTY is gone. Asserted on
+    /// the state, because `sweep` being tested on the struct says nothing about `tick` calling it.
+    #[test]
+    fn the_tick_drops_the_verdict_of_an_agent_whose_observer_is_detached() {
+        let app = tauri::test::mock_app();
+        let handle = app.handle().clone();
+        handle.manage(Observers::default());
+        handle.manage(NudgeFlags::default());
+        handle.manage(crate::observed_attention::ObservedAttentionState::default());
+
+        let observer = handle.state::<Observers>().attach("agent-1", 120, 40);
+        observer.ingest("\x1b[2J\x1b[HDo you want to proceed?\r\n❯ 1. Yes\r\n  2. No");
+
+        let mut tracked: HashMap<String, Tracked> = HashMap::new();
+        let now = now_ms();
+        tick(&handle, &mut tracked, now);
+        let state = handle.state::<crate::observed_attention::ObservedAttentionState>();
+        assert_eq!(state.list().len(), 1, "non-vacuity: a verdict was recorded first");
+
+        handle.state::<Observers>().detach("agent-1");
+        tick(&handle, &mut tracked, now + 1_000);
+
+        assert!(
+            state.list().is_empty(),
+            "a verdict outlived the terminal it described — it would stay raised forever"
+        );
+    }
+
     #[test]
     fn tick_records_a_failed_write_on_the_state_and_escalates() {
         let app = tauri::test::mock_app();

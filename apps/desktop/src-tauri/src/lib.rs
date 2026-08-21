@@ -142,6 +142,10 @@ mod notes;
 mod nudge_gate;
 mod nudge_ladder;
 mod nudger;
+// The mount-independent attention verdict (bead: invisible-green-attention). Same split as
+// the nudger above: `observed_attention` is the pure classification + the wire shape, and
+// `nudger`'s existing per-second tick is the only thing that owns a screen to classify.
+mod observed_attention;
 // The deterministic conflicting/stale-PR detector (bead sparkle-zss67). Same two-file split as the
 // nudger above and for the same reason: `conflict_ladder` is the pure decision, `conflict_watch`
 // owns the thread, the `gh` probe and the flags. Neither makes a model call on any path.
@@ -242,6 +246,10 @@ pub fn run() {
         // so a test can stand one up in isolation.
         .manage(nudger::Observers::default())
         .manage(nudger::NudgeFlags::default())
+        // The last attention verdict emitted per agent. Managed for the same reasons: the
+        // nudger thread writes it from an `AppHandle`, and the frontend SEEDS from it with
+        // `observed_attention` because the event only fires on change.
+        .manage(observed_attention::ObservedAttentionState::default())
         // The conflicting/stale-PR detector's raised flags. Managed state for the same reasons the
         // nudger's are: the watcher thread reaches them from an `AppHandle`, the frontend PULLS
         // them with `conflict_flags`, and a test can stand one up in isolation.
@@ -779,6 +787,7 @@ pub fn run() {
             nudger::nudger_flags,
             nudger::nudger_clear_flag,
             nudger::nudger_send_escape,
+            observed_attention::observed_attention,
             conflict_watch::conflict_flags,
             conflict_watch::conflict_clear_flag,
             conflict_watch::conflict_probe_status,

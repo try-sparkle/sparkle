@@ -6,6 +6,7 @@
 import { create } from "zustand";
 import { persist, createJSONStorage } from "zustand/middleware";
 import type { AgentTabStatus, LastObserved } from "../types";
+import type { ObservedReading } from "../engine/observedAttention";
 import { isRedStatus } from "../services/windowStatus";
 import type { BranchStatus, WorkflowState, AgentStatusResult } from "../services/branchStatus";
 import type { WorkflowStageId } from "../engine/workflowStage";
@@ -724,6 +725,16 @@ interface RuntimeState {
   // is the second witness: it is read off disk for the whole `openAgentIdSet()` population, needs no
   // pane, and costs no agent turn. `engine/movementRetraction` is what compares the two.
   agentMovement: Record<string, MovementEvidence>;
+  // agentId -> the LAST attention verdict the Rust nudger read off that agent's grid, pushed by
+  // `services/observedAttentionListener` off `attention://observed`. Live-only, like `status`.
+  //
+  // THE THIRD WITNESS, and it exists for the same reason `agentMovement` above does — `status` is
+  // written by a MOUNTED pane and by essentially nothing else, so for an agent this window is not
+  // hosting it is a frozen last reading. Where `agentMovement` reads ARTIFACTS off disk (what the
+  // agent DID), this reads the agent's own rendered SCREEN once a second in the Rust process (what
+  // the agent is asking for RIGHT NOW), which is the half that says a human is being waited on.
+  // `engine/observedAttention` is what applies it.
+  observedAttention: Record<string, ObservedReading>;
   // agentId -> the terminal screen text captured the moment the agent entered an "ask" status
   // (waiting/approval), so the notification path can summarize WHAT it's asking. Live-only (never
   // persisted, like `status`); cleared whenever `status` is cleared for an agent — AND, since
@@ -802,6 +813,17 @@ interface RuntimeState {
    *  evidence this tick and must not keep a previous tick's — a retraction is only ever as good as
    *  its most recent reading. */
   setAgentMovement: (movement: Record<string, MovementEvidence>) => void;
+  /** Record ONE agent's attention verdict. Per-agent, NOT whole-map: the producer emits on change
+   *  and a missing agent this tick means "unchanged", never "no evidence" — the opposite of
+   *  `setAgentMovement`'s complete-reading semantics above. The Rust side sweeps a verdict when its
+   *  PTY dies, so a stale row cannot outlive its terminal. */
+  setObservedAttention: (agentId: string, reading: ObservedReading) => void;
+  /** Replace the whole map from the startup seed, which IS a complete reading. */
+  seedObservedAttention: (readings: Record<string, ObservedReading>) => void;
+  /** Drop one agent's verdict — the producer's `gone` retraction, sent when its PTY is swept. A
+   *  held verdict that outlives its terminal is a latched reading with no writer that can move it,
+   *  which is the exact bug this whole channel exists to fix. Safe to call when unset. */
+  clearObservedAttention: (agentId: string) => void;
   /** Store the terminal screen captured when an agent entered an "ask" status, for the notification
    *  summarizer. Live-only (mirrors `status`), and EXPIRES with the ask: the next `setStatus` that
    *  moves this agent out of the red tier drops it. Write it before you set the red status, not
@@ -865,6 +887,7 @@ export const useRuntimeStore = create<RuntimeState>()(
       status: {},
       lastObserved: {},
       agentMovement: {},
+      observedAttention: {},
       attentionScreen: {},
       attentionScreenAt: {},
       unjudgedAsk: {},
@@ -1041,6 +1064,28 @@ export const useRuntimeStore = create<RuntimeState>()(
         // case for a quiet fleet, every ten seconds — must not churn a render. Shallow-compared by
         // the three fields that matter, because the digest hands back fresh objects each tick.
         set((s) => (sameMovement(s.agentMovement, movement) ? s : { agentMovement: movement })),
+
+      setObservedAttention: (agentId, reading) =>
+        // Same no-op guard `setStatus` uses, for the same reason: this map has whole-map
+        // subscribers (the sidebar, on every render), and the producer re-asserts a verdict on
+        // reconnect. `atMs` is deliberately OUT of the comparison — it moves on every reading, so
+        // including it would make the guard a no-op and churn a render once a second per agent.
+        set((s) => {
+          const prev = s.observedAttention[agentId];
+          if (prev && prev.verdict === reading.verdict && prev.alternate === reading.alternate)
+            return s;
+          return { observedAttention: { ...s.observedAttention, [agentId]: reading } };
+        }),
+
+      seedObservedAttention: (readings) =>
+        set(() => ({ observedAttention: readings })),
+
+      clearObservedAttention: (agentId) =>
+        set((s) => {
+          if (!(agentId in s.observedAttention)) return s;
+          const { [agentId]: _dropped, ...rest } = s.observedAttention;
+          return { observedAttention: rest };
+        }),
 
       setAttentionScreen: (agentId, text) =>
         // The stamp is written with the text, never separately: `captureFor` compares movement

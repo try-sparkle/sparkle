@@ -81,6 +81,10 @@ import {
 import { resolveStage } from "./engine/workflowStage";
 import { withNudgeLoopCalm } from "./engine/nudgeLoopCalm";
 import { withFinishedHeadCalm } from "./engine/finishedHeadCalm";
+import {
+  withObservedAttention,
+  type ObservedReading,
+} from "./engine/observedAttention";
 import { thrashReportFor, type ThrashReport } from "./engine/agentThrash";
 import type { AgentTab, AgentTabStatus } from "./types";
 import { projectNameForAgent } from "./services/creditProject";
@@ -170,6 +174,11 @@ export function publishedStatusFor(
    *  `hasBackgroundTasksOf` do, so every production caller drives the real exemption without passing
    *  anything while `composeRollup` itself stays pure. */
   nudgeFlags: NudgeFlagSnapshot = nudgeFlagsSnapshot(),
+  /** agentId → the mount-independent attention verdict (`engine/observedAttention`). Defaults to
+   *  the live store at this OUTERMOST boundary, exactly as `nudgeFlags` above does, so every
+   *  production caller gets the real reading without passing anything while `composeRollup` itself
+   *  stays pure. */
+  observed: Readonly<Record<string, ObservedReading>> = observedAttentionSnapshot(),
 ): StatusMap {
   const { published, dotOf } = composeRollup(
     agents,
@@ -184,6 +193,7 @@ export function publishedStatusFor(
     deathCauseOf,
     hasBackgroundTasksOf,
     nudgeFlags,
+    observed,
   );
   return withWorkerRollupGreen(agents, published, dotOf, promoted);
 }
@@ -239,6 +249,11 @@ export function rollupViewFor(
    *  `hasBackgroundTasksOf` do, so every production caller drives the real exemption without passing
    *  anything while `composeRollup` itself stays pure. */
   nudgeFlags: NudgeFlagSnapshot = nudgeFlagsSnapshot(),
+  /** agentId → the mount-independent attention verdict (`engine/observedAttention`). Defaults to
+   *  the live store at this OUTERMOST boundary, exactly as `nudgeFlags` above does, so every
+   *  production caller gets the real reading without passing anything while `composeRollup` itself
+   *  stays pure. */
+  observed: Readonly<Record<string, ObservedReading>> = observedAttentionSnapshot(),
 ): { own: StatusMap; dotOf: (id: string) => RollupDot } {
   const { own, dotOf } = composeRollup(
     agents,
@@ -253,11 +268,20 @@ export function rollupViewFor(
     deathCauseOf,
     hasBackgroundTasksOf,
     nudgeFlags,
+    observed,
   );
   return { own, dotOf };
 }
 
 /** Steps 1–4 plus the rollup accessor they feed. The single place the chain is spelled out. */
+/** The live mount-independent verdict map, for the two OUTERMOST boundaries' defaults. Read here
+ *  rather than inside `composeRollup` so that composition stays PURE — the same rule `nudgeFlags`,
+ *  `deathCauseOf` and `hasBackgroundTasksOf` follow, and for the same reason: a module-state read
+ *  inside the composition makes every test driving it depend on what a prior test left behind. */
+function observedAttentionSnapshot(): Readonly<Record<string, ObservedReading>> {
+  return useRuntimeStore.getState().observedAttention;
+}
+
 function composeRollup(
   agents: readonly AgentTab[],
   status: StatusMap,
@@ -311,6 +335,13 @@ function composeRollup(
    *  test had left behind — and left the production wiring reachable by no test at all. It is also a
    *  MAP rather than a predicate on purpose; see the boundary parameters above (roborev 65465). */
   nudgeFlags: NudgeFlagSnapshot = new Map(),
+  /** agentId → the mount-independent attention verdict the Rust nudger read off that agent's grid
+   *  (`engine/observedAttention`). Injected for the same reason `nudgeFlags` and `deathCauseOf` are:
+   *  this composition is consumed by `buildConciergeFeed`, which documents itself as PURE, and the
+   *  backing map is store state. Defaults to EMPTY — no reading, which changes nothing and is
+   *  exactly today's behaviour for a caller with no evidence to give. Wired at the OUTERMOST
+   *  boundaries above. */
+  observed: Readonly<Record<string, ObservedReading>> = {},
 ): { published: StatusMap; own: StatusMap; dotOf: (id: string) => RollupDot } {
   // (0): a spawned-but-never-briefed agent is `new`, not red. FIRST, on the RAW map, so the two
   // bubbles below never carry a briefless agent's false red up to its orchestrator — a bubbled red
@@ -336,11 +367,35 @@ function composeRollup(
   // runs BEFORE the bubbles/unmerged/rollup so the single `working` it writes is the one source of
   // truth every downstream surface reads — the dot, isInMotion's worker-red suppression, the
   // withUnmergedWork "is this agent finished?" test, and the published map itself.
+  // (0z): THE MOUNT-INDEPENDENT VERDICT, and it runs FIRST — before (0), (0b) and (0c) — because it
+  // is the only overlay here that corrects the RAW READING ITSELF rather than reinterpreting it. For
+  // an agent no pane is mounted for, `status` is a frozen last reading with no writer that can move
+  // it (the founder's "it was green when I first clicked on it"), and every rule below is reasoning
+  // about that frozen value. Correct it before they do.
+  //
+  // THE SURVIVING REASON FOR THIS POSITION is the `awaiting` raise against step (0): a raise to
+  // `waiting` survives `calmNewAgent`, whose DEMONSTRATED_ASK exempts `waiting`/`approval`
+  // explicitly, because "a real ask goes red immediately, at any age, briefed or not". A
+  // positively-read on-screen prompt is exactly that, and it must outrank "quiet because it was
+  // never briefed", which is a STALL-TIMER inference rather than a reading. Pinned by
+  // `observedAttentionPublished.test.ts`.
+  //
+  // ⚠️ AND IT MUST MATCH AgentSidebar's COPY OF THIS CHAIN, which is the constraint that actually
+  // binds — the two applied the overlay at DIFFERENT points for one commit and diverged on a real
+  // case. `publishedRollupAgreement.test.ts` cannot see that: both maps it compares come out of
+  // this one function.
+  //
+  // This comment used to argue a second constraint — (0z) before (0c), so an `unreadable`
+  // latch-break could not undo a green `withBackgroundTaskGreen` had granted. THAT IS NOW VACUOUS:
+  // `applyVerdict`'s `unreadable` arm returns `undefined`, so there is no latch-break to order
+  // against. `engine/observedAttention.ts` carries the current contract; read it there rather than
+  // trusting a restatement here.
+  const observedCorrected = withObservedAttention(agents, status, observed, (id) => openIds.has(id));
   const calm = withBackgroundTaskGreen(
     agents,
     withDeadSessionCalm(
       agents,
-      withNewAgentCalm(agents, status, now, interaction),
+      withNewAgentCalm(agents, observedCorrected, now, interaction),
       deathCauseOf,
     ),
     hasBackgroundTasksOf,
