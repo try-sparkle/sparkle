@@ -3,6 +3,9 @@ import {
   ADVANCE_IDLE_MS,
   NEVER_IDLE_CADENCE_MS,
   NEVER_IDLE_NUDGE_TEXT,
+  NEVER_IDLE_ESCALATED_NUDGE_TEXT,
+  NEVER_IDLE_ESCALATE_AFTER,
+  neverIdleNudgeText,
   _resetImproveNudgeForTests,
   decideImproveNudge,
   improveLastNudgedAt,
@@ -85,6 +88,47 @@ describe("sweepImproveNudge — the side effect, keyed off concrete advance not 
     // case a 'children exist' gate would have wrongly suppressed; here it nudges.
     const sent = await sweepStaleThen(ADVANCE_IDLE_MS);
     expect(sent).toEqual([NEVER_IDLE_NUDGE_TEXT]);
+  });
+
+  // THE ESCALATION (the durable fix for an agent that answers the nudge instead of shipping). Keyed on
+  // the advance fingerprint — a reworded deferral does not move it, so only a real artifact resets it.
+  const tick = async (t: number, fingerprint: string): Promise<string[]> => {
+    const d = makeDeps({ now: t, fingerprint });
+    await sweepImproveNudge(d.deps);
+    return d.sent;
+  };
+
+  it("the pure selector: soft below the threshold, escalated at or above it", () => {
+    expect(neverIdleNudgeText(0)).toBe(NEVER_IDLE_NUDGE_TEXT);
+    expect(neverIdleNudgeText(NEVER_IDLE_ESCALATE_AFTER - 1)).toBe(NEVER_IDLE_NUDGE_TEXT);
+    expect(neverIdleNudgeText(NEVER_IDLE_ESCALATE_AFTER)).toBe(NEVER_IDLE_ESCALATED_NUDGE_TEXT);
+    expect(neverIdleNudgeText(NEVER_IDLE_ESCALATE_AFTER + 3)).toBe(NEVER_IDLE_ESCALATED_NUDGE_TEXT);
+  });
+
+  it("escalates after repeated flat-signal nudges without a concrete advance", async () => {
+    const t0 = 5_000_000;
+    const C = NEVER_IDLE_CADENCE_MS; // == ADVANCE_IDLE_MS
+    await tick(t0, "idle"); // baseline (grace) — no nudge
+    const n1 = await tick(t0 + C, "idle"); // nudge #1
+    const n2 = await tick(t0 + 2 * C, "idle"); // nudge #2
+    const n3 = await tick(t0 + 3 * C, "idle"); // nudge #3 — the streak is now past the threshold
+    expect(n1).toEqual([NEVER_IDLE_NUDGE_TEXT]);
+    expect(n2).toEqual([NEVER_IDLE_NUDGE_TEXT]);
+    expect(n3).toEqual([NEVER_IDLE_ESCALATED_NUDGE_TEXT]);
+  });
+
+  it("a concrete ADVANCE resets the streak — the next nudge is SOFT again, never carried-over escalated", async () => {
+    // THE PAIRED CONTROL: without the reset an agent that ships once would still be shouted at. The
+    // advance (a changed fingerprint) must return the next idle stretch to the soft reminder.
+    const t0 = 5_000_000;
+    const C = NEVER_IDLE_CADENCE_MS;
+    await tick(t0, "idle"); // baseline
+    await tick(t0 + C, "idle"); // nudge #1
+    await tick(t0 + 2 * C, "idle"); // nudge #2 — one more flat nudge would escalate
+    await tick(t0 + 2 * C + 1_000, "shipped-a-commit"); // ADVANCE → resets the streak, no nudge
+    // A fresh flat stretch on the new fingerprint, a full interval later: it nudges SOFT, not escalated.
+    const nAfter = await tick(t0 + 3 * C + 1_000, "shipped-a-commit");
+    expect(nAfter).toEqual([NEVER_IDLE_NUDGE_TEXT]);
   });
 
   it("a fingerprint that MOVED within the interval → does NOT send (it advanced something concrete)", async () => {

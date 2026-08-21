@@ -69,6 +69,42 @@ export const NEVER_IDLE_NUDGE_TEXT =
   "a bead, or make a real edit.";
 
 /**
+ * The ESCALATED nudge, sent once the agent has been nudged repeatedly WITHOUT advancing a concrete
+ * item (see `NEVER_IDLE_ESCALATE_AFTER`). The soft nudge above is a reminder; this is the response to
+ * an agent that keeps ANSWERING the nudge — with a status line, a plan, or a question back to the
+ * founder — instead of shipping. That is the exact failure a prompt cannot fix, so this text does not
+ * merely repeat the ask: it names the streak, DECLARES those non-artifact replies unacceptable, and
+ * demands a concrete artifact THIS turn. The counter it keys off (`advanceFingerprint`) measures what
+ * the agent DID, so rewording a deferral cannot satisfy it — only a real artifact resets the streak.
+ */
+export const NEVER_IDLE_ESCALATED_NUDGE_TEXT =
+  "You have now been asked to work MULTIPLE times without producing a single concrete artifact. A " +
+  "status line, a plan, a list of options, or a question back to the founder is NOT an acceptable " +
+  "response — prioritizing and executing is your job, and deferring that choice is the failure being " +
+  "corrected. Do ONE thing this turn that leaves an artifact: a commit, a pushed PR, a filed or " +
+  "closed bead, or a real file edit. Pick the single highest-value ready item YOURSELF (open " +
+  "P1/blocking pipeline-health beads first, then `bd ready`, then the agent-feedback inbox) and act " +
+  "on it — do not ask which one. Reply `blocked-*` ONLY if a genuine consent, cost, or " +
+  "product-direction decision that is truly the founder's is pending; 'which of these should I fix " +
+  "first' is never such a decision.";
+
+/**
+ * How many nudges an agent may absorb WITHOUT a concrete advance before the escalated text replaces
+ * the soft one. Two: the first nudge is a reminder and the second gives a resumed turn one more
+ * chance to produce an artifact; a THIRD nudge in the same flat-signal streak means the agent is
+ * answering the nudge instead of working, which is what escalation exists to break.
+ */
+export const NEVER_IDLE_ESCALATE_AFTER = 2;
+
+/** The nudge text for a given streak of prior nudges-without-advance. Soft below the threshold, the
+ *  escalated demand at or above it. Exported so the sweep and its test name the SAME selector. */
+export function neverIdleNudgeText(priorNudgesWithoutAdvance: number): string {
+  return priorNudgesWithoutAdvance >= NEVER_IDLE_ESCALATE_AFTER
+    ? NEVER_IDLE_ESCALATED_NUDGE_TEXT
+    : NEVER_IDLE_NUDGE_TEXT;
+}
+
+/**
  * How long after a delivered nudge before another may be sent to the same agent.
  *
  * Ten minutes, chosen against the Pusher's 60s tick: without a floor the sweep would re-nudge every
@@ -213,10 +249,21 @@ let lastNudgedAt: number | null = null;
  *  goal runner's idle clock. */
 let lastFingerprint: string | null = null;
 let lastAdvanceAt: number | null = null;
+/** How many nudges have been DELIVERED in the current flat-signal streak — i.e. since the agent last
+ *  advanced a concrete item. Reset to 0 the instant `advancedRecently` is true (any real advance ends
+ *  the streak) and incremented on each confirmed delivery. Feeds `neverIdleNudgeText` so the message
+ *  escalates when the agent keeps answering the nudge without shipping. Window-local, not persisted. */
+let consecutiveIdleNudges = 0;
+
+/** Test/introspection seam: the current flat-signal nudge streak. */
+export function improveConsecutiveIdleNudges(): number {
+  return consecutiveIdleNudges;
+}
 
 /** Test seam: forget every clock so one suite cannot leak into the next. */
 export function _resetImproveNudgeForTests(): void {
   lastNudgedAt = null;
+  consecutiveIdleNudges = 0;
   lastFingerprint = null;
   lastAdvanceAt = null;
 }
@@ -269,6 +316,10 @@ export async function sweepImproveNudge(deps: ImproveNudgeDeps): Promise<Improve
     // gate, so a window that is not the owner (or is disarmed) still tracks advance and does not
     // manufacture a false "idle for ages" the moment it becomes eligible.
     const advancedRecently = advancedWithin(deps.advanceFingerprint(), now, ADVANCE_IDLE_MS);
+    // A real advance ENDS the streak: the agent worked, so the next nudge (if any) starts soft again.
+    // Done every sweep, before the decision, so an advance resets escalation even on a tick that then
+    // refuses to nudge for some other reason.
+    if (advancedRecently) consecutiveIdleNudges = 0;
     const backlog = deps.readyBacklog();
     const decision = decideImproveNudge({
       armed: deps.armed(),
@@ -290,8 +341,14 @@ export async function sweepImproveNudge(deps: ImproveNudgeDeps): Promise<Improve
     // send is in flight. A private `sending` flag here would be redundant with that and, worse, would
     // stay latched forever if a send never settled — permanently, silently disabling the watcher
     // (roborev 66023). The one serializer is the Pusher's.
-    const delivered = await deps.send(NEVER_IDLE_NUDGE_TEXT);
-    if (delivered) lastNudgedAt = now;
+    // ESCALATE by the streak so far: `consecutiveIdleNudges` counts prior deliveries WITHOUT an
+    // advance, so the text hardens the more the agent answers the nudge instead of shipping. Keyed on
+    // the advance fingerprint (what the agent DID), so a reworded deferral cannot dodge it.
+    const delivered = await deps.send(neverIdleNudgeText(consecutiveIdleNudges));
+    if (delivered) {
+      lastNudgedAt = now;
+      consecutiveIdleNudges += 1;
+    }
     return { sent: delivered, detail: delivered ? "nudged" : "transport-failed" };
   } catch (e) {
     log.warn("pusher", "never-idle nudge sweep threw", { error: String(e) });
