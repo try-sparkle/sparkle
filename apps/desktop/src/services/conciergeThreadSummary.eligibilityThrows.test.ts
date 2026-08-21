@@ -28,6 +28,7 @@ vi.mock("../engine/conciergeContinuity", async (importActual) => {
 import {
   maybeRefreshThreadSummary,
   _resetThreadSummaryForTests,
+  SUMMARY_FAILURE_BACKOFF_MS,
 } from "./conciergeThreadSummary";
 import {
   useConciergeThreadSummaryStore,
@@ -64,7 +65,7 @@ describe("when the eligibility work itself throws", () => {
     outsideWindow.mockImplementationOnce(() => {
       throw new Error("transient");
     });
-    await maybeRefreshThreadSummary([]);
+    await maybeRefreshThreadSummary([], { now: () => 0 });
 
     // THE POSITIVE CONTROL, and the reason the case above is not vacuous: the same fixture, with a
     // working dependency, reaches the model and stores the result. If the latch had stayed set —
@@ -72,7 +73,11 @@ describe("when the eligibility work itself throws", () => {
     // above would prove nothing about the throw.
     outsideWindow.mockReturnValue(outside());
     const chat = vi.fn(async () => "- recovered summary");
-    await expect(maybeRefreshThreadSummary([], { chat })).resolves.toBe(true);
+    // Past the failure backoff the throw above arms, so this reaches the model for the reason the
+    // test claims (the latch cleared) and not merely because the cooldown had not yet been set.
+    await expect(
+      maybeRefreshThreadSummary([], { chat, now: () => SUMMARY_FAILURE_BACKOFF_MS }),
+    ).resolves.toBe(true);
     expect(chat).toHaveBeenCalledTimes(1);
     expect(useConciergeThreadSummaryStore.getState().text).toBe("- recovered summary");
   });

@@ -22,6 +22,7 @@ vi.mock("./anthropic", () => ({}));
 import {
   maybeRefreshThreadSummary,
   _resetThreadSummaryForTests,
+  SUMMARY_FAILURE_BACKOFF_MS,
 } from "./conciergeThreadSummary";
 import {
   useConciergeThreadSummaryStore,
@@ -55,13 +56,17 @@ describe("a partially-mocked anthropic module", () => {
   });
 
   it("does not wedge the in-flight latch, so a later healthy call still runs", async () => {
-    await maybeRefreshThreadSummary(thread());
+    await maybeRefreshThreadSummary(thread(), { now: () => 0 });
     const ok = vi.fn(async () => "recovered");
     // THE POSITIVE CONTROL for the case above, and the reason the reset matters: the SAME fixture,
     // with a working dependency, must cross the threshold and reach the model. If it did not — a
     // wedged latch, or a store that already recorded these messages — then `false` above would be
     // satisfied by a summariser that never got near the throw, and would prove nothing.
-    await expect(maybeRefreshThreadSummary(thread(), { chat: ok })).resolves.toBe(true);
+    // Past the failure backoff the missing-binding throw arms, so a `true` here is evidence about
+    // the latch rather than about the cooldown not having been set yet.
+    await expect(
+      maybeRefreshThreadSummary(thread(), { chat: ok, now: () => SUMMARY_FAILURE_BACKOFF_MS }),
+    ).resolves.toBe(true);
     expect(ok).toHaveBeenCalledTimes(1);
     expect(useConciergeThreadSummaryStore.getState().text).toBe("recovered");
   });

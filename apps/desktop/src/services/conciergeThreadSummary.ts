@@ -78,9 +78,48 @@ export const SUMMARY_TIMEOUT_MS = 60_000;
  *  guard makes the extra attempts free no-ops instead. */
 let inFlight = false;
 
-/** Test seam: clears the in-flight latch between cases. */
+/** Backoff after a FAILED attempt — the in-flight latch above cannot cover this.
+ *
+ *  The failure path deliberately does not advance `throughMessageId` (see the `catch` below), which
+ *  keeps the pending turns eligible for the next attempt. That is right for a transient failure and
+ *  wrong for a STICKY one, because the threshold it is re-tested against stays crossed: once
+ *  `pending.length >= SUMMARY_REGEN_EVERY`, it is true on the next turn too, and on every turn
+ *  after. So a failure that will still be a failure in ten minutes gets a fresh model call per turn
+ *  — the latch never fires, since each attempt has already ended before the next turn begins.
+ *
+ *  Measured (anonymised session logs, 2026-08-20): the summariser attempted and failed 7 times in
+ *  under four minutes, each in ~500ms, every one against an exhausted subscription — a condition
+ *  that clears on the order of hours, not seconds. Nothing was retried into success; the retries
+ *  only spent the attempt.
+ *
+ *  Backing off on ANY failure (not just the quota sentinel) is deliberate: a genuinely transient
+ *  failure is delayed by one base interval and then recovers, while a sticky one doubles away
+ *  quickly. That needs no sentinel plumbed through the frontend, so there is no second place for
+ *  the classification to drift. */
+export const SUMMARY_FAILURE_BACKOFF_MS = 60_000;
+/** Ceiling on the doubling. A quota window is hours long, so there is nothing to gain past this and
+ *  a summary that is one interval stale is the cheaper error than a call that cannot succeed. */
+export const SUMMARY_FAILURE_BACKOFF_MAX_MS = 30 * 60_000;
+
+let consecutiveFailures = 0;
+let cooldownUntil = 0;
+
+/** How long to wait after the `n`th consecutive failure. Exported for the test that pins the curve
+ *  rather than re-deriving it. */
+export function failureBackoffMs(failures: number): number {
+  if (failures < 1) return 0;
+  // 2**(n-1) grows past Number.MAX_SAFE_INTEGER for a long enough outage; `Math.min` handles that
+  // correctly (Infinity clamps to the cap), but cap the exponent anyway so the intermediate stays a
+  // number a reader can reason about.
+  const doublings = Math.min(failures - 1, 20);
+  return Math.min(SUMMARY_FAILURE_BACKOFF_MS * 2 ** doublings, SUMMARY_FAILURE_BACKOFF_MAX_MS);
+}
+
+/** Test seam: clears the in-flight latch and the failure backoff between cases. */
 export function _resetThreadSummaryForTests(): void {
   inFlight = false;
+  consecutiveFailures = 0;
+  cooldownUntil = 0;
 }
 
 async function withTimeout(p: Promise<string>, ms: number): Promise<string> {
@@ -126,7 +165,11 @@ export async function maybeRefreshThreadSummary(
   // `timeoutMs` is injectable for the same reason `chat` is: the production value is 60s, so a test
   // that cannot shorten it can never make the TIMEOUT win the race — and the late-rejection leak
   // below only exists on that branch. A guard for a path no test can reach is not a guard.
-  deps?: { chat?: typeof chatOnce; timeoutMs?: number },
+  // `now` is injectable for the same reason `timeoutMs` is, and it is ONE clock on purpose: the
+  // same reader both SETS `cooldownUntil` on the failure path and TESTS it on the way in. Two
+  // clocks (a real one to stamp, an injected one to compare) would leave a test unable to tell a
+  // working gate from a broken one, because it could only control one side of the comparison.
+  deps?: { chat?: typeof chatOnce; timeoutMs?: number; now?: () => number },
 ): Promise<boolean> {
   // The ONLY statement outside the try, because it is the only one that cannot throw: reading a
   // module-local boolean touches no import.
@@ -142,6 +185,12 @@ export async function maybeRefreshThreadSummary(
   // caller can observe the earlier set.
   inFlight = true;
   try {
+    // BEFORE the eligibility work, and before any model call: a backoff that only took effect once
+    // the thread was re-examined would still pay for the examination on every turn. Inside the try
+    // because `deps.now` is caller-supplied and this function promises above that it never throws.
+    const now = deps?.now ?? Date.now;
+    if (cooldownUntil > 0 && now() < cooldownUntil) return false;
+
     const store = useConciergeThreadSummaryStore.getState();
     const outside = messagesOutsideWindow(chat);
     const pending = pendingSince(outside, store.throughMessageId);
@@ -174,11 +223,19 @@ export async function maybeRefreshThreadSummary(
       text: text.trim(),
       throughMessageId: newest.id,
     });
+    // A reply landed, so whatever was failing has stopped. Clearing the run here rather than at the
+    // top of the call is what makes the backoff recover on its own: the next failure starts again at
+    // one base interval instead of resuming a doubled one from an outage that is over.
+    consecutiveFailures = 0;
+    cooldownUntil = 0;
     return true;
   } catch {
     // Deliberately swallowed. The previous summary stays valid, `throughMessageId` does not
-    // advance, and the same pending turns are retried at the next threshold. A thrown error here
-    // would surface as a failed TURN, which is not what happened.
+    // advance, and the same pending turns are retried — but no sooner than the backoff above, since
+    // the threshold that made them eligible stays crossed and would otherwise re-fire every turn.
+    // A thrown error here would surface as a failed TURN, which is not what happened.
+    consecutiveFailures += 1;
+    cooldownUntil = (deps?.now ?? Date.now)() + failureBackoffMs(consecutiveFailures);
     return false;
   } finally {
     inFlight = false;
