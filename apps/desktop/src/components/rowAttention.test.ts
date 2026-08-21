@@ -261,9 +261,14 @@ describe("stallChipFor — naming the outstanding work", () => {
     // The real shape carries both signals — GitHub reports the PR merged and `merge_adds_nothing`
     // holds — and pairing this with the next test is what isolates `landed` as the operative one:
     // identical fixture minus `landed` answers TRUE.
+    // ⚠️ `landedOnOrigin` IS EXPLICIT NOW, and that is a correction rather than a weakening. The case
+    // this pins is a branch whose work reached ORIGIN main by squash. `landed: true` alone did not
+    // say that: `branch_landed_scope`'s first arms answer `Local` too, so the fixture also described
+    // a local-only landing — which is `merged_local`, a rung `hasUnmergedCommittedWork` calls
+    // outstanding ON PURPOSE. The local-only direction has its own tests in `workflowStage.test.ts`.
     const input = stallInputsFor("idle", NOW, undefined, {
       bs: { ...CLEAN_BS, ahead: 3 },
-      ws: { ...BARE_WS, landed: true, prState: "merged" },
+      ws: { ...BARE_WS, landed: true, landedOnOrigin: true, prState: "merged" },
       stageOverride: "merged",
     });
     expect(input.hasUnlandedWork).toBe(false);

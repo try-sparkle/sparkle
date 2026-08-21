@@ -185,7 +185,12 @@ describe("mayRetire — composed with the real unlanded evidence", () => {
   });
 
   it("retires a SQUASH-LANDED branch that still reads 7 ahead", () => {
-    const ws = { landed: true } as WorkflowState;
+    // ⚠️ `landedOnOrigin` IS EXPLICIT NOW, and that is a correction rather than a weakening. The case
+    // this pins is a branch whose work reached ORIGIN main by squash. `landed: true` alone did not
+    // say that: `branch_landed_scope`'s first arms answer `Local` too, so the fixture also described
+    // a local-only landing — which is `merged_local`, a rung `hasUnmergedCommittedWork` calls
+    // outstanding ON PURPOSE. The local-only direction has its own tests in `workflowStage.test.ts`.
+    const ws = { landed: true, landedOnOrigin: true } as WorkflowState;
     const unlanded = unlandedWorkEvidence({ bs: bs(), ws, stageOverride: "merged" });
     expect(unlanded).toBe(false);
     expect(mayRetire(retirable({ unlanded }))).toEqual({ ok: true });

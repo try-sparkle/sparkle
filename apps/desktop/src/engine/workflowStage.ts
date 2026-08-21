@@ -222,9 +222,16 @@ export function unlandedWorkEvidence(ev: UnlandedInputs): boolean | undefined {
   // is not, and `ahead` stays N forever. Unguarded, this paints a landed agent red `blocked` with
   // nothing able to clear it — a manufactured POSITIVE, costlier than the stall it was chasing.
   //
-  // So it yields to direct reachability: `landed` is the squash case by name (Rust
-  // `merge_adds_nothing` — tip not an ancestor, merging adds nothing), `inOriginMain`/`inLocalMain` the
-  // ancestor case. Each is `true` only from a reading that ran, so this yields to evidence, never a gap.
+  // So it yields to direct reachability — and to the ORIGIN-scoped proofs ONLY: `landedOnOrigin` is
+  // the squash case by name (Rust `merge_adds_nothing`/`cherry_empty` against origin — tip not an
+  // ancestor, merging adds nothing), `inOriginMain` the ancestor case. Each is `true` only from a
+  // reading that ran, so this yields to evidence, never a gap.
+  //
+  // ⚠️ `landed` AND `inLocalMain` ARE NOT IN THAT LIST, and must never be added back. `landed` is a
+  // strict SUPERSET of local reachability (`branch_landed_scope`'s first arm answers `Local` from
+  // the same `ref_contains` behind `in_local_main`), so either of them lets a branch merged into
+  // LOCAL main only — `merged_local`, which this function calls outstanding on purpose — read as
+  // nothing outstanding. See the ⚠️ at the veto itself.
   //
   // ⚠️ `prState === "merged"` IS DELIBERATELY NOT IN THAT LIST. It is the state of the branch's PR, not
   // of the branch: merge PR #1, keep committing, and until a second PR exists the probe still answers
@@ -243,15 +250,47 @@ export function unlandedWorkEvidence(ev: UnlandedInputs): boolean | undefined {
   // positive derived from an ORIGIN-scoped counter is exactly the conflation this function must not
   // make. Left in, the second lap of a lands-locally-without-pushing repo reads as nothing
   // outstanding: lap 1 crosses origin and latches the watermark at `merged`, lap 2 merges three
-  // commits into local main without pushing, and with `inLocalMain` vetoing here the fall-through
-  // consults that stale `merged` watermark and answers `false` over three unpushed commits. Dropping
-  // it costs nothing: when the base IS local (no origin ref) a branch contained in local main has
-  // `ahead === 0`, so this can't fire; when the base is origin, `ahead > 0` over a locally-merged
-  // branch is a CORRECT positive.
-  const alreadyInBase = ev.ws?.landed === true || ev.ws?.inOriginMain === true;
-  if (!alreadyInBase && ev.bs !== undefined && ev.bs.ahead > 0) return true;
-  // A LIVE READING BEATS A STALE WATERMARK (bead `sparkle-qh6j7g`). `alreadyInBase` used to veto
-  // only the `ahead` early return above, so the line below could still manufacture unlanded work out
+  // commits into local main without pushing, and with a local proof vetoing here the fall-through
+  // consults that stale `merged` watermark and answers `false` over three unpushed commits.
+  //
+  // WHAT DROPPING THE LOCAL TERMS CHANGES. Not "nothing" — earlier drafts of this paragraph said
+  // that, reasoning about one term and one gate, and it was wrong on both counts.
+  //
+  // `inLocalMain` is BENEFICIAL, not inert, and it moves BOTH gates, because they share one const.
+  // Put it back and each one breaks a lands-locally-without-pushing shape:
+  //   • the early return stops firing when `ahead > 0` — the second-lap case above, which then falls
+  //     through to a stale `merged` watermark and answers `false` over unpushed commits;
+  //   • the second gate answers `false` outright when `ahead === 0`, since `nothingOutstanding`
+  //     already holds.
+  // Both are pinned: that mutation reds BOTH local-landing tests in `workflowStage.test.ts`
+  // ("LOCAL main is not origin main" and "a SECOND lap merged only into local main").
+  //
+  // `landed` is the one that costs something. In a repo
+  // with NO origin ref, a branch SQUASH-landed into local main is contained in nothing: `ahead` and
+  // `aheadOfBase` stay at N, `landed` is `Local` via `merge_adds_nothing(<local default>)`, and
+  // neither origin term can ever be true — so this returns `true` permanently, with nothing able to
+  // clear it. That is the manufactured POSITIVE the roborev 55456 note above calls costlier than the
+  // stall it chased, and it is accepted here deliberately: `hasRemote: false` is documented as
+  // ambiguous between "probed, no origin" and "did not probe", so this boundary cannot tell an
+  // origin-less repo from an unprobed poll, and guessing wrong the OTHER way retires unpushed work
+  // as landed. If a trustworthy origin-less signal ever reaches this seam, that is the moment to
+  // revisit — not before.
+  //
+  // ⚠️ `landedOnOrigin`, NOT `landed` — and this is the whole point, not a refinement. `landed` is a
+  // strict SUPERSET of local reachability: `branch_landed_scope`'s first arm is
+  // `ref_contains(root, <local default>, tip) -> Local`, the identical call the caller uses for
+  // `in_local_main`. So `inLocalMain: true` IMPLIES `landed: true` on every payload Rust can emit,
+  // and a disjunction naming both is exactly the disjunction naming `landed` alone. Scoping this
+  // veto by removing `inLocalMain` while keeping `landed` therefore changes nothing production can
+  // reach — an inert fix that reads as a real one.
+  //
+  // ONE const for BOTH gates below, deliberately. They ask the same question — "is this branch's
+  // work already on ORIGIN" — and an earlier revision carried two names for it, which read as a
+  // preserved distinction that no longer existed and invited someone to re-add a local term here.
+  const inBaseOnOrigin = ev.ws?.landedOnOrigin === true || ev.ws?.inOriginMain === true;
+  if (!inBaseOnOrigin && ev.bs !== undefined && ev.bs.ahead > 0) return true;
+  // A LIVE READING BEATS A STALE WATERMARK (bead `sparkle-qh6j7g`). The reachability veto used to
+  // gate only the `ahead` early return above, so the line below could still manufacture unlanded work out
   // of `stageOverride` alone — and that watermark is MONOTONIC and only moves when a poll OBSERVES a
   // crossing. An agent whose PR merged while nothing was watching keeps a watermark at
   // `pull_request`, `hasUnmergedCommittedWork` reads that as outstanding work, and the row reports
@@ -267,16 +306,14 @@ export function unlandedWorkEvidence(ev: UnlandedInputs): boolean | undefined {
   // commit means merging WOULD add something. So the new-work cycle still reports `true` through
   // both arms: fresh commits make `landedOnOrigin` false AND move `ahead` off zero.
   //
-  // ⚠️ ORIGIN-SCOPED, and NOT `alreadyInBase` — which also carries the two LOCAL proofs. Where
-  // `origin/<default>` has no remote-tracking ref Rust falls back to the LOCAL default for
-  // `base_for_ahead`, so a branch merged into local main reports `inLocalMain: true` with both
-  // counters at zero. `deriveLiveStage` puts that branch at `merged_local`, and
-  // `hasUnmergedCommittedWork` calls `merged_local` OUTSTANDING on purpose — local-only work still
-  // needs someone to get it the rest of the way. Reusing `alreadyInBase` here would answer `false`
-  // for it, silently retiring the unmerged chip, the `unlanded-work` stall cause and the `mayRetire`
-  // input for exactly the lands-locally-without-pushing repos that are called out elsewhere as a
-  // population not to regress.
-  const inBaseOnOrigin = ev.ws?.inOriginMain === true || ev.ws?.landedOnOrigin === true;
+  // ⚠️ THE SAME `inBaseOnOrigin` AS THE GATE ABOVE, and it must stay that way. Neither gate may
+  // regrow a LOCAL term (`inLocalMain`, or `landed` — which subsumes it, see above). A branch merged
+  // into local main and not pushed reports both counters at zero; `deriveLiveStage` puts it at
+  // `merged_local`, a rung `hasUnmergedCommittedWork` calls OUTSTANDING on purpose, because
+  // local-only work still needs someone to get it the rest of the way. A local term in either gate
+  // answers `false` for it, silently retiring the unmerged chip, the `unlanded-work` stall cause and
+  // the `mayRetire` input for exactly the lands-locally-without-pushing repos called out elsewhere
+  // as a population not to regress.
   const nothingOutstanding =
     ev.ws?.landedOnOrigin === true ||
     ((ev.bs?.ahead ?? 0) === 0 && (ev.ws?.aheadOfBase ?? 0) === 0);

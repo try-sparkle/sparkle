@@ -209,8 +209,11 @@ export function useRosterPublisher(): void {
   const workflowShipped = useRuntimeStore((s) => s.workflowShipped);
   // ⚠️ `workflowState` TOO, and it is the one that matters most for the motivating population
   // (roborev 66006). `unlandedWorkEvidence` clears its `ahead > 0` veto only via
-  // `ws.landed || ws.inOriginMain || ws.inLocalMain` — the SQUASH/REBASE-MERGE case, where `ahead`
-  // never returns to 0, which is most merges here. `setWorkflowState` is written independently of
+  // `ws.landedOnOrigin` — the SQUASH/REBASE-MERGE case, where `ahead` never returns to 0, which is
+  // most merges here — or `ws.inOriginMain`, which is the opposite shape: plain ancestry, where
+  // `ahead` HAS returned to 0. (Both terms are ORIGIN-scoped deliberately: `ws.landed` and
+  // `ws.inLocalMain` used to be in that disjunction and were removed, because they also describe a
+  // LOCAL-only landing, which is outstanding work.) `setWorkflowState` is written independently of
   // `setBranchStatus` and the stage is monotonic once `merged`, so a row that becomes awaiting-close
   // purely through a reachability update would otherwise keep publishing the old token — and for an
   // idle merged agent, `status` and `interaction` are exactly the inputs that have stopped moving.

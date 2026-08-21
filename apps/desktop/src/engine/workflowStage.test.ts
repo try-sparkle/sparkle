@@ -792,16 +792,25 @@ describe("unlandedWorkEvidence — a LIVE reading beats a STALE watermark", () =
   });
 
   it("LOCAL main is not origin main — merged_local is still outstanding work", () => {
-    // `alreadyInBase` carries the local proofs too, and reusing it here would answer `false` for a
-    // branch merged into LOCAL main with both counters at zero — which `deriveLiveStage` puts at
-    // `merged_local`, a rung `hasUnmergedCommittedWork` calls outstanding ON PURPOSE, because
-    // local-only work still needs someone to get it the rest of the way. Retiring it here would
-    // silently take down the unmerged chip, the `unlanded-work` stall cause and the `mayRetire`
-    // input for every repo that lands locally without pushing.
+    // ⚠️ DO NOT DELETE THIS AS REDUNDANT — it is the only fixture in the block with both counters at
+    // zero AND NO ORIGIN PROOF, which makes it the only one that can catch two distinct regressions.
+    // (The both-zero part alone does not single it out: the first test in the block is also `bs(0)`
+    // with `aheadOfBase` defaulted to 0. What is unique is that it expects `true` while
+    // `nothingOutstanding` is true — every other both-zero fixture carries an origin proof and
+    // expects `false`, so the mutants below leave it unchanged.) A branch merged
+    // into LOCAL main only sits at `merged_local`, a rung this function calls outstanding ON
+    // PURPOSE, because local-only work still needs someone to get it the rest of the way. With
+    // `bs(0)`/`aheadOfBase: 0`, `nothingOutstanding` is TRUE here, so:
+    //
+    //   • drop the `inBaseOnOrigin &&` conjunct from the second gate and it returns `false` — this
+    //     assertion flips, and no `bs(3)`/`bs(5)` fixture in the block can see that mutation;
+    //   • regrow a local term on the shared const and it returns `false` too.
+    //
+    // `landed: true` is part of the fixture because Rust cannot emit `inLocalMain` without it.
     expect(
       unlandedWorkEvidence({
         bs: bs(0),
-        ws: ws({ inLocalMain: true, aheadOfBase: 0 }),
+        ws: ws({ inLocalMain: true, landed: true, landedOnOrigin: false, aheadOfBase: 0 }),
         stageOverride: "pull_request",
       }),
     ).toBe(true);
@@ -809,16 +818,48 @@ describe("unlandedWorkEvidence — a LIVE reading beats a STALE watermark", () =
 
   it("a SECOND lap merged only into local main is still outstanding, stale merged watermark or not", () => {
     // The sibling veto's half of the same origin-scoping. Lap 1 crossed origin and latched the
-    // watermark at `merged`; lap 2 merged three commits into LOCAL main without pushing. With
-    // `inLocalMain` allowed to veto the `ahead > 0` positive, the fall-through would consult that
-    // stale `merged` watermark and answer `false` over three unpushed commits.
+    // watermark at `merged`; lap 2 merged three commits into LOCAL main without pushing. Vetoed
+    // here, the fall-through consults that stale `merged` watermark and answers `false` over three
+    // unpushed commits.
+    //
+    // ⚠️ `landed: true` IS PART OF THE FIXTURE AND MUST STAY. An earlier version seeded
+    // `inLocalMain: true` alone, which Rust cannot emit: `branch_landed_scope`'s first arm is
+    // `ref_contains(<local default>, tip) -> Local`, the same call behind `in_local_main`, so local
+    // reachability IMPLIES `landed`. Omitting it made the test red-on-revert (grip) while pinning a
+    // state the poll can never leave in the store — which is how an inert change came to read as
+    // covered.
     expect(
       unlandedWorkEvidence({
         bs: bs(3),
-        ws: ws({ inLocalMain: true, aheadOfBase: 3 }),
+        ws: ws({ inLocalMain: true, landed: true, landedOnOrigin: false, aheadOfBase: 3 }),
         stageOverride: "merged",
       }),
     ).toBe(true);
+  });
+
+  it("…and the SQUASH form of it, which no amount of inLocalMain scoping ever reaches", () => {
+    // A squash into LOCAL main yields `inLocalMain: false` (the tip is an ancestor of nothing) with
+    // `landed: true` scoped Local. This is the repo's documented normal shipping shape, and only a
+    // predicate that ignores `landed` in favour of `landedOnOrigin` reports it as outstanding.
+    expect(
+      unlandedWorkEvidence({
+        bs: bs(3),
+        ws: ws({ landed: true, landedOnOrigin: false, aheadOfBase: 3 }),
+        stageOverride: "merged",
+      }),
+    ).toBe(true);
+  });
+
+  it("…while a squash onto ORIGIN keeps its veto — the protection this gate exists for", () => {
+    // The paired negative, so the veto is narrowed rather than deleted: `ahead` stays at N forever
+    // after a squash land, and `landedOnOrigin` is what proves the work is nonetheless on origin.
+    expect(
+      unlandedWorkEvidence({
+        bs: bs(3),
+        ws: ws({ landed: true, landedOnOrigin: true, aheadOfBase: 3 }),
+        stageOverride: "merged",
+      }),
+    ).toBe(false);
   });
 
   it("a branch in NO base is unaffected by the guard", () => {

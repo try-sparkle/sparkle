@@ -262,7 +262,14 @@ describe("the unlanded rule is SHARED with the sidebar, not a second copy", () =
     seedRoster({ lastPrompt: "go build the thing" });
     seed({
       branchStatus: { [A]: { ...CLEAN_BS, ahead: 3 } },
-      workflowState: { [A]: { ...BARE_WS, landed: true, prState: "merged" } },
+    // ⚠️ `landedOnOrigin` IS EXPLICIT NOW, and that is a correction rather than a weakening. The case
+    // this pins is a branch whose work reached ORIGIN main by squash. `landed: true` alone did not
+    // say that: `branch_landed_scope`'s first arms answer `Local` too, so the fixture also described
+    // a local-only landing — which is `merged_local`, a rung `hasUnmergedCommittedWork` calls
+    // outstanding ON PURPOSE. The local-only direction has its own tests in `workflowStage.test.ts`.
+      workflowState: {
+        [A]: { ...BARE_WS, landed: true, landedOnOrigin: true, prState: "merged" },
+      },
       workflowStage: { [A]: "merged" },
     });
     expect(stallEvidenceFor(A).hasUnlandedWork).toBe(false);
