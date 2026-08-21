@@ -1271,11 +1271,132 @@ fn decide(gate: &ProbeGate, number: u64, knightwatch_override: Option<&str>) -> 
 /// merge is the irreversible half, and a merge that then failed to post its override record would
 /// leave no record at all, the exact state this gate exists to make impossible. So the comment goes
 /// first, and a failure to post refuses the merge.
+/// THE VERCEL REVIEW-AGENT (VADE) GATE — deliberately a SHELL-OUT to `scripts/vade-gate.sh`
+/// rather than a second Rust implementation of its parser.
+///
+/// This is a DEPARTURE from the pattern everything else in this module follows. The knightwatch
+/// probe rules are implemented twice — here and in `scripts/probe-gate.sh` — held together by one
+/// shared fixture corpus, because two implementations of one contract are exactly what that corpus
+/// exists to keep honest. The VADE rules are implemented ONCE, and the reason is the specific shape
+/// of the trap they guard.
+///
+/// Vercel's GraphQL surface returns the author login as the BARE `vercel`, while its REST surface
+/// returns `vercel[bot]`. A gate keyed on the wrong spelling matches NOTHING — it does not error,
+/// it reports every PR as clean, and it does so silently and permanently. That is a defect whose
+/// failure mode is a GREEN LIGHT, and it is precisely the kind that gets fixed on one side and not
+/// the other: the fixed side goes on blocking, so nobody notices the other side never did. A
+/// corpus catches drift only if someone re-runs both suites against it; there is no corpus that
+/// catches a rule nobody remembered was duplicated.
+///
+/// So: one parser, one file, one place to fix it. The cost is a subprocess per merge and a
+/// dependency on the checkout containing the script — both cheap, and both fail SAFE (see below).
+///
+/// Returns `Some(refusal)` when the merge must be refused, `None` when it may proceed.
+fn vade_refusal(root: &str, number: u64) -> Option<String> {
+    let script = std::path::Path::new(root).join("scripts").join("vade-gate.sh");
+    if !script.is_file() {
+        // A checkout without the script (an older worktree, a shallow copy) is not a clean PR, but
+        // it is also not a finding. Warn and proceed: refusing every merge in a checkout that
+        // predates this gate would block work the gate has nothing to say about.
+        tracing::warn!(
+            target: "knightwatch",
+            pr = number,
+            "vade-gate.sh is not present in this checkout; the PR was NOT checked for Vercel review findings"
+        );
+        return None;
+    }
+
+    let mut cmd = Command::new("bash");
+    cmd.arg(&script).arg(number.to_string()).current_dir(root);
+    // THE CHILD NEEDS A LOGIN `PATH`, AND WITHOUT IT THIS GATE FAILS OPEN — SILENTLY, FOREVER.
+    //
+    // A Tauri app launched from Finder inherits `/usr/bin:/bin:/usr/sbin:/sbin`. Both tools
+    // vade-gate.sh probes for — `gh` and `jq` — live in Homebrew's prefix, so BOTH `command -v`
+    // checks fail, the script exits 3, and the could-not-tell arm below warns and returns None.
+    // That is not a degraded gate; it is NO gate, on the one machine the app actually runs on,
+    // with nothing in the UI to say so. It is the same fail-open shape as the `vercel[bot]` login
+    // trap: a green light produced by a lookup that never resolved.
+    //
+    // This is why `read_gate` and `merge_pr` reach for `crate::preflight::gh_program()` rather
+    // than bare `gh`. A subprocess that runs a SCRIPT cannot use that trick — the script does its
+    // own resolution — so it takes the other established idiom in this crate and hands the child
+    // the login shell's PATH, exactly as concierge.rs and claude_chat.rs do.
+    cmd.env("PATH", crate::claude_chat::cached_login_shell_path());
+    apply_noninteractive(&mut cmd);
+    let output = match crate::worktree::output_with_timeout(cmd, READ_TIMEOUT) {
+        Ok(o) => o,
+        Err(e) => {
+            tracing::warn!(
+                target: "knightwatch",
+                pr = number,
+                error = %e,
+                "could not run vade-gate.sh; the PR was NOT checked for Vercel review findings"
+            );
+            return None;
+        }
+    };
+
+    match output.status.code() {
+        // 10 = BLOCKED. The script's own stderr is the refusal text: it names the file, the line,
+        // the finding and the `--decline` escape hatch, and it is the SAME text the shell merge
+        // path prints. Reformatting it here would be a second copy of a user-facing string that has
+        // to stay true to the script's behaviour.
+        Some(10) => {
+            let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let detail = if detail.is_empty() {
+                String::from_utf8_lossy(&output.stdout).trim().to_string()
+            } else {
+                detail
+            };
+            Some(format!(
+                "PR #{number} has an unresolved blocking finding from Vercel's review agent.\n\n\
+                 {detail}\n\n\
+                 Note: the knightwatch override does NOT cover a Vercel finding. It is validated \
+                 and recorded against the knightwatch probe gate, and letting one rationale buy \
+                 both bypasses is the same defect `both_gates_refusal` exists to prevent. A Vercel \
+                 finding has its own record, scoped to ONE thread:\n\
+                 \x20 scripts/vade-gate.sh {number} --decline \"<why this ships unfixed>\" --thread <id>"
+            ))
+        }
+        Some(0) => None,
+        // ANYTHING ELSE IS COULD-NOT-TELL, AND IT WARNS RATHER THAN BLOCKING. This is a CALLER
+        // policy choice, not a laundering of the script's exit 3 into a pass — the script itself
+        // never reports 3 as clear, and this code never claims it did. The reason to fail open
+        // HERE specifically: `--decline` needs a blocking finding to decline, so on a 3 there is
+        // nothing to decline and no reachable remedy. A refusal whose stated remedy cannot be
+        // followed is the shape AGENTS.md calls out, and it would take the app's merge button down
+        // for the duration of any gh hiccup. The CI `vade-gate` job is the backstop that makes a
+        // persistent could-not-tell visible instead of silent.
+        other => {
+            tracing::warn!(
+                target: "knightwatch",
+                pr = number,
+                code = ?other,
+                stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+                "vade-gate.sh could not determine whether PR has Vercel review findings; NOT blocking on that"
+            );
+            None
+        }
+    }
+}
+
 pub(crate) fn enforce(
     root: &str,
     number: u64,
     knightwatch_override: Option<&str>,
 ) -> Result<(), String> {
+    // THE VERCEL GATE RUNS FIRST, and it runs before `read_gate` on purpose.
+    //
+    // Not for speed — for reachability. Both arms below can `return Ok(())` after recording a
+    // knightwatch override, so a VADE check placed after them would be skipped for exactly the PRs
+    // that bypassed something. The override reason is validated against, and recorded against, the
+    // KNIGHTWATCH gate; letting it also clear a Vercel finding the author was never shown is the
+    // "one rationale buys a second bypass" defect that `both_gates_refusal` exists to prevent. A
+    // Vercel finding has its own escape hatch, scoped to one thread.
+    if let Some(refusal) = vade_refusal(root, number) {
+        return Err(refusal);
+    }
+
     let gate = read_gate(root, number);
 
     // `[open]` probes WARN and never block — see the module header for where the warning goes.
@@ -2649,6 +2770,190 @@ mod tests {
              bypass, and without this the same string clears both gates and `coverage_refusal` is \
              never shown to the author"
         );
+    }
+
+    /// THE VERCEL (VADE) GATE IS WIRED INTO `enforce`, AND IT RUNS BEFORE THE ARMS THAT CAN
+    /// `return Ok(())`.
+    ///
+    /// Ordering is the whole assertion, not a style preference. Both the probe-override arm and the
+    /// coverage arm below it can return Ok after recording a knightwatch override — so a VADE check
+    /// placed after either is SKIPPED for exactly the PRs that bypassed something, which is the
+    /// population most likely to also be carrying a Vercel finding. A test that only asserted "the
+    /// call exists somewhere in enforce" would pass for that broken ordering.
+    #[test]
+    fn enforce_checks_the_vade_gate_before_anything_can_return_ok() {
+        let src = include_str!("knightwatch.rs");
+        let start = src.find("pub(crate) fn enforce(").expect("enforce's signature");
+        let body = &src[start..];
+        // Same rule as the slice guard above: an absent delimiter must FAIL, never silently widen
+        // to EOF, or the assertions below start finding their own source literals in `mod tests`.
+        let end = body
+            .find("\n/// THE COVERAGE DECISION, PURE")
+            .expect("the item that follows enforce — re-scope this slice rather than widening it");
+        let body = &body[..end];
+
+        let vade_at = body
+            .find("vade_refusal(root, number)")
+            .expect("enforce must consult the Vercel review gate; without this call the gate is \
+                    inert on the app's merge button while every unit test stays green");
+
+        // It must REFUSE on the verdict, as a statement. `let _ = vade_refusal(…)` compiles, runs
+        // the subprocess, throws the answer away, and passes any substring test for the call.
+        let arm = &body[vade_at..];
+        assert!(
+            arm.contains("return Err(refusal)"),
+            "enforce must RETURN the Vercel refusal — computing it and dropping it is worse than \
+             not calling it, because it costs the subprocess and still merges"
+        );
+
+        // THE ORDERING. Both matches below can return Ok(()) after recording a knightwatch
+        // override, so the VADE check has to precede both.
+        let probe_match = body
+            .find("match decide(&gate, number, knightwatch_override)")
+            .expect("the probe-gate dispatch");
+        assert!(
+            vade_at < probe_match,
+            "the Vercel gate must be consulted BEFORE the probe/override arms — those can return \
+             Ok(()) on a recorded knightwatch override, and a knightwatch rationale must not buy a \
+             bypass of a Vercel finding the author was never shown"
+        );
+        // ...and before the head read too, so a repo whose coverage half is retired still gets it.
+        let coverage_at = body.find("let coverage_verdict =").expect("the coverage verdict");
+        assert!(
+            vade_at < coverage_at,
+            "the Vercel gate must not sit behind the coverage computation, whose early-return paths \
+             would skip it"
+        );
+    }
+
+    /// A CHECKOUT WITHOUT THE SCRIPT IS NOT A CLEAN PR — but it is not a finding either, so it
+    /// warns and proceeds. Drives the REAL function rather than asserting on the source text.
+    #[test]
+    fn vade_refusal_is_absent_when_the_script_is_not_in_the_checkout() {
+        let dir = std::env::temp_dir().join(format!("sparkle-vade-none-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let verdict = vade_refusal(dir.to_str().expect("temp path is utf-8"), 1234);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            verdict.is_none(),
+            "a checkout that predates this gate must not have every merge refused: {verdict:?}"
+        );
+    }
+
+    /// EXIT 10 REFUSES, AND THE SCRIPT'S OWN STDERR IS THE REFUSAL TEXT. This drives the real
+    /// subprocess path — a stub `scripts/vade-gate.sh` that exits 10 — so deleting the `Some(10)`
+    /// arm, or reformatting the detail away, turns this red.
+    #[test]
+    fn vade_refusal_blocks_on_exit_10_and_carries_the_script_s_own_detail() {
+        let dir = std::env::temp_dir().join(format!("sparkle-vade-block-{}", std::process::id()));
+        let scripts = dir.join("scripts");
+        std::fs::create_dir_all(&scripts).expect("temp scripts dir");
+        let script = scripts.join("vade-gate.sh");
+        std::fs::write(
+            &script,
+            "#!/usr/bin/env bash\necho 'BLOCKED — 1 unresolved blocking Vercel review finding' >&2\nexit 10\n",
+        )
+        .expect("write the stub gate");
+
+        let verdict = vade_refusal(dir.to_str().expect("temp path is utf-8"), 4321);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let msg = verdict.expect("exit 10 must refuse the merge");
+        assert!(msg.contains("4321"), "the refusal names the PR: {msg}");
+        assert!(
+            msg.contains("BLOCKED — 1 unresolved blocking Vercel review finding"),
+            "the refusal must carry the SCRIPT's own detail — reformatting it here would be a \
+             second copy of a user-facing string that has to stay true to the script: {msg}"
+        );
+        assert!(
+            msg.contains("--decline"),
+            "the refusal must name the escape hatch, or it is an obstacle rather than a gate: {msg}"
+        );
+    }
+
+    /// THE CHILD GETS A LOGIN `PATH`, so `gh` and `jq` resolve in the packaged app.
+    ///
+    /// This is the test the first cut did not have, and its absence hid a total fail-open: every
+    /// other test here writes a stub that never invokes `gh` or `jq`, so all of them passed while
+    /// the packaged app — whose PATH from Finder is `/usr/bin:/bin:/usr/sbin:/sbin` — could not
+    /// run the real script at all. Asserting on the EFFECT (what the child can actually resolve)
+    /// rather than on the call is what makes it able to fail: delete the `cmd.env("PATH", …)` line
+    /// and this goes red, because the inherited test PATH is not what production inherits.
+    #[test]
+    fn vade_refusal_hands_the_child_a_login_shell_path() {
+        let dir = std::env::temp_dir().join(format!("sparkle-vade-path-{}", std::process::id()));
+        let scripts = dir.join("scripts");
+        std::fs::create_dir_all(&scripts).expect("temp scripts dir");
+        let out = dir.join("seen-path.txt");
+        // The stub records the PATH it was handed, then blocks so the call is a real refusal path.
+        std::fs::write(
+            scripts.join("vade-gate.sh"),
+            format!(
+                "#!/usr/bin/env bash\nprintf '%s' \"$PATH\" > '{}'\necho blocked >&2\nexit 10\n",
+                out.display()
+            ),
+        )
+        .expect("write the stub gate");
+
+        let verdict = vade_refusal(dir.to_str().expect("temp path is utf-8"), 5150);
+        let seen = std::fs::read_to_string(&out).unwrap_or_default();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(verdict.is_some(), "the stub exits 10, so this must refuse");
+        assert!(
+            !seen.is_empty(),
+            "the child received no PATH at all — vade-gate.sh could not resolve gh or jq"
+        );
+        assert_eq!(
+            seen,
+            crate::claude_chat::cached_login_shell_path(),
+            "the child must get the LOGIN shell PATH. Inheriting the app's own PATH means \
+             /usr/bin:/bin:/usr/sbin:/sbin when launched from Finder, where neither gh nor jq \
+             exists — the script then exits 3 and this gate silently allows every merge."
+        );
+    }
+
+    /// COULD-NOT-TELL WARNS AND PROCEEDS, and that is a caller policy choice rather than a
+    /// laundering of exit 3 into a pass. `--decline` needs a blocking finding to decline, so on a 3
+    /// there is nothing to decline and no reachable remedy — a refusal whose stated remedy cannot be
+    /// followed would take the merge button down for the duration of any gh hiccup.
+    #[test]
+    fn vade_refusal_does_not_block_on_could_not_tell() {
+        let dir = std::env::temp_dir().join(format!("sparkle-vade-cnt-{}", std::process::id()));
+        let scripts = dir.join("scripts");
+        std::fs::create_dir_all(&scripts).expect("temp scripts dir");
+        std::fs::write(
+            scripts.join("vade-gate.sh"),
+            "#!/usr/bin/env bash\necho 'could not read PR' >&2\nexit 3\n",
+        )
+        .expect("write the stub gate");
+
+        let verdict = vade_refusal(dir.to_str().expect("temp path is utf-8"), 99);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            verdict.is_none(),
+            "exit 3 must not refuse — there is nothing to decline, so the refusal would be \
+             unescapable: {verdict:?}"
+        );
+    }
+
+    /// ...and the PAIRED case, without which the test above passes for a `vade_refusal` that never
+    /// blocks at all. Exit 0 and exit 3 both proceed; only their REASONS differ, so the pair is
+    /// what proves the function distinguishes them rather than always returning None.
+    #[test]
+    fn vade_refusal_is_absent_on_a_clean_pr() {
+        let dir = std::env::temp_dir().join(format!("sparkle-vade-clean-{}", std::process::id()));
+        let scripts = dir.join("scripts");
+        std::fs::create_dir_all(&scripts).expect("temp scripts dir");
+        std::fs::write(
+            scripts.join("vade-gate.sh"),
+            "#!/usr/bin/env bash\necho 'clear to merge'\nexit 0\n",
+        )
+        .expect("write the stub gate");
+
+        let verdict = vade_refusal(dir.to_str().expect("temp path is utf-8"), 7);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(verdict.is_none(), "a clean PR must merge: {verdict:?}");
     }
 
     /// One reason does not buy two bypasses, asserted on the decision rather than the wiring.
