@@ -54,6 +54,8 @@
 // where a task comes from.
 import { MAX_CONCURRENT_RESEARCH, QUEUE_UNFANNED_MIN_AGE_MS } from "@sparkle/core";
 
+import { endsMidClause } from "../voice/confidence";
+
 import type { QueuedTurn } from "./conciergeTurnQueue";
 
 /**
@@ -310,7 +312,9 @@ export type AutoDispatchSkip =
   /** The oldest re-dispatchable waiter has not waited long enough yet. */
   | "too-young"
   /** It is too short to be a question worth researching. See {@link MIN_DISPATCHABLE_CHARS}. */
-  | "too-short";
+  | "too-short"
+  /** It reads as CUT OFF mid-clause, so there is no whole question in it. See {@link endsMidClause}. */
+  | "fragment";
 
 export type AutoDispatchDecision =
   | {
@@ -456,6 +460,27 @@ function excludeReason(
   }
 
   if (entry.text.trim().length < MIN_DISPATCHABLE_CHARS) return "too-short";
+  // ── A FRAGMENT IS NOT A QUESTION (bead `sparkle-r3wl6f`) ─────────────────────────────────────
+  // Distinct from `too-short` above and NOT a refinement of it: length is the wrong axis entirely.
+  // `we can see that there is` is 24 characters, clears that floor exactly, and is not a question
+  // by any reading. What disqualifies it is its TAIL.
+  //
+  // WHAT THIS COST, measured on one evening: the founder's dictation was being truncated (the other
+  // half of that bead), and SEVEN research agents were dispatched on the resulting fragments. All
+  // seven came back with the same finding — "your message got cut off, there is nothing here to
+  // research" — each having first read NOTES.md, the stash list and the bead backlog hunting for an
+  // antecedent that only ever existed in the conversation. Seven metered children, seven `+1`s on
+  // the row misrepresenting the concierge as delegating, and no answer produced by any of them.
+  //
+  // THIS IS WORTH KEEPING EVEN IF THE TRUNCATION NEVER RECURS, which is why it is a separate fix
+  // rather than a belt on the first one. It is defensive against ANY future source of a cut-off
+  // message — a relay drop, a paste that lost its tail, a hand-typed thought abandoned halfway —
+  // and it costs one string comparison against a message already in hand.
+  //
+  // The message still REACHES the concierge; only the research child is refused. A fragment the
+  // founder wants answered is answered by the concierge asking him to finish it, which is a turn he
+  // was going to spend anyway — not by a subprocess searching the repo for words he never said.
+  if (endsMidClause(entry.text)) return "fragment";
   return null;
 }
 

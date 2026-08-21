@@ -28,30 +28,50 @@ export type Confidence = "high" | "normal" | "low" | "verylow";
 /**
  * The silence each tier buys before the send fires, in milliseconds.
  *
- * NO CAP ON THE TOTAL WAIT (PRD §4, decided). A sentence that keeps reading as `verylow` waits ten
- * seconds, then ten more from the next chunk, indefinitely — because "I can't tell if you're done"
- * has no honest expiry. A cap would convert exactly the least-confident case into an automatic
- * send, which is backwards.
- */
-/**
- * The 20% the founder asked for, applied to the THRESHOLDS rather than to the animation.
+ * NO CAP ON THE TOTAL WAIT (PRD §4, decided). A sentence that keeps reading as `verylow` waits its
+ * thirty seconds, then thirty more from the next chunk, indefinitely — because "I can't tell if
+ * you're done" has no honest expiry. A cap would convert exactly the least-confident case into an
+ * automatic send, which is backwards.
  *
- * He described the visible drain as too fast. The honest place to fix that is here, not in the
- * sweep's CSS: the sweep is a PICTURE OF THE DEADLINE (SendModeTray draws `remaining` straight off
- * this clock), so slowing the picture while leaving the deadline where it is would make the control
- * lie — the fill would still be travelling when the message had already gone. Moving the deadline
- * keeps the two the same fact.
+ * ══ RETUNED 2026-08-20 — THE FOUNDER WAS BEING CUT OFF MID-SENTENCE (bead `sparkle-r3wl6f`) ═════
+ * Eight consecutive dictated messages reached the concierge as fragments: `The`, `we can see that
+ * there is`, `Let's just take this one here. And so`. Every break landed on a natural speech pause,
+ * because he DICTATES WHILE READING THE UI — a pause to look at the screen is the normal case here,
+ * not the exception, and the old ladder finalised the utterance inside it.
  *
- * Kept as a named multiplier over the original values rather than four rewritten literals, so the
- * tuning stays legible as a tuning and the ladder's shape (1 : 3 : 5 : 10) survives it.
+ * The tier VERDICTS were already right: `fix the header and` scored `verylow` then and scores
+ * `verylow` now. What was wrong was the price of that verdict. `verylow` bought 12 seconds, and a
+ * stare at the screen outlasts 12 seconds routinely. So this is a retune of the RUNGS, not of the
+ * judgement — see {@link confidence} for the one judgement that did change (a trailing comma).
+ *
+ * The two numbers the founder chose himself, offered against worked examples of each:
+ *
+ *   • `high` 1200 → 2000. THE ROW THAT ACTUALLY CUT HIM OFF MOST. Deepgram's `smart_format` will
+ *     put a full stop on an unfinished thought — `So these are the sent out to the build agents.`
+ *     is garbled mid-sentence and carries a period, so it scored `high` and went in 1.2s. A glance
+ *     at the screen is longer than that. He picked 2s over 3s and 5s: the lighter touch.
+ *   • `verylow` 12000 → 30000. He picked this over "never auto-send, hold until you press send",
+ *     knowing what it means: at 30s he still gets cut off, just far less often. If tonight's
+ *     pattern repeats at 30s the answer is the hold, and this comment is the record of that
+ *     decision being deliberate rather than a compromise nobody noticed.
+ *
+ * `low` is the agent's, and it is the only number here nobody chose: it has to sit between the two
+ * he set, and 7s keeps it nearer `normal` than `verylow` in the spirit of the lighter touch he
+ * picked. Move it freely — unlike the two above, no decision is recorded in it.
+ *
+ * ── WHY THIS IS NO LONGER A MULTIPLIER OVER A 1 : 3 : 5 : 10 SHAPE ─────────────────────────────
+ * It used to be `CONFIDENCE_PACE` (1.2) times the PRD's ratio, which kept an earlier "20% slower"
+ * tuning legible as a tuning. That form cannot express this change: the whole point is that the
+ * top and bottom rungs move by different factors (1.7x and 2.5x), because a clean sentence and a
+ * dangling `and` are not the same kind of wrong to get wrong. Preserving the ratio would mean
+ * dragging `high` to 6s to reach a 30s `verylow` — a wait he explicitly declined. Four literals
+ * with their reasons attached beats a shape that no longer describes the decision.
  */
-export const CONFIDENCE_PACE = 1.2;
-
 export const CONFIDENCE_THRESHOLD_MS: Record<Confidence, number> = {
-  high: 1_000 * CONFIDENCE_PACE, // 1200
-  normal: 3_000 * CONFIDENCE_PACE, // 3600
-  low: 5_000 * CONFIDENCE_PACE, // 6000
-  verylow: 10_000 * CONFIDENCE_PACE, // 12000
+  high: 2_000,
+  normal: 4_000,
+  low: 7_000,
+  verylow: 30_000,
 };
 
 /** The threshold this tier is measured against. */
@@ -117,6 +137,30 @@ const QUESTION_OPENERS = new Set([
 const TERMINAL_PUNCTUATION = /[.!?！？。]$/;
 
 /**
+ * Punctuation that ends a CLAUSE but not a THOUGHT — the written form of "I have not finished".
+ *
+ * ══ THE FOUNDER NAMED THIS ONE AND NOTHING IMPLEMENTED IT (bead `sparkle-r3wl6f`) ══════════════
+ * *"refuse to finalise on a trailing conjunction, article or comma."* The first two were already
+ * handled by {@link TRAILING_CONJUNCTIONS}. The comma was not, and it was not merely missing — it
+ * was UNREACHABLE, which is why nobody noticed. {@link bareWord} strips punctuation from a token's
+ * edges so `"button,"` compares equal to `"button"`, so by the time the tail was inspected the
+ * comma had already been thrown away. There was no line to fix; the character never survived to be
+ * tested. Measured cost: `there are the actual tasks here. Each one of these tasks,` — a sentence
+ * that stops ON A COMMA, as unambiguous a "more is coming" as speech offers — scored `low` and was
+ * sent 6 seconds later, mid-thought.
+ *
+ * So this is tested against the RAW TRIMMED TEXT, before tokenisation, and that ordering is the
+ * whole fix rather than an implementation detail.
+ *
+ * The semicolon, colon and dash join it because they dangle identically ("here's the problem:",
+ * "two things —"), and `smart_format` emits all of them. The ELLIPSIS is here for a reason stated
+ * one line above: it is deliberately absent from `TERMINAL_PUNCTUATION` because it is a trail-off,
+ * and a trail-off is exactly this category. `...` is matched as well as `…` — the three-dot form
+ * ends in a `.` and would otherwise read as a full stop and score `high`, which is backwards.
+ */
+const MID_CLAUSE_PUNCTUATION = /(\.\.\.|[,;:…–—-])$/;
+
+/**
  * Past this many words, an utterance with no terminal punctuation at all stops reading as a terse
  * complete instruction ("ship it") and starts reading as someone still mid-thought.
  *
@@ -138,6 +182,39 @@ function words(transcript: string): string[] {
     .split(/\s+/)
     .map(bareWord)
     .filter((w) => w.length > 0);
+}
+
+/**
+ * Does this text stop MID-CLAUSE — a dangling function word, or a comma?
+ *
+ * The strongest "do not send" signal available without a model, and the exact check
+ * {@link confidence} makes below for its `verylow` tier. Exported so the rule lives in ONE place,
+ * the same reason {@link endsMidThought} is exported: `engine/conciergeAutoDispatch` asks this
+ * question of a message already sitting in the concierge's queue, deciding whether to spend a
+ * metered research child on it. A second copy of the word list at that layer would drift from this
+ * one on the first edit to either.
+ *
+ * ── DELIBERATELY NARROWER THAN `verylow`, AND THE GAP IS LOAD-BEARING ─────────────────────────
+ * `confidence` returns `verylow` for this AND for an unclosed question — an utterance that opened
+ * like a question and never got its mark. That second rule is right for the countdown (waiting
+ * longer costs nothing) and WRONG for the dispatcher, because `why is the DMG build red` is a
+ * genuine research question that simply lost its question mark. Folding the two would make the
+ * dispatch guard refuse exactly the messages research exists to serve. So callers who want "is
+ * this cut off" get this; callers who want "how finished does this sound" get `confidence`.
+ *
+ * NOT a claim about the SPEAKER, only about the TEXT — same posture as `endsMidThought`. A tail
+ * like `and` reads as unfinished whether a transcriber cut it, a countdown fired early, or the
+ * writer changed their mind. Every caller is asking whether MORE was coming.
+ */
+export function endsMidClause(text: string): boolean {
+  const trimmed = text.trim();
+  if (trimmed === "") return false;
+  // RAW TEXT FIRST — see MID_CLAUSE_PUNCTUATION on why tokenising before this check is what made
+  // the trailing comma unreachable for as long as it was.
+  if (MID_CLAUSE_PUNCTUATION.test(trimmed)) return true;
+  const w = words(trimmed);
+  const last = w[w.length - 1] ?? "";
+  return TRAILING_CONJUNCTIONS.has(last);
 }
 
 /**
@@ -184,10 +261,14 @@ export function confidence(transcript: string): Confidence {
   const endsWithQuestionMark = /[?？]$/.test(trimmed);
 
   // ── verylow — the speaker is demonstrably mid-clause ────────────────────────────────────────
-  // A dangling conjunction/preposition/auxiliary beats everything, INCLUDING a terminal mark:
+  // A dangling conjunction/preposition/auxiliary — or a trailing comma — beats everything,
+  // INCLUDING a terminal mark:
   // "let's deploy it, and." is punctuation landing on an unfinished clause, which is a transcription
   // artefact rather than a finished thought.
-  if (TRAILING_CONJUNCTIONS.has(last)) return "verylow";
+  // Delegated to `endsMidClause` above — same condition, one definition, so the dispatch guard's
+  // copy of this question cannot drift. It also folds in the TRAILING COMMA, which the tokenised
+  // `last` could never see: `bareWord` had already stripped it.
+  if (endsMidClause(trimmed)) return "verylow";
 
   // An UNCLOSED QUESTION — it opened like a question and never got its mark. Only when nothing else
   // terminated it either: "how do I ship this. ok" has landed somewhere, however oddly.

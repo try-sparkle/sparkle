@@ -2,11 +2,11 @@ import { describe, it, expect } from "vitest";
 import {
   confidence,
   thresholdMs,
-  CONFIDENCE_PACE,
   CONFIDENCE_THRESHOLD_MS,
   LONG_UTTERANCE_WORDS,
   type Confidence,
   endsMidThought,
+  endsMidClause,
 } from "./confidence";
 
 /**
@@ -116,22 +116,36 @@ describe("confidence — purity", () => {
 });
 
 describe("thresholds", () => {
-  it("keeps the PRD's 1 : 3 : 5 : 10 SHAPE, paced by CONFIDENCE_PACE", () => {
-    // The founder asked for the countdown to run 20% slower, so the absolute numbers moved
-    // (1200 / 3600 / 6000 / 12000). Asserted as the PRD RATIO times the pace multiplier rather than
-    // as four fresh literals: the ladder's shape is the decision, the pace is a tuning knob, and
-    // re-pinning literals here would just have to be rewritten by the next tuning without ever
-    // catching a real regression.
+  it("pins the rungs the founder chose after being cut off mid-sentence", () => {
+    // ══ WHY THIS IS FOUR LITERALS AND NOT A RATIO ═══════════════════════════════════════════
+    // It used to assert `1 : 3 : 5 : 10` times a pace multiplier, on the reasoning that the shape
+    // was the decision and the pace a knob. That stopped being true (bead `sparkle-r3wl6f`): the
+    // top and bottom rungs now move by different factors, deliberately, because a clean sentence
+    // and a dangling `and` are not the same kind of wrong to get wrong. A ratio cannot express
+    // that, and keeping one would have forced a 6s `high` to reach a 30s `verylow` — a wait the
+    // founder explicitly declined.
+    //
+    // Two of these four are RECORDED DECISIONS, not tuning, which is the other reason to spell
+    // them: he was shown worked examples of 2s / 3s / 5s and picked 2s, and shown "hold forever"
+    // against 30s and picked 30s. Someone retuning these should have to read that.
     expect(CONFIDENCE_THRESHOLD_MS).toEqual({
-      high: 1_000 * CONFIDENCE_PACE,
-      normal: 3_000 * CONFIDENCE_PACE,
-      low: 5_000 * CONFIDENCE_PACE,
-      verylow: 10_000 * CONFIDENCE_PACE,
+      high: 2_000, // his choice — the rung that a glance at the screen used to blow past
+      normal: 4_000, // his choice
+      low: 7_000, // the agent's — nobody chose it; it only has to sit between the two above
+      verylow: 30_000, // his choice, over "never auto-send"
     });
-    // …and the shape itself, independent of the pace, so a bad multiplier cannot quietly flatten it.
-    expect(thresholdMs("normal") / thresholdMs("high")).toBeCloseTo(3, 5);
-    expect(thresholdMs("low") / thresholdMs("high")).toBeCloseTo(5, 5);
-    expect(thresholdMs("verylow") / thresholdMs("high")).toBeCloseTo(10, 5);
+  });
+
+  it("gives a mid-clause tail enough room for a pause spent reading the screen", () => {
+    // The DEFECT, stated as a property rather than as a number: the founder dictates while reading
+    // the UI, so the rung that a dangling word earns has to outlast a stare at the screen. Twelve
+    // seconds did not, and eight consecutive messages were truncated. Pinned as a relation to the
+    // observed behaviour so a future retune has to argue with the evidence, not just edit a literal.
+    const A_LONG_STARE_MS = 15_000;
+    expect(thresholdMs("verylow")).toBeGreaterThan(A_LONG_STARE_MS);
+    // …and a clean sentence must outlast an ordinary glance, which is what `smart_format` putting a
+    // full stop on an unfinished thought turns into a truncated send.
+    expect(thresholdMs("high")).toBeGreaterThan(1_500);
   });
 
   it("keeps every tier above the tray's one-second sweep floor", () => {
@@ -158,10 +172,11 @@ describe("thresholds", () => {
   });
 
   it("has no upper cap — verylow is the longest wait and it is finite per evaluation", () => {
-    // PRD §4: no cap on the TOTAL wait. Each re-evaluation re-imposes verylow's 10s from the
+    // PRD §4: no cap on the TOTAL wait. Each re-evaluation re-imposes verylow's 30s from the
     // accumulated clock, so a sentence that keeps trailing off waits indefinitely by construction
     // rather than by a special case. See autoSendTimer.
-    expect(thresholdMs("verylow")).toBe(10_000 * CONFIDENCE_PACE);
+    expect(thresholdMs("verylow")).toBe(CONFIDENCE_THRESHOLD_MS.verylow);
+    expect(thresholdMs("verylow")).toBeGreaterThan(thresholdMs("low"));
   });
 });
 
@@ -209,5 +224,55 @@ describe("endsMidThought", () => {
     const cut = "go through the migration files and check that every one of them applies";
     expect(endsMidThought(cut)).toBe(true);
     expect(confidence(cut)).toBe("low");
+  });
+});
+
+describe("endsMidClause — the shared 'is this cut off' predicate", () => {
+  // ONE definition, two callers: this rail's `verylow` tier and `engine/conciergeAutoDispatch`'s
+  // refusal to spend a research child on a fragment. The cases below are the founder's own
+  // truncated messages, verbatim from bead `sparkle-r3wl6f`.
+  const CUT_OFF = [
+    "The",
+    "we can see that there is",
+    "we can see that there is the",
+    "Is this the",
+    "Let's just take this one here. And so",
+    "there are the actual tasks here. Each one of these tasks,", // the trailing COMMA
+    "here's the problem:",
+    "two things —",
+    "and I was thinking...",
+  ];
+  for (const text of CUT_OFF) {
+    it(`reads as cut off: ${JSON.stringify(text)}`, () => {
+      expect(endsMidClause(text)).toBe(true);
+      // …and the rail must price it as such. These two travel together by construction, but a
+      // reader should not have to trace `confidence` to know it.
+      expect(confidence(text)).toBe("verylow");
+    });
+  }
+
+  // ── THE OTHER DIRECTION, WHICH IS THE ONE THAT COSTS SOMETHING IF IT BREAKS ─────────────────
+  // A predicate that answered `true` to everything would pass every row above while making the
+  // dispatch guard refuse all research and the countdown never fire. These are messages that must
+  // stay dispatchable, and the second is the specific false positive the narrow definition exists
+  // to avoid: an unclosed question is `verylow` for the COUNTDOWN and must not be a `fragment` for
+  // the DISPATCHER, because it is exactly the kind of thing research is for.
+  const WHOLE = [
+    "why is the DMG build red", // unclosed question — verylow, but NOT a fragment
+    "why is the DMG build red?",
+    "Add a login button.",
+    "ship it",
+    "Look into the flaky test in worktree.rs",
+  ];
+  for (const text of WHOLE) {
+    it(`does NOT read as cut off: ${JSON.stringify(text)}`, () => {
+      expect(endsMidClause(text)).toBe(false);
+    });
+  }
+
+  it("is empty-safe and whitespace-insensitive", () => {
+    expect(endsMidClause("")).toBe(false);
+    expect(endsMidClause("   ")).toBe(false);
+    expect(endsMidClause("  fix the header and \t")).toBe(true);
   });
 });

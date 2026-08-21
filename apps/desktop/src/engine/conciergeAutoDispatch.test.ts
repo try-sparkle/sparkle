@@ -590,6 +590,59 @@ describe("fail-closed guards", () => {
       "dispatch",
     );
   });
+
+  // ══ A FRAGMENT IS NOT A QUESTION (bead `sparkle-r3wl6f`) ═══════════════════════════════════
+  // One evening the founder's dictation was being truncated, and SEVEN research agents were
+  // dispatched on the resulting fragments. All seven returned the same finding — "your message got
+  // cut off, there is nothing here to research" — each having first read NOTES.md, the stash list
+  // and the bead backlog looking for an antecedent that only existed in the conversation.
+  it("refuses a message that reads as CUT OFF mid-clause", () => {
+    // The founder's actual truncated messages, verbatim from the bead.
+    for (const text of [
+      "we can see that there is",
+      "we can see that there is the",
+      "Let's just take this one here. And so",
+      "there are the actual tasks here. Each one of these tasks,",
+    ]) {
+      expect(decideAutoDispatch(obs({ waiting: [{ ...waiter("w1", OLD), text }] }))).toEqual({
+        action: "none",
+        reason: "fragment",
+      });
+    }
+  });
+
+  it("reports `fragment` rather than `too-short` for a fragment that clears the length floor", () => {
+    // THE TWO GUARDS ARE ON DIFFERENT AXES, and this pins that they are not collapsible. The first
+    // string is 24 characters — it clears MIN_DISPATCHABLE_CHARS EXACTLY, so the length guard lets
+    // it straight through and only the tail disqualifies it. If someone later folds this rule into
+    // the length check, the reason reported here changes and this test says so.
+    const exactly = "we can see that there is";
+    expect(exactly.length).toBe(MIN_DISPATCHABLE_CHARS);
+    expect(decideAutoDispatch(obs({ waiting: [{ ...waiter("w1", OLD), text: exactly }] }))).toEqual({
+      action: "none",
+      reason: "fragment",
+    });
+  });
+
+  // ── AND THE DIRECTION THAT COSTS SOMETHING IF IT BREAKS ────────────────────────────────────
+  // A guard that refused everything would satisfy every assertion above while silently switching
+  // auto-dispatch off — the feature the founder asked for precisely because the concierge kept
+  // forgetting to delegate. These must still dispatch.
+  it("…and still dispatches whole questions, including one that lost its question mark", () => {
+    for (const text of [
+      "why is the DMG build red?",
+      // NOT a fragment, though `confidence` scores it `verylow` — an unclosed question is exactly
+      // what research is for, and folding the countdown's rule in here would refuse it.
+      "why is the DMG build red and what changed",
+      "Look into the flaky test in worktree.rs",
+      "Find out which PRs are blocked on checks right now.",
+    ]) {
+      expect(
+        decideAutoDispatch(obs({ waiting: [{ ...waiter("w1", OLD), text }] })).action,
+        `${JSON.stringify(text)} must still be dispatchable`,
+      ).toBe("dispatch");
+    }
+  });
 });
 
 describe("what the concierge is told", () => {

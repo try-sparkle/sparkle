@@ -84,8 +84,71 @@ export const THRESHOLD_DROP_GRACE_MS = 600;
  * countdown that was suspended — the app backgrounded, the machine slept, a debugger paused the
  * event loop — resumes with an elapsed time measured against a wall clock the user was not present
  * for, and firing on that is sending a message nobody watched. `evaluate` disarms instead.
+ *
+ * See {@link staleBoundMs} for the bound this actually feeds, and why it is not simply this number.
  */
 export const AUTO_SEND_STALE_MS = 30_000;
+
+/**
+ * The slack a countdown gets PAST its own deadline before the staleness rule can claim it.
+ *
+ * One second against a 100ms tick (`useAutoSend.AUTO_SEND_TICK_MS`), so ten ticks' worth of event
+ * loop jitter, GC, or a slow render still lands inside it. It exists only so a tier whose threshold
+ * meets or exceeds {@link AUTO_SEND_STALE_MS} can reach its own deadline at all.
+ */
+export const STALE_DEADLINE_GRACE_MS = 1_000;
+
+/**
+ * The elapsed silence at which this countdown stops being something the user watched.
+ *
+ * ══ WHY THIS IS A `max` AND NOT EITHER HALF ON ITS OWN (bead `sparkle-r3wl6f`) ══════════════════
+ * Both obvious forms are wrong, in opposite directions, and this rail hit each in turn.
+ *
+ * A FLAT `AUTO_SEND_STALE_MS` — what this was — is a silent ceiling on the whole confidence ladder.
+ * `evaluate` tests staleness one line BEFORE the fire branch, so no tier can ever be tuned to 30s
+ * or beyond: it reaches its deadline and is abandoned on the same tick. That went live the moment
+ * `verylow` was retuned to exactly 30_000, and it would have delivered the founder "never
+ * auto-send" — the option he was shown and explicitly declined — as a behaviour change with no
+ * error and no failing test.
+ *
+ * A PURELY TIER-RELATIVE `thresholdFor(state) + AUTO_SEND_STALE_MS` lifts that ceiling and opens a
+ * worse hole, which is the one roborev caught on the first attempt at this fix: it scales the
+ * unwatched window WITH the tier, handing the widest window to the least-confident tier. The lid
+ * closes 1s into a `verylow` countdown on `we can see that there is`; 45s later the first tick
+ * after wake sees `elapsed = 45_000`, which is under `30_000 + 30_000`, so the half-sentence is
+ * dispatched to an agent on wake. That is precisely the send the guard exists to refuse, and the
+ * flat bound DID refuse it.
+ *
+ * The `max` keeps the flat bound wherever it is the stricter of the two — every tier below 30s, so
+ * `high`/`normal`/`low` behave EXACTLY as before this bead — and only lifts it for a tier that
+ * would otherwise be unable to fire, by the one second of {@link STALE_DEADLINE_GRACE_MS} rather
+ * than by another full 30. `verylow` therefore gets a 1s window past its deadline instead of 18s,
+ * making the guard TIGHTER than it was, not looser.
+ *
+ * ── WHAT THIS IS A PROXY FOR, STATED PLAINLY ───────────────────────────────────────────────────
+ * The honest measure of "nobody was present" is a GAP BETWEEN CONSECUTIVE TICKS: if the loop is
+ * running, `evaluate` lands within ~100ms of the deadline, so any large elapsed overshoot means the
+ * ticks stopped. That was the reviewer's suggested fix and it is the better statement of the rule.
+ * It is not what runs here because it needs a `lastEvaluatedAt` written into the state on EVERY
+ * tick — ten new state objects a second where the `wait` branch currently returns the same object
+ * by identity, which is what keeps the host from re-rendering the rail at 10Hz while it counts.
+ *
+ * The one case the proxy admits and a tick-gap detector would not: a freeze that ends inside the
+ * grace — between the deadline and one second past it — still fires. That is a ~1s window per
+ * countdown, against ~28s under the flat bound, so it is a strict improvement rather than a
+ * remaining instance of the same bug.
+ *
+ * ── AND WHY THE GRACE CANNOT SIMPLY BE THE WHOLE RULE ──────────────────────────────────────────
+ * `thresholdFor(state) + STALE_DEADLINE_GRACE_MS` alone reads as the tight, tier-independent
+ * answer, and it breaks {@link THRESHOLD_DROP_GRACE_MS}. When a late chunk drops the tier, elapsed
+ * is legitimately far past the NEW threshold — 25s of accumulated `verylow` silence against a
+ * freshly-computed `high` — with the loop running the whole time. A 1s bound calls that stale and
+ * throws away a countdown the user was watching, instead of firing it after the visible 600ms the
+ * drop-grace promises. The flat floor is what covers that case, which is the second reason it stays.
+ */
+export function staleBoundMs(state: AutoSendState): number {
+  return Math.max(AUTO_SEND_STALE_MS, thresholdFor(state) + STALE_DEADLINE_GRACE_MS);
+}
 
 /** What the rail is doing, and therefore what it draws. */
 export type AutoSendPhase =
@@ -459,7 +522,9 @@ export function evaluate(state: AutoSendState, now: number): AutoSendDecision {
       state: { ...state, phase: "listening", silenceStartedAt: null, fireNoEarlierThan: null },
     };
   }
-  if (elapsedMs(state, now) >= AUTO_SEND_STALE_MS) {
+  // See `staleBoundMs`: the flat bound everywhere it is the stricter of the two, lifted by exactly
+  // one second only for a tier that could otherwise never reach its own deadline.
+  if (elapsedMs(state, now) >= staleBoundMs(state)) {
     return {
       action: "stale",
       state: { ...state, phase: "listening", silenceStartedAt: null, fireNoEarlierThan: null },

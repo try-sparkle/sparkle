@@ -250,14 +250,20 @@ describe("staleness — a countdown nobody was present for does not fire on its 
     // watching a fill drain, and this rail's whole bargain is that they were.
     const t0 = 0;
     const s = counting("fix the header", t0);
-    const d = evaluate(s, t0 + AUTO_SEND_STALE_MS);
+    // MEASURED FROM THE TIER'S OWN DEADLINE, not from the start of the silence (bead
+    // `sparkle-r3wl6f`). The absolute form was a silent ceiling on the confidence ladder: no tier
+    // could be tuned to 30s or beyond, because this check runs one line ahead of the fire branch
+    // and would abandon the countdown on the tick it came due. The suspend this guards is unchanged
+    // — a freeze of the margin's length past the deadline is still a message nobody watched.
+    const d = evaluate(s, t0 + thresholdMs(s.tier) + AUTO_SEND_STALE_MS);
     expect(d.action).toBe("stale");
     expect(d.state.phase).toBe("listening");
     expect(d.state.silenceStartedAt).toBeNull();
   });
 
   it("still fires normally just under the staleness bound", () => {
-    // verylow's window is nowhere near the staleness bound, so ordinary operation is untouched.
+    // The staleness margin sits a full 30s BEYOND whatever the tier's own deadline is, so
+    // ordinary operation is untouched at every rung — including a `verylow` retuned to 30s.
     const t0 = 0;
     const s = counting("send the diff to", t0);
     expect(evaluate(s, t0 + VERYLOW).action).toBe("fire");

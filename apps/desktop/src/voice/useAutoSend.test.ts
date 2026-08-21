@@ -613,7 +613,9 @@ describe("keep talking and it waits — ON THE ON-DEVICE PATH TOO", () => {
     resumeSpeaking(true);
     expect(result.current.phase).not.toBe("counting");
     // …and it stays uncounted right through the threshold it would otherwise have fired at.
-    await tick(2000);
+    // DERIVED, not the literal 1200 this used to be: the rung moved to 2000 (bead
+    // `sparkle-r3wl6f`) and a hardcoded span stops covering the deadline it claims to cover.
+    await tick(HIGH + AUTO_SEND_TICK_MS);
     expect(onFire).not.toHaveBeenCalled();
   });
 
@@ -625,7 +627,7 @@ describe("keep talking and it waits — ON THE ON-DEVICE PATH TOO", () => {
     resumeSpeaking(true);
     speechEnds();
     expect(result.current.phase).not.toBe("counting");
-    await tick(2000);
+    await tick(HIGH + AUTO_SEND_TICK_MS);
     expect(onFire).not.toHaveBeenCalled();
   });
 
@@ -635,7 +637,7 @@ describe("keep talking and it waits — ON THE ON-DEVICE PATH TOO", () => {
     speechEnds(); // suppressed — still talking
     resumeSpeaking(false); // the VAD falls: they really did stop
     speechEnds(); // the next closed segment arms
-    await tick(1200);
+    await tick(HIGH + AUTO_SEND_TICK_MS);
     expect(onFire).toHaveBeenCalledTimes(1);
   });
 
@@ -681,7 +683,7 @@ describe("keep talking and it waits — ON THE ON-DEVICE PATH TOO", () => {
     resumeSpeaking(true); // they carry straight on into the command
     update({ micLive: true }); // the claim lands mid-sentence → (3b) replays into the guard
     expect(result.current.phase).not.toBe("counting");
-    await tick(2000);
+    await tick(HIGH + AUTO_SEND_TICK_MS);
     expect(onFire).not.toHaveBeenCalled();
   });
 
@@ -695,7 +697,7 @@ describe("keep talking and it waits — ON THE ON-DEVICE PATH TOO", () => {
     update({ micLive: true }); // hold consumed and refused
     resumeSpeaking(false); // they finish the command; the VAD falls
     speechEnds(); // that segment closes and emits its own boundary
-    await tick(1200);
+    await tick(HIGH + AUTO_SEND_TICK_MS);
     expect(onFire).toHaveBeenCalledTimes(1);
   });
 
@@ -714,7 +716,7 @@ describe("keep talking and it waits — ON THE ON-DEVICE PATH TOO", () => {
     const { onFire } = setup();
     expect(useDictationStore.getState().onDeviceSpeech).toBe(false);
     speechEnds();
-    await tick(1200);
+    await tick(HIGH + AUTO_SEND_TICK_MS);
     expect(onFire).toHaveBeenCalledTimes(1);
   });
 });
