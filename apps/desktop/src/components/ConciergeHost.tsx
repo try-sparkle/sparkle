@@ -5044,6 +5044,25 @@ export function ConciergeHost({
       // reaches by pausing the concierge mid-queue, and the failure is silent and permanent.
       (err) => {
         console.warn("concierge: turn failed to start:", err);
+        // ══ A SUPERSEDED DISPATCH OWNS NOTHING (roborev 66373) ═════════════════════════════════
+        // `startConciergeTurn` is not awaited before the next dispatch, so `mergeIntoRunning` can
+        // re-dispatch the same run — a NEW `RunningRun` that CONTAINS this dispatch's entries —
+        // while this promise is still pending. Everything below describes THE TURN IN FLIGHT: the
+        // typing indicator, the awaited-bubble pointer, the `refused` stamps, the `neverSentRef`
+        // re-entries and the drain. Running any of it on behalf of a dispatch that has been
+        // superseded damages the turn that replaced it: it stamps "Not sent" on a bubble the live
+        // turn is actively answering, suppresses that bubble's "Answered below" anchor when the
+        // reply lands, drops the typing indicator mid-stream, and — via `drainQueueRef` — calls
+        // `turnFinished` on a `running` that is still streaming, discarding it and promoting the
+        // next waiter. Narrowing the list this handler reads (below) was not enough; the teardown
+        // itself is the hazard, which is why the guard is here rather than inside the branches.
+        //
+        // Reference identity is the test because it is exact: every non-null `running` in
+        // `engine/conciergeTurnQueue` is written together with a `dispatch` of THE SAME object
+        // (lines 221/254/364), so `running !== run` means precisely "a later dispatch, or none, owns
+        // this slot now". `services/concierge.ts`'s `isSupersededDetail` branch refuses to tear down
+        // a live turn for the same reason.
+        if (turnQueueRef.current.running !== run) return;
         setTyping(false);
         awaitingBubbleRef.current = null;
         setAwaitingId(null);
@@ -5078,10 +5097,36 @@ export function ConciergeHost({
           // caught and routed through `dispatchLocalError` — so this is the DEFENSIVE branch. It is
           // also the branch that exists precisely for a future transient rejection, which is when
           // an unguarded version would start losing questions quietly.
-          neverSentRef.current.add(entry.bubbleId);
+          //
+          // ══ EVERY MESSAGE IN THE RUN, NOT JUST THE HEAD (roborev 65842) ══════════════════════
+          // A turn answers a RUN now, and this branch read only `entry`. Messages 2..N were already
+          // removed from `neverSentRef` by `dispatchTurn`, are no longer in `waiting` or `delegated`
+          // (they were absorbed into `running`), and `turnFinished` discards the run wholesale — so
+          // a head-only mark drops them with no mark, no notice and no re-queue, and the next
+          // settled reply claims them as "Answered below" for a question the brain never received.
+          // That is the precise over-claim the paragraph above exists to prevent, reintroduced one
+          // message along. The sticky branch below was updated for runs and this one was not, which
+          // made it an asymmetry rather than a decision.
+          //
+          // ══ THIS DISPATCH'S OWN `entries`, NOT `runEntriesRef` (roborev 66301) ═══════════════
+          // `runEntriesRef` OUTLIVES the turn that set it — that is why the read at line ~4502 is
+          // gated on `awaitingId` — and `startConciergeTurn` is not awaited before the next
+          // dispatch: `mergeIntoRunning` re-dispatches the same run while this promise is still
+          // pending, and `drainQueue` resets the ref to `[]` when a run ends with nothing behind
+          // it. So a late rejection from turn A reading the ref marks turn B's messages: it stamps
+          // "Not sent" on a bubble the live turn is actually answering, publishes its text in the
+          // failure bubble, and then drains the slot of a turn that is still running. The closure
+          // cannot go stale — `dispatchTurn` binds `entries = run.entries` at entry and assigns the
+          // ref FROM it — so within this dispatch the two are identical and only one of them is
+          // safe. The sticky branch below already reads `entries`; this restores the symmetry.
+          // No `[entry]` fallback is needed: `entry = entries[0]` is already dereferenced above, so
+          // `entries` is non-empty by construction.
+          const lost = entries;
+          const lostIds = new Set(lost.map((q) => q.bubbleId));
+          for (const q of lost) neverSentRef.current.add(q.bubbleId);
           setChat((prev) =>
             prev.map((m) =>
-              m.kind === "you" && m.id === entry.bubbleId && m.receipt
+              m.kind === "you" && lostIds.has(m.id) && m.receipt
                 ? {
                 ...m,
                 // NO `agentName` ON A NEVER-SENT MESSAGE (knightwatch, PR #1288). Spreading the
@@ -5101,7 +5146,9 @@ export function ConciergeHost({
               id: nextId("err"),
               kind: "failure",
               headline: "That message didn't get sent",
-              evidence: [String(err), "", entry.text].join("\n"),
+              // EVERY lost message's text, so the founder can recover what he asked rather than
+              // only the first of them.
+              evidence: [String(err), "", ...lost.map((q) => q.text)].join("\n"),
             },
           ]);
           // Same mounted blind spot as its sticky twin below and `onConciergeError` above

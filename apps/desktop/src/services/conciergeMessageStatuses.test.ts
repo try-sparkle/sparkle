@@ -246,6 +246,56 @@ describe("useConciergeMessageStatuses", () => {
   });
 
   /**
+   * EVERY MESSAGE THE TURN IS ANSWERING CARRIES THE LIVE LINE (roborev 65842).
+   *
+   * A turn answers a RUN now (bead sparkle-agx4d8) and only its HEAD owns `awaitingId`. Attaching
+   * the line to the head alone leaves the follow-ups with NO status at all — not "waiting" (they are
+   * not in line), not "working", just blank — which on screen is indistinguishable from being
+   * ignored. That is the exact symptom absorbing them was meant to remove, so the status layer must
+   * not reintroduce it.
+   *
+   * EVERY OTHER ROW IN THIS FILE BUILDS ITS QUEUE VIA `enqueue`, which yields a run of length ONE,
+   * so the loop this pins was never exercised and a revert to head-only left the suite green. This
+   * row drives `turnFinished` with an always-related judge, which is how a real multi-message run is
+   * formed.
+   */
+  it("puts the live line on EVERY message of an absorbed run, not just its head", () => {
+    const floor = seqNow();
+    noteConciergeSent();
+    noteConciergeNativeToolCall("Grep", '{"pattern":"x"}');
+    let q = enqueue(EMPTY_TURN_QUEUE, { bubbleId: "run", text: "running", enqueuedAt: TURN_T0 }).next;
+    for (const id of ["a", "b", "c", "d"]) {
+      q = enqueue(q, { bubbleId: id, text: `msg ${id}`, enqueuedAt: TURN_T0 }).next;
+    }
+    // The running turn ends and the drain absorbs a's run into ONE turn — but NOT `d`, which the
+    // judge calls different. `walkRelated` stops on the first different verdict and leaves
+    // everything it declines in `waiting`, which is what gives this row a message that is queued
+    // and NOT part of the run. The judge's `next` is the candidate's TEXT, not the entry.
+    const drained = turnFinished(q, (_run, next) => next !== "msg d");
+    expect(drained.next.running?.entries.map((e) => e.bubbleId)).toEqual(["a", "b", "c"]);
+    expect(drained.next.waiting.map((e) => e.bubbleId)).toEqual(["d"]);
+
+    const { result } = renderHook(() => useConciergeMessageStatuses("a", true, floor, drained.next));
+    const live = result.current["a"]!;
+    // The head's line is the observed tool line, not a queue position…
+    expect(live.text).not.toMatch(/in line|Next up/);
+    // …and each absorbed follow-up carries THE SAME live line rather than nothing. Asserting the
+    // shared value, not merely truthiness: a synthesised per-message phrase would be a claim about
+    // work nobody observed.
+    expect(result.current["b"]).toEqual(live);
+    expect(result.current["c"]).toEqual(live);
+    // ══ THE CONTROL HAS TO BE A MESSAGE THE HOOK KNOWS ABOUT (roborev 66301) ════════════════════
+    // Asserting that some id never enqueued is `undefined` proves nothing: the map is built solely
+    // from `queue.waiting`, `queue.delegated`, `queue.running.entries` and `awaitingId`, so an
+    // unknown id is absent under EVERY implementation, including one that paints the live line on
+    // all four of those. The risk worth excluding is the live line LEAKING onto a message that is
+    // queued but not part of the run, and only `d` can show that — it is in `waiting`, so a
+    // paint-everything implementation would hand it `live` instead of its position.
+    expect(result.current["d"]).toEqual({ text: "Next up" });
+    expect(result.current["d"]).not.toEqual(live);
+  });
+
+  /**
    * THE LINE MOVES. A position that is right once and then frozen would be worse than no position at
    * all — it would keep telling the reader they are third while they are actually next.
    *

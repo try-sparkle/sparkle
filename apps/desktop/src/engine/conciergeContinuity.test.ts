@@ -101,6 +101,35 @@ describe("buildContinuityBlock", () => {
     expect(block).not.toContain("the new ask");
   });
 
+  it("excludes EVERY message a merged run is carrying, not only its head (roborev 65842)", () => {
+    // A turn answers a RUN now (bead sparkle-agx4d8), and each of its bubbles is already in the
+    // thread. Excluding only the head puts messages 2..N in the prompt TWICE — once in the replayed
+    // thread and again under "The user says" — which is exactly the defect `excludeId` was added to
+    // prevent, reintroduced for every message but the first. Nothing covered `excludeIds`, so a
+    // revert to head-only exclusion left the whole suite green.
+    const chat = [
+      you("older ask", "m1"),
+      sparkle("older answer", "m2"),
+      you("the new ask", "m3"),
+      you("and the context for it", "m4"),
+    ];
+    const block = buildContinuityBlock({ chat, excludeIds: ["m3", "m4"] });
+    expect(block).toContain("older ask");
+    expect(block).toContain("older answer");
+    expect(block).not.toContain("the new ask");
+    expect(block).not.toContain("and the context for it");
+  });
+
+  it("applies excludeId AND excludeIds together, so an existing caller is unaffected", () => {
+    // `excludeIds` is additive: a caller passing only `excludeId` must behave exactly as before,
+    // and a caller passing both must have both honoured.
+    const chat = [you("keep me", "m1"), you("head", "m2"), you("absorbed", "m3")];
+    const block = buildContinuityBlock({ chat, excludeId: "m2", excludeIds: ["m3"] });
+    expect(block).toContain("keep me");
+    expect(block).not.toContain("head");
+    expect(block).not.toContain("absorbed");
+  });
+
   it("is empty when the ONLY message is the one being carried", () => {
     // The first-turn case: excluding it must leave nothing, not an empty heading.
     expect(buildContinuityBlock({ chat: [you("first", "m1")], excludeId: "m1" })).toBe("");

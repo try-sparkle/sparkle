@@ -1842,6 +1842,144 @@ describe("ConciergeHost", () => {
     ).toMatch(/Not sent/);
   });
 
+  it("a rejected MERGED run marks and lists EVERY message, not just its head", async () => {
+    // ══ THE ASYMMETRY THIS CLOSES (roborev 65842) ═════════════════════════════════════════════
+    // A turn answers a RUN now, and the transient-rejection branch above read only the head. Its
+    // follow-ups were already removed from `neverSentRef` by `dispatchTurn`, are no longer in
+    // `waiting` or `delegated` (they were absorbed into `running`), and `turnFinished` discards the
+    // run wholesale — so a head-only mark dropped them with no mark, no notice and no re-queue, and
+    // the next settled reply would claim them as "Answered below" for a question the brain never
+    // received. The STICKY branch had been updated for runs and this one had not.
+    //
+    // Both halves are asserted, because they fail independently: the failure bubble must NAME both
+    // texts (so he can recover what he asked), and each bubble must carry its own "Not sent" mark
+    // (which is what stops a later reply claiming it).
+    _resetConciergeActivityForTests();
+    h.feed = feedWith("approval");
+    render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "rebase the branch" } });
+    fireEvent.click(screen.getByText("Send"));
+    await settle();
+
+    // The follow-on is related and the turn has produced nothing, so it MERGES — and the
+    // re-dispatch is the call that rejects.
+    h.startConciergeTurn.mockRejectedValueOnce(new Error("a transient blip"));
+    fireEvent.change(screen.getByRole("textbox"), {
+      target: { value: "and also squash the fixups" },
+    });
+    fireEvent.click(screen.getByText("Send"));
+    await settle();
+
+    const lost = within(thread()).getAllByTestId(FAILURE_EVIDENCE_TESTID).at(-1)?.textContent ?? "";
+    expect(lost).toContain("rebase the branch");
+    expect(lost).toContain("and also squash the fixups");
+
+    for (const text of ["rebase the branch", "and also squash the fixups"]) {
+      const bubble = within(thread())
+        .getAllByTestId("you-bubble")
+        .find((b) => b.textContent?.includes(text))!;
+      expect(bubble, `no bubble for "${text}"`).toBeTruthy();
+      expect(
+        bubble.closest("[data-message-id]")!.textContent,
+        `"${text}" must be marked Not sent`,
+      ).toMatch(/Not sent/);
+    }
+  });
+
+  /**
+   * A LATE REJECTION TOUCHES NOTHING — THE DISPATCH THAT REPLACED IT OWNS THE TURN (roborev 66373).
+   *
+   * `startConciergeTurn` is not awaited before the next dispatch, so `mergeIntoRunning` re-dispatches
+   * the run — a NEW `RunningRun` containing this dispatch's entries — while the first call's promise
+   * is still pending. Everything in the reject handler describes THE TURN IN FLIGHT, so a stale
+   * promise that runs it damages the turn that replaced it: it stamps "Not sent" on bubbles the live
+   * turn is answering (and suppresses their "Answered below" anchors), drops the typing indicator
+   * mid-stream, and drains a `running` that is still streaming.
+   *
+   * ══ WHY BOTH DIRECTIONS ARE ASSERTED ══════════════════════════════════════════════════════════
+   * An earlier version of this row asserted only that the MERGED FOLLOW-UP was untouched while the
+   * head WAS published as lost — which pinned the defect rather than the fix (the "grip, not intent"
+   * case in AGENTS.md: it had a firm grip on the line it named and passed mutation cleanly). The
+   * head is part of the live merged run too, so the correct outcome is that NEITHER is marked, no
+   * failure bubble is posted at all, and the live turn survives to deliver its reply.
+   *
+   * The last assertion is the one that separates a stale-dispatch guard from a merely narrower list:
+   * a handler that still tore the turn down would have cleared `awaitingId` and released the slot,
+   * so turn B's reply would have nowhere to land.
+   */
+  it("a LATE rejection leaves the run that grew past it completely untouched", async () => {
+    _resetConciergeActivityForTests();
+    h.feed = feedWith("approval");
+    // Turn A's promise is HELD OPEN so its rejection can arrive after the merge has re-dispatched.
+    const held: { reject?: (e: unknown) => void } = {};
+    h.startConciergeTurn.mockImplementationOnce(
+      () =>
+        new Promise<string | null>((_resolve, reject) => {
+          held.reject = reject;
+        }),
+    );
+    render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "rebase the branch" } });
+    fireEvent.click(screen.getByText("Send"));
+    await settle();
+
+    // The related follow-on merges into the running run and RE-DISPATCHES it — call #2, which
+    // resolves normally. This is the call that overwrites `runEntriesRef` with both entries.
+    fireEvent.change(screen.getByRole("textbox"), {
+      target: { value: "and also squash the fixups" },
+    });
+    fireEvent.click(screen.getByText("Send"));
+    await settle();
+    expect(h.startConciergeTurn).toHaveBeenCalledTimes(2);
+
+    // Only NOW does turn A's stale promise reject.
+    await act(async () => {
+      held.reject?.(new Error("a late blip"));
+      await Promise.resolve();
+    });
+    await settle();
+
+    // NOTHING was reported lost — both messages are in the run the live turn is answering.
+    expect(within(thread()).queryByText(/That message didn't get sent/)).toBeNull();
+    for (const text of ["rebase the branch", "and also squash the fixups"]) {
+      const bubble = within(thread())
+        .getAllByTestId("you-bubble")
+        .find((b) => b.textContent?.includes(text))!;
+      expect(bubble, `no bubble for "${text}"`).toBeTruthy();
+      expect(
+        bubble.closest("[data-message-id]")!.textContent,
+        `"${text}" is being answered right now and must not be stamped Not sent`,
+      ).not.toMatch(/Not sent/);
+    }
+
+    // ══ AND THE TEARDOWN HALF, WHICH IS THE LARGER ONE ═══════════════════════════════════════
+    // The indicator the LIVE turn raised is still up. `setTyping(false)` is the first thing the
+    // stale handler does, so this reds the moment the guard goes — and it is the only assertion
+    // here that does: an earlier version of this row ended at "turn B's reply still renders",
+    // which cannot discriminate the guard at all, because the `done` path renders through
+    // `retireThroughRef`/`latestTurnRef` and reads neither `typing` nor the queue slot (roborev
+    // 66389). Prose in a comment is not coverage.
+    expect(screen.queryByTestId(THINKING_INDICATOR_TESTID)).toBeTruthy();
+
+    // …and when turn B answers, BOTH of its questions carry "Answered below". That is the
+    // user-visible form of the `neverSentRef` damage: the guard-less path re-adds both ids, and
+    // `pendingAnchors` then filters both bubbles out of the anchor walk, so the reply lands with
+    // neither question marked as answered — the silent-loss shape this whole file exists to remove.
+    act(() => h.brain.done?.({ id: "1", text: "answered both" }));
+    await settle();
+    expect(await within(thread()).findByText(/answered both/)).toBeTruthy();
+    for (const text of ["rebase the branch", "and also squash the fixups"]) {
+      const row = within(thread())
+        .getAllByTestId("you-bubble")
+        .find((b) => b.textContent?.includes(text))!
+        .closest("[data-message-id]")!;
+      expect(
+        row.querySelector(`[data-testid="${ANSWERED_MARKER_TESTID}"]`),
+        `"${text}" was answered by the live turn and must carry the anchor`,
+      ).toBeTruthy();
+    }
+  });
+
   /**
    * A PUSH'S `done` MUST NOT RELEASE A USER TURN'S SLOT (roborev 58503).
    *
@@ -4090,6 +4228,30 @@ describe("ConciergeHost — the concierge relays a message, and says so ON the b
   it("publishes the founder's own words with the turn, not just the bubble id", async () => {
     await sendPlain("please rebase this branch onto origin/main");
     expect(currentConciergeTurnContent().text).toBe("please rebase this branch onto origin/main");
+  });
+
+  it("publishes the WHOLE RUN's words when a follow-on is merged, not just the head", async () => {
+    // ══ A SAFETY PROPERTY, AND IT WAS UNASSERTED (roborev 65842) ══════════════════════════════
+    // `relayGate` reads this origin and is deliberately FAIL-OPEN: `carriesFounderWords` returning
+    // false ALLOWS the relay. So an origin carrying only the head's text makes the gate fail open on
+    // the founder's own words from messages 2..N — precisely the ruling that module exists to make.
+    //
+    // `sendSeq` IS WHAT REFRESHES IT, not `awaitingId`: a merge keeps the same head bubble, so an
+    // effect keyed on `awaitingId` alone would publish the pre-merge text and never update. Drop
+    // `sendSeq` from that dependency list and this row goes red; nothing else in the suite does.
+    await sendPlain("please rebase this branch onto origin/main");
+    expect(currentConciergeTurnContent().text).toBe("please rebase this branch onto origin/main");
+
+    // A related follow-on, before the turn has produced anything, so it MERGES into the run.
+    fireEvent.change(screen.getByRole("textbox"), {
+      target: { value: "and also squash the fixups first" },
+    });
+    fireEvent.click(screen.getByText("Send"));
+    await settle();
+
+    const origin = currentConciergeTurnContent();
+    expect(origin.text).toContain("please rebase this branch onto origin/main");
+    expect(origin.text).toContain("and also squash the fixups first");
   });
 
   it("drops his words when the turn ends, so they cannot be read against the NEXT send", async () => {
