@@ -36,7 +36,7 @@
 // truth — it adds one more claim on a poll that was already running.
 
 import { Fragment, useMemo, useState, useCallback, useEffect, useRef } from "react";
-import { FiChevronDown, FiChevronRight } from "react-icons/fi";
+import { FiChevronDown, FiChevronRight, FiX } from "react-icons/fi";
 import { C, FONT_WEIGHT } from "../theme/colors";
 import { FONT_UI, TYPE } from "../theme/scale";
 import { ZOOM_COLUMN_ATTR, zoomColumnFor } from "../engine/columnZoom";
@@ -703,10 +703,46 @@ function EpicRow({
           row in turn, so a child that swallows the row's click reds immediately — which is exactly
           what the goal span did. `BeadPriorityChip` above is safe because it is a readout with no
           handler, by its own documented design. */}
-      {total > 0 && (
-        <span data-testid="epic-row-children" style={{ flex: "0 0 auto", color: C.muted }}>
-          {open}/{total}
+      {/* ── THE COUNT SLOT BECOMES THE CLOSE X WHILE THE CARD IS OPEN ────────────────────────────
+          Item 15 of the 2026-08-20 self-interview, and the founder placed it by pointing AT this
+          slot: [07:51] "let's put the x in the top, where it says the six out of six when it's
+          closed. That's where the x would go to close the card out." So it is a SUBSTITUTION —
+          collapsed shows the ratio, expanded shows the X — not a second control crowding a 280px
+          row.
+
+          ══ IT IS A READOUT WITH NO HANDLER, AND THAT IS THE WHOLE DESIGN ══════════════════════
+          This row is ONE `<button>`. A real `<button>` here would be an interactive element nested
+          inside an interactive element, and it would have to `stopPropagation()` to avoid
+          double-firing — which is EXACTLY the shape that produced the bug the founder hit live,
+          where the goal span swallowed the click that was meant to open the card (`sparkle-huw924.3`,
+          fixed in PR #2285). Rebuilding that shape to add a close affordance would trade a fixed
+          bug for a new one.
+
+          It does not need to be a button. The row's own `onSelect` already TOGGLES, so a click
+          anywhere on an open row closes it — including on these pixels. The X therefore has to
+          *look* like the close control and do nothing itself; the row underneath it is what acts.
+          Same rule `BeadPriorityChip` above follows, and the comment block above says why any
+          clickable child here reds `Workspace.epicsColumn.test.tsx`'s "opens the card wherever
+          inside the row the click lands" — a guard this change deliberately leaves at full
+          strength rather than narrowing.
+
+          `aria-hidden` because the button already announces its state through `aria-pressed`:
+          a screen reader hears one control that is pressed, not a stray "X" with no role. */}
+      {selected ? (
+        <span
+          data-testid="epic-row-close"
+          aria-hidden
+          title="Close"
+          style={{ flex: "0 0 auto", display: "inline-flex", alignItems: "center", color: C.muted }}
+        >
+          <FiX size={13} />
         </span>
+      ) : (
+        total > 0 && (
+          <span data-testid="epic-row-children" style={{ flex: "0 0 auto", color: C.muted }}>
+            {open}/{total}
+          </span>
+        )
       )}
     </button>
   );

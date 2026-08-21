@@ -601,6 +601,53 @@ describe("an epic that HAS a goal opens its card, exactly like one that does not
     expect(rowFor("ep-goal")!.textContent).toContain("ep-goal");
   });
 
+  // ── ITEM 15 — THE COUNT SLOT BECOMES THE CLOSE X WHILE THE CARD IS OPEN ───────────────────────
+
+  const closeX = (id: string) => rowFor(id)!.querySelector('[data-testid="epic-row-close"]');
+  const ratio = (id: string) => rowFor(id)!.querySelector('[data-testid="epic-row-children"]');
+
+  it("swaps the ratio for an X on the OPEN row, while a closed row beside it keeps its ratio", () => {
+    // BOTH ROWS MOUNTED, and that is what gives this power. Asserting "the X is here" on a single
+    // open row would also pass for an X rendered unconditionally on every row; asserting "no X" on
+    // a single closed row would pass for an X that never renders at all. Only the pair pins the
+    // substitution to the SELECTED row (`sparkle-foqoe`).
+    render(<Workspace />);
+
+    expect(ratio("ep-goal")).toBeTruthy();
+    expect(closeX("ep-goal")).toBeNull();
+
+    fireEvent.click(rowFor("ep-goal")!);
+    expect(cardUnder("ep-goal")).toBeTruthy();
+
+    // The open one traded its ratio for the X...
+    expect(closeX("ep-goal")).toBeTruthy();
+    expect(ratio("ep-goal")).toBeNull();
+    // ...and the CLOSED one next to it did not.
+    expect(closeX("ep-plain")).toBeNull();
+    expect(ratio("ep-plain")).toBeTruthy();
+
+    // Closing puts the ratio back — the substitution is reversible, not a one-way replacement.
+    fireEvent.click(rowFor("ep-goal")!);
+    expect(cardUnder("ep-goal")).toBeNull();
+    expect(closeX("ep-goal")).toBeNull();
+    expect(ratio("ep-goal")).toBeTruthy();
+  });
+
+  it("clicking the X CLOSES the card — it must not swallow the row's click", () => {
+    // THE ASSERTION THAT MATTERS. The X is a readout with no handler of its own: the row underneath
+    // is what closes. Make it a real nested <button> with stopPropagation — the shape that caused
+    // `sparkle-huw924.3`, where the goal span ate the click meant for the row — and this reds,
+    // because the click would never reach the row.
+    render(<Workspace />);
+    fireEvent.click(rowFor("ep-goal")!);
+    const x = closeX("ep-goal");
+    expect(x).toBeTruthy();
+
+    fireEvent.click(x as HTMLElement);
+
+    expect(cardUnder("ep-goal")).toBeNull();
+  });
+
   it("opens the card wherever inside the row the click lands", () => {
     render(<Workspace />);
     for (const id of ["ep-goal", "ep-plain"]) {
