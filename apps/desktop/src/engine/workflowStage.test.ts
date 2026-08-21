@@ -16,6 +16,7 @@ import {
   LINE_TO,
   rollupHoldsWork,
   uncommittedWorkEvidence,
+  unlandedWorkEvidence,
   hasUnmergedCommittedWork,
 } from "./workflowStage";
 import { sectionOfRow } from "./buildSections";
@@ -729,5 +730,100 @@ describe("nested-worktree adoption reaches the stage ladder (sparkle-d5muhf)", (
         prev: "building_unsaved",
       }),
     ).toBe("building_unsaved");
+  });
+});
+
+describe("unlandedWorkEvidence — a LIVE reading beats a STALE watermark", () => {
+  // The guard these pin (bead `sparkle-qh6j7g`) short-circuits the new-work-cycle veto roborev 55334
+  // installed, so its dangerous direction has to be pinned HERE, at the function, not at a caller
+  // that refuses earlier for an unrelated reason. Replacing the whole `nothingOutstanding` expression
+  // with `true` must red at least one of these.
+
+  it("a stale sub-merged watermark cannot outvote reachability plus two live zeroes", () => {
+    // THE MEASURED CASE. The watermark is monotonic and only moves when a poll OBSERVES a crossing,
+    // so a PR that merged unwatched leaves it at `pull_request` — which `hasUnmergedCommittedWork`
+    // calls outstanding work, over a tip that is IN origin main with nothing ahead of the base.
+    expect(
+      unlandedWorkEvidence({
+        bs: bs(0),
+        ws: ws({ inOriginMain: true, aheadOfBase: 0 }),
+        stageOverride: "pull_request",
+      }),
+    ).toBe(false);
+  });
+
+  it("…but the same stale watermark still wins when the branch IS ahead", () => {
+    // The direction that must not be lost: prior work landed, then three fresh commits. Both live
+    // counters are non-zero, so the guard must not fire and the veto must report outstanding work.
+    // This is the assertion an unconditionally-true `nothingOutstanding` reds.
+    expect(
+      unlandedWorkEvidence({
+        bs: bs(3),
+        ws: ws({ inOriginMain: true, aheadOfBase: 3 }),
+        stageOverride: "pushed",
+      }),
+    ).toBe(true);
+  });
+
+  it("a SQUASH land is answered by landedOnOrigin, which is the only thing that can answer it", () => {
+    // A squash land leaves the tip an ancestor of nothing, so `ahead` never returns to zero — and
+    // `aheadOfBase` is a plain `rev-list --count base..branch` on the Rust side, so it does not
+    // either. The zeroes above are structurally unable to speak for this shape.
+    expect(
+      unlandedWorkEvidence({
+        bs: bs(3),
+        ws: ws({ landed: true, landedOnOrigin: true, aheadOfBase: 3 }),
+        stageOverride: "pushed",
+      }),
+    ).toBe(false);
+  });
+
+  it("…and NEW commits after that squash land put it back to outstanding", () => {
+    // `landedOnOrigin` is the proof that merging would add NOTHING, so it falls back to false the
+    // moment a new commit means merging WOULD add something. Without this pair, "landed by squash"
+    // and "landed by squash, then kept working" are one reading.
+    expect(
+      unlandedWorkEvidence({
+        bs: bs(5),
+        ws: ws({ landed: true, landedOnOrigin: false, aheadOfBase: 5 }),
+        stageOverride: "pushed",
+      }),
+    ).toBe(true);
+  });
+
+  it("LOCAL main is not origin main — merged_local is still outstanding work", () => {
+    // `alreadyInBase` carries the local proofs too, and reusing it here would answer `false` for a
+    // branch merged into LOCAL main with both counters at zero — which `deriveLiveStage` puts at
+    // `merged_local`, a rung `hasUnmergedCommittedWork` calls outstanding ON PURPOSE, because
+    // local-only work still needs someone to get it the rest of the way. Retiring it here would
+    // silently take down the unmerged chip, the `unlanded-work` stall cause and the `mayRetire`
+    // input for every repo that lands locally without pushing.
+    expect(
+      unlandedWorkEvidence({
+        bs: bs(0),
+        ws: ws({ inLocalMain: true, aheadOfBase: 0 }),
+        stageOverride: "pull_request",
+      }),
+    ).toBe(true);
+  });
+
+  it("a SECOND lap merged only into local main is still outstanding, stale merged watermark or not", () => {
+    // The sibling veto's half of the same origin-scoping. Lap 1 crossed origin and latched the
+    // watermark at `merged`; lap 2 merged three commits into LOCAL main without pushing. With
+    // `inLocalMain` allowed to veto the `ahead > 0` positive, the fall-through would consult that
+    // stale `merged` watermark and answer `false` over three unpushed commits.
+    expect(
+      unlandedWorkEvidence({
+        bs: bs(3),
+        ws: ws({ inLocalMain: true, aheadOfBase: 3 }),
+        stageOverride: "merged",
+      }),
+    ).toBe(true);
+  });
+
+  it("a branch in NO base is unaffected by the guard", () => {
+    expect(
+      unlandedWorkEvidence({ bs: bs(2), ws: ws({ aheadOfBase: 2 }), stageOverride: "pushed" }),
+    ).toBe(true);
   });
 });

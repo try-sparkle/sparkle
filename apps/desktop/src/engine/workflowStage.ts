@@ -236,9 +236,51 @@ export function unlandedWorkEvidence(ev: UnlandedInputs): boolean | undefined {
   // corrupts, because every other one is computed from the branch REF and is immune to what got
   // checked out into the tree. Gating `ahead` on it would discard sound evidence and re-open this hole
   // for a parked worktree — a real state here (sparkle-rhgm), not a hypothetical.
-  const alreadyInBase =
-    ev.ws?.landed === true || ev.ws?.inOriginMain === true || ev.ws?.inLocalMain === true;
+  //
+  // ⚠️ `inLocalMain` IS NOT IN THIS VETO, and that is the same origin-scoping the guard below
+  // documents, applied to the gate it sits beside. `ahead` is measured against `base_for_ahead`,
+  // which is `origin/<default>` whenever that ref exists — so letting a LOCAL proof suppress a
+  // positive derived from an ORIGIN-scoped counter is exactly the conflation this function must not
+  // make. Left in, the second lap of a lands-locally-without-pushing repo reads as nothing
+  // outstanding: lap 1 crosses origin and latches the watermark at `merged`, lap 2 merges three
+  // commits into local main without pushing, and with `inLocalMain` vetoing here the fall-through
+  // consults that stale `merged` watermark and answers `false` over three unpushed commits. Dropping
+  // it costs nothing: when the base IS local (no origin ref) a branch contained in local main has
+  // `ahead === 0`, so this can't fire; when the base is origin, `ahead > 0` over a locally-merged
+  // branch is a CORRECT positive.
+  const alreadyInBase = ev.ws?.landed === true || ev.ws?.inOriginMain === true;
   if (!alreadyInBase && ev.bs !== undefined && ev.bs.ahead > 0) return true;
+  // A LIVE READING BEATS A STALE WATERMARK (bead `sparkle-qh6j7g`). `alreadyInBase` used to veto
+  // only the `ahead` early return above, so the line below could still manufacture unlanded work out
+  // of `stageOverride` alone — and that watermark is MONOTONIC and only moves when a poll OBSERVES a
+  // crossing. An agent whose PR merged while nothing was watching keeps a watermark at
+  // `pull_request`, `hasUnmergedCommittedWork` reads that as outstanding work, and the row reports
+  // unlanded commits over a branch whose tip is IN origin main with `ahead` and `aheadOfBase` both
+  // zero. That combination is what the goal verifier then renders as "git says it is not on
+  // origin/main yet" — a claim git contradicts. Reachability plus two live zeroes is a stronger
+  // reading than a stale latch, so let it win.
+  //
+  // `landedOnOrigin` is named separately because a SQUASH land leaves both counters at N forever
+  // (the tip is an ancestor of nothing — see the roborev 55456 note above), so the zeroes can never
+  // speak for it. It is the cherry-equivalence proof — "merging this branch into origin would add
+  // NOTHING" — which is precisely "nothing outstanding", and it falls back to false the moment a new
+  // commit means merging WOULD add something. So the new-work cycle still reports `true` through
+  // both arms: fresh commits make `landedOnOrigin` false AND move `ahead` off zero.
+  //
+  // ⚠️ ORIGIN-SCOPED, and NOT `alreadyInBase` — which also carries the two LOCAL proofs. Where
+  // `origin/<default>` has no remote-tracking ref Rust falls back to the LOCAL default for
+  // `base_for_ahead`, so a branch merged into local main reports `inLocalMain: true` with both
+  // counters at zero. `deriveLiveStage` puts that branch at `merged_local`, and
+  // `hasUnmergedCommittedWork` calls `merged_local` OUTSTANDING on purpose — local-only work still
+  // needs someone to get it the rest of the way. Reusing `alreadyInBase` here would answer `false`
+  // for it, silently retiring the unmerged chip, the `unlanded-work` stall cause and the `mayRetire`
+  // input for exactly the lands-locally-without-pushing repos that are called out elsewhere as a
+  // population not to regress.
+  const inBaseOnOrigin = ev.ws?.inOriginMain === true || ev.ws?.landedOnOrigin === true;
+  const nothingOutstanding =
+    ev.ws?.landedOnOrigin === true ||
+    ((ev.bs?.ahead ?? 0) === 0 && (ev.ws?.aheadOfBase ?? 0) === 0);
+  if (inBaseOnOrigin && nothingOutstanding) return false;
   return hasUnmergedCommittedWork(resolveStage(ev.bs, ev.stageOverride));
 }
 

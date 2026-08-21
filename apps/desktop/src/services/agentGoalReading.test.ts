@@ -14,6 +14,7 @@ import {
   correctedStatusFor,
   expiryProofFor,
   goalReading,
+  landedEvidenceFor,
   stallEvidenceFor,
   stallReadingFor,
 } from "./agentGoalReading";
@@ -51,11 +52,16 @@ function seed(over: {
   branchStatus?: Record<string, BranchStatus>;
   workflowState?: Record<string, WorkflowState>;
   workflowStage?: Record<string, string>;
+  // The sticky "reached ORIGIN main at least once" latch. Seeded here — and RESET on every call —
+  // because it persists across relaunch in production, so a test that left it set would hand the
+  // next test a watermark it never asked for.
+  workflowShipped?: Record<string, boolean>;
 }) {
   useRuntimeStore.setState({
     branchStatus: over.branchStatus ?? {},
     workflowState: over.workflowState ?? {},
     workflowStage: over.workflowStage ?? {},
+    workflowShipped: over.workflowShipped ?? {},
   } as never);
 }
 
@@ -383,5 +389,41 @@ describe("goalReading — a frozen escalation beside a goal that has moved on", 
     const reading = goalReading(newGoal("cut the DMG", T), T + 2)!;
     expect(reading.escalationReason).toBeUndefined();
     expect(reading.escalationStale).toBeUndefined();
+  });
+});
+
+describe("landedEvidenceFor — a stale watermark must not veto a landed tip", () => {
+  // The refusal this branch is about (bead `sparkle-qh6j7g`, plus four closed duplicates): an agent
+  // whose branch is provably an ancestor of origin/main is refused `set_agent_goal_met` with copy
+  // saying "git says it is not on origin/main yet" — a claim git contradicts, and one no permitted
+  // agent action can clear. `goalVerify` renders that copy for `landed: false` + `unlandedWork: true`
+  // exactly, so the veto is the half to fix; the fix itself lives in `unlandedWorkEvidence` and is
+  // pinned at the function in `workflowStage.test.ts`. These two are the round-trip through the
+  // caller a human actually hits.
+
+  it("a stale sub-merged stage watermark no longer manufactures unlanded work", () => {
+    // The stage watermark is monotonic and moves only when a poll OBSERVES a crossing, so a PR that
+    // merged unwatched leaves it at `pull_request` — which `hasUnmergedCommittedWork` called
+    // outstanding work, over a tip that is IN origin main with nothing ahead of the base.
+    seed({
+      branchStatus: { [A]: CLEAN_BS },
+      workflowState: { [A]: { ...BARE_WS, inOriginMain: true, aheadOfBase: 0 } },
+      workflowStage: { [A]: "pull_request" },
+      workflowShipped: { [A]: true },
+    });
+    expect(landedEvidenceFor(A)).toBe(true);
+  });
+
+  it("…but the NEW-WORK cycle still reads as outstanding", () => {
+    // The latch outlives the cycle that set it, so prior work on origin plus three fresh commits
+    // must NOT read as landed. This is the false-"done" the veto exists for, and the guard above
+    // must not reopen it.
+    seed({
+      branchStatus: { [A]: { ...CLEAN_BS, ahead: 3 } },
+      workflowState: { [A]: { ...BARE_WS, inOriginMain: true, aheadOfBase: 3 } },
+      workflowStage: { [A]: "pull_request" },
+      workflowShipped: { [A]: true },
+    });
+    expect(landedEvidenceFor(A)).toBe(false);
   });
 });
