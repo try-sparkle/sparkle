@@ -270,11 +270,19 @@ impl ObservedAttentionState {
 /// Every agent's current attention reading.
 ///
 /// The frontend calls this once when its listener starts, because the event only fires on change.
+///
+/// `async` DELIBERATELY, even though the body is one mutex read. A SYNC `#[tauri::command]` runs
+/// its body INLINE on the AppKit main thread, so it freezes the whole UI for its duration —
+/// `cmd_timing`'s `every_tauri_command_is_async_or_explicitly_exempt` guard fails on any sync
+/// command not in its debt list, and that list's own header is explicit that it is "SYNC-COMMAND
+/// DEBT, NOT A LIST OF APPROVALS": adding a NEW name is adding new debt, and converting is the fix.
+/// A cheap body is not a reason to stay sync — `frontend_log` was cheap too, at 90-145K invokes a
+/// day, and sat unguarded on the main thread (bead sparkle-rfhu5).
 #[tauri::command]
-pub fn observed_attention(
-    state: tauri::State<ObservedAttentionState>,
-) -> Vec<ObservedAttention> {
-    state.list()
+pub async fn observed_attention(
+    state: tauri::State<'_, ObservedAttentionState>,
+) -> Result<Vec<ObservedAttention>, ()> {
+    Ok(state.list())
 }
 
 #[cfg(test)]

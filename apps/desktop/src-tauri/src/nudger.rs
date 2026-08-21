@@ -2695,7 +2695,22 @@ mod tests {
             crate::observed_attention::Verdict::Awaiting,
             "a picker on screen must read as `awaiting`"
         );
-        assert_eq!(rows[0].at_ms, now + 1_000, "at_ms is AS OF this tick, not onset");
+        assert_eq!(
+            rows[0].at_ms, now,
+            "at_ms is the ONSET of the current verdict — an unchanged reading must not refresh it"
+        );
+
+        // …and it DOES move when the verdict actually changes, or the assertion above would also
+        // pass for a seam that had stopped stamping at all.
+        observer.ingest("\x1b[2J\x1b[H\u{b7} Thinking… (3s · esc to interrupt)");
+        tick(&handle, &mut tracked, now + 2_000);
+        let rows = state.list();
+        assert_eq!(rows[0].verdict, crate::observed_attention::Verdict::Calm);
+        assert_eq!(
+            rows[0].at_ms,
+            now + 2_000,
+            "a CHANGED verdict restamps onset, or 'how long has it been awaiting' is unanswerable"
+        );
     }
 
     /// The PAIRED case for the sweep: the tick must drop a verdict whose PTY is gone. Asserted on
