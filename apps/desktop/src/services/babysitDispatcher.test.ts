@@ -45,6 +45,7 @@ import {
   babysitPrompt,
   sweepAllProjects,
   startBabysitDispatcher,
+  BABYSIT_REFUSAL_STREAK_WEDGED,
   BABYSIT_SWEEP_ABANDON_MS,
   BABYSIT_SWEEP_MS,
   babysitSweepProject,
@@ -466,6 +467,134 @@ describe("sweepAllProjects — the single-owner election", () => {
 
 // ── THE HOLD ROLLUP MUST REACH THE PERSISTENT LOG ───────────────────────────────────────────────
 //
+// ── A PERMANENTLY REFUSED PR IS NOT A DECISION (the streak) ─────────────────────────────────────
+//
+// `lease-lost-or-spawn-refused` lands in the same `holds` map as every deliberate hold, so ONE of
+// them and a THOUSAND of them render identically in the rollup. Measured on the founder's machine:
+// one PR held at that reason on every sweep for over two days — ~58 consecutive identical INFO
+// lines at the 180 s cadence — dispatching nothing and escalating nothing.
+//
+// Every assertion below is on the OUTCOME/side effect (`wedged`, which mock received a call), never
+// on the streak field itself: `refusalStreak` is module-private state, and a test that read it back
+// would pass for a counter wired to nothing.
+describe("consecutive refusals — one is contention, a run of them is wedged", () => {
+  /** Sweeps that all decide to dispatch and all get refused. The FIRST sweep is the two-observation
+   *  hold, so `n` refusals needs `n + 1` sweeps. Returns the last sweep's outcome. */
+  async function refuse(n: number, startAt = T0) {
+    wireInvoke({ leases: [], acquired: false });
+    let out = await babysitSweepProject(PROJECT, startAt, CONFIG);
+    for (let i = 1; i <= n; i += 1) {
+      out = await babysitSweepProject(PROJECT, startAt + i * 60_000, CONFIG);
+    }
+    return out;
+  }
+
+  it("stays QUIET below the threshold — a lost acquire race is what the compare-and-set is for", async () => {
+    vi.mocked(log.warn).mockClear();
+    const out = await refuse(BABYSIT_REFUSAL_STREAK_WEDGED - 1);
+
+    // The refusals really did happen — without this the test would pass on a sweep that never ran.
+    expect(out.holds["lease-lost-or-spawn-refused"]).toBe(1);
+    expect(out.wedged).toBe(0);
+    expect(vi.mocked(log.warn).mock.calls.filter((c) => c[1] === "a PR keeps being chosen for a driver and keeps not getting one")).toHaveLength(0);
+  });
+
+  it("reports WEDGED and warns once when the run reaches the threshold", async () => {
+    vi.mocked(log.warn).mockClear();
+    const out = await refuse(BABYSIT_REFUSAL_STREAK_WEDGED);
+
+    expect(out.wedged).toBe(1);
+    const warns = vi.mocked(log.warn).mock.calls.filter((c) => c[1] === "a PR keeps being chosen for a driver and keeps not getting one");
+    expect(warns).toHaveLength(1);
+    // It has to name WHICH PR, or the warn is no more actionable than the info line it replaces.
+    expect(warns[0]?.[2]).toMatchObject({
+      repo: "drodio/sparkle",
+      pr: 1251,
+      consecutiveRefusals: BABYSIT_REFUSAL_STREAK_WEDGED,
+    });
+  });
+
+  it("does NOT re-warn every sweep once wedged, but keeps COUNTING it", async () => {
+    vi.mocked(log.warn).mockClear();
+    // A few sweeps past the threshold, still well short of the re-warn interval.
+    const out = await refuse(BABYSIT_REFUSAL_STREAK_WEDGED + 3);
+
+    // Still visible in the summary a human reads, every single sweep...
+    expect(out.wedged).toBe(1);
+    // ...but the warn fired once, not four times. A line that repeats forever reads as background
+    // noise — that is the 143-warns-a-day failure this file's rollup describe records.
+    expect(vi.mocked(log.warn).mock.calls.filter((c) => c[1] === "a PR keeps being chosen for a driver and keeps not getting one")).toHaveLength(1);
+  });
+
+  // NOT "the dispatch branch resets the counter" — that reset was written, MUTATION-TESTED, and
+  // deleted as unreachable: the sweep after a dispatch always holds first, so the hold branch has
+  // already zeroed the streak. What is asserted here is the CAPABILITY, which is real and which
+  // no other test covers: a PR that was just given a driver must never be reported wedged.
+  it("a PR THAT WAS JUST GIVEN A DRIVER is never reported wedged", async () => {
+    await refuse(BABYSIT_REFUSAL_STREAK_WEDGED - 1);
+
+    // The acquire succeeds: a real driver exists, so the run is broken.
+    wireInvoke({ leases: [], acquired: true });
+    const dispatched = await babysitSweepProject(PROJECT, T0 + BABYSIT_REFUSAL_STREAK_WEDGED * 60_000, CONFIG);
+    expect(dispatched.dispatched).toHaveLength(1);
+
+    // Past the recovery cooldown, so the next sweep genuinely re-decides to dispatch. The sweep at
+    // +45m takes the exit edge and holds `cooling-down`; the one at +90m is the refusal.
+    wireInvoke({ leases: [], acquired: false });
+    await babysitSweepProject(PROJECT, T0 + 45 * 60_000, CONFIG);
+    const after = await babysitSweepProject(PROJECT, T0 + 90 * 60_000, CONFIG);
+
+    expect(after.holds["lease-lost-or-spawn-refused"]).toBe(1);
+    // Without the reset this is the 5th refusal and reports wedged — which would tell a human a PR
+    // is stuck when a driver was dispatched for it minutes ago.
+    expect(after.wedged).toBe(0);
+  });
+
+  it("a sweep that DECIDED NOT TO DISPATCH breaks the run too — the count is consecutive", async () => {
+    await refuse(BABYSIT_REFUSAL_STREAK_WEDGED - 1);
+
+    // An unreadable lease store: judged, held, no dispatch attempted — so not a refusal.
+    wireInvoke({ leases: undefined });
+    const held = await babysitSweepProject(PROJECT, T0 + BABYSIT_REFUSAL_STREAK_WEDGED * 60_000, CONFIG);
+    expect(held.holds["lease-unknown"]).toBe(1);
+
+    wireInvoke({ leases: [], acquired: false });
+    const after = await babysitSweepProject(PROJECT, T0 + (BABYSIT_REFUSAL_STREAK_WEDGED + 1) * 60_000, CONFIG);
+
+    expect(after.holds["lease-lost-or-spawn-refused"]).toBe(1);
+    expect(after.wedged).toBe(0);
+  });
+});
+
+// The rollup LEVEL, for the same reason the describe below pins the info level: a wedged sweep that
+// reports at `info` is indistinguishable from a quiet one that decided to leave things alone, which
+// is exactly how the measured two-day stall stayed invisible.
+describe("sweepAllProjects — a WEDGED sweep is promoted out of info", () => {
+  it("emits the rollup at warn, with the wedged count, once a PR is stuck", async () => {
+    vi.mocked(log.warn).mockClear();
+    wireInvoke({ leases: [], acquired: false });
+
+    for (let i = 0; i <= BABYSIT_REFUSAL_STREAK_WEDGED; i += 1) {
+      const at = T0 + i * BABYSIT_SWEEP_MS;
+      await sweepAllProjects(CONFIG, {
+        ownsProject: () => true,
+        projects: () => [PROJECT],
+        dispatchClock: () => at,
+        sweepClock: () => at,
+      });
+    }
+
+    const warned = vi.mocked(log.warn).mock.calls.filter((c) => c[0] === "babysit" && c[1] === "sweep could not dispatch a PR it keeps choosing");
+    expect(warned).toHaveLength(1);
+    expect((warned[0]?.[2] as { wedged: number }).wedged).toBe(1);
+
+    // The half that makes this non-vacuous: at `info` the assertion above would be empty and the
+    // wedged sweep would sit in the same bucket as the quiet ones.
+    const quiet = logInfoMock.mock.calls.filter((c) => c[0] === "babysit" && c[1] === "sweep");
+    expect(quiet.every((c) => (c[2] as { wedged: number }).wedged === 0)).toBe(true);
+  });
+});
+
 // This asserts a LEVEL, which is unusual, so here is why it earns a test. The rollup is the only
 // record of WHICH hold fired. `logger.ts` skips forwarding DEBUG to disk in production builds, so
 // while this line was `log.debug` the answer to "why has nothing dispatched?" existed only in a

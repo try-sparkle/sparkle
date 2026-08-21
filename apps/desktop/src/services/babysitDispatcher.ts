@@ -247,7 +247,42 @@ interface PrClocks {
   lastDriverExitAt?: number;
   /** Whether the previous sweep saw a LIVE lease. The edge out of this is what an exit IS. */
   sawLive?: boolean;
+  /**
+   * How many sweeps IN A ROW have decided to dispatch this PR and then failed to produce a driver.
+   *
+   * A `lease-lost-or-spawn-refused` hold is filed in the same `holds` map as every ordinary
+   * DECISION, which is what makes a permanent one invisible: one refusal is routine (a lost acquire
+   * race is exactly what the compare-and-set is for), and a thousand of them look identical to it in
+   * the rollup. Measured on the founder's own machine — one PR held at that reason on EVERY sweep
+   * for over two days, ~58 consecutive identical INFO lines at the 180 s cadence, dispatching
+   * nothing and escalating nothing. The streak is the only thing that separates the two cases, and
+   * nothing was counting it.
+   *
+   * Reset on a dispatch that produced a driver, and on any sweep that decided NOT to dispatch — the
+   * count is `consecutive refusals`, so anything that is not a refusal breaks the run. Resetting on
+   * a plain hold is the conservative direction (it can only produce FEWER warnings) and it is what
+   * keeps a handful of unrelated lost races spread over a week from ever adding up to an alarm.
+   */
+  refusalStreak?: number;
 }
+
+/**
+ * Consecutive refused dispatches before a PR is called WEDGED.
+ *
+ * At the 180 s sweep cadence this is ~15 minutes of the dispatcher deciding, over and over, that a
+ * PR needs a driver and then not getting one. Below it, a refusal is ordinary contention and must
+ * stay quiet; the whole point of the streak is that the two are indistinguishable per-sweep.
+ */
+export const BABYSIT_REFUSAL_STREAK_WEDGED = 5;
+
+/**
+ * Once wedged, re-warn only every this-many further refusals (~1 hour at the 180 s cadence).
+ *
+ * A warn on EVERY sweep would reproduce the failure this fixes with a louder level: the header on
+ * the rollup below records a sweep that emitted 143 identical warns a day and went undiagnosed for
+ * a full day precisely because a line that repeats forever reads as background noise.
+ */
+export const BABYSIT_REFUSAL_STREAK_REWARN = 20;
 const prClocks = new Map<string, PrClocks>();
 
 /**
@@ -336,6 +371,16 @@ export interface BabysitSweepOutcome {
    * and it is the only outcome here that indicates a bug rather than a decision.
    */
   failed: number;
+  /**
+   * PRs this sweep decided to dispatch, could not, and has now failed to dispatch for at least
+   * {@link BABYSIT_REFUSAL_STREAK_WEDGED} sweeps in a row.
+   *
+   * Counted rather than only logged, for the same reason `failed` is: these PRs are already inside
+   * `holds`, indistinguishable from a PR the dispatcher deliberately left alone. A wedged PR is not
+   * a decision — the dispatcher WANTED a driver and the fleet would not give it one — so it needs a
+   * field of its own in the summary a human reads.
+   */
+  wedged: number;
   /** True when this sweep was superseded mid-flight and stopped early rather than writing stale
    *  state. Surfaced so an abandoned sweep is visible rather than looking like a quiet one. */
   abandoned?: boolean;
@@ -368,7 +413,7 @@ export async function babysitSweepProject(
    */
   dispatchClock: () => number = () => now,
 ): Promise<BabysitSweepOutcome> {
-  const out: BabysitSweepOutcome = { dispatched: [], holds: {}, unidentified: 0, failed: 0 };
+  const out: BabysitSweepOutcome = { dispatched: [], holds: {}, unidentified: 0, failed: 0, wedged: 0 };
   const hold = (reason: string): void => {
     out.holds[reason] = (out.holds[reason] ?? 0) + 1;
   };
@@ -480,6 +525,9 @@ export async function babysitSweepProject(
 
       if (!decision.dispatch) {
         hold(decision.hold);
+        // A sweep that declined to dispatch is not a refusal, so it BREAKS the run — see the field's
+        // own note for why the count is consecutive rather than cumulative.
+        clocks.refusalStreak = 0;
         // REMEMBER WHAT WE SAW EVEN WHEN HOLDING — that is the entire two-observation rule. A hold of
         // `single-observation` that did not record this sighting could never become a dispatch, and
         // the sweep would report "waiting for a second look" forever.
@@ -515,10 +563,34 @@ export async function babysitSweepProject(
         // for an event that never happened — and since the exit clock is the sole per-PR limiter,
         // `sawLive` is the field that guard now protects. Hoisting it out of `if (agentId)` is what
         // the two refusal tests fail on.
+        // NO `clocks.refusalStreak = 0` HERE, DELIBERATELY. One was written and DELETED because it
+        // could not fail: after a dispatch, the very next sweep for this PR necessarily HOLDS —
+        // `driver-alive` while the lease is live, `cooling-down` once the exit edge stamps — and
+        // the reset on that branch has already zeroed the streak before any later refusal can add
+        // to it. Removing this line left every assertion green, which is the file's own test for
+        // dead state (see the `lastDispatchAt` note above). The reset a dispatch needs is real; it
+        // just arrives one sweep later, through the hold, and that path IS covered.
         clocks.sawLive = true;
         out.dispatched.push({ repo, pr: pr.number, agentId });
       } else {
         hold("lease-lost-or-spawn-refused");
+        // THE STREAK, NOT THE REFUSAL, IS THE SIGNAL. One refusal is what the compare-and-set is
+        // for; a run of them means this PR is never going to get a driver until someone looks.
+        const streak = (clocks.refusalStreak ?? 0) + 1;
+        clocks.refusalStreak = streak;
+        if (streak >= BABYSIT_REFUSAL_STREAK_WEDGED) {
+          out.wedged += 1;
+          if (
+            streak === BABYSIT_REFUSAL_STREAK_WEDGED ||
+            (streak - BABYSIT_REFUSAL_STREAK_WEDGED) % BABYSIT_REFUSAL_STREAK_REWARN === 0
+          ) {
+            log.warn("babysit", "a PR keeps being chosen for a driver and keeps not getting one", {
+              repo,
+              pr: pr.number,
+              consecutiveRefusals: streak,
+            });
+          }
+        }
       }
     } catch (e) {
       // Counted, not just logged. `failed` is the only outcome in a sweep that means a BUG rather
@@ -742,7 +814,14 @@ export async function sweepAllProjects(
       // rather than `debug` because a quiet sweep should still say so — the failure this system is
       // most likely to have is silence. Cost is one small JSON line per owned project per 180 s
       // sweep, and only when there is something to say.
+      //
+      // A THIRD PROMOTION, SAME CAUSE (see `BabysitSweepOutcome.wedged`). A PR whose dispatch is
+      // refused every single sweep files an ordinary hold, so this line stayed at `info` and read
+      // exactly like a quiet sweep that had decided to leave things alone — for over two days, at
+      // three-minute intervals, on the founder's own machine. `wedged` is the same shape as
+      // `failed`: not a decision, so it enters the LEVEL and not just the payload.
       const failures = outcome.failed > 0;
+      const wedged = outcome.wedged > 0;
       if (failures || outcome.dispatched.length > 0 || Object.keys(outcome.holds).length > 0) {
         const summary = {
           project: project.id,
@@ -750,8 +829,10 @@ export async function sweepAllProjects(
           holds: outcome.holds,
           unidentified: outcome.unidentified,
           failed: outcome.failed,
+          wedged: outcome.wedged,
         };
         if (failures) log.warn("babysit", "sweep skipped PRs that threw", summary);
+        else if (wedged) log.warn("babysit", "sweep could not dispatch a PR it keeps choosing", summary);
         else log.info("babysit", "sweep", summary);
       }
     } catch (e) {
