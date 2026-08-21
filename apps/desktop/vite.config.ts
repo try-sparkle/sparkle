@@ -23,7 +23,12 @@ function devChiefPat(mode: string): string {
     const p = resolve(process.cwd(), rel);
     if (existsSync(p)) {
       const m = readFileSync(p, "utf8").match(/^\s*CHIEF_API\s*=\s*(.+)\s*$/m);
-      if (m) return m[1].replace(/^["']|["']$/g, "").trim();
+      // `m?.[1]` rather than `m[1]`: this file is now inside the typechecked program (a test
+      // imports it to pin the PAT gate), and `noUncheckedIndexedAccess` types a capture group as
+      // possibly-undefined. Behaviour is identical — `(.+)` is not optional, so a match always
+      // participates — this just states it in a way tsc can see.
+      const raw = m?.[1];
+      if (raw !== undefined) return raw.replace(/^["']|["']$/g, "").trim();
     }
   }
   return "";
