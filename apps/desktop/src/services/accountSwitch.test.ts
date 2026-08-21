@@ -11,9 +11,13 @@ import {
   advanceSwitch,
   moveAgent,
   isSwitchComplete,
+  revalidateSwitchTarget,
+  planHelperRescue,
   type SwitchPlan,
 } from "./accountSwitch";
 import { getPin, setPin, clearAllPins } from "./accountStore";
+import type { Account, Usage, Identity } from "./accountStore";
+import type { Ceiling } from "./headroom";
 import type { AgentTabStatus } from "../types";
 
 beforeEach(() => clearAllPins());
@@ -252,5 +256,155 @@ describe("a switch actually changes the account the agent runs under", () => {
     expect(lastExec).not.toContain("/cfg/old-account");
     // And a fresh rebuild keeps landing on the new account, so the pane re-registers it.
     expect(rebuildExec("x")).toContain("/cfg/new-account");
+  });
+});
+
+// ── revalidateSwitchTarget — re-plan when a switch target goes invalid mid-migration ─────────────
+describe("revalidateSwitchTarget", () => {
+  const NOW = 1_000_000;
+  const WALL = NOW + 3_600_000; // an observed rate-limit wall an hour out
+  const a = (id: string): Account => ({
+    id,
+    nickname: id,
+    configDir: `/cfg/${id}`,
+    isDefault: false,
+    createdAt: 0,
+  });
+  const u = (id: string, exhaustedUntil: number | null = null): Usage => ({
+    id,
+    tokens5h: 0,
+    tokens7d: 0,
+    exhaustedUntil,
+  });
+  const ident = (id: string): Identity => ({
+    id,
+    email: `${id}@example.com`,
+    organization: null,
+    accountUuid: `uuid-${id}`,
+  });
+  const plan = (toAccountId: string, fromAccountId: string | null = "from"): SwitchPlan => ({
+    fromAccountId,
+    toAccountId,
+    pending: ["agent-1", "agent-2"],
+    moved: [],
+  });
+  const noCeil: Ceiling[] = [];
+
+  it("leaves a still-healthy target untouched", () => {
+    const accounts = [a("from"), a("to"), a("other")];
+    const idents = [ident("from"), ident("to"), ident("other")];
+    const p = plan("to");
+    const r = revalidateSwitchTarget(p, accounts, [u("to")], noCeil, idents, NOW, []);
+    expect(r.kind).toBe("ok");
+    expect(r.plan).toBe(p); // same object — nothing re-planned
+  });
+
+  it("re-targets to a healthy account when the target has hit its OWN wall mid-migration", () => {
+    const accounts = [a("from"), a("to"), a("other")];
+    const idents = [ident("from"), ident("to"), ident("other")];
+    const r = revalidateSwitchTarget(
+      plan("to"),
+      accounts,
+      [u("to", WALL)], // the chosen target is now walled
+      noCeil,
+      idents,
+      NOW,
+      [],
+    );
+    expect(r.kind).toBe("retargeted");
+    expect(r.plan.toAccountId).toBe("other");
+    expect(r.plan.pending).toEqual(["agent-1", "agent-2"]); // pending redirected, not dropped
+  });
+
+  it("re-targets when the target was REMOVED mid-migration (gone from accounts)", () => {
+    const accounts = [a("from"), a("other")]; // "gone" no longer registered
+    const idents = [ident("from"), ident("other")];
+    const r = revalidateSwitchTarget(plan("gone"), accounts, [], noCeil, idents, NOW, []);
+    expect(r.kind).toBe("retargeted");
+    expect(r.plan.toAccountId).toBe("other");
+  });
+
+  it("re-targets when the target's LOGIN expired mid-migration (no longer signed in)", () => {
+    const accounts = [a("from"), a("to"), a("other")];
+    const idents = [ident("from"), ident("other")]; // "to" lost its login
+    const r = revalidateSwitchTarget(plan("to"), accounts, [u("to")], noCeil, idents, NOW, []);
+    expect(r.kind).toBe("retargeted");
+    expect(r.plan.toAccountId).toBe("other");
+  });
+
+  it("HOLDS — moves nobody — when the target is dead and nothing healthy remains", () => {
+    const accounts = [a("from"), a("to"), a("other")];
+    const idents = [ident("from"), ident("to"), ident("other")];
+    const p = plan("to");
+    const r = revalidateSwitchTarget(
+      p,
+      accounts,
+      [u("to", WALL), u("other", WALL)], // both the target and the only alternative are walled
+      noCeil,
+      idents,
+      NOW,
+      [],
+    );
+    expect(r.kind).toBe("held");
+    expect(r.plan).toBe(p);
+  });
+
+  it("never re-targets back to the account being VACATED, even when it is the only healthy one", () => {
+    // The whole point of the switch is to get OFF `from`; sending agents back would undo it. With the
+    // target walled and `from` the only other signed-in account, the correct answer is HOLD, not from.
+    const accounts = [a("from"), a("to")];
+    const idents = [ident("from"), ident("to")];
+    const r = revalidateSwitchTarget(
+      plan("to"),
+      accounts,
+      [u("to", WALL)], // to walled; from perfectly healthy
+      noCeil,
+      idents,
+      NOW,
+      [],
+    );
+    expect(r.kind).toBe("held");
+  });
+
+  it("folds ALREADY-MOVED agents back into pending on a re-target, so none is left on the dead target", () => {
+    // A retarget must not leave the agents that already reached the (now-dead) target stranded on it:
+    // nothing else moves them (the exhaustion auto-switch judges the busiest account, which after a
+    // retarget is the NEW target, not the dead one). Fold `moved` into `pending` under the new target.
+    const accounts = [a("from"), a("to"), a("other")];
+    const idents = [ident("from"), ident("to"), ident("other")];
+    const inFlight: SwitchPlan = {
+      fromAccountId: "from",
+      toAccountId: "to",
+      pending: ["still-pending"],
+      moved: ["already-moved-1", "already-moved-2"],
+      revalidate: true,
+      ownsPreference: true,
+    };
+    const r = revalidateSwitchTarget(inFlight, accounts, [u("to", WALL)], noCeil, idents, NOW, []);
+    expect(r.kind).toBe("retargeted");
+    expect(r.plan.toAccountId).toBe("other");
+    expect(r.plan.pending.sort()).toEqual(["already-moved-1", "already-moved-2", "still-pending"]);
+    expect(r.plan.moved).toEqual([]);
+  });
+});
+
+// ── plan target-ownership flags — who may re-validate, who owns the fleet preference ─────────────
+describe("plan target-ownership flags", () => {
+  it("planSwitch (auto/accept) may re-validate AND owns the fleet preference", () => {
+    const p = planSwitch("a", "b", { one: "a" });
+    expect(p.revalidate).toBe(true);
+    expect(p.ownsPreference).toBe(true);
+  });
+
+  it("planSwitchToAccount (manual activation) may NOT be re-validated — the user chose the target", () => {
+    const p = planSwitchToAccount("b", { one: "a" });
+    expect(p.revalidate).toBe(false);
+    expect(p.ownsPreference).toBe(false);
+  });
+
+  it("planHelperRescue may re-validate but does NOT own the fleet preference (it only relocates the pair)", () => {
+    const p = planHelperRescue("a", "b", { __sparkle_self__: "a" });
+    expect(p.revalidate).toBe(true);
+    expect(p.ownsPreference).toBe(false);
   });
 });

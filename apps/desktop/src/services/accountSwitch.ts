@@ -30,7 +30,12 @@ import {
   type LiveUsage,
 } from "./accountStore";
 import { isStickyAccountKey, SPARKLE_SELF_ACCOUNT_PREFIX } from "./accountSelection";
-import { switchRecommendation, type Ceiling } from "./headroom";
+import {
+  switchRecommendation,
+  bestHealthyTarget,
+  isHealthyTarget,
+  type Ceiling,
+} from "./headroom";
 import { releaseQuotaBlockForAgent } from "../engine/engineRegistry";
 
 /** Statuses at which an agent can be re-spawned without losing in-flight work. Everything except
@@ -61,6 +66,18 @@ export interface SwitchPlan {
   pending: string[];
   /** Agents already re-pinned and re-spawned. */
   moved: string[];
+  /** Whether phase 2 may RE-VALIDATE this plan's target mid-migration and re-target it if it went
+   *  invalid ({@link revalidateSwitchTarget}). True ONLY for plans whose target THIS oracle chose —
+   *  `planSwitch` (auto/accept) and the helper rescue. A MANUAL activation (`planSwitchToAccount`)
+   *  leaves it false/absent: the user named that account explicitly, and re-validation would silently
+   *  redirect the fleet away from their choice (worse, off a just-added account not yet in the 120s
+   *  health snapshot, or off a uuid-only login that reads as "not signed in"). Absent ⇒ false. */
+  revalidate?: boolean;
+  /** Whether re-targeting this plan also writes the fleet-wide preference (`setPreferredAccountId`).
+   *  True ONLY for `planSwitch` (auto/accept), which owns that preference. A HELPER RESCUE carries a
+   *  `fromAccountId` but deliberately must NOT touch the fleet preference — it only relocates the
+   *  sticky pair — so it sets this false. Absent ⇒ false. */
+  ownsPreference?: boolean;
 }
 
 /** Entries a migration may touch AT ALL: it is running somewhere, and nobody pinned it by hand.
@@ -138,7 +155,9 @@ export function planSwitch(
   const pending = unpinnedRunning(agentAccounts)
     .filter(([, acct]) => acct === fromAccountId)
     .map(([agentId]) => agentId);
-  return { fromAccountId, toAccountId, pending, moved: [] };
+  // Auto/accept: this oracle chose the target and owns the fleet preference, so phase 2 may
+  // re-validate + re-target it, and a re-target writes the preference.
+  return { fromAccountId, toAccountId, pending, moved: [], revalidate: true, ownsPreference: true };
 }
 
 /** Build the plan for "run agents on THIS account": every agent that is not already there needs to
@@ -192,7 +211,10 @@ export function planSwitchToAccount(
   const pending = Object.keys(agentAccounts).filter(
     (id) => agentAccounts[id] !== toAccountId && sweepableByActivation(id),
   );
-  return { fromAccountId: null, toAccountId, pending, moved: [] };
+  // MANUAL activation: the user named this account explicitly. Phase 2 must NOT re-validate or
+  // re-target it — doing so would silently overrule their choice (and could fire off a just-added
+  // account absent from the 120s health snapshot, or a uuid-only login that reads as unsigned).
+  return { fromAccountId: null, toAccountId, pending, moved: [], revalidate: false, ownsPreference: false };
 }
 
 /** Distinct accounts a STICKY HELPER (Improve Sparkle, or a concierge pane) is currently running
@@ -231,7 +253,10 @@ export function planHelperRescue(
     .filter((e): e is [string, string] => e[1] === fromAccountId)
     .filter(([id]) => isStickyAccountKey(id) || !hasHumanPin(id))
     .map(([id]) => id);
-  return { fromAccountId, toAccountId, pending, moved: [] };
+  // Rescue: this oracle chose the target, so re-validate + re-target it if it dies too — but a rescue
+  // relocates only the sticky pair and must NOT rewrite the fleet-wide preference (phase 1's own
+  // contract), so `ownsPreference` stays false.
+  return { fromAccountId, toAccountId, pending, moved: [], revalidate: true, ownsPreference: false };
 }
 
 /** Find a sticky helper stranded on an EXHAUSTED account and plan its rescue, or null if none is.
@@ -264,6 +289,67 @@ export function planStrandedHelperRescue(
     if (plan.pending.length > 0) return plan;
   }
   return null;
+}
+
+/** The outcome of re-checking a running plan's destination. `ok` and `retargeted` both hand back a
+ *  plan to advance; `held` means the caller must move NOBODY this tick. */
+export type TargetRevalidation =
+  | { kind: "ok"; plan: SwitchPlan }
+  | { kind: "retargeted"; plan: SwitchPlan }
+  | { kind: "held"; plan: SwitchPlan };
+
+/** Re-validate a running plan's destination against current account health, re-targeting when it has
+ *  gone invalid mid-migration.
+ *
+ *  A plan's `toAccountId` is chosen ONCE, when the switch starts, but agents migrate onto it over
+ *  minutes — each waits for its own safe boundary. In that window the target can go invalid: it hits
+ *  its OWN rate-limit wall, its login expires, or the user removes it. Nothing else watches for this
+ *  while a plan runs — `useAccountSwitch` phase 1 (the health poll) suppresses itself as soon as a plan
+ *  exists — so without this check `advanceSwitch` keeps pinning and re-spawning agents onto a dead
+ *  account. Re-pick the destination the SAME way the switch was planned ({@link bestHealthyTarget}, the
+ *  shared oracle), excluding the vacated account and the dead target:
+ *
+ *   - target still a healthy destination  → `ok`, the plan unchanged;
+ *   - target invalid, a healthy replacement exists → `retargeted`, the plan pointed at it. Agents
+ *     already MOVED onto the now-dead target are folded back into `pending` so they, too, migrate off
+ *     it — nothing should be left pinned to a dead account, and re-spawns still respect each agent's
+ *     safe boundary. (They are NOT covered by the exhaustion auto-switch: after a retarget the
+ *     majority land on the new target, so the dead account is by construction not `busiestPaneAccount`,
+ *     and ordinary build agents are not the sticky helpers the stranded-helper sweep watches.)
+ *   - target invalid, NO healthy account at all → `held`: the caller retires the plan (rather than
+ *     spinning it), which re-arms phase 1 so its recommendation, auto-switch, and helper-rescue sweeps
+ *     run again; the fleet stays put and keeps working, and phase 1 re-plans once an account frees up.
+ *
+ *  PURE: the hook drives the effects (the preference write, the re-spawns, retiring a held plan) so
+ *  this stays testable. */
+export function revalidateSwitchTarget(
+  plan: SwitchPlan,
+  accounts: Account[],
+  usage: Usage[],
+  ceilings: Ceiling[],
+  identities: Identity[],
+  now: number,
+  live: readonly LiveUsage[],
+): TargetRevalidation {
+  if (isHealthyTarget(plan.toAccountId, accounts, usage, ceilings, identities, now, live)) {
+    return { kind: "ok", plan };
+  }
+  // Dead target: exclude it (and the vacated login) so we never re-pick a sibling of a walled login.
+  const exclude = plan.fromAccountId ? [plan.toAccountId, plan.fromAccountId] : [plan.toAccountId];
+  const next = bestHealthyTarget(accounts, usage, ceilings, identities, now, live, exclude);
+  if (!next) return { kind: "held", plan };
+  // Redirect the pending agents AND fold the already-moved back into pending: they are stranded on the
+  // dead target and nothing else will move them. `advanceSwitch` still only re-spawns each at a safe
+  // boundary, so no in-flight turn is lost.
+  return {
+    kind: "retargeted",
+    plan: {
+      ...plan,
+      toAccountId: next.id,
+      pending: [...plan.pending, ...plan.moved],
+      moved: [],
+    },
+  };
 }
 
 /** Which pending agents are ready to move right now, given live statuses. PURE — the caller

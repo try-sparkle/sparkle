@@ -25,9 +25,15 @@ const h = vi.hoisted(() => ({
   restart: vi.fn((_agentId: string) => true),
   /** Stands in for `setPinFromSwitch` — the pin a MIGRATION writes. */
   setPin: vi.fn((_agentId: string, _accountId: string) => {}),
+  /** Stands in for `setPreferredAccountId` — the durable fleet preference a (re)target writes. */
+  setPreferred: vi.fn((_accountId: string) => {}),
   invalidate: vi.fn(),
   statuses: {} as Record<string, AgentTabStatus | undefined>,
   paneAccounts: {} as Record<string, string | undefined>,
+  // Phase 2's mid-migration re-validation, driven per test. Default: the target stays healthy, so
+  // re-validation is a no-op and the advance behaves exactly as before.
+  targetHealthy: true,
+  retarget: null as Account | null,
 }));
 
 // Makes React's *permitted* behavior deterministic: when `replayUpdaters` is on, every
@@ -66,6 +72,7 @@ vi.mock("../services/paneControl", () => ({
 vi.mock("../services/accountStore", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../services/accountStore")>()),
   setPinFromSwitch: (agentId: string, accountId: string) => h.setPin(agentId, accountId),
+  setPreferredAccountId: (accountId: string) => h.setPreferred(accountId),
   listCeilings: async () => [],
 }));
 
@@ -94,6 +101,9 @@ vi.mock("../services/headroom", () => ({
     fraction: 0.9,
     reason: "approaching" as const,
   }),
+  // Phase 2's mid-migration re-validation, driven per test via the harness (default: healthy → no-op).
+  isHealthyTarget: () => h.targetHealthy,
+  bestHealthyTarget: () => h.retarget,
 }));
 
 // Imported AFTER the mocks so the hook picks them up.
@@ -126,9 +136,12 @@ beforeEach(() => {
   h.replayUpdaters = false;
   h.restart.mockClear();
   h.setPin.mockClear();
+  h.setPreferred.mockClear();
   h.invalidate.mockClear();
   h.paneAccounts = { a1: "acct-a", a2: "acct-a" };
   h.statuses = { a1: "idle", a2: "idle" };
+  h.targetHealthy = true;
+  h.retarget = null;
 });
 
 afterEach(() => {
@@ -198,5 +211,67 @@ describe("useAccountSwitch phase 2", () => {
 
     expect(h.restart).toHaveBeenCalledTimes(2);
     expect(view.result.current.plan).toBeNull();
+  });
+});
+
+// ── phase 2 re-validates the target mid-migration (sparkle-m8f39q) ───────────────────────────────
+describe("phase 2 re-validates a running plan's target before moving anyone onto it", () => {
+  it("re-targets the pending agents to a healthy account when the target goes invalid mid-migration", async () => {
+    const view = await acceptedSwitch(); // plan → acct-b, pending [a1, a2]
+    expect(view.result.current.plan?.toAccountId).toBe("acct-b");
+
+    // The chosen target dies mid-migration; acct-c is the healthy replacement the oracle picks.
+    h.targetHealthy = false;
+    h.retarget = acct("acct-c");
+    tick();
+
+    // Agents are re-spawned onto acct-c, NOT the dead acct-b, and the fleet preference follows.
+    expect(h.setPin).toHaveBeenCalledWith("a1", "acct-c");
+    expect(h.setPin).toHaveBeenCalledWith("a2", "acct-c");
+    expect(h.setPin).not.toHaveBeenCalledWith("a1", "acct-b");
+    expect(h.setPreferred).toHaveBeenCalledWith("acct-c");
+  });
+
+  it("RETIRES the plan — moving nobody — when the target is dead and no healthy account remains", async () => {
+    const view = await acceptedSwitch();
+
+    // Target invalid and nowhere healthy to go: move nobody, and RETIRE the plan rather than hold it.
+    // A held plan keeps planRef set, which makes phase 1 short-circuit and silences its recommendation,
+    // auto-switch, and helper-rescue sweeps for the session. Retiring re-arms them; the fleet never left
+    // `from`, so it keeps working, and phase 1 re-plans once an account frees up.
+    h.targetHealthy = false;
+    h.retarget = null;
+    tick();
+
+    expect(h.restart).not.toHaveBeenCalled();
+    expect(h.setPin).not.toHaveBeenCalled();
+    expect(h.setPreferred).not.toHaveBeenCalled();
+    expect(view.result.current.plan).toBeNull();
+  });
+
+  it("does NOT re-validate a MANUAL activation plan — the user's chosen target is honoured", async () => {
+    // The HIGH regression: re-validation must apply only to plans THIS oracle chose. "Activate this
+    // account" names a target explicitly; retargeting it would silently overrule the user — worse, off
+    // a just-added account absent from the 120s snapshot, or a uuid-only login that reads as unsigned.
+    const view = renderHook(() => useAccountSwitch(60 * 60 * 1000));
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    act(() => {
+      view.result.current.switchTo("acct-c"); // planSwitchToAccount → revalidate:false
+    });
+    expect(view.result.current.plan?.toAccountId).toBe("acct-c");
+
+    // Even with the oracle screaming that acct-c is dead and acct-d is the healthy pick, a manual plan
+    // is left alone: agents go to acct-c, never acct-d.
+    h.targetHealthy = false;
+    h.retarget = acct("acct-d");
+    tick();
+
+    expect(h.setPin).toHaveBeenCalledWith("a1", "acct-c");
+    expect(h.setPin).toHaveBeenCalledWith("a2", "acct-c");
+    expect(h.setPin).not.toHaveBeenCalledWith("a1", "acct-d");
   });
 });

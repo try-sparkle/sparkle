@@ -177,9 +177,8 @@ export function switchRecommendation(
   const current = byId.get(currentAccountId);
   if (!current) return null;
 
-  const signedIn = new Set(signedInAccountIds(identities));
-  // ONE login grouping, shared by the same-login exclusion, the current-account spend test below, and
-  // the PER-LOGIN live check on candidates.
+  // ONE login grouping, shared by the current-account spend test below and — via
+  // {@link bestHealthyTarget} — the same-login exclusion and the per-login live check on candidates.
   const siblingIds = loginSiblingIds(accounts, identities);
 
   // TRIGGER on EITHER authoritative signal auto-pick already acts on for the CURRENT account — never
@@ -205,13 +204,58 @@ export function switchRecommendation(
   const currentIsSpent = current.state === "exhausted" || currentLiveWorst >= LIVE_AVOID_PERCENT;
   if (!currentIsSpent) return null;
 
-  const sameLoginAsFrom = new Set(
-    (siblingIds.get(currentAccountId) ?? []).filter((id) => id !== currentAccountId),
-  );
+  // The FROM account is spent — pick the healthiest signed-in account to move to, excluding the
+  // vacated login and its same-login siblings (a sibling shares one quota and hits the wall together).
+  const best = bestHealthyTarget(accounts, usage, ceilings, identities, now, live, [currentAccountId]);
+  if (!best) return null;
+
+  return {
+    from,
+    to: best,
+    fraction: current.fraction,
+    reason: "exhausted",
+  };
+}
+
+/** The healthiest signed-in account to move agents TO, or null when none qualifies.
+ *
+ *  "Healthy" is the candidate-eligibility test {@link switchRecommendation} has always applied, lifted
+ *  out so a MID-MIGRATION re-target can reuse the exact same oracle rather than re-deriving a second
+ *  rule (`accountSwitch.revalidateSwitchTarget`). An account qualifies when it is:
+ *   - signed in;
+ *   - not on the OBSERVED wall (`state !== "exhausted"`); and
+ *   - below {@link LIVE_AVOID_PERCENT} of its real Anthropic quota, judged PER LOGIN
+ *     ({@link loginLiveWorstPercent}) — the SAME exclusion the spawn gate (`partitionAccounts`) and
+ *     AC8 (`exhaustionOutlook`) apply, so every consumer of the live signal stays consistent.
+ *
+ *  Every account whose login group intersects `excludeLoginsOf` is dropped BEFORE ranking: pass the
+ *  account being vacated (agents are leaving it) and, for a re-target, the dead target — switching to a
+ *  sibling of a walled login gains nothing, it shares that login's one quota and one wall. The
+ *  learned-ceiling estimate (`warn`) is deliberately NOT an exclusion — it must not veto a real
+ *  escape; it only RANKS a target last. Ties and ranking use {@link headroomRank}: most runway first. */
+export function bestHealthyTarget(
+  accounts: Account[],
+  usage: Usage[],
+  ceilings: Ceiling[],
+  identities: Identity[],
+  now: number,
+  live: readonly LiveUsage[],
+  excludeLoginsOf: Iterable<string>,
+): Account | null {
+  const liveById = new Map(live.map((l) => [l.id, l]));
+  const byId = new Map(assessHeadroom(usage, ceilings, now).map((h) => [h.accountId, h]));
+  const signedIn = new Set(signedInAccountIds(identities));
+  const siblingIds = loginSiblingIds(accounts, identities);
+
+  // Expand each excluded id to its whole login group, so excluding one registration excludes the
+  // quota it shares. An id not in a duplicate group falls back to just itself.
+  const excluded = new Set<string>();
+  for (const id of excludeLoginsOf) {
+    for (const sib of siblingIds.get(id) ?? [id]) excluded.add(sib);
+  }
+
   const candidates = accounts
-    .filter(
-      (a) => a.id !== currentAccountId && signedIn.has(a.id) && !sameLoginAsFrom.has(a.id),
-    )
+    .filter((a) => signedIn.has(a.id) && !excluded.has(a.id))
     .map((a) => ({
       account: a,
       h: byId.get(a.id) ?? {
@@ -222,31 +266,41 @@ export function switchRecommendation(
         state: "unknown" as const,
       },
     }))
-    // Exclude a target on the OBSERVED wall OR real Anthropic utilization at/above LIVE_AVOID_PERCENT,
-    // judged PER LOGIN ({@link loginLiveWorstPercent}) — the SAME exclusions and the SAME per-login
-    // judgement `partitionAccounts` (the spawn gate) and `exhaustionOutlook` (AC8) now apply, so all
-    // three consumers of the live signal stay consistent. This is what closes both the harm (a
-    // duplicate of a spent login whose OWN live fetch failed is no longer offered/auto-migrated onto)
-    // and the contradiction (AC8 judges the login-DEDUPED `usable` set, so a per-DIR live rule made
-    // "which dir carries the row" decide the banner while this filter saw another dir — banner and
-    // runway could then render opposite verdicts). The learned-ceiling estimate (`warn`) is
-    // deliberately NOT an exclusion here — it must not veto a real escape — it only RANKS last.
     .filter(
       (c) =>
         c.h.state !== "exhausted" &&
         !((loginLiveWorstPercent(c.account.id, liveById, siblingIds) ?? 0) >= LIVE_AVOID_PERCENT),
     );
-
   if (candidates.length === 0) return null;
   candidates.sort((x, y) => headroomRank(x.h) - headroomRank(y.h));
-  const best = candidates[0]!;
+  return candidates[0]!.account;
+}
 
-  return {
-    from,
-    to: best.account,
-    fraction: current.fraction,
-    reason: "exhausted",
-  };
+/** Whether `accountId` is STILL a valid place to move agents to — the single-account form of the
+ *  {@link bestHealthyTarget} eligibility test. It must still exist, be signed in, not be on the
+ *  observed wall, and be below {@link LIVE_AVOID_PERCENT} of its real quota (judged per login).
+ *
+ *  Used to decide whether a running switch's chosen target has gone invalid mid-migration (hit its own
+ *  wall, had its login expire, or been removed) and needs re-targeting — separate from "pick the best"
+ *  so a still-valid target is NEVER abandoned merely because another account happens to have more
+ *  runway, which would churn agents already on their way to a perfectly good account. */
+export function isHealthyTarget(
+  accountId: string,
+  accounts: Account[],
+  usage: Usage[],
+  ceilings: Ceiling[],
+  identities: Identity[],
+  now: number,
+  live: readonly LiveUsage[],
+): boolean {
+  if (!accounts.some((a) => a.id === accountId)) return false; // removed mid-migration
+  if (!new Set(signedInAccountIds(identities)).has(accountId)) return false; // login expired / never
+  const h = new Map(assessHeadroom(usage, ceilings, now).map((x) => [x.accountId, x])).get(accountId);
+  if (h && h.state === "exhausted") return false; // observed wall
+  const liveById = new Map(live.map((l) => [l.id, l]));
+  const siblingIds = loginSiblingIds(accounts, identities);
+  if ((loginLiveWorstPercent(accountId, liveById, siblingIds) ?? 0) >= LIVE_AVOID_PERCENT) return false;
+  return true;
 }
 
 

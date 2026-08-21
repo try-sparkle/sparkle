@@ -100,6 +100,9 @@ vi.mock("../services/headroom", () => ({
           reason: h.reason,
         };
   },
+  // The target stays healthy in this suite, so phase 2's mid-migration re-validation is a no-op.
+  isHealthyTarget: () => true,
+  bestHealthyTarget: () => null,
 }));
 
 vi.mock("../stores/runtimeStore", () => ({

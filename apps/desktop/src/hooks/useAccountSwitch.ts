@@ -25,6 +25,8 @@ import {
   setPreferredAccountId,
   clearSwitchWrittenPins,
   type Usage,
+  type Account,
+  type Identity,
 } from "../services/accountStore";
 import { switchRecommendation, type SwitchRecommendation, type Ceiling } from "../services/headroom";
 import {
@@ -32,6 +34,7 @@ import {
   planSwitch,
   planSwitchToAccount,
   planStrandedHelperRescue,
+  revalidateSwitchTarget,
   type SwitchPlan,
 } from "../services/accountSwitch";
 import { busiestPaneAccount, paneAccountMap, restartPane } from "../services/paneControl";
@@ -91,6 +94,17 @@ export function useAccountSwitch(pollMs: number = HEADROOM_POLL_MS): AccountSwit
   useEffect(() => {
     planRef.current = plan;
   }, [plan]);
+  // Phase 1's most recent believable account-health snapshot, read SYNCHRONOUSLY by phase 2 to
+  // re-validate a running plan's target without doing its own IPC. Written on every phase-1 tick we can
+  // believe (`!state.failed`) — including while a plan is running, since it is stamped BEFORE phase 1's
+  // in-plan early return — so it refreshes every HEADROOM_POLL_MS throughout a migration. Null until the
+  // first believable load, in which case phase 2 advances without re-validating, as it always did.
+  const healthRef = useRef<{
+    accounts: Account[];
+    usage: Usage[];
+    ceilings: Ceiling[];
+    identities: Identity[];
+  } | null>(null);
 
   // ---- phase 1: recommend ---------------------------------------------------------------------
   useEffect(() => {
@@ -111,6 +125,14 @@ export function useAccountSwitch(pollMs: number = HEADROOM_POLL_MS): AccountSwit
         // earlier tick while a plan is running.
         if (!state.failed) {
           observedWalls.current = new Map(state.usage.map((u) => [u.id, u.exhaustedUntil ?? null]));
+          // Stamp the health snapshot phase 2 reads to re-validate a running plan's target. BEFORE the
+          // in-plan early return below, so it stays fresh even while a switch is in progress.
+          healthRef.current = {
+            accounts: state.accounts,
+            usage: state.usage,
+            ceilings,
+            identities: state.identities,
+          };
         }
         const current = busiestPaneAccount();
         // The SAME live rows the spawn gate uses (`loadAccountState` kicks the background refresh;
@@ -256,7 +278,56 @@ export function useAccountSwitch(pollMs: number = HEADROOM_POLL_MS): AccountSwit
       const cur = planRef.current;
       if (!cur) return;
       const statuses = useRuntimeStore.getState().status;
-      const { plan: next, movedNow } = advanceSwitch(cur, statuses, restartPane);
+
+      // RE-VALIDATE THE TARGET before moving anyone onto it. The destination is chosen ONCE, when the
+      // switch starts, but agents migrate onto it over minutes; in that window it can hit its own wall,
+      // have its login expire, or be removed. Phase 1 suppresses its recommendation logic while a plan
+      // runs, so nothing else would notice — an agent reaching a boundary would be pinned and re-spawned
+      // onto a dead account. `healthRef` is phase 1's most recent account-health snapshot: it loads
+      // state every HEADROOM_POLL_MS *before* that suppression, so the snapshot refreshes even mid-plan,
+      // and reading a ref keeps this mover SYNCHRONOUS and cheap (no per-tick IPC, no async re-entrancy —
+      // the double re-spawn of sparkle-0t2o). Until the first snapshot lands, advance as before.
+      //
+      // ONLY for plans whose target THIS oracle chose (`cur.revalidate`). A MANUAL activation named its
+      // target explicitly, and re-validating it would silently redirect the fleet off the user's choice
+      // — including off a just-added account not yet in the 120s snapshot, or a uuid-only login that
+      // reads as unsigned. So `planSwitchToAccount` opts out.
+      let work = cur;
+      const health = healthRef.current;
+      if (health && cur.revalidate) {
+        const verdict = revalidateSwitchTarget(
+          cur,
+          health.accounts,
+          health.usage,
+          health.ceilings,
+          health.identities,
+          Date.now(),
+          liveUsageRows(),
+        );
+        // Target dead and nowhere healthy to go: RETIRE the plan rather than spin it. A kept plan keeps
+        // `planRef.current` set, which makes phase 1 short-circuit — silencing its recommendation,
+        // auto-switch, AND helper-rescue sweeps for the rest of the session, even the ones unrelated to
+        // this plan. Retiring re-arms all of them; the fleet never left `from`, so it keeps working, and
+        // phase 1 re-plans from scratch once an account frees up.
+        if (verdict.kind === "held") {
+          planRef.current = null;
+          setPlan(null);
+          return;
+        }
+        if (verdict.kind === "retargeted") {
+          // Redirect the pending (and now the folded-in already-moved) agents. Write the fleet-wide
+          // preference ONLY when this plan owns it — the auto/accept path does; a helper rescue must not
+          // (it only relocates the sticky pair). The banner names `plan.toAccountId`, so the retargeted
+          // plan we advance and set below re-renders pointing at the new account for free.
+          if (cur.ownsPreference) setPreferredAccountId(verdict.plan.toAccountId);
+          work = verdict.plan;
+        }
+      }
+
+      // Computed OUTSIDE any setPlan updater and run once per interval tick, because advanceSwitch
+      // re-pins and re-spawns real terminals and React may replay an updater against stale state — bead
+      // sparkle-0t2o. `planRef` is the source of truth; every setter writes it synchronously.
+      const { plan: next, movedNow } = advanceSwitch(work, statuses, restartPane);
       if (movedNow.length > 0) invalidateAccountState();
       // Retire the plan once everyone has moved, which also re-arms recommendations.
       const settled = next.pending.length === 0 ? null : next;

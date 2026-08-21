@@ -68,6 +68,9 @@ vi.mock("../services/headroom", () => ({
     currentAccountId != null && currentAccountId === h.walledAccount
       ? { from: acct(currentAccountId), to: acct("acct-healthy"), fraction: 0.99, reason: "exhausted" }
       : null,
+  // The rescue target stays healthy here, so phase 2's mid-migration re-validation is a no-op.
+  isHealthyTarget: () => true,
+  bestHealthyTarget: () => null,
 }));
 
 vi.mock("../stores/runtimeStore", () => ({

@@ -73,7 +73,12 @@ vi.mock("../stores/projectStore", () => ({
 
 // No banner in these tests: the manual path is the subject, and a live recommendation would set a
 // plan of its own and muddy the restart counts.
-vi.mock("../services/headroom", () => ({ switchRecommendation: () => null }));
+vi.mock("../services/headroom", () => ({
+  switchRecommendation: () => null,
+  // No target goes invalid in this suite, so phase 2's mid-migration re-validation is a no-op.
+  isHealthyTarget: () => true,
+  bestHealthyTarget: () => null,
+}));
 
 const ACCOUNTS = [
   { id: "acct-a", nickname: "A", configDir: "/cfg/a", isDefault: true, createdAt: 1 },
