@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type CSSProperties, type ComponentType } from "react";
-import { FiZap, FiBell, FiCreditCard, FiEye, FiCpu, FiUsers, FiSliders, FiX, FiCommand, FiSmartphone, FiMic, FiTool, FiSearch, FiCheckCircle, FiCloud, FiLock, FiTrendingUp, FiShield, FiMessageSquare, FiMessageCircle, FiBookOpen } from "react-icons/fi";
+import { FiZap, FiBell, FiCreditCard, FiEye, FiCpu, FiUsers, FiSliders, FiX, FiCommand, FiSmartphone, FiMic, FiTool, FiSearch, FiCheckCircle, FiCloud, FiLock, FiTrendingUp, FiShield, FiMessageSquare, FiMessageCircle, FiBookOpen, FiSend } from "react-icons/fi";
 import { C, MODAL_SHADOW, ROW_ACTIVE_BUBBLE, SCRIM } from "../theme/colors";
 import { FONT_MONO, FONT_UI, LABEL, RADIUS, TYPE, WEIGHT } from "../theme/scale";
 import { openSignIn, signOut } from "../services/sparkleApi";
@@ -31,6 +31,7 @@ import { ConciergeGuidelinesPane } from "./ConciergeGuidelinesPane";
 import { CloudAuthPane } from "./CloudAuthPane";
 import { OnePasswordPane } from "./OnePasswordPane";
 import { ChiefPane } from "./ChiefPane";
+import { PublishPane } from "./PublishPane";
 import { SettingsChatPane } from "./SettingsChatPane";
 import { useSettingsStore } from "../stores/settingsStore";
 
@@ -104,6 +105,7 @@ const CATEGORIES: Category[] = [
   { id: "cloudauth", label: "Claude auth for cloud agents", Icon: FiCloud, blurb: "The Claude credential your cloud agents run with. Stored encrypted; never shown again.", keywords: ["cloud agents anthropic api key byok subscription setup-token credential sandbox"] },
   { id: "onepassword", label: "1Password", Icon: FiLock, blurb: "Back your .env files up to a vault, and restore them into fresh agent worktrees.", keywords: ["1password onepassword op cli env dotenv secrets vault backup restore seed worktree"] },
   { id: "chief", label: "Chief", Icon: FiBookOpen, blurb: "Which Chief library each project's docs are sent to, and whether they are arriving.", keywords: ["chief storytell think library markdown prd docs sync link relink project assets"] },
+  { id: "publish", label: "Publishing", Icon: FiSend, blurb: "Where Sparkle may post, and whether that destination speaks the tool contract.", keywords: ["publish post destination drodio mcp blog article draft content token bearer capability probe tools"] },
   { id: "mobile", label: "Mobile", Icon: FiSmartphone, blurb: "Pair your phone with this Mac and manage paired devices.", keywords: ["phone pair devices"] },
   { id: "voice", label: "Voice controls", Icon: FiMic, blurb: "Which microphone Sparkle listens to, and how the send tray turns it on.", keywords: ["dictation microphone input device audio picker system audio loopback push to talk speak send tray"] },
   { id: "approvals", label: "Auto-approve", Icon: FiCheckCircle, blurb: "Auto-answer Claude Code permission prompts, and choose how to auto-resume large sessions.", keywords: ["auto-approve approvals permission prompts skills commands bash edits mcp tools fetch remember yes nudge resume session summary full continue"] },
@@ -335,6 +337,8 @@ function PaneBody({
       return <OnePasswordPane />;
     case "chief":
       return <ChiefPane />;
+    case "publish":
+      return <PublishPane />;
     case "mobile":
       return <MobileDevicesPane />;
     case "voice":

@@ -101,6 +101,9 @@ mod promotion;
 mod project_window;
 mod pty;
 mod pty_write_watch;
+/// The publish destination's CAPABILITY PROBE (bead `sparkle-131ms.5`) — a pure diff of the
+/// destination's `tools/list` against the contract Sparkle pins, plus the commands that expose it.
+mod publish_capabilities;
 /// The publish destination's MCP client — the outbound JSON-RPC calls and the HTTP-200
 /// `isError` decoder that keeps a failed publish from reading as a successful one.
 mod publish_client;
@@ -992,7 +995,16 @@ pub fn run() {
             // scripts/lib/tauri-handler-guard.sh enforces in both directions.
             publish_credential::publish_token_set,
             publish_credential::publish_token_clear,
+            publish_credential::publish_token_source,
             publish_credential::publish_token_present,
+            // The capability probe and the destination transport (bead `sparkle-131ms.5`). All
+            // three are `pub async fn` with the network call in `spawn_blocking`, so no
+            // cmd_timing.rs EXEMPT entry is needed and the main thread never blocks on a remote
+            // host. The bearer never crosses this boundary — `token_for_destination` is read
+            // inside the command and scrubbed out of every error string.
+            publish_capabilities::destination_probe,
+            publish_capabilities::destination_list_tools,
+            publish_capabilities::destination_call_tool,
             bridge::start_orchestration_bridge,
             bridge::stop_orchestration_bridge,
             bridge::orchestration_respond,

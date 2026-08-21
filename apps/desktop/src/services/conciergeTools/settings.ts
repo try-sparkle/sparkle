@@ -1207,6 +1207,7 @@ const SETTINGS_PANES: Record<CategoryId, true> = {
   cloudauth: true,
   onepassword: true,
   chief: true,
+  publish: true,
   mobile: true,
   voice: true,
   approvals: true,

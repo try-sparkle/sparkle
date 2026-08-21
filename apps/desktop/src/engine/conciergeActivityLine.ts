@@ -34,6 +34,7 @@ import type { PlansOp } from "../services/conciergeTools/plans";
 import type { ResearchOp } from "../services/conciergeTools/research";
 import type { AccountsOp } from "../services/conciergeTools/accounts";
 import type { MemoryOp } from "../services/conciergeTools/memory";
+import type { PublishOp } from "../services/conciergeTools/publish";
 import { conciergeNativeToolLine } from "./conciergeNativeToolLine";
 
 /** Which glyph family a line wears. A KIND, not a component: this module stays React-free, and the
@@ -469,6 +470,28 @@ const MEMORY_PHRASES: Record<MemoryOp, OpPhrase> = {
   list_memories: phrase("Reading my memory", "Read my memory"),
 };
 
+/**
+ * Publishing. Every phrase names the USER'S OWN SITE, and the two that reach the public say so.
+ *
+ * THIS LINE IS READ BY A HUMAN WHO IS NOT THE MODEL, and it is the one place a publish shows up
+ * outside the approval card. So the wording draws the same line the risk table does: a draft is
+ * "a draft", and `publish_go_live` says "Publishing" rather than something softer like "Updating
+ * your site". A phrase that understates what happened is the copy half of settling a receipt from
+ * absence-of-exception — see conciergeTools/publish.ts.
+ */
+const PUBLISH_PHRASES: Record<PublishOp, OpPhrase> = {
+  publish_list_destinations: phrase("Checking where you can publish", "Checked where you can publish"),
+  publish_probe: phrase("Checking what your site supports", "Checked what your site supports"),
+  publish_list_projects: phrase("Reading your site's sections", "Read your site's sections"),
+  publish_get: phrase("Reading one of your posts", "Read one of your posts"),
+  publish_list: phrase("Listing your posts", "Listed your posts"),
+  publish_create_draft: phrase("Creating a draft on your site", "Created a draft on your site"),
+  publish_update_draft: phrase("Editing a draft on your site", "Edited a draft on your site"),
+  publish_update_live: phrase("Rewriting a live post", "Rewrote a live post"),
+  publish_go_live: phrase("Publishing a post to your site", "Published a post to your site"),
+  publish_take_down: phrase("Taking a post down", "Took a post down"),
+};
+
 /** Domain → its phrase table and its glyph. Keyed on the registry's own domain union, so a new
  *  domain cannot be added without deciding how the column describes it.
  *
@@ -497,6 +520,9 @@ const DOMAINS: Record<
   // consistent with `board` and `plans` above.
   screenshot: { icon: "workspace", phrases: SCREENSHOT_PHRASES },
   preview_inspect: { icon: "workspace", phrases: PREVIEW_INSPECT_PHRASES },
+  // Reuses the workflow glyph: publishing is the same shape of act as a push or a merge — work
+  // leaving this machine for somewhere other people can see it.
+  publish: { icon: "workflow", phrases: PUBLISH_PHRASES },
   board: { icon: "workspace", phrases: BOARD_PHRASES },
   approvals: { icon: "agents", phrases: APPROVALS_PHRASES },
   plans: { icon: "workspace", phrases: PLANS_PHRASES },

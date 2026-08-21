@@ -199,6 +199,34 @@ export interface OnePasswordConfig {
   /** Restore backed-up env files into each newly created agent worktree. */
   seed_worktrees: boolean;
 }
+
+/** One configured publish destination. Mirrors Rust's `PublishDestination`.
+ *
+ *  Never carries a token: the credential lives in the OS keychain and is referenced by the
+ *  destination's id, so a serialized config.toml can be pasted into a bug report without leaking
+ *  one. `hasCredentialInKeychain` answers the pane's only legitimate question about it. */
+export interface PublishDestination {
+  name: string;
+  url: string;
+  has_credential_in_keychain: boolean;
+}
+
+/** [publish] — MACHINE-WIDE, like [concierge] and [onepassword]. A per-repo `.sparkle/config.toml`
+ *  that sets it is IGNORED with a warning: a destination is a network egress target Sparkle sends a
+ *  bearer token to, and a cloned repo must not be able to grant itself one.
+ *
+ *  Mirrors Rust's `config::PublishConfig`. */
+export interface PublishConfig {
+  /** The destination id publish ops act on.
+   *
+   *  `string | null`, NOT `active?: string`. It is a Rust `Option<String>` with no
+   *  `skip_serializing_if`, so serde emits THE KEY WITH A `null` VALUE — a `?:` parser would
+   *  describe a shape the wire cannot produce (AGENTS.md's Rust-`Option` seam). `null` means no
+   *  destination has been chosen, and publish ops then refuse rather than guessing. */
+  active: string | null;
+  /** Configured destinations, keyed by id. Empty on a fresh install. */
+  destinations: Record<string, PublishDestination>;
+}
 /** Branch/build freshness guardrails (read by the build script + session-start staleness hook). */
 export interface FreshnessConfig {
   staleness_warn_commits: number;
@@ -302,6 +330,17 @@ export interface SparkleConfig {
    *  backend predating [onepassword] omits it. Callers must guard and fall back to the off/unset
    *  defaults — never read an absent section as "enabled". */
   onepassword?: OnePasswordConfig;
+  /**
+   * Where Sparkle may publish a post (`[publish]`, bead `sparkle-131ms.3`). Machine-wide, like
+   * `[concierge]`: a destination is a network-egress target Sparkle sends a bearer token to, so a
+   * per-project file cannot set one.
+   *
+   * OPTIONAL for the same back-compat reason as `onepassword?` above — a payload from a Rust
+   * backend predating `[publish]` omits it. An absent section means SPARKLE CAN PUBLISH NOWHERE,
+   * which is also the shipped default and the only safe reading: never treat it as "publishing is
+   * on with whatever destination we can find".
+   */
+  publish?: PublishConfig;
   freshness: FreshnessConfig;
   /** Optional for the same back-compat reason as `tools?`/`roborev?` above: a payload from a Rust
    *  backend predating [review] omits it. An absent section means "a reviewer is expected", the

@@ -73,28 +73,30 @@ describe("toolbarShowsLabels — the toolbar collapses to icons before it clips"
   });
 });
 
-// ── TWO BUTTONS COST LESS THAN THE DISCLOSURE DID ──────────────────────────────────────────────
+// ── THE ICON CLUSTER COSTS NO MORE THAN THE DISCLOSURE DID ─────────────────────────────────────
 //
-// The obvious worry about replacing one paperclip with two permanent buttons is that the narrow
-// column gets worse. It does not, and this is the argument, pinned so it cannot quietly stop being
-// true:
+// The obvious worry about replacing one paperclip with permanent buttons is that the narrow column
+// gets worse. It does not, and this is the argument, pinned so it cannot quietly stop being true:
 //
 //   old, at rest      1 control  (paperclip)
 //   old, EXPANDED     3 controls (paperclip + Screenshot + Upload) — reachable at ANY width, by
 //                     hover alone, which is the state the founder's clipping report was of
-//   new, always       2 controls (Screenshot + Upload)
+//   new, always       3 controls (Screenshot + Upload + Write a post)
 //
-// The worst case shrank by one control. The other half of the argument is that the new row's width
-// cannot GROW with anything: neither button ever renders a word at any column width, so the attach
-// group's content is a constant ~66px instead of a value that was ~165px whenever it was open.
+// The worst case did not grow. "Write a post" (bead sparkle-131ms.10) took the row from 2 to 3 at
+// rest, which is the founder's own ask — the button must sit beside Screenshot — and it lands
+// exactly on the old worst case rather than past it. The other half of the argument is unchanged
+// and is what keeps this bounded: NO button here ever renders a word at any column width, so the
+// group's content is a constant ~99px instead of a value that was ~165px whenever it was open.
 describe("the attach row is width-bounded by construction", () => {
   const group = () => screen.getByTestId("concierge-attach");
 
-  it("holds exactly two controls, and no trigger to expand into a third", () => {
-    render(<AttachControl onAttach={() => {}} />);
+  it("holds exactly three controls, and no trigger to expand into a fourth", () => {
+    render(<AttachControl onAttach={() => {}} onComposePost={() => {}} />);
     const buttons = group().querySelectorAll("button");
-    expect(buttons).toHaveLength(2);
-    // The paperclip. Its absence is what makes 2 the WORST case and not the resting one.
+    expect(buttons).toHaveLength(3);
+    // The paperclip. Its absence is what makes 3 the resting count AND the worst case, rather than
+    // a floor that hover can push past.
     expect(screen.queryByRole("button", { name: "Attach" })).toBeNull();
   });
 
@@ -102,11 +104,11 @@ describe("the attach row is width-bounded by construction", () => {
     // AttachControl takes no width and no `showLabels` any more. That is the assertion: the row
     // cannot be put into a labelled state by any caller, so no column width can widen it. Against
     // the old component this same render produced "Screenshot" and "Upload" as visible text.
-    render(<AttachControl onAttach={() => {}} />);
+    render(<AttachControl onAttach={() => {}} onComposePost={() => {}} />);
     for (const b of Array.from(group().querySelectorAll("button"))) {
       expect(b.textContent).toBe("");
       // …but each is still NAMED, or the wordless button would be unaddressable rather than tidy.
-      expect(b.getAttribute("aria-label")).toMatch(/^(Screenshot|Upload)$/);
+      expect(b.getAttribute("aria-label")).toMatch(/^(Screenshot|Upload|Write a post)$/);
       // …and still draws something, or "no word" would be satisfied by an empty box.
       expect(b.querySelector("svg")).toBeTruthy();
     }
@@ -124,7 +126,7 @@ describe("the attach row is width-bounded by construction", () => {
     //
     // The INNER actions container that used to carry the identical pair is gone with the
     // disclosure — there is only one box to pin now.
-    render(<AttachControl onAttach={() => {}} />);
+    render(<AttachControl onAttach={() => {}} onComposePost={() => {}} />);
     expect(group().style.minWidth).toBe("0");
     expect(group().style.flexWrap).toBe("wrap");
     expect(document.getElementById("concierge-attach-actions")).toBeNull();

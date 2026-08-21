@@ -92,7 +92,7 @@ import {
   type PointerEvent as ReactPointerEvent,
 } from "react";
 // FiFile left with the chip row it belonged to — the shared AttachmentStrip draws the file glyph now.
-import { FiAlertTriangle, FiUpload, FiX } from "react-icons/fi";
+import { FiAlertTriangle, FiEdit3, FiUpload, FiX } from "react-icons/fi";
 // THE SCREENSHOT GLYPH IS DRAWN HERE, NOT IMPORTED — see CaptureRegionIcon below for both the
 // shape and the reason it is inline.
 // `C` ALONE, and the three tokens that left are the two halves of this merge, not an oversight:
@@ -104,6 +104,14 @@ import { C } from "../../theme/colors";
 import { BLUEPRINT } from "../../theme/blueprintSpec";
 import { useResolvedTheme } from "../../theme/theme";
 import type { Attachment, ConciergeAttachKind } from "./types";
+// The "Write a post" button beside Screenshot (bead sparkle-131ms.10). Its copy, its hint id and
+// its seeding rule live in the React-free module so the rule is testable without a render — and,
+// more importantly, so the one thing it must NEVER do (send, publish) is stated where it is read.
+import {
+  COMPOSE_POST_HINT,
+  COMPOSE_POST_LABEL,
+  seedComposePost,
+} from "./composePost";
 import { useUiStore } from "../../stores/uiStore";
 import { PresenceSlider } from "./PresenceSlider";
 import { usePresenceStore } from "../../stores/presenceStore";
@@ -430,22 +438,27 @@ function CaptureRegionIcon({ size = 13 }: AttachGlyphProps) {
   );
 }
 
-/** THE TWO ATTACH ACTIONS, BOTH ALWAYS ON SCREEN.
+/** THE ATTACH ACTIONS, ALL ALWAYS ON SCREEN.
+ *
+ *  Two of them until `sparkle-131ms.10` added the wordless "Write a post" control beside them, at
+ *  the founder's request that composing a post be as immediate as grabbing a screengrab.
  *
  *  This row has had three shapes. It began as three permanently-visible LABELLED buttons
  *  (Screenshot / Image / Files) — three controls' worth of chrome above a compose box whose whole
  *  design is to look empty. That collapsed to ONE paperclip that expanded into these two on hover
- *  or focus. It is now these two, permanently visible, as icons with no word at all.
+ *  or focus. It is now three, permanently visible, as icons with no word at all — Screenshot and Upload,
+ *  joined by "Write a post" (`sparkle-131ms.10`).
  *
  *  THE PAPERCLIP IS GONE BECAUSE OF WHAT IT COST THE COMMON CASE. Screenshot is the founder's
  *  single highest-frequency composer action — he sends them constantly, and each one turns a vague
  *  report into a diagnosis. The expansion made that action cost two interactions (reveal, then
  *  choose) where it had cost one, to save chrome that two icon-only buttons do not actually spend:
- *  the resting row is now 2 controls wide where the expanded row was 3.
+ *  the resting row is 3 icon-only controls where the expanded row was 3 LABELLED ones — the same
+ *  count, at roughly a third of the width.
  *
  *  NO PERMANENT WORD, BY REQUEST — "it doesn't have to say screenshot, it could say screenshot on a
  *  mouse over". So `label` is the hover tooltip AND the accessible name, and nothing is drawn but
- *  the glyph. That makes the two identical, which is the a11y-correct pairing anyway: what a
+ *  the glyph. That makes them identical, which is the a11y-correct pairing anyway: what a
  *  pointer user is told on hover is exactly what a screen-reader user is told on focus.
  *
  *  Two actions, not three: `image` and `files` are the same OS panel, differing only in whether it
@@ -502,10 +515,19 @@ export const COMPOSER_INSETS_PX = 46;
  * named for it. `toolbarShowsLabels` takes a column width, and the parameter says so.
  *
  * ── THE ATTACH HALF OF THAT DERIVATION IS NOW SLACK, DELIBERATELY ───────────────────────────────
- * The attach group no longer HAS words to drop at any width: it is two icon-only buttons (~30px
- * each + a 6px gap ≈ 66px, fixed), so the ~124px the two labels used to claim is gone and the only
- * thing still trading width for words is the PresenceSlider (~96px labelled, ~52px as glyphs).
- * Re-derived from scratch the threshold would land near 170.
+ * The attach group no longer HAS words to drop at any width: it is THREE icon-only buttons
+ * (Screenshot, Upload, Write a post — ~30px each + two 6px gaps ≈ 102px, fixed), so the ~124px the
+ * old labels used to claim is gone and the only thing still trading width for words is the
+ * PresenceSlider (~96px labelled, ~52px as glyphs). Re-derived from scratch, STATED AS ARITHMETIC
+ * so the figure and its inputs cannot drift apart: ≈102 group + ≈96 labelled slider + ~8 row gap
+ * ≈ 206. (The old text said ~170 from a 66px group; the group has since grown by exactly one ~30px
+ * button plus one 6px gap, so the same derivation moves by +36, not by +33.)
+ *
+ * That group was TWO buttons until `sparkle-131ms.10` added the compose-post control. The numbers
+ * above are restated rather than left at the two-button arithmetic on purpose: this is the
+ * load-bearing derivation someone re-reads when the narrow-column clipping report
+ * (bead `sparkle-kk9dg`) resurfaces, and a stale justification is what a fourth control would be
+ * sized against.
  *
  * The value is held at 300 anyway, and that is a decision rather than an oversight. Lowering it
  * would change WHEN the Here/Away slider collapses — a behaviour change to a control the founder
@@ -533,7 +555,7 @@ export function toolbarShowsLabels(columnWidthPx: number): boolean {
 }
 
 /**
- * THE TWO ATTACH ACTIONS, SIDE BY SIDE AND ALWAYS VISIBLE — the founder's ask, replacing the single
+ * THE ICON CLUSTER, ALWAYS VISIBLE — the founder's ask, replacing the single
  * paperclip that expanded into them on hover.
  *
  * WHAT THIS DELETED, AND WHY NONE OF IT IS OWED A REPLACEMENT. The old control was a disclosure,
@@ -544,29 +566,45 @@ export function toolbarShowsLabels(columnWidthPx: number): boolean {
  * `hidden` on the actions so the announced state and the tab order could not drift apart.
  *
  * Every one of those was correct, and every one of them was solving a problem created by hiding two
- * buttons behind a third. With both buttons simply present there is no open state to hold, nothing
+ * buttons behind a third. With the buttons simply present there is no open state to hold, nothing
  * to unwind, nothing to announce as expanded, and nothing that can be visible-but-unfocusable. That
  * is why this is ~15 lines where it was ~150 — the machinery went away with the thing it managed,
  * not into some other file. Do not reintroduce a disclosure here without re-reading the four
  * behaviours above; they are the cost of one.
  *
- * NARROWER AT REST THAN THE THING IT REPLACED. The concern with two permanent controls is the
- * narrow column (bead sparkle-kk9dg), but the arithmetic runs the right way: this row is 2
- * icon-only buttons where the EXPANDED old row was 3 (paperclip + two actions, labelled until
- * ~346px). The resting row grew by one control and the worst case shrank by one.
+ * THE WORST CASE DID NOT GROW — but as of `sparkle-131ms.10` it no longer SHRINKS either, and the
+ * honest statement matters more than the flattering one. The concern with permanent controls is the
+ * narrow column (bead sparkle-kk9dg). This row is now 3 icon-only buttons, which EQUALS the
+ * EXPANDED old row of 3 (paperclip + two actions, labelled until ~346px) rather than undercutting
+ * it. It is still much narrower in practice because these three carry no words where those three
+ * did — ~102px against ~346px — but the control COUNT at rest is now the old worst case, so a
+ * fourth control is the one that makes this claim false. Re-measure before adding one.
  *
  * `minWidth: 0` / `flexWrap` stay, and they are still load-bearing. This is a flex item of the
  * toolbar, so its own default `min-width: auto` refuses to go below its min-content and the
  * toolbar's `flex-wrap` cannot break INSIDE it — which is how the row ran past the column's right
  * edge in the founder's original narrow-column report.
  */
-/** Exported for a RENDER test: only a render can prove these two buttons carry an accessible name,
+/** Exported for a RENDER test: only a render can prove these buttons carry an accessible name,
  *  since neither ever draws a visible word (roborev 57049 pinned the same property of the older
  *  collapsed form). */
 export function AttachControl({
   onAttach,
+  onComposePost,
 }: {
   onAttach: (kind: ConciergeAttachKind) => void;
+  // "Write a post" — pressed, it seeds this box with a compose prompt and nothing else. It is a
+  // sibling of the two attach buttons rather than a control of its own somewhere else in the row
+  // because that adjacency IS the founder's ask: "next to the screenshot button". Screenshot is his
+  // highest-frequency composer action (see ATTACH_ACTIONS above), so this cluster is the one place
+  // in the app his hand already goes without looking.
+  //
+  // It lives here despite the group being NAMED for attaching, which is a deliberate trade: the
+  // alternatives were a second cluster (which puts a gap between the two buttons the ask says must
+  // be adjacent) or widening this component's name (churn across every call site and test for no
+  // behaviour). What the group actually is, and has been since the paperclip went, is the
+  // composer's icon-button row.
+  onComposePost: () => void;
 }) {
   return (
     <div
@@ -593,6 +631,24 @@ export function AttachControl({
           <Icon size={13} aria-hidden />
         </button>
       ))}
+      {/* SAME CONSTRUCTION AS THE TWO ABOVE, deliberately: same `attachStyle`, same 5px/7px padding,
+          same 13px glyph, same title-is-the-accessible-name pairing, same leaf `data-hint`. A third
+          visual idiom sitting between them would read as a different KIND of control, which is
+          exactly what it is not — all three are one-tap composer actions.
+
+          THE LABEL NAMES NO DESTINATION. See composePost.ts: whether "post out socially" means the
+          configured destination MCP or a real network is still open (bead sparkle-131ms.9), and a
+          button that said "Post to X" would be a promise this app cannot keep today. */}
+      <button
+        type="button"
+        title={COMPOSE_POST_LABEL}
+        aria-label={COMPOSE_POST_LABEL}
+        data-hint={COMPOSE_POST_HINT}
+        onClick={onComposePost}
+        style={{ ...attachStyle, padding: "5px 7px" }}
+      >
+        <FiEdit3 size={13} aria-hidden />
+      </button>
     </div>
   );
 }
@@ -1262,6 +1318,26 @@ export function ComposeBox({
     },
     [onTextEdit],
   );
+
+  /**
+   * "Write a post" pressed: seed this box with the compose prompt. THAT IS THE WHOLE EFFECT.
+   *
+   * It goes through `applyEdit` for the reason `showBlockAsText` does — a programmatic write to the
+   * textarea fires no `onChange`, so the host would never learn the box changed. That matters twice
+   * over here: the host retires its routing latches on `onTextEdit`, and an auto-send countdown must
+   * PAUSE when the user starts composing. `"edit"` rather than a new interaction kind, because that
+   * is honestly what happened — the user put words in the box.
+   *
+   * NOTHING BELOW THIS LINE SENDS. `submit` is not called, `onSend` is not called, and no publish
+   * path is reachable from here: publishing lives behind the concierge approval card (bead
+   * sparkle-131ms.6) and the user has not written the post yet, let alone approved it. If a future
+   * edit is tempted to auto-send this prompt, read composePost.ts's header first — the point of the
+   * button is that the user reads and edits before the model ever sees it.
+   */
+  const composePost = useCallback(() => {
+    onComposeInteraction?.("edit");
+    applyEdit(seedComposePost(textRef.current));
+  }, [applyEdit, onComposeInteraction]);
 
   const chooseMention = useCallback(
     (agent: MentionAgent) => {
@@ -2129,7 +2205,7 @@ export function ComposeBox({
           minWidth: 0,
         }}
       >
-        <AttachControl onAttach={onAttach} />
+        <AttachControl onAttach={onAttach} onComposePost={composePost} />
         {/* Right-aligned in the attach row, which puts it directly ABOVE the Send button — the
             action whose autonomy it governs. It reads and writes presenceStore itself rather than
             taking props; see PresenceSlider's header for why, and note this box already reads

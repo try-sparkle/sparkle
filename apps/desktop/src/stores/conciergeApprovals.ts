@@ -57,6 +57,11 @@ import type { ConciergeRiskClass } from "../services/conciergeTools/policy";
 // TYPE ONLY — the derivation lives beside the registry that produces the arguments it reads, so
 // there is one definition of what a subject is rather than a copy on each side of the seam.
 import type { ApprovalSubject } from "../services/conciergeTools/approvalSubject";
+// TYPE ONLY, for the same reason as `ApprovalSubject` above: the guard is derived beside the domain
+// that produces it, so there is one definition rather than a copy on each side of the seam. A
+// type-only import is erased, so this does not create a cycle with `publish.ts`'s own (value)
+// import of `findApproval` from here.
+import type { PublishApprovalGuard } from "../services/conciergeTools/publish";
 // The concierge's drainable event log. Imported for ONE purpose: to announce that a question
 // reached the human and that they answered it. Nothing is read back from it, and nothing in this
 // file's behaviour depends on it — see `emitApprovalEvent`.
@@ -193,6 +198,29 @@ export interface ConciergeApprovalRequest {
    * unresolvable OWNER is rendered as "owner unresolved" beside a subject that is present.
    */
   subject?: ApprovalSubject;
+  /**
+   * WHAT THE POST LOOKED LIKE WHEN THIS QUESTION WAS ASKED — publish ops only (bead
+   * `sparkle-131ms.6`).
+   *
+   * THE WINDOW THIS CLOSES. {@link APPROVAL_REQUEST_TTL_MS} is ten minutes and the resume path
+   * replays `rawArgs` VERBATIM, matching by id, so the grant authorises unconditionally. In those
+   * ten minutes the post can be unpublished (the card now overstates what is about to happen) or
+   * edited by the founder on the web (the approved text silently clobbers work the human never
+   * saw). Neither is detectable from the arguments, because both are changes on the SERVER.
+   *
+   * STAMPED AT RAISE, for the same reason as {@link relayedFounderWords} and {@link subject}: the
+   * click handler runs arbitrarily long after the requesting turn ended, and by then the "before"
+   * reading is unrecoverable. Written from a snapshot the HOST took of a destination response —
+   * never from model-supplied arguments, which would be the model approving itself.
+   *
+   * READ BY THE DOMAIN HANDLER, not by the policy binding: `conciergeApprovalResume` dispatches
+   * straight into the registry, so anything in `policyBinding`/`resolveAskTier` is bypassed on the
+   * replay path. See `conciergeTools/publish.ts`'s `guardApprovedCall`.
+   *
+   * ABSENT for every non-publish op, and absent for a publish call this app has never read the post
+   * for — which the handler treats as a REFUSAL, not as permission.
+   */
+  publishGuard?: PublishApprovalGuard;
   /** `concierge.tools.<op>` — named in the card so "stop asking me" is one click from discoverable. */
   configPath: string;
   /** Canonical identity of this exact call. Build with {@link approvalFingerprint}. */

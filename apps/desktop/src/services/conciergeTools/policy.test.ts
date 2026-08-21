@@ -68,6 +68,7 @@ import { CHIEF_CALL_TOOL_ARG, CHIEF_OPS, CHIEF_RISK, chiefCallToolName } from ".
 import { CHIEF_DESTRUCTIVE_TOOLS } from "../chiefScope";
 import { ACCOUNTS_OPS } from "./accounts";
 import { MEMORY_OPS } from "./memory";
+import { PUBLISH_OPS } from "./publish";
 import { toConciergeToolPolicy } from "../../stores/settingsStore";
 
 const NONE = { overrides: NO_TOOL_POLICY_OVERRIDES };
@@ -496,6 +497,7 @@ describe("the tool set is derived from the domains", () => {
       "chief",
       "accounts",
       "memory",
+      "publish",
       "app",
     ]);
     expect(CONCIERGE_TOOL_DOMAINS.map((d) => d.id)).toEqual(
@@ -555,6 +557,7 @@ describe("the tool set is derived from the domains", () => {
         CHIEF_OPS.length +
         ACCOUNTS_OPS.length +
         MEMORY_OPS.length +
+        PUBLISH_OPS.length +
         APP_TOOL_NAMES.length,
     );
   });

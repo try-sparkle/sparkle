@@ -32,12 +32,6 @@
 //!   payload extractor tolerates SSE framing rather than assuming the shape that happens to arrive.
 //! - **No redirect** on either the bare or trailing-slash URL form.
 
-// Every item here is dead until `sparkle-131ms.5` (the capability probe) and `sparkle-131ms.6` (the
-// concierge tool domain) call it. Landing the client separately is deliberate — its decoder is the
-// load-bearing part and it gets its own review — but it means the compiler cannot see a caller yet.
-// REMOVE THIS when PR 4 lands; a lingering module-wide allow would mask real rot later.
-#![allow(dead_code)]
-
 use serde_json::{json, Value};
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -205,12 +199,45 @@ pub fn decode_rpc_envelope(body: &str) -> Result<Value, PublishError> {
             )
         })?;
 
-    // The module's central invariant, applied once for every caller. Absent means false, per the
-    // MCP spec — only an explicit `true` is a failure.
-    if result.get("isError").and_then(Value::as_bool) == Some(true) {
-        return Err(tool_failure(&content_text(&result)));
+    // ── The module's central invariant, applied once for every caller ────────────────────────
+    //
+    // TEST "NOT PROVABLY FALSE", NOT `== true`. This read `.and_then(Value::as_bool) ==
+    // Some(true)`, which is FAIL-OPEN and is precisely the hole this module exists to plug: a
+    // re-serializing proxy that spells the flag `"true"`, `1` or `"1"` yields `None` from
+    // `as_bool()`, compares unequal to `Some(true)`, and a **401 body decodes as a successful
+    // publish** — telling the founder their post is live when it is not. The build plan specified
+    // this polarity in as many words and it shipped inverted; nothing caught it, because every
+    // test fed a real JSON boolean.
+    //
+    // So success requires the field to be provably absent or provably `false`, and every other
+    // shape fails CLOSED, naming what it saw so a destination author can fix it.
+    //
+    // `null` joins "absent" deliberately, and only because this module already decided that
+    // question one screen up: `v.get("error")` is filtered for `Value::Null` because servers emit
+    // `"error": null` beside a perfectly good result, and treating that as present turns a
+    // SUCCESSFUL publish into an error. The same spelling, the same server, the same reasoning —
+    // `isError: null` is an absent flag, not an unreadable one. Everything that is neither null
+    // nor a boolean is unreadable, and unreadable is a failure.
+    match result.get("isError") {
+        None | Some(Value::Null) | Some(Value::Bool(false)) => Ok(result),
+        Some(Value::Bool(true)) => Err(tool_failure(&content_text(&result))),
+        Some(other) => {
+            // Not a boolean at all. Do NOT guess which way it leans: report it as a failure and
+            // say what arrived, so this is diagnosable rather than merely safe.
+            let seen = match other {
+                Value::String(s) => format!("the string {s:?}"),
+                Value::Number(n) => format!("the number {n}"),
+                Value::Array(_) => "an array".to_string(),
+                Value::Object(_) => "an object".to_string(),
+                _ => "an unreadable value".to_string(),
+            };
+            Err(PublishError::Protocol(format!(
+                "the destination answered with a non-boolean `isError` ({seen}). Sparkle cannot \
+                 tell a successful publish from a failed one on that answer, so it treats it as a \
+                 failure. A destination must send `isError` as a real JSON boolean."
+            )))
+        }
     }
-    Ok(result)
 }
 
 /// Concatenate the text parts of an MCP `content` array. Non-text parts are skipped rather than
@@ -281,11 +308,25 @@ pub fn decode_tool_result(body: &str) -> Result<String, PublishError> {
 /// One tool as the destination describes it. `required_args` is what makes a capability probe
 /// meaningful: two destinations can both expose `create_content` and mean different things by it,
 /// so the contract Sparkle pins is the argument shape, not the name.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `input_schema` carries the whole declared schema verbatim ALONGSIDE the flattened
+/// `required_args`, rather than instead of it. The probe (`publish_capabilities`) decides on
+/// `required_args`; the configure pane's tool list renders the schema so a human can see what a
+/// destination actually accepts. Reconstructing the schema from `required_args` at the boundary
+/// would have handed the webview a `{"required": [...]}` object that no destination ever sent —
+/// a plausible wrong answer, which is the failure shape this module exists to avoid.
+///
+/// `Eq` is deliberately absent: `serde_json::Value` is only `PartialEq` (it can hold a float).
+/// Nothing in this tree compared `ToolDescriptor` with `Eq`, so nothing is lost.
+#[derive(Debug, Clone, PartialEq)]
 pub struct ToolDescriptor {
     pub name: String,
     pub description: String,
     pub required_args: Vec<String>,
+    /// The tool's `inputSchema` exactly as the destination declared it, or [`Value::Null`] when it
+    /// declared none. Never an `Option`: this crosses into the webview, where a Rust `Option`
+    /// arrives as `null` and never as an absent key.
+    pub input_schema: Value,
 }
 
 /// Decode a `tools/list` answer.
@@ -306,6 +347,7 @@ pub fn decode_tools_list(body: &str) -> Result<Vec<ToolDescriptor>, PublishError
         .iter()
         .filter_map(|t| {
             let name = t.get("name").and_then(Value::as_str)?;
+            let input_schema = t.get("inputSchema").cloned().unwrap_or(Value::Null);
             let required_args = t
                 .get("inputSchema")
                 .and_then(|s| s.get("required"))
@@ -325,6 +367,7 @@ pub fn decode_tools_list(body: &str) -> Result<Vec<ToolDescriptor>, PublishError
                     .unwrap_or_default()
                     .to_string(),
                 required_args,
+                input_schema,
             })
         })
         .collect())
@@ -716,6 +759,49 @@ mod tests {
     fn an_absent_is_error_key_is_a_success() {
         let body = r#"{"jsonrpc":"2.0","id":9,"result":{"content":[{"type":"text","text":"ok"}]}}"#;
         assert_eq!(decode_tool_result(body).as_deref(), Ok("ok"));
+    }
+
+    /// A NON-BOOLEAN `isError` MUST NOT DECODE AS SUCCESS — the fail-open hole this module exists
+    /// to plug, which shipped inverted and was caught only by a doc-vs-code review.
+    ///
+    /// The old test was `.and_then(Value::as_bool) == Some(true)`. Every one of these bodies is a
+    /// 401 that a re-serializing proxy re-spelled, and every one of them yields `None` from
+    /// `as_bool()` — so every one of them decoded as a SUCCESSFUL PUBLISH, and the founder would
+    /// have been told a post was live when it was not. The suite did not notice because every
+    /// fixture in it fed a real JSON boolean.
+    ///
+    /// Asserted on the OUTCOME (`is_err`) rather than on the error variant, so this stays true
+    /// however the diagnostic is later worded.
+    #[test]
+    fn a_non_boolean_is_error_fails_closed() {
+        for spelling in [r#""true""#, "1", r#""1""#, r#""false""#, "0", "{}", "[]"] {
+            let body = format!(
+                r#"{{"jsonrpc":"2.0","id":9,"result":{{"content":[{{"type":"text","text":"{{\"error\":\"Unauthorized\",\"status\":401}}"}}],"isError":{spelling}}}}}"#
+            );
+            let decoded = decode_tool_result(&body);
+            assert!(
+                decoded.is_err(),
+                "`isError: {spelling}` is not provably false and must NOT decode as a successful \
+                 publish — got {decoded:?}"
+            );
+        }
+    }
+
+    /// …and the converse, so the rule above is a rule and not a blanket refusal: the two shapes
+    /// that ARE provably not-an-error still succeed. Without this half, "fail closed" could be
+    /// satisfied by failing on everything, which would break every real destination.
+    #[test]
+    fn the_two_provably_false_spellings_still_succeed() {
+        for spelling in ["false", "null"] {
+            let body = format!(
+                r#"{{"jsonrpc":"2.0","id":9,"result":{{"content":[{{"type":"text","text":"ok"}}],"isError":{spelling}}}}}"#
+            );
+            assert_eq!(
+                decode_tool_result(&body).as_deref(),
+                Ok("ok"),
+                "`isError: {spelling}` means no error; a publish must not be reported as failed"
+            );
+        }
     }
 
     /// Several text parts are joined, and a non-text part is skipped rather than debug-dumped.

@@ -82,6 +82,10 @@ import { SCREENSHOT_OPS, SCREENSHOT_RISK, type ScreenshotOp, type ScreenshotRisk
 import { PREVIEW_INSPECT_OPS, PREVIEW_INSPECT_RISK, type PreviewInspectOp } from "./previewInspect";
 import { RESEARCH_OPS, RESEARCH_RISK, type ResearchOp } from "./research";
 import { MEMORY_OPS, MEMORY_RISK, type MemoryOp } from "./memory";
+// `PublishRisk` is deliberately NOT imported: publishing reuses WORKSPACE's four risk words
+// verbatim, and `translateRisk(PUBLISH_RISK, WORKSPACE_RISK_TO_CLASS)` already fails to compile if
+// publish.ts ever adds a fifth — the vocabulary check is structural, not an annotation.
+import { PUBLISH_OPS, PUBLISH_RISK, type PublishOp } from "./publish";
 import {
   CHIEF_OPS,
   CHIEF_RISK,
@@ -170,7 +174,13 @@ export const CONCIERGE_RISK_NOTE: Record<ConciergeRiskClass, string> = {
   routine: "Local and reversible.",
   disruptive: "Stops work that is in flight.",
   "rewrites-branch": "Rewrites the agent's own commit history.",
-  "outward-facing": "Reaches the outside world (a push or a pull request).",
+  // WIDENED FOR `publish` (bead `sparkle-131ms.6`). This sentence RENDERS ON THE APPROVAL CARD,
+  // and it used to name only the two git cases — so after publishing landed it would have
+  // described posting to the founder's public site as "a pull request". This repo's rule: a
+  // change to WHEN something happens must update every string that described the old behaviour.
+  // (The two public publish ops are classed `irreversible`, not `outward-facing` — see
+  // publish.ts for why — but `publish_take_down` and any future outward publish op land here.)
+  "outward-facing": "Reaches the outside world — a push, a pull request, or a post on your own site.",
   "costs-money": "Starts something that bills while it runs.",
   "mutates-main": "Changes the branch everything else is measured against.",
   irreversible: "Permanently destroys something that cannot be recovered.",
@@ -202,6 +212,7 @@ export type ConciergeToolDomain =
   | "chief"
   | "accounts"
   | "memory"
+  | "publish"
   | "app";
 
 /** The domains in the order the pane lists them, with the heading each renders under. */
@@ -224,6 +235,7 @@ export const CONCIERGE_TOOL_DOMAINS = [
   { id: "chief", label: "Chief (client work)" },
   { id: "accounts", label: "Claude accounts" },
   { id: "memory", label: "Durable memory" },
+  { id: "publish", label: "Publishing" },
   { id: "app", label: "App & settings" },
 ] as const satisfies readonly { id: ConciergeToolDomain; label: string }[];
 
@@ -508,6 +520,50 @@ const CHIEF_TOOL_SUMMARY: Record<ChiefOp, string> = {
 
 /** The attachment domain's rows. Keyed on that domain's own op union, so an op added there is a
  *  typecheck failure here rather than a settings row that silently falls back to a risk note. */
+/**
+ * The publishing rows — REQUIRED, not nice to have, and exhaustive by construction.
+ *
+ * WHY EVERY ROW HAS PROSE. `SUMMARY_BY_TOOL` is `Partial<>`, so a missing row is SILENT: `entryFor`
+ * falls back to `CONCIERGE_RISK_NOTE[riskClass]` and the settings row survives having merely lost
+ * its words. For most domains that is a cosmetic loss. Here it is not — the fallback for the two
+ * public acts is "Permanently destroys something that cannot be recovered", which is the WRONG
+ * headline on a card asking whether a model may post to the founder's public site. It describes
+ * deletion; the thing being consented to is publication. Typed as a total `Record<PublishOp, …>`
+ * so an op added without prose fails `tsc`, and `publish.test.ts` asserts every row reaches the
+ * catalog verbatim.
+ *
+ * EACH ROW SAYS WHERE IT LANDS, in words, for the same reason `CHIEF_TOOL_SUMMARY` does: these are
+ * the only tools in the catalog whose output is read by strangers.
+ */
+const PUBLISH_TOOL_SUMMARY: Record<PublishOp, string> = {
+  publish_list_destinations:
+    "List the places Sparkle is configured to publish to, and which one is active. Reads your " +
+    "settings only — it does not contact the site.",
+  publish_probe:
+    "Ask a publish destination what it can do — which tools it offers and which arguments they " +
+    "take — so Sparkle offers only what that site actually supports.",
+  publish_list_projects:
+    "List the sections of your site a post can be filed under. Required before a draft can be " +
+    "created, because the destination has no default.",
+  publish_get: "Read one of your posts back from the site, including whether it is still a draft.",
+  publish_list: "List your posts on the site.",
+  publish_create_draft:
+    "Create a DRAFT on your site. The destination makes drafts only — this cannot publish " +
+    "anything, and nobody but you can see the result.",
+  publish_update_draft:
+    "Edit a draft on your site. Editing a post that is already LIVE is refused here and needs " +
+    "`publish_update_live`, which always asks first — even if you allow this tool.",
+  publish_update_live:
+    "Rewrite a post that is ALREADY PUBLIC on your site. People may be reading the old text; the " +
+    "new text replaces it the moment this runs.",
+  publish_go_live:
+    "PUBLISH a draft to your public site. Anyone can read it, and it is scraped, syndicated and " +
+    "archived within seconds — taking it down afterwards does not take that back.",
+  publish_take_down:
+    "Un-publish a live post, turning it back into a draft. Copies already scraped or syndicated " +
+    "stay out there.",
+};
+
 const ATTACHMENTS_TOOL_SUMMARY: Record<AttachmentsOp, string> = {
   list_attachments: "See which files are queued to ride along with an agent's next message.",
   attach_to_message: "Attach a file from the project to an agent's next message.",
@@ -610,6 +666,7 @@ export type ConciergeToolName =
   | ChiefOp
   | AccountsOp
   | MemoryOp
+  | PublishOp
   | AppToolName;
 
 /**
@@ -714,6 +771,14 @@ const RISK_BY_TOOL: Record<ConciergeToolName, ConciergeRiskClass> = {
   // auto-allow — the whole point is that the concierge accumulates durable context without the
   // human approving each fact; `recall`/`list` are `read-only`. See memory.ts.
   ...translateRisk(MEMORY_RISK, WORKSPACE_RISK_TO_CLASS),
+  // Publishing reuses WORKSPACE's four words exactly, so it reuses that translation rather than
+  // declaring a table identical to it. The load-bearing rows are the two `irreversible` ones —
+  // `publish_update_live` and `publish_go_live` — and publish.ts records at length why that word
+  // and not `outward-facing`: `ConciergeToolsPane` derives its bulk-allow warnings from
+  // `irreversible` and `privacy-sensitive` and reads `outward-facing` NOWHERE, so an
+  // `outward-facing` publish op would be invisible to the one dialog that exists to name what a
+  // single click is about to hand over.
+  ...translateRisk(PUBLISH_RISK, WORKSPACE_RISK_TO_CLASS),
   // Chief publishes two of WORKFLOW's five risk words, so it reuses that translation. The split is
   // the load-bearing part: the seven reads are `read-only` and auto-allow, while the four writes and
   // the `chief_call` hatch are `outward-facing` and ask — because what they write lands in a real
@@ -893,6 +958,7 @@ const DOMAIN_BY_TOOL: Record<ConciergeToolName, ConciergeToolDomain> = {
   ...constantOver(CHIEF_RISK, "chief" as const),
   ...constantOver(ACCOUNTS_RISK, "accounts" as const),
   ...constantOver(MEMORY_RISK, "memory" as const),
+  ...constantOver(PUBLISH_RISK, "publish" as const),
   ...constantOver(APP_TOOL_RISK, "app" as const),
 };
 
@@ -920,6 +986,7 @@ export const SUMMARY_BY_TOOL: Partial<Record<ConciergeToolName, string>> = {
   ...CHIEF_TOOL_SUMMARY,
   ...APP_TOOL_SUMMARY,
   ...ACCOUNTS_TOOL_SUMMARY,
+  ...PUBLISH_TOOL_SUMMARY,
   ...Object.fromEntries(WORKFLOW_OPERATIONS.map((op) => [op, WORKFLOW_RISK[op].summary])),
 };
 
@@ -943,6 +1010,7 @@ const NAMES_BY_DOMAIN: Record<ConciergeToolDomain, readonly ConciergeToolName[]>
   chief: CHIEF_OPS,
   accounts: ACCOUNTS_OPS,
   memory: MEMORY_OPS,
+  publish: PUBLISH_OPS,
   app: APP_TOOL_NAMES,
 };
 

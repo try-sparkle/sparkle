@@ -96,6 +96,15 @@ export const CHROME_HINTS: Record<string, string> = {
   // reachable by mouse only.
   "attach-screenshot": "k",
   "attach-upload": "f",
+  // The concierge composer's "Write a post" button, the third icon in that same cluster (bead
+  // sparkle-131ms.10). "w" for Write — the verb the button's own label uses, and the one letter of
+  // that word still free (p/o/s/t are all taken, which is why it is not named for "post").
+  //
+  // It costs AGENT_OVERFLOW_POOL one letter, like "f" before it, and that is a real price rather
+  // than a rounding error: see the pool's own note — every letter promoted to a chrome mnemonic is
+  // one fewer agent addressable by keyboard at all. Paid because the alternative is a permanently
+  // visible control reachable by mouse only, which is what the two attach buttons already rejected.
+  "compose-post": "w",
 };
 
 // The prefix character for TWO-character labels. It is never a label on its own, anywhere: press it
@@ -116,9 +125,10 @@ export const PAIR_SECONDS = ALPHABET;
 
 // Letters available to agents beyond the 9th, with the reserved chrome letters AND the pair prefix
 // removed so an overflow agent can never collide with a chrome control or shadow the prefix.
-// Reserved: a b c d g i m n o p r s t u (+ f h k from the concierge controls, "/" is not a letter),
-// plus z → pool = e j l q v w x y (8 letters, then 26 pairs; with 1–9 that's 43 addressable
-// agents). "f" joined the reserved set when the composer's one paperclip became two buttons.
+// Reserved: a b c d g i m n o p r s t u (+ f h k w from the concierge controls, "/" is not a
+// letter), plus z → pool = e j l q v x y (7 letters, then 26 pairs; with 1–9 that's 42 addressable
+// agents). "f" joined the reserved set when the composer's one paperclip became two buttons, and
+// "w" when the "Write a post" button joined that same cluster.
 //
 // "u" IS RESERVED, not available: it is `newcloud`, the "+ Cloud Agent" sidebar row. It was listed
 // as free here for as long as that row has existed, which is exactly the mistake this comment gets

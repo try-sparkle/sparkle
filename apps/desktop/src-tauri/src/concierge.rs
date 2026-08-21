@@ -224,6 +224,25 @@ features in one breath, file one epic EACH rather than one epic holding a list; 
 the entire point of the column. And when it sounds like something they have raised before, check \
 `list_plans` first: two epics for one idea splits its history in half and neither card tells the \
 whole story.\n\n\
+PUBLISHING A POST: YOU ARE THE COMPOSE SURFACE. There is no separate editor — when the user wants \
+to publish something to their own site, it gets written HERE, by talking. The loop, in order: \
+recognise the intent; gather the structure fields CONVERSATIONALLY rather than as a form — Title, \
+Subtitle, Page URL (the slug), Format (article, musing, short video or tutorial) and Project (call \
+`publish_list_projects`; there is no default and a draft cannot be created without one); ECHO ALL \
+OF THEM BACK and get their agreement BEFORE you create anything; create the draft; give them the \
+preview URL the site returned, so they can read it in place; then iterate as they react. Those \
+fields mirror what the destination itself says it needs — `publish_probe` reports them — so ask \
+about what that site actually supports rather than a list you remember.\n\n\
+NEVER PUBLISH WITHOUT THE APPROVAL CARD, AND DO NOT ROUTE AROUND IT. Publishing puts the user's \
+words in front of strangers; it is scraped, syndicated and archived within seconds, and taking the \
+post down afterwards does not take that back. So `publish_go_live` raises a card and the user \
+decides — do not ask them to pre-authorise it, do not suggest they set it to Allow, and do not \
+treat 'yes, that reads well' about the TEXT as approval to PUBLISH it. Drafting is free-flowing on \
+purpose so that the one moment that matters stands out. If a draft edit comes back refused with \
+`post-is-live`, the post is already public: switch to `publish_update_live`, which asks first. Do \
+not retry the draft op — it will refuse again, and the refusal is doing its job. And if a publish \
+comes back `publish-unconfirmed`, the call was accepted but the post is NOT live: say exactly that, \
+never that it published.\n\n\
 Be a real collaborator: give ideas, push back when you think the user is wrong, and flag risks \
 you notice. Stay calm and brief — no filler, no alarmism. When nothing needs them, say so in a \
 sentence. Respond in clean GitHub-flavored markdown, tightest-first: lead with what needs the \
@@ -2292,6 +2311,40 @@ mod tests {
         // The alternate-screen refusal is still correct and must still be honoured — correcting an
         // overstatement must not read as permission to route around the real guard.
         assert!(CONCIERGE_PERSONA.contains("that refusal is correct"));
+    }
+
+    #[test]
+    fn persona_carries_the_compose_and_publish_loop() {
+        // THE COMPOSE SURFACE IS THIS CHAT (bead `sparkle-131ms.6`). There is no editor, so the
+        // drafting loop lives nowhere but here — and a persona that does not carry it leaves the
+        // model to invent one, which in practice means creating a draft before it has asked for the
+        // fields the destination REQUIRES and cannot default.
+        assert!(CONCIERGE_PERSONA.contains("YOU ARE THE COMPOSE SURFACE"));
+        // The structure fields, echoed back BEFORE anything is created. The echo is the cheap half
+        // of the loop: a wrong Project or Format on a created draft costs a round trip to fix, and
+        // the user never asked for either to be guessed.
+        assert!(CONCIERGE_PERSONA.contains("publish_list_projects"));
+        assert!(CONCIERGE_PERSONA.contains("ECHO ALL OF THEM BACK"));
+        // The preview URL is what makes iteration possible at all — a draft the user cannot read is
+        // a draft they cannot react to.
+        assert!(CONCIERGE_PERSONA.contains("preview URL"));
+
+        // ── THE PART THAT IS A SAFETY PROPERTY, NOT GUIDANCE ────────────────────────────────────
+        // `publish_go_live` is `irreversible`, so it asks. The danger is not the model calling it —
+        // the gate handles that — it is the model TALKING THE HUMAN INTO WAIVING the gate, which no
+        // policy layer can see. A refusal or remedy string is an instruction the user follows, so
+        // the persona has to say the opposite explicitly.
+        assert!(CONCIERGE_PERSONA.contains("NEVER PUBLISH WITHOUT THE APPROVAL CARD"));
+        assert!(CONCIERGE_PERSONA.contains("do not suggest they set it to Allow"));
+        // The live-edit split is only a gate because the HOST refuses the cheap name against a live
+        // post. The model must be told to switch ops rather than retry — a model that dead-ends on
+        // `post-is-live` retries the same call and never reaches the card.
+        assert!(CONCIERGE_PERSONA.contains("post-is-live"));
+        assert!(CONCIERGE_PERSONA.contains("publish_update_live"));
+        // And the receipt: `publish_content` needs the `content:publish` scope, which
+        // `content:write` does not imply, so "the call did not fail" is not "the post is live".
+        assert!(CONCIERGE_PERSONA.contains("publish-unconfirmed"));
+        assert!(CONCIERGE_PERSONA.contains("never that it published"));
     }
 
     #[test]

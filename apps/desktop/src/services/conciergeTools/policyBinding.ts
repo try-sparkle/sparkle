@@ -72,6 +72,11 @@ import {
 import { primeRepoSlug, slugForRoot } from "./repoSlug";
 import type { ConciergeToolPolicy, ToolPolicyQuery } from "./registry";
 import { approvalSubject } from "./approvalSubject";
+import {
+  publishApprovalGuard,
+  summarizePublishArgLines,
+  type PublishApprovalGuard,
+} from "./publish";
 import type { ChiefOp } from "./chief";
 
 /** Read the human's `[concierge.tools]` rules off the live settings store, WITH whether we have
@@ -203,6 +208,20 @@ interface AskContext {
  * button. Everything else — unknown id, expired window, already spent, denied, still pending —
  * comes back false.
  */
+/**
+ * The publish guard for this call, computed ONCE and used twice: stamped onto the entry so the
+ * DOMAIN HANDLER can re-check it at execution, and used to replace the raw post body on the card
+ * with a diff summary.
+ *
+ * SYNCHRONOUS, because this whole path is. It reads the host's own snapshot of the post — a
+ * reading the host took from a destination response, never anything the model supplied — and
+ * returns null when there is none, which the handler treats as a refusal rather than as
+ * permission. See `conciergeTools/publish.ts`.
+ */
+function publishGuardFor(c: AskContext): PublishApprovalGuard | null {
+  return publishApprovalGuard(c.domain, c.op, c.args);
+}
+
 function resolveAskTier(c: AskContext): ToolPolicyDecision {
   const fingerprint = approvalFingerprint(c.domain, c.op, c.args);
   // The approval is BOUND to this call's id, so `conciergeToolAuthority` refuses if it is ever
@@ -230,6 +249,7 @@ function resolveAskTier(c: AskContext): ToolPolicyDecision {
 
   const entry = CATALOG_BY_NAME.get(c.op);
   const riskClass = c.evaluation.riskClass;
+  const publishGuard = publishGuardFor(c);
 
   // ASKING IS A SIDE EFFECT, AND DISPATCH SOMETIMES NEEDS THE VERDICT WITHOUT IT (bead
   // `sparkle-jjm27e`). When the arguments have already failed their schema, dispatch consults this
@@ -248,7 +268,14 @@ function resolveAskTier(c: AskContext): ToolPolicyDecision {
     summary: entry?.summary ?? c.evaluation.reason,
     riskClass,
     riskNote: riskClass ? CONCIERGE_RISK_NOTE[riskClass] : "",
-    args: describeApprovalArgs(c.args),
+    // THE CARD MUST NOT SHOW THE FIRST 220 CHARACTERS OF A POST AND CALL THAT CONSENT.
+    // `ARG_VALUE_MAX_CHARS` is 220, and for a live-post edit the human's READING IS THE GATE — so
+    // for publish calls the raw `bodyMarkdown` line is replaced with a diff summary (how much was
+    // added and removed, and the text either side of the first change). `rawArgs` below is
+    // untouched, so this changes what is DISPLAYED and nothing about what runs. Every other domain
+    // passes through unchanged: `summarizePublishArgLines` returns its input when there is no
+    // publish guard.
+    args: summarizePublishArgLines(describeApprovalArgs(c.args), publishGuard),
     // The same value the fingerprint above was computed from, kept verbatim so approving can replay
     // this exact call instead of waiting for the model to reproduce it. See the ledger's `rawArgs`.
     rawArgs: c.args,
@@ -278,6 +305,13 @@ function resolveAskTier(c: AskContext): ToolPolicyDecision {
     )
       ? { relayedFounderWords: true as const }
       : {}),
+    // WHAT THE POST LOOKED LIKE RIGHT NOW — the "before" reading for the ten-minute window between
+    // this card and the click that runs it (`APPROVAL_REQUEST_TTL_MS`). Stamped here for exactly
+    // the reason `subject` and `relayedFounderWords` are: the click handler runs long after this
+    // turn ended and cannot recover it. The RE-CHECK is deliberately NOT here — it lives in the
+    // publish domain handler, which runs on both entry points, whereas this binding is bypassed
+    // entirely by the approval replay path.
+    ...(publishGuard ? { publishGuard } : {}),
     configPath: entry?.configPath ?? conciergeToolConfigPath(c.op),
     fingerprint,
     ranRecently,

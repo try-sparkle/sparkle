@@ -1,8 +1,8 @@
 // @vitest-environment jsdom
 //
 // The compose box's keyboard-hint tagging, and the end-to-end behaviour it buys with HintOverlay:
-// "/" puts the caret in the box; "k" fires Screenshot and "f" fires Upload, each a leaf that
-// activates its button and dismisses the overlay.
+// "/" puts the caret in the box; "k" fires Screenshot, "f" fires Upload and "w" seeds the compose
+// prompt, each a leaf that activates its button and dismisses the overlay.
 //
 // The overlay is mounted for real here rather than stubbed. The interesting failures in this
 // feature are all in the seam between the two — a textarea that is clicked instead of focused, an
@@ -13,6 +13,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ComposeBox } from "./ComposeBox";
 import { HintOverlay } from "../HintOverlay";
 import { CHROME_HINTS } from "../../keyboardHints/hintTargets";
+import { COMPOSE_POST_LABEL, COMPOSE_POST_PROMPT } from "./composePost";
 
 // jsdom gives every element a 0×0 rect and a null offsetParent, both of which the overlay's
 // visibility filter rejects. Stub them so the tagged controls count as on screen.
@@ -87,9 +88,10 @@ describe("ComposeBox — the prompt-box hint", () => {
   });
 });
 
-describe("ComposeBox — the two attach-button hints", () => {
+describe("ComposeBox — the three icon-cluster hints", () => {
   const shot = () => screen.getByRole("button", { name: "Screenshot" });
   const upload = () => screen.getByRole("button", { name: "Upload" });
+  const writePost = () => screen.getByRole("button", { name: COMPOSE_POST_LABEL });
 
   it("tags both buttons at their approved characters", () => {
     setup();
@@ -118,6 +120,43 @@ describe("ComposeBox — the two attach-button hints", () => {
     // sub-layer. Against the old form "k" left the overlay open showing "s" and "u".
     await waitFor(() => expect(screen.queryByText("k")).toBeNull());
     expect(screen.queryByText("f")).toBeNull();
+  });
+
+  // THE THIRD CONTROL GETS THE SAME END-TO-END TREATMENT AS THE OTHER TWO (roborev 66480, Medium).
+  //
+  // `sparkle-131ms.10` added compose-post with ATTRIBUTE-ONLY coverage — data-hint is right, the
+  // letter is right, the letters are unique. This suite exists precisely because that is not
+  // sufficient: its own header says the interesting failures live in the seam between the two, and
+  // names "an attach button that is tagged but never badged" as one a test asserting only on
+  // attributes passes straight through. The registration path is data-driven so the risk is
+  // modest, but the other two controls earned this coverage for a stated reason and the third
+  // should not be the exception.
+  it("badges the third control too — a Control tap shows all three letters at once", () => {
+    setup();
+    expect(writePost().dataset.hint).toBe("compose-post");
+    expect(CHROME_HINTS["compose-post"]).toBe("w");
+    controlTap();
+    // All three MOUNTED and asserted together: a badge missing from one is only visible when the
+    // others are on screen to compare against.
+    expect(screen.getByText("k")).toBeTruthy();
+    expect(screen.getByText("f")).toBeTruthy();
+    expect(screen.getByText("w")).toBeTruthy();
+  });
+
+  it("w seeds the compose prompt and closes the overlay, without attaching anything", async () => {
+    const { onAttach } = setup();
+    controlTap();
+    fireEvent.keyDown(window, { key: "w" });
+
+    // The SIDE EFFECT, not the tag: the box actually holds the prompt.
+    await waitFor(() => expect(box().value).toContain(COMPOSE_POST_PROMPT));
+
+    // A leaf, like k and f — selecting it dismisses the overlay rather than re-collecting.
+    await waitFor(() => expect(screen.queryByText("w")).toBeNull());
+    expect(screen.queryByText("k")).toBeNull();
+
+    // And it is not a fourth way to attach something: this control never touches that path.
+    expect(onAttach).not.toHaveBeenCalled();
   });
 
   it("f reaches Upload, so the second action is not mouse-only", async () => {

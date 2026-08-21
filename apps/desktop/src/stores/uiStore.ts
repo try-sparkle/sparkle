@@ -62,6 +62,9 @@ export type CategoryId =
   | "cloudauth"
   | "onepassword"
   | "chief"
+  // Where Sparkle may publish, and whether the configured destination's tool set is one Sparkle
+  // can actually drive (bead `sparkle-131ms.5`).
+  | "publish"
   | "mobile"
   | "voice"
   | "approvals"

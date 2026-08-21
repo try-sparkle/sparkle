@@ -151,6 +151,21 @@ export const EXEMPT_SYNONYMS: Readonly<Record<string, string>> = {
   "clear the escalation": "set_agent_escalation",
   "raise an escalation": "set_agent_escalation",
   "escalate it to you": "set_agent_escalation",
+  // irreversible, PUBLISHING (bead `sparkle-131ms.6`) — the post lands on the user's own public
+  // site, is scraped and syndicated within seconds, and `publish_take_down` does not un-send that.
+  // Asking first is exactly right, so the check stands down.
+  //
+  // EVERY TERM NAMES THE POST OR THE SITE EXPLICITLY, the same discipline the Chief block above
+  // states: a bare "publish" would exempt half the replies this check exists to catch — and note
+  // that the bare `publish` term already above maps to `ship_agent` (cutting a release), which is a
+  // different act entirely. "live" alone is worse still, since a reply can call anything live.
+  "publish the post": "publish_go_live",
+  "publish this post": "publish_go_live",
+  "publish it to your site": "publish_go_live",
+  "take the post live": "publish_go_live",
+  "edit the live post": "publish_update_live",
+  "update the live post": "publish_update_live",
+  "rewrite the live post": "publish_update_live",
   // costs-money
   spend: "spawn_cloud_build_agent",
   fund: "spawn_cloud_build_agent",

@@ -332,6 +332,24 @@ import {
   type FleetOp,
   type FleetResult,
 } from "./fleet";
+import {
+  PUBLISH_OPS,
+  PUBLISH_RISK,
+  PUBLISH_KINDS,
+  MAX_PUBLISH_TAGS,
+  createDraft,
+  getPost,
+  goLive,
+  listDestinations,
+  listPosts,
+  listProjects as listPublishProjects,
+  probe as probeDestinationCapabilities,
+  takeDown,
+  updateDraft,
+  updateLive,
+  type PublishOp,
+  type PublishResult,
+} from "./publish";
 import type { AgentTab, Project } from "../../types";
 import type { HistoryHit } from "../history";
 
@@ -358,6 +376,16 @@ export const CONCIERGE_TOOL_DOMAINS = [
   "research",
   "accounts",
   "memory",
+  // ⚠️ A REGISTRY DOMAIN, NOT A CONTROL OP — AND MEMBERSHIP OF *THIS LIST* IS WHY (bead
+  // `sparkle-131ms.6`). `conciergeApprovalResume.isReplayable` is literally
+  // `CONCIERGE_TOOL_DOMAINS.includes(entry.domain)`, and this list omits `chief` and `app`. So an
+  // approved CONTROL op is never replayed: the grant sits there and the MODEL must retype every
+  // argument byte-identically inside the 5-minute grant window to match `approvalFingerprint`.
+  // For a multi-paragraph post body that is impossible, so following the Chief pattern would have
+  // made `publish_go_live` APPROVABLE AND NEVER RUNNABLE. Removing `publish` from this list does
+  // not merely change a routing detail; it silently breaks the approval round trip for the one
+  // domain whose whole safety model is the approval card.
+  "publish",
 ] as const;
 
 export type ConciergeToolDomain = (typeof CONCIERGE_TOOL_DOMAINS)[number];
@@ -750,6 +778,16 @@ function fromResearch<T>(ctx: OpContext, r: ResearchResult<T>): ConciergeToolRep
 
 /** memory: same convention as research/board — the refusal's `reason` becomes the wire code. */
 function fromMemory<T>(ctx: OpContext, r: MemoryResult<T>): ConciergeToolReply {
+  return r.ok ? ok(ctx, r.data) : err(ctx, r.reason, r.message);
+}
+
+/** publish: the board/memory convention. Its refusal `reason` is a `PublishRefusalCode` and passes
+ *  straight through, which is the entire point of having ten of them rather than one
+ *  `publish-failed`: `post-is-live` tells the model to switch to the gated op,
+ *  `post-changed-since-approval` tells it to re-ask, `visibility-unreadable` says the destination is
+ *  unreachable, and `publish-unconfirmed` says the call was accepted but the post is NOT live —
+ *  four different next actions that a flattened code cannot distinguish. */
+function fromPublish<T>(ctx: OpContext, r: PublishResult<T>): ConciergeToolReply {
   return r.ok ? ok(ctx, r.data) : err(ctx, r.reason, r.message);
 }
 
@@ -2255,6 +2293,138 @@ const PLANS_ROUTES: Record<PlansOp, Handler> = {
   ),
 };
 
+// ---------------------------------------------------------------------------------------------
+// PUBLISH — the concierge's reach OUT of Sparkle, onto the founder's own public site
+// ---------------------------------------------------------------------------------------------
+//
+// See `conciergeTools/publish.ts` for the whole design. Three things belong HERE rather than there:
+//
+// 1. THE STRICT SCHEMAS. `args` is untyped JSON a model wrote, and `.strict()` refuses an
+//    unrecognised field rather than forwarding it to a network peer that will publish something.
+// 2. THE TIER, HANDED TO THE DOMAIN. The two TOCTOU re-checks in publish.ts need to know whether
+//    this call is running off a human's approval, and `ctx.decision` is where that lives.
+// 3. THE OP SPLIT'S ARGUMENT SHAPES. `publish_update_draft` and `publish_update_live` take the
+//    IDENTICAL arguments on purpose: they are one destination verb behind two policy names, and a
+//    model that picks the cheap name against a live post is refused BY THE HOST, not by a schema.
+
+/** What the two live-post ops and `publish_get`/`publish_take_down` all name. */
+const publishContentArgs = z
+  .object({
+    contentId: z.string().min(1, "a post id is required"),
+    /** Omitted = `[publish] active`. A NAMED destination that is not configured is still a refusal
+     *  — that is a mistake, not a choice — but omitting it is the ordinary case, since v1 has one. */
+    destinationId: z.string().min(1).optional(),
+  })
+  .strict();
+
+const publishDestinationArgs = z
+  .object({ destinationId: z.string().min(1).optional() })
+  .strict();
+
+const publishListArgs = z
+  .object({
+    destinationId: z.string().min(1).optional(),
+    projectId: z.string().min(1).optional(),
+    limit: z.number().int().positive().max(200).optional(),
+  })
+  .strict();
+
+/** The editable fields, verified against the live endpoint 2026-08-17. `kind` is the "Format"
+ *  field and is a FIXED enum server-side, so it is a closed enum here too — a value the destination
+ *  will bounce is better refused inside the turn, where the model can still fix it. `tags` is a
+ *  free-form parameter of create/update capped at 12; the cap is enforced here so the failure names
+ *  its own cause instead of arriving as an unexplained refusal. */
+const publishFields = {
+  title: z.string().min(1).optional(),
+  subtitle: z.string().optional(),
+  slug: z.string().min(1).optional(),
+  /** MARKDOWN, and sanitized server-side (verified) — the design's plan to emit sanitized HTML from
+   *  Sparkle is unnecessary. */
+  bodyMarkdown: z.string().optional(),
+  kind: z.enum(PUBLISH_KINDS).optional(),
+  tags: z.array(z.string().min(1)).max(MAX_PUBLISH_TAGS).optional(),
+};
+
+const publishCreateArgs = z
+  .object({
+    destinationId: z.string().min(1).optional(),
+    ...publishFields,
+    /** REQUIRED, both of them — `create_content` demands a `projectId` and has no default, and the
+     *  capability probe asserts `title` + `projectId` as the argument shape it pins. Making them
+     *  required here means the refusal arrives with a field name inside the same turn rather than
+     *  as the destination's own error a round trip later. */
+    title: z.string().min(1, "a title is required"),
+    projectId: z.string().min(1, "a projectId is required — call publish_list_projects first"),
+  })
+  .strict();
+
+/** An edit must actually change something. A no-field update would send an empty write to the
+ *  destination and — on the live path — would put an approval card in front of the founder for a
+ *  change that does not exist. */
+const publishUpdateArgs = z
+  .object({
+    contentId: z.string().min(1, "a post id is required"),
+    destinationId: z.string().min(1).optional(),
+    ...publishFields,
+  })
+  .strict()
+  .refine(
+    (a) =>
+      a.title !== undefined ||
+      a.subtitle !== undefined ||
+      a.slug !== undefined ||
+      a.bodyMarkdown !== undefined ||
+      a.kind !== undefined ||
+      a.tags !== undefined,
+    { message: "name at least one field to change (title, subtitle, slug, bodyMarkdown, kind, tags)" },
+  );
+
+/** The tier this call is running under, as the publish domain's TOCTOU re-check needs it. Read off
+ *  the DISPATCH's own decision rather than re-derived, so there is one answer to "is this running
+ *  off a human's approval" and the handler cannot disagree with the gate that let it through. */
+function publishCtx(ctx: OpContext): { toolCallId: string; tier: string } {
+  return { toolCallId: ctx.toolCallId, tier: ctx.decision.tier };
+}
+
+const PUBLISH_ROUTES: Record<PublishOp, Handler> = {
+  publish_list_destinations: route(noArgs, async (_a, ctx) =>
+    fromPublish(ctx, await listDestinations()),
+  ),
+  publish_probe: route(publishDestinationArgs, async (a, ctx) =>
+    fromPublish(ctx, await probeDestinationCapabilities(a.destinationId)),
+  ),
+  publish_list_projects: route(publishDestinationArgs, async (a, ctx) =>
+    fromPublish(ctx, await listPublishProjects(a.destinationId)),
+  ),
+  publish_get: route(publishContentArgs, async (a, ctx) =>
+    fromPublish(ctx, await getPost(a.contentId, a.destinationId)),
+  ),
+  publish_list: route(publishListArgs, async (a, ctx) => {
+    const { destinationId, ...rest } = a;
+    return fromPublish(ctx, await listPosts(destinationId, rest));
+  }),
+  publish_create_draft: route(publishCreateArgs, async (a, ctx) => {
+    const { destinationId, ...fields } = a;
+    return fromPublish(ctx, await createDraft(destinationId, fields));
+  }),
+  // ⚠️ THE CHEAP NAME. It reaches the SAME destination verb as `publish_update_live`; what makes it
+  // safe to auto-allow is `updateDraft`'s host-side refusal, not this route. See publish.ts.
+  publish_update_draft: route(publishUpdateArgs, async (a, ctx) => {
+    const { contentId, destinationId, ...fields } = a;
+    return fromPublish(ctx, await updateDraft(contentId, destinationId, fields));
+  }),
+  publish_update_live: route(publishUpdateArgs, async (a, ctx) => {
+    const { contentId, destinationId, ...fields } = a;
+    return fromPublish(ctx, await updateLive(contentId, destinationId, fields, publishCtx(ctx)));
+  }),
+  publish_go_live: route(publishContentArgs, async (a, ctx) =>
+    fromPublish(ctx, await goLive(a.contentId, a.destinationId, publishCtx(ctx))),
+  ),
+  publish_take_down: route(publishContentArgs, async (a, ctx) =>
+    fromPublish(ctx, await takeDown(a.contentId, a.destinationId, publishCtx(ctx))),
+  ),
+};
+
 interface DomainEntry {
   routes: Record<string, Handler>;
   /** Whether an op changes the world — asked of the DOMAIN's own classification wherever it has one
@@ -2362,6 +2532,15 @@ const DOMAINS: Record<ConciergeToolDomain, DomainEntry> = {
     write: (op) => MEMORY_RISK[op as MemoryOp] !== "read-only",
     ops: MEMORY_OPS,
   },
+  publish: {
+    routes: PUBLISH_ROUTES,
+    // The risk map answers "is this a write" exactly — the five reads are `read-only` and every
+    // other op changes something on a live web site — so there is no separate PUBLISH_WRITE table
+    // to keep in step. `publish_probe` and `publish_list_projects` cross the network and are still
+    // reads: the class is about whether anything CHANGES, not about whether a packet leaves.
+    write: (op) => PUBLISH_RISK[op as PublishOp] !== "read-only",
+    ops: PUBLISH_OPS,
+  },
 };
 
 /**
@@ -2400,6 +2579,7 @@ export const CONCIERGE_TOOL_OPS: Record<ConciergeToolDomain, readonly string[]> 
   research: DOMAINS.research.ops,
   accounts: DOMAINS.accounts.ops,
   memory: DOMAINS.memory.ops,
+  publish: DOMAINS.publish.ops,
 };
 
 function isDomain(v: string): v is ConciergeToolDomain {

@@ -719,12 +719,24 @@ fn scrub_anthropic_env(cmd: &mut Command) {
 /// PREFIXES, not exact names, because these families grow: `STRIPE_SECRET_KEY` and
 /// `STRIPE_WEBHOOK_SECRET`, four `KNOCK_*` workflow ids plus a signing key, six `R2_*` names. An
 /// exact list would be correct on the day it was written and quietly incomplete a month later.
+///
+/// `SPARKLE_PUBLISH_TOKEN` is here for a reason worth stating, because it looks like it should NOT
+/// be (bead `sparkle-xekz6g`, roborev 66497 Medium). That variable exists so an AGENT can exercise
+/// the publishing flow — so scrubbing it from agent children reads, at a glance, like undoing the
+/// fix. It is not: the token is consumed by the Rust publish client INSIDE the Sparkle process
+/// (`publish_credential::token_for_destination` is deliberately not a `#[tauri::command]`), so a
+/// child never needs to hold it. Leaving it inheritable would hand every agent PTY child — spawned
+/// `--dangerously-skip-permissions` — a bearer token for the user's public site, readable with a
+/// bare `env` and postable under their identity. Before the fallback existed the credential was
+/// keychain-only and structurally out of a child's reach; scrubbing keeps that property while the
+/// fallback keeps the reachability it was added for. The prefix form covers the per-destination
+/// `SPARKLE_PUBLISH_TOKEN_<ID>` names too.
 const SPARKLE_SECRET_ENV_PREFIXES: &[&str] = &[
     "STRIPE_", "CLERK_", "DATABASE_URL", "POSTGRES_", "PG",
     "R2_", "KNOCK_", "POSTHOG_", "GITHUB_SPARKLE_", "GOOGLE_OAUTH_SECRET", "EXPO_TOKEN",
     "CLOUDFLARE", "E2B_API", "SOCKET_IO_SECRET", "DESKTOP_TOKEN_SECRET", "RESEND",
     "APPLE_SPARKLE_NOTARY", "VERCEL_OIDC_TOKEN", "DEEPGRAM_API", "CHIEF_API", "VITE_CHIEF_PAT",
-    "NEON_", "BEADS_CREDENTIAL",
+    "NEON_", "BEADS_CREDENTIAL", "SPARKLE_PUBLISH_TOKEN",
 ];
 
 /// Names an agent child must NOT inherit, computed against a snapshot of the parent environment.
@@ -1583,6 +1595,51 @@ mod tests {
                 "{keep} must SURVIVE — an agent cannot work without it"
             );
         }
+    }
+
+    /// AN AGENT CHILD MUST NEVER INHERIT THE PUBLISH DESTINATION'S BEARER (roborev 66497, Medium).
+    ///
+    /// The test above derives its fixtures FROM `SPARKLE_SECRET_ENV_PREFIXES`, so it passes whether
+    /// or not any particular family is in the list — it cannot notice a removal. This one asks the
+    /// question that matters and can actually fail: is the name the publish module really derives
+    /// stripped from a child's environment?
+    ///
+    /// It is deliberately a CROSS-MODULE assertion, built from `publish_credential::env_var_name`
+    /// rather than from a literal here. That makes it red in both directions — if this scrub entry
+    /// is deleted, and if the publish module renames its variable family out from under the scrub —
+    /// which a literal in this file could not do. (It also keeps a secret-SHAPED literal out of a
+    /// file that is exported to the public mirror, for the reason the test above records.)
+    #[test]
+    fn an_agent_child_never_inherits_the_publish_destination_bearer() {
+        let per_destination = crate::publish_credential::env_var_name("drodio.com");
+        let generic = per_destination
+            .rsplit_once("_DRODIO_COM")
+            .expect("the per-destination name is the family prefix plus the mapped id")
+            .0
+            .to_string();
+
+        let env = vec![
+            generic.clone(),
+            per_destination.clone(),
+            // The control: a name an agent is broken without, proving the assertion below is about
+            // these two names and not about everything being stripped.
+            "GH_TOKEN".to_string(),
+        ];
+        let stripped = secret_env_names(env);
+
+        assert!(
+            stripped.contains(&generic),
+            "{generic} must not reach an agent child — it is a bearer for the user's public site"
+        );
+        assert!(
+            stripped.contains(&per_destination),
+            "{per_destination} must not reach an agent child either; the scrub is by PREFIX so the \
+             per-destination names are covered by the same entry"
+        );
+        assert!(
+            !stripped.contains(&"GH_TOKEN".to_string()),
+            "GH_TOKEN must SURVIVE — this assertion is about the publish family, not a blanket strip"
+        );
     }
 
     /// PINS THE CONSTANT ITSELF, which is the only assertion here the implementation can fail.
