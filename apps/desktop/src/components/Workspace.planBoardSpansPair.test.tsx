@@ -293,35 +293,45 @@ describe("the Plan board takes over the whole pair", () => {
       expect(row.style.justifyContent).toBe("flex-start");
       expect(row.style.minHeight).toBe("34px");
 
-      // ── WHICH PHYSICAL EDGE `flex-start` RESOLVES TO ────────────────────────────────────────
+      // ── WHICH PHYSICAL EDGE `flex-start` RESOLVES TO, AND THE FOUNDER'S SECOND CORRECTION ──────
       // The assertions above are identical for both sides and therefore CANNOT see the one thing
       // that differs between them. `.paircols` is `row-reverse` on the left pair and `row` on the
-      // right, while its children are `[build, terminal]` in DOM order on both — so the Build
-      // column paints on the RIGHT of a left pair. This overlay is `inset: 0` over that box and
-      // `inset` ignores `row-reverse`, so an UNMIRRORED row anchors to the physical left on both
-      // sides: correct on the right pair, and a full-terminal-width jump on the left one.
+      // right, while its children are `[epics, build, terminal]` in DOM order on both — so the
+      // Build column paints on the RIGHT of a left pair. This overlay is `inset: 0` over that box
+      // and `inset` ignores `row-reverse`, so a bare `flex-start` row anchors to the pair's
+      // PHYSICAL left on both sides.
       //
-      // Asserting a literal per side would just restate the source. Asserting that the header
-      // AGREES WITH ITS OWN PAIR is the claim that survives someone re-mirroring the shell, and it
-      // is false on the unmirrored row — which is what makes it worth having. Both directions are
-      // exercised because the loop runs both sides.
+      // THAT USED TO BE TREATED AS THE BUG, and the row carried a per-side inset
+      // (`calc(100% - BUILD_COLUMN_PAINTED_WIDTH("left") + 10px)`) so the exit landed on the Build
+      // header's x on the mirrored pair too. The founder has now overruled it looking at the
+      // result: "I want the open planning board be left justified and not right justified." On a
+      // left pair that inset pushed this row most of the way to the pair's RIGHT edge while the
+      // board's own columns below it started at the left — the board read as right-justified, which
+      // is the thing he named. Physical left, both pairs, is the requirement now.
+      //
+      // THIS ASSERTION HAS TO BE ABLE TO FAIL ON THE OLD ROW, which is why it is a `toBe` on the
+      // literal rather than "the inset agrees with its pair": the old left-pair value satisfied
+      // every side-agnostic claim above. `toBe("10px")` is FALSE for `side === "left"` before this
+      // change and true after — run it against the previous Workspace.tsx and it reds.
       const cols = screen.getByTestId(`pair-cols-${side}`);
       expect(cols.style.flexDirection).toBe(side === "left" ? "row-reverse" : "row");
       // The ROW itself is never mirrored: mirroring it would put the filters to the toggle's LEFT
-      // on the left pair, which is the one thing the founder named explicitly.
+      // on the left pair, which is the one thing the founder named explicitly, and it would also
+      // re-create the right-justification he has now asked to be rid of.
       expect(row.style.flexDirection).toBe("row");
-      // ...so the alignment is carried entirely by the inline-start inset, and THAT is the claim
-      // worth pinning. On the unmirrored pair the Build column starts at the pair's own left edge,
-      // so the inset is AgentSidebar's bare `.bhd` 10px. On the mirrored pair the Build column
-      // starts a full column-width in from the right, so the inset must be DERIVED FROM the
-      // published build-width var — the property that makes the toggle land on the Build header's
-      // x rather than merely on the correct half of the screen.
-      if (side === "right") {
-        expect(row.style.paddingLeft).toBe("10px");
-      } else {
-        expect(row.style.paddingLeft).toContain(buildWidthVar("left"));
-        expect(row.style.paddingLeft).toContain("100%");
-      }
+      // ONE INSET, BOTH PAIRS: AgentSidebar's bare `.bhd` 10px, which is also exactly what the
+      // satellite window's copy of this row declares (SatelliteApp.test.tsx pins the twin). The two
+      // hosts had drifted — BoardFilterBar.tsx's header says they must not — and this closes it.
+      expect(row.style.paddingLeft).toBe("10px");
+      // Stated again as the SHAPE that is now forbidden, so a re-introduced derived inset fails
+      // here even if it happened to resolve to 10px at some particular build width. `100%` resolves
+      // against the whole pair, so any inset built from it is by construction a fraction of the
+      // pair rather than a fixed gutter — that is the family this pins out.
+      expect(row.style.paddingLeft).not.toContain("100%");
+      expect(row.style.paddingLeft).not.toContain(buildWidthVar("left"));
+      // Nothing else may push the row inward either — an inline-start MARGIN would move the exit
+      // exactly as the padding did while leaving the padding assertion above green.
+      expect(row.style.marginLeft || "").toBe("");
       // The row is addressable in its own right too, for the satellite test's twin of this.
       expect(row.dataset.testid).toBe("plan-board-header");
     }

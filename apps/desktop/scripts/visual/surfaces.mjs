@@ -568,6 +568,64 @@ export const SURFACES = [
     },
     mock: null,
   },
+  {
+    // ── THE PLANNING BOARD, ON THE MIRRORED PAIR ────────────────────────────────────────────────
+    // The board is an `inset: 0` overlay over the pair's whole column box, and `.paircols` is
+    // `row-reverse` on the LEFT pair while `inset` is not mirrored — so the LEFT pair is the only
+    // place a horizontal-alignment defect in this overlay can show. A right-pair capture cannot
+    // see it: that side's board has been flush left throughout.
+    //
+    // It exists because the founder reported the board as RIGHT-justified ("I want the open
+    // planning board be left justified and not right justified") and a percentage cannot answer
+    // that — the header row's x is the whole question. `mock: null`: rev4 has no plan board, so
+    // compare reports no-reference rather than scoring this against something it isn't.
+    //
+    // REACHED THROUGH THE REAL LINK, not by seeding a work mode. `epics-open-plan-board` is the
+    // only way in to the board in the main window, so clicking it is also a check that the way in
+    // still works — and scoping the click by `[data-side=left]` matters because the two pairs each
+    // render one and they share a testid.
+    //
+    // THE RED `board-error` BANNER IN THIS CAPTURE IS THE HARNESS, NOT THE BOARD. `serve.mjs`'s
+    // transport shim resolves every unknown command to `null`, the board polls a beads command on
+    // mount, and `beads.ts`'s PARSE-ERROR path builds its message with `raw.slice(0, 200)` — which
+    // throws `Cannot read properties of null (reading 'slice')` on a null payload rather than
+    // reporting the empty read. The seeded snapshot is what the columns render from, so the poll
+    // failing changes nothing below the banner. Left as-is deliberately: it is pre-existing, it is
+    // reachable only under the shim, and silencing it means either answering the command in the
+    // fixture or touching `beads.ts` — both wider than the alignment change this surface exists
+    // for. Do not read it as a defect in the board.
+    name: "plan-board-left",
+    query: "pairs=2",
+    description: "The Open Planning Board on the LEFT (mirrored) pair — header row and columns.",
+    app: {
+      steps: [
+        { waitFor: "[data-testid=workspace-shell]" },
+        { waitFor: "[data-testid=epics-column][data-side=left]" },
+        { cable: "off" },
+        { click: "[data-testid=epics-column][data-side=left] [data-testid=epics-open-plan-board]" },
+        { waitFor: "[data-testid=plan-column]" },
+        { waitFor: "[data-testid=plan-board-header]" },
+        // ── WAIT FOR THE COLUMNS, NOT JUST THE HEADER — THIS IS THE STEP THAT MAKES IT LOUD ──────
+        // Two separate things put a BLANK body under a perfectly correct header, and neither one
+        // fails a capture on its own:
+        //   1. `BoardView` is `lazy()`, and `PaneFallback` is a bare `C.forest` rectangle. Waiting
+        //      only for the header photographs that rectangle — it looks like an empty board and
+        //      is actually a chunk that had not resolved yet.
+        //   2. `byProject` is keyed by PROJECT, and this surface's left pair holds a DIFFERENT
+        //      project. Without its own bead snapshot `viewBoard` is `null` and the body renders
+        //      `Loading tasks…` forever (the Tauri shim answers unknown commands with `null`, so
+        //      the poll never fills it) — see `visualFixtures.ts`, which seeds it.
+        // `board-columns` is the element that exists only when neither of those is true, and a
+        // `waitFor` that never matches FAILS the capture instead of filing a picture of a spinner
+        // under a name promising columns.
+        { waitFor: "[data-testid=board-columns]" },
+      ],
+      // CLIPPED TO THE PAIR, not the viewport: the claim is about where this row sits WITHIN the
+      // box it is inset over, and a full-shell shot buries that in the rest of the cockpit.
+      clip: "[data-testid=pair-cols-left]",
+    },
+    mock: null,
+  },
 ];
 
 export const THEMES = ["light", "dark"];

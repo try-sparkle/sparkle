@@ -44,7 +44,7 @@ import { useConnectionStore } from "../stores/connectionStore";
 import { useCableStore } from "../stores/cableStore";
 import { useUiStore } from "../stores/uiStore";
 import { useBeadsStore } from "../stores/beadsStore";
-import { bucketBeads, type Bead } from "../services/beads";
+import { bucketBeads, type Bead, type BeadStatus } from "../services/beads";
 import { useDictationStore } from "../stores/dictationStore";
 import { useInboxStore } from "../stores/inboxStore";
 import { useConciergeQueueStore } from "../stores/conciergeQueueStore";
@@ -1178,9 +1178,55 @@ export function applyVisualFixtures(
       feedbackBead(`vfx-bead-${i + 2}`, "vfx-agent-6", `Narrow-row finding ${i + 1}`),
     ),
   ];
+  // ── THE LEFT PAIR'S OWN BOARD, SO A PLAN-BOARD CAPTURE PHOTOGRAPHS A BOARD ────────────────────
+  //
+  // `byProject` is keyed by PROJECT, and `?pairs=2` puts a DIFFERENT project on the left pair
+  // (`buildLeftPairFixture`). So seeding the primary project alone leaves the left pair's board
+  // with no snapshot at all — `BoardView`'s `viewBoard` is `null` and the body renders the
+  // `Loading tasks…` placeholder instead of the five columns. That is PERMANENT, not a race: the
+  // Tauri shim resolves every unknown command to `null`, so the poll never fills it either.
+  //
+  // It is worth spelling out because the failure is SILENT in exactly the way this file keeps
+  // paying for: the capture still succeeds, the header still renders, and nothing in
+  // `harness.test.mjs` can tell a board from a spinner — so `plan-board-left` shipped a picture
+  // that contradicted its own description ("header row and columns") while looking fine.
+  //
+  // BEHIND THE `?pairs=2` OPT-IN, like everything else here: with one pair there is no left
+  // project to key, and writing one anyway would put a snapshot in the store for a project no
+  // surface has open.
+  //
+  // SPREAD ACROSS THREE COLUMNS ON PURPOSE. `columnFor` buckets on `status` (+ the terminal
+  // labels), so a set that is all-`open` piles into Backlog and photographs a board with four
+  // empty columns — which cannot show a reader that the columns lay out, or where they start.
+  const boardBead = (id: string, title: string, status: BeadStatus, priority: number): Bead => ({
+    id,
+    title,
+    description: "Seeded by dev/visualFixtures for the plan-board capture.",
+    status,
+    labels: [],
+    priority,
+    commentCount: 0,
+  });
+  const leftBeads: Bead[] = [
+    boardBead("vfx-left-bead-1", "Tab strip loses its seam at narrow widths", "open", 1),
+    boardBead("vfx-left-bead-2", "Dictation pill overlaps the send tray", "open", 2),
+    boardBead("vfx-left-bead-3", "Cold-start splash flashes the unauthed shell", "open", 3),
+    boardBead("vfx-left-bead-4", "Port the settings sheet to the new scale tokens", "in_progress", 1),
+    boardBead("vfx-left-bead-5", "Terminal scrollback survives a pane move", "in_progress", 2),
+    boardBead("vfx-left-bead-6", "Retire the preview segment", "closed", 2),
+  ];
   useBeadsStore.setState({
     byProject: {
       [project.id]: { beads: fixtureBeads, board: bucketBeads(fixtureBeads), loadedAt: 0 },
+      ...(left
+        ? {
+            [left.project.id]: {
+              beads: leftBeads,
+              board: bucketBeads(leftBeads),
+              loadedAt: 0,
+            },
+          }
+        : {}),
     },
   });
 

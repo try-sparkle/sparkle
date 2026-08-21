@@ -336,15 +336,27 @@ describe("surface registry", () => {
       // which is where this menu has regressed twice — and both times a photograph caught it.
       "open-pr-menu-dismissed-wide",
       "open-pr-menu-dismissed-narrow",
+      // The Open Planning Board on the LEFT pair (bead sparkle-7kssy7). The board is an `inset: 0`
+      // overlay over a pair whose column box is `row-reverse` on that side only, so the left pair
+      // is the ONLY place a horizontal-alignment defect in it can be photographed — the right
+      // pair's board has been flush left throughout. Needs the second pair to exist at all.
+      "plan-board-left",
     ]);
     expect(THEMES).toEqual(["light", "dark"]);
   });
 
-  // THE SURFACE THAT NEEDS TWO PAIRS MUST ASK FOR THEM. Without `?pairs=2` the fixture seeds one
+  // THE SURFACES THAT NEED TWO PAIRS MUST ASK FOR THEM. Without `?pairs=2` the fixture seeds one
   // project, the left pair has no selected agent, `useEffectiveWired` refuses to project that side,
-  // and this surface photographs the unwired app — which is exactly what it did for its whole life.
-  it("asks the fixture for the second pair on the surface that needs it", () => {
-    expect(surfaceByName("workspace-wired-left").query).toBe("pairs=2");
+  // and `workspace-wired-left` photographs the unwired app — which is exactly what it did for its
+  // whole life. `plan-board-left` is worse off still: with no left pair there is no left epics
+  // column, so its opening click has nothing to press and the surface cannot be reached at all.
+  it("asks the fixture for the second pair on the surfaces that need it", () => {
+    // NAMED, not counted — a bare number cannot tell "a surface was added" from "one was swapped".
+    const twoPair = ["workspace-wired-left", "plan-board-left"];
+    for (const name of twoPair) {
+      const pairs = new URLSearchParams(surfaceByName(name).query ?? "").get("pairs");
+      expect(pairs, `${name} must open the second pair`).toBe("2");
+    }
     // …and NO OTHER SURFACE OPENS A SECOND PAIR, which is the invariant — a second pair re-lays-out
     // the whole shell, so every other baseline would move.
     //
@@ -353,7 +365,7 @@ describe("surface registry", () => {
     // stopped being one the moment a second was added: `open-pr-menu-narrow` carries `prs` and
     // `concierge`, neither of which opens a pair, and the proxy would have refused it. Guard the
     // fact, not the shape it happened to have.
-    for (const s of SURFACES.filter((x) => x.name !== "workspace-wired-left")) {
+    for (const s of SURFACES.filter((x) => !twoPair.includes(x.name))) {
       const pairs = new URLSearchParams(s.query ?? "").get("pairs");
       expect(pairs, `${s.name} must not open a second pair`).toBeNull();
     }

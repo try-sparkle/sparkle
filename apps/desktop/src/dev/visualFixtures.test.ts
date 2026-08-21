@@ -12,6 +12,7 @@ import {
   FIXTURE_NOW,
   FIXTURE_PRS,
   FIXTURE_PRS_BY_ROOT,
+  FIXTURE_LEFT_PROJECT_ID,
   FIXTURE_PROJECT_ID,
   FIXTURE_PROJECT_ROOT,
   FIXTURE_SECOND_PRS,
@@ -35,6 +36,7 @@ import { bandOfStatus, sectionOfRow } from "../engine/buildSections";
 import { uncommittedWorkEvidence } from "../engine/workflowStage";
 import type { AgentTabStatus } from "../types";
 import { useUiStore } from "../stores/uiStore";
+import { useBeadsStore } from "../stores/beadsStore";
 import { isProjectOpen } from "../engine/openProjects";
 import { PROJECTS_PERSIST_DEBOUNCE_MS, PROJECTS_PERSIST_KEY, debouncedProjectsStorage, flushProjectsPersist, useProjectStore } from "../stores/projectStore";
 import { RUNTIME_PERSIST_KEY, useRuntimeStore } from "../stores/runtimeStore";
@@ -822,6 +824,46 @@ describe("the second-project parameter", () => {
     // second pair re-lays-out the entire shell.
     expect(visualProjectCount("?visual=1&pairs=2")).toBe(1);
     expect(visualPairCount("?visual=1&projects=2")).toBe(1);
+  });
+
+  // ── THE LEFT PAIR NEEDS ITS OWN BEAD SNAPSHOT, OR ITS BOARD IS A SPINNER ──────────────────────
+  //
+  // `byProject` is keyed by PROJECT and `?pairs=2` puts a DIFFERENT project on the left pair, so
+  // seeding the primary project alone leaves `BoardView`'s `viewBoard` at `null` there and the
+  // body renders `Loading tasks…` forever (the Tauri shim answers every unknown command with
+  // `null`, so the poll never fills it). The `plan-board-left` visual surface shipped exactly that
+  // — a capture whose header was right but whose body contradicted its own description — and
+  // nothing could notice, because a capture of a spinner succeeds just as loudly as a capture of a
+  // board.
+  //
+  // ASSERTED ON THE BUCKETED BOARD, NOT ON THE BEAD ARRAY. "the array is non-empty" is the vacuous
+  // form here: `columnFor` buckets on `status`, so an all-`open` set is non-empty and still paints
+  // four empty columns. The claim with power is that the cards LAND in more than one column.
+  it("seeds the LEFT pair's project with a board of its own, in more than one column", () => {
+    expect(applyVisualFixtures("?visual=1&pairs=2", ON)).toBe(true);
+    const left = useBeadsStore.getState().byProject[FIXTURE_LEFT_PROJECT_ID];
+    expect(left, "the left pair's project has no bead snapshot — its board renders Loading tasks…")
+      .toBeTruthy();
+    const board = left!.board;
+    expect(board, "a snapshot with no bucketed board is the same spinner").toBeTruthy();
+    const occupied = (["backlog", "inProgress", "done", "delivered", "blocked"] as const).filter(
+      (k) => (board![k] ?? []).length > 0,
+    );
+    expect(
+      occupied.length,
+      `cards landed in only ${occupied.join(", ") || "no"} column(s) — the capture shows empty columns`,
+    ).toBeGreaterThan(1);
+  });
+
+  // The other half, and it is what keeps the seed behind its opt-in: with ONE pair there is no
+  // left project on screen, so a snapshot keyed to it would be state no surface can reach — the
+  // "fixture seeds something nothing photographs" drift this file guards everywhere else.
+  it("writes NO left-pair snapshot without ?pairs=2", () => {
+    expect(applyVisualFixtures("?visual=1", ON)).toBe(true);
+    expect(useBeadsStore.getState().byProject[FIXTURE_LEFT_PROJECT_ID]).toBeUndefined();
+    // …and the primary project still has its own, so this is not passing because the whole store
+    // is empty — which is how a broken seed would satisfy the line above.
+    expect(useBeadsStore.getState().byProject[FIXTURE_PROJECT_ID]).toBeTruthy();
   });
 });
 

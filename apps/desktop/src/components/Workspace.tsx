@@ -66,7 +66,9 @@ import { focusedZoomColumn, installColumnFocusTracker } from "../services/column
 import { useColumnZoom } from "../hooks/useZoomColumn";
 import { useWindowWidth } from "../hooks/useWindowWidth";
 import {
-  BUILD_COLUMN_PAINTED_WIDTH,
+  // BUILD_COLUMN_PAINTED_WIDTH is no longer read here — the plan-board header sits on the pair's
+  // own left edge on both sides now, so there is no derived inset to build. It stays exported for
+  // `columnResize`'s own suite and any future caller.
   CONCIERGE_MAX_WIDTH,
   CONCIERGE_MIN_WIDTH,
   // CONCIERGE_PAIRED_HARD_MAX is no longer read here — `acceptsStoredConciergeWidth` owns the
@@ -2592,63 +2594,60 @@ function PlanBoardSlot({ project, side }: { project: Project; side: PairSide }) 
         zIndex: PLAN_COLUMN_Z,
       }}
     >
-      {/* TOP LEFT, BOTH SIDES, ON THE BUILD HEADER'S OWN x AND y.
-          The founder: "The build versus plan toggle should stay left justified when it's in plan
-          mode. It should stay in the same spot that it is when it's in build mode, so it shouldn't
-          be going to the right side. And then the filters can be to the right of the build and plan
-          toggle, not to the left. So don't move build and plan to the right. Keep it where it is so
-          I can switch between them easily."
+      {/* TOP LEFT, BOTH SIDES — the pair's own left edge.
+          The founder, looking at the board: "I want the open planning board be left justified and
+          not right justified." That is the operative instruction for this row's x, and the block
+          on `paddingLeft` below records what it replaced and why the thing it replaced is not a
+          requirement any more.
 
-          THIS REVERSES the previous instruction ("just have it be top right"), and the reversal is
-          the whole point rather than a change of taste: this toggle is the control you ROUND-TRIP
-          on, so it must not move when you use it. A control that jumps corners between the two
-          modes it switches makes its own second press a hunt.
-
-          THE GEOMETRY IS AgentSidebar's `.bhd` BAND, COPIED ON PURPOSE. This overlay is `inset: 0`
-          over the pair's column box, and the Build header is the TOP of the Build column, which is
-          that box's first in-flow child — so the two rows share an origin, and matching `minHeight`
-          + `padding` lands the toggle on the same x AND the same y in both modes.
+          THE GEOMETRY IS STILL AgentSidebar's `.bhd` BAND, and that half is unchanged. This overlay
+          is `inset: 0` over the pair's column box, so matching `minHeight` + the 10px inset keeps
+          this row on the same y — and the same height — as the Build header it covers.
 
           The numbers are LITERALS rather than an import, deliberately: `BUILD_HEADER_H` is
           module-private to AgentSidebar, and 17 test files replace that module with a mock factory,
           so exporting it would make it `undefined` in every one of them — silently un-pinning the
           alignment the import was meant to hold. The tests pin it instead, against AgentSidebar's
-          own source, and do it for BOTH hosts of this row (see the note in BoardFilterBar.tsx).
-
-          `variant="mini"` is the same chiclet AgentSidebar renders in the Build header. No `width`:
-          the mini segment is intrinsically sized (`flex: 0 0 auto`), and a fixed box would stretch
-          the two segments back into a strip. */}
+          own source, and do it for BOTH hosts of this row (see the note in BoardFilterBar.tsx). */}
       <div
         data-testid="plan-board-header"
         style={{
           display: "flex",
           alignItems: "center",
-          // ── INSET TO THE BUILD COLUMN, WHICH IS WHERE "LEFT JUSTIFIED" ACTUALLY MEANS ────────
+          // ── THE PAIR'S PHYSICAL LEFT EDGE, ON BOTH PAIRS ─────────────────────────────────────
           // `.paircols` is `row-reverse` on the LEFT pair (PairShell) while its children are
-          // `[build, terminal]` in DOM order on BOTH sides — so the Build column paints on the
-          // RIGHT of a left pair and on the LEFT of a right pair. This overlay is `inset: 0` over
-          // that box and `inset` ignores `row-reverse`, so a bare `flex-start` row anchors to the
-          // pair's PHYSICAL left on both sides: the Build header's own x on the right pair, and a
-          // full terminal-width away from it on the left one.
+          // `[epics, build, terminal]` in DOM order on BOTH sides — so the Build column paints on
+          // the RIGHT of a left pair and on the LEFT of a right pair. This overlay is `inset: 0`
+          // over that box and `inset` ignores `row-reverse`, so a bare `flex-start` row anchors to
+          // the pair's PHYSICAL left on both sides.
           //
-          // TWO EARLIER ATTEMPTS AND WHY NEITHER WAS ENOUGH, because the second looks right:
-          //   1. Bare `flex-start` — correct on the right pair, terminal-width jump on the left.
-          //   2. Mirroring the ROW with its pair — put the toggle on the pair's right EDGE, still
-          //      a whole Build-column width from the Build header's left inner edge, and worse, it
-          //      flipped the filters to the toggle's LEFT on that pair, which is the one thing the
-          //      founder named explicitly ("the filters can be to the right of the build and plan
-          //      toggle, not to the left").
-          // A comment here previously claimed a full-pair overlay "cannot know the Build column's
-          // width". That was simply wrong, and roborev 65299 was right to refuse it: AgentSidebar
-          // PUBLISHES that width document-wide via `publishColumnWidthVar(buildWidthVar(side))`,
-          // and every constant in its clamp is exported from `engine/columnResize`. So the row
-          // stays an unmirrored `row` — filters always grow rightward from the toggle, on both
-          // pairs — and simply insets its start edge by the Build column's width on the mirrored
-          // side. The toggle then lands on the Build header's exact x on BOTH pairs.
+          // THAT ANCHOR USED TO BE TREATED AS THE BUG. This row carried a per-side inset
+          // (`calc(100% - BUILD_COLUMN_PAINTED_WIDTH("left") + 10px)`) so that the exit landed on
+          // the Build header's exact x on the mirrored pair too — reading "left justified" as "the
+          // x the Build header occupies" rather than as a physical edge.
+          //
+          // THE FOUNDER OVERRULED THAT LOOKING AT THE RESULT: "I want the open planning board be
+          // left justified and not right justified." On a left pair the inset pushed this row most
+          // of the way to the pair's RIGHT edge, while the board's own columns underneath it still
+          // began at the left — so the board read as right-justified, which is precisely what he
+          // named. His earlier instruction ("keep it where it is so I can switch between them
+          // easily") was about the toggle not MOVING between modes; the control it was said of is
+          // gone, replaced by a one-way "Close Planning Board" link that is not round-tripped in
+          // place, so the cost that instruction was buying against no longer applies.
+          //
+          // Two things fall out and both are wanted:
+          //   • ONE INSET, NOT TWO. The satellite window's copy of this row always declared a plain
+          //     `padding: "0 10px"`. BoardFilterBar.tsx's header records that this row has TWO
+          //     hosts and that a change made in only one DRIFTS — they had drifted, and this ends
+          //     it. Both hosts now declare the same 10px, and both are pinned by tests.
+          //   • THE MIRRORED PAIR STOPS WRAPPING EARLY. The old inset removed its own space from
+          //     the content box, leaving the header line `BUILD_W - 20` wide on a left pair, so a
+          //     populated BoardFilterBar dropped to a second line on that pair only (roborev
+          //     65327's accepted trade). The row now has the whole pair to lay out in.
           flexDirection: "row",
           justifyContent: "flex-start",
           // Wraps for the same reason the Build header does. Both children are `flex: 0 0 auto`
-          // (the mini segment and BoardFilterBar's own span), so neither can give width up: at a
+          // (the exit link and BoardFilterBar's own span), so neither can give width up: at a
           // narrow pair width the row would overflow a box that sets no `overflow`. Wrapping drops
           // the filter bar to a second line and grows the band instead.
           flexWrap: "wrap",
@@ -2656,27 +2655,11 @@ function PlanBoardSlot({ project, side }: { project: Project; side: PairSide }) 
           // `--hd-h` from rev4.html, the height AgentSidebar's `.bhd` uses. minHeight, not height,
           // so the band grows when the filter bar wraps.
           minHeight: 34,
-          // 10px is AgentSidebar's `.bhd` inset. On the mirrored pair the Build column starts a
-          // full column-width in from the right, so the row's own start edge moves with it.
-          //
-          // THE ROW WRAPS SOONER ON THE MIRRORED PAIR, AND THAT IS THE ACCEPTED TRADE (roborev
-          // 65327). Padding removes its own space from the content box, so on a left pair the
-          // header line is `BUILD_W - 20` wide rather than the full pair. At the 220px default the
-          // mini segment (~80) plus a populated BoardFilterBar (~130-250) does not fit, and the bar
-          // drops to a second line — on that pair only.
-          //
-          // It is not fixable by moving the inset onto the toggle as a margin, which is the obvious
-          // remedy: a flex item's margins count toward its outer size for line-breaking, so the
-          // same total still exceeds the same line. The constraint is geometric, not a choice of
-          // property — anchoring the toggle to the Build column's left edge on a pair where that
-          // column is the RIGHTMOST one leaves exactly `BUILD_W` of room to its right, and
-          // toggle+filters are wider than that. Something has to give: wrap, overflow, or drop the
-          // alignment. Wrapping is chosen because it keeps BOTH of the founder's stated
-          // requirements (same x as Build mode, filters to the RIGHT of the toggle) and because it
-          // is precisely what AgentSidebar's own Build header does at the same width — see the
-          // `flexWrap: "wrap"` note there, which reasons this through for the identical case.
+          // AgentSidebar's `.bhd` inset — `padding: "0 10px"` — spelled as the two axes because the
+          // vertical gap below this band is a margin (see `marginBottom`). SIDE-INDEPENDENT: see
+          // the block above for why the left pair no longer gets a derived inset.
           paddingRight: 10,
-          paddingLeft: side === "left" ? `calc(100% - ${BUILD_COLUMN_PAINTED_WIDTH("left")} + 10px)` : 10,
+          paddingLeft: 10,
           // The old row spent 8px of BOTTOM PADDING on the gap above the board. Padding would now
           // pull the toggle off the Build header's centre line, so the gap is a MARGIN instead —
           // outside the band, so it cannot move what the band centres.
