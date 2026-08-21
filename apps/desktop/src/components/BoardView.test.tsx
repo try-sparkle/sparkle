@@ -2779,9 +2779,17 @@ describe("BoardView — column order", () => {
   const SCRAMBLED = ["p1-t2", "p1-t1", "p1-t0", "p1-e2", "p1-kid", "p1-e0", "p1-e1"];
   const scrambled = () => SCRAMBLED.map((id) => cards.find((c) => c.id === id)!);
 
-  /** The same seven cards in EVERY column, each column's copy independently scrambled. Status is
-   *  irrelevant here — the columns are seeded directly rather than through `columnFor`, which is
-   *  what lets one fixture assert "each column" without inventing five different bead states. */
+  /** The same seven cards in EVERY column, each column's copy independently scrambled. The columns
+   *  are seeded directly rather than through `columnFor`, which is what lets one fixture assert
+   *  "each column" without inventing five different bead states.
+   *
+   *  SEEDING EVERY BEAD INTO `blocked` TOO IS NOT INCIDENTAL, though it reads that way.
+   *  `useBeadBuildActions` takes `blockedIds` from `board.blocked`, so a bead present there is not
+   *  startable and `StartControls` renders nothing. That is why no card here carries a Build It
+   *  button. The order assertions do not depend on it — `column()` now selects the two exact card
+   *  testids rather than the `board-card-` prefix — but the coupling is written down because the
+   *  previous version of this fixture DID depend on it silently: drop the `blocked` lane and all
+   *  seven tests failed with a message about the fixture rather than about the selector. */
   function orderBoard(): Board {
     return {
       backlog: scrambled(),
@@ -2802,7 +2810,15 @@ describe("BoardView — column order", () => {
   function column(key: string): { id: string; epic: boolean }[] {
     const col = document.querySelector(`[data-board-column="${key}"]`);
     if (!col) throw new Error(`no column ${key} on screen`);
-    return Array.from(col.querySelectorAll('[data-testid^="board-card-"]')).map((el) => {
+    // EXACT testids, never the `board-card-` PREFIX — the same rule `cardsIn` states above, and
+    // for the same reason: `board-card-build-it` / `board-card-clear-stalled` are rendered by
+    // `StartControls` INSIDE the card div, so the prefix form counts controls as cards. Here that
+    // would be worse than a miscount: the extra node matches no fixture id and this helper throws
+    // "a rendered card matched no fixture id", pointing the reader at the fixture instead of at
+    // the selector.
+    return Array.from(
+      col.querySelectorAll('[data-testid="board-card-epic"], [data-testid="board-card-task"]'),
+    ).map((el) => {
       const id = cards.find((c) => el.textContent?.includes(c.id))?.id;
       if (!id) throw new Error("a rendered card matched no fixture id");
       return { id, epic: el.querySelector('[data-testid="epic-pill"]') !== null };

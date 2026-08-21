@@ -17,7 +17,7 @@
 //
 // This file is the guard for that one inch. Delete the mount line and it goes red.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, render, screen, within } from "@testing-library/react";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: () => Promise.resolve(null) }));
 
@@ -73,15 +73,24 @@ afterEach(() => {
 });
 
 describe("the epic goal is mounted on the epic's row", () => {
-  it("renders the goal row for the epic actually on screen", () => {
+  it("renders the goal row INSIDE the epic's row button, keyed to that epic", () => {
     const beads = [bead("ep-1")];
     seed(beads);
     render(<EpicsColumn project={PROJECT} side="right" />);
 
-    // The row exists AND is keyed to this epic — a mount that rendered a goal row for the wrong
-    // epic would be just as broken as no mount at all.
-    const row = screen.getByTestId("epic-goal-row");
-    expect(row.getAttribute("data-epic-id")).toBe("ep-1");
+    // ⚠️ CONTAINMENT, not just existence (roborev 65967). A global `screen` query is satisfied
+    // wherever in the column the mount lives, so asserting only the testid and the count left the
+    // most plausible bad merge resolution unguarded: hoisting `<EpicGoalRowForEpic/>` out of
+    // `EpicRow`'s <button> into a per-epic sibling keeps the id and the count correct while
+    // breaking the design contract. `EpicGoalRow.tsx`'s own header explains why that matters — the
+    // row is built from inline <span>s with stopPropagation PRECISELY because it lives inside the
+    // epic row's button; outside it, the goal paints on its own line and the click-swallow contract
+    // is moot. This suite exists to survive a hand-resolved conflict in this file, so the
+    // resolution that MISPLACES the mount is squarely in scope.
+    const epicRow = screen.getByTestId("epic-row");
+    const goalRow = screen.getByTestId("epic-goal-row");
+    expect(epicRow.contains(goalRow)).toBe(true);
+    expect(goalRow.getAttribute("data-epic-id")).toBe("ep-1");
   });
 
   it("shows the goal TEXT the store holds, not just an empty affordance", () => {
@@ -101,10 +110,18 @@ describe("the epic goal is mounted on the epic's row", () => {
     seed(beads);
     render(<EpicsColumn project={PROJECT} side="right" />);
 
-    const ids = screen
-      .queryAllByTestId("epic-goal-row")
-      .map((r) => r.getAttribute("data-epic-id"))
+    // Each goal row must sit inside ITS OWN epic's button — the per-epic-sibling hoist produces the
+    // right ids and the right count and would pass an id-only assertion.
+    const pairs = screen
+      .queryAllByTestId("epic-row")
+      .map((r) => [
+        r.getAttribute("data-epic-id"),
+        within(r).queryByTestId("epic-goal-row")?.getAttribute("data-epic-id") ?? null,
+      ])
       .sort();
-    expect(ids).toEqual(["ep-1", "ep-2"]);
+    expect(pairs).toEqual([
+      ["ep-1", "ep-1"],
+      ["ep-2", "ep-2"],
+    ]);
   });
 });

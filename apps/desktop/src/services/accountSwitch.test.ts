@@ -200,15 +200,15 @@ describe("moveAgent", () => {
     expect(getPin("__sparkle_self__")).toBeUndefined();
   });
 
-  it("…and still writes NO machinery pin of its own while doing it", () => {
-    // The half of the original claim that SURVIVES, kept separate so the reversal above cannot be
-    // read as licence to start pinning: the rescue re-spawns and lets `chooseAccountForAgent`
-    // re-resolve. Writing a pin would launder a machinery choice into the slot the modal renders
-    // back as the user's own — and in a satellite window it lands on the `-win-<uuid>` variant,
-    // detaching that window from the modal long after the limit resets.
-    const restart = vi.fn(() => true);
-    moveAgent("__sparkle_self__", "b", restart);
-    expect(restart).toHaveBeenCalledWith("__sparkle_self__");
+  it("…and clears the BASE key's pin when a satellite VARIANT is the one being rescued", () => {
+    // roborev 65980. `clearPin(agentId)` deletes the pin for that exact key, but `stickyPin`
+    // (accountSelection.ts) falls back from a `__sparkle_self__-win-<uuid>` variant to the pin on
+    // the BASE `__sparkle_self__`. So rescuing a satellite window cleared a variant pin that almost
+    // never exists, left the human pin that is actually READ, and the re-spawn re-read it and
+    // bounced straight back to the walled account — precisely the failure the clear was added to
+    // prevent, for every satellite window.
+    setPin("__sparkle_self__", "personal");
+    moveAgent("__sparkle_self__-win-6f2c", "b", vi.fn(() => true));
     expect(getPin("__sparkle_self__")).toBeUndefined();
   });
 });

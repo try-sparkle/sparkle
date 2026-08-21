@@ -29,7 +29,7 @@ import {
   type Identity,
   type LiveUsage,
 } from "./accountStore";
-import { isStickyAccountKey } from "./accountSelection";
+import { isStickyAccountKey, SPARKLE_SELF_ACCOUNT_PREFIX } from "./accountSelection";
 import { switchRecommendation, type Ceiling } from "./headroom";
 import { releaseQuotaBlockForAgent } from "../engine/engineRegistry";
 
@@ -333,6 +333,14 @@ export function moveAgent(
   // invariant the pin protected, kept while the pair moves off the exhausted account.
   if (isStickyAccountKey(agentId)) {
     clearPin(agentId);
+    // …AND THE BASE KEY, when this is a satellite VARIANT (roborev 65980). `stickyPin` falls back
+    // from a `__sparkle_self__-win-<uuid>` variant to the pin on the base `__sparkle_self__`, so
+    // clearing only the exact key removed a variant pin that almost never exists and left the one
+    // that actually gets READ. The re-spawn then re-read it and bounced straight back to the walled
+    // account — the exact failure this clear was added to prevent, for every satellite window. The
+    // fallback is mirrored here rather than inferred: whatever `stickyPin` would resolve is what has
+    // to be cleared, or the clear is a no-op against the reader.
+    if (agentId.startsWith(`${SPARKLE_SELF_ACCOUNT_PREFIX}-`)) clearPin(SPARKLE_SELF_ACCOUNT_PREFIX);
     return restart(agentId);
   }
   // `setPinFromSwitch`, not `setPin`: this pin is MACHINERY's, and a later activation has to be able

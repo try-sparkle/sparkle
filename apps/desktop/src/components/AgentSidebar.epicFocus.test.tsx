@@ -191,19 +191,36 @@ describe("clearing the epic focus from inside the build column", () => {
     expect(screen.queryByText("Beta")).not.toBeNull();
   });
 
-  it("says WHICH filter the header control clears, because its label cannot", () => {
-    // NOT decoration, and not a duplicate of the label assertion. "Show all" is the STATUS
-    // filter's wording too — its reset sits in this same band — and the identical string appears
-    // on two further buttons in this column. So the label alone cannot identify this control, and
-    // a reader hovering it learns nothing without this. It regressed exactly once already: the
-    // swap to `HeaderLink` dropped the tooltip silently, because the component took no `title`
-    // (roborev 65983). Asserting the accessible name too, since that is the half a mouse user
-    // never sees.
+  it("says WHICH filter the header control clears, WITHOUT dropping its visible label from the name", () => {
+    // TWO PROPERTIES, and the second is the one a naive version gets wrong.
+    //
+    // The label cannot identify this control on its own: "Show all" is the STATUS filter's wording
+    // too — its reset is in this same band — and the identical string is on two further buttons in
+    // this column. So the accessible name has to carry the distinguishing words.
+    //
+    // But it must also still CONTAIN "Show all". Replacing the name outright fails WCAG 2.5.3
+    // (Label in Name): a voice-control user saying "click Show all" stops matching the control,
+    // and a screen-reader user hears a name sharing no words with what is painted. That is exactly
+    // what the first attempt did (roborev 66314), and a `toContain("clears the epic…")` assertion
+    // passes for that broken shape — which is why the label containment is asserted here.
+    //
+    // NO `title` IS ASSERTED, deliberately. `disableNativeTooltips()` (main.tsx) deletes `title` on
+    // a capture-phase mouseover, so one could never show; asserting it in jsdom — where that
+    // listener is never installed — passes while every real hover strips it. The attribute is
+    // asserted ABSENT so nobody restores a dead affordance a third time.
     useUiStore.setState({ epicFocusBySide: { left: null, right: "ep-1" } } as never);
     render(<AgentSidebar project={PROJECT} />);
     const clear = screen.getByTestId("epic-clear-focus-build");
-    expect(clear.getAttribute("title")).toContain("clears the epic selected in the Epics column");
-    expect(clear.getAttribute("aria-label")).toContain("clears the epic selected in the Epics column");
+    const name = clear.getAttribute("aria-label") ?? "";
+    // THE LITERAL, not `clear.textContent` read back off the element under test. A self-referential
+    // expectation cannot tell "the name contains the visible label" from "there IS no visible
+    // label": an icon-only variant would make textContent `""`, and `toContain("")` is true of
+    // every string, so the WCAG property this test exists for would silently stop being checked
+    // (roborev 66330). Pinning the visible text separately is what keeps that from passing.
+    expect(clear.textContent?.trim()).toBe("Show all");
+    expect(name).toContain("Show all");
+    expect(name).toContain("clears the epic");
+    expect(clear.getAttribute("title")).toBeNull();
   });
 
   it("retires the header control once nothing is focused, so it is never a dead button", () => {

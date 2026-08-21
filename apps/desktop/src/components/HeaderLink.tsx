@@ -21,7 +21,7 @@ export function HeaderLink({
   onClick,
   testId,
   hint,
-  title,
+  description,
   style,
 }: {
   label: string;
@@ -34,19 +34,32 @@ export function HeaderLink({
    *  working AND fixes a latent ambiguity: `data-hint="build"` used to match several live elements
    *  at once, and `HintOverlay` fires whichever is first in DOM order. */
   hint?: string;
-  /** Hover/tooltip text. OPTIONAL, but not decorative: `label` is a short verb phrase and the same
-   *  words recur on unrelated controls — "Show all" alone appears on three buttons in the build
-   *  column, one of them in this very band beside the status filter's own reset. Where a link's
-   *  label does not by itself say WHICH thing it acts on, pass this so hover and the accessible
-   *  name do. Omitted when the label is already unambiguous ("Open Planning Board"). */
-  title?: string;
+  /** WHAT THIS LINK ACTS ON, when `label` alone cannot say — "Show all" appears on three separate
+   *  buttons in the build column, one of them in this very band beside the status filter's reset.
+   *
+   *  IT IS NOT A TOOLTIP, and must not be described as one. `disableNativeTooltips()` (wired at
+   *  `main.tsx`) installs a CAPTURE-PHASE `mouseover` listener that walks the hovered element and
+   *  every ancestor and deletes `title` before the webview's tooltip delay elapses, so a native
+   *  `title` here is dead by construction — see `ProjectTabs.tsx` and bead `sparkle-7h01z`, which
+   *  reached this conclusion already. Worse, that helper only promotes `title` to a name when the
+   *  element is otherwise UNNAMED; this button has visible text, so a `title` would be deleted
+   *  and nothing kept. So this feeds the ACCESSIBLE NAME only.
+   *
+   *  The name is composed as `<label> — <description>` rather than replacing the label, because an
+   *  accessible name that does not contain the visible text fails WCAG 2.5.3 (Label in Name): a
+   *  voice-control user saying "click Show all" would no longer match the control.
+   *
+   *  If a VISIBLE hover explanation is ever wanted, the established pattern is local hover state
+   *  plus a portaled fixed-position card (`composer/SuggestionRow.tsx`, `ProjectTabs.tsx`) — not
+   *  this prop. Omit it when the label is already unambiguous ("Open Planning Board"). */
+  description?: string;
   style?: CSSProperties;
 }) {
   return (
     <button
       data-testid={testId}
       {...(hint ? { "data-hint": hint } : null)}
-      {...(title ? { title, "aria-label": title } : null)}
+      {...(description ? { "aria-label": `${label} — ${description}` } : null)}
       onClick={onClick}
       style={{
         background: "transparent",

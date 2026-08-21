@@ -3241,12 +3241,16 @@ export function AgentSidebar({
             <HeaderLink
               testId="epic-clear-focus-build"
               label="Show all"
-              // WHICH filter this clears, because the label cannot say it. "Show all" is the
-              // status filter's wording too — its reset sits in this same band — and two more
-              // buttons in this column carry the identical string. Without this the header shows
-              // a bare "Show all" beside a differently-styled "Reset" with nothing distinguishing
-              // them (roborev 65983).
-              title="Show every build agent — clears the epic selected in the Epics column"
+              // WHICH filter this clears, because the label cannot say it: "Show all" is the status
+              // filter's wording too — its reset sits in this same band — and two more buttons in
+              // this column carry the identical string.
+              //
+              // `description`, NOT `title` (roborev 66314). A native `title` is stripped app-wide
+              // by `disableNativeTooltips()` before any tooltip can appear, so the string this
+              // replaced never rendered — not after the HeaderLink swap, and not before it either.
+              // This feeds the accessible name, which is composed as "Show all — …" so the visible
+              // label stays inside it (WCAG 2.5.3).
+              description="clears the epic selected in the Epics column, showing every build agent"
               onClick={() => setEpicFocus(pairSide, null)}
             />
           )}
