@@ -71,6 +71,7 @@ import {
   sparkleAgentIdFor,
   SPARKLE_AGENT_DISPLAY_NAME,
   SPARKLE_AGENT_ID,
+  SPARKLE_PROJECT_ID,
   isSparkleAgentId,
 } from "./sparkleAgent";
 import { sparkleActivityLine } from "./sparkleBusy";
@@ -704,6 +705,29 @@ function selfIdentity(req: ControlRequest): SelfIdentity | null {
       activity: latest ? (conciergeActivityLine(latest)?.text ?? null) : null,
       // The concierge line is a last-tool-call observation, not a stamped agent self-report, so it
       // has no per-agent `activityAt` to age — its recency rules live in `seq` (see the field docs).
+      activityAgeMs: null,
+    };
+  }
+  // THE APP-OWNED IMPROVE SPARKLE AGENT, special-cased for the SAME reason the concierge is above:
+  // its id (`__sparkle_self__`, or a per-window variant) is a documented, stable address that is
+  // deliberately NOT a projectStore roster row (`handleGetState` synthesizes the row into the WIRE
+  // reply only). So `findAgent` can never resolve it, and this op used to return `self: null` for the
+  // one agent whose whole job is to act through this API — it could see the roster but never learn who
+  // it was (bead sparkle-t41yw0). Resolve it here from the SAME synthesized facts the roster row uses.
+  if (isSparkleAgentId(req.callerAgentId)) {
+    const project = projects.find((p) => p.id === SPARKLE_PROJECT_ID);
+    return {
+      id: req.callerAgentId,
+      kind: "build",
+      name: SPARKLE_AGENT_DISPLAY_NAME,
+      // It HAS a row (the synthesized one), so per-agent ops may default to it — unlike the concierge,
+      // which is `isAgent: false` because it has no row at all.
+      isAgent: true,
+      projectId: project?.id ?? SPARKLE_PROJECT_ID,
+      projectName: project?.name ?? null,
+      // The computed busy line (services/sparkleBusy), the same one the roster row shows — not a
+      // stamped self-report, so there is no per-agent age to show.
+      activity: sparkleActivityLine(Date.now()),
       activityAgeMs: null,
     };
   }
@@ -3360,6 +3384,16 @@ async function handleSendPeerMessage(req: ControlRequest): Promise<Record<string
     const { projects, selectedProjectId } = useProjectStore.getState();
     callerProjectId = projects.find((p) => p.id === selectedProjectId)?.id ?? null;
     callerLabel = CONCIERGE_SELF_NAME;
+  } else if (isSparkleAgentId(req.callerAgentId)) {
+    // THE APP-OWNED IMPROVE SPARKLE AGENT, special-cased BEFORE findAgent for the SAME reason the
+    // concierge is: its id is a documented, stable address that is deliberately not a projectStore
+    // roster row, so `findAgent` can never resolve it. Without this branch the agent the founder most
+    // wants talking to the concierge was refused as an `unknown_caller` — it could be addressed but
+    // could not address back, the exact asymmetry the concierge case above was added to end (bead
+    // sparkle-t41yw0). Its project is the fixed sparkle-self namespace, not the selected one.
+    const { projects } = useProjectStore.getState();
+    callerProjectId = projects.find((p) => p.id === SPARKLE_PROJECT_ID)?.id ?? SPARKLE_PROJECT_ID;
+    callerLabel = peerLabel(SPARKLE_AGENT_DISPLAY_NAME, req.callerAgentId);
   } else {
     const caller = findAgent(req.callerAgentId);
     if (!caller) {

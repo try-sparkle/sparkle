@@ -11,7 +11,7 @@ import { useUiStore } from "../stores/uiStore";
 // tests spell the constant rather than the literal so a rename cannot leave them asserting a string
 // nothing produces. `notePaneStatus` / `resetPaneBusyForTests` drive the REAL busy latch, so these
 // exercise services/sparkleBusy end to end instead of mocking the thing under test.
-import { SPARKLE_AGENT_ID } from "./sparkleAgent";
+import { SPARKLE_AGENT_ID, SPARKLE_PROJECT_ID, SPARKLE_AGENT_DISPLAY_NAME } from "./sparkleAgent";
 // THE SHARED BUSY RULE IS THE SEAM, not `improvementPass` behind it. What this file is responsible
 // for is PUBLISHING that rule on the roster row — promoting `status` to "working" and carrying the
 // line as `activity`. Whether a pass is actually in flight is `sparkleBusy`'s own question, asserted
@@ -4851,6 +4851,36 @@ describe("controlListener", () => {
 
     // An id that resolves to nothing is described as nothing. Inventing an identity for a stale or
     // spoofed caller would be the same lie the empty roster was, one field over.
+    it("resolves the app-owned __sparkle_self__ caller to its own identity, not null", async () => {
+      // bead sparkle-t41yw0. Its id is a documented, stable address that is deliberately NOT a
+      // projectStore row, so it hit the same `self: null` the concierge did — the one agent whose
+      // whole job is to act through this API could see the roster but never learn who it was. It must
+      // resolve to its own identity, on every scope, not null.
+      for (const scope of ["self", "active", "all"] as const) {
+        fire({
+          reqId: `self-sparkle-${scope}`,
+          op: "get_state",
+          callerAgentId: SPARKLE_AGENT_ID,
+          payload: { scope },
+        });
+        await flush();
+        const res = lastReply() as { self: Record<string, unknown> | null };
+        expect(res.self, `scope ${scope} must resolve the app-owned agent`).toMatchObject({
+          id: SPARKLE_AGENT_ID,
+          kind: "build",
+          name: "Improve Sparkle",
+          // It HAS a synthesized row, so per-agent ops may default to it — the field the concierge
+          // (isAgent:false, no row) does NOT get. This is the precondition set_agent_* reads.
+          isAgent: true,
+          // No sparkle-self project is registered in this test's store, so it falls back to the
+          // fixed namespace id rather than resolving to null (which is what broke the write ops).
+          projectId: SPARKLE_PROJECT_ID,
+          // sparkleActivityLine is mocked to null here (no headless pass in the test env).
+          activity: null,
+        });
+      }
+    });
+
     it("reports self: null for a caller that resolves to no agent at all", async () => {
       fire({ reqId: "self-4", op: "get_state", callerAgentId: "ghost-agent", payload: { scope: "all" } });
       await flush();
@@ -6649,6 +6679,30 @@ describe("send_peer_message", () => {
     expect(lastReply()).toMatchObject({ ok: true, to: { id: SPARKLE_AGENT_ID } });
     expect(inboxSends).toHaveLength(1);
     expect(inboxSends[0]).toMatchObject({ agentId: SPARKLE_AGENT_ID });
+  });
+
+  it("delivers FROM the app-owned Improve Sparkle agent TO the concierge — it can address, not only be addressed", async () => {
+    // bead sparkle-t41yw0. The mirror of B2, and the founder's actual use case: `__sparkle_self__`
+    // is a valid SENDER too. Its id is no project row, so it hit the same `unknown_caller` the
+    // concierge did before its special-case — the one agent the founder most wants talking to the
+    // concierge could be addressed but could not address back, the exact asymmetry that made a human
+    // relay messages by hand. The concierge is an app-global recipient (resolveSpecialAddressee), so
+    // this exercises the whole sparkle→concierge path the founder relies on.
+    //
+    // Assert the ENQUEUE SIDE EFFECT, not just the reply: the message lands addressed to the
+    // concierge, and its `from` is the agent's peer label (`Improve Sparkle [__sparkle_self__]`).
+    // Removing the caller special-case reverts it to `unknown_caller` and queues nothing, so this
+    // reds — not vacuous.
+    send({ to: CONCIERGE_CALLER_AGENT_ID, message: "asking for your feedback" }, SPARKLE_AGENT_ID);
+    await flush();
+
+    expect(lastReply()).toMatchObject({ ok: true, to: { id: CONCIERGE_CALLER_AGENT_ID } });
+    expect(inboxSends).toHaveLength(1);
+    expect(inboxSends[0]).toMatchObject({
+      agentId: CONCIERGE_CALLER_AGENT_ID,
+      text: "asking for your feedback",
+    });
+    expect(inboxSends[0]!.from).toBe(`${SPARKLE_AGENT_DISPLAY_NAME} [${SPARKLE_AGENT_ID}]`);
   });
 
   it("still refuses a bogus id as not_in_project — only the two special ids resolve app-globally", async () => {

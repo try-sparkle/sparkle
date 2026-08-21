@@ -2692,7 +2692,25 @@ function secretStagingMessage(verdict) {
  *  worktree in the repo the work actually belongs to. Committing into a repo the work does not belong
  *  to is called out explicitly because it is the improvisation that was actually observed, and it
  *  looks locally reasonable at the moment an agent reaches for it. */
-export function outsideWorktreeMessage(target, callerRoot) {
+export function outsideWorktreeMessage(target, callerRoot, sameRepo = null) {
+  // SAME-REPO SIBLING WORKTREE. `sameRepo === true` means the target sits in another worktree of the
+  // repository this agent is ALREADY in, so both of the cross-repo options above are wrong advice for
+  // it: there is nothing to hand off (the file is reachable on the caller's own branch) and nothing to
+  // ask for (a worktree in that repo is what the caller already has). Following them stages a copy in
+  // a scratchpad, or requests a worktree that already exists, and in both cases the edit that was
+  // wanted never happens. Only `true` takes this branch — `null` means the guard could not resolve the
+  // repositories, and an unproven same-repo claim must fall back to the conservative cross-repo text.
+  if (sameRepo === true) {
+    return (
+      `Blocked: ${target} is outside this agent's worktree (${callerRoot}).\n` +
+      "It IS in the same repository, though — a sibling worktree, not another repo. So there is nothing\n" +
+      "to hand off: edit that same path under your OWN worktree root instead, and it reaches `main`\n" +
+      "through your own branch and PR like any other change.\n" +
+      "Do NOT reach across into the sibling checkout even though the file is 'the same file': that\n" +
+      "worktree belongs to another agent, your write would land outside your branch, and nothing in\n" +
+      "your PR would carry it.\n"
+    );
+  }
   return (
     `Blocked: ${target} is outside this agent's worktree (${callerRoot}).\n` +
     "Edit only files inside your worktree. If the file you are producing genuinely belongs somewhere\n" +
@@ -2705,6 +2723,48 @@ export function outsideWorktreeMessage(target, callerRoot) {
     "Do NOT commit it into a repo it does not belong to just because that repo is writable: it buries\n" +
     "the deliverable somewhere nobody is reviewing, and a checkout with no remote cannot ship it at all.\n"
   );
+}
+
+/** Resolve the git COMMON dir for `dir` — the one directory every worktree of a repository shares.
+ *  This is what distinguishes "another worktree of MY repo" from "a different repository": the
+ *  per-worktree gitdir differs between siblings, the common dir does not. `--path-format=absolute`
+ *  keeps the answer comparable across callers (a bare `--git-common-dir` can come back relative).
+ *  Returns null on any failure — no git, not a repo, an older git that rejects the flag — and every
+ *  consumer treats null as UNKNOWN rather than as a negative. */
+function gitCommonDir(dir) {
+  try {
+    const out = execFileSync("git", ["-C", dir, "rev-parse", "--path-format=absolute", "--git-common-dir"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    const common = out.trim();
+    return common.length > 0 ? common : null;
+  } catch {
+    return null;
+  }
+}
+
+/** True iff `target` and `callerRoot` live in the SAME repository, null when that cannot be
+ *  established. Deliberately three-valued: the message this feeds picks a materially different remedy
+ *  for each, and guessing "different repo" from an unresolvable lookup is the safe fallback while
+ *  guessing "same repo" is not. `target` is a file path that may not exist yet, so the lookup runs
+ *  against its containing directory, walking up until one resolves. */
+export function sameRepositoryAs(target, callerRoot) {
+  if (typeof target !== "string" || typeof callerRoot !== "string") return null;
+  if (target.length === 0 || callerRoot.length === 0) return null;
+  const mine = gitCommonDir(callerRoot);
+  if (!mine) return null;
+  // The target's own directory may not exist (a Write creating a new file), so climb to the nearest
+  // ancestor git can answer for. Bounded by reaching the filesystem root.
+  let dir = dirname(target);
+  for (let i = 0; i < 64; i++) {
+    const theirs = gitCommonDir(dir);
+    if (theirs) return theirs === mine;
+    const up = dirname(dir);
+    if (up === dir) break;
+    dir = up;
+  }
+  return null;
 }
 
 /** True iff `target` resolves into a Claude Code SESSION SCRATCHPAD directory — the harness-sanctioned
@@ -3001,7 +3061,15 @@ async function main() {
     allowedScratchpad = false;
   }
   if (allowedScratchpad) process.exit(0);
-  process.stderr.write(outsideWorktreeMessage(target, callerRoot));
+  // Three-valued on purpose: only a proven same-repo answer changes the remedy (see
+  // outsideWorktreeMessage). Any failure here leaves it null and the conservative text stands.
+  let sameRepo = null;
+  try {
+    sameRepo = sameRepositoryAs(target, callerRoot);
+  } catch {
+    sameRepo = null;
+  }
+  process.stderr.write(outsideWorktreeMessage(target, callerRoot, sameRepo));
   process.exit(2); // exit code 2 → Claude Code blocks the tool call
 }
 
