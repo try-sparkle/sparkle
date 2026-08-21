@@ -24,7 +24,7 @@ import { useEffect, useState } from "react";
 import { useShallow } from "zustand/react/shallow";
 import { BeadCard } from "./BeadCard/BeadCard";
 import { beadsComment, beadsDetail, type BeadComment } from "../services/beadsCommands";
-import { beadStage, workersForBead } from "../services/planView";
+import { beadStage, workersInEpic } from "../services/planView";
 import { DELIVERED_LABEL, type Bead } from "../services/beads";
 import { setBeadPriority } from "./BeadCard/beadPriority";
 import { useBeadBuildActions } from "./BeadCard/useBeadBuildActions";
@@ -94,7 +94,11 @@ export function EpicInlineCard({
         chrome="epics"
         bead={bead}
         stage={stage}
-        workers={workersForBead(agents, bead.id)}
+        // EVERY WORKER IN THE EPIC, not just the ones bound to the epic's own bead id. The
+        // founder saw an empty space on a card reading nine-of-nine: workers are dispatched
+        // against the CHILDREN, so `workersForBead(agents, bead.id)` was correct code answering
+        // the wrong question and rendered empty on precisely the busiest epics.
+        workers={workersInEpic(agents, allBeads, bead.id)}
         // CAPPED, unlike the board's overlay. That panel is its own scroller; this card sits inside
         // the column's list, so an uncapped description would push the whole ladder off screen.
         descMaxHeight={160}

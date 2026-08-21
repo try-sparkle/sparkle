@@ -96,6 +96,53 @@ export function workersForBead(
   return agents.filter((a) => a.kind === "worker" && a.beadId === beadId).map((a) => a.name);
 }
 
+/**
+ * Names of every worker building ANY bead inside an epic — the epic's own bead and all its
+ * children.
+ *
+ * WHY THIS EXISTS SEPARATELY FROM {@link workersForBead}. The founder, 2026-08-20, looking at an
+ * epic card reading nine-of-nine: *"I don't see any build agents… it should be showing any build
+ * agent that's working on any bead that is part of the card."* The card was asking
+ * `workersForBead(agents, epic.id)`, which matches workers bound to the EPIC'S OWN bead id — and
+ * almost nothing is ever bound there, because workers are dispatched against the CHILDREN. So the
+ * field was correct code answering the wrong question, and it rendered empty on exactly the epics
+ * with the most work in flight.
+ *
+ * MEMBERSHIP COMES FROM `childrenOf`, never from a parent-field equality test written out locally.
+ * That edge has one owner (`services/beads.ts`) and `scripts/lib/epic-membership-guard.sh` fails CI
+ * on a re-derivation — the dotted-id and reparented-bead forms are both the same edge and a
+ * hand-rolled filter silently misses one of them.
+ *
+ * THE FORBIDDEN IDIOM IS DESCRIBED HERE RATHER THAN QUOTED, ON PURPOSE. The guard's pattern is
+ * deliberately broad and does NOT skip comment lines, so writing the literal comparison out — even
+ * inside a sentence telling you not to write it — reds the guard. It did, on this very branch. The
+ * escape hatch (`// epic-guard-ok`) exists, but the guard's own header warns that sprinkling
+ * opt-outs is how a broad pattern gets trained away, and narrowing the pattern to dodge a false
+ * positive is what reopened the SIGPIPE hole. So the prose steps around the literal instead, the
+ * same way `EpicsColumn.tsx` steps around the label-treatment ratchet's literal. Do not "restore"
+ * the example.
+ *
+ * DEDUPED, because one worker can be bound to a bead that is reachable twice, and ORDER-STABLE on
+ * the agents array so the line does not reshuffle between polls.
+ */
+export function workersInEpic(
+  agents: Pick<AgentTab, "name" | "kind" | "beadId">[],
+  beads: readonly Bead[],
+  epicId: string,
+): string[] {
+  const ids = new Set<string>([epicId, ...childrenOf(beads, epicId).map((b) => b.id)]);
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const a of agents) {
+    if (a.kind !== "worker") continue;
+    if (a.beadId === null || a.beadId === undefined || !ids.has(a.beadId)) continue;
+    if (seen.has(a.name)) continue;
+    seen.add(a.name);
+    out.push(a.name);
+  }
+  return out;
+}
+
 /** The id of the epic a build agent's workers are on — the first worker bound to a bead with a
  *  parent wins (they all share one parent epic). Null when no worker is bound yet. */
 function workerDerivedEpicId(
