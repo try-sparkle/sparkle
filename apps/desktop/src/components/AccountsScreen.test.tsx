@@ -5,7 +5,7 @@
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AccountsScreen, SIGNED_IN_NO_EMAIL, type AccountsDeps } from "./AccountsScreen";
-import { PENDING_NICKNAME } from "./accountsView";
+import { PENDING_NICKNAME, EXPIRED_LOGIN_NICKNAME } from "./accountsView";
 import {
   NOT_SIGNED_IN,
   type Account,
@@ -1854,34 +1854,36 @@ describe("rotation-readiness banner", () => {
     expect(banner.textContent).not.toContain("2 accounts are still");
   });
 
-  it("collapses two same-placeholder NO-EMAIL accounts into ONE counted bullet, worded correctly", async () => {
-    // "Login expired — reconnect" is a shared placeholder in the noEmail bucket (the expired login
-    // retains its accountUuid, so rotationReadiness routes it here, not to notSignedIn). Two of them
-    // must collapse to one bullet — and the plural must AGREE IN NUMBER (not "a Claude login … them").
+  it("collapses two EXPIRED-login accounts (in notSignedIn) with EXPIRED copy, not 'never signed in'", async () => {
+    // The expired placeholder is produced with email AND accountUuid BOTH null — the oauthAccount was
+    // cleared — so rotationReadiness files it under notSignedIn, NOT noEmail (the earlier "noEmail
+    // retains the uuid" premise was wrong; roborev 67153/67154). The two collapse to ONE bullet whose
+    // copy must say the login EXPIRED — never "registered but never signed in", which contradicts the
+    // nickname it quotes and points at the wrong remedy. Fixture uses the shape the wire actually emits:
+    // {email: null, accountUuid: null}.
     const deps = makeDeps(
       [
         acct("real", { nickname: "Real", isDefault: true }),
-        acct("x1", { nickname: "Login expired — reconnect" }),
-        acct("x2", { nickname: "Login expired — reconnect" }),
+        acct("x1", { nickname: EXPIRED_LOGIN_NICKNAME }),
+        acct("x2", { nickname: EXPIRED_LOGIN_NICKNAME }),
       ],
       [],
       [
         signedInAs("real", "real@example.com", "u1"),
-        { id: "x1", email: null, organization: null, accountUuid: "ux1" },
-        { id: "x2", email: null, organization: null, accountUuid: "ux2" },
+        { id: "x1", email: null, organization: null, accountUuid: null },
+        { id: "x2", email: null, organization: null, accountUuid: null },
       ],
     );
     render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
     const banner = await screen.findByTestId("rotation-banner");
-    const noEmailBullets = within(banner)
+    const expiredBullets = within(banner)
       .getAllByRole("listitem")
-      .filter((li) => /no readable email/i.test(li.textContent ?? ""));
-    expect(noEmailBullets).toHaveLength(1);
-    expect(noEmailBullets[0]!.textContent).toContain("2 accounts are");
-    expect(noEmailBullets[0]!.textContent).toContain("each a Claude login with no readable email");
-    // The number-agreement bug the collapse would otherwise ship: a singular "— a Claude login" next
-    // to a plural "them". The fixed wording puts "each" between the dash and "a Claude login".
-    expect(noEmailBullets[0]!.textContent).not.toContain("— a Claude login");
+      .filter((li) => /login expired/i.test(li.textContent ?? ""));
+    expect(expiredBullets).toHaveLength(1); // collapsed, not two identical bullets
+    expect(expiredBullets[0]!.textContent).toContain("2 accounts show");
+    expect(expiredBullets[0]!.textContent).toContain("reconnect them");
+    // The contradiction the earlier fix shipped: an expired login labelled "never signed in".
+    expect(banner.textContent).not.toContain("never signed in");
   });
 
   it("does NOT collapse REDUNDANT accounts — two same-nickname rows can be DIFFERENT logins", async () => {

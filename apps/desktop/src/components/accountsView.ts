@@ -169,6 +169,16 @@ export const PENDING_NICKNAME = "Signing in…";
  *  in' notice." */
 export const STALLED_SIGN_IN_TITLE = "Trouble signing in";
 
+/** The generic label a RETAINED-BUT-EXPIRED login keeps: a dir that was signed in once, whose
+ *  `oauthAccount` Claude Code has since cleared. The Rust side (`adopt_orphan_dirs_at`, on
+ *  `LoginEvidence::SignedOutButUsed`) writes this exact string as the row's `nickname`, and — because
+ *  the cleared `oauthAccount` makes `read_oauth_identity_at` return `None` — such a row carries
+ *  `email: null` AND `accountUuid: null`, so `rotationReadiness` files it under `notSignedIn` (NOT
+ *  `noEmail`). This MUST stay byte-identical to `EXPIRED_LOGIN_NICKNAME` in
+ *  `src-tauri/src/accounts.rs`; `scripts/tests/expired-nickname-sync.test.sh` fails the build if it
+ *  drifts, since there is no generated binding across the boundary for it. */
+export const EXPIRED_LOGIN_NICKNAME = "Login expired — reconnect";
+
 /** How long a sign-in may sit unfinished before it is called a failure. The founder proposed "maybe
  *  within two minutes or something like that"; an OAuth round trip through a browser is seconds,
  *  so two minutes is already generous and a row past it is not merely slow. */

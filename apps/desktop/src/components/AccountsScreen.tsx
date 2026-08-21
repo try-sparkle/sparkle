@@ -67,6 +67,7 @@ import {
   collapsedRunningAgents,
   signInStalled,
   PENDING_NICKNAME,
+  EXPIRED_LOGIN_NICKNAME,
   STALLED_SIGN_IN_TITLE,
   SIGN_IN_STALL_SECONDS,
 } from "./accountsView";
@@ -649,36 +650,42 @@ function RotationBanner({
   // a config dir that was created but never signed into renders as an ordinary row, so two rows read
   // as two accounts. Each sentence says which registration and WHY it doesn't count.
   //
-  // COLLAPSE IDENTICAL PLACEHOLDERS. "Signing in…" (`notSignedIn`) and "Login expired — reconnect"
-  // (`noEmail`, which retains the accountUuid) are GENERIC placeholder nicknames shared by every
-  // not-signed-in / expired account, so two such accounts used to render byte-identical bullets — the
-  // same sentence twice, which reads as a bug and also collided on the React `key`. Group those two
-  // categories by nickname and say a shared placeholder ONCE with a count, mirroring the duplicate-login
-  // group further below. Distinct nicknames (a user renamed one) stay on their own line.
+  // COLLAPSE IDENTICAL PLACEHOLDERS. The only bucket with a shared placeholder is `notSignedIn`, which
+  // holds BOTH "Signing in…" ({@link PENDING_NICKNAME}) and "Login expired — reconnect"
+  // ({@link EXPIRED_LOGIN_NICKNAME}) — the Rust producer nulls email AND accountUuid together for an
+  // expired login (its `oauthAccount` was cleared), so `rotationReadiness` files it here, NOT under
+  // `noEmail` (roborev 67153/67154 corrected the earlier claim). Two accounts sharing one of these
+  // placeholders used to render byte-identical bullets — the same sentence twice, and a React `key`
+  // collision — so we group by nickname and say a shared placeholder ONCE with a count.
   //
-  // `redundant` is DELIBERATELY NOT collapsed (roborev 67907). Its accounts are signed in with real
-  // emails, so they carry no shared placeholder — and two same-nickname `redundant` rows can duplicate
-  // two DIFFERENT logins (`rotationReadiness` puts a row here when it duplicates *some earlier* usable
-  // account), so a plural "they share one quota and count as one" would assert a relationship between
-  // the grouped rows that need not hold. Per-account bullets are accurate; `key` on the id avoids any
-  // React collision the collapse was covering for.
+  // …but the SENTENCE must match WHY the row is out: an expired login is not "never signed in" (that
+  // contradicts the nickname it quotes and points at the wrong remedy). So the copy branches on the
+  // expired placeholder. Distinct nicknames stay on their own line.
+  //
+  // `redundant` is NOT collapsed (roborev 66907): its rows are signed in with real emails, carry no
+  // shared placeholder, and two same-nickname rows can duplicate two DIFFERENT logins — so a plural
+  // "they share one quota" would assert a relationship that need not hold. Per-account bullets, keyed on
+  // the id. `noEmail` is likewise per-account: `list_account_identities` nulls email and accountUuid
+  // together, so no production row reaches it with a readable-uuid-but-no-email shape — collapsing a
+  // bucket nothing reaches would be a claim about an unreachable state.
+  const notSignedInSingular = (nick: string) =>
+    nick === EXPIRED_LOGIN_NICKNAME
+      ? `“${nick}” — its Claude login expired; reconnect it to route agents there.`
+      : `“${nick}” is registered but has never been signed in, so it cannot receive agents.`;
+  const notSignedInPlural = (count: number, nick: string) =>
+    nick === EXPIRED_LOGIN_NICKNAME
+      ? `${count} accounts show “${nick}” — their Claude login expired; reconnect them to route agents there.`
+      : `${count} accounts are still “${nick}” — registered but never signed in, so they cannot receive agents.`;
   const excluded = [
-    ...groupExcluded(
-      readiness.notSignedIn,
-      (nick) => `“${nick}” is registered but has never been signed in, so it cannot receive agents.`,
-      (count, nick) =>
-        `${count} accounts are still “${nick}” — registered but never signed in, so they cannot receive agents.`,
-    ),
+    ...groupExcluded(readiness.notSignedIn, notSignedInSingular, notSignedInPlural),
     ...readiness.redundant.map((a) => ({
       key: a.id,
       text: `“${a.nickname}” is the same Claude login as another account, so they share one quota and count as one.`,
     })),
-    ...groupExcluded(
-      readiness.noEmail,
-      (nick) => `“${nick}” has a Claude login with no readable email, so Sparkle cannot route agents to it.`,
-      (count, nick) =>
-        `${count} accounts are “${nick}” — each a Claude login with no readable email, so Sparkle cannot route agents to them.`,
-    ),
+    ...readiness.noEmail.map((a) => ({
+      key: a.id,
+      text: `“${a.nickname}” has a Claude login with no readable email, so Sparkle cannot route agents to it.`,
+    })),
   ];
 
   return (
