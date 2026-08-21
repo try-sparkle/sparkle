@@ -151,9 +151,23 @@ export const DEFAULT_PREVIEW_EAGERNESS: PreviewEagerness = "visual";
  *
  * ══ WHY IT NAMES THE TOOL AND ITS ARGUMENTS ═════════════════════════════════════════════════════
  * An instruction an agent cannot act on is worse than none: it produces an agent that tries, fails,
- * and learns to distrust the brief. So this says the tool (`preview`), the exact payload key
- * (`previewOp`, deliberately NOT `op` — see `controlListener.handlePreview` for why an inner `op`
- * never arrives), and what each op does.
+ * and learns to distrust the brief. So this says the tool (`preview`), its exact argument (`op`),
+ * and what each op does.
+ *
+ * `op`, NOT `previewOp` — AND THIS COMMENT IS WHERE THE BUG CAME FROM, so it is worth being exact
+ * about which of two different names belongs to which of two different hops:
+ *
+ *   1. THE TOOL ARGUMENT, which is the only thing an agent ever types, is `op`. `server.ts`
+ *      registers `inputSchema: { op: z.enum(["open","close","list"]) }` and `previewTool` validates
+ *      `previewArgs.parse({ op, path })`. An agent that sends `previewOp` gets MCP -32602 —
+ *      `previewOp` is not in the schema and `op` is required.
+ *   2. THE BRIDGE WIRE KEY, chosen inside `previewTool` and never seen by an agent, is `previewOp`
+ *      (`tools.ts`). It has to be renamed there because `BridgeClient.attempt` stamps the envelope
+ *      LAST, so an inner field spelled `op` is overwritten by the envelope's own op ("preview").
+ *
+ * This fragment used to carry hop 2's name and tell agents "The key is `previewOp`, not `op`",
+ * which broke the FIRST preview call every agent made. Read `controlListener.handlePreview` for hop
+ * 2, but never quote its key here.
  *
  * ══ EVERY AGENT KIND GETS IT NOW, AND THAT IS THE SAME RULE ═════════════════════════════════════
  * This block used to read "ORCHESTRATORS ONLY", and the reason was the tier gate rather than taste:
@@ -184,19 +198,20 @@ export function previewProtocol(opts: { eagerness: PreviewEagerness }): string {
           "  component, a layout, styling, on-screen copy, a chart. Work with nothing to see (a pure",
           "  refactor, a config edit, a docs change, backend-only plumbing) does not need one.",
         ]),
-    "- HOW: call the `preview` tool on the `sparkle-control` MCP server with `{ previewOp: \"open\" }`.",
+    "- HOW: call the `preview` tool on the `sparkle-control` MCP server with `{ op: \"open\" }`.",
     "  It detects the project's dev server, starts it against YOUR OWN worktree on a loopback port,",
-    "  and shows the live site in a pane. The key is `previewOp`, not `op`.",
-    "    • `{ previewOp: \"open\" }` — start (or return) your preview.",
-    "    • `{ previewOp: \"open\", path: \"/settings\" }` — same, landing on a particular route.",
-    "    • `{ previewOp: \"list\" }` — what is already running. Opening twice is safe; it returns the",
+    "  and surfaces it as a CARD in the concierge column that opens the url in a real browser.",
+    "  The argument is `op` — NOT `previewOp`, which is an internal wire key and is rejected.",
+    "    • `{ op: \"open\" }` — start (or return) your preview.",
+    "    • `{ op: \"open\", path: \"/settings\" }` — same, landing on a particular route.",
+    "    • `{ op: \"list\" }` — what is already running. Opening twice is safe; it returns the",
     "      preview you already have rather than starting a second server.",
-    "    • `{ previewOp: \"close\" }` — stop it when the work it showed is done.",
+    "    • `{ op: \"close\" }` — stop it when the work it showed is done.",
     "- It always targets YOUR OWN worktree. There is no agentId parameter, by design: you cannot open",
     "  or close another agent's preview, and you do not need to name yourself.",
     "- OPEN IT EARLY, as soon as there is something renderable — not as a flourish at the end. The",
     "  whole value is that the person watching can redirect you while it is still cheap.",
-    "- SAY THE URL in your report as well, so it survives outside the pane.",
+    "- SAY THE URL in your report as well, so it survives outside the card.",
     "- If the project has no detectable dev server the call DECLINES and says why. Report that; do",
     "  not hand-roll a server to work around it.",
     "- A preview is not a substitute for the project's tests. Run those too.",

@@ -1,4 +1,6 @@
 import { describe, it, expect } from "vitest";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import {
   parseWorkerResult,
   workerPersona,
@@ -390,15 +392,47 @@ describe("the preview protocol — an agent that is never TOLD about previews ne
     expect(brief).toMatch(/OPEN A LIVE PREVIEW/);
   });
 
-  it("tells the agent HOW, by tool name and exact payload key", () => {
-    // An instruction an agent cannot act on is worse than none. `previewOp`, NOT `op`: the wire
-    // envelope's own reserved `op` is written after the spread and stripped by the Rust bridge, so
-    // an inner field named `op` never arrives (controlListener.handlePreview).
+  it("tells the agent HOW, by tool name and the argument the MCP schema actually takes", () => {
+    // An instruction an agent cannot act on is worse than none — and for a year this test asserted
+    // the WRONG name, so it passed while every agent's FIRST preview call failed MCP -32602.
+    //
+    // `op`, NOT `previewOp`. Two different hops, two different names, and the brief only ever
+    // describes the first: the TOOL ARGUMENT is `op` (mcp-control's `inputSchema`, validated by
+    // `previewArgs.parse`), while `previewOp` is the BRIDGE WIRE key chosen inside `previewTool`
+    // one hop later, because the envelope's own reserved `op` is stamped after the spread and an
+    // inner `op` never arrives (controlListener.handlePreview). An agent never types the second.
     const brief = orchestrationPersona(base);
     expect(brief).toContain("`preview` tool");
-    expect(brief).toContain('{ previewOp: "open" }');
-    expect(brief).toContain('{ previewOp: "close" }');
-    expect(brief).toContain('{ previewOp: "list" }');
+    expect(brief).toContain('{ op: "open" }');
+    expect(brief).toContain('{ op: "close" }');
+    expect(brief).toContain('{ op: "list" }');
+
+    // The REGRESSION half, and the one with teeth: no example may tell an agent to send
+    // `previewOp`. Naming it to warn it is rejected is fine; instructing it is not.
+    expect(brief).not.toMatch(/\{\s*previewOp:/);
+  });
+
+  it("the argument it names is the one mcp-control REGISTERS — checked across the boundary", () => {
+    // WHY READ THE OTHER PACKAGE'S SOURCE instead of asserting a string. This bug was a DRIFT
+    // between two files that no suite spanned: mcp-control declared `op`, the brief said
+    // `previewOp`, both packages were green, and nothing failed until an agent made a real call.
+    // A test that only pins the brief's own text cannot see that class of bug again — it would
+    // stay green if the tool's schema were renamed tomorrow. So this test derives the expected
+    // name from the schema itself.
+    const serverSrc = readFileSync(
+      fileURLToPath(new URL("../../../mcp-control/src/server.ts", import.meta.url)),
+      "utf8",
+    );
+    // Fail CLOSED: an unreadable/moved registration must break this test, never silently pass it.
+    const reg = serverSrc.indexOf('registerTool(\n    "preview"');
+    expect(reg, "could not find the preview tool registration in mcp-control/src/server.ts").toBeGreaterThan(-1);
+    const key = /inputSchema:\s*\{\s*(\w+):/.exec(serverSrc.slice(reg, reg + 4000))?.[1];
+    expect(key, "could not read the preview tool's first inputSchema key").toBeTruthy();
+
+    // The contract: whatever mcp-control registers is what the brief must tell agents to send.
+    expect(key).toBe("op");
+    const brief = orchestrationPersona(base);
+    expect(brief).toContain(`{ ${key}: "open" }`);
   });
 
   it("CHANGES the composed brief with the config knob — all three modes differ", () => {
@@ -409,7 +443,7 @@ describe("the preview protocol — an agent that is never TOLD about previews ne
     // "never" removes the section outright — the manual affordances are untouched, but the brief
     // stops asking.
     expect(never).not.toMatch(/OPEN A LIVE PREVIEW/);
-    expect(never).not.toContain('{ previewOp: "open" }');
+    expect(never).not.toContain('{ op: "open" }');
 
     // The other two both carry it, and they do not say the same thing: "visual" scopes the ask to
     // work with something to look at, "always" drops that qualifier.
@@ -458,10 +492,10 @@ describe("the preview protocol — an agent that is never TOLD about previews ne
     const orchestrator = orchestrationPersona(base);
     expect(orchestrator).toMatch(/OPEN A LIVE PREVIEW/);
     expect(worker).toMatch(/OPEN A LIVE PREVIEW/);
-    // The whole fragment, not just its banner — a worker that gets the headline without the payload
-    // key would try `{ op: "open" }`, which the bridge strips before the handler ever sees it.
+    // The whole fragment, not just its banner — a worker that gets the headline without the
+    // argument would have to guess the tool's shape, which is how the -32602 above happened.
     expect(worker).toContain(previewProtocol({ eagerness: DEFAULT_PREVIEW_EAGERNESS }));
-    expect(worker).toContain('{ previewOp: "open" }');
+    expect(worker).toContain('{ op: "open" }');
   });
 
   it("a worker's preview section obeys the SAME knob as everyone else's", () => {
