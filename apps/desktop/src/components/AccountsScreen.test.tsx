@@ -1810,6 +1810,110 @@ describe("rotation-readiness banner", () => {
     expect(banner.textContent).toContain("share one quota");
   });
 
+  it("collapses two same-placeholder excluded accounts into ONE counted bullet", async () => {
+    // "Signing in…" / "Login expired — reconnect" are GENERIC placeholder nicknames shared by every
+    // not-signed-in account, so two of them used to render the SAME sentence twice — a visible bug,
+    // and a React key collision. One real login keeps the banner in the "only 1 signed in" state where
+    // the excluded bullets show.
+    const deps = makeDeps(
+      [
+        acct("real", { nickname: "Real", isDefault: true }),
+        acct("p1", { nickname: PENDING_NICKNAME }),
+        acct("p2", { nickname: PENDING_NICKNAME }),
+      ],
+      [],
+      [signedInAs("real", "real@example.com", "u1"), neverLoggedIn("p1"), neverLoggedIn("p2")],
+    );
+    render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
+    const banner = await screen.findByTestId("rotation-banner");
+    const placeholderBullets = within(banner)
+      .getAllByRole("listitem")
+      .filter((li) => /never signed in|never been signed in/i.test(li.textContent ?? ""));
+    // ONE bullet for the two shared-placeholder accounts, not two byte-identical ones.
+    expect(placeholderBullets).toHaveLength(1);
+    expect(placeholderBullets[0]!.textContent).toContain("2 accounts are still");
+    expect(placeholderBullets[0]!.textContent).toContain(PENDING_NICKNAME);
+  });
+
+  it("keeps distinctly-named excluded accounts on their OWN bullets (no over-collapse)", async () => {
+    // The collapse keys on the shared nickname: a user who renamed a not-signed-in account must still
+    // see it called out separately, not folded into a count with an unrelated one.
+    const deps = makeDeps(
+      [
+        acct("real", { nickname: "Real", isDefault: true }),
+        acct("p1", { nickname: "Renamed A" }),
+        acct("p2", { nickname: "Renamed B" }),
+      ],
+      [],
+      [signedInAs("real", "real@example.com", "u1"), neverLoggedIn("p1"), neverLoggedIn("p2")],
+    );
+    render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
+    const banner = await screen.findByTestId("rotation-banner");
+    expect(banner.textContent).toContain("Renamed A");
+    expect(banner.textContent).toContain("Renamed B");
+    expect(banner.textContent).not.toContain("2 accounts are still");
+  });
+
+  it("collapses two same-placeholder NO-EMAIL accounts into ONE counted bullet, worded correctly", async () => {
+    // "Login expired — reconnect" is a shared placeholder in the noEmail bucket (the expired login
+    // retains its accountUuid, so rotationReadiness routes it here, not to notSignedIn). Two of them
+    // must collapse to one bullet — and the plural must AGREE IN NUMBER (not "a Claude login … them").
+    const deps = makeDeps(
+      [
+        acct("real", { nickname: "Real", isDefault: true }),
+        acct("x1", { nickname: "Login expired — reconnect" }),
+        acct("x2", { nickname: "Login expired — reconnect" }),
+      ],
+      [],
+      [
+        signedInAs("real", "real@example.com", "u1"),
+        { id: "x1", email: null, organization: null, accountUuid: "ux1" },
+        { id: "x2", email: null, organization: null, accountUuid: "ux2" },
+      ],
+    );
+    render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
+    const banner = await screen.findByTestId("rotation-banner");
+    const noEmailBullets = within(banner)
+      .getAllByRole("listitem")
+      .filter((li) => /no readable email/i.test(li.textContent ?? ""));
+    expect(noEmailBullets).toHaveLength(1);
+    expect(noEmailBullets[0]!.textContent).toContain("2 accounts are");
+    expect(noEmailBullets[0]!.textContent).toContain("each a Claude login with no readable email");
+    // The number-agreement bug the collapse would otherwise ship: a singular "— a Claude login" next
+    // to a plural "them". The fixed wording puts "each" between the dash and "a Claude login".
+    expect(noEmailBullets[0]!.textContent).not.toContain("— a Claude login");
+  });
+
+  it("does NOT collapse REDUNDANT accounts — two same-nickname rows can be DIFFERENT logins", async () => {
+    // roborev 67907: `redundant` rows are signed in with real emails and can duplicate two DIFFERENT
+    // usable logins, so a plural "…they share one quota and count as one" would assert a relationship
+    // that need not hold. Here `dupA` duplicates login X and `dupB` duplicates login Y — both nicknamed
+    // "Extra" — so they must render as TWO separate per-account bullets, never one collapsed count.
+    const deps = makeDeps(
+      [
+        acct("a", { nickname: "Work A", isDefault: true }),
+        acct("dupA", { nickname: "Extra" }),
+        acct("c", { nickname: "Work C" }),
+        acct("dupB", { nickname: "Extra" }),
+      ],
+      [],
+      [
+        signedInAs("a", "a@example.com", "uX"),
+        signedInAs("dupA", "a@example.com", "uX"), // same login as a → redundant
+        signedInAs("c", "c@example.com", "uY"),
+        signedInAs("dupB", "c@example.com", "uY"), // same login as c → redundant, DIFFERENT login from dupA
+      ],
+    );
+    render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
+    const banner = await screen.findByTestId("rotation-banner");
+    const redundantBullets = within(banner)
+      .getAllByRole("listitem")
+      .filter((li) => /the same Claude login as another account/i.test(li.textContent ?? ""));
+    expect(redundantBullets).toHaveLength(2); // per-account, never collapsed
+    // And never the false group-level claim about the two grouped rows.
+    expect(banner.textContent).not.toContain("2 accounts are “Extra”");
+  });
+
   it("offers the fix inline: the banner's own add button opens the add form", async () => {
     const deps = makeDeps([acct("a")], [], [signedInAs("a", "one@example.com")]);
     render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);

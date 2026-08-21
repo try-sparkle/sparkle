@@ -589,6 +589,32 @@ function noticeCard(ink: string): CSSProperties {
  *
  *  Counting is delegated to {@link rotationReadiness}, which derives signed-in-ness from the same
  *  predicate selection uses and sameness from the canonical grouping. This component only renders. */
+
+/** Build the "counted out" bullets for ONE reason bucket, collapsing accounts that share a nickname.
+ *
+ *  A single account keeps the `singular` sentence naming it. Two-or-more accounts with the SAME
+ *  nickname — the generic placeholders "Signing in…" / "Login expired — reconnect" are shared by
+ *  every not-signed-in / expired account — collapse to ONE `plural` sentence with a count, instead of
+ *  repeating a byte-identical line per account (which also collided on the React `key`). Distinct
+ *  nicknames within the bucket stay separate: they are already tellable apart. Each returned `key` is
+ *  the group's account ids joined, so it is stable and unique even when two buckets share a nickname. */
+function groupExcluded(
+  accounts: Account[],
+  singular: (nickname: string) => string,
+  plural: (count: number, nickname: string) => string,
+): { key: string; text: string }[] {
+  const byNickname = new Map<string, Account[]>();
+  for (const a of accounts) {
+    const group = byNickname.get(a.nickname);
+    if (group) group.push(a);
+    else byNickname.set(a.nickname, [a]);
+  }
+  return [...byNickname.values()].map((group) => ({
+    key: group.map((a) => a.id).join(","),
+    text: group.length === 1 ? singular(group[0]!.nickname) : plural(group.length, group[0]!.nickname),
+  }));
+}
+
 function RotationBanner({
   readiness,
   nameOf,
@@ -622,18 +648,36 @@ function RotationBanner({
   // Registrations that are counted OUT, named one by one. This is the state that is invisible today:
   // a config dir that was created but never signed into renders as an ordinary row, so two rows read
   // as two accounts. Each sentence says which registration and WHY it doesn't count.
+  //
+  // COLLAPSE IDENTICAL PLACEHOLDERS. "Signing in…" (`notSignedIn`) and "Login expired — reconnect"
+  // (`noEmail`, which retains the accountUuid) are GENERIC placeholder nicknames shared by every
+  // not-signed-in / expired account, so two such accounts used to render byte-identical bullets — the
+  // same sentence twice, which reads as a bug and also collided on the React `key`. Group those two
+  // categories by nickname and say a shared placeholder ONCE with a count, mirroring the duplicate-login
+  // group further below. Distinct nicknames (a user renamed one) stay on their own line.
+  //
+  // `redundant` is DELIBERATELY NOT collapsed (roborev 67907). Its accounts are signed in with real
+  // emails, so they carry no shared placeholder — and two same-nickname `redundant` rows can duplicate
+  // two DIFFERENT logins (`rotationReadiness` puts a row here when it duplicates *some earlier* usable
+  // account), so a plural "they share one quota and count as one" would assert a relationship between
+  // the grouped rows that need not hold. Per-account bullets are accurate; `key` on the id avoids any
+  // React collision the collapse was covering for.
   const excluded = [
-    ...readiness.notSignedIn.map(
-      (a) =>
-        `“${a.nickname}” is registered but has never been signed in, so it cannot receive agents.`,
+    ...groupExcluded(
+      readiness.notSignedIn,
+      (nick) => `“${nick}” is registered but has never been signed in, so it cannot receive agents.`,
+      (count, nick) =>
+        `${count} accounts are still “${nick}” — registered but never signed in, so they cannot receive agents.`,
     ),
-    ...readiness.redundant.map(
-      (a) =>
-        `“${a.nickname}” is the same Claude login as another account, so they share one quota and count as one.`,
-    ),
-    ...readiness.noEmail.map(
-      (a) =>
-        `“${a.nickname}” has a Claude login with no readable email, so Sparkle cannot route agents to it.`,
+    ...readiness.redundant.map((a) => ({
+      key: a.id,
+      text: `“${a.nickname}” is the same Claude login as another account, so they share one quota and count as one.`,
+    })),
+    ...groupExcluded(
+      readiness.noEmail,
+      (nick) => `“${nick}” has a Claude login with no readable email, so Sparkle cannot route agents to it.`,
+      (count, nick) =>
+        `${count} accounts are “${nick}” — each a Claude login with no readable email, so Sparkle cannot route agents to them.`,
     ),
   ];
 
@@ -647,7 +691,7 @@ function RotationBanner({
       {excluded.length > 0 && (
         <ul style={{ margin: "6px 0 0", paddingLeft: 18 }}>
           {excluded.map((line) => (
-            <li key={line}>{line}</li>
+            <li key={line.key}>{line.text}</li>
           ))}
         </ul>
       )}
