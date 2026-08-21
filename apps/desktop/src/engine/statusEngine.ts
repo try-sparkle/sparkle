@@ -270,9 +270,25 @@ export function isSpinnerFrame(frame: string): boolean {
   return SPINNER_GLYPH.test(frame) && WORKING_PATTERNS.some((re) => re.test(frame));
 }
 
-/** How many trailing viewport rows count as the LIVE status region. Claude Code paints its spinner
- *  immediately above the input box, so the live frame is always within a few rows of the bottom. */
-const LIVE_TAIL_ROWS = 6;
+/** How many trailing viewport rows count as the LIVE status region.
+ *
+ *  ── WHY 12 AND NOT 6 ────────────────────────────────────────────────────────────────────────────
+ *  Claude Code paints its spinner immediately above the input box, and the stack BELOW the spinner
+ *  is what this has to clear. Measured on a real turn-in-flight viewport that is already 5 rows
+ *  (spinner, three-row box, footer) — so 6 sat ONE ROW from the cliff, and the failure past it is
+ *  silent and total: the spinner falls outside the tail, `screenShowsLiveSpinner` returns false, and
+ *  a live agent settles straight to gray with no hold at all. That is the founder's original bug,
+ *  returning with every test still green (roborev 67258).
+ *
+ *  Things that add a row are ordinary, not exotic: a wrapped footer on a narrow pane, a `? for
+ *  shortcuts` hint, a queued-message indicator, a two-line composer. So this is sized for headroom
+ *  rather than for the measurement, and the boundary is pinned in both directions by
+ *  `statusEngine.liveSpinner.test.ts` so a future widening fails a test instead of going inert.
+ *
+ *  Widening costs little here because PRESENCE ALONE NO LONGER HOLDS ANYTHING — the hold also
+ *  requires the tail to have CHANGED between settles, so a stale spinner-shaped row further up the
+ *  transcript cannot latch the row green; it can at most delay one settle by `SPINNER_GRACE_MS`. */
+const LIVE_TAIL_ROWS = 12;
 
 /**
  * Is Claude's live status line STILL PAINTED on this viewport snapshot?
@@ -377,9 +393,10 @@ const SCREEN_RECHECK_MS = 25000;
 // Spinner ticks ~1/s; if we don't see it for this long the turn has ended.
 const SPINNER_GRACE_MS = 2000;
 /** Backstop on consecutive spinner holds, in case a grid somehow changes on every read without the
- *  turn making progress. 150 holds is ~5 minutes at `SPINNER_GRACE_MS`, far longer than any real
- *  gap between redraws and far shorter than "forever". The progress check above is the real guard;
- *  this is what keeps a bug in it bounded. */
+ *  turn making progress. 150 holds is ~5 minutes at `SPINNER_GRACE_MS` of UNINTERRUPTED holding —
+ *  the counter is reset by any ingested spinner frame, so this bounds one pathological run rather
+ *  than accumulating across a turn's stalls. The progress check is the real guard; this keeps a bug
+ *  in it bounded. */
 const MAX_SPINNER_HOLDS = 150;
 // How many ingested lines the "the user just submitted a message" echo-suppression window lasts
 // (Fix 2). Bounded so it can't permanently mask a LATER genuine wedge: after this many lines with
@@ -1414,6 +1431,19 @@ export class StatusEngine {
     // cleaned chunk rather than only completed lines — but FRAME BY FRAME, so the persistent footer
     // bar can't be mistaken for a running turn. See the WORKING_PATTERNS header.
     const hasSpinner = hasSpinnerFrame(clean);
+    if (hasSpinner) {
+      // FORWARD PROGRESS RESETS THE HOLD BUDGET. `MAX_SPINNER_HOLDS` is meant to bound ONE
+      // pathological run, but nothing on this path cleared it — so the budget accrued across every
+      // stall in a turn, and a long turn with repeated ≥2s ingest gaps would exhaust it while the
+      // spinner was still ticking. The expiry then writes ONE `idle` on a live agent, and `set()`'s
+      // dedup pins it for the rest of the turn — the exact defect the hold exists to prevent, and
+      // the Improve Sparkle row has no router to outrank it (roborev 67258).
+      //
+      // An ingested spinner frame is the strongest evidence of progress this engine has, which is
+      // why the reset belongs here rather than only on the gray fall-through.
+      this.spinnerHolds = 0;
+      this.heldSpinnerTail = null;
+    }
     if (hasSpinner && !this.sawSpinner) {
       this.sawSpinner = true;
       // The spinner is now a witness to turn END (its disappearance), so this agent's settled

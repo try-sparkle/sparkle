@@ -560,6 +560,42 @@ mod tests {
         assert_eq!(changed.at_ms, 3_000);
     }
 
+    /// THE ONSET CONTRACT, ASSERTED IN THE MODULE THAT OWNS IT.
+    ///
+    /// `only_a_changed_verdict_is_emitted` cannot cover this: it asserts `.is_none()`, which stays
+    /// true whether or not the unchanged branch refreshes the stored stamp. So re-adding an
+    /// `at_ms` refresh on that path — the exact regression roborev 67212 caught, where `list()`
+    /// carries as-of while the event stream carries onset — used to leave this whole suite green,
+    /// with the only guard living across the seam in `nudger.rs`. That is the filtered-run trap
+    /// this branch already paid for once, mirrored to the other side (roborev 67283).
+    ///
+    /// Both directions are pinned, because "the stamp did not move" alone would also pass for a
+    /// `record` that had stopped storing anything at all.
+    #[test]
+    fn an_unchanged_reading_keeps_the_onset_stamp_and_a_changed_one_moves_it() {
+        let state = ObservedAttentionState::default();
+        state.record(reading("a1", Verdict::Calm, false, 1_000));
+        assert_eq!(state.list()[0].at_ms, 1_000);
+
+        assert!(state
+            .record(reading("a1", Verdict::Calm, false, 2_000))
+            .is_none());
+        assert_eq!(
+            state.list()[0].at_ms,
+            1_000,
+            "an unchanged reading must not refresh onset — the seed and the event stream must agree"
+        );
+
+        assert!(state
+            .record(reading("a1", Verdict::Awaiting, false, 3_000))
+            .is_some());
+        assert_eq!(
+            state.list()[0].at_ms,
+            3_000,
+            "a CHANGED verdict must restamp, or 'how long has it been awaiting' is unanswerable"
+        );
+    }
+
     /// `alternate` is part of the reading, so flipping it alone is a change the consumer must see.
     #[test]
     fn a_flip_of_alternate_alone_is_a_change() {

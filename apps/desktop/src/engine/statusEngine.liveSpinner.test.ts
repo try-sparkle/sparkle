@@ -22,7 +22,7 @@
 // `set()` dedups on its own field, so a steadily-working pane emits nothing further and never
 // re-asserts `working`.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { StatusEngine, screenShowsLiveSpinner } from "./statusEngine";
+import { StatusEngine, isSpinnerFrame, screenShowsLiveSpinner } from "./statusEngine";
 import { AGENT_STATUS } from "@sparkle/ui/tokens";
 import { log } from "../logger";
 import type { AgentTabStatus } from "../types";
@@ -83,6 +83,12 @@ const STALE_SPINNER_IN_SCROLLBACK = [
   "",
   "  Ran 1 shell command",
   "",
+  "● All gates clean; the branch is pushed and the review is drained.",
+  "",
+  "  Ran 2 shell commands",
+  "",
+  "● Nothing further — let me know if you want anything else.",
+  "",
   "╭──────────────────────────────────────────╮",
   "│ >                                        │",
   "╰──────────────────────────────────────────╯",
@@ -114,14 +120,45 @@ describe("screenShowsLiveSpinner — bottom-anchored, because scrollback has no 
     expect(screenShowsLiveSpinner(KNEADING_SCREEN)).toBe(true);
   });
 
-  it("REJECTS a spinner left in the scrollback above a settled prompt", () => {
-    // The paired case, and the one that makes the rule safe. A whole-viewport scan would report
-    // `true` here and latch every finished agent green.
+  it("REJECTS a spinner far enough up the scrollback", () => {
+    // Distance is the FIRST line of defence, not the only one — see the settle test below for the
+    // one that matters once the window is wide enough to admit some transcript.
     expect(screenShowsLiveSpinner(STALE_SPINNER_IN_SCROLLBACK)).toBe(false);
   });
 
   it("sees it through the trailing blank rows a fixed-height grid pads with", () => {
     expect(screenShowsLiveSpinner(`${KNEADING_SCREEN}\n\n\n\n`)).toBe(true);
+  });
+
+  it("sees a spinner sitting exactly at the tail boundary", () => {
+    // The boundary, pinned in both directions, because the failure past it is SILENT and total: the
+    // spinner falls out of the tail, no hold happens, and a live agent goes straight to gray with
+    // every test still green. That is the founder's original bug returning.
+    const atEdge = ["✻ Kneading… (1s · ↓ 1k tokens)", ...Array(11).fill("filler")].join("\n");
+    expect(screenShowsLiveSpinner(atEdge)).toBe(true);
+  });
+
+  it("does NOT see one sitting one row beyond it", () => {
+    const pastEdge = ["✻ Kneading… (1s · ↓ 1k tokens)", ...Array(12).fill("filler")].join("\n");
+    expect(screenShowsLiveSpinner(pastEdge)).toBe(false);
+  });
+
+  it("clears the real turn-in-flight stack with headroom to spare", () => {
+    // spinner → three-row input box → footer is already 5 rows, and a wrapped footer, a
+    // `? for shortcuts` hint or a two-line composer each add one. This asserts the margin exists
+    // rather than trusting the constant.
+    const crowded = [
+      "✻ Kneading… (13m 56s · ↓ 42.7k tokens)",
+      "╭──────────────────────────────────────────╮",
+      "│ >                                        │",
+      "│                                          │",
+      "╰──────────────────────────────────────────╯",
+      "  ▶▶ bypass permissions on (shift+tab to cycle) ·",
+      "     esc to interrupt",
+      "  ? for shortcuts",
+      "  1 message queued",
+    ].join("\n");
+    expect(screenShowsLiveSpinner(crowded)).toBe(true);
   });
 
   it.each([["a settled screen", SETTLED_SCREEN], ["nothing", ""], ["blank rows", "\n\n\n"]])(
@@ -167,6 +204,19 @@ describe("a visibly-working agent never settles to GRAY", () => {
     expect(isGray(last()!)).toBe(true);
   });
 
+  it("a LONG turn with many stalls never exhausts the hold budget", () => {
+    // `MAX_SPINNER_HOLDS` bounds ONE pathological run. Without a reset on the ingest path the budget
+    // accrued across every stall in a turn, so a long turn would exhaust it while the spinner was
+    // still ticking — and the single `idle` that follows is pinned by `set()`'s dedup for the rest
+    // of the turn. 400 stalls is well past the 150 cap.
+    const { engine, statuses } = engineOn(advancing());
+    for (let i = 0; i < 400; i++) {
+      engine.ingest(SPINNER_CHUNK); // a real frame arrives — forward progress
+      vi.advanceTimersByTime(2000); // …then ingest stalls long enough to settle
+    }
+    expect(statuses.some(isGray)).toBe(false);
+  });
+
   it("THE PAIRED CASE — it DOES settle to gray once the spinner is really gone", () => {
     // Without this, "never gray" would also pass for an engine that had stopped settling at all,
     // which is the opposite bug: a permanently green fleet.
@@ -202,6 +252,32 @@ describe("a visibly-working agent never settles to GRAY", () => {
   });
 });
 
+describe("a stale spinner INSIDE the tail still cannot latch a row green", () => {
+  // THE PROPERTY THAT CARRIES THE WEIGHT once `LIVE_TAIL_ROWS` is wide enough to admit some
+  // transcript. Distance alone was the whole guarantee when the window was 6 rows, and that made
+  // the window a tightrope: too narrow and a live spinner falls outside it (silent, total, the
+  // founder's original bug); too wide and scrollback matches. Requiring the tail to have CHANGED
+  // removes the trade — a spinner that is present but not redrawing cannot hold anything, wherever
+  // it sits — so the window can be sized for headroom instead.
+  it("settles to gray even with a finished turn's spinner still visible in the tail", () => {
+    const withStaleSpinner = [
+      "✻ Kneading… (13m 56s · ↓ 42.7k tokens)",
+      "● Done. Opened PR #2355.",
+      "╭────────────────╮",
+      "│ >              │",
+      "╰────────────────╯",
+    ].join("\n");
+    // Non-vacuity: the matcher really does see it, so this pins the progress rule rather than
+    // distance quietly doing the work.
+    expect(screenShowsLiveSpinner(withStaleSpinner)).toBe(true);
+
+    const { engine, last } = engineOn(() => withStaleSpinner);
+    engine.ingest(SPINNER_CHUNK);
+    vi.advanceTimersByTime(60_000);
+    expect(last()).toBe("idle");
+  });
+});
+
 describe("the matcher's known false positives cannot latch a row green", () => {
   // `isSpinnerFrame` was tuned for redraw FRAMES and is applied here to rendered transcript rows,
   // where `SPINNER_GLYPH` admits `*`/`+`/`·` and the tails include `esc to interrupt` and a bare
@@ -211,9 +287,17 @@ describe("the matcher's known false positives cannot latch a row green", () => {
 
   it.each([
     ["a wrapped persistent footer stranded in the tail", "· bypass permissions on · esc to interrupt"],
-    ["a markdown bullet that looks like a frame", "* rerun the suite for 30s"],
+    ["a markdown bullet quoting a token count", "* Rerun the suite (30s · 1.2k tokens)"],
     ["a bare token counter in prose", "· wrote 1.2k tokens to the log"],
   ])("settles to gray anyway: %s", (_label, tail) => {
+    // ⚠️ NON-VACUITY FIRST. Each row must actually MATCH the spinner matcher, or the assertion
+    // below passes because nothing ever fired — which is what happened to an earlier version of
+    // this table: `* rerun the suite for 30s` does not match (`SPINNER_BARE_FRAME` needs the tail
+    // to follow the word immediately, and lower-case fails its `[A-Z]`), so that case proved
+    // nothing at all (roborev 67258).
+    expect(isSpinnerFrame(tail), `row does not match the matcher, so this case is vacuous: ${tail}`)
+      .toBe(true);
+
     const { engine, last } = engineOn(() => settledWith(tail));
     engine.ingest(SPINNER_CHUNK);
     vi.advanceTimersByTime(60_000);
@@ -223,8 +307,14 @@ describe("the matcher's known false positives cannot latch a row green", () => {
 
 describe("teardown", () => {
   it("stops writing status once disposed mid-hold", () => {
-    // The hold RE-ARMS ITSELF, so an orphaned chain would keep calling `onStatus` on a torn-down
-    // engine indefinitely. Asserts the SIDE EFFECT — no further writes — not that a flag was set.
+    // WHAT THIS DOES AND DOES NOT COVER, stated because an earlier comment here claimed more.
+    //
+    // It pins a REAL property — a disposed engine writes no further status while a hold is in
+    // flight — and that property is delivered by `dispose()` cancelling the pending timer, not by
+    // `settle`'s `disposed` guard. Mutating that guard leaves this test green, because `dispose()`
+    // already stopped the timer from firing (roborev 67258). The guard remains as defence in depth
+    // for a future path that could re-enter `settle` after teardown; it is deliberately NOT claimed
+    // as covered here. Asserts the SIDE EFFECT — no further writes — not that a flag was set.
     const { engine, statuses } = engineOn(advancing());
     engine.ingest(SPINNER_CHUNK);
     vi.advanceTimersByTime(4000);
