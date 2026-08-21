@@ -16110,6 +16110,12 @@ detached
             workflow_state_shared(&root_str, branch, "", "main", false, &tip, None, &none);
         assert_eq!(before.ahead_of_base, 0, "the agent's own branch authored nothing");
         assert!(before.in_origin_main, "and its tip is trivially an ancestor of origin/main");
+        // ⚠️ AND `landed_on_origin` IS **FALSE** HERE, WHICH IS NOT A CONTRADICTION. `in_origin_main`
+        // is a direct ancestor test; `landed_on_origin` reports WHICH ARM of `branch_landed_scope`
+        // proved the landing, and its ancestor arm asks LOCAL first — so a tip reachable from both
+        // refs answers `Local`. The two fields answer different questions and a test that assumed
+        // otherwise (this one, at first) reds on the semantics rather than on the fold.
+        assert!(!before.landed_on_origin, "the local ancestor arm answers first, so scope is Local");
 
         // ── Cut a worktree INSIDE the agent's tree, on a named branch, and commit there. ──
         // Directory name carries a space too, matching `.claude/worktrees/<name>` in the wild.
@@ -16142,6 +16148,14 @@ detached
         // though the branch the row tracks IS an ancestor of origin/main.
         assert!(!after.in_origin_main, "the subtree has not landed");
         assert!(!after.landed, "and merging it in would not be a no-op");
+        // ⚠️ THIS LINE DOES **NOT** PIN THE FOLD, and an earlier revision's comment claimed it did
+        // (roborev 66318). It passes with or without `landed_on_origin = a_landed_origin;`, because
+        // this agent's own tip is on local `main` and the ancestor arm asks LOCAL first — so the
+        // un-folded reading is already `Local` ⇒ false. Kept because it DOCUMENTS that semantics,
+        // which is genuinely easy to get wrong (the first draft of this test asserted the
+        // opposite). THE DISCRIMINATING PIN IS THE `landed locally only` BLOCK AT THE END OF THIS
+        // TEST — that is the one that reds when the fold is deleted.
+        assert!(!after.landed_on_origin, "and it is certainly not on ORIGIN main");
 
         // ── A nested checkout that carries NO WORK OF ITS OWN is not adopted. ──
         // A pool slot or a scratch checkout sitting exactly on the base would otherwise drag the
@@ -16159,6 +16173,19 @@ detached
              base must not pull the subtree's reading back to main's history",
         );
         assert!(!with_idle_state.in_origin_main, "and the unlanded branch still holds it back");
+        // NOTE: an `assert_eq!(with_idle_state.landed_on_origin, after.landed_on_origin)` stood here
+        // and was REMOVED rather than kept with a caveat (roborev 66318). It read as coverage of
+        // "Rule 1 protects the origin-scope signal too" and could not provide it: both sides are
+        // `false` under EVERY variant, including one where Rule 1's filter is deleted outright, so
+        // no mutation of the adoption code can make them disagree. The idle slot sits on `main`,
+        // which equals `origin/main` here, so it would scope `Local` and contribute the same
+        // `false` that `terminal-only-gray` has already forced.
+        //
+        // Making it discriminating needs a fixture where a work-free checkout COULD flip the
+        // accumulator — own branch abstaining under `no_own_work`, seeded true, with the only
+        // work-carrying nested branch on `origin/main`. That is worth building; it is not built
+        // here, and leaving a vacuous assertion in its place would be the exact defect this test
+        // was rewritten to remove.
 
         // ── THE FORK BUDGET, measured where the SHORT-CIRCUIT actually bites (roborev 65909) ────
         //
@@ -16224,6 +16251,70 @@ detached
              them adopted; the ceiling is {NESTED_FORK_CEILING}. If this is a deliberate increase, \
              move the ceiling and say why — do not delete the assertion.",
         );
+
+        // ── LANDED LOCALLY IS NOT LANDED ON ORIGIN — the case that gives the fold its teeth ─────
+        //
+        // ⚠️ RUNS LAST, AND MUST. It MOVES local `main`, while the fork-budget fixture above cuts
+        // `sparkle/zz-more-work` from `main` — so running this first would silently re-base that
+        // fixture and change the very count the budget asserts. `reset --hard` rather than
+        // `branch -f` because `main` is checked out in the root worktree, which refuses the latter.
+        //
+        // Everything above drives `landed` and `landed_on_origin` to the SAME value, so it cannot
+        // tell a folded origin-scope signal from one that merely copies `landed`. This pair can:
+        // merge the nested branch into LOCAL `main` without moving `refs/remotes/origin/main`, and
+        // the two must disagree — `landed` true (merging adds nothing) while `landed_on_origin`
+        // stays false, which is precisely `merged_local` rather than `merged`.
+        //
+        // A fresh agent is used rather than the fixture above, because the branches already cut
+        // there hold the accumulators at false and would mask the distinction entirely.
+        {
+            let l = create_worktree_at(&root_str, "p", "s3", "main", &app_data).unwrap();
+            let l_wt = PathBuf::from(&l.path);
+            let l_branch = "sparkle/agent-s3";
+            let l_tip = rev_parse_tip(&root_str, l_branch);
+            std::fs::create_dir_all(l_wt.join(".claude").join("worktrees")).unwrap();
+            let nd = l_wt.join(".claude").join("worktrees").join("local only");
+            let nd_str = nd.to_string_lossy().to_string();
+            git(&l.path, &["worktree", "add", "-b", "sparkle/local-only", &nd_str, "main"]).unwrap();
+            std::fs::write(nd.join("lo.txt"), "lo").unwrap();
+            git(&nd_str, &["add", "-A"]).unwrap();
+            git(&nd_str, &["commit", "-m", "landed locally only"]).unwrap();
+            // Fast-forward LOCAL main onto it; origin/main deliberately stays where it was.
+            let base_main = rev_parse_tip(&root_str, "main");
+            git(&root_str, &["reset", "--hard", "sparkle/local-only"]).unwrap();
+
+            let ad = nested_branch_checkouts(&records(), &l_wt, l_branch);
+            assert_eq!(ad.len(), 1, "the local-only checkout is adopted: {ad:?}");
+            let st =
+                workflow_state_shared(&root_str, l_branch, "", "main", false, &l_tip, None, &ad);
+            assert!(st.in_local_main, "PRECONDITION: the nested work IS on local main");
+            assert!(st.landed, "…so merging it into the local target adds nothing");
+            assert!(
+                !st.landed_on_origin,
+                "THE DISCRIMINATOR: origin/main does not carry it, so the row is merged_local — \
+                 NOT merged. A `landed_on_origin` that merely mirrored `landed` would pass every \
+                 other assertion in this test and fail here.",
+            );
+
+            // THE PAIRED POSITIVE, so a hardcoded `false` cannot satisfy the case above.
+            //
+            // Moving origin/main onto the SAME commit is not enough — the ancestor arm asks local
+            // first, so it would still answer `Local`. Origin scope requires the work to be on
+            // origin/main and NOT on local main, which is exactly the real shape it describes: the
+            // PR merged upstream and this clone has not pulled yet.
+            git(&root_str, &["update-ref", "refs/remotes/origin/main", "sparkle/local-only"])
+                .unwrap();
+            git(&root_str, &["reset", "--hard", &base_main]).unwrap();
+            let st2 =
+                workflow_state_shared(&root_str, l_branch, "", "main", false, &l_tip, None, &ad);
+            assert!(
+                st2.landed_on_origin,
+                "with the adopted work on origin/main and NOT on local main, the same fold must \
+                 report ORIGIN scope — this is the direction that makes the row `merged` rather \
+                 than `merged_local`",
+            );
+        }
+
 
         for d in [&root, &app_data] {
             let _ = std::fs::remove_dir_all(d);

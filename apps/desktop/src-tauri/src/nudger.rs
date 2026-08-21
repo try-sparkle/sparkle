@@ -3353,13 +3353,10 @@ mod tests {
     fn goal_state_vocabulary_matches_the_frontend() {
         let ts = std::fs::read_to_string("../src/engine/agentGoal.ts")
             .expect("engine/agentGoal.ts must be readable from the crate root");
-        let union = ts
+        let after_marker = ts
             .split_once("export type GoalState =")
             .expect("agentGoal.ts must declare GoalState")
-            .1
-            .split_once(';')
-            .expect("the GoalState union must be terminated by `;`")
-            .0;
+            .1;
         // ⚠️ STRIP COMMENTS BEFORE SPLITTING ON `|`, and this is load-bearing rather than tidy.
         // The union INTERLEAVES doc comments between its members:
         //
@@ -3377,8 +3374,8 @@ mod tests {
         // the exact class this pin exists for — a disagreement only observable after the merge —
         // and it surfaced by firing on itself the moment the two sides were put together.
         let uncommented = {
-            let mut out = String::with_capacity(union.len());
-            let mut rest = union;
+            let mut out = String::with_capacity(after_marker.len());
+            let mut rest = after_marker;
             while let Some((before, after)) = rest.split_once("/*") {
                 out.push_str(before);
                 out.push(' '); // never let a comment fuse its neighbours into one token
@@ -3400,6 +3397,24 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
+        // ⚠️ THE TERMINATOR IS FOUND **AFTER** STRIPPING, NOT BEFORE (roborev 66270, Medium).
+        //
+        // Truncating at the first `;` while comments are still present only covers HALF the
+        // interleaved-comment hazard the stripper above exists for. Today's doc comment happens to
+        // carry no semicolon, but prose here routinely does — `Not "blocked"; see …`, `@see a.ts;
+        // b.ts`, an HTML entity like `&nbsp;`. One of those between two members silently truncates
+        // the union and DROPS the final member, and the failure that follows is worse than a miss:
+        // TOTALITY passes vacuously, the bare-token guard passes, and NO PHANTOMS fires claiming
+        // `awaiting_close` "is not published" — which is false, and whose stated remedy would
+        // permanently blind the pin on the one token it most needs to watch. That is the very
+        // "names the wrong state" class this pin was repaired to remove, relocated upstream of the
+        // repair. Strip first, then terminate.
+        let uncommented = uncommented
+            .split_once(';')
+            .expect("the GoalState union must be terminated by `;`")
+            .0
+            .to_string();
+
         let from_ts: Vec<&str> = uncommented
             .split('|')
             .map(|s| s.trim().trim_matches('"'))
@@ -3410,15 +3425,22 @@ mod tests {
         // stripping above degrades the pin into comparing prose, and the TOTALITY direction would
         // report a mangled member instead of the missing one it exists to name.
         //
-        // A HYPHEN IS ALLOWED DELIBERATELY. It is a legitimate spelling for a union member, and
-        // rejecting it here would make this guard — which is about PARSER health — pre-empt the two
-        // directions that are about VOCABULARY agreement. A misspelling like `awaiting-close` must
-        // be caught by NO PHANTOMS, whose message names the token and says what is inert; catching
-        // it here instead reports "the union's punctuation outran the parser", which is true of
-        // nothing and sends the reader to fix the wrong thing.
+        // HYPHENS **AND** LETTERS OF EITHER CASE ARE ALLOWED DELIBERATELY. Both are legitimate
+        // spellings for a union member, and rejecting either here would make this guard — which is
+        // about PARSER health — pre-empt the two directions that are about VOCABULARY agreement. A
+        // misspelling must be caught by TOTALITY / NO PHANTOMS, whose messages name the token and
+        // say what is inert; catching it here instead reports "the union's punctuation outran the
+        // parser", which is true of nothing and sends the reader to fix a parser that works.
+        //
+        // ⚠️ THE UPPERCASE HALF WAS MISSING AND THAT WAS A REAL HOLE (roborev 66270, Medium). The
+        // class was lowercase-only while the paragraph above argued the general principle, so
+        // `awaitingClose` — named in `agentGoal.ts` as one of the two variant misspellings this pin
+        // exists to catch — tripped the parser guard instead of TOTALITY. The carve-out was
+        // half-implemented against its own stated rationale; alphanumeric closes it, and the guard
+        // still rejects what it is actually for: whitespace, quotes and prose punctuation.
         for t in &from_ts {
             assert!(
-                t.chars().all(|c| c.is_ascii_lowercase() || c == '_' || c == '-'),
+                t.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
                 "parsed {t:?} out of the GoalState union — not a bare token, so the union's \
                  punctuation or comment style has outrun this parser. Fix the stripping above \
                  rather than loosening this check; a pin that compares prose classifies nothing."
