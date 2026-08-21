@@ -813,6 +813,25 @@ export interface PickOptions {
    *  `leastBad` still returns it: a login prompt on the fragile default beats no account at all. Opt-in
    *  per caller — omit it and behaviour is unchanged, which is why only the concierge passes it today. */
   clobberedIds?: ReadonlySet<string>;
+  /** Ids of accounts whose identity WAS read and came back with no login at all (see
+   *  {@link notSignedInAccountIds}). This is a POSITIVE reading — "we opened this config dir and
+   *  there is no authenticated account in it" — and it is a different fact from "we have no reading
+   *  for this account", which is what an absent id means.
+   *
+   *  It exists because the signed-in filter degrades OPEN: when no listed account resolves as signed
+   *  in, {@link signedInFilterApplies} reports no usable signal and `eligible` becomes the FULL list
+   *  rather than blocking the spawn. That is the right call — better a login prompt than a dead
+   *  agent — but on its own it is worse than it needs to be, because auto-pick ranks on the LOCAL
+   *  token tally and a config dir that was never `claude login`ed has no transcripts. Its tally is
+   *  zero, which is the most headroom of all, so the never-logged-in dir does not merely survive the
+   *  degraded filter: it WINS, for every agent at once. That is sparkle-gms0's trap re-entering
+   *  through the degradation path.
+   *
+   *  Excluded from `candidates` exactly like an exhausted or clobbered account, and — for the same
+   *  reason — NEVER removed from `eligible`, so when every account reads unauthenticated `leastBad`
+   *  still returns one and no spawn is blocked. When the signed-in filter DOES apply this set has no
+   *  effect: those accounts are already absent from `eligible`. Absent the option nothing changes. */
+  unauthedIds?: ReadonlySet<string>;
   /** Current time (epoch ms), injectable for tests. Defaults to `Date.now()`. */
   now?: number;
 }
@@ -828,6 +847,19 @@ export interface PickOptions {
  *  to `organization`, which accounts.rs can leave None even for a completed login. */
 export function signedInAccountIds(identities: Identity[]): string[] {
   return identities.filter((i) => i.email != null).map((i) => i.id);
+}
+
+/** The ids of accounts whose identity was READ and carries no login — the exact complement of
+ *  {@link signedInAccountIds} over the identities we actually have. Feed this to
+ *  {@link PickOptions.unauthedIds}.
+ *
+ *  The distinction that makes this worth deriving separately: an account MISSING from `identities`
+ *  is unknown (never read, read failed, arrived after the snapshot), while an account PRESENT with
+ *  `email: null` has been read and positively has no `oauthAccount` to run as. Only the second is
+ *  evidence, and the degraded-filter path needs evidence — the whole reason it degrades open is that
+ *  it cannot tell those two apart from `signedInIds` alone. */
+export function notSignedInAccountIds(identities: Identity[]): string[] {
+  return identities.filter((i) => i.email == null).map((i) => i.id);
 }
 
 /** Does the signed-in reading carry a USABLE signal — i.e. does it name at least one account that
@@ -871,7 +903,15 @@ export function signedInFilterApplies(
  *  account dir that was created but never `claude login`ed has no transcripts, so its tally is
  *  zero — the most headroom of all — and it would win auto-pick for EVERY agent, spawning each one
  *  into a login prompt. It degrades safely: if no listed account is signed in (identities not
- *  loaded yet, or an IPC hiccup returning []), the filter is skipped rather than blocking spawns. */
+ *  loaded yet, or an IPC hiccup returning []), the filter is skipped rather than blocking spawns.
+ *
+ *  That degradation is deliberate and stays — better a login prompt than a dead agent — but skipping
+ *  the filter is not the same as forgetting what was read. `unauthedIds` carries the accounts whose
+ *  identity came back with NO login, and those are demoted out of `candidates` even while the filter
+ *  is skipped, so the trap above cannot re-enter through the degraded path: the never-logged-in dir
+ *  no longer wins on its zero tally just because the signal that would have excluded it was
+ *  unusable. It is a demotion, not a block — `eligible` still holds them, so an install where every
+ *  account reads unauthenticated still spawns. See {@link PickOptions.unauthedIds}. */
 export function pickAccount(
   accounts: Account[],
   usage: Usage[],
@@ -984,10 +1024,18 @@ function partitionAccounts(
   // `eligible`, so `leastBad` can still return it when it is the only account (a login prompt on the
   // fragile default beats a dead agent). Absent the option this set is empty and nothing changes.
   const isClobbered = (a: Account) => opts.clobberedIds?.has(a.id) ?? false;
+  // Positively read as having no login (see PickOptions.unauthedIds). Only ever reachable when the
+  // signed-in filter degraded open, since otherwise these accounts are not in `eligible` at all —
+  // and it is exactly there that it matters, because a never-logged-in dir's zero tally would
+  // otherwise make it the TOP pick for every agent. Like `isClobbered`, it demotes rather than
+  // blocks: `eligible` keeps it, so `leastBad` still has something to return.
+  const isUnauthed = (a: Account) => opts.unauthedIds?.has(a.id) ?? false;
 
   const candidates = eligible.filter((a) => {
     const u = usageFor(a);
-    return !isExhausted(u) && !isNearStaticCap(u) && !isLiveSpent(a) && !isClobbered(a);
+    return (
+      !isExhausted(u) && !isNearStaticCap(u) && !isLiveSpent(a) && !isClobbered(a) && !isUnauthed(a)
+    );
   });
   return { eligible, candidates };
 }

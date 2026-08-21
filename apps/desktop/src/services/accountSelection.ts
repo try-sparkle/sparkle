@@ -20,6 +20,7 @@ import {
   markExhausted,
   isAccountLiveSpent,
   signedInAccountIds,
+  notSignedInAccountIds,
   signedInFilterApplies,
   loginSiblingIds,
   clobberedDefaultIds,
@@ -334,6 +335,12 @@ export async function chooseAccountForAgent(
   // `pickAccount` honours it even for a near-cap account, because a human chose it on purpose.
   const base = {
     signedInIds: signedInAccountIds(state.identities),
+    // The COMPLEMENT of the line above, and it rides the shared base for the same reason
+    // everything else here does. It only ever bites when `signedInIds` carries no usable
+    // signal and the filter degrades open: without it, a config dir positively read as having
+    // no login still wins auto-pick on its zero tally, which is sparkle-gms0 arriving by the
+    // back door. It demotes, never blocks — see PickOptions.unauthedIds.
+    unauthedIds: new Set(notSignedInAccountIds(state.identities)),
     now: opts.now,
     ceilings: state.ceilings,
     // REAL Anthropic utilization, and it rides the shared base for exactly the reason the two above
@@ -943,6 +950,7 @@ export async function rotateStickyConsumerOffFailedAccount(
     // two cannot disagree about what "healthy" means.
     const base = {
       signedInIds: signedInAccountIds(state.identities),
+      unauthedIds: new Set(notSignedInAccountIds(state.identities)),
       now,
       ceilings: state.ceilings,
       live: liveUsageRows(),
@@ -1060,6 +1068,7 @@ export async function conciergeFallbackConfigDirs(
     );
     const base = {
       signedInIds: signedInAccountIds(state.identities),
+      unauthedIds: new Set(notSignedInAccountIds(state.identities)),
       now,
       ceilings: state.ceilings,
       live: liveUsageRows(),

@@ -28,6 +28,7 @@ import {
   clearAllPins,
   signedInAccountIds,
   signedInFilterApplies,
+  notSignedInAccountIds,
   duplicateAccountGroups,
   identityKey,
   accountsAreSame,
@@ -1149,6 +1150,78 @@ describe("signedInFilterApplies — the shared 'is this reading usable' predicat
   it("is false for an absent or empty reading — 'could not tell' never empties the pool", () => {
     expect(signedInFilterApplies(accounts, undefined)).toBe(false);
     expect(signedInFilterApplies(accounts, [])).toBe(false);
+  });
+});
+
+// The degraded-filter path. `signedInFilterApplies` returning false opens the pool to every account
+// — deliberately, so a spawn still happens — but that used to also discard what WAS read, letting a
+// config dir positively known to hold no login win auto-pick on its zero tally.
+describe("unauthedIds — a KNOWN-unauthenticated dir must not win the degraded pool", () => {
+  const NOW = 1_000_000;
+
+  it("demotes the never-logged-in dir even though the signed-in filter was skipped", () => {
+    const accounts = [acct("heavy"), acct("neverLoggedIn")];
+    const u = [usage("heavy", { tokens7d: 5_000_000 }), usage("neverLoggedIn", { tokens7d: 0 })];
+    // The signal is UNUSABLE — the only listed id names no existing account — so the filter is
+    // skipped and both accounts are eligible. That is the pre-existing, intended degradation.
+    expect(signedInFilterApplies(accounts, ["ghost"])).toBe(false);
+    expect(pickAccount(accounts, u, { now: NOW, signedInIds: ["ghost"] })?.id).toBe(
+      "neverLoggedIn",
+    );
+    // But we DID read `neverLoggedIn`'s config dir and it holds no login. Carrying that reading
+    // through the degradation is what stops the zero tally from winning.
+    expect(
+      pickAccount(accounts, u, {
+        now: NOW,
+        signedInIds: ["ghost"],
+        unauthedIds: new Set(["neverLoggedIn"]),
+      })?.id,
+    ).toBe("heavy");
+  });
+
+  it("demotes, never blocks: every account unauthenticated still spawns one", () => {
+    // The whole point of degrading open is that a spawn happens. Demoting out of `candidates`
+    // rather than out of `eligible` is what preserves that when the demotion covers everyone.
+    const accounts = [acct("a", { isDefault: true }), acct("b")];
+    const chosen = pickAccount(accounts, [], {
+      now: NOW,
+      signedInIds: [],
+      unauthedIds: new Set(["a", "b"]),
+    });
+    expect(chosen).not.toBeNull();
+    expect(["a", "b"]).toContain(chosen?.id);
+  });
+
+  it("is inert when the signed-in filter DOES apply — those accounts are already gone", () => {
+    const accounts = [acct("in"), acct("out")];
+    const u = [usage("in", { tokens7d: 9_000 }), usage("out", { tokens7d: 0 })];
+    const opts = { now: NOW, signedInIds: ["in"] };
+    expect(pickAccount(accounts, u, opts)?.id).toBe("in");
+    expect(pickAccount(accounts, u, { ...opts, unauthedIds: new Set(["out"]) })?.id).toBe("in");
+  });
+
+  it("omitting the option changes nothing", () => {
+    const accounts = [acct("heavy"), acct("empty")];
+    const u = [usage("heavy", { tokens7d: 5_000_000 }), usage("empty", { tokens7d: 0 })];
+    expect(pickAccount(accounts, u, { now: NOW })?.id).toBe("empty");
+  });
+});
+
+describe("notSignedInAccountIds — read-and-has-no-login, not merely unknown", () => {
+  function id(idv: string, email: string | null): Identity {
+    return { id: idv, email, organization: null, accountUuid: null };
+  }
+
+  it("is the complement of signedInAccountIds over the identities we HAVE", () => {
+    const identities = [id("in", "a@example.test"), id("out", null)];
+    expect(signedInAccountIds(identities)).toEqual(["in"]);
+    expect(notSignedInAccountIds(identities)).toEqual(["out"]);
+  });
+
+  it("says nothing about an account with no identity row at all", () => {
+    // Absent from `identities` is UNKNOWN, and unknown must not be reported as evidence of
+    // no-login — that is the distinction the degraded path needs and `signedInIds` cannot make.
+    expect(notSignedInAccountIds([id("out", null)])).not.toContain("unread");
   });
 });
 
