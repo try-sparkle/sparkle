@@ -573,6 +573,127 @@ fn file_stamp(path: &Path) -> Option<(u64, std::time::SystemTime)> {
     Some((meta.len(), meta.modified().ok()?))
 }
 
+/// Pre-seed Claude Code's per-project folder-TRUST acceptance for `worktree_path` into `config_dir`'s
+/// `.claude.json`, so a worker spawned in that worktree with `--dangerously-skip-permissions` does
+/// NOT stop on the interactive "Is this a project you trust? / 1. Yes, I trust this folder / 2. No,
+/// exit" dialog.
+///
+/// ── A SEPARATE GATE FROM THE BYPASS CONSENT RECORD ──────────────────────────────────────────────
+/// [`ensure_account_allowlist_at`] seeds `skipDangerousModePermissionPrompt` — the acceptance of the
+/// `--dangerously-skip-permissions` DISCLAIMER. Folder trust is a DIFFERENT gate that the flag does
+/// NOT waive. Verified against the shipped Claude Code 2.1.235 bundle: trust is read as
+/// `config.projects[<abs cwd>].hasTrustDialogAccepted === true`, and the functions that gate on it
+/// short-circuit only on `CLAUDE_CODE_SANDBOXED` / a managed-sandbox check / a parent-dir trust walk
+/// — `--dangerously-skip-permissions` is not among them. So a worker whose config dir has never seen
+/// THIS project still hits the trust dialog even with every permission bypass in place.
+///
+/// A fresh worktree path is a project the config dir has never trusted, by construction — and a
+/// respawn after an app restart lands a worker into a worktree/config-dir pair that never recorded
+/// it. The worker then HANGS on a dialog nobody is watching, alive and idle with zero tool calls
+/// ("refused a write into a blocked prompt on a Claude Code screen"). This is one half of the
+/// restart-wedge; the other half (onboarding, bypass consent) is already seeded above.
+///
+/// ── WHY THIS IS SAFE AT THIS SCOPE ──────────────────────────────────────────────────────────────
+/// It trusts exactly ONE directory: Sparkle's own throwaway worktree, created by Sparkle under its
+/// managed worktrees root, for Sparkle's own unattended worker. That is precisely the intent — the
+/// app pre-trusts the directories IT made for the workers IT spawns — and it grants nothing wider:
+/// it is not an account-level bypass, it does not trust the filesystem, and it touches no path the
+/// user did not already delegate to Sparkle by choosing to run agents in it.
+///
+/// Non-destructive and CAS-guarded, IDENTICAL to [`ensure_onboarding_marker_at`] because it writes
+/// the same live file Claude Code owns (`.claude.json`): only `NotFound` counts as absent; an
+/// unparseable file is refused untouched; an existing `projects` map and every other key survive; a
+/// worktree already carrying `hasTrustDialogAccepted: true` is not rewritten; the write goes through
+/// [`crate::hooks::atomic_write_settings`]; and a compare-and-swap on `(len, mtime)` aborts rather
+/// than clobber a login `claude` completed between our read and our write.
+pub(crate) fn ensure_project_trusted_at(config_dir: &Path, worktree_path: &str) -> Result<(), String> {
+    ensure_project_trusted_with(config_dir, worktree_path, || {})
+}
+
+/// [`ensure_project_trusted_at`] with a seam that runs AFTER the read and BEFORE the write, so the
+/// lost-update guard is testable on the real path (see [`ensure_onboarding_marker_with`] for why a
+/// pre-write mutation is the only interleaving that exercises the CAS). Production passes a no-op.
+fn ensure_project_trusted_with(
+    config_dir: &Path,
+    worktree_path: &str,
+    between_read_and_write: impl FnOnce(),
+) -> Result<(), String> {
+    let file = config_dir.join(CLAUDE_JSON);
+    let existing = match std::fs::read_to_string(&file) {
+        Ok(s) => Some(s),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            return Err(format!(
+                "cannot read account {CLAUDE_JSON} ({e}), leaving it untouched: {}",
+                file.display()
+            ))
+        }
+    };
+    let stamp_at_read = file_stamp(&file);
+
+    let mut obj = match existing.as_deref() {
+        None => serde_json::Map::new(),
+        Some(s) => match serde_json::from_str::<serde_json::Value>(s) {
+            Ok(serde_json::Value::Object(m)) => m,
+            _ => {
+                return Err(format!(
+                    "account {CLAUDE_JSON} is not a JSON object, leaving it untouched: {}",
+                    file.display()
+                ))
+            }
+        },
+    };
+
+    // Already trusted for this exact worktree → do not rewrite the file for nothing.
+    if obj
+        .get("projects")
+        .and_then(|p| p.as_object())
+        .and_then(|p| p.get(worktree_path))
+        .and_then(|w| w.as_object())
+        .and_then(|w| w.get("hasTrustDialogAccepted"))
+        == Some(&serde_json::Value::Bool(true))
+    {
+        return Ok(());
+    }
+
+    // Merge into the projects map, preserving every OTHER project entry and every other key on THIS
+    // project. `entry`-style: only `hasTrustDialogAccepted` is written; a `projects` map the user (or
+    // a live claude) already built is extended, never replaced.
+    let projects = obj
+        .entry("projects")
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    if !projects.is_object() {
+        *projects = serde_json::Value::Object(serde_json::Map::new());
+    }
+    let projects = projects.as_object_mut().unwrap();
+    let entry = projects
+        .entry(worktree_path.to_string())
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    if !entry.is_object() {
+        *entry = serde_json::Value::Object(serde_json::Map::new());
+    }
+    entry.as_object_mut().unwrap().insert(
+        "hasTrustDialogAccepted".into(),
+        serde_json::Value::Bool(true),
+    );
+
+    std::fs::create_dir_all(config_dir).map_err(|e| format!("mkdir account dir: {e}"))?;
+    let json = serde_json::to_string(&serde_json::Value::Object(obj))
+        .map_err(|e| format!("serialize {CLAUDE_JSON}: {e}"))?;
+    between_read_and_write();
+    if file_stamp(&file) != stamp_at_read {
+        return Err(format!(
+            "{CLAUDE_JSON} changed while seeding folder trust (a live claude wrote to it); \
+             leaving it alone and retrying on the next spawn: {}",
+            file.display()
+        ));
+    }
+    crate::hooks::atomic_write_settings(&file, &json)
+        .map_err(|e| format!("write account {CLAUDE_JSON}: {e}"))?;
+    tighten_mode(&file, 0o600); // it holds the login once one completes
+    Ok(())
+}
+
 /// Create the account's config dir, append it (non-default) to `accounts.json`,
 /// and return it. The frontend launches `claude login` against `config_dir`
 /// separately — we never spawn it here.
@@ -3109,6 +3230,42 @@ pub async fn accounts_list(app: AppHandle) -> Result<Vec<Account>, String> {
     })
     .await
     .map_err(|e| format!("accounts_list task failed: {e}"))?
+}
+
+/// Pre-seed folder-trust acceptance for a worker's `worktree` into the account it will run under, so
+/// the spawned `claude --dangerously-skip-permissions` skips Claude Code's "Is this a project you
+/// trust?" dialog instead of hanging on it. Call this at spawn prep, AFTER the account is chosen and
+/// BEFORE building the exec — it needs both the worktree path and the account's config dir.
+///
+/// `config_dir` is the chosen account's isolated config dir; empty/absent means the DEFAULT account,
+/// whose `.claude.json` lives at `$HOME/.claude.json` (Claude Code reads `$HOME` when
+/// `CLAUDE_CONFIG_DIR` is unset — mirroring [`crate::claude::spawn_env_config_dir`]'s empty rule).
+///
+/// Best-effort by contract: the caller warns and spawns anyway on `Err`, because a failure here is at
+/// worst the pre-existing behavior (one trust prompt), never a reason to refuse to start the worker.
+/// Runs on the blocking pool: it is a `.claude.json` read-modify-write, filesystem I/O that must not
+/// stall the UI thread.
+#[tauri::command]
+pub async fn ensure_project_trusted(
+    config_dir: Option<String>,
+    worktree: String,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let dir: PathBuf = match config_dir.filter(|s| !s.is_empty()) {
+            Some(c) => PathBuf::from(c),
+            None => match std::env::var_os("HOME").filter(|h| !h.is_empty()) {
+                Some(h) => PathBuf::from(h),
+                None => {
+                    return Err(
+                        "HOME is unset; cannot resolve the default account's .claude.json".into(),
+                    )
+                }
+            },
+        };
+        ensure_project_trusted_at(&dir, &worktree)
+    })
+    .await
+    .map_err(|e| format!("ensure_project_trusted task failed: {e}"))?
 }
 
 /// Register a new (non-default) account: create `<app_data>/accounts/<id>/` and
@@ -6094,6 +6251,138 @@ mod tests {
             "the concurrent write must survive WHOLE, not be partially merged"
         );
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ---- folder trust (the restart-wedge's first half) ------------------------------------
+
+    /// THE SIDE EFFECT THAT SKIPS THE DIALOG. Claude Code 2.1.235 shows "Is this a project you
+    /// trust?" unless `config.projects[<abs cwd>].hasTrustDialogAccepted === true` is in
+    /// `.claude.json` — and `--dangerously-skip-permissions` does NOT waive it. So the record this
+    /// writes is exactly what an unattended worker needs to not hang on that dialog. Asserts the
+    /// written boolean, not the `Ok`: a version that returned `Ok` and wrote nothing (or wrote the
+    /// wrong key/path) would pass an `is_ok()` check and still wedge every respawned worker.
+    #[test]
+    fn seeding_folder_trust_writes_the_record_that_skips_the_dialog() {
+        let tmp = unique_dir("trust-absent");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let wt = "/wt/acme/agent-7";
+        assert!(!tmp.join(".claude.json").exists(), "precondition: no config yet");
+
+        ensure_project_trusted_at(&tmp, wt).unwrap();
+
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(tmp.join(".claude.json")).unwrap()).unwrap();
+        assert_eq!(
+            v["projects"][wt]["hasTrustDialogAccepted"], true,
+            "a worker spawned in this worktree would still stop on the trust dialog"
+        );
+    }
+
+    /// The seed must EXTEND `.claude.json`, never replace it: the file holds the account's login and
+    /// any other project's trust record, and this write happens right before a spawn on a live file.
+    /// Asserts the new record AND that the login, an unrelated project's trust, and a top-level key
+    /// all survive — the four ways a careless `projects: {..}` overwrite would lose real state.
+    #[test]
+    fn seeding_folder_trust_preserves_other_projects_the_login_and_keys() {
+        let tmp = unique_dir("trust-preserve");
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(
+            tmp.join(".claude.json"),
+            r#"{"oauthAccount":{"emailAddress":"me@example.com"},"numStartups":9,
+                "projects":{"/wt/other/agent-1":{"hasTrustDialogAccepted":true,"history":[1,2]}}}"#,
+        )
+        .unwrap();
+        let wt = "/wt/acme/agent-7";
+
+        ensure_project_trusted_at(&tmp, wt).unwrap();
+
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(tmp.join(".claude.json")).unwrap()).unwrap();
+        assert_eq!(v["projects"][wt]["hasTrustDialogAccepted"], true, "our record must be written");
+        assert_eq!(
+            v["projects"]["/wt/other/agent-1"]["hasTrustDialogAccepted"], true,
+            "another worktree's trust must survive"
+        );
+        assert_eq!(
+            v["projects"]["/wt/other/agent-1"]["history"],
+            serde_json::json!([1, 2]),
+            "the other project's own keys must survive whole"
+        );
+        assert_eq!(
+            v["oauthAccount"]["emailAddress"], "me@example.com",
+            "the seed destroyed the login — unrecoverable"
+        );
+        assert_eq!(v["numStartups"], 9, "unrelated top-level Claude Code state must survive");
+    }
+
+    /// Already trusted → not rewritten AT ALL (byte-for-byte), so a spawn does not churn the live
+    /// `.claude.json` Claude Code is reading every time an already-trusted worktree reopens.
+    #[test]
+    fn seeding_folder_trust_does_not_rewrite_an_already_trusted_worktree() {
+        let tmp = unique_dir("trust-already");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let wt = "/wt/acme/agent-7";
+        // Compact, key-ordered unlike our writer's output, so any rewrite is visible.
+        let original =
+            r#"{"projects":{"/wt/acme/agent-7":{"hasTrustDialogAccepted":true}},"zzz":1}"#;
+        std::fs::write(tmp.join(".claude.json"), original).unwrap();
+
+        ensure_project_trusted_at(&tmp, wt).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(tmp.join(".claude.json")).unwrap(),
+            original,
+            "an already-trusted worktree must leave the file byte-for-byte alone"
+        );
+    }
+
+    /// Unparseable → refused, bytes intact. Same data-loss reasoning as the onboarding twin: this
+    /// file holds the login and there is no prior copy, so a spawn-time seed must never clobber it.
+    #[test]
+    fn seeding_folder_trust_leaves_an_unparseable_claude_json_intact() {
+        let tmp = unique_dir("trust-garbage");
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join(".claude.json"), "{ not json").unwrap();
+
+        assert!(ensure_project_trusted_at(&tmp, "/wt/acme/agent-7").is_err());
+        assert_eq!(
+            std::fs::read_to_string(tmp.join(".claude.json")).unwrap(),
+            "{ not json",
+            "an unparseable .claude.json must be left byte-for-byte intact"
+        );
+    }
+
+    /// A login completing DURING the seed must survive whole — the lost-update window atomicity does
+    /// not cover, driven through the `between_read_and_write` seam so the concurrent write lands in
+    /// the one window that matters. Asserts the SIDE EFFECT (the login on disk), not just `Err`: an
+    /// implementation that errored and still wrote would satisfy `is_err()` while destroying the
+    /// credential. Writing the file before the call would pass with the CAS deleted (the function
+    /// would read the newer content and its stamp would match), which is the vacuous shape to avoid.
+    #[test]
+    fn seeding_folder_trust_refuses_to_clobber_a_write_that_landed_mid_seed() {
+        let tmp = unique_dir("trust-lost-update");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let file = tmp.join(".claude.json");
+        std::fs::write(&file, r#"{"oauthAccount":{"emailAddress":"before@example.com"}}"#).unwrap();
+
+        let after = r#"{"oauthAccount":{"emailAddress":"after@example.com","organizationName":"Org"}}"#;
+        let f = file.clone();
+        let res = ensure_project_trusted_with(&tmp, "/wt/acme/agent-7", move || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            std::fs::write(&f, after).unwrap();
+        });
+
+        assert!(res.is_err(), "the seed must ABORT when the file changed under it");
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        assert_eq!(
+            v["oauthAccount"]["emailAddress"], "after@example.com",
+            "the seed overwrote a login written while it was in flight — unrecoverable"
+        );
+        assert_eq!(
+            v["oauthAccount"]["organizationName"], "Org",
+            "the concurrent write must survive WHOLE, not be partially merged"
+        );
     }
 
     // ---- orphan adoption ------------------------------------------------------------------

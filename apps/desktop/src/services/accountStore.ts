@@ -110,6 +110,19 @@ export function listAccounts(): Promise<Account[]> {
   return invoke<Account[]>("accounts_list");
 }
 
+/** Pre-seed Claude Code's folder-trust acceptance for `worktree` into the chosen account's config
+ *  dir (or `$HOME` for the default account when `configDir` is undefined), so a worker spawned there
+ *  with `--dangerously-skip-permissions` skips the "Is this a project you trust?" dialog instead of
+ *  hanging on it. Call at spawn prep AFTER the account is chosen and BEFORE `buildClaudeExec`.
+ *
+ *  Best-effort: `--dangerously-skip-permissions` does NOT waive folder trust, so this closes the
+ *  restart-wedge where a respawned worker's config dir has never trusted the (often fresh) worktree
+ *  path. A failure leaves the pre-existing behavior (one trust prompt), so the caller warns and
+ *  spawns anyway rather than refusing to start the worker. */
+export function ensureProjectTrusted(worktree: string, configDir?: string): Promise<void> {
+  return invoke("ensure_project_trusted", { worktree, configDir });
+}
+
 /** Register a fresh, empty config dir under `nickname` and return the new account. The caller still
  *  has to run the `claude login` flow in `account.configDir` — see the {@link AccountsScreen}
  *  `onLogin` seam; this command only creates the folder + metadata. */

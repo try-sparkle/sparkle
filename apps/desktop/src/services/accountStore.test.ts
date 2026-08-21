@@ -20,6 +20,7 @@ import {
   setNickname,
   removeAccount,
   markExhausted,
+  ensureProjectTrusted,
   DEFAULT_NEAR_CAP,
   getPin,
   setPin,
@@ -825,6 +826,27 @@ describe("command wrappers pass camelCase args to invoke", () => {
     // wrapper must divide by 1000 (sparkle-ggvp — persisting ms made the future-filter a no-op).
     await markExhausted("a", 9_999_000);
     expect(invoke).toHaveBeenCalledWith("accounts_mark_exhausted", { id: "a", untilEpoch: 9999 });
+  });
+
+  it("ensureProjectTrusted passes the worktree AND the chosen account's configDir", async () => {
+    // The command name and BOTH args are the seam: a wrong command name silently no-ops (the trust
+    // record never lands and the worker still wedges on the dialog), and dropping configDir would
+    // seed the WRONG account's .claude.json. Pin both.
+    await ensureProjectTrusted("/wt/acme/agent-7", "/data/accounts/ab12");
+    expect(invoke).toHaveBeenCalledWith("ensure_project_trusted", {
+      worktree: "/wt/acme/agent-7",
+      configDir: "/data/accounts/ab12",
+    });
+  });
+
+  it("ensureProjectTrusted forwards an undefined configDir for the default account", async () => {
+    // The default account has no configDir; Rust resolves that to $HOME/.claude.json. The wrapper
+    // must forward `undefined` rather than omit the key or coerce it.
+    await ensureProjectTrusted("/wt/acme/agent-7");
+    expect(invoke).toHaveBeenCalledWith("ensure_project_trusted", {
+      worktree: "/wt/acme/agent-7",
+      configDir: undefined,
+    });
   });
 });
 

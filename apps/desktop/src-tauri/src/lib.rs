@@ -1092,6 +1092,7 @@ pub fn run() {
             watchdog::watchdog_heartbeat,
             attention_summary::summarize_attention,
             accounts::accounts_list,
+            accounts::ensure_project_trusted,
             accounts::accounts_add,
             accounts::accounts_set_nickname,
             accounts::accounts_remove,

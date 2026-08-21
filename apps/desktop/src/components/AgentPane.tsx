@@ -37,7 +37,14 @@ import {
 } from "../services/orchestrationLaunch";
 import { purgeBuildAgent } from "../services/orchestrationListener";
 import { useSettingsStore, enforcedWorkerCap } from "../stores/settingsStore";
-import { setPin, accountDisplay, forkNotice, type Account, type Identity } from "../services/accountStore";
+import {
+  setPin,
+  accountDisplay,
+  forkNotice,
+  ensureProjectTrusted,
+  type Account,
+  type Identity,
+} from "../services/accountStore";
 import {
   registerPaneRestart,
   unregisterPaneRestart,
@@ -764,6 +771,19 @@ function AgentPaneInner({
       // agents have to move. Not derivable from the pin map — most agents auto-pick and have no pin.
       if (chosen) registerPaneAccount(agent.id, chosen.id);
       const configDir = chosen?.configDir;
+      // Pre-seed Claude Code's folder-TRUST acceptance for this worktree into the account that will
+      // run it, BEFORE the spawn — otherwise `claude --dangerously-skip-permissions` still stops on
+      // the "Is this a project you trust?" dialog (trust is a separate gate the skip-permissions flag
+      // does NOT waive). This is the restart-wedge's first half: a respawned worker lands in a
+      // worktree/config-dir pair that never recorded the trust, and hangs with zero tool calls.
+      // Best-effort: on failure we warn and spawn anyway — the worst case is the pre-existing single
+      // prompt, never a reason to refuse to start the agent. Awaited so the record is on disk before
+      // claude reads it; it is one small `.claude.json` read-modify-write.
+      try {
+        await ensureProjectTrusted(wt.path, configDir);
+      } catch (e) {
+        console.warn(`[trust] could not pre-seed folder trust for ${wt.path}; spawning anyway`, e);
+      }
       // Resume the prior conversation if this worktree already has one (the
       // worktree path is the session key). `--continue` errors in a directory
       // with no history, so only add it when a session exists. Resume is a
@@ -879,6 +899,11 @@ function AgentPaneInner({
           // Workers run unattended in an isolated worktree: auto-approve every tool call so an
           // approval prompt can't silently deadlock the worker (and its waiting orchestrator).
           dangerouslySkipPermissions: true,
+          // …and, on a resume of an old/large session, don't stop on Claude Code's "resume from
+          // summary?" prompt either — no human is here to answer it, so it wedges the worker the same
+          // way. Child-scoped env thresholds; see suppressResumePrompt's JSDoc. (The folder-trust
+          // dialog, the other restart-wedge prompt, is pre-seeded via ensureProjectTrusted above.)
+          suppressResumePrompt: true,
           // NOT `beadsReadonly: true` — see bead sparkle-x5xn0 (roborev 62900, High).
           //
           // The reasoning for it is half right: every worktree shares one Dolt beads DB, so an

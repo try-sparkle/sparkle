@@ -110,7 +110,32 @@ export interface ClaudeExecOpts {
    * `inbox_claim_for_idle`) still delivers it over the agent's own PTY.
    */
   inboxAgentId?: string;
+  /**
+   * Suppress Claude Code's interactive "This session is Xh old and Nk tokens — resume from summary?"
+   * prompt for this spawn. Set for UNATTENDED WORKERS: on `--continue`/`--resume` of an OLD, LARGE
+   * session that prompt blocks a headless worker forever — nobody is there to press "1. Resume from
+   * summary" — so the worker sits RED and its orchestrator blocks in wait_for_workers. This is the
+   * second half of the restart-wedge (the first is the folder-trust dialog, seeded server-side).
+   *
+   * Mechanism (verified against the Claude Code 2.1.235 bundle): the gate reads two env vars,
+   * `CLAUDE_CODE_RESUME_THRESHOLD_MINUTES` (default 70) and `CLAUDE_CODE_RESUME_TOKEN_THRESHOLD`
+   * (default 100000), and shows the prompt only when the session is older AND larger than those. We
+   * export both at an unreachable ceiling so the gate always takes its "no prompt" branch — the
+   * session is never old/large ENOUGH — for THIS child only. Deliberately NOT the config-file
+   * mechanism (`resumeReturnDismissed` in `~/.claude.json`, what "Don't ask me again" writes): that
+   * is global and would silence the prompt in the human's OWN interactive Claude Code too. An env
+   * export is confined to the worker's own process, exactly like {@link configDir}/{@link
+   * inboxAgentId}, so it changes nothing the user sees. Harmless on a fresh (non-resumed) spawn: the
+   * gate needs a prior session to fire at all.
+   */
+  suppressResumePrompt?: boolean;
 }
+
+/** The unreachable ceilings exported for {@link ClaudeExecOpts.suppressResumePrompt}. A session is
+ *  never this old (in minutes) or this large (in tokens), so Claude Code's resume-summary gate always
+ *  takes its "no prompt" branch. Exported so a test pins the SAME values the exec emits. */
+export const RESUME_PROMPT_SUPPRESS_MINUTES = "525600000"; // ~1000 years
+export const RESUME_PROMPT_SUPPRESS_TOKENS = "1000000000000"; // 1e12 tokens
 
 /** Build the `exec …` string passed to `zsh -l -c`. Appends `--continue` only
  *  when a prior session exists for this worktree, so a fresh worktree (where
@@ -217,7 +242,17 @@ export function buildClaudeExec(
   const inboxAgentId = opts.inboxAgentId ?? "";
   const inboxAgentExport =
     inboxAgentId !== "" ? `export SPARKLE_INBOX_AGENT=${shellQuote(inboxAgentId)}; ` : "";
-  return `${configExport}${beadsReadonlyExport}${inboxAgentExport}export PATH="$HOME/.local/bin:$PATH"; ${cmd}`;
+  // Push the resume-summary prompt's age/token thresholds out of reach so an unattended worker
+  // resuming an old, large session never stops on it (see suppressResumePrompt's JSDoc). Child-scoped
+  // like the exports above — never Sparkle's own env, never the user's config file. Written as an
+  // explicit `=== true` so a mutation check can invert the gate: a worker that silently stops
+  // exporting these re-opens the exact restart-wedge this closes.
+  const resumeThresholdExport =
+    opts.suppressResumePrompt === true
+      ? `export CLAUDE_CODE_RESUME_THRESHOLD_MINUTES=${RESUME_PROMPT_SUPPRESS_MINUTES}; ` +
+        `export CLAUDE_CODE_RESUME_TOKEN_THRESHOLD=${RESUME_PROMPT_SUPPRESS_TOKENS}; `
+      : "";
+  return `${configExport}${beadsReadonlyExport}${inboxAgentExport}${resumeThresholdExport}export PATH="$HOME/.local/bin:$PATH"; ${cmd}`;
 }
 
 /**

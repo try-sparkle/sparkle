@@ -11,6 +11,8 @@ import {
   buildMergedMcpConfig,
   controlMcpServers,
   orchestratorMcpServers,
+  RESUME_PROMPT_SUPPRESS_MINUTES,
+  RESUME_PROMPT_SUPPRESS_TOKENS,
 } from "./claudeSpawn";
 
 const PATH_PREFIX = `export PATH="$HOME/.local/bin:$PATH"; `;
@@ -159,6 +161,37 @@ describe("buildClaudeExec ()", () => {
   it("keeps auto-approve on a resumed worker (after --continue, before the prompt)", () => {
     const cmd = buildClaudeExec("/bin/claude", true, { dangerouslySkipPermissions: true });
     expect(cmd).toBe(`${PATH_PREFIX}exec '/bin/claude' --continue --dangerously-skip-permissions`);
+  });
+
+  // suppressResumePrompt (restart-wedge, second half). On `--continue`/`--resume` of an OLD, LARGE
+  // session Claude Code shows an interactive "resume from summary?" prompt that a headless worker
+  // can never answer. The gate reads CLAUDE_CODE_RESUME_THRESHOLD_MINUTES / _TOKEN_THRESHOLD; we
+  // export both at an unreachable ceiling for the child so it never fires. Asserting the exports are
+  // PRESENT is the side effect — a worker that stops emitting them re-opens the wedge (mutation: flip
+  // the `=== true` gate and this goes red).
+  it("exports the unreachable resume-prompt thresholds when suppressResumePrompt is set", () => {
+    const cmd = buildClaudeExec("/bin/claude", true, {
+      dangerouslySkipPermissions: true,
+      suppressResumePrompt: true,
+    });
+    expect(cmd).toContain(
+      `export CLAUDE_CODE_RESUME_THRESHOLD_MINUTES=${RESUME_PROMPT_SUPPRESS_MINUTES}; `,
+    );
+    expect(cmd).toContain(
+      `export CLAUDE_CODE_RESUME_TOKEN_THRESHOLD=${RESUME_PROMPT_SUPPRESS_TOKENS}; `,
+    );
+    // Both exports precede `exec` (they must reach the child claude), like every other child export.
+    expect(cmd.indexOf("CLAUDE_CODE_RESUME_TOKEN_THRESHOLD")).toBeLessThan(cmd.indexOf("exec "));
+    // The ceilings are truly unreachable, so the gate's "no prompt" branch always wins.
+    expect(Number(RESUME_PROMPT_SUPPRESS_MINUTES)).toBeGreaterThan(70); // default threshold
+    expect(Number(RESUME_PROMPT_SUPPRESS_TOKENS)).toBeGreaterThan(100000); // default threshold
+  });
+
+  it("omits the resume-prompt threshold exports by default (interactive agents keep the prompt)", () => {
+    expect(buildClaudeExec("/bin/claude", true)).not.toContain("CLAUDE_CODE_RESUME_");
+    expect(
+      buildClaudeExec("/bin/claude", true, { suppressResumePrompt: false }),
+    ).not.toContain("CLAUDE_CODE_RESUME_");
   });
 
   // CLAUDE_CONFIG_DIR injection for multi Claude Max account support (design spec
