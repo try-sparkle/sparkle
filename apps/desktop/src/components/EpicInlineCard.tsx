@@ -41,7 +41,6 @@ export function EpicInlineCard({
   projectId,
   rootPath,
   allBeads,
-  onClose,
 }: {
   bead: Bead;
   projectId: string;
@@ -49,7 +48,6 @@ export function EpicInlineCard({
    *  offering controls that cannot work — the same contract the board's overlay takes. */
   rootPath: string | null;
   allBeads: readonly Bead[];
-  onClose: () => void;
 }) {
   const agents = useProjectStore(
     (s) => s.projects.find((p) => p.id === projectId)?.agents ?? NO_AGENTS,
@@ -135,7 +133,12 @@ export function EpicInlineCard({
         // little blue bar here."* The switch is a prop rather than a branch inside `BeadCard`, so
         // this surface owns the decision and no other card is changed by it; see `showStageLine`.
         showStageLine={false}
-        onClose={onClose}
+        // NO CLOSE BUTTON ON THIS CARD — item 16, [07:30]: the chat button *replaces* it. The X did
+        // not disappear, it MOVED: it now renders in the epic row's count slot, where the founder
+        // put it ([07:51] "put the x in the top, where it says the six out of six when it's
+        // closed"). Passing `onClose` here as well would paint a SECOND close control one row below
+        // the first, which is what shipped briefly while the two halves of item 15 were in separate
+        // PRs. `EpicsColumn` owns closing now, through the row's own toggle.
         // THE CHAT BUTTON, [07:30] *"We're also missing a chat button."* Bound HERE rather than
         // threaded down from `Workspace` through `EpicsColumn`, which is exactly what the
         // concierge's `BeadPill` does (`dispatchBeadChat(bead, projectId)`) and for the same

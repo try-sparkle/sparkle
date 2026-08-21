@@ -633,6 +633,27 @@ describe("an epic that HAS a goal opens its card, exactly like one that does not
     expect(ratio("ep-goal")).toBeTruthy();
   });
 
+  it("has exactly ONE close control, and it is the row's — not a second one on the card", () => {
+    // ITEM 16: the chat button REPLACES the close button on the card, and item 15 moves the X up
+    // into the row. Those are one change seen from two sides, and while the two halves sat in
+    // separate PRs the tree briefly carried BOTH — a card X and a row X, one line apart.
+    //
+    // THE ASSERTION IS A COUNT, not "the card has no X". Asserting absence alone would also pass
+    // for a card that failed to render at all, and for a row that never grew its X — so this opens
+    // the card, proves the card really is there by finding content only it has, and only then
+    // counts the close controls in the whole open row + card region.
+    render(<Workspace />);
+    fireEvent.click(rowFor("ep-goal")!);
+
+    const card = cardUnder("ep-goal");
+    expect(card).toBeTruthy();
+    // The card is genuinely rendered — its id line is card-only content.
+    expect(card!.querySelector('[data-testid="epics-bead-card-id"]')).toBeTruthy();
+
+    expect(card!.querySelector('[data-testid="epics-bead-card-close"]')).toBeNull();
+    expect(closeX("ep-goal")).toBeTruthy();
+  });
+
   it("clicking the X CLOSES the card — it must not swallow the row's click", () => {
     // THE ASSERTION THAT MATTERS. The X is a readout with no handler of its own: the row underneath
     // is what closes. Make it a real nested <button> with stopPropagation — the shape that caused

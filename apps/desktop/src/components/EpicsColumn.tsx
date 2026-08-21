@@ -482,7 +482,6 @@ export function EpicsColumn({
                           projectId={project.id}
                           rootPath={project.rootPath ?? null}
                           allBeads={allBeads}
-                          onClose={() => setEpicFocus(side, null)}
                         />
                       )}
                     </Fragment>

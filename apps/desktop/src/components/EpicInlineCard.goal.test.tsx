@@ -67,7 +67,6 @@ function mount(over: Partial<Parameters<typeof EpicInlineCard>[0]> = {}) {
       projectId={PROJECT}
       rootPath={ROOT}
       allBeads={[EPIC]}
-      onClose={() => {}}
       {...over}
     />,
   );
@@ -124,7 +123,6 @@ describe("EpicInlineCard — the goal wiring, not the rendering", () => {
         projectId={PROJECT}
         rootPath={ROOT}
         allBeads={[parent, child]}
-        onClose={() => {}}
       />,
     );
     const { container: loneBox } = render(
@@ -133,7 +131,6 @@ describe("EpicInlineCard — the goal wiring, not the rendering", () => {
         projectId={PROJECT}
         rootPath={ROOT}
         allBeads={[lone]}
-        onClose={() => {}}
       />,
     );
 
@@ -153,7 +150,6 @@ describe("EpicInlineCard — the goal wiring, not the rendering", () => {
         projectId={PROJECT}
         rootPath={ROOT}
         allBeads={[EPIC]}
-        onClose={() => {}}
       />,
     );
     const { container: taskBox } = render(
@@ -162,7 +158,6 @@ describe("EpicInlineCard — the goal wiring, not the rendering", () => {
         projectId={PROJECT}
         rootPath={ROOT}
         allBeads={[task]}
-        onClose={() => {}}
       />,
     );
 
@@ -184,7 +179,6 @@ describe("EpicInlineCard — the goal wiring, not the rendering", () => {
         projectId={PROJECT}
         rootPath={ROOT}
         allBeads={[EPIC]}
-        onClose={() => {}}
       />,
     );
     const { container: readOnly } = render(
@@ -193,7 +187,6 @@ describe("EpicInlineCard — the goal wiring, not the rendering", () => {
         projectId={PROJECT}
         rootPath={null}
         allBeads={[EPIC]}
-        onClose={() => {}}
       />,
     );
 

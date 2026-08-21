@@ -70,7 +70,6 @@ function mount(over: Partial<Parameters<typeof EpicInlineCard>[0]> = {}) {
       projectId={PROJECT}
       rootPath={ROOT}
       allBeads={[EPIC]}
-      onClose={() => {}}
       {...over}
     />,
   );

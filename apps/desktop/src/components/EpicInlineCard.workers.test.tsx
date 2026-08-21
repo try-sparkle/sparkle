@@ -55,7 +55,6 @@ function mount() {
       projectId={PROJECT}
       rootPath="/repo"
       allBeads={BEADS}
-      onClose={() => {}}
     />,
   );
 }
