@@ -24,6 +24,15 @@ export interface AccountSwitchBannerProps {
    *  the plan's real target account, so it is the friendly name the user assigned — shown on the
    *  progress notice at the founder's request. Null when the host cannot resolve it. */
   targetName?: string | null;
+  /** The host completed a DEFINITIVE read of the account registry and the plan's destination was
+   *  NOT in it. Not "we haven't looked yet" and not "the read failed" — both of those leave this
+   *  false, exactly as the accounts pane's own `loaded` flag separates not-yet-read from read-and-
+   *  empty, so a slow or broken read can never raise a false alarm.
+   *
+   *  When true the notice must NOT read as success: it goes amber, takes `role="alert"`, and says
+   *  the destination could not be confirmed. A green bar naming a destination the registry does not
+   *  contain is the exact contradiction this prop exists to make unrenderable. */
+  targetUnverified?: boolean;
   onAccept: () => void;
   onDismiss: () => void;
   /** Open the Accounts settings screen — the "Manage" link on the progress notice. */
@@ -56,13 +65,24 @@ const btn: React.CSSProperties = {
 
 // The auto-switch progress bar: a solid brand-green bar with black text (founder request). #34c759
 // is the constant brand green; black on it clears WCAG AA comfortably (~9:1).
-const SWITCH_GREEN = "#34c759";
+export const SWITCH_GREEN = "#34c759";
 
 const progressWrap: React.CSSProperties = {
   ...wrap,
   background: SWITCH_GREEN,
   color: "#000",
   borderBottom: "1px solid rgba(0,0,0,0.15)",
+};
+
+// The UNVERIFIED-DESTINATION variant of the same bar. Brand amber, same black ink (8.7:1, well clear
+// of AA) and the same geometry, so it reads as the same notice in a different state rather than as a
+// second widget. The colour is the whole point: a switch whose destination cannot be confirmed must
+// not be able to paint itself in the success colour.
+export const SWITCH_AMBER = "#e0982f";
+
+const unverifiedWrap: React.CSSProperties = {
+  ...progressWrap,
+  background: SWITCH_AMBER,
 };
 
 // "Manage" — a link, not a button box, in the same black as the text.
@@ -116,6 +136,7 @@ export function AccountSwitchBanner({
   plan,
   display,
   targetName,
+  targetUnverified,
   onAccept,
   onDismiss,
   onManage,
@@ -125,13 +146,46 @@ export function AccountSwitchBanner({
     // n = how many agents this switch is moving. Constant across the migration (agents leave the
     // `pending` list and join `moved`, but the total is what the sentence names).
     const n = plan.pending.length + plan.moved.length;
+    const agents = `${n} ${n === 1 ? "agent" : "agents"}`;
+    // A destination the registry does not contain is NOT a success. Amber + `alert`, and the
+    // sentence says what is wrong and where to go — never the green "switching to <name>" bar,
+    // whose whole claim is that the destination is real. `targetName` is deliberately not rendered
+    // in this branch even if the host still holds a stale one: naming it is the bug.
+    if (targetUnverified) {
+      return (
+        <div role="alert" style={unverifiedWrap}>
+          <span aria-hidden="true" style={{ flex: 1 }} />
+          <span
+            style={{ display: "inline-flex", alignItems: "center", gap: 8, textAlign: "center" }}
+          >
+            <span>
+              Session limit reached: moving {agents}, but Sparkle{" "}
+              <strong>could not confirm the destination account</strong> — it is no longer in your
+              accounts list. Check that your agents are running where you expect.
+            </span>
+            {onManage ? (
+              <button type="button" style={manageLink} onClick={onManage}>
+                Manage
+              </button>
+            ) : null}
+          </span>
+          <span style={{ flex: 1, display: "flex", justifyContent: "flex-end" }}>
+            {onDismissProgress ? (
+              <button type="button" aria-label="Dismiss" style={dismissX} onClick={onDismissProgress}>
+                <FiX size={DISMISS_ICON} aria-hidden />
+              </button>
+            ) : null}
+          </span>
+        </div>
+      );
+    }
     return (
       <div role="status" style={progressWrap}>
         {/* Left spacer balances the ✕ column so the centered content sits at true center. */}
         <span aria-hidden="true" style={{ flex: 1 }} />
         <span style={{ display: "inline-flex", alignItems: "center", gap: 8, textAlign: "center" }}>
           <span>
-            Session limit reached: Automatically switching {n} {n === 1 ? "agent" : "agents"}
+            Session limit reached: Automatically switching {agents}
             {targetName ? (
               <>
                 {" "}
