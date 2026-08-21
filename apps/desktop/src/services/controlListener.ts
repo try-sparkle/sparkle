@@ -3459,13 +3459,20 @@ async function handleSendPeerMessage(req: ControlRequest): Promise<Record<string
   // AN UNRESOLVABLE CALLER still fails closed: it has no project, and "no project" must never widen to
   // "all projects", so this refuses rather than searching everywhere.
   //
+  // ONE FLAG, TWO ENFORCEMENT POINTS THAT MUST NOT DRIFT (roborev 66542). The "Improve Sparkle
+  // searches NO roster" rule is enforced BOTH in the caller chain below and at the sibling-candidate
+  // gate ~90 lines down. Those were two independent `isSparkleAgentId(...)` calls, and that split is
+  // not hypothetical drift: a merge took main's side at the first and silently dropped the second,
+  // reopening the hole (`sparkle-w04ess`) until review caught it. Hoisted so there is ONE thing to
+  // change and ONE thing for the contract doc to point at.
+  const callerIsAppOwned = isSparkleAgentId(req.callerAgentId);
   let callerProjectId: string | null;
   let callerLabel: string;
   if (req.callerAgentId === CONCIERGE_CALLER_AGENT_ID) {
     const { projects, selectedProjectId } = useProjectStore.getState();
     callerProjectId = projects.find((p) => p.id === selectedProjectId)?.id ?? null;
     callerLabel = CONCIERGE_SELF_NAME;
-  } else if (isSparkleAgentId(req.callerAgentId)) {
+  } else if (callerIsAppOwned) {
     // THE APP-OWNED IMPROVE SPARKLE AGENT, special-cased BEFORE findAgent for the SAME reason the
     // concierge is: its id is a documented, stable address that is deliberately not a projectStore
     // roster row, so `findAgent` can never resolve it. Without this branch the agent the founder most
@@ -3499,7 +3506,7 @@ async function handleSendPeerMessage(req: ControlRequest): Promise<Record<string
   // `callerProjectId === null` whenever no project is selected (fresh install, or the last project
   // removed), and that caller would otherwise be handed the roster remedy it equally cannot follow.
   const callerIsProjectless =
-    callerProjectId === null || isSparkleAgentId(req.callerAgentId);
+    callerProjectId === null || callerIsAppOwned;
 
   const rawMessage = req.payload.message;
   const message = typeof rawMessage === "string" ? rawMessage.trim() : "";
@@ -3551,7 +3558,7 @@ async function handleSendPeerMessage(req: ControlRequest): Promise<Record<string
     // could message those rows carrying the trusted "Improve Sparkle" sender label. That id is
     // stamped from an env var on the SHARED control socket and is therefore claimable, so any roster
     // it can reach is a roster a forged stamp can reach (bead `sparkle-w04ess`).
-    const siblings = isSparkleAgentId(req.callerAgentId)
+    const siblings = callerIsAppOwned
       ? []
       : (useProjectStore.getState().projects.find((p) => p.id === callerProjectId)?.agents ?? []);
 
