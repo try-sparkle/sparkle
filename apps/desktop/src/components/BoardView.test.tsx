@@ -740,6 +740,46 @@ describe("BoardView", () => {
       };
     }
 
+    // ══ ITEM 19 — THE DOUBLE BORDER, COUNTED IN THE CHAIN THAT ACTUALLY HAS ONE ═══════════════
+    // The founder, screenshotting this very panel: [09:15] *"I know why we have we have, a double
+    // border around these I'm not sure why. We don't need that double border."* [09:41] *"So we can
+    // get rid of the double border. Just have one border."*
+    //
+    // It lived HERE and nowhere else: the overlay is a bordered, rounded, shadowed panel, and the
+    // card drew a second edge 20px inside it. `BeadCard/BeadCardChrome.test.tsx` pins the card's
+    // half (`chrome: "board"` paints no edge of its own); this pins the OTHER half — that the panel
+    // still paints one, so the chain has exactly ONE rather than none. Neither row alone can say
+    // that, because "one border" is a statement about a chain and a card mounted on its own has no
+    // chain to count.
+    it("draws exactly ONE border around the open card — the panel's, not a second one", () => {
+      overlaySnapshot();
+      const { container } = render(<BoardView project={project} side="right" />);
+      fireEvent.click(screen.getByText("Detailed task"));
+
+      // THE CARD IS REALLY OPEN before anything is counted — an empty tree has no borders either.
+      const card = screen.getByTestId("board-bead-card");
+      expect(screen.getByTestId("board-bead-card-title").textContent).toBe("Detailed task");
+      expect(screen.getByTestId("board-bead-card-meta")).toBeTruthy();
+
+      // Read the shorthand and the side longhands, never `border-*-style`: jsdom's cssstyle will
+      // not expand `border` when the colour is a `var()`, which every colour in this app is.
+      const painted = (el: HTMLElement) =>
+        [el.style.border, el.style.borderTop, el.style.borderRight, el.style.borderBottom, el.style.borderLeft]
+          .some((v) => v !== "" && v !== "none");
+
+      const bordered: HTMLElement[] = [];
+      for (let el: HTMLElement | null = card; el !== null; el = el.parentElement) {
+        if (painted(el)) bordered.push(el);
+        if (el === container) break;
+      }
+
+      expect(bordered).toHaveLength(1);
+      // …and the survivor is the PANEL, the dialog the user is looking at — not the card inside it.
+      expect(bordered[0]!.getAttribute("role")).toBe("dialog");
+      expect(bordered[0]!.contains(card)).toBe(true);
+      expect(bordered[0]).not.toBe(card);
+    });
+
     it("marks the panel as a dismissible surface, so Escape does not unbind the cable", () => {
       overlaySnapshot();
       render(<BoardView project={project} side="right" />);

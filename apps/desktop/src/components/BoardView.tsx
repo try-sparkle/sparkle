@@ -1,7 +1,6 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState, type MouseEvent } from "react";
 import { C, FONT_WEIGHT, MODAL_SHADOW, SCRIM } from "../theme/colors";
 import { PILL, RADIUS } from "../theme/scale";
-import { TAG } from "./labelTreatment";
 import type { Project } from "../types";
 import {
   epicIndexOf,
@@ -72,6 +71,7 @@ import { StageColumnHeader, DefineStageCta, definableStageKey, type DeliveryChip
 import { CardCriteria } from "./CardCriteria";
 import { BeadCard } from "./BeadCard/BeadCard";
 import { BeadPriorityChip } from "./BeadCard/BeadPriorityChip";
+import { EpicPill } from "./BeadCard/EpicPill";
 import { BeadSeverityBadge } from "./BeadCard/BeadSeverityBadge";
 import { useBeadBuildActions } from "./BeadCard/useBeadBuildActions";
 import { setBeadPriority } from "./BeadCard/beadPriority";
@@ -1265,35 +1265,6 @@ function Column({
   );
 }
 
-/**
- * The gold EPIC pill. The founder asked for GOLD, and the reason this cannot read `C.goldFill` is
- * that Blueprint retired gold: the four `gold*` tokens carry BLUE now, so a `goldFill` pill would
- * be blue-on-blue against the epic card and invisible. `epicPillFill` is the themed warm pair —
- * see the EPIC CARD block in theme/colors.ts for the measured contrast on both cards.
- */
-function EpicPill() {
-  return (
-    <span
-      data-testid="epic-pill"
-      // `TAG`, not a hand-rolled box. It already carries every value this needs — uppercase, the
-      // spec's 0.1em tracking, mono at TYPE.micro, RADIUS.sm — and two tree-wide ratchets
-      // (theme/scale.test.ts on off-scale fontSize, labelTreatment.test.ts on hand-typed
-      // letterSpacing) exist precisely to stop a new badge re-deriving them by eye. Both caught
-      // this pill's first draft.
-      //
-      // FILLED rather than outlined, so `tag(ink)` is the wrong helper: this is a solid identity
-      // badge, and its fill/ink pair is themed and measured in theme/epicCardContrast.test.ts.
-      style={{
-        ...TAG,
-        alignSelf: "flex-start",
-        background: C.epicPillFill,
-        color: C.onEpicPillFill,
-      }}
-    >
-      EPIC
-    </span>
-  );
-}
 
 /** "Contains N tasks" — N is the count of OPEN children, i.e. remaining work, not total work. */
 function ContainsTasks({

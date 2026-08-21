@@ -29,7 +29,7 @@ import { useEffect, useState, type CSSProperties, type ReactNode } from "react";
 import { FiExternalLink, FiMessageSquare, FiUsers, FiX } from "react-icons/fi";
 import { C, FONT_WEIGHT, ON_BRAND_FILL } from "../../theme/colors";
 import { FONT_MONO, FONT_UI, RADIUS, TYPE } from "../../theme/scale";
-import { severityOf, type Bead } from "../../services/beads";
+import { isTypedEpic, severityOf, type Bead } from "../../services/beads";
 import type { BeadComment } from "../../services/beadsCommands";
 import type { WorkflowStageId } from "../../engine/workflowStage";
 import type { EpicGoal, EpicGoalSource } from "../../engine/epicGoal";
@@ -38,6 +38,7 @@ import { PriorityPill } from "./PriorityPill";
 import { BeadSeverityBadge } from "./BeadSeverityBadge";
 import { CommentThread } from "./CommentThread";
 import { EpicCardGoal } from "./EpicCardGoal";
+import { EpicPill } from "./EpicPill";
 import { StageLine } from "./StageLine";
 import { stageLabel, statusDot } from "./beadStatus";
 
@@ -55,14 +56,60 @@ interface ChromeSpec {
   testId: string;
   surface: string;
   padding: string;
+  /**
+   * THE CARD'S OWN EDGE — the one shell property that genuinely differs per surface, because it
+   * describes what the card is MOUNTED IN rather than what it says.
+   *
+   * ══ THIS IS NOT THE `chrome` ESCAPE HATCH THE FILE HEADER FORBIDS ═══════════════════════════
+   * That rule is about CONTENT: a `chrome` that changed which fields or controls appear would be
+   * the drift this component was written to end. Surface colour and padding are already per-chrome
+   * for exactly this reason, and a border is the same kind of fact. Every field and every control
+   * below is still identical in all three.
+   *
+   * ══ WHY EACH VALUE IS WHAT IT IS ════════════════════════════════════════════════════════════
+   * • `board` — NONE. `BoardView`'s detail overlay is itself a bordered, rounded, shadowed panel
+   *   with 20px of padding, and this card drew a SECOND border 20px inside it. That is the
+   *   founder's item 19, screenshotted: [09:15] *"I know why we have we have, a double border
+   *   around these I'm not sure why. We don't need that double border."* [09:41] *"So we can get
+   *   rid of the double border. Just have one border."* The panel keeps its edge; the card drops
+   *   its own, so the chain has exactly one.
+   * • `concierge` — ALL FOUR SIDES, rounded. It mounts inline in a sentence with nothing around
+   *   it, so its own border is the only thing making it a card.
+   * • `epics` — THREE SIDES, SQUARE TOP. The card opens flush under its own row, and its
+   *   `border-top` was the hairline cutting the two same-coloured fills apart: items 20 and 21,
+   *   [12:55] *"the top of the card is rounded. But it shouldn't be rounded"* and [13:07]
+   *   *"there's a line in between the row and the card, it should just be solid."* Dropping the
+   *   top edge and squaring the top corners is one visual idea, not two — the open card reads as
+   *   a continuation of its row rather than a separate floating box.
+   *
+   * ══ THREE SIDES ARE SPELLED AS LONGHANDS, NOT `border` PLUS `borderTop: "none"` ═════════════
+   * The shorthand-then-override form is the shorter one and it is UNTESTABLE here: jsdom's
+   * cssstyle drops the override outright when the colour is a `var()` — which every colour in this
+   * app is — so the serialized style keeps all four sides and `border-top-style` reads empty
+   * either way. A test could then assert the top edge was gone against a card that still painted
+   * it. Naming the three sides that survive is both what we mean and what can be checked.
+   */
+  edge: CSSProperties;
   /** The concierge card IS the result of clicking a pill, so it announces itself. The board's is
    *  a panel the user navigated into and has nothing to announce. */
   role?: "status";
 }
 
 const CHROME: Record<BeadCardChrome, ChromeSpec> = {
-  board: { testId: "board-bead-card", surface: C.dialogSurface, padding: "16px 18px" },
-  concierge: { testId: "concierge-bead-card", surface: C.forest, padding: "10px 12px", role: "status" },
+  // NO BORDER: the detail overlay around it already is one. See `ChromeSpec.border`.
+  board: {
+    testId: "board-bead-card",
+    surface: C.dialogSurface,
+    padding: "16px 18px",
+    edge: {},
+  },
+  concierge: {
+    testId: "concierge-bead-card",
+    surface: C.forest,
+    padding: "10px 12px",
+    edge: { border: `1px solid ${C.hairline}`, borderRadius: RADIUS.modal },
+    role: "status",
+  },
   // THE EPICS COLUMN'S INLINE CARD. Same fields and same controls as the other two — a `chrome`
   // that changed WHAT is shown would be the drift this component exists to end — differing only in
   // the box: the column is ~280px, so it takes the concierge's tighter padding rather than the
@@ -71,7 +118,21 @@ const CHROME: Record<BeadCardChrome, ChromeSpec> = {
   //
   // `role: "status"` for the same reason the concierge has it: this card IS the result of clicking
   // the row above it, so it announces itself instead of appearing silently mid-list.
-  epics: { testId: "epics-bead-card", surface: C.epicCardFill, padding: "10px 12px", role: "status" },
+  epics: {
+    testId: "epics-bead-card",
+    surface: C.epicCardFill,
+    padding: "10px 12px",
+    // SQUARE-TOPPED AND OPEN AT THE TOP — the row above supplies that edge. The radius is
+    // COMPOSED from `RADIUS.modal` rather than typed as a literal, so theme/scale.test.ts's
+    // off-scale ratchet stays satisfied and a retune of the scale reaches here for free.
+    edge: {
+      borderRight: `1px solid ${C.hairline}`,
+      borderBottom: `1px solid ${C.hairline}`,
+      borderLeft: `1px solid ${C.hairline}`,
+      borderRadius: `0 0 ${RADIUS.modal}px ${RADIUS.modal}px`,
+    },
+    role: "status",
+  },
 };
 
 export interface BeadCardProps {
@@ -148,6 +209,25 @@ export interface BeadCardProps {
    */
   goal?: EpicGoal;
   onSetGoal?: (text: string, source: EpicGoalSource) => void | Promise<void>;
+  /**
+   * DRAW THE WORKFLOW PROGRESS LINE. Default `true`, which is every surface but one.
+   *
+   * ══ THE FOUNDER CALLED IT "THIS LITTLE BLUE BAR" AND ASKED FOR IT OFF THE EPIC CARD ═════════
+   * [13:17], reading the epics column's open card top to bottom: *"we don't wanna have this little
+   * blue bar here. Don't do that."* — his item 22, immediately after the two edges above it.
+   *
+   * ON THAT CARD IT IS ALSO REDUNDANT, which is why the reading is coherent rather than merely
+   * literal: the meta row directly above already names the stage in words, and the column is
+   * ~280px wide, so a full-bleed gradient rule plus its own repeated stage word is the same fact
+   * said twice in the narrowest place the app has to say it.
+   *
+   * ══ A PROP, NOT A BRANCH ON `chrome` ════════════════════════════════════════════════════════
+   * This file's header forbids `chrome` deciding what is SHOWN, and that rule is right: it is what
+   * let three drawings of one bead drift field by field. A caller-supplied switch keeps the
+   * decision where it belongs — the board's overlay can pass `false` tomorrow and get the same
+   * card — and is the same shape `goal`/`onSetGoal` and `onChat` already take.
+   */
+  showStageLine?: boolean;
   /** A sentence the caller wants under the controls — today, "that board could not be opened". */
   notice?: string;
   /** Bumped by the caller so a REPEAT of the same notice re-registers as a live-region update
@@ -190,6 +270,7 @@ export function BeadCard({
   prdEpicCount,
   comments,
   onComment,
+  showStageLine = true,
   notice,
   noticeKey,
 }: BeadCardProps) {
@@ -306,8 +387,7 @@ export function BeadCard({
         margin: chrome === "concierge" ? "6px 0" : undefined,
         padding: spec.padding,
         background: spec.surface,
-        border: `1px solid ${C.hairline}`,
-        borderRadius: RADIUS.modal,
+        ...spec.edge,
         fontFamily: FONT_UI,
         // The card carries prose, and a pill it may sit beside is `nowrap`.
         whiteSpace: "normal",
@@ -315,12 +395,191 @@ export function BeadCard({
         overflowWrap: "anywhere",
       }}
     >
-      {/* ── TITLE ROW ──────────────────────────────────────────────────────────────────────── */}
-      <span style={{ display: "flex", alignItems: "flex-start", gap: 8 }}>
+      {/* ── THE CHROME ROW — THE EPIC PILL TOP-LEFT, THE ID AND THE CONTROLS TOP-RIGHT ──────
+          The founder's layout, from the card as it looks CLOSED on the planning board: [08:42]
+          *"We have it above the title. So that should be above the title, and that's gonna work
+          well because when they say when it says epic there, we've got space in the top right,
+          and that's where the chat button and the bead ID are gonna go in the top right. And then
+          in the top left, it'll say epic."* [10:08] *"it should look the same when it's open as
+          it does when it's closed."*
+
+          SO THE TITLE MOVES DOWN A LINE, which is also his: [05:44] *"that would mean that the
+          title is gonna go down one row."* Nothing here is gated on `chrome` — the board's
+          expanded epic gets the identical corner, which is the whole point of one component. */}
+      <span data-testid={`${t}-chrome`} style={{ display: "flex", alignItems: "center", gap: 8 }}>
+        {/* THE PILL IS DRAWN FROM THE BEAD, NOT FROM THE SURFACE. The board's collapsed card
+            renders this same component from the same test, so the two cannot drift about what an
+            epic looks like — see `BeadCard/EpicPill.tsx` for why it was extracted.
+
+            `isTypedEpic`, never a hand-written comparison against the type field: "epic" has had
+            three competing meanings in this codebase and `services/beads.ts` is the one place
+            allowed to say which is meant. `epic-membership-guard.sh` enforces that, and it is
+            asking the right question here — this badge is about what the bead was DECLARED to be,
+            not about what it contains, which is `isEpic`'s question instead.
+
+            THE LITERAL IS SPELLED AROUND ON PURPOSE. That guard greps line-wise and does not skip
+            comments, so quoting the idiom in prose here fails the build — the same trap
+            `EpicsColumn.tsx` records for `labelTreatment.test.ts`'s ratchet. */}
+        {isTypedEpic(bead) && <EpicPill testId={`${t}-epic-pill`} />}
+        {/* THE SPACER IS THE WHOLE LAYOUT. It takes the slack, so the cluster is pinned right and
+            the pill left with no positioning and no `justify-content` fighting a wrapped pill.
+            `aria-hidden` because it says nothing. */}
+        <span aria-hidden style={{ flex: 1, minWidth: 0 }} />
+        {/* ID FIRST, THEN CHAT — [09:52] *"chat would go to the right. The SparkLE ID would go to
+            the left of chat."* Source order IS render order in a row flex container, so this is
+            the assertion `BeadCardChrome.test.tsx` pins: the id node precedes the chat node.
+
+            THE CLOSE BUTTON IS STILL HERE, DELIBERATELY. [07:51] has it moving up into the epic
+            ROW, where the `6/6` count sits when collapsed — that lands in `EpicsColumn.tsx`'s
+            `EpicRow`, which another branch is rewriting right now, so it is deferred rather than
+            raced. */}
+        {/* ══ IT MUST BE ABLE TO GIVE GROUND ═══════════════════════════════════════════════════
+            `flex: "0 1 auto"` + `minWidth: 0`, NOT `0 0 auto`. This cluster carries the id plus up
+            to three buttons — the concierge supplies all three at once — and its intrinsic width is
+            roughly 300px. The epics column is ~280px and the concierge column is user-resizable
+            down to `CONCIERGE_MIN_WIDTH`, so a cluster that cannot shrink pushes itself straight
+            through the card's padding box and past its border: the row's only other flexible item
+            is the zero-content spacer, and the card's `overflowWrap: "anywhere"` does not apply to
+            a `nowrap` span. The id absorbs the squeeze (it ellipsizes below) while every BUTTON
+            keeps `flex: "0 0 auto"` and stays pressable — the right priority, since the id is a
+            handle you copy and the buttons are the only way out of the card.
+
+            jsdom has no layout engine, so nothing here can be caught by rendering it; the test
+            pins the style values instead, which is what the app's other narrow-column components
+            do for the same reason. */}
+        <span
+          data-testid={`${t}-corner`}
+          style={{ display: "flex", alignItems: "center", gap: 6, flex: "0 1 auto", minWidth: 0 }}
+        >
+          {/* ── THE ID ───────────────────────────────────────────────────────────────────
+              MONO AND SMALL, in the corner. Mono because a bead id is what the founder types,
+              greps and asks other agents about — [05:30] *"It can be that career style font
+              that's fine"*, his rendering of "courier". `TYPE.micro` because he asked for it
+              SMALLER than it was: [05:17] *"make it smaller font size, make it the same font
+              size as the word open is."* It sat on a line of its own under the title at
+              `TYPE.small`; it is now the left half of the top-right cluster. */}
+          <span
+            data-testid={`${t}-id`}
+            style={{
+              color: C.muted,
+              opacity: 0.8,
+              fontSize: TYPE.micro,
+              fontFamily: FONT_MONO,
+              // TRUNCATES RATHER THAN PUSHING. `nowrap` keeps the id on one line (it is a handle,
+              // not prose, and a wrapped `sparkle-huw924.5` is unreadable); these three are what
+              // stop that line from being a battering ram against the controls beside it.
+              whiteSpace: "nowrap",
+              minWidth: 0,
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+            }}
+          >
+            {bead.id}
+          </span>
+          {onChat !== undefined && (
+            // ══ THE BLUE IS BUILD IT'S BLUE, THE METRICS ARE THE TITLE ROW'S ═════════════════════
+            // `C.teal` / `ON_BRAND_FILL` / `border: none` / `RADIUS.modal` are lifted verbatim from
+            // the Build It button below, because the founder asked for "the same blue as Build It"
+            // and a second near-teal would read as a different kind of action. Everything else is
+            // this ROW's scale — the compact padding and `TYPE.small` its two neighbours use — so it
+            // reads as a corner control rather than a second call-to-action shouting over the title.
+            //
+            // NO POSITIONING. The chrome row's spacer is `flex: 1`, so `flex: "0 0 auto"` is the
+            // whole layout: the spacer takes the slack and this lands top-right. Absolute
+            // positioning here would overlap the title, which now sits on the line below and is a
+            // sentence long in the common case.
+            //
+            // NOT GATED ON `buildBusy`. That flag exists because ONE shared flag made a priority save
+            // relabel the primary action to "Building…" (see the two-busy-flags note above); handing
+            // a draft to the composer is synchronous and starts nothing, so it has no busy state of
+            // its own to add and no business reading anyone else's.
+            <button
+              type="button"
+              data-testid={`${t}-chat`}
+              onClick={onChat}
+              title="Chat with Sparkle about this bead — starts a message that references it"
+              style={{
+                flex: "0 0 auto",
+                display: "inline-flex",
+                alignItems: "center",
+                gap: 4,
+                background: C.teal,
+                color: ON_BRAND_FILL,
+                border: "none",
+                borderRadius: RADIUS.modal,
+                cursor: "pointer",
+                padding: "2px 8px",
+                fontFamily: FONT_UI,
+                fontSize: TYPE.small,
+                lineHeight: 1.4,
+              }}
+            >
+              <FiMessageSquare size={12} aria-hidden />
+              Chat
+            </button>
+          )}
+          {onViewOnBoard !== undefined && (
+            // A BUTTON, not a fake link. It was an underlined `accentInk` run — which reads as
+            // navigation to somewhere else on the page and is the founder's item 3. It performs an
+            // action inside the app, so it is drawn as the control it is.
+            <button
+              type="button"
+              data-testid={`${t}-view-on-board`}
+              onClick={onViewOnBoard}
+              title="Open the Plan board focused on this card"
+              style={{
+                flex: "0 0 auto",
+                display: "inline-flex",
+                alignItems: "center",
+                gap: 4,
+                background: "transparent",
+                border: `1px solid ${C.hairline}`,
+                borderRadius: RADIUS.input,
+                color: C.accentInk,
+                cursor: "pointer",
+                padding: "2px 8px",
+                fontFamily: FONT_UI,
+                fontSize: TYPE.small,
+                lineHeight: 1.4,
+              }}
+            >
+              <FiExternalLink size={12} aria-hidden />
+              View on board
+            </button>
+          )}
+          {onClose !== undefined && (
+            <button
+              type="button"
+              data-testid={`${t}-close`}
+              aria-label="Close"
+              title="Close"
+              onClick={onClose}
+              style={{
+                flex: "0 0 auto",
+                display: "inline-flex",
+                alignItems: "center",
+                background: "transparent",
+                border: `1px solid ${C.hairline}`,
+                borderRadius: RADIUS.input,
+                color: C.muted,
+                cursor: "pointer",
+                padding: "2px 8px",
+                fontFamily: FONT_UI,
+                fontSize: TYPE.small,
+                lineHeight: 1.4,
+              }}
+            >
+              <FiX size={13} aria-hidden />
+            </button>
+          )}
+        </span>
+      </span>
+
+      {/* ── TITLE ─────────────────────────────────────────────────────────────────────────── */}
         <span
           data-testid={`${t}-title`}
           style={{
-            flex: 1,
+            display: "block",
             minWidth: 0,
             color: C.cream,
             fontWeight: FONT_WEIGHT.semibold,
@@ -330,103 +589,6 @@ export function BeadCard({
         >
           {bead.title || bead.id}
         </span>
-        {onChat !== undefined && (
-          // ══ THE BLUE IS BUILD IT'S BLUE, THE METRICS ARE THE TITLE ROW'S ═════════════════════
-          // `C.teal` / `ON_BRAND_FILL` / `border: none` / `RADIUS.modal` are lifted verbatim from
-          // the Build It button below, because the founder asked for "the same blue as Build It"
-          // and a second near-teal would read as a different kind of action. Everything else is
-          // this ROW's scale — the compact padding and `TYPE.small` its two neighbours use — so it
-          // reads as a corner control rather than a second call-to-action shouting over the title.
-          //
-          // NO POSITIONING. The title span beside it is `flex: 1`, so `flex: "0 0 auto"` is the
-          // whole layout: the title takes the slack and this lands top-right. Absolute positioning
-          // here would overlap a wrapped title, which is the common case (bead titles are
-          // sentences).
-          //
-          // NOT GATED ON `buildBusy`. That flag exists because ONE shared flag made a priority save
-          // relabel the primary action to "Building…" (see the two-busy-flags note above); handing
-          // a draft to the composer is synchronous and starts nothing, so it has no busy state of
-          // its own to add and no business reading anyone else's.
-          <button
-            type="button"
-            data-testid={`${t}-chat`}
-            onClick={onChat}
-            title="Chat with Sparkle about this bead — starts a message that references it"
-            style={{
-              flex: "0 0 auto",
-              display: "inline-flex",
-              alignItems: "center",
-              gap: 4,
-              background: C.teal,
-              color: ON_BRAND_FILL,
-              border: "none",
-              borderRadius: RADIUS.modal,
-              cursor: "pointer",
-              padding: "2px 8px",
-              fontFamily: FONT_UI,
-              fontSize: TYPE.small,
-              lineHeight: 1.4,
-            }}
-          >
-            <FiMessageSquare size={12} aria-hidden />
-            Chat
-          </button>
-        )}
-        {onViewOnBoard !== undefined && (
-          // A BUTTON, not a fake link. It was an underlined `accentInk` run — which reads as
-          // navigation to somewhere else on the page and is the founder's item 3. It performs an
-          // action inside the app, so it is drawn as the control it is.
-          <button
-            type="button"
-            data-testid={`${t}-view-on-board`}
-            onClick={onViewOnBoard}
-            title="Open the Plan board focused on this card"
-            style={{
-              flex: "0 0 auto",
-              display: "inline-flex",
-              alignItems: "center",
-              gap: 4,
-              background: "transparent",
-              border: `1px solid ${C.hairline}`,
-              borderRadius: RADIUS.input,
-              color: C.accentInk,
-              cursor: "pointer",
-              padding: "2px 8px",
-              fontFamily: FONT_UI,
-              fontSize: TYPE.small,
-              lineHeight: 1.4,
-            }}
-          >
-            <FiExternalLink size={12} aria-hidden />
-            View on board
-          </button>
-        )}
-        {onClose !== undefined && (
-          <button
-            type="button"
-            data-testid={`${t}-close`}
-            aria-label="Close"
-            title="Close"
-            onClick={onClose}
-            style={{
-              flex: "0 0 auto",
-              display: "inline-flex",
-              alignItems: "center",
-              background: "transparent",
-              border: `1px solid ${C.hairline}`,
-              borderRadius: RADIUS.input,
-              color: C.muted,
-              cursor: "pointer",
-              padding: "2px 8px",
-              fontFamily: FONT_UI,
-              fontSize: TYPE.small,
-              lineHeight: 1.4,
-            }}
-          >
-            <FiX size={13} aria-hidden />
-          </button>
-        )}
-      </span>
 
       {/* ── THE GOAL ───────────────────────────────────────────────────────────────────────────
           DIRECTLY UNDER THE TITLE, which is where the founder put it: [05:44] "the title is gonna
@@ -439,22 +601,6 @@ export function BeadCard({
       {onSetGoal !== undefined && (
         <EpicCardGoal goal={goal} onSetGoal={onSetGoal} testId={t} />
       )}
-
-      {/* ── THE ID ─────────────────────────────────────────────────────────────────────────────
-          Mono, because a bead id is what the founder types, greps and asks other agents about. The
-          concierge card had no id line at all, which made it the one surface where the handle you
-          would quote was missing. */}
-      <span
-        data-testid={`${t}-id`}
-        style={block({
-          color: C.muted,
-          opacity: 0.8,
-          fontSize: TYPE.small,
-          fontFamily: FONT_MONO,
-        })}
-      >
-        {bead.id}
-      </span>
 
       {/* ── META ─────────────────────────────────────────────────────────────────────────────── */}
       <span
@@ -474,8 +620,8 @@ export function BeadCard({
       {/* ── THE STATUS LINE — THE POINT OF THE WHOLE COMPONENT ────────────────────────────────
           The founder screenshotted this on the CLOSED board card and asked why it disappears when
           the card opens. It is the answer to "how far along is this?", and it now sits on every
-          surface that draws a bead. */}
-      <StageLine stage={stage} height={3} testId={`${t}-stage`} />
+          surface that draws a bead — bar one, which asked for it off by name: see `showStageLine`. */}
+      {showStageLine && <StageLine stage={stage} height={3} testId={`${t}-stage`} />}
 
       {/* ── DESCRIPTION — THE ONLY THING THAT SCROLLS ────────────────────────────────────────── */}
       {bead.description !== "" && (

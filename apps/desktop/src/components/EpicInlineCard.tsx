@@ -24,6 +24,7 @@ import { useEffect, useState } from "react";
 import { useShallow } from "zustand/react/shallow";
 import { BeadCard } from "./BeadCard/BeadCard";
 import { beadsComment, beadsDetail, type BeadComment } from "../services/beadsCommands";
+import { dispatchBeadChat } from "../services/beadChat";
 import { beadStage, workersInEpic } from "../services/planView";
 import { DELIVERED_LABEL, isEpic, type Bead } from "../services/beads";
 import { setBeadPriority } from "./BeadCard/beadPriority";
@@ -130,7 +131,20 @@ export function EpicInlineCard({
         // CAPPED, unlike the board's overlay. That panel is its own scroller; this card sits inside
         // the column's list, so an uncapped description would push the whole ladder off screen.
         descMaxHeight={160}
+        // NO BLUE BAR ON THIS CARD — the founder's item 22, [13:17] *"we don't wanna have this
+        // little blue bar here."* The switch is a prop rather than a branch inside `BeadCard`, so
+        // this surface owns the decision and no other card is changed by it; see `showStageLine`.
+        showStageLine={false}
         onClose={onClose}
+        // THE CHAT BUTTON, [07:30] *"We're also missing a chat button."* Bound HERE rather than
+        // threaded down from `Workspace` through `EpicsColumn`, which is exactly what the
+        // concierge's `BeadPill` does (`dispatchBeadChat(bead, projectId)`) and for the same
+        // reason: this card already holds both arguments, and the callback `BeadCard` takes is a
+        // bare `() => void` that never learns what a bead chat is addressed by.
+        //
+        // GATED ON `canWrite` for the same reason every other control here is: `dispatchBeadChat`
+        // writes a draft addressed to this project, and a card with no project path is read-only.
+        onChat={canWrite ? () => dispatchBeadChat(bead, projectId) : undefined}
         // ONLY FOR AN EPIC, and gated on being able to WRITE. `canWrite` is the same `rootPath`
         // test every other control here takes: a card with no project path shows a read-only bead
         // rather than a field whose save can only fail.

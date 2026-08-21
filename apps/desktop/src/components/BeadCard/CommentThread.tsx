@@ -17,12 +17,38 @@ import type { BeadComment } from "../../services/beadsCommands";
 
 const block = (extra: CSSProperties = {}): CSSProperties => ({ display: "block", ...extra });
 
-/** Format a comment's ISO timestamp for the thread. Null (a comment with no recorded time) shows
- *  nothing rather than "Invalid Date". Pure; date only — the thread does not need minutes. */
-function when(createdAt: string | null): string {
+const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+/**
+ * Format a comment's ISO timestamp as `Aug 20, 2026 at 10:14 AM`.
+ *
+ * ══ THE TIME IS THE POINT ══════════════════════════════════════════════════════════════════════
+ * This returned a bare `2026-08-20` and the founder asked for the clock back, having just watched
+ * his own comment take ten seconds to appear: [11:28] *"We should have the time. So instead of the
+ * date being the way that it is, it should be, like, a u g space twenty space twenty twenty six at
+ * 10:14AM or whatever."* On a thread where humans and agents interleave, the date alone cannot
+ * order two comments made the same afternoon — which is most of them.
+ *
+ * ══ WHY THIS IS SPELLED OUT RATHER THAN `toLocaleString` ═══════════════════════════════════════
+ * Two reasons, and the second is the one that bites. `Intl` renders the day period separated by a
+ * NARROW NO-BREAK SPACE (U+202F) in current ICU, so a test asserting the founder's format with an
+ * ordinary space fails on a string that LOOKS identical in every log and diff. And the exact shape
+ * he asked for — the comma, the word "at" — is not any locale's default anyway, so a format
+ * argument would have to be reassembled by hand regardless.
+ *
+ * LOCAL TIME, deliberately: `getHours` and friends read the reader's own clock, which is the one
+ * "ten seconds ago" is measured against. Null (a comment with no recorded time) and an unparseable
+ * value both show NOTHING rather than "Invalid Date". Pure.
+ */
+export function when(createdAt: string | null): string {
   if (createdAt === null) return "";
   const d = new Date(createdAt);
-  return Number.isNaN(d.getTime()) ? "" : d.toISOString().slice(0, 10);
+  if (Number.isNaN(d.getTime())) return "";
+  const h24 = d.getHours();
+  const hour = h24 % 12 === 0 ? 12 : h24 % 12;
+  const minute = String(d.getMinutes()).padStart(2, "0");
+  const period = h24 < 12 ? "AM" : "PM";
+  return `${MONTHS[d.getMonth()]} ${d.getDate()}, ${d.getFullYear()} at ${hour}:${minute} ${period}`;
 }
 
 export function CommentThread({
@@ -136,7 +162,14 @@ export function CommentThread({
               lineHeight: 1.4,
             }}
           />
-          <span style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          {/* BOTTOM RIGHT, not bottom left — [11:06] *"Let's put the comments button bottom right
+              instead of bottom left."* `justifyContent: "flex-end"` on the row rather than a margin
+              on the button, so the row keeps working when the error or a second control joins it.
+              The button itself stays `flex: "0 0 auto"`: it must not stretch to the full width. */}
+          <span
+            data-testid={`${testId}-submit-row`}
+            style={{ display: "flex", alignItems: "center", justifyContent: "flex-end", gap: 8 }}
+          >
             <button
               type="button"
               data-testid={`${testId}-submit`}

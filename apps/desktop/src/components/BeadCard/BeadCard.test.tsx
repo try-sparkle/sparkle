@@ -492,18 +492,29 @@ describe("BeadCard — the Chat button", () => {
     expect(onViewOnBoard).not.toHaveBeenCalled();
   });
 
-  // TOP RIGHT, and LEFTMOST of the corner controls — the founder asked for a position, so the
-  // position is the assertion. The title span is `flex: 1`, so DOM order after it IS the visual
-  // order along the row; jsdom has no layout, so an x-coordinate assertion would be theatre
-  // (every rect here is zeroes).
-  it("sits in the title row, after the title and before View on board", () => {
+  // ══ TOP RIGHT, AND SECOND IN THE CORNER — THE ID IS NOW WHAT IT FOLLOWS ══════════════════════
+  // This row used to read "after the TITLE and before View on board", because the chat button and
+  // the title shared one flex row. They no longer do: the founder moved the id up beside the
+  // controls and the title down a line — [09:52] *"chat would go to the right. The SparkLE ID
+  // would go to the left of chat"*, [05:44] *"the title is gonna go down one row"* (bead
+  // `sparkle-huw924.5`). The INTENT is unchanged and is still the whole point of the row — the
+  // founder asked for a position, so the position is the assertion — but the neighbour it is
+  // measured against moved, so measuring against the title now asks a question with no answer.
+  //
+  // The corner span is the row, and DOM order inside it IS the visual order along it. jsdom has no
+  // layout, so an x-coordinate assertion would be theatre (every rect here is zeroes).
+  it("sits in the corner cluster, after the id and before View on board", () => {
     mount({ onChat: vi.fn(), onViewOnBoard: vi.fn(), onClose: vi.fn() });
-    const row = screen.getByTestId(`${t}-title`).parentElement!;
-    const kids = Array.from(row.children);
+    const corner = screen.getByTestId(`${t}-corner`);
+    const kids = Array.from(corner.children);
     const at = (id: string) => kids.indexOf(screen.getByTestId(`${t}-${id}`));
-    expect(at("chat")).toBeGreaterThan(kids.indexOf(screen.getByTestId(`${t}-title`)));
+
+    expect(at("chat")).toBeGreaterThan(at("id"));
     expect(at("chat")).toBeLessThan(at("view-on-board"));
     expect(at("view-on-board")).toBeLessThan(at("close"));
+    // Every one of them is really IN this cluster — `indexOf` returns -1 for a node that is not a
+    // child, and -1 satisfies two of the three comparisons above on its own.
+    for (const id of ["id", "chat", "view-on-board", "close"]) expect(at(id)).toBeGreaterThan(-1);
   });
 
   // "THE SAME BLUE AS BUILD IT" — asserted against the Build It button rendered in the SAME tree,
