@@ -24,6 +24,13 @@ import {
   parseGoalVerify,
   type GoalVerify,
   type GoalVerifyEvidence,
+  // ONE list of scope names for all three surfaces (roborev 66300). This union, mcp-control's
+  // `StateScope`, and the `z.enum` that decides what the tool ACCEPTS were three hand-written
+  // copies. They drifted: the desktop grew "fleet", the enum did not, and an agent following a
+  // description we wrote got a zod failure. A guard over descriptions cannot catch that — the
+  // description drift was the downstream symptom, not the cause — so the lists are shared instead.
+  type StateScope as CoreStateScope,
+  isStateScope,
 } from "@sparkle/core";
 import { safeUnlisten } from "./safeUnlisten";
 import { startControlBridge, controlRespond } from "./orchestrationLaunch";
@@ -849,25 +856,28 @@ function notYours(
  *  builder produces both, so a name read here always resolves there. An unresolvable caller gets an
  *  EMPTY roster rather than the full one: this scope is the project boundary made readable, so
  *  failing open would turn a read into a cross-project enumeration oracle. */
-export type StateScope = "self" | "active" | "all" | "project" | "fleet";
+export type StateScope = CoreStateScope;
 
 /** Coerce the caller-supplied `scope` to a known value, defaulting to the cheap one. Unknown or
  *  non-string input falls back to "active" rather than erroring: the MCP layer already rejects a
  *  bad enum, so anything odd arriving here is a misbehaving client, and quietly serving it the
  *  narrow (safe, cheap) roster beats failing a read op. */
-function resolveScope(raw: unknown): StateScope {
-  return raw === "self" ||
-    raw === "all" ||
-    raw === "active" ||
-    raw === "project" ||
-    raw === "fleet"
-    ? raw
-    : "active";
+export function resolveScope(raw: unknown): StateScope {
+  // READS `STATE_SCOPES`, never a hand-written chain (roborev 66302/66304). Equality-narrowing only
+  // makes the compiler catch REMOVALS from the list; ADDITIONS are silent — add a sixth scope and the
+  // `z.enum` accepts it, the type admits it, a description may name it, and this would fall through
+  // to "active", serving a roster the caller never asked for with every suite green. That has a
+  // widening flavour too: a future NARROW scope silently downgrading to "active" hands back rows
+  // outside the very boundary it was introduced to draw.
+  return typeof raw === "string" && isStateScope(raw) ? raw : "active";
 }
 
 /** Max ids reported in `omittedIds`. The field is a convenience for resolving a specific dropped
  *  agent, not a second roster — left unbounded it would grow with the dormant-tab backlog and give
- *  back the context cost the scope was added to remove. `omitted` remains the exact count. */
+ *  back the context cost the scope was added to remove. This CAP does not change `omitted`; what
+ *  `omitted` means per scope is stated once in `OMITTED_CONTRACT` (`@sparkle/core`) and deliberately
+ *  not paraphrased here. This comment previously asserted the absolute, which is wrong for the two
+ *  scopes that hard-code 0 below. */
 const OMITTED_IDS_CAP = 20;
 
 /** How much this window actually KNOWS about a row's status — reported per agent alongside `status`.
@@ -1470,11 +1480,13 @@ function handleGetState(req: ControlRequest): {
   });
   const omittedAll = all.filter((a) => !agents.includes(a)).map((a) => a.id);
   // `omittedIds` exists so a caller can resolve a SPECIFIC dropped agent instead of re-reading the
-  // whole roster — which only makes sense for "active". Under "self" the caller asked for exactly
-  // one agent, so every other agent is "omitted": on the motivating 57-agent roster that would ship
+  // whole roster — which only makes sense for "active". Under "self" the caller asked for a single
+  // agent, so every other agent is dropped: on the motivating 57-agent roster that would ship
   // 56 ids (~600 permanently-resident tokens) back to the scope that is supposed to be nearly free.
-  // Capped as well, so the field can never grow with the dormant-tab backlog; `omitted` stays the
-  // EXACT count either way, so the truncation is always visible. roborev #53441.
+  // Capped as well, so the field can never grow with the dormant-tab backlog. That CAP is not what
+  // decides the reported value — `OMITTED_CONTRACT` (`@sparkle/core`) is the one statement of what
+  // this field means per scope, and `scopedOmitted` below hard-codes 0 for "project" exactly as the
+  // "fleet" branch does. Deliberately not restated here. roborev #53441.
   const omittedIds = scope === "active" ? omittedAll.slice(0, OMITTED_IDS_CAP) : [];
   // SCOPE "project" MUST NOT COUNT WHAT IT REFUSED TO SHOW. `totalAgents`/`omitted` are honest
   // book-keeping for every other scope — they exist so a truncated roster does not read as "that's
@@ -3378,6 +3390,26 @@ const NO_SUCH_PEER =
   "no agent by that id or name is working in your project — read the roster with " +
   "get_state({ scope: 'project' }), which lists exactly the agents you may message";
 
+/** The same refusal for a caller that HAS no project (roborev 66018/66483).
+ *
+ *  WHICH CALLERS: Improve Sparkle, whose `sparkle-self` namespace is not a user project, AND the
+ *  concierge whenever no project is selected (fresh install, or the last project removed). The name
+ *  says `APP_OWNED` for continuity, but the SELECTOR is keyed on the property — `callerProjectId ===
+ *  null || isSparkleAgentId(...)` — because keying it on identity left the project-less concierge
+ *  holding the remedy it equally cannot follow.
+ *
+ *  The string above is not merely inaccurate for such a caller — its remedy is one it CANNOT FOLLOW. `get_state({ scope: 'project' })` returns an EMPTY roster for an agent with no
+ *  project row, so following it reads as "there is no one to talk to" and sends the agent back to its
+ *  human. That is the exact failure this work exists to end, reintroduced by a help string. Point at
+ *  the directory that does list what it may address. The anti-oracle property is unaffected: this
+ *  names no agent and is chosen by the CALLER's shape, never by whether the target happened to
+ *  exist. */
+const NO_SUCH_PEER_APP_OWNED =
+  "no agent by that id or name is addressable from here — you belong to no project, so " +
+  "get_state({ scope: 'project' }) is empty for you. Read get_state({ scope: 'fleet' }), which " +
+  "lists exactly the agents you may message; content for an ordinary build agent belongs in a bead " +
+  "comment that @mentions it, not here";
+
 /** The two APP-GLOBAL addressees, resolved OUTSIDE the project boundary (bead sparkle-179b2s).
  *
  *  The project boundary is the right default — an agent messages its own siblings — but two ids are
@@ -3426,6 +3458,7 @@ async function handleSendPeerMessage(req: ControlRequest): Promise<Record<string
   //
   // AN UNRESOLVABLE CALLER still fails closed: it has no project, and "no project" must never widen to
   // "all projects", so this refuses rather than searching everywhere.
+  //
   let callerProjectId: string | null;
   let callerLabel: string;
   if (req.callerAgentId === CONCIERGE_CALLER_AGENT_ID) {
@@ -3455,6 +3488,19 @@ async function handleSendPeerMessage(req: ControlRequest): Promise<Record<string
     callerLabel = peerLabel(agentDisplayName(caller.agent), req.callerAgentId);
   }
 
+  // WHICH REFUSAL COPY THIS CALLER CAN ACT ON. Improve Sparkle belongs to the app-owned
+  // `sparkle-self` namespace rather than a user project, so `get_state({ scope: "project" })` comes
+  // back EMPTY for it — and the stock remedy tells it to read exactly that. Following the advice
+  // would read as "there is no one to talk to" and send it back to its human, which is the failure
+  // this channel exists to remove, reintroduced by a help string. The anti-oracle property is
+  // untouched: this is chosen by WHO IS CALLING, never by whether the target happened to exist.
+  //
+  // KEYED ON THE PROPERTY, NOT THE IDENTITY (roborev 66483). The concierge branch above also yields
+  // `callerProjectId === null` whenever no project is selected (fresh install, or the last project
+  // removed), and that caller would otherwise be handed the roster remedy it equally cannot follow.
+  const callerIsProjectless =
+    callerProjectId === null || isSparkleAgentId(req.callerAgentId);
+
   const rawMessage = req.payload.message;
   const message = typeof rawMessage === "string" ? rawMessage.trim() : "";
   if (!message) {
@@ -3475,7 +3521,8 @@ async function handleSendPeerMessage(req: ControlRequest): Promise<Record<string
   const to = typeof rawTo === "string" ? rawTo.trim() : "";
   // An absent or non-string `to` names no agent in the caller's project, which is precisely what
   // `not_in_project` means. Reusing it keeps the refusal vocabulary the frozen one.
-  if (!to) return peerRefusal("not_in_project", NO_SUCH_PEER);
+  const noSuchPeer = callerIsProjectless ? NO_SUCH_PEER_APP_OWNED : NO_SUCH_PEER;
+  if (!to) return peerRefusal("not_in_project", noSuchPeer);
 
   // THE TWO APP-GLOBAL ADDRESSEES FIRST (bead sparkle-179b2s). The concierge and Improve Sparkle are
   // not project rows, so the project-scoped resolution below can never find them; they resolve
@@ -3497,8 +3544,16 @@ async function handleSendPeerMessage(req: ControlRequest): Promise<Record<string
     // RESOLUTION NEVER LEAVES THE CALLER'S PROJECT — the candidate list is built from it, rather than
     // searching globally and rejecting afterwards. A global search that filters late is one early
     // `return` away from leaking, and this way there is nothing to leak.
-    const siblings =
-      useProjectStore.getState().projects.find((p) => p.id === callerProjectId)?.agents ?? [];
+    // AN APP-OWNED CALLER SEARCHES NO ROSTER, EXPLICITLY (roborev 66483). Relying on "no project
+    // carries the id `sparkle-self`" is an incidental property, not a guarantee — this very file
+    // looks that project up and handles it EXISTING (`selfIdentity`, and a test that registers one).
+    // Should one be registered, `siblings` becomes non-empty and a caller stamped `__sparkle_self__`
+    // could message those rows carrying the trusted "Improve Sparkle" sender label. That id is
+    // stamped from an env var on the SHARED control socket and is therefore claimable, so any roster
+    // it can reach is a roster a forged stamp can reach (bead `sparkle-w04ess`).
+    const siblings = isSparkleAgentId(req.callerAgentId)
+      ? []
+      : (useProjectStore.getState().projects.find((p) => p.id === callerProjectId)?.agents ?? []);
 
     // Exact id first, then a UNIQUE display-name match — the same name the roster prints, so a name
     // read from get_state({ scope: "project" }) always resolves here. The RULE lives in
@@ -3520,7 +3575,7 @@ async function handleSendPeerMessage(req: ControlRequest): Promise<Record<string
     // project's agents and nothing else, so it cannot distinguish "no such agent" from "exists, but
     // elsewhere" — and NO_SUCH_PEER must keep merging the two, or sweeping ids through this op reads
     // back which ones exist in other projects. There is nothing here for a new variant to leak.
-    if (resolved.kind !== "ok") return peerRefusal("not_in_project", NO_SUCH_PEER);
+    if (resolved.kind !== "ok") return peerRefusal("not_in_project", noSuchPeer);
     targetId = resolved.id;
     targetName = resolved.name;
   }
@@ -3572,7 +3627,51 @@ async function handleSendPeerMessage(req: ControlRequest): Promise<Record<string
     // inbox" is actionable and "send failed" is not.
     return peerRefusal("send_failed", errMsg(e));
   }
-  return { ok: true, messageId, to: { id: targetId, name: targetName } };
+  // AN ENQUEUE RECEIPT, NOT A DELIVERY RECEIPT (bead `sparkle-0fm9ke`, reprising `sparkle-ei7keg`).
+  // This used to answer a bare `{ ok, messageId, to }`, which carried no field that could ever have
+  // been FALSE — "an enqueue receipt wearing a delivery receipt's clothes", in the words of
+  // `conciergeTools/fleet.inboxSend`, which learned this the expensive way: an id looks like proof,
+  // `ok: true` looks like success, and the caller is a language model whose very next act is to tell
+  // a human what it did. It told the founder seven instructions were delivered; five reached nobody.
+  //
+  // `ok` is still honest and is not the lie being fixed: the ENQUEUE really happened, and `enqueue`
+  // reads the record back before returning an id, so a failed queue write is already a refusal. What
+  // `ok` never meant — and now cannot be misread as meaning — is that an agent has SEEN the text.
+  // `verifyArgs` is the "did it actually land?" question pre-filled, because a receipt that says
+  // "this is unconfirmed" without saying how to confirm it only relocates the problem to the caller.
+  //
+  // Additive: `docs/agent-peer-messaging.md` §1 froze `{ ok, messageId, to }` and every one of those
+  // fields still means exactly what it did.
+  return {
+    ok: true,
+    messageId,
+    to: { id: targetId, name: targetName },
+    state: "queued",
+    delivered: false,
+    // THE POINTER MUST BE FOLLOWABLE BY WHOEVER IS HOLDING IT (roborev 66025, finding 2).
+    //
+    // `fleet.inbox_status` lives behind `sparkle_fleet` -> `concierge_tool`, and `handleConciergeTool`
+    // refuses every caller that is not `CONCIERGE_CALLER_AGENT_ID` with `code: "forbidden"`. There is
+    // no inbox op in `CONTROL_OP_TIERS` at all, so an ordinary agent — and Improve Sparkle, the
+    // caller this whole branch exists to enable — has NO way to read inbox status. Handing it that
+    // pointer anyway would reprise the exact defect this work deletes: a remedy naming a channel the
+    // reader cannot use, which `server.ts` states as "a tool whose only possible reply to THIS caller
+    // is a refusal is worse than an absent one".
+    //
+    // So the pointer is `null` for an agent, and the tool description says what that means: arrival
+    // cannot be confirmed from your surface, so do not report the message as delivered. That is a
+    // real gap in the surface rather than a wording problem — tracked as `sparkle-12fq4r` — and `null`
+    // reports it honestly instead of papering over it with an address that refuses.
+    //
+    // Spelled as the tool a caller actually invokes, not the internal `domain.op` name: nothing is
+    // callable as `fleet.inbox_status`, and a pointer that must be translated gets translated wrong.
+    ...(req.callerAgentId === CONCIERGE_CALLER_AGENT_ID
+      ? {
+          verifyWith: 'sparkle_fleet({ op: "inbox_status" })',
+          verifyArgs: { agentIds: [targetId], messageIds: [messageId] },
+        }
+      : { verifyWith: null, verifyArgs: null }),
+  };
 }
 
 function reportControlOpSuccess(req: ControlRequest, result: unknown): void {

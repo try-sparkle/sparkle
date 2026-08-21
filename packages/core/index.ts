@@ -64,6 +64,7 @@ export * from "./babysitDispatch";
 export * from "./conciergeAsks";
 // The peer-messaging cap, shared because the app ENFORCES it and the MCP tool DESCRIBES it.
 export * from "./peerMessageLimits";
+export * from "./stateScopes";
 // The research pool's shape, mirrored from `research.rs` and drift-tested against it. Shared
 // because the pure deciders pace themselves against the cap and used to restate it in prose,
 // where it went stale for six days without anything being able to notice.

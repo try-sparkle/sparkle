@@ -191,6 +191,7 @@ import {
 import { useSettingsStore } from "../stores/settingsStore";
 import {
   startControlListener,
+  resolveScope,
   CHIEF_CONNECT_TIMEOUT_MS,
   isControlOpSuccess,
   CONCIERGE_CALLER_AGENT_ID,
@@ -205,10 +206,16 @@ import {
   PAIR_LIMIT,
   SENDER_LIMIT,
   _resetPeerRateLimitsForTests,
+  peerLabel,
 } from "./peerMessaging";
 // Imported from CORE, not from the desktop alias, on purpose: the point of the test below is that
 // the enforcer agrees with the value core owns, so it must not read that value through the alias.
-import { PEER_MESSAGE_MAX_CHARS } from "@sparkle/core";
+import {
+  PEER_MESSAGE_MAX_CHARS,
+  uncallableStateScopesIn,
+  stateScopesNamedIn,
+  STATE_SCOPES,
+} from "@sparkle/core";
 // The FROZEN Chief contract. Imported for its types only — the cases below drive the real handler
 // through the real `dispatch`, and the stub they inject is the same seam production writes.
 import type { ChiefClient, ChiefProject } from "./chiefScope";
@@ -6970,6 +6977,295 @@ describe("send_peer_message", () => {
     expect(racerReplies).toHaveLength(2);
     expect(racerReplies.filter((r) => r.ok === true)).toHaveLength(1);
     expect(racerReplies.filter((r) => r.code === "rate_limited")).toHaveLength(1);
+  });
+
+  // ── THE REPLY PATH (bead `sparkle-0fm9ke`) ───────────────────────────────────────────────────
+  //
+  // Improve Sparkle could be ADDRESSED (the `__sparkle_self__` target test above) but could not
+  // ADDRESS ANYONE BACK: its id is deliberately in no project roster, so `findAgent` returned
+  // undefined and the caller guard refused it as `unknown_caller`. Measured live 2026-08-20 — the
+  // agent reported "I genuinely cannot talk to the concierge directly; you're still the
+  // intermediary." The human was the return wire.
+  //
+  // That is the SAME defect already fixed once for the concierge, whose own comment names it: "the
+  // one participant that could be addressed but could not address anyone back." These tests pin the
+  // missing symmetric twin.
+
+  it("delivers FROM Improve Sparkle to the concierge — the reply path the founder was standing in for", async () => {
+    // THE SIDE EFFECT, not the reply: the message must land in the concierge's own inbox id, which
+    // is what `conciergeInbox.drainConciergeInbox` reads at its next turn assembly. A handler that
+    // replied ok and queued nothing would pass a reply-only assertion with the channel still dead.
+    //
+    // NON-VACUITY, restated against the LANDED code: removing the `isSparkleAgentId(req.callerAgentId)`
+    // branch in `handleSendPeerMessage` reds this — the caller falls back to
+    // `findAgent("__sparkle_self__")`, which is undefined by construction, so it refuses and queues
+    // nothing. (The proof used to name `resolveSpecialCaller`, a module this branch deleted when it
+    // adopted main's implementation, so the mutation it described could no longer be performed.)
+    send({ to: CONCIERGE_CALLER_AGENT_ID, message: "PR #2226 merged; release-finalize.yml is on main" }, SPARKLE_AGENT_ID);
+    await flush();
+
+    expect(lastReply()).toMatchObject({ ok: true, to: { id: CONCIERGE_CALLER_AGENT_ID } });
+    expect(inboxSends).toHaveLength(1);
+    expect(inboxSends[0]).toMatchObject({
+      agentId: CONCIERGE_CALLER_AGENT_ID,
+      text: "PR #2226 merged; release-finalize.yml is on main",
+    });
+    // Named so the recipient can reply. The landed implementation (bead `sparkle-t41yw0`) uses the
+    // ordinary `Name [id]` peer label rather than the bare display name the concierge gets, which is
+    // the right call: unlike the concierge there may be several Sparkle ids (per-window), so the id
+    // is what makes the reply address unambiguous.
+    expect(inboxSends[0]!.from).toBe(peerLabel(SPARKLE_AGENT_DISPLAY_NAME, SPARKLE_AGENT_ID));
+  });
+
+  it("does NOT let Improve Sparkle reach a build agent in another project — the widening is withheld", async () => {
+    // THE SECURITY PIN (roborev 66018, bead `sparkle-w04ess`). Fleet-wide target resolution was
+    // implemented here and then WITHDRAWN, and this test is what stops it being re-added by someone
+    // "finishing the job".
+    //
+    // The concierge exemption this is modelled on rests on a property Improve Sparkle does not have:
+    // `resolve_control_caller` mints the concierge id on its OWN socket and rejects anything merely
+    // claiming it on the shared one. Improve Sparkle rides the SHARED socket, stamped from a
+    // `SPARKLE_AGENT_ID` env var, and every ordinary agent holds that socket's path and token — one
+    // app-level bridge serves them all. So the id is claimable, and with fleet scope a forged claim
+    // would buy a flattened roster of every project PLUS the trusted "Improve Sparkle" sender label
+    // on a message to anyone: authority laundering, which is what the provenance banner exists to
+    // prevent. Reaching an ordinary build agent is the bead-doorbell's job (`sparkle-jb809e`).
+    const other = useProjectStore.getState().addProject("Elsewhere", "/tmp/elsewhere");
+    const stranger = useProjectStore.getState().addAgent(other, { kind: "build" })!;
+
+    send({ to: stranger, message: "your branch is 192 commits behind" }, SPARKLE_AGENT_ID);
+    await flush();
+
+    expect(lastReply()).toMatchObject({ ok: false, code: "not_in_project" });
+    expect(inboxSends).toHaveLength(0);
+  });
+
+  it("gives a project-less caller a remedy it can actually follow", async () => {
+    // roborev 66018, finding 2. The stock refusal says "read the roster with
+    // get_state({ scope: 'project' })" — and for a caller with NO project that call returns an EMPTY
+    // roster. Following the advice therefore reads as "there is no one to talk to" and sends the
+    // agent back to its human, which is the exact failure this whole branch exists to end,
+    // reintroduced by a help string. A remedy is an instruction the model follows, so a false one
+    // costs a real channel.
+    send({ to: "nobody-by-that-name", message: "x" }, SPARKLE_AGENT_ID);
+    await flush();
+
+    const reply = lastReply() as { ok: boolean; code: string; error: string };
+    expect(reply).toMatchObject({ ok: false, code: "not_in_project" });
+    expect(reply.error).toContain("scope: 'fleet'");
+    // Asserted on a substring unique to the OTHER string. `scope: 'project'` appears in BOTH (the
+    // app-owned copy says "get_state({ scope: 'project' }) is empty for you"), so a bare
+    // `not.toContain("scope: 'project'")` would be vacuous — see the sibling case below.
+    expect(reply.error).not.toContain("working in your project");
+  });
+
+  it("never names a get_state scope the MCP schema would REJECT, in either refusal", async () => {
+    // THE CROSS-PACKAGE GUARD (roborev 66032, finding 1). Both High findings on this branch were the
+    // same shape: a remedy naming `get_state({ scope: 'fleet' })` while `apps/mcp-control`'s enum
+    // listed four values. Both halves compiled and every suite was green — the only symptom was an
+    // agent getting a zod validation failure for following an instruction we wrote.
+    //
+    // This scans the SHIPPED strings (obtained by driving the real refusal) rather than the source
+    // constants, and checks them against core's `STATE_SCOPES` — the same list the `z.enum` is now
+    // built from. Testing the constants would prove only that they agree with themselves.
+    send({ to: "nobody-by-that-name", message: "x" }, SPARKLE_AGENT_ID, "scan1");
+    await flush();
+    const appOwned = (lastReply() as { error: string }).error;
+    send({ to: "nobody-by-that-name", message: "x" }, callerId, "scan2");
+    await flush();
+    const ordinary = (lastReply() as { error: string }).error;
+
+    expect(uncallableStateScopesIn(appOwned)).toEqual([]);
+    expect(uncallableStateScopesIn(ordinary)).toEqual([]);
+
+    // FAIL CLOSED, THROUGH THE SCANNER'S OWN ANCHOR (roborev 66304). This used to assert
+    // `toMatch(/scope:\s*'/)` — a LOOSER pattern than the scanner uses, so the two could diverge:
+    // reword either refusal past the anchor ("get_state, passing scope: 'fleet'") and
+    // `uncallableStateScopesIn` returns [] for a string naming an uncallable scope while this
+    // "prove it read something" assertion still passes on the leftover `scope:`. The guard would go
+    // inert exactly when the copy it guards is edited, which is its only hazard. Asking the
+    // companion means the proof-of-reading and the scan cannot drift apart.
+    expect(stateScopesNamedIn(appOwned).length).toBeGreaterThan(0);
+    expect(stateScopesNamedIn(ordinary).length).toBeGreaterThan(0);
+    expect(uncallableStateScopesIn("get_state({ scope: 'sideways' })")).toEqual(["sideways"]);
+    // ANCHORED: another tool's `scope:` parameter must NOT be judged against get_state's enum.
+    // `sparkle_workspace`'s description carries `scope: "all"` for `search_history`, whose legal
+    // values are HISTORY_SCOPES — it passes an unanchored scan only because WIDE_HISTORY_SCOPE
+    // happens to equal "all" today (roborev 66300).
+    expect(uncallableStateScopesIn('Pass scope: "conversations" to search past chats')).toEqual([]);
+  });
+
+  it("refuses even when a project with the sparkle-self id IS registered", async () => {
+    // roborev 66483. The merge resolution dropped the explicit empty candidate list, leaving the
+    // roster empty only because nothing happens to register a project whose id is `sparkle-self`.
+    // That is incidental, and this file's own `selfIdentity` path looks that project up and handles
+    // it EXISTING — so the scenario is reachable, not hypothetical.
+    //
+    // The existing "another project" pin cannot catch it: it seeds a DIFFERENT project id, so it
+    // stays green whether the guard is explicit or accidental. This one seeds the exact id the
+    // caller resolves to, which is the only shape that distinguishes them.
+    //
+    // Why it must refuse: `__sparkle_self__` is stamped from an env var on the SHARED control
+    // socket and is therefore claimable, so any roster it can reach is one a forged stamp can reach
+    // — carrying the trusted "Improve Sparkle" sender label (bead `sparkle-w04ess`).
+    const selfProject = useProjectStore.getState().addProject("Sparkle Self", "/tmp/sparkle-self");
+    useProjectStore.setState((st) => ({
+      projects: st.projects.map((p) => (p.id === selfProject ? { ...p, id: SPARKLE_PROJECT_ID } : p)),
+    }));
+    const inside = useProjectStore.getState().addAgent(SPARKLE_PROJECT_ID, { kind: "build" })!;
+
+    send({ to: inside, message: "reachable?" }, SPARKLE_AGENT_ID);
+    await flush();
+
+    expect(lastReply()).toMatchObject({ ok: false, code: "not_in_project" });
+    expect(inboxSends).toHaveLength(0);
+  });
+
+  it("gives a CONCIERGE with no selected project the same followable remedy", async () => {
+    // roborev 66483, the paired shape. The remedy used to be chosen by IDENTITY
+    // (`isSparkleAgentId`), but the condition it describes is "you belong to no project" — and the
+    // concierge branch also yields a null project when nothing is selected (fresh install, or the
+    // last project removed). That caller was handed "read the roster with
+    // get_state({ scope: 'project' })", which is empty for it: the advice reads as "there is no one
+    // to talk to" and sends it back to its human, the exact failure this copy exists to end.
+    useProjectStore.setState({ selectedProjectId: null } as never);
+
+    send({ to: "nobody-by-that-name", message: "x" }, CONCIERGE_CALLER_AGENT_ID);
+    await flush();
+
+    const reply = lastReply() as { ok: boolean; code: string; error: string };
+    expect(reply).toMatchObject({ ok: false, code: "not_in_project" });
+    expect(reply.error).toContain("scope: 'fleet'");
+    expect(reply.error).not.toContain("working in your project");
+  });
+
+  it("still gives an ORDINARY caller the project-scoped remedy — the copy is chosen by caller shape", async () => {
+    // The paired negative. Without it, an implementation that showed the fleet remedy to EVERYONE
+    // would pass the test above while pointing ordinary agents at a directory whose extra entries
+    // they may not address. Also holds the anti-oracle property: the wording is chosen by WHO IS
+    // CALLING, never by whether the target happened to exist.
+    send({ to: "nobody-by-that-name", message: "x" }, callerId);
+    await flush();
+
+    const reply = lastReply() as { ok: boolean; code: string; error: string };
+    expect(reply).toMatchObject({ ok: false, code: "not_in_project" });
+    // ON A SUBSTRING UNIQUE TO `NO_SUCH_PEER` (roborev 66032, finding 2). This asserted
+    // `toContain("scope: 'project'")` and was VACUOUS: the app-owned copy contains that literal too,
+    // in "get_state({ scope: 'project' }) is empty for you". So it passed against BOTH strings, and
+    // an implementation that dropped the selector and handed the app-owned copy to everyone would
+    // have passed this test AND its sibling — pointing ordinary agents at a fleet directory whose
+    // extra entries they may not address. Exactly the #1 finding in AGENTS.md: an assertion that was
+    // already true before the code under test ran.
+    expect(reply.error).toContain("working in your project");
+    expect(reply.error).not.toContain("scope: 'fleet'");
+  });
+
+  it("does NOT widen an ordinary build agent past its own project", async () => {
+    // THE BOUNDARY CONTROL, and the reason this is a special-case rather than a relaxation. The
+    // project boundary is an anti-oracle: an ordinary agent must not be able to enumerate another
+    // project's roster. Only the two app-owned ids resolve outside it, and a cross-project target
+    // stays indistinguishable from one that does not exist.
+    const other = useProjectStore.getState().addProject("Elsewhere", "/tmp/elsewhere");
+    const stranger = useProjectStore.getState().addAgent(other, { kind: "build" })!;
+
+    send({ to: stranger, message: "hello stranger" }, callerId);
+    await flush();
+
+    expect(lastReply()).toMatchObject({ ok: false, code: "not_in_project" });
+    expect(inboxSends).toHaveLength(0);
+  });
+
+  it("refuses a lookalike that is merely PREFIXED with the sparkle namespace", async () => {
+    // `isSparkleAgentId` matches the canonical id or `__sparkle_self__-<window>`. A near-miss that
+    // only starts with the same letters is not in the namespace and must fail closed — the same
+    // shape as the existing `sparkle:not-the-concierge` pin, so this opened one door, not the wall.
+    send({ to: otherId, message: "who am I" }, `${SPARKLE_AGENT_ID}X-win-1`);
+    await flush();
+
+    expect(lastReply()).toMatchObject({ ok: false, code: "unknown_caller" });
+    expect(inboxSends).toHaveLength(0);
+  });
+
+  it("answers an ENQUEUE receipt, never something a model can read as delivery", async () => {
+    // REQUIREMENT 4 of bead `sparkle-0fm9ke`, and a rerun of a bug this repo has already paid for
+    // once (`sparkle-ei7keg`). `conciergeTools/fleet.inboxSend` answers an `EnqueueReceipt` because
+    // a bare `{ messageId }` is "an enqueue receipt wearing a delivery receipt's clothes": an id
+    // looks like proof, `ok: true` looks like success, and the caller is a language model whose very
+    // next act is to tell a human what it did. It told the founder seven instructions were
+    // delivered; five reached nobody.
+    //
+    // The PEER path bypassed that wrapper entirely — `peerMessaging.sendPeerInboxMessage` invokes
+    // `inbox_send` directly and got Rust's raw id string back — so this op carried no field that
+    // could ever have been false. `ok` still honestly means the ENQUEUE happened (`enqueue` reads
+    // the record back before returning an id). What it must never be readable as is arrival.
+    send({ to: otherId, message: "taking the Rust half" });
+    await flush();
+
+    const reply = lastReply() as Record<string, unknown>;
+    expect(reply).toMatchObject({ ok: true, state: "queued", delivered: false });
+    // NOT MERELY THE SHAPE. `verifyArgs` is the follow-up question pre-filled — a receipt that says
+    // "this is unconfirmed" without saying how to confirm it just relocates the problem. Hardcoded
+    // empty arrays would satisfy a shape check and answer nothing, so pin the real ids.
+    // AND THE POINTER MUST BE FOLLOWABLE BY THE CALLER IT IS HANDED TO (roborev 66025, finding 2).
+    // `fleet.inbox_status` is a concierge-tool domain/op, reachable only via `sparkle_fleet` ->
+    // `concierge_tool`, which refuses any caller that is not the concierge with `code: "forbidden"`.
+    // There is no inbox op in `CONTROL_OP_TIERS` at all, so an ordinary agent — and Improve Sparkle,
+    // the caller this branch exists to enable — cannot read it. Handing it that pointer would be the
+    // SAME defect this work set out to delete: a remedy naming a channel the reader cannot use.
+    // `null` is the honest answer, and the tool description says what to do with it.
+    expect(reply.verifyWith).toBeNull();
+    expect(reply.verifyArgs).toBeNull();
+  });
+
+  it("gives the CONCIERGE a verification pointer, spelled as the tool it actually invokes", async () => {
+    // The paired positive. Without it, an implementation that returned `null` for EVERYONE would
+    // pass the test above while removing a pointer the concierge can genuinely follow.
+    //
+    // Spelled `sparkle_fleet({ op: "inbox_status" })` rather than the internal `fleet.inbox_status`:
+    // there is no callable tool by the latter name, and a pointer a model has to translate before it
+    // can use is a pointer that gets translated wrong.
+    send({ to: otherId, message: "from the concierge" }, CONCIERGE_CALLER_AGENT_ID);
+    await flush();
+
+    const reply = lastReply() as Record<string, unknown>;
+    expect(reply).toMatchObject({ ok: true, state: "queued", delivered: false });
+    expect(reply.verifyWith).toBe('sparkle_fleet({ op: "inbox_status" })');
+    expect(reply.verifyArgs).toEqual({ agentIds: [otherId], messageIds: [reply.messageId] });
+  });
+
+  it("does not claim delivery for the app-owned recipients either", async () => {
+    // The paired case for the reply path. Improve Sparkle reaching the concierge is exactly where an
+    // over-confident receipt does the most damage: it is the direction that replaces the founder as
+    // the wire, so a false "delivered" there is a message he no longer relays AND no longer sees.
+    send({ to: CONCIERGE_CALLER_AGENT_ID, message: "release-finalize.yml is on main" }, SPARKLE_AGENT_ID);
+    await flush();
+
+    expect(lastReply()).toMatchObject({ ok: true, delivered: false, state: "queued" });
+  });
+});
+
+describe("resolveScope", () => {
+  it("round-trips EVERY scope in the shared list rather than silently downgrading", () => {
+    // roborev 66302/66304. This was a hand-written `raw === "self" || raw === "all" || …` chain —
+    // a fourth copy of the list. Equality-narrowing makes the compiler catch REMOVALS from
+    // STATE_SCOPES but ADDITIONS are silent: add a sixth scope and the z.enum accepts it, the type
+    // admits it, a description may name it, and this fell through to "active" — serving a roster the
+    // caller never asked for, with every suite green. Worse for a NARROW scope, which would hand
+    // back rows outside the boundary it was added to draw.
+    //
+    // Iterating STATE_SCOPES rather than listing names is the point: a scope added tomorrow is
+    // covered by this test the moment it joins the list, which is the only way to pin "additions".
+    for (const scope of STATE_SCOPES) {
+      expect(resolveScope(scope), `${scope} must not fall back`).toBe(scope);
+    }
+  });
+
+  it("still falls back for input that is not a scope at all", () => {
+    // The paired negative: a version that returned `raw` unconditionally would pass the loop above.
+    expect(resolveScope("sideways")).toBe("active");
+    expect(resolveScope(undefined)).toBe("active");
+    expect(resolveScope(42)).toBe("active");
+    expect(resolveScope(null)).toBe("active");
   });
 });
 
