@@ -28,6 +28,7 @@ import {
 import { safeUnlisten } from "./safeUnlisten";
 import { startControlBridge, controlRespond } from "./orchestrationLaunch";
 import { useProjectStore } from "../stores/projectStore";
+import { useAppOwnedAgentStore } from "../stores/appOwnedAgentStore";
 // The concierge's bounded lever on `escalated` (bead sparkle-hm4z9) and the honesty half of its
 // reply. `rearmsRemaining` is the allowance the concierge is spending; `decideContinuation` is the
 // ~9 further gates a cleared escalation still has to pass before anything actually resumes — see
@@ -725,9 +726,13 @@ function selfIdentity(req: ControlRequest): SelfIdentity | null {
       isAgent: true,
       projectId: project?.id ?? SPARKLE_PROJECT_ID,
       projectName: project?.name ?? null,
-      // The computed busy line (services/sparkleBusy), the same one the roster row shows — not a
-      // stamped self-report, so there is no per-agent age to show.
-      activity: sparkleActivityLine(Date.now()),
+      // A MANUALLY-SET activity (set_agent_activity → appOwnedAgentStore) is preferred over the
+      // computed busy line (services/sparkleBusy): an explicit self-report is more specific than the
+      // pass's generic state. Falls back to the computed line when none is set. Neither is a stamped
+      // per-agent record, so there is no age to show.
+      activity:
+        useAppOwnedAgentStore.getState().activityById[req.callerAgentId] ??
+        sparkleActivityLine(Date.now()),
       activityAgeMs: null,
     };
   }
@@ -1403,11 +1408,25 @@ function handleGetState(req: ControlRequest): {
     rollupDot: observableDotOf(sparkleId),
     liveness: livenessOf(sparkleId, status, openIds),
     parentId: null,
-    // THE SHARED BUSY RULE (services/sparkleBusy), the same one the write gate refuses on — so the
-    // roster can never say "idle" about an agent the very next send will refuse as busy. That
-    // disagreement is worse than either fact alone: a model reads a refusal contradicting the roster
-    // as a broken tool and retries.
-    activity: sparkleBusy,
+    // A MANUALLY-SET activity (set_agent_activity → appOwnedAgentStore) is preferred; otherwise THE
+    // SHARED BUSY RULE (services/sparkleBusy), the same one the write gate refuses on — so the roster
+    // can never say "idle" about an agent the very next send will refuse as busy. `status` above is
+    // unaffected (it keys on `sparkleBusy`, not on this line), so a manual activity narrates without
+    // ever masking the busy state a send would refuse on.
+    activity: useAppOwnedAgentStore.getState().activityById[sparkleId] ?? sparkleBusy,
+    // THE DISPLAY-ONLY GOAL (set_agent_goal / set_agent_goal_met → appOwnedAgentStore), shaped like
+    // every other row's goal so the concierge's `goal.state` branch reads it uniformly, but carrying
+    // only text + met — the app-owned agent's continuation is scheduler-driven, not goal-driven, so
+    // there is no TTL/escalation. Absent when no goal is set.
+    ...(useAppOwnedAgentStore.getState().goalById[sparkleId]
+      ? {
+          goal: {
+            text: capForRoster(useAppOwnedAgentStore.getState().goalById[sparkleId]!.text),
+            state: useAppOwnedAgentStore.getState().goalById[sparkleId]!.met ? "met" : "unmet",
+            remainingMs: 0,
+          },
+        }
+      : {}),
     // THE ONE FIELD NO OTHER ROW CARRIES, and it is absent rather than `false` on them — this reply
     // is the largest thing the control API puts in a context window and the budget is permanent.
     // It says: the app owns this agent, so the destructive lifecycle ops (discard/close/ship/save)
@@ -1549,6 +1568,14 @@ function handleSetActivity(req: ControlRequest): Record<string, unknown> {
   }
   const activity = req.payload.activity;
   if (typeof activity !== "string") return { ok: false, error: "activity must be a string" };
+  // THE APP-OWNED AGENT has no projectStore row (bead sparkle-t41yw0), so its activity lives in the
+  // dedicated store the synthesized roster row + `selfIdentity` read back (a stored line is preferred
+  // over the computed one; empty clears). Short-circuit BEFORE `findAgent`, which can never resolve
+  // it. Ownership is already checked above by `mayWriteAgentFieldFor`.
+  if (isSparkleAgentId(targetId)) {
+    useAppOwnedAgentStore.getState().setActivity(targetId, activity);
+    return { ok: true };
+  }
   const found = findAgent(targetId);
   if (!found) return { ok: false, error: `unknown agent ${targetId}` };
   useProjectStore.getState().setAgentActivity(found.projectId, targetId, activity);
@@ -1602,6 +1629,17 @@ function handleSetGoal(req: ControlRequest): Record<string, unknown> {
   }
   const goal = req.payload.goal;
   if (typeof goal !== "string") return { ok: false, error: "goal must be a string" };
+  // THE APP-OWNED AGENT keeps a DISPLAY-ONLY goal (bead sparkle-t41yw0): it has no projectStore row,
+  // and its continuation is driven by the improvement scheduler / never-idle pusher, NOT the generic
+  // goal auto-continue — so it carries no verify/TTL/escalation machinery. Store just the text (empty
+  // clears) and report it as it stands. Short-circuit BEFORE the verify parsing below, which does not
+  // apply here. Ownership was checked above by `mayWriteAgentFieldFor`.
+  if (isSparkleAgentId(targetId)) {
+    useAppOwnedAgentStore.getState().setGoal(targetId, goal);
+    const stored = useAppOwnedAgentStore.getState().goalById[targetId];
+    if (stored === undefined) return { ok: true, cleared: true };
+    return { ok: true, goal: { text: capForRoster(stored.text), state: stored.met ? "met" : "unmet", remainingMs: 0 } };
+  }
   const ttlMs = typeof req.payload.ttlMs === "number" && req.payload.ttlMs > 0 ? req.payload.ttlMs : undefined;
   // HOW the goal is checked, when the caller stated it. Optional at this seam on purpose: making it
   // required would refuse every existing caller, and an unverified goal is still better than none.
@@ -1749,6 +1787,16 @@ function handleSetGoalMet(req: ControlRequest): Record<string, unknown> {
   }
   const met = req.payload.met;
   if (typeof met !== "boolean") return { ok: false, error: "met must be a boolean" };
+  // THE APP-OWNED AGENT's display-only goal (bead sparkle-t41yw0). It carries no verify, so the
+  // self-markability gate above cannot apply (an agent marking its OWN goal is already allowed — the
+  // caller-stamped self-only check ran earlier). Its goal lives in the dedicated store, not
+  // projectStore, so short-circuit before `findAgent`. A `met` with no goal set is a no-op (the store
+  // early-returns), reported honestly as `changed: false` rather than a fake success.
+  if (isSparkleAgentId(targetId)) {
+    const had = useAppOwnedAgentStore.getState().goalById[targetId] !== undefined;
+    useAppOwnedAgentStore.getState().setGoalMet(targetId, met);
+    return had ? { ok: true, met } : { ok: true, met, changed: false };
+  }
   const found = findAgent(targetId);
   if (!found) return { ok: false, error: `unknown agent ${targetId}` };
   // NOTHING TO MARK is not a success. `setAgentGoalMet` early-returns unchanged when there is no

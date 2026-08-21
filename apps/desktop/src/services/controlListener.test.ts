@@ -12,6 +12,7 @@ import { useUiStore } from "../stores/uiStore";
 // nothing produces. `notePaneStatus` / `resetPaneBusyForTests` drive the REAL busy latch, so these
 // exercise services/sparkleBusy end to end instead of mocking the thing under test.
 import { SPARKLE_AGENT_ID, SPARKLE_PROJECT_ID, SPARKLE_AGENT_DISPLAY_NAME } from "./sparkleAgent";
+import { useAppOwnedAgentStore } from "../stores/appOwnedAgentStore";
 // THE SHARED BUSY RULE IS THE SEAM, not `improvementPass` behind it. What this file is responsible
 // for is PUBLISHING that rule on the roster row — promoting `status` to "working" and carrying the
 // line as `activity`. Whether a pass is actually in flight is `sparkleBusy`'s own question, asserted
@@ -298,6 +299,7 @@ describe("controlListener", () => {
     // something, since it cannot yet tell "no rule" from "a rule we haven't loaded".
     useSettingsStore.setState({ conciergeToolPolicy: {}, conciergeToolPolicyHydrated: true });
     useProjectStore.setState({ projects: [], selectedProjectId: null } as never);
+    useAppOwnedAgentStore.setState({ goalById: {}, activityById: {} });
     // Reset BOTH liveness inputs get_state's "active" scope reads — the in-memory open set and the
     // shared persisted one (readPersistedOpenAgentIds reads localStorage) — or open ids leak between
     // tests and silently widen the roster.
@@ -534,6 +536,86 @@ describe("controlListener", () => {
       const row = res.agents.find((a) => a.id === SPARKLE_AGENT_ID)!;
       expect(row.activity).toBeNull();
       expect(row.status).toBe("stopped");
+    });
+
+    // THE WRITE-PATH (bead sparkle-t41yw0): the app-owned agent can now set its OWN goal + activity,
+    // which had nowhere to live (no projectStore row). These drive the ops end-to-end and assert the
+    // roster reflects them — removing the handler short-circuits or the store reds each.
+    const getSparkleRow = async (reqId: string) => {
+      fire({ reqId, op: "get_state", callerAgentId: callerId, payload: { scope: "all" } });
+      await flush();
+      return (lastReply() as { agents: Array<Record<string, unknown>> }).agents.find(
+        (a) => a.id === SPARKLE_AGENT_ID,
+      )!;
+    };
+
+    it("set_agent_activity from the app-owned agent shows a MANUAL line, preferred over the computed one", async () => {
+      // A pass is running, so the computed line is non-null — the manual line must WIN over it, and
+      // status must still key on the busy state (the manual line narrates, it does not mask busy).
+      vi.mocked(sparkleActivityLine).mockReturnValue("running its hourly improvement pass");
+      fire({
+        reqId: "wp-a1",
+        op: "set_agent_activity",
+        callerAgentId: SPARKLE_AGENT_ID,
+        payload: { activity: "wiring the control listener" },
+      });
+      await flush();
+      expect(lastReply()).toMatchObject({ ok: true });
+      const row = await getSparkleRow("wp-a2");
+      expect(row.activity).toBe("wiring the control listener");
+      expect(row.status).toBe("working"); // still busy — the manual line did not mask it
+    });
+
+    it("an empty set_agent_activity CLEARS the manual line, falling back to the computed one", async () => {
+      vi.mocked(sparkleActivityLine).mockReturnValue("running its hourly improvement pass");
+      useAppOwnedAgentStore.getState().setActivity(SPARKLE_AGENT_ID, "stale line");
+      fire({
+        reqId: "wp-a3",
+        op: "set_agent_activity",
+        callerAgentId: SPARKLE_AGENT_ID,
+        payload: { activity: "" },
+      });
+      await flush();
+      const row = await getSparkleRow("wp-a4");
+      expect(row.activity).toBe("running its hourly improvement pass"); // fell back to computed
+    });
+
+    it("set_agent_goal from the app-owned agent shows a display-only goal; goal_met flips its state", async () => {
+      fire({
+        reqId: "wp-g1",
+        op: "set_agent_goal",
+        callerAgentId: SPARKLE_AGENT_ID,
+        payload: { goal: "land the write-path PR" },
+      });
+      await flush();
+      expect(lastReply()).toMatchObject({ ok: true, goal: { state: "unmet" } });
+      let row = await getSparkleRow("wp-g2");
+      expect(row.goal).toMatchObject({ text: "land the write-path PR", state: "unmet", remainingMs: 0 });
+
+      // Mark it met — the SAME agent marking its OWN goal (caller === target passes the self gate).
+      fire({
+        reqId: "wp-g3",
+        op: "set_agent_goal_met",
+        callerAgentId: SPARKLE_AGENT_ID,
+        payload: { met: true },
+      });
+      await flush();
+      expect(lastReply()).toMatchObject({ ok: true, met: true });
+      row = await getSparkleRow("wp-g4");
+      expect(row.goal).toMatchObject({ state: "met" });
+    });
+
+    it("set_agent_goal_met with NO goal set is an honest no-op, not a fabricated finished goal", async () => {
+      fire({
+        reqId: "wp-g5",
+        op: "set_agent_goal_met",
+        callerAgentId: SPARKLE_AGENT_ID,
+        payload: { met: true },
+      });
+      await flush();
+      expect(lastReply()).toMatchObject({ ok: true, changed: false });
+      const row = await getSparkleRow("wp-g6");
+      expect(row.goal).toBeUndefined(); // no goal invented
     });
   });
 
