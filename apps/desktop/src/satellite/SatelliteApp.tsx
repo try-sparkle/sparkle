@@ -41,6 +41,10 @@ import type { PairSide } from "../engine/cable";
 import { useSettingsStore } from "../stores/settingsStore";
 import { AgentSidebar } from "../components/AgentSidebar";
 import { HeaderLink } from "../components/HeaderLink";
+import {
+  PLAN_BOARD_HEADER_COLUMN_GAP,
+  PLAN_BOARD_HEADER_ROW_GAP,
+} from "../components/planBoardHeader";
 import { BoardFilterBar } from "../components/BoardFilterBar";
 import { PLAN_COLUMN_Z } from "../components/layers";
 import { ErrorBoundary, AgentPaneErrorCard } from "../components/ErrorBoundary";
@@ -419,7 +423,9 @@ export function SatelliteApp({ projectId }: { projectId: string }) {
                 alignItems: "center",
                 justifyContent: "flex-start",
                 flexWrap: "wrap",
-                gap: 8,
+                // The main window's twin of this row, read from one place so the two cannot drift.
+                columnGap: PLAN_BOARD_HEADER_COLUMN_GAP,
+                rowGap: PLAN_BOARD_HEADER_ROW_GAP,
                 minHeight: 34,
                 padding: "0 10px",
                 // A margin, not bottom padding: padding would pull the toggle off the Build

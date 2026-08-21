@@ -326,11 +326,42 @@ export function EpicsColumn({
           letterSpacing: "0.01em",
         }}
       >
-        <span>Epics</span>
-        {/* THE RIGHT SLOT IS A GROUP NOW, not a single conditional child. The row is
-            `space-between`, so with only two children "right-aligned" was emergent — a third child
-            would have parked `Clear` in the MIDDLE of the header. Wrapping the controls keeps the
-            title at one end and every control at the other however many there are. */}
+        {/* THE TITLE'S OWN GROUP, and the board link belongs to it — not to the controls.
+            Founder, 2026-08-20: "I wanted the open planning board to be left justified and not
+            right… It should just show to the right of the word epics."
+
+            GROUPING IS THE WHOLE FIX; there is no alignment property to set. The header is
+            `space-between`, so the link's old right-edge position was EMERGENT from it being the
+            second of two children rather than anything written down. Moving it in here makes the
+            title side two items wide and leaves `Clear` alone on the other end, which is the
+            arrangement he described. `minWidth: 0` so a narrow column ellipsises the title rather
+            than shoving the link out of the box. */}
+        <span
+          data-testid="epics-header-left"
+          style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}
+        >
+          <span>Epics</span>
+          {/* THE WAY IN TO THE BOARD, and it is the ONLY one in the main window now that the
+              Build/Plan toggle is gone. Gated on `beadsEnabled` because `planBoardUp()` requires
+              it — an ungated link would be a control that visibly does nothing.
+
+              It can only ever say OPEN. While the board is up this whole column is `covered`, i.e.
+              `inert` + `visibility: hidden`, per the founder's own constraint quoted at the top of
+              this file ("when I'm on the Plan board I should not see the EPICS column"). The CLOSE
+              half therefore lives in the board's own header, where it stays visible. */}
+          {beadsEnabled && (
+            <HeaderLink
+              testId="epics-open-plan-board"
+              hint="plan"
+              label="Open Planning Board"
+              onClick={() => openPlanBoard(side)}
+            />
+          )}
+        </span>
+        {/* THE RIGHT SLOT IS A GROUP, not a single conditional child. The row is `space-between`,
+            so a bare conditional child would park `Clear` in the MIDDLE of the header whenever the
+            title side grew. Wrapping the controls keeps the title at one end and every control at
+            the other however many there are. */}
         <span style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
           {/* THE ONLY WAY BACK from a narrowed build column, and it lives here rather than in the
               build column because this is where the narrowing was set. A filter whose clear control
@@ -353,22 +384,6 @@ export function EpicsColumn({
             >
               Clear
             </button>
-          )}
-          {/* THE WAY IN TO THE BOARD, and it is the ONLY one in the main window now that the
-              Build/Plan toggle is gone. Gated on `beadsEnabled` because `planBoardUp()` requires
-              it — an ungated link would be a control that visibly does nothing.
-
-              It can only ever say OPEN. While the board is up this whole column is `covered`, i.e.
-              `inert` + `visibility: hidden`, per the founder's own constraint quoted at the top of
-              this file ("when I'm on the Plan board I should not see the EPICS column"). The CLOSE
-              half therefore lives in the board's own header, where it stays visible. */}
-          {beadsEnabled && (
-            <HeaderLink
-              testId="epics-open-plan-board"
-              hint="plan"
-              label="Open Planning Board"
-              onClick={() => openPlanBoard(side)}
-            />
           )}
         </span>
       </div>

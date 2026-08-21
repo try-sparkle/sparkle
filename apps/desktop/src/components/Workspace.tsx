@@ -31,6 +31,7 @@ import { useNewBuildAgentDrop } from "../hooks/useNewBuildAgentDrop";
 import { AgentSidebar } from "./AgentSidebar";
 import { PLAN_COLUMN_Z } from "./layers";
 import { HeaderLink } from "./HeaderLink";
+import { PLAN_BOARD_HEADER_COLUMN_GAP, PLAN_BOARD_HEADER_ROW_GAP } from "./planBoardHeader";
 import { agentIdsInEpic } from "../engine/epicFocus";
 import { useBeadsStore } from "../stores/beadsStore";
 // IN ITS OWN FILE, unlike `PlanBoardSlot` directly below — this file is already 2300+ lines, and
@@ -2651,7 +2652,11 @@ function PlanBoardSlot({ project, side }: { project: Project; side: PairSide }) 
           // narrow pair width the row would overflow a box that sets no `overflow`. Wrapping drops
           // the filter bar to a second line and grows the band instead.
           flexWrap: "wrap",
-          gap: 8,
+          // SPLIT AXES, and the horizontal one is the founder's "a little bit more space between
+          // closed planning board and the filter". Shared with the satellite's copy of this row so
+          // the two hosts cannot drift again — see `planBoardHeader.ts`.
+          columnGap: PLAN_BOARD_HEADER_COLUMN_GAP,
+          rowGap: PLAN_BOARD_HEADER_ROW_GAP,
           // `--hd-h` from rev4.html, the height AgentSidebar's `.bhd` uses. minHeight, not height,
           // so the band grows when the filter bar wraps.
           minHeight: 34,
