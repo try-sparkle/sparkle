@@ -120,9 +120,15 @@ describe("EpicsColumn — each epic row carries its own priority chiclet", () =>
     const chip = chiclet("ep-parent");
     // DOCUMENT_POSITION_FOLLOWING: the count comes AFTER the chiclet in document order.
     expect(chip.compareDocumentPosition(kids!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-    // …and the chiclet comes after the title text, which is the row's first child.
-    const title = r.firstElementChild;
-    expect(title?.textContent).toContain("ep-parent");
+    // …and the chiclet comes after the title text.
+    //
+    // FOUND BY ITS CONTENT, NOT BY `firstElementChild`. It was the row's first child until the
+    // health square (bead `sparkle-l06ax7`) took the leading slot, and this line then asserted
+    // `''` contains the epic id — a red on a change that did not touch the ordering this test is
+    // about. What the founder's placement rule actually says is title → chiclet → count, so that
+    // is what is asserted, positionally, against a title located by what it CONTAINS.
+    const title = [...r.children].find((el) => el.textContent?.includes("ep-parent"));
+    expect(title).toBeDefined();
     expect(title!.compareDocumentPosition(chip) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });
 

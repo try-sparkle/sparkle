@@ -63,7 +63,6 @@ import { refreshPreviewCapability } from "../services/preview";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { SPARKLE_PANE_SIDE, useUiStore } from "../stores/uiStore";
 import { APP_WINDOW_LABEL } from "../windowContext";
-import { useInteractionStore } from "../stores/interactionStore";
 import { useSettingsStore } from "../stores/settingsStore";
 import { removeAgentWorkspace } from "../services/worktree";
 import { spinDownWorker } from "../services/workerSpawn";
@@ -133,14 +132,8 @@ import {
 import { StageSectionHeader } from "./StageSectionHeader";
 import { ChatSection } from "./ChatSection";
 import { StatusFilterBar } from "./StatusFilterBar";
-import {
-  withUnstartedWorkerAttention,
-  withRedWorkerAttention,
-} from "../engine/workerAttention";
-import { withObservedAttention } from "../engine/observedAttention";
 import { attentionWorkersOf } from "../engine/workerExpansion";
 import { withDismissedAlerts, alertControlKind } from "../engine/alertDismissal";
-import { withUnmergedWork } from "../engine/unmergedAttention";
 import { withNudgeLoopCalm } from "../engine/nudgeLoopCalm";
 import { withFinishedHeadCalm } from "../engine/finishedHeadCalm";
 import { thrashReportFor } from "../engine/agentThrash";
@@ -159,6 +152,8 @@ import { quotaBlockForAgent } from "../engine/engineRegistry";
 // nudger's founder-level `blocked-on-human` answer never reached a colour. See engine/humanBlock.
 import { humanBlockIn, isHumanBlockedIn } from "../services/humanBlockFor";
 import { useNudgeFlagSnapshot } from "../useNudgeFlags";
+import { useFinishedHeads } from "../hooks/useFinishedHeads";
+import { useOverlaidStatus } from "../hooks/useOverlaidStatus";
 import {
   stallInputsFor,
 } from "./rowAttention";
@@ -166,7 +161,6 @@ import { awaitingCloseEvidenceFor } from "../services/agentGoalReading";
 // ONE producer for what an agent is complaining about, shared with the composer's pill row so the
 // two surfaces cannot drift — the taxonomy drift engine/workerRollup.ts warns about twice.
 import { splitStatusPollTargets } from "../engine/statusPollTargets";
-import { useNewAgentCalm, useNewAgentGraceTick } from "../hooks/useNewAgentCalm";
 
 /** Stable empty list, so the hook below is not handed a fresh `[]` on every render before a project
  *  resolves — a new array identity each time would re-arm its grace timer forever. */
@@ -337,21 +331,9 @@ export function AgentSidebar({
   const liveStatus = useRuntimeStore((s) => s.status);
   const openAgentIds = useRuntimeStore((s) => s.openAgentIds);
   const lastObserved = useRuntimeStore((s) => s.lastObserved);
-  // The mount-independent attention verdict, pushed by `services/observedAttentionListener` off the
-  // Rust nudger's once-a-second read of every live grid. This is the writer that exists for agents
-  // whose pane has never been mounted — see engine/observedAttention.
-  const observedAttention = useRuntimeStore((s) => s.observedAttention);
   // The open set, built once: the strand overlay below and the peek both
   // ask it, and two Sets from one array is two allocations per render for the same answer.
   const openIds = useMemo(() => new Set(openAgentIds), [openAgentIds]);
-  // A spawned-but-never-started worker has no live status, so it (and the orchestrator it's
-  // blocking) would render GRAY. Overlay RED ("Approve?") on the strand and bubble it to the parent
-  // so the orchestrator row goes red — matching the TopBar dot cluster. No-op (same ref) when
-  // nothing is stranded.
-  // Terminal keystrokes land here and nowhere else (Terminal.onData → touch), so this is the ONLY
-  // evidence that an agent driven by hand in the pane has in fact been briefed. Step (0) needs it or
-  // it would keep calling such an agent "New — not briefed" forever. See newAgentAttention route 4.
-  const interactionAt = useInteractionStore((s) => s.lastAt);
   // Step (0), hoisted out of the memo below and into the hook that owns its CLOCK. The backstop is
   // a deadline and an `errored` agent emits no further status writes, so a bare
   // `useMemo(… Date.now() …)` here would hold such a row gray forever (roborev 54743, finding 1).
@@ -370,37 +352,16 @@ export function AgentSidebar({
   // `publishedRollupAgreement.test.ts` is structurally blind to this — both maps it compares come
   // out of the one `composeRollup`, so it can never see this parallel copy. Keeping the two calls
   // at the same position is the only thing that holds them equal.
-  const observedCorrected = useMemo(
-    () =>
-      withObservedAttention(
-        project?.agents ?? NO_AGENTS,
-        liveStatus,
-        observedAttention,
-        (id) => openIds.has(id),
-      ),
-    [project, liveStatus, observedAttention, openIds],
-  );
-  const s0 = useNewAgentCalm(project?.agents ?? NO_AGENTS, observedCorrected, interactionAt);
-  // The same wake-up, exposed as a value so the rollup memo far below can depend on it too.
-  const graceTick = useNewAgentGraceTick(project?.agents ?? NO_AGENTS, liveStatus, interactionAt);
-  const status = useMemo(() => {
-    if (!project) return liveStatus;
-    // Two attention overlays, composed: (1) an unstarted worker gets a synthetic red + bubbles to
-    // its orchestrator; (2) a started-then-red worker — ANY red-tier status, `blocked` included (see
-    // services/windowStatus.isRedStatus) — bubbles its own red to its orchestrator so the
-    // orchestrator floats up and shows red. Order matters — run (2) after
-    // (1) so a strand's synthetic red also bubbles.
-    // (0) FIRST, on the raw map: a spawned-but-never-briefed agent reads `new` (GRAY) rather than
-    // the red `blocked` statusEngine's 25s stall timer hands it for being quiet. Before the bubbles,
-    // for the reason spelled out on publishedStatusFor's step (0) — once a red has bubbled to an
-    // orchestrator it is indistinguishable from that row's own. Keeping the same position here is
-    // what keeps this chain equal to publishedStatusFor's (see the CONCIERGE BANDING NOTE below).
-    // `s0` is that step, computed by useNewAgentCalm above so the 5-minute backstop has a clock.
-    // It feeds (1) in place of the raw map; `lastObserved` (origin/main, sparkle-w340) is unrelated
-    // and rides along untouched.
-    const s1 = withUnstartedWorkerAttention(project.agents, s0, openIds, lastObserved);
-    return withRedWorkerAttention(project.agents, s1);
-  }, [project, liveStatus, openIds, s0, lastObserved]);
+  // ── THE OVERLAY CHAIN, NOW SHARED ────────────────────────────────────────────────────────────
+  // It was five inline derivations here (`withObservedAttention` → `useNewAgentCalm` →
+  // `withUnstartedWorkerAttention` → `withRedWorkerAttention` → `withUnmergedWork`, plus the grace
+  // tick). It moved to `hooks/useOverlaidStatus` unchanged, ORDER INCLUDED, because the Epics column
+  // now asks the same stall question about the same agents (bead `sparkle-l06ax7`) and its first cut
+  // passed the RAW map with none of these overlays — which makes a head carrying a red worker read
+  // `blocked` here (verdict `active`) and `idle` there (verdict `finished`). A doc comment cannot
+  // stop that; one derivation can. Nothing about this file's behaviour changes: same functions, same
+  // order, same inputs.
+  const { status, calmStatus, graceTick } = useOverlaidStatus(project?.agents ?? NO_AGENTS);
   // Advance each agent's alert-episode record on every change to the overlaid (pre-dismissal) status
   // — the input the "Dismiss Alert" feature reads. Runs AFTER the worker-attention overlays so a
   // worker's bubbled red counts as the orchestrator's episode too: a dismissed orchestrator re-alerts
@@ -434,15 +395,6 @@ export function AgentSidebar({
   //       (2) — but it honours the dismissal record itself, so an acknowledged row is skipped and
   //       stays in its OWN band instead of being de-escalated to `idle` by (2), which would erase the
   //       "Needs merge" label and the evidence that the branch exists. See engine/stallEscalation.
-  const calmStatus = useMemo(
-    () =>
-      project
-        ? withUnmergedWork(project.agents, status, (id) =>
-            resolveStage(branchStatus[id], workflowStage[id]),
-          )
-        : status,
-    [project, status, branchStatus, workflowStage],
-  );
   // The stall question is asked about `calmStatus` — the PRE-escalation map — for the reason spelled
   // out on AgentRowProps.calmSt: `stallReport` answers `active` for the red tier, so feeding it the
   // escalated map would collapse every report to "nothing outstanding" and the escalation would erase
@@ -490,50 +442,17 @@ export function AgentSidebar({
   // component, but a `useMemo`/`useCallback` keyed on unchanged deps would still serve its stale
   // value, which is the same invisibility one layer in.
   const nudgeFlags = useNudgeFlagSnapshot();
-  const stallReportOf = useCallback(
-    (id: string) => {
-      // REACTIVITY ANCHOR, not dead code. `awaitingCloseEvidenceFor` reads the merge watermark from
-      // the store rather than taking it as an argument, so nothing in this body mentions
-      // `workflowShipped` and the dep would read as unnecessary — while dropping it leaves a row
-      // that has just merged painting its old colour until some other input happens to change.
-      void workflowShipped;
-      const agent = agentsById.get(id);
-      if (agent === undefined) return undefined;
-      return stallReport(
-        stallInputsFor(
-          calmStatus[id] ?? "stopped",
-          Date.now(),
-          agent.goal,
-          { bs: branchStatus[id], ws: workflowState[id], stageOverride: workflowStage[id] },
-          quotaBlockForAgent(id, Date.now()),
-          humanBlockIn(nudgeFlags, id),
-          // Whether git says this agent's work already shipped FOR THIS GOAL. Without it this
-          // surface cannot reach `awaiting_close`, so a row whose PR is merged behind a check only a
-          // person may answer keeps raising the RED `blocked-on-human` cause — the exact
-          // wrong-status reading this state was added to remove, on the one surface he watches.
-          awaitingCloseEvidenceFor(id, agent.goal),
-        ),
-      );
-    },
-    [
-      agentsById,
-      calmStatus,
-      branchStatus,
-      workflowState,
-      workflowStage,
-      workflowShipped,
-      nudgeFlags,
-    ],
-  );
   /** Positively read as FINISHED, or `undefined` when the git state was never read. `undefined` is a
-   *  real answer and it demotes nothing — see engine/finishedHeadCalm. */
-  const isFinishedOf = useCallback(
-    (id: string) => {
-      const r = stallReportOf(id);
-      return r === undefined ? undefined : r.verdict === "finished";
-    },
-    [stallReportOf],
-  );
+   *  real answer and it demotes nothing — see engine/finishedHeadCalm.
+   *
+   *  LIFTED OUT OF THIS FILE (bead `sparkle-l06ax7`). It was an eight-line `stallReport` chain right
+   *  here with one consumer, which was fine while this column was the only surface painting a
+   *  rolled-up disc. The Epics column now paints an epic's square from the SAME `rollupViewFor`
+   *  composition and needs the identical verdict, and this file's own note at the old site said why
+   *  copying it would be wrong: "Re-deriving it in two places is how this subsystem has drifted
+   *  before." `calmStatus`, `agentsById` and `nudgeFlags` stay local because they have other
+   *  consumers here; only the VERDICT moved. */
+  const isFinishedOf = useFinishedHeads(agentsById, calmStatus, nudgeFlags);
   const escalatedStatus = useMemo(() => {
     if (!project) return status;
     const escalated = withStallAttention(

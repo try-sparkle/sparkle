@@ -37,6 +37,7 @@
 
 import { Fragment, useMemo, useState, useCallback, useEffect, useRef } from "react";
 import { FiChevronDown, FiChevronRight, FiX } from "react-icons/fi";
+import { useShallow } from "zustand/react/shallow";
 import { C, FONT_WEIGHT } from "../theme/colors";
 import { FONT_UI, TYPE } from "../theme/scale";
 import { ZOOM_COLUMN_ATTR, zoomColumnFor } from "../engine/columnZoom";
@@ -68,6 +69,22 @@ import {
   readStoredEpicsWidth,
 } from "../engine/columnResize";
 import { EPIC_LADDER_COLUMNS, bucketEpics, type EpicLadderKey } from "../services/epicBoard";
+// ── THE HEALTH SQUARE'S THREE IMPORTS, AND WHY EACH IS THE SHARED ONE ─────────────────────────
+// `rollupViewFor` is the SANCTIONED entry point for "what disc is this build row painted"
+// (useAttentionNotifications / engine.workerRollup). A local `rollupDot` call here would be a
+// second derivation of the same fact, which is the column↔column drift those files' headers record
+// as already shipped. `agentsForEpicSlices` is the epic↔agent edge, stated once in
+// `services/epicLadder`. `engine/epicHealth` is the only place the rollup RULE lives.
+import { rollupViewFor } from "../useAttentionNotifications";
+import { resolveStage } from "../engine/workflowStage";
+import { useFinishedHeads } from "../hooks/useFinishedHeads";
+import { useOverlaidStatus } from "../hooks/useOverlaidStatus";
+import { useNudgeFlagSnapshot } from "../useNudgeFlags";
+import type { AgentTab } from "../types";
+import { agentsForEpicSlices } from "../services/epicLadder";
+import { epicHealth, epicHealthApplies, type EpicHealth } from "../engine/epicHealth";
+import { EpicHealthSquare } from "./EpicHealthSquare";
+import { useRuntimeStore } from "../stores/runtimeStore";
 import {
   childrenOfIndexed,
   epicDisplayTitle,
@@ -84,6 +101,10 @@ const SEAM_CLEARANCE = 10;
 /** A stable empty list, so a project with no snapshot yet does not hand a fresh array to the memo
  *  below on every render and re-bucket the whole store for nothing. */
 const NO_BEADS: Bead[] = [];
+
+/** The same trick for the roster: a pair with no project must not hand a fresh `[]` to the health
+ *  memos each render and rebuild the whole rollup for a column that has nothing in it. */
+const NO_AGENTS: AgentTab[] = [];
 
 /** Which stages start OPEN.
  *
@@ -186,6 +207,88 @@ export function EpicsColumn({
     () => (board ? bucketEpics(board, allBeads) : null),
     [board, allBeads],
   );
+
+  // ── HEALTH ───────────────────────────────────────────────────────────────────────────────────
+  // The founder: *"The epics should be tied to the corresponding build agents and the statuses
+  // should be showing next to the epic row."* The rule is `engine/epicHealth`; this is only the
+  // wiring, and it is deliberately COMPUTED ONCE FOR THE COLUMN rather than per row. `rollupViewFor`
+  // buckets every worker by `parentId` on construction, so calling it inside `EpicRow` would rebuild
+  // that map once per epic — on a store where the founder has nineteen of them and rows re-render
+  // on a 5s poll.
+  //
+  // SUBSCRIBED, NOT `getState()`-ed. Agent status is exactly the thing that changes while he is
+  // looking at this column, and a memo reading the store imperatively would paint the health it saw
+  // at mount and never move — the "green square on a red epic" version of the bug PR #2357 fixed one
+  // column over. These are the same four slices `AgentSidebar` subscribes to for its own discs.
+  const rt = useRuntimeStore(
+    useShallow((s) => ({
+      status: s.status,
+      openAgentIds: s.openAgentIds,
+      lastObserved: s.lastObserved,
+      branchStatus: s.branchStatus,
+      workflowStage: s.workflowStage,
+    })),
+  );
+  const agents = project?.agents;
+  const roster = agents ?? NO_AGENTS;
+  // THE SAME OVERLAID MAP THE BUILD COLUMN READS, from the same hook. The first cut built its own
+  // `withUnmergedWork(roster, RAW status, …)` here — the tail of that chain with none of the
+  // overlays — and that is not cosmetic: `stallReport` gates its arms behind `isQuiet(status)`, so a
+  // head carrying a red worker reads `blocked` in the build column (verdict `active`, NOT finished)
+  // and raw `idle` here (verdict `finished`). The two columns then disagreed about the same head in
+  // exactly the case the shared verdict was extracted to fix.
+  const { calmStatus, graceTick } = useOverlaidStatus(roster);
+  const agentsById = useMemo(() => {
+    const index = new Map<string, AgentTab>();
+    for (const a of roster) index.set(a.id, a);
+    return index;
+  }, [roster]);
+  const nudgeFlags = useNudgeFlagSnapshot();
+  const isFinishedOf = useFinishedHeads(agentsById, calmStatus, nudgeFlags);
+
+  const healthOf = useMemo(() => {
+    const openIds = new Set(rt.openAgentIds);
+    const stageOf = (id: string) => resolveStage(rt.branchStatus[id], rt.workflowStage[id]);
+    // ── THE TWO ARGUMENTS `rollupViewFor` WILL NOT DEFAULT CORRECTLY FOR A SECOND COLUMN ────────
+    // Both are documented on its own parameters as things a second caller has to pass:
+    //   • `isFinishedOf` — without it a finished orchestrator still carrying a red worker bubble
+    //     rolls up RED here while the build column has already gone calm.
+    //   • `nudgeFlags` — the nudger's table is a module-level Map with no store behind it, and a
+    //     flagged agent is SILENT by definition, so a memo that let this default could never re-run
+    //     to learn a flag had arrived (roborev 65408).
+    const { own, dotOf } = rollupViewFor(
+      roster,
+      rt.status,
+      openIds,
+      rt.lastObserved,
+      stageOf,
+      undefined,
+      undefined,
+      undefined,
+      isFinishedOf,
+      undefined,
+      undefined,
+      nudgeFlags,
+    );
+    // `own`, not the raw store map: it is the head's status with the worker bubbles stripped, which
+    // is what `engine/epicHealth`'s one status-reading arm (`lapsed`) is written against.
+    return (epicId: string): EpicHealth =>
+      epicHealth(
+        agentsForEpicSlices(roster, allBeads, epicId).map((a) => ({
+          id: a.id,
+          parentId: a.parentId,
+          dot: dotOf(a.id),
+          status: own[a.id] ?? "new",
+        })),
+      );
+    // `graceTick` is a REACTIVITY ANCHOR, not dead code — nothing in the body mentions it, and
+    // `AgentSidebar`'s twin memo lists it for the identical reason (roborev 54830). `composeRollup`
+    // samples its own clock in step (0), and for a held `errored` or briefless agent NONE of this
+    // memo's other deps ever move again: the beads snapshot short-circuits when unchanged, `rt` is
+    // shallow-compared, `roster` is stable, and `nudgeFlags` only moves when a flag arrives. Without
+    // it the epic square holds the pre-deadline reading indefinitely while the build column reddens.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [roster, allBeads, rt, isFinishedOf, nudgeFlags, graceTick]);
 
   // ── SELECTION ────────────────────────────────────────────────────────────────────────────────
   const focusedEpicId = useUiStore((s) => s.epicFocusBySide[side]);
@@ -463,6 +566,9 @@ export function EpicsColumn({
                       <EpicRow
                         epic={epic}
                         allBeads={allBeads}
+                        /* `null` on the three terminal rungs — a finished epic has no health to
+                           report, and `epicHealthApplies` is where that is decided. */
+                        health={epicHealthApplies(key) ? healthOf(epic.id) : null}
                         selected={focusedEpicId === epic.id}
                         reveal={revealEpicId === epic.id}
                         onSelect={() => setEpicFocus(side, epic.id)}
@@ -574,12 +680,16 @@ function EmptyNote({ children }: { children: React.ReactNode }) {
 function EpicRow({
   epic,
   allBeads,
+  health,
   selected,
   reveal = false,
   onSelect,
 }: {
   epic: Bead;
   allBeads: readonly Bead[];
+  /** The square's verdict, or `null` on a terminal rung where no square renders. Passed IN rather
+   *  than computed here: the column builds one rollup for every row (see `healthOf`). */
+  health: EpicHealth | null;
   selected: boolean;
   /** This row just ARRIVED and the column has expanded its stage for it — bring it on screen. Only
    *  ever true for one row at a time (see `revealEpicId`). */
@@ -630,6 +740,25 @@ function EpicRow({
         textAlign: "left",
       }}
     >
+      {/* ── THE HEALTH SQUARE, LEADING ────────────────────────────────────────────────────────
+          FIRST IN THE ROW, before the name, because it is the only thing here meant to be read
+          without reading. A leading slot puts every epic's mark in one vertical line down a 280px
+          column, so "which of these is nobody building" is answered by scanning an edge rather than
+          by reading nineteen titles. The founder's own placements — the priority chiclet "to the
+          right of the epic name, before the count" — are all TRAILING, and none of them was asked
+          for as a glance surface; this one was ("the statuses should be showing next to the epic
+          row").
+
+          NOTHING ELSE MOVES. The slot is `flex: "0 0 auto"` at 9px + the row's 6px gap, so the
+          title (already ellipsised at `flex: 1`) truncates 15px sooner and the chiclet and count
+          keep their positions exactly.
+
+          NO SLOT IS RESERVED ON A TERMINAL RUNG. `health === null` renders nothing at all rather
+          than an empty 9px gutter: Done/Shipped/Archived rows then sit flush left, which is a
+          second, free signal that those rungs are not reporting health. Alignment across rungs is
+          not worth defending here — the rungs are separate collapsible lists with their own
+          headers, never interleaved. */}
+      {health !== null && <EpicHealthSquare health={health} />}
       <span
         style={{
           flex: 1,
