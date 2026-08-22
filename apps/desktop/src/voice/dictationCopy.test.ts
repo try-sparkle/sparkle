@@ -10,6 +10,7 @@ import {
   preparingPlaceholder,
   modelPercent,
   classifyVoiceError,
+  isWatchdogFault,
   MICROPHONE_SETTINGS_URL,
   voiceErrorNotice,
   type VoiceErrorKind,
@@ -20,6 +21,7 @@ import {
   BACKEND_MIC_NOT_ANSWERED,
   BACKEND_NO_AUDIO_PREFIX,
   BACKEND_STALE_GRANT_PREFIX,
+  BACKEND_BUNDLE_REPLACED_PREFIX,
 } from "./backendVoiceErrors";
 // The advanced opt-in's own label, imported rather than retyped: the no-device remedy tells the user
 // to turn it on, and an instruction naming a control by a stale label is worse than none.
@@ -222,6 +224,73 @@ describe("stale-grant — the OS is sending silence on a grant it says is live",
   });
 });
 
+/** The watchdog's BUNDLE-REPLACED report, assembled the way the backend does — same convention as
+ *  the two fixtures above, and fully pinned in both directions: dictation/tests.rs's
+ *  `the_bundle_replaced_message_matches_the_prefix_the_frontend_pins` reads
+ *  `BACKEND_BUNDLE_REPLACED_PREFIX` back out of backendVoiceErrors.ts and asserts the Rust message
+ *  starts with it, and building the fixture FROM the constant means this side cannot drift either. */
+const bundleReplacedError = (device: string) =>
+  `${BACKEND_BUNDLE_REPLACED_PREFIX}${device}". Quit Sparkle and open it again to restore the ` +
+  `microphone.`;
+
+describe("bundle-replaced — the app was swapped on disk under the running process", () => {
+  // THE ROUTING, which is what makes the copy below reachable at all. This sentence names the
+  // microphone, so a missing pattern would not land it in `unknown` harmlessly — it sits one
+  // DENIAL word away from `permission`, the bucket whose remedy is the very pane that cannot work
+  // here. Asserted first for the same reason its stale-grant sibling is.
+  it("gets its own bucket rather than the stale-grant or permission one", () => {
+    expect(classifyVoiceError(bundleReplacedError("MacBook Pro Microphone"))).toBe(
+      "bundle-replaced",
+    );
+  });
+
+  // The disjointness the Rust side promises, checked from this end: neither sentence classifies as
+  // the other, so this bucket does not depend on winning a PATTERNS ordering race. Asserting only
+  // the forward direction would still pass for a build where `bundle-replaced` swallowed BOTH.
+  it("does not steal the stale-grant sentence, and is not stolen by it", () => {
+    expect(classifyVoiceError(staleGrantError("MacBook Pro Microphone"))).toBe("stale-grant");
+    expect(classifyVoiceError(bundleReplacedError("MacBook Pro Microphone"))).toBe(
+      "bundle-replaced",
+    );
+  });
+
+  // THE PAIRED COPY TEST. The same device through the two buckets, because "no System Settings in
+  // this notice" proves nothing on its own — it is equally true of a build that lost the Privacy
+  // remedy everywhere, or that routes both readings into the new bucket. The pair pins the cause.
+  it("drops the Privacy pane its sibling still offers, and keeps the one act that works", () => {
+    const replaced = voiceErrorNotice(bundleReplacedError("MacBook Pro Microphone"));
+    expect(replaced?.kind).toBe("bundle-replaced");
+    expect(replaced?.detail).toContain("MacBook Pro Microphone");
+    // The only remedy the evidence supports (bead sparkle-1ueh3: zero recoveries without one).
+    expect(replaced?.detail).toMatch(/quit sparkle/i);
+    // And NOT the pane. Sparkle is already switched on in it, and that switch governs the bundle
+    // now on disk rather than the unlinked binary the user is talking to.
+    expect(replaced?.detail).not.toMatch(/System Settings/i);
+    expect(replaced?.headline).toMatch(/updated/i);
+
+    // THE OTHER HALF OF THE PAIR: an ordinary stale grant keeps its full ladder, Privacy pane last.
+    const stale = voiceErrorNotice(staleGrantError("MacBook Pro Microphone"));
+    expect(stale?.kind).toBe("stale-grant");
+    expect(stale?.detail).toMatch(/System Settings/i);
+  });
+
+  it("falls back to the raw string when the sentence no longer parses", () => {
+    // Same fail-soft contract as the other two parsed buckets: a reworded backend must not produce
+    // a confident remedy about a device we can no longer name.
+    const raw = "Sparkle updated in the background and the microphone stopped working";
+    const n = voiceErrorNotice(raw);
+    expect(n?.kind).toBe("bundle-replaced");
+    expect(n?.detail).toBe(raw);
+  });
+
+  // The seam that drifted the last time a watchdog kind was added (see isWatchdogFault's own doc).
+  // Membership is decided by WHO EMITS IT — this is the same frame-liveness watchdog — and getting
+  // it wrong leaves the notice up over a microphone that has recovered.
+  it("is a watchdog fault, so the all-clear is allowed to retract it", () => {
+    expect(isWatchdogFault("bundle-replaced")).toBe(true);
+  });
+});
+
 describe("classifyVoiceError — bucket the raw backend error string", () => {
   const cases: [VoiceErrorKind, string][] = [
     // The frame-liveness watchdog: capture is LIVE, zero frames arriving. The real 2026-07-29
@@ -245,6 +314,9 @@ describe("classifyVoiceError — bucket the raw backend error string", () => {
     // A genuine microphone-permission denial (must mention the mic — see the misattribution guard).
     ["permission", "microphone permission denied"],
     ["permission", "Audio capture not authorized"],
+    // The watchdog's two NAMED-cause reports, so the table covers every live bucket.
+    ["stale-grant", staleGrantError("MacBook Pro Microphone")],
+    ["bundle-replaced", bundleReplacedError("MacBook Pro Microphone")],
   ];
 
   it.each(cases)("classifies %s from %j", (kind, raw) => {

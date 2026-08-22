@@ -173,6 +173,303 @@ fn notify_frontend_shown() {
     FRONTEND_SHOWN.store(true, std::sync::atomic::Ordering::SeqCst);
 }
 
+// ── INSTALL THE STAGED UPDATE AT QUIT, NOT HOURS BEFORE IT (bead sparkle-1ueh3) ─────────────────
+//
+// `services/updaterService.ts` now DOWNLOADS an update at check time and installs it only when the
+// process is about to stop running, because tauri-plugin-updater's macOS install DELETES the bundle
+// the live process was launched from (`updater.rs:1255-1302`: rename aside → remove_dir_all →
+// rename in → touch). macOS keys a TCC microphone grant to the bundle's signing identity AT ITS
+// PATH, so that swap silently and permanently kills the running process's microphone — 43 fault
+// events over six days, zero recoveries, every cluster ending in a restart onto a higher version.
+// This module is the Rust half of the fix: it holds the exit open long enough for the webview to
+// install, then lets the process go.
+//
+// WHICH QUITS THIS ACTUALLY COVERS — read out of the locked crate sources rather than assumed.
+// `RunEvent::ExitRequested` is emitted from exactly TWO sites in tauri-runtime-wry 2.11.3
+// (`src/lib.rs:4316` last-window-destroyed, `:4356` `Message::RequestExit` — i.e. `AppHandle::exit`
+// and `restart`). The macOS ⌘Q / app-menu Quit reaches NEITHER: muda maps the predefined Quit item
+// to `sel!(terminate:)` (muda-0.19.3 `src/platform_impl/macos/mod.rs:994`), and tao's macOS app
+// delegate implements only `applicationWillTerminate:` (tao-0.35.3
+// `src/platform_impl/macos/app_delegate.rs:131`) — there is no `applicationShouldTerminate:` — so
+// that path arrives as `Event::LoopDestroyed` → `RunEvent::Exit`, which is not preventable and is
+// far too late to await an async install. —— CHANGE D: `app_menu.rs` therefore REPLACES that
+// predefined Quit item on macOS with a custom one whose handler calls `AppHandle::exit`, so ⌘Q
+// lands on `Message::RequestExit` like everything else. Its ⌘Q header block is the contract, and it
+// also names what still cannot be covered from anywhere (Force Quit, a system logout or restart, the
+// Dock icon's own Quit — all `terminate:` or SIGKILL, neither interceptable without an
+// `applicationShouldTerminate:` tao does not implement). —— So this covers ⌘Q and the app menu's
+// Quit, and the helper island's "Quit Sparkle" (`roster::quit_app` → `AppHandle::exit`).
+//
+// LAST-WINDOW-DESTROYED IS **NOT** COVERED, and saying it was cost 5 seconds of hung app per quit.
+// That `ExitRequested` is emitted from `TaoWindowEvent::Destroyed` (tauri-runtime-wry 2.11.3
+// `src/lib.rs:4316`) AFTER the window has left the window map and only once `windows.is_empty()` —
+// the webview is already gone, so `app.emit` reaches ZERO listeners and still returns `Ok(())`.
+// Nothing ever acked, the `Err` arm never fired, and `prevent_exit()` held a windowless process for
+// the whole `ACK_BUDGET_MS` while installing nothing at all. `should_defer_exit` now declines that
+// exit outright: closing the last window with an update staged quits immediately and the update is
+// DELAYED to the next launch, which is this module's designed failure mode.
+//
+// AND THAT IS SURVIVABLE, because failing to install is DELAYED, never BROKEN: nothing on disk was
+// touched, so the next launch re-checks, re-downloads, and the banner's "Restart now" still works.
+// The only cost is one repeated download.
+//
+// THE WATCHDOG IS TWO-PHASE, AND THAT IS THE WHOLE DESIGN. A single short timer would be WORSE than
+// no timer: `install_inner` renames /Applications/Sparkle.app aside, `remove_dir_all`s it, and only
+// then renames the new bundle in, so killing the process mid-install can leave the app GONE from
+// disk. An unbounded wait, though, is a user who cannot quit their app — a far worse bug than the
+// one this fixes. The two states are therefore separated: the webview must ACK quickly (it only has
+// to run a listener callback), and the long budget is granted ONLY once it has said an install is
+// actually running. Expiring the short phase is safe by construction — nothing has started.
+mod updater_quit {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// Emitted to the webview when we have deferred an exit. MUST match `INSTALL_BEFORE_EXIT_EVENT`
+    /// in src/services/updaterService.ts — asserted by a test below, not merely by this comment.
+    pub const INSTALL_BEFORE_EXIT_EVENT: &str = "updater://install-before-exit";
+
+    /// How long the webview gets to report that it has STARTED installing. It only has to run a
+    /// listener callback and one invoke, so this is generous for a live webview and short for a
+    /// wedged one — and expiring here cannot corrupt anything, because no install has begun.
+    pub const ACK_BUDGET_MS: u64 = 5_000;
+
+    /// How long an install that HAS started gets before we exit regardless. Long on purpose: the
+    /// alternative to waiting is killing a process that may be between `remove_dir_all` and the
+    /// final rename. Reached only if the install neither resolves nor rejects.
+    pub const INSTALL_BUDGET_MS: u64 = 120_000;
+
+    static STAGED: AtomicBool = AtomicBool::new(false);
+    static DEFERRED: AtomicBool = AtomicBool::new(false);
+    static INSTALL_STARTED: AtomicBool = AtomicBool::new(false);
+    /// Set immediately before each of the two SANCTIONED exits — the webview's
+    /// `resume_exit_after_update`, and the watchdog's own `handle.exit(0)`. It is what tells the
+    /// second-quit hold below "this ExitRequested is the one we asked for", so those two pass
+    /// through while a user's second ⌘Q does not.
+    static RESUMING: AtomicBool = AtomicBool::new(false);
+
+    /// The webview telling us whether it is holding a downloaded update. With nothing staged we
+    /// never prevent an exit, so an ordinary quit pays nothing at all.
+    pub fn note_staged(staged: bool) {
+        STAGED.store(staged, Ordering::SeqCst);
+    }
+
+    /// The webview telling us `Update.install()` is running RIGHT NOW — the signal that promotes
+    /// the watchdog from the short ack budget to the long install budget.
+    pub fn note_install_started() {
+        INSTALL_STARTED.store(true, Ordering::SeqCst);
+    }
+
+    pub fn install_started() -> bool {
+        INSTALL_STARTED.load(Ordering::SeqCst)
+    }
+
+    /// May THIS exit be deferred? True at most ONCE per process, and only while something is
+    /// staged. The one-shot is what makes the resume — which re-enters `ExitRequested` by calling
+    /// `AppHandle::exit` again — terminate instead of looping forever.
+    pub fn claim_exit_deferral() -> bool {
+        STAGED.load(Ordering::SeqCst) && !DEFERRED.swap(true, Ordering::SeqCst)
+    }
+
+    /// The whole deferral decision, INCLUDING the precondition the one-shot cannot express: there
+    /// must still be a webview to receive `INSTALL_BEFORE_EXIT_EVENT`.
+    ///
+    /// WHY THE WEBVIEW GATE IS LOAD-BEARING, and why it is `&&`-FIRST so a windowless exit does not
+    /// burn the one claim: one of the two sites that emit `ExitRequested` in tauri-runtime-wry
+    /// 2.11.3 is `src/lib.rs:4316`, reached from `TaoWindowEvent::Destroyed` AFTER the window has
+    /// left the window map and only once `windows.is_empty()`. The webview is already GONE there,
+    /// so `app.emit(...)` reaches zero listeners and STILL returns `Ok(())` — the `Err` arm never
+    /// fires, nothing ever acks, and `prevent_exit()` held a windowless process for the full
+    /// `ACK_BUDGET_MS`. Net effect before this gate: closing the last window with an update staged
+    /// installed NOTHING and cost 5 seconds of apparently-hung app. Declining to claim there is
+    /// "update delayed", which is the failure mode this whole module is designed around.
+    pub fn should_defer_exit(has_webview: bool) -> bool {
+        has_webview && claim_exit_deferral()
+    }
+
+    /// Must THIS exit be held even though the deferral was already claimed?
+    ///
+    /// THE HAZARD THIS CLOSES. The deferral is one-shot, so before this existed only the FIRST exit
+    /// request was ever held. The quit-time install produces no instant result — the window just
+    /// sits there for the multi-second bundle swap — so the natural reaction is a second ⌘Q. That
+    /// second press reaches the same always-enabled custom Quit item (`app_menu.rs`), gets `false`
+    /// from `claim_exit_deferral`, and the process dies while `install_inner` is between its
+    /// `remove_dir_all` and its final rename: /Applications/Sparkle.app DELETED. That is strictly
+    /// worse than the bug this branch fixes.
+    ///
+    /// ALL THREE CONJUNCTS ARE SAFETY, NOT BELT-AND-BRACES:
+    ///  - `DEFERRED` — hold only when someone is already ON THE HOOK to resume (the webview's
+    ///    `resume_exit_after_update`, or the watchdog). Without it a sticky `INSTALL_STARTED` from
+    ///    an earlier install could hold an exit that NOTHING would ever release, i.e. an app that
+    ///    cannot be quit — the one outcome this module rates worse than a missed update.
+    ///  - `INSTALL_STARTED` — before the webview acks, nothing on disk has been touched, so killing
+    ///    the process is safe and the user gets their quit. That is the same reasoning as the
+    ///    watchdog's short phase.
+    ///  - `!RESUMING` — the sanctioned exits must pass. Both set it immediately before exiting.
+    ///
+    /// RESIDUAL WINDOW, STATED RATHER THAN ASSUMED AWAY: two ⌘Q presses inside the single IPC
+    /// round-trip it takes the webview to ack are still not held, because nothing yet distinguishes
+    /// them from a wedged webview. That is one round-trip, against the multi-second swap the
+    /// finding is actually about.
+    pub fn hold_second_exit() -> bool {
+        DEFERRED.load(Ordering::SeqCst)
+            && INSTALL_STARTED.load(Ordering::SeqCst)
+            && !RESUMING.load(Ordering::SeqCst)
+    }
+
+    /// Drop every flag back to process-start state. Test-only, and used ONLY to re-enter the
+    /// sequence below from a different starting point — a hold that fires with no deferral claimed
+    /// is otherwise unreachable in a single process, and it is the conjunct guarding against an
+    /// exit nobody would ever release.
+    #[cfg(test)]
+    pub fn reset_for_test() {
+        STAGED.store(false, Ordering::SeqCst);
+        DEFERRED.store(false, Ordering::SeqCst);
+        INSTALL_STARTED.store(false, Ordering::SeqCst);
+        RESUMING.store(false, Ordering::SeqCst);
+    }
+
+    /// Mark the exit we are about to make ourselves as sanctioned. Call IMMEDIATELY before the
+    /// `exit(0)` it describes — anything between the two is a window in which a real user quit
+    /// would be let through mid-install.
+    pub fn note_resuming() {
+        RESUMING.store(true, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// ONE test drives the whole sequence deliberately, and every new case belongs IN it:
+        /// these are process-wide statics and cargo runs tests in parallel threads, so a second
+        /// test touching them races this one and both flake. (Measured: adding the second-quit
+        /// cases as their own `#[test]` made this one fail on its very first claim.)
+        ///
+        /// Every assertion is about a SIDE EFFECT of the decision under test — was this exit
+        /// deferred, was it held — never about the precondition that set it up.
+        #[test]
+        fn the_deferral_defers_once_and_a_second_quit_mid_install_is_held() {
+            // Nothing staged — an ordinary quit is never deferred, so it costs nothing.
+            assert!(!should_defer_exit(true), "an exit with nothing staged must not be deferred");
+            // ...and nothing is ever HELD before a deferral was claimed, or a stray sticky flag
+            // could leave a user in an app that will not quit.
+            assert!(!hold_second_exit(), "with nothing deferred, no exit may ever be held");
+
+            note_staged(true);
+
+            // FINDING 3 — the last-window-destroyed exit arrives with the webview already gone, so
+            // it can install nothing. It must decline WITHOUT burning the single claim.
+            assert!(
+                !should_defer_exit(false),
+                "an exit with no webview left cannot install anything, so it must not be deferred"
+            );
+
+            // The claim it declined is still there for a real, webview-backed quit.
+            assert!(should_defer_exit(true), "the first webview-backed quit is deferred");
+            // THE LOOP GUARD. The resume path calls `AppHandle::exit` again, which re-enters
+            // ExitRequested; if this answered true a second time the app could never quit.
+            assert!(!should_defer_exit(true), "the deferral must be claimable at most once");
+            assert!(!claim_exit_deferral());
+
+            // The webview has to say so before the long budget applies — the whole point of the
+            // two-phase watchdog is that "webview never answered" is distinguishable from
+            // "an install is mid-rename".
+            assert!(!install_started(), "nothing has started installing yet");
+            // Deferred, but nothing on disk has been touched yet: a second quit here is SAFE to
+            // honour, and honouring it is how the user still gets their quit out of a wedged
+            // webview. Same reasoning as the watchdog's short phase.
+            assert!(
+                !hold_second_exit(),
+                "before the install starts, killing the process cannot corrupt the bundle"
+            );
+
+            // FINDING 1 — the bundle swap is now running. THIS is the second ⌘Q that used to kill
+            // the process between `remove_dir_all` and the final rename, leaving
+            // /Applications/Sparkle.app deleted.
+            note_install_started();
+            assert!(install_started());
+            assert!(
+                hold_second_exit(),
+                "a second quit while the bundle swap is running must be prevented"
+            );
+
+            // Both sanctioned exits — the webview's `resume_exit_after_update` and the watchdog's
+            // own `handle.exit(0)` — announce themselves first, so neither is caught by that hold.
+            note_resuming();
+            assert!(
+                !hold_second_exit(),
+                "the sanctioned resume must not be held, or the app could never quit"
+            );
+
+            // AN INSTALL FLAG WITH NO DEFERRAL BEHIND IT MUST NEVER HOLD ANYTHING. Nothing is
+            // waiting to resume that exit — no webview was asked, no watchdog was started — so
+            // holding it is an app that cannot be quit, which this module rates worse than a
+            // missed update. Reached only by rewinding the statics, since one process cannot
+            // otherwise get here.
+            reset_for_test();
+            note_install_started();
+            assert!(
+                !hold_second_exit(),
+                "an exit may only be held while something is on the hook to release it"
+            );
+        }
+
+        /// The short phase must stay short and the long phase must stay long — inverting them would
+        /// turn the safe branch into the one that can kill a process mid-rename.
+        #[test]
+        fn the_ack_budget_is_much_shorter_than_the_install_budget() {
+            assert!(
+                ACK_BUDGET_MS * 4 < INSTALL_BUDGET_MS,
+                "the ack budget bounds a webview that never answered (safe to kill); the install \
+                 budget bounds a rename that must be allowed to finish"
+            );
+        }
+
+        /// Same coherence check `app_menu.rs` runs for its menu events: a renamed event or command
+        /// is otherwise silent on BOTH sides — Rust defers an exit nobody answers, and the webview
+        /// waits for a message that never comes.
+        #[test]
+        fn the_typescript_updater_uses_the_same_event_and_commands() {
+            const UPDATER_TS: &str = include_str!("../../src/services/updaterService.ts");
+            assert!(
+                UPDATER_TS.contains(INSTALL_BEFORE_EXIT_EVENT),
+                "src/services/updaterService.ts must listen for {INSTALL_BEFORE_EXIT_EVENT}"
+            );
+            for cmd in ["note_staged_update", "note_update_install_started", "resume_exit_after_update"] {
+                assert!(
+                    UPDATER_TS.contains(cmd),
+                    "src/services/updaterService.ts must invoke {cmd} — without it the exit is \
+                     deferred and never resumed except by the watchdog"
+                );
+            }
+        }
+    }
+}
+
+/// The webview reporting whether it is holding a downloaded update. Drives whether an exit is worth
+/// deferring at all.
+#[tauri::command]
+fn note_staged_update(staged: bool) {
+    updater_quit::note_staged(staged);
+}
+
+/// The webview reporting that `Update.install()` is running now. Promotes the exit watchdog from
+/// its short "are you alive?" budget to the long "let the rename finish" one.
+#[tauri::command]
+fn note_update_install_started() {
+    updater_quit::note_install_started();
+}
+
+/// The webview reporting that it is done with the staged update — installed, or failed. Either way
+/// the exit proceeds; the frontend calls this in a `finally`.
+#[tauri::command]
+fn resume_exit_after_update(app: tauri::AppHandle) {
+    tracing::info!("webview finished with the staged update; resuming exit");
+    // Announce the sanctioned exit BEFORE requesting it: this `exit(0)` re-enters `ExitRequested`,
+    // where `hold_second_exit` would otherwise treat it exactly like a user's second ⌘Q and
+    // prevent it — an app that can never quit.
+    updater_quit::note_resuming();
+    app.exit(0);
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // BEFORE the event loop, before anything opens a window: the Builder Index dry run. It is a
@@ -352,6 +649,14 @@ pub fn run() {
             // best-effort — it only writes to the user's own disk here; upload is consent-gated in
             // the `flush_crash_reports` command.
             crash::install(app.handle());
+            // ── sparkle-1ueh3 (change C) ── EAGERLY copy every bundled resource out of the app
+            // bundle into `<app_data>/bin/<build sha>/`, ONCE, before the updater can replace
+            // /Applications/Sparkle.app underneath this running process (it polls at launch,
+            // hourly, and on every window focus). Every later consumer — the orchestrator and
+            // sparkle-control MCP servers, the Claude hook scripts, the roborev git hooks — reads
+            // that staged copy, so an old process can never end up running a NEWER build's files.
+            // Eager, not lazy: a first resolve happening after a swap would cache the new bundle.
+            hooks::init_staged_resources(app.handle());
             // Supply the `prepareForDragOperation:` override wry leaves unimplemented, so a file
             // released over a TERMINAL is delivered at all. Without it AppKit stops the drag after
             // the hover phase for any drop outside a natively-droppable element, which is why the
@@ -732,6 +1037,11 @@ pub fn run() {
             let handler: Box<dyn Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sync> =
                 Box::new(tauri::generate_handler![
             notify_frontend_shown,
+            // The install-on-quit hook for the auto-updater (bead sparkle-1ueh3). See the
+            // `updater_quit` module above for why the bundle swap must not happen mid-session.
+            note_staged_update,
+            note_update_install_started,
+            resume_exit_after_update,
             // ASYNC on purpose: it is read from the input-freeze trace, so it must not be able to
             // block on the main thread it exists to report on. See key_window.rs.
             key_window::main_window_key_state,
@@ -1226,6 +1536,70 @@ pub fn run() {
             // still-live CoreAudio callback otherwise raced teardown and aborted ().
             // Dropping the cpal stream here quiesces the audio IOThread first. Idempotent, so a
             // no-active-capture exit is a cheap no-op.
+            // Hold the exit open just long enough for the webview to install a DOWNLOADED-but-
+            // not-yet-installed update, so the bundle on disk is replaced ~a second before this
+            // process stops rather than hours before it (bead sparkle-1ueh3). No-ops unless the
+            // frontend has said something is staged. See the `updater_quit` module for which quits
+            // reach here — ⌘Q included, via the replacement Quit item app_menu.rs installs — and why
+            // the watchdog has two phases.
+            tauri::RunEvent::ExitRequested { ref api, .. } => {
+                // The webview gate is inside `should_defer_exit`, and it is `&&`-first so a
+                // last-window-destroyed exit — which arrives here with the window already out of
+                // the map — declines WITHOUT consuming the single claim. See that function.
+                let has_webview = !app.webview_windows().is_empty();
+                if updater_quit::should_defer_exit(has_webview) {
+                    match app.emit(updater_quit::INSTALL_BEFORE_EXIT_EVENT, ()) {
+                        Ok(()) => {
+                            api.prevent_exit();
+                            tracing::info!(
+                                "exit deferred so the staged update installs as this process goes away"
+                            );
+                            let handle = app.clone();
+                            std::thread::spawn(move || {
+                                // Phase 1 — did the webview even answer? If not, nothing is
+                                // installing and killing the process is safe.
+                                std::thread::sleep(std::time::Duration::from_millis(
+                                    updater_quit::ACK_BUDGET_MS,
+                                ));
+                                if !updater_quit::install_started() {
+                                    tracing::warn!(
+                                        "the webview never started the staged install; exiting without updating"
+                                    );
+                                    // Sanctioned exit — say so first or `hold_second_exit` would
+                                    // prevent the very timeout that exists to un-wedge the quit.
+                                    updater_quit::note_resuming();
+                                    handle.exit(0);
+                                    return;
+                                }
+                                // Phase 2 — an install IS running. Give it room, because exiting
+                                // between its remove_dir_all and its rename would leave
+                                // /Applications/Sparkle.app deleted.
+                                std::thread::sleep(std::time::Duration::from_millis(
+                                    updater_quit::INSTALL_BUDGET_MS,
+                                ));
+                                tracing::warn!(
+                                    "the staged install never reported back; exiting anyway"
+                                );
+                                updater_quit::note_resuming();
+                                handle.exit(0);
+                            });
+                        }
+                        Err(e) => tracing::warn!(
+                            "could not ask the webview to install the staged update: {e}"
+                        ),
+                    }
+                } else if updater_quit::hold_second_exit() {
+                    // A SECOND quit landed while the bundle swap is running. Dying here can leave
+                    // /Applications/Sparkle.app between `remove_dir_all` and the final rename —
+                    // i.e. GONE. Hold it; the webview's resume or the watchdog releases it, and
+                    // both announce themselves first so they are never caught by this arm.
+                    api.prevent_exit();
+                    tracing::warn!(
+                        "quit requested again while the staged update is installing; holding the \
+                         exit until the bundle swap finishes"
+                    );
+                }
+            }
             tauri::RunEvent::Exit => {
                 app.state::<dictation::DictationState>().stop_capture();
                 // Record + kill any in-flight improve pass here rather than in `Drop`: on macOS

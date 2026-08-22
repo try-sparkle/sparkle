@@ -13,7 +13,7 @@ use std::sync::mpsc;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{AppHandle, Emitter, State};
 
 use crate::worktree::read_worker_result_at;
 
@@ -607,19 +607,14 @@ pub struct McpPaths {
 pub fn orchestrator_mcp_paths(app: AppHandle) -> Result<McpPaths, String> {
     let node_path = crate::preflight::resolve_node_path_cached()
         .ok_or_else(|| "node not found (install Node.js; needed to run the orchestrator)".to_string())?;
-    let server = app
-        .path()
-        .resolve(
-            "resources/mcp-orchestrator-server.js",
-            tauri::path::BaseDirectory::Resource,
-        )
-        .map_err(|e| format!("orchestrator server.js missing: {e}"))?;
-    if !server.exists() {
-        return Err(format!(
-            "orchestrator server.js not bundled at {} (run apps/desktop build to copy it)",
-            server.display()
-        ));
-    }
+    // The STAGED copy under `<app_data>/bin/<build sha>/`, taken once at startup — NOT a fresh
+    // resolve out of the app bundle. The updater replaces the bundle under this running process
+    // (hourly, and on every window focus), and `resolve()` recomputes from `current_exe()`'s path
+    // STRING, so a per-call resolve after a swap hands back the NEXT version's server.js while
+    // every `.exists()` guard passes. This process would then speak version N's socket protocol to
+    // a version N+1 orchestrator. See `hooks::init_staged_resources` (bead sparkle-1ueh3).
+    let server = crate::hooks::stage_resource_script(&app, "mcp-orchestrator-server.js")
+        .map_err(|e| format!("orchestrator server.js unavailable: {e}"))?;
     Ok(McpPaths {
         node_path,
         server_path: server.to_string_lossy().to_string(),
@@ -1515,19 +1510,12 @@ pub fn control_respond(
 pub fn control_mcp_paths(app: AppHandle) -> Result<McpPaths, String> {
     let node_path = crate::preflight::resolve_node_path_cached()
         .ok_or_else(|| "node not found (install Node.js; needed to run sparkle-control)".to_string())?;
-    let server = app
-        .path()
-        .resolve(
-            "resources/mcp-control-server.js",
-            tauri::path::BaseDirectory::Resource,
-        )
-        .map_err(|e| format!("control server.js missing: {e}"))?;
-    if !server.exists() {
-        return Err(format!(
-            "control server.js not bundled at {} (run apps/desktop build to copy it)",
-            server.display()
-        ));
-    }
+    // Same staged-copy contract as `orchestrator_mcp_paths` above, and the stakes are higher here:
+    // all four callers of this command degrade SILENTLY (a `console.warn`, a `tracing::warn`), so a
+    // post-swap version skew would show up only as agents' `mcp__sparkle-control__*` calls failing
+    // with opaque `unauthorized`/unknown-op JSON. See `hooks::init_staged_resources`.
+    let server = crate::hooks::stage_resource_script(&app, "mcp-control-server.js")
+        .map_err(|e| format!("control server.js unavailable: {e}"))?;
     Ok(McpPaths {
         node_path,
         server_path: server.to_string_lossy().to_string(),

@@ -14,6 +14,28 @@
 // bundle's Info.plist version; the SHA is carried for the day the build stamps it into the plist
 // (see stale_build.rs / PRD/sparkle/stale-build-banner.md). Kept cheap: poll on an interval (default
 // hourly) + on refocus, never hot.
+//
+// ── WHY THE UPDATER'S "READY" STATE MUST NEVER BE ROUTED THROUGH HERE (bead sparkle-1ueh3) ──────
+// When updaterService was split so that it DOWNLOADS an update at check time and installs it only
+// at restart/quit, the obvious-looking tidy-up was to fold its new deferred state into this store
+// so there is one banner instead of two. Do not. Two independent reasons, both load-bearing:
+//
+//   1. THIS STORE GATES WORKER SPAWN. `workerSpawn.ts` THROWS on `staleBuild.stale`, so pushing
+//      "an update is downloaded but not installed" in here would break agent spawn for every user
+//      who declines to restart — and it would do it with a message ("version X is installed but not
+//      yet running") that is now FACTUALLY FALSE, because nothing has been installed: the payload
+//      is sitting in the webview's memory and /Applications is untouched.
+//   2. THE PREDICATES DO NOT OVERLAP, so there is nothing to merge. `isStaleBuild` keeps its EXACT
+//      predicate and still covers the cases only it can see — a hand-drag install over
+//      /Applications, and an update applied in a PREVIOUS session and never restarted.
+//      UpdateBanner's `phase === "ready"` covers this session's auto-update path. They answer
+//      different questions about different moments.
+//
+// AND DO NOT ADD AN MTIME TERM TO `isStaleBuild` EITHER. `installedMtimeMs` is carried on the probe
+// as a bug-report fallback and deliberately does NOT drive the predicate: an mtime comparison is
+// speculative (a touch, a partial write, an installer that stamps the bundle before the final swap
+// all move it), this watcher is hourly, and its output gates spawn. stale_build.rs:21-25 is right
+// about that; a speculative term in a spawn gate is a much worse failure than a missed banner.
 import { invoke } from "@tauri-apps/api/core";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { create } from "zustand";

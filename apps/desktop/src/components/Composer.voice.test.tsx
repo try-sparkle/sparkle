@@ -279,6 +279,32 @@ describe("Composer — a denied microphone offers a way out, not just a diagnosi
     expect(useDictationStore.getState().error).toBeNull();
   });
 
+  it("renders the bundle-replaced notice with NO Privacy remedy at all", () => {
+    // The watchdog's update-swap report. macOS killed this process's grant because the .app under
+    // it was replaced, so the Privacy pane is a PROVEN dead end: Sparkle is already switched on in
+    // it, and the switch governs the bundle now on disk rather than the binary the user is talking
+    // to. Quitting and reopening is the only thing that has ever ended one of these.
+    //
+    // NOT VACUOUS: the `permission` sibling in this same file proves the button is reachable from
+    // this surface and that this negative is not free — a Composer that simply never rendered the
+    // button would fail that test, and one that rendered it for every notice would fail this.
+    // Nothing needed changing in Composer.tsx for this: the button is gated on
+    // `notice.kind === "permission"`, so a new kind excludes it structurally. That is the claim
+    // under test.
+    useDictationStore.setState({
+      error:
+    `Sparkle updated in the background. macOS revoked the microphone for the running copy ` +
+    `and is sending silence from "MacBook Pro Microphone". Quit Sparkle and open it again to ` +
+    `restore the microphone.`,
+      status: "error",
+    });
+    renderComposer();
+    expect(composerText()).toMatch(/updated while it was running/i);
+    expect(composerText()).toMatch(/quit sparkle/i);
+    expect(screen.queryByRole("button", { name: "Open System Settings" })).toBeNull();
+    expect(composerText()).not.toMatch(/System Settings/i);
+  });
+
   it("offers System Settings ONLY for permission — never for a failure it cannot fix", () => {
     // The misattribution guard, rendered. Sending a user whose wifi dropped (or whose disk is
     // full) into the Microphone pane wastes their time on a switch that is already on — the exact

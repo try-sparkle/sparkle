@@ -2891,6 +2891,12 @@ impl DictationState {
         // feeds BOTH the fault log and — new as of the 2026-08-05 fix — the sentence the user reads,
         // so the contradiction the log has always recorded is now the thing that picks the remedy.
         let mut tcc = crate::mic_permission::MicAuth::Authorized;
+        // Was /Applications/Sparkle.app replaced UNDER this process? Gathered on the same arm and
+        // for the same reason as `tcc`: it is the fact that turns the stale-grant reading from an
+        // inference into a named cause, and it changes the remedy the user is given (bead
+        // sparkle-1ueh3). Default `false` so every non-Report arm stays a pure no-op — the stat
+        // happens once per fault, on this background thread, behind the `audio_reported` latch.
+        let mut bundle_replaced = false;
         match action {
             FaultAction::Idle => {}
             FaultAction::Reacquire => {
@@ -2921,12 +2927,20 @@ impl DictationState {
                 // reading, and it is the difference between "your microphone is broken" (it is
                 // not) and "this process's mic grant is dead; restart Sparkle" (it is).
                 tcc = crate::mic_permission::status();
+                // ONE `stat` of the installed bundle. macOS keys a TCC microphone grant to CODE
+                // IDENTITY at a path, so a bundle swapped out from under a running process kills
+                // that grant — while the line above keeps answering `Authorized` off its
+                // process-local cache. That pair is exactly the signature this fault has worn every
+                // time it has fired, and it is the difference between telling the user to visit a
+                // Privacy pane that cannot help and telling them to quit and reopen, which always
+                // has. See stale_build::bundle_replaced_since_launch for why mtime and not version.
+                bundle_replaced = crate::stale_build::bundle_replaced_since_launch_now();
                 tracing::error!(
                     target: "dictation",
                     device = device.as_ref().map(|d| d.name.as_str()).unwrap_or("<none>"),
                     uid = device.as_ref().and_then(|d| d.uid.as_deref()).unwrap_or("<none>"),
                     is_virtual = device.as_ref().map(|d| d.is_virtual).unwrap_or(false),
-                    muted, ?health, ?tcc,
+                    muted, ?health, ?tcc, bundle_replaced,
                     raw_samples = counts.raw_samples, raw_nonzero = counts.raw_nonzero,
                     out_samples = counts.out_samples, out_nonzero = counts.out_nonzero,
                     zero_source = ?counts.zero_source,
@@ -2952,7 +2966,14 @@ impl DictationState {
         // EVERY user-visible output of this tick, decided in one tested place and dispatched here.
         // This site holds no copy and makes no choice about who gets told what — see
         // `WatchdogEmission` for why that separation is the point rather than tidiness.
-        match watchdog_emission(action, device.as_ref(), muted, counts.zero_source, tcc) {
+        match watchdog_emission(
+            action,
+            device.as_ref(),
+            muted,
+            counts.zero_source,
+            tcc,
+            bundle_replaced,
+        ) {
             WatchdogEmission::Silent => {}
             WatchdogEmission::Error(message) => {
                 let _ = app.emit("dictation://error", message);

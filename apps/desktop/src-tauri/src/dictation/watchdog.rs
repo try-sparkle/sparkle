@@ -303,6 +303,36 @@ const NO_CAPTURE_MESSAGE: &str =
     "Sparkle couldn't open a microphone. Connect one, then pick it in Sparkle's mic menu \
      (hover the mic).";
 
+/// The BUNDLE-REPLACED report: the same digital silence as [`STALE_GRANT_MESSAGE`], with the cause
+/// established rather than inferred — /Applications/Sparkle.app was REPLACED under this running
+/// process, so macOS invalidated the grant this binary is still caching an `Authorized` answer for.
+///
+/// ── WHY THIS OUTRANKS THE STALE-GRANT SENTENCE ────────────────────────────────────────────────
+/// That sentence ends by sending the user to System Settings → Privacy & Security → Microphone.
+/// For a grant invalidated by a bundle swap that pane CANNOT help: Sparkle is already switched on
+/// there, and toggling it re-grants the code identity now on disk, not the unlinked binary the user
+/// is talking to. The only thing that restores the microphone is relaunching onto the bundle that
+/// is actually installed. Bead sparkle-1ueh3: 12 of 12 fault clusters ended in a restart onto a
+/// HIGHER version, and across six days there were ZERO successful transcripts after a swap and
+/// ZERO "audio is arriving again" recoveries. Nothing short of a relaunch has ever fixed this.
+///
+/// THREE CONSTRAINTS ON THESE BYTES, each of which has a test:
+///
+/// 1. NO APOSTROPHE in the pinned opening clause. `the_bundle_replaced_message_matches_the_prefix_
+///    the_frontend_pins` reads the TS constant back with `.split('\'').nth(1)`, so a single quote
+///    would truncate the pin to a prefix of itself and the cross-language check would pass while
+///    the two sides had drifted. Hence "the running copy", never "this process's copy".
+/// 2. LEXICALLY DISJOINT from [`STALE_GRANT_MESSAGE`] — it must NOT contain "sending silence
+///    instead of audio", which is the noun phrase dictationCopy's `stale-grant` pattern matches.
+///    Disjoint means the new bucket cannot be stolen by an ordering change in that PATTERNS list;
+///    it does not have to WIN a race it never enters.
+/// 3. It must not name System Settings (see above), it must say "Quit Sparkle" (the one remedy that
+///    works), and it must carry `{device}` like both of its siblings — the device name is the fact
+///    only the backend has, and every other message in this module names it.
+const BUNDLE_REPLACED_MESSAGE: &str =
+    "Sparkle updated in the background. macOS revoked the microphone for the running copy and is \
+     sending silence from \"{device}\". Quit Sparkle and open it again to restore the microphone.";
+
 /// The stale-grant report: macOS is handing this process pure digital silence from a microphone it
 /// says we are allowed to use.
 ///
@@ -358,8 +388,17 @@ pub(in crate::dictation) fn watchdog_report_message(
     muted: bool,
     zero_source: ZeroSource,
     tcc: crate::mic_permission::MicAuth,
+    bundle_replaced: bool,
 ) -> String {
     match device {
+        // A REFINEMENT WITHIN the stale-grant reading, not a fifth condition on it — which is why
+        // `is_stale_grant` is unchanged and is re-tested here rather than extended. Keeping the
+        // guard whole is what preserves the existing precedence: a MUTED device still falls through
+        // to `no_audio_message` and is told it is muted, even mid-update, because unmuting is still
+        // the fix and the update story would send that user off to quit an app for nothing.
+        Some(d) if bundle_replaced && is_stale_grant(d, muted, zero_source, tcc) => {
+            BUNDLE_REPLACED_MESSAGE.replace("{device}", &d.name)
+        }
         Some(d) if is_stale_grant(d, muted, zero_source, tcc) => {
             STALE_GRANT_MESSAGE.replace("{device}", &d.name)
         }
@@ -402,12 +441,17 @@ pub(in crate::dictation) fn watchdog_emission(
     muted: bool,
     zero_source: ZeroSource,
     tcc: crate::mic_permission::MicAuth,
+    bundle_replaced: bool,
 ) -> WatchdogEmission {
     match action {
         FaultAction::Idle | FaultAction::Reacquire => WatchdogEmission::Silent,
-        FaultAction::Report => {
-            WatchdogEmission::Error(watchdog_report_message(device, muted, zero_source, tcc))
-        }
+        FaultAction::Report => WatchdogEmission::Error(watchdog_report_message(
+            device,
+            muted,
+            zero_source,
+            tcc,
+            bundle_replaced,
+        )),
         FaultAction::Recovered => WatchdogEmission::Recovered,
     }
 }

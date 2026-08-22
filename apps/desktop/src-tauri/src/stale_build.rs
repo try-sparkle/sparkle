@@ -30,7 +30,8 @@
 // running side plus `None` for everything read off disk.
 
 use serde::Serialize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::UNIX_EPOCH;
 use tauri::{AppHandle, Runtime};
 
@@ -68,6 +69,17 @@ pub struct StaleBuildProbe {
 
 fn installed_app_path() -> PathBuf {
     PathBuf::from(INSTALLED_APP_PATH)
+}
+
+/// The `.app` bundle an executable lives inside: the nearest ancestor whose name ends in `.app`.
+/// `None` for a binary with no such ancestor — `cargo run`, `cargo test`, a Windows `.exe`.
+///
+/// PURE, and taking the exe path as an argument, because this is the half of
+/// [`bundle_replaced_since_launch_now`] that decides WHICH bundle gets stat'd.
+fn app_bundle_of(exe: &Path) -> Option<PathBuf> {
+    exe.ancestors()
+        .find(|p| p.extension().and_then(|e| e.to_str()) == Some("app"))
+        .map(Path::to_path_buf)
 }
 
 /// Read `CFBundleShortVersionString` from an installed macOS bundle's Info.plist. Uses `defaults`
@@ -161,6 +173,131 @@ pub fn probe<R: Runtime>(app: &AppHandle<R>) -> StaleBuildProbe {
     }
 }
 
+/// Was the installed bundle replaced on disk AFTER this process started? PURE — the two facts are
+/// passed in, so the decision is unit-testable without a filesystem or a `ps`.
+///
+/// Unknown on either side is `false`: a missing bundle (dev run, DMG launched from Downloads) or an
+/// unreadable start time is not evidence that a swap happened, and inventing one here would put the
+/// "quit and reopen" story in front of a user whose microphone is dead for an ordinary reason.
+///
+/// ── WHY MTIME AND NOT A VERSION COMPARISON ────────────────────────────────────────────────────
+/// The TCC microphone grant is keyed to CODE IDENTITY at a path, not to a version string. A
+/// same-version rebuild, or a re-sign of the identical version, invalidates the running process's
+/// grant exactly as a version bump does. mtime is the only fact available off disk that covers all
+/// three, and `install_inner` (tauri-plugin-updater) always `touch`es the bundle after swapping it
+/// in — so a real swap ALWAYS stamps the mtime. A version comparison would add zero true positives
+/// (the touch already guarantees the mtime moves) and one PERMANENT false positive: the
+/// side-by-side case, where a dev build or a DMG runs from somewhere other than /Applications while
+/// /Applications holds a different release, where a version comparison would report "replaced"
+/// forever. So this deliberately does NOT `||` in a version mismatch.
+///
+/// The side-by-side case is handled by probing the RIGHT BUNDLE, not by hoping /Applications is
+/// never written: see [`bundle_replaced_for`]. This function is only the comparison — it is told
+/// which mtime to use.
+///
+/// NO TIME MARGIN, and that is deliberate too: `process_started_ms` derives from `ps -o etimes=`,
+/// which truncates to whole seconds, so it OVER-estimates the start time by up to 999 ms. The
+/// comparison is therefore already biased fail-closed — a swap in the same second as launch reads
+/// as "not replaced" rather than the other way round.
+///
+/// ── THIS IS NOT stale_build.rs:21-25 CONTRADICTING ITSELF ─────────────────────────────────────
+/// The module docs above say the BANNER predicate deliberately excludes mtime, and that reasoning
+/// is correct FOR THAT PREDICATE and does not transfer. `isStaleBuild` runs hourly against a
+/// healthy app and gates worker spawn (workerSpawn.ts:102-111 THROWS on it), so a false positive
+/// there is expensive. This one runs only inside `FaultAction::Report` — after `is_stale_grant` has
+/// already established not-muted, not-virtual, `zero_source == Os` and `tcc == Authorized`. We are
+/// not deciding whether anything is wrong; we are choosing between two explanations for a fault
+/// that ALREADY happened, and one of the two remedies is free.
+pub fn bundle_replaced_since_launch(
+    installed_mtime_ms: Option<u64>,
+    running_started_ms: Option<u64>,
+) -> bool {
+    match (installed_mtime_ms, running_started_ms) {
+        (Some(m), Some(s)) => m > s,
+        _ => false,
+    }
+}
+
+/// This process's start time, gathered once. Process start is IMMUTABLE, so caching it is not just
+/// an optimization: it also removes the per-call jitter of re-running `ps -o etimes=`, whose
+/// whole-second truncation would otherwise make the same launch resolve to a slightly different
+/// millisecond on every read.
+///
+/// `OnceLock<u64>`, NOT `OnceLock<Option<u64>>`: the latter memoizes a FAILURE just as permanently
+/// as a success, and the failure mode is a `/bin/ps` fork that did not happen — most likely under
+/// exactly the memory/load pressure that accompanies an incident. One such miss would disable
+/// bundle-swap detection for the whole process lifetime, silently and with nothing logged.
+static PROCESS_STARTED_MS: OnceLock<u64> = OnceLock::new();
+
+/// Memoize ONLY a `Some`. The seam takes the cell and the reader so a test can drive the property
+/// that matters — a failed read is RETRIED on the next call, a successful one never is.
+fn started_ms_memo(cell: &OnceLock<u64>, read: impl FnOnce() -> Option<u64>) -> Option<u64> {
+    if let Some(v) = cell.get() {
+        return Some(*v);
+    }
+    let v = read()?;
+    Some(*cell.get_or_init(|| v))
+}
+
+/// The decision behind [`bundle_replaced_since_launch_now`], with every impure input injected: the
+/// executable this process was exec'd as, its start time, and how to read an mtime.
+///
+/// THE BUNDLE PROBED IS THE ONE THIS PROCESS RUNS FROM, not the hard-coded `/Applications` path —
+/// the question is "was MY bundle replaced under me", and `/Applications` is written during an
+/// ordinary session by the OTHER copy's own hourly auto-update. A DMG copy running from
+/// `~/Downloads`, or a dev build outliving the release copy's update, would otherwise both read as
+/// "replaced" with the running binary's code identity untouched — handing the user a confidently
+/// wrong cause and a remedy (quit and reopen) that cannot fix their fault.
+///
+/// The TRUE POSITIVE survives: `_NSGetExecutablePath` returns the path recorded at exec, so after a
+/// real in-place swap `current_exe()` STILL resolves to the replaced bundle. Only the side-by-side
+/// case changes, and it changes to a correct negative.
+///
+/// THE `.app`-LESS CASE IS A NEGATIVE, NOT A FALLBACK (roborev 67429). When `current_exe()`
+/// SUCCEEDS and the path has no `.app` ancestor we know with certainty this process is not running
+/// from `/Applications/Sparkle.app`, so statting that bundle would reintroduce the exact false
+/// positive this function exists to remove. `tauri dev` / `cargo run` produces precisely that shape
+/// (a bare `target/debug/sparkle`), and the release copy's own hourly auto-update then writes
+/// `/Applications` mid-session — the very trigger this change is about. Such a process cannot have
+/// had its bundle swapped by the updater, so `false` is the correct answer, not a guess.
+///
+/// `installed_app_path()` remains the fallback ONLY for a `current_exe()` that failed, where we
+/// genuinely cannot tell where we are running from and the installed path is the best guess left.
+fn bundle_replaced_for(
+    exe: Option<&Path>,
+    running_started_ms: Option<u64>,
+    mtime: &dyn Fn(&Path) -> Option<u64>,
+) -> bool {
+    let bundle = match exe {
+        Some(exe) => match app_bundle_of(exe) {
+            Some(bundle) => bundle,
+            None => return false,
+        },
+        None => installed_app_path(),
+    };
+    bundle_replaced_since_launch(mtime(&bundle), running_started_ms)
+}
+
+/// [`bundle_replaced_since_launch`] against live facts: one `stat` of the installed bundle, plus
+/// the cached process start.
+///
+/// DELIBERATELY NOT `probe()`. It needs no `AppHandle` and no `R: Runtime` generic (so it is
+/// callable from the audio watchdog, which has neither), and it skips the `/usr/bin/defaults` fork
+/// entirely — the expensive half of `probe`, and the one this decision has no use for.
+///
+/// SAFE TO CALL FROM THE WATCHDOG. `watchdog_tick` runs on the dedicated `audio-watchdog` thread
+/// (dictation.rs:2983-3008), never the AppKit main thread, and the `Report` arm is latched by
+/// `sess.audio_reported` — so this is ONE `stat` per fault, on a background thread, plus ONE FORK,
+/// ONCE PER PROCESS, off the main thread. That last clause used to read "there is no fork here at
+/// all", which was inaccurate: the first call forks `/bin/ps` through [`process_started_ms`]. The
+/// THREAD is the real safeguard against the warning at stale_build.rs:107-113 about forking from a
+/// large-RSS app on the main thread — a reader who took "no fork" at face value could call this from
+/// the main thread, which is precisely what that warning forbids.
+pub fn bundle_replaced_since_launch_now() -> bool {
+    let started = started_ms_memo(&PROCESS_STARTED_MS, process_started_ms);
+    bundle_replaced_for(std::env::current_exe().ok().as_deref(), started, &mtime_ms)
+}
+
 /// Tauri command: the frontend polls this on an interval and feeds it to the pure JS `isStaleBuild`
 /// predicate (staleBuildService.ts) to decide whether to show the "Restart to finish updating"
 /// banner.
@@ -225,6 +362,137 @@ mod tests {
     #[test]
     fn mtime_ms_is_none_for_a_missing_path() {
         assert_eq!(mtime_ms(std::path::Path::new("/no/such/bundle.app")), None);
+    }
+
+    /// The bundle-replaced predicate, at the boundary that decides which remedy a user is shown.
+    ///
+    /// STRICTLY GREATER, and the equal case is the assertion that pins it. `process_started_ms`
+    /// truncates `ps -o etimes=` to whole seconds and therefore OVER-estimates the start time by up
+    /// to 999 ms, so the comparison is already biased fail-closed; loosening it to `>=` would tip
+    /// a same-millisecond reading — the launch-time stat of a bundle we ourselves just opened —
+    /// into "we were replaced", which is the false positive this side of the boundary exists to
+    /// exclude.
+    #[test]
+    fn bundle_replaced_only_when_the_install_is_strictly_newer_than_the_launch() {
+        // A swap under a running process: the bundle's mtime postdates our start.
+        assert!(bundle_replaced_since_launch(Some(2_000), Some(1_000)));
+        // Installed BEFORE we launched — the ordinary healthy shape, and the side-by-side case
+        // (a dev build running while /Applications holds an older release).
+        assert!(!bundle_replaced_since_launch(Some(1_000), Some(2_000)));
+        // EQUAL is not replaced. See the doc above: `>=` would make this true and would be wrong.
+        assert!(!bundle_replaced_since_launch(Some(1_000), Some(1_000)));
+    }
+
+    /// Unknown is NOT evidence. Each of the three degraded readings has a real producer — no bundle
+    /// at /Applications (dev run, DMG from Downloads), a `ps` that did not parse, and the non-macOS
+    /// build where BOTH stubs return `None` — and in every one of them claiming a swap would put
+    /// "Sparkle updated in the background, quit and reopen" in front of a user whose microphone is
+    /// dead for a completely different reason.
+    #[test]
+    fn an_unknown_side_is_never_read_as_a_replacement() {
+        assert!(!bundle_replaced_since_launch(None, Some(1_000)));
+        assert!(!bundle_replaced_since_launch(Some(1_000), None));
+        assert!(!bundle_replaced_since_launch(None, None));
+    }
+
+    /// FINDING 4. The predicate must answer "was MY bundle replaced under me", so it has to stat the
+    /// bundle THIS process runs from. Statting the hard-coded `/Applications/Sparkle.app` instead
+    /// turns every write to /Applications during the session — the OTHER copy's own hourly
+    /// auto-update — into a confident, wrong "Sparkle updated in the background" story with a
+    /// remedy (quit and reopen) that cannot fix the user's fault.
+    #[test]
+    fn a_bundle_running_from_elsewhere_is_not_replaced_by_a_write_to_slash_applications() {
+        let started = Some(1_000);
+        // /Applications got a NEW build 5 s into our session. Our own copy did not move.
+        let stat = |p: &Path| -> Option<u64> {
+            match p.to_string_lossy().as_ref() {
+                "/Applications/Sparkle.app" => Some(6_000),
+                "/Users/x/Downloads/Sparkle.app" => Some(500),
+                _ => None,
+            }
+        };
+
+        // THE CASE THAT MUST BE NEGATIVE: a DMG copy running from ~/Downloads.
+        assert!(
+            !bundle_replaced_for(
+                Some(Path::new("/Users/x/Downloads/Sparkle.app/Contents/MacOS/Sparkle")),
+                started,
+                &stat,
+            ),
+            "a write to /Applications is not a replacement of the bundle we are running from"
+        );
+
+        // THE TRUE POSITIVE IS PRESERVED. `current_exe()` reports the path recorded at exec, so
+        // after a real in-place swap it still names the bundle that was replaced.
+        assert!(
+            bundle_replaced_for(
+                Some(Path::new("/Applications/Sparkle.app/Contents/MacOS/Sparkle")),
+                started,
+                &stat,
+            ),
+            "an in-place swap of OUR bundle is still detected"
+        );
+
+        // A KNOWN `.app`-LESS PATH IS A NEGATIVE, NOT A FALLBACK (roborev 67429). This assertion
+        // used to expect `true` here, which pinned the very false positive the test above exists to
+        // remove: `current_exe()` SUCCEEDED, so we know for certain this process is not running from
+        // /Applications, and `tauri dev` / `cargo run` produces exactly this shape. Statting
+        // /Applications anyway would tell a developer their bundle was swapped every time the
+        // release copy auto-updated beside them.
+        assert!(
+            !bundle_replaced_for(Some(Path::new("/tmp/target/debug/sparkle")), started, &stat),
+            "a dev build with no .app ancestor cannot have been swapped by the updater"
+        );
+
+        // A FAILED `current_exe()` still falls back to the installed path: there we genuinely cannot
+        // tell where we are running from, and the installed bundle is the best guess left.
+        assert!(
+            bundle_replaced_for(None, started, &stat),
+            "an unreadable current_exe() falls back to the installed path"
+        );
+    }
+
+    #[test]
+    fn the_app_bundle_is_the_nearest_dot_app_ancestor() {
+        assert_eq!(
+            app_bundle_of(Path::new("/Users/x/Downloads/Sparkle.app/Contents/MacOS/Sparkle")),
+            Some(PathBuf::from("/Users/x/Downloads/Sparkle.app"))
+        );
+        // NEAREST, not outermost: a bundle nested inside another (a helper .app) belongs to itself.
+        assert_eq!(
+            app_bundle_of(Path::new("/A/Sparkle.app/Contents/Helpers/H.app/Contents/MacOS/H")),
+            Some(PathBuf::from("/A/Sparkle.app/Contents/Helpers/H.app"))
+        );
+        assert_eq!(app_bundle_of(Path::new("/tmp/target/debug/sparkle")), None);
+        assert_eq!(app_bundle_of(Path::new("/Applications/Sparkle.apple/x")), None);
+    }
+
+    /// FINDING 5. A `OnceLock<Option<u64>>` memoizes the FAILURE too, and the failure is a `/bin/ps`
+    /// fork that did not happen — most likely under exactly the load that accompanies an incident.
+    /// One miss would disable bundle-swap detection for the rest of the process lifetime, silently.
+    #[test]
+    fn a_failed_process_start_read_is_retried_rather_than_memoized() {
+        static CELL: OnceLock<u64> = OnceLock::new();
+        static READS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        use std::sync::atomic::Ordering;
+
+        let bump = || READS.fetch_add(1, Ordering::Relaxed);
+
+        assert_eq!(started_ms_memo(&CELL, || { bump(); None }), None, "the fork failed");
+        assert_eq!(
+            started_ms_memo(&CELL, || { bump(); Some(1_234) }),
+            Some(1_234),
+            "detection must come back, not stay dead for the process lifetime"
+        );
+        assert_eq!(READS.load(Ordering::Relaxed), 2, "the failure was retried, not sealed");
+
+        // A SUCCESS is still sealed: process start is immutable, and re-reading `ps -o etimes=`
+        // would re-truncate to a different millisecond on every call.
+        assert_eq!(
+            started_ms_memo(&CELL, || panic!("a successful read must never be repeated")),
+            Some(1_234)
+        );
+        assert_eq!(READS.load(Ordering::Relaxed), 2);
     }
 
     #[test]

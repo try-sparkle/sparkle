@@ -16,7 +16,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tauri::{AppHandle, Manager};
+use tauri::AppHandle;
 
 /// A frontend-supplied id component (project_id / agent_id / worker_id) that gets joined into a
 /// filesystem path AND embedded into a git branch name. These are UUIDs in practice, so we hold
@@ -1347,8 +1347,10 @@ fn hooks_are_inert(repo_root: &str, installed_into: &Path, configured: Option<&s
 /// NON-DESTRUCTIVE: a pre-existing hook that is not ours (no vendored marker) is left untouched
 /// (see `may_write_hook`) — since `[tools].roborev` defaults on and this runs for every project,
 /// silently overwriting a user's own `post-commit`/`post-rewrite` would be data loss. Each script is
-/// resolved from the app bundle's `resources/roborev/<name>` and `.exists()`-guarded, so a dev build
-/// with un-bundled resources degrades to a clear Err rather than a panic. Git worktrees share the
+/// read from this build's STAGED copy (`hooks::stage_resource_script`, staged once at startup into
+/// `<app_data>/bin/<build sha>/roborev/<name>`), so a dev build with un-bundled resources degrades
+/// to a clear Err naming the path rather than a panic — and an updater swapping the bundle under
+/// the running process can never substitute a different version's hook. Git worktrees share the
 /// common-dir hooks (see `hooks_dir_for`), so installing once transparently covers every
 /// `.sparkle/` agent worktree cut from the repo — and works when `repo_root` IS such a worktree.
 pub fn install_repo_hooks(app: &AppHandle, repo_root: &str) -> Result<(), String> {
@@ -1357,19 +1359,11 @@ pub fn install_repo_hooks(app: &AppHandle, repo_root: &str) -> Result<(), String
         .map_err(|e| format!("cannot create {hooks_dir:?}: {e}"))?;
 
     for (name, marker) in ROBOREV_HOOKS {
-        let src = app
-            .path()
-            .resolve(
-                format!("resources/roborev/{name}"),
-                tauri::path::BaseDirectory::Resource,
-            )
-            .map_err(|e| format!("bundled roborev {name} hook missing: {e}"))?;
-        if !src.exists() {
-            return Err(format!(
-                "bundled roborev {name} hook not found at {} (run apps/desktop build to bundle it)",
-                src.display()
-            ));
-        }
+        // The STAGED copy taken at startup, not a fresh resolve out of the app bundle: the updater
+        // can replace the bundle under this running process, and a post-swap resolve silently
+        // returns the NEXT version's hook. See `hooks::init_staged_resources` (bead sparkle-1ueh3).
+        let src = crate::hooks::stage_resource_script(app, &format!("roborev/{name}"))
+            .map_err(|e| format!("bundled roborev {name} hook unavailable: {e}"))?;
         let dest = hooks_dir.join(name);
         // Never clobber a user's own hook: skip if a foreign hook already sits here. Pass existence
         // separately from readable contents so a present-but-unreadable (binary/perm) hook is NOT

@@ -147,6 +147,28 @@ describe("LogoWaveform — a denied microphone gets the same one-click remedy as
     );
   });
 
+  it("renders the bundle-replaced notice with NO Privacy remedy at all", () => {
+    // The composer's twin, and it must be asserted in BOTH surfaces for the reason this whole
+    // describe block exists (roborev 37737): the same notice renders in each, so a remedy — or the
+    // absence of one — that is right in only one place is right nowhere. Here the absence is the
+    // point: a grant killed by a bundle swap cannot be repaired from the Microphone pane.
+    //
+    // NOT VACUOUS: the `permission` tests above prove this surface DOES render the button, so a
+    // null query here is a real discrimination rather than a free negative.
+    useDictationStore.setState({
+      error:
+    `Sparkle updated in the background. macOS revoked the microphone for the running copy ` +
+    `and is sending silence from "MacBook Pro Microphone". Quit Sparkle and open it again to ` +
+    `restore the microphone.`,
+      status: "error",
+    });
+    render(<LogoWaveform />);
+    expect(document.body.textContent).toMatch(/updated while it was running/i);
+    expect(document.body.textContent).toMatch(/quit sparkle/i);
+    expect(screen.queryByRole("button", { name: "Open System Settings" })).toBeNull();
+    expect(document.body.textContent).not.toMatch(/System Settings/i);
+  });
+
   it("offers System Settings ONLY for permission — never for a failure it cannot fix", () => {
     for (const raw of [
       "Dns Failed: resolve error",

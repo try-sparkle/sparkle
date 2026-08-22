@@ -1298,6 +1298,7 @@
             false,
             ZeroSource::Os,
             crate::mic_permission::MicAuth::Authorized,
+            false,
         ) else {
             panic!("a Report must speak");
         };
@@ -1332,6 +1333,7 @@
             false,
             ZeroSource::SelfInflicted,
             crate::mic_permission::MicAuth::Authorized,
+            false,
         ) else {
             panic!("a Report must speak");
         };
@@ -1347,10 +1349,137 @@
             true,
             ZeroSource::Os,
             crate::mic_permission::MicAuth::Authorized,
+            false,
         ) else {
             panic!("a Report must speak");
         };
         assert!(muted.contains("is muted"), "a muted device is still named as muted: {muted}");
+    }
+
+    /// THE BUNDLE-REPLACED REPORT, AND ITS PAIR — one bit apart, driven through the real dispatch.
+    ///
+    /// A test that only proves ABSENCE is ambiguous (AGENTS.md): "no System Settings in the copy"
+    /// passes just as well for a build that lost the stale-grant sentence entirely, or that never
+    /// consults `bundle_replaced` and always emits the new one. So all three readings are asserted
+    /// from the SAME setup, and no single mutation can satisfy them together:
+    ///
+    ///   bundle_replaced = true   → the update copy, which must NOT send anyone to System Settings
+    ///   bundle_replaced = false  → the OLD stale-grant copy, System Settings and all
+    ///   muted = true, replaced   → still the muted copy, because unmuting is still the fix
+    ///
+    /// The third is the precedence guard. `is_stale_grant` is deliberately UNCHANGED by this
+    /// feature — the swap is a refinement WITHIN it — so a muted device must keep outranking the
+    /// update story even in the middle of an update. Wiring `bundle_replaced` ahead of the mute
+    /// check would pass both of the first two and fail here.
+    #[test]
+    fn a_bundle_swapped_under_the_process_changes_the_remedy_but_not_the_precedence() {
+        let physical = crate::audio::BoundDevice {
+            name: "MacBook Pro Microphone".into(),
+            uid: Some("BuiltInMicrophoneDevice".into()),
+            is_virtual: false,
+            was_default: true,
+        };
+        let report = |muted: bool, bundle_replaced: bool| {
+            let WatchdogEmission::Error(msg) = watchdog_emission(
+                FaultAction::Report,
+                Some(&physical),
+                muted,
+                ZeroSource::Os,
+                crate::mic_permission::MicAuth::Authorized,
+                bundle_replaced,
+            ) else {
+                panic!("a Report must speak");
+            };
+            msg
+        };
+
+        // 1. THE SWAP. /Applications/Sparkle.app was replaced under us, so the grant is dead for
+        //    code-identity reasons the Privacy pane cannot undo — the pane shows Sparkle already
+        //    switched on, and toggling it re-grants the bundle on disk, not the binary talking.
+        let replaced = report(false, true);
+        assert!(
+            replaced.contains("updated in the background"),
+            "the swap must be NAMED as the cause; it is the whole point of the new bucket: {replaced}"
+        );
+        assert!(
+            replaced.contains("Quit Sparkle"),
+            "relaunching is the ONLY remedy that has ever fixed this (sparkle-1ueh3): {replaced}"
+        );
+        assert!(
+            !replaced.contains("System Settings"),
+            "a grant killed by a bundle swap cannot be repaired from a Privacy pane; sending the \
+             user there is the dead end this change exists to remove: {replaced}"
+        );
+        assert!(
+            replaced.contains("MacBook Pro Microphone"),
+            "the device name is the fact only the backend has, and every sibling carries it: {replaced}"
+        );
+        // Lexically disjoint from its sibling ON PURPOSE, so the frontend bucket cannot be stolen
+        // by an ordering change in dictationCopy's PATTERNS list.
+        assert!(
+            !replaced.contains("sending silence instead of audio"),
+            "must not carry the stale-grant noun phrase the other bucket matches on: {replaced}"
+        );
+
+        // 2. THE SAME READING WITHOUT THE SWAP still gets the old sentence, System Settings and all.
+        //    Its remedies are correctly ordered for a grant that went stale for some OTHER reason,
+        //    and deleting them to make (1) pass would be a regression this asserts against.
+        let not_replaced = report(false, false);
+        assert!(
+            not_replaced.contains("System Settings → Privacy & Security → Microphone"),
+            "the stale-grant copy keeps its full remedy ladder when nothing was swapped: {not_replaced}"
+        );
+        assert!(
+            !not_replaced.contains("updated in the background"),
+            "with no swap on disk we must not claim one; that is a confident wrong cause: {not_replaced}"
+        );
+
+        // 3. PRECEDENCE. Muted outranks both grant stories — mid-update or not.
+        let muted = report(true, true);
+        assert!(
+            muted.contains("is muted"),
+            "unmuting is still the fix; the update story must not displace it: {muted}"
+        );
+        assert!(
+            !muted.contains("updated in the background"),
+            "a muted device must not be told to quit and reopen: {muted}"
+        );
+    }
+
+    /// The same cross-language pin as its stale-grant twin below, for the NEW prefix. Cloned in the
+    /// SAME commit that adds the constant, because the frontend routes this message by its opening
+    /// clause too — and without this the new bucket could drift wordlessly into `unknown`, which
+    /// renders the raw backend string and quietly loses the tailored remedy.
+    #[test]
+    fn the_bundle_replaced_message_matches_the_prefix_the_frontend_pins() {
+        let pinned = std::fs::read_to_string("../src/voice/backendVoiceErrors.ts")
+            .expect("read the frontend contract file");
+        // SINGLE-quoted in the TS for the same reason as its siblings: the literal ends in a bare
+        // `"` and this naive split has to survive it. The corollary is that the literal must
+        // contain NO APOSTROPHE — one would truncate `want` to a prefix of the prefix and this
+        // assertion would pass while the two sides had actually drifted.
+        let want = pinned
+            .split("BACKEND_BUNDLE_REPLACED_PREFIX =")
+            .nth(1)
+            .and_then(|s| s.split('\'').nth(1))
+            .expect("BACKEND_BUNDLE_REPLACED_PREFIX literal (single-quoted)");
+        let device = crate::audio::BoundDevice {
+            name: "MacBook Pro Microphone".into(),
+            uid: Some("BuiltInMicrophoneDevice".into()),
+            is_virtual: false,
+            was_default: true,
+        };
+        let msg = watchdog_report_message(
+            Some(&device),
+            false,
+            ZeroSource::Os,
+            crate::mic_permission::MicAuth::Authorized,
+            true,
+        );
+        assert!(
+            msg.starts_with(&want),
+            "backend message and frontend pin have drifted:\n  backend: {msg}\n  pinned:  {want}"
+        );
     }
 
     /// The cross-language pin the `BACKEND_NO_AUDIO_PREFIX` comment asked for and never got ("HALF A
@@ -1381,6 +1510,7 @@
             false,
             ZeroSource::Os,
             crate::mic_permission::MicAuth::Authorized,
+            false,
         );
         assert!(
             msg.starts_with(&want),
@@ -1837,7 +1967,7 @@
         // constant proved nothing: it is a precondition, not an output, so reverting the emitting
         // arm to an inline "System Settings → Sound → Input" literal left the constant merely
         // unreferenced and this test still green while the regression shipped.
-        let WatchdogEmission::Error(msg) = watchdog_emission(FaultAction::Report, None, false, ZeroSource::NotApplicable, crate::mic_permission::MicAuth::Authorized)
+        let WatchdogEmission::Error(msg) = watchdog_emission(FaultAction::Report, None, false, ZeroSource::NotApplicable, crate::mic_permission::MicAuth::Authorized, false)
         else {
             panic!("a Report with no device bound must still TELL the user something");
         };
@@ -1859,7 +1989,7 @@
             was_default: true,
         };
         let WatchdogEmission::Error(named) =
-            watchdog_emission(FaultAction::Report, Some(&bound), false, ZeroSource::NotApplicable, crate::mic_permission::MicAuth::Authorized)
+            watchdog_emission(FaultAction::Report, Some(&bound), false, ZeroSource::NotApplicable, crate::mic_permission::MicAuth::Authorized, false)
         else {
             panic!("a Report with a device bound must tell the user something");
         };
@@ -1878,20 +2008,20 @@
         let quiet = [FaultAction::Idle, FaultAction::Reacquire];
         for action in quiet {
             assert_eq!(
-                watchdog_emission(action, None, false, ZeroSource::NotApplicable, crate::mic_permission::MicAuth::Authorized),
+                watchdog_emission(action, None, false, ZeroSource::NotApplicable, crate::mic_permission::MicAuth::Authorized, false),
                 WatchdogEmission::Silent,
                 "{action:?} is a silent internal step; the user must not be told about it"
             );
         }
         assert!(
             matches!(
-                watchdog_emission(FaultAction::Report, None, false, ZeroSource::NotApplicable, crate::mic_permission::MicAuth::Authorized),
+                watchdog_emission(FaultAction::Report, None, false, ZeroSource::NotApplicable, crate::mic_permission::MicAuth::Authorized, false),
                 WatchdogEmission::Error(_)
             ),
             "a Report is the ONLY thing that surfaces a fault — going quiet here is the incident"
         );
         assert_eq!(
-            watchdog_emission(FaultAction::Recovered, None, false, ZeroSource::NotApplicable, crate::mic_permission::MicAuth::Authorized),
+            watchdog_emission(FaultAction::Recovered, None, false, ZeroSource::NotApplicable, crate::mic_permission::MicAuth::Authorized, false),
             WatchdogEmission::Recovered,
             "recovery must RETRACT the notice; sending an error here would leave it up forever"
         );

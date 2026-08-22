@@ -57,6 +57,32 @@ export const BACKEND_NO_AUDIO_PREFIX = 'No audio from "';
  *  matched FIRST in dictationCopy's PATTERNS. → `stale-grant` */
 export const BACKEND_STALE_GRANT_PREFIX = 'macOS is sending silence instead of audio from "';
 
+/** The watchdog's BUNDLE-REPLACED report — again the durable opening clause only, for the same
+ *  reason as the two prefixes above: the rest interpolates an OS-supplied device name.
+ *
+ *  Distinct from BACKEND_STALE_GRANT_PREFIX because the CAUSE is now NAMED and the remedy is
+ *  narrower. Both are emitted from the same reading (`zero_source=Os` + `tcc=Authorized`), but this
+ *  one adds one more fact: the installed bundle's mtime postdates this process's start, i.e.
+ *  /Applications/Sparkle.app was REPLACED under the running binary. macOS keys a microphone grant
+ *  to code identity at a path, so that swap invalidates the running process's grant while
+ *  AVCaptureDevice.authorizationStatus keeps answering Authorized from its process-local cache.
+ *  Bead sparkle-1ueh3 has the evidence (12/12 fault clusters ended in a restart onto a higher
+ *  version; zero successful transcripts after a swap across six days).
+ *
+ *  ORDERING IS *NOT* LOAD-BEARING HERE, ON PURPOSE. Unlike BACKEND_STALE_GRANT_PREFIX, this
+ *  sentence is LEXICALLY DISJOINT from its sibling — it does not contain "sending silence instead
+ *  of audio" — so the `bundle-replaced` bucket cannot be stolen by the `stale-grant` pattern no
+ *  matter which is tested first. Its pattern is still listed first in dictationCopy's PATTERNS, but
+ *  correctness does not depend on winning that race.
+ *
+ *  NO APOSTROPHE MAY APPEAR IN THIS LITERAL. dictation/tests.rs reads it back out of this file with
+ *  `.split('\'').nth(1)`, so a single quote inside the string truncates the parse and the
+ *  cross-language pin silently checks a prefix of the prefix. (The same test's own comment records
+ *  a `\"` breaking that parse once.) Hence "the running copy" rather than "this process's copy".
+ *  → `bundle-replaced` */
+export const BACKEND_BUNDLE_REPLACED_PREFIX =
+  'Sparkle updated in the background. macOS revoked the microphone for the running copy and is sending silence from "';
+
 /** We prompted and timed out waiting. Deliberately carries NO denial word, so it lands in `unknown`
  *  (which renders it verbatim) rather than `permission`: the status is still NotDetermined, so the
  *  Privacy pane has no Sparkle entry yet and sending the user there would be a dead end. → `unknown` */

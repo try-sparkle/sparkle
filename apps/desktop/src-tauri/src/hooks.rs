@@ -11,13 +11,13 @@
 //! `worktree-guard.mjs`, the emitter by `sparkle-hook.mjs`).
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 use serde::Serialize;
 use serde_json::{json, Value};
 use tauri::path::BaseDirectory;
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Manager, Runtime};
 
 /// Substring identifying a Sparkle emitter hook entry, for idempotent reinstall.
 const EMITTER_MARKER: &str = "sparkle-hook.mjs";
@@ -78,38 +78,514 @@ fn hook_command(script: &Path, arg: &Path) -> String {
     )
 }
 
+// ── Staged bundle resources (bead sparkle-1ueh3) ──────────────────────────────────────────────
+//
+// EVERY bundled resource this app runs is copied out of the bundle ONCE, EAGERLY, at startup, into
+// `<app_data>/bin/<running build segment>/<relative path>` — and every consumer reads the staged
+// copy, never the bundle.
+//
+// WHY, and why the SHA segment is the load-bearing part. `tauri-plugin-updater` replaces
+// `/Applications/Sparkle.app` UNDERNEATH the running process (rename aside → `remove_dir_all` →
+// rename in), silently, on a poller that fires at launch, hourly, and on every window focus. On
+// macOS `current_exe()` returns the path STRING captured at exec, not the inode, and
+// `app.path().resolve(.., BaseDirectory::Resource)` recomputes from it on EVERY call. So a resource
+// resolved after a swap has three possible fates:
+//
+//   A. DURING the swap → the path is missing        → an `Err`; every `.exists()` guard fires.
+//   B. AFTER the swap  → same path, NEW content     → `.exists()` is TRUE → SILENT VERSION SKEW.
+//   C. bundle moved    → permanently missing        → a persistent `Err`.
+//
+// MODE A IS NOT MERELY "a clean Err", and pretending it was is what made the first cut of this a
+// REGRESSION in failure behaviour. The updater's poller fires AT LAUNCH and [`init_staged_resources`]
+// runs in `setup()`, so an overlap with the updater's `remove_dir_all` window makes `src.exists()`
+// false for ALL SIX resources at the one moment staging happens. Sealing that in a `OnceLock` returned
+// the same Err FOREVER from `orchestrator_mcp_paths`, `control_mcp_paths`, `install_agent_hooks_sync`,
+// `heal_agent_hooks_sync` and `install_repo_hooks` — no agent openable, no hook installable, no
+// roborev hook writable, until the user quit and relaunched, with a `tracing::warn` as the only
+// signal. Before staging existed each of those re-resolved per call, so the agent pane's "Try again"
+// recovered by itself once the swap finished. Two things restore that, WITHOUT reopening mode B:
+//
+//   * [`stage_one`] falls back to an ALREADY-STAGED copy at `<dest_dir>/<rel>`. `dest_dir` is
+//     `bin/<this build's segment>/`, so anything there is this build's own bytes by construction —
+//     written by this process or by an earlier run of the SAME build, never by version N+1.
+//   * the memo is re-runnable ([`staged_or_init`]): a load in which NOTHING staged is RETRIED on a
+//     later call, gated on this process's own bundle not having been replaced since launch
+//     (`stale_build::bundle_replaced_since_launch_now`). Once the swap has landed the gate closes and
+//     the stale Err is preferred over version N+1's bytes. A load with at least one success is sealed
+//     exactly as before.
+//
+// Mode B is the dangerous one and is why this exists: a version-N Rust process would spawn a
+// version-N+1 `mcp-control-server.js` against its own N socket protocol (op names, token shape,
+// `handle_request_line`). Nothing errors — agents' `mcp__sparkle-control__*` calls just fail with
+// opaque `unauthorized`/unknown-op JSON, or succeed with the wrong semantics.
+//
+// Two properties close it, and BOTH are required:
+//   * RESOLVE + COPY ONCE PER PROCESS, EAGERLY at startup ([`init_staged_resources`], called from
+//     `lib.rs` `setup()`). Lazy memoization is NOT sufficient: a first resolve that happens after a
+//     swap caches the NEW bundle's content, which is mode B again with an extra step.
+//   * KEY THE DESTINATION BY BUILD SHA. `<app_data>/bin/` used to be flat, so a NEWER process
+//     starting up overwrote the very file a RUNNING older process depends on — mode B relocated
+//     from the bundle into app-data. A per-build directory means no process can ever write over
+//     another build's staged copy.
+//
+// The staged copies are also what makes the baked absolute paths in each worktree's
+// `.claude/settings.local.json` survive the bundle being renamed/replaced/removed (the original
+// reason `stage_resource_script` existed); `heal_agent_hooks` re-points stale copies at launch, so
+// the SHA segment moving from build to build heals itself.
+
 /// Per-process counter so concurrent stages (several agents opening at once) never collide on the
 /// same temp filename before the atomic rename below.
 static STAGE_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// Copy a bundled resource script (`resources/<name>`) into a STABLE app-data location
-/// (`<app_data>/bin/<name>`) and return that stable path.
+/// Every bundled resource staged out of the bundle at startup, as a path RELATIVE to the bundle's
+/// `resources/` dir. Nested paths are supported and load-bearing: `roborev/post-commit` must keep
+/// its subdirectory, or it would collide with any future top-level `post-commit`.
 ///
-/// Why: the absolute script path is baked into each worktree's `.claude/settings.local.json` hook
-/// commands. If we pointed those at the app *bundle* (`<App>.app/Contents/Resources/...`), then
-/// renaming/replacing/deleting the bundle (e.g. running "Sparkle 2.app", then swapping in a new
-/// build) orphans every hook the old bundle ever wrote — Claude then fails to run them with
-/// `MODULE_NOT_FOUND`. The app-data dir is independent of the bundle's name/location and lives
-/// next to the worktrees themselves, so a path under it survives app rename/reinstall.
+/// These are all SELF-CONTAINED single-file bundles (tsup, node builtins external, zero relative
+/// imports) or standalone shell scripts, so copying the one file is sufficient — there is no
+/// `node_modules` or sibling to drag along. That is what makes staging cheap enough to do eagerly.
+pub const STAGED_RESOURCES: &[&str] = &[
+    "sparkle-hook.mjs",
+    "worktree-guard.mjs",
+    "mcp-orchestrator-server.js",
+    "mcp-control-server.js",
+    "roborev/post-commit",
+    "roborev/post-rewrite",
+];
+
+/// How long a staged directory belonging to some OTHER build may sit unused before the startup
+/// sweep reclaims it. See [`sweep_stale_bins`] for why this is a backstop, not the safety property.
+const STALE_BIN_MAX_AGE_MS: u64 = 14 * 24 * 60 * 60 * 1000;
+
+/// One process's view of the staged resources: the directory they live in, and the outcome for each
+/// one. Errors are stored rather than returned so a single missing resource cannot take the whole
+/// staging step down — each consumer gets its own failure, with its own message.
+#[derive(Clone)]
+pub(crate) struct StagedBin {
+    pub(crate) dir: PathBuf,
+    pub(crate) entries: std::collections::BTreeMap<String, Result<PathBuf, String>>,
+}
+
+/// The single per-process memo. Populated eagerly by [`init_staged_resources`].
 ///
-/// Published atomically (copy to a temp sibling, then rename) so a hook firing in parallel never
-/// reads a half-written script.
-pub fn stage_resource_script(app: &AppHandle, name: &str) -> Result<PathBuf, String> {
-    let src = app
-        .path()
-        .resolve(format!("resources/{name}"), BaseDirectory::Resource)
-        .map_err(|e| format!("{name} missing in bundle: {e}"))?;
-    let dir = crate::dev_identity::app_data_dir(app)?.join("bin");
-    std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir bin: {e}"))?;
-    let dst = dir.join(name);
+/// A `Mutex<Option<..>>` rather than a `OnceLock` for exactly one reason: a `OnceLock` seals a
+/// FAILURE as permanently as a success, and the failure this staging step is most likely to hit is
+/// the launch-time overlap with the updater's own `remove_dir_all` (mode A in the module header) —
+/// which sealed meant no agent could be opened for the rest of the session. See [`staged_or_init`].
+static STAGED: Mutex<Option<StagedBin>> = Mutex::new(None);
+
+/// Is this process's own bundle still the one it was launched from — i.e. may a failed stage be
+/// retried without risking version N+1's bytes landing under version N's segment (mode B)?
+///
+/// Consulted ONLY when a previous load produced nothing usable, so the healthy path never pays for
+/// it. `bundle_replaced_since_launch_now` stats the bundle THIS process runs from (derived from
+/// `current_exe()`); its one `/bin/ps` fork is memoized process-wide.
+fn bundle_is_still_this_build() -> bool {
+    !crate::stale_build::bundle_replaced_since_launch_now()
+}
+
+/// The memo seam, taking the cell and the retry gate explicitly so a test can drive it with its OWN
+/// cell and assert the side effects that matter.
+///
+/// WHEN IT SEALS: only when EVERY entry is `Ok`. From that point nothing reloads, so a later change
+/// to the SOURCE — the bundle being swapped — can never reach the staged copies. Any entry still in
+/// `Err` is RETRIED, subject to `retry_allowed`, rather than sealed for the process lifetime. (This
+/// paragraph previously said a load with "at least one usable path" sealed, which stopped being true
+/// when the partial case was fixed and contradicted the paragraph below it — roborev 67441. It is
+/// the paragraph a reader consults to reason about mode B, so it is the worst one to leave stale.)
+///
+/// WHAT EACH MECHANISM ACTUALLY BUYS — they cover DIFFERENT halves, and an earlier version of this
+/// paragraph overstated it badly enough to be dangerous (roborev 67454), so it is spelled out:
+///
+/// * The PER-ENTRY retry (below) protects the entries that ALREADY STAGED. They are never re-copied,
+///   so whatever they took while the bundle was provably ours is what they keep. It does nothing for
+///   the entry still in `Err` — that is precisely the one a retry re-copies.
+/// * `retry_allowed` is the ONLY guard on that still-`Err` entry. `stage_one` reads
+///   `<resource_root>/<rel>` out of the bundle NOW, so if the swap has landed, a retry publishes
+///   version N+1's bytes into `bin/<N's segment>/<rel>` — and a never-staged entry has no prior copy
+///   to fall back on, so the consumer gets N+1's server under a running N.
+///
+/// AND THAT GUARD FAILS OPEN, so the hole is narrowed, not closed: `bundle_replaced_since_launch`
+/// answers "not replaced" whenever either input is unknown, and `process_started_ms()` is `None` on
+/// every non-macOS target — so off macOS it is a constant "retry allowed". A retried `Err` entry
+/// after an undetected swap is therefore a RESIDUAL mode-B hole, not a closed one; it is bounded in
+/// practice only because the swap-under-a-running-process mechanism is the macOS updater's, where
+/// the gate does hold. Do NOT read this as a reason to drop the gate — on macOS it is the live
+/// protection. The platform-independent fix (snapshot the bundle mtime once in `setup()`, before the
+/// poller can fire, and require BOTH) is bead sparkle-j2j509.
+///
+/// THE RETRY IS PER ENTRY, and that is a correctness requirement rather than an optimisation
+/// (roborev 67444). [`stage_all`] copies the resources SEQUENTIALLY, so a window opening or closing
+/// mid-loop leaves a MIXED result — as does a per-file transient (ENOSPC, an EINTR'd copy, a briefly
+/// locked app-data dir) on one resource while the others land. Sealing that state was the defect
+/// this retry fixes; but re-running the WHOLE load to fix it was worse, because [`stage_one`]
+/// deliberately never prefers an already-staged copy over a fresh one, so a whole-load retry
+/// re-copies the entries that already succeeded — publishing whatever `resources/` holds NOW into
+/// this build's segment. After a swap that is version N+1's bytes in version N's directory: mode B,
+/// the silent version skew this module exists to prevent. (Why `retry_allowed` cannot carry that
+/// weight on its own is stated once, above — deliberately not repeated here.)
+///
+/// So: only the entries that are still `Err` are re-attempted, and their results are merged in. An
+/// entry that staged keeps the copy it took while the bundle was provably ours, whatever happens
+/// later in the session.
+pub(crate) fn staged_or_init(
+    cell: &Mutex<Option<StagedBin>>,
+    retry_allowed: &dyn Fn() -> bool,
+    all_rels: &[&str],
+    load: &dyn Fn(&[&str]) -> StagedBin,
+) -> StagedBin {
+    // A poisoned lock here means some other caller panicked mid-load; the value is still whatever
+    // was last stored, and refusing to stage would be strictly worse than reading it.
+    let mut slot = cell.lock().unwrap_or_else(|e| e.into_inner());
+
+    let pending: Vec<&str> = match slot.as_ref() {
+        None => all_rels.to_vec(),
+        Some(existing) => {
+            let pending: Vec<&str> = all_rels
+                .iter()
+                .copied()
+                .filter(|r| existing.entries.get(*r).map(|e| e.is_err()).unwrap_or(true))
+                .collect();
+            if pending.is_empty() || !retry_allowed() {
+                return existing.clone();
+            }
+            pending
+        }
+    };
+
+    let fresh = load(&pending);
+    let merged = match slot.take() {
+        None => fresh,
+        Some(mut existing) => {
+            // `fresh` carries ONLY the entries we re-attempted, so this adopts the retry's results
+            // without touching an entry that already staged. A degraded load reports an empty dir;
+            // keeping the known-good one means a later success is still addressable.
+            if !fresh.dir.as_os_str().is_empty() {
+                existing.dir = fresh.dir;
+            }
+            for (rel, result) in fresh.entries {
+                existing.entries.insert(rel, result);
+            }
+            existing
+        }
+    };
+    *slot = Some(merged.clone());
+    merged
+}
+
+/// The directory-name segment that identifies THIS build's staged copies.
+///
+/// `sha` is the compile-time `SPARKLE_GIT_SHA`; `pid` is this process's id. When the SHA is
+/// unavailable ("unknown" — a tarball build, or git missing at compile time) there is NO build
+/// discriminator, and two genuinely different builds would both land in `bin/unknown/` — which is
+/// precisely the mode-B collision the segment exists to prevent. So the unknown case FAILS SAFE to
+/// a per-PROCESS segment: unique by construction, so nothing can ever overwrite what this process
+/// staged. The cost is one extra directory per launch of an unknown-SHA build, which the startup
+/// sweep reclaims.
+pub(crate) fn build_segment(sha: &str, pid: u32) -> String {
+    let clean: String = sha.chars().filter(|c| c.is_ascii_alphanumeric()).take(40).collect();
+    if clean.is_empty() || clean == "unknown" {
+        format!("unknown-{pid}")
+    } else {
+        clean
+    }
+}
+
+/// [`build_segment`] for the running process. This is the line that supplies the REAL build
+/// discriminator; everything below takes the segment as an argument so it can be tested.
+pub(crate) fn current_build_segment() -> String {
+    build_segment(option_env!("SPARKLE_GIT_SHA").unwrap_or("unknown"), std::process::id())
+}
+
+/// Copy ONE resource from `<resource_root>/<rel>` to `<dest_dir>/<rel>`, published atomically (copy
+/// to a temp sibling, then rename) so a hook or MCP launch firing in parallel never reads a
+/// half-written file. Creates the destination's parent dirs, so a NESTED `rel` such as
+/// `roborev/post-commit` works — the flat `resources/<name>` shape this replaced could not express
+/// one, which is why the roborev hooks could not share this code path.
+///
+/// Missing sources are reported HERE, naming the path. Relying on `fs::copy`'s error instead
+/// surfaced as a bare `stage <name>: No such file or directory` with nothing to act on.
+///
+/// FALLS BACK TO AN ALREADY-STAGED COPY when the source cannot be read. `dest_dir` is
+/// `bin/<this build's segment>/`, keyed by SHA (or by pid for an unknown-SHA build), so a file
+/// sitting there is THIS build's own bytes by construction — put there by this process or by an
+/// earlier run of the same build, never by version N+1. Serving it is therefore free of the
+/// version-skew (mode B) risk, and it is what stops the updater's `remove_dir_all` window turning a
+/// launch-time miss into a session-long brick. See the module header.
+pub(crate) fn stage_one(resource_root: &Path, dest_dir: &Path, rel: &str) -> Result<PathBuf, String> {
+    if rel.is_empty() || Path::new(rel).is_absolute() || rel.split('/').any(|c| c == "..") {
+        return Err(format!("refusing to stage unsafe resource path {rel:?}"));
+    }
+    let dst = dest_dir.join(rel);
+    // Only reached when the copy below cannot happen; never preferred over a fresh copy, so a
+    // normal launch still republishes the bundle's bytes every time.
+    let already_staged = |e: String| if dst.exists() { Ok(dst.clone()) } else { Err(e) };
+    let src = resource_root.join(rel);
+    if !src.exists() {
+        return already_staged(format!(
+            "{rel} is not in this build's bundle (looked at {}) — reinstall Sparkle; in a dev checkout, build apps/desktop so the resource is copied in",
+            src.display()
+        ));
+    }
+    let parent = dst
+        .parent()
+        .ok_or_else(|| format!("stage {rel}: destination has no parent dir"))?;
+    std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+    let leaf = Path::new(rel)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| format!("stage {rel}: no file name"))?;
     let seq = STAGE_SEQ.fetch_add(1, Ordering::Relaxed);
-    let tmp = dir.join(format!(".{name}.{}.{seq}.tmp", std::process::id()));
-    std::fs::copy(&src, &tmp).map_err(|e| format!("stage {name}: {e}"))?;
-    std::fs::rename(&tmp, &dst).map_err(|e| {
+    let tmp = parent.join(format!(".{leaf}.{}.{seq}.tmp", std::process::id()));
+    if let Err(e) = std::fs::copy(&src, &tmp) {
+        return already_staged(format!("stage {rel}: {e}"));
+    }
+    if let Err(e) = std::fs::rename(&tmp, &dst) {
         let _ = std::fs::remove_file(&tmp);
-        format!("publish {name}: {e}")
-    })?;
+        return already_staged(format!("publish {rel}: {e}"));
+    }
     Ok(dst)
+}
+
+/// Stage every `rel` into `<bin_root>/<seg>/`, and leave a liveness marker naming this process so
+/// [`sweep_stale_bins`] can tell a directory some other build is still USING from one merely left
+/// behind. Never fails as a whole: each resource carries its own `Result`.
+pub(crate) fn stage_all(
+    resource_root: &Path,
+    bin_root: &Path,
+    seg: &str,
+    rels: &[&str],
+) -> StagedBin {
+    let dir = bin_root.join(seg);
+    let mut entries = std::collections::BTreeMap::new();
+    for rel in rels {
+        entries.insert((*rel).to_string(), stage_one(resource_root, &dir, rel));
+    }
+    // Only after something actually landed — a build whose resources are all missing must not leave
+    // an empty directory behind for the sweep to reclaim later.
+    if dir.is_dir() {
+        let _ = std::fs::File::create(dir.join(format!(".alive-{}", std::process::id())));
+    }
+    StagedBin { dir, entries }
+}
+
+/// Is `pid` a live process? Used ONLY to decide whether a staged directory is still in use.
+///
+/// `kill(pid, 0)` sends no signal; it just asks the kernel. `EPERM` (the pid exists but belongs to
+/// another user) counts as ALIVE, because every error in this predicate must bias towards KEEPING a
+/// directory. PID reuse can only produce a false "alive", which delays a reclaim — never a deletion.
+#[cfg(unix)]
+pub(crate) fn pid_is_alive(pid: u32) -> bool {
+    // Neither can be a pid we wrote (`std::process::id()` is always in `1..=pid_t::MAX`), and both
+    // would mean something else to `kill` — 0 is "my whole process group", and anything above
+    // `pid_t::MAX` wraps NEGATIVE, which addresses a group. Answer ALIVE so the sweep keeps the dir.
+    if pid == 0 || pid > i32::MAX as u32 {
+        return true;
+    }
+    // SAFETY: `kill` with signal 0 performs no action; it only reports whether the pid is signalable.
+    if unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+/// Windows has no `kill(pid, 0)` here, so guard 2 is SKIPPED and the age gate really is the sole
+/// guard — which is what this comment used to CLAIM while the code did the opposite.
+///
+/// The bug: [`dir_has_live_claim`] runs BEFORE the age gate and short-circuits on any parseable
+/// `.alive-*` marker, and [`stage_all`] always writes one. Answering `true` here therefore meant
+/// EVERY staged directory was kept forever, the age gate was never consulted, and `<app_data>/bin/`
+/// grew one directory per build installed, without bound.
+///
+/// Answering `false` inverts this predicate's usual "every error biases towards KEEPING" rule, and
+/// that is deliberate: on this platform it is not an error reading, it is the ABSENCE of a reading,
+/// and guard 3 (14 days untouched) is the backstop the sweep doc already names for exactly this
+/// case. The residual risk is the one already stated there — a process running continuously for
+/// longer than `max_age_ms` loses its staged dir and its next spawn fails LOUDLY (mode A), never
+/// silently (mode B). Replace this with a real `OpenProcess`/`GetExitCodeProcess` answer and guard 2
+/// lights up on Windows with no other change.
+#[cfg(not(unix))]
+pub(crate) fn pid_is_alive(_pid: u32) -> bool {
+    false
+}
+
+/// Reclaim `<app_data>/bin/<seg>/` directories left by builds that are no longer running.
+///
+/// SAFETY REASONING — the thing that must never happen is pulling a staged file out from under a
+/// CONCURRENTLY RUNNING older process, which would break every agent it spawns afterwards. Three
+/// independent guards, in order:
+///
+///   1. NEVER the running segment. `keep_seg` is skipped unconditionally, so this process (and any
+///      sibling of the same build) is safe by construction.
+///   2. NEVER a directory a live process claims. Each process drops a `.alive-<pid>` marker in its
+///      own staged dir ([`stage_all`]); if ANY marker there names a live pid, the directory stays.
+///      Markers are never removed on exit, so this is crash-safe: the pid check, not tidy shutdown,
+///      is what decides.
+///   3. NEVER a directory younger than `max_age_ms`. A backstop for platforms where the pid check
+///      cannot answer (Windows, where [`pid_is_alive`] answers `false` so guard 2 never fires and
+///      this IS the only guard) and for a marker that failed to write.
+///
+/// Only DIRECTORIES are considered. Plain files directly under `bin/` are the LEGACY unversioned
+/// staged scripts (`bin/sparkle-hook.mjs`), whose absolute paths are still baked into older
+/// worktrees' `settings.local.json` until `heal_agent_hooks` re-points them — deleting those would
+/// break hooks that are currently wired up.
+///
+/// Residual risk, stated rather than hidden: a process running CONTINUOUSLY for longer than
+/// `max_age_ms` whose `.alive-` marker never landed could have its directory reclaimed. Its next
+/// spawn would then fail LOUDLY with a missing-file error (mode A) — never the silent version skew
+/// (mode B) this whole scheme exists to prevent — so the failure direction is the safe one.
+///
+/// Best-effort throughout: an unreadable dir or a failed removal is ignored. Returns the segments
+/// removed, so the caller can log them and a test can assert on them.
+pub(crate) fn sweep_stale_bins(
+    bin_root: &Path,
+    keep_seg: &str,
+    now_ms: u64,
+    max_age_ms: u64,
+    is_alive: &dyn Fn(u32) -> bool,
+) -> Vec<String> {
+    let mut removed = Vec::new();
+    let Ok(rd) = std::fs::read_dir(bin_root) else {
+        return removed;
+    };
+    for entry in rd.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue; // legacy flat staged scripts — still referenced by un-healed worktrees
+        }
+        let Some(name) = path.file_name().and_then(|s| s.to_str()).map(str::to_string) else {
+            continue;
+        };
+        if name == keep_seg {
+            continue; // guard 1: never the running build
+        }
+        if dir_has_live_claim(&path, is_alive) {
+            continue; // guard 2: another running process is using it
+        }
+        if dir_age_ms(&path, now_ms).is_none_or(|age| age < max_age_ms) {
+            continue; // guard 3: too young (or unreadable mtime — fail closed, keep it)
+        }
+        if std::fs::remove_dir_all(&path).is_ok() {
+            removed.push(name);
+        }
+    }
+    removed
+}
+
+/// Does any `.alive-<pid>` marker in `dir` name a live process?
+fn dir_has_live_claim(dir: &Path, is_alive: &dyn Fn(u32) -> bool) -> bool {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return true; // unreadable → assume in use; this predicate must never bias towards deleting
+    };
+    rd.flatten().any(|e| {
+        e.file_name()
+            .to_str()
+            .and_then(|n| n.strip_prefix(".alive-"))
+            .and_then(|p| p.parse::<u32>().ok())
+            .is_some_and(&is_alive)
+    })
+}
+
+/// Age of `dir` in ms from its mtime, or `None` when that cannot be read (treated as "keep").
+fn dir_age_ms(dir: &Path, now_ms: u64) -> Option<u64> {
+    let mtime = std::fs::metadata(dir).ok()?.modified().ok()?;
+    let ms = mtime.duration_since(std::time::UNIX_EPOCH).ok()?.as_millis() as u64;
+    Some(now_ms.saturating_sub(ms))
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Resolve the bundle's `resources/` dir and stage `rels` into `<app_data>/bin/<build segment>/`.
+///
+/// `rels` is the subset still to attempt — every resource on the first call, only the ones still
+/// `Err` on a retry (see [`staged_or_init`]).
+///
+/// THIS IS THE RETRY BODY, SO IT MAY RUN MORE THAN ONCE PER PROCESS. It used to say "runs EXACTLY
+/// ONCE per process", and that sentence is what put a destructive sweep on the retried path in the
+/// first place — the next person adding a side effect here would have read it and done the same
+/// (roborev 67453). ANYTHING THAT MUST HAPPEN ONCE GOES BEHIND [`SWEPT`], not merely inside this
+/// function.
+///
+/// ACCEPTED COST, uncapped: a permanently-unstageable resource (a rename that outran
+/// [`STAGED_RESOURCES`], a file dropped from packaging) leaves an entry `Err` forever, so every
+/// `stage_resource_script` call — one per agent open, plus the per-worktree hook installs — re-runs
+/// `resolve` + `app_data_dir` + `stage_all` + the `.alive-<pid>` `File::create`, under the
+/// process-wide [`STAGED`] mutex, with no attempt cap or backoff. That is the price of never sealing
+/// a failure; bounding it is bead sparkle-j2j509.
+fn load_staged<R: Runtime>(app: &AppHandle<R>, rels: &[&str]) -> StagedBin {
+    let all_failed = |e: String| StagedBin {
+        dir: PathBuf::new(),
+        entries: rels
+            .iter()
+            .map(|r| ((*r).to_string(), Err(format!("{r}: {e}"))))
+            .collect(),
+    };
+    let resource_root = match app.path().resolve("resources", BaseDirectory::Resource) {
+        Ok(p) => p,
+        Err(e) => return all_failed(format!("cannot resolve the app bundle's resources dir: {e}")),
+    };
+    let bin_root = match crate::dev_identity::app_data_dir(app) {
+        Ok(p) => p.join("bin"),
+        Err(e) => return all_failed(e),
+    };
+    let seg = current_build_segment();
+    let staged = stage_all(&resource_root, &bin_root, &seg, rels);
+    // ONCE PER PROCESS, not once per retry. The sweep is a destructive `remove_dir_all` pass over
+    // <app_data>/bin/ and it runs under the process-wide STAGED mutex; leaving it on the retried
+    // path meant a single permanently-unstageable resource — a rename that outran STAGED_RESOURCES,
+    // a file dropped from packaging — would re-sweep on every `stage_resource_script` call, i.e.
+    // once per agent open, serialising every concurrent caller behind it (roborev 67444).
+    if !SWEPT.swap(true, Ordering::Relaxed) {
+        let removed =
+            sweep_stale_bins(&bin_root, &seg, now_ms(), STALE_BIN_MAX_AGE_MS, &pid_is_alive);
+        if !removed.is_empty() {
+            tracing::info!(segments = ?removed, "reclaimed staged resources from builds no longer running");
+        }
+    }
+    staged
+}
+
+/// Has the stale-segment sweep already run in this process? See [`load_staged`].
+static SWEPT: AtomicBool = AtomicBool::new(false);
+
+/// Stage every bundled resource for this build, EAGERLY, once. Called from `lib.rs` `setup()`.
+///
+/// Eager is the whole point: the updater can replace the bundle within minutes of launch, and any
+/// resolve after that reads the NEW build's files. Doing all the work here means every later
+/// consumer is served from a copy taken while the bundle was still ours.
+///
+/// Never fails: a resource that could not be staged is logged and its own consumer gets the error.
+pub fn init_staged_resources<R: Runtime>(app: &AppHandle<R>) {
+    let staged = staged_or_init(&STAGED, &bundle_is_still_this_build, STAGED_RESOURCES, &|rels| {
+        load_staged(app, rels)
+    });
+    for (rel, res) in &staged.entries {
+        if let Err(e) = res {
+            tracing::warn!(resource = %rel, error = %e, "could not stage a bundled resource");
+        }
+    }
+    tracing::info!(dir = %staged.dir.display(), count = staged.entries.len(), "staged this build's bundled resources");
+}
+
+/// The staged path for one bundled resource — the app-data copy taken at startup, NEVER a fresh
+/// resolve out of the bundle. `rel` is the path relative to `resources/`, e.g. `sparkle-hook.mjs`
+/// or `roborev/post-commit`, and must be listed in [`STAGED_RESOURCES`].
+pub fn stage_resource_script<R: Runtime>(app: &AppHandle<R>, rel: &str) -> Result<PathBuf, String> {
+    let staged = staged_or_init(&STAGED, &bundle_is_still_this_build, STAGED_RESOURCES, &|rels| {
+        load_staged(app, rels)
+    });
+    match staged.entries.get(rel) {
+        Some(Ok(p)) => Ok(p.clone()),
+        Some(Err(e)) => Err(e.clone()),
+        None => Err(format!(
+            "{rel} is not staged for this build (add it to hooks::STAGED_RESOURCES)"
+        )),
+    }
 }
 
 /// Replace a file atomically: write a temp sibling in the SAME dir, then rename over the target.
@@ -1701,6 +2177,548 @@ pub fn read_events_since_impl(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Staged bundle resources (bead sparkle-1ueh3) ──────────────────────────────────────────
+    //
+    // These guard the three properties that make an updater swapping the app bundle under this
+    // running process survivable: a NESTED source path can be staged at all, the destination is
+    // keyed by BUILD SHA, and the resolve+copy happens exactly ONCE per process.
+
+    /// Unique scratch root per test, so tests running in parallel in one binary cannot collide.
+    fn stage_tmp(tag: &str) -> PathBuf {
+        static CTR: AtomicU64 = AtomicU64::new(0);
+        let n = CTR.fetch_add(1, Ordering::Relaxed);
+        let d = std::env::temp_dir()
+            .join(format!("sparkle-stage-{tag}-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// Write `<root>/<rel>` with `body`, creating parents. Stands in for the app bundle's
+    /// `Contents/Resources/resources/` tree.
+    fn put_resource(root: &Path, rel: &str, body: &str) {
+        let p = root.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, body).unwrap();
+    }
+
+    #[test]
+    fn stages_a_nested_source_path_without_flattening_it() {
+        // The thing the old flat `resources/<name>` helper could NOT express, which is why the
+        // roborev hooks had to hand-roll their own bundle resolve.
+        let tmp = stage_tmp("nested");
+        let src = tmp.join("resources");
+        let dest = tmp.join("bin").join("sha1");
+        put_resource(&src, "roborev/post-commit", "#!/bin/sh\nroborev\n");
+        // A DIFFERENT resource with the same leaf name, to prove the subdirectory is preserved
+        // rather than collapsed onto the file name.
+        put_resource(&src, "post-commit", "top level, not roborev's\n");
+
+        let staged = stage_one(&src, &dest, "roborev/post-commit").expect("nested rel stages");
+        assert_eq!(staged, dest.join("roborev").join("post-commit"));
+        assert_eq!(std::fs::read_to_string(&staged).unwrap(), "#!/bin/sh\nroborev\n");
+
+        let top = stage_one(&src, &dest, "post-commit").expect("flat rel still stages");
+        assert_ne!(top, staged, "the nested path must not collapse onto the top-level one");
+        assert_eq!(std::fs::read_to_string(&staged).unwrap(), "#!/bin/sh\nroborev\n");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn a_missing_resource_names_the_path_it_looked_at() {
+        // The old site relied on `fs::copy`'s error, which surfaced as a bare
+        // "stage <name>: No such file or directory" with nothing to act on.
+        let tmp = stage_tmp("missing");
+        let src = tmp.join("resources");
+        std::fs::create_dir_all(&src).unwrap();
+        let err = stage_one(&src, &tmp.join("bin").join("sha1"), "roborev/post-commit")
+            .expect_err("a missing resource is an error");
+        assert!(err.contains("roborev/post-commit"), "names the resource: {err}");
+        assert!(
+            err.contains(&src.join("roborev/post-commit").display().to_string()),
+            "names the full path it looked at: {err}"
+        );
+        assert!(
+            !tmp.join("bin").exists(),
+            "a failed stage must not leave an empty staged dir behind for the sweep"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn refuses_to_stage_a_path_that_escapes_the_staging_dir() {
+        let tmp = stage_tmp("escape");
+        for rel in ["", "/etc/passwd", "../../etc/passwd", "roborev/../../x"] {
+            assert!(
+                stage_one(&tmp.join("resources"), &tmp.join("bin"), rel).is_err(),
+                "must refuse {rel:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn staged_destination_is_keyed_by_build_sha_so_a_newer_build_cannot_overwrite_an_older_one() {
+        // THE MODE-B FIX. `<app_data>/bin/` used to be flat: a newer process starting up
+        // overwrote the exact file a running older process depends on, so an old Rust process
+        // ended up launching a NEW-version control server against its own old socket protocol.
+        let tmp = stage_tmp("sha-keyed");
+        let bin = tmp.join("bin");
+        let old_bundle = tmp.join("v1-resources");
+        let new_bundle = tmp.join("v2-resources");
+        put_resource(&old_bundle, "mcp-control-server.js", "VERSION ONE");
+        put_resource(&new_bundle, "mcp-control-server.js", "VERSION TWO");
+
+        let old = stage_all(&old_bundle, &bin, "aaaaaaa", &["mcp-control-server.js"]);
+        let new = stage_all(&new_bundle, &bin, "bbbbbbb", &["mcp-control-server.js"]);
+        let old_path = old.entries["mcp-control-server.js"].as_ref().unwrap();
+        let new_path = new.entries["mcp-control-server.js"].as_ref().unwrap();
+
+        assert_ne!(old_path, new_path, "two builds must not share a staged destination");
+        assert_eq!(
+            std::fs::read_to_string(old_path).unwrap(),
+            "VERSION ONE",
+            "the older build's staged copy must survive the newer build staging its own"
+        );
+        assert_eq!(std::fs::read_to_string(new_path).unwrap(), "VERSION TWO");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn an_unknown_build_sha_falls_back_to_a_per_process_segment() {
+        // A real SHA is used verbatim...
+        assert_eq!(build_segment("a1b2c3d", 4242), "a1b2c3d");
+        // ...but "unknown" is NOT a discriminator: two different tarball builds would share
+        // `bin/unknown/`, which is the same overwrite this scheme exists to prevent. Fail safe to
+        // something unique per process instead.
+        assert_eq!(build_segment("unknown", 4242), "unknown-4242");
+        assert_ne!(
+            build_segment("unknown", 4242),
+            build_segment("unknown", 4243),
+            "two unknown-SHA processes must never share a staged directory"
+        );
+        assert_eq!(build_segment("", 7), "unknown-7", "an empty SHA is also no discriminator");
+        // And nothing that reaches a directory name may contain a separator.
+        assert_eq!(build_segment("../../etc", 9), "etc");
+    }
+
+    #[test]
+    fn staging_happens_once_per_process_so_a_bundle_swap_cannot_reach_the_staged_copy() {
+        // The updater replaces /Applications/Sparkle.app under this process; `resolve()`
+        // recomputes from `current_exe()`'s path STRING, so a per-call resolve would hand back the
+        // NEW build's file with every `.exists()` guard passing. Assert the SIDE EFFECT: the loader
+        // runs exactly once, and a later change to the SOURCE is invisible to the staged copy.
+        static CELL: Mutex<Option<StagedBin>> = Mutex::new(None);
+        static LOADS: AtomicU64 = AtomicU64::new(0);
+
+        let tmp = stage_tmp("once");
+        let bundle = tmp.join("resources");
+        let bin = tmp.join("bin");
+        put_resource(&bundle, "mcp-control-server.js", "VERSION ONE");
+
+        let names = ["mcp-control-server.js"];
+        let load = |rels: &[&str]| {
+            LOADS.fetch_add(1, Ordering::Relaxed);
+            stage_all(&bundle, &bin, "aaaaaaa", rels)
+        };
+        // The retry gate is WIDE OPEN (`|| true`) on purpose: a load that produced a usable path
+        // must be sealed regardless of it, so this still proves the once-only property after the
+        // memo was made re-runnable.
+        let first = staged_or_init(&CELL, &|| true, &names, &load);
+        let first_path = first.entries["mcp-control-server.js"].as_ref().unwrap().clone();
+        assert_eq!(std::fs::read_to_string(&first_path).unwrap(), "VERSION ONE");
+
+        // ── the swap ──────────────────────────────────────────────────────────────────────────
+        put_resource(&bundle, "mcp-control-server.js", "VERSION TWO");
+
+        let second = staged_or_init(&CELL, &|| true, &names, &load);
+        assert_eq!(LOADS.load(Ordering::Relaxed), 1, "the bundle must be read exactly once");
+        assert_eq!(second.dir, first.dir);
+        assert_eq!(
+            second.entries["mcp-control-server.js"].as_ref().unwrap(),
+            &first_path
+        );
+        assert_eq!(
+            std::fs::read_to_string(&first_path).unwrap(),
+            "VERSION ONE",
+            "this process must keep running ITS OWN build's server after the bundle is replaced"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn a_resource_missing_from_the_bundle_falls_back_to_this_builds_own_staged_copy() {
+        // The updater's `remove_dir_all` window makes the SOURCE vanish mid-session. `dest_dir` is
+        // keyed by this build's segment, so the copy already sitting there is this build's own
+        // bytes by construction — serving it beats an Err that nothing retries.
+        let tmp = stage_tmp("fallback");
+        let src = tmp.join("resources");
+        let dest = tmp.join("bin").join("aaaaaaa");
+        put_resource(&src, "mcp-control-server.js", "VERSION ONE");
+        let staged = stage_one(&src, &dest, "mcp-control-server.js").expect("first stage");
+
+        std::fs::remove_dir_all(&src).unwrap(); // ← the swap window
+        let again = stage_one(&src, &dest, "mcp-control-server.js")
+            .expect("an already-staged copy is served rather than a session-long Err");
+        assert_eq!(again, staged);
+        assert_eq!(std::fs::read_to_string(&again).unwrap(), "VERSION ONE");
+
+        // ...and the fallback is not a blanket "any error is fine": a resource this build never
+        // staged still fails, naming the path, so mode C stays loud.
+        let err = stage_one(&src, &dest, "worktree-guard.mjs")
+            .expect_err("nothing staged under this segment, so nothing to fall back to");
+        assert!(err.contains("worktree-guard.mjs"), "names the resource: {err}");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn a_stage_in_which_nothing_landed_is_retried_rather_than_sealed_for_the_session() {
+        // THE REGRESSION THIS GUARDS. The updater's poller fires AT LAUNCH and staging runs in
+        // `setup()`, so the `remove_dir_all` window can make all six resources missing at exactly
+        // the moment the memo is filled. Sealing that Err meant no agent could be opened, no hook
+        // installed and no roborev hook written until the user quit and relaunched.
+        static CELL: Mutex<Option<StagedBin>> = Mutex::new(None);
+        static LOADS: AtomicU64 = AtomicU64::new(0);
+
+        let tmp = stage_tmp("retry");
+        let bundle = tmp.join("resources");
+        let bin = tmp.join("bin");
+        let names = ["mcp-control-server.js"];
+        let load = |rels: &[&str]| {
+            LOADS.fetch_add(1, Ordering::Relaxed);
+            stage_all(&bundle, &bin, "aaaaaaa", rels)
+        };
+
+        // The swap window: `resources/` does not exist, so nothing stages.
+        let first = staged_or_init(&CELL, &|| true, &names, &load);
+        assert!(first.entries["mcp-control-server.js"].is_err(), "nothing could stage");
+
+        // The swap finishes and the bundle is ours again — the next consumer must RECOVER.
+        put_resource(&bundle, "mcp-control-server.js", "VERSION ONE");
+        let second = staged_or_init(&CELL, &|| true, &names, &load);
+        let p = second.entries["mcp-control-server.js"]
+            .as_ref()
+            .expect("an all-failed load must be retried, not returned forever");
+        assert_eq!(std::fs::read_to_string(p).unwrap(), "VERSION ONE");
+        assert_eq!(LOADS.load(Ordering::Relaxed), 2, "exactly one retry");
+
+        // ...and now that something DID stage, it is sealed again: a later bundle swap can never
+        // reach this process's staged copy.
+        put_resource(&bundle, "mcp-control-server.js", "VERSION TWO");
+        let third = staged_or_init(&CELL, &|| true, &names, &load);
+        assert_eq!(LOADS.load(Ordering::Relaxed), 2, "a successful load is never re-run");
+        assert_eq!(
+            std::fs::read_to_string(third.entries["mcp-control-server.js"].as_ref().unwrap())
+                .unwrap(),
+            "VERSION ONE"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// roborev 67430. A PARTIAL load must be retried too, and this is the case the sibling test
+    /// above structurally cannot see: it stages a single resource, so "nothing landed" and "not
+    /// everything landed" are the same state there.
+    ///
+    /// `stage_all` copies the six resources SEQUENTIALLY, so the updater's swap window opening or
+    /// closing mid-loop leaves a MIXED result — as does a per-file transient (ENOSPC, an EINTR'd
+    /// copy, a briefly-locked app-data dir) on one resource while the others land. Under the old
+    /// `any(is_ok)` test that mixed state was sealed with `retry_allowed` never consulted, so the
+    /// missing resource could never recover even once the bundle was perfectly readable — the same
+    /// session-long brick, in its more likely form.
+    #[test]
+    fn a_stage_in_which_only_some_resources_landed_is_retried_rather_than_sealed() {
+        static CELL: Mutex<Option<StagedBin>> = Mutex::new(None);
+        static LOADS: AtomicU64 = AtomicU64::new(0);
+
+        let tmp = stage_tmp("partial");
+        let bundle = tmp.join("resources");
+        let bin = tmp.join("bin");
+        let names = ["mcp-control-server.js", "mcp-orchestrator-server.js"];
+        let load = |rels: &[&str]| {
+            LOADS.fetch_add(1, Ordering::Relaxed);
+            stage_all(&bundle, &bin, "aaaaaaa", rels)
+        };
+
+        // ONE of the two is present — the mixed state the old predicate sealed.
+        put_resource(&bundle, "mcp-control-server.js", "CONTROL");
+        let first = staged_or_init(&CELL, &|| true, &names, &load);
+        assert!(first.entries["mcp-control-server.js"].is_ok(), "one landed");
+        assert!(first.entries["mcp-orchestrator-server.js"].is_err(), "the other did not");
+
+        // THE SWAP LANDS BEFORE THE RETRY. `resources/` now holds version N+1's bytes, and the
+        // missing resource has appeared. This is the ordering that makes the retry dangerous, and
+        // it is why the retry must be PER ENTRY (roborev 67444): a whole-load retry re-copies the
+        // entry that already succeeded, publishing N+1's control server into N's segment — mode B,
+        // the silent version skew the module exists to prevent. `retry_allowed` cannot save us here;
+        // it fails open off macOS and whenever the `ps` fork fails.
+        put_resource(&bundle, "mcp-control-server.js", "VERSION TWO");
+        put_resource(&bundle, "mcp-orchestrator-server.js", "ORCHESTRATOR");
+        let second = staged_or_init(&CELL, &|| true, &names, &load);
+
+        // The entry that FAILED recovers...
+        let p = second.entries["mcp-orchestrator-server.js"]
+            .as_ref()
+            .expect("a partial load must be retried, not sealed for the process lifetime");
+        assert_eq!(std::fs::read_to_string(p).unwrap(), "ORCHESTRATOR");
+        assert_eq!(LOADS.load(Ordering::Relaxed), 2, "exactly one retry");
+
+        // ...and the entry that SUCCEEDED keeps the copy it took while the bundle was provably ours.
+        assert_eq!(
+            std::fs::read_to_string(second.entries["mcp-control-server.js"].as_ref().unwrap())
+                .unwrap(),
+            "CONTROL",
+            "a retry must never re-copy an entry that already staged — that is mode B"
+        );
+
+        // Now that EVERY entry is Ok the memo seals and nothing reloads at all.
+        let third = staged_or_init(&CELL, &|| true, &names, &load);
+        assert_eq!(LOADS.load(Ordering::Relaxed), 2, "a fully-successful load is never re-run");
+        assert_eq!(
+            std::fs::read_to_string(third.entries["mcp-control-server.js"].as_ref().unwrap())
+                .unwrap(),
+            "CONTROL"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn a_retry_is_refused_once_this_processs_bundle_has_been_replaced() {
+        // The gate that keeps the retry from reopening mode B: re-reading `resources/` AFTER the
+        // swap landed would copy version N+1's file into version N's segment. The stale Err is the
+        // correct answer there — loud (mode A) beats silent version skew (mode B).
+        static CELL: Mutex<Option<StagedBin>> = Mutex::new(None);
+        static LOADS: AtomicU64 = AtomicU64::new(0);
+
+        let tmp = stage_tmp("retry-gated");
+        let bundle = tmp.join("resources");
+        let bin = tmp.join("bin");
+        let names = ["mcp-control-server.js"];
+        let load = |rels: &[&str]| {
+            LOADS.fetch_add(1, Ordering::Relaxed);
+            stage_all(&bundle, &bin, "aaaaaaa", rels)
+        };
+
+        let first = staged_or_init(&CELL, &|| false, &names, &load);
+        assert!(first.entries["mcp-control-server.js"].is_err());
+
+        // The NEW build's bundle is now on disk at the same path.
+        put_resource(&bundle, "mcp-control-server.js", "VERSION TWO");
+        let second = staged_or_init(&CELL, &|| false, &names, &load);
+        assert_eq!(LOADS.load(Ordering::Relaxed), 1, "the gate refused the retry");
+        assert!(
+            second.entries["mcp-control-server.js"].is_err(),
+            "version N+1's bytes must never be staged under version N's segment"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ── the startup sweep ─────────────────────────────────────────────────────────────────────
+
+    /// An aged staged dir named `seg`, optionally claimed by `pid`.
+    fn aged_bin(bin: &Path, seg: &str, claim: Option<u32>) -> PathBuf {
+        let d = bin.join(seg);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("mcp-control-server.js"), "x").unwrap();
+        if let Some(pid) = claim {
+            std::fs::write(d.join(format!(".alive-{pid}")), "").unwrap();
+        }
+        d
+    }
+
+    /// Age gate DISABLED (nothing is ever "too young"), so the guard under test is the only thing
+    /// that can save a directory. The freshly-created dirs below are seconds old, so leaving the
+    /// real gate on would keep everything and the test would pass without exercising anything.
+    const NO_AGE_GATE_MS: u64 = 0;
+    /// The production gate, for the cases that assert a young directory is SPARED.
+    const MAX_AGE_MS: u64 = 14 * 24 * 60 * 60 * 1000;
+
+    #[test]
+    fn the_sweep_never_removes_the_running_builds_directory() {
+        let tmp = stage_tmp("sweep-self");
+        let bin = tmp.join("bin");
+        let mine = aged_bin(&bin, "running", None);
+        let theirs = aged_bin(&bin, "abandoned", None);
+
+        let removed = sweep_stale_bins(&bin, "running", now_ms(), NO_AGE_GATE_MS, &|_| false);
+        assert!(mine.exists(), "the running build's own staged dir must never be reclaimed");
+        assert!(!theirs.exists(), "a dead build's dir IS reclaimed");
+        assert_eq!(removed, vec!["abandoned".to_string()]);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn the_sweep_never_removes_a_directory_a_live_process_claims() {
+        let tmp = stage_tmp("sweep-live");
+        let bin = tmp.join("bin");
+        let live = aged_bin(&bin, "older-build-still-running", Some(4242));
+        let dead = aged_bin(&bin, "older-build-long-gone", Some(4243));
+
+        let removed =
+            sweep_stale_bins(&bin, "running", now_ms(), NO_AGE_GATE_MS, &|p| p == 4242);
+        assert!(
+            live.exists(),
+            "pulling a staged file out from under a running sibling would break every agent it spawns"
+        );
+        assert!(!dead.exists());
+        assert_eq!(removed, vec!["older-build-long-gone".to_string()]);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn the_sweep_spares_young_dirs_and_the_legacy_flat_scripts() {
+        let tmp = stage_tmp("sweep-keep");
+        let bin = tmp.join("bin");
+        let young = aged_bin(&bin, "just-staged", None);
+        // Pre-SHA staged scripts live as plain FILES directly under bin/, and older worktrees still
+        // have their absolute paths baked into settings.local.json until heal re-points them.
+        let legacy = bin.join("sparkle-hook.mjs");
+        std::fs::write(&legacy, "legacy").unwrap();
+
+        // now == the dirs' own mtime, so nothing is older than the max age.
+        let removed = sweep_stale_bins(&bin, "running", now_ms(), MAX_AGE_MS, &|_| false);
+        assert!(young.exists(), "a young dir is kept even with no live claim");
+        assert!(legacy.exists(), "legacy flat scripts are files, never swept");
+        assert!(removed.is_empty(), "nothing to reclaim: {removed:?}");
+
+        // ...and it was the AGE that saved it, not some other accident: wind the clock past the
+        // gate and the same directory IS reclaimed, while the legacy FILE still is not.
+        let later = now_ms() + MAX_AGE_MS + 1;
+        let removed = sweep_stale_bins(&bin, "running", later, MAX_AGE_MS, &|_| false);
+        assert!(!young.exists(), "past the age gate it is reclaimed");
+        assert!(legacy.exists(), "a file directly under bin/ is never swept, at any age");
+        assert_eq!(removed, vec!["just-staged".to_string()]);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pid_liveness_answers_for_real_processes() {
+        // The production predicate the sweep is wired to — not an injected stub.
+        assert!(pid_is_alive(std::process::id()), "this very process is alive");
+        assert!(!pid_is_alive(i32::MAX as u32), "an impossible pid is not alive");
+        // Both mean something else to `kill`, so both must bias towards KEEPING the directory.
+        assert!(pid_is_alive(0));
+        assert!(pid_is_alive(u32::MAX));
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn without_a_pid_check_guard_two_never_fires_so_the_age_gate_is_the_sole_guard() {
+        // This used to answer `true`, and because `dir_has_live_claim` runs BEFORE the age gate and
+        // `stage_all` always writes a marker, that kept EVERY directory forever — `<app_data>/bin/`
+        // growing one directory per build installed, with the age gate never consulted. Assert the
+        // SIDE EFFECT, never the predicate: a claimed, aged directory really is reclaimed. The
+        // sweep runs with the PRODUCTION `pid_is_alive`, and the marker names a pid that IS live —
+        // so nothing but guard 3 can save this directory, and answering `true` here brings the
+        // unbounded growth straight back.
+        let tmp = stage_tmp("sweep-nonunix");
+        let bin = tmp.join("bin");
+        let claimed = aged_bin(&bin, "older-build", Some(std::process::id()));
+        let removed =
+            sweep_stale_bins(&bin, "running", now_ms() + MAX_AGE_MS + 1, MAX_AGE_MS, &pid_is_alive);
+        assert!(
+            !claimed.exists(),
+            "guard 2 must not fire without a pid check — the age gate is the sole guard here"
+        );
+        assert_eq!(removed, vec!["older-build".to_string()]);
+
+        // ...and a YOUNG directory is still spared, so the age gate is doing the deciding rather
+        // than the sweep having simply become unconditional.
+        let young = aged_bin(&bin, "younger-build", Some(std::process::id()));
+        let removed = sweep_stale_bins(&bin, "running", now_ms(), MAX_AGE_MS, &pid_is_alive);
+        assert!(young.exists(), "the age gate still spares a young dir");
+        assert!(removed.is_empty(), "nothing to reclaim: {removed:?}");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn stage_all_claims_its_directory_with_a_live_marker_naming_this_process() {
+        // Sweep guard 2 — the guard that stops the sweep pulling a staged file out from under a
+        // running sibling — depends ENTIRELY on this write, and nothing asserted it: delete the
+        // marker block and every other staging/sweep test stayed green while production lost the
+        // guard. Assert the file, and then assert what it BUYS, end to end.
+        let tmp = stage_tmp("alive-marker");
+        let bundle = tmp.join("resources");
+        let bin = tmp.join("bin");
+        put_resource(&bundle, "mcp-control-server.js", "VERSION ONE");
+
+        let staged = stage_all(&bundle, &bin, "this-build", &["mcp-control-server.js"]);
+        let marker = staged.dir.join(format!(".alive-{}", std::process::id()));
+        assert!(marker.exists(), "stage_all must claim its dir: {}", marker.display());
+
+        // END TO END, against a directory `stage_all` really produced (NOT the `aged_bin` helper
+        // that hand-writes its own marker): the sweep runs with the age gate DISABLED and a
+        // different running segment, so guard 2 is the only thing that can save it.
+        let removed = sweep_stale_bins(
+            &bin,
+            "some-other-segment",
+            now_ms(),
+            NO_AGE_GATE_MS,
+            &|p| p == std::process::id(),
+        );
+        assert!(
+            staged.dir.exists(),
+            "a sibling process still running must keep its staged copies"
+        );
+        assert!(removed.is_empty(), "nothing to reclaim: {removed:?}");
+
+        // ...and it was the LIVE CLAIM that saved it, not some other accident: the same directory,
+        // same age gate, with that pid reported dead, IS reclaimed.
+        let removed = sweep_stale_bins(&bin, "some-other-segment", now_ms(), NO_AGE_GATE_MS, &|_| false);
+        assert!(!staged.dir.exists(), "once the claimant is gone the dir is reclaimed");
+        assert_eq!(removed, vec!["this-build".to_string()]);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ── production wiring ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn the_real_command_seam_is_memoized_and_keyed_by_the_real_build_segment() {
+        // Drives the SHIPPING entry point — `stage_resource_script` on a real AppHandle — so the
+        // lines that supply the real values (the bundle resolve, `dev_identity::app_data_dir`, the
+        // compile-time SPARKLE_GIT_SHA, the process-wide OnceLock) are covered by something. Under
+        // `cargo test` the bundle's resources are not present, so the outcome is an Err; what is
+        // asserted is the wiring, which holds either way.
+        let app = tauri::test::mock_app();
+        let first = stage_resource_script(app.handle(), "mcp-control-server.js");
+        let second = stage_resource_script(app.handle(), "mcp-control-server.js");
+        assert_eq!(first, second, "the same process must always get the same answer");
+
+        let seg = current_build_segment();
+        assert!(!seg.is_empty() && !seg.contains('/'), "segment is one path component: {seg:?}");
+        match &first {
+            Ok(p) => {
+                let s = p.to_string_lossy().to_string();
+                assert!(s.contains(&format!("bin/{seg}/")), "staged under bin/<segment>: {s}");
+                assert!(s.ends_with("mcp-control-server.js"));
+            }
+            Err(e) => assert!(e.contains("mcp-control-server.js"), "error names the resource: {e}"),
+        }
+
+        // A resource nobody staged at startup is REFUSED, never resolved out of the bundle on the
+        // fly — an on-demand resolve is exactly the post-swap read this change removes.
+        let err = stage_resource_script(app.handle(), "not-a-bundled-resource.js")
+            .expect_err("an unlisted resource has no staged copy");
+        assert!(err.contains("STAGED_RESOURCES"), "says how to fix it: {err}");
+    }
+
+    #[test]
+    fn every_resource_the_app_launches_is_staged_at_startup() {
+        // The eager list IS the contract: anything missing here would fall back to no staged copy
+        // at all. These four are the ones whose absolute paths cross into a spawned process or a
+        // baked hook command.
+        for rel in [
+            "sparkle-hook.mjs",
+            "worktree-guard.mjs",
+            "mcp-orchestrator-server.js",
+            "mcp-control-server.js",
+            "roborev/post-commit",
+            "roborev/post-rewrite",
+        ] {
+            assert!(STAGED_RESOURCES.contains(&rel), "{rel} must be staged eagerly");
+        }
+    }
 
     fn emitter_present(v: &Value, event: &str) -> bool {
         v["hooks"][event]

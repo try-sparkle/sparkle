@@ -420,6 +420,13 @@ describe("dictation://audio-recovered (the frame-liveness watchdog's all-clear)"
     `macOS is sending silence instead of audio from "MacBook Pro Microphone", even though ` +
     `Sparkle's microphone permission looks granted. Quit Sparkle and open it again — that usually ` +
     `re-establishes the grant.`;
+  /** The SAME watchdog's third report — the swap-under-the-running-process case, where macOS killed
+   *  the grant because /Applications/Sparkle.app was replaced out from under this binary. One
+   *  emitter, now three kinds, and the retraction seam has to cover every one of them. */
+  const BUNDLE_REPLACED_ERROR =
+    `Sparkle updated in the background. macOS revoked the microphone for the running copy and is ` +
+    `sending silence from "MacBook Pro Microphone". Quit Sparkle and open it again to restore the ` +
+    `microphone.`;
   /** A failure that is STILL TRUE when frames resume — audio flowing again says nothing about a
    *  half-downloaded voice model, so this notice must survive the all-clear. */
   const UNRELATED_ERROR = "model download completed but expected files are missing";
@@ -470,6 +477,28 @@ describe("dictation://audio-recovered (the frame-liveness watchdog's all-clear)"
     // `deadMicSilent === true` assertion while shipping the visible half of the bug.
     emit("dictation://error", STALE_GRANT_ERROR);
     expect(useDictationStore.getState().error).toBe(STALE_GRANT_ERROR);
+    expect(useDictationStore.getState().status).toBe("error");
+
+    emit("dictation://audio-recovered", null);
+    expect(useDictationStore.getState().error).toBeNull();
+    expect(useDictationStore.getState().status).toBe("listening");
+    expect(useDictationStore.getState().deadMicSilent).toBe(false);
+  });
+
+  it("retracts the BUNDLE-REPLACED report too — same watchdog, third kind", () => {
+    // THIS IS THE TEST THAT CATCHES THE SEAM DRIFTING AGAIN. `isWatchdogFault` is the single
+    // predicate both ends of the retraction consult (useDictation.ts:851 latches on it, :878
+    // early-returns without it), and a new kind that is not added to it fails NOTHING else in this
+    // repo: the copy tests pass, the classifier tests pass, the Rust tests pass, and the only
+    // visible symptom is a notice that stays up over a microphone that came back — with the mic
+    // drawn as paused until the user cycles it. That is exactly how it broke when `stale-grant`
+    // was added (see the sibling test above).
+    //
+    // Asserted on the OUTPUT of the recovery — notice gone, mic listening again — not on the flag,
+    // because a version that latched the fault but still refused to clear the notice would satisfy
+    // a `deadMicSilent === true` assertion while shipping the visible half of the bug.
+    emit("dictation://error", BUNDLE_REPLACED_ERROR);
+    expect(useDictationStore.getState().error).toBe(BUNDLE_REPLACED_ERROR);
     expect(useDictationStore.getState().status).toBe("error");
 
     emit("dictation://audio-recovered", null);

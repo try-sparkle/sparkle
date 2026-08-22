@@ -218,6 +218,15 @@ export type VoiceErrorKind =
   // bucket rather than a variant of `no-audio` because the remedy inverts — nothing is holding the
   // device and no other input will help; the process's grant has to be re-established.
   | "stale-grant"
+  // The SAME reading as `stale-grant` with one more fact established: /Applications/Sparkle.app was
+  // replaced under the running process (installed mtime > process start). macOS keys a microphone
+  // grant to code identity at a path, so that swap kills the running binary's grant while
+  // AVCaptureDevice.authorizationStatus keeps answering Authorized from a process-local cache.
+  // Its own bucket because the remedy NARROWS to exactly one act — quit and reopen — and the
+  // Privacy pane, which `stale-grant` still offers last, is a proven dead end here: it shows
+  // Sparkle already switched on, and toggling it re-grants the bundle on disk rather than the
+  // unlinked binary the user is talking to. Bead sparkle-1ueh3.
+  | "bundle-replaced"
   | "no-device"
   | "unsupported-format"
   | "download"
@@ -239,7 +248,7 @@ export type VoiceErrorKind =
  *  only the watchdog's own notices may be cleared by its all-clear. A model-download failure or a
  *  permission denial is still true when frames resume. */
 export function isWatchdogFault(kind: VoiceErrorKind): boolean {
-  return kind === "no-audio" || kind === "stale-grant";
+  return kind === "no-audio" || kind === "stale-grant" || kind === "bundle-replaced";
 }
 
 export interface VoiceErrorNotice {
@@ -256,6 +265,16 @@ export interface VoiceErrorNotice {
 // pinning exact sentences, and anything we don't recognize falls through to `unknown` (which shows
 // the raw string) rather than being forced into a bucket that would misattribute the cause.
 const PATTERNS: [VoiceErrorKind, RegExp][] = [
+  // FIRST — but, unlike the entry below it, NOT because correctness depends on winning the race.
+  //
+  // The backend sentence this matches is LEXICALLY DISJOINT from the stale-grant one: it does not
+  // contain "sending silence instead of audio", so `stale-grant` cannot claim it at any position,
+  // and it carries no DENIAL word ("revoked" is not one) so it cannot fall into `permission`
+  // either. That disjointness is enforced on the Rust side too (watchdog.rs's BUNDLE_REPLACED_
+  // MESSAGE doc, constraint 2) precisely so this bucket does not depend on list order — an
+  // ordering dependency is a silent failure mode, and this file already carries one it must not
+  // add a second to. It leads the list because it is the most specific cause we can name.
+  ["bundle-replaced", /updated in the background/],
   // BEFORE EVERYTHING, INCLUDING `no-audio`, AND FOR A SHARPER REASON THAN THE NOTE BELOW.
   //
   // This sentence names microphone permission and the Privacy pane, so it matches MIC_CONTEXT AND
@@ -339,6 +358,18 @@ function staleGrantDevice(text: string): string | null {
   return m?.[1] ?? null;
 }
 
+/** The device name out of the BUNDLE-REPLACED report. Same null-means-fall-back-to-raw contract as
+ *  its two siblings — a reworded backend must surface its own string rather than have this module
+ *  author a confident remedy about a device it can no longer name.
+ *
+ *  Note the clause is "sending silence from", NOT "sending silence instead of audio from": the two
+ *  sentences are deliberately disjoint, so neither parser can pull a name out of the other's
+ *  message and mislabel the bucket. */
+function bundleReplacedDevice(text: string): string | null {
+  const m = /sending silence from\s+"([^"]+)"/i.exec(text);
+  return m?.[1] ?? null;
+}
+
 /** Bucket a raw backend error string. Pure + exported so the mapping is unit-tested directly
  *  (this codebase's convention — cf. deriveMicState / shouldBlockMicArm in MicButton). */
 export function classifyVoiceError(raw: string): VoiceErrorKind {
@@ -393,6 +424,33 @@ export function voiceErrorNotice(raw: string | null | undefined): VoiceErrorNoti
         // that omits the only detail that mattered.
         detail: device
           ? `Another app may be holding "${device}" — a screen recorder or a virtual audio device. Pick a different input in ${INPUT_PICKER_LOCATION}, or turn the mic off and on.`
+          : text,
+      };
+    }
+    case "bundle-replaced": {
+      // THE ONE FAULT IN THIS FILE WHOSE CAUSE IS PROVEN RATHER THAN RANKED. Every other branch
+      // offers ordered remedies because the reading admits more than one story; this one does not.
+      // Bead sparkle-1ueh3's natural experiment: 12 of 12 fault clusters ended in a restart onto a
+      // HIGHER version, ZERO successful transcripts followed a swap across six days, and ZERO
+      // "audio is arriving again" recoveries have ever been recorded. Nothing but a relaunch has
+      // ever ended one of these.
+      //
+      // SO THIS BRANCH NAMES NO PANE, and that is the entire point of splitting it out of
+      // `stale-grant`. That sibling ends at System Settings → Privacy & Security → Microphone,
+      // which is defensible for a grant that went stale for an unknown reason. Here the reason is
+      // known and the pane is a proven dead end: Sparkle is already switched on in it, and the
+      // switch governs the code identity now on disk, not the unlinked binary the user is talking
+      // to. AGENTS.md's remedy rule — an instruction the user will follow must name a control that
+      // exists AND works — makes mentioning it worse than saying nothing.
+      const device = bundleReplacedDevice(text);
+      return {
+        kind,
+        // Leads with the CAUSE, not the symptom, because the cause is the part that makes the
+        // remedy make sense: "quit and reopen" reads as a shrug until you know the app on disk is
+        // no longer the app that is running.
+        headline: "Sparkle updated while it was running.",
+        detail: device
+          ? `The update replaced Sparkle on disk, so macOS stopped letting the running copy hear "${device}". Quit Sparkle and open it again — that restores the microphone. Nothing on your Mac needs changing.`
           : text,
       };
     }
