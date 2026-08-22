@@ -211,23 +211,188 @@ fn classify_roborev(status: &StatusProbe, daemon_loaded: Option<bool>) -> (Healt
     }
 }
 
+/// One non-healthy subsystem line under `Health:`, e.g. `! workers: 7 stalled job(s) running > 30
+/// min`. roborev prints one indented line per subsystem, each led by a status marker: `+` healthy,
+/// `!` degraded/warn, `-` (or `x`) unhealthy. We keep the `hard` bit (a `-`/`x` marker, or the word
+/// "unhealthy") apart from the subsystem name and detail because the whole calibration turns on it.
+struct HealthProblem {
+    /// The subsystem token before the colon, lowercased (`database`, `workers`, …).
+    subsystem: String,
+    /// The remainder after the colon, lowercased.
+    detail: String,
+    /// A hard-unhealthy marker (`-`/`x`) or the literal "unhealthy" — a genuinely sick subsystem, as
+    /// opposed to a soft `!` warning.
+    hard: bool,
+}
+
+/// Every non-healthy subsystem under `Health:`, plus whether the parse was clean.
+struct HealthReading {
+    problems: Vec<HealthProblem>,
+    /// TRUE if any line inside the health block could not be classified — an indented line with a
+    /// marker we do not recognise, or a marker line with no `<subsystem>: <detail>` shape. This is
+    /// the whole reason the greening decision can fail CLOSED: an unrecognised line is exactly where
+    /// a hard failure could hide, so its mere presence forbids a green (`sparkle` roborev finding —
+    /// the parser must not drop evidence and then read "all benign").
+    saw_unrecognised: bool,
+}
+
+/// Parse the subsystem lines under a `Health:` line into the not-healthy problems plus a
+/// `saw_unrecognised` flag. Each roborev health sub-line reads `<marker> <subsystem>: <detail>`; a
+/// `+`/healthy line contributes nothing. The block is the run of INDENTED lines right after
+/// `Health:`; the first NON-indented, non-blank line (e.g. `Recent Errors:`) legitimately ends it.
+/// An indented line we cannot classify does NOT silently vanish — it sets `saw_unrecognised`, which
+/// the caller treats as "cannot confirm benign" and so refuses to green.
+fn roborev_health_problems(out: &str) -> HealthReading {
+    let mut seen_health = false;
+    let mut problems = Vec::new();
+    let mut saw_unrecognised = false;
+    for line in out.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("Health:") {
+            seen_health = true;
+            continue;
+        }
+        if !seen_health {
+            continue;
+        }
+        if trimmed.is_empty() {
+            // A blank line inside/after the block — skip it (the real output has one before
+            // `Recent Errors:`). It neither ends the block nor counts as unrecognised.
+            continue;
+        }
+        if !line.starts_with(char::is_whitespace) {
+            // A non-indented, non-blank line is the next top-level section — the block ends here and
+            // nothing below it is a subsystem. This is the ONLY safe terminator.
+            break;
+        }
+        // An INDENTED, non-blank line must be a subsystem marker line. Anything we cannot classify
+        // here is evidence we are not equipped to read, so we flag it rather than drop it — and we
+        // keep scanning so a later hard line is still collected too.
+        let marker = trimmed.chars().next().unwrap_or(' ');
+        if !matches!(marker, '+' | '!' | '-' | 'x' | 'X') {
+            saw_unrecognised = true;
+            continue;
+        }
+        let body = trimmed[marker.len_utf8()..].trim();
+        let Some((subsystem, detail)) = body.split_once(':') else {
+            saw_unrecognised = true;
+            continue;
+        };
+        let subsystem = subsystem.trim().to_ascii_lowercase();
+        let detail = detail.trim().to_ascii_lowercase();
+        // A `+`/healthy subsystem is not a problem. Everything else is, and its severity is `hard`
+        // when the marker is `-`/`x` or the detail says "unhealthy".
+        if marker == '+' || (detail == "healthy" && marker != '-' && marker != 'x' && marker != 'X')
+        {
+            continue;
+        }
+        let hard = matches!(marker, '-' | 'x' | 'X') || detail.contains("unhealthy");
+        problems.push(HealthProblem { subsystem, detail, hard });
+    }
+    HealthReading { problems, saw_unrecognised }
+}
+
+/// A detail line that mentions stalled jobs but ALSO signals a real fault. Only UNAMBIGUOUS fault
+/// words count (`sparkle` roborev findings): the earlier version also scanned for `"active"` and
+/// `"0/"`, but `active` is the very word roborev uses for HEALTHY capacity (`4/4 active`) and `0/`
+/// matches inside any number ending in zero (`10/12`), so both silently and permanently ambered a
+/// working daemon. A genuinely lost worker is reported by roborev with one of these explicit words
+/// (or a hard `-`/unhealthy marker, already handled), which is what we key on.
+fn detail_bundles_a_fault(detail: &str) -> bool {
+    const FAULT_TOKENS: &[&str] =
+        &["down", "fail", "error", "offline", "unavailable", "not running", "crash", "unhealthy"];
+    FAULT_TOKENS.iter().any(|t| detail.contains(t))
+}
+
+/// Is this problem the benign "stale review jobs" kind — a soft (`!`) worker/job line whose detail is
+/// ONLY about stalled or stuck jobs? These are doomed temp-fixture review jobs (`sparkle-o4mqng`)
+/// that pile up on a busy machine as zombie rows; they are counted under "running" but are not held
+/// by a live worker, so they do not consume worker capacity or stop new review. A detail that also
+/// carries an explicit fault word (a worker down, offline, crashed) is excluded — that is review
+/// actually stopping, not debris.
+fn is_benign_stalled(p: &HealthProblem) -> bool {
+    !p.hard
+        && (p.subsystem.contains("worker") || p.subsystem.contains("job"))
+        && (p.detail.contains("stall") || p.detail.contains("stuck"))
+        && !detail_bundles_a_fault(&p.detail)
+}
+
+/// The health VERDICT word — the first token after `Health:`, lowercased. Matched by EQUALITY, never
+/// substring (`sparkle` roborev finding): `contains("ok")` greened `Health: BROKEN` (br-OK-en) and
+/// `Health: DEGRADED (database not ok)`, short-circuiting every fence below. `None` when there is no
+/// parseable word after the colon.
+fn health_word(health_line: &str) -> Option<String> {
+    let after = health_line.trim().strip_prefix("Health:")?.trim();
+    after.split_whitespace().next().map(|w| w.to_ascii_lowercase())
+}
+
 /// A `Daemon: running` reading — healthy unless the `Health:` line says otherwise.
+///
+/// CALIBRATION: `roborev status` reports `Health: DEGRADED` whenever ANY subsystem is off, and on a
+/// busy machine the near-permanent driver is `workers: N stalled job(s) running > 30 min` — doomed
+/// temp-fixture jobs (`sparkle-o4mqng`) with the database healthy and workers active. A genuinely
+/// working daemon then reads amber forever, which is the signal-erosion defect `sparkle-ot4dxb` names
+/// for this exact panel: an alert that fires on a condition it simultaneously declares harmless. So a
+/// DEGRADED whose ONLY non-healthy subsystems are stale review jobs (database healthy, nothing hard)
+/// reads Healthy with a note; a genuinely sick subsystem (a `-`/unhealthy line, or any degradation we
+/// cannot confirm is the benign stale-jobs kind) stays Warning.
+///
+/// The green path is fenced THREE ways, every one fail-closed, because it overrides roborev's own
+/// verdict: the verdict word must be exactly `degraded` (a strictly-worse `unhealthy`/`critical` is
+/// never discounted), the parse must be clean (`!saw_unrecognised` — an unreadable subsystem line
+/// could be the hard one), and every problem must be benign stalled-jobs debris with no explicit
+/// fault word. There is deliberately NO worker-count fence: `Workers: N/M active` counts workers
+/// BUSY, not alive, so `0/M active` is a healthy IDLE daemon — blocking on it would re-amber exactly
+/// the drained-queue case this fix greens (`sparkle` roborev finding). A genuinely dead worker
+/// surfaces as a fault word / hard marker in the health block instead.
 fn classify_running(out: &str) -> (HealthState, String) {
     let health_line = out.lines().find(|l| l.trim_start().starts_with("Health:"));
     match health_line {
-        // "Health: OK" — the daemon reports itself sound. Summarise the queue for the panel.
-        Some(h) if h.to_ascii_lowercase().contains("ok") => {
-            (HealthState::Healthy, format!("Review daemon running. {}", jobs_summary(out)))
+        Some(h) => {
+            let word = health_word(h);
+            // "Health: OK" — the daemon reports itself sound. Summarise the queue for the panel.
+            if word.as_deref() == Some("ok") {
+                return (
+                    HealthState::Healthy,
+                    format!("Review daemon running. {}", jobs_summary(out)),
+                );
+            }
+            // A non-OK health. Decide between benign stale-job debris (green) and a real degradation
+            // (amber) from the subsystem lines.
+            let reading = roborev_health_problems(out);
+            // Green ONLY when every fence passes: the verdict word is exactly `degraded`, the parse
+            // saw nothing it could not classify, and there is at least one problem with every problem
+            // benign stalled-jobs debris. An empty problem list (a bare `Health: DEGRADED`) is not
+            // confirmable and stays amber.
+            let is_degraded = word.as_deref() == Some("degraded");
+            let all_benign_stalled =
+                !reading.problems.is_empty() && reading.problems.iter().all(is_benign_stalled);
+            if is_degraded && !reading.saw_unrecognised && all_benign_stalled {
+                let stalled = reading
+                    .problems
+                    .iter()
+                    .map(|p| p.detail.as_str())
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                (
+                    HealthState::Healthy,
+                    format!(
+                        "Review daemon running ({stalled}) — stale review jobs that do not stop \
+                         review; merges and deploys are unaffected. {}",
+                        jobs_summary(out)
+                    ),
+                )
+            } else {
+                (
+                    HealthState::Warning,
+                    format!(
+                        "roborev is running but reports {} — review may be degraded. Merges and \
+                         deploys are unaffected.",
+                        h.trim()
+                    ),
+                )
+            }
         }
-        // A running daemon that reports a non-OK health (e.g. a sick database) — degraded, not down.
-        Some(h) => (
-            HealthState::Warning,
-            format!(
-                "roborev is running but reports {} — review may be degraded. Merges and deploys are \
-                 unaffected.",
-                h.trim()
-            ),
-        ),
         // Running with no Health line (an older CLI). Take the running line at its word.
         None => (HealthState::Healthy, format!("Review daemon running. {}", jobs_summary(out))),
     }
@@ -1144,6 +1309,164 @@ mod tests {
         let (state, detail) = classify_roborev(&StatusProbe::Text(out), Some(true));
         assert_eq!(state, HealthState::Warning);
         assert!(detail.to_lowercase().contains("degraded"), "{detail}");
+    }
+
+    /// The founder's ACTUAL, near-permanent case (`sparkle-o4mqng` / `sparkle-ot4dxb`): the daemon is
+    /// working — database healthy, workers active, jobs completing — and reports `Health: DEGRADED`
+    /// ONLY because doomed temp-fixture jobs pile up as `workers: N stalled job(s) running > 30 min`.
+    /// A genuinely-working daemon must read HEALTHY here, or the deployment panel is amber forever on
+    /// a condition it declares harmless. The stalled jobs are still NAMED in the detail, not hidden.
+    #[test]
+    fn degraded_only_by_stale_review_jobs_reads_healthy() {
+        let out = "Daemon: running (uptime: 48h 31m) [v0.53.1]\n\
+                   Workers: 4/4 active\n\
+                   Jobs:    8 queued, 11 running, 17014 completed, 4064 failed, 0 skipped\n\
+                   \n\
+                   Health: DEGRADED\n  + database: healthy\n  \
+                   ! workers: 7 stalled job(s) running > 30 min\n\
+                   \n\
+                   Recent Errors (last 24h): 100\n  \
+                   [11m0s ago] worker: claim job: database is locked (5) (SQLITE_BUSY)\n"
+            .to_string();
+        let (state, detail) = classify_roborev(&StatusProbe::Text(out), Some(true));
+        assert_eq!(
+            state,
+            HealthState::Healthy,
+            "a working daemon degraded only by stale review jobs is green: {detail}"
+        );
+        // The stalled jobs must still be surfaced, and the deploy-safety line must survive.
+        assert!(detail.contains("7 stalled job(s)"), "names the stale jobs: {detail}");
+        assert!(detail.contains("17014 completed"), "carries the queue summary: {detail}");
+        assert!(detail.contains("do not stop review"), "{detail}");
+    }
+
+    /// The DISCRIMINATOR, paired with the test above: the SAME stale-jobs line, but the database is
+    /// also unhealthy. A real sick subsystem alongside the debris must NOT be greened — the benign
+    /// case is greened only when the debris is the *only* thing wrong.
+    #[test]
+    fn stale_jobs_beside_a_sick_database_stays_a_warning() {
+        let out = "Daemon: running (uptime: 48h) [v0.53.1]\n\
+                   Health: DEGRADED\n  - database: unhealthy\n  \
+                   ! workers: 7 stalled job(s) running > 30 min\n"
+            .to_string();
+        let (state, detail) = classify_roborev(&StatusProbe::Text(out), Some(true));
+        assert_eq!(state, HealthState::Warning, "a sick database is not debris: {detail}");
+        assert!(detail.to_lowercase().contains("degraded"), "{detail}");
+    }
+
+    /// A non-OK health whose degraded subsystem is NOT the stale-jobs kind (here a soft `!` on the
+    /// database) is a degradation we cannot confirm is benign → WARNING. Fail toward honest amber.
+    #[test]
+    fn a_soft_non_stall_degradation_stays_a_warning() {
+        let out = "Daemon: running [v0.53.1]\n\
+                   Health: DEGRADED\n  ! database: replication lag 40s\n"
+            .to_string();
+        let (state, _) = classify_roborev(&StatusProbe::Text(out), Some(true));
+        assert_eq!(state, HealthState::Warning);
+    }
+
+    /// A bare `Health: DEGRADED` with no subsystem lines is not confirmable as benign, so it must NOT
+    /// green — the greening path requires a positively-identified stale-jobs subsystem line.
+    #[test]
+    fn a_bare_degraded_with_no_subsystems_stays_a_warning() {
+        let out = "Daemon: running [v0.53.1]\nHealth: DEGRADED\n".to_string();
+        let (state, _) = classify_roborev(&StatusProbe::Text(out), Some(true));
+        assert_eq!(state, HealthState::Warning, "unconfirmable degradation is honest amber");
+    }
+
+    /// Ordering-independence for a RECOGNISED hard marker: a benign stalled line first, then a hard
+    /// `- database: unhealthy`, still Warning. (This shape was already handled — both are marker lines
+    /// the parser collects — so this is a regression guard, not the fix for the drop bug; the dropped
+    /// shapes are covered by `an_unrecognised_subsystem_line_forbids_greening` and
+    /// `a_colonless_marker_line_forbids_greening`.)
+    #[test]
+    fn a_hard_line_after_the_stalled_line_still_warns() {
+        let out = "Daemon: running\nWorkers: 4/4 active\n\
+                   Health: DEGRADED\n  ! workers: 7 stalled job(s) running > 30 min\n  \
+                   - database: unhealthy\n"
+            .to_string();
+        let (state, _) = classify_roborev(&StatusProbe::Text(out), Some(true));
+        assert_eq!(state, HealthState::Warning, "a hard line below the debris must be seen");
+    }
+
+    /// An UNRECOGNISED indented subsystem line (a marker we do not know, e.g. `✗`) sits BEFORE a hard
+    /// line. It must not silently drop the rest of the block: the unrecognised line alone forbids a
+    /// green, so the panel stays Warning (roborev finding, High — the parser must fail closed).
+    #[test]
+    fn an_unrecognised_subsystem_line_forbids_greening() {
+        let out = "Daemon: running\nWorkers: 4/4 active\n\
+                   Health: DEGRADED\n  ! workers: 7 stalled job(s) running > 30 min\n  \
+                   \u{2717} database: connection refused\n"
+            .to_string();
+        let (state, _) = classify_roborev(&StatusProbe::Text(out), Some(true));
+        assert_eq!(state, HealthState::Warning, "an unclassifiable line is not proof of benign");
+    }
+
+    /// A worker line that bundles an EXPLICIT fault word with the stall count — `2 workers down, 7
+    /// stalled job(s)` — is review actually failing, not debris, and must stay Warning (roborev
+    /// finding, Medium: the benign test was an over-broad substring match).
+    #[test]
+    fn a_stall_line_bundling_a_fault_stays_a_warning() {
+        let out = "Daemon: running\nWorkers: 2/4 active\n\
+                   Health: DEGRADED\n  ! workers: 2 workers down, 7 stalled job(s) running > 30 min\n"
+            .to_string();
+        let (state, _) = classify_roborev(&StatusProbe::Text(out), Some(true));
+        assert_eq!(state, HealthState::Warning, "an explicit fault word is not benign debris");
+    }
+
+    /// The PAIR to the fault-word test AND the fix for the "active"/"0/" substring bug: a detail that
+    /// carries the worker COUNT (`4/4 active`) beside the stall count is still benign — the count is
+    /// healthy capacity, not a fault — so the panel greens. Earlier code ambered this permanently.
+    #[test]
+    fn a_stall_line_carrying_a_healthy_worker_count_still_greens() {
+        let out = "Daemon: running\nWorkers: 4/4 active\n\
+                   Health: DEGRADED\n  ! workers: 4/4 active, 7 stalled job(s) running > 30 min\n"
+            .to_string();
+        let (state, detail) = classify_roborev(&StatusProbe::Text(out), Some(true));
+        assert_eq!(state, HealthState::Healthy, "a healthy worker count is not a fault: {detail}");
+    }
+
+    /// The verdict word is matched by EQUALITY, not substring (roborev finding, Medium). A
+    /// strictly-worse `Health: UNHEALTHY` with the same stalled line is never discounted, and — the
+    /// sharper case — `Health: DEGRADED (database not ok)` must NOT hit the old `contains("ok")` arm
+    /// and green with no fences: the verdict word is `degraded` but a real subsystem is sick, and here
+    /// the "(database not ok)" is only in the summary while the block shows the stall, so equality on
+    /// the FIRST word plus the fences is what holds. `Health: BROKEN` (contains "ok") must be Warning.
+    #[test]
+    fn the_verdict_word_is_matched_by_equality_not_substring() {
+        for (h, tag) in [
+            ("Health: UNHEALTHY", "unhealthy is worse than degraded"),
+            ("Health: BROKEN", "broken contains 'ok' but is not ok"),
+            ("Health: NOT OK", "'not ok' is not ok"),
+        ] {
+            let out = format!(
+                "Daemon: running\nWorkers: 4/4 active\n{h}\n  \
+                 ! workers: 7 stalled job(s) running > 30 min\n"
+            );
+            let (state, _) = classify_roborev(&StatusProbe::Text(out), Some(true));
+            assert_eq!(state, HealthState::Warning, "{tag}");
+        }
+    }
+
+    /// A recognised marker line with NO colon (`! disk usage above 95%`) is unclassifiable and must
+    /// set `saw_unrecognised`, forbidding a green even though the only real problem parsed is the
+    /// benign stall (roborev finding, Medium — the colon-less half of the fail-closed fix was
+    /// untested). A hard line BELOW the colon-less line must also still force Warning.
+    #[test]
+    fn a_colonless_marker_line_forbids_greening() {
+        let out = "Daemon: running\nWorkers: 4/4 active\n\
+                   Health: DEGRADED\n  ! workers: 7 stalled job(s) running > 30 min\n  \
+                   ! disk usage above 95%\n"
+            .to_string();
+        let (state, _) = classify_roborev(&StatusProbe::Text(out), Some(true));
+        assert_eq!(state, HealthState::Warning, "a colon-less marker line is unclassifiable");
+
+        let with_hard = "Daemon: running\nWorkers: 4/4 active\n\
+                         Health: DEGRADED\n  ! disk usage above 95%\n  \
+                         - database: unhealthy\n"
+            .to_string();
+        let (state, _) = classify_roborev(&StatusProbe::Text(with_hard), Some(true));
+        assert_eq!(state, HealthState::Warning, "the hard line below is still collected");
     }
 
     /// A connect-to-daemon failure is the down/wedged path; an unrelated failure is UNKNOWN, not a
