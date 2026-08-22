@@ -395,8 +395,10 @@ export function classifyFromScrollback(scrollback: string): ApiFailureClass | nu
     //
     // A hard wrap never starts a new TUI row, so a continuation CANNOT begin with a message marker.
     // Requiring that is what separates "the rest of this banner" from "the next thing that happened".
-    // NOTE this gates only the UPGRADE. A line that classifies null on its own keeps the original
-    // join behaviour, which predates this rule and is what unwraps a split account-limit banner.
+    // NOTE it gates BOTH doors — the upgrade AND the null-verdict arm. An earlier cut gated only the
+    // upgrade, and the same false `terminal` was still reachable through the other: a row that
+    // classifies null on its own could take a tail from a marker-bearing next row. A genuine hard
+    // wrap carries no marker, so it still unwraps a split account-limit banner exactly as before.
     // ⚠️ THE GATE COVERS BOTH DOORS (roborev 67824). A first cut applied it only to the UPGRADE arm
     // and left `alone === null ? fromJoined` unconditional — so a marker-bearing next row could
     // still lend a tail to an anchored prose opener and produce the same false `terminal`, reached

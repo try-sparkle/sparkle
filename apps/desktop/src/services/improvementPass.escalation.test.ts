@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it } from "vitest";
-import { AGENT_STATUS } from "@sparkle/ui";
+import { bandOfStatus } from "../engine/buildSections";
 import {
   classifyPassFailure,
 } from "../engine/passFailureStatus";
@@ -49,6 +49,21 @@ describe("noteRunFailureStatus — a repeat escalates", () => {
     expect(other.streak).toBe(1);
   });
 
+  // ⚠️ THIS IS THE CASE THAT ACTUALLY GUARDS "leaves the tally alone" (roborev 68035). The test
+  // below starts from a streak of ZERO, so `toBe(0)` is satisfied identically by the old code that
+  // NULLED the tally — reverting the fix leaves it green. Only a wall interposed into a REAL tally
+  // can tell "left alone" from "reset", which is the whole distinction.
+  it("a WALL interposed mid-tally does not reset it, so the escalation still fires", () => {
+    const SAME = "toolchain missing";
+    for (let i = 0; i < PARK_DECLINE_ESCALATE_AFTER - 1; i++) noteRunFailureStatus(SAME, "other");
+    expect(runFailureStreakAt()).toBe(PARK_DECLINE_ESCALATE_AFTER - 1);
+    // A wall lands in between — red at once, and the tally SURVIVES it.
+    expect(noteRunFailureStatus("Claude usage limit reached", "quota").status).toBe("blocked");
+    expect(runFailureStreakAt()).toBe(PARK_DECLINE_ESCALATE_AFTER - 1);
+    // ...so the next same-reason failure is the Nth and escalates, rather than starting over.
+    expect(noteRunFailureStatus(SAME, "other").status).toBe("errored");
+  });
+
   it("a WALL is red immediately and does not participate in the streak", () => {
     const first = noteRunFailureStatus("Claude usage limit reached", "quota");
     expect(first.status).toBe("blocked");
@@ -60,13 +75,18 @@ describe("noteRunFailureStatus — a repeat escalates", () => {
     );
   });
 
-  it("escalates to a status that is NOT in the calm band", () => {
+  // ⚠️ THE BAND, NOT THE COLOUR (roborev 67903). Colour is not the property this fix turns on:
+  // `blocked` and `lapsed` are BOTH outside the notify set, so a colour assertion would have passed
+  // for the very state the escalation exists to leave. What actually changes is the BAND — `lapsed`
+  // sits in `done`, which the sidebar collapses and the digest does not count, while the escalated
+  // tier does not. That is the whole argument, so that is what gets pinned.
+  it("escalates OUT of the band that hides a row", () => {
     const msg = "toolchain missing";
     for (let i = 0; i < PARK_DECLINE_ESCALATE_AFTER - 1; i++) noteRunFailureStatus(msg, "other");
     const red = noteRunFailureStatus(msg, "other").status;
-    // The whole point: the escalated tier must differ from the amber one it escalated FROM.
-    expect(AGENT_STATUS[red].color).not.toBe(AGENT_STATUS.lapsed.color);
-    expect(AGENT_STATUS[red].color).toBe(AGENT_STATUS.blocked.color);
+    expect(bandOfStatus("lapsed")).toBe("done");
+    expect(bandOfStatus(red)).not.toBe("done");
+    expect(bandOfStatus(red)).toBe(bandOfStatus("blocked"));
   });
 });
 

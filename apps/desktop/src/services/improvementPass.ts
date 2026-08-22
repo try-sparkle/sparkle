@@ -690,6 +690,12 @@ function clearParkDeclineStreak(): void {
  *  re-attempts by itself" is a claim about the mechanism, not about the outcome — and once the same
  *  re-attempt has failed identically N times, no other actor is coming. That is red by definition.
  *
+ *  ⚠️ IT COUNTS ATTEMPTS, NOT HOURS (roborev 67903). `armRetryIfTransient` earns one early
+ *  re-attempt inside the same slot, so a transient shape can contribute two ticks in one hour and the
+ *  threshold can be reached in fewer than three. That is the honest reading and it is the one the
+ *  name should carry — the guarantee is N consecutive failures FOR THE SAME REASON, which is the
+ *  property that means "no other actor is coming", not a claim about the clock.
+ *
  *  Normalized so a message differing only by a timestamp or a path still counts as the same reason;
  *  module state for the same reason as the park tally, and cleared by any pass that COMPLETES. */
 let runFailureReason: string | null = null;
@@ -712,16 +718,19 @@ function runFailureKey(message: string): string {
  *  A wall (`quota`/`auth`) is red immediately and does NOT participate: it is already the loudest
  *  thing this row can say, and streaking it would only delay the escalation it has already earned.
  *  Everything else is AMBER once, AMBER twice, and RED on the {@link PARK_DECLINE_ESCALATE_AFTER}th
- *  consecutive failure for the same reason — the same threshold and the same argument as the park
- *  path, so the two cannot drift apart in behaviour or in wording. */
+ *  consecutive failure for the same reason — the same threshold as the park path — though NOT the same
+ *  cadence, per the attempts-not-hours note above. */
 export function noteRunFailureStatus(
   message: string,
   cls: PassFailureClass,
 ): { status: AgentTabStatus; streak: number } {
   if (cls === "quota" || cls === "auth") {
-    runFailureReason = null;
-    runFailureStreak = 0;
-    return { status: passFailureStatus(cls), streak: 0 };
+    // ⚠️ DOES NOT PARTICIPATE — AND THAT MEANS IT LEAVES THE TALLY ALONE (roborev 67902). This used
+    // to null the streak, which is a different thing and a worse one: a loop failing identically most
+    // hours but hitting an occasional wall had its count restarted every time, so it could never
+    // reach the threshold and the escalation this whole helper exists for never fired. A wall is
+    // already the loudest thing this row can say; it neither needs the streak nor should erase it.
+    return { status: passFailureStatus(cls), streak: runFailureStreak };
   }
   const key = runFailureKey(message);
   if (key === runFailureReason) runFailureStreak += 1;
@@ -731,6 +740,42 @@ export function noteRunFailureStatus(
   }
   const escalate = runFailureStreak >= PARK_DECLINE_ESCALATE_AFTER;
   return { status: escalate ? "errored" : passFailureStatus(cls), streak: runFailureStreak };
+}
+
+/** Park the row on a run failure AND, when it has escalated, say WHY somewhere a human can read.
+ *
+ *  ⚠️ ONE HELPER, CALLED FROM BOTH SITES (roborev 68035). The first cut wrote the screen in the
+ *  `outcome` branch only, and the outer `catch` shares this very tally — so a repeatable SETUP throw
+ *  (the worktree cut, `parkWorktreeOnBase`, `assertWorkspaceIntegrity`, all networked and all capable
+ *  of failing with an identical message every hour) escalated to RED completely silently. A tally
+ *  shared by two branches needs its surface shared too, or one of them is a trap.
+ *
+ *  STATUS FIRST, THEN THE SCREEN, and that order is load-bearing: `setStatus` DROPS `attentionScreen`
+ *  whenever the new status is outside the red tier, so writing the screen first would erase it on
+ *  every amber (non-escalated) pass. The park path documents the same rule for the same reason.
+ *
+ *  The wording says PASSES, not "hourly passes": `armRetryIfTransient` can contribute a second tick
+ *  inside one slot, so the count is attempts. The park path's "hourly" is correct for ITS tally,
+ *  which really is one tick per hourly park; copying it here would assert the thing this module just
+ *  established is false. */
+function surfaceRunFailure(
+  failure: { status: AgentTabStatus; streak: number },
+  detail: string,
+): void {
+  useRuntimeStore.getState().setStatus(SPARKLE_AGENT_ID, failure.status);
+  if (failure.status !== "errored") return;
+  console.error(
+    "improvement pass: STUCK —",
+    failure.streak,
+    "consecutive failures for the same reason —",
+    detail,
+  );
+  useRuntimeStore
+    .getState()
+    .setAttentionScreen(
+      SPARKLE_AGENT_ID,
+      `Improve Sparkle has failed ${failure.streak} passes in a row for the same reason, so it is not going to clear itself:\n\n${detail}`,
+    );
 }
 
 /** Any pass that COMPLETES breaks the run-failure streak — the loop is demonstrably not stuck. */
@@ -1219,11 +1264,7 @@ export async function runImprovementPass(
       // AMBER unless the account is walled — OR unless this is the same failure for the third hour
       // running, at which point no other actor is coming and it is red. See noteRunFailureStatus.
       const outcomeFailure = noteRunFailureStatus(outcome.text, outcomeClass);
-      if (outcomeFailure.status === "errored")
-        console.warn(
-          `improvement pass failed ${outcomeFailure.streak}x for the same reason; escalating`,
-        );
-      setStatus(SPARKLE_AGENT_ID, outcomeFailure.status);
+      surfaceRunFailure(outcomeFailure, outcome.text);
     }
   } catch (e) {
     console.warn("improvement pass errored:", e);
@@ -1237,7 +1278,7 @@ export async function runImprovementPass(
     if (failureClass === "transient") armRetryIfTransient(failure);
     // Same rule as the failure branch above: a setup throw is something the next slot re-attempts,
     // so it is AMBER — unless the message names an account wall, which no re-attempt can clear.
-    setStatus(SPARKLE_AGENT_ID, noteRunFailureStatus(failure, failureClass).status);
+    surfaceRunFailure(noteRunFailureStatus(failure, failureClass), failure);
   } finally {
     releasePass();
   }

@@ -289,6 +289,68 @@ describe("runImprovementPass watchdog", () => {
   // and still be wired to nothing, and a test asserting "the classifier was called" would pass
   // against a call whose result was thrown away.
 
+  // ⚠️ A LOOP NEEDS A *NEW* INVOKE, NOT ANY INVOKE. `untilRunInvoked` asks whether a
+  // `sparkle_improve_run` has EVER been recorded, which is true from the second pass onward the
+  // instant it is called — so the error below would fire before the new pass had registered its
+  // handler, and the pass would never settle. Waiting on the COUNT is what makes a loop work.
+  async function untilAnotherRun(before: number) {
+    for (let i = 0; i < 200 && harness.invokes.filter((c) => c.cmd === "sparkle_improve_run").length <= before; i++) {
+      await Promise.resolve();
+    }
+    expect(harness.invokes.filter((c) => c.cmd === "sparkle_improve_run").length).toBeGreaterThan(before);
+  }
+
+  /** Drive ONE pass that fails with `message`, and return the status the store ends up holding. */
+  async function failOnce(message: string): Promise<string> {
+    const before = harness.invokes.filter((c) => c.cmd === "sparkle_improve_run").length;
+    const pass = runImprovementPass("always");
+    await untilAnotherRun(before);
+    harness.handlers.get("sparkle_improve:error")?.({ payload: { message } });
+    await withWarnSpy(async () => {
+      await pass;
+    });
+    return useRuntimeStore.getState().status[SPARKLE_AGENT_ID] ?? "";
+  }
+
+  /** Drive ONE pass that SUCCEEDS. Local to this describe: the identically-named helper further down
+   *  belongs to the account-binding suite and is not in scope here. */
+  async function succeedOnce() {
+    const before = harness.invokes.filter((c) => c.cmd === "sparkle_improve_run").length;
+    const pass = runImprovementPass("always");
+    await untilAnotherRun(before);
+    harness.handlers.get("sparkle_improve:done")?.({ payload: { sessionId: "s", text: "done" } });
+    await pass;
+  }
+
+  // ── AND THE ESCALATION, THROUGH THE REAL ENTRY POINT (roborev 67902/67903) ────────────────────
+  // The unit tests for `noteRunFailureStatus` call the helper directly, which proves the rule and
+  // NOT the wiring: delete either production call site, or the `clearRunFailureStreak()` on the
+  // success path, and every one of them stays green. This drives `runImprovementPass` itself.
+  it("the SAME failure, N times running, ends RED with a readable reason", async () => {
+    const SAME = "toolchain missing: cargo not found";
+    let last = "";
+    for (let i = 0; i < PARK_DECLINE_ESCALATE_AFTER; i++) {
+      last = await failOnce(SAME);
+      // Amber until the threshold — nothing is owed by the founder while it may still be a blip.
+      if (i < PARK_DECLINE_ESCALATE_AFTER - 1) expect(last).toBe("lapsed");
+    }
+    expect(last).toBe("errored");
+    // The red must SAY something. `console.warn` reaches neither the pane, the phone, nor
+    // `readAgentTerminal`; `attentionScreen` is what all three read.
+    const screen = useRuntimeStore.getState().attentionScreen[SPARKLE_AGENT_ID] ?? "";
+    expect(screen).toContain(SAME);
+    expect(screen).not.toBe("");
+  });
+
+  it("a pass that COMPLETES breaks the streak, so the next failure starts amber again", async () => {
+    const SAME = "toolchain missing: cargo not found";
+    for (let i = 0; i < PARK_DECLINE_ESCALATE_AFTER - 1; i++) await failOnce(SAME);
+    // One clean pass — the loop is demonstrably not stuck.
+    await succeedOnce();
+    // Without the reset on the success path this would already be `errored`.
+    expect(await failOnce(SAME)).toBe("lapsed");
+  });
+
   it("a TRANSIENT failure is AMBER, and arms the slot's one re-attempt", async () => {
     const pass = runImprovementPass("always", true);
     await untilRunInvoked();
@@ -574,6 +636,29 @@ describe("runImprovementPass watchdog", () => {
       expect(useRuntimeStore.getState().status[SPARKLE_AGENT_ID]).toBe("lapsed");
       expectNoRunInvoked();
     });
+  });
+
+  // ⚠️ THE OUTER CATCH SHARES THE RUN-FAILURE TALLY, SO IT NEEDS THE SAME SURFACE (roborev 68035).
+  // The first cut wrote the escalation screen in the `outcome` branch only. A SETUP throw is exactly
+  // the repeatable kind — the worktree cut, the park, the integrity assert are all networked and can
+  // fail with an identical message every hour — so it escalated to RED completely silently, which is
+  // the state this whole escalation exists to stop. Silencing this path leaves the suite green
+  // WITHOUT this case; that is what makes it worth its runtime.
+  it("a repeated SETUP throw escalates to RED and says why", async () => {
+    // Deliberately NOT a connectivity shape: those are `transient` and earn a retry. This is the
+    // `other` arm — nothing armed, nothing to clear it but the next hour, which fails the same way.
+    harness.parkImpl = () => Promise.reject(new Error("assertWorkspaceIntegrity: unexpected tree state"));
+
+    await withWarnSpy(async () => {
+      for (let i = 0; i < PARK_DECLINE_ESCALATE_AFTER; i++) await runImprovementPass("always", true);
+    });
+
+    expect(useRuntimeStore.getState().status[SPARKLE_AGENT_ID]).toBe("errored");
+    const screen = useRuntimeStore.getState().attentionScreen[SPARKLE_AGENT_ID] ?? "";
+    expect(screen).toContain("unexpected tree state");
+    // ...and it must NOT claim hours: an armed retry can add a tick inside one slot, so the tally
+    // counts attempts. The park path's own "hourly" wording is correct for ITS tally, not this one.
+    expect(screen).not.toContain("hourly");
   });
 
   // A decline is PERMANENT for the reasons that reach it — a stash cannot save a commit, so nothing
