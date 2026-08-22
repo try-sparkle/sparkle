@@ -831,9 +831,45 @@ pub(crate) const EXPIRED_LOGIN_NICKNAME: &str = "Login expired — reconnect";
 enum LoginEvidence {
     /// A live `oauthAccount.emailAddress`: a usable identity, adopted with the email as its label.
     SignedIn(OauthIdentity),
-    /// No usable `oauthAccount`, but the dir carries proof a real login once lived here — a Claude
-    /// Code `userID`, a completed onboarding, or a `history.jsonl` of past prompts. This is the
-    /// EXPIRED case: RETAIN it so the founder can re-authenticate, never drop it to an empty list.
+    /// No usable `oauthAccount`, but the dir carries PURELY ON-DISK proof a login once completed and
+    /// the account was USED — a `history.jsonl` of past interactive prompts, or a `.claude.json`
+    /// `projects` entry Claude Code populated with real work. This is the EXPIRED case: RETAIN it so
+    /// the founder can re-authenticate, never drop it to an empty list.
+    ///
+    /// The signals here are deliberately ones a COMPLETED login / real use leaves and that Sparkle's
+    /// own add / spawn / token-paste footprint does NOT forge. Every forgeable signal is excluded,
+    /// because a never-signed-in "Signing in…" dir carries all of them (verified on the founder's
+    /// machine — a cancelled add left `userID` + `hasCompletedOnboarding` + an empty `projects` map,
+    /// no `oauthAccount`, no `history.jsonl`):
+    ///   * `hasCompletedOnboarding` is seeded by Sparkle at [`add_account_at`] time (see
+    ///     [`ensure_onboarding_marker_at`]);
+    ///   * Claude Code writes a `userID` on its first startup, before "Select login method";
+    ///   * `ensure_project_trusted_at` seeds `projects[<worktree>].hasTrustDialogAccepted` at spawn
+    ///     prep — so a `projects` ENTRY is proof only when it carries a key BEYOND that one trust key
+    ///     (real Claude Code work: `lastCost`, `mcpServers`, `history`, …), which Sparkle never writes;
+    ///   * the token-paste flow (`account_usage::account_set_oauth_token`) writes `.credentials.json`
+    ///     BEFORE the CLI verifies the token and leaves it there on rejection, so neither the file's
+    ///     existence NOR a readable token in it proves a completed login — the credential is excluded
+    ///     entirely.
+    ///
+    /// WHY FILESYSTEM-ONLY, AND WHY NOT the keychain. An earlier cut probed the credential via
+    /// [`crate::account_usage::has_readable_credential`]. That probe is wrong for THIS caller on four
+    /// counts, and adoption is a ONE-WAY PERSISTENT write, so each is a permanent phantom row:
+    ///   * it FAILS OPEN — every non-`NoEntry` keychain error (a locked login keychain, a host with no
+    ///     secret-service backend, a `PlatformFailure`) is treated as "usable", so one bad keychain
+    ///     moment would adopt EVERY orphan, including the never-signed-in shells this exists to skip;
+    ///   * it can raise a BLOCKING macOS keychain modal per dir — Sparkle is not on those items' ACLs
+    ///     — inside `accounts_list`'s `call_once`, freezing the 5s-polled account list app-wide;
+    ///   * a successful read WRITES a plaintext token cache into a dir Sparkle holds no record for;
+    ///   * it accepts an UNVERIFIED pasted token (previous bullet).
+    /// Adoption retries every launch, so UNDER-retaining is free (re-add / re-auth) while
+    /// OVER-retaining is permanent — the safe direction is on-disk proof that cannot fail open. A real
+    /// login used only headlessly that lost BOTH its row and every on-disk trace is the one case this
+    /// forgoes; it is recovered by re-adding, which is cheaper than any phantom row.
+    ///
+    /// Counting any forgeable signal as a past login is what minted phantom "Login expired —
+    /// reconnect" rows for accounts that were never signed in, and made a removed one reappear after
+    /// a restart when its dir outlived the row (see [`read_login_evidence`]).
     SignedOutButUsed,
     /// Nothing but Claude Code's own first-run footprint (`projects/`, telemetry) with no completed
     /// login. Adopting one would hand the auto-picker a zero-usage account that wins every spawn and
@@ -841,35 +877,59 @@ enum LoginEvidence {
     NeverLoggedIn,
 }
 
-/// Classify a config dir by its login evidence (see [`LoginEvidence`]). Pure over the filesystem it
-/// reads, and unit-tested against all three shapes so the RETAIN-on-expiry branch cannot be deleted
-/// without reddening the suite. Reads `.claude.json` once via the SAME [`identity_json_path`]
-/// resolution the identity badge uses, so an explicit dir and the default account agree.
+/// Classify a config dir by its login evidence (see [`LoginEvidence`]). PURELY FILESYSTEM — a
+/// `history.jsonl` stat and one `.claude.json` read, no keychain, no token read, no side effects (see
+/// the `SignedOutButUsed` docs for why the keychain probe is deliberately not used here). Reads
+/// `.claude.json` via the SAME [`identity_json_path`] resolution the identity badge uses, so an
+/// explicit dir and the default account agree. Deterministic, so its tests need no injected seam.
 fn read_login_evidence(dir: &Path) -> LoginEvidence {
     // A live login is unambiguous — reuse the identity read the badge trusts.
     if let Some(id) = read_oauth_identity_at(Some(dir), None) {
         return LoginEvidence::SignedIn(id);
     }
-    // No live `oauthAccount`. Did a real login ever live here, or is this bare footprint?
-    let json_evidence = identity_json_path(Some(dir), None)
-        .and_then(|p| std::fs::read(p).ok())
-        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
-        .is_some_and(|v| {
-            let has_user_id = v
-                .get("userID")
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|s| !s.is_empty());
-            let onboarded =
-                v.get("hasCompletedOnboarding").and_then(serde_json::Value::as_bool) == Some(true);
-            has_user_id || onboarded
-        });
-    // `history.jsonl` is Claude Code's interactive prompt history — its presence is independent
-    // proof the dir was USED, catching a login whose `.claude.json` was reset to bare footprint.
-    if json_evidence || dir.join("history.jsonl").exists() {
+    // No live `oauthAccount`: retain only on unforgeable on-disk proof of real use.
+    if login_use_evidence_on_disk(dir) {
         LoginEvidence::SignedOutButUsed
     } else {
         LoginEvidence::NeverLoggedIn
     }
+}
+
+/// Purely on-disk proof that a login completed AND the dir was used — no keychain, no token read, no
+/// side effects. True iff Claude Code's interactive prompt history exists, or its `.claude.json`
+/// `projects` map holds an entry recording real work (see [`project_entry_shows_real_work`]).
+fn login_use_evidence_on_disk(dir: &Path) -> bool {
+    // Cheapest first: a stat, no parse. `history.jsonl` is interactive-REPL history — Sparkle never
+    // writes it, and a cancelled `claude auth login` never runs the REPL that would.
+    if dir.join("history.jsonl").exists() {
+        return true;
+    }
+    identity_json_path(Some(dir), None)
+        .and_then(|p| std::fs::read(p).ok())
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .and_then(|v| {
+            v.get("projects")
+                .and_then(|p| p.as_object())
+                .map(project_entry_shows_real_work)
+        })
+        .unwrap_or(false)
+}
+
+/// The one trust key [`ensure_project_trusted_at`] seeds into a `projects` entry at spawn prep. It is
+/// the ONLY key Sparkle writes there, so it is the exact key a real-work check must discount.
+const TRUST_SEED_KEY: &str = "hasTrustDialogAccepted";
+
+/// Does any `projects` entry carry a key BEYOND [`TRUST_SEED_KEY`]? Claude Code records real work
+/// (`lastCost`, `mcpServers`, `history`, `hasCompletedProjectOnboarding`, …) on an entry only after
+/// the account actually ran in that directory; Sparkle's trust seed writes `hasTrustDialogAccepted`
+/// alone. So "an entry with any other key" is real use that a never-signed-in, spawn-trusted dir
+/// cannot forge. An empty entry (`{}`) or a trust-only entry is NOT proof.
+fn project_entry_shows_real_work(projects: &serde_json::Map<String, serde_json::Value>) -> bool {
+    projects.values().any(|entry| {
+        entry
+            .as_object()
+            .is_some_and(|e| e.keys().any(|k| k != TRUST_SEED_KEY))
+    })
 }
 
 /// Record `email` as this config dir's Claude identity by filling `oauthAccount.emailAddress` in its
@@ -948,11 +1008,14 @@ fn record_oauth_email_at(claude_json_path: &Path, email: &str) -> Result<(), Str
 /// ══ RETAIN A USED LOGIN, SKIP AN EMPTY DIR ═════════════════════════════════════════════════════
 /// Classification is [`read_login_evidence`], which distinguishes THREE cases where this once saw
 /// two. A live `oauthAccount.emailAddress` ([`read_oauth_identity_at`], the identity badge's test)
-/// is adopted under its email. A dir with NO live `oauthAccount` but real proof of past use — a
-/// Claude Code `userID`, a completed onboarding, or a `history.jsonl` — is an EXPIRED login (Claude
-/// Code deletes `oauthAccount` on expiry) and is RETAINED under [`EXPIRED_LOGIN_NICKNAME`] so it
-/// never vanishes from the list; this is the founder's #1 ask — an expired account must stay
-/// visible with a re-login path, not silently disappear.
+/// is adopted under its email. A dir with NO live `oauthAccount` but unforgeable ON-DISK proof of
+/// past use — a `history.jsonl`, or a `.claude.json` `projects` entry carrying real Claude Code work
+/// (a key beyond `hasTrustDialogAccepted`) — is an EXPIRED login (Claude Code deletes `oauthAccount`
+/// on expiry) and is RETAINED under [`EXPIRED_LOGIN_NICKNAME`] so it never vanishes from the list;
+/// this is the founder's #1 ask — an expired account must stay visible with a re-login path, not
+/// silently disappear. `userID`, `hasCompletedOnboarding`, a bare/trust-only `projects` map, and a
+/// `.credentials.json` (written pre-verify) are all DELIBERATELY EXCLUDED — Sparkle's own footprint
+/// forges every one before a login completes (see [`LoginEvidence::SignedOutButUsed`]).
 ///
 /// A dir with neither — bare `projects/` + telemetry footprint, never logged in — is still left
 /// alone, and that exclusion is load-bearing rather than tidiness. An un-logged-in dir has no
@@ -6617,8 +6680,10 @@ mod tests {
         let tmp = unique_dir("adopt-expired");
         std::fs::create_dir_all(&tmp).unwrap();
 
-        // Was signed in (a Claude Code userID + completed onboarding + prompt history) but the
-        // `oauthAccount` block is gone — exactly the shape an expired login leaves on disk.
+        // Was signed in but the `oauthAccount` block is gone — the shape an expired login leaves on
+        // disk. `history.jsonl` (real interactive use) is what carries the RETAIN here; the `userID`
+        // and `hasCompletedOnboarding` in `.claude.json` are deliberately INERT (Sparkle forges both),
+        // so removing the history line — not the json — is what would drop this dir.
         let expired = tmp.join("accounts").join("ccc333");
         std::fs::create_dir_all(&expired).unwrap();
         std::fs::write(
@@ -6651,6 +6716,78 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
+    /// THE FOUNDER'S #1/#2 ASK, PINNED THROUGH THE REAL ADD FLOW: an account created by
+    /// [`add_account_at`] whose sign-in never completed must NOT be resurrected by adoption once its
+    /// row is gone but its dir survives (a removal whose `remove_dir_all` failed, or an app quit
+    /// before the frontend's undo ran). Seeds the dir with the PRODUCTION seeding — `add_account_at`
+    /// itself, which writes the onboarding marker and lets `claude` startup add a `userID` — so the
+    /// test cannot drift from what the add flow actually leaves on disk. Then drops the row and runs
+    /// adoption: the dir must be skipped, not re-minted into a phantom "Login expired — reconnect".
+    ///
+    /// SIDE EFFECT asserted: no row for the orphan id in `accounts.json` after the sweep. Deleting
+    /// the `NeverLoggedIn` skip (adopting the dir) reddens this — the guard the don't-resurrect
+    /// requirement rides on. The paired retain test above proves the sweep still ADOPTS a genuinely
+    /// used dir, so this is not "adopt nothing".
+    #[test]
+    fn a_never_completed_signin_is_not_resurrected_by_adoption() {
+        let tmp = unique_dir("no-resurrect");
+        let app_data = tmp.clone();
+        let accounts_path = accounts_json_path(&tmp);
+
+        // Real add flow: creates <app_data>/accounts/<id>/ and seeds the onboarding marker, exactly
+        // as "Add account" does before `claude auth login` runs.
+        let created = add_account_at(&app_data, &accounts_path, "Foo".into(), "orphanid".into(), 1)
+            .unwrap();
+        // Simulate `claude auth login` STARTING (writes a startup `userID`) but never completing:
+        // no `oauthAccount`, no `history.jsonl`, empty real work. This is the founder's "Signing in…"
+        // shape, hardened with every forgeable signal a real cancelled add can leave behind.
+        let dir = PathBuf::from(&created.config_dir);
+        ensure_onboarding_marker_at(&dir).unwrap(); // idempotent; mirrors the marker already seeded
+        let cj = dir.join(".claude.json");
+        let mut obj: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(&std::fs::read_to_string(&cj).unwrap()).unwrap();
+        obj.insert("userID".into(), serde_json::json!("7ec77cf4d0743bc6"));
+        // …a trust-seeded projects entry, as `ensure_project_trusted_at` writes at spawn prep — a
+        // never-signed-in account CAN be chosen for a spawn (a pin, or the no-account-signed-in
+        // fallback), and that must not later convert the dir to a retained login.
+        obj.insert(
+            "projects".into(),
+            serde_json::json!({"/some/worktree": {"hasTrustDialogAccepted": true}}),
+        );
+        std::fs::write(&cj, serde_json::to_string(&obj).unwrap()).unwrap();
+        // …and a rejected pasted token: `account_set_oauth_token` writes `.credentials.json` BEFORE
+        // the CLI verifies it, and a rejected paste leaves this well-formed blob on disk. It must
+        // NOT count as a completed login.
+        std::fs::write(
+            dir.join(".credentials.json"),
+            r#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-BOGUS","refreshToken":null,"expiresAt":0}}"#,
+        )
+        .unwrap();
+        // Sanity on the seeded shape: onboarding + userID + trust entry + a rejected credential
+        // present, but no completed-login evidence (no oauthAccount, no history.jsonl, no real work).
+        assert_eq!(obj.get("hasCompletedOnboarding"), Some(&serde_json::Value::Bool(true)));
+        assert!(obj.get("oauthAccount").is_none());
+        assert!(!dir.join("history.jsonl").exists());
+
+        // The row is gone (removed) but the dir survives — the state a failed `remove_dir_all` or an
+        // app quit before the frontend undo leaves behind.
+        write_accounts_at(&accounts_path, &[]).unwrap();
+
+        let adopted = adopt_orphan_dirs_at(&app_data, &accounts_path, 2).unwrap();
+
+        assert!(
+            !adopted.iter().any(|a| a.id == "orphanid"),
+            "a never-completed sign-in was resurrected by adoption: {adopted:?}"
+        );
+        // SIDE EFFECT: nothing was written back for it.
+        let on_disk = read_accounts_at(&accounts_path).unwrap();
+        assert!(
+            !on_disk.iter().any(|a| a.id == "orphanid"),
+            "phantom row persisted to accounts.json: {on_disk:?}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
     /// `read_login_evidence` tells the three cases apart — the classifier the retain/skip decision
     /// rides on. Flipping an input (drop the `oauthAccount`, or strip the use-evidence) moves the
     /// verdict, which is what keeps the adoption test above non-vacuous.
@@ -6667,11 +6804,35 @@ mod tests {
         .unwrap();
         assert!(matches!(read_login_evidence(&signed_in), LoginEvidence::SignedIn(_)));
 
-        // A `userID` alone (oauthAccount cleared) is enough to prove past use.
+        // A `projects` entry Claude Code populated with REAL work (a key beyond the trust seed)
+        // proves the account ran — covers a headless login whose `oauthAccount` was later cleared.
         let expired = tmp.join("e");
         std::fs::create_dir_all(&expired).unwrap();
-        std::fs::write(expired.join(".claude.json"), r#"{"userID":"u-1"}"#).unwrap();
+        std::fs::write(
+            expired.join(".claude.json"),
+            r#"{"machineID":"m","projects":{"/repo":{"hasTrustDialogAccepted":true,"lastCost":0.42}}}"#,
+        )
+        .unwrap();
         assert!(matches!(read_login_evidence(&expired), LoginEvidence::SignedOutButUsed));
+
+        // A `.credentials.json` — even one holding a WELL-FORMED token — is NOT proof (High finding).
+        // The token-paste flow writes exactly this shape BEFORE the CLI verifies it, and a rejected
+        // paste leaves it on disk (`AccountTokenForm` only shows an error). The credential is excluded
+        // from the classifier entirely, so a never-signed-in dir carrying a rejected token must still
+        // be NeverLoggedIn.
+        let bad_cred = tmp.join("bad-cred");
+        std::fs::create_dir_all(&bad_cred).unwrap();
+        std::fs::write(bad_cred.join(".claude.json"), r#"{"machineID":"m"}"#).unwrap();
+        std::fs::write(
+            bad_cred.join(".credentials.json"),
+            r#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-BOGUS","refreshToken":null,"expiresAt":0}}"#,
+        )
+        .unwrap();
+        assert!(
+            matches!(read_login_evidence(&bad_cred), LoginEvidence::NeverLoggedIn),
+            "an unverified pasted token in .credentials.json (the real rejected-paste shape) must \
+             not count as a completed login"
+        );
 
         // history.jsonl alone also proves it, even with a bare `.claude.json`.
         let expired2 = tmp.join("e2");
@@ -6680,11 +6841,46 @@ mod tests {
         std::fs::write(expired2.join("history.jsonl"), "{}\n").unwrap();
         assert!(matches!(read_login_evidence(&expired2), LoginEvidence::SignedOutButUsed));
 
+        // A TRUST-SEEDED `projects` entry is NOT proof (Medium finding): `ensure_project_trusted_at`
+        // writes `projects[<worktree>].hasTrustDialogAccepted` at spawn prep, before any login. A
+        // never-signed-in dir spawned on once carries this shape and must still be NeverLoggedIn.
+        let trust_only = tmp.join("trust-only");
+        std::fs::create_dir_all(&trust_only).unwrap();
+        std::fs::write(
+            trust_only.join(".claude.json"),
+            r#"{"userID":"u-1","hasCompletedOnboarding":true,"projects":{"/some/worktree":{"hasTrustDialogAccepted":true}}}"#,
+        )
+        .unwrap();
+        assert!(
+            matches!(read_login_evidence(&trust_only), LoginEvidence::NeverLoggedIn),
+            "a trust-seeded projects entry (Sparkle's own spawn footprint) must not count as a login"
+        );
+
         // Bare footprint, no login evidence → never adopted.
         let empty = tmp.join("n");
         std::fs::create_dir_all(empty.join("projects")).unwrap();
         std::fs::write(empty.join(".claude.json"), r#"{"machineID":"m"}"#).unwrap();
         assert!(matches!(read_login_evidence(&empty), LoginEvidence::NeverLoggedIn));
+
+        // ══ THE FOUNDER'S "Signing in…" SHAPE — A SIGN-IN THAT NEVER COMPLETED ═══════════════════
+        // Verbatim from the founder's machine (dirs 17f9e44…, c93e7cb…): Sparkle seeded
+        // `hasCompletedOnboarding` at add time, Claude Code wrote a `userID` on startup, and the
+        // `claude auth login` was cancelled — so there is NO `oauthAccount`, NO `history.jsonl`, and
+        // an EMPTY `projects` map. The old classifier read `userID`/`hasCompletedOnboarding` as proof
+        // of a past login and adopted this as a phantom "Login expired — reconnect" account (and
+        // resurrected removed ones on restart). It must classify as NeverLoggedIn.
+        let never = tmp.join("signing-in");
+        std::fs::create_dir_all(&never).unwrap();
+        std::fs::write(
+            never.join(".claude.json"),
+            r#"{"userID":"7ec77cf4","hasCompletedOnboarding":true,"machineID":"m","projects":{}}"#,
+        )
+        .unwrap();
+        assert!(
+            matches!(read_login_evidence(&never), LoginEvidence::NeverLoggedIn),
+            "a never-completed sign-in (Sparkle onboarding + startup userID, no oauth/history/projects) \
+             must not count as a past login"
+        );
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
