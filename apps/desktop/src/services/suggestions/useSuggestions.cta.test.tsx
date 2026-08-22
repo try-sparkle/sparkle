@@ -32,6 +32,7 @@ vi.mock("./approvalsRuntime", () => ({
   maybeAutoApprove: () => null,
   maybeAutoResume: () => null,
   maybeAutoPlan: () => null,
+  maybeAutoTrust: () => null,
 }));
 
 import { useSuggestions , resetSuggestionMemory } from "./useSuggestions";

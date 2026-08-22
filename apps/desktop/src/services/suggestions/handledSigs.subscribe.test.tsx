@@ -17,6 +17,7 @@ vi.mock("./approvalsRuntime", () => ({
   maybeAutoApprove: h.maybeAutoApprove,
   maybeAutoResume: vi.fn(() => null),
   maybeAutoPlan: vi.fn(() => null),
+  maybeAutoTrust: vi.fn(() => null),
   useSyncProjectApprovals: () => {},
 }));
 vi.mock("../terminalScrollback", () => ({ getAgentScrollback: () => h.scrollback }));

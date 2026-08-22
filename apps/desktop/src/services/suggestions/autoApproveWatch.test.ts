@@ -52,6 +52,7 @@ import {
   windowRetractionLedger,
 } from "../../engine/movementRetraction";
 import { PLAN_EXIT_PROMPT } from "./planPrompt.fixture";
+import { FOLDER_TRUST_PROMPT, folderTrustPromptFor } from "./trustPrompt.fixture";
 
 const AGENT = "a1";
 const FOOTER = "Enter to select · ↑/↓ to navigate · Esc to cancel";
@@ -702,6 +703,57 @@ describe("the session-resume picker is answered off-pane too, per the configured
     stopWatch = startAutoApproveWatch();
 
     useRuntimeStore.getState().setStatus(AGENT, "waiting");
+    vi.advanceTimersByTime(SETTLE_MS);
+
+    expect(writePty).not.toHaveBeenCalled();
+  });
+});
+
+
+// ── THE FOURTH ANSWERER, AT THIS CALL SITE ───────────────────────────────────────────────────────
+// The folder-trust dialog lands on an agent's FIRST FRAME, in a freshly-cut worktree, before it has
+// run a single tool — so by definition nobody is looking at that pane yet. Wiring it only into the
+// mounted, selected-agent hook would mean a spawned fleet sits idle until each pane is clicked,
+// which is the same reachability hole this module's header records twice.
+describe("the folder-trust dialog, on a pane nobody has opened", () => {
+  const MANAGED = `/Users/dev/Library/Application Support/ai.sparkle.desktop/worktrees/p1/${AGENT}`;
+
+  /** Seed the roster the way `projectStore.setAgentWorktree` does after a spawn. */
+  function seedWorktree(worktreePath: string | null): void {
+    useProjectStore.setState({
+      projects: [{ id: "p1", rootPath: "/repo", agents: [{ id: AGENT, worktreePath }] }],
+    } as never);
+  }
+
+  it("answers it for a worktree Sparkle cut for THIS agent", () => {
+    seedWorktree(MANAGED);
+    stopWatch = startAutoApproveWatch();
+
+    agentAsks(FOLDER_TRUST_PROMPT);
+    vi.advanceTimersByTime(SETTLE_MS);
+
+    expect(writePty).toHaveBeenCalledWith(AGENT, "1\n");
+  });
+
+  // THE SAFETY CASE, and it is a real assertion rather than a restatement: `bash = "always"` is set
+  // (see beforeEach) and this dialog classifies as `bash` off the word "execute" in its body, so
+  // WITHOUT the trust arm ahead of it `maybeAutoApprove` types "1" here and trusts the founder's own
+  // repository on his behalf. The only thing stopping it is the scope.
+  it("does NOT answer it for a folder outside Sparkle's worktrees root", () => {
+    seedWorktree(MANAGED);
+    stopWatch = startAutoApproveWatch();
+
+    agentAsks(folderTrustPromptFor("/Users/dev/Projects/some-random-repo"));
+    vi.advanceTimersByTime(SETTLE_MS);
+
+    expect(writePty).not.toHaveBeenCalled();
+  });
+
+  it("does NOT answer it when the agent has no recorded worktree — fail closed", () => {
+    seedWorktree(null);
+    stopWatch = startAutoApproveWatch();
+
+    agentAsks(FOLDER_TRUST_PROMPT);
     vi.advanceTimersByTime(SETTLE_MS);
 
     expect(writePty).not.toHaveBeenCalled();

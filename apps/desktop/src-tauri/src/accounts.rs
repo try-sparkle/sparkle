@@ -607,7 +607,174 @@ fn file_stamp(path: &Path) -> Option<(u64, std::time::SystemTime)> {
 /// [`crate::hooks::atomic_write_settings`]; and a compare-and-swap on `(len, mtime)` aborts rather
 /// than clobber a login `claude` completed between our read and our write.
 pub(crate) fn ensure_project_trusted_at(config_dir: &Path, worktree_path: &str) -> Result<(), String> {
-    ensure_project_trusted_with(config_dir, worktree_path, || {})
+    // BOUNDED RETRY, because the CAS below aborts rather than clobber a concurrent writer and a
+    // single abort used to degrade — silently — into exactly the dialog this function exists to
+    // prevent. `.claude.json` is written by every live `claude` in the fleet AND by every other
+    // pane's seed, so on a machine running dozens of agents losing the race once is ordinary, not
+    // exceptional. Retrying re-reads the file the winner just wrote, so each attempt is a fresh
+    // read-modify-write and never resurrects stale content.
+    const ATTEMPTS: usize = 5;
+    let mut last = String::new();
+    for attempt in 0..ATTEMPTS {
+        match ensure_project_trusted_with(config_dir, worktree_path, || {}) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                last = e;
+                // Brief, growing backoff so a burst of concurrent seeds de-synchronizes instead of
+                // colliding on the same instant. Short by design: this sits on the spawn path.
+                if attempt + 1 < ATTEMPTS {
+                    std::thread::sleep(std::time::Duration::from_millis(20 * (attempt as u64 + 1)));
+                }
+            }
+        }
+    }
+    Err(format!("folder-trust seed failed after {ATTEMPTS} attempts: {last}"))
+}
+
+/// Seed folder trust for `worktree_path` into EVERY registered account's config dir, plus `$HOME`
+/// for the imported default account.
+///
+/// ── WHY EVERY ACCOUNT AND NOT JUST THE CHOSEN ONE ───────────────────────────────────────────────
+/// Trust is recorded per (config dir × key). Sparkle runs multi-account rotation, and each account
+/// has its OWN `CLAUDE_CONFIG_DIR` — so seeding only the account picked at spawn leaves the agent
+/// one rotation away from an unseeded config dir and a fresh dialog. Rotation happens for reasons
+/// that have nothing to do with this agent (a usage limit on an unrelated account, a manual switch),
+/// so the re-prompt lands unpredictably and looks like a new bug every time.
+///
+/// Measured at filing time: the key that IS read was trusted in 5 of 12 account config dirs for one
+/// project and ZERO of 12 for another, which is why that project's agents prompted without fail.
+///
+/// Best-effort PER ACCOUNT: one unwritable or unparseable config dir must not stop the others, so
+/// failures are collected and returned as a summary rather than short-circuiting. An `Err` here is
+/// still only a warning to the caller — the worst case is the pre-existing single prompt.
+pub(crate) fn ensure_project_trusted_everywhere(
+    app_data: &Path,
+    worktree_path: &str,
+) -> Result<(), String> {
+    let dirs = seedable_config_dirs(app_data);
+
+    let mut failures: Vec<String> = Vec::new();
+    for dir in &dirs {
+        // Only seed a config dir that EXISTS. Creating one for an account that was removed, or that
+        // the user never logged into, would fabricate a config dir Claude Code then treats as a real
+        // (logged-out) account — see `projects_entry_has_real_work`, which reads a trust-only entry
+        // as "not real work" precisely so this cannot be mistaken for a login.
+        if !dir.is_dir() {
+            continue;
+        }
+        if let Err(e) = ensure_project_trusted_at(dir, worktree_path) {
+            failures.push(format!("{}: {e}", dir.display()));
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "folder trust seeded with {} failure(s): {}",
+            failures.len(),
+            failures.join("; ")
+        ))
+    }
+}
+
+/// The config dirs Sparkle may pre-seed trust into, for the AHEAD-OF-TIME paths (cross-account seed
+/// and the sweep) that write to accounts this spawn is not using.
+///
+/// ── WHY `$HOME` IS CONDITIONAL HERE AND UNCONDITIONAL AT THE SPAWN ──────────────────────────────
+/// `$HOME/.claude.json` is not just "the default account" — it is the user's OWN Claude Code config,
+/// the one their plain `claude` in a terminal reads. Seeding a project root into it changes the
+/// behaviour of a tool Sparkle does not own, outside Sparkle.
+///
+/// At a SPAWN that is still correct and necessary: the user picked the default account, so the agent
+/// genuinely runs as their plain `claude` and the record is about a directory they are launching an
+/// agent in right now. Ahead of time it is not: sweeping every project root into the personal config
+/// of a user who may not even USE the default account would make a trust decision on their behalf
+/// for sessions that have nothing to do with Sparkle.
+///
+/// So `$HOME` is included ONLY when a default account is actually REGISTERED (an `accounts.json`
+/// entry that is `is_default`, or one carrying an empty `config_dir`, which is how the imported
+/// default account is spelled). Note the trust key for a worktree is its MAIN REPO ROOT, so this is
+/// a real widening to guard — it is not confined to Sparkle's own worktrees the way the screen-level
+/// auto-answer is.
+fn seedable_config_dirs(app_data: &Path) -> Vec<PathBuf> {
+    let accounts = read_accounts_at(&accounts_json_path(app_data)).unwrap_or_default();
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    let has_default = accounts
+        .iter()
+        .any(|a| a.is_default || a.config_dir.is_empty());
+    if has_default {
+        if let Some(h) = std::env::var_os("HOME").filter(|h| !h.is_empty()) {
+            dirs.push(PathBuf::from(h));
+        }
+    }
+    for a in accounts {
+        if !a.config_dir.is_empty() {
+            dirs.push(PathBuf::from(a.config_dir));
+        }
+    }
+    dirs.sort();
+    dirs.dedup();
+    dirs
+}
+
+/// THE BACKSTOP SWEEP. Reconcile folder trust for every agent worktree on disk against every
+/// account config dir, so a wedged agent is impossible rather than merely unlikely.
+///
+/// ── WHY A SWEEP IS NEEDED WHEN THE SPAWN ALREADY SEEDS ──────────────────────────────────────────
+/// The per-spawn seed only ever runs at a spawn. It therefore cannot repair:
+///   * the worktrees that already exist having never been seeded correctly (63 of 117 on the
+///     reporting machine, because the seed wrote a key nothing read — bead `sparkle-ubee5u`);
+///   * an account added, re-logged-in, or adopted AFTER the agents were spawned;
+///   * a `.claude.json` that Claude Code itself replaced wholesale, taking the record with it.
+/// In each of those the agent is already sitting on the dialog when the seed would have run, and
+/// nothing goes back to look. That is exactly the reported symptom: a column of red agents that need
+/// nothing from the human.
+///
+/// Cheap by construction: keys are de-duplicated across worktrees FIRST (every agent worktree of one
+/// project shares its main checkout's key), so this is a handful of small JSON read-modify-writes,
+/// not one per worktree. Returns the number of (key-set × config dir) seeds attempted.
+///
+/// Best-effort throughout — this runs on a listing path, and a failure to pre-seed must never take
+/// the user's accounts away from them.
+pub(crate) fn sweep_folder_trust_at(app_data: &Path) -> Result<usize, String> {
+    let keys = crate::claude_trust::managed_worktree_trust_keys(app_data);
+    if keys.is_empty() {
+        return Ok(0);
+    }
+    let dirs = seedable_config_dirs(app_data);
+
+    let mut seeded = 0usize;
+    for dir in &dirs {
+        // Never CREATE a config dir here — see `ensure_project_trusted_everywhere` for why a
+        // fabricated dir is worse than a missing one.
+        if !dir.is_dir() {
+            continue;
+        }
+        if let Err(e) = ensure_keys_trusted_at(dir, &keys) {
+            tracing::warn!(dir = %dir.display(), error = %e, "folder-trust sweep skipped a config dir");
+            continue;
+        }
+        seeded += 1;
+    }
+    Ok(seeded)
+}
+
+/// [`ensure_keys_trusted_with`] with the same bounded CAS retry [`ensure_project_trusted_at`] uses.
+fn ensure_keys_trusted_at(config_dir: &Path, keys: &[String]) -> Result<(), String> {
+    const ATTEMPTS: usize = 5;
+    let mut last = String::new();
+    for attempt in 0..ATTEMPTS {
+        match ensure_keys_trusted_with(config_dir, keys, || {}) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                last = e;
+                if attempt + 1 < ATTEMPTS {
+                    std::thread::sleep(std::time::Duration::from_millis(20 * (attempt as u64 + 1)));
+                }
+            }
+        }
+    }
+    Err(format!("folder-trust seed failed after {ATTEMPTS} attempts: {last}"))
 }
 
 /// [`ensure_project_trusted_at`] with a seam that runs AFTER the read and BEFORE the write, so the
@@ -616,6 +783,22 @@ pub(crate) fn ensure_project_trusted_at(config_dir: &Path, worktree_path: &str) 
 fn ensure_project_trusted_with(
     config_dir: &Path,
     worktree_path: &str,
+    between_read_and_write: impl FnOnce(),
+) -> Result<(), String> {
+    // THE KEYS CLAUDE CODE ACTUALLY READS — see `crate::claude_trust` and bead `sparkle-ubee5u`.
+    let keys = crate::claude_trust::trust_keys_for(Path::new(worktree_path));
+    ensure_keys_trusted_with(config_dir, &keys, between_read_and_write)
+}
+
+/// Seed an explicit, already-derived set of trust keys.
+///
+/// Split out from [`ensure_project_trusted_with`] so the startup sweep can work on keys that have
+/// been DE-DUPLICATED across worktrees. Every agent worktree of one project derives the SAME key
+/// (its main checkout), so sweeping by worktree would perform ~117 × 12 read-modify-writes on this
+/// machine to write a handful of distinct values; sweeping by key performs a handful.
+fn ensure_keys_trusted_with(
+    config_dir: &Path,
+    keys: &[String],
     between_read_and_write: impl FnOnce(),
 ) -> Result<(), String> {
     let file = config_dir.join(CLAUDE_JSON);
@@ -644,15 +827,18 @@ fn ensure_project_trusted_with(
         },
     };
 
-    // Already trusted for this exact worktree → do not rewrite the file for nothing.
-    if obj
-        .get("projects")
-        .and_then(|p| p.as_object())
-        .and_then(|p| p.get(worktree_path))
-        .and_then(|w| w.as_object())
-        .and_then(|w| w.get("hasTrustDialogAccepted"))
-        == Some(&serde_json::Value::Bool(true))
-    {
+    // Already trusted under EVERY key → do not rewrite the file for nothing. It must be every key,
+    // not any: a partial record is what a half-completed earlier seed leaves behind, and treating
+    // that as done is how the missing key never gets written.
+    let all_present = keys.iter().all(|k| {
+        obj.get("projects")
+            .and_then(|p| p.as_object())
+            .and_then(|p| p.get(k))
+            .and_then(|w| w.as_object())
+            .and_then(|w| w.get("hasTrustDialogAccepted"))
+            == Some(&serde_json::Value::Bool(true))
+    });
+    if all_present {
         return Ok(());
     }
 
@@ -666,16 +852,21 @@ fn ensure_project_trusted_with(
         *projects = serde_json::Value::Object(serde_json::Map::new());
     }
     let projects = projects.as_object_mut().unwrap();
-    let entry = projects
-        .entry(worktree_path.to_string())
-        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
-    if !entry.is_object() {
-        *entry = serde_json::Value::Object(serde_json::Map::new());
+    // ONE read-modify-write for ALL keys — not one write per key. Each write is CAS-guarded against
+    // a live `claude`, so writing them separately would multiply the chance of losing the race by
+    // the number of keys and could leave the derived key (the one that matters) unwritten.
+    for key in keys {
+        let entry = projects
+            .entry(key.clone())
+            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+        if !entry.is_object() {
+            *entry = serde_json::Value::Object(serde_json::Map::new());
+        }
+        entry.as_object_mut().unwrap().insert(
+            "hasTrustDialogAccepted".into(),
+            serde_json::Value::Bool(true),
+        );
     }
-    entry.as_object_mut().unwrap().insert(
-        "hasTrustDialogAccepted".into(),
-        serde_json::Value::Bool(true),
-    );
 
     std::fs::create_dir_all(config_dir).map_err(|e| format!("mkdir account dir: {e}"))?;
     let json = serde_json::to_string(&serde_json::Value::Object(obj))
@@ -3528,6 +3719,19 @@ pub async fn accounts_list(app: AppHandle) -> Result<Vec<Account>, String> {
                 tracing::warn!(account = %a.id, error = %e, "could not heal the account's onboarding marker");
             }
         }
+        // FOLDER-TRUST BACKSTOP, on the same "repair before it can be spawned on" pass and for the
+        // same reason — but keyed by WORKTREE rather than by account, because trust is recorded per
+        // (config dir × key) and an account healed here would still meet an unseeded worktree.
+        //
+        // Once per app run: the population it reconciles only grows by a spawn, and every spawn
+        // seeds itself. Doing it on each listing would re-walk the worktrees tree on a hot path for
+        // nothing.
+        static TRUST_SWEPT: std::sync::Once = std::sync::Once::new();
+        TRUST_SWEPT.call_once(|| match sweep_folder_trust_at(&app_data) {
+            Ok(0) => {}
+            Ok(n) => tracing::info!(config_dirs = n, "swept folder trust for managed worktrees"),
+            Err(e) => tracing::warn!(error = %e, "could not sweep folder trust"),
+        });
         Ok(accounts)
     })
     .await
@@ -3549,9 +3753,11 @@ pub async fn accounts_list(app: AppHandle) -> Result<Vec<Account>, String> {
 /// stall the UI thread.
 #[tauri::command]
 pub async fn ensure_project_trusted(
+    app: AppHandle,
     config_dir: Option<String>,
     worktree: String,
 ) -> Result<(), String> {
+    let app_data = crate::worktree::app_data_dir_pub(&app).ok();
     tauri::async_runtime::spawn_blocking(move || {
         let dir: PathBuf = match config_dir.filter(|s| !s.is_empty()) {
             Some(c) => PathBuf::from(c),
@@ -3564,7 +3770,18 @@ pub async fn ensure_project_trusted(
                 }
             },
         };
-        ensure_project_trusted_at(&dir, &worktree)
+        // The account this spawn will actually run under, FIRST and on its own — it is the one that
+        // must be right for THIS launch, and its result is what the caller is told about.
+        let chosen = ensure_project_trusted_at(&dir, &worktree);
+        // …then every other account, so a later rotation cannot re-earn the dialog. Advisory: a
+        // failure to pre-seed an account this agent is not currently using must not be reported as a
+        // failure of this spawn's own seeding.
+        if let Some(app_data) = app_data {
+            if let Err(e) = ensure_project_trusted_everywhere(&app_data, &worktree) {
+                tracing::warn!(worktree = %worktree, error = %e, "partial cross-account folder-trust seed");
+            }
+        }
+        chosen
     })
     .await
     .map_err(|e| format!("ensure_project_trusted task failed: {e}"))?
@@ -6802,6 +7019,187 @@ mod tests {
     }
 
     // ---- folder trust (the restart-wedge's first half) ------------------------------------
+
+    /// THE AHEAD-OF-TIME PATHS MUST NOT TOUCH THE USER'S PERSONAL CONFIG UNINVITED.
+    ///
+    /// `$HOME/.claude.json` is the config the user's own `claude` reads in a terminal, and the trust
+    /// key for a worktree is its MAIN REPO ROOT — so sweeping it in would grant trust for sessions
+    /// that have nothing to do with Sparkle, on behalf of a user who may not even use the default
+    /// account. Asserts the SELECTION, in both directions, because a one-directional test ("it is
+    /// included when a default exists") passes for an implementation that always includes it.
+    #[test]
+    fn home_is_seeded_ahead_of_time_only_when_a_default_account_is_registered() {
+        let tmp = unique_dir("trust-home-scope");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/nonexistent".into()));
+
+        // No default account registered → the personal config must be left alone.
+        std::fs::write(
+            tmp.join("accounts.json"),
+            r#"[{"id":"a","nickname":"a","configDir":"/tmp/acct-a","isDefault":false,"createdAt":0}]"#,
+        )
+        .unwrap();
+        let dirs = seedable_config_dirs(&tmp);
+        assert!(
+            !dirs.contains(&home),
+            "with no default account registered, the sweep must not write the user's own \
+             ~/.claude.json — that changes their plain `claude` outside Sparkle. Got: {dirs:?}"
+        );
+        assert!(dirs.contains(&PathBuf::from("/tmp/acct-a")), "the real account must be seeded");
+
+        // A registered default account → $HOME is legitimately that account's config.
+        std::fs::write(
+            tmp.join("accounts.json"),
+            r#"[{"id":"d","nickname":"d","configDir":"","isDefault":true,"createdAt":0}]"#,
+        )
+        .unwrap();
+        let dirs = seedable_config_dirs(&tmp);
+        assert!(
+            dirs.contains(&home),
+            "a REGISTERED default account keeps its config at $HOME, so it must be seeded or every \
+             agent on it stops on the dialog. Got: {dirs:?}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// THE BACKSTOP, END TO END: a worktree that was NEVER seeded gets healed by the sweep, into an
+    /// account that has never seen it.
+    ///
+    /// This is the case the per-spawn seed structurally cannot reach — the agent is already sitting
+    /// on the dialog by the time a spawn would have seeded anything — and it is the shape of the
+    /// reported symptom (a column of red agents needing nothing from the human). Asserts the record
+    /// landed in the ACCOUNT's config under the key Claude Code reads, not merely that the sweep
+    /// returned a count.
+    #[test]
+    fn the_sweep_heals_a_worktree_that_was_never_seeded() {
+        let tmp = unique_dir("trust-sweep");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let git = |args: &[&str], cwd: &Path| -> bool {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        };
+        // A project repo, and an agent worktree laid out the way Sparkle lays them out:
+        // <app_data>/worktrees/<projectId>/<agentId>
+        let main = tmp.join("proj");
+        std::fs::create_dir_all(&main).unwrap();
+        if !git(&["init", "-q", "-b", "main"], &main) {
+            eprintln!("skipping: git unavailable");
+            let _ = std::fs::remove_dir_all(&tmp);
+            return;
+        }
+        git(&["config", "user.email", "t@t"], &main);
+        git(&["config", "user.name", "t"], &main);
+        std::fs::write(main.join("f.txt"), "hi").unwrap();
+        git(&["add", "-A"], &main);
+        assert!(git(&["commit", "-qm", "init"], &main));
+
+        let app_data = tmp.join("appdata");
+        let wt = app_data.join("worktrees").join("proj-1").join("agent-1");
+        std::fs::create_dir_all(wt.parent().unwrap()).unwrap();
+        assert!(git(
+            &["worktree", "add", "-q", "-b", "feature", wt.to_str().unwrap(), "main"],
+            &main
+        ));
+
+        // An account whose config has NEVER recorded this project — the untrusted starting state.
+        let acct = app_data.join("accounts").join("acct-1");
+        std::fs::create_dir_all(&acct).unwrap();
+        std::fs::write(
+            app_data.join("accounts.json"),
+            serde_json::to_string(&serde_json::json!([{
+                "id": "acct-1",
+                "nickname": "one",
+                "configDir": acct.to_string_lossy(),
+                "isDefault": false,
+                "createdAt": 0,
+            }]))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let swept = sweep_folder_trust_at(&app_data).unwrap();
+        assert!(swept >= 1, "the sweep must have seeded at least the registered account");
+
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(acct.join(".claude.json")).unwrap())
+                .unwrap();
+        let main_key = main.canonicalize().unwrap().to_string_lossy().to_string();
+        assert_eq!(
+            v["projects"][&main_key]["hasTrustDialogAccepted"],
+            true,
+            "the sweep must heal an unseeded worktree under the key Claude Code reads ({main_key}); \
+             without it an already-spawned agent stays parked on the dialog forever. Wrote: {v:#}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// THE TEST THAT WOULD HAVE CAUGHT `sparkle-ubee5u` ON DAY ONE, and the one that reds if the
+    /// prompt can come back.
+    ///
+    /// Every test above this line seeds a MADE-UP path string (`/wt/acme/agent-7`) and then asserts
+    /// that same string came back out of the JSON. That is a tautology about a map — it passed for
+    /// the entire life of the bug, because the thing that was wrong was never the writing, it was
+    /// WHICH KEY to write. Claude Code resolves a linked worktree's trust under the MAIN REPOSITORY
+    /// ROOT, so the worktree-path key the seed wrote was read by nothing and every fresh agent
+    /// stopped on the dialog.
+    ///
+    /// So this test uses a REAL git worktree cut by REAL git, and asserts the seed wrote the key the
+    /// CLI will actually index by. Feed it a fabricated fixture and it goes back to proving nothing.
+    #[test]
+    fn seeding_folder_trust_writes_the_key_claude_code_reads_for_a_real_worktree() {
+        let tmp = unique_dir("trust-real-worktree");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let main = tmp.join("main");
+        std::fs::create_dir_all(&main).unwrap();
+        let git = |args: &[&str], cwd: &Path| -> bool {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        };
+        if !git(&["init", "-q", "-b", "main"], &main) {
+            eprintln!("skipping: git unavailable");
+            let _ = std::fs::remove_dir_all(&tmp);
+            return;
+        }
+        git(&["config", "user.email", "t@t"], &main);
+        git(&["config", "user.name", "t"], &main);
+        std::fs::write(main.join("f.txt"), "hi").unwrap();
+        git(&["add", "-A"], &main);
+        assert!(git(&["commit", "-qm", "init"], &main));
+        let wt = tmp.join("wt");
+        assert!(git(
+            &["worktree", "add", "-q", "-b", "feature", wt.to_str().unwrap(), "main"],
+            &main
+        ));
+
+        let cfg = tmp.join("cfg");
+        std::fs::create_dir_all(&cfg).unwrap();
+        ensure_project_trusted_at(&cfg, wt.to_str().unwrap()).unwrap();
+
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(cfg.join(".claude.json")).unwrap())
+                .unwrap();
+        let main_key = main.canonicalize().unwrap().to_string_lossy().to_string();
+        assert_eq!(
+            v["projects"][&main_key]["hasTrustDialogAccepted"],
+            true,
+            "the seed must write the MAIN REPO ROOT key ({main_key}) — that is the only key Claude \
+             Code indexes for a linked worktree, and writing anything else means every fresh agent \
+             stops on the trust dialog (sparkle-ubee5u). Wrote: {v:#}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 
     /// THE SIDE EFFECT THAT SKIPS THE DIALOG. Claude Code 2.1.235 shows "Is this a project you
     /// trust?" unless `config.projects[<abs cwd>].hasTrustDialogAccepted === true` is in

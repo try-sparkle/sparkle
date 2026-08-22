@@ -44,6 +44,9 @@ mod capture_window;
 mod chief;
 mod claude;
 mod claude_chat;
+/// Derives the key Claude Code looks folder-trust up under — the main repo root for a linked
+/// worktree, NOT the worktree path. See the module header and bead `sparkle-ubee5u`.
+mod claude_trust;
 /// One-shot text inference on the user's own Claude Code subscription, via their authenticated
 /// `claude` CLI. Replaces the server-side `/ai/anthropic` proxy that `ai.rs` used to own.
 mod claude_oneshot;

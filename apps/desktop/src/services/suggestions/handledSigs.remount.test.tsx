@@ -24,6 +24,9 @@ vi.mock("./approvalsRuntime", () => ({
   maybeAutoApprove: h.maybeAutoApprove,
   maybeAutoResume: vi.fn(() => null),
   maybeAutoPlan: vi.fn(() => null),
+  // The FOURTH answerer. A mock that omits it makes the hook call `undefined(...)`, so leaving it
+  // out does not fail as "trust is unwired" — it fails as every de-dupe case in this file throwing.
+  maybeAutoTrust: vi.fn(() => null),
   useSyncProjectApprovals: () => {},
 }));
 vi.mock("../terminalScrollback", () => ({ getAgentScrollback: () => h.scrollback }));

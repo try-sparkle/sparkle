@@ -30,11 +30,18 @@
 // lazily per project (`Workspace`), so such an agent has no process in this window and therefore no
 // prompt to answer.
 //
-// ── THREE ANSWERERS RIDE THIS PATH, AND THE COUNT KEEPS BEING THE BUG ──────────────────────────
+// ── FOUR ANSWERERS RIDE THIS PATH, AND THE COUNT KEEPS BEING THE BUG ───────────────────────────
+// `maybeAutoTrust` (Claude Code's folder-trust dialog, scoped to Sparkle's own worktrees),
 // `maybeAutoPlan` (the plan-exit dialog, `[approvals].plan`), `maybeAutoResume` (the session-resume
 // picker, `[approvals].resume`) and `maybeAutoApprove` (permission prompts, per-category rules), in
-// that order — see `decide()` for why the order between the first two is a convention while being
-// ahead of the third is not.
+// that order — see `decide()` for why the order among the first three is a convention while being
+// ahead of the fourth is not.
+//
+// THE FOURTH WAS ADDED WITH THIS PARAGRAPH IN FRONT OF IT, so it was wired into all three call
+// sites (here, plus the live path AND the memo-hit fast path in `useSuggestions`) in the same
+// commit. Its miss would have been the most expensive of the four: the trust dialog lands on an
+// agent's FIRST FRAME, before it has run a single tool, so an unwired answerer means a fleet that
+// spawns and does nothing at all.
 //
 // THE SAME OMISSION HAPPENED TWICE, WHICH IS WHY THIS PARAGRAPH EXISTS. The 2026-08-12 decision
 // above ("let the auto-approver see agents whose pane is not open") was implemented for permission
@@ -46,7 +53,7 @@
 // per-project rule resolution, keystroke, unit tests — so the reachability hole presents as
 // "configured and silently inert", never as broken: nothing logged, nothing red, no failing test.
 // A reader checking whether auto-resume works finds a complete, well-tested implementation and
-// concludes that it does. So when you add a FOURTH answerer, the question to ask is not "does my
+// concludes that it does. So when you add a FIFTH answerer, the question to ask is not "does my
 // detector work" but "which of the two call sites did I wire it into" — the answer must be both,
 // plus the memo-hit fast path in `useSuggestions`, which is a third place that is easy to miss
 // because it looks like a cache read rather than a decision point.
@@ -88,7 +95,7 @@
 //     ahead of the category branch, so it applies to this path by construction — which is the thing
 //     standing between "answer prompts I did not read" and real harm.
 import { useRuntimeStore } from "../../stores/runtimeStore";
-import { maybeAutoApprove, maybeAutoPlan, maybeAutoResume } from "./approvalsRuntime";
+import { maybeAutoApprove, maybeAutoPlan, maybeAutoResume, maybeAutoTrust } from "./approvalsRuntime";
 import { approvalScreenFor } from "./approvalScreen";
 import { handledSigsFor } from "./handledSigs";
 import { log } from "../../logger";
@@ -182,6 +189,25 @@ function decide(agentId: string, textAtSchedule: string): void {
   if (read.text !== textAtSchedule) {
     // Still painting (or new output arrived). Start the settle over on what it says now.
     schedule(agentId);
+    return;
+  }
+  // THE FOLDER-TRUST DIALOG GOES FIRST, and this call site is the one that matters most for it: the
+  // dialog lands on an agent's FIRST FRAME, in a freshly-cut worktree, before it has run anything —
+  // so there is by definition nobody looking at that pane yet. Wiring it only into the mounted,
+  // selected-agent hook would mean a spawned fleet sits idle until each pane is clicked.
+  //
+  // AHEAD OF ALL THREE SIBLINGS, and that ordering is a safety requirement rather than a reading
+  // convention. The dialog satisfies `looksLikePermission` and classifies as `bash`, so leaving it
+  // to `maybeAutoApprove` means `bash = "always"` presses "Yes, I trust this folder" for ANY folder.
+  // `maybeAutoTrust` claims it either way — answering it only for Sparkle's own managed worktrees,
+  // and handing every other folder to the founder unanswered.
+  const trust = maybeAutoTrust(agentId, read.text, handledSigsFor(agentId));
+  if (trust) {
+    log.info(
+      "approvals",
+      trust === "asked" ? "folder-trust dialog left for a human" : "auto-trusted a managed worktree off-pane",
+      { agentId, source: read.source },
+    );
     return;
   }
   // THE PLAN-EXIT PROMPT IS ANSWERED HERE TOO, and this is the call site that matters most for it.

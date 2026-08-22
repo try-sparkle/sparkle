@@ -37,10 +37,17 @@ const maybeAutoPlan = vi.fn(() => null as string | null);
 // answerer declining from the answerer being unreachable. That is exactly what happened: the plan
 // arm was added to this branch while the resume arm was still missing from it.
 const maybeAutoResume = vi.fn(() => null as string | null);
+// A SPY for the same reason as `maybeAutoResume` above, and the reason applies hardest to this one:
+// the folder-trust dialog is the FOURTH answerer, and `autoApproveWatch`'s header records that the
+// recurring bug is wiring a new answerer into some call sites and not others. The memo-hit branch is
+// the site that looks like a cache read rather than a decision point, so it is the one that gets
+// missed. A stub returning null cannot tell "declined" from "never asked"; a spy can.
+const maybeAutoTrust = vi.fn(() => null as string | null);
 vi.mock("./approvalsRuntime", () => ({
   maybeAutoApprove: (...a: unknown[]) => maybeAutoApprove(...(a as [])),
   maybeAutoResume: (...a: unknown[]) => maybeAutoResume(...(a as [])),
   maybeAutoPlan: (...a: unknown[]) => maybeAutoPlan(...(a as [])),
+  maybeAutoTrust: (...a: unknown[]) => maybeAutoTrust(...(a as [])),
 }));
 vi.mock("./pendingQuestion", () => ({ detectPendingQuestion: () => false }));
 
@@ -90,6 +97,9 @@ beforeEach(() => {
   maybeAutoPlan.mockReturnValue(null);
   maybeAutoResume.mockReset();
   maybeAutoResume.mockReturnValue(null);
+  // Re-armed, not reset-to-undefined: `memoTrust === null` is what lets the approve arm run at all.
+  maybeAutoTrust.mockReset();
+  maybeAutoTrust.mockReturnValue(null);
   scrollback = "Done. Committed abc. Nothing further.";
   status = "idle";
   useConnectionStore.setState({ browserOnline: true, probeOk: true, isOnline: true });
@@ -227,6 +237,96 @@ describe("useSuggestions memo across your-turn flips", () => {
     await act(async () => {});
 
     expect(maybeAutoApprove).toHaveBeenCalled();
+  });
+
+  // ── THE FOURTH ANSWERER, AT BOTH OF THIS HOOK'S CALL SITES ────────────────────────────────────
+  // `autoApproveWatch`'s header records that the recurring bug is wiring a new answerer into some
+  // call sites and not others, and that the memo-hit branch is the one that gets missed because it
+  // reads like a cache lookup. These are the executable answer to "which sites did you wire it
+  // into" for the folder-trust dialog. They are NOT redundant with the plan-path pair above: the
+  // guards are separate expressions and either can be dropped on its own.
+  it("asks the TRUST path on a memo hit", async () => {
+    computeSuggestions.mockResolvedValue({ agentId: "a1", buttons: [BTN] });
+
+    const { rerender } = renderHook(() => useSuggestions("a1", true));
+    await act(async () => {});
+
+    status = "working";
+    rerender();
+    await act(async () => {});
+
+    maybeAutoTrust.mockClear();
+    status = "idle";
+    rerender();
+    await act(async () => {});
+
+    expect(maybeAutoTrust).toHaveBeenCalled();
+  });
+
+  it("a memo hit the TRUST path has claimed is never offered to the approver", async () => {
+    // The safety leak this closes, and it is worse than the plan path's. The folder-trust dialog
+    // satisfies `looksLikePermission` and classifies as `bash` off the word "execute" in its body,
+    // so `maybeAutoApprove` does not merely hand it onward — under `bash = "always"` it PRESSES
+    // "Yes, I trust this folder" for whatever folder the dialog names.
+    computeSuggestions.mockResolvedValue({ agentId: "a1", buttons: [BTN] });
+
+    const { rerender } = renderHook(() => useSuggestions("a1", true));
+    await act(async () => {});
+
+    status = "working";
+    rerender();
+    await act(async () => {});
+
+    maybeAutoTrust.mockReturnValue("asked");
+    maybeAutoApprove.mockClear();
+    status = "idle";
+    rerender();
+    await act(async () => {});
+
+    expect(maybeAutoTrust).toHaveBeenCalled();
+    expect(maybeAutoApprove).not.toHaveBeenCalled();
+  });
+
+  it("a FRESH screen the TRUST path has claimed is never offered to the approver either", async () => {
+    computeSuggestions.mockResolvedValue({ agentId: "a1", buttons: [BTN] });
+    maybeAutoTrust.mockReturnValue("asked");
+    maybeAutoApprove.mockClear();
+    maybeAutoPlan.mockClear();
+
+    renderHook(() => useSuggestions("a1", true));
+    await act(async () => {});
+
+    expect(maybeAutoTrust).toHaveBeenCalled();
+    expect(maybeAutoApprove).not.toHaveBeenCalled();
+    expect(maybeAutoPlan).not.toHaveBeenCalled();
+  });
+
+  // THE PAIRED POSITIVE FOR THE FRESH PATH, and it is not decoration: the two "claimed → approver
+  // not called" cases above are both satisfied by an approve arm that is simply DEAD. Mutating the
+  // fresh path's guard to `autoTrust !== null && autoPlan !== null` leaves every negative case green
+  // — only this row goes red. The memo branch has had its own version of this since the plan work;
+  // the fresh branch did not, and that asymmetry is exactly how a call site regresses unnoticed.
+  it("still offers an UNCLAIMED fresh screen to the approver — the guard is not a blanket", async () => {
+    computeSuggestions.mockResolvedValue({ agentId: "a1", buttons: [BTN] });
+    maybeAutoTrust.mockReturnValue(null);
+    maybeAutoPlan.mockReturnValue(null);
+    maybeAutoApprove.mockClear();
+
+    renderHook(() => useSuggestions("a1", true));
+    await act(async () => {});
+
+    expect(maybeAutoApprove).toHaveBeenCalled();
+  });
+
+  it("a TRUSTED screen suppresses the buttons on the fresh path", async () => {
+    computeSuggestions.mockResolvedValue({ agentId: "a1", buttons: [BTN] });
+    maybeAutoTrust.mockReturnValue("trusted");
+
+    const { result } = renderHook(() => useSuggestions("a1", true));
+    await act(async () => {});
+
+    expect(result.current.buttons).toHaveLength(0);
+    expect(result.current.autoApproved).toBeNull(); // not a category note — the pills are just gone
   });
 
   // THE RESUME SIBLING OF THE THREE PLAN CASES ABOVE, and it was missing — which is how this branch

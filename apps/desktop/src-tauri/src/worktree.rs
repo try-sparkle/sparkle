@@ -8806,6 +8806,31 @@ fn merge_permission_posture(root: &mut Value) {
     let obj = root.as_object_mut().unwrap();
     // The consent record lives at the TOP level of a settings file, not under `permissions`.
     obj.insert("skipDangerousModePermissionPrompt".into(), json!(true));
+
+    // ── THE SECOND PER-DIRECTORY TRUST DECISION: PROJECT MCP SERVERS ──────────────────────────
+    // Claude Code raises a separate "New MCP server found in this project / Use this MCP server"
+    // dialog for every server declared in the project's own `.mcp.json`, and an unattended agent
+    // hangs on it exactly the way it hangs on the folder-trust dialog. That is the known
+    // fleet-wide stall in which every agent carrying the claude-in-chrome server wedges after an
+    // app restart — the SAME root shape as bead `sparkle-ubee5u`: a per-directory decision Sparkle
+    // re-earns on every fresh path.
+    //
+    // Answering "yes, all" is precisely what this key records, and the CLI honours it from a
+    // project's LOCAL settings — this file. Two properties make that reachable here, both verified
+    // against the shipped 2.1.240 bundle rather than assumed:
+    //   * it SKIPS `localSettings` when that file is git-TRACKED (a tracked settings file must not
+    //     grant itself trust). `.claude/settings.local.json` is gitignored, so it is read.
+    //   * the per-server check short-circuits on `isPathPersistedTrusted(cwd)` FIRST, so this key
+    //     only takes effect once folder trust resolves — which is why the `claude_trust` fix is a
+    //     PREREQUISITE for this one, not an alternative to it.
+    //
+    // Scope: this approves the servers the USER'S OWN repository declares, in a throwaway worktree
+    // Sparkle cut from that same repository for its own unattended agent. It grants no tool
+    // execution by itself — MCP tool calls still go through the permission layer and the deny list
+    // below. Written ungated, like the consent record above, because it is a dialog-suppression
+    // record rather than a brake release.
+    obj.insert("enableAllProjectMcpServers".into(), json!(true));
+
     if !guard_installed {
         return;
     }
@@ -15853,6 +15878,36 @@ mod tests {
     ///
     /// So the assertion is on the SIDE EFFECT of the guard being missing: no `defaultMode`, no
     /// `deny`. The paired case above (composing over a document the guard installer wrote) proves
+    /// THE SECOND DIALOG: project MCP servers must be pre-approved, or an unattended agent hangs on
+    /// "New MCP server found in this project" the same way it hung on the folder-trust dialog.
+    ///
+    /// This is the known fleet-wide stall where every agent carrying the claude-in-chrome server
+    /// wedges after an app restart — the same root shape as bead `sparkle-ubee5u`. Asserted for BOTH
+    /// the guarded and unguarded compositions, because this is a dialog-suppression record rather
+    /// than a brake release: gating it on the write-guard the way `defaultMode` is gated would
+    /// reintroduce the hang in exactly the case where the guard install failed, which is precisely
+    /// when nobody is watching.
+    #[test]
+    fn every_agent_worktree_pre_approves_the_projects_own_mcp_servers() {
+        // Guarded composition (the normal path).
+        let guarded = r#"{"hooks":{"PreToolUse":[{"matcher":"","hooks":[{"type":"command","command":"node /x/worktree-guard.mjs"}]}]}}"#;
+        let v: serde_json::Value =
+            serde_json::from_str(&merge_agent_worktree_settings(Some(guarded))).unwrap();
+        assert_eq!(
+            v["enableAllProjectMcpServers"], true,
+            "without this an agent stops on the per-project MCP trust dialog, which no unattended \
+             worker can answer"
+        );
+
+        // …and the UNGUARDED composition, where the hang would be worst.
+        let v: serde_json::Value =
+            serde_json::from_str(&merge_agent_worktree_settings(None)).unwrap();
+        assert_eq!(
+            v["enableAllProjectMcpServers"], true,
+            "a failed write-guard install must not also reintroduce the MCP trust hang"
+        );
+    }
+
     /// the same code path DOES produce the posture when the guard is there — one test showing
     /// absence is ambiguous; the pair is what pins the cause.
     #[test]

@@ -13,7 +13,7 @@ import { pushSuggestions } from "../relayClient";
 import { deriveCta } from "../../engine/agentCta";
 import { isInMotion } from "../../engine/inMotion";
 import { resolveStage } from "../../engine/workflowStage";
-import { maybeAutoApprove, maybeAutoResume, maybeAutoPlan } from "./approvalsRuntime";
+import { maybeAutoApprove, maybeAutoResume, maybeAutoPlan, maybeAutoTrust } from "./approvalsRuntime";
 // The de-dupe registry, shared with `./autoApproveWatch` — see that module's header for why the
 // off-pane answerer and this hook must read one set and not two.
 import { clearHandledSignatures, handledSigsFor, resetHandledSignatures } from "./handledSigs";
@@ -625,6 +625,23 @@ export function useSuggestions(agentId: string, composerEmpty: boolean) {
       // depending on a render that the batched approval→working→approval transition skips
       // (roborev 53286).
       if (!isLive()) return;
+      // THE FOLDER-TRUST DIALOG RUNS HERE TOO — the third call site, and the one that looks like a
+      // cache read rather than a decision point, which is exactly why answerers keep being left out
+      // of it. What reaches this branch is a trust dialog the founder was SHOWN (only
+      // NON-auto-answered results are memoized), so serving the cached pills without re-asking would
+      // hand a repeat sighting to `maybeAutoApprove`, where the dialog classifies as `bash` and a
+      // `bash = "always"` config presses "Yes, I trust this folder" for whatever folder it names.
+      const memoTrust = maybeAutoTrust(agentId, scrollback, handledSigs.current);
+      if (memoTrust === "trusted") {
+        lastHash.current = nextHash;
+        setDismissed(new Set());
+        setAutoApproved(null);
+        setButtons([]);
+        setQuestionPending(false);
+        retire();
+        log.debug("suggestions", "auto-trusted a managed worktree (memo)", { agentId });
+        return;
+      }
       // The plan path runs here too, and for a reason that is easy to miss: only NON-auto-answered
       // results are memoized, so the screen that reaches this branch under `plan = "ask"` is exactly
       // a plan prompt the founder asked to see. Without the same claim, the memo hit would hand it
@@ -657,8 +674,11 @@ export function useSuggestions(agentId: string, composerEmpty: boolean) {
       // `memoPlan === "asked"` means the plan path CLAIMED this screen for a human, and a resume
       // answer is not `maybeAutoApprove`'s to give either — so the approve arm runs only when
       // neither sibling has spoken for the screen.
+      // `memoTrust === "asked"` is the safety claim, not a routing nicety: the trust path recognised
+      // the dialog and refused it because the folder is not one Sparkle minted. Offering it to
+      // `maybeAutoApprove` would press it anyway under `bash = "always"`.
       const autoCat =
-        memoPlan === null && !autoResume
+        memoTrust === null && memoPlan === null && !autoResume
           ? maybeAutoApprove(agentId, scrollback, handledSigs.current)
           : null;
       lastHash.current = nextHash;
@@ -794,11 +814,27 @@ export function useSuggestions(agentId: string, composerEmpty: boolean) {
         // the next microtask would see a freshly-emptied set and auto-answer a SECOND time
         // (roborev 53203). Checking the live status makes the watcher's timing irrelevant.
         const live = isLive();
+        // THE FOLDER-TRUST DIALOG IS ANSWERED FIRST OF ALL, ahead of the plan path. It is the one
+        // prompt here whose wrong answer cannot be taken back by a later screen: it tells Claude
+        // Code it may read, edit and execute everything in a directory. `maybeAutoTrust` answers it
+        // only for `<app data>/worktrees/<project id>/<agent id>` — the folders Sparkle itself cut
+        // for this very agent — and CLAIMS every other one so `maybeAutoApprove`, which classifies
+        // this dialog as `bash`, never presses it for a folder the founder opened by hand.
+        const autoTrust = live ? maybeAutoTrust(agentId, scrollback, handledSigs.current) : null;
+        if (autoTrust === "trusted") {
+          setAutoApproved(null); // not a category note; just suppress the pills for this prompt
+          setButtons([]);
+          setQuestionPending(false); // answered on the user's behalf — nothing is pending
+          retire();
+          log.debug("suggestions", "auto-trusted a managed worktree", { agentId });
+          return;
+        }
         // The plan-exit prompt goes FIRST, ahead of both siblings. `maybeAutoApprove` hands every
         // screen it cannot classify to the concierge, and this dialog is one of those by
         // construction — so answering it here is what stops a prompt with a standing rule behind it
         // from being escalated as though nobody could decide it.
-        const autoPlan = live ? maybeAutoPlan(agentId, scrollback, handledSigs.current) : null;
+        const autoPlan =
+          live && autoTrust === null ? maybeAutoPlan(agentId, scrollback, handledSigs.current) : null;
         if (autoPlan === "auto" || autoPlan === "manual") {
           setAutoApproved(null); // not a category note; just suppress the pills for this prompt
           setButtons([]);
@@ -820,7 +856,9 @@ export function useSuggestions(agentId: string, composerEmpty: boolean) {
         // so it must not be offered to `maybeAutoApprove`, whose unclassified arm would hand it to
         // the concierge and answer the very prompt `plan = "ask"` promised to surface.
         const autoCat =
-          live && autoPlan === null ? maybeAutoApprove(agentId, scrollback, handledSigs.current) : null;
+          live && autoTrust === null && autoPlan === null
+            ? maybeAutoApprove(agentId, scrollback, handledSigs.current)
+            : null;
         if (autoCat) {
           setAutoApproved(autoCat);
           setButtons([]);

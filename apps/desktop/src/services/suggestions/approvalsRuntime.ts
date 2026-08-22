@@ -18,6 +18,7 @@ import { classifyApproval, headerRegion } from "./approvalClassifier";
 import { mcpAutoAnswerable, mcpToolFromPrompt, isDeniedTool } from "./mcpToolPolicy";
 import { detectResumePrompt, pickerSignature } from "./heuristics";
 import { detectPlanPrompt, isPlanExitDialog } from "./planPrompt";
+import { isFolderTrustDialog, trustAnswerFor } from "./trustPrompt";
 import { routeUnclassifiedPrompt } from "./conciergeEscalation";
 import { handOffToConcierge } from "./conciergeHandoff";
 import {
@@ -101,7 +102,7 @@ function declineOrHandOff(agentId: string, scrollback: string): null {
 function typeAutoAnswer(
   agentId: string,
   keystroke: string,
-  what: "auto-approve" | "auto-resume" | "auto-plan",
+  what: "auto-approve" | "auto-resume" | "auto-plan" | "auto-trust",
 ) {
   // Chained: the option keystroke carries its own CR (see pty.writePtyChainedStrict).
   void writePtyChainedStrict(agentId, keystroke).then(
@@ -405,6 +406,124 @@ export function maybeAutoPlan(
   typeAutoAnswer(agentId, option, "auto-plan");
   log.info("approvals", "auto-answered plan prompt", { agentId, mode: rule });
   return rule;
+}
+
+/**
+ * What {@link maybeAutoTrust} did with the screen it was handed.
+ *
+ * `"asked"` IS THE LOAD-BEARING VALUE, exactly as it is for {@link PlanOutcome} — and here it is
+ * load-bearing for a SAFETY reason rather than a routing one. See {@link maybeAutoTrust}.
+ */
+export type TrustOutcome = "trusted" | "asked";
+
+/** The Sparkle-managed worktree recorded for `agentId`, or null when there is none.
+ *
+ *  ONE WRITER, and that is what makes this usable as a security input: `projectStore.setAgentWorktree`
+ *  is fed the path Rust's `worktree_path()` minted from validated ids. Nothing a model said, and no
+ *  id-to-path guessing. `trustPrompt.isManagedWorktreePath` re-checks the SHAPE anyway — see its
+ *  doc for why that redundancy is deliberate. */
+export function worktreePathForAgent(agentId: string): string | null {
+  for (const p of useProjectStore.getState().projects) {
+    const a = p.agents.find((x) => x.id === agentId);
+    if (a) return a.worktreePath ?? null;
+  }
+  return null;
+}
+
+/**
+ * Refuse a folder-trust dialog and CLAIM it — the shape every refusal in {@link maybeAutoTrust}
+ * takes, factored out so each refusal is ONE line (see the note at the call sites).
+ *
+ * `declined`, deliberately NEVER `declineOrHandOff`. Routing this onward would let the concierge
+ * answer the one prompt in Claude Code whose entire purpose is to ask a HUMAN whether they trust a
+ * folder — which is not a narrower version of the safety scope, it is the scope switched off with an
+ * extra hop in front of it.
+ */
+function declineTrust(agentId: string): TrustOutcome {
+  log.info("approvals", "folder-trust dialog left for a human", { agentId });
+  declined(agentId);
+  return "asked";
+}
+
+/**
+ * Decide whether to auto-answer Claude Code's FOLDER-TRUST dialog (if any) currently in
+ * `scrollback`, and if so type the trust affirmative's keystroke exactly once per picker instance.
+ *
+ * Returns `"trusted"` when it answered, `"asked"` when it recognised the dialog and deliberately
+ * left it for a human, or null when this is not the trust dialog at all.
+ *
+ * ── WHY THIS PATH EXISTS ──────────────────────────────────────────────────────────────────────
+ * Every Sparkle agent spawns into a FRESH git worktree, so Claude Code raises its folder-trust
+ * dialog on the agent's first frame and the agent sits there having done nothing. The PRIMARY fix is
+ * in Rust — the spawn pre-seeds the trust key into the account config so the dialog never renders —
+ * and this is the BACKSTOP for the two cases that seed structurally cannot cover: it lost a race
+ * with the spawn, or it is absent (an older config, a hand-launched pane, a worktree cut before the
+ * seed shipped).
+ *
+ * ══ `"asked"` IS A SAFETY CLAIM, NOT A ROUTING CONVENIENCE ═════════════════════════════════════
+ * This dialog ALREADY reaches `maybeAutoApprove` and is already answerable by it. "Yes, I trust this
+ * folder" is a plain yes (`PLAIN_YES` matches, no `YES_CONTINUATION` word in it) and "No, exit" is a
+ * plain no, so `looksLikePermission` accepts it; the body — "read, edit, and execute files here" —
+ * then classifies as `bash` off the word "execute". So today a user with `bash = "always"` has this
+ * dialog auto-pressed FOR ANY FOLDER, and a user with no rule has it handed to the concierge.
+ *
+ * That is why recognising the dialog must CLAIM it in BOTH directions. Answering the in-scope case
+ * is half the job; the other half is taking the OUT-OF-SCOPE case away from the general answerers,
+ * so a genuine "do you trust this folder?" about a folder the founder opened by hand reaches HIM.
+ * It is the one prompt in Claude Code whose entire purpose is to ask a human that question — a
+ * machine answering it does not automate a chore, it deletes the control. Hence `declined` and never
+ * `declineOrHandOff`: the concierge must not answer it either.
+ *
+ * ── WHAT "IN SCOPE" MEANS ─────────────────────────────────────────────────────────────────────
+ * `trustPrompt.trustAnswerFor` is the whole rule and it lives there, as a pure function, so the
+ * safety property is testable with no stores to seed: the folder must be
+ * `<app data>/worktrees/<project id>/<agent id>` — the layout `worktree.rs::worktree_path` mints —
+ * with the last segment matching THIS agent, and it must agree with the path the dialog prints when
+ * it prints one. Every uncertain path returns null there and DECLINES here. If the path cannot be
+ * established at all, that is a decline: "I could not tell" is not "it is fine".
+ *
+ * SECURITY: the keystroke comes ONLY from the local heuristic detector (detectTrustPrompt), never
+ * from the AI/learned suggestion tier — preserving the raw-keystroke trust boundary.
+ */
+export function maybeAutoTrust(
+  agentId: string,
+  scrollback: string,
+  handled: Set<string>,
+): TrustOutcome | null {
+  // THE BAIL IS THE DIALOG PREDICATE, NOT THE ANSWERABILITY ONE — the same distinction
+  // `maybeAutoPlan` turns on. Bailing on `detectTrustPrompt` would mean that a build renaming the
+  // affirmative past what the detector recognises silently returns the dialog to `maybeAutoApprove`,
+  // where `bash = "always"` presses it for any folder. The rename must produce a decline, not a leak.
+  //
+  // No report on this arm: a screen that is not the trust dialog is not a decision about anything.
+  if (!isFolderTrustDialog(scrollback)) return null;
+  // Gated on the SAME master toggle as its three siblings — this is a sub-behaviour of "auto-respond
+  // to prompts" and must never press while the parent is off. CLAIMED even so: switching off the
+  // presser does not make it safe for the concierge to answer a trust question, which is the one
+  // thing `declineOrHandOff` would do here.
+  // BOTH REFUSALS ARE ONE LINE, so `scripts/mutation-check.sh` can judge them: commenting out the
+  // head of a multi-line `if` whose body is a block leaves a dangling brace, the mutant will not
+  // parse, and the guard becomes one no check can prove is live. The same reason `autoApproveWatch`
+  // keeps its `ASK` test on one line.
+  if (!aiFeatureVisibleNow("autoApprove")) return declineTrust(agentId);
+  const option = trustAnswerFor(scrollback, agentId, worktreePathForAgent(agentId));
+  // Out of scope, or the path could not be established, or the only affirmative widens past this
+  // folder. All three are the same statement: the human decides this one.
+  if (!option) return declineTrust(agentId);
+  const sig = pickerSignature(scrollback);
+  // Already answered THIS picker instance: never re-send the keystroke, and never re-report it
+  // either (see the same early return in maybeAutoApprove).
+  if (handled.has(sig)) return "trusted";
+  handled.add(sig);
+  // `typeAutoAnswer` reports `handled` to the blocked-prompt grace window on a delivered write and
+  // `unreachable` on a dead pane — which is what keeps an agent parked on this dialog OUT of the
+  // needs-you band while the answer lands, and surfaces it at once when it cannot land. Note the
+  // burn rule in `engine/blockedPromptGrace`: a prompt identity is held ONCE and never again, so a
+  // dialog that reappears after an app restart goes straight to red unless it is genuinely ANSWERED.
+  // This path answers.
+  typeAutoAnswer(agentId, option, "auto-trust");
+  log.info("approvals", "auto-trusted a Sparkle-managed worktree", { agentId });
+  return "trusted";
 }
 
 /** The project root path that owns `agentId`, or null if it can't be resolved. */
