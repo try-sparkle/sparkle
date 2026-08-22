@@ -14,13 +14,19 @@
 //
 // SCOPE, precisely: the watchdog recovers a stream that dies while the turn is CLOSED (lastHook
 // "idle" — the reported bug: agent asks a question, user answers, row must go green). It does NOT
-// recover a stream that dies MID-TURN: lastHook is then frozen at "working", no contradiction ever
-// forms, and resolve() answers "working" for every screen report, so the row pins green until the
-// next reset() (a re-prepare). That gap predates the watchdog and is NOT a regression from it — but
-// it is real, and detecting it needs a signal this router does not have (silence cannot distinguish
-// a dead stream from a long tool call; see HOOK_STALE_MS). `mid_turn_death_is_not_recovered` in the
-// tests pins the current behavior so the gap stays explicit rather than latent. Tracked as
-// sparkle-7wij.
+// recover a stream that dies MID-TURN while the PROCESS IS STILL ALIVE: lastHook is then frozen at
+// "working", no contradiction ever forms, and resolve() answers "working" for every screen report,
+// so the row pins green until the next reset() (a re-prepare). That gap predates the watchdog and is
+// NOT a regression from it — but it is real, and detecting it needs a signal this router does not
+// have (silence cannot distinguish a dead stream from a long tool call; see HOOK_STALE_MS).
+// `mid_turn_death_is_not_recovered` in the tests pins the still-live case. Tracked as sparkle-7wij.
+//
+// THE ONE MID-TURN DEATH THAT IS NOW RECOVERED IS A PTY EXIT (sparkle-tab3nm). When the claude
+// PROCESS exits mid-turn — the founder's case: the "Terminal stopped" footer with a
+// `claude --resume <id>` banner, yet the sidebar row rendering GREEN with an "In PR" chip —
+// statusEngine.exit() emits a screen `done`, which is an actual EVENT, not silence. resolve() now
+// treats that `done` (and `errored`) as a fail-closed pierce of the frozen hook, so a dead process
+// can never read as a live working turn. See the SECOND override in `resolve`.
 import type { AgentTabStatus } from "@sparkle/ui";
 
 /**
@@ -220,7 +226,29 @@ export function createStatusRouter(
     // process alive (so no Stop/SessionEnd ever fires). The scraper clears this the instant real
     // progress resumes — it emits a non-errored screen status — so it can't outlive recovery.
     if (lastScreen === "errored") return "errored";
-    // SECOND FAIL-CLOSED OVERRIDE — the session-limit picker (PRD §6c). Ordered here deliberately:
+    // SECOND FAIL-CLOSED OVERRIDE — the PTY has EXITED (sparkle-tab3nm). A screen `done` is the one
+    // status statusEngine emits from a single path: `exit()`, on `pty:exit`. Settle emits
+    // idle/waiting/approval and never `done`, so `lastScreen === "done"` uniquely means THIS window
+    // watched the process close — the strongest turn-end witness there is (statusEngine's exit()
+    // comment: "nothing can still be writing the worktree"). It must pierce a hook frozen mid-turn
+    // at `working` exactly as `errored` does above, and for the same reason: when the claude process
+    // exits MID-TURN no `Stop` hook ever fires, `lastHook` freezes at "working", and the idle-only
+    // escalation below never gets a look — so without this the row PINS GREEN on a dead process.
+    // That is the founder's P0 here and the "mid-turn death" gap this module's header flags as
+    // sparkle-7wij; unlike that gap this is NOT inferred from silence but from an actual exit event,
+    // which is why it is a safe carve-out (the same standard as the session-limit pierce below).
+    // `clearedByProgress("done")` has already dropped the picker/approval latches by the time this
+    // resolves, so a dead process reads as `done` (gray), never as a live `working` (green).
+    //
+    // RETRACTION rests on a screen `working` arriving later, NOT on `reset()`. The in-mount restart
+    // path (typing into a dead terminal → `attempt` bump in Terminal.tsx) does not call `reset()` —
+    // only prepare()/unmount does — so `lastScreen` stays "done" and the hook stays frozen at
+    // "working" across the restart. What clears the pierce is the NEW StatusEngine's constructor emit
+    // of "working", which reaches here as a screen `working` and re-resolves to green. That mirrors
+    // the `errored` override's self-clearing (it too clears on the next non-errored screen), so this
+    // cannot become the "gray that outlives its evidence" the surrounding comments warn against.
+    if (lastScreen === "done") return "done";
+    // THIRD FAIL-CLOSED OVERRIDE — the session-limit picker (PRD §6c). Ordered here deliberately:
     // AFTER `errored` (a crashed agent is the more urgent read of the same screen) and BEFORE hook
     // authority, because hook authority is exactly what is broken in this case. A session limit
     // lands MID-TURN, so no `Stop` ever fires, `lastHook` freezes at `working`, and the escalation
@@ -233,7 +261,7 @@ export function createStatusRouter(
     // here to `blocked` would turn the rows red and still page nobody — the letter of the report
     // with its reason dropped. `waiting` ("Needs you") already alerts.
     if (sessionLimitPicker) return "waiting";
-    // THIRD FAIL-CLOSED OVERRIDE — a tool-approval / permission prompt on the rendered viewport.
+    // FOURTH FAIL-CLOSED OVERRIDE — a tool-approval / permission prompt on the rendered viewport.
     // Ordered directly under the session limit and for the identical reason, because it is the
     // identical bug one case over: an MCP "Approve?" dialog also opens MID-TURN, so no `Stop` fires,
     // `lastHook` freezes at `working`, and the idle-only escalation below never gets a look. The
@@ -266,6 +294,11 @@ export function createStatusRouter(
    *  outranks the picker, so it must not be reported as one. */
   const resolveReason = (): StatusReason | null => {
     if (lastScreen === "errored") return null;
+    // A PTY exit (`done`) carries no StatusReason — it is a terminal band, not a `waiting` a consumer
+    // acts on — and it outranks the picker/approval reasons just as it does in `resolve`. The latches
+    // are already cleared by `clearedByProgress("done")`, so this is belt-and-braces against a later
+    // trailing hook event re-deriving a stale reason on an exited session.
+    if (lastScreen === "done") return null;
     if (sessionLimitPicker) return "session-limit-picker";
     if (approvalPrompt && lastHook !== "done") return "tool-approval-prompt";
     return null;

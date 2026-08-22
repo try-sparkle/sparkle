@@ -419,11 +419,14 @@ describe("hook-liveness watchdog", () => {
     // for a false red on healthy sessions. The gap predates this watchdog — the pre-watchdog router
     // behaved identically — so nothing regressed; it is simply not covered.
     //
-    // NARROWED, NOT DELETED (PRD §6c). Exactly ONE screen now pierces the frozen hook: Claude Code's
-    // session-limit picker, which carries a REASON CODE saying so (see the suite below). That is a
-    // carve-out on the evidence, not a weakening of the rule — silence is still not a signal, and a
-    // prompt the classifier cannot NAME still leaves the row green, which is what this test pins.
-    // Only widen it with another named screen; never with a bare `waiting`.
+    // NARROWED, NOT DELETED. Several EVIDENCE-BACKED screens now pierce the frozen hook — Claude
+    // Code's session-limit picker and a viewport-confirmed approval prompt (both carry a REASON
+    // CODE), plus the two terminal PTY states `errored` and `done` (a `done` is emitted only by
+    // statusEngine.exit() on pty:exit — sparkle-tab3nm). Every one is a carve-out on the EVIDENCE,
+    // not a weakening of the rule: an on-screen named prompt or an actual exit EVENT, never silence.
+    // A prompt the classifier cannot NAME, and a bare mid-turn `waiting`/`approval` guess with no
+    // reason, still leave the row green — which is what THIS test pins. Only widen the set with
+    // another named screen or another actual event; never with a bare `waiting`.
     const emit = vi.fn();
     const c = mkClock();
     const r = createStatusRouter(emit, c.now);
@@ -437,6 +440,70 @@ describe("hook-liveness watchdog", () => {
     // keep today's behaviour, and only the named screen is exempt.
     r.fromScreen("approval");
     expect(emit.mock.calls.map((x) => x[0])).toEqual(["working"]);
+  });
+
+  // ── The PTY-exit carve-out (sparkle-tab3nm) ────────────────────────────────────────────────────
+  // The founder's P0: the claude PROCESS exits mid-turn (the "Terminal stopped" footer + a
+  // `claude --resume <id>` banner), yet the sidebar row renders GREEN with an "In PR" chip —
+  // indistinguishable from a live worker, so the Watcher/Pusher leave it alone and only ever try to
+  // TYPE into a dead session. The cause is exactly the frozen-hook gap above, but the fix is safe
+  // here because a PTY exit is an EVENT, not silence: statusEngine.exit() emits a screen `done`
+  // (its only source), which resolve() now treats as a fail-closed pierce of the frozen hook.
+  it("a PTY exit (screen `done`) pierces a frozen `working` hook — a dead process is NOT green", () => {
+    const emit = vi.fn();
+    const c = mkClock();
+    const r = createStatusRouter(emit, c.now);
+    r.activate();
+    r.fromHook("working"); // turn opens; the process is clobbered inside it, so no Stop hook follows
+    c.advance(HOOK_STALE_MS * 100); // the hook stays frozen at "working" for as long as you like
+    r.fromScreen("done"); // statusEngine.exit() on pty:exit — the strongest turn-end witness there is
+    // The row is `done` (gray), never the frozen `working` (green). Before the fix this read
+    // ["working"]: resolve() returned the frozen hook and the screen `done` deduped to a no-op.
+    expect(emit.mock.calls.map((x) => x[0])).toEqual(["working", "done"]);
+  });
+
+  it("a PTY exit that ended in error (screen `errored`) also pierces a frozen `working` hook", () => {
+    const emit = vi.fn();
+    const c = mkClock();
+    const r = createStatusRouter(emit, c.now);
+    r.activate();
+    r.fromHook("working");
+    c.advance(HOOK_STALE_MS * 100);
+    r.fromScreen("errored"); // exit() emits this when a stream failure / error preceded the exit
+    expect(emit.mock.calls.map((x) => x[0])).toEqual(["working", "errored"]);
+  });
+
+  // The paired negative: a still-ALIVE mid-turn screen guess must keep losing to the frozen hook, or
+  // this pierce would revive the prose-question false-green the hook migration killed. Only the two
+  // terminal PTY states (`done`/`errored`) pierce; a screen `working` guess changes nothing.
+  it("a live mid-turn screen `working` guess does NOT get treated as a pierce (stays green, no churn)", () => {
+    const emit = vi.fn();
+    const c = mkClock();
+    const r = createStatusRouter(emit, c.now);
+    r.activate();
+    r.fromHook("working");
+    c.advance(HOOK_STALE_MS * 100);
+    r.fromScreen("working"); // the agent is alive and working; nothing exited
+    expect(emit.mock.calls.map((x) => x[0])).toEqual(["working"]);
+  });
+
+  // The retraction the `errored` override has ("clears … when the scraper reports progress again")
+  // and the `done` pierce needs too, or a RESTARTED agent's row would sit gray forever. The restart
+  // path (typing into a dead terminal → `attempt` bump in Terminal.tsx) does NOT call the router's
+  // `reset()` — only prepare()/unmount does — so `lastScreen` stays "done" and `lastHook` stays
+  // frozen at "working" across the restart. What clears the pierce is the NEW StatusEngine's
+  // constructor emit of "working" (statusEngine.ts), which arrives here as a screen `working`. This
+  // pins that a subsequent screen `working` retracts the pierce, so the row goes green again.
+  it("the `done` pierce retracts on the next screen `working` (a restarted agent is green again)", () => {
+    const emit = vi.fn();
+    const c = mkClock();
+    const r = createStatusRouter(emit, c.now);
+    r.activate();
+    r.fromHook("working");
+    c.advance(HOOK_STALE_MS * 100);
+    r.fromScreen("done"); // PTY exit → gray
+    r.fromScreen("working"); // the restarted engine's first emit → the pierce retracts, back to green
+    expect(emit.mock.calls.map((x) => x[0])).toEqual(["working", "done", "working"]);
   });
 
   it("reset() clears the hook timestamp", () => {

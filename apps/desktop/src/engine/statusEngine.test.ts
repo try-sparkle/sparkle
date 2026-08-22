@@ -1781,6 +1781,85 @@ describe("StatusEngine — a tool-approval prompt never reads green", () => {
   });
 });
 
+// A PTY exit is the ONE mid-turn death the router now recovers (sparkle-tab3nm). The router unit
+// tests hand-feed `fromScreen("done")`; these drive the REAL engine+router pair, because the fix
+// rests on a cross-module contract — "statusEngine emits a screen `done` from exactly one path,
+// exit()" — that a router-only test cannot see. If exit() ever changes what it emits, these fail
+// while the router tests stay green. Same precedent as the two suites above.
+describe("StatusEngine — a PTY exit never reads green (sparkle-tab3nm)", () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  const SPINNER = "✻ Cogitating… (12s · ↑ 1.2k tokens · esc to interrupt)";
+
+  function wired(getScreen: () => string) {
+    const emitted: AgentTabStatus[] = [];
+    const transitions: StatusTransition[] = [];
+    const router = createStatusRouter(
+      (s) => emitted.push(s),
+      undefined,
+      (t) => transitions.push(t),
+    );
+    const engine = new StatusEngine({ agentId: "wired-exit", onStatus: (s) => router.fromScreen(s), getScreen });
+    return { engine, router, emitted, transitions };
+  }
+
+  it("THE TEST: the claude process exits mid-turn behind a frozen `working` hook — the row goes gray, not green", () => {
+    const screen = { v: "⏺ Working on it." };
+    const { engine, router, emitted, transitions } = wired(() => screen.v);
+    router.activate();
+    router.fromHook("working"); // the turn opens…
+    engine.ingest(SPINNER);
+    // …and the process dies INSIDE it (the founder's case: "Terminal stopped" + a `claude --resume`
+    // banner). No `Stop` hook ever follows, so `lastHook` is frozen at "working" forever. The PTY
+    // closing is what statusEngine.exit() reports as a screen `done`.
+    engine.exit();
+    // Against the code as it stood this stayed ["working"]: green, on a dead process. Now the real
+    // exit() → screen `done` pierces the frozen hook.
+    expect(emitted.at(-1)).toBe("done");
+    expect(emitted.at(-1)).not.toBe("working");
+    expect(transitions.at(-1)?.lastHook).toBe("working"); // frozen hook overridden, not repaired
+  });
+
+  it("a process that died in error surfaces `errored`, still overriding the frozen hook", () => {
+    const screen = { v: "⏺ Working on it." };
+    const { engine, router, emitted } = wired(() => screen.v);
+    router.activate();
+    router.fromHook("working");
+    // An API-error banner the agent kept churning under, then the PTY closes → exit() emits errored.
+    engine.ingest(SPINNER + "\rAPI Error: Rate limited\n");
+    engine.exit();
+    expect(isRedStatus(emitted.at(-1)!)).toBe(true);
+    expect(emitted.at(-1)).toBe("errored");
+  });
+
+  it("a restart (a NEW engine on the SAME router, no reset) retracts the pierce — green again", () => {
+    // The retraction the `done` pierce depends on, pinned through the REAL mechanism rather than a
+    // hand-fed screen `working`. The in-mount restart path bumps `attempt` and mounts a NEW
+    // StatusEngine against the SAME router — it never calls router.reset(), so `lastScreen` stays
+    // "done" and `lastHook` stays frozen at "working". The ONLY thing that produces a screen
+    // `working` on the fresh engine is its CONSTRUCTOR emit (`onStatus(this.status)`): `set()` dedups
+    // on (status, reason) and the initial status is already "working", so the first `spinner-seen`
+    // set() is a no-op. Drop or defer that constructor emit and this reds — the restarted agent's row
+    // would sit gray `done` for its whole first turn (reading as finished, gating the destructive
+    // CTAs and clearing isInMotion). The router-only retraction test cannot see this.
+    const screen = { v: "⏺ Working on it." };
+    const { engine, router, emitted } = wired(() => screen.v);
+    router.activate();
+    router.fromHook("working");
+    engine.ingest(SPINNER);
+    engine.exit();
+    expect(emitted.at(-1)).toBe("done");
+    // The restart: a fresh engine wired to the same router, exactly as an `attempt` bump remounts it.
+    new StatusEngine({
+      agentId: "wired-exit-restart",
+      onStatus: (s) => router.fromScreen(s),
+      getScreen: () => screen.v,
+    });
+    expect(emitted.at(-1)).toBe("working");
+  });
+});
+
 // ─────────────────────────────────────────────────────────────────────────────────────────────
 // THE RETAINED API BANNER — `recentFailureNow`, the read side of `lastFailureEver`.
 //
