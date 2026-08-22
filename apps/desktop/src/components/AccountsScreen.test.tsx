@@ -1473,6 +1473,17 @@ describe("rotation-readiness banner", () => {
     expect(banner.textContent).not.toContain("2 accounts available");
   });
 
+  // Sentences that are FALSE of a login that expired. The first two are the deleted bullet's own
+  // wording; the rest are what the blocked card's softened sentence would revert to if someone
+  // "restored" the plainer copy without knowing why it was softened — which is the regression this
+  // guard exists to catch, and the one the bullet-only phrasings miss entirely.
+  const WRONG_FOR_AN_EXPIRED_LOGIN = [
+    "never signed in",
+    "never been signed in",
+    "was ever completed",
+    "never completed",
+  ];
+
   // THE GUARANTEE #2355 LANDED, CARRIED ACROSS THE SURFACE THAT CARRIED IT (commit a2e60d636).
   //
   // #2355 fixed the rotation box's per-account bullets so an EXPIRED login stopped being described
@@ -1488,9 +1499,21 @@ describe("rotation-readiness banner", () => {
   //
   // PAIRED on purpose, because `not.toContain` alone is exactly the vacuous shape — it passes just
   // as well against a banner that renders nothing, or a screen where the expired rows never loaded.
-  // The two positive assertions establish that the screen really did render this state before the
-  // negative one is allowed to mean anything, and the row-level check is the one that says the
-  // information was RELOCATED rather than simply dropped.
+  // The positive assertions establish that the screen really did render this state before the
+  // negative ones are allowed to mean anything.
+  //
+  // ANCHORED ON THE CARRIER, NOT ON THE FIXTURE (roborev 67401). An earlier version of this test
+  // asserted the ROW contained EXPIRED_LOGIN_NICKNAME, which is the precondition wearing the
+  // costume of a side effect: the fixture hands the row that exact string and the title renders
+  // `display.nickname || primary`, so it passes for any component that echoes `a.nickname` — every
+  // trace of expired handling could be deleted from the card and it would stay green.
+  //
+  // The surface that actually carries #2355's guarantee is the `account-blocked-<id>` card, whose
+  // SECOND sentence was deliberately softened to "no active Claude login" precisely because it now
+  // also covers a login that EXPIRED (see the comment at its definition: "no login was ever
+  // completed" would be a lie for that row). So that sentence is what a regression would revert,
+  // and the negatives are widened to the phrasings it could revert TO — "never signed in" alone
+  // does not match "no login was ever completed", so pinning only that leaves the real hole open.
   it("never tells an EXPIRED login it has never signed in — the reason moved to the row, not away", async () => {
     const deps = makeDeps(
       [
@@ -1508,18 +1531,32 @@ describe("rotation-readiness banner", () => {
     const banner = await screen.findByTestId("rotation-banner");
     expect(banner.textContent).toContain("Only 1 account is signed in");
 
-    // POSITIVE 2 — the expired rows really are on screen, still naming their own reason. This is
-    // where the founder's cleanup moved the per-account "why", so it is where the user now reads it.
+    // POSITIVE 2 — THE CARRIER. Each expired row renders the blocked card, and that card's second
+    // sentence is the expiry-compatible wording. This is DERIVED output (the card renders on
+    // `!signedIn`, and this copy is a constant of the component, not of the fixture), so it fails
+    // if the expired handling is removed — unlike a nickname echo, which the fixture supplies.
     for (const id of ["x1", "x2"]) {
-      const row = await screen.findByTestId(`account-row-${id}`);
-      expect(row.textContent).toContain(EXPIRED_LOGIN_NICKNAME);
+      const blocked = await screen.findByTestId(`account-blocked-${id}`);
+      expect(blocked.textContent).toContain("no active Claude login");
+      // The remedy has to come with the diagnosis: this card is the only place an expired row is
+      // offered a way back, so a card that states the problem without the control is half-useless.
+      expect(within(blocked).getByRole("button", { name: /Finish sign-in/ })).toBeTruthy();
+
+      // Scoped to the carrier as well as to the document below — a negative that only ever runs
+      // over the whole body cannot say WHERE the wrong sentence would have appeared.
+      const blockedText = blocked.textContent ?? "";
+      for (const wrong of WRONG_FOR_AN_EXPIRED_LOGIN) {
+        expect(blockedText).not.toContain(wrong);
+      }
     }
 
     // THE CLAIM ITSELF — the wrong sentence is nowhere on the screen, not merely absent from the
-    // bullets it used to live in.
+    // bullets it used to live in, and not merely absent in the two phrasings the DELETED bullet
+    // happened to use.
     const text = document.body.textContent ?? "";
-    expect(text).not.toContain("never signed in");
-    expect(text).not.toContain("never been signed in");
+    for (const wrong of WRONG_FOR_AN_EXPIRED_LOGIN) {
+      expect(text).not.toContain(wrong);
+    }
   });
 
   it("offers the fix inline: the banner's own add button opens the add form", async () => {
