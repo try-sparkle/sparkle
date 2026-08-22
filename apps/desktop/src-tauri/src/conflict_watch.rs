@@ -1182,6 +1182,44 @@ where
     }
 }
 
+/// How much of one `gh` stderr line reaches the log. Long enough for gh's real sentences — the
+/// unauthenticated one is ~120 chars — short enough that a wall of prose cannot flood the log.
+const GH_STDERR_HINT_CAP: usize = 200;
+
+/// `gh`'s own stderr, condensed to ONE bounded line FOR THE LOG — never to a reason code.
+///
+/// [`probe_open_prs`] deliberately returns the single reason `gh-failed`, because gh's exit codes
+/// cannot tell "not logged in" from "no remote" and a taxonomy guessed from prose is worse than one
+/// honest reason. That decision is about the RETURN VALUE, which drives behaviour, and it stands.
+/// It says nothing about the log — and the log is the one place the two failures actually differ.
+///
+/// Discarding it has a measured cost: `conflict_watch` warns several times a day that a repo is
+/// UNREADABLE while the only sentence explaining why was thrown away at the point it was read, so
+/// the operator's next step is to re-run `gh` by hand and hope to reproduce it. Nothing on the
+/// machine records what gh said.
+///
+/// So this is a DIAGNOSTIC AND NEVER A BRANCH: no caller may match on it, and its shape is free to
+/// change with gh's wording without any behaviour changing with it.
+///
+/// Returns `None` for stderr that is empty or all whitespace, so a silent failure logs no field at
+/// all rather than an empty one that reads like gh said something blank.
+fn gh_stderr_hint(stderr: &[u8]) -> Option<String> {
+    // Lossy rather than strict: stderr that is not valid UTF-8 is still worth showing, and a
+    // diagnostic that vanishes exactly when the output is unusual is the opposite of useful.
+    let text = String::from_utf8_lossy(stderr);
+    // `trim` per line, not just `trim_end`: gh indents continuation lines, and a leading blank line
+    // before the real message is ordinary. `\r` is whitespace, so CRLF is handled by the same trim.
+    let line = text.lines().map(str::trim).find(|l| !l.is_empty())?;
+    // Truncate by CHARS, never by bytes — a byte slice through a multi-byte character panics, and
+    // gh emits non-ASCII (its arrows and box drawing) freely.
+    if line.chars().count() <= GH_STDERR_HINT_CAP {
+        return Some(line.to_string());
+    }
+    let mut out: String = line.chars().take(GH_STDERR_HINT_CAP).collect();
+    out.push('…');
+    Some(out)
+}
+
 /// Every open PR in `dir`'s repo, plus whether the list was TRUNCATED at [`PROBE_LIMIT`].
 ///
 /// `Err(reason)` — never an empty list — when `gh` is absent, unauthenticated, offline, or slow.
@@ -1210,6 +1248,12 @@ fn probe_open_prs(dir: &Path) -> Result<Probed, &'static str> {
     if !output.status.success() {
         // gh's own exit codes do not distinguish "not logged in" from "no remote", and the stderr
         // text is prose we would have to parse. One honest reason beats a guessed taxonomy.
+        //
+        // But the prose is still the only thing that says WHY, so it goes to the log even though it
+        // does not go into the reason — see [`gh_stderr_hint`].
+        if let Some(hint) = gh_stderr_hint(&output.stderr) {
+            tracing::warn!(target: "conflict_watch", hint = %hint, "`gh pr list` exited non-zero");
+        }
         return Err("gh-failed");
     }
     probe_from_stdout(&String::from_utf8_lossy(&output.stdout), PROBE_LIMIT).ok_or("gh-unreadable")
@@ -1249,6 +1293,12 @@ fn gh_api(dir: &Path, path: &str) -> Result<String, &'static str> {
     let output =
         crate::worktree::output_with_timeout(cmd, PROBE_TIMEOUT).map_err(|_| "gh-unavailable")?;
     if !output.status.success() {
+        // Same seam as [`probe_open_prs`]: the reason stays one honest code, the WHY goes to the
+        // log. `path` is the literal `{owner}/{repo}` template gh resolves itself, so naming it
+        // says which endpoint failed without naming which repo.
+        if let Some(hint) = gh_stderr_hint(&output.stderr) {
+            tracing::warn!(target: "conflict_watch", path = %path, hint = %hint, "`gh api` exited non-zero");
+        }
         return Err("gh-failed");
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
@@ -1427,6 +1477,76 @@ mod rest_fallback_tests {
         });
         assert_eq!(got, Err("gh-unavailable"), "the actionable reason survives");
         assert!(!tried.get(), "and the fallback is not even attempted");
+    }
+
+    // ── gh_stderr_hint ───────────────────────────────────────────────────────────────────────
+    // The reason code stays `gh-failed` for every one of these; what is under test is that the
+    // sentence explaining WHY survives to the log instead of being dropped at the read.
+
+    /// THE HEADLINE CASE. gh's unauthenticated failure — the shape that produced the measured
+    /// UNREADABLE warnings — must reach the log as its own first sentence, with the blank line gh
+    /// puts ahead of it skipped rather than reported as the message.
+    #[test]
+    fn a_gh_auth_failure_reaches_the_log_as_its_own_sentence() {
+        let stderr = b"\n  gh: To use GitHub CLI in a GitHub Actions workflow, set the GH_TOKEN environment variable.\nexit status 4\n";
+        assert_eq!(
+            gh_stderr_hint(stderr).as_deref(),
+            Some("gh: To use GitHub CLI in a GitHub Actions workflow, set the GH_TOKEN environment variable."),
+            "the first non-blank line, trimmed — not the blank line, and not the exit-status tail"
+        );
+    }
+
+    /// A DIFFERENT CAUSE MUST READ DIFFERENTLY. This is the whole point of keeping the prose: both
+    /// of these exit non-zero and both return `gh-failed`, so the log is the only place they differ.
+    #[test]
+    fn two_causes_that_share_one_reason_code_produce_different_hints() {
+        let unauth = gh_stderr_hint(b"gh: Bad credentials (HTTP 401)\n");
+        let no_remote = gh_stderr_hint(b"no git remotes found\n");
+        assert_eq!(unauth.as_deref(), Some("gh: Bad credentials (HTTP 401)"));
+        assert_eq!(no_remote.as_deref(), Some("no git remotes found"));
+        assert_ne!(unauth, no_remote, "or the hint adds nothing the reason code did not already say");
+    }
+
+    /// SILENCE STAYS SILENT. A failure with nothing on stderr must log NO hint field, rather than
+    /// an empty one that reads as "gh said something blank".
+    #[test]
+    fn stderr_with_nothing_in_it_yields_no_hint() {
+        assert_eq!(gh_stderr_hint(b""), None, "empty");
+        assert_eq!(gh_stderr_hint(b"\n\n   \n\t\r\n"), None, "and whitespace-only is also nothing");
+    }
+
+    /// A WALL OF PROSE CANNOT FLOOD THE LOG. Truncation is by CHARACTER, so a cap landing mid-way
+    /// through a multi-byte character must not panic — gh emits non-ASCII freely.
+    #[test]
+    fn an_overlong_line_is_capped_without_splitting_a_character() {
+        let long: String = "é".repeat(GH_STDERR_HINT_CAP * 2);
+        let hint = gh_stderr_hint(long.as_bytes()).expect("a long line still yields a hint");
+        assert_eq!(
+            hint.chars().count(),
+            GH_STDERR_HINT_CAP + 1,
+            "the cap plus the ellipsis that marks it as cut"
+        );
+        assert!(hint.ends_with('…'), "and it says it was cut: {hint}");
+        assert!(hint.starts_with('é'), "keeping the START of the line, where gh puts the cause");
+    }
+
+    /// A line exactly at the cap is NOT truncated — an off-by-one here would mark a complete
+    /// message as cut, sending a reader looking for prose that was never withheld.
+    #[test]
+    fn a_line_exactly_at_the_cap_is_left_whole() {
+        let exact = "x".repeat(GH_STDERR_HINT_CAP);
+        let hint = gh_stderr_hint(exact.as_bytes()).expect("a full-width line still yields a hint");
+        assert_eq!(hint, exact, "unchanged");
+        assert!(!hint.ends_with('…'), "and unmarked");
+    }
+
+    /// Invalid UTF-8 must degrade, never panic: a diagnostic that dies exactly when the output is
+    /// unusual is the opposite of useful.
+    #[test]
+    fn invalid_utf8_still_produces_a_hint() {
+        let hint = gh_stderr_hint(&[0xff, 0xfe, b'g', b'h', b':', b' ', b'b', b'a', b'd'])
+            .expect("lossy decoding still leaves a readable line");
+        assert!(hint.contains("gh: bad"), "the readable part survives: {hint}");
     }
 
     /// The fallback costs O(N) network calls, so a healthy primary must never pay for it.
