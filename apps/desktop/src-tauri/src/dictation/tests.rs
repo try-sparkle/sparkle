@@ -2734,24 +2734,29 @@
             let mut rest = code;
             while let Some(i) = rest.find("std::thread::spawn(") {
                 let after = &rest[i..];
-                // BOUND THE SEARCH TO THIS STATEMENT. An unbounded `find('{')` takes the first brace
-                // ANYWHERE after the spawn, so a brace-less single-expression spawn
-                // (`spawn(move || tx.send(()).ok());`) latches onto the next unrelated block and
-                // brace-matches THAT into `inside` — silently exempting main-thread code from the
-                // ban list, and able to satisfy the containment assertion below with a
-                // `build_and_install` that never left the main thread. That is the one direction
-                // this function claims not to fail in, so it panics rather than guessing: the
-                // closure's brace cannot be further away than the end of the spawn statement, and
-                // between `spawn(` and it there is only `move ||`, never a `;`.
-                let stmt_end = after.find(';').unwrap_or(after.len());
-                let open = after[..stmt_end].find('{').unwrap_or_else(|| {
-                    panic!(
-                        "`std::thread::spawn` with no braced closure body — this guard cannot tell \
-                         which code runs off-main, so it refuses to judge rather than exempting the \
-                         wrong block. Give the closure a braced body, or teach this splitter the \
-                         new form."
-                    )
-                });
+                // DO NOT SEARCH FOR THE BRACE — REQUIRE IT, at a fixed offset.
+                //
+                // Every searching version of this line has been wrong, and each was wrong about a
+                // DIFFERENT shape. An unbounded `find('{')` latched onto the next unrelated block
+                // when the closure was brace-less. Bounding the window to the first `;` fixed that
+                // only for a spawn in STATEMENT position: as a match-arm tail or any other
+                // expression position, a brace-less spawn is comma- or block-terminated, so the
+                // first `;` is again inside a later block and the window spans it. Both failures
+                // are the same failure — exempting a block that is not the closure — and both are
+                // QUIET, which is the one direction this function must never fail in.
+                //
+                // So the shape is asserted rather than located. The brace is at a known offset in
+                // `HEADER` or this is not a form the splitter understands, and it says so. There is
+                // no window left to be wrong about, and no third shape to be surprised by.
+                const HEADER: &str = "std::thread::spawn(move || {";
+                assert!(
+                    after.starts_with(HEADER),
+                    "`std::thread::spawn` in a form this guard does not understand (expected \
+                     `{HEADER}`). It refuses to judge rather than guess which block is the closure \
+                     — guessing wrong exempts main-thread code from the ban list silently. Give the \
+                     closure a braced `move ||` body, or teach this splitter the new form."
+                );
+                let open = HEADER.len() - 1;
                 let bytes = after.as_bytes();
                 let mut depth = 0usize;
                 let mut close = None;
