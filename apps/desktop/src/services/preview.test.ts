@@ -9,11 +9,13 @@ vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn(() => Promise.resolve(()
 import { invoke } from "@tauri-apps/api/core";
 import {
   applyPreviewStatus,
+  decidePreviewOpen,
   isLoopbackPreviewUrl,
   openPreviewServer,
   refreshPreviewCapability,
+  resolvePreviewOpenTarget,
 } from "./preview";
-import { usePreviewStore } from "../stores/previewStore";
+import { usePreviewStore, type PreviewStatus } from "../stores/previewStore";
 
 describe("isLoopbackPreviewUrl", () => {
   // ACCEPTED — the three spellings a dev server actually binds, over plain http.
@@ -289,5 +291,161 @@ describe("refreshPreviewCapability — a failed probe must stay re-askable", () 
 
     expect(usePreviewStore.getState().capability.p1?.previewable).toBe(false);
     expect(usePreviewStore.getState().capability.p1?.declineReason).toBe("no dev script");
+  });
+});
+
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// THE CLICK-TIME OWNERSHIP CHECK — decidePreviewOpen / resolvePreviewOpenTarget
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+//
+// A preview card was clicked and a DIFFERENT agent's app answered. `lsof` found exactly one dev
+// server in the whole allocation range at that moment — on the port the card named, owned by
+// another agent's worktree — and minutes later it was gone too. The card was holding an address
+// whose server had died and whose port had since been recycled, and nothing on screen could say so.
+//
+// Distinct ports per agent narrow that window; they cannot close it, because the mechanism is REUSE
+// OVER TIME rather than collision at one instant. What closes it is refusing to act on a stamped
+// value: ask this agent's own live status at the moment of the click, and open only if it agrees.
+// Every row below is a way the two can disagree, and each one must REFUSE rather than pick a side.
+describe("decidePreviewOpen — an address is only openable while it is provably this agent's", () => {
+  const AGENT = "a1";
+  /** The live status Rust would answer for `a1`, healthy. Explicit `null`s throughout, per the
+   *  `T | null` wire contract — a fixture with keys omitted tests a payload serde cannot emit. */
+  function live(over: Partial<PreviewStatus> = {}): PreviewStatus {
+    return {
+      id: "srv-1",
+      agentId: AGENT,
+      projectId: "p1",
+      url: "http://127.0.0.1:5199/",
+      port: 5199,
+      state: "serving",
+      error: null,
+      ...over,
+    };
+  }
+  const held = { url: "http://127.0.0.1:5199/", port: 5199 };
+
+  it("allows the open when the live status still matches what the card holds", () => {
+    // The PRESENT twin of every refusal below. Without it each of them would be satisfied by a
+    // function that refuses unconditionally — which passes seven rows and ships a dead card.
+    const d = decidePreviewOpen(AGENT, held, live());
+    expect(d).toEqual({ ok: true, url: "http://127.0.0.1:5199/", port: 5199 });
+  });
+
+  it("refuses when this agent has no preview at all any more", () => {
+    // The measured case: the server died, and its port is now free for the next allocation.
+    expect(decidePreviewOpen(AGENT, held, null)).toMatchObject({ ok: false, reason: "gone" });
+  });
+
+  it("refuses when the live status names a DIFFERENT agent", () => {
+    // Unreachable if the read below is keyed correctly — asserted anyway, because it is the literal
+    // shape of the incident and a gate that only holds while the layer beneath it is right is not
+    // a gate. Checked BEFORE anything else is read off the status: a status about someone else is
+    // not weaker evidence about this agent, it is evidence about someone else.
+    expect(decidePreviewOpen(AGENT, held, live({ agentId: "a2" }))).toMatchObject({
+      ok: false,
+      reason: "wrong-agent",
+    });
+  });
+
+  // NOT SERVING — the same two gates the card strip applies at render time, re-asked at click time.
+  // `crashed` and `stopped` are the ones that matter: a dead process leaves its address behind, and
+  // that address is exactly what gets reused. `listening` is the third: a port is bound before the
+  // first compile finishes.
+  it.each(["crashed", "stopped", "failed", "listening", "starting"] as const)(
+    "refuses a live status in %s",
+    (state) => {
+      expect(decidePreviewOpen(AGENT, held, live({ state }))).toMatchObject({
+        ok: false,
+        reason: "not-live",
+      });
+    },
+  );
+
+  it("refuses when the live status is serving but has no address", () => {
+    expect(decidePreviewOpen(AGENT, held, live({ url: null, port: null }))).toMatchObject({
+      ok: false,
+      reason: "not-live",
+    });
+  });
+
+  it("refuses when the live address is no longer loopback http", () => {
+    // The security gate re-asked against the FRESH url rather than the one the card was born with —
+    // a preview that came back bound to a LAN address must not be opened just because it once was
+    // loopback.
+    expect(decidePreviewOpen(AGENT, held, live({ url: "http://192.168.1.42:5199/" }))).toMatchObject(
+      { ok: false, reason: "unsafe" },
+    );
+  });
+
+  it("refuses when the agent's server has moved to another port", () => {
+    // THE HEADLINE ROW. The card says 5199; this agent is now on 5203, so 5199 is somebody else's
+    // or nobody's. Both addresses are carried on the refusal so a caller can log what disagreed.
+    const d = decidePreviewOpen(AGENT, held, live({ url: "http://127.0.0.1:5203/", port: 5203 }));
+    expect(d).toMatchObject({
+      ok: false,
+      reason: "moved",
+      heldUrl: "http://127.0.0.1:5199/",
+      liveUrl: "http://127.0.0.1:5203/",
+    });
+  });
+
+  it("refuses when the url agrees but the PORT the card carries does not", () => {
+    // Not redundant with the row above, and not reachable through a well-formed wire payload — it
+    // is the card's own two facts contradicting each other, which is not a state to act on either.
+    expect(
+      decidePreviewOpen(AGENT, { url: "http://127.0.0.1:5199/", port: 5173 }, live()),
+    ).toMatchObject({ ok: false, reason: "moved" });
+  });
+
+  it("does NOT quietly redirect to the address it just discovered", () => {
+    // The tidier code and the worse product. The reader clicked a card naming a specific address;
+    // opening a different one is a second destination from one gesture, and it hides the very fact
+    // worth knowing — that the card, and the screenshot above it, describe a page that is gone.
+    const d = decidePreviewOpen(AGENT, held, live({ url: "http://127.0.0.1:5203/", port: 5203 }));
+    expect(d.ok).toBe(false);
+    expect(d).not.toHaveProperty("url");
+  });
+});
+
+describe("resolvePreviewOpenTarget — the read that makes the decision fresh", () => {
+  beforeEach(() => {
+    usePreviewStore.setState({ byAgent: {}, capability: {}, openedProjects: {} });
+    vi.mocked(invoke).mockReset();
+  });
+
+  it("asks the supervisor for THIS agent's status, and folds what it read into the store", () => {
+    // The fold is what makes a refusal self-correcting: the card re-renders onto the real address,
+    // so the copy's "click again" is a promise the mechanism can keep.
+    const fresh: PreviewStatus = {
+      id: "srv-1",
+      agentId: "a1",
+      projectId: "p1",
+      url: "http://127.0.0.1:5203/",
+      port: 5203,
+      state: "serving",
+      error: null,
+    };
+    vi.mocked(invoke).mockResolvedValue(fresh);
+
+    return resolvePreviewOpenTarget("a1", { url: "http://127.0.0.1:5199/", port: 5199 }).then((d) => {
+      expect(invoke).toHaveBeenCalledWith("preview_status", { agentId: "a1" });
+      expect(d).toMatchObject({ ok: false, reason: "moved" });
+      // THE SIDE EFFECT that makes the second click work.
+      expect(usePreviewStore.getState().byAgent.a1?.url).toBe("http://127.0.0.1:5203/");
+      expect(usePreviewStore.getState().byAgent.a1?.port).toBe(5203);
+    });
+  });
+
+  it("FAILS CLOSED when the live read itself throws", () => {
+    // "We could not check" is not "it is fine". An unreachable bridge is precisely when a held
+    // address is least trustworthy, and falling back to it here would undo every branch above:
+    // one failed read and the stale-address path is back, silently.
+    vi.mocked(invoke).mockRejectedValue(new Error("bridge is down"));
+    return resolvePreviewOpenTarget("a1", { url: "http://127.0.0.1:5199/", port: 5199 }).then((d) => {
+      expect(d).toMatchObject({ ok: false, reason: "unreadable", heldUrl: "http://127.0.0.1:5199/" });
+      expect(d).not.toHaveProperty("url");
+    });
   });
 });

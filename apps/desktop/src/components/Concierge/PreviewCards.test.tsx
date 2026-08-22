@@ -31,6 +31,8 @@ import {
   PREVIEW_CARD_CAPTURED_TESTID,
   PREVIEW_CARD_REFRESH_TESTID,
   PREVIEW_CARD_REFRESH_FAILED_TESTID,
+  PREVIEW_CARD_REFUSED_TESTID,
+  PREVIEW_OPEN_REFUSAL_COPY,
   PREVIEW_CARD_AGE_TICK_MS,
   PREVIEW_NOTICES_TESTID,
   PREVIEW_NOTICE_TESTID,
@@ -41,7 +43,7 @@ import {
 } from "./PreviewCards";
 import { AgentPillProvider, type AgentPillContextValue } from "./AgentPill";
 import { applyPreviewStatus } from "../../services/preview";
-import { usePreviewStore, type PreviewState } from "../../stores/previewStore";
+import { usePreviewStore, type PreviewState, type PreviewStatus } from "../../stores/previewStore";
 import { useProjectStore } from "../../stores/projectStore";
 import type { MentionAgent } from "./mentions";
 import type { RevealOutcome } from "../../services/agentReveal";
@@ -54,6 +56,45 @@ const OTTER = "ag-otter";
  *  simultaneous states gets which surface. */
 const NEWT = "ag-newt";
 
+/**
+ * WHAT RUST WOULD ANSWER RIGHT NOW, per agent — the click-time source of truth, kept in a map that
+ * is DELIBERATELY SEPARATE from the store.
+ *
+ * The founder's bug is precisely a DISAGREEMENT between the two: a card holding an address whose
+ * server has since died and whose port another agent has taken. A fixture where the store IS the
+ * live truth cannot express that, so it could only ever test the happy path. `fire` writes both
+ * (an event and a re-read agreeing is the healthy case); {@link setLive} moves the live half alone.
+ */
+const liveStatus = new Map<string, PreviewStatus | null>();
+
+/** Move the LIVE answer without emitting an event, so the card keeps what it was told while the
+ *  world underneath it changes. Pass `null` for "this agent has no preview any more". */
+function setLive(agentId: string, over: Partial<PreviewStatus> | null) {
+  if (over === null) {
+    liveStatus.set(agentId, null);
+    return;
+  }
+  const prev = liveStatus.get(agentId);
+  liveStatus.set(agentId, {
+    id: `srv-${agentId}`,
+    agentId,
+    projectId: "p1",
+    url: null,
+    port: null,
+    state: "ready",
+    error: null,
+    ...(prev ?? {}),
+    ...over,
+  });
+}
+
+/** The bridge every row starts from: `preview_status` answers {@link liveStatus}, and everything
+ *  else refuses — no headless Chromium is the ORDINARY machine, not the exotic one. */
+function defaultInvoke(cmd: string, args?: { agentId?: string }): Promise<unknown> {
+  if (cmd === "preview_status") return Promise.resolve(liveStatus.get(args?.agentId ?? "") ?? null);
+  return Promise.reject(new Error("no preview is open"));
+}
+
 /** One wire payload, exactly as Rust emits it — every optional field an explicit `null`, never an
  *  omitted key (the `T | null` contract on `PreviewStatus`). */
 function fire(
@@ -63,6 +104,9 @@ function fire(
   port: number | null = 5173,
   error: string | null = null,
 ) {
+  // The healthy world: what Rust just emitted is also what Rust would answer if asked again. A row
+  // that wants the UNhealthy world moves this half afterwards with `setLive`.
+  liveStatus.set(agentId, { id: `srv-${agentId}`, agentId, projectId: "p1", url, port, state, error });
   // Inside `act`, because the fold is a STORE WRITE rather than a React event: outside it, React 18
   // has not flushed the subscriber by the time the next line reads the DOM, and every assertion
   // below would be about the render BEFORE the event. That failure looks exactly like a broken
@@ -124,9 +168,12 @@ function cardsOnScreen(): [string, string][] {
 beforeEach(() => {
   invokeMock.mockReset();
   openUrlMock.mockClear();
+  liveStatus.clear();
   // No screenshot by default: a capture needs a headless Chromium that may not be installed, and
   // that is the ORDINARY case, not the exotic one. The rows that care about the picture opt in.
-  invokeMock.mockRejectedValue(new Error("no preview is open"));
+  // `preview_status` DOES answer, because it is the click-time ownership read every open goes
+  // through — a bridge that refuses it would make every card refuse, which is not the ordinary case.
+  invokeMock.mockImplementation(defaultInvoke);
   usePreviewStore.setState({ byAgent: {}, capability: {}, openedProjects: {} });
   useProjectStore.setState({
     projects: [
@@ -207,12 +254,12 @@ describe("a live preview becomes a card", () => {
 });
 
 describe("the two click targets", () => {
-  it("clicking the card opens THAT card's loopback url", () => {
+  it("clicking the card opens THAT card's loopback url", async () => {
     // Two live cards, so a handler wired to "the first preview" rather than to this card's own url
     // fails here instead of passing by coincidence.
     mount();
-    fire(KRAKEN, "ready", "http://127.0.0.1:5173");
-    fire(OTTER, "ready", "http://localhost:4321");
+    fire(KRAKEN, "ready", "http://127.0.0.1:5173", 5173);
+    fire(OTTER, "ready", "http://localhost:4321", 4321);
 
     const otter = screen
       .getAllByTestId(PREVIEW_CARD_TESTID)
@@ -220,7 +267,9 @@ describe("the two click targets", () => {
     expect(otter).toBeTruthy();
     fireEvent.click(otter!);
 
-    expect(openUrlMock).toHaveBeenCalledTimes(1);
+    // AWAITED, because the open is no longer a straight hand-off: the card re-reads THIS agent's
+    // live status first and opens only if the address it is showing is still that agent's own.
+    await waitFor(() => expect(openUrlMock).toHaveBeenCalledTimes(1));
     expect(openUrlMock).toHaveBeenCalledWith("http://localhost:4321");
   });
 
@@ -651,7 +700,7 @@ describe("a preview that is NOT openable still says something", () => {
     expect(noticesOnScreen().some(([id]) => id === KRAKEN)).toBe(false);
   });
 
-  it("makes the failed notice STRUCTURALLY un-openable, beside a card that opens", () => {
+  it("makes the failed notice STRUCTURALLY un-openable, beside a card that opens", async () => {
     // "A dead link is worse than no card, because it costs the reader a click to learn it is dead."
     // The notice keeps that rule by having NOTHING to activate — not by being styled inert, which
     // still invites the click that teaches the reader it is dead.
@@ -675,7 +724,7 @@ describe("a preview that is NOT openable still says something", () => {
     // …while the LIVE card mounted beside it still opens on the same gesture. Without this half the
     // absence above would be satisfied by an `openUrl` that is broken everywhere.
     fireEvent.click(screen.getByTestId(PREVIEW_CARD_TESTID));
-    expect(openUrlMock).toHaveBeenCalledTimes(1);
+    await waitFor(() => expect(openUrlMock).toHaveBeenCalledTimes(1));
     expect(openUrlMock).toHaveBeenCalledWith("http://127.0.0.1:5173");
   });
 
@@ -823,7 +872,7 @@ describe("neither strip is painted for an empty projection", () => {
 // neither could cross). Both sites are pinned, per `sparkle-50m03`: checking one would go green on
 // the first covered site while its sibling carried the same hole.
 describe("PreviewCards — a human touching a card counts as activity", () => {
-  it("clicking through to the url stamps activity", () => {
+  it("clicking through to the url stamps activity", async () => {
     mount();
     fire(KRAKEN, "ready", "http://127.0.0.1:5173");
 
@@ -844,10 +893,14 @@ describe("PreviewCards — a human touching a card counts as activity", () => {
       spy.mockRestore();
     }
 
+    // STAMPED SYNCHRONOUSLY, before the click-time ownership read — the spy above is restored the
+    // instant `fireEvent.click` returns, so an implementation that stamped after the await would
+    // record the real clock and this assertion would fail. The click happened either way, which is
+    // the fact the grace clock is asking about.
     expect(usePreviewStore.getState().byAgent[KRAKEN]?.lastActivityAt).toBe(later);
     // …and the click still did its real job. Asserting both together is what stops a future edit
     // from swapping one for the other.
-    expect(openUrlMock).toHaveBeenCalledWith("http://127.0.0.1:5173");
+    await waitFor(() => expect(openUrlMock).toHaveBeenCalledWith("http://127.0.0.1:5173"));
   });
 
   it("a click on the ⟳ while it is BUSY must not launch a browser", () => {
@@ -905,6 +958,220 @@ describe("PreviewCards — a human touching a card counts as activity", () => {
 
     expect(usePreviewStore.getState().byAgent[KRAKEN]?.lastActivityAt).toBe(later);
     expect(openUrlMock).not.toHaveBeenCalled();
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// A CARD OPENS THE PORT ITS OWN AGENT OWNS — OR IT REFUSES, OUT LOUD
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+//
+// ══ THE MEASURED FAILURE ════════════════════════════════════════════════════════════════════════
+// The founder clicked one agent's preview card and a DIFFERENT agent's app answered. `lsof` found
+// exactly one dev server in the whole allocation range — on the port the card named, owned by a
+// worktree belonging to someone else — and minutes later that server was gone too. So the card was
+// holding an address whose server had DIED and whose port another agent had since taken. Nothing on
+// screen could tell him: the url looked right, the page rendered, it was simply not his agent's.
+//
+// ══ WHY A STAMPED-ONCE VALUE CANNOT BE MADE SAFE ════════════════════════════════════════════════
+// Giving each agent a distinct port (the Rust half) shrinks the window; it does not close it. Ports
+// are recycled, servers die, and a value copied into a card at open time is a claim about a moment
+// that has passed. The only address worth acting on is the one read from THIS agent's own live
+// status at the instant of the click — which is what these rows drive.
+//
+// ══ REFUSING IS THE FEATURE, NOT THE ERROR PATH ═════════════════════════════════════════════════
+// Every row below asserts the SIDE EFFECT: `openUrl` called with the right url, or NOT CALLED AT
+// ALL. Opening the stale address anyway would satisfy any assertion about state, and is the exact
+// outcome that is worse than an error — a wrong app the reader cannot tell is wrong.
+describe("a preview card opens its own agent's port, or refuses", () => {
+  const cardFor = (agentId: string) =>
+    screen
+      .queryAllByTestId(PREVIEW_CARD_TESTID)
+      .find((el) => el.getAttribute("data-agent-id") === agentId);
+  const refusalFor = (agentId: string) =>
+    screen
+      .queryAllByTestId(PREVIEW_CARD_REFUSED_TESTID)
+      .find((el) => el.closest(`[data-agent-id="${agentId}"]`) !== null);
+  /** The NOTICE for an agent — the surface a retired card falls back to. Local rather than shared
+   *  with the notice describe below, which owns its own copy for the same reason. */
+  const noticeForAgent = (agentId: string) =>
+    screen
+      .queryAllByTestId(PREVIEW_NOTICE_TESTID)
+      .find((el) => el.getAttribute("data-agent-id") === agentId);
+
+  it("never gives two agents the same url, and each card holds its OWN agent's port", async () => {
+    // ══ THE ROW THE WHOLE BEAD IS ABOUT ══════════════════════════════════════════════════════
+    // Both halves are asserted, and the second is what stops the first from passing by accident.
+    // "The two urls differ" alone is satisfied by any implementation that hands out two different
+    // wrong values; it says nothing about WHOSE port each card is showing. So the mapping is pinned
+    // agent-by-agent as well — and then each card is CLICKED, because the url a card renders and
+    // the url it opens are two different facts and only the second one can send the reader astray.
+    mount();
+    fire(KRAKEN, "ready", "http://127.0.0.1:5173", 5173);
+    fire(OTTER, "ready", "http://127.0.0.1:5174", 5174);
+
+    const byAgent = Object.fromEntries(cardsOnScreen());
+    expect(byAgent[KRAKEN]).toBe("http://127.0.0.1:5173");
+    expect(byAgent[OTTER]).toBe("http://127.0.0.1:5174");
+    // NO TWO CARDS MAY SHARE A URL. Stated as a set over everything on screen rather than as a
+    // pairwise `not.toBe`, so a third card cannot quietly collide with one of these two.
+    const urls = cardsOnScreen().map(([, u]) => u);
+    expect(new Set(urls).size).toBe(urls.length);
+    // …and each card carries its own agent's PORT as a fact of its own, not merely buried in a
+    // string, so a future edit that keeps the urls distinct while losing the ownership fails here.
+    expect(cardFor(KRAKEN)?.getAttribute("data-preview-port")).toBe("5173");
+    expect(cardFor(OTTER)?.getAttribute("data-preview-port")).toBe("5174");
+
+    fireEvent.click(cardFor(KRAKEN)!);
+    await waitFor(() => expect(openUrlMock).toHaveBeenCalledTimes(1));
+    expect(openUrlMock).toHaveBeenLastCalledWith("http://127.0.0.1:5173");
+
+    fireEvent.click(cardFor(OTTER)!);
+    await waitFor(() => expect(openUrlMock).toHaveBeenCalledTimes(2));
+    expect(openUrlMock).toHaveBeenLastCalledWith("http://127.0.0.1:5174");
+    // Neither click ever reached the other agent's address — the founder's exact failure, stated
+    // as an assertion rather than as a hope.
+    expect(openUrlMock.mock.calls.map(([u]) => u)).toEqual([
+      "http://127.0.0.1:5173",
+      "http://127.0.0.1:5174",
+    ]);
+  });
+
+  it("REFUSES when the port the card holds is no longer this agent's, and says so", async () => {
+    // The founder's case exactly: the card was told 5173; by click time this agent's server has
+    // restarted on 5199 and 5173 is someone else's. Opening 5173 would show a working page that is
+    // the wrong app — strictly worse than an error, because nothing on screen contradicts it.
+    mount();
+    fire(KRAKEN, "ready", "http://127.0.0.1:5173", 5173);
+    setLive(KRAKEN, { url: "http://127.0.0.1:5199", port: 5199, state: "serving" });
+
+    fireEvent.click(cardFor(KRAKEN)!);
+
+    await waitFor(() => expect(refusalFor(KRAKEN)).toBeTruthy());
+    // THE SIDE EFFECT, both directions: nothing was opened — not the stale address, and not the
+    // freshly-discovered one either. A silent redirect to a url the reader never asked for is the
+    // same class of surprise as a wrong app.
+    expect(openUrlMock).not.toHaveBeenCalled();
+    expect(refusalFor(KRAKEN)?.textContent).toBe(PREVIEW_OPEN_REFUSAL_COPY.moved);
+  });
+
+  it("self-heals: the refused click re-derives the address, and the NEXT click opens it", async () => {
+    // The refusal is not a dead end. Re-reading the live status is what discovered the mismatch, so
+    // the store now holds the truth — the card re-renders onto the real port and the second click
+    // goes through. Without this the remedy the copy promises ("click again") would be a lie.
+    mount();
+    fire(KRAKEN, "ready", "http://127.0.0.1:5173", 5173);
+    setLive(KRAKEN, { url: "http://127.0.0.1:5199", port: 5199, state: "serving" });
+
+    fireEvent.click(cardFor(KRAKEN)!);
+    await waitFor(() => expect(refusalFor(KRAKEN)).toBeTruthy());
+    await waitFor(() =>
+      expect(cardFor(KRAKEN)?.getAttribute("data-preview-url")).toBe("http://127.0.0.1:5199"),
+    );
+
+    fireEvent.click(cardFor(KRAKEN)!);
+    await waitFor(() => expect(openUrlMock).toHaveBeenCalledTimes(1));
+    // THE NEW PORT, and only it. The stale one is never opened, on either click.
+    expect(openUrlMock).toHaveBeenCalledWith("http://127.0.0.1:5199");
+    expect(openUrlMock).not.toHaveBeenCalledWith("http://127.0.0.1:5173");
+  });
+
+  it("REFUSES when the agent has no preview any more — the server died under the card", async () => {
+    // A card can outlive its server by the width of one event: `preview:state` has not landed yet,
+    // or was missed entirely. The port is then free for the next allocation, which is how the
+    // founder got someone else's app.
+    mount();
+    fire(KRAKEN, "ready", "http://127.0.0.1:5173", 5173);
+    setLive(KRAKEN, null);
+
+    fireEvent.click(cardFor(KRAKEN)!);
+
+    await waitFor(() => expect(refusalFor(KRAKEN)?.textContent).toBe(PREVIEW_OPEN_REFUSAL_COPY.gone));
+    expect(openUrlMock).not.toHaveBeenCalled();
+  });
+
+  it("does not open a server that has since CRASHED — the card retires into a notice instead", async () => {
+    // `crashed` keeps the entry and its url: a crashed process leaves its address behind, and that
+    // address is exactly what the next allocation reuses. The card was rendered while it was
+    // `ready`, so only a CLICK-TIME state check can catch this.
+    //
+    // THE REFUSAL HERE IS LOUDER THAN A SENTENCE, and that is why this row asserts an outcome
+    // rather than copy. The read that answers the ownership question folds what it read into the
+    // store, `crashed` is not a surfacing state, so the card retires on the spot and the existing
+    // notice strip explains why. A refusal line on a card that no longer exists would be strictly
+    // less than that — and asserting one would have pinned an implementation, not a behaviour.
+    mount();
+    fire(KRAKEN, "ready", "http://127.0.0.1:5173", 5173);
+    fire(OTTER, "ready", "http://127.0.0.1:5174", 5174);
+    setLive(KRAKEN, { state: "crashed", error: "exit 1" });
+
+    fireEvent.click(cardFor(KRAKEN)!);
+
+    // THE SIDE EFFECT: no navigation to the dead address, ever.
+    await waitFor(() => expect(cardFor(KRAKEN)).toBeUndefined());
+    expect(openUrlMock).not.toHaveBeenCalled();
+    // …and the reader is told, rather than left with a card that quietly disappeared.
+    expect(noticeForAgent(KRAKEN)?.getAttribute("data-preview-status")).toBe("crashed");
+    // The sibling is untouched — this is one card's verdict, not the strip collapsing.
+    expect(cardFor(OTTER)?.getAttribute("data-preview-url")).toBe("http://127.0.0.1:5174");
+  });
+
+  it("REFUSES when the live status names a DIFFERENT agent", async () => {
+    // Belt to the braces: the read is keyed by agentId, so this should be unreachable. It is
+    // asserted anyway because it is the literal shape of the incident — one agent's card, another
+    // agent's server — and a gate that only holds while the layer beneath it is correct is not a
+    // gate. Nothing else on the card could tell the reader.
+    mount();
+    fire(KRAKEN, "ready", "http://127.0.0.1:5173", 5173);
+    setLive(KRAKEN, { agentId: OTTER });
+
+    fireEvent.click(cardFor(KRAKEN)!);
+
+    await waitFor(() =>
+      expect(refusalFor(KRAKEN)?.textContent).toBe(PREVIEW_OPEN_REFUSAL_COPY["wrong-agent"]),
+    );
+    expect(openUrlMock).not.toHaveBeenCalled();
+  });
+
+  it("REFUSES rather than falling back when the live read itself fails", async () => {
+    // FAIL CLOSED. "We could not check" is not "it is fine": an unreachable bridge is precisely
+    // when the held address is least trustworthy, and opening it anyway would make every other row
+    // here decorative — one failed read and the stale-url path is back.
+    invokeMock.mockImplementation((cmd: string) =>
+      cmd === "preview_status"
+        ? Promise.reject(new Error("bridge is down"))
+        : Promise.reject(new Error("no preview is open")),
+    );
+    mount();
+    fire(KRAKEN, "ready", "http://127.0.0.1:5173", 5173);
+
+    fireEvent.click(cardFor(KRAKEN)!);
+
+    await waitFor(() =>
+      expect(refusalFor(KRAKEN)?.textContent).toBe(PREVIEW_OPEN_REFUSAL_COPY.unreadable),
+    );
+    expect(openUrlMock).not.toHaveBeenCalled();
+  });
+
+  it("puts the refusal on the card that refused, while the sibling still opens", async () => {
+    // An absence asserted against a lone mounted card proves nothing (`sparkle-foqoe`). Both cards
+    // are on screen: one refuses, the other opens on the same gesture — so this is a per-card
+    // verdict rather than an open path that is broken everywhere.
+    mount();
+    fire(KRAKEN, "ready", "http://127.0.0.1:5173", 5173);
+    fire(OTTER, "ready", "http://127.0.0.1:5174", 5174);
+    setLive(KRAKEN, null);
+
+    fireEvent.click(cardFor(KRAKEN)!);
+    await waitFor(() => expect(refusalFor(KRAKEN)).toBeTruthy());
+    expect(openUrlMock).not.toHaveBeenCalled();
+
+    fireEvent.click(cardFor(OTTER)!);
+    await waitFor(() => expect(openUrlMock).toHaveBeenCalledTimes(1));
+    expect(openUrlMock).toHaveBeenCalledWith("http://127.0.0.1:5174");
+    // The refusal did not spread to the healthy card, and the healthy click did not clear the
+    // refusal on the other one.
+    expect(refusalFor(OTTER)).toBeUndefined();
+    expect(refusalFor(KRAKEN)).toBeTruthy();
   });
 });
 

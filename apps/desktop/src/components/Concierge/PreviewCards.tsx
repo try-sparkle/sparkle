@@ -46,6 +46,11 @@ import {
   type NamedPreviewNoticeModel,
   type PreviewNoticeState,
 } from "../../services/previewCards";
+// The CLICK-TIME ownership read. See `resolvePreviewOpenTarget`: the address a card is showing was
+// true when the event that made the card landed, and a dev server's port outlives the server —
+// which is how one agent's card came to open another agent's app. Nothing about the card can be
+// trusted to notice, so the question is re-asked at the instant of the click.
+import { resolvePreviewOpenTarget, type PreviewOpenRefusal } from "../../services/preview";
 // `notePreviewActivity` is imported for the reason `previewStore` spells out at its definition:
 // `supervise()` in preview.rs goes SILENT once a server is `Ready` (it sleeps on a liveness check
 // and transitions again only to Crashed/Failed), so a healthy preview produces no further wire
@@ -76,6 +81,39 @@ export const PREVIEW_CARD_REFRESH_TESTID = "concierge-preview-refresh";
 /** The "couldn't refresh" note. A capture that fails changes nothing else on screen, so without it
  *  the only signal is silence — and silence reads as a dead button. */
 export const PREVIEW_CARD_REFRESH_FAILED_TESTID = "concierge-preview-refresh-failed";
+
+/** The "didn't open, and here is why" line. Present ONLY after a click this card refused — see
+ *  {@link PREVIEW_OPEN_REFUSAL_COPY} for why a refusal has to be visible rather than silent. */
+export const PREVIEW_CARD_REFUSED_TESTID = "concierge-preview-refused";
+
+/**
+ * WHAT THE CARD SAYS WHEN IT WILL NOT OPEN, in the reader's language rather than the wire's.
+ *
+ * ══ WHY THERE IS COPY HERE AT ALL ═══════════════════════════════════════════════════════════════
+ * The failure this whole path exists to prevent is SILENT: a card whose port has been recycled
+ * opens a page that renders perfectly and belongs to somebody else. The reader cannot tell. So a
+ * refusal that produced nothing on screen would be only half a fix — the wrong app would be gone
+ * and "I clicked and nothing happened" would take its place, which is the second-worst outcome and
+ * the one people work around by clicking again.
+ *
+ * ══ A MAP RATHER THAN A TERNARY, same rule as `PREVIEW_NOTICE_LEAD` ═════════════════════════════
+ * Adding a refusal reason in `services/preview` without giving it wording is a TYPE ERROR here,
+ * rather than a blank line under a card at the moment someone most needs a sentence.
+ *
+ * ══ EACH LINE NAMES THE REMEDY IT ACTUALLY HAS ══════════════════════════════════════════════════
+ * `moved` is the only one that can promise "click again", and it can because the read that found
+ * the mismatch also corrected the card. The others end where they end on purpose: inventing a
+ * remedy a refusal message cannot honour is how a remedy becomes the unsafe path (AGENTS.md,
+ * `sparkle-8bvh`).
+ */
+export const PREVIEW_OPEN_REFUSAL_COPY: Record<PreviewOpenRefusal, string> = {
+  moved: "Didn't open — this agent's preview moved to a different port. The card is updated; click again.",
+  gone: "Didn't open — this agent's preview server is gone. That port may belong to another agent now.",
+  "not-live": "Didn't open — this agent's preview is no longer serving.",
+  "wrong-agent": "Didn't open — that address is answering for a different agent.",
+  unsafe: "Didn't open — this preview's address is no longer a local one.",
+  unreadable: "Didn't open — couldn't confirm this port is still this agent's.",
+};
 
 /** The NOTICE strip — the second, separate zone this component paints. See the block comment above
  *  {@link PreviewNotices} for why it is a zone of its own rather than more cards. */
@@ -192,7 +230,30 @@ function PreviewCard({
   name: string;
   surfacedAt: number;
 }) {
+  /**
+   * THIS AGENT'S PORT, subscribed BY AGENT ID rather than passed down with the url.
+   *
+   * The card model carries the url and nothing else, so a port threaded through it would be a
+   * second copy of the same fact stamped at the same moment — and the whole bug is that a stamped
+   * value goes stale. Reading it out of the store keyed on `agentId` means the card can never hold
+   * a port belonging to a different agent, whatever else drifts: there is exactly one row it can
+   * read, and it is this agent's own. It is also what `data-preview-port` publishes, so a test can
+   * assert the OWNERSHIP of what is on screen rather than only that two urls happen to differ.
+   *
+   * It is still a value read at RENDER time — which is why it is checked again below. See `open`.
+   */
+  const heldPort = usePreviewStore((s) => s.byAgent[agentId]?.port ?? null);
   const [shotState, setShotState] = useState<{ dataUrl: string; capturedAt: number } | null>(null);
+  /** Why the last click did not open anything. Null until a click is refused, and deliberately NOT
+   *  cleared when the url changes — the `moved` refusal's whole point is that the card corrected
+   *  itself, and wiping the sentence on that very re-render would leave the reader with a card that
+   *  silently changed under them and no idea why nothing opened. */
+  const [refusal, setRefusal] = useState<PreviewOpenRefusal | null>(null);
+  /** ONE OWNERSHIP READ IN FLIGHT AT A TIME. A refused click shows a sentence and nothing else
+   *  moves, which is exactly the shape that invites a second and third click — and each one is a
+   *  round trip to the supervisor. A ref rather than state: it must be read and set inside the same
+   *  handler invocation, before React has re-rendered anything. */
+  const openingRef = useRef(false);
   // ONE FETCH PER (agent, url, surfacing), and the guard is a ref rather than a dependency array
   // because the point is to survive re-renders the dependency array cannot see — every unrelated
   // store tick re-renders this strip, and a capture drives a real headless browser.
@@ -270,12 +331,61 @@ function PreviewCard({
     return () => clearInterval(id);
   }, [shotState]);
 
+  /**
+   * OPEN THIS AGENT'S PREVIEW — OR REFUSE, AND SAY SO.
+   *
+   * ══ WHY THIS IS NOT A STRAIGHT `openUrl(url)` ANY MORE ════════════════════════════════════════
+   * It was, and it opened another agent's app. A card is rendered from an event that was true when
+   * it landed; a dev server can die seconds later and its port be handed to the next agent that
+   * asks. The url still parses, the page still renders, and there is nothing on screen for the
+   * reader to disbelieve. Distinct ports per agent (the supervisor's half) narrow that window —
+   * they cannot close it, because reuse over time is the mechanism, not collision at one instant.
+   *
+   * So the address is RE-DERIVED here, from this agent's own live status, at the moment of the
+   * click. `resolvePreviewOpenTarget` does the read and the comparison; this handler only decides
+   * what the reader sees.
+   *
+   * ══ REFUSING IS THE POINT, AND THERE IS NO FALLBACK ═══════════════════════════════════════════
+   * Every non-`ok` branch ends here, with a sentence and no navigation. Opening the held url anyway
+   * "because we could not check" would restore the exact defect for the exact case that is most
+   * likely to hit it. Opening the FRESH url instead would be a silent redirect — a second
+   * destination from one gesture, hiding the fact that the card (and the screenshot above it) had
+   * gone stale.
+   */
   const open = () => {
-    // A human opening the preview is the strongest "still wanted" signal there is — stamped BEFORE
-    // the await, so a slow or failing `openUrl` cannot cost the signal. The click happened either
-    // way, which is the fact the grace clock is asking about.
+    // A human opening the preview is the strongest "still wanted" signal there is — stamped FIRST
+    // and synchronously, so neither a slow ownership read nor a refusal can cost the signal. The
+    // click happened either way, which is the fact the grace clock is asking about.
     notePreviewActivity(agentId);
-    void openUrl(url).catch((e) => console.warn("preview card: open url failed", url, e));
+    if (openingRef.current) return;
+    openingRef.current = true;
+    void resolvePreviewOpenTarget(agentId, { url, port: heldPort })
+      .then((decision) => {
+        if (!decision.ok) {
+          // The card may have retired while the read was in flight — a retired card has no reader,
+          // and writing to it is a React warning for no benefit. The absence of a navigation is
+          // what matters, and that has already happened by not calling `openUrl`.
+          if (aliveRef.current) setRefusal(decision.reason);
+          console.warn(
+            "preview card: refusing to open",
+            agentId,
+            decision.reason,
+            decision.heldUrl,
+            decision.liveUrl,
+          );
+          return;
+        }
+        // NOT GATED ON `aliveRef`. The verdict is about the SERVER, not about this component: a
+        // click that was answered "yes, this address is this agent's" has earned its navigation
+        // even if the strip re-rendered the card away underneath it in the meantime.
+        if (aliveRef.current) setRefusal(null);
+        void openUrl(decision.url).catch((e) =>
+          console.warn("preview card: open url failed", decision.url, e),
+        );
+      })
+      .finally(() => {
+        openingRef.current = false;
+      });
   };
 
   return (
@@ -283,6 +393,11 @@ function PreviewCard({
       data-testid={PREVIEW_CARD_TESTID}
       data-agent-id={agentId}
       data-preview-url={url}
+      // THE PORT, PUBLISHED AS ITS OWN FACT. `data-preview-url` already contains it, but a test
+      // that can only read the url can assert two cards DIFFER — never that each belongs to the
+      // right agent, which is the claim that actually failed. Absent rather than `"null"` when
+      // there is none, so "no port" and the string "null" cannot be confused.
+      data-preview-port={heldPort === null ? undefined : String(heldPort)}
       role="button"
       tabIndex={0}
       // THE URL IS IN THE ACCESSIBLE NAME. A card whose whole promise is "this opens somewhere
@@ -341,6 +456,33 @@ function PreviewCard({
         >
           {url}
         </span>
+      )}
+      {refusal && (
+        // THE ONE THING ON THE CARD THAT SAYS A CLICK WAS REFUSED. Without it the fix trades a
+        // wrong app for a dead-looking card, and a dead-looking card gets clicked again.
+        //
+        // ══ ITS OWN LINE, NOT A CHILD OF THE FOOTER ROW ═══════════════════════════════════════
+        // The footer is a nowrap flex row beside the ⟳, inside a card that CLIPS its overflow —
+        // so a sentence put there would be silently cut off in a narrow column, which is the one
+        // failure mode this element exists to prevent. Here it wraps instead.
+        //
+        // `role="status"` for the reason `MountedNotice` states for its own refusal: this is
+        // information the reader needs and cannot otherwise get — nothing else on the card moves
+        // when a click is refused. It is mounted only WHILE there is something to say, so the
+        // column's "exactly one live region" budget is untouched in every other state.
+        <div
+          data-testid={PREVIEW_CARD_REFUSED_TESTID}
+          role="status"
+          style={{
+            color: C.conciergeMuted,
+            fontSize: TYPE.micro,
+            minWidth: 0,
+            whiteSpace: "normal",
+            overflowWrap: "anywhere",
+          }}
+        >
+          {PREVIEW_OPEN_REFUSAL_COPY[refusal]}
+        </div>
       )}
       {/* THE FOOTER ROW — always present, and its two halves are gated DIFFERENTLY on purpose.
           ══ THE CAPTION IS WHAT MAKES A SNAPSHOT HONEST, and it needs a picture to date. A still

@@ -332,10 +332,27 @@ fn v6_refusal(addr: &str) -> String {
 /// KEEP THIS DOCBLOCK ADJACENT TO THE `fn` BELOW. It has been detached twice by inserting a helper
 /// between the two, and misattributed docs are still valid docs — `cargo check` cannot see it.
 ///
+/// `preferred` IS "A PORT SOMEBODY ASKED FOR", NOT "a port we allocated and told no one about".
+/// It is `Some` only when [`build_spawn`] says so — either Sparkle injected port flags, or the user
+/// PINNED `[preview].port` — and `None` for everything else, which includes the ordinary `[preview]`
+/// config override (`Framework::Unknown` injects no flags, and most overrides pin no port).
+///
+/// It was called `requested` while `open_reserved` fed it an allocated ephemeral port that reached
+/// the child through no channel whatsoever, so the rule below was reasoning from a fiction on every
+/// override project — bead `sparkle-cdq5de`, where the founder's agent announced port 52459 for a
+/// dev server sitting on 5173.
+///
+/// **THIS IS THE WEAKER OF THE TWO PORT CLAIMS `build_spawn` COMPUTES, AND DELIBERATELY SO.** Its
+/// `PortClaim::forced()` is the subset we can prove — flags we put on the command line — and is the
+/// only one anything may publish as an ADDRESS, or turn into the claim-driven v6 refusal below. A
+/// pin is the user's assertion about where their server binds, unverified by construction, which is
+/// enough to break a tie between sockets here but not enough to print. (The TAIL refusal, when
+/// there is no v4 candidate at all, is separate and applies at every level.)
+///
 /// Three outcomes, and they are three because collapsing any two loses information the pane has to
 /// render:
 ///   * `Ok(None)` — nothing is listening yet. Keep waiting.
-///   * `Ok(Some(port))` — a loopback listener. The `requested` port wins when it is ONE OF THEM, so
+///   * `Ok(Some(port))` — a loopback listener. The `preferred` port wins when it is ONE OF THEM, so
 ///     a framework's second socket (HMR) cannot displace it. It does NOT win merely by being
 ///     passed: a forced port that has not bound yet loses to the lowest v4 loopback port in the
 ///     tree. See the caveat below — this bullet claimed the forced case was "deterministic" for one
@@ -346,17 +363,19 @@ fn v6_refusal(addr: &str) -> String {
 ///     showing a generic failure.
 ///
 /// **A PORT THAT MATCHES NEITHER LIST FALLS THROUGH TO THE FIRST v4 LOOPBACK SOCKET, WHATEVER IT
-/// IS — and passing a `requested` port does not change that.** The rule is uniform: `requested` wins
+/// IS — and passing a `preferred` port does not change that.** The rule is uniform: `preferred` wins
 /// when it appears in one of the lists, and otherwise the v4 list is consulted first, so any
 /// unrelated socket in the tree (Node's inspector on 9229 is the one you will actually meet) is
 /// handed back as the preview's port. Nothing about that is an error, and the pane frames the
 /// debugger.
 ///
-/// This bites the DRIVEN frameworks too, not only `Framework::Unknown`: if the forced port has not
-/// appeared by the discovery tick on which some other v4 socket already has, that socket is what
-/// comes back — and `supervise` latches the first answer (`if bound.is_none()`), so discovery never
-/// revisits it. Refusing instead is not the fix: it kills servers that are merely slow, which is the
-/// regression bead `sparkle-dnvaq` records. Identifying the app's socket is.
+/// An UNFORCED target (`None`) takes that fall-through by definition — there is nothing to prefer,
+/// and pretending otherwise is what `sparkle-cdq5de` was. But it bites the DRIVEN frameworks too:
+/// if the forced port has not appeared by the discovery tick on which some other v4 socket already
+/// has, that socket is what comes back — and `supervise` latches the first answer (`if
+/// bound.is_none()`), so discovery never revisits it. Refusing instead is not the fix: it kills
+/// servers that are merely slow, which is the regression bead `sparkle-dnvaq` records. Identifying
+/// the app's socket is.
 ///
 /// **AND THE NON-DESTRUCTIVE ANSWER IS ONLY AVAILABLE WHILE SOMETHING IS ON v4 LOOPBACK.** With an
 /// empty v4 list the fall-through has nothing to hand back, so the v6-only refusal below fires and
@@ -367,7 +386,7 @@ fn v6_refusal(addr: &str) -> String {
 /// socket IS the app and wrong when it is a helper, and — the whole of `sparkle-dnvaq` — nothing
 /// here can tell those apart. It is kept because with no v4 candidate at all the app is more likely
 /// than not the thing we can see, not because the case is unambiguous.
-pub fn choose_listener(listeners: &[Listener], requested: Option<u16>) -> Result<Option<u16>, String> {
+pub fn choose_listener(listeners: &[Listener], claim: PortClaim) -> Result<Option<u16>, String> {
     let mut loopback: Vec<u16> = Vec::new();
     let mut foreign: Vec<String> = Vec::new();
     // Bound on the IPv6 loopback ONLY. Tracked separately from `loopback` because every consumer
@@ -406,19 +425,36 @@ pub fn choose_listener(listeners: &[Listener], requested: Option<u16>) -> Result
         v6_only.remove(port);
     }
 
-    // THE REQUESTED PORT DECIDES when there is one: we forced it, so it is the app's port, and a
-    // v6-only bind on it is the failure whatever else happens to be listening.
-    if let Some(want) = requested {
+    // THE NAMED PORT DECIDES when it is actually listening, whatever the strength of the claim:
+    // somebody asked for this number, so among sockets that ARE up it is the best candidate for
+    // being the app's. This branch only ever picks BETWEEN OBSERVED SOCKETS — it never invents an
+    // address, which is what `sparkle-cdq5de` was.
+    if let Some(want) = claim.port() {
         if loopback.contains(&want) {
             return Ok(Some(want));
         }
-        if let Some(addr) = v6_only.get(&want) {
-            return Err(v6_refusal(addr));
+        // THE HARD REFUSAL IS RESERVED FOR A *FORCED* PORT, and that gate is the whole reason
+        // `PortClaim` has three levels instead of two. `supervise` treats an `Err` here as terminal:
+        // it kills the child and marks the preview `Failed`. That is the right answer when we put
+        // `--port <want>` on the command line ourselves — the app really is on `want`, and a
+        // v6-only bind there is unreachable. It is the WRONG answer for a `[preview].port` pin,
+        // which reaches the child through no channel at all: any unrelated helper on `[::1]:<pin>`
+        // would kill a dev server that is healthy on some other v4 port. An unverified pin may
+        // prefer, but may not refuse ON ITS OWN ACCOUNT — so it falls through to the v4 list below.
+        // NOTE WHAT THAT DOES NOT SAY: the TAIL refusal further down ("nothing on v4, something on
+        // v6") still applies at every claim level, `Unknown` included. This gate removes the
+        // claim-driven kill, not every kill.
+        if claim.forced() == Some(want) {
+            if let Some(addr) = v6_only.get(&want) {
+                return Err(v6_refusal(addr));
+            }
         }
-        // A REQUESTED PORT THAT MATCHED NEITHER LIST FALLS THROUGH ON PURPOSE — see the caveat in
+        // A PREFERRED PORT THAT MATCHED NEITHER LIST FALLS THROUGH ON PURPOSE — see the caveat in
         // the docblock. A previous version of this function refused here whenever any v6-only socket
-        // was in the tree, on the theory that it must be the app (`Framework::Unknown` injects no
-        // port flag, so the child binds where the runtime chose). That was REVERTED, because the
+        // was in the tree, on the theory that it must be the app. (That reasoning was written when
+        // an unforced `Framework::Unknown` still arrived here carrying a port; it no longer does —
+        // an override that pins nothing arrives as `None` and never enters this block at all.) That
+        // was REVERTED, because the
         // theory is a coin flip and the two outcomes are not equally bad:
         //
         //   * guess wrong toward refusing — an app on `127.0.0.1:3000` with any helper on a bare
@@ -453,30 +489,44 @@ pub fn choose_listener(listeners: &[Listener], requested: Option<u16>) -> Result
 
 /// The whole discovery step: process tree → listening sockets → a verdict. Split out from the
 /// supervisor loop so it can be driven from a test with both seams fixed.
-/// TAKES A `u16`, NOT AN `Option<u16>`, AND THAT IS THE GUARD. Passing `None` from here would be
-/// silently catastrophic: see [`choose_listener`]'s caveat, where an unrelated v4 socket (Node's
-/// inspector on 9229) wins and the pane frames the debugger's JSON blob instead of the app. That
-/// constraint used to live in a test comment claiming to pin a call site no test can reach; making
-/// the parameter non-optional moves it to the compiler, which is the only thing that can hold it.
 ///
-/// **PASSING IT DOES NOT GUARANTEE THE ANSWER IS THE APP.** `Framework::Unknown` gets no port flag
-/// at all (`port_args`'s `_ => Vec::new()` arm), so for a plain `node server.js` this is a port
-/// Sparkle allocated and never told the child about — but even a DRIVEN framework loses the
-/// guarantee whenever its port has not bound yet and another v4 socket has. `choose_listener` falls
-/// through to the first v4 loopback socket in either case; see its caveat. The `u16` here removes
-/// one way to get it wrong (asking with no port at all), not the ambiguity itself, which is bead
-/// `sparkle-dnvaq` — the alternative, refusing on a guess, kills working servers.
+/// TAKES A [`PortClaim`], AND `PortClaim::Unknown` IS A REAL ANSWER RATHER THAN A CARELESS ONE. It
+/// used to take a bare `u16`, on the reasoning that "asking with no port at all" was the mistake worth putting
+/// in front of the compiler. That guard was aimed at the wrong failure: the value the only
+/// production caller had to pass was an ALLOCATED port that had been injected nowhere, so the type
+/// forced the caller to state a preference it had no basis for, and `choose_listener`'s "somebody
+/// asked for this port" rule was being fed a fiction on every `[preview]` config override
+/// (bead `sparkle-cdq5de`). A `None` that means "nobody asked for a port" is strictly more honest
+/// than a number that means "we allocated something and told no one".
+///
+/// **THE PROVENANCE IS THE GUARD NOW: `claim` MUST COME FROM [`Spawn::claim`]**, which is computed
+/// by the same function that builds the argv, so it cannot claim a port nobody ever asked for. Do
+/// not hand-write a `PortClaim::Forced(port)` here from a port you merely allocated — that is
+/// precisely the bug this parameter's type used to institutionalize.
+///
+/// IT TAKES THE WHOLE CLAIM, NOT A BARE PORT, and [`choose_listener`] reads BOTH halves of it.
+/// `claim.port()` is the discovery preference — safe at any strength, because choosing between
+/// sockets that are ALREADY LISTENING can only ever pick the wrong observed socket, never invent
+/// one. `claim.forced()` is the subset that may additionally turn a v6-only bind into a TERMINAL
+/// refusal, which `supervise` answers by killing the child; restricting that to a port we really
+/// put on the command line is the whole reason the claim travels intact rather than as a bare
+/// `Option<u16>`.
+///
+/// **PASSING A `Some` STILL DOES NOT GUARANTEE THE ANSWER IS THE APP.** Even a DRIVEN framework
+/// loses the guarantee whenever its port has not bound yet and another v4 socket has:
+/// `choose_listener` falls through to the first v4 loopback socket, which is bead `sparkle-dnvaq`
+/// — the alternative, refusing on a guess, kills working servers.
 pub fn discover_port(
     procs: &dyn ProcessTable,
     listen: &dyn ListenTable,
     root_pid: u32,
-    requested: u16,
+    claim: PortClaim,
 ) -> Result<Option<u16>, String> {
     // `None` from either seam means we could not look — NOT that nothing is listening.
     let Some(rows) = procs.rows() else { return Ok(None) };
     let tree = descendant_pids(&rows, root_pid);
     let Some(listeners) = listen.listeners(&tree) else { return Ok(None) };
-    choose_listener(&listeners, Some(requested))
+    choose_listener(&listeners, claim)
 }
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════
@@ -601,6 +651,12 @@ pub enum Decline {
     /// More than one candidate. Guessing among them is worse than declining (§7 rule 4), so every
     /// candidate is named and the user picks one via `[preview]` in the project's config.
     Ambiguous(Vec<String>),
+    /// A `[preview]` override that pins a CONSTANT port and carries no `{port}` token anywhere, so
+    /// it would hand every agent on this machine the same number. Carries the offending flag as it
+    /// was written, because a refusal that does not name the line to edit is a refusal nobody acts
+    /// on. Bead `sparkle-ne230x`: this repo's own block pinned `--port 5173` and the founder opened
+    /// one agent's preview card to find a DIFFERENT agent's app behind it.
+    ConstantPortPin(String),
 }
 
 impl Decline {
@@ -616,6 +672,7 @@ impl Decline {
             Decline::NoPackageManager => "no-package-manager",
             Decline::NoDevScript => "no-dev-script",
             Decline::Ambiguous(_) => "ambiguous",
+            Decline::ConstantPortPin(_) => "constant-port-pin",
         }
     }
 
@@ -651,9 +708,18 @@ impl Decline {
                  [preview] in this project's .sparkle/config.toml",
                 candidates.join(", ")
             ),
+            Decline::ConstantPortPin(flag) => format!(
+                "this project's [preview] command pins a constant port (`{flag}`), which hands \
+                 EVERY agent the same one — so one agent's dev server ends up serving another \
+                 agent's preview. Write the value as `{PORT_PLACEHOLDER}` instead (e.g. `--port \
+                 {PORT_PLACEHOLDER}`) and Sparkle substitutes the port it allocated for this agent",
+            ),
         }
     }
 }
+
+/// The token a `[preview]` override writes to receive the port Sparkle allocated for THIS agent.
+pub const PORT_PLACEHOLDER: &str = "{port}";
 
 /// What to run, and where, to bring a preview up.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -681,18 +747,182 @@ pub struct PreviewTarget {
     pub port: Option<u16>,
 }
 
-/// The full argument vector for a spawn on `port`.
-pub fn build_argv(target: &PreviewTarget, port: u16) -> Vec<String> {
-    let mut args = target.args.clone();
+/// A planned spawn: what to run, and whether Sparkle actually FORCED the port it was planned with.
+///
+/// THE TWO HALVES ARE COMPUTED TOGETHER ON PURPOSE. "Did the child get told which port to use" is
+/// answerable only from the argv that was built, and while it lived in the caller's head it was
+/// wrong: `open_reserved` allocated an ephemeral port, built an argv that mentioned it nowhere, and
+/// then published `http://127.0.0.1:<that port>` as the preview's address (bead `sparkle-cdq5de`).
+/// The founder read one of those numbers out of his agent's chat — 52459 — while the dev server was
+/// on 5173 and the concierge card said so correctly. Returning the verdict from the same function
+/// that builds the argv is what makes the two unable to disagree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Spawn {
+    /// The program to spawn, with any `{port}` token already substituted. Computed HERE rather
+    /// than read off the target for the same reason the claim is: `command = "serve-on-{port}"` is
+    /// a channel the port can reach the child through, so whoever decides the claim has to be the
+    /// one that resolves it, or the two can disagree.
+    pub program: String,
+    /// The full argument vector to spawn with.
+    pub argv: Vec<String>,
+    /// How much Sparkle actually knows about the port this child will bind. See [`PortClaim`] —
+    /// the whole point is that "we injected it" and "the user asserted it" are DIFFERENT claims,
+    /// and only the first may become an address.
+    pub claim: PortClaim,
+}
+
+/// How strong Sparkle's claim on a preview's port is. Three levels, because collapsing the middle
+/// one into either neighbour is what bead `sparkle-cdq5de` was.
+///
+/// The distinction is not academic — it decides two things with very different blast radii:
+///   * MAY WE PUBLISH IT AS AN ADDRESS before anything has bound a socket? Only `Forced`. Being
+///     wrong here invents a URL out of nothing, which is the bug this bead is about.
+///   * MAY THIS NUMBER *BY ITSELF* TRIGGER THE HARD v6 REFUSAL in [`choose_listener`]? Only
+///     `Forced`. `supervise` treats that refusal as terminal and KILLS the child, so letting an
+///     unverified number reach it means a healthy dev server on some other port dies because an
+///     unrelated helper happened to sit on `[::1]:<pin>`.
+/// Preferring a port among sockets that ARE listening is safe at any level, and that is all
+/// `Preferred` is allowed to do.
+///
+/// **THIS IS NOT A PROMISE THAT A NON-FORCED CLAIM CANNOT KILL ANYTHING, AND THE DIFFERENCE MATTERS.**
+/// [`choose_listener`]'s TAIL refusal — "nothing on v4 loopback, but something IS on v6" — fires at
+/// EVERY level, `Unknown` included; `a_v6_only_bind_is_refused_because_the_frame_is_pointed_at_v4`
+/// pins exactly that. So a pinned override whose child has not bound yet, in a tree where some
+/// helper sits on a bare `localhost` (Node >= 17 resolves that to `::1`), still dies — over a socket
+/// that is not even the pinned port. What the gate below removes is the *claim-driven* kill, not
+/// every kill. Refusing when there is no v4 candidate at all is bead `sparkle-dnvaq`'s deliberate
+/// coin-flip, and it is unchanged here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PortClaim {
+    /// Nobody named a port. Discovery reports whatever it finds.
+    Unknown,
+    /// The user PINNED `[preview].port`, and Sparkle put it on NO command line. `target.port` is
+    /// `Some` only in `detect_preview_target`'s `[preview]` override branch, which is always
+    /// `Framework::Unknown`, so `port_args` contributes nothing there — and the pin itself is not a
+    /// channel, so the number reaches the child through none. It is the user's assertion about
+    /// where their server binds: good enough to break a tie between observed sockets, not good
+    /// enough to print or to kill a process over.
+    ///
+    /// AN OVERRIDE IS NO LONGER TRAPPED AT THIS LEVEL, and that is bead `sparkle-ne230x`. Writing
+    /// [`PORT_PLACEHOLDER`] anywhere in `command` or `args` puts the allocated port ON the command
+    /// line, which is proof rather than assertion, so such a config promotes to `Forced` below.
+    /// What is left here is the config that names a port but offers Sparkle no way to convey one.
+    Preferred(u16),
+    /// This number is ON THE COMMAND LINE — either `Framework::port_args` returned flags carrying
+    /// it, or the override wrote [`PORT_PLACEHOLDER`] and `build_spawn` substituted it in. The only
+    /// claim we can prove the child received, and the only one distinct per agent.
+    Forced(u16),
+}
+
+impl PortClaim {
+    /// The port named, at whatever strength. Use for DISCOVERY PREFERENCE only.
+    pub fn port(self) -> Option<u16> {
+        match self {
+            PortClaim::Unknown => None,
+            PortClaim::Preferred(p) | PortClaim::Forced(p) => Some(p),
+        }
+    }
+
+    /// The port we can PROVE the child was told. The only value publishable as an address, and the
+    /// only one that may trigger a terminal refusal ON ITS OWN ACCOUNT.
+    ///
+    /// That last qualifier is load-bearing, and the unqualified form of this sentence was wrong.
+    /// `choose_listener`'s no-v4-candidate TAIL refusal — "nothing on v4 loopback, but something IS
+    /// on v6" — fires at EVERY claim level, `Unknown` included, over a socket that need not be the
+    /// claimed port at all. See [`PortClaim`]'s own docblock, which this accessor used to
+    /// contradict: a reader at the `claim.forced()` call site would have concluded the terminal-kill
+    /// branch was unreachable without a forced port, which is backwards.
+    pub fn forced(self) -> Option<u16> {
+        match self {
+            PortClaim::Forced(p) => Some(p),
+            _ => None,
+        }
+    }
+}
+
+/// Every `{port}` in `text` replaced with `port`. EVERY occurrence, not the first: a token honoured
+/// once and silently ignored the second time looks correct in the config and produces one real port
+/// and one fiction.
+fn substitute_port(text: &str, port: u16) -> String {
+    if !text.contains(PORT_PLACEHOLDER) {
+        return text.to_string();
+    }
+    text.replace(PORT_PLACEHOLDER, &port.to_string())
+}
+
+/// All ASCII digits, so it is a number this config would hand to every agent alike. Anything
+/// carrying a substitution — `{port}`, a shell `$PORT` — is not a constant and is left alone.
+fn is_constant_port(value: &str) -> bool {
+    !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// A port flag in an override's args whose value is a literal constant, rendered AS WRITTEN so the
+/// decline can name the exact thing to edit. `None` when no port flag names a constant.
+///
+/// Three spellings, because a rule that catches two of the three ways to write the same mistake is
+/// one a config walks around by accident: `--port 5173`, `--port=5173`, and the `-p` short form of
+/// both. The value is checked rather than assumed, so `--port {port}` is NOT a constant.
+fn constant_port_flag(args: &[String]) -> Option<String> {
+    for (i, arg) in args.iter().enumerate() {
+        let (name, inline) = match arg.split_once('=') {
+            Some((n, v)) => (n, Some(v)),
+            None => (arg.as_str(), None),
+        };
+        if !matches!(name, "--port" | "-p") {
+            continue;
+        }
+        match inline {
+            Some(value) if is_constant_port(value) => return Some(arg.clone()),
+            Some(_) => {}
+            None => {
+                let value = args.get(i + 1).map(String::as_str).unwrap_or_default();
+                if is_constant_port(value) {
+                    return Some(format!("{arg} {value}"));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// The full argument vector for a spawn on `port`, plus whether `port` was forced onto the child.
+pub fn build_spawn(target: &PreviewTarget, port: u16) -> Spawn {
+    // THE TOKEN IS AN OVERRIDE'S ONLY CHANNEL, and substituting it is what turns the claim below
+    // from a guess into proof. `port_args` gives `Framework::Unknown` nothing, so before this a
+    // hand-written command could not be handed the allocated port through anything at all.
+    let conveyed = target.program.contains(PORT_PLACEHOLDER)
+        || target.args.iter().any(|a| a.contains(PORT_PLACEHOLDER));
+    let program = substitute_port(&target.program, port);
+    let mut argv: Vec<String> = target.args.iter().map(|a| substitute_port(a, port)).collect();
     let flags = target.framework.port_args(port);
-    if flags.is_empty() {
-        return args;
+    let injected = !flags.is_empty();
+    if injected {
+        if target.needs_arg_separator {
+            argv.push("--".into());
+        }
+        argv.extend(flags);
     }
-    if target.needs_arg_separator {
-        args.push("--".into());
-    }
-    args.extend(flags);
-    args
+    // `== Some(port)`, not `.is_some()`: the pin only vouches for the port we are ACTUALLY spawning
+    // with. A pin we declined to honour (the reserved-port refusal above bails out before this, but
+    // the type does not know that) would otherwise vouch for a different number entirely.
+    let pinned = target.port == Some(port);
+    // `conveyed` sits beside `injected` and not below `pinned` ON PURPOSE: both are the same kind
+    // of fact — this number is ON THE COMMAND LINE — and only that kind may be published. A pin is
+    // an assertion about someone else's server and stays the weaker claim.
+    let claim = if injected || conveyed {
+        PortClaim::Forced(port)
+    } else if pinned {
+        PortClaim::Preferred(port)
+    } else {
+        PortClaim::Unknown
+    };
+    Spawn { program, argv, claim }
+}
+
+/// The full argument vector for a spawn on `port`. A thin view over [`build_spawn`] — call that one
+/// when you also need to know whether the port was real.
+pub fn build_argv(target: &PreviewTarget, port: u16) -> Vec<String> {
+    build_spawn(target, port).argv
 }
 
 /// A project's `[preview]` override, read straight off the worktree's own `.sparkle/config.toml`.
@@ -822,12 +1052,27 @@ pub fn detect_preview_target(worktree: &Path, enabled: bool) -> Result<PreviewTa
     // by writing it, he has already answered every question detection would ask.
     let over = read_preview_override(worktree);
     if let Some(command) = over.command.as_ref().map(|c| c.trim()).filter(|c| !c.is_empty()) {
+        let args = over.args.unwrap_or_default();
+        // REFUSE A CONSTANT PORT BEFORE IT CAN COLLIDE. A config that names a fixed number and
+        // gives Sparkle no `{port}` token to substitute PROVABLY hands every agent on the machine
+        // the same port, and the collision is invisible at the point it happens — a dev server that
+        // steps aside to the next free port serves the wrong app behind a URL that looks right.
+        // Failing loudly here is the founder's explicit instruction (bead `sparkle-ne230x`).
+        let conveyable = command.contains(PORT_PLACEHOLDER)
+            || args.iter().any(|a| a.contains(PORT_PLACEHOLDER));
+        if !conveyable {
+            if let Some(flag) = constant_port_flag(&args) {
+                return Err(Decline::ConstantPortPin(flag));
+            }
+        }
         return Ok(PreviewTarget {
             // Unknown, not a guess: we do not know which framework a hand-written command starts,
-            // so nothing is injected and discovery + the loopback refusal do the work.
+            // so `port_args` injects nothing and discovery + the loopback refusal do the work. The
+            // one channel that IS available is the `{port}` token, which `build_spawn` substitutes
+            // into whatever the config wrote it in.
             framework: Framework::Unknown,
             program: command.to_string(),
-            args: over.args.unwrap_or_default(),
+            args,
             needs_arg_separator: false,
             path: over.path.unwrap_or_default(),
             source: "config",
@@ -1051,6 +1296,22 @@ pub struct PreviewEntry {
     pub agent_id: String,
     pub project_id: String,
     pub worktree: String,
+    /// THE PORT SOMEBODY ASKED FOR — `PortClaim::port()`: flags Sparkle injected, or a pin the user
+    /// wrote in `[preview].port`. NEVER the one we merely allocated, which is what this field used
+    /// to hold and is bead `sparkle-cdq5de`.
+    ///
+    /// **THIS IS THE WEAKER OF THE TWO CLAIMS, SO IT IS NOT PUBLISHABLE AS AN ADDRESS.** It stores
+    /// `PortClaim::port()`, not `PortClaim::forced()`, so a `Some` here may be an unverified pin —
+    /// the user's assertion about where their server binds, conveyed to the child through no
+    /// channel. Only `bound_port` below is an observed fact. A future reader wanting "the address
+    /// this preview answers at" wants that field, every time.
+    ///
+    /// `None` is the ordinary case for a `[preview]` config override, which injects no port flags
+    /// and usually pins none either.
+    ///
+    /// The FIELD NAME is deliberately left alone. It is a serde-serialized key in the on-disk
+    /// registry that previous launches have already written; renaming it would make every existing
+    /// entry fail to deserialize, and the registry's whole job is to survive a hard kill.
     pub requested_port: Option<u16>,
     pub bound_port: Option<u16>,
     pub pid: u32,
@@ -1300,6 +1561,12 @@ pub struct PreviewStatus {
 }
 
 /// What `preview_open` answers with.
+///
+/// `url: ""` / `port: 0` IS A REAL, CONTRACTED ANSWER — "started, no address yet" — not a bug to
+/// paper over. `reserve_or_reattach` already sent it for a re-attach landing before the port
+/// existed, and `controlListener.handlePreview` has always stripped an empty address rather than
+/// forwarding it. A fresh open of an UNFORCED target now sends it too (see `opened_reply`), which
+/// is the whole of bead `sparkle-cdq5de`: the alternative was a URL naming a port nothing binds.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PreviewOpened {
@@ -1307,6 +1574,21 @@ pub struct PreviewOpened {
     pub url: String,
     pub port: u16,
     pub state: PreviewState,
+}
+
+/// The pre-discovery `preview_open` reply for a server whose port was `forced` (or was not).
+///
+/// Pure, and separate from `open_reserved` for one reason: `open_reserved` needs a live
+/// `AppHandle` and cannot be unit-tested at all, so the decision that actually reaches the agent —
+/// "do we name an address before anything has bound one?" — would otherwise be untestable. This is
+/// the side effect a test can assert on.
+pub fn opened_reply(id: String, forced: Option<u16>, state: PreviewState) -> PreviewOpened {
+    match forced {
+        Some(port) => PreviewOpened { id, url: preview_url_for(port), port, state },
+        // NOT `preview_url_for(0)`: an empty string is the sentinel the frontend guard keys on, and
+        // `http://127.0.0.1:0` would sail through it as a perfectly well-formed loopback URL.
+        None => PreviewOpened { id, url: String::new(), port: 0, state },
+    }
 }
 
 /// What `preview_capability` answers with.
@@ -1938,11 +2220,25 @@ fn open_reserved(
             Err(e) => fail!(e),
         },
     };
-    let program = match resolve_program(&target.program) {
+    // BUILD ARGV AND THE PORT VERDICTS TOGETHER — see `build_spawn`. TWO verdicts, because they
+    // answer two different questions and only one of them may become an address:
+    //   * `forced`    — Sparkle put this port on the command line. The ONLY value publishable
+    //                   (status, reply) before a socket exists, because it is the only one we can
+    //                   prove the child was told.
+    //   * `preferred` — that, OR a `[preview].port` pin. A hint for discovery only. A pin always
+    //                   arrives with no flags injected, so it is the user's assertion about where
+    //                   their server binds, not a fact about what we told it.
+    // A `[preview]` config override is `None` UNLESS it writes `{port}`. Without the token the
+    // allocated `port` above reaches the child through no flag at all, so a URL built from it names
+    // a socket nothing will ever bind; with it, the number is on the command line and publishable.
+    let spawn = build_spawn(&target, port);
+    let program = match resolve_program(&spawn.program) {
         Ok(p) => p,
         Err(e) => fail!(e),
     };
-    let args = build_argv(&target, port);
+    let args = spawn.argv;
+    let claim = spawn.claim;
+    let forced = claim.forced();
 
     let mut cmd = Command::new(&program);
     cmd.current_dir(&cwd)
@@ -1994,7 +2290,11 @@ fn open_reserved(
             agent_id: agent_id.clone(),
             project_id: project_id.clone(),
             worktree: real.to_string_lossy().to_string(),
-            requested_port: Some(port),
+            // The port we ASKED FOR — flags we injected, or a pin the user wrote — never the one
+            // we merely allocated. `None` records the truth for a target where we asked for
+            // nothing, and `bound_port` below is what discovery later fills in with the socket it
+            // really took.
+            requested_port: claim.port(),
             bound_port: None,
             pid,
             pgid,
@@ -2022,19 +2322,22 @@ fn open_reserved(
     }
 
     manager.set_pgid(&id, pgid);
-    // The URL is knowable before the server is ready precisely because the port was FORCED;
-    // discovery may still replace it if the framework ignored us. State stays `Starting` — this is
-    // an attribute update (port/url), not a phase change, so it reuses `transition` rather than a
-    // second `insert`.
-    manager.transition(&app, &id, PreviewState::Starting, Some(port), None);
+    // The URL is knowable before the server is ready ONLY when the port was genuinely FORCED, and
+    // `claim.forced()` is the fact rather than the assumption — an unforced target publishes
+    // NOTHING here and waits for discovery, because a port we injected nowhere is not an address.
+    // (`transition` leaves `port`/`url` untouched on `None`, so the entry keeps the `None`s it was
+    // inserted with.) Discovery may still replace a forced port if the framework ignored us. State
+    // stays `Starting` — this is an attribute update (port/url), not a phase change, so it reuses
+    // `transition` rather than a second `insert`.
+    manager.transition(&app, &id, PreviewState::Starting, forced, None);
 
     let supervisor_app = app.clone();
     let supervisor_id = id.clone();
     std::thread::spawn(move || {
-        supervise(supervisor_app, supervisor_id, child, stop, err_drain, pid, port, app_data);
+        supervise(supervisor_app, supervisor_id, child, stop, err_drain, pid, claim, app_data);
     });
 
-    Ok(PreviewOpened { id, url: preview_url_for(port), port, state: PreviewState::Starting })
+    Ok(opened_reply(id, forced, PreviewState::Starting))
 }
 
 /// Watch one server: discover its port, probe it, then keep noticing whether it died.
@@ -2046,7 +2349,16 @@ fn supervise(
     stop: Arc<AtomicBool>,
     stderr: crate::worktree::Drain,
     pid: u32,
-    requested: u16,
+    // WHAT SPARKLE KNOWS about this child's port, straight from `Spawn::claim` — flags Sparkle
+    // injected (`Forced`), a `[preview].port` the user pinned (`Preferred`), or nothing at all
+    // (`Unknown`, the honest answer for an ordinary `[preview]` config override). Never an
+    // allocated-but-uninjected number: that is bead `sparkle-cdq5de`.
+    //
+    // THE WHOLE CLAIM TRAVELS, not just the port, because `choose_listener` needs both halves: the
+    // number to prefer among listening sockets, and whether it is strong enough to justify a
+    // terminal refusal — which this function answers by KILLING the child. `open_reserved` keeps
+    // `claim.forced()` for its own address-publishing sites.
+    claim: PortClaim,
     app_data: PathBuf,
 ) {
     let deadline = Instant::now() + READY_TIMEOUT;
@@ -2080,7 +2392,7 @@ fn supervise(
         }
 
         if bound.is_none() {
-            match discover_port(&PsProcessTable, &LsofListenTable, pid, requested) {
+            match discover_port(&PsProcessTable, &LsofListenTable, pid, claim) {
                 Ok(Some(port)) => {
                     bound = Some(port);
                     app.state::<PreviewManager>().transition(&app, &id, PreviewState::Listening, Some(port), None);
@@ -2424,7 +2736,7 @@ mod tests {
             vec![listener(20226, "127.0.0.1:5200"), listener(20228, "*:5201")],
             "exit=1 must not discard a listing lsof reported correctly"
         );
-        assert_eq!(choose_listener(&listeners, Some(5200)), Ok(Some(5200)));
+        assert_eq!(choose_listener(&listeners, PortClaim::Forced(5200)), Ok(Some(5200)));
     }
 
     /// The same property against the REAL binary, so a status gate added anywhere in the call path —
@@ -2449,7 +2761,7 @@ mod tests {
             .listeners(&pids)
             .expect("lsof is present, so the probe must produce a listing rather than 'could not look'");
         assert_eq!(
-            choose_listener(&found, Some(port)),
+            choose_listener(&found, PortClaim::Forced(port)),
             Ok(Some(port)),
             "our own listening socket must survive the invalid pid; got {found:?}"
         );
@@ -2471,7 +2783,7 @@ mod tests {
         // ONLY the great-grandchild listens. If the walk stopped at the direct child, `lsof` would
         // be asked about pid 100 alone and this would be `Ok(None)` forever.
         let listen = FixedListenTable(Some(vec![listener(103, "127.0.0.1:5200")]));
-        assert_eq!(discover_port(&procs, &listen, 100, 5200), Ok(Some(5200)));
+        assert_eq!(discover_port(&procs, &listen, 100, PortClaim::Forced(5200)), Ok(Some(5200)));
 
         // Pin the mechanism, not just the outcome: the pid set handed to lsof must contain the
         // great-grandchild. Without this, a walk that returned every pid on the machine would also
@@ -2502,7 +2814,7 @@ mod tests {
     /// host flag, and Node >= 17 resolves a bare `localhost` listen to `::1` first on macOS.
     #[test]
     fn a_v6_only_bind_is_refused_because_the_frame_is_pointed_at_v4() {
-        let err = choose_listener(&[listener(7, "[::1]:5173")], None)
+        let err = choose_listener(&[listener(7, "[::1]:5173")], PortClaim::Unknown)
             .expect_err("a v6-only listener must be refused, not accepted");
         assert!(
             err.contains("[::1]:5173"),
@@ -2514,7 +2826,7 @@ mod tests {
         );
         // Even when it is the port we asked for — the requested-port fast path must not smuggle it
         // through ahead of the loopback classification.
-        assert!(choose_listener(&[listener(7, "[::1]:5173")], Some(5173)).is_err());
+        assert!(choose_listener(&[listener(7, "[::1]:5173")], PortClaim::Forced(5173)).is_err());
     }
 
     /// AN UNRELATED v4 SOCKET IN THE SAME TREE MUST NOT RESCUE A v6-ONLY APP PORT.
@@ -2528,7 +2840,7 @@ mod tests {
     #[test]
     fn an_unrelated_v4_socket_does_not_rescue_a_v6_only_app_port() {
         let ls = [listener(7, "[::1]:5173"), listener(7, "127.0.0.1:9229")];
-        let err = choose_listener(&ls, Some(5173))
+        let err = choose_listener(&ls, PortClaim::Forced(5173))
             .expect_err("the REQUESTED port is v6-only; the debugger's port is not a substitute");
         assert!(err.contains("[::1]:5173"), "must name the app's address; got: {err}");
 
@@ -2537,22 +2849,30 @@ mod tests {
         // An earlier version of this comment claimed it also guarded the CALL SITE ("rewriting it
         // to pass None shows up as this test going red"), which was false: changing `supervise`
         // cannot change what this function returns, so the test would have stayed green while the
-        // pane framed a JSON blob. The call site is now guarded by the only thing that can hold it,
-        // the type — `discover_port` takes a `u16`, so `None` is unexpressible there.
+        // pane framed a JSON blob. The call site was then guarded by making `discover_port` take a
+        // bare `u16` — which held the wrong invariant, since the only value the caller could pass
+        // was an allocated port it had injected nowhere (bead `sparkle-cdq5de`). `None` is
+        // expressible again, and it is the CORRECT value for an unforced target; what holds the
+        // call site now is provenance — `supervise` gets `Spawn::claim`, computed by the same
+        // function that builds the argv — pinned by `open_reserved_publishes_only_the_forced_port`.
         //
         // (The assertion before that — `!err.contains("9229")` — could not fail at all: it ran only
         // after `expect_err` had established the value was the v6 refusal, whose only interpolation
         // is the app's own address.)
         assert_eq!(
-            choose_listener(&ls, None),
+            choose_listener(&ls, PortClaim::Unknown),
             Ok(Some(9229)),
             "with no requested port the first v4 loopback socket wins, debugger included"
         );
     }
 
-    /// THE UNFORCED FRAMEWORK, AND WHY WE ACCEPT RATHER THAN REFUSE. `Framework::Unknown` gets no
-    /// port flag, so the requested port is one the child was never told about; it matches neither
-    /// list, and the two trees below are INDISTINGUISHABLE from the socket list alone.
+    /// A FORCED PORT THAT HAS NOT BOUND YET, AND WHY WE ACCEPT RATHER THAN REFUSE. A driven
+    /// framework's `--port` is real but slow to appear, so it matches neither list on this tick,
+    /// and the two trees below are INDISTINGUISHABLE from the socket list alone.
+    ///
+    /// (This case used to be reached by `Framework::Unknown` as well, whose "requested" port was
+    /// one the child was never told about. It no longer is — an unforced target passes `None` and
+    /// takes the fall-through directly, which is bead `sparkle-cdq5de`.)
     ///
     /// A version of this refused whenever any v6-only socket was present, reading it as "the app is
     /// on v6 and unreachable". The second case is why that was reverted: refusing there kills a
@@ -2565,7 +2885,7 @@ mod tests {
         // App v6-only, an unrelated v4 socket (Node's inspector). We hand back 9229 and the pane
         // frames a JSON blob: the WRONG page, and the known cost of not guessing.
         assert_eq!(
-            choose_listener(&[listener(7, "[::1]:4000"), listener(7, "127.0.0.1:9229")], Some(5173)),
+            choose_listener(&[listener(7, "[::1]:4000"), listener(7, "127.0.0.1:9229")], PortClaim::Forced(5173)),
             Ok(Some(9229)),
             "wrong socket, but nothing is destroyed and Reload/Stop still work"
         );
@@ -2573,7 +2893,7 @@ mod tests {
         // The mirror image, and the expensive one: app on v4, a helper on a bare `localhost` that
         // Node >= 17 resolved to `[::1]`. This MUST resolve — refusing would kill it.
         assert_eq!(
-            choose_listener(&[listener(7, "127.0.0.1:3000"), listener(7, "[::1]:9230")], Some(5173)),
+            choose_listener(&[listener(7, "127.0.0.1:3000"), listener(7, "[::1]:9230")], PortClaim::Forced(5173)),
             Ok(Some(3000)),
             "a working v4 app must never be vetoed by an unidentified v6 socket"
         );
@@ -2585,7 +2905,7 @@ mod tests {
         // being slow. It is NOT the unambiguous case an earlier version of this comment claimed:
         // the v6 socket may be the app or may be a helper, and nothing here can tell (sparkle-dnvaq).
         // Pinned as the known cost of keeping the refusal, not as evidence it is right.
-        let err = choose_listener(&[listener(7, "[::1]:4000")], Some(5173))
+        let err = choose_listener(&[listener(7, "[::1]:4000")], PortClaim::Forced(5173))
             .expect_err("nothing on v4 loopback: the v6 socket is the only candidate");
         assert!(err.contains("[::1]:4000"), "must name it; got: {err}");
     }
@@ -2597,7 +2917,7 @@ mod tests {
         assert_eq!(
             choose_listener(
                 &[listener(7, "[::1]:5173"), listener(7, "127.0.0.1:5173")],
-                None
+                PortClaim::Unknown
             ),
             Ok(Some(5173)),
         );
@@ -2605,7 +2925,7 @@ mod tests {
         assert_eq!(
             choose_listener(
                 &[listener(7, "[::1]:5173"), listener(7, "127.0.0.1:5173")],
-                Some(5173)
+                PortClaim::Forced(5173)
             ),
             Ok(Some(5173)),
         );
@@ -2615,11 +2935,11 @@ mod tests {
     /// and the refusal NAMES the address so the pane can say what it refused.
     #[test]
     fn a_wildcard_bind_is_refused_by_name() {
-        let err = choose_listener(&[listener(7, "*:3000")], Some(3000))
+        let err = choose_listener(&[listener(7, "*:3000")], PortClaim::Forced(3000))
             .expect_err("a non-loopback bind must be refused, not previewed");
         assert!(err.contains("*:3000"), "the refusal must name the offending address, got: {err}");
         // The same for an explicit all-interfaces bind, which is what `--host 0.0.0.0` produces.
-        let err = choose_listener(&[listener(7, "0.0.0.0:3000")], None).expect_err("0.0.0.0 is not loopback");
+        let err = choose_listener(&[listener(7, "0.0.0.0:3000")], PortClaim::Unknown).expect_err("0.0.0.0 is not loopback");
         assert!(err.contains("0.0.0.0:3000"), "got: {err}");
     }
 
@@ -2627,14 +2947,14 @@ mod tests {
     fn the_requested_port_wins_and_nothing_listening_is_not_an_error() {
         // A framework may open a second socket (HMR); the forced port is the one to frame.
         let ls = vec![listener(1, "127.0.0.1:5300"), listener(1, "127.0.0.1:5200")];
-        assert_eq!(choose_listener(&ls, Some(5200)), Ok(Some(5200)));
+        assert_eq!(choose_listener(&ls, PortClaim::Forced(5200)), Ok(Some(5200)));
         // With no request, the lowest loopback port is a deterministic answer.
-        assert_eq!(choose_listener(&ls, None), Ok(Some(5200)));
+        assert_eq!(choose_listener(&ls, PortClaim::Unknown), Ok(Some(5200)));
         // Still settling is NOT a failure.
-        assert_eq!(choose_listener(&[], Some(5200)), Ok(None));
+        assert_eq!(choose_listener(&[], PortClaim::Forced(5200)), Ok(None));
         // A loopback listener alongside a foreign one is fine: the foreign one is not what we frame.
         let mixed = vec![listener(1, "*:3000"), listener(1, "127.0.0.1:5200")];
-        assert_eq!(choose_listener(&mixed, Some(5200)), Ok(Some(5200)));
+        assert_eq!(choose_listener(&mixed, PortClaim::Forced(5200)), Ok(Some(5200)));
     }
 
     /// "We could not look" must never read as "nothing is listening" — a broken probe would
@@ -2642,9 +2962,9 @@ mod tests {
     #[test]
     fn an_unavailable_seam_reports_pending_not_a_refusal() {
         let procs = FixedProcessTable(None);
-        assert_eq!(discover_port(&procs, &FixedListenTable(None), 100, 5200), Ok(None));
+        assert_eq!(discover_port(&procs, &FixedListenTable(None), 100, PortClaim::Forced(5200)), Ok(None));
         let procs = FixedProcessTable(Some(vec![ProcRow { pid: 100, ppid: 1, rss_bytes: 0 }]));
-        assert_eq!(discover_port(&procs, &FixedListenTable(None), 100, 5200), Ok(None));
+        assert_eq!(discover_port(&procs, &FixedListenTable(None), 100, PortClaim::Forced(5200)), Ok(None));
     }
 
     // ---------------------------------------------------------------- §3 detection
@@ -2738,6 +3058,62 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A CONFIG THAT PINS A LITERAL PORT MAKES EVERY AGENT COLLIDE, AND IT DOES SO SILENTLY — so
+    /// it is refused at detection rather than honoured. This repo's own `[preview]` block carried
+    /// `--port 5173` for exactly as long as it took the founder to open one agent's preview card
+    /// and be served a DIFFERENT agent's app (bead `sparkle-ne230x`). Nothing anywhere reported a
+    /// collision: `--no-strictPort` made vite step quietly aside to 5174, so the only symptom was
+    /// the wrong UI behind the right URL.
+    ///
+    /// Both spellings of the flag AND the short one, because a refusal that catches two of the
+    /// three ways to write the same mistake is a refusal a config can walk around by accident.
+    #[test]
+    fn a_constant_port_in_an_override_is_refused_and_the_message_names_the_flag() {
+        for (args, flag) in [
+            (r#"["exec", "vite", "--port", "5173"]"#, "--port 5173"),
+            (r#"["exec", "vite", "--port=5173"]"#, "--port=5173"),
+            (r#"["exec", "vite", "-p", "5173"]"#, "-p 5173"),
+        ] {
+            let dir = tempdir("constant-port");
+            write(
+                &dir.join(".sparkle").join("config.toml"),
+                &format!("[preview]\ncommand = \"pnpm\"\nargs = {args}\npath = \"apps/desktop\"\n"),
+            );
+            let d = detect_preview_target(&dir, true).expect_err("a constant port must be refused");
+            assert_eq!(d.code(), "constant-port-pin");
+            let msg = d.message();
+            assert!(msg.contains(flag), "the decline must name the offending flag `{flag}`: {msg}");
+            assert!(
+                msg.contains(PORT_PLACEHOLDER),
+                "and must name the token to write instead, or it is a refusal nobody can act on: {msg}"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        // THE PAIR — without it, "refuses every override carrying a port flag" would pass too, and
+        // that would make the feature unusable rather than safe. The SAME flag carrying the token
+        // is the sanctioned fix and must be accepted AND forced.
+        let dir = tempdir("placeholder-port");
+        write(
+            &dir.join(".sparkle").join("config.toml"),
+            "[preview]\ncommand = \"pnpm\"\nargs = [\"exec\", \"vite\", \"--port\", \"{port}\"]\n",
+        );
+        let t = detect_preview_target(&dir, true).expect("`{port}` is the sanctioned spelling");
+        assert_eq!(build_spawn(&t, 52459).claim, PortClaim::Forced(52459));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // …and an override naming no port at all is untouched: this rule fires on a pin, not on the
+        // absence of one. Sparkle allocates, nothing is conveyed, and the claim stays honest.
+        let dir = tempdir("no-port-flag");
+        write(
+            &dir.join(".sparkle").join("config.toml"),
+            "[preview]\ncommand = \"bin/serve\"\nargs = [\"--dev\"]\n",
+        );
+        let t = detect_preview_target(&dir, true).expect("no port flag, nothing to refuse");
+        assert_eq!(build_spawn(&t, 52459).claim, PortClaim::Unknown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn the_master_switch_declines_before_any_detection_runs() {
         let dir = tempdir("disabled");
@@ -2773,20 +3149,33 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// SPARKLE ITSELF MUST DECLINE. Four `dev:*` scripts at the root and no plain `dev` — guessing
-    /// among them is worse than declining (§7 rule 4), and the decline has to NAME them or the user
-    /// cannot act on it. Run against the REAL repo, because a fixture that merely resembles it would
-    /// stop testing this the moment the real scripts changed.
+    /// SPARKLE ITSELF MUST DECLINE, ABSENT ITS OVERRIDE. Four `dev:*` scripts at the root and no
+    /// plain `dev` — guessing among them is worse than declining (§7 rule 4), and the decline has to
+    /// NAME them or the user cannot act on it. Driven by the REAL root manifest, copied in, because
+    /// a hand-written fixture that merely resembles it would stop testing this the moment the real
+    /// scripts changed.
     #[test]
-    fn sparkles_own_repo_declines_and_names_all_four_dev_scripts() {
+    fn sparkles_own_root_manifest_would_decline_and_name_all_four_dev_scripts() {
+        // THE REAL MANIFEST, IN A TREE WITH NO `[preview]` BLOCK. This used to point straight at
+        // the repo root, and went red the day this repo grew a `[preview]` override: step 1 of
+        // detection reads that block BEFORE enumeration, so the repo no longer declines at all —
+        // which is the POINT of the override, and is pinned by
+        // `two_concurrent_previews_of_this_repo_are_handed_different_ports_on_their_command_lines`.
+        // What THIS test protects is the reason the override has to exist, and that fact lives in
+        // the root manifest rather than in the config: four `dev:*` scripts, no plain `dev`, so
+        // enumeration cannot pick one and guessing would be worse than declining.
         let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..").canonicalize().unwrap();
         assert!(repo.join("pnpm-workspace.yaml").is_file(), "sanity: this is the Sparkle repo root");
-        let decline = detect_preview_target(&repo, true).expect_err("Sparkle must refuse to guess");
+        let dir = tempdir("sparkle-root-manifest");
+        std::fs::copy(repo.join("package.json"), dir.join("package.json"))
+            .expect("the real root manifest is what makes this test about Sparkle");
+        let decline = detect_preview_target(&dir, true).expect_err("Sparkle must refuse to guess");
         assert_eq!(decline.code(), "ambiguous");
         let msg = decline.message();
         for script in ["dev:web", "dev:orchestration", "dev:desktop", "dev:mobile"] {
             assert!(msg.contains(script), "the decline must name {script}: {msg}");
         }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ------------------------------------------------------- §5b Installing / deps-wait
@@ -3163,6 +3552,419 @@ mod tests {
         // An undriven framework gets nothing injected — a guessed flag is worse than none.
         assert!(Framework::Astro.port_args(5200).is_empty());
         assert!(Framework::Unknown.port_args(5200).is_empty());
+    }
+
+    // ------------------------------------------------- §4 the port we FORCED (bead sparkle-cdq5de)
+
+    /// A `[preview]` config-override target — exactly what this repo's own `.sparkle/config.toml`
+    /// produces, and what the founder was running when his agent announced port 52459 for a dev
+    /// server sitting on 5173.
+    fn override_target(port: Option<u16>) -> PreviewTarget {
+        PreviewTarget {
+            framework: Framework::Unknown,
+            program: "pnpm".into(),
+            args: vec!["exec".into(), "vite".into(), "--port".into(), "5173".into()],
+            needs_arg_separator: false,
+            path: "apps/desktop".into(),
+            source: "config",
+            port,
+        }
+    }
+
+    fn driven_target(framework: Framework) -> PreviewTarget {
+        PreviewTarget {
+            framework,
+            program: "pnpm".into(),
+            args: vec!["run".into(), "dev".into()],
+            needs_arg_separator: false,
+            path: String::new(),
+            source: "test",
+            port: None,
+        }
+    }
+
+    /// AN ALLOCATED PORT IS NOT A FORCED PORT, and the difference is the whole bug.
+    ///
+    /// `Framework::Unknown` — every `[preview]` override — gets no flags from `port_args`, so an
+    /// allocated ephemeral port reaches the child through NO channel: not a flag, not an env var,
+    /// nothing. Publishing it produced a URL for a socket nothing will ever bind. The verdict comes
+    /// back from the same call that builds the argv precisely so the two cannot disagree.
+    #[test]
+    fn an_unforced_target_forces_no_port_and_an_injected_one_does() {
+        // The measured production case: nothing injected, no pin.
+        let spawn = build_spawn(&override_target(None), 52459);
+        assert_eq!(spawn.claim, PortClaim::Unknown, "nothing told the child about 52459");
+        assert!(
+            !spawn.argv.iter().any(|a| a == "52459"),
+            "and it appears nowhere in the argv either: {:?}",
+            spawn.argv
+        );
+        // The project's own `--port 5173` is still passed through untouched — we inject nothing,
+        // we also strip nothing.
+        assert_eq!(spawn.argv, vec!["exec", "vite", "--port", "5173"]);
+
+        // A PIN IS THE USER'S OWN ASSERTION about where their server binds, and it is NOT a forced
+        // port: `target.port` is `Some` only in the `[preview]` override branch, which is always
+        // `Framework::Unknown`, so a pin ALWAYS arrives with nothing injected. It steers discovery
+        // and is never published as an address.
+        let pinned = build_spawn(&override_target(Some(5173)), 5173);
+        assert_eq!(pinned.claim, PortClaim::Preferred(5173), "a pin PREFERS, it does not force");
+        assert_eq!(pinned.claim.forced(), None, "so nothing may publish or refuse on it");
+        assert_eq!(pinned.claim.port(), Some(5173), "but discovery may still prefer it");
+
+        // THE CASE THAT MAKES THE DISTINCTION LOAD-BEARING: a pin whose port the argv never
+        // mentions. Trusting it would publish `http://127.0.0.1:3000` for a server binding 5173 —
+        // `sparkle-cdq5de` again, on the one path that could still reach it.
+        let unconveyed = build_spawn(&override_target(Some(3000)), 3000);
+        assert_eq!(unconveyed.claim, PortClaim::Preferred(3000));
+        assert_eq!(unconveyed.claim.forced(), None);
+        assert!(
+            !unconveyed.argv.iter().any(|a| a == "3000"),
+            "the pinned port reaches the child through no channel: {:?}",
+            unconveyed.argv
+        );
+        assert_eq!(
+            opened_reply("pv1".into(), unconveyed.claim.forced(), PreviewState::Starting).url,
+            "",
+            "so nothing may be announced for it before discovery runs"
+        );
+
+        // …and a pin for some OTHER number than the one being spawned with vouches for nothing at
+        // all, not even a preference.
+        let mismatched = build_spawn(&override_target(Some(5173)), 52459);
+        assert_eq!(mismatched.claim, PortClaim::Unknown);
+
+        // THE PAIR: a driven framework really does force it, and still reports it.
+        for framework in [Framework::Next, Framework::Vite] {
+            let spawn = build_spawn(&driven_target(framework), 5200);
+            assert_eq!(spawn.claim, PortClaim::Forced(5200), "{framework:?} injects --port");
+            assert_eq!(spawn.claim.forced(), Some(5200), "so it may be published and may refuse");
+            let at = spawn.argv.iter().position(|a| a == "--port").expect("the flag must be there");
+            assert_eq!(spawn.argv.get(at + 1).map(String::as_str), Some("5200"));
+        }
+
+        // `build_argv` is the same computation, so the two views can never drift.
+        assert_eq!(build_argv(&override_target(None), 52459), build_spawn(&override_target(None), 52459).argv);
+    }
+
+    /// THE `{port}` TOKEN IS THE ONLY CHANNEL AN OVERRIDE HAS. `Framework::Unknown` — every
+    /// `[preview]` override — gets no flags from `port_args`, so before this token existed a
+    /// hand-written command COULD NOT BE HANDED the port Sparkle allocated at all: the number was
+    /// allocated, published, and dropped on the floor by `build_spawn`.
+    ///
+    /// Substituted in `command` as well as in the args, and at EVERY occurrence, because a token
+    /// honoured in one position and silently ignored in another is worse than no token: the config
+    /// looks correct and one of the two ports is a fiction.
+    #[test]
+    fn the_port_token_is_substituted_in_the_command_in_every_arg_and_at_every_occurrence() {
+        let target = PreviewTarget {
+            framework: Framework::Unknown,
+            program: "serve-on-{port}".into(),
+            args: vec![
+                "--port".into(),
+                "{port}".into(),
+                "--inspect=127.0.0.1:{port}".into(),
+                "--label".into(),
+                "agent-{port}-of-{port}".into(),
+                "--mode".into(),
+                "preview".into(),
+            ],
+            needs_arg_separator: false,
+            path: "apps/desktop".into(),
+            source: "config",
+            port: None,
+        };
+        let spawn = build_spawn(&target, 52459);
+        assert_eq!(spawn.program, "serve-on-52459", "the token is live in `command`, not only in args");
+        assert_eq!(
+            spawn.argv,
+            vec![
+                "--port".to_string(),
+                "52459".to_string(),
+                "--inspect=127.0.0.1:52459".to_string(),
+                "--label".to_string(),
+                "agent-52459-of-52459".to_string(),
+                "--mode".to_string(),
+                "preview".to_string(),
+            ],
+            "every occurrence in every arg, including two in one arg and one inside an `=` value"
+        );
+        assert!(
+            !spawn.argv.iter().any(|a| a.contains(PORT_PLACEHOLDER)),
+            "no token may survive into the argv: {:?}",
+            spawn.argv
+        );
+    }
+
+    /// THE PROMOTION IS THE WHOLE FEATURE. An override carrying the token has PROVABLY been handed
+    /// the port — it is on the command line — so it is `Forced`, which is the one claim that may
+    /// become a published address. A bare `[preview].port` pin is still only `Preferred`: the user
+    /// asserting where their server binds is not Sparkle knowing what it told the child.
+    #[test]
+    fn an_override_carrying_the_token_forces_the_port_where_a_bare_pin_only_prefers_it() {
+        let mut tokened = override_target(None);
+        tokened.args = vec!["exec".into(), "vite".into(), "--port".into(), "{port}".into()];
+        let spawn = build_spawn(&tokened, 52459);
+        assert_eq!(spawn.claim, PortClaim::Forced(52459), "the token PROVES the child was told");
+        assert_eq!(spawn.claim.forced(), Some(52459));
+        assert_eq!(
+            opened_reply("pv1".into(), spawn.claim.forced(), PreviewState::Starting).url,
+            "http://127.0.0.1:52459",
+            "which is exactly what makes the address publishable before a socket exists"
+        );
+
+        // THE PAIR: the same shape minus the token is the old, weaker claim, and must stay weak.
+        let bare = build_spawn(&override_target(Some(5173)), 5173);
+        assert_eq!(bare.claim, PortClaim::Preferred(5173), "a pin PREFERS, it does not force");
+        assert_eq!(bare.claim.forced(), None);
+
+        // A pin ALONGSIDE the token is still Forced: the token is proof, a pin is only an
+        // assertion, and proof outranks it.
+        let mut both = override_target(Some(4321));
+        both.args = vec!["--port".into(), "{port}".into()];
+        assert_eq!(build_spawn(&both, 4321).claim, PortClaim::Forced(4321));
+    }
+
+    /// REQUIREMENT 4, ASSERTED ON THE SIDE EFFECT: two agents previewing at once are handed
+    /// DIFFERENT ports ON THEIR COMMAND LINES — not merely by `allocate_port`, which is where the
+    /// founder's bug hid. The allocator was already correct and already returned two different
+    /// numbers; `build_spawn` then threw both away and every child ran the config's hardcoded
+    /// `--port 5173`. A test that stops at `allocate_port` is GREEN against that bug.
+    ///
+    /// Runs against THIS REPO'S OWN SHIPPED `.sparkle/config.toml`, so the config and the code are
+    /// pinned by one test. A future edit that drops the token from that file fails here.
+    #[test]
+    fn two_concurrent_previews_of_this_repo_are_handed_different_ports_on_their_command_lines() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..").canonicalize().unwrap();
+        assert!(repo.join("pnpm-workspace.yaml").is_file(), "sanity: this is the Sparkle repo root");
+        let target = detect_preview_target(&repo, true)
+            .expect("this repo's own [preview] override must be previewable");
+        assert_eq!(target.source, "config");
+
+        // Two REAL allocations, with agent A's port held open across agent B's — otherwise this
+        // asserts nothing about concurrency, only that the kernel happens to rotate.
+        let a = allocate_port().expect("agent A gets a port");
+        let hold = TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), a))
+            .expect("hold agent A's port the way its dev server would");
+        let b = allocate_port().expect("agent B gets a port");
+        assert_ne!(a, b, "the kernel must not offer a second agent a port that is already bound");
+
+        let sa = build_spawn(&target, a);
+        let sb = build_spawn(&target, b);
+        drop(hold);
+
+        assert_eq!(sa.claim, PortClaim::Forced(a), "agent A's port reached agent A's command line");
+        assert_eq!(sb.claim, PortClaim::Forced(b), "agent B's port reached agent B's command line");
+        assert!(sa.argv.iter().any(|x| x == &a.to_string()), "A's argv names A's port: {:?}", sa.argv);
+        assert!(sb.argv.iter().any(|x| x == &b.to_string()), "B's argv names B's port: {:?}", sb.argv);
+        assert_ne!(sa.argv, sb.argv, "two agents must not be spawned with the SAME argv");
+        for (argv, other) in [(&sa.argv, b), (&sb.argv, a)] {
+            assert!(
+                !argv.iter().any(|x| x == &other.to_string()),
+                "and neither may carry the other agent's port: {argv:?}"
+            );
+        }
+
+        // THE CONSTANT THAT CAUSED THE BUG, named explicitly. `5173` on both command lines is the
+        // measured production state this test exists to keep from coming back.
+        for argv in [&sa.argv, &sb.argv] {
+            assert!(
+                !argv.iter().any(|x| x == "5173"),
+                "no shared constant port may survive into a spawn: {argv:?}"
+            );
+        }
+
+        // A collision must now FAIL rather than drift. `--no-strictPort` is what made the founder's
+        // collision invisible: vite stepped aside to 5174 and served the wrong app behind the right
+        // URL. With a per-agent port there is nothing to step aside FOR.
+        assert!(
+            sa.argv.iter().any(|x| x == "--strictPort"),
+            "the shipped config must fail loudly on a taken port: {:?}",
+            sa.argv
+        );
+        assert!(
+            !sa.argv.iter().any(|x| x == "--no-strictPort"),
+            "the silent-drift flag must be gone: {:?}",
+            sa.argv
+        );
+    }
+
+    /// AN UNVERIFIED PIN MAY PREFER, BUT IT MAY NOT REFUSE ON ITS OWN ACCOUNT. THE PAIR IS THE POINT.
+    ///
+    /// Note the qualifier, which the last two rows below are what force: the no-v4-candidate
+    /// refusal at the end of `choose_listener` applies at EVERY claim level, so a pin can still end
+    /// in a terminal kill. What is restricted here is the CLAIM-DRIVEN refusal.
+    ///
+    /// `choose_listener`'s v6-only branch returns `Err`, and `supervise` treats that as terminal:
+    /// it kills the child and marks the preview `Failed`. That is correct for a port SPARKLE PUT ON
+    /// THE COMMAND LINE — the app really is on it, and a v6-only bind there is unreachable. It is
+    /// wrong for a `[preview].port` pin, which reaches the child through no channel at all: an
+    /// unrelated helper on `[::1]:<pin>` would then kill a dev server that is healthy on v4.
+    ///
+    /// Both cases below see the IDENTICAL socket list. Only the provenance differs, so a gate keyed
+    /// on anything else — or no gate, which is what this replaced — cannot pass both rows.
+    #[test]
+    fn only_a_forced_port_may_refuse_on_its_own_account_over_a_v6_only_bind() {
+        // The app is healthy on v4:3000; something unrelated holds [::1]:5173.
+        let tree = [listener(7, "[::1]:5173"), listener(7, "127.0.0.1:3000")];
+
+        // FORCED: we wrote `--port 5173` ourselves, so 5173 IS the app and v6-only is the failure.
+        let err = choose_listener(&tree, PortClaim::Forced(5173))
+            .expect_err("a forced port bound v6-only must refuse");
+        assert!(err.contains("[::1]:5173"), "and must name the address; got: {err}");
+
+        // PREFERRED: the user asserted 5173 and we told the child nothing. Refusing here would kill
+        // the working server on 3000 over a socket that may not be the app at all.
+        assert_eq!(
+            choose_listener(&tree, PortClaim::Preferred(5173)),
+            Ok(Some(3000)),
+            "an unverified pin must fall through to the v4 socket, never refuse"
+        );
+
+        // A pin that IS listening on v4 still wins — preferring is exactly what it may do.
+        let bound = [listener(7, "127.0.0.1:5173"), listener(7, "127.0.0.1:3000")];
+        assert_eq!(choose_listener(&bound, PortClaim::Preferred(5173)), Ok(Some(5173)));
+
+        // THE RESIDUAL KILL PATH, ON THE RECORD RATHER THAN IMPLIED. The gate above removes the
+        // CLAIM-DRIVEN refusal; it does not make a non-forced claim harmless. With NO v4 candidate
+        // at all, the tail refusal fires at every level — so a pinned override whose child has not
+        // bound yet, beside a helper on a bare `localhost` (Node >= 17 resolves that to `::1`),
+        // still dies, over a socket that is not even the pinned port. That is bead `sparkle-dnvaq`'s
+        // deliberate coin flip and is unchanged here; the docblocks say so, and this row is what
+        // stops the next reader believing "may prefer, never refuse" is absolute.
+        let no_v4 = [listener(7, "[::1]:9230")];
+        assert!(
+            choose_listener(&no_v4, PortClaim::Preferred(5173)).is_err(),
+            "with nothing on v4, even an unverified pin ends in the terminal refusal"
+        );
+        assert!(
+            choose_listener(&no_v4, PortClaim::Unknown).is_err(),
+            "and so does no claim at all — the tail refusal is not claim-driven"
+        );
+    }
+
+    /// THE DOCS AND THE TYPE MUST NOT DRIFT. `Spawn` carried two parallel `Option<u16>` fields
+    /// before `PortClaim` replaced them, and deleting them left SEVEN docblocks describing the old
+    /// model — two of which asserted the opposite of the code (roborev 67855). A comment naming a
+    /// field that no longer exists is not a stale nicety here: the whole bead is about a comment
+    /// that claimed a port had been forced when it had not.
+    ///
+    /// SCANS THE WHOLE FILE, and the `concat!` is what lets it. A first draft truncated the input at
+    /// this test's own definition so the needles would not match themselves — which left the last
+    /// ~550 lines, including three sibling tests and the entire registry block, structurally
+    /// unscanned (roborev 67878). Splitting each needle across a `concat!` makes it absent from the
+    /// source at rest, so nothing has to be excluded and there is no blind half to reason about.
+    #[test]
+    fn no_comment_still_describes_the_deleted_two_field_spawn() {
+        let whole = include_str!("preview.rs");
+        assert!(whole.len() > 100_000, "the scan must not be running against a truncated file");
+        let dead = [
+            concat!("Spawn", "::forced_port"),
+            concat!("Spawn", "::preferred_port"),
+            concat!("spawn", ".preferred_port"),
+            // The unqualified over-claim this file was corrected for. It read as a guarantee the
+            // code does not give: the no-v4-candidate refusal kills at every claim level.
+            concat!("MAY PREFER, BUT IT ", "MAY NOT KILL"),
+            // The pre-`{port}` claim that an override could never be handed a port. Writing the
+            // token IS putting one on the command line, so a comment still saying this describes a
+            // hole that has been closed (bead `sparkle-ne230x`).
+            concat!("a pin arrives with ", "nothing injected, by construction"),
+            concat!("config override `forced` is ", "`None`: the allocated"),
+            // The same over-claim in its accessor-docblock spelling. The needle list is the
+            // mechanism meant to stop this recurring, and it is a list of LITERAL strings — so a
+            // differently-worded absolute claim passes by construction. That is exactly how the
+            // sweep that retired the test name missed `PortClaim::forced()`'s own docblock.
+            concat!("only one allowed to trigger a terminal ", "refusal"),
+        ];
+        for needle in dead {
+            assert!(
+                !whole.contains(needle),
+                "`{needle}` is retired — the comment carrying it must be rewritten, not left behind"
+            );
+        }
+    }
+
+    /// WHAT THE AGENT IS ACTUALLY TOLD. `open_reserved` needs an `AppHandle` and cannot be called
+    /// from a test at all, so this pins the pure decision it delegates to — the one that decides
+    /// whether a URL is announced before anything has bound a socket.
+    #[test]
+    fn opened_reply_names_an_address_only_for_a_forced_port() {
+        let unforced = opened_reply("pv1".into(), None, PreviewState::Starting);
+        assert_eq!(unforced.url, "", "an unforced open must name no address at all");
+        assert_eq!(unforced.port, 0);
+        assert_eq!(unforced.state, PreviewState::Starting);
+        // Specifically NOT a well-formed URL for port 0: `controlListener.handlePreview`'s guard and
+        // `isLoopbackPreviewUrl` would both wave `http://127.0.0.1:0` straight through.
+        assert!(!unforced.url.contains("127.0.0.1"));
+
+        let forced = opened_reply("pv1".into(), Some(5200), PreviewState::Starting);
+        assert_eq!(forced.url, "http://127.0.0.1:5200");
+        assert_eq!(forced.port, 5200);
+    }
+
+    /// THE WIRING, because the three places the fiction escaped from are all inside a function no
+    /// test can call: the `Starting` transition (which is what the pane and the card render), the
+    /// `requested` argument handed to discovery (which decides `choose_listener`'s fast path), and
+    /// the `PreviewOpened` reply (which is what the agent prints).
+    ///
+    /// Source-level, and scoped to `open_reserved`'s OWN body, for exactly the reasons the
+    /// `cancel_if_stopped_during_spawn` guard above documents: an unscoped scan matches this test's
+    /// own text, and a whole-file scan pins nothing to the function. Two of the three sites are also
+    /// held by the compiler now (`supervise` and `discover_port` take `Option<u16>`, so the bare
+    /// allocated `u16` no longer type-checks there) — this is what holds the third, `transition`,
+    /// whose `Some(port)` would compile perfectly.
+    #[test]
+    fn open_reserved_publishes_only_the_forced_port() {
+        let whole = include_str!("preview.rs");
+        let test_mod = whole
+            .find("#[cfg(test)]\nmod tests {")
+            .expect("preview.rs no longer carries its `#[cfg(test)] mod tests` marker");
+        let prod = &whole[..test_mod];
+        assert!(prod.len() > 1000, "the production half must not have been truncated to nothing");
+        let fn_start = prod.find("fn open_reserved(").expect("open_reserved must still exist");
+        let after_sig = &prod[fn_start..];
+        let fn_end = after_sig.find("\n}\n").expect("open_reserved must still have a top-level close");
+        let body = &after_sig[..fn_end];
+        assert!(body.len() > 500, "open_reserved's body must not have been truncated to nothing");
+
+        assert!(
+            body.contains("let spawn = build_spawn(&target, port);"),
+            "the argv and the forced-port verdict must be built together"
+        );
+        assert!(
+            body.contains("let forced = claim.forced();"),
+            "and the PUBLISHABLE claim must be the value the address sites read"
+        );
+        assert!(
+            body.contains("let claim = spawn.claim;"),
+            "with the full claim kept separate for discovery"
+        );
+        assert!(
+            body.contains("requested_port: claim.port(),"),
+            "the registry records what was ASKED FOR, never the allocated port"
+        );
+        // THE THREE PUBLISH SITES, each named explicitly. `Some(port)` at any of them is the bug.
+        assert!(
+            body.contains("manager.transition(&app, &id, PreviewState::Starting, forced, None);"),
+            "the Starting transition must publish the FORCED port, not the allocated one"
+        );
+        assert!(
+            body.contains("pid, claim, app_data)"),
+            "supervise/discover_port gets the CLAIM, never the port we merely allocated"
+        );
+        assert!(
+            !body.contains("pid, port, app_data)"),
+            "and never the allocated port itself"
+        );
+        assert!(
+            body.contains("Ok(opened_reply(id, forced, PreviewState::Starting))"),
+            "the agent-facing reply must go through opened_reply"
+        );
+        // And the allocated port must not be published anywhere by name.
+        assert!(
+            !body.contains("Some(port), None)") && !body.contains("preview_url_for(port)"),
+            "no publish site may name the allocated `port` again: {body}"
+        );
     }
 
     // ---------------------------------------------------------------- §5 registry + sweep

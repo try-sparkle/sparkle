@@ -14,6 +14,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { safeUnlisten } from "./safeUnlisten";
 import {
+  isSurfacingState,
   usePreviewStore,
   type PreviewCapability,
   type PreviewState,
@@ -217,6 +218,139 @@ export async function fetchPreviewStatus(agentId: string): Promise<PreviewStatus
   const status = await invoke<PreviewStatus | null>("preview_status", { agentId });
   if (status) applyPreviewStatus(status);
   return status ?? null;
+}
+
+/**
+ * WHY A CARD MAY NOT ACT ON THE ADDRESS IT IS SHOWING.
+ *
+ * Every value here is a way of saying "this address is not provably this agent's ANY MORE", and
+ * they are separate constants rather than one boolean because each one reads as a different
+ * sentence to the person who just clicked. A single `false` would force the card to say something
+ * vague, and vague is what the incident was made of.
+ *
+ *  • `gone`        — this agent has no preview at all now. Its port is free for the next allocation.
+ *  • `not-live`    — it has one, but it is not serving (crashed, stopped, still compiling) or has
+ *                    no address. A dead process leaves its port behind, and that is what gets reused.
+ *  • `moved`       — it is serving, at a DIFFERENT address from the one the card holds.
+ *  • `wrong-agent` — the status came back naming someone else. Unreachable if the layer below is
+ *                    correct; checked anyway, because it is the literal shape of the incident.
+ *  • `unsafe`      — the live address is not loopback http. {@link isLoopbackPreviewUrl}'s verdict,
+ *                    re-asked against the FRESH url rather than the one the card was born with.
+ *  • `unreadable`  — the live read itself failed. FAIL CLOSED: "we could not check" is not "it is
+ *                    fine", and an unreachable bridge is exactly when a held address is least
+ *                    trustworthy.
+ */
+export type PreviewOpenRefusal =
+  | "gone"
+  | "not-live"
+  | "moved"
+  | "wrong-agent"
+  | "unsafe"
+  | "unreadable";
+
+/** A verified address, safe to hand to the browser. `url` is the LIVE one, which by construction
+ *  equals what the card was holding — a decision that let them differ would be a silent redirect,
+ *  which is the same class of surprise as a wrong app. */
+export interface PreviewOpenAllowed {
+  ok: true;
+  url: string;
+  port: number | null;
+}
+
+/** A refusal, carrying both addresses so a caller can log (or show) what disagreed. */
+export interface PreviewOpenRefused {
+  ok: false;
+  reason: PreviewOpenRefusal;
+  /** What the card was showing when it was clicked. */
+  heldUrl: string;
+  /** What the live status says now — `null` when there is nothing, or nothing readable. */
+  liveUrl: string | null;
+}
+
+export type PreviewOpenDecision = PreviewOpenAllowed | PreviewOpenRefused;
+
+/**
+ * Is the address this card is showing still the one THIS agent owns?
+ *
+ * ══ THE INCIDENT THIS ANSWERS ═══════════════════════════════════════════════════════════════════
+ * A preview card was clicked and a DIFFERENT agent's app answered. Exactly one dev server existed
+ * in the whole allocation range at that moment — on the port the card named, owned by another
+ * agent's worktree — and minutes later it was gone too. So the card held an address whose server
+ * had died and whose port had been recycled. Nothing on screen could contradict it: the url looked
+ * right and the page rendered.
+ *
+ * ══ WHY A DISAGREEMENT REFUSES RATHER THAN SILENTLY FOLLOWING THE FRESH VALUE ═══════════════════
+ * Following it would be the tidier code and the worse product. The reader clicked a card that named
+ * a specific address; opening a different one is a second destination from one gesture, and it
+ * hides the very fact that the card had gone stale — which is the fact worth knowing, because it
+ * means everything else on that card (the screenshot above all) is describing a page that no longer
+ * exists. The caller re-reads the live status to make this call, so the store is corrected on the
+ * way through and the NEXT click opens the real thing. The refusal costs one click and buys the
+ * reader the truth.
+ *
+ * PURE, and separate from the read that feeds it, so every branch is testable without a bridge.
+ *
+ * @param agentId the agent whose card was clicked — the ownership question is asked ABOUT this id.
+ * @param held    what the card is showing: the url it renders, and the port it carries.
+ * @param live    that agent's status as just read from the supervisor, or `null` for "none".
+ */
+export function decidePreviewOpen(
+  agentId: string,
+  held: { url: string; port: number | null },
+  live: PreviewStatus | null,
+): PreviewOpenDecision {
+  if (!live) return { ok: false, reason: "gone", heldUrl: held.url, liveUrl: null };
+  // BEFORE anything is read off it. A status naming another agent is not weaker evidence about this
+  // agent — it is evidence about someone else, and treating it as this agent's is the whole bug.
+  if (live.agentId !== agentId) {
+    return { ok: false, reason: "wrong-agent", heldUrl: held.url, liveUrl: live.url ?? null };
+  }
+  const liveUrl = live.url ?? null;
+  // The SAME two gates `livePreviewCards` applies at render time, re-asked at click time against
+  // the fresh value. Re-asking is the point: a card is rendered once and clicked later, and every
+  // one of these can change in between.
+  if (!isSurfacingState(live.state) || !liveUrl) {
+    return { ok: false, reason: "not-live", heldUrl: held.url, liveUrl };
+  }
+  if (!isLoopbackPreviewUrl(liveUrl)) {
+    return { ok: false, reason: "unsafe", heldUrl: held.url, liveUrl };
+  }
+  // TWO COMPARISONS, AND THE PORT ONE IS NOT REDUNDANT. The url already embeds the port, so a
+  // moved server fails the string test — but the port is also carried on the card as a fact of its
+  // own, and a card whose port and url disagree is not something to act on either. Skipped only
+  // when the card holds no port at all, which is a fixture shape rather than a wire one.
+  if (liveUrl !== held.url || (held.port !== null && live.port !== held.port)) {
+    return { ok: false, reason: "moved", heldUrl: held.url, liveUrl };
+  }
+  return { ok: true, url: liveUrl, port: live.port ?? null };
+}
+
+/**
+ * Re-derive, AT CLICK TIME, whether this card's address is still its own agent's — and fold what
+ * was read back into the store on the way.
+ *
+ * THE READ IS THE POINT. A port stamped into a card when the preview opened is a claim about a
+ * moment that has passed: servers die, ports are recycled, and the card has no way to notice. This
+ * asks the supervisor for THIS agent's status at the instant of the click and decides against that.
+ *
+ * `fetchPreviewStatus` applies what it read, so a refusal is self-correcting: the card re-renders
+ * onto whatever is actually true, and a second click opens it. That is why the refusal copy can
+ * honestly say "click again" rather than leaving the reader stuck.
+ */
+export async function resolvePreviewOpenTarget(
+  agentId: string,
+  held: { url: string; port: number | null },
+): Promise<PreviewOpenDecision> {
+  let live: PreviewStatus | null;
+  try {
+    live = await fetchPreviewStatus(agentId);
+  } catch (e) {
+    // FAIL CLOSED — see `unreadable`. Falling back to the held url here would undo every other
+    // branch above: one unreachable bridge and the stale-address path is back, silently.
+    console.debug("preview open: could not read live status", agentId, e);
+    return { ok: false, reason: "unreadable", heldUrl: held.url, liveUrl: null };
+  }
+  return decidePreviewOpen(agentId, held, live);
 }
 
 /** Every live preview — the reconciliation read, for a window that mounted after the servers did. */
