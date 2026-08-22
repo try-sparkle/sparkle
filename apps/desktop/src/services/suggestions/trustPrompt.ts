@@ -17,7 +17,7 @@
 // The same rule `planPrompt` documents and for the same reason: "1." labels identical menus across
 // completely different questions. The ordinal is READ OFF the parsed picker AFTER the question has
 // been recognised, and the option is chosen BY LABEL. A build that reorders the two rows still
-// answers correctly; a build that renames the affirmative past {@link TRUST_YES_LABEL} answers
+// answers correctly; a build that renames the affirmative past {@link TRUST_SAFE_YES_LABEL} answers
 // nothing at all, which is the safe direction.
 //
 // ══ THE SAFETY SCOPE IS THE WHOLE POINT ════════════════════════════════════════════════════════
@@ -59,27 +59,55 @@ import { normalizePromptText } from "./planPrompt";
 const TRUST_QUESTION = /\bquick\s+safety\s+check\b/i;
 const TRUST_CORROBORATION = /\b(?:trust|trusted)\b/i;
 
-/** "Yes, I trust this folder" — the affirmative, matched BY LABEL.
+/** An affirmative row of ANY breadth — used only to RECOGNISE the dialog, never to choose a row.
  *
- *  Deliberately narrow: it must be a "yes" that says TRUST. The near-miss it must not press is a
- *  remember-my-answer variant ("Yes, and trust every folder in this directory"), which hands
- *  Claude Code a standing allowlist that outlives this one worktree — a stickier decision than the
- *  one being answered, exactly as `planPrompt.PLAN_STICKY_LABEL` records for its own dialog. */
-const TRUST_YES_LABEL = /^\s*yes\b[^.]*\btrust\b/i;
+ *  Deliberately loose, and that is the point: {@link isFolderTrustDialog} must recognise the dialog
+ *  even when its only affirmative is one we refuse to press, so `maybeAutoTrust` can CLAIM the
+ *  screen and decline it. If recognition were as strict as {@link TRUST_SAFE_YES_LABEL}, a
+ *  widening-only dialog would fall through to the general answerers — and this screen already
+ *  satisfies `approvalClassifier.looksLikePermission` and classifies as `bash` off the word
+ *  "execute", so a user with `bash = "always"` would have it auto-pressed for ANY folder. Claiming
+ *  is what prevents that.
+ *
+ *  Loose, but NOT a bare `^yes`: it must still be a yes that says TRUST. An ordinary bash prompt's
+ *  rows are a plain "Yes" and "Yes, and don't ask again for rm commands", so a bare `^yes` matches
+ *  them — and a bash prompt drawn under a still-visible trust question would then be claimed as this
+ *  dialog and taken away from `maybeAutoApprove`, silently breaking `bash = "always"`. That is a
+ *  real regression a test in this suite catches; keep the trust clause. */
+const TRUST_AFFIRMATIVE_ROW = /^\s*yes\b[^.]*\btrust\b/i;
+
+/** The ONE affirmative that is safe to press: the plain, single-folder answer, whole-label.
+ *
+ *  ── AN ALLOWLIST, NOT A BLACKLIST — THE POLARITY IS THE SAFETY PROPERTY ──────────────────────
+ *  This was a blacklist: "a yes that says trust", minus {@link TRUST_STICKY_LABEL}'s enumerated
+ *  widening phrasings. That is the exact shape that already failed once — the enumeration was
+ *  complete against the wordings someone thought of, and "…and its subdirectories" was not one of
+ *  them, so it passed and would have been auto-pressed. Enumerating harder does not fix a
+ *  blacklist; every unlisted future wording ("…and everything under it", "…and remember this
+ *  choice", "…trust all its contents") is another silent grant.
+ *
+ *  The asymmetry decides the polarity. An over-strict affirmative merely SURFACES the dialog to the
+ *  human — the module's documented fail-closed direction, and a rename costs one prompt. An
+ *  under-strict blacklist SILENTLY grants a standing or recursive trust. So the whole label must be
+ *  the plain answer: any extra clause declines by construction rather than by enumeration.
+ *
+ *  {@link TRUST_STICKY_LABEL} is kept as a secondary belt-and-braces check, not as the guard. */
+const TRUST_SAFE_YES_LABEL =
+  /^\s*yes[,!]?\s+(?:i\s+)?trust\s+(?:this|the)\s+(?:folder|directory|project)\s*[.!]?\s*$/i;
 
 /** Any option that widens the answer past THIS folder — "…every folder", "…all folders", "…this
- *  directory and its subdirectories", "…don't ask again". Excluded from {@link TRUST_YES_LABEL}'s
- *  match, so the widening option is never the one pressed and the prompt is surfaced instead.
+ *  directory and its subdirectories", "…don't ask again". A SECONDARY check on top of
+ *  {@link TRUST_SAFE_YES_LABEL}'s allowlist — belt-and-braces, no longer the guard itself.
  *
  *  ── THE ALTERNATION MUST COVER EVERY PHRASING THIS COMMENT ENUMERATES ────────────────────────
  *  It did not. The subdirectory-tree wording above was listed as excluded while matching none of
  *  the branches, so an option reading "Yes, I trust this directory and its subdirectories" passed
- *  {@link TRUST_YES_LABEL}, escaped this guard, and would have been auto-pressed — granting a
+ *  the old blacklist affirmative, escaped this guard, and would have been auto-pressed — granting a
  *  RECURSIVE trust for a whole tree in answer to a question about one folder. A doc comment is not
  *  a matcher; every phrasing named here has a branch below, and `trustPrompt.test.ts` asserts each
  *  one is refused. Add the branch and the case together when a new wording appears. */
 const TRUST_STICKY_LABEL =
-  /\b(?:every|all)\s+folders?\b|\bdon'?t\s+ask\s+again\b|\balways\s+trust\b|\bsub-?director(?:y|ies)\b|\brecursive(?:ly)?\b|\bparent\s+director(?:y|ies)\b|\ball\s+(?:its\s+)?(?:sub)?directories\b/i;
+  /\b(?:every|all)\s+folders?\b|\bdon['’]?t\s+ask\s+again\b|\balways\s+trust\b|\bsub-?director(?:y|ies)\b|\brecursive(?:ly)?\b|\bparent\s+director(?:y|ies)\b|\ball\s+(?:its\s+)?(?:sub)?directories\b/i;
 
 /** The refusal — "No, exit". Only used to corroborate that a two-row trust menu is on screen. */
 const TRUST_NO_LABEL = /^\s*no\b/i;
@@ -109,7 +137,7 @@ export function isFolderTrustDialog(scrollback: string): boolean {
   // A trust menu is an affirmative and a way out. Requiring both is what stops an ordinary picker
   // drawn while the trust question is still inside `pickerQuestionBlock`'s ten-line borderless
   // fallback window from being read as this dialog.
-  return opts.some((o) => TRUST_YES_LABEL.test(o.label)) && opts.some((o) => TRUST_NO_LABEL.test(o.label));
+  return opts.some((o) => TRUST_AFFIRMATIVE_ROW.test(o.label)) && opts.some((o) => TRUST_NO_LABEL.test(o.label));
 }
 
 /**
@@ -126,7 +154,7 @@ export function detectTrustPrompt(
 ): { trustOption: string; workspacePath: string | null } | null {
   if (!isFolderTrustDialog(scrollback)) return null;
   const opts = parsePickerOptions(scrollback);
-  const yes = opts.find((o) => TRUST_YES_LABEL.test(o.label) && !TRUST_STICKY_LABEL.test(o.label));
+  const yes = opts.find((o) => TRUST_SAFE_YES_LABEL.test(o.label) && !TRUST_STICKY_LABEL.test(o.label));
   if (!yes) return null; // recognised the question, but the only affirmative widens past this folder
   return { trustOption: `${yes.n}\n`, workspacePath: workspacePathFromDialog(scrollback) };
 }

@@ -61,14 +61,19 @@ describe("detectTrustPrompt", () => {
     expect(detectTrustPrompt(FOLDER_TRUST_PROMPT_STICKY)).toBeNull();
   });
 
-  // EVERY widening phrasing `TRUST_STICKY_LABEL`'s doc comment enumerates must actually be refused.
+  // ANY affirmative carrying an extra clause must be refused — enumerated wordings AND unlisted ones.
   //
-  // The regression this pins shipped: the comment listed "…this directory and its subdirectories"
-  // as excluded while the alternation matched none of it, so that option passed the affirmative
-  // test, escaped the guard, and would have been auto-pressed — answering a question about ONE
-  // folder with a RECURSIVE grant over a whole tree. One case per phrasing, so a future edit to the
-  // pattern cannot quietly drop a branch; the affirmative below proves the pattern is not simply
-  // refusing everything.
+  // Two regressions are pinned here. The first shipped: the sticky-label comment listed "…this
+  // directory and its subdirectories" as excluded while the alternation matched none of it, so that
+  // option passed and would have been auto-pressed — a RECURSIVE grant in answer to a question about
+  // ONE folder. The second was structural: the guard was a BLACKLIST, so the last two cases below —
+  // deliberately phrasings no pattern enumerates — would have sailed through it. They pass now only
+  // because the affirmative is an allowlist that requires the whole label to be the plain answer.
+  //
+  // EVERY case must carry "trust", or it is vacuous: a label with no "trust" fails the affirmative
+  // match outright and never reaches the guard at all, so it would stay green with the guard deleted
+  // (the exact defect this file was written to prevent — a test that cannot fail proves nothing).
+  // The paired positive case below proves the pattern is not simply refusing everything.
   it.each([
     ["subdirectory tree", "Yes, I trust this directory and its subdirectories"],
     ["subdirectories, hyphenated", "Yes, trust this folder and its sub-directories"],
@@ -77,8 +82,11 @@ describe("detectTrustPrompt", () => {
     ["all directories", "Yes, and trust all directories below it"],
     ["every folder", "Yes, and trust every folder in this directory"],
     ["all folders", "Yes, trust all folders here"],
-    ["don't ask again", "Yes, and don't ask again"],
-    ["always trust", "Yes, always trust this"],
+    ["don't ask again", "Yes, I trust this folder and don't ask again"],
+    ["don't ask again, curly apostrophe", "Yes, I trust this folder and don’t ask again"],
+    ["always trust", "Yes, always trust this folder"],
+    ["unlisted widening clause", "Yes, I trust this folder and everything under it"],
+    ["remember-this-choice clause", "Yes, I trust this folder and remember this choice"],
   ])("refuses a %s affirmative", (_name, label) => {
     const screen = [
       "Quick safety check: Is this a project you created or one you trust?",
