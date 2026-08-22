@@ -1604,6 +1604,35 @@ function handleRename(req: ControlRequest): Record<string, unknown> {
   }
   const name = req.payload.name;
   if (typeof name !== "string" || !name.trim()) return { ok: false, error: "name is required" };
+  // THE APP-OWNED AGENT has no projectStore row (bead sparkle-t41yw0), so `findAgent` can never
+  // resolve it — the same short-circuit `set_agent_activity` / `set_agent_goal` / `set_agent_goal_met`
+  // each take a few lines below. Rename is the one op that never got one, and unlike those three it
+  // has NOWHERE to write: its display name is a constant every read site resolves independently
+  // (`selfIdentity`, the synthesized roster row, the peer address book), so there is no stored name
+  // to prefer. So this refuses rather than storing — but it refuses HONESTLY.
+  //
+  // WHY THAT MATTERS MORE HERE THAN ANYWHERE ELSE. Falling through to `findAgent` produced
+  // `unknown agent __sparkle_self__`, which is wrong twice over. The agent is not unknown — the
+  // ownership check two lines up just resolved it, and `get_state` returns it as `self`. And the
+  // string spells the raw internal id, which names nothing a human has ever seen. An agent reading
+  // "unknown agent <id>" concludes it addressed the WRONG id and retries with guessed ones; the
+  // app-owned improvement agent is instructed to name itself on its first turn, so it hit this
+  // every single pass, forever, with no wording of the call that could have worked.
+  //
+  // The remedy has to be safe under the SAME conditions that triggered the refusal (AGENTS.md: a
+  // remedy is an instruction the caller WILL follow). `set_agent_activity` is that: it is the other
+  // half of the same self-report, it is what the human actually reads off this row, and it has the
+  // short-circuit this op lacks — so it works for exactly the caller being turned away here.
+  if (isSparkleAgentId(targetId)) {
+    return {
+      ok: false,
+      code: "name_app_owned",
+      error:
+        `the app-owned agent's display name is fixed at "${SPARKLE_AGENT_DISPLAY_NAME}" and cannot be changed — ` +
+        "it is resolved from a constant, not a roster row, so there is nothing to rename. You are already " +
+        "named and addressable; describe this pass with set_agent_activity instead.",
+    };
+  }
   const found = findAgent(targetId);
   if (!found) return { ok: false, error: `unknown agent ${targetId}` };
   // Model-authored text: decode HTML entities before storing. An agent that means "A & B" routinely

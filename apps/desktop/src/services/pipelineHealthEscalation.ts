@@ -269,7 +269,17 @@ function passesGate(ev: EscalationEvent, now: number): boolean {
     // Consume the flag either way: the outstanding alarm is over, announced or not.
     return !unannouncedAlarm.delete(ev.componentId);
   }
-  if (ev.severity === "blocking") return true;
+  if (ev.severity === "blocking") {
+    // CLEAR THE FLAG — a blocking alarm is an ANNOUNCED one, and returning early without saying so
+    // is what let a flap eat its all-clear. The suppression rule is "do not announce the clearing of
+    // an alarm nobody was told about"; blocking is never debounced, so the reader was always told.
+    // Leaving a debounced WARNING's flag standing meant the next recovery consumed it and fell
+    // silent — for the blocking alarm, not the warning that raised it. The component then reads
+    // BLOCKED with no all-clear ever issued, and since the recovery is what tells the improvement
+    // pass its P1 pipeline-health bead can be closed, a green deployment stays reported as blocked.
+    unannouncedAlarm.delete(ev.componentId);
+    return true;
+  }
   // warning
   const last = lastWarningAt.get(ev.componentId);
   if (last !== undefined && now - last < WARNING_DEBOUNCE_MS) {

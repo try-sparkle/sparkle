@@ -691,6 +691,47 @@ describe("controlListener", () => {
       expect(row.activity).toBe("running its hourly improvement pass"); // fell back to computed
     });
 
+    // RENAME IS THE ONE SELF-REPORT OP WITH NOWHERE TO WRITE — the display name is a constant every
+    // read site resolves independently, so this refuses. What is under test is that it refuses
+    // HONESTLY: falling through to `findAgent` produced `unknown agent __sparkle_self__`, which told
+    // the one agent instructed to name itself on its first turn that it had addressed the WRONG id.
+    // It then retried with guessed ids, every pass, forever, with no wording that could have worked.
+    it("rename_agent on the app-owned agent refuses with a TYPED reason, not `unknown agent <raw id>`", async () => {
+      fire({
+        reqId: "wp-r1",
+        op: "rename_agent",
+        callerAgentId: SPARKLE_AGENT_ID,
+        payload: { name: "Hourly Improvement Pass" },
+      });
+      await flush();
+      const reply = lastReply() as { ok: boolean; code?: string; error?: string };
+      expect(reply.ok).toBe(false);
+      expect(reply.code).toBe("name_app_owned");
+      // The raw internal id names nothing a human or an agent can act on, and "unknown" is false —
+      // `get_state` resolves this caller as `self` two ops away. Neither may appear.
+      expect(reply.error).not.toMatch(/unknown agent/);
+      expect(reply.error).not.toMatch(SPARKLE_AGENT_ID);
+      // The remedy has to be one that WORKS for this exact caller (AGENTS.md: a remedy is an
+      // instruction the caller will follow). `set_agent_activity` has the short-circuit rename lacks.
+      expect(reply.error).toMatch(/set_agent_activity/);
+      expect(reply.error).toMatch(SPARKLE_AGENT_DISPLAY_NAME);
+      // …and the row still reads by its real name, so nothing half-applied.
+      const row = await getSparkleRow("wp-r2");
+      expect(row.name).toBe(SPARKLE_AGENT_DISPLAY_NAME);
+    });
+
+    // THE PAIRED HALF. A refusal test alone passes for a `handleRename` that refuses EVERYONE, so it
+    // cannot tell "keyed to the app-owned agent" from "broken outright" — the short-circuit has to be
+    // shown NOT to fire for an ordinary agent reaching the same op.
+    it("…while an ordinary agent's rename_agent still renames it", async () => {
+      fire({ reqId: "wp-r3", op: "rename_agent", callerAgentId: callerId, payload: { name: "Parser Builder" } });
+      await flush();
+      expect(lastReply()).toMatchObject({ ok: true });
+      expect(useProjectStore.getState().projects.find((p) => p.id === projectId)!.agents.find((a) => a.id === callerId)!.name).toBe(
+        "Parser Builder",
+      );
+    });
+
     it("set_agent_goal from the app-owned agent shows a display-only goal; goal_met flips its state", async () => {
       fire({
         reqId: "wp-g1",

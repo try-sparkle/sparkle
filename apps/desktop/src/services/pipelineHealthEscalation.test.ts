@@ -263,6 +263,44 @@ describe("escalatePipelineHealth — routing + gating side effects", () => {
     expect(r.woke).toHaveLength(3);
   });
 
+  // ── A BLOCKING ALARM'S ALL-CLEAR IS NOT THE FLAP'S TO SWALLOW ─────────────────────────────────
+  // The suppression rule is "do not announce the clearing of an alarm nobody was told about". A
+  // BLOCKING alarm is always told, so its recovery must always be told too — but `blocking` short-
+  // circuited the gate without touching the suppression flag, so a flap's debounced WARNING left a
+  // flag standing that the blocking recovery then consumed. The component is announced as blocking
+  // and never announced as recovered: per this module's own contract the recovery is what lets the
+  // improvement pass close the P1 bead, so the deployment reads BLOCKED indefinitely after it is
+  // green again. Reachable on the real cadence — ci_runners flaps green↔warning on the 60s poll.
+  it("a BLOCKING alarm's recovery fires even when a debounced warning left a flag standing", async () => {
+    const r = recorder();
+    // Cycle 1: announced in full, so the debounce window is now open for this component.
+    await escalatePipelineHealth(snap("healthy"), snap("warning"), r.deps);
+    r.now += POLL_MS;
+    await escalatePipelineHealth(snap("warning"), snap("healthy"), r.deps);
+    expect(r.woke).toHaveLength(2);
+
+    // Cycle 2's warning is debounced — this is what raises the suppression flag.
+    r.now += POLL_MS;
+    const flapped = await escalatePipelineHealth(snap("healthy"), snap("warning"), r.deps);
+    expect(flapped.debounced).toHaveLength(1);
+
+    // The pool now genuinely goes down. BLOCKING is never debounced, so it IS announced.
+    r.now += POLL_MS;
+    const blocked = await escalatePipelineHealth(snap("warning"), snap("blocking"), r.deps);
+    expect(blocked.delivered).toHaveLength(1);
+    expect(blocked.delivered[0]!.severity).toBe("blocking");
+    expect(r.woke).toHaveLength(3);
+
+    // …and its all-clear must reach both channels. This is the assertion the bug failed.
+    r.now += POLL_MS;
+    const recovered = await escalatePipelineHealth(snap("blocking"), snap("healthy", "back up"), r.deps);
+    expect(recovered.delivered).toHaveLength(1);
+    expect(recovered.delivered[0]!.severity).toBe("recovery");
+    expect(r.woke).toHaveLength(4);
+    expect(r.woke[3]).toContain("RECOVERED");
+    expect(r.concierge).toHaveLength(4);
+  });
+
   it("a recovery with no SUPPRESSED warning behind it always fires — the startup baseline case", async () => {
     // The first poll establishes a baseline without alerting, so a component already warning at
     // launch has no delivered alarm. Its recovery is what tells the improvement pass that an open
