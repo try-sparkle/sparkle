@@ -3027,17 +3027,85 @@ function walkGlobToRegExp(pattern) {
   try { return new RegExp(`^${out}$`); } catch { return null; }
 }
 
-/** The directories a walker segment will descend from. */
-function walkSearchRoots(bin, args) {
+/** SHORT flags that CONSUME a value, per binary — so the letters AFTER one in a bundle are its
+ *  VALUE, not more flags.
+ *
+ *  This table exists because three rounds of ad-hoc pattern-matching each shipped the same class of
+ *  bug (roborev 67769, 67805, 67812), the third of which was a REGRESSION the second introduced:
+ *  a flag-agnostic `/^-[A-Za-z]*[ef]./` fires on `-tdocker` (…`ck`|`e`|`r`) and `-tswift`
+ *  (…`wi`|`f`|`t`), where the `e`/`f` is a character of ripgrep's TYPE NAME and not a flag at all.
+ *  A letter's meaning depends on what precedes it in the bundle, so the scan has to stop at the
+ *  first value-taking letter instead of searching the whole word. */
+const SHORT_VALUE_FLAGS = {
+  rg: "efgtTmABCMjr",
+  grep: "efmABCDd",
+  fd: "edtEXxS",
+};
+
+/** SHORT flags that supply the SEARCH PATTERN — when one carries an ATTACHED value, there is no
+ *  pattern operand left and every operand is a path. `fd` has none: its `-e` is an EXTENSION
+ *  filter, not a pattern, and reading it as one is how a generic table would misjudge it. */
+const PATTERN_SHORT_FLAGS = { rg: "ef", grep: "ef", fd: "" };
+
+/** LONG flags that supply the pattern, in both the `--flag value` and `--flag=value` spellings. */
+const PATTERN_LONG_FLAGS = { rg: ["--regexp", "--file"], grep: ["--regexp", "--file"], fd: [] };
+
+/** Flags that mean there is NO pattern operand AT ALL, so every operand is a path.
+ *
+ *  `rg --files ~/Library` recursively lists every file under home's Library and takes no pattern
+ *  (roborev 67812). Before this set it matched nothing, so the lone path operand was sliced off as
+ *  "the pattern", the walk was judged with NO ROOTS, and an empty root list reads as "reaches
+ *  nothing" — the same silent allow, on a command that raises a dialog per container. */
+const NO_PATTERN_FLAGS = { rg: ["--files"], grep: [], fd: [] };
+
+/** Does this segment take its search pattern from a FLAG (or have no pattern at all), so that every
+ *  operand is a PATH rather than the first one being the pattern?
+ *
+ *  Bundles are scanned LEFT TO RIGHT and stop at the first value-taking letter, because everything
+ *  after that letter belongs to its value. That is the whole correction: `-reChrome` is `-r` then
+ *  `-e` carrying `Chrome`, while `-tdocker` is `-t` carrying `docker` and contains no flag `e` at
+ *  all, even though both words contain the letter. */
+function patternComesFromFlags(bin, args) {
+  const valueTaking = SHORT_VALUE_FLAGS[bin] ?? "";
+  const patternShort = PATTERN_SHORT_FLAGS[bin] ?? "";
+  const patternLong = PATTERN_LONG_FLAGS[bin] ?? [];
+  const noPattern = NO_PATTERN_FLAGS[bin] ?? [];
+  for (const a of args) {
+    if (noPattern.includes(a)) return true;
+    if (a.startsWith("--")) {
+      // `--regexp=X` and `--regexp X` are the same flag; only the name half decides.
+      if (patternLong.includes(a.split("=")[0])) return true;
+      continue;
+    }
+    if (!a.startsWith("-") || a.length < 2) continue;
+    for (let i = 1; i < a.length; i++) {
+      const c = a[i];
+      if (!/[A-Za-z]/.test(c)) break;
+      if (!valueTaking.includes(c)) continue; // a no-argument flag — keep reading the bundle
+      // A pattern flag whose value is ATTACHED leaves no pattern operand. One whose value is the
+      // NEXT WORD does leave an operand — and `operandsOf` keeps it, so `slice(1)` removes exactly
+      // that value. Both routes end at the same roots; only the attached form needs this branch.
+      if (patternShort.includes(c) && i + 1 < a.length) return true;
+      break; // the rest of the word is this flag's value, not more flags
+    }
+  }
+  return false;
+}
+
+/** The directories a walker segment will descend from.
+ *
+ *  `flagBin` is the REAL binary, which is not always `bin`: a recursive `grep` is judged with
+ *  ripgrep's operand shape (pattern first, then paths), but its FLAGS are grep's — and rg's `-r`
+ *  takes a value while grep's does not, so borrowing the wrong table makes `grep -reChrome` stop
+ *  scanning at the `r` and go dark again. */
+function walkSearchRoots(bin, args, flagBin = bin) {
   if (bin === "find") return findSearchRoots(args);
   const spec = WALKERS[bin];
   // `ls -R` is the only walker whose recursion is opt-in via a flag rather than its nature.
   const operands = operandsOf(args);
   if (!spec) return operands;
   if (!spec.patternFirst) return operands;
-  // `rg -e PAT ~/x` / `rg -f file ~/x`: the pattern came from a FLAG, so every operand is a path.
-  const patternFromFlag = args.some((a) => a === "-e" || a === "--regexp" || a === "-f" || a === "--file");
-  return patternFromFlag ? operands : operands.slice(1);
+  return patternComesFromFlags(flagBin, args) ? operands : operands.slice(1);
 }
 
 /** The walker's traversal depth limit, or null when it has none (or when its depth flag does not
@@ -3160,16 +3228,28 @@ export function blocksProtectedAppDataWalk(command, home = homedir(), depth = 0)
     const recursiveLs =
       bin === "ls" &&
       args.some((a) => LS_RECURSIVE_LONG.has(a) || (!a.startsWith("--") && /^-[A-Za-z]*R/.test(a)));
-    const recursiveGrep =
+    // grep's FOURTH way of saying it, and the one that spells recursion with no `r` in the flag
+    // at all (roborev 67769): `-d recurse` / `--directories=recurse` / `--directories recurse`.
+    // Both BSD and GNU grep honour it, so it is the same defect one flag over — a recursion test
+    // that pattern-matches the flag NAME cannot see a recursion selected by the flag's VALUE.
+    const grepDirRecurse =
       bin === "grep" &&
       args.some(
-        (a) => GREP_RECURSIVE_LONG.has(a) || (!a.startsWith("--") && /^-[A-Za-z]*[rR]/.test(a)),
+        (a, i) =>
+          a === "--directories=recurse" ||
+          ((a === "-d" || a === "--directories") && args[i + 1] === "recurse"),
       );
+    const recursiveGrep =
+      bin === "grep" &&
+      (grepDirRecurse ||
+        args.some(
+          (a) => GREP_RECURSIVE_LONG.has(a) || (!a.startsWith("--") && /^-[A-Za-z]*[rR]/.test(a)),
+        ));
     if (!WALKERS[bin] && !recursiveLs && !recursiveGrep) continue;
     const effBin = recursiveGrep ? "rg" : bin; // same operand shape: PATTERN then paths
     const maxDepth = walkMaxDepth(effBin, args);
     const excludes = walkExcludePatterns(effBin, args);
-    const roots = walkSearchRoots(recursiveLs ? "ls" : effBin, args);
+    const roots = walkSearchRoots(recursiveLs ? "ls" : effBin, args, bin);
     for (const rawRoot of roots) {
       const root = expandHomePrefix(rawRoot, home);
       if (!isAbsolute(root)) continue; // relative root — cwd is a worktree, not the home tree
