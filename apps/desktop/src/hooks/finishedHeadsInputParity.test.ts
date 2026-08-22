@@ -41,12 +41,17 @@
 // signature in this repo (185 `.tsx` files use it, `AgentSidebar.tsx` among them). Every round the
 // fix was another pattern, and every round the stated reach was the next round's finding.
 //
-// The lesson is not "write a better regex". A regex family enumerates SYNTAX, and the set of ways
-// JavaScript can bind a name is not a set this file gets to close. So it parses instead: one
-// TypeScript AST walk, counting identifiers named `calmStatus` that sit in a BINDING position —
-// a variable declaration, a binding element (shorthand or renamed, nested to any depth), or a
-// parameter. The AST knows every form, including ones nobody here has thought of, which is what
-// makes "a shape nobody enumerated still counts" TRUE rather than aspirational.
+// The lesson is not "write a better regex" — and it was not "list the right node kinds" either.
+// The first AST version enumerated three kinds and called them "every form the language has"; it
+// missed `import { calmStatus } from …`, the easiest module-scope shadow there is. FIVE rounds, five
+// enumerations, five misses.
+//
+// So the test is INVERTED. Any node whose own `.name` is this identifier is declaring it, and the
+// exceptions are the few nodes that carry a `.name` while naming something else — a member access,
+// an object key, a JSX attribute, a type member. That set is structural and does not grow when the
+// language adds a declaration form. It is not claimed to be exhaustive; it is built to fail in the
+// SAFE direction, where an unlisted naming node reds the guard as a false alarm someone reads,
+// rather than passing as a shadow nobody sees. See `bindingsOf`.
 //
 // The contract, in two assertions: `calmStatus` is bound EXACTLY ONCE in each caller, and that one
 // binding is destructured from `useOverlaidStatus(...)`. Everything else is a use.
@@ -64,38 +69,74 @@ import { fileURLToPath } from "node:url";
 const here = dirname(fileURLToPath(import.meta.url));
 const read = (rel: string) => readFileSync(resolve(here, rel), "utf8");
 
-/** Every identifier named `calmStatus` that is BEING BOUND — not used — in this source.
+/** Every identifier named `calmStatus` that is BEING DECLARED — not used.
  *
- *  Three node kinds cover every form the language has, which is the entire reason this is an AST
- *  walk and not a pattern list:
+ *  ══ AN EXCLUSION LIST, NOT AN INCLUSION LIST, AND THAT IS THE WHOLE POINT ═══════════════════
+ *  This started as three node kinds — VariableDeclaration, BindingElement, Parameter — described in
+ *  the commit that added it as "every form the language has". It was not. It missed
+ *  `import { calmStatus } from …`, which shadows at MODULE scope and is the easiest second-scope
+ *  shadow of all, plus function/class/type/enum declaration names. That was the fifth consecutive
+ *  round in which an enumeration of forms was the defect, and the fourth time a header claimed a
+ *  reach it did not have.
  *
- *    VariableDeclaration  `const calmStatus = …`, any keyword
- *    BindingElement       `{ calmStatus }`, `{ status: calmStatus }`, `[calmStatus]`, nested to any
- *                         depth, and — the form four rounds of regexes missed — the same patterns
- *                         used as a FUNCTION PARAMETER, `function F({ calmStatus }: Props)`
- *    Parameter            `(calmStatus: T) => …`, arrow or not, annotated or contextually typed
+ *  So the test is inverted. ANY node whose own `name` is this identifier is declaring it — that is
+ *  what `.name` MEANS across the AST — and the exceptions are the handful of nodes that carry a
+ *  `.name` while naming something OTHER than a new binding. That set is small, structural, and does
+ *  not grow when the language adds a declaration form, which is exactly the property the inclusion
+ *  list never had:
  *
- *  Comments and type positions are not nodes of these kinds, so a doc line reading
- *  `calmStatus: the pre-escalation map` — which both caller files genuinely contain — cannot be
- *  mistaken for a binding. That was a real false alarm under the regex version. */
+ *    PropertyAccessExpression  `deps.calmStatus`      — the `.name` is a MEMBER, not a binding
+ *    QualifiedName             `Foo.calmStatus`       — same, in type space
+ *    PropertyAssignment        `{ calmStatus: x }`    — an object-literal KEY
+ *    ShorthandPropertyAssignment `{ calmStatus }`     — a key AND a use; the binding is elsewhere
+ *    JsxAttribute              `<X calmStatus={…} />` — an attribute name
+ *    PropertySignature / MethodSignature              — TYPE members, no runtime binding
+ *
+ *  ⚠️ AND A PARAMETER IN A TYPE POSITION IS NOT A BINDING EITHER. `type P = { onCalm: (calmStatus:
+ *  Map) => void }` parses to a real `ts.Parameter`, and counting it would red this guard on an
+ *  ordinary future prop type — a false alarm on a declaration that binds nothing at runtime. The
+ *  test is whether the parameter's owner has a BODY: a function that runs has one, a function TYPE
+ *  does not.
+ *
+ *  Comments are not nodes at all, so the doc line `calmStatus: the pre-escalation map` — which both
+ *  caller files genuinely contain — is invisible here. That is why the comment-stripping hack this
+ *  file used to carry is gone.
+ *
+ *  This is NOT claimed to be exhaustive. It is claimed to fail in the SAFE direction: an unlisted
+ *  naming node counts as a binding and reds the guard, which is a false alarm someone reads, rather
+ *  than a shadow nobody sees. Four earlier versions failed the other way. */
 function bindingsOf(src: string): ts.Identifier[] {
   const sf = ts.createSourceFile("caller.tsx", src, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
   const out: ts.Identifier[] = [];
   const visit = (n: ts.Node): void => {
-    if (ts.isIdentifier(n) && n.text === "calmStatus") {
-      const p = n.parent as ts.Node | undefined;
-      if (
-        p !== undefined &&
-        (ts.isVariableDeclaration(p) || ts.isBindingElement(p) || ts.isParameter(p)) &&
-        p.name === n
-      ) {
-        out.push(n);
-      }
-    }
+    if (ts.isIdentifier(n) && n.text === "calmStatus" && isDeclaredHere(n)) out.push(n);
     ts.forEachChild(n, visit);
   };
   visit(sf);
   return out;
+}
+
+/** Does this identifier introduce a NEW binding at its own position? See `bindingsOf`'s header. */
+function isDeclaredHere(id: ts.Identifier): boolean {
+  const p = id.parent as (ts.Node & { name?: ts.Node }) | undefined;
+  if (p === undefined || p.name !== id) return false;
+  if (
+    ts.isPropertyAccessExpression(p) ||
+    ts.isQualifiedName(p) ||
+    ts.isPropertyAssignment(p) ||
+    ts.isShorthandPropertyAssignment(p) ||
+    ts.isJsxAttribute(p) ||
+    ts.isPropertySignature(p) ||
+    ts.isMethodSignature(p)
+  ) {
+    return false;
+  }
+  // A parameter of a function TYPE binds nothing at runtime — only one with a body does.
+  if (ts.isParameter(p)) {
+    const owner = p.parent as ts.Node & { body?: ts.Node };
+    return owner.body !== undefined;
+  }
+  return true;
 }
 
 /** The function a binding was destructured from, or null when it did not come from a call.
