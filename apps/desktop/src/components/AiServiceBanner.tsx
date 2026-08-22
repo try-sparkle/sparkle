@@ -48,6 +48,7 @@ import {
   useAiServiceHealthStore,
   type AiServiceReason,
 } from "../stores/aiServiceHealthStore";
+import { selectAiEnhancedBlocked, useBlockedSubsystemsStore } from "../stores/blockedSubsystemsStore";
 
 /** One sentence per coarse reason. Both open with the same plain statement that the features are
  *  affected, then add the coarse cause without a raw status or any PII — and both attribute it to
@@ -127,9 +128,21 @@ export function AiServiceBanner() {
   const dismissed = health.dismissed;
   const reason = health.reason;
 
-  // Show only while a SUSTAINED outage is recorded and the user hasn't dismissed THIS episode. `reason`
-  // is always set once `degraded` is true, but guard anyway so a partial state can never throw.
-  if (!degraded || dismissed || reason === null) return null;
+  // WORST-CONDITION PRECEDENCE, narrowed to this bar's SUBJECT. This bar is about AI-Enhanced
+  // features (on the default account). When AI-Enhanced is COMPLETELY BLOCKED (a session/usage limit
+  // exhausted), BlockedAgentsBanner shows the red "Blocked due to session limits …" bar naming it,
+  // which is strictly worse than this amber "paused, we keep retrying" one about the very same thing
+  // — so the amber bar steps aside (the founder's complaint was a total block read as a soft
+  // degrade). It is keyed on AI-Enhanced specifically, NOT on "anything blocked": a build agent
+  // benched on an unrelated pool account must not hide a genuine, separate AI-Enhanced outage on the
+  // default account. The store is empty unless BlockedAgentsBanner is mounted and polling, so this
+  // changes nothing on a surface that renders this bar alone.
+  const aiEnhancedBlocked = useBlockedSubsystemsStore(selectAiEnhancedBlocked);
+
+  // Show only while a SUSTAINED outage is recorded, AI-Enhanced is not already shown as blocked, and
+  // the user hasn't dismissed THIS episode. `reason` is always set once `degraded` is true, but guard
+  // anyway so a partial state can never throw.
+  if (aiEnhancedBlocked || !degraded || dismissed || reason === null) return null;
 
   return (
     <div style={bar} data-testid={AI_SERVICE_BAR_TESTID}>

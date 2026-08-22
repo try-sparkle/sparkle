@@ -13,8 +13,12 @@ import {
   SERVICE_DEGRADED_MAX_AGE_MS,
   useAiServiceHealthStore,
 } from "../stores/aiServiceHealthStore";
+import { useBlockedSubsystemsStore } from "../stores/blockedSubsystemsStore";
 
-beforeEach(() => useAiServiceHealthStore.setState({ ...HEALTHY_SERVICE }));
+beforeEach(() => {
+  useAiServiceHealthStore.setState({ ...HEALTHY_SERVICE });
+  useBlockedSubsystemsStore.setState({ blocked: [] });
+});
 afterEach(cleanup);
 
 describe("AiServiceBanner", () => {
@@ -76,6 +80,39 @@ describe("AiServiceBanner", () => {
     fireEvent.click(screen.getByLabelText("Dismiss"));
     expect(useAiServiceHealthStore.getState().dismissed).toBe(true);
     expect(container.innerHTML).toBe("");
+  });
+
+  it("steps aside for the RED blocked bar when AI-Enhanced ITSELF is blocked, and returns when that block clears", () => {
+    // Worst-condition precedence, about the SAME subject. When AI Enhancement Features are blocked
+    // (session/usage limit exhausted), the red BlockedAgentsBanner names it and is strictly worse
+    // than this amber "paused, retrying" bar about the very same thing — so the amber bar hides (the
+    // founder's complaint was a total block read as a soft degrade). PAIRED so the block is proven to
+    // be the cause: same degraded state, only the blocked list changes.
+    useAiServiceHealthStore.setState({ degraded: true, degradedAt: Date.now(), reason: "rate_limited" });
+    useBlockedSubsystemsStore.setState({
+      blocked: [{ key: "ai-enhanced", label: "AI Enhancement Features" }],
+    });
+    const { container, rerender } = render(<AiServiceBanner />);
+    // AI-Enhanced blocked ⇒ amber bar hidden even though the degraded state alone would show it.
+    expect(container.innerHTML).toBe("");
+
+    // Clear the block; the SAME degraded state now shows the amber bar — proving the suppression was
+    // driven by the block, not by the degraded state changing.
+    act(() => useBlockedSubsystemsStore.setState({ blocked: [] }));
+    rerender(<AiServiceBanner />);
+    expect(screen.getByRole("status").textContent ?? "").toContain("AI-Enhanced features are paused");
+  });
+
+  it("does NOT step aside for an unrelated block (a build agent on a different pool account)", () => {
+    // Multi-account correctness: a build agent benched on some pool account must not hide a genuine,
+    // separate AI-Enhanced outage on the default account. Suppression is keyed on AI-Enhanced being
+    // blocked, not on "anything blocked" — so this amber bar STAYS.
+    useAiServiceHealthStore.setState({ degraded: true, degradedAt: Date.now(), reason: "rate_limited" });
+    useBlockedSubsystemsStore.setState({
+      blocked: [{ key: "agent:a1", label: "Some Build Agent" }],
+    });
+    render(<AiServiceBanner />);
+    expect(screen.getByRole("status").textContent ?? "").toContain("AI-Enhanced features are paused");
   });
 
   it("retires itself when the service recovers (degraded cleared)", () => {

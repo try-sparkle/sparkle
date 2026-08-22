@@ -43,6 +43,7 @@ import { OfflineBanner } from "./OfflineBanner";
 import { ZeroCreditBanner } from "./ZeroCreditBanner";
 import { ProviderUnavailableBanner } from "./ProviderUnavailableBanner";
 import { AiServiceBanner } from "./AiServiceBanner";
+import { BlockedAgentsBanner } from "./BlockedAgentsBanner";
 import { DictationEngineBanner } from "./DictationEngineBanner";
 import { ClosePrompt } from "./ClosePrompt";
 import { StatusStrip } from "./StatusStrip";
@@ -2004,10 +2005,17 @@ export function Workspace() {
           (with two pairs it would otherwise have to be drawn twice, saying the same thing). */}
       <OfflineBanner />
       <ZeroCreditBanner />
-      {/* Below both on purpose. Offline and a $0 balance are things the USER can act on, so they
-          lead; this one they cannot act on at all. It is here rather than nowhere because the
-          alternative — what shipped before — was every AI feature going dark with no explanation
-          anywhere for 12 hours. Renders only while an outage is actually recorded. */}
+      {/* The WORST-CASE AI bar, and the reason it leads the AI group: a session/usage limit is
+          exhausted, so the named subsystems are COMPLETELY BLOCKED (not merely throttled). Red, not
+          amber. It writes blockedSubsystemsStore, which makes the amber AiServiceBanner below step
+          aside while any block stands — the founder's rule that the shell must show the worst true
+          condition, never narrate a total block as a soft "we keep retrying". Renders only while a
+          real bench is observed; the user acts on it via "Manage fleet" → Settings → Accounts. */}
+      <BlockedAgentsBanner />
+      {/* Below on purpose. Offline and a $0 balance are things the USER can act on, so they lead;
+          this one they cannot act on at all. It is here rather than nowhere because the alternative —
+          what shipped before — was every AI feature going dark with no explanation anywhere for 12
+          hours. Renders only while an outage is actually recorded. */}
       <ProviderUnavailableBanner />
       {/* Sibling of ProviderUnavailableBanner for the outage the server does NOT name: a SUSTAINED
           run of bare gateway/transport failures (the live 12-hour 502 incident). Detector is

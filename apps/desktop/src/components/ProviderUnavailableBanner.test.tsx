@@ -9,6 +9,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ProviderUnavailableBanner, PROVIDER_UNAVAILABLE_BAR_TESTID } from "./ProviderUnavailableBanner";
 import { OUTAGE_MAX_AGE_MS, useAiProviderStore } from "../stores/aiProviderStore";
 import { loadAccountState } from "../services/accountSelection";
+import { useBlockedSubsystemsStore } from "../stores/blockedSubsystemsStore";
+import { AI_ENHANCED_KEY } from "../engine/blockedSubsystems";
 
 // The usage-limit branch reads the accounts' LIVE exhaustion flags through the shared seam. Mocked
 // so a test can state what the accounts currently say without a Tauri backend.
@@ -28,6 +30,7 @@ function stateWith(exhaustedUntil: number | null) {
 
 beforeEach(() => {
   useAiProviderStore.setState({ outage: null });
+  useBlockedSubsystemsStore.setState({ blocked: [] });
   loadStateMock.mockReset();
   loadStateMock.mockResolvedValue(stateWith(null));
 });
@@ -186,6 +189,40 @@ describe("the usage-limit banner reads live account state", () => {
       // And it must stop implying the agent fleet is stopped, which caused the original confusion.
       expect(text).toContain("agents keep running");
     });
+  });
+
+  it("defers its full-width usage-limit bar to the red blocked bar (no duplicate about one fact), but returns when the block clears", async () => {
+    // The red BlockedAgentsBanner and this amber usage-limit bar derive from the SAME default-account
+    // bench. When AI-Enhanced is in the red bar, the amber duplicate must step aside. PAIRED: same
+    // outage + bench, only the blocked list changes.
+    const until = Date.now() + 45 * 60_000;
+    useAiProviderStore.setState({ outage: { reason: "usage_limit", at: Date.now() } });
+    loadStateMock.mockResolvedValue(stateWith(until));
+    useBlockedSubsystemsStore.setState({
+      blocked: [{ key: AI_ENHANCED_KEY, label: "AI Enhancement Features" }],
+    });
+
+    const { rerender } = render(<ProviderUnavailableBanner />);
+    await act(async () => {
+      await Promise.all(loadStateMock.mock.results.map((r) => r.value));
+    });
+    expect(screen.queryByTestId(PROVIDER_UNAVAILABLE_BAR_TESTID)).toBeNull();
+
+    // Clear the red block; the SAME usage-limit state now shows the amber bar again.
+    act(() => useBlockedSubsystemsStore.setState({ blocked: [] }));
+    rerender(<ProviderUnavailableBanner />);
+    await waitFor(() => expect(screen.getByRole("status").textContent ?? "").toMatch(/paused until/));
+  });
+
+  it("still shows the INLINE usage-limit variant even while the red bar is up — it is context on its own pane, not a duplicate top bar", async () => {
+    const until = Date.now() + 45 * 60_000;
+    useAiProviderStore.setState({ outage: { reason: "usage_limit", at: Date.now() } });
+    loadStateMock.mockResolvedValue(stateWith(until));
+    useBlockedSubsystemsStore.setState({
+      blocked: [{ key: AI_ENHANCED_KEY, label: "AI Enhancement Features" }],
+    });
+    render(<ProviderUnavailableBanner inline />);
+    await waitFor(() => expect(screen.getByRole("status").textContent ?? "").toMatch(/paused until/));
   });
 
   it("outlives the store's 10-minute expiry while the limit is verifiably still live", async () => {

@@ -17,6 +17,10 @@ import {
 } from "../stores/aiProviderStore";
 import { currentUsageLimit, oneshotAccountId, USAGE_LIMIT_RECHECK_MS } from "../engine/usageLimit";
 import { loadAccountState, type AccountState } from "../services/accountSelection";
+import {
+  selectAiEnhancedBlocked,
+  useBlockedSubsystemsStore,
+} from "../stores/blockedSubsystemsStore";
 
 /** The full-width bar's hook, so a real-layout test can measure the element the user sees. */
 export const PROVIDER_UNAVAILABLE_BAR_TESTID = "provider-unavailable-bar";
@@ -209,13 +213,25 @@ export function ProviderUnavailableBanner({ inline = false }: { inline?: boolean
   // health, and a derived clear would hide a real limit. Positive evidence still earns its keep: it
   // carries the reset instant, and it outranks the store's generic 10-minute expiry, which was the
   // right bound on an UNVERIFIABLE claim but would otherwise hide a limit we can see is still live.
+  // WORST-CASE PRECEDENCE for the usage-limit case. When AI-Enhanced is in the red
+  // BlockedAgentsBanner ("Blocked due to session limits: AI Enhancement Features …"), the amber
+  // usage-limit bar below is about the SAME default-account bench, from the SAME `exhaustedUntil`
+  // signal (`currentUsageLimit`). Two bars for one fact is the very "mild message beside the severe
+  // one" this shell is being fixed to stop, so the full-width usage-limit bar defers to the red one.
+  // ONLY the top bar and ONLY the usage-limit reason: the inline Settings→Credits variant is useful
+  // context on its own pane, and cli_missing / cli_not_authenticated are different conditions the red
+  // bar does not cover.
+  const aiEnhancedBlocked = useBlockedSubsystemsStore(selectAiEnhancedBlocked);
+  const deferToBlockedBar = !inline && aiEnhancedBlocked;
+
   const seen =
     claimsUsageLimit && live !== null
       ? currentUsageLimit(live.usage, oneshotAccountId(live.accounts), now)
       : null;
-  if (seen) return renderBar(usageLimitSentence(seen.until), inline);
+  if (seen && !deferToBlockedBar) return renderBar(usageLimitSentence(seen.until), inline);
 
   if (!isOutageActive(outage, now)) return null;
+  if (deferToBlockedBar && outage.reason === "usage_limit") return null;
   return renderBar(WARNING[outage.reason], inline);
 }
 
