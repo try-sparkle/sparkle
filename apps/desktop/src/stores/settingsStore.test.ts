@@ -542,6 +542,7 @@ describe("hydrateFromConfig — reflect config.toml into the store", () => {
           drift: { behind_nudge: 3, ahead_nudge: 4, changed_lines: 5 },
         },
         workers: { max_concurrent: 0 }, // out of range → clamped to 1
+        drainer: { enabled: false }, // the kill-switch must reach the store
         ai: {
           auto_rename: false,
           voice_dictation: false,
@@ -580,6 +581,8 @@ describe("hydrateFromConfig — reflect config.toml into the store", () => {
     expect(s.driftChangedLines).toBe(5);
     expect([s.aiAutoRename, s.cloudDictation, s.aiComposer]).toEqual([false, false, true]);
     expect(s.configWarnings).toEqual(["w1", "w2"]);
+    // [drainer].enabled maps into the store (here explicitly OFF — the kill-switch).
+    expect(s.drainerEnabled).toBe(false);
   });
 
   describe("[plugins] mirror", () => {
@@ -838,6 +841,8 @@ describe("1Password env backup — config hydration", () => {
     // Sanity: the absent [tools] block still reads the OTHER tools as on, so this test is
     // really pinning the asymmetry rather than a blanket "everything defaults off".
     expect(s.roborevEnabled).toBe(true);
+    // An absent [drainer] section keeps the ON default (`?? true`), never reads as off.
+    expect(s.drainerEnabled).toBe(true);
   });
 
   it("hydrates the flag, vault and seeding from config", () => {

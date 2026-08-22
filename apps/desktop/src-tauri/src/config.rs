@@ -1422,6 +1422,40 @@ pub struct ImprovementConfig {
     pub consent: Option<String>,
 }
 
+/// The BACKLOG DRAINER's master switch (`[drainer]`) — bead-backlog auto-drain, ON by default.
+///
+/// Once the app ships in a DMG, the launch-time consumer (`drainer.rs`, wired from `lib.rs`'s
+/// `setup`) reads this value and, when ON, idempotently INSTALLS the LaunchAgent supervisor via
+/// `scripts/backlog-drainer.sh --install`; when OFF it runs `--uninstall`, so nothing is scheduled
+/// and no worker is ever spawned. The scheduled `--watchdog` pass then drains the sparkle-self
+/// `agent-feedback` bead backlog, resting when it is at/below a floor. The deterministic
+/// floor/cap/claim decisions live in `scripts/backlog-drainer.sh`; this section is only the KILL
+/// SWITCH both the launch consumer and the watchdog read. (Modelled on the `[roborev]` daemon-ensure
+/// at launch — a launchd job installed/removed from config — NOT an in-process Rust/TS loop.)
+///
+/// `enabled` is a CONCRETE bool, not `Option<String>` like `[improvement].consent`: unlike that
+/// mirror, this value is NOT persisted to localStorage (see `settingsStore.ts` `drainerEnabled`,
+/// modelled on `roborevEnabled`), so it is re-read from the file each launch and there is no
+/// persisted choice for a defaulted value to clobber. It serializes as `true`/`false`.
+///
+/// Ships TRUE — the founder's directive: zero human steps, on by default. That is defensible for the
+/// same reason as `[babysit]`/`[pushers]`: the worst case is bounded (the shell engine honors a
+/// conservative worker cap and a rest floor, and refuses to CLAIM at all unless a dispatch consumer
+/// is wired), and a human can switch it off without a rebuild by setting `enabled = false` — which
+/// the launch consumer honors by uninstalling the LaunchAgent. The shell engine additionally honors
+/// `SPARKLE_DRAINER_ENABLED=0`.
+///
+/// GLOBAL ONLY, like `[babysit]`: how much of this machine's Claude quota an autonomous loop may spend
+/// is a property of the human at the machine, not of a repo. A `[drainer]` in a per-project file is
+/// not applied (it is only overlaid in the global layer, `build_effective`).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct DrainerConfig {
+    /// Master switch for the in-app backlog drainer loop. Ships TRUE. `false` makes the loop fully
+    /// inert (it dispatches nothing and never spawns a worker).
+    pub enabled: bool,
+}
+
 /// Settings for the Builder Index REPORTER (`builder_index.rs`) — what it publishes, once the
 /// separate `[tools].builder_index` switch has turned it on.
 ///
@@ -1839,6 +1873,9 @@ pub struct SparkleConfig {
     /// The fleet's global CI-concurrency budget + release priority. Machine-wide (see FleetConfig) —
     /// a repo does not get to decide how much of this machine's fleet may hammer the shared pool.
     pub fleet: FleetConfig,
+    /// The in-app backlog drainer's kill switch. Machine-wide (see DrainerConfig). Placed at the end
+    /// of the struct, well away from `improvement:`, so it does not textually collide with PR #2281.
+    pub drainer: DrainerConfig,
 }
 
 impl Default for SparkleConfig {
@@ -2004,6 +2041,11 @@ impl Default for SparkleConfig {
             // runner headroom for a release's base CI. `ci_budget = 0` in the global config.toml opts
             // out. Lease ≈ a full CI matrix's wall-clock (the safety drain, not a completion signal).
             fleet: FleetConfig { ci_budget: 6, ci_lease_secs: 900 },
+            // Ships ENABLED — the founder's directive (zero human steps, on by default). The worker
+            // cap + rest floor in scripts/backlog-drainer.sh bound the worst case, and `enabled =
+            // false` (or SPARKLE_DRAINER_ENABLED=0) is the rebuild-free kill switch. Stated as a
+            // literal so this line, the struct, and DEFAULT_TEMPLATE cannot drift apart.
+            drainer: DrainerConfig { enabled: true },
         }
     }
 }
@@ -2284,6 +2326,19 @@ struct PartialImprovement {
     consent: Option<String>,
 }
 
+/// `[drainer]` as read from TOML. EVERY value is `toml::Value` for the reason `PartialPushers`/
+/// `PartialBabysit` above record: with a strong `Option<bool>`, ONE hand-edit (`enabled = "false"`,
+/// `enabled = "off"`) fails `toml::from_str::<PartialConfig>` for the WHOLE global layer, which is
+/// then discarded (`hard_error`) — reverting every unrelated setting to defaults AND leaving the
+/// drainer at its ON default, i.e. failing OPEN on a kill switch. `#[serde(flatten)] rest` reports a
+/// misspelled key instead of silently swallowing it.
+#[derive(Debug, Default, Deserialize)]
+struct PartialDrainer {
+    enabled: Option<toml::Value>,
+    #[serde(flatten)]
+    rest: std::collections::BTreeMap<String, toml::Value>,
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct PartialOnePassword {
     vault_id: Option<String>,
@@ -2454,6 +2509,7 @@ struct PartialConfig {
     delivered: Option<PartialDelivered>,
     builder_index: Option<PartialBuilderIndex>,
     fleet: Option<PartialFleet>,
+    drainer: Option<PartialDrainer>,
     cleared: Option<PartialCleared>,
 }
 
@@ -3344,6 +3400,59 @@ fn apply_improvement(into: &mut ImprovementConfig, p: Option<PartialImprovement>
     if let Some(PartialImprovement { consent: Some(v) }) = p {
         into.consent = Some(v);
     }
+}
+
+fn apply_drainer(into: &mut DrainerConfig, p: Option<PartialDrainer>) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let Some(p) = p else { return warnings };
+
+    // SAME OFF-SPELLING RULE AS `[babysit]`/`[pushers]`, and for the same reason, which applies with
+    // full force here: this switch stops a loop that can spawn a background worker fleet on the
+    // founder's Claude quota. Dropping `enabled = "false"` with a warning — or worse, letting a
+    // wrong-typed value fail the whole layer — would leave the drainer ON, and the only signal that
+    // the edit did nothing is a string in the Advanced panel, not where someone who just hand-edited
+    // the TOML to stop it is looking. Failing open on an off switch is the one direction the user
+    // cannot recover by noticing later.
+    if let Some(v) = p.enabled {
+        let off = match &v {
+            toml::Value::Boolean(false) => true,
+            toml::Value::Integer(0) => true,
+            toml::Value::String(s) => {
+                matches!(s.trim().to_ascii_lowercase().as_str(), "false" | "off" | "no" | "0")
+            }
+            _ => false,
+        };
+        if off {
+            into.enabled = false;
+        } else {
+            match v.as_bool() {
+                Some(b) => into.enabled = b,
+                None => warnings.push(format!(
+                    "[drainer].enabled is a {}, not true or false, so it has no effect — the \
+                     backlog drainer is still running. Use `enabled = false` to stop it.",
+                    v.type_str()
+                )),
+            }
+        }
+    }
+
+    // Keys the SHELL watchdog (scripts/backlog-drainer.sh, PR #2417) reads from THIS SAME global
+    // config.toml via `sparkle_cfg_get_int drainer …`. The app itself does not read them, but they are
+    // real, honoured [drainer] settings — so they must NOT be reported as "has no effect" (telling a
+    // user their `feedback_floor = 20` is inert, when deleting it makes the fleet drain to empty
+    // instead of resting, is worse than saying nothing). Skip them; warn only on genuinely unknown keys.
+    const ENGINE_KEYS: &[&str] =
+        &["feedback_floor", "max_workers", "claim_max_age", "inprogress_max_age", "lock_ttl"];
+    for (field, _) in p.rest {
+        if ENGINE_KEYS.contains(&field.as_str()) {
+            continue;
+        }
+        warnings.push(format!(
+            "[drainer].{field} is not a drainer setting (enabled, feedback_floor, max_workers, \
+             claim_max_age, inprogress_max_age, lock_ttl), so it has no effect"
+        ));
+    }
+    warnings
 }
 
 fn apply_onepassword(into: &mut OnePasswordConfig, p: Option<PartialOnePassword>) {
@@ -4601,6 +4710,10 @@ fn build_effective_layered(
                 // repo layer's — the project layer only ever reports that it was ignored.
                 warnings.extend(apply_builder_index(&mut cfg.builder_index, p.builder_index));
                 apply_fleet(&mut cfg.fleet, p.fleet);
+                // Global-only like [babysit]/[pushers]: how much of this machine's quota an
+                // autonomous drain loop may spend is a property of the human at the machine, not a
+                // repo, so it is overlaid only here and a [drainer] in a project file is ignored.
+                warnings.extend(apply_drainer(&mut cfg.drainer, p.drainer));
                 apply_done(&mut cfg.done, p.done);
                 apply_delivered(&mut cfg.delivered, p.delivered);
             }
@@ -5418,6 +5531,18 @@ inbox_yield_pct     = 80      # if the partner's inbox is this % full or more, t
 [advisor]
 enabled = true              # master switch — false stops the pass entirely
 model   = "claude-opus-5"   # must differ from the planner's model, and be one Sparkle can dispatch
+
+# --- Backlog drainer (per-machine; ignored in a project file) ---------------------------
+# The in-app loop that drains the sparkle-self agent-feedback bead backlog with a bounded fleet of
+# background worker agents, resting when the backlog is at/below a floor. The deterministic floor,
+# worker cap and worst-first claim logic live in scripts/backlog-drainer.sh; this is only the switch.
+#
+# Ships ON — zero human steps, on by default. Defensible for the same reason as [pushers]/[babysit]:
+# the shell engine's worker cap and rest floor bound the worst case. Set enabled = false to switch
+# the loop fully off (it then dispatches nothing and spawns no worker). The shell engine also honors
+# the SPARKLE_DRAINER_ENABLED=0 environment variable.
+[drainer]
+enabled = true              # master switch — false makes the in-app drain loop fully inert
 
 # --- Opinionated tools (per-machine; ignored in a project file) -------------------------
 # The non-AI tools Sparkle leans on, surfaced in ⋯ Settings → "Tools". Each defaults on for a
@@ -7541,6 +7666,99 @@ quit_app = 42
         let (cfg, warns, _) = effective(None, Some(p));
         assert_eq!(cfg.improvement.consent, None);
         assert!(warns.iter().any(|w| w.contains("[improvement]")));
+    }
+
+    #[test]
+    fn drainer_enabled_defaults_true_and_config_can_mute_it() {
+        // Ships ON with no config file — the founder's directive (zero human steps, on by default).
+        // LITERAL expectation, never read back off DrainerConfig::default(), so flipping the shipped
+        // default to off makes this test go red rather than silently agree with itself.
+        let (cfg, warns, hard) = effective(None, None);
+        assert!(!hard);
+        assert!(cfg.drainer.enabled, "the backlog drainer ships ON by default");
+        assert!(
+            !warns.iter().any(|w| w.contains("[drainer]")),
+            "the shipped default must load clean: {warns:?}"
+        );
+
+        // An explicit `enabled = false` is the rebuild-free KILL SWITCH.
+        let g = "[drainer]\nenabled = false\n";
+        let (cfg, warns, hard) = effective(Some(g), None);
+        assert!(!hard);
+        assert!(warns.is_empty(), "a clean off-switch must not warn: {warns:?}");
+        assert!(!cfg.drainer.enabled, "enabled = false must mute the loop");
+
+        // An absent [drainer] section (an older config file that predates it) leaves the ON default
+        // in place — never read absence as "off".
+        let g = "[workflow]\nrequire_pr = true\n";
+        let (cfg, _, _) = effective(Some(g), None);
+        assert!(cfg.drainer.enabled, "an absent [drainer] keeps the ON default");
+
+        // Serializes as a CONCRETE bool (`"enabled":true`), never a null/absent key: the TS seam
+        // (`config.drainer?.enabled ?? true`) depends on the wire carrying true/false, and this is
+        // exactly the serde-Option-crosses-as-null trap AGENTS.md warns about, avoided by a plain bool.
+        let json = serde_json::to_string(&DrainerConfig { enabled: true }).unwrap();
+        assert_eq!(json, "{\"enabled\":true}", "wire shape must be a concrete bool: {json}");
+    }
+
+    #[test]
+    fn drainer_template_matches_the_default() {
+        // Same trap avoided the same way as `pushers_template_matches_the_default`: overlaying the
+        // template onto SparkleConfig::default() would pass with the [drainer] block MISSING because
+        // the base already holds the value. WIPE the section to something no default could be first.
+        let mut base = SparkleConfig::default();
+        base.drainer = DrainerConfig { enabled: false };
+        let (cfg, warns, hard) = build_effective(base, Some(DEFAULT_TEMPLATE), None);
+        assert!(!hard, "the shipped template must parse: {warns:?}");
+        assert_eq!(
+            cfg.drainer,
+            SparkleConfig::default().drainer,
+            "DEFAULT_TEMPLATE's [drainer] disagrees with SparkleConfig::default()"
+        );
+        // Ships LIVE, not commented out: this section is the only in-file place a human can turn the
+        // loop off, so there must be something to edit.
+        assert!(DEFAULT_TEMPLATE.contains("\n[drainer]\n"), "the block must ship uncommented");
+    }
+
+    #[test]
+    fn drainer_enabled_reads_off_spellings_and_refuses_nonsense() {
+        // The kill switch reads the SAME unambiguous off-spellings as [babysit]/[pushers], and a
+        // wrong-typed value must NEVER fail the whole layer (which would discard every unrelated
+        // setting AND leave the drainer at its ON default — failing open on a kill switch).
+        for spelling in ["false", "\"false\"", "\"off\"", "\"no\"", "0"] {
+            let toml = format!("[drainer]\nenabled = {spelling}\n");
+            let (cfg, _w, hard) = build_effective(SparkleConfig::default(), Some(&toml), None);
+            assert!(!hard, "{spelling} must not be a hard error");
+            assert!(!cfg.drainer.enabled, "`enabled = {spelling}` must stop the drainer");
+        }
+        // A value with no defensible off-reading warns and changes nothing — the default is only ever
+        // flipped by an intent, never by a typo, and crucially it stays ON rather than parsing fatally.
+        let (cfg, warns, hard) =
+            build_effective(SparkleConfig::default(), Some("[drainer]\nenabled = \"maybe\"\n"), None);
+        assert!(!hard, "a wrong-typed kill switch must not discard the whole layer");
+        assert!(cfg.drainer.enabled, "an unreadable value must leave the shipped default alone");
+        assert!(
+            warns.iter().any(|w| w.contains("[drainer].enabled")),
+            "and it must SAY the edit did nothing: {warns:?}"
+        );
+        // An unknown key under [drainer] is reported, not silently swallowed or fatal.
+        let (_cfg, warns, hard) =
+            build_effective(SparkleConfig::default(), Some("[drainer]\nenabeld = false\n"), None);
+        assert!(!hard, "one misspelled key must not discard the whole layer");
+        assert!(warns.iter().any(|w| w.contains("[drainer].enabeld")), "{warns:?}");
+
+        // Engine-owned knobs the SHELL watchdog reads from this same file (feedback_floor, max_workers,
+        // claim_max_age, inprogress_max_age, lock_ttl) are valid settings — the app must NOT report
+        // them as inert, or a user who set a rest floor would delete it and get a MORE aggressive fleet.
+        for key in ["feedback_floor", "max_workers", "claim_max_age", "inprogress_max_age", "lock_ttl"] {
+            let toml = format!("[drainer]\n{key} = 20\n");
+            let (_cfg, warns, hard) = build_effective(SparkleConfig::default(), Some(&toml), None);
+            assert!(!hard, "{key} must not be a hard error");
+            assert!(
+                !warns.iter().any(|w| w.contains(&format!("[drainer].{key}"))),
+                "{key} is a real engine setting and must not be reported as having no effect: {warns:?}"
+            );
+        }
     }
 
     #[test]

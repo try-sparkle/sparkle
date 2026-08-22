@@ -63,6 +63,7 @@ mod deps_bootstrap;
 mod dev_identity;
 mod dictation;
 mod display_span;
+mod drainer;
 mod fleet;
 mod gh_rest;
 mod folder_picker;
@@ -955,6 +956,48 @@ pub fn run() {
                     });
                 }
             }
+            // Backlog-drainer auto-start (retro feature: make a shipped DMG run the drainer with zero
+            // human steps). Mirrors the roborev daemon-ensure above: read the machine-wide [drainer]
+            // kill-switch at launch and idempotently INSTALL the LaunchAgent supervisor
+            // (scripts/backlog-drainer.sh --install) when ON, or UNINSTALL it when OFF so nothing is
+            // scheduled and no worker is ever spawned. ON by default. NEVER clones — if the app-owned
+            // sparkle-self checkout isn't present yet, the ensure no-ops and a later launch installs.
+            // Best-effort and OFF the startup path (spawn_blocking shells out to bash + launchctl);
+            // any failure is swallowed and retried next launch. See drainer.rs for the safety rails.
+            {
+                let enabled = config::current_effective().config.drainer.enabled;
+                match dev_identity::app_data_dir(app.handle()) {
+                    Ok(app_data) => {
+                        tauri::async_runtime::spawn(async move {
+                            let repo = drainer::sparkle_repo_root(&app_data);
+                            match tauri::async_runtime::spawn_blocking(move || {
+                                drainer::ensure_backlog_drainer_at(&repo, enabled)
+                            })
+                            .await
+                            {
+                                Ok(Ok(Some(mode))) => {
+                                    tracing::info!(mode, enabled, "backlog-drainer: launch ensure ran")
+                                }
+                                Ok(Ok(None)) => tracing::debug!(
+                                    enabled,
+                                    "backlog-drainer: sparkle-self clone not present yet; skipped"
+                                ),
+                                Ok(Err(e)) => tracing::warn!(
+                                    error = %e,
+                                    enabled,
+                                    "backlog-drainer ensure failed (non-fatal)"
+                                ),
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "backlog-drainer ensure task failed")
+                                }
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "backlog-drainer ensure skipped (app_data_dir)")
+                    }
+                }
+            }
             // Plugin pre-enable install ensure (bead sparkle-s3g2.1). Writing `enabledPlugins` into
             // each worktree does NOT fetch the plugin — Claude Code only loads one that is actually
             // installed — so run the headless, idempotent `claude plugin install` for the default-on
@@ -1289,6 +1332,7 @@ pub fn run() {
             babysit_lease::babysit_lease_release,
             babysit_lease::babysit_leases,
             sparkle_agent::ensure_sparkle_repo,
+            drainer::ensure_backlog_drainer,
             sparkle_agent::reap_secondary_sparkle_worktrees,
             sparkle_agent::sparkle_submit_capability,
             // Per-project concierge tool policy: the frontend's synchronous slug cache is filled

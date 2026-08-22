@@ -185,11 +185,14 @@ describe("ToolsPane", () => {
     // Hand-listed on purpose, unlike the derived counts further down: this is the one assertion
     // that says WHICH rows the pane offers, so a new plugin must be added here deliberately. A
     // count derived from the store's key set would accept any row set at all.
-    expect(screen.getAllByRole("switch")).toHaveLength(18);
+    expect(screen.getAllByRole("switch")).toHaveLength(19);
     for (const name of [
       "Deepgram voice",
       "Guardrails",
       "Roborev",
+      // Machine-wide autonomous loop, beside Roborev — the user-facing kill-switch for the
+      // background backlog drainer (default ON; off uninstalls its launchd supervisor).
+      "Backlog drainer",
       "Builder Index",
       // The SECOND reporting destination, and it sits beside the Builder Index deliberately —
       // these are competing leaderboards and the pane is where a user chooses either, both, or

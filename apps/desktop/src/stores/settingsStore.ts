@@ -784,6 +784,12 @@ interface SettingsState {
    *  the daemon reviews each BUILD-agent commit; off → dormant. Mirrors [tools].roborev. Config-
    *  backed, NOT persisted — re-read from the file each launch. */
   roborevEnabled: boolean;
+  /** Backlog drainer (`[drainer]`) — the bounded fleet that auto-drains the sparkle-self
+   *  agent-feedback bead backlog via a launchd supervisor. On (default) → the launch consumer keeps
+   *  the LaunchAgent installed; off → it uninstalls it, so nothing is scheduled and no worker is ever
+   *  spawned. Mirrors [drainer].enabled. Config-backed, NOT persisted — re-read from the file each
+   *  launch (so it is absent from `partialize`, exactly like `roborevEnabled`). */
+  drainerEnabled: boolean;
   /** Builder Index (tokenmaxxing leaderboard) reporting. Mirrors [tools].builder_index — the ONE
    *  tool that defaults OFF, because it's the only one that publishes anything about you. Even
    *  when on, the Rust reporter posts nothing until consent + a username + an API key are stored
@@ -868,6 +874,9 @@ interface SettingsState {
   ) => boolean;
   setMaxConcurrentWorkers: (n: number) => void;
   setCloudDictation: (on: boolean) => void;
+  /** Toggle the backlog drainer. Optimistic store set; the config write + launchd install/uninstall
+   *  side effect live in `configActions.setDrainerEnabled`. */
+  setDrainerEnabled: (on: boolean) => void;
   /** Toggle auto-apply of desktop updates (the "Automatically apply updates" checkbox). */
   setAutoApplyUpdates: (on: boolean) => void;
   /** Toggle deleting a shipped agent's merged branch on close (optimistic; configActions persists). */
@@ -1023,6 +1032,9 @@ export const useSettingsStore = create<SettingsState>()(
       githubEnabled: true,
       guardrailsEnabled: true,
       roborevEnabled: true,
+      // Ships ON — the founder's directive (zero human steps, on by default); the shell engine's
+      // worker cap + rest floor bound the worst case and `enabled=false` is the rebuild-free switch.
+      drainerEnabled: true,
       // Default OFF — nothing is published until the user opts in AND consents.
       builderIndexEnabled: false,
       straudeEnabled: false,
@@ -1043,6 +1055,7 @@ export const useSettingsStore = create<SettingsState>()(
       setRuntimeChiefPat: (pat) => set({ runtimeChiefPat: pat.trim() }),
       setKeychainChiefPat: (pat) => set({ keychainChiefPat: pat.trim() }),
       setCloudDictation: (on) => set({ cloudDictation: on }),
+      setDrainerEnabled: (on) => set({ drainerEnabled: on }),
       setAutoApplyUpdates: (on) => set({ autoApplyUpdates: on }),
       setWindowSpanMode: (mode) => set({ windowSpanMode: mode }),
       setWindowAutoRespan: (on) => set({ windowAutoRespan: on }),
@@ -1362,6 +1375,8 @@ export const useSettingsStore = create<SettingsState>()(
           githubEnabled: config.tools?.github ?? true,
           guardrailsEnabled: config.tools?.guardrails ?? true,
           roborevEnabled: config.tools?.roborev ?? true,
+          // `?? true` like its on-by-default siblings: an absent [drainer] (older backend) keeps ON.
+          drainerEnabled: config.drainer?.enabled ?? true,
           // `?? false` here, unlike its on-by-default siblings: an absent [tools] block (older
           // backend) must read as "not opted in", never as "publishing".
           builderIndexEnabled: config.tools?.builder_index ?? false,

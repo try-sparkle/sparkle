@@ -23,6 +23,11 @@ vi.mock("./roborev", () => ({
   roborevAuthSelftest: vi.fn().mockResolvedValue({ kind: "Passed" }),
 }));
 
+// Mock the drainer shim so setDrainerEnabled's launchd side effect is observable without IPC.
+vi.mock("./drainer", () => ({
+  ensureBacklogDrainer: vi.fn().mockResolvedValue("--install"),
+}));
+
 // Mock the worktree service so the plugin-install side effect is observable without IPC (and so
 // importing it doesn't drag the pty module into jsdom).
 vi.mock("./worktree", () => ({
@@ -51,6 +56,7 @@ import {
   setMaxConcurrentWorkers,
   setPluginEnabled,
   setRoborevEnabled,
+  setDrainerEnabled,
   setResumeRule,
   authWarningFor,
   refreshRoborevAuth,
@@ -77,6 +83,7 @@ import {
   installRepoHooks,
   removeRepoHooks,
 } from "./roborev";
+import { ensureBacklogDrainer } from "./drainer";
 import { useSettingsStore, DEFAULT_SPARKLE_CONSENT } from "../stores/settingsStore";
 import { useProjectStore } from "../stores/projectStore";
 
@@ -500,6 +507,53 @@ describe("configActions", () => {
       useSettingsStore.setState({ roborevEnabled: true, roborevAuthWarning: "some warning" });
       await setRoborevEnabled(false);
       expect(useSettingsStore.getState().roborevAuthWarning).toBeNull();
+    });
+  });
+
+  describe("setDrainerEnabled", () => {
+    // This describe asserts .not.toHaveBeenCalled() across ordered cases, so call history must be
+    // cleared between them (the configActions describe has no blanket beforeEach). clearAllMocks
+    // keeps the mock implementations, only the recorded calls are dropped.
+    beforeEach(() => {
+      vi.clearAllMocks();
+    });
+
+    it("turning ON: optimistic store + config write, then installs the launchd supervisor", async () => {
+      useSettingsStore.setState({ drainerEnabled: false });
+      await setDrainerEnabled(true);
+      expect(useSettingsStore.getState().drainerEnabled).toBe(true);
+      expect(setConfigValue).toHaveBeenCalledWith("drainer.enabled", true);
+      // The ACTUAL side effect: the launchd install/uninstall command runs with the same value.
+      expect(ensureBacklogDrainer).toHaveBeenCalledWith(true);
+    });
+
+    it("turning OFF: optimistic store + config write, then uninstalls the supervisor", async () => {
+      useSettingsStore.setState({ drainerEnabled: true });
+      await setDrainerEnabled(false);
+      expect(useSettingsStore.getState().drainerEnabled).toBe(false);
+      expect(setConfigValue).toHaveBeenCalledWith("drainer.enabled", false);
+      expect(ensureBacklogDrainer).toHaveBeenCalledWith(false);
+    });
+
+    it("turning ON with a failed config write short-circuits AND reverts the row", async () => {
+      // ON is a START: if the write the next launch reads didn't land, we must not chase it with an
+      // install the file won't corroborate — and the row must not keep asserting ON.
+      vi.mocked(setConfigValue).mockRejectedValueOnce(new Error("disk full"));
+      useSettingsStore.setState({ drainerEnabled: false });
+      await setDrainerEnabled(true);
+      expect(ensureBacklogDrainer).not.toHaveBeenCalled();
+      expect(useSettingsStore.getState().drainerEnabled).toBe(false); // reverted to persisted value
+    });
+
+    it("turning OFF with a failed config write STILL uninstalls AND reverts the row (no silent un-kill)", async () => {
+      // The dangerous half: a failed write on OFF must NOT leave the supervisor live while the UI
+      // reads off. Stopping is safe regardless of the write, so the uninstall runs; and the row is
+      // reverted to the persisted ON so it can't silently re-enable at next launch behind an OFF UI.
+      vi.mocked(setConfigValue).mockRejectedValueOnce(new Error("disk full"));
+      useSettingsStore.setState({ drainerEnabled: true });
+      await setDrainerEnabled(false);
+      expect(ensureBacklogDrainer).toHaveBeenCalledWith(false);
+      expect(useSettingsStore.getState().drainerEnabled).toBe(true); // reverted: UI matches persisted state
     });
   });
 

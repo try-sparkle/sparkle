@@ -6,6 +6,7 @@ import {
   FiBarChart2,
   FiTerminal,
   FiShield,
+  FiRefreshCw,
   FiCheckCircle,
   FiBookOpen,
   FiLayout,
@@ -28,6 +29,7 @@ import {
   setToolEnabled,
   setPluginEnabled,
   setRoborevEnabled,
+  setDrainerEnabled,
   refreshPluginInstallState,
   setBuilderIndexEnabled,
   setStraudeEnabled,
@@ -88,6 +90,11 @@ export const TOOL_META = {
     name: "Roborev",
     desc: "Per-commit AI code review of your BUILD agents' commits, using your Claude login.",
     keywords: "roborev review code review findings",
+  },
+  drainer: {
+    name: "Backlog drainer",
+    desc: "Keeps a bounded fleet quietly draining the Sparkle-improvement feedback backlog in the background, resting when it's empty. On by default; off uninstalls it so nothing runs.",
+    keywords: "backlog drainer supervisor auto drain feedback beads fleet background launchd",
   },
   onepassword: {
     name: "1Password env backup",
@@ -497,6 +504,7 @@ export function ToolsPane({ query = "" }: { query?: string }) {
   const guardrailsEnabled = useSettingsStore((s) => s.guardrailsEnabled);
   const roborevEnabled = useSettingsStore((s) => s.roborevEnabled);
   const roborevAuthWarning = useSettingsStore((s) => s.roborevAuthWarning);
+  const drainerEnabled = useSettingsStore((s) => s.drainerEnabled);
   const builderIndexEnabled = useSettingsStore((s) => s.builderIndexEnabled);
   const openBuilderIndexModal = useSettingsStore((s) => s.setBuilderIndexModalOpen);
   const openStraudeModal = useSettingsStore((s) => s.setStraudeModalOpen);
@@ -604,6 +612,16 @@ export function ToolsPane({ query = "" }: { query?: string }) {
       hint: roborevAuthWarning ?? undefined,
       checked: roborevEnabled,
       onToggle: () => void setRoborevEnabled(!roborevEnabled),
+    },
+    {
+      // The backlog drainer's user-facing kill-switch. Beside Roborev deliberately: both are
+      // machine-wide autonomous loops driven off config, and this is the one place to switch it off
+      // without a rebuild (the launch consumer then uninstalls the launchd supervisor).
+      ...TOOL_META.drainer,
+      key: "drainer",
+      Icon: FiRefreshCw,
+      checked: drainerEnabled,
+      onToggle: () => void setDrainerEnabled(!drainerEnabled),
     },
     {
       ...TOOL_META.builderIndex,

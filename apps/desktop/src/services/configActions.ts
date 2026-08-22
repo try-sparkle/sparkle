@@ -37,6 +37,7 @@ import {
   pluginInstallOutcomes,
   type PluginInstallOutcome,
 } from "./worktree";
+import { ensureBacklogDrainer } from "./drainer";
 import { useApprovalsStore } from "../stores/approvalsStore";
 import {
   DEFAULT_RESUME_RULE,
@@ -664,6 +665,42 @@ export async function setPluginEnabled(key: PluginKey, on: boolean): Promise<voi
     console.warn("plugin install pass failed (will retry next launch)", e);
     store.setPluginInstallState(key, pluginPassFailedHint());
   }
+}
+
+/** Turn the backlog drainer on or off.
+ *
+ * Beyond the config write, this has a real side effect: turning it ON installs the launchd
+ * supervisor (scripts/backlog-drainer.sh --install); turning it OFF uninstalls it, so nothing is
+ * scheduled and no worker is ever spawned. The optimistic store update + config write go first so
+ * the UI flips instantly; the launchd install/uninstall is best-effort (the drainer.ts wrapper
+ * swallows + logs its own error) and never rejects. Written to the GLOBAL config: how much of this
+ * machine's quota an autonomous drain loop may spend is a property of the machine, not a repo.
+ *
+ * The kill-switch is honoured even if this side effect fails: the launch consumer re-applies it on
+ * the next launch, and the shell watchdog itself re-reads [drainer].enabled every pass. */
+export async function setDrainerEnabled(on: boolean): Promise<void> {
+  const prev = useSettingsStore.getState().drainerEnabled;
+  useSettingsStore.getState().setDrainerEnabled(on);
+  try {
+    await setConfigValue("drainer.enabled", on);
+  } catch (e) {
+    console.warn("config write failed (drainer)", e);
+    // The config file is what the launch consumer reads next start, and this write did NOT land — so
+    // REVERT the optimistic row to the persisted value. Without this, an OFF the user threw would read
+    // OFF all session while the unchanged `enabled = true` re-installs the supervisor at next launch:
+    // a kill switch that silently un-kills itself, the one failure the module doctrine calls
+    // unrecoverable-by-noticing-later.
+    useSettingsStore.getState().setDrainerEnabled(prev);
+    // DIRECTIONAL. ON is a START: don't chase a write the config won't corroborate — bail.
+    if (on) return;
+    // OFF is a STOP: still tear the supervisor down for THIS session (idempotent, config-independent),
+    // even though the persisted state — and the row, now reverted — stay ON until the user retries.
+    await ensureBacklogDrainer(false);
+    return;
+  }
+  // Apply it now so the toggle takes effect without an app restart (mirrors setRoborevEnabled's
+  // install/deactivate). Best-effort: the config write is what the next launch honours anyway.
+  await ensureBacklogDrainer(on);
 }
 
 /** Toggle roborev (the per-commit AI code-review daemon). Beyond the config write, this has real

@@ -184,6 +184,12 @@ export interface RoborevConfig {
 export interface ImprovementConfig {
   consent: "always" | "case_by_case" | "never" | null;
 }
+/** The backlog drainer's kill-switch (`[drainer]`). Machine-wide (like `[roborev]`/`[babysit]`);
+ *  ignored in a per-project file. Ships `enabled: true`. Config-backed and NOT persisted to
+ *  localStorage — re-read from the file each launch (see `settingsStore.ts` `drainerEnabled`). */
+export interface DrainerConfig {
+  enabled: boolean;
+}
 /** 1Password env-backup state (chosen vault + worktree seeding). Machine-wide; ignored in a
  *  per-project file — and here that's a security boundary, not just tidiness: a project-level
  *  value would let one repo redirect where another repo's secrets are written. */
@@ -326,6 +332,10 @@ export interface SparkleConfig {
    *  predating [improvement] omits it. Callers read `config.improvement?.consent ?? <store value>`,
    *  so an absent section (or a null consent) keeps the store's persisted choice. */
   improvement?: ImprovementConfig;
+  /** The backlog drainer's kill-switch. Optional for the same back-compat reason as `improvement?`
+   *  above: a payload from a Rust backend predating [drainer] omits it, so callers read
+   *  `config.drainer?.enabled ?? true` — an absent section keeps the ON default, never "off". */
+  drainer?: DrainerConfig;
   /** Optional for the same back-compat reason as `tools?`/`roborev?` above: a payload from a Rust
    *  backend predating [onepassword] omits it. Callers must guard and fall back to the off/unset
    *  defaults — never read an absent section as "enabled". */

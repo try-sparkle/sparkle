@@ -28,7 +28,7 @@ const SPARKLE_REPO_URL: &str = "https://github.com/try-sparkle/sparkle.git";
 
 /// Synthetic project id namespacing the Sparkle agent's worktrees under app-data. MUST match
 /// `SPARKLE_PROJECT_ID` in `src/services/sparkleAgent.ts`.
-const SPARKLE_PROJECT_ID: &str = "sparkle-self";
+pub(crate) const SPARKLE_PROJECT_ID: &str = "sparkle-self";
 
 /// The CANONICAL Sparkle agent id — the main window's interactive pane and the hourly headless
 /// pass share it (one worktree). MUST match `SPARKLE_AGENT_ID` in `src/services/sparkleAgent.ts`.
