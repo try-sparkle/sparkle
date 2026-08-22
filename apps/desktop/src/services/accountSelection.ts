@@ -558,9 +558,10 @@ async function accountsHoldingTranscript(
  *   2. NOT AT THE OBSERVED WALL — an `exhaustedUntil` in the future strands it at a rate limit;
  *   3. NOT LIVE-SPENT — Anthropic's OWN utilization (`isAccountLiveSpent`, ≥ `LIVE_AVOID_PERCENT`)
  *      is the proactive-avoid signal `partitionAccounts` already excludes on. Resuming under a holder
- *      Anthropic reports at ≥95% lands the agent ~5% from a wall it will hit within the session, then
- *      move accounts MID-TASK (a proactive move has no stale-resume retry, by design) — worse than
- *      moving now. This is the SAME move-and-warn the exhausted-holder case already makes; live-spent
+ *      Anthropic reports at or above `LIVE_AVOID_PERCENT` lands the agent close to a wall it will hit
+ *      within the session, then move accounts MID-TASK (a proactive move has no stale-resume retry, by
+ *      design) — worse than moving now. This is the SAME move-and-warn the exhausted-holder case
+ *      already makes; live-spent
  *      is FACT, not the retired learned-ceiling estimate, so aligning the two is a tightening, not a
  *      new heuristic.
  *

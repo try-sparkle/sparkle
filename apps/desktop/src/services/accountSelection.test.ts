@@ -892,7 +892,7 @@ describe("transcript affinity", () => {
 
   it("STILL resumes under the holder when its live usage is present but BELOW the avoid threshold", async () => {
     // The other half of the pair: the new gate must not over-trigger. With live data present but the
-    // holder at a merely-busy 50%, affinity still wins — proving the change excludes on the ≥95%
+    // holder at a merely-busy 50%, affinity still wins — proving the change excludes on the ≥ LIVE_AVOID_PERCENT
     // FACT, not on the presence of any live row. Non-vacuous against negating the clause: flip
     // `!isAccountLiveSpent` and this usable holder is skipped, `fresh` is chosen, and this reds.
     await seedLive(AFF_ACCOUNTS, {

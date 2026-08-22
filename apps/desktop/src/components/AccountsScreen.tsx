@@ -1628,24 +1628,30 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
           `pickAccount` still returns an account rather than refusing, so promising a block would be
           false, and so would implying everything is fine.
 
-          ON THE WORDING: the sentence below is the founder's, chosen to settle a contradiction
-          between two older strings (sparkle-cjpte). `pickAccount` IS lowest-usage in the general
-          case — see accountSelection.ts — but in THIS branch, where every account is already at its
-          limit, the pick is the least-bad fallback rather than a genuinely least-used one. The copy
-          is deliberate and is not to be re-voiced here; this note exists so the next reader knows
-          the nuance is known rather than overlooked. */}
+          ON THE WORDING: the "least-used account" sentence below is the founder's, chosen to settle a
+          contradiction between two older strings (sparkle-cjpte) — `pickAccount` IS lowest-usage in
+          general, but in THIS branch the pick is the least-bad fallback rather than a genuinely
+          least-used one. That sentence is deliberate and not re-voiced here. The HEADLINE now
+          distinguishes an observed wall ("at its limit") from live-utilization-only ("near its
+          limit") — see the render below — because the 90 avoid threshold can fire this on accounts
+          that are high but not walled, where "at its limit" would overstate. */}
       {outlook.allAtLimit && (
         <div data-testid="all-at-limit-banner" role="alert" style={noticeCard(C.dangerInk)}>
           <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 13, fontWeight: 600 }}>
             <FiAlertTriangle size={13} aria-hidden />
-            {readiness.usableLogins === 1
-              ? "Your only signed-in account is at its limit."
-              : "All accounts are at their limit."}
+            {/* "at its limit" only when there is an OBSERVED WALL (earliestReset set). When the banner
+                fires on live utilization alone — high real usage but no rate-limit event — the account
+                is NEAR its limit, not at it, and agents are still spawning. Saying "at its limit … no
+                reset time" there overstates a wall that has not been hit; this matters more now that
+                the avoid threshold is 90 (see LIVE_AVOID_PERCENT), so the banner can fire with up to
+                10% real quota left. */}
             {outlook.earliestReset != null
               ? readiness.usableLogins === 1
-                ? ` It frees up at ${clockTime(outlook.earliestReset)}.`
-                : ` The first frees up at ${clockTime(outlook.earliestReset)}.`
-              : " No reset time has been reported yet."}
+                ? `Your only signed-in account is at its limit. It frees up at ${clockTime(outlook.earliestReset)}.`
+                : `All accounts are at their limit. The first frees up at ${clockTime(outlook.earliestReset)}.`
+              : readiness.usableLogins === 1
+                ? "Your only signed-in account is near its limit — high real usage, but no hard wall yet."
+                : "All accounts are near their limit — high real usage, but no hard wall yet."}
           </div>
           <div style={{ marginTop: 4 }}>Sparkle spawns new agents in the least-used account.</div>
         </div>

@@ -9,7 +9,7 @@ import {
   type Ceiling,
   type SwitchRecommendation,
 } from "./headroom";
-import { accountDisplay, CEILING_AVOID_FRACTION } from "./accountStore";
+import { accountDisplay, CEILING_AVOID_FRACTION, LIVE_AVOID_PERCENT } from "./accountStore";
 import type { Account, Usage, Identity } from "./accountStore";
 
 const NOW = 1_000_000;
@@ -122,15 +122,43 @@ describe("switchRecommendation", () => {
   });
 
   it("does NOT trigger when the current account's live usage is BELOW the avoid threshold", () => {
-    // The paired negative. `a` at 94% weekly is under LIVE_AVOID_PERCENT (95) and has no wall, so it
-    // is not spent — the boundary that proves the THRESHOLD drives the trigger, not the mere presence
-    // of a live row. Bump 94→95 and the recommendation appears.
+    // The paired negative. `a` one point UNDER LIVE_AVOID_PERCENT and with no wall is not spent — the
+    // boundary that proves the THRESHOLD drives the trigger, not the mere presence of a live row.
+    // Symbolic in the constant so it holds at any threshold: bump to LIVE_AVOID_PERCENT and the
+    // recommendation appears.
     const u = [healthy, usage("b", 10)];
     const live = [
-      { id: "a", fiveHourPercent: 10, sevenDayPercent: 94 },
+      { id: "a", fiveHourPercent: 10, sevenDayPercent: LIVE_AVOID_PERCENT - 1 },
       { id: "b", fiveHourPercent: 20, sevenDayPercent: 56 },
     ];
     expect(switchRecommendation("a", twoAccts, u, bigCeil, twoIdents, NOW, live)).toBeNull();
+  });
+
+  it("pins LIVE_AVOID_PERCENT at exactly 90 (founder product decision, 2026-08-21)", () => {
+    // The intent test below pins the threshold from ABOVE (reds if > 92). This anchors the exact
+    // value so a drift ANYWHERE — e.g. to 70 — reds a test instead of silently moving the switch
+    // trigger, the spawn gate (partitionAccounts), the affinity gate (firstUsableHolder), and the
+    // "all accounts near their limit" banner (exhaustionOutlook) together. The value is a founder
+    // product decision with no other durable record in code; change it here on purpose, not by
+    // accident. See LIVE_AVOID_PERCENT's docblock for why 90.
+    expect(LIVE_AVOID_PERCENT).toBe(90);
+  });
+
+  it("TRIGGERS at the INCIDENT value of 92% — pins the threshold at ≤92, not the mechanism", () => {
+    // The symbolic boundary tests above prove the threshold DRIVES the trigger, but they hold at any
+    // threshold, so a revert of LIVE_AVOID_PERCENT to 95 would leave them all green while the founder's
+    // reported symptom returns. This pins the VALUE: an account at 92% (the measured incident — reached
+    // on Auto without switching under the old 95 bar) must now produce a recommendation. Goes RED if
+    // the constant drifts back above 92.
+    const u = [healthy, usage("b", 10)];
+    const live = [
+      { id: "a", fiveHourPercent: 10, sevenDayPercent: 92 }, // the incident value
+      { id: "b", fiveHourPercent: 20, sevenDayPercent: 56 }, // healthy target
+    ];
+    const rec = switchRecommendation("a", twoAccts, u, bigCeil, twoIdents, NOW, live);
+    expect(rec?.from.id).toBe("a");
+    expect(rec?.to.id).toBe("b");
+    expect(rec?.reason).toBe("exhausted");
   });
 
   it("TRIGGERS on a live SESSION wall too — the trigger is symmetric across both windows", () => {
@@ -642,9 +670,10 @@ describe("exhaustionOutlook (AC8)", () => {
     expect(got.allAtLimit).toBe(true);
     // ...but it has no observed rate-limit event, so there is NO reset instant to quote.
     expect(got.earliestReset).toBeNull();
-    // Just under the line → still has room → not all-at-limit. Remove the live clause from
-    // exhaustionOutlook and the first assertion flips to false (out of step with the gate again).
-    const under = [{ id: "a", fiveHourPercent: 94, sevenDayPercent: 10 }];
+    // Just under the line → still has room → not all-at-limit. Symbolic (LIVE_AVOID_PERCENT - 1) so it
+    // holds at any threshold. Remove the live clause from exhaustionOutlook and the first assertion
+    // flips to false (out of step with the gate again).
+    const under = [{ id: "a", fiveHourPercent: LIVE_AVOID_PERCENT - 1, sevenDayPercent: 10 }];
     expect(exhaustionOutlook(["a"], [usage("a", 1)], [ceil("a", CEIL)], NOW, under).allAtLimit).toBe(
       false,
     );

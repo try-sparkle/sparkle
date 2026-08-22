@@ -2103,23 +2103,28 @@ describe("AC8 — every account at its limit", () => {
     expect(screen.queryByTestId("all-at-limit-banner")).toBeNull();
   });
 
-  it("fires from REAL Anthropic usage with no observed wall — and quotes NO reset time", async () => {
+  it("fires from REAL Anthropic usage with no observed wall — and says NEAR, not AT, its limit", async () => {
     // AC8 tracks the SAME signal the spawn gate excludes on: an account at 97% of its REAL Anthropic
-    // limit with NO rate-limit event is out of room to auto-pick, so the banner must say so. And
-    // because there is no observed wall, there is no reset instant to quote — the "No reset time"
-    // branch (unreachable under observed-only) is reachable again exactly here. Remove the live
-    // clause from `exhaustionOutlook` and this banner never renders (the gate and banner disagree).
+    // limit with NO rate-limit event is out of room to auto-pick, so the banner must say so. But
+    // because there is no observed wall, the account is NEAR its limit, not AT it — agents still spawn
+    // — so the copy must not claim a wall was hit. This distinction matters now that the avoid
+    // threshold is 90 (LIVE_AVOID_PERCENT): the banner can fire with up to 10% real quota left. Remove
+    // the live clause from `exhaustionOutlook` and this banner never renders (the gate and banner
+    // disagree).
     const deps = makeDeps(
       [acct("a")],
       [used("a", 5)], // low local tally, NOT exhausted
       [signedInAs("a", "one@example.com")],
       [ceiling("a", CEIL)],
     );
-    deps.getUsageLive = vi.fn(async () => liveUsage(97, 50)); // 97% real → spent
+    deps.getUsageLive = vi.fn(async () => liveUsage(97, 50)); // 97% real → spent (near limit, no wall)
     render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
     const banner = await screen.findByTestId("all-at-limit-banner");
-    expect(banner.textContent).toContain("Your only signed-in account is at its limit");
-    expect(banner.textContent).toContain("No reset time has been reported yet");
+    expect(banner.textContent).toContain("Your only signed-in account is near its limit");
+    expect(banner.textContent).toContain("no hard wall yet");
+    // The overstatement this fixes: no observed wall must not read as "at its limit" / a reset to wait on.
+    expect(banner.textContent).not.toContain("at its limit");
+    expect(banner.textContent).not.toContain("No reset time has been reported yet");
     expect(banner.textContent).not.toMatch(/frees up at/);
   });
 });

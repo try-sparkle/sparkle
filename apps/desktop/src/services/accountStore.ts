@@ -759,12 +759,18 @@ export interface LiveUsage {
 /** Utilization (percent of Anthropic's OWN limit) at or above which an account stops receiving new
  *  spawns.
  *
- *  Distinct from {@link CEILING_AVOID_FRACTION} because the two measure different things. That one
- *  is a fraction of a LEARNED ceiling — an estimate with a measured CoV of 0.24, which is why it
- *  acts at 0.9 rather than at the wall. This is Anthropic's own number for its own limit, so it can
- *  sit much closer to 100 without risking a false exclusion. 95 leaves a margin for the usage
- *  endpoint lagging the spend that a running agent is generating right now. */
-export const LIVE_AVOID_PERCENT = 95;
+ *  Distinct from {@link CEILING_AVOID_FRACTION} in WHAT IT MEASURES, even though the two now coincide
+ *  numerically (both effectively 0.9). That one is a fraction of a LEARNED ceiling — an estimate with
+ *  a measured CoV of 0.24 — so its value is a hedge against estimation error. This is Anthropic's OWN
+ *  number for its own limit, a FACT rather than an estimate, so the same 90 here is not a hedge but a
+ *  chosen buffer: how far below the real wall the founder wants the fleet to move.
+ *
+ *  90, lowered from 95 at the founder's instruction (2026-08-21): an account reached 92% under the
+ *  old bar without the fleet switching, which read as rotation not working. Moving the fleet off at
+ *  90 gives a wider buffer before a hard limit — the founder's priority is not hitting limits while
+ *  away — and matches the threshold he expected. The 10-point margin still covers the usage endpoint
+ *  lagging the spend a running agent is generating right now. */
+export const LIVE_AVOID_PERCENT = 90;
 
 /** The higher of an account's two live windows, or null when neither was reported.
  *
