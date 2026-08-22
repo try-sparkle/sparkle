@@ -11,7 +11,7 @@
 // claiming to be scoped.
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { useProjectStore } from "../stores/projectStore";
-import type { PreviewState } from "../stores/previewStore";
+import type { PreviewState, PreviewStatus } from "../stores/previewStore";
 import {
   startControlListener,
   CONCIERGE_CALLER_AGENT_ID,
@@ -60,15 +60,24 @@ interface OpenArgs {
 }
 // `state` widened to the full `PreviewState` union (not just its own default) so
 // `mockResolvedValueOnce` below can supply "installing"/"starting"/"listening" without a cast.
+//
+// The default is `ready` — the DISCOVERED state a re-attach to a live server reports — and it used
+// to be `"running"`, which is not a member of `PreviewState` at all and only compiled because of
+// the cast. That is the fixture equivalent of typing a wire field into a shape the producer cannot
+// emit: every test resting on this default was exercising a state Rust never sends. `ready` also
+// keeps those tests honest about the settle wait below, since a discovered address is precisely the
+// one that passes through without a poll.
 const openPreviewServerMock = vi.fn(async (_args: OpenArgs) => ({
   id: "pv1",
   url: "http://127.0.0.1:5199",
   port: 5199,
-  state: "running" as PreviewState,
+  state: "ready" as PreviewState,
 }));
 const stopPreviewMock = vi.fn(async (_id: string) => "stopped" as const);
 const stopPreviewForAgentMock = vi.fn(async (_agentId: string) => "stopped" as const);
-const fetchPreviewStatusMock = vi.fn(async (_agentId: string) => null);
+// Typed to the full `PreviewStatus | null` (not just its own `null` default) so the settle tests
+// below can supply a DISCOVERED status via `mockResolvedValueOnce` without a cast.
+const fetchPreviewStatusMock = vi.fn(async (_agentId: string): Promise<PreviewStatus | null> => null);
 const listPreviewsMock = vi.fn(async () => []);
 vi.mock("./preview", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./preview")>();
@@ -148,7 +157,7 @@ describe("control op: preview", () => {
     });
     expect(lastReply()).toMatchObject({
       ok: true,
-      preview: { id: "pv1", url: "http://127.0.0.1:5199", port: 5199, state: "running" },
+      preview: { id: "pv1", url: "http://127.0.0.1:5199", port: 5199, state: "ready" },
     });
   });
 
@@ -394,15 +403,16 @@ describe("control op: preview", () => {
     },
   );
 
-  // `state: "starting"` here is the DISCRIMINATING case (roborev 64017): a state-keyed
-  // implementation (`state === "installing" || state === "starting"`) passes the two rows above
-  // too, since both keep an empty address — the only thing that tells the two hypotheses apart is
-  // a `starting` reply that DOES carry a real address, which is exactly what a fresh (non-reattach)
-  // `preview_open` returns (`preview.rs`'s `open_reserved`, tail: `PreviewOpened { url:
-  // preview_url_for(port), port, state: PreviewState::Starting }`). A state-keyed guard would strip
-  // the URL from every ordinary open reply; `"listening"` alone could never have caught that.
-  it.each(["starting", "listening"] as const)(
-    "open with a real port already allocated (state %s) → the real url/port pass through",
+  // A POST-DISCOVERY state passes straight through, and must NOT be made to wait. `listening` is
+  // only reached from `supervise`'s `discover_port` (preview.rs), so its address is already the
+  // BOUND one — polling again would add a round trip to every re-attach for an answer we hold.
+  //
+  // `starting` deliberately does NOT appear in this row any more; see the settle tests below for
+  // why its address is the one thing that must never pass through. That split is also what still
+  // discriminates roborev 64017's state-keyed strip: a guard keyed on the STATE alone would strip
+  // this reply's real address too, and this row goes red if anyone reintroduces one.
+  it.each(["listening"] as const)(
+    "open with an already-DISCOVERED port (state %s) → the real url/port pass through, unpolled",
     async (state) => {
       openPreviewServerMock.mockResolvedValueOnce({
         id: "pv1",
@@ -416,8 +426,137 @@ describe("control op: preview", () => {
         ok: true,
         preview: { id: "pv1", url: "http://127.0.0.1:5199", port: 5199, state },
       });
+      expect(fetchPreviewStatusMock).not.toHaveBeenCalled();
     },
   );
+
+  // ─── THE BOUND PORT, NOT THE REQUESTED ONE ────────────────────────────────────────────────────
+  //
+  // `preview_open` returns BEFORE the dev server has listened: `open_reserved`'s tail is
+  // `PreviewOpened { url: preview_url_for(port), port, state: Starting }` where `port` is the one
+  // SPARKLE ASKED FOR. That address is a PREDICTION, and the prediction is wrong exactly when it
+  // matters: `Framework::Unknown` gets no port flag at all (`port_args`'s `_ => Vec::new()` arm),
+  // and a framework free to hop off a taken port does so silently. `supervise` then discovers the
+  // REAL port and `transition`s the manager onto it — but that correction only ever reached the
+  // pane, over the `preview:state` event. The agent that called this op got the guess, reported it
+  // to the human, and the link opened a port nothing was serving.
+  //
+  // THIS IS THE ROW THAT FAILS IF A CONSTANT PORT IS USED, and it is parameterised for exactly that
+  // reason. The requested port and the bound port are different numbers, so an implementation that
+  // echoes `opened.port` cannot satisfy it — but a single row asserting `port: 3000` would also be
+  // satisfied by a hardcoded 3000, which is the same defect wearing the answer as a costume. TWO
+  // different bound ports against the SAME requested port leave no constant that passes both.
+  it.each([
+    [3000, "http://127.0.0.1:3000"],
+    [4321, "http://127.0.0.1:4321"],
+  ])(
+    "open → the reply carries the port the dev server actually BOUND (%i), not the one Sparkle asked for",
+    async (boundPort, boundUrl) => {
+      openPreviewServerMock.mockResolvedValueOnce({
+        id: "pv1",
+        url: "http://127.0.0.1:5199",
+        port: 5199,
+        state: "starting",
+      });
+      fetchPreviewStatusMock.mockResolvedValueOnce({
+        id: "pv1",
+        agentId: buildId,
+        projectId,
+        url: boundUrl,
+        port: boundPort,
+        state: "ready",
+        error: null,
+      });
+      fire({ reqId: "p16", op: "preview", callerAgentId: buildId, payload: { previewOp: "open" } });
+      await flush();
+      expect(fetchPreviewStatusMock).toHaveBeenCalledWith(buildId);
+      const preview = lastReply().preview as { url: string; port: number; state: string; id: string };
+      expect(preview).toEqual({ id: "pv1", url: boundUrl, port: boundPort, state: "ready" });
+      expect(preview.port).not.toBe(5199);
+      expect(preview.url).not.toContain("5199");
+    },
+  );
+
+  // The settle wait is bounded by an ANSWER as well as by its deadline. A server that died before
+  // listening will never produce a port, so waiting out the full budget would hold the op open for
+  // twenty seconds to return the same "no address" it can already give.
+  it.each(["failed", "crashed", "stopped"] as const)(
+    "open whose server reaches a terminal state (%s) → gives up at once with no address",
+    async (state) => {
+      openPreviewServerMock.mockResolvedValueOnce({
+        id: "pv1",
+        url: "http://127.0.0.1:5199",
+        port: 5199,
+        state: "starting",
+      });
+      fetchPreviewStatusMock.mockResolvedValueOnce({
+        id: "pv1",
+        agentId: buildId,
+        projectId,
+        url: null,
+        port: null,
+        state,
+        error: "the dev server exited before it started listening.",
+      });
+      fire({ reqId: "p17", op: "preview", callerAgentId: buildId, payload: { previewOp: "open" } });
+      await flush();
+      expect(fetchPreviewStatusMock).toHaveBeenCalledTimes(1);
+      expect(lastReply()).toEqual({ ok: true, preview: { id: "pv1", state } });
+    },
+  );
+
+  // `fetchPreviewStatus` is keyed by AGENT, not by preview id, and one agent holds one preview. So a
+  // concurrent stop-and-reopen inside the settle window replaces the entry under us, and the status
+  // we read then describes a DIFFERENT server than the one this call opened. Pairing that server's
+  // port with our own preview's id would report an address the id does not name — a quieter version
+  // of the same defect this whole function exists to remove, since the caller would be told a
+  // specific preview is reachable somewhere it is not.
+  //
+  // The honest answer is that OUR preview has no address, plus the freshest state observed.
+  it("open whose preview is REPLACED mid-wait → reports no address, never the replacement's port", async () => {
+    openPreviewServerMock.mockResolvedValueOnce({
+      id: "pv1",
+      url: "http://127.0.0.1:5199",
+      port: 5199,
+      state: "starting",
+    });
+    // A different id: the entry this agent holds is no longer the one we opened.
+    fetchPreviewStatusMock.mockResolvedValueOnce({
+      id: "pv2",
+      agentId: buildId,
+      projectId,
+      url: "http://127.0.0.1:3000",
+      port: 3000,
+      state: "ready",
+      error: null,
+    });
+    fire({ reqId: "p19", op: "preview", callerAgentId: buildId, payload: { previewOp: "open" } });
+    await flush();
+    const reply = lastReply();
+    expect(reply).toEqual({ ok: true, preview: { id: "pv1", state: "ready" } });
+    // The replacement's address must not be attributed to our preview.
+    expect(JSON.stringify(reply)).not.toContain("3000");
+    expect(JSON.stringify(reply)).not.toContain("pv2");
+  });
+
+  // A fresh open whose address never settles must report NO address rather than the guess. The
+  // `{ id, state }` shape is the contract this op already defines for "started, nothing to point a
+  // browser at yet" — the caller watches the pane, which the `preview:state` event still populates.
+  it("open that never discovers a port → reports no address rather than the requested one", async () => {
+    openPreviewServerMock.mockResolvedValueOnce({
+      id: "pv1",
+      url: "http://127.0.0.1:5199",
+      port: 5199,
+      state: "starting",
+    });
+    // `null` = the supervisor has no entry for this agent, so there is nothing left to wait for.
+    fetchPreviewStatusMock.mockResolvedValueOnce(null);
+    fire({ reqId: "p18", op: "preview", callerAgentId: buildId, payload: { previewOp: "open" } });
+    await flush();
+    const reply = lastReply();
+    expect(reply).toEqual({ ok: true, preview: { id: "pv1", state: "starting" } });
+    expect(JSON.stringify(reply)).not.toContain("5199");
+  });
 
   it("a failing supervisor call is reported as a refusal, not as a thrown op", async () => {
     openPreviewServerMock.mockRejectedValueOnce(new Error("already-starting"));

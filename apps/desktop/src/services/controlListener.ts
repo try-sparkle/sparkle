@@ -160,7 +160,13 @@ import {
 } from "./peerMessaging";
 // The preview supervisor's wrappers — the ONE module that invokes the Rust preview commands, so
 // this handler never touches `invoke` directly (services/preview's own header explains why).
-import { openPreviewServer, stopPreviewForAgent, fetchPreviewStatus } from "./preview";
+import {
+  openPreviewServer,
+  stopPreviewForAgent,
+  fetchPreviewStatus,
+  type PreviewOpened,
+} from "./preview";
+import type { PreviewState } from "../stores/previewStore";
 import type { ControlOp } from "../stores/selfReportMetrics";
 import type { AgentTab, AgentTabStatus } from "../types";
 
@@ -2735,6 +2741,119 @@ type PreviewSubOp = (typeof PREVIEW_OPS)[number];
 const PREVIEW_ROUTE = /^\/(?![/\\])[^\s\x00-\x1f\x7f]*$/;
 
 /**
+ * The states in which a preview's address is the port the dev server ACTUALLY BOUND.
+ *
+ * `supervise` (preview.rs) is the only thing that can move a preview into any of these, and it does
+ * so only from `discover_port`'s `Ok(Some(port))` arm — so reaching one of them IS the proof that a
+ * listening socket was observed and its port read off `lsof`. Everything before them carries at
+ * best a prediction.
+ */
+const PREVIEW_DISCOVERED_STATES: ReadonlySet<PreviewState> = new Set<PreviewState>([
+  "listening",
+  "ready",
+  "serving",
+]);
+
+/** The states from which no port will ever arrive — `supervise` has stopped watching. */
+const PREVIEW_TERMINAL_STATES: ReadonlySet<PreviewState> = new Set<PreviewState>([
+  "failed",
+  "crashed",
+  "stopped",
+]);
+
+/** How long `open` waits for discovery before answering with no address.
+ *
+ *  THIS BUDGET IS THE TAIL OF A SHARED 30 s, NOT A BUDGET OF ITS OWN. The MCP client gives the
+ *  whole op `DEFAULT_TIMEOUT_MS` (`bridgeClient.ts`), and "the client's wait is the ceiling and the
+ *  server must respect it" — so what this may spend is 30 s MINUS whatever `open_reserved` already
+ *  spent getting here (target detection, a login-shell PATH lookup, the spawn itself: seconds, and
+ *  more when a deps wait runs). The listener cannot read the caller's actual deadline — Rust strips
+ *  `deadlineMs` as a reserved envelope field before forwarding — so the split is static and must be
+ *  conservative.
+ *
+ *  Twelve seconds is that conservative half. Rust polls discovery every 500 ms and a Vite or Next
+ *  server binds 1-3 s after spawn, so this is several times the case it exists for, while leaving
+ *  ~18 s for everything upstream.
+ *
+ *  GETTING THIS TOO HIGH IS A REGRESSION, NOT MERELY A SLOW REPLY. `preview` is NOT in
+ *  `TIMEOUT_RETRYABLE_OPS`, so overrunning the ceiling hands the caller a bare transport failure —
+ *  strictly worse than the `{ id, state }` degraded reply it would otherwise get, and worse than
+ *  the wrong address this whole function exists to stop returning. Deliberately NOT matched to
+ *  Rust's 120 s `READY_TIMEOUT`: a caller kept waiting past its own transport deadline learns
+ *  nothing, while the pane keeps painting from `preview:state` either way. */
+const PREVIEW_SETTLE_TIMEOUT_MS = 12_000;
+
+/** Gap between discovery polls. Matches Rust's own `DISCOVERY_INTERVAL` order of magnitude — the
+ *  supervisor cannot answer faster than it looks. */
+const PREVIEW_SETTLE_POLL_MS = 250;
+
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+/**
+ * Resolve a fresh `preview open` onto the port the dev server ACTUALLY BOUND.
+ *
+ * THE ADDRESS `preview_open` RETURNS IS A PREDICTION, NOT AN OBSERVATION. `open_reserved`
+ * (preview.rs) tails with `PreviewOpened { url: preview_url_for(port), port, state: Starting }`
+ * where `port` is the one Sparkle FORCED on the command line — returned before the child has
+ * listened, because for a driven framework it is usually right. Usually is the problem:
+ *
+ *   * `Framework::Unknown` gets NO port flag at all (`port_args`'s `_ => Vec::new()` arm), so a
+ *     plain `node server.js` binds wherever it likes — commonly `:3000` — while we predicted the
+ *     port we allocated.
+ *   * a framework free to hop off a taken port does so silently (only Vite is given
+ *     `--strictPort`).
+ *
+ * `supervise` then discovers the real port and `transition`s onto it, which emits `preview:state`
+ * — so THE PANE self-corrects and the agent that called this op did not. It received the guess,
+ * put it in its report, and the human clicked a link to a port nothing was serving. Waiting here is
+ * what makes the returned link mean the same thing the pane shows.
+ *
+ * Bounded three ways, because an op that hangs is its own failure: a DISCOVERED state answers it, a
+ * TERMINAL state or a vanished entry ends it early (no port is ever coming), and
+ * `PREVIEW_SETTLE_TIMEOUT_MS` caps the rest.
+ *
+ * `url`/`port` are `null` together when there is no address to give — which the caller renders as
+ * the `{ id, state }` shape this op already defines for a preview that has started with nothing to
+ * point a browser at yet. Returning the prediction instead is the bug this function exists to
+ * remove.
+ *
+ * `state` is always the FRESHEST one observed, not the one the open reply carried. A server that
+ * died during the wait must be reported as `failed`/`crashed`, not as the `starting` it was when
+ * the spawn returned — the caller is deciding what to tell a human, and "still starting" for a
+ * process that is already gone is the same class of stale answer as the predicted port.
+ */
+async function settlePreviewAddress(
+  agentId: string,
+  opened: PreviewOpened,
+): Promise<{ id: string; url: string | null; port: number | null; state: PreviewState }> {
+  const noAddress = (state: PreviewState) => ({ id: opened.id, url: null, port: null, state });
+  // Already discovered — a re-attach to a live server. Its address was read off `lsof`, so polling
+  // again would buy a round trip and learn nothing.
+  if (PREVIEW_DISCOVERED_STATES.has(opened.state) && opened.url && opened.port) {
+    return { id: opened.id, url: opened.url, port: opened.port, state: opened.state };
+  }
+  const deadline = Date.now() + PREVIEW_SETTLE_TIMEOUT_MS;
+  for (;;) {
+    const status = await fetchPreviewStatus(agentId);
+    // `null` = the supervisor holds no entry for this agent. `open_reserved` inserts one BEFORE it
+    // spawns, so this means the entry went away (a concurrent stop), not that it has yet to appear.
+    // There is no fresher state to report, so the open reply's own is the best available.
+    if (!status) return noAddress(opened.state);
+    // KEYED BY AGENT, NOT BY PREVIEW ID — and one agent holds one preview. A concurrent
+    // stop-and-reopen inside this window replaces the entry, so a status carrying a different id
+    // describes a DIFFERENT server than the one this call opened. Attributing its port to our id
+    // would report an address our preview does not answer at: the same defect in quieter clothes.
+    if (status.id !== opened.id) return noAddress(status.state);
+    if (PREVIEW_DISCOVERED_STATES.has(status.state) && status.url && status.port) {
+      return { id: opened.id, url: status.url, port: status.port, state: status.state };
+    }
+    if (PREVIEW_TERMINAL_STATES.has(status.state)) return noAddress(status.state);
+    if (Date.now() >= deadline) return noAddress(status.state);
+    await sleep(PREVIEW_SETTLE_POLL_MS);
+  }
+}
+
+/**
  * preview → open / close / list THE CALLER'S OWN live browser preview (bead `sparkle-3475b.6`).
  *
  * WIRE CONTRACT, mirrored in `bridge.rs` CONTROL_OPS and apps/mcp-control's `previewTool`:
@@ -2850,7 +2969,19 @@ async function handlePreview(req: ControlRequest): Promise<Record<string, unknow
     if (!opened.url || !opened.port) {
       return { ok: true, preview: { id: opened.id, state: opened.state } };
     }
-    return { ok: true, preview: opened };
+    // AND EVEN A REAL-LOOKING ADDRESS IS NOT YET AN OBSERVED ONE. The guard above catches a reply
+    // with no address; this catches the more dangerous one — a fresh open's `starting` reply, whose
+    // url and port are both present, well-formed, and merely PREDICTED. `settlePreviewAddress` waits
+    // for the port `supervise` actually discovered; `null` means it never arrived, and the caller
+    // gets the same "started, no address yet" shape rather than a link to a port nothing bound.
+    const settled = await settlePreviewAddress(req.callerAgentId, opened);
+    if (!settled.url || !settled.port) {
+      return { ok: true, preview: { id: settled.id, state: settled.state } };
+    }
+    return {
+      ok: true,
+      preview: { id: settled.id, url: settled.url, port: settled.port, state: settled.state },
+    };
   } catch (e) {
     // A REFUSAL, NOT A THROW. An uncaught error still replies (dispatch catches it), but as a bare
     // `{ error }` with no `code` — and the message a caller most needs to branch on comes through
