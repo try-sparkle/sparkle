@@ -43,7 +43,7 @@ import {
 import { __clearRepoSlugCache, __setRepoSlugForTest } from "./repoSlug";
 import { useProjectStore } from "../../stores/projectStore";
 import { useRuntimeStore } from "../../stores/runtimeStore";
-import { useUiStore } from "../../stores/uiStore";
+import { focusedBeadIdForSide, useUiStore } from "../../stores/uiStore";
 import { useBeadsStore } from "../../stores/beadsStore";
 import type { Bead } from "../../services/beads";
 import type { AgentTab, AgentTabStatus, Project } from "../../types";
@@ -1161,5 +1161,66 @@ describe("focusEpic and the child-task rung", () => {
     useUiStore.getState().setBeadFocus("right", "sparkle-ep.a");
     const again = focusEpic(EPIC.id);
     expect(again.ok).toBe(true);
+  });
+
+  // ── CONTRACT 4: REVERSIBLE, AND SAYS HOW ──────────────────────────────────────────────────────
+  //
+  // Focusing an epic DESTROYS the child rung beneath it, and the child is the NARROWER of the two.
+  // A result that reported only `priorEpicId` would let a caller "restore" the column to a WIDER
+  // view than it found — silently dropping the human's drill-down.
+  //
+  // These rows assert the ROUND TRIP, not the presence of a field: a field that is merely returned
+  // and cannot actually put the column back satisfies the type and not the contract.
+  it("reports the CHILD it destroyed, so the drill-down can be put back", () => {
+    value(focusEpic(EPIC.id));
+    useUiStore.getState().setBeadFocus("right", "sparkle-ep.a");
+    const v = value(focusEpic(EPIC.id));
+    expect(v.priorBeadId).toBe("sparkle-ep.a");
+
+    // THE ROUND TRIP, through the STORE rather than back through `focusEpic`. Re-applying the epic
+    // is what clears this key, so the order is epic-then-child; and here the epic is already in
+    // place, which `focusEpic` correctly reports as a no-op — restoring the epic rung is a
+    // NON-EVENT in exactly the case where the child rung is the only thing that was lost. That is
+    // the whole point of returning it.
+    useUiStore.getState().openEpicFocus("right", v.priorEpicId!);
+    useUiStore.getState().setBeadFocus("right", v.priorBeadId!);
+    expect(focusedBeadIdForSide(useUiStore.getState(), "right")).toBe("sparkle-ep.a");
+  });
+
+  // THE CASE THAT MAKES A priorEpicId-ONLY RESULT USELESS RATHER THAN MERELY LOSSY: the column was
+  // ALREADY on this epic, so `priorEpicId === epicId` and replaying it is a no-op. Without
+  // `priorBeadId` there is nothing in the result that can restore anything.
+  it("priorEpicId alone cannot undo this call — priorBeadId is the only recoverable part", () => {
+    value(focusEpic(EPIC.id));
+    useUiStore.getState().setBeadFocus("right", "sparkle-ep.a");
+    const v = value(focusEpic(EPIC.id));
+    expect(v.priorEpicId).toBe(v.epicId);
+    expect(v.priorBeadId).toBe("sparkle-ep.a");
+  });
+
+  it("clearEpicFocus reports both rungs it dropped", () => {
+    value(focusEpic(EPIC.id));
+    useUiStore.getState().setBeadFocus("right", "sparkle-ep.a");
+    const v = value(clearEpicFocus());
+    expect(v.priorEpicId).toBe(EPIC.id);
+    expect(v.priorBeadId).toBe("sparkle-ep.a");
+    expect(focusedBeadIdForSide(useUiStore.getState(), "right")).toBeNull();
+  });
+
+  // "NOTHING IS NARROWED" MEANS NEITHER RUNG. A column with no epic but a live CHILD selection is
+  // visibly filtered, and `setEpicFocus(side, null)` does clear it — so refusing as a no-op would
+  // reject the only call that widens it back.
+  it("clearEpicFocus is NOT a no-op when only the CHILD rung is set", () => {
+    useUiStore.getState().setBeadFocus("right", "sparkle-ep.a");
+    const v = value(clearEpicFocus());
+    expect(v.priorEpicId).toBeNull();
+    expect(v.priorBeadId).toBe("sparkle-ep.a");
+    expect(focusedBeadIdForSide(useUiStore.getState(), "right")).toBeNull();
+  });
+
+  it("clearEpicFocus still refuses when genuinely nothing is narrowed", () => {
+    const r = clearEpicFocus();
+    expect(r.ok).toBe(false);
+    expect(!r.ok && r.reason).toBe("no-op");
   });
 });

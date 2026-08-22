@@ -902,6 +902,21 @@ export function setWorkMode(mode: string): SidebarViewResult<WorkModeChange> {
 export interface EpicFocusChange {
   /** The epic that was focused before, or null when the column was showing everything. */
   priorEpicId: string | null;
+  /**
+   * The CHILD-TASK selection this call destroyed, or null if there was none.
+   *
+   * ══ CONTRACT 4 IS WHY THIS FIELD EXISTS ═══════════════════════════════════════════════════════
+   * "Every filter/isolate op is REVERSIBLE and says how." Focusing an epic clears the child rung
+   * beneath it (rule 3 on `beadFocusBySide`), and the child is the NARROWER of the two — so a
+   * caller that put the column back with `priorEpicId` alone would restore the wider view and
+   * silently drop the drill-down the human had. Worse in the exact case that made this reachable:
+   * when the column is already on this epic and merely drilled into a child, `priorEpicId` EQUALS
+   * `epicId`, so replaying it is a no-op and the column stays widened with nothing saying so.
+   *
+   * Restore it with `setBeadFocus(side, priorBeadId)` AFTER re-applying `priorEpicId` — that order
+   * matters, because re-applying the epic clears this key again.
+   */
+  priorBeadId: string | null;
   epicId: string;
   /** Whether the call also had to put the column into Build — see the note in the body. */
   switchedToBuild: boolean;
@@ -958,6 +973,9 @@ export function focusEpic(epicId: string): SidebarViewResult<EpicFocusChange> {
   const side = scopedSide();
   const ui = useUiStore.getState();
   const priorEpicId = ui.epicFocusBySide[side];
+  // CAPTURED BEFORE THE WRITE — `openEpicFocus` clears this key, so reading it afterwards would
+  // always report null and contract 4 would be satisfied only on paper.
+  const priorBeadId = ui.beadFocusBySide[side];
   // ALREADY NARROWED TO THIS EPIC **AND** ALREADY SHOWING IT **AND** NOT STILL DRILLED INTO A
   // CHILD. Three conditions, and each one is a state in which "already narrowed to that epic" is
   // true while the caller's request is NOT satisfied:
@@ -976,7 +994,7 @@ export function focusEpic(epicId: string): SidebarViewResult<EpicFocusChange> {
   const switchedToBuild = !showing;
   if (switchedToBuild) ui.showBuildStage(side);
   ui.openEpicFocus(side, epicId);
-  return ok("focus_epic", { priorEpicId, epicId, switchedToBuild });
+  return ok("focus_epic", { priorEpicId, priorBeadId, epicId, switchedToBuild });
 }
 
 /**
@@ -987,18 +1005,28 @@ export function focusEpic(epicId: string): SidebarViewResult<EpicFocusChange> {
  * non-null id, because "open nothing" is not a gesture). This does NOT touch the work mode — a
  * caller asking to widen the filter has not asked to be moved to another surface.
  */
-export function clearEpicFocus(): SidebarViewResult<{ priorEpicId: string }> {
+export function clearEpicFocus(): SidebarViewResult<{
+  priorEpicId: string | null;
+  priorBeadId: string | null;
+}> {
   const side = scopedSide();
-  const priorEpicId = useUiStore.getState().epicFocusBySide[side];
-  if (priorEpicId === null) {
+  const ui = useUiStore.getState();
+  const priorEpicId = ui.epicFocusBySide[side];
+  // BOTH RUNGS, captured before the write and consulted by the guard — see `EpicFocusChange`.
+  const priorBeadId = ui.beadFocusBySide[side];
+  // "NOTHING IS NARROWED" MEANS NEITHER RUNG, not just the epic one. `setEpicFocus(side, null)`
+  // clears the child too (rule 3), so a column with no epic but a live CHILD selection DOES have
+  // something to widen — refusing there would reject the only call that puts it back, on a column
+  // that is visibly filtered.
+  if (priorEpicId === null && priorBeadId === null) {
     return refuse(
       "clear_epic_focus",
       "no-op",
-      "The Build column is not narrowed to an epic.",
+      "The Build column is not narrowed.",
     );
   }
-  useUiStore.getState().setEpicFocus(side, null);
-  return ok("clear_epic_focus", { priorEpicId });
+  ui.setEpicFocus(side, null);
+  return ok("clear_epic_focus", { priorEpicId, priorBeadId });
 }
 
 export interface RevealOutcome {
