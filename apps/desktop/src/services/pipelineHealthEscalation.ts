@@ -293,10 +293,20 @@ function passesGate(ev: EscalationEvent, now: number): boolean {
 
 /** The outcome of one escalation sweep, returned for logging/testing. */
 export interface EscalationResult {
-  /** Events that passed the gate and were routed (blocking always, warning if un-debounced, recovery). */
+  /** Events that passed the gate and reached AT LEAST ONE sink (concierge, inbox, or fail-safe bead). */
   delivered: EscalationEvent[];
   /** Warning events suppressed by the debounce this sweep. */
   debounced: EscalationEvent[];
+  /**
+   * Events that passed the gate and reached NO sink at all — every channel refused or threw.
+   *
+   * This is NOT a subset of `delivered`; the two partition the gated events. It exists because
+   * `passesGate` CONSUMES the alarm (it clears `unannouncedAlarm` for the component), so an event
+   * that routed nowhere is not retried on the next sweep — it is simply gone. Counting such an
+   * event as `delivered` reported a lost alarm as a handled one, which is the one shape a watchdog
+   * must never produce.
+   */
+  undelivered: EscalationEvent[];
 }
 
 /**
@@ -316,6 +326,7 @@ export async function escalatePipelineHealth(
   const candidates = detectEscalations(prev, next);
   const delivered: EscalationEvent[] = [];
   const debounced: EscalationEvent[] = [];
+  const undelivered: EscalationEvent[] = [];
 
   for (const ev of candidates) {
     if (!passesGate(ev, now)) {
@@ -347,15 +358,18 @@ export async function escalatePipelineHealth(
     // FAIL-SAFE. Only for ALARM events, and only when the DURABLE channel failed: the concierge feed
     // is ephemeral, so an alarm whose inbox doorbell did not land has no durable real-time record.
     // File the same deduped bead now rather than waiting for the hourly scan.
+    let beadOk = false;
     if (ev.severity !== "recovery" && !improveOk) {
       try {
         await deps.fileDurableBead(ev, text);
+        beadOk = true;
         log.info("pipeline-health", "real-time wake failed; durable bead filed as fail-safe", {
           component: ev.componentId,
           severity: ev.severity,
         });
       } catch (e) {
-        // The hourly pipeline-health-scan.sh remains the ultimate floor.
+        // The hourly pipeline-health-scan.sh is the intended floor — but it files through the SAME
+        // `bd` this throw usually means is unreachable, so it is not a floor that can be assumed.
         log.warn("pipeline-health", "fail-safe bead filing threw; hourly scan is the floor", {
           component: ev.componentId,
           error: String(e),
@@ -363,16 +377,33 @@ export async function escalatePipelineHealth(
       }
     }
 
-    log.info("pipeline-health", "escalated pipeline transition", {
-      component: ev.componentId,
-      severity: ev.severity,
-      concierge: conciergeOk,
-      improve: improveOk,
-    });
-    delivered.push(ev);
+    // ZERO-SINK IS NOT DELIVERY. Every channel is independently best-effort and each already logs
+    // its own failure, so the three warnings above can all fire and still leave no line saying the
+    // alarm itself was lost — a reader has to notice an ABSENCE across three messages to work it
+    // out. Measured on a machine where the improve inbox sat at its 50-message cap (so `inbox_send`
+    // refused every alarm) and `bd` was not installed (so the fail-safe throw), a blocking alarm
+    // reached nothing at all and was still logged as an escalated transition and returned as
+    // `delivered`. Decide it here, once, from the sink results rather than from having reached the
+    // end of the loop body.
+    if (conciergeOk || improveOk || beadOk) {
+      log.info("pipeline-health", "escalated pipeline transition", {
+        component: ev.componentId,
+        severity: ev.severity,
+        concierge: conciergeOk,
+        improve: improveOk,
+        bead: beadOk,
+      });
+      delivered.push(ev);
+    } else {
+      log.error("pipeline-health", "escalation reached NO sink; this alarm is LOST", {
+        component: ev.componentId,
+        severity: ev.severity,
+      });
+      undelivered.push(ev);
+    }
   }
 
-  return { delivered, debounced };
+  return { delivered, debounced, undelivered };
 }
 
 /**
@@ -458,6 +489,16 @@ export async function runPipelineEscalation(
     return await escalatePipelineHealth(prev, next, deps);
   } catch (e) {
     log.warn("pipeline-health", "escalation sweep threw", { error: String(e) });
-    return { delivered: [], debounced: [] };
+    // `undelivered: []` here means UNKNOWN, not zero. `escalatePipelineHealth` is documented never
+    // to throw, so this is a defensive backstop; if it ever does throw, the throw happened INSIDE
+    // the per-event loop and no partition survived it, so there is no event list to attribute. The
+    // `log.warn` above is the only record in that case.
+    //
+    // Worth stating because it is the one gap this partition does not close: `passesGate` CONSUMES
+    // the alarm, so events gated before the throw are already gone and are reported here as neither
+    // delivered nor undelivered. Narrowing that would mean returning the partial partition from
+    // inside the sweep rather than losing it to the catch — a change to the sweep's shape, not to
+    // this backstop, and deliberately not folded into a merge fix.
+    return { delivered: [], debounced: [], undelivered: [] };
   }
 }

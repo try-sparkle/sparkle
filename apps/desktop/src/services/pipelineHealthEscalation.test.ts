@@ -139,6 +139,72 @@ describe("composeEscalationMessage + remediationFor", () => {
   });
 });
 
+describe("escalatePipelineHealth — an alarm that reached NO sink is not `delivered`", () => {
+  /** Every channel refused: the measured shape (inbox at its cap, `bd` not installed). */
+  function deadSinks(now = 1_000_000): EscalationDeps {
+    return {
+      now: () => now,
+      notifyConcierge: () => false,
+      wakeImprove: async () => false,
+      fileDurableBead: async () => {
+        throw new Error("bd not found — install beads or add `bd` to your PATH");
+      },
+    };
+  }
+
+  it("a blocking alarm whose concierge, inbox AND fail-safe bead all fail is reported UNDELIVERED", async () => {
+    const res = await escalatePipelineHealth(snap("healthy"), snap("blocking", "wedged"), deadSinks());
+
+    // The side effect under test: it must NOT be counted as handled.
+    expect(res.delivered).toHaveLength(0);
+    expect(res.undelivered).toHaveLength(1);
+    expect(res.undelivered[0]!.componentId).toBe("roborev");
+    expect(res.undelivered[0]!.severity).toBe("blocking");
+  });
+
+  it("ONE surviving sink is still delivery — the concierge alone keeps it out of `undelivered`", async () => {
+    // The paired case: same failing inbox and same throwing bead, one channel alive. Without this,
+    // a rule that simply called every alarm undelivered would pass the test above.
+    const deps: EscalationDeps = { ...deadSinks(), notifyConcierge: () => true };
+    const res = await escalatePipelineHealth(snap("healthy"), snap("blocking", "wedged"), deps);
+
+    expect(res.delivered).toHaveLength(1);
+    expect(res.undelivered).toHaveLength(0);
+  });
+
+  it("the fail-safe bead ALONE is delivery, even though both real-time channels refused", async () => {
+    const filed: EscalationEvent[] = [];
+    const deps: EscalationDeps = {
+      ...deadSinks(),
+      fileDurableBead: async (ev) => {
+        filed.push(ev);
+      },
+    };
+    const res = await escalatePipelineHealth(snap("healthy"), snap("blocking", "wedged"), deps);
+
+    expect(filed).toHaveLength(1);
+    expect(res.delivered).toHaveLength(1);
+    expect(res.undelivered).toHaveLength(0);
+  });
+
+  it("a RECOVERY files no bead, so both channels failing leaves it undelivered", async () => {
+    // Recoveries deliberately skip the fail-safe bead, which makes the concierge and the inbox the
+    // ONLY two sinks — so a recovery is the event most easily lost, and must say so.
+    const res = await escalatePipelineHealth(snap("blocking"), snap("healthy", "back up"), deadSinks());
+
+    expect(res.delivered).toHaveLength(0);
+    expect(res.undelivered).toHaveLength(1);
+    expect(res.undelivered[0]!.severity).toBe("recovery");
+  });
+
+  it("a healthy sweep reports an EMPTY undelivered list, not an absent one", async () => {
+    const r = recorder();
+    const res = await escalatePipelineHealth(snap("healthy"), snap("blocking", "wedged"), r.deps);
+    expect(res.undelivered).toEqual([]);
+    expect(res.delivered).toHaveLength(1);
+  });
+});
+
 describe("escalatePipelineHealth — routing + gating side effects", () => {
   it("green→blocking fires EXACTLY ONE escalation to BOTH channels, naming component+severity+remediation", async () => {
     const r = recorder();
