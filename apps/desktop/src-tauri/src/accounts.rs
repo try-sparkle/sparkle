@@ -115,7 +115,7 @@ fn normalize_epoch_seconds(epoch: i64) -> i64 {
 
 /// Per-account usage snapshot returned by [`accounts_usage`]: token tallies in the
 /// trailing 5h and 7d windows, plus the still-in-effect exhausted-until epoch.
-#[derive(Serialize, Debug, PartialEq, Eq)]
+#[derive(Serialize, Debug, PartialEq, Eq, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct AccountUsage {
     pub id: String,
@@ -3059,6 +3059,113 @@ fn usage_for_accounts(accounts: &[Account], now: i64) -> Vec<AccountUsage> {
     usage
 }
 
+// ---- the usage-RESULT memo (sparkle-xwnawc) -----------------------------------
+//
+// `usage_for_accounts` is the second off-main hot loop the founder's 2026-08-22 hang sample caught:
+// 2,136 ms of one core in `stat()` walking the default account's ~17,316 `.jsonl` transcripts. The
+// dir-LISTING cache (above) already took `read_dir` to zero on a settled tree, and the parse memo
+// skips re-parsing an unchanged file — but the per-file `stat` is unavoidable PER PASS (an append
+// bumps no directory mtime, so every file must be stat'd to catch it), so the only remaining lever
+// is running FEWER passes.
+//
+// The passes that pile up are the ones no user asked for: `ProviderUnavailableBanner` re-reads on
+// `USAGE_LIMIT_RECHECK_MS` (10s) for the whole time a limit is showing — hours — and each tick
+// misses the frontend's own 5s `ACCOUNT_CACHE_TTL_MS` and pays the full walk (`sparkle-608gg` closed
+// the IDENTITIES half of this; the token walk stayed). A short result memo lets that poll, and any
+// burst of overlapping callers, share ONE walk.
+//
+// SAFE because it re-runs the moment anything that is NOT a slow-moving transcript tally moves. The
+// key hashes each account's (id, config_dir, exhausted_until, exhausted_identity) AND its RESOLVED
+// on-disk identity — the last of which is load-bearing and easy to miss (roborev 67848): the output
+// `exhausted_until` is computed from `effective_exhaustion(acct, identity_for_account(acct, HOME))`
+// and the cross-identity contagion fold (`sparkle-xsr6o`), both of which read `<config_dir>/.claude.
+// json`. A terminal `claude login` / profile switch rewrites that file WITHOUT touching accounts.json,
+// so keying on `Account` fields alone would keep serving `exhaustedUntil: null` for up to the TTL
+// after a switch onto a walled login — routing a spawn straight onto the wall the fold exists to
+// avoid. Hashing `identity_key_for` per account closes that (it also flips when `accountUuid` first
+// appears — a re-walk in the safe direction). The identity read is the cheap half — a small JSON
+// parse next to the 2.1s stat walk it guards.
+//
+// What it lets go stale is only `tokens_5h` / `tokens_7d` and a transcript-borne rate-limit event,
+// all of which move on the scale of turns-per-minute against 5h/7d windows — 15s cannot shift a
+// ranking or a reset countdown. The explicit-bench path (`republish_roborev_candidates`) deliberately
+// calls the UNCACHED `usage_for_accounts`: it runs right after writing a bench and must observe it.
+const USAGE_RESULT_TTL_SECS: i64 = 15;
+
+/// One cached usage snapshot: the account-set key it was computed for, the epoch it was computed at,
+/// and the result. A single slot (there is effectively one account set) — a newer set simply
+/// overwrites it.
+struct UsageResultCache {
+    key: u64,
+    at: i64,
+    result: Vec<AccountUsage>,
+}
+
+fn usage_result_cache() -> &'static std::sync::Mutex<Option<UsageResultCache>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<Option<UsageResultCache>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// The memo key: everything `usage_for_accounts`' result depends on that is NOT a transcript tally.
+/// Any change here (add/remove/bench/switch-login) must force a fresh walk, so all of it is hashed —
+/// including the RESOLVED on-disk identity, which a bare `Account` cannot see (roborev 67848). Reads
+/// each account's `.claude.json` via `identity_key_for`; cheap next to the walk it gates.
+fn usage_accounts_key(accounts: &[Account], home: Option<&Path>) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    accounts.len().hash(&mut h);
+    for a in accounts {
+        a.id.hash(&mut h);
+        a.config_dir.hash(&mut h);
+        a.exhausted_until.hash(&mut h);
+        a.exhausted_identity.hash(&mut h);
+        // The live login behind this dir. `None` (a dir never logged into) hashes distinctly from any
+        // resolved key, so a login appearing or disappearing also moves the key.
+        identity_key_for(a, home).hash(&mut h);
+    }
+    h.finish()
+}
+
+/// [`usage_for_accounts`] served from a short-TTL result memo — the production entry point for the
+/// banner/spawn/AccountsScreen path (the `accounts_usage` command). See the module comment above for
+/// why this is sound. The cache slot is a parameter so the TTL/key logic is testable against a fresh,
+/// isolated slot without the process-wide static; production passes [`usage_result_cache`].
+fn usage_for_accounts_cached_in(
+    accounts: &[Account],
+    now: i64,
+    home: Option<&Path>,
+    cache: &std::sync::Mutex<Option<UsageResultCache>>,
+) -> Vec<AccountUsage> {
+    let key = usage_accounts_key(accounts, home);
+    // Held ACROSS the walk on purpose (roborev 67848): the lock used to be dropped before computing
+    // and re-taken only to store, so concurrent callers all missed and all paid the full 2.1s stat
+    // walk — no coalescing, just sequential reuse. `accounts_usage` runs on `spawn_blocking` and
+    // EVERY window's banner hits it, so N windows ticking in the same second stacked N walks on the
+    // blocking pool — the exact core-burn this memo exists to stop. Holding the lock makes a
+    // concurrent caller for the same key wait and then hit the entry this one stores: one walk, not N.
+    // Poison is recovered rather than propagated — a panicked walk must not wedge every later usage
+    // read behind a poisoned lock.
+    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(c) = guard.as_ref() {
+        // `now >= c.at` guards a clock that went backwards (also a test injecting an earlier
+        // instant): treat that as a miss rather than serving from a future entry.
+        if c.key == key && now >= c.at && now - c.at < USAGE_RESULT_TTL_SECS {
+            return c.result.clone();
+        }
+    }
+    let result = usage_for_accounts(accounts, now);
+    *guard = Some(UsageResultCache { key, at: now, result: result.clone() });
+    result
+}
+
+/// Production wrapper: [`usage_for_accounts_cached_in`] against the process-wide slot, resolving
+/// `HOME` the same way `usage_for_accounts` does so the key sees the default account's identity.
+fn usage_for_accounts_cached(accounts: &[Account], now: i64) -> Vec<AccountUsage> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    usage_for_accounts_cached_in(accounts, now, home.as_deref(), usage_result_cache())
+}
+
 /// Compute the usage snapshot for one account at `now`. Resolves the transcript root the SAME way
 /// session detection does (`claude.rs::claude_projects_root`, passing the account's own
 /// `config_dir`), then buckets. The stored `exhausted_until` is surfaced through
@@ -3710,7 +3817,11 @@ pub async fn accounts_usage(app: AppHandle) -> Result<Vec<AccountUsage>, String>
     tauri::async_runtime::spawn_blocking(move || -> Result<Vec<AccountUsage>, String> {
         let accounts = read_accounts_at(&accounts_json_path(&app_data))?;
         let now = now_secs();
-        Ok(usage_for_accounts(&accounts, now))
+        // Cached: this command is the banner's 10s re-read and the spawn/AccountsScreen path, the
+        // "runs constantly" caller. The memo coalesces both overlapping (single-flight under the
+        // lock) and back-to-back walks, and re-runs the instant the account set, a bench, or a login
+        // changes — see `usage_for_accounts_cached_in`.
+        Ok(usage_for_accounts_cached(&accounts, now))
     })
     .await
     .map_err(|e| format!("accounts_usage task failed: {e}"))?
@@ -4760,6 +4871,228 @@ mod tests {
             .collect();
         assert_eq!(stamps.len(), 1, "one generation across every account in the call");
         drop(cache);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // sparkle-xwnawc: the result memo must (a) serve a repeat call within the TTL WITHOUT re-walking
+    // the transcript tree — that is the whole point, coalescing the banner's 10s re-read — and (b)
+    // re-walk once the TTL passes. Proven by the strongest available side effect: DELETE the
+    // transcripts between calls. An actual walk of a deleted tree yields 0; getting the pre-deletion
+    // tally back can ONLY mean the walk was skipped.
+    #[test]
+    fn the_usage_result_memo_skips_the_walk_within_ttl_and_rewalks_after() {
+        let base = unique_dir("usage-result-memo");
+        let cfg = base.join("acct");
+        let proj = cfg.join("projects").join("p");
+        let ts = "2026-06-25T21:20:25.931Z";
+        let now = parse_iso8601_to_epoch("2026-06-25T21:30:00.000Z").unwrap();
+        let seed = |tokens: u64| {
+            std::fs::create_dir_all(&proj).unwrap();
+            std::fs::write(
+                proj.join("s.jsonl"),
+                format!(
+                    "{{\"timestamp\":\"{ts}\",\"type\":\"assistant\",\"message\":{{\
+                     \"usage\":{{\"input_tokens\":{tokens},\"output_tokens\":0}}}}}}\n"
+                ),
+            )
+            .unwrap();
+        };
+        let account = || Account {
+            id: "acct".into(),
+            nickname: "acct".into(),
+            config_dir: cfg.to_string_lossy().into_owned(),
+            is_default: false,
+            created_at: 0,
+            exhausted_until: None,
+            exhausted_identity: None,
+        };
+        // A FRESH, isolated slot — never the process-wide static — so this is deterministic and does
+        // not contend with any other test.
+        let slot = std::sync::Mutex::new(None);
+
+        seed(11);
+        let accounts = vec![account()];
+        let a = usage_for_accounts_cached_in(&accounts, now, None, &slot);
+        assert_eq!(a[0].tokens_7d, 11, "cold call walks and tallies the seeded transcript");
+
+        // Delete the whole tree. A real walk now yields 0.
+        std::fs::remove_dir_all(&base).unwrap();
+
+        // Within the TTL: MUST be served from the memo (11), not re-walked (which would be 0).
+        let b = usage_for_accounts_cached_in(&accounts, now + USAGE_RESULT_TTL_SECS - 1, None, &slot);
+        assert_eq!(
+            b[0].tokens_7d, 11,
+            "a repeat call within the TTL must reuse the cached result and NOT re-walk \
+             (a re-walk of the deleted tree would be 0)"
+        );
+
+        // Past the TTL: MUST re-walk, and the walk now sees the deleted tree → 0.
+        let c = usage_for_accounts_cached_in(&accounts, now + USAGE_RESULT_TTL_SECS, None, &slot);
+        assert_eq!(
+            c[0].tokens_7d, 0,
+            "once the TTL elapses the memo must re-walk — and the tree is gone, so the tally is 0"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // sparkle-xwnawc: the memo must NOT outlive a change to anything that is not a slow transcript
+    // tally. A bench (or add/remove/switch-login) changes the key, so even inside the TTL the next
+    // call re-walks rather than serving a snapshot taken before the change.
+    #[test]
+    fn a_bench_changes_the_key_and_forces_a_rewalk_inside_the_ttl() {
+        let base = unique_dir("usage-result-memo-key");
+        let cfg = base.join("acct");
+        let proj = cfg.join("projects").join("p");
+        let ts = "2026-06-25T21:20:25.931Z";
+        let now = parse_iso8601_to_epoch("2026-06-25T21:30:00.000Z").unwrap();
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(
+            proj.join("s.jsonl"),
+            format!(
+                "{{\"timestamp\":\"{ts}\",\"type\":\"assistant\",\"message\":{{\
+                 \"usage\":{{\"input_tokens\":11,\"output_tokens\":0}}}}}}\n"
+            ),
+        )
+        .unwrap();
+        let account = |exhausted: Option<i64>| Account {
+            id: "acct".into(),
+            nickname: "acct".into(),
+            config_dir: cfg.to_string_lossy().into_owned(),
+            is_default: false,
+            created_at: 0,
+            exhausted_until: exhausted,
+            exhausted_identity: None,
+        };
+        let slot = std::sync::Mutex::new(None);
+
+        let a = usage_for_accounts_cached_in(&[account(None)], now, None, &slot);
+        assert_eq!(a[0].tokens_7d, 11, "cold call walks");
+
+        // Delete the tree so any real re-walk is observable as 0.
+        std::fs::remove_dir_all(&base).unwrap();
+
+        // Same instant window, but the account is now benched → the key differs → the memo entry is
+        // NOT reused and the call re-walks (seeing the deleted tree → 0). If the key ignored
+        // `exhausted_until` this would wrongly return 11.
+        let b = usage_for_accounts_cached_in(&[account(Some(now + 3600))], now + 1, None, &slot);
+        assert_eq!(
+            b[0].tokens_7d, 0,
+            "a bench must change the key and force a fresh walk even inside the TTL"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // roborev 67848: the output `exhausted_until` depends on the account's LIVE on-disk identity
+    // (`.claude.json`), which a `claude login` / "Switch login" rewrites without touching
+    // accounts.json. The memo key must therefore fold in the resolved identity, or a switch onto a
+    // walled login would keep being reported healthy for the whole TTL. Proven by switching the
+    // identity (and only the identity — the `Account` struct is byte-identical across the two calls)
+    // between two within-TTL calls; the transcript tree is deleted too so the forced re-walk is
+    // observable as 0. Drop the `identity_key_for` hash and this returns the cached 11.
+    #[test]
+    fn a_login_switch_changes_the_key_and_forces_a_rewalk_inside_the_ttl() {
+        let base = unique_dir("usage-result-memo-identity");
+        let cfg = base.join("acct");
+        let proj = cfg.join("projects").join("p");
+        let ts = "2026-06-25T21:20:25.931Z";
+        let now = parse_iso8601_to_epoch("2026-06-25T21:30:00.000Z").unwrap();
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(
+            proj.join("s.jsonl"),
+            format!(
+                "{{\"timestamp\":\"{ts}\",\"type\":\"assistant\",\"message\":{{\
+                 \"usage\":{{\"input_tokens\":11,\"output_tokens\":0}}}}}}\n"
+            ),
+        )
+        .unwrap();
+        // A non-default account reads its identity from `<config_dir>/.claude.json`, so `home` is
+        // irrelevant here and passed as `None`.
+        let login = |uuid: &str| {
+            std::fs::write(
+                cfg.join(".claude.json"),
+                format!(
+                    "{{\"oauthAccount\":{{\"emailAddress\":\"user@example.com\",\
+                     \"accountUuid\":\"{uuid}\"}}}}"
+                ),
+            )
+            .unwrap();
+        };
+        let account = || Account {
+            id: "acct".into(),
+            nickname: "acct".into(),
+            config_dir: cfg.to_string_lossy().into_owned(),
+            is_default: false,
+            created_at: 0,
+            exhausted_until: None,
+            exhausted_identity: None,
+        };
+        let slot = std::sync::Mutex::new(None);
+
+        login("uuid-one");
+        let a = usage_for_accounts_cached_in(&[account()], now, None, &slot);
+        assert_eq!(a[0].tokens_7d, 11, "cold call walks under the first login");
+
+        // Switch the login on disk and delete the transcripts. The `Account` value is unchanged.
+        login("uuid-two");
+        std::fs::remove_dir_all(cfg.join("projects")).unwrap();
+
+        let b = usage_for_accounts_cached_in(&[account()], now + 1, None, &slot);
+        assert_eq!(
+            b[0].tokens_7d, 0,
+            "a login switch must change the key and force a fresh walk even inside the TTL — \
+             otherwise a switch onto a walled login is served as healthy"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // roborev 67849: the three tests above inject their own slot, leaving the PRODUCTION seam — the
+    // `usage_for_accounts_cached` wrapper that binds the memo to the process-wide static, and the
+    // `accounts_usage` line that calls it — covered by nothing (reverting that line to the uncached
+    // walk would keep the suite green: the "defaulted seam every test injects", sparkle-lgbwf). This
+    // drives the real wrapper. It is stable under parallel execution: no other test touches that
+    // static slot, and `unique_dir` gives a key no other account shares.
+    #[test]
+    fn the_production_usage_memo_wrapper_binds_the_process_wide_slot() {
+        let base = unique_dir("usage-result-memo-prod");
+        let cfg = base.join("acct");
+        let proj = cfg.join("projects").join("p");
+        let ts = "2026-06-25T21:20:25.931Z";
+        let now = parse_iso8601_to_epoch("2026-06-25T21:30:00.000Z").unwrap();
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(
+            proj.join("s.jsonl"),
+            format!(
+                "{{\"timestamp\":\"{ts}\",\"type\":\"assistant\",\"message\":{{\
+                 \"usage\":{{\"input_tokens\":11,\"output_tokens\":0}}}}}}\n"
+            ),
+        )
+        .unwrap();
+        let accounts = vec![Account {
+            id: "prod-wrapper-acct".into(),
+            nickname: "acct".into(),
+            config_dir: cfg.to_string_lossy().into_owned(),
+            is_default: false,
+            created_at: 0,
+            exhausted_until: None,
+            exhausted_identity: None,
+        }];
+
+        let a = usage_for_accounts_cached(&accounts, now);
+        assert_eq!(a[0].tokens_7d, 11, "cold call through the real wrapper walks");
+
+        // Delete the tree: a real walk now yields 0, so returning 11 proves the wrapper's static slot
+        // served it.
+        std::fs::remove_dir_all(&base).unwrap();
+        let b = usage_for_accounts_cached(&accounts, now + USAGE_RESULT_TTL_SECS - 1);
+        assert_eq!(
+            b[0].tokens_7d, 11,
+            "the production wrapper must serve a within-TTL call from the process-wide slot — \
+             reverting accounts_usage to the uncached walk fails here"
+        );
 
         let _ = std::fs::remove_dir_all(&base);
     }

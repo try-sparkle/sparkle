@@ -6888,6 +6888,33 @@ pub fn project_agents_status_at(
     // Symlink-resolve every path ONCE here rather than per agent per record — see
     // `WorktreeRecord::canonical`.
     canonicalize_records(&mut worktree_records);
+    // ONE `for-each-ref` for the WHOLE batch resolves every agent's MINTED-branch tip, replacing the
+    // per-agent `rev_parse_tip(root, "sparkle/agent-<id>")` fork that ran BEFORE the fingerprint skip
+    // (so it was paid on every tick even for the idle-and-unchanged majority this batch exists to keep
+    // cheap — one fork per agent, ~N forks a tick for N agents). Same shape as the batch `worktree
+    // list` above: one enumeration answers the whole fleet, and a per-agent lookup is a HashMap hit
+    // with zero forks. `%(objectname)` on a branch head is the commit sha — identical to what
+    // `rev-parse <ref>^{commit}` returned, because a branch never points at a tag. The `agent-*` glob
+    // is applied by git itself (no shell), and agent ids are UUIDs with no `/`, so it matches exactly
+    // the minted refs; a RENAMED branch has no `sparkle/agent-<id>` ref and so is simply absent from
+    // the map — which yields the empty tip the old `rev_parse_tip` miss produced, keeping the
+    // renamed/parked else-branch below byte-for-byte unchanged. An unreadable listing (empty repo,
+    // git error) ⇒ empty map ⇒ every agent takes that same else-branch, exactly as before.
+    let minted_tips: HashMap<String, String> = git(
+        root,
+        &["for-each-ref", "--format=%(objectname) %(refname)", "refs/heads/sparkle/agent-*"],
+    )
+    .map(|listing| {
+        listing
+            .lines()
+            .filter_map(|line| {
+                let (sha, refname) = line.split_once(' ')?;
+                let id = refname.strip_prefix("refs/heads/sparkle/agent-")?;
+                (!sha.is_empty() && !id.is_empty()).then(|| (id.to_string(), sha.to_string()))
+            })
+            .collect()
+    })
+    .unwrap_or_default();
     // Memoize effective base ref + its tip per distinct logical base (avoid re-resolving per agent).
     let mut base_ref_memo: HashMap<String, String> = HashMap::new();
     let mut base_tip_memo: HashMap<String, String> = HashMap::new();
@@ -6952,7 +6979,9 @@ pub fn project_agents_status_at(
         // is the parked/renamed minority. `head == minted` — the idle-and-unchanged majority
         // sparkle-zlic exists to keep cheap — still takes the tip the batch already had.
         let minted = format!("sparkle/agent-{}", a.agent_id);
-        let minted_tip = rev_parse_tip(root, &minted);
+        // From the ONE batch `for-each-ref` above, not a per-agent fork. Absent ⇒ empty ⇒ the
+        // renamed/parked else-branch, exactly as a `rev_parse_tip` miss behaved.
+        let minted_tip = minted_tips.get(&a.agent_id).cloned().unwrap_or_default();
         let head = worktree_head_branch(&wt.to_string_lossy(), wt.exists());
         let (branch, tip) = if head == minted && !minted_tip.is_empty() {
             (minted, minted_tip)
@@ -13055,6 +13084,83 @@ mod tests {
             workflow_before,
             "the reused workflow state must carry the previously computed values"
         );
+    }
+
+    // sparkle-xwnawc: the minted-branch tip used to be a per-agent `rev_parse_tip` fork, run BEFORE
+    // the fingerprint skip, so an N-agent tick paid N of them EVERY tick even when every agent was
+    // idle-and-unchanged — one of the two off-main hot loops the founder's hang sample caught (~38
+    // git children on a 15s sidebar tick). It is now resolved for the whole batch in ONE
+    // `for-each-ref`, so it must not scale with the agent count.
+    //
+    // Measured as the MARGINAL fork cost of one extra idle agent — the difference between a 2-agent
+    // skip tick and a 1-agent skip tick, which cancels every fixed per-BATCH fork (the `for-each-ref`
+    // itself, `default` tips, the `worktree list`, the origin probe) and isolates the per-AGENT cost.
+    // With the minted tip batched, the only per-agent fork left on the skip path is
+    // `worktree_head_branch`, so the marginal cost is 1. Restore the per-agent
+    // `rev_parse_tip(root, &minted)` and it becomes 2 — which is exactly what `<= 1` fails on, so the
+    // assertion grips the batching and not incidental arithmetic.
+    #[test]
+    fn the_minted_tip_is_resolved_once_per_batch_not_once_per_agent() {
+        let r = init_repo("batch-minted-tip");
+        let app_data = unique_root("batch-minted-tip-appdata");
+
+        // Two agents, each committed on its own minted branch (so `head == minted` and both take the
+        // cheap on-branch arm), sharing base `main` (so the base-tip memo hits for the second).
+        for id in ["a1", "a2"] {
+            let wt = create_worktree_at(&r, "p1", id, "main", &app_data).unwrap().path;
+            std::fs::write(format!("{wt}/w.txt"), "work").unwrap();
+            git(&wt, &["add", "."]).unwrap();
+            git(&wt, &["commit", "-q", "-m", "work"]).unwrap();
+        }
+
+        let input = |id: &str| AgentStatusInput {
+            agent_id: id.into(),
+            base_branch: "main".into(),
+            parent_branch: String::new(),
+            kind: "build".into(),
+            force: false,
+            created_at_ms: None,
+        };
+
+        // Cold tick over BOTH so the fingerprint cache is warm for each worktree path.
+        let cold = project_agents_status_at(
+            &r,
+            "p1",
+            &[input("a1"), input("a2")],
+            false,
+            &app_data,
+        );
+        assert!(cold[0].changed && cold[1].changed, "cold tick computes both");
+
+        let forks = |agents: &[AgentStatusInput]| {
+            let before = git_spawns_on_this_thread();
+            let out = project_agents_status_at(&r, "p1", agents, false, &app_data);
+            (git_spawns_on_this_thread() - before, out)
+        };
+
+        // Warm skip ticks: both agents are idle-and-unchanged, so both are fingerprint-skipped.
+        let (forks_one, out_one) = forks(&[input("a1")]);
+        let (forks_two, out_two) = forks(&[input("a1"), input("a2")]);
+
+        // PRECONDITION / anti-vacuity: the marginal-cost comparison only isolates the per-agent fork
+        // if BOTH ticks actually skipped (an agent that recomputed would drag in the full ladder and
+        // swamp the one fork under test).
+        assert!(!out_one[0].changed, "a1 must be skipped on the warm tick");
+        assert!(
+            !out_two[0].changed && !out_two[1].changed,
+            "both agents must be skipped on the warm 2-agent tick"
+        );
+
+        let marginal = forks_two - forks_one;
+        assert!(
+            marginal <= 1,
+            "one extra idle agent must add at most ONE git fork on the skip path (its \
+             worktree HEAD read) — the minted tip is batched. Restoring the per-agent \
+             rev_parse_tip(minted) makes this 2. (one={forks_one}, two={forks_two}, \
+             marginal={marginal})"
+        );
+
+        let _ = std::fs::remove_dir_all(&app_data);
     }
 
     // : a worktree whose directory SURVIVES but is no longer a git repo makes the batch's
