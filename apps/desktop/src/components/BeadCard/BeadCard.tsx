@@ -170,6 +170,29 @@ export interface BeadCardProps {
    */
   onViewOnBoard?: () => void;
   /**
+   * OPEN THIS EPIC IN THE BUILD COLUMN — narrow that column to the agents working this epic.
+   *
+   * ══ THE FOUNDER ASKED FOR THE PAIR, NOT FOR THIS ONE ALONE ══════════════════════════════════
+   * *"maybe instead of build it, because it's already building… it could say something like Open.
+   * And then there's two options, and maybe they're just two clickable links. One is in column, and
+   * the other is on board."* So this prop's real job is to turn the card's single board link into
+   * the two-destination **Open** group below: supplied, the card offers *in column* and *on board*
+   * together; absent, it keeps the standalone board button it has always had.
+   *
+   * ══ WHY IT IS A SECOND CALLBACK AND NOT A FLAG ══════════════════════════════════════════════
+   * Callback-is-the-switch, exactly like `onChat`, `onComment` and `goal` above. TWO different
+   * surfaces cannot offer this: a board overlay is ALREADY the board (its "in column" would be a
+   * jump out of the surface the reader chose), and a read-only fixture has no column to narrow. The
+   * concierge card is the one place both destinations are real, and it is the place he asked from.
+   *
+   * ══ ONLY AN EPIC GETS IT, AND THAT IS THE CALLER'S CALL ═════════════════════════════════════
+   * Nothing here reads `bead.type` — this file must never grow its own answer to "is this an epic"
+   * (`scripts/lib/epic-membership-guard.sh` fails CI on a second definition, and the card is
+   * exactly where a raw comparison of the bead's `type` field would look harmless). The caller
+   * gates it on the shared resolver and passes nothing for a task, which renders no link at all.
+   */
+  onOpenInColumn?: () => void;
+  /**
    * Start a concierge chat that already references this bead (bead sparkle-1cpomd). The founder
    * asked for it on EVERY bead card, task or epic — which is why it needs no branching here:
    * nothing in this component keys on `bead.type`, so "task or epic" is already the default.
@@ -240,6 +263,30 @@ const block = (extra: CSSProperties = {}): CSSProperties => ({ display: "block",
 
 const rowStyle: CSSProperties = { display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" };
 
+/** THE **Open** GROUP'S LINK SHAPE, written once so the two destinations cannot drift apart — a
+ *  pair of navigation links that differ by a shade or a weight stops reading as one choice.
+ *
+ *  A `<button>` painted as a link, which is the honest combination here: it moves the app rather
+ *  than following an href (so it is not an `<a>`), but it offers a CHOICE BETWEEN destinations
+ *  rather than performing an action (so it is not drawn as a button). `padding: 0` and the
+ *  transparent background are what strip the UA button chrome; `accentInk` + underline are what the
+ *  rest of the app already uses to say "this goes somewhere". */
+const openLinkStyle: CSSProperties = {
+  flex: "0 0 auto",
+  background: "transparent",
+  border: "none",
+  padding: 0,
+  color: C.accentInk,
+  cursor: "pointer",
+  fontFamily: FONT_UI,
+  fontSize: TYPE.small,
+  lineHeight: 1.4,
+  textDecoration: "underline",
+  // The link is the thing the eye lands on; the label beside it is not. Without this the
+  // underline sits hard against the descenders at the card's small type size.
+  textUnderlineOffset: 2,
+};
+
 /** A metadata line — a faint field name followed by its value. */
 function Field({ label, children }: { label: string; children: ReactNode }) {
   return (
@@ -262,6 +309,7 @@ export function BeadCard({
   projectName,
   descMaxHeight,
   onViewOnBoard,
+  onOpenInColumn,
   onChat,
   onSetPriority,
   onClose,
@@ -518,10 +566,22 @@ export function BeadCard({
               Chat
             </button>
           )}
-          {onViewOnBoard !== undefined && (
+          {onViewOnBoard !== undefined && onOpenInColumn === undefined && (
             // A BUTTON, not a fake link. It was an underlined `accentInk` run — which reads as
             // navigation to somewhere else on the page and is the founder's item 3. It performs an
             // action inside the app, so it is drawn as the control it is.
+            //
+            // ══ AND IT STANDS DOWN WHEN THE **Open** GROUP IS DRAWING BOTH DESTINATIONS ═══════
+            // `onOpenInColumn` is the signal that this card has TWO places to go (an epic in the
+            // concierge). The founder asked for those two as a pair — *"there's two options… one
+            // is in column, and the other is on board"* — so when both exist they belong in the
+            // one group below, and rendering the board here as well would put "on board" on the
+            // card twice, three inches apart, doing the same thing. This is the whole reason the
+            // group takes over rather than sitting alongside.
+            //
+            // The condition is on the NEW prop, never on `chrome`: this file's header forbids the
+            // surface deciding what is shown, and a board overlay that never passes
+            // `onOpenInColumn` keeps this button unchanged — which is every caller but one.
             <button
               type="button"
               data-testid={`${t}-view-on-board`}
@@ -664,6 +724,88 @@ export function BeadCard({
             {workers.join(", ")}
           </span>
         </Field>
+      )}
+
+      {/* ── OPEN ─────────────────────────────────────────────────────────────────────────────────
+          THE TWO PLACES AN EPIC CAN BE OPENED, as one group.
+
+          ══ WHY IT SITS HERE, DIRECTLY ABOVE BUILD ═════════════════════════════════════════════
+          The founder read this off the card himself: *"instead of Build It, because it's already
+          building… it could say something like Open."* `useBeadBuildActions` returns
+          `buildIt: startable ? … : null`, and that null is documented as "a RENDER instruction as
+          much as a capability one" — so a card for an epic that is ALREADY RUNNING has an empty
+          slot exactly here, where its primary action used to be. This group fills that slot with
+          the thing he actually wants at that moment: not a way to start the work again, but a way
+          to go and watch it.
+
+          ══ IT IS NOT GATED ON `startable`, AND THAT IS DELIBERATE ═════════════════════════════
+          *"for an epic, no matter what state it's in, it could say something like open."* An epic
+          that has not started, one mid-flight and one finished are all worth opening — the column
+          and the board are views, not actions, and nothing about them can fail on a closed bead.
+          So this appears whenever the caller says both destinations are real, and it can sit
+          BESIDE Build It on an epic that has not started yet. That is the founder's reading; the
+          two controls answer different questions ("start it" vs "show me it") and never compete.
+
+          ══ LINKS, NOT BUTTONS — THE ONE PLACE THIS CARD DRAWS THEM ════════════════════════════
+          `onViewOnBoard` above is deliberately a BUTTON because it performs an action, and the
+          note there is right. These are the exception the founder named twice — *"maybe they're
+          just two clickable links"* — and the distinction survives scrutiny: that button is one
+          control doing one thing, while this is a choice BETWEEN destinations, which is what a
+          run of links reads as. They are still real `<button>`s underneath, because they move the
+          app rather than following an href, and a fake `<a>` here would lie to a screen reader
+          about what pressing it does. */}
+      {/* GATED ON `onOpenInColumn` ALONE. "Only a board" is not this group's case — it is the
+          standalone button above, unchanged since before this existed — so the group appears
+          exactly when the column destination is real, and decides internally whether it is drawing
+          one link or two. */}
+      {onOpenInColumn !== undefined && (
+        <span style={rowStyle} data-testid={`${t}-open-links`}>
+          <span style={{ color: C.muted, fontSize: TYPE.small, lineHeight: 1.4 }}>Open</span>
+          <button
+            type="button"
+            data-testid={`${t}-open-in-column`}
+            onClick={onOpenInColumn}
+            // ══ `aria-label`, NOT `title` — A NATIVE TOOLTIP HERE WOULD BE DEAD CODE ══════════
+            // `disableNativeTooltips()` strips every `title` app-wide on the first `mouseover`,
+            // and it only rescues the text into `aria-label` for a control that has NO other
+            // accessible name. These links have visible text, so a `title` on them is dropped
+            // outright: no tooltip, and nothing moved to the AX tree. (The `title`s on this card's
+            // older buttons are inert for the same reason — pre-existing, and not this change's to
+            // fix.) `HeaderLink` already solved it the way this copies: compose the accessible
+            // name as `<label> — <description>`.
+            //
+            // It is worth the words because "in column" is the ambiguous half of the pair. The
+            // build column is off-screen-right of the concierge at most widths, so the label alone
+            // names neither the column nor what will change about it.
+            aria-label="in column — narrow the Build column to the agents working this epic"
+            style={openLinkStyle}
+          >
+            in column
+          </button>
+          {/* THE SEPARATOR IS NOT A LINK and must never be read as one. `aria-hidden` keeps it
+              out of the accessibility tree entirely, so the two controls read as two controls. */}
+          {onViewOnBoard !== undefined && (
+            <span aria-hidden style={{ color: C.hairline, fontSize: TYPE.small }}>
+              ·
+            </span>
+          )}
+          {/* ONE LINK WHEN ONLY ONE DESTINATION IS MEANINGFUL, TWO WHEN BOTH ARE. A surface that
+              can narrow the column but has no board to open (none today, but the props allow it)
+              shows "in column" alone rather than a dead second link — which is the same
+              callback-is-the-switch rule every other affordance on this card follows. */}
+          {onViewOnBoard !== undefined && (
+            <button
+              type="button"
+              data-testid={`${t}-open-on-board`}
+              onClick={onViewOnBoard}
+              // Composed like its sibling above — see that note for why `title` cannot work here.
+              aria-label="on board — open the Plan board focused on this epic"
+              style={openLinkStyle}
+            >
+              on board
+            </button>
+          )}
+        </span>
       )}
 
       {/* ── BUILD ────────────────────────────────────────────────────────────────────────────── */}

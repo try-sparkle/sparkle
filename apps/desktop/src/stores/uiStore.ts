@@ -456,6 +456,28 @@ interface UiState {
   // also keeps the persisted-key ratchet green with no migration.
   epicFocusBySide: Record<PairSide, string | null>;
   setEpicFocus: (side: PairSide, epicId: string | null) => void;
+  /**
+   * FOCUS THIS EPIC — idempotently. The non-toggling half of {@link setEpicFocus}, and the reason
+   * it has to exist as its own action rather than as a caller-side `if`.
+   *
+   * `setEpicFocus` TOGGLES by design: pressing the epics-column row you are already on is a request
+   * to CLEAR, because that row is both the way in and the way out. A link labelled **Open** is the
+   * opposite promise — pressing it twice must leave the epic open, not un-focus it — so the two
+   * gestures genuinely want two verbs. Naming the second one here rather than making each caller
+   * read the current value first keeps every writer of this field in ONE file: a caller-side
+   * `if (focus !== id) setEpicFocus(...)` is the same toggle bug re-derived, one call site at a
+   * time, and it reads correct.
+   *
+   * PAIR IT WITH `showBuildStage(side)`, the same way `setBoardFocusBeadId` is paired with
+   * `openPlanBoard`. The build column's focus banner (`AgentSidebar`, gated on `mode !== "plan"`)
+   * is the only thing on screen that says a narrowing is in force, so focusing an epic on a side
+   * that is showing the Plan board narrows a column the reader cannot see and looks like a dead
+   * click. Order does not matter here — unlike the board's one-shot — but both writes do.
+   *
+   * Takes a NON-NULL id: "open nothing" is not a gesture. Clearing stays with `setEpicFocus(side,
+   * null)`, which is what both Clear buttons already call.
+   */
+  openEpicFocus: (side: PairSide, epicId: string) => void;
   // ── THE CHILD-TASK RUNG OF THE SAME SELECTION ────────────────────────────────────────────────
   //
   // The founder: "If I click to open an epic on the epic column and then I click on one of the
@@ -892,11 +914,23 @@ export const useUiStore = create<UiState>()(
           },
         })),
       epicFocusBySide: { left: null, right: null },
-      // TOGGLES: clicking the selected epic again clears the narrowing. The column is the only
-      // control that sets this, so without a way to clear it from the same gesture the user has to
+      // TOGGLES: clicking the selected epic again clears the narrowing. The epics column ROW is
+      // both the way in and the way out, so without a clear on the same gesture the user has to
       // hunt for one — and identity-stability on a no-op is not available as a substitute, because
       // re-clicking the same row is a REQUEST TO CLEAR rather than a redundant re-assert. That is
       // the one place this setter deliberately differs from the three above it.
+      //
+      // THIS IS NO LONGER THE ONLY WRITER, and the comment here used to say it was ("The column is
+      // the only control that sets this"). The concierge's bead card now opens an epic in the build
+      // column too (`BeadPill.viewInColumn`), which is the entry point the founder asked for —
+      // "open the epic in the build column" from a card in the chat. It deliberately does NOT come
+      // through this setter: a link labelled Open must be idempotent, and routing it here would
+      // make the SECOND press of Open un-focus the epic. It calls `openEpicFocus` below instead.
+      //
+      // So the invariant that survives is narrower and worth stating precisely: this TOGGLING
+      // setter belongs to the epics column and to the two Clear buttons. Any new entry point that
+      // means "show me this epic" wants `openEpicFocus`; only a control that is its own off-switch
+      // wants this one.
       setEpicFocus: (side, epicId) =>
         set((st) => {
           const next = st.epicFocusBySide[side] === epicId ? null : epicId;
@@ -920,6 +954,29 @@ export const useUiStore = create<UiState>()(
           const next = st.beadFocusBySide[side] === beadId ? null : beadId;
           if (st.beadFocusBySide[side] === next) return {};
           return { beadFocusBySide: { ...st.beadFocusBySide, [side]: next } };
+        }),
+      // IDEMPOTENT — see the interface note. Identity-stable when the epic is already focused AND
+      // no child selection is left over, so pressing Open twice is genuinely nothing rather than a
+      // re-assert that re-runs every consumer's narrowing memo (`agentIdsInEpic` in AgentSidebar
+      // and Workspace).
+      //
+      // ══ IT OBEYS RULE 3 TOO, AND THAT IS NOT OPTIONAL ═══════════════════════════════════════
+      // `beadFocusBySide` is the NARROWER rung and it WINS while it holds
+      // (`focusedBeadIdForSide` is `child ?? epic`). So an "Open this epic" that wrote only the
+      // epic key would be swallowed whole whenever a child task happened to be selected: the
+      // column would go on showing that task's agents, under a different epic, and the link would
+      // read as broken. This is the identical reason `setEpicFocus` clears the child — the rule
+      // belongs to "the epic moved", not to one particular setter — and the no-op guard therefore
+      // has to ask about BOTH keys, or the stale child survives exactly the case that most needs
+      // it gone: pressing Open on the epic that is already focused.
+      openEpicFocus: (side, epicId) =>
+        set((st) => {
+          const staleChild = st.beadFocusBySide[side] !== null;
+          if (st.epicFocusBySide[side] === epicId && !staleChild) return {};
+          return {
+            epicFocusBySide: { ...st.epicFocusBySide, [side]: epicId },
+            beadFocusBySide: { ...st.beadFocusBySide, [side]: null },
+          };
         }),
       buildAgentHover: false,
       setBuildAgentHover: (v) => set({ buildAgentHover: v }),

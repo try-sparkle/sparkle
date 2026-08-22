@@ -56,6 +56,8 @@ import { useProjectStore } from "../../stores/projectStore";
 import { useRuntimeStore } from "../../stores/runtimeStore";
 import { REVEAL_REQUEST_TTL_MS, SPARKLE_PANE_SIDE, useUiStore, type WorkMode } from "../../stores/uiStore";
 import { sideOf } from "../../engine/pairs";
+import { useBeadsStore } from "../../stores/beadsStore";
+import { epicIndexOf, isEpicIndexed } from "../../services/beads";
 // The MODE LIST as a value, so the guard below is derived from the same source as the type rather
 // than re-listing it (roborev 60625).
 import { WORK_MODES, isWorkMode } from "../../engine/workMode";
@@ -100,6 +102,8 @@ export const SIDEBAR_VIEW_OPS = [
   "collapse_orchestrators",
   "set_orchestrators_collapsed",
   "set_work_mode",
+  "focus_epic",
+  "clear_epic_focus",
   "reveal_row",
   "select_row",
 ] as const;
@@ -150,6 +154,12 @@ export const SIDEBAR_VIEW_OP_RISK: Record<SidebarViewOp, SidebarViewRiskClass> =
   collapse_orchestrators: "view",
   set_orchestrators_collapsed: "view",
   set_work_mode: "view",
+  // "view", NOT "disruptive", on the same test every other entry here takes: it changes WHAT THE
+  // HUMAN SEES and nothing else. A narrowed column hides rows; it never stops, starts, retargets or
+  // touches an agent, and the state it writes is transient — a relaunch starts unnarrowed. It is
+  // strictly less invasive than `select_row`, which moves the user's actual selection.
+  focus_epic: "view",
+  clear_epic_focus: "view",
   reveal_row: "view",
   select_row: "disruptive",
 };
@@ -175,6 +185,8 @@ export type SidebarViewRefusalReason =
   | "unknown-band" // a band name outside needs_you | questions | running | done
   | "incomplete-bands" // every key was a real band, but the record did not name all of them
   | "unknown-mode" // a work mode outside plan | build
+  | "unknown-bead" // no bead by that id in the scoped project's backlog
+  | "not-an-epic" // the id names a real bead, but not one the build column can narrow to
   | "no-ids" // an empty id list — almost always a caller bug, never a silent no-op
   | "no-op"; // the request was VALID and would change nothing
 
@@ -880,6 +892,113 @@ export function setWorkMode(mode: string): SidebarViewResult<WorkModeChange> {
   if (mode === "plan") useUiStore.getState().openPlanBoard(side);
   else useUiStore.getState().showBuildStage(side);
   return ok("set_work_mode", { priorWorkMode, workMode: mode });
+}
+
+// ---------------------------------------------------------------------------------------------
+// Narrowing the column to one epic
+// ---------------------------------------------------------------------------------------------
+
+/** What `focus_epic` changed, in the same prior/next shape `set_work_mode` reports. */
+export interface EpicFocusChange {
+  /** The epic that was focused before, or null when the column was showing everything. */
+  priorEpicId: string | null;
+  epicId: string;
+  /** Whether the call also had to put the column into Build — see the note in the body. */
+  switchedToBuild: boolean;
+}
+
+/**
+ * NARROW THE BUILD COLUMN TO ONE EPIC — the concierge's half of the gesture the epics column and
+ * the bead card's "Open in column" link already offer.
+ *
+ * It exists so the concierge can answer "show me what's building on the auth epic" by MOVING THE
+ * VIEW rather than by describing it in prose. Everything it needs was already here: the tool
+ * surface could flip a column's mode (`set_work_mode`) but had no way to narrow one.
+ *
+ * ══ TWO WRITES, AND THE SECOND IS NOT OPTIONAL ═════════════════════════════════════════════════
+ * The narrowing is INVISIBLE while that side is showing the Plan board: `AgentSidebar` gates the
+ * focus banner — the only thing on screen that says a filter is in force, and the only place its
+ * "Show all" clear lives — on `mode !== "plan"`. So this calls `showBuildStage(side)` when it has
+ * to, exactly as `BeadPill.viewInColumn` does, and REPORTS having done it (`switchedToBuild`) so
+ * the concierge can say so rather than silently relocating the user.
+ *
+ * ══ `openEpicFocus`, NEVER `setEpicFocus` ══════════════════════════════════════════════════════
+ * The latter TOGGLES, so asking twice for the same epic would clear the narrowing — a tool whose
+ * second identical call undoes the first is a tool no caller can use safely. The no-op refusal
+ * below is the honest way to say "already there".
+ *
+ * ══ IT VALIDATES THE BEAD AGAINST THE SHARED RESOLVER ══════════════════════════════════════════
+ * `isEpicIndexed`, never a raw comparison of the bead's `type` field — a second definition of epic
+ * membership fails CI (`scripts/lib/epic-membership-guard.sh`), and that type test is `isTypedEpic`,
+ * a DIFFERENT question that misses every structural epic nobody declared. Two refusals, not one, because they want opposite
+ * responses: `unknown-bead` is a caller bug no retry fixes, while `not-an-epic` names a real bead
+ * the caller may simply have mistaken for a plan.
+ */
+export function focusEpic(epicId: string): SidebarViewResult<EpicFocusChange> {
+  const project = scopedProject();
+  if (project === null) {
+    return refuse("focus_epic", "no-project", "No project is scoped into the Build column.");
+  }
+  const beads = useBeadsStore.getState().byProject[project.id]?.beads ?? [];
+  const bead = beads.find((b) => b.id === epicId);
+  if (bead === undefined) {
+    return refuse(
+      "focus_epic",
+      "unknown-bead",
+      `There is no bead "${epicId}" in ${project.name}'s backlog.`,
+    );
+  }
+  if (!isEpicIndexed(epicIndexOf(beads), bead)) {
+    return refuse(
+      "focus_epic",
+      "not-an-epic",
+      `"${epicId}" is a bead but not an epic, so the Build column has nothing to narrow to.`,
+    );
+  }
+  const side = scopedSide();
+  const ui = useUiStore.getState();
+  const priorEpicId = ui.epicFocusBySide[side];
+  // ALREADY NARROWED TO THIS EPIC **AND** ALREADY SHOWING IT **AND** NOT STILL DRILLED INTO A
+  // CHILD. Three conditions, and each one is a state in which "already narrowed to that epic" is
+  // true while the caller's request is NOT satisfied:
+  //
+  //   * the MODE — a column focused on this epic while sitting in Plan is not showing it, and
+  //     refusing there leaves the narrowing invisible (the hole `set_work_mode`'s `surfaceHidden`
+  //     guard closes one surface over);
+  //   * the CHILD — `beadFocusBySide` is the narrower rung and WINS while it holds, so a column
+  //     drilled into one task of this epic is showing that TASK's agents, not the epic's. Calling
+  //     that a no-op would refuse the one request that widens it back.
+  const showing = ui.workModeBySide[side] === "build";
+  const drilledIntoChild = ui.beadFocusBySide[side] !== null;
+  if (priorEpicId === epicId && showing && !drilledIntoChild) {
+    return refuse("focus_epic", "no-op", `The Build column is already narrowed to ${epicId}.`);
+  }
+  const switchedToBuild = !showing;
+  if (switchedToBuild) ui.showBuildStage(side);
+  ui.openEpicFocus(side, epicId);
+  return ok("focus_epic", { priorEpicId, epicId, switchedToBuild });
+}
+
+/**
+ * SHOW EVERY AGAIN — the mirror, and the tool form of the column's own "Show all" link.
+ *
+ * `setEpicFocus(side, null)` rather than `openEpicFocus`: clearing is precisely the case the
+ * toggling setter handles correctly and the idempotent one deliberately cannot express (it takes a
+ * non-null id, because "open nothing" is not a gesture). This does NOT touch the work mode — a
+ * caller asking to widen the filter has not asked to be moved to another surface.
+ */
+export function clearEpicFocus(): SidebarViewResult<{ priorEpicId: string }> {
+  const side = scopedSide();
+  const priorEpicId = useUiStore.getState().epicFocusBySide[side];
+  if (priorEpicId === null) {
+    return refuse(
+      "clear_epic_focus",
+      "no-op",
+      "The Build column is not narrowed to an epic.",
+    );
+  }
+  useUiStore.getState().setEpicFocus(side, null);
+  return ok("clear_epic_focus", { priorEpicId });
 }
 
 export interface RevealOutcome {

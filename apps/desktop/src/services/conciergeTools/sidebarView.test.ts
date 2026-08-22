@@ -32,6 +32,8 @@ import {
   setOrchestratorsCollapsed,
   setStatusBands,
   setWorkMode,
+  focusEpic,
+  clearEpicFocus,
   showAllStatusBands,
   toggleStatusBand,
   type BandVisibility,
@@ -42,6 +44,8 @@ import { __clearRepoSlugCache, __setRepoSlugForTest } from "./repoSlug";
 import { useProjectStore } from "../../stores/projectStore";
 import { useRuntimeStore } from "../../stores/runtimeStore";
 import { useUiStore } from "../../stores/uiStore";
+import { useBeadsStore } from "../../stores/beadsStore";
+import type { Bead } from "../../services/beads";
 import type { AgentTab, AgentTabStatus, Project } from "../../types";
 
 // ── fixtures ─────────────────────────────────────────────────────────────────────────────────
@@ -976,5 +980,186 @@ describe("cross-repo rows (bead `sparkle-pgh1ue`)", () => {
       selectedProjectId: "p1",
     } as never);
     expect(rowsById(value(listBuildRows()))("b2").section).toBe("tracked_elsewhere");
+  });
+});
+
+// ── NARROWING THE COLUMN TO ONE EPIC ─────────────────────────────────────────────────────────────
+//
+// The tool surface could already flip a column's MODE and had no way to narrow one, so the
+// concierge could describe what was building on an epic but never show it. These rows pin the two
+// halves that are invisible in any rendered output, and that a plausible implementation gets wrong:
+//
+//   * the SECOND store write (`showBuildStage`), without which the narrowing is real but hidden
+//     behind the Plan board, with no banner and no way to clear it;
+//   * the IDEMPOTENT setter, without which asking twice for the same epic silently un-narrows.
+describe("focusEpic / clearEpicFocus", () => {
+  function bead(over: Partial<Bead> & { id: string }): Bead {
+    return {
+      title: "t",
+      description: "",
+      status: "open",
+      type: "feature",
+      priority: 0,
+      labels: [],
+      parent: null,
+      commentCount: 0,
+      ...over,
+    };
+  }
+  /** A declared epic, a STRUCTURAL epic (children, never declared), and a plain task. */
+  const EPIC = bead({ id: "sparkle-ep", type: "epic" });
+  const STRUCT = bead({ id: "sparkle-st" });
+  const KID = bead({ id: "", parent: "sparkle-st" });
+  const TASK = bead({ id: "sparkle-tk" });
+
+  beforeEach(() => {
+    useBeadsStore.setState({
+      byProject: { p1: { beads: [EPIC, STRUCT, KID, TASK], board: {} as never, loadedAt: 1 } },
+    } as never);
+    useUiStore.setState({ epicFocusBySide: { left: null, right: null } } as never);
+  });
+
+  it("narrows the column to the epic", () => {
+    const v = value(focusEpic(EPIC.id));
+    expect(v.epicId).toBe(EPIC.id);
+    expect(useUiStore.getState().epicFocusBySide.right).toBe(EPIC.id);
+  });
+
+  // MEMBERSHIP, NOT TYPE — a structural epic is one because something points at it.
+  it("accepts a STRUCTURAL epic that was never declared one", () => {
+    value(focusEpic(STRUCT.id));
+    expect(useUiStore.getState().epicFocusBySide.right).toBe(STRUCT.id);
+  });
+
+  it("refuses a bead that is not an epic — distinctly from one that does not exist", () => {
+    const notEpic = focusEpic(TASK.id);
+    const missing = focusEpic("sparkle-nope");
+    expect(notEpic.ok).toBe(false);
+    expect(missing.ok).toBe(false);
+    // TWO reasons, not one: "not an epic" is a real bead the caller may have mistaken for a plan,
+    // while "unknown" is a caller bug no retry fixes. A shared reason answers neither question.
+    expect(!notEpic.ok && notEpic.reason).toBe("not-an-epic");
+    expect(!missing.ok && missing.reason).toBe("unknown-bead");
+    expect(useUiStore.getState().epicFocusBySide.right).toBeNull();
+  });
+
+  // ══ THE WRITE THAT IS EASY TO OMIT ═══════════════════════════════════════════════════════════
+  // Narrowing a column that is showing the Plan board hides rows the reader cannot see, with no
+  // banner and no "Show all". The op must move the column AND say that it did.
+  it("switches the column to Build so the narrowing is visible, and REPORTS doing so", () => {
+    useUiStore.setState({ workModeBySide: { left: "build", right: "plan" } } as never);
+    const v = value(focusEpic(EPIC.id));
+    expect(useUiStore.getState().workModeBySide.right).toBe("build");
+    expect(v.switchedToBuild).toBe(true);
+  });
+
+  it("does not claim to have switched when the column was already in Build", () => {
+    const v = value(focusEpic(EPIC.id));
+    expect(v.switchedToBuild).toBe(false);
+  });
+
+  // IDEMPOTENT. Wired to the toggling `setEpicFocus`, the second call would clear the narrowing;
+  // here it refuses as a no-op and the focus SURVIVES, which is the assertion that catches it.
+  it("refuses as a no-op when already narrowed to that epic — and does NOT un-narrow", () => {
+    value(focusEpic(EPIC.id));
+    const again = focusEpic(EPIC.id);
+    expect(again.ok).toBe(false);
+    expect(!again.ok && again.reason).toBe("no-op");
+    expect(useUiStore.getState().epicFocusBySide.right).toBe(EPIC.id);
+  });
+
+  // …but "already focused" is NOT a no-op while that side is showing the board, because the state
+  // the caller asked for — a visible narrowing — is not the state it is in.
+  it("is NOT a no-op when the epic is focused but the column is showing the board", () => {
+    value(focusEpic(EPIC.id));
+    useUiStore.setState({ workModeBySide: { left: "build", right: "plan" } } as never);
+    const v = value(focusEpic(EPIC.id));
+    expect(v.switchedToBuild).toBe(true);
+    expect(useUiStore.getState().workModeBySide.right).toBe("build");
+  });
+
+  it("reports the prior epic, so the change is reversible from its own result", () => {
+    value(focusEpic(EPIC.id));
+    const v = value(focusEpic(STRUCT.id));
+    expect(v.priorEpicId).toBe(EPIC.id);
+    value(focusEpic(v.priorEpicId!));
+    expect(useUiStore.getState().epicFocusBySide.right).toBe(EPIC.id);
+  });
+
+  it("clearEpicFocus shows every agent again", () => {
+    value(focusEpic(EPIC.id));
+    const v = value(clearEpicFocus());
+    expect(v.priorEpicId).toBe(EPIC.id);
+    expect(useUiStore.getState().epicFocusBySide.right).toBeNull();
+  });
+
+  // Widening the filter is not a request to be moved to another surface.
+  it("clearEpicFocus leaves the work mode alone", () => {
+    value(focusEpic(EPIC.id));
+    useUiStore.setState({ workModeBySide: { left: "build", right: "plan" } } as never);
+    value(clearEpicFocus());
+    expect(useUiStore.getState().workModeBySide.right).toBe("plan");
+  });
+
+  it("clearEpicFocus refuses as a no-op when nothing is narrowed", () => {
+    const r = clearEpicFocus();
+    expect(r.ok).toBe(false);
+    expect(!r.ok && r.reason).toBe("no-op");
+  });
+
+  it("refuses when no project is scoped", () => {
+    useProjectStore.setState({ selectedProjectId: null } as never);
+    const r = focusEpic(EPIC.id);
+    expect(r.ok).toBe(false);
+    expect(!r.ok && r.reason).toBe("no-project");
+  });
+});
+
+// ── RULE 3 REACHES THE TOOL SURFACE TOO ──────────────────────────────────────────────────────────
+//
+// `beadFocusBySide` (the child-task rung) is NARROWER and wins while it holds, so every one of
+// these rows is a state where "already narrowed to that epic" is true and the caller's request is
+// still not satisfied.
+describe("focusEpic and the child-task rung", () => {
+  function bead(over: Partial<Bead> & { id: string }): Bead {
+    return {
+      title: "t",
+      description: "",
+      status: "open",
+      type: "feature",
+      priority: 0,
+      labels: [],
+      parent: null,
+      commentCount: 0,
+      ...over,
+    };
+  }
+  const EPIC = bead({ id: "sparkle-ep", type: "epic" });
+
+  beforeEach(() => {
+    useBeadsStore.setState({
+      byProject: { p1: { beads: [EPIC], board: {} as never, loadedAt: 1 } },
+    } as never);
+    useUiStore.setState({
+      epicFocusBySide: { left: null, right: null },
+      beadFocusBySide: { left: null, right: null },
+    } as never);
+  });
+
+  it("drops a stale child selection, so the epic it opens is what actually narrows", () => {
+    value(focusEpic(EPIC.id));
+    useUiStore.getState().setBeadFocus("right", "sparkle-ep.a");
+    value(focusEpic(EPIC.id));
+    expect(useUiStore.getState().beadFocusBySide.right).toBeNull();
+    expect(useUiStore.getState().epicFocusBySide.right).toBe(EPIC.id);
+  });
+
+  // NOT a no-op: the column is drilled into a TASK of this epic, so it is showing that task's
+  // agents rather than the epic's. Refusing here would reject the one call that widens it back.
+  it("is NOT a no-op while the column is drilled into a child of that epic", () => {
+    value(focusEpic(EPIC.id));
+    useUiStore.getState().setBeadFocus("right", "sparkle-ep.a");
+    const again = focusEpic(EPIC.id);
+    expect(again.ok).toBe(true);
   });
 });

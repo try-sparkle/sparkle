@@ -159,6 +159,15 @@ export interface BeadPillContextValue {
    *  surface — the card still opens and still shows the bead, it simply offers no second step. That
    *  is not a dead end: the click already produced the card. */
   onViewOnBoard?: (target: { beadId: string; projectId: string }) => boolean;
+  /** Open the epic in the BUILD column, narrowed to the agents working it — and report whether it
+   *  LANDED, on exactly the contract `onViewOnBoard` above describes. Same object-not-two-strings
+   *  reasoning, same "absence means this surface cannot go there" reasoning.
+   *
+   *  IT IS OFFERED ONLY FOR AN EPIC, and that gate is NOT here: whether a bead is an epic is a
+   *  question about the BEAD, answered by the shared resolver where the card is assembled
+   *  (`ConciergeBeadCard`), not a property of the surface. This field says only that a build column
+   *  exists to narrow — the same thing `onViewOnBoard` says about a board. */
+  onViewInColumn?: (target: { beadId: string; projectId: string }) => boolean;
 }
 
 /** One project the reader is NOT currently in: `[id, rootPath, name]`. The sweep needs the first
@@ -481,6 +490,7 @@ export function BeadPillHost({ children }: { children: ReactNode }) {
         ? indexBeads(byProject, foreignProjects(others), projectId, rootPath)
         : EMPTY_BEADS,
       onViewOnBoard: viewOnBoard,
+      onViewInColumn: viewInColumn,
     }),
     [byProject, others, projectId, rootPath, beadsEnabled],
   );
@@ -616,6 +626,48 @@ function viewOnBoard(target: { beadId: string; projectId: string }): boolean {
   return true;
 }
 
+/**
+ * Open the epic in the BUILD column on its own side — the other half of the founder's pair.
+ *
+ * *"I have the option to open the epic in the build column or open the epic on the planning
+ * board."* This is the first of those two, and it is the exact mirror of {@link viewOnBoard} above:
+ * same project-existence check, same derived side, same boolean contract. Read that function's
+ * docblock first — everything it says about WHICH SIDE and why the project is selected first
+ * applies here unchanged, and is not repeated.
+ *
+ * ══ TWO STORE WRITES, AND THE SECOND ONE IS EASY TO MISS ═══════════════════════════════════════
+ * `showBuildStage(side)` THEN `openEpicFocus(side, epicId)`. The narrowing alone is invisible: the
+ * build column's focus banner — the only thing on screen that says a filter is in force, and the
+ * only place its "Show all" clear lives — is gated on `mode !== "plan"` in `AgentSidebar`. So
+ * focusing an epic on a side that is currently showing the Plan board narrows a column the reader
+ * is not looking at, with nothing to explain it and no way to undo it. `showBuildStage` /
+ * `openPlanBoard` are the store's documented pair of "make this stage actually visible" writes, and
+ * this needs the build half for the same reason the board path needs the plan half.
+ *
+ * ══ `openEpicFocus`, NEVER `setEpicFocus` ══════════════════════════════════════════════════════
+ * `setEpicFocus` TOGGLES — pressing it on the epic it already holds CLEARS the narrowing. That is
+ * right for the epics-column row, which is its own off-switch, and wrong for a link labelled
+ * **Open**: the second press would un-focus the epic the reader just asked to see, and read as the
+ * link being broken. `openEpicFocus` is the idempotent write that exists for this call site.
+ *
+ * ══ UNLIKE THE BOARD, NOTHING HERE IS A ONE-SHOT ═══════════════════════════════════════════════
+ * `setBoardFocusBeadId` is consumed and cleared by `BoardView`, which is what makes the board
+ * path's ORDER load-bearing. `epicFocusBySide` is ordinary state that nothing consumes, so the two
+ * writes here commute — but they are still both required, and the order is kept the same as the
+ * board's so the two functions read as one pattern.
+ */
+function viewInColumn(target: { beadId: string; projectId: string }): boolean {
+  const projects = useProjectStore.getState();
+  // Same reported-not-assumed contract as `viewOnBoard`: `false` becomes a sentence on the card.
+  if (!projects.projects.some((p) => p.id === target.projectId)) return false;
+  projects.selectProject(target.projectId);
+  const ui = useUiStore.getState();
+  const side = sideOf(ui.pairAssignment, target.projectId);
+  ui.showBuildStage(side);
+  ui.openEpicFocus(side, target.beadId);
+  return true;
+}
+
 // ── PRESENTATION ────────────────────────────────────────────────────────────────────────────────
 
 /** The shared shape, so the pill and its card differ only where they must. Mirrors `AgentPill`'s
@@ -673,7 +725,7 @@ const noBoardSentence = (beadId: string) => `${beadId} is not on an open board.`
  * live status rather than the label, a misleading label buys nothing.
  */
 export function BeadPill({ beadId }: { beadId: string }) {
-  const { beads, onViewOnBoard } = useContext(BeadPillContext);
+  const { beads, onViewOnBoard, onViewInColumn } = useContext(BeadPillContext);
   // ── OPEN IS AN OVERRIDE OVER A RULE, NOT A FLAG ─────────────────────────────────────────────
   //
   // `null` means THE READER HAS NOT DECIDED, so the message-level rule (`BeadAutoExpandProvider`)
@@ -863,6 +915,17 @@ export function BeadPill({ beadId }: { beadId: string }) {
                   setMisses((n) => (landed ? 0 : n + 1));
                 }
           }
+          // THE SAME SHAPE, AND THE SAME WARNING APPLIES — the navigation runs in the handler, the
+          // updater only folds an outcome already decided. See the block above; it is not repeated
+          // because the hazard is identical and one copy of that explanation is enough.
+          onViewInColumn={
+            onViewInColumn === undefined
+              ? undefined
+              : () => {
+                  const landed = onViewInColumn({ beadId: bead.id, projectId: resolved.projectId });
+                  setMisses((n) => (landed ? 0 : n + 1));
+                }
+          }
         />
       )}
     </span>
@@ -897,6 +960,7 @@ function ConciergeBeadCard({
   id,
   resolved,
   onViewOnBoard,
+  onViewInColumn,
   onClose,
   notice,
   noticeKey,
@@ -906,6 +970,9 @@ function ConciergeBeadCard({
   /** Absent when the surface has no board to open. The card is still the result of the click, so
    *  this is a missing SECOND step, not a dead end. */
   onViewOnBoard?: () => void;
+  /** Absent when the surface has no build column to narrow. Passed through to the card ONLY for an
+   *  epic — see the `isEpic` gate in the body, which is where the bead question is asked. */
+  onViewInColumn?: () => void;
   onClose: () => void;
   notice?: string;
   noticeKey: number;
@@ -945,6 +1012,21 @@ function ConciergeBeadCard({
       // shows six lines of a description is a card you have to open the board to read.
       descMaxHeight={DESC_MAX_H}
       onViewOnBoard={onViewOnBoard}
+      // ══ THE EPIC GATE — READ OFF THE SHARED RESOLVER, NEVER RE-DERIVED ═════════════════════════
+      // `build.isEpic` is `isEpicIndexed(epicIndexOf(allBeads), bead)`, memoized inside the hook
+      // that is already mounted here. Asking it any other way would be a second definition of epic
+      // membership, which `scripts/lib/epic-membership-guard.sh` fails CI on — and the tempting
+      // wrong answer — comparing the bead's raw `type` field — is a DIFFERENT question
+      // (`isTypedEpic`) that misses every structural epic nobody declared.
+      //
+      // WHY ONLY AN EPIC: the build column narrows by epic, and both destinations are epic-shaped.
+      // The founder scoped it himself — "if it is an epic". A task card is untouched by all of
+      // this and keeps the standalone "View on board" button it already had, because
+      // `onOpenInColumn` arriving `undefined` is what puts that button back.
+      //
+      // NOT gated on `canWrite`, unlike Chat and the priority control: this navigates, it does not
+      // write, so a project with no `bd` path can still send the reader to the column or the board.
+      onOpenInColumn={build.isEpic ? onViewInColumn : undefined}
       onClose={onClose}
       // ══ YES, EVEN INSIDE THE CONCIERGE ═══════════════════════════════════════════════════════
       // Clicking Chat on a card that is ALREADY in a concierge thread looks like a loop, and it

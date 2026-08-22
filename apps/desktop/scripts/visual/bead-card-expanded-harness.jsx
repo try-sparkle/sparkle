@@ -23,6 +23,7 @@ import { createRoot } from "react-dom/client";
 import "../../src/index.css";
 import { ConciergeThread } from "../../src/components/Concierge/ConciergeThread";
 import { BeadPillProvider } from "../../src/components/Concierge/BeadPill";
+import { useBeadsStore } from "../../src/stores/beadsStore";
 
 const params = new URLSearchParams(location.search);
 /** The concierge column width to model. `CONCIERGE_DEFAULT_WIDTH` is 360. */
@@ -58,13 +59,43 @@ const BEADS = [
   bead({ id: "sparkle-aaa11", status: "in_progress", priority: 1, title: "Rotate the auth-failure retry to a healthy account" }),
   bead({ id: "sparkle-bbb22", status: "open", priority: 2, title: "Bead cards render expanded in the concierge" }),
   bead({ id: "sparkle-ccc33", status: "blocked", priority: 3, title: "Drain the orphaned roborev findings" }),
+  // AN EPIC, so the card's **Open** group has something to draw. It is the only bead here that gets
+  // it — the two destinations are epic-shaped, and the founder scoped it "if it is an epic" — so
+  // this card is also the control that proves the four TASK cards above correctly do NOT get it.
+  //
+  // `type: "epic"` rather than giving it children, deliberately: `isEpicIndexed` accepts either, and
+  // a declared epic keeps the fixture to one bead instead of two, with no child card appearing in
+  // the thread that the photograph would then have to explain.
+  //
+  // `status: "in_progress"` is the founder's own case — *"instead of Build It, because it's already
+  // building"*. A started epic has no Build It, so this card photographs the exact hole the Open
+  // links were asked to fill.
+  bead({
+    id: "sparkle-ddd44",
+    status: "in_progress",
+    priority: 1,
+    type: "epic",
+    title: "EPIC: the concierge can open an epic where the founder wants it",
+  }),
 ];
+
+// THE BACKLOG THE EPIC GATE IS ANSWERED AGAINST. `useBeadBuildActions` reads `allBeads` from the
+// beads STORE, not from the pill context above — so without this seed every bead resolves as "not
+// an epic" and the Open group is invisible no matter what the fixture says. The store is a
+// module-level singleton, so this runs once at import and needs no provider.
+useBeadsStore.setState({
+  byProject: { p1: { beads: BEADS, board: {}, loadedAt: 1 } },
+});
 
 // `rootPath` is supplied so the cards render their WRITE controls — the priority chip and "Build
 // It". Without it the card is read-only, and the founder's screenshot has Build It in it.
 const CTX = {
   beads: new Map(BEADS.map((b) => [b.id, { bead: b, projectId: "p1", rootPath: "/repo" }])),
   onViewOnBoard: () => true,
+  // The new destination. Supplied here for the same reason `onViewOnBoard` is: its PRESENCE is what
+  // switches the affordance on, so a harness that omitted it would photograph the feature turned
+  // off and look like a passing shot.
+  onViewInColumn: () => true,
 };
 
 const MESSAGES = [
@@ -84,6 +115,13 @@ const MESSAGES = [
   },
   {
     id: "m4",
+    kind: "sparkle",
+    text:
+      "And sparkle-ddd44 is an epic that is already building — so instead of Build It, its card " +
+      "offers Open, with the two places an epic can be opened.",
+  },
+  {
+    id: "m5",
     kind: "sparkle",
     text:
       "For contrast: sparkle-notreal is an id I made up and it must stay prose, and `sparkle-qogah` " +

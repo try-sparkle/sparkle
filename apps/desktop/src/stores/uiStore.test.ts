@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { STATUS_BANDS } from "../engine/buildSections";
 import { ZOOM_COLUMNS } from "../engine/columnZoom";
 import {
+  focusedBeadIdForSide,
   useUiStore,
   ZOOM_MIN,
   ZOOM_MAX,
@@ -940,5 +941,99 @@ describe("uiStore boardFilter — every field of BoardFilter reaches the store",
     const before = useUiStore.getState().boardFilterBySide.right;
     useUiStore.getState().setBoardFilter("right", { ...before });
     expect(useUiStore.getState().boardFilterBySide.right).toBe(before);
+  });
+});
+
+// ── EPIC FOCUS: TWO WRITERS, TWO DIFFERENT PROMISES ─────────────────────────────────────────────
+//
+// `setEpicFocus` TOGGLES and `openEpicFocus` does not, and that is the entire reason the second one
+// exists. The epics-column ROW is its own off-switch, so re-clicking it must clear; a link labelled
+// **Open** in the concierge must be IDEMPOTENT, because a reader pressing it twice is asking to see
+// the epic, never to un-see it.
+//
+// These rows are the executable statement of that difference. Nothing in the rendered UI
+// distinguishes the two setters — both leave a focused epic on the first press — so a caller wired
+// to the wrong one is invisible until someone clicks twice.
+describe("uiStore epic focus — toggle vs idempotent open", () => {
+  beforeEach(() => {
+    useUiStore.setState({
+      epicFocusBySide: { left: null, right: null },
+      beadFocusBySide: { left: null, right: null },
+    });
+  });
+
+  it("setEpicFocus focuses the epic", () => {
+    useUiStore.getState().setEpicFocus("right", "ep-1");
+    expect(useUiStore.getState().epicFocusBySide.right).toBe("ep-1");
+  });
+
+  // THE TOGGLE, asserted so that removing it is a failure — the epics column depends on it, and a
+  // careless "make both setters idempotent" would break the column's only clear gesture.
+  it("setEpicFocus CLEARS when handed the epic it already holds", () => {
+    useUiStore.getState().setEpicFocus("right", "ep-1");
+    useUiStore.getState().setEpicFocus("right", "ep-1");
+    expect(useUiStore.getState().epicFocusBySide.right).toBeNull();
+  });
+
+  it("openEpicFocus focuses the epic", () => {
+    useUiStore.getState().openEpicFocus("right", "ep-1");
+    expect(useUiStore.getState().epicFocusBySide.right).toBe("ep-1");
+  });
+
+  // ══ THE ROW THIS WHOLE BLOCK EXISTS FOR ══════════════════════════════════════════════════════
+  // Point `openEpicFocus` at `setEpicFocus` and only THIS assertion goes red.
+  it("openEpicFocus is IDEMPOTENT — a second press does not un-focus", () => {
+    useUiStore.getState().openEpicFocus("right", "ep-1");
+    useUiStore.getState().openEpicFocus("right", "ep-1");
+    expect(useUiStore.getState().epicFocusBySide.right).toBe("ep-1");
+  });
+
+  it("openEpicFocus moves the focus when handed a DIFFERENT epic", () => {
+    useUiStore.getState().openEpicFocus("right", "ep-1");
+    useUiStore.getState().openEpicFocus("right", "ep-2");
+    expect(useUiStore.getState().epicFocusBySide.right).toBe("ep-2");
+  });
+
+  // ══ RULE 3 — AND THE REASON THIS IS NOT COSMETIC ═════════════════════════════════════════════
+  // `beadFocusBySide` is the NARROWER rung and WINS while it holds (`focusedBeadIdForSide` is
+  // `child ?? epic`). An "Open this epic" that wrote only the epic key would be SWALLOWED whole
+  // whenever a child task happened to be selected — the column would keep showing that task's
+  // agents, under a different epic. Asserted on the EFFECTIVE focus, not just on the raw key, so
+  // the row fails for the reason that actually matters to the reader.
+  it("openEpicFocus clears a stale CHILD selection, so the epic it opens is what narrows", () => {
+    useUiStore.getState().openEpicFocus("right", "ep-1");
+    useUiStore.getState().setBeadFocus("right", "ep-1.a");
+    expect(focusedBeadIdForSide(useUiStore.getState(), "right")).toBe("ep-1.a");
+    useUiStore.getState().openEpicFocus("right", "ep-2");
+    expect(useUiStore.getState().beadFocusBySide.right).toBeNull();
+    expect(focusedBeadIdForSide(useUiStore.getState(), "right")).toBe("ep-2");
+  });
+
+  // THE CASE THE NO-OP GUARD MOST NEEDS TO GET RIGHT: re-opening the epic that is ALREADY focused
+  // while a child is selected. Guarding on the epic key alone returns early here and the stale
+  // child survives — which is the one press a reader makes to get back to the whole epic.
+  it("openEpicFocus on the ALREADY-focused epic still drops a stale child", () => {
+    useUiStore.getState().openEpicFocus("right", "ep-1");
+    useUiStore.getState().setBeadFocus("right", "ep-1.a");
+    useUiStore.getState().openEpicFocus("right", "ep-1");
+    expect(useUiStore.getState().beadFocusBySide.right).toBeNull();
+    expect(focusedBeadIdForSide(useUiStore.getState(), "right")).toBe("ep-1");
+  });
+
+  // PER SIDE, like every other selection in this store: opening an epic on one side must never
+  // narrow the build column the reader is not looking at.
+  it("openEpicFocus leaves the other side alone", () => {
+    useUiStore.getState().openEpicFocus("right", "ep-1");
+    expect(useUiStore.getState().epicFocusBySide.left).toBeNull();
+  });
+
+  // IDENTITY-STABLE ON A NO-OP. Re-opening the epic already focused must not hand consumers a new
+  // record — `agentIdsInEpic` memos in AgentSidebar and Workspace key on it, and a fresh object
+  // re-runs a whole-backlog narrowing for a click that changed nothing.
+  it("openEpicFocus returns the SAME record when nothing changed", () => {
+    useUiStore.getState().openEpicFocus("right", "ep-1");
+    const before = useUiStore.getState().epicFocusBySide;
+    useUiStore.getState().openEpicFocus("right", "ep-1");
+    expect(useUiStore.getState().epicFocusBySide).toBe(before);
   });
 });

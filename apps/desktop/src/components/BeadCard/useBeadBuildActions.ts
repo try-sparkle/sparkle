@@ -94,6 +94,22 @@ export interface BeadBuildActions {
    * the bead's status and not the board column it happens to be drawn in.
    */
   buildIt: (() => Promise<void>) | null;
+  /**
+   * IS THIS BEAD AN EPIC — the same answer `buildIt` already branches on, published rather than
+   * re-derived by each caller.
+   *
+   * IT EXISTS TO KEEP EPIC MEMBERSHIP AT ONE DEFINITION. `scripts/lib/epic-membership-guard.sh`
+   * fails CI on a second definition of "what is an epic" outside the resolver, and a caller that
+   * needs the answer for PRESENTATION rather than for building (the concierge card's "Open in
+   * column" link, which only an epic can offer) would otherwise either re-run `epicIndexOf` over
+   * the whole backlog for a second index, or reach for the bead's raw `type` field — which is
+   * `isTypedEpic`, a DIFFERENT question that misses every structural epic that was never declared
+   * one.
+   *
+   * This hook already holds the index and already memoizes this exact call, so publishing it is
+   * free and is strictly cheaper than any correct alternative at the call site.
+   */
+  isEpic: boolean;
 }
 
 /**
@@ -490,5 +506,9 @@ export function useBeadBuildActions({
     // `startable` replaces it and asks a DIFFERENT question — not "is this the kind of thing an
     // agent can build" but "has anyone started it yet".
     buildIt: startable ? (epic ? buildEpic : buildTask) : null,
+    // Published for presentation, not for building — see the interface note. Deliberately NOT
+    // gated on `startable`: an epic that is already running is still an epic, and the card's
+    // navigation links are exactly what should remain when Build It has gone away.
+    isEpic: epic,
   };
 }
