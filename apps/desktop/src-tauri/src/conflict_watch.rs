@@ -392,11 +392,32 @@ pub struct PrFacts {
 #[derive(Debug, Clone, PartialEq)]
 struct Probed {
     prs: Vec<PrFacts>,
-    /// The list came back at least [`PROBE_LIMIT`] rows long, so a PR past the cap is ABSENT from
-    /// `prs` and we cannot know whether it exists. Never read as "those PRs are gone": see
-    /// [`prune_tracked`], where reading it that way deleted state and swept raised flags.
+    /// The read did not cover every open PR, so a PR it omitted is ABSENT from `prs` and we cannot
+    /// know whether it exists. Never read as "those PRs are gone": see [`prune_tracked`], where
+    /// reading it that way deleted state and swept raised flags.
     saturated: bool,
+    /// WHICH bound truncated the read — the two probes hit DIFFERENT ones, and the diagnostic has
+    /// to name the one that actually fired.
+    ///
+    /// `saturated` alone is one bit for two causes, and the sweep's warning assumed the GraphQL
+    /// one unconditionally: it reported "the open-PR list FILLED its window" with `limit` =
+    /// [`PROBE_LIMIT`] (300) for a REST fallback that had merely run past
+    /// [`REST_CHECK_BUDGET`] (20). Measured on a repo with 23 open PRs, where GraphQL was failing
+    /// over to REST all day — so the line claimed a 300-PR backlog that did not exist and buried
+    /// the real cause, which was the GraphQL probe being down. A reader chasing that number looks
+    /// for the wrong thing entirely.
+    ///
+    /// Always set, on saturated and unsaturated reads alike: it names the bound this read was
+    /// judged against, which is a property of the probe, not of whether the bound was reached.
+    saturated_by: &'static str,
 }
+
+/// `gh pr list --limit N` came back with its window full — a PR past [`PROBE_LIMIT`] is missing.
+const SATURATED_BY_LIST_WINDOW: &str = "list-window";
+
+/// The REST fallback enriched only the first [`REST_CHECK_BUDGET`] open PRs. Nothing to do with
+/// [`PROBE_LIMIT`]: the LIST was complete, the per-PR check enrichment was not.
+const SATURATED_BY_CHECK_BUDGET: &str = "rest-check-budget";
 
 /// Did the read come back with its window FULL?
 ///
@@ -480,6 +501,7 @@ fn probe_from_stdout(stdout: &str, limit: u32) -> Option<Probed> {
     let rows = serde_json::from_str::<Vec<Value>>(stdout).ok()?;
     Some(Probed {
         saturated: read_is_saturated(rows.len(), limit),
+        saturated_by: SATURATED_BY_LIST_WINDOW,
         prs: rows.iter().filter_map(decode_pr_facts).collect(),
     })
 }
@@ -1322,6 +1344,9 @@ fn gh_api(dir: &Path, path: &str) -> Result<String, &'static str> {
 ///    than you can see, do not treat this list as complete" and every caller already refuses to
 ///    prune on it. Reusing it is what stops a bounded fallback from presenting as a full census —
 ///    the failure mode that would let a PR we never reached read as one that no longer exists.
+///    It is tagged [`SATURATED_BY_CHECK_BUDGET`] rather than left to be assumed: the consequence
+///    is shared with the GraphQL path's full window, but the BOUND is a different number and the
+///    remedy is a different investigation.
 fn rest_probe_from_parts<F>(pulls_body: &str, budget: usize, mut fetch_checks: F) -> Option<Probed>
 where
     F: FnMut(&str) -> Option<Vec<Value>>,
@@ -1353,12 +1378,32 @@ where
             }
         })
         .collect();
-    Some(Probed { prs, saturated: covered < pulls.len() })
+    Some(Probed {
+        prs,
+        saturated: covered < pulls.len(),
+        saturated_by: SATURATED_BY_CHECK_BUDGET,
+    })
 }
+
+/// The REST list query, held as a constant so the ORDER it asks for is testable.
+///
+/// `sort=created&direction=asc` is load-bearing, not tidying. REST's default is `created` DESC, so
+/// the [`REST_CHECK_BUDGET`] prefix covered the NEWEST open PRs — precisely the population least
+/// likely to have gone stale or conflicting, which is the only thing this module escalates. A PR
+/// old enough to have fallen behind `main` sorts last under the default and so was the first thing
+/// the budget dropped: the fallback spent its whole budget on the PRs with the least to report and
+/// never reached the ones it exists to find. Measured on a degraded sweep reading 20 of 23 open
+/// PRs, the three it could not reach were the three oldest.
+///
+/// Ascending `created` is also STABLE, which `updated` would not be: `updated_at` moves on every
+/// comment and push, so an `updated`-ordered prefix would re-shuffle between sweeps and carry a
+/// different subset of PRs forward each time.
+const REST_PULLS_QUERY: &str =
+    "repos/{owner}/{repo}/pulls?state=open&per_page=100&sort=created&direction=asc";
 
 /// The real REST fallback: one list call, then two calls per covered PR.
 fn rest_probe_open_prs(dir: &Path) -> Result<Probed, &'static str> {
-    let pulls = gh_api(dir, "repos/{owner}/{repo}/pulls?state=open&per_page=100")?;
+    let pulls = gh_api(dir, REST_PULLS_QUERY)?;
     rest_probe_from_parts(&pulls, REST_CHECK_BUDGET, |sha| {
         let runs = gh_api(dir, &format!("repos/{{owner}}/{{repo}}/commits/{sha}/check-runs?per_page=100")).ok()?;
         let statuses = gh_api(dir, &format!("repos/{{owner}}/{{repo}}/commits/{sha}/status")).ok()?;
@@ -1434,6 +1479,7 @@ mod rest_fallback_tests {
         Probed {
             prs: vec![PrFacts { number: 7, has_ci: true, ..PrFacts::default() }],
             saturated: false,
+            saturated_by: SATURATED_BY_LIST_WINDOW,
         }
     }
 
@@ -1443,6 +1489,53 @@ mod rest_fallback_tests {
         {"number":2028,"title":"u","draft":false,"html_url":"https://gh/2028",
          "head":{"ref":"c","sha":"cccc3333"},"base":{"sha":"bbbb2222"}}
     ]"#;
+
+    /// THE BUDGET MUST SPEND ITSELF ON THE OLDEST PRs, NOT THE NEWEST.
+    ///
+    /// `rest_probe_from_parts` covers a PREFIX of whatever order the list arrives in, so the sort
+    /// the query asks for decides which PRs the fallback can see at all. REST defaults to `created`
+    /// DESC; leaving that default covers the newest PRs, and a PR is escalated here for being STALE
+    /// or CONFLICTING — both of which correlate with age. So the default spends the entire budget
+    /// on the rows with the least to report.
+    ///
+    /// This asserts the query OVERRIDES the default rather than merely mentioning a sort: drop
+    /// either parameter, or flip the direction back to `desc`, and it goes red.
+    #[test]
+    fn the_rest_list_asks_for_oldest_first_so_the_budget_reaches_stale_prs() {
+        assert!(
+            REST_PULLS_QUERY.contains("sort=created"),
+            "the ordering must be pinned explicitly, not inherited from REST's default"
+        );
+        assert!(
+            REST_PULLS_QUERY.contains("direction=asc"),
+            "oldest-first is the point: {REST_PULLS_QUERY}"
+        );
+        assert!(
+            !REST_PULLS_QUERY.contains("direction=desc"),
+            "newest-first covers the PRs least likely to be stale or conflicting"
+        );
+        assert!(
+            REST_PULLS_QUERY.contains("state=open"),
+            "and it is still the OPEN-PR list the sweep is built on"
+        );
+    }
+
+    /// THE PREFIX IS A PREFIX — the half of the above that makes the ordering matter.
+    ///
+    /// If the budget sampled the list some other way, the sort would be decoration. Cover one of
+    /// two rows and it must be the FIRST row that survives, with the read marked saturated so no
+    /// caller reads the dropped row as a PR that no longer exists.
+    #[test]
+    fn the_budget_covers_the_front_of_the_list_and_admits_what_it_dropped() {
+        let read = rest_probe_from_parts(PULLS, 1, |_| Some(vec![]))
+            .expect("two decodable rows must produce a read");
+        assert_eq!(read.prs.len(), 1, "the budget of 1 must cover exactly one PR");
+        assert_eq!(
+            read.prs[0].number, 2027,
+            "and it must be the FIRST row, or the query's sort order buys nothing"
+        );
+        assert!(read.saturated, "the row it could not reach must be admitted, never silently lost");
+    }
 
     /// THE HEADLINE REGRESSION TEST. A failed GraphQL probe — the shape a GitHub GraphQL 503
     /// produces, measured 4-of-6 on 2026-08-17 — must still yield a READ, not a refusal. Delete
@@ -1586,6 +1679,36 @@ mod rest_fallback_tests {
         let cut = rest_probe_from_parts(PULLS, 1, |_| Some(vec![])).unwrap();
         assert_eq!(cut.prs.len(), 1);
         assert!(cut.saturated, "a read that ran out of budget is NOT a complete census");
+    }
+
+    /// …and it must announce WHICH bound it is, because the sweep's warning names one.
+    ///
+    /// THE DEFECT: `saturated` is one bit carrying two causes, and the sweep assumed the GraphQL
+    /// one, reporting "the open-PR list FILLED its window, limit=300" for a REST read that had
+    /// merely passed a budget of 20. Measured against a repo with 23 open PRs whose GraphQL probe
+    /// was failing over all day: the line asserted a 300-PR backlog that did not exist, and said
+    /// nothing about the GraphQL failure that was the real fault.
+    ///
+    /// Asserting the two probes disagree is the point — a single-probe assertion passes for a
+    /// constant, which is exactly the field the sweep used to have.
+    #[test]
+    fn the_two_probes_report_different_saturation_bounds() {
+        let cut = rest_probe_from_parts(PULLS, 1, |_| Some(vec![])).unwrap();
+        assert_eq!(
+            cut.saturated_by, SATURATED_BY_CHECK_BUDGET,
+            "a REST read is bounded by its per-PR check budget, never by the list cap"
+        );
+
+        // Same field on the GraphQL path, and it must NOT be the same value: an unsaturated read
+        // still names the bound it was judged against.
+        let listed = probe_from_stdout(r#"[{"number":1}]"#, 4).expect("decodes");
+        assert!(!listed.saturated);
+        assert_eq!(listed.saturated_by, SATURATED_BY_LIST_WINDOW);
+        assert_ne!(
+            cut.saturated_by, listed.saturated_by,
+            "one value for both bounds is the bug this field exists to remove — the sweep \
+             cannot name the bound that fired if the two probes report the same one"
+        );
     }
 
     /// Check presence comes from a rollup we actually read. A real empty rollup means "nothing has
@@ -1967,6 +2090,10 @@ fn tick<R: Runtime>(app: &AppHandle<R>, watch: &mut Watch, now: u64) {
             Ok((dir, probed)) => {
                 probed_ok.insert(repo.project_id.clone());
                 let was_saturated = probed.saturated;
+                // Captured with it, because both are read AFTER `probed.prs` is moved below and
+                // the warning is useless without them: which bound fired, and how far the read got.
+                let saturated_by = probed.saturated_by;
+                let rows_read = probed.prs.len();
                 // Attribute the whole read to this repo BEFORE anything downstream copies it, so
                 // the identity rides along on every path a row can take from here.
                 for f in stamp_project(probed.prs, &repo.project_id) {
@@ -1987,14 +2114,32 @@ fn tick<R: Runtime>(app: &AppHandle<R>, watch: &mut Watch, now: u64) {
                 }
                 if was_saturated {
                     saturated.insert(repo.project_id.clone());
-                    tracing::warn!(
-                        target: "conflict_watch",
-                        project = %repo.project_id,
-                        limit = PROBE_LIMIT,
-                        "this repo's open-PR list FILLED its window, so a PR past the cap is \
-                         missing from this sweep entirely; nothing is pruned and every tracked PR \
-                         the list omitted keeps climbing blind"
-                    );
+                    // NAME THE BOUND THAT ACTUALLY FIRED. Both arms describe the same consequence
+                    // — a PR this sweep never reached — but they send a reader to opposite places,
+                    // and the second arm used to render as the first with a `limit` of 300 it had
+                    // never been measured against. See `Probed::saturated_by`.
+                    match saturated_by {
+                        SATURATED_BY_CHECK_BUDGET => tracing::warn!(
+                            target: "conflict_watch",
+                            project = %repo.project_id,
+                            budget = REST_CHECK_BUDGET,
+                            covered = rows_read,
+                            "this repo fell back to the REST PR probe, which enriches only the \
+                             first `budget` open PRs, and it ran past that budget; the open PRs \
+                             beyond it are missing from this sweep entirely. Nothing is pruned and \
+                             every tracked PR the read omitted keeps climbing blind. The bound here \
+                             is the REST budget, NOT the list cap — the underlying fault is \
+                             whatever made the GraphQL probe fail over"
+                        ),
+                        _ => tracing::warn!(
+                            target: "conflict_watch",
+                            project = %repo.project_id,
+                            limit = PROBE_LIMIT,
+                            "this repo's open-PR list FILLED its window, so a PR past the cap is \
+                             missing from this sweep entirely; nothing is pruned and every tracked \
+                             PR the list omitted keeps climbing blind"
+                        ),
+                    }
                     // FAIL CLOSED, exactly as the unreadable arm does: a tracked PR the truncated
                     // page left out is not a merged PR. Without this it would simply stop being
                     // looked at — retained by `prune_tracked` but never escalated again, which for
@@ -3115,7 +3260,11 @@ mod tests {
             if dir.ends_with("broken") {
                 Err("gh-failed")
             } else {
-                Ok(Probed { prs: vec![conflicting_facts()], saturated: false })
+                Ok(Probed {
+                    prs: vec![conflicting_facts()],
+                    saturated: false,
+                    saturated_by: SATURATED_BY_LIST_WINDOW,
+                })
             }
         });
         let (dir, probed) = got.expect("the second worktree answered");
@@ -3456,7 +3605,11 @@ mod tests {
                     if fail {
                         Err("gh-failed")
                     } else {
-                        Ok(Probed { prs: vec![], saturated: false })
+                        Ok(Probed {
+                            prs: vec![],
+                            saturated: false,
+                            saturated_by: SATURATED_BY_LIST_WINDOW,
+                        })
                     }
                 },
                 || clock.get(),
@@ -3551,7 +3704,11 @@ mod tests {
                     if dir.starts_with("/wt/broken") {
                         Err("gh-failed")
                     } else {
-                        Ok(Probed { prs: vec![], saturated: false })
+                        Ok(Probed {
+                            prs: vec![],
+                            saturated: false,
+                            saturated_by: SATURATED_BY_LIST_WINDOW,
+                        })
                     }
                 },
                 || now,
