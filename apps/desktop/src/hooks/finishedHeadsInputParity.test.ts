@@ -34,49 +34,85 @@
 // If `useFinishedHeads` ever takes its map from a hook rather than a parameter, DELETE THIS FILE: a
 // structural guarantee needs no guard.
 //
-// ══ WHAT THIS GRIPS — AND WHY IT IS NO LONGER A LIST OF SYNTAXES ══════════════════════════════
-// Three consecutive review rounds each found a declaration shape this file's enumeration had
-// missed, and each round the fix was to add one more regex. The last miss was the one that proved
-// the approach wrong: a destructure whose right-hand side is NOT a call, in a SECOND SCOPE in the
-// same file — which every shape-regex missed, which the old destructure counter did not count
-// (it required `= ident(`), and whose argument spelling was correct. Three rounds where the
-// STATED REACH was itself the defect is an argument for changing the method, not extending it.
+// ══ IT WALKS THE AST, BECAUSE FOUR ROUNDS OF PATTERNS DID NOT CONVERGE ════════════════════════
+// This check has been rewritten four times and each version missed a binding form the previous
+// author had not thought of — the last one a destructured parameter of a NON-arrow function,
+// `function EpicRowFooter({ calmStatus }: FooterProps)`, which is the dominant React component
+// signature in this repo (185 `.tsx` files use it, `AgentSidebar.tsx` among them). Every round the
+// fix was another pattern, and every round the stated reach was the next round's finding.
 //
-// So the question is no longer "which syntax is this". It is: HOW MANY TIMES is this name BOUND in
-// this file? The answer must be one, and that one must come from `useOverlaidStatus`. A shape
-// nobody enumerated still counts as a binding, which is the property the enumeration never had.
+// The lesson is not "write a better regex". A regex family enumerates SYNTAX, and the set of ways
+// JavaScript can bind a name is not a set this file gets to close. So it parses instead: one
+// TypeScript AST walk, counting identifiers named `calmStatus` that sit in a BINDING position —
+// a variable declaration, a binding element (shorthand or renamed, nested to any depth), or a
+// parameter. The AST knows every form, including ones nobody here has thought of, which is what
+// makes "a shape nobody enumerated still counts" TRUE rather than aspirational.
 //
-// Mutation-verified to RED: a second call with the wrong argument; `let`/`var`; a rename INTO the
-// name; a destructure from the wrong producer; a type-annotated parameter; a contextually-typed
-// arrow parameter; an ARRAY destructure; a `for…of` destructure; and the second-scope non-call
-// destructure above. Verified NOT to red: a doc comment naming the identifier — comments are
-// stripped before scanning, because both caller files genuinely comment on this very name.
+// The contract, in two assertions: `calmStatus` is bound EXACTLY ONCE in each caller, and that one
+// binding is destructured from `useOverlaidStatus(...)`. Everything else is a use.
 //
-// WHAT IT STILL CANNOT SEE: an indirection through an object at the CALL (`useFinishedHeads(a,
-// deps.calmStatus, n)` — though that reds on the argument check, as a false alarm), a spread call
-// (`useFinishedHeads(...args)`), and a caller outside `apps/desktop/src`.
-//
-// ⚠️ HOW TO READ A FAILURE. The argument check is an exact string comparison, so renaming
-// `agentsById` or `nudgeFlags`, or adding a trailing comma to a wrapped call, will red this file.
-// That is "reformat, or update the guard" — NOT a regression. A real regression looks like the name
-// being BOUND a second time, or an argument that is a different MAP.
+// ⚠️ HOW TO READ A FAILURE. "bound more than once" means someone introduced a second
+// `calmStatus` — the regression this file exists to catch. The argument check beside it is an exact
+// string comparison, so renaming `agentsById` or `nudgeFlags` reds it too; that one is "update the
+// guard", not a regression.
 import { describe, expect, it } from "vitest";
 import { readdirSync, readFileSync } from "node:fs";
+import ts from "typescript";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const read = (rel: string) => readFileSync(resolve(here, rel), "utf8");
 
-/** Source with comments removed.
+/** Every identifier named `calmStatus` that is BEING BOUND — not used — in this source.
  *
- *  NOT cosmetic: every pattern below scans raw text, and both caller files comment ON this very
- *  identifier. A doc line reading `calmStatus: the pre-escalation map` is a perfectly natural thing
- *  to write and would have matched the annotated-parameter pattern, reddening this guard with the
- *  message "calmStatus is type-annotated (a parameter)" — a false alarm on a comment. Stripping
- *  first means the guard reads CODE, which is what it claims to do. */
-const strip = (src: string) =>
-  src.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:])\/\/[^\n]*/g, "$1");
+ *  Three node kinds cover every form the language has, which is the entire reason this is an AST
+ *  walk and not a pattern list:
+ *
+ *    VariableDeclaration  `const calmStatus = …`, any keyword
+ *    BindingElement       `{ calmStatus }`, `{ status: calmStatus }`, `[calmStatus]`, nested to any
+ *                         depth, and — the form four rounds of regexes missed — the same patterns
+ *                         used as a FUNCTION PARAMETER, `function F({ calmStatus }: Props)`
+ *    Parameter            `(calmStatus: T) => …`, arrow or not, annotated or contextually typed
+ *
+ *  Comments and type positions are not nodes of these kinds, so a doc line reading
+ *  `calmStatus: the pre-escalation map` — which both caller files genuinely contain — cannot be
+ *  mistaken for a binding. That was a real false alarm under the regex version. */
+function bindingsOf(src: string): ts.Identifier[] {
+  const sf = ts.createSourceFile("caller.tsx", src, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+  const out: ts.Identifier[] = [];
+  const visit = (n: ts.Node): void => {
+    if (ts.isIdentifier(n) && n.text === "calmStatus") {
+      const p = n.parent as ts.Node | undefined;
+      if (
+        p !== undefined &&
+        (ts.isVariableDeclaration(p) || ts.isBindingElement(p) || ts.isParameter(p)) &&
+        p.name === n
+      ) {
+        out.push(n);
+      }
+    }
+    ts.forEachChild(n, visit);
+  };
+  visit(sf);
+  return out;
+}
+
+/** The function a binding was destructured from, or null when it did not come from a call.
+ *
+ *  Walks OUT to the enclosing variable declaration, so it answers the same for `const { calmStatus }
+ *  = f()` and for a nested `const { a: { calmStatus } } = f()`. A parameter has no declaration to
+ *  walk out to and answers null, which is what makes a parameter shadow fail this. */
+function producerOf(binding: ts.Identifier): string | null {
+  let n: ts.Node | undefined = binding.parent;
+  while (n !== undefined && !ts.isVariableDeclaration(n)) {
+    if (ts.isParameter(n) || ts.isSourceFile(n)) return null;
+    n = n.parent;
+  }
+  const init = n !== undefined && ts.isVariableDeclaration(n) ? n.initializer : undefined;
+  if (init === undefined || !ts.isCallExpression(init)) return null;
+  return ts.isIdentifier(init.expression) ? init.expression.text : null;
+}
 
 /** Every production caller. A new one added without a line here is the case this cannot see, so the
  *  list is asserted to be complete against a repo-wide grep below. */
@@ -107,48 +143,14 @@ describe("every caller feeds useFinishedHeads the overlaid map", () => {
     });
 
     it(`${label} binds calmStatus exactly once, from useOverlaidStatus`, () => {
-      // ══ COUNT BINDINGS, DO NOT ENUMERATE SYNTAXES ══════════════════════════════════════════
-      // This assertion was a list of five regexes, one per declaration shape, and three consecutive
-      // review rounds each found a shape the list had missed — the last being a destructure whose
-      // right-hand side is NOT a call, in a SECOND SCOPE in the same file:
-      //
-      //   function EpicRowFooter(props: FooterProps) {
-      //     const { agentsById, nudgeFlags } = props;
-      //     const { calmStatus } = props.maps;                 // ← the shadow, no call on the RHS
-      //     const isFinishedOf = useFinishedHeads(agentsById, calmStatus, nudgeFlags);
-      //
-      // Every shape-regex missed it, the old destructure counter did not count it (it required
-      // `= ident(`), and the argument check passed because the SPELLING was right. That case is
-      // also the only viable one left: a second binding INSIDE one component is a TypeScript
-      // redeclaration error, and a parameter shadow puts the hook call in a non-hook callback,
-      // which `react-hooks/rules-of-hooks` rejects. A second component in one file has neither
-      // problem — and `AgentSidebar.tsx` is 4,000+ lines.
-      //
-      // So the enumeration is abandoned. The question is not "which syntax is this" but "HOW MANY
-      // TIMES is this name bound", and the answer must be one. Adding a sixth regex would have been
-      // the fourth round of the same mistake.
-      const src = strip(read(rel));
-      const bindings = [
-        // A destructure in ANY binding position — `=`, `of`, `in` — whatever is on the right.
-        ...src.matchAll(/\{[^{}]*\bcalmStatus\b[^{}]*\}\s*(?:=[^=>]|\bof\b|\bin\b)/g),
-        // A plain declaration, any keyword.
-        ...src.matchAll(/(?:const|let|var)\s+calmStatus\b/g),
-        // An array destructure.
-        ...src.matchAll(/\[[^\]]*\bcalmStatus\b[^\]]*\]\s*=[^=>]/g),
-        // A rename INTO the name, and a type-annotated parameter. Both are bindings; neither is a
-        // use. (Comments are stripped above, so a doc line reading `calmStatus: the pre-escalation
-        // map` — which these files genuinely contain — cannot be mistaken for one.)
-        ...src.matchAll(/:\s*calmStatus\b/g),
-        ...src.matchAll(/\bcalmStatus\s*:/g),
-        // A contextually-typed arrow parameter, which carries no annotation at all.
-        ...src.matchAll(/\(\s*[^()]*\bcalmStatus\b[^()]*\)\s*=>/g),
-      ];
+      const bound = bindingsOf(read(rel));
       expect(
-        bindings.map((m) => m[0]),
+        bound.map((n) => n.getText().slice(0, 60)),
         `${label} should bind calmStatus EXACTLY ONCE`,
       ).toHaveLength(1);
-      // …and that one binding must take it from the shared hook.
-      expect(src).toMatch(/\{[^{}]*\bcalmStatus\b[^{}]*\}\s*=\s*useOverlaidStatus\(/);
+      expect(producerOf(bound[0]!), `${label}'s calmStatus must come from useOverlaidStatus`).toBe(
+        "useOverlaidStatus",
+      );
     });
   }
 
