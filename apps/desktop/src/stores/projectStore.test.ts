@@ -687,3 +687,82 @@ describe("setProjectRepoKey", () => {
     expect(useProjectStore.getState().projects).toBe(before);
   });
 });
+
+// ── The cross-repo assignment LATCH, driven through the real `appendPrompt` (bead `sparkle-pgh1ue`)
+//
+// The guard is the substance of this feature's (b) half and, until this block, was covered by
+// nothing: `crossRepo.test.ts` tests the pure `assignmentRepos` function and `sidebarView.test.ts`
+// hand-writes the field into fixtures, so every clause of the condition could be deleted with a green
+// suite (roborev 67730) — including the two added specifically to close migration hazards. These
+// drive the production action so each clause is load-bearing.
+describe("projectStore — the cross-repo assignment latch", () => {
+  beforeEach(() => useProjectStore.setState({ projects: [], selectedProjectId: null }));
+
+  const agent = (pid: string, aid: string) =>
+    useProjectStore.getState().projects.find((p) => p.id === pid)!.agents.find((a) => a.id === aid)!;
+
+  const seed = () => {
+    const pid = useProjectStore.getState().addProject("Demo", "/tmp/demo");
+    const aid = useProjectStore.getState().addAgent(pid)!;
+    return { pid, aid };
+  };
+
+  it("latches the repos the OPENING composer prompt names", () => {
+    const { pid, aid } = seed();
+    useProjectStore.getState().appendPrompt(pid, aid, "ship it in https://github.com/owner/other");
+    expect(agent(pid, aid).assignmentRepos).toEqual(["owner/other"]);
+  });
+
+  it("latches an EMPTY list when the opening prompt names no repo — and that still counts as latched", () => {
+    // The empty array is the "we looked and there was nothing" record. It must be distinguishable
+    // from `undefined` ("never latched"), or the next prompt re-opens the latch.
+    const { pid, aid } = seed();
+    useProjectStore.getState().appendPrompt(pid, aid, "fix the flaky test");
+    expect(agent(pid, aid).assignmentRepos).toEqual([]);
+  });
+
+  it("a SECOND composer prompt does not re-latch — this is the oscillation guard", () => {
+    const { pid, aid } = seed();
+    useProjectStore.getState().appendPrompt(pid, aid, "fix the flaky test");
+    useProjectStore.getState().appendPrompt(pid, aid, "port the fix from owner/other#253");
+    // Without the `assignmentRepos !== undefined` clause this would become ["owner/other"] and the
+    // row's ladder rung would move because of something the human typed mid-conversation.
+    expect(agent(pid, aid).assignmentRepos).toEqual([]);
+  });
+
+  it("an agent that ALREADY has composer history never latches — the migration guard", () => {
+    // Every row persisted before this feature reads `assignmentRepos === undefined`, so the
+    // undefined check alone would latch a mid-conversation prompt as an "opening assignment",
+    // permanently. Simulated here by giving the agent prior composer history and then clearing the
+    // field the way a pre-feature persisted record would have it.
+    const { pid, aid } = seed();
+    useProjectStore.getState().appendPrompt(pid, aid, "some earlier instruction");
+    useProjectStore.setState((st) => ({
+      projects: st.projects.map((p) => ({
+        ...p,
+        agents: p.agents.map((a) =>
+          a.id === aid ? { ...a, assignmentRepos: undefined } : a,
+        ),
+      })),
+    }));
+    useProjectStore.getState().appendPrompt(pid, aid, "port the fix from owner/other#253");
+    expect(agent(pid, aid).assignmentRepos).toBeUndefined();
+  });
+
+  it("a HAND-BRIEFED agent never latches either — promptHistory alone does not cover it", () => {
+    // An agent driven entirely through its terminal has EMPTY promptHistory (see
+    // `terminalBriefedAt` in types.ts), so the composer-history clause misses exactly that
+    // population and the first composer prompt it ever gets would latch arbitrarily deep into its
+    // life (roborev 67730).
+    const { pid, aid } = seed();
+    useProjectStore.getState().noteTerminalBrief(pid, aid);
+    useProjectStore.getState().appendPrompt(pid, aid, "port the fix from owner/other#253");
+    expect(agent(pid, aid).assignmentRepos).toBeUndefined();
+  });
+
+  it("a PICKER answer latches nothing — it answers the agent's question, not the human's", () => {
+    const { pid, aid } = seed();
+    useProjectStore.getState().appendPrompt(pid, aid, "use owner/other#253", "picker");
+    expect(agent(pid, aid).assignmentRepos).toBeUndefined();
+  });
+});

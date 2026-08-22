@@ -286,6 +286,7 @@ export const APP_TOOL_NAMES = [
   "append_communication_guideline",
   "set_agent_goal",
   "set_agent_goal_met",
+  "set_agent_landed",
   "set_agent_escalation",
   "claim_pr",
   "release_pr",
@@ -329,6 +330,12 @@ export const APP_TOOL_RISK: Record<AppToolName, ConciergeRiskClass> = {
   // repo — the claim only makes `merge_pr` pause and point at the claimant.
   set_agent_goal: "routine",
   set_agent_goal_met: "routine",
+  // ROUTINE, same class and same reasoning: one short field about who did what, written by the only
+  // party that can know it. Nothing is destructive and nothing reaches a repo — the stamp is a
+  // POINTER (`owner/repo#N`) whose whole value is that a human can check it in one click, and it is
+  // cleared by one more call. What it changes is where a row files on the ladder, which is a
+  // statement the app was previously making WRONGLY on its own (bead `sparkle-pgh1ue`).
+  set_agent_landed: "routine",
   // ROUTINE — reclassified from `irreversible` on 2026-08-13 by founder ruling, and the reasoning
   // is worth keeping because the original class was defensible and still lost.
   //
@@ -364,6 +371,7 @@ const APP_TOOL_SUMMARY: Record<AppToolName, string> = {
   get_config: "Read Sparkle's workflow and worker settings.",
   rename_agent: "Rename an agent.",
   set_agent_activity: "Update an agent's one-line activity caption.",
+  set_agent_landed: "Record which repository and pull request an agent's work landed in.",
   set_theme: "Switch the app between light and dark.",
   set_zoom: "Change the terminal text size.",
   navigate: "Move you to a view or open a specific agent.",

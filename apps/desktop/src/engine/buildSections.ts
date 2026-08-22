@@ -19,9 +19,11 @@ import {
   type WorkflowStageMeta,
 } from "./workflowStage";
 import type { BranchStatus } from "../services/branchStatus";
+import { isCrossRepo, type CrossRepoReading } from "./crossRepo";
 
 // ── The ladder ───────────────────────────────────────────────────────────────────────────────
 export type BuildSectionId =
+  | "tracked_elsewhere"
   | "local_none"
   | "local_uncommitted"
   | "local_committed"
@@ -62,6 +64,31 @@ export interface BuildSectionMeta {
 // an origin-scoped proof reads the full `merged`, and the only rows left here are ones whose proof
 // really was local. Bead `sparkle-e3lxt7`.
 export const BUILD_SECTIONS: readonly BuildSectionMeta[] = [
+  {
+    // THE ROW WE CANNOT MEASURE FROM HERE — bead `sparkle-pgh1ue`.
+    //
+    // Every other rung on this ladder is a claim about how far the work got, read out of the agent's
+    // BOUND-PROJECT worktree. For an agent whose task lands in a DIFFERENT repository that reading is
+    // a structural zero — no commits on its bound branch, no PR, nothing landed — and the row filed
+    // one rung down, under "Local: Nothing Yet", asserting that nothing had happened. The founder, on
+    // an agent whose work was merged and shipped in another repo: *"why the hell is it still in
+    // local? Nothing yet."*
+    //
+    // THIS RUNG MAKES NO PROGRESS CLAIM AT ALL, and that is the entire design. It says where the work
+    // is tracked and that Sparkle cannot see it from this project — which is TRUE, unlike both the
+    // alarming reading ("nothing here") and the optimistic one ("probably fine"). A row only leaves
+    // it by acquiring evidence: an agent that records where it landed (`set_agent_landed`) gets a
+    // real rung below, backed by an `owner/repo#N` a human can click.
+    //
+    // IT SITS AT SLOT 0 ON PURPOSE. The ladder is ordered by "how far toward safely on remote main",
+    // and this rung has no position on that scale — interleaving an unmeasurable row among rungs that
+    // do make progress claims would imply one. Above the whole ladder is the one place that implies
+    // nothing about it.
+    id: "tracked_elsewhere",
+    label: "Tracked Elsewhere",
+    detail:
+      "This agent's work lands in another repository, so Sparkle can't measure it from this project. Ask it to record where it landed.",
+  },
   {
     // THE ROW THAT HOLDS NOTHING — split out of `local_uncommitted` (sparkle-biezi).
     //
@@ -170,7 +197,21 @@ export function sectionMeta(id: BuildSectionId): BuildSectionMeta {
 export function sectionFromReadings(
   bs: BranchStatus | undefined,
   override: WorkflowStageId | undefined,
+  /** What this row knows about work living OUTSIDE the bound project — see {@link sectionOfRow}.
+   *
+   *  ⚠️ IT IS CONSULTED BEFORE THE `undefined` GUARD BELOW, and that ordering is the point. A
+   *  cross-repo row is precisely the row whose bound-project readings are absent or all-zero, so
+   *  requiring a reading first would make this parameter unreachable for its own motivating case.
+   *  "We never read its git state" and "its git state is not where the work is" are different facts,
+   *  and only the first is ignorance. */
+  crossRepo?: CrossRepoReading | null,
 ): BuildSectionId | undefined {
+  if (isCrossRepo(crossRepo ?? undefined)) {
+    // `undefined` for `holdsWork`, because this overload genuinely has no worktree reading to pass —
+    // NOT as a shortcut. `sectionOfRow` treats `undefined` as "not evidence of work at risk here",
+    // which is the honest reading of "we were not given one".
+    return sectionOfRow(resolveStage(bs, override), undefined, crossRepo);
+  }
   if (bs === undefined && override === undefined) return undefined;
   return sectionOfStage(resolveStage(bs, override));
 }
@@ -246,9 +287,35 @@ export function sectionOfStage(stage: WorkflowStageId): BuildSectionId {
 export function sectionOfRow(
   stage: WorkflowStageId,
   holdsWork: boolean | undefined,
+  /** What this row knows about work living OUTSIDE the bound project (`engine/crossRepo`).
+   *
+   *  THE SAME SHAPE OF FIX AS `holdsWork`, ONE LEVEL FURTHER OUT. `holdsWork` exists because a stage
+   *  cannot tell "I have unsaved edits" from "nothing has happened"; this exists because a stage
+   *  cannot tell "nothing has happened" from "it happened somewhere I cannot see". Both are facts a
+   *  stage is structurally unable to carry, and both were being asserted anyway.
+   *
+   *  IT ONLY EVER RE-ROUTES THE TWO BOTTOM RUNGS. A row that reached `local_committed` or beyond has
+   *  measurable work in the bound project — whatever else it also did elsewhere — and moving it up to
+   *  an unmeasurable rung would DISCARD a true reading in favour of "we cannot tell". The stamp is
+   *  what carries a cross-repo row past those rungs, through `deriveLiveStage`, and it arrives here
+   *  as an ordinary stage needing no special case. */
+  crossRepo?: CrossRepoReading | null,
 ): BuildSectionId {
   const section = sectionOfStage(stage);
   if (section !== "local_uncommitted") return section;
+  // ⚠️ `holdsWork === true` OUTRANKS THE CROSS-REPO ROUTE, and the order is the correctness.
+  //
+  // `true` means this row's bound worktree holds dirty, attributable, AT-RISK edits — the one
+  // reading whose heading warns that closing the agent loses them. A row can honestly be both: work
+  // landing in another repo AND unsaved edits sitting here. Routing that row to "Tracked Elsewhere"
+  // ("Sparkle can't measure it from this project") would be measurably false — we just measured it —
+  // and would drop the data-loss warning, which is the most consequential copy in the column.
+  //
+  // So the cross-repo rung only ever collects rows with NOTHING measurable here, which is exactly
+  // what its own detail sentence claims. `false` (positively empty) and `undefined` (never read, or
+  // a parked tree) both qualify: neither is evidence of work at risk in THIS repo, and for both the
+  // other repo is the more informative thing to say.
+  if (holdsWork !== true && isCrossRepo(crossRepo ?? undefined)) return "tracked_elsewhere";
   return holdsWork === false ? "local_none" : section;
 }
 
@@ -289,14 +356,43 @@ export function honestStageMeta(
   section?: BuildSectionId,
 ): WorkflowStageMeta {
   const meta = stageMeta(stage);
-  if (section !== "local_none" || stage !== "building_unsaved") return meta;
-  return {
-    ...meta,
+  if (stage !== "building_unsaved") return meta;
+  const override = EMPTY_STAGE_COPY[section as BuildSectionId];
+  return override ? { ...meta, ...override } : meta;
+}
+
+/**
+ * The `building_unsaved` copy each rung may honestly show — and the TWO ENTRIES SAY DIFFERENT THINGS
+ * ON PURPOSE, because the two rungs are reached under different evidence (roborev 67613).
+ *
+ * `local_none` requires `holdsWork === false`: a worktree we POSITIVELY READ and found empty. It has
+ * earned the right to say "nothing here is at risk".
+ *
+ * `tracked_elsewhere` is reached on `holdsWork !== true`, which also admits `undefined` — and
+ * `uncommittedWorkEvidence` returns `undefined` for a tree that is DIRTY BUT PARKED (the sparkle-rhgm
+ * attribution rule: a parked tree's dirt belongs to whatever branch was checked out into it). Giving
+ * that row `local_none`'s sentence would tell a user "no edits in the working tree — nothing here is
+ * at risk" about a tree that is, in fact, dirty. That is the same false-reassurance class this file's
+ * header spends three paragraphs on, only inverted — and it is exactly what reusing the copy did.
+ *
+ * So this rung's copy asserts NOTHING about the worktree. It repeats what the section itself claims —
+ * the work is tracked in another repository and cannot be measured from here — which is true whether
+ * the tree is empty, dirty, or unread.
+ */
+const EMPTY_STAGE_COPY: Partial<Record<BuildSectionId, Partial<WorkflowStageMeta>>> = {
+  local_none: {
     label: "Nothing Built Yet",
     short: "Empty",
     detail: "No commits and no edits in the working tree — nothing here is at risk.",
-  };
-}
+  },
+  tracked_elsewhere: {
+    label: "Tracked Elsewhere",
+    short: "Elsewhere",
+    // Deliberately silent about the worktree — see the doc comment above.
+    detail:
+      "This agent's work lands in another repository, so Sparkle can't measure its progress from this project.",
+  },
+};
 
 /**
  * Should the ROW's stage chip stay silent entirely? Bead sparkle-tyter.
@@ -317,8 +413,13 @@ export function honestStageMeta(
  * that had to apply it. A predicate beside the override it is derived from cannot drift from it.
  */
 export function stageChipIsSilent(stage: WorkflowStageId, section?: BuildSectionId): boolean {
-  return section === "local_none" && stage === "building_unsaved";
+  // Keyed on the SAME table `honestStageMeta` reads, so the two cannot drift apart — which is this
+  // file header's whole argument for why both live here rather than inside the components that apply
+  // them. A rung with an override has a heading that already carries the fact; the chip would spend a
+  // row slot restating it beside the agent's name.
+  return stage === "building_unsaved" && EMPTY_STAGE_COPY[section as BuildSectionId] !== undefined;
 }
+
 
 // ── Status bands (the filter) ────────────────────────────────────────────────────────────────
 // The four buckets the filter chips toggle. These are the color tiers in packages/ui/tokens.ts
@@ -489,11 +590,22 @@ export function groupAgentsByStage<T extends { id: string }>(
    *  three production callers (AgentSidebar, ladderSelection, conciergeTools/sidebarView) all derive
    *  it from `runtimeStore.branchStatus` through the same `uncommittedWorkEvidence`. */
   holdsWorkOf?: (id: string) => boolean | undefined,
+  /** Does this row's work live outside the bound project? See {@link sectionOfRow}.
+   *
+   *  ⚠️ SAME CONSISTENCY RULE AS `holdsWorkOf`, for the same reason: it changes which section a row
+   *  lands in and therefore the flattened row ORDER, so two callers that disagree hand selection to a
+   *  row the column is not rendering. Every production caller derives it from the same
+   *  `engine/crossRepo.crossRepoReading` over the same agent record. */
+  crossRepoOf?: (id: string) => CrossRepoReading | undefined,
 ): BuildSectionGroup<T>[] {
   const buckets = new Map<BuildSectionId, T[]>();
   for (const agent of agents) {
     if (!visibleBands[bandOf(agent.id)]) continue;
-    const section = sectionOfRow(stageOf(agent.id), holdsWorkOf?.(agent.id));
+    const section = sectionOfRow(
+      stageOf(agent.id),
+      holdsWorkOf?.(agent.id),
+      crossRepoOf?.(agent.id),
+    );
     const arr = buckets.get(section);
     if (arr) arr.push(agent);
     else buckets.set(section, [agent]);

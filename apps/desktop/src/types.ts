@@ -3,6 +3,7 @@
 // PTY handles) is NOT stored here — see stores/runtimeStore.ts.
 import type { AgentTabStatus } from "@sparkle/ui";
 import type { AgentGoal, GoalDebt } from "./engine/agentGoal";
+import type { LandedElsewhere } from "./engine/crossRepo";
 import type { EpicGoal } from "./engine/epicGoal";
 
 export type { AgentGoal, GoalDebt };
@@ -95,6 +96,33 @@ export interface AgentTab {
   // (undefined) whenever the line is cleared. Optional, so legacy/restored records read as "unknown
   // age", which callers must treat as stale — never as fresh (see engine/activityFreshness).
   activityAt?: number;
+  // WHERE THIS AGENT'S WORK ACTUALLY LANDED, when that is not the repository this project is bound
+  // to (engine/crossRepo.LandedElsewhere). Written by the agent itself via the sparkle-control
+  // `set_agent_landed` op; read by `deriveLiveStage`, which PREFERS it over the bound-project probe.
+  //
+  // IT EXISTS BECAUSE NO PROBE CAN DERIVE IT (bead `sparkle-pgh1ue`). Every landed-work reading in
+  // this app resolves against the agent's bound-project worktree, so an agent handed a task in
+  // another repo commits nothing to its bound branch — and the row read "Local: Nothing Yet" forever,
+  // however finished and shipped the work was. The founder reported that repeatedly. A stamp is the
+  // only thing that can carry the fact, because the fact is not in this repo.
+  //
+  // SELF-REPORTED and deliberately unverified — see the type's own doc comment. Optional, so every
+  // pre-existing persisted agent reads as "never stamped", which is exactly today's behaviour.
+  landedElsewhere?: LandedElsewhere;
+  // THE REPOSITORIES THIS AGENT'S OPENING ASSIGNMENT NAMED (engine/crossRepo.assignmentRepos),
+  // latched ONCE — at spawn for a worker's `task`, on the first composer prompt for a build agent —
+  // and never rewritten. The (b) half of the cross-repo status fix: it is what lets a row say
+  // "tracked elsewhere" before any landing stamp exists.
+  //
+  // LATCHED RATHER THAN RE-DERIVED, and that is the whole point of persisting it. Reading the
+  // CURRENT prompt instead would flip an ordinary agent to "Tracked Elsewhere" the moment any prompt
+  // mentioned another repo ("port the fix from owner/repo#253") and flip it back on the next one —
+  // a rung that moves with chat content rather than with work state (roborev 67500).
+  //
+  // It holds REFERENCES, not a verdict: the comparison against the bound repo happens at read time,
+  // because the bound slug comes from a cache that can be cold at assignment time. Optional, so
+  // every pre-existing persisted agent reads as "nothing latched" — today's behaviour exactly.
+  assignmentRepos?: string[];
   // What this agent is trying to ACHIEVE, and whether it has (engine/agentGoal.AgentGoal).
   //
   // Distinct from `activity` in the way that matters: `activity` is what the agent is doing right

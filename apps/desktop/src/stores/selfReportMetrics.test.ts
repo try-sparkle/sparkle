@@ -88,6 +88,11 @@ describe("useSelfReportMetrics — session-scoped increments", () => {
         // Intent signals (services/mergeGuard). The op NAME only — never the goal text or the
         // claim note, both of which are free text an agent wrote.
         "set_agent_goal", "set_agent_goal_met", "claim_pr", "release_pr",
+        // Where an agent's work landed, when that is another repository (bead `sparkle-pgh1ue`).
+        // Same rule and it matters as much as the Chief entry above: the payload names a repository,
+        // a PR number and a free-text note — for a cross-repo agent that repo name IS the
+        // identifying payload, and none of it is stored. Only that a stamp was written.
+        "set_agent_landed",
         // Peer messaging. The op NAME only — never `to`, and never the message body, which is the
         // most identifying payload this op carries. Same treatment, same reason, as the two above:
         // the counter answers "are agents using the channel", not what they said to each other.

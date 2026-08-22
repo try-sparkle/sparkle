@@ -864,6 +864,14 @@ const CONTROL_OPS: &[&str] = &[
     // the two above, and the documented exit from auto-continue: the prompt Sparkle types into a
     // resumed agent tells it to mark its goal met through this op.
     "set_agent_goal",
+    // WHERE AN AGENT'S WORK ACTUALLY LANDED, when that is a repository other than the one its
+    // project is bound to (bead `sparkle-pgh1ue`). Self-report like the three above, and the ONLY
+    // carrier of a fact this app cannot probe: every landed-work reading resolves inside the agent's
+    // bound-project worktree, so a cross-repo agent reads as an honest zero and its row files under
+    // "Local: Nothing Yet" however finished the work is. This entry is the coarse existence gate —
+    // without it every stamp dies at "unknown op" before the frontend is ever reached, and the whole
+    // feature is inert. Who may stamp WHOSE row is decided frontend-side, in `handleSetAgentLanded`.
+    "set_agent_landed",
     "set_theme",
     "get_config",
     "set_config",
@@ -2259,6 +2267,8 @@ mod tests {
         for op in [
             // Phase 1.
             "get_state", "rename_agent", "set_agent_activity", "set_agent_goal", "set_theme", "get_config", "set_config",
+            // Where the work landed, for an agent whose repo is not the bound one (`sparkle-pgh1ue`).
+            "set_agent_landed",
             // Phase 3 breadth ops.
             "pin_agent", "unpin_agent", "set_agent_model", "set_agent_ordering", "set_zoom", "navigate",
             // Phase 4: the concierge tool surface (one generic op; domain/op ride in the payload).
@@ -2286,8 +2296,8 @@ mod tests {
         }
         assert_eq!(
             CONTROL_OPS.len(),
-            22,
-            "exactly the frozen Phase-1 + Phase-3 + Phase-4 control ops, the guidelines append, the three intent ops, the concierge escalation lever, the peer send, the Chief tool op, and the preview op"
+            23,
+            "exactly the frozen Phase-1 + Phase-3 + Phase-4 control ops, the guidelines append, the three intent ops, the cross-repo landing stamp, the concierge escalation lever, the peer send, the Chief tool op, and the preview op"
         );
     }
 

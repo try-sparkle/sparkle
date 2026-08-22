@@ -14,6 +14,8 @@ import type { MovementEvidence } from "../engine/movementRetraction";
 import type { FollowupSignal } from "../services/turnFollowup";
 import { agentBranchStatus, agentWorkflowState, projectAgentsStatus } from "../services/branchStatus";
 import { deriveLiveStage, stageIndex } from "../engine/workflowStage";
+import { crossRepoReading } from "../engine/crossRepo";
+import { slugForRoot } from "../services/conciergeTools/repoSlug";
 import { beadLifecycleActions, levelAfter, BEAD_LEVEL } from "../engine/beadLifecycle";
 import {
   createBead,
@@ -541,6 +543,15 @@ async function applyWorkflowState(
   driveLifecycle = true,
 ): Promise<void> {
   const store = useRuntimeStore;
+  // The PERSISTED row, for the two fields that live there rather than in any git reading: the
+  // cross-repo landing stamp and the assignment text. `agent` above is the caller's narrow projection
+  // (it deliberately carries only what every caller has), so this reads the record itself. Absent for
+  // a row that has already been removed mid-tick, which reads as "no cross-repo signal" — today's
+  // behaviour exactly.
+  const agentRecord = useProjectStore
+    .getState()
+    .projects.find((p) => p.id === projectId)
+    ?.agents.find((a) => a.id === agent.id);
   // Keep the RAW signals for the composer CTA (the monotonic stage watermark below can't tell
   // "on local main" from "on origin main"). Latches an observed hasRemote — see setWorkflowState.
   store.getState().setWorkflowState(agent.id, ws);
@@ -583,6 +594,18 @@ async function applyWorkflowState(
     shipped: ws.shipped,
     // A bead-bound agent floors at Planned before any code work exists.
     hasBead: !!agent.beadId,
+    // WORK THAT LANDED IN ANOTHER REPO (bead `sparkle-pgh1ue`). `ws` above is measured entirely
+    // inside the BOUND project, so for a cross-repo agent every field of it is an honest zero and the
+    // row settles at "Local: Nothing Yet" forever. Read straight off the agent record, which is where
+    // `set_agent_landed` writes it — the ONLY carrier of a fact this repo cannot contain.
+    crossRepo: crossRepoReading({
+      landedElsewhere: agentRecord?.landedElsewhere,
+      // The ASSIGNMENT is what names the other repo before any stamp exists: a worker's one-shot
+      // `task`, or a build agent's most recent prompt. Both are what a human typed (or an
+      // orchestrator wrote) to define the work.
+      taskText: agentRecord?.task ?? agentRecord?.lastPrompt ?? null,
+      boundSlug: slugForRoot(rootPath),
+    }),
   });
   if (next !== prev) store.getState().setWorkflowStage(agent.id, next);
   // One-time roborev consent: the first time this agent's work reaches a reviewable commit

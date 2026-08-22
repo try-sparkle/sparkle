@@ -52,6 +52,7 @@ import { hasTurnEndAuthority } from "../engine/turnEndAuthority";
 import { quotaBlockForAgent } from "../engine/engineRegistry";
 import { withUnmergedWork } from "../engine/unmergedAttention";
 import { resolveStage } from "../engine/workflowStage";
+import { landedStampLabel, parseLandedStamp } from "../engine/crossRepo";
 // The SAME evidence readers the sweep uses (services/goalContinuationRunner). Borrowed rather than
 // re-derived: a second answer to "is this agent resumable" would drift from the one that actually
 // decides, and this reply's whole value is that it predicts what the sweep will do.
@@ -226,6 +227,9 @@ const TALLY: Record<ControlOp, boolean> = {
   // goal text or the claim note.
   set_agent_goal: true,
   set_agent_goal_met: true,
+  // Where the work landed — the op name only, never the repo/PR/note. For a cross-repo agent the
+  // repository name IS the identifying payload, so it is exactly the thing not to record.
+  set_agent_landed: true,
   // The concierge's bounded lever on `escalated`. Op name only, like everything else here — never
   // the reason text, which names an agent's real work.
   set_agent_escalation: true,
@@ -247,6 +251,11 @@ const PER_AGENT_OPS = new Set<ControlOp>([
   "rename_agent",
   "set_agent_activity",
   "set_agent_goal",
+  // TARGETABLE, like its neighbours: an orchestrator may stamp a landing on a worker in its own
+  // subtree (the app refuses anything else with `not_yours`). Being here is what makes
+  // `reportControlOpSuccess` resolve the TARGET's kind rather than the caller's — without it a
+  // stamp written onto a worker would be tallied as though the orchestrator's own row moved.
+  "set_agent_landed",
   "pin_agent",
   "unpin_agent",
   "set_agent_model",
@@ -326,6 +335,16 @@ const CONTROL_OP_TIERS: Record<ControlOp, "free" | "privileged"> = {
   // a target), because declaring a different live agent finished latches its `metAt` and renders a
   // possibly-stalled agent done.
   set_agent_goal_met: "free",
+  // FREE, and stated as a decision because the table demands one. It is SELF-REPORT — an agent
+  // saying where its own work landed — the same class as `set_agent_activity`, and it has to be
+  // reachable by an UNATTENDED worker, which is precisely the agent most likely to be doing
+  // cross-repo work with nobody watching. Gating it behind interactive-only would leave exactly
+  // those rows stuck reading "Local: Nothing Yet", which is the defect this op exists to fix.
+  //
+  // TARGETABLE, like `set_agent_goal` and unlike `claim_pr`: an orchestrator may stamp a worker in
+  // its own subtree. What makes that safe is `mayWriteAgentFieldFor` in the handler, NOT this tier —
+  // `free` says who may call, never whose row they may write.
+  set_agent_landed: "free",
   // FREE, like `set_agent_activity` and for the same reason: an agent's report about its OWN work. A
   // worker that cannot say "I am landing this myself" is a worker whose intent stays invisible, which
   // is the failure this whole surface exists to fix — gating it behind interactive-only would
@@ -468,6 +487,7 @@ const _conciergeGateCoverage: _ConciergeGateCoversEveryControlOp = {
   get_config: true,
   rename_agent: true,
   set_agent_activity: true,
+  set_agent_landed: true,
   append_communication_guideline: true,
   set_theme: true,
   set_config: true,
@@ -1592,6 +1612,68 @@ function handleSetActivity(req: ControlRequest): Record<string, unknown> {
   if (!found) return { ok: false, error: `unknown agent ${targetId}` };
   useProjectStore.getState().setAgentActivity(found.projectId, targetId, activity);
   return { ok: true };
+}
+
+/**
+ * set_agent_landed → RECORD WHERE THIS AGENT'S WORK ACTUALLY LANDED (defaults to the caller).
+ *
+ * THE ONE FACT NO PROBE IN THIS APP CAN DERIVE (bead `sparkle-pgh1ue`). `agent_workflow_state`
+ * resolves the agent's branch inside its BOUND PROJECT and measures ancestry into that repo's
+ * default branch. For an agent whose task lands in a DIFFERENT repository every one of those
+ * readings is an honest zero — its bound branch really does hold no commits — so the row filed under
+ * "Local: Nothing Yet" and stayed there however finished and shipped the work was. The founder
+ * reported that repeatedly, of an agent whose work was merged as a PR in another repo: *"why the
+ * hell is it still in local? Nothing yet."*
+ *
+ * The answer cannot come from looking harder at this repo, because the fact is not in this repo. It
+ * has to be RECORDED, which is what this op is for.
+ *
+ * SAME OWNERSHIP CLOSURE AS `rename_agent` / `set_agent_activity`, and for the same reason rather
+ * than by symmetry: this write MOVES A ROW UP THE LADDER — a stamp claiming `state: "merged"` files
+ * the row under "Remote: Merged to Main". An unowned write could therefore paint someone else's
+ * stalled agent as finished in the operator's own trusted surface, which is precisely the class of
+ * lie the roster exists to prevent.
+ *
+ * `repo: null` (or an empty string with no url) CLEARS the stamp, so an agent that stamped the wrong
+ * place can take it back. Everything else is validated by `engine/crossRepo.parseLandedStamp` — one
+ * place decides what a stamp may say, and its refusal text is handed straight back so the agent can
+ * correct itself rather than guess.
+ */
+function handleSetAgentLanded(req: ControlRequest): Record<string, unknown> {
+  const targetId = resolveTargetId(req);
+  if (!targetId) return targetRequired("set_agent_landed", req);
+  const mayWrite = mayWriteAgentFieldFor(req, targetId);
+  if (!mayWrite.allowed) {
+    return notYours(
+      mayWrite,
+      targetId,
+      "record landed work for",
+      "a landing stamp moves that agent's row up the ladder, and the human reads the roster as that agent's own account of itself",
+    );
+  }
+  const found = findAgent(targetId);
+  if (!found) return { ok: false, error: `unknown agent ${targetId}` };
+
+  // An EXPLICIT null/empty `repo` is the take-back. Distinguished from "field absent", which is a
+  // malformed call and must be refused rather than silently wiping a good stamp.
+  const rawRepo = req.payload.repo;
+  const rawUrl = req.payload.url;
+  const clearing =
+    (rawRepo === null || (typeof rawRepo === "string" && rawRepo.trim() === "")) &&
+    (rawUrl === undefined || rawUrl === null || (typeof rawUrl === "string" && rawUrl.trim() === ""));
+  if (clearing) {
+    useProjectStore.getState().setAgentLandedElsewhere(found.projectId, targetId, null);
+    return { ok: true, cleared: true };
+  }
+
+  const parsed = parseLandedStamp(req.payload, Date.now());
+  if (!parsed.ok) return { ok: false, error: parsed.error };
+  useProjectStore.getState().setAgentLandedElsewhere(found.projectId, targetId, parsed.stamp);
+  // ECHO THE STORED STAMP BACK, not the caller's payload. The two can differ — the slug is
+  // normalized, a PR number is read out of a URL, an unstated state floors at `pushed` — and an agent
+  // that assumes its own words were stored has no way to notice it claimed less (or differently) than
+  // it meant to. Same reason `set_agent_goal` returns the goal it actually wrote.
+  return { ok: true, landed: parsed.stamp, label: landedStampLabel(parsed.stamp) };
 }
 
 /**
@@ -3905,6 +3987,9 @@ async function dispatch(req: ControlRequest): Promise<void> {
         break;
       case "set_agent_activity":
         result = handleSetActivity(req);
+        break;
+      case "set_agent_landed":
+        result = handleSetAgentLanded(req);
         break;
       case "set_agent_goal":
         result = handleSetGoal(req);

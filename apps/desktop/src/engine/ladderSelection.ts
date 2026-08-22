@@ -18,6 +18,7 @@
 import type { AgentKind, AgentTabStatus } from "../types";
 import type { WorkflowStageId } from "./workflowStage";
 import { flattenSections, groupAgentsByStage, type StatusBand } from "./buildSections";
+import type { CrossRepoReading } from "./crossRepo";
 import { topLevelAgents } from "./agentOrdering";
 import type { WorkMode } from "./workMode";
 
@@ -47,6 +48,13 @@ export function firstLadderRowId<
    *  exact "selection points at a row the column is not rendering" failure this module was extracted
    *  to end (roborev 53858), just reached through the section axis instead of the band axis. */
   holdsWorkOf?: (id: string) => boolean | undefined,
+  /** Does this row's work live in ANOTHER REPOSITORY? Forwarded straight to `groupAgentsByStage`,
+   *  and it MUST be the same accessor the column passes — for the identical reason as `holdsWorkOf`
+   *  above, only more sharply: `tracked_elsewhere` is section SLOT 0, so a cross-repo row sorts to
+   *  the very TOP of the rendered column. A caller that omits it here while the sidebar supplies it
+   *  computes it in `local_none`/`local_uncommitted` instead and returns a first row that is not the
+   *  first row on screen (roborev 67500). */
+  crossRepoOf?: (id: string) => CrossRepoReading | undefined,
 ): string | null {
   // NO rollup accessor here, deliberately — `statusOf` already carries it.
   //
@@ -70,6 +78,7 @@ export function firstLadderRowId<
     visibleBands,
     undefined,
     holdsWorkOf,
+    crossRepoOf,
   );
   return flattenSections(sections)[0]?.id ?? null;
 }

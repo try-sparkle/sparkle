@@ -68,6 +68,8 @@ import {
   type BuildSectionId,
   type StatusBand,
 } from "../../engine/buildSections";
+import { crossRepoAccessors } from "../../engine/crossRepo";
+import { slugForRoot } from "./repoSlug";
 import { topLevelAgents } from "../../engine/agentOrdering";
 import {
   resolveStage,
@@ -358,6 +360,11 @@ function columnView(project: Project): ColumnView {
     headById.set(head.id, head);
     for (const child of childRows(head)) headById.set(child.id, head);
   }
+  // The SAME shared builder AgentSidebar uses, for the same reason `headHoldsWorkOf` is folded by a
+  // shared helper: this view exists to tell the concierge what the COLUMN is showing, so a rung it
+  // computes differently is a lie about the screen. `tracked_elsewhere` is ladder slot 0, so a
+  // disagreement here also reorders the rows it reports (roborev 67500).
+  const { head: headCrossRepoOf } = crossRepoAccessors(agents, slugForRoot(project.rootPath));
   const sections = groupAgentsByStage(
     topLevel,
     headStageOf,
@@ -365,6 +372,7 @@ function columnView(project: Project): ColumnView {
     bands,
     bandOf,
     headHoldsWorkOf,
+    headCrossRepoOf,
   ).map((g) => ({ id: g.id, rows: g.rows }));
 
   return {

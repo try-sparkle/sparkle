@@ -120,7 +120,6 @@ import {
   groupAgentsByStage,
   sectionFromReadings,
   sectionOfRow,
-  sectionOfStage,
   type BuildSectionId,
   type StatusBand,
 } from "../engine/buildSections";
@@ -175,6 +174,8 @@ import {
   uncommittedWorkEvidence,
 } from "../engine/workflowStage";
 import type { WorkflowStageId } from "../engine/workflowStage";
+import { crossRepoAccessors } from "../engine/crossRepo";
+import { slugForRoot } from "../services/conciergeTools/repoSlug";
 import { useSpawnBuildAgent } from "../hooks/useSpawnBuildAgent";
 import { NewAgentButtons } from "./NewAgentButtons";
 import { CloseAgentPrompt } from "./CloseAgentPrompt";
@@ -653,6 +654,25 @@ export function AgentSidebar({
   const statusFilter = useUiStore((s) => s.statusFilter);
   const toggleStatusBand = useUiStore((s) => s.toggleStatusBand);
   const showAllStatusBands = useUiStore((s) => s.showAllStatusBands);
+  // ── CROSS-REPO: work that does not live in this project (bead `sparkle-pgh1ue`) ───────────────
+  //
+  // Every git reading feeding the ladder is taken inside the BOUND project's worktree, so an agent
+  // whose task lands in another repository reads as an honest zero on all of them and files under
+  // "Local: Nothing Yet" — however finished and shipped the work is. `engine/crossRepo` supplies the
+  // two signals that reading cannot: the agent's own landing STAMP, and the GUARD that its opening
+  // assignment named a different repo.
+  //
+  // BUILT BY THE SHARED `crossRepoAccessors`, not by hand here. `groupAgentsByStage` requires every
+  // caller to derive this identically, and `tracked_elsewhere` is ladder SLOT 0 — so two callers that
+  // disagree produce two different row ORDERS and selection lands on a row the column is not
+  // rendering (roborev 67500). `firstRenderedRowId` and the concierge's `sidebarView` call the same
+  // builder.
+  const { own: crossRepoOf, head: headCrossRepoOf } = useMemo(
+    // `null` for an unresolved root, which `detectCrossRepoTarget` treats as "cannot tell" and fails
+    // closed on — a cold `repoSlug` cache must never mark ordinary rows cross-repo.
+    () => crossRepoAccessors(project?.agents ?? [], slugForRoot(project?.rootPath)),
+    [project],
+  );
   // The workflow stage an agent's own git state + any known override resolves to.
   const stageOf = (id: string): WorkflowStageId =>
     resolveStage(branchStatus[id], workflowStage[id]);
@@ -664,7 +684,7 @@ export function AgentSidebar({
    *  the entire unpolled fleet amber on our own ignorance. Both readings absent means we did not
    *  look. This is also what keeps a brand-new agent calm without an exemption written for it. */
   const sectionOf = (id: string): BuildSectionId | undefined =>
-    sectionFromReadings(branchStatus[id], workflowStage[id]);
+    sectionFromReadings(branchStatus[id], workflowStage[id], crossRepoOf(id));
   // Has this agent ever shipped (reached On Main+)? Sticky flag set by refreshWorkflowStage, OR'd
   // with the current resolved stage so the ✓ shows even on the first tick that lands it.
   const shippedOf = (id: string): boolean =>
@@ -1468,6 +1488,9 @@ export function AgentSidebar({
   // exact same inputs the render uses: the full overlay chain (publishedStatusFor) and the
   // worker-roll-up stage. Every selection path goes through this, so none of them can drift from
   // the column again (roborev 53411/53428/53439/53440 all found the same class of bug here).
+  // Captured as a plain string so `firstRenderedRowId` can stay a near-constant callback: the root
+  // is stable for the life of a project, unlike the `project` object it hangs off.
+  const rootPathForRows = project?.rootPath;
   const firstRenderedRowId = useCallback(
     (agents: readonly AgentTab[], forMode: WorkMode): string | null => {
       const rt = useRuntimeStore.getState();
@@ -1488,6 +1511,10 @@ export function AgentSidebar({
           uncommittedWorkEvidence(rt.branchStatus[id]),
           ...agents.filter((a) => a.parentId === id).map((w) => uncommittedWorkEvidence(rt.branchStatus[w.id])),
         ]);
+      // The SAME shared builder the column uses, over the SAME (post-removal) list it was handed.
+      // `tracked_elsewhere` is ladder slot 0, so omitting this would compute a first row that is not
+      // the first row on screen — the drift above, reached through the section axis (roborev 67500).
+      const { head: headCrossRepoFor } = crossRepoAccessors(agents, slugForRoot(rootPathForRows));
       return firstLadderRowId(
         agents,
         forMode,
@@ -1495,9 +1522,10 @@ export function AgentSidebar({
         (id) => published[id] ?? "stopped",
         useUiStore.getState().statusFilter,
         headHoldsWorkFor,
+        headCrossRepoFor,
       );
     },
-    [],
+    [rootPathForRows],
   );
 
   // After a close removes an agent (and its workers), keep selection coherent with the sidebar:
@@ -2245,6 +2273,7 @@ export function AgentSidebar({
     return { topLevelAgents, childrenByParent };
   }, [project]);
 
+
   // ── NARROWED TO THE EPICS COLUMN'S SELECTION ───────────────────────────────────────────────
   //
   // The point of the epics column, from this end: the founder picks an epic beside the concierge
@@ -2440,9 +2469,13 @@ export function AgentSidebar({
       if (readIds.length === 0) return undefined;
       const stages = readIds.map((x) => resolveStage(branchStatus[x], workflowStage[x]));
       const rolled = rollupStages(stages);
-      return sectionOfStage(rolled ? rolled.stage : stages[0]!);
+      // Routed through `sectionOfRow` rather than `sectionOfStage` for the cross-repo arm only: a
+      // subtree whose work lives in another repo must paint from the honest "Tracked Elsewhere" rung,
+      // not from the "Local: Nothing Yet" one its all-zero readings would otherwise roll up to.
+      // `holdsWork: undefined` keeps every other row's answer byte-identical to `sectionOfStage`.
+      return sectionOfRow(rolled ? rolled.stage : stages[0]!, undefined, headCrossRepoOf(id));
     },
-    [childrenByParent, branchStatus, workflowStage],
+    [childrenByParent, branchStatus, workflowStage, headCrossRepoOf],
   );
 
   // Does this row's SUBTREE hold anything uncommitted? Rolled up exactly like `headStageOf` above,
@@ -2537,6 +2570,7 @@ export function AgentSidebar({
             statusFilter,
             rowBandOf,
             headHoldsWorkOf,
+            headCrossRepoOf,
           );
     },
     [
@@ -2547,6 +2581,7 @@ export function AgentSidebar({
       statusFilter,
       rowBandOf,
       headHoldsWorkOf,
+      headCrossRepoOf,
       epicAgentIds,
     ],
   );
@@ -3355,6 +3390,7 @@ export function AgentSidebar({
                 section: sectionOfRow(
                   stageOf(w.id) as WorkflowStageId,
                   uncommittedWorkEvidence(branchStatus[w.id]),
+                  crossRepoOf(w.id),
                 ),
                 status: wst,
                 statusColor: wcolor,

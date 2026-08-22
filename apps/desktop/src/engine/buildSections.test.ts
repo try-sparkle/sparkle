@@ -43,8 +43,14 @@ describe("the stage ladder", () => {
 
   it("orders the sections Local-first, then Remote", () => {
     expect(BUILD_SECTIONS.map((s) => s.id)).toEqual([
-      // `local_none` is FIRST — least advanced of all. A row that holds nothing has not started, so
-      // it sorts above one holding unsaved edits (sparkle-biezi).
+      // `tracked_elsewhere` sits OUTSIDE the Local→Remote scale entirely, above it (bead
+      // `sparkle-pgh1ue`). The ladder below measures "how far toward safely on remote main"; this
+      // rung says the work is in a repository this project cannot measure and makes no progress
+      // claim at all. Interleaving it among rungs that DO make one would imply a position on a scale
+      // it has none on — so it goes first, where it implies nothing about the ladder under it.
+      "tracked_elsewhere",
+      // `local_none` is FIRST OF THE MEASURED RUNGS — least advanced of all. A row that holds
+      // nothing has not started, so it sorts above one holding unsaved edits (sparkle-biezi).
       "local_none",
       "local_uncommitted",
       "local_committed",
@@ -108,9 +114,18 @@ describe("the stage ladder", () => {
   });
 
   it("puts the Local→Remote boundary exactly once, and never lets a Remote section precede a Local one", () => {
-    const kinds = BUILD_SECTIONS.map((s) => (s.label.startsWith("Local:") ? "local" : "remote"));
+    // `tracked_elsewhere` is EXCLUDED BY ID, not by a loosened label test. It is neither side of the
+    // boundary — it is the rung for work this project cannot measure at all — and a label-shaped
+    // exemption ("anything not starting with Local:") would quietly re-admit any future section that
+    // happened to be named the same way. Naming it keeps this guard at full force: add a real remote
+    // section above a local one and this still fails.
+    const measured = BUILD_SECTIONS.filter((s) => s.id !== "tracked_elsewhere");
+    const kinds = measured.map((s) => (s.label.startsWith("Local:") ? "local" : "remote"));
     // Every local section comes before every remote section — one clean boundary, no interleaving.
     expect(kinds.lastIndexOf("local")).toBeLessThan(kinds.indexOf("remote"));
+    // …and the excluded rung really is the only unmeasured one, so the filter above cannot silently
+    // grow to cover a section that should have been on the scale.
+    expect(BUILD_SECTIONS.length - measured.length).toBe(1);
   });
 });
 

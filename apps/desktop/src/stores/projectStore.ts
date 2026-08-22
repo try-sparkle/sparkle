@@ -37,6 +37,7 @@ import {
   resetGoalRetries,
   unraiseGoal,
 } from "../engine/agentGoal";
+import { assignmentRepos, type LandedElsewhere } from "../engine/crossRepo";
 import {
   failedEpicGoal,
   mayAutoGenerate,
@@ -259,6 +260,19 @@ export interface ProjectState {
    *  TIMESTAMPED QUOTE rather than as perpetually-current state — a stale self-report is how a dead
    *  agent looked "explained" (bead sparkle-s8y5t6). Clearing the line clears the stamp. */
   setAgentActivity: (projectId: string, agentId: string, activity: string, now?: number) => void;
+  /** Record WHERE this agent's work actually landed, when that is a repository other than the one
+   *  this project is bound to (sparkle-control `set_agent_landed`; bead `sparkle-pgh1ue`). `null`
+   *  clears the stamp.
+   *
+   *  THE ONLY WRITER OF A FACT NO PROBE CAN SEE. `agent_workflow_state` measures the agent's branch
+   *  INSIDE the bound project, so a cross-repo agent's every reading is an honest zero and its row
+   *  filed under "Local: Nothing Yet" however finished the work was. The stamp is what
+   *  `deriveLiveStage` prefers over that reading. */
+  setAgentLandedElsewhere: (
+    projectId: string,
+    agentId: string,
+    landed: LandedElsewhere | null,
+  ) => void;
   /**
    * Flip an agent's runtime IN PLACE — local→cloud promotion (services/agentPromotion,
    * spec 2026-07-31 §Decision 3). It changes `runtime` and NOTHING else, and that is the whole
@@ -1699,6 +1713,23 @@ export const useProjectStore = create<ProjectState>()(
           ),
         })),
 
+      setAgentLandedElsewhere: (projectId, agentId, landed) =>
+        set((s) => ({
+          projects: mapProject(s.projects, projectId, (p) =>
+            // A single-field patch. The stamp arrives already validated and normalized by
+            // `engine/crossRepo.parseLandedStamp` — this store never parses caller text, so there is
+            // exactly one place that decides what a stamp may say.
+            mapAgent(p, agentId, (a) => {
+              if (!landed) {
+                if (a.landedElsewhere === undefined) return a;
+                const { landedElsewhere: _dropped, ...rest } = a;
+                return rest as typeof a;
+              }
+              return { ...a, landedElsewhere: landed };
+            }),
+          ),
+        })),
+
       setAgentRuntime: (projectId, agentId, runtime) =>
         set((s) => ({
           projects: mapProject(s.projects, projectId, (p) =>
@@ -2508,6 +2539,47 @@ export const useProjectStore = create<ProjectState>()(
               // concierge's own tool layer, whose text an LLM wrote.
               ...(humanAuthored ? releaseGoalDebt(a) : a),
               lastPrompt: isPicker ? a.lastPrompt : text,
+              // THE CROSS-REPO ASSIGNMENT LATCH (bead `sparkle-pgh1ue`), written exactly once, on
+              // the OPENING composer prompt. A build agent has no `task` field, so its first prompt
+              // IS its assignment — and it is the only prompt that may be read this way. Re-deriving
+              // from later prompts would make the row's ladder rung oscillate with chat content
+              // (roborev 67500).
+              //
+              // ⚠️ "NOT LATCHED YET" IS NOT THE SAME QUESTION AS "IS THIS THE FIRST PROMPT", AND
+              // CONFLATING THEM IS A MIGRATION HAZARD (roborev 67613). Every agent already persisted
+              // when this ships has `assignmentRepos === undefined`, so an `undefined` check alone
+              // would latch the NEXT prompt of an existing conversation — arbitrarily far in — as
+              // that agent's "opening assignment", permanently and irreversibly. The very example
+              // the paragraph above calls out ("port the fix from owner/repo#253"), typed at a
+              // long-running agent, would file it under "Tracked Elsewhere" FOREVER rather than for
+              // one turn: strictly worse than the oscillation this replaced, because nothing clears
+              // it. So the latch additionally requires that no composer prompt has been recorded at
+              // all, which leaves every pre-existing row simply unlatched — the conservative arm, and
+              // the one where those rows keep exactly the status they have today.
+              //
+              // Picker answers are excluded, and do not count as the opening prompt either: they are
+              // answers to the agent's OWN question, not a statement of the work. A missing `source`
+              // predates picker-tagging and counts as composer, matching `capPromptHistory`.
+              //
+              // `humanAuthored` is deliberately NOT required. The concierge dispatching work to a
+              // build agent IS that agent's assignment — it is the ordinary "send to build" path —
+              // so demanding a human typist would leave precisely the orchestrated agents unlatched.
+              // What must not latch is a LATER prompt, whoever wrote it, and the first-prompt guard
+              // is what enforces that.
+              // ⚠️ AND `terminalBriefedAt`, because "no recorded composer prompt" IS NOT "new agent"
+              // (roborev 67730). Only four call sites ever write `promptHistory`, and
+              // `terminalBriefedAt`'s own doc says it outright: an agent driven entirely BY HAND has
+              // empty `lastPrompt`/`promptHistory`. So a long-running terminal-briefed agent reads
+              // `promptHistory === []`, and the first composer prompt it ever received — arbitrarily
+              // deep into its life — would latch as its "opening assignment", permanently. That is
+              // the very hazard this guard exists to close, surviving in the one population the store
+              // already has a durable marker for. This clause is what makes the claim above true.
+              ...(isPicker ||
+              a.assignmentRepos !== undefined ||
+              a.terminalBriefedAt !== undefined ||
+              (a.promptHistory ?? []).some((e) => (e.source ?? "composer") === "composer")
+                ? {}
+                : { assignmentRepos: assignmentRepos(text) }),
               // Append newest-last, then cap PER SOURCE so the persisted record stays bounded without
               // letting picker volume evict real composer prompts (capPromptHistory). Dropdown reverses.
               promptHistory: capPromptHistory([

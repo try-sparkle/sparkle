@@ -8,6 +8,7 @@
 // state (the proven model) plus a release "shipped" signal. A unit that's only planned (no code yet)
 // sits at Planned; opening a Build agent starts there and the bar fills as work advances.
 import type { BranchStatus, WorkflowState } from "../services/branchStatus";
+import { stageFromLandedStamp, type CrossRepoReading } from "./crossRepo";
 import { C } from "../theme/colors";
 
 // Ordered earliest → final. Order is load-bearing: stageIndex/rollup/dominant all rely on it.
@@ -342,6 +343,18 @@ export interface LiveStageInputs {
   // ── Build signals not derivable from ahead/behind/dirty:
   pushed?: boolean; //  the branch is pushed to its remote      → at least Pushed
   shipped?: boolean; // included in a published release/deploy  → Shipped
+  /** WORK THAT DOES NOT LIVE IN THE BOUND PROJECT (bead `sparkle-pgh1ue`). Every other input here is
+   *  a reading taken INSIDE the agent's bound-project worktree, so an agent whose task lands in a
+   *  different repository makes every one of them an honest zero — and the row filed under "Local:
+   *  Nothing Yet" while its work was merged and shipped.
+   *
+   *  Only the STAMP half moves the stage (see `engine/crossRepo`): a self-recorded `owner/repo#N` is
+   *  a positive claim, and `stageFromLandedStamp` says exactly how far it reaches. The GUARD half
+   *  (the task named another repo, but nothing has been stamped) deliberately moves NOTHING here —
+   *  it is evidence that this row is unmeasurable from the bound project, not evidence of progress.
+   *  It is spent one layer out, in `buildSections.sectionOfRow`, where it buys the honest "Tracked
+   *  Elsewhere" rung instead of the false "Nothing Yet" one. */
+  crossRepo?: CrossRepoReading | null;
 }
 
 // The floor stage implied by the planning signals (Think/Plan), independent of any git work.
@@ -382,12 +395,18 @@ export function deriveLiveStage(input: LiveStageInputs): WorkflowStageId {
   // (`branch_carries_no_own_work` suppresses the commit probe and the release-tag check for a branch
   // with no work of its own), so DON'T re-derive that here — but if you ever add another PR/shipped
   // source, it owes the same guarantee before it may feed this gate.
+  //
+  // A CROSS-REPO STAMP FEEDS THIS GATE TOO, and it owes the same guarantee the comment above
+  // demands of any new source: it is never true for a no-op branch, because nothing writes it except
+  // an agent explicitly naming the repository and pull request its work landed in. A branch sitting
+  // on main's HEAD has no such record; only a deliberate `set_agent_landed` call produces one.
   const committedSeen =
     idx >= stageIndex("building_saved") ||
     prevIdx >= stageIndex("building_saved") ||
     (ws?.aheadOfBase ?? 0) > 0 ||
     input.pushed === true ||
-    ws?.prState != null;
+    ws?.prState != null ||
+    input.crossRepo?.stamp != null;
 
   const bump = (id: WorkflowStageId) => {
     idx = Math.max(idx, stageIndex(id));
@@ -468,6 +487,21 @@ export function deriveLiveStage(input: LiveStageInputs): WorkflowStageId {
 
   // Shipped is the authoritative top — only meaningful once real work landed.
   if (input.shipped && committedSeen) bump("shipped");
+
+  // THE CROSS-REPO STAMP, PREFERRED OVER THE BOUND-PROJECT READING (bead `sparkle-pgh1ue`).
+  //
+  // "Preferred" is implemented as a BUMP rather than an override, and that is the correct reading of
+  // the word here, not a weakening of it. The bound-project probe's answer for a cross-repo agent is
+  // structurally an all-zero: no commits, no PR, nothing landed. Zero is the ladder's floor, so
+  // raising to the stamp IS preferring it — there is nothing above it to override. Where the two can
+  // genuinely disagree the bump is also the honest arm: an agent with real unlanded commits in the
+  // bound repo AND a merged PR elsewhere has done both, and the higher rung is the one the row
+  // should not walk back.
+  //
+  // What it must never do is claim more than the stamp states. `stageFromLandedStamp` floors an
+  // unstated state at `pushed`, so a bare `{ repo }` stamp cannot manufacture a merge.
+  const stamp = input.crossRepo?.stamp;
+  if (stamp) bump(stageFromLandedStamp(stamp));
 
   // New-cycle detection: prior work already landed (prev ≥ Merged) but live signals fell back AND
   // there are fresh un-landed commits — track the new cycle instead of staying pinned at Merged.

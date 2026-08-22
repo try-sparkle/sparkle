@@ -1360,6 +1360,96 @@ describe("controlListener", () => {
     expect(lastReply()).toMatchObject({ ok: false });
   });
 
+  // ── set_agent_landed: WHERE THE WORK ACTUALLY LANDED (bead `sparkle-pgh1ue`) ────────────────
+  //
+  // The op exists because no probe in this app can derive the fact: every landed-work reading
+  // resolves inside the agent's BOUND project, so an agent working in another repository reads as an
+  // honest zero and files under "Local: Nothing Yet" however finished the work is. Every case below
+  // asserts the SIDE EFFECT on the stored row, not just the reply — a handler that answered `ok` and
+  // wrote nothing would satisfy a reply-only assertion, which is the defect shape this repo keeps
+  // shipping.
+  describe("set_agent_landed", () => {
+    const agentOf = (id: string) =>
+      useProjectStore.getState().projects.flatMap((p) => p.agents).find((a) => a.id === id);
+
+    it("stores a NORMALIZED stamp and echoes back what was actually stored", async () => {
+      fire({
+        reqId: "cr1",
+        op: "set_agent_landed",
+        callerAgentId: callerId,
+        payload: { repo: "https://github.com/Drodio/Drodio-Website/pull/253", state: "merged", sha: "79b157a" },
+      });
+      await flush();
+      // THE ECHO IS THE POINT, not decoration: the slug was lowercased and the PR number was read
+      // out of the URL, so an agent trusting its own words would be wrong about what its row says.
+      expect(lastReply()).toMatchObject({
+        ok: true,
+        landed: { repo: "drodio/drodio-website", prNumber: 253, state: "merged", sha: "79b157a" },
+        label: "drodio/drodio-website#253 · merged",
+      });
+      expect(agentOf(callerId)!.landedElsewhere).toMatchObject({
+        repo: "drodio/drodio-website",
+        prNumber: 253,
+        state: "merged",
+      });
+    });
+
+    it("an EMPTY repo clears the stamp — the take-back for a wrong one", async () => {
+      fire({ reqId: "cr2", op: "set_agent_landed", callerAgentId: callerId, payload: { repo: "a/b", state: "merged" } });
+      await flush();
+      expect(agentOf(callerId)!.landedElsewhere).toBeDefined();
+
+      fire({ reqId: "cr3", op: "set_agent_landed", callerAgentId: callerId, payload: { repo: "" } });
+      await flush();
+      expect(lastReply()).toMatchObject({ ok: true, cleared: true });
+      expect(agentOf(callerId)!.landedElsewhere).toBeUndefined();
+    });
+
+    it("an ABSENT repo is REFUSED, never treated as a clear", async () => {
+      // The distinction the clearing predicate turns on: an explicit empty string is a take-back; a
+      // missing field is a malformed call, and silently wiping a good stamp for it would lose the one
+      // fact nothing else can supply.
+      fire({ reqId: "cr4", op: "set_agent_landed", callerAgentId: callerId, payload: { repo: "a/b", state: "merged" } });
+      await flush();
+      fire({ reqId: "cr5", op: "set_agent_landed", callerAgentId: callerId, payload: { pr: 7 } });
+      await flush();
+      expect(lastReply()).toMatchObject({ ok: false });
+      expect(agentOf(callerId)!.landedElsewhere).toMatchObject({ repo: "a/b" });
+    });
+
+    it("REFUSES an unrelated agent's stamp — the target's row is unchanged", async () => {
+      // A stamp MOVES A ROW UP THE LADDER, so an unowned write paints someone else's stalled agent
+      // as finished in the operator's own trusted surface. Same closure as rename/activity.
+      const stranger = useProjectStore.getState().addAgent(projectId, { kind: "build" })!;
+      fire({
+        reqId: "cr6",
+        op: "set_agent_landed",
+        callerAgentId: stranger,
+        payload: { targetAgentId: callerId, repo: "a/b", state: "merged" },
+      });
+      await flush();
+      expect(lastReply()).toMatchObject({ ok: false });
+      // The refusal NAMES THE ACTION, so the caller can tell which write was rejected rather than
+      // being handed a generic denial for a payload carrying several fields.
+      expect(String((lastReply() as { error: string }).error)).toContain(
+        "not yours to record landed work for",
+      );
+      expect(agentOf(callerId)!.landedElsewhere).toBeUndefined();
+    });
+
+    it("refuses shipped:true without a merge, and leaves the row untouched", async () => {
+      fire({
+        reqId: "cr7",
+        op: "set_agent_landed",
+        callerAgentId: callerId,
+        payload: { repo: "a/b", state: "open", shipped: true },
+      });
+      await flush();
+      expect(lastReply()).toMatchObject({ ok: false });
+      expect(agentOf(callerId)!.landedElsewhere).toBeUndefined();
+    });
+  });
+
   // ── THE ROSTER CARRIES THE SELF-REPORT'S AGE (bead sparkle-s8y5t6) ───────────────────────────
   // This roster is the surface a WATCHER / concierge agent scans, and the bug is that it read a
   // dead agent's hours-old self-report as current state. The row must now carry `activityAgeMs` so a

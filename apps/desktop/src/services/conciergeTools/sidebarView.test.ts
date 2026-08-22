@@ -38,6 +38,7 @@ import {
   type BuildRow,
   type SidebarViewRiskClass,
 } from "./sidebarView";
+import { __clearRepoSlugCache, __setRepoSlugForTest } from "./repoSlug";
 import { useProjectStore } from "../../stores/projectStore";
 import { useRuntimeStore } from "../../stores/runtimeStore";
 import { useUiStore } from "../../stores/uiStore";
@@ -884,5 +885,96 @@ describe("every entry point returns a value", () => {
       expect(typeof r.ok).toBe("boolean");
       expect(SIDEBAR_VIEW_OPS).toContain(r.op);
     }
+  });
+});
+
+// ── The concierge's view must agree with the column about `tracked_elsewhere` ────────────────────
+//
+// This whole module exists so the concierge describes the SCREEN rather than its own recomputation
+// of it, and `crossRepoOf` is an optional trailing argument to `groupAgentsByStage` — so dropping it
+// here is neither a type error nor, without this block, a test failure. It would silently restore the
+// state roborev 67500 found: the column showing a row on ladder slot 0 while this view reported it in
+// `local_none`, at a different index (roborev 67613).
+describe("cross-repo rows (bead `sparkle-pgh1ue`)", () => {
+  const ROOT = "/tmp/p1";
+
+  beforeEach(() => {
+    __clearRepoSlugCache();
+    __setRepoSlugForTest(ROOT, "drodio/sparkle");
+  });
+
+  it("files a row whose ASSIGNMENT named another repo under `tracked_elsewhere`", () => {
+    useProjectStore.setState({
+      projects: [
+        mkProject("p1", "web", [
+          mkAgent("b1", { assignmentRepos: ["drodio/drodio-website"] }),
+          mkAgent("b3"),
+        ]),
+      ],
+      selectedProjectId: "p1",
+    } as never);
+    const row = rowsById(value(listBuildRows()));
+    expect(row("b1").section).toBe("tracked_elsewhere");
+    // The negative control: the sibling is untouched, so this is the accessor doing the work rather
+    // than the whole column moving.
+    expect(row("b3").section).toBe("local_uncommitted");
+  });
+
+  it("files a row carrying a landing STAMP by what the stamp proves", () => {
+    useProjectStore.setState({
+      projects: [
+        mkProject("p1", "web", [
+          mkAgent("b1", {
+            landedElsewhere: { repo: "drodio/drodio-website", prNumber: 253, state: "merged", stampedAt: 1 },
+          }),
+        ]),
+      ],
+      selectedProjectId: "p1",
+    } as never);
+    // ⚠️ THE ASSERTION IS POSITIVE, NOT A NEGATION — the first cut of this test asserted only
+    // `not.toBe("local_none")`, which a bare `mkAgent` in this suite already satisfies (no
+    // branchStatus ⇒ holdsWork undefined ⇒ `local_uncommitted`). It was therefore TRUE BEFORE the
+    // stamp was read at all: deleting `landedElsewhere` from the accessor entirely left it green
+    // (roborev 67730). A stamp alone satisfies `isCrossRepo`, so the rung it actually produces here
+    // is `tracked_elsewhere`, and pinning that is what can tell "the stamp routed the row" from "the
+    // stamp was ignored".
+    const row = rowsById(value(listBuildRows()));
+    expect(row("b1").section).toBe("tracked_elsewhere");
+  });
+
+  it("…and a row with NO stamp and no assignment is the control that keeps that test honest", () => {
+    // The negative half of the pair. Same fixture shape, same absent branchStatus — the ONLY
+    // difference is the stamp, so the two together isolate it.
+    useProjectStore.setState({
+      projects: [mkProject("p1", "web", [mkAgent("b1")])],
+      selectedProjectId: "p1",
+    } as never);
+    expect(rowsById(value(listBuildRows()))("b1").section).toBe("local_uncommitted");
+  });
+
+  it("an UNRESOLVED bound slug files nothing as cross-repo — the fail-closed arm", () => {
+    __setRepoSlugForTest(ROOT, null);
+    useProjectStore.setState({
+      projects: [mkProject("p1", "web", [mkAgent("b1", { assignmentRepos: ["drodio/drodio-website"] })])],
+      selectedProjectId: "p1",
+    } as never);
+    expect(rowsById(value(listBuildRows()))("b1").section).toBe("local_uncommitted");
+  });
+
+  it("a head inherits a WORKER's cross-repo assignment, like every other subtree fold here", () => {
+    useProjectStore.setState({
+      projects: [
+        mkProject("p1", "web", [
+          mkAgent("b2"),
+          mkAgent("w1", {
+            kind: "worker",
+            parentId: "b2",
+            task: "publish at https://github.com/drodio/drodio-website",
+          }),
+        ]),
+      ],
+      selectedProjectId: "p1",
+    } as never);
+    expect(rowsById(value(listBuildRows()))("b2").section).toBe("tracked_elsewhere");
   });
 });

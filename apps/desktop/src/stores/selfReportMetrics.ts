@@ -32,6 +32,16 @@ export type ControlOp =
   // myself" somewhere the concierge can see it. See services/mergeGuard/types.ts for the incident.
   | "set_agent_goal"
   | "set_agent_goal_met"
+  // WHERE AN AGENT'S WORK ACTUALLY LANDED, when that is a repository other than the one its project
+  // is bound to (bead `sparkle-pgh1ue`). The op NAME only — never the repo, the PR number or the
+  // note, all of which name the caller's real work and, for a cross-repo agent, a repository this
+  // telemetry has no business enumerating (see the privacy note above).
+  //
+  // Its membership here is load-bearing for the same reason `chief_tool`'s is, one comment below:
+  // an op named outside this union reads `undefined` out of `CONTROL_OP_TIERS` and is free BY
+  // OMISSION rather than by decision. This op writes a field that moves a row up the ladder, so
+  // "free" needs to be a decision someone made.
+  | "set_agent_landed"
   // The concierge's BOUNDED lever on `escalated` (bead sparkle-hm4z9). Not a self-report at all —
   // it is the one op on this surface only the concierge may call — but it is tallied like the rest
   // so the tier table stays exhaustive (see the `chief_tool` note below for what an omission costs).
@@ -101,6 +111,7 @@ const emptyControlOps = (): Record<ControlOp, number> => ({
   chief_tool: 0,
   rename_agent: 0,
   set_agent_activity: 0,
+  set_agent_landed: 0,
   set_agent_goal: 0,
   set_agent_goal_met: 0,
   set_agent_escalation: 0,
