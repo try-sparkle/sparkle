@@ -638,6 +638,37 @@ describe("evidence — commits pushed since the last review", () => {
     expect(second.evidence[0]?.detail).toContain("4d3030a");
   });
 
+  /**
+   * THE DETAIL MUST NOT NAME A REVIEWER. Both inputs it is built from (`reviewStale`,
+   * `reviewedHead`) come from `probe-gate.sh --json`, whose `coverage_of` counts a
+   * `<!-- sparkle-reviewer:auto-post -->` review identically to a knightwatch one — so this string
+   * is emitted for reviews `scripts/pr-review.sh` produced, and naming knightwatch attributed them
+   * to a bot that never touched the PR.
+   *
+   * This is asserted because the SAME misattribution existed in THREE emitters and a change that
+   * fixed two of them missed this one (roborev 67322). A copy-only fix with nothing pinning it is
+   * exactly what comes back; both branches are covered because the stale branch and the
+   * moved-head branch are separate strings and only one is exercised by the test above.
+   */
+  it("names no reviewer — the same string covers knightwatch and Sparkle reviews alike", () => {
+    const movedHead = babysitEvidenceFor(uncovered(HEAD_NEW, HEAD_OLD.slice(0, 7)));
+    const stale = babysitEvidenceFor(
+      snapshot({ headSha: HEAD_NEW, gate: gate([], { reviewedHead: HEAD_NEW.slice(0, 7), reviewStale: true }) }),
+    );
+
+    for (const [label, evidence] of [
+      ["moved head", movedHead],
+      ["self-labelled stale", stale],
+    ] as const) {
+      const detail = evidence.find((e) => e.kind === "commits-pushed-since-last-review")?.detail;
+      expect(detail, `${label}: this branch must produce the evidence at all`).toBeTruthy();
+      expect(detail, `${label}: must not attribute the review to a specific bot`).not.toMatch(
+        /knightwatch|srosro|sparkle-reviewer/i,
+      );
+      expect(detail, `${label}: still says the head is unreviewed`).toContain("unreviewed");
+    }
+  });
+
   it("a 7-char abbreviation covering the 40-char head is not evidence", () => {
     expect(babysitEvidenceFor(covered(HEAD_NEW))).toEqual([]);
   });

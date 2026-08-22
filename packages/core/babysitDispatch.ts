@@ -375,9 +375,16 @@ export function babysitEvidenceFor(pr: BabysitPrSnapshot): BabysitEvidence[] {
         // count of commits would have been the wrong identity for the reason rule 3 names outright:
         // it drifts, so a persisting condition would look new forever and could never qualify.
         id: `unreviewed-head:${pr.headSha}`,
+        // THE REVIEWER IS NOT NAMED, and that is deliberate. These two facts come from
+        // `probe-gate.sh --json`, whose `coverage_of` counts a `<!-- sparkle-reviewer:auto-post -->`
+        // review identically to a knightwatch one — so this string is emitted for reviews produced
+        // by `scripts/pr-review.sh` too, and naming knightwatch attributed them to a bot that never
+        // touched the PR. This is the THIRD emitter of the same facts; the two gate implementations
+        // were neutralised in the same change and this one was missed by the grep that should have
+        // caught it (AGENTS.md § "User-facing copy is code" — bring every message along).
         detail: pr.gate.reviewStale
-          ? `knightwatch self-labelled its newest review stale — head ${pr.headSha.slice(0, 7)} is unreviewed.`
-          : `The newest knightwatch review read ${reviewedHead}; head is now ${pr.headSha.slice(0, 7)} and unreviewed.`,
+          ? `The newest review self-labelled stale — head ${pr.headSha.slice(0, 7)} is unreviewed.`
+          : `The newest review read ${reviewedHead}; head is now ${pr.headSha.slice(0, 7)} and unreviewed.`,
       });
     }
   }
