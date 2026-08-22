@@ -77,6 +77,7 @@ import { searchHistory } from "../history";
 import { pickerParseDiagnosis, type PickerBlindness } from "../suggestions/heuristics";
 import { SNAPSHOT_MAX_LINES, getAgentScrollback } from "../terminalScrollback";
 import {
+  agentConfigDir,
   agentSessionIds,
   agentTranscriptPath,
   agentTranscriptWorktree,
@@ -749,9 +750,17 @@ async function resolveWorktreeTranscript(agentId: string): Promise<string | null
   // `[...sessionIds]`, matching the page and tail call sites in `services/agentTranscript`: the
   // registry hands out a FROZEN array (its identity has to be stable for `useSyncExternalStore`), and
   // all three readers of that binding send a copy across the boundary rather than the shared object.
+  // AND WHICH ACCOUNT'S `projects/` ROOT TO SCAN — writer (4). Sparkle spawns each agent's `claude`
+  // with a per-account `CLAUDE_CONFIG_DIR`, so the transcript lives under
+  // `<accountConfigDir>/projects/<slug>/`. Omitting it sent Rust to `$HOME/.claude/projects/<slug>`,
+  // which for an account-spawned agent does not exist — so this returned null and tier (d) reported
+  // "none of its sessions has been written into its worktree yet" about an agent that was writing at
+  // that moment. `undefined` here is NOT writer (3)'s fail-closed UNKNOWN: pass `null` and let Rust
+  // fall back to `$HOME/.claude`, which is right for an agent with no account override.
   return (
     (await invoke<string | null>("agent_own_session_path", {
       worktreePath,
+      configDir: agentConfigDir(agentId) ?? null,
       sessionIds: [...sessionIds],
     })) ?? null
   );

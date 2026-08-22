@@ -1396,6 +1396,9 @@ pub fn run() {
             // `claude::claude_latest_session_path`, which is the unfiltered LEARN seam — see
             // `agent_own_session_path`'s doc for why they are two commands and not one with a mode.
             transcript::agent_own_session_path,
+            // Resolution only — where an agent's hook log lives, so the mounted pane can
+            // recover a session binding without reconstructing an app-data path itself.
+            hooks::agent_event_log_path,
             spend::spend_report,
             builder_index::builder_index_status,
             builder_index::builder_index_set_identity,

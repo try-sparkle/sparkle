@@ -1,7 +1,7 @@
 // apps/desktop/src/components/AgentPane.test.ts
 // Unit tests for pure helpers extracted from AgentPane — kept thin and dependency-free
 // so they can run in the node env without mocking any Tauri/React machinery.
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
 // `noteTranscriptFromHook` writes into the concierge terminal module's registry. Mocked so the
 // write is directly observable — the property under test is that the path is HANDED OVER, which is
@@ -16,6 +16,11 @@ import {
   noteAgentSessionId,
   noteAgentTranscriptPath,
 } from "../services/conciergeTools/terminal";
+// The REAL leaf registry for writer (4) — see that describe block for why it is not mocked.
+import {
+  agentConfigDir,
+  forgetAgentTranscriptPath,
+} from "../services/agentTranscriptRegistry";
 import type { HookEvent } from "../engine/hookEvents";
 
 describe("buildShellSpawnArgs — injection-safety invariant", () => {
@@ -141,5 +146,76 @@ describe("noteTranscriptFromHook — binding the agent to its Claude sessions", 
       ["ag-1", "abc-123"],
       ["ag-1", "abc-123"],
     ]);
+  });
+});
+
+// ══ THE THIRD HAND-OFF: WHICH ACCOUNT'S DIRECTORY THE CONVERSATION IS IN ═══════════════════════
+//
+// Knowing WHOSE conversation it is does not help if every read scans the wrong account's tree.
+// Sparkle spawns each agent's `claude` with a per-account `CLAUDE_CONFIG_DIR`, so Claude writes
+// `<accountConfigDir>/projects/<slug>/<session>.jsonl` — and every read looked in
+// `$HOME/.claude/projects/<slug>`, which for such an agent does not exist. Measured on the founder's
+// machine: 42 of 52 live worktrees with a transcript on disk read EMPTY, his failing agent 0 → 480
+// records. That is the "No conversation with <name> yet." over a live terminal he reported.
+//
+// THE REGISTRY IS NOT MOCKED HERE, unlike the two writers above. `agentTranscriptRegistry` is a leaf
+// with no imports of its own, so using it for real costs nothing — and it lets these rows assert
+// what a READER would get back rather than that a function was called, which is the difference
+// between testing the hand-off and testing the spelling of it.
+describe("noteTranscriptFromHook — binding the agent to its ACCOUNT config dir", () => {
+  const ACCOUNT = "/home/u/Library/Application Support/ai.sparkle.desktop/accounts/c7c0d098";
+  beforeEach(() => {
+    vi.clearAllMocks();
+    forgetAgentTranscriptPath("ag-1");
+  });
+  afterEach(() => forgetAgentTranscriptPath("ag-1"));
+
+  // EVERY EVENT, NOT JUST Stop — and this is the row that pins it. `Stop` fires when a turn ENDS, so
+  // harvesting only there leaves an agent mounted mid-turn reading the wrong account for minutes,
+  // exactly the reason the session-id write was already moved off that gate. Every hook payload
+  // carries `transcript_path`, and SessionStart fires at spawn.
+  it("harvests the account from a NON-Stop event's transcript path", () => {
+    noteTranscriptFromHook("ag-1", {
+      event: "SessionStart",
+      session_id: "sess-1",
+      transcriptPath: `${ACCOUNT}/projects/-home-u-wt-ag-1/sess-1.jsonl`,
+    } as HookEvent);
+    expect(agentConfigDir("ag-1")).toBe(ACCOUNT);
+  });
+
+  it("harvests it from a mid-turn tool event too", () => {
+    noteTranscriptFromHook("ag-1", {
+      event: "PreToolUse",
+      session_id: "sess-1",
+      tool: "Bash",
+      transcriptPath: `${ACCOUNT}/projects/-home-u-wt-ag-1/sess-1.jsonl`,
+    } as HookEvent);
+    expect(agentConfigDir("ag-1")).toBe(ACCOUNT);
+  });
+
+  // FAILS CLOSED, and in the safe direction: `undefined` leaves the reader on `$HOME/.claude`, which
+  // is today's behaviour and correct for a default-config agent. A FABRICATED directory would turn a
+  // working pane into an empty one, so a path that is not a Claude session layout binds nothing.
+  it("records nothing for an event with no path, or a path that is not a session file", () => {
+    for (const ev of [
+      { event: "SessionStart", session_id: "sess-1" },
+      { event: "Stop", transcriptPath: "" },
+      { event: "Notification", transcriptPath: "/var/log/claude.log" },
+      { event: "PostToolUse", transcriptPath: `${ACCOUNT}/sessions/slug/sess-1.jsonl` },
+    ] as HookEvent[]) {
+      noteTranscriptFromHook("ag-1", ev);
+    }
+    expect(agentConfigDir("ag-1")).toBeUndefined();
+  });
+
+  // The default-config agent, whose transcript really is under `~/.claude`. Recorded as itself
+  // rather than left unknown, so a later resume onto an ACCOUNT is a visible change rather than a
+  // first sighting.
+  it("records the default root for a `~/.claude` transcript", () => {
+    noteTranscriptFromHook("ag-1", {
+      event: "Stop",
+      transcriptPath: "/home/u/.claude/projects/-home-u-wt-ag-1/sess-1.jsonl",
+    } as HookEvent);
+    expect(agentConfigDir("ag-1")).toBe("/home/u/.claude");
   });
 });

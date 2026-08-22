@@ -92,6 +92,9 @@ import {
   type AgentTerminalRead,
   type ReadAgentTerminalOptions,
 } from "./terminal";
+// Writer (4) from the LEAF registry, not through the re-export above: `conciergeTools/terminal` only
+// READS a config dir, and that block's own rule is "only the names that have an importer here".
+import { noteAgentConfigDir } from "../agentTranscriptRegistry";
 
 const AGENT = "ag-1";
 const scrollbackMock = vi.mocked(getAgentScrollback);
@@ -512,9 +515,54 @@ describe("readAgentTerminal — tier (d), the session transcript", () => {
     });
     // And the resolve was CONSTRAINED — an unbound resolve is the defect even when it happens to
     // land on the right file, because which file it lands on is not something the caller controls.
+    // …and it named the ACCOUNT it should look in. `null` is the honest answer for an agent with no
+    // account override — Rust falls back to `$HOME/.claude`, which is this agent's real location —
+    // and asserting it explicitly is what keeps the payload's shape pinned rather than just its two
+    // interesting fields. The row below is the same call for an ACCOUNT-spawned agent.
     expect(invokeMock).toHaveBeenCalledWith("agent_own_session_path", {
       worktreePath: "/wt/ag-1",
+      configDir: null,
       sessionIds: ["mine-1111", "mine-2222"],
+    });
+  });
+
+  // ══ WRITER (4): AND IT LOOKS IN THE RIGHT ACCOUNT'S `projects/` ROOT ═══════════════════════════
+  //
+  // Sparkle spawns each agent's `claude` with a per-account `CLAUDE_CONFIG_DIR`, so its transcript
+  // lives under `<accountConfigDir>/projects/<slug>/`. This resolve omitted it, so Rust looked in
+  // `$HOME/.claude/projects/<slug>` — a directory that does not exist for an account-spawned agent —
+  // and tier (d) reported "none of its sessions has been written into its worktree yet" about an
+  // agent that was writing at that moment. Measured on the founder's machine: 42 of 52 live
+  // worktrees with a transcript on disk were unreadable this way.
+  //
+  // The stub answers ONLY for the account root, so this row can tell "the config dir reached the
+  // command" from "the command ignored it" — a permissive stub could not.
+  it("resolves through the agent's ACCOUNT config dir when one is registered", async () => {
+    const ACCOUNT = "/home/u/Library/Application Support/ai.sparkle.desktop/accounts/c7c0d098";
+    noteAgentTranscriptWorktree(AGENT, "/wt/ag-1");
+    noteAgentSessionId(AGENT, "mine-1111");
+    noteAgentConfigDir(AGENT, ACCOUNT);
+    invokeMock.mockImplementation((cmd: string, args?: unknown) => {
+      if (cmd === "agent_own_session_path") {
+        const dir = (args as { configDir?: string | null }).configDir ?? null;
+        return Promise.resolve(dir === ACCOUNT ? `${ACCOUNT}/projects/-wt-ag-1/mine-1111.jsonl` : null);
+      }
+      if (cmd === "read_transcript_last_assistant") return Promise.resolve("FROM THE ACCOUNT TREE");
+      if (cmd === "claude_latest_session_path") {
+        throw new Error("tier (d) must not resolve through the UNFILTERED command");
+      }
+      return Promise.resolve("");
+    });
+
+    const r = await readAgentTerminal(AGENT);
+
+    // THE SIDE EFFECT — the tier produced this agent's words, out of the account's own tree.
+    expect(r.source).toBe("transcript");
+    expect(r.text).toContain("FROM THE ACCOUNT TREE");
+    expect(invokeMock).toHaveBeenCalledWith("agent_own_session_path", {
+      worktreePath: "/wt/ag-1",
+      configDir: ACCOUNT,
+      sessionIds: ["mine-1111"],
     });
   });
 

@@ -61,6 +61,22 @@ function PagingHarness({ agentId, worktree }: { agentId: string; worktree: strin
 /** Agent ids these tests mount. Their session bindings are seeded/cleared per case below. */
 const AGENTS = ["a1", "a2"];
 
+
+/** The fail-closed property, stated precisely: NO TRANSCRIPT READ went out.
+ *
+ *  It used to be spelled `expect(invoke).not.toHaveBeenCalled()`, which was true only while the hook
+ *  made no other calls at all. It now probes an unbound agent's own hook log to try to RECOVER a
+ *  binding (`services/sessionBindingRecovery`), so the blanket form would fail on a call that is the
+ *  fix working. What must stay true is narrower and is the thing the gate is actually for: while the
+ *  binding is unknown, nothing reads or tails a transcript, because there is no file we may honestly
+ *  attribute to this agent. */
+function expectNoTranscriptRead(): void {
+  const reads = invoke.mock.calls.filter(([cmd]) =>
+    cmd === "agent_transcript_page" || cmd === "agent_transcript_tail",
+  );
+  expect(reads).toEqual([]);
+}
+
 beforeEach(() => {
   vi.useFakeTimers();
   invoke.mockReset();
@@ -97,7 +113,7 @@ describe("useAgentTranscript", () => {
   it("does nothing at all when nothing is mounted — no reads, no timer", async () => {
     render(<Harness agentId={null} worktree={null} />);
     await flush();
-    expect(invoke).not.toHaveBeenCalled();
+    expectNoTranscriptRead();
   });
 
   it("loads the first page and records where the live tail starts", async () => {
@@ -270,7 +286,7 @@ describe("useAgentTranscript — the session binding", () => {
       await Promise.resolve();
     });
 
-    expect(invoke).not.toHaveBeenCalled();
+    expectNoTranscriptRead();
     expect(entriesOf("a1")).toEqual([]);
     // And not stuck on a spinner: an unknown binding is a settled empty state, not a pending read.
     expect(useMountedThreadStore.getState().threads["a1"]?.loading).toBe(false);
@@ -340,7 +356,7 @@ describe("useAgentTranscript — the session binding", () => {
     act(() => reader!.pageBack());
     await flush();
 
-    expect(invoke).not.toHaveBeenCalled();
+    expectNoTranscriptRead();
     expect(entriesOf("a1")).toEqual([]);
   });
 
@@ -351,7 +367,7 @@ describe("useAgentTranscript — the session binding", () => {
     forgetAgentTranscriptPath("a1");
     render(<Harness agentId="a1" worktree="/wt/a1" />);
     await flush();
-    expect(invoke).not.toHaveBeenCalled();
+    expectNoTranscriptRead();
 
     invoke.mockResolvedValue(page([human("h1", "at last", "2026-07-30T10:00:00.000Z")]));
     await act(async () => {

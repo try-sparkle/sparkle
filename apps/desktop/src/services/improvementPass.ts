@@ -897,7 +897,16 @@ export async function runImprovementPass(
     // precisely because of where this line sits: the pass has not spawned yet, and it spawns with no
     // `--resume`, so the newest transcript right now is the PREVIOUS pass's. Tier (d) picks the file
     // when it reads (roborev 55363).
-    registerSparkleTranscript(SPARKLE_AGENT_ID, wt.path);
+    //
+    // AND IT CARRIES THE ACCOUNT CONFIG DIR. This pass spawns `claude` with a per-account
+    // `CLAUDE_CONFIG_DIR`, so its transcript is written under `<accountConfigDir>/projects/<slug>/`
+    // and NOT under `$HOME/.claude/projects/<slug>/`. Registering the worktree without it left both
+    // readers — the concierge's tier (d) and the mounted pane — scanning a directory that does not
+    // exist for this agent, i.e. an empty answer for a pass that was writing at that moment. This
+    // agent has no `AgentPane`, so there is no hook stream to supply it later; the registration is
+    // the only writer it will ever get.
+    const configDir = (await accountConfigDirFor(SPARKLE_AGENT_ID)) ?? null;
+    registerSparkleTranscript(SPARKLE_AGENT_ID, wt.path, configDir);
     // THE REFUSAL TEXT IS RETRACTED THE MOMENT IT STOPS BEING TRUE. Nothing else clears it, and it
     // is not merely cosmetic residue: `attentionScreen` is tier (b) of `readAgentTerminal`, so a
     // stale "can't start a pass — push that branch" would be handed to the concierge as this agent's
@@ -941,7 +950,10 @@ export async function runImprovementPass(
     // `chooseAccountForAgent`, and a rule implemented here would leave that half on a different
     // one — two spawns into one shared worktree, disagreeing. So `?? null` is the whole of it, and
     // `undefined` here now means only "no account has ever resolved for this key".
-    const configDir = (await accountConfigDirFor(SPARKLE_AGENT_ID)) ?? null;
+    //
+    // RESOLVED ABOVE `registerSparkleTranscript`, not here, so the registration can CARRY it — see
+    // that call. Still one resolution, still at the pass boundary, still untouched for the life of
+    // the pass; only its line moved.
 
     // `working` was already claimed at the top of the work (right after the Claude-installed check),
     // so the row has been green through the clone/worktree/park/probe preamble — see that call.

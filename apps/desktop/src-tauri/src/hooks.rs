@@ -1726,6 +1726,29 @@ pub fn event_log_path(app: &AppHandle, worktree: &str) -> Result<PathBuf, String
         .join(format!("{}.jsonl", log_key(worktree))))
 }
 
+/// Where an agent's hook-event log LIVES — resolution only, no side effects, no IO.
+///
+/// The renderer needs this to recover a mounted agent's session binding from its own log
+/// (`services/sessionBindingRecovery`), and it must not build the path itself: the app data dir is
+/// `dev_identity::app_data_dir`, which appends a per-checkout `-dev` suffix on debug builds, so a
+/// frontend-reconstructed path is wrong on exactly one build flavour. `services/fleetWatch` already
+/// declines to reconstruct it for that reason; this is the read-only way to ask.
+///
+/// DELIBERATELY NOT `install_agent_hooks`, which also returns a log path: that one WRITES an
+/// executable hook config into the worktree, so using it as a lookup would make a read path install
+/// hooks as a side effect. This resolves and returns; it does not create the file, and a log that
+/// does not exist yet is not an error — `read_events_since` reports an empty batch for it.
+///
+/// Unconfined on purpose, and safe because it is pure string math on a path the caller already has:
+/// it opens nothing. The confinement that matters is on `read_events_since`, which refuses any path
+/// outside `<app_data>/hook-events` regardless of what this returned.
+#[tauri::command]
+pub async fn agent_event_log_path(app: AppHandle, worktree_path: String) -> Option<String> {
+    event_log_path(&app, &worktree_path)
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned())
+}
+
 /// Confine a frontend-supplied worktree path to the app's managed worktrees dir before we write
 /// an executable hook config into it. `install_agent_hooks` writes `.claude/settings.local.json`,
 /// which Claude Code runs hook *commands* from — so an unconfined path is a write-anywhere →

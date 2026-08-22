@@ -55,6 +55,14 @@ import { chooseAccountForAgent, loadAccountState } from "../services/accountSele
 import { readWorkerResult } from "../pty";
 import { judgeNeedsFollowup } from "../services/turnFollowup";
 import { noteAgentSessionId, noteAgentTranscriptPath } from "../services/conciergeTools/terminal";
+// THE LEAF REGISTRY DIRECTLY for writer (4), rather than widening the re-export above. That block's
+// own rule is "only the names that have an importer here", and nothing in `conciergeTools/terminal`
+// writes a config dir — it only reads one. A re-export is a promise to other modules; there is no
+// other module.
+import {
+  configDirFromTranscriptPath,
+  noteAgentConfigDir,
+} from "../services/agentTranscriptRegistry";
 import { invoke } from "@tauri-apps/api/core";
 import { HookStatusEngine, createHookEventHandler, type HookEvent } from "../engine/hookEvents";
 import { createStatusRouter, type StatusRouter } from "../engine/statusRouter";
@@ -179,6 +187,28 @@ export function noteTranscriptFromHook(agentId: string, ev: HookEvent): void {
   // `noteAgentSessionId` accumulates and no-ops on an id it already holds, so the per-event call is a
   // Set membership test, not a write.
   if (ev.session_id) noteAgentSessionId(agentId, ev.session_id);
+
+  // WHICH ACCOUNT'S CONFIG DIR THIS AGENT WRITES UNDER — writer (4), and also from EVERY event.
+  //
+  // Sparkle spawns each agent's `claude` with a per-account `CLAUDE_CONFIG_DIR`, so the transcript
+  // lives under `<accountConfigDir>/projects/<slug>/`, NOT `$HOME/.claude/projects/<slug>/`. Every
+  // read omitted it, Rust fell back to `$HOME/.claude`, that directory does not exist for an
+  // account-spawned agent, and the mounted pane rendered "No conversation with <name> yet." over a
+  // transcript being written at that moment. Measured on the founder's machine: 42 of 52 live
+  // worktrees with a transcript on disk read EMPTY that way.
+  //
+  // ABOVE THE `Stop` GATE, for the same reason the session-id write was moved above it: `Stop` fires
+  // at turn END, so an agent mounted mid-turn would read the wrong account's directory for minutes
+  // with the answer sitting in the log. Every hook payload carries `transcript_path`, and
+  // SessionStart fires at spawn.
+  //
+  // DERIVED FROM THE PATH, not from the account chooser. `configDirFromTranscriptPath` is pure and
+  // fails closed: it only answers for a real `<configDir>/projects/<slug>/<session>.jsonl` layout, so
+  // an unexpected shape leaves the reader on `$HOME/.claude` — today's behaviour — rather than
+  // pointing it at a fabricated directory. Re-asking the CHOOSER would be worse than useless here:
+  // it can rotate accounts and name one this agent never spawned under.
+  const fromHook = configDirFromTranscriptPath(ev.transcriptPath);
+  if (fromHook) noteAgentConfigDir(agentId, fromHook);
 
   if (ev.event !== "Stop") return;
   const path = ev.transcriptPath?.trim();
@@ -771,6 +801,13 @@ function AgentPaneInner({
       // agents have to move. Not derivable from the pin map — most agents auto-pick and have no pin.
       if (chosen) registerPaneAccount(agent.id, chosen.id);
       const configDir = chosen?.configDir;
+      // WRITER (4), AT THE SPAWN — so the binding PREDATES the first hook event rather than waiting
+      // for it. The hook-driven write in `noteTranscriptFromHook` is the durable one (it survives a
+      // resume that lands on a different account), but it cannot land before Claude has emitted
+      // anything, and a pane mounted in that window would read the wrong account's directory. This
+      // is the account this very PTY is about to be spawned under, so it is not a guess.
+      // `noteAgentConfigDir` ignores an empty/undefined value, which is exactly the no-accounts case.
+      noteAgentConfigDir(agent.id, configDir);
       // Pre-seed Claude Code's folder-TRUST acceptance for this worktree into the account that will
       // run it, BEFORE the spawn — otherwise `claude --dangerously-skip-permissions` still stops on
       // the "Is this a project you trust?" dialog (trust is a separate gate the skip-permissions flag

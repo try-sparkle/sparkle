@@ -31,8 +31,21 @@
 //     the other side. The app-owned agent is the one case where no better source exists and the
 //     worktree was cut by the app for that agent alone; see services/sparkleTranscript's safety
 //     block for the residual race it inherits.
-import { useEffect } from "react";
+//
+//   • IT CARRIES THE ACCOUNT CONFIG DIR, because the resolve it performs is a directory scan and the
+//     directory is per-account. `claude_latest_session_path` takes a `configDir` and this hook
+//     dropped it, so the scan ran under `$HOME/.claude/projects/<slug>` — a path that does not exist
+//     for an agent spawned with a per-account `CLAUDE_CONFIG_DIR`. The resolve then found nothing,
+//     bound nothing, and the pane stayed in its fail-closed empty state for an agent whose
+//     transcript was on disk the whole time. Read from the registry (writer 4) rather than taken as
+//     an argument, for the reason `useAgentTranscript` spells out at length: a parameter no caller
+//     supplies is a seam that reads as wired and is not.
+import { useEffect, useSyncExternalStore } from "react";
 
+import {
+  agentConfigDir,
+  subscribeAgentConfigDirs,
+} from "../services/agentTranscriptRegistry";
 import { isSparkleAgentId } from "../services/sparkleAgent";
 import { bindWorktreeSession } from "../services/sparkleTranscript";
 
@@ -49,9 +62,14 @@ export function useSparkleSessionBinding(
   agentId: string | null,
   worktreePath: string | null,
 ): void {
+  // SUBSCRIBED rather than read once, so a binding that lands after the mount re-runs the resolve
+  // under the right account instead of leaving the pane on a scan that already came back empty.
+  const configDir = useSyncExternalStore(subscribeAgentConfigDirs, () =>
+    agentId ? (agentConfigDir(agentId) ?? null) : null,
+  );
   useEffect(() => {
     if (!agentId || !worktreePath) return;
     if (!isSparkleAgentId(agentId)) return;
-    void bindWorktreeSession(agentId, worktreePath);
-  }, [agentId, worktreePath]);
+    void bindWorktreeSession(agentId, worktreePath, configDir);
+  }, [agentId, worktreePath, configDir]);
 }

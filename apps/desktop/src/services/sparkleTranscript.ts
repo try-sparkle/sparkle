@@ -85,6 +85,7 @@ import { invoke } from "@tauri-apps/api/core";
 // module is now imported by a mount path (ConciergeHost) — see the registry's own header for the
 // 16-file collection failure that edge caused the last time a writer dragged that graph along.
 import {
+  noteAgentConfigDir,
   noteAgentSessionId,
   noteAgentTranscriptWorktree,
 } from "./agentTranscriptRegistry";
@@ -109,6 +110,13 @@ export function registerSparkleTranscript(
   configDir?: string | null,
 ): void {
   noteAgentTranscriptWorktree(agentId, worktreePath);
+  // WRITER (4) — RECORDED, not merely forwarded. `bindWorktreeSession` uses the config dir for its
+  // own one-shot resolve and then it is gone, but the mounted pane's page and tail reads need it on
+  // every read for the life of the mount, and they get it from the registry. This agent has no
+  // `AgentPane` and therefore no hook events (see this module's header), so if the registration does
+  // not record it, nothing else ever will: its pane would resolve a session id correctly and then
+  // read for it in `$HOME/.claude`, where the file is not.
+  noteAgentConfigDir(agentId, configDir);
   void bindWorktreeSession(agentId, worktreePath, configDir);
 }
 
