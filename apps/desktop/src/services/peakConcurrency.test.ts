@@ -529,3 +529,112 @@ describe("each watchdog report is folded at most once", () => {
     expect(currentAgentRss()).toHaveLength(1);
   });
 });
+
+// ── ROBOREV FINDINGS (job 67780) ────────────────────────────────────────────────────────────────
+describe("the fold-once guard survives OVERLAPPING ticks", () => {
+  // recordPeakConcurrency is void-ed from a 5s setInterval with no in-flight guard. Every earlier
+  // test awaited each call before the next, so two samples were never in flight together and the
+  // race was structurally invisible — the tests could not have caught it.
+  it("a second tick starting before the first resolves sends NO agentRss", async () => {
+    resetPeakConcurrency();
+    seedWatchdog([verdict({ agent_id: "a", rss_bytes: 1_000_000_000, proc_count: 2 })]);
+
+    let release: ((v: unknown) => void) | undefined;
+    invoke.mockImplementationOnce(() => new Promise((r) => { release = r; }));
+    invoke.mockResolvedValueOnce(FIXTURE);
+
+    const first = recordPeakConcurrency();   // in flight, holding seq
+    const second = recordPeakConcurrency();  // fires while the first is outstanding
+    release?.(FIXTURE);
+    await Promise.all([first, second]);
+
+    expect(invoke.mock.calls[0]?.[1]?.sample.agentRss).toHaveLength(1);
+    // Without a send-time reservation this re-sent the SAME verdicts and Rust folded one snapshot
+    // twice into a permanent, never-lowered distribution.
+    expect(invoke.mock.calls[1]?.[1]?.sample.agentRss).toEqual([]);
+  });
+
+  it("an out-of-order resolution cannot move the marker BACKWARDS", async () => {
+    resetPeakConcurrency();
+    // TWO DISTINCT reports in flight at once, with the LATER one resolving FIRST. Awaiting each
+    // call in turn (as the first draft of this test did) can never produce that interleaving, so it
+    // proved nothing about ordering — the failure this guards is specifically a late resolution
+    // committing an OLDER seq last.
+    seedWatchdog([verdict({ agent_id: "a", rss_bytes: 1_000_000_000, proc_count: 2 })]);
+    let releaseOld: ((v: unknown) => void) | undefined;
+    invoke.mockImplementationOnce(() => new Promise((r) => { releaseOld = r; }));
+    const older = recordPeakConcurrency();          // holds seq N, unresolved
+
+    seedWatchdog([verdict({ agent_id: "a", rss_bytes: 1_100_000_000, proc_count: 2 })]);
+    invoke.mockResolvedValueOnce(FIXTURE);
+    await recordPeakConcurrency();                  // seq N+1, resolves FIRST -> commits N+1
+
+    releaseOld?.(FIXTURE);                          // the OLDER fold lands last
+    await older;
+
+    // A bare assignment would now have the marker back at N, re-admitting the N+1 report.
+    expect(currentAgentRss()).toEqual([]);
+  });
+
+  it("a DEFLECTED tick cannot clear the reservation held by a still-in-flight tick", async () => {
+    // The three-tick interleaving, which neither the two-tick race test nor the sequential ones can
+    // produce. Tick 1 reserves the reading and stays in flight. Tick 2 is DEFLECTED — its
+    // currentAgentRss() returns [] because the reading is spoken for — but `pendingWatchdogSeq`
+    // still holds tick 1's seq, so a deflected tick that compared against it would match and its
+    // `finally` would release a claim it never made. Tick 3 would then re-send the SAME verdicts
+    // and Rust would fold one snapshot twice.
+    resetPeakConcurrency();
+    seedWatchdog([verdict({ agent_id: "a", rss_bytes: 1_000_000_000, proc_count: 2 })]);
+
+    let releaseFirst: ((v: unknown) => void) | undefined;
+    invoke.mockImplementationOnce(() => new Promise((r) => { releaseFirst = r; }));
+    const first = recordPeakConcurrency();      // reserves, stays in flight
+
+    invoke.mockResolvedValueOnce(FIXTURE);
+    await recordPeakConcurrency();              // DEFLECTED, resolves first, must clear NOTHING
+
+    // Tick 3, while tick 1 is STILL in flight: the reading must remain spoken for.
+    expect(currentAgentRss()).toEqual([]);
+
+    releaseFirst?.(FIXTURE);
+    await first;
+    // And once it lands it is committed, not merely released.
+    expect(currentAgentRss()).toEqual([]);
+  });
+
+  it("a rejected invoke RELEASES the reservation rather than pinning the reading out", async () => {
+    resetPeakConcurrency();
+    seedWatchdog([verdict({ agent_id: "a", rss_bytes: 1_000_000_000, proc_count: 2 })]);
+    invoke.mockRejectedValueOnce(new Error("command not found"));
+    await recordPeakConcurrency();
+    // Still eligible: the fold never reached Rust, so it must not be marked consumed OR left
+    // reserved forever.
+    expect(currentAgentRss()).toHaveLength(1);
+  });
+});
+
+describe("hourlySpanHours never publishes NaN", () => {
+  // isRecord checks Array.isArray(hourly) and nothing about the ELEMENTS, so a renamed or
+  // partially-serialized entry used to reach the arithmetic and yield NaN — which serializes to
+  // null over JSON, in the one temporal figure the concierge quotes beside the peak.
+  it("an hourly entry missing hour_start_ms yields 0, not NaN", async () => {
+    resetPeakConcurrency();
+    invoke.mockResolvedValueOnce({
+      ...FIXTURE,
+      samples: 10,
+      hourly: [{ hourStartMs: 1787418000000 }, { hourStartMs: 1787421600000 }],
+    });
+    await recordPeakConcurrency();
+    const span = peakSummary().hourlySpanHours;
+    expect(Number.isNaN(span)).toBe(false);
+    expect(span).toBe(0);
+  });
+
+  it("a non-object hourly entry also yields 0", async () => {
+    resetPeakConcurrency();
+    invoke.mockResolvedValueOnce({ ...FIXTURE, samples: 10, hourly: [1787418000000, "x"] });
+    await recordPeakConcurrency();
+    expect(peakSummary().hourlySpanHours).toBe(0);
+  });
+});
+

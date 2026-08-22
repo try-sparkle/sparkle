@@ -202,7 +202,7 @@ export function currentAgentRss(): AgentRssIn[] {
   //
   // Returning `[]` is the contracted "no basis" path: Rust leaves the memory block byte-for-byte
   // unchanged. An unmeasured tick is not an empty machine.
-  if (seq === lastFoldedWatchdogSeq) return [];
+  if (seq === lastFoldedWatchdogSeq || seq === inFlightWatchdogSeq) return [];
   pendingWatchdogSeq = seq;
   return report.verdicts.map((v) => ({
     agentId: v.agent_id,
@@ -249,12 +249,25 @@ let cached: PeakRecord | null = null;
  */
 let lastFoldedWatchdogSeq = 0;
 let pendingWatchdogSeq = 0;
+/**
+ * The seq of a fold that has been SENT but not yet accepted. Reserved at send time, because
+ * `recordPeakConcurrency` is `void`-ed from a 5s interval with NO in-flight guard: tick 2 fires
+ * while tick 1 is still awaiting Rust, `lastFoldedWatchdogSeq` is still behind, and the SAME
+ * verdicts go out twice — one snapshot folded twice into a permanent, never-lowered distribution.
+ * The trigger is a slow round trip under memory pressure, which is the exact regime the fold-once
+ * guard exists for, so checking only the committed marker fails precisely when it matters.
+ *
+ * `0` means nothing is outstanding. Cleared rather than committed on rejection, so a failed invoke
+ * leaves the reading eligible next tick instead of silently dropping it.
+ */
+let inFlightWatchdogSeq = 0;
 
 /** Test seam — drop the cache, so one test's record can't leak into the next. */
 export function resetPeakConcurrency(): void {
   cached = null;
   lastFoldedWatchdogSeq = 0;
   pendingWatchdogSeq = 0;
+  inFlightWatchdogSeq = 0;
 }
 
 function isRecord(value: unknown): value is PeakRecord {
@@ -307,12 +320,31 @@ function isRecord(value: unknown): value is PeakRecord {
 export async function recordPeakConcurrency(): Promise<void> {
   try {
     const sample = buildConcurrencySample();
-    const foldingSeq = pendingWatchdogSeq;
-    const record = await invoke<PeakRecord>("record_agent_concurrency", { sample });
-    // Only now is the fold real. Advancing on SEND would lose a reading whenever the invoke
-    // rejected — and an older backend rejects on every single tick.
-    if (sample.agentRss.length > 0) lastFoldedWatchdogSeq = foldingSeq;
-    if (isRecord(record)) cached = record;
+    // ONLY the tick that actually carries observations owns a reservation.
+    //
+    // A DEFLECTED tick (one whose `currentAgentRss()` returned `[]` because the reading was already
+    // spoken for) must touch nothing: `pendingWatchdogSeq` still holds the OTHER tick's seq, so a
+    // deflected tick that compared against it would match, and its `finally` would clear a
+    // reservation it never made — releasing the still-in-flight tick's claim and re-opening exactly
+    // the double-fold window this guard exists to close.
+    const reserved = sample.agentRss.length > 0;
+    const foldingSeq = reserved ? pendingWatchdogSeq : 0;
+    // RESERVE before awaiting, so an overlapping tick sees this reading as already spoken for.
+    if (reserved) inFlightWatchdogSeq = foldingSeq;
+    try {
+      const record = await invoke<PeakRecord>("record_agent_concurrency", { sample });
+      // Only now is the fold real. `Math.max` because two invokes can resolve OUT OF ORDER, and a
+      // bare assignment would move the marker BACKWARDS and re-admit a report already folded.
+      if (reserved) {
+        lastFoldedWatchdogSeq = Math.max(lastFoldedWatchdogSeq, foldingSeq);
+      }
+      if (isRecord(record)) cached = record;
+    } finally {
+      // Release ONLY our own reservation — `reserved` gates this, so a deflected tick can never
+      // clear another tick's claim. Committed above on success, released on failure so the reading
+      // stays eligible; never left stale, which would pin a report out of the fold forever.
+      if (reserved && inFlightWatchdogSeq === foldingSeq) inFlightWatchdogSeq = 0;
+    }
   } catch {
     // See above: an older backend rejects every tick, and the cache must survive it.
   }
@@ -392,7 +424,15 @@ function hourlySpanHours(record: PeakRecord | null): number {
   // rather than asserting it away.
   const first = hours[0];
   const last = hours[hours.length - 1];
-  if (!first || !last) return 0;
+  // Validate the FIELD, not just the element. `isRecord` checks `Array.isArray(hourly)` and stops
+  // there, so a renamed or partially-serialized entry (`{hourStartMs: …}`, a number, a string)
+  // passes, is cached permanently, and yields NaN here — which serializes to `null` over JSON and
+  // becomes the one temporal figure the concierge quotes beside the peak. Same class as the guard
+  // this replaced; it had simply moved one level deeper.
+  // ONE load-bearing check, deliberately not belt-and-braces: a redundant `Number.isFinite` on the
+  // result would mask this one, so neither could be shown to matter and a mutation of either stays
+  // green. JSON cannot carry Infinity, so a non-number endpoint is the only way NaN arises here.
+  if (typeof first?.hour_start_ms !== "number" || typeof last?.hour_start_ms !== "number") return 0;
   return Math.floor((last.hour_start_ms - first.hour_start_ms) / 3_600_000) + 1;
 }
 
