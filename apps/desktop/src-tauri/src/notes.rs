@@ -1884,6 +1884,53 @@ mod tests {
         assert!(!msg.contains("do not retry blindly"), "read told not to retry: {msg}");
     }
 
+    /// A `StoreBusy` from the NEVER-SPAWNED producer (`queue_saturated`) is provably write-safe and
+    /// must keep its own retry-safe message — NOT get dressed up as an ambiguous write.
+    ///
+    /// This pins the second half of the bounded-bd fix's correctness argument (roborev 67729): a
+    /// permit-starvation error is `StoreBusy`/`exit_code: None`/`mutates: true`, and because it is
+    /// not `Timeout`, `describe_bd_failure` passes its message through verbatim. The guard this test
+    /// provides: adding a `StoreBusy` arm to `describe_bd_failure` that emits the ambiguous-write
+    /// copy — a plausible, locally-correct-looking edit, since a real store-lock LOSS on a mutation
+    /// *is* ambiguous — would re-attach "UNKNOWN … do not retry blindly" to a call that provably
+    /// never ran, exactly the defect this fix removed. That edit reds this test.
+    #[test]
+    fn a_never_spawned_store_busy_mutation_keeps_its_write_safe_message() {
+        // Derive the fixture from the REAL producer, not a hand-copied string, so this test and
+        // production fail TOGETHER if queue_saturated's wording drifts (roborev 67773/67774).
+        let saturated = crate::beads_cmd::queue_saturated(std::time::Duration::from_secs(30));
+        assert_eq!(saturated.kind, BeadsErrorKind::StoreBusy, "producer contract: kind");
+        assert!(saturated.exit_code.is_none(), "producer contract: never-spawned has no exit code");
+        // Grip on PRODUCTION's copy (not describe_bd_failure's echo of it): the write-safe phrases
+        // must actually be in what queue_saturated emits.
+        assert!(
+            saturated.message.contains("nothing was run and nothing was written"),
+            "producer must state it was write-safe: {}",
+            saturated.message
+        );
+        assert!(
+            saturated.message.contains("retrying in a moment is safe"),
+            "producer must state retry is safe: {}",
+            saturated.message
+        );
+        let msg = describe_bd_failure(&saturated, true);
+        // POSITIVE grip on the CONSUMER path (roborev 67795/67796): the write-safe remedy must
+        // survive describe_bd_failure's pass-through, not just exist on the producer. A future
+        // StoreBusy arm that REPLACES the message with copy dropping these phrases reds this.
+        assert!(
+            msg.contains("nothing was run and nothing was written"),
+            "describe_bd_failure must pass the write-safe copy through: {msg}"
+        );
+        assert!(
+            msg.contains("retrying in a moment is safe"),
+            "describe_bd_failure must pass the retry-safe remedy through: {msg}"
+        );
+        // The ambiguous-write copy must be ABSENT — a never-spawned call did not "maybe land".
+        assert!(!msg.contains("may or may not have been created"), "never-ran got write copy: {msg}");
+        assert!(!msg.contains("UNKNOWN"), "never-ran told outcome is unknown: {msg}");
+        assert!(!msg.contains("do not retry blindly"), "safe call told not to retry: {msg}");
+    }
+
     /// The two Timeout variants are DIFFERENT outcomes, and conflating them overstates the doubt.
     ///
     /// `exit_code: Some(_)` is the drain path — bd EXITED with a status we read, and only its output

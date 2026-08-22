@@ -208,11 +208,16 @@ export function isWriteDropped(e: unknown): boolean {
 /** True when the call lost a race for the store rather than being wrong — the failure whose remedy
  *  is to re-issue the SAME request in a moment.
  *
- *  Two kinds land here because they are one event seen from two sides: `timeout` is us giving up on
- *  a bd that was still waiting, `storeBusy` is bd giving up first and telling us so. The store is a
- *  single embedded database shared by every worktree, written by many agents at once and polled by
- *  this app every five seconds, so losing that race is the ORDINARY failure here — and it is the
- *  one that reads as a fault in the request when it is reported without a name. */
+ *  Kinds land here because they are one event seen from several sides: `timeout` is us giving up on a
+ *  bd that was still waiting; `storeBusy` is either bd giving up first (it ran and lost the store
+ *  lock) OR bd never starting because the concurrency permit queue stayed saturated. Those two
+ *  `storeBusy` halves differ in write-safety — the never-spawned half provably wrote nothing, while a
+ *  create that lost the lock may have committed — but the kind does not yet distinguish them
+ *  (sparkle-lncpoc will add a machine-readable marker). Treat `isStoreBusy` as "lost the race, not a
+ *  bad request"; do not infer write-safety from the kind alone for a non-idempotent create. The store
+ *  is a single embedded database shared by every worktree, written by many agents at once and polled
+ *  by this app every five seconds, so losing that race is the ORDINARY failure here — the one that
+ *  reads as a fault in the request when it is reported without a name. */
 export function isStoreBusy(e: unknown): boolean {
   const { kind } = toBeadsError(e);
   return kind === "timeout" || kind === "storeBusy";

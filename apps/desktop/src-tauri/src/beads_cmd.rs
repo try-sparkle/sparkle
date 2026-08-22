@@ -37,6 +37,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::io::Read;
 use std::process::{Command, Stdio};
+use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::notes::{bd_exec_path, cached_bd_path, valid_bead_id};
@@ -95,6 +96,33 @@ const BD_CONFIRM_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 /// detached (they finish when the grandchild does).
 const READER_DRAIN_GRACE: Duration = Duration::from_secs(5);
 
+/// Hard ceiling on bd/Dolt subprocesses running AT ONCE across the whole process.
+///
+/// THE ROOT CAUSE this bounds. The work graph is one single-writer embedded Dolt store shared by
+/// every worktree on the machine, and `beadsStore.ts` polls `bd list --all` + `bd blocked` every 5s
+/// per watched project. Each poll and every mutation funnels through `run_cmd_timed` (below), which
+/// had NO cap on how many bd children could be in flight. Under contention a cold `bd list` takes
+/// ~44.8s — longer than BD_TIMEOUT — so every call burns the full 30s doing nothing while the 5s
+/// poll launches yet more, a convoy that never drains and saturates the tokio blocking pool. Every
+/// UI action needs a blocking-pool thread (git, pty, worktree), so they queue behind the jam and the
+/// whole app goes unresponsive. This was a P0.
+///
+/// Capping concurrent bd children at a small N attacks the cause, not the symptom: fewer writers
+/// contend for the one Dolt lock, so each call finishes in a fraction of the 44.8s cold time, which
+/// turns the non-draining convoy into a queue that drains faster than the 5s poll refills it. 2 is
+/// deliberately small — the store is single-writer, so extra parallelism buys almost nothing and
+/// only deepens the contention this exists to relieve; a reader and a writer overlapping is the case
+/// worth keeping. It is a `const` so the one policy lives in one place.
+const BD_MAX_CONCURRENT: usize = 2;
+
+/// The minimum budget that must remain AFTER acquiring a permit for it to be worth spawning bd.
+///
+/// Comfortably above the 20ms subprocess poll tick and a plausible process spawn, so a child we do
+/// start has a real chance to finish. Below it, spawning only pays a cold Dolt open for a child that
+/// will be killed on the next tick — and mislabels a queue-dominated call as a wedged bd — so
+/// `run_cmd_until` returns the queue-saturation `StoreBusy` error without spawning instead.
+const MIN_RUN_BUDGET_AFTER_QUEUE: Duration = Duration::from_millis(100);
+
 // ── Typed errors ──────────────────────────────────────────────────────────────────────────────
 
 /// What KIND of failure this was, as a stable machine-readable tag.
@@ -116,10 +144,24 @@ pub enum BeadsErrorKind {
     BdFailed,
     /// bd exceeded BD_TIMEOUT and was killed.
     Timeout,
-    /// bd reached the store but could not complete against it — its own context was canceled, or
-    /// the embedded database refused the write because another writer holds it. Distinct from
-    /// `BdFailed` because the remedy is the opposite one: retry unchanged in a moment. Nothing
-    /// about the request was wrong, so re-issuing it is not "hoping a broken call works".
+    /// The call lost the race for the store, from either of TWO producers with DIFFERENT write-safety
+    /// (this is why the kind alone is not enough to pick a remedy). Distinct from `BdFailed` because
+    /// nothing about the request was wrong.
+    ///  1. `classify_bd_message`: bd RAN, reached the store, and could not complete — its context was
+    ///     canceled or the embedded DB refused the write because another writer holds it. Retry-safe
+    ///     for a READ or an idempotent update, but for a non-idempotent mutation (`bd create`) this is
+    ///     write-AMBIGUOUS — bd may have committed just before the lock was pulled, so a blind retry
+    ///     can file a SECOND item. Check the board before retrying a create.
+    ///  2. `queue_saturated`: bd was NEVER SPAWNED because the concurrency permit queue stayed
+    ///     saturated past the deadline. Unconditionally write-SAFE — nothing ran, nothing was
+    ///     written — so retry the same request as-is.
+    /// Only producer 2 is unconditionally retry-safe. Today both reach the user via `describe_bd_failure`'s
+    /// verbatim pass-through, so producer 1's write-ambiguity is NOT yet surfaced — a real gap tracked
+    /// as a follow-up (sparkle-lncpoc: a machine-distinguishable never-spawned marker so consumers like
+    /// `describe_bd_failure` and the frontend `createFailureVerdict` can tell the two apart). Until
+    /// then, do NOT collapse them into one remedy in either direction: keep the never-spawned half's
+    /// write-safe copy (guarded by a test in notes.rs), and do NOT tell a create that lost the lock to
+    /// retry blindly.
     StoreBusy,
     /// bd exited cleanly but its output was not the JSON we expect (version skew, partial write).
     BadOutput,
@@ -670,27 +712,181 @@ fn run_bd_timed(
     timeout: Duration,
     env: ChildEnv<'_>,
 ) -> Result<BdOutput, BeadsError> {
-    let bd = cached_bd_path().ok_or_else(|| {
+    run_cmd_timed(&resolve_bd()?, project_path, args, timeout, env)
+}
+
+/// Resolve the bd binary or a typed `BinaryNotFound`. Shared by `run_bd_timed` and the confirmation
+/// probe's `run_bd_unlimited` so the "install beads" wording lives in one place.
+fn resolve_bd() -> Result<String, BeadsError> {
+    cached_bd_path().ok_or_else(|| {
         BeadsError::new(
             BeadsErrorKind::BinaryNotFound,
             "bd not found — install beads (https://github.com/steveyegge/beads) or add `bd` to your PATH",
         )
-    })?;
-    run_cmd_timed(&bd, project_path, args, timeout, env)
+    })
 }
 
-/// The runner proper, with the program a parameter so the timeout behaviour is testable without
-/// needing a bd that hangs on demand.
+/// Run bd WITHOUT taking a store permit. ONLY for the post-create confirmation probe — see
+/// `bd_stdout_unlimited_within`. It resolves and runs the real bd binary exactly as `run_bd_timed`
+/// does, but passes `None` for the limiter so the probe never queues behind other bd traffic.
+fn run_bd_unlimited(
+    project_path: &str,
+    args: &[String],
+    timeout: Duration,
+    env: ChildEnv<'_>,
+) -> Result<BdOutput, BeadsError> {
+    run_cmd_until(None, &resolve_bd()?, project_path, args, timeout, env)
+}
+
+/// A sync counting semaphore bounding how many bd children run at once.
 ///
-/// The child is killed on timeout (std's `Child::kill`, so this stays portable — `libc` is
-/// unix-gated in Cargo.toml). Output is drained on threads so a child that fills a pipe buffer
-/// cannot deadlock against our own wait, and the wait on those threads is itself bounded — see
-/// READER_DRAIN_GRACE.
+/// std-only (a `Mutex<usize>` + `Condvar`) rather than tokio's `Semaphore` ON PURPOSE: `run_cmd_timed`
+/// is a synchronous function reached from EVERY bd caller (`notes.rs`'s 5s board poll and mutations,
+/// this module's commands, `bead_dup`), each already offloaded onto the blocking pool via
+/// `spawn_blocking`, and also driven directly by tests that stand up NO tokio runtime. A tokio
+/// `Semaphore::acquire().await` cannot be reached from this sync context, and `block_on` would panic
+/// in the test path where no runtime exists. A std primitive works identically in all three.
+///
+/// The `Mutex` is held ONLY for the counter bookkeeping in `acquire`/`release`, never across the
+/// subprocess — the permit (the decrement) is what spans the child; the lock is released the instant
+/// the count is adjusted. So nothing holds a std `Mutex` across the wait, and there is no `.await`
+/// here to hold one across in the first place.
+struct BdConcurrencyLimiter {
+    /// Permits still available. Guarded by its own `Mutex`; `Condvar` wakes a waiter on release.
+    available: Mutex<usize>,
+    ready: Condvar,
+}
+
+impl BdConcurrencyLimiter {
+    const fn new(permits: usize) -> Self {
+        Self { available: Mutex::new(permits), ready: Condvar::new() }
+    }
+
+    /// Wait for a permit until `deadline`, take it, and hand back an RAII guard that returns it on
+    /// drop — or `None` if no permit came free in time.
+    ///
+    /// The wait is BOUNDED on purpose. An unbounded wait would move the caller's hang from "the bd
+    /// subprocess never finishes" (which BD_TIMEOUT already catches) to "no permit ever frees",
+    /// defeating the very contract this module documents — a wedged store must surface as a typed
+    /// error, never a hung caller. `run_cmd_until` passes the SAME deadline it uses for the
+    /// subprocess, so a call's TOTAL wall clock (queue + run) stays inside the caller's `timeout`.
+    ///
+    /// `wait_timeout_while` re-checks the predicate across spurious wakeups; on return, a non-zero
+    /// count means a permit is ours to take, and a still-zero count means the deadline elapsed.
+    /// `unwrap_or_else(PoisonError::into_inner)` rather than `unwrap`: a bd call that panicked while
+    /// holding the brief bookkeeping lock must not wedge every future bd call behind a poisoned
+    /// mutex — the counter is a plain integer, so proceeding with it is safe.
+    fn acquire_by(&self, deadline: Instant) -> Option<BdPermit<'_>> {
+        let available = self.available.lock().unwrap_or_else(|e| e.into_inner());
+        let wait = deadline.saturating_duration_since(Instant::now());
+        let (mut available, _timed_out) = self
+            .ready
+            .wait_timeout_while(available, wait, |n| *n == 0)
+            .unwrap_or_else(|e| e.into_inner());
+        if *available == 0 {
+            return None;
+        }
+        *available -= 1;
+        Some(BdPermit { limiter: self })
+    }
+
+    fn release(&self) {
+        let mut available = self.available.lock().unwrap_or_else(|e| e.into_inner());
+        *available += 1;
+        // Drop the lock before signalling so the woken waiter does not immediately re-block on it.
+        drop(available);
+        self.ready.notify_one();
+    }
+}
+
+/// Held for the lifetime of one bd subprocess; releases its permit on drop, so EVERY return path out
+/// of `run_cmd_until` — success, timeout, spawn failure, an undrainable pipe — gives the permit back
+/// without a manual release at each `return`.
+struct BdPermit<'a> {
+    limiter: &'a BdConcurrencyLimiter,
+}
+
+impl Drop for BdPermit<'_> {
+    fn drop(&mut self) {
+        self.limiter.release();
+    }
+}
+
+/// The one process-wide limiter every bd child passes through. `Mutex::new`/`Condvar::new` are
+/// const, so this needs no `OnceLock` lazy init.
+///
+/// Production uses `BD_MAX_CONCURRENT`. The `cfg(test)` build raises it, because this crate's own
+/// suite runs many real-bd integration tests IN PARALLEL (`create_then_close_round_trips`, the fold
+/// tests, `notes.rs`'s round-trips), each holding a permit through a slow cold Dolt open — at a cap
+/// of 2 they would starve one another into spurious permit timeouts now that the wait is bounded.
+/// The cap ITSELF is proven independently, on a dedicated fresh `BdConcurrencyLimiter::new(
+/// BD_MAX_CONCURRENT)` in `run_cmd_until_never_runs_more_children_than_the_permit_allows`, so
+/// loosening the shared instance here costs no coverage of the bound.
+#[cfg(not(test))]
+static BD_LIMITER: BdConcurrencyLimiter = BdConcurrencyLimiter::new(BD_MAX_CONCURRENT);
+#[cfg(test)]
+static BD_LIMITER: BdConcurrencyLimiter = BdConcurrencyLimiter::new(64);
+
+/// Whether a child of `program` CONTENDS for the shared Dolt store — i.e. it is the bd binary
+/// `bd_path` resolved to — and so must take a permit. PURE, with the resolved bd path passed in.
+///
+/// Split out from `contends_for_store` precisely so BOTH branches are testable WITHOUT bd installed:
+/// CI has no bd, so a decision that reached `cached_bd_path()` directly could only ever assert the
+/// FALSE branch there, and a mutation flipping it to always-`false` — which silently restores the P0
+/// poll convoy — would stay green. That is the "defaulted seam" the repo contract warns about. With
+/// the bd path as a parameter, `should_bound_is_true_only_for_the_resolved_bd_binary` pins the true
+/// branch on every machine.
+///
+/// `run_cmd_timed` is deliberately program-agnostic and is the shared runner for children that are
+/// NOT bd — most importantly `bead_dup`'s `scripts/bead-dup-check.sh`, the filing-time dedupe
+/// scanner, which by `docs/bead-dedupe-contract.md` reads a cached TSV in ~1s and never touches the
+/// Dolt lock, PRECISELY so it can sit on the create hot path. Making it wait behind bd traffic for a
+/// permit it needs for nothing would add the very latency the cap exists to remove. When bd is not
+/// installed `bd_path` is `None`, so nothing is gated; correct, because with no bd there are no bd
+/// children to contend in the first place.
+fn should_bound(program: &str, bd_path: Option<&str>) -> bool {
+    bd_path == Some(program)
+}
+
+/// `should_bound` against the resolved bd binary — the exact string `run_bd_timed` and
+/// `notes::run_bd` pass, so every real bd call is gated while the scanner and tests' `/bin/sh` are
+/// not.
+fn contends_for_store(program: &str) -> bool {
+    should_bound(program, cached_bd_path().as_deref())
+}
+
+/// Whether enough of the caller's budget survived the permit wait to be worth spawning bd. Pure, so
+/// the floor is testable without racing a permit free exactly at a deadline.
+fn enough_budget_to_run(remaining: Duration) -> bool {
+    remaining >= MIN_RUN_BUDGET_AFTER_QUEUE
+}
+
+/// The typed error for "a permit never came free within budget". `StoreBusy`, deliberately NOT
+/// `Timeout`, and that KIND is load-bearing: `notes::describe_bd_failure` reads a `Timeout` with no
+/// exit code as the KILL path — "bd was still running, so whether the write landed is UNKNOWN; do not
+/// retry blindly." Here bd was NEVER SPAWNED, so nothing was written and the honest remedy is the
+/// opposite: retry, nothing ran. `StoreBusy` already means exactly that ("retry unchanged in a
+/// moment; nothing about the request was wrong"), and `describe_bd_failure` passes a non-`Timeout`
+/// message through verbatim, so the user is told the truth. One definition, shared by the "no permit
+/// at all" and "permit came too late to use" branches.
+pub(crate) fn queue_saturated(timeout: Duration) -> BeadsError {
+    BeadsError::new(
+        BeadsErrorKind::StoreBusy,
+        format!(
+            "bd was not started within {}s — the bd concurrency limit stayed saturated (the store is contended), so nothing was run and nothing was written; retrying in a moment is safe",
+            timeout.as_secs()
+        ),
+    )
+}
+
+/// The runner every bd caller shares. Selects the store permit — the process-wide `BD_LIMITER` for
+/// bd children, none for anything else (see `contends_for_store`) — and delegates.
 ///
 /// `pub(crate)` so `notes::run_bd` delegates here rather than growing a SECOND timeout
-/// implementation. The subtleties above (drain threads, kill-on-expiry, the deliberate refusal to
-/// touch the readers on the timeout path) are the whole reason a second one would be wrong: each is
-/// a hang this already survives, and a re-implementation would have to rediscover all three.
+/// implementation. The subtleties in `run_cmd_until` (drain threads, kill-on-expiry, the deliberate
+/// refusal to touch the readers on the timeout path, the bounded permit wait) are the whole reason a
+/// second one would be wrong: each is a hang this already survives, and a re-implementation would
+/// have to rediscover all of them.
 pub(crate) fn run_cmd_timed(
     program: &str,
     project_path: &str,
@@ -698,7 +894,57 @@ pub(crate) fn run_cmd_timed(
     timeout: Duration,
     env: ChildEnv<'_>,
 ) -> Result<BdOutput, BeadsError> {
+    let limiter = if contends_for_store(program) { Some(&BD_LIMITER) } else { None };
+    run_cmd_until(limiter, program, project_path, args, timeout, env)
+}
+
+/// The runner proper, with the program AND the limiter parameters so the timeout behaviour and the
+/// concurrency bound are both testable without a real bd: a test drives it with a FRESH
+/// `BdConcurrencyLimiter` and its own `/bin/sh`, which exercises the real acquire/hold/release path
+/// while touching neither the process-wide `BD_LIMITER` nor any bd — so it cannot perturb, or be
+/// perturbed by, the other tests sharing this binary.
+///
+/// The child is killed on timeout (std's `Child::kill`, so this stays portable — `libc` is
+/// unix-gated in Cargo.toml). Output is drained on threads so a child that fills a pipe buffer
+/// cannot deadlock against our own wait, and the wait on those threads is itself bounded — see
+/// READER_DRAIN_GRACE.
+///
+/// ONE DEADLINE bounds the whole call. It is computed once, up front, and used for BOTH the permit
+/// wait and the subprocess wait, so a caller's TOTAL wall clock — however the time splits between
+/// queueing for a permit and running bd — never exceeds its `timeout`. That is what keeps the
+/// module's contract true (a wedged subprocess surfaces as `Timeout`, a saturated queue as `StoreBusy`, never a hung
+/// caller) now that a permit sits in front of the spawn. The wait is a plain blocking wait: callers
+/// already arrive on a blocking-pool thread (or a test thread), never on a tokio worker.
+fn run_cmd_until(
+    limiter: Option<&BdConcurrencyLimiter>,
+    program: &str,
+    project_path: &str,
+    args: &[String],
+    timeout: Duration,
+    env: ChildEnv<'_>,
+) -> Result<BdOutput, BeadsError> {
     require_project_dir(project_path)?;
+
+    // The single budget for this call: permit wait AND subprocess share it, so the total is bounded.
+    let deadline = Instant::now() + timeout;
+
+    // Bound concurrent bd/Dolt children. Held until this fn returns, covering spawn, wait, and drain.
+    // A saturated store that never frees a permit within budget is a typed StoreBusy error, not a hang.
+    let _permit = match limiter {
+        Some(l) => {
+            let permit = l.acquire_by(deadline).ok_or_else(|| queue_saturated(timeout))?;
+            // If queueing ate nearly the whole budget, do NOT spawn: a child started with a sliver
+            // left is SIGKILLed on the next poll tick after paying a cold Dolt open for nothing, and
+            // for a mutation that mid-startup kill re-opens the ambiguous-write window. It would also
+            // report "bd did not finish within Ns" — mislabelling a queue-dominated call as a wedged
+            // bd. Report the queue-saturation StoreBusy instead, so the diagnosis points at contention.
+            if !enough_budget_to_run(deadline.saturating_duration_since(Instant::now())) {
+                return Err(queue_saturated(timeout));
+            }
+            Some(permit)
+        }
+        None => None,
+    };
 
     let mut cmd = Command::new(program);
     cmd.args(args)
@@ -731,7 +977,8 @@ pub(crate) fn run_cmd_timed(
     let out_rx = drain(child.stdout.take());
     let err_rx = drain(child.stderr.take());
 
-    let deadline = Instant::now() + timeout;
+    // Reuse the single `deadline` computed before the permit wait, so queue time counts against the
+    // caller's budget too — never a fresh `timeout` here, which would let the total exceed it.
     let status = loop {
         match child.try_wait() {
             Ok(Some(s)) => break Some(s),
@@ -757,6 +1004,12 @@ pub(crate) fn run_cmd_timed(
     // that this thread comes back, and a grandchild holding the pipes means the readers may never
     // return at all. They are left detached and finish when that grandchild does.
     let Some(status) = status else {
+        // Name the BUDGET, not the child's runtime: this string is grepped operationally by
+        // scripts/bd-contention-bench.sh, session-beads-gc.sh, the bd-timeout-ladder test and the
+        // notes.rs describe_bd_failure fixtures. A runtime-based message truncated sub-second kills
+        // to "bd ran 0s" (colliding with the never-spawned queue_saturated copy) and dropped the
+        // greppable bound — reverted (roborev 67767/67768). Queue time counts toward the budget by
+        // design (one shared deadline), so "within {timeout}s" is the honest, stable phrasing.
         return Err(BeadsError::new(
             BeadsErrorKind::Timeout,
             format!("bd did not finish within {}s and was terminated", timeout.as_secs()),
@@ -828,6 +1081,24 @@ fn bd_stdout_within(
     env: ChildEnv<'_>,
 ) -> Result<String, BeadsError> {
     let out = run_bd_timed(project_path, args, timeout, env)?;
+    check_run(&out)?;
+    Ok(out.stdout)
+}
+
+/// `bd_stdout_within` that BYPASSES the concurrency limiter. ONLY for the post-create confirmation
+/// probe: it is a single-id read against the store the create just opened, and forcing it to
+/// re-queue for a permit is exactly what would defeat it under the contention it exists to detect.
+/// `confirm_written` fails OPEN on a probe that could not run (see its doc), so a permit-starved
+/// probe would silently report an unverified create as filed — reintroducing the write-drop this
+/// guard exists to catch, precisely when the store is busiest. One extra quick read beyond the cap
+/// is a negligible price; creates are user-initiated and rare (see `create_bead`).
+fn bd_stdout_unlimited_within(
+    project_path: &str,
+    args: &[String],
+    timeout: Duration,
+    env: ChildEnv<'_>,
+) -> Result<String, BeadsError> {
+    let out = run_bd_unlimited(project_path, args, timeout, env)?;
     check_run(&out)?;
     Ok(out.stdout)
 }
@@ -1096,8 +1367,11 @@ fn create_bead(project_path: &str, bead: &NewBead, env: ChildEnv<'_>) -> Result<
     }
     // BOUNDED SEPARATELY, and shorter — see `BD_CONFIRM_PROBE_TIMEOUT`. Two full budgets in one
     // command exceed the concierge bridge's own ceiling, which turns a CONFIRMED create into a
-    // reported timeout.
-    let probe = bd_stdout_within(
+    // reported timeout. It also BYPASSES the concurrency limiter (`bd_stdout_unlimited_within`): a
+    // probe that re-queued for a permit would be starved out under the very contention it exists to
+    // detect, and `confirm_written` fails open on a probe that could not run — so it would report an
+    // unverified create as filed exactly when the store is busiest.
+    let probe = bd_stdout_unlimited_within(
         project_path,
         &["show".into(), created.id.clone(), "--json".into()],
         BD_CONFIRM_PROBE_TIMEOUT,
@@ -1422,7 +1696,7 @@ pub(crate) mod tests {
                 Duration::from_millis(300),
                 NO_EXTRA_ENV,
             );
-            tx.send(r.map(|_| ()).map_err(|e| e.kind)).ok();
+            tx.send(r.map(|_| ())).ok();
         });
         let got = rx.recv_timeout(Duration::from_secs(3));
 
@@ -1434,7 +1708,289 @@ pub(crate) mod tests {
 
         let got = got
             .expect("run_cmd_timed never returned — it is blocked on a pipe a grandchild still holds");
-        assert_eq!(got.unwrap_err(), BeadsErrorKind::Timeout);
+        let err = got.unwrap_err();
+        assert_eq!(err.kind, BeadsErrorKind::Timeout);
+        // Guard the kill-path MESSAGE, not just the kind (roborev 67779): this exact phrase is grepped
+        // operationally by scripts/bd-contention-bench.sh, session-beads-gc.sh, the bd-timeout-ladder
+        // test and the notes.rs describe_bd_failure fixtures. A test, not a code comment, is what keeps
+        // production and those consumers from drifting apart (as commit 117ea51 did). Asserts the phrase
+        // only, not the number — this test's 300ms budget renders as "0s", while production's is 30s.
+        // Guard BOTH ends of the greppable contract (roborev 67798), not just the prefix: the
+        // downstream fixtures/scripts key on "within {N}s" AND "terminated". A reword of either end
+        // (or swapping the budget for an elapsed-runtime value) reds this.
+        assert!(
+            err.message.contains("did not finish within"),
+            "kill-path message must carry the 'did not finish within Ns' prefix: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("and was terminated"),
+            "kill-path message must carry the 'and was terminated' tail: {}",
+            err.message
+        );
+    }
+
+    // ── The bd-concurrency bound ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn the_limiter_admits_exactly_its_permit_count_then_blocks_until_one_is_freed() {
+        // The primitive in isolation, on a FRESH limiter so the process-wide `BD_LIMITER` (shared
+        // by every other test in this binary) cannot perturb the counts. Two properties:
+        //   (1) it hands out exactly N permits at once, and the (N+1)th BLOCKS, and
+        //   (2) releasing one wakes the blocked acquirer.
+        // Both are false under the obvious mutations: `new(2)` -> `new(usize::MAX)` grants the third
+        // immediately and (1) fails; dropping the `Condvar` wake path never resumes and (2) fails.
+        let limiter = BdConcurrencyLimiter::new(2);
+        let far = || Instant::now() + Duration::from_secs(3600);
+        let p1 = limiter.acquire_by(far()).expect("first permit is free");
+        let _p2 = limiter.acquire_by(far()).expect("second permit is free");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                // A far deadline, so the ONLY thing that can release this is p1 being dropped.
+                let _p3 = limiter.acquire_by(far()).expect("third permit after a release");
+                tx.send(()).ok();
+                // Return immediately, dropping _p3 — the scope must be able to join this thread.
+            });
+
+            // Both permits are held here, so the third acquire cannot have completed.
+            assert!(
+                rx.recv_timeout(Duration::from_millis(250)).is_err(),
+                "a third permit was granted while all {BD_MAX_CONCURRENT} were already held",
+            );
+
+            // Free one; the blocked acquirer must now proceed.
+            drop(p1);
+            assert!(
+                rx.recv_timeout(Duration::from_secs(2)).is_ok(),
+                "releasing a permit did not wake the waiting acquirer",
+            );
+        });
+    }
+
+    #[test]
+    fn a_saturated_limiter_times_out_at_its_deadline_instead_of_waiting_forever() {
+        // The bounded-wait property that keeps `run_cmd_until`'s TOTAL wall clock inside the caller's
+        // timeout: with every permit held, `acquire_by` returns None AT the deadline rather than
+        // blocking. Mutate `acquire_by` back to an unbounded wait and this test hangs and is killed —
+        // i.e. it can fail. Without the bound, the whole point of BD_TIMEOUT is defeated: a wedged
+        // store would move the hang from "the subprocess never finishes" to "no permit ever frees".
+        let limiter = BdConcurrencyLimiter::new(1);
+        let _held =
+            limiter.acquire_by(Instant::now() + Duration::from_secs(3600)).expect("the one permit");
+
+        let start = Instant::now();
+        let denied = limiter.acquire_by(Instant::now() + Duration::from_millis(150));
+        let waited = start.elapsed();
+
+        assert!(denied.is_none(), "a saturated limiter must time out, not conjure a permit");
+        assert!(
+            waited >= Duration::from_millis(120),
+            "it must wait for its deadline, not return early: {waited:?}",
+        );
+        assert!(waited < Duration::from_secs(5), "it must not wait far past its deadline: {waited:?}");
+    }
+
+    #[test]
+    fn should_bound_is_true_only_for_the_resolved_bd_binary() {
+        // The gating DECISION, tested purely so BOTH branches are covered WITHOUT bd installed (CI
+        // has none). This is the guard against the "defaulted seam": if the only positive assertion
+        // sat behind `cached_bd_path()`, a mutation of the decision to always-`false` — which quietly
+        // restores the P0 poll convoy — would stay green on CI. Here the true branch is pinned on
+        // every machine, and the false branches keep the lock-free scanner and shells unthrottled.
+        assert!(should_bound("/opt/homebrew/bin/bd", Some("/opt/homebrew/bin/bd")), "bd must be bounded");
+        assert!(!should_bound("/bin/sh", Some("/opt/homebrew/bin/bd")), "a shell must not be bounded");
+        assert!(
+            !should_bound("scripts/bead-dup-check.sh", Some("/opt/homebrew/bin/bd")),
+            "the lock-free dedupe scanner must not be bounded",
+        );
+        assert!(!should_bound("/opt/homebrew/bin/bd", None), "with no bd resolved, nothing is bounded");
+    }
+
+    #[test]
+    fn only_the_bd_binary_takes_a_store_permit() {
+        // The wiring of `should_bound` to the resolved bd path. The pure decision is proven above;
+        // this confirms `contends_for_store` feeds it `cached_bd_path()`.
+        assert!(!contends_for_store("/bin/sh"), "a shell does not contend for the store");
+        assert!(!contends_for_store("/usr/bin/env"), "a non-bd program does not contend");
+        assert!(
+            !contends_for_store("scripts/bead-dup-check.sh"),
+            "the lock-free dedupe scanner must not take a permit",
+        );
+        match cached_bd_path() {
+            Some(bd) => {
+                assert!(contends_for_store(&bd), "the resolved bd binary must take a permit")
+            }
+            None => assert!(!contends_for_store("bd"), "with no bd resolved, nothing is gated"),
+        }
+    }
+
+    #[test]
+    fn the_cap_wiring_cannot_be_silently_removed() {
+        // Two production seams the concurrency fix hangs on are single lines that NO runtime test on
+        // a bd-less CI can reach (see `should_bound`'s doc): `run_cmd_timed` selecting the global
+        // limiter for bd, and `create_bead`'s probe using the UNLIMITED path. Both are the "a later
+        // edit undoes it without noticing" shape `every_mutation_goes_through_the_acknowledged_path`
+        // already guards for, so pin them the same way — a source guard that reds if either mutates
+        // back. `let limiter = None;` or a limited probe compiles and passes every other test.
+        let src = include_str!("beads_cmd.rs");
+        let body_of = |sig: &str| -> &str {
+            let from = src.find(sig).unwrap_or_else(|| panic!("{sig} still exists"));
+            let rest = &src[from..];
+            &rest[..rest.find("\n}\n").expect("the fn body ends")]
+        };
+
+        // run_cmd_timed must gate the process-wide BD_LIMITER on contends_for_store; replacing that
+        // with `let limiter = None;` restores the P0 convoy and this catches it.
+        let rct = body_of("pub(crate) fn run_cmd_timed(");
+        assert!(rct.contains("contends_for_store("), "run_cmd_timed must gate on contends_for_store");
+        assert!(rct.contains("&BD_LIMITER"), "run_cmd_timed must select the process-wide BD_LIMITER for bd");
+
+        // create_bead's confirmation probe must use the UNLIMITED path; swapping it back to the
+        // limited `bd_stdout_within` re-starves the probe under contention (confirm_written fails open).
+        let cb = body_of("fn create_bead(");
+        assert!(cb.contains("bd_stdout_unlimited_within("), "create_bead's probe must bypass the limiter");
+        assert!(!cb.contains("bd_stdout_within("), "create_bead must not use the LIMITED probe path");
+    }
+
+    #[test]
+    fn a_permit_that_ate_the_budget_is_not_spent_on_a_doomed_spawn() {
+        // The budget floor: after queueing eats most of the budget, spawning bd only pays a cold Dolt
+        // open for a child killed on the next tick (and, for a mutation, SIGKILLs it mid-startup).
+        // Mutate the floor to zero and a sliver of budget would still spawn.
+        assert!(!enough_budget_to_run(Duration::from_millis(0)), "no budget must not spawn");
+        assert!(!enough_budget_to_run(Duration::from_millis(20)), "a poll-tick's worth must not spawn");
+        assert!(enough_budget_to_run(Duration::from_secs(1)), "a real budget must spawn");
+        assert!(enough_budget_to_run(MIN_RUN_BUDGET_AFTER_QUEUE), "exactly the floor must spawn");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_cmd_until_reports_a_saturated_queue_as_store_busy_without_hanging() {
+        // End to end through the real runner: a caller that cannot get a permit within its budget
+        // returns PROMPTLY, never blocking — the whole point of bounding the permit wait. The kind is
+        // StoreBusy, NOT Timeout: nothing was spawned, so nothing was written, and `describe_bd_failure`
+        // must not dress this up as an ambiguous "did the write land?" — it is safe to retry. The kind
+        // is what carries that, so this asserts it, not just the message.
+        let dir = std::env::temp_dir()
+            .join(format!("sparkle-test-beads-satq-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.to_string_lossy().to_string();
+
+        let limiter = BdConcurrencyLimiter::new(1);
+        let _held = limiter.acquire_by(Instant::now() + Duration::from_secs(3600)).expect("hold the one permit");
+
+        let start = Instant::now();
+        let err = run_cmd_until(
+            Some(&limiter),
+            "/bin/sh",
+            &path,
+            &["-c".to_string(), "echo hi".to_string()],
+            Duration::from_millis(200),
+            NO_EXTRA_ENV,
+        )
+        .expect_err("a saturated queue must not run the child");
+        let waited = start.elapsed();
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(
+            err.kind,
+            BeadsErrorKind::StoreBusy,
+            "queue saturation is StoreBusy (retry-safe), never Timeout (write-ambiguous)",
+        );
+        assert!(err.message.contains("concurrency limit"), "the message names the queue, not a wedged bd: {}", err.message);
+        assert!(err.message.contains("retrying"), "the message must tell the user retrying is safe: {}", err.message);
+        assert!(waited < Duration::from_secs(3), "it must return near its deadline, not hang: {waited:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_cmd_until_never_runs_more_children_than_the_permit_allows() {
+        // The SIDE EFFECT, through the real bounded runner: fire far more concurrent callers than the
+        // cap, and prove no more than the permit count are ever alive at once.
+        //
+        // Driven with `/bin/sh` (so it runs on every machine — CI has no bd) and a FRESH limiter, so
+        // this exercises the real acquire/hold/release path in `run_cmd_until` while touching neither
+        // the process-wide `BD_LIMITER` nor any other test's permits — no cross-test flakiness in
+        // either direction. Each child records that it is IN FLIGHT by creating a uniquely-named
+        // marker on entry and removing it on exit; a monitor thread samples the marker directory and
+        // keeps the peak. The assertion is that peak, i.e. the maximum ACTUAL concurrency — not that
+        // the limiter was called. Delete the permit acquire in `run_cmd_until` and the peak climbs to
+        // the number of callers, so this cannot pass without the bound.
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let dir = std::env::temp_dir()
+            .join(format!("sparkle-test-beads-concurrency-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let markers = dir.join("inflight");
+        std::fs::create_dir_all(&markers).expect("marker dir");
+        let path = dir.to_string_lossy().to_string();
+
+        let limiter = BdConcurrencyLimiter::new(BD_MAX_CONCURRENT);
+
+        // Comfortably above BD_MAX_CONCURRENT so the cap is under real pressure.
+        const CALLERS: usize = 8;
+        assert!(CALLERS > BD_MAX_CONCURRENT, "the test must offer more load than the cap");
+        // A child that outlives a monitor tick by a wide margin, so overlap is observable.
+        let script = format!(r#"f="{}/$$"; : > "$f"; sleep 0.4; rm -f "$f""#, markers.display());
+
+        let peak = AtomicUsize::new(0);
+        let done = AtomicBool::new(false);
+        std::thread::scope(|s| {
+            // Monitor: sample the in-flight marker count and keep the maximum seen.
+            s.spawn(|| {
+                while !done.load(Ordering::Relaxed) {
+                    if let Ok(rd) = std::fs::read_dir(&markers) {
+                        let n = rd.filter(|e| e.is_ok()).count();
+                        peak.fetch_max(n, Ordering::Relaxed);
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            });
+
+            // Fire every caller through the real runner at once, all sharing the one fresh limiter.
+            let handles: Vec<_> = (0..CALLERS)
+                .map(|_| {
+                    let path = path.clone();
+                    let script = script.clone();
+                    let limiter = &limiter;
+                    s.spawn(move || {
+                        run_cmd_until(
+                            Some(limiter),
+                            "/bin/sh",
+                            &path,
+                            &["-c".to_string(), script],
+                            Duration::from_secs(30),
+                            NO_EXTRA_ENV,
+                        )
+                    })
+                })
+                .collect();
+            for h in handles {
+                // The stand-in may exit non-zero; we only care that the thread did not panic.
+                let _ = h.join().expect("a caller thread panicked");
+            }
+            done.store(true, Ordering::Relaxed);
+        });
+
+        let observed = peak.load(Ordering::Relaxed);
+        std::fs::remove_dir_all(&dir).ok();
+
+        // The fresh limiter is uncontended, so the cap is genuinely reachable — assert it IS reached
+        // (grip: permits are handed out concurrently, not accidentally serialized) AND never exceeded.
+        // The lower bound is `min(cap, CALLERS)` so it tracks the constant either way: tuning the cap
+        // down to 1 keeps the two bounds consistent (peak == 1) instead of contradicting each other,
+        // and a cap above the offered load still expects only as many as there are callers.
+        let expected_peak = BD_MAX_CONCURRENT.min(CALLERS);
+        assert!(
+            observed >= expected_peak,
+            "expected up to {expected_peak} concurrent children, but the peak was only {observed}",
+        );
+        assert!(
+            observed <= BD_MAX_CONCURRENT,
+            "run_cmd_until allowed {observed} children at once, over the cap of {BD_MAX_CONCURRENT}",
+        );
     }
 
     #[test]
