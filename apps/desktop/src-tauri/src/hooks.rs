@@ -108,11 +108,15 @@ fn hook_command(script: &Path, arg: &Path) -> String {
 //   * [`stage_one`] falls back to an ALREADY-STAGED copy at `<dest_dir>/<rel>`. `dest_dir` is
 //     `bin/<this build's segment>/`, so anything there is this build's own bytes by construction —
 //     written by this process or by an earlier run of the SAME build, never by version N+1.
-//   * the memo is re-runnable ([`staged_or_init`]): a load in which NOTHING staged is RETRIED on a
-//     later call, gated on this process's own bundle not having been replaced since launch
-//     (`stale_build::bundle_replaced_since_launch_now`). Once the swap has landed the gate closes and
-//     the stale Err is preferred over version N+1's bytes. A load with at least one success is sealed
-//     exactly as before.
+//   * the memo is re-runnable ([`staged_or_init`]): ANY entry still in `Err` is retried on a later
+//     call — per entry, so an entry that already staged is never re-copied — and the memo seals only
+//     once EVERY entry is `Ok`. The retry is gated on this process's own bundle not having been
+//     replaced since launch (`stale_build::bundle_replaced_since_launch_now`).
+//     THAT GATE FAILS OPEN, so this narrows mode B rather than closing it: the gate answers "not
+//     replaced" whenever either input is unknown, and off macOS it always does. A retry that
+//     succeeds while the gate is blind SEALS version N+1's bytes for that resource for the rest of
+//     the session. See `staged_or_init`'s header for the full argument and bead sparkle-j2j509 for
+//     the platform-independent fix.
 //
 // Mode B is the dangerous one and is why this exists: a version-N Rust process would spawn a
 // version-N+1 `mcp-control-server.js` against its own N socket protocol (op names, token shape,
@@ -235,8 +239,11 @@ fn bundle_is_still_this_build() -> bool {
 /// weight on its own is stated once, above — deliberately not repeated here.)
 ///
 /// So: only the entries that are still `Err` are re-attempted, and their results are merged in. An
-/// entry that staged keeps the copy it took while the bundle was provably ours, whatever happens
-/// later in the session.
+/// entry staged by the FIRST load keeps the copy it took while the bundle was provably ours; an entry
+/// that reached `Ok` on a RETRY keeps whatever that retry took, subject only to `retry_allowed` —
+/// which fails open, as above. Do not shorten this back to "an entry that staged keeps the copy it
+/// took while the bundle was provably ours": that sentence was here, it is false for the retry case,
+/// and being the last line before the signature it is the one a reader carries away.
 pub(crate) fn staged_or_init(
     cell: &Mutex<Option<StagedBin>>,
     retry_allowed: &dyn Fn() -> bool,
