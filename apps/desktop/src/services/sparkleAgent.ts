@@ -264,6 +264,15 @@ export const PIPELINE_HEALTH_SCAN_HEADER =
  *  standing operating contract the agent carries into every turn, not a late footnote. */
 export const NEVER_IDLE_HEADER = "NEVER END A TURN IDLE — RUN THE INTAKE → PULL LOOP";
 
+/** Header of the fan-out-first contract. Exported (like the headers above) so the test asserts its
+ *  PRESENCE in the autonomous-loop modes and its ABSENCE in the chat-only "never" mode structurally.
+ *  Placed FIRST in the persona — ahead of even the never-idle contract — because it governs the
+ *  agent's FIRST action on any multi-deliverable work, and the founder's standing ask is that the
+ *  agent stop defaulting to serial, one-thing-at-a-time execution without being told to parallelize
+ *  (AGENTS.md: "Optimize for wall-clock time, not tokens. Fan out concurrent agents … by default").
+ *  Deeper than the UserPromptSubmit reminder hook — this is the baked-in prompt layer. */
+export const FAN_OUT_HEADER = "FAN OUT BY DEFAULT — DECOMPOSE BEFORE YOU DO";
+
 function submitBlockedSection(
   verdict: SubmitVerdict,
   attended: boolean,
@@ -666,11 +675,61 @@ export function sparklePersona(
         ]
       : [];
 
+  // FAN OUT BY DEFAULT — the founder's standing ask, baked into the prompt (not just the reminder
+  // hook). The measured failure is the agent defaulting to serial, one-thing-at-a-time execution on
+  // multi-deliverable work even though AGENTS.md says to parallelize aggressively — and a human then
+  // having to say "use more agents". So this is the LEADING operating directive: on any request with
+  // >=2 independent deliverables, the FIRST action is to decompose and dispatch, before doing any
+  // unit yourself. Scoped to the autonomous-loop modes (consent !== "never") exactly like neverIdle:
+  // a chat-only session does no multi-unit code work, so telling it to spawn file-editing sub-agents
+  // would contradict the consent it is under.
+  //
+  // TWO THINGS THE NAIVE VERSION GOT WRONG (roborev 67505/67506): (1) a sub-agent gets a FRESH system
+  // prompt and inherits NONE of this persona's consent/PII/scrub gates via --append-system-prompt, so
+  // fanning out multiplies actors while dropping every gate that made one actor safe — the block must
+  // require each sub-agent prompt to RESTATE those gates; and (2) every sub-agent runs in the ONE
+  // app-owned clone (one git index, one HEAD, one shared beads/Dolt store), so disjoint FILE sets do
+  // not make concurrent commits/bd-writes safe — the orchestrator alone commits, writes beads, and
+  // submits, and reserves its own unit rather than double-owning one it already dispatched.
+  const fanOut =
+    consent !== "never"
+      ? [
+          FAN_OUT_HEADER,
+          "- On ANY request or backlog with 2 OR MORE independent deliverables, your FIRST action is to",
+          "  FAN OUT — not to start unit one serially. Before you start any unit:",
+          "    1. ENUMERATE the work units;",
+          "    2. assign each a DISJOINT set of files (no two sub-agents may touch the same file);",
+          "    3. RESERVE the highest-context unit for yourself, then DISPATCH one sub-agent for EACH",
+          "       REMAINING unit in a SINGLE message — before you start your own reserved unit.",
+          "- THEN work your reserved unit while you ORCHESTRATE the rest; never sit idle waiting on them",
+          "  (that idle time is itself a TRIGGER to pull the next item, per the loop below).",
+          "- SUB-AGENTS DO NOT INHERIT THIS PERSONA — they get a fresh system prompt. So EVERY sub-agent",
+          "  prompt you write MUST restate the constraints that keep this pass safe, or you multiply",
+          "  actors while dropping the gates that made ONE actor safe:",
+          "    - the CONSENT rule for this mode — in case_by_case, or whenever submission is blocked, a",
+          "      sub-agent MUST NOT run `gh pr create` / `gh pr edit` / `git push`;",
+          "    - the PRIVACY hard default and the `scripts/sparkle-scrub.sh` gate below (no PII in any",
+          "      edit, summary, or text a sub-agent produces).",
+          "- COMMITS, `bd` WRITES, PR TEXT AND SUBMISSION ARE THE ORCHESTRATOR'S JOB, NEVER A SUB-AGENT'S.",
+          "  All sub-agents share this ONE app-owned clone — one git index, one HEAD, one beads/Dolt",
+          "  store — so a sub-agent that commits or writes beads races every other on `index.lock` and",
+          "  interleaves half-units. Sub-agents EDIT their disjoint files and RETURN a summary; you",
+          "  stage, commit, write beads, and open the PR.",
+          "- SERIAL is the exception you must JUSTIFY by naming a specific file-collision that cannot be",
+          "  scoped apart — and even then you split by FILE, not by time.",
+          '- NEVER wait to be told to parallelize. A human having to say "use more agents" is a FAILURE',
+          "  of this default, not a normal request.",
+          "- The ONLY real limits are file-collision (scope each sub-agent to a DISJOINT file set) and",
+          '  the shared git/beads state above. NOT limits: token cost, "it feels like a lot," your own',
+          "  review bandwidth, or wanting to check results first.",
+        ]
+      : [];
+
   // THE STANDING NEVER-IDLE CONTRACT, and it is an INTAKE→PULL loop, not pull-only. Scoped to the
   // autonomous-loop modes (consent !== "never"): a chat-only session must not be told to mine backlog
   // it is barred from touching, so this whole block is dropped there exactly as the log-mining
-  // sections above are. Spliced HIGH in the persona (right after the mission line) because it governs
-  // how EVERY turn ends, not just how a pass begins.
+  // sections above are. Spliced HIGH in the persona (right after the fan-out directive) because it
+  // governs how EVERY turn ends, not just how a pass begins.
   //
   // WHY INTAKE MATTERS AS MUCH AS PULL: a loop that only pulls from `bd ready` drains the cheap end
   // of an existing list and then stalls — or manufactures busywork to hit the metric. The real wins
@@ -718,6 +777,9 @@ export function sparklePersona(
     "You are the Sparkle Improvement Agent — a built-in agent inside the Sparkle desktop app",
     "whose sole mission is to make Sparkle (the open-source desktop client) better for everyone.",
     "",
+    // FIRST ON PURPOSE — the fan-out-first directive leads even the never-idle contract, because it
+    // governs the agent's FIRST action on any multi-deliverable work. Empty (dropped) in "never".
+    ...(fanOut.length ? [...fanOut, ""] : []),
     // HIGH ON PURPOSE — the standing contract precedes the per-pass mechanics so it is load-bearing
     // in every turn. Empty (dropped) in the chat-only "never" mode.
     ...(neverIdle.length ? [...neverIdle, ""] : []),

@@ -167,6 +167,22 @@ made most often about you. YOU DO NOT HAVE CLAUDE'S `Task`/`Agent` TOOL — `spa
 your version of it, so an instruction anywhere telling you to 'fan out subagents via your Agent \
 tool' means this tool. Reach for it EARLY, on the first question that needs real digging rather \
 than after you are ten reads deep, and say that you have sent it off.\n\n\
+FAN OUT A FLEET BY DEFAULT — YOU ARE THE HUB, SO SPIN UP AGENTS PROACTIVELY. When the user has \
+asked you to DO two or more INDEPENDENT things NOW, your instinct should be to dispatch them in \
+PARALLEL — spawn one build agent per piece rather than grinding through them serially — and do not \
+wait for the user to ask you to parallelize. This governs serial-vs-parallel ONLY; it does not \
+decide WHETHER a piece is a build agent at all. The FILE A FEATURE AS AN EPIC and DECIDE WHERE AN \
+IMPROVEMENT GOES rules below make that call first — capture an ambiguous or someday idea as an \
+epic, route a systemic problem to Improve-Sparkle, and when intent is unclear ASK which they \
+meant — and only a piece that is genuinely a build-now task gets fanned out here. Scope each agent \
+to a DISJOINT set of files so two never collide, and hand each a clear finish line. Once a fan-out \
+is warranted, the reasons NOT to spread it across agents are a real file-collision or \
+shared-resource contention — never token cost and never your own review bandwidth. And a single \
+focused ask you can settle in one reply — one you can answer from what you already know — you \
+just answer yourself rather than spinning up a BUILD AGENT for it. A one-off CODE fix is still a \
+build agent per DECIDE WHERE AN IMPROVEMENT GOES below, and a question that needs real digging \
+still goes to sparkle_research per DELEGATE THE DIGGING above; this carve-out is only for what you \
+can answer in the turn itself.\n\n\
 YOU HAVE A DURABLE MEMORY — USE IT INSTEAD OF RELYING ON THIS THREAD. Your `sparkle_memory` tool is \
 a persistent, searchable store that survives past this conversation's window, a truncation, and a \
 restart — the same kind of memory the Improve-Sparkle agent has. WRITE a fact to it (op `remember`, \
@@ -2311,6 +2327,43 @@ mod tests {
         // The alternate-screen refusal is still correct and must still be honoured — correcting an
         // overstatement must not read as permission to route around the real guard.
         assert!(CONCIERGE_PERSONA.contains("that refusal is correct"));
+    }
+
+    #[test]
+    fn persona_fans_out_a_fleet_by_default_on_independent_work() {
+        // The founder's directive: every orchestrator PROACTIVELY fans out on multi-deliverable
+        // work, without a human asking — and the concierge is the fleet hub that spawns build
+        // agents. The behaviour-changing claim is that fanning out is the DEFAULT and needs no
+        // prompt, not merely that parallelism is possible (which the old copy already implied via
+        // spawn_build_agent). Assert the parts that actually move behaviour.
+        assert!(CONCIERGE_PERSONA.contains("FAN OUT A FLEET BY DEFAULT"));
+        // Proactive: it must not wait for the user to ask.
+        assert!(CONCIERGE_PERSONA.contains("do not wait for the user to ask you to parallelize"));
+        // The disjoint-files constraint is the ONE real reason to hold back — naming it is what keeps
+        // the model from either over-serialising OR colliding two agents in the same file.
+        assert!(CONCIERGE_PERSONA.contains("DISJOINT set of files"));
+        // And the non-reasons, stated so token cost / review bandwidth can't be used to justify serial.
+        assert!(CONCIERGE_PERSONA.contains("never token cost"));
+        // Deference (roborev 67517/67518): this directive decides serial-vs-parallel ONLY, and must
+        // NOT read as authority to spawn a build agent for work the epic-capture / Improve-Sparkle
+        // routing rules would first send elsewhere. spawn_build_agent is auto-allowed and cuts real
+        // worktrees, so an absolute here would start agents for ideas the user only wanted captured.
+        assert!(CONCIERGE_PERSONA.contains("does not decide WHETHER a piece is a build agent at all"));
+        assert!(CONCIERGE_PERSONA.contains("only a piece that is genuinely a build-now task gets fanned out here"));
+        // The single-ask carve-out (roborev 67540): fanning out must not swallow the one-reply case.
+        // spawn_build_agent is auto-allowed and cuts a real worktree, so the persona must still say a
+        // small ask answerable in one reply is answered in-house — mirroring the orchestrator's leaf
+        // carve-out, which has its own test.
+        assert!(CONCIERGE_PERSONA.contains("you can settle in one reply"));
+        assert!(CONCIERGE_PERSONA.contains("just answer yourself rather than spinning up a BUILD AGENT"));
+        // The carve-out must NOT re-widen into territory the other rules own (roborev 67567): a
+        // one-off CODE fix stays a build agent, and a question needing real digging stays
+        // sparkle_research. Assert both deferrals, and assert the over-broad examples are gone so the
+        // wording cannot silently creep back.
+        assert!(CONCIERGE_PERSONA.contains("A one-off CODE fix is still a build agent"));
+        assert!(CONCIERGE_PERSONA.contains("still goes to sparkle_research"));
+        assert!(!CONCIERGE_PERSONA.contains("a small correction"));
+        assert!(!CONCIERGE_PERSONA.contains("a quick lookup"));
     }
 
     #[test]

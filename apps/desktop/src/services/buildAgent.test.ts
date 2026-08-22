@@ -543,6 +543,35 @@ describe("orchestrationPersona", () => {
     expect(p).toMatch(/decompose/i);
   });
 
+  it("makes fanning out the DEFAULT on independent work, with the leaf carve-out", () => {
+    // The founder's directive: every orchestrator PROACTIVELY fans out on multi-deliverable work
+    // without a human asking. The behaviour-changing claims are (a) fan-out is the default and needs
+    // no prompt, and (b) the carve-out that stops a build agent handed ONE task from manufacturing a
+    // worker to re-delegate it. Slice the whole SECTION (header to the next section header) so a
+    // later section reusing these words can't pass this by luck (roborev 56178).
+    const start = p.indexOf("FAN OUT BY DEFAULT");
+    expect(start, "persona no longer contains the FAN OUT BY DEFAULT section").toBeGreaterThan(-1);
+    const end = p.indexOf("DIVISION OF LABOR", start);
+    expect(end, "FAN OUT section is no longer followed by DIVISION OF LABOR").toBeGreaterThan(start);
+    const section = p.slice(start, end);
+    expect(section).toMatch(/DON'T WAIT TO BE ASKED/);
+    expect(section).toMatch(/do not\s+wait to be told to parallelize/i);
+    expect(section).toMatch(/two or more independent/i);
+    // The non-reasons — token cost / review bandwidth can't be used to justify staying serial.
+    expect(section).toMatch(/must NEVER hold a fan-out back: token cost/i);
+    // The leaf carve-out: a single scoped task is done in-house, not re-delegated to a worker.
+    expect(section).toMatch(/one focused, scoped task/i);
+    expect(section).toMatch(/re-delegate a single unit/i);
+    // Deference (roborev 67517/67518): the directive must NOT read as absolute over the two rules
+    // that legitimately hold a fan-out back — the shared concurrency cap (the one-at-a-time batch
+    // workflow below) and an as-yet-unsettled contract (SETTLE THE CONTRACT BEFORE YOU FAN OUT).
+    // Without these, an orchestrator resolves the conflict toward the louder "never" and either
+    // over-caps its REPL or builds a superseded plan.
+    expect(section).toMatch(/shared concurrency cap/i);
+    expect(section).toMatch(/contract\s+still UNDER REVIEW/i);
+    expect(section).toMatch(/mechanics rule, not a reason\s+to fall back to serial/i);
+  });
+
   it("states the division of labor: subagents for research, spawn_worker for code units", () => {
     expect(p).toMatch(/subagent/i);
     expect(p).toMatch(/read-only|research/i);

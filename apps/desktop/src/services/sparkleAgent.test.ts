@@ -28,6 +28,7 @@ import {
   PIPELINE_HEALTH_SCAN_HEADER,
   PIPELINE_HEALTH_LABEL,
   NEVER_IDLE_HEADER,
+  FAN_OUT_HEADER,
   sparklePersona,
   sparkleMissionPrompt,
   sparkleChatOnlyMissionPrompt,
@@ -317,6 +318,57 @@ describe("sparklePersona — consent branching", () => {
     expect(p).not.toContain("ci-autoscale.log");
   });
 
+  it.each(["always", "case_by_case"] as const)(
+    "%s: carries the fan-out-first directive as the LEADING operating rule",
+    (mode) => {
+      const p = sparklePersona(LOG_DIR, REPO, mode, "unknown", { attended: false });
+      expect(p).toContain(FAN_OUT_HEADER);
+      // Slice the fan-out block out and assert its clauses against the SLICE, not the whole persona:
+      // strings like "scripts/sparkle-scrub.sh" and "index.lock" also appear in the PII/privacy
+      // sections, so asserting them against the full prompt is vacuous — they stay green with the
+      // fan-out clause deleted (roborev 67523). The block runs from its header to the next section.
+      const fanBlock = p.slice(p.indexOf(FAN_OUT_HEADER), p.indexOf(NEVER_IDLE_HEADER));
+      expect(p.indexOf(NEVER_IDLE_HEADER)).toBeGreaterThan(p.indexOf(FAN_OUT_HEADER));
+      // The FIRST action on multi-deliverable work must be to decompose and dispatch — not to start
+      // unit one serially. Pin the load-bearing clauses so removing the directive fails the test.
+      expect(fanBlock).toContain("2 OR MORE independent deliverables");
+      expect(fanBlock).toContain("your FIRST action is to");
+      expect(fanBlock).toContain("DISJOINT");
+      expect(fanBlock).toContain("SINGLE message");
+      // The orchestrator RESERVES its own unit and dispatches only the REMAINING ones — the naive
+      // "dispatch one per unit, THEN take one yourself" double-owned a unit (roborev 67505).
+      expect(fanBlock).toContain("RESERVE the highest-context unit");
+      // Sub-agents get a FRESH prompt, so the consent + PII/scrub gates must be RESTATED to them, or
+      // fanning out multiplies actors while dropping every gate (roborev 67506, High). Assert the
+      // no-submit consent clause, the scrub-gate restatement, AND orchestrator-only submission —
+      // all against the slice so a copy elsewhere in the persona cannot satisfy them.
+      expect(fanBlock).toContain("SUB-AGENTS DO NOT INHERIT THIS PERSONA");
+      expect(fanBlock).toContain("sub-agent MUST NOT run `gh pr create`");
+      expect(fanBlock).toContain("`scripts/sparkle-scrub.sh` gate below");
+      expect(fanBlock).toContain("ARE THE ORCHESTRATOR'S JOB, NEVER A SUB-AGENT'S");
+      // The shared-state reality is named — one clone / one git index — not a false "own worktree".
+      expect(fanBlock).toContain("races every other on `index.lock`");
+      // Serial must be the justified exception, and the founder's specific failure mode is named.
+      expect(fanBlock).toContain("SERIAL is the exception");
+      expect(fanBlock).toContain('"use more agents"');
+      // The non-limits are explicit — token cost / review bandwidth are NOT reasons to stay serial.
+      expect(fanBlock).toContain("token cost");
+      // It LEADS: ahead of even the never-idle contract, and ahead of the per-pass mechanics.
+      expect(p.indexOf(FAN_OUT_HEADER)).toBeLessThan(p.indexOf(NEVER_IDLE_HEADER));
+      expect(p.indexOf(FAN_OUT_HEADER)).toBeLessThan(p.indexOf("WHAT YOU WORK ON"));
+      expect(p.indexOf(FAN_OUT_HEADER)).toBeLessThan(p.indexOf("WHAT YOU DO"));
+    },
+  );
+
+  it("never (chat-only): drops the fan-out-first directive entirely", () => {
+    // A chat-only session does no multi-unit code work, so telling it to spawn file-editing
+    // sub-agents would contradict the consent it is under. Dropped exactly like the never-idle block.
+    const p = sparklePersona(LOG_DIR, REPO, "never", "unknown", { attended: false });
+    expect(p).not.toContain(FAN_OUT_HEADER);
+    expect(p).not.toContain("2 OR MORE independent deliverables");
+    expect(p).not.toContain("SERIAL is the exception");
+  });
+
   it.each(["always", "case_by_case", "never"] as const)(
     "%s: the dedupe gate survives an unauthenticated gh instead of failing open",
     (mode) => {
@@ -362,7 +414,10 @@ describe("sparklePersona — consent branching", () => {
       // Ordering is the whole point: dedupe has to precede spec-writing, which precedes the PR.
       const dedupeStep = p.indexOf("Run the DEDUPE GATE below on every candidate");
       const specStep = p.indexOf("write a short, well-scoped spec");
-      const prStep = p.indexOf("gh pr create");
+      // The ACTUAL submission command — `gh pr create --base main` — not the bare `gh pr create`,
+      // which now also appears earlier as a sub-agent PROHIBITION in the fan-out directive. Keying on
+      // the full submit command targets the real step this ordering is about.
+      const prStep = p.indexOf("gh pr create --base main");
       expect(dedupeStep).toBeGreaterThan(-1);
       expect(dedupeStep).toBeLessThan(specStep);
       expect(specStep).toBeLessThan(prStep);
