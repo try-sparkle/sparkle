@@ -127,6 +127,37 @@ pub const AUTH_EXPIRY_PHRASES: &[&str] = &[
     "please run claude login",
 ];
 
+/// Is this failure text Claude Code's SUBSCRIPTION session wall — "You've hit your session limit"?
+///
+/// DISJOINT from [`is_auth_expired`] by construction, and the disjointness is pinned in both
+/// directions by tests: an auth expiry is a DEAD login that only a human re-signing in can clear,
+/// while a session wall is a LIVE login with a known reset instant that clears on its own. The two
+/// call for opposite remedies, so a classifier that conflated them would rotate away from a healthy
+/// account (or wait out a login that is never coming back).
+///
+/// WHY IT IS NOT ENOUGH TO ASK THE EXISTING QUOTA PATH: the module header above records that the
+/// API-shaped quota tokens (`insufficient_quota`, `429`, a structured `rate_limit` record) never
+/// match this text, so a subscription wall is invisible to every quota consumer. This is the
+/// narrowest thing that makes it visible — a pure predicate over the failure text, with no policy.
+///
+/// Matches by lowercasing the INPUT and testing each [`SESSION_WALL_PHRASES`] entry verbatim, so
+/// those phrases MUST be lowercase.
+pub fn is_session_wall(text: &str) -> bool {
+    let t = text.to_ascii_lowercase();
+    SESSION_WALL_PHRASES.iter().any(|p| t.contains(p))
+}
+
+/// The subscription session-wall phrases [`is_session_wall`] matches, all lowercase.
+///
+/// Deliberately keyed on the SESSION wall only, not on every usage limit. The wording carries a
+/// reset instant ("· resets 7:20am") which the phrases do NOT include, because that suffix is
+/// locale- and clock-dependent and matching it would make detection fail exactly when the message
+/// is most informative.
+pub const SESSION_WALL_PHRASES: &[&str] = &[
+    "hit your session limit",
+    "session limit reached",
+];
+
 /// Rank the accounts roborev may use, best headroom first.
 ///
 /// `headroom` maps account id → fraction of its ceiling already consumed (0.0 = untouched,
@@ -699,6 +730,34 @@ mod tests {
         assert!(!is_auth_expired("error: unknown flag --nope"));
         assert!(!is_auth_expired("Connection reset by peer"));
         assert!(!is_auth_expired(""));
+    }
+
+    /// The subscription session wall — the text the module header records as matching NO existing
+    /// quota classifier, which is why it "never fired once in 63,000+ jobs".
+    #[test]
+    fn is_session_wall_matches_the_subscription_wall_and_nothing_else() {
+        assert!(is_session_wall("You've hit your session limit · resets 2am"));
+        assert!(is_session_wall("You've hit your session limit · resets 7:20am (America/Los_Angeles)"));
+        assert!(is_session_wall("session limit reached, resets 4pm"));
+        // Case-insensitive, like every classifier in this module.
+        assert!(is_session_wall("YOU'VE HIT YOUR SESSION LIMIT"));
+
+        // Paired negatives. Auth death is the one that MUST stay disjoint: it is the other classifier
+        // reading these same two sources, and their remedies are opposites.
+        assert!(!is_session_wall("OAuth session expired and could not be refreshed"));
+        assert!(!is_session_wall("please run /login"));
+        assert!(!is_session_wall("Credit balance is too low"));
+        assert!(!is_session_wall("error: unknown flag --nope"));
+        assert!(!is_session_wall(""));
+    }
+
+    /// Every phrase must be lowercase or the matcher — which lowercases only the INPUT — can never
+    /// match it. Same invariant `AUTH_EXPIRY_PHRASES` carries, asserted the same way.
+    #[test]
+    fn every_session_wall_phrase_is_lowercase() {
+        for p in SESSION_WALL_PHRASES {
+            assert_eq!(*p, p.to_ascii_lowercase(), "phrase must be lowercase: {p:?}");
+        }
     }
 
     #[test]
