@@ -25,6 +25,13 @@ import {
   type PassGate,
   passHoldReason,
 } from "./improvementPass";
+// The leaf the failure→colour rule lives in. Imported DIRECTLY (not through the service's
+// re-export) so the identity assertion below has two genuinely independent references to compare.
+import {
+  classifyPassFailure,
+  isTransientPassFailure as leafIsTransientPassFailure,
+  passFailureStatus,
+} from "../engine/passFailureStatus";
 
 const HOUR = IMPROVEMENT_INTERVAL_MS;
 
@@ -144,6 +151,53 @@ describe("isTransientPassFailure", () => {
     // A spend/usage limit would fail again immediately — burning the retry on it helps nobody.
     expect(isTransientPassFailure("You've hit your monthly spend limit")).toBe(false);
     expect(isTransientPassFailure("Claude usage limit reached")).toBe(false);
+  });
+
+  // THE PREDICATE MOVED, THE EXPORT DID NOT. It now lives in the leaf `engine/passFailureStatus`
+  // (the classifier needs it, and defining it here would make the two modules import each other);
+  // this module re-exports it, so every importer above is unchanged. Pinned because a re-export is
+  // exactly the kind of line a later tidy-up deletes as redundant.
+  it("is the very function the classifier asks — one predicate, not two copies", () => {
+    expect(isTransientPassFailure).toBe(leafIsTransientPassFailure);
+  });
+});
+
+// ── WHAT COLOUR A FAILED PASS EARNS ─────────────────────────────────────────────────────────────
+//
+// The mapping itself is `engine/passFailureStatus`'s to prove; what this suite owns is that the two
+// modules AGREE — that the transient list this service re-attempts and the transient class the
+// classifier paints amber are the same set. Split across two files they could drift silently: a
+// pattern added here would keep earning a retry while the row it produces stayed... also amber, and
+// nobody would notice until a shape earned a retry AND a red row at the same time.
+describe("the transient shapes and the amber tier are the same set", () => {
+  const AT = Date.UTC(2026, 7, 22, 12, 0, 0);
+
+  it.each([
+    "API Error: Unable to connect to API (ENOTFOUND)",
+    "read ECONNRESET",
+    "socket hang up",
+    "getaddrinfo EAI_AGAIN api.example",
+    "API Error: Connection closed mid-response. The response above may be incomplete.",
+    "API Error: Response stalled mid-stream. The response above may be incomplete.",
+  ])("%j earns a re-attempt AND the amber row that says another actor is coming", (message) => {
+    expect(isTransientPassFailure(message)).toBe(true);
+    expect(passFailureStatus(classifyPassFailure(message, AT))).toBe("lapsed");
+  });
+
+  it("a failure that earns NO re-attempt is still amber — the hourly slot is the other actor", () => {
+    // The 30-minute watchdog and the unknown shapes. Nothing is armed, and the row is amber anyway:
+    // "another actor clears it" is satisfied by the next hourly pass, not only by an armed retry.
+    for (const message of ["pass timed out after 30 minutes and was killed", "exited with code 1"]) {
+      expect(isTransientPassFailure(message)).toBe(false);
+      expect(passFailureStatus(classifyPassFailure(message, AT))).toBe("lapsed");
+    }
+  });
+
+  it("an ACCOUNT WALL is the one shape that earns neither a re-attempt nor amber", () => {
+    // Both halves matter: no retry (it would fail again) and RED (nothing in this app clears it).
+    const wall = "You've hit your session limit · resets 8:40am (America/Bogota)";
+    expect(isTransientPassFailure(wall)).toBe(false);
+    expect(passFailureStatus(classifyPassFailure(wall, AT))).toBe("blocked");
   });
 });
 

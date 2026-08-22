@@ -98,6 +98,12 @@ import {
   WORK_BACKSTOP_WINDOW_TICKS,
 } from "../services/agentNaming";
 import { sparkleAgentIdFor } from "../services/sparkleAgent";
+import { useShallow } from "zustand/react/shallow";
+import {
+  useImproveDutyStore,
+  type ImproveDutySnapshot,
+} from "../services/improveDutySnapshot";
+import { sparkleDutyPaint } from "../engine/sparkleDutyPaint";
 import { handleImproveSparkleClick } from "../services/sparkleReveal";
 import {
   topLevelAgents as topLevelOf,
@@ -2716,10 +2722,47 @@ export function AgentSidebar({
     [project?.agents, sparkleAgentId],
   );
   const sparkleStatus = effectiveStatus[sparkleAgentId] ?? "stopped";
+  // ── THE DUTY OVERLAY, COMPOSED ON TOP OF THAT ONE DERIVATION (NOT BESIDE IT) ──────────────────
+  //
+  // Read the paragraph above first: `sparkleStatus` is the shared pipeline's answer, and this line
+  // does NOT re-derive it. `sparkleDutyPaint` is a pure overlay in exactly the shape
+  // `withStallAttention` / `withUnmergedWork` already take for build rows — status in, status out —
+  // and it may only RAISE. It adds no tier and no colour: rule 1 reuses the existing red `blocked`,
+  // and rules 2-4 change only the hover text via `StatusDot`'s existing `label` prop, which the
+  // rollup override already uses. That is what keeps the founder's hard rule intact — this row
+  // reads the one shared `AGENT_STATUS` table like every build row.
+  //
+  // WHY IT IS NEEDED AT ALL: with the pane CLOSED this key has three producers and a six-value
+  // vocabulary, three of them gray and three the same red, so four genuinely different situations
+  // all render as one gray dot with hover text that is factually false on every app launch. See
+  // `engine/sparkleDutyPaint`'s header for the measurement.
+  //
+  // SUBSCRIBED THROUGH THE PAINT, NOT AROUND IT. The snapshot carries an `at` timestamp that moves
+  // on every 10s poll, so a bare `useImproveDutyStore()` would re-render this whole sidebar six
+  // times a minute for a countdown that only changes once a minute. Selecting the RENDERED result
+  // and comparing it shallowly means a re-render happens exactly when the dot's status or its hover
+  // text actually differs.
+  const sparklePaint = useImproveDutyStore(
+    useShallow((s: ImproveDutySnapshot) => sparkleDutyPaint(sparkleStatus, s)),
+  );
   const sparkleRollup = rollupOf(sparkleAgentId);
-  const sparkleBand = bandOfRollup(sparkleRollup);
+  // ⚠️ THE BAND FOLLOWS THE PAINTED STATUS WHEN THE OVERLAY RAISED IT (roborev 67804). `rollupOf`
+  // reads the UN-painted live status and knows nothing about the duty snapshot, so a `pane-wedged`
+  // row rendered a red disc while `bandCounts` still tallied it as done/running and the "Needs you"
+  // chip read 0 — a dot and a chip disagreeing about the same row, which is the exact defect the
+  // comments bracketing this block forbid.
+  // ⚠️ TWO DIFFERENT BANDS, AND CONFLATING THEM SWAPS THE RED DISC FOR A GRAY ONE. The override asks
+  // "is this disc reporting the SUBTREE rather than this row?", which is a question about the ROLLUP
+  // and must stay on the rollup band — feeding it the painted band made a wedge look like a rollup
+  // disagreement, so the dot took `ROLLUP_DOT_COLOR` (gray) instead of the red the wedge just earned.
+  const sparkleRollupBand = bandOfRollup(sparkleRollup);
   const sparkleRollupOverrides =
-    sparkleBand !== bandOfStatus(ownStatus[sparkleAgentId] ?? "stopped");
+    sparkleRollupBand !== bandOfStatus(ownStatus[sparkleAgentId] ?? "stopped");
+  // The TALLY band, by contrast, must follow what the row actually PAINTS (roborev 67804): a wedged
+  // pass rendered a red disc while `bandCounts` still tallied it done/running and the "Needs you"
+  // chip read 0 — a dot and a chip disagreeing about the same row.
+  const sparkleBand =
+    sparklePaint.status === sparkleStatus ? sparkleRollupBand : bandOfStatus(sparklePaint.status);
 
   // ── THE PINNED CONCIERGE AGENTS ROW'S VIEW MODEL (bead sparkle-s7rfc) ──────────────────────────
   //
@@ -3796,9 +3839,12 @@ export function AgentSidebar({
           // active where the pane it stands for actually mounts. `activeSpecial` is `"sparkle" | null`,
           // so this is the same test, asked per column.
           active={paneCoversMe}
-          status={sparkleStatus}
+          status={sparklePaint.status}
           dotColor={sparkleRollupOverrides ? ROLLUP_DOT_COLOR[sparkleRollup] : undefined}
-          dotLabel={sparkleRollupOverrides ? rollupLabel(sparkleRollup) : undefined}
+          // The rollup still wins when it fires — a worker's red bubbled onto this head is a
+          // statement about THIS ROW that outranks a sentence about the schedule, and its dot is
+          // painted from `dotColor` so its label has to match or the two disagree.
+          dotLabel={sparkleRollupOverrides ? rollupLabel(sparkleRollup) : sparklePaint.label}
           dotRing={
             sparkleRollupOverrides && (sparkleRollup === "red" || sparkleRollup === "orange")
           }

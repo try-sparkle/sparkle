@@ -8,9 +8,7 @@ import {
   hourlySlotStamp,
   IMPROVEMENT_TICK_MS,
   isHourlySlotDue,
-  isPassRunning,
   notePaneStatus,
-  passRetryDueAt,
   runImprovementPass,
   shouldRunImprovementPass,
 } from "./services/improvementPass";
@@ -19,8 +17,8 @@ import {
   pollImprovePassLiveness,
   resetImprovePassLiveness,
 } from "./services/improvePassLiveness";
+import { readPassGate, refreshImproveDuty } from "./services/improveDutySnapshot";
 import { SPARKLE_AGENT_ID } from "./services/sparkleAgent";
-import { useConnectionStore } from "./stores/connectionStore";
 import { useRuntimeStore } from "./stores/runtimeStore";
 import { useSettingsStore } from "./stores/settingsStore";
 
@@ -33,7 +31,7 @@ export function useImprovementScheduler(enabled: boolean) {
       // pane's status, and a latch that only advanced on ticks that got as far as the gate would
       // never age past the first hold — which is the one measurement the wedge bound needs.
       const paneStatus = useRuntimeStore.getState().status[SPARKLE_AGENT_ID];
-      const paneBusySince = notePaneStatus(paneStatus, Date.now());
+      notePaneStatus(paneStatus, Date.now());
       const consent = settings.sparkleImprovementConsent;
       if (consent === "never") return;
       // First-ever tick with consent active: seed the clock instead of running, so the first
@@ -43,21 +41,17 @@ export function useImprovementScheduler(enabled: boolean) {
         return;
       }
       const now = Date.now();
-      const due = shouldRunImprovementPass({
-        consent,
-        lastRunAt: settings.improvementLastRunAt,
-        now,
-        passRunning: isPassRunning(),
-        paneStatus,
-        paneBusySince,
-        // A pass that died because the network was unreachable never ran; it gets ONE early
-        // re-attempt instead of forfeiting the slot (improvementPass.ts owns the latch).
-        retryDueAt: passRetryDueAt(),
-        // Read fresh inside the tick, like every other input: a slot that comes due while the
-        // machine is offline waits for the network instead of burning itself on a launch that
-        // cannot reach the API.
-        isOnline: useConnectionStore.getState().isOnline,
-      });
+      // ONE GATE ASSEMBLY, SHARED — `services/improveDutySnapshot.readPassGate`. It used to be
+      // written out inline here, which made this tick the only place in the app that could say WHY
+      // the hourly duty was holding; `services/pusherMount`'s `duties()` documents what that cost
+      // ("a second, disagreeing opinion") and names the fix as lifting the assembly into a shared
+      // reader that "belongs with the scheduler". This is that call site. Every input is still read
+      // FRESH inside the tick — the reader reads the stores, it does not cache — so a consent change
+      // or a network flap still takes effect on the next tick without re-mounting.
+      //
+      // Order matters by one line: `notePaneStatus` above is the SAMPLER (this tick is the only
+      // one), and the reader consumes the latch it just advanced via the read-only `paneBusySinceAt`.
+      const due = shouldRunImprovementPass(readPassGate(now));
       if (!due) return;
       // Which kind of run this is, read BEFORE the stamp below overwrites the clock: the hourly
       // slot coming due (re-earns the one retry) or the early re-attempt (spends it).
@@ -88,8 +82,23 @@ export function useImprovementScheduler(enabled: boolean) {
     // is also deliberately outside the tick's consent/due gating — a pass child that is alive is
     // alive whatever the clock thinks, which is exactly the case (a webview reload lost the latch)
     // that leaves the row stranded. See services/improvePassLiveness.
-    const livenessFirst = setTimeout(() => void pollImprovePassLiveness(), 1_000);
-    const liveness = setInterval(() => void pollImprovePassLiveness(), LIVENESS_POLL_MS);
+    //
+    // ── AND THE DOT'S FACTS, ON THE SAME 10s BEAT ────────────────────────────────────────────────
+    // `refreshImproveDuty` publishes the standing duty — which gate is holding, when the next slot
+    // is due — for `engine/sparkleDutyPaint` to turn into hover text. It rides THIS interval and not
+    // `tick` for the reason stated above in this file's own words: the scheduler ticks every five
+    // minutes, and five minutes of a stale dot on a row whose state has already changed is the
+    // symptom, not the fix. It only READS (`readPassGate` → `paneBusySinceAt`), so putting it on a
+    // second beat cannot disturb the wedge clock the tick above samples.
+    //
+    // AFTER the poll, not beside it: the poll is what writes `passElapsedMs` and may raise the row's
+    // status, so refreshing first would publish a snapshot describing the state one beat ago.
+    const livenessTick = async () => {
+      await pollImprovePassLiveness();
+      refreshImproveDuty(Date.now());
+    };
+    const livenessFirst = setTimeout(() => void livenessTick(), 1_000);
+    const liveness = setInterval(() => void livenessTick(), LIVENESS_POLL_MS);
     return () => {
       clearTimeout(first);
       clearInterval(id);

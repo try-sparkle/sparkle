@@ -3,6 +3,13 @@
 // (one wedged claude -p must not silently end the hourly loop), and a done event must win the
 // race against the timer. Tauri invoke/listen and the worktree/preflight seams are mocked; the
 // REAL runtimeStore carries the status assertions.
+//
+// ⚠️ A FAILED PASS IS AMBER `lapsed`, NOT RED `blocked` — every assertion below said `blocked`
+// until 2026-08-22. The rule now lives in `engine/passFailureStatus` (which is unit-tested in
+// isolation); these tests are the other half of it, driving the REAL entry point and asserting the
+// status the runtimeStore actually ends up holding. Red is reserved for the two shapes no other
+// actor can clear: an account/quota wall (`blocked`, asserted below) and a park that has declined
+// for the SAME reason PARK_DECLINE_ESCALATE_AFTER hours running (`errored`, also below).
 import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from "vitest";
 
 type Handler = (ev: { payload: unknown }) => void;
@@ -177,7 +184,7 @@ describe("runImprovementPass watchdog", () => {
     vi.useRealTimers();
   });
 
-  it("kills a silent pass at PASS_TIMEOUT_MS, releases the latch, and parks on blocked", async () => {
+  it("kills a silent pass at PASS_TIMEOUT_MS, releases the latch, and parks on lapsed", async () => {
     const pass = runImprovementPass("always");
     await untilRunInvoked();
     expect(isPassRunning()).toBe(true);
@@ -188,7 +195,7 @@ describe("runImprovementPass watchdog", () => {
 
     expect(harness.invokes.some((c) => c.cmd === "sparkle_improve_cancel")).toBe(true);
     expect(isPassRunning()).toBe(false);
-    expect(useRuntimeStore.getState().status[SPARKLE_AGENT_ID]).toBe("blocked");
+    expect(useRuntimeStore.getState().status[SPARKLE_AGENT_ID]).toBe("lapsed");
     // Listeners were torn down, so a late event can't touch a future pass.
     expect(harness.handlers.size).toBe(0);
   });
@@ -246,16 +253,77 @@ describe("runImprovementPass watchdog", () => {
     await untilRunInvoked();
     harness.handlers.get("sparkle_improve:error")?.({ payload: { message: "boom" } });
     await pass;
-    expect(useRuntimeStore.getState().status[SPARKLE_AGENT_ID]).toBe("blocked");
+    expect(useRuntimeStore.getState().status[SPARKLE_AGENT_ID]).toBe("lapsed");
     expect(isPassRunning()).toBe(false);
     expect(harness.invokes.some((c) => c.cmd === "sparkle_improve_cancel")).toBe(false);
     expect(harness.handlers.size).toBe(0);
   });
 
+  // ── THE COLOUR OF A FAILURE IS DECIDED BY ITS MESSAGE, AND NOTHING ELSE ────────────────────────
+  //
+  // These three drive the SAME real entry point through the SAME real failure path, differing only
+  // in the text the pass failed with, and assert the status the runtimeStore actually ends up
+  // holding. That is the point of the trio: `engine/passFailureStatus` can be unit-tested all day
+  // and still be wired to nothing, and a test asserting "the classifier was called" would pass
+  // against a call whose result was thrown away.
+
+  it("a TRANSIENT failure is AMBER, and arms the slot's one re-attempt", async () => {
+    const pass = runImprovementPass("always", true);
+    await untilRunInvoked();
+    harness.handlers.get("sparkle_improve:error")?.({
+      payload: {
+        message: "API Error: Connection closed mid-response. The response above may be incomplete.",
+      },
+    });
+    await withWarnSpy(async () => {
+      await pass;
+    });
+
+    // The two halves of "another actor clears this": the colour that says so, and the armed
+    // re-attempt that is the actor. Asserting the colour alone would pass for a row that is amber
+    // while nothing is ever coming back for it.
+    expect(useRuntimeStore.getState().status[SPARKLE_AGENT_ID]).toBe("lapsed");
+    expect(passRetryDueAt()).not.toBeNull();
+  });
+
+  it("a QUOTA WALL is RED — the one failure no retry and no next hour can clear", async () => {
+    // NON-OVERRIDABLE, by the founder's instruction: the Improve Sparkle row and a build row must
+    // paint an account wall the same. `statusEngine` paints a build row's wall `blocked`; this path
+    // asks the SAME detector (`engine/quotaBlock`), so the two agree by construction.
+    const pass = runImprovementPass("always", true);
+    await untilRunInvoked();
+    harness.handlers.get("sparkle_improve:error")?.({
+      payload: { message: "You've hit your session limit · resets 8:40am (America/Bogota)" },
+    });
+    await withWarnSpy(async () => {
+      await pass;
+    });
+
+    expect(useRuntimeStore.getState().status[SPARKLE_AGENT_ID]).toBe("blocked");
+    // And it is NOT re-attempted: a wall will fail again, so the slot's retry stays unspent. This is
+    // the paired half — without it, "red" could be coming from a path that simply retries anyway.
+    expect(passRetryDueAt()).toBeNull();
+  });
+
+  it("a TIMEOUT is AMBER even though nothing is armed for it", async () => {
+    // The 30-minute watchdog: no retry is armed (a timeout is not a connectivity shape), and the row
+    // is still amber, because the NEXT HOURLY SLOT is the other actor. This is the case the amber
+    // tier is easiest to get wrong on — "nothing armed" reads like "nobody is coming".
+    await withWarnSpy(async () => {
+      const pass = runImprovementPass("always", true);
+      await untilRunInvoked();
+      await vi.advanceTimersByTimeAsync(PASS_TIMEOUT_MS);
+      await pass;
+
+      expect(useRuntimeStore.getState().status[SPARKLE_AGENT_ID]).toBe("lapsed");
+      expect(passRetryDueAt()).toBeNull();
+    });
+  });
+
   it("a rejecting sparkle_improve_run tears down fully via the fail path", async () => {
     // The fail → finish wiring: a Rust-side rejection (e.g. "a pass is already running") must
-    // clear the timer, unlisten, release the latch, and park on blocked — same teardown as
-    // the settle paths.
+    // clear the timer, unlisten, release the latch, and park on the classified failure status —
+    // same teardown as the settle paths.
     harness.invokeImpl = (cmd) =>
       cmd === "sparkle_improve_run"
         ? Promise.reject(new Error("sparkle_improve_run: a pass is already running"))
@@ -263,7 +331,7 @@ describe("runImprovementPass watchdog", () => {
 
     await runImprovementPass("always");
 
-    expect(useRuntimeStore.getState().status[SPARKLE_AGENT_ID]).toBe("blocked");
+    expect(useRuntimeStore.getState().status[SPARKLE_AGENT_ID]).toBe("lapsed");
     expect(isPassRunning()).toBe(false);
     expect(harness.handlers.size).toBe(0);
     // The watchdog timer was cleared: nothing fires later.
@@ -316,7 +384,7 @@ describe("runImprovementPass watchdog", () => {
   // log nobody reads, while every pass built on whatever the last one left behind. `unpushed` is the
   // case that cannot be stashed away (a stash cannot save a commit), so it is the one that still
   // reaches this branch after the dirt policy widened, and it is what the fixture uses.
-  it("an UNPUSHED park is a gate: the pass never spawns and the row goes blocked", async () => {
+  it("an UNPUSHED park is a gate: the pass never spawns and the row goes lapsed", async () => {
     harness.parkImpl = () => Promise.resolve({ parked: false, reason: "unpushed" });
 
     await withWarnSpy(async (warn) => {
@@ -324,7 +392,7 @@ describe("runImprovementPass watchdog", () => {
 
       // The side effect is the claim: no `claude` was spawned against a base we cannot describe.
       expectNoRunInvoked();
-      expect(useRuntimeStore.getState().status[SPARKLE_AGENT_ID]).toBe("blocked");
+      expect(useRuntimeStore.getState().status[SPARKLE_AGENT_ID]).toBe("lapsed");
       expect(isPassRunning()).toBe(false);
       // Loud, not silent — but the warning is the secondary assertion, never the only one.
       expect(warn).toHaveBeenCalledWith(
@@ -336,10 +404,12 @@ describe("runImprovementPass watchdog", () => {
     });
   });
 
-  // ESCALATION: a refusal that RECURS for the same reason must stop hiding in the silent `blocked`
-  // pill. The founder-requested prevention — the hourly loop stopped for days behind a red row nobody
-  // was pinged about, because the park declined every hour and `blocked` is deliberately not in the
-  // notify set. On the Nth consecutive same-reason decline the row rises to `errored`, which IS.
+  // ESCALATION: a refusal that RECURS for the same reason must stop hiding in the silent AMBER
+  // `lapsed` pill. The founder-requested prevention — the hourly loop stopped for days behind a row
+  // nobody was pinged about, because the park declined every hour and the quiet tier is deliberately
+  // not in the notify set. On the Nth consecutive same-reason decline the row rises to RED `errored`,
+  // which IS. That threshold is what makes the amber first refusals safe: a decline that really has
+  // no other actor still reaches the founder, just three hours later instead of instantly.
   it("escalates a STUCK loop to errored after N consecutive same-reason declines", async () => {
     harness.parkImpl = () => Promise.resolve({ parked: false, reason: "unpushed" });
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
@@ -349,7 +419,7 @@ describe("runImprovementPass watchdog", () => {
       for (let i = 1; i < PARK_DECLINE_ESCALATE_AFTER; i++) {
         await runImprovementPass("always");
         expect(parkDeclineStreakAt()).toBe(i);
-        expect(useRuntimeStore.getState().status[SPARKLE_AGENT_ID]).toBe("blocked");
+        expect(useRuntimeStore.getState().status[SPARKLE_AGENT_ID]).toBe("lapsed");
       }
       expect(errorSpy).not.toHaveBeenCalled();
 
@@ -357,7 +427,7 @@ describe("runImprovementPass watchdog", () => {
       await runImprovementPass("always");
       expect(parkDeclineStreakAt()).toBe(PARK_DECLINE_ESCALATE_AFTER);
       expect(useRuntimeStore.getState().status[SPARKLE_AGENT_ID]).toBe("errored");
-      // And it is loud where `blocked` was silent: an error log naming the streak, and an attention
+      // And it is loud where `lapsed` was silent: an error log naming the streak, and an attention
       // screen (tier (b), relayed to the phone) that says how long it has been stuck — not just the
       // bare remedy, so the reader learns this is a persistent loop, not a one-off.
       expect(errorSpy).toHaveBeenCalled();
@@ -385,7 +455,7 @@ describe("runImprovementPass watchdog", () => {
       harness.parkImpl = () => Promise.resolve({ parked: false, reason: "no-base" });
       await runImprovementPass("always");
       expect(parkDeclineStreakAt()).toBe(1);
-      expect(useRuntimeStore.getState().status[SPARKLE_AGENT_ID]).toBe("blocked");
+      expect(useRuntimeStore.getState().status[SPARKLE_AGENT_ID]).toBe("lapsed");
       expect(errorSpy).not.toHaveBeenCalled();
     } finally {
       warnSpy.mockRestore();
@@ -410,11 +480,11 @@ describe("runImprovementPass watchdog", () => {
       harness.handlers.get("sparkle_improve:done")?.({ payload: { sessionId: "s", text: "" } });
       await pass;
 
-      // The next refusal is a first offence again: back to a single `blocked`, not straight to errored.
+      // The next refusal is a first offence again: back to a single `lapsed`, not straight to errored.
       harness.parkImpl = () => Promise.resolve({ parked: false, reason: "unpushed" });
       await runImprovementPass("always");
       expect(parkDeclineStreakAt()).toBe(1);
-      expect(useRuntimeStore.getState().status[SPARKLE_AGENT_ID]).toBe("blocked");
+      expect(useRuntimeStore.getState().status[SPARKLE_AGENT_ID]).toBe("lapsed");
       expect(errorSpy).not.toHaveBeenCalled();
     } finally {
       warnSpy.mockRestore();
@@ -457,7 +527,7 @@ describe("runImprovementPass watchdog", () => {
       await runImprovementPass("always", true);
 
       expectNoRunInvoked();
-      expect(useRuntimeStore.getState().status[SPARKLE_AGENT_ID]).toBe("blocked");
+      expect(useRuntimeStore.getState().status[SPARKLE_AGENT_ID]).toBe("lapsed");
       expect(isPassRunning()).toBe(false);
       // The throw reaches the OUTER catch, not a local handler — see below.
       expect(warn).toHaveBeenCalledWith(PASS_ERRORED_WARNING, expect.any(Error));
@@ -479,16 +549,24 @@ describe("runImprovementPass watchdog", () => {
 
       // THE SIDE EFFECT: an armed retry, not merely a warning. A local catch would leave this null.
       expect(passRetryDueAt()).not.toBeNull();
-      expect(useRuntimeStore.getState().status[SPARKLE_AGENT_ID]).toBe("blocked");
+      expect(useRuntimeStore.getState().status[SPARKLE_AGENT_ID]).toBe("lapsed");
       expectNoRunInvoked();
     });
   });
 
   // A decline is PERMANENT for the reasons that reach it — a stash cannot save a commit, so nothing
-  // in the pass, the app, or the next hour's park can clear `unpushed`. A red row with no text is
-  // then the same shape the Rust side just removed, relocated from "runs forever from a stale base"
-  // to "never runs again". So the reason is written where someone will actually read it. roborev
-  // 55239.
+  // in the pass, the app, or the next hour's park can clear `unpushed`. A recoloured row with no
+  // text is then the same shape the Rust side just removed, relocated from "runs forever from a
+  // stale base" to "never runs again". So the reason is written where someone will actually read it.
+  // roborev 55239.
+  //
+  // ⚠️ THIS GOT STRICTLY MORE IMPORTANT WHEN THE FIRST REFUSALS WENT AMBER, and it very nearly went
+  // the other way: `runtimeStore.setStatus` DROPS `attentionScreen[agentId]` whenever the incoming
+  // status is outside the red tier (sparkle-99o9a), so with the writes in their original order the
+  // amber status wiped the remedy text on the next line — an amber row with no explanation anywhere,
+  // which is worse than the red row the change removes. The service writes the STATUS FIRST for that
+  // reason; this test is what pins it, and the assertion below is deliberately paired with the
+  // status so a re-reordering cannot go green.
   it("writes a readable reason and remedy where the user (and the concierge) will see it", async () => {
     harness.parkImpl = () => Promise.resolve({ parked: false, reason: "unpushed" });
 
@@ -499,6 +577,9 @@ describe("runImprovementPass watchdog", () => {
       // `read_agent_terminal` returns at tier (b) — so this one write reaches every surface.
       const screen = useRuntimeStore.getState().attentionScreen[SPARKLE_AGENT_ID] ?? "";
       expect(screen).toBe(refusalDetail("unpushed"));
+      // PAIRED WITH THE STATUS. The row is AMBER and the text is still there — asserting the text
+      // alone would pass on a row that had been left red, which is the thing this change removes.
+      expect(useRuntimeStore.getState().status[SPARKLE_AGENT_ID]).toBe("lapsed");
       // It must NAME A REMEDY, not just restate the machine token: a user told "unpushed" has no
       // way to know the thing to act on is a branch in a worktree they have never opened.
       expect(screen).toMatch(/push that branch|delete it/i);
@@ -571,7 +652,8 @@ describe("runImprovementPass watchdog", () => {
     await pass;
 
     expect(isPassRunning()).toBe(false);
-    // A deliberate handoff is not a failure — "blocked" would read as "needs your attention".
+    // A deliberate handoff is not a failure at all — not even the amber "unfinished" tier, which
+    // would claim the pass still owes this hour something. It doesn't; the pane took over.
     expect(useRuntimeStore.getState().status[SPARKLE_AGENT_ID]).toBe("idle");
     expect(harness.handlers.size).toBe(0);
 
@@ -599,8 +681,8 @@ describe("runImprovementPass watchdog", () => {
 
   it("the watchdog's own cancel still reports a timeout, not a cancellation", async () => {
     // Ordering guard: the watchdog cancels AND settles. Its synchronous settle must win over
-    // the cancel hook, or a genuinely hung pass would be quietly recorded as a handoff and
-    // stop parking on "blocked".
+    // the cancel hook, or a genuinely hung pass would be quietly recorded as a handoff and land on
+    // the calm `idle` instead of the "unfinished" `lapsed` a timeout earns.
     await withWarnSpy(async (warn) => {
       const pass = runImprovementPass("always");
       await untilRunInvoked();
@@ -608,7 +690,7 @@ describe("runImprovementPass watchdog", () => {
       await vi.advanceTimersByTimeAsync(PASS_TIMEOUT_MS);
       await pass;
 
-      expect(useRuntimeStore.getState().status[SPARKLE_AGENT_ID]).toBe("blocked");
+      expect(useRuntimeStore.getState().status[SPARKLE_AGENT_ID]).toBe("lapsed");
       expect(warn).toHaveBeenCalledWith(
         "improvement pass failed:",
         expect.stringContaining("timed out"),
@@ -793,7 +875,7 @@ describe("runImprovementPass watchdog", () => {
         );
         // The bound exists so a diagnostic can never end the hourly loop.
         expect(isPassRunning()).toBe(false);
-        expect(useRuntimeStore.getState().status[SPARKLE_AGENT_ID]).toBe("blocked");
+        expect(useRuntimeStore.getState().status[SPARKLE_AGENT_ID]).toBe("lapsed");
       });
     });
 
@@ -818,11 +900,11 @@ describe("runImprovementPass watchdog", () => {
           "improvement pass: gave up waiting to see what the killed pass left behind",
         );
         expect(isPassRunning()).toBe(false);
-        expect(useRuntimeStore.getState().status[SPARKLE_AGENT_ID]).toBe("blocked");
+        expect(useRuntimeStore.getState().status[SPARKLE_AGENT_ID]).toBe("lapsed");
       });
     });
 
-    it("a probe that throws is swallowed — the pass still ends blocked, with the latch released", async () => {
+    it("a probe that throws is swallowed — the pass still ends lapsed, with the latch released", async () => {
       let n = 0;
       harness.parkImpl = () =>
         n++ === 0
@@ -835,7 +917,7 @@ describe("runImprovementPass watchdog", () => {
         await expect(pass).resolves.toBeUndefined();
 
         expect(isPassRunning()).toBe(false);
-        expect(useRuntimeStore.getState().status[SPARKLE_AGENT_ID]).toBe("blocked");
+        expect(useRuntimeStore.getState().status[SPARKLE_AGENT_ID]).toBe("lapsed");
         expect(warn).toHaveBeenCalledWith(
           "improvement pass: could not tell what the killed pass left behind:",
           expect.any(Error),
@@ -847,7 +929,7 @@ describe("runImprovementPass watchdog", () => {
   it("a partial listen failure still unlistens the fulfilled registration", async () => {
     // The leak this suite's service fix exists for (roborev #24516 → 23912a26): done registers,
     // error rejects → the fulfilled done handle must still be torn down, the pass must park on
-    // blocked with the latch released, and no run must be spawned.
+    // lapsed with the latch released, and no run must be spawned.
     harness.listenImpl = (name) =>
       name === "sparkle_improve:error"
         ? Promise.reject(new Error("event bus unavailable"))
@@ -855,7 +937,7 @@ describe("runImprovementPass watchdog", () => {
 
     await runImprovementPass("always");
 
-    expect(useRuntimeStore.getState().status[SPARKLE_AGENT_ID]).toBe("blocked");
+    expect(useRuntimeStore.getState().status[SPARKLE_AGENT_ID]).toBe("lapsed");
     expect(isPassRunning()).toBe(false);
     // The one that DID register was unlistened — this is the assertion that catches the leak.
     expect(harness.handlers.size).toBe(0);

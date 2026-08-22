@@ -18,6 +18,10 @@ import {
   resetImprovePassLiveness,
   type ImprovePassLiveness,
 } from "./improvePassLiveness";
+import {
+  resetImproveDutyForTests,
+  useImproveDutyStore,
+} from "./improveDutySnapshot";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 
@@ -42,9 +46,13 @@ function store(opts: { open?: boolean; status?: AgentTabStatus } = {}): void {
 const rowStatus = (): AgentTabStatus | undefined =>
   useRuntimeStore.getState().status[SPARKLE_AGENT_ID];
 
+/** What the row's hover text is allowed to say about the pass's age, as this poll publishes it. */
+const elapsed = (): number | null => useImproveDutyStore.getState().passElapsedMs;
+
 beforeEach(() => {
   invokeMock.mockReset();
   resetImprovePassLiveness();
+  resetImproveDutyForTests();
   store();
 });
 
@@ -240,5 +248,93 @@ describe("the pinned Improve Sparkle row's process-driven status writer", () => 
     await expect(pollImprovePassLiveness()).resolves.toBeUndefined();
 
     expect(rowStatus()).toBe("stopped");
+  });
+
+  // ── THE AMBER TIER, WHICH IS CALM RATHER THAN ADDRESSED TO ANYONE ────────────────────────────
+  it("raises the row off `lapsed` — amber describes the LAST pass, not the live one", () => {
+    // `lapsed` means "unfinished, and finishing it is not your job". A row still wearing the
+    // previous pass's amber while THIS pass's child is demonstrably alive is describing the wrong
+    // pass, and green is the truer answer.
+    store({ status: "lapsed" });
+    invokeMock.mockResolvedValue(reading(true, 90_000));
+
+    return pollImprovePassLiveness().then(() => {
+      expect(rowStatus()).toBe("working");
+    });
+  });
+
+  // ⚠️ REQUIRED GUARD. A quota wall and a park that has declined the same way three hours running
+  // land on this row as `blocked` / `errored`. A green raise over either would hide the ONE state
+  // only the founder can clear — and the recurring shape of this bug is exactly a red quietly
+  // re-derived into something calmer.
+  it.each(["blocked", "errored"] as AgentTabStatus[])(
+    "NEVER paints green over a red `%s` row, however alive the child looks",
+    async (status) => {
+      store({ status });
+      invokeMock.mockResolvedValue(reading(true, 5 * 60_000));
+
+      await pollImprovePassLiveness();
+      await pollImprovePassLiveness();
+
+      expect(rowStatus()).toBe(status);
+    },
+  );
+
+  // ── THE HALF OF THE READING THAT USED TO BE THROWN AWAY ──────────────────────────────────────
+  describe("the pass's elapsed clock", () => {
+    it("publishes how long the live child has been running", async () => {
+      expect(elapsed()).toBeNull();
+      invokeMock.mockResolvedValue(reading(true, 12 * 60_000));
+
+      await pollImprovePassLiveness();
+
+      // Before this, `active` was read and `elapsedMs` discarded, so a hung pass sat green with no
+      // indication at all until STALE_PASS_MAX (35 minutes) flipped `active` to false.
+      expect(elapsed()).toBe(12 * 60_000);
+    });
+
+    it("clears the clock the moment no child is live", async () => {
+      invokeMock.mockResolvedValue(reading(true, 12 * 60_000));
+      await pollImprovePassLiveness();
+
+      invokeMock.mockResolvedValue(reading(false, null));
+      await pollImprovePassLiveness();
+
+      expect(elapsed()).toBeNull();
+    });
+
+    it("does not report a STALE pass's age — past the ceiling it is not a pass this row reports", async () => {
+      // Rust keeps sending `elapsedMs` past STALE_PASS_MAX (deliberately, so a caller can tell
+      // "nothing running" from "running but stale"). Reporting that number would label a row green
+      // that this writer has already released.
+      invokeMock.mockResolvedValue(reading(false, 40 * 60_000));
+
+      await pollImprovePassLiveness();
+
+      expect(elapsed()).toBeNull();
+    });
+
+    it("keeps the last good reading through a probe it could not take", async () => {
+      // Same rule as the status hold above: a failed probe is not evidence the child died, so
+      // blanking "12m into this pass" on a transient IPC hiccup would be inventing a fact.
+      invokeMock.mockResolvedValue(reading(true, 12 * 60_000));
+      await pollImprovePassLiveness();
+
+      invokeMock.mockRejectedValue(new Error("ipc hiccup"));
+      await pollImprovePassLiveness();
+
+      expect(elapsed()).toBe(12 * 60_000);
+    });
+
+    it("carries a null `elapsedMs` on a live child without inventing a number", async () => {
+      // The wire shape says the key is ALWAYS present and may be null. Null means "no age known",
+      // and the paint engine's rule 2 is keyed on `!= null` precisely so that reads as no label.
+      invokeMock.mockResolvedValue(reading(true, null));
+
+      await pollImprovePassLiveness();
+
+      expect(rowStatus()).toBe("working");
+      expect(elapsed()).toBeNull();
+    });
   });
 });

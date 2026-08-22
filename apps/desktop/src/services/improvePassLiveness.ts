@@ -55,6 +55,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import type { AgentTabStatus } from "../types";
 import { statusWriteCount, useRuntimeStore } from "../stores/runtimeStore";
+import { noteImprovePassElapsed } from "./improveDutySnapshot";
 import { SPARKLE_AGENT_ID } from "./sparkleAgent";
 
 /** Wire shape of the `sparkle_improve_active` command (`ImproveLiveness` in `sparkle_improve.rs`).
@@ -77,12 +78,21 @@ export const LIVENESS_POLL_MS = 10_000;
 /** The statuses this writer may raise FROM: the ones that mean "no turn is running". Anything else
  *  — `working`, and every attention tier (`waiting`/`approval`/`blocked`/`errored`/`questions`) — is
  *  a live producer's word about this agent and is never overwritten, so a pass that reports its own
- *  richer state mid-flight keeps it. `undefined` (no producer has ever written) counts as resting. */
+ *  richer state mid-flight keeps it. `undefined` (no producer has ever written) counts as resting.
+ *
+ *  ⚠️ `lapsed` IS HERE AND IT IS THE ONLY CALM TIER ADDED. Amber means "unfinished, and finishing it
+ *  is not your job" — another actor clears it — so a row wearing it while a pass child is DEMONSTRABLY
+ *  ALIVE is describing the previous pass, not this one, and green is the truer answer. The two RED
+ *  neighbours are deliberately NOT here and adding them would be the recurring bug this row keeps
+ *  hitting: `blocked`/`errored` on this row is typically a quota wall or a park that declined the
+ *  same way three hours running, and a green raise over either would hide the one state only the
+ *  founder can clear. RAISE OVER CALM, NEVER OVER RED. */
 const RESTING: ReadonlySet<AgentTabStatus> = new Set<AgentTabStatus>([
   "stopped",
   "idle",
   "done",
   "new",
+  "lapsed",
 ]);
 
 /** The resting value this writer displaced when it raised the row, or `null` when it holds nothing.
@@ -135,8 +145,18 @@ export async function pollImprovePassLiveness(): Promise<void> {
   try {
     live = await invoke<ImprovePassLiveness>("sparkle_improve_active");
   } catch {
-    // No reading taken — leave the row exactly as the existing producers left it.
+    // No reading taken — leave the row exactly as the existing producers left it, AND leave the
+    // elapsed clock alone. A failed probe is not evidence the child died (see the header); writing
+    // `null` here would blank a live pass's "12m into this pass" on a transient IPC hiccup.
     return;
   }
-  applyLiveness(live?.active === true);
+  const active = live?.active === true;
+  // THE OTHER HALF OF A READING WE USED TO THROW AWAY. Rust has always shipped `{ active,
+  // elapsed_ms }` and this file read only `active`, so a hung pass sat green with no indication at
+  // all until `STALE_PASS_MAX` (35 minutes) flipped `active` to false. Published only while the
+  // child is genuinely live: past that ceiling `elapsedMs` is still present (deliberately, so a
+  // caller can tell "nothing running" from "running but stale") but it no longer describes a pass
+  // this row is reporting, and a stale number is worse than no number.
+  noteImprovePassElapsed(active ? (live.elapsedMs ?? null) : null);
+  applyLiveness(active);
 }

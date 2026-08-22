@@ -13,6 +13,10 @@ import { useRuntimeStore } from "./stores/runtimeStore";
 import { useSettingsStore } from "./stores/settingsStore";
 import { SPARKLE_AGENT_ID } from "./services/sparkleAgent";
 import { resetImprovePassLiveness } from "./services/improvePassLiveness";
+import {
+  resetImproveDutyForTests,
+  useImproveDutyStore,
+} from "./services/improveDutySnapshot";
 import { useImprovementScheduler } from "./useImprovementScheduler";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
@@ -36,6 +40,7 @@ beforeEach(() => {
   // "never" parks the hourly tick at its first gate, so nothing here can start a real pass; the
   // liveness poll sits deliberately outside that gating and must run anyway.
   useSettingsStore.setState({ sparkleImprovementConsent: "never" });
+  resetImproveDutyForTests();
 });
 
 afterEach(() => {
@@ -86,5 +91,65 @@ describe("useImprovementScheduler mounts the row's process-truth writer", () => 
 
     expect(invokeMock).not.toHaveBeenCalled();
     expect(useRuntimeStore.getState().status[SPARKLE_AGENT_ID]).toBeUndefined();
+  });
+});
+
+// ── THE DOT'S FACTS RIDE THE SAME 10s BEAT ─────────────────────────────────────────────────────
+//
+// Same charter as the block above, for the other half of the pinned row's honesty: the RULE is
+// covered by `engine/sparkleDutyPaint.test.ts` and the READER by
+// `services/improveDutySnapshot.test.ts`, and neither can see whether anything calls the reader.
+// Wired to the FIVE-MINUTE scheduler tick instead of this one, every assertion in both of those
+// suites stays green while the dot sits up to five minutes stale — which this file's own comment
+// names as the symptom rather than the fix.
+describe("useImprovementScheduler publishes the pinned row's standing duty", () => {
+  it("publishes a snapshot on the first liveness beat, not on the five-minute tick", async () => {
+    invokeMock.mockResolvedValue({ active: false, elapsedMs: null });
+    // `never` is a real hold with a real sentence, and it parks the hourly tick at its first gate —
+    // so anything published here demonstrably came from the liveness beat.
+    useSettingsStore.setState({ sparkleImprovementConsent: "never" });
+    expect(useImproveDutyStore.getState().at).toBe(0);
+
+    renderHook(() => useImprovementScheduler(true));
+    await advance(1_500);
+
+    expect(useImproveDutyStore.getState().hold).toBe("consent-off");
+    expect(useImproveDutyStore.getState().holdText).toBeTruthy();
+    expect(useImproveDutyStore.getState().at).toBeGreaterThan(0);
+  });
+
+  it("keeps republishing, so a hold that clears stops being reported within ten seconds", async () => {
+    invokeMock.mockResolvedValue({ active: false, elapsedMs: null });
+    useSettingsStore.setState({ sparkleImprovementConsent: "never" });
+
+    renderHook(() => useImprovementScheduler(true));
+    await advance(1_500);
+    expect(useImproveDutyStore.getState().hold).toBe("consent-off");
+
+    // The user turns consent back on, with the clock already seeded.
+    useSettingsStore.setState({
+      sparkleImprovementConsent: "always",
+      improvementLastRunAt: Date.now() - 60_000,
+    });
+    await advance(11_000);
+
+    expect(useImproveDutyStore.getState().hold).toBeNull();
+    expect(useImproveDutyStore.getState().nextPassAt).not.toBeNull();
+  });
+
+  it("publishes the live pass's age from the same beat that reads the process", async () => {
+    invokeMock.mockResolvedValue({ active: true, elapsedMs: 8 * 60_000 });
+
+    renderHook(() => useImprovementScheduler(true));
+    await advance(1_500);
+
+    expect(useImproveDutyStore.getState().passElapsedMs).toBe(8 * 60_000);
+  });
+
+  it("publishes nothing in a window the scheduler is disabled in", async () => {
+    renderHook(() => useImprovementScheduler(false));
+    await advance(30_000);
+
+    expect(useImproveDutyStore.getState().at).toBe(0);
   });
 });

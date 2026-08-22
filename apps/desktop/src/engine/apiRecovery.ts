@@ -96,6 +96,101 @@ const ACCOUNT_LIMIT_OPENER = /^you['’´`]?ve hit your\b[^\n]*\blimit\b/i;
 const ACCOUNT_LIMIT_TAIL = /(?:·|•|\||—|-)\s*(?:resets\b|raise it at\b)/i;
 
 /**
+ * A SUB-AGENT's banner, quoted onto the PARENT's screen behind a failure prefix.
+ *
+ * With the Task tool the child process dies on the account wall and the parent prints the child's
+ * whole banner behind its own prose:
+ *
+ *     Agent "Fix auto-switch on expired account" failed: Claude Code process exited due to an API
+ *     error: You've hit your session limit · resets 9:30am
+ *
+ * The opener is `^`-anchored, so that line matched NOTHING and the parent row painted GRAY while the
+ * account was flatly out of session window. Stripping ONLY this exact shape and re-running the
+ * unchanged opener+tail test on the remainder keeps the anchor's whole point: the remainder must
+ * still OPEN with the banner, so prose that merely mentions a failed sub-agent, or quotes one
+ * mid-sentence, still declines. Deliberately NOT applied before {@link API_BANNER_PATTERN} — a
+ * retryable verdict is already the default for anything that reaches it, so widening its reach buys
+ * nothing and costs the anchor.
+ */
+const SUBAGENT_FAILURE_PREFIX = /^agent\s+"[^"]*"\s+failed:\s*.*?\bapi error:\s*/i;
+
+/**
+ * The TUI's tool-result marker, stripped ONLY before the ACCOUNT-LIMIT test and NEVER before
+ * {@link API_BANNER_PATTERN}. That asymmetry is the entire mechanism — read
+ * {@link classifyFromScrollback}'s note on the backwards scan before touching it.
+ *
+ * A sub-agent's limit banner reaches the parent's screen as a tool RESULT row, so it wears `⎿`, not
+ * `⏺`. Stripping it here makes "  ⎿  You've hit your session limit · resets 9:30am" classify
+ * `terminal`, while "  ⎿  API Error: 529 Overloaded." still classifies NULL and therefore still
+ * cannot win the backwards scan over a genuine limit banner above it. Adding `⎿` to
+ * `streamFailure.MESSAGE_MARKERS` instead would strip it for BOTH tests and invert exactly that case.
+ */
+const TOOL_RESULT_MARKER = /^⎿\s*/;
+
+/**
+ * The AUTO-CONTINUE wording of the same wall:
+ *
+ *     Usage limit reached · continuing automatically at 9:30am
+ *
+ * Its own opener, because it does not start with "You've hit your", and it earns `terminal` the same
+ * way every other account wall does — an anchored opener AND a separator-led tail — so prose about
+ * usage limits stays null. Classified `terminal` like every other account wall: the founder's rule is
+ * that the Improve Sparkle row and the build rows resolve colours IDENTICALLY, and every quota wall is
+ * RED on every row today. (Whether "continuing automatically" should instead read as amber — the
+ * agent says it will retry itself — is a real product question, and the founder's to decide.)
+ */
+const AUTO_CONTINUE_OPENER = /^(?:claude(?:\s+ai)?\s+)?usage limit reached\b/i;
+
+/**
+ * The tail {@link AUTO_CONTINUE_OPENER} accepts, in addition to {@link ACCOUNT_LIMIT_TAIL}.
+ *
+ * ⚠️ THE OPENER'S `claude` PREFIX AND THIS ALTERNATION ARE BOTH LOAD-BEARING, and both were missing
+ * (roborev 67784). EVERY wording this repo has actually captured leads with "Claude" and none of
+ * them ends in "· resets":
+ *
+ *     Claude usage limit reached. Your limit resets at 5:00pm.        (rateLimitWatch.test.ts)
+ *     Claude usage limit reached - resuming at 5pm                    (claude_oneshot.rs tests)
+ *     Claude usage limit reached — will reset at 3pm (America/Bogota) (rateLimitWatch.test.ts)
+ *     Claude usage limit reached|1787412000                           (429 body)
+ *
+ * An opener anchored on `^usage limit reached` with a `· continuing` tail reaches NONE of them, so
+ * the shape this arm was added for still painted gray on every real capture.
+ *
+ * THE EARN-IT RULE IS NOT RELAXED, and that is the difference between this and the wider fix that
+ * was declined. `claude_oneshot.rs::is_account_limit` matches these phrases ANYWHERE, unanchored —
+ * correct for ITS input (a JSON error body), wrong here, where the input is a terminal line and
+ * `classifyApiFailure`'s whole false-positive discipline is that prose must not match. Matching the
+ * bare phrase anywhere would reclassify all three of this module's own prose negatives, including
+ * "Usage limit reached is the wall we must paint red". So the opener stays ANCHORED and a tail is
+ * still REQUIRED; only the vocabulary of real tails is corrected.
+ *
+ * The trailing epoch alternative covers the 429 body's `|1787412000`: a separator followed by a long
+ * bare integer is machine output, never prose.
+ */
+const AUTO_CONTINUE_TAIL =
+  /(?:(?:·|•|\||—|-)\s*(?:continuing|resets|resuming|will reset)\b)|(?:\blimit resets at\b)|(?:\bwill reset at\b)|(?:\bresuming at\b)|(?:(?:·|•|\||—|-)\s*\d{6,})/i;
+
+/**
+ * The two multi-word phrases that mean "this is an ACCOUNT wall" when they appear INSIDE an
+ * `API Error:` banner — the 429-delivered form of the very same limit.
+ *
+ * Same phrases `claude_oneshot.rs::is_account_limit` trusts, and its header records that each is "a
+ * fragment of a real message, verified against captures". They are used here ONLY in conjunction
+ * with {@link API_BANNER_PATTERN}, i.e. only on a line that already OPENS with "API Error:", which
+ * is what keeps prose out — a sentence about usage limits does not begin that way.
+ *
+ * WHY IT MATTERS (roborev 67784): a subscription wall delivered as a 429 reaches
+ * {@link API_BANNER_PATTERN} first and classifies `retryable`, so the ladder spends all eleven rungs
+ * prompting an account that is flatly out of window. That is the exact inversion `claude_oneshot.rs`
+ * reordered its own gates to prevent ("status first is what caused it").
+ *
+ * DISJOINT, not merely ordered, from the one banner that must stay retryable:
+ * "API Error: Server is temporarily limiting requests (not your usage limit) · Rate limited"
+ * contains "usage limit" but neither "usage limit reached" nor "limit resets at".
+ */
+const ACCOUNT_WALL_IN_BANNER = /\busage limit reached\b|\blimit resets at\b/i;
+
+/**
  * ANY banner Claude Code prints for a failed request, tested only after the account-limit shapes
  * above have declined.
  *
@@ -152,10 +247,47 @@ const API_BANNER_PATTERN = /^api error\s*:/i;
  */
 export function classifyApiFailure(line: string): ApiFailureClass | null {
   const s = line.trim();
-  // Terminal must EARN it: the opener AND the tail, the latter anywhere in the line.
-  if (ACCOUNT_LIMIT_OPENER.test(s) && ACCOUNT_LIMIT_TAIL.test(s)) return "terminal";
-  if (API_BANNER_PATTERN.test(s)) return "retryable";
+  // Terminal must EARN it: an ANCHORED opener AND a separator-led tail, the latter anywhere in the
+  // line. Tested against the line itself and against the two narrow UNWRAPPINGS below — never
+  // against a search-anywhere opener, which is what keeps prose out.
+  for (const candidate of accountLimitCandidates(s)) {
+    if (ACCOUNT_LIMIT_OPENER.test(candidate) && ACCOUNT_LIMIT_TAIL.test(candidate)) return "terminal";
+    if (
+      AUTO_CONTINUE_OPENER.test(candidate) &&
+      (AUTO_CONTINUE_TAIL.test(candidate) || ACCOUNT_LIMIT_TAIL.test(candidate))
+    ) {
+      return "terminal";
+    }
+  }
+  // NOTE the input: `s`, never a candidate. Stripping `⎿` before this anchor is what would let a
+  // tool-result "API Error: 529" win the backwards scan over a real limit banner above it.
+  if (API_BANNER_PATTERN.test(s)) {
+    // An ACCOUNT wall delivered as a 429 is still an account wall. Checked INSIDE this branch, so
+    // the phrase can only ever be read on a line that already opens with the banner prefix — prose
+    // never reaches it. See {@link ACCOUNT_WALL_IN_BANNER} for why retryable here is expensive.
+    return ACCOUNT_WALL_IN_BANNER.test(s) ? "terminal" : "retryable";
+  }
   return null;
+}
+
+/**
+ * The forms of one line the ACCOUNT-LIMIT test is run against: the line itself, then it with a
+ * leading `⎿` removed, then each of those with a {@link SUBAGENT_FAILURE_PREFIX} removed.
+ *
+ * Both peelings are narrowly anchored and BOTH exist for the same real shape — a sub-agent's wall
+ * arriving on the parent's screen — which is why they compose rather than being alternatives. The
+ * opener stays `^`-anchored against whatever remains, so nothing here loosens the discipline that
+ * keeps prose, paraphrase and this module's own docstrings out of `terminal`.
+ */
+function accountLimitCandidates(s: string): string[] {
+  const out = [s];
+  const unmarked = s.replace(TOOL_RESULT_MARKER, "");
+  if (unmarked !== s) out.push(unmarked);
+  for (const base of [...out]) {
+    const unprefixed = base.replace(SUBAGENT_FAILURE_PREFIX, "");
+    if (unprefixed !== base) out.push(unprefixed);
+  }
+  return out;
 }
 
 /** How many trailing lines of scrollback {@link classifyFromScrollback} considers. The banner that
@@ -199,8 +331,15 @@ export const SCROLLBACK_SCAN_LINES = 40;
  * recorded rather than rushed: it inverts `terminal` → `retryable`, i.e. eleven bounded prompts and a
  * mis-worded escalation — not the expensive direction (a false billing claim with zero rungs spent).
  * Closing it means skipping rows that belong to an open tool-result block, the same block-tracking
- * `streamFailure`'s header proposes; unlike over there it would be fail-SAFE here, since a genuine
- * banner is an ASSISTANT message and wears `⏺`, never `⎿`. Tracked on bead `sparkle-onzu`.
+ * `streamFailure`'s header proposes; unlike over there it would be fail-SAFE here.
+ *
+ * ⚠️ "A GENUINE BANNER WEARS `⏺`, NEVER `⎿`" — which this note used to assert — IS FALSE, and
+ * believing it is what left a session-limited agent GRAY. With the Task tool a SUB-AGENT hits the
+ * wall, and its banner reaches the parent's screen as a tool RESULT row: "  ⎿  You've hit your
+ * session limit · resets 9:30am". So `⎿` is stripped — in {@link classifyApiFailure}, before the
+ * ACCOUNT-LIMIT test ONLY (see {@link TOOL_RESULT_MARKER}). It is deliberately NOT stripped before
+ * `^api error:`, so the inversion described above stays impossible by construction rather than by
+ * the accident of one glyph being left alone. Tracked on bead `sparkle-onzu`.
  *
  * Pure — the caller supplies the scrollback.
  */
@@ -222,8 +361,48 @@ export function classifyFromScrollback(scrollback: string): ApiFailureClass | nu
     // with the following one as well as alone. Joined SECOND so an already-complete line is judged on
     // its own first, and only the immediately-next row is used: a wrap continues on the very next row,
     // and reaching further would let an unrelated later line lend a tail to an innocent opener.
-    const joined = i + 1 < tail.length ? `${line} ${stripMarkers(tail[i + 1] ?? "")}` : null;
-    const verdict = classifyApiFailure(line) ?? (joined === null ? null : classifyApiFailure(joined));
+    const rawNext = i + 1 < tail.length ? (tail[i + 1] ?? "") : null;
+    const joined = rawNext === null ? null : `${line} ${stripMarkers(rawNext)}`;
+    // A wrapped row is the SAME TUI row continued, so it carries no marker of its own.
+    //
+    // ESCAPES, NOT LITERAL GLYPHS, and deliberately (the `glyphIcons` ratchet counted this line as a
+    // fifth glyph-as-icon site and reds CI at a ceiling of four). That ratchet is about glyphs used
+    // as ICONS, which react-icons/fi should own; this is a PARSER matching the TUI's own markers, so
+    // the honest fix is to spell the codepoints rather than to exempt the file and blunt the ratchet
+    // for every future edit to it. U+23FA ⏺ message, U+23BF ⎿ tool result, U+25CF ● bullet.
+    const isWrapContinuation =
+      rawNext !== null && !/^\s*[\u23FA\u23BF\u25CF]/.test(rawNext);
+    // ⚠️ A `retryable` LINE-ALONE VERDICT MUST STILL BE UPGRADABLE BY THE JOIN (roborev 67803).
+    // `alone ?? joined` consults the join only when the row alone is NULL — and an `API Error:` row
+    // is never null, it is `retryable`. So a 429-delivered account wall, which is ~100 chars and
+    // therefore wraps on any narrow pane, returned `retryable` on its first row and the row carrying
+    // "usage limit reached" was never joined in: all eleven rungs spent against a walled account,
+    // verbatim the inversion the in-banner rule was added to end. `quotaBlock.quotaBlocksIn` already
+    // gates its join on `!== "terminal"` for this reason; these two read the same rows and must not
+    // disagree about them.
+    const alone = classifyApiFailure(line);
+    if (alone === "terminal") return alone;
+    const fromJoined = joined === null ? null : classifyApiFailure(joined);
+    // ⚠️ AN UPGRADE MAY ONLY COME FROM A WRAP CONTINUATION (roborev 67814, HIGH).
+    // The in-banner rule's whole safety is that it is read only on a line already opening with
+    // "API Error:" — "prose never reaches it". An unconditional join defeats exactly that: an
+    // innocent 529 followed by ANY row mentioning the phrase became `terminal`. Measured on
+    //     ⏺ API Error: 529 Overloaded.
+    //     ⏺ Usage limit reached is the wall we must paint red
+    // — and that second line is verbatim one of this file's own prose negatives, i.e. a line an
+    // agent working on this feature actually prints. The cost is the expensive direction the header
+    // names: a false billing claim, zero rungs spent, the row red for hours.
+    //
+    // A hard wrap never starts a new TUI row, so a continuation CANNOT begin with a message marker.
+    // Requiring that is what separates "the rest of this banner" from "the next thing that happened".
+    // NOTE this gates only the UPGRADE. A line that classifies null on its own keeps the original
+    // join behaviour, which predates this rule and is what unwraps a split account-limit banner.
+    const verdict =
+      alone === null
+        ? fromJoined
+        : isWrapContinuation && fromJoined === "terminal"
+          ? "terminal"
+          : alone;
     if (verdict !== null) return verdict;
   }
   return null;

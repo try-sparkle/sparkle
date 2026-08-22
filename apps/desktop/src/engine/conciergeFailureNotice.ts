@@ -165,6 +165,14 @@ export interface ConciergeFailureNotice {
   evidence: string;
 }
 
+/** Is this a CREDENTIAL failure? Exported so a caller that rejects the quota arm can still reach the
+ *  auth one — `classify` returns on the FIRST hit, so a message carrying any quota token can never
+ *  fall through to AUTH on its own (roborev 67814). Reuses the pattern rather than restating it: its
+ *  "session" vs "token" scar is exactly what a second copy would lose. */
+export function isAuthFailure(detail: string): boolean {
+  return AUTH.test(detail);
+}
+
 function classify(detail: string): ConciergeFailureKind {
   if (QUOTA.test(detail)) return "quota";
   if (AUTH.test(detail)) return "auth";

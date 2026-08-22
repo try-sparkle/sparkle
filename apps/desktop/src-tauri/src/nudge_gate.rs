@@ -640,6 +640,119 @@ fn account_limit_tail() -> &'static Regex {
     })
 }
 
+/// The AUTO-CONTINUE opener, mirroring TS `AUTO_CONTINUE_OPENER`.
+///
+/// PORTED LATE, AND THAT GAP WAS THE BUG (roborev 67784). This module had only the "you've hit
+/// your … limit" shape, so the founder's own screen — `Usage limit reached · continuing
+/// automatically at 9:30am` — left `quota_blocked` FALSE and the ladder kept climbing against a
+/// walled agent, which is verbatim the eight-consecutive-nudges incident this file exists to
+/// prevent.
+///
+/// The optional `claude` / `claude ai` prefix is not decoration: every wording this repo has
+/// captured leads with it (`Claude usage limit reached — will reset at 3pm`). The anchor stays, so
+/// prose still cannot match.
+fn auto_continue_opener() -> &'static Regex {
+    static CELL: OnceLock<Regex> = OnceLock::new();
+    CELL.get_or_init(|| {
+        Regex::new(r"(?i)^(?:claude(?:\s+ai)?\s+)?usage limit reached\b")
+            .expect("auto_continue_opener must compile")
+    })
+}
+
+/// The tail that opener accepts, mirroring TS `AUTO_CONTINUE_TAIL`. A tail is still REQUIRED — the
+/// earn-it discipline is what keeps an agent discussing usage limits from standing itself down.
+fn auto_continue_tail() -> &'static Regex {
+    static CELL: OnceLock<Regex> = OnceLock::new();
+    CELL.get_or_init(|| {
+        Regex::new(
+            r"(?i)(?:(?:·|•|\||—|-)\s*(?:continuing|resets|resuming|will reset)\b)|(?:\blimit resets at\b)|(?:\bwill reset at\b)|(?:\bresuming at\b)|(?:(?:·|•|\||—|-)\s*\d{6,})",
+        )
+        .expect("auto_continue_tail must compile")
+    })
+}
+
+/// A sub-agent's banner quoted onto the parent's screen, mirroring TS `SUBAGENT_FAILURE_PREFIX`.
+///
+/// With the Task tool the CHILD dies on the wall and the parent prints the child's whole banner
+/// behind its own prose, so the line-initial opener cannot anchor. Peeling only this narrowly
+/// anchored shape keeps the anchor's point: the remainder must still OPEN with the banner.
+fn subagent_failure_prefix() -> &'static Regex {
+    static CELL: OnceLock<Regex> = OnceLock::new();
+    CELL.get_or_init(|| {
+        Regex::new(r#"(?i)^agent\s+"[^"]*"\s+failed:\s*.*?\bapi error:\s*"#)
+            .expect("subagent_failure_prefix must compile")
+    })
+}
+
+/// The account wall carried INSIDE an `API Error:` banner — the 429-delivered form, mirroring TS
+/// `ACCOUNT_WALL_IN_BANNER`.
+///
+/// Ported because the TS side promotes this shape to `terminal` and the two gates must not disagree
+/// about what a wall is: without it an agent whose screen shows
+/// `API Error: 429 {…"Claude AI usage limit reached|…"}` is quota-blocked on the TS side while
+/// `quota_blocked` stays FALSE here, and the ladder keeps climbing against a walled agent — the
+/// eight-consecutive-nudges incident this file exists to prevent (roborev 67803).
+///
+/// Used ONLY together with an `^api error:` line, which is what keeps prose out.
+fn account_wall_in_banner() -> &'static Regex {
+    static CELL: OnceLock<Regex> = OnceLock::new();
+    CELL.get_or_init(|| {
+        Regex::new(r"(?i)\busage limit reached\b|\blimit resets at\b")
+            .expect("account_wall_in_banner must compile")
+    })
+}
+
+/// `^api error\s*:`, mirroring TS `API_BANNER_PATTERN` — needed only to scope
+/// {@link account_wall_in_banner}.
+fn api_banner_opener() -> &'static Regex {
+    static CELL: OnceLock<Regex> = OnceLock::new();
+    CELL.get_or_init(|| {
+        Regex::new(r"(?i)^api error\s*:").expect("api_banner_opener must compile")
+    })
+}
+
+/// Does this row (optionally joined with the next, to survive an xterm hard wrap) show either
+/// account-limit shape? Both openers are anchored and both demand a tail.
+fn row_shows_account_limit(row: &str, next: Option<&str>) -> bool {
+    let peeled = subagent_failure_prefix().replace(row, "");
+    for candidate in [row, peeled.as_ref()] {
+        // The 429-delivered wall: an API-error banner whose BODY names the account limit. Checked
+        // inside the banner scope so prose can never reach it. Joined form too, since the banner is
+        // long enough to wrap.
+        if api_banner_opener().is_match(candidate)
+            && (account_wall_in_banner().is_match(candidate)
+                || next.is_some_and(|n| {
+                    account_wall_in_banner().is_match(&format!("{candidate} {n}"))
+                }))
+        {
+            return true;
+        }
+        let opener_hit = account_limit_opener().is_match(candidate);
+        let auto_hit = auto_continue_opener().is_match(candidate);
+        if !opener_hit && !auto_hit {
+            continue;
+        }
+        if (opener_hit && account_limit_tail().is_match(candidate))
+            || (auto_hit
+                && (auto_continue_tail().is_match(candidate)
+                    || account_limit_tail().is_match(candidate)))
+        {
+            return true;
+        }
+        if let Some(next) = next {
+            let joined = format!("{candidate} {next}");
+            if (opener_hit && account_limit_tail().is_match(&joined))
+                || (auto_hit
+                    && (auto_continue_tail().is_match(&joined)
+                        || account_limit_tail().is_match(&joined)))
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Strip the TUI's leading chrome so the LINE-INITIAL opener can still anchor.
 ///
 /// The banner is printed as an assistant message, so it arrives behind the `⏺` glyph, and inside a
@@ -659,16 +772,18 @@ fn strip_row_chrome(line: &str) -> &str {
 /// for the same reason. Only the IMMEDIATELY following row is joined: reaching further would let an
 /// unrelated later line lend a tail to an innocent opener.
 pub fn screen_shows_account_limit(text: &str) -> bool {
-    let rows: Vec<&str> = lines(text).map(strip_row_chrome).collect();
+    let raw: Vec<&str> = lines(text).collect();
+    let rows: Vec<&str> = raw.iter().map(|r| strip_row_chrome(r)).collect();
     rows.iter().enumerate().any(|(i, row)| {
-        if !account_limit_opener().is_match(row) {
-            return false;
-        }
-        if account_limit_tail().is_match(row) {
-            return true;
-        }
-        rows.get(i + 1)
-            .is_some_and(|next| account_limit_tail().is_match(&format!("{row} {next}")))
+        // ⚠️ ONLY A WRAP CONTINUATION MAY LEND A TAIL (mirrors `apiRecovery.classifyFromScrollback`,
+        // roborev 67814). A hard wrap is the SAME TUI row continued, so it never carries a marker of
+        // its own. Without this an innocent banner followed by ANY row mentioning a limit phrase
+        // stands the agent down for half an hour — the expensive direction.
+        let next = raw
+            .get(i + 1)
+            .filter(|n| !n.trim_start().starts_with(['⏺', '⎿', '●']))
+            .map(|_| rows[i + 1]);
+        row_shows_account_limit(row, next)
     })
 }
 
@@ -3109,6 +3224,16 @@ mod tests {
         for needle in [
             r"/^you['’´`]?ve hit your\b[^\n]*\blimit\b/i",
             r"/(?:·|•|\||—|-)\s*(?:resets\b|raise it at\b)/i",
+            // The AUTO-CONTINUE shape and the sub-agent peel. Enrolled because the drift guard
+            // pins LITERALS, so a new sibling matcher in the TS file is invisible to it — which is
+            // exactly how the two ports came to disagree about what a limit looks like while this
+            // test stayed green (roborev 67784).
+            r"/^(?:claude(?:\s+ai)?\s+)?usage limit reached\b/i",
+            r#"/^agent\s+"[^"]*"\s+failed:\s*.*?\bapi error:\s*/i"#,
+            // The in-banner wall and the widened auto-continue tail. Both are ported above, and an
+            // unpinned port is an unenforced invariant — matching today would be coincidence.
+            r"/\busage limit reached\b|\blimit resets at\b/i",
+            r"(?:(?:·|•|\||—|-)\s*(?:continuing|resets|resuming|will reset)\b)",
         ] {
             assert!(
                 api_recovery.contains(needle),
@@ -3242,6 +3367,47 @@ mod tests {
     /// The discipline that makes the verdict affordable. A false positive here does not merely
     /// mis-paint a row: it silences the ladder for `QUOTA_BACKOFF_SECS` against an agent that is
     /// merely stuck, which is the failure this whole module exists to prevent.
+    /// ══ THE SHAPES PORTED FROM apiRecovery IN 2026-08 — BEHAVIOUR, NOT JUST A LITERAL PIN ══════
+    /// The drift pin proves the TS literal is unchanged; it proves NOTHING about whether this port
+    /// evaluates it. Deleting the `auto_hit` arm, the sub-agent peel or the in-banner arm left the
+    /// whole Rust suite green (roborev 67806/67814). These are the side-effect assertions.
+    #[test]
+    fn the_ported_limit_shapes_stand_an_agent_down() {
+        for screen in [
+            "Usage limit reached \u{b7} continuing automatically at 9:30am",
+            "Claude usage limit reached \u{2014} will reset at 3pm (America/Bogota)",
+            "Claude usage limit reached - resuming at 5pm",
+            "Agent \"x\" failed: Claude Code process exited due to an API error: You've hit your session limit \u{b7} resets 9:30am",
+            "  \u{23bf}  You've hit your session limit \u{b7} resets 9:30am",
+            "API Error: 429 {\"type\":\"error\",\"error\":{\"message\":\"Claude AI usage limit reached|1787412000\"}}",
+            "API Error: 429 {\"type\":\"error\",\"error\":{\"message\":\"Claude AI usage\nlimit reached|1787412000\"}}",
+        ] {
+            assert!(
+                screen_shows_account_limit(screen),
+                "should have been seen as a wall: {screen}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_ported_shapes_keep_their_false_positive_discipline() {
+        for screen in [
+            "Usage limit reached",
+            "Claude usage limit reached",
+            "The row said usage limit reached \u{b7} continuing automatically",
+            "I think you've hit your session limit \u{b7} resets soon, so I'll wait.",
+            "usage limit reached is the wall we must paint red",
+            // The adjacency case: an innocent banner with prose on the NEXT TUI row, which wears its
+            // own marker and is therefore a new row rather than a wrap continuation.
+            "\u{23fa} API Error: 529 Overloaded.\n\u{23fa} Usage limit reached is the wall we must paint red",
+        ] {
+            assert!(
+                !screen_shows_account_limit(screen),
+                "should NOT have stood the agent down: {screen}"
+            );
+        }
+    }
+
     #[test]
     fn prose_about_limits_never_stands_an_agent_down() {
         for (name, screen) in [

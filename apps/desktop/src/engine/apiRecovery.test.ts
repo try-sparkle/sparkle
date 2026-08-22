@@ -119,6 +119,76 @@ describe("classifyApiFailure", () => {
     // Mid-sentence mention of an account limit is prose, not an exhaustion line.
     expect(classifyApiFailure("when you've hit your session limit the agent stops")).toBeNull();
   });
+
+  // ── THE THREE SHAPES THAT RENDERED GRAY ─────────────────────────────────────────────────────────
+  // All three are real strings off the founder's screen, verbatim (U+2019 apostrophe, the `⎿`, and
+  // the leading spaces are all load-bearing — retype them and the test stops testing the bug). The
+  // RED path downstream of here already worked end to end; classification was the only thing that
+  // missed, so each of these left a session-limited agent painted GRAY.
+
+  // 1. A SUB-AGENT's wall, quoted onto the parent's screen behind the Task tool's failure prose. The
+  //    opener is `^`-anchored, so the prefix alone was enough to make it match nothing.
+  it("calls a SUB-AGENT's limit banner terminal through the Task tool's failure prefix", () => {
+    expect(
+      classifyApiFailure(
+        'Agent "Fix auto-switch on expired account" failed: Claude Code process exited due to an API error: You’ve hit your session limit · resets 9:30am',
+      ),
+    ).toBe("terminal");
+  });
+
+  // …and the anchor still does its job on the remainder: prose that merely QUOTES the whole thing
+  // mid-sentence has no prefix to peel and does not open with the banner, so it stays null. This is
+  // the negative that proves change 1 did not become a search-anywhere match.
+  it("does NOT call prose quoting a sub-agent failure mid-sentence terminal", () => {
+    expect(
+      classifyApiFailure(
+        'I saw Agent "Fix auto-switch" failed: an API error: You’ve hit your session limit · resets 9:30am, so I stopped.',
+      ),
+    ).toBeNull();
+    // The prefix without a real banner behind it is a failure report, not an account wall.
+    expect(classifyApiFailure('Agent "Do the thing" failed: API error: 529 Overloaded.')).toBeNull();
+  });
+
+  // 2. The `⎿` ROW. A sub-agent's banner arrives as a tool RESULT, so it wears `⎿` and not `⏺` —
+  //    falsifying the assumption this module's own comment used to rest on.
+  it("calls a ⎿-marked limit banner terminal — a sub-agent's wall is a tool RESULT row", () => {
+    expect(classifyApiFailure("  ⎿  You’ve hit your session limit · resets 9:30am")).toBe(
+      "terminal",
+    );
+  });
+
+  // THE NEEDLE, and the negative that keeps the guard below (":does not let a ⎿-marked API error…")
+  // true BY CONSTRUCTION rather than by luck: `⎿` is stripped before the ACCOUNT-LIMIT test ONLY,
+  // never before `^api error:`. So a ⎿-marked API error still classifies NULL and therefore still
+  // cannot win the backwards scan over a real limit banner sitting above it.
+  it("still returns null for a ⎿-marked API error, so it cannot win the backwards scan", () => {
+    expect(classifyApiFailure("  ⎿  API Error: 529 Overloaded.")).toBeNull();
+    expect(classifyApiFailure("  ⎿  API Error: 500 Internal server error.")).toBeNull();
+  });
+
+  // 3. THE AUTO-CONTINUE WORDING. Nothing in the app knew this string existed; it is the same account
+  //    wall under a different opener, so it is TERMINAL like every other one. (Its "continuing
+  //    automatically" wording arguably means amber rather than red — a product question, deliberately
+  //    not decided here.)
+  it("calls the auto-continue usage-limit wording terminal", () => {
+    expect(classifyApiFailure("Usage limit reached · continuing automatically at 9:30am")).toBe(
+      "terminal",
+    );
+    // Separator variants, same as every other tail — pinning one glyph is how a check silently dies.
+    expect(classifyApiFailure("Usage limit reached | continuing automatically at 9:30am")).toBe(
+      "terminal",
+    );
+    // And the ordinary tail on the same opener.
+    expect(classifyApiFailure("Usage limit reached · resets 9:30am")).toBe("terminal");
+  });
+
+  // The earn-it discipline, held for the new opener too: an anchored opener is NOT enough on its own,
+  // and prose about usage limits stays null.
+  it("does NOT call bare or quoted 'usage limit reached' prose terminal", () => {
+    expect(classifyApiFailure("Usage limit reached")).toBeNull();
+    expect(classifyApiFailure("Usage limit reached is the wall we must paint red")).toBeNull();
+    expect(classifyApiFailure("The row said usage limit reached · continuing automatically")).toBeNull();
+  });
 });
 
 describe("classifyFromScrollback", () => {
@@ -199,6 +269,93 @@ describe("classifyFromScrollback", () => {
       "  ⎿  API Error: 529 Overloaded.",
     ].join("\n");
     expect(classifyFromScrollback(sb)).toBe("terminal");
+  });
+
+  // The other half of that same rule, and the shape that made this a bug: a SUB-AGENT's limit banner
+  // arrives as a tool RESULT row, so it wears `⎿`. Before the split strip it classified null, the
+  // scan walked past it, and the parent row painted GRAY on an account that was flatly out of session
+  // window. Note both lines below are `⎿`-marked — only the limit one classifies.
+  // ⚠️ THE API-ERROR ROW MUST SIT *BELOW* THE BANNER, or this test cannot fail (roborev 67784).
+  // `classifyFromScrollback` scans BACKWARDS and returns at the first classifying line. With the
+  // error row ABOVE, the banner classifies first and the row is never passed to
+  // `classifyApiFailure` at all — so a regression making a ⎿-marked API error `retryable` would
+  // leave the test green while asserting in its own title that it would not. Below, the scan is
+  // forced to walk past it, which is the only arrangement that exercises the invariant.
+  // A 429-DELIVERED WALL THAT HARD-WRAPS. ~100 chars, so on any narrow pane it is split across two
+  // xterm rows. The first row alone is `API Error: …` → `retryable`; only the JOIN carries
+  // "usage limit reached". Gating the join on `alone === null` therefore returned `retryable` and the
+  // ladder spent all eleven rungs against a walled account (roborev 67803).
+  it("classifies a WRAPPED 429 account wall terminal, not retryable", () => {
+    const sb = [
+      "⏺ Running the pass.",
+      // ⚠️ THE WRAP MUST SPLIT *INSIDE* THE PHRASE. An earlier fixture broke after "Claude AI", and
+      // the continuation row `usage limit reached|1787412000"}}` satisfies AUTO_CONTINUE_OPENER and
+      // the epoch tail ON ITS OWN — so the backwards scan returned terminal at that row and never
+      // reached the API-error row the test names. It was green against the old code (roborev 67814).
+      'API Error: 429 {"type":"error","error":{"message":"Claude AI usage',
+      'limit reached|1787412000"}}',
+    ].join("\n");
+    expect(classifyFromScrollback(sb)).toBe("terminal");
+  });
+
+  // THE FALSE POSITIVE THE UPGRADE MUST NOT OPEN (roborev 67814, HIGH). An innocent 529 with prose
+  // beneath it — the second line is verbatim a prose negative from this very file.
+  it("does NOT let prose on the NEXT TUI row flip an innocent 529 to terminal", () => {
+    const sb = ["⏺ API Error: 529 Overloaded.", "⏺ Usage limit reached is the wall we must paint red"].join("\n");
+    expect(classifyFromScrollback(sb)).toBe("retryable");
+  });
+
+  it("walks PAST a ⎿-marked API error below a ⎿-marked sub-agent limit banner", () => {
+    const sb = [
+      "⏺ Dispatching the sub-agent.",
+      "  ⎿  You’ve hit your session limit · resets 9:30am",
+      "  ⎿  API Error: 529 Overloaded.",
+    ].join("\n");
+    expect(classifyFromScrollback(sb)).toBe("terminal");
+  });
+
+  // ══ THE WORDINGS THIS REPO HAS ACTUALLY CAPTURED — every one leads with "Claude" ══════════════
+  // Sources: rateLimitWatch.test.ts and the claude_oneshot.rs tests. The first cut of the
+  // auto-continue arm reached NONE of them, so the shape it was added for still painted gray.
+  it.each([
+    "Claude usage limit reached. Your limit resets at 5:00pm.",
+    "Claude usage limit reached - resuming at 5pm",
+    "Claude usage limit reached — will reset at 3pm (America/Bogota)",
+    "Claude usage limit reached|resets 5pm",
+    "Claude AI usage limit reached|1787412000",
+  ])("calls the verified real wording %# terminal", (line) => {
+    expect(classifyApiFailure(line)).toBe("terminal");
+  });
+
+  // A subscription wall delivered as a 429 is still a wall. Classified `retryable`, the ladder
+  // spends all eleven rungs prompting an account that is flatly out of window.
+  it("calls an ACCOUNT wall carried inside an API Error banner terminal, not retryable", () => {
+    expect(
+      classifyApiFailure(
+        'API Error: 429 {"type":"error","error":{"message":"Claude AI usage limit reached|1787412000"}}',
+      ),
+    ).toBe("terminal");
+  });
+
+  // ...while the one banner that merely MENTIONS usage limits stays retryable. Disjoint, not merely
+  // ordered: it carries neither "usage limit reached" nor "limit resets at".
+  it("keeps the 'not your usage limit' server banner retryable", () => {
+    expect(
+      classifyApiFailure(
+        "API Error: Server is temporarily limiting requests (not your usage limit) · Rate limited",
+      ),
+    ).toBe("retryable");
+  });
+
+  // THE DISCIPLINE THE WIDER FIX WOULD HAVE BROKEN. `claude_oneshot.rs` matches these phrases
+  // anywhere because its input is a JSON error body; here the input is a terminal line, so the
+  // opener stays anchored and a tail is still required.
+  it("still refuses bare and quoted prose after the opener was widened", () => {
+    expect(classifyApiFailure("Claude usage limit reached")).toBeNull();
+    expect(classifyApiFailure("Usage limit reached is the wall we must paint red")).toBeNull();
+    expect(classifyApiFailure("Claude usage limit reached is what we are painting red")).toBeNull();
+    expect(classifyApiFailure("The row said usage limit reached · continuing automatically")).toBeNull();
+    expect(classifyApiFailure("I read that a limit resets at 5pm, apparently.")).toBeNull();
   });
 
   // ⚠️ THE SAME SHAPE WITH AN UNMARKED CONTINUATION ROW — the residual the comment above scopes

@@ -30,6 +30,13 @@ import { registerSparkleTranscript } from "./sparkleTranscript";
 // snapshot machinery and the dispatcher into its graph (see agentTranscriptRegistry's header).
 import { noteAgentSessionId } from "./agentTranscriptRegistry";
 import { claimPass, releasePass } from "./improvementPassLatch";
+// The failure→colour rule, kept OUT of this file so it is testable without the Tauri graph and
+// so the quota arm reuses the very detector the build rows use (see its header).
+import {
+  classifyPassFailure,
+  isTransientPassFailure,
+  passFailureStatus,
+} from "../engine/passFailureStatus";
 import { accountConfigDirFor } from "./accountSelection";
 import { buildControlMcpConfig } from "./claudeSpawn";
 import { startControlBridge, controlMcpPaths } from "./orchestrationLaunch";
@@ -376,40 +383,14 @@ export function shouldRunImprovementPass(gate: PassGate): boolean {
   return isHourlySlotDue(gate.lastRunAt!, gate.now);
 }
 
-/** Failure shapes that mean "the transport broke", as opposed to "the pass ran and something
- *  about the work went wrong". Only these earn a re-attempt: they carry no signal that a second
- *  try would fail the same way, and the slot they burned produced nothing usable. Matched on the
- *  message text because that is all the failure event carries (the Rust side renders it in
- *  `failure_message`). Deliberately narrow — an ambiguous message stays non-transient and waits
- *  out the hour. In particular a usage/spend limit is NOT here: that WILL fail again. */
-const TRANSIENT_FAILURE_PATTERNS = [
-  "unable to connect",
-  "enotfound",
-  "eai_again",
-  "econnreset",
-  "econnrefused",
-  "econnaborted",
-  "etimedout",
-  "socket hang up",
-  "network error",
-  "connection refused",
-  "connection reset",
-  "getaddrinfo",
-  // Truncated-stream shapes. These come from the OTHER side of the connection — the pass did
-  // reach the API and the stream then died partway — so they never match the pre-flight
-  // patterns above, yet they are the dominant failure in practice: most failed passes report
-  // one of these two, and every one of them costs a full hourly slot. The re-attempt is safe
-  // for the same reason the hourly one is: a pass re-reads the repo state (and its own open
-  // PRs) before doing anything, so partial work from the dead attempt is deduped, not redone.
-  "closed mid-response",
-  "stalled mid-stream",
-];
-
-/** True when a failed pass's message names a connectivity problem rather than a real failure. */
-export function isTransientPassFailure(message: string): boolean {
-  const lower = message.toLowerCase();
-  return TRANSIENT_FAILURE_PATTERNS.some((p) => lower.includes(p));
-}
+/** True when a failed pass's message names a connectivity problem rather than a real failure.
+ *
+ *  RE-EXPORTED, not defined here. The predicate and its pattern list moved to the LEAF
+ *  `engine/passFailureStatus` when the failure→colour classifier was added: that classifier asks
+ *  this question, this module asks the classifier, and defining both here would make the two
+ *  modules import each other — dragging this module's Tauri/store graph into every consumer of a
+ *  pure function. Importers of `isTransientPassFailure` from here keep working unchanged. */
+export { isTransientPassFailure };
 
 /** True while a headless pass is in flight (read by the scheduler's gate).
  *
@@ -421,7 +402,7 @@ export function isTransientPassFailure(message: string): boolean {
 export { isPassRunning } from "./improvementPassLatch";
 
 /** How a pass ended. `cancelled` marks the deliberate-handoff path — an `ok: false` that is NOT
- *  a failure, so it must not warn or park the agent on "blocked". */
+ *  a failure, so it must not warn or park the agent on a failure status at all. */
 type PassOutcome = {
   ok: boolean;
   text: string;
@@ -533,9 +514,11 @@ async function reportTimeoutLeftovers(
  *
  * NAMES THE REMEDY, per reason. These declines are self-perpetuating — nothing in the pass, the app,
  * or the next hour's park can clear them, and the `"stash"` policy explicitly cannot help (a stash
- * cannot save a commit) — so the hourly pass stops for good until a human acts. A red row alone does
- * not tell them that, or that the thing to act on is a leftover branch in an app-owned worktree they
- * have never opened. AGENTS.md's rule applies: a refusal a user is expected to act on needs a remedy
+ * cannot save a commit) — so the hourly pass stops for good until a human acts. A recoloured dot
+ * alone does not tell them that, or that the thing to act on is a leftover branch in an app-owned
+ * worktree they have never opened. (The dot is AMBER for the first declines and only goes RED once
+ * the same reason has recurred PARK_DECLINE_ESCALATE_AFTER times, which makes this text MORE
+ * load-bearing than it was, not less: for the first hours it is the only detail anywhere.) AGENTS.md's rule applies: a refusal a user is expected to act on needs a remedy
  * they can actually see.
  *
  * PATH-FREE and BRANCH-FREE by construction, exactly like the Rust side's reason token: this text is
@@ -598,13 +581,18 @@ let retryDueAt: number | null = null;
 let retryUsed = false;
 
 /** Consecutive hourly passes that must refuse to run for the SAME reason before the row escalates
- *  from the SILENT `blocked` pill to the NOTIFYING `errored` one. One refusal is routine — a killed
- *  pass left work behind and the next hour clears it — but the SAME refusal several hours running is a
- *  loop nothing here can break (a stash cannot save a commit, and next hour's park makes the identical
- *  decision), and staying silently red is exactly how the hourly loop went dark for days without
- *  anyone being pinged. `errored` is in the notify set (settingsStore DEFAULT_NOTIFY_STATUSES) where
- *  `blocked` deliberately is not, so crossing this threshold fires the banner/badge `blocked` holds
- *  back. Three: the second refusal could still be the tail of a transient hiccup; the third is a loop. */
+ *  from the SILENT AMBER `lapsed` pill to the NOTIFYING RED `errored` one. One refusal is routine — a
+ *  killed pass left work behind and the next hour clears it — but the SAME refusal several hours
+ *  running is a loop nothing here can break (a stash cannot save a commit, and next hour's park makes
+ *  the identical decision), and staying silent is exactly how the hourly loop went dark for days
+ *  without anyone being pinged. `errored` is in the notify set (settingsStore
+ *  DEFAULT_NOTIFY_STATUSES) where the non-escalated status deliberately is not, so crossing this
+ *  threshold fires the banner/badge the quiet tier holds back. Three: the second refusal could still
+ *  be the tail of a transient hiccup; the third is a loop.
+ *
+ *  ⚠️ THE NON-ESCALATED ARM WAS RED `blocked` UNTIL 2026-08-22 and is now AMBER `lapsed`; the
+ *  ESCALATED arm is unchanged. The threshold itself is deliberately untouched by that change — what
+ *  moved is only the colour of the rows BELOW it, which the next hour's park re-attempts by itself. */
 export const PARK_DECLINE_ESCALATE_AFTER = 3;
 /** The reason the last hourly park DECLINED, and how many hourly passes in a row it has declined for
  *  THAT reason. Module-level for the same reason as the retry latch above: it is this webview's running
@@ -653,9 +641,20 @@ export function resetPassRetryForTests(): void {
 
 /** Fold one park DECLINE into the running same-reason tally and decide how loudly to surface it. It
  *  advances the module tally — a NEW reason restarts it at 1, the SAME reason extends it — and once it
- *  reaches PARK_DECLINE_ESCALATE_AFTER the status rises from the silent `blocked` pill to the notifying
- *  `errored` one, so a stuck loop stops hiding in a red row nobody watches. Returns the status to set
- *  and the current streak length (for the escalation log and attention screen). */
+ *  reaches PARK_DECLINE_ESCALATE_AFTER the status rises from the silent AMBER `lapsed` pill to the
+ *  notifying RED `errored` one, so a stuck loop stops hiding in a row nobody watches. Returns the
+ *  status to set and the current streak length (for the escalation log and attention screen).
+ *
+ *  WHY THE FIRST REFUSALS ARE AMBER. `lapsed` is "the machinery stopped and ANOTHER ACTOR clears it"
+ *  (packages/ui/tokens.ts). A single decline is exactly that: next hour's park makes the attempt
+ *  again, and it commonly succeeds (a killed pass's leftovers get cleaned up, a fetch that failed
+ *  works). Nothing is owed by the founder, so it must not wear the alarm colour — the founder's own
+ *  complaint about rows that "don't require my assistance" is what created the amber tier.
+ *
+ *  WHY THE ESCALATED ARM STAYS RED. At PARK_DECLINE_ESCALATE_AFTER consecutive same-reason declines
+ *  there IS no other actor: `unpushed` cannot be stashed away, and every later park will decide
+ *  identically. A human is the only one who can clear it, which is precisely what red means — and
+ *  `errored` is the arm that notifies. */
 function noteParkDeclineStatus(reason: string): { status: AgentTabStatus; streak: number } {
   if (reason === parkDeclineReason) {
     parkDeclineStreak += 1;
@@ -664,7 +663,7 @@ function noteParkDeclineStatus(reason: string): { status: AgentTabStatus; streak
     parkDeclineStreak = 1;
   }
   const escalate = parkDeclineStreak >= PARK_DECLINE_ESCALATE_AFTER;
-  return { status: escalate ? "errored" : "blocked", streak: parkDeclineStreak };
+  return { status: escalate ? "errored" : "lapsed", streak: parkDeclineStreak };
 }
 
 /** Clear the consecutive-decline tally — any park that SUCCEEDS (parked or already-fresh) breaks the
@@ -717,9 +716,11 @@ export async function cancelImprovementPass(): Promise<void> {
  * that only want to fire-and-forget can ignore the promise. Quietly does nothing if claude
  * isn't installed. Status wiring: the pinned row shows "working" for the duration, then
  * "approval" (red "Approve?") when a case-by-case draft awaits the user, else back to "idle";
- * a failed pass parks on "blocked", which is RED (packages/ui/tokens.ts) but deliberately outside
- * the badge/notification set, so it recolors and re-sorts the row without firing a banner at you —
- * and it is dismissible, since it persists until the retry an hour later.
+ * a failed pass parks on whatever `engine/passFailureStatus` classifies it as — AMBER `lapsed`
+ * ("Unfinished, not yours") for the transient shapes and the timeout, which the armed re-attempt or
+ * the next hourly slot picks up unaided, and RED `blocked` only for an account/quota wall, which
+ * nothing but the founder or the clock can clear. Neither fires a banner; both recolor and re-sort
+ * the row, and both persist until the retry.
  *
  * `freshSlot` says this run is the hourly one coming due, not the connectivity re-attempt —
  * the scheduler knows which, and only a fresh slot re-earns the one retry.
@@ -794,8 +795,9 @@ export async function runImprovementPass(
     // NOT EARLIER — this is below the `!claude.installed` return on purpose. A machine with no Claude
     // never runs, and marking it green would be a false-green with no turn behind it. Everything below
     // this line, by contrast, either runs the pass or resolves to a TERMINAL status that overrides
-    // this: a declined/thrown park → `blocked`/`errored` (the park gate below), any setup throw → the
-    // outer `catch` → `blocked`, a completed run → `idle`/`approval`, a handoff → `idle`. So no path
+    // this: a declined/thrown park → `lapsed`/`errored` (the park gate below), any setup throw → the
+    // outer `catch` → `passFailureStatus` (`lapsed`, or `blocked` for a quota wall), a completed run
+    // → `idle`/`approval`, a handoff → `idle`. So no path
     // leaves a stale `working`; the only change is that the truthful green now starts at the top of the
     // work rather than at the end of the setup.
     setStatus(SPARKLE_AGENT_ID, "working");
@@ -821,10 +823,16 @@ export async function runImprovementPass(
     // worse than no pass — it burns the hour, and its output is a diff against a tree we cannot
     // describe. So a park that neither moved the worktree nor found it already fresh stops the run.
     //
-    // "blocked" is the existing user-visible surface for exactly this: RED, so the row recolors and
-    // re-sorts, but deliberately outside the badge/notification set, so it does not fire a banner —
-    // and dismissible, since it persists until the retry an hour later. That makes the refusal loud
-    // enough to see and quiet enough to ignore, rather than log-only.
+    // THE REFUSAL IS SURFACED ON THE ROW, not just logged — but AMBER `lapsed`, not red. It was
+    // `blocked` (RED) until 2026-08-22, on the argument that red "recolors and re-sorts … but is
+    // deliberately outside the badge/notification set, so it does not fire a banner". That argument
+    // was about LOUDNESS and it was right about loudness; it was wrong about MEANING. Red means "you
+    // are the only one who can clear this" (packages/ui/tokens.ts), and a first refusal is the
+    // opposite: next hour's park re-attempts it unaided, and it commonly clears. `lapsed` — "the
+    // machinery stopped and another actor clears it" — recolours the dot with no badge and no
+    // banner, which is the same loudness with the true meaning. The row still goes RED when there
+    // genuinely is no other actor: PARK_DECLINE_ESCALATE_AFTER consecutive same-reason declines
+    // escalate to `errored` (noteParkDeclineStatus, below).
     //
     // A THROW is deliberately NOT caught here. It used to be swallowed, which silently promoted the
     // least-informed case to the most-permissive outcome — but catching it HERE was wrong in the
@@ -833,8 +841,8 @@ export async function runImprovementPass(
     // one early re-attempt. Park is the MOST networked setup step (it fetches), so it was the one
     // step whose throw could not arm a retry, and the scheduler has already stamped `lastRunAt` —
     // making a connectivity blip cost a full hour of no pass, where before it cost nothing.
-    // The outer `catch` already warns, arms the retry and sets `blocked`; letting the throw reach it
-    // gets all three, so there is nothing left for a local handler to do.
+    // The outer `catch` already warns, arms the retry and sets the classified failure status; letting
+    // the throw reach it gets all three, so there is nothing left for a local handler to do.
     const park: ParkOutcome = await parkWorktreeOnBase(
       ws.repoPath,
       SPARKLE_PROJECT_ID,
@@ -847,20 +855,21 @@ export async function runImprovementPass(
       // committed and could not push, so its work exists nowhere else and park refuses to step over
       // it. A stash cannot save a commit, so nothing here can clear it — a human has to.
       //
-      // WHICH MEANS THE REFUSAL IS PERMANENT, and a permanent refusal whose only signal is a red row
-      // is the same shape the Rust side just spent a commit removing (a guard becoming the thing it
-      // exists to prevent), relocated from "runs forever from a stale base" to "never runs again"
-      // (roborev 55239). So the reason is WRITTEN WHERE SOMEONE WILL READ IT, not just warned:
-      // `attentionScreen` is the text captured when an agent goes red, which is what the pane shows,
+      // WHICH MEANS THE REFUSAL IS PERMANENT, and a permanent refusal whose only signal is a
+      // recoloured dot is the same shape the Rust side just spent a commit removing (a guard becoming
+      // the thing it exists to prevent), relocated from "runs forever from a stale base" to "never
+      // runs again" (roborev 55239). So the reason is WRITTEN WHERE SOMEONE WILL READ IT, not just
+      // warned: `attentionScreen` is the text captured when an agent needs looking at (it is written
+      // on the amber first refusals too, not only on the red escalation), which is what the pane shows,
       // what the phone relays, and — since the concierge can now address this agent at all — what
       // `read_agent_terminal` returns for it at tier (b). The remedy is named, not implied: a user
-      // told only "blocked" has no way to learn that a leftover branch in an app-owned worktree they
-      // have never seen is what stopped it.
+      // told only that the pass did not run has no way to learn that a leftover branch in an
+      // app-owned worktree they have never seen is what stopped it.
       const detail = refusalDetail(park.reason);
-      // ESCALATE A STUCK LOOP. A single refusal stays on the silent `blocked` pill (it may clear next
-      // hour); the SAME refusal PARK_DECLINE_ESCALATE_AFTER hours running is a loop nothing here can
-      // break, so it must stop being invisible. Crossing the threshold raises the row to `errored` —
-      // which IS in the notify set that `blocked` is deliberately kept out of — so it fires the
+      // ESCALATE A STUCK LOOP. A single refusal stays on the silent AMBER `lapsed` pill (it may clear
+      // next hour); the SAME refusal PARK_DECLINE_ESCALATE_AFTER hours running is a loop nothing here
+      // can break, so it must stop being invisible. Crossing the threshold raises the row to RED
+      // `errored` — which IS in the notify set that the amber tier is deliberately kept out of — so it fires the
       // banner/badge, and the attention screen (tier (b) of readAgentTerminal, relayed to the phone
       // and returned to the concierge) says how long it has been stuck. This is the founder-requested
       // prevention: the hourly log-mining + beads-drain loop stopped for days behind a red row nobody
@@ -883,8 +892,16 @@ export async function runImprovementPass(
       } else {
         console.warn("improvement pass: refusing to run from an unknown base —", park.reason, "—", detail);
       }
-      useRuntimeStore.getState().setAttentionScreen(SPARKLE_AGENT_ID, screen);
+      // ⚠️ STATUS FIRST, THEN THE SCREEN — the order is load-bearing, and it became so the day this
+      // branch stopped being red. `runtimeStore.setStatus` DROPS `attentionScreen[agentId]` whenever
+      // the new status is outside the red tier (sparkle-99o9a: a capture must not outlive the ask it
+      // photographs). `lapsed` is outside that tier by design, so writing the screen first and the
+      // status second would erase the remedy text on the very next line — silently, leaving the row
+      // amber with nothing anywhere to say WHY, which is strictly worse than the red row this change
+      // is removing. Written after, it survives: `setAttentionScreen` has no such gate, and tier (b)
+      // of `readAgentTerminal` reads the capture without asking whether the row is red.
       setStatus(SPARKLE_AGENT_ID, status);
+      useRuntimeStore.getState().setAttentionScreen(SPARKLE_AGENT_ID, screen);
       return; // `finally` still clears the passRunning latch.
     }
     // The park cleared (a fresh base, or one already fresh) — the consecutive-decline streak the hourly
@@ -1098,8 +1115,8 @@ export async function runImprovementPass(
       );
     } else if (outcome.cancelled) {
       // Somebody deliberately took the worktree — the interactive pane's prepare(). Nothing is
-      // wrong, so don't park on "blocked" (red — it reads as "this needs your attention") and
-      // don't warn; the pane is about to drive the agent's status itself.
+      // wrong, so don't park on a failure status at all (not even the amber one — nothing here is
+      // unfinished) and don't warn; the pane is about to drive the agent's status itself.
       setStatus(SPARKLE_AGENT_ID, "idle");
     } else {
       console.warn("improvement pass failed:", outcome.text);
@@ -1108,15 +1125,34 @@ export async function runImprovementPass(
       // an unconditional probe would park the worktree out from under the retry armed just below.
       if (outcome.timedOut)
         await reportTimeoutLeftovers(ws.repoPath, ws.defaultBranch, outcome.killed);
-      armRetryIfTransient(outcome.text);
-      setStatus(SPARKLE_AGENT_ID, "blocked");
+      // ⚠️ CLASSIFY ONCE, DRIVE BOTH DECISIONS (roborev 67806). The quota-outranks-transient ordering
+      // was applied to the COLOUR and not to the RETRY: `armRetryIfTransient` asked
+      // `isTransientPassFailure` directly, so a message carrying BOTH shapes — a dropped connection
+      // and a limit banner in one payload — armed the slot's one early re-attempt AND painted the row
+      // red. The pass then re-ran minutes later against a wall no retry can clear, burned `retryUsed`
+      // for the hour (so a genuinely transient failure later got none), and flickered the red dot back
+      // through `working`. The classifier honoured the ordering; this caller did not.
+      const outcomeClass = classifyPassFailure(outcome.text, Date.now());
+      if (outcomeClass === "transient") armRetryIfTransient(outcome.text);
+      // AMBER unless the account itself is walled. This wrote `blocked` (RED) for EVERY failure
+      // until 2026-08-22 — including the connectivity shapes `armRetryIfTransient` re-attempts a
+      // minute later on the line above, and the 30-minute timeout the next hourly slot re-attempts
+      // by itself. See engine/passFailureStatus for the rule and why quota is the one red arm.
+      setStatus(SPARKLE_AGENT_ID, passFailureStatus(outcomeClass));
     }
   } catch (e) {
     console.warn("improvement pass errored:", e);
     // The setup steps above (worktree, guard, integrity) reach the network too, so a throw
     // here can be the same lost-connectivity story as a failed run.
-    armRetryIfTransient(e instanceof Error ? e.message : String(e));
-    setStatus(SPARKLE_AGENT_ID, "blocked");
+    const failure = e instanceof Error ? e.message : String(e);
+    // ⚠️ Same rule as the outcome path above (roborev 67806): classify ONCE and let it gate the
+    // retry too. A quota wall reached through a THROW must not arm the slot's one re-attempt — it
+    // would re-run against the wall minutes later and burn `retryUsed` for the hour.
+    const failureClass = classifyPassFailure(failure, Date.now());
+    if (failureClass === "transient") armRetryIfTransient(failure);
+    // Same rule as the failure branch above: a setup throw is something the next slot re-attempts,
+    // so it is AMBER — unless the message names an account wall, which no re-attempt can clear.
+    setStatus(SPARKLE_AGENT_ID, passFailureStatus(failureClass));
   } finally {
     releasePass();
   }
