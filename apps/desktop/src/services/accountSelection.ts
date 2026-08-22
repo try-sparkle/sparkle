@@ -253,6 +253,19 @@ let inflight: Promise<AccountState> | null = null;
 // in-flight fetch repopulating the cache with the now-stale snapshot.
 let generation = 0;
 
+/** Fire a single best-effort refresher, absorbing a SYNCHRONOUS throw from its call (typically a
+ *  `deps`-default dereference of a module binding that failed to resolve). Each refresher gets its
+ *  OWN guard so one throwing cannot skip the next — see the call site in {@link loadAccountState}.
+ *  The load has already succeeded by the time these run; a best-effort side task must never be able
+ *  to turn that into a `failed` state. */
+function kickBackgroundRefresh(label: string, kick: () => Promise<void>): void {
+  try {
+    void kick();
+  } catch (e) {
+    console.warn(`accountSelection: ${label} refresh kick threw (ignored, load still valid):`, e);
+  }
+}
+
 /** Load accounts + usage, served from a short TTL cache and de-duped across concurrent callers.
  *  Best-effort: on IPC failure it resolves to empty arrays (→ no accounts → default spawn behavior,
  *  so a backend hiccup never blocks an agent from starting). `force` bypasses the cache.
@@ -321,14 +334,29 @@ export async function loadAccountState(
       // strand every spawn at a login prompt. A `withIdentities: false` reader is opting out for
       // itself, not for the app.
       if (withIdentities && gen === generation) cache = { at: now, state }; // skip if invalidated mid-load
-      // Kick the live-usage refresh, deliberately NOT awaited — see `refreshLiveUsage`. It costs a
-      // keychain read and a network call per account, and a spawn must never wait on either. The
-      // rows land for the NEXT pick; this one uses whatever is already cached.
-      void refreshLiveUsage(state.accounts, now);
-      // …and the login-health probe, same fire-and-forget discipline — see `refreshDeadLogins`. It
-      // spawns `claude auth status` per account, which must never gate a spawn; the verdict lands for
-      // the NEXT pick and this one reads whatever is cached.
-      void refreshDeadLogins(state.accounts, now);
+      // Kick the two fire-and-forget refreshers — the live-usage refresh (`refreshLiveUsage`, a
+      // keychain read + network call per account) and the login-health probe (`refreshDeadLogins`,
+      // a `claude auth status` per account). Both land for the NEXT pick; a spawn must never wait on
+      // OR be gated by either — that is their whole contract.
+      //
+      // ISOLATED PER KICK, and this is load-bearing rather than defensive habit. The load itself has
+      // already SUCCEEDED here — `state` is built and cached. But each refresher evaluates its `deps`
+      // default (`getAccountUsageLive` / `checkClaudeAuthStatus`) SYNCHRONOUSLY at the call site, so a
+      // throw there — a module that failed to resolve that binding — would otherwise be caught by the
+      // OUTER try below and silently downgrade a good load to `failed: true` (EMPTY). That is not a
+      // cosmetic slip: `failed` is the signal every consumer reads to mean "the accounts backend is
+      // broken", so `chooseAccountForAgent` returns `chosen: null` and `accountConfigDirFor` returns
+      // `undefined`, stranding the hourly improvement pass (and every pane/concierge spawn) on the
+      // default `$HOME/.claude` — the exact mis-binding this whole account-rotation surface exists to
+      // prevent. A best-effort refresher cannot be allowed to fail a load that already worked.
+      //
+      // ONE GUARD PER KICK, not one shared try: a shared try lets an earlier kick's synchronous throw
+      // skip the LATER kick entirely (e.g. a thrown `refreshLiveUsage` would mean `refreshDeadLogins`
+      // never runs, so the dead-login probe silently stops refreshing forever). Each is independent
+      // best-effort work; the failure of one must not suppress the other. The label makes the warning
+      // name which refresher threw.
+      kickBackgroundRefresh("live-usage", () => refreshLiveUsage(state.accounts, now));
+      kickBackgroundRefresh("dead-login", () => refreshDeadLogins(state.accounts, now));
       return state;
     } catch {
       if (gen === generation) cache = null; // don't pin a failure; the next call retries

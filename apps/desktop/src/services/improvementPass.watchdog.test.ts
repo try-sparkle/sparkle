@@ -48,6 +48,22 @@ vi.mock("@tauri-apps/api/event", () => ({
 }));
 vi.mock("../preflight", () => ({
   checkClaude: vi.fn(() => Promise.resolve({ installed: true, path: "/usr/local/bin/claude" })),
+  // `accountSelection.loadAccountState` — reached via `accountConfigDirFor` on the pass boundary —
+  // kicks two fire-and-forget refreshers whose `deps` defaults dereference these preflight exports
+  // SYNCHRONOUSLY at the call site. A mock that omits them makes that dereference throw, which (before
+  // the fix) the account load caught and downgraded to `failed: true`, stranding the pass's account
+  // binding at null. Provide healthy, side-effect-free stand-ins so the refreshers run harmlessly.
+  checkClaudeAuthStatus: vi.fn(() =>
+    Promise.resolve({
+      loggedIn: true,
+      source: "cli",
+      email: "improve@sparkle.test",
+      authMethod: null,
+      subscriptionType: null,
+    }),
+  ),
+  authIsDefinitelyExpired: vi.fn(() => false),
+  claudeSessionAccounts: vi.fn(() => Promise.resolve([])),
 }));
 vi.mock("./worktree", () => ({
   createAgentWorktree: vi.fn(() => Promise.resolve({ path: "/wt/sparkle-self", branch: "b" })),
