@@ -2645,6 +2645,159 @@
     }
 
     #[test]
+    fn no_blocking_audio_call_is_reachable_from_the_main_thread_focus_path() {
+        // ── THE FOCUS-EDGE FREEZE, STATED AS A REACHABILITY RULE (sparkle-p3tu8r) ───────────────
+        // `reconcile_locked_decides_the_step_without_building_inline` pins the DECISION. This pins
+        // that no later edit puts the ACTION back on the run loop, which is the regression that
+        // actually costs a user their app: the founder's spindump caught the main thread parked
+        // inside `Capture::start` (`HALB_IOThread::_WaitForState` -> `__psynch_mutexwait`,
+        // `AudioUnitSetProperty` -> `mach_msg2_trap`, `list_input_devices` ->
+        // `AudioObjectGetPropertyData`) with 175 of 322 threads queued behind it in
+        // `callOnMainRunLoopAndWait`. Every one of those is a Tauri IPC reply, and the concierge's
+        // MCP bridge waits on the same run loop, so ONE focus gain froze the UI and blacked out the
+        // concierge together — self-recovering only because nothing involved times out.
+        //
+        // WHY A SOURCE SCAN AND NOT A BEHAVIOURAL TEST. The property is REACHABILITY, and the thing
+        // to be unreachable cannot be executed in CI at all: `Capture::start` needs a real audio
+        // device and the Build arm needs a resident `ParakeetTdt` (482 MB of model). That is
+        // precisely why the inline build survived on this path for so long — nothing could run it,
+        // so nothing could catch it. Its sibling test says as much in its own closing note.
+        //
+        // ── THE LEAF NAMES ALONE ARE NOT ENOUGH ────────────────────────────────────────────────
+        // The likeliest re-introduction is not a re-inlined `build_capture`; it is a plausible
+        // one-liner. An inline `self.reconcile_capture(app)` or `self.build_and_install(..)` in
+        // `set_focused` blocks the run loop for the SAME 160-990 ms (phase 1 posts to the main
+        // thread, phase 3 is `Capture::start`) while containing none of the leaf names. So the
+        // transitive entry points are banned by name too, each carrying its opening paren.
+        const SRC: &str = include_str!("../dictation.rs");
+        const BANNED: &[&str] = &[
+            // The leaves the spindump named.
+            "build_capture(",
+            "Capture::start",
+            "list_input_devices",
+            // Everything that reaches them synchronously.
+            "build_and_install(",
+            "reconcile_capture(",
+            "reacquire_capture(",
+        ];
+
+        /// The CODE of one `impl` method: from its signature to the first line that is exactly
+        /// `    }`, which closes a 4-space-indented method and nothing nested inside it.
+        ///
+        /// Comments are stripped, because this file argues at length in prose about exactly these
+        /// names — a scan that could not tell an explanation from a call site would either fire on
+        /// the explanation or force the explanation to be written around it. A trailing comment is
+        /// cut at `" // "` rather than `"//"` so a string literal like `"dictation://focus"`
+        /// survives intact.
+        fn code_of(src: &str, signature: &str) -> String {
+            assert_eq!(
+                src.matches(signature).count(),
+                1,
+                "`{signature}` must appear exactly once, or this test is reading the wrong function"
+            );
+            let from = &src[src.find(signature).unwrap()..];
+            let mut out = String::new();
+            for line in from.lines() {
+                let code = match line.find(" // ") {
+                    Some(i) => &line[..i],
+                    None => line,
+                };
+                if !code.trim_start().starts_with("//") {
+                    out.push_str(code);
+                    out.push('\n');
+                }
+                if line == "    }" {
+                    return out;
+                }
+            }
+            panic!("no closing `    }}` found for `{signature}`");
+        }
+
+        /// Split a method into (INSIDE every spawned closure, OUTSIDE all of them).
+        ///
+        /// A spawned closure is allowed to block — that is the entire point of spawning it — so
+        /// judging its body by the calling thread's rule would flag the fix as the bug. Everything
+        /// else in the method is main-thread code.
+        ///
+        /// CONTAINMENT, NOT ORDER. Truncating at the first `std::thread::` was the obvious version
+        /// and it is wrong in the direction that matters: it leaves everything AFTER the spawn
+        /// unscanned, which is still the main thread. `spawn(..); self.build_and_install(..)` blocks
+        /// the run loop for the same 160-990 ms, and an "is it after the spawn?" test is not merely
+        /// blind to it — it is SATISFIED by it. So the closure body is brace-matched out and the
+        /// pre-spawn prefix and post-closure suffix are scanned together.
+        ///
+        /// The code is comment-stripped before it gets here, so a depth counter over `{`/`}` is
+        /// sound; a brace inside a string literal in one of these closures would break it, and would
+        /// do so LOUDLY (a failing test to investigate), never by quietly exempting more.
+        fn split_spawned_closures(code: &str) -> (String, String) {
+            let (mut inside, mut outside) = (String::new(), String::new());
+            let mut rest = code;
+            while let Some(i) = rest.find("std::thread::spawn(") {
+                let after = &rest[i..];
+                let Some(open) = after.find('{') else { break };
+                let bytes = after.as_bytes();
+                let mut depth = 0usize;
+                let mut close = None;
+                for (k, b) in bytes.iter().enumerate().skip(open) {
+                    match b {
+                        b'{' => depth += 1,
+                        b'}' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                close = Some(k);
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                let Some(close) = close else { break };
+                // Up to the closure's opening brace is still the calling thread (the `spawn(` call
+                // itself, and everything before it).
+                outside.push_str(&rest[..i + open]);
+                inside.push_str(&after[open..=close]);
+                rest = &after[close + 1..];
+            }
+            outside.push_str(rest);
+            (inside, outside)
+        }
+
+        // `WindowEvent::Focused` (lib.rs) -> `note_focus_event` -> `set_focused` ->
+        // `reconcile_locked`, all on the AppKit main thread.
+        for signature in [
+            "fn reconcile_locked(sess:",
+            "pub fn set_focused(",
+            "pub fn note_focus_event(",
+        ] {
+            let code = code_of(SRC, signature);
+            let (_inside, on_main) = split_spawned_closures(&code);
+            for banned in BANNED {
+                assert!(
+                    !on_main.contains(banned),
+                    "`{signature}` runs on the AppKit main thread and must not call `{banned}` — \
+                     that is the 160-990 ms CoreAudio block that froze the UI and the concierge \
+                     bridge together (sparkle-p3tu8r). Spawn it, as the Build arm already does."
+                );
+            }
+        }
+
+        // ...and the positive half. Without it every assertion above is satisfied by a
+        // `set_focused` that simply never builds at all — which is a permanently dead microphone,
+        // the opposite failure and just as user-visible.
+        //
+        // Asserted as CONTAINMENT (the build is inside the spawned closure), never as ordering. A
+        // byte-offset "after the spawn" comparison cannot tell "handed to the worker" from "called
+        // once the worker was started", and the second of those is the bug.
+        let (inside, _outside) = split_spawned_closures(&code_of(SRC, "pub fn set_focused("));
+        assert!(
+            inside.contains("build_and_install("),
+            "the focus-gain build must run INSIDE the spawned closure — it is absent from every \
+             spawned body, so either the hand-off was deleted (a permanently dead mic on focus \
+             gain) or it was moved back onto the main thread"
+        );
+    }
+
+    #[test]
     fn blur_parks_a_live_cloud_session_and_leaves_everything_else_alone() {
         // The blur path used to drop the capture and say nothing to the cloud session, so the socket
         // idled — unpaused, no CloseStream, no warm timer — until the relay's upstream idle-close
