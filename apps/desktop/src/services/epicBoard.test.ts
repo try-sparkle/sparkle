@@ -41,7 +41,14 @@ const only = (b: ReturnType<typeof bucketEpics>, key: EpicLadderKey, ids: string
 
 describe("EPIC_LADDER", () => {
   // The founder's ladder, verbatim and in his reading order:
-  // Backlog > Planning > Blocked > Being built > Done > Shipped > Archived.
+  // Backlog > Planning > Blocked > Unstaffed > Being built > Done > Shipped > Archived.
+  //
+  // UNSTAFFED WAS ADDED BETWEEN BLOCKED AND BEING BUILT, on his instruction, after he asked why an
+  // epic can sit under "Being built" with no billed agent running against it. He chose the derived
+  // rung over a new bead status explicitly: *"bead.status = in_progress + zero live agents bound ->
+  // 'Unstaffed' (derived; no write to bd) ... an agent binds -> card slides right to 'Being built'
+  // by itself, no sweep, no label."* Its POSITION is the part that has to be pinned here: one rung
+  // left of Being built is what makes an agent binding look like the one-step slide it is.
   //
   // PLANNING MOVED LEFT OF BLOCKED on his instruction ("let's put Planning to the left of Blocked").
   // The earlier order had it third; this is the second spelling of the same list and the reason the
@@ -51,16 +58,24 @@ describe("EPIC_LADDER", () => {
   // The KEYS reuse the Board snapshot's vocabulary wherever one already exists (inProgress,
   // delivered) so `Column`, its testids and its stage definitions keep working unchanged. Only
   // `planning` is new — the board never had a bucket for "the plan is written, nobody picked it up".
-  it("is the seven stages, in the founder's reading order", () => {
+  it("is the eight stages, in the founder's reading order", () => {
     expect(EPIC_LADDER).toEqual([
       "backlog",
       "planning",
       "blocked",
+      "unstaffed",
       "inProgress",
       "done",
       "delivered",
       "archived",
     ]);
+  });
+
+  it("puts Unstaffed IMMEDIATELY left of Being built — the rung a card slides off and back onto", () => {
+    // Asserted as a relationship as well as a position, so a future insertion between the two reds
+    // here with a message about the pair rather than only as one row of the list above.
+    expect(EPIC_LADDER.indexOf("unstaffed")).toBe(EPIC_LADDER.indexOf("inProgress") - 1);
+    expect(EPIC_LADDER.indexOf("blocked")).toBe(EPIC_LADDER.indexOf("unstaffed") - 1);
   });
 });
 
@@ -135,6 +150,174 @@ describe("bucketEpics — which ladder column an epic lands in", () => {
     const got = idsIn(bucketEpics(bucketBeads(all), all));
     expect(got.planning).toEqual(["e"]);
     expect(got.backlog).toEqual([]); // neither the task nor the epic is left behind here
+  });
+});
+
+// ══ THE UNSTAFFED RUNG — "why is this under Being built with nothing running?" ═════════════════
+//
+// The founder, 2026-08-22, verbatim: *"I don't have a good understanding of why an epic can be in
+// the being built category and yet there are no active billed agents running against it."*
+//
+// `bead.status` is stamped ONCE at promote-to-build and never re-derived, so the bead itself cannot
+// answer him — measured that day, 129 beads sat `in_progress` with three touched in the last two
+// hours. The roster can answer, and `bucketEpics` asks it through the optional `buildRungFor`
+// supplier — which returns a RUNG rather than a boolean, because the founder named three outcomes
+// (working, all-red, nobody) and a boolean could only ever carry two. Nothing is written to bd
+// anywhere on this path.
+//
+// ══ WHY EVERY CASE MOUNTS A STAFFED EPIC BESIDE THE UNSTAFFED ONE ══════════════════════════════
+// "seed one unstaffed epic, assert it is in Unstaffed" passes against a predicate that is never
+// called, against a rule wired to a constant, and against one that files EVERY in-progress epic
+// under the new rung. So each case below stands the two side by side and asserts they SEPARATE —
+// and the paired case re-runs the identical fixture with the predicate inverted, because one test
+// proving absence is ambiguous and the pair is what pins the cause.
+describe("bucketEpics — the Unstaffed rung, derived from the live roster", () => {
+  /** Two epics the board files under Being built, told apart only by who is on them. */
+  const twoInProgress = () => [
+    bead("e-staffed", "in_progress", null, { type: "epic" }),
+    bead("e-bare", "in_progress", null, { type: "epic" }),
+  ];
+  /** The named epics are actively built; everything else has nobody on it.
+   *
+   *  Returns a RUNG, not a boolean, because that is what `bucketEpics` now takes — a boolean could
+   *  only ever say inProgress-or-unstaffed, which left the founder's "all agents red -> Blocked"
+   *  arm with nowhere to land. See the `red` case at the bottom of this describe. */
+  const staffedIs =
+    (...ids: string[]) =>
+    (id: string): "blocked" | "unstaffed" | "inProgress" =>
+      ids.includes(id) ? "inProgress" : "unstaffed";
+  /** Nobody anywhere. */
+  const nobodyStaffed = () => "unstaffed" as const;
+
+  it("routes an in_progress epic with NOBODY on it to Unstaffed, and leaves its staffed sibling in Being built", () => {
+    const all = twoInProgress();
+    const board = bucketBeads(all);
+    // PRECONDITION, stated so a fixture that stopped reaching this route reds here rather than
+    // passing for the wrong reason: bd's own bucketing puts BOTH under Being built today.
+    expect(board.inProgress.map((b) => b.id)).toEqual(["e-staffed", "e-bare"]);
+
+    const got = idsIn(bucketEpics(board, all, staffedIs("e-staffed")));
+    // THE SIDE EFFECT: the bare epic MOVED. Present in the new rung...
+    expect(got.unstaffed).toEqual(["e-bare"]);
+    // ...and ABSENT from the column whose header was lying about it. This is the assertion the
+    // founder's complaint is actually about; the line above alone would pass for a card rendered in
+    // both places at once.
+    expect(got.inProgress).toEqual(["e-staffed"]);
+  });
+
+  it("...and the SAME fixture with the predicate inverted swaps them — the pair that pins the cause", () => {
+    // Identical beads, identical board, one thing different. A rule that ignored `isStaffed`, or
+    // that keyed off anything on the bead (its id, its type, its position), passes the case above
+    // and fails this one.
+    const all = twoInProgress();
+    const got = idsIn(bucketEpics(bucketBeads(all), all, staffedIs("e-bare")));
+    expect(got.unstaffed).toEqual(["e-staffed"]);
+    expect(got.inProgress).toEqual(["e-bare"]);
+  });
+
+  it("applies the same rule to an OPEN epic that reaches Being built through its CHILDREN", () => {
+    // ROUTE 2. `openEpicStage` sends an open epic with a mix of open and closed children to
+    // Being built — a different code path into the same rung, and one a fix covering only the
+    // `board.inProgress` copy-through would leave dishonest. Both routes are mounted at once.
+    const all = [
+      bead("e-kids-staffed", "open"),
+      bead("e-kids-staffed.1", "closed", "e-kids-staffed"),
+      bead("e-kids-staffed.2", "open", "e-kids-staffed"),
+      bead("e-kids-bare", "open"),
+      bead("e-kids-bare.1", "closed", "e-kids-bare"),
+      bead("e-kids-bare.2", "open", "e-kids-bare"),
+    ];
+    const board = bucketBeads(all);
+    // PRECONDITION: both epics are in the OPEN pile, i.e. nothing about their own status put them
+    // in Being built. Only the child roll-up does, which is the route under test.
+    expect(board.inProgress).toEqual([]);
+
+    const got = idsIn(bucketEpics(board, all, staffedIs("e-kids-staffed")));
+    expect(got.unstaffed).toEqual(["e-kids-bare"]);
+    expect(got.inProgress).toEqual(["e-kids-staffed"]);
+    // Their children are plain tasks and belong to neither rung.
+    expect(got.backlog).toEqual([]);
+    expect(got.planning).toEqual([]);
+  });
+
+  it("diverts ONLY the Being-built rung — a blocked, planning, backlog or done epic stays put", () => {
+    // THE NEGATIVE THAT THE THREE CASES ABOVE CANNOT SEE. `isStaffed` answers false for every id
+    // here, so a rule written as "unstaffed epics go to Unstaffed" — rather than "epics that would
+    // land in Being built and have nobody on them" — empties four other rungs into the new one and
+    // still passes every case above. Every candidate rung is mounted at once so absence is a real
+    // observation rather than an empty column.
+    const all = [
+      bead("e-blocked", "open", null, { labels: ["stalled"] }),
+      bead("e-blocked.1", "open", "e-blocked"),
+      bead("e-planning", "open"),
+      bead("e-planning.1", "open", "e-planning"),
+      bead("e-backlog", "open", null, { type: "epic" }),
+      bead("e-done", "open"),
+      bead("e-done.1", "closed", "e-done"),
+      bead("e-shipped", "closed", null, { labels: ["delivered"] }),
+      bead("e-shipped.1", "closed", "e-shipped"),
+      bead("e-live", "in_progress", null, { type: "epic" }),
+    ];
+    const got = idsIn(bucketEpics(bucketBeads(all), all, nobodyStaffed));
+    // ONLY the Being-built one moved.
+    expect(got.unstaffed).toEqual(["e-live"]);
+    expect(got.inProgress).toEqual([]);
+    expect(got.blocked).toEqual(["e-blocked"]);
+    expect(got.planning).toEqual(["e-planning"]);
+    expect(got.backlog).toEqual(["e-backlog"]);
+    expect(got.done).toEqual(["e-done"]);
+    expect(got.delivered).toEqual(["e-shipped"]);
+  });
+
+  it("is UNCHANGED with the predicate omitted — nothing can reach Unstaffed without a roster", () => {
+    // The compatibility contract every rosterless caller and every fixture in this file leans on.
+    // Both routes into Being built are seeded, so this is not satisfied by an empty board.
+    const all = [
+      bead("e-own", "in_progress", null, { type: "epic" }),
+      bead("e-kids", "open"),
+      bead("e-kids.1", "closed", "e-kids"),
+      bead("e-kids.2", "open", "e-kids"),
+    ];
+    const got = idsIn(bucketEpics(bucketBeads(all), all));
+    expect(got.unstaffed).toEqual([]);
+    expect(got.inProgress).toEqual(["e-own", "e-kids"]);
+  });
+
+  it("keeps plain TASKS out of the Unstaffed rung, however the predicate answers", () => {
+    // Epic-ness is decided before staffing is ever asked, and a task in Being built with nobody on
+    // it is the overwhelmingly common case — filing those here would bury the epics the rung exists
+    // to surface. The epic beside them proves the rung is reachable in this same fixture.
+    const all = [
+      bead("t1", "in_progress"),
+      bead("t2", "in_progress"),
+      bead("e", "in_progress", null, { type: "epic" }),
+    ];
+    only(bucketEpics(bucketBeads(all), all, nobodyStaffed), "unstaffed", ["e"]);
+  });
+
+  // ══ THE ARM THAT HAD NO PRODUCTION CALLER UNTIL THE RUNG BECAME THE ARGUMENT ═════════════════
+  // The founder: *"if there are not any [agents] and it's not finished then by definition it should
+  // be considered blocked … Meaning if the agents are Red then it would go into blocked."* Three
+  // outcomes, not two — which is exactly what a boolean `isStaffed` could not carry. While this
+  // took a boolean, `engine/epicHealth.rungForEpicHealth` held the red->blocked rule and NOTHING in
+  // the app called it: its tests were green over a path the screen could never reach.
+  it("routes an epic whose whole fleet is RED into Blocked, beside the dependency-blocked work", () => {
+    const all = twoInProgress();
+    const board = bucketBeads(all);
+    // Same precondition as above — bd files both under Being built, so nothing here is pre-sorted.
+    expect(board.inProgress.map((b) => b.id)).toEqual(["e-staffed", "e-bare"]);
+
+    const got = idsIn(
+      bucketEpics(board, all, (id) => (id === "e-staffed" ? "blocked" : "unstaffed")),
+    );
+    // THE SIDE EFFECT: it left the build rungs entirely and joined the lane he already scans.
+    expect(got.blocked).toEqual(["e-staffed"]);
+    // ...and is absent from BOTH build rungs. Asserting only its arrival would pass for a card
+    // rendered in two columns at once, and asserting only its absence from `inProgress` would pass
+    // for a rule that quietly filed it as unstaffed instead — which is a different claim about the
+    // epic (nobody came) than the one the fleet is making (everyone is stuck).
+    expect(got.inProgress).toEqual([]);
+    expect(got.unstaffed).toEqual(["e-bare"]);
   });
 });
 
@@ -245,9 +428,17 @@ describe("STAGE_LABELS — the one place a stage is put into words", () => {
     }
   });
 
-  it("labels the in-progress rung 'Being built' — the founder's phrase — and never 'Building'", () => {
-    expect(STAGE_LABELS.inProgress).toBe("Being built");
+  it("labels the two build rungs 'Build: Unstaffed' and 'Build: Active' — one stage, two states", () => {
+    expect(STAGE_LABELS.inProgress).toBe("Build: Active");
     expect(Object.values(STAGE_LABELS)).not.toContain("Building");
+  });
+
+  it("prefixes the derived rung so it reads as a BUILD state, not a fourth kind of not-started", () => {
+    // It is the word he wrote in the ladder he picked, and it is the one the header renders. A
+    // near-miss ("Unassigned", "No agent", "Idle") would be a second vocabulary for a state the app
+    // already names `unstaffed` in `engine/epicHealth` and describes to the user as "Nobody is
+    // working on this epic".
+    expect(STAGE_LABELS.unstaffed).toBe("Build: Unstaffed");
   });
 
   // ── THE ROW THAT ACTUALLY BITES: `EPIC_LADDER` MUST COVER EVERY RUNG ────────────────────────

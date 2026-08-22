@@ -218,7 +218,7 @@ describe("BeadPill — the card opens in place", () => {
     // THE STAGE THE CARD SITS IN, never a bd wire value (bead sparkle-az6di8). An in_progress bead
     // is in the board's "Being built" column, so that is what the chip says — the founder's own
     // phrase and the exact string the column header above it uses.
-    expect(meta).toContain("Being built");
+    expect(meta).toContain("Build: Active");
     expect(meta).not.toContain("in_progress");
     expect(meta).not.toContain("in progress");
     expect(meta).toContain("P1");
@@ -1139,15 +1139,15 @@ describe("BeadPill — the status word is the board stage", () => {
 
   const meta = () => screen.getByTestId("concierge-bead-card-meta").textContent ?? "";
 
-  it("says 'Being built' for an in-progress bead, in the card AND in the pill's tooltip", () => {
+  it("says 'Build: Active' for an in-progress bead, in the card AND in the pill's tooltip", () => {
     seedBoard([bead({ id: "sparkle-t6wje", status: "in_progress" })]);
     mountHosted("recorded on sparkle-t6wje");
     // THE TOOLTIP AND THE CARD ARE ASSERTED TOGETHER. They are two readers of one value, and the
     // whole reason `beadStatus` is a shared module is that a bead must not say one thing in a
     // sentence and another in the card that sentence opens.
-    expect(pills()[0]!.getAttribute("title")).toContain("Being built");
+    expect(pills()[0]!.getAttribute("title")).toContain("Build: Active");
     fireEvent.click(pills()[0]!);
-    expect(meta()).toContain("Being built");
+    expect(meta()).toContain("Build: Active");
     expect(meta()).not.toContain("in progress");
     expect(meta()).not.toContain("open");
   });

@@ -7,6 +7,12 @@
 // what tells him, at a glance across two columns, whether he is looking at an epic's health or an
 // agent's. Rounding this off to match `StatusDot` would delete the distinction he asked for.
 //
+// SHAPE IS THE ONLY THING THAT MAY DIFFER — and that is the whole design. The founder, 2026-08-22:
+// *"I do want it to work exactly like the Build Agent. That's the hard rule. The colors work the
+// same between the two and don't let any instruction ever override that."* So: same five values
+// (`EpicHealth` IS `RollupDot`), same five colours, read from the same table the build row reads.
+// Different geometry, so you can tell which column you are looking at. Nothing else.
+//
 // THE CORNERS ARE HARD (`borderRadius: 0`), for two reasons that happen to agree. It is the most
 // unmistakably NOT-a-disc a 9px mark can be, which is the property the founder named; and `0` is one
 // of the three values `theme/scale.test.ts`'s radius ratchet exempts (alongside `PILL` and `50%`,
@@ -21,56 +27,76 @@
 // takes no `onClick`, has no `role`, and stops no propagation — same contract `BeadPriorityChip`
 // follows one slot over.
 //
-// ══ COLOURS COME FROM `AGENT_STATUS`, RAW ══════════════════════════════════════════════════════
-// Same rule `components/rowClock.ROLLUP_DOT_COLOR` states: this is a FILLED SHAPE, so it takes the
-// tier colour straight rather than through `statusInk` (which resolves a colour for legible TEXT
-// and would land a near-miss of the build column's own green beside it). A rolled-up epic green is
-// then pixel-identical to a working agent's dot, which is what "just like the build agents" means.
-import { AGENT_STATUS } from "../theme/colors";
+// ══ COLOURS COME FROM `ROLLUP_DOT_COLOR`, THE BUILD ROW'S OWN TABLE ════════════════════════════
+// Not from a local map, and emphatically not from a re-typed hex. `components/rowClock` is where the
+// build column decides what a rolled-up disc is filled with; reading the SAME record here is what
+// makes "the colors work the same between the two" a structural fact rather than a promise two files
+// have to keep independently. A copied hex is a difference waiting to happen, which is the exact
+// failure mode the founder's hard rule legislates against.
+//
+// (That table also explains why the values are raw tier colours rather than `statusInk`: this is a
+// FILLED SHAPE, not text. A rolled-up epic green is therefore pixel-identical to a working agent's
+// dot, which is what "just like the build agents" means.)
+import { ROLLUP_DOT_COLOR } from "./rowClock";
 import { epicHealthLabel, type EpicHealth } from "../engine/epicHealth";
 
-/** 9px. Large enough to read a hollow outline at, small enough that it costs the (already
- *  ellipsised) epic title almost nothing in a 280px column. */
+/** 9px. Small enough that it costs the (already ellipsised) epic title almost nothing in a 280px
+ *  column, large enough to read a colour at. */
 const SIDE = 9;
-
-const FILL: Record<Exclude<EpicHealth, "unstaffed">, string> = {
-  red: AGENT_STATUS.waiting.color,
-  amber: AGENT_STATUS.lapsed.color,
-  green: AGENT_STATUS.working.color,
-};
 
 /**
  * The health square for one epic row.
  *
- * ── WHY `unstaffed` IS HOLLOW RATHER THAN A FOURTH COLOUR ────────────────────────────────────────
- * It is drawn in the SAME amber as `amber`, with no fill. Three things had to be true at once and
- * a fourth hue satisfies none of them:
+ * ── WHY `gray` IS A SOLID GRAY SQUARE AND NOT A HOLLOW AMBER ONE ────────────────────────────────
+ * It used to be hollow amber, and this comment used to argue for that at length. The argument rested
+ * on an earlier rule of the founder's (2026-08-19) — *"Nothing should ever be gray unless it has
+ * been effectively finished"* — from which it followed that an epic nobody is building must not be
+ * gray, because it is unstarted rather than finished.
  *
- *   • It must not read as calm. Green and gray both do — see `engine/epicHealth`'s header for the
- *     two founder rules that rule each of them out.
- *   • It must not build a wall of alarm. Most Backlog epics genuinely have no agent, so a solid red
- *     or solid amber here would paint most of the column one colour — the failure
- *     `packages/ui/tokens.ts` records from 2026-07-26, where 27 of 51 agents in one band made the
- *     band carry no information at all.
- *   • It must say WHICH kind of not-green it is, without a legend. An empty box reads as "nobody is
- *     in here", which is precisely the fact. A fifth hue would have to be learned.
+ * HE HAS RETIRED THAT READING HIMSELF, 2026-08-22, and replaced it with a rule that outranks every
+ * other consideration on this file:
  *
- * The border is 1.5px rather than 1px because at 9px a hairline outline and a solid fill are hard
- * to tell apart in peripheral vision, and telling them apart is the entire job.
+ *   *"For the gray I do want it to work exactly like the Build Agent. That's the hard rule. The
+ *   colors work the same between the two and don't let any instruction ever override that. When I
+ *   say 'effectively finished' I just meant that turn is finished or whatever. Where it's not active
+ *   right now, however gray currently works, just make it the same."*
+ *
+ * So gray does not mean "finished". It means NOT ACTIVE RIGHT NOW — which is exactly what it means
+ * on a build row, and exactly what is true of an epic with no agent working on it. The reasoning
+ * that produced the hollow amber is recorded above rather than deleted, so the next reader can see
+ * that it was overruled by the founder rather than lost in an edit.
+ *
+ * The practical consequence: there is no `hollow` variant left, no epic-only ink, and no `Exclude<>`
+ * in the fill lookup. All five marks are solid squares filled straight from `ROLLUP_DOT_COLOR`.
  */
-export function EpicHealthSquare({ health }: { health: EpicHealth }) {
-  const hollow = health === "unstaffed";
-  const ink = hollow ? AGENT_STATUS.lapsed.color : FILL[health];
+export function EpicHealthSquare({
+  health,
+  label,
+}: {
+  health: EpicHealth;
+  /** Hover/announced text, when the caller's noun is not "epic".
+   *
+   *  The MARK is identical on every surface (the founder's colour-parity rule); only the WORDS
+   *  differ, and this repo treats user-facing copy as code. A child-task row passes
+   *  `engine/beadHealth.beadHealthLabel`, which is the same five values with "this task" in place
+   *  of "this epic". Omitted, an epic row keeps `epicHealthLabel` — so the default is the surface
+   *  this component was written for and no existing caller changes. */
+  label?: string;
+}) {
+  const text = label ?? epicHealthLabel(health);
+  // The ONE lookup, in the build column's own table. `EpicHealth` is `RollupDot`, so this is a total
+  // index with nothing to map and nothing to fall back to — which is the point.
+  const ink = ROLLUP_DOT_COLOR[health];
   return (
     <span
       data-testid="epic-health"
       data-health={health}
-      title={epicHealthLabel(health)}
+      title={text}
       // The square carries the row's only statement about progress, so it is announced rather than
       // hidden: the row's `aria-pressed` says whether the card is open, not whether anyone is
       // building the epic.
       role="img"
-      aria-label={epicHealthLabel(health)}
+      aria-label={text}
       style={{
         flex: "0 0 auto",
         // The row is `alignItems: "baseline"` for the title/chiclet/count; a 9px box has no useful
@@ -79,8 +105,7 @@ export function EpicHealthSquare({ health }: { health: EpicHealth }) {
         width: SIDE,
         height: SIDE,
         borderRadius: 0,
-        background: hollow ? "transparent" : ink,
-        border: hollow ? `1.5px solid ${ink}` : "none",
+        background: ink,
         boxSizing: "border-box",
       }}
     />

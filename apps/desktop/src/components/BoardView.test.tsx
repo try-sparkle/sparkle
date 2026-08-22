@@ -151,6 +151,7 @@ import { sendToBuild } from "../services/sendToBuild";
 import { bucketBeads, claimBead, labelBead, closeBead, markBeadDelivered } from "../services/beads";
 import { useCriteriaStore } from "../services/criteriaStore";
 import { useProjectStore } from "../stores/projectStore";
+import { useRuntimeStore } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
 import { NO_BOARD_FILTER } from "../services/boardFilters";
 import { dismissibleSurfaceOpen, unbindsOnKey } from "../engine/cable";
@@ -627,7 +628,7 @@ describe("BoardView", () => {
     // Column headers, addressed by lane so they cannot be confused with card text — the terminal
     // lane and the terminal STAGE badge are both "Shipped", deliberately (one vocabulary).
     expect(screen.getByTestId("lane-label-backlog").textContent).toContain("Backlog");
-    expect(screen.getByTestId("lane-label-inProgress").textContent).toContain("Being built");
+    expect(screen.getByTestId("lane-label-inProgress").textContent).toContain("Build: Active");
     expect(screen.getByTestId("lane-label-done").textContent).toContain("Done");
     expect(screen.getByTestId("lane-label-delivered").textContent).toContain("Shipped");
     // The count renders UNDER the title, inside the same lane stack.
@@ -1500,7 +1501,7 @@ describe("BoardView — Definable Done & Delivered (Unit 5)", () => {
     expect(screen.getByText("Define “Shipped”")).toBeTruthy();
     // The inert columns never get a Define affordance.
     expect(screen.queryByText("Define “Backlog”")).toBeNull();
-    expect(screen.queryByText("Define “Being built”")).toBeNull();
+    expect(screen.queryByText("Define “Build: Active”")).toBeNull();
   });
 
   it("opens the Define modal for the matching stage when a Done/Delivered header is clicked", async () => {
@@ -2223,6 +2224,159 @@ describe("BoardView — Tasks / Epics kind toggles", () => {
   });
   afterEach(() => {
     useUiStore.setState({ planKindsBySide: { ...ALL_KINDS } });
+    // The Unstaffed cases below seed agent statuses; clear them so a failure mid-test cannot leave
+    // a live roster behind for the next case (every other test here expects an empty one).
+    useRuntimeStore.setState({ status: {} } as never);
+  });
+
+  // ══ THE UNSTAFFED RUNG — "why is this under Being built with nothing running?" ═══════════════
+  //
+  // The founder, 2026-08-22: *"I don't have a good understanding of why an epic can be in the being
+  // built category and yet there are no active billed agents running against it."* `bead.status` is
+  // stamped once at promote-to-build and never re-derived, so the bead cannot answer him; the live
+  // roster can, and `bucketEpics` asks it through an OPTIONAL predicate. Optional is exactly why
+  // this case has to exist HERE and not only in `services/epicBoard.test.ts`: a board that never
+  // passes a predicate renders precisely as it did before the rung existed, and every bucketing test
+  // stays green. This is the test that fails if `BoardView` forgets to ask.
+  //
+  // BOTH EPICS ARE `in_progress` AND IDENTICAL BUT FOR THEIR ROSTER, so "it landed in Unstaffed"
+  // cannot pass against a rule wired to a constant, keyed to the bead, or applied to every card.
+  describe("the Unstaffed rung, on the Epics ladder", () => {
+    /** Two epics bd files under Being built. Only one has an orchestrator bound to it. */
+    function seedTwoBuilding() {
+      const beads: Bead[] = [
+        // NOT "... epic": a trailing bare word `epic` is scrubbed from the DISPLAYED title
+        // (`epicDisplayTitle`), and these queries locate cards BY their rendered text — so a title
+        // ending in it silently matches nothing and every assertion below reads `null`. Same trap
+        // `seedEpicSnapshot` above names.
+        bead({ id: "p1-staffed", title: "Staffed rollup", type: "epic", status: "in_progress" }),
+        bead({ id: "p1-bare", title: "Bare rollup", type: "epic", status: "in_progress" }),
+      ];
+      snapshot = { beads, board: bucketBeads(beads), loadedAt: Date.now() };
+    }
+
+    function withAgents(agents: AgentTab[]) {
+      useProjectStore.setState({
+        projects: [{ ...project, agents }],
+        selectedProjectId: project.id,
+      });
+    }
+
+    const buildAgent = (id: string, epicId: string) =>
+      ({ id, name: id, kind: "build", parentId: null, epicId }) as unknown as AgentTab;
+
+    /** Epics-only: the combination that swaps the six task columns for the founder's ladder. */
+    const epicsOnly = () =>
+      useUiStore.setState({
+        planKindsBySide: { left: { tasks: true, epics: true }, right: { tasks: false, epics: true } },
+      });
+
+    it("sends the epic with NOBODY on it to Build: Unstaffed and leaves its staffed twin in Build: Active", () => {
+      seedTwoBuilding();
+      withAgents([buildAgent("a-live", "p1-staffed")]);
+      useRuntimeStore.setState({ status: { "a-live": "working" } } as never);
+      epicsOnly();
+
+      const { container } = render(<BoardView project={project} side="right" />);
+      // The column exists at all — it never did before this change, in any combination.
+      expect(container.querySelector('[data-board-column="unstaffed"]')).not.toBeNull();
+      expect(screen.getByTestId("lane-label-unstaffed").textContent).toContain("Build: Unstaffed");
+      // THE SIDE EFFECT: the bare epic moved, and the staffed one did not. Asserting only the first
+      // would pass against a board that files every in-progress epic under the new rung.
+      expect(columnOf("Bare rollup")).toBe("unstaffed");
+      expect(columnOf("Staffed rollup")).toBe("inProgress");
+    });
+
+    // ══ THE THIRD OUTCOME, AND THE SECOND CALL SITE ═════════════════════════════════════════════
+    // `EpicsColumn.unstaffed.test.tsx` proves this wiring on the OTHER surface. That is not enough:
+    // the argument the fix rests on — a hand-supplied rung proves the rule and says nothing about
+    // whether the surface asks for it — applies unchanged here. Replacing BoardView's call site with
+    // a second local rule (`epicHealthOf(id) === "gray" ? "unstaffed" : "inProgress"` — spelled with
+    // the COLOUR, because that is what `epicHealthOf` returns since `EpicHealth` collapsed to
+    // `RollupDot`; the older `"unstaffed"` spelling no longer typechecks, so a reader who tried to
+    // run the mutation got a type error rather than the green suite the argument depends on)
+    // typechecks and leaves this whole suite green, silently deleting the founder's rule from
+    // Epics-only mode while the epics column keeps it. Only a red-fleet render can see that.
+    it("sends an epic whose whole fleet is RED to Blocked, on this surface too", () => {
+      seedTwoBuilding();
+      // `waiting` bands as `needs_you` (`engine/workerRollup.isRedStatus` / `bandOfStatus`), which
+      // is what rolls this fleet up to the red dot. Cite the CLASSIFIER, not a palette:
+      // `EpicHealthSquare` has no colour map any more (it is `ROLLUP_DOT_COLOR[health]`), this test
+      // never renders a square, and a paint lookup could be re-hexed without moving the outcome —
+      // while `isRedStatus` de-escalating `waiting`, which `workerRollup`'s header records as having
+      // already happened once to `unmerged`, would red this case with its comment sending the next
+      // reader to the wrong file (roborev 67958). Both epics carry an agent, so the difference
+      // between them is purely what their fleets are DOING, not whether anyone showed up.
+      withAgents([buildAgent("a-live", "p1-staffed"), buildAgent("a-stuck", "p1-bare")]);
+      useRuntimeStore.setState({
+        status: { "a-live": "working", "a-stuck": "waiting" },
+      } as never);
+      epicsOnly();
+
+      render(<BoardView project={project} side="right" />);
+      // THE SIDE EFFECT: it left the build rungs entirely for the lane the founder already scans.
+      expect(columnOf("Bare rollup")).toBe("blocked");
+      // ...and its working twin did NOT move. Asserting only the first would pass against a board
+      // that files every in-progress epic under Blocked the moment any agent anywhere is red.
+      expect(columnOf("Staffed rollup")).toBe("inProgress");
+    });
+
+    // ══ ARRIVING IN Blocked MUST NOT COST THE CARD ITS PROGRESS CHIP ═══════════════════════════
+    // roborev 67959. `nextStageOf` decides which stage a card evaluates toward, and `blocked` used
+    // to fall through to `null` — harmless while `blocked` was a bead-status bucket no LIVE epic
+    // could reach. The rung rule changed that: an epic whose whole fleet is stopped is filed here
+    // while its own status is still `in_progress`. Falling through would make it evaluate no Done
+    // criteria and render no chip — so the epic the founder is most likely to open goes quiet at
+    // exactly the moment he wants to know how far the stopped work got, and the column assertion
+    // above cannot see it.
+    //
+    // BOTH EPICS ARE CHECKED, because "a chip is on screen" is satisfied by the working twin alone.
+    it("keeps the Done-progress chip on the epic it just sent to Blocked", async () => {
+      defineDone({ text: "Reviewed by a teammate", kind: "manual", signal: null });
+      seedTwoBuilding();
+      withAgents([buildAgent("a-live", "p1-staffed"), buildAgent("a-stuck", "p1-bare")]);
+      useRuntimeStore.setState({
+        status: { "a-live": "working", "a-stuck": "waiting" },
+      } as never);
+      epicsOnly();
+
+      render(<BoardView project={project} side="right" />);
+      expect(columnOf("Bare rollup")).toBe("blocked");
+      // The chip reads "0 of 1" on a card that is evaluating toward a defined Done. TWO of them —
+      // one per epic — is the assertion: one would pass with the blocked card silently chip-less.
+      await waitFor(() => expect(screen.getAllByText("0 of 1")).toHaveLength(2));
+    });
+
+    it("...and the same two beads swap rungs when the AGENT moves — the pair that pins the cause", () => {
+      // Identical snapshot, identical toggles; the roster is the only thing that changed. A board
+      // that ignored staffing, or keyed off anything on the bead, passes the UNSTAFFED case — the
+      // `Build: Unstaffed` / `Build: Active` pair further above, NOT the red-fleet cases that now
+      // sit between it and this one — and fails this one. Naming the partner rather than saying
+      // "the case above" is the fix for roborev 67958: the red-fleet case is a discriminator too
+      // (a staffing-blind board files `Bare rollup` under `inProgress` and reds its `blocked`
+      // assertion), so "passes the case above" had become false the moment a case was inserted.
+      seedTwoBuilding();
+      withAgents([buildAgent("a-live", "p1-bare")]);
+      useRuntimeStore.setState({ status: { "a-live": "working" } } as never);
+      epicsOnly();
+
+      render(<BoardView project={project} side="right" />);
+      expect(columnOf("Bare rollup")).toBe("inProgress");
+      expect(columnOf("Staffed rollup")).toBe("unstaffed");
+    });
+
+    it("keeps the rung off the board entirely while TASKS are on — it is an epics-only stage", () => {
+      // The complement, and the reason `withPlanning` widens a task board with an EMPTY Unstaffed
+      // pile: with tasks on the board the familiar six columns stay, and both epics stay under
+      // Being built exactly as they always did. Without this, "the rung appeared" would be
+      // indistinguishable from "the rung appeared everywhere".
+      seedTwoBuilding();
+      withAgents([]);
+      const { container } = render(<BoardView project={project} side="right" />);
+      expect(container.querySelector('[data-board-column="unstaffed"]')).toBeNull();
+      expect(columnOf("Bare rollup")).toBe("inProgress");
+      expect(columnOf("Staffed rollup")).toBe("inProgress");
+    });
   });
 
   it("defaults to BOTH KINDS ON — the board is exactly what it was before these controls existed", () => {
@@ -2597,14 +2751,28 @@ describe("BoardView — epic vs task card treatment", () => {
     expect(epic.title).toBe("Concierge chat surface (epic)");
   });
 
-  it("counts only OPEN children in 'Contains N tasks'", () => {
+  // ══ "CONTAINS N" NAMES WHAT THE EPIC CONTAINS, AND N IS THE TOTAL ═══════════════════════════
+  // THIS TEST WAS INVERTED, DELIBERATELY. It used to assert `Contains 2 tasks` for an epic with
+  // three children one of which is closed — a containment phrase reporting a REMAINDER — and it
+  // explicitly ruled the total out. That is the same misreading the epics column's ratio flip
+  // exists to kill, and the founder's ruling settles it: *"flip it so that it builds up to the
+  // total versus building down."*
+  //
+  // Left as it was, one epic showed three different numbers across two surfaces: the epics-column
+  // row read `1/3` under the old direction and `2/3` under the new one, while this card read
+  // `Contains 1 task`. The count and the ratio now agree because both are derived from the SAME
+  // membership walk and both count up.
+  it("names the TOTAL in 'Contains N tasks', with progress counted UP beside it", () => {
     seedEpicBoard();
     render(<BoardView project={project} side="right" />);
-    // Three children exist; one is closed. A total-children count would read 3 and is what this
-    // rules out.
-    expect(within(epicCard()).getByTestId("epic-contains-tasks").textContent).toContain(
-      "Contains 2 tasks",
-    );
+    // Three children exist; one is closed. So: contains 3, one of them done.
+    const text = within(epicCard()).getByTestId("epic-contains-tasks").textContent ?? "";
+    expect(text).toContain("Contains 3 tasks");
+    expect(text).toContain("1 done");
+    // ...and NOT the remainder it used to report. Naming the value it must not be is what keeps
+    // this pinned to the flip rather than to a fixture that happens to agree.
+    expect(text).not.toContain("Contains 2 tasks");
+    expect(text).not.toContain("Contains 1 task");
   });
 
   it("is COLLAPSED by default and expands in place on click", () => {
@@ -3077,11 +3245,11 @@ describe("BoardView — the bead card's status chip is the board stage, not the 
     fireEvent.click(node);
   };
 
-  it("says 'Being built' — not 'open', not 'in progress' — for a card in that column", () => {
+  it("says 'Build: Active' — not 'open', not 'in progress' — for a card in that column", () => {
     render(<BoardView project={project} side="right" />);
     fireEvent.click(screen.getByText("Doing now")); // the sole inProgress card
     // THE FOUNDER'S OWN PHRASE, and byte-for-byte the column header above it.
-    expect(meta()).toContain("Being built");
+    expect(meta()).toContain("Build: Active");
     expect(meta()).not.toContain("in progress");
     expect(meta()).not.toContain("in_progress");
     expect(meta()).not.toContain("open");
@@ -3191,12 +3359,136 @@ describe("BoardView — the bead card's status chip is the board stage, not the 
     render(<BoardView project={project} side="right" />);
     const ladderLabel = screen.getByTestId("lane-label-inProgress").textContent ?? "";
 
-    expect(ladderLabel).toContain("Being built");
+    expect(ladderLabel).toContain("Build: Active");
     expect(ladderLabel).not.toContain("Building");
     // The identity itself — the thing that was false before this change.
     expect(ladderLabel).toBe(taskBoardLabel);
     useUiStore.setState({
       planKindsBySide: { left: { tasks: true, epics: true }, right: { tasks: true, epics: true } },
     });
+  });
+});
+
+// ══ THE CHILD-TASK SQUARE, ON THE EPIC CARD'S EXPANDED ROWS ═══════════════════════════════════
+//
+// The founder, 2026-08-22 (bead `sparkle-tsyh5u`): *"Each of the children should also have a status
+// so just like the epic has a square status, the children should also have that status."*
+//
+// ══ WHY EVERY CASE EXPANDS ALL FOUR CHILDREN AT ONCE ══════════════════════════════════════════
+// Same trap `EpicsColumn.health.test.tsx` names, and it is the reason that file mounts four epics
+// side by side: the states are a small enum, so "render a red child, assert the square is red"
+// passes against a square hard-wired to red, against one reading the WRONG child's agents, and
+// against a rollup that ignores its input entirely. Every assertion below is therefore that the
+// rendered squares DISAGREE in the specific way the rule says they should — and the closed child
+// is mounted beside them so "renders none" is a fact about THAT row rather than about a fixture in
+// which no row has a square at all.
+describe("BoardView — the child-task health square on an expanded epic card", () => {
+  /** One epic, four children: a red one, a green one, one nobody is on, and a CLOSED one whose
+   *  worker is green — so the terminal arm is exercised against a row that would otherwise paint. */
+  function seedEpicWithFourKids() {
+    const epic = bead({ id: "p1-e1", title: "Concierge chat surface", type: "epic" });
+    const kidRed = bead({ id: "p1-e1.1", title: "Child red", parent: "p1-e1" });
+    const kidGreen = bead({ id: "p1-e1.2", title: "Child green", parent: "p1-e1" });
+    const kidBare = bead({ id: "p1-e1.3", title: "Child bare", parent: "p1-e1" });
+    const kidClosed = bead({
+      id: "p1-e1.4",
+      title: "Child closed",
+      parent: "p1-e1",
+      status: "closed",
+    });
+    const beads = [epic, kidRed, kidGreen, kidBare, kidClosed];
+    snapshot = { beads, board: bucketBeads(beads), loadedAt: Date.now() };
+  }
+
+  /** A worker bound to ONE bead — the `beadId` edge `workersForBead` reads for the same row. */
+  const worker = (id: string, beadId: string) =>
+    ({ id, name: id, kind: "worker", parentId: null, beadId }) as unknown as AgentTab;
+
+  function withAgents(agents: AgentTab[]) {
+    useProjectStore.setState({
+      projects: [{ ...project, agents }],
+      selectedProjectId: project.id,
+    });
+  }
+
+  /** Expand the epic and hand back its child rows, keyed by the title each one prints. */
+  function expandedRows(): Map<string, HTMLElement> {
+    const card = screen.getAllByTestId("board-card-epic")[0]!;
+    fireEvent.click(within(card).getByTestId("epic-contains-tasks"));
+    const rows = within(screen.getAllByTestId("board-card-epic")[0]!).getAllByTestId(
+      "epic-child-row",
+    );
+    const byTitle = new Map<string, HTMLElement>();
+    for (const r of rows) {
+      const title = ["Child red", "Child green", "Child bare", "Child closed"].find((t) =>
+        r.textContent?.includes(t),
+      );
+      if (title) byTitle.set(title, r);
+    }
+    return byTitle;
+  }
+
+  const squareIn = (row: HTMLElement) =>
+    row.querySelector<HTMLElement>('[data-testid="epic-health"]');
+
+  beforeEach(() => {
+    seedEpicWithFourKids();
+    withAgents([
+      worker("w-red", "p1-e1.1"),
+      worker("w-green", "p1-e1.2"),
+      // "Child bare" deliberately has NONE.
+      worker("w-closed", "p1-e1.4"),
+    ]);
+    useRuntimeStore.setState({
+      // `waiting` is an on-screen prompt — the build row's `needs_you` red. Same three statuses
+      // `EpicsColumn.health.test.tsx` drives its four epics with, so the two surfaces are pinned to
+      // one vocabulary here as well as in the rule.
+      status: { "w-red": "waiting", "w-green": "working", "w-closed": "working" },
+      openAgentIds: [],
+      lastObserved: {},
+      branchStatus: {},
+      workflowStage: {},
+      observedAttention: {},
+    } as never);
+  });
+
+  it("paints each child from ITS OWN agents — red, green and gray in one expanded epic", () => {
+    render(<BoardView project={project} side="right" />);
+    const rows = expandedRows();
+
+    // THE SIDE EFFECT, three ways at once. Asserting only the red one would pass against a square
+    // wired to a constant; asserting only that squares exist would pass against a rollup that
+    // ignores which child it was asked about.
+    expect(squareIn(rows.get("Child red")!)?.getAttribute("data-health")).toBe("red");
+    expect(squareIn(rows.get("Child green")!)?.getAttribute("data-health")).toBe("green");
+    // Nobody on it — the founder's settled gray: "not active right now", the build row's own gray.
+    expect(squareIn(rows.get("Child bare")!)?.getAttribute("data-health")).toBe("gray");
+  });
+
+  it("renders NO square on a closed child, beside three siblings that have one", () => {
+    render(<BoardView project={project} side="right" />);
+    const rows = expandedRows();
+
+    // The closed child's worker is `working`, so a rule that forgot `beadHealthApplies` would paint
+    // it GREEN here rather than merely leaving it gray — the mark is wrong, not just present.
+    expect(squareIn(rows.get("Child closed")!)).toBeNull();
+    // ...and the row is still there with its title, so this is "no square", not "no row".
+    expect(rows.get("Child closed")!.textContent).toContain("Child closed");
+    for (const title of ["Child red", "Child green", "Child bare"]) {
+      expect(squareIn(rows.get(title)!)).not.toBeNull();
+    }
+  });
+
+  it("says 'this task' in the hover text, never 'this epic'", () => {
+    render(<BoardView project={project} side="right" />);
+    const rows = expandedRows();
+
+    // User-facing copy is code here: the SAME five marks carry a different noun on a child row, and
+    // `beadHealthLabel` is the only reason that module is not a pure delegation. A row that reused
+    // `epicHealthLabel` would tell the founder a build agent is stopped "on this epic" while he is
+    // looking at one task of nine.
+    const label = squareIn(rows.get("Child red")!)?.getAttribute("aria-label") ?? "";
+    expect(label).toContain("this task");
+    expect(label).not.toContain("this epic");
   });
 });

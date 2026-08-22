@@ -28,13 +28,18 @@ import {
   epicIndexOf,
   isEpicIndexed,
   STALLED_LABEL,
+  unclaimBead,
   type Bead,
   type EpicIndex,
 } from "../../services/beads";
 import { rollupEpicStatus } from "../../services/planView";
 import { useBeadsStore } from "../../stores/beadsStore";
 import { parsePrdRef } from "../../services/tasks";
-import { sendToBuild, sendToBuildBlockedReason } from "../../services/sendToBuild";
+import {
+  AtCapacityError,
+  sendToBuild,
+  sendToBuildBlockedReason,
+} from "../../services/sendToBuild";
 import { useProjectStore } from "../../stores/projectStore";
 
 export interface BeadBuildActions {
@@ -259,6 +264,36 @@ export function isStartable(
   return true;
 }
 
+/**
+ * Undo a claim whose handoff did not take — the rollback half of claim-then-dispatch.
+ *
+ * ══ WHY IT EXISTS AT ALL ═══════════════════════════════════════════════════════════════════════
+ * `claimBead` is awaited; `sendToBuild` is not, and it CAN throw — for an unknown project, or for a
+ * capacity race the preflight above it cannot see because a preflight runs before the thing it is
+ * predicting. Every throw after the claim used to leave the bead `in_progress` with no orchestrator
+ * bound and no way back: until `unclaimBead` there was no edge from in_progress to open anywhere in
+ * the app, so the strand was PERMANENT and invisible. `sendToBuildBlockedReason`'s doc has named
+ * this outcome verbatim the whole time ("nothing un-claims it"). This is the something.
+ *
+ * ══ WHY IT IS BEST-EFFORT ══════════════════════════════════════════════════════════════════════
+ * The error the caller must see is the one that REFUSED THE BUILD — that is the sentence the card
+ * renders beside the button, and the only one that tells the user what to do next. A cleanup that
+ * fails is a strictly smaller problem than a build that failed for a reason nobody read, so a
+ * throwing unclaim must never displace it. Swallowed here rather than at each call site so the
+ * reasoning lives in one place and a future site cannot forget it.
+ *
+ * A blank `rootPath` is a no-op for the same reason the claim is skipped for one: there is no store
+ * to write to.
+ */
+async function releaseClaim(rootPath: string | null | undefined, id: string): Promise<void> {
+  if (!rootPath) return;
+  try {
+    await unclaimBead(rootPath, id);
+  } catch {
+    // Deliberately swallowed — see above.
+  }
+}
+
 export function useBeadBuildActions({
   bead,
   projectId,
@@ -370,7 +405,15 @@ export function useBeadBuildActions({
       const blocked = sendToBuildBlockedReason(projectId, bead.id, mode);
       if (blocked) throw new Error(blocked);
       if (rootPath) await claimBead(rootPath, bead.id);
-      sendToBuild({ projectId, epicId: bead.id, prdPath, mode });
+      // THE PREFLIGHT IS NOT ENOUGH — see `releaseClaim`. It answers the capacity question only,
+      // and it answers it BEFORE the claim; a `sendToBuild` that throws after it (unknown project,
+      // a capacity race) still strands the claim this line just wrote.
+      try {
+        sendToBuild({ projectId, epicId: bead.id, prdPath, mode });
+      } catch (e) {
+        await releaseClaim(rootPath, bead.id);
+        throw e;
+      }
       onStarted?.();
     },
     [projectId, bead.id, rootPath, prdPath, onStarted],
@@ -387,7 +430,30 @@ export function useBeadBuildActions({
         throw new Error(`${blocked} Started ${built} of ${prdEpics.length}; the rest are untouched.`);
       }
       if (rootPath) await claimBead(rootPath, epic.id);
-      sendToBuild({ projectId, epicId: epic.id, prdPath });
+      // Same rollback as `buildOne`, and here it is what keeps the SENTENCE above true: "the rest
+      // are untouched" has to include the epic that just failed. Its already-dispatched siblings
+      // keep their claims — they really are building.
+      try {
+        sendToBuild({ projectId, epicId: epic.id, prdPath });
+      } catch (e) {
+        await releaseClaim(rootPath, epic.id);
+        // The same partial-batch sentence the ceiling path already carries, and it is now true of
+        // BOTH refusal shapes: the rollback above is what makes "the rest are untouched" include
+        // the epic whose dispatch just threw. `cause` keeps the original error reachable.
+        //
+        // ══ THE CLASS SURVIVES THE REWRAP ══════════════════════════════════════════════════════
+        // `AtCapacityError` exists precisely so callers "can map it to their own vocabulary …
+        // instead of string-matching a generic Error", and `epicSweepRunner` and
+        // `conciergeTools/plans` both establish `instanceof AtCapacityError` as the house pattern.
+        // A capacity race is exactly what can throw HERE, so flattening it to a plain `Error` would
+        // make the batch path and `buildOne` — which rethrows unwrapped, one arm up — disagree about
+        // what they throw for the identical refusal. Nothing catches it by class on this path today;
+        // the next caller that does would silently fall through to the generic branch.
+        const sentence = `${e instanceof Error ? e.message : String(e)} Started ${built} of ${prdEpics.length}; the rest are untouched.`;
+        throw e instanceof AtCapacityError
+          ? new AtCapacityError(sentence)
+          : new Error(sentence, { cause: e });
+      }
       built += 1;
     }
     onStarted?.();

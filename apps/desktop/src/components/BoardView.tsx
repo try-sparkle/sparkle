@@ -35,6 +35,10 @@ import {
 import { safeUnlisten } from "../services/safeUnlisten";
 import { useBeadsStore } from "../stores/beadsStore";
 import { useProjectStore } from "../stores/projectStore";
+import { rungForEpicHealth, type EpicHealth } from "../engine/epicHealth";
+import { beadHealthApplies, beadHealthLabel } from "../engine/beadHealth";
+import { useEpicHealthOf, useBeadHealthOf } from "../hooks/useEpicHealthOf";
+import { EpicHealthSquare } from "./EpicHealthSquare";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import type { PairSide } from "../engine/cable";
 import { useUiStore } from "../stores/uiStore";
@@ -81,12 +85,32 @@ import { FONT_MONO, FONT_UI } from "../theme/scale";
 
 /** The next board stage a card in `columnKey` is progressing toward (whose criteria we evaluate):
  *  Backlog / In Progress → Done; Done → Delivered; Delivered is terminal (none). */
-// Takes the LADDER key rather than `BoardColumn` because the Epics mode renders one column the task
-// board has no bucket for (`planning`). Widening the parameter is the whole change: an epic sitting
-// in Planning is open and unstarted, so it wants the same "next stage" as Backlog — which is what
-// the existing `backlog` arm already answers.
+// Takes the LADDER key rather than `BoardColumn` because the Epics mode renders two columns the task
+// board has no bucket for (`planning`, `unstaffed`). Widening the parameter is the whole change: an
+// epic sitting in Planning is open and unstarted, so it wants the same "next stage" as Backlog —
+// which is what the existing `backlog` arm already answers.
+//
+// UNSTAFFED AND BLOCKED ARE LISTED BESIDE `inProgress` RATHER THAN LEFT TO FALL THROUGH, and the
+// fall-through is the bug it prevents. An unstaffed epic is `in_progress` work with nobody on it —
+// the SAME work, progressing toward the SAME stage; only the staffing differs. Dropping to the
+// `return null` below would treat it as terminal, so the cards in that column would evaluate no Done
+// criteria and show no progress chip — the rung would go quiet in a second way, on the surface added
+// to make it loud.
+//
+// `blocked` is the SAME argument and it now bites the loudest case (roborev 67959). It used to be a
+// bead-status bucket only, so no live epic reached it and the fall-through was harmless; the rung
+// rule changed that — `services/epicBoard`'s own doc records it — and an epic whose whole fleet is
+// stopped is filed here while its OWN status is still `in_progress` or `open`. Before that rule it
+// sat in `inProgress` and carried a chip; left falling through it would silently lose one at exactly
+// the moment somebody is looking to see how far the stopped work got.
 function nextStageOf(columnKey: EpicLadderKey): StageKey | null {
-  if (columnKey === "backlog" || columnKey === "planning" || columnKey === "inProgress")
+  if (
+    columnKey === "backlog" ||
+    columnKey === "planning" ||
+    columnKey === "unstaffed" ||
+    columnKey === "blocked" ||
+    columnKey === "inProgress"
+  )
     return "done";
   if (columnKey === "done") return "delivered";
   return null;
@@ -517,6 +541,20 @@ export function BoardView({
   }, [agentOnlyBoard, boardFilter, filterActive]);
 
   // ══ TASKS / EPICS — the Plan board's two independent kind toggles ════════════════════════════
+  //
+  // ── THE ROSTER IS READ HERE, NOT FURTHER DOWN, AND THE ORDER IS THE REASON ───────────────────
+  // Workers live in the agent store; the Plan view reads them to show who's building each bead —
+  // and, since the ladder grew an **Unstaffed** rung, to decide which epics under "Being built"
+  // actually have anyone on them. That makes it an input to the bucketing memo below, so the read
+  // and the hook that consumes it both have to precede it. Hoisting a `useProjectStore` selector is
+  // safe: it is a pure subscription with no dependency on anything declared between here and its
+  // old position (`filterAgentName`, the only other consumer, sits below either way). Both are
+  // UNCONDITIONAL hook calls — do not move either inside a branch.
+  const agents = useProjectStore((s) => s.projects.find((p) => p.id === project.id)?.agents ?? NO_AGENTS);
+  // The SHARED wiring, not a second copy — `hooks/useEpicHealthOf`'s header says why. `EpicsColumn`
+  // renders this same ladder from the same hook, so the two surfaces cannot file one epic under two
+  // different rungs.
+  const epicHealthOf = useEpicHealthOf(agents, allBeads);
   const planKinds = useUiStore((s) => s.planKindsBySide[side]);
   /**
    * The columns to render and the beads in each, for the kinds currently switched on.
@@ -561,7 +599,20 @@ export function BoardView({
     if (!planKinds.tasks)
       return {
         columns: EPIC_LADDER_COLUMNS,
-        viewBoard: ordered(bucketEpics(displayBoard, allBeads)),
+        // THE STAFFING PREDICATE IS `engine/epicHealth`'s RULE, asked through the shared hook — the
+        // same one that paints the square on an epic row. An epic whose bead says `in_progress`
+        // while nothing is bound to it lands under **Unstaffed** rather than under a "Being built"
+        // header that is not true of it, and it slides back the moment an agent binds.
+        // Nothing is written to bd on this path; see `bucketEpics`.
+        //
+        // `"gray"` IS THE COLOUR, `"unstaffed"` IS THE RUNG — they used to share a name. `EpicHealth`
+        // is now literally `RollupDot` (the founder's colour-parity rule; see `engine/epicHealth`),
+        // so "nothing is active on this epic" is spelled the way the build column spells it.
+        viewBoard: ordered(
+          // ONE RULE — see the note at EpicsColumn's identical call. A boolean here could not
+          // express "all agents red -> Blocked", so that arm never fired on either surface.
+          bucketEpics(displayBoard, allBeads, (id) => rungForEpicHealth(epicHealthOf(id))),
+        ),
       };
     if (!planKinds.epics)
       return {
@@ -586,7 +637,7 @@ export function BoardView({
     // `sortBy`/`dateField` are read off `boardFilter` OUTSIDE this memo (see above) so the deps are
     // the two scalars that actually change the order — depending on `boardFilter` itself would
     // re-sort the whole board every time the user touched the priority or date-window filter.
-  }, [displayBoard, planKinds, allBeads, sortBy, dateField]);
+  }, [displayBoard, planKinds, allBeads, sortBy, dateField, epicHealthOf]);
 
   /**
    * EVERY USER-DRIVEN CONTROL THAT SWAPS A COLUMN'S DATASET, as one string.
@@ -642,9 +693,6 @@ export function BoardView({
     const baseline = size(agentOnlyBoard);
     return baseline > 0 && size(displayBoard) === 0 ? baseline : 0;
   }, [agentOnlyBoard, displayBoard, filterActive]);
-  // Workers live in the agent store; the Plan view reads them to show who's building each bead.
-  const agents = useProjectStore((s) => s.projects.find((p) => p.id === project.id)?.agents ?? NO_AGENTS);
-
   /**
    * The NAME of the agent the board is filtered to, for the banner below.
    *
@@ -1267,12 +1315,27 @@ function Column({
 
 
 /** "Contains N tasks" — N is the count of OPEN children, i.e. remaining work, not total work. */
+/**
+ * "Contains N tasks · M done" — the epic card's child readout.
+ *
+ * ══ IT TAKES THE TOTAL, AND THAT IS A CORRECTION ═══════════════════════════════════════════════
+ * This was handed `openChildCountIndexed(...)` — the number of children still OPEN — while wording
+ * itself as containment. It therefore named a total and reported a remainder: an epic with three
+ * children, two of them closed, said "Contains 1 task". That is the exact misreading the epics
+ * column's ratio flip exists to kill, and leaving it here would have left one epic showing three
+ * different numbers across two surfaces (row `2/3`, card `Contains 1 task`).
+ *
+ * So `total` is what the card contains and `done` is the progress through it — the same direction
+ * the row's fraction now counts, stated in words rather than as a bare ratio.
+ */
 function ContainsTasks({
-  count,
+  total,
+  done,
   open,
   onToggle,
 }: {
-  count: number;
+  total: number;
+  done: number;
   open: boolean;
   onToggle: () => void;
 }) {
@@ -1300,7 +1363,8 @@ function ContainsTasks({
         aria-hidden
         style={{ transform: open ? "rotate(90deg)" : "none", transition: "transform 120ms" }}
       />
-      Contains {count} {count === 1 ? "task" : "tasks"}
+      Contains {total} {total === 1 ? "task" : "tasks"}
+      {done > 0 ? ` \u00b7 ${done} done` : ""}
     </button>
   );
 }
@@ -1427,8 +1491,13 @@ const Card = memo(function Card({
   // PER-CARD AND DELIBERATELY NOT PERSISTED — same contract as the Tasks/Epics kind toggles.
   // Collapsed is the default because a board of auto-expanded epics is unreadable.
   const [childrenOpen, setChildrenOpen] = useState(false);
-  const openKids = beadIsEpic ? openChildCountIndexed(epicIndex, bead.id) : 0;
-  const hasKids = beadIsEpic && childrenOfIndexed(epicIndex, bead.id).length > 0;
+  // ONE WALK, BOTH NUMBERS. `total` is what the epic contains and `done` is progress through it —
+  // counting UP, the same direction the epics column's ratio now counts. Deriving `done` as
+  // `total - open` rather than counting closed children keeps `openChildCountIndexed` the single
+  // definition of "still open" (`in_progress` counts as open; bd's only terminal state is closed).
+  const totalKids = beadIsEpic ? childrenOfIndexed(epicIndex, bead.id).length : 0;
+  const doneKids = beadIsEpic ? totalKids - openChildCountIndexed(epicIndex, bead.id) : 0;
+  const hasKids = beadIsEpic && totalKids > 0;
 
   return (
     // The card's visual shell is a div so the interactive Start button can live BESIDE the
@@ -1546,7 +1615,8 @@ const Card = memo(function Card({
       {beadIsEpic &&
         (hasKids ? (
           <ContainsTasks
-            count={openKids}
+            total={totalKids}
+            done={doneKids}
             open={childrenOpen}
             onToggle={() => setChildrenOpen((v) => !v)}
           />
@@ -1818,6 +1888,11 @@ function EpicLiveStatus({
   onOpen?: (b: Bead) => void;
 }) {
   const rows = epicChildViews(allBeads, agents, epicId);
+  // ONCE FOR THE WHOLE LIST, never per row. `hooks/useEpicHealthOf`'s header states the reason:
+  // `rollupViewFor` buckets every worker by `parentId` on construction, so asking inside
+  // `EpicChildRow` would rebuild that map once per child on every 5s poll. The hook is called
+  // BEFORE the early return below, because a hook cannot sit after a conditional exit.
+  const beadHealthOf = useBeadHealthOf(agents);
   if (rows.length === 0) return null;
   const orchestrator = orchestratorNameForEpic(allBeads, agents, epicId);
   return (
@@ -1830,7 +1905,17 @@ function EpicLiveStatus({
       </div>
       <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
         {rows.map((row) => (
-          <EpicChildRow key={row.bead.id} row={row} agents={agents} onOpen={onOpen} />
+          <EpicChildRow
+            key={row.bead.id}
+            row={row}
+            agents={agents}
+            /* FINISHED WORK GETS NO MARK — `beadHealthApplies` is where that is decided, the same
+               shape `EpicsColumn` uses for a terminal rung. A closed child sitting under a gray
+               square would read "nobody is working on this", which is true and useless; nothing
+               rendered cannot be mistaken for calm. */
+            health={beadHealthApplies(row.bead.status) ? beadHealthOf(row.bead.id) : null}
+            onOpen={onOpen}
+          />
         ))}
       </div>
     </div>
@@ -1842,10 +1927,14 @@ function EpicLiveStatus({
 function EpicChildRow({
   row,
   agents,
+  health,
   onOpen,
 }: {
   row: EpicChildView;
   agents: AgentTab[];
+  /** This child's square, or `null` for finished work that gets none. Computed by the PARENT so
+   *  the rollup view is built once for the list rather than once per row. */
+  health: EpicHealth | null;
   onOpen?: (b: Bead) => void;
 }) {
   const { bead, workers } = row;
@@ -1884,6 +1973,11 @@ function EpicChildRow({
       }}
     >
       <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+        {/* THE CHILD'S SQUARE — *"just like the epic has a square status, the children should also
+            have that status"*. Literally the epic row's component, so the two surfaces cannot paint
+            the same fleet different colours; only the hover NOUN differs, which is why
+            `beadHealthLabel` exists beside the rule. */}
+        {health !== null && <EpicHealthSquare health={health} label={beadHealthLabel(health)} />}
         <span style={{ flex: 1, minWidth: 0, color: C.cream, fontSize: 13 }}>{bead.title}</span>
         <span
           style={{

@@ -9,6 +9,19 @@
 // made for a display reason. So the extra three stages the founder's ladder names (Blocked,
 // Shipped, Archived) are derived HERE, at the view layer, from the board bucket the epic bead
 // already sits in. The sweeper is untouched by anything in this file.
+//
+// -- WHY THE STAFFING PREDICATE IS AN ARGUMENT AND NOT A STORE READ ----------------------------
+// The Unstaffed rung is a statement about the LIVE AGENT ROSTER, which lives in React stores. This
+// module is pure data -- no React, no stores, exactly as the paragraph above says -- and keeping it
+// that way is what makes the whole ladder unit-testable without a GUI: `epicBoard.test.ts` proves
+// where an epic lands by handing `bucketEpics` a two-line predicate, with no roster, no runtime
+// store and no jsdom. Reading `useRuntimeStore` here would put a hook boundary in the middle of a
+// pure bucketing function and every one of those cases would need a rendered component instead.
+//
+// The predicate is also OPTIONAL, and that is load-bearing rather than a convenience: omitted, this
+// function behaves exactly as it did before the rung existed, so every caller with no roster (and
+// every fixture in the suite) keeps its previous behaviour and the new rung stays provably empty
+// for them.
 import {
   epicIndexOf,
   isEpicIndexed,
@@ -23,9 +36,16 @@ import { rollupEpicStatus } from "./planView";
  *
  *  The keys deliberately REUSE the Board snapshot's vocabulary wherever one already exists —
  *  `inProgress` renders as "Being built", `delivered` as "Shipped" — so `BoardView`'s `Column`, its
- *  `data-testid`s and its definable-stage wiring keep working with no widening. `planning` is the
- *  one genuinely new key, because the board has never had a bucket for it. */
-export type EpicLadderKey = BoardColumn | "planning";
+ *  `data-testid`s and its definable-stage wiring keep working with no widening. `planning` and
+ *  `unstaffed` are the two genuinely new keys, because the board has never had a bucket for
+ *  either.
+ *
+ *  BOTH ARE DERIVED HERE AND NEITHER IS EVER WRITTEN TO A BEAD. `planning` is derived from the
+ *  epic's children; `unstaffed` is derived from the live agent roster, through the `buildRungFor`
+ *  predicate {@link bucketEpics} takes. That is what makes the Unstaffed rung honest for every
+ *  epic in the store the instant it ships — there is no migration, no sweep and no label — and it
+ *  is what makes a card slide back to "Being built" BY ITSELF the moment an agent binds. */
+export type EpicLadderKey = BoardColumn | "planning" | "unstaffed";
 
 /**
  * THE ONE PLACE A STAGE IS PUT INTO WORDS. Every surface that names a stage — the task board's
@@ -49,7 +69,21 @@ export const STAGE_LABELS: Record<EpicLadderKey, string> = {
   backlog: "Backlog",
   blocked: "Blocked",
   planning: "Planning",
-  inProgress: "Being built",
+  // ══ THE BUILD STAGE IS TWO COLUMNS, AND THE SHARED PREFIX IS THE POINT ═══════════════════════
+  // The founder, 2026-08-22, verbatim: *"I actually really like the idea that we have that we split
+  // being built into two subcategories as follows: 'Build: Unstaffed' and 'Build: Active'. So the
+  // unstaffed one would be right above the active one."*
+  //
+  // They read as ONE stage with two states rather than two unrelated rungs, which is the fact:
+  // both hold work he has already said he wants built. The prefix is what says so — "Unstaffed"
+  // alone, sitting between Blocked and Being built, looked like a fourth kind of not-started.
+  //
+  // "Being built" was this column's name from the beginning and is retired here deliberately. It
+  // was TRUE ABOUT INTENT AND FALSE ABOUT ACTIVITY — the whole defect this ladder change exists to
+  // fix — and leaving it on the staffed half would keep inviting the reading that its neighbour is
+  // some lesser form of the same thing. "Build: Active" states the live fact the column now checks.
+  unstaffed: "Build: Unstaffed",
+  inProgress: "Build: Active",
   done: "Done",
   delivered: "Shipped",
   archived: "Archived",
@@ -86,6 +120,16 @@ export const EPIC_LADDER: readonly EpicLadderKey[] = Object.keys({
   backlog: true,
   planning: true,
   blocked: true,
+  // UNSTAFFED SITS BETWEEN BLOCKED AND BEING BUILT, on the founder's instruction: *"I don't have a
+  // good understanding of why an epic can be in the being built category and yet there are no
+  // active billed agents running against it."* The rung he picked reads
+  // `Backlog | Planning | Blocked | Unstaffed | Being built | Done | Shipped | Archived`.
+  //
+  // It is immediately LEFT of "Being built" because that is where the card falls back FROM and
+  // slides forward TO. An epic claimed to `in_progress` with nobody bound has not progressed; an
+  // agent binding to it moves it one rung right, with no write to bd and no sweep. Putting it any
+  // further left would make that one-rung slide look like a stage change it is not.
+  unstaffed: true,
   inProgress: true,
   done: true,
   delivered: true,
@@ -110,6 +154,7 @@ export const emptyEpicBoard = (): EpicBoard => ({
   backlog: [],
   blocked: [],
   planning: [],
+  unstaffed: [],
   inProgress: [],
   done: [],
   delivered: [],
@@ -162,8 +207,46 @@ function openEpicStage(index: EpicIndex, epicId: string): EpicLadderKey {
  * exactly one test (the blocked case), while every other case stays green — which is what "the
  * blocked pile is separate" looks like from the outside, and is the invariant to protect if this
  * ever stops walking the source buckets one for one.
+ *
+ * == `buildRungFor` -- THE ONE THING "Being built" CANNOT ANSWER ABOUT ITSELF ==================
+ * `bead.status === "in_progress"` is stamped ONCE, at promote-to-build, and never re-derived. No
+ * agent, PID or pane is consulted anywhere on this path, so an epic whose build never bound an
+ * orchestrator -- or whose orchestrator finished and went away -- sits under a header reading
+ * "Being built" indefinitely. Measured on the founder's store the day this shipped: 129 beads
+ * `in_progress`, three touched in the last two hours.
+ *
+ * So the caller may hand in the roster's answer, and an epic that would land in `inProgress` is
+ * filed on whichever rung that answer NAMES -- `inProgress`, `unstaffed`, or `blocked` for a fleet
+ * that is entirely red. BOTH ROUTES INTO `inProgress` GO THROUGH IT -- the
+ * `board.inProgress` copy-through AND {@link openEpicStage}'s `in_progress` child-rollup arm, which
+ * is how an `open` epic with in-flight children gets there. Covering only the first would leave the
+ * founder's screen honest for one half of its Being-built column and silently wrong for the other.
+ *
+ * THE PREDICATE MUST BE `engine/epicHealth`'s RULE, NOT A SECOND ONE. Its callers pass
+ * `(id) => rungForEpicHealth(healthOf(id))`, where `healthOf` is `hooks/useEpicHealthOf`. A local
+ * "does the roster contain an agent" test looks equivalent and is not: `epicHealth` deliberately
+ * collapses "no agents at all" AND "every bound agent has finished and gone gray" into one value,
+ * and it FOLDS workers into their orchestrator. A rival rule would put the square and the column
+ * header into disagreement about the same epic, which is the column-chip drift this codebase's own
+ * comments record as already shipped twice.
+ *
+ * NOTE THE TWO VOCABULARIES, which used to share a word. `EpicHealth` is now `RollupDot` — a
+ * COLOUR (`"gray"`, `"red"`, …) identical to what a build row paints. `"unstaffed"` is a RUNG, one
+ * of the columns this function files an epic into. `rungForEpicHealth` is the translation between
+ * them, and it is the only place that translation happens.
+ *
+ * OMITTED, NOTHING EVER REACHES `unstaffed` OR `blocked` BY THIS ROUTE, and this function behaves
+ * exactly as it did before the rung existed. Note that `blocked` IS now a reachable outcome for a
+ * bead whose OWN status is `in_progress` or `open` — an entirely red fleet files the epic beside
+ * the dependency-blocked work, which is a thing this function previously could not say at all.
+ * Behaving unchanged when omitted is the contract every rosterless caller and every fixture relies
+ * on.
  */
-export function bucketEpics(board: Board, allBeads: readonly Bead[]): EpicBoard {
+export function bucketEpics(
+  board: Board,
+  allBeads: readonly Bead[],
+  buildRungFor?: (epicId: string) => "blocked" | "unstaffed" | "inProgress",
+): EpicBoard {
   const out = emptyEpicBoard();
   // CACHED, not `buildEpicIndex`. Both are one walk instead of one per bead, but this receives the
   // SAME `allBeads` identity every Card and EpicRow resolves through, so a direct uncached build
@@ -171,15 +254,43 @@ export function bucketEpics(board: Board, allBeads: readonly Bead[]): EpicBoard 
   // founder's store, on the render path this index exists to make cheap (roborev 65662).
   const index = epicIndexOf(allBeads);
   const keep = (b: Bead) => isEpicIndexed(index, b);
+  /**
+   * THE ONE PLACE THE BUILD RUNG IS CHOSEN, so the two routes into it cannot diverge.
+   *
+   * ══ WHY THIS TAKES A RUNG AND NOT A BOOLEAN ═══════════════════════════════════════════════════
+   * It used to take `isStaffed?: (id) => boolean`, and a boolean cannot express the founder's rule.
+   * He named THREE outcomes for a live fleet, not two: *"if there are not any [agents] and it's not
+   * finished then by definition it should be considered blocked … Meaning if the agents are Red then
+   * it would go into blocked … Now if there are some agents that are red and there are some agents
+   * that are not red … probably it should stay in Being Built."*
+   *
+   * With a boolean, the `red -> blocked` arm had nowhere to go. `engine/epicHealth.rungForEpicHealth`
+   * held that rule and had **zero production callers** — five tests asserted it as though it were
+   * live while the shipped path could only ever answer inProgress-or-unstaffed. A green suite over a
+   * rule the screen never runs is the vacuous shape `AGENTS.md` names, and it is worse here than
+   * usual: the arm that never fired is the one that tells the founder a human is needed.
+   *
+   * Taking the rung itself means ONE rule decides, it lives in `epicHealth`, and this module stays
+   * pure data with no opinion about agents — see this file's header for why that separation is
+   * load-bearing.
+   */
+  const buildingRung = (b: Bead): EpicLadderKey =>
+    buildRungFor === undefined ? "inProgress" : buildRungFor(b.id);
   out.archived = board.archived.filter(keep);
   out.delivered = board.delivered.filter(keep);
   out.done = board.done.filter(keep);
   out.blocked = board.blocked.filter(keep);
-  out.inProgress = board.inProgress.filter(keep);
+  // ROUTE 1 -- the epic's OWN `in_progress` status. This is the 129-bead case.
+  for (const b of board.inProgress) {
+    if (!keep(b)) continue;
+    out[buildingRung(b)].push(b);
+  }
   // Only the open pile splits, and it is the split that gives Planning its column.
   for (const b of board.backlog) {
     if (!keep(b)) continue;
-    out[openEpicStage(index, b.id)].push(b);
+    const stage = openEpicStage(index, b.id);
+    // ROUTE 2 -- an `open` epic whose CHILDREN roll up to in-progress. Same question, same answer.
+    out[stage === "inProgress" ? buildingRung(b) : stage].push(b);
   }
   return out;
 }
@@ -195,12 +306,13 @@ export function tasksOnly(board: Board, allBeads: readonly Bead[]): Board {
   return mapBoard(board, (b) => !isEpicIndexed(index, b));
 }
 
-/** A task-shaped `Board` widened to the ladder's shape with an EMPTY Planning pile, so the view
- *  can index one type for every mode. Planning is empty by construction here and that is correct:
- *  it is an EPIC-only stage (it is a statement about an epic's children), and the task modes never
- *  render a Planning column to put anything in. */
+/** A task-shaped `Board` widened to the ladder's shape with EMPTY Planning and Unstaffed piles, so
+ *  the view can index one type for every mode. Both are empty by construction here and that is
+ *  correct: Planning is an EPIC-only stage (it is a statement about an epic's children), and
+ *  Unstaffed is an EPIC-only stage for the same kind of reason (it is a statement about the agents
+ *  bound to an epic). The task modes render neither column, so there is nothing to put in them. */
 export function withPlanning(board: Board): EpicBoard {
-  return { ...board, planning: [] };
+  return { ...board, planning: [], unstaffed: [] };
 }
 
 /**

@@ -20,7 +20,7 @@ import { ConciergeHost } from "./ConciergeHost";
 import { ColumnPullTab, publishColumnWidthVar, HEADER_H } from "./ColumnPullTab";
 import { CommandPalette, PaletteTrigger, useCommandPalette } from "./Concierge";
 import { useRuntimeStore } from "../stores/runtimeStore";
-import { useUiStore } from "../stores/uiStore";
+import { focusedBeadIdForSide, useUiStore } from "../stores/uiStore";
 import { useConnectionStore } from "../stores/connectionStore";
 import { useCloudAgentsEnabled } from "../hooks/useCloudAgents";
 import { useSettingsStore } from "../stores/settingsStore";
@@ -1454,8 +1454,14 @@ export function Workspace() {
   // the pane stays mounted and stops being shown. It also makes the founder's second sentence true
   // for free — press Clear and the same terminal is back, mid-scrollback, because nothing about it
   // was torn down.
-  const epicFocusLeft = useUiStore((s) => s.epicFocusBySide.left);
-  const epicFocusRight = useUiStore((s) => s.epicFocusBySide.right);
+  // BOTH RUNGS OF THE SELECTION, not just the epic. The Epics column narrows the build column by
+  // an epic OR by one of its CHILD TASKS, and `focusedBeadIdForSide` is the single definition of
+  // which of the two is in force (uiStore). Reading `epicFocusBySide` directly here was the bug
+  // this replaces: with a child focused, the sidebar hid the row while this kept answering about
+  // the epic, so the row vanished and its terminal went on painting beside the gap — the very
+  // "output with no row" mismatch the paragraph above exists to prevent, one rung down.
+  const epicFocusLeft = useUiStore((s) => focusedBeadIdForSide(s, "left"));
+  const epicFocusRight = useUiStore((s) => focusedBeadIdForSide(s, "right"));
   const leftBeads = useBeadsStore((s) => (leftProject ? s.byProject[leftProject.id]?.beads : undefined));
   const rightBeads = useBeadsStore((s) => (project ? s.byProject[project.id]?.beads : undefined));
   // `agentIdsInEpic` is the ONE membership rule (engine/epicFocus) — the sidebar's own narrowing

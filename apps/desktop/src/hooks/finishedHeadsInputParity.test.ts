@@ -2,6 +2,8 @@
 //
 // `useFinishedHeads` takes its most consequential input as a plain `Record<string, AgentTabStatus>`
 // parameter, and the two callers must pass the SAME thing: `hooks/useOverlaidStatus`'s `calmStatus`.
+// (Those two are `AgentSidebar` and `hooks/useEpicHealthOf`; the epics column reached the hook
+// directly until its rollup wiring was extracted so `BoardView`'s Epics ladder could share it.)
 // Handing it the raw store map instead is a one-word edit, it type-checks, and it is exactly the bug
 // this subsystem already shipped — `stallReport` gates every arm behind `isQuiet(status)`, so a head
 // carrying a red worker reads `blocked` in the overlaid map (verdict `active`) and `idle` in the raw
@@ -181,7 +183,12 @@ function producerOf(binding: ts.Identifier): string | null {
  *  list is asserted to be complete against a repo-wide grep below. */
 const CALLERS: readonly (readonly [string, string])[] = [
   ["AgentSidebar", "../components/AgentSidebar.tsx"],
-  ["EpicsColumn", "../components/EpicsColumn.tsx"],
+  // WAS `../components/EpicsColumn.tsx`, and the move is the good direction. That column's rollup
+  // wiring became `hooks/useEpicHealthOf` when `BoardView`'s Epics mode needed the same answer for
+  // the ladder's Unstaffed rung — so there is now ONE call site behind both surfaces instead of two
+  // copies for this guard to police. Neither column calls `useFinishedHeads` directly any more; the
+  // completeness walk below is what proves that rather than this list.
+  ["useEpicHealthOf", "./useEpicHealthOf.ts"],
 ];
 
 describe("every caller feeds useFinishedHeads the overlaid map", () => {

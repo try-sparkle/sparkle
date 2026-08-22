@@ -267,6 +267,42 @@ export async function claimBead(projectPath: string, id: string): Promise<void> 
   await invoke("bead_claim", { projectPath, id });
 }
 
+/** `bd update <id> -s open -a ""` — release a claim: move in_progress back to open AND clear the
+ *  assignee.
+ *
+ *  ══ BOTH FIELDS, AND IT CLEARS RATHER THAN RESTORES ══════════════════════════════════════════
+ *  {@link claimBead} is `--claim`, which bd documents as "sets assignee to you, status to
+ *  in_progress" — TWO writes — so undoing it means undoing both. A release that moved only the
+ *  status left the bead back in the backlog still holding an advisory lease against an orchestrator
+ *  that was never created, which bd will refuse a competing claim against.
+ *
+ *  But this CLEARS the assignee; it does not restore a previous one, because it has no memory of
+ *  one. A bead a human had assigned to themselves before Build It was pressed comes back with an
+ *  EMPTY assignee, not their name. That is right for the path this exists for — the claim being
+ *  undone is the one this app just wrote, moments earlier — and it is why this is named for
+ *  releasing a CLAIM rather than for setting a status. **If you only want to walk a bead's status
+ *  back without touching ownership, do not call this.** bd's `Owner` (creator) field is untouched.
+ *
+ *  THE MISSING EDGE. Every other status mutator in this file moves work FORWARD — {@link claimBead}
+ *  open → in_progress, {@link closeBead} and {@link markBeadDelivered} → closed, {@link deleteBead}
+ *  → gone. There was no path back, so a claim outlived whatever it was claimed for: an agent that is
+ *  killed, crashes, or is refused at dispatch left its bead marked in progress permanently, with
+ *  nothing building it and nothing able to say so.
+ *
+ *  The concrete hole this closes is the board handoff. It claims the epic and THEN calls
+ *  `sendToBuild`, and `sendToBuildBlockedReason`'s own doc already spells the consequence out
+ *  verbatim — "the epic would be left marked in progress with no orchestrator bound, and nothing
+ *  un-claims it". That preflight covers capacity only, and a preflight cannot cover a throw that
+ *  happens after it (an unknown project, a capacity race). Something has to un-claim it. This is it.
+ *
+ *  Idempotent on the Rust side — setting an already-open bead to `open` is a no-op — so a
+ *  best-effort caller may fire it without first reading the status. It is deliberately NOT wired to
+ *  any sweep or timer: it runs on the dispatch-failed path only, undoing a write this app just made.
+ */
+export async function unclaimBead(projectPath: string, id: string): Promise<void> {
+  await invoke("bead_unclaim", { projectPath, id });
+}
+
 /** `bd close <id>` — mark a bead done. */
 export async function closeBead(projectPath: string, id: string): Promise<void> {
   await invoke("bead_close", { projectPath, id });

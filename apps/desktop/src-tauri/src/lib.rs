@@ -1358,6 +1358,7 @@ pub fn run() {
             notes::concierge_memory_recall,
             notes::concierge_memory_forget,
             notes::bead_claim,
+            notes::bead_unclaim,
             notes::bead_close,
             // The typed/capped planning surface (services/beadsCommands.ts). Distinct from the
             // notes::* commands above, which stay the board's raw-JSON path — see beads_cmd.rs.

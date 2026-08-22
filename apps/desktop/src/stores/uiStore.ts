@@ -106,6 +106,11 @@ const TRANSIENT_UI_KEYS = [
   // restored selection is a build column missing most of its agents with the only explanation
   // off to one side and never touched this session.
   "epicFocusBySide",
+  // The epics column's CHILD-TASK selection. Transient for the same reason as `epicFocusBySide`
+  // directly above, and one degree worse again: it narrows the build column HARDER than the epic
+  // does, so a restored one is a column showing the agents of a single task nobody selected this
+  // session, with the control that set it in a different column.
+  "beadFocusBySide",
   "settingsRequest",
   "composeFocusSeq",
   "revealAgentId",
@@ -451,6 +456,31 @@ interface UiState {
   // also keeps the persisted-key ratchet green with no migration.
   epicFocusBySide: Record<PairSide, string | null>;
   setEpicFocus: (side: PairSide, epicId: string | null) => void;
+  // ── THE CHILD-TASK RUNG OF THE SAME SELECTION ────────────────────────────────────────────────
+  //
+  // The founder: "If I click to open an epic on the epic column and then I click on one of the
+  // children, I can see the exact build agent or agents that are working on that child." So this is
+  // the epic focus one rung DOWN, and the two are set AT THE SAME TIME by that gesture — the epic
+  // is still open when the child is clicked. They are therefore NOT independent, and the rule for
+  // how they compose lives here, next to the state, rather than in whichever column reads it:
+  //
+  //   1. THE NARROWER ONE WINS. A non-null `beadFocusBySide[side]` is the effective focus and
+  //      `epicFocusBySide[side]` is ignored while it holds. Intersecting the two sets instead would
+  //      be the same answer by a longer route — every agent under a child of the epic is already
+  //      under the epic — but only while both ids belong to one tree, and rule 3 is what keeps
+  //      that true rather than an assumption a reader has to verify.
+  //   2. CLEARING THE CHILD RETURNS TO THE EPIC, not to everything. `setBeadFocus(side, null)`
+  //      writes ONLY this key, so the epic focus that was underneath it is in force again on the
+  //      very next render. That is what makes the child selection feel like a drill-DOWN: the
+  //      gesture that opens it is reversible without re-picking the epic.
+  //   3. CHANGING THE EPIC CLEARS THE CHILD — see `setEpicFocus`. A child of epic A is not a
+  //      narrowing of epic B, and leaving it set would show one task's agents beneath a different
+  //      epic's highlighted row, which reads as the filter being broken rather than as stale.
+  //
+  // PER SIDE and TRANSIENT for the identical reasons `epicFocusBySide` gives above; a focus that
+  // was not per-side would leak into the column the user is not looking at.
+  beadFocusBySide: Record<PairSide, string | null>;
+  setBeadFocus: (side: PairSide, beadId: string | null) => void;
   // Whether ANY "+ New Build Agent" button is currently hovered. Shared so hovering the empty-state
   // start button on the Workspace also lights up the sidebar's button blue (and vice versa),
   // pointing the user at where that affordance normally lives. Transient — NOT persisted.
@@ -870,8 +900,26 @@ export const useUiStore = create<UiState>()(
       setEpicFocus: (side, epicId) =>
         set((st) => {
           const next = st.epicFocusBySide[side] === epicId ? null : epicId;
-          if (st.epicFocusBySide[side] === next) return {};
-          return { epicFocusBySide: { ...st.epicFocusBySide, [side]: next } };
+          // RULE 3 of the composition note on `beadFocusBySide`: moving (or clearing) the epic
+          // drops the child selection with it. The no-op guard has to ask about BOTH keys or the
+          // stale child would survive the one case that most needs it gone — re-clicking the
+          // already-focused epic, where `next` equals the current value on the epic key alone.
+          const staleChild = st.beadFocusBySide[side] !== null;
+          if (st.epicFocusBySide[side] === next && !staleChild) return {};
+          return {
+            epicFocusBySide: { ...st.epicFocusBySide, [side]: next },
+            beadFocusBySide: { ...st.beadFocusBySide, [side]: null },
+          };
+        }),
+      beadFocusBySide: { left: null, right: null },
+      // TOGGLES, exactly like `setEpicFocus`: clicking the selected child again clears it and hands
+      // the column back to the epic (rule 2). It writes ONLY this key — never `epicFocusBySide` —
+      // which is the whole of rule 2: the epic underneath is left in force rather than re-derived.
+      setBeadFocus: (side, beadId) =>
+        set((st) => {
+          const next = st.beadFocusBySide[side] === beadId ? null : beadId;
+          if (st.beadFocusBySide[side] === next) return {};
+          return { beadFocusBySide: { ...st.beadFocusBySide, [side]: next } };
         }),
       buildAgentHover: false,
       setBuildAgentHover: (v) => set({ buildAgentHover: v }),
@@ -1068,3 +1116,29 @@ export const useUiStore = create<UiState>()(
     },
   ),
 );
+
+/** THE COMPOSITION RULE OF THE TWO FOCUS RUNGS, AS ONE EXPRESSION — the executable half of the
+ *  note on `beadFocusBySide` above, exported so that no consumer has to spell it out and then be
+ *  the copy that is wrong.
+ *
+ *  It answers ONE question: **which bead is this side's build column actually narrowed to?** Rule 1
+ *  is the `??` — a child selection is the effective focus while it holds, and the epic underneath
+ *  is what the same expression returns the instant it is cleared, which is rule 2 falling out for
+ *  free rather than being implemented a second time. `null` means NOTHING is narrowed, and every
+ *  caller must treat that as "no filter", never as "an empty filter".
+ *
+ *  THIS EXISTS BECAUSE THERE ARE THREE CONSUMERS, NOT ONE, and the third is the reason the rule
+ *  could not stay inline in the column. `AgentSidebar` narrows the rows; `Workspace` decides
+ *  whether the STAGE must stop painting the terminal of a row the column is hiding. Those two must
+ *  agree by construction — `engine/epicFocus.agentIdsInEpic` is already the single membership rule
+ *  they both call, and this is the single FOCUS rule feeding it. When the child rung was added to
+ *  the column alone, `Workspace` went on reading `epicFocusBySide` by itself, so selecting a child
+ *  hid the row while its terminal kept rendering beside the gap — the exact "output with no row"
+ *  mismatch the comment at that call site exists to prevent.
+ *
+ *  Takes the state rather than being a hook, so it works both under `useUiStore(...)` (it returns a
+ *  string-or-null, a primitive, so it is safe to select on directly — no `useShallow`) and against
+ *  `useUiStore.getState()` outside React. */
+export function focusedBeadIdForSide(st: UiState, side: PairSide): string | null {
+  return st.beadFocusBySide[side] ?? st.epicFocusBySide[side];
+}

@@ -61,7 +61,7 @@ import { useConciergeQueueStore } from "../stores/conciergeQueueStore";
 import { usePreviewStore } from "../stores/previewStore";
 import { refreshPreviewCapability } from "../services/preview";
 import { useRuntimeStore } from "../stores/runtimeStore";
-import { SPARKLE_PANE_SIDE, useUiStore } from "../stores/uiStore";
+import { SPARKLE_PANE_SIDE, focusedBeadIdForSide, useUiStore } from "../stores/uiStore";
 import { APP_WINDOW_LABEL } from "../windowContext";
 import { useSettingsStore } from "../stores/settingsStore";
 import { removeAgentWorkspace } from "../services/worktree";
@@ -2297,10 +2297,51 @@ export function AgentSidebar({
   // an already-clear side is a no-op. So the two entry points stay one code path rather than one
   // of them re-implementing "clear".
   const setEpicFocus = useUiStore((s) => s.setEpicFocus);
+  // ── AND ONE RUNG DOWN: THE CHILD TASK ──────────────────────────────────────────────────────
+  //
+  // The founder: "if I click on a child task row, it would constrain the build agents that show to
+  // only be the ones that are related to that specific child task row." The COMPOSITION rule — the
+  // narrower one wins, clearing the child falls back to the epic, changing the epic drops the child
+  // — is stated once, at the state, in `uiStore.beadFocusBySide`. This column does not restate it;
+  // it consumes it in the one line below, which is the whole of it from this end.
+  const beadFocusId = useUiStore((s) => s.beadFocusBySide[pairSide]);
+  const setBeadFocus = useUiStore((s) => s.setBeadFocus);
   const epicBeads = useBeadsStore((s) => (project ? s.byProject[project.id]?.beads : undefined));
-  const epicAgentIds = useMemo(
-    () => agentIdsInEpic(project?.agents ?? [], epicBeads ?? [], epicFocusId),
-    [project?.agents, epicBeads, epicFocusId],
+  // RULE 1, READ FROM THE ONE PLACE IT IS DEFINED (`uiStore.focusedBeadIdForSide`) rather than
+  // re-spelled here. It is deliberately a `??` and not an intersection of two narrowings: a child
+  // selection is only ever set on a child OF the focused epic (uiStore rule 3 guarantees it), so
+  // the narrower id alone already answers the wider question, and ONE id means one code path
+  // through everything downstream — the filter, the selection guard, and the empty state each stay
+  // the single expression they were rather than growing a second, separately-wrong copy.
+  //
+  // Selected through the store, not derived from the two ids above, because THIS COLUMN IS NOT THE
+  // ONLY CONSUMER: `Workspace` asks the same question to decide whether the stage must stop
+  // painting a hidden row's terminal, and the two have to answer it identically or the column and
+  // the pane disagree about who is on screen. The separate `beadFocusId` / `epicFocusId` reads
+  // below it survive because the header controls need to tell the two rungs APART — which is a
+  // different question from which one is in force.
+  const focusBeadId = useUiStore((s) => focusedBeadIdForSide(s, pairSide));
+  // ONE MEMBERSHIP RULE FOR BOTH RUNGS, and reusing it is the point rather than an economy.
+  // `agentIdsInEpic` is not epic-specific in what it computes: it resolves the bead id it is given
+  // to that bead PLUS its subtree (`services/beads.descendantsOf`, the ONE resolver — a second
+  // definition of membership is a CI failure, scripts/lib/epic-membership-guard.sh), matches the
+  // agents sitting on those beads, and then lifts each match to its head.
+  //
+  // THAT LIFT IS WHY THIS CANNOT BE A PLAIN `beadId ===` MATCH. A child task is implemented by a
+  // WORKER, and a worker is not a top-level agent — the list narrowed below is `topLevelOf(...)`,
+  // so an id set holding only the worker would match no row at all and this column would go empty
+  // in exactly the case the founder is asking to SEE. The orchestrator that owns the worker is the
+  // row that renders, so it is the row the rule has to keep.
+  //
+  // It is also why the rule is asked about the agent's `beadId` and not about `epicLadder`'s
+  // resolved owning epic. `prepareHandoff` stamps BOTH `epicId` and `beadId` on an orchestrator
+  // (epicLadder's own doc records the misattribution that follows from reading them in the wrong
+  // order), and an orchestrator whose stamped bead is the EPIC must not be dragged into a CHILD's
+  // filter by that stamp — it survives a child focus only through a worker actually on that child,
+  // which is the founder's sentence exactly.
+  const focusAgentIds = useMemo(
+    () => agentIdsInEpic(project?.agents ?? [], epicBeads ?? [], focusBeadId),
+    [project?.agents, epicBeads, focusBeadId],
   );
 
 
@@ -2568,7 +2609,7 @@ export function AgentSidebar({
       // breaking the file's syntax — so the guard on this behaviour would be unprovable. A rule
       // worth writing is worth being able to show is load-bearing.
       let ladderInput = topLevelOf(project.agents, mode);
-      if (epicAgentIds) ladderInput = ladderInput.filter((a) => epicAgentIds.has(a.id));
+      if (focusAgentIds) ladderInput = ladderInput.filter((a) => focusAgentIds.has(a.id));
       return groupAgentsByStage(
             ladderInput,
             headStageOf,
@@ -2588,7 +2629,7 @@ export function AgentSidebar({
       rowBandOf,
       headHoldsWorkOf,
       headCrossRepoOf,
-      epicAgentIds,
+      focusAgentIds,
     ],
   );
   // The flat rendered order, used for the empty-state check and by anything that needs "the rows,
@@ -2662,7 +2703,7 @@ export function AgentSidebar({
     // than the user left. Leaving the selection intact is what makes Clear restore the very
     // terminal they were reading.
     //
-    // ASK VALIDITY, NOT MEMBERSHIP (roborev job 65669). `!epicAgentIds.has(selected)` is true for
+    // ASK VALIDITY, NOT MEMBERSHIP (roborev job 65669). `!focusAgentIds.has(selected)` is true for
     // TWO different states, and only one of them is the one this paragraph argues for: a live agent
     // the filter is hiding, and an id that names no agent at all. Keyed on membership alone, a
     // stale `selectedAgentId` under an epic focus took this same early return and was never
@@ -2670,13 +2711,13 @@ export function AgentSidebar({
     // did not re-trigger it either, so the column sat pointing at nothing until the user clicked a
     // row by hand. Existence is what separates them, so it is what gets asked.
     const stillExists = selected != null && agentsById.has(selected);
-    if (epicAgentIds && stillExists && !epicAgentIds.has(selected)) return;
+    if (focusAgentIds && stillExists && !focusAgentIds.has(selected)) return;
     if (selected && renderedRowIds.includes(selected)) return;
     const first = renderedRowIds[0];
     if (first !== undefined) selectAndWireRef.current(first);
     // `selectAndWire` is read through a ref: it is rebuilt every render, so listing it would make
     // this effect re-run on every paint for a rule that only cares about a mode change.
-  }, [mode, paneCoversMe, project, renderedRowIds, epicAgentIds, agentsById]);
+  }, [mode, paneCoversMe, project, renderedRowIds, focusAgentIds, agentsById]);
   // The selected row if it is on screen, else the first row. Never null while any row renders, so
   // the column can't become unreachable by keyboard just because selection points at a filtered-out
   // or folded-away agent.
@@ -3254,8 +3295,9 @@ export function AgentSidebar({
               below structurally cannot cover. That hint is gated on `ordered.length === 0`, so an
               epic matching two of six agents narrows this column with no in-column escape at all,
               which is exactly the "so that the user doesn't have to press the clear on the epic
-              column" the founder asked about. Mounted whenever an epic is focused, so it is never
-              a dead control; retired the moment nothing is.
+              column" the founder asked about. Mounted whenever an epic is focused AND no
+              child task is — the child rung below supersedes it — so it is never a dead control;
+              retired the moment nothing is.
 
               `HeaderLink`, NOT a hand-rolled button — it is the band's own link shape ("used by
               every header that offers a way somewhere"), it already sits beside this one for
@@ -3268,7 +3310,7 @@ export function AgentSidebar({
               No `hint`: the ⌘-tap mnemonics are a fixed pinned set (`hintTargets.test.ts`), and
               this control is transient — it exists only while an epic is focused, so a standing
               letter for it would point at nothing most of the time. */}
-          {mode !== "plan" && epicFocusId !== null && (
+          {mode !== "plan" && beadFocusId === null && epicFocusId !== null && (
             <HeaderLink
               testId="epic-clear-focus-build"
               label="Show all"
@@ -3283,6 +3325,29 @@ export function AgentSidebar({
               // label stays inside it (WCAG 2.5.3).
               description="clears the epic selected in the Epics column, showing every build agent"
               onClick={() => setEpicFocus(pairSide, null)}
+            />
+          )}
+          {/* THE CHILD-TASK rung's own way back, and it is a DIFFERENT control rather than the same
+              one with a different handler. Two reasons, both about honesty rather than tidiness:
+              its destination is not "everything" (clearing the child hands the column back to the
+              EPIC — uiStore rule 2), so a button reading "Show all" would be describing the wrong
+              outcome; and the caller has to be able to tell the two states apart, which a shared
+              testid would prevent. Rendered INSTEAD of the epic control above, never beside it:
+              while a child is focused the epic filter is not the one doing the narrowing, so
+              offering to clear it would be offering to clear something already not in force. */}
+          {mode !== "plan" && beadFocusId !== null && (
+            <HeaderLink
+              testId="bead-clear-focus-build"
+              // Names the DESTINATION, because the destination is the thing that differs from the
+              // control above. Falling back to an epic set is not "all", and saying so is what
+              // stops this reading as a broken "Show all" the first time it leaves rows hidden.
+              label={epicFocusId !== null ? "Show Epic" : "Show all"}
+              description={
+                epicFocusId !== null
+                  ? "clears the task selected in the Epics column, showing every build agent in the selected Epic"
+                  : "clears the task selected in the Epics column, showing every build agent"
+              }
+              onClick={() => setBeadFocus(pairSide, null)}
             />
           )}
           <PairCountControl projectId={project.id} pairSide={pairSide} shown={headerHover} />
@@ -3737,7 +3802,7 @@ export function AgentSidebar({
             and an epic selected in the NEXT COLUMN is hiding them. A filter whose explanation is
             off-screen is the failure `uiStore`'s transient-key comments keep naming; here the
             filter cannot be persisted, but it can still be set and forgotten within a session. */}
-        {project && mode === "build" && epicAgentIds && topLevelAgents.length > 0 && ordered.length === 0 && (
+        {project && mode === "build" && focusAgentIds && topLevelAgents.length > 0 && ordered.length === 0 && (
           <div
             data-testid="epic-empty-overlay"
             // OVERLAID, NOT IN FLOW. This hint is not alone in the container — the New Agent button
@@ -3761,17 +3826,35 @@ export function AgentSidebar({
               pointerEvents: "none",
             }}
           >
-            <span>
-              No active build agents match your selected Epic.{" "}
-              <button
-                data-testid="epic-empty-show-all"
-                onClick={() => setEpicFocus(pairSide, null)}
-                // Re-armed against the wrapper's `none` — the one thing in here that IS clickable.
-                style={{ ...FILTER_ESCAPE_LINK_STYLE, pointerEvents: "auto" }}
-              >
-                Show all
-              </button>
-            </span>
+            {/* WHICH narrowing emptied the column decides the sentence. A child task with NOTHING
+                bound to it is the ordinary case, not an error — so this says the filter is on and
+                that nothing is working this task, rather than reusing the Epic wording, which
+                would have the user looking for an epic they can plainly see has agents. */}
+            {beadFocusId !== null ? (
+              <span>
+                No build agents are working on this task.{" "}
+                <button
+                  data-testid="bead-empty-show-all"
+                  onClick={() => setBeadFocus(pairSide, null)}
+                  // Re-armed against the wrapper's `none` — the one thing in here that IS clickable.
+                  style={{ ...FILTER_ESCAPE_LINK_STYLE, pointerEvents: "auto" }}
+                >
+                  {epicFocusId !== null ? "Show the Epic's agents" : "Show all"}
+                </button>
+              </span>
+            ) : (
+              <span>
+                No active build agents match your selected Epic.{" "}
+                <button
+                  data-testid="epic-empty-show-all"
+                  onClick={() => setEpicFocus(pairSide, null)}
+                  // Re-armed against the wrapper's `none` — the one thing in here that IS clickable.
+                  style={{ ...FILTER_ESCAPE_LINK_STYLE, pointerEvents: "auto" }}
+                >
+                  Show all
+                </button>
+              </span>
+            )}
           </div>
         )}
         {project && mode === "build" && topLevelAgents.length === 0 && (

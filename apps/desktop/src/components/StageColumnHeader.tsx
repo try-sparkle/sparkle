@@ -7,13 +7,19 @@
 import { type CSSProperties } from "react";
 import { FiCheck, FiAlertTriangle } from "react-icons/fi";
 import { C, FONT_WEIGHT, ROW_ACTIVE_BUBBLE } from "../theme/colors";
-import type { BoardColumn } from "../services/beads";
+import type { EpicLadderKey } from "../services/epicBoard";
 import type { StageKey } from "../services/stageDefs";
 import { FONT_UI, TYPE } from "../theme/scale";
 import { CHIP, COUNT, SECTION_LABEL } from "./labelTreatment";
 
-/** Only these two columns are definable; the map both gates the affordance and names the stage. */
-export function definableStageKey(columnKey: BoardColumn | "planning"): StageKey | null {
+/** Only these two columns are definable; the map both gates the affordance and names the stage.
+ *
+ *  Takes the LADDER key rather than `BoardColumn` so every rung the Epics mode can render reaches
+ *  it — `planning` and `unstaffed` are both derived stages the task board has no bucket for, and
+ *  both answer null here, which is what makes their headers inert exactly as Backlog's is. Typed as
+ *  `EpicLadderKey` rather than spelled out as a union so a rung added to the ladder later cannot
+ *  reach this function without the compiler saying so. */
+export function definableStageKey(columnKey: EpicLadderKey): StageKey | null {
   if (columnKey === "done") return "done";
   if (columnKey === "delivered") return "delivered";
   return null;
@@ -35,10 +41,11 @@ export function StageColumnHeader({
   deliveryChip,
   onDefine,
 }: {
-  // Widened for the Plan board's Epics mode, which renders one column the task board has no bucket
-  // for (`planning`). It reaches `definableStageKey`, which answers null for it — a Planning column
-  // is not a definable stage — so the header is inert for it exactly as Backlog and Blocked are.
-  columnKey: BoardColumn | "planning";
+  // Widened for the Plan board's Epics mode, which renders columns the task board has no bucket
+  // for (`planning`, `unstaffed`). Both reach `definableStageKey`, which answers null for them —
+  // neither a Planning nor an Unstaffed column is a definable stage — so the header is inert for
+  // them exactly as Backlog and Blocked are.
+  columnKey: EpicLadderKey;
   label: string;
   count: number;
   /** Whether THIS column's stage is defined (drives the header status chip). */

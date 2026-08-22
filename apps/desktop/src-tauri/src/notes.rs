@@ -957,6 +957,88 @@ pub async fn bead_claim(project_path: String, id: String) -> Result<String, Stri
         .map_err(|e| format!("bd task failed: {e}"))?
 }
 
+/// Assemble the argv for an unclaim. Pure, so the STATUS *and the assignee* the release actually
+/// writes are both assertable without bd — the id guard alone proves only that a bad id is refused,
+/// never that either half of the claim is undone.
+///
+/// `update … -s open` rather than an invented `bd unclaim` subcommand: that is the flag shape
+/// `beads_cmd::build_update_args` already uses for STATUS, and the one its round-trip test covers.
+///
+/// ⚠️ THAT PRECEDENT COVERS ONLY THE FIRST HALF. `build_update_args` filters an EMPTY value out
+/// entirely (`.filter(|s| !s.is_empty())`), so it has never sent `-a ""` to bd and cannot be cited
+/// for it — the two assemblies deliberately disagree here. The convention being followed for the
+/// empty value is `build_close_args`' `--reason ""` handling and bd's own documented
+/// empty-string-clears flags (`--parent`, `--defer`, `--due`). Confirmed against bd directly on a
+/// throwaway ephemeral wisp: `-s open -a ""` clears the Assignee line and moves the status in one
+/// update. The argv test below asserts what we ASSEMBLE, not what bd does with it.
+///
+/// ══ `-a ""` IS THE OTHER HALF OF THE CLAIM, NOT A FLOURISH ═════════════════════════════════════
+/// `bd update <id> --claim` is documented by bd itself as *"sets assignee to you, status to
+/// in_progress"* — TWO writes. A release that set only the status left the bead back in the backlog
+/// STILL ASSIGNED to an orchestrator that was never created, and that assignee is an advisory lease:
+/// `docs/superpowers/specs/2026-07-16-beads-worktree-safety-design.md` has bd refusing a competing
+/// claim against it (exit 1). So a failed dispatch would have handed the epic back to the board as
+/// startable while quietly holding a lease nothing would ever release, and the next actor to claim
+/// it — a worker on another machine — would be refused by a ghost.
+///
+/// Verified against bd directly before it was written: `-a ""` clears the Assignee line while
+/// `-s open` moves the status, in one update. (`--parent`/`--defer`/`--due` document the same
+/// empty-string-clears convention.) The `Owner` field is bd's CREATOR and is deliberately untouched:
+/// `--claim` never wrote it, so undoing the claim must not either.
+fn bead_unclaim_args(id: &str) -> [String; 6] {
+    [
+        "update".into(),
+        id.to_string(),
+        "-s".into(),
+        "open".into(),
+        "-a".into(),
+        String::new(),
+    ]
+}
+
+/// Release a claim — move a bead from `in_progress` back to `open`. `bd update <id> -s open`.
+///
+/// THE MISSING EDGE. Every other status mutator in this module moves work FORWARD — claim, close,
+/// delete — so once a bead was claimed there was no path back, and a claim that outlived the thing
+/// it was claimed for was permanent. The board's handoff claims the epic BEFORE dispatching to the
+/// orchestrator, and a dispatch that throws after the claim leaves the bead marked in progress with
+/// no orchestrator bound; `sendToBuild`'s own preflight doc names that outcome verbatim and can only
+/// ever be a preflight. This is what the frontend calls to undo it.
+///
+/// ══ IT WRITES TWO FIELDS, AND IT CLEARS RATHER THAN RESTORES ══════════════════════════════════
+/// `--claim` sets a status AND an assignee, so undoing it must do both — a release that moved only
+/// the status handed the bead back to the board as startable while still holding an advisory lease
+/// (`docs/superpowers/specs/2026-07-16-beads-worktree-safety-design.md` has bd refusing a competing
+/// claim against one). But the undo is a CLEAR, not a restore: it has no memory of who was assigned
+/// before, so a bead a human had assigned to themselves before Build It was pressed comes back with
+/// an EMPTY assignee, not their name. That is correct for the dispatch-failed path this exists for —
+/// the claim being undone is the one this app just wrote — and it is why the function is named for
+/// releasing a CLAIM rather than for setting a status. A caller that only wants to walk a status
+/// back, without touching ownership, must not use this.
+///
+/// The `Owner` field (bd's creator) is untouched: `--claim` never wrote it.
+///
+/// Idempotent server-side, like `bead_claim`: setting an already-open bead to `open` is a no-op, so
+/// a best-effort caller can fire it without first reading the status.
+/// Sync core of [`bead_unclaim`]; a plain fn so the async command offloads it via `spawn_blocking`
+/// and the tests can drive the id-validation guard directly.
+fn bead_unclaim_inner(project_path: String, id: String) -> Result<String, String> {
+    if !valid_bead_id(&id) {
+        return Err(format!("invalid bead id: {id}"));
+    }
+    let args = bead_unclaim_args(&id);
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let output = run_bd(&project_path, &arg_refs)?;
+    select_bd_action(output.success, output.stdout.trim(), output.stderr.trim())
+}
+
+#[tauri::command]
+pub async fn bead_unclaim(project_path: String, id: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || bead_unclaim_inner(project_path, id))
+        .await
+        .map_err(|e| format!("bd task failed: {e}"))?
+}
+
 /// Close a bead (mark done). `bd close <id>`. Idempotent server-side.
 #[tauri::command]
 pub async fn bead_close(project_path: String, id: String) -> Result<String, String> {
@@ -1248,6 +1330,28 @@ mod tests {
         // The id-taking commands reject a flag-like id before shelling out.
         assert!(bead_claim_inner("/tmp".into(), "-s".into()).is_err());
         assert!(delete_bead_inner("/tmp".into(), "--force".into()).is_err());
+    }
+
+    #[test]
+    fn unclaim_argv_sets_the_status_back_to_open() {
+        // THE SIDE EFFECT, not the guard. The id check below proves only that a flag-like id is
+        // refused — it stays green for an argv that writes any status at all, or none. This pins
+        // the one thing the missing edge is FOR: the status moving back to `open`.
+        // BOTH HALVES OF THE CLAIM. `--claim` writes a status AND an assignee, so asserting only
+        // the status would stay green for a release that leaves an advisory lease behind on a bead
+        // it just handed back to the board as startable.
+        assert_eq!(
+            bead_unclaim_args("sparkle-tsyh5u"),
+            ["update", "sparkle-tsyh5u", "-s", "open", "-a", ""],
+        );
+        // ...and it is a WRITE, so a timeout gets the "may or may not have landed" copy rather
+        // than a read's clean failure (roborev 59622's defect).
+        let argv = bead_unclaim_args("sparkle-tsyh5u");
+        let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+        assert!(bd_subcommand_mutates(&refs));
+        // The id guard, same shape as `bead_claim_inner`'s above.
+        assert!(bead_unclaim_inner("/tmp".into(), "-s".into()).is_err());
+        assert!(bead_unclaim_inner("/tmp".into(), "".into()).is_err());
     }
 
     #[test]

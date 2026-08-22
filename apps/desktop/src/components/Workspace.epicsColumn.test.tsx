@@ -683,3 +683,95 @@ describe("an epic that HAS a goal opens its card, exactly like one that does not
     }
   });
 });
+
+// ── THE CHILD RATIO COUNTS UP TO THE TOTAL ───────────────────────────────────────────────────────
+//
+// The founder read the old `{open}/{total}` as its own opposite: *"I'm not sure I understand what
+// the '14/14' etc numbers mean exactly. […] I would make the assumption that if all of the children
+// are done, then the epic itself is done but for example I see an epic called 'Productized Work Tree
+// Workflow Book Ends' that has a 6/6 on it, and yet it is still in the 'being built' status so I
+// don't understand why that's the case or how that could be possible."*
+//
+// `6/6` meant six STILL OPEN of six — nothing finished — which is exactly why it had not moved. His
+// ruling: *"flip it so that it builds up to the total versus building down."*
+describe("the epic row's child ratio counts COMPLETED work, not remaining work", () => {
+  // THREE CHILDREN, DELIBERATELY UNEQUAL: two closed, one still open. A fixture where the two
+  // numbers coincide (0 of 0, or n of n) is satisfied by BOTH directions of the fraction, which is
+  // precisely how the old reading survived unnoticed — and `2/3` vs `1/3` cannot be confused.
+  //
+  // The open child is `in_progress` rather than `open` on purpose: bd's only terminal state is
+  // `closed`, so work in flight must count as NOT done. A fixture using `open` for it would pass
+  // for a rule that treated `in_progress` as finished.
+  const MIXED: Bead[] = [
+    bead("ep-ratio"),
+    bead("ep-ratio.a", { status: "closed" }),
+    bead("ep-ratio.b", { status: "closed" }),
+    bead("ep-ratio.c", { status: "in_progress" }),
+  ];
+  const rowFor = (id: string) => document.querySelector<HTMLElement>(`[data-epic-id="${id}"]`);
+  const ratioText = (id: string) =>
+    rowFor(id)?.querySelector('[data-testid="epic-row-children"]')?.textContent?.trim() ?? null;
+
+  beforeEach(() => {
+    useBeadsStore.setState({
+      byProject: { p1: { beads: MIXED, board: bucketBeads(MIXED), polledAt: 0 } },
+      error: {},
+    } as never);
+    useProjectStore.setState({
+      projects: [mkProject("p1", "Alpha", [mkAgent("a1")])],
+      selectedProjectId: "p1",
+    } as never);
+  });
+
+  it("renders DONE over total — 2/3, never the remaining-work 1/3", () => {
+    render(<Workspace />);
+    // Asserting the exact string BOTH ways round. `toBe("2/3")` alone would be satisfied by a
+    // coincidence in some other fixture; naming the value it must NOT be pins this to the flip
+    // itself, and is the assertion that goes red if the numerator ever counts down again.
+    expect(ratioText("ep-ratio")).toBe("2/3");
+    expect(ratioText("ep-ratio")).not.toBe("1/3");
+  });
+
+  it("reads 0/N while nothing has finished — the '6/6 but still building' case he hit", () => {
+    // His actual confusion, reproduced: an epic with every child still open. Under the old reading
+    // this rendered `3/3` and looked complete; it must now read `0/3` and look untouched, which is
+    // the truth about it and the reason it has not moved off the build rung.
+    const NONE: Bead[] = [
+      bead("ep-none"),
+      bead("ep-none.a", { status: "in_progress" }),
+      bead("ep-none.b", { status: "open" }),
+      bead("ep-none.c", { status: "in_progress" }),
+    ];
+    useBeadsStore.setState({
+      byProject: { p1: { beads: NONE, board: bucketBeads(NONE), polledAt: 0 } },
+      error: {},
+    } as never);
+    render(<Workspace />);
+    expect(ratioText("ep-none")).toBe("0/3");
+  });
+
+  it("reads N/N once every child has closed", () => {
+    // The far end of the same scale, and the one the founder's inference is about: an epic whose
+    // children have ALL closed should read as fully done rather than as fully remaining.
+    //
+    // THE EPIC'S OWN BEAD IS `in_progress` ON PURPOSE, and it is what makes this assertable at all.
+    // Left `open`, an epic whose children have all closed is rolled up to the DONE rung — which
+    // `OPEN_BY_DEFAULT` deliberately leaves COLLAPSED, so the row is not in the DOM and the ratio
+    // reads `null` rather than a number. That is correct product behaviour and a useless test.
+    // `in_progress` with nobody bound puts it on the Build: Unstaffed rung, which IS open by
+    // default — and it is also the more interesting row: an epic whose work is finished but whose
+    // own bead nobody closed, which is precisely the stamped-not-derived class of bug this whole
+    // change is about.
+    const ALL: Bead[] = [
+      bead("ep-all", { status: "in_progress" }),
+      bead("ep-all.a", { status: "closed" }),
+      bead("ep-all.b", { status: "closed" }),
+    ];
+    useBeadsStore.setState({
+      byProject: { p1: { beads: ALL, board: bucketBeads(ALL), polledAt: 0 } },
+      error: {},
+    } as never);
+    render(<Workspace />);
+    expect(ratioText("ep-all")).toBe("2/2");
+  });
+});

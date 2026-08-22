@@ -1,6 +1,12 @@
 // @vitest-environment jsdom
 //
-// THE COMMENT THREAD — the founder's items 23 and 24.
+// THE COMMENT THREAD — the founder's items 23 and 24, plus the 2026-08-22 reorder.
+//
+// ══ THE REORDER: NEWEST FIRST, COMPOSE BOX ON TOP ══════════════════════════════════════════════
+// Its own describe block at the foot of this file, with the ask quoted there. The one thing to
+// carry up here: those assertions read the RENDERED DOM ORDER, never a sorted array or a helper
+// call, because a component that sorts correctly and then renders the unsorted prop would pass the
+// latter. Item 23's "bottom of the thread" row changed meaning as a result — see its comment.
 //
 // ══ 23: THE BUTTON MOVED, WHICH IS A CLAIM ABOUT THE ROW, NOT ABOUT THE BUTTON ═════════════════
 // [11:06] *"Let's put the comments button bottom right instead of bottom left."* A control's
@@ -126,14 +132,19 @@ describe("item 23 — the Comment button sits bottom RIGHT", () => {
     expect(button.style.flex).toBe("0 0 auto");
   });
 
-  it("is the bottom of the thread, under the comment and the input", () => {
+  // "Bottom" means the bottom of the COMPOSE BLOCK. It used to also mean the bottom of the whole
+  // thread, and that half is deliberately gone: the compose block now leads the section (see the
+  // reorder describe below), so the button sits ABOVE the comments. What item 23 actually claimed —
+  // the button is under the field it submits, at the right-hand end of its row — is unchanged.
+  it("is the bottom of the COMPOSE BLOCK, under the input it submits", () => {
     mount();
     const row = screen.getByTestId(`${T}-submit-row`);
     const after = (a: Element, b: Element) =>
       Boolean(a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_PRECEDING);
 
-    expect(after(row, screen.getByTestId(`${T}-item`))).toBe(true);
     expect(after(row, screen.getByTestId(`${T}-input`))).toBe(true);
+    // …and it is still the LAST thing in the compose block, not floating loose in the thread.
+    expect(screen.getByTestId(`${T}-compose`).lastElementChild).toBe(row);
   });
 
   // A relocated button wired to nothing passes every placement row above. This is the side effect.
@@ -147,5 +158,167 @@ describe("item 23 — the Comment button sits bottom RIGHT", () => {
     fireEvent.click(screen.getByTestId(`${T}-submit`));
 
     await waitFor(() => expect(onComment).toHaveBeenCalledWith("bottom right now"));
+  });
+});
+
+// ── NEWEST FIRST, AND THE COMPOSE BOX LEADS ─────────────────────────────────────────────────────
+//
+// [2026-08-22] *"I want to reorder the comments to have the newest comments at the top and I want
+// the comment box to be right below the comments section header. The comment section header should
+// say 'Comments (newest first):' since the comments can be long, the comments would be ordered from
+// newest to oldest, descending."*
+//
+// EVERY assertion below reads the RENDERED DOM — the node order, the document positions, the
+// header's own text. None of them asks whether a helper was called or whether an array came back
+// sorted: a component that sorts perfectly and then renders the prop would pass that, and it is
+// exactly the bug worth catching here.
+
+describe("the comments section reads newest → oldest", () => {
+  const iso = (d: number, h: number, min: number) => localIso(2026, 8, d, h, min);
+
+  /** The rendered comment bodies, top to bottom. `getAllByTestId` returns document order. */
+  const renderedTexts = () =>
+    screen.getAllByTestId(`${T}-item-text`).map((n) => n.textContent);
+
+  it("renders the header the founder asked for, verbatim", () => {
+    mount();
+    // The literal, not a constant imported from the component — comparing the string to itself
+    // would pass against any typo, including the one that drops the parenthetical entirely.
+    expect(screen.getByTestId(`${T}-header`).textContent).toBe("Comments (newest first):");
+  });
+
+  it("puts the NEWEST comment at the top and the oldest at the bottom", () => {
+    mount({
+      comments: [
+        // Handed over oldest-first, which is the order bd returns.
+        comment({ id: "a", text: "oldest", createdAt: iso(18, 9, 0) }),
+        comment({ id: "b", text: "middle", createdAt: iso(19, 9, 0) }),
+        comment({ id: "c", text: "newest", createdAt: iso(20, 9, 0) }),
+      ],
+    });
+    expect(renderedTexts()).toEqual(["newest", "middle", "oldest"]);
+  });
+
+  it("keeps comments that share a timestamp in the order they arrived", () => {
+    // Agents write in bursts, so a shared second is the normal case, not a corner. Stability is the
+    // only deterministic answer available, and an unstable comparator reshuffles them per render.
+    const same = iso(20, 9, 0);
+    mount({
+      comments: [
+        comment({ id: "t1", text: "burst one", createdAt: same }),
+        comment({ id: "t2", text: "burst two", createdAt: same }),
+        comment({ id: "t3", text: "burst three", createdAt: same }),
+        comment({ id: "older", text: "yesterday", createdAt: iso(19, 9, 0) }),
+      ],
+    });
+    expect(renderedTexts()).toEqual(["burst one", "burst two", "burst three", "yesterday"]);
+  });
+
+  it.each([
+    ["no recorded time", null],
+    ["an unparseable time", "not a date"],
+  ])("sinks a comment with %s to the BOTTOM, never floats it to the top", (_name, bad) => {
+    // An undated comment is not evidence of being the newest. It is also where a `NaN` comparator
+    // result comes from, and a `NaN` return makes the whole sort's result unspecified — which
+    // presents as "the list came back in input order" with nothing logged.
+    //
+    // FIVE ROWS, TWO UNDATED, INTERLEAVED — deliberately, and this is the fixture's whole point.
+    // The rule is TWO lines in the comparator (`ta === null` and `tb === null`) and the realistic
+    // typo flips only one of them, leaving a comparator that contradicts itself. Measured: a
+    // three-row fixture with a single undated comment stayed GREEN against exactly that mutation —
+    // V8's sort happened to reach the same answer — so it proved nothing about the rule. At this
+    // width the one-sided flip is caught.
+    mount({
+      comments: [
+        comment({ id: "u1", text: "undated one", createdAt: bad }),
+        comment({ id: "o", text: "oldest", createdAt: iso(17, 9, 0) }),
+        comment({ id: "m", text: "middle", createdAt: iso(18, 9, 0) }),
+        comment({ id: "u2", text: "undated two", createdAt: bad }),
+        comment({ id: "n", text: "newest", createdAt: iso(20, 9, 0) }),
+      ],
+    });
+    // The dated ones descend; both undated ones sit under all of them, in the caller's order.
+    expect(renderedTexts()).toEqual([
+      "newest",
+      "middle",
+      "oldest",
+      "undated one",
+      "undated two",
+    ]);
+  });
+
+  it("does NOT mutate the array it was handed", () => {
+    // The prop is the caller's array, shared with whatever memo produced it. An in-place `.sort()`
+    // here reorders a list elsewhere in the app at render time, with nothing to point at — and it
+    // is invisible to every other assertion in this file, which all read the rendering.
+    const input = [
+      comment({ id: "a", text: "oldest", createdAt: iso(18, 9, 0) }),
+      comment({ id: "b", text: "middle", createdAt: iso(19, 9, 0) }),
+      comment({ id: "c", text: "newest", createdAt: iso(20, 9, 0) }),
+    ];
+    const identities = [...input];
+    mount({ comments: input });
+
+    expect(input.map((c) => c.id)).toEqual(["a", "b", "c"]);
+    expect(input).toEqual(identities); // same objects, same slots
+    // …and the render really did reorder, so the row above is about the input rather than about a
+    // component that never sorted anything.
+    expect(renderedTexts()).toEqual(["newest", "middle", "oldest"]);
+  });
+
+  it("puts the compose box BEFORE the first comment, directly under the header", () => {
+    mount({
+      comments: [
+        comment({ id: "a", text: "oldest", createdAt: iso(18, 9, 0) }),
+        comment({ id: "c", text: "newest", createdAt: iso(20, 9, 0) }),
+      ],
+    });
+    const before = (a: Element, b: Element) =>
+      Boolean(a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING);
+
+    const header = screen.getByTestId(`${T}-header`);
+    const compose = screen.getByTestId(`${T}-compose`);
+    const firstItem = screen.getAllByTestId(`${T}-item`)[0]!;
+
+    // Document position, not a class name or a style — the founder judges this by where the box IS.
+    expect(before(header, compose)).toBe(true);
+    expect(before(compose, firstItem)).toBe(true);
+    // "Right below the header": nothing renders between them in the thread's own children.
+    const kids = Array.from(screen.getByTestId(T).children);
+    expect(kids.indexOf(compose)).toBe(kids.indexOf(header) + 1);
+  });
+
+  it("puts the compose box above the EMPTY state too", () => {
+    mount({ comments: [] });
+    const compose = screen.getByTestId(`${T}-compose`);
+    const empty = screen.getByTestId(`${T}-empty`);
+    expect(
+      Boolean(compose.compareDocumentPosition(empty) & Node.DOCUMENT_POSITION_FOLLOWING),
+    ).toBe(true);
+  });
+
+  it("names the list with the header, so the order is announced and not just seen", () => {
+    // A screen-reader user gets no visual cue that the order flipped. The list is a `<span>` (this
+    // subtree must stay phrasing content), so the list semantics are carried by ARIA.
+    mount();
+    const list = screen.getByTestId(`${T}-list`);
+    expect(list.getAttribute("role")).toBe("list");
+    expect(list.getAttribute("aria-labelledby")).toBe(screen.getByTestId(`${T}-header`).id);
+    expect(screen.getByTestId(`${T}-item`).getAttribute("role")).toBe("listitem");
+  });
+
+  it("keeps the error beside the control that produced it, above the thread", async () => {
+    const onComment = vi.fn().mockRejectedValue(new Error("bd is busy"));
+    mount({ comments: [comment({ id: "a", text: "history" })], onComment });
+    fireEvent.change(screen.getByTestId(`${T}-input`), { target: { value: "try me" } });
+    fireEvent.click(screen.getByTestId(`${T}-submit`));
+
+    const error = await screen.findByTestId(`${T}-error`);
+    expect(
+      Boolean(
+        error.compareDocumentPosition(screen.getByTestId(`${T}-item`)) &
+          Node.DOCUMENT_POSITION_FOLLOWING,
+      ),
+    ).toBe(true);
   });
 });

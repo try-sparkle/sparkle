@@ -188,7 +188,7 @@ describe("expanded by default — the card is there without a click", () => {
     // that is the chip's word. The point of THIS row is the withheld Build It — the meta assertion
     // is here to prove the rest of the card still rendered, and it has to speak the same vocabulary.
     expect(screen.getByTestId("concierge-bead-card-meta").textContent ?? "").toContain(
-      "Being built",
+      "Build: Active",
     );
     expect(screen.queryByTestId("concierge-bead-card-build-it")).toBeNull();
   });

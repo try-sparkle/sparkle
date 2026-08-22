@@ -37,7 +37,6 @@
 
 import { Fragment, useMemo, useState, useCallback, useEffect, useRef } from "react";
 import { FiChevronDown, FiChevronRight, FiX } from "react-icons/fi";
-import { useShallow } from "zustand/react/shallow";
 import { C, FONT_WEIGHT } from "../theme/colors";
 import { FONT_UI, TYPE } from "../theme/scale";
 import { ZOOM_COLUMN_ATTR, zoomColumnFor } from "../engine/columnZoom";
@@ -69,22 +68,16 @@ import {
   readStoredEpicsWidth,
 } from "../engine/columnResize";
 import { EPIC_LADDER_COLUMNS, bucketEpics, type EpicLadderKey } from "../services/epicBoard";
-// ── THE HEALTH SQUARE'S THREE IMPORTS, AND WHY EACH IS THE SHARED ONE ─────────────────────────
-// `rollupViewFor` is the SANCTIONED entry point for "what disc is this build row painted"
-// (useAttentionNotifications / engine.workerRollup). A local `rollupDot` call here would be a
-// second derivation of the same fact, which is the column↔column drift those files' headers record
-// as already shipped. `agentsForEpicSlices` is the epic↔agent edge, stated once in
-// `services/epicLadder`. `engine/epicHealth` is the only place the rollup RULE lives.
-import { rollupViewFor } from "../useAttentionNotifications";
-import { resolveStage } from "../engine/workflowStage";
-import { useFinishedHeads } from "../hooks/useFinishedHeads";
-import { useOverlaidStatus } from "../hooks/useOverlaidStatus";
-import { useNudgeFlagSnapshot } from "../useNudgeFlags";
+// ── THE HEALTH WIRING IS ONE HOOK, SHARED WITH THE PLAN BOARD ─────────────────────────────────
+// It used to be a memo right here, which was correct while this column was the only surface asking.
+// `BoardView`'s Epics mode now renders the same ladder and needs the same answer for its Unstaffed
+// rung, so the chain lives in `hooks/useEpicHealthOf` and both callers read it. Its header explains
+// why each link in that chain is the SHARED one; the short version is that two hand-written copies
+// is how two columns come to disagree about one epic.
+import { epicHealthApplies, rungForEpicHealth, type EpicHealth } from "../engine/epicHealth";
+import { useEpicHealthOf } from "../hooks/useEpicHealthOf";
 import type { AgentTab } from "../types";
-import { agentsForEpicSlices } from "../services/epicLadder";
-import { epicHealth, epicHealthApplies, type EpicHealth } from "../engine/epicHealth";
 import { EpicHealthSquare } from "./EpicHealthSquare";
-import { useRuntimeStore } from "../stores/runtimeStore";
 import {
   childrenOfIndexed,
   epicDisplayTitle,
@@ -120,11 +113,20 @@ const NO_AGENTS: AgentTab[] = [];
  *  to the concierge, the bead is filed correctly, and what he sees is a COUNT tick from 3 to 4
  *  behind a closed chevron. It is also the pile he came here to read: "so much that I have asked
  *  for that I have not been able to track" is a description of Backlog. Done/Shipped/Archived stay
- *  collapsed — those are history, and they are the piles that actually grow without bound. */
+ *  collapsed — those are history, and they are the piles that actually grow without bound.
+ *
+ *  UNSTAFFED IS ON THIS LIST BECAUSE IT IS THE WHOLE POINT OF THE RUNG. The founder's complaint was
+ *  *"I don't have a good understanding of why an epic can be in the being built category and yet
+ *  there are no active billed agents running against it."* — i.e. these epics were ALREADY invisible
+ *  to him, hidden inside a column whose header said the opposite. Shipping the new rung collapsed
+ *  would re-hide exactly the epics it exists to surface, and swap one wrong header for a closed
+ *  chevron with a count beside it. It is a live state, not history; it belongs with the other three
+ *  he scans for "what have I asked for, what is happening, and what is stuck". */
 const OPEN_BY_DEFAULT: ReadonlySet<EpicLadderKey> = new Set<EpicLadderKey>([
   "backlog",
   "blocked",
   "planning",
+  "unstaffed",
   "inProgress",
 ]);
 
@@ -203,92 +205,50 @@ export function EpicsColumn({
 
   const board = snapshot?.board;
   const allBeads = snapshot?.beads ?? NO_BEADS;
-  const ladder = useMemo(
-    () => (board ? bucketEpics(board, allBeads) : null),
-    [board, allBeads],
-  );
 
   // ── HEALTH ───────────────────────────────────────────────────────────────────────────────────
   // The founder: *"The epics should be tied to the corresponding build agents and the statuses
-  // should be showing next to the epic row."* The rule is `engine/epicHealth`; this is only the
-  // wiring, and it is deliberately COMPUTED ONCE FOR THE COLUMN rather than per row. `rollupViewFor`
-  // buckets every worker by `parentId` on construction, so calling it inside `EpicRow` would rebuild
-  // that map once per epic — on a store where the founder has nineteen of them and rows re-render
-  // on a 5s poll.
+  // should be showing next to the epic row."* The rule is `engine/epicHealth`; the wiring is
+  // `hooks/useEpicHealthOf`, shared with `BoardView`'s Epics mode so the two surfaces cannot
+  // disagree about one epic.
   //
-  // SUBSCRIBED, NOT `getState()`-ed. Agent status is exactly the thing that changes while he is
-  // looking at this column, and a memo reading the store imperatively would paint the health it saw
-  // at mount and never move — the "green square on a red epic" version of the bug PR #2357 fixed one
-  // column over. These are the same four slices `AgentSidebar` subscribes to for its own discs.
-  const rt = useRuntimeStore(
-    useShallow((s) => ({
-      status: s.status,
-      openAgentIds: s.openAgentIds,
-      lastObserved: s.lastObserved,
-      branchStatus: s.branchStatus,
-      workflowStage: s.workflowStage,
-    })),
-  );
+  // ⚠️ IT SITS ABOVE `ladder` BECAUSE THE LADDER NOW DEPENDS ON IT. This used to be the other way
+  // round, and swapping the order is the whole reason the block moved: `bucketEpics` asks this
+  // function which epics are staffed, so a `ladder` memo declared above it would close over a
+  // `healthOf` that does not exist yet. Both are unconditional hook calls in a fixed order — do not
+  // "fix" this by moving one inside a branch.
   const agents = project?.agents;
   const roster = agents ?? NO_AGENTS;
-  // THE SAME OVERLAID MAP THE BUILD COLUMN READS, from the same hook. The first cut built its own
-  // `withUnmergedWork(roster, RAW status, …)` here — the tail of that chain with none of the
-  // overlays — and that is not cosmetic: `stallReport` gates its arms behind `isQuiet(status)`, so a
-  // head carrying a red worker reads `blocked` in the build column (verdict `active`, NOT finished)
-  // and raw `idle` here (verdict `finished`). The two columns then disagreed about the same head in
-  // exactly the case the shared verdict was extracted to fix.
-  const { calmStatus, graceTick } = useOverlaidStatus(roster);
-  const agentsById = useMemo(() => {
-    const index = new Map<string, AgentTab>();
-    for (const a of roster) index.set(a.id, a);
-    return index;
-  }, [roster]);
-  const nudgeFlags = useNudgeFlagSnapshot();
-  const isFinishedOf = useFinishedHeads(agentsById, calmStatus, nudgeFlags);
+  const healthOf = useEpicHealthOf(roster, allBeads);
 
-  const healthOf = useMemo(() => {
-    const openIds = new Set(rt.openAgentIds);
-    const stageOf = (id: string) => resolveStage(rt.branchStatus[id], rt.workflowStage[id]);
-    // ── THE TWO ARGUMENTS `rollupViewFor` WILL NOT DEFAULT CORRECTLY FOR A SECOND COLUMN ────────
-    // Both are documented on its own parameters as things a second caller has to pass:
-    //   • `isFinishedOf` — without it a finished orchestrator still carrying a red worker bubble
-    //     rolls up RED here while the build column has already gone calm.
-    //   • `nudgeFlags` — the nudger's table is a module-level Map with no store behind it, and a
-    //     flagged agent is SILENT by definition, so a memo that let this default could never re-run
-    //     to learn a flag had arrived (roborev 65408).
-    const { own, dotOf } = rollupViewFor(
-      roster,
-      rt.status,
-      openIds,
-      rt.lastObserved,
-      stageOf,
-      undefined,
-      undefined,
-      undefined,
-      isFinishedOf,
-      undefined,
-      undefined,
-      nudgeFlags,
-    );
-    // `own`, not the raw store map: it is the head's status with the worker bubbles stripped, which
-    // is what `engine/epicHealth`'s one status-reading arm (`lapsed`) is written against.
-    return (epicId: string): EpicHealth =>
-      epicHealth(
-        agentsForEpicSlices(roster, allBeads, epicId).map((a) => ({
-          id: a.id,
-          parentId: a.parentId,
-          dot: dotOf(a.id),
-          status: own[a.id] ?? "new",
-        })),
-      );
-    // `graceTick` is a REACTIVITY ANCHOR, not dead code — nothing in the body mentions it, and
-    // `AgentSidebar`'s twin memo lists it for the identical reason (roborev 54830). `composeRollup`
-    // samples its own clock in step (0), and for a held `errored` or briefless agent NONE of this
-    // memo's other deps ever move again: the beads snapshot short-circuits when unchanged, `rt` is
-    // shallow-compared, `roster` is stable, and `nudgeFlags` only moves when a flag arrives. Without
-    // it the epic square holds the pre-deadline reading indefinitely while the build column reddens.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [roster, allBeads, rt, isFinishedOf, nudgeFlags, graceTick]);
+  // ── THE LADDER, WITH THE UNSTAFFED RUNG DERIVED FROM THAT SAME RULE ──────────────────────────
+  // The founder, on an epic sitting under "Being built" with nothing running: *"I don't have a good
+  // understanding of why an epic can be in the being built category and yet there are no active
+  // billed agents running against it."* `bead.status` is stamped once at promote-to-build and never
+  // re-derived, so it cannot answer him; the roster can, and this is where it is asked.
+  //
+  // ONE RULE, NOT TWO. `epicHealth(readings) === "gray"` is the same predicate that paints the
+  // square beside the row, so the mark and the header above it cannot contradict each other.
+  // A local "does the roster contain an agent for this epic" test would look equivalent and would
+  // not be: `epicHealth` folds workers into their orchestrator and reads an epic whose agents have
+  // ALL finished and gone gray as gray too — which is the founder's case as much as the empty one
+  // is.
+  //
+  // `"gray"` IS THE COLOUR, `"unstaffed"` IS THE RUNG. `EpicHealth` is now literally `RollupDot`
+  // (the founder's colour-parity rule; see `engine/epicHealth`), so the health value that used to be
+  // called `"unstaffed"` is spelled the way the build column spells it, and the rung keeps the name.
+  //
+  // NO WRITE TO BD HAPPENS ANYWHERE ON THIS PATH. The rung is purely derived, which is what makes it
+  // honest for every existing `in_progress` bead the instant it ships, and what makes a card slide
+  // back to "Being built" by itself the moment an agent binds.
+  const ladder = useMemo(
+    // ONE RULE DECIDES THE RUNG, and it is `engine/epicHealth`'s. This passed a BOOLEAN
+    // (`healthOf(id) !== "unstaffed"`), which could only ever say inProgress-or-unstaffed — so the
+    // founder's *"if the agents are Red then it would go into blocked"* had nowhere to land, and
+    // `rungForEpicHealth` sat with zero production callers while its tests asserted it as live.
+    () => (board ? bucketEpics(board, allBeads, (id) => rungForEpicHealth(healthOf(id))) : null),
+    [board, allBeads, healthOf],
+  );
 
   // ── SELECTION ────────────────────────────────────────────────────────────────────────────────
   const focusedEpicId = useUiStore((s) => s.epicFocusBySide[side]);
@@ -703,7 +663,23 @@ function EpicRow({
   // comparisons per row and 2.
   const epicIndex = epicIndexOf(allBeads);
   const total = childrenOfIndexed(epicIndex, epic.id).length;
-  const open = openChildCountIndexed(epicIndex, epic.id);
+  // ══ THE PAIR COUNTS UP TO THE TOTAL, NOT DOWN FROM IT ═══════════════════════════════════════
+  // This rendered `{open}/{total}` — REMAINING work over total — and the founder read it as its own
+  // opposite: *"I'm not sure I understand what the '14/14' etc numbers mean exactly. […] I would
+  // make the assumption that if all of the children are done, then the epic itself is done but for
+  // example I see an epic called 'Productized Work Tree Workflow Book Ends' that has a 6/6 on it,
+  // and yet it is still in the 'being built' status so I don't understand […] how that's possible."*
+  //
+  // Nothing was wrong with the epic. `6/6` meant SIX STILL OPEN of six — nothing finished — which is
+  // exactly why it had not moved. But a fraction whose numerator SHRINKS as work completes reads as
+  // progress running backwards, and `14/14` reads as "all done" at the precise moment none of it is.
+  // His ruling: *"flip it so that it builds up to the total versus building down."*
+  //
+  // Derived as `total - open` rather than by counting closed children directly, so the two halves of
+  // the fraction cannot disagree: they come from ONE membership walk, and `openChildCountIndexed`
+  // stays the single definition of "still open" (`in_progress` counts as open — bd's only terminal
+  // state is `closed`). A second closed-child count here would be a rival definition of done.
+  const done = total - openChildCountIndexed(epicIndex, epic.id);
 
   const rowRef = useRef<HTMLButtonElement | null>(null);
   useEffect(() => {
@@ -867,8 +843,16 @@ function EpicRow({
         </span>
       ) : (
         total > 0 && (
-          <span data-testid="epic-row-children" style={{ flex: "0 0 auto", color: C.muted }}>
-            {open}/{total}
+          <span
+            data-testid="epic-row-children"
+            // THE NUMBER NOW COUNTS THE RIGHT WAY; THIS SAYS WHAT IT COUNTS. The founder's original
+            // complaint was not only the direction — *"I'm not sure I understand what the '14/14'
+            // etc numbers mean exactly"* — it was that a bare fraction on a row states nothing at
+            // all. Flipping it without saying so leaves the next reader to infer the meaning again.
+            title={`${done} of ${total} ${total === 1 ? "task" : "tasks"} done`}
+            style={{ flex: "0 0 auto", color: C.muted }}
+          >
+            {done}/{total}
           </span>
         )
       )}

@@ -7,6 +7,13 @@
 // be tied to the corresponding build agents and the statuses should be showing next to the epic
 // row."*
 //
+// AND THE RULE THAT SETTLED WHAT "just like the build agents" MEANS EXACTLY, 2026-08-22: *"For the
+// gray I do want it to work exactly like the Build Agent. That's the hard rule. The colors work the
+// same between the two and don't let any instruction ever override that."* So the epic square's
+// five values ARE `RollupDot`'s five — a questioning agent is BLUE on both surfaces, and an epic
+// with nothing active on it is GRAY on both. The per-colour parity property itself is guarded in
+// `EpicHealthSquare.test.tsx`; this file guards the wiring that gets a value to the row.
+//
 // ══ WHY EVERY CASE MOUNTS ALL FOUR EPICS AT ONCE ═══════════════════════════════════════════════
 // Same trap `EpicsColumn.priorityChiclet.test.tsx` names, and it is sharper here because the states
 // are a small enum: "render a red epic, assert the square is red" passes against a square hard-wired
@@ -14,9 +21,9 @@
 // input. So the fixture below stands one epic of each state side by side and every assertion is
 // that the four rendered squares DISAGREE in the specific way the rule says they should.
 //
-// It also means the fourth state is tested where it actually matters: `ep-none` has no agent while
-// three siblings do, so a rule that defaulted an unknown epic to green (or to gray) reddens here
-// rather than passing on an empty column where everything is unstaffed anyway.
+// It also means the no-agent state is tested where it actually matters: `ep-none` has no agent while
+// three siblings do, so a rule that defaulted an unknown epic to green reddens here rather than
+// passing on an empty column where every epic is agent-less anyway.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 
@@ -40,16 +47,16 @@ function build(id: string, epicId: string): AgentTab {
 }
 
 /** THE FIXTURE: four epics, one per state, and the agents that put them there. */
-const EPICS = [epic("ep-red"), epic("ep-amber"), epic("ep-green"), epic("ep-none")];
+const EPICS = [epic("ep-red"), epic("ep-blue"), epic("ep-green"), epic("ep-none")];
 const AGENTS = [
   build("a-red", "ep-red"),
-  build("a-amber", "ep-amber"),
+  build("a-blue", "ep-blue"),
   build("a-green", "ep-green"),
   // ep-none deliberately has NONE.
 ];
 const STATUS: Record<string, AgentTabStatus> = {
   "a-red": "waiting", // an on-screen prompt — `needs_you`
-  "a-amber": "questions",
+  "a-blue": "questions",
   "a-green": "working",
 };
 
@@ -111,11 +118,14 @@ describe("EpicsColumn — the epic row's health square", () => {
     render(<EpicsColumn project={projectWith(AGENTS)} side="right" />);
 
     expect(healthOf("ep-red")).toBe("red");
-    expect(healthOf("ep-amber")).toBe("amber");
+    // BLUE, not amber. A questioning agent's own build row is blue, and the founder's hard rule is
+    // that the two surfaces use one set of colours.
+    expect(healthOf("ep-blue")).toBe("blue");
     expect(healthOf("ep-green")).toBe("green");
-    // THE STATE THE FOUNDER DID NOT NAME. Not green — "there are build agents that are working" is
-    // false of it — and not gray, which this app reserves for finished work.
-    expect(healthOf("ep-none")).toBe("unstaffed");
+    // THE STATE THE FOUNDER DID NOT NAME, and then did: *"Where it's not active right now, however
+    // gray currently works, just make it the same."* Not green — "there are build agents that are
+    // working" is false of it — and gray is what a build row with nothing happening is painted.
+    expect(healthOf("ep-none")).toBe("gray");
 
     // Four rows, four distinct verdicts: nothing here can be a constant.
     expect(new Set(EPICS.map((e) => healthOf(e.id))).size).toBe(4);
@@ -144,41 +154,80 @@ describe("EpicsColumn — the epic row's health square", () => {
     }
   });
 
-  it("draws the unstaffed square HOLLOW and the other three FILLED", () => {
-    // The one visual difference that is doing semantic work: an empty box reads as "nobody is in
-    // here". Asserted on the rendered style rather than on a class name, because there is no
+  it("draws all four squares SOLID and in four different inks", () => {
+    // THIS ASSERTION WAS INVERTED ON PURPOSE, 2026-08-22. The no-agent square used to be drawn
+    // HOLLOW (transparent fill, amber outline) and this case pinned that. The founder overruled it —
+    // *"For the gray I do want it to work exactly like the Build Agent. That's the hard rule."* — so
+    // there is no hollow variant left: an epic with nothing active on it is a solid gray square,
+    // which is what its agents' own rows would be painted.
+    //
+    // Asserted on the rendered INLINE style rather than on a class name, because there is no
     // stylesheet in jsdom to resolve a class against (docs/jsdom-test-caveats.md).
     seed(EPICS);
     render(<EpicsColumn project={projectWith(AGENTS)} side="right" />);
-    const none = square("ep-none")!;
-    expect(none.style.background).toBe("transparent");
-    expect(none.style.border).not.toBe("none");
-    for (const id of ["ep-red", "ep-amber", "ep-green"]) {
+    const inks: string[] = [];
+    for (const id of ["ep-red", "ep-blue", "ep-green", "ep-none"]) {
       const el = square(id)!;
-      expect(el.style.background).not.toBe("transparent");
-      expect(el.style.background).not.toBe("");
+      expect(el.style.background, id).not.toBe("transparent");
+      expect(el.style.background, id).not.toBe("");
+      expect(el.style.border, id).toBe("");
+      inks.push(el.style.background);
     }
-    // ...and the hollow one is NOT drawn in the green ink, which is the specific lie to guard.
-    expect(none.style.border).not.toContain(square("ep-green")!.style.background);
+    // Four rows, four DIFFERENT inks: a square hard-wired to one colour, or one that lost a state by
+    // folding two together, cannot satisfy this.
+    expect(new Set(inks).size).toBe(4);
   });
 
-  it("takes the WORST of an epic's agents, not the first or the last", () => {
+  it("reads a MIXED fleet as orange, in either agent order", () => {
     // Two agents on one epic, in both orders across two renders. A rule that read `agents[0]` — or
-    // that stopped at the first non-calm reading — passes one of these and fails the other.
+    // that stopped at the first non-calm reading — passes one of these and fails the other. That
+    // order-independence is what this case has always been for, and it still is.
+    //
+    // THE EXPECTED VALUE CHANGED ON PURPOSE, 2026-08-22: this fleet used to read `red`, because
+    // `markOf` sent an orange dot through `bandOfRollup` (→ `needs_you`) and a half-broken epic was
+    // indistinguishable from a fully stopped one. Telling those apart is the whole point of the
+    // fifth state — the founder's *"some agents that are red and some that are not red […] probably
+    // it should stay in Being Built"* — so an assertion of `red` here would now be pinning the
+    // defect. See `engine/epicHealth`'s header.
     seed([epic("ep-mixed")]);
     const green = build("g", "ep-mixed");
     const red = build("r", "ep-mixed");
     useRuntimeStore.setState({ status: { g: "working", r: "waiting" } } as never);
 
     const first = render(<EpicsColumn project={projectWith([green, red])} side="right" />);
-    expect(healthOf("ep-mixed")).toBe("red");
+    expect(healthOf("ep-mixed")).toBe("orange");
+    // ...and specifically NOT the old answer, so a regression to the band-only fold is caught here
+    // and not only in the engine's own suite.
+    expect(healthOf("ep-mixed")).not.toBe("red");
+    // THE SQUARE MUST ACTUALLY BE PAINTED. `FILL` is keyed by `EpicHealth`, so a missing `orange`
+    // entry yields `undefined` and renders a BLANK 9px box — the mark vanishing for exactly the
+    // fleet the fifth state exists to surface. Asserting the colour reaches the DOM is what makes
+    // that failure loud instead of invisible.
+    const painted = square("ep-mixed")!;
+    expect(painted.style.background).not.toBe("");
+    expect(painted.style.background).not.toBe("transparent");
     first.unmount();
 
     render(<EpicsColumn project={projectWith([red, green])} side="right" />);
-    expect(healthOf("ep-mixed")).toBe("red");
+    expect(healthOf("ep-mixed")).toBe("orange");
   });
 
-  it("goes UNSTAFFED, not green, when the epic's only agent has finished and gone idle", () => {
+  it("still reads a fleet with NO green as red — the mixed arm did not swallow it", () => {
+    // The paired case, and the reason the one above is about a CAUSE rather than a fixture: swap
+    // the working agent for a second stopped one and the epic is fully stopped again. If this ever
+    // reports `orange` too, the fleet test has stopped distinguishing "half broken" from "broken".
+    seed([epic("ep-allred")]);
+    useRuntimeStore.setState({ status: { r1: "waiting", r2: "blocked" } } as never);
+    render(
+      <EpicsColumn
+        project={projectWith([build("r1", "ep-allred"), build("r2", "ep-allred")])}
+        side="right"
+      />,
+    );
+    expect(healthOf("ep-allred")).toBe("red");
+  });
+
+  it("goes GRAY, not green, when the epic's only agent has finished and gone idle", () => {
     // The other half of "just sitting there": the agents exist, and none of them is working. A rule
     // written as "any bound agent → green" passes every case above and fails only this one.
     seed([epic("ep-finished")]);
@@ -186,7 +235,7 @@ describe("EpicsColumn — the epic row's health square", () => {
     render(
       <EpicsColumn project={projectWith([build("done1", "ep-finished")])} side="right" />,
     );
-    expect(healthOf("ep-finished")).toBe("unstaffed");
+    expect(healthOf("ep-finished")).toBe("gray");
   });
 
   // ── WHERE THE CROSS-COLUMN GUARD LIVES, AND WHY NOT HERE ────────────────────────────────────
@@ -205,9 +254,9 @@ describe("EpicsColumn — the epic row's health square", () => {
   //     without it, reverting the argument left the whole suite green.
 
   it("renders NO square on a terminal rung, and still renders one beside it", () => {
-    // A shipped/done epic is finished, and reporting "nobody is working on this" about finished
-    // work is the founder's gray rule inverted. The rung header ("Done") is what tells the reader
-    // why there is no mark.
+    // A shipped/done epic is finished, and painting a mark on it would report "nothing is active
+    // here" about work that is complete. The rung header ("Done") is what tells the reader why
+    // there is no mark.
     //
     // ══ THE RUNG HAS TO BE EXPANDED FIRST, AND THE FIRST CUT OF THIS TEST DID NOT ═══════════════
     // `OPEN_BY_DEFAULT` collapses Done/Shipped/Archived, so the closed epic's row is simply not in
@@ -222,6 +271,6 @@ describe("EpicsColumn — the epic row's health square", () => {
     const doneRow = row("ep-done");
     expect(doneRow.querySelector('[data-testid="epic-health"]')).toBeNull();
     // The live sibling still carries one, so a blanket "never render a square" cannot pass this.
-    expect(healthOf("ep-live")).toBe("unstaffed");
+    expect(healthOf("ep-live")).toBe("gray");
   });
 });

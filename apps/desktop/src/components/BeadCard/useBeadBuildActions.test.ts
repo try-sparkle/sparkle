@@ -12,13 +12,22 @@
 //   * the preflight runs INSIDE the batch loop, so a ceiling reached partway leaves the remaining
 //     epics untouched rather than throwing out of the middle;
 //   * `buildTask` passes mode "task", so the refusal does not call a single-bead build a plan —
-//     roborev 55145.
+//     roborev 55145;
+//   * a dispatch that THROWS after the claim releases it again, because the preflight above cannot
+//     cover a throw that happens after it and until `unclaimBead` there was no edge from
+//     in_progress back to open at all — the strand was permanent (sparkle-tsyh5u).
 import { renderHook, act } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const sendToBuild = vi.fn();
 const blockedReason = vi.fn<(p: string, e: string, m?: string) => string | null>(() => null);
-vi.mock("../../services/sendToBuild", () => ({
+vi.mock("../../services/sendToBuild", async (orig) => ({
+  // SPREAD THE REAL MODULE FIRST, so a class the hook reaches for is the REAL class. `buildAllPrd`
+  // does `e instanceof AtCapacityError` to keep the batch's refusal typed, and a factory listing
+  // only the two functions makes that import resolve to nothing — vitest answers `No
+  // "AtCapacityError" export`, which surfaces as an unrelated-looking assertion failure three
+  // tests away from the mock. Only the two seams a test drives are overridden.
+  ...(await orig<typeof import("../../services/sendToBuild")>()),
   sendToBuild: (...a: unknown[]) => sendToBuild(...a),
   // Forwards ALL args so a test can assert the MODE. A factory that dropped them is how a call
   // site that never passed "task" went unnoticed (roborev 55145).
@@ -26,11 +35,14 @@ vi.mock("../../services/sendToBuild", () => ({
 }));
 
 const claimBead = vi.fn().mockResolvedValue(undefined);
+const unclaimBead = vi.fn().mockResolvedValue(undefined);
 vi.mock("../../services/beads", async (orig) => ({
   ...(await orig<typeof import("../../services/beads")>()),
   claimBead: (...a: unknown[]) => claimBead(...a),
+  unclaimBead: (...a: unknown[]) => unclaimBead(...a),
 }));
 
+import { AtCapacityError } from "../../services/sendToBuild";
 import { useBeadBuildActions } from "./useBeadBuildActions";
 import { useProjectStore } from "../../stores/projectStore";
 import { useBeadsStore } from "../../stores/beadsStore";
@@ -71,8 +83,12 @@ const epic2 = bead({ id: "e2", type: "epic", description: PRD });
 const task1 = bead({ id: "t1", type: "task", description: PRD });
 
 beforeEach(() => {
-  sendToBuild.mockClear();
+  sendToBuild.mockReset();
   claimBead.mockClear();
+  // mockReset, not mockClear: one test below makes the unclaim REJECT, and a leaked rejection
+  // would turn a later test's best-effort cleanup into an unhandled one.
+  unclaimBead.mockReset();
+  unclaimBead.mockResolvedValue(undefined);
   blockedReason.mockReset();
   blockedReason.mockReturnValue(null);
   useProjectStore.setState({
@@ -328,6 +344,151 @@ describe("useBeadBuildActions — the batch checks the ceiling on every iteratio
     });
     expect(sendToBuild).toHaveBeenCalledTimes(2);
     expect(claimBead).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("useBeadBuildActions — a dispatch that never binds an orchestrator releases the claim", () => {
+  // ══ WHY THE ASSERTION IS THE UNCLAIM AND NOT THE CLAIM ══════════════════════════════════════
+  // `claimBead` was already called here before this change — asserting it proves nothing about the
+  // fix. The SIDE EFFECT is the release: the claim was written, the handoff then threw, and the
+  // bead has to come back to `open`. Until `unclaimBead` existed there was no path from
+  // in_progress back to open ANYWHERE in the app, so the strand was permanent — measured at 129
+  // beads sitting in_progress on one machine, 35 of them older than 14 days (sparkle-tsyh5u).
+  //
+  // The preflight cannot cover this. It answers CAPACITY only — it returns null for an unknown
+  // project — and it is a preflight, so anything throwing after it strands the claim regardless.
+
+  it("unclaims the bead when the handoff throws, AFTER having claimed it", async () => {
+    sendToBuild.mockImplementationOnce(() => {
+      throw new Error("Unknown project.");
+    });
+    const { result } = hook(epic1);
+
+    await act(async () => {
+      // The ORIGINAL error still reaches the caller — that is the sentence the card renders.
+      await expect(result.current.buildIt?.()).rejects.toThrow("Unknown project.");
+    });
+
+    expect(unclaimBead).toHaveBeenCalledWith("/tmp/demo", "e1");
+    expect(unclaimBead).toHaveBeenCalledTimes(1);
+    // ...and it ran AFTER the claim, not instead of it. A release that raced the write it undoes
+    // would leave the bead claimed just the same.
+    // Both defaults fail the assertion if the call is missing, so an absent claim or an absent
+    // release cannot read as a satisfied ordering.
+    const claimedAt = claimBead.mock.invocationCallOrder[0] ?? Infinity;
+    const releasedAt = unclaimBead.mock.invocationCallOrder[0] ?? -Infinity;
+    expect(releasedAt).toBeGreaterThan(claimedAt);
+  });
+
+  // THE PAIRED HALF. One test proving the release happens is ambiguous on its own — a hook that
+  // unclaimed unconditionally would pass it while destroying every real handoff. This pins the
+  // cause: the release is the FAILURE path, and a build that took keeps its claim.
+  it("does NOT unclaim when the handoff succeeds", async () => {
+    const { result } = hook(epic1);
+    await act(async () => {
+      await result.current.buildIt?.();
+    });
+    expect(claimBead).toHaveBeenCalledWith("/tmp/demo", "e1");
+    expect(sendToBuild).toHaveBeenCalledTimes(1);
+    expect(unclaimBead).not.toHaveBeenCalled();
+  });
+
+  // Nor on the preflight refusal, which never claimed in the first place — there is nothing to
+  // release, and an unclaim there would write to a bead this press never touched.
+  it("does NOT unclaim when the preflight refuses before the claim", async () => {
+    blockedReason.mockReturnValue("At capacity.");
+    const { result } = hook(epic1);
+    await act(async () => {
+      await expect(result.current.buildIt?.()).rejects.toThrow("At capacity.");
+    });
+    expect(claimBead).not.toHaveBeenCalled();
+    expect(unclaimBead).not.toHaveBeenCalled();
+  });
+
+  it("lets the DISPATCH error through even when the cleanup itself fails", async () => {
+    // Best-effort, and this is why: the user needs to know why the build refused, not why the
+    // tidy-up did. A throwing unclaim that displaced the real error would make the failure
+    // unreadable at exactly the moment it matters.
+    sendToBuild.mockImplementationOnce(() => {
+      throw new Error("Unknown project.");
+    });
+    unclaimBead.mockRejectedValueOnce(new Error("bd not found"));
+    const { result } = hook(epic1);
+
+    await act(async () => {
+      await expect(result.current.buildIt?.()).rejects.toThrow("Unknown project.");
+    });
+    expect(unclaimBead).toHaveBeenCalledWith("/tmp/demo", "e1");
+  });
+
+  it("releases only the epic whose dispatch threw, leaving its started siblings claimed", async () => {
+    // The batch's sentence is "Started N of M; the rest are untouched" — the epic that failed has
+    // to be one of the untouched ones or the copy lies. Its already-dispatched siblings really ARE
+    // building, so their claims stand.
+    sendToBuild.mockImplementationOnce(() => {}).mockImplementationOnce(() => {
+      throw new Error("Unknown project.");
+    });
+    const { result } = hook(epic1);
+
+    await act(async () => {
+      await expect(result.current.buildAllPrd?.()).rejects.toThrow(/Started 1 of 2/);
+    });
+
+    expect(claimBead.mock.calls.map((c) => c[1])).toEqual(["e1", "e2"]);
+    expect(unclaimBead.mock.calls.map((c) => c[1])).toEqual(["e2"]);
+  });
+
+  // ══ THE BATCH REWRAP KEEPS THE ERROR'S CLASS — BOTH ARMS, OR NEITHER IS PINNED ═══════════════
+  // `buildAllPrd` appends "Started N of M; the rest are untouched." to whatever `sendToBuild` threw,
+  // and appending means CONSTRUCTING A NEW ERROR — which is where a class goes to die. It matters
+  // because `AtCapacityError` exists so callers "can map it to their own vocabulary … instead of
+  // string-matching a generic Error", and `epicSweepRunner` / `conciergeTools/plans` both establish
+  // `instanceof AtCapacityError` as the house pattern. `buildOne`, one arm up, rethrows UNWRAPPED —
+  // so a flattening rewrap here would make two sibling paths disagree about the identical refusal.
+  //
+  // Every other test on this path throws a plain `Error`, so collapsing the ternary back to
+  // `new Error(...)` left the whole suite green: the true arm never ran. These two drive both.
+
+  it("keeps AtCapacityError's CLASS through the partial-batch rewrap, sentence and all", () => {
+    const atCapacity = new AtCapacityError("Starting this plan would need another agent.");
+    sendToBuild.mockImplementationOnce(() => {}).mockImplementationOnce(() => {
+      throw atCapacity;
+    });
+    const { result } = hook(epic1);
+
+    return act(async () => {
+      const thrown = await result.current
+        .buildAllPrd?.()
+        .then(() => null)
+        .catch((e: unknown) => e);
+      // BOTH HALVES. The class alone would pass for a rethrow that dropped the batch sentence, and
+      // the sentence alone is what the plain-Error case already proves.
+      expect(thrown).toBeInstanceOf(AtCapacityError);
+      expect((thrown as Error).message).toContain("Started 1 of 2");
+      expect((thrown as Error).message).toContain("would need another agent");
+    });
+  });
+
+  it("does NOT promote a plain Error into an AtCapacityError", () => {
+    // The other direction. Without this, `throw new AtCapacityError(sentence)` unconditionally —
+    // which is a real way to "fix" the test above — would pass, and every unrelated dispatch failure
+    // would start reporting itself to the concierge as a capacity refusal.
+    sendToBuild.mockImplementationOnce(() => {}).mockImplementationOnce(() => {
+      throw new Error("Unknown project.");
+    });
+    const { result } = hook(epic1);
+
+    return act(async () => {
+      const thrown = await result.current
+        .buildAllPrd?.()
+        .then(() => null)
+        .catch((e: unknown) => e);
+      expect(thrown).toBeInstanceOf(Error);
+      expect(thrown).not.toBeInstanceOf(AtCapacityError);
+      expect((thrown as Error).message).toContain("Started 1 of 2");
+      // `cause` is what keeps the original reachable once the message has been rebuilt.
+      expect((thrown as Error).cause).toBeInstanceOf(Error);
+    });
   });
 });
 
