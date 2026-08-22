@@ -5,7 +5,7 @@
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AccountsScreen, SIGNED_IN_NO_EMAIL, type AccountsDeps } from "./AccountsScreen";
-import { PENDING_NICKNAME, EXPIRED_LOGIN_NICKNAME } from "./accountsView";
+import { EXPIRED_LOGIN_NICKNAME, PENDING_NICKNAME } from "./accountsView";
 import {
   NOT_SIGNED_IN,
   type Account,
@@ -193,308 +193,6 @@ describe("AccountsScreen", () => {
     expect(screen.getAllByRole("progressbar")).toHaveLength(2);
   });
 
-  it("states WHICH billing meter is live — subscription when no credits meter is reported", async () => {
-    // `extraUsage: null` is the wire's common case (a Rust `Option::None` crosses as an explicit
-    // null). The honest reading is "subscription", and it must be SAID rather than left implied —
-    // before this line the screen could not distinguish the two meters at all.
-    const deps = makeDeps([acct("a", { nickname: "Personal", isDefault: true })]);
-    deps.getUsageLive = vi.fn(async () => ({
-      fiveHourPercent: 42,
-      fiveHourResetsAt: null,
-      sevenDayPercent: 15,
-      sevenDayResetsAt: null,
-      limits: [],
-      extraUsage: null,
-    }));
-    render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
-    // …but SAID WITH THE CAVEAT, and that half is load-bearing rather than decoration. A bare
-    // "subscription" here would be indistinguishable from the disarmed-meter case below, and the
-    // two are opposite verdicts to `advisorSpendVerdict`: this state refuses every advisor pass.
-    // Asserting only /Billing: subscription/ would pass against a component that cannot tell them
-    // apart at all, which is precisely the defect this pair exists to catch.
-    expect(await screen.findByText(/Billing: subscription/)).toBeTruthy();
-    expect(await screen.findByText(/This account: no credits meter reported/)).toBeTruthy();
-    // …and nothing invents a credits figure or a warning out of a null meter.
-    expect(screen.queryByText(/used/)).toBeNull();
-    expect(screen.queryByText(/Spend limit reached/)).toBeNull();
-  });
-
-  it("names the USAGE-CREDITS meter and its spend when the account is on credits", async () => {
-    // The case the line exists for: the subscription bars can read comfortable while real money is
-    // being spent beside them. Non-vacuous against the test above — same component, same bars,
-    // opposite verdict, and the figures must come through rather than be flattened away.
-    const deps = makeDeps([acct("a", { nickname: "Personal", isDefault: true })]);
-    deps.getUsageLive = vi.fn(async () => ({
-      fiveHourPercent: 42,
-      fiveHourResetsAt: null,
-      sevenDayPercent: 15,
-      sevenDayResetsAt: null,
-      limits: [],
-      extraUsage: {
-        isEnabled: true,
-        monthlyLimit: 200,
-        usedCredits: 199.5,
-        utilization: 99.75,
-        spendLimitReached: false,
-      },
-    }));
-    render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
-    expect(
-      await screen.findByText(/Billing: usage credits · 199\.50 of 200 credits used this month/),
-    ).toBeTruthy();
-    // spendLimitReached is false here, so the warning must NOT appear — that keeps the warning
-    // assertion below from passing on a component that simply always renders it.
-    expect(screen.queryByText(/Spend limit reached/)).toBeNull();
-  });
-
-  it("warns when the usage-credit SPEND LIMIT has been reached", async () => {
-    // The whole point of surfacing this: a human sees the wall BEFORE a fleet of agents hits it.
-    const deps = makeDeps([acct("a", { nickname: "Personal", isDefault: true })]);
-    deps.getUsageLive = vi.fn(async () => ({
-      fiveHourPercent: 42,
-      fiveHourResetsAt: null,
-      sevenDayPercent: 15,
-      sevenDayResetsAt: null,
-      limits: [],
-      extraUsage: {
-        isEnabled: true,
-        monthlyLimit: 200,
-        usedCredits: 200,
-        utilization: 100,
-        spendLimitReached: true,
-      },
-    }));
-    render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
-    expect(await screen.findByText(/Credit spend limit reached/)).toBeTruthy();
-  });
-
-  it("reads DIFFERENTLY for a disarmed credits meter than for one that was never reported", async () => {
-    // The distinction the whole line turns on, and the one `summarizeMeter` cannot make: it folds
-    // absent / null / false into "subscription", but `advisorSpendVerdict` treats them as OPPOSITE
-    // outcomes — an explicit `false` is the ONLY state that permits an advisor call, while a
-    // missing meter is `meter-unreadable` and every pass refuses. Rendering both as plain
-    // "subscription" would be most reassuring in exactly the state where the advisor is silently
-    // skipping. Paired with the `extraUsage: null` test above: same component, same bars, and the
-    // two must not produce the same sentence.
-    const deps = makeDeps([acct("a", { nickname: "Personal", isDefault: true })]);
-    deps.getUsageLive = vi.fn(async () => ({
-      fiveHourPercent: 42,
-      fiveHourResetsAt: null,
-      sevenDayPercent: 15,
-      sevenDayResetsAt: null,
-      limits: [],
-      extraUsage: {
-        isEnabled: false,
-        monthlyLimit: null,
-        usedCredits: null,
-        utilization: null,
-        spendLimitReached: false,
-      },
-    }));
-    render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
-    expect(await screen.findByText(/Billing: subscription/)).toBeTruthy();
-    // The unreported-meter caveat must NOT appear here — credits are provably disarmed, which is
-    // the one state the advisor can run in. Without this assertion the two cases could still be
-    // rendering the identical string and the test above would not notice.
-    // The permitting account fact, stated positively. Silence would be ambiguous — and, before the
-    // fleet line existed, was being read as a fleet-wide permission claim it could not support.
-    expect(screen.getByText(/This account: usage credits disarmed/)).toBeTruthy();
-  });
-
-  it("the FLEET line refuses when a SIBLING account has credits armed", async () => {
-    // The account-vs-fleet gap, and it is the one a per-card line structurally cannot close.
-    // Production asks `checkSpendGateForAccounts`, which requires UNANIMITY, so account A being
-    // disarmed decides nothing while account B is armed. An earlier cut rendered A with no caveat
-    // at all and said nothing anywhere about the fleet, which made silence a permission claim.
-    const deps = makeDeps([
-      acct("a", { nickname: "Personal", isDefault: true }),
-      acct("b", { nickname: "Work" }),
-    ]);
-    deps.getUsageLive = vi.fn(async (dir: string) => ({
-      fiveHourPercent: 10,
-      fiveHourResetsAt: null,
-      sevenDayPercent: 10,
-      sevenDayResetsAt: null,
-      limits: [],
-      extraUsage:
-        dir === "/cfg/b"
-          ? { isEnabled: true, monthlyLimit: null, usedCredits: null, utilization: null, spendLimitReached: false }
-          : { isEnabled: false, monthlyLimit: null, usedCredits: null, utilization: null, spendLimitReached: false },
-    })) as never;
-    render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
-    const line = await screen.findByTestId("advisor-gate-line");
-    expect(line.textContent).toMatch(/Advisor passes are SKIPPING/);
-    expect(line.textContent).toMatch(/usage credits armed/);
-    // …and account A's own card still truthfully reports its own meter as disarmed. Both must hold:
-    // the fix is that the ACCOUNT fact and the FLEET verdict are stated separately, not that the
-    // account fact was wrong.
-    expect(screen.getAllByText(/This account: usage credits disarmed/).length).toBeGreaterThan(0);
-  });
-
-  it("the FLEET line refuses when a SIBLING account's usage read FAILS", async () => {
-    // The nastier half: a rejected read mounts "Real usage unavailable." and NO meter line at all,
-    // so before the fleet line there was nowhere on the screen that said the advisor was off. The
-    // gate treats an unreadable account as a refusal, not an abstention.
-    const deps = makeDeps([
-      acct("a", { nickname: "Personal", isDefault: true }),
-      acct("b", { nickname: "Work" }),
-    ]);
-    deps.getUsageLive = vi.fn(async (dir: string) => {
-      if (dir === "/cfg/b") throw new Error("no token");
-      return {
-        fiveHourPercent: 10,
-        fiveHourResetsAt: null,
-        sevenDayPercent: 10,
-        sevenDayResetsAt: null,
-        limits: [],
-        extraUsage: { isEnabled: false, monthlyLimit: null, usedCredits: null, utilization: null, spendLimitReached: false },
-      };
-    }) as never;
-    render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
-    const line = await screen.findByTestId("advisor-gate-line");
-    expect(line.textContent).toMatch(/Advisor passes are SKIPPING/);
-    expect(line.textContent).toMatch(/could not be read/);
-  });
-
-  it("the FLEET line says passes CAN run when every account is disarmed", async () => {
-    // The permitting direction, asserted in the same file as both refusals above — a suite that
-    // only ever exercised the refusal would not prove the line can distinguish anything.
-    const deps = makeDeps([
-      acct("a", { nickname: "Personal", isDefault: true }),
-      acct("b", { nickname: "Work" }),
-    ]);
-    deps.getUsageLive = vi.fn(async () => ({
-      fiveHourPercent: 10,
-      fiveHourResetsAt: null,
-      sevenDayPercent: 10,
-      sevenDayResetsAt: null,
-      limits: [],
-      extraUsage: { isEnabled: false, monthlyLimit: null, usedCredits: null, utilization: null, spendLimitReached: false },
-    })) as never;
-    render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
-    const line = await screen.findByTestId("advisor-gate-line");
-    expect(line.textContent).toMatch(/Advisor passes can run/);
-    expect(line.textContent).not.toMatch(/SKIPPING/);
-  });
-
-  it("distinguishes a meter that was not reported from one that did not say whether it is armed", async () => {
-    // The fourth branch, which had no test: `extraUsage` PRESENT with `isEnabled` null and
-    // `spendLimitReached` FALSE. The only null-isEnabled fixture set spendLimitReached true, which
-    // short-circuits at the first ternary and never reaches this branch — so collapsing the last
-    // two branches into one string would have left the whole suite green, reintroducing the very
-    // self-contradiction ("no credits meter reported" for a block that plainly was) this removes.
-    // Positive AND negative, since either alone is half the evidence.
-    const deps = makeDeps([acct("a", { nickname: "Personal", isDefault: true })]);
-    deps.getUsageLive = vi.fn(async () => ({
-      fiveHourPercent: 42,
-      fiveHourResetsAt: null,
-      sevenDayPercent: 15,
-      sevenDayResetsAt: null,
-      limits: [],
-      extraUsage: {
-        isEnabled: null,
-        monthlyLimit: null,
-        usedCredits: null,
-        utilization: null,
-        spendLimitReached: false,
-      },
-    }));
-    render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
-    expect(
-      await screen.findByText(/This account: credits meter did not say whether it is armed/),
-    ).toBeTruthy();
-    expect(screen.queryByText(/no credits meter reported/)).toBeNull();
-  });
-
-  it("a DISARMED meter at its spend limit does not read as the permitting state", async () => {
-    // The ordering bug this pins, and it is not intuitive: `spendGate.ts` checks
-    // `spendLimitReached` BEFORE the `isEnabled` gate, so `isEnabled: false` + limit reached
-    // REFUSES. Reading the label off the tri-state while the warning came off `summarizeMeter`
-    // rendered exactly this case as a plain unqualified "subscription" — which under this line's
-    // contract is the one reading that means a pass is permitted. Most reassuring in a refusing
-    // state is the failure the whole line exists to prevent.
-    const deps = makeDeps([acct("a", { nickname: "Personal", isDefault: true })]);
-    deps.getUsageLive = vi.fn(async () => ({
-      fiveHourPercent: 42,
-      fiveHourResetsAt: null,
-      sevenDayPercent: 15,
-      sevenDayResetsAt: null,
-      limits: [],
-      extraUsage: {
-        isEnabled: false,
-        monthlyLimit: 200,
-        usedCredits: 200,
-        utilization: 100,
-        spendLimitReached: true,
-      },
-    }));
-    render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
-    expect(
-      await screen.findByText(/This account: credit spend limit reported reached/),
-    ).toBeTruthy();
-    // Paired with the disarmed-and-under-limit test above, which asserts NO skip line at all: the
-    // two disarmed cases must not render the same sentence, or the distinction cannot regress-fail.
-    expect(screen.getByText(/Credit spend limit reached/)).toBeTruthy();
-  });
-
-  it("does not call the meter unreported while stating a definite fact about it", async () => {
-    // `isEnabled: null` with `spendLimitReached: true` is a shape the Rust `Option<bool>` really
-    // sends. The block plainly WAS reported — it carried a spend-limit fact — so saying "reported no
-    // credits meter" one line above "Credit spend limit reached" contradicts itself. Both refuse,
-    // but only a wholly absent block can honestly be called unreported.
-    const deps = makeDeps([acct("a", { nickname: "Personal", isDefault: true })]);
-    deps.getUsageLive = vi.fn(async () => ({
-      fiveHourPercent: 42,
-      fiveHourResetsAt: null,
-      sevenDayPercent: 15,
-      sevenDayResetsAt: null,
-      limits: [],
-      extraUsage: {
-        isEnabled: null,
-        monthlyLimit: null,
-        usedCredits: null,
-        utilization: null,
-        spendLimitReached: true,
-      },
-    }));
-    render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
-    expect(await screen.findByText(/Credit spend limit reached/)).toBeTruthy();
-    expect(screen.queryByText(/no credits meter reported/)).toBeNull();
-    // …and the skip reason names the ORDER the gate actually applies: the spend limit refuses
-    // first, so that — not the unknown `isEnabled` — is what this account is told. Asserting the
-    // positive wording as well as the absent one is what gives this test power; a bare
-    // "does not say X" passes against any component that says nothing at all.
-    expect(
-      screen.getByText(/This account: credit spend limit reported reached/),
-    ).toBeTruthy();
-  });
-
-  it("never prints a credit figure beside the word subscription", async () => {
-    // A meter disabled part-way through a month: `isEnabled: false` with `usedCredits` still
-    // populated. Every field is its own `Option` on the Rust side, so this shape is permitted by
-    // the type. Reading the figure off `summarizeMeter` rendered "Billing: subscription · 47.50 of
-    // 200 used" — one meter asserted while the other's spend sits beside it, which is the exact
-    // confusion this line was added to remove.
-    const deps = makeDeps([acct("a", { nickname: "Personal", isDefault: true })]);
-    deps.getUsageLive = vi.fn(async () => ({
-      fiveHourPercent: 42,
-      fiveHourResetsAt: null,
-      sevenDayPercent: 15,
-      sevenDayResetsAt: null,
-      limits: [],
-      extraUsage: {
-        isEnabled: false,
-        monthlyLimit: 200,
-        usedCredits: 47.5,
-        utilization: 23.75,
-        spendLimitReached: false,
-      },
-    }));
-    render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
-    expect(await screen.findByText(/Billing: subscription/)).toBeTruthy();
-    expect(screen.queryByText(/47\.50/)).toBeNull();
-    expect(screen.queryByText(/used this month/)).toBeNull();
-  });
 
   it("shows a window's reset caption even when that window's PERCENT is null (the two are independent)", async () => {
     // The wire nullable percent and reset instant separately, so a window can report "resets at T"
@@ -1198,40 +896,6 @@ describe("AccountsScreen", () => {
   // records per config dir (`identity_log::takeover_at`), and a terminal `claude` login into another
   // account is exactly that: one file, one identity at a time, a CHANGE rather than a divergence.
 
-  it("warns when the account's folder has hosted a DIFFERENT login recently", async () => {
-    const deps = makeDeps(
-      [acct("def", { nickname: "FC Superadmin", isDefault: true })],
-      [],
-      [
-        {
-          id: "def",
-          email: "now@example.com",
-          organization: null,
-          accountUuid: "uuid-now",
-          identityChanged: true,
-        },
-      ],
-    );
-    render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
-
-    const notice = await screen.findByTestId("account-identity-changed-def");
-    expect(notice.textContent).toMatch(/signed into a different Claude account/i);
-    // The DEFAULT account gets the explanation that names the cause, since it is the shared dir.
-    expect(notice.textContent).toMatch(/terminal/i);
-  });
-
-  it("stays quiet when the folder has not changed hands", async () => {
-    // Paired direction: without it, rendering the notice unconditionally would pass the test above
-    // and put a takeover warning on every card.
-    const deps = makeDeps(
-      [acct("def", { nickname: "FC Superadmin", isDefault: true })],
-      [],
-      [{ id: "def", email: "now@example.com", organization: null, accountUuid: "uuid-now" }],
-    );
-    render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
-    await screen.findByTestId("account-identity-def");
-    expect(screen.queryByTestId("account-identity-changed-def")).toBeNull();
-  });
 
   // ── A SIGN-IN THAT NEVER FINISHED SAYS SO ───────────────────────────────────────────────────
   //
@@ -1758,9 +1422,8 @@ describe("rotation-readiness banner", () => {
     // Names the account every agent will actually land on — by its VERIFIED email.
     expect(banner.textContent).toContain("drodio@gmail.com");
     expect(banner.textContent).toContain("Sign in another account to enable rotation");
-    // ...and names the registration that does NOT count, which is the part that was invisible.
-    expect(banner.textContent).toContain("DROdio Gmail");
-    expect(banner.textContent).toContain("never been signed in");
+    // The per-account "counted out" bullets were removed from the rotation box (founder's ask); the
+    // box is now just the headline + routing line. WHY an account is out lives on its own row now.
     expect(banner.textContent).not.toContain("Rotation active");
   });
 
@@ -1803,64 +1466,32 @@ describe("rotation-readiness banner", () => {
     );
     render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
     const banner = await screen.findByTestId("rotation-banner");
+    // The dedup still counts these two registrations as ONE usable login (not "2 available"). The
+    // per-account "share one quota" bullet was removed from the box (founder's ask); WHY a row is
+    // discounted now lives on the account's own row.
     expect(banner.textContent).toContain("Only 1 account is signed in");
     expect(banner.textContent).not.toContain("2 accounts available");
-    // ...and says WHICH row was discounted, and why.
-    expect(banner.textContent).toContain("Gmail");
-    expect(banner.textContent).toContain("share one quota");
   });
 
-  it("collapses two same-placeholder excluded accounts into ONE counted bullet", async () => {
-    // "Signing in…" / "Login expired — reconnect" are GENERIC placeholder nicknames shared by every
-    // not-signed-in account, so two of them used to render the SAME sentence twice — a visible bug,
-    // and a React key collision. One real login keeps the banner in the "only 1 signed in" state where
-    // the excluded bullets show.
-    const deps = makeDeps(
-      [
-        acct("real", { nickname: "Real", isDefault: true }),
-        acct("p1", { nickname: PENDING_NICKNAME }),
-        acct("p2", { nickname: PENDING_NICKNAME }),
-      ],
-      [],
-      [signedInAs("real", "real@example.com", "u1"), neverLoggedIn("p1"), neverLoggedIn("p2")],
-    );
-    render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
-    const banner = await screen.findByTestId("rotation-banner");
-    const placeholderBullets = within(banner)
-      .getAllByRole("listitem")
-      .filter((li) => /never signed in|never been signed in/i.test(li.textContent ?? ""));
-    // ONE bullet for the two shared-placeholder accounts, not two byte-identical ones.
-    expect(placeholderBullets).toHaveLength(1);
-    expect(placeholderBullets[0]!.textContent).toContain("2 accounts are still");
-    expect(placeholderBullets[0]!.textContent).toContain(PENDING_NICKNAME);
-  });
-
-  it("keeps distinctly-named excluded accounts on their OWN bullets (no over-collapse)", async () => {
-    // The collapse keys on the shared nickname: a user who renamed a not-signed-in account must still
-    // see it called out separately, not folded into a count with an unrelated one.
-    const deps = makeDeps(
-      [
-        acct("real", { nickname: "Real", isDefault: true }),
-        acct("p1", { nickname: "Renamed A" }),
-        acct("p2", { nickname: "Renamed B" }),
-      ],
-      [],
-      [signedInAs("real", "real@example.com", "u1"), neverLoggedIn("p1"), neverLoggedIn("p2")],
-    );
-    render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
-    const banner = await screen.findByTestId("rotation-banner");
-    expect(banner.textContent).toContain("Renamed A");
-    expect(banner.textContent).toContain("Renamed B");
-    expect(banner.textContent).not.toContain("2 accounts are still");
-  });
-
-  it("collapses two EXPIRED-login accounts (in notSignedIn) with EXPIRED copy, not 'never signed in'", async () => {
-    // The expired placeholder is produced with email AND accountUuid BOTH null — the oauthAccount was
-    // cleared — so rotationReadiness files it under notSignedIn, NOT noEmail (the earlier "noEmail
-    // retains the uuid" premise was wrong; roborev 67153/67154). The two collapse to ONE bullet whose
-    // copy must say the login EXPIRED — never "registered but never signed in", which contradicts the
-    // nickname it quotes and points at the wrong remedy. Fixture uses the shape the wire actually emits:
-    // {email: null, accountUuid: null}.
+  // THE GUARANTEE #2355 LANDED, CARRIED ACROSS THE SURFACE THAT CARRIED IT (commit a2e60d636).
+  //
+  // #2355 fixed the rotation box's per-account bullets so an EXPIRED login stopped being described
+  // as "never signed in" — a contradiction, because the bullet quoted a nickname that already read
+  // "Login expired — reconnect", and it pointed at the wrong remedy (sign in for the first time, vs
+  // reconnect). This branch then deleted those bullets wholesale at the founder's instruction, and
+  // deleted #2355's test along with them, because a test that asserts on a bullet cannot outlive
+  // the bullet.
+  //
+  // What must NOT be lost is the CLAIM, which is independent of the bullets: nothing on this screen
+  // may tell a user with an expired login that they never signed in. So the claim is re-pinned here
+  // against the surviving surface.
+  //
+  // PAIRED on purpose, because `not.toContain` alone is exactly the vacuous shape — it passes just
+  // as well against a banner that renders nothing, or a screen where the expired rows never loaded.
+  // The two positive assertions establish that the screen really did render this state before the
+  // negative one is allowed to mean anything, and the row-level check is the one that says the
+  // information was RELOCATED rather than simply dropped.
+  it("never tells an EXPIRED login it has never signed in — the reason moved to the row, not away", async () => {
     const deps = makeDeps(
       [
         acct("real", { nickname: "Real", isDefault: true }),
@@ -1868,52 +1499,27 @@ describe("rotation-readiness banner", () => {
         acct("x2", { nickname: EXPIRED_LOGIN_NICKNAME }),
       ],
       [],
-      [
-        signedInAs("real", "real@example.com", "u1"),
-        { id: "x1", email: null, organization: null, accountUuid: null },
-        { id: "x2", email: null, organization: null, accountUuid: null },
-      ],
+      [signedInAs("real", "real@example.com", "u1"), neverLoggedIn("x1"), neverLoggedIn("x2")],
     );
     render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
-    const banner = await screen.findByTestId("rotation-banner");
-    const expiredBullets = within(banner)
-      .getAllByRole("listitem")
-      .filter((li) => /login expired/i.test(li.textContent ?? ""));
-    expect(expiredBullets).toHaveLength(1); // collapsed, not two identical bullets
-    expect(expiredBullets[0]!.textContent).toContain("2 accounts show");
-    expect(expiredBullets[0]!.textContent).toContain("reconnect them");
-    // The contradiction the earlier fix shipped: an expired login labelled "never signed in".
-    expect(banner.textContent).not.toContain("never signed in");
-  });
 
-  it("does NOT collapse REDUNDANT accounts — two same-nickname rows can be DIFFERENT logins", async () => {
-    // roborev 67907: `redundant` rows are signed in with real emails and can duplicate two DIFFERENT
-    // usable logins, so a plural "…they share one quota and count as one" would assert a relationship
-    // that need not hold. Here `dupA` duplicates login X and `dupB` duplicates login Y — both nicknamed
-    // "Extra" — so they must render as TWO separate per-account bullets, never one collapsed count.
-    const deps = makeDeps(
-      [
-        acct("a", { nickname: "Work A", isDefault: true }),
-        acct("dupA", { nickname: "Extra" }),
-        acct("c", { nickname: "Work C" }),
-        acct("dupB", { nickname: "Extra" }),
-      ],
-      [],
-      [
-        signedInAs("a", "a@example.com", "uX"),
-        signedInAs("dupA", "a@example.com", "uX"), // same login as a → redundant
-        signedInAs("c", "c@example.com", "uY"),
-        signedInAs("dupB", "c@example.com", "uY"), // same login as c → redundant, DIFFERENT login from dupA
-      ],
-    );
-    render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
+    // POSITIVE 1 — the banner rendered its real verdict for this state. Without this the negative
+    // below would hold over an empty banner.
     const banner = await screen.findByTestId("rotation-banner");
-    const redundantBullets = within(banner)
-      .getAllByRole("listitem")
-      .filter((li) => /the same Claude login as another account/i.test(li.textContent ?? ""));
-    expect(redundantBullets).toHaveLength(2); // per-account, never collapsed
-    // And never the false group-level claim about the two grouped rows.
-    expect(banner.textContent).not.toContain("2 accounts are “Extra”");
+    expect(banner.textContent).toContain("Only 1 account is signed in");
+
+    // POSITIVE 2 — the expired rows really are on screen, still naming their own reason. This is
+    // where the founder's cleanup moved the per-account "why", so it is where the user now reads it.
+    for (const id of ["x1", "x2"]) {
+      const row = await screen.findByTestId(`account-row-${id}`);
+      expect(row.textContent).toContain(EXPIRED_LOGIN_NICKNAME);
+    }
+
+    // THE CLAIM ITSELF — the wrong sentence is nowhere on the screen, not merely absent from the
+    // bullets it used to live in.
+    const text = document.body.textContent ?? "";
+    expect(text).not.toContain("never signed in");
+    expect(text).not.toContain("never been signed in");
   });
 
   it("offers the fix inline: the banner's own add button opens the add form", async () => {
@@ -1942,6 +1548,39 @@ describe("rotation-readiness banner", () => {
     expect(text).not.toContain("Each account is a separate Claude login");
     expect(text).not.toContain("Bars show each account");
     expect(text).not.toContain("never sees your Claude credentials");
+  });
+
+  it("the rotation box shows NO per-account 'counted out' bullets, even with excluded rows present", async () => {
+    // The founder emptied the box (2026-08-21 live session): headline + routing line only. Seed the
+    // exact state that USED to produce bullets — one usable login plus a never-signed-in row and a
+    // same-login duplicate — and assert the box renders no <li> and none of the removed sentences.
+    // Paired with a positive assertion (the headline is present) so it cannot pass by rendering
+    // nothing. Restoring groupExcluded + the <ul> reds this.
+    const UUID = "5fb3d67c-f4ed-417b-9bf2-f9156450eb73";
+    const deps = makeDeps(
+      [
+        acct("a", { nickname: "Real", isDefault: true }),
+        acct("dup", { nickname: "Dupe" }),
+        acct("new", { nickname: PENDING_NICKNAME }),
+      ],
+      [],
+      [
+        signedInAs("a", "drodio@gmail.com", UUID),
+        signedInAs("dup", "drodio@gmail.com", UUID), // same login → would have been a "share one quota" bullet
+        neverLoggedIn("new"), // would have been a "never signed in" bullet
+      ],
+    );
+    render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
+    const banner = await screen.findByTestId("rotation-banner");
+    // Positive control: the box still renders its headline (cannot pass by rendering nothing).
+    expect(banner.textContent).toContain("signed in");
+    // The deletion, asserted on the rendered box: no bullet list, and none of the removed sentences.
+    expect(within(banner).queryAllByRole("listitem")).toHaveLength(0);
+    const t = banner.textContent ?? "";
+    expect(t).not.toContain("never been signed in");
+    expect(t).not.toContain("share one quota");
+    expect(t).not.toContain("no readable email");
+    expect(t).not.toContain("registered but");
   });
 
   it("still reaches the per-row Finish sign-in control the deleted copy pointed at", async () => {

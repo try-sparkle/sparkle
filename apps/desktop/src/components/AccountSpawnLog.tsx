@@ -126,15 +126,19 @@ interface AccountGroup {
   /** The authenticated email where there is one; never the nickname over an email, since the
    *  nickname is user-typed and is evidence of nothing. */
   label: string;
+  /** Number of ledger ENTRIES (selection decisions) recorded for this account. Not shown directly —
+   *  the summary row shows {@link agentCount} — but kept because it is the honest count of the
+   *  per-spawn rows behind the disclosure. */
   count: number;
   /** The NEWEST spawn on this account. Every "as of now" figure on the summary row — the limit
    *  fraction, the last-used time — is read from here, because an older spawn's numbers describe a
    *  machine state that has since moved on. */
   newest: SpawnLogEntry;
-  /** How many distinct reasons appear across this account's spawns. More than one means the
-   *  summary's single reason label is the newest of several, and it has to say so rather than
-   *  presenting one spawn's reason as if it covered all of them. */
-  reasonCount: number;
+  /** DISTINCT agents that ran on this account, by ledger `key` — the number the summary row shows as
+   *  "N agents". NOT `count`: one agent that respawns many times on the non-sticky path writes many
+   *  entries (`accountLedger.shouldLogSelection` only de-dupes sticky keys), so the raw entry count
+   *  overstates how many agents ran. Distinct keys is the honest figure. */
+  agentCount: number;
 }
 
 /** Collapse the ledger to one entry per account, newest account first.
@@ -144,14 +148,16 @@ interface AccountGroup {
  *  injected to be testable. */
 export function groupByAccount(entries: SpawnLogEntry[]): AccountGroup[] {
   const byId = new Map<string, AccountGroup>();
-  const reasons = new Map<string, Set<SelectionReason>>();
+  // accountId → the DISTINCT agent keys seen on it, so the summary can show a true agent count
+  // rather than the raw selection-record count (which double-counts a respawning non-sticky agent).
+  const agents = new Map<string, Set<string>>();
   for (const e of entries) {
     // `null` is a real, distinct group (no account was chosen), not a missing key to be dropped.
     const id = e.accountId ?? " none";
     const existing = byId.get(id);
     if (existing) {
       existing.count += 1;
-      reasons.get(id)!.add(e.reason);
+      agents.get(id)!.add(e.key);
       continue;
     }
     byId.set(id, {
@@ -159,11 +165,11 @@ export function groupByAccount(entries: SpawnLogEntry[]): AccountGroup[] {
       label: e.email ?? e.nickname ?? "no account (used your terminal's login)",
       count: 1,
       newest: e,
-      reasonCount: 1,
+      agentCount: 1,
     });
-    reasons.set(id, new Set([e.reason]));
+    agents.set(id, new Set([e.key]));
   }
-  for (const [id, g] of byId) g.reasonCount = reasons.get(id)!.size;
+  for (const [id, g] of byId) g.agentCount = agents.get(id)!.size;
   return [...byId.values()];
 }
 
@@ -387,17 +393,10 @@ export function AccountSpawnLog({ read = readSpawnLog }: AccountSpawnLogProps) {
           {groups.map((g) => (
             <div key={g.accountId ?? "none"} style={row}>
               <strong style={{ color: g.accountId ? C.cream : C.amberInk }}>{g.label}</strong>
-              {/* "N shown", never a bare total — see SHOW. Deliberately NOT "N of M": this span sits
-                  inside a row labelled with ONE account, so a ratio reads as "this account has M
-                  selections and we are showing N", which is false — M is the whole list. The
-                  caption under the list already names the population and both its caveats. */}
-              <span style={{ color: C.muted }}>{g.count} shown</span>
+              {/* The founder's ask: just the agent count, no "shown", no reason label. DISTINCT agents
+                  (g.agentCount), not the raw selection-record count — see AccountGroup.agentCount. */}
               <span style={{ color: C.muted }}>
-                {REASON_LABEL[g.newest.reason] ?? g.newest.reason}
-                {/* An account whose spawns were chosen for DIFFERENT reasons must not be summarised
-                    as if one reason covered all of them. The count is the honest qualifier: the
-                    label is the newest, and the row says how many it is standing in for. */}
-                {g.reasonCount > 1 && ` (newest of ${g.reasonCount} reasons)`}
+                {g.agentCount} agent{g.agentCount === 1 ? "" : "s"}
               </span>
               {g.newest.fraction != null && (
                 <span style={{ color: g.newest.fraction >= 0.8 ? C.amberInk : C.muted }}>
@@ -426,24 +425,17 @@ export function AccountSpawnLog({ read = readSpawnLog }: AccountSpawnLogProps) {
             onClick={() => setDetailOpen((v) => !v)}
             style={disclosureBtn}
           >
+            {/* The disclosure holds one row PER SPAWN (a selection record), not per account, so it is
+                named for what it contains — "selections", not the founder's loose "accounts", which
+                would read "60 accounts" under two account rows. The summary above is the per-account
+                view. */}
             {detailOpen
-              ? "Hide the individual selections"
+              ? "Hide"
               : entries.length === 1
-                ? "Show the single selection"
-                : `Show each of the ${entries.length} selections`}
+                ? "Show the last selection"
+                : `Show the last ${entries.length} selections`}
           </button>
 
-          {/* WHAT THE NUMBERS ABOVE ACTUALLY COUNT. Both qualifications are load-bearing: the list
-              is truncated to the newest SHOW, and an agent that keeps the account it already had is
-              never re-recorded — so neither figure is a spawn total, and the panel says so instead
-              of letting a reader assume one. */}
-          <div style={{ color: C.muted, fontSize: TYPE.micro, marginTop: 6, lineHeight: 1.45 }}>
-            {entries.length >= SHOW
-              ? `Newest ${SHOW} recorded selections; older ones are not shown.`
-              : `All ${entries.length} recorded selections.`}{" "}
-            An agent that keeps the account it already had is not re-recorded, so these are not
-            spawn totals.
-          </div>
           {detailOpen && (
             <div
               data-testid="spawn-detail-list"

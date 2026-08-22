@@ -256,6 +256,9 @@ describe("AccountSpawnLog", () => {
   it("distinguishes the least-bad fallback from an ordinary pick", async () => {
     const read = vi.fn().mockResolvedValue([entry({ reason: "fallback", candidateIds: [], eligibleCount: 0 })]);
     render(<AccountSpawnLog read={read} />);
+    // The per-spawn REASON is detail now (behind the disclosure), not on the per-account summary row
+    // — the founder removed the summary reason label. Open the disclosure to assert on it.
+    fireEvent.click(await screen.findByRole("button", { name: /show the last selection/i }));
     expect(await screen.findByText(/every account was near its limit/i)).toBeTruthy();
   });
 
@@ -269,7 +272,7 @@ describe("AccountSpawnLog", () => {
     // WHICH agent a spawn was is per-spawn detail, so it lives behind the disclosure now — the
     // summary above it is per-ACCOUNT and both of these ran on the same one. Open it to assert on
     // the naming; the rows are unmounted while collapsed, not merely hidden.
-    fireEvent.click(await screen.findByRole("button", { name: /show each of the 2 selections/i }));
+    fireEvent.click(await screen.findByRole("button", { name: /show the last 2 selections/i }));
 
     expect(screen.getByText("Concierge")).toBeTruthy();
     expect(screen.getByText("Improve Sparkle")).toBeTruthy();

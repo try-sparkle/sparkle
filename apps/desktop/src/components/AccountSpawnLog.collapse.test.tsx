@@ -57,39 +57,21 @@ describe("the ledger shows each account once, not each spawn", () => {
     // The count is what replaces the repetition. Without it the collapse would be hiding data
     // rather than summarising it.
     const summary = labels[0]!.parentElement as HTMLElement;
-    expect(within(summary).getByText("12 shown")).toBeTruthy();
+    expect(within(summary).getByText("12 agents")).toBeTruthy();
   });
 
-  // ── THE COUNT IS NOT A TOTAL, AND MUST NOT READ AS ONE ──────────────────────────────────────
-  // Collapsing replaced a visibly bounded list of dated rows with a bare cardinal number. Two
-  // independent things make that number smaller than the truth, and BOTH are invisible in the
-  // rendering unless the copy names them: the read is capped at SHOW and the Rust side truncates to
-  // it, and the ledger records selection DECISIONS, skipping a sticky key whose answer did not
-  // change. On the founder's machine — one account, hundreds of agents — an unqualified figure
-  // would sit at 25 forever while reading as "25 spawns, ever".
-  it("says the list is capped when it is, rather than presenting the cap as a total", async () => {
-    // Exactly SHOW entries: the only volume `read(SHOW)` can actually return at the boundary, and
-    // the state neither of the other cases in this file reaches.
+  // ── THE "recorded selections" CAPTION IS REMOVED (founder's ask, 2026-08-21 live session) ────
+  // It read "Newest 25 recorded selections; older ones are not shown … not spawn totals". The
+  // founder found it noise and cut it; the account row now carries a bare "N agents" count. This
+  // pins the removal so the caption cannot creep back, and confirms the count still renders. It is
+  // non-vacuous: were the caption present, the queryByText(...).toBeNull() assertions would fail.
+  it("shows a bare agent count and NO 'recorded selections' caption", async () => {
     render(<AccountSpawnLog read={vi.fn(async () => sameAccount(SHOW))} />);
 
-    expect(await screen.findByText(new RegExp(`Newest ${SHOW} recorded selections`))).toBeTruthy();
-    expect(screen.getByText(/older ones are not shown/i)).toBeTruthy();
-    // The de-dupe is the other half, and it applies whether or not the list is capped.
-    expect(screen.getByText(/not re-recorded, so these are not spawn totals/i)).toBeTruthy();
-    // The row is scoped to what is shown and names NO denominator — a ratio inside a row labelled
-    // with one account reads as "this account has M selections", which is false.
-    expect(screen.getByText(`${SHOW} shown`)).toBeTruthy();
-  });
-
-  it("does NOT claim truncation when the whole ledger fits", async () => {
-    // The paired negative. Without it the capped sentence could render unconditionally and the test
-    // above would still pass — the exact vacuity that makes a guard worthless.
-    render(<AccountSpawnLog read={vi.fn(async () => sameAccount(3))} />);
-
-    expect(await screen.findByText(/All 3 recorded selections/)).toBeTruthy();
+    expect(await screen.findByText(`${SHOW} agents`)).toBeTruthy();
+    expect(screen.queryByText(/recorded selections/i)).toBeNull();
     expect(screen.queryByText(/older ones are not shown/i)).toBeNull();
-    // The de-dupe caveat is NOT conditional on truncation — it is true either way.
-    expect(screen.getByText(/not re-recorded, so these are not spawn totals/i)).toBeTruthy();
+    expect(screen.queryByText(/not spawn totals/i)).toBeNull();
   });
 
   it("keeps genuinely different accounts as separate rows, newest-used first", async () => {
@@ -98,18 +80,39 @@ describe("the ledger shows each account once, not each spawn", () => {
     render(
       <AccountSpawnLog
         read={vi.fn(async () => [
-          entry({ accountId: "b", email: "second@example.com", signedInCount: 2 }),
-          entry({ accountId: "a", email: "first@example.com", signedInCount: 2 }),
-          entry({ accountId: "a", email: "first@example.com", signedInCount: 2 }),
+          entry({ accountId: "b", email: "second@example.com", key: "agent-b1", signedInCount: 2 }),
+          // TWO DISTINCT agents on account "a" — the summary shows a distinct-agent count, so two
+          // spawns by ONE agent would read "1 agent", not "2". Distinct keys make it a real 2.
+          entry({ accountId: "a", email: "first@example.com", key: "agent-a1", signedInCount: 2 }),
+          entry({ accountId: "a", email: "first@example.com", key: "agent-a2", signedInCount: 2 }),
         ])}
       />,
     );
 
     expect(await screen.findAllByText("second@example.com")).toHaveLength(1);
     expect(screen.getAllByText("first@example.com")).toHaveLength(1);
-    // Order: `b` was used most recently, so it leads. Two rows, with the counts on the right ones.
-    expect(screen.getByText("2 shown")).toBeTruthy();
-    expect(screen.getByText("1 shown")).toBeTruthy();
+    // Order: `b` was used most recently, so it leads. Two rows, with the DISTINCT-AGENT counts on the
+    // right ones: account "a" had two different agents, "b" had one.
+    expect(screen.getByText("2 agents")).toBeTruthy();
+    expect(screen.getByText("1 agent")).toBeTruthy();
+  });
+
+  it("the account ROW shows the distinct-agent count, not the raw selection count", async () => {
+    // Guards the RENDER's use of g.agentCount (not g.count): three spawns by ONE agent on one account
+    // must read "1 agent", never "3 agents". The groupByAccount unit test covers the pure function;
+    // this pins the JSX at AccountSpawnLog.tsx's row. Reverting the row to {g.count} reds this
+    // (findByText "1 agent" fails and "3 agents" appears).
+    render(
+      <AccountSpawnLog
+        read={vi.fn(async () => [
+          entry({ accountId: "a", key: "agent-1" }),
+          entry({ accountId: "a", key: "agent-1" }),
+          entry({ accountId: "a", key: "agent-1" }),
+        ])}
+      />,
+    );
+    expect(await screen.findByText("1 agent")).toBeTruthy();
+    expect(screen.queryByText("3 agents")).toBeNull();
   });
 
   it("keeps every spawn available behind a disclosure — collapsed is not discarded", async () => {
@@ -117,7 +120,7 @@ describe("the ledger shows each account once, not each spawn", () => {
 
     // Collapsed by default, and UNMOUNTED rather than hidden: 60 rows left in the document would
     // still duplicate every account label and still be paid for on each render.
-    const toggle = await screen.findByRole("button", { name: "Show each of the 60 selections" });
+    const toggle = await screen.findByRole("button", { name: "Show the last 60 selections" });
     expect(toggle.getAttribute("aria-expanded")).toBe("false");
     expect(screen.queryByTestId("spawn-detail-list")).toBeNull();
 
@@ -131,7 +134,7 @@ describe("the ledger shows each account once, not each spawn", () => {
     expect(detail.style.overflowY).toBe("auto");
     expect(parseFloat(detail.style.maxHeight)).toBeGreaterThan(0);
 
-    fireEvent.click(screen.getByRole("button", { name: "Hide the individual selections" }));
+    fireEvent.click(screen.getByRole("button", { name: "Hide" }));
     expect(screen.queryByTestId("spawn-detail-list")).toBeNull();
   });
 });
@@ -162,19 +165,25 @@ describe("groupByAccount", () => {
     expect(groups[0]!.newest.fraction).toBe(0.9);
   });
 
-  it("counts DISTINCT reasons so one spawn's reason is never presented as covering all of them", () => {
-    // A summary row shows a single reason label. When the underlying spawns disagree, the row has
-    // to qualify it — and it can only do that if the grouping counted them.
-    const mixed = groupByAccount([
-      entry({ reason: "auto" }),
-      entry({ reason: "fallback" }),
-      entry({ reason: "auto" }),
+  it("counts DISTINCT agents per account (by ledger key), not raw selection records", () => {
+    // The summary row shows "N agents". One agent that respawns many times on the non-sticky path
+    // writes many ledger entries, so a raw entry count would overstate the agents — the group counts
+    // distinct ledger keys instead.
+    const respawns = groupByAccount([
+      entry({ accountId: "a", key: "agent-1" }),
+      entry({ accountId: "a", key: "agent-1" }),
+      entry({ accountId: "a", key: "agent-1" }),
     ]);
-    expect(mixed[0]!.reasonCount).toBe(2);
+    expect(respawns[0]!.count).toBe(3); // three selection records…
+    expect(respawns[0]!.agentCount).toBe(1); // …but ONE distinct agent
 
-    // The paired negative: unanimous spawns must report 1, or the qualifier renders unconditionally
-    // and the assertion above would pass against a hard-coded value.
-    const unanimous = groupByAccount([entry({ reason: "auto" }), entry({ reason: "auto" })]);
-    expect(unanimous[0]!.reasonCount).toBe(1);
+    // The paired positive: three different agents count as three, so the distinct-key logic is not a
+    // constant-1.
+    const distinct = groupByAccount([
+      entry({ accountId: "a", key: "agent-1" }),
+      entry({ accountId: "a", key: "agent-2" }),
+      entry({ accountId: "a", key: "agent-3" }),
+    ]);
+    expect(distinct[0]!.agentCount).toBe(3);
   });
 });

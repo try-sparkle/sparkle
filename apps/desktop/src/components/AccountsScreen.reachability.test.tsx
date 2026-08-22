@@ -106,9 +106,16 @@ describe("the accounts dialog cannot grow off the screen", () => {
   it("bounds the card to the viewport and scrolls its body, however long the ledger is", async () => {
     await renderDialog(60);
     // All 60 spawns really are accounted for — the bound must come from the card, not from the
-    // panel quietly dropping data. (They collapse to one row per account; the count is the proof
-    // nothing was discarded.)
-    await waitFor(() => expect(screen.getByText("60 shown")).toBeTruthy());
+    // panel quietly dropping data. (They collapse to one row per account; the fixture gives each spawn
+    // a distinct agent key, so the row's distinct-agent count is 60 — proof nothing was discarded.)
+    //
+    // TWO counts, because the panel reports the ledger at two altitudes and each can drop data
+    // independently. The summary row counts DISTINCT AGENTS; the disclosure label counts raw
+    // SELECTION RECORDS — and it is the record list, not the account summary, whose length actually
+    // threatens the card's height. Pinning only the summary would leave the disclosure free to
+    // truncate the very list this test exists to bound.
+    await waitFor(() => expect(screen.getByText("60 agents")).toBeTruthy());
+    expect(screen.getByText("Show the last 60 selections")).toBeTruthy();
 
     const body = screen.getByTestId("modal-shell-body");
 

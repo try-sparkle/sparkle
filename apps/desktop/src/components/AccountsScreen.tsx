@@ -16,7 +16,6 @@ import {
   removeAccount,
   accountDisplay,
   forkNotice,
-  identityChanged,
   duplicateAccountGroups,
   loginSiblingIds,
   identityKey,
@@ -53,7 +52,6 @@ import {
   getAccountUsageLive,
   type AccountUsageLive,
 } from "../services/accountUsage";
-import { checkSpendGateForAccounts } from "../services/advisor/spendGate";
 import {
   checkClaudeAuthStatus,
   authIsDefinitelyExpired,
@@ -67,7 +65,6 @@ import {
   collapsedRunningAgents,
   signInStalled,
   PENDING_NICKNAME,
-  EXPIRED_LOGIN_NICKNAME,
   STALLED_SIGN_IN_TITLE,
   SIGN_IN_STALL_SECONDS,
 } from "./accountsView";
@@ -413,151 +410,20 @@ function LiveUsageSection({
         resetsAt={live.sevenDayResetsAt}
         now={now}
       />
-      <MeterLine live={live} />
+      {/* The "Billing: subscription / usage credits disarmed" MeterLine was REMOVED at the founder's
+          instruction (2026-08-21 live session) — the billing/credit lines were noise on this screen.
+          The usage bars stay; the credits meter still gates advisor passes in spendGate.ts. */}
     </div>
   );
 }
 
-/** THE FLEET ANSWER: will an advisor pass run at all, right now?
- *
- *  `MeterLine` below states one ACCOUNT's meter. This states the thing a human actually wants to
- *  know, and the two are not the same question — which is the trap this component exists to close.
- *
- *  Production asks `checkSpendGateForAccounts`, which folds EVERY registered account and requires
- *  UNANIMITY: the first account that cannot prove its credits are disarmed refuses for the whole
- *  fleet. So a card reading "usage credits disarmed" proves nothing on its own, and two reachable
- *  states were being reported as though it did — a sibling with credits ARMED, and a sibling whose
- *  usage read FAILED (which renders "Real usage unavailable" and mounts no meter line at all, so
- *  nothing anywhere on the screen said the advisor was off).
- *
- *  It calls the SAME function production calls rather than re-deriving the rule. A second copy of a
- *  unanimity fold is exactly the drift that would put a reassuring sentence on screen while every
- *  pass silently refuses — the failure this whole surface exists to prevent.
- *
- *  An account still loading contributes nothing; one that ERRORED contributes `null`, which the
- *  gate reads as unreadable and refuses on, matching production, where a rejected read is a refusal
- *  rather than an abstention. */
-function AdvisorGateLine({
-  liveByAccount,
-}: {
-  liveByAccount: readonly (AccountUsageLive | "error" | undefined)[];
-}) {
-  const payloads = liveByAccount
-    .filter((l) => l !== undefined)
-    .map((l) => (l === "error" ? null : l));
-  if (payloads.length === 0) return null;
-  const verdict = checkSpendGateForAccounts(payloads);
-  const why =
-    verdict.allowed === true
-      ? null
-      : verdict.reason === "credits-armed"
-        ? "an account has usage credits armed, so a pass could bill outside the subscription"
-        : verdict.reason === "spend-limit-reached"
-          ? "an account reports its credit spend limit reached"
-          : verdict.reason === "usage-unreadable"
-            ? "an account's usage could not be read, and an unreadable meter is not permission"
-            : "an account did not report its usage-credits meter";
-  return (
-    <div
-      data-testid="advisor-gate-line"
-      style={{
-        ...card,
-        fontSize: 12,
-        color: why ? C.dangerInk : C.muted,
-        marginBottom: 8,
-      }}
-    >
-      {why ? `Advisor passes are SKIPPING — ${why}.` : "Advisor passes can run — all accounts have usage credits disarmed."}
-    </div>
-  );
-}
+// The fleet-level `AdvisorGateLine` ("Advisor passes are SKIPPING — …" / "Advisor passes can run
+// — …") was REMOVED at the founder's instruction (2026-08-21 live session): the message was
+// unintelligible to users and, as a top-of-view banner, disconnected from the account that caused
+// it. Its unanimity fold (`checkSpendGateForAccounts`) still gates advisor passes in production
+// (services/advisor/spendGate.ts) — only the on-screen sentence is gone.
 
-/** WHICH BILLING METER this account is spending against, in one plain line under the bars.
- *
- *  The two bars above are the SUBSCRIPTION windows, and for a long time they were the whole story
- *  the screen could tell — the usage-credits meter was fetched and thrown away by the parser. So an
- *  account spending pay-as-you-go credits looked identical to one on subscription alone, and the
- *  first anyone learned of a spend limit was a fleet of agents stalling against it. The point of
- *  this line is that a human sees it BEFORE that, not after.
- *
- *  Driven off the RAW TRI-STATE, not `summarizeMeter`, and IN THE GATE'S OWN ORDER. The summary
- *  folds absent / `null` / `isEnabled: false` together as "subscription", which is right for a
- *  status pill and wrong here: `services/advisor/spendGate.ts` treats those as opposite outcomes.
- *
- *  The order is the subtle half, and getting it wrong is what a first cut of this line did. The
- *  gate checks `spendLimitReached` BEFORE the `isEnabled` gate, so a DISARMED meter at its spend
- *  limit still refuses — yet reading the warning off the summary while the label read the
- *  tri-state rendered that case as a plain, unqualified "subscription", which under this line's own
- *  contract is the one reading that means a pass is permitted. Most reassuring in a refusing state
- *  is precisely the failure this exists to prevent, so the whole line derives from one verdict that
- *  mirrors the gate rather than from two independent reads.
- *
- *  It also distinguishes NO METER BLOCK from a block that did not say whether it is armed. Both
- *  refuse, but only the first can honestly be called "not reported" — a payload carrying
- *  `spendLimitReached: true` with a null `isEnabled` plainly did report a meter, and saying
- *  otherwise one line above a definite statement about that meter's ceiling contradicts itself. */
-function MeterLine({ live }: { live: AccountUsageLive }) {
-  const extra = live.extraUsage ?? null;
-  const armed = extra?.isEnabled;
-  const limitReached = extra?.spendLimitReached === true;
-  const credits = extra?.usedCredits ?? null;
-  const monthly = extra?.monthlyLimit ?? null;
 
-  // ONE derivation, in `spendGate.ts`'s order: spend limit, then armed, then disarmed (the only
-  // permitting state), then unreadable.
-  //
-  // Worded as a fact about THIS ACCOUNT, never as a verdict about whether advisor passes run. That
-  // distinction is not pedantry: production asks `checkSpendGateForAccounts`, which requires
-  // UNANIMITY across every registered account, so one disarmed account proves nothing on its own —
-  // a sibling with credits armed, or one whose usage read failed, refuses for the whole fleet. An
-  // earlier cut said "Advisor passes skip here — …" and rendered NOTHING on a permitting card,
-  // which made silence a fleet-wide permission claim this line cannot support. The fleet answer is
-  // `AdvisorGateLine`, rendered once above the cards from the same fold production uses.
-  const accountNote =
-    limitReached
-      ? "credit spend limit reported reached"
-      : armed === true
-        ? "usage credits armed"
-        : armed === false
-          ? "usage credits disarmed"
-          : extra == null
-            ? "no credits meter reported"
-            : "credits meter did not say whether it is armed";
-
-  // Credit figures belong ONLY beside the credits label. The Rust type makes every field its own
-  // `Option`, so a meter disabled part-way through a month arrives as `isEnabled: false` with
-  // `usedCredits` still populated — and rendering that as "subscription · 47.50 of 200 used"
-  // asserts one meter while displaying the other's spend, the exact confusion this removes.
-  const usedText =
-    armed !== true || credits == null
-      ? null
-      : monthly == null
-        ? `${formatCredits(credits)} in credits used this month`
-        : `${formatCredits(credits)} of ${formatCredits(monthly)} credits used this month`;
-
-  return (
-    <div style={{ marginTop: 6, fontSize: TYPE.small, color: C.muted }}>
-      <span>
-        Billing: {armed === true ? "usage credits" : "subscription"}
-        {usedText ? ` · ${usedText}` : ""}
-      </span>
-      {limitReached && (
-        <div style={{ color: C.dangerInk, marginTop: 2 }}>
-          Credit spend limit reached — usage credits will not cover new agents.
-        </div>
-      )}
-      <div style={{ color: limitReached ? C.dangerInk : C.muted, marginTop: 2 }}>
-        This account: {accountNote}.
-      </div>
-    </div>
-  );
-}
-
-/** Credits as a plain figure: whole numbers stay whole, fractions keep two places. Never a
- *  fabricated value — the caller has already established the figure is non-null. */
-function formatCredits(n: number): string {
-  return Number.isInteger(n) ? String(n) : n.toFixed(2);
-}
 
 function exhaustedLabel(usage: Usage | undefined, now: number): string | null {
   if (!usage?.exhaustedUntil || usage.exhaustedUntil <= now) return null;
@@ -591,30 +457,6 @@ function noticeCard(ink: string): CSSProperties {
  *  Counting is delegated to {@link rotationReadiness}, which derives signed-in-ness from the same
  *  predicate selection uses and sameness from the canonical grouping. This component only renders. */
 
-/** Build the "counted out" bullets for ONE reason bucket, collapsing accounts that share a nickname.
- *
- *  A single account keeps the `singular` sentence naming it. Two-or-more accounts with the SAME
- *  nickname — the generic placeholders "Signing in…" / "Login expired — reconnect" are shared by
- *  every not-signed-in / expired account — collapse to ONE `plural` sentence with a count, instead of
- *  repeating a byte-identical line per account (which also collided on the React `key`). Distinct
- *  nicknames within the bucket stay separate: they are already tellable apart. Each returned `key` is
- *  the group's account ids joined, so it is stable and unique even when two buckets share a nickname. */
-function groupExcluded(
-  accounts: Account[],
-  singular: (nickname: string) => string,
-  plural: (count: number, nickname: string) => string,
-): { key: string; text: string }[] {
-  const byNickname = new Map<string, Account[]>();
-  for (const a of accounts) {
-    const group = byNickname.get(a.nickname);
-    if (group) group.push(a);
-    else byNickname.set(a.nickname, [a]);
-  }
-  return [...byNickname.values()].map((group) => ({
-    key: group.map((a) => a.id).join(","),
-    text: group.length === 1 ? singular(group[0]!.nickname) : plural(group.length, group[0]!.nickname),
-  }));
-}
 
 function RotationBanner({
   readiness,
@@ -646,48 +488,6 @@ function RotationBanner({
         ? `Every agent will run on ${nameOf(readiness.usable[0]!)} until it hits its limit. Sign in another account to enable rotation.`
         : `New agents go to whichever of ${readiness.usable.map(nameOf).join(", ")} has the most room left.`;
 
-  // Registrations that are counted OUT, named one by one. This is the state that is invisible today:
-  // a config dir that was created but never signed into renders as an ordinary row, so two rows read
-  // as two accounts. Each sentence says which registration and WHY it doesn't count.
-  //
-  // COLLAPSE IDENTICAL PLACEHOLDERS. The only bucket with a shared placeholder is `notSignedIn`, which
-  // holds BOTH "Signing in…" ({@link PENDING_NICKNAME}) and "Login expired — reconnect"
-  // ({@link EXPIRED_LOGIN_NICKNAME}) — the Rust producer nulls email AND accountUuid together for an
-  // expired login (its `oauthAccount` was cleared), so `rotationReadiness` files it here, NOT under
-  // `noEmail` (roborev 67153/67154 corrected the earlier claim). Two accounts sharing one of these
-  // placeholders used to render byte-identical bullets — the same sentence twice, and a React `key`
-  // collision — so we group by nickname and say a shared placeholder ONCE with a count.
-  //
-  // …but the SENTENCE must match WHY the row is out: an expired login is not "never signed in" (that
-  // contradicts the nickname it quotes and points at the wrong remedy). So the copy branches on the
-  // expired placeholder. Distinct nicknames stay on their own line.
-  //
-  // `redundant` is NOT collapsed (roborev 66907): its rows are signed in with real emails, carry no
-  // shared placeholder, and two same-nickname rows can duplicate two DIFFERENT logins — so a plural
-  // "they share one quota" would assert a relationship that need not hold. Per-account bullets, keyed on
-  // the id. `noEmail` is likewise per-account: `list_account_identities` nulls email and accountUuid
-  // together, so no production row reaches it with a readable-uuid-but-no-email shape — collapsing a
-  // bucket nothing reaches would be a claim about an unreachable state.
-  const notSignedInSingular = (nick: string) =>
-    nick === EXPIRED_LOGIN_NICKNAME
-      ? `“${nick}” — its Claude login expired; reconnect it to route agents there.`
-      : `“${nick}” is registered but has never been signed in, so it cannot receive agents.`;
-  const notSignedInPlural = (count: number, nick: string) =>
-    nick === EXPIRED_LOGIN_NICKNAME
-      ? `${count} accounts show “${nick}” — their Claude login expired; reconnect them to route agents there.`
-      : `${count} accounts are still “${nick}” — registered but never signed in, so they cannot receive agents.`;
-  const excluded = [
-    ...groupExcluded(readiness.notSignedIn, notSignedInSingular, notSignedInPlural),
-    ...readiness.redundant.map((a) => ({
-      key: a.id,
-      text: `“${a.nickname}” is the same Claude login as another account, so they share one quota and count as one.`,
-    })),
-    ...readiness.noEmail.map((a) => ({
-      key: a.id,
-      text: `“${a.nickname}” has a Claude login with no readable email, so Sparkle cannot route agents to it.`,
-    })),
-  ];
-
   return (
     <div data-testid="rotation-banner" role="status" style={noticeCard(ink)}>
       <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 13, fontWeight: 600 }}>
@@ -695,13 +495,11 @@ function RotationBanner({
         {headline}
       </div>
       <div style={{ marginTop: 4 }}>{body}</div>
-      {excluded.length > 0 && (
-        <ul style={{ margin: "6px 0 0", paddingLeft: 18 }}>
-          {excluded.map((line) => (
-            <li key={line.key}>{line.text}</li>
-          ))}
-        </ul>
-      )}
+      {/* The per-account "counted out" bullets ("Signing in… is registered but never signed in",
+          "Login expired — reconnect … same login", etc.) were REMOVED from the rotation box at the
+          founder's instruction (2026-08-21 live session): the terminology was unclear and the box
+          should be a simple non-scrolling headline + routing line. WHY each account is out of rotation
+          now belongs on that account's own row (the per-account rotation status — a later chunk). */}
       {!rotates && (
         <button type="button" style={{ ...primaryBtn, marginTop: 8 }} onClick={onAdd}>
           <FiUserPlus size={12} aria-hidden style={{ verticalAlign: "-1px", marginRight: 4 }} />
@@ -1769,10 +1567,10 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
       {/* The "lists below cover agents with an open tab in this window…" coverage caption was
           removed (overhaul item 7) at the founder's instruction. */}
 
-      {/* One fleet-level statement, above the cards, because the gate is a fleet-level fact — see
-          `AdvisorGateLine`. Rendered before the per-account meters so a human reads "are passes
-          running" before "what is this one account's meter", which is the order they care about. */}
-      <AdvisorGateLine liveByAccount={orderedAccounts.map((a) => liveUsage[a.id])} />
+      {/* The fleet-level "Advisor passes are SKIPPING — …" line was REMOVED at the founder's
+          instruction (2026-08-21 live session): the message was unintelligible to users and, being a
+          top-of-view banner, disconnected from the account that caused it. Any error now belongs on
+          the specific account row where it occurred. */}
 
       {orderedAccounts.map((a) => {
         const u = usageFor(a.id);
@@ -1992,18 +1790,8 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
 
                 Sparkle cannot PREVENT a terminal login to the user's own config; making it visible
                 where it is looked for is the achievable fix. */}
-            {identityChanged(identity) && (
-              <div
-                data-testid={`account-identity-changed-${a.id}`}
-                style={{ marginTop: 8, fontSize: 12, color: C.amber }}
-              >
-                <strong>This account&rsquo;s folder was signed into a different Claude account
-                recently.</strong>{" "}
-                {a.isDefault
-                  ? "The default account is your real ~/.claude, shared with your terminal — a `claude` login there changes who this account is."
-                  : "Its usage figures may have been measured against the previous login."}
-              </div>
-            )}
+            {/* The "This account's folder was signed into a different Claude account recently" notice
+                was REMOVED at the founder's instruction (2026-08-21 live session). */}
             {forkNotice(display) && (
               <div
                 data-testid={`account-fork-notice-${a.id}`}
