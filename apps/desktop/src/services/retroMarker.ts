@@ -171,19 +171,113 @@ export function buildRetroMarker(retro: Retro): string {
   return `${RETRO_MARKER_PREFIX}${json}${RETRO_MARKER_SUFFIX}`;
 }
 
-/** Recover a retro from a PR body. Returns the LAST well-formed `<!-- sparkle:retro {json} -->`
- *  marker (an updated PR may carry more than one; the last is the freshest), or null when none is
- *  present or valid. Never throws. */
+/** A stable JSON serialization (object keys sorted recursively) used only to compare payloads for
+ *  DISTINCTNESS, so a re-serialized identical retro (different key order / whitespace) collapses to
+ *  one instead of triggering a spurious refusal. Mirrors `jq -Sc` on the shell side. */
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (value !== null && typeof value === "object") {
+    const obj = value as Record<string, unknown>;
+    const keys = Object.keys(obj).sort();
+    return `{${keys.map((k) => `${JSON.stringify(k)}:${canonicalJson(obj[k])}`).join(",")}}`;
+  }
+  return JSON.stringify(value ?? null);
+}
+
+/** Recover a retro from a PR body. Returns the sole well-formed `<!-- sparkle:retro {json} -->`
+ *  marker's retro, or null.
+ *
+ *  AUTHORSHIP AMBIGUITY (bead sparkle-h16j26): a body carrying MORE THAN ONE *distinct* valid marker
+ *  is REFUSED (returns null) rather than guessing which is this PR's own. A shared-temp collision or a
+ *  foreign re-append can leave a second agent's marker behind, and picking one would file the wrong
+ *  agent's retro. Identical duplicates (the same retro re-appended, even re-serialized) collapse to
+ *  one and are returned.
+ *
+ *  Both the EXTRACTION and the DISTINCTNESS predicate MUST mirror extract_retro_marker in
+ *  scripts/capture-merge-retro.sh, or the two disagree about whether a second marker "counts":
+ *   - EXTRACTION is PARSE-DRIVEN, PERMISSIVE IN LOCATION and STRICT IN PAYLOAD. Scanning left to
+ *     right, at each prefix it looks on the payload's line for the LONGEST `{…}` — starting at ANY
+ *     `{`, ending at a `}` + blanks + `-->` — that actually PARSES as JSON with an array `painPoints`,
+ *     then advances PAST its terminator so a prefix / `-->` / `} -->` inside the payload is not
+ *     re-read. Permissive location is the SAFE direction: an own marker with an odd prefix (a newline
+ *     before its payload — `\s` in the prefix regex — or stray text before the `{`) STILL counts, so
+ *     beside a foreign marker it triggers REFUSAL rather than letting the foreign retro be the lone
+ *     survivor (round 5 regressed exactly this by narrowing the predicate). A heuristic split cannot
+ *     do this: the marker is LLM-hand-authored, so its payload can legitimately contain `-->`,
+ *     `} -->`, or the marker prefix itself (this subsystem's own retros quote all three).
+ *   - The DISTINCTNESS predicate is STRICT IN PAYLOAD but loose on schema — a slice counts if it
+ *     parses as JSON with an array `painPoints`. This keeps a doc placeholder `{json}` from counting
+ *     (it is not JSON) while still counting an off-schema real payload, matching the shell's
+ *     `select((.painPoints|type)=="array")`. Full schema validation (`parseRetro`) is applied only to
+ *     the single survivor. Never throws. */
+/** Fold every Unicode-space codepoint JS `\s` matches (beyond ASCII) to a plain space, so an
+ *  odd-space-separated marker still counts. MUST match the shell's byte-replacement list in
+ *  extract_retro_marker (capture-merge-retro.sh) — after this, both scan identical ASCII whitespace,
+ *  independent of locale. */
+function foldUnicodeSpaces(s: string): string {
+  return s.replace(/[\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff]/g, " ");
+}
+
 export function parseRetroMarker(prBody: string): Retro | null {
   if (typeof prBody !== "string" || !prBody) return null;
-  // Non-greedy body, stopping at the first " -->", so nested JSON braces are captured intact.
-  const re = /<!--\s*sparkle:retro\s+([\s\S]*?)\s*-->/g;
-  let match: RegExpExecArray | null;
-  let last: string | null = null;
-  while ((match = re.exec(prBody)) !== null) last = match[1] ?? null;
-  if (last == null) return null;
+  const text = foldUnicodeSpaces(prBody);
+  // ASCII whitespace only (Unicode spaces folded above) — byte-identical to the shell mirror.
+  const prefixRe = /<!--[ \t\n\v\f\r]*sparkle:retro[ \t\n\v\f\r]+/g;
+  const distinctValid = new Set<string>();
+  let firstRaw: string | null = null;
+  let consumedTo = 0; // end offset of the last accepted payload — skip prefixes inside it
+  let pm: RegExpExecArray | null;
+  while ((pm = prefixRe.exec(text)) !== null) {
+    const payloadStart = pm.index + pm[0].length;
+    if (payloadStart < consumedTo) continue; // this prefix sits inside an already-accepted payload
+    // `split` always yields at least one element, but `noUncheckedIndexedAccess` cannot know that;
+    // `?? ""` states it without changing behaviour (an empty remainder yields "" either way).
+    const line = text.slice(payloadStart).split("\n", 1)[0] ?? "";
+    // Collect end offsets ONCE (not rescanned per `{`), then try each `{` start EARLIEST first, taking
+    // the LONGEST slice ending at `}[ \t]*-->` that parses as a retro. Take the FIRST `{` start that
+    // yields one. Earliest-first keeps two same-line markers apart (the first prefix parses at its own
+    // `{`, never reaching the next marker's); backing off to a later `{` tolerates stray text — even a
+    // brace — before the real payload.
+    const ends: Array<{ brace: number; after: number }> = [];
+    for (const em of line.matchAll(/\}[ \t]*-->/g)) ends.push({ brace: em.index, after: em.index + em[0].length });
+    let best: string | null = null;
+    let bestEnd = -1;
+    for (let j = line.indexOf("{"); j >= 0 && best === null; j = line.indexOf("{", j + 1)) {
+      for (let e = ends.length - 1; e >= 0; e--) {
+        // ends ascending by position → iterate descending for LONGEST slice at this start first.
+        // Bound into a local: the loop is bounds-checked, but `noUncheckedIndexedAccess` types every
+        // `ends[e]` as possibly-undefined, and re-indexing repeats the claim at each use.
+        const end = ends[e];
+        if (end === undefined || end.brace <= j) continue;
+        const candidate = line.slice(j, end.brace + 1);
+        let obj: unknown;
+        try {
+          obj = JSON.parse(candidate);
+        } catch {
+          continue;
+        }
+        // STRICT-IN-PAYLOAD predicate — identical to the shell's `select((.painPoints|type)=="array")`.
+        if (obj !== null && typeof obj === "object" && Array.isArray((obj as { painPoints?: unknown }).painPoints)) {
+          best = candidate;
+          bestEnd = payloadStart + end.after;
+          break; // longest valid at this (earliest) start — stop
+        }
+      }
+    }
+    if (best != null) {
+      const norm = canonicalJson(JSON.parse(best));
+      if (!distinctValid.has(norm)) {
+        distinctValid.add(norm);
+        if (firstRaw == null) firstRaw = best;
+      }
+      consumedTo = bestEnd; // advance past this payload's terminator
+    }
+  }
+  // Exactly one distinct valid marker is trustworthy; zero or more-than-one is null. The survivor
+  // still has to pass full schema validation before we hand it back.
+  if (distinctValid.size !== 1 || firstRaw == null) return null;
   try {
-    return parseRetro(JSON.parse(last));
+    return parseRetro(JSON.parse(firstRaw));
   } catch {
     return null;
   }

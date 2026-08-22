@@ -109,11 +109,152 @@ describe("buildRetroMarker / parseRetroMarker — single-line PR-body marker rou
     expect(parseRetroMarker("")).toBeNull();
   });
 
-  it("returns the LAST marker when a PR body carries more than one", () => {
+  // AUTHORSHIP AMBIGUITY (bead sparkle-h16j26) — mirrors capture-merge-retro.sh tests 8b/8b2/8b3.
+  it("refuses (returns null) when a PR body carries two DISTINCT valid markers", () => {
     const first = buildRetroMarker({ ...sample, percentComplete: 40 });
     const second = buildRetroMarker({ ...sample, percentComplete: 100 });
-    const recovered = parseRetroMarker(`${first}\nsome edit later\n${second}`);
-    expect(recovered?.percentComplete).toBe(100);
+    // A shared-temp collision or foreign re-append left a second agent's marker: picking either
+    // one would file the wrong agent's retro, so the ambiguous body is refused outright.
+    expect(parseRetroMarker(`${first}\nsome edit later\n${second}`)).toBeNull();
+  });
+
+  it("still returns the retro when IDENTICAL markers are repeated (benign re-append)", () => {
+    const marker = buildRetroMarker({ ...sample, percentComplete: 55 });
+    const recovered = parseRetroMarker(`${marker}\nprose\n${marker}`);
+    expect(recovered?.percentComplete).toBe(55);
+  });
+
+  it("ignores a doc placeholder marker and returns the one real marker", () => {
+    const marker = buildRetroMarker(sample);
+    // The literal `<!-- sparkle:retro {json} -->` documentation placeholder does not parse as a
+    // retro, so it does not count toward distinctness and must not trigger a refusal.
+    const prBody = `See the format: <!-- sparkle:retro {json} -->\n\n${marker}`;
+    expect(parseRetroMarker(prBody)).toEqual(sample);
+  });
+
+  // Distinctness uses the SAME loose predicate as capture-merge-retro.sh (JSON + array painPoints),
+  // NOT the strict schema — otherwise an off-schema own marker beside a well-formed foreign one
+  // would be refused by the shell but accepted here, the exact mis-attribution the guard prevents.
+  it("refuses an off-schema (painPoints-only) marker beside a well-formed foreign one", () => {
+    // The exact mis-attribution scenario: this PR's OWN marker is off-schema (painPoints-only, no
+    // tldr — plausible LLM-authored JSON), and a shared-temp collision left a well-formed FOREIGN
+    // marker. Under a STRICT distinctness predicate only the foreign one counts (size 1) and it is
+    // returned — the bug. Under the LOOSE predicate (matching the shell) both count (size 2) → null.
+    const offSchema = '<!-- sparkle:retro {"painPoints":[{"summary":"mine","severity":2,"recommendation":"x"}]} -->';
+    const foreign = buildRetroMarker({ ...sample, tldr: "someone else's work" });
+    expect(parseRetroMarker(`${offSchema}\ncollision\n${foreign}`)).toBeNull();
+  });
+
+  it("collapses re-serialized identical retros (different key order) instead of refusing", () => {
+    const a = '<!-- sparkle:retro {"tldr":"t","percentComplete":90,"estCompletionMin":30,"details":["d"],"painPoints":[{"summary":"s","severity":2,"recommendation":"r"}]} -->';
+    const b = '<!-- sparkle:retro {"painPoints":[{"recommendation":"r","severity":2,"summary":"s"}],"details":["d"],"estCompletionMin":30,"percentComplete":90,"tldr":"t"} -->';
+    // Same retro, keys in a different order — canonicalization makes them one marker, not two.
+    const recovered = parseRetroMarker(`${a}\nedit\n${b}`);
+    expect(recovered?.tldr).toBe("t");
+    expect(recovered?.painPoints).toHaveLength(1);
+  });
+
+  // Extraction must mirror the shell: capture to the LAST `} -->` on the line, so a payload whose
+  // prose contains `-->` or even `} -->` is captured whole rather than truncated at the first `-->`.
+  it("captures a payload whose string contains `-->` / `} -->` whole (mirrors shell 8b7/8b9)", () => {
+    const raw = { ...sample, tldr: "we split at the real } --> terminator now" };
+    const marker = `<!-- sparkle:retro ${JSON.stringify(raw)} -->`;
+    expect(marker.includes("-->", RETRO_MARKER_PREFIX.length)).toBe(true); // the payload really has it
+    const recovered = parseRetroMarker(`prose\n${marker}\nmore prose`);
+    expect(recovered?.tldr).toBe("we split at the real } --> terminator now");
+  });
+
+  it("still refuses when a `-->`-bearing own marker sits beside a foreign one (no mis-attribution)", () => {
+    const own = `<!-- sparkle:retro ${JSON.stringify({ ...sample, tldr: "mine } --> x" })} -->`;
+    const foreign = `<!-- sparkle:retro ${JSON.stringify({ ...sample, tldr: "not mine" })} -->`;
+    // Both extract whole → two distinct valid markers → ambiguous → refuse (never return foreign).
+    expect(parseRetroMarker(`${own}\ncollision\n${foreign}`)).toBeNull();
+  });
+
+  // Parse-driven extraction: prose AFTER the marker containing `} -->` must not over-capture (the
+  // longest candidate that PARSES wins, so `{…}` beats `{…} --> prose }`).
+  it("ignores trailing prose containing `} -->` on the marker's line", () => {
+    const marker = buildRetroMarker(sample);
+    const recovered = parseRetroMarker(`${marker} note: we split at the real } --> terminator now`);
+    expect(recovered).toEqual(sample);
+  });
+
+  it("refuses when a trailing-`} -->`-prose own marker sits beside a foreign one", () => {
+    const own = `${buildRetroMarker({ ...sample, tldr: "mine" })} aside } --> x`;
+    const foreign = buildRetroMarker({ ...sample, tldr: "not mine" });
+    expect(parseRetroMarker(`${own}\n${foreign}`)).toBeNull();
+  });
+
+  // The marker PREFIX quoted inside a payload string must not be treated as a second marker start.
+  it("captures a payload whose string quotes the marker prefix, whole", () => {
+    const raw = { ...sample, tldr: "docs quote <!-- sparkle:retro {json} --> verbatim" };
+    const marker = `<!-- sparkle:retro ${JSON.stringify(raw)} -->`;
+    const recovered = parseRetroMarker(`intro\n${marker}\noutro`);
+    expect(recovered?.tldr).toBe("docs quote <!-- sparkle:retro {json} --> verbatim");
+  });
+
+  it("refuses when a prefix-quoting own marker sits beside a foreign one", () => {
+    const own = `<!-- sparkle:retro ${JSON.stringify({ ...sample, tldr: "quote <!-- sparkle:retro {x} --> end" })} -->`;
+    const foreign = buildRetroMarker({ ...sample, tldr: "foreign" });
+    expect(parseRetroMarker(`${own}\n${foreign}`)).toBeNull();
+  });
+
+  // A real marker sharing a line AFTER a placeholder must still be found (the scan keeps going past
+  // a prefix whose payload did not parse) — mirrors shell 8b14.
+  it("finds a real marker that shares a line after a doc placeholder", () => {
+    const marker = buildRetroMarker(sample);
+    expect(parseRetroMarker(`see <!-- sparkle:retro {json} --> and the real one ${marker}`)).toEqual(sample);
+  });
+
+  // PERMISSIVE LOCATION (mirror of shell 8b15): stray text or a newline between the prefix and the
+  // payload's `{` must NOT stop the marker from counting — the SAFE direction, so such a marker still
+  // triggers refusal beside a foreign one instead of letting the foreign retro be the lone survivor.
+  it("captures an own marker with stray text before its `{` (permissive location)", () => {
+    const raw = { ...sample, tldr: "junk-prefixed" };
+    expect(parseRetroMarker(`<!-- sparkle:retro RETRO ${JSON.stringify(raw)} -->`)?.tldr).toBe("junk-prefixed");
+  });
+
+  it("refuses when a stray-text-prefixed own marker sits beside a foreign one", () => {
+    const own = `<!-- sparkle:retro RETRO ${JSON.stringify({ ...sample, tldr: "mine" })} -->`;
+    const foreign = buildRetroMarker({ ...sample, tldr: "foreign" });
+    expect(parseRetroMarker(`${own}\n${foreign}`)).toBeNull();
+  });
+
+  it("captures an own marker whose payload sits on the line after the prefix (newline wrap)", () => {
+    const raw = { ...sample, tldr: "newline-wrapped" };
+    expect(parseRetroMarker(`<!-- sparkle:retro\n${JSON.stringify(raw)} -->`)?.tldr).toBe("newline-wrapped");
+  });
+
+  it("refuses when a newline-wrapped own marker sits beside a foreign one", () => {
+    const own = `<!-- sparkle:retro\n${JSON.stringify({ ...sample, tldr: "mine" })} -->`;
+    const foreign = buildRetroMarker({ ...sample, tldr: "foreign" });
+    expect(parseRetroMarker(`${own}\n${foreign}`)).toBeNull();
+  });
+
+  // Stray text CONTAINING a brace before the payload: back off to the next `{` (mirror of shell 8b17).
+  it("backs off past a brace in stray text to capture the real payload", () => {
+    const raw = { ...sample, tldr: "brace-in-junk" };
+    expect(parseRetroMarker(`<!-- sparkle:retro v2 {schema} ${JSON.stringify(raw)} -->`)?.tldr).toBe("brace-in-junk");
+  });
+
+  it("refuses when a brace-in-junk own marker sits beside a foreign one", () => {
+    const own = `<!-- sparkle:retro v2 {schema} ${JSON.stringify({ ...sample, tldr: "mine" })} -->`;
+    const foreign = buildRetroMarker({ ...sample, tldr: "foreign" });
+    expect(parseRetroMarker(`${own}\n${foreign}`)).toBeNull();
+  });
+
+  // Unicode-space separators (U+00A0 etc.) are FOLDED to a space on both sides, so an odd-space
+  // marker still counts (the safe direction). MUST match the shell's byte-fold list.
+  it("folds a Unicode-space (U+00A0) separator so the marker still counts", () => {
+    const raw = { ...sample, tldr: "nbsp-separated" };
+    const marker = "<!-- sparkle:retro\u00a0" + JSON.stringify(raw) + " -->";
+    expect(parseRetroMarker(marker)?.tldr).toBe("nbsp-separated");
+  });
+
+  it("refuses when a Unicode-space-separated own marker sits beside a foreign one", () => {
+    const own = "<!-- sparkle:retro\u00a0" + JSON.stringify({ ...sample, tldr: "mine" }) + " -->";
+    const foreign = buildRetroMarker({ ...sample, tldr: "foreign" });
+    expect(parseRetroMarker(own + "\n" + foreign)).toBeNull();
   });
 });
 
