@@ -220,6 +220,37 @@ pub fn holds_unlanded_work(stage: &str) -> bool {
 /// evidence in the module, resting on two frontend-written facts, so it earns the lower level.
 const UNLANDED_STALL_SECS: u64 = 1800;
 
+/// How long a reply-driven `Standdown::Done` may hold while the agent stays SILENT before the
+/// concierge is told, in seconds.
+///
+/// ── THE ONE BRANCH THAT HAD NO EXIT (bead sparkle-3a6di0) ─────────────────────────────────────
+/// `Standdown::Done` is what a `not-blocked` reply produces. It raises NO flag and permits NO
+/// writes, and until now its ONLY release was UNPROVOKED OUTPUT. A genuinely wedged agent does not
+/// produce unprovoked output — so an agent that answered `not-blocked` and then went silent was
+/// never re-checked and never surfaced. The nudge ladder converted a silent stall into a politer,
+/// well-documented stall: legible, and zero improvement in throughput, which is exactly what the
+/// founder observed ("helping, but still not working"). Every OTHER stand-down already has an exit
+/// — `AwaitHuman`/`LoginExpired` flag at once, `Quota`/`NoTask`/`OutOfContext` flag the concierge,
+/// `External` keeps climbing to the terminal rung — leaving this the sole silent-in-both-directions
+/// hole.
+///
+/// So a silent `not-blocked` claim gets a TIME bound as well as the output one: after this long
+/// with no output at all, the concierge is flagged. It TELLS rather than TYPES — no second agent
+/// turn is spent, which the founder's "secondary nudge" idea would have cost against the account
+/// quota the whole fleet shares. Thirty minutes matches `UNLANDED_STALL_SECS`: long enough that an
+/// agent legitimately quiet after saying it is unblocked is not paged for ordinary work, short
+/// enough that a wedged one is a row a human sees within the hour rather than never.
+///
+/// SCOPED TO AN UNVERIFIED CLAIM: it accrues only while a met goal does NOT corroborate the answer
+/// — the same `obs.goal_met && !goal_met_superseded` predicate `effective_standdown` uses, NOT the
+/// raw roster flag (which reports "met" forever and would make this inert for any agent that ever
+/// finished a goal — roborev 67839/67840). `nudger::goal_is_quiet` folds in `discharged` (git's own
+/// proof the work landed) alongside the agent's own `met`; either, while un-superseded, means a
+/// finished agent that is not a row anybody owes — the `a_met_goal_and_a_not_blocked_reply_end_the_
+/// pinging` invariant. A green-or-merged row that LIED about being done is a separate gap the
+/// unlanded clock cannot see either (bead sparkle-3a6di0) and needs its own answer.
+const DONE_STALL_SECS: u64 = 1800;
+
 /// The one-line answers the nudge asks for, and the ONLY vocabulary this module accepts.
 ///
 /// ── THE DEFECT THIS TYPE EXISTS TO CLOSE ──────────────────────────────────────────────────────
@@ -635,6 +666,16 @@ pub struct AgentState {
     /// The counter that tells a WORKING agent from a REPAINTING one. Our own echo zeroes it (it is
     /// not the agent living) and so does any quiet look, so it only ever reports a genuine run.
     live_looks: u32,
+    /// Seconds a reply-driven `Standdown::Done` has held while the agent stayed SILENT and its goal
+    /// was NOT reported met — the clock behind `DONE_STALL_SECS`.
+    ///
+    /// The exit `Standdown::Done` otherwise lacked (bead sparkle-3a6di0): its only release was
+    /// unprovoked output, which a wedged agent never produces, so a `not-blocked` claim that went
+    /// silent was invisible forever. Accrues only on silent looks while that latch holds and no
+    /// un-superseded met goal corroborates it (`obs.goal_met && !goal_met_superseded` — the raw flag
+    /// reports "met" forever); reset the moment the latch is set fresh or released, so it measures
+    /// the CURRENT silence rather than a lifetime.
+    done_secs: u64,
 }
 
 impl AgentState {
@@ -684,12 +725,22 @@ impl AgentState {
     pub fn parked_looks_for_test(&self) -> u32 {
         self.parked_looks
     }
+    /// Whether new work has superseded a met-goal claim — for the test that pins the `DONE_STALL_SECS`
+    /// exit firing through a stale-but-superseded `goal_met`.
+    #[cfg(test)]
+    pub fn goal_met_superseded_for_test(&self) -> bool {
+        self.goal_met_superseded
+    }
     /// Seconds this row has been not-green, holding unlanded work, with no stage advance.
     pub fn unlanded_secs(&self) -> u64 {
         self.unlanded_secs
     }
     pub fn silent_secs(&self) -> u64 {
         self.silent_secs
+    }
+    /// Seconds a silent, unverified `not-blocked` stand-down has held — the `DONE_STALL_SECS` clock.
+    pub fn done_secs(&self) -> u64 {
+        self.done_secs
     }
     /// The stand-down currently in force, if the agent's own answer put us in one.
     pub fn standdown(&self) -> Option<Standdown> {
@@ -865,8 +916,21 @@ fn step_inner(state: &mut AgentState, obs: &Observation) -> Decision {
     // The cost of stickiness is the honest one: an agent that is superseded and then legitimately
     // finishes NEW work will keep being watched, because nothing on this observation distinguishes
     // "a new goal was met" from "the old met claim is still being reported". That errs toward
-    // nudging, which is the only direction this module is allowed to err in — and the agent can
-    // still quiet itself for free by answering `not-blocked`.
+    // nudging, which is the only direction this module is allowed to err in.
+    //
+    // ── AND `not-blocked` NO LONGER BUYS PERMANENT QUIET FOR A SUPERSEDED ROW (bead sparkle-3a6di0) ─
+    // This clause once ended "the agent can still quiet itself for free by answering `not-blocked`."
+    // That stopped being true with the `DONE_STALL_SECS` exit: for a superseded row `goal_corroborates`
+    // is permanently false (the latch never clears), so a `not-blocked` answer starts the done-clock
+    // and, after 30 minutes of silence, raises a CONCIERGE row — for a superseded-and-wedged agent
+    // AND for a superseded-and-genuinely-finished one alike, because their observations are identical
+    // here (goal_met true, superseded, silent). That is the accepted direction, not an oversight: a
+    // superseded agent has already been through one work cycle, so an idle one is a row the CONCIERGE
+    // (never the founder) should reclaim or stand down — `no-task-assigned` already lands there at
+    // once — and the concierge clears it for free by delivering work (a foreign write releases the
+    // latch and resets the clock). The one agent left genuinely exempt is a met goal that was NEVER
+    // superseded (`a_met_goal_and_a_not_blocked_reply_end_the_pinging`), which is a finished agent
+    // nobody handed more work.
     if obs.goal_met {
         match state.goal_met_at_write {
             None => state.goal_met_at_write = Some(obs.foreign_write_ms),
@@ -886,6 +950,8 @@ fn step_inner(state: &mut AgentState, obs: &Observation) -> Decision {
         state.delivered = 0;
         state.escalated = None;
         state.last_blocked = None;
+        // New work restarts the silence: the `Done` clock is about THIS stand-down, so it goes too.
+        state.done_secs = 0;
     }
 
     // ── THE AGENT'S OWN ANSWER ────────────────────────────────────────────────────────────────
@@ -903,6 +969,9 @@ fn step_inner(state: &mut AgentState, obs: &Observation) -> Decision {
                 state.last_reply = Some(reply);
                 state.standdown = Some(Standdown::of(reply));
                 state.standdown_at_foreign_write = obs.foreign_write_ms;
+                // A fresh answer starts a fresh silence: the `Done` time-expiry measures how long
+                // THIS claim has gone unbacked by output, not any earlier one still in scrollback.
+                state.done_secs = 0;
             }
         }
     }
@@ -1057,6 +1126,9 @@ fn step_inner(state: &mut AgentState, obs: &Observation) -> Decision {
             if invisible {
                 state.standdown = None;
                 state.last_reply = None;
+                // The latch is gone, so its silence clock is meaningless — clear it, or a later
+                // re-latch would inherit a stale count and flag the concierge early.
+                state.done_secs = 0;
             }
 
             // ── AND THE EPISODE HISTORY SURVIVES A SURVIVING STAND-DOWN (roborev 60369, Medium) ─
@@ -1120,9 +1192,11 @@ fn step_inner(state: &mut AgentState, obs: &Observation) -> Decision {
     // row reports. Re-deriving it from the rung meant an agent that answered `blocked-on-quota` was
     // looked at every half hour and credited five seconds a look, so the row under-reported a real
     // wait by up to 100× to the one audience that cannot check it.
-    state.silent_secs += obs
-        .elapsed_secs
-        .unwrap_or(LADDER_SECS[state.rung.min(LADDER_SECS.len() - 1)]);
+    // The wall clock this look represents, measured where the caller measured it and falling back
+    // to the schedule otherwise. Captured once so `silent_secs` and the `Done` clock below credit
+    // the SAME interval — see `Observation::elapsed_secs` for why the rung cannot re-derive it.
+    let elapsed = obs.elapsed_secs.unwrap_or(LADDER_SECS[state.rung.min(LADDER_SECS.len() - 1)]);
+    state.silent_secs += elapsed;
     state.rung = (state.rung + 1).min(LADDER_SECS.len() - 1);
     let rung = state.rung;
     let rung_1based = (rung + 1) as u32;
@@ -1139,7 +1213,42 @@ fn step_inner(state: &mut AgentState, obs: &Observation) -> Decision {
     // help. Stop TYPING — and keep TELLING, at whatever level the situation warrants.
     if let Some(stand) = stand {
         if stand.silences_writes() {
-            let flagged = standdown_level(Some(stand), state.escalated);
+            let mut flagged = standdown_level(Some(stand), state.escalated);
+
+            // ── A SILENT, UNVERIFIED `not-blocked` CLAIM STILL HAS AN EXIT ────────────────────
+            // `Done` reports no flag and never writes, and its output-based release cannot reach a
+            // wedged agent — so without this a `not-blocked` answer followed by silence is invisible
+            // forever (bead sparkle-3a6di0). Give it a TIME bound: after `DONE_STALL_SECS` of
+            // silence, TELL the concierge — no second agent turn spent, unlike a re-ask.
+            //
+            // Keyed on `state.standdown`, not the effective `stand`, so it fires ONLY for the
+            // agent's OWN reply-driven claim and never manufactures a row for a finished, task-less
+            // agent whose `Done` comes from the goal alone — the
+            // `a_met_goal_and_a_not_blocked_reply_end_the_pinging` invariant.
+            //
+            // ── A MET GOAL CORROBORATES ONLY WHILE IT HAS NOT BEEN SUPERSEDED ─────────────────
+            // The raw `obs.goal_met` is the WRONG fact to read (roborev 67839/67840, High). This
+            // module already knows a met claim goes stale — `goalStateOf` reports "met" forever
+            // once `metAt` is set, so any agent that finished an EARLIER goal and was handed new
+            // work still reads `goal_met: true` — which is why `effective_standdown` honours a met
+            // goal only while `!goal_met_superseded`. Reading the raw flag here made the exit inert
+            // for that population (the commonest long-lived fleet state): the agent answers
+            // `not-blocked`, wedges, and stays invisible forever, the exact hole this closes. So use
+            // the SAME corroboration predicate. `discharged` is git's own proof the work landed;
+            // `met` is the agent's own word, trusted here only until new work contradicts it. The
+            // clock accrues only on this silent look and is reset wherever the latch is set or
+            // released, so it measures the current silence rather than a lifetime.
+            let goal_corroborates = obs.goal_met && !state.goal_met_superseded;
+            if stand == Standdown::Done
+                && state.standdown == Some(Standdown::Done)
+                && !goal_corroborates
+            {
+                state.done_secs = state.done_secs.saturating_add(elapsed);
+                if state.done_secs >= DONE_STALL_SECS {
+                    flagged = flagged.max(Some(Escalation::Concierge));
+                }
+            }
+
             let escalate = raise(state, flagged);
             return Decision {
                 action: Action::Observe,
@@ -3639,18 +3748,27 @@ mod tests {
         assert_eq!(parse_reply(&answered), Some(Reply::NotBlocked));
     }
 
-    /// A stand-down holds while the agent stays SILENT — the situation it exists for.
+    /// A `not-blocked` stand-down NEVER TYPES while the agent is silent — but it does not stay
+    /// invisible forever either. Its only release used to be UNPROVOKED OUTPUT, which a genuinely
+    /// wedged agent never produces, so an agent that answered `not-blocked` and then went silent was
+    /// never re-checked and never surfaced: the nudge converted a stall into a politer stall (bead
+    /// sparkle-3a6di0). After `DONE_STALL_SECS` of silence the CONCIERGE is told — TELL, not TYPE,
+    /// so no further agent turn is spent.
     ///
-    /// THE HASH IS HELD STEADY, and that is the whole point of the rewrite (roborev 60338, Medium).
-    /// The previous version fed a DIFFERENT hash on every iteration and asserted `Observe`, which
-    /// cannot fail: a changed look returns `Observe` with the rung reset to 0 whatever the
-    /// stand-down says, so the ladder never reached a nudge rung and the claim in the test's own
-    /// name went untested.
+    /// THE HASH IS HELD STEADY, and that is load-bearing: a changed look resets the rung to 0
+    /// whatever the stand-down says, so only a truly silent run reaches a nudge rung and lets the
+    /// clock accrue. `goal_met` stays FALSE — an unverified claim is exactly what earns the flag.
     #[test]
-    fn a_stand_down_holds_while_the_agent_stays_silent() {
+    fn a_silent_not_blocked_stand_down_never_types_but_surfaces_to_the_concierge() {
         let mut s = AgentState::default();
         run(&mut s, &stalled(), 7);
-        let answered = Observation { hash: 0x11aa, reply: Some(Reply::NotBlocked), ..stalled() };
+        // 10 minutes per look, so three silent looks cross the 30-minute bound deterministically.
+        let answered = Observation {
+            hash: 0x11aa,
+            reply: Some(Reply::NotBlocked),
+            elapsed_secs: Some(600),
+            ..stalled()
+        };
         step(&mut s, &answered);
         assert_eq!(s.standdown(), Some(Standdown::Done), "precondition: stood down");
 
@@ -3659,7 +3777,162 @@ mod tests {
             d.iter().any(|x| x.rung as usize > FIRST_NUDGE_RUNG),
             "precondition: the ladder must actually reach a nudge rung, or this proves nothing"
         );
+        // NEVER TYPES — the whole point of a stand-down survives.
         assert!(d.iter().all(|x| x.action == Action::Observe), "and still never types");
+        // …but the concierge is raised exactly once, and the row then stays up while it is silent.
+        let raised: Vec<Escalation> = d.iter().filter_map(|x| x.escalate).collect();
+        assert_eq!(
+            raised,
+            vec![Escalation::Concierge],
+            "a silent, unverified not-blocked claim must be surfaced — once — not hidden forever"
+        );
+        assert_eq!(
+            d.last().unwrap().flagged,
+            Some(Escalation::Concierge),
+            "and the row a human owes stays up for as long as the agent stays silent"
+        );
+    }
+
+    /// The FLOOR of the same rule: below `DONE_STALL_SECS` a silent `not-blocked` agent is left
+    /// entirely alone — no type, no flag. Pairs with the test above so the escalation is pinned to
+    /// the TIME BOUND and not to "any silent not-blocked look flags", which would page the concierge
+    /// about every agent that ever answered the nudge honestly.
+    #[test]
+    fn a_briefly_silent_not_blocked_agent_is_not_yet_surfaced() {
+        let mut s = AgentState::default();
+        run(&mut s, &stalled(), 7);
+        // 60 seconds per look — twenty looks is 20 minutes, comfortably under the 30-minute bound.
+        let answered = Observation {
+            hash: 0x22bb,
+            reply: Some(Reply::NotBlocked),
+            elapsed_secs: Some(60),
+            ..stalled()
+        };
+        step(&mut s, &answered);
+        assert_eq!(s.standdown(), Some(Standdown::Done), "precondition: stood down");
+
+        let d = run(&mut s, &answered, 20);
+        assert!(
+            d.iter().all(|x| x.action == Action::Observe && x.flagged.is_none()),
+            "under the time bound a not-blocked agent is neither typed at nor flagged"
+        );
+        assert!(s.done_secs() < DONE_STALL_SECS, "precondition: still under the bound");
+    }
+
+    /// A met goal that was NEVER superseded corroborates `not-blocked`, so the time-expiry must NOT
+    /// fire — a finished agent nobody handed more work is not a row anybody owes. The corroboration
+    /// predicate is `obs.goal_met && !goal_met_superseded`; here no foreign write ever supersedes, so
+    /// `goal_corroborates` holds and the clock never accrues. (A SUPERSEDED met goal is the opposite
+    /// case — see `a_superseded_met_goal_still_surfaces_a_silent_not_blocked_claim`.)
+    #[test]
+    fn a_met_goal_not_blocked_agent_is_never_surfaced_by_the_time_expiry() {
+        let mut s = AgentState::default();
+        run(&mut s, &stalled(), 7);
+        let answered = Observation {
+            hash: 0x33cc,
+            reply: Some(Reply::NotBlocked),
+            goal_met: true,
+            elapsed_secs: Some(600),
+            ..stalled()
+        };
+        step(&mut s, &answered);
+
+        // Far past the bound — ten looks of ten minutes each is well over an hour.
+        let d = run(&mut s, &answered, 10);
+        assert!(
+            d.iter().all(|x| x.action == Action::Observe && x.flagged.is_none()),
+            "an un-superseded, finished agent must not manufacture a concierge row"
+        );
+        assert_eq!(s.done_secs(), 0, "the clock never accrues while a met goal backs the claim");
+    }
+
+    /// A SUPERSEDED met goal must NOT exempt the claim — the case both reviews caught (roborev
+    /// 67839/67840, High). `goalStateOf` reports `met` forever once `metAt` is set, so an agent that
+    /// finished an EARLIER goal and was handed new work still reads `goal_met: true` from the roster
+    /// — the commonest long-lived fleet state. Reading the raw flag made the exit inert for exactly
+    /// that population; the guard must use `!goal_met_superseded`, the same predicate
+    /// `effective_standdown` honours.
+    ///
+    /// This one observation covers BOTH readings of a superseded, silent `not-blocked` row — the
+    /// agent that wedged mid-task and the one that genuinely finished its new work (`discharged`) —
+    /// because the module sees an identical observation for both (roborev 67863/67864). Surfacing
+    /// either to the CONCIERGE after the bound is intended: a superseded agent has been through a
+    /// work cycle, so an idle one is the concierge's to reclaim or stand down, and the concierge
+    /// clears it for free by delivering work. See the sticky-supersession note in `step_inner`.
+    #[test]
+    fn a_superseded_met_goal_still_surfaces_a_silent_not_blocked_claim() {
+        let mut s = AgentState::default();
+        // First a met look stamps the write clock, then a LATER foreign write supersedes the claim.
+        step(&mut s, &Observation { hash: 0x40a0, goal_met: true, foreign_write_ms: 100, ..stalled() });
+        step(&mut s, &Observation { hash: 0x40a1, goal_met: true, foreign_write_ms: 500, ..stalled() });
+        assert!(
+            s.goal_met_superseded_for_test(),
+            "precondition: new work superseded the met claim"
+        );
+
+        // The agent is silent (goal still reports met, but superseded so the ladder is not
+        // suppressed) until it reaches a nudge, then answers `not-blocked` on the SAME screen — an
+        // unchanged look, so the reply latches without the changed-branch expiry. `obs.goal_met`
+        // stays true the whole time, which is the whole point.
+        let base = Observation {
+            hash: 0x40a1,
+            goal_met: true,
+            foreign_write_ms: 500,
+            elapsed_secs: Some(600),
+            ..stalled()
+        };
+        run(&mut s, &base, 6); // exactly one nudge — attempts>0 without pre-escalating the row
+        assert_eq!(s.attempts(), 1, "precondition: reached a nudge rung, not yet escalated");
+        let answered = Observation { reply: Some(Reply::NotBlocked), ..base.clone() };
+        step(&mut s, &answered);
+        assert_eq!(s.standdown(), Some(Standdown::Done), "precondition: stood down on its own claim");
+
+        let d = run(&mut s, &answered, 20);
+        assert!(d.iter().all(|x| x.action == Action::Observe), "never types");
+        let raised: Vec<Escalation> = d.iter().filter_map(|x| x.escalate).collect();
+        assert_eq!(
+            raised,
+            vec![Escalation::Concierge],
+            "a superseded met goal must not exempt an unbacked not-blocked claim from the bound"
+        );
+        assert_eq!(
+            d.last().unwrap().flagged,
+            Some(Escalation::Concierge),
+            "and the concierge row stays up while it is silent"
+        );
+    }
+
+    /// THE CLOCK RESET ON RE-LATCH IS LOAD-BEARING (roborev 67840, Medium). A `not-blocked` claim
+    /// that accrued, was replaced by a different answer, and is then re-made must start a FRESH
+    /// clock — otherwise the stale count crosses the bound on a claim seconds old and pages the
+    /// concierge falsely. Deleting the reset in the reply-absorption block leaves every other new
+    /// test green (none changes reply token mid-episode), so pin it here.
+    #[test]
+    fn re_latching_not_blocked_restarts_the_done_clock() {
+        let mut s = AgentState::default();
+        run(&mut s, &stalled(), 7);
+        // not-blocked, then accrue two silent looks — 1200s, comfortably under the 1800s bound but
+        // close enough that ONE more silent look would cross it if the clock were not reset.
+        let nb = Observation {
+            hash: 0x50a0,
+            reply: Some(Reply::NotBlocked),
+            elapsed_secs: Some(600),
+            ..stalled()
+        };
+        step(&mut s, &nb);
+        run(&mut s, &nb, 2);
+        assert_eq!(s.done_secs(), 1200, "precondition: accrued but still under the bound");
+
+        // A DIFFERENT answer replaces it (same screen, so an unchanged look re-latches cleanly)…
+        let ci = Observation { reply: Some(Reply::Ci), ..nb.clone() };
+        step(&mut s, &ci);
+        assert_eq!(s.done_secs(), 0, "a different answer clears the done clock");
+
+        // …then `not-blocked` is re-made. The next silent look accrues from ZERO, so no flag — a
+        // stale 1200s would have crossed the bound here instead.
+        let d = step(&mut s, &nb);
+        assert_eq!(d.flagged, None, "a freshly re-made claim is not instantly at the bound");
+        assert!(s.done_secs() < DONE_STALL_SECS, "the clock restarted rather than resuming");
     }
 
     /// …AND IT EXPIRES ON UNPROVOKED OUTPUT (roborev 60338, High).

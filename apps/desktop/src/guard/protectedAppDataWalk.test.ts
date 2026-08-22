@@ -206,6 +206,16 @@ describe("the pattern operand is recognised in every spelling, so the PATH is ne
     // may slice an operand off as "the pattern", or the walk is judged with no roots (roborev
     // 67812) — the same silent allow, on a command that raises a dialog per container.
     "rg --files /Users/tester/Library",
+    // OPTIONS MAY FOLLOW POSITIONALS (ripgrep uses clap; GNU grep permutes too). A rule that
+    // infers "the slice already removed the flag value" from operand ORDER eats the PATH here and
+    // leaves one relative word, which `isAbsolute` skips — no roots, and no roots reads as
+    // "reaches nothing" (roborev 67851). `-e PAT` is the most common spelling an agent types.
+    "rg /Users/tester/Library -e Chrome",
+    "grep -r /Users/tester/Library -e Chrome",
+    "rg /Users/tester/Library -f pats.txt",
+    // Everything after `--` is a positional, so the path is still a path. Dropping that tail
+    // leaves no roots — the same "reaches nothing" reading, by a fourth route.
+    "rg -e Chrome -- /Users/tester/Library",
   ])("`%s` is a refusal — the operand left is a PATH, not a pattern", (command) => {
     const verdict = blocksProtectedAppDataWalk(command, HOME);
     expect(verdict, `expected a refusal for: ${command}`).not.toBeNull();
@@ -259,6 +269,186 @@ describe("the pattern operand is recognised in every spelling, so the PATH is ne
     expect(
       blocksProtectedAppDataWalk(`rg -edocker ${HOME}/Library/Containers ${HOME}/Projects`, HOME),
     ).not.toBeNull();
+  });
+
+  it("when a flag supplies the patterns, EVERY operand is a path — including the first", () => {
+    // The mirror image of the allow cases, and the one the review got backwards. With `--file`
+    // carrying the patterns there is no pattern operand at all, so BOTH words are roots and the
+    // walk into Containers is real. Blocking it is the correct reading, not an over-block —
+    // which is why it is asserted on its own root rather than folded into the list above.
+    const verdict = blocksProtectedAppDataWalk(
+      `grep -r --file pats.txt ${HOME}/Library/Containers ${HOME}/Projects`,
+      HOME,
+    );
+    expect(verdict).not.toBeNull();
+    expect(verdict!.root).toBe(`${HOME}/Library/Containers`);
+  });
+
+  it("a SEPARATED long pattern flag takes the next word, so that word is not a root", () => {
+    // The long-flag half of the same asymmetry: the short form was corrected to require an
+    // ATTACHED value, but the long form had no such requirement, so `--regexp <abs path>` promoted
+    // the thing being searched FOR into a walk root — a false refusal with no way around it.
+    expect(
+      blocksProtectedAppDataWalk(`rg --regexp ${HOME}/Library/Containers ${HOME}/Projects`, HOME),
+    ).toBeNull();
+    // Attached, the pattern is inside the word, so the operand really is a root.
+    expect(
+      blocksProtectedAppDataWalk(`rg --regexp=Chrome ${HOME}/Library/Containers`, HOME),
+    ).not.toBeNull();
+  });
+
+  it("an ORDINARY flag's separated value is consumed too, or it shifts what counts as the pattern", () => {
+    // `-m 5` must swallow the `5` AT ITS POSITION. Leave it in the operand list and it becomes
+    // "the pattern", which pushes the Containers string into the root slot and refuses an ordinary
+    // search FOR that path — the same false-refusal shape as `-tdocker`, via the separated form.
+    expect(
+      blocksProtectedAppDataWalk(`rg -m 5 ${HOME}/Library/Containers ${HOME}/Projects`, HOME),
+    ).toBeNull();
+    // The LONG spelling of the same thing. The existing `--max-depth 1` case cannot show this:
+    // the depth it sets makes the verdict null under both readings, so it is silent on the bug.
+    expect(
+      blocksProtectedAppDataWalk(
+        `rg --max-count 5 ${HOME}/Library/Containers ${HOME}/Projects`,
+        HOME,
+      ),
+    ).toBeNull();
+    // Drop the flag and its value entirely and the first operand really is the pattern again —
+    // same verdict, so the case above is not green merely because Containers is unreachable here.
+    expect(
+      blocksProtectedAppDataWalk(`rg ${HOME}/Library/Containers ${HOME}/Projects`, HOME),
+    ).toBeNull();
+    // …and with the pattern supplied by a flag, that same first operand IS a root.
+    expect(
+      blocksProtectedAppDataWalk(
+        `rg -m 5 -e x ${HOME}/Library/Containers ${HOME}/Projects`,
+        HOME,
+      ),
+    ).not.toBeNull();
+  });
+
+  it("an OPTIONAL-value flag never consumes the next word — that word is the pattern", () => {
+    // The invariant the flag table's docstring rests on, made executable (roborev 67871). It had
+    // no assertion anywhere, which is exactly how the `-C` regression got in: a later reader could
+    // add `--color`/`--context` to the value table and nothing would go red.
+    //
+    // macOS ships BSD grep, whose `-C[num]` / `--context[=num]` take an argument that may NOT be
+    // whitespace-separated. So in all four of these the next word is the PATTERN, and swallowing
+    // it leaves the walk with no roots — the silent allow this whole file exists to close.
+    for (const cmd of [
+      `grep -rC pat ${HOME}/Library`,
+      `grep -r --context pat ${HOME}/Library`,
+      `grep -r --color pat ${HOME}/Library`,
+      `grep -rC3 pat ${HOME}/Library`,
+    ]) {
+      const verdict = blocksProtectedAppDataWalk(cmd, HOME);
+      expect(verdict, `expected a refusal for: ${cmd}`).not.toBeNull();
+      expect(verdict!.root).toBe(`${HOME}/Library`);
+    }
+    // The paired half: a flag whose value IS mandatory and separated still consumes it, so the
+    // cases above are not green merely because nothing consumes anything any more.
+    expect(
+      blocksProtectedAppDataWalk(`grep -r -m 5 ${HOME}/Library/Containers ${HOME}/Projects`, HOME),
+    ).toBeNull();
+  });
+
+  it("a bare `-` is a POSITIONAL, so it occupies the pattern slot rather than vanishing", () => {
+    // Skipping it would promote the PATH into the pattern slot and empty the root list. `-` is
+    // never an absolute path, so keeping it as an operand costs nothing.
+    const verdict = blocksProtectedAppDataWalk(`rg - ${HOME}/Library`, HOME);
+    expect(verdict).not.toBeNull();
+    expect(verdict!.root).toBe(`${HOME}/Library`);
+  });
+
+  it("a flag that NAMES a root is never subject to the pattern slice, in either order", () => {
+    // `fd --search-path <path>` and `--base-directory <path>` supply the walk root themselves. Left
+    // in the operand list they were removed as "the pattern" — and fd has no pattern flags at all,
+    // so nothing else could keep a root alive. The bug was ORDER-DEPENDENT in exactly the way this
+    // parser claims nothing is (roborev 67870), so both orders are asserted to the same root.
+    const flagFirst = blocksProtectedAppDataWalk(`fd --search-path ${HOME}/Library cli.js`, HOME);
+    const flagLast = blocksProtectedAppDataWalk(`fd cli.js --search-path ${HOME}/Library`, HOME);
+    expect(flagFirst).not.toBeNull();
+    expect(flagLast).not.toBeNull();
+    expect(flagFirst!.root).toBe(`${HOME}/Library`);
+    expect(flagLast!.root).toBe(flagFirst!.root);
+    // The attached spelling, and fd's other root-naming flag.
+    expect(
+      blocksProtectedAppDataWalk(`fd --search-path=${HOME}/Library cli.js`, HOME),
+    ).not.toBeNull();
+    expect(blocksProtectedAppDataWalk(`fd --base-directory ${HOME} cli.js`, HOME)).not.toBeNull();
+  });
+
+  it("`--base-directory` is a PREFIX when a path survives, and a root only when none does", () => {
+    // fd's help: a relative positional or `--search-path` "will also be resolved relative to this
+    // directory". Folding it in with the root flags made an ordinary `~/Projects` walk a refusal
+    // citing $HOME, and told the user to narrow a root they had already narrowed (roborev 67942).
+    expect(
+      blocksProtectedAppDataWalk(`fd --base-directory ${HOME} cli.js Projects`, HOME),
+    ).toBeNull();
+    // …but a relative survivor that DOES resolve into the protected set is still a walk of it.
+    const resolved = blocksProtectedAppDataWalk(
+      `fd --base-directory ${HOME} cli.js Library`,
+      HOME,
+    );
+    expect(resolved).not.toBeNull();
+    expect(resolved!.root).toBe(`${HOME}/Library`);
+    // …and with NO path surviving there is nothing to resolve, so the base itself is the root.
+    const bare = blocksProtectedAppDataWalk(`fd --base-directory ${HOME} cli.js`, HOME);
+    expect(bare).not.toBeNull();
+    expect(bare!.root).toBe(HOME);
+  });
+
+  it("the WIDENING direction is pinned — a non-root flag's value never becomes a root", () => {
+    // Every other root-flag case here is a BLOCK assertion, so on their own they stay green under
+    // any widening of the root table: add `--exclude` or `--extension` to it and an arbitrary flag
+    // value is promoted to a walk root, turning ordinary fd invocations into refusals with nothing
+    // red. That is the same asymmetry this file already fixed once for `-C`/`--color`.
+    // NOT `--exclude`, deliberately. Its value is ALSO collected by `walkExcludePatterns`, so a
+    // root manufactured from it is neutralised by its own flag and the case stays green under the
+    // very mutation its comment names — vacuous in exactly the way this test exists to prevent
+    // (roborev 67948). `--ignore-file` takes an absolute path and is not an exclusion.
+    for (const cmd of [
+      `fd --ignore-file ${HOME}/Library/Containers cli.js ${HOME}/Projects`,
+      `fd --search-path ${HOME}/Projects cli.js`,
+      `fd --base-directory ${HOME}/Projects cli.js`,
+    ]) {
+      expect(blocksProtectedAppDataWalk(cmd, HOME), `unexpected refusal for: ${cmd}`).toBeNull();
+    }
+    // The paired half: the flag that genuinely DOES name a root still refuses, so the three above
+    // are not green merely because nothing is collected as a root any more.
+    expect(blocksProtectedAppDataWalk(`fd --search-path ${HOME}/Library cli.js`, HOME)).not.toBeNull();
+  });
+
+  it("`fdfind` is `fd` — a binary with no table key parses as if no flag took a value", () => {
+    // Debian's name for the same tool had no key in ANY of the five flag tables, so every lookup
+    // fell through to the empty default. Asserted against the same command under both names.
+    const fd = blocksProtectedAppDataWalk(`fd --search-path ${HOME}/Library x`, HOME);
+    const fdfind = blocksProtectedAppDataWalk(`fdfind --search-path ${HOME}/Library x`, HOME);
+    expect(fdfind).not.toBeNull();
+    expect(fdfind!.root).toBe(fd!.root);
+  });
+
+  it("fd's verdicts are pinned in BOTH directions — the rewrite changed them silently", () => {
+    // `-e` is fd's EXTENSION filter and consumes its value, so `cli.js` is the pattern and
+    // `~/Library` is a real root…
+    const withPath = blocksProtectedAppDataWalk(`fd -e ts cli.js ${HOME}/Library`, HOME);
+    expect(withPath).not.toBeNull();
+    expect(withPath!.root).toBe(`${HOME}/Library`);
+    // …while a LONE positional is fd's pattern, not a path. This verdict FLIPPED in the rewrite
+    // and nothing asserted it either way, so the next edit to fd's tables could flip it back.
+    expect(
+      blocksProtectedAppDataWalk(`fd -e ts ${HOME}/Library/Containers`, HOME),
+    ).toBeNull();
+  });
+
+  it("argument ORDER changes nothing — the same walk, flags first or flags last", () => {
+    // The pair that pins order-independence: identical commands, identical verdicts, and the root
+    // must be NAMED in both, since a verdict built from an empty root list cannot exist.
+    const leading = blocksProtectedAppDataWalk(`rg -e Chrome ${HOME}/Library`, HOME);
+    const trailing = blocksProtectedAppDataWalk(`rg ${HOME}/Library -e Chrome`, HOME);
+    expect(leading).not.toBeNull();
+    expect(trailing).not.toBeNull();
+    expect(trailing!.root).toBe(leading!.root);
+    expect(trailing!.root).toBe(`${HOME}/Library`);
   });
 
   it("grep is judged with GREP's flag table, not ripgrep's", () => {

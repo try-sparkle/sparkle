@@ -51,6 +51,27 @@ use tauri::AppHandle;
 /// oldest: a concierge that believes it delivered something it did not is worse than one told no.
 pub(crate) const MAX_PER_AGENT: usize = 50;
 
+/// Ceiling for [`Severity::Fyi`] alone, leaving `MAX_PER_AGENT - FYI_CEILING` slots that only
+/// [`Severity::Act`] can occupy.
+///
+/// WHY THE CEILING HAD TO SPLIT. The refusal above is the right call and stays — nothing is ever
+/// evicted. But a single ceiling makes the refusal SEVERITY-BLIND, and the two message classes do
+/// not fail equally when they are turned away. `Fyi` is context: the agent reads it or it expires,
+/// and one more piece of context that did not arrive costs nothing. `Act` exists precisely because
+/// something needs doing before the agent continues.
+///
+/// The traffic is lopsided in exactly the wrong direction. Every agent-to-agent peer message and
+/// the concierge's own default send `fyi`; the pipeline-health escalation and the mention watch
+/// send `act`. So the class that can flood is the class that does not matter, and the one that
+/// gets locked out is the one that does — observed on this machine as a saturated queue refusing a
+/// blocked-deployment alert while fifty pieces of context sat in front of it, undrained.
+///
+/// A RESERVE, NOT A RAISE. `MAX_PER_AGENT` is unchanged, so the worst case an agent can be handed
+/// is exactly what it was; all this does is stop the cheap class from consuming the last slots.
+/// Sizing it as a reserve rather than a per-class quota also keeps the invariant one number:
+/// `pending().len() <= MAX_PER_AGENT` still holds for every combination of severities.
+pub(crate) const FYI_CEILING: usize = 40;
+
 /// How long an undelivered message stays worth delivering. A "main has moved, rebase" message is
 /// actively misleading a day later, and this queue is durable precisely so it survives restarts —
 /// which means without a TTL it would also survive into irrelevance.
@@ -588,7 +609,9 @@ pub fn pending(app_data: &Path, agent_id: &str, now: i64) -> Vec<InboxMessage> {
 
 /// Queue a message. Returns its id.
 ///
-/// Refuses rather than evicts when full: see `MAX_PER_AGENT`.
+/// Refuses rather than evicts when full: see `MAX_PER_AGENT`. The ceiling it is judged against
+/// depends on `severity` — `Fyi` stops at `FYI_CEILING` so context traffic cannot occupy the slots
+/// an `Act` message needs.
 pub fn enqueue(
     app_data: &Path,
     agent_id: &str,
@@ -605,11 +628,32 @@ pub fn enqueue(
     if text.is_empty() {
         return Err("inbox: refusing to queue an empty message".into());
     }
-    if pending(app_data, agent_id, now).len() >= MAX_PER_AGENT {
-        return Err(format!(
-            "inbox: {agent_id} already has {MAX_PER_AGENT} undelivered messages; \
-             it is not draining them — check its Level 0 verdict before sending more"
-        ));
+    // SEVERITY-AWARE CAPACITY (see `FYI_CEILING`). `Act` is judged against the full ceiling; `Fyi`
+    // stops short of it, so context traffic can never occupy the slots an action message needs.
+    // Both are still REFUSALS — nothing queued is evicted or reordered by this.
+    let queued = pending(app_data, agent_id, now).len();
+    let ceiling = match severity {
+        Severity::Act => MAX_PER_AGENT,
+        Severity::Fyi => FYI_CEILING,
+    };
+    if queued >= ceiling {
+        // Name WHICH ceiling was hit and what it means, because the two refusals ask the reader for
+        // different things: a full inbox means the agent is not reaching turn boundaries at all,
+        // while a full FYI allowance means it is merely behind on context and an `act` message
+        // would still get through — advice a single shared string cannot give.
+        return Err(if matches!(severity, Severity::Fyi) {
+            format!(
+                "inbox: {agent_id} already has {queued} undelivered messages, at or over the \
+                 {FYI_CEILING} the `fyi` class is allowed; the remaining slots are reserved for \
+                 `act` messages — resend as `act` only if it genuinely needs doing before the \
+                 agent continues"
+            )
+        } else {
+            format!(
+                "inbox: {agent_id} already has {MAX_PER_AGENT} undelivered messages; \
+                 it is not draining them — check its Level 0 verdict before sending more"
+            )
+        });
     }
     let msg = InboxMessage {
         id: id.clone(),
@@ -1084,6 +1128,11 @@ mod tests {
 
     fn send(base: &Path, agent: &str, text: &str, now: i64, id: &str) -> Result<String, String> {
         enqueue(base, agent, text, Severity::Fyi, "concierge", now, id.to_string())
+    }
+
+    /// Same as [`send`] but at [`Severity::Act`] — the class judged against the full ceiling.
+    fn send_act(base: &Path, agent: &str, text: &str, now: i64, id: &str) -> Result<String, String> {
+        enqueue(base, agent, text, Severity::Act, "concierge", now, id.to_string())
     }
 
     /// Same as [`send`] but names the sender — the peer-messaging path. A separate helper rather than
@@ -1866,14 +1915,50 @@ mod tests {
     #[test]
     fn a_full_inbox_refuses_rather_than_dropping_the_oldest() {
         // A concierge that believes it delivered something it did not is worse than one told no.
+        // Filled with `act`, which is the class judged against the FULL ceiling — `fyi` stops
+        // earlier now (see the reserve tests below).
         let base = tmp("full");
         for i in 0..MAX_PER_AGENT {
-            send(&base, "a1", "msg", 1_000, &format!("m{i}")).unwrap();
+            send_act(&base, "a1", "msg", 1_000, &format!("m{i}")).unwrap();
         }
-        let err = send(&base, "a1", "one too many", 1_000, "overflow").unwrap_err();
+        let err = send_act(&base, "a1", "one too many", 1_000, "overflow").unwrap_err();
         assert!(err.contains("not draining"), "got: {err}");
         // And the refusal did not corrupt what was already queued.
         assert_eq!(pending(&base, "a1", 1_000).len(), MAX_PER_AGENT);
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// THE SIDE EFFECT, not the refusal: the `act` message is ADMITTED and readable back out of the
+    /// queue while `fyi` is at its ceiling. Asserting only that the `fyi` send is refused would
+    /// pass against a single shared ceiling too — it is the delivered `act` that the reserve exists
+    /// for, and it is what breaks if the ceiling is ever collapsed back into one number.
+    #[test]
+    fn context_traffic_cannot_lock_out_an_action_message() {
+        let base = tmp("reserve");
+        for i in 0..FYI_CEILING {
+            send(&base, "a1", "context", 1_000, &format!("f{i}")).unwrap();
+        }
+        // The cheap class has spent its allowance...
+        let err = send(&base, "a1", "more context", 1_000, "f-overflow").unwrap_err();
+        assert!(err.contains("reserved for"), "got: {err}");
+        assert!(err.contains("`act`"), "the refusal must name the way through: {err}");
+
+        // ...and the class that needs doing still gets through, all the way to the full ceiling.
+        for i in FYI_CEILING..MAX_PER_AGENT {
+            send_act(&base, "a1", "blocked deployment", 1_000, &format!("a{i}"))
+                .unwrap_or_else(|e| panic!("act send {i} refused behind fyi traffic: {e}"));
+        }
+        let queued = pending(&base, "a1", 1_000);
+        assert_eq!(queued.len(), MAX_PER_AGENT, "the total ceiling is unchanged by the split");
+        assert_eq!(
+            queued.iter().filter(|m| m.severity == Severity::Act).count(),
+            MAX_PER_AGENT - FYI_CEILING,
+            "every reserved slot was delivered, not merely accepted"
+        );
+
+        // The reserve is a reserve, not a raise: `act` is still refused past the full ceiling.
+        let err = send_act(&base, "a1", "one too many", 1_000, "a-overflow").unwrap_err();
+        assert!(err.contains("not draining"), "got: {err}");
         std::fs::remove_dir_all(&base).ok();
     }
 

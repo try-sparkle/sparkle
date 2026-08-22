@@ -3042,6 +3042,25 @@ const SHORT_VALUE_FLAGS = {
   fd: "edtEXxS",
 };
 
+/** …and of those, the ones whose value may be a SEPARATE WORD, so the next argument is consumed.
+ *
+ *  THE TWO ROLES HAVE OPPOSITE SAFETY REQUIREMENTS, and conflating them shipped a regression
+ *  (roborev 67871). As a bundle-STOP table a spurious letter is harmless — it just ends the scan
+ *  early. As a CONSUME table a spurious letter swallows the next operand, and if that operand was
+ *  the PATTERN the walk is left with no roots, which reads as "reaches nothing".
+ *
+ *  `C` is exactly that case. macOS ships BSD grep, whose `-C[num]` / `--context[=num]` take an
+ *  OPTIONAL argument that may not be separated by whitespace — so in `grep -rC pat ~/Library` the
+ *  next word is the PATTERN, not the count. `C` therefore stops the bundle scan (its attached
+ *  digits are its value) but never consumes a separate word. The cost is a possible false refusal
+ *  on GNU's `grep -C 3 /abs/protected ~/Projects`, which is the VISIBLE direction this file
+ *  already says to prefer. */
+const SHORT_SEPARATED_VALUE_FLAGS = {
+  rg: "efgtTmABCMjr",
+  grep: "efmABDd", // no `C` — see above
+  fd: "edtEXxS",
+};
+
 /** SHORT flags that supply the SEARCH PATTERN — when one carries an ATTACHED value, there is no
  *  pattern operand left and every operand is a path. `fd` has none: its `-e` is an EXTENSION
  *  filter, not a pattern, and reading it as one is how a generic table would misjudge it. */
@@ -3058,38 +3077,160 @@ const PATTERN_LONG_FLAGS = { rg: ["--regexp", "--file"], grep: ["--regexp", "--f
  *  nothing" — the same silent allow, on a command that raises a dialog per container. */
 const NO_PATTERN_FLAGS = { rg: ["--files"], grep: [], fd: [] };
 
-/** Does this segment take its search pattern from a FLAG (or have no pattern at all), so that every
- *  operand is a PATH rather than the first one being the pattern?
+/** LONG flags whose value is MANDATORY and may be separated (`--type ts`), so the next word is that
+ *  value rather than an operand.
  *
- *  Bundles are scanned LEFT TO RIGHT and stop at the first value-taking letter, because everything
- *  after that letter belongs to its value. That is the whole correction: `-reChrome` is `-r` then
- *  `-e` carrying `Chrome`, while `-tdocker` is `-t` carrying `docker` and contains no flag `e` at
- *  all, even though both words contain the letter. */
-function patternComesFromFlags(bin, args) {
+ *  Optional-value flags are deliberately ABSENT. `grep --color` takes a value only in the `=`
+ *  spelling, so consuming the next word for it would eat the PATTERN out of
+ *  `grep -r --color pat ~/Library`, leaving one operand that the pattern slice then removes — a
+ *  no-roots silent allow, which is the failure this whole branch exists to close. When in doubt,
+ *  leave a flag OUT: an unconsumed value becomes an extra candidate root, which is visible, rather
+ *  than a swallowed path, which is not. */
+const LONG_VALUE_FLAGS = {
+  rg: [
+    "--max-depth", "--maxdepth", "--glob", "--iglob", "--type", "--type-not", "--type-add",
+    "--max-count", "--replace", "--after-context", "--before-context", "--context", "--threads",
+    "--max-columns", "--max-filesize", "--ignore-file", "--pre", "--sort", "--sortr", "--encoding",
+  ],
+  grep: [
+    // `--context` is ABSENT for the same reason `--color` is: BSD grep's takes an OPTIONAL
+    // argument, so `grep -r --context pat ~/Library` would have its PATTERN eaten. The
+    // `--context=NUM` spelling needs no entry — the attached branch already handles it.
+    "--directories", "--devices", "--max-count", "--after-context", "--before-context",
+    "--exclude", "--exclude-dir", "--exclude-from", "--include", "--label",
+  ],
+  fd: [
+    "--max-depth", "--maxdepth", "--min-depth", "--exact-depth", "--exclude", "--extension",
+    "--type", "--size", "--changed-within", "--changed-before", "--ignore-file", "--threads",
+    "--max-results", "--path-separator",
+  ],
+};
+
+/** Flags whose VALUE IS A WALK ROOT in its own right, not a pattern and not an ordinary setting.
+ *
+ *  `fd --search-path <path>` is documented as "paths to search as an alternative to the positional
+ *  <path> argument" and is REPEATABLE; `fd --base-directory <path>` is the directory the walk is
+ *  performed from. Neither was known here, so the value landed in `operands` as an ordinary word
+ *  and — because `fd` has no pattern flags at all — `slice(1)` removed it as "the pattern",
+ *  leaving no roots (roborev 67870). Worse, it was ORDER-DEPENDENT in exactly the way the parser
+ *  below claims nothing is: `fd --search-path ~/Library cli.js` went dark while
+ *  `fd cli.js --search-path ~/Library` was correctly refused. Same command, two orders, two
+ *  verdicts. These values are collected SEPARATELY from `operands` so the pattern slice can never
+ *  reach them. */
+const ROOT_VALUE_FLAGS = { fd: ["--search-path"], rg: [], grep: [] };
+
+/** Flags whose value is a BASE the walk is performed FROM — a prefix, not a root.
+ *
+ *  fd's own help: "Note that relative paths which are passed to fd via the positional <path>
+ *  argument or the --search-path option will also be resolved relative to this directory." So
+ *  `--base-directory` is a root ONLY when no path survives to be resolved against it. Folding it in
+ *  with `--search-path` made `fd --base-directory ~ cli.js Projects` — a walk of `~/Projects`,
+ *  which reaches nothing protected — a refusal citing `$HOME`, and told the user to narrow a root
+ *  they had already narrowed (roborev 67942).
+ *
+ *  That is worse than the "unconsumed value becomes a visible extra candidate root" case the
+ *  `LONG_VALUE_FLAGS` docstring blesses: that one yields a relative word `isAbsolute` skips, while
+ *  this one MANUFACTURES `$HOME` — the maximally-blocking root — out of a flag that never named
+ *  it. */
+const BASE_DIR_FLAGS = { fd: ["--base-directory"], rg: [], grep: [] };
+
+/** `fdfind` is Debian's name for the same binary, and it had NO KEY in any of these tables, so
+ *  every lookup fell through to the empty default and it was parsed as though no flag anywhere
+ *  took a value. Normalise before looking anything up. */
+function flagTableKey(bin) {
+  return bin === "fdfind" ? "fd" : bin;
+}
+
+/** The PATH operands of a pattern-first walker (`rg`, `fd`, a recursive `grep`).
+ *
+ *  WHY THIS IS A POSITIONAL PARSE rather than "filter the options out, then drop the first word".
+ *  The filter-then-slice shortcut infers that a separated flag value has already been removed by
+ *  the slice — which is true ONLY when every flag precedes every path. Both ripgrep (clap) and GNU
+ *  grep accept options AFTER positionals, so `rg ~/Library -e Chrome` filtered to
+ *  `["~/Library", "Chrome"]` and the slice ate THE PATH, leaving one relative word that
+ *  `isAbsolute` skips: no roots, and no roots reads as "reaches nothing" (roborev 67851, a
+ *  regression in a file that had already fixed this shape twice in other spellings — and the plain
+ *  `-e PAT` form is the most common one an agent types).
+ *
+ *  So each flag's own value is consumed AT ITS POSITION, and the first-operand-is-the-pattern rule
+ *  is applied only when no flag supplied the pattern. Nothing depends on argument order. */
+function walkPatternFirstRoots(rawBin, args) {
+  const bin = flagTableKey(rawBin);
   const valueTaking = SHORT_VALUE_FLAGS[bin] ?? "";
+  const separatedValue = SHORT_SEPARATED_VALUE_FLAGS[bin] ?? "";
   const patternShort = PATTERN_SHORT_FLAGS[bin] ?? "";
   const patternLong = PATTERN_LONG_FLAGS[bin] ?? [];
   const noPattern = NO_PATTERN_FLAGS[bin] ?? [];
-  for (const a of args) {
-    if (noPattern.includes(a)) return true;
-    if (a.startsWith("--")) {
-      // `--regexp=X` and `--regexp X` are the same flag; only the name half decides.
-      if (patternLong.includes(a.split("=")[0])) return true;
+  const longValue = LONG_VALUE_FLAGS[bin] ?? [];
+  const rootValue = ROOT_VALUE_FLAGS[bin] ?? [];
+  const baseDirFlags = BASE_DIR_FLAGS[bin] ?? [];
+  let baseDir = null;
+  const operands = [];
+  // Roots named by a FLAG, kept apart from `operands` so the pattern slice below cannot eat one.
+  const flagRoots = [];
+  let patternFromFlag = false;
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === "--") {
+      // Everything after `--` is a positional, whatever it looks like.
+      // NOTE a bare `-` is NOT skipped anywhere in this function. It is a positional to these
+      // tools, and dropping it would shift which word lands in the pattern slot: `rg - ~/Library`
+      // means pattern `-` and path `~/Library`, so skipping the `-` would promote the PATH to the
+      // pattern and empty the root list — a silent allow. `-` is never an absolute path, so
+      // keeping it costs nothing.
+      for (let k = i + 1; k < args.length; k++) operands.push(args[k]);
+      break;
+    }
+    if (noPattern.includes(a)) {
+      patternFromFlag = true;
       continue;
     }
-    if (!a.startsWith("-") || a.length < 2) continue;
-    for (let i = 1; i < a.length; i++) {
-      const c = a[i];
-      if (!/[A-Za-z]/.test(c)) break;
-      if (!valueTaking.includes(c)) continue; // a no-argument flag — keep reading the bundle
-      // A pattern flag whose value is ATTACHED leaves no pattern operand. One whose value is the
-      // NEXT WORD does leave an operand — and `operandsOf` keeps it, so `slice(1)` removes exactly
-      // that value. Both routes end at the same roots; only the attached form needs this branch.
-      if (patternShort.includes(c) && i + 1 < a.length) return true;
-      break; // the rest of the word is this flag's value, not more flags
+    if (a.startsWith("--")) {
+      const name = a.split("=")[0];
+      const attached = a.includes("=");
+      if (rootValue.includes(name)) {
+        if (attached) flagRoots.push(a.slice(name.length + 1));
+        else if (args[i + 1] !== undefined) flagRoots.push(args[++i]);
+      } else if (baseDirFlags.includes(name)) {
+        if (attached) baseDir = a.slice(name.length + 1);
+        else if (args[i + 1] !== undefined) baseDir = args[++i];
+      } else if (patternLong.includes(name)) {
+        patternFromFlag = true;
+        if (!attached) i++; // the pattern is the NEXT word, so it is not an operand
+      } else if (!attached && longValue.includes(name)) {
+        i++; // an ordinary flag's mandatory value
+      }
+      continue;
     }
+    if (a.startsWith("-") && a.length > 1) {
+      // Read the bundle left to right and stop at the first value-taking letter: everything after
+      // it belongs to that letter's value. `-reChrome` is `-r` then `-e` carrying `Chrome`, while
+      // `-tdocker` is `-t` carrying `docker` and holds no flag `e` at all (roborev 67812).
+      for (let k = 1; k < a.length; k++) {
+        const c = a[k];
+        if (!/[A-Za-z]/.test(c)) break;
+        if (!valueTaking.includes(c)) continue; // a no-argument flag — keep reading the bundle
+        const attached = k + 1 < a.length;
+        if (patternShort.includes(c)) {
+          patternFromFlag = true;
+          if (!attached) i++; // `-e PAT`: the pattern is the next word
+        } else if (!attached && separatedValue.includes(c)) {
+          i++; // `-t ts`: an ordinary flag's value is the next word
+        }
+        break;
+      }
+      continue;
+    }
+    operands.push(a);
   }
-  return false;
+  // Only NOW does the first-operand rule apply, and only when nothing else supplied the pattern.
+  // Flag-named roots are never subject to it — they are roots by the flag's own definition.
+  const roots = [...flagRoots, ...(patternFromFlag ? operands : operands.slice(1))];
+  if (baseDir === null) return roots;
+  // A base with nothing to resolve against IS the root; otherwise it only prefixes the RELATIVE
+  // ones. An absolute root ignores the base entirely, which is what fd itself does.
+  if (roots.length === 0) return [baseDir];
+  return roots.map((r) => (isAbsolute(r) || /^(?:~|\$HOME|\$\{HOME\})(?:\/|$)/.test(r) ? r : join(baseDir, r)));
 }
 
 /** The directories a walker segment will descend from.
@@ -3102,10 +3243,8 @@ function walkSearchRoots(bin, args, flagBin = bin) {
   if (bin === "find") return findSearchRoots(args);
   const spec = WALKERS[bin];
   // `ls -R` is the only walker whose recursion is opt-in via a flag rather than its nature.
-  const operands = operandsOf(args);
-  if (!spec) return operands;
-  if (!spec.patternFirst) return operands;
-  return patternComesFromFlags(flagBin, args) ? operands : operands.slice(1);
+  if (!spec || !spec.patternFirst) return operandsOf(args);
+  return walkPatternFirstRoots(flagBin, args);
 }
 
 /** The walker's traversal depth limit, or null when it has none (or when its depth flag does not
