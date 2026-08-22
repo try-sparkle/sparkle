@@ -1,3 +1,4 @@
+import { useEffect, useState } from "react";
 import { C, MODAL_SHADOW, SCRIM } from "../theme/colors";
 import { FONT_UI, RADIUS } from "../theme/scale";
 import type { Account } from "../services/accountStore";
@@ -23,6 +24,38 @@ export function AccountLoginModal({ account, onClose }: { account: Account; onCl
   // implementation is the fix for that class of drift, not just for the instance.
   //
   // `configDir` targets this account's own credentials rather than the machine-wide login.
+
+  // The browser OAuth flow (ClaudeSignIn) is the SECONDARY, opt-in path — token-based is the
+  // recommended one above it. OAuth mints a token that expires in a few hours, so we do not start
+  // its PTY (which is what pops the browser) until the user explicitly asks for it.
+  //
+  // SCOPED TO THE ACCOUNT IT WAS OPENED FOR, not a bare boolean (roborev). KebabMenu keeps ONE
+  // AccountLoginModal mounted and swaps `account` beneath it (a second "Log in" from the screen
+  // behind the backdrop is reachable), and this state is not remounted with it. A bare
+  // `oauthOpen=true` would survive a swap and auto-start the swapped-in account's browser PTY with
+  // no click — the exact thing the gate exists to prevent.
+  //
+  // Two parts, both required:
+  //   1. Derive `oauthOpen` by matching the CURRENT account's id — during render, so a swapped-in
+  //      account (different id) is closed on the very first frame, with no window in which its PTY
+  //      could mount. Keyed on `account.id`, which is unique by construction and never empty; the
+  //      config dir can be empty for a legacy default, and two empty-configDir accounts would
+  //      collide on that key and reproduce the original auto-pop.
+  //   2. Clear the opt-in whenever the account changes, so returning to an account it was once
+  //      granted for (A → B → A) does NOT re-arm it — otherwise the match in (1) would re-open A's
+  //      surface on the way back, with no click in that visit. The effect runs after the swap
+  //      render, whose derivation already showed the new account closed, so there is no interim pop.
+  // Because a swap always closes the surface, ClaudeSignIn is unmounted and remounted per opt-in —
+  // which is why the account's stale sign-in verdict can no longer be inherited without a fresh key.
+  //
+  // Both parts are load-bearing: (2) alone (a bare boolean reset by the effect) would still mount the
+  // swapped-in account's PTY for the one render between the swap and the effect firing; (1) alone
+  // would re-arm on A → B → A. jsdom flushes the effect synchronously and cannot observe that interim
+  // frame, so the A → B → A test guards (2) while (1)'s race-safety is verified by reasoning, not a
+  // unit test — do not "simplify" it to a bare boolean on the strength of a green suite.
+  const [oauthOpenFor, setOauthOpenFor] = useState<string | null>(null);
+  const oauthOpen = oauthOpenFor === account.id;
+  useEffect(() => setOauthOpenFor(null), [account.id]);
 
   // `zIndex: 120` only outranks anything if this competes at ROOT, and it is mounted from
   // Concierge/KebabMenu — inside the concierge column's `CONCIERGE_LIFT_Z` stacking context, which
@@ -87,11 +120,20 @@ export function AccountLoginModal({ account, onClose }: { account: Account; onCl
           </div>
           {/* THE SCROLLPORT: the explanatory prose, which is what a short window has to give up.
               It scrolls here rather than on the card, so "Done" above and the terminal below both
-              stay put. */}
-          <div data-testid="account-login-body" style={{ flex: "0 1 auto", minHeight: 0, overflowY: "auto" }}>
+              stay put.
+
+              GROWS TO FILL when OAuth is closed (roborev). The card is a fixed 520px, sized when the
+              ClaudeSignIn terminal took the remainder via `flex: 1`. That terminal is now behind the
+              opt-in, so in the default state — every open of the modal — the body was the only child
+              and, at `0 1 auto`, left the bottom half of the card blank. `1 1 auto` when closed lets
+              it take the slack; when OAuth is open we go back to `0 1 auto` so the terminal's own
+              `flex: 1` container keeps its sizing untouched. */}
+          <div
+            data-testid="account-login-body"
+            style={{ flex: oauthOpen ? "0 1 auto" : "1 1 auto", minHeight: 0, overflowY: "auto" }}
+          >
           <p style={{ fontSize: 12, color: C.muted, marginTop: 0, lineHeight: 1.4 }}>
-            Complete the normal Claude login below (it opens your browser). Sparkle never sees your
-            credentials. Close when you’re done.
+            Log in to your Claude Code account. Sparkle never sees your credentials.
           </p>
           {/* The default account IS the user's real ~/.claude, so "this account's own config folder"
               would be actively misleading here — the login it writes is the one every `claude`
@@ -115,27 +157,56 @@ export function AccountLoginModal({ account, onClose }: { account: Account; onCl
               ? `Signing in here changes the Claude login Sparkle uses for this account, stored in ${account.configDir || "~/.claude.json"}. If that is also the config your terminal uses, it changes there too.`
               : "Credentials are stored in this account’s own config folder, separate from your other accounts."}
           </p>
-          {/* The durable alternative to the browser login below: a pasted `claude setup-token`
-              (≈1-year, subscription billing). Closes the modal on a CONFIRMED login, same as the
-              PTY path. Offered for BOTH "Add account" and "Renew Login" (this modal serves both). */}
+          {/* The RECOMMENDED path: a pasted `claude setup-token` (≈1-year, subscription billing).
+              Closes the modal on a CONFIRMED login, same as the PTY path. Offered for BOTH "Add
+              account" and "Renew Login" (this modal serves both). */}
           <AccountTokenForm configDir={account.configDir} onSaved={onClose} />
+          {/* The SECONDARY, opt-in OAuth path. Until the user clicks the button its terminal is not
+              even mounted, so the browser never pops on its own — only token-based (above) is
+              offered by default. */}
+          {!oauthOpen && (
+            <div data-testid="account-oauth-teaser" style={{ marginTop: 16 }}>
+              <div style={{ fontSize: 12, fontWeight: 600, color: C.cream }}>
+                Alternative: OAuth login
+              </div>
+              <button
+                type="button"
+                data-testid="account-oauth-open"
+                onClick={() => setOauthOpenFor(account.id)}
+                style={{
+                  marginTop: 8,
+                  background: "transparent",
+                  border: `1px solid ${C.muted}`,
+                  borderRadius: RADIUS.input,
+                  color: C.cream,
+                  fontSize: 12,
+                  fontWeight: 600,
+                  padding: "6px 12px",
+                  cursor: "pointer",
+                }}
+              >
+                Click here to open a browser login window.
+              </button>
+              <p style={{ fontSize: 12, color: C.muted, margin: "8px 0 0", lineHeight: 1.4 }}>
+                Not recommended, as you may have to re-auth every couple of hours.
+              </p>
+            </div>
+          )}
           </div>
-          <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column" }}>
-            {/* Closes on a CONFIRMED sign-in rather than on the PTY exiting. The old wiring closed
-                on exit, which dismissed the modal while the user was still on the OAuth page in
-                their browser — and reported nothing when the login had in fact failed. */}
-            <ClaudeSignIn
-              // `key` is load-bearing, not decoration (knightwatch probe 2). A second reachable
-              // "Log in" swaps the account BENEATH this modal without unmounting it, and
-              // ClaudeSignIn's `done` / `confirming` / `unconfirmed` are component state: without a
-              // key they survive the swap, so the new account inherits the PREVIOUS account's
-              // verdict — rendering "signed in" for one that was never signed into, and never
-              // starting its PTY. Keying on the config dir remounts it, which is exactly the reset.
-              key={account.configDir}
-              configDir={account.configDir}
-              onSignedIn={onClose}
-            />
-          </div>
+          {oauthOpen && (
+            <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column" }}>
+              {/* Closes on a CONFIRMED sign-in rather than on the PTY exiting. The old wiring closed
+                  on exit, which dismissed the modal while the user was still on the OAuth page in
+                  their browser — and reported nothing when the login had in fact failed. */}
+              {/* No `key` remount guard is needed here any more (knightwatch probe 2). That guard
+                  existed because ClaudeSignIn used to stay mounted across an account swap and its
+                  `done`/`confirming`/`unconfirmed` state would let the new account inherit the old
+                  one's verdict. The opt-in gate now CLOSES on every account change (see `oauthOpen`
+                  above), so this surface is unmounted and freshly remounted per opt-in — a swapped-in
+                  account can never see a prior account's ClaudeSignIn instance at all. */}
+              <ClaudeSignIn configDir={account.configDir} onSignedIn={onClose} />
+            </div>
+          )}
         </div>
       </div>
     </ModalLayer>

@@ -1,6 +1,8 @@
 import { useState } from "react";
+import { FiCheck, FiCopy } from "react-icons/fi";
 import { C, ON_BRAND_FILL } from "../theme/colors";
 import { RADIUS } from "../theme/scale";
+import { copyToClipboard } from "../clipboard";
 import {
   setOauthToken as realSetOauthToken,
   recordOauthIdentity as realRecordOauthIdentity,
@@ -8,18 +10,23 @@ import {
 import { checkClaudeAuthStatus as realCheckAuthStatus, type ClaudeAuthStatus } from "../preflight";
 
 // Add / renew an account by pasting a LONG-LIVED token instead of the interactive browser OAuth.
+// This is the RECOMMENDED path (the browser OAuth below it is the fallback): the interactive
+// `claude auth login` mints a token that lasts only ~8–12h, so the founder's ~6 build accounts fall
+// out of auth constantly and every expiry shows up as scattered downstream failures. `claude
+// setup-token` mints a token that lasts ≈1 YEAR and keeps SUBSCRIPTION billing (not metered).
 //
-// WHY THIS EXISTS: the interactive `claude auth login` mints a token that lasts only ~8–12h, so the
-// founder's ~6 build accounts fall out of auth constantly and every expiry shows up as scattered
-// downstream failures. `claude setup-token` mints a token that lasts ≈1 YEAR and keeps SUBSCRIPTION
-// billing (not metered). This form takes that pasted value, has Rust write it into the account's
-// own `<configDir>/.credentials.json` (0600) — the exact file an agent spawned with
-// CLAUDE_CONFIG_DIR reads — and then CONFIRMS it authenticates before declaring success, so a token
-// the CLI rejects surfaces as an error rather than a silent inert "added".
+// This form takes that pasted value, has Rust write it into the account's own
+// `<configDir>/.credentials.json` (0600) — the exact file an agent spawned with CLAUDE_CONFIG_DIR
+// reads — and then CONFIRMS it authenticates before declaring success, so a token the CLI rejects
+// surfaces as an error rather than a silent inert "added".
 //
 // The verify step is not optional: writing the file always "succeeds", so without re-probing
 // `claude auth status` this could report a healthy account for a malformed paste. `onSaved` fires
-// ONLY on a confirmed live login.
+// ONLY on a confirmed live login THAT IS ALSO ROUTABLE — see the identity hard gate in submit().
+
+/** The command the user runs to mint the long-lived token. Copied verbatim by the copy button, so
+ *  the string the button copies and the string the label renders can never drift apart. */
+const SETUP_TOKEN_CMD = "claude setup-token";
 
 export interface AccountTokenFormDeps {
   /** Store the pasted token as the account's credential (Rust `account_set_oauth_token`). */
@@ -54,9 +61,18 @@ export function AccountTokenForm({ configDir, onSaved, deps }: AccountTokenFormP
   const [token, setTokenValue] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [copied, setCopied] = useState(false);
 
   const trimmed = token.trim();
   const canSubmit = trimmed.length > 0 && !busy;
+
+  function copyCommand() {
+    void copyToClipboard(SETUP_TOKEN_CMD).then((ok) => {
+      if (!ok) return;
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1500);
+    });
+  }
 
   async function submit() {
     if (!canSubmit) return;
@@ -80,15 +96,31 @@ export function AccountTokenForm({ configDir, onSaved, deps }: AccountTokenFormP
         );
         return;
       }
-      // 3. It authenticates. Record the identity Claude reported so the account is ROUTABLE — without
-      //    an `oauthAccount.emailAddress` a token account reads "not signed in" and never gets a spawn.
-      //    Best-effort: a failed identity write must not turn a genuinely-working login into an error.
-      if (status.email) {
-        try {
-          await recordIdentity(configDir, status.email);
-        } catch {
-          /* the credential is valid regardless; the row may lag until the first spawn writes it */
-        }
+      // 3. It authenticates — now HARD GATE on routability. A token account with no
+      //    `oauthAccount.emailAddress` reads "not signed in" downstream and never gets a spawn, so it
+      //    silently drops out of rotation while this UI says "added". That is exactly the failure the
+      //    founder can't blind-switch to tokens over, so DO NOT report success unless we can route it:
+      //    the identity must be present AND the record must land. Both were best-effort before; both
+      //    are now blocking. `onSaved` fires only on a confirmed, routable account.
+      if (!status.email) {
+        // A live login with no email is genuinely unroutable: the dir gets a `.credentials.json` but
+        // no `oauthAccount.emailAddress`, so `getIdentities` reports `isSignedIn: false` and
+        // `pickAccount` can never spawn to it (see accounts.rs `record_oauth_email_at`). Surfacing it
+        // as success would silently drop the account out of rotation. NO "try again" remedy — a retry
+        // reads the same credential and gets the same empty email, so it would just loop.
+        setError(
+          "Verified the token, but Claude reported no email, so this account can't be routed. " +
+            "Sign in with `claude setup-token` from an account that has an email address.",
+        );
+        return;
+      }
+      try {
+        await recordIdentity(configDir, status.email);
+      } catch {
+        setError(
+          "Verified the token, but couldn't save its identity, so this account wouldn't be routable. Try again.",
+        );
+        return;
       }
       onSaved();
       return;
@@ -101,12 +133,55 @@ export function AccountTokenForm({ configDir, onSaved, deps }: AccountTokenFormP
 
   return (
     <div data-testid="account-token-form" style={{ marginTop: 12 }}>
-      <div style={{ fontSize: 12, fontWeight: 600, color: C.cream }}>
-        Faster: paste a long-lived token
-      </div>
-      <p style={{ fontSize: 12, color: C.muted, margin: "4px 0 6px", lineHeight: 1.4 }}>
-        Run <code>claude setup-token</code> in your terminal and paste the result here. It lasts about
-        a year and keeps your subscription billing, so you stop re-logging in every few hours.
+      <div style={{ fontSize: 12, fontWeight: 600, color: C.cream }}>Recommended: token-based</div>
+      <p style={{ fontSize: 12, color: C.muted, margin: "4px 0 4px", lineHeight: 1.5 }}>
+        Run{" "}
+        <code
+          data-testid="account-token-cmd"
+          style={{
+            // A distinct FONT COLOR so it reads unmistakably as a terminal command, on top of the
+            // monospace face. `tealInk` is the AA-safe brand-blue INK tier (the plain brand fill
+            // does not clear the contrast floor as text).
+            fontFamily: "monospace",
+            fontSize: 12,
+            color: C.tealInk,
+            background: C.deepForest,
+            border: `1px solid ${C.inputEdge}`,
+            borderRadius: RADIUS.input,
+            padding: "1px 6px",
+            whiteSpace: "nowrap",
+          }}
+        >
+          {SETUP_TOKEN_CMD}
+        </code>{" "}
+        <button
+          type="button"
+          data-testid="account-token-copy"
+          onClick={copyCommand}
+          aria-label={copied ? "Copied" : "Copy command"}
+          title={copied ? "Copied" : "Copy"}
+          style={{
+            display: "inline-flex",
+            alignItems: "center",
+            gap: 4,
+            verticalAlign: "middle",
+            background: "transparent",
+            border: `1px solid ${C.inputEdge}`,
+            borderRadius: RADIUS.input,
+            color: copied ? C.successInk : C.tealInk,
+            fontSize: 12,
+            fontWeight: 600,
+            padding: "1px 6px",
+            cursor: "pointer",
+          }}
+        >
+          {copied ? <FiCheck size={12} aria-hidden /> : <FiCopy size={12} aria-hidden />}
+          {copied ? "Copied" : "Copy"}
+        </button>{" "}
+        in a terminal window.
+      </p>
+      <p style={{ fontSize: 12, color: C.muted, margin: "0 0 6px", lineHeight: 1.5 }}>
+        It should last a year and keep you from having to log in every few hours.
       </p>
       <textarea
         data-testid="account-token-input"
@@ -139,26 +214,29 @@ export function AccountTokenForm({ configDir, onSaved, deps }: AccountTokenFormP
           {error}
         </div>
       )}
-      <button
-        type="button"
-        data-testid="account-token-submit"
-        onClick={() => void submit()}
-        disabled={!canSubmit}
-        style={{
-          marginTop: 8,
-          background: C.teal,
-          border: `1px solid ${C.teal}`,
-          borderRadius: RADIUS.input,
-          color: ON_BRAND_FILL,
-          fontSize: 12,
-          fontWeight: 600,
-          padding: "6px 12px",
-          cursor: canSubmit ? "pointer" : "default",
-          opacity: canSubmit ? 1 : 0.5,
-        }}
-      >
-        {busy ? "Saving…" : "Use this token"}
-      </button>
+      {/* RIGHT-justified — the primary action sits at the trailing edge of the field it acts on. */}
+      <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 8 }}>
+        <button
+          type="button"
+          data-testid="account-token-submit"
+          onClick={() => void submit()}
+          disabled={!canSubmit}
+          style={{
+            background: C.teal,
+            border: `1px solid ${C.teal}`,
+            borderRadius: RADIUS.input,
+            color: ON_BRAND_FILL,
+            fontSize: 12,
+            fontWeight: 600,
+            padding: "6px 12px",
+            // Grayed out until a token is pasted (enabled once the field is non-empty).
+            cursor: canSubmit ? "pointer" : "default",
+            opacity: canSubmit ? 1 : 0.5,
+          }}
+        >
+          {busy ? "Saving…" : "Use this token"}
+        </button>
+      </div>
     </div>
   );
 }

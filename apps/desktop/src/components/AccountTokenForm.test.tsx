@@ -10,8 +10,18 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AccountTokenForm, type AccountTokenFormDeps } from "./AccountTokenForm";
 import type { ClaudeAuthStatus } from "../preflight";
+import { copyToClipboard } from "../clipboard";
+import { C } from "../theme/colors";
 
-afterEach(() => cleanup());
+// The copy button routes through the shared `copyToClipboard` helper. Mock it so the test asserts
+// the EXACT string handed to the clipboard, without depending on jsdom's clipboard shims.
+vi.mock("../clipboard", () => ({ copyToClipboard: vi.fn(async () => true) }));
+const copyMock = vi.mocked(copyToClipboard);
+
+afterEach(() => {
+  cleanup();
+  copyMock.mockClear();
+});
 
 function authStatus(over: Partial<ClaudeAuthStatus> = {}): ClaudeAuthStatus {
   return {
@@ -107,6 +117,97 @@ describe("AccountTokenForm", () => {
     expect(deps.setOauthToken).not.toHaveBeenCalled();
     expect(deps.checkAuthStatus).not.toHaveBeenCalled();
     expect(deps.recordOauthIdentity).not.toHaveBeenCalled();
+    expect(onSaved).not.toHaveBeenCalled();
+  });
+
+  it("keeps 'Use this token' DISABLED until a token is pasted, then enables it", () => {
+    render(<AccountTokenForm configDir="/cfg/acct-1" onSaved={vi.fn()} deps={makeDeps()} />);
+    const submit = screen.getByTestId("account-token-submit") as HTMLButtonElement;
+
+    // Empty field → disabled (grayed out).
+    expect(submit.disabled).toBe(true);
+    expect(submit.style.opacity).toBe("0.5");
+
+    // Whitespace-only is still empty → still disabled.
+    fireEvent.change(screen.getByTestId("account-token-input"), { target: { value: "   " } });
+    expect(submit.disabled).toBe(true);
+
+    // A real paste → enabled.
+    fireEvent.change(screen.getByTestId("account-token-input"), { target: { value: "sk-ant-oat01-X" } });
+    expect(submit.disabled).toBe(false);
+    expect(submit.style.opacity).toBe("1");
+
+    // Clearing it again → disabled once more.
+    fireEvent.change(screen.getByTestId("account-token-input"), { target: { value: "" } });
+    expect(submit.disabled).toBe(true);
+  });
+
+  it("RIGHT-justifies the 'Use this token' button", () => {
+    render(<AccountTokenForm configDir="/cfg/acct-1" onSaved={vi.fn()} deps={makeDeps()} />);
+    const submit = screen.getByTestId("account-token-submit");
+    // The button sits in a flex row justified to the trailing (right) edge.
+    expect((submit.parentElement as HTMLElement).style.justifyContent).toBe("flex-end");
+  });
+
+  it("copies exactly `claude setup-token` when the copy button is clicked", () => {
+    render(<AccountTokenForm configDir="/cfg/acct-1" onSaved={vi.fn()} deps={makeDeps()} />);
+    fireEvent.click(screen.getByTestId("account-token-copy"));
+    expect(copyMock).toHaveBeenCalledTimes(1);
+    expect(copyMock).toHaveBeenCalledWith("claude setup-token");
+  });
+
+  it("renders the command `claude setup-token` as a distinctly-colored monospace terminal command", () => {
+    render(<AccountTokenForm configDir="/cfg/acct-1" onSaved={vi.fn()} deps={makeDeps()} />);
+    const cmd = screen.getByTestId("account-token-cmd");
+    expect(cmd.textContent).toBe("claude setup-token");
+    // Monospace face AND a distinct command color — asserted as the EXACT token, and specifically
+    // NOT the muted prose color it must stand apart from (a bare not-"" would pass even if the
+    // command regressed to the surrounding prose color). roborev.
+    expect(cmd.style.fontFamily).toContain("monospace");
+    expect(cmd.style.color).toBe(C.tealInk);
+    expect(cmd.style.color).not.toBe(C.muted);
+    // And it is genuinely different from the paragraph prose it sits inside.
+    expect(cmd.style.color).not.toBe((cmd.parentElement as HTMLElement).style.color);
+  });
+
+  it("HARD GATE: a verified token with NO email surfaces an error and does NOT report success", async () => {
+    // A token account with no routable email silently drops out of rotation while the UI says
+    // "added" — the exact failure that blocks a blind switch to tokens. It must NOT be a success.
+    const deps = makeDeps({
+      checkAuthStatus: vi.fn(async () => authStatus({ loggedIn: true, source: "cli", email: null })),
+    });
+    const onSaved = vi.fn();
+
+    render(<AccountTokenForm configDir="/cfg/acct-ne" onSaved={onSaved} deps={deps} />);
+    fireEvent.change(screen.getByTestId("account-token-input"), { target: { value: "sk-ant-oat01-NOEMAIL" } });
+    fireEvent.click(screen.getByTestId("account-token-submit"));
+
+    await waitFor(() => expect(deps.setOauthToken).toHaveBeenCalledWith("/cfg/acct-ne", "sk-ant-oat01-NOEMAIL"));
+    const err = await screen.findByTestId("account-token-error");
+    expect(err.textContent).toMatch(/no email/i);
+    expect(onSaved).not.toHaveBeenCalled();
+    expect(deps.recordOauthIdentity).not.toHaveBeenCalled();
+  });
+
+  it("HARD GATE: if recording the identity THROWS, surfaces an error and does NOT report success", async () => {
+    // recordOauthIdentity is what makes the account routable; if it fails the account is not
+    // routable, so a genuine-looking token must still not be reported as added.
+    const deps = makeDeps({
+      recordOauthIdentity: vi.fn(async () => {
+        throw new Error("write failed");
+      }),
+    });
+    const onSaved = vi.fn();
+
+    render(<AccountTokenForm configDir="/cfg/acct-th" onSaved={onSaved} deps={deps} />);
+    fireEvent.change(screen.getByTestId("account-token-input"), { target: { value: "sk-ant-oat01-THROW" } });
+    fireEvent.click(screen.getByTestId("account-token-submit"));
+
+    await waitFor(() =>
+      expect(deps.recordOauthIdentity).toHaveBeenCalledWith("/cfg/acct-th", "placeholder@example.com"),
+    );
+    const err = await screen.findByTestId("account-token-error");
+    expect(err.textContent).toMatch(/routable|identity/i);
     expect(onSaved).not.toHaveBeenCalled();
   });
 });
