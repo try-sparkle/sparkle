@@ -53,10 +53,18 @@ describe("the scope table", () => {
       "3m",
       "6m",
       "1y",
+      // Added 2026-08-22: *"I basically wanna go as far back as we can."* It is the one entry whose
+      // edge is MEASURED rather than nominal — see `scopeFromMs` and `scrubberOneTable.test.ts`.
+      "all",
     ]);
     for (const s of SCRUBBER_SCOPES) {
-      expect(SCOPE_LABEL[s]).toBe(s);
-      expect(SCOPE_PHRASE[s]).toMatch(/^\d+ (hour|day|week|month|year)s?$/);
+      // "all" is the ONE scope whose visible token is not its own key: the key is a sentinel, the
+      // label is a word. Everything else is the token itself, which is what keeps a 16px gutter
+      // readable.
+      expect(SCOPE_LABEL[s]).toBe(s === "all" ? "All" : s);
+      expect(SCOPE_PHRASE[s]).toMatch(
+        s === "all" ? /^all of your history$/ : /^\d+ (hour|day|week|month|year)s?$/,
+      );
     }
   });
 

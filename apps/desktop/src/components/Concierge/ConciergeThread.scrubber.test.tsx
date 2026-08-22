@@ -17,7 +17,7 @@
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ConciergeThread, BACKLOG_DIVIDER_TESTID, THREAD_RAIL_TESTID } from "./ConciergeThread";
-import { useConciergeScrubberWiring, type ScrubberMarker } from "./useThreadScrubber";
+import { useConciergeScrubberWiring, type RailMark } from "./useThreadScrubber";
 import { setThreadScrubberIo } from "./useThreadScrubber";
 import {
   setConciergeBacklogIo,
@@ -30,11 +30,14 @@ import type { ConciergeMessage } from "./types";
 const NOW = 1_700_000_000_000;
 const DAY = 86_400_000;
 
-const ANCIENT: ScrubberMarker = {
+/** The mark the stand-in rail commits. `fraction` is a CONTENT-axis position now (see
+ *  railGeometry.ts) — 0 because a three-day-old prompt is at the top of everything loaded. */
+const ANCIENT: RailMark = {
   id: "you-ancient",
   createdAt: NOW - 3 * DAY,
   textPrefix: "what did we decide about the rail",
   index: 1,
+  fraction: 0,
 };
 
 /** The rows SQLite would return for that window — the ancient prompt and the reply to it. */
@@ -123,7 +126,16 @@ beforeEach(() => {
   });
   useConciergeBacklogStore.getState().clear();
   setConciergeChat([]);
-  setThreadScrubberIo({ now: () => NOW, promptsInRange: async () => [] });
+  // EVERY LEG OF THE SEAM IS STUBBED, not just the one this file exercises. An unstubbed leg reaches
+  // the real Tauri `invoke`, which rejects in jsdom — and the controller records that as `failed`,
+  // so the rail under test would quietly be in its error state for reasons that have nothing to do
+  // with what these rows are about.
+  setThreadScrubberIo({
+    now: () => NOW,
+    promptsInRange: async () => [],
+    promptDensity: async () => [],
+    historyExtent: async () => ({ oldestMs: NOW - 30 * DAY, newestMs: NOW, count: 0 }),
+  });
   setConciergeBacklogIo({ now: () => NOW, entriesInRange: async () => ANCIENT_ROWS });
 });
 

@@ -119,8 +119,18 @@ export const MEASURE = `(() => {
   }
   const track = rail.querySelector('[data-scrubber-track="yes"]');
   const handle = rail.querySelector('[data-testid="concierge-thread-scrubber-handle"]');
-  const dots = Array.from(rail.querySelectorAll('[data-testid="concierge-thread-scrubber-dot"]'));
+  // MARKS, not dots — the founder's own correction ("we need it to be little lines instead of
+  // dots"), so the testid moved with the shape.
+  const dots = Array.from(rail.querySelectorAll('[data-testid="concierge-thread-scrubber-mark"]'));
   const scope = rail.querySelector('select');
+  // THE VISIBLE HALF of the scope control. The <select> is now an invisible overlay (it carries the
+  // value, the name and the platform picker), and the CHIP is what is painted — so the chip is what
+  // a clipping or overflow check has to measure. Measuring the transparent overlay would report a
+  // control that is perfectly placed while the token beside it hangs off the column.
+  const chip = rail.querySelector('[data-testid="concierge-thread-scrubber-scope"]');
+  // THE BAR MUST BE GONE (defect 1). Read off the scroller the rail sits beside: a scroller with a
+  // classic scrollbar has a clientWidth narrower than its offsetWidth by the bar's width.
+  const scroller = (rail.closest('section') || document).querySelector('[data-concierge-scroller="yes"]');
   // The COLUMN is the concierge section — the box whose edge the rail must stay inside, and whose
   // sideways overflow a new gutter is the likeliest thing to cause.
   const col = rail.closest('section[aria-label="Sparkle concierge"]') || rail.parentElement;
@@ -140,12 +150,21 @@ export const MEASURE = `(() => {
     colScrollW: col.scrollWidth,
     colClientW: col.clientWidth,
     scope: scope ? {
-      box: box(scope),
-      scrollW: scope.scrollWidth,
-      clientW: scope.clientWidth,
+      box: box(chip || scope),
+      scrollW: (chip || scope).scrollWidth,
+      clientW: (chip || scope).clientWidth,
       value: scope.value,
       aria: scope.getAttribute('aria-label'),
       options: scope.options.length,
+      // THE CHEVRON he asked for ("a little down arrow to the right of the 3d, to make it obvious
+      // that I can change that time period"). Absent, the control reads as a label.
+      hasChevron: !!(chip && chip.querySelector('svg')),
+      overlayHidden: getComputedStyle(scope).opacity === '0',
+    } : null,
+    scroller: scroller ? {
+      railScrolled: scroller.getAttribute('data-rail-scrolled'),
+      barWidth: scroller.offsetWidth - scroller.clientWidth,
+      overflowY: getComputedStyle(scroller).overflowY,
     } : null,
     // Every dot's centre, so a dot painted outside the track can be named rather than counted.
     dotCentres: dots.map((d) => { const r = d.getBoundingClientRect();
@@ -188,12 +207,12 @@ export function verdictFor(m, width) {
   if (!m.hasHandle) fails.push("the rail rendered with no draggable handle");
 
   if (m.dotCount === 0) {
-    fails.push("the rail drew NO dots — a dot per prompt is the whole feature");
+    fails.push("the rail drew NO dots — a mark per prompt is the whole feature");
   } else if (m.trackBox) {
     const stray = m.dotCentres.filter(
       (d) => d.cx < m.trackBox.x - 8 || d.cx > m.trackBox.right + 8,
     );
-    if (stray.length) fails.push(`${stray.length} dot(s) painted outside the track`);
+    if (stray.length) fails.push(`${stray.length} mark(s) painted outside the track`);
   }
 
   if (!m.scope) {
@@ -209,7 +228,31 @@ export function verdictFor(m, width) {
         `the scope control is painted ${Math.round(m.scope.box.right - m.colBox.right)}px past the column's right edge`,
       );
     }
-    if (m.scope.options !== 13) notes.push(`scope offers ${m.scope.options} options, expected 13`);
+    if (m.scope.options !== 14) notes.push(`scope offers ${m.scope.options} options, expected 14`);
+    // DISCOVERABILITY IS THE DEFECT, not the option list: he could always change the scope and did
+    // not know it. A control with no chevron reads as a label.
+    if (!m.scope.hasChevron) fails.push("the scope control has no chevron — it reads as a label, not a menu");
+    if (!m.scope.overlayHidden) fails.push("the scope <select> is visible, so the UA focus ring will show");
+  }
+
+  // ── THE RAIL REPLACES THE BAR ────────────────────────────────────────────────────────────────
+  // His words: "there shouldn't be a scroll bar. There should only be the slider." A DOM check
+  // cannot see this — the bar is UA chrome — but the SCROLLER'S OWN GEOMETRY can: a classic bar
+  // takes width, so `offsetWidth - clientWidth` is non-zero exactly while one is painted.
+  if (!m.scroller) {
+    notes.push("no concierge scroller found beside the rail");
+  } else {
+    if (m.scroller.railScrolled !== "yes") {
+      fails.push("the scroller is not marked as rail-scrolled, so the scrollbar rule never applies");
+    }
+    if (m.scroller.barWidth > 0) {
+      fails.push(`the native scrollbar is still painted (${m.scroller.barWidth}px of chrome)`);
+    }
+    // …AND THE SCROLLING SURVIVED. He is removing the bar, not the ability to scroll — a rule that
+    // reached for `overflow: hidden` would pass the check above and break the thread.
+    if (m.scroller.overflowY !== "auto" && m.scroller.overflowY !== "scroll") {
+      fails.push(`the scroller stopped scrolling (overflow-y: ${m.scroller.overflowY})`);
+    }
   }
 
   // Only overflow BEYOND what the column does without a rail is this feature's fault. The inherited

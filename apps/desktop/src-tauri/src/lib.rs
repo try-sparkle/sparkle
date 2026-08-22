@@ -1394,6 +1394,12 @@ pub fn run() {
             // check; run it rather than trusting a green build.
             history::history_prompts_in_range,
             history::history_entries_in_range,
+            // Defects 3 and 7 of bead sparkle-bjbhw6: the scope menu's TRUE extent ("All —
+            // since Aug 12"), and the bucketed density the rail is drawn FROM so it can represent
+            // every prompt in range without loading every row into the renderer. Same
+            // registration hazard as the two lines above — unregistered still compiles clean.
+            history::history_extent,
+            history::history_prompt_density,
             transcript::read_transcript_last_assistant,
             // Mounted-agent conversation: bounded backwards paging + incremental tailing of the
             // agent's own Claude Code JSONL transcripts.

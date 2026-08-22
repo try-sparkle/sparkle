@@ -37,6 +37,13 @@ function Harness({ enabled = true, onCopied }: { enabled?: boolean; onCopied?: (
           <p data-testid="inside">Sparkle said this bit.</p>
           <p data-testid="blank"> &nbsp; </p>
         </div>
+        {/* A CONTROL that opted out (the scrubber rail's shape), and its twin that did not. The two
+            are identical in every other respect, which is what makes the paired tests below pin the
+            ATTRIBUTE as the cause rather than merely the position. */}
+        <span data-testid="rail" data-control-gesture="yes">
+          <span data-testid="rail-knob" />
+        </span>
+        <span data-testid="plain" />
         <p data-testid="compose">Draft in the compose box.</p>
       </div>
       <p data-testid="outside">Someone else&apos;s words.</p>
@@ -69,6 +76,23 @@ function releaseOverBox(): void {
   const box = screen.getByTestId("box");
   fireEvent.mouseDown(box);
   fireEvent.mouseUp(box);
+}
+
+/** A real press, as the browser dispatches it: `pointerdown` first, then `mousedown`.
+ *
+ *  Constructed as a MouseEvent rather than through `fireEvent.pointerDown`, because jsdom's
+ *  PointerEvent support is not something to lean on — the listener reads `type` and `target` and
+ *  does not care which constructor produced them. Same idiom as `ColumnPullTab.test.tsx`. */
+function pressOn(el: Element): void {
+  el.dispatchEvent(new MouseEvent("pointerdown", { bubbles: true, cancelable: true, button: 0 }));
+  fireEvent.mouseDown(el);
+}
+
+/** The matching release: `pointerup` first, then `mouseup` — the real order, and the reason a
+ *  press-time flag is needed beside the latch. */
+function releaseOn(el: Element): void {
+  el.dispatchEvent(new MouseEvent("pointerup", { bubbles: true, cancelable: true, button: 0 }));
+  fireEvent.mouseUp(el);
 }
 
 describe("useCopyOnSelection", () => {
@@ -462,5 +486,119 @@ describe("useCopyOnSelection", () => {
     });
 
     expect(writeText).toHaveBeenCalledTimes(1);
+  });
+
+  // ══ A CONTROL GESTURE IS NOT A SELECTION (DEFECT 4 of sparkle-bjbhw6) ═════════════════════════
+  // "If I'm dragging and scrolling the scroll bar, I don't want it to be implementing drag to
+  // understand. So anything where there is an action that is click drag should not trigger drag to
+  // understand."
+  //
+  // Every test here is PAIRED against the identical gesture with the attribute absent, because
+  // "nothing was copied" on its own is satisfied by a hook that copies nothing at all.
+  describe("a press that lands on a control that opted out", () => {
+    it("does NOT copy the selection the drag left behind", async () => {
+      render(<Harness />);
+      // The scrubber drag: press on the rail knob, the browser highlights transcript text as the
+      // pointer sweeps across it, release over the thread.
+      pressOn(screen.getByTestId("rail-knob"));
+      selectContentsOf("inside");
+      releaseOn(screen.getByTestId("box"));
+      await settle();
+
+      expect(writeText).not.toHaveBeenCalled();
+      expect(screen.queryByTestId("toast")).toBeNull();
+    });
+
+    it("DOES copy for the identical gesture on an element that did not opt out", async () => {
+      // THE PAIR. Same press-drag-release, same selection, same release point — the only difference
+      // is `data-control-gesture`. Without this, the test above passes for a hook that is simply
+      // broken.
+      render(<Harness />);
+      pressOn(screen.getByTestId("plain"));
+      selectContentsOf("inside");
+      releaseOn(screen.getByTestId("box"));
+      await settle();
+
+      expect(writeText).toHaveBeenCalledTimes(1);
+      expect(writeText).toHaveBeenCalledWith("Sparkle said this bit.");
+    });
+
+    it("copies normally again on the NEXT gesture — one control drag must not deafen the session", async () => {
+      render(<Harness />);
+      pressOn(screen.getByTestId("rail-knob"));
+      selectContentsOf("inside");
+      releaseOn(screen.getByTestId("box"));
+      await settle();
+      expect(writeText).not.toHaveBeenCalled();
+
+      // A perfectly ordinary content selection, immediately afterwards.
+      window.getSelection()?.removeAllRanges();
+      pressOn(screen.getByTestId("inside"));
+      selectContentsOf("inside");
+      releaseOn(screen.getByTestId("box"));
+      await settle();
+
+      expect(writeText).toHaveBeenCalledTimes(1);
+    });
+
+    it("suppresses the KEYBOARD debounce for the whole drag — the latch, which is the only thing that can", async () => {
+      // `selectionchange` carries NO target, so nothing in this path can ask what was pressed. Only
+      // the pointerdown latch knows. No `mousedown` is dispatched here at all, so the hook's own
+      // press-time flag is false and the latch is the sole guard under test.
+      vi.useFakeTimers();
+      render(<Harness />);
+      screen
+        .getByTestId("rail-knob")
+        .dispatchEvent(new MouseEvent("pointerdown", { bubbles: true, cancelable: true, button: 0 }));
+      selectContentsOf("inside");
+
+      // The reader holds the handle still for longer than the quiet period — the pause that used to
+      // fire a copy mid-gesture.
+      act(() => {
+        document.dispatchEvent(new Event("selectionchange"));
+        vi.advanceTimersByTime(KEYBOARD_SELECTION_DEBOUNCE_MS * 3);
+      });
+      await settle();
+      expect(writeText).not.toHaveBeenCalled();
+
+      // PAIRED with the release: once the handle is let go, the same quiet period copies.
+      screen
+        .getByTestId("rail-knob")
+        .dispatchEvent(new MouseEvent("pointerup", { bubbles: true, cancelable: true, button: 0 }));
+      act(() => {
+        document.dispatchEvent(new Event("selectionchange"));
+        vi.advanceTimersByTime(KEYBOARD_SELECTION_DEBOUNCE_MS * 3);
+      });
+      await settle();
+
+      expect(writeText).toHaveBeenCalledTimes(1);
+    });
+
+    it("recovers on window blur when the release never arrives", async () => {
+      // THE BACKSTOP `ThreadScrubber` already relies on. A latch with no release is silent and
+      // permanent: copy-on-selection would be dead for the rest of the session.
+      vi.useFakeTimers();
+      render(<Harness />);
+      screen
+        .getByTestId("rail-knob")
+        .dispatchEvent(new MouseEvent("pointerdown", { bubbles: true, cancelable: true, button: 0 }));
+      selectContentsOf("inside");
+      act(() => {
+        document.dispatchEvent(new Event("selectionchange"));
+        vi.advanceTimersByTime(KEYBOARD_SELECTION_DEBOUNCE_MS * 3);
+      });
+      await settle();
+      expect(writeText).not.toHaveBeenCalled();
+
+      // The window goes away mid-drag and no pointerup is ever dispatched.
+      act(() => void window.dispatchEvent(new Event("blur")));
+      act(() => {
+        document.dispatchEvent(new Event("selectionchange"));
+        vi.advanceTimersByTime(KEYBOARD_SELECTION_DEBOUNCE_MS * 3);
+      });
+      await settle();
+
+      expect(writeText).toHaveBeenCalledTimes(1);
+    });
   });
 });

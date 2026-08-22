@@ -15,6 +15,11 @@
 import { useEffect, useRef, useState } from "react";
 import type { RefObject } from "react";
 import { copyToClipboard } from "../../clipboard";
+import {
+  isControlGestureActive,
+  isControlGestureTarget,
+  watchControlGesture,
+} from "./controlGesture";
 
 /** How long the check-mark confirmation stays up. Long enough to register as an answer to the
  *  gesture, short enough that it is gone before the eye goes looking for what it covers. */
@@ -158,6 +163,26 @@ export function useCopyOnSelection(
      */
     let dragging = false;
 
+    /**
+     * Did THIS gesture start on a control that opted out of selection features?
+     *
+     * A drag on the scrubber rail sweeps a text selection across the transcript as a side effect; it
+     * is not a copy gesture and must not write the clipboard. See `controlGesture.ts` for why the
+     * opt-out is an attribute a control sets on itself rather than a selector list here.
+     *
+     * KEPT BESIDE the module latch rather than replacing it, because the two answer different
+     * moments. `pointerup` fires BEFORE `mouseup`, so by the time the release below runs the latch
+     * has already cleared — only a flag recorded at the press still knows what this gesture was. The
+     * latch covers the other half: `selectionchange` during the drag, which carries no target at
+     * all.
+     *
+     * Recomputed on EVERY press, including a secondary one, so it can never go stale into the next
+     * gesture. NOT cleared on release: a double-click arrives as
+     * mousedown/mouseup/mousedown/mouseup/dblclick, and clearing it on the second `mouseup` would
+     * let the trailing `dblclick` copy a control's incidental selection anyway.
+     */
+    let controlGesture = false;
+
     const cancelPending = () => {
       if (debounceTimer.current !== null) clearTimeout(debounceTimer.current);
       debounceTimer.current = null;
@@ -237,7 +262,12 @@ export function useCopyOnSelection(
     // hook is being fixed for. Nothing downstream needs the press to have landed in the thread —
     // `copySelection` refuses selections that do not reach in.
     const onMouseDown = (e: MouseEvent) => {
+      // BEFORE the button test, so a secondary press cannot leave the previous gesture's answer
+      // standing for the release that follows it.
+      controlGesture = isControlGestureTarget(e.target);
       if (e.button !== 0) return;
+      // A control gesture is not a selection being dragged out, so this hook takes no part in it.
+      if (controlGesture) return;
       dragging = true;
       // NO CLAIM RESET HERE — see `onSelectionChange`. Keying it on the press location cannot work:
       // scoped to the container it misses every gesture that BEGINS outside the thread (the
@@ -260,6 +290,9 @@ export function useCopyOnSelection(
     const onMouseUp = () => {
       dragging = false;
       cancelPending();
+      // The press landed on a control — whatever the browser highlighted along the way is a side
+      // effect of that drag, not a copy the reader asked for.
+      if (controlGesture) return;
       copySelection();
     };
 
@@ -271,6 +304,11 @@ export function useCopyOnSelection(
     // the mouse gesture; this one owns only the keyboard, which is all it was ever written for.
     const onSelectionChange = () => {
       cancelPending();
+      // A CONTROL GESTURE IS IN FLIGHT — the latch, because this event names no target and so cannot
+      // be asked what the user pressed on. Nothing is copied and no debounce is armed: a scrubber
+      // drag that pauses longer than the quiet period would otherwise fire a copy mid-gesture, which
+      // is the same mid-drag write the `dragging` branch below exists to prevent.
+      if (controlGesture || isControlGestureActive()) return;
       if (dragging) {
         // WHERE THE DE-DUPE CLAIM IS RELEASED: the selection is changing under a held button, so a
         // NEW one is being made by hand and whatever we copied last is no longer what is on screen.
@@ -293,6 +331,11 @@ export function useCopyOnSelection(
       }, KEYBOARD_SELECTION_DEBOUNCE_MS);
     };
 
+    // Armed here rather than by the integration layer, so the guard cannot be left un-wired by a
+    // future caller that mounts this hook somewhere new. Ref-counted, so the quote hook beside this
+    // one shares the same listeners.
+    const unwatchControlGesture = watchControlGesture(document);
+
     container.addEventListener("dblclick", onMouseUp);
     // Document-level: a drag can START and END anywhere (see `onMouseDown`/`onMouseUp`), and
     // `selectionchange` is only ever dispatched here.
@@ -305,6 +348,7 @@ export function useCopyOnSelection(
       document.removeEventListener("mousedown", onMouseDown);
       document.removeEventListener("mouseup", onMouseUp);
       document.removeEventListener("selectionchange", onSelectionChange);
+      unwatchControlGesture();
     };
   }, [enabled, containerRef]);
 

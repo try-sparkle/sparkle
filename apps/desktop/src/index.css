@@ -319,6 +319,56 @@ body {
   border-radius: 3px;
 }
 
+/* ── THE RAIL REPLACES THE BAR ─────────────────────────────────────────────────────────────────
+   The founder, 2026-08-22: *"I want the slider bar to replace the scroll bar... there shouldn't be
+   a scroll bar. There should only be the slider."* So the transcript that CARRIES the scrubber rail
+   gets no scrollbar chrome at all.
+
+   THIS SUPERSEDES THE BLOCK ABOVE FOR THAT ONE SCROLLER, AND ONLY THAT ONE. Bead sparkle-nheu8
+   asked repeatedly for a classic, always-visible bar and the rule above is what delivered it — it
+   still governs `MountedAgentThread`, which has no rail and would otherwise be left with the macOS
+   overlay bar that started that whole bead. Hung off a SEPARATE marker rather than narrowing the
+   existing one, because `data-concierge-scroller` is the handle ComposeBox measures its drag
+   ceiling against and both threads must keep carrying it (threadScrollerMarker.test.tsx).
+
+   IT REMOVES THE BAR, NOT THE SCROLLING. `overflow-y: auto` is untouched, so wheel, trackpad,
+   keyboard paging, `scrollIntoView` and the auto-follow all behave exactly as they did — he is
+   removing the bar, not the ability to scroll. Both spellings are needed: `scrollbar-width` is the
+   standard (and Firefox's only), `::-webkit-scrollbar` is what WKWebView reads. Source order is
+   what makes this win over the 10px rule above — the two selectors have identical specificity, so
+   this block MUST stay below it. */
+[data-rail-scrolled="yes"] {
+  scrollbar-width: none;
+}
+[data-rail-scrolled="yes"]::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+}
+
+/* ── THE SCRUBBER'S SCOPE MENU ─────────────────────────────────────────────────────────────────
+   His complaint: *"after I select it, it still has a little, like, select outline around it. It
+   shouldn't have that."* That is the macOS WebKit UA focus ring on the `<select>`, which persists
+   because the control keeps DOM focus after the picker closes. Nothing in this repo overrode it.
+
+   The select is rendered INVISIBLE (opacity 0) on top of a chip we draw ourselves — see
+   `ThreadScrubber`'s `ScopeMenu` for why, which is that the founder also asked for a chevron the
+   native control cannot be made to position. So the UA ring is gone by construction and this rule
+   only has to say what replaces it.
+
+   THE RING IS NOT DROPPED, IT MOVES. Dropping it outright would leave a keyboard-reachable control
+   invisible when focused — the exact tradeoff `.nudge-card-quiet` above argues about, and the wrong
+   side of it. `:focus-visible` is the whole point: the browser raises it for keyboard focus and NOT
+   for the click that opened the picker, which is precisely the distinction the complaint is about.
+   Here rather than inline because an inline style cannot express a pseudo-class, and the `+`
+   combinator needs the chip to be the select's next sibling (it is). */
+.scrubber-scope-select {
+  outline: none;
+}
+.scrubber-scope-select:focus-visible + .scrubber-scope-chip {
+  outline: 1px solid var(--c-accent-ink);
+  outline-offset: 1px;
+}
+
 /* Think composer: the textarea is transparent-text over a mention-highlight overlay. Hide its
    scrollbar so a scrollbar's width can never narrow the text and drift it out from under the
    overlay (which has no scrollbar). Scroll position is mirrored to the overlay in JS. */

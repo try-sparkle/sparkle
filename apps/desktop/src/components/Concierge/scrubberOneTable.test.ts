@@ -29,12 +29,47 @@ describe("the rail has exactly one scope table", () => {
     expect(Object.keys(geometry.SCOPE_MS).sort()).toEqual([...geometry.SCRUBBER_SCOPES].sort());
   });
 
-  // The founder's own list, in his own order. A scope silently dropped from the dropdown is a
-  // feature he asked for going missing, which is the whole history of this bead.
-  it("offers all thirteen of the scopes he asked for, in order", () => {
+  // The founder's own list, in his own order, plus the one he asked for on 2026-08-22: *"I'm
+  // realizing that I want more than one day of history. I wanna know how far back you have
+  // history... I basically wanna go as far back as we can."* A scope silently dropped from the
+  // dropdown is a feature he asked for going missing, which is the whole history of this bead.
+  it("offers all fourteen of the scopes he asked for, in order, ending at All", () => {
     expect(geometry.SCRUBBER_SCOPES).toEqual([
-      "1h", "3h", "6h", "12h", "1d", "3d", "7d", "1w", "2w", "1m", "3m", "6m", "1y",
+      "1h", "3h", "6h", "12h", "1d", "3d", "7d", "1w", "2w", "1m", "3m", "6m", "1y", "all",
     ]);
+  });
+
+  // ── "all" IS A SENTINEL, AND ITS REAL EDGE COMES FROM THE STORE ────────────────────────────────
+  // `SCOPE_MS.all` exists only to keep the Record total and to keep arithmetic on it finite; the
+  // window a caller actually uses is `scopeFromMs`, which takes MIN(created_at). Asserting the
+  // SUBSTITUTION — the returned instant, not that a branch ran — is the only version of this that
+  // could go red if `scopeFromMs` started ignoring the measured value.
+  it("takes All's top edge from the measured oldest row, not from the sentinel", () => {
+    const NOW = 1_700_000_000_000;
+    const OLDEST = NOW - 10 * 86_400_000;
+    expect(geometry.scopeFromMs(NOW, "all", OLDEST)).toBe(OLDEST);
+    // A bounded scope ignores the measurement entirely — its edge IS the scope.
+    expect(geometry.scopeFromMs(NOW, "1d", OLDEST)).toBe(NOW - geometry.SCOPE_MS["1d"]);
+  });
+
+  it("falls back to the sentinel window — never to the epoch — when the store has not answered", () => {
+    const NOW = 1_700_000_000_000;
+    // 0 would put every real prompt in the last 0.0001 of the axis, which is precisely the
+    // "the rail shows a couple of dots" failure this work exists to fix.
+    expect(geometry.scopeFromMs(NOW, "all", null)).toBe(NOW - geometry.SCOPE_MS.all);
+    expect(geometry.scopeFromMs(NOW, "all", NaN)).toBe(NOW - geometry.SCOPE_MS.all);
+    // …and a store whose oldest row is somehow in the FUTURE cannot define a window either.
+    expect(geometry.scopeFromMs(NOW, "all", NOW + 1)).toBe(NOW - geometry.SCOPE_MS.all);
+  });
+
+  // The menu answers "how far back do you have history" IN PLACE, which is the thing he had to ask
+  // a person to measure. Only "all" carries it: on a bounded scope the axis's top edge is the scope,
+  // not the data, so printing the data's edge there would describe a different window.
+  it("prints the true extent behind All, and only behind All", () => {
+    const at = Date.UTC(2026, 7, 12, 14, 21, 39);
+    expect(geometry.scopeMenuLabel("all", at)).toMatch(/^All — since Aug 1[23]$/);
+    expect(geometry.scopeMenuLabel("1d", at)).toBe("1d");
+    expect(geometry.scopeMenuLabel("all", null)).toBe("All");
   });
 
   // STRICTLY INCREASING, WITH EXACTLY ONE NAMED EXCEPTION (roborev 66437). The first version of

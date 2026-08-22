@@ -9,7 +9,14 @@
     "is the measured way a feature ships completely inert (AGENTS.md, 'A Rust Option crosses the",
     "wire as null'). Every field here is non-optional by construction, so there is no null case.",
     "The ids look like concierge message ids on purpose: for source='concierge' the history row id",
-    "IS the message id, which is what lets the rail scroll the thread to a specific bubble."
+    "IS the message id, which is what lets the rail scroll the thread to a specific bubble.",
+    "SECOND WAVE (bead sparkle-bjbhw6, defects 3 and 7): historyExtent / historyExtentEmpty for the",
+    "scope menu's true extent, and promptBucket for the bucketed density the rail is DRAWN from. The",
+    "version stays 1 \u2014 these are additive keys, and no existing key moved.",
+    "historyExtentEmpty is the only fixture here carrying nulls, and it is the whole reason it exists:",
+    "HistoryExtent's two bounds are Rust Options, an Option crosses the wire as an EXPLICIT null and",
+    "never as an absent key, so the TS side must read `oldestMs: number | null`. `oldestMs?: number`",
+    "is number|undefined, which excludes null \u2014 a parser describing a payload the wire cannot make."
   ],
   "promptMarker": {
     "id": "you-42",
@@ -21,5 +28,25 @@
     "kind": "prompt",
     "createdAt": 1754400000000,
     "text": "Search public data sources to find me 20 people that are most like Zoe: I'm looking for..."
+  },
+  "historyExtent": {
+    "oldestMs": 1754400000000,
+    "newestMs": 1755000000000,
+    "count": 2514
+  },
+  "historyExtentEmpty": {
+    "oldestMs": null,
+    "newestMs": null,
+    "count": 0
+  },
+  "promptBucket": {
+    "index": 3,
+    "startMs": 1754400000000,
+    "endMs": 1754486400000,
+    "count": 128,
+    "firstAtMs": 1754400500000,
+    "newestAtMs": 1754486300000,
+    "newestId": "you-42",
+    "newestTextPrefix": "Search public data sources to find me 20 people that are most like Zoe"
   }
 }

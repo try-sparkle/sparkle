@@ -47,8 +47,9 @@ function controller(): ConciergeController {
 
 function scrubber(failed: boolean): ThreadScrubberController {
   return {
-    markers: [], scope: "1h", setScope: noop, now: 1_700_000_000_000,
-    position: 1, onSeek: noop, onPick: noop, loading: false, failed,
+    marks: [], scope: "1h", setScope: noop, now: 1_700_000_000_000, oldestMs: null,
+    position: 1, onScrub: noop, onScrubEnd: noop, onPick: noop, loading: false, failed,
+    moreAbove: 0, attachScroller: noop,
   };
 }
 

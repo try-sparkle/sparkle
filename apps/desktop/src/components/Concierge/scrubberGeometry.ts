@@ -36,7 +36,11 @@ export type ScrubberScope =
   | "1m"
   | "3m"
   | "6m"
-  | "1y";
+  | "1y"
+  /** EVERY live prompt, however old — the axis's top edge is `MIN(created_at)`, read from the store
+   *  rather than assumed. See {@link scopeFromMs}. The founder asked for this directly: *"I wanna
+   *  know how far back you have history... I basically wanna go as far back as we can"*. */
+  | "all";
 
 /**
  * The dropdown's order — HIS order, tightest first, so scrolling the list walks steadily further
@@ -57,6 +61,7 @@ export const SCRUBBER_SCOPES: readonly ScrubberScope[] = [
   "3m",
   "6m",
   "1y",
+  "all",
 ] as const;
 
 const HOUR = 3_600_000;
@@ -84,7 +89,34 @@ export const SCOPE_MS: Record<ScrubberScope, number> = {
   "3m": 90 * DAY,
   "6m": 180 * DAY,
   "1y": 365 * DAY,
+  /**
+   * A SENTINEL, not a duration, and it is finite on purpose.
+   *
+   * `"all"`'s real top edge is `MIN(created_at)`, which only the store knows — so every caller must
+   * go through {@link scopeFromMs}, which takes that measured value. This entry exists so the
+   * `Record` stays total and so arithmetic on it can never produce `NaN` or `-Infinity` (both of
+   * which would silently place every mark at an invalid position rather than failing loudly). 100
+   * years is far outside any real history and reads as "unbounded" to anyone who prints it.
+   */
+  all: 100 * 365 * DAY,
 };
+
+/**
+ * The instant at the TOP of the axis for a scope — the one place `"all"` differs from every other
+ * entry.
+ *
+ * `oldestMs` is `MIN(created_at)` for the source, or `null` when the store holds nothing (or has not
+ * answered yet). A `null` under `"all"` falls back to the sentinel window rather than to 0: an epoch
+ * of 1970 would put every real prompt in the last 0.0001 of the axis, which is precisely the
+ * "the rail shows a couple of dots" failure this work exists to fix.
+ */
+export function scopeFromMs(now: number, scope: ScrubberScope, oldestMs: number | null): number {
+  if (scope !== "all") return now - SCOPE_MS[scope];
+  if (oldestMs === null || !Number.isFinite(oldestMs)) return now - SCOPE_MS.all;
+  // A store whose oldest row is somehow in the future cannot define a window; fall back rather than
+  // producing an inverted one.
+  return oldestMs <= now ? oldestMs : now - SCOPE_MS.all;
+}
 
 /**
  * What the dropdown prints. The control sits at the top of a ~16px rail, so the label is the token
@@ -105,6 +137,7 @@ export const SCOPE_LABEL: Record<ScrubberScope, string> = {
   "3m": "3m",
   "6m": "6m",
   "1y": "1y",
+  all: "All",
 };
 
 /**
@@ -126,6 +159,7 @@ export const SCOPE_PHRASE: Record<ScrubberScope, string> = {
   "3m": "3 months",
   "6m": "6 months",
   "1y": "1 year",
+  all: "all of your history",
 };
 
 /** One dot's worth of input. The caller truncates `textPrefix`; this module never touches text. */
@@ -170,6 +204,27 @@ export function fractionFor(createdAt: number, w: ScrubberWindow): number {
 export function timeAt(fraction: number, w: ScrubberWindow): number {
   return w.fromMs + clamp01(fraction) * (w.toMs - w.fromMs);
 }
+
+// ══ EVERYTHING BELOW THIS LINE IS THE RETIRED TIME AXIS ════════════════════════════════════════
+//
+// NOTHING IN PRODUCTION CALLS IT ANY MORE. As of bead `sparkle-bjbhw6` the rail is drawn on the
+// CONTENT axis — `railGeometry.ts` — because a control that REPLACES the scrollbar has to be
+// measured in the scroller's own units. `clusterMarkers`, `nearestCluster`, `nearestMarker`,
+// `fractionFor`, `timeAt`, `scopeWindow` and `DotCluster` are reached only by their own tests.
+//
+// IF YOU ARE ABOUT TO USE ONE OF THESE, YOU ALMOST CERTAINLY WANT `railGeometry.ts` INSTEAD.
+// `mergeMarks` / `nearestBand` / `pickFromBand` are the live equivalents and they take a 0..1
+// content fraction rather than a timestamp and a window.
+//
+// It is left in place rather than deleted in the same change as the rewrite, so the diff reviewers
+// read is the behaviour change and not a 150-line deletion mixed into it. Removing it is its own
+// single-purpose commit — bead filed. What must NOT happen meanwhile is a new caller binding to it,
+// which is the only reason this banner is here: a green test suite over an unreachable module is
+// exactly the "guarantee defended for nobody" this file has already been bitten by twice.
+//
+// The SCOPE TABLE above (SCOPE_MS / SCOPE_LABEL / SCOPE_PHRASE / SCRUBBER_SCOPES / scopeFromMs /
+// scopeMenuLabel) and `ageLabel` are LIVE and stay — the scope is still a time window, it is only
+// the rail's axis that stopped being one.
 
 /** The spec's figure: dots closer than ~6px merge (`PRD/sparkle/thread-scrubber-and-retention.md`). */
 export const DEFAULT_MIN_GAP_PX = 6;
@@ -383,4 +438,41 @@ export function ageLabel(createdAt: number, now: number): string {
   if (diff < 30 * DAY) return plural(Math.floor(diff / DAY), "day");
   if (diff < 365 * DAY) return plural(Math.floor(diff / (30 * DAY)), "month");
   return plural(Math.floor(diff / (365 * DAY)), "year");
+}
+
+/**
+ * What the scope menu prints for one entry, INCLUDING the true extent behind `"all"`.
+ *
+ * ── WHY THE MENU REPORTS THE EXTENT RATHER THAN JUST NAMING THE SCOPE ──────────────────────────
+ * The founder's question was *"I wanna know how far back you have history"* — and he had to ask a
+ * person to measure the SQLite file to find out. A menu that answers it in place means he never has
+ * to ask again, which is the whole reason this is a label and not a tooltip.
+ *
+ * `oldestMs` is `MIN(created_at)` for the source, or `null` when the store holds nothing or has not
+ * answered yet. The extent is appended ONLY to `"all"`: on a bounded scope the axis's top edge is
+ * the scope, not the data, so printing the data's edge there would describe a different window from
+ * the one drawn.
+ *
+ * Deliberately DAY precision and no year — "since Aug 12". The menu sits in a 16px gutter and this
+ * string is the widest thing in it; a full timestamp would be unreadable at that width and tells the
+ * reader nothing a day does not. `Intl` rather than a hand-rolled month table so it follows the
+ * platform locale, with a fixed `en-US` fallback for the test environment's sake.
+ */
+export function scopeMenuLabel(scope: ScrubberScope, oldestMs: number | null): string {
+  const base = SCOPE_LABEL[scope];
+  if (scope !== "all") return base;
+  if (oldestMs === null || !Number.isFinite(oldestMs)) return base;
+  return `${base} — since ${shortDay(oldestMs)}`;
+}
+
+/** "Aug 12". Its own function so the menu label above stays one readable line. */
+export function shortDay(atMs: number): string {
+  try {
+    return new Intl.DateTimeFormat("en-US", { month: "short", day: "numeric" }).format(
+      new Date(atMs),
+    );
+  } catch {
+    // An environment with no `Intl` is not a reason for the menu to fail to render.
+    return new Date(atMs).toDateString().slice(4, 10);
+  }
 }

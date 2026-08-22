@@ -21,8 +21,12 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke }));
 import {
   promptsInRange,
   entriesInRange,
+  historyExtent,
+  promptDensity,
   type PromptMarkerRow,
   type HistoryRangeRow,
+  type HistoryExtent,
+  type PromptBucket,
 } from "./history";
 
 const FIXTURE = JSON.parse(
@@ -34,6 +38,21 @@ const FIXTURE = JSON.parse(
   version: number;
   promptMarker: Record<string, unknown>;
   rangeRow: Record<string, unknown>;
+  // The second wave (bead sparkle-bjbhw6). `historyExtent`'s bounds are `number | null` — NOT
+  // `number | undefined` — because that is what a Rust `Option` puts on the wire, and describing it
+  // any other way here would defeat the purpose of parsing the shared fixture at all.
+  historyExtent: { oldestMs: number | null; newestMs: number | null; count: number };
+  historyExtentEmpty: { oldestMs: number | null; newestMs: number | null; count: number };
+  promptBucket: {
+    index: number;
+    startMs: number;
+    endMs: number;
+    count: number;
+    firstAtMs: number;
+    newestAtMs: number;
+    newestId: string;
+    newestTextPrefix: string;
+  };
 };
 
 beforeEach(() => {
@@ -113,5 +132,67 @@ describe("entriesInRange", () => {
       limit: 400,
     });
     expect(got[0]!.text).toContain("I'm looking for");
+  });
+});
+
+
+// ── THE SECOND WAVE (bead sparkle-bjbhw6, defects 3 and 7) ──────────────────────────────────────
+
+describe("historyExtent", () => {
+  it("calls history_extent and reads every key the fixture carries", async () => {
+    invoke.mockResolvedValue(FIXTURE.historyExtent);
+    const got: HistoryExtent = await historyExtent("concierge");
+    expect(invoke).toHaveBeenCalledWith("history_extent", { source: "concierge" });
+    expect(got.oldestMs).toBe(FIXTURE.historyExtent.oldestMs);
+    expect(got.newestMs).toBe(FIXTURE.historyExtent.newestMs);
+    expect(got.count).toBe(FIXTURE.historyExtent.count);
+  });
+
+  // THE NULL CASE IS THE WHOLE POINT OF THIS ROW, and it is the one shape a `?: number` type cannot
+  // describe. A Rust `Option` reaches the wire as an EXPLICIT null, never as an absent key — so a
+  // parser typed `oldestMs?: number` (which is `number | undefined`) describes a payload the wire
+  // cannot produce. The fixture carries the nulls so both suites fail together (AGENTS.md,
+  // bead sparkle-16y6h).
+  it("reads an EMPTY store's explicit nulls — not an absent key", async () => {
+    expect(Object.keys(FIXTURE.historyExtentEmpty)).toEqual(["oldestMs", "newestMs", "count"]);
+    expect(FIXTURE.historyExtentEmpty.oldestMs).toBeNull();
+    invoke.mockResolvedValue(FIXTURE.historyExtentEmpty);
+    const got: HistoryExtent = await historyExtent("concierge");
+    expect(got.oldestMs).toBeNull();
+    expect(got.newestMs).toBeNull();
+    expect(got.count).toBe(0);
+  });
+});
+
+describe("promptDensity", () => {
+  it("calls history_prompt_density with camelCase args and reads every bucket key", async () => {
+    invoke.mockResolvedValue([FIXTURE.promptBucket]);
+    const got: PromptBucket[] = await promptDensity(1000, 2000, "concierge", 64);
+    expect(invoke).toHaveBeenCalledWith("history_prompt_density", {
+      fromMs: 1000,
+      toMs: 2000,
+      source: "concierge",
+      buckets: 64,
+    });
+    const b = got[0]!;
+    // EVERY key, by value from the fixture — a partial read is exactly how a renamed field survives
+    // on this side while the Rust suite stays green.
+    expect(b.index).toBe(FIXTURE.promptBucket.index);
+    expect(b.startMs).toBe(FIXTURE.promptBucket.startMs);
+    expect(b.endMs).toBe(FIXTURE.promptBucket.endMs);
+    expect(b.count).toBe(FIXTURE.promptBucket.count);
+    expect(b.firstAtMs).toBe(FIXTURE.promptBucket.firstAtMs);
+    expect(b.newestAtMs).toBe(FIXTURE.promptBucket.newestAtMs);
+    expect(b.newestId).toBe(FIXTURE.promptBucket.newestId);
+    expect(b.newestTextPrefix).toBe(FIXTURE.promptBucket.newestTextPrefix);
+  });
+
+  // NO OPTIONALS ANYWHERE IN THIS SHAPE, deliberately: the Rust struct carries no `Option`, so there
+  // is no null for the two halves to disagree about. Asserted rather than merely stated, because the
+  // day someone adds one is the day the TS type has to grow a `| null`.
+  it("has no nullable field to disagree about", () => {
+    for (const [k, v] of Object.entries(FIXTURE.promptBucket)) {
+      expect(v, `promptBucket.${k} must not be null`).not.toBeNull();
+    }
   });
 });

@@ -22,6 +22,11 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { RefObject } from "react";
 import { selectionWithin } from "./useCopyOnSelection";
+import {
+  isControlGestureActive,
+  isControlGestureTarget,
+  watchControlGesture,
+} from "./controlGesture";
 import { matchesChord } from "../../keyboardHints/keybindings";
 import { useKeybindingsStore } from "../../stores/keybindingsStore";
 import type { QuoteSource } from "./composeQuote";
@@ -93,6 +98,10 @@ export function useQuoteOnSelection(
     if (!enabled || !container) return;
 
     let dragging = false;
+    /** Did THIS gesture start on a control that opted out? See `useCopyOnSelection`'s twin of this
+     *  flag for why a press-time record is needed BESIDE the module latch: `pointerup` clears the
+     *  latch before `mouseup` runs, and `selectionchange` names no target at all. */
+    let controlGesture = false;
 
     const cancelPending = () => {
       if (debounceTimer.current !== null) clearTimeout(debounceTimer.current);
@@ -150,6 +159,9 @@ export function useQuoteOnSelection(
     };
 
     const onMouseDown = (e: MouseEvent) => {
+      // BEFORE either early return, so a secondary press or a press on the chiclet cannot leave the
+      // previous gesture's answer standing for the release that follows.
+      controlGesture = isControlGestureTarget(e.target);
       if (e.button !== 0) return;
       // A press INSIDE the chiclet is the activation, not the start of a new selection. Without this
       // the affordance would tear itself down on the way to being clicked.
@@ -164,6 +176,9 @@ export function useQuoteOnSelection(
       if (!dragging) return;
       dragging = false;
       cancelPending();
+      // The press landed on a control that opted out — the highlight this drag left behind is a side
+      // effect of moving a handle, not a passage the reader picked out to quote.
+      if (controlGesture) return;
       offer({ x: e.clientX, y: e.clientY });
     };
 
@@ -173,6 +188,10 @@ export function useQuoteOnSelection(
     // the pointer.
     const onSelectionChange = () => {
       cancelPending();
+      // A CONTROL GESTURE IS IN FLIGHT — read from the latch, because this event names no target.
+      // Without it a scrubber drag that pauses past the quiet period raises a chiclet over text the
+      // reader never picked out.
+      if (controlGesture || isControlGestureActive()) return;
       if (dragging) return;
       debounceTimer.current = setTimeout(() => {
         debounceTimer.current = null;
@@ -196,12 +215,18 @@ export function useQuoteOnSelection(
       offer();
     };
 
+    // Armed here as well as in `useCopyOnSelection`: the two hooks mount together today, but neither
+    // may depend on the other having done it. The calls are ref-counted, so this is one set of
+    // listeners either way.
+    const unwatchControlGesture = watchControlGesture(document);
+
     document.addEventListener("mousedown", onMouseDown);
     document.addEventListener("mouseup", onMouseUp);
     document.addEventListener("selectionchange", onSelectionChange);
     document.addEventListener("keydown", onKeyDown);
     return () => {
       cancelPending();
+      unwatchControlGesture();
       document.removeEventListener("mousedown", onMouseDown);
       document.removeEventListener("mouseup", onMouseUp);
       document.removeEventListener("selectionchange", onSelectionChange);

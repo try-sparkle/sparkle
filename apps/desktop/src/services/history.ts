@@ -160,3 +160,81 @@ export async function entriesInRange(
     limit,
   });
 }
+
+// ── THE RAIL'S TWO AGGREGATE READS (bead `sparkle-bjbhw6`, defects 3 and 7) ──────────────────────
+//
+// Both answer a question about the WHOLE store without moving the store's rows, which is the
+// founder's own constraint on this feature: *"draw the rail from an aggregate query (counts
+// bucketed by time), and page entries in as the viewport needs them. Do not load every row into the
+// renderer to draw the rail — at the current rate this table reaches ~1 GB/year and he wants all of
+// it kept."*
+//
+// `HistoryExtent` IS THE ONE PLACE IN THIS FILE WITH NULLS, and they are `T | null` rather than
+// `?: T` for the reason AGENTS.md records (bead sparkle-16y6h): a Rust `Option` crosses the wire as
+// an EXPLICIT `null`, never as an absent key, and TypeScript's `field?: T` means `T | undefined`,
+// which EXCLUDES null. A hand-written type in that shape describes a payload the wire cannot
+// produce. `historyExtentEmpty` in `shared/history-range-wire.json` is the fixture both suites parse
+// so the two halves fail together rather than one of them silently going inert.
+
+/** The true extent of stored prompts for one source. Both bounds are null iff `count` is 0. */
+export interface HistoryExtent {
+  /** `MIN(created_at)`, epoch ms — what the scope menu prints as "All — since Aug 12". */
+  oldestMs: number | null;
+  /** `MAX(created_at)`, epoch ms. Null under exactly the same condition as `oldestMs`. */
+  newestMs: number | null;
+  /** How many live prompt rows exist for the source. */
+  count: number;
+}
+
+/**
+ * One band of the rail, counted rather than fetched.
+ *
+ * `count` is the TRUE number of prompts in the band — no limit, no sampling — which is what lets the
+ * rail vary its mark instead of lying by omission. Empty bands are NOT returned, so the array is
+ * sparse and strictly ascending by `index`; the renderer places by `index`, and zero-filling a
+ * 2,000-band year would pay for thousands of empty rows to draw nothing.
+ */
+export interface PromptBucket {
+  /** Band ordinal on the axis. 0 is the OLDEST band. */
+  index: number;
+  /** Inclusive start of the band on the axis. */
+  startMs: number;
+  /** End of the band: exclusive, except the LAST band which ends on `toMs` itself. */
+  endMs: number;
+  /** How many live prompts fell in this band. Always >= 1. */
+  count: number;
+  /** `MIN(created_at)` of the band's rows — where the data actually starts inside the band. */
+  firstAtMs: number;
+  /** `MAX(created_at)` of the band's rows. */
+  newestAtMs: number;
+  /** The id of the row at `newestAtMs` — what a pick on this band commits. Ties on `createdAt`
+   *  break toward the row inserted last; see `PromptBucket` in src-tauri/src/history.rs. */
+  newestId: string;
+  /** First 160 chars of that same row's text, truncated in SQL. */
+  newestTextPrefix: string;
+}
+
+/** `MIN`/`MAX`/`COUNT` over one source's live prompts. One indexed scan; moves no text. */
+export async function historyExtent(source: HistorySource): Promise<HistoryExtent> {
+  return await invoke<HistoryExtent>("history_extent", { source });
+}
+
+/**
+ * Prompts of one source bucketed into `buckets` equal bands across `[fromMs, toMs]`, oldest band
+ * first, EMPTY BANDS OMITTED.
+ *
+ * `buckets` is clamped Rust-side to `[1, 4096]`, so 0 is one band rather than a division by zero.
+ */
+export async function promptDensity(
+  fromMs: number,
+  toMs: number,
+  source: HistorySource,
+  buckets: number,
+): Promise<PromptBucket[]> {
+  return await invoke<PromptBucket[]>("history_prompt_density", {
+    fromMs,
+    toMs,
+    source,
+    buckets,
+  });
+}

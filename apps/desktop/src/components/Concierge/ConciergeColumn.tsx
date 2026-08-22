@@ -820,20 +820,33 @@ export function ConciergeColumn({
                 rail ??
                 (scrubber ? (
                   <ThreadScrubber
-                    markers={scrubber.markers}
+                    marks={scrubber.marks}
                     scope={scrubber.scope}
                     onScopeChange={scrubber.setScope}
                     now={scrubber.now}
+                    /* MIN(created_at), so the scope menu can print "All — since Aug 12" rather than
+                       leaving the founder to ask a person to measure the SQLite file. */
+                    oldestMs={scrubber.oldestMs}
                     position={scrubber.position}
-                    onSeek={scrubber.onSeek}
+                    /* LIVE — every pointermove of a drag. This is what scrolls the thread now; see
+                       useThreadScrubber's header for why the old mouseup-only design was reversed. */
+                    onScrub={scrubber.onScrub}
+                    onScrubEnd={scrubber.onScrubEnd}
                     onPick={scrubber.onPick}
-                    /* So a rejected history query cannot read as a quiet week — both draw zero
-                       dots, and only the rail can say which one this is (roborev 66429). */
+                    /* So a rejected history query cannot read as a quiet week — both leave the cards
+                       ageless, and only the rail can say which one this is (roborev 66429). */
                     failed={scrubber.failed}
+                    /* What the store holds ABOVE the loaded thread, by aggregate count. The rail
+                       must never imply that what is loaded is all there is. */
+                    moreAbove={scrubber.moreAbove}
                   />
                 ) : undefined)
               }
               jumpRequest={jumpRequest}
+              /* THE CABLE THE RAIL SCROLLS THROUGH. The rail replaces this thread's scrollbar, so
+                 its controller needs the scroller element itself — see ConciergeThread's prop doc
+                 for why this is a callback rather than a shared ref. */
+              onScrollerAttached={scrubber?.attachScroller}
               onNudgeClick={controller.onNudgeClick}
               onRevealAgent={controller.onRevealAgent}
               onNudgeAction={controller.onNudgeAction}
@@ -1016,7 +1029,7 @@ export function ConciergeColumn({
           rather than to the concierge — a big change in where their words land, and Escape is the
           only gesture that undoes it. So the affordance is ON SCREEN while the state is live rather
           than learned once: the founder's placement is this row, directly above the composer (the
-          one carrying the `>_ …` activity line), right-justified.
+          one carrying the `<_ …` activity line), right-justified.
 
           GATED ON `isWired`, which is the whole point — a hint offering an exit from a state you are
           no longer in asserts the cable is still patched when it isn't, the same stale signal the

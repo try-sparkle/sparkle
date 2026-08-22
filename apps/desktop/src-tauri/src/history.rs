@@ -88,6 +88,84 @@ pub struct RangeRow {
     pub text: String,
 }
 
+/// The TRUE extent of one source's prompt history — what lets the scope menu say "All — since Aug
+/// 12" instead of offering a ladder and leaving the reader to guess which rungs have data
+/// (defect 3 of bead `sparkle-bjbhw6`).
+///
+/// THE ONLY `Option` FIELDS ON THIS SEAM, and they are deliberate. An empty store has no oldest and
+/// no newest instant, and there is no in-band i64 that means "none" — 0 is a real epoch instant and
+/// would render as 1970. So this pair really is nullable, unlike [`PromptMarker`]/[`RangeRow`]/
+/// [`PromptBucket`], which carry no `Option` at all.
+///
+/// serde emits `None` as an explicit `null`, never as an absent key, so the TypeScript side must be
+/// written `oldestMs: number | null` — `oldestMs?: number` is `number | undefined`, which EXCLUDES
+/// null, i.e. a parser describing a shape the wire cannot produce (AGENTS.md; bead `sparkle-16y6h`).
+/// `count` is not optional: "no rows" is 0, which is in-band and unambiguous.
+#[derive(Debug, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryExtent {
+    /// `MIN(created_at)` over live prompts of the source; `None` iff there are none.
+    pub oldest_ms: Option<i64>,
+    /// `MAX(created_at)` over the same rows; `None` under exactly the same condition as
+    /// `oldest_ms` — the two are never independently null.
+    pub newest_ms: Option<i64>,
+    /// How many such rows exist. 0 when both bounds are `None`.
+    pub count: i64,
+}
+
+/// One BAND of the scrubber rail: every prompt whose instant falls inside a slice of the axis,
+/// counted rather than listed (defect 7 of bead `sparkle-bjbhw6`).
+///
+/// ── WHY A BUCKET AND NOT MORE DOTS ────────────────────────────────────────────────────────────
+/// The founder's complaint was "it's giving me, like, some random prompts but it's definitely not
+/// giving me all of them. I mean, I have hundreds." A rail that draws one dot per row must either
+/// cap (and then lie about how much history is behind it) or draw thousands of marks into a few
+/// hundred pixels. Neither is acceptable, and the store is unbounded — ~1 GB/year at the measured
+/// rate, all of it kept. So the rail is drawn from THIS aggregate instead: the renderer gets at most
+/// `buckets` rows however many millions are in range, and `count` is the TRUE number in the band, so
+/// the mark can be VARIED by density rather than the rows silently dropped. There is no LIMIT and no
+/// sampling in [`prompt_density_in`]; adding either would re-introduce exactly the defect.
+///
+/// ── SPARSE, NOT ZERO-FILLED ───────────────────────────────────────────────────────────────────
+/// Bands with no prompts are NOT returned, and `count` is therefore always >= 1. The renderer places
+/// a band by its `index`, so it needs no zero-fill — and a 4,096-bucket year-wide rail over a quiet
+/// stretch would otherwise pay to ship thousands of empty rows.
+///
+/// EVERY FIELD IS NON-OPTIONAL, same reasoning as [`PromptMarker`]: no `Option` means no null for
+/// the two halves of the wire to disagree about.
+#[derive(Debug, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PromptBucket {
+    /// Band ordinal on the axis. **0 is the OLDEST band.** Strictly ascending across the returned
+    /// vector, with gaps wherever a band was empty.
+    pub index: u32,
+    /// This band's inclusive start on the axis: `from_ms + index * span / buckets`.
+    pub start_ms: i64,
+    /// This band's end on the axis. Exclusive (it is the next band's `start_ms`) except on the LAST
+    /// band, whose end is `to_ms` itself — the axis is inclusive at both ends, so a row landing
+    /// exactly on `to_ms` belongs to the last band and never to a phantom band `buckets`.
+    pub end_ms: i64,
+    /// The TRUE number of live prompts in the band. Never 0 — empty bands are not returned.
+    pub count: i64,
+    /// `MIN(created_at)` of the band's rows. Inside `[start_ms, end_ms]` but generally not equal to
+    /// `start_ms`: the axis is a fixed grid, this is where the data actually starts.
+    pub first_at_ms: i64,
+    /// `MAX(created_at)` of the band's rows.
+    pub newest_at_ms: i64,
+    /// The id of the row at `newest_at_ms`.
+    ///
+    /// TIE-BREAK, PINNED: when two rows share the newest `created_at` in a band, `newest_id` and
+    /// `newest_text_prefix` come from the row with the greatest `(created_at, rowid)` — i.e. the
+    /// one inserted last. This is NOT what a bare column beside `MAX(created_at)` gives you: SQLite
+    /// documents that as picking an ARBITRARY row among ties, so [`prompt_density_in`] uses an
+    /// explicit `ROW_NUMBER() OVER (PARTITION BY band ORDER BY created_at DESC, rowid DESC)`
+    /// instead. `prompt_density_ties_on_created_at_break_by_rowid` is the test.
+    pub newest_id: String,
+    /// `substr(text, 1, PROMPT_PREFIX_CHARS)` of the SAME row `newest_id` names — truncated in SQL
+    /// so a year-wide rail never moves whole prompt bodies to draw a hover card.
+    pub newest_text_prefix: String,
+}
+
 impl HistoryDb {
     /// Open `<app_data>/history/history.db` (creating dirs), enable WAL, and ensure the schema.
     pub fn new(app_data_dir: &std::path::Path) -> Result<Self, String> {
@@ -319,6 +397,172 @@ pub(crate) fn entries_in_range_in(
     Ok(out)
 }
 
+/// The upper bound on rail bands. 4,096 is far past any plausible pixel height for the rail, and it
+/// bounds the aggregate's output rows so a caller cannot ask SQLite to build a million-row grouping.
+pub(crate) const MAX_DENSITY_BUCKETS: u32 = 4_096;
+
+/// The TRUE extent of one source's live prompt history: oldest instant, newest instant, and count.
+///
+/// Filters are deliberately identical to [`prompts_in_range_in`] minus the window — `source = ?`,
+/// `kind = 'prompt'`, `deleted_at IS NULL` — so the number the scope menu reports is the number the
+/// rail can actually draw. `MIN`/`MAX` over zero rows are SQL NULL, which is why the two bounds are
+/// `Option`; `COUNT(*)` over zero rows is 0, which is not.
+pub(crate) fn extent_in(conn: &Connection, source: &str) -> rusqlite::Result<HistoryExtent> {
+    conn.query_row(
+        "SELECT MIN(created_at), MAX(created_at), COUNT(*)
+         FROM entries
+         WHERE source = ?1
+           AND kind = 'prompt'
+           AND deleted_at IS NULL",
+        rusqlite::params![source],
+        |r| {
+            Ok(HistoryExtent {
+                oldest_ms: r.get(0)?,
+                newest_ms: r.get(1)?,
+                count: r.get(2)?,
+            })
+        },
+    )
+}
+
+/// Bucketed prompt density across `[from_ms, to_ms]` — the rail's ONLY drawing source.
+///
+/// Returns at most `buckets` [`PromptBucket`]s, SPARSE (empty bands omitted) and STRICTLY ASCENDING
+/// by `index`, where index 0 is the OLDEST band.
+///
+/// ── THE AXIS ──────────────────────────────────────────────────────────────────────────────────
+/// `[from_ms, to_ms]` INCLUSIVE at both ends, matching [`prompts_in_range_in`] exactly so the rail
+/// and the backlog page can never disagree about which rows are "in range". Band `i` covers
+/// `[from + i*span/buckets, from + (i+1)*span/buckets)`, except the LAST band, which is inclusive of
+/// `to_ms`: a row landing exactly on `to_ms` must fall in band `buckets - 1`, never in a phantom
+/// band `buckets`. That is what the `MIN(buckets - 1, …)` in the SQL is for — it is a clamp, not a
+/// rounding nicety, and without it the newest prompt in every window disappears off the end.
+///
+/// ── DEGENERATE INPUTS ─────────────────────────────────────────────────────────────────────────
+/// `buckets` is clamped to `1..=MAX_DENSITY_BUCKETS`, so `buckets == 0` behaves as 1 rather than
+/// dividing by zero. A degenerate span (`to_ms <= from_ms`) collapses to a single band 0 for the
+/// same reason — the divisor is forced to 1 and the clamp does the rest.
+///
+/// ── NO LIMIT, NO SAMPLING ─────────────────────────────────────────────────────────────────────
+/// This is the whole point of defect 7 (bead `sparkle-bjbhw6`): `count` is the TRUE number of live
+/// prompts in the band, so a rail drawn from it can vary its mark by density and can never lie about
+/// how much history is behind it. Aggregation happens in SQLite; the renderer never sees the rows.
+///
+/// ── WHY A WINDOW FUNCTION AND NOT A BARE COLUMN BESIDE `MAX()` ────────────────────────────────
+/// SQLite's bare-column-in-an-aggregate extension does hand back values from a row that produced the
+/// max — but it explicitly picks an ARBITRARY one when several rows tie on that max, and prompts
+/// captured in the same millisecond tie routinely. `newest_id`/`newest_text_prefix` are contracted
+/// to come from the greatest `(created_at, rowid)`, which the extension cannot express, so the
+/// newest row per band is chosen by an explicit `ROW_NUMBER()` instead. Correctness beats one query.
+pub(crate) fn prompt_density_in(
+    conn: &Connection,
+    from_ms: i64,
+    to_ms: i64,
+    source: &str,
+    buckets: u32,
+) -> rusqlite::Result<Vec<PromptBucket>> {
+    // The axis span as the caller drew it — used for the band BOUNDARIES, so `start_ms`/`end_ms`
+    // describe the axis the renderer laid out and not an adjusted one.
+    let axis_span = to_ms - from_ms;
+    // …and the divisor, which must never be 0. A non-positive span means every matching row (there
+    // can only be rows at all when `from_ms == to_ms`) belongs to the single band 0.
+    let (n_buckets, div_span) = if axis_span > 0 {
+        (buckets.clamp(1, MAX_DENSITY_BUCKETS), axis_span)
+    } else {
+        (1u32, 1i64)
+    };
+    let n = i64::from(n_buckets);
+
+    let mut stmt = conn.prepare(
+        // ── THE CLAMP IS IN THE SQL, AND IT HAS TO BE (VADE finding on PR #2435) ────────────────
+        // `(created_at - from) * n / span` yields exactly `n` for a row landing ON `to_ms`, because
+        // the axis is inclusive at both ends. That is one PAST the last band. Folding it in Rust
+        // after the GROUP BY is too late: `band = n` is its own group, so a window holding both a
+        // row in the real last band AND a row exactly on `to_ms` produced TWO rows that the cast
+        // then collapsed onto the same `index`, breaking the contract's "strictly ascending by
+        // index" and drawing two marks in one place with the counts split between them.
+        //
+        // `MIN(expr, n - 1)` is SQLite's two-argument SCALAR min (the one-argument form is the
+        // aggregate), so the fold happens BEFORE `GROUP BY band` and the two rows become one group
+        // with one count. `created_at >= ?1` in the WHERE keeps the expression non-negative, so no
+        // lower clamp is needed.
+        "WITH banded AS (
+             SELECT MIN((created_at - ?1) * ?4 / ?5, ?4 - 1) AS band,
+                    created_at AS created_at,
+                    id AS id,
+                    substr(text, 1, ?6) AS prefix,
+                    rowid AS rid
+             FROM entries
+             WHERE source = ?3
+               AND kind = 'prompt'
+               AND deleted_at IS NULL
+               AND created_at >= ?1 AND created_at <= ?2
+         ),
+         agg AS (
+             SELECT band,
+                    COUNT(*) AS cnt,
+                    MIN(created_at) AS first_at,
+                    MAX(created_at) AS newest_at
+             FROM banded
+             GROUP BY band
+         ),
+         ranked AS (
+             SELECT band, id, prefix,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY band ORDER BY created_at DESC, rid DESC
+                    ) AS rn
+             FROM banded
+         )
+         SELECT a.band, a.cnt, a.first_at, a.newest_at, r.id, r.prefix
+         FROM agg a
+         JOIN ranked r ON r.band = a.band AND r.rn = 1
+         ORDER BY a.band ASC",
+    )?;
+    let rows = stmt.query_map(
+        rusqlite::params![from_ms, to_ms, source, n, div_span, PROMPT_PREFIX_CHARS],
+        |r| {
+            let band: i64 = r.get(0)?;
+            Ok((
+                band,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, String>(5)?,
+            ))
+        },
+    )?;
+
+    let mut out: Vec<PromptBucket> = Vec::new();
+    for row in rows {
+        let (band, count, first_at_ms, newest_at_ms, newest_id, newest_text_prefix) = row?;
+        // The SQL folds `band` into `0..=n-1` before grouping (see the note on the CTE), so this is
+        // a cast. The `clamp` stays as a total-function guard rather than an `as` on a raw i64:
+        // it can no longer change a value, and it must not be the thing the correctness rests on —
+        // that is the SQL's job now, and `prompt_density_to_ms_row_joins_the_last_band` is what
+        // proves it.
+        let index = band.clamp(0, n - 1) as u32;
+        let start_ms = from_ms + (i64::from(index) * axis_span) / n;
+        // Last band ends ON `to_ms` — the axis is inclusive there.
+        let end_ms = if index + 1 >= n_buckets {
+            to_ms
+        } else {
+            from_ms + ((i64::from(index) + 1) * axis_span) / n
+        };
+        out.push(PromptBucket {
+            index,
+            start_ms,
+            end_ms,
+            count,
+            first_at_ms,
+            newest_at_ms,
+            newest_id,
+            newest_text_prefix,
+        });
+    }
+    Ok(out)
+}
+
 /// How many `source = 'concierge'` rows we keep, newest-first.
 ///
 /// AGE and COUNT are two DIFFERENT bounds, and concierge rows are deliberately exempt from the age
@@ -537,6 +781,45 @@ pub async fn history_entries_in_range(
     })
     .await
     .map_err(|e| format!("history_entries_in_range task failed: {e}"))?
+}
+
+/// The scope menu's "how far back does this go" read (defect 3 of bead `sparkle-bjbhw6`).
+///
+/// Cheap by construction: three aggregates over `idx_entries_created`, no rows returned. Safe to
+/// call on every menu open rather than caching a number that goes stale the next time you type.
+#[tauri::command]
+pub async fn history_extent(app: AppHandle, source: String) -> Result<HistoryExtent, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let db = history_db(&app)?;
+        let conn = db.conn.lock().unwrap_or_else(|e| e.into_inner());
+        extent_in(&conn, &source).map_err(|e| format!("extent: {e}"))
+    })
+    .await
+    .map_err(|e| format!("history_extent task failed: {e}"))?
+}
+
+/// The rail's drawing source (defect 7 of bead `sparkle-bjbhw6`): counts bucketed by time.
+///
+/// Note there is no `limit` here and no `Option` on `buckets`, unlike the two range reads above.
+/// The output is bounded by `buckets` (itself clamped to [`MAX_DENSITY_BUCKETS`]) however many rows
+/// are in range, so there is nothing left for a row cap to protect — and a row cap is precisely the
+/// thing that made the rail under-report in the first place.
+#[tauri::command]
+pub async fn history_prompt_density(
+    app: AppHandle,
+    from_ms: i64,
+    to_ms: i64,
+    source: String,
+    buckets: u32,
+) -> Result<Vec<PromptBucket>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let db = history_db(&app)?;
+        let conn = db.conn.lock().unwrap_or_else(|e| e.into_inner());
+        prompt_density_in(&conn, from_ms, to_ms, &source, buckets)
+            .map_err(|e| format!("prompt_density: {e}"))
+    })
+    .await
+    .map_err(|e| format!("history_prompt_density task failed: {e}"))?
 }
 
 #[cfg(test)]
@@ -1086,5 +1369,374 @@ mod tests {
         }
         let got = entries_in_range_in(&conn, 0, 100_000, "concierge", 2).unwrap();
         assert_eq!(got.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(), vec!["c4", "c5"]);
+    }
+
+    // ── DEFECT 3: THE TRUE EXTENT ─────────────────────────────────────────────────────────────
+    // What lets the scope menu say "All — since Aug 12" rather than offering a ladder of rungs the
+    // reader has to probe one by one (bead `sparkle-bjbhw6`).
+
+    /// The three numbers the menu label is built from, asserted as VALUES — the oldest and newest
+    /// instants and the count, not merely "something came back".
+    #[test]
+    fn extent_reports_the_true_oldest_newest_and_count() {
+        let conn = mem();
+        record_into(&conn, &concierge("mid", "second", 2_000)).unwrap();
+        record_into(&conn, &concierge("old", "first", 1_000)).unwrap();
+        record_into(&conn, &concierge("new", "third", 5_000)).unwrap();
+
+        let got = extent_in(&conn, "concierge").unwrap();
+        assert_eq!(
+            got,
+            HistoryExtent { oldest_ms: Some(1_000), newest_ms: Some(5_000), count: 3 }
+        );
+    }
+
+    /// No rows of that source → BOTH bounds absent and the count 0. This is the case that forces
+    /// `Option<i64>` on the seam: 0 is a real epoch instant and would render as 1970, so there is no
+    /// in-band sentinel for "none".
+    #[test]
+    fn extent_is_none_and_zero_when_the_source_has_no_prompts() {
+        let conn = mem();
+        // The table is NOT empty — a build row and a concierge RESPONSE both exist, so this asserts
+        // the WHERE clause rather than an empty database.
+        record_into(&conn, &entry("b", "prompt", "another source", 1_000)).unwrap();
+        record_into(&conn, &concierge_response("r", "an answer", 1_100)).unwrap();
+        assert_eq!(count(&conn), 2);
+
+        assert_eq!(
+            extent_in(&conn, "concierge").unwrap(),
+            HistoryExtent { oldest_ms: None, newest_ms: None, count: 0 }
+        );
+    }
+
+    /// The extent must describe exactly the rows the rail can draw — same three filters as
+    /// `prompts_in_range_in`. Every excluded row is present in the table, and each one would move
+    /// `oldest_ms`/`newest_ms` if it leaked in, so this cannot pass by accident.
+    #[test]
+    fn extent_excludes_tombstones_responses_and_other_sources() {
+        let conn = mem();
+        record_into(&conn, &concierge("keep-old", "mine", 3_000)).unwrap();
+        record_into(&conn, &concierge("keep-new", "mine too", 4_000)).unwrap();
+        // Older than keep-old, so a leak would drag `oldest_ms` down to 1_000.
+        record_into(&conn, &concierge("dead", "tombstoned", 1_000)).unwrap();
+        conn.execute("UPDATE entries SET deleted_at = 9 WHERE id = 'dead'", []).unwrap();
+        // Newer than keep-new, so a leak would push `newest_ms` up to 9_000.
+        record_into(&conn, &concierge_response("resp", "an answer", 9_000)).unwrap();
+        record_into(&conn, &entry("build", "prompt", "another source", 8_000)).unwrap();
+
+        assert_eq!(count(&conn), 5);
+        assert_eq!(
+            extent_in(&conn, "concierge").unwrap(),
+            HistoryExtent { oldest_ms: Some(3_000), newest_ms: Some(4_000), count: 2 }
+        );
+    }
+
+    // ── DEFECT 7: BUCKETED DENSITY ────────────────────────────────────────────────────────────
+
+    /// `(index, count)` pairs — the shape most of these assertions are about.
+    fn bands(rows: &[PromptBucket]) -> Vec<(u32, i64)> {
+        rows.iter().map(|b| (b.index, b.count)).collect()
+    }
+
+    /// THE DEFECT-7 PIN: no LIMIT, no sampling. 500 prompts across a 10-band axis must come back as
+    /// 500, spread exactly 50 per band. This is the test that goes RED if a cap or a sample is ever
+    /// reintroduced — the sum is the true row count, asserted as a number.
+    #[test]
+    fn prompt_density_counts_every_row_with_no_limit_and_no_sampling() {
+        let conn = mem();
+        // 500 rows at 0, 10, 20 … 4990, over the axis [0, 5000] cut into 10 bands of 500ms.
+        for i in 0..500i64 {
+            record_into(&conn, &concierge(&format!("p{i}"), "q", i * 10)).unwrap();
+        }
+        let got = prompt_density_in(&conn, 0, 5_000, "concierge", 10).unwrap();
+
+        assert_eq!(got.len(), 10, "one band per tenth of the axis");
+        assert_eq!(
+            got.iter().map(|b| b.count).sum::<i64>(),
+            500,
+            "every prompt in range must be represented; a cap or a sample makes this < 500"
+        );
+        assert_eq!(bands(&got), (0..10u32).map(|i| (i, 50i64)).collect::<Vec<_>>());
+    }
+
+    /// The axis is INCLUSIVE at both ends, matching `prompts_in_range_in` — and a row landing
+    /// exactly on `to_ms` belongs to the LAST band, never to a phantom band `buckets`.
+    #[test]
+    fn prompt_density_axis_is_inclusive_and_to_ms_lands_in_the_last_band() {
+        let conn = mem();
+        record_into(&conn, &concierge("before", "outside", 999)).unwrap();
+        record_into(&conn, &concierge("lo", "on from_ms", 1_000)).unwrap();
+        record_into(&conn, &concierge("hi", "on to_ms", 2_000)).unwrap();
+        record_into(&conn, &concierge("after", "outside", 2_001)).unwrap();
+
+        let got = prompt_density_in(&conn, 1_000, 2_000, "concierge", 4).unwrap();
+        // Band 0 holds `lo`; band 3 (the LAST, not a band 4) holds `hi`.
+        assert_eq!(bands(&got), vec![(0, 1), (3, 1)]);
+        assert_eq!(got[0].newest_id, "lo");
+        assert_eq!(got[1].newest_id, "hi");
+        assert!(
+            got.iter().all(|b| b.index < 4),
+            "a row on to_ms must not create a phantom band `buckets`: {:?}",
+            got.iter().map(|b| b.index).collect::<Vec<_>>()
+        );
+    }
+
+    /// THE PAIR THE ROW ABOVE NEEDED, and the bug it was blind to (VADE finding on PR #2435).
+    ///
+    /// The row above puts a prompt on `to_ms` and nothing else in the last band, so a `band = n`
+    /// group and a `band = n - 1` group can never both exist — the Rust-side cast folds the lone
+    /// phantom onto `n - 1` and the result LOOKS right. That is the shape AGENTS.md calls a test
+    /// asserting the precondition: it proves a phantom band is not RETURNED, never that a phantom
+    /// band is not FORMED.
+    ///
+    /// Here band 3 (`[1750, 2000)`) genuinely holds `mid`, and `hi` sits exactly on `to_ms`. Before
+    /// the SQL-side fold these were two GROUP BY groups that the cast collapsed onto the same
+    /// `index`, so the caller received TWO buckets both claiming index 3 with the count split
+    /// between them — breaking "strictly ascending by index" and drawing two marks in one place.
+    ///
+    /// The assertions are therefore on the MERGE: one bucket, count 2, and the newest of the two.
+    #[test]
+    fn prompt_density_to_ms_row_joins_the_last_band_rather_than_splitting_it() {
+        let conn = mem();
+        record_into(&conn, &concierge("mid", "genuinely in the last band", 1_900)).unwrap();
+        record_into(&conn, &concierge("hi", "on to_ms", 2_000)).unwrap();
+
+        let got = prompt_density_in(&conn, 1_000, 2_000, "concierge", 4).unwrap();
+        assert_eq!(bands(&got), vec![(3, 2)], "the to_ms row must JOIN band 3, not form its own");
+        assert_eq!(got.len(), 1, "two buckets sharing an index breaks the ascending contract");
+        assert_eq!(got[0].count, 2, "neither row may be lost to the fold");
+        assert_eq!(got[0].first_at_ms, 1_900);
+        assert_eq!(got[0].newest_at_ms, 2_000);
+        assert_eq!(got[0].newest_id, "hi", "the newest of the MERGED band, not of one half of it");
+        // …and the contract's ascending-and-unique guarantee, stated directly.
+        let idx: Vec<u32> = got.iter().map(|b| b.index).collect();
+        let mut sorted = idx.clone();
+        sorted.dedup();
+        assert_eq!(idx, sorted, "indices must be strictly ascending with no duplicates");
+    }
+
+    /// Band `i` covers `[from + i*span/n, from + (i+1)*span/n)` — half-open, so a row exactly on a
+    /// boundary belongs to the HIGHER band. The last band's `end_ms` is `to_ms` itself.
+    #[test]
+    fn prompt_density_bands_are_half_open_except_the_last_which_ends_on_to_ms() {
+        let conn = mem();
+        record_into(&conn, &concierge("just-under", "99", 99)).unwrap();
+        record_into(&conn, &concierge("on-boundary", "100", 100)).unwrap();
+
+        let got = prompt_density_in(&conn, 0, 1_000, "concierge", 10).unwrap();
+        assert_eq!(bands(&got), vec![(0, 1), (1, 1)], "100 belongs to band 1, not band 0");
+        assert_eq!((got[0].start_ms, got[0].end_ms), (0, 100));
+        assert_eq!((got[1].start_ms, got[1].end_ms), (100, 200));
+
+        // …and the last band closes ON to_ms rather than one grid step short of it.
+        record_into(&conn, &concierge("last", "at the end", 1_000)).unwrap();
+        let got = prompt_density_in(&conn, 0, 1_000, "concierge", 10).unwrap();
+        let last = got.last().unwrap();
+        assert_eq!((last.index, last.start_ms, last.end_ms), (9, 900, 1_000));
+    }
+
+    /// SPARSE, not zero-filled: bands with no prompts are simply absent, the result ascends strictly
+    /// by `index`, and every returned `count` is >= 1.
+    #[test]
+    fn prompt_density_omits_empty_bands_and_ascends_strictly_by_index() {
+        let conn = mem();
+        // Bands 0 and 9 only, out of 10. Written newest-first to prove the ordering is the query's
+        // and not the insertion order's.
+        record_into(&conn, &concierge("late", "band 9", 950)).unwrap();
+        record_into(&conn, &concierge("early", "band 0", 10)).unwrap();
+
+        let got = prompt_density_in(&conn, 0, 1_000, "concierge", 10).unwrap();
+        assert_eq!(bands(&got), vec![(0, 1), (9, 1)], "the eight empty bands are NOT returned");
+        assert!(got.iter().all(|b| b.count >= 1));
+        assert!(
+            got.windows(2).all(|w| w[0].index < w[1].index),
+            "indices must strictly ascend"
+        );
+    }
+
+    /// `buckets == 0` behaves as 1 — one band, every row in it — rather than dividing by zero.
+    #[test]
+    fn prompt_density_treats_zero_buckets_as_one_band() {
+        let conn = mem();
+        record_into(&conn, &concierge("a", "one", 10)).unwrap();
+        record_into(&conn, &concierge("b", "two", 900)).unwrap();
+
+        let got = prompt_density_in(&conn, 0, 1_000, "concierge", 0).unwrap();
+        assert_eq!(bands(&got), vec![(0, 2)]);
+        assert_eq!((got[0].start_ms, got[0].end_ms), (0, 1_000));
+        assert_eq!((got[0].first_at_ms, got[0].newest_at_ms), (10, 900));
+    }
+
+    /// …and an absurd `buckets` is clamped to [`MAX_DENSITY_BUCKETS`], so no caller can ask SQLite
+    /// to build a multi-million-row grouping. The row on `to_ms` proves the CLAMPED ceiling is the
+    /// one the last-band rule uses: it must land on index 4095, not on `u32::MAX - 1`.
+    #[test]
+    fn prompt_density_clamps_buckets_to_the_ceiling() {
+        let conn = mem();
+        record_into(&conn, &concierge("lo", "at from_ms", 0)).unwrap();
+        record_into(&conn, &concierge("hi", "at to_ms", 1_000_000)).unwrap();
+
+        let got = prompt_density_in(&conn, 0, 1_000_000, "concierge", u32::MAX).unwrap();
+        assert_eq!(
+            bands(&got),
+            vec![(0, 1), (MAX_DENSITY_BUCKETS - 1, 1)],
+            "buckets clamps to {MAX_DENSITY_BUCKETS}"
+        );
+        assert_eq!(got[1].end_ms, 1_000_000, "the clamped last band still closes on to_ms");
+    }
+
+    /// A degenerate span must not divide by zero: every matching row collapses into band 0 and
+    /// exactly one bucket comes back.
+    #[test]
+    fn prompt_density_degenerate_span_collapses_to_a_single_band() {
+        let conn = mem();
+        record_into(&conn, &concierge("x", "at the instant", 1_000)).unwrap();
+        record_into(&conn, &concierge("y", "same instant", 1_000)).unwrap();
+        record_into(&conn, &concierge("z", "elsewhere", 2_000)).unwrap();
+
+        // to_ms == from_ms: a zero-width axis.
+        let got = prompt_density_in(&conn, 1_000, 1_000, "concierge", 64).unwrap();
+        assert_eq!(bands(&got), vec![(0, 2)]);
+        assert_eq!((got[0].start_ms, got[0].end_ms), (1_000, 1_000));
+
+        // to_ms < from_ms: inverted, so nothing matches — but still no panic and no divide by zero.
+        assert!(prompt_density_in(&conn, 2_000, 1_000, "concierge", 64).unwrap().is_empty());
+    }
+
+    /// The same three filters as `prompts_in_range_in`, asserted on THIS query's own SQL: the two
+    /// are independent strings, so coverage on one says nothing about the other. Every excluded row
+    /// is in the table and each would change a band's `count` if it leaked in.
+    #[test]
+    fn prompt_density_excludes_tombstones_responses_and_other_sources() {
+        let conn = mem();
+        record_into(&conn, &concierge("keep", "mine", 1_500)).unwrap();
+        record_into(&conn, &concierge("dead", "tombstoned", 1_510)).unwrap();
+        conn.execute("UPDATE entries SET deleted_at = 9 WHERE id = 'dead'", []).unwrap();
+        record_into(&conn, &concierge_response("resp", "an answer", 1_520)).unwrap();
+        record_into(&conn, &entry("build", "prompt", "another source", 1_530)).unwrap();
+
+        assert_eq!(count(&conn), 4);
+        let got = prompt_density_in(&conn, 1_000, 2_000, "concierge", 1).unwrap();
+        assert_eq!(bands(&got), vec![(0, 1)], "only the live concierge PROMPT is counted");
+        assert_eq!(got[0].newest_id, "keep");
+    }
+
+    /// `first_at_ms`/`newest_at_ms` are the band's real MIN/MAX `created_at`, NOT its grid
+    /// boundaries — the rail needs to know where the data actually sits inside the slice.
+    #[test]
+    fn prompt_density_reports_the_bands_real_first_and_newest_instants() {
+        let conn = mem();
+        record_into(&conn, &concierge("a", "one", 120)).unwrap();
+        record_into(&conn, &concierge("b", "two", 170)).unwrap();
+
+        let got = prompt_density_in(&conn, 0, 1_000, "concierge", 10).unwrap();
+        assert_eq!(got.len(), 1);
+        let b = &got[0];
+        assert_eq!((b.index, b.count), (1, 2));
+        // The grid says [100, 200); the DATA says [120, 170]. Both are reported, and they differ.
+        assert_eq!((b.start_ms, b.end_ms), (100, 200));
+        assert_eq!((b.first_at_ms, b.newest_at_ms), (120, 170));
+        assert_eq!(b.newest_id, "b");
+    }
+
+    /// THE TIE-BREAK, pinned. Two prompts captured in the SAME millisecond tie on `created_at`, and
+    /// SQLite's bare-column-beside-`MAX()` extension picks an ARBITRARY one of them — which is why
+    /// `prompt_density_in` uses an explicit `ROW_NUMBER() … ORDER BY created_at DESC, rowid DESC`.
+    /// The contract is the greatest `(created_at, rowid)`: the row inserted LAST wins.
+    ///
+    /// Asserted in BOTH insertion orders, because a single ordering is satisfied by "whichever row
+    /// SQLite happened to visit first" and would stay green under an arbitrary pick.
+    #[test]
+    fn prompt_density_ties_on_created_at_break_by_rowid() {
+        for (first, second) in [("aaa", "bbb"), ("bbb", "aaa")] {
+            let conn = mem();
+            record_into(&conn, &concierge(first, &format!("text of {first}"), 1_000)).unwrap();
+            record_into(&conn, &concierge(second, &format!("text of {second}"), 1_000)).unwrap();
+
+            let got = prompt_density_in(&conn, 0, 10_000, "concierge", 4).unwrap();
+            assert_eq!(bands(&got), vec![(0, 2)]);
+            // Same instant either way, so this really is a tie and not an ordering by time.
+            assert_eq!((got[0].first_at_ms, got[0].newest_at_ms), (1_000, 1_000));
+            assert_eq!(
+                got[0].newest_id, second,
+                "the greater rowid (inserted last) must win the tie"
+            );
+            // …and the prefix comes from that SAME row, not from a different one of the tied pair.
+            assert_eq!(got[0].newest_text_prefix, format!("text of {second}"));
+        }
+    }
+
+    /// The prefix is truncated in SQL to [`PROMPT_PREFIX_CHARS`], so a year-wide rail never moves
+    /// whole prompt bodies across the wire to draw a hover card.
+    #[test]
+    fn prompt_density_truncates_the_newest_prefix_in_sql() {
+        let conn = mem();
+        let long = "z".repeat(500);
+        record_into(&conn, &concierge("short", "hi", 100)).unwrap();
+        record_into(&conn, &concierge("long", &long, 900)).unwrap();
+
+        let got = prompt_density_in(&conn, 0, 1_000, "concierge", 2).unwrap();
+        assert_eq!(bands(&got), vec![(0, 1), (1, 1)]);
+        assert_eq!(got[0].newest_text_prefix, "hi", "a short prompt comes back whole");
+        assert_eq!(
+            got[1].newest_text_prefix.chars().count(),
+            PROMPT_PREFIX_CHARS as usize,
+            "a long one is clipped to PROMPT_PREFIX_CHARS"
+        );
+    }
+
+    /// THE SEAM PIN for the two new shapes, same mechanism as
+    /// `range_row_shapes_match_the_shared_wire_fixture`: this asserts serde PRODUCES these exact
+    /// objects, and `services/history.wire.test.ts` asserts the frontend READS them. A field renamed
+    /// on either side reds BOTH suites rather than neither.
+    ///
+    /// `historyExtentEmpty` is the case the other fixtures cannot cover: an `Option::None` crosses
+    /// the wire as an explicit `null`, NOT as an absent key, which is why the TS type is
+    /// `oldestMs: number | null` and never `oldestMs?: number`.
+    #[test]
+    fn extent_and_bucket_shapes_match_the_shared_wire_fixture() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("shared")
+            .join("history-range-wire.json");
+        let raw = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let fixture: serde_json::Value = serde_json::from_str(&raw).expect("fixture is valid JSON");
+
+        let extent =
+            HistoryExtent { oldest_ms: Some(1_754_400_000_000), newest_ms: Some(1_755_000_000_000), count: 2_514 };
+        assert_eq!(
+            serde_json::to_value(&extent).unwrap(),
+            fixture["historyExtent"],
+            "HistoryExtent drifted from apps/desktop/shared/history-range-wire.json"
+        );
+
+        let empty = HistoryExtent { oldest_ms: None, newest_ms: None, count: 0 };
+        let empty_json = serde_json::to_value(&empty).unwrap();
+        assert_eq!(
+            empty_json, fixture["historyExtentEmpty"],
+            "the empty extent drifted from the shared fixture"
+        );
+        assert!(
+            empty_json.get("oldestMs").is_some_and(|v| v.is_null()),
+            "serde must emit None as an explicit null, not omit the key: {empty_json}"
+        );
+
+        let bucket = PromptBucket {
+            index: 3,
+            start_ms: 1_754_400_000_000,
+            end_ms: 1_754_486_400_000,
+            count: 128,
+            first_at_ms: 1_754_400_500_000,
+            newest_at_ms: 1_754_486_300_000,
+            newest_id: "you-42".into(),
+            newest_text_prefix:
+                "Search public data sources to find me 20 people that are most like Zoe".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(&bucket).unwrap(),
+            fixture["promptBucket"],
+            "PromptBucket drifted from apps/desktop/shared/history-range-wire.json"
+        );
     }
 }

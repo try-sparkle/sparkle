@@ -36,8 +36,12 @@ function healthy(over = {}) {
     colClientW: 520,
     scope: {
       box: { x: 500, y: 100, w: 16, h: 14, right: 516, bottom: 114 },
-      scrollW: 16, clientW: 16, value: "1d", aria: "Scrubber time scope", options: 13,
+      scrollW: 16, clientW: 16, value: "1d", aria: "Scrubber time scope", options: 14,
+      hasChevron: true, overlayHidden: true,
     },
+    // The rail REPLACES the bar: the scroller is marked, paints no scrollbar chrome, and still
+    // scrolls. All three are separate facts and each has its own row below.
+    scroller: { railScrolled: "yes", barWidth: 0, overflowY: "auto" },
     dotCentres: [
       { cx: 508, cy: 300, w: 5, colour: "rgb(120, 170, 255)" },
       { cx: 508, cy: 500, w: 5, colour: "rgb(120, 170, 255)" },
@@ -146,7 +150,8 @@ it("exempts the column's PRE-EXISTING sideways overflow, and says it did", () =>
     railBox: { x: 240, y: 100, w: 16, h: 800, right: 256, bottom: 900 },
     trackBox: { x: 240, y: 130, w: 16, h: 770, right: 256, bottom: 900 },
     scope: { box: { x: 240, y: 100, w: 16, h: 14, right: 256, bottom: 114 },
-      scrollW: 16, clientW: 16, value: "1d", aria: "Scrubber time scope", options: 13 },
+      scrollW: 16, clientW: 16, value: "1d", aria: "Scrubber time scope", options: 14,
+      hasChevron: true, overlayHidden: true },
     dotCentres: [{ cx: 248, cy: 300, w: 5, colour: "rgb(120, 170, 255)" }],
     dotCount: 1,
     colScrollW: 295,
@@ -163,7 +168,8 @@ it("still fails on overflow BEYOND the inherited baseline", () => {
     railBox: { x: 240, y: 100, w: 16, h: 800, right: 256, bottom: 900 },
     trackBox: { x: 240, y: 130, w: 16, h: 770, right: 256, bottom: 900 },
     scope: { box: { x: 240, y: 100, w: 16, h: 14, right: 256, bottom: 114 },
-      scrollW: 16, clientW: 16, value: "1d", aria: "Scrubber time scope", options: 13 },
+      scrollW: 16, clientW: 16, value: "1d", aria: "Scrubber time scope", options: 14,
+      hasChevron: true, overlayHidden: true },
     dotCentres: [{ cx: 248, cy: 300, w: 5, colour: "rgb(120, 170, 255)" }],
     dotCount: 1,
     colScrollW: 320,
@@ -178,4 +184,42 @@ it("reports the column even when the rail is ABSENT, so an overflow can be attri
   const v = verdictFor({ found: false, colBox: { x: 0, y: 0, w: 260, right: 260 }, colScrollW: 295, colClientW: 260 }, 260);
   expect_equal(v.ok, false);
   expect_ok(v.notes.some((n) => /rail absent/.test(n)), "must report the column's own overflow");
+});
+
+// ── THE 2026-08-22 DEFECTS, each with its own row ───────────────────────────────────────────────
+// These are the rules a DOM test cannot reach: the chevron is chrome, and the scrollbar is UA
+// chrome with no element of its own. The probe reads them off real geometry in a real browser, so
+// the verdict function is where they get pinned.
+
+it("a scope control with no chevron fails — it reads as a label, not a menu", () => {
+  const m = healthy();
+  m.scope = { ...m.scope, hasChevron: false };
+  expect_match(fails(m), /no chevron/);
+});
+
+it("a VISIBLE select fails — the UA focus ring would come back with it", () => {
+  const m = healthy();
+  m.scope = { ...m.scope, overlayHidden: false };
+  expect_match(fails(m), /UA focus ring/);
+});
+
+it("a scroller still painting its native bar fails — the rail is meant to REPLACE it", () => {
+  expect_match(fails(healthy({ scroller: { railScrolled: "yes", barWidth: 15, overflowY: "auto" } })),
+    /native scrollbar is still painted/);
+});
+
+it("an unmarked scroller fails, because the stylesheet rule then never applies to it", () => {
+  expect_match(fails(healthy({ scroller: { railScrolled: null, barWidth: 0, overflowY: "auto" } })),
+    /not marked as rail-scrolled/);
+});
+
+// THE PAIRED HALF. Removing the BAR by removing the SCROLLING would satisfy every row above and
+// break the thread outright — he is removing the bar, not the ability to scroll.
+it("a scroller that stopped scrolling fails, even with no bar painted", () => {
+  expect_match(fails(healthy({ scroller: { railScrolled: "yes", barWidth: 0, overflowY: "hidden" } })),
+    /stopped scrolling/);
+});
+
+it("…and the healthy scroller passes all three, so the rows above are not a blanket refusal", () => {
+  expect_equal(verdictFor(healthy(), 520).ok, true);
 });

@@ -80,6 +80,7 @@ export function ConciergeThread({
   turnFloor,
   backlog,
   rail,
+  onScrollerAttached,
   jumpRequest,
 }: {
   messages: ConciergeMessage[];
@@ -101,6 +102,25 @@ export function ConciergeThread({
   /** A fixed-width column rendered to the RIGHT of the scroller, full height. The thread owns the
    *  layout; the caller owns what goes in it. (The scrubber rail lands here.) */
   rail?: ReactNode;
+  /**
+   * Hand the SCROLLER ITSELF to the caller, once, as it mounts (and `null` as it unmounts).
+   *
+   * ── WHY THE THREAD NOW PUBLISHES ITS SCROLLER, HAVING DELIBERATELY NOT DONE SO ────────────────
+   * The scrubber rail REPLACES this thread's scrollbar (bead sparkle-bjbhw6). The founder:
+   * *"It replaces the scroll. So I don't have the scroll anymore. I just have this draggable
+   * handle."* A control that replaces the scrollbar has to write `scrollTop` on every pointermove
+   * and has to know the scroll range to place its handle — neither of which is possible for a
+   * component that cannot reach the element. `ThreadScrubber`'s header used to state the opposite
+   * rule ("the rail does not know how tall the thread is and must never pretend to"); that rule was
+   * overruled, and both headers say so.
+   *
+   * A CALLBACK RATHER THAN AN EXPOSED REF, because the caller needs to know WHEN the element exists:
+   * a ref handed down is `null` on the render that mounts it and nothing re-renders to say
+   * otherwise, so a controller reading it would measure an empty rail exactly once and never again.
+   *
+   * OPTIONAL, and absent means nothing changes — every existing caller and suite behaves as before.
+   */
+  onScrollerAttached?: (el: HTMLElement | null) => void;
   /**
    * Scroll to this message id.
    *
@@ -162,6 +182,23 @@ export function ConciergeThread({
   onQuote?: (quote: PendingQuote) => void;
 }) {
   const scrollRef = useRef<HTMLDivElement | null>(null);
+  const onScrollerAttachedRef = useRef(onScrollerAttached);
+  onScrollerAttachedRef.current = onScrollerAttached;
+  /**
+   * ONE ref that feeds two consumers: this component's own `scrollRef` (which every hook below
+   * already reads) and the caller's `onScrollerAttached`.
+   *
+   * `useCallback` with an EMPTY dep list on purpose. React calls a callback ref with `null` and then
+   * with the node again whenever the callback's IDENTITY changes — so a ref rebuilt whenever
+   * `onScrollerAttached` changed would detach and re-attach the scroller on every render of a parent
+   * that passes an inline arrow, and the controller would re-measure from scratch several times a
+   * second while a reply streams. Reading the handler out of a ref keeps the identity stable and
+   * still calls the CURRENT handler.
+   */
+  const attachScroller = useCallback((el: HTMLDivElement | null) => {
+    scrollRef.current = el;
+    onScrollerAttachedRef.current?.(el);
+  }, []);
   // GUARD 4 — WHAT THE READER ACTUALLY SEES, which is `messages` except while a selection is being
   // dragged out, when the thread's STRUCTURE is held still (./useSelectionStableThread).
   //
@@ -513,8 +550,15 @@ export function ConciergeThread({
           ceiling and `threadScrollerMarker.test.tsx` looks for them. */}
       <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "row" }}>
       <div
-        ref={scrollRef}
+        ref={attachScroller}
         data-testid={CONCIERGE_THREAD_TESTID}
+        /* THE RAIL REPLACES THE BAR (bead sparkle-bjbhw6, defect 1). Present only when a rail is
+           actually mounted beside this scroller, which is what keeps `MountedAgentThread` — which
+           has no rail — on the classic always-visible bar that bead sparkle-nheu8 asked for. The
+           rule itself is in index.css, because a pseudo-element has no inline form. It removes the
+           BAR, not the scrolling: `overflowY: "auto"` below is untouched, so wheel, trackpad,
+           keyboard paging and every programmatic scroll behave exactly as they did. */
+        data-rail-scrolled={rail !== undefined && rail !== null ? "yes" : undefined}
         // The marker ComposeBox measures its drag ceiling against. BOTH threads carry it — see
         // MountedAgentThread — so the composer asks for "the thread" and never has to know which one
         // is on screen. Dropped once already, by a merge that took the other side's JSX verbatim;

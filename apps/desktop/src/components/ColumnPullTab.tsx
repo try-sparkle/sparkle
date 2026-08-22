@@ -119,6 +119,20 @@ const TAB_PAD = 5;
 /** The dot field: 2 columns × 3 rows of 3px squares, 2px apart. */
 const DOT = 3;
 const DOT_GAP = 2;
+/**
+ * THE SAME METRICS, EXPORTED — because a second grip exists.
+ *
+ * The concierge scrubber rail's handle expands into a grip when it is grabbed, and the founder asked
+ * for it in these exact terms: *"just like we have the drag to expand column rows... but I want it
+ * to be three columns and two — so I want it to be flipped 90 degrees from the drag sliders."*
+ * Three columns by two rows is THIS field rotated, so it must be THESE numbers — a restated `3` and
+ * `2` over there would be a second dot vocabulary that drifts the first time either is tuned, which
+ * is the drift the header of this file already warns about for the pull tab and the 4x2 grip.
+ * Renamed on the way out (`RAIL_GRIP_*`) rather than exported as bare `DOT`, which would be an
+ * unreadably generic name in an importer's scope.
+ */
+export const RAIL_GRIP_DOT = DOT;
+export const RAIL_GRIP_DOT_GAP = DOT_GAP;
 /** The chevron's box. Drawn at a heavier stroke than Feather's default — the "bolder" of the ask. */
 const ARROW = 12;
 const ARROW_STROKE = 3;
