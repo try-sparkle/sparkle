@@ -23,6 +23,13 @@ const h = vi.hoisted(() => ({
   // Captured so the test can prove the oracle was handed the FRESH re-loaded state, not skipped.
   seenArgs: undefined as unknown[] | undefined,
   freshAccounts: [{ id: "walled" }] as unknown,
+  // The shared dead-login set — the SAME source `useAccountSwitch` reads. Captured to prove
+  // `useLimitSync` forwards it, so the two oracles cannot disagree (a dead-login-only target must not
+  // make one suppress the modal while the other declines the switch).
+  deadIds: new Set<string>() as ReadonlySet<string>,
+  // Every `invalidateAccountState(...)` argument, so a test can prove a rate-limit bench does NOT
+  // wipe the dead-login verdict (it reads it a few lines later).
+  invalidateArgs: [] as unknown[],
 }));
 
 vi.mock("../services/accountSelection", async (importOriginal) => ({
@@ -33,8 +40,9 @@ vi.mock("../services/accountSelection", async (importOriginal) => ({
     identities: [],
     failed: false,
   }),
-  invalidateAccountState: () => {},
+  invalidateAccountState: (opts?: unknown) => h.invalidateArgs.push(opts),
   liveUsageRows: () => [],
+  deadLoginIds: () => h.deadIds,
 }));
 
 vi.mock("../services/limitSync", async (importOriginal) => ({
@@ -81,6 +89,8 @@ beforeEach(() => {
   h.rec = null;
   h.applied = [{ accountId: "walled", until: Date.now() + 5_000 }];
   h.seenArgs = undefined;
+  h.deadIds = new Set<string>();
+  h.invalidateArgs = [];
 });
 
 describe("useLimitSync gates the limit modal on auto-switch's own oracle", () => {
@@ -104,5 +114,32 @@ describe("useLimitSync gates the limit modal on auto-switch's own oracle", () =>
     await settle();
 
     expect(state().current).toEqual(h.applied[0]);
+  });
+
+  it("forwards the shared dead-login set to the oracle so the two agree", async () => {
+    // Finding C's guard: the modal-suppression oracle must judge dead logins the SAME way
+    // `useAccountSwitch` does, or a dead-login-only target lets one suppress the modal while the other
+    // declines the switch — the fleet walled with the last-resort modal silently swallowed. `live`
+    // defaults to [] and dead-login to empty, so this is a defaulted seam: drop the forwarding and
+    // `seenArgs[7]` is `undefined`, not the primed set → red.
+    h.deadIds = new Set(["healthy"]);
+    h.rec = { from: { id: "walled" }, to: { id: "x" }, fraction: null, reason: "exhausted" };
+    renderHook(() => useLimitSync(POLL_MS));
+    await settle();
+
+    expect(h.seenArgs?.[7]).toBe(h.deadIds);
+  });
+
+  it("busts the cache WITHOUT wiping the dead-login verdict it reads in the same tick", async () => {
+    // roborev 67726: a rate-limit bench is a usage change, not a credential change, and the same tick
+    // reads deadLoginIds() to gate the modal. If this invalidation dropped the dead-login cache the
+    // read would be empty and the oracle disagreement would return. So it must pass credentials:false.
+    renderHook(() => useLimitSync(POLL_MS));
+    await settle();
+    // It DID invalidate (a limit landed) — and every such call opted out of the dead-login drop.
+    expect(h.invalidateArgs.length).toBeGreaterThan(0);
+    expect(h.invalidateArgs.every((a) => (a as { credentials?: boolean })?.credentials === false)).toBe(
+      true,
+    );
   });
 });

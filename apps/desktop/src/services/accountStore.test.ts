@@ -1207,6 +1207,56 @@ describe("unauthedIds — a KNOWN-unauthenticated dir must not win the degraded 
   });
 });
 
+describe("deadLoginIds — a DEFINITELY-expired login must not win the pool", () => {
+  const NOW = 1_000_000;
+
+  it("demotes a dead-login account even though it is signed in with the lowest tally", () => {
+    // The exact expired-login trap: `dead` is signed in (it keeps its recorded email) and, because it
+    // can't spend, carries the LOWEST tally — so without the demotion it wins auto-pick and every
+    // agent spawns into a 401. `live` is the healthy target.
+    const accounts = [acct("dead"), acct("live")];
+    const u = [usage("dead", { tokens7d: 0 }), usage("live", { tokens7d: 5_000 })];
+    const opts = { now: NOW, signedInIds: ["dead", "live"] };
+    // Control: with no dead-login set, the zero-tally `dead` wins — the bug.
+    expect(pickAccount(accounts, u, opts)?.id).toBe("dead");
+    // With it, the fleet is routed to the healthy account instead.
+    expect(pickAccount(accounts, u, { ...opts, deadLoginIds: new Set(["dead"]) })?.id).toBe("live");
+  });
+
+  it("demotes, never blocks: a lone dead-login account still spawns (re-login prompt beats no agent)", () => {
+    // This is what keeps a re-login reachable AND what makes the auto-switch helper rescue converge:
+    // `eligible` keeps the dead account, so `leastBad` returns it rather than emptying the pool.
+    const accounts = [acct("only")];
+    const chosen = pickAccount(accounts, [usage("only", { tokens7d: 0 })], {
+      now: NOW,
+      signedInIds: ["only"],
+      deadLoginIds: new Set(["only"]),
+    });
+    expect(chosen?.id).toBe("only");
+  });
+
+  it("omitting the option changes nothing", () => {
+    const accounts = [acct("dead"), acct("live")];
+    const u = [usage("dead", { tokens7d: 0 }), usage("live", { tokens7d: 5_000 })];
+    expect(pickAccount(accounts, u, { now: NOW, signedInIds: ["dead", "live"] })?.id).toBe("dead");
+  });
+
+  it("eligibleAccounts drops a dead-login account so a sticky key is re-picked off it", () => {
+    // `autoPick`'s "is my previous account still eligible?" reads `eligibleAccounts`. A dead login must
+    // fall out of it, or a rescued sticky helper is judged still-healthy on its dead account and never
+    // moves — the non-converging restart loop.
+    const accounts = [acct("dead"), acct("live")];
+    const u = [usage("dead", { tokens7d: 0 }), usage("live", { tokens7d: 5_000 })];
+    const ids = eligibleAccounts(accounts, u, {
+      now: NOW,
+      signedInIds: ["dead", "live"],
+      deadLoginIds: new Set(["dead"]),
+    }).map((a) => a.id);
+    expect(ids).toContain("live");
+    expect(ids).not.toContain("dead");
+  });
+});
+
 describe("notSignedInAccountIds — read-and-has-no-login, not merely unknown", () => {
   function id(idv: string, email: string | null): Identity {
     return { id: idv, email, organization: null, accountUuid: null };

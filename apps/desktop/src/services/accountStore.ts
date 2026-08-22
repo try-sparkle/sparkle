@@ -881,6 +881,20 @@ export interface PickOptions {
    *  and re-probes, with no stale-resume retry. A kebab click must not be able to do that; only
    *  observed facts (a rate limit, real utilization) relocate a sticky consumer. */
   outOfRotationIds?: ReadonlySet<string>;
+  /** Ids whose OAuth login is DEFINITELY dead — a live `claude auth status` "no"
+   *  (`preflight.authIsDefinitelyExpired`), collected by the shared probe cache
+   *  (`accountSelection.deadLoginIds`).
+   *
+   *  An expired login is the case NONE of the tests above can see: it records no rate-limit event
+   *  (`exhaustedUntil` stays null), returns no live-usage row (the usage probe 401s too), and — since
+   *  it can't spend — carries the LOWEST local tally on the machine, so it would win auto-pick for
+   *  every agent and spawn each into a 401. `signedInIds` cannot exclude it either, because that keys
+   *  on the recorded email, which an expired login still carries. So it is demoted here.
+   *
+   *  Demotes exactly like {@link PickOptions.unauthedIds} — dropped from `candidates`, NEVER from
+   *  `eligible` — so when a dead login is the ONLY account `leastBad` still returns it (a re-login
+   *  prompt beats a dead agent). Absent the option this set is empty and nothing changes. */
+  deadLoginIds?: ReadonlySet<string>;
   /** Current time (epoch ms), injectable for tests. Defaults to `Date.now()`. */
   now?: number;
 }
@@ -1084,6 +1098,12 @@ function partitionAccounts(
   // still leaves `leastBad` something to return. The screen's dot reads off the same set, so a row
   // saying "out of rotation" and a spawn landing on it cannot both happen.
   const isOutOfRotation = (a: Account) => opts.outOfRotationIds?.has(a.id) ?? false;
+  // DEFINITELY-expired login (live `claude auth status` "no", see PickOptions.deadLoginIds). Demotes
+  // rather than blocks, like `isUnauthed`: `eligible` keeps it so `leastBad` still returns it when it
+  // is the only account. This is what keeps the auto-switch's helper rescue CONVERGENT — without it,
+  // re-selection would hand a rescued sticky helper straight back to its dead account (lowest tally,
+  // no live row, signed-in by email), and the sweep would restart it every poll forever.
+  const isDeadLogin = (a: Account) => opts.deadLoginIds?.has(a.id) ?? false;
 
   const candidates = eligible.filter((a) => {
     const u = usageFor(a);
@@ -1093,7 +1113,8 @@ function partitionAccounts(
       !isLiveSpent(a) &&
       !isClobbered(a) &&
       !isUnauthed(a) &&
-      !isOutOfRotation(a)
+      !isOutOfRotation(a) &&
+      !isDeadLogin(a)
     );
   });
   return { eligible, candidates };

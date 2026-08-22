@@ -19,6 +19,10 @@ import {
   loadAccountState,
   invalidateAccountState,
   liveUsageRows,
+  // The shared DEFINITELY-expired-login set (a live `claude auth status` "no"), cached alongside
+  // `liveUsageRows` so the fleet switch, the helper rescue, the spawn gate, and `useLimitSync` all
+  // read ONE source and cannot disagree — see `accountSelection.deadLoginIds`.
+  deadLoginIds,
 } from "../services/accountSelection";
 import {
   listCeilings,
@@ -138,6 +142,11 @@ export function useAccountSwitch(pollMs: number = HEADROOM_POLL_MS): AccountSwit
           };
         }
         const current = busiestPaneAccount();
+        // The shared DEFINITELY-expired-login set. `loadAccountState` above kicks the background
+        // `claude auth status` probe; `deadLoginIds()` returns whatever it has landed (empty before
+        // the first probe → nothing acted on). The SAME source the spawn gate and `useLimitSync`
+        // read, so the fleet switch, the helper rescue, re-selection, and the modal cannot disagree.
+        const deadIds = deadLoginIds();
         // The SAME live rows the spawn gate uses (`loadAccountState` kicks the background refresh;
         // `liveUsageRows` returns whatever is cached). Passing them here is what stops an auto-switch
         // migrating the fleet onto an account `pickAccount` would refuse for being live-spent.
@@ -149,6 +158,7 @@ export function useAccountSwitch(pollMs: number = HEADROOM_POLL_MS): AccountSwit
           state.identities,
           Date.now(),
           liveUsageRows(),
+          deadIds,
         );
         // Suppress while a switch is already running — the answer is "we're on it", not a new ask.
         if (planRef.current) return;
@@ -162,7 +172,7 @@ export function useAccountSwitch(pollMs: number = HEADROOM_POLL_MS): AccountSwit
         // retire every live wave-off on one transient hiccup. "We could not look" is not evidence a
         // wall ended, and it costs nothing to skip: `state.accounts` is empty on that tick, so `rec`
         // is null and neither branch below has anything to say anyway.
-        if (!state.failed) retireStaleWallDismissals(dismissed.current, state.usage);
+        if (!state.failed) retireStaleWallDismissals(dismissed.current, state.usage, deadIds);
 
         // ══ AN OBSERVED WALL MOVES THE FLEET BY ITSELF; AN ESTIMATE STILL ASKS ═══════════════════
         // `reason: "exhausted"` comes from an observed rate-limit event, and `headroom.ts` says so
@@ -234,6 +244,7 @@ export function useAccountSwitch(pollMs: number = HEADROOM_POLL_MS): AccountSwit
             Date.now(),
             liveUsageRows(),
             paneAccountMap(),
+            deadIds,
           );
           if (rescue) {
             if (rescue.fromAccountId) {
@@ -309,6 +320,10 @@ export function useAccountSwitch(pollMs: number = HEADROOM_POLL_MS): AccountSwit
           health.identities,
           Date.now(),
           liveUsageRows(),
+          // The shared dead-login set (same source phase 1 reads). Re-targets the fleet off a
+          // destination whose OAuth session EXPIRES while agents are still migrating — which
+          // `signedInAccountIds` (email-keyed) cannot see, since an expired login keeps its email.
+          deadLoginIds(),
         );
         // Target dead and nowhere healthy to go: RETIRE the plan rather than spin it. A kept plan keeps
         // `planRef.current` set, which makes phase 1 short-circuit — silencing its recommendation,
@@ -335,7 +350,10 @@ export function useAccountSwitch(pollMs: number = HEADROOM_POLL_MS): AccountSwit
       // re-pins and re-spawns real terminals and React may replay an updater against stale state — bead
       // sparkle-0t2o. `planRef` is the source of truth; every setter writes it synchronously.
       const { plan: next, movedNow } = advanceSwitch(work, statuses, restartPane);
-      if (movedNow.length > 0) invalidateAccountState();
+      // An agent MOVE changes usage/pins but NO credentials, so refresh the account/live caches but
+      // keep the dead-login verdict — otherwise this per-advance call (every ~3s during a migration)
+      // would wipe it mid-migration and make the mid-migration re-target below inert. (roborev 67627)
+      if (movedNow.length > 0) invalidateAccountState({ credentials: false });
       // Retire the plan once everyone has moved, which also re-arms recommendations.
       const settled = next.pending.length === 0 ? null : next;
       planRef.current = settled;
@@ -368,6 +386,12 @@ export function useAccountSwitch(pollMs: number = HEADROOM_POLL_MS): AccountSwit
         // WHICH episode is being declined. Retirement compares this against the live
         // `exhaustedUntil`, so a later wall is a different claim even if no tick ever saw the gap.
         episode: observedWalls.current.get(recommendation.from.id) ?? null,
+        // An EXPIRED-login wave-off is a STANDING preference, not an episode: an expired session has
+        // no `exhaustedUntil`, so the episode-based retirement would delete it on the very next tick
+        // ("no live wall → episode over") and re-raise the banner every poll — "Not now" doing
+        // nothing. It clears when the login is actually renewed (the trigger disappears), not on a
+        // tick. See {@link retireStaleWallDismissals}.
+        expired: recommendation.expired ?? false,
       });
     }
     setRecommendation(null);
@@ -441,9 +465,15 @@ export function useAccountSwitch(pollMs: number = HEADROOM_POLL_MS): AccountSwit
  *  Both halves are load-bearing — see the `dismissed` ref. Deriving it in ONE place is what keeps
  *  the write (`dismiss`) and the read (phase 1) from drifting apart; keying them differently is the
  *  whole defect this replaces. Adding a third `reason` needs no change here: a new kind of claim
- *  gets its own key and inherits the right behaviour by construction. */
+ *  gets its own key and inherits the right behaviour by construction.
+ *
+ *  The `:expired` suffix is that "new kind of claim" for an EXPIRED login: `reason` is still
+ *  `"exhausted"` (so every gate fires), but an expired wave-off and a wall wave-off on the SAME
+ *  account must not share a key — otherwise dismissing the expired banner would also silence a later
+ *  real wall (which retirement would then never re-raise, because the expired claim never retires).
+ *  A wall/live recommendation has `expired` falsy, so its key is unchanged. */
 function dismissKey(rec: SwitchRecommendation): string {
-  return `${rec.from.id}:${rec.reason}`;
+  return `${rec.from.id}:${rec.reason}${rec.expired ? ":expired" : ""}`;
 }
 
 /** One recorded wave-off. The first two fields come straight off the recommendation that was
@@ -458,6 +488,10 @@ interface DismissedClaim {
    *  at dismiss time, which falls the helper back to plain "is it walled now". Meaningless for an
    *  `"approaching"` claim, which declines an estimate rather than an episode. */
   episode: number | null;
+  /** True when the declined recommendation was an EXPIRED login (no wall, no live over-utilization).
+   *  Such a claim has no episode, so retirement treats it as STANDING (survives until the login is
+   *  renewed) rather than deleting it on the next tick — see {@link retireStaleWallDismissals}. */
+  expired: boolean;
 }
 
 /** Drop each recorded WALL wave-off once the wall it declined is over.
@@ -527,6 +561,7 @@ interface DismissedClaim {
 function retireStaleWallDismissals(
   dismissed: Map<string, DismissedClaim>,
   usage: readonly Pick<Usage, "id" | "exhaustedUntil">[],
+  deadLoginIds: ReadonlySet<string>,
   now: number = Date.now(),
 ): void {
   // accountId -> the `exhaustedUntil` of the wall that is live RIGHT NOW. The value, not just
@@ -537,6 +572,16 @@ function retireStaleWallDismissals(
   }
   for (const [key, claim] of [...dismissed]) {
     if (claim.reason !== "exhausted") continue; // an estimate's wave-off is a standing preference
+    // An EXPIRED-login wave-off is standing WHILE the login is dead — an expired session has no
+    // `exhaustedUntil`, so the episode logic below would see "no live wall" and delete it every tick,
+    // re-raising the banner and making "Not now" do nothing. But it is NOT standing forever: it clears
+    // the moment the login leaves `deadLoginIds` (the user renewed it, the trigger is gone), so a
+    // LATER expiry of the same account is a fresh claim that asks again — the "declined the 09:00
+    // wall, nobody asked about the 19:00 one" rule, applied to expiry. (roborev 67719)
+    if (claim.expired) {
+      if (!deadLoginIds.has(claim.accountId)) dismissed.delete(key);
+      continue;
+    }
     const live = walled.get(claim.accountId);
     if (live === undefined) {
       dismissed.delete(key); // no live wall at all: the declined episode is over

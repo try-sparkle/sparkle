@@ -30,6 +30,11 @@ import {
  *  can wait for a natural boundary instead of interrupting work. */
 export const WARN_FRACTION = 0.8;
 
+/** Shared empty set for the optional `deadLoginIds` argument, so the default never allocates and the
+ *  "no signal / before the first probe" case is a single canonical value. See
+ *  {@link switchRecommendation}'s third trigger arm. */
+const NO_DEAD_LOGINS: ReadonlySet<string> = new Set<string>();
+
 /** A learned ceiling from Rust (`accounts_ceilings`). `ceiling` is null until enough limit
  *  episodes have been observed — treat that as "unknown", never as zero. */
 export interface Ceiling {
@@ -103,6 +108,13 @@ export interface SwitchRecommendation {
    *  mislabel as "has hit its limit". Both authoritative signals mean the fleet cannot keep working on
    *  `from`, which is exactly what "has hit its limit. Switch to X to keep working." states. */
   reason: "exhausted";
+  /** True when the ONLY reason `from` is spent is a DEFINITELY-expired login (no usage wall, no live
+   *  over-utilization). Kept SEPARATE from `reason` on purpose: the auto-migration, helper-rescue and
+   *  dismissal gates all key on `reason === "exhausted"` and must fire for an expired login exactly as
+   *  for a wall, so `reason` stays `"exhausted"`; this only redirects the human-facing SENTENCE
+   *  ({@link describeRecommendation}) away from "has hit its limit" — which, for an expired session,
+   *  would tell the user to wait out a usage limit that never resets instead of re-authenticating. */
+  expired?: boolean;
 }
 
 /** Rank candidate targets: least-loaded first, in three tiers so a near-ceiling target is a LAST
@@ -167,6 +179,7 @@ export function switchRecommendation(
   identities: Identity[],
   now: number = Date.now(),
   live: readonly LiveUsage[] = [],
+  deadLoginIds: ReadonlySet<string> = NO_DEAD_LOGINS,
 ): SwitchRecommendation | null {
   if (!currentAccountId) return null;
   const from = accounts.find((a) => a.id === currentAccountId);
@@ -188,9 +201,21 @@ export function switchRecommendation(
   //     "exhausted"`); OR
   //   * real Anthropic utilization at/above LIVE_AVOID_PERCENT — its OWN number, WEEKLY or session,
   //     judged per login ({@link loginLiveWorstPercent}), the SAME test used to EXCLUDE a target just
-  //     below and the SAME one `partitionAccounts`/`exhaustionOutlook` gate spawns on.
+  //     below and the SAME one `partitionAccounts`/`exhaustionOutlook` gate spawns on; OR
+  //   * a DEFINITELY-EXPIRED login — Claude Code's own live `claude auth status` says the OAuth
+  //     session on this account is dead ({@link authIsDefinitelyExpired}, folded per-account into
+  //     `deadLoginIds` by the caller). An expired login is out of room in the way that matters MOST:
+  //     it cannot authenticate at all, so every agent on it 401s. The two signals above only catch an
+  //     account that hit a USAGE wall — an expired token records neither a rate-limit event
+  //     (`exhaustedUntil` stays null → never "exhausted") nor a utilization figure (the usage probe
+  //     401s too → `loginLiveWorstPercent` is null → scored 0% via the `?? 0`, i.e. the HEALTHIEST
+  //     possible), so before this arm a dead account stranded the fleet on it silently, scored as the
+  //     emptiest account on the machine. `deadLoginIds` carries ONLY a live CLI "no" (source "cli");
+  //     an errored/pending/offline/never-probed account is absent from it, so a flaky probe can never
+  //     manufacture a false trigger — the same "defers to signed-in" rule `deriveRowLogin` applies to
+  //     the EXPIRED badge.
   //
-  // The WEEKLY cap is the case this second arm closes (bead sparkle-hbyae): an account at 100% of its
+  // The WEEKLY cap is the case the second arm closes (bead sparkle-hbyae): an account at 100% of its
   // 7-day limit with its 5-HOUR SESSION at 0% never records a session rate-limit event, so its
   // `exhaustedUntil` stays null and `state` never becomes "exhausted" — yet the fleet running on it is
   // just as walled, refused by Anthropic until the weekly window resets (up to a day). Before this,
@@ -201,19 +226,40 @@ export function switchRecommendation(
   // live-spent account); the retired driver was the learned-ceiling GUESS (`warn`), which still never
   // triggers — it only ranks a target last.
   const currentLiveWorst = loginLiveWorstPercent(currentAccountId, liveById, siblingIds) ?? 0;
-  const currentIsSpent = current.state === "exhausted" || currentLiveWorst >= LIVE_AVOID_PERCENT;
+  const currentIsSpent =
+    current.state === "exhausted" ||
+    currentLiveWorst >= LIVE_AVOID_PERCENT ||
+    deadLoginIds.has(currentAccountId);
   if (!currentIsSpent) return null;
 
   // The FROM account is spent — pick the healthiest signed-in account to move to, excluding the
-  // vacated login and its same-login siblings (a sibling shares one quota and hits the wall together).
-  const best = bestHealthyTarget(accounts, usage, ceilings, identities, now, live, [currentAccountId]);
+  // vacated login and its same-login siblings (a sibling shares one quota and hits the wall together)
+  // and any account whose OWN login is definitely dead (it can't receive agents either).
+  const best = bestHealthyTarget(
+    accounts,
+    usage,
+    ceilings,
+    identities,
+    now,
+    live,
+    [currentAccountId],
+    deadLoginIds,
+  );
   if (!best) return null;
+
+  // Was the ONLY thing making `from` spent a dead login? (No usage wall, no live over-utilization.)
+  // Redirects only the SENTENCE — `reason` stays "exhausted" so every gate still fires.
+  const expiredOnly =
+    deadLoginIds.has(currentAccountId) &&
+    current.state !== "exhausted" &&
+    currentLiveWorst < LIVE_AVOID_PERCENT;
 
   return {
     from,
     to: best,
     fraction: current.fraction,
     reason: "exhausted",
+    expired: expiredOnly,
   };
 }
 
@@ -241,6 +287,7 @@ export function bestHealthyTarget(
   now: number,
   live: readonly LiveUsage[],
   excludeLoginsOf: Iterable<string>,
+  deadLoginIds: ReadonlySet<string> = NO_DEAD_LOGINS,
 ): Account | null {
   const liveById = new Map(live.map((l) => [l.id, l]));
   const byId = new Map(assessHeadroom(usage, ceilings, now).map((h) => [h.accountId, h]));
@@ -272,8 +319,13 @@ export function bestHealthyTarget(
   // back in rotation. See `useAccountSwitch.recordActivation`. One rule, no inert preferences, and
   // this oracle stays a pure function of its arguments rather than mixing a snapshot up to
   // HEADROOM_POLL_MS old with a live localStorage read.
+  // `signedIn` keys on EMAIL (`signedInAccountIds`), and an EXPIRED login still has its email recorded
+  // in `.claude.json` — so a dead-login account reads "signed in" here and would be a valid target
+  // unless dropped. Moving the fleet onto an account that cannot authenticate just relocates the 401,
+  // exactly as moving onto an exhausted account relocates the wall. `deadLoginIds` carries only a
+  // live CLI "no", so nothing merely flaky is dropped.
   const candidates = accounts
-    .filter((a) => signedIn.has(a.id) && !excluded.has(a.id))
+    .filter((a) => signedIn.has(a.id) && !excluded.has(a.id) && !deadLoginIds.has(a.id))
     .map((a) => ({
       account: a,
       h: byId.get(a.id) ?? {
@@ -310,8 +362,14 @@ export function isHealthyTarget(
   identities: Identity[],
   now: number,
   live: readonly LiveUsage[],
+  deadLoginIds: ReadonlySet<string> = NO_DEAD_LOGINS,
 ): boolean {
   if (!accounts.some((a) => a.id === accountId)) return false; // removed mid-migration
+  // A DEFINITELY-EXPIRED login (live `claude auth status` "no") — the "had its login expire"
+  // mid-migration case this docblock names. `signedInAccountIds` keys on the RECORDED email, which an
+  // expired session still carries, so without this an account whose OAuth died mid-migration reads
+  // healthy and the fleet keeps landing on it. Only a live CLI "no" is in the set, never a flake.
+  if (deadLoginIds.has(accountId)) return false;
   if (!new Set(signedInAccountIds(identities)).has(accountId)) return false; // login expired / never
   const h = new Map(assessHeadroom(usage, ceilings, now).map((x) => [x.accountId, x])).get(accountId);
   if (h && h.state === "exhausted") return false; // observed wall
@@ -351,11 +409,19 @@ export function describeRecommendation(
 ): string {
   const from = leadName(display(rec.from));
   const to = accountSentenceName(display(rec.to));
-  // ONE sentence now: the observed-wall message. The "approaching … is N% of its usual limit …"
-  // wording is gone with the estimate-driven `"approaching"` recommendation — `switchRecommendation`
-  // only ever returns `reason: "exhausted"`, so a recommendation exists only for an account that has
-  // actually hit its limit. Naming a percentage "of its usual limit" was the exact estimate the
-  // founder retired; there is no learned-ceiling figure to quote here any more.
+  // A DEFINITELY-EXPIRED login gets its OWN sentence: "has hit its limit" would tell the user to wait
+  // out a usage limit that never resets, when the real remedy is to re-authenticate. The switch to a
+  // healthy account still keeps the fleet working now, and the renew hint points at the actual fix.
+  // (`reason` stays "exhausted", so this is the only place the expired case diverges — see the
+  // `expired` field on {@link SwitchRecommendation}.)
+  if (rec.expired) {
+    return `${from}'s login has expired. Switch to ${to} to keep working, then sign back in.`;
+  }
+  // Otherwise the observed out-of-room message. The "approaching … is N% of its usual limit …"
+  // wording is gone with the estimate-driven `"approaching"` recommendation — a recommendation exists
+  // only for an account out of room by an AUTHORITATIVE signal (a wall or live over-utilization).
+  // Naming a percentage "of its usual limit" was the exact estimate the founder retired; there is no
+  // learned-ceiling figure to quote here any more.
   return `${from} has hit its limit. Switch to ${to} to keep working.`;
 }
 

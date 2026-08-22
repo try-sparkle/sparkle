@@ -51,6 +51,9 @@ const h = vi.hoisted(() => ({
   // otherwise: `live` defaults to [], so dropping `liveUsageRows()` from the call site stays green).
   liveRows: [] as { id: string; fiveHourPercent: number | null; sevenDayPercent: number | null }[],
   seenLive: undefined as unknown,
+  // Every `invalidateAccountState(...)` arg, so a test can prove the per-move call opts out of the
+  // dead-login drop ({ credentials: false }) — the site where the 67627 regression lived.
+  invalidateArgs: [] as unknown[],
 }));
 
 vi.mock("../services/paneControl", () => ({
@@ -74,7 +77,7 @@ vi.mock("../services/accountSelection", async (importOriginal) => ({
     identities: [],
     failed: h.failed,
   }),
-  invalidateAccountState: () => {},
+  invalidateAccountState: (opts?: unknown) => h.invalidateArgs.push(opts),
   liveUsageRows: () => h.liveRows,
 }));
 
@@ -181,6 +184,7 @@ beforeEach(() => {
   h.failed = false;
   h.liveRows = [];
   h.seenLive = undefined;
+  h.invalidateArgs = [];
   useAccountLimitStore.setState({ current: null, dismissed: new Set() });
 });
 
@@ -344,6 +348,13 @@ describe("an OBSERVED wall migrates running agents without being asked", () => {
     expect(h.restart).toHaveBeenCalledWith("a2");
     // Everyone moved, so the plan retires — which is also what re-arms recommendations.
     expect(view.result.current.plan).toBeNull();
+    // THE PER-MOVE INVALIDATION OPTS OUT OF THE DEAD-LOGIN DROP. An agent move changes usage, not
+    // credentials; wiping the dead-login verdict every ~3s here made the mid-migration re-target
+    // inert (roborev 67627). Revert the `{ credentials: false }` at the call site and this reds.
+    expect(h.invalidateArgs.length).toBeGreaterThan(0);
+    expect(
+      h.invalidateArgs.every((a) => (a as { credentials?: boolean })?.credentials === false),
+    ).toBe(true);
   });
 
   it("raises the banner instead of spinning an EMPTY plan when nothing can be moved", async () => {

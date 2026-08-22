@@ -9,7 +9,12 @@
 // a pane, and every pane polling independently would multiply the transcript walk by the number of
 // open agents to reach the same conclusion.
 import { useEffect } from "react";
-import { loadAccountState, invalidateAccountState, liveUsageRows } from "../services/accountSelection";
+import {
+  loadAccountState,
+  invalidateAccountState,
+  liveUsageRows,
+  deadLoginIds,
+} from "../services/accountSelection";
 import { syncLimitsOnce, LIMIT_POLL_MS } from "../services/limitSync";
 import { raiseFirstLimitUnlessAutoSwitchHandles } from "../stores/accountLimitStore";
 import { listCeilings } from "../services/accountStore";
@@ -47,7 +52,13 @@ export function useLimitSync(pollMs: number = LIMIT_POLL_MS): void {
       // Only bust the cache when something actually changed, so the common (unlimited) case costs
       // one transcript walk and nothing else.
       if (cancelled || applied.length === 0) return;
-      invalidateAccountState();
+      // A rate-limit bench is a USAGE change, NOT a credential change — and this same tick reads
+      // `deadLoginIds()` ~30 lines below to gate the modal. Wiping the dead-login verdict here would
+      // make that read empty (the re-probe is fire-and-forget and cannot resolve in-tick), so an
+      // only-other-account with an expired login would read signed-in, `rec` non-null, and the modal
+      // suppressed while `useAccountSwitch` declines the switch — the oracle disagreement this set
+      // exists to close, re-entered. Keep the verdict. (roborev 67726)
+      invalidateAccountState({ credentials: false });
 
       // A landed exhaustion is the deterministic "you are blocked" signal the founder asked for —
       // `syncLimitsOnce` returns only writes that PERSISTED, and re-seeing the same event is a
@@ -76,6 +87,12 @@ export function useLimitSync(pollMs: number = LIMIT_POLL_MS): void {
       if (cancelled) return;
       const now = Date.now();
       const live = liveUsageRows();
+      // The SAME shared dead-login set `useAccountSwitch` uses — so the two oracles cannot disagree.
+      // Without it, an only-other-account with an EXPIRED login reads signed-in here (email-keyed), so
+      // `rec` would be non-null and the modal suppressed, while `useAccountSwitch` excludes that dead
+      // target and declines to switch: the fleet walled, nothing moving, and the last-resort modal
+      // silently swallowed — the exact silent-strand this whole change exists to close.
+      const dead = deadLoginIds();
       const rec = switchRecommendation(
         busiestPaneAccount(),
         fresh.accounts,
@@ -84,6 +101,7 @@ export function useLimitSync(pollMs: number = LIMIT_POLL_MS): void {
         fresh.identities,
         now,
         live,
+        dead,
       );
       // A helper stranded on its OWN exhausted account is rescued by `useAccountSwitch` even when it
       // is not the busiest account — so the modal for it would ask the founder to do by hand what the
@@ -98,6 +116,7 @@ export function useLimitSync(pollMs: number = LIMIT_POLL_MS): void {
           now,
           live,
           paneAccountMap(),
+          dead,
         ) !== null;
       raiseFirstLimitUnlessAutoSwitchHandles(applied, rec !== null || helperRescue);
     };

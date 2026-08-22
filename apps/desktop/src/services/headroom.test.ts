@@ -421,6 +421,106 @@ describe("switchRecommendation", () => {
     expect(switchRecommendation(null, accounts, u, c2, idents, NOW)).toBeNull();
     expect(switchRecommendation("ghost", accounts, u, c2, idents, NOW)).toBeNull();
   });
+
+  // THE EXPIRED-LOGIN TRIGGER (the P0). An account whose OAuth session has DIED (a live
+  // `claude auth status` "no") records NO rate-limit event and returns NO utilization figure — its
+  // live probe 401s too — so `loginLiveWorstPercent` is null, `?? 0` scores it 0%, and before this
+  // arm it read as the HEALTHIEST account on the machine and the fleet was stranded on it, unable to
+  // authenticate, with nothing moving. The caller folds `authIsDefinitelyExpired` per account into
+  // the `deadLoginIds` argument; here it is passed directly so the pure decision is what's under test.
+  describe("a DEFINITELY-EXPIRED login triggers the switch", () => {
+    // NEITHER account is walled and NEITHER has any live-usage row — so the ONLY thing that can move
+    // the fleet is the dead-login signal. That is what makes these non-vacuous: with `deadLoginIds`
+    // empty (the negative), every other signal says "healthy" and the answer must be null.
+    const u = [usage("a", 10), usage("b", 10)];
+    const c = [ceil("a", 1000), ceil("b", 1000)];
+
+    it("recommends moving to the healthy account when the current login is dead", () => {
+      // THE SIDE EFFECT: a recommendation to move the fleet OFF the dead account `a` and ONTO the
+      // healthy `b` — which `useAccountSwitch` then auto-migrates because `reason === "exhausted"`.
+      const rec = switchRecommendation(
+        "a",
+        twoAccts,
+        u,
+        c,
+        twoIdents,
+        NOW,
+        [],
+        new Set(["a"]),
+      );
+      expect(rec?.from.id).toBe("a");
+      expect(rec?.to.id).toBe("b");
+      expect(rec?.reason).toBe("exhausted");
+      // Flags this as an EXPIRED login (no wall, no live-spend) so the banner says "renew", not the
+      // false "has hit its limit" — but `reason` stays "exhausted" so every gate still fires.
+      expect(rec?.expired).toBe(true);
+    });
+
+    it("does NOT flag `expired` when the trigger was a real wall, not a dead login", () => {
+      // The contrast: a wall-triggered recommendation must NOT get the expired sentence. Same target,
+      // but the reason is a real rate-limit event and no login is dead.
+      const walled = [usage("a", 10, NOW + 60_000), usage("b", 10)];
+      const rec = switchRecommendation("a", twoAccts, walled, c, twoIdents, NOW, [], new Set());
+      expect(rec?.reason).toBe("exhausted");
+      expect(rec?.expired).toBe(false);
+    });
+
+    it("does NOT flag `expired` when the account is BOTH walled and dead (the wall message stands)", () => {
+      // A dead login that ALSO hit a real wall is not "expired-only"; the generic out-of-room copy is
+      // still accurate, so `expired` stays false.
+      const walled = [usage("a", 10, NOW + 60_000), usage("b", 10)];
+      const rec = switchRecommendation("a", twoAccts, walled, c, twoIdents, NOW, [], new Set(["a"]));
+      expect(rec?.expired).toBe(false);
+    });
+
+    it("does NOT flag `expired` when the account is BOTH live-over-utilized and dead", () => {
+      // The third conjunct of `expiredOnly`. `a` is dead AND at 95% of its real weekly quota — the
+      // "your login has expired, sign back in" remedy would be wrong (re-authenticating does not
+      // restore spent quota), so `expired` must be false. Delete `currentLiveWorst < LIVE_AVOID_PERCENT`
+      // from the conjunction and this reds.
+      const live = [
+        { id: "a", fiveHourPercent: 5, sevenDayPercent: 95 },
+        { id: "b", fiveHourPercent: 10, sevenDayPercent: 5 },
+      ];
+      const rec = switchRecommendation("a", twoAccts, u, c, twoIdents, NOW, live, new Set(["a"]));
+      expect(rec?.expired).toBe(false);
+    });
+
+    it("does NOT trigger when the probe merely errored / is pending / offline (paired negative)", () => {
+      // The paired negative that makes the test above non-vacuous. An account whose probe could not
+      // decisively say "expired" is ABSENT from `deadLoginIds` — exactly the errored/pending/offline/
+      // before-first-poll case — so with no wall and no live row the fleet must NOT move. Revert the
+      // `|| deadLoginIds.has(...)` arm and the case above still passes on this same empty set, which
+      // is why BOTH are needed: only their split proves the dead-login signal is what drives it.
+      expect(switchRecommendation("a", twoAccts, u, c, twoIdents, NOW, [], new Set())).toBeNull();
+    });
+
+    it("returns null when the current login is dead but there is NO healthy target", () => {
+      // The founder's genuine stranded case — every account is spent/dead. `b` is ALSO dead, so it is
+      // excluded as a target (an expired login keeps its recorded email, so it still reads "signed
+      // in" and would otherwise be offered). No candidate → null → the caller falls through to the
+      // manual modal, which is correct.
+      const rec = switchRecommendation(
+        "a",
+        twoAccts,
+        u,
+        c,
+        twoIdents,
+        NOW,
+        [],
+        new Set(["a", "b"]),
+      );
+      expect(rec).toBeNull();
+    });
+
+    it("never picks a dead-login account as the destination even when it looks emptiest", () => {
+      // `c` has the most headroom (0 usage) and is signed in, but its login is dead — moving there
+      // just relocates the 401. The switch must pick the healthy `b` instead.
+      const u3 = [usage("a", 90, NOW + 60_000), usage("b", 50), usage("c", 0)];
+      const rec = switchRecommendation("a", accounts, u3, c, idents, NOW, [], new Set(["c"]));
+      expect(rec?.to.id).toBe("b");
+    });
+  });
 });
 
 describe("describeRecommendation", () => {
@@ -440,6 +540,19 @@ describe("describeRecommendation", () => {
     expect(describeRecommendation(rec, signedIn)).toBe(
       "drodio@storytell.ai has hit its limit. Switch to drodio@gmail.com to keep working.",
     );
+  });
+
+  it("says the LOGIN EXPIRED (not 'hit its limit') when the trigger was a dead login", () => {
+    // The remedy-copy fix: an expired session must not be described as a usage limit, or the user is
+    // told to wait out a reset that never comes instead of signing back in. The switch is still
+    // offered (the fleet keeps working on the healthy account), and the copy points at the real fix.
+    const rec = { from: FROM, to: TO, fraction: null, reason: "exhausted" as const, expired: true };
+    const out = describeRecommendation(rec, signedIn);
+    expect(out).toBe(
+      "drodio@storytell.ai's login has expired. Switch to drodio@gmail.com to keep working, then sign back in.",
+    );
+    // The misleading usage-limit phrasing must be ABSENT.
+    expect(out).not.toContain("has hit its limit");
   });
 
   it("NEVER quotes a '% of its usual limit' estimate, even when a fraction is present", () => {
@@ -801,5 +914,25 @@ describe("bestHealthyTarget — the AUTOMATIC switch's choice", () => {
     const withOptOut = bestHealthyTarget(ACCOUNTS, USAGE, [], IDENTS, NOW, [], ["a"])?.id;
     setAccountInRotation("b", true);
     expect(bestHealthyTarget(ACCOUNTS, USAGE, [], IDENTS, NOW, [], ["a"])?.id).toBe(withOptOut);
+  });
+
+  // ── A DEAD-LOGIN ACCOUNT IS NEVER A TARGET ────────────────────────────────────────────────────
+  // `signedInAccountIds` keys on the recorded EMAIL, which an EXPIRED login still carries, so a
+  // dead-login account reads "signed in" and would be a valid destination unless dropped explicitly.
+  it("excludes a dead-login account as a destination", () => {
+    // `b` is the only other account and its login is dead → nowhere healthy to go → null. Without the
+    // `deadLoginIds` filter, `b` reads signed-in and would be returned as the (unusable) target.
+    expect(bestHealthyTarget(ACCOUNTS, USAGE, [], IDENTS, NOW, [], ["a"], new Set(["b"]))).toBeNull();
+  });
+
+  it("picks the live account over a dead-login one with more headroom", () => {
+    // The paired positive: `c` has zero usage (emptiest) but a dead login; `b` is chosen instead.
+    const three = [acct("a"), acct("b"), acct("c")];
+    const usage3 = [usage("a", 10), usage("b", 50), usage("c", 0)];
+    const idents3 = [ident("a"), ident("b"), ident("c")];
+    expect(bestHealthyTarget(three, usage3, [], idents3, NOW, [], ["a"])?.id).toBe("c"); // control
+    expect(bestHealthyTarget(three, usage3, [], idents3, NOW, [], ["a"], new Set(["c"]))?.id).toBe(
+      "b",
+    );
   });
 });

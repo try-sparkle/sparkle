@@ -15,12 +15,17 @@ import {
   isStickyAccountKey,
   rotateStickyConsumerOffFailedAccount,
   refreshLiveUsage,
+  refreshDeadLogins,
+  deadLoginIds,
   ACCOUNT_CACHE_TTL_MS,
+  DEAD_LOGIN_TTL_MS,
   CONCIERGE_ACCOUNT_KEY,
 } from "./accountSelection";
+import type { ClaudeAuthStatus } from "../preflight";
 import { CONCIERGE_CALLER_AGENT_ID } from "./controlListener";
 import { SPARKLE_AGENT_ID, sparkleAgentIdFor, isSparkleAgentId } from "./sparkleAgent";
-import { setPin, clearAllPins } from "./accountStore";
+import { setPin, clearAllPins, setPreferredAccountId, clearPreferredAccount } from "./accountStore";
+import { pauseRotation } from "./rotationState";
 
 const ACCOUNTS = [
   { id: "def", nickname: "Default", configDir: "/home/.claude", isDefault: true, createdAt: 1 },
@@ -1041,6 +1046,62 @@ describe("reactive rotation off a failed concierge account", () => {
     // The pin still wins on the next resolve.
     expect(await accountConfigDirFor(CONCIERGE_ACCOUNT_KEY, { now: t + 2 })).toBe("/home/.claude");
   });
+
+  it("does NOT re-resolve onto a DEAD-LOGIN account even when it is cheaper (the third invalidation site)", async () => {
+    // roborev 67736 / sparkle-50m03: rotateStickyConsumerOffFailedAccount is the third non-credential
+    // caller converted to invalidateAccountState({ credentials: false }), and it reads the dead-login
+    // verdict one line later (via chooseAccountForAgent). If that call wiped the verdict, the concierge
+    // would re-resolve onto a cheaper DEAD-LOGIN account. `dead` is cheaper than `alt` but expired, so
+    // the rotation must land on `alt`. Revert :1232 to invalidateAccountState() and this reds (→ dead).
+    const t = 24_000_000;
+    const THREE = [
+      { id: "def", nickname: "Personal", configDir: "/home/.claude", isDefault: true, createdAt: 1 },
+      { id: "dead", nickname: "Dead", configDir: "/data/accounts/dead", isDefault: false, createdAt: 2 },
+      { id: "alt", nickname: "Alt", configDir: "/data/accounts/alt", isDefault: false, createdAt: 3 },
+    ];
+    const ex: Record<string, number | null> = {};
+    invoke.mockImplementation((cmd: string, args?: { id: string; untilEpoch: number }) => {
+      if (cmd === "accounts_list") return Promise.resolve(THREE);
+      if (cmd === "accounts_usage")
+        return Promise.resolve([
+          { id: "def", tokens5h: 0, tokens7d: 10, exhaustedUntil: ex["def"] ?? null },
+          { id: "dead", tokens5h: 0, tokens7d: 20, exhaustedUntil: ex["dead"] ?? null },
+          { id: "alt", tokens5h: 0, tokens7d: 50, exhaustedUntil: ex["alt"] ?? null },
+        ]);
+      if (cmd === "accounts_identities")
+        return Promise.resolve([
+          { id: "def", email: "def@x", organization: null },
+          { id: "dead", email: "dead@x", organization: null },
+          { id: "alt", email: "alt@x", organization: null },
+        ]);
+      if (cmd === "accounts_ceilings") return Promise.resolve([]);
+      if (cmd === "account_usage_live") return Promise.reject(new Error("no token in tests"));
+      if (cmd === "accounts_mark_exhausted") {
+        ex[args!.id] = args!.untilEpoch;
+        return Promise.resolve();
+      }
+      return Promise.reject(new Error(`unexpected ${cmd}`));
+    });
+    invalidateAccountState();
+    // Seed the dead verdict at the test clock so loadAccountState's TTL-guarded refresh won't overwrite it.
+    await refreshDeadLogins(THREE, t, {
+      probe: async (dir?: string) =>
+        dir === "/data/accounts/dead"
+          ? { loggedIn: false, source: "cli", email: "dead@x", authMethod: null, subscriptionType: null }
+          : { loggedIn: true, source: "cli", email: "x@x", authMethod: "oauth", subscriptionType: "max" },
+    });
+
+    // Parked on the cheapest signed-in account, `def`.
+    expect(await accountConfigDirFor(CONCIERGE_ACCOUNT_KEY, { now: t })).toBe("/home/.claude");
+
+    // def's auth fails → rotate. `dead` is cheaper than `alt` but its login is dead, so the rotation
+    // must skip it and land on `alt`.
+    const result = await rotateStickyConsumerOffFailedAccount(CONCIERGE_ACCOUNT_KEY, "auth", {
+      now: t + 1,
+    });
+    expect(result.rotated).toBe(true);
+    expect(result.to).toBe("alt");
+  });
 });
 
 describe("concierge fallback config dirs (single-turn auth-failover candidates)", () => {
@@ -1129,5 +1190,187 @@ describe("concierge fallback config dirs (single-turn auth-failover candidates)"
     invoke.mockImplementation(() => Promise.reject(new Error("backend down")));
     invalidateAccountState();
     expect(await conciergeFallbackConfigDirs({ now: 33_000_000 })).toEqual([]);
+  });
+});
+
+describe("deadLoginIds — the shared DEFINITELY-expired-login cache", () => {
+  const acc = (id: string) => ({
+    id,
+    nickname: id,
+    configDir: `/cfg/${id}`,
+    isDefault: false,
+    createdAt: 1,
+  });
+  const expired = (): ClaudeAuthStatus => ({
+    loggedIn: false,
+    source: "cli", // a live CLI "no" — the only shape authIsDefinitelyExpired accepts
+    email: "x@example.test",
+    authMethod: null,
+    subscriptionType: null,
+  });
+  const alive = (): ClaudeAuthStatus => ({
+    loggedIn: true,
+    source: "cli",
+    email: "x@example.test",
+    authMethod: "oauth",
+    subscriptionType: "max",
+  });
+  const absent = (): ClaudeAuthStatus => ({
+    loggedIn: false,
+    source: "absent", // never signed in — NOT "definitely expired"
+    email: null,
+    authMethod: null,
+    subscriptionType: null,
+  });
+
+  beforeEach(() => {
+    invalidateAccountState(); // clears the dead-login cache too
+  });
+
+  it("collects ONLY the accounts whose live probe says definitely-expired", async () => {
+    const probe = vi.fn(async (dir?: string) =>
+      dir === "/cfg/dead" ? expired() : dir === "/cfg/new" ? absent() : alive(),
+    );
+    await refreshDeadLogins([acc("dead"), acc("healthy"), acc("new")], 1_000, { probe });
+    const ids = deadLoginIds();
+    expect(ids.has("dead")).toBe(true); // live CLI "no"
+    expect(ids.has("healthy")).toBe(false); // logged in
+    expect(ids.has("new")).toBe(false); // never signed in is NOT expired
+  });
+
+  it("absorbs a probe that cannot run — a flaky probe never manufactures a dead login", async () => {
+    const probe = vi.fn(async (dir?: string) => {
+      if (dir === "/cfg/flaky") throw new Error("probe failed");
+      return expired();
+    });
+    await refreshDeadLogins([acc("flaky"), acc("dead")], 2_000, { probe });
+    expect(deadLoginIds().has("flaky")).toBe(false); // errored → not dead
+    expect(deadLoginIds().has("dead")).toBe(true);
+  });
+
+  it("serves the cache within the TTL and re-probes only after it lapses", async () => {
+    const probe = vi.fn(async () => expired());
+    await refreshDeadLogins([acc("dead")], 10_000, { probe });
+    expect(probe).toHaveBeenCalledTimes(1);
+    // Within the TTL: no re-probe.
+    await refreshDeadLogins([acc("dead")], 10_000 + DEAD_LOGIN_TTL_MS - 1, { probe });
+    expect(probe).toHaveBeenCalledTimes(1);
+    // Past the TTL: re-probe.
+    await refreshDeadLogins([acc("dead")], 10_000 + DEAD_LOGIN_TTL_MS, { probe });
+    expect(probe).toHaveBeenCalledTimes(2);
+  });
+
+  it("invalidateAccountState drops the verdict — a re-login re-probes rather than migrating off the fixed account", async () => {
+    const probe = vi.fn(async () => expired());
+    await refreshDeadLogins([acc("dead")], 20_000, { probe });
+    expect(deadLoginIds().has("dead")).toBe(true);
+    invalidateAccountState();
+    expect(deadLoginIds().size).toBe(0); // stale "expired" cannot outlive the remedy
+  });
+
+  it("a probe IN FLIGHT when a re-login lands does not re-pin the stale verdict, and the next refresh re-probes", async () => {
+    // The race the generation guard closes (roborev 67535). The `invalidateAccountState` test above
+    // awaits the probe FIRST, so it only covers the settled case; this drives the interleaving that
+    // actually bites: a probe kicked at T resolves AFTER the user re-logs in at T+ε. Without the guard
+    // it writes `{dead}` back and the fleet migrates off the account the user just fixed.
+    let releaseFirst!: () => void;
+    const firstProbe = vi.fn(
+      () =>
+        new Promise<ClaudeAuthStatus>((res) => {
+          releaseFirst = () => res(expired());
+        }),
+    );
+    const p = refreshDeadLogins([acc("dead")], 30_000, { probe: firstProbe }); // in flight, not settled
+    invalidateAccountState(); // the re-login lands mid-probe
+    releaseFirst(); // now the stale "expired" answer arrives
+    await p;
+    expect(deadLoginIds().has("dead")).toBe(false); // discarded by the generation guard
+
+    // …and the in-flight handle was dropped, so the NEXT refresh actually re-probes (post-login creds)
+    // rather than returning the stale in-flight promise.
+    const secondProbe = vi.fn(async () => alive());
+    await refreshDeadLogins([acc("dead")], 31_000, { probe: secondProbe });
+    expect(secondProbe).toHaveBeenCalledTimes(1);
+    expect(deadLoginIds().has("dead")).toBe(false);
+  });
+
+  it("a NON-credential invalidation (an agent move) keeps the dead-login verdict; a credential one drops it", async () => {
+    // roborev 67627: phase 2 calls invalidateAccountState() on every agent move (~3s). If that dropped
+    // the dead-login verdict it would be empty for most of a migration, making the mid-migration
+    // re-target / demotion / firstUsableHolder exclusion inert. So a non-credential invalidation must
+    // preserve it; only a credential event (login/add/remove) drops it.
+    const probe = vi.fn(async () => expired());
+    await refreshDeadLogins([acc("dead")], 60_000, { probe });
+    expect(deadLoginIds().has("dead")).toBe(true);
+
+    invalidateAccountState({ credentials: false }); // an agent move
+    expect(deadLoginIds().has("dead")).toBe(true); // preserved
+
+    invalidateAccountState(); // a credential event (default)
+    expect(deadLoginIds().size).toBe(0); // dropped
+  });
+});
+
+describe("a fleet preference / pause pointing at a DEFINITELY-expired login falls through to auto-pick", () => {
+  // The preference and the freeze are honoured by routing them through `pickAccount`'s pinnedAccountId
+  // slot, which deliberately OVERRIDES the dead-login demotion in `partitionAccounts` (a human pin
+  // wins). So without an explicit gate in `usablePreferredAccount`/`usablePausedAccount`, a fleet
+  // preference on an EXPIRED account keeps spawning every new agent there to 401 whenever the fleet
+  // switch does not fire. (roborev 67535)
+  const ACCTS = [
+    { id: "dead", nickname: "Dead", configDir: "/data/accounts/dead", isDefault: false, createdAt: 1 },
+    { id: "live", nickname: "Live", configDir: "/data/accounts/live", isDefault: false, createdAt: 2 },
+  ];
+  // `dead` has the LOWER tally, so auto-pick would prefer it on usage alone — but it is dead-login, so
+  // `partitionAccounts` demotes it and the healthy `live` is chosen once the preference is refused.
+  const USE = [
+    { id: "dead", tokens5h: 10, tokens7d: 10, exhaustedUntil: null },
+    { id: "live", tokens5h: 500, tokens7d: 500, exhaustedUntil: null },
+  ];
+  const IDS = [
+    { id: "dead", email: "dead@example.com", organization: null, accountUuid: "u-dead" },
+    { id: "live", email: "live@example.com", organization: null, accountUuid: "u-live" },
+  ];
+
+  beforeEach(async () => {
+    invoke.mockReset();
+    localStorage.clear(); // preferred account, pins, pause, rotation-out are all localStorage-backed
+    invalidateAccountState();
+    resetStickyAccounts();
+    clearAllPins();
+    clearPreferredAccount();
+    invoke.mockImplementation((cmd: string) => {
+      if (cmd === "accounts_list") return Promise.resolve(ACCTS);
+      if (cmd === "accounts_usage") return Promise.resolve(USE);
+      if (cmd === "accounts_identities") return Promise.resolve(IDS);
+      if (cmd === "accounts_ceilings") return Promise.resolve([]);
+      return Promise.reject(new Error(`unexpected command ${cmd}`));
+    });
+    // Populate the shared dead-login cache at the SAME clock the pick uses, so `loadAccountState`'s own
+    // (real-probe) refresh is within TTL and does not overwrite it.
+    await refreshDeadLogins(ACCTS, 40_000_000, {
+      probe: async (dir?: string) =>
+        dir === "/data/accounts/dead"
+          ? { loggedIn: false, source: "cli", email: "dead@example.com", authMethod: null, subscriptionType: null }
+          : { loggedIn: true, source: "cli", email: "live@example.com", authMethod: "oauth", subscriptionType: "max" },
+    });
+  });
+
+  it("does not route a non-sticky spawn to the preferred account when its login is dead", async () => {
+    setPreferredAccountId("dead");
+    const { chosen } = await chooseAccountForAgent("agent-x", { now: 40_000_000 });
+    // Refused as a preference (dead login) AND demoted as an auto-pick candidate → the healthy account.
+    // Remove the dead-login gate in `usablePreferredAccount` and the preference wins via the pin slot,
+    // sending the agent to `dead`.
+    expect(chosen?.id).toBe("live");
+  });
+
+  it("does not route a non-sticky spawn to a PAUSED-frozen account when its login is dead", async () => {
+    // The pause gate — the symmetric half, separately covered per sparkle-50m03 (test each site). A
+    // freeze is routed through pickAccount's pin slot too, so without the dead-login gate in
+    // `usablePausedAccount` a pause frozen onto an expired account keeps spawning agents there to 401.
+    pauseRotation("dead", 40_000_000);
+    const { chosen } = await chooseAccountForAgent("agent-y", { now: 40_000_000 });
+    expect(chosen?.id).toBe("live");
   });
 });

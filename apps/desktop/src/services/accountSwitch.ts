@@ -281,9 +281,23 @@ export function planStrandedHelperRescue(
   now: number,
   live: readonly LiveUsage[],
   agentAccounts: Record<string, string | undefined>,
+  /** Accounts whose OAuth login is DEFINITELY dead (live `claude auth status` "no"), forwarded to
+   *  {@link switchRecommendation} so a helper stranded on an EXPIRED account is rescued too — not just
+   *  one that hit a usage wall. Optional so existing callers/tests are unaffected; empty = no expiry
+   *  signal, exactly the prior behaviour. */
+  deadLoginIds: ReadonlySet<string> = new Set<string>(),
 ): SwitchPlan | null {
   for (const acct of stickyHelperAccounts(agentAccounts)) {
-    const rec = switchRecommendation(acct, accounts, usage, ceilings, identities, now, live);
+    const rec = switchRecommendation(
+      acct,
+      accounts,
+      usage,
+      ceilings,
+      identities,
+      now,
+      live,
+      deadLoginIds,
+    );
     if (!rec || rec.reason !== "exhausted") continue;
     const plan = planHelperRescue(acct, rec.to.id, agentAccounts);
     if (plan.pending.length > 0) return plan;
@@ -330,13 +344,29 @@ export function revalidateSwitchTarget(
   identities: Identity[],
   now: number,
   live: readonly LiveUsage[],
+  /** Accounts whose OAuth login is DEFINITELY dead (live `claude auth status` "no"). Threaded so a
+   *  target whose login EXPIRES mid-migration is re-targeted off — `signedInAccountIds` keys on the
+   *  recorded email, which an expired session still carries, so the plain check reads it as healthy.
+   *  Optional so existing callers/tests are unaffected; empty = prior behaviour. */
+  deadLoginIds: ReadonlySet<string> = new Set<string>(),
 ): TargetRevalidation {
-  if (isHealthyTarget(plan.toAccountId, accounts, usage, ceilings, identities, now, live)) {
+  if (
+    isHealthyTarget(plan.toAccountId, accounts, usage, ceilings, identities, now, live, deadLoginIds)
+  ) {
     return { kind: "ok", plan };
   }
   // Dead target: exclude it (and the vacated login) so we never re-pick a sibling of a walled login.
   const exclude = plan.fromAccountId ? [plan.toAccountId, plan.fromAccountId] : [plan.toAccountId];
-  const next = bestHealthyTarget(accounts, usage, ceilings, identities, now, live, exclude);
+  const next = bestHealthyTarget(
+    accounts,
+    usage,
+    ceilings,
+    identities,
+    now,
+    live,
+    exclude,
+    deadLoginIds,
+  );
   if (!next) return { kind: "held", plan };
   // Redirect the pending agents AND fold the already-moved back into pending: they are stranded on the
   // dead target and nothing else will move them. `advanceSwitch` still only re-spawns each at a safe

@@ -35,7 +35,7 @@ import { getAccountUsageLive } from "./accountUsage";
 // and the fleet-wide pause. Both read through localStorage on every call — see `rotationState.ts` for
 // why that discipline, and why neither is allowed to block a spawn.
 import { rotationOutIds, rotationPause } from "./rotationState";
-import { claudeSessionAccounts } from "../preflight";
+import { claudeSessionAccounts, checkClaudeAuthStatus, authIsDefinitelyExpired } from "../preflight";
 import type { Ceiling } from "./headroom";
 import type { ConciergeFailureKind } from "../engine/conciergeFailureNotice";
 import {
@@ -148,6 +148,103 @@ export function refreshLiveUsage(
   return p;
 }
 
+// ── DEFINITELY-EXPIRED logins, cached OFF the spawn's critical path ──────────────────────────────
+//
+// A live `claude auth status` per account — the ONLY signal that catches an OAuth session that has
+// DIED. An expired login records no rate-limit event and returns no utilization figure (its usage
+// probe 401s), so by every OTHER signal it reads as the healthiest account on the machine; the fleet
+// then strands on an account that cannot authenticate. `authIsDefinitelyExpired` is a live CLI "no"
+// (source "cli") — an errored/absent/recorded answer is NOT counted, so a flaky probe never
+// manufactures a false positive (the same rule `deriveRowLogin` applies to the accounts-screen badge).
+//
+// Shared here, ALONGSIDE `liveUsageRows`, for the reason roborev flagged: the fleet auto-switch, the
+// sticky-helper rescue, the manual-limit-modal suppression (`useLimitSync`), AND the spawn gate
+// (`pickAccount`/`firstUsableHolder`) must all agree on which accounts are dead. If only the switch
+// oracle knew, (a) the modal would be suppressed while the switch declined — a silent strand — and
+// (b) a rescued helper would be re-selected straight back onto its dead account and restarted every
+// poll forever. One shared source, read by all of them, with the SAME never-blocks-a-spawn contract:
+// a dead login DEMOTES an account (dropped from `candidates`, kept in `eligible`), never blocks it.
+//
+// Same background-cache discipline as live usage: `deadLoginIds()` never fetches/blocks/throws, the
+// refresh is kicked (not awaited) by `loadAccountState`, and `invalidateAccountState` drops it — so a
+// re-login (which invalidates) re-probes rather than migrating the fleet off the account just fixed.
+export const DEAD_LOGIN_TTL_MS = 90_000;
+
+let deadLoginCache: { at: number; ids: Set<string> } | null = null;
+let deadLoginInflight: Promise<void> | null = null;
+// Bumped by every invalidation. A probe captures the generation before its awaits and writes the
+// cache (and clears the in-flight handle) only if it still matches on resolve — the SAME guard
+// `loadAccountState` uses, and it is load-bearing HERE specifically: a probe kicked before a re-login
+// resolves after it, and without this guard it would re-pin the STALE `{expired}` verdict, so the
+// next `useAccountSwitch` tick migrates the whole fleet off the account the user just fixed (and
+// writes `setPreferredAccountId`, a durable side effect that does not undo itself). See the incident
+// this closes on review 67535.
+let deadLoginGen = 0;
+
+/** The accounts whose OAuth login is DEFINITELY dead right now. Never fetches, never blocks, never
+ *  throws. Empty means "we don't know yet" (nothing probed, or offline) — which every consumer treats
+ *  as "not dead", so nothing is acted on before the first probe lands. */
+export function deadLoginIds(): ReadonlySet<string> {
+  return deadLoginCache?.ids ?? EMPTY_DEAD_LOGINS;
+}
+const EMPTY_DEAD_LOGINS: ReadonlySet<string> = new Set<string>();
+
+/** Drop the dead-login cache so the next {@link loadAccountState} re-probes. Called by
+ *  {@link invalidateAccountState} — an add/remove/login changes which credentials resolve, and a
+ *  re-login is exactly the remedy that must clear a stale "expired" verdict before it can migrate the
+ *  fleet off the account the user just fixed.
+ *
+ *  Bumps the generation and drops the in-flight handle so a probe that was ALREADY RUNNING when the
+ *  re-login landed can neither write its stale verdict back (its gen check fails) nor block the next
+ *  refresh from re-probing with the post-login credentials (`deadLoginInflight` is cleared, so the
+ *  next call kicks a fresh probe rather than returning the stale in-flight one). */
+function invalidateDeadLogins(): void {
+  deadLoginGen++;
+  deadLoginCache = null;
+  deadLoginInflight = null;
+}
+
+/** Kick a background `claude auth status` probe per account if the cache is cold. Fire-and-forget by
+ *  design — a subprocess + keychain read per account must never gate a spawn or a headroom tick. Per
+ *  account failures are ABSORBED (a probe that can't run is "not dead", never a false positive), and
+ *  only a live CLI "no" ({@link authIsDefinitelyExpired}) lands in the set. `now`/`deps` are injected
+ *  for tests, exactly as {@link refreshLiveUsage} does and for the same both-clocks-move-together
+ *  reason. */
+export function refreshDeadLogins(
+  accounts: Account[],
+  now: number = Date.now(),
+  deps = { probe: checkClaudeAuthStatus },
+): Promise<void> {
+  if (deadLoginCache && now - deadLoginCache.at < DEAD_LOGIN_TTL_MS) return Promise.resolve();
+  if (deadLoginInflight) return deadLoginInflight;
+  // Captured BEFORE the awaits; the write and the in-flight clear below both check it, so an
+  // invalidation (a re-login) that lands mid-probe discards this batch's stale result instead of
+  // re-pinning it. See `invalidateDeadLogins` / `deadLoginGen`.
+  const gen = deadLoginGen;
+  const p = (async () => {
+    const flags = await Promise.all(
+      accounts.map((a) =>
+        deps
+          .probe(a.configDir)
+          .then((s) => (authIsDefinitelyExpired(s) ? a.id : null))
+          .catch(() => null),
+      ),
+    );
+    if (gen === deadLoginGen) {
+      deadLoginCache = { at: now, ids: new Set(flags.filter((id): id is string => id !== null)) };
+    }
+  })()
+    .catch(() => {
+      // Whole-batch failure: leave whatever was cached rather than pinning an empty result.
+    })
+    .finally(() => {
+      // Only clear OUR handle — an invalidation already dropped it and a newer probe may own it now.
+      if (gen === deadLoginGen) deadLoginInflight = null;
+    });
+  deadLoginInflight = p;
+  return p;
+}
+
 let cache: { at: number; state: AccountState } | null = null;
 let inflight: Promise<AccountState> | null = null;
 // Bumped on every invalidate. A load captures the generation before its await and only writes to
@@ -228,6 +325,10 @@ export async function loadAccountState(
       // keychain read and a network call per account, and a spawn must never wait on either. The
       // rows land for the NEXT pick; this one uses whatever is already cached.
       void refreshLiveUsage(state.accounts, now);
+      // …and the login-health probe, same fire-and-forget discipline — see `refreshDeadLogins`. It
+      // spawns `claude auth status` per account, which must never gate a spawn; the verdict lands for
+      // the NEXT pick and this one reads whatever is cached.
+      void refreshDeadLogins(state.accounts, now);
       return state;
     } catch {
       if (gen === generation) cache = null; // don't pin a failure; the next call retries
@@ -245,15 +346,30 @@ export async function loadAccountState(
 }
 
 /** Drop the cache so the next load re-fetches (call after add/remove/login or a failover update).
- *  Bumps the generation so any in-flight load won't repopulate the cache with its stale snapshot. */
-export function invalidateAccountState(): void {
+ *  Bumps the generation so any in-flight load won't repopulate the cache with its stale snapshot.
+ *
+ *  `credentials` (default true) also drops the DEAD-LOGIN verdict. A dead login only changes on a
+ *  credential event (login / add / remove), so the FREQUENT non-credential caller — phase 2's
+ *  per-advance `invalidateAccountState()` after each agent MOVE (every ~3s during a migration) — must
+ *  pass `credentials: false`. Otherwise it bumps the dead-login generation and drops the in-flight
+ *  probe every few seconds, leaving `deadLoginIds()` empty for most of the very migration the verdict
+ *  protects — making the mid-migration re-target, the `partitionAccounts` demotion and
+ *  `firstUsableHolder`'s exclusion all inert, so a sticky consumer lands back on the dead account.
+ *  Default true keeps every credential-changing caller correct; the mover opts out. (roborev 67627) */
+export function invalidateAccountState(opts: { credentials?: boolean } = {}): void {
   cache = null;
   inflight = null;
   generation++;
   // An add/remove/login changes WHICH accounts exist and which credentials resolve, so the live
   // rows keyed by account id are stale too. Dropping them is safe: until the refresh lands,
-  // selection falls back to the local tally rather than to a stale percentage.
+  // selection falls back to the local tally rather than to a stale percentage. (An agent MOVE also
+  // changes usage, so this is dropped on every call, credential event or not.)
   invalidateLiveUsage();
+  // A re-login is the exact remedy for an expired session, so a stale "expired" verdict must not
+  // outlive it — drop the dead-login cache on a credential event so the next probe re-reads rather
+  // than migrating the fleet off the account the user just fixed. NOT on a plain agent move (see the
+  // `credentials` note above), which changes no credentials and fires far too often.
+  if (opts.credentials !== false) invalidateDeadLogins();
 }
 
 /** Choose the account `agentId` should spawn under (honoring its manual pin) plus the loaded state
@@ -367,6 +483,13 @@ export async function chooseAccountForAgent(
     // is the SAME per-login judgement `exhaustionOutlook` (AC8) and `switchRecommendation` use, so the
     // spawn gate cannot land agents on a quota those two already call spent.
     siblingIds: loginSiblingIds(state.accounts, state.identities),
+    // DEFINITELY-expired logins (live `claude auth status` "no"), from the shared probe cache. Rides
+    // the shared base like everything else so BOTH branches honour it — an expired login can't
+    // authenticate, so routing any agent there spawns it into a 401. It demotes, never blocks (see
+    // PickOptions.deadLoginIds), so a pin still wins and a lone dead account still gets `leastBad`.
+    // This is also what makes the auto-switch helper rescue converge: a rescued sticky helper must
+    // NOT be re-selected straight back onto the dead account it was just moved off.
+    deadLoginIds: deadLoginIds(),
     // Only the concierge asks to avoid a clobbered default (`avoidClobberedDefault`); every other
     // caller passes undefined, so `partitionAccounts` sees an absent set and behaves exactly as before.
     // A pin still overrides this — `pickAccount` honours a pinned account even when clobbered, because
@@ -627,7 +750,11 @@ function firstUsableHolder(
     (a) =>
       (!applies || base.signedInIds!.includes(a.id)) &&
       !isAccountExhausted(state.usage, a.id, now) &&
-      !isAccountLiveSpent(a.id, base.live, base.siblingIds),
+      !isAccountLiveSpent(a.id, base.live, base.siblingIds) &&
+      // A DEFINITELY-expired login can't authenticate, so resuming an agent's conversation there just
+      // spawns it into a 401. Excluding it here (as well as in `partitionAccounts`) is what stops a
+      // rescued sticky helper's transcript affinity from pulling it straight back to the dead account.
+      !(base.deadLoginIds?.has(a.id) ?? false),
   );
 }
 
@@ -794,6 +921,14 @@ function usablePreferredAccount(
   if (signedInFilterApplies(state.accounts, signedInIds) && !signedInIds.includes(preferred))
     return undefined;
   if (isAccountExhausted(state.usage, preferred, now ?? Date.now())) return undefined; // (4)
+  // (4b) NOT A DEAD LOGIN. The preference is honoured by routing it through `pickAccount`'s
+  //      pinnedAccountId slot, which deliberately OVERRIDES the dead-login demotion in
+  //      `partitionAccounts` (a human pin wins). So the demotion is inert on this path, and without
+  //      this gate a fleet preference pointing at an EXPIRED account keeps spawning every new agent
+  //      there to 401 — reachable whenever the fleet switch does not fire (e.g. no panes running, so
+  //      `switchRecommendation` never moves the preference off it). Observed fact, exactly like the
+  //      exhausted gate above, so it overrides the preference the same way. (roborev 67535)
+  if (deadLoginIds().has(preferred)) return undefined;
   // 5. NOT TAKEN OUT OF ROTATION. One rule for both FLEET-LEVEL mechanisms — this and the pause —
   //    and never for a per-agent pin. Both of these are the user's own choice, so the tie is broken
   //    by which one the SCREEN is showing: the card renders "out of rotation · you took it out", and
@@ -848,6 +983,11 @@ function usablePausedAccount(
   if (signedInFilterApplies(state.accounts, signedInIds) && !signedInIds.includes(frozen))
     return undefined;
   if (isAccountExhausted(state.usage, frozen, now ?? Date.now())) return undefined;
+  // A DEAD LOGIN fails the freeze the same way it fails the preference above, and for the same reason:
+  // the frozen id is routed through `pickAccount`'s pin slot, which overrides the demotion. Without
+  // this, a pause frozen onto an account whose login later expires keeps spawning every new agent
+  // there to 401. (roborev 67535)
+  if (deadLoginIds().has(frozen)) return undefined;
   return frozen;
 }
 
@@ -1085,8 +1225,11 @@ export async function rotateStickyConsumerOffFailedAccount(
         ),
     );
     // Fresh usage now reflects the bench; re-resolve so `autoPick` evicts `from` and the sticky
-    // pointer moves to the healthy account, making the consumer's next turn stable.
-    invalidateAccountState();
+    // pointer moves to the healthy account, making the consumer's next turn stable. A rate-limit
+    // bench changes USAGE, not credentials — and `chooseAccountForAgent` on the very next line reads
+    // the dead-login verdict (via `base.deadLoginIds`) to demote dead accounts, so wiping it here
+    // would let the sticky consumer re-resolve onto a dead account. Keep it. (roborev 67726)
+    invalidateAccountState({ credentials: false });
     const { chosen } = await chooseAccountForAgent(key, { force: true, now });
     const to = chosen?.id;
     return { rotated: !!to && to !== from, from, to };
