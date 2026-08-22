@@ -1029,7 +1029,7 @@ export function ConciergeColumn({
           rather than to the concierge — a big change in where their words land, and Escape is the
           only gesture that undoes it. So the affordance is ON SCREEN while the state is live rather
           than learned once: the founder's placement is this row, directly above the composer (the
-          one carrying the `<_ …` activity line), right-justified.
+          one carrying the `>_ …` activity line), right-justified.
 
           GATED ON `isWired`, which is the whole point — a hint offering an exit from a state you are
           no longer in asserts the cable is still patched when it isn't, the same stale signal the

@@ -1508,11 +1508,39 @@ mod tests {
         assert_eq!(got[0].first_at_ms, 1_900);
         assert_eq!(got[0].newest_at_ms, 2_000);
         assert_eq!(got[0].newest_id, "hi", "the newest of the MERGED band, not of one half of it");
-        // …and the contract's ascending-and-unique guarantee, stated directly.
+    }
+
+    /// The ascending-and-unique half of the same contract, on a window that can actually BREAK it.
+    ///
+    /// The single-band row above cannot test ordering: it asserts `got.len() == 1`, and one element
+    /// is trivially ascending and trivially unique. An assertion placed there could not fail under
+    /// any mutation — it would be the vacuous shape the row above exists to prevent, planted inside
+    /// the fix for it. So ordering is tested HERE, where the result has several buckets and the
+    /// `to_ms` row is folded into the last of them.
+    ///
+    /// `pairs` is `windows(2)` with a STRICT `<`, not a sort-and-compare: sorting proves the values
+    /// can be ordered, never that they arrived ordered, and it silently accepts duplicates.
+    #[test]
+    fn prompt_density_indices_are_strictly_ascending_across_several_bands() {
+        let conn = mem();
+        // Bands over [1_000, 2_000] with 4 buckets: 0=[1000,1250) 1=[1250,1500) 3=[1750,2000].
+        record_into(&conn, &concierge("b0", "band 0", 1_100)).unwrap();
+        record_into(&conn, &concierge("b1", "band 1", 1_300)).unwrap();
+        record_into(&conn, &concierge("b3", "band 3", 1_800)).unwrap();
+        record_into(&conn, &concierge("edge", "on to_ms", 2_000)).unwrap();
+
+        let got = prompt_density_in(&conn, 1_000, 2_000, "concierge", 4).unwrap();
+        // Band 2 is empty and therefore absent — the result is SPARSE, which is why "ascending" is
+        // the contract rather than "contiguous".
+        assert_eq!(bands(&got), vec![(0, 1), (1, 1), (3, 2)]);
         let idx: Vec<u32> = got.iter().map(|b| b.index).collect();
-        let mut sorted = idx.clone();
-        sorted.dedup();
-        assert_eq!(idx, sorted, "indices must be strictly ascending with no duplicates");
+        assert!(
+            idx.windows(2).all(|w| w[0] < w[1]),
+            "indices must be STRICTLY ascending with no duplicates: {idx:?}"
+        );
+        // …and the fold is still what put `edge` in band 3 rather than in a phantom band 4.
+        assert_eq!(got[2].count, 2);
+        assert_eq!(got[2].newest_id, "edge");
     }
 
     /// Band `i` covers `[from + i*span/n, from + (i+1)*span/n)` — half-open, so a row exactly on a
