@@ -2474,8 +2474,68 @@
             "nothing installed and nothing in flight → nothing to do"
         );
 
-        // `reconcile_locked` (the focus-edge twin) needs an AppHandle, so it cannot be driven here
-        // and stays unpinned by construction. Its call site is kept honest by the shared helper.
+        // `reconcile_locked` (the focus-edge twin) is now a pure decider too — it no longer takes an
+        // AppHandle and no longer builds/tears down inline — so its Idle/Teardown decisions ARE
+        // driveable here; see `reconcile_locked_decides_the_step_without_building_inline`.
+    }
+
+    #[test]
+    fn reconcile_locked_decides_the_step_without_building_inline() {
+        // THE FOCUS-EDGE UI-FREEZE FIX. `set_focused` (a window-focus event, on the MAIN thread)
+        // used to build the capture INLINE inside `reconcile_locked`, under the session lock —
+        // `Capture::start` → `AudioOutputUnitStart`, which blocks on CoreAudio's HAL IO thread and
+        // can stall for seconds if the HAL wedges. `reconcile_locked` now only DECIDES, returning a
+        // `ReconcileStep` the caller acts on off-lock and (for a build) off the main thread.
+        //
+        // This pins that call site the way `take_reconcile_step_honours_the_in_flight_build_marker`
+        // pins the worker path: an in-flight-build marker with nothing that wants a capture must be
+        // seen as a Teardown decision — returned as data, not performed under the lock. It would go
+        // red if `reconcile_locked` reverted to returning `CaptureLeftovers`/building inline.
+        let state = DictationState::default();
+        {
+            let mut sess = state.0.lock().unwrap();
+            sess.armed = false;
+            sess.focused = false;
+            sess.build_started_at = Some(std::time::Instant::now());
+            assert!(
+                matches!(
+                    DictationState::reconcile_locked(&mut sess),
+                    ReconcileStep::Teardown { capture: None, worker: None }
+                ),
+                "an in-flight build with nothing wanting a capture must be DECIDED as a Teardown, \
+                 not built/torn down inline on the caller (main) thread"
+            );
+        }
+
+        // The converse, so the assertion above can't be satisfied by a call site that always tears
+        // down: nothing installed, nothing in flight, nothing wanted → Idle.
+        let clean = DictationState::default();
+        {
+            let mut sess = clean.0.lock().unwrap();
+            sess.armed = false;
+            sess.focused = false;
+            sess.build_started_at = None;
+            assert!(
+                matches!(DictationState::reconcile_locked(&mut sess), ReconcileStep::Idle),
+                "nothing installed and nothing in flight → nothing to do"
+            );
+        }
+
+        // Armed + focused enters the `CapturePlan::Build` arm; with no transcriber resident (no
+        // 482 MB model in CI) it falls to the belt-and-suspenders `None => Idle`. It still exercises
+        // the Build arm's decision path returning WITHOUT calling `Capture::start`, which is the
+        // whole point — a real transcriber would yield `ReconcileStep::Build` for the caller to run
+        // off-main, never an inline CoreAudio call.
+        let armed = DictationState::default();
+        {
+            let mut sess = armed.0.lock().unwrap();
+            sess.armed = true;
+            sess.focused = true;
+            assert!(
+                matches!(DictationState::reconcile_locked(&mut sess), ReconcileStep::Idle),
+                "the Build arm with no resident transcriber decides Idle without building"
+            );
+        }
     }
 
     #[test]

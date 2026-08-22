@@ -1905,8 +1905,8 @@ impl DictationState {
     /// is cheap and doesn't disturb an in-flight cloud epoch. Pausing drops `Capture`, which stops
     /// CoreAudio invoking the callback and releases the OS mic (the macOS recording indicator goes
     /// off) — true "not capturing", not merely discarded frames.
-    #[must_use = "the returned capture/worker MUST be dropped after the session lock is released"]
-    fn reconcile_locked(sess: &mut DictationSession, app: &AppHandle) -> CaptureLeftovers {
+    #[must_use = "the returned ReconcileStep MUST be acted on after the session lock is released"]
+    fn reconcile_locked(sess: &mut DictationSession) -> ReconcileStep {
         // Same decision as the worker-side reconcile — both derive it from `plan_capture` so the two
         // paths can't drift on when to build vs. tear down (sparkle-sfxu review).
         //
@@ -1919,10 +1919,14 @@ impl DictationState {
         // unbounded `pthread_join`, WHILE HOLDING the session mutex the main thread's focus handler
         // was waiting on. Main thread: 6705 of 6705 samples blocked on that mutex.
         //
-        // So the teardown is no longer performed here. This function DECIDES; the caller drops what
-        // it hands back, after the guard is released. That is the same shape `reconcile_capture`
-        // (`ReconcileStep::Teardown`) and `stop_dictation` already use — this path was the last one
-        // that still tore down under the lock.
+        // NEITHER the teardown NOR the build is performed here any more. This function only DECIDES,
+        // handing the caller a `ReconcileStep`; `set_focused` drops the teardown, and BUILDS off the
+        // main thread — because `Capture::start`'s `AudioOutputUnitStart` blocks on CoreAudio's HAL
+        // IO thread and can stall for seconds if the HAL wedges, which on the main-thread focus
+        // handler is a UI freeze. That is the same shape `reconcile_capture` (`ReconcileStep`) and
+        // `stop_dictation` already use — this path was the last one that still touched CoreAudio
+        // under the lock, on the main thread.
+        //
         // Same reasoning as `take_reconcile_step`'s: log the DECISION and both of its inputs on
         // every path, so a mic that silently never comes up is visible in the log.
         // Counts an in-flight build as an existing capture, for the same reason and via the same
@@ -1946,51 +1950,42 @@ impl DictationState {
             "reconcile decision (focus edge)",
         );
         match plan {
-            CapturePlan::Idle => CaptureLeftovers::default(),
-            CapturePlan::Build => {
-            // transcriber is always Some while armed; the guard is belt-and-suspenders.
-            if let Some(transcriber) = sess.transcriber.clone() {
-                match build_capture(
-                    app.clone(),
-                    transcriber,
-                    sess.cloud_active.clone(),
-                    sess.cloud_tx.clone(),
-                ) {
-                    Ok((cap, worker)) => {
-                        sess.capture = Some(cap);
-                        sess.decode_worker = Some(worker);
-                        // Fresh capture → fresh liveness verdict (see install_capture).
-                        sess.build_started_at = None;
-                        sess.clear_audio_fault();
-                        // Refocus inside the warm window resumes the parked socket rather than
-                        // re-handshaking. Only once the capture is actually installed: resuming a
-                        // session we then failed to feed would leave it live but silent.
-                        unpark_cloud_for_focus(&sess.cloud, &sess.cloud_active);
-                        tracing::info!(target: "dictation", "capture resumed (window focused)");
-                    }
-                    Err(e) => {
-                        let _ = app.emit("dictation://error", e);
+            CapturePlan::Idle => ReconcileStep::Idle,
+            // transcriber is always Some while armed; the guard is belt-and-suspenders (a Build with
+            // nothing to build from is simply Idle). Mark the build in flight so the watchdog does not
+            // mistake the off-lock, off-main build window for a failure — exactly as
+            // `take_reconcile_step` does, and cleared by `install_capture` / `note_build_failed`.
+            CapturePlan::Build => match sess.transcriber.clone() {
+                Some(transcriber) => {
+                    sess.build_started_at = Some(std::time::Instant::now());
+                    ReconcileStep::Build {
+                        transcriber,
+                        cloud_active: sess.cloud_active.clone(),
+                        cloud_tx: sess.cloud_tx.clone(),
                     }
                 }
-            }
-            CaptureLeftovers::default()
-            }
+                None => ReconcileStep::Idle,
+            },
             CapturePlan::Teardown => {
-            // Tell the worker to abandon its queued backlog before handing it back, so the caller's
-            // off-lock drop doesn't wait out the decode duration of up to DECODE_QUEUE_CAP queued
-            // segments. A paused capture's trailing partials are moot — same rationale as
-            // stop_capture (which also aborts first).
-            if let Some(w) = sess.decode_worker.as_ref() {
-                w.abort();
-            }
-            // Park the cloud socket too, so a quick refocus reuses it instead of re-handshaking.
-            // Safe under the lock: pause() is a non-blocking channel send, not main-thread-dependent
-            // work — the same reasoning `reconcile_capture`'s Teardown arm states for doing it here.
-            park_cloud_for_blur(&sess.cloud, &sess.cloud_active);
-            tracing::info!(target: "dictation", "capture paused (window unfocused or muted)");
-            // TAKEN, not dropped: the cpal stream teardown touches CoreAudio and the worker drop
-            // waits on a thread, and neither may happen while this lock is held.
-            CaptureLeftovers { capture: sess.capture.take(), worker: sess.decode_worker.take() }
+                // Tell the worker to abandon its queued backlog before handing it back, so the
+                // caller's off-lock drop doesn't wait out the decode duration of up to
+                // DECODE_QUEUE_CAP queued segments. A paused capture's trailing partials are moot —
+                // same rationale as stop_capture (which also aborts first).
+                if let Some(w) = sess.decode_worker.as_ref() {
+                    w.abort();
+                }
+                // Park the cloud socket too, so a quick refocus reuses it instead of re-handshaking.
+                // Safe under the lock: pause() is a non-blocking channel send, not
+                // main-thread-dependent work — the same reasoning `reconcile_capture`'s Teardown arm
+                // states for doing it here.
+                park_cloud_for_blur(&sess.cloud, &sess.cloud_active);
+                // TAKEN, not dropped: the cpal stream teardown touches CoreAudio and the worker drop
+                // waits on a thread, and neither may happen while this lock is held. The caller logs
+                // WHICH teardown this is (a real pause vs. a build-window no-op) once it has the step.
+                ReconcileStep::Teardown {
+                    capture: sess.capture.take(),
+                    worker: sess.decode_worker.take(),
+                }
             }
         }
     }
@@ -2047,44 +2042,64 @@ impl DictationState {
                 }
             }
             // Build OUTSIDE the lock (Capture::start's CoreAudio init blocks on the main thread), then
-            // install under the lock only if the arm intent is still current.
+            // install under the lock only if the arm intent is still current. The build+install+retry
+            // body is shared with the focus-edge path (`set_focused`) via `build_and_install`, so the
+            // two callers cannot drift on how a failed build is handled.
             ReconcileStep::Build { transcriber, cloud_active, cloud_tx } => {
-                match build_capture(app.clone(), transcriber.clone(), cloud_active, cloud_tx) {
-                    Ok((capture, worker)) => self.install_capture(app, &transcriber, capture, worker),
-                    Err(e) => {
-                        // The build FAILED — clear the in-flight marker so the watchdog stops
-                        // treating this as a build still running and can escalate/retry.
-                        //
-                        // …AND RE-ISSUE, exactly as the discard path does (roborev 60351). This is
-                        // the OTHER way a build gets invalidated, and it was dropping the same
-                        // suppressed reconcile: marker set for T1 → stop → start installs T2 and
-                        // reconciles to Idle because the marker stands → T1's build returns Err (the
-                        // device was held during the stop) → marker cleared, error emitted, nothing
-                        // pending. Same armed && focused && no-capture dead end, recoverable only by
-                        // the watchdog ~3 s later. The retry frequently SUCCEEDS here, because the
-                        // failure belonged to the stale T1 attempt and not to T2's session.
-                        //
-                        // NO RETRY STORM — and the bound is a LATCH, not the in-flight marker. An
-                        // earlier version of this comment claimed the re-issued build would find
-                        // `build_started_at` set by its own plan and stop there; it does not, because
-                        // the line clearing that marker runs first, so the re-issued reconcile plans
-                        // a fresh Build every time. A device failing for its OWN reasons therefore
-                        // recursed until the stack ran out (roborev 60384). `note_build_failed`
-                        // spends a one-shot budget instead: the stale-attempt case gets its retry,
-                        // and a persistently failing device falls through to the watchdog.
-                        let reissue = {
-                            let mut sess = self.0.lock().unwrap_or_else(|p| p.into_inner());
-                            note_build_failed(&mut sess)
-                        };
-                        let _ = app.emit("dictation://error", e);
-                        if reissue {
-                            tracing::info!(
-                                target: "dictation",
-                                "re-reconciling after a FAILED build; the session still wants a capture",
-                            );
-                            self.reconcile_capture(app);
-                        }
-                    }
+                self.build_and_install(app, transcriber, cloud_active, cloud_tx)
+            }
+        }
+    }
+
+    /// Build a capture OFF the session lock and install it, re-validating the arm intent under the
+    /// lock (`install_capture`). Shared by `reconcile_capture` (the worker/watchdog/arm path) and the
+    /// focus-edge build spawned by `set_focused`, so both handle a failed build identically.
+    ///
+    /// The caller decides where this RUNS: `Capture::start` blocks on CoreAudio's HAL IO thread (an
+    /// `AudioOutputUnitStart` that can stall for seconds if the HAL wedges), so it must never be
+    /// invoked on the main/UI thread. Every caller reaches it from an async-runtime worker or a
+    /// dedicated `std::thread`, never inline on the window-focus handler.
+    fn build_and_install(
+        &self,
+        app: &AppHandle,
+        transcriber: Arc<Mutex<ParakeetTdt>>,
+        cloud_active: Arc<AtomicBool>,
+        cloud_tx: Arc<Mutex<Option<CloudAudioSender>>>,
+    ) {
+        match build_capture(app.clone(), transcriber.clone(), cloud_active, cloud_tx) {
+            Ok((capture, worker)) => self.install_capture(app, &transcriber, capture, worker),
+            Err(e) => {
+                // The build FAILED — clear the in-flight marker so the watchdog stops
+                // treating this as a build still running and can escalate/retry.
+                //
+                // …AND RE-ISSUE, exactly as the discard path does (roborev 60351). This is
+                // the OTHER way a build gets invalidated, and it was dropping the same
+                // suppressed reconcile: marker set for T1 → stop → start installs T2 and
+                // reconciles to Idle because the marker stands → T1's build returns Err (the
+                // device was held during the stop) → marker cleared, error emitted, nothing
+                // pending. Same armed && focused && no-capture dead end, recoverable only by
+                // the watchdog ~3 s later. The retry frequently SUCCEEDS here, because the
+                // failure belonged to the stale T1 attempt and not to T2's session.
+                //
+                // NO RETRY STORM — and the bound is a LATCH, not the in-flight marker. An
+                // earlier version of this comment claimed the re-issued build would find
+                // `build_started_at` set by its own plan and stop there; it does not, because
+                // the line clearing that marker runs first, so the re-issued reconcile plans
+                // a fresh Build every time. A device failing for its OWN reasons therefore
+                // recursed until the stack ran out (roborev 60384). `note_build_failed`
+                // spends a one-shot budget instead: the stale-attempt case gets its retry,
+                // and a persistently failing device falls through to the watchdog.
+                let reissue = {
+                    let mut sess = self.0.lock().unwrap_or_else(|p| p.into_inner());
+                    note_build_failed(&mut sess)
+                };
+                let _ = app.emit("dictation://error", e);
+                if reissue {
+                    tracing::info!(
+                        target: "dictation",
+                        "re-reconciling after a FAILED build; the session still wants a capture",
+                    );
+                    self.reconcile_capture(app);
                 }
             }
         }
@@ -2348,22 +2363,63 @@ impl DictationState {
     /// meter, reset the dictation phase, and update the listening UI. Moving focus between two Sparkle
     /// windows keeps `focused` true, so no event fires and the mic stays live.
     pub fn set_focused(&self, app: &AppHandle, focused: bool) {
-        let (changed, leftovers) = {
+        let (changed, step) = {
             let mut sess = self.0.lock().unwrap_or_else(|p| p.into_inner());
             if sess.focused == focused {
-                (false, CaptureLeftovers::default())
+                (false, ReconcileStep::Idle)
             } else {
+                // Set focus AUTHORITATIVELY from the event payload before deciding — the caller
+                // (`note_focus_event`) trusts a `Focused(true)` even if a focus poll momentarily
+                // lags. `reconcile_locked` only decides against this value; it neither builds nor
+                // tears down under the lock.
                 sess.focused = focused;
-                (true, Self::reconcile_locked(&mut sess, app))
+                (true, Self::reconcile_locked(&mut sess))
             }
-        }; // release the lock before emitting AND before the teardown drops below
-        // THE DEADLOCK FIX. This drop waits on the decode thread and disposes a cpal stream; doing
-        // it inside the block above (which `reconcile_locked` used to) held the session mutex across
-        // an unbounded `pthread_join` and hung the whole app — main thread blocked here at 6705 of
-        // 6705 samples. `set_focused` is called from BOTH the main-thread focus handler and
-        // `note_focus_event`'s deferred-blur thread, so either one holding this lock for an
-        // unbounded time stalls the other. See `DECODE_JOIN_TIMEOUT`.
-        drop(leftovers);
+        }; // release the lock before emitting AND before acting on the step below
+        // Everything the step touches — a cpal-stream teardown drop, or a `Capture::start` build —
+        // is main-thread-blocking and/or lock-hostile, so it runs only after the guard above is
+        // released, and the BUILD runs off the main thread entirely (see below). `set_focused` is
+        // called from BOTH the main-thread focus handler and `note_focus_event`'s deferred-blur
+        // thread, so either one holding this lock for an unbounded time stalls the other
+        // (sparkle-sfxu; see `DECODE_JOIN_TIMEOUT`).
+        match step {
+            ReconcileStep::Idle => {}
+            ReconcileStep::Teardown { capture, worker } => {
+                // SAY WHICH TEARDOWN THIS IS (roborev 59586), mirroring `reconcile_capture`. Now that
+                // the build is deferred off-lock, a blur can land inside the build window and reach
+                // Teardown with nothing installed — logging "capture paused" there would be a fresh
+                // false statement in exactly the window this file works to describe honestly.
+                let had_capture = capture.is_some();
+                // THE DEADLOCK FIX. This drop waits on the decode thread and disposes a cpal stream;
+                // doing it under the lock (which `reconcile_locked` used to) held the session mutex
+                // across an unbounded `pthread_join` and hung the whole app — main thread blocked at
+                // 6705 of 6705 samples.
+                drop(capture);
+                drop(worker);
+                if had_capture {
+                    tracing::info!(target: "dictation", "capture paused (window unfocused or muted)");
+                } else {
+                    tracing::info!(
+                        target: "dictation",
+                        "stop/blur landed during a build; the in-flight capture will be discarded on install"
+                    );
+                }
+            }
+            // BUILD OFF THE MAIN THREAD. `Capture::start` calls CoreAudio's `AudioOutputUnitStart`,
+            // which blocks on the HAL IO thread and can stall for seconds if the HAL wedges — a UI
+            // freeze if run on this window-focus handler. Hand it to a dedicated thread, exactly as
+            // `note_focus_event`'s blur path already spawns `set_focused(false)` off-main. The build
+            // installs via the shared `build_and_install` → `install_capture`, which re-validates the
+            // arm intent under the lock, so a blur/stop that lands while the build runs correctly
+            // discards the capture rather than leaving the mic live while unfocused.
+            ReconcileStep::Build { transcriber, cloud_active, cloud_tx } => {
+                let this = DictationState(self.0.clone(), self.1.clone());
+                let app = app.clone();
+                std::thread::spawn(move || {
+                    this.build_and_install(&app, transcriber, cloud_active, cloud_tx);
+                });
+            }
+        }
         if changed {
             let _ = app.emit("dictation://focus", focused);
         }
