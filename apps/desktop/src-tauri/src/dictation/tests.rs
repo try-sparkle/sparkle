@@ -2734,7 +2734,24 @@
             let mut rest = code;
             while let Some(i) = rest.find("std::thread::spawn(") {
                 let after = &rest[i..];
-                let Some(open) = after.find('{') else { break };
+                // BOUND THE SEARCH TO THIS STATEMENT. An unbounded `find('{')` takes the first brace
+                // ANYWHERE after the spawn, so a brace-less single-expression spawn
+                // (`spawn(move || tx.send(()).ok());`) latches onto the next unrelated block and
+                // brace-matches THAT into `inside` — silently exempting main-thread code from the
+                // ban list, and able to satisfy the containment assertion below with a
+                // `build_and_install` that never left the main thread. That is the one direction
+                // this function claims not to fail in, so it panics rather than guessing: the
+                // closure's brace cannot be further away than the end of the spawn statement, and
+                // between `spawn(` and it there is only `move ||`, never a `;`.
+                let stmt_end = after.find(';').unwrap_or(after.len());
+                let open = after[..stmt_end].find('{').unwrap_or_else(|| {
+                    panic!(
+                        "`std::thread::spawn` with no braced closure body — this guard cannot tell \
+                         which code runs off-main, so it refuses to judge rather than exempting the \
+                         wrong block. Give the closure a braced body, or teach this splitter the \
+                         new form."
+                    )
+                });
                 let bytes = after.as_bytes();
                 let mut depth = 0usize;
                 let mut close = None;
