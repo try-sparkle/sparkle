@@ -142,6 +142,16 @@ export function useAgentTranscript(
   const inFlightRef = useRef(false);
   // Consecutive failed tail reads, and how many ticks we have skipped since the last attempt. Refs
   // rather than state: backoff must not re-render the pane, and only the timer reads them.
+  //
+  // THEY BELONG TO ONE AGENT, BUT THE HOOK INSTANCE OUTLIVES THE AGENT. `ConciergeHost` calls this
+  // hook ONCE for the window — mounting a different agent changes the ARGUMENT, it does not remount
+  // the hook — so these refs carry over unless something clears them. The interval effect rebuilds
+  // on an agent change; the counters do not. That was near-unreachable while only a THROWN tail read
+  // incremented `failuresRef`, but the heal branch increments it on the ordinary expected path (a
+  // bound agent with no live edge yet), so a quiet agent now drives it to the backoff ceiling within
+  // ~30s — and the NEXT agent mounted would inherit that ceiling and start its life reading once a
+  // minute. Cleared where the generation moves, which is the one place that already means "this is a
+  // different conversation now".
   const failuresRef = useRef(0);
   const skippedRef = useRef(0);
 
@@ -291,6 +301,10 @@ export function useAgentTranscript(
       return;
     }
     const gen = ++genRef.current;
+    // A NEW GENERATION IS A NEW CONVERSATION — retire the previous agent's backoff with it. See the
+    // block at `failuresRef`: this hook instance is shared across every agent the founder mounts.
+    failuresRef.current = 0;
+    skippedRef.current = 0;
     let cancelled = false;
 
     // NOT `entries: []`. Clearing here would blank a re-mount of an agent we already have pages for,
@@ -378,6 +392,12 @@ export function useAgentTranscript(
     // Reading from byte 0 is still what we refuse to do (see `TranscriptPage.tailByte`) — so this is
     // a PAGE, not a tail. It establishes the live edge exactly the way the mount-time effect does,
     // and the very next tick becomes an ordinary cheap tail.
+    // DO NOT STACK A HEAL PAGE UNDER THE MOUNT-TIME FIRST PAGE. `inFlightRef` is this callback's own
+    // guard and the first-page effect does not set it; it sets `loading`. A page is the EXPENSIVE
+    // read — it scans and mtime-sorts the whole session directory, and one measured worktree holds
+    // 1,172 files — so a first page slower than one tick would otherwise get a second, fully
+    // redundant page issued underneath it, exactly when reads are already slow.
+    if (thread?.loading) return;
     if (!thread || thread.tailFile === null) {
       inFlightRef.current = true;
       try {
@@ -396,6 +416,9 @@ export function useAgentTranscript(
         // the shared backoff instead: the tick below then spaces these attempts out to ~a minute,
         // and any page that does find the file resets the counter and restores the 1 Hz tail.
         if (page.tailFile === null) {
+          // Still no live edge. This is the ORDINARY case for a quiet agent, not an error — but it
+          // shares the backoff counter with genuinely failing reads, which is what keeps a mounted
+          // idle agent from re-paging once a second forever.
           failuresRef.current += 1;
           return;
         }
