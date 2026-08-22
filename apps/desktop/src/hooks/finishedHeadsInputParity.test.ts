@@ -131,10 +131,26 @@ function isDeclaredHere(id: ts.Identifier): boolean {
   ) {
     return false;
   }
+  // ── RESOLVE OUT THROUGH BINDING PATTERNS BEFORE ASKING WHO OWNS THIS ──────────────────────────
+  // The carve-out below was written against a DIRECT parameter (`(calmStatus: T) => void`) and was
+  // half a fix: a DESTRUCTURED parameter of a function type — `type P = { onCalm: ({ calmStatus }:
+  // A) => void }` — parses as BindingElement → ObjectBindingPattern → Parameter → FunctionTypeNode,
+  // so the direct parent is a BindingElement and it fell straight through to "binds". That is the
+  // most common shape in this repo (destructured props) written in type space, and it would have
+  // reddened this guard with "bound more than once" — the message that means the regression this
+  // file exists to catch. So walk out of the pattern first, then ask.
+  let owner: ts.Node = p;
+  while (
+    ts.isBindingElement(owner) ||
+    ts.isObjectBindingPattern(owner) ||
+    ts.isArrayBindingPattern(owner)
+  ) {
+    owner = owner.parent;
+  }
   // A parameter of a function TYPE binds nothing at runtime — only one with a body does.
-  if (ts.isParameter(p)) {
-    const owner = p.parent as ts.Node & { body?: ts.Node };
-    return owner.body !== undefined;
+  if (ts.isParameter(owner)) {
+    const fn = owner.parent as ts.Node & { body?: ts.Node };
+    return fn.body !== undefined;
   }
   return true;
 }
@@ -234,3 +250,62 @@ function readdirSyncSafe(dir: string) {
     return [];
   }
 }
+
+// ══ THE CLASSIFIER'S OWN SUITE, WHICH IS THE THING THAT WAS MISSING ═══════════════════════════
+// `isDeclaredHere` is the load-bearing part of this file and it shipped, five times, with NOTHING
+// able to red on it. Every mutation check across those rounds was run against ad-hoc sources that
+// were never committed — so the evidence lived in commit messages, where no future change can
+// re-run it, and deleting the entire exclusion list left the suite green. Given that the classifier
+// is exactly where all five defects were, that is the property most worth pinning.
+//
+// Each case below is an inline source string with a stated expected count, so every branch has a
+// test that fails when that branch is mutated.
+describe("bindingsOf — what counts as declaring the name", () => {
+  const count = (src: string) => bindingsOf(src).length;
+
+  it.each([
+    ["a plain declaration", "const calmStatus = 1;"],
+    ["let, which is still a binding", "let calmStatus;"],
+    ["a shorthand destructure", "const { calmStatus } = f();"],
+    ["a renamed destructure", "const { status: calmStatus } = f();"],
+    ["a NESTED destructure", "const { a: { calmStatus } } = f();"],
+    ["an array destructure", "const [calmStatus] = xs;"],
+    ["a for-of destructure", "for (const { calmStatus } of xs) { use(calmStatus); }"],
+    // The module-scope shadow the inclusion-list version could not see at all.
+    ["an IMPORT", 'import { calmStatus } from "./m";'],
+    ["a renamed import", 'import { m as calmStatus } from "./m";'],
+    ["a function declaration", "function calmStatus() { return 1; }"],
+    ["a class declaration", "class calmStatus {}"],
+    // The shape four regex versions AND the first AST version missed.
+    ["a DESTRUCTURED parameter of a real function", "function F({ calmStatus }: P) { return calmStatus; }"],
+    ["a direct parameter of a real function", "const f = (calmStatus: T) => calmStatus;"],
+  ])("counts %s", (_label, src) => {
+    expect(count(src)).toBe(1);
+  });
+
+  it.each([
+    // Each of these carries a `.name` that is this identifier while naming something that is NOT a
+    // new binding — the exclusion list. Delete an entry and its case here reds.
+    ["a member access", "use(deps.calmStatus);"],
+    ["a qualified name in type space", "let x: Foo.calmStatus;"],
+    ["an object-literal key", "const o = { calmStatus: 1 };"],
+    ["a shorthand property USE", "const o = { calmStatus };"],
+    ["a JSX attribute", "const el = <X calmStatus={y} />;"],
+    ["a property signature", "interface I { calmStatus: T }"],
+    ["a method signature", "interface I { calmStatus(): void }"],
+    // Binds nothing at runtime — the false alarm the body check exists to prevent…
+    ["a parameter of a function TYPE", "type F = (calmStatus: T) => void;"],
+    // …and the same thing DESTRUCTURED, which the first version of that check let through.
+    ["a DESTRUCTURED parameter of a function type", "type F = ({ calmStatus }: A) => void;"],
+    ["a plain use as an argument", "f(agentsById, calmStatus, nudgeFlags);"],
+    ["a comment", "// calmStatus: the pre-escalation map\nconst x = 1;"],
+  ])("does NOT count %s", (_label, src) => {
+    expect(count(src)).toBe(0);
+  });
+
+  it("counts each binding separately when a file has two", () => {
+    // The actual regression: one legitimate binding plus a shadow. Neither case above would catch a
+    // classifier that returned at most one.
+    expect(count('import { calmStatus } from "./m";\nfunction F({ calmStatus }: P) { return calmStatus; }')).toBe(2);
+  });
+});
