@@ -197,9 +197,12 @@ fn bundle_is_still_this_build() -> bool {
 /// WHAT EACH MECHANISM ACTUALLY BUYS — they cover DIFFERENT halves, and an earlier version of this
 /// paragraph overstated it badly enough to be dangerous (roborev 67454), so it is spelled out:
 ///
-/// * The PER-ENTRY retry (below) protects the entries that ALREADY STAGED. They are never re-copied,
-///   so whatever they took while the bundle was provably ours is what they keep. It does nothing for
-///   the entry still in `Err` — that is precisely the one a retry re-copies.
+/// * The PER-ENTRY retry (below) protects the entries staged by the FIRST load — the one
+///   `init_staged_resources` runs from `setup()`, before the updater poller can fire and with no
+///   gate consulted. Those are never re-copied, so what they took while the bundle was provably ours
+///   is what they keep. It does nothing for the entry still in `Err` — that is precisely the one a
+///   retry re-copies. Note the scope carefully: an entry can ALSO reach `Ok` on a retry, and that
+///   one was not staged under the same guarantee (see below).
 /// * `retry_allowed` is the ONLY guard on that still-`Err` entry. `stage_one` reads
 ///   `<resource_root>/<rel>` out of the bundle NOW, so if the swap has landed, a retry publishes
 ///   version N+1's bytes into `bin/<N's segment>/<rel>` — and a never-staged entry has no prior copy
@@ -213,6 +216,12 @@ fn bundle_is_still_this_build() -> bool {
 /// the gate does hold. Do NOT read this as a reason to drop the gate — on macOS it is the live
 /// protection. The platform-independent fix (snapshot the bundle mtime once in `setup()`, before the
 /// poller can fire, and require BOTH) is bead sparkle-j2j509.
+///
+/// AND THAT HOLE IS SESSION-LONG, NOT ONE CALL WIDE (roborev 67456). The moment a fail-open retry
+/// returns `Ok`, that entry drops out of `pending` and is sealed — so N+1's bytes become the
+/// PERMANENT answer for that resource under a running N, for the rest of the process. So the sealed
+/// set is NOT skew-free by construction: it is skew-free for what the first load staged, and only as
+/// trustworthy as `retry_allowed` was for anything added after.
 ///
 /// THE RETRY IS PER ENTRY, and that is a correctness requirement rather than an optimisation
 /// (roborev 67444). [`stage_all`] copies the resources SEQUENTIALLY, so a window opening or closing
