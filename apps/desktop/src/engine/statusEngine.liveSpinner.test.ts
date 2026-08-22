@@ -217,6 +217,21 @@ describe("a visibly-working agent never settles to GRAY", () => {
     expect(statuses.some(isGray)).toBe(false);
   });
 
+  it("SPINNER CHUNKS OVER A STATIC SCREEN still settle — arrival is not movement", () => {
+    // The latch reintroduced through the budget reset (roborev 67297). A rate-limit retry loop
+    // re-emits IDENTICAL spinner frames, and a hung TUI or a glyph-led false match on the stream
+    // does the same. If ingest cleared the movement baseline, each arrival would re-null it, every
+    // settle would re-hold, and the row would latch `working` with no path back — while the screen
+    // never changed. Chunks keep coming here; only the SCREEN is static.
+    const { engine, last, statuses } = engineOn(() => KNEADING_SCREEN);
+    for (let i = 0; i < 40; i++) {
+      engine.ingest(SPINNER_CHUNK);
+      vi.advanceTimersByTime(2000);
+    }
+    expect(last()).toBe("idle");
+    expect(statuses.some(isGray)).toBe(true);
+  });
+
   it("THE PAIRED CASE — it DOES settle to gray once the spinner is really gone", () => {
     // Without this, "never gray" would also pass for an engine that had stopped settling at all,
     // which is the opposite bug: a permanently green fleet.

@@ -287,7 +287,9 @@ export function isSpinnerFrame(frame: string): boolean {
  *
  *  Widening costs little here because PRESENCE ALONE NO LONGER HOLDS ANYTHING — the hold also
  *  requires the tail to have CHANGED between settles, so a stale spinner-shaped row further up the
- *  transcript cannot latch the row green; it can at most delay one settle by `SPINNER_GRACE_MS`. */
+ *  transcript cannot latch the row green; it can at most delay one settle by `SPINNER_GRACE_MS`.
+ *  That guarantee depends on the ingest path NOT clearing `heldSpinnerTail` — see the comment on
+ *  the reset there, which is what keeps this rationale true. */
 const LIVE_TAIL_ROWS = 12;
 
 /**
@@ -1441,8 +1443,18 @@ export class StatusEngine {
       //
       // An ingested spinner frame is the strongest evidence of progress this engine has, which is
       // why the reset belongs here rather than only on the gray fall-through.
+      // ⚠️ ONLY THE COUNTER. Nulling `heldSpinnerTail` here too would make
+      // `moved = tail !== this.heldSpinnerTail` UNCONDITIONALLY TRUE on the next settle, which
+      // destroys the movement guarantee the whole hold rests on: while spinner-shaped frames keep
+      // arriving over a STATIC screen — the rate-limit retry loop below re-emits identical frames,
+      // and a hung TUI or a `·`/`*`/`+`-led false match on the stream does the same — every arrival
+      // would re-null the baseline, every settle would re-hold, and the row would latch `working`
+      // with no path back. That is the permanent-green latch this hold was written to remove,
+      // reintroduced through its own reset (roborev 67297).
+      //
+      // The budget fix does not need it: a genuinely advancing spinner produces a different tail by
+      // itself. The baseline is cleared where it belongs, on the settle fall-through.
       this.spinnerHolds = 0;
-      this.heldSpinnerTail = null;
     }
     if (hasSpinner && !this.sawSpinner) {
       this.sawSpinner = true;
