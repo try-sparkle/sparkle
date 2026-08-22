@@ -188,8 +188,10 @@ import {
   getBoard,
   readyItems,
   blockedItems,
+  listComments,
   createItem,
   updateItem,
+  commentItem,
   deleteItem,
   type BoardOp,
   type BoardResult,
@@ -555,6 +557,85 @@ function describeIssue(issue: z.ZodIssue): string {
   return `\`${field}\`: ${issue.message}`;
 }
 
+/**
+ * The argument names a model reaches for when what it actually wants is to APPEND PROSE to a bead.
+ *
+ * Deliberately WIDER than the field it is named after. `body` is the one the measured incident used,
+ * but the same intent arrives spelled `description`, `notes`, `text`, `comment` — and a model that
+ * guessed the wrong synonym is in exactly the same place as one that guessed `body`: it is holding a
+ * paragraph it cannot find a home for. Naming only the exact miss would teach only the exact miss.
+ *
+ * `text` and `comment` are here on purpose even though `comment_item` accepts `text`: sending them
+ * to `update_item` is the RIGHT INSTINCT AT THE WRONG OP, which is the cheapest possible correction
+ * to make — the hint just has to name the op.
+ */
+const PROSE_APPEND_ARGS = [
+  "body",
+  "description",
+  "notes",
+  "note",
+  "text",
+  "content",
+  "comment",
+  "details",
+  "summary",
+  "append",
+  "message",
+] as const;
+
+/**
+ * TEACH AT THE REFUSAL — the durable half of bead `sparkle-ddhk5x`, and the reason it is worth a
+ * named function rather than a longer error string.
+ *
+ * ══ THE INCIDENT ═══════════════════════════════════════════════════════════════════════════════
+ * The concierge tried to append a founder-level design decision to an epic by calling
+ * `board.update_item` with a `body` argument. It was refused, verbatim:
+ *
+ *   "board.update_item was called with bad arguments — unrecognised argument(s) `body` — this op
+ *    does not accept them; `(the arguments object)`: nothing to update — pass `status`, `priority`,
+ *    `addLabels`, or `removeLabels`."
+ *
+ * Every word of that is TRUE and it is still the wrong lesson. It says what is not allowed, lists
+ * the four fields that are, and never mentions that comments exist — so the only conclusion
+ * available from it is the one the concierge drew: that a bead cannot be added to at all. It stored
+ * the decision in its own private memory instead, and the founder had to correct it.
+ *
+ * ══ WHY A HINT AND NOT A DOC ═══════════════════════════════════════════════════════════════════
+ * A doc has to have been read; a memory has to have been retained. This arrives at the one moment
+ * the model has the problem in hand and its full attention on this string. It costs nothing when
+ * the call was fine, and it is the same principle the refusal-with-a-remedy rule in AGENTS.md
+ * states: the alternative a refusal names must be one that actually works under the conditions that
+ * triggered the refusal.
+ *
+ * ══ NARROW ON PURPOSE ══════════════════════════════════════════════════════════════════════════
+ * Board `update_item` only. `create_item` takes a real `body` (a NEW bead has no history to
+ * preserve), so hinting there would teach a rule that does not apply. Returning null for every
+ * other refusal is what keeps the ordinary bad-args message — a misspelled `id`, a missing
+ * `projectId` — as short as it has always been.
+ *
+ * EXPORTED FOR ITS OWN GUARD TEST. `registry.test.ts` asserts this text names the alternative, so
+ * that rewording the refusal without carrying the alternative along fails the suite instead of
+ * silently restoring the original defect.
+ */
+export function appendOnlyBodyHint(domain: string, op: string, raw: unknown): string | null {
+  if (domain !== "board" || op !== "update_item") return null;
+  // Defensive on both counts: `raw` is off the wire, and an array has string keys ("0", "1") that
+  // `hasOwnProperty` would happily answer for.
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const offered = PROSE_APPEND_ARGS.filter((k) => Object.prototype.hasOwnProperty.call(raw, k));
+  if (offered.length === 0) return null;
+  const named = offered.map((k) => `\`${k}\``).join(", ");
+  return (
+    `A bead's body is APPEND-ONLY BY DESIGN — it is the original ask, preserved verbatim, and ` +
+    `nothing rewrites it. That is not a gap in this op: one shared store and many agents writing ` +
+    `at once means a mutable body is last-write-wins, which silently destroys somebody else's ` +
+    `edit. New information goes on as a COMMENT, which keeps the ask, the accumulated thinking ` +
+    `and the attribution, in order. So put ${named} on the bead as a comment instead: call ` +
+    `\`board.comment_item\` with \`{ projectId, id, text }\`, and read the thread back with ` +
+    `\`board.list_comments\`. From a shell the same thing is \`bd comment <id> "…"\`.`
+  );
+}
+
 type Parsed<T> = { ok: true; value: T } | { ok: false; reply: ConciergeToolError };
 
 function parseArgs<T>(ctx: OpContext, schema: z.ZodType<T>, raw: unknown): Parsed<T> {
@@ -563,12 +644,17 @@ function parseArgs<T>(ctx: OpContext, schema: z.ZodType<T>, raw: unknown): Parse
   // stops being one.
   const r = schema.safeParse(raw === undefined ? {} : raw);
   if (r.success) return { ok: true, value: r.data };
+  // THE HINT GOES HERE, in `parseArgs`, and that placement is what makes it unmissable: both paths
+  // that can refuse a call for bad arguments come through this function — dispatch's gate 2 and
+  // `route`'s own belt-and-braces re-parse — so neither can produce the untaught refusal.
+  const hint = appendOnlyBodyHint(ctx.domain, ctx.op, raw);
   return {
     ok: false,
     reply: err(
       ctx,
       REGISTRY_CODES.badArgs,
-      `${ctx.domain}.${ctx.op} was called with bad arguments — ${describeIssues(r.error.issues)}.`,
+      `${ctx.domain}.${ctx.op} was called with bad arguments — ${describeIssues(r.error.issues)}.` +
+        (hint ? ` ${hint}` : ""),
     ),
   };
 }
@@ -1887,6 +1973,22 @@ const updateItemArgs = boardWriteItem
     "nothing to update — pass `status`, `priority`, `addLabels`, or `removeLabels`",
   );
 
+/**
+ * `comment_item`'s arguments. A WRITE, so `projectId` is required (`boardWriteItem`).
+ *
+ * `text` has a MINIMUM and deliberately NO MAXIMUM. The floor exists because an empty comment is
+ * refused by bd anyway and, worse, `bd comment` with no text falls back to `$EDITOR` — the hang
+ * AGENTS.md warns about — so catching it here turns a timeout into a named argument error. The
+ * absence of a ceiling is the considered half: `research.dispatch` caps its `question` at 2000
+ * because a question that long is a payload pretending to be a question, but here the prose IS the
+ * payload. This op exists to preserve accumulated thinking, and a founder's design decision that
+ * runs long must not be silently clipped — the whole point of appending rather than editing is that
+ * nothing is lost.
+ */
+const commentItemArgs = boardWriteItem.extend({
+  text: z.string().min(1, "a comment needs some text — say what you're adding to the bead"),
+});
+
 /** Resolve the board's project: the named one, or the selected one when the name is omitted. */
 async function withBoardProject(
   ctx: OpContext,
@@ -1921,6 +2023,13 @@ const BOARD_ROUTES: Record<BoardOp, Handler> = {
   blocked_items: route(boardScope, (a, ctx) =>
     withBoardProject(ctx, a.projectId, async (p) => fromBoard(ctx, await blockedItems(p.rootPath))),
   ),
+  // A READ, so it defaults its project like every other read above — asking "what does this bead's
+  // thread say" must not require an id the human doesn't know. `boardItem`, not `boardWriteItem`.
+  list_comments: route(boardItem, (a, ctx) =>
+    withBoardProject(ctx, a.projectId, async (p) =>
+      fromBoard(ctx, await listComments(p.rootPath, a.id)),
+    ),
+  ),
   // The writes resolve through `withProject` — no store fallback. See boardWriteScope.
   create_item: route(createItemArgs, (a, ctx) =>
     withProject(ctx, a.projectId, async (p) =>
@@ -1938,6 +2047,13 @@ const BOARD_ROUTES: Record<BoardOp, Handler> = {
           priority: a.priority,
         }),
       ),
+    ),
+  ),
+  // THE OP THE REFUSAL ABOVE NAMES. Resolves through `withProject` with no store fallback, like
+  // every other board write — see `boardWriteScope` for why a write may not default its project.
+  comment_item: route(commentItemArgs, (a, ctx) =>
+    withProject(ctx, a.projectId, async (p) =>
+      fromBoard(ctx, await commentItem(p.rootPath, a.id, a.text)),
     ),
   ),
   delete_item: route(boardWriteItem, (a, ctx) =>

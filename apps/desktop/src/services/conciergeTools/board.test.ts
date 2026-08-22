@@ -34,15 +34,33 @@ vi.mock("../beads", async (importOriginal) => {
   };
 });
 
+// The COMMENT half lives on the other seam (`services/beadsCommands`), so it is mocked separately.
+// `isBeadsError` is kept REAL — recognising the structured rejection is precisely what this module
+// must get right, and stubbing the recogniser would leave the thing under test untested.
+const beadsComment = vi.fn();
+const beadsDetail = vi.fn();
+
+vi.mock("../beadsCommands", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../beadsCommands")>();
+  return {
+    ...actual,
+    beadsComment: (...a: unknown[]) => beadsComment(...a),
+    beadsDetail: (...a: unknown[]) => beadsDetail(...a),
+  };
+});
+
 const {
   BOARD_OPS,
   BOARD_RISK,
+  COMMENT_PAGE_LIMIT,
   listItems,
   getItem,
   readyItems,
   blockedItems,
+  listComments,
   createItem,
   updateItem,
+  commentItem,
   deleteItem,
 } = await import("./board");
 
@@ -72,6 +90,8 @@ beforeEach(() => {
   labelBead.mockResolvedValue(undefined);
   setBeadPriority.mockResolvedValue(undefined);
   deleteBead.mockResolvedValue(undefined);
+  beadsComment.mockResolvedValue(undefined);
+  beadsDetail.mockResolvedValue({ comments: [] });
 });
 
 describe("classification", () => {
@@ -84,6 +104,14 @@ describe("classification", () => {
     expect(BOARD_RISK.delete_item).toBe("irreversible");
     expect(BOARD_RISK.update_item).toBe("routine");
     expect(BOARD_RISK.list_items).toBe("read-only");
+  });
+
+  // An append can destroy nothing — not the body, not an earlier comment — so it sits with the
+  // ordinary bookkeeping rather than behind an approval. Gating it would put the founder back in
+  // the loop for every note an agent adds, which is the round-trip this domain exists to remove.
+  it("rates comment_item routine and list_comments read-only", () => {
+    expect(BOARD_RISK.comment_item).toBe("routine");
+    expect(BOARD_RISK.list_comments).toBe("read-only");
   });
 });
 
@@ -264,5 +292,86 @@ describe("writes", () => {
     const r = await deleteItem(ROOT, "gone");
     expect(deleteBead).toHaveBeenCalledWith(ROOT, "gone");
     expect(r.ok && r.data).toEqual({ id: "gone" });
+  });
+});
+
+// ══ COMMENTS — the append-only path (bead `sparkle-ddhk5x`) ═══════════════════════════════════
+//
+// A bead's body is the original ask and is never rewritten; everything learned afterwards goes on
+// as a comment. These two ops are what make that reachable without shelling out to `bd`.
+describe("comments", () => {
+  function comment(over: Partial<import("../beadsCommands").BeadComment> = {}) {
+    return { id: "c", author: "DROdio", text: "said a thing", createdAt: null, ...over };
+  }
+
+  it("comment_item appends through the verified seam and acks with the length, not the text", async () => {
+    const r = await commentItem(ROOT, "sparkle-x", "the decision, recorded");
+    expect(beadsComment).toHaveBeenCalledWith(ROOT, "sparkle-x", "the decision, recorded");
+    expect(r.ok && r.data).toEqual({ id: "sparkle-x", chars: "the decision, recorded".length });
+  });
+
+  // THE REASON `attempt` had to learn a second rejection shape. `beadsCommands` rejects with a
+  // structured object, not an Error — so the pre-existing `String(e)` arm would have handed the
+  // concierge the literal string "[object Object]" as its explanation. This asserts the real
+  // message survives, which is the only version of this test that could have caught it.
+  it("carries a structured BeadsError's own message through, never [object Object]", async () => {
+    beadsComment.mockRejectedValue({ kind: "storeBusy", message: "bd is busy", exitCode: 1 });
+    const r = await commentItem(ROOT, "x", "hi");
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.reason).toBe("beads-failed");
+    expect(r.message).toBe("bd is busy");
+    expect(r.message).not.toContain("object Object");
+  });
+
+  // The two kinds that are a NORMAL state rather than a failure land on the same refusal the other
+  // seam's substring match produces — a project with no `bd init` must read identically whichever
+  // op noticed.
+  it.each(["noWorkspace", "binaryNotFound"] as const)(
+    "reports a %s rejection as beads-unavailable, not as a bug",
+    async (kind) => {
+      beadsComment.mockRejectedValue({ kind, message: "no beads database found", exitCode: 2 });
+      const r = await commentItem(ROOT, "x", "hi");
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.reason).toBe("beads-unavailable");
+    },
+  );
+
+  it("list_comments returns the thread oldest-first with nothing omitted", async () => {
+    beadsDetail.mockResolvedValue({
+      comments: [comment({ id: "1", text: "first" }), comment({ id: "2", text: "second" })],
+    });
+    const r = await listComments(ROOT, "sparkle-x");
+    expect(beadsDetail).toHaveBeenCalledWith(ROOT, "sparkle-x");
+    expect(r.ok && r.data.comments.map((c) => c.text)).toEqual(["first", "second"]);
+    expect(r.ok && [r.data.omitted, r.data.total]).toEqual([0, 2]);
+  });
+
+  // WHICH END GETS CUT is the whole judgement in this op, so it is asserted rather than described:
+  // the newest comments carry the current decision, the oldest is usually the filing note the body
+  // already says. A page that dropped the other end would still be "bounded" and would be useless.
+  it("bounds a long thread by dropping the OLDEST, and says how many it dropped", async () => {
+    const all = Array.from({ length: COMMENT_PAGE_LIMIT + 3 }, (_, i) =>
+      comment({ id: String(i), text: `c${i}` }),
+    );
+    beadsDetail.mockResolvedValue({ comments: all });
+
+    const r = await listComments(ROOT, "sparkle-x");
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.data.comments).toHaveLength(COMMENT_PAGE_LIMIT);
+    expect(r.data.omitted).toBe(3);
+    expect(r.data.total).toBe(COMMENT_PAGE_LIMIT + 3);
+    // The newest survived and the oldest went — and order within the page is still oldest-first.
+    expect(r.data.comments.at(-1)?.text).toBe(`c${COMMENT_PAGE_LIMIT + 2}`);
+    expect(r.data.comments[0]?.text).toBe("c3");
+  });
+
+  // bd always sends the key, but a shape we did not agree to read must degrade to "no comments"
+  // rather than throwing an internal-error at the concierge.
+  it("treats a detail with no comments key as an empty thread", async () => {
+    beadsDetail.mockResolvedValue({});
+    const r = await listComments(ROOT, "x");
+    expect(r.ok && r.data).toEqual({ id: "x", comments: [], omitted: 0, total: 0 });
   });
 });

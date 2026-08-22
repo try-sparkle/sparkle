@@ -36,6 +36,24 @@ import {
   isBeadsUnavailable,
   type Bead,
 } from "../beads";
+// The COMMENT half comes from `services/beadsCommands` rather than `services/beads`, and the split
+// is not arbitrary. `beads.ts` is the board's rendering path: it has a comment WRITE
+// (`commentBead`) and no comment READ at all, and its write goes through `notes.rs::bead_comment`,
+// which reports success without reading the row back. `beadsCommands.ts` is the programmatic
+// seam — bounded output, typed errors — and it already carries BOTH halves: `beadsComment` writes
+// (via `beads_cmd.rs::comment_bead`) and `beadsDetail` returns the thread. Using it means this
+// domain adds no new IPC command and no new Rust.
+//
+// The cost of crossing seams is that its rejection is a STRUCTURED `BeadsError` object, not an
+// `Error` — so `attempt`'s `String(e)` would have produced the literal "[object Object]" as a
+// refusal message. `isBeadsError` below is what keeps that from happening.
+import {
+  beadsComment,
+  beadsDetail,
+  isBeadsError,
+  type BeadComment,
+  type BeadsError,
+} from "../beadsCommands";
 
 // ---------------------------------------------------------------------------------------------
 // The operation surface
@@ -47,8 +65,10 @@ export const BOARD_OPS = [
   "get_board",
   "ready_items",
   "blocked_items",
+  "list_comments",
   "create_item",
   "update_item",
+  "comment_item",
   "delete_item",
 ] as const;
 
@@ -72,8 +92,15 @@ export const BOARD_RISK: Record<BoardOp, BoardRisk> = {
   get_board: "read-only",
   ready_items: "read-only",
   blocked_items: "read-only",
+  list_comments: "read-only",
   create_item: "routine",
   update_item: "routine",
+  // APPEND-ONLY, and that is what makes it `routine` rather than `disruptive`. A comment cannot
+  // overwrite anything — not the body, not an earlier comment — so the worst a wrong one does is
+  // add a line somebody has to read. Compare `update_item`, which is also routine and CAN change a
+  // status. The one thing it shares with `create_item` is that it has no idempotency key: a retry
+  // after a lost ack appends a SECOND copy, which is why mcp-control bounds it like a create.
+  comment_item: "routine",
   delete_item: "irreversible",
 };
 
@@ -117,16 +144,38 @@ async function attempt<T>(op: BoardOp, run: () => Promise<T>): Promise<BoardResu
   try {
     return ok(op, await run());
   } catch (e) {
-    if (isBeadsUnavailable(e)) {
-      return refuse(
-        op,
-        "beads-unavailable",
-        "This project doesn't have a beads database (or `bd` isn't installed), so it has no work " +
-          "graph for me to read. Run `bd init` in the project to start one.",
-      );
-    }
+    // The TYPED rejection first — a `BeadsError` is a plain object, so every test below it
+    // (`instanceof Error`, `String(e)`) reads it as "[object Object]" and loses the whole message.
+    if (isBeadsError(e)) return fromBeadsError(op, e);
+    if (isBeadsUnavailable(e)) return unavailable(op);
     return refuse(op, "beads-failed", e instanceof Error ? e.message : String(e));
   }
+}
+
+/** The one wording for "this project has no work graph", shared by both rejection shapes so the two
+ *  seams cannot drift into two different explanations of the same normal state. */
+function unavailable(op: BoardOp): BoardRefusal {
+  return refuse(
+    op,
+    "beads-unavailable",
+    "This project doesn't have a beads database (or `bd` isn't installed), so it has no work " +
+      "graph for me to read. Run `bd init` in the project to start one.",
+  );
+}
+
+/**
+ * Map `beadsCommands`' closed error union onto this domain's refusal vocabulary.
+ *
+ * Only two kinds are the not-a-bug case `attempt` already had a word for: `noWorkspace` (never ran
+ * `bd init`) and `binaryNotFound` (bd isn't installed) — the same two facts `isBeadsUnavailable`
+ * substring-matches on the other seam. Everything else is a real failure and keeps its own message,
+ * which is strictly better than the substring path could manage: `storeBusy` and `timeout` are the
+ * contended-Dolt-lock cases this repo hits constantly, and telling the concierge "bd was busy" is
+ * what lets it retry rather than report the project as beadless.
+ */
+function fromBeadsError(op: BoardOp, e: BeadsError): BoardRefusal {
+  if (e.kind === "noWorkspace" || e.kind === "binaryNotFound") return unavailable(op);
+  return refuse(op, "beads-failed", e.message);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -220,6 +269,65 @@ export async function readyItems(projectPath: string): Promise<BoardResult<Board
 /** Open work a dependency is holding. */
 export async function blockedItems(projectPath: string): Promise<BoardResult<BoardItemView[]>> {
   return laneOf("blocked_items", projectPath, "blocked");
+}
+
+/**
+ * How many comments one read hands back before it starts reporting a remainder.
+ *
+ * A tool result is never evicted from an agent's context, so an unbounded read costs for the whole
+ * session — the argument beadsCommands.ts's header makes about `bd list`, applied to a thread. It
+ * bites here specifically: the threads worth reading are the ones on long-lived epics, and this
+ * repo's carry hundreds of lines of founder prose each. So the read is bounded and SAYS SO, rather
+ * than truncating silently.
+ */
+export const COMMENT_PAGE_LIMIT = 50;
+
+/** One comment as the concierge sees it — bd's row, unchanged. Re-exported so a caller reading this
+ *  domain's result type doesn't have to reach past it into `beadsCommands`. */
+export type BoardCommentView = BeadComment;
+
+export interface BoardCommentThread {
+  id: string;
+  /** Oldest-first, as bd stores them — the order the thinking actually accumulated in. */
+  comments: BoardCommentView[];
+  /** How many EARLIER comments were left out. `0` when the whole thread is here. */
+  omitted: number;
+  /** The thread's true length, so a caller can tell a bounded page from a complete one without
+   *  arithmetic. */
+  total: number;
+}
+
+/**
+ * The bead's comment thread — the READ half of the append-only rule.
+ *
+ * A WRITE NOBODY CAN READ IS HALF A FEATURE, which is why this exists alongside `comment_item`
+ * rather than after it: an agent that can append but not re-read has to trust that its predecessors
+ * wrote nothing relevant, and the accumulated thinking a comment thread exists to preserve is
+ * exactly what it cannot see.
+ *
+ * WHICH END GETS CUT, and why it is the OLD one. `beadsDetail` returns the thread oldest-first, and
+ * a bounded page has to drop something. It drops from the FRONT: the most recent comments are the
+ * ones carrying the current decision (this bead's own thread is the example — the founder's ruling
+ * is the newest entry), while the oldest is usually the filing note the body already says. Order
+ * WITHIN the page is left oldest-first regardless, because a thread read backwards reads as a
+ * different argument.
+ *
+ * `getItem` is deliberately NOT changed to carry comments. It is the board's "what is this epic
+ * made of" call and is issued for every card the concierge looks at; folding a thread into it would
+ * put hundreds of lines of prose into a context that asked for a title and a status. The count is
+ * already on every bead (`commentCount`), so "is there a thread here?" stays a free question and
+ * this call is what answers "what does it say?".
+ */
+export async function listComments(
+  projectPath: string,
+  id: string,
+): Promise<BoardResult<BoardCommentThread>> {
+  return attempt("list_comments", async () => {
+    const detail = await beadsDetail(projectPath, id);
+    const all = detail.comments ?? [];
+    const comments = all.slice(Math.max(0, all.length - COMMENT_PAGE_LIMIT));
+    return { id, comments, omitted: all.length - comments.length, total: all.length };
+  });
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -320,6 +428,45 @@ export async function updateItem(
     );
   }
   return ok("update_item", { id, applied });
+}
+
+/**
+ * Append a comment to a bead — THE op for adding anything to an item that already exists.
+ *
+ * ══ WHY THIS IS AN OP AND NOT A SHELL COMMAND (bead `sparkle-ddhk5x`) ═══════════════════════════
+ *
+ * A bead's BODY is what the founder wrote when he asked for the thing, and it is immutable by
+ * design: `update_item` moves status, priority and labels and touches no prose. That is the right
+ * model — one shared Dolt store, 50+ agents writing at once, and a mutable body is last-write-wins,
+ * so one agent's edit silently destroys another's. Append-only comments let both survive, in order,
+ * with attribution.
+ *
+ * The design was never the problem. DISCOVERABILITY was. This domain shipped with no comment op at
+ * all, so the only way to add to a bead was to shell out to `bd comment` — and the concierge, told
+ * only that `body` was an unrecognised argument, concluded that a bead simply could not be added to
+ * and stored a founder-level design decision in its own private memory instead. The founder had to
+ * correct it. A capability reachable only by dropping to the CLI is one most agents never find.
+ *
+ * So the fix is two-sided and this is one side: the op exists here, and `registry.ts`'s bad-args
+ * refusal for a prose field NAMES it (see `appendOnlyBodyHint`). Neither half is sufficient — the
+ * op nobody knows about is unused, and the refusal pointing at a shell command is a worse answer
+ * than pointing at a tool.
+ *
+ * NO IDEMPOTENCY KEY, deliberately unfixed here. `bd` gives an append no dedupe handle, so a retry
+ * after a lost ack writes a SECOND copy — the same shape as `create_item`, not the claim/close/label
+ * shape of `update_item`. That is a TRANSPORT concern and it is answered where the transport is
+ * (mcp-control's `DUPLICATES_ON_RETRY_OPS`), not by inventing a key this store cannot enforce.
+ */
+export async function commentItem(
+  projectPath: string,
+  id: string,
+  text: string,
+): Promise<BoardResult<{ id: string; chars: number }>> {
+  const done = await attempt("comment_item", () => beadsComment(projectPath, id, text));
+  if (!done.ok) return done;
+  // `chars`, not the text back. The caller already has what it sent; echoing it doubles the cost of
+  // the call in a context window for no information. The count is the ack.
+  return ok("comment_item", { id, chars: text.length });
 }
 
 /** Permanent. Classified `irreversible` above, so the policy layer defaults it to `ask`. */

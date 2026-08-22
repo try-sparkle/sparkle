@@ -389,8 +389,12 @@ const BOARD_PHRASES: Record<BoardOp, OpPhrase> = {
   get_board: phrase("Reading your board", "Read your board"),
   ready_items: phrase("Checking what's ready to start", "Checked what's ready to start"),
   blocked_items: phrase("Checking what's blocked", "Checked what's blocked"),
+  list_comments: phrase("Reading a task's notes", "Read a task's notes"),
   create_item: phrase("Filing a task", "Filed a task"),
   update_item: phrase("Updating a task", "Updated a task"),
+  // "Adding a note", not "Commenting": the human's word for what lands on a bead is a note, and the
+  // line is read by someone watching the concierge work, not by someone reading the API.
+  comment_item: phrase("Adding a note to a task", "Added a note to a task"),
   delete_item: phrase("Deleting a task", "Deleted a task"),
 };
 

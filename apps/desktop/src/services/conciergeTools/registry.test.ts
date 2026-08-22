@@ -152,6 +152,7 @@ import {
   CONCIERGE_TOOL_OPS,
   REGISTRY_CODES,
   RELAY_GATED_OPS,
+  appendOnlyBodyHint,
   describeIssues,
   dispatchConciergeTool,
   permissiveToolPolicy,
@@ -1684,6 +1685,84 @@ describe("board — the registry's project resolution", () => {
       expect(refusal(r).code, op).toBe(REGISTRY_CODES.badArgs);
       expect(refusal(r).message, op).toMatch(/projectId/);
     }
+  });
+
+  // ══ THE GUARD TEST (bead `sparkle-ddhk5x`) ══════════════════════════════════════════════════
+  //
+  // WHAT IT IS GUARDING, stated plainly because the assertion looks like string-matching and is
+  // not. `update_item` refusing a `body` argument is CORRECT — bead bodies are append-only by
+  // design. The defect was that the refusal named no alternative, so the only conclusion available
+  // from it was "a bead cannot be added to", which is what the concierge concluded before the
+  // founder corrected it. The message is therefore not decoration: it is the ONLY place an agent
+  // that makes this mistake can learn the right path, and rewording it without carrying the
+  // alternative along silently restores the original defect.
+  //
+  // It asserts the SIDE EFFECT (the alternative reaches the caller through the real dispatch), not
+  // the precondition (that `body` is rejected — which was already true before this change and
+  // therefore proves nothing).
+  describe("update_item teaches the comment path at the refusal", () => {
+    it("names comment_item, list_comments and `bd comment` when handed a body", async () => {
+      const projectId = seedProject();
+      const r = await dispatchConciergeTool(
+        call({
+          domain: "board",
+          op: "update_item",
+          args: { projectId, id: "sparkle-x", body: "a design decision worth keeping" },
+        }),
+      );
+      const { message } = refusal(r);
+      expect(refusal(r).code).toBe(REGISTRY_CODES.badArgs);
+      // The RULE — an agent that reads only this must not conclude the bead is unamendable.
+      expect(message).toMatch(/append-only/i);
+      // The REMEDY, in both reachable forms: the first-class op, and the shell fallback.
+      expect(message).toContain("board.comment_item");
+      expect(message).toContain("bd comment");
+      // And the READ side, because a write nobody can read is half a feature.
+      expect(message).toContain("board.list_comments");
+    });
+
+    // The same intent arrives under several spellings; teaching only the one that was measured
+    // teaches only the agent that made the measured mistake.
+    it.each(["body", "description", "notes", "text", "comment"])(
+      "teaches the same lesson for a `%s` argument",
+      async (field) => {
+        const projectId = seedProject();
+        const r = await dispatchConciergeTool(
+          call({
+            domain: "board",
+            op: "update_item",
+            args: { projectId, id: "sparkle-x", [field]: "prose" },
+          }),
+        );
+        expect(refusal(r).message).toContain("board.comment_item");
+      },
+    );
+
+    // The hint must not become ambient noise on every refusal — an ordinary bad-args message stays
+    // as short as it has always been. This is the half that fails if someone "simplifies" the
+    // narrowing away by appending the sentence unconditionally.
+    it("stays silent for a refusal that has nothing to do with prose", async () => {
+      const projectId = seedProject();
+      const r = await dispatchConciergeTool(
+        call({ domain: "board", op: "update_item", args: { projectId, id: "a" } }),
+      );
+      expect(refusal(r).code).toBe(REGISTRY_CODES.badArgs);
+      expect(refusal(r).message).not.toContain("comment_item");
+    });
+
+    // `create_item` takes a REAL body — a new bead has no history to preserve — so hinting there
+    // would teach a rule that does not apply to the call being made.
+    it("does not fire on create_item, whose body argument is legitimate", () => {
+      expect(appendOnlyBodyHint("board", "create_item", { body: "x" })).toBeNull();
+    });
+
+    // Off the wire, so neither shape may throw. An array is the one that catches a naive
+    // `hasOwnProperty` sweep — its indices are string keys.
+    it("tolerates non-object arguments", () => {
+      for (const raw of [null, undefined, "body", 7, ["body"]]) {
+        expect(appendOnlyBodyHint("board", "update_item", raw)).toBeNull();
+      }
+    });
   });
 
   it("an update that changes nothing is refused rather than reported as a no-op success", async () => {

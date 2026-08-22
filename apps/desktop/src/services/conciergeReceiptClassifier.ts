@@ -275,8 +275,13 @@ const BOARD_RULES: Record<BoardOp, OpRule> = {
   get_board: null,
   ready_items: null,
   blocked_items: null,
+  list_comments: null,
   create_item: { kind: "filed" },
   update_item: null,
+  // NULL, like `update_item` and for the same reason: a receipt exists to hand the human something
+  // NEW to open. A comment mints no id — it lands on a bead the human already has — so a receipt
+  // here would be a card pointing at a row that was already on their board.
+  comment_item: null,
   delete_item: null,
 };
 
