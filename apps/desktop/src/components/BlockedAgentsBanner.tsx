@@ -22,9 +22,8 @@
 // switch/re-auth/see per-account usage — lives in Settings → Accounts, so "Manage fleet" opens it.
 import { useEffect, useMemo, useState, type CSSProperties } from "react";
 import { FiAlertOctagon } from "react-icons/fi";
-import { C, ON_BRAND_FILL_DARK } from "../theme/colors";
+import { C } from "../theme/colors";
 import { FONT_WEIGHT } from "@sparkle/ui";
-import { FONT_UI } from "../theme/scale";
 import {
   computeBlockedSubsystems,
   summarizeBlocked,
@@ -38,6 +37,7 @@ import { oneshotAccountId } from "../engine/usageLimit";
 import { paneAccountMap } from "../services/paneControl";
 import { useProjectStore } from "../stores/projectStore";
 import { useUiStore } from "../stores/uiStore";
+import { BANNER_BAR } from "./ProviderUnavailableBanner";
 
 /** The full-width bar's hook, so a real-layout test can measure the element the user sees. */
 export const BLOCKED_AGENTS_BAR_TESTID = "blocked-agents-bar";
@@ -64,7 +64,6 @@ export const BLOCKED_MAX_VISIBLE = 2;
  *  identity parse this banner never reads. */
 export const BLOCKED_RECHECK_MS = 20_000;
 
-const INK = ON_BRAND_FILL_DARK;
 
 /** Injectable seams. Real defaults in production; overridden in tests so no IPC or global registry is
  *  needed to drive a render. */
@@ -93,20 +92,7 @@ const DEFAULT_DEPS: BlockedAgentsBannerDeps = {
 // See BANNER_BAR_TOP_ANCHOR in ProviderUnavailableBanner — the shell's bars share this shape, so a
 // fix that left this one centred vertically would be half a fix. RED fill (`C.sienna`, the brand's
 // error/deny colour) is the one deliberate departure from the amber siblings: blocked is not paused.
-const bar: CSSProperties = {
-  flex: "0 0 auto",
-  display: "flex",
-  alignItems: "flex-start",
-  justifyContent: "center",
-  gap: 8,
-  background: C.sienna,
-  color: INK,
-  padding: "6px 16px",
-  fontSize: 13,
-  fontWeight: FONT_WEIGHT.semibold,
-  fontFamily: FONT_UI,
-  letterSpacing: 0.2,
-};
+const bar: CSSProperties = { ...BANNER_BAR, background: C.sienna };
 
 const sentence: CSSProperties = {
   // Overrides a flex item's `min-width: auto` floor so a long list WRAPS instead of spilling off both
@@ -120,7 +106,10 @@ const cta: CSSProperties = {
   border: "none",
   padding: 0,
   margin: 0,
-  color: INK,
+  // `C.onFillInk`, not the local `INK` alias — the SAME value, named so the contrast guard can trace
+  // it. `theme/linkContrast` fails closed on an underlined element whose colour it cannot resolve to
+  // an ink tier, and a bare `ON_BRAND_FILL_DARK` carries no `C.<name>` for it to read.
+  color: C.onFillInk,
   cursor: "pointer",
   font: "inherit",
   fontWeight: FONT_WEIGHT.semibold,

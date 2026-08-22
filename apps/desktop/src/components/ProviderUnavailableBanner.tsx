@@ -7,7 +7,7 @@
 // ones could only say "this is ours to fix". See the WARNING map below.
 import { useEffect, useState, type CSSProperties } from "react";
 import { FiAlertTriangle } from "react-icons/fi";
-import { C, ON_BRAND_FILL_DARK } from "../theme/colors";
+import { C } from "../theme/colors";
 import { FONT_WEIGHT } from "@sparkle/ui";
 import { FONT_UI } from "../theme/scale";
 import {
@@ -69,7 +69,6 @@ export function usageLimitSentence(until: number): string {
 
 // Brand amber is the caution fill and is theme-CONSTANT, so it needs an ink legible on it in both
 // themes — the constant brand navy, not the themed `C.cream`. Matches ZeroCreditBanner exactly.
-const INK = ON_BRAND_FILL_DARK;
 
 /**
  * ── BANNER_BAR_TOP_ANCHOR — why these bars align to `flex-start`, not `center` ────────────────
@@ -121,15 +120,33 @@ const sentence: CSSProperties = {
   overflowWrap: "break-word",
 };
 
-const bar: CSSProperties = {
+/**
+ * THE SHELL'S BANNER BAR — everything except the fill, so the siblings cannot drift.
+ *
+ * `BlockedAgentsBanner` already carried a byte-identical copy of this block and a comment saying
+ * "the shell's bars share this shape"; the copy is now the import. That is the same argument
+ * `labelTreatment` makes about hand-typed label tracking — each near-copy is defensible alone, and
+ * together they are several decisions where the design has one — and it is what the tree-wide
+ * ratchet counts, so the duplicate tracking value was redding CI for every branch cut from main.
+ *
+ * ONLY `background` is left to the caller, and that is the one deliberate difference: amber for
+ * paused, `C.sienna` for blocked, because blocked is not paused.
+ */
+export const BANNER_BAR: CSSProperties = {
   flex: "0 0 auto",
   display: "flex",
   // TOP-ANCHORED, not centred — see BANNER_BAR_TOP_ANCHOR.
   alignItems: "flex-start",
   justifyContent: "center",
   gap: 8,
-  background: C.amber,
-  color: INK,
+  // `C.onFillInk`, the SAME value the local `INK` alias carried (both are `BLUEPRINT.<mode>.term`)
+  // — but the ink tier's own name rather than `forest`, the SURFACE token that happens to share it.
+  // The link inside this bar inherits nothing: it declares `C.onFillInk` too, so bar and link now
+  // name ONE token. That is the point. `var(--c-forest)` and `var(--c-on-fill-ink)` hold the same
+  // hex today, so `color: INK` painted correctly — but forest is the app BODY BACKGROUND, and the
+  // day it is re-tuned the bar's ink would have followed it while the link's stayed put, drifting
+  // the two apart with every guard still green.
+  color: C.onFillInk,
   // Symmetric, and narrower than ZeroCreditBanner's because there is no out-of-flow ✕ to reserve a
   // lane for (see the non-dismissible note above).
   padding: "6px 16px",
@@ -138,6 +155,8 @@ const bar: CSSProperties = {
   fontFamily: FONT_UI,
   letterSpacing: 0.2,
 };
+
+const bar: CSSProperties = { ...BANNER_BAR, background: C.amber };
 
 const inlineStrip: CSSProperties = {
   display: "flex",

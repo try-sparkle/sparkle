@@ -244,6 +244,43 @@ export const THEME_HEX = {
 export const C = {
   ...BRAND,
   forest: "var(--c-forest)",
+  /**
+   * TEXT ON A BRAND FILL — the ink tier `ON_BRAND_FILL_DARK` has always been, finally NAMED.
+   *
+   * Same value, byte for byte: `BRAND.forest`, the CONSTANT navy. This adds no colour and changes no
+   * pixel; what it adds is a name the contrast guard can VERIFY.
+   *
+   * ⚠️ CONSTANT, NOT THEMED, AND THE FIRST CUT OF THIS GOT IT WRONG. Two different values are named
+   * `forest`: `THEME_HEX.forest` is the THEMED terminal surface, while `BRAND.forest` — what
+   * `ON_BRAND_FILL_DARK` actually is — is constant navy in both themes. Pointing this token at the
+   * themed one flipped light mode's banner text to near-WHITE on a constant sienna fill, which is
+   * verbatim the low-contrast failure `ON_BRAND_FILL`'s own comment warns about. It is constant for
+   * the reason stated there: THE FILL IS CONSTANT TOO, so its ink must not move under it. That is
+   * also why it is a literal here rather than a `var(--c-*)` — it needs no `THEME_HEX` entry and no
+   * CSS mirror, because there is nothing to theme.
+   *
+   * Measured, sRGB relative luminance per WCAG 2.x — the numbers are why this is not a style call:
+   *
+   *                  constant #0a1a3f     themed light #d9e3f3
+   *   on `C.amber`           7.06                     1.87   <- near-invisible
+   *   on `C.sienna`          4.45                     2.96
+   *
+   * `theme/statusInk.test.ts` pins all of it: byte-identity with `ON_BRAND_FILL_DARK`, that this is
+   * a constant absent from both `THEME_HEX` palettes, and that it BEATS the themed value on BOTH
+   * fills — asserting merely "it is dark" would not have caught the substitution.
+   *
+   * WHY IT HAD TO EXIST. `theme/linkContrast.test.ts` fails CLOSED — "an expression that cannot be
+   * traced to an ink is not evidence of safety" — and it traces by looking for a `C.<name>` matching
+   * `/.*Ink|muted|…/`. A bare module export carries no such token, so `color: ON_BRAND_FILL_DARK` on
+   * an underlined element was unverifiable and red on the default branch, blocking every PR cut from
+   * it. The two obvious escapes were both wrong: `statusInk(C.sienna)` returns `C.dangerInk`, i.e.
+   * red text on a red fill, and widening the guard's allowlist to admit a bare export would trade a
+   * measurable rule for an unmeasurable one.
+   *
+   * So the fix is the one the guard's own message asks for: point it at an ink token. Use this
+   * wherever text sits on `C.sienna` / `C.amber` / any saturated brand fill.
+   */
+  onFillInk: BRAND.forest,
   deepForest: "var(--c-deep-forest)",
   // The concierge column — the lightest of the shell's three depth layers. See THEME_HEX above.
   conciergeSurface: "var(--c-concierge-surface)",

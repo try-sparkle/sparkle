@@ -202,6 +202,49 @@ describe("BlockedAgentsBanner", () => {
     expect(bar.style.background).not.toBe(asRendered(C.amber));
   });
 
+  it("paints the 'Manage fleet' link with the SAME ink token as the bar it sits in", async () => {
+    // THE CAPABILITY, not the scanner's label. `linkContrast` is a static scan: it proves the CTA's
+    // colour is *traceable to some ink tier*, which is a weaker claim than "legible on THIS bar".
+    // The bar's fill is `C.sienna` (red) — the amber sibling's ink was copied onto it wholesale and
+    // nobody had checked forest-on-red — so what has to hold is that the link and the sentence
+    // beside it are the SAME ink, and stay that way.
+    //
+    // Asserting equality of the declared token is what catches the drift the static scan cannot:
+    // `var(--c-forest)` and `var(--c-on-fill-ink)` hold the same hex today, so a bar on `forest` and
+    // a link on `onFillInk` would render identically AND pass `linkContrast` — right up until
+    // `forest`, the app body background, is re-tuned and only one of them moves.
+    render(
+      <BlockedAgentsBanner
+        deps={deps({
+          usage: [{ id: "acct-default", exhaustedUntil: Date.now() + HOUR }],
+          accounts: [{ id: "acct-default", isDefault: true }],
+        })}
+      />,
+    );
+    const bar = await screen.findByTestId(BLOCKED_AGENTS_BAR_TESTID);
+    const cta = await screen.findByTestId(BLOCKED_AGENTS_CTA_TESTID);
+
+    // It is a link at all — otherwise the ink assertion below guards nothing.
+    expect(cta.style.textDecoration).toContain("underline");
+    // Both actually declare an ink; `toBe("")` on either would make the equality vacuous.
+    expect(bar.style.color).not.toBe("");
+    expect(cta.style.color).not.toBe("");
+    // ...and it is ONE token, so they cannot drift apart.
+    expect(cta.style.color).toBe(bar.style.color);
+    // The ink tier's own name, not the surface token that happens to share its value today.
+    //
+    // ⚠️ COMPARED THROUGH THE CSSOM, NOT AS A RAW STRING, because `.style.color` is FORM-DEPENDENT:
+    // jsdom passes a `var(--c-*)` through verbatim but normalises a hex literal to `rgb(r, g, b)`.
+    // `C.onFillInk` is a LITERAL — it is `BRAND.forest`, constant navy in both themes, because the
+    // brand fills it sits on are constant too — so a direct `toBe(C.onFillInk)` compares "#0a1a3f"
+    // against "rgb(10, 26, 63)" and fails on the spelling while the inks are in fact identical.
+    // Round-tripping the expectation through the same CSSOM makes the assertion about the VALUE.
+    const probe = document.createElement("span");
+    probe.style.color = C.onFillInk;
+    expect(probe.style.color).not.toBe("");
+    expect(cta.style.color).toBe(probe.style.color);
+  });
+
   it("renders nothing when the only bench is in the PAST (a lapsed limit is not a block)", async () => {
     const load = vi.fn(async () => ({
       accounts: [{ id: "acct-default", isDefault: true }],
