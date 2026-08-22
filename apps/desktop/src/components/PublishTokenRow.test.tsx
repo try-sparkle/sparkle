@@ -678,3 +678,66 @@ describe("two lookups for the SAME destination cannot land out of order", () => 
     expect(screen.queryByTestId(PUBLISH_TOKEN_INPUT_TESTID)).toBeNull();
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+// THE OTHER ARM OF THE STALENESS GUARD (roborev 67371, Medium).
+//
+// `readSource` guards both its resolve and its catch, and only the resolve arm was pinned: every
+// rejection in this file is a first/only lookup or a _set/_clear failure, and both out-of-order
+// tests settle with `resolve`. Deleting the guard from the catch left the suite green.
+//
+// The scenario lands in the component's WORST state — could-not-run painted over a
+// ran-and-said-yes, which is the exact distinction the module doc says this row is built around.
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+describe("a superseded lookup that REJECTS is dropped too", () => {
+  it("does not paint could-not-run over an answer it already has", async () => {
+    // A keychain that unlocks between two polls, then a transient error on the straggler.
+    const answers: Array<{ resolve: (v: TokenSource) => void; reject: (e: string) => void; promise: Promise<TokenSource> }> = [];
+    invoke.mockImplementation((cmd: string) => {
+      if (cmd !== "publish_token_source") return Promise.reject(`unexpected ${cmd}`);
+      if (answers.length === 0) {
+        answers.push({ resolve: () => {}, reject: () => {}, promise: Promise.resolve("none" as TokenSource) });
+        return Promise.reject("the item could not be read");
+      }
+      let resolve!: (v: TokenSource) => void;
+      let reject!: (e: string) => void;
+      const promise = new Promise<TokenSource>((res, rej) => {
+        resolve = res;
+        reject = rej;
+      });
+      // Swallow the rejection here so an unhandled one cannot fail the run; the component's own
+      // catch is what this test is about.
+      promise.catch(() => undefined);
+      answers.push({ resolve, reject, promise });
+      return promise;
+    });
+
+    await mount();
+    await act(async () => {
+      fireEvent.click(screen.getByTestId(PUBLISH_TOKEN_RECHECK_TESTID));
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByTestId(PUBLISH_TOKEN_RECHECK_TESTID));
+    });
+    expect(answers.length).toBe(3);
+
+    // The NEWER lookup succeeds…
+    await act(async () => {
+      answers[2]!.resolve("keychain");
+      await answers[2]!.promise;
+    });
+    expect(status()).toMatch(/stored for this destination in this Mac’s keychain/i);
+
+    // …then the OLDER one rejects. Without the guard on the catch arm, this repaints the row as
+    // could-not-run with a stale error string and re-offers the recheck button — a "the check never
+    // ran" message over a check that ran and said yes.
+    await act(async () => {
+      answers[1]!.reject("a transient failure");
+      await answers[1]!.promise.catch(() => undefined);
+    });
+
+    expect(status()).toMatch(/stored for this destination in this Mac’s keychain/i);
+    expect(status()).not.toMatch(/couldn’t check/i);
+    expect(status()).not.toContain("a transient failure");
+  });
+});
