@@ -34,7 +34,7 @@
 import { classifyLine } from "@sparkle/core";
 import type { AgentTabStatus } from "@sparkle/ui";
 import { isSessionLimitPicker, screenAwaitsInput } from "./screenClassifier";
-import { parseBackgroundTaskCount } from "./backgroundTaskFooter";
+import { parseDelegatedWorkCount } from "./backgroundTaskFooter";
 import {
   noteBackgroundTasks,
   forgetBackgroundTasks,
@@ -1161,7 +1161,11 @@ export class StatusEngine {
    */
   private noteBackgroundTasksFromScreen(snapshot: string | undefined): void {
     if (snapshot === undefined) return;
-    const count = parseBackgroundTaskCount(snapshot);
+    // EITHER surface counts — the backgrounded-task footer OR the live subagent roster. See
+    // engine/backgroundTaskFooter.parseDelegatedWorkCount: the roster is the only evidence of an
+    // agent BLOCKED WAITING on its own subagents, which is the state the founder named and the one
+    // this path used to read as silence.
+    const count = parseDelegatedWorkCount(snapshot);
     if (count !== null) noteBackgroundTasks(this.opts.agentId, count);
     else forgetBackgroundTasks(this.opts.agentId);
   }

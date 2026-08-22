@@ -43,6 +43,7 @@
 import type { AgentTabStatus } from "../types";
 import { needsAttention } from "./attention";
 import { isRedStatus } from "../services/windowStatus";
+import { overlaidRowIds } from "./overlayRows";
 
 /** What the grid said. Mirrors `observed_attention::Verdict` in Rust, lowercase on the wire. */
 export type ObservedVerdict = "awaiting" | "unreadable" | "calm" | "gone";
@@ -136,7 +137,7 @@ export function withObservedAttention(
   hasLiveWriter: (agentId: string) => boolean,
 ): Record<string, AgentTabStatus> {
   let out: Record<string, AgentTabStatus> | null = null;
-  for (const { id } of agents) {
+  for (const id of overlaidRowIds(agents, readings)) {
     const reading = readings[id];
     if (!reading) continue;
     if (hasLiveWriter(id)) continue;

@@ -302,3 +302,89 @@ describe("applyVerdict — the decision, directly", () => {
     expect(applyVerdict("working", "unreadable")).toBeUndefined();
   });
 });
+
+// ══ GUARD 2 — THE SELF ROW AND A BUILD ROW MUST DERIVE COLOUR IDENTICALLY ═══════════════════════
+//
+// The founder's HARD RULE (2026-08-22), verbatim: "I do want it to work exactly like the build
+// agents, so that's the hard rule. The colors work the same between the two, and don't let any
+// instruction ever override that."
+//
+// He asked for this guard BY NAME, because the divergence it catches had already shipped once and
+// he expected it to regress again. It did ship: `withObservedAttention` iterated only the array it
+// was handed, both call sites hand it `project.agents`, and `services/knownAgents.ts` keeps the
+// app-owned Improve Sparkle row out of that array by design — so the whole overlay skipped it and
+// the self row kept the green-while-blocked bug after build rows were fixed.
+//
+// ⚠️ THE EMPTY `agents` ARRAY IS THE POINT, not a shortcut. That is the REAL condition for the self
+// row — it is genuinely never in the roster — so a version of this test that puts the sparkle id in
+// `agents` would pass against the very bug it exists to catch.
+describe("parityAcrossRowKinds — the founder's hard rule", () => {
+  const VERDICTS = ["awaiting", "unreadable", "calm"] as const;
+  // Both spellings resolve through `isSparkleAgentId`: the bare namespace and the per-window form.
+  const SELF_IDS = ["__sparkle_self__", "__sparkle_self__-main"];
+
+  it.each(VERDICTS)(
+    "a build row and the self row reach the same STATUS for verdict `%s`",
+    (verdict) => {
+      for (const selfId of SELF_IDS) {
+        const build = withObservedAttention(
+          [{ id: "a1" }],
+          { a1: "working" },
+          { a1: reading(verdict) },
+          NO_PANE,
+        );
+        // No roster entry — exactly how the self row actually arrives here.
+        const self = withObservedAttention(
+          [],
+          { [selfId]: "working" },
+          { [selfId]: reading(verdict) },
+          NO_PANE,
+        );
+        expect(self[selfId], `self row diverged from a build row on \`${verdict}\``).toBe(
+          build.a1,
+        );
+      }
+    },
+  );
+
+  it.each(VERDICTS)(
+    "…and the same COLOUR, which is what the founder actually sees, for verdict `%s`",
+    (verdict) => {
+      for (const selfId of SELF_IDS) {
+        const build = withObservedAttention(
+          [{ id: "a1" }],
+          { a1: "working" },
+          { a1: reading(verdict) },
+          NO_PANE,
+        );
+        const self = withObservedAttention(
+          [],
+          { [selfId]: "working" },
+          { [selfId]: reading(verdict) },
+          NO_PANE,
+        );
+        expect(colorOf(self[selfId])).toBe(colorOf(build.a1));
+      }
+    },
+  );
+
+  // NON-VACUITY, asserted rather than assumed. If `awaiting` ever stops moving a green build row,
+  // both assertions above collapse into "gray === gray" and would pass against a dead overlay.
+  it("the `awaiting` case actually MOVES a build row, so the parity assertions mean something", () => {
+    const build = withObservedAttention(
+      [{ id: "a1" }],
+      { a1: "working" },
+      { a1: reading("awaiting") },
+      NO_PANE,
+    );
+    expect(build.a1).toBe("waiting");
+    expect(colorOf(build.a1)).not.toBe(AGENT_STATUS.working.color);
+  });
+
+  // A reading for an id that is neither in the roster nor the self row must still be ignored —
+  // widening the overlay for Improve Sparkle must not have widened it for everything.
+  it("still ignores a reading for a foreign agent that is in no roster", () => {
+    const out = withObservedAttention([], { other: "working" }, { other: reading("awaiting") }, NO_PANE);
+    expect(out.other).toBe("working");
+  });
+});

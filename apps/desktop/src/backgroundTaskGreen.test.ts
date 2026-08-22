@@ -21,6 +21,7 @@ import {
   noteBackgroundTasks,
   _resetBackgroundTaskRegistryForTests,
 } from "./services/backgroundTaskRegistry";
+import { SPARKLE_AGENT_ID } from "./services/sparkleAgent";
 import type { AgentTab, AgentTabStatus } from "./types";
 
 function mk(id: string, kind: AgentTab["kind"], parentId: string | null): AgentTab {
@@ -42,6 +43,14 @@ function surfacesFor(agents: AgentTab[], status: Record<string, AgentTabStatus>,
   return { published: published[id], columnBand: bandOfRollup(dotOf(id)) };
 }
 
+// ⚠️ THE HEAD BELOW IS A BUILD AGENT STANDING IN FOR THE SELF ROW, AND THAT STAND-IN WAS A LIE.
+// This block was written as "the Improve-Sparkle shape" and asserted against `mk("p1", "build")` —
+// but Improve Sparkle is DELIBERATELY never in `project.agents` (services/knownAgents.ts), and
+// `withBackgroundTaskGreen` iterated that array. So every assertion here passed while the promotion
+// had never once run on the row it was built for: it read GRAY with N subagents live, for months,
+// which is exactly what the founder kept reporting. The shape was covered; the ROW was not.
+// The real row is now covered by the block below and, end to end from a rendered screen through
+// both status chains, by `delegatedGreenParity.test.tsx`.
 describe("green while waiting on background tasks (childless head — the Improve-Sparkle shape)", () => {
   beforeEach(() => _resetBackgroundTaskRegistryForTests());
 
@@ -98,5 +107,43 @@ describe("the promotion feeds isInMotion — worker-red suppression on a delegat
     noteBackgroundTasks("p1", 1);
     const { columnBand } = surfacesFor(headWithBlockedWorker, { p1: "idle", w1: "waiting" }, "p1");
     expect(columnBand).toBe("needs_you");
+  });
+});
+
+// ══ THE ACTUAL SELF ROW, NOT A STAND-IN ═════════════════════════════════════════════════════════
+// The EMPTY roster is the point, not a shortcut: it is the real condition. A version of this that
+// put the sparkle id in `agents` would pass against the very bug it exists to catch — which is what
+// the block above did.
+describe("the REAL Improve Sparkle row — never a member of any project's roster", () => {
+  beforeEach(() => _resetBackgroundTaskRegistryForTests());
+
+  const NO_ROSTER: AgentTab[] = [];
+
+  it("is GREEN while its subagents run, with no roster entry of its own", () => {
+    noteBackgroundTasks(SPARKLE_AGENT_ID, 3);
+    const { published, columnBand } = surfacesFor(
+      NO_ROSTER, { [SPARKLE_AGENT_ID]: "idle" }, SPARKLE_AGENT_ID,
+    );
+    expect(published).toBe("working");
+    expect(bandOfStatus(published!)).toBe("running");
+    expect(columnBand).toBe("running");
+  });
+
+  it("is GRAY with nothing delegated — the paired case, so the above is not vacuous", () => {
+    const { published, columnBand } = surfacesFor(
+      NO_ROSTER, { [SPARKLE_AGENT_ID]: "idle" }, SPARKLE_AGENT_ID,
+    );
+    expect(published).toBe("idle");
+    expect(columnBand).toBe("done");
+  });
+
+  it("reaches the SAME answer a build row does — the founder's hard rule", () => {
+    noteBackgroundTasks(SPARKLE_AGENT_ID, 1);
+    noteBackgroundTasks("p1", 1);
+    const self = surfacesFor(NO_ROSTER, { [SPARKLE_AGENT_ID]: "idle" }, SPARKLE_AGENT_ID);
+    const build = surfacesFor([mk("p1", "build", null)], { p1: "idle" }, "p1");
+    expect(self.published, "the self row diverged from a build row").toBe(build.published);
+    expect(self.columnBand).toBe(build.columnBand);
+    expect(build.published).toBe("working"); // …and the build row genuinely moved.
   });
 });

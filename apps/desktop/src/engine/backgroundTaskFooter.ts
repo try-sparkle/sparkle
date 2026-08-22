@@ -35,6 +35,8 @@
 // shape whenever the wording moves, or the signal silently goes dead (a green suite that says
 // nothing — the failure mode WORKING_PATTERNS' own header records from 2026-07-28).
 
+import { liveBackgroundSubagentCount } from "./claudeCodeScreen";
+
 /**
  * Claude Code's live-background-task footer, with the count captured.
  *
@@ -77,4 +79,39 @@ export function parseBackgroundTaskCount(screen: string): number | null {
 /** Does this rendered screen show at least one live background task? */
 export function hasLiveBackgroundTasks(screen: string): boolean {
   return parseBackgroundTaskCount(screen) !== null;
+}
+
+/**
+ * How much delegated work this rendered screen shows as live — from EITHER of Claude Code's two
+ * surfaces — or `null` when it shows none.
+ *
+ * ══ WHY TWO SURFACES, AND WHY THE FOOTER ALONE WAS NOT ENOUGH ═══════════════════════════════════
+ * The founder named two states that must both read GREEN:
+ *   1. the agent is working AND has subagents running;
+ *   2. the agent has delegated and is BLOCKED WAITING on them.
+ * He called (2) out specifically — "sometimes I've noticed that it's waiting on the sub agents to
+ * finish, and it should again be green when that's happening" — and it is the one that was missed,
+ * because from the parent's own PTY it looks exactly like doing nothing: no spinner, no output, no
+ * tool calls, for minutes.
+ *
+ * The `N background task(s) live` footer covers work Claude has explicitly BACKGROUNDED. It does not
+ * cover the roster Claude draws while it is running subagents — `◯ <kind>  <label>  <elapsed>` — and
+ * that roster REPLACES the composer box, so a screen showing it has no other sign of life on it at
+ * all. `engine/claudeCodeScreen` has parsed those rows since bead sparkle-tbsvf, but only to answer
+ * "is this a Claude Code screen"; the rows, kinds and elapsed clocks were discarded. This is where
+ * that evidence finally reaches a status.
+ *
+ * THE MAX, NOT THE SUM. The two surfaces can describe the SAME work — a backgrounded Task subagent
+ * is both a background task and a roster row — so adding them would double-count. Nothing downstream
+ * reads the magnitude (`hasLiveBackgroundTasksForAgent` asks only `> 0`), so the max is the honest
+ * answer to "at least this much is live" without inventing delegates that do not exist.
+ *
+ * `null` when neither surface is present, mirroring {@link parseBackgroundTaskCount} — an ABSENCE,
+ * never a zero-valued entry, so every reader keeps one definition of "in motion".
+ */
+export function parseDelegatedWorkCount(screen: string): number | null {
+  const footer = parseBackgroundTaskCount(screen);
+  const roster = liveBackgroundSubagentCount(screen);
+  if (footer === null && roster === null) return null;
+  return Math.max(footer ?? 0, roster ?? 0) || null;
 }

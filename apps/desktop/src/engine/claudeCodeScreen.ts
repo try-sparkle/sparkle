@@ -334,12 +334,49 @@ const BOX_PROMPT = /^\s*[│|]\s*[❯›>]\s*[│|]?\s*$|^\s*[│|]\s*[❯›>]\
 const BACKGROUND_TASK_ROW = /^\s*◯\s+\S.*\d+m\s*\d+s\s*$/;
 
 function hasBackgroundTaskList(lines: readonly string[]): boolean {
+  return backgroundTaskRowCount(lines) !== null;
+}
+
+/** How many subagents Claude Code is listing as live, or `null` when this is not a live list.
+ *
+ *  ── WHY A COUNT AND NOT JUST THE BOOLEAN ────────────────────────────────────────────────────────
+ *  This roster is the ONLY on-screen evidence of the founder's second state — "sometimes I've
+ *  noticed that it's waiting on the sub agents to finish, and it should again be green when that's
+ *  happening". From the parent's own PTY that state is indistinguishable from doing nothing: no
+ *  spinner, no output, no tool calls, for minutes. The rows ARE the work.
+ *
+ *  `services/backgroundTaskRegistry` stores a count, so this returns one rather than making the
+ *  caller re-walk the grid. It is deliberately the SAME walk `isClaudeCodeScreen` already trusted —
+ *  extracted, not copied, because a second matcher for these rows is a second thing to retune when
+ *  the TUI moves (this file's own retune discipline).
+ *
+ *  ── `null` IS "NOT A LIVE LIST", WHICH IS NOT THE SAME AS ZERO ──────────────────────────────────
+ *  `nothingUnrecognizedBelowFooter` is what separates Claude's live roster from a PAGER QUOTING one
+ *  — this module's header notes that the bead describing this feature reproduces a row verbatim, so
+ *  a doc on screen trips the row pattern. A quoted list must not park a count that paints a finished
+ *  agent green forever. Position is the discriminator, exactly as it is for the dialog family. */
+function backgroundTaskRowCount(lines: readonly string[]): number | null {
   for (let i = lines.length - 1; i >= 0; i--) {
-    if (BACKGROUND_TASK_ROW.test(lines[i] ?? "")) {
-      return nothingUnrecognizedBelowFooter(lines, i);
+    if (!BACKGROUND_TASK_ROW.test(lines[i] ?? "")) continue;
+    if (!nothingUnrecognizedBelowFooter(lines, i)) return null;
+    // Walk UP the contiguous block. Blank rows inside the list are tolerated; the first non-blank
+    // line that is not a row ends it (in practice the `⏺ <branch>` header the list hangs under).
+    let n = 0;
+    for (let j = i; j >= 0; j--) {
+      const row = lines[j] ?? "";
+      if (BACKGROUND_TASK_ROW.test(row)) n++;
+      else if (row.trim() !== "") break;
     }
+    return n;
   }
-  return false;
+  return null;
+}
+
+/** {@link backgroundTaskRowCount} over a rendered snapshot. See its header for why this is a count
+ *  and why `null` is not zero. */
+export function liveBackgroundSubagentCount(snapshot: string): number | null {
+  if (!snapshot) return null;
+  return backgroundTaskRowCount(snapshot.split("\n"));
 }
 
 function hasLiveDialog(lines: readonly string[]): boolean {

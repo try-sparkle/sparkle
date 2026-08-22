@@ -54,6 +54,7 @@
 // the bug that shipped twice, most recently leaving a blocked worker unable to bubble to its
 // orchestrator at all. `bandOfStatus(...) === "needs_you"` is the "is this row painted red?" test.
 import { bandOfStatus, type StatusBand } from "./buildSections";
+import { overlaidRowIds } from "./overlayRows";
 import type { AgentTabStatus } from "../types";
 
 /** The five marks a head row's disc can take. `orange` is NOT an agent status — there is no such
@@ -409,13 +410,18 @@ export function withBackgroundTaskGreen<
   M extends Record<string, AgentTabStatus>,
 >(agents: readonly T[], statusMap: M, hasBackgroundTasks: (id: string) => boolean): M {
   let out: M | null = null;
-  for (const a of agents) {
+  // `overlaidRowIds`, NOT `agents` — see engine/overlayRows. Iterating the roster alone is what kept
+  // this promotion off the ONE row its own header names as the case it exists for: Improve Sparkle
+  // is deliberately never in `project.agents`, so for as long as this loop read that array, the
+  // green-while-delegating fix had never once run on the agent it was written for. It read gray with
+  // N subagents live, which is exactly the founder's report.
+  for (const id of overlaidRowIds(agents, statusMap)) {
     // ONLY `idle` — see the header. Not `working` (already there), not red, amber, unmerged, new,
     // done or stopped. This single guard encodes every exclusion above.
-    if (statusMap[a.id] !== "idle") continue;
-    if (!hasBackgroundTasks(a.id)) continue;
+    if (statusMap[id] !== "idle") continue;
+    if (!hasBackgroundTasks(id)) continue;
     out ??= { ...statusMap };
-    (out as Record<string, AgentTabStatus>)[a.id] = "working";
+    (out as Record<string, AgentTabStatus>)[id] = "working";
   }
   return out ?? statusMap;
 }
