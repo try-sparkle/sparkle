@@ -26,7 +26,7 @@
 import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AccountsScreen, type AccountsDeps } from "./AccountsScreen";
-import { ModalShell } from "./ModalShell";
+import { ModalShell, MODAL_PADDING } from "./ModalShell";
 import { expectBoundedCard } from "./dialogCardGeometryTestUtils";
 import type { Account, Identity } from "../services/accountStore";
 import type { SpawnLogEntry } from "../services/accountLedger";
@@ -150,6 +150,43 @@ describe("the accounts dialog cannot grow off the screen", () => {
     const body = screen.getByTestId("modal-shell-body");
     expect(body.contains(pinned!)).toBe(true);
     expect(screen.getByTestId("account-spawn-log").contains(addBtn)).toBe(false);
+  });
+
+  it("covers the WebKit sticky band above the header so no content bleeds through it", async () => {
+    // THE BUG: WKWebView (this app's engine) resolves a sticky `top: 0` against the scroll
+    // container's CONTENT box, so the header pins `MODAL_PADDING`px below the card's top edge and
+    // rows scroll up through the uncovered band above it — the green routing text the founder saw
+    // bleeding above the title. jsdom has no layout engine, so the band's PIXELS are not measurable
+    // here (see the file header). What IS measurable — and is exactly the structure that fixes it —
+    // is that the sticky header carries an opaque cover that (a) is absolutely positioned, so it
+    // reserves no flow and cannot re-create the overlap a negative top margin caused, and (b) is
+    // pulled up by `MODAL_PADDING` and is `MODAL_PADDING` tall, i.e. it spans precisely the band.
+    await renderDialog(60);
+    const header = screen.getByTestId("accounts-header");
+    const cover = screen.getByTestId("accounts-header-top-cover");
+
+    // It lives INSIDE the sticky header — that is what makes it move with the pin and paint in the
+    // header's stacking context, above the rows. A cover elsewhere in the tree would not travel with
+    // the header when stuck.
+    expect(header.style.position).toBe("sticky");
+    expect(header.contains(cover)).toBe(true);
+    expect(cover).not.toBe(header);
+
+    // Absolute → no layout box, so it cannot push the following rows down (the overlap failure mode).
+    expect(cover.style.position).toBe("absolute");
+    // It spans exactly the band: pulled up by the inset and as tall as the inset.
+    expect(cover.style.top).toBe(`-${MODAL_PADDING}px`);
+    expect(cover.style.height).toBe(`${MODAL_PADDING}px`);
+    // Pinned to its containing block's edges (`0`), NOT a negative bleed: the header is already
+    // full-bleed, so its padding box — which the absolute cover is positioned against — already spans
+    // the scrollport edge-to-edge. A negative bleed would push past the right edge and, because the
+    // dialog body is `overflow-y: auto` (so overflow-x computes to auto), make it scroll sideways.
+    expect(cover.style.left).toBe("0px");
+    expect(cover.style.right).toBe("0px");
+    // Opaque, and the SAME plane as the header — a transparent cover would let content show straight
+    // through it.
+    expect(cover.style.background).toBeTruthy();
+    expect(cover.style.background).toBe(header.style.background);
   });
 
   it("keeps the control reachable when the ledger is empty too, not only when it is long", async () => {

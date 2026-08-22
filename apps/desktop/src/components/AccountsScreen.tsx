@@ -271,7 +271,17 @@ const tagStyle: CSSProperties = { ...tag(C.accentInk), borderColor: C.teal };
  *  that reserved space, so content passes below it rather than behind it. It sits at the
  *  scrollport's own top inset, which reads as ordinary breathing room above the title. The `top: 0`
  *  pin, the opaque plane and the z-index are unchanged — see AccountsScreen.reachability.test.tsx,
- *  which pins that contract. */
+ *  which pins that contract.
+ *
+ *  THE `MODAL_PADDING` BAND ABOVE THE STUCK HEADER — see `headerTopCover`. This app runs in
+ *  WKWebView (macOS Tauri), and WebKit resolves a sticky `top: 0` against the scroll container's
+ *  CONTENT box, not its padding box: the scrollport here (`ModalShell`'s body) carries a
+ *  `MODAL_PADDING` top inset, so the header pins `MODAL_PADDING`px BELOW the card's top edge and the
+ *  rows scroll UP THROUGH that uncovered band — the green rotation/routing text bleeding above the
+ *  title in the founder's report (measured in WKWebView: band = MODAL_PADDING; Chromium pins at the
+ *  padding box and the band is 0, which is why it never reproduced in a browser preview). `top: 0`
+ *  with a negative top margin cannot fix it — WebKit still pins at the content box, so that just
+ *  brings back the overlap the note above records. The band is covered by an opaque plane instead. */
 const stickyHeader: CSSProperties = {
   position: "sticky",
   top: 0,
@@ -284,6 +294,31 @@ const stickyHeader: CSSProperties = {
   alignItems: "center",
   justifyContent: "space-between",
   gap: 8,
+};
+
+/** The opaque plane that fills the `MODAL_PADDING` band between the card's top edge and where the
+ *  sticky header pins in WebKit (see the `stickyHeader` note). It is a CHILD of the sticky header,
+ *  positioned ABSOLUTELY so it adds no layout — reserving no flow space is what keeps it from
+ *  reintroducing the overlap a negative top margin caused.
+ *
+ *  `left: 0 / right: 0`, NOT a negative bleed: the cover is positioned against the header's PADDING
+ *  box, and the header is ALREADY full-bleed (`margin: 0 -${MODAL_PADDING}px …`), so that padding box
+ *  already spans the modal body's scrollport edge-to-edge — `0/0` covers the side gutters too.
+ *  Pulling it out another `MODAL_PADDING` per side pushes the right edge past the scrollport, and the
+ *  body is `overflow-y: auto` (so `overflow-x` computes to `auto`): the overhang then makes the whole
+ *  dialog horizontally scrollable, and a sideways swipe re-exposes the very gutters this covers
+ *  (measured: +MODAL_PADDING of horizontal scrollable overflow in WKWebView).
+ *
+ *  Since it sits inside the header's `z-index: 2` stacking context it paints above the static rows
+ *  scrolling underneath with no z-index of its own. Verified topmost across the full band width, with
+ *  zero horizontal overflow, in WKWebView. */
+const headerTopCover: CSSProperties = {
+  position: "absolute",
+  left: 0,
+  right: 0,
+  top: -MODAL_PADDING,
+  height: MODAL_PADDING,
+  background: C.dialogSurface,
 };
 
 const inputStyle: CSSProperties = {
@@ -658,6 +693,9 @@ function RotationGlance({
 
   return (
     <div data-testid="accounts-header" style={stickyHeader}>
+      {/* Opaque cover for the WebKit sticky band above the header — see `headerTopCover`. Presentational
+          only; kept out of the accessibility tree. */}
+      <div aria-hidden data-testid="accounts-header-top-cover" style={headerTopCover} />
       <button
         type="button"
         data-testid="rotation-toggle"
