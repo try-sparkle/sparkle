@@ -173,10 +173,13 @@ export async function spawnWorker(args: {
     const selectedWasDoomed =
       useProjectStore.getState().projects.find((p) => p.id === args.projectId)?.selectedAgentId ===
       workerId;
-    // The worker's pane NEVER mounted: the row is added with `select: false` and
+    // A FAILED SPAWN IS NOT A CLOSE, so it must not emit a close waterfall. The worker's pane
+    // normally never mounted at all here — the row is added with `select: false` and
     // `runtime.open(workerId)` does not run until `runSpawn`, which this rollback is the failure to
-    // reach. Fan-out reaches this path (worktree cut failures) far more often than the build-agent
-    // teardown where the same leak was first found.
+    // reach — in which case the store opens no trace and this is a no-op. It stays because the
+    // awaits above are long enough (a real `git worktree` cut) that a user CAN click the row and
+    // mount its pane, and that pane unmounting would otherwise time a "close" the user never asked
+    // for. See `removeAgentWithoutPane`.
     removeAgentWithoutPane(args.projectId, workerId);
     if (selectedWasDoomed) {
       useProjectStore.getState().selectAgent(args.projectId, args.parentAgentId);
@@ -278,12 +281,15 @@ export async function spinDownWorker(args: {
   // Removing the row synchronously up front is what makes the × feel immediate. It's safe because
   // removeAgent now TOMBSTONES the id (pendingLocalRemovals), so the disk reconcile can't re-adopt
   // this worker from its still-present manifest during the teardown window (sparkle-close-resurrect).
-  // DELIBERATELY UNCHANGED, and the leak here is KNOWN — see bead sparkle-vmfda. A `close:` trace can
-  // dangle when no pane was mounted, but "was one?" has no answer this call site can give: it is
-  // false in the main window for an unvisited or torn-out project, and TRUE in the satellite window
-  // for that same torn-out project (SatelliteApp mounts on `openAgentIds` alone). Guessing wrong in
-  // the other direction cancels a LIVE trace and silently stops measuring closes, which is worse
-  // than the dangle. Left alone until the ownership question is settled where it belongs.
+  // PLAIN `removeAgent` IS CORRECT HERE, and the `close:` dangle this site used to carry is fixed —
+  // not by anything written at this call site, which genuinely could not answer "was a pane
+  // mounted?" (false in the main window for an unvisited or torn-out project, TRUE in the satellite
+  // window for that same project, since SatelliteApp mounts on `openAgentIds` alone). The store
+  // answers it instead, per window, by asking the pane: `removeAgent` opens the trace only while
+  // `services/agentPaneRegistry` holds a live pane for the id (bead sparkle-bxidpw, closing
+  // sparkle-vmfda). Note this site's ordering is what PRESERVES its waterfall: `close()` and
+  // `removeAgent()` below run in the same tick, React 18 batches the re-render, so the pane is still
+  // mounted when the store asks and the close is still measured end to end.
   // KILL BEFORE THE ROW GOES. Dropping the row unmounts the pane, and that unmount is itself a
   // `killPty(id, "pane-unmount")`; `mark_stopped_at` writes only while the record is still `Live`,
   // so FIRST WRITER WINS. Killing after the removal let the unmount win and recorded a human's ×

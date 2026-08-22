@@ -138,6 +138,7 @@ import {
 import { claimPass, releasePass } from "../improvementPassLatch";
 import { SPARKLE_AGENT_ID } from "../sparkleAgent";
 import { killPty } from "../../pty";
+import { openTraceKinds } from "../../perfTrace";
 
 const CLEAN: BranchStatus = {
   ahead: 0,
@@ -926,6 +927,47 @@ describe("discardAgent", () => {
     expect(r.data.destroyed.targets.map((t) => t.agentId)).toEqual([parent, child]);
   });
 
+  // PER-SITE LEAK COVERAGE — `discardAgent` (bead sparkle-bxidpw).
+  //
+  // `removeAgent` opens a `close:<id>` perf trace that only a mounted `AgentPane`'s unmount can end,
+  // so a row removed with no pane used to leak it permanently — and `openTraceKinds()` then named
+  // the ghost as an in-flight interaction on every later jank stall line. Each `removeAgent` call
+  // site is covered separately because the fix is ONE shared gate in the store: per AGENTS.md
+  // (`sparkle-50m03`) a shared fix reads as verified the moment any single site is covered, while a
+  // site that later grows its own `perfStart` regresses in silence.
+  //
+  // This site leaks unconditionally rather than occasionally: it `await`s `discardAgentGit` BEFORE
+  // `removeAgent`, so by then React has long since committed the unmount of any pane that did exist.
+  // That is also why nothing is lost by gating — this path emitted no waterfall even when a pane had
+  // been open, because the pane's `perfEnd` ran against a trace that had not been started yet.
+  //
+  // NO `__resetTracesForTest()` ANYWHERE IN THIS FILE, deliberately. The assertion is that the whole
+  // suite ahead of it leaves no `close` ghost, which a reset would quietly manufacture.
+  it("leaves NO dangling close trace — the discarded agent's pane was never mounted", async () => {
+    const pid = seedProject();
+    const parent = seedBuild(pid, { bs: AHEAD, beadId: "bd-parent" });
+    seedWorker(pid, parent, "bd-child");
+
+    const r = await discardAgent(parent, { confirm: DISCARD_CONFIRM_TOKEN, agentId: parent });
+    expect(r.ok).toBe(true);
+
+    // The rows are gone, so a `close` still in flight is a ghost by definition.
+    expect(useProjectStore.getState().projects[0]!.agents).toHaveLength(0);
+    // THE SIDE EFFECT — what the jank monitor would actually print in its `during` field.
+    //
+    // NARROWED TO `close`, AND HERE IS THE ACTUAL REASON — which is NOT the one this comment used
+    // to give ("selection fallbacks on these paths open `switch:` traces"). `discardAgent` never
+    // calls `selectAgent`, so that mechanism does not exist on this path (roborev 67348, 67368).
+    // The narrowing is required by THIS FILE instead: it deliberately never calls
+    // `__resetTracesForTest()` (see the note above), and it drives the real
+    // `spawnBuildAgentInProject`, which `perfStart`s a `spawn:` trace and lands via
+    // `agentReveal` → `selectAgent`. So earlier tests leave `spawn:`/`switch:` residue in the
+    // module-scoped map and a whole-map `toBeUndefined()` would fail on THEIR traces, not this
+    // path's. The cost is stated plainly: this form cannot see a non-`close` leak that this path
+    // grows later. `services/workerSpawn.test.ts` asserts the whole map for the site that can.
+    expect(openTraceKinds() ?? "").not.toContain("close");
+  });
+
   it("is never the fallback of a conditional: an unknown agent refuses, it does not destroy", async () => {
     const r = await discardAgent("ghost", { confirm: DISCARD_CONFIRM_TOKEN, agentId: "ghost" });
     expect(r.ok).toBe(false);
@@ -1223,6 +1265,26 @@ describe("saveAgent", () => {
     );
     expect(discardGitMock).not.toHaveBeenCalled();
     expect(useProjectStore.getState().projects[0]!.agents).toHaveLength(0);
+  });
+
+  // PER-SITE LEAK COVERAGE — `saveAgent` → `tearDownKeepingBranches` (bead sparkle-bxidpw). See the
+  // equivalent test in the `discardAgent` describe for why every `removeAgent` call site gets its
+  // own case rather than trusting the one shared gate in the store.
+  //
+  // Same shape as discard and leaking for the same reason: `spinDownAgentGit` is awaited BEFORE
+  // `removeAgent`, so any pane has already unmounted and its `perfEnd` found no trace to end.
+  it("leaves NO dangling close trace — the saved agent's pane was never mounted", async () => {
+    const pid = seedProject();
+    const id = seedBuild(pid, { bs: AHEAD, beadId: "bd-save" });
+
+    const r = await saveAgent(id);
+    expect(r.ok).toBe(true);
+
+    expect(useProjectStore.getState().projects[0]!.agents).toHaveLength(0);
+    // Narrowed for the same file-level reason as the discard case above — cross-test `spawn:` /
+    // `switch:` residue in a suite that never resets the trace map — and NOT because this path
+    // opens a `switch:` trace of its own; `saveAgent` never calls `selectAgent` either.
+    expect(openTraceKinds() ?? "").not.toContain("close");
   });
 
   // roborev 54225-2: the SAME principle ship got. A save's own sentence is "backed the branch up to

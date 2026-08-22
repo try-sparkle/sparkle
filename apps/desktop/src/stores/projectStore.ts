@@ -48,6 +48,7 @@ import {
 import { isDefaultModel } from "../services/models";
 import { clearPin } from "../services/accountStore";
 import { clearBrief } from "../services/agentBrief";
+import { isAgentPaneMounted } from "../services/agentPaneRegistry";
 import { usageTelemetry } from "../services/usageTelemetry";
 import { perfSpan, perfStart } from "../perfTrace";
 import { useUiStore } from "./uiStore";
@@ -2093,7 +2094,20 @@ export const useProjectStore = create<ProjectState>()(
       removeAgent: (projectId, agentId) => {
         // Close waterfall: from this removal to the pane's unmount cleanup (ended in AgentPane's
         // unmount, keyed "close:<id>") — captures the cost the user feels when closing an agent.
-        perfStart(`close:${agentId}`, "close");
+        //
+        // ONLY IF A PANE IS ACTUALLY MOUNTED TO END IT. `perfEnd("close:<id>")` in AgentPane's
+        // unmount cleanup is the sole remover, so starting this for a row with no pane leaks the
+        // entry for the life of the process — and `openTraceKinds()` then reports that ghost as an
+        // in-flight interaction on every subsequent jank stall (measured: `"during":"close×37"` on
+        // every stall line for hours). Panes mount lazily per project, so "was one ever opened?" is
+        // a real question with a real answer, and `agentPaneRegistry` is the pane telling us rather
+        // than a call site guessing. See that module for why this is NOT the `openAgentIds` test
+        // that was rightly rejected, and why gating here loses no waterfall that works today
+        // (bead sparkle-bxidpw, sparkle-vmfda).
+        //
+        // THIS IS THE BALANCE GUARANTEE, and it lives here so no future caller can forget it: every
+        // `close:` trace this store opens has a mounted pane committed to closing it.
+        if (isAgentPaneMounted(agentId)) perfStart(`close:${agentId}`, "close");
         set((s) => {
           // Closing a build agent also closes its workers (they belong to it). Their worktrees are
           // cleaned up separately by the caller for each removed id.
@@ -2415,6 +2429,32 @@ export const useProjectStore = create<ProjectState>()(
         if (get().projects.find((p) => p.id === projectId)?.selectedAgentId === agentId) return;
         // Switch waterfall: from this selection to the target pane actually painting (ended in
         // AgentPane's visibility effect, keyed "switch:<id>"). Only real selections, not deselects.
+        //
+        // NO `isAgentPaneMounted` GATE HERE, AND THAT IS A DECISION, NOT AN OVERSIGHT — the `close:`
+        // gate at `removeAgent` above is deliberately NOT mirrored onto this line. It was proposed
+        // (roborev 67320, 67348) on the correct observation that this trace has the identical
+        // shape: only a mounted `AgentPane` can end it (`settleSwitchTrace`), so a selection whose
+        // pane never mounts leaks an entry that `openTraceKinds()` then names on every later stall.
+        //
+        // WHY THE SAME GATE IS WRONG HERE. `close:` and `switch:` sit on opposite sides of the
+        // mount. A close happens to a pane that ALREADY EXISTS, so "is one mounted?" is answerable
+        // and the gate is strictly dominant. A switch is measured FROM the selection TO the pane
+        // painting — so on the cold path there is by definition no pane yet, and the gate would
+        // suppress precisely the switches worth measuring. Not a hypothetical: three call sites
+        // select BEFORE the pane can exist — `AgentSidebar`'s row activation (`selectAgent(...)`
+        // then `open(id)`, in that order), `landInAgent`, and `cloudAgents/create` on an id minted
+        // moments earlier. `agentReveal` calls `open()` first, but that is a store write whose
+        // React commit has not happened by the next statement, so it reads false too. A gate here
+        // would zero out the cold-switch distribution and leave only the warm re-selects.
+        //
+        // SO THE `switch:` EXPOSURE IS REAL AND STILL OPEN, tracked at `sparkle-sl3g` (the
+        // unbounded `traces` map — the general form) and `sparkle-5uuh` (this function's own
+        // start/settle asymmetry). The known leak path: `agentReveal` selects into a TORN-OUT
+        // project, whose panes `Workspace`'s `live` memo refuses to mount in this window, so
+        // nothing ever calls `settleSwitchTrace`. `workerSpawn.ts`'s spawn rollback is the same
+        // shape with no `open()` at all. A fix has to come from the settle side — a bound on the
+        // map, or a cancel of the outstanding switch when a newer selection supersedes it — not
+        // from refusing to start the trace.
         if (agentId) perfStart(`switch:${agentId}`, "switch");
         set((s) => ({
           projects: mapProject(s.projects, projectId, (p) => ({

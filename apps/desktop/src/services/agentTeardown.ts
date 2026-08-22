@@ -1,64 +1,62 @@
-// REMOVING A ROW OPENS A TRACE ONLY A PANE CAN CLOSE — so the sites where no pane exists must say so.
+// SUPPRESSING A CLOSE MEASUREMENT FOR A CLOSE THAT NEVER HAPPENED.
 //
-// `useProjectStore.removeAgent` unconditionally starts a `close:<id>` waterfall (projectStore.ts),
-// and its only remover is `perfEnd` in AgentPane's unmount cleanup. That is correct for the ordinary
-// close, where the row's pane is mounted and unmounts in response. It leaks everywhere a row is
-// removed WITHOUT a pane ever having mounted, and the entry is permanent: `openTraceKinds()` is the
-// jank monitor's only attribution channel on macOS WKWebView, so each leak misattributes every later
-// stall in the session, growing monotonically.
+// READ THIS FIRST, BECAUSE THIS FILE USED TO CLAIM THE OPPOSITE. It previously carried the whole
+// balance guarantee for `removeAgent`'s `close:<id>` trace, argued that only two call sites could
+// ever qualify, and recorded the leak at every other teardown site as "real, present, and unfixed"
+// (bead sparkle-vmfda). That is no longer where the guarantee lives, and THE `close:` DANGLE is no
+// longer present. `projectStore.removeAgent` now opens that trace ONLY while a pane is actually
+// mounted to end it, asking `services/agentPaneRegistry` — which the pane itself writes. The
+// balance is therefore structural and cannot be forgotten by a caller, which is what this file
+// could never achieve by asking each site to reason about it (bead sparkle-bxidpw).
+//
+// READ THAT AS `close:` AND NOTHING ELSE. Its sibling `switch:<id>` (`projectStore.selectAgent`) is
+// still ungated and still leaks into the SAME `during` attribution field, by the same mechanism —
+// only a mounted pane can end it. The registry gate is not the fix for it and would be wrong there;
+// the argument is at `selectAgent`, and the debt is `sparkle-sl3g` / `sparkle-5uuh`. So this file
+// no longer says the attribution channel is clean — it says one of its two producers is.
+//
+// WHY THE OLD ARGUMENT FAILED, KEPT BECAUSE IT IS STILL TRUE AND STILL WORTH KNOWING. The question
+// "will a surface exist to end this trace?" genuinely cannot be answered at `spinDownWorker`,
+// `closeBuildAgent`, `tearDownKeepingBranches`, `discardAgent` or `AgentSidebar`'s teardown: panes
+// mount lazily per project, so the answer turns on where the user has clicked this session, on
+// whether the project has been torn out into a satellite window, and — at the awaiting sites — on
+// whether the await lands before or after React commits. Every attempt to encode that as a rule at
+// the call site was wrong, three times, always in the costly direction (roborev 60130, 60142,
+// 60144). The resolution was not a better rule but a different question-asker: the PANE knows,
+// because it is the thing that mounted, so it records itself and the store looks it up.
+//
+// AND WHY THE STORE-LEVEL GATE THAT WAS REJECTED IS NOT THIS ONE. roborev 60088 proposed gating on
+// `runtimeStore.openAgentIds` and was correctly refused: every genuine close calls `close(id)`
+// BEFORE `removeAgent` precisely so the pane unmounts, so that flag reads false on exactly the paths
+// whose measurement is the point. The registry reads a different fact — whether React has COMMITTED
+// the unmount — which on the synchronous close paths it has not. See `agentPaneRegistry` for the
+// full argument that the gate is strictly dominant: it emits the waterfall in every case that emits
+// one today, and skips it in exactly the cases that leak today.
+//
+// SO WHAT IS LEFT FOR THIS HELPER. Not leak prevention — the store handles that. What remains is
+// suppressing a MEANINGLESS measurement: a spawn that failed and rolled back is not a close, and if
+// a pane did happen to mount before the rollback, the row's removal would unmount it and emit a
+// `close … (total)` waterfall for an interaction the user never performed. `perfCancel` drops it
+// silently. On the ordinary path for both callers no pane ever mounted, the store opened nothing,
+// and the `perfCancel` is a harmless no-op — belt and braces, deliberately.
 //
 // TWO CALLERS, AND ONLY TWO ON PURPOSE — `buildAgentSpawn`'s pre-launch teardown and `workerSpawn`'s
-// rollback. THE TEST FOR MEMBERSHIP IS THE OUTCOME, NOT ITS CAUSE: the site must be able to name why
-// NO PANE EVER MOUNTED for that row. There are two ways to earn that, and each caller uses a
-// different one — so neither "the throw is synchronous" nor "`open` never ran" is the rule, because
-// each is true of only one of them:
-//
-//   * `open` NEVER RAN — `workerSpawn`'s rollback. The row is added with `select: false` and
-//     `runtime.open(workerId)` first runs in `runSpawn`, which the rollback IS the failure to reach.
-//     It is not synchronous at all: it is reached from `catch` after `await prepareWorkerWorkspace` /
-//     `await writeWorkerManifest`, a real `git worktree` cut and many render commits later.
-//   * `open` RAN BUT NOTHING RENDERED — `buildAgentSpawn`. It really does call
-//     `runtime.open(id)`/`landInAgent`, which is why the teardown has to `close(id)` a few lines
-//     above its `removeAgentWithoutPane`. It qualifies because the whole `try` body is await-free, so
-//     the `catch` runs in the SAME TICK and React never rendered in between.
-//
-// Both halves are stated because a one-line rule has now been wrong here three times, each time in
-// the costly direction — a reader checks their site against a criterion that fits only the other
-// caller, concludes they do not qualify, and leaves a dangle this helper would have handled
-// (roborev 60130, 60142, 60144).
-//
-// THE DECISION CANNOT MOVE INTO THE STORE. `removeAgent` cannot decide this for itself, because the
-// genuine close paths deliberately `close()` BEFORE `removeAgent` precisely so the pane unmounts —
-// so any store-level test like "is the id still open?" reads false on exactly the paths whose
-// measurement is the point, and would suppress the waterfall everywhere (roborev 60088 proposed it).
-//
-// AND IT CANNOT BE EXTENDED TO THE OTHER TEARDOWN SITES, which is why they are not here. Asking
-// "will a surface still exist to end this?" is unanswerable at `spinDownWorker`, `closeBuildAgent`
-// and `AgentSidebar`'s teardown: it differs between the main and satellite windows (the satellite
-// mounts on `openAgentIds` alone, for a project that IS torn out and is NOT visited), and at the
-// awaiting sites it turns on whether the await lands before or after React commits. A guard
-// mirroring the main window's mount gate was written and REMOVED for that reason — guessing wrong in
-// the cancel direction deletes a LIVE trace and silently stops measuring closes, which is worse than
-// the dangle.
-//
-// SO THE DANGLE AT THOSE SITES IS REAL, PRESENT, AND UNFIXED — tracked in `sparkle-vmfda`, not
-// neutralised by anything here. A read-side age bound in `openTraceKinds` (ignore/prune stale
-// entries, making a missed cancel harmless everywhere) WAS attempted and rejected: a wall-clock
-// bound prunes the trace during precisely the long stall it exists to attribute, breaking
-// `perfTrace.jankLabel.test.ts`. A correct version must count RUNNING time, which `perfTrace`
-// already distinguishes for suspend — so it belongs in that module, and does not exist today.
+// rollback. THE TEST FOR MEMBERSHIP IS THE OUTCOME, NOT ITS CAUSE: the site must be a SPAWN that
+// failed, so that any close waterfall it produced would describe nothing. Do NOT add a genuine
+// teardown site here — those are real closes, and where their pane is mounted their waterfall is
+// wanted. There is no longer any cost to leaving them on plain `removeAgent`, which is the point.
 import { useProjectStore } from "../stores/projectStore";
 import { perfCancel } from "../perfTrace";
 
 /**
- * Remove an agent row whose pane never mounted, cancelling the `close:` trace `removeAgent` opens.
+ * Remove an agent row for a SPAWN THAT FAILED, suppressing any `close:` waterfall it would emit.
  *
- * Use this wherever a row is torn down without a live pane. Where a pane IS mounted, call
- * `removeAgent` directly — the unmount ends the trace and that measurement is the point.
+ * Use this only from spawn rollback paths. For a genuine teardown call `removeAgent` directly: the
+ * store opens a `close:` trace only when a mounted pane is there to end it, so nothing leaks, and
+ * where a pane IS mounted the measurement is the whole point.
  */
 export function removeAgentWithoutPane(projectId: string, agentId: string): void {
   useProjectStore.getState().removeAgent(projectId, agentId);
-  // AFTER, never before: `removeAgent` is what starts the trace.
+  // AFTER, never before: `removeAgent` is what would start the trace.
   perfCancel(`close:${agentId}`);
 }
-

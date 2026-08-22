@@ -26,7 +26,8 @@ import { useRuntimeStore } from "../stores/runtimeStore";
 import { useStaleBuildStore } from "./staleBuildService";
 import { useBeadsStore } from "../stores/beadsStore";
 import { spawnWorker, spinDownWorker, ladderGoalFor } from "./workerSpawn";
-import { __resetTracesForTest, openTraceKinds } from "../perfTrace";
+import { __resetTracesForTest, openTraceKinds, perfEnd } from "../perfTrace";
+import { registerMountedPane, unregisterMountedPane } from "./agentPaneRegistry";
 
 describe("spawnWorker", () => {
   beforeEach(() => {
@@ -500,12 +501,15 @@ describe("spawnWorker", () => {
 
   // A ROLLED-BACK WORKER MUST NOT LEAVE A PHANTOM `close:` TRACE (roborev 60088).
   //
-  // `removeAgent` opens `close:<id>` unconditionally, and its only remover is `perfEnd` in
-  // AgentPane's unmount cleanup. On this path the worker's pane NEVER mounted — the row is added
-  // with `select: false` and `runtime.open(workerId)` does not run until `runSpawn`, which is
-  // exactly what this rollback is the failure to reach. Left behind, the entry is reported by
-  // `openTraceKinds()` as an in-flight interaction on every later jank warning, growing by one per
-  // failed spawn — and fan-out reaches this path (worktree cut failures) far more often than the
+  // TWO THINGS KEEP THIS PATH CLEAN, and this test asserts the OUTCOME rather than either one, so
+  // it holds whichever is doing the work. `removeAgent` opens `close:<id>` only while a pane is
+  // mounted to end it (`services/agentPaneRegistry`), and on this path the worker's pane never
+  // mounted — the row is added with `select: false` and `runtime.open(workerId)` does not run until
+  // `runSpawn`, which is exactly what this rollback is the failure to reach. On top of that the
+  // rollback calls `removeAgentWithoutPane`, whose `perfCancel` suppresses a waterfall for a spawn
+  // that failed even if a pane HAD mounted during the awaits. Left open, such an entry is reported
+  // by `openTraceKinds()` as an in-flight interaction on every later jank warning, growing by one
+  // per failed spawn — and fan-out reaches this path (worktree cut failures) far more often than the
   // build-agent teardown where the same leak was first found.
   it("leaves no dangling close trace when the spawn rolls back", async () => {
     const store = useProjectStore.getState();
@@ -553,9 +557,23 @@ describe("spinDownWorker", () => {
     vi.restoreAllMocks(); // restore any vi.spyOn (e.g. runtime-store close) so it can't leak between tests
     useProjectStore.setState({ projects: [], selectedProjectId: null });
     useRuntimeStore.setState({ status: {}, openAgentIds: [], branchStatus: {} });
-    // The "a pane could end it" case below deliberately LEAVES `close:<id>` open, so without this
-    // it persists in the module-level map and poisons any later openTraceKinds() assertion — and
-    // the file's current order is the only reason it doesn't already (roborev 60107).
+    // LOAD-BEARING, and this comment used to claim the opposite ("hygiene only … a reset cannot
+    // manufacture its result", roborev 60107). That was true while the leak case asserted on
+    // `close` specifically; it stopped being true when the assertions were tightened to the WHOLE
+    // map, and both of this describe's trace assertions are now whole-map — the no-pane leak case's
+    // `expect(openTraceKinds()).toBeUndefined()` (`:782`) and the mounted-pane positive case's
+    // `expect(openTraceKinds()).toBe("close")` (`:817`); grep the assertions, not the line numbers,
+    // which rot every time this comment is edited (roborev 67483). `traces` is module-scoped
+    // (`perfTrace.ts:29`), so the `spawn:`/`switch:` residue the earlier `spawnWorker` describes
+    // leave behind would fail both. Remove this line
+    // and two tests go red — it is not decorative, and it must not be relocated or loosened away.
+    //
+    // WHAT IT COSTS, stated so the next reader can price it: a reset cannot mask a leak opened
+    // WITHIN one of these tests, which is the only window they claim about, but it does hide
+    // cross-test leakage from earlier describes. `conciergeTools/lifecycle.test.ts:944` answers the
+    // same question the OPPOSITE way on purpose — it never resets, and narrows its assertion
+    // instead, because there the whole-map emptiness across the file is the thing worth asserting.
+    // The two files are deliberately different; change one and read the other first.
     __resetTracesForTest();
     killPtyMock.mockReset();
     killPtyMock.mockResolvedValue(undefined);
@@ -712,6 +730,101 @@ describe("spinDownWorker", () => {
     });
     // Named, so the ledger records automation rather than reporting a human stop.
     expect(killPtyMock).toHaveBeenCalledWith(workerId, "worker-spin-down");
+  });
+
+  // PER-SITE LEAK COVERAGE — `spinDownWorker` (bead sparkle-bxidpw).
+  //
+  // One of four+ teardown sites that call `removeAgent`, each covered separately on purpose. The fix
+  // is a single gate in the store, so it would be easy to believe one test covers them all — but
+  // AGENTS.md's `sparkle-50m03` is exactly this trap: a shared fix goes vacuously green the moment
+  // ANY ONE site is covered, while a site that later grows its own `perfStart`, or stops routing
+  // through the store, silently regresses. Each site therefore states its own contract.
+  //
+  // This site is the one the ORCHESTRATOR drives on fan-out, so it is the highest-volume leaker in a
+  // real session: a build agent spinning down N workers removes N rows, and a worker's pane is very
+  // often never mounted (the project was never visited, or the row was closed from another window).
+  //
+  // Proving the waterfall SETTLES on a real React unmount needs a real pane and stays in
+  // `components/AgentPane.closeTrace.test.tsx`. What that file CANNOT cover is this site's ordering
+  // — it calls `removeAgent` directly and never drives `spinDownWorker` — so the positive half for
+  // THIS call site is the test below.
+  it("leaves NO dangling close trace when the worker's pane was never mounted", async () => {
+    const store = useProjectStore.getState();
+    const projectId = store.addProject("Demo", "/tmp/demo");
+    const buildId = store.addAgent(projectId, { kind: "build" })!;
+    store.setAgentWorktree(projectId, buildId, "/wt/build", "sparkle/agent-build1");
+    const workerId = store.addAgent(projectId, { kind: "worker", parentId: buildId })!;
+    store.setAgentWorktree(projectId, workerId, "/wt/w", "sparkle/agent-w");
+    // No pane is registered for this worker — the normal case for a spun-down worker, and the exact
+    // condition under which this site used to leak.
+
+    await spinDownWorker({ projectId, workerId });
+
+    // The row really is gone, so any `close` entry still open is a ghost, not a live interaction.
+    const agents = useProjectStore.getState().projects.find((p) => p.id === projectId)!.agents;
+    expect(agents.some((a) => a.id === workerId)).toBe(false);
+    // THE SIDE EFFECT: the exact string the jank monitor would print in its `during` field.
+    //
+    // `toBeUndefined()`, NOT a narrowed `.not.toContain("close")`. This assertion used to be the
+    // weaker form on the stated grounds that "this path also opens a `switch:` trace via the
+    // selection fallback" — which is false here, and reasoning from a mechanism that does not exist
+    // is how the next reader loosens the right assertion (roborev 67348, 67368). `spinDownWorker`
+    // never calls `selectAgent`: `reselectAfterClose` is a local of `AgentSidebar`, and
+    // `removeAgent` recomputes `selectedAgentId` inside its own `set` without touching `perfStart`.
+    // The only `selectAgent` in this FILE is the spawn rollback at `workerSpawn.ts:185`, in a
+    // different describe — and this describe's own `beforeEach` calls `__resetTracesForTest()`, so
+    // nothing carries in either way.
+    //
+    // The exact shape matters as much as the emptiness: the stall line embeds this value verbatim,
+    // so `undefined` is the pass and `""` would read as a real in-flight interaction with no name.
+    // Asserting it whole also catches a leak of ANY kind this path grows later — including a
+    // `switch:` one, which is precisely what the narrowed form could not have seen.
+    expect(openTraceKinds()).toBeUndefined();
+  });
+
+  // THE POSITIVE HALF OF THE PAIR, AT THIS CALL SITE (roborev 67368).
+  //
+  // The test above proves no trace is LEFT when no pane exists. On its own that is ambiguous: it
+  // passes just as well against a change that killed the waterfall everywhere, which is the worse
+  // failure — the instrument goes SILENT instead of noisy, and nothing else in the suite notices.
+  // `workerSpawn.ts` states the claim this pins in its own comment: this site keeps its waterfall
+  // because `close()` and `removeAgent()` run in the same tick, BEFORE the function's first
+  // `await`, so a mounted pane is still mounted when the store asks.
+  //
+  // SO THE PROMISE IS DELIBERATELY NOT AWAITED BEFORE THE ASSERTION. That is the whole test. Move
+  // `removeAgent` behind any await — `await kill`, `await removeAgentWorkspace`, the
+  // `terminateIfCloud` this family previously awaited — and the synchronous prefix no longer opens
+  // the trace, so this goes red while every leak assertion in the file stays green.
+  //
+  // `registerMountedPane` rather than a real `AgentPane`: this is a service suite with no React
+  // tree, and the fact under test is what the store's gate READS at this site. Settled by hand
+  // afterwards in the pane's own order (`perfEnd`, then deregister), so nothing is left behind.
+  it("keeps the close waterfall when the worker's pane IS mounted — opened before the first await", async () => {
+    const store = useProjectStore.getState();
+    const projectId = store.addProject("Demo", "/tmp/demo");
+    const buildId = store.addAgent(projectId, { kind: "build" })!;
+    store.setAgentWorktree(projectId, buildId, "/wt/build", "sparkle/agent-build1");
+    const workerId = store.addAgent(projectId, { kind: "worker", parentId: buildId })!;
+    store.setAgentWorktree(projectId, workerId, "/wt/w", "sparkle/agent-w");
+    // THE ONLY DIFFERENCE FROM THE TEST ABOVE — the world, not the call.
+    registerMountedPane(workerId);
+
+    const pending = spinDownWorker({ projectId, workerId });
+    try {
+      // BEFORE the await resolves: the synchronous prefix must already have dropped the row AND
+      // opened the trace. `toBe`, not `toContain` — this describe resets the trace map, so the
+      // whole `during` string is knowable and an extra kind appearing here is itself a finding.
+      expect(openTraceKinds()).toBe("close");
+      expect(
+        useProjectStore.getState().projects.find((p) => p.id === projectId)!.agents.some((a) => a.id === workerId),
+      ).toBe(false);
+    } finally {
+      await pending;
+      perfEnd(`close:${workerId}`, "unmounted");
+      unregisterMountedPane(workerId);
+    }
+    // Settled, not merely opened — so this test cannot become the residue the one above forbids.
+    expect(openTraceKinds()).toBeUndefined();
   });
 
   it("still removes the tab when killPty / removeAgentWorkspace reject", async () => {

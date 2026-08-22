@@ -26,6 +26,7 @@ mod beads_cmd;
 /// Recovering the paths of a drag whose Tauri event carried none — wry reads only the deprecated
 /// `NSFilenamesPboardType`, so a modern-only drag source drops silently. See the module docs.
 mod drag_paths;
+mod drag_watch;
 /// Opt-in tokenmaxxing (Builder Index) reporting — default-off, consent-gated (bead sparkle-s3g2.6).
 mod builder_index;
 mod straude;

@@ -1968,6 +1968,9 @@ async function tearDownKeepingBranches(project: Project, ids: string[]): Promise
     ids,
     deleteBranch: false,
   });
+  // Same shape as `closeBuildAgent`: the awaited git teardown above means any pane has already
+  // unmounted, so the `close:` trace `removeAgent` would have opened had nothing left to end it.
+  // The store's mounted-pane gate settles that (bead sparkle-bxidpw).
   useProjectStore.getState().removeAgent(project.id, ids[0]!);
 }
 
@@ -2062,6 +2065,8 @@ export async function discardAgent(
     ids,
     beadIds: destroyed.beadIds,
   });
+  // `discardAgentGit` was awaited above, so no pane survives to end a `close:` trace — see the note
+  // in `tearDownKeepingBranches`; the store's mounted-pane gate is what keeps this from leaking.
   useProjectStore.getState().removeAgent(project.id, agentId);
   // `agentName` — see the note on `spinDownWorkerAgent`'s reply. `destroyed` describes what was
   // torn down, not who; without the name the receipt reads "Closed that agent."

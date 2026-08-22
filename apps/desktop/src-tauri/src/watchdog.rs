@@ -20,14 +20,27 @@
 //! nothing the main thread does can stop it from writing.
 //!
 //! ── WHAT IT CAN AND CANNOT PROVE ──────────────────────────────────────────────────────────────
-//! It observes ONE thing: heartbeats from the webview stopped while this thread kept running. That
-//! is strong evidence of a blocked main thread but it is not proof, because on macOS the webview's
-//! JS runs in a separate WebContent process — so a dead, crashed, or reloading content process
-//! produces identical silence with a perfectly healthy main thread. The log lines are worded for
+//! Its primary observation is ONE thing: heartbeats from the webview stopped while this thread kept
+//! running. That is strong evidence of a blocked main thread but it is not proof, because on macOS
+//! the webview's JS runs in a separate WebContent process — so a dead, crashed, or reloading content
+//! process produces identical silence with a perfectly healthy main thread. The log lines are worded for
 //! what is actually observed ("no heartbeat for Xms") rather than asserting a diagnosis, and the
 //! restates back off exponentially so a permanently dead webview cannot fill the log with confident
 //! false claims for the life of the process. That matters: this log is what the next person reads
 //! to diagnose a real hang.
+//!
+//! ── AND WHY SILENCE ALONE IS NOT ENOUGH TO WATCH ──────────────────────────────────────────────
+//! Silence is a BINARY verdict at a five-second bar, and a whole family of hangs lives underneath
+//! it. Measured 2026-08-20: a user reported a 30-second unusable window and this module captured
+//! nothing, correctly — the UI stalled seven to thirteen times a minute, lost 2.6-4.7 seconds of
+//! every minute, and never once went quiet for the five seconds a report needs. Every instrument in
+//! the app read green while the app was unusable.
+//!
+//! So there is a SECOND trigger, in the same pure state machine, over the same capture machinery: a
+//! cumulative stall budget across a rolling ten-second window, fed by the aggregate `perfTrace.ts`
+//! was already computing and discarding. See `STALL_BUDGET_MS` for the measurement that sets the
+//! bar and for why it is a clustered window rather than a per-minute rate. It routes to the same
+//! visible pool, behind the same limiter, so it cannot evict the evidence it exists to add to.
 //!
 //! ── AND WHY THE CAPTURE HAS TO SAMPLE MORE THAN ONE PROCESS ───────────────────────────────────
 //! The paragraph above was written down and then not acted on, which cost the module most of its
@@ -56,17 +69,38 @@
 //! ── HOW IT TELLS A HANG FROM A SLEEPING MACHINE ───────────────────────────────────────────────
 //! This is the discrimination the webview cannot make (see the note above `startJankMonitor` in
 //! perfTrace.ts: on this platform `performance.now()` keeps advancing through App Nap and display
-//! sleep, so both of the webview's clocks agree in both cases). Here it is direct rather than
-//! inferred: a machine suspend freezes THIS thread too, so we watch our own tick.
+//! sleep, so both of the webview's clocks agree in both cases). Here we start from our own tick:
 //!
 //!   * our sleep took roughly as long as we asked  → we were running normally. If heartbeats also
 //!     stopped, something is genuinely wrong. REPORT.
-//!   * our sleep took far longer than we asked     → we were frozen alongside everything else, so
-//!     the missing heartbeats mean nothing. Rebaseline and stay quiet.
+//!   * our sleep took far longer than we asked     → ask a SECOND question, below.
 //!
-//! Measured in WALL time (`SystemTime`) on purpose. Whether a monotonic clock counts suspended time
-//! is platform- and clock-specific, and that ambiguity is exactly what this has to resolve; the wall
-//! clock always advances, so "how much real time passed during our sleep" has one answer.
+//! For a year that second line ended the reasoning: a long overshoot WAS a suspend, the episode was
+//! discarded, and nothing was written down. That inference is wrong, and it is wrong in the
+//! expensive direction. The overshoot measures how late THIS THREAD was scheduled, and a machine
+//! starved of CPU produces it identically to a machine that slept — so on a loaded box the guard
+//! granted amnesty to precisely the freezes it sits beneath. Measured on the reporting machine: load
+//! average 191-201 while nominally idle and 366-520 with agents running, against a five-second bar.
+//! On 2026-08-21 a 30-second TOTAL UI freeze produced no capture at all: the detector saw the gap,
+//! called it a suspend, and threw it away in silence (`sparkle-rlmsb4`).
+//!
+//! So a long overshoot now asks a second question, of a clock that can actually answer it.
+//! `mach_continuous_time()` counts the time a machine spends asleep and `mach_absolute_time()` does
+//! not, so their difference across our sleep is suspended time — measured, not inferred:
+//!
+//!   * the machine slept through it → we were frozen alongside everything else and the missing
+//!     heartbeats mean nothing. Rebaseline — and SAY SO, see `SUSPEND_LOG_MIN_INTERVAL`.
+//!   * the machine was awake        → this thread was STARVED. The freeze is real and the user sat
+//!     through it. Report it, and name starvation on the line, because the remedy is the host's load
+//!     rather than the app's code. See `SUSPEND_CONFIRM` and `machine_was_suspended`.
+//!
+//! The anti-phantom property is preserved exactly: a genuine lid-open still produces no report, and
+//! an UNREADABLE clock (off macOS, or a timebase we cannot fetch) falls back to the old inference
+//! rather than to reporting — a phantom multi-hour hang on every wake is the worse of the two errors.
+//!
+//! The overshoot itself is still measured in WALL time (`SystemTime`) on purpose: the wall clock
+//! always advances, so "how much real time passed during our sleep" has exactly one answer. The mach
+//! pair is what then attributes that time to sleep or to starvation.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -118,6 +152,73 @@ const HANG_AFTER: Duration = Duration::from_secs(5);
 /// covered; the 60s bar bought nothing and cost the dump budget.
 const HIDDEN_HANG_AFTER: Duration = Duration::from_secs(600);
 
+/// ── THE FOURTH HANG FAMILY: A SAWTOOTH THAT NEVER CROSSES THE BAR ─────────────────────────────
+/// How much of the rolling window below may be lost to main-thread stalls before that is itself a
+/// hang episode — with no single stall anywhere near `HANG_AFTER`.
+///
+/// WHY A SECOND TRIGGER EXISTS AT ALL. Everything above measures exactly ONE quantity — how long
+/// the heartbeat has been silent — and returns a binary verdict at a five-second bar. On
+/// 2026-08-20 a user reported a 30-second unusable window and this module captured NOTHING,
+/// correctly by every rule it had: the detector thread was alive (sampled live, 161 of 161 samples
+/// inside its own loop), no limiter was in force (the previous capture was NINE HOURS earlier), and
+/// the window was VISIBLE — the renderer's rAF monitor logged continuously through the whole window
+/// with `sinceMs` ≈ 60000 every minute, which a hidden, throttled webview cannot do — so the
+/// five-second bar applied. Nothing this module watches ever went silent for five seconds. What the
+/// log holds for that window instead is this, from the renderer's own rAF monitor:
+///
+///   jank stall        {ms:2049, win:"main"}
+///   jank minor stalls {count: 8, totalMs:2646, maxMs:610, sinceMs:60018}
+///   jank minor stalls {count: 7, totalMs:2813, maxMs:717, sinceMs:60004}
+///   jank minor stalls {count:13, totalMs:4681, maxMs:956, sinceMs:60286}
+///
+/// Seven to thirteen stalls a minute, 2.6-4.7 SECONDS of stall per minute, worst single block
+/// 2049ms — 41% of `HANG_AFTER`, so the silence bar could not have seen it however long the bad
+/// patch lasted. To the user that is an unusable app; to every instrument here it is green, by
+/// design. And the aggregate was already being COMPUTED and then thrown away: `perfTrace.ts`
+/// derives exactly the numbers above and logs them at info, and nothing acted on them.
+///
+/// ── WHY 4000ms, AND WHY OVER TEN SECONDS ──────────────────────────────────────────────────────
+/// The rate in those lines is 4.4%, 4.7% and 7.8% of their own minute. A bar at that rate is
+/// useless as a trigger, because that rate is ORDINARY here: `perfTrace.ts`'s own measurement is
+/// ~10.3k stalls a day at a median of 221ms — a stall every eight seconds around the clock — so
+/// minutes at 4-8% are what this app does when nothing is wrong. Set the bar there and it fires
+/// forever, and a trigger that fires forever deletes the evidence it exists to keep (see
+/// `MAX_HANG_DUMPS`).
+///
+/// What separates the reported window from ordinary jank is not the per-minute rate, it is
+/// CLUSTERING — and a sixty-second rollup is precisely the instrument that cannot see clustering.
+/// 4681ms spread evenly across a minute is a slightly janky minute; the same 4681ms arriving
+/// back-to-back is four seconds in ten during which the UI barely moves, which is what the user
+/// reported. So the window is TEN SECONDS (matching `perfTrace.ts`'s SUSPEND_MS, whose claim is
+/// that nothing this app does on the main thread lasts ten seconds) and the input is a per-heartbeat
+/// increment rather than the rollup line.
+///
+/// 4000ms of 10_000ms is then the number the measurement gives, from both sides:
+///   * the three rollups above, spread across their own minute, put at most 780ms into any
+///     ten-second slice — 5.1x under the bar, so the ordinary case cannot reach it;
+///   * those same stalls arriving inside one ten-second cluster are 4681ms, 47% of the window and
+///     over the bar — the case that must fire;
+///   * and nothing lower would separate the two, because sixty-second-uniform ordinary jank already
+///     reaches 7.8% and a 10% bar would fire on it.
+/// Reaching it takes two or more stalls at the observed maximum (2049ms), or a handful at the
+/// observed minor sizes (610-956ms). A single block big enough to reach it alone is already within
+/// a second of `HANG_AFTER`, which owns that case.
+const STALL_BUDGET_MS: u64 = 4_000;
+
+/// The rolling window the budget is measured over, in ticks. `TICK` is one second, so this is ten
+/// seconds — and the ring is exact rather than an approximation of a time span.
+const STALL_WINDOW_TICKS: usize = 10;
+
+/// Minimum wall time between two stall-budget reports.
+///
+/// Sixty seconds, which is `JANK_ROLLUP_MS` in `perfTrace.ts`: a sustained bad patch then emits one
+/// line here per rollup line there, so the two read side by side instead of one drowning the other.
+/// It must also be at least as long as the window, and it is by 6x — the ring holds only the last
+/// ten seconds, so by the time a report is one interval old there is no stall time left in the ring
+/// that it already reported. That is what keeps one bad patch from being counted twice, and it is
+/// why this needs no bookkeeping beyond a timestamp.
+const STALL_REPORT_MIN_INTERVAL: Duration = Duration::from_secs(60);
+
 /// First restate delay for an ongoing episode. Doubles each time (see `restate_delay_ms`).
 const RESTATE_EVERY: Duration = Duration::from_secs(10);
 
@@ -125,10 +226,48 @@ const RESTATE_EVERY: Duration = Duration::from_secs(10);
 /// proves it was STILL hung at T+60s — without a dead webview emitting a line forever at 10s.
 const RESTATE_MAX: Duration = Duration::from_secs(300);
 
-/// If our own tick overran by this much, we were not running either — a machine suspend, not a
-/// hang. Generously above scheduler jitter under heavy load; a real suspend overshoots by seconds
-/// to hours, so nothing lands near this boundary in practice.
+/// If our own tick overran by this much, we were not running either — so this tick is worth a
+/// second question before anything else is believed.
+///
+/// ── THIS USED TO BE THE WHOLE TEST, AND THAT COST A REAL HANG ─────────────────────────────────
+/// It read: "generously above scheduler jitter under heavy load; a real suspend overshoots by
+/// seconds to hours, so nothing lands near this boundary in practice." Both halves are false on a
+/// busy machine. The overshoot is how far OUR OWN `sleep(TICK)` overran, and a descheduled thread
+/// produces that exactly the way a suspended machine does; on the machine that reported the freeze
+/// the load average was 191-201 while nominally IDLE and 366-520 across 18 CPUs with agents
+/// running, so the bar sits BELOW that noise floor rather than above it. The consequence was
+/// `sparkle-rlmsb4`: a 30-second total UI freeze the detector observed, relabelled as a suspend,
+/// and discarded without a line.
+///
+/// So the constant no longer decides anything on its own — it SELECTS the ticks worth asking about,
+/// and `machine_was_suspended` answers, from a clock that can tell the two cases apart. Keeping it
+/// at five seconds is deliberate: a punctual tick must never pay for the second reading, and this
+/// is still far above ordinary jitter for the case where the reading is unavailable and the old
+/// inference is all we have.
 const SUSPEND_OVERSHOOT: Duration = Duration::from_secs(5);
+
+/// How much of our own sleep the MACHINE must have spent suspended before we believe it slept.
+///
+/// One second, and note that the two cases are not close to this line — they are at opposite ends
+/// of it. A genuine suspend counts seconds to hours of sleep; CPU starvation counts exactly ZERO,
+/// because `mach_continuous_time()` and `mach_absolute_time()` advance in lockstep for as long as
+/// the machine is awake, however badly this thread is being scheduled. The floor exists only so
+/// that reading the two clocks a few instructions apart (skew: nanoseconds) and macOS's brief dark
+/// wakes cannot be read as a lid-close. Nothing under a second of suspension could explain a
+/// five-second overshoot anyway, so there is no case this number has to adjudicate.
+const SUSPEND_CONFIRM: Duration = Duration::from_secs(1);
+
+/// Minimum wall time between two "declined to report a heartbeat gap" lines.
+///
+/// The suppression above used to be SILENT — no line, at any level, whatever size the gap was —
+/// and that is the second half of `sparkle-rlmsb4`: the one signal that would have exposed the
+/// guard misfiring, "I just threw away a thirty-second gap", did not exist anywhere to be read.
+/// It exists now, and this limiter is what keeps the fix from becoming a defect of its own. A
+/// laptop that sleeps nightly emits one line a night either way; the case that needs bounding is
+/// the FALLBACK path (`machine_was_suspended` with no reading available), which can rebaseline on
+/// many consecutive ticks under load. Sixty seconds, matching `STALL_REPORT_MIN_INTERVAL`, so the
+/// module's two rate-limited lines share one cadence.
+const SUSPEND_LOG_MIN_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Keep at most this many `sample(1)` dumps on disk. `retention.rs` only reaps `sparkle.log*`
 /// entries directly in the log dir and explicitly does not recurse, so nothing else would ever
@@ -436,10 +575,143 @@ fn maintain_renderer_tracking(last_beat_ms: u64, now_ms: u64) {
 
 /// Milliseconds since the epoch of the last heartbeat from the webview. `0` = none yet.
 static LAST_BEAT_MS: AtomicU64 = AtomicU64::new(0);
+/// Main-thread stall time (ms) the renderer has reported since the tick last drained this.
+///
+/// Written by `watchdog_heartbeat` (any thread), drained by the tick with a `swap`. An accumulator
+/// rather than a level, because beats and ticks are both ~1s and neither drives the other: a beat
+/// that lands twice between two ticks must ADD, or the stall it carried is silently dropped.
+static STALL_MS_SINCE_TICK: AtomicU64 = AtomicU64::new(0);
 /// The webview told us it went hidden. See `watchdog_heartbeat`.
 static HIDDEN: AtomicBool = AtomicBool::new(false);
 /// Set once the watchdog thread is running, so a second call cannot start a second one.
 static STARTED: AtomicBool = AtomicBool::new(false);
+
+/// The two mach clocks, declared here rather than taken from `libc`.
+///
+/// `libc` has `mach_absolute_time` but not `mach_continuous_time`, and its `mach_timebase_info` is
+/// deprecated in favour of a crate this app does not depend on — so taking half the pair from there
+/// would mean a deprecation warning and a second spelling of the same idea. All three are in
+/// libSystem, which is linked unconditionally, and `mach_continuous_time` has been there since
+/// macOS 10.12.
+#[cfg(target_os = "macos")]
+mod mach_clock {
+    /// `mach_timebase_info_data_t`: a tick is `numer / denom` nanoseconds. 1/1 on x86_64 and 125/3
+    /// on Apple silicon, which is why the raw tick counts below cannot be compared to a duration
+    /// without it.
+    #[repr(C)]
+    pub struct TimebaseInfo {
+        pub numer: u32,
+        pub denom: u32,
+    }
+
+    extern "C" {
+        /// Ticks since boot, EXCLUDING every interval the machine spent asleep.
+        pub fn mach_absolute_time() -> u64;
+        /// Ticks since boot, INCLUDING them.
+        pub fn mach_continuous_time() -> u64;
+        /// Non-zero on failure.
+        pub fn mach_timebase_info(info: *mut TimebaseInfo) -> i32;
+    }
+}
+
+/// Milliseconds the MACHINE has spent suspended since boot — or `None` if we cannot tell.
+///
+/// ── THE ONE ASYMMETRY THAT SEPARATES A SLEEPING MACHINE FROM A STARVED THREAD ─────────────────
+/// Everything else this thread can observe is symmetrical between the two. A suspend and a load
+/// spike both leave our own `sleep(TICK)` overrunning by seconds, and from inside a descheduled
+/// thread there is nothing in the wall clock, the heartbeat, or our own state that tells them
+/// apart — which is exactly how `sparkle-rlmsb4` stayed invisible. macOS has one asymmetry, and
+/// this is it: `mach_continuous_time()` keeps counting while the system sleeps and
+/// `mach_absolute_time()` does not, so their difference is total suspended time since boot and
+/// nothing else. Sampled either side of our sleep, the DELTA is how much of that sleep the machine
+/// spent suspended: essentially the whole overshoot for a lid-close, exactly zero for starvation.
+///
+/// Returned as an accumulator (since boot) rather than as a per-sleep figure so the caller takes
+/// one reading per tick and the subtraction happens in one place. Both clocks share a timebase, so
+/// differencing the TICKS first and converting once is what keeps this exact on Apple silicon,
+/// where a tick is 125/3 ns rather than 1.
+///
+/// `None` — off macOS, or an unreadable timebase — means "we could not take the reading", which
+/// `machine_was_suspended` deliberately resolves toward the old behaviour. See its note for why
+/// that direction is the safe one.
+#[cfg(target_os = "macos")]
+fn machine_slept_since_boot_ms() -> Option<u64> {
+    let mut tb = mach_clock::TimebaseInfo { numer: 0, denom: 0 };
+    // SAFETY: `mach_timebase_info` writes only through the pointer to our own stack slot and we act
+    // on its return code before reading the result; the two clock reads take no arguments and
+    // cannot fail.
+    let (absolute, continuous, numer, denom) = unsafe {
+        if mach_clock::mach_timebase_info(&mut tb) != 0 || tb.denom == 0 {
+            return None;
+        }
+        // ABSOLUTE FIRST. Continuous is then read a few nanoseconds LATER, so whatever skew comes
+        // from reading them non-atomically inflates the difference by that much rather than
+        // underflowing it — the direction that cannot manufacture a negative sleep.
+        let absolute = mach_clock::mach_absolute_time();
+        let continuous = mach_clock::mach_continuous_time();
+        (absolute, continuous, tb.numer, tb.denom)
+    };
+    Some(slept_ms_from_ticks(absolute, continuous, numer, denom))
+}
+
+/// Fold one raw pair of mach tick counts into milliseconds of counted sleep.
+///
+/// Split out, and deliberately NOT gated on macOS, because it holds the two things a test running
+/// on an awake machine cannot otherwise catch by observation — and both are silent when wrong:
+///
+///   * THE ORDER OF THE SUBTRACTION. Continuous minus absolute. Reversed, it saturates to zero on
+///     every reading, which reads as "the machine has never slept" and turns every lid-open back
+///     into a reported hang. While the machine is awake both orders give zero, so only a fixture
+///     with a known-slept pair can tell them apart.
+///   * THE TIMEBASE. A tick is `numer / denom` nanoseconds: 1/1 on x86_64 but 125/3 on Apple
+///     silicon, where dropping the conversion under-reports sleep by 41x and puts an hour of
+///     lid-close under the one-second bar.
+///
+/// Ticks difference FIRST, then one conversion — the two clocks share a timebase, so converting
+/// each separately would round twice for no reason.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn slept_ms_from_ticks(absolute: u64, continuous: u64, numer: u32, denom: u32) -> u64 {
+    if denom == 0 {
+        return 0;
+    }
+    let ticks = u128::from(continuous.saturating_sub(absolute));
+    (ticks * u128::from(numer) / u128::from(denom) / 1_000_000) as u64
+}
+
+#[cfg(not(target_os = "macos"))]
+fn machine_slept_since_boot_ms() -> Option<u64> {
+    None
+}
+
+/// Did the MACHINE sleep through our overrun, or was this thread merely starved of CPU?
+///
+/// Pure and separate from `step` so the FALLBACK direction is assertable on its own. `None` is the
+/// reading we could not take, and it resolves to "suspended" — today's behaviour — because the two
+/// errors are nothing like symmetric. Calling a suspend a hang files a phantom multi-hour freeze on
+/// EVERY lid-open, floods the visible dump pool and evicts the real evidence with it; calling a
+/// starvation a suspend loses one report. The anti-phantom property is the one thing this module
+/// cannot trade away, so an unknown reading keeps it.
+/// Fold the two readings taken either side of our sleep into "how long the machine slept during
+/// it".
+///
+/// `None` if EITHER end is missing, never a half-reading — and that is the assertion, not defensive
+/// habit. A delta against a missing endpoint would arrive as a confident `Some(0)`, which
+/// `machine_was_suspended` reads as "the machine was AWAKE" and which therefore reports a phantom
+/// multi-hour hang on every lid-open: the exact regression this whole change is written not to
+/// cause. Pure and lifted out of the loop so that direction is reachable from a test.
+fn machine_slept_during(before: Option<u64>, after: Option<u64>) -> Option<u64> {
+    match (before, after) {
+        (Some(a), Some(b)) => Some(b.saturating_sub(a)),
+        _ => None,
+    }
+}
+
+fn machine_was_suspended(machine_slept_ms: Option<u64>) -> bool {
+    match machine_slept_ms {
+        Some(ms) => ms >= SUSPEND_CONFIRM.as_millis() as u64,
+        None => true,
+    }
+}
 
 fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
@@ -455,8 +727,24 @@ fn now_ms() -> u64 {
 /// occluded WKWebView has its timers throttled hard, so silence there has an innocent explanation
 /// that needs room — but only room, not amnesty; see `HIDDEN_HANG_AFTER`. The frontend sends a beat
 /// with `hidden: true` on `visibilitychange`, before the throttling lands.
+/// `stalled_ms` is how much main-thread time the renderer lost to stalls since its last beat — the
+/// SAME quantity `perfTrace.ts` already sums into its `jank stall` / `jank minor stalls` lines, fed
+/// here rather than recomputed, so there is one definition of a stall instead of two that drift. It
+/// is what `STALL_BUDGET_MS` is measured against.
+///
+/// OPTIONAL ON PURPOSE, and this is not defensive habit — it is the one shape of this change that
+/// could take the whole instrument down. A Tauri command whose argument fails to deserialize
+/// returns an error, the frontend's `.catch(() => {})` swallows it, and the beat is never recorded;
+/// a webview beating without this field would therefore look PERMANENTLY SILENT and file a hang
+/// every five seconds forever. `None` reads as "this beat carries no stall accounting", which is
+/// exactly what an older or non-instrumented webview means.
 #[tauri::command]
-pub fn watchdog_heartbeat(hidden: bool) {
+pub fn watchdog_heartbeat(hidden: bool, stalled_ms: Option<u64>) {
+    if let Some(ms) = stalled_ms {
+        if ms > 0 {
+            STALL_MS_SINCE_TICK.fetch_add(ms, Ordering::Relaxed);
+        }
+    }
     HIDDEN.store(hidden, Ordering::Relaxed);
     LAST_BEAT_MS.store(now_ms(), Ordering::Relaxed);
 }
@@ -470,6 +758,16 @@ pub struct TickInput {
     /// Epoch ms of the last heartbeat; `0` means none has ever arrived.
     pub last_beat_ms: u64,
     pub hidden: bool,
+    /// Main-thread stall time the renderer reported since our last tick — see `STALL_BUDGET_MS`.
+    /// Always `0` when no beat arrived, which is why silence and sawtooth never contest each other.
+    pub stall_ms: u64,
+    /// How much of our own sleep the MACHINE spent suspended, in ms; `None` = we could not tell.
+    ///
+    /// Passed IN exactly the way `overshoot_ms` is, rather than read inside `step`, because that is
+    /// what makes the headline pair of this fix writable at all: the same large overshoot with two
+    /// different readings has to produce two different verdicts, and a `step` that called the clock
+    /// itself could be driven to only one of them. See `machine_slept_since_boot_ms`.
+    pub machine_slept_ms: Option<u64>,
 }
 
 /// The watchdog's carried state between ticks.
@@ -490,6 +788,23 @@ pub struct WatchdogState {
     /// Has this episode already produced a stack? An episode that has NOT is still owed one, and
     /// `Restate` will ask again — see `Effect::Restate { wants_stack }`.
     captured: bool,
+    /// The rolling stall window: one bucket per tick, oldest overwritten. See `STALL_BUDGET_MS`.
+    ///
+    /// A ring rather than a timestamped list because a tick is a fixed second and the whole point is
+    /// to bound what this thread costs: summing ten `u32`s per second is free, and a `Copy` state
+    /// keeps `step` the pure, cheaply-cloneable function every test here drives.
+    stall_ring: [u32; STALL_WINDOW_TICKS],
+    /// Next bucket to write.
+    stall_next: usize,
+    /// Epoch ms of our last stall-budget report; `0` = none. See `STALL_REPORT_MIN_INTERVAL`.
+    last_stall_report_ms: u64,
+    /// Epoch ms of our last "declined to report a gap" line; `0` = none. See
+    /// `SUSPEND_LOG_MIN_INTERVAL`.
+    ///
+    /// Deliberately CARRIED ACROSS the two `*state = default()` resets below. It describes the log,
+    /// not an episode, and a limiter that any state reset silently clears is not a limiter — the
+    /// suspend path resets on every rebaseline, which is precisely when it is consulted.
+    last_suspend_log_ms: u64,
 }
 
 /// What a tick decided to do.
@@ -502,9 +817,23 @@ pub enum Effect {
     /// Carries the value rather than leaving the loop to reach for `now` itself: the store is the
     /// guard against a phantom hang on every lid-open, and as an implicit convention it was
     /// unreachable from any test. See `apply_baseline`.
-    Rebaseline { new_last_beat_ms: u64 },
+    ///
+    /// `discarded_gap_ms` is the heartbeat gap this tick is throwing away, and `announce` whether to
+    /// write a line about it. Both exist because this path used to be entirely SILENT, which is how
+    /// `sparkle-rlmsb4` survived a year of logs nobody could fault. The rate-limit decision is made
+    /// HERE rather than in the loop so it stays inside the pure state machine, where a test can
+    /// drive the second suppression inside a minute and assert that it says nothing.
+    Rebaseline { new_last_beat_ms: u64, discarded_gap_ms: u64, announce: bool },
     /// Heartbeats have stopped for `stalled_ms`. First line of an episode.
-    ReportNew { stalled_ms: u64, hidden: bool },
+    ///
+    /// `starved_ms` is non-zero only when this tick reached the `SUSPEND_OVERSHOOT` bar and the
+    /// machine was demonstrably AWAKE for it: our own sleep overran by that much because the
+    /// scheduler never ran us, so the process was starved of CPU rather than the main thread being
+    /// blocked on something. It is carried on the OPENING line and not on the restates because the
+    /// verdict belongs to the episode, is written once where a reader meets it first, and a restate
+    /// that repeated it would say nothing the open did not — while every restate literal in the
+    /// suite would have to grow a field that is only ever incidental to the tick that emitted it.
+    ReportNew { stalled_ms: u64, hidden: bool, starved_ms: u64 },
     /// Still silent. `stalled_ms` is measured from when the beats stopped, not from the last line.
     ///
     /// `wants_stack` is true while this episode has not managed a capture yet. It is the fix for a
@@ -515,6 +844,14 @@ pub enum Effect {
     /// `hidden` is not decoration here — it is the difference between an eight-hour wedge and an
     /// eight-hour cmd-tab, which are otherwise byte-for-byte identical on this line.
     Recovered { hung_for_ms: u64, hidden: bool },
+    /// The heartbeat never went silent long enough to trip `HANG_AFTER`, and the UI still lost
+    /// `stalled_ms` of the last `window_ms` to main-thread stalls. The fourth hang family — see
+    /// `STALL_BUDGET_MS` for the measurement that sets the bar.
+    ///
+    /// Carries no `hidden`: it is only ever emitted for a VISIBLE window (rAF, and therefore the
+    /// stall accounting, is paused while hidden), so its evidence always belongs to the visible
+    /// pool — see `capture_for`.
+    StallBudget { stalled_ms: u64, window_ms: u64 },
 }
 
 /// Is this episode strong enough evidence to shout about?
@@ -578,7 +915,7 @@ fn may_capture(last_capture_ms: u64, now_ms: u64, min_interval_ms: u64) -> bool 
 /// Extracted so it is reachable from a test. Deleting the store leaves every lid-open filing a
 /// phantom `ReportNew`, and against a `static` inside the loop nothing could catch that.
 fn apply_baseline(last_beat: &AtomicU64, effect: &Effect) {
-    if let Effect::Rebaseline { new_last_beat_ms } = effect {
+    if let Effect::Rebaseline { new_last_beat_ms, .. } = effect {
         last_beat.store(*new_last_beat_ms, Ordering::Relaxed);
     }
 }
@@ -589,6 +926,65 @@ fn apply_baseline(last_beat: &AtomicU64, effect: &Effect) {
 /// limiter may refuse, the dump dir may be missing), and `step` is pure.
 pub fn note_captured(state: &mut WatchdogState) {
     state.captured = true;
+}
+
+/// Fold one tick's reported stall time into the rolling window, dropping the oldest bucket.
+///
+/// Called on EVERY tick that could have observed anything, including ticks that go on to report or
+/// restate a silence episode — a window with holes in it is not a window, and the hole would always
+/// be the interesting part.
+fn push_stall(state: &mut WatchdogState, stall_ms: u64) {
+    // Saturating rather than wrapping: a beat carrying an implausible number (a clock step on the
+    // renderer side) must read as "a very bad second", never as a near-zero one.
+    state.stall_ring[state.stall_next] = stall_ms.min(u32::MAX as u64) as u32;
+    state.stall_next = (state.stall_next + 1) % STALL_WINDOW_TICKS;
+}
+
+/// Total stall time currently inside the rolling window.
+fn stall_in_window(state: &WatchdogState) -> u64 {
+    state.stall_ring.iter().map(|&ms| ms as u64).sum()
+}
+
+/// Where an effect's evidence goes: `Some(hidden_pool)`, or `None` for an effect that owes no stack.
+///
+/// Extracted from the loop so the WIRING is assertable rather than promised. "The new trigger reuses
+/// the existing capture path, its two-pool routing and its rate limiter" is a claim about this one
+/// function: a future trigger that quietly grew a third pool or its own limiter would have to change
+/// it here, where a test can see it. Inside the loop's match arms it was reachable from nothing.
+fn capture_for(effect: &Effect) -> Option<bool> {
+    match effect {
+        // A STARVED episode (`starved_ms > 0`) lands here too, and it goes to the VISIBLE pool
+        // deliberately. The discounted hidden pool is for evidence that is WEAK — a hidden webview's
+        // silence has a documented innocent explanation — and a starvation freeze is not that: the
+        // freeze is confirmed, only its CAUSE is in question. Routing it to a three-file pool on a
+        // thirty-minute floor would also make it evict the backgrounded-wedge stacks that pool
+        // exists for, i.e. re-create `sparkle-rlmsb4` in a quieter form. And the stack is still
+        // worth taking even though a starved machine parks every thread: "starved" is what we can
+        // prove about OUR thread, never about the main thread, and a genuine lock-wedge that
+        // coincides with a load spike is exactly the case where losing the stack is unrecoverable —
+        // the log line says starvation was in play so a reader knows to discount a dump in which
+        // everything looks parked. If a load storm ever does churn `MAX_HANG_DUMPS`, the fix is a
+        // starvation-specific floor beside `VISIBLE_CAPTURE_MIN_INTERVAL`, not a third pool.
+        Effect::ReportNew { hidden, .. } => Some(*hidden),
+        // PERSISTENCE EARNS THE STACK: an episode refused at open keeps asking. See `Restate`.
+        Effect::Restate { hidden, wants_stack: true, .. } => Some(*hidden),
+        // The VISIBLE pool, deliberately: this is a visible-window event, and routing it anywhere
+        // else would either evict hidden evidence or invent a third budget.
+        Effect::StallBudget { .. } => Some(false),
+        _ => None,
+    }
+}
+
+/// Does this effect belong to a silence episode — i.e. may a capture taken for it mark that episode
+/// as having got its stack?
+///
+/// A stall-budget report is NOT an episode: it opens nothing and never recovers. Marking `captured`
+/// from one would set an episode flag while no episode is open. The cost today is bounded, because
+/// `ReportNew` clears the flag when the next episode opens — but the flag would then mean two
+/// things, and it exists to answer exactly one question, the one `Restate` asks with it: does THIS
+/// episode still owe a stack?
+fn capture_satisfies_episode(effect: &Effect) -> bool {
+    matches!(effect, Effect::ReportNew { .. } | Effect::Restate { .. })
 }
 
 /// How long to wait before the Nth restate. Exponential, capped — see `RESTATE_MAX`.
@@ -604,20 +1000,57 @@ fn restate_delay_ms(restates: u32) -> u64 {
 /// Order matters. The suspend check short-circuits first: if the machine slept, every other input
 /// this tick is meaningless (of course there were no heartbeats — nothing was running), and treating
 /// that as a hang would report a phantom freeze on every lid-open.
+///
+/// But it short-circuits on TWO facts now, not one — our tick overran AND the machine really slept
+/// through it. With only the first, everything downstream of here was unreachable on a loaded
+/// machine, the stall-budget trigger included: a load spike overshoots our sleep exactly the way a
+/// suspend does, so the amnesty landed on the freezes rather than on the wakes. See
+/// `machine_was_suspended` and `SUSPEND_OVERSHOOT`.
 pub fn step(state: &mut WatchdogState, input: TickInput) -> Effect {
-    if input.overshoot_ms >= SUSPEND_OVERSHOOT.as_millis() as u64 {
+    let overran = input.overshoot_ms >= SUSPEND_OVERSHOOT.as_millis() as u64;
+    if overran && machine_was_suspended(input.machine_slept_ms) {
+        // The gap we are declining to report. This is the number whose absence from every log is
+        // the reason this defect went a year undetected — see `SUSPEND_LOG_MIN_INTERVAL`. Zero when
+        // nothing has ever beaten, because `now - 0` is "milliseconds since 1970", not a gap.
+        let discarded_gap_ms = if input.last_beat_ms == 0 {
+            0
+        } else {
+            input.now_ms.saturating_sub(input.last_beat_ms)
+        };
+        let announce = may_capture(
+            state.last_suspend_log_ms,
+            input.now_ms,
+            SUSPEND_LOG_MIN_INTERVAL.as_millis() as u64,
+        );
+        // Read BEFORE the reset below, which is the whole reason this is spelled out rather than
+        // folded into the struct literal.
+        let last_suspend_log_ms = if announce { input.now_ms } else { state.last_suspend_log_ms };
         // Clearing the episode is not housekeeping. Leaving it open keeps a `hang_started_ms` from
         // before the sleep, so the next in-threshold tick emits a `Recovered` spanning the whole
         // machine suspend — the phantom multi-hour hang this branch exists to prevent, re-entering
         // through the recovery line instead of the report line.
-        *state = WatchdogState::default();
-        return Effect::Rebaseline { new_last_beat_ms: input.now_ms };
+        *state = WatchdogState { last_suspend_log_ms, ..WatchdogState::default() };
+        return Effect::Rebaseline {
+            new_last_beat_ms: input.now_ms,
+            discarded_gap_ms,
+            announce,
+        };
     }
+    // FALLING THROUGH WITH A LARGE OVERSHOOT IS THE FIX. The machine was demonstrably awake, so
+    // nothing excuses the missing heartbeats and every rule below applies to them exactly as it
+    // would to a punctual tick — including the stall-budget trigger, which sits downstream of here
+    // and was therefore just as suppressed. `starved_ms` carries the observation onto the line we
+    // write, because the user's remedy for a starved freeze (the host's load) is not the remedy for
+    // a blocked main thread, and the two are indistinguishable in the log without it.
+    let starved_ms = if overran { input.overshoot_ms } else { 0 };
     // Silence from something that has never spoken is not evidence of anything: the webview has not
     // booted yet, or this build predates the frontend half.
     if input.last_beat_ms == 0 {
         return Effect::Quiet;
     }
+    // BEFORE any branch below can return. The window has to be continuous to mean anything, and the
+    // ticks most likely to be skipped by a later-placed fold are the ones inside a bad patch.
+    push_stall(state, input.stall_ms);
     let stalled_ms = input.now_ms.saturating_sub(input.last_beat_ms);
     let threshold =
         if input.hidden { HIDDEN_HANG_AFTER.as_millis() } else { HANG_AFTER.as_millis() } as u64;
@@ -641,8 +1074,43 @@ pub fn step(state: &mut WatchdogState, input: TickInput) -> Effect {
             // and a beat that would change visibility mid-episode is itself a beat, so it ends the
             // episode through this same branch rather than changing anything under it.
             let hidden = state.hidden;
-            *state = WatchdogState::default();
+            // Clearing the state also clears the stall ring, and that is load-bearing rather than
+            // incidental: the beat that ENDS a silence episode carries the whole block's stall time
+            // in one bucket, so keeping it would have the sawtooth trigger re-report, seconds later,
+            // the very wedge the silence trigger just reported in full. The silence path owns that
+            // time; the ring starts again from the recovery.
+            // `last_suspend_log_ms` survives, for the reason given on the field: it bounds a log
+            // line, not an episode, so an episode ending must not hand the next suspend a fresh
+            // budget.
+            *state = WatchdogState {
+                last_suspend_log_ms: state.last_suspend_log_ms,
+                ..WatchdogState::default()
+            };
             return Effect::Recovered { hung_for_ms, hidden };
+        }
+        // ── THE SECOND TRIGGER ────────────────────────────────────────────────────────────────
+        // Beats are current and no episode is open — every rule above says this app is healthy. It
+        // is not, if it has been losing most of its seconds to blocks too short to be noticed one at
+        // a time. See `STALL_BUDGET_MS` for the measured window this exists for.
+        //
+        // Only while VISIBLE: rAF is paused behind a hidden window, so the renderer accrues no stall
+        // time there and a budget evaluated then could only ever act on accounting from before the
+        // occlusion. That is `HIDDEN_HANG_AFTER`'s territory, not this one's.
+        if !input.hidden {
+            let stalled_in_window = stall_in_window(state);
+            if stalled_in_window >= STALL_BUDGET_MS
+                && may_capture(
+                    state.last_stall_report_ms,
+                    input.now_ms,
+                    STALL_REPORT_MIN_INTERVAL.as_millis() as u64,
+                )
+            {
+                state.last_stall_report_ms = input.now_ms;
+                return Effect::StallBudget {
+                    stalled_ms: stalled_in_window,
+                    window_ms: STALL_WINDOW_TICKS as u64 * TICK.as_millis() as u64,
+                };
+            }
         }
         return Effect::Quiet;
     }
@@ -656,7 +1124,7 @@ pub fn step(state: &mut WatchdogState, input: TickInput) -> Effect {
         state.restates = 0;
         state.hidden = input.hidden;
         state.captured = false;
-        return Effect::ReportNew { stalled_ms, hidden: input.hidden };
+        return Effect::ReportNew { stalled_ms, hidden: input.hidden, starved_ms };
     }
 
     if input.now_ms.saturating_sub(state.last_report_ms) >= restate_delay_ms(state.restates) {
@@ -682,16 +1150,27 @@ pub fn start<R: Runtime>(app: &AppHandle<R>) {
         let mut state = WatchdogState::default();
         loop {
             let before = now_ms();
+            // Taken as TIGHT around the sleep as the wall reading, and for the same reason: this
+            // pair is what attributes the overshoot to a sleeping machine rather than to a starved
+            // thread, so any work between the reading and the sleep is time it cannot account for.
+            let slept_before = machine_slept_since_boot_ms();
             std::thread::sleep(TICK);
             let after = now_ms();
+            let slept_after = machine_slept_since_boot_ms();
             // Saturating: a wall clock can step backwards (NTP), and a negative overshoot must read
             // as "no overshoot" rather than wrapping into a huge one that fakes a suspend.
             let overshoot = after.saturating_sub(before).saturating_sub(TICK.as_millis() as u64);
+            let machine_slept_ms = machine_slept_during(slept_before, slept_after);
             let input = TickInput {
                 now_ms: after,
                 overshoot_ms: overshoot,
                 last_beat_ms: LAST_BEAT_MS.load(Ordering::Relaxed),
                 hidden: HIDDEN.load(Ordering::Relaxed),
+                // DRAINED, not read. Whatever the renderer reported since the last tick belongs to
+                // exactly one bucket of the rolling window; leaving it in place would let one bad
+                // second be counted by every tick until the next beat overwrote it.
+                stall_ms: STALL_MS_SINCE_TICK.swap(0, Ordering::Relaxed),
+                machine_slept_ms,
             };
 
             // Identify (and keep identifying) this app's WebContent processes, so a capture can
@@ -699,19 +1178,53 @@ pub fn start<R: Runtime>(app: &AppHandle<R>) {
             // set is known this shells out at most once every `RENDERER_RECHECK`.
             maintain_renderer_tracking(input.last_beat_ms, input.now_ms);
 
-            match step(&mut state, input) {
+            let effect = step(&mut state, input);
+            match effect {
                 Effect::Quiet => {}
-                effect @ Effect::Rebaseline { .. } => {
+                Effect::Rebaseline { discarded_gap_ms, announce, .. } => {
                     // Without this the first tick after a wake sees a heartbeat as old as the whole
                     // suspend and reports a hang that never happened.
                     apply_baseline(&LAST_BEAT_MS, &effect);
+                    // ── AND SAY THAT WE DID ──────────────────────────────────────────────────
+                    // This path discarded a heartbeat gap of ANY size and wrote nothing, at any
+                    // level. That silence is the second half of `sparkle-rlmsb4`: with the guard
+                    // misfiring on every load spike, the one line that would have shown it — "I
+                    // declined to report a thirty-second gap" — existed in no log anyone could read.
+                    // INFO rather than WARN, because on the macOS path this now fires only for a
+                    // clock-confirmed suspend, which is not a fault and must not read as one; the
+                    // fields are what make it worth having, since `machine_slept_ms` ≈
+                    // `overshoot_ms` is the proof the discrimination actually ran.
+                    if announce {
+                        tracing::info!(
+                            target: "watchdog",
+                            discarded_gap_ms,
+                            overshoot_ms = input.overshoot_ms,
+                            machine_slept_ms = ?input.machine_slept_ms,
+                            "the machine slept through our own tick; discarding the heartbeat gap rather than reporting a hang"
+                        );
+                    }
                 }
-                Effect::ReportNew { stalled_ms, hidden } => {
+                Effect::ReportNew { stalled_ms, hidden, starved_ms } => {
                     // Worded for what is OBSERVED, not for a diagnosis we cannot prove: on macOS the
                     // webview runs in its own process, so a dead/reloading content process makes
                     // identical silence with a healthy main thread. Written while the app is still
                     // hung, which is the whole point — everything else could only speak afterwards.
-                    if is_reportable_evidence(hidden) {
+                    if is_reportable_evidence(hidden) && starved_ms > 0 {
+                        // A STARVED freeze, and the line says so on purpose. Our own sleep overran
+                        // by `starved_ms` while the machine was awake, so this thread was
+                        // descheduled alongside the main thread and the whole process was starved of
+                        // CPU. The freeze is real — the user sat through it — but the remedy is the
+                        // host's load, and a reader who is not told that goes looking for a lock
+                        // that was never held. It is also the case to read a captured stack most
+                        // carefully in: everything will look parked, because everything was.
+                        tracing::warn!(
+                            target: "watchdog",
+                            stalled_ms,
+                            hidden,
+                            starved_ms,
+                            "no heartbeat from the webview, and our own watchdog tick overran while the machine was AWAKE — this process was starved of CPU; the freeze is real but its cause is host load rather than necessarily a blocked main thread; capturing stack"
+                        );
+                    } else if is_reportable_evidence(hidden) {
                         tracing::warn!(
                             target: "watchdog",
                             stalled_ms,
@@ -723,24 +1236,12 @@ pub fn start<R: Runtime>(app: &AppHandle<R>) {
                             target: "watchdog",
                             stalled_ms,
                             hidden,
+                            starved_ms,
                             "no heartbeat from a HIDDEN webview — expected while backgrounded (throttled timers), but capturing a stack in case it is a backgrounded wedge"
                         );
                     }
-                    // BOTH cases capture — into separate pools, so a cmd-tab can never evict a
-                    // visible hang's stack and a backgrounded wedge is never left without evidence.
-                    // Hidden captures are additionally rate-limited: the pool bounds files kept, not
-                    // the five-second whole-process `sample` run itself. See `may_capture_hidden`.
-                    if try_capture(
-                        hangs_dir.as_deref(),
-                        hidden,
-                        after,
-                        &LAST_VISIBLE_CAPTURE_MS,
-                        &LAST_HIDDEN_CAPTURE_MS,
-                    ) {
-                        note_captured(&mut state);
-                    }
                 }
-                Effect::Restate { stalled_ms, hidden, wants_stack } => {
+                Effect::Restate { stalled_ms, hidden, .. } => {
                     if is_reportable_evidence(hidden) {
                         tracing::warn!(
                             target: "watchdog",
@@ -754,29 +1255,6 @@ pub fn start<R: Runtime>(app: &AppHandle<R>) {
                             hidden,
                             "still no heartbeat from a hidden webview"
                         );
-                    }
-                    // PERSISTENCE EARNS THE STACK. If this episode was refused a capture when it
-                    // opened — the rate limiter had just been spent, most likely by an ordinary
-                    // cmd-tab — ask again now. Without this the refusal was PERMANENT for the
-                    // episode, because `ReportNew` fires exactly once, so a benign backgrounding
-                    // could spend the slot a real wedge needed and the wedge would end with an
-                    // `info` line and no evidence. Persisting is precisely what a wedge does and a
-                    // cmd-tab does not, so retrying here spends the budget on the right event.
-                    //
-                    // This is now load-bearing for VISIBLE episodes too, which is what keeps
-                    // `VISIBLE_CAPTURE_MIN_INTERVAL` from being a way to lose stacks: an episode
-                    // refused because a duplicate detection 10s earlier spent the floor keeps
-                    // asking, and gets its stack as soon as the floor expires.
-                    if wants_stack
-                        && try_capture(
-                        hangs_dir.as_deref(),
-                        hidden,
-                        after,
-                        &LAST_VISIBLE_CAPTURE_MS,
-                        &LAST_HIDDEN_CAPTURE_MS,
-                    )
-                    {
-                        note_captured(&mut state);
                     }
                 }
                 Effect::Recovered { hung_for_ms, hidden } => {
@@ -798,6 +1276,46 @@ pub fn start<R: Runtime>(app: &AppHandle<R>) {
                         );
                     }
                 }
+                Effect::StallBudget { stalled_ms, window_ms } => {
+                    // WARN, like a visible silence episode, and for the same reason: the window this
+                    // describes is one the user experiences as an unusable app. The wording says what
+                    // was measured — time lost to stalls — and states the bar it did NOT cross, so a
+                    // reader is not left wondering why the silence lines are absent. The per-stall
+                    // breakdown is in the renderer's own `jank stall` / `jank minor stalls` lines at
+                    // these same timestamps; this line is what makes the app act on them.
+                    tracing::warn!(
+                        target: "watchdog",
+                        stalled_ms,
+                        window_ms,
+                        hang_after_ms = HANG_AFTER.as_millis() as u64,
+                        "the UI lost most of a window to main-thread stalls, none long enough to trip the silence bar; capturing stack"
+                    );
+                }
+            }
+
+            // ── ONE CAPTURE PATH, ONE LIMITER, TWO POOLS ─────────────────────────────────────
+            // Lifted out of the arms above when the stall-budget trigger was added, so a new trigger
+            // has to declare its pool in `capture_for` rather than reach for `try_capture` itself.
+            // That is the difference between reusing the rate limiter and merely intending to: a
+            // trigger with its own path could fire alongside a silence episode and evict the very
+            // stack it was meant to complement, out of a budget of `MAX_HANG_DUMPS` files.
+            //
+            // PERSISTENCE EARNS THE STACK. `capture_for` returns `Some` for a `Restate` that still
+            // owes one, so an episode refused at open — the limiter having just been spent, most
+            // likely by an ordinary cmd-tab — keeps asking and gets its stack as soon as the floor
+            // expires. Without that the refusal was PERMANENT for the episode, because `ReportNew`
+            // fires exactly once.
+            if let Some(hidden) = capture_for(&effect) {
+                if try_capture(
+                    hangs_dir.as_deref(),
+                    hidden,
+                    after,
+                    &LAST_VISIBLE_CAPTURE_MS,
+                    &LAST_HIDDEN_CAPTURE_MS,
+                ) && capture_satisfies_episode(&effect)
+                {
+                    note_captured(&mut state);
+                }
             }
         }
     });
@@ -805,6 +1323,8 @@ pub fn start<R: Runtime>(app: &AppHandle<R>) {
         target: "watchdog",
         hang_after_ms = HANG_AFTER.as_millis() as u64,
         hidden_hang_after_ms = HIDDEN_HANG_AFTER.as_millis() as u64,
+        stall_budget_ms = STALL_BUDGET_MS,
+        stall_window_ms = STALL_WINDOW_TICKS as u64 * TICK.as_millis() as u64,
         "main-thread watchdog started (off-thread)"
     );
 }
@@ -1094,9 +1614,21 @@ mod tests {
     /// A tick that ran on schedule — i.e. we were NOT suspended.
     const PUNCTUAL: u64 = 0;
     const HANG_MS: u64 = HANG_AFTER.as_millis() as u64;
+    /// The mach pair read back "the machine did not sleep at all during our tick". What a punctual
+    /// tick means, and — with a large `overshoot_ms` — what STARVATION looks like.
+    const AWAKE: Option<u64> = Some(0);
+    /// An overshoot far past `SUSPEND_OVERSHOOT`: the measured 2026-08-21 freeze.
+    const FREEZE_MS: u64 = 30_000;
 
     fn input(now_ms: u64, last_beat_ms: u64, hidden: bool) -> TickInput {
-        TickInput { now_ms, overshoot_ms: PUNCTUAL, last_beat_ms, hidden }
+        TickInput {
+            now_ms,
+            overshoot_ms: PUNCTUAL,
+            last_beat_ms,
+            hidden,
+            stall_ms: 0,
+            machine_slept_ms: AWAKE,
+        }
     }
 
     /// Drive an episode: beats stop at `beats_stopped_at`, we tick until `until`, and the effects
@@ -1148,16 +1680,311 @@ mod tests {
     }
 
     // ── SUSPEND vs HANG ────────────────────────────────────────────────────────────────────────
+    // THE HEADLINE PAIR, and the pair is the whole test. Both halves feed the SAME large overshoot
+    // and differ in one input: what the mach clocks said about the machine. Either half alone
+    // proves nothing — an always-report mutation passes the starved half and an always-suppress
+    // mutation (which is what shipped, `sparkle-rlmsb4`) passes the slept half.
+    //
+    // This replaces a test named `our_own_tick_overrunning_means_we_were_suspended_not_that_the_ui_hung`,
+    // whose title stated the defect as the requirement. Its assertion — the same overshoot, the
+    // same `Rebaseline` — survives verbatim as `..._when_the_machine_really_slept` below, now
+    // qualified by the reading that makes it true.
     #[test]
-    fn our_own_tick_overrunning_means_we_were_suspended_not_that_the_ui_hung() {
-        let overshoot = SUSPEND_OVERSHOOT.as_millis() as u64;
+    fn a_tick_that_overran_while_the_machine_was_awake_is_a_starved_hang_and_is_reported() {
+        let now = 8 * 3600 * 1000;
         let mut state = WatchdogState::default();
-        // Every other input says "hung", and it still must not report.
         let effect = step(
             &mut state,
-            TickInput { now_ms: 8 * 3600 * 1000, overshoot_ms: overshoot, last_beat_ms: 1, hidden: false },
+            TickInput {
+                now_ms: now,
+                overshoot_ms: FREEZE_MS,
+                last_beat_ms: now - FREEZE_MS,
+                hidden: false,
+                stall_ms: 0,
+                // The mach pair counted no sleep at all: the machine was up the whole time and it
+                // was THIS PROCESS that was not scheduled.
+                machine_slept_ms: AWAKE,
+            },
         );
-        assert_eq!(effect, Effect::Rebaseline { new_last_beat_ms: 8 * 3600 * 1000 });
+        assert_eq!(
+            effect,
+            Effect::ReportNew { stalled_ms: FREEZE_MS, hidden: false, starved_ms: FREEZE_MS },
+            "a 30s freeze on an awake machine is the incident this branch exists for; \
+             suppressing it is what produced a total UI freeze with no capture"
+        );
+        assert!(state.reporting, "and the episode must really be open, so restates follow");
+    }
+
+    #[test]
+    fn the_identical_overshoot_is_still_suppressed_when_the_machine_really_slept() {
+        let now = 8 * 3600 * 1000;
+        let mut state = WatchdogState::default();
+        // Byte-for-byte the tick above except for the clock reading. Every other input says "hung",
+        // and it still must not report — this is the anti-phantom property, unchanged.
+        let effect = step(
+            &mut state,
+            TickInput {
+                now_ms: now,
+                overshoot_ms: FREEZE_MS,
+                last_beat_ms: now - FREEZE_MS,
+                hidden: false,
+                stall_ms: 0,
+                machine_slept_ms: Some(FREEZE_MS),
+            },
+        );
+        assert_eq!(
+            effect,
+            Effect::Rebaseline {
+                new_last_beat_ms: now,
+                discarded_gap_ms: FREEZE_MS,
+                announce: true,
+            }
+        );
+        assert!(!state.reporting, "a lid-open must not leave an episode open behind it");
+    }
+
+    // The fallback, which is the direction the anti-phantom property depends on: off macOS, or when
+    // the timebase cannot be read, there IS no discrimination and the old inference is all we have.
+    // Getting this backwards would file a phantom multi-hour hang on every wake on every platform
+    // that cannot take the reading.
+    #[test]
+    fn an_unreadable_clock_falls_back_to_suppressing_not_to_reporting() {
+        let now = 8 * 3600 * 1000;
+        assert!(machine_was_suspended(None), "unknown must read as suspended, never as awake");
+        let mut state = WatchdogState::default();
+        assert_eq!(
+            step(
+                &mut state,
+                TickInput {
+                    now_ms: now,
+                    overshoot_ms: FREEZE_MS,
+                    last_beat_ms: now - FREEZE_MS,
+                    hidden: false,
+                    stall_ms: 0,
+                    machine_slept_ms: None,
+                },
+            ),
+            Effect::Rebaseline {
+                new_last_beat_ms: now,
+                discarded_gap_ms: FREEZE_MS,
+                announce: true,
+            }
+        );
+    }
+
+    // A HALF-READING MUST NOT BECOME A CONFIDENT ZERO. `Some(0)` means "the machine was awake",
+    // which is the REPORT side of the discriminator — so folding a missing endpoint into a delta
+    // would file a phantom multi-hour hang on every lid-open, the regression this whole change
+    // exists not to cause. Paired with the both-present case so "always None" cannot pass either.
+    #[test]
+    fn a_missing_clock_reading_at_either_end_is_unknown_not_zero_sleep() {
+        assert_eq!(machine_slept_during(None, Some(30_000)), None);
+        assert_eq!(machine_slept_during(Some(10), None), None);
+        assert_eq!(machine_slept_during(None, None), None);
+        assert_eq!(
+            machine_slept_during(Some(10), Some(30_010)),
+            Some(30_000),
+            "and with both ends present it must be the delta, or the discriminator never sees sleep"
+        );
+        // A clock that appeared to go backwards reads as no sleep, never as a wrapped eternity.
+        assert_eq!(machine_slept_during(Some(30_000), Some(10)), Some(0));
+    }
+
+    // THE TWO THINGS AN AWAKE MACHINE CANNOT SHOW YOU. Both are silent when wrong and both undo
+    // the fix in the anti-phantom direction, which is the one direction this change may not
+    // regress. See `slept_ms_from_ticks`.
+    #[test]
+    fn the_tick_fold_subtracts_the_right_way_round_and_applies_the_timebase() {
+        // Apple silicon: 125/3 ns per tick, so 24_000_000 ticks is exactly one second.
+        assert_eq!(
+            slept_ms_from_ticks(1_000_000, 1_000_000 + 24_000_000, 125, 3),
+            1_000,
+            "continuous MINUS absolute, converted — reversed it saturates to 0 and every lid-open \
+             becomes a reported hang; unconverted it reads 24ms and an hour of sleep clears nothing"
+        );
+        // x86_64: a tick is a nanosecond.
+        assert_eq!(slept_ms_from_ticks(5, 5 + 1_000_000, 1, 1), 1);
+        // Awake: the two clocks are level, which is the reading that makes a starved tick
+        // reportable at all.
+        assert_eq!(slept_ms_from_ticks(9_999, 9_999, 125, 3), 0);
+        // Eight hours on Apple silicon, the case the bar exists for.
+        assert_eq!(slept_ms_from_ticks(0, 8 * 3600 * 24_000_000, 125, 3), 8 * 3600 * 1_000);
+        // A pair that appears to run backwards reads as no sleep, never as a wrapped eternity.
+        assert_eq!(slept_ms_from_ticks(24_000_000, 0, 125, 3), 0);
+        // An unreadable timebase cannot divide by zero in the watchdog thread.
+        assert_eq!(slept_ms_from_ticks(0, 24_000_000, 125, 0), 0);
+    }
+
+    // THE READING ITSELF, against the real clocks. Everything else here drives `step` with a number
+    // a test made up; this is the one place that checks the number can actually be obtained and
+    // means what the discriminator assumes. A swapped pair, a constant, or an unreadable timebase
+    // all leave the suite green otherwise, and all three make the fix inert in production.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_two_mach_clocks_are_live_and_agree_while_the_machine_is_awake() {
+        // SAFETY: both are argument-less reads of a kernel-maintained counter.
+        let (abs0, cont0) =
+            unsafe { (mach_clock::mach_absolute_time(), mach_clock::mach_continuous_time()) };
+        let before = machine_slept_since_boot_ms().expect("the timebase must be readable on macOS");
+        std::thread::sleep(Duration::from_millis(50));
+        let after = machine_slept_since_boot_ms().expect("the timebase must be readable on macOS");
+        // SAFETY: as above.
+        let (abs1, cont1) =
+            unsafe { (mach_clock::mach_absolute_time(), mach_clock::mach_continuous_time()) };
+
+        assert!(abs1 > abs0 && cont1 > cont0, "both clocks must be LIVE; a constant one would make the discriminator silently inert");
+        assert!(
+            cont0 >= abs0 && cont1 >= abs1,
+            "continuous counts a superset of absolute — reading them the other way round saturates \
+             every genuine suspend to zero sleep and turns every lid-open into a reported hang"
+        );
+        assert_eq!(
+            machine_slept_during(Some(before), Some(after)),
+            Some(0),
+            "no machine sleep happened during a 50ms sleep on the box running this test, so the \
+             pair must report none — this zero is what makes a starved tick reportable"
+        );
+    }
+
+    // The boundary the discriminator actually turns on. Below `SUSPEND_CONFIRM` the counted sleep
+    // cannot explain the overshoot, so the overshoot belongs to starvation.
+    #[test]
+    fn the_suspend_verdict_turns_at_suspend_confirm() {
+        let confirm = SUSPEND_CONFIRM.as_millis() as u64;
+        assert!(!machine_was_suspended(Some(confirm - 1)), "one ms short is not a sleep");
+        assert!(machine_was_suspended(Some(confirm)), "exactly at it is");
+    }
+
+    // A tick that overran but stayed UNDER the bar is not starvation and must not be labelled as
+    // such — otherwise `starved_ms` decorates ordinary jitter and the log line stops meaning
+    // anything. Paired with the reported case above, which shares everything but the overshoot.
+    #[test]
+    fn an_overshoot_below_the_bar_reports_without_claiming_starvation() {
+        let now = 100_000;
+        let mut state = WatchdogState::default();
+        assert_eq!(
+            step(
+                &mut state,
+                TickInput {
+                    now_ms: now,
+                    overshoot_ms: SUSPEND_OVERSHOOT.as_millis() as u64 - 1,
+                    last_beat_ms: now - FREEZE_MS,
+                    hidden: false,
+                    stall_ms: 0,
+                    machine_slept_ms: AWAKE,
+                },
+            ),
+            Effect::ReportNew { stalled_ms: FREEZE_MS, hidden: false, starved_ms: 0 }
+        );
+    }
+
+    // ── THE SUPPRESSION IS OBSERVABLE, AND RATE-LIMITED ────────────────────────────────────────
+    // Both halves are needed. "It announces" alone passes for an unlimited firehose; "the second one
+    // is quiet" alone passes for a path that never announces at all — which is exactly what shipped.
+    #[test]
+    fn a_suppressed_gap_announces_once_then_stays_quiet_until_the_interval_expires() {
+        let interval = SUSPEND_LOG_MIN_INTERVAL.as_millis() as u64;
+        let now = 8 * 3600 * 1000;
+        let slept = TickInput {
+            now_ms: now,
+            overshoot_ms: FREEZE_MS,
+            last_beat_ms: now - FREEZE_MS,
+            hidden: false,
+            stall_ms: 0,
+            machine_slept_ms: Some(FREEZE_MS),
+        };
+        let mut state = WatchdogState::default();
+        assert_eq!(
+            step(&mut state, slept),
+            Effect::Rebaseline { new_last_beat_ms: now, discarded_gap_ms: FREEZE_MS, announce: true },
+            "the first suppression must say what it threw away"
+        );
+
+        // Inside the interval: same suppression, no second line. The limiter has to survive the
+        // `*state = default()` the branch above performs, or this is indistinguishable from the
+        // first tick.
+        let soon = now + interval - 1;
+        assert_eq!(
+            step(&mut state, TickInput { now_ms: soon, last_beat_ms: soon - FREEZE_MS, ..slept }),
+            Effect::Rebaseline {
+                new_last_beat_ms: soon,
+                discarded_gap_ms: FREEZE_MS,
+                announce: false,
+            },
+            "a nightly-sleeping laptop must not become a nightly firehose"
+        );
+
+        // Past it: audible again.
+        let later = now + interval;
+        assert_eq!(
+            step(&mut state, TickInput { now_ms: later, last_beat_ms: later - FREEZE_MS, ..slept }),
+            Effect::Rebaseline {
+                new_last_beat_ms: later,
+                discarded_gap_ms: FREEZE_MS,
+                announce: true,
+            }
+        );
+    }
+
+    // THE LIMITER SURVIVES THE OTHER RESET TOO. `Recovered` also does `*state = default()`, so a
+    // hang episode landing between two suspends would hand the second one a fresh budget and the
+    // rate limit would be defeated by ordinary traffic rather than by time passing.
+    #[test]
+    fn an_episode_recovering_does_not_refill_the_suppression_log_budget() {
+        let mut state = WatchdogState::default();
+        // A suspend, announced.
+        let t0 = 100_000;
+        assert!(matches!(
+            step(&mut state, TickInput {
+                now_ms: t0,
+                overshoot_ms: FREEZE_MS,
+                last_beat_ms: t0 - FREEZE_MS,
+                hidden: false,
+                stall_ms: 0,
+                machine_slept_ms: Some(FREEZE_MS),
+            }),
+            Effect::Rebaseline { announce: true, .. }
+        ));
+
+        // A perfectly ordinary hang episode, opening and recovering inside the interval.
+        assert!(matches!(step(&mut state, input(t0 + 6_000, t0 + 1_000, VISIBLE)), Effect::ReportNew { .. }));
+        assert!(matches!(step(&mut state, input(t0 + 7_000, t0 + 6_900, VISIBLE)), Effect::Recovered { .. }));
+
+        // A second suspend, still inside `SUSPEND_LOG_MIN_INTERVAL` of the first.
+        let t1 = t0 + SUSPEND_LOG_MIN_INTERVAL.as_millis() as u64 - 1;
+        assert_eq!(
+            step(&mut state, TickInput {
+                now_ms: t1,
+                overshoot_ms: FREEZE_MS,
+                last_beat_ms: t1 - FREEZE_MS,
+                hidden: false,
+                stall_ms: 0,
+                machine_slept_ms: Some(FREEZE_MS),
+            }),
+            Effect::Rebaseline { new_last_beat_ms: t1, discarded_gap_ms: FREEZE_MS, announce: false },
+            "an unrelated episode ending must not buy the log another line"
+        );
+    }
+
+    // The gap is what a reader needs; `now - 0` is "milliseconds since 1970" and would print a
+    // 58-year hang on the first tick of a launch that suspends before the webview ever beats.
+    #[test]
+    fn a_suppression_before_the_first_heartbeat_reports_no_gap_rather_than_the_epoch() {
+        let now = 8 * 3600 * 1000;
+        assert_eq!(
+            step(
+                &mut WatchdogState::default(),
+                TickInput {
+                    now_ms: now,
+                    overshoot_ms: FREEZE_MS,
+                    last_beat_ms: 0,
+                    hidden: false,
+                    stall_ms: 0,
+                    machine_slept_ms: Some(FREEZE_MS),
+                },
+            ),
+            Effect::Rebaseline { new_last_beat_ms: now, discarded_gap_ms: 0, announce: true }
+        );
     }
 
     // The previous version of the test above asserted `state == default` after a suspend and called
@@ -1175,7 +2002,8 @@ mod tests {
         assert!(matches!(step(&mut state, input(16_000, 10_000, VISIBLE)), Effect::ReportNew { .. }));
         assert!(state.reporting, "precondition: the episode really is open");
 
-        // Now the lid closes for eight hours.
+        // Now the lid closes for eight hours — and the mach clocks agree that it did, which is the
+        // input this test grew when the overshoot alone stopped being sufficient evidence.
         let wake = 8 * 3600 * 1000;
         let effect = step(
             &mut state,
@@ -1184,10 +2012,23 @@ mod tests {
                 overshoot_ms: SUSPEND_OVERSHOOT.as_millis() as u64,
                 last_beat_ms: 10_000,
                 hidden: false,
+                stall_ms: 0,
+                machine_slept_ms: Some(wake - 16_000),
             },
         );
-        assert_eq!(effect, Effect::Rebaseline { new_last_beat_ms: wake });
-        assert_eq!(state, WatchdogState::default(), "the open episode must be cleared, not carried");
+        assert_eq!(
+            effect,
+            Effect::Rebaseline {
+                new_last_beat_ms: wake,
+                discarded_gap_ms: wake - 10_000,
+                announce: true,
+            }
+        );
+        assert_eq!(state, WatchdogState {
+            // The only field a suppression may carry forward; see the field's own note.
+            last_suspend_log_ms: wake,
+            ..WatchdogState::default()
+        }, "the open episode must be cleared, not carried");
 
         // The assertion that actually bites: the next healthy tick must be silent, NOT a recovery
         // claiming the machine slept for eight hours of hang.
@@ -1198,6 +2039,46 @@ mod tests {
         );
     }
 
+    // ITS PAIR. The identical open episode and the identical overshoot, with the machine AWAKE:
+    // now nothing is excused, the episode stays open, and the freeze keeps being reported. Without
+    // this, `a_suspend_closes_an_open_episode…` above passes just as happily for the shipped defect,
+    // which closed the episode on every load spike.
+    #[test]
+    fn a_starved_tick_does_not_close_an_open_episode_it_keeps_reporting_it() {
+        let mut state = WatchdogState::default();
+        assert!(matches!(step(&mut state, input(16_000, 10_000, VISIBLE)), Effect::ReportNew { .. }));
+        let opened_at = state.hang_started_ms;
+
+        // Ten seconds later the box is at load 500 and our own sleep overran by thirty. The lid
+        // never closed.
+        let t = 16_000 + RESTATE_EVERY.as_millis() as u64;
+        let effect = step(
+            &mut state,
+            TickInput {
+                now_ms: t,
+                overshoot_ms: FREEZE_MS,
+                last_beat_ms: 10_000,
+                hidden: false,
+                stall_ms: 0,
+                machine_slept_ms: AWAKE,
+            },
+        );
+        assert_eq!(
+            effect,
+            Effect::Restate { stalled_ms: t - 10_000, hidden: false, wants_stack: true },
+            "the episode is still on and still owed a stack; a starved tick is not amnesty"
+        );
+        assert!(state.reporting, "and it must still be OPEN");
+        assert_eq!(state.hang_started_ms, opened_at, "with the original start, not a rebaselined one");
+
+        // Which means the recovery still carries the TRUE duration, the one number no other
+        // instrument in the app can produce.
+        assert_eq!(
+            step(&mut state, input(t + 1_000, t + 900, VISIBLE)),
+            Effect::Recovered { hung_for_ms: t + 1_000 - 10_000, hidden: false }
+        );
+    }
+
     // The one piece of state a tick writes outside `WatchdogState`, and the guard against a phantom
     // hang on every lid-open. Against a `static` inside the loop it was unreachable from any test —
     // deleting the store left the suite green and every wake filing a false ReportNew.
@@ -1205,7 +2086,10 @@ mod tests {
     fn a_rebaseline_actually_moves_the_heartbeat_baseline_forward() {
         let last_beat = AtomicU64::new(10_000);
         let wake = 8 * 3600 * 1000;
-        apply_baseline(&last_beat, &Effect::Rebaseline { new_last_beat_ms: wake });
+        apply_baseline(
+            &last_beat,
+            &Effect::Rebaseline { new_last_beat_ms: wake, discarded_gap_ms: 0, announce: false },
+        );
         assert_eq!(
             last_beat.load(Ordering::Relaxed),
             wake,
@@ -1218,7 +2102,7 @@ mod tests {
         let last_beat = AtomicU64::new(10_000);
         for effect in [
             Effect::Quiet,
-            Effect::ReportNew { stalled_ms: 5_000, hidden: false },
+            Effect::ReportNew { stalled_ms: 5_000, hidden: false, starved_ms: 0 },
             Effect::Restate { stalled_ms: 5_000, hidden: false, wants_stack: false },
             Effect::Recovered { hung_for_ms: 5_000, hidden: false },
         ] {
@@ -1239,7 +2123,7 @@ mod tests {
         // Exactly at it: reported.
         assert_eq!(
             step(&mut WatchdogState::default(), input(beat_at + HANG_MS, beat_at, VISIBLE)),
-            Effect::ReportNew { stalled_ms: HANG_MS, hidden: false }
+            Effect::ReportNew { stalled_ms: HANG_MS, hidden: false, starved_ms: 0 }
         );
     }
 
@@ -1852,7 +2736,7 @@ mod tests {
         assert_eq!(step(&mut state, input(hidden_ms - 1, 1, true)), Effect::Quiet);
         assert_eq!(
             step(&mut state, input(hidden_ms + 1, 1, true)),
-            Effect::ReportNew { stalled_ms: hidden_ms, hidden: true }
+            Effect::ReportNew { stalled_ms: hidden_ms, hidden: true, starved_ms: 0 }
         );
     }
 
@@ -1863,7 +2747,7 @@ mod tests {
         let now = beat_at + HANG_MS + 1_000; // comfortably past the visible bar
         assert_eq!(
             step(&mut WatchdogState::default(), input(now, beat_at, VISIBLE)),
-            Effect::ReportNew { stalled_ms: HANG_MS + 1_000, hidden: false }
+            Effect::ReportNew { stalled_ms: HANG_MS + 1_000, hidden: false, starved_ms: 0 }
         );
         assert_eq!(step(&mut WatchdogState::default(), input(now, beat_at, true)), Effect::Quiet);
     }
@@ -1946,7 +2830,7 @@ mod tests {
         let mut state = WatchdogState::default();
         assert_eq!(
             step(&mut state, input(16_000, 10_000, VISIBLE)),
-            Effect::ReportNew { stalled_ms: 6_000, hidden: false },
+            Effect::ReportNew { stalled_ms: 6_000, hidden: false, starved_ms: 0 },
             "the episode opens visible, warn-level, with a stack"
         );
         for t in (17_000..=100_000).step_by(1_000) {
@@ -2010,5 +2894,398 @@ mod tests {
             step(&mut state, input(40_000, 30_000, VISIBLE)),
             Effect::ReportNew { .. }
         ));
+    }
+
+    // ── THE FOURTH HANG FAMILY: THE SUB-THRESHOLD SAWTOOTH ─────────────────────────────────────
+    // Everything above measures ONE quantity — how long the heartbeat has been silent — at a
+    // five-second bar, and returns a binary verdict. A real 30-second unusable window went entirely
+    // unreported by that instrument, correctly: the UI stalled seven to thirteen times a minute and
+    // never once for five seconds. See `STALL_BUDGET_MS` for the log lines and the arithmetic.
+    //
+    // These tests are written against the numbers in that log, not against invented ones, because
+    // the trigger's whole difficulty is that the firing case and the must-not-fire case are the SAME
+    // MILLISECONDS arranged differently.
+
+    /// A tick with beats CURRENT that carries `stall_ms` of renderer stall time.
+    ///
+    /// Every gate upstream of the budget rule is deliberately satisfied here: the tick was punctual
+    /// (so the suspend branch does not short-circuit), a beat has arrived (so the `last_beat_ms == 0`
+    /// branch does not), and it is recent (so the silence branch does not open an episode). AGENTS.md
+    /// names "an earlier guard short-circuits the path" as the #1 way a test like this goes vacuous;
+    /// each of those three is also asserted directly, with its pair, further down.
+    fn healthy_tick(now_ms: u64, stall_ms: u64, hidden: bool) -> TickInput {
+        TickInput {
+            now_ms,
+            overshoot_ms: PUNCTUAL,
+            last_beat_ms: now_ms - 500,
+            hidden,
+            stall_ms,
+            machine_slept_ms: AWAKE,
+        }
+    }
+
+    /// Five consecutive seconds at 780ms of stall — 3900ms in the window, ONE TICK SHORT of the bar.
+    /// The verdict of the next tick is then decided by the budget rule and nothing else, which is
+    /// what lets the guard tests below pair "does not fire" against "the identical setup does".
+    fn primed(now_ms: u64) -> WatchdogState {
+        let mut state = WatchdogState::default();
+        for i in 0..5u64 {
+            let t = now_ms - (5 - i) * 1_000;
+            assert_eq!(
+                step(&mut state, healthy_tick(t, 780, VISIBLE)),
+                Effect::Quiet,
+                "priming must stay under the bar, or these tests assert nothing"
+            );
+        }
+        state
+    }
+
+    /// The window, in ms — 10 ticks of `TICK`.
+    const WINDOW_MS: u64 = STALL_WINDOW_TICKS as u64 * 1_000;
+    const OCCLUDED: bool = true;
+
+    // ── THE CASE THAT MUST FIRE ────────────────────────────────────────────────────────────────
+    // The reported window's worst minute was 13 stalls totalling 4681ms, max 956ms. Arriving
+    // back-to-back that is six seconds in which the UI is stalled for 78% of each — an unusable app,
+    // and invisible to every instrument this module had.
+    #[test]
+    fn a_cluster_of_sub_threshold_stalls_is_a_hang_even_though_nothing_ever_went_silent() {
+        let mut state = WatchdogState::default();
+        let mut fired: Option<(u64, Effect)> = None;
+        let mut opened_a_silence_episode = false;
+        for i in 0..6u64 {
+            let t = 100_000 + i * 1_000;
+            let effect = step(&mut state, healthy_tick(t, 780, VISIBLE));
+            if matches!(effect, Effect::ReportNew { .. } | Effect::Restate { .. }) {
+                opened_a_silence_episode = true;
+            }
+            if matches!(effect, Effect::StallBudget { .. }) {
+                fired = Some((t, effect));
+            }
+        }
+        assert_eq!(
+            fired,
+            Some((105_000, Effect::StallBudget { stalled_ms: 4_680, window_ms: WINDOW_MS })),
+            "6 x 780ms inside ten seconds is 47% of the window — the reported window's own 4681ms, clustered"
+        );
+        // The claim that makes this a SECOND trigger rather than a louder first one: the silence
+        // detector cannot have seen any of this. Every beat was current on every tick.
+        assert!(
+            !opened_a_silence_episode,
+            "if the silence path fired here the fixture is wrong and this proves nothing new"
+        );
+    }
+
+    // ── THE REGRESSION THAT MATTERS ────────────────────────────────────────────────────────────
+    // The same milliseconds, spread across the minute they were actually logged over. This app runs
+    // ~10.3k stalls a day at a median of 221ms (perfTrace.ts's own measurement) — a stall every eight
+    // seconds around the clock — so a minute at 4-8% is what it does when NOTHING IS WRONG. A bar low
+    // enough to catch a bad minute by its per-minute rate fires forever, and a trigger that fires
+    // forever evicts, out of `MAX_HANG_DUMPS`, the very stacks it exists to keep.
+    #[test]
+    fn the_measured_ordinary_jank_rate_must_never_fire_it() {
+        for total in [2_646u64, 2_813, 4_681] {
+            let mut state = WatchdogState::default();
+            let per_tick = total / 60; // 44, 46, 78 ms of stall per second
+            for i in 0..60u64 {
+                let t = 100_000 + i * 1_000;
+                assert_eq!(
+                    step(&mut state, healthy_tick(t, per_tick, VISIBLE)),
+                    Effect::Quiet,
+                    "{total}ms spread over its own minute puts {}ms in a ten-second window; \
+                     firing on that fires on every minute this app has",
+                    per_tick * STALL_WINDOW_TICKS as u64
+                );
+            }
+        }
+    }
+
+    // ── GUARD 1: THE SUSPEND CHECK, AND ITS PAIR ───────────────────────────────────────────────
+    // A machine suspend freezes this thread too, so nothing observed during it means anything. One
+    // test proving absence is ambiguous — it passes for a rule that never fires at all — so the pair
+    // runs the IDENTICAL state and the IDENTICAL stall through a punctual tick and demands the
+    // effect.
+    #[test]
+    fn a_suspended_tick_cannot_fire_the_budget_but_the_identical_punctual_one_does() {
+        let now = 100_000;
+        let mut suspended = primed(now);
+        assert_eq!(
+            step(
+                &mut suspended,
+                TickInput {
+                    now_ms: now,
+                    overshoot_ms: SUSPEND_OVERSHOOT.as_millis() as u64,
+                    last_beat_ms: now - 500,
+                    hidden: false,
+                    stall_ms: 780,
+                    machine_slept_ms: Some(SUSPEND_OVERSHOOT.as_millis() as u64),
+                }
+            ),
+            Effect::Rebaseline { new_last_beat_ms: now, discarded_gap_ms: 500, announce: true },
+            "we were not running either; the ring describes a world we did not observe"
+        );
+
+        let mut running = primed(now);
+        assert_eq!(
+            step(&mut running, healthy_tick(now, 780, VISIBLE)),
+            Effect::StallBudget { stalled_ms: 4_680, window_ms: WINDOW_MS },
+            "the same state and the same stall, punctual, MUST reach the effect"
+        );
+    }
+
+    // ── AND THE THIRD LEG, WHICH IS WHY THIS FIX MATTERS TO THE BUDGET AT ALL ──────────────────
+    // The budget trigger sits DOWNSTREAM of the suspend short-circuit, so for as long as that
+    // short-circuit fired on any long overshoot it swallowed this trigger too — on exactly the
+    // machines whose load is what produces the sawtooth in the first place. Same primed ring, same
+    // 780ms, same overshoot as the suppressed leg above; the machine was awake, so the tick is
+    // evaluated and the budget is reachable.
+    #[test]
+    fn a_starved_tick_still_reaches_the_stall_budget_that_a_suspend_would_have_swallowed() {
+        let now = 100_000;
+        let mut starved = primed(now);
+        assert_eq!(
+            step(
+                &mut starved,
+                TickInput {
+                    now_ms: now,
+                    overshoot_ms: SUSPEND_OVERSHOOT.as_millis() as u64,
+                    last_beat_ms: now - 500,
+                    hidden: false,
+                    stall_ms: 780,
+                    machine_slept_ms: AWAKE,
+                }
+            ),
+            Effect::StallBudget { stalled_ms: 4_680, window_ms: WINDOW_MS },
+            "under load the overshoot and the sawtooth arrive together; suppressing on the \
+             overshoot alone hid the sawtooth as well"
+        );
+    }
+
+    // ── GUARD 2: A WEBVIEW THAT HAS NEVER SPOKEN, AND ITS PAIR ─────────────────────────────────
+    #[test]
+    fn a_never_beaten_webview_cannot_fire_the_budget_but_the_identical_beaten_one_does() {
+        let now = 100_000;
+        let mut never = primed(now);
+        assert_eq!(
+            step(&mut never, TickInput { now_ms: now, overshoot_ms: PUNCTUAL, last_beat_ms: 0, hidden: false, stall_ms: 780, machine_slept_ms: AWAKE }),
+            Effect::Quiet,
+            "stall accounting from something that has never beaten is not evidence of anything"
+        );
+
+        let mut beaten = primed(now);
+        assert_eq!(
+            step(&mut beaten, healthy_tick(now, 780, VISIBLE)),
+            Effect::StallBudget { stalled_ms: 4_680, window_ms: WINDOW_MS }
+        );
+    }
+
+    // ── GUARD 3: HIDDEN, AND ITS PAIR ──────────────────────────────────────────────────────────
+    // rAF is paused behind a hidden window, so the renderer accrues no stall time there; a budget
+    // evaluated while hidden could only ever act on accounting from before the occlusion. That is
+    // `HIDDEN_HANG_AFTER`'s territory.
+    #[test]
+    fn a_hidden_window_cannot_fire_the_budget_but_the_identical_visible_one_does() {
+        let now = 100_000;
+        let mut hidden = primed(now);
+        assert_eq!(step(&mut hidden, healthy_tick(now, 780, OCCLUDED)), Effect::Quiet);
+
+        let mut visible = primed(now);
+        assert_eq!(
+            step(&mut visible, healthy_tick(now, 780, VISIBLE)),
+            Effect::StallBudget { stalled_ms: 4_680, window_ms: WINDOW_MS }
+        );
+    }
+
+    // ── GUARD 4: AN OPEN SILENCE EPISODE OWNS THE TICK ─────────────────────────────────────────
+    // The two triggers must never contest the same moment: a wedge long enough to be silent is the
+    // first trigger's, and it already reports, restates and captures for it.
+    #[test]
+    fn a_silent_tick_reports_silence_not_a_stall_budget_even_with_the_ring_full() {
+        let now = 100_000;
+        let mut state = primed(now);
+        // Same tick, except the last beat is HANG_AFTER old.
+        let effect = step(
+            &mut state,
+            TickInput { now_ms: now, overshoot_ms: PUNCTUAL, last_beat_ms: now - HANG_MS, hidden: false, stall_ms: 780, machine_slept_ms: AWAKE },
+        );
+        assert_eq!(effect, Effect::ReportNew { stalled_ms: HANG_MS, hidden: false, starved_ms: 0 });
+
+        let mut current = primed(now);
+        assert_eq!(
+            step(&mut current, healthy_tick(now, 780, VISIBLE)),
+            Effect::StallBudget { stalled_ms: 4_680, window_ms: WINDOW_MS },
+            "with beats current the identical ring MUST reach the budget effect"
+        );
+    }
+
+    // The beat that ENDS a silence episode carries the whole block's stall time in one bucket, so a
+    // ring that survived the recovery would have the sawtooth trigger re-report, seconds later, the
+    // wedge the silence trigger just reported in full — a second WARN and a second `sample(1)` for
+    // one event. The recovery's state reset is what prevents it; deleting it leaves this red.
+    #[test]
+    fn a_recovered_wedge_is_not_re_reported_by_the_stall_budget() {
+        let mut state = WatchdogState::default();
+        // A 20-second wedge: silence opens an episode.
+        assert!(matches!(step(&mut state, input(120_000, 100_000, VISIBLE)), Effect::ReportNew { .. }));
+        // The first beat back carries all 20 seconds of stall the renderer accrued.
+        assert!(matches!(
+            step(&mut state, TickInput { now_ms: 121_000, overshoot_ms: PUNCTUAL, last_beat_ms: 120_900, hidden: false, stall_ms: 20_000, machine_slept_ms: AWAKE }),
+            Effect::Recovered { .. }
+        ));
+        // Now a perfectly ordinary second. Nothing may fire off the wedge's own stall time.
+        assert_eq!(
+            step(&mut state, healthy_tick(122_000, 44, VISIBLE)),
+            Effect::Quiet,
+            "the silence path owns a wedge's stall time; the ring must restart at the recovery"
+        );
+    }
+
+    // ── IT IS A ROLLING WINDOW, NOT A RUNNING TOTAL ────────────────────────────────────────────
+    // The distinction is the entire trigger: a running total fires on any app left open long enough,
+    // which is every app. Paired, because "it did not fire" is also what a broken accumulator does.
+    #[test]
+    fn stall_time_older_than_the_window_stops_counting() {
+        // Two very bad seconds, then a quiet stretch one window long, then one more bad second.
+        let mut rolled = WatchdogState::default();
+        step(&mut rolled, healthy_tick(100_000, 2_000, VISIBLE));
+        step(&mut rolled, healthy_tick(101_000, 1_900, VISIBLE)); // 3900 — one tick short
+        for i in 0..STALL_WINDOW_TICKS as u64 {
+            assert_eq!(step(&mut rolled, healthy_tick(102_000 + i * 1_000, 0, VISIBLE)), Effect::Quiet);
+        }
+        assert_eq!(
+            step(&mut rolled, healthy_tick(112_000, 780, VISIBLE)),
+            Effect::Quiet,
+            "3900ms from more than ten seconds ago must have left the window"
+        );
+
+        // THE PAIR: the identical 780ms arriving while those two seconds are still inside it.
+        let mut fresh = WatchdogState::default();
+        step(&mut fresh, healthy_tick(100_000, 2_000, VISIBLE));
+        step(&mut fresh, healthy_tick(101_000, 1_900, VISIBLE));
+        assert_eq!(
+            step(&mut fresh, healthy_tick(102_000, 780, VISIBLE)),
+            Effect::StallBudget { stalled_ms: 4_680, window_ms: WINDOW_MS },
+            "in-window, the same three ticks are 4680ms and over the bar"
+        );
+    }
+
+    // The bar itself, at the boundary — where an off-by-one is the difference between a trigger and
+    // a nuisance.
+    #[test]
+    fn the_budget_is_inclusive_at_the_bar_and_silent_one_millisecond_under() {
+        let mut over = WatchdogState::default();
+        for i in 0..3u64 {
+            assert_eq!(step(&mut over, healthy_tick(100_000 + i * 1_000, 1_000, VISIBLE)), Effect::Quiet);
+        }
+        assert_eq!(
+            step(&mut over, healthy_tick(103_000, 1_000, VISIBLE)),
+            Effect::StallBudget { stalled_ms: STALL_BUDGET_MS, window_ms: WINDOW_MS },
+            "exactly at the bar must report, or the boundary can never be reached"
+        );
+
+        let mut under = WatchdogState::default();
+        for i in 0..3u64 {
+            step(&mut under, healthy_tick(100_000 + i * 1_000, 1_000, VISIBLE));
+        }
+        assert_eq!(
+            step(&mut under, healthy_tick(103_000, 999, VISIBLE)),
+            Effect::Quiet,
+            "one millisecond under the bar is not a hang"
+        );
+    }
+
+    // ── A SUSTAINED BAD PATCH REPORTS ONCE A MINUTE, NOT ONCE A SECOND ─────────────────────────
+    // Without the interval the ring stays over the bar for as long as the patch lasts and every tick
+    // reports — a WARN a second, each asking for a `sample(1)` against an app already in trouble.
+    // Sixty seconds is `JANK_ROLLUP_MS`, so this line pairs one-to-one with the renderer's own
+    // rollup line, and it is 6x the window, so no two reports can count the same stall time twice.
+    #[test]
+    fn a_sustained_bad_patch_reports_on_an_interval_not_on_every_tick() {
+        let mut state = WatchdogState::default();
+        let mut fired_at: Vec<u64> = Vec::new();
+        for i in 0..120u64 {
+            let t = 100_000 + i * 1_000;
+            if matches!(step(&mut state, healthy_tick(t, 780, VISIBLE)), Effect::StallBudget { .. }) {
+                fired_at.push(t);
+            }
+        }
+        assert_eq!(
+            fired_at,
+            vec![105_000, 165_000],
+            "two minutes of a bad patch is two lines; without the interval it is ~115"
+        );
+        assert_eq!(
+            fired_at[1] - fired_at[0],
+            STALL_REPORT_MIN_INTERVAL.as_millis() as u64,
+            "and the spacing is the interval, not an accident of the ring"
+        );
+    }
+
+    // ── THE NEW TRIGGER REUSES THE EXISTING CAPTURE MACHINERY ──────────────────────────────────
+    // The brief's live risk: a second trigger with its own path can fire alongside a silence episode
+    // and evict, out of a finite `MAX_HANG_DUMPS`, the stack it was meant to complement. This asserts
+    // the SIDE EFFECT — how many `sample(1)` runs actually happen — through the same `try_capture_with`
+    // and the same `VISIBLE_CAPTURE_MIN_INTERVAL` the silence path uses. Route the stall budget to the
+    // hidden pool instead and the hidden floor allows both, so the count becomes 2 and this goes red.
+    #[test]
+    fn a_stall_budget_capture_shares_the_visible_pool_and_its_floor() {
+        let saw = Effect::StallBudget { stalled_ms: 4_680, window_ms: WINDOW_MS };
+        assert_eq!(capture_for(&saw), Some(false), "the visible pool, never a third one");
+        assert_eq!(
+            dump_target(Path::new("/logs/hangs"), false),
+            (PathBuf::from("/logs/hangs"), MAX_HANG_DUMPS),
+            "and `false` resolves to the visible directory and its full budget"
+        );
+        // It is not an EPISODE, so a capture taken for it must not tell a later silence episode it
+        // already has a stack it never got.
+        assert!(!capture_satisfies_episode(&saw));
+        assert!(capture_satisfies_episode(&Effect::ReportNew {
+            stalled_ms: 5_000,
+            hidden: false,
+            starved_ms: 0
+        }));
+
+        let dir = Path::new("/logs/hangs");
+        let mut captures: Vec<u64> = Vec::new();
+        {
+            let mut capture = |_: &Path, stamp: u64, _: usize| captures.push(stamp);
+            let vis = AtomicU64::new(0);
+            let hid = AtomicU64::new(0);
+            // A visible silence episode captures at T.
+            let silence = Effect::ReportNew { stalled_ms: 5_000, hidden: false, starved_ms: 0 };
+            assert!(try_capture_with(Some(dir), capture_for(&silence).unwrap(), 200_000, &vis, &hid, &mut capture));
+            // The sawtooth trigger fires 10 seconds later — inside the visible floor. REFUSED.
+            assert!(!try_capture_with(Some(dir), capture_for(&saw).unwrap(), 210_000, &vis, &hid, &mut capture));
+            // And once the floor expires it is owed its own stack like anything else.
+            let floor = VISIBLE_CAPTURE_MIN_INTERVAL.as_millis() as u64;
+            assert!(try_capture_with(Some(dir), capture_for(&saw).unwrap(), 200_000 + floor, &vis, &hid, &mut capture));
+        }
+        assert_eq!(captures, vec![200_000, 200_000 + VISIBLE_CAPTURE_MIN_INTERVAL.as_millis() as u64]);
+    }
+
+    // An effect that owes no stack must ask for none, or a `Quiet` tick spends the floor a real
+    // episode needs.
+    #[test]
+    fn only_the_effects_that_owe_a_stack_ask_for_one() {
+        assert_eq!(capture_for(&Effect::Quiet), None);
+        assert_eq!(
+            capture_for(&Effect::Rebaseline {
+                new_last_beat_ms: 1,
+                discarded_gap_ms: 30_000,
+                announce: true
+            }),
+            None
+        );
+        assert_eq!(capture_for(&Effect::Recovered { hung_for_ms: 5_000, hidden: false }), None);
+        assert_eq!(
+            capture_for(&Effect::Restate { stalled_ms: 9_000, hidden: false, wants_stack: false }),
+            None,
+            "an episode that already has its stack must stop asking"
+        );
+        assert_eq!(
+            capture_for(&Effect::Restate { stalled_ms: 9_000, hidden: true, wants_stack: true }),
+            Some(true),
+            "a hidden episode that still owes one asks the hidden pool"
+        );
     }
 }

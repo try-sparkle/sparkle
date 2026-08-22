@@ -8,6 +8,24 @@ vi.mock("@tauri-apps/api/core", () => ({
 }));
 vi.mock("./logger", () => ({ log: { info: vi.fn(), warn: vi.fn(), debug: vi.fn() } }));
 
+// The stall accounting the beat carries, standing in for perfTrace's rAF monitor. Mocked with the
+// REAL drain semantics (returns and resets), because that is the property the beat depends on — the
+// accumulator itself is tested against the live monitor in perfTrace.stallBudget.test.ts.
+let pendingStallMs = 0;
+vi.mock("./perfTrace", () => ({
+  takePendingStallMs: () => {
+    const ms = pendingStallMs;
+    pendingStallMs = 0;
+    return ms;
+  },
+}));
+
+/** The `stalledMs` argument of the last heartbeat sent. */
+function lastStalledMs(): number | undefined {
+  const args = invoke.mock.calls.at(-1) as unknown[] | undefined;
+  return (args?.[1] as { stalledMs?: number } | undefined)?.stalledMs;
+}
+
 /** The `hidden` argument of the last heartbeat sent. */
 function lastHidden(): boolean | undefined {
   const args = invoke.mock.calls.at(-1) as unknown[] | undefined;
@@ -32,6 +50,7 @@ describe("startWatchdogHeartbeat", () => {
     invoke.mockClear();
     invoke.mockImplementation(() => Promise.resolve());
     vi.useFakeTimers();
+    pendingStallMs = 0;
     Object.defineProperty(document, "hidden", { value: false, configurable: true });
   });
 
@@ -48,7 +67,7 @@ describe("startWatchdogHeartbeat", () => {
 
     expect(invoke).not.toHaveBeenCalled(); // nothing before the first interval elapses
     vi.advanceTimersByTime(1_000);
-    expect(invoke).toHaveBeenCalledWith("watchdog_heartbeat", { hidden: false });
+    expect(invoke).toHaveBeenCalledWith("watchdog_heartbeat", { hidden: false, stalledMs: 0 });
     vi.advanceTimersByTime(1_000);
     expect(invoke).toHaveBeenCalledTimes(2);
   });
@@ -105,6 +124,54 @@ describe("startWatchdogHeartbeat", () => {
 
     expect(() => vi.advanceTimersByTime(3_000)).not.toThrow();
     await expect(Promise.resolve()).resolves.toBeUndefined();
+  });
+
+  // ── THE SECOND THING A BEAT CARRIES ──────────────────────────────────────────────────────────
+  // Silence is a binary verdict at a five-second bar, and an entire hang family sits under it: a
+  // reported 30-second unusable window stalled 7-13 times a minute and never once for five seconds,
+  // so the watchdog captured nothing — correctly, by every rule it had. The beat now also carries
+  // how much main-thread time the rAF monitor watched the UI lose, which the Rust side sums over a
+  // rolling window (`STALL_BUDGET_MS`).
+  //
+  // Asserts the SIDE EFFECT — the value that actually crosses the IPC boundary — not that the
+  // accumulator was consulted.
+  it("carries the stall time the UI has lost since the last beat", async () => {
+    const { startWatchdogHeartbeat } = await import("./watchdogHeartbeat");
+    dispose = startWatchdogHeartbeat();
+    pendingStallMs = 4_681; // the measured window's worst minute
+
+    vi.advanceTimersByTime(1_000);
+
+    expect(lastStalledMs()).toBe(4_681);
+  });
+
+  // A DRAIN, NOT A READ, and the beat is where that has to hold: two beats reporting the same 4681ms
+  // would have the watchdog's ten-second window count one bad patch ten times over and fire on an app
+  // that has since recovered.
+  it("does not report the same stall time twice", async () => {
+    const { startWatchdogHeartbeat } = await import("./watchdogHeartbeat");
+    dispose = startWatchdogHeartbeat();
+    pendingStallMs = 4_681;
+
+    vi.advanceTimersByTime(1_000);
+    expect(lastStalledMs()).toBe(4_681);
+    vi.advanceTimersByTime(1_000);
+
+    expect(lastStalledMs()).toBe(0);
+  });
+
+  // The visibilitychange beat drains too, so an occlusion cannot carry stall time into the next
+  // interval beat and be counted twice.
+  it("drains on the visibility beat as well as the interval beat", async () => {
+    const { startWatchdogHeartbeat } = await import("./watchdogHeartbeat");
+    dispose = startWatchdogHeartbeat();
+    pendingStallMs = 956;
+
+    setHidden(true);
+    expect(lastStalledMs()).toBe(956);
+    vi.advanceTimersByTime(1_000);
+
+    expect(lastStalledMs()).toBe(0);
   });
 
   it("is idempotent — a second call does not double the beat rate", async () => {

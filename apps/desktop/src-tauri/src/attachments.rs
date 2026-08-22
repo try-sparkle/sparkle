@@ -7,12 +7,15 @@
 //! Clipboard + save flows are macOS-only (the app is macOS-only) and shell out to the
 //! built-in `sips` / `osascript` rather than pull in a clipboard crate.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use crate::drag_watch;
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde::Serialize;
@@ -274,10 +277,26 @@ impl Chosen {
     }
 
     fn contains(&self, real: &Path, now: Instant) -> bool {
+        self.contains_durable(real) || self.contains_provisional(real, now)
+    }
+
+    /// Consent the user really gave: a completed drop, or the native file panel.
+    ///
+    /// Split out because this is the ONLY tier a registry that is BEHIND the delivered events can
+    /// under-report but never OVER-report. Nothing queued revokes a durable entry — `Forget` touches
+    /// `provisional` alone, and `note_chosen` only adds — so a stale read of this tier can answer a
+    /// spurious "no", which is fail-closed, and can never answer a spurious "yes". That asymmetry is
+    /// what lets a timed-out read still honour a real drop; see `is_user_chosen`.
+    fn contains_durable(&self, real: &Path) -> bool {
         self.durable.iter().any(|p| p == real)
-            || self.provisional.iter().any(|h| {
-                h.path == real && now.saturating_duration_since(h.seen) <= PROVISIONAL_TTL
-            })
+    }
+
+    /// A hover — and the tier a queued-but-unapplied `Forget` can leave standing past its truth,
+    /// which is exactly the grant `is_user_chosen` refuses to read from a stale registry.
+    fn contains_provisional(&self, real: &Path, now: Instant) -> bool {
+        self.provisional
+            .iter()
+            .any(|h| h.path == real && now.saturating_duration_since(h.seen) <= PROVISIONAL_TTL)
     }
 }
 
@@ -286,33 +305,498 @@ fn chosen() -> &'static Mutex<Chosen> {
     PATHS.get_or_init(|| Mutex::new(Chosen::default()))
 }
 
+// ── Keeping the FILESYSTEM off the AppKit main thread (bead `sparkle-bxidpw`) ───────────────────
+//
+// Everything below this line exists for ONE reason: `lib.rs`'s `on_window_event` closure is run
+// SYNCHRONOUSLY BY TAURI ON THE APPKIT MAIN THREAD, and `note_window_event` is called from inside
+// it. Any syscall made on this side of that call stops the whole UI for its duration.
+//
+// `std::fs::canonicalize` is an unbounded blocking filesystem syscall. Against a dataless iCloud
+// placeholder, a network volume, or a stalled NFS mount it can take seconds or never return at all,
+// and it used to be executed INLINE here — once per dragged path, on `Enter` as well as `Drop`.
+// `Enter` fires for ANY drag crossing the window, including one on its way to another app, so
+// merely dragging a file PAST Sparkle could freeze it. That is the same class of defect
+// `pty.rs::pty_write` records (bead `sparkle-epc1zh`): a blocking syscall on the main thread froze
+// the entire app for 73.5 seconds with the webview itself idle.
+//
+// THE REMEDY, and the three things it must not break:
+//
+//  1. The main thread only ENQUEUES. Registration ops are values pushed onto an in-memory queue
+//     under a short-lived lock — no filesystem, no allocation beyond the paths already in hand — and
+//     a background worker performs the resolution and applies the result.
+//
+//  2. THE SYMLINK-SWAP WINDOW STAYS CLOSED. The registry still stores ONLY canonical paths and
+//     `Chosen::contains` still compares canonical forms, so the property the note on `canonical_all`
+//     describes is untouched: a link repointed between the drag and the read resolves to a target
+//     that was never registered. A queued op is NOT a grant — it grants nothing at all until the
+//     canonical form has been computed and installed. Deferring the work changed WHERE it happens,
+//     never WHAT decides a read.
+//
+//  3. THE ORDERING RACE (bead `sparkle-zviq`) STAYS CLOSED, and this is the subtle one. Tauri emits
+//     the JS drag-drop event to the frontend BEFORE running this listener, so `load_attachment` can
+//     arrive while a registration is still in flight — and a read that answered "not chosen" then
+//     would be the original silent refusal, restored by the very fix that removed the freeze. So the
+//     READ SIDE WAITS: `is_user_chosen` blocks until every registration issued before it has been
+//     applied, and only then gives its answer. That wait happens on the blocking pool (every command
+//     that reaches it is `async` + `spawn_blocking`), which is exactly where waiting is free. Waiting
+//     on the MAIN thread is the bug being fixed; waiting on a worker is not.
+//
+// ONE WORKER, IN ORDER, and that is load-bearing rather than simplicity. `Leave` must forget a hover
+// that `Enter` registered, and `Drop` must supersede it. If resolution were fanned out across a pool,
+// a slow `Enter` could install its provisional grant AFTER the `Leave` that was supposed to revoke it
+// — a hover grant left standing for a drag that already left, which is the exact posture the
+// provisional tier exists to deny. A single FIFO worker makes the applied order the delivered order,
+// so every tier rule in `Chosen` keeps the meaning it was written and tested with.
+
+/// How a batch of raw OS-supplied paths becomes the CANONICAL forms the registry stores.
+///
+/// A seam so a test can make resolution arbitrarily slow WITHOUT a dataless iCloud file — the point
+/// being tested is that the main thread is released while a resolution is still outstanding, and
+/// that is not observable against a resolver that always returns instantly.
+type PathResolver = std::sync::Arc<dyn Fn(Vec<PathBuf>) -> Vec<PathBuf> + Send + Sync>;
+
+/// The test-only override slot. Read unconditionally (so the production path and the tested path are
+/// the same code), written only from tests — there is no way to install one from a shipping build.
+fn resolver_override() -> &'static Mutex<Option<PathResolver>> {
+    static R: OnceLock<Mutex<Option<PathResolver>>> = OnceLock::new();
+    R.get_or_init(|| Mutex::new(None))
+}
+
 /// Canonicalize, skipping what can't be resolved: a path we can't canonicalize can't be matched at
 /// read time anyway. Canonicalizing on the way IN is what closes the symlink-swap window — a link
 /// repointed between the drag and the read resolves to a target that was never registered.
+///
+/// THIS IS THE BLOCKING SYSCALL. It must only ever run on the resolution worker; calling it from
+/// `note_window_event` is the freeze (bead `sparkle-bxidpw`).
 fn canonical_all<I: IntoIterator<Item = PathBuf>>(paths: I) -> Vec<PathBuf> {
     paths.into_iter().filter_map(|p| p.canonicalize().ok()).collect()
 }
 
-/// A drag is now OVER `window` (`DragDropEvent::Enter`). Provisional only — see the tier note.
-fn note_dragged_paths<I: IntoIterator<Item = PathBuf>>(paths: I, window: &str) {
-    let real = canonical_all(paths);
-    if let Ok(mut c) = chosen().lock() {
-        c.note_dragged(real, Instant::now(), window);
+/// Resolve a batch through the seam.
+///
+/// The `None` arm is the PRODUCTION WIRING — the only thing that makes a real drag register real
+/// canonical paths — and it is covered by `the_production_default_resolver_really_canonicalizes`
+/// plus the end-to-end symlink-swap test. Without those, a suite in which every test injects its own
+/// resolver would stay green with this arm deleted, which is precisely the defaulted-seam trap.
+fn resolve_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    let injected = resolver_override().lock().ok().and_then(|g| g.clone());
+    match injected {
+        Some(f) => f(paths),
+        None => canonical_all(paths),
     }
+}
+
+/// One queued mutation of the `Chosen` registry. A value, so the whole sequence can be applied in
+/// delivery order by one worker — see the ORDERING note above.
+enum RegistryOp {
+    /// `Enter`: these RAW paths become provisional once resolved.
+    Dragged { paths: Vec<PathBuf>, window: String, at: Instant },
+    /// `Over`: renew this window's provisional stamps. No filesystem work at all — queued only so it
+    /// cannot overtake the `Enter` whose entries it is meant to renew.
+    Refresh { window: String, at: Instant },
+    /// `Leave` / window teardown: forget this window's hovers. Queued for the same ordering reason.
+    Forget { window: String },
+    /// `Drop`, or the native file panel: these RAW paths become durable once resolved.
+    Chosen { paths: Vec<PathBuf>, window: String, phase: &'static str },
+}
+
+struct ResolveQueue {
+    state: Mutex<QueueState>,
+    /// Signalled when an op is enqueued — unparks the worker.
+    work: Condvar,
+    /// Signalled when an op has been APPLIED — unparks readers waiting for their tickets to clear.
+    done: Condvar,
+}
+
+#[derive(Default)]
+struct QueueState {
+    queued: VecDeque<(u64, RegistryOp)>,
+    /// Ticket ids enqueued OR in flight. A `BTreeSet` so "is anything issued at or before T still
+    /// outstanding" is one look at the minimum — an op that is popped but not yet applied must still
+    /// hold a reader, so this cannot be derived from queue length.
+    outstanding: BTreeSet<u64>,
+    next_ticket: u64,
+}
+
+fn resolve_queue() -> &'static ResolveQueue {
+    static Q: OnceLock<ResolveQueue> = OnceLock::new();
+    Q.get_or_init(|| ResolveQueue {
+        state: Mutex::new(QueueState::default()),
+        work: Condvar::new(),
+        done: Condvar::new(),
+    })
+}
+
+/// Hand an op to the worker. THIS RUNS ON THE APPKIT MAIN THREAD — one lock, one push, no syscall.
+///
+/// The lock is recovered from poisoning rather than skipped. `QueueState` is bookkeeping with no
+/// invariant a panic could leave half-written, and silently dropping the op would be the worse
+/// outcome: a dropped `Forget` leaves a hover grant standing for a drag that already left.
+fn enqueue(op: RegistryOp) {
+    let q = resolve_queue();
+    {
+        let mut st = q.state.lock().unwrap_or_else(|e| e.into_inner());
+        let ticket = st.next_ticket;
+        st.next_ticket = st.next_ticket.wrapping_add(1);
+        st.outstanding.insert(ticket);
+        st.queued.push_back((ticket, op));
+    }
+    q.work.notify_one();
+    ensure_resolve_worker();
+}
+
+/// Whether a resolution worker thread is believed to be alive.
+///
+/// Set only once a thread REALLY exists, and cleared again if that thread ever unwinds — see
+/// `ensure_resolve_worker` and `WorkerLiveness` for why neither can be a `OnceLock`.
+static RESOLVE_WORKER_RUNNING: AtomicBool = AtomicBool::new(false);
+
+/// How the resolution worker thread is started.
+///
+/// A seam, for the same reason `resolver_override` is one: the FAILED-spawn path is the branch that
+/// matters and it cannot be reached from a test by any means that does not first exhaust the
+/// machine's thread table. Read unconditionally so the production path and the tested path are the
+/// same code; written only from tests.
+type WorkerSpawner = std::sync::Arc<dyn Fn() -> std::io::Result<()> + Send + Sync>;
+
+fn spawner_override() -> &'static Mutex<Option<WorkerSpawner>> {
+    static S: OnceLock<Mutex<Option<WorkerSpawner>>> = OnceLock::new();
+    S.get_or_init(|| Mutex::new(None))
+}
+
+/// The PRODUCTION WIRING — the only thing that puts a real thread behind the queue. Covered by
+/// `the_production_default_spawner_starts_the_real_resolve_worker`, and in practice by every drag
+/// test in this file, all of which need a live worker to drain what they enqueue.
+fn spawn_resolve_worker() -> std::io::Result<()> {
+    let injected = spawner_override().lock().ok().and_then(|g| g.clone());
+    match injected {
+        Some(f) => f(),
+        // Named, so it is identifiable in the hang captures this whole change exists to make
+        // unnecessary — and so a stack showing THIS thread inside `canonicalize` is immediately
+        // legible as "working as designed", not as a regression back onto the main thread.
+        None => std::thread::Builder::new()
+            .name("drag-path-resolve".to_string())
+            .spawn(resolve_worker)
+            .map(|_| ()),
+    }
+}
+
+/// Start the resolution worker if one is not already running.
+///
+/// NOT a `OnceLock`. `STARTED.get_or_init(|| { let _ = …spawn(…); })` completes the cell whether or
+/// not the spawn inside it succeeded, so ONE failed spawn — `EAGAIN` under thread pressure, which is
+/// precisely the loaded state a drag stall gets reported from in the first place — would be
+/// discarded silently and no worker ever started again for the life of the process. The symptom is
+/// maximally confusing and gives no hint of its cause: `enqueue` keeps succeeding on the main
+/// thread, `outstanding` never drains, every drag/drop registration is dropped on the floor, and
+/// every non-contained `validate_read_path` spends the full read budget before answering "refusing
+/// to read a path outside allowed directories".
+///
+/// So the flag is set FIRST (claiming the right to spawn, so two callers cannot both start a worker
+/// and break the FIFO ordering the whole design rests on) and rolled back if the spawn fails, which
+/// leaves the next `enqueue` to retry. `drag_watch::ensure_watcher` keeps the `let _ =` shape it
+/// inherited from `pty_write_watch.rs`: that worker is purely DIAGNOSTIC, so losing it costs a log
+/// line. This one is on the functional path.
+fn ensure_resolve_worker() {
+    if RESOLVE_WORKER_RUNNING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    if let Err(e) = spawn_resolve_worker() {
+        RESOLVE_WORKER_RUNNING.store(false, Ordering::SeqCst);
+        tracing::error!(
+            error = %e,
+            "drag path resolution worker failed to spawn; the next drag event will retry"
+        );
+    }
+}
+
+/// Clears the running flag if the worker thread ever leaves its loop, so the next `enqueue` starts a
+/// replacement instead of leaving the queue unattended for the life of the process.
+///
+/// `resolve_worker`'s loop has no `break`, so the only way out is an unwind — from the queue lock or
+/// the condvar wait, since `apply_registry_op` is caught below. Rare, and permanent if unhandled.
+struct WorkerLiveness;
+
+impl Drop for WorkerLiveness {
+    fn drop(&mut self) {
+        RESOLVE_WORKER_RUNNING.store(false, Ordering::SeqCst);
+        tracing::error!(
+            "drag path resolution worker exited; the next drag event will start a replacement"
+        );
+    }
+}
+
+/// Run `body` under a `WorkerLiveness` guard.
+///
+/// EXISTS TO BE TESTABLE, not for abstraction. Written inline as `let _liveness = WorkerLiveness;`
+/// the INSTALLATION was pinned by nothing: a test can construct and drop the guard directly, which
+/// proves `Drop` works and stays green if the binding is deleted — or, more plausibly, rewritten as
+/// `let _ = WorkerLiveness`, which drops it IMMEDIATELY and leaves the worker unsupervised while the
+/// flag reads `true` forever. Routing it through here lets a test drive a panicking body on its own
+/// thread and assert the flag came back down, without ever attaching a second worker to the queue
+/// (which would break FIFO). See `a_panic_inside_the_guarded_body_clears_the_flag` (roborev 67722).
+fn guarded_by_liveness(body: impl FnOnce()) {
+    let _liveness = WorkerLiveness;
+    body();
+}
+
+fn resolve_worker() {
+    guarded_by_liveness(resolve_worker_loop);
+}
+
+fn resolve_worker_loop() {
+    let q = resolve_queue();
+    loop {
+        let (ticket, op) = {
+            let mut st = q.state.lock().unwrap_or_else(|e| e.into_inner());
+            loop {
+                if let Some(next) = st.queued.pop_front() {
+                    break next;
+                }
+                // Park while there is nothing to resolve. `wait` releases the lock, so a drag event
+                // on the main thread is never blocked by a sleeping worker.
+                let (guard, _) = q
+                    .work
+                    .wait_timeout(st, Duration::from_secs(60))
+                    .unwrap_or_else(|e| e.into_inner());
+                st = guard;
+            }
+        };
+        // OUTSIDE the queue lock: this is where the blocking filesystem work happens, and holding
+        // the queue lock across it would put the main thread's `enqueue` right back behind it.
+        //
+        // CAUGHT, because an unwind here is not merely the loss of one registration. It would take
+        // the whole worker with it, and then `outstanding` never drains again: every subsequent
+        // attachment read spends the full budget waiting for a ticket nothing will ever retire and
+        // then answers from durable consent alone. Catching lets THIS ticket be drained (below) and
+        // the loop carry on, so one bad path costs one registration rather than the feature.
+        //
+        // AND CRASH RECORDS ARE SUPPRESSED ACROSS IT, which is this crate's convention for a
+        // firewall that RECOVERS (`crash.rs`'s hook comment; `audio.rs` and `dictation.rs` both do
+        // it). The process-wide panic hook runs BEFORE the unwind reaches this `catch_unwind`, so
+        // without the guard a single unresolvable path would write a `CrashRecord` to disk and, on a
+        // consenting mode, upload it — reporting the app as having crashed for a drag it fully
+        // survived (roborev 67722). The hook's `tracing::error!` still fires, so the panic stays
+        // visible in the log; only the false crash artifact is withheld.
+        let caught = {
+            let _suppress = crate::crash::suppress_crash_records();
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| apply_registry_op(op)))
+        };
+        if caught.is_err() {
+            tracing::error!(
+                "drag path resolution panicked applying a registration; dropping it and continuing"
+            );
+        }
+        {
+            let mut st = q.state.lock().unwrap_or_else(|e| e.into_inner());
+            st.outstanding.remove(&ticket);
+        }
+        q.done.notify_all();
+    }
+}
+
+/// The registry, recovered from poisoning rather than skipped.
+///
+/// PROPAGATING POISON HERE IS THE WORSE OUTCOME, and it used to be what happened: every writer took
+/// the lock as `if let Ok(mut c) = chosen().lock()` and the reader as `.map(…).unwrap_or(false)`, so
+/// one panic anywhere inside the critical section silently discarded EVERY later registration and
+/// answered EVERY later `is_user_chosen` with `false`, for the life of the process — with the worker
+/// looping cheerfully and `outstanding` draining normally, so none of the supervision above notices.
+/// A permanent, silent loss of the feature, which is exactly the class the firewall exists to remove
+/// (roborev 67722).
+///
+/// Recovering is sound for the same reason it is sound for `QueueState` three lines below: `Chosen`
+/// is two `VecDeque`s of canonical paths with no cross-field invariant a panic could leave
+/// half-written. The worst a recovered lock can hold is a queue missing one entry — which is the
+/// same outcome as the dropped registration the firewall already accepts, and strictly better than
+/// dropping all of them forever.
+fn chosen_locked() -> std::sync::MutexGuard<'static, Chosen> {
+    chosen().lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn apply_registry_op(op: RegistryOp) {
+    match op {
+        RegistryOp::Dragged { paths, window, at } => {
+            let _watch =
+                drag_watch::begin(drag_watch::Stage::Resolve, &window, "enter", paths.len());
+            let real = resolve_paths(paths);
+            chosen_locked().note_dragged(real, at, &window);
+        }
+        RegistryOp::Refresh { window, at } => {
+            chosen_locked().refresh_dragged(at, &window);
+        }
+        RegistryOp::Forget { window } => {
+            chosen_locked().forget_dragged(&window);
+        }
+        RegistryOp::Chosen { paths, window, phase } => {
+            let _watch =
+                drag_watch::begin(drag_watch::Stage::Resolve, &window, phase, paths.len());
+            let real = resolve_paths(paths);
+            chosen_locked().note_chosen(real, &window);
+        }
+    }
+}
+
+/// How long a read waits for outstanding registrations before answering without them.
+///
+/// It errs LONG for the same asymmetry `PROVISIONAL_TTL` documents: giving up early silently refuses
+/// a real drop (bead `sparkle-zviq`, the original bug), while waiting too long merely delays an
+/// attachment the user is already waiting on — and the caller is on the blocking pool, not the main
+/// thread, so nothing is frozen while it waits. It is bounded at all only so a `canonicalize` that
+/// NEVER returns cannot pin blocking-pool threads for the life of the process; the read side would
+/// have to canonicalize that same wedged path itself anyway.
+const RESOLVE_WAIT: Duration = Duration::from_secs(30);
+
+/// The budget one READ may spend ordering itself after the registrations already delivered.
+///
+/// A seam, read unconditionally so the production path and the tested path are the same code, and
+/// written only from tests. The DEADLINE branch of the wait is the whole point of this seam: it is
+/// the branch a stale registry is answered from, and against the shipping 30-second budget no test
+/// could reach it without wedging the suite for half a minute per assertion.
+fn resolve_wait_override() -> &'static Mutex<Option<Duration>> {
+    static W: OnceLock<Mutex<Option<Duration>>> = OnceLock::new();
+    W.get_or_init(|| Mutex::new(None))
+}
+
+fn resolve_wait() -> Duration {
+    resolve_wait_override()
+        .lock()
+        .ok()
+        .and_then(|g| *g)
+        .unwrap_or(RESOLVE_WAIT)
+}
+
+/// One read-ordering budget, shared by a whole command's worth of path checks.
+///
+/// `is_user_chosen` must be ordered after every registration delivered before it, and that wait is
+/// bounded by `resolve_wait()`. A BATCH command re-paying that bound per path is the part that
+/// turns a bounded wait into an unbounded one: against a wedged worker a 50-path `copy_files_to_dir`
+/// would occupy one blocking-pool thread for `RESOLVE_WAIT × 50` — roughly 25 minutes, with no
+/// cancellation — while the queue it is waiting on has not moved since the first path.
+///
+/// So the BUDGET is per command, not per path, while the WAIT stays per path. Each check still
+/// orders itself after everything delivered before it (in the healthy case that is one uncontended
+/// lock and a return, so nothing about the existing semantics changes); it just cannot spend more
+/// than one `resolve_wait()` between them all. A batch that runs out answers from the durable tier
+/// alone, exactly as a single timed-out read does.
+///
+/// LAZY, so a batch whose paths are all inside the allowed roots never waits at all: containment
+/// still short-circuits ahead of provenance, and the clock never starts.
+///
+/// SPENT TIME, NOT A DEADLINE — and the difference is the whole correctness of the amortisation
+/// (roborev 67513). A deadline stamped at the first check keeps running through work that is not
+/// waiting, and in this command's case that work is `std::fs::copy`: a 20-file, multi-GB
+/// `copy_files_to_dir` whose copies take longer than the budget would arrive at each remaining src
+/// with ZERO left, call `await_pending_registrations(Duration::ZERO)`, see an outstanding ticket and
+/// return `false` having waited no time at all. Those reads lose their ordering guarantee for a
+/// reason that has nothing to do with them — a src holding only a provisional grant is refused
+/// mid-batch where the pre-amortisation code would have waited and granted it. So the budget is an
+/// accumulator: only time actually spent INSIDE the wait is charged against it, and copying is free.
+struct ReadOrder {
+    /// What is left of the batch's single budget. `None` until the first read that actually reaches
+    /// provenance, so a batch entirely inside the allowed roots never starts the clock.
+    remaining: Option<Duration>,
+    /// Whether this batch has already reported an exhausted budget. One wedge behind twenty paths
+    /// is ONE event, not twenty identical lines.
+    warned: bool,
+}
+
+/// What one ordered read cost and what it concluded — see `ReadOrder::order`.
+struct ReadOrdering {
+    /// Whether the registry is now up to date. `false` means the caller holds a registry it knows is
+    /// behind events the OS has already delivered.
+    drained: bool,
+    /// How much of the batch budget this read was actually offered. Logged instead of the constant,
+    /// because a read that was offered 0 ms did not exhaust a 30-second budget and must not say so.
+    offered: Duration,
+    /// True only on the FIRST failure of this batch, so the warning fires once per wedge.
+    first_failure: bool,
+}
+
+impl ReadOrder {
+    fn new() -> Self {
+        ReadOrder { remaining: None, warned: false }
+    }
+
+    /// Order this read after the registrations already delivered, spending at most what is left of
+    /// the batch's single budget — and charging back only what the wait itself consumed.
+    fn order(&mut self) -> ReadOrdering {
+        let offered = *self.remaining.get_or_insert_with(resolve_wait);
+        let started = Instant::now();
+        let drained = await_pending_registrations(offered);
+        // MEASURED AROUND THE WAIT AND NOTHING ELSE. Everything between two `order()` calls — the
+        // copy, the canonicalize, the caller's own work — is deliberately not charged.
+        self.remaining = Some(offered.saturating_sub(started.elapsed()));
+        let first_failure = if drained {
+            false
+        } else {
+            let first = !self.warned;
+            self.warned = true;
+            first
+        };
+        ReadOrdering { drained, offered, first_failure }
+    }
+}
+
+/// Block until every registration issued BEFORE this call has been applied.
+///
+/// RETURNS WHETHER IT ACTUALLY DRAINED. `false` means the deadline passed with registrations still
+/// outstanding — the caller is then holding a registry it KNOWS is behind events the OS has already
+/// delivered, and must not read it as though it were complete. Returning `()` and simply breaking
+/// out of the loop was the defect: it made "everything applied" and "gave up with a revocation still
+/// queued" indistinguishable to the one caller whose whole job is to tell them apart.
+///
+/// Snapshotting `next_ticket` on entry, rather than waiting for a globally empty queue, is what
+/// bounds this: a stream of new drag events arriving while we wait cannot keep extending the wait.
+/// The reader only ever needed the registrations that already happened.
+///
+/// NEVER call this from the main thread — that would reintroduce exactly the freeze this module was
+/// restructured to remove. Every caller reaches it from an `async` command's `spawn_blocking` body.
+#[must_use = "a timed-out wait leaves the registry stale — see is_user_chosen"]
+fn await_pending_registrations(timeout: Duration) -> bool {
+    let q = resolve_queue();
+    let mut st = q.state.lock().unwrap_or_else(|e| e.into_inner());
+    let high = match st.next_ticket.checked_sub(1) {
+        Some(h) => h,
+        // Nothing has ever been enqueued, so there is nothing to wait for.
+        None => return true,
+    };
+    let deadline = Instant::now() + timeout;
+    while matches!(st.outstanding.iter().next(), Some(&t) if t <= high) {
+        let now = Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        let (guard, _) = q
+            .done
+            .wait_timeout(st, deadline - now)
+            .unwrap_or_else(|e| e.into_inner());
+        st = guard;
+    }
+    true
+}
+
+/// A drag is now OVER `window` (`DragDropEvent::Enter`). Provisional only — see the tier note.
+///
+/// The stamp is taken HERE, at delivery, not when the worker gets to it: `Instant::now()` is a cheap
+/// monotonic read rather than a syscall, and using it means `PROVISIONAL_TTL` still measures from
+/// when the OS told us, exactly as it did when this ran inline.
+fn note_dragged_paths<I: IntoIterator<Item = PathBuf>>(paths: I, window: &str) {
+    enqueue(RegistryOp::Dragged {
+        paths: paths.into_iter().collect(),
+        window: window.to_owned(),
+        at: Instant::now(),
+    });
 }
 
 /// The drag is still over `window` (`DragDropEvent::Over`) — renew its provisional stamps.
 fn refresh_dragged_paths(window: &str) {
-    if let Ok(mut c) = chosen().lock() {
-        c.refresh_dragged(Instant::now(), window);
-    }
+    enqueue(RegistryOp::Refresh { window: window.to_owned(), at: Instant::now() });
 }
 
 /// The drag left `window` without dropping (`DragDropEvent::Leave`) — it was never for us.
 fn forget_dragged_paths(window: &str) {
-    if let Ok(mut c) = chosen().lock() {
-        c.forget_dragged(window);
-    }
+    enqueue(RegistryOp::Forget { window: window.to_owned() });
 }
 
 /// Record paths the user genuinely chose through the OS: a completed DROP, or a native file panel.
@@ -320,18 +804,23 @@ fn forget_dragged_paths(window: &str) {
 /// The native panel is not attached to any window's drag state, so it passes a window label that
 /// matches no live hover — it only ADDS durable entries, and must not clear anyone's provisional set.
 pub fn note_user_chosen_paths<I: IntoIterator<Item = PathBuf>>(paths: I) {
-    note_chosen_from(paths, NO_WINDOW);
+    note_chosen_from(paths, NO_WINDOW, "panel");
 }
 
 /// A label no real window has, for consent that did not arrive through a window's drag (the native
 /// file panel). Tauri window labels are non-empty, so this cannot collide with one.
 const NO_WINDOW: &str = "";
 
-fn note_chosen_from<I: IntoIterator<Item = PathBuf>>(paths: I, window: &str) {
-    let real = canonical_all(paths);
-    if let Ok(mut c) = chosen().lock() {
-        c.note_chosen(real, window);
-    }
+fn note_chosen_from<I: IntoIterator<Item = PathBuf>>(
+    paths: I,
+    window: &str,
+    phase: &'static str,
+) {
+    enqueue(RegistryOp::Chosen {
+        paths: paths.into_iter().collect(),
+        window: window.to_owned(),
+        phase,
+    });
 }
 
 /// The single entry point from `lib.rs`'s `on_window_event`. Everything that decides a grant lives on
@@ -347,9 +836,47 @@ fn note_chosen_from<I: IntoIterator<Item = PathBuf>>(paths: I, window: &str) {
 /// `WindowGrant`, and tested.
 pub fn note_window_event(window: &str, event: &tauri::WindowEvent) {
     match dispatch_window(event) {
-        WindowGrant::Drag(drag) => note_drag_event(window, drag),
-        WindowGrant::Teardown => note_window_gone(window),
+        WindowGrant::Drag(drag) => {
+            // THE MAIN-THREAD SPAN. Everything between here and the guard's drop runs on the AppKit
+            // main thread with the UI stopped, so this is the span that has to be observable — see
+            // `drag_watch.rs` for why nothing else in the app could see it.
+            let _watch = drag_watch::begin(
+                drag_watch::Stage::Dispatch,
+                window,
+                drag_phase_name(drag),
+                drag_path_count(drag),
+            );
+            note_drag_event(window, drag)
+        }
+        WindowGrant::Teardown => {
+            let _watch =
+                drag_watch::begin(drag_watch::Stage::Dispatch, window, "teardown", 0);
+            note_window_gone(window)
+        }
         WindowGrant::Ignore => {}
+    }
+}
+
+/// The drag phase as a FIXED token for the log. A closed vocabulary by construction — there is no
+/// arm that can put user data in it, which is the property that keeps paths out of a log that ships
+/// with support tickets (`note_drag_event` records why that matters).
+fn drag_phase_name(event: &tauri::DragDropEvent) -> &'static str {
+    match event {
+        tauri::DragDropEvent::Enter { .. } => "enter",
+        tauri::DragDropEvent::Over { .. } => "over",
+        tauri::DragDropEvent::Drop { .. } => "drop",
+        tauri::DragDropEvent::Leave => "leave",
+        _ => "other",
+    }
+}
+
+/// How many paths a drag phase carries. A COUNT, never the paths.
+fn drag_path_count(event: &tauri::DragDropEvent) -> usize {
+    match event {
+        tauri::DragDropEvent::Enter { paths, .. } | tauri::DragDropEvent::Drop { paths, .. } => {
+            paths.len()
+        }
+        _ => 0,
     }
 }
 
@@ -402,7 +929,7 @@ pub fn note_drag_event(window: &str, event: &tauri::DragDropEvent) {
     match dispatch_drag(event) {
         DragGrant::Provisional(paths) => note_dragged_paths(paths, window),
         DragGrant::Renew => refresh_dragged_paths(window),
-        DragGrant::Durable(paths) => note_chosen_from(paths, window),
+        DragGrant::Durable(paths) => note_chosen_from(paths, window, "drop"),
         DragGrant::Forget => forget_dragged_paths(window),
         DragGrant::Ignore => {}
     }
@@ -629,11 +1156,77 @@ fn remember_into(q: &mut VecDeque<PathBuf>, real: PathBuf, cap: usize) {
 }
 
 /// True when `real` (already canonicalized) is one the user handed us, or one currently being
-/// dragged over the window. A poisoned lock reads as "not chosen" — fail-closed, falling back to
-/// plain containment.
-fn is_user_chosen(real: &Path) -> bool {
+/// dragged over the window. A poisoned registry is RECOVERED rather than read as "not chosen" — see
+/// `chosen_locked` for why propagating the poison was the worse failure.
+///
+/// BLOCKS while a registration is in flight — see the body. Callers reach this only from an `async`
+/// command's `spawn_blocking` body; calling it from the AppKit main thread would reintroduce the
+/// freeze the registration path was restructured to remove.
+fn is_user_chosen(real: &Path, order: &mut ReadOrder) -> bool {
+    // FIRST, not as a fallback when the answer is "no". Registration is performed by a background
+    // worker (see the main-thread note above), so at any instant the registry may be missing drag
+    // events the OS has already delivered — and BOTH DIRECTIONS matter:
+    //
+    //   - a GRANT still in flight. Tauri emits the JS drag-drop event to the frontend BEFORE running
+    //     the window-event listener, so `load_attachment` for a drop that is genuinely happening
+    //     right now can arrive mid-registration. Answering "no" there is the silent refusal of bead
+    //     `sparkle-zviq`, restored by the very fix that removed the freeze.
+    //
+    //   - a REVOCATION still in flight, which is the half that is easy to miss. `Leave` and a window
+    //     teardown are queued behind the `Enter` whose entries they revoke, so a read that consulted
+    //     the registry first would find the hover STILL PRESENT and return `true` without ever
+    //     waiting — granting a path for a drag that has already left. An earlier draft did exactly
+    //     that (fast-path on the positive answer, wait only on the negative) and two existing tier
+    //     tests caught it under full-suite load, where the worker lags behind the test thread.
+    //
+    // So: order the read AFTER every drag event delivered before it, then answer. That is the
+    // semantics the inline version had for free, and restoring it is what makes moving the work off
+    // the main thread invisible to every rule in `Chosen`.
+    //
+    // Waiting here is free: every command that reaches this is `async` and does its work under
+    // `spawn_blocking`, so the wait costs a pool thread and freezes nothing. When nothing is
+    // outstanding — the overwhelmingly common case — it is one uncontended lock and a return.
+    // AND THE WAIT CAN TIME OUT, which is the case this branch exists for. `resolve_wait()` is 30
+    // seconds and `PROVISIONAL_TTL` is 60, so a worker wedged inside `canonicalize` for longer than
+    // the budget leaves a registry that still holds a hover whose `Forget` — from `Leave` or from
+    // `note_window_gone` — is queued behind the wedge and unapplied, while that entry is still well
+    // inside its TTL. Answering from it would grant a path for a drag that has already left the
+    // window: precisely what the revocation half of the note above, and the tier itself, exist to
+    // deny. Reading a registry known to be behind, as though it were complete, is the wait failing
+    // OPEN in the one direction this module says it must not.
+    //
+    // WHICH FAIL-CLOSED, AND WHY THIS ONE. Refusing everything on timeout would be the blunt answer,
+    // and it is worse than the tiered one for no security gain: it would refuse a file the user
+    // genuinely dropped or picked minutes ago — a download or a clipboard copy of an existing
+    // attachment — because some unrelated drag wedged the worker, which is bead `sparkle-zviq`'s
+    // silent refusal restored under a new trigger. The DURABLE tier cannot be over-reported by a
+    // stale registry at all (see `Chosen::contains_durable`: nothing queued revokes it), so consent
+    // stays readable and only the tier that a queued `Forget` can falsify is dropped. The refusal we
+    // do take is a genuine hover-read during a wedge, which is the narrow case actually at risk.
+    let ordering = order.order();
     let now = Instant::now();
-    chosen().lock().map(|c| c.contains(real, now)).unwrap_or(false)
+    let c = chosen_locked();
+    if ordering.drained {
+        c.contains(real, now)
+    } else {
+        // Visible, because from the outside a timed-out read is indistinguishable from a path that
+        // was simply never granted — and the cause is a wedged worker, not the user's path.
+        //
+        // ONCE PER BATCH, and reporting what THIS read was actually offered rather than the
+        // constant. Twenty paths behind one wedged worker are one event; and a later path in an
+        // exhausted batch is offered 0 ms, so logging `resolve_wait()` there would assert a
+        // 30-second budget exhaustion that never happened (roborev 67513).
+        if ordering.first_failure {
+            tracing::warn!(
+                offered_ms = ordering.offered.as_millis() as u64,
+                budget_ms = resolve_wait().as_millis() as u64,
+                "drag path resolution did not drain within the read budget; answering from durable \
+                 consent only (a queued revocation may be unapplied). Further paths in this batch \
+                 are not logged."
+            );
+        }
+        c.contains_durable(real)
+    }
 }
 
 /// Validate a path we're about to READ (it must already exist). Canonicalizing first resolves
@@ -642,10 +1235,20 @@ fn is_user_chosen(real: &Path) -> bool {
 /// the OS (see the provenance note above); otherwise rejects anything outside the allowed roots or
 /// reaching a hidden component.
 fn validate_read_path(path: &Path, roots: &[PathBuf]) -> Result<PathBuf, String> {
+    validate_read_path_ordered(path, roots, &mut ReadOrder::new())
+}
+
+/// `validate_read_path` for a BATCH: every path in one command shares a single `ReadOrder`, so the
+/// read-ordering budget is paid once for the command rather than once per path. See `ReadOrder`.
+fn validate_read_path_ordered(
+    path: &Path,
+    roots: &[PathBuf],
+    order: &mut ReadOrder,
+) -> Result<PathBuf, String> {
     let real = path
         .canonicalize()
         .map_err(|e| format!("cannot access {}: {e}", path.display()))?;
-    if is_contained_and_visible(&real, roots) || is_user_chosen(&real) {
+    if is_contained_and_visible(&real, roots) || is_user_chosen(&real, order) {
         Ok(real)
     } else {
         Err(format!("refusing to read a path outside allowed directories: {}", path.display()))
@@ -910,38 +1513,55 @@ pub async fn copy_files_to_dir(srcs: Vec<String>, dest_dir: String) -> Result<()
         // Defense-in-depth: the destination folder (normally the OS folder picker) must be inside
         // the allowed roots, and each src is containment-checked before it's read. Guards the
         // direct-invoke bypass of the dialog.
-        let roots = allowed_roots();
-        let dir = validate_dir_path(Path::new(&dest_dir), &roots)?;
-        let mut claimed: HashSet<String> = HashSet::new();
-        let mut errors: Vec<String> = Vec::new();
-        for src in &srcs {
-            let real_src = match validate_read_path(Path::new(src), &roots) {
-                Ok(r) => r,
-                Err(e) => {
-                    errors.push(e);
-                    continue;
-                }
-            };
-            let name = match real_src.file_name() {
-                Some(n) => n.to_owned(),
-                None => {
-                    errors.push(format!("no filename in {src}"));
-                    continue;
-                }
-            };
-            let dest = unique_dest(&dir, &name, &mut claimed);
-            if let Err(e) = std::fs::copy(&real_src, &dest) {
-                errors.push(format!("{src}: {e}"));
-            }
-        }
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(errors.join("; "))
-        }
+        copy_files_to_dir_blocking(&srcs, &dest_dir, &allowed_roots())
     })
     .await
     .map_err(|e| format!("copy_files task failed: {e}"))?
+}
+
+/// The body of `copy_files_to_dir`, with the allowed roots passed in.
+///
+/// Split out for the same reason `load_blocking` / `probe_blocking` are: a test can then drive the
+/// REAL batch loop — the thing whose per-path wait is the defect — against roots it controls,
+/// instead of asserting on a helper the command might not even call.
+fn copy_files_to_dir_blocking(
+    srcs: &[String],
+    dest_dir: &str,
+    roots: &[PathBuf],
+) -> Result<(), String> {
+    let dir = validate_dir_path(Path::new(dest_dir), roots)?;
+    let mut claimed: HashSet<String> = HashSet::new();
+    let mut errors: Vec<String> = Vec::new();
+    // ONE read-ordering budget for the whole batch. Per-path it would be `RESOLVE_WAIT` times the
+    // number of srcs against a wedged resolver — ~25 minutes on one blocking-pool thread for a
+    // 50-file copy, with nothing to cancel it — while the queue being waited on has not moved since
+    // the first path. See `ReadOrder`.
+    let mut order = ReadOrder::new();
+    for src in srcs {
+        let real_src = match validate_read_path_ordered(Path::new(src), roots, &mut order) {
+            Ok(r) => r,
+            Err(e) => {
+                errors.push(e);
+                continue;
+            }
+        };
+        let name = match real_src.file_name() {
+            Some(n) => n.to_owned(),
+            None => {
+                errors.push(format!("no filename in {src}"));
+                continue;
+            }
+        };
+        let dest = unique_dest(&dir, &name, &mut claimed);
+        if let Err(e) = std::fs::copy(&real_src, &dest) {
+            errors.push(format!("{src}: {e}"));
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
 }
 
 #[cfg(test)]
@@ -990,7 +1610,7 @@ mod tests {
     }
 
     // ── Path containment (defense-in-depth) ─────────────────────────────────────────────────
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
     static SEQ: AtomicU32 = AtomicU32::new(0);
 
     /// A fresh, real temp dir to use as the single allowed ROOT for a containment test. Returning a
@@ -1811,6 +2431,982 @@ mod tests {
             DragGrant::Renew,
             "Over is the OS confirming the hover is live — it must renew the TTL"
         );
+    }
+
+    // ── Off the AppKit main thread (bead `sparkle-bxidpw`) ──────────────────────────────────────
+    //
+    // These drive the REAL entry point Tauri calls on the main thread — `note_window_event` — with
+    // path resolution made arbitrarily slow through the injected seam. That injection is what makes
+    // the property observable at all: against a resolver that always returns instantly, "the main
+    // thread was released while resolution was outstanding" and "the main thread blocked until
+    // resolution finished" produce identical observations, which is the vacuous shape AGENTS.md
+    // warns about. `the_production_default_resolver_really_canonicalizes` covers the other half —
+    // that the PRODUCTION wiring, with nothing injected, is the real `canonicalize`.
+
+    /// Installs a path resolver for the life of the guard, restoring the production default after.
+    ///
+    /// The restore first DRAINS the queue, because an op enqueued under the injected resolver but
+    /// not yet applied would otherwise be resolved by the production default — a test's setup
+    /// leaking into whatever ran next.
+    struct ResolverOverride;
+
+    impl ResolverOverride {
+        fn install(f: PathResolver) -> Self {
+            *resolver_override().lock().unwrap_or_else(|e| e.into_inner()) = Some(f);
+            ResolverOverride
+        }
+    }
+
+    impl Drop for ResolverOverride {
+        fn drop(&mut self) {
+            let _ = await_pending_registrations(Duration::from_secs(10));
+            *resolver_override().lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
+    }
+
+    #[derive(Default)]
+    struct GateState {
+        entered: usize,
+        released: bool,
+    }
+
+    /// A path resolver that BLOCKS inside itself until the test releases it, then does the REAL
+    /// production resolution so the registry still ends up holding genuine canonical paths.
+    ///
+    /// The 3-second self-release cap is deliberate. A regression that put resolution back on the
+    /// calling thread must FAIL the timing assertion, not hang the suite forever — a test that wedges
+    /// is a test nobody can read the verdict of.
+    #[derive(Clone)]
+    struct ResolverGate(std::sync::Arc<(Mutex<GateState>, Condvar)>);
+
+    impl ResolverGate {
+        const SELF_RELEASE: Duration = Duration::from_secs(3);
+
+        fn new() -> Self {
+            ResolverGate(std::sync::Arc::new((Mutex::new(GateState::default()), Condvar::new())))
+        }
+
+        fn resolver(&self) -> PathResolver {
+            let inner = std::sync::Arc::clone(&self.0);
+            std::sync::Arc::new(move |paths: Vec<PathBuf>| {
+                let (m, cv) = &*inner;
+                let mut st = m.lock().unwrap_or_else(|e| e.into_inner());
+                st.entered += 1;
+                cv.notify_all();
+                let deadline = Instant::now() + ResolverGate::SELF_RELEASE;
+                while !st.released {
+                    let now = Instant::now();
+                    if now >= deadline {
+                        break;
+                    }
+                    let (g, _) =
+                        cv.wait_timeout(st, deadline - now).unwrap_or_else(|e| e.into_inner());
+                    st = g;
+                }
+                drop(st);
+                canonical_all(paths)
+            })
+        }
+
+        /// Block until the resolver has been entered at least `n` times. Returns false on timeout.
+        fn wait_entered(&self, n: usize) -> bool {
+            let (m, cv) = &*self.0;
+            let mut st = m.lock().unwrap_or_else(|e| e.into_inner());
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while st.entered < n {
+                let now = Instant::now();
+                if now >= deadline {
+                    return false;
+                }
+                let (g, _) = cv.wait_timeout(st, deadline - now).unwrap_or_else(|e| e.into_inner());
+                st = g;
+            }
+            true
+        }
+
+        fn is_released(&self) -> bool {
+            self.0 .0.lock().unwrap_or_else(|e| e.into_inner()).released
+        }
+
+        fn release(&self) {
+            let (m, cv) = &*self.0;
+            m.lock().unwrap_or_else(|e| e.into_inner()).released = true;
+            cv.notify_all();
+        }
+    }
+
+    /// Shrinks the read-ordering budget for the life of the guard.
+    ///
+    /// The DEADLINE branch of `await_pending_registrations` is the branch a stale registry gets
+    /// answered from, and against the shipping 30-second budget nothing could reach it without
+    /// parking the suite for half a minute per assertion — which is why that branch shipped covered
+    /// by nothing at all.
+    struct ResolveWaitOverride;
+
+    impl ResolveWaitOverride {
+        fn install(d: Duration) -> Self {
+            *resolve_wait_override().lock().unwrap_or_else(|e| e.into_inner()) = Some(d);
+            ResolveWaitOverride
+        }
+    }
+
+    impl Drop for ResolveWaitOverride {
+        fn drop(&mut self) {
+            *resolve_wait_override().lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
+    }
+
+    fn leave_event() -> tauri::WindowEvent {
+        tauri::WindowEvent::DragDrop(tauri::DragDropEvent::Leave)
+    }
+
+    fn drop_event(paths: Vec<PathBuf>) -> tauri::WindowEvent {
+        tauri::WindowEvent::DragDrop(tauri::DragDropEvent::Drop { paths, position: drag_position() })
+    }
+
+    fn enter_event(paths: Vec<PathBuf>) -> tauri::WindowEvent {
+        tauri::WindowEvent::DragDrop(tauri::DragDropEvent::Enter { paths, position: drag_position() })
+    }
+
+    /// THE DEFECT, as a test. `note_window_event` is run SYNCHRONOUSLY BY TAURI ON THE APPKIT MAIN
+    /// THREAD, and it used to call `std::fs::canonicalize` inline — an unbounded blocking syscall,
+    /// once per dragged path, on `Enter` as well as `Drop`. Against a dataless iCloud placeholder or
+    /// a stalled network mount that parks the UI for as long as the syscall takes, and `Enter` fires
+    /// for ANY drag crossing the window, including one on its way to another app.
+    ///
+    /// The assertion is the SIDE EFFECT — we are back on the calling thread while the resolution it
+    /// triggered is demonstrably still running — not that some function was called. Against the
+    /// pre-fix code this fails by taking `ResolverGate::SELF_RELEASE` to return.
+    #[test]
+    fn note_window_event_returns_while_path_resolution_is_still_outstanding() {
+        let _serialized = global_drag_lock();
+        let outside = fresh_root();
+        let f = outside.join("slow-to-resolve.txt");
+        touch(&f);
+
+        let gate = ResolverGate::new();
+        let _installed = ResolverOverride::install(gate.resolver());
+
+        let t0 = Instant::now();
+        note_window_event("bxidpw-prompt", &drop_event(vec![f.clone()]));
+        let on_the_calling_thread = t0.elapsed();
+
+        assert!(gate.wait_entered(1), "path resolution must actually have been started");
+        assert!(
+            !gate.is_released(),
+            "precondition: nothing has released the resolver, so it is STILL running right now"
+        );
+        assert!(
+            on_the_calling_thread < Duration::from_millis(100),
+            "note_window_event runs on the AppKit main thread and must return while resolution is \
+             still outstanding — it took {on_the_calling_thread:?}"
+        );
+
+        gate.release();
+    }
+
+    /// THE OTHER HALF, and the one that makes the fix safe: bead `sparkle-zviq`. Tauri emits the JS
+    /// drag-drop event to the frontend BEFORE it runs this listener, so `load_attachment` for a drop
+    /// that is genuinely happening right now can arrive while that drop's registration is still in
+    /// flight. A read that answered "not chosen" there would be the original silent refusal,
+    /// restored by the very change that removed the freeze.
+    ///
+    /// So the read must WAIT — and waiting is free, because every command that reaches it is `async`
+    /// and does its work under `spawn_blocking`. Deleting `await_pending_registrations` from
+    /// `is_user_chosen` fails this test twice over: the read finishes early, and it finishes wrong.
+    #[test]
+    fn a_drop_still_resolving_makes_the_read_wait_rather_than_refusing_it() {
+        let _serialized = global_drag_lock();
+        let outside = fresh_root();
+        let f = outside.join("read-me-immediately.txt");
+        touch(&f);
+
+        let gate = ResolverGate::new();
+        let _installed = ResolverOverride::install(gate.resolver());
+
+        note_window_event("zviq-race", &drop_event(vec![f.clone()]));
+        assert!(gate.wait_entered(1), "the drop's registration is in flight");
+
+        let target = f.clone();
+        let reader = std::thread::spawn(move || {
+            // No containment at all: provenance is the only rule that can grant this path, exactly
+            // as for the `/private/tmp` file in the original report.
+            let roots: Vec<PathBuf> = vec![];
+            validate_read_path(&target, &roots).is_ok()
+        });
+
+        std::thread::sleep(Duration::from_millis(120));
+        assert!(
+            !reader.is_finished(),
+            "a read arriving mid-resolution must WAIT for it — an answer now could only be the \
+             silent refusal of sparkle-zviq"
+        );
+
+        gate.release();
+        assert!(
+            reader.join().expect("reader thread"),
+            "and once resolution lands, the dropped file must be readable"
+        );
+    }
+
+    /// THE OTHER DIRECTION, and the one an earlier draft of this change got wrong. Making the read
+    /// wait only when the registry says "no" looks like a harmless fast path and is not: a `Leave` or
+    /// a window teardown is a REVOCATION queued behind the `Enter` whose entries it revokes, so a
+    /// read that consults the registry first finds the hover STILL PRESENT and answers `true` without
+    /// ever waiting — granting a path for a drag that has already left the window.
+    ///
+    /// That draft passed every filtered run and only reddened two existing tier tests under
+    /// full-suite load, where the worker lags behind the test thread. Luck is not a guard, so this
+    /// pins it deterministically: the revocation is held behind a resolution that is blocked on
+    /// command, and the read must still come back refused.
+    #[test]
+    fn a_revocation_still_queued_is_not_raced_by_a_read() {
+        let _serialized = global_drag_lock();
+        let outside = fresh_root();
+        let hovered = outside.join("already-left.txt");
+        let blocker = outside.join("blocks-the-worker.txt");
+        touch(&hovered);
+        touch(&blocker);
+        let roots: Vec<PathBuf> = vec![];
+
+        // 1. An ordinary hover, fully registered — the grant really is in the registry.
+        note_window_event("race-window", &enter_event(vec![hovered.clone()]));
+        assert!(
+            validate_read_path(&hovered, &roots).is_ok(),
+            "precondition: the hover is granted and applied"
+        );
+
+        // 2. Wedge the worker inside a resolution for an UNRELATED window, so whatever is queued
+        //    behind it cannot be applied. A different label, so it does not disturb the hover above.
+        let gate = ResolverGate::new();
+        let installed = ResolverOverride::install(gate.resolver());
+        note_window_event("race-blocker", &enter_event(vec![blocker]));
+        assert!(gate.wait_entered(1), "the worker is now blocked inside a resolution");
+
+        // 3. The drag leaves. The revocation is queued BEHIND the blocked resolution, so right now
+        //    the registry still holds the grant from step 1.
+        note_window_event("race-window", &leave_event());
+
+        // 4. Release on a timer, so the read below is the thing that has to wait.
+        let releaser = {
+            let gate = gate.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(150));
+                gate.release();
+            })
+        };
+
+        assert!(
+            validate_read_path(&hovered, &roots).is_err(),
+            "a read must not be answered from a registry that has not yet applied the Leave it was \
+             already told about — that grants a path for a drag which has already left"
+        );
+
+        releaser.join().expect("releaser thread");
+        drop(installed);
+    }
+
+    /// THE SAME REVOCATION, PAST THE DEADLINE — the branch the test above never reaches.
+    ///
+    /// `a_revocation_still_queued_is_not_raced_by_a_read` releases the wedge after 150 ms, so it only
+    /// ever exercises the wait SUCCEEDING. The interesting case is the wait giving up: `RESOLVE_WAIT`
+    /// is 30 s while `PROVISIONAL_TTL` is 60, so a worker wedged inside `canonicalize` for longer
+    /// than the budget leaves a hover whose `Forget` is queued behind the wedge and unapplied, while
+    /// the entry itself is still comfortably inside its TTL. The pre-fix `await_pending_registrations`
+    /// returned `()` and simply broke out of its loop, so the read could not tell "everything
+    /// applied" from "gave up with a revocation still queued" — and answered from the stale registry,
+    /// granting a path for a drag that had already left the window.
+    ///
+    /// The assertion is the SIDE EFFECT: the read comes back REFUSED. Reverting the wait to `()` (or
+    /// consulting `contains` instead of `contains_durable` on timeout) fails it.
+    #[test]
+    fn a_read_that_times_out_with_a_revocation_still_queued_refuses_the_hover() {
+        let _serialized = global_drag_lock();
+        let outside = fresh_root();
+        let hovered = outside.join("left-while-the-worker-was-wedged.txt");
+        let blocker = outside.join("wedges-the-worker.txt");
+        touch(&hovered);
+        touch(&blocker);
+        let roots: Vec<PathBuf> = vec![];
+
+        // 1. An ordinary hover, fully applied — the grant really is in the registry.
+        note_window_event("deadline-window", &enter_event(vec![hovered.clone()]));
+        assert!(
+            validate_read_path(&hovered, &roots).is_ok(),
+            "precondition: the hover is granted and applied"
+        );
+
+        // 2. Wedge the worker inside a resolution for an UNRELATED window, so whatever is queued
+        //    behind it cannot be applied.
+        let gate = ResolverGate::new();
+        let installed = ResolverOverride::install(gate.resolver());
+        note_window_event("deadline-blocker", &enter_event(vec![blocker]));
+        assert!(gate.wait_entered(1), "the worker is now wedged inside a resolution");
+
+        // 3. The drag leaves. The revocation is queued BEHIND the wedge, so the registry still holds
+        //    the grant from step 1 — and will for as long as the wedge lasts.
+        note_window_event("deadline-window", &leave_event());
+
+        // 4. And unlike the test above, NOTHING releases the wedge. The read must cross its deadline.
+        let _short = ResolveWaitOverride::install(Duration::from_millis(80));
+        assert!(
+            validate_read_path(&hovered, &roots).is_err(),
+            "a read whose wait TIMED OUT must not be answered from the provisional tier — the \
+             registry it would consult is known to be missing a Leave it was already told about, \
+             and PROVISIONAL_TTL outlives RESOLVE_WAIT by 30 seconds"
+        );
+        assert!(
+            !gate.is_released(),
+            "and the revocation really was still queued while that answer was given"
+        );
+
+        gate.release();
+        drop(installed);
+    }
+
+    /// THE PAIR, and the reason the fix is tiered rather than a blanket refusal. One test showing a
+    /// timed-out read says "no" is ambiguous — a read that always says "no" would pass it while
+    /// restoring bead `sparkle-zviq`'s silent refusal for every attachment in the app whenever any
+    /// unrelated drag wedges the worker.
+    ///
+    /// Durable consent is the tier a stale registry cannot OVER-report: nothing queued revokes it
+    /// (`Forget` touches `provisional` alone, `note_chosen` only adds), so a file the user really
+    /// dropped or picked stays downloadable through a wedge. Making `is_user_chosen` return a bare
+    /// `false` on timeout fails this.
+    #[test]
+    fn a_read_that_times_out_still_honours_consent_the_user_actually_gave() {
+        let _serialized = global_drag_lock();
+        let outside = fresh_root();
+        let dropped = outside.join("really-dropped.txt");
+        let blocker = outside.join("wedges-the-worker-too.txt");
+        touch(&dropped);
+        touch(&blocker);
+        let roots: Vec<PathBuf> = vec![];
+
+        note_window_event("durable-deadline-window", &drop_event(vec![dropped.clone()]));
+        assert!(
+            validate_read_path(&dropped, &roots).is_ok(),
+            "precondition: the drop is registered"
+        );
+
+        let gate = ResolverGate::new();
+        let installed = ResolverOverride::install(gate.resolver());
+        note_window_event("durable-deadline-blocker", &enter_event(vec![blocker]));
+        assert!(gate.wait_entered(1), "the worker is wedged");
+
+        let _short = ResolveWaitOverride::install(Duration::from_millis(80));
+        assert!(
+            validate_read_path(&dropped, &roots).is_ok(),
+            "a wedged worker must not revoke consent the user actually gave — refusing here is the \
+             silent refusal of sparkle-zviq under a new trigger"
+        );
+        assert!(!gate.is_released(), "and it really was still wedged");
+
+        gate.release();
+        drop(installed);
+    }
+
+    /// THE BATCH HALF of the same finding. The read-ordering wait is bounded at 30 s so one wedged
+    /// `canonicalize` cannot pin a blocking-pool thread forever — but a batch command re-paying that
+    /// bound PER PATH turns the bound back into an unbounded wait: 50 non-contained srcs is ~25
+    /// minutes on one thread, with nothing to cancel it, while the queue being waited on has not
+    /// moved since the first path.
+    ///
+    /// TIME IS THE ASSERTION HERE, deliberately: both the fixed and the per-path forms refuse all
+    /// these paths, so the only thing that separates them is how long the command occupies its
+    /// thread. Restoring `validate_read_path` inside the loop makes this take `N` budgets instead of
+    /// one and fails it.
+    #[test]
+    fn a_batch_copy_pays_the_read_budget_once_not_once_per_path() {
+        let _serialized = global_drag_lock();
+        let outside = fresh_root();
+        let dest = fresh_root();
+        let blocker = outside.join("wedges-the-batch.txt");
+        touch(&blocker);
+        // Only the destination is an allowed root, so every src must go through provenance — which
+        // is the path that waits.
+        let roots = vec![dest.clone()];
+
+        const PATHS: usize = 20;
+        const BUDGET: Duration = Duration::from_millis(150);
+        let srcs: Vec<String> = (0..PATHS)
+            .map(|n| {
+                let f = outside.join(format!("batch-{n}.txt"));
+                touch(&f);
+                f.to_string_lossy().into_owned()
+            })
+            .collect();
+
+        let gate = ResolverGate::new();
+        let installed = ResolverOverride::install(gate.resolver());
+        note_window_event("batch-blocker", &enter_event(vec![blocker]));
+        assert!(gate.wait_entered(1), "the worker is wedged, so every read must wait its budget out");
+
+        let _short = ResolveWaitOverride::install(BUDGET);
+        let t0 = Instant::now();
+        let err = copy_files_to_dir_blocking(&srcs, dest.to_str().unwrap(), &roots)
+            .expect_err("no src was ever granted, so every one must be refused");
+        let elapsed = t0.elapsed();
+
+        assert_eq!(
+            err.matches("refusing to read a path outside allowed directories").count(),
+            PATHS,
+            "precondition: every src really did reach the provenance check"
+        );
+        // GENEROUS ON PURPOSE. The amortised form spends ~1 budget and the per-path form spends 20,
+        // so the discriminating gap is 20:1 and the bound only has to sit somewhere in between.
+        // It used to be `BUDGET * 4` — 600 ms, leaving ~450 ms for 20 `canonicalize` calls, 20
+        // registry-lock acquisitions, the condvar's `wait_timeout` overshoot and scheduling on a
+        // shared CI pool. That is the shape that produces CI-red/local-green flakes here, and it
+        // bought nothing: the mutant it must kill is 3 s away, five times further out than the
+        // bound needs to be (roborev 67513).
+        assert!(
+            elapsed < BUDGET * 8,
+            "a {PATHS}-path batch must pay the read-ordering budget ONCE, not once per path — it \
+             took {elapsed:?} against a budget of {BUDGET:?}"
+        );
+
+        gate.release();
+        drop(installed);
+    }
+
+    /// THE ACCUMULATOR, not a deadline (roborev 67513).
+    ///
+    /// This is the half of the batch amortisation that `a_batch_copy_pays_the_read_budget_once…`
+    /// cannot see: that test proves the batch does not pay N budgets, and a plain deadline stamped
+    /// at the first check passes it just as well. What a deadline gets wrong is everything that
+    /// happens BETWEEN the checks — in the real command, `std::fs::copy` of a multi-GB file. Under a
+    /// deadline the copy burns the budget, so every later src arrives with zero left, waits no time
+    /// at all, and is answered from durable consent alone — refused mid-batch for a reason that has
+    /// nothing to do with it, where the pre-amortisation code would have waited and granted it.
+    ///
+    /// So the discriminator is: spend real time NOT waiting, then check that the next read is still
+    /// offered its budget. Asserting on `offered` is the direct statement of the invariant; the
+    /// elapsed check beside it proves the offer was real rather than a number nothing spends.
+    #[test]
+    fn the_batch_budget_charges_time_spent_waiting_and_not_time_spent_between_reads() {
+        let _serialized = global_drag_lock();
+        const BUDGET: Duration = Duration::from_millis(300);
+        let _short = ResolveWaitOverride::install(BUDGET);
+
+        let mut order = ReadOrder::new();
+        // Nothing is queued yet, so this read drains at once and spends ~nothing of the budget.
+        let first = order.order();
+        assert!(first.drained, "precondition: nothing is outstanding, so the first read drains");
+        assert!(!first.first_failure, "a drained read is not a failure and must not log");
+
+        // THE WORK THAT IS NOT A WAIT — the copy, in production. Twice the whole budget of it.
+        std::thread::sleep(BUDGET * 2);
+
+        // Now wedge the worker, so the next read has something real to wait for.
+        let outside = fresh_root();
+        let blocker = outside.join("wedges-the-accumulator.txt");
+        touch(&blocker);
+        let gate = ResolverGate::new();
+        let installed = ResolverOverride::install(gate.resolver());
+        note_window_event("budget-accumulator", &enter_event(vec![blocker]));
+        assert!(gate.wait_entered(1), "precondition: the worker is wedged, so this read must wait");
+
+        let t0 = Instant::now();
+        let second = order.order();
+        let waited = t0.elapsed();
+
+        assert!(!second.drained, "the worker is wedged, so this read cannot drain");
+        // THE INVARIANT. Under a deadline this would be ~zero: the sleep above would have consumed
+        // it. Nine tenths rather than the whole, because the first read's own lock acquisition is
+        // legitimately charged.
+        assert!(
+            second.offered >= BUDGET * 9 / 10,
+            "time spent between reads must not be charged to the read budget — this read was \
+             offered {:?} of a {BUDGET:?} budget",
+            second.offered
+        );
+        // …and the offer was spent, not merely quoted.
+        assert!(
+            waited >= BUDGET / 2,
+            "the read must actually have waited on the wedged worker, not returned at once — it \
+             took {waited:?}"
+        );
+        assert!(second.first_failure, "the first exhausted read in a batch is the one that logs");
+
+        // ONE WEDGE IS ONE EVENT. A later path in the same batch must not repeat the line — twenty
+        // identical warnings for one wedged worker is the noise this flag exists to prevent.
+        let third = order.order();
+        assert!(!third.drained, "still wedged");
+        assert!(!third.first_failure, "only the first exhausted read in a batch logs");
+
+        gate.release();
+        drop(installed);
+    }
+
+    /// A POISONED REGISTRY IS RECOVERED, NOT ABANDONED (roborev 67722).
+    ///
+    /// The old shape took the registry as `if let Ok(mut c) = chosen().lock()` in all four writers
+    /// and `.map(…).unwrap_or(false)` in the reader, so ONE panic inside the critical section
+    /// silently discarded every later registration and answered every later read `false`, for the
+    /// life of the process — with the worker looping cheerfully and `outstanding` draining normally,
+    /// so none of the worker supervision notices. Permanent, silent, and precisely the class the
+    /// firewall was added to remove.
+    ///
+    /// The existing panic test cannot see it: it panics inside the injected RESOLVER, which runs
+    /// before `chosen().lock()` is ever taken, so the lock is never poisoned. This poisons it
+    /// directly — the only way to reach the state without an injection seam inside `Chosen` — and
+    /// then asserts the SIDE EFFECT a user would notice: a drop made afterwards is still readable.
+    ///
+    /// THE POISONING IS PERMANENT FOR THE REST OF THE BINARY, and that is deliberate rather than
+    /// sloppy: a `Mutex` cannot be un-poisoned. It is safe here precisely BECAUSE of the fix under
+    /// test — every production path now goes through `chosen_locked`, which recovers — so every
+    /// later test sees the same behaviour it would have seen anyway. If a future test ever needs an
+    /// unpoisoned registry it will have to take a lock through `chosen()` directly, and this comment
+    /// is the reason it cannot. That is a strictly better failure than the silent one it replaces.
+    #[test]
+    fn a_poisoned_registry_still_registers_and_answers_a_later_drop() {
+        let _serialized = global_drag_lock();
+        let outside = fresh_root();
+        let after = outside.join("dropped-after-the-poisoning.txt");
+        touch(&after);
+        let roots: Vec<PathBuf> = vec![];
+
+        // POISON IT. A panic while the guard is held is what a panic inside `note_dragged` would do.
+        let poisoned = std::thread::spawn(|| {
+            let _suppress = crate::crash::suppress_crash_records();
+            let _guard = chosen().lock().expect("the registry is not poisoned yet");
+            panic!("a panic inside the registry's critical section");
+        })
+        .join();
+        assert!(poisoned.is_err(), "precondition: the panicking thread really did unwind");
+        assert!(
+            chosen().lock().is_err(),
+            "precondition: the registry mutex really is poisoned now — if this ever stops being \
+             true the test below is asserting nothing"
+        );
+
+        // THE SIDE EFFECT. Under the old shape this drop was discarded by every writer and the read
+        // answered `false`; nothing in the log or the queue would have said so.
+        note_window_event("poisoned-registry", &drop_event(vec![after.clone()]));
+        assert!(
+            await_pending_registrations(Duration::from_secs(10)),
+            "the worker must still drain — poisoning the registry must not wedge the queue"
+        );
+        assert!(
+            validate_read_path(&after, &roots).is_ok(),
+            "a path the user dropped AFTER the registry was poisoned must still be readable — \
+             propagating the poison turns one panic into a permanent, silent loss of the feature"
+        );
+    }
+
+    /// THE DEFAULTED-SEAM GUARD for the read budget (AGENTS.md: "a defaulted seam every test
+    /// injects"). Every deadline test above installs a millisecond budget, so without this the
+    /// production value would be pinned by nothing and could be set to zero — which would make every
+    /// read answer from durable consent alone and silently drop the provisional tier the drag path
+    /// depends on.
+    ///
+    /// It also records the asymmetry that makes the timeout branch reachable at all: the budget is
+    /// SHORTER than `PROVISIONAL_TTL`, so a hover can outlive the wait meant to order a read after
+    /// its revocation. That is the whole mechanism of the finding, not an incidental constant.
+    #[test]
+    fn the_production_read_budget_is_the_shipping_constant() {
+        let _serialized = global_drag_lock();
+        assert!(
+            resolve_wait_override().lock().unwrap_or_else(|e| e.into_inner()).is_none(),
+            "precondition: no override installed, so this IS the shipping wiring"
+        );
+        assert_eq!(resolve_wait(), RESOLVE_WAIT, "the production budget must be the constant");
+        assert!(
+            RESOLVE_WAIT >= Duration::from_secs(10),
+            "a short budget would refuse real drops that are merely slow to canonicalize"
+        );
+        assert!(
+            RESOLVE_WAIT < PROVISIONAL_TTL,
+            "the budget is deliberately shorter than the hover TTL, which is exactly why a timed-out \
+             read can meet a still-live provisional entry whose Forget is unapplied"
+        );
+    }
+
+    // ── Supervising the resolution worker ───────────────────────────────────────────────────────
+    //
+    // Two independent holes, both silent and both PERMANENT, and the symptom of either gives no hint
+    // of its cause: `enqueue` keeps succeeding on the main thread, `outstanding` never drains, every
+    // registration is dropped on the floor, and every non-contained read spends its whole budget
+    // before refusing. Which is to say the feature is off, for the life of the process, with the
+    // drag path looking exactly as it does when a path was simply never granted.
+
+    /// Fakes the worker spawn for the life of the guard.
+    ///
+    /// Restoring `RESOLVE_WORKER_RUNNING` to what it was — rather than to `false` — is load-bearing:
+    /// a stray `false` would let the next `enqueue` start a SECOND real worker beside the one already
+    /// running, and one FIFO worker is what makes the applied order the delivered order for every
+    /// tier rule in `Chosen`. Two would let a `Leave` overtake the `Enter` it revokes.
+    struct WorkerSpawnerOverride {
+        was_running: bool,
+    }
+
+    impl WorkerSpawnerOverride {
+        fn install(f: WorkerSpawner) -> Self {
+            let was_running = RESOLVE_WORKER_RUNNING.swap(false, Ordering::SeqCst);
+            *spawner_override().lock().unwrap_or_else(|e| e.into_inner()) = Some(f);
+            WorkerSpawnerOverride { was_running }
+        }
+    }
+
+    impl Drop for WorkerSpawnerOverride {
+        fn drop(&mut self) {
+            *spawner_override().lock().unwrap_or_else(|e| e.into_inner()) = None;
+            RESOLVE_WORKER_RUNNING.store(self.was_running, Ordering::SeqCst);
+        }
+    }
+
+    /// THE ONCE-CELL HOLE. `STARTED.get_or_init(|| { let _ = …spawn(…); })` completes the cell
+    /// whether or not the spawn inside it succeeded, so a single `EAGAIN` — thread pressure, which
+    /// is exactly the loaded state a drag stall gets reported from — silently disabled path
+    /// resolution for the life of the process.
+    ///
+    /// The assertion is the OBSERVABLE CONSEQUENCE, driven through the real entry point Tauri calls:
+    /// a LATER drag event tries again. Restoring the `OnceLock` (or setting the flag before checking
+    /// the spawn's result) leaves the retry count stuck at 1 and fails this.
+    #[test]
+    fn a_worker_spawn_that_fails_is_retried_by_the_next_drag_event() {
+        let _serialized = global_drag_lock();
+
+        // The REAL worker must be alive and draining before we start faking spawns — the ops this
+        // test enqueues still have to be applied by someone, and a ticket left outstanding would
+        // make every later read in the suite spend its whole budget.
+        note_window_event("spawn-probe-warmup", &leave_event());
+        assert!(
+            await_pending_registrations(Duration::from_secs(10)),
+            "precondition: a live worker is draining the queue"
+        );
+
+        let attempts = std::sync::Arc::new(AtomicUsize::new(0));
+        let succeed_from = std::sync::Arc::new(AtomicUsize::new(usize::MAX));
+        let spawner: WorkerSpawner = {
+            let attempts = std::sync::Arc::clone(&attempts);
+            let succeed_from = std::sync::Arc::clone(&succeed_from);
+            std::sync::Arc::new(move || {
+                let n = attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                if n >= succeed_from.load(Ordering::SeqCst) {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::other("simulated EAGAIN under thread pressure"))
+                }
+            })
+        };
+        let _faked = WorkerSpawnerOverride::install(spawner);
+
+        note_window_event("spawn-retry-probe", &leave_event());
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "the first drag event after the worker is gone must try to start one"
+        );
+        assert!(
+            !RESOLVE_WORKER_RUNNING.load(Ordering::SeqCst),
+            "a spawn that FAILED must not be recorded as a live worker — that is the once-cell bug"
+        );
+
+        note_window_event("spawn-retry-probe", &leave_event());
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            2,
+            "and the next drag event must RETRY — one EAGAIN cannot be allowed to disable drag path \
+             resolution for the life of the process"
+        );
+
+        // Now let a spawn succeed, and the retrying must stop: two live workers would break the FIFO
+        // ordering every tier rule in `Chosen` depends on.
+        succeed_from.store(3, Ordering::SeqCst);
+        note_window_event("spawn-retry-probe", &leave_event());
+        assert_eq!(attempts.load(Ordering::SeqCst), 3, "the third attempt is the one that succeeds");
+        assert!(
+            RESOLVE_WORKER_RUNNING.load(Ordering::SeqCst),
+            "a spawn that SUCCEEDED is recorded"
+        );
+
+        note_window_event("spawn-retry-probe", &leave_event());
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            3,
+            "and a running worker is never re-spawned — one FIFO worker is what makes the applied \
+             order the delivered order"
+        );
+    }
+
+    /// THE OTHER HALF OF THE UNWIND HOLE. If the worker ever leaves its loop the flag must come back
+    /// down, or `ensure_resolve_worker` declines to start a replacement for the life of the process —
+    /// the same permanent silence as the once-cell bug, reached by a different route.
+    ///
+    /// This pins the GUARD, not its installation. `resolve_worker`'s only remaining unwind path is
+    /// its queue lock / condvar wait (`apply_registry_op` is caught), and there is no way to panic
+    /// those from outside without standing a SECOND worker up beside the live one, which would break
+    /// the FIFO ordering every tier rule in `Chosen` depends on. The rest of the chain is covered:
+    /// `a_worker_spawn_that_fails_is_retried_by_the_next_drag_event` proves a cleared flag really
+    /// does bring the next drag event back to `spawn_resolve_worker`.
+    #[test]
+    fn a_worker_that_leaves_its_loop_clears_the_flag_so_a_replacement_can_start() {
+        let _serialized = global_drag_lock();
+        let was_running = RESOLVE_WORKER_RUNNING.swap(true, Ordering::SeqCst);
+        drop(WorkerLiveness);
+        let cleared = !RESOLVE_WORKER_RUNNING.load(Ordering::SeqCst);
+        RESOLVE_WORKER_RUNNING.store(was_running, Ordering::SeqCst);
+        assert!(
+            cleared,
+            "a worker that unwound out of its loop must leave the flag DOWN — otherwise the queue is \
+             unattended forever and every read pays its whole budget before refusing"
+        );
+    }
+
+    /// THE INSTALLATION, not just the guard (roborev 67722).
+    ///
+    /// The test above constructs and drops a `WorkerLiveness` by hand, so it pins `Drop` and nothing
+    /// else: delete the guard's binding from the worker — or, far likelier, rewrite it as
+    /// `let _ = WorkerLiveness`, which drops it IMMEDIATELY — and it stays green while the worker
+    /// runs unsupervised with the flag stuck `true` forever. That is the "guard tested against a
+    /// copy of its mechanism" shape AGENTS.md names.
+    ///
+    /// This drives the real installation seam instead. `guarded_by_liveness` is what `resolve_worker`
+    /// calls, so a body that unwinds through it exercises exactly the path a panicking worker takes —
+    /// on a thread of its own, with no second worker ever attached to the queue (which would break
+    /// FIFO, and is the reason the test above settled for the weaker form).
+    #[test]
+    fn a_panic_inside_the_guarded_body_clears_the_flag() {
+        let _serialized = global_drag_lock();
+        let was_running = RESOLVE_WORKER_RUNNING.swap(true, Ordering::SeqCst);
+
+        let joined = std::thread::spawn(|| {
+            let _suppress = crate::crash::suppress_crash_records();
+            guarded_by_liveness(|| panic!("the worker unwound out of its loop"));
+        })
+        .join();
+
+        let cleared = !RESOLVE_WORKER_RUNNING.load(Ordering::SeqCst);
+        RESOLVE_WORKER_RUNNING.store(was_running, Ordering::SeqCst);
+
+        assert!(joined.is_err(), "precondition: the body really did unwind");
+        assert!(
+            cleared,
+            "the liveness guard must be INSTALLED for the whole body, not merely defined — a worker \
+             that unwinds has to leave the flag DOWN so the next enqueue starts a replacement"
+        );
+    }
+
+    /// THE DEFAULTED-SEAM GUARD for the spawn seam (AGENTS.md). The test above injects a spawner, so
+    /// without this the `None` arm — the only thing that puts a real thread behind the queue — would
+    /// be pinned only indirectly.
+    ///
+    /// The assertion is that the queue actually DRAINS, which nothing but a live worker thread can
+    /// do: an arm that never spawned would leave the ticket outstanding until the wait gave up.
+    #[test]
+    fn the_production_default_spawner_starts_the_real_resolve_worker() {
+        let _serialized = global_drag_lock();
+        assert!(
+            spawner_override().lock().unwrap_or_else(|e| e.into_inner()).is_none(),
+            "precondition: no override installed, so this IS the shipping wiring"
+        );
+        // AND THE FLAG MUST BE DOWN, or this test proves nothing (roborev 67722).
+        //
+        // `RESOLVE_WORKER_RUNNING` is a process-global that stays `true` once ANY earlier drag test
+        // in this binary has started the worker — `WorkerSpawnerOverride` restores `was_running`, so
+        // it is never left down. With it already up, `ensure_resolve_worker`'s
+        // `if RESOLVE_WORKER_RUNNING.swap(true) { return; }` returns before `spawn_resolve_worker` is
+        // reached, the `None` arm this test exists to pin never executes, the drain below is
+        // performed by some other test's worker, and the flag assertion at the end is satisfied by
+        // the stale flag. Every assertion passes and nothing was tested.
+        //
+        // Claimed as a PRECONDITION rather than forced down, because forcing it would let a second
+        // worker attach to the same queue and break FIFO. Under `cargo test`'s parallel harness the
+        // ordering is not deterministic, so this may skip — but it fails LOUDLY when it cannot
+        // establish what it needs, instead of passing while measuring another test's worker.
+        if RESOLVE_WORKER_RUNNING.load(Ordering::SeqCst) {
+            eprintln!(
+                "the_production_default_spawner_starts_the_real_resolve_worker: SKIPPED — a worker \
+                 was already running, so the None arm cannot be reached from here. Run this test \
+                 alone (--test-threads=1, or by name) to exercise it."
+            );
+            return;
+        }
+
+        note_window_event("default-spawner-probe", &leave_event());
+        assert!(
+            await_pending_registrations(Duration::from_secs(10)),
+            "with nothing injected, a drag event must put a real thread behind the queue and that \
+             thread must apply what was queued"
+        );
+        assert!(
+            RESOLVE_WORKER_RUNNING.load(Ordering::SeqCst),
+            "and the successful spawn is recorded, so the next event does not start a second one"
+        );
+    }
+
+    /// THE UNWIND HOLE. `apply_registry_op` does unbounded filesystem work; if it ever panicked the
+    /// whole worker went with it and NOTHING restarted it. The ticket it was holding then stayed in
+    /// `outstanding` forever, so every subsequent attachment read spent its full budget waiting for
+    /// a ticket nobody would ever retire — one panic converting the entire feature into a slow
+    /// refusal, permanently.
+    ///
+    /// Two side effects, and both are needed: the panicking op's ticket DRAINS (so reads stop
+    /// waiting on it), and a LATER drop still registers (so the worker survived). Removing the
+    /// `catch_unwind` fails both — the first takes the full 10s wait before it does.
+    #[test]
+    fn a_panicking_resolution_drains_its_ticket_and_the_worker_survives() {
+        let _serialized = global_drag_lock();
+        let outside = fresh_root();
+        let after = outside.join("registered-after-the-panic.txt");
+        touch(&after);
+        let roots: Vec<PathBuf> = vec![];
+
+        {
+            let panics = std::sync::Arc::new(AtomicUsize::new(0));
+            let counted = std::sync::Arc::clone(&panics);
+            let _installed = ResolverOverride::install(std::sync::Arc::new(move |_paths| {
+                counted.fetch_add(1, Ordering::SeqCst);
+                panic!("simulated panic inside path resolution");
+            }));
+
+            note_window_event("panic-window", &enter_event(vec![outside.join("boom.txt")]));
+            assert!(
+                await_pending_registrations(Duration::from_secs(10)),
+                "a panicking resolution must still DRAIN its ticket — otherwise every later read \
+                 spends its whole budget waiting for a ticket nothing will ever retire"
+            );
+            assert_eq!(
+                panics.load(Ordering::SeqCst),
+                1,
+                "precondition: the resolution really did panic"
+            );
+        }
+
+        // ...and the worker is still there to apply what comes next.
+        note_window_event("panic-window", &drop_event(vec![after.clone()]));
+        assert!(
+            validate_read_path(&after, &roots).is_ok(),
+            "one panic must not stop the worker — a drop after it must still register"
+        );
+    }
+
+    /// THE DEFAULTED-SEAM GUARD (AGENTS.md: "a defaulted seam every test injects"). Every test above
+    /// installs its own resolver, so without this one the `None` arm of `resolve_paths` — the only
+    /// thing that makes a real drag register real canonical paths — would be covered by nothing and
+    /// could be deleted with the whole suite still green.
+    ///
+    /// It also re-pins the security property from the other side: resolving on the way IN is what
+    /// closes the symlink-swap window, so the default must resolve the LINK to its TARGET.
+    #[test]
+    fn the_production_default_resolver_really_canonicalizes() {
+        let _serialized = global_drag_lock();
+        assert!(
+            resolver_override().lock().unwrap_or_else(|e| e.into_inner()).is_none(),
+            "precondition: no override installed, so this IS the shipping wiring"
+        );
+
+        let dir = fresh_root();
+        let target = dir.join("innocent.txt");
+        touch(&target);
+        let link = dir.join("link.txt");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let got = resolve_paths(vec![link.clone()]);
+        assert_eq!(
+            got,
+            vec![target.canonicalize().unwrap()],
+            "the production default must be the REAL canonicalize"
+        );
+        assert_ne!(
+            got,
+            vec![link],
+            "a default that echoed its input back would reopen the symlink-swap window"
+        );
+    }
+
+    /// THE ORDERING HAZARD the inline version could not have had. `Leave` must revoke the hover
+    /// `Enter` registered — but `Enter` now resolves on a worker. If `Leave` were applied
+    /// immediately while a slow `Enter` was still resolving, the Enter would install its provisional
+    /// grant AFTER the Leave meant to revoke it: a hover grant left standing for a drag that has
+    /// already left, which is precisely what the provisional tier exists to deny (a file dragged
+    /// PAST Sparkle en route to another app).
+    ///
+    /// One FIFO worker is what makes the applied order the delivered order. Applying `Forget`
+    /// synchronously instead of queueing it fails this.
+    #[test]
+    fn a_leave_cannot_overtake_the_enter_it_revokes() {
+        let _serialized = global_drag_lock();
+        let outside = fresh_root();
+        let f = outside.join("passing-through.txt");
+        touch(&f);
+
+        let gate = ResolverGate::new();
+        let _installed = ResolverOverride::install(gate.resolver());
+
+        note_window_event("ordering-window", &enter_event(vec![f.clone()]));
+        assert!(gate.wait_entered(1), "the Enter's resolution is in flight");
+
+        // The drag leaves WHILE that resolution is still outstanding.
+        note_window_event("ordering-window", &leave_event());
+        gate.release();
+
+        let roots: Vec<PathBuf> = vec![];
+        assert!(
+            validate_read_path(&f, &roots).is_err(),
+            "a drag that left without dropping must leave NO grant behind, even when its Enter was \
+             still resolving as the Leave arrived"
+        );
+    }
+
+    /// INVARIANT 5: the recent-drop marker is cheap, lock-only, and must STAY on the calling thread.
+    /// The frontend's drop handler can call `recover_drag_paths` before this listener has finished,
+    /// so a marker deferred behind path resolution could not be there in time — which would reopen
+    /// the very race that marking on Enter/Over exists to win.
+    ///
+    /// Pins that the marker is already there while resolution is demonstrably STILL outstanding.
+    /// Moving `mark_recent_drop` onto the resolution worker fails this.
+    #[test]
+    fn the_recent_drop_marker_is_set_before_note_window_event_returns() {
+        let _serialized = global_drag_lock();
+        let outside = fresh_root();
+        let f = outside.join("marker-first.txt");
+        touch(&f);
+
+        let gate = ResolverGate::new();
+        let _installed = ResolverOverride::install(gate.resolver());
+
+        note_window_event("marker-first-window", &drop_event(vec![f.clone()]));
+        assert!(gate.wait_entered(1), "resolution is under way");
+        assert!(!gate.is_released(), "precondition: and it has NOT finished");
+
+        assert!(
+            take_recent_drop("marker-first-window"),
+            "the recent-drop marker must already exist while path resolution is still outstanding"
+        );
+
+        gate.release();
+    }
+
+    /// The instrumentation's log vocabulary. This log ships with support tickets (see the note in
+    /// `note_drag_event`), so the fields the watcher emits must be structurally incapable of
+    /// carrying a path: a fixed phase token and a COUNT.
+    #[test]
+    fn the_logged_drag_phase_is_a_closed_vocabulary_and_paths_are_only_counted() {
+        let secret = PathBuf::from("/Users/someone/Secret Plans.pdf");
+
+        let dropped = tauri::DragDropEvent::Drop {
+            paths: vec![secret.clone(), secret.clone()],
+            position: drag_position(),
+        };
+        assert_eq!(drag_phase_name(&dropped), "drop");
+        assert_eq!(drag_path_count(&dropped), 2, "a COUNT — never the paths themselves");
+
+        let entered = tauri::DragDropEvent::Enter {
+            paths: vec![secret],
+            position: drag_position(),
+        };
+        assert_eq!(drag_phase_name(&entered), "enter");
+        assert_eq!(drag_path_count(&entered), 1);
+
+        let over = tauri::DragDropEvent::Over { position: drag_position() };
+        assert_eq!(drag_phase_name(&over), "over");
+        assert_eq!(drag_path_count(&over), 0);
+
+        assert_eq!(drag_phase_name(&tauri::DragDropEvent::Leave), "leave");
+        assert_eq!(drag_path_count(&tauri::DragDropEvent::Leave), 0);
     }
 
     #[test]

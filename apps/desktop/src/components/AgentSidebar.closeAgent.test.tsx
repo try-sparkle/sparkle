@@ -81,6 +81,8 @@ import { useBeadsStore, __setBeadsPolledAtForTest } from "../stores/beadsStore";
 import { useUiStore } from "../stores/uiStore";
 import type { AgentTab, Project } from "../types";
 import { openAgentCard } from "../testing/rowGestures";
+import { openTraceKinds, perfEnd } from "../perfTrace";
+import { registerMountedPane, unregisterMountedPane } from "../services/agentPaneRegistry";
 
 function buildAgentProject(beadId?: string): Project {
   const agent: AgentTab = {
@@ -207,6 +209,134 @@ describe("AgentSidebar — silent close removes the row without waiting on git",
     // No await, no waitFor: the store must already have dropped the row synchronously with the click,
     // NOT after the hanging removeAgentWorkspace settles.
     expect(agentsNow()).not.toContain("a1");
+  });
+});
+
+// ── PER-SITE LEAK COVERAGE — THE TWO SIDEBAR `removeAgent` CALL SITES (bead sparkle-bxidpw) ─────
+//
+// `projectStore.removeAgent` opens a `close:<id>` perf trace that only a mounted `AgentPane`'s
+// unmount cleanup can end. Panes mount LAZILY per project, so a row removed with no pane leaked the
+// entry permanently — after which `openTraceKinds()` named the ghost as an in-flight interaction on
+// EVERY later jank stall line (measured: `"during":"close×37"` for hours, whatever the real cause).
+//
+// THE SIDEBAR IS WHERE "CAN THIS REACH AN UNMOUNTED PANE?" IS LEAST OBVIOUS, so the answer is
+// recorded here rather than assumed. It is YES at both sites, for two DIFFERENT reasons:
+//
+//   • `teardownAgent` (the × / Save path) runs `close(cid)` and `removeAgent(id)` in the SAME tick.
+//     A pane is therefore still mounted IF one ever was — which is why this site keeps its waterfall
+//     unchanged. But the sidebar lists every row in `project.agents`, while a pane exists only for an
+//     agent in `openAgentIds` inside a VISITED, non-torn-out project (Workspace's `live` memo). A row
+//     restored from disk, adopted by the worker reconcile, or admitted by the resurrector has no pane
+//     at all — and closing one of those leaked.
+//   • `onDiscardClose` `await`s `discardAgentGit` BEFORE `removeAgent`, so React has already
+//     committed the unmount of any pane that did exist. This site leaked UNCONDITIONALLY, and it
+//     emitted no `close … (total)` waterfall even when a pane had been open, because the pane's
+//     `perfEnd` ran against a trace not yet started. Pure leak.
+//
+// Each site is covered separately because the fix is ONE shared gate in the store: per AGENTS.md
+// (`sparkle-50m03`) a shared fix reads as verified the moment any single site is covered. These
+// render the REAL sidebar and drive the REAL store.
+//
+// AND THEY ARE A PAIR, BECAUSE ABSENCE ALONE IS AMBIGUOUS. Every leak test here is set up with no
+// pane, so on its own the suite passes just as well against a change that killed the waterfall
+// outright — the silent failure, and the harder one to notice. The mounted case below pins the
+// other side at THIS call site: the × on a row whose pane is registered really does open the trace.
+// Proving the waterfall then SETTLES on a real React unmount needs a real pane and lives in
+// `AgentPane.closeTrace.test.tsx`; what cannot live there is the ORDERING this site depends on,
+// since that file calls `removeAgent` directly and never drives `teardownAgent`.
+//
+// No `__resetTracesForTest()`: that helper empties the very map whose residue is the defect.
+describe("AgentSidebar — a close leaves no phantom close: trace behind", () => {
+  const noCloseGhost = () => expect(openTraceKinds() ?? "").not.toContain("close");
+
+  it("× on a row whose pane was never mounted leaves NO open close entry", () => {
+    silentCloseProject();
+    const p = useProjectStore.getState().projects[0]!;
+    useProjectStore.setState({ projects: [{ ...p, selectedAgentId: "a1" }] } as never);
+    useUiStore.setState({ collapsedOrchestrators: {}, activeSpecial: null } as never);
+    render(<AgentSidebar project={useProjectStore.getState().projects[0]!} />);
+
+    fireEvent.click(screen.getByLabelText("Close agent"));
+
+    // The row is gone, so a `close` still in flight is a ghost by definition.
+    expect(agentsNow()).not.toContain("a1");
+    // THE SIDE EFFECT — what the jank monitor would print in its `during` field.
+    //
+    // NARROWED TO `close` AS A FILE-LEVEL RESIDUE GUARD — not because this test opens anything
+    // else. An earlier revision of this comment claimed "the reselect-after-close fallback really
+    // does open a `switch:` trace here", and that is FALSE for this test, which is the exact defect
+    // class the preceding commits on this branch existed to remove (roborev 67485). Trace it:
+    // `buildAgentProject` mints exactly ONE agent (`a1`), so after `teardownAgent` the project's
+    // `agents` is `[]`; `selectionAfterClose`'s last-agent case yields `{ reselect: true, next:
+    // null }` (pinned at `engine/closeAgent.test.ts:88-91`); and `selectAgent` guards its
+    // `perfStart` with `if (agentId)` (`projectStore.ts:2427`). The selection here is a DESELECT
+    // and no `switch:<id>` is ever started. The real reason for the narrowing is that this suite
+    // deliberately never calls `__resetTracesForTest()` (see `:248`), so the whole map carries
+    // residue from earlier cases in the file and only the `close` kind is this test's business.
+    //
+    // The `switch:` exposure is real and still open — ungated by design, because the mounted-pane
+    // gate would be wrong for it (see `selectAgent`) — but it is NOT produced by this path, so do
+    // not cite this line as evidence that the sidebar close is one of its producers. It is tracked
+    // at `sparkle-sl3g` / `sparkle-5uuh`. A case that genuinely exercises it needs a SURVIVING
+    // sibling row, where `next` is non-null and `perfStart("switch:<id>")` actually runs.
+    noCloseGhost();
+  });
+
+  // THE POSITIVE HALF OF THE PAIR, AT THIS CALL SITE (roborev 67368).
+  //
+  // `teardownAgent` claims in its own comment that this site keeps its waterfall because `close(cid)`
+  // and `removeAgent(...)` run in the SAME TICK — React 18 batches the re-render, so a mounted pane
+  // is still mounted when the store asks. Nothing tested that claim. The failure it guards is
+  // directional: insert an `await` between those two statements (awaiting `Promise.all(kills)`, or
+  // `terminateIfCloud`, which this path previously DID await), React commits the pane's unmount
+  // across it, `isAgentPaneMounted` reads false, and the human × stops emitting
+  // `close … (total)` PERMANENTLY — while every leak test above stays green, because a killed
+  // waterfall satisfies "no close entry is open" perfectly.
+  //
+  // THE ASSERTION IS SYNCHRONOUS ON PURPOSE, and that is what an inserted `await` breaks: the ×
+  // handler is `void teardownAgent(id)`, so anything moved behind an await has NOT run by the time
+  // this line executes and `openTraceKinds()` would not name a close at all.
+  //
+  // `registerMountedPane` rather than a real `AgentPane`: this suite mounts a sidebar, not a
+  // workspace, and the fact under test is what the STORE'S GATE reads at this call site. The
+  // registration is settled by hand below exactly as the pane's unmount cleanup would — `perfEnd`
+  // BEFORE the deregistration, in the pane's own order — so nothing is left in the module-scoped
+  // map for the later tests in this file to trip over.
+  it("× on a row whose pane IS mounted opens the close trace in the same tick", () => {
+    silentCloseProject();
+    const p = useProjectStore.getState().projects[0]!;
+    useProjectStore.setState({ projects: [{ ...p, selectedAgentId: "a1" }] } as never);
+    useUiStore.setState({ collapsedOrchestrators: {}, activeSpecial: null } as never);
+    // THE ONLY DIFFERENCE FROM THE TEST ABOVE — the world, not the call.
+    registerMountedPane("a1");
+    try {
+      render(<AgentSidebar project={useProjectStore.getState().projects[0]!} />);
+
+      fireEvent.click(screen.getByLabelText("Close agent"));
+
+      // TRACE FIRST, so a regression in the GATE reports as a gate failure rather than being
+      // shadowed by a row assertion that any `removeAgent` regression would also trip.
+      // Same predicate as `noCloseGhost`, opposite polarity — which is what makes this a pair
+      // rather than two unrelated tests. `toContain` and not `toBe("close")` because this file
+      // deliberately never resets the trace map, so an earlier test's residue may sit alongside.
+      expect(openTraceKinds() ?? "").toContain("close");
+      expect(agentsNow()).not.toContain("a1");
+    } finally {
+      perfEnd("close:a1", "unmounted");
+      unregisterMountedPane("a1");
+    }
+    // …and settling it leaves nothing behind, so this test cannot become the residue it warns about.
+    noCloseGhost();
+  });
+
+  it("Discard leaves NO open close entry either — its pane unmounted before the row was dropped", async () => {
+    buildAgentProject("bd-1");
+    openClosePrompt();
+    fireEvent.click(screen.getByText("Discard"));
+    fireEvent.click(screen.getByText("Delete permanently"));
+    await waitFor(() => expect(agentsNow()).not.toContain("a1"));
+
+    noCloseGhost();
   });
 });
 

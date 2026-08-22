@@ -110,6 +110,7 @@ import { arePanePropsEqual } from "./panePropsEqual";
 import { TERMINAL_STAGE_PADDING } from "./terminalStageAnchor";
 import { useTerminalOverlayStore } from "../stores/terminalOverlayStore";
 import { perfRender, perfMark, perfEnd, perfCancel } from "../perfTrace";
+import { registerMountedPane, unregisterMountedPane } from "../services/agentPaneRegistry";
 
 type Phase = "preparing" | "ready" | "no-claude" | "error";
 
@@ -1099,6 +1100,13 @@ function AgentPaneInner({
   };
 
   useEffect(() => {
+    // THIS PANE IS THE ONLY THING THAT CAN END A `close:` TRACE, so say so out loud. `removeAgent`
+    // opens `close:<id>` only while this registration stands (services/agentPaneRegistry) — without
+    // it, removing a row whose pane was never opened left an entry nothing could ever remove, and
+    // `openTraceKinds()` named that ghost on every later jank stall (bead sparkle-bxidpw). Registered
+    // FIRST in this effect and released in its cleanup, so the window in which the store may open a
+    // trace is exactly the window in which the `perfEnd` below is guaranteed to run.
+    registerMountedPane(agent.id);
     // Spawn waterfall: the click (useSpawnBuildAgent) started the "spawn" trace for this id; record
     // how long from click to this pane actually mounting + prepare() kicking off.
     perfMark(agent.id, "pane mount");
@@ -1107,7 +1115,11 @@ function AgentPaneInner({
     return () => {
       // Close waterfall: removeAgent started a "close:<id>" trace; this pane unmounting is the end
       // of the visible close cost. A no-op if the unmount wasn't a user close (e.g. project switch).
+      // BEFORE the deregistration below, not after — the trace must be settled while this pane is
+      // still the registered owner of it, or a `removeAgent` interleaved between the two would see
+      // no pane, skip its `perfStart`, and the close would go unmeasured.
       perfEnd(`close:${agent.id}`, "unmounted");
+      unregisterMountedPane(agent.id);
       // Drop any still-open spawn trace so a pane closed mid-prepare can't leak its start entry.
       perfCancel(agent.id);
       // Increment the generation counter to invalidate any in-flight prepare() run. If

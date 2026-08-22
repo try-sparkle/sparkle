@@ -115,16 +115,44 @@ vi.mock("../services/conciergeRouter", () => ({
 // panes use, so `getComputedStyle(...).visibility` in a case below is the real contract rather than a
 // stand-in the test invented. The `visible` prop itself still comes from the real `Workspace` →
 // `AgentPaneList` chain, which is the seam under test.
+// …AND THE REAL MOUNTED-PANE REGISTRATION (roborev 67484). This mock used to be visibility-only, and
+// that left a hole nothing in the repo covered: `AgentPane.closeTrace.test.tsx` drives a real pane
+// but calls `removeAgent` DIRECTLY, while the two teardown-site tests
+// (`AgentSidebar.closeAgent.test.tsx`, `workerSpawn.test.ts`) drive the real teardown but STIPULATE
+// mountedness with a hand-made `registerMountedPane` that nothing during the test can revoke. So the
+// composite production claim — `removeAgent` runs in the synchronous prefix AND a *React-committed*
+// pane is therefore still registered when the store asks — had each half pinned separately and the
+// conjunction pinned nowhere. A change that unmounts the pane synchronously before `removeAgent`
+// while keeping both in one tick would kill the `close … (total)` waterfall permanently in
+// production with every one of those tests still green.
+//
+// Registering here closes it: the registration is now driven by a REAL React commit through the real
+// `Workspace` → `AgentPaneList` chain, and revoked by a REAL unmount, at a call site the user's own
+// gesture reaches. The cleanup mirrors the production pane's ORDER exactly — `perfEnd` while this
+// pane is still the registered owner, THEN release — because a `removeAgent` interleaved between the
+// two would otherwise see no pane and skip its `perfStart`.
 vi.mock("./AgentPane", async () => {
   const { paneVisibilityStyle } = await import("./paneVisibility");
+  const { registerMountedPane, unregisterMountedPane } = await import("../services/agentPaneRegistry");
+  const { perfEnd } = await import("../perfTrace");
+  const { useEffect } = await import("react");
   return {
-    AgentPane: ({ agent, visible }: { agent: { id: string }; visible: boolean }) => (
-      <div
-        data-testid={`pane-${agent.id}`}
-        data-visible={String(visible)}
-        style={paneVisibilityStyle(visible)}
-      />
-    ),
+    AgentPane: ({ agent, visible }: { agent: { id: string }; visible: boolean }) => {
+      useEffect(() => {
+        registerMountedPane(agent.id);
+        return () => {
+          perfEnd(`close:${agent.id}`, "unmounted");
+          unregisterMountedPane(agent.id);
+        };
+      }, [agent.id]);
+      return (
+        <div
+          data-testid={`pane-${agent.id}`}
+          data-visible={String(visible)}
+          style={paneVisibilityStyle(visible)}
+        />
+      );
+    },
   };
 });
 vi.mock("./SparkleAgentPane", async () => {
@@ -164,6 +192,8 @@ import { resetVisitedProjects } from "../services/sessionProjects";
 import { resetCable } from "../stores/cableStore";
 import { enableAiEnhancementsForTests } from "../testing/aiEnhancements";
 import { doubleClickRow, openRowMenu, singleClickRow } from "../testing/rowGestures";
+import { isAgentPaneMounted } from "../services/agentPaneRegistry";
+import { log } from "../logger";
 import type { AgentTab, Project } from "../types";
 
 const MOUNTED = "Stripe checkout retry"; // a1
@@ -551,6 +581,50 @@ describe("closing the MOUNTED agent leaves the surviving agent's terminal on scr
     // — a pane that is portalled but hidden is precisely the reported symptom, and `terminalOnScreen`
     // is what tells the two apart.
     expect(terminalOnScreen("a2")).toBe(true);
+  });
+
+  // THE COMPOSITE CLAIM, PINNED WHOLE — a REAL React-committed pane, driven through the REAL close
+  // gesture (roborev 67484). Everywhere else in the repo the two halves are pinned apart:
+  // `AgentPane.closeTrace.test.tsx` has a real pane but calls `removeAgent` directly, and the two
+  // teardown-site tests reach `teardownAgent`/`spinDownWorker` but stipulate mountedness with a
+  // hand-made registration nothing in the test can revoke. Neither can go red for the failure that
+  // matters most here: a change that unmounts the pane synchronously BEFORE `removeAgent`, while
+  // keeping both in the same tick, kills the `close … (total)` waterfall permanently in production
+  // and satisfies every "no close entry is left open" assertion perfectly, because a dead waterfall
+  // leaves nothing open either. The instrument goes SILENT instead of noisy, which is the failure
+  // direction nothing else in the suite is watching for.
+  //
+  // ASSERTED ON THE EMITTED LINE, not on the open trace. Reading `openTraceKinds()` mid-gesture
+  // would race React's commit of the unmount; the waterfall line can only exist if BOTH halves ran —
+  // `removeAgent` found the pane registered and opened `close:a1`, and the pane's unmount cleanup
+  // then ended it. One assertion, both halves, no ordering guess.
+  it("emits the close waterfall for a real mounted pane closed through the real gesture", async () => {
+    const perfLines: string[] = [];
+    vi.spyOn(log, "info").mockImplementation((scope: string, msg: string) => {
+      if (scope === "perf") perfLines.push(msg);
+    });
+
+    await mount();
+    doubleClickRow(rowFor(MOUNTED));
+    // THE PRECONDITION, ASSERTED — the registration is React's, not the test's. If this is false the
+    // case below proves nothing about the gate, only that no trace was opened.
+    expect(isAgentPaneMounted("a1")).toBe(true);
+
+    await act(async () => {
+      openRowMenu(rowFor(MOUNTED));
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("row-menu-close-agent"));
+    });
+
+    // The close really happened, so the assertion below is about a teardown that ran.
+    expect(rowExistsFor(MOUNTED)).toBe(false);
+    // THE SIDE EFFECT: measured, not merely un-leaked.
+    expect(perfLines.filter((m) => m.startsWith("close ") && m.includes("(total)"))).toEqual([
+      "close unmounted (total)",
+    ]);
+    // …and the pane really did go, so the registration is released rather than stuck true.
+    expect(isAgentPaneMounted("a1")).toBe(false);
   });
 });
 

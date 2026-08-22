@@ -467,8 +467,11 @@ export function spawnBuildAgentInProject(
       // it in localStorage until something happened to run the reconcile prune. Closed first,
       // because after `removeAgent` there is no row for a reconcile to match it against.
       useRuntimeStore.getState().close(id);
-      // No pane ever mounted (the throw is synchronous, before React renders), so the `close:` trace
-      // `removeAgent` opens has nothing to end it — see `removeAgentWithoutPane`.
+      // A FAILED SPAWN IS NOT A CLOSE. `open(id)`/`landInAgent` really did run above, but the whole
+      // `try` body is await-free so this `catch` is the SAME TICK and React never rendered — no pane
+      // mounted, the store opens no `close:` trace, and this is a no-op. It stays as the explicit
+      // statement of intent: should a pane ever exist here, timing its unmount as a "close" would
+      // report an interaction the user never performed. See `removeAgentWithoutPane`.
       removeAgentWithoutPane(project.id, id);
       return null;
     }

@@ -612,6 +612,31 @@ let jankRunning = false;
 // The span instrument applies the same threshold for the same reason — see SPAN_SUSPEND_MS. Keep
 // the two in step: they are one claim ("nothing this app does on the main thread lasts 10s")
 // measured by two instruments, not two independently tunable knobs.
+//
+// ── THE CASE THIS CANNOT DISTINGUISH, AND WHERE THE ANSWER LIVES ────────────────────────────────
+// COMMENT ONLY — nothing below changes. The threshold and the 10s number keep the rationale above,
+// which is measured; this is here so the next reader knows what a `resume` label does NOT rule out.
+//
+// CPU STARVATION produces a gap of exactly this shape. When the host is saturated the whole process
+// is descheduled, rAF stops firing, and the first frame back sees one long gap — indistinguishable,
+// from inside this renderer, from a machine that slept. So a `resume` here means "past the bar",
+// never "the machine was asleep": the app may have been frozen and unusable for the whole interval.
+// Measured 2026-08-21 on a box at load average 191-201 while nominally idle and 366-520 with agents
+// running (`sparkle-rlmsb4`).
+//
+// This instrument has no way to settle it. `performance.now()` and `Date.now()` both advance
+// through sleep on this platform (see the note above `startJankMonitor`), so the two clocks already
+// compared here agree in both cases — which is exactly why the cross-window clustering tell above is
+// the only discriminator available in the renderer, and why it is a heuristic rather than a proof.
+//
+// The host CAN settle it, and now does: `src-tauri/src/watchdog.rs` reads `mach_continuous_time()`
+// against `mach_absolute_time()` — the first counts time the machine spends asleep, the second does
+// not — so their difference across one of its ticks is suspended time, measured rather than
+// inferred. See `machine_was_suspended` and `SUSPEND_CONFIRM` there. The same inference bug lived in
+// that module and silently DISCARDED a 30-second total UI freeze; here it only mislabels one, since
+// the block above already stopped this threshold from silencing anything. Correlate by timestamp: a
+// `resume after suspend` line here with a watchdog `starved_ms` line at the same moment is a real
+// freeze, not a wake.
 const SUSPEND_MS = 10_000;
 
 /** A stall at or above this warns on its own line; anything shorter is coalesced into the periodic
@@ -679,6 +704,42 @@ export function classifyJankGap(
 // costs nothing and it is the measurement that would falsify the paragraph above: if a real suspend
 // ever shows up with `wallMs` far exceeding `ms`, then the monotonic clock does freeze on some path
 // after all, and a cross-check becomes worth building.
+
+// ── THE AGGREGATE THIS MODULE USED TO COMPUTE AND THROW AWAY ───────────────────────────────────
+// The rollup below derives count/totalMs/maxMs/sinceMs for every window and logs them at info, and
+// for a year nothing acted on them. That gap has a measured cost: on 2026-08-20 a user reported a
+// 30-second unusable window, and the Rust watchdog — which measures exactly one thing, how long the
+// heartbeat has been silent, against a five-second bar — captured nothing, because the UI stalled
+// seven to thirteen times a minute and never once for five seconds. Every instrument reported green
+// while the app was unusable.
+//
+// So the total is now also handed to the watchdog on each heartbeat, which sums it over a rolling
+// ten-second window and treats a blown budget as a hang episode with the same evidence (stacks, IPC
+// timeline) a silence episode gets. See `STALL_BUDGET_MS` in `src-tauri/src/watchdog.rs`.
+//
+// THE POINT OF FEEDING IT RATHER THAN RECOMPUTING IT is that a stall then has ONE definition. The
+// alternative — a second stall detector on the Rust side — is two definitions that drift, and the
+// one on this side is the only one that can see an inter-frame gap at all.
+let pendingStallMs = 0;
+
+/** Take the main-thread stall time accrued since the last call, and reset the accumulator.
+ *
+ *  Drained rather than read: each millisecond of stall belongs to exactly one heartbeat, or the
+ *  watchdog's rolling window would count the same bad second on every beat until the next stall
+ *  replaced it. The caller is `watchdogHeartbeat.ts`, once per beat.
+ *
+ *  Reports zero, not nothing, when nothing stalled — a beat carrying `0` is what tells the watchdog
+ *  that this second was clean, and a window of clean seconds is how a bad patch ends.
+ *
+ *  Honest caveat: a beat whose `invoke` fails loses the stall time it drained. That is the same
+ *  direction as every other failure here — the watchdog under-counts and stays quiet — and the
+ *  alternative (holding it until the invoke resolves) would let a bridge that is failing every beat
+ *  accumulate an unbounded total and fire the trigger on the first one that lands. */
+export function takePendingStallMs(): number {
+  const ms = Math.round(pendingStallMs);
+  pendingStallMs = 0;
+  return ms;
+}
 
 /** Start a requestAnimationFrame loop that logs any inter-frame gap exceeding `thresholdMs` — i.e.
  *  every time the main thread was blocked long enough to drop frames (the visible "freeze"). Gaps
@@ -819,6 +880,15 @@ export function startJankMonitor(thresholdMs = 150, windowLabel = "main"): void 
         ...(rendered ? { rendered } : {}),
       });
     } else if (verdict === "stall") {
+      // Every stall, severe and minor alike, in ONE place — above the branch that splits them — so
+      // the budget the watchdog measures covers exactly the set of gaps this monitor calls a stall,
+      // rather than a second opinion about it. Wiring it into the minor branch alone would silently
+      // drop the biggest stalls of all, which are the ones a hang budget is for.
+      //
+      // The WHOLE gap, not its excess over a healthy frame: that is how the rollup's `totalMs`
+      // accounts for the minor half, and two numbers named the same thing that differ by a frame's
+      // worth of time is how a threshold set from one stops meaning anything against the other.
+      pendingStallMs += gap;
       if (gap >= JANK_SEVERE_MS) {
         // `during` attributes the stall to whatever interaction was mid-flight (kinds only, no
         // keys). Only the severe branch carries it: a minor stall is reported as a coalesced

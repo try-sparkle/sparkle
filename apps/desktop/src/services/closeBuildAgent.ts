@@ -135,6 +135,13 @@ export async function closeBuildAgent(
   });
 
   // Finally drop the build agent (and, via cascade, its workers) from the sidebar.
+  // NO PANE IS LEFT BY THIS POINT, and that is now handled rather than merely true: `close(id)` ran
+  // above and `spinDownAgentGit` was awaited in between, so React committed the unmount long ago.
+  // `removeAgent` opens its `close:` trace only while a pane is registered to end it
+  // (services/agentPaneRegistry), so this no longer strands a permanent entry that
+  // `openTraceKinds()` would name on every later jank stall (bead sparkle-bxidpw). Nothing is lost:
+  // this site never produced a `close … (total)` waterfall anyway — the pane's `perfEnd` fired
+  // against a trace that had not been started yet.
   useProjectStore.getState().removeAgent(project.id, buildAgentId);
   return { ok: true };
 }

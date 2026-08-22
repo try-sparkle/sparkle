@@ -1603,6 +1603,14 @@ export function AgentSidebar({
     // interaction path nothing and the rows still disappear immediately.
     const kills = allIds.map((cid) => killPty(cid, "sidebar-close-agent").catch(() => {}));
     for (const cid of allIds) close(cid);
+    // CAN THIS REACH AN UNMOUNTED PANE? YES — and it is handled, in the store, not here. The sidebar
+    // lists every row in `project.agents`, but a pane exists only for an agent in `openAgentIds`
+    // inside a VISITED, non-torn-out project (Workspace's `live` memo), so a row restored from disk,
+    // adopted by the worker reconcile, or admitted by the resurrector has none. `removeAgent` opens
+    // its `close:` trace only while a pane is registered to end it (services/agentPaneRegistry), so
+    // no ghost is left for `openTraceKinds()` to misreport on a later jank stall (sparkle-bxidpw).
+    // This site's waterfall is UNAFFECTED: `close()` above and `removeAgent` here run in the same
+    // tick, React 18 batches the re-render, so a mounted pane is still mounted when the store asks.
     removeAgent(project.id, id);
     reselectAfterClose(id);
     // Background: remove each worktree. NOT awaited on the interaction path — the rows are already
@@ -1923,6 +1931,10 @@ export function AgentSidebar({
     // cloud ids — harmless no-ops (no local PTY or worktree to reap).
     for (const a of [row, ...children]) void terminateIfCloud(a);
     await discardAgentGit({ root: project.rootPath, projectId: project.id, ids, beadIds });
+    // UNLIKE `teardownAgent` ABOVE, the await has already let React commit the pane's unmount — so
+    // there is never a pane here, and this site produced no `close … (total)` waterfall even before
+    // the fix (the pane's `perfEnd` ran against a trace not yet started). It therefore leaked
+    // unconditionally; the store's mounted-pane gate is what settles it (sparkle-bxidpw).
     removeAgent(project.id, id);
     reselectAfterClose(id);
   };
