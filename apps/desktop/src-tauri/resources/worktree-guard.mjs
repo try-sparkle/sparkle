@@ -2923,6 +2923,287 @@ export function callerWorktreeRoot(installRoot, cwd, resolveToplevel = gitToplev
   return installRoot;
 }
 
+
+// ── macOS TCC: home-tree walks that reach PROTECTED app data ────────────────────────────────────
+//
+// WHY THIS EXISTS (bead sparkle-cj4sl7). The founder kept seeing "'Sparkle' would like to access
+// data from other apps." He is not wrong that Sparkle is named: macOS makes the SPAWNING APP the
+// TCC "responsible process" for every descendant, so an AGENT's `find ~ …` is billed to
+// ai.sparkle.desktop and the dialog wears Sparkle's name. Measured directly: a probe five levels
+// below an agent's shell reports its responsible pid as Sparkle's.
+//
+// Disclaiming that responsibility was the obvious fix and is the WRONG one — it was measured too.
+// A disclaimed child is judged on its own identity, which for `/bin/zsh` is a PLATFORM BINARY, and
+// tccd's policy for those is "prompting is 'Deny'": the access is refused with NO dialog and NO
+// System Settings entry to grant it back. Agents would silently lose ~/Desktop, ~/Documents and
+// ~/Downloads — paths the founder actively hands them. So the attribution is not the thing to fix;
+// the WALK is. If nothing descends into a protected container, no dialog is raised at all.
+//
+// The corpus below is not guesswork. The eight AppProtectionPolicy entries were read off
+// XProtect.bundle's own plist; the file-provider and container families are the ones sandboxd was
+// observed attributing to Sparkle (Google Drive, Dropbox, iCloud) while Sparkle held no open file
+// there. A `find ~ -maxdepth 5` reaches Chrome's container at depth 4 and CloudStorage at depth 2,
+// and raises ONE DIALOG PER CONTAINER — which is why a single stray walk feels like a storm.
+//
+// This is a NOISE-and-privacy rule, not a destructive one, so it is deliberately NOT part of
+// `blocksDestructiveCommand` / the `mustBlock` corpus: that predicate's contract is "unconditionally
+// destructive", and a read-only `find` is neither. It gets its own predicate, its own corpus keys,
+// and its own message.
+
+/** TCC-protected app-data containers, as paths relative to $HOME.
+ *
+ *  The first eight are the `protections` entries in
+ *  `/Library/Apple/System/Library/CoreServices/XProtect.bundle/…/AppProtectionPolicy.plist`.
+ *  The last four are the families that are protected per-app rather than by that static list:
+ *  every sandboxed app gets `Library/Containers/<id>/Data`, and each file-provider domain under
+ *  `CloudStorage` / `Mobile Documents` is its own TCC target. Walking the PARENT is enough to touch
+ *  them all, which is why the parents are listed rather than enumerating installed apps. */
+const PROTECTED_APP_DATA = [
+  "Library/Application Support/discord",
+  "Library/Application Support/Google/Chrome",
+  "Library/Application Support/BraveSoftware/Brave-Browser",
+  "Library/Application Support/Microsoft Edge",
+  "Library/Application Support/Firefox",
+  "Library/Application Support/Ledger Live",
+  "Library/Application Support/Exodus",
+  ".walletwasabi",
+  "Library/Containers",
+  "Library/Group Containers",
+  "Library/CloudStorage",
+  "Library/Mobile Documents",
+];
+
+/** Directory walkers, and whether their depth flag actually limits TRAVERSAL.
+ *
+ *  `du`'s does NOT, and that distinction is the whole point of the field: `du -d 1 ~` still stats
+ *  every file under home and only SUMMARISES at depth 1, so a depth flag must not be read as
+ *  "cannot reach Chrome". `find`/`fd`/`tree`/`rg` genuinely stop descending.
+ *
+ *  `patternFirst` marks the tools whose FIRST operand is a search pattern rather than a path
+ *  (`rg foo ~/`), so the root extractor must not treat `foo` as a directory to walk. */
+const WALKERS = {
+  find: { depthFlags: ["-maxdepth"], depthLimitsTraversal: true, patternFirst: false },
+  fd: { depthFlags: ["-d", "--max-depth", "--maxdepth"], depthLimitsTraversal: true, patternFirst: true },
+  fdfind: { depthFlags: ["-d", "--max-depth", "--maxdepth"], depthLimitsTraversal: true, patternFirst: true },
+  du: { depthFlags: ["-d", "--max-depth"], depthLimitsTraversal: false, patternFirst: false },
+  ncdu: { depthFlags: [], depthLimitsTraversal: false, patternFirst: false },
+  tree: { depthFlags: ["-L"], depthLimitsTraversal: true, patternFirst: false },
+  rg: { depthFlags: ["--max-depth", "--maxdepth"], depthLimitsTraversal: true, patternFirst: true },
+};
+
+/** Flags whose VALUE is a glob that keeps the walker OUT of a subtree.
+ *
+ *  Only exclusions that prevent DESCENT count. `find … -not -path X` is deliberately absent: it
+ *  filters the RESULTS but still walks into X, so it still raises the dialog. `-prune` is the one
+ *  find spelling that actually stops descent, and saying so in the remedy is most of this rule's
+ *  teaching value. */
+const WALK_EXCLUDE_FLAGS = new Set(["-g", "--glob", "-E", "--exclude", "--iglob"]);
+
+/** Expand a leading `~`, `$HOME` or `${HOME}` to `home`; leave everything else alone. */
+function expandHomePrefix(p, home) {
+  if (p === "~" || p === "$HOME" || p === "${HOME}") return home;
+  for (const prefix of ["~/", "$HOME/", "${HOME}/"]) {
+    if (p.startsWith(prefix)) return join(home, p.slice(prefix.length));
+  }
+  return p;
+}
+
+/** A `find`/`fd`/`rg` glob, as a RegExp. These patterns are matched against a whole path, and their
+ *  `*` crosses `/` (unlike a shell glob), so a wildcard-anchored `-path` covering a whole Library
+ *  subtree is the idiomatic prune and must match. Character classes pass through; every other
+ *  metacharacter is escaped. */
+function walkGlobToRegExp(pattern) {
+  let out = "";
+  for (let i = 0; i < pattern.length; i++) {
+    const c = pattern[i];
+    if (c === "*") out += ".*";
+    else if (c === "?") out += ".";
+    else if (c === "[") {
+      const close = pattern.indexOf("]", i + 1);
+      if (close === -1) out += "\\[";
+      else { out += pattern.slice(i, close + 1); i = close; }
+    } else out += c.replace(/[.+^${}()|\\]/g, "\\$&");
+  }
+  try { return new RegExp(`^${out}$`); } catch { return null; }
+}
+
+/** The directories a walker segment will descend from. */
+function walkSearchRoots(bin, args) {
+  if (bin === "find") return findSearchRoots(args);
+  const spec = WALKERS[bin];
+  // `ls -R` is the only walker whose recursion is opt-in via a flag rather than its nature.
+  const operands = operandsOf(args);
+  if (!spec) return operands;
+  if (!spec.patternFirst) return operands;
+  // `rg -e PAT ~/x` / `rg -f file ~/x`: the pattern came from a FLAG, so every operand is a path.
+  const patternFromFlag = args.some((a) => a === "-e" || a === "--regexp" || a === "-f" || a === "--file");
+  return patternFromFlag ? operands : operands.slice(1);
+}
+
+/** The walker's traversal depth limit, or null when it has none (or when its depth flag does not
+ *  actually bound traversal — see `depthLimitsTraversal`). */
+function walkMaxDepth(bin, args) {
+  const spec = WALKERS[bin];
+  if (!spec || !spec.depthLimitsTraversal) return null;
+  for (const flag of spec.depthFlags) {
+    const at = args.indexOf(flag);
+    if (at !== -1 && args[at + 1] !== undefined) {
+      const n = Number.parseInt(args[at + 1], 10);
+      if (Number.isFinite(n)) return n;
+    }
+    // `--max-depth=3`
+    const eq = args.find((a) => a.startsWith(`${flag}=`));
+    if (eq) {
+      const n = Number.parseInt(eq.slice(flag.length + 1), 10);
+      if (Number.isFinite(n)) return n;
+    }
+  }
+  return null;
+}
+
+/** Glob patterns this segment uses to STOP descending. */
+function walkExcludePatterns(bin, args) {
+  const out = [];
+  if (bin === "find") {
+    // Only a `-prune` makes find's `-path` patterns stop descent. Without one, its `-path` values
+    // are ordinary match predicates and the walk happens anyway.
+    if (!args.includes("-prune")) return out;
+    for (let i = 0; i < args.length; i++) {
+      if ((args[i] === "-path" || args[i] === "-ipath") && args[i + 1] !== undefined) out.push(args[++i]);
+    }
+    return out;
+  }
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (WALK_EXCLUDE_FLAGS.has(a) && args[i + 1] !== undefined) { out.push(args[++i]); continue; }
+    const eq = [...WALK_EXCLUDE_FLAGS].find((f) => a.startsWith(`${f}=`));
+    if (eq) out.push(a.slice(eq.length + 1));
+  }
+  // ripgrep negates with a leading `!`; fd's --exclude is already an exclusion.
+  return out.map((p) => (p.startsWith("!") ? p.slice(1) : p));
+}
+
+/** Is `p` excluded by one of `patterns` — matching the path itself or any ancestor of it, since
+ *  pruning an ancestor is what actually keeps the walker out. */
+function walkPathExcluded(p, patterns) {
+  const candidates = [p];
+  let cur = p;
+  while (true) {
+    const parent = dirname(cur);
+    if (parent === cur) break;
+    candidates.push(parent);
+    cur = parent;
+  }
+  return patterns.some((pat) => {
+    const re = walkGlobToRegExp(pat);
+    return re !== null && candidates.some((c) => re.test(c));
+  });
+}
+
+/** Relative depth of `target` below `root`, or null when it is not below it. */
+function depthBelow(root, target) {
+  const rel = relative(root, target);
+  if (rel === "" ) return 0;
+  if (rel.startsWith("..") || isAbsolute(rel)) return null;
+  return rel.split(sep).length;
+}
+
+/** Does a walk rooted at `root` reach any protected container? Returns the ones it reaches. */
+function protectedReachedFrom(root, maxDepth, excludes, home) {
+  const reached = [];
+  for (const rel of PROTECTED_APP_DATA) {
+    const full = join(home, rel);
+    // Two ways to touch it: walk DOWN to it from an ancestor root, or start INSIDE it.
+    const d = depthBelow(root, full);
+    const inside = depthBelow(full, root) !== null;
+    if (d === null && !inside) continue;
+    // STRICT `>=`, not `>`: at exactly `-maxdepth d` the walker STATS the container as an entry of
+    // its parent but never opens it, and it is the DESCENT that raises the dialog. Getting this
+    // wrong makes `find ~ -maxdepth 1` (an `ls ~` in all but name, and very common) a refusal —
+    // over-blocking a read-only diagnostic is the exact wall bypassPermissions exists to remove.
+    if (d !== null && maxDepth !== null && d >= maxDepth) continue;
+    if (walkPathExcluded(full, excludes)) continue;
+    reached.push(full);
+  }
+  return reached;
+}
+
+/** A Bash command that would walk into macOS-protected app data, or null.
+ *
+ *  PURE: reads no filesystem. `home` is injected so the test can pin a fixed home rather than the
+ *  runner's — a defaulted seam every test overrides is a line covered by nothing, so `main()` is the
+ *  one caller that leaves it defaulted and the corpus exercises the same code path with its own. */
+export function blocksProtectedAppDataWalk(command, home = homedir(), depth = 0) {
+  if (typeof command !== "string" || command.length === 0) return null;
+  if (typeof home !== "string" || home.length === 0) return null;
+  if (depth > MAX_NESTING) return null;
+  for (const tokens of lexCommand(stripHeredocBodies(command))) {
+    const seg = segmentCommand(tokens);
+    if (!seg) continue;
+    const { bin, args } = seg;
+    // Laundering through `bash -c '…'` must not slip the rule — mirrors judgeSegment's recursion.
+    if (SHELL_BINARIES.has(bin)) {
+      const at = args.findIndex((a) => a.startsWith("-") && !a.startsWith("--") && a.includes("c"));
+      if (at !== -1 && args[at + 1] !== undefined) {
+        const nested = blocksProtectedAppDataWalk(args[at + 1], home, depth + 1);
+        if (nested) return nested;
+      }
+      continue;
+    }
+    // A SHORT-flag-only test is a bypass, not a narrowing (VADE finding on PR #2405): `--recursive`
+    // never matches `^-[A-Za-z]*R`, because after the first `-` the next character is another `-`
+    // and not a letter. The long forms are ordinary spellings an agent types, so they are checked
+    // explicitly rather than by loosening the bundle pattern — `--reverse`/`--regexp` must not
+    // count, and a pattern permissive enough to catch `--recursive` would catch those too.
+    const LS_RECURSIVE_LONG = new Set(["--recursive"]);
+    const GREP_RECURSIVE_LONG = new Set(["--recursive", "--dereference-recursive"]);
+    const recursiveLs =
+      bin === "ls" &&
+      args.some((a) => LS_RECURSIVE_LONG.has(a) || (!a.startsWith("--") && /^-[A-Za-z]*R/.test(a)));
+    const recursiveGrep =
+      bin === "grep" &&
+      args.some(
+        (a) => GREP_RECURSIVE_LONG.has(a) || (!a.startsWith("--") && /^-[A-Za-z]*[rR]/.test(a)),
+      );
+    if (!WALKERS[bin] && !recursiveLs && !recursiveGrep) continue;
+    const effBin = recursiveGrep ? "rg" : bin; // same operand shape: PATTERN then paths
+    const maxDepth = walkMaxDepth(effBin, args);
+    const excludes = walkExcludePatterns(effBin, args);
+    const roots = walkSearchRoots(recursiveLs ? "ls" : effBin, args);
+    for (const rawRoot of roots) {
+      const root = expandHomePrefix(rawRoot, home);
+      if (!isAbsolute(root)) continue; // relative root — cwd is a worktree, not the home tree
+      const reached = protectedReachedFrom(root, maxDepth, excludes, home);
+      if (reached.length > 0) return { rule: "protected-app-data-walk", bin, root, reached };
+    }
+  }
+  return null;
+}
+
+/** The refusal text. It names the containers actually reached and hands back a runnable prune,
+ *  because a refusal with no compliable alternative is a wall — and under bypassPermissions there
+ *  is no approval path around it. */
+function protectedAppDataWalkMessage(v) {
+  const names = v.reached.map((p) => `  - ${p}`).join("\n");
+  const prune = v.bin === "find"
+    ? `  find ${v.root} \\( -path '*/Library/Application Support/Google/*' -o ` +
+      `-path '*/Library/Containers' -o -path '*/Library/CloudStorage' -o ` +
+      `-path '*/Library/Mobile Documents' -o -path '*/Library/Group Containers' \\) ` +
+      `-prune -o <your predicates> -print\n`
+    : "";
+  return (
+    `Blocked: this ${v.bin} would walk into macOS TCC-protected app data.\n\n` +
+    `Root: ${v.root}\nReaches:\n${names}\n\n` +
+    `Each container it touches raises its OWN "would like to access data from other apps" dialog, ` +
+    `attributed to Sparkle — macOS makes the spawning app the responsible process for every agent, ` +
+    `so your walk wears Sparkle's name. A single sweep can raise half a dozen.\n\n` +
+    `Fix it by narrowing the ROOT to the subtree you actually need — that is almost always what you ` +
+    `meant. If you genuinely must start at home, prune the protected set:\n${prune}\n` +
+    `Note: \`-not -path\` does NOT help. It filters find's OUTPUT but still descends, so the dialog ` +
+    `fires anyway. Only \`-prune\` (or a narrower root, or a -maxdepth that cannot reach them) works.\n`
+  );
+}
+
 async function main() {
   const root = process.argv[2];
   if (!root) process.exit(0); // misconfigured guard must not block work
@@ -2964,6 +3245,23 @@ async function main() {
   }
   if (destructive !== null) {
     process.stderr.write(destructiveCommandMessage(destructive));
+    process.exit(2); // exit code 2 → Claude Code blocks the tool call
+  }
+  // TCC home-walk guard (sparkle-cj4sl7): a directory walk that would descend into macOS-protected
+  // app data. Each container reached raises its own "access data from other apps" dialog, attributed
+  // to Sparkle because macOS makes the spawning app the responsible process for every agent.
+  //
+  // Fail-open catch for the same reason as the destructive guard above: this predicate runs on EVERY
+  // Bash command, so a parser bug that exited 2 would block every shell command for every agent. The
+  // access it prevents is a NUISANCE, not a loss — degrading to "no opinion" is strictly correct here.
+  let appDataWalk = null;
+  try {
+    appDataWalk = blocksProtectedAppDataWalk(input.command);
+  } catch {
+    appDataWalk = null;
+  }
+  if (appDataWalk !== null) {
+    process.stderr.write(protectedAppDataWalkMessage(appDataWalk));
     process.exit(2); // exit code 2 → Claude Code blocks the tool call
   }
   // Merge-policy guard (contract §7): `gh pr merge` in a worktree whose resolved policy says the

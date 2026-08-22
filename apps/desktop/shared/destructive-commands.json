@@ -48,7 +48,21 @@
     "                        when stale. Only a git PUSH to main is unambiguous, so only that is here.",
     "  `rm -rf` in general — `rm -rf node_modules` is ordinary. Only catastrophic ROOTS are blocked.",
     "  `security:*` blanket— the existing narrow keychain guard already requires all three signals;",
-    "                        a blanket deny would be broader than the shipped policy."
+    "                        a blanket deny would be broader than the shipped policy.",
+    "",
+    "`mustBlockAppDataWalk` / `mustAllowAppDataWalk` ARE A THIRD KIND OF RULE (bead sparkle-cj4sl7),",
+    "which is why they are their own keys and not more `mustBlock` entries. Everything in `mustBlock`",
+    "is DESTRUCTIVE and judged by `blocksDestructiveCommand`; a `find ~ -maxdepth 5` is read-only and",
+    "destroys nothing. What it does is DESCEND into macOS TCC-protected app data, and each container",
+    "it touches raises its own 'would like to access data from other apps' dialog \u2014 attributed to",
+    "SPARKLE, because macOS makes the spawning app the TCC responsible process for every agent it",
+    "spawns. Keeping them out of `mustBlock` also keeps the deny-rule coverage test honest: these",
+    "commands are guard-only and match no `permissions.deny` prefix. They drive",
+    "`blocksProtectedAppDataWalk`.",
+    "",
+    "Every command here is judged against a FIXED home of `/Users/tester`, injected by the test, so",
+    "the corpus reads the same on every machine. The predicate's `homedir()` default is a seam no",
+    "corpus entry can reach, so the suite drives the real hook end-to-end for that one."
   ],
 
   "denyRules": [
@@ -1239,5 +1253,43 @@
         }
       }
     ]
-  }
+  },
+  "mustBlockAppDataWalk": [
+    { "command": "find ~ -maxdepth 5 -name cli.js", "why": "OBSERVED in agent transcript history: reaches Chrome's container at depth 4 and CloudStorage at depth 2" },
+    { "command": "find ~ -maxdepth 4 -type d -name node", "why": "OBSERVED: -type is a filter, not a narrowing; still descends into CloudStorage and Containers" },
+    { "command": "find ~/Library -iname '*sparkle*'", "why": "OBSERVED: rooted one level above every Library-resident protected container" },
+    { "command": "find /Users/tester -maxdepth 7 -path '*@anthropic-ai/claude-code/cli.js'", "why": "OBSERVED: an absolute home root is the same walk spelled without a tilde" },
+    { "command": "find /Users/tester -maxdepth 4 -type d \\( -iname 'node*' \\)", "why": "OBSERVED: the fifth real case from transcript history" },
+    { "command": "du -sh ~", "why": "du walks every byte under home; its depth flag summarises OUTPUT and does not bound traversal" },
+    { "command": "du -d 1 ~", "why": "so a du depth flag must never be read as narrowing \u2014 it still stats the whole tree" },
+    { "command": "bash -c 'find $HOME -maxdepth 4 -name x'", "why": "laundering the walk through a nested shell must not slip the rule" },
+    { "command": "cd /tmp && find ~/Library/CloudStorage -name x", "why": "a root INSIDE a protected container, reached through a compound" },
+    { "command": "rg foo ~/Library", "why": "ripgrep's first operand is the PATTERN; the path operand is still a home-tree root" },
+    { "command": "grep -r pat ~/Library", "why": "recursive grep is the same walk with a different binary" },
+    { "command": "ls -R ~/Library", "why": "ls recurses only with -R, and that is enough to descend into the protected set" },
+    { "command": "ls --recursive ~/Library", "why": "the LONG spelling of -R: `--recursive` never matches a short-flag-bundle pattern, because the character after the first dash is another dash (VADE finding, PR #2405)" },
+    { "command": "grep --recursive pat ~/Library", "why": "same bypass on grep's side — the long form is an ordinary spelling, not an exotic one" },
+    { "command": "grep --dereference-recursive pat ~/Library", "why": "grep's second recursive spelling, which also follows symlinks OUT of the named root" },
+    { "command": "find ~ -maxdepth 4 -not -path '*/Chrome/*' -name x", "why": "`-not -path` filters find's OUTPUT but still DESCENDS, so the dialog fires anyway" },
+    { "command": "find ~ -name x", "why": "an unbounded home walk \u2014 the shape with no depth limit at all" },
+    { "command": "tree ~/Library", "why": "tree descends by default" },
+    { "command": "find ~/Library/Containers -name x", "why": "every sandboxed app's Data dir is its own TCC target" }
+  ],
+  "mustAllowAppDataWalk": [
+    { "command": "find ~/.claude -name '*.jsonl'", "why": "a dotfile subtree with no protected container below it" },
+    { "command": "find ~/Projects -maxdepth 3 -name Cargo.toml", "why": "ordinary project work" },
+    { "command": "find . -name '*.ts'", "why": "a relative root is the worktree, not the home tree" },
+    { "command": "find ~ -maxdepth 1 -name .zshrc", "why": "at exactly -maxdepth 1 find STATS home's entries and descends into none \u2014 an `ls ~` in all but name, and over-blocking a read-only diagnostic is the wall bypassPermissions exists to remove" },
+    { "command": "ls -la ~/Library/Logs/ai.sparkle.desktop/", "why": "a non-recursive ls, and Logs is not protected" },
+    { "command": "find ~/Library/Logs -name '*.log'", "why": "a Library subtree that holds no protected container" },
+    { "command": "rg foo apps/desktop", "why": "a relative root" },
+    { "command": "git status", "why": "not a walker at all" },
+    { "command": "ls ~/Library", "why": "ls without -R does not recurse" },
+    { "command": "ls --reverse ~/Library", "why": "a long flag that merely CONTAINS an r — the recursion test must not be loosened into matching it" },
+    { "command": "grep --regexp=Chrome ~/Library", "why": "grep without a recursive flag does not descend, whatever its other long flags spell" },
+    { "command": "du -sh ~/Projects", "why": "du bounded to a subtree that reaches nothing protected" },
+    { "command": "rg --max-depth 1 foo ~/Library", "why": "ripgrep's depth flag DOES bound traversal, unlike du's" },
+    { "command": "find ~/Library/Application Support/ai.sparkle.desktop -name x", "why": "Sparkle's own app-support dir is not in the protection policy" },
+    { "command": "find ~ \\( -path '*/Library/Application Support/Google/*' -o -path '*/Library/Containers' -o -path '*/Library/CloudStorage' -o -path '*/Library/Mobile Documents' -o -path '*/Library/Group Containers' -o -path '*/Library/Application Support/discord' -o -path '*/Library/Application Support/BraveSoftware/*' -o -path '*/Library/Application Support/Microsoft Edge' -o -path '*/Library/Application Support/Firefox' -o -path '*/Library/Application Support/Ledger Live' -o -path '*/Library/Application Support/Exodus' -o -path '*/.walletwasabi' \\) -prune -o -name x -print", "why": "THE REMEDY THE REFUSAL HANDS BACK must itself be allowed, or the guard is a wall with no way through it" }
+  ]
 }

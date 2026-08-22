@@ -14,6 +14,20 @@ declare module "*/worktree-guard.mjs" {
   export function blocksDestructiveCommand(
     command: unknown,
   ): { rule: string; why: string } | null;
+  // TCC home-walk guard predicate (sparkle-cj4sl7): non-null iff a Bash command would run a
+  // DIRECTORY WALK that descends into macOS TCC-protected app data. This is a NOISE-and-privacy
+  // rule, not a destructive one — a `find ~ -maxdepth 5` destroys nothing, but each protected
+  // container it descends into raises its own "would like to access data from other apps" dialog,
+  // attributed to SPARKLE because macOS makes the spawning app the TCC responsible process for
+  // every agent it spawns. So it is deliberately separate from `blocksDestructiveCommand` (whose
+  // contract is "unconditionally destructive") and carries its own corpus keys,
+  // `mustBlockAppDataWalk` / `mustAllowAppDataWalk`. PURE — reads no filesystem. `home` is an
+  // injected seam so tests can pin a fixed home; production leaves it defaulted to `homedir()`.
+  export function blocksProtectedAppDataWalk(
+    command: unknown,
+    home?: string,
+    depth?: number,
+  ): { rule: string; bin: string; root: string; reached: string[] } | null;
   // Merge-policy guard predicate (contract §7): non-null iff a Bash command invokes `gh pr merge`
   // in a worktree whose `<worktree>/.sparkle/merge-policy.json` refuses it. Deliberately NOT a
   // global rule — in the owner's own repo merging is the sanctioned path — so the verdict is
