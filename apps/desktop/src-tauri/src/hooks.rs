@@ -103,7 +103,10 @@ fn hook_command(script: &Path, arg: &Path) -> String {
 // `heal_agent_hooks_sync` and `install_repo_hooks` — no agent openable, no hook installable, no
 // roborev hook writable, until the user quit and relaunched, with a `tracing::warn` as the only
 // signal. Before staging existed each of those re-resolved per call, so the agent pane's "Try again"
-// recovered by itself once the swap finished. Two things restore that, WITHOUT reopening mode B:
+// recovered by itself once the swap finished. Two things restore that. The FIRST cannot reopen mode B
+// at all; the SECOND narrows it but leaves a residual hole off macOS — spelled out in its own bullet
+// and in full in [`staged_or_init`]'s header. (This sentence used to read "WITHOUT reopening mode B",
+// which handed the reader an absolute guarantee four lines before the bullet that retracts it.)
 //
 //   * [`stage_one`] falls back to an ALREADY-STAGED copy at `<dest_dir>/<rel>`. `dest_dir` is
 //     `bin/<this build's segment>/`, so anything there is this build's own bytes by construction —
