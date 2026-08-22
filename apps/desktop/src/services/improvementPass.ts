@@ -36,6 +36,7 @@ import {
   classifyPassFailure,
   isTransientPassFailure,
   passFailureStatus,
+  type PassFailureClass,
 } from "../engine/passFailureStatus";
 import { accountConfigDirFor } from "./accountSelection";
 import { buildControlMcpConfig } from "./claudeSpawn";
@@ -673,6 +674,81 @@ function clearParkDeclineStreak(): void {
   parkDeclineStreak = 0;
 }
 
+/** The last RUN failure's reason and how many hourly passes in a row have failed for THAT reason.
+ *
+ *  ⚠️ WHY THIS EXISTS AT ALL (roborev 67832, HIGH). Moving auto-retried failures off red onto amber
+ *  was right for a ONE-OFF failure and wrong for a REPEATING one, and it made the repeating case
+ *  QUIETER THAN IT WAS BEFORE — not merely calmer. `blocked` bands into `needs_you`
+ *  (`engine/buildSections.bandOfStatus`), while `lapsed` bands into **`done`**: a band the sidebar
+ *  can collapse and filter away and the concierge digest does not count. Both are outside
+ *  `DEFAULT_NOTIFY_STATUSES`, so neither fires a banner. An hourly loop dying the same way every hour
+ *  therefore sat in the FINISHED band with nothing pinged — verbatim the "the hourly loop stopped for
+ *  days behind a row nobody was pinged about" incident that {@link PARK_DECLINE_ESCALATE_AFTER}
+ *  exists to end, reintroduced through a different door.
+ *
+ *  The amber tier's own rule settles it: amber means ANOTHER ACTOR clears this. "The next hourly slot
+ *  re-attempts by itself" is a claim about the mechanism, not about the outcome — and once the same
+ *  re-attempt has failed identically N times, no other actor is coming. That is red by definition.
+ *
+ *  Normalized so a message differing only by a timestamp or a path still counts as the same reason;
+ *  module state for the same reason as the park tally, and cleared by any pass that COMPLETES. */
+let runFailureReason: string | null = null;
+let runFailureStreak = 0;
+
+/** Collapse a failure message to the part that identifies the REASON, so a repeat is recognisable.
+ *  Digits and anything path-shaped vary run to run and would otherwise restart the tally forever. */
+function runFailureKey(message: string): string {
+  return message
+    .toLowerCase()
+    .replace(/\/[^\s'"]+/g, "/P")
+    .replace(/\d+/g, "N")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 200);
+}
+
+/** The status a RUN failure (or a setup throw) parks on, escalating a repeat to the notifying tier.
+ *
+ *  A wall (`quota`/`auth`) is red immediately and does NOT participate: it is already the loudest
+ *  thing this row can say, and streaking it would only delay the escalation it has already earned.
+ *  Everything else is AMBER once, AMBER twice, and RED on the {@link PARK_DECLINE_ESCALATE_AFTER}th
+ *  consecutive failure for the same reason — the same threshold and the same argument as the park
+ *  path, so the two cannot drift apart in behaviour or in wording. */
+export function noteRunFailureStatus(
+  message: string,
+  cls: PassFailureClass,
+): { status: AgentTabStatus; streak: number } {
+  if (cls === "quota" || cls === "auth") {
+    runFailureReason = null;
+    runFailureStreak = 0;
+    return { status: passFailureStatus(cls), streak: 0 };
+  }
+  const key = runFailureKey(message);
+  if (key === runFailureReason) runFailureStreak += 1;
+  else {
+    runFailureReason = key;
+    runFailureStreak = 1;
+  }
+  const escalate = runFailureStreak >= PARK_DECLINE_ESCALATE_AFTER;
+  return { status: escalate ? "errored" : passFailureStatus(cls), streak: runFailureStreak };
+}
+
+/** Any pass that COMPLETES breaks the run-failure streak — the loop is demonstrably not stuck. */
+function clearRunFailureStreak(): void {
+  runFailureReason = null;
+  runFailureStreak = 0;
+}
+
+/** Read the consecutive same-reason run-failure tally without disturbing it. */
+export function runFailureStreakAt(): number {
+  return runFailureStreak;
+}
+
+/** Test seam: forget the run-failure tally, as a fresh webview would. */
+export function resetRunFailureStreakForTests(): void {
+  clearRunFailureStreak();
+}
+
 /** Read the consecutive same-reason decline tally without disturbing it. */
 export function parkDeclineStreakAt(): number {
   return parkDeclineStreak;
@@ -1109,6 +1185,8 @@ export async function runImprovementPass(
 
     if (outcome.ok) {
       const result = parseImproveResult(outcome.text);
+      // A pass that COMPLETED is proof the loop is not stuck, whatever it reported.
+      clearRunFailureStreak();
       setStatus(
         SPARKLE_AGENT_ID,
         result && result.awaitingApproval > 0 ? "approval" : "idle",
@@ -1138,7 +1216,14 @@ export async function runImprovementPass(
       // until 2026-08-22 — including the connectivity shapes `armRetryIfTransient` re-attempts a
       // minute later on the line above, and the 30-minute timeout the next hourly slot re-attempts
       // by itself. See engine/passFailureStatus for the rule and why quota is the one red arm.
-      setStatus(SPARKLE_AGENT_ID, passFailureStatus(outcomeClass));
+      // AMBER unless the account is walled — OR unless this is the same failure for the third hour
+      // running, at which point no other actor is coming and it is red. See noteRunFailureStatus.
+      const outcomeFailure = noteRunFailureStatus(outcome.text, outcomeClass);
+      if (outcomeFailure.status === "errored")
+        console.warn(
+          `improvement pass failed ${outcomeFailure.streak}x for the same reason; escalating`,
+        );
+      setStatus(SPARKLE_AGENT_ID, outcomeFailure.status);
     }
   } catch (e) {
     console.warn("improvement pass errored:", e);
@@ -1152,7 +1237,7 @@ export async function runImprovementPass(
     if (failureClass === "transient") armRetryIfTransient(failure);
     // Same rule as the failure branch above: a setup throw is something the next slot re-attempts,
     // so it is AMBER — unless the message names an account wall, which no re-attempt can clear.
-    setStatus(SPARKLE_AGENT_ID, passFailureStatus(failureClass));
+    setStatus(SPARKLE_AGENT_ID, noteRunFailureStatus(failure, failureClass).status);
   } finally {
     releasePass();
   }

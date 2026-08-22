@@ -397,10 +397,16 @@ export function classifyFromScrollback(scrollback: string): ApiFailureClass | nu
     // Requiring that is what separates "the rest of this banner" from "the next thing that happened".
     // NOTE this gates only the UPGRADE. A line that classifies null on its own keeps the original
     // join behaviour, which predates this rule and is what unwraps a split account-limit banner.
+    // ⚠️ THE GATE COVERS BOTH DOORS (roborev 67824). A first cut applied it only to the UPGRADE arm
+    // and left `alone === null ? fromJoined` unconditional — so a marker-bearing next row could
+    // still lend a tail to an anchored prose opener and produce the same false `terminal`, reached
+    // the other way. A join is only ever evidence when the next row is a wrap CONTINUATION; when it
+    // is a new TUI row, the two lines are separate events and neither may complete the other.
+    const joinedEvidence = isWrapContinuation ? fromJoined : null;
     const verdict =
       alone === null
-        ? fromJoined
-        : isWrapContinuation && fromJoined === "terminal"
+        ? joinedEvidence
+        : joinedEvidence === "terminal"
           ? "terminal"
           : alone;
     if (verdict !== null) return verdict;

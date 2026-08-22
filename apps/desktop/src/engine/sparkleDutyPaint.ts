@@ -152,7 +152,15 @@ export function sparkleDutyPaint(
   // while `sparkle_improve_active` still reports inactive — the liveness poller has not raised the
   // row yet and there is no elapsed time to show.
   if (RESTING.has(status) && s.hold === "already-running") {
-    return { status, label: s.passElapsedMs != null ? intoPass(s.passElapsedMs) : "Working — pass starting" };
+    // ⚠️ RAISE THE STATUS, DO NOT JUST RELABEL IT (roborev 67831). Returning the resting status with
+    // a label beginning "Working" produced a GRAY disc whose own hover text said the pass was
+    // working — a disc and its label describing different situations, which is the mirror of the
+    // defect this file's header is written against. The latch is claimed, so a pass genuinely IS in
+    // flight; green is the honest disc and this is a raise off a resting value like every other.
+    return {
+      status: "working",
+      label: s.passElapsedMs != null ? intoPass(s.passElapsedMs) : "Working — pass starting",
+    };
   }
   if (RESTING.has(status) && s.holdText) {
     return { status, label: HELD + s.holdText };

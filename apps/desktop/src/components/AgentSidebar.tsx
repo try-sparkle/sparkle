@@ -2761,8 +2761,13 @@ export function AgentSidebar({
   // The TALLY band, by contrast, must follow what the row actually PAINTS (roborev 67804): a wedged
   // pass rendered a red disc while `bandCounts` still tallied it done/running and the "Needs you"
   // chip read 0 — a dot and a chip disagreeing about the same row.
-  const sparkleBand =
-    sparklePaint.status === sparkleStatus ? sparkleRollupBand : bandOfStatus(sparklePaint.status);
+  // ⚠️ THE SAME PRECEDENCE THE DISC USES, or the two disagree about the row they both describe
+  // (roborev 67831). The disc takes `ROLLUP_DOT_COLOR` whenever the rollup overrides, REGARDLESS of
+  // what the overlay painted; asking "did the overlay raise?" first inverted that whenever both were
+  // true. Read the rollup first here too, and fall back to the painted status otherwise.
+  const sparkleBand = sparkleRollupOverrides
+    ? sparkleRollupBand
+    : bandOfStatus(sparklePaint.status);
 
   // ── THE PINNED CONCIERGE AGENTS ROW'S VIEW MODEL (bead sparkle-s7rfc) ──────────────────────────
   //

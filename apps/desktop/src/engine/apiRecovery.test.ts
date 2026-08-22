@@ -300,6 +300,22 @@ describe("classifyFromScrollback", () => {
 
   // THE FALSE POSITIVE THE UPGRADE MUST NOT OPEN (roborev 67814, HIGH). An innocent 529 with prose
   // beneath it — the second line is verbatim a prose negative from this very file.
+  // THE OTHER DOOR (roborev 67824): the row classifies NULL on its own, so the upgrade arm is never
+  // consulted — the join has to be gated there too or the same false `terminal` is reachable.
+  it("does NOT let a marker-bearing next row complete an anchored prose opener", () => {
+    const sb = [
+      "⏺ Usage limit reached",
+      "⏺ · continuing automatically at 9:30am, according to the docs",
+    ].join("\n");
+    expect(classifyFromScrollback(sb)).toBeNull();
+  });
+
+  // ...while a GENUINE wrap, which carries no marker, still completes.
+  it("still unwraps a genuine hard wrap, which carries no marker", () => {
+    const sb = ["⏺ You’ve hit your session limit", "· resets 9:30am (America/Bogota)"].join("\n");
+    expect(classifyFromScrollback(sb)).toBe("terminal");
+  });
+
   it("does NOT let prose on the NEXT TUI row flip an innocent 529 to terminal", () => {
     const sb = ["⏺ API Error: 529 Overloaded.", "⏺ Usage limit reached is the wall we must paint red"].join("\n");
     expect(classifyFromScrollback(sb)).toBe("retryable");

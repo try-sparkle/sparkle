@@ -94,6 +94,7 @@ import {
   refusalDetail,
   resetParkDeclineStreakForTests,
   resetPassRetryForTests,
+  resetRunFailureStreakForTests,
   runImprovementPass,
 } from "./improvementPass";
 import {
@@ -144,6 +145,11 @@ function resetHarness() {
   // an unpushed decline in one case would otherwise carry a streak into the next and escalate a first
   // refusal there to `errored`. Forget it, so every test starts from a clean count.
   resetParkDeclineStreakForTests();
+  // The THIRD module tally, and it needs the same isolation as its two siblings: a run-failure
+  // streak survives between tests in a file, so several passes failing with the same message would
+  // escalate the later ones to `errored` and the assertion would read as a behaviour change rather
+  // than as leaked state.
+  resetRunFailureStreakForTests();
   useRuntimeStore.getState().setStatus(SPARKLE_AGENT_ID, "stopped");
   useRuntimeStore.getState().setAttentionScreen(SPARKLE_AGENT_ID, "");
   // The transcript registry is module-level state that OUTLIVES a test, so a pass in one case would

@@ -297,7 +297,10 @@ describe("sparkleDutyPaint — already-running is not a hold", () => {
     // The old label read "Hourly pass held — a pass is already in flight", which contradicts itself.
     expect(out.label).toBe("Working — pass starting");
     expect(out.label).not.toContain("held");
-    expect(out.status).toBe("stopped");
+    // ⚠️ AND THE DISC MOVES WITH IT (roborev 67831). Keeping the resting status here left a GRAY dot
+    // whose own hover text said the pass was working — the disc and its label describing different
+    // situations. The latch is claimed, so a pass genuinely is in flight; green is the honest disc.
+    expect(out.status).toBe("working");
   });
 
   it("prefers the elapsed time once the child is reporting one", () => {
@@ -310,5 +313,6 @@ describe("sparkleDutyPaint — already-running is not a hold", () => {
     });
     expect(out.label).toContain("12m");
     expect(out.label).not.toContain("held");
+    expect(out.status).toBe("working");
   });
 });
