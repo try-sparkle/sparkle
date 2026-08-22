@@ -34,36 +34,32 @@
 // If `useFinishedHeads` ever takes its map from a hook rather than a parameter, DELETE THIS FILE: a
 // structural guarantee needs no guard.
 //
-// ══ WHAT THIS GRIPS, STATED AS A LIST BECAUSE TWO EARLIER CUTS GOT IT WRONG ═══════════════════
-// A source guard is only as good as the evasions it was actually run against, and this file has now
-// misdescribed its own reach twice — first OVERSTATED (whole-file `toMatch`es that were satisfied by
-// any one matching occurrence), then UNDERSTATED (an example listed as a blind spot that the guard
-// actually catches). Both failures cost the same thing: the next maintainer trusts the list instead
-// of re-deriving. So the list below is exactly the set that has been mutation-verified to RED:
+// ══ WHAT THIS GRIPS — AND WHY IT IS NO LONGER A LIST OF SYNTAXES ══════════════════════════════
+// Three consecutive review rounds each found a declaration shape this file's enumeration had
+// missed, and each round the fix was to add one more regex. The last miss was the one that proved
+// the approach wrong: a destructure whose right-hand side is NOT a call, in a SECOND SCOPE in the
+// same file — which every shape-regex missed, which the old destructure counter did not count
+// (it required `= ident(`), and whose argument spelling was correct. Three rounds where the
+// STATED REACH was itself the defect is an argument for changing the method, not extending it.
 //
-//   1. a SECOND call in a file already on the list, with the wrong argument
-//   2. `let` / `var` rebinding `calmStatus`
-//   3. `const { status: calmStatus } = rt` — renamed INTO the name
-//   4. `const { calmStatus } = somethingElse()` — right name, wrong producer
-//   5. a TYPE-ANNOTATED PARAMETER named `calmStatus` — the form that needs no declaration keyword
-//      and no `=`, so every check above misses it, and the likeliest one to appear in a 3,500-line
-//      component full of memo and callback bodies
-//   6. a CONTEXTUALLY-TYPED ARROW PARAMETER — `({ calmStatus }) => …` — which carries no annotation
-//      at all because its type comes from the call it is passed to
-//   7. a THIRD caller file
+// So the question is no longer "which syntax is this". It is: HOW MANY TIMES is this name BOUND in
+// this file? The answer must be one, and that one must come from `useOverlaidStatus`. A shape
+// nobody enumerated still counts as a binding, which is the property the enumeration never had.
 //
-// WHAT IT STILL CANNOT SEE, and these are true rather than illustrative: an indirection through an
-// object (`deps.calmStatus`), a spread call (`useFinishedHeads(...args)`), an UNANNOTATED parameter
-// in a position TypeScript does not contextually type (which `noImplicitAny` rejects anyway, so the
-// compiler is the guard there), and a caller outside `apps/desktop/src`. An ALIAS (`const m = calmStatus; useFinishedHeads(agentsById, m, …)`) was
-// listed here and is WRONG — the per-call check compares against the literal argument list, so an
-// alias reds. It reds as a FALSE ALARM, since aliasing the correct map is harmless, which brings us
-// to the last thing a reader needs:
+// Mutation-verified to RED: a second call with the wrong argument; `let`/`var`; a rename INTO the
+// name; a destructure from the wrong producer; a type-annotated parameter; a contextually-typed
+// arrow parameter; an ARRAY destructure; a `for…of` destructure; and the second-scope non-call
+// destructure above. Verified NOT to red: a doc comment naming the identifier — comments are
+// stripped before scanning, because both caller files genuinely comment on this very name.
+//
+// WHAT IT STILL CANNOT SEE: an indirection through an object at the CALL (`useFinishedHeads(a,
+// deps.calmStatus, n)` — though that reds on the argument check, as a false alarm), a spread call
+// (`useFinishedHeads(...args)`), and a caller outside `apps/desktop/src`.
 //
 // ⚠️ HOW TO READ A FAILURE. The argument check is an exact string comparison, so renaming
-// `agentsById` or `nudgeFlags`, adding a trailing comma to a wrapped call, or even quoting a
-// `useFinishedHeads(…)` call inside a comment will red this file. That is "reformat, or update the
-// guard" — NOT a regression. A real regression looks like an argument that is a different MAP.
+// `agentsById` or `nudgeFlags`, or adding a trailing comma to a wrapped call, will red this file.
+// That is "reformat, or update the guard" — NOT a regression. A real regression looks like the name
+// being BOUND a second time, or an argument that is a different MAP.
 import { describe, expect, it } from "vitest";
 import { readdirSync, readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
@@ -71,6 +67,16 @@ import { fileURLToPath } from "node:url";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const read = (rel: string) => readFileSync(resolve(here, rel), "utf8");
+
+/** Source with comments removed.
+ *
+ *  NOT cosmetic: every pattern below scans raw text, and both caller files comment ON this very
+ *  identifier. A doc line reading `calmStatus: the pre-escalation map` is a perfectly natural thing
+ *  to write and would have matched the annotated-parameter pattern, reddening this guard with the
+ *  message "calmStatus is type-annotated (a parameter)" — a false alarm on a comment. Stripping
+ *  first means the guard reads CODE, which is what it claims to do. */
+const strip = (src: string) =>
+  src.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:])\/\/[^\n]*/g, "$1");
 
 /** Every production caller. A new one added without a line here is the case this cannot see, so the
  *  list is asserted to be complete against a repo-wide grep below. */
@@ -101,47 +107,48 @@ describe("every caller feeds useFinishedHeads the overlaid map", () => {
     });
 
     it(`${label} binds calmStatus exactly once, from useOverlaidStatus`, () => {
-      const src = read(rel);
-      // The name check above is only as good as the name. Three ways to rebind it, all of which
-      // would satisfy the call assertion while feeding the hook something else — and the first cut
-      // of this guard caught only the first of them while its header claimed to close the hole:
+      // ══ COUNT BINDINGS, DO NOT ENUMERATE SYNTAXES ══════════════════════════════════════════
+      // This assertion was a list of five regexes, one per declaration shape, and three consecutive
+      // review rounds each found a shape the list had missed — the last being a destructure whose
+      // right-hand side is NOT a call, in a SECOND SCOPE in the same file:
       //
-      //   const/let/var calmStatus = rt.status      ← direct rebind, any keyword
-      //   const { status: calmStatus } = rt          ← renamed INTO the name during a destructure
-      //   const { calmStatus } = somethingElse()     ← destructured from the wrong producer
+      //   function EpicRowFooter(props: FooterProps) {
+      //     const { agentsById, nudgeFlags } = props;
+      //     const { calmStatus } = props.maps;                 // ← the shadow, no call on the RHS
+      //     const isFinishedOf = useFinishedHeads(agentsById, calmStatus, nudgeFlags);
       //
-      // So: no direct binding at all, no rename into the name, and exactly ONE destructure that
-      // binds it — whose right-hand side must be `useOverlaidStatus(`.
-      expect(src.match(/(?:const|let|var)\s+calmStatus\b/g) ?? [], "calmStatus rebound directly").toEqual([]);
-      expect(src.match(/:\s*calmStatus\b/g) ?? [], "something renamed INTO calmStatus").toEqual([]);
-      // A PARAMETER needs no keyword and no `=`, so nothing above sees it — and in a component full
-      // of memo and callback bodies it is the likeliest shadow of all:
-      //   const finishedFor = (agentsById, calmStatus) => useFinishedHeads(agentsById, calmStatus, …)
-      //   groups.map(({ calmStatus }) => useFinishedHeads(agentsById, calmStatus, …))
-      // Both would satisfy every other assertion in this file while feeding the hook another map.
-      // ⚠️ NOT `/[(,]\s*calmStatus\s*[:,)]/`, which was the first attempt and matched the ARGUMENT
-      // position in the very call this file exists to bless (`…, calmStatus, nudgeFlags)`). What
-      // separates a parameter from an argument here is a TYPE ANNOTATION — this codebase is
-      // `noImplicitAny`, so a declared parameter carries one. The same pattern also rejects an
-      // object-literal key, which is a shadow by another route and equally unwelcome.
+      // Every shape-regex missed it, the old destructure counter did not count it (it required
+      // `= ident(`), and the argument check passed because the SPELLING was right. That case is
+      // also the only viable one left: a second binding INSIDE one component is a TypeScript
+      // redeclaration error, and a parameter shadow puts the hook call in a non-hook callback,
+      // which `react-hooks/rules-of-hooks` rejects. A second component in one file has neither
+      // problem — and `AgentSidebar.tsx` is 4,000+ lines.
+      //
+      // So the enumeration is abandoned. The question is not "which syntax is this" but "HOW MANY
+      // TIMES is this name bound", and the answer must be one. Adding a sixth regex would have been
+      // the fourth round of the same mistake.
+      const src = strip(read(rel));
+      const bindings = [
+        // A destructure in ANY binding position — `=`, `of`, `in` — whatever is on the right.
+        ...src.matchAll(/\{[^{}]*\bcalmStatus\b[^{}]*\}\s*(?:=[^=>]|\bof\b|\bin\b)/g),
+        // A plain declaration, any keyword.
+        ...src.matchAll(/(?:const|let|var)\s+calmStatus\b/g),
+        // An array destructure.
+        ...src.matchAll(/\[[^\]]*\bcalmStatus\b[^\]]*\]\s*=[^=>]/g),
+        // A rename INTO the name, and a type-annotated parameter. Both are bindings; neither is a
+        // use. (Comments are stripped above, so a doc line reading `calmStatus: the pre-escalation
+        // map` — which these files genuinely contain — cannot be mistaken for one.)
+        ...src.matchAll(/:\s*calmStatus\b/g),
+        ...src.matchAll(/\bcalmStatus\s*:/g),
+        // A contextually-typed arrow parameter, which carries no annotation at all.
+        ...src.matchAll(/\(\s*[^()]*\bcalmStatus\b[^()]*\)\s*=>/g),
+      ];
       expect(
-        src.match(/\bcalmStatus\s*:/g) ?? [],
-        "calmStatus is type-annotated (a parameter) or used as an object key",
-      ).toEqual([]);
-      // …and the CONTEXTUALLY-typed arrow parameter, which needs no annotation because its type
-      // comes from the call it is passed to: `(a, calmStatus) => …`. Anchored on the `=>` so the
-      // ordinary argument position — no arrow after it — cannot match.
-      expect(
-        src.match(/\(\s*[^()]*\bcalmStatus\b[^()]*\)\s*=>/g) ?? [],
-        "calmStatus is an arrow PARAMETER",
-      ).toEqual([]);
-      expect(
-        src.match(/\{[^{}]*\bcalmStatus\b[^{}]*\}\s*(?::[^=]*)?=>/g) ?? [],
-        "calmStatus is destructured in an ARROW PARAMETER",
-      ).toEqual([]);
-      const destructures = [...src.matchAll(/\{[^{}]*\bcalmStatus\b[^{}]*\}\s*=\s*([A-Za-z_$][\w$]*)\(/g)];
-      expect(destructures.length, `${label} should destructure calmStatus exactly once`).toBe(1);
-      expect(destructures[0]![1]).toBe("useOverlaidStatus");
+        bindings.map((m) => m[0]),
+        `${label} should bind calmStatus EXACTLY ONCE`,
+      ).toHaveLength(1);
+      // …and that one binding must take it from the shared hook.
+      expect(src).toMatch(/\{[^{}]*\bcalmStatus\b[^{}]*\}\s*=\s*useOverlaidStatus\(/);
     });
   }
 
