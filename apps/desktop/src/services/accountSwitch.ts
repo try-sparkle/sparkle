@@ -379,6 +379,18 @@ export function moveAgent(
   agentId: string,
   toAccountId: string,
   restart: (agentId: string) => boolean,
+  /** Is the agent ARRIVING from a different account, or being re-pinned where it already is?
+   *
+   *  This is the seam the two callers actually reach, which is why the distinction lives here rather
+   *  than on `setPinFromSwitch` — an earlier cut put it there and every production path took the
+   *  same branch, so the flag was dead and the defect it was written for reproduced unchanged.
+   *
+   *  `advanceSwitch` passes true: that is a migration, and arriving agents make a stale statement of
+   *  the target's rotation membership. `authRecovery.resumeAll` passes nothing: it re-pins a stuck
+   *  agent to the account it is ALREADY on, so the re-spawn cannot auto-pick a different, still-walled
+   *  one. Nothing moves there and nothing is said about the fleet, so nothing about the pool is
+   *  revised. Defaults to false so a new caller opts IN to changing the pool. */
+  relocating = false,
 ): boolean {
   // THE WALL BELONGED TO THE ACCOUNT WE JUST LEFT. A quota block is a claim about an account
   // ("you've hit your session limit · resets 4pm"), and this agent is no longer running under that
@@ -431,7 +443,8 @@ export function moveAgent(
   }
   // `setPinFromSwitch`, not `setPin`: this pin is MACHINERY's, and a later activation has to be able
   // to clear the pins a previous one left without touching the ones a person set by hand.
-  setPinFromSwitch(agentId, toAccountId);
+  // Forwarded from `moveAgent`'s own caller — see its `relocating` docblock.
+  setPinFromSwitch(agentId, toAccountId, relocating);
   return restart(agentId);
 }
 
@@ -445,7 +458,9 @@ export function advanceSwitch(
   const ready = readyToMove(plan, statuses);
   const movedNow: string[] = [];
   for (const agentId of ready) {
-    moveAgent(agentId, plan.toAccountId, restart);
+    // `relocating: true` — a plan MOVES agents from `fromAccountId` to `toAccountId`, so the target
+    // rejoins the rotation pool. `authRecovery.resumeAll`, the other caller, passes nothing.
+    moveAgent(agentId, plan.toAccountId, restart, true);
     movedNow.push(agentId);
   }
   if (movedNow.length === 0) return { plan, movedNow };

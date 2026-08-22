@@ -12,7 +12,7 @@
 //   * and, for every `switch_all` refusal, a PAIRED test showing the same setup DOES switch once the
 //     refused condition is removed. A refusal test alone is ambiguous — it passes just as well
 //     against a function that never switches at all.
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   ACCOUNTS_DEPS,
   ACCOUNTS_RISK,
@@ -26,6 +26,21 @@ import type { Ceiling } from "../headroom";
 import type { AccountUsageLive } from "../accountUsage";
 import { getAccountUsageLive } from "../accountUsage";
 import { activateAccount } from "../../hooks/useAccountSwitch";
+import { setPreferredAccountId, clearPreferredAccount } from "../accountStore";
+import {
+  setAccountInRotation,
+  pauseRotation,
+  ROTATION_OUT_STORAGE_KEY,
+  ROTATION_PAUSED_STORAGE_KEY,
+} from "../rotationState";
+
+// Both persist in localStorage by design (the spawn path reads them and is not React), so a test
+// that sets one would otherwise leak into its neighbours.
+afterEach(() => {
+  localStorage.removeItem(ROTATION_OUT_STORAGE_KEY);
+  localStorage.removeItem(ROTATION_PAUSED_STORAGE_KEY);
+  clearPreferredAccount();
+});
 import { busiestPaneAccount } from "../paneControl";
 
 const NOW = 1_700_000_000_000;
@@ -232,6 +247,165 @@ describe("read_usage — provenance", () => {
     expect(report.rows.find((r) => r.accountId === "one")!.sameQuotaAs).toEqual(["two"]);
     // Two rows, but only ONE place to run work.
     expect(report.usableLogins).toBe(1);
+  });
+
+  // ── THE COUNT THE CONCIERGE SAYS OUT LOUD ───────────────────────────────────────────────────
+  // `usableLogins` promises "how many DISTINCT logins can actually receive a spawn". The accounts
+  // screen lets a human take one out of the pool from its ⋮ menu, and the spawn path honours that —
+  // so an unnetted figure is not a stale statistic, it is the concierge telling someone there are
+  // two accounts to rotate between while agents can only reach one.
+  it("does not count a login the user took OUT of rotation", async () => {
+    const base = deps({
+      listAccounts: async () => [acct("a"), acct("b")],
+      getIdentities: async () => [signedIn("a"), signedIn("b")],
+    });
+    // The control: both count while both are in the pool.
+    expect(dataOf(await readUsage(base)).usableLogins).toBe(2);
+
+    setAccountInRotation("b", false);
+    const report = dataOf(await readUsage(base));
+    expect(report.usableLogins).toBe(1);
+    // …and the ROW says WHY, which is what makes the count and the rows one partition rather than
+    // two. A netted count beside rows the model cannot tell apart is the count-contradicts-the-rows
+    // shape inside a single JSON object — and the model is what picks the switch target from it.
+    expect(report.rows.find((r) => r.accountId === "b")!.outOfRotationReason).toBe("manual");
+    expect(report.rows.find((r) => r.accountId === "a")!.outOfRotationReason).toBeNull();
+  });
+
+  it("reports whether rotation is PAUSED, so a switch is not recommended into a freeze", async () => {
+    const base = deps({
+      listAccounts: async () => [acct("a"), acct("b")],
+      getIdentities: async () => [signedIn("a"), signedIn("b")],
+    });
+    expect(dataOf(await readUsage(base)).rotationPaused).toBe(false);
+
+    pauseRotation("a", 1000);
+    const report = dataOf(await readUsage(base));
+    expect(report.rotationPaused).toBe(true);
+    // WHERE the work is going, not just that it stopped moving. `rotationPaused` alone is fleet-level
+    // and does not answer the question a caller asks next.
+    expect(report.pausedOnAccountId).toBe("a");
+    // The pool is UNCHANGED by a pause — pausing does not take accounts out, it stops re-ranking
+    // them. Reporting a shrunken count here would send the concierge to the wrong remedy.
+    expect(report.usableLogins).toBe(2);
+  });
+
+  it("keeps a login whose FIRST registration was taken out, because the sibling still works", async () => {
+    // THE ORDER-DEPENDENCE. `rotationReadiness` elects each login's representative by input order,
+    // before any of the user's choices are known, so netting the opt-out off that representative
+    // gave two answers for one fleet: taking the first row out dropped a login agents could still
+    // reach through its sibling, while taking the sibling out changed nothing. `partitionAccounts`
+    // excludes duplicates from nothing, so only the second answer was ever right.
+    const shared = { accountUuid: "one-login" };
+    const base = deps({
+      listAccounts: async () => [acct("a"), acct("aa"), acct("b")],
+      getIdentities: async () => [
+        signedIn("a", shared),
+        signedIn("aa", shared),
+        signedIn("b"),
+      ],
+    });
+    expect(dataOf(await readUsage(base)).usableLogins).toBe(2);
+
+    setAccountInRotation("a", false);
+    const first = dataOf(await readUsage(base));
+    expect(first.usableLogins).toBe(2); // the shared login is still reachable through `aa`
+    // …and `aa` is now the one representing it, so it must not ALSO report itself a duplicate.
+    expect(first.rows.find((r) => r.accountId === "aa")!.outOfRotationReason).toBeNull();
+    expect(first.rows.find((r) => r.accountId === "a")!.outOfRotationReason).toBe("manual");
+
+    // The paired case — one fleet, one answer, whichever registration was excluded.
+    setAccountInRotation("a", true);
+    setAccountInRotation("aa", false);
+    expect(dataOf(await readUsage(base)).usableLogins).toBe(2);
+
+    // …and the login leaves only when EVERY registration of it is out.
+    setAccountInRotation("a", false);
+    expect(dataOf(await readUsage(base)).usableLogins).toBe(1);
+  });
+
+  it("names only a fleet target the router would actually honour", async () => {
+    // The raw stored id is not the answer, and reporting it as one contradicts the rest of this
+    // payload: pause onto `a`, take `a` out, and the old field returned `pausedOnAccountId: "a"`
+    // beside `rows[a].outOfRotationReason: "manual"` while every spawn had fallen through elsewhere.
+    const base = deps({
+      listAccounts: async () => [acct("a"), acct("b")],
+      getIdentities: async () => [signedIn("a"), signedIn("b")],
+    });
+    pauseRotation("a", 1000);
+    expect(dataOf(await readUsage(base)).pausedOnAccountId).toBe("a"); // the control
+
+    setAccountInRotation("a", false);
+    const report = dataOf(await readUsage(base));
+    expect(report.rotationPaused).toBe(true); // still paused — the FREEZE is what stopped biting
+    expect(report.pausedOnAccountId).toBeNull();
+  });
+
+  it("names the OVERRIDE rather than the freeze, because the router consults it first", async () => {
+    // `chooseAccountForAgent` skips the pause whenever a preference exists. A caller handed only
+    // `pausedOnAccountId` would be told about the weaker of the two — and told the wrong account.
+    const base = deps({
+      listAccounts: async () => [acct("a"), acct("b")],
+      getIdentities: async () => [signedIn("a"), signedIn("b")],
+    });
+    pauseRotation("a", 1000);
+    setPreferredAccountId("b");
+
+    const report = dataOf(await readUsage(base));
+    expect(report.overrideAccountId).toBe("b");
+    expect(report.pausedOnAccountId).toBeNull();
+    expect(report.rotationPaused).toBe(true);
+  });
+
+  it("falls back to naming the FREEZE when the override stops being honourable", async () => {
+    // THE DISCRIMINATING CASE. Suppressing the pause on the RAW stored preference blanks both fields
+    // in exactly the state where the freeze is deciding: `usablePreferredAccount` declines a
+    // preference whose account was taken out (or walled, or signed out), `usablePausedAccount` then
+    // returns the frozen id, and every spawn lands there — while the report said routing was
+    // automatic. Setting a preference that IS honourable, as the test above does, cannot see this.
+    const base = deps({
+      listAccounts: async () => [acct("a"), acct("b")],
+      getIdentities: async () => [signedIn("a"), signedIn("b")],
+    });
+    setPreferredAccountId("a");
+    pauseRotation("b", 1000);
+    // The control: while `a` is honourable, the override is what decides and the freeze is not named.
+    const before = dataOf(await readUsage(base));
+    expect(before.overrideAccountId).toBe("a");
+    expect(before.pausedOnAccountId).toBeNull();
+
+    setAccountInRotation("a", false);
+
+    const after = dataOf(await readUsage(base));
+    expect(after.overrideAccountId).toBeNull();
+    expect(after.pausedOnAccountId).toBe("b");
+  });
+
+  it("reports an install where NO account reports an email CONSISTENTLY, not optimistically", async () => {
+    // `accounts.rs` leaves `Identity.email` null for any config dir with no parseable `oauthAccount`,
+    // and the ROUTER degrades open on that reading — it honours the preference rather than dropping
+    // it, because an absent signal is not evidence. Mirroring that here was tried and made one
+    // payload say two things: `overrideAccountId: "a"` beside `usableLogins: 0`, every row reading
+    // `not-signed-in`, and `switch_all` refusing every account. A model reading that is told the
+    // fleet is routed to `a` and that it cannot move the fleet anywhere.
+    //
+    // So this asserts the WHOLE payload agrees with itself, which is the property that makes it
+    // reasonable to reason over. The divergence from the router is a stated overstatement in
+    // `honouredTarget`, not a silent one.
+    const base = deps({
+      listAccounts: async () => [acct("a"), acct("b")],
+      getIdentities: async () => [
+        { id: "a", email: null, organization: null, accountUuid: null },
+        { id: "b", email: null, organization: null, accountUuid: null },
+      ],
+    });
+    setPreferredAccountId("a");
+
+    const report = dataOf(await readUsage(base));
+    expect(report.overrideAccountId).toBeNull();
+    expect(report.usableLogins).toBe(0);
+    expect(report.rows.every((r) => r.outOfRotationReason === "not-signed-in")).toBe(true);
+    expect(report.rows.every((r) => !r.signedIn)).toBe(true);
   });
 
   it("marks the account the fleet is actually on", async () => {

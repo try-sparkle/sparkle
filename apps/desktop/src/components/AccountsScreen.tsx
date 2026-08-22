@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState, type CSSProperties } from "react";
-import { FiAlertTriangle, FiRotateCw, FiSlash, FiUserPlus } from "react-icons/fi";
+import { FiAlertTriangle, FiPause, FiRotateCw, FiSlash, FiUserPlus } from "react-icons/fi";
 import { C, ON_BRAND_FILL } from "../theme/colors";
 import { FONT_UI, PILL, TYPE } from "../theme/scale";
 import { tag } from "./labelTreatment";
@@ -21,6 +21,15 @@ import {
   identityKey,
   getPreferredAccountId,
   clearPreferredAccount,
+  // The OBSERVED rate limit, shared with the spawn path's own fleet-target gates — see
+  // `honouredFleetTarget`. One definition, so the header cannot disagree with the router about
+  // whether an account is at its wall.
+  isAccountExhausted,
+  // The ROUTER's own definition of "signed in", shared for the same reason — see
+  // `honouredFleetTarget`. Deliberately NOT the card-level `isSignedIn`: these are two different
+  // predicates (email vs uuid-or-email) and the header must not hold the second opinion.
+  signedInAccountIds,
+  signedInFilterApplies,
   clearSwitchWrittenPins,
   getPin,
   setPin,
@@ -65,10 +74,24 @@ import {
   collapsedRunningAgents,
   signInStalled,
   PENDING_NICKNAME,
+  // Still read here for the expired-login card title, which renders it as a red status with a real
+  // `reconnect` button rather than as a nickname. main dropped this import when it deleted the
+  // rotation-box bullets that were the other reader.
+  EXPIRED_LOGIN_NICKNAME,
   STALLED_SIGN_IN_TITLE,
   SIGN_IN_STALL_SECONDS,
 } from "./accountsView";
-import { joinList } from "../engine/joinList";
+import {
+  accountRotationState,
+  rotationLabel,
+  rotationReasonLabel,
+  rotationOutIds,
+  electRotationPool,
+  setAccountInRotation,
+  rotationPause,
+  pauseRotation,
+  resumeRotation,
+} from "../services/rotationState";
 
 // Accounts settings screen for multi Claude Max account support (design spec
 // docs/superpowers/specs/2026-06-26-multi-max-account-design.md). Lists each registered Claude
@@ -457,53 +480,237 @@ function noticeCard(ink: string): CSSProperties {
  *  Counting is delegated to {@link rotationReadiness}, which derives signed-in-ness from the same
  *  predicate selection uses and sameness from the canonical grouping. This component only renders. */
 
+// ── THE BULLET LIST IS GONE ──────────────────────────────────────────────────────────────────────
+// `groupExcluded` and the "counted out" `<ul>` lived here. They named every registration that did not
+// count toward rotation and why — "“Signing in…” is registered but has never been signed in, so it
+// cannot receive agents", "N accounts are the same Claude login…" — and the founder read that block
+// out loud and could not parse it: "I don't know what that means. I don't know what sign ing in is.
+// I don't know what log in is."
+//
+// He was right, and the reason is structural rather than a matter of wording. The bullets described
+// ACCOUNTS from a banner sitting several rows above them, so each one had to re-identify its subject
+// by quoting a nickname — and the nicknames it was quoting are the generic placeholders
+// ("Signing in…", "Login expired — reconnect") that two different rows can share, which is why the
+// block needed collapsing logic and a paragraph of comments about React keys in the first place. The
+// information is not lost: every one of those facts is now a dot and a two-word label on the card it
+// is ABOUT, derived from `accountRotationState`, where it needs no quoting and cannot collide.
 
-function RotationBanner({
-  readiness,
-  nameOf,
+/** THE GLANCE, at the top of the screen and above the fold: is rotation running, how many accounts
+ *  can actually receive a spawn, and where the next agent goes.
+ *
+ *  The founder's layout, in his words: "the green circular icon … make that bigger and put it to the
+ *  left of where it says cloud accounts, and then below it, it should say rotation active in green".
+ *  And the control: "there would just be a pause button. And I could pause the fleet rotation … then
+ *  it would say rotation paused, and it would have the two line pause icon instead of rotation
+ *  active. And if I click it again, then it goes back to rotation active."
+ *
+ *  THE ICON IS THE BUTTON. He described the big icon and the pause control in the same place, one
+ *  after the other, and two adjacent controls that both mean "rotation" would be one too many: the
+ *  icon already shows the state, so making it the toggle means the thing you look at to know and the
+ *  thing you press to change it are the same object.
+ *
+ *  THE COUNT IS THE POOL, NOT THE ROSTER. `available` is passed in already netted of manual
+ *  opt-outs — see its use in `AccountsScreen`. A header reading "6 accounts available" over rows
+ *  marked out of rotation is precisely the contradiction this screen was rebuilt to stop. */
+function RotationGlance({
+  available,
+  soleName,
+  paused,
+  frozenName,
+  onToggle,
   onAdd,
+  adding,
+  loading,
+  overrideName,
+  anySignedIn,
+  expiredOut,
+  takenOut,
 }: {
-  readiness: ReturnType<typeof rotationReadiness>;
-  /** The VERIFIED identity for an account — never the nickname, which is user-typed and proves
-   *  nothing about which login a config dir holds. */
-  nameOf: (a: Account) => string;
+  /** How many accounts can receive a spawn right now: signed in, not a duplicate, not taken out. */
+  available: number;
+  /** The one account's verified name when `available === 1` — never the nickname, which is
+   *  user-typed and proves nothing about which login a config dir holds. */
+  soleName: string | null;
+  /** Whether ANY account is signed in, before the pool's exclusions. */
+  anySignedIn: boolean;
+  /** How many signed-in logins are out of the pool because their live session is DEAD, and how many
+   *  for any other reason the user can reverse. The empty-pool copy is built from the mix rather
+   *  than asserting a single cause — see the derivation in `AccountsScreen`. */
+  expiredOut: number;
+  takenOut: number;
+  paused: boolean;
+  /** The account new agents are frozen onto while paused, or null when there was none to freeze. */
+  frozenName: string | null;
+  /** The account a MANUAL OVERRIDE is sending every new agent to, or null when routing is automatic.
+   *
+   *  Distinct from `frozenName` and it has to be: a pause stops re-ranking, an override replaces the
+   *  ranking with one account. The reason it is stated up here at all is that without it the header
+   *  reads "Rotation active: 2 accounts available" while a card down the list is quietly taking every
+   *  spawn — the same count-contradicts-the-rows defect the count itself was fixed for, arriving
+   *  from the other direction. Only ever set when the override names an account that is genuinely in
+   *  the router would actually honour — see `honouredFleetTarget`, which applies exactly the gates
+   *  `usablePreferredAccount` applies, no more and no less. Stricter would be as wrong as looser:
+   *  dropping the line for a target the router IS using says routing is automatic when it is not. */
+  overrideName: string | null;
+  onToggle: () => void;
   onAdd: () => void;
+  adding: boolean;
+  /** The first accounts read has not resolved yet. Every count below is 0 in that state and would
+   *  read as "No account is signed in" — the same false-empty flash the list's own skeleton guards
+   *  against, and worse here because this is the line stating the fleet's health. */
+  loading: boolean;
 }) {
-  const n = readiness.usableLogins;
-  const rotates = n >= 2;
-  const ink = rotates ? C.successInk : C.dangerInk;
-  const Icon = n === 0 ? FiSlash : rotates ? FiRotateCw : FiAlertTriangle;
+  const rotates = !loading && available >= 2;
+  const Icon = loading
+    ? FiRotateCw
+    : paused
+      ? FiPause
+      : available === 0
+        ? FiSlash
+        : rotates
+          ? FiRotateCw
+          : FiAlertTriangle;
+  // GREEN ONLY FOR A POOL THAT ACTUALLY ROTATES. "Do not display status as green when the account has
+  // not yet been signed in" was said about a card, but the same rule has to hold here or the header
+  // becomes the last green thing on a screen full of red ones.
+  const ink = loading || paused ? C.muted : rotates ? C.successInk : C.dangerInk;
+  const stateLabel = loading
+    ? "reading accounts"
+    : paused
+      ? "rotation paused"
+      : rotates
+        ? "rotation active"
+        : "rotation stalled";
 
-  const headline =
-    n === 0
-      ? "No account is signed in."
-      : n === 1
-        ? "Only 1 account is signed in, so Sparkle has nothing to rotate to."
-        : `Rotation active — ${n} accounts available.`;
+  const headline = loading
+    ? "Reading your accounts…"
+    : paused
+    ? `Rotation paused — ${available} ${available === 1 ? "account" : "accounts"} available`
+    : available === 0
+      ? // See `expiredOut` / `takenOut` for why this is a mix rather than a single cause.
+        expiredOut > 0 && takenOut === 0
+        ? expiredOut === 1
+          ? "This account's login has expired"
+          : "Every account's login has expired"
+        : anySignedIn
+          ? "No account is in rotation"
+          : "No account is signed in"
+      : available === 1
+        ? "Only 1 account is in rotation"
+        : `Rotation active: ${available} accounts available`;
 
-  const body =
-    n === 0
-      ? "Agents will run on whatever your terminal is logged into. Sparkle has no account of its own to hand them."
-      : n === 1
-        ? `Every agent will run on ${nameOf(readiness.usable[0]!)} until it hits its limit. Sign in another account to enable rotation.`
-        : `New agents go to whichever of ${readiness.usable.map(nameOf).join(", ")} has the most room left.`;
+  // ORDER IS LOAD-BEARING, and getting it wrong put two contradicting sentences on screen. The
+  // fleet-target lines (`frozenName` / `overrideName`) used to be evaluated FIRST, and once
+  // `honouredFleetTarget` was loosened to match the router it can name an account that is NOT in the
+  // pool — a duplicate, or one whose live session is dead. On a one-account install with a dead
+  // session and that account preferred (which the auto-switch path writes on its own), the header
+  // read "Every account's login has expired" over "Manual override: every new agent runs on Only…",
+  // and the reconnect remedy the copy points at was unreachable.
+  //
+  // AN EMPTY POOL IS THE MORE FUNDAMENTAL FACT and it is the one carrying a remedy, so it wins.
+  // Nothing is hidden by the reorder: the headline still reads "Rotation paused" when it is, and the
+  // card holding the override still reads "Back to automatic".
+  const body = loading
+    ? "Nothing is claimed about the pool until that read comes back."
+    : available === 0
+      ? anySignedIn
+        ? // BUILT FROM THE MIX. Each clause names only what is actually true, and each names the
+          // remedy that applies to IT — a reconnect for a dead session, the ⋮ menu for an opt-out.
+          // Naming the menu for an expired row sends the user to a control that is greyed out for
+          // exactly the reason they are standing there.
+          [
+            expiredOut > 0
+              ? `${expiredOut === 1 ? "One account's session is" : `${expiredOut} accounts' sessions are`} dead — reconnect from the card.`
+              : null,
+            takenOut > 0
+              ? `${takenOut === 1 ? "One account is" : `${takenOut} accounts are`} out of rotation by your own choice — put one back from its ⋮ menu.`
+              : null,
+            // WHERE THE WORK IS ACTUALLY GOING, and it is not always least-bad. Neither
+            // `usablePreferredAccount` nor `usablePausedAccount` gates on duplication or on the auth
+            // probe, so a fleet target routinely SURVIVES an empty pool — an expired account that
+            // also holds the preference (which the auto-switch arm writes without anyone clicking)
+            // takes every spawn while this line, unconditionally, said least-bad. That is the
+            // inverse contradiction the previous commit removed from the non-empty case, walking
+            // back in through the one state the user is most likely to be reading.
+            overrideName
+              ? `Every new agent still runs on ${overrideName} — the manual override outranks all of this.`
+              : frozenName
+                ? `New agents are still held on ${frozenName} by the pause — resume to let rotation pick again.`
+                : "New agents still run on the least-bad account until then.",
+          ]
+            .filter(Boolean)
+            .join(" ")
+        : "Agents will run on whatever your terminal is logged into. Sparkle has no account of its own to hand them."
+      : // THE OVERRIDE OUTRANKS THE PAUSE, matching the router: `chooseAccountForAgent` consults the
+        // preference BEFORE the freeze, so an activation made while paused really does win. Stated
+        // the other way round, the header read "New agents stay on X until you resume" while every
+        // spawn was going to Y — and an accepted `switch_all` from the concierge reaches exactly that
+        // state without anyone touching this screen.
+        overrideName
+        ? `Manual override: every new agent runs on ${overrideName} until you switch that card back to automatic.${paused ? " Rotation is paused, and this override outranks the freeze." : ""}`
+        : paused
+          ? frozenName
+            ? `New agents stay on ${frozenName} until you resume.`
+            : "Nothing was in rotation to hold them, so new agents are picked as usual until you resume."
+          : available === 1
+            ? `Every agent runs on ${soleName ?? "it"} until it hits its limit. Sign in another account to enable rotation.`
+            : "New agents go to whichever account has the most room left.";
 
   return (
-    <div data-testid="rotation-banner" role="status" style={noticeCard(ink)}>
-      <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 13, fontWeight: 600 }}>
-        <Icon size={13} aria-hidden />
-        {headline}
+    <div data-testid="accounts-header" style={stickyHeader}>
+      <button
+        type="button"
+        data-testid="rotation-toggle"
+        aria-pressed={paused}
+        onClick={onToggle}
+        title={
+          paused
+            ? "Resume rotation — go back to sending each new agent to the account with the most room."
+            : "Pause rotation — keep sending new agents to the account rotation is on now. Running agents are not moved."
+        }
+        style={{
+          display: "flex",
+          flexDirection: "column",
+          alignItems: "center",
+          gap: 2,
+          background: "transparent",
+          border: "none",
+          padding: 0,
+          cursor: "pointer",
+          color: ink,
+          fontFamily: fontStack,
+          flexShrink: 0,
+        }}
+      >
+        <Icon size={22} aria-hidden />
+        <span data-testid="rotation-state-label" style={{ fontSize: 10, fontWeight: 600 }}>
+          {stateLabel}
+        </span>
+      </button>
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <div style={{ fontSize: 13, fontWeight: 600 }}>Claude accounts</div>
+        <div data-testid="rotation-headline" style={{ fontSize: 12, color: C.muted, marginTop: 2 }}>
+          {headline}
+        </div>
+        <div style={{ fontSize: 12, color: C.muted }}>{body}</div>
       </div>
-      <div style={{ marginTop: 4 }}>{body}</div>
-      {/* The per-account "counted out" bullets ("Signing in… is registered but never signed in",
-          "Login expired — reconnect … same login", etc.) were REMOVED from the rotation box at the
-          founder's instruction (2026-08-21 live session): the terminology was unclear and the box
-          should be a simple non-scrolling headline + routing line. WHY each account is out of rotation
-          now belongs on that account's own row (the per-account rotation status — a later chunk). */}
-      {!rotates && (
-        <button type="button" style={{ ...primaryBtn, marginTop: 8 }} onClick={onAdd}>
+      {/* The per-account "counted out" bullets were REMOVED from the rotation box at the founder's
+          instruction (2026-08-21 live session): the terminology was unclear and the box should be a
+          simple non-scrolling headline + routing line. WHY each account is out of rotation belongs on
+          that account's own row — main's note here called that "a later chunk", and it is the
+          per-account rotation dot this branch adds. */}
+      {/* The global "Refresh usage" button was replaced by a per-card "Check usage levels" item in
+          each card's ⋮ kebab menu (overhaul item 14).
+
+          ONE LABEL, ALWAYS. The banner this header replaced varied its CTA by state — "Add an
+          account" / "Add another account" — which made sense inside a banner whose whole subject was
+          the missing account. Up here it is the screen's standing action, and a control that renames
+          itself as the fleet changes is harder to find, not easier. The icon carries the urgency
+          instead: it is red with a slash when nothing is signed in. */}
+      {!adding && (
+        <button type="button" style={primaryBtn} onClick={onAdd}>
           <FiUserPlus size={12} aria-hidden style={{ verticalAlign: "-1px", marginRight: 4 }} />
-          {n === 0 ? "Add an account" : "Add another account"}
+          + Add account
         </button>
       )}
     </div>
@@ -684,6 +891,14 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
   // ~/.claude — see the button below.
   const [confirmLogin, setConfirmLogin] = useState<string | null>(null);
   const [adding, setAdding] = useState(false);
+  // THE RENDER'S SUBSCRIPTION TO A STORE WITH NO SUBSCRIBE. The rotation opt-outs and the pause live
+  // in `localStorage` (see `services/rotationState.ts`) because the SPAWN PATH has to read them and
+  // it is not React. Nothing re-renders when they are written, so without this the kebab toggle and
+  // the header's pause button would both appear to do nothing until an unrelated state change
+  // happened to repaint the screen — a control that looks broken while working correctly, which on
+  // this particular surface is the exact complaint being fixed. Bumping a counter is the smallest
+  // honest fix; the values themselves are still read fresh on every render, never cached here.
+  const [, setRotationTick] = useState(0);
   const [newName, setNewName] = useState("");
   const [busy, setBusy] = useState(false);
 
@@ -1027,6 +1242,152 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
     return agents;
   };
   const readiness = rotationReadiness(accounts, identities);
+  // ── THE ROTATION POOL, AS THE HEADER AND EVERY CARD BOTH SEE IT ──────────────────────────────
+  // `rotationReadiness` answers "which accounts COULD rotate" from identity alone. The user's own
+  // opt-outs are the other half, and netting them off HERE — once — is what stops the header
+  // claiming "6 accounts available" over rows that say "out of rotation". That contradiction is the
+  // specific thing the founder screenshotted, so it gets one source of truth rather than two reads.
+  //
+  // `rotationTick` exists because both facts live in `localStorage`, outside React: nothing
+  // re-renders when the kebab writes one, so the toggle would appear to do nothing until an
+  // unrelated state change happened to repaint. Bumping it is the render's subscription to a store
+  // that has no subscribe.
+  const outOfRotation = rotationOutIds();
+  // PROBE-EXPIRED ROWS ARE NOT IN THE POOL EITHER, and this is the one exclusion `rotationReadiness`
+  // structurally cannot make: it decides `usable` from `signedInAccountIds`, i.e. an email being
+  // present, while `authIsDefinitelyExpired` exists precisely to catch a row whose recorded identity
+  // still carries an email over a dead OAuth session. Without this the header reads "Rotation active:
+  // 2 accounts available" directly above a card reading "out of rotation · login expired" — the exact
+  // count-contradicts-the-rows defect this screen was rebuilt to remove.
+  //
+  // Derived from `deriveRowLogin`, the SAME per-row function the card calls, so the two cannot drift.
+  const probeExpired = new Set(
+    accounts
+      .filter((a) => deriveRowLogin(isSignedIn(identityFor(a.id)), authStatus[a.id]) === "expired")
+      .map((a) => a.id),
+  );
+  // THE POOL IS PER LOGIN, AND THE REPRESENTATIVE IS RE-ELECTED WITH THE EXCLUSIONS IN HAND.
+  // Filtering `readiness.usable` after the fact was wrong in a way that depended on registration
+  // order: `rotationReadiness` picks each login's representative by input order, before anything
+  // about the user's choices is known, so taking THAT row out dropped the whole login from the count
+  // while agents could still reach it through its sibling — and taking the sibling out instead
+  // correctly changed nothing. `electRotationPool` redoes the election, so a login leaves the pool
+  // only when every registration of it is excluded. See its docblock.
+  const groupKeyById = new Map<string, string>();
+  for (const g of duplicateAccountGroups(accounts, identities)) {
+    for (const a of g.accounts) groupKeyById.set(a.id, g.key);
+  }
+  const excludedFromPool = new Set([...outOfRotation, ...probeExpired]);
+  const elected = electRotationPool(
+    [...readiness.usable, ...readiness.redundant],
+    groupKeyById,
+    excludedFromPool,
+  );
+  const rotationPool = elected.pool;
+  /** WHY THE POOL IS EMPTY, when it is. Three different situations with three different remedies,
+   *  and every collapse of them has produced a false sentence in the one line that states the fleet's
+   *  health:
+   *
+   *    • nothing signed in at all       → add or sign in an account
+   *    • everything signed in has EXPIRED → reconnect one, from the button its card is already showing
+   *    • everything else                → put one back from its ⋮ menu
+   *
+   *  The middle case is the one a two-way split gets wrong, and it is not exotic: a one-account
+   *  install whose OAuth session died is `usable` by identity (an email is recorded) and out of the
+   *  pool by probe. Told it had "been taken out or is a duplicate", the user is sent to a menu item
+   *  that does not apply, past the Reconnect button that does. */
+  const anySignedIn = readiness.usable.length > 0;
+  /** Of the signed-in logins, how many are out for each reason. An empty pool is almost never
+   *  single-cause once there is more than one account, and asserting one cause is how the copy
+   *  ends up false: with A expired and B taken out, "every signed-in account has been taken out or
+   *  is a duplicate" is wrong about A — and sends the user to A's ⋮ menu, where the toggle it names
+   *  is greyed out precisely BECAUSE A is expired. */
+  const excludedUsable = readiness.usable.filter((a) => excludedFromPool.has(a.id));
+  const expiredOut = excludedUsable.filter((a) => probeExpired.has(a.id)).length;
+  const takenOut = excludedUsable.length - expiredOut;
+  // THE REDUNDANT HALF OF A DUPLICATE PAIR, not both halves. `duplicateAccountIds` names every row
+  // in a shared-login group, which is the right set for "which rows are worth re-logging" (the
+  // kebab tints them) and the WRONG set here: marking both rows "out of rotation · duplicate" would
+  // report a pool of zero for a login that is perfectly usable — the first claim on it still routes.
+  // `rotationReadiness` already draws that line, keeping the first and filing the rest under
+  // `redundant`, and reading it here is what makes the dots add up to the header's count.
+  // FROM THE ELECTION, not from `readiness.redundant` — otherwise a row that was promoted into the
+  // pool because its sibling was taken out would still render "out of rotation · duplicate" while
+  // being counted, which is the count-contradicts-the-rows defect inside one login group.
+  const redundantIds = new Set(elected.redundant.map((a) => a.id));
+  const paused = rotationPause();
+  /** Would the spawn path actually honour this account as a fleet-level target right now?
+   *
+   *  THE HEADER MUST NOT NAME AN ACCOUNT ROUTING HAS ALREADY DISCARDED. `usablePreferredAccount` and
+   *  `usablePausedAccount` both decline for an account that is gone, signed out, taken out of
+   *  rotation, or at an OBSERVED rate limit — and the header used to apply only the first two, so a
+   *  rate-limited preferred account rendered "every new agent runs on X" while every spawn had
+   *  already fallen through to auto-pick somewhere else. That is the loudest line on the screen being
+   *  wrong about the one thing it exists to state.
+   *
+   *  Deliberately the OBSERVED wall (`isAccountExhausted`) and not the wider `eligibleAccounts` test:
+   *  near-cap and near-ceiling are estimates, and the two gates on the spawn path stop at observed
+   *  fact for exactly that reason. Same rule here, or the header disagrees with them again. */
+  const honouredFleetTarget = (id: string | null | undefined): Account | null => {
+    if (!id) return null;
+    // THE ROUTER'S GATES, EXACTLY — present, signed in, not taken out, not at an observed wall. An
+    // earlier cut looked the id up in `rotationPool`, which was STRICTER than the router in two ways
+    // and produced the inverse contradiction: `rotationPool` also drops duplicates and probe-expired
+    // rows, while `usablePreferredAccount` / `usablePausedAccount` know about neither. Activating the
+    // redundant half of a duplicate pair is one click (the Manual Override button gates on
+    // `display.signedIn` alone), and the router really does send every spawn there — so a header that
+    // dropped the override line and printed "New agents go to whichever account has the most room
+    // left" was saying routing was automatic while a fleet target was in force.
+    //
+    // Matching the router in BOTH directions is the point. The header is a report on where agents go,
+    // not a second opinion about where they should.
+    const a = accounts.find((x) => x.id === id);
+    if (!a) return null;
+    // `signedInAccountIds` + `signedInFilterApplies`, NOT the card-level `isSignedIn`. They are two
+    // different predicates and the difference bites in both directions: `isSignedIn` is uuid OR
+    // email, while the router keys on email alone and DEGRADES OPEN when no listed account has one.
+    // So a uuid-only login passed here and was dropped by the router (header announces an override
+    // that is not in force), and on an install where nothing parsed an `oauthAccount` the router
+    // honoured the preference unconditionally while this returned null (header says routing is
+    // automatic when it is not). Sharing the functions is the only way these agree by construction
+    // rather than by inspection.
+    const signedInIds = signedInAccountIds(identities);
+    if (signedInFilterApplies(accounts, signedInIds) && !signedInIds.includes(id)) return null;
+    if (outOfRotation.has(id)) return null;
+    return isAccountExhausted(usage, id, now) ? null : a;
+  };
+  const frozenAccount = honouredFleetTarget(paused?.accountId);
+  /** Pause freezes onto the account rotation is on RIGHT NOW, which is the healthiest one in the
+   *  pool — the same account the next spawn would have gone to anyway. Pausing therefore changes
+   *  nothing about the next agent and everything about the one after it, which is what "pause"
+   *  should mean. With an empty pool there is nothing to freeze onto and the pause records null,
+   *  which `usablePausedAccount` reads as "fall through to auto-pick". */
+  const handleToggleRotation = () => {
+    if (paused) resumeRotation();
+    else {
+      // The SAME "most space first" projection the row order uses, so the account the header freezes
+      // onto is the one sitting at the top of the list the user is looking at. Deriving it a second
+      // way would let the pause land on an account the screen does not present as the leader.
+      const lead =
+        orderBySpace(rotationPool, (a) => {
+          const live = liveUsage[a.id];
+          const hasData = live !== undefined && live !== "error";
+          return {
+            id: a.id,
+            alias: displayFor(a).nickname || displayFor(a).primary || a.id,
+            usable: true, // every member of `rotationPool` is signed in by construction
+            sessionUsedPct: hasData ? live.fiveHourPercent : null,
+            weeklyUsedPct: hasData ? live.sevenDayPercent : null,
+          };
+        })[0] ?? null;
+      pauseRotation(lead?.id ?? null, now);
+    }
+    setRotationTick((t) => t + 1);
+  };
+  const handleToggleAccountRotation = (id: string, inRotation: boolean) => {
+    setAccountInRotation(id, inRotation);
+    setRotationTick((t) => t + 1);
+  };
   // The REAL Anthropic rows we have fetched, in the shape selection uses. Feeding these into the
   // AC8 verdict keeps "all accounts are at their limit" tracking the SAME signal the spawn gate now
   // excludes on (`partitionAccounts` → `isLiveSpent`), rather than only the observed wall — so the
@@ -1143,6 +1504,39 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
           existing
             ? `You're already signed in to this account as “${existing.nickname}”. To add a different account, switch accounts in your browser (or use a private window) and try again.`
             : `You're already signed in to this account. To add a different one, switch accounts in your browser (or use a private window) and try again.`,
+        );
+        return;
+      }
+      // ══ A SIGN-IN THAT NEVER LANDED LEAVES NO ROW ═══════════════════════════════════════════
+      // The founder, looking at two cards reading "Trouble signing in / Not signed in": "if I say
+      // add account and it doesn't add… it just shouldn't create the account in the first place. And
+      // so I could get an error when I try to add it, but then if I'm not signed in, I probably
+      // shouldn't even see it there. Like, it should just silently go away. I shouldn't have to
+      // remove the account."
+      //
+      // He is right that those rows are worse than nothing: a registration with no login looks
+      // exactly like a working account while being unable to receive a single agent, which is the
+      // resemblance that let a never-signed-in dir pass for a second Max account on his machine.
+      //
+      // WHY IT CANNOT LITERALLY BE "don't create it". `addAccount` has to make the config dir BEFORE
+      // `claude auth login` can run in it — the dir is the thing being logged into. So the honest
+      // shape is create, attempt, and UNDO on failure, which is what this does. The undo is the same
+      // `removeAccount` the duplicate branch above already uses.
+      //
+      // SCOPED TO THIS ADD, AND TO THIS ADD ONLY. The rule applies to the slot we just created and
+      // watched fail, never to a row that was signed in before — "if I was signed in and then I
+      // signed out, then it should have the account information still… and I should have a sign in
+      // again". `handleLogin` (the re-login path) deliberately never deletes, for exactly that
+      // reason, and the Rust side RETAINS a dir whose login expired rather than dropping it.
+      const stillNoLogin = !isSignedIn(freshIdentities.find((i) => i.id === created.id));
+      if (stillNoLogin) {
+        await io.removeAccount(created.id);
+        await refresh();
+        // NOT silent, despite his word for it. He also said "I could get an error when I try to add
+        // it", and the two together mean: no orphan ROW, but say what happened — a create that
+        // vanishes with no explanation is indistinguishable from a button that did nothing.
+        setError(
+          `“${nickname}” was not added — the Claude sign-in did not complete, so there was no account to keep. Try adding it again.`,
         );
         return;
       }
@@ -1399,28 +1793,36 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
 
   return (
     <div style={{ fontFamily: fontStack, color: C.cream }}>
-      <div data-testid="accounts-header" style={stickyHeader}>
-        <div style={{ fontSize: 13, fontWeight: 600 }}>Claude accounts</div>
-        {/* The global "Refresh usage" button was replaced by a per-card "Check usage levels" item in
-            each card's ⋮ kebab menu (overhaul item 14). */}
-        {!adding && (
-          <button type="button" style={primaryBtn} onClick={() => setAdding(true)}>
-            + Add account
-          </button>
-        )}
-      </div>
+      {/* THE GLANCE, folded INTO the header rather than sitting under it — the founder asked for the
+          rotation icon to the left of "Claude accounts" with its state in green underneath, and for
+          the whole thing not to scroll. `stickyHeader` is what makes that last part true.
 
-      {/* THE GLANCE. How many accounts can actually receive a spawn, and what that means — stated
-          before anything else on the screen, because the row count is not that number. Gated on
-          `loaded`: before the first read resolves this would read "No account is signed in", the
-          same false-empty flash the CTA below guards against. */}
-      {loaded && (
-        <RotationBanner
-          readiness={readiness}
-          nameOf={(a) => displayFor(a).primary}
-          onAdd={() => setAdding(true)}
-        />
-      )}
+          NOT gated on `loaded`, unlike the banner it replaces: this IS the header now, and hiding it
+          would make the title disappear on first paint. The first-read state is handled INSIDE it
+          instead: `loading` keeps every count and colour neutral, because `rotationPool` is empty
+          until the read resolves and "No account is signed in" is exactly the false-empty flash the
+          list's own skeleton already guards against. */}
+      <RotationGlance
+        loading={!loaded}
+        available={rotationPool.length}
+        anySignedIn={anySignedIn}
+        expiredOut={expiredOut}
+        takenOut={takenOut}
+        soleName={rotationPool.length === 1 ? displayFor(rotationPool[0]!).primary : null}
+        paused={paused != null}
+        frozenName={frozenAccount ? displayFor(frozenAccount).primary : null}
+        // Only when the override names an account genuinely in the pool — the same gate
+        // `usablePreferredAccount` applies on the spawn path. A preference can outlive the login it
+        // pointed at (nothing clears it when an account signs out), and routing silently discards it
+        // there; the header must discard it too rather than announce an override that is not in force.
+        overrideName={(() => {
+          const pref = honouredFleetTarget(routing.preferredId);
+          return pref ? displayFor(pref).primary : null;
+        })()}
+        onToggle={handleToggleRotation}
+        onAdd={() => setAdding(true)}
+        adding={adding}
+      />
 
       {/* AC8 — every usable account is out of room. Deliberately does NOT claim spawns are blocked:
           `pickAccount` still returns an account rather than refusing, so promising a block would be
@@ -1521,27 +1923,19 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
         </div>
       )}
 
-      {/* Two registrations of the SAME Claude login look like two accounts here but share one
-          quota, so failover between them is a no-op that re-hits the same limit immediately. The
-          nickname can't reveal this (it's user-typed), so we surface the identity clash instead.
-          NOTE: a group is a PROVEN clash when it has an accountUuid, and an INFERENCE from a shared
-          verified email when it does not — `duplicateAccountGroups` only infers when that email
-          identifies exactly one uuid group, or none at all. */}
-      {duplicates.map((g) => (
-        <div
-          key={g.key}
-          role="alert"
-          style={{ ...card, borderColor: C.amber, color: C.amber, fontSize: 12, lineHeight: 1.5 }}
-        >
-          <strong>
-            {g.accounts.length} accounts are the same Claude login
-            {g.email ? ` (${g.email})` : ""}.
-          </strong>{" "}
-          {joinList(g.accounts.map((a) => a.nickname))} share one usage quota, so switching
-          between them gains you nothing — they hit the limit together. Log one of them into a
-          different Claude account, or remove it.
-        </div>
-      ))}
+      {/* THE DUPLICATE-LOGIN BANNERS WERE HERE and are deleted. Each read "2 accounts are the same
+          Claude login (name@example.com). X and Y share one usage quota, so switching between them
+          gains you nothing — they hit the limit together. Log one of them into a different Claude
+          account, or remove it." The founder: "there's just too much text here… don't put something
+          at the top that says all this text. I think just put in the second box duplicate."
+
+          The fact is still surfaced, on the card that has it: the duplicate row now reads a red dot,
+          "out of rotation", and the word "duplicate" underneath, and its rotation toggle is greyed
+          out because putting a shared quota back in the pool would buy nothing. That is strictly more
+          actionable than the banner was — the banner had to name its subjects by NICKNAME, which is
+          user-typed and is exactly the thing that cannot tell two registrations of one login apart.
+
+          `duplicateIds` is still derived and still drives the card; only this restatement is gone. */}
 
       {/* THREE EXPLICIT STATES, never collapsed (the intermittent false-empty the founder hit):
           • not yet loaded, no error → a skeleton, NEVER the empty CTA;
@@ -1594,6 +1988,22 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
         // signed-in but its session is actually dead.
         const rowLogin = deriveRowLogin(signedIn, authStatus[a.id]);
         const loginExpired = rowLogin === "expired";
+        // THE DOT'S ANSWER, and the header's, from one function — see `services/rotationState.ts`.
+        // Deriving it here rather than inline is what makes "in rotation" a single claim: the count
+        // in the header nets off the SAME `outOfRotation` set this reads, so a card cannot say it is
+        // out while the header counts it in.
+        const rotation = accountRotationState({
+          signedIn,
+          loginExpired,
+          // `duplicate` is suppressed for a row the user took out THEMSELVES, and that is a deliberate
+          // reading of the precedence rather than a bypass of it. `accountRotationState` puts `duplicate`
+          // ahead of `manual` because a structural block is the more fundamental fact — but it also makes
+          // `duplicate` disable the toggle, and a row that is BOTH would then be permanently marked out
+          // with no control to undo it. Between "the toggle may not visibly change anything" and "the
+          // user cannot reverse their own action", the second is the one that traps someone.
+          duplicate: redundantIds.has(a.id) && !outOfRotation.has(a.id),
+          manuallyOut: outOfRotation.has(a.id),
+        });
         // Can this account be made PRIMARY? Narrower than `signedIn` on purpose — see the Activate
         // button below: `usablePreferredAccount` gates on `signedInAccountIds`, which keys on email.
         const canBePrimary = display.signedIn;
@@ -1635,7 +2045,53 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
                 Rename / Switch login / Remove moved INTO the ⋮ kebab (item 11); the activate toggle
                 and the kebab form the top-right cluster (item 11 layout refinement). */}
             <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              {/* TOP LEFT: the dot and the two words. The founder's ask, verbatim — "let's just have
+                  a green dot and have it say in rotation… if it's not in rotation, for some reason,
+                  give it a red dot and say out of rotation" — and, for the duplicate case, "below
+                  that say duplicate". The reason line generalises that to every out-of-rotation
+                  cause, in the same two-word register: the card already carries a full explanation
+                  for each of them in its own banner below, and repeating it here would rebuild the
+                  wall of text he asked to have taken off the top of this screen. */}
               <div style={{ display: "flex", alignItems: "center", gap: 8, flex: 1, minWidth: 0 }}>
+                <span
+                  data-testid={`account-rotation-${a.id}`}
+                  style={{ display: "flex", alignItems: "baseline", gap: 5, minWidth: 0 }}
+                >
+                  <span
+                    aria-hidden
+                    style={{
+                      width: 8,
+                      height: 8,
+                      borderRadius: "50%",
+                      flexShrink: 0,
+                      alignSelf: "center",
+                      background: rotation.inRotation ? C.successInk : C.dangerInk,
+                    }}
+                  />
+                  <span style={{ minWidth: 0 }}>
+                    <span
+                      style={{
+                        fontSize: 12,
+                        fontWeight: 600,
+                        color: rotation.inRotation ? C.successInk : C.dangerInk,
+                        display: "block",
+                      }}
+                    >
+                      {rotationLabel(rotation)}
+                    </span>
+                    {rotationReasonLabel(rotation) && (
+                      <span
+                        data-testid={`account-rotation-reason-${a.id}`}
+                        // TYPE.micro, not a literal 11: `theme/scale.test.ts` ratchets off-scale
+                        // font sizes to zero, and a one-off between micro and small is exactly the
+                        // sprawl it exists to stop.
+                        style={{ fontSize: TYPE.micro, color: C.muted, display: "block" }}
+                      >
+                        {rotationReasonLabel(rotation)}
+                      </span>
+                    )}
+                  </span>
+                </span>
                 {a.isDefault && <span style={tagStyle}>default</span>}
               </div>
               {/* Manual Override = the activate/deactivate toggle. Hidden while renaming. */}
@@ -1726,6 +2182,37 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
                           Remove
                         </button>
                       )}
+                      {/* IN / OUT OF ROTATION. "In the three dot menu, give me the option to take it
+                          out of rotation if it's in rotation or put it in rotation if it's out of
+                          rotation." Greyed rather than hidden when the state is structural — the
+                          founder asked for that on duplicates ("the ability to put it into rotation
+                          would be grayed out… because it's a duplicate") and the same holds for a
+                          row that is out because it has no login: an enabled control that cannot
+                          change the outcome is a lie about what the user controls, and a HIDDEN one
+                          leaves them wondering where the option went. The title says what would fix
+                          it instead. */}
+                      <button
+                        role="menuitem"
+                        type="button"
+                        data-testid={`account-rotation-toggle-${a.id}`}
+                        disabled={!rotation.canToggle}
+                        style={rotation.canToggle ? menuItem : { ...menuItem, opacity: 0.45, cursor: "default" }}
+                        title={
+                          rotation.canToggle
+                            ? undefined
+                            : rotation.reason === "duplicate"
+                              ? "This is a second registration of a login another account already holds. Both share one quota, so rotating to it gains nothing."
+                              : "Sign this account in first — it cannot receive agents yet."
+                        }
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          if (!rotation.canToggle) return;
+                          setOpenMenuId(null);
+                          handleToggleAccountRotation(a.id, !rotation.inRotation);
+                        }}
+                      >
+                        {rotation.inRotation ? "Take out of rotation" : "Put in rotation"}
+                      </button>
                       {signedIn && (
                         <button
                           role="menuitem"
@@ -1859,7 +2346,20 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
               ) : (
                 <>
                   {/* TITLE = the nickname (bold), on its own — no "alias:" prefix. Falls back to the
-                      identity string when the account has no nickname. */}
+                      identity string when the account has no nickname.
+
+                      ONE TITLE IS NOT A NICKNAME AT ALL. `EXPIRED_LOGIN_NICKNAME` is the placeholder
+                      the Rust side writes when a login is cleared, and it reads "Login expired —
+                      reconnect" — an instruction wearing a name's clothes, rendered in the same white
+                      bold as "DROdio Gmail". The founder: "put login expired in red instead of white,
+                      and make reconnect a clickable link. So I should be able to click that [and it]
+                      would pop up the login."
+
+                      So this one title is rendered as what it is: a red status and a real button. The
+                      button is the SAME `handleLogin` path the card's own "Renew Login" uses, via the
+                      identical default-account confirm — re-logging the default changes the Claude
+                      login the whole machine uses, and that must take a confirm step no matter which
+                      of the two affordances the user reached for. */}
                   <span
                     data-testid={`account-identity-${a.id}`}
                     style={{
@@ -1869,9 +2369,27 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
                       overflow: "hidden",
                       textOverflow: "ellipsis",
                       whiteSpace: "nowrap",
+                      color: titleText === EXPIRED_LOGIN_NICKNAME ? C.dangerInk : undefined,
                     }}
                   >
-                    {titleText}
+                    {titleText === EXPIRED_LOGIN_NICKNAME ? (
+                      <>
+                        Login expired —{" "}
+                        <button
+                          type="button"
+                          data-testid={`account-reconnect-${a.id}`}
+                          style={{ ...linkBtn, color: C.dangerInk, fontWeight: 600 }}
+                          onClick={() => {
+                            if (a.isDefault) setConfirmLogin(a.id);
+                            else void handleLogin(a);
+                          }}
+                        >
+                          reconnect
+                        </button>
+                      </>
+                    ) : (
+                      titleText
+                    )}
                   </span>
                   {/* SECONDARY = the verified email, or the honest sign-in status for a uuid-only /
                       not-signed-in account (amber, so a not-signed-in card still reads as a problem —
@@ -1998,64 +2516,30 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
                 question he asked next. A button that silently re-routes an invisible fleet is the
                 thing that was unclear; the list is most of the feature. */}
             {(() => {
-              const isPrimary = routing.preferredId === a.id;
+              // `isPrimary` was read here to colour the routing line that is now deleted. Whether
+              // this card holds the manual override is still visible — the header's Manual Override
+              // button reads "Back to automatic" when it does — so nothing is lost by not
+              // re-deriving it.
               const here = consumersOn(a.id);
               return (
                 <div data-testid={`account-routing-${a.id}`} style={{ marginTop: 10 }}>
-                  {/* The activate/deactivate TOGGLE moved to the card's top-right header (item 11
-                      layout). This block keeps only the subtle active-state indicator and the list of
-                      what is running here. */}
-                  <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-                    <span
-                      data-testid={`account-active-state-${a.id}`}
-                      style={{
-                        fontSize: 12,
-                        fontWeight: 600,
-                        color: isPrimary ? C.successInk : C.muted,
-                      }}
-                    >
-                      {/* NOT "Inactive". This line states a ROUTING fact — where the NEXT agent
-                          will be started — and says nothing about what is running now. The founder
-                          screenshotted a card reading "Inactive" directly above "Running agents:
-                          Concierge" and reasonably read it as a bug in the state. The state was
-                          right; the word was wrong, and it sits one line above the very list that
-                          contradicts it.
+                  {/* THE ROUTING LINE WAS HERE — "Active — new agents run here" / "Not taking new
+                      agents" / "Automatic — new agents may run here" — and it is deleted. The
+                      founder, reading it: "when it says not taking new agents, I don't think I
+                      [know] what that means. Does it mean that it's not available to take new
+                      agents? Or that it's just, like, it's not currently selected?… Let's just
+                      delete those two lines."
 
-                          THREE states, not two, and the third is the DEFAULT one. With no manual
-                          override anywhere, `preferredId` is unset, so NO card is primary and a
-                          two-way label would tell every card it takes no new agents — while
-                          `chooseAccountForAgent` is in fact auto-picking one of them by lowest
-                          usage. On a single-account fleet that is the card receiving 100% of spawns
-                          declaring it receives none: a definitely false claim, which is worse than
-                          the vague word it replaced (roborev 65216). Only when some OTHER card
-                          holds the override is "not taking new agents" actually true — and even
-                          then a per-agent pin can outrank it, which "may" leaves room for.
-
-                          `!signedIn` comes FIRST because a signed-out card cannot receive agents at
-                          all: `chooseAccountForAgent` filters both `eligibleAccounts` and `autoPick`
-                          on `signedInIds`, and this same card renders "Not signed in — this account
-                          cannot receive agents" a few lines below. Claiming "automatic — may run
-                          here" above that banner would rebuild the founder's original complaint
-                          inside a single card (roborev 65221).
-
-                          The PRIMARY arm needs the same gate, and for the same reason (roborev
-                          65223): nothing clears a stored preference when an account's login later
-                          goes away — `handleActivate` checks `canBePrimary` at CLICK time only —
-                          so a preference can outlive its identity. `usablePreferredAccount` drops a
-                          preference that is not in `signedInIds`, so routing sides with the banner
-                          there too, and an unqualified "Active" is the loudest possible way to be
-                          wrong about it. */}
-                      {isPrimary && signedIn
-                        ? "Active — new agents run here"
-                        : !signedIn || routing.preferredId
-                          ? "Not taking new agents"
-                          : "Automatic — new agents may run here"}
-                    </span>
-                  </div>
+                      The ambiguity he is pointing at was real and structural: the line was trying to
+                      say two different things at once — whether this account CAN receive an agent,
+                      and whether it is the one currently being routed to — in a single three-way
+                      string. Those are now two separate, unambiguous things in two places: the
+                      rotation dot at the top of the card answers the first, and the Manual Override
+                      button beside it answers the second by its own state. The empty-list sentence
+                      ("Nothing is running on this account right now") went with it — an empty list
+                      renders as nothing at all now, which is the same information without a line. */}
                   <div style={{ fontSize: 12, color: C.muted, marginTop: 4 }}>
-                    {here.length === 0 ? (
-                      "Nothing is running on this account right now."
-                    ) : expandedRunning[a.id] ? (
+                    {here.length === 0 ? null : expandedRunning[a.id] ? (
                       // EXPANDED: the full comma list + a Collapse link back to one line.
                       <>
                         Running agents: <span style={{ color: C.cream }}>{here.join(", ")}</span>{" "}

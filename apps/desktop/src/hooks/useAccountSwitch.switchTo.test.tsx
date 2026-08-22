@@ -103,11 +103,19 @@ const IDENTITIES = ACCOUNTS.map((a) => ({
 }));
 
 // Imported AFTER the mocks so the hook and the resolver pick them up.
-const { useAccountSwitch, activateAccount, SWITCH_ADVANCE_MS } = await import("./useAccountSwitch");
+const { useAccountSwitch, activateAccount, recordPreference, SWITCH_ADVANCE_MS } = await import(
+  "./useAccountSwitch"
+);
 const { chooseAccountForAgent, invalidateAccountState, resetStickyAccounts } = await import(
   "../services/accountSelection"
 );
 const { clearAllPins, clearPreferredAccount, getPreferredAccountId } = await import(
+  "../services/accountStore"
+);
+const { setAccountInRotation, rotationOutIds, ROTATION_OUT_STORAGE_KEY } = await import(
+  "../services/rotationState"
+);
+const { setPinFromSwitch, getPin, SWITCH_WRITTEN_PINS_STORAGE_KEY } = await import(
   "../services/accountStore"
 );
 
@@ -158,11 +166,82 @@ beforeEach(() => {
   resetStickyAccounts();
   clearAllPins();
   clearPreferredAccount();
+  localStorage.removeItem(ROTATION_OUT_STORAGE_KEY);
+  localStorage.removeItem(SWITCH_WRITTEN_PINS_STORAGE_KEY);
 });
 
 afterEach(() => {
   vi.useRealTimers();
   vi.unstubAllGlobals();
+});
+
+describe("activation versus the rotation opt-out", () => {
+  // TWO CONTROLS THAT CAN CONTRADICT EACH OTHER, and the resolution has to happen where the
+  // preference is WRITTEN, not only where it is read. `usablePreferredAccount` declines a preference
+  // for an account the user took out of rotation — its card says "out of rotation", and routing
+  // there would put the dot and the router back in disagreement. But the button that writes the
+  // preference gates on a readable email alone, so without this the two deadlock in the worst
+  // available way: the control reports success, flips to "Back to automatic", and the effect is
+  // PARTIALLY applied — `switchTo` pins already-running panes, pins are deliberately exempt from the
+  // opt-out, so existing agents migrate while new spawns do not.
+  //
+  // Activating is the later and more specific instruction, so it revises the earlier one.
+  // ── THE AUTOMATIC ARMS MUST NOT SWEEP PINS ──────────────────────────────────────────────────
+  // Routing them through the full activation helper smuggled in `clearSwitchWrittenPins()`, a global
+  // sweep across every project and window. That is right for the MANUAL lever, whose ask is
+  // fleet-wide by definition — and wrong for an automatic switch, which `planSwitch` scopes to the
+  // agents on the walled account precisely because "a third account's agents are fine where they
+  // are". The dropped pin does not move that agent now; it moves it at its NEXT spawn, which falls
+  // through to the new preference — the relocation the plan declined to make, with no gesture behind
+  // it.
+  it("recordPreference writes the preference and the rotation membership, and nothing else", () => {
+    setPinFromSwitch("agent-elsewhere", "acct-a");
+    expect(getPin("agent-elsewhere")).toBe("acct-a");
+    setAccountInRotation("acct-b", false);
+
+    recordPreference("acct-b");
+
+    expect(getPreferredAccountId()).toBe("acct-b");
+    expect(rotationOutIds().has("acct-b")).toBe(false);
+    // The pin of an agent on a THIRD account survives — the automatic arms' whole scope claim.
+    expect(getPin("agent-elsewhere")).toBe("acct-a");
+  });
+
+  it("the MANUAL lever still sweeps them, because its ask really is fleet-wide", async () => {
+    // The paired positive. Without it, "recordPreference leaves pins alone" would pass against a
+    // build that had lost the sweep everywhere — and a stale switch-written pin outranks the fleet
+    // preference forever, which is the defect `clearSwitchWrittenPins` exists to prevent.
+    const view = await mounted();
+    setPinFromSwitch("agent-elsewhere", "acct-a");
+    act(() => view.result.current.switchTo("acct-b"));
+    tick();
+    expect(getPin("agent-elsewhere")).toBeUndefined();
+  });
+
+  it("puts a taken-out account back IN rotation, so the activation is not silently inert", async () => {
+    const view = await mounted();
+    setAccountInRotation("acct-b", false);
+    // The control: while it is out, a new agent does not land there (and `acct-a` is the auto-pick).
+    expect(await accountFor("agent-before")).toBe("acct-a");
+
+    act(() => view.result.current.switchTo("acct-b"));
+    tick();
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    // The end of the chain, not the start: a BRAND-NEW agent actually resolves to the activated
+    // account. Asserting only that the opt-out set was cleared would pass with the preference gate
+    // never consulted at all.
+    expect(await accountFor("agent-after")).toBe("acct-b");
+    expect(rotationOutIds().has("acct-b")).toBe(false);
+    // …and it revised only THAT account's state. A sweep of the whole set would silently undo every
+    // other opt-out the user had made.
+    setAccountInRotation("acct-a", false);
+    act(() => view.result.current.switchTo("acct-b"));
+    tick();
+    expect(rotationOutIds().has("acct-a")).toBe(true);
+  });
 });
 
 describe("switchTo — the manual activation", () => {

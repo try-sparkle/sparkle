@@ -38,6 +38,9 @@ import {
   type SwitchPlan,
 } from "../services/accountSwitch";
 import { busiestPaneAccount, paneAccountMap, restartPane } from "../services/paneControl";
+// Activation revises an earlier "take this out of rotation" rather than being defeated by it — see
+// `recordActivation`.
+import { setAccountInRotation } from "../services/rotationState";
 import { useAccountLimitStore } from "../stores/accountLimitStore";
 
 /** How often to re-evaluate headroom. Slower than the limit poll: the ceiling is cached in Rust for
@@ -191,7 +194,10 @@ export function useAccountSwitch(pollMs: number = HEADROOM_POLL_MS): AccountSwit
             // the RUNNING agents; without this the target never becomes preferred, so the next spawn
             // and the UI's "active account" would not follow. `setPreferredAccountId` is the same
             // durable write `switchTo`/"Activate this account" makes — see `recordActivation`.
-            setPreferredAccountId(rec.to.id);
+            // Through `recordActivation`, not `setPreferredAccountId` — writing the preference and
+            // putting the target back in rotation are one operation, or an opted-out target becomes
+            // an inert preference while `planSwitch` re-pins the running agents onto it anyway.
+            recordPreference(rec.to.id);
             // Auto-switch is now rescuing this account's fleet, so a manual limit modal for it is
             // moot. This closes the loop for the case the modal is DESIGNED for — raised earlier when
             // there was nowhere to go — and a target has since freed up (an account's window reset,
@@ -319,7 +325,8 @@ export function useAccountSwitch(pollMs: number = HEADROOM_POLL_MS): AccountSwit
           // preference ONLY when this plan owns it — the auto/accept path does; a helper rescue must not
           // (it only relocates the sticky pair). The banner names `plan.toAccountId`, so the retargeted
           // plan we advance and set below re-renders pointing at the new account for free.
-          if (cur.ownsPreference) setPreferredAccountId(verdict.plan.toAccountId);
+          // Same rule as the initial write above — see `recordActivation`.
+          if (cur.ownsPreference) recordPreference(verdict.plan.toAccountId);
           work = verdict.plan;
         }
       }
@@ -560,8 +567,48 @@ let liveSwitchTo: ((accountId: string) => number) | null = null;
  *  is mounted, so nothing arrives later to correct it — which is the same "an activation silently
  *  defeats the next one" defect the sweep exists to close. Idempotent, so the double call when a
  *  hook IS mounted costs nothing. */
-function recordActivation(accountId: string): void {
+export function recordPreference(accountId: string): void {
   setPreferredAccountId(accountId);
+  // WRITING THE PREFERENCE PUTS THE ACCOUNT BACK IN ROTATION — every caller, human or automatic.
+  // `setPinFromSwitch` carries the same rule for the paths that MOVE agents without writing a
+  // preference (the accepted banner, the stranded-helper rescue), so the invariant does not depend
+  // on enumerating callers here.
+  //
+  // The alternative was tried and is worse. Leaving the opt-out standing creates an INERT preference:
+  // `usablePreferredAccount` refuses it for every new spawn while `advanceSwitch` still re-pins the
+  // already-running panes, so existing agents migrate there and new ones do not — a split with
+  // nothing on screen explaining it. Blocking automation from naming an opted-out account instead
+  // strands the fleet whenever that account is the only escape from a wall.
+  //
+  // So: one rule, and no inert preferences can exist. An AUTOMATIC switch does revise a human's
+  // opt-out, which is the honest reading of what it is doing — it is moving the fleet there — and it
+  // is VISIBLE: the card flips to "in rotation" the moment it happens, and the user can take it out
+  // again. A silent split and a silently stranded fleet are neither honest nor visible.
+  //
+  // WHY IT IS NOT A REFUSAL INSTEAD. `usablePreferredAccount` declines a preference for an account
+  // the user took out of rotation (its card says "out of rotation", and routing there would put the
+  // dot and the router back in contradiction). Without this line the two controls deadlock in the
+  // worst possible way: the button stays enabled, flips to "Back to automatic" as if it took, and
+  // the effect is PARTIALLY applied — `switchTo` writes per-agent pins for running panes, pins are
+  // deliberately exempt from the opt-out, so existing agents migrate while new spawns do not. A
+  // split nothing on screen explains.
+  //
+  // Activating is the later and more specific instruction — "run my agents HERE" — so it wins by
+  // revising the earlier one rather than by being silently ignored.
+  setAccountInRotation(accountId, true);
+}
+
+/** The MANUAL lever's version: the preference, plus the sweep of pins a PREVIOUS activation wrote.
+ *
+ *  THE SWEEP IS NOT PART OF "record a preference", and folding it in was a real defect for a while.
+ *  "Activate this account" asks to move EVERYTHING, so clearing stale switch-written pins is exactly
+ *  right for it. An automatic switch asks for much less: `planSwitch` moves only the agents on the
+ *  walled account, because "a third account's agents are fine where they are, and re-spawning them
+ *  would be work destroyed for nothing". Sweeping there dropped the pin of an agent that was not in
+ *  the plan, on a third account, so its next spawn fell through to the new preference — the
+ *  fleet-wide relocation the plan had deliberately declined to make, with no user gesture behind it. */
+function recordActivation(accountId: string): void {
+  recordPreference(accountId);
   clearSwitchWrittenPins();
 }
 
@@ -578,7 +625,12 @@ function recordActivation(accountId: string): void {
  *
  *  Everything durable happens either way (see `recordActivation`) — it must not depend on whether a
  *  particular component is in the tree. An agent that is not moved now still lands on the activated
- *  account at its next spawn, so a `false` is a slower path to the same place, never a failure. */
+ *  account at its next spawn, so a `false` is a slower path to the same place, never a failure.
+ *
+ *  THAT PROMISE HOLDS BECAUSE ACTIVATION ALSO PUTS THE ACCOUNT BACK IN ROTATION. It would otherwise
+ *  be false for an account the user had taken out from its kebab: `usablePreferredAccount` declines
+ *  such a preference, so the next spawn would land somewhere else while this function reported
+ *  success. See `recordActivation`. */
 export function activateAccount(accountId: string): boolean {
   recordActivation(accountId);
   if (!liveSwitchTo) return false;

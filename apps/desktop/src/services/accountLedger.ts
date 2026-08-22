@@ -85,6 +85,12 @@ export type SelectionReason =
   // the real one sits intact one directory over, which is invisible from the UI (the row, the
   // header and the brief all still render) and reads as "the agent was spawned with no task".
   | "transcript"
+  // ROTATION IS PAUSED and this is the account it was frozen onto. Distinct from "preferred", which
+  // is a standing choice about ONE account, and from "auto", which is the headroom ranking this
+  // replaces: pausing does not choose an account, it stops re-choosing. Recording them apart is what
+  // lets a reader of the log tell "the founder paused the fleet on Tuesday" from "this account
+  // happened to keep winning" — two very different explanations for an identical run of rows.
+  | "paused"
   | "auto" // ordinary auto-pick: lowest usage among healthy, signed-in accounts
   | "sticky" // a sticky key (concierge / Improve Sparkle) reusing its still-healthy account
   | "fallback" // every account was exhausted or near its ceiling; this was the least-bad one

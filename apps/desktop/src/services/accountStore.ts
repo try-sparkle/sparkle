@@ -11,6 +11,9 @@
 import { invoke } from "@tauri-apps/api/core";
 import type { LimitEvent } from "./rateLimitWatch";
 import type { Ceiling } from "./headroom";
+// Moving agents onto an account puts it back in rotation — see `setPinFromSwitch`. `rotationState`
+// imports nothing, so this cannot close a cycle.
+import { setAccountInRotation } from "./rotationState";
 
 /** Sparkle metadata for one registered Claude config dir. `configDir` is the absolute path we set
  *  as CLAUDE_CONFIG_DIR when spawning under this account. `isDefault` marks the imported `~/.claude`
@@ -859,6 +862,25 @@ export interface PickOptions {
    *  still returns one and no spawn is blocked. When the signed-in filter DOES apply this set has no
    *  effect: those accounts are already absent from `eligible`. Absent the option nothing changes. */
   unauthedIds?: ReadonlySet<string>;
+  /** Ids the user has explicitly taken OUT of rotation from the accounts screen's kebab (see
+   *  `services/rotationState.rotationOutIds`).
+   *
+   *  This is the only exclusion on this interface that is a HUMAN CHOICE rather than a reading of the
+   *  world, and it is wired here rather than left in the UI on purpose: a dot that says "out of
+   *  rotation" over an account that keeps receiving agents would be a worse lie than the green dot it
+   *  replaced. The founder asked for the toggle precisely so he could steer the fleet.
+   *
+   *  Demotes exactly like {@link PickOptions.clobberedIds} — dropped from `candidates`, NEVER from
+   *  `eligible` — so a user who takes every account out of rotation gets `leastBad` rather than a
+   *  fleet that silently stops spawning. Taking accounts out is a preference; turning the machine off
+   *  is not what the control says it does. Absent the option nothing changes.
+   *
+   *  NOT PASSED FOR A STICKY KEY. `accountSelection.chooseAccountForAgent` omits it when the caller is
+   *  the concierge or Improve Sparkle, because this set also reaches the branch that decides whether a
+   *  sticky key KEEPS its account — and relocating one mid-conversation nulls both session pointers
+   *  and re-probes, with no stale-resume retry. A kebab click must not be able to do that; only
+   *  observed facts (a rate limit, real utilization) relocate a sticky consumer. */
+  outOfRotationIds?: ReadonlySet<string>;
   /** Current time (epoch ms), injectable for tests. Defaults to `Date.now()`. */
   now?: number;
 }
@@ -1057,11 +1079,21 @@ function partitionAccounts(
   // otherwise make it the TOP pick for every agent. Like `isClobbered`, it demotes rather than
   // blocks: `eligible` keeps it, so `leastBad` still has something to return.
   const isUnauthed = (a: Account) => opts.unauthedIds?.has(a.id) ?? false;
+  // Taken out of rotation BY THE USER (see PickOptions.outOfRotationIds). Demotes rather than
+  // blocks, for the same reason as the two above: `eligible` keeps it, so taking every account out
+  // still leaves `leastBad` something to return. The screen's dot reads off the same set, so a row
+  // saying "out of rotation" and a spawn landing on it cannot both happen.
+  const isOutOfRotation = (a: Account) => opts.outOfRotationIds?.has(a.id) ?? false;
 
   const candidates = eligible.filter((a) => {
     const u = usageFor(a);
     return (
-      !isExhausted(u) && !isNearStaticCap(u) && !isLiveSpent(a) && !isClobbered(a) && !isUnauthed(a)
+      !isExhausted(u) &&
+      !isNearStaticCap(u) &&
+      !isLiveSpent(a) &&
+      !isClobbered(a) &&
+      !isUnauthed(a) &&
+      !isOutOfRotation(a)
     );
   });
   return { eligible, candidates };
@@ -1260,11 +1292,39 @@ export function setPin(agentId: string, accountId: string): void {
  *  account picker whose comment calls it a "manual override", and `chooseAccountForAgent` honours a
  *  pin over every judgement it makes precisely because a human chose it on purpose. One click on
  *  Activate must not delete that, in every project and every window. */
-export function setPinFromSwitch(agentId: string, accountId: string): void {
+export function setPinFromSwitch(
+  agentId: string,
+  accountId: string,
+  /** Is this pin part of a RELOCATION — is the agent arriving from somewhere else?
+   *
+   *  Only a relocation revises the rotation pool (see below). The other caller is
+   *  `authRecovery.resumeAll`, which re-pins a stuck agent to the account it is ALREADY on so the
+   *  re-spawn cannot auto-pick a different, still-walled one. Nothing moves there, and nothing is
+   *  said about the fleet — so revising the user's statement about the pool off that gesture is the
+   *  same overreach the `setPin` exemption below exists to avoid. Defaults to false, so a new caller
+   *  has to opt IN to changing the pool rather than doing it by accident. */
+  relocating = false,
+): void {
   setPin(agentId, accountId); // clears the mark…
   const marked = readSwitchWritten();
   marked.add(agentId); // …and this puts it back, so the two calls cannot drift
   writeSwitchWritten(marked);
+  // RELOCATING AGENTS ONTO AN ACCOUNT PUTS IT BACK IN ROTATION, and this is the right place for that
+  // rule rather than any of the four callers.
+  //
+  // Pins are deliberately EXEMPT from `outOfRotationIds` — a human naming one agent and one account
+  // outranks a statement about the rotation pool. That exemption is what makes a migration onto an
+  // opted-out account possible, and the resulting state is the dot-contradicts-the-router failure
+  // this whole surface was rebuilt to remove: the card reads "out of rotation · you took it out"
+  // while the machinery re-pins running agents there. Enumerating the callers was tried and is
+  // fragile — the accept path and the stranded-helper rescue deliberately write no preference, so a
+  // fix hung off `recordActivation` skips exactly them, and whether the card ever flipped depended
+  // on whether a retarget happened to occur later.
+  //
+  // Here it is true by construction: if agents are being MOVED onto it, the pool statement about it
+  // is stale, and the card says so immediately. `relocating` is what keeps that premise honest — a
+  // re-pin in place moves nothing, so it revises nothing.
+  if (relocating) setAccountInRotation(accountId, true);
 }
 
 /** Clear an agent's pin (revert it to auto-pick). Called when an agent is closed, so persisted

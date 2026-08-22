@@ -31,6 +31,10 @@ import {
   type LiveUsage,
 } from "./accountStore";
 import { getAccountUsageLive } from "./accountUsage";
+// The user's own steering of the pool: the accounts taken out of rotation from the accounts screen,
+// and the fleet-wide pause. Both read through localStorage on every call — see `rotationState.ts` for
+// why that discipline, and why neither is allowed to block a spawn.
+import { rotationOutIds, rotationPause } from "./rotationState";
 import { claudeSessionAccounts } from "../preflight";
 import type { Ceiling } from "./headroom";
 import type { ConciergeFailureKind } from "../engine/conciergeFailureNotice";
@@ -341,6 +345,16 @@ export async function chooseAccountForAgent(
     // no login still wins auto-pick on its zero tally, which is sparkle-gms0 arriving by the
     // back door. It demotes, never blocks — see PickOptions.unauthedIds.
     unauthedIds: new Set(notSignedInAccountIds(state.identities)),
+    // The accounts the USER took out of rotation from the accounts screen. Rides the shared base
+    // like everything else here, so the pinned branch honours it too — except that a pin is an
+    // explicit per-agent override and `pickAccount` lets it win, which is correct: taking an account
+    // out of the ROTATION pool is not the same as forbidding a human to send one agent there.
+    //
+    // A sticky key is exempt from this in ONE place only — see `autoPick`'s `stillHealthy` lookup.
+    // Exempting the whole `base` was too wide: `stickySelections` is process-lifetime memory, so the
+    // concierge's FIRST turn after every launch runs the fall-through pick, where there is no
+    // conversation to strand and no reason to ignore the user's opt-out.
+    outOfRotationIds: rotationOutIds(),
     now: opts.now,
     ceilings: state.ceilings,
     // REAL Anthropic utilization, and it rides the shared base for exactly the reason the two above
@@ -408,6 +422,29 @@ export async function chooseAccountForAgent(
     pinnedAccountId || preferredAccountId
       ? undefined
       : firstUsableHolder(holders, state, base, opts.now)?.id;
+  // ROTATION IS PAUSED — the fleet-wide control the founder asked for ("I could pause the fleet
+  // rotation… it pauses the rotation across all of them").
+  //
+  // WHAT PAUSING MEANS, precisely, because the word admits a much worse reading. It does NOT stop
+  // spawns: a glance-level toggle that silently takes the fleet down is the one outcome nobody would
+  // forgive, and "pause" is not what anyone would call it. It stops the thing rotation actually DOES
+  // — re-ranking accounts by headroom on every spawn — and keeps sending new agents to the account
+  // rotation was on when it was paused.
+  //
+  // FOURTH IN PRECEDENCE, below transcript affinity, and that placement is the load-bearing part. A
+  // freeze is a statement about WHICH ACCOUNT ROTATION PICKS, and transcript affinity is not a
+  // rotation decision at all — it is the only account that can resume an agent's existing
+  // conversation. Ranking the freeze above it would answer "don't re-rank the pool" by silently
+  // starting agents blank, which is the failure `transcript` exists to prevent and the one no UI
+  // surface can show.
+  //
+  // Degrades exactly like the preference above it: `usablePausedAccount` drops a frozen id that no
+  // longer names a real, signed-in, unexhausted account, and the spawn falls through to ordinary
+  // auto-pick. A pause whose target went away must not strand the fleet.
+  const pausedAccountId =
+    pinnedAccountId || preferredAccountId || transcriptAccountId
+      ? undefined
+      : usablePausedAccount(agentId, state, base.signedInIds, opts.now);
   const chosen = pinnedAccountId
     ? pickAccount(state.accounts, state.usage, { ...base, pinnedAccountId })
     : preferredAccountId
@@ -420,20 +457,24 @@ export async function chooseAccountForAgent(
             ...base,
             pinnedAccountId: transcriptAccountId,
           })
-        : autoPick(agentId, state, base);
+        : pausedAccountId
+          ? pickAccount(state.accounts, state.usage, { ...base, pinnedAccountId: pausedAccountId })
+          : autoPick(agentId, state, base);
   const reason: SelectionReason = pinnedAccountId
     ? "pinned"
     : preferredAccountId
       ? "preferred"
       : transcriptAccountId
         ? "transcript"
-        : !chosen
-          ? "none"
-          : isStickyAccountKey(agentId) && previousSticky === chosen.id
-            ? "sticky"
-            : candidates != null && candidates.length === 0
-              ? "fallback"
-              : "auto";
+        : pausedAccountId
+          ? "paused"
+          : !chosen
+            ? "none"
+            : isStickyAccountKey(agentId) && previousSticky === chosen.id
+              ? "sticky"
+              : candidates != null && candidates.length === 0
+                ? "fallback"
+                : "auto";
   // NEVER SILENT. We are about to launch under an account that does NOT hold this agent's
   // conversation, so it will come up FRESH — the exact state that read as "spawned with no task",
   // and the one thing no UI surface can show (the row, the header and the brief all keep rendering).
@@ -668,9 +709,20 @@ function autoPick(agentId: string, state: AccountState, base: PickOptions): Acco
     // (`ceilings: undefined`) so it could not evict a live conversation. That is now redundant — the
     // estimate was retired as a selection driver and gates NEITHER keep nor first-pick — so keep and
     // first-pick share one eligibility rule and no `ceilings` override is needed.
-    const stillHealthy = eligibleAccounts(state.accounts, state.usage, base).find(
-      (a) => a.id === previousId,
-    );
+    // …AND A KEBAB CLICK IS NOT ONE OF THOSE FACTS. `outOfRotationIds` is withheld HERE and only
+    // here, which is the whole of the sticky exemption. Without it, taking the concierge's current
+    // account out of rotation makes it ineligible on the next turn and relocates a LIVE session —
+    // a proactive move triggered by a menu item, which is exactly what the paragraph above says must
+    // not happen. Withholding it on the FIRST pick instead would be a different and worse bug: that
+    // branch runs on every launch (`stickySelections` is process-lifetime), strands nothing, and
+    // would put the concierge on an account whose own card reads "out of rotation".
+    //
+    // This is the same shape the retired `ceilings: undefined` override had, for the same reason —
+    // keep is judged on observed fact, first-pick on the full rule.
+    const stillHealthy = eligibleAccounts(state.accounts, state.usage, {
+      ...base,
+      outOfRotationIds: undefined,
+    }).find((a) => a.id === previousId);
     if (stillHealthy) return stillHealthy;
   }
   // FIRST pick for this key (or its previous account just became ineligible): ordinary auto-pick —
@@ -742,7 +794,61 @@ function usablePreferredAccount(
   if (signedInFilterApplies(state.accounts, signedInIds) && !signedInIds.includes(preferred))
     return undefined;
   if (isAccountExhausted(state.usage, preferred, now ?? Date.now())) return undefined; // (4)
+  // 5. NOT TAKEN OUT OF ROTATION. One rule for both FLEET-LEVEL mechanisms — this and the pause —
+  //    and never for a per-agent pin. Both of these are the user's own choice, so the tie is broken
+  //    by which one the SCREEN is showing: the card renders "out of rotation · you took it out", and
+  //    honouring a fleet preference onto it would put the dot and the router back in contradiction,
+  //    which is the whole defect this surface was rebuilt to remove. A pin stays exempt because it
+  //    names one agent and one account deliberately — "out of the rotation pool" was never "nobody
+  //    may send anything here".
+  if (rotationOutIds().has(preferred)) return undefined;
   return preferred;
+}
+
+/** The account rotation was FROZEN onto when it was paused, if it is still safe to honour — else
+ *  undefined, and the caller falls through to auto-pick.
+ *
+ *  THE SAME GATE, FOR A WEAKER CLAIM. `usablePreferredAccount` above guards a human saying "run my
+ *  agents HERE"; this guards a human saying "stop moving them", which names an account only as a side
+ *  effect. So every way that gate can fail safely, this one must too — an unreadable backend, an
+ *  account that was removed, a login that went away, an observed rate limit — and each falls through
+ *  to ordinary auto-pick rather than stranding the spawn. A pause is a convenience; it is never worth
+ *  a dead agent.
+ *
+ *  STICKY KEYS ARE EXEMPT, exactly as they are from the preference (condition 1 there). The concierge
+ *  and Improve Sparkle are sticky by design and moving the concierge mid-conversation re-probes both
+ *  session pointers. Pausing rotation is a statement about the AGENT FLEET; those two have their own
+ *  explicit control in the accounts modal.
+ *
+ *  NOT PRUNED HERE when the frozen account is gone, for the reason spelled out at (3) above: `state`
+ *  is served from a cache that another window may not have invalidated, so a silent, irreversible
+ *  write to shared `localStorage` derived from a stale read is exactly the wrong move. Declining to
+ *  act is enough — the pause simply stops biting, and the header still says rotation is paused, which
+ *  is true. */
+function usablePausedAccount(
+  agentId: string,
+  state: AccountState,
+  signedInIds: readonly string[],
+  now: number | undefined,
+): string | undefined {
+  if (isStickyAccountKey(agentId)) return undefined;
+  const pause = rotationPause();
+  if (!pause?.accountId) return undefined; // not paused, or paused with nothing frozen
+  const frozen = pause.accountId;
+  if (state.failed) return undefined;
+  if (!state.accounts.some((a) => a.id === frozen)) return undefined;
+  // TAKEN OUT OF ROTATION BEATS THE FREEZE, and this gate cannot be left to `partitionAccounts`:
+  // the frozen id is routed through `pickAccount`'s pin slot, which returns a pinned account
+  // OUTRIGHT, before the partition runs. Without this, one gesture produces the exact contradiction
+  // this whole screen was rebuilt to remove — pause the fleet while it is on X, then take X out from
+  // its kebab, and every spawn keeps landing on X under a card reading "out of rotation — you took
+  // it out". A pause names an account only as a SIDE EFFECT of declining to re-rank, so it has no
+  // standing to override a choice the user made about that account directly.
+  if (rotationOutIds().has(frozen)) return undefined;
+  if (signedInFilterApplies(state.accounts, signedInIds) && !signedInIds.includes(frozen))
+    return undefined;
+  if (isAccountExhausted(state.usage, frozen, now ?? Date.now())) return undefined;
+  return frozen;
 }
 
 // ── Consumers that have no agent pane ────────────────────────────────────────────────────────

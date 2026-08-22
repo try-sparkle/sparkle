@@ -70,6 +70,8 @@ import {
   accountDisplay,
   accountSentenceName,
   signedInAccountIds,
+  getPreferredAccountId,
+  isAccountExhausted,
   listAccounts,
   getIdentities,
   getUsage,
@@ -79,6 +81,15 @@ import {
   type Usage,
 } from "../accountStore";
 import { assessHeadroom, rotationReadiness, type Ceiling, type Headroom } from "../headroom";
+// The user's own steering of the pool. `read_usage` reports a count the concierge says out loud, so
+// it has to net off the same exclusions the spawn path honours — see `UsageReport.usableLogins`.
+import {
+  accountRotationState,
+  electRotationPool,
+  rotationOutIds,
+  rotationPause,
+  type OutOfRotationReason,
+} from "../rotationState";
 import { getAccountUsageLive, type AccountUsageLive } from "../accountUsage";
 import { activateAccount } from "../../hooks/useAccountSwitch";
 import { busiestPaneAccount } from "../paneControl";
@@ -182,14 +193,53 @@ export interface AccountUsageRow {
   /** Other registered accounts that resolve to the SAME Anthropic login, and therefore share this
    *  one's quota. Non-empty means switching between them buys nothing. */
   sameQuotaAs: string[];
+  /** Why this row cannot receive a spawn from rotation, or null when it can.
+   *
+   *  THE ROW AND THE COUNT COME FROM ONE PARTITION. Reporting a netted `usableLogins` beside rows the
+   *  caller cannot tell apart puts the count-contradicts-the-rows shape inside a single JSON object —
+   *  and the caller here is a model choosing a switch target from exactly these rows.
+   *
+   *  `login-expired` is NOT reachable through this field, and the omission is deliberate: this report
+   *  has no `claude auth status` probe, so it cannot see a dead session (the gap documented on
+   *  {@link UsageReport.usableLogins}). Inventing a second definition of expiry here would drift from
+   *  the accounts screen's, which is the failure this whole partition exists to prevent. */
+  outOfRotationReason: OutOfRotationReason | null;
 }
 
 export interface UsageReport {
   /** The account every new agent is running on, or null when nothing is running. */
   currentAccountId: string | null;
   rows: AccountUsageRow[];
-  /** How many DISTINCT logins can actually receive a spawn — below 2 there is nowhere to switch. */
+  /** How many DISTINCT logins can actually receive a spawn — below 2 there is nowhere to switch.
+   *
+   *  NETTED OF MANUAL OPT-OUTS, because that sentence is a promise. `rotationReadiness` answers
+   *  "which logins COULD rotate" from identity alone, and the accounts screen lets a human take one
+   *  out of the pool from its ⋮ menu (`services/rotationState`) — an exclusion the spawn path honours
+   *  and this count did not. The concierge reads this number and says it out loud, so an unnetted
+   *  figure is not a stale statistic, it is the concierge telling someone there are three accounts to
+   *  rotate between while agents can only reach two. Exactly the count-contradicts-the-rows defect
+   *  the accounts header was rebuilt to remove, in the surface that states it in prose.
+   *
+   *  Does NOT net off a probe-expired login: this report has no `claude auth status` probe to read,
+   *  and inventing one here would be a second definition of expiry drifting from the screen's. That
+   *  gap is a known overstatement rather than an unknown one. */
   usableLogins: number;
+  /** True when the user has PAUSED rotation — Sparkle is not re-ranking accounts, it is holding new
+   *  agents on the one rotation was on. Reported because `usableLogins >= 2` otherwise reads as "you
+   *  can switch", and recommending a switch while rotation is deliberately frozen is advice that
+   *  contradicts the user's own most recent instruction. */
+  rotationPaused: boolean;
+  /** The account new agents are HELD ON while paused, or null when there was none to freeze onto.
+   *  `rotationPaused` alone is fleet-level and does not say where the work is going, which is the
+   *  question a caller asks next. */
+  pausedOnAccountId: string | null;
+  /** The account a MANUAL OVERRIDE is sending every new agent to, or null when routing is automatic.
+   *
+   *  Reported because the router consults the preference BEFORE the freeze, so a caller handed only
+   *  `pausedOnAccountId` can be told about the weaker of the two. Both fields name only a target the
+   *  router would actually honour; `pausedOnAccountId` is null whenever an override is in force,
+   *  because the freeze is not what is deciding. */
+  overrideAccountId: string | null;
   /**
    * True when live numbers could not be fetched for ANY account, so the whole report is estimate-
    * only. Stated once here as well as per-row so a caller cannot miss it: this is the difference
@@ -284,6 +334,62 @@ export async function readUsage(
   );
   const liveById = new Map(live.map((l) => [l.id, l.value]));
 
+  // THE POOL, ELECTED PER LOGIN with the opt-outs in hand — not `readiness.usable` filtered after
+  // the fact. That filter was order-dependent: `rotationReadiness` picks each login's representative
+  // by input order, so taking THAT row out dropped a login agents could still reach through its
+  // sibling, while taking the sibling out changed nothing. Same fleet, two answers.
+  const readiness = rotationReadiness(accounts, identities);
+  const groupKeyById = new Map<string, string>();
+  for (const g of duplicateAccountGroups(accounts, identities)) {
+    for (const a of g.accounts) groupKeyById.set(a.id, g.key);
+  }
+  const takenOut = rotationOutIds();
+  const { pool: reachableLogins, redundant: electedRedundant } = electRotationPool(
+    [...readiness.usable, ...readiness.redundant],
+    groupKeyById,
+    takenOut,
+  );
+  const redundantIds = new Set(electedRedundant.map((a) => a.id));
+  const pause = rotationPause();
+  const preferredId = getPreferredAccountId() ?? null;
+  /** Would the router honour this id as a fleet-level target right now?
+   *
+   *  The raw stored id is not the answer, and reporting it as one contradicts the rest of this
+   *  payload: `usablePausedAccount` declines for an id that is gone, signed out, taken out of
+   *  rotation or at an observed wall, so "pause onto A, then take A out" would report
+   *  `pausedOnAccountId: "a"` beside `rows[a].outOfRotationReason: "manual"` while every spawn had
+   *  fallen through to auto-pick somewhere else. Same gates the accounts screen applies for the same
+   *  reason — see `honouredFleetTarget` there.
+   *
+   *  The PROBE is absent here as everywhere in this report (see `usableLogins`), and the preference
+   *  is checked ahead of the pause because `chooseAccountForAgent` consults it first: an override
+   *  outranks a freeze, so naming the freeze while an override is in force would state the wrong one. */
+  function honouredTarget(id: string | null): string | null {
+    if (!id) return null;
+    if (!accounts.some((a) => a.id === id)) return null;
+    // STRICT MEMBERSHIP, AND THE DIVERGENCE FROM THE ROUTER IS NAMED RATHER THAN CLOSED.
+    //
+    // `usablePreferredAccount` / `usablePausedAccount` DEGRADE OPEN here — they skip the sign-in test
+    // entirely when no listed account carries an email, which `accounts.rs` produces for any config
+    // dir with no parseable `oauthAccount`. Mirroring that was tried, and it made ONE PAYLOAD SAY TWO
+    // THINGS: on that install this field named `a` while every row reported `signedIn: false` and
+    // `outOfRotationReason: "not-signed-in"`, `usableLogins` was 0 (`rotationReadiness` keys on the
+    // same strict membership), and `switch_all` refused every account with "has no Claude login
+    // behind it". A model reading that is told the fleet is routed to `a` and that it cannot move the
+    // fleet anywhere.
+    //
+    // Internal consistency wins, because this payload's whole job is to be reasoned over as a unit.
+    // On an install where nothing reads as signed in, the coherent report is "your logins are
+    // unreadable" — and naming an override the caller is then refused permission to change adds
+    // nothing it can act on. The residual overstatement is stated, like the probe gap above: a spawn
+    // on that install WILL follow the preference, and this field will not say so.
+    if (!signedIn.has(id)) return null;
+    if (takenOut.has(id)) return null;
+    return isAccountExhausted(usage, id, now) ? null : id;
+  }
+
+  const overrideId = honouredTarget(preferredId);
+
   const rows: AccountUsageRow[] = accounts.map((a) => {
     const identity = identityById.get(a.id);
     const h = headroomById.get(a.id);
@@ -313,13 +419,42 @@ export async function readUsage(
         exhaustedUntilRaw != null && exhaustedUntilRaw > now ? exhaustedUntilRaw : null,
       state: h?.state ?? "unknown",
       sameQuotaAs: sameQuota.get(a.id) ?? [],
+      // THE ROW AND THE COUNT FROM ONE PARTITION. Reporting a netted `usableLogins` beside rows the
+      // model cannot tell apart puts the count-contradicts-the-rows shape inside a single JSON
+      // object — and the concierge is then asked to pick a target from rows that all look equally
+      // valid. `outOfRotationReason` is null exactly when the row can receive a spawn.
+      //
+      // The probe input is deliberately absent, matching the expiry gap documented on
+      // `usableLogins`: this report has no `claude auth status` read, and inventing one here would be
+      // a second definition of expiry drifting from the screen's.
+      outOfRotationReason: accountRotationState({
+        signedIn: signedIn.has(a.id),
+        loginExpired: false,
+      // `duplicate` is suppressed for a row the user took out THEMSELVES, and that is a deliberate
+      // reading of the precedence rather than a bypass of it. `accountRotationState` puts `duplicate`
+      // ahead of `manual` because a structural block is the more fundamental fact — but it also makes
+      // `duplicate` disable the toggle, and a row that is BOTH would then be permanently marked out
+      // with no control to undo it. Between "the toggle may not visibly change anything" and "the
+      // user cannot reverse their own action", the second is the one that traps someone.
+        duplicate: redundantIds.has(a.id) && !takenOut.has(a.id),
+        manuallyOut: takenOut.has(a.id),
+      }).reason,
     };
   });
 
   return ok("read_usage", {
     currentAccountId,
     rows,
-    usableLogins: rotationReadiness(accounts, identities).usableLogins,
+    usableLogins: reachableLogins.length,
+    rotationPaused: pause != null,
+    // THE TARGET THE ROUTER WOULD ACTUALLY HONOUR, not the raw stored ids. See `honouredTarget`.
+    overrideAccountId: overrideId,
+    // GATED ON THE HONOURED OVERRIDE, NOT THE STORED ONE. `chooseAccountForAgent` skips the pause
+    // only when `usablePreferredAccount` RETURNS something — a preference whose account is gone,
+    // signed out, taken out or walled is declined, and the freeze is then what decides. Suppressing
+    // on the raw id therefore blanked the one field naming where the fleet was going in exactly the
+    // case the freeze was in force, and told the caller routing was automatic.
+    pausedOnAccountId: overrideId != null ? null : honouredTarget(pause?.accountId ?? null),
     // "No account returned a live number." Vacuously false with no accounts at all, which is the
     // honest reading: there is nothing we failed to fetch.
     liveUnavailable: rows.length > 0 && rows.every((r) => r.usageSource !== "live"),

@@ -49,9 +49,20 @@ vi.mock("./ClaudeSignIn", () => ({
   ),
 }));
 
-import { ReadinessGate, READINESS_AUTH_BANNER_TESTID } from "./ReadinessGate";
+import { ReadinessGate, READINESS_AUTH_BANNER_TESTID, ensureUsablePreferred } from "./ReadinessGate";
+import {
+  rotationOutIds,
+  setAccountInRotation,
+  ROTATION_OUT_STORAGE_KEY,
+  RESCUED_ONTO_STORAGE_KEY,
+} from "../services/rotationState";
 import { reportClaudeAuthFailed, resetClaudeAuthSignalForTests } from "../services/claudeAuthSignal";
-import { getPreferredAccountId, setPreferredAccountId } from "../services/accountStore";
+import {
+  getPreferredAccountId,
+  setPreferredAccountId,
+  clearPreferredAccount,
+  pickAccount,
+} from "../services/accountStore";
 import { getCredentialHealth, resetCredentialHealthForTests } from "../services/credentialHealth";
 
 const report = (over: Partial<Record<"git" | "node" | "claude", boolean>> = {}) => {
@@ -384,6 +395,7 @@ describe("ReadinessGate", () => {
     expect(screen.queryByTestId(READINESS_AUTH_BANNER_TESTID)).toBeNull();
     // The preference is NOT steered when there is nothing usable to steer to.
     expect(getPreferredAccountId()).toBeUndefined();
+
   });
 
   // The re-login UI must let the user tell WHICH account to fix. In the BLOCK screen, render the
@@ -490,5 +502,188 @@ describe("ReadinessGate", () => {
       signIn.click();
     });
     expect(await screen.findByText("CLAUDE SIGN IN")).toBeTruthy();
+  });
+});
+
+
+// ── THE FIFTH PREFERENCE WRITER ────────────────────────────────────────────────────────────────
+// `ensureUsablePreferred` is the auth-lapse rescue: it moves the fleet preference onto a healthy
+// account so future spawns stop landing on an expired default. It is silent and automatic, which is
+// how it came to be the one writer that knew nothing about the rotation opt-out — in BOTH directions.
+describe("ensureUsablePreferred and the rotation opt-out", () => {
+  const acc = (id: string): Account => ({
+    id,
+    nickname: id,
+    configDir: `/cfg/${id}`,
+    isDefault: false,
+    createdAt: 0,
+  });
+  const use = (id: string, tokens: number): Usage => ({
+    id,
+    tokens5h: tokens,
+    tokens7d: tokens,
+    exhaustedUntil: null,
+  });
+
+  afterEach(() => {
+    localStorage.removeItem(ROTATION_OUT_STORAGE_KEY);
+    localStorage.removeItem(RESCUED_ONTO_STORAGE_KEY);
+    clearPreferredAccount();
+  });
+
+  it("re-points away from a preference the user took OUT of rotation", () => {
+    // It used to read an opted-out `current` as "already usable → leave it" and not even try, so the
+    // rescue did nothing while the fleet sat on the account it was rescuing them from.
+    setPreferredAccountId("a");
+    setAccountInRotation("a", false);
+
+    ensureUsablePreferred([acc("a"), acc("b")], [use("a", 10), use("b", 20)], {});
+
+    expect(getPreferredAccountId()).toBe("b");
+  });
+
+  it("leaves an in-rotation preference alone", () => {
+    // The paired negative: a choice the user made on purpose is never overwritten, which is the
+    // whole reason this function checks `current` first.
+    setPreferredAccountId("a");
+    ensureUsablePreferred([acc("a"), acc("b")], [use("a", 10), use("b", 20)], {});
+    expect(getPreferredAccountId()).toBe("a");
+  });
+
+  it("prefers an in-rotation account when it picks a new one", () => {
+    // `b` is the LOWER tally, so plain auto-pick takes it; the opt-out is what has to move the pick
+    // to `c`. Asserting `c` is therefore evidence the exclusion reached `pickAccount`.
+    setAccountInRotation("b", false);
+
+    ensureUsablePreferred(
+      [acc("b"), acc("c")],
+      [use("b", 10), use("c", 20)],
+      {},
+    );
+
+    expect(getPreferredAccountId()).toBe("c");
+  });
+
+  // THE "REPEATED PROBE" TEST LIVED HERE and its subject moved rather than vanished. It asserted
+  // that an opt-out survives repeated focus events, which is still required — but it drove an
+  // ORDINARY rescue first and then a single opt-out, and under the corrected rule that first click
+  // legitimately gets one rescue. The property it existed for is now split across the two cases
+  // above, each driving the branch it actually names: "does not fight the user when they take it out
+  // AGAIN" holds the opt-out across four focus events after a genuine second answer, and "an ORDINARY
+  // rescue does not spend the one-shot" pins the half that made the old version pass for the wrong
+  // reason.
+
+  it("rescues ONCE onto an opted-out account, because declining strands the fleet", () => {
+    // THIS TEST HAS BEEN INVERTED TWICE and the history is the point, because both earlier
+    // expectations were written on premises that turned out to be false.
+    //
+    // v1 asserted the rescue always writes and clears the opt-out — true to "keep the app working",
+    // but `probe()` runs on every window focus, so it re-cleared the user's kebab click forever.
+    // v2 asserted it always declines, on the reasoning that "`partitionAccounts` keeps a demoted
+    // account in `eligible`, so `leastBad` still returns it and the spawn still happens". That is
+    // false where it matters: `leastBad` runs only when `candidates` is EMPTY, and at
+    // `chooseAccountForAgent` the lapsed default is STILL a candidate — its recorded email keeps it
+    // in `signedInIds`, and it carries no wall and no live-spent row. So declining does not fall back
+    // to the opted-out account; it falls onto the EXPIRED one, and every agent opens on a login
+    // prompt. Steering off that account is the whole reason this rescue exists.
+    setPreferredAccountId("gone");
+    setAccountInRotation("b", false);
+
+    ensureUsablePreferred([acc("b")], [use("b", 10)], {});
+
+    // FIRST TIME: the app keeps working. The opt-out is revised, visibly — the card flips.
+    expect(getPreferredAccountId()).toBe("b");
+    expect(rotationOutIds().has("b")).toBe(false);
+  });
+
+  it("does not fight the user when they take it out AGAIN", () => {
+    // THE SEQUENCE THE MODULE DOC DESCRIBES, driven end to end. An earlier version of this test began
+    // with `b` IN rotation, so its first call went through the ORDINARY branch — it asserted the
+    // one-shot being spent by a rescue that had contradicted nobody, and its
+    // `rotationOutIds().has("b") === false` was vacuous because nothing had ever opted `b` out.
+    setAccountInRotation("b", false);
+
+    // FIRST answer: the rescue overrides it, because the alternative is stranding the fleet.
+    ensureUsablePreferred([acc("b")], [use("b", 10)], {});
+    expect(rotationOutIds().has("b")).toBe(false);
+    expect(getPreferredAccountId()).toBe("b");
+
+    setAccountInRotation("b", false); // SECOND answer — the deliberate one
+
+    // Four more focus events. None of them may revert it.
+    for (let i = 0; i < 4; i++) ensureUsablePreferred([acc("b")], [use("b", 10)], {});
+
+    expect(rotationOutIds().has("b")).toBe(true);
+    // …and no inert preference is left behind pointing at it.
+    expect(getPreferredAccountId()).toBeUndefined();
+
+    // AND WHERE A SPAWN ACTUALLY GOES, which neither storage assertion above can see. This came from
+    // the retired "repeated probe" test and is re-homed rather than dropped: it ends in the same
+    // state, and it is the only assertion here about the outcome the user cares about. With no
+    // preference, selection auto-picks — `b` is DEMOTED by the opt-out, so a healthy sibling wins,
+    // and `b` is still returned when it is all there is, because the opt-out never blocks.
+    expect(
+      pickAccount([acc("b"), acc("c")], [use("b", 10), use("c", 20)], {
+        signedInIds: ["b", "c"],
+        outOfRotationIds: rotationOutIds(),
+      })?.id,
+    ).toBe("c"); // `b` is CHEAPER — only the opt-out moves the pick
+    expect(
+      pickAccount([acc("b")], [use("b", 10)], {
+        signedInIds: ["b"],
+        outOfRotationIds: rotationOutIds(),
+      })?.id,
+    ).toBe("b");
+  });
+
+  it("an ORDINARY rescue does not spend the one-shot", () => {
+    // The first finding this rule shipped with: marking on the path that steers onto an account the
+    // user has said nothing about made their FIRST kebab click read as their second. The next focus
+    // declined, and the fleet stranded on the expired default — permanently.
+    ensureUsablePreferred([acc("b")], [use("b", 10)], {}); // ordinary: `b` was never opted out
+    expect(getPreferredAccountId()).toBe("b");
+
+    setAccountInRotation("b", false); // the user's FIRST answer
+
+    ensureUsablePreferred([acc("b")], [use("b", 10)], {});
+
+    // It must still be willing to rescue once, or the click above was read as an answer to a
+    // question nobody asked.
+    expect(rotationOutIds().has("b")).toBe(false);
+  });
+
+  it("an answered account stays answered when the pick alternates", () => {
+    // A single last-wins string was reassigned out from under an answer already given: rescue onto
+    // `b`, user takes `b` out, the pick returns `c` (lowest-usage-first, and usage moves as agents
+    // run) so the memory became `c`, user takes `c` out, the pick returns `b` — and the guard missed.
+    // Unbounded, just on a longer cycle. The memory is a set.
+    setAccountInRotation("b", false);
+    ensureUsablePreferred([acc("b")], [use("b", 10)], {}); // rescues over b's opt-out
+    setAccountInRotation("b", false); // b: answered twice
+
+    setAccountInRotation("c", false);
+    ensureUsablePreferred([acc("c")], [use("c", 10)], {}); // rescues over c's opt-out
+    setAccountInRotation("c", false); // c: answered twice
+
+    // Back to `b`. Its answer must still stand.
+    ensureUsablePreferred([acc("b")], [use("b", 10)], {});
+    expect(rotationOutIds().has("b")).toBe(true);
+    expect(rotationOutIds().has("c")).toBe(true);
+  });
+
+  it("a deliberate put-back starts a fresh episode", () => {
+    // Otherwise the memory is once-ever: an account rescued over in March could never be rescued
+    // onto again in June, however the fleet had changed since.
+    setAccountInRotation("b", false);
+    ensureUsablePreferred([acc("b")], [use("b", 10)], {});
+    setAccountInRotation("b", false);
+    ensureUsablePreferred([acc("b")], [use("b", 10)], {});
+    expect(rotationOutIds().has("b")).toBe(true); // answered; the rescue stands off
+
+    setAccountInRotation("b", true); // the user puts it back ON PURPOSE
+    setAccountInRotation("b", false); // …and later takes it out again
+
+    ensureUsablePreferred([acc("b")], [use("b", 10)], {});
+    expect(rotationOutIds().has("b")).toBe(false); // a new episode, so it rescues once more
   });
 });

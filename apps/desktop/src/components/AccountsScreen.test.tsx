@@ -5,7 +5,8 @@
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AccountsScreen, SIGNED_IN_NO_EMAIL, type AccountsDeps } from "./AccountsScreen";
-import { EXPIRED_LOGIN_NICKNAME, PENDING_NICKNAME } from "./accountsView";
+import { PENDING_NICKNAME, EXPIRED_LOGIN_NICKNAME } from "./accountsView";
+import { ROTATION_OUT_STORAGE_KEY, ROTATION_PAUSED_STORAGE_KEY } from "../services/rotationState";
 import {
   NOT_SIGNED_IN,
   type Account,
@@ -27,7 +28,14 @@ function liveUsage(fiveHourPercent: number, sevenDayPercent: number): AccountUsa
   };
 }
 
-afterEach(() => cleanup());
+afterEach(() => {
+  cleanup();
+  // The rotation opt-outs and the pause persist in `localStorage` by design (the spawn path reads
+  // them and is not React), so a test that toggles one would otherwise leak into the next file-order
+  // neighbour and fail it for a reason that has nothing to do with what it is testing.
+  localStorage.removeItem(ROTATION_OUT_STORAGE_KEY);
+  localStorage.removeItem(ROTATION_PAUSED_STORAGE_KEY);
+});
 
 function acct(id: string, over: Partial<Account> = {}): Account {
   return { id, nickname: id, configDir: `/cfg/${id}`, isDefault: false, createdAt: 0, ...over };
@@ -193,6 +201,96 @@ describe("AccountsScreen", () => {
     expect(screen.getAllByRole("progressbar")).toHaveLength(2);
   });
 
+  // ── THE BILLING LINES ARE GONE, AND THE WARNING IS NOT ───────────────────────────────────────
+  // Ten tests used to live here. They pinned a three-line billing block on every card — "Billing:
+  // subscription", "This account: usage credits disarmed", and a fleet-level "Advisor passes are
+  // SKIPPING — …" banner above the list — and they were right about the DISTINCTIONS they drew:
+  // absent / null / false are opposite verdicts to the spend gate, and folding them would put a
+  // reassuring sentence on a card whose advisor is silently refusing.
+  //
+  // The founder read the result on screen and asked for the two per-card lines gone ("get rid of
+  // those two lines") and the fleet banner gone with them ("I've got no idea what any of that says…
+  // I'm inclined to just get rid of that error"). His objection to the banner is the sharper one and
+  // it is not about wording: it stated a per-account cause about ONE unnamed account, fleet-wide,
+  // above a list of named cards, so the only way to act on it was to guess which row it meant.
+  //
+  // NONE OF THE GATE LOGIC MOVED. `spendGate.ts` still folds every account and still refuses, and it
+  // has its own tests. What these now assert is the two things a UI test can: the card says nothing
+  // about billing when there is nothing to act on, and it still says the ONE thing there is.
+
+  it("says nothing about billing on an account there is nothing to act on", async () => {
+    // All three meter shapes, in one test, because the claim is the same for each and the OLD suite's
+    // whole difficulty was that they had to read differently. `queryByText` after an awaited render:
+    // the bars are the proof the card actually rendered, so these absences are not vacuous.
+    for (const extraUsage of [
+      null,
+      { isEnabled: false, monthlyLimit: null, usedCredits: null, utilization: null, spendLimitReached: false },
+      { isEnabled: true, monthlyLimit: 200, usedCredits: 199.5, utilization: 99.75, spendLimitReached: false },
+    ]) {
+      const deps = makeDeps([acct("a", { nickname: "Personal", isDefault: true })]);
+      deps.getUsageLive = vi.fn(async () => ({
+        fiveHourPercent: 42,
+        fiveHourResetsAt: null,
+        sevenDayPercent: 15,
+        sevenDayResetsAt: null,
+        limits: [],
+        extraUsage,
+      }));
+      const { unmount } = render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
+
+      // The card is up and its live figures landed — without this the queries below pass against an
+      // empty document.
+      await waitFor(() => expect(screen.getAllByRole("progressbar").length).toBe(2));
+      expect(screen.queryByText(/Billing:/)).toBeNull();
+      expect(screen.queryByText(/This account:/)).toBeNull();
+      expect(screen.queryByText(/Advisor passes/)).toBeNull();
+      expect(screen.queryByTestId("advisor-gate-line")).toBeNull();
+      expect(screen.queryByTestId("account-spend-limit")).toBeNull();
+      unmount();
+    }
+  });
+
+  // THE SPEND-LIMIT TEST WAS DELETED WITH ITS SUBJECT, and the deletion is deferred to rather than
+  // argued with. This branch kept "Credit spend limit reached" on the grounds that the founder named
+  // the two lines ABOVE it, not that one, and that it was the only place a spend limit was visible
+  // anywhere in the app. Another agent read the same instruction as covering the whole block and
+  // landed that on main first. Re-introducing it here would be overriding a landed decision inside a
+  // merge, which is not what a merge is for — it is flagged in the branch's report instead, where a
+  // human can restore it deliberately if the loss matters.
+
+  it("no longer renders a FLEET-wide advisor verdict, however the siblings read", async () => {
+    // The deleted banner's own trigger: one account disarmed, a sibling whose usage read FAILED.
+    // That combination is what used to print "Advisor passes are SKIPPING — an account's usage could
+    // not be read" above the cards, unable to say which account it meant. Driving exactly that state
+    // is what makes this an assertion about the removal rather than about an easy case.
+    const deps = makeDeps([
+      acct("a", { nickname: "Personal", isDefault: true }),
+      acct("b", { nickname: "Second" }),
+    ]);
+    deps.getUsageLive = vi.fn(async (configDir: string) => {
+      if (configDir.includes("b")) throw new Error("usage read failed");
+      return {
+        fiveHourPercent: 10,
+        fiveHourResetsAt: null,
+        sevenDayPercent: 10,
+        sevenDayResetsAt: null,
+        limits: [],
+        extraUsage: {
+          isEnabled: false,
+          monthlyLimit: null,
+          usedCredits: null,
+          utilization: null,
+          spendLimitReached: false,
+        },
+      };
+    });
+    render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
+
+    await screen.findByTestId("account-identity-a");
+    await waitFor(() => expect(deps.getUsageLive).toHaveBeenCalledTimes(2));
+    expect(screen.queryByTestId("advisor-gate-line")).toBeNull();
+    expect(screen.queryByText(/Advisor passes/)).toBeNull();
+  });
 
   it("shows a window's reset caption even when that window's PERCENT is null (the two are independent)", async () => {
     // The wire nullable percent and reset instant separately, so a window can report "resets at T"
@@ -263,6 +361,12 @@ describe("AccountsScreen", () => {
       return a;
     });
     deps.getUsageLive = vi.fn(async () => liveUsage(42, 15));
+    // The login SUCCEEDS here — `handleAdd` now undoes a create whose sign-in never landed, and an
+    // undone account is not re-fetched at all, so without an identity this would be measuring the
+    // removal path rather than the nonce.
+    deps.getIdentities = vi.fn(async () =>
+      accounts.map((a) => ({ id: a.id, email: "new@example.invalid", organization: null, accountUuid: "u-new" })),
+    );
     const onLogin = vi.fn(() => new Promise<void>((res) => (resolveLogin = res)));
     render(<AccountsScreen onLogin={onLogin} deps={deps} />);
     fireEvent.click(await screen.findByText("+ Add account"));
@@ -511,6 +615,14 @@ describe("AccountsScreen", () => {
     // a `Partial<…>` would be `possibly undefined`, and a `!` there would be a type assertion
     // standing exactly where the test's evidence comes from.
     const getIdentities = vi.fn(async () => [...identities]);
+    // ACTUALLY REMOVES. It used to be a no-op spy, which was harmless while nothing in the add flow
+    // called it — and became a silent lie the moment `handleAdd` started undoing a failed create:
+    // the row would stay on screen in the test while disappearing in production, so the test would
+    // have described the OPPOSITE of the shipped behaviour.
+    const removeAccount = vi.fn(async (id: string) => {
+      const i = accounts.findIndex((a) => a.id === id);
+      if (i >= 0) accounts.splice(i, 1);
+    });
     // PARTIAL: this helper models the add→login→re-read loop, so it overrides only the IO that loop
     // touches. The routing readers fall through to the real ones, which read empty registries here.
     const deps: Partial<AccountsDeps> = {
@@ -528,7 +640,7 @@ describe("AccountsScreen", () => {
         return a;
       }),
       setNickname: vi.fn(async () => {}),
-      removeAccount: vi.fn(async () => {}),
+      removeAccount,
       readSpawnLog: vi.fn(async () => []),
     };
     let readsAtLoginStart = -1;
@@ -536,7 +648,7 @@ describe("AccountsScreen", () => {
       readsAtLoginStart = getIdentities.mock.calls.length;
       onLoginEffect(identities);
     });
-    return { deps, onLogin, getIdentities, readsAtLoginStart: () => readsAtLoginStart };
+    return { deps, onLogin, getIdentities, removeAccount, readsAtLoginStart: () => readsAtLoginStart };
   }
 
   async function addAccountNamed(name: string) {
@@ -562,27 +674,73 @@ describe("AccountsScreen", () => {
     expect(getIdentities.mock.calls.length).toBeGreaterThan(readsAtLoginStart());
   });
 
-  it("leaves the account visibly NOT signed in when the login resolves no identity", async () => {
-    // The failure state has to look like failure. This is exactly the founder's `602064ad` account:
-    // a config dir that exists with no `oauthAccount` in it. A closed window is not a sign-in.
-    const { deps, onLogin } = store(() => {
+  it("leaves NO row behind when the login resolves no identity", async () => {
+    // THIS TEST WAS INVERTED, and the old expectation is worth stating because it was not wrong at
+    // the time: it asserted the failed slot stayed on screen looking like failure — nickname title,
+    // "Not signed in" sub-line, loud blocked banner — on the principle that a failure state has to
+    // LOOK like failure.
+    //
+    // The founder looked at two such rows and drew the other conclusion: "if I say add account and
+    // it doesn't add… it just shouldn't create the account in the first place… I shouldn't have to
+    // remove the account." The blocked banner was honest about the row; the row itself was the
+    // problem. So the create is UNDONE, and the failure is reported as an error on the add instead.
+    const { deps, onLogin, removeAccount } = store(() => {
       /* login window closed, nothing was written — the OAuth never completed */
     });
     render(<AccountsScreen onLogin={onLogin} deps={deps} />);
     await addAccountNamed("Cloud Max");
 
-    // The title is the nickname, but the failure still LOOKS like failure: the secondary line reads
-    // "Not signed in" and the loud blocked banner renders. A closed window is not a sign-in.
-    expect((await screen.findByTestId("account-identity-acct-0")).textContent).toBe("Cloud Max");
-    expect(screen.getByTestId("account-identity-sub-acct-0").textContent).toBe("Not signed in");
-    expect(screen.getByTestId("account-blocked-acct-0")).toBeTruthy();
+    // The slot is gone from the backend, not merely hidden — the same `removeAccount` the duplicate
+    // branch uses, so a half-created dir cannot linger and be re-adopted later.
+    await waitFor(() => expect(removeAccount).toHaveBeenCalledTimes(1));
+    expect(screen.queryByTestId("account-identity-acct-0")).toBeNull();
+    expect(screen.queryByTestId("account-blocked-acct-0")).toBeNull();
+
+    // …and the user is told why, rather than watching a button do nothing. "I could get an error
+    // when I try to add it" — his words, in the same breath as "it should just silently go away".
+    expect(screen.getByRole("alert").textContent).toMatch(
+      /“Cloud Max” was not added — the Claude sign-in did not complete/,
+    );
+  });
+
+  it("KEEPS a row whose login existed and later went away", async () => {
+    // The paired positive, and the boundary the founder drew himself: "now if I was signed in and
+    // then I signed out, then it should have the account information still. Right? It should have
+    // the account name, the account email address, and I should have a sign in again."
+    //
+    // The undo above is scoped to a slot THIS add just created and watched fail. An account that is
+    // merely signed out now — however it got that way — is never touched by it. Without this test,
+    // widening the undo into a general "delete rows with no identity" sweep would stay green.
+    const deps = makeDeps(
+      [acct("a", { nickname: "Was Signed In", isDefault: true })],
+      [],
+      [neverLoggedIn("a")],
+    );
+    render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
+
+    expect((await screen.findByTestId("account-identity-a")).textContent).toBe("Was Signed In");
+    expect(screen.getByTestId("account-blocked-a")).toBeTruthy();
+    expect(screen.getAllByRole("button", { name: /Finish sign-in/ }).length).toBeGreaterThan(0);
+    expect(deps.removeAccount).not.toHaveBeenCalled();
   });
 
   it("does not cap how many accounts can be added", async () => {
     // The founder has four or five. Nothing in the add path is allowed to bound the list.
-    const { deps, onLogin } = store(() => {});
+    // Each add must SIGN IN now: `handleAdd` undoes a create whose login never landed, so a
+    // no-op `onLogin` would leave zero accounts and this would be testing the undo instead.
+    // Distinct identities per slot, or the duplicate-reconciliation branch discards them as one.
+    let n = 0;
+    const { deps, onLogin } = store((ids) => {
+      ids.push({
+        id: `acct-${n}`,
+        email: `add-${n}@example.invalid`,
+        organization: null,
+        accountUuid: `u-add-${n}`,
+      });
+      n += 1;
+    });
     render(<AccountsScreen onLogin={onLogin} deps={deps} />);
-    for (const n of ["One", "Two", "Three", "Four", "Five"]) await addAccountNamed(n);
+    for (const name of ["One", "Two", "Three", "Four", "Five"]) await addAccountNamed(name);
     await waitFor(() => expect(deps.addAccount).toHaveBeenCalledTimes(5));
     // The 5th account's nickname is its card title (overhaul item 3). Assert via its row's identity
     // slot rather than a bare text match (the name can appear in more than one node).
@@ -896,6 +1054,50 @@ describe("AccountsScreen", () => {
   // records per config dir (`identity_log::takeover_at`), and a terminal `claude` login into another
   // account is exactly that: one file, one identity at a time, a CHANGE rather than a divergence.
 
+  it("no longer warns that the folder hosted a DIFFERENT login recently — the notice was removed", async () => {
+    // THIS TEST INVERTS A REAL FEATURE, deliberately, and the loss is worth naming rather than
+    // glossing. `identityChanged` is the temporal signal from `identity_log::takeover_at`, and it
+    // covered a symptom the founder himself hit: running `claude` in a terminal and logging into
+    // another account silently turns the DEFAULT card into that account, with both cards then
+    // showing identical usage because they had genuinely become one login. Nothing else reports it.
+    //
+    // He read the notice in situ and asked for it gone anyway — "let's just get rid of that message
+    // completely" — which is his call. The Rust signal and `identityChanged` are untouched, so
+    // restoring a surface costs only markup; this asserts the current, intended state so a later
+    // reader knows the absence is a decision rather than a regression.
+    const deps = makeDeps(
+      [acct("def", { nickname: "FC Superadmin", isDefault: true })],
+      [],
+      [
+        {
+          id: "def",
+          email: "now@example.com",
+          organization: null,
+          accountUuid: "uuid-now",
+          identityChanged: true,
+        },
+      ],
+    );
+    render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
+
+    // Wait for the card, or the absence below is an assertion about an empty document.
+    expect((await screen.findByTestId("account-identity-def")).textContent).toBe("FC Superadmin");
+    expect(screen.queryByTestId("account-identity-changed-def")).toBeNull();
+    expect(screen.queryByText(/signed into a different Claude account/i)).toBeNull();
+  });
+
+  it("stays quiet when the folder has not changed hands", async () => {
+    // Paired direction: without it, rendering the notice unconditionally would pass the test above
+    // and put a takeover warning on every card.
+    const deps = makeDeps(
+      [acct("def", { nickname: "FC Superadmin", isDefault: true })],
+      [],
+      [{ id: "def", email: "now@example.com", organization: null, accountUuid: "uuid-now" }],
+    );
+    render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
+    await screen.findByTestId("account-identity-def");
+    expect(screen.queryByTestId("account-identity-changed-def")).toBeNull();
+  });
 
   // ── A SIGN-IN THAT NEVER FINISHED SAYS SO ───────────────────────────────────────────────────
   //
@@ -1179,7 +1381,18 @@ describe("duplicate-login warning", () => {
   // with independent headroom bars.
   const UUID = "5fb3d67c-f4ed-417b-9bf2-f9156450eb73";
 
-  it("warns when two registered accounts are the same Claude login", async () => {
+  // THE TOP-OF-SCREEN BANNERS ARE GONE. They read "2 accounts are the same Claude login
+  // (x@y.com). A and B share one usage quota, so switching between them gains you nothing — they
+  // hit the limit together. Log one of them into a different Claude account, or remove it." The
+  // founder: "there's just too much text here… don't put something at the top that says all this
+  // text. I think just put in the second box duplicate."
+  //
+  // The banner also had a defect the founder did not name and the new treatment fixes: it had to
+  // identify its subjects by NICKNAME, which is user-typed, and telling two registrations of one
+  // login apart is the exact thing a nickname cannot do. The label now sits ON the duplicate row,
+  // where it needs no name at all.
+
+  it("marks the duplicate row out of rotation and labels it, instead of a banner at the top", async () => {
     const deps = makeDeps(
       [
         acct("s", { nickname: "DROdio Storytell", isDefault: true }),
@@ -1192,19 +1405,57 @@ describe("duplicate-login warning", () => {
       ],
     );
     render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
-    const alert = await screen.findByText(/are the same Claude login/i);
-    expect(alert).toBeTruthy();
-    expect(alert.textContent).toContain("drodio@gmail.com");
-    // Names both offenders so the user knows which to re-log-in.
-    const banner = alert.closest("[role='alert']");
-    expect(banner?.textContent).toContain("DROdio Storytell");
-    expect(banner?.textContent).toContain("DROdio Gmail");
+
+    // EXACTLY ONE of the two is the duplicate — the FIRST claim of a login keeps it, so the other
+    // row is the redundant one. Asserting both were marked would describe a screen that says the
+    // pool is empty when it has one usable account in it.
+    const marked = await screen.findByTestId("account-rotation-reason-g");
+    expect(marked.textContent).toBe("duplicate");
+    expect(screen.getByTestId("account-rotation-g").textContent).toMatch(/out of rotation/);
+    expect(screen.getByTestId("account-rotation-s").textContent).toMatch(/in rotation/);
+    expect(screen.queryByTestId("account-rotation-reason-s")).toBeNull();
+
+    // And the banner it replaces is really gone, not merely re-worded.
+    expect(screen.queryByText(/are the same Claude login/i)).toBeNull();
+    expect(screen.queryByText(/share one usage quota/i)).toBeNull();
   });
 
-  // Four registrations of one login is the live-machine state that exposed the join: the names were
-  // `.join(" and ")`-ed, so the banner read "A and B and C and D" — a sentence nobody can parse at a
-  // glance, in the one place the user has to identify WHICH accounts to fix.
-  it("comma-separates the names when more than two accounts share the login", async () => {
+  it("refuses to put a duplicate back in rotation, and says why", async () => {
+    // The founder's explicit ask — "the ability to put it into rotation would be grayed out… because
+    // it's a duplicate". A shared quota is no escape from a limit, so the control would not do what
+    // pressing it implies.
+    const deps = makeDeps(
+      [
+        acct("s", { nickname: "DROdio Storytell", isDefault: true }),
+        acct("g", { nickname: "DROdio Gmail" }),
+      ],
+      [],
+      [
+        { id: "s", email: "drodio@gmail.com", organization: null, accountUuid: UUID },
+        { id: "g", email: "drodio@gmail.com", organization: null, accountUuid: UUID },
+      ],
+    );
+    render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
+    await screen.findByTestId("account-rotation-reason-g");
+
+    const menu = await openKebab("g");
+    const toggle = within(menu).getByTestId("account-rotation-toggle-g");
+    expect(toggle.textContent).toBe("Put in rotation");
+    expect((toggle as HTMLButtonElement).disabled).toBe(true);
+    expect(toggle.getAttribute("title")).toMatch(/share one quota/i);
+
+    // The paired positive: the row that ISN'T a duplicate has a live toggle. Without it this test
+    // would pass against a menu item that is disabled for everyone.
+    const other = await openKebab("s");
+    expect((within(other).getByTestId("account-rotation-toggle-s") as HTMLButtonElement).disabled).toBe(
+      false,
+    );
+  });
+
+  it("counts four registrations of one login as ONE account in rotation", async () => {
+    // Four is the live-machine state that exposed the old banner's `.join(" and ")` ("A and B and C
+    // and D"). There is no sentence to mis-join now, so the claim worth pinning is the arithmetic
+    // the founder actually cares about: four rows, one quota, and the header must not say four.
     const deps = makeDeps(
       [
         acct("p", { nickname: "DROdio Personal", isDefault: true }),
@@ -1221,13 +1472,14 @@ describe("duplicate-login warning", () => {
       })),
     );
     render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
-    const alert = await screen.findByText(/are the same Claude login/i);
-    const banner = alert.closest("[role='alert']");
-    expect(banner?.textContent).toContain(
-      "DROdio Personal, DROdio Gmail, DROdio Storytell II and DROdio AmForge share one usage quota",
+
+    expect((await screen.findByTestId("rotation-headline")).textContent).toBe(
+      "Only 1 account is in rotation",
     );
-    // The defect this replaces, stated directly: no name is introduced by a repeated "and".
-    expect(banner?.textContent).not.toContain("and DROdio Gmail and");
+    for (const id of ["g", "s", "a"]) {
+      expect(screen.getByTestId(`account-rotation-reason-${id}`).textContent).toBe("duplicate");
+    }
+    expect(screen.queryByTestId("account-rotation-reason-p")).toBeNull();
   });
 
   it("shows no warning when the accounts are genuinely different logins", async () => {
@@ -1241,7 +1493,10 @@ describe("duplicate-login warning", () => {
     );
     render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
     expect(await screen.findByText("drodio@storytell.ai")).toBeTruthy();
-    expect(screen.queryByText(/are the same Claude login/i)).toBeNull();
+    // Neither row is a duplicate, so neither carries the label — the paired negative for the two
+    // tests above, which would otherwise pass against a screen that marks everything.
+    expect(screen.queryByTestId("account-rotation-reason-s")).toBeNull();
+    expect(screen.queryByTestId("account-rotation-reason-g")).toBeNull();
   });
 
   it("does not warn about accounts that simply aren't signed in yet", async () => {
@@ -1255,7 +1510,10 @@ describe("duplicate-login warning", () => {
     );
     render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
     expect((await screen.findByTestId("account-identity-s")).textContent).toBe("One");
-    expect(screen.queryByText(/are the same Claude login/i)).toBeNull();
+    // Out of rotation, yes — but for the reason a human can act on, not as a bogus duplicate. Two
+    // config dirs with no login are not evidence of a shared one.
+    expect(screen.getByTestId("account-rotation-reason-s").textContent).toBe("not signed in");
+    expect(screen.getByTestId("account-rotation-reason-g").textContent).toBe("not signed in");
   });
 });
 
@@ -1402,11 +1660,23 @@ function clock(epochMs: number): string {
   return new Date(epochMs).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
 }
 
-describe("rotation-readiness banner", () => {
-  it("THE FOUNDER'S STATE: says ONE account is usable and names the dead row", async () => {
-    // Two registered accounts, one of which has no `oauthAccount` in its config dir. Before this
-    // banner the screen said nothing at all about the difference, so "2 accounts" was the only
-    // number on offer and "rotation is broken" the only conclusion it supported.
+// ── THE GLANCE MOVED INTO THE HEADER, AND THE BULLETS ARE GONE ───────────────────────────────────
+// This suite used to drive `rotation-banner`: a bordered card under the header carrying a headline,
+// a sentence, and a `<ul>` naming every registration that did not count toward rotation. Eight of
+// its tests were about that list — collapsing shared placeholder nicknames, NOT over-collapsing
+// renamed ones, choosing expired copy over never-signed-in copy, refusing to collapse redundant
+// rows. Every one of those was solving the same problem: the bullets described ACCOUNTS from a
+// banner sitting above them, so each had to re-identify its subject by quoting a nickname — and the
+// nicknames being quoted are generic placeholders that two rows can share.
+//
+// The founder read the result and could not parse it: "signing in is registered, but has never been
+// signed in. Like, I don't know what that means." The facts are now a dot and a two-word label on
+// the card each is ABOUT, where there is nothing to quote and nothing to collide, so the collapse
+// logic and its tests both go. What is left here is the header's own claim — is rotation running,
+// and how many accounts can receive a spawn — plus the paired negative that the list is really gone
+// rather than re-worded, and the assertions that the count and the cards cannot disagree.
+describe("the rotation glance in the header", () => {
+  it("THE FOUNDER'S STATE: one usable account, and the dead row says so on its own card", async () => {
     const deps = makeDeps(
       [
         acct("personal", { nickname: "DROdio Personal", isDefault: true }),
@@ -1416,15 +1686,23 @@ describe("rotation-readiness banner", () => {
       [signedInAs("personal", "drodio@gmail.com"), neverLoggedIn("gmail")],
     );
     render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
-    const banner = await screen.findByTestId("rotation-banner");
-    expect(banner.textContent).toContain("Only 1 account is signed in");
-    expect(banner.textContent).toContain("nothing to rotate to");
-    // Names the account every agent will actually land on — by its VERIFIED email.
-    expect(banner.textContent).toContain("drodio@gmail.com");
-    expect(banner.textContent).toContain("Sign in another account to enable rotation");
-    // The per-account "counted out" bullets were removed from the rotation box (founder's ask); the
-    // box is now just the headline + routing line. WHY an account is out lives on its own row now.
-    expect(banner.textContent).not.toContain("Rotation active");
+
+    expect((await screen.findByTestId("rotation-headline")).textContent).toBe(
+      "Only 1 account is in rotation",
+    );
+    // The account every agent will actually land on, by its VERIFIED email — never the nickname.
+    expect(screen.getByTestId("accounts-header").textContent).toContain("drodio@gmail.com");
+    expect(screen.getByTestId("accounts-header").textContent).toContain(
+      "Sign in another account to enable rotation",
+    );
+    // NOT green, and not claiming rotation. "Do not display status as green when the account has
+    // not yet been signed in" — the founder's rule, applied to the header that summarises them.
+    expect(screen.getByTestId("rotation-state-label").textContent).toBe("rotation stalled");
+
+    // …and the registration that does not count says so where a human is looking at it.
+    expect(screen.getByTestId("account-rotation-gmail").textContent).toMatch(/out of rotation/);
+    expect(screen.getByTestId("account-rotation-reason-gmail").textContent).toBe("not signed in");
+    expect(screen.getByTestId("account-rotation-personal").textContent).toMatch(/in rotation/);
   });
 
   it("says NOTHING is signed in when no account has a login", async () => {
@@ -1434,45 +1712,95 @@ describe("rotation-readiness banner", () => {
       [neverLoggedIn("a"), neverLoggedIn("b")],
     );
     render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
-    const banner = await screen.findByTestId("rotation-banner");
-    expect(banner.textContent).toContain("No account is signed in");
-    expect(banner.textContent).toContain("whatever your terminal is logged into");
-    expect(banner.textContent).not.toContain("Rotation active");
+
+    expect((await screen.findByTestId("rotation-headline")).textContent).toBe(
+      "No account is signed in",
+    );
+    expect(screen.getByTestId("accounts-header").textContent).toContain(
+      "whatever your terminal is logged into",
+    );
+    expect(screen.getByTestId("rotation-state-label").textContent).toBe("rotation stalled");
   });
 
-  it("reports rotation ACTIVE with the count and the accounts once two logins exist", async () => {
+  it("reports rotation ACTIVE with the count once two logins exist", async () => {
     const deps = makeDeps(
       [acct("a", { nickname: "One" }), acct("b", { nickname: "Two" })],
       [],
       [signedInAs("a", "one@example.com", "u1"), signedInAs("b", "two@example.com", "u2")],
     );
     render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
-    const banner = await screen.findByTestId("rotation-banner");
-    expect(banner.textContent).toContain("Rotation active — 2 accounts available");
-    expect(banner.textContent).toContain("one@example.com");
-    expect(banner.textContent).toContain("two@example.com");
-    expect(banner.textContent).not.toContain("nothing to rotate to");
+
+    expect((await screen.findByTestId("rotation-headline")).textContent).toBe(
+      "Rotation active: 2 accounts available",
+    );
+    expect(screen.getByTestId("rotation-state-label").textContent).toBe("rotation active");
+    // The founder's own sentence for where the next agent goes. The banner used to LIST the
+    // accounts here; he asked for the rule instead, and the rule does not grow with the fleet.
+    expect(screen.getByTestId("accounts-header").textContent).toContain(
+      "New agents go to whichever account has the most room left",
+    );
+    expect(screen.getByTestId("accounts-header").textContent).not.toContain("nothing to rotate to");
   });
 
-  it("counts two registrations of the SAME login as ONE usable account", async () => {
-    // Two config dirs, one Anthropic account, one quota. Counting rows would report "Rotation
-    // active — 2 accounts available" for a user who cannot rotate at all: both "targets" hit the
-    // same wall at the same instant.
-    const UUID = "5fb3d67c-f4ed-417b-9bf2-f9156450eb73";
+  // ── THE PAIRED NEGATIVE FOR THE DELETED LIST ────────────────────────────────────────────────
+  // Driven with the exact fixture that used to produce a COLLAPSED bullet ("2 accounts are still
+  // “Signing in…”"), because that is the case the removed logic existed for. If the list came back
+  // in any form this fails, and the per-card assertions below are what stop it passing by rendering
+  // nothing at all.
+  it("names excluded registrations on their own cards, not as bullets in the header", async () => {
     const deps = makeDeps(
-      [acct("s", { nickname: "Storytell" }), acct("g", { nickname: "Gmail" })],
+      [
+        acct("real", { nickname: "Real", isDefault: true }),
+        acct("p1", { nickname: PENDING_NICKNAME }),
+        acct("p2", { nickname: PENDING_NICKNAME }),
+      ],
       [],
-      [signedInAs("s", "drodio@gmail.com", UUID), signedInAs("g", "drodio@gmail.com", UUID)],
+      [signedInAs("real", "real@example.com", "u1"), neverLoggedIn("p1"), neverLoggedIn("p2")],
     );
     render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
-    const banner = await screen.findByTestId("rotation-banner");
-    // The dedup still counts these two registrations as ONE usable login (not "2 available"). The
-    // per-account "share one quota" bullet was removed from the box (founder's ask); WHY a row is
-    // discounted now lives on the account's own row.
-    expect(banner.textContent).toContain("Only 1 account is signed in");
-    expect(banner.textContent).not.toContain("2 accounts available");
+
+    const header = await screen.findByTestId("accounts-header");
+    expect(within(header).queryAllByRole("listitem")).toHaveLength(0);
+    expect(header.textContent).not.toMatch(/never been signed in/i);
+    expect(header.textContent).not.toMatch(/2 accounts are still/i);
+
+    // Both rows say it themselves — no count, no quoted nickname, no way for two of them to collide.
+    for (const id of ["p1", "p2"]) {
+      expect(screen.getByTestId(`account-rotation-reason-${id}`).textContent).toBe("not signed in");
+    }
   });
 
+  it("an EXPIRED login reads as expired on its card, not as 'never signed in'", async () => {
+    // The distinction the deleted bullet copy worked hard to preserve, and it still matters: an
+    // expired login is not a dir that was never used, and pointing the user at "sign in" rather than
+    // "reconnect" sends them to the wrong remedy. The wire shape is what production emits — email
+    // AND accountUuid both null, because Claude Code cleared the whole `oauthAccount`.
+    const deps = makeDeps(
+      [
+        acct("real", { nickname: "Real", isDefault: true }),
+        acct("x1", { nickname: EXPIRED_LOGIN_NICKNAME }),
+      ],
+      [],
+      [
+        signedInAs("real", "real@example.com", "u1"),
+        { id: "x1", email: null, organization: null, accountUuid: null },
+      ],
+    );
+    render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
+
+    // The founder's ask for this card: "put login expired in red instead of white, and make
+    // reconnect a clickable link."
+    const title = await screen.findByTestId("account-identity-x1");
+    expect(title.textContent).toBe("Login expired — reconnect");
+    expect(within(title).getByTestId("account-reconnect-x1").tagName).toBe("BUTTON");
+  });
+
+  // ── MAIN'S CARRIER-ANCHORED GUARD, KEPT ─────────────────────────────────────────────────────
+  // Landed on main (#2375) while this branch was in review, and it is better than what this branch
+  // had: it anchors #2355's guarantee on the `account-blocked-<id>` card that actually carries it,
+  // rather than on a nickname the fixture supplies — a shape that would stay green with every trace
+  // of expired handling deleted. Only its POSITIVE 1 is adapted, because this branch moved the box
+  // it read into the header.
   // Sentences that are FALSE of a login that expired. The first two are the deleted bullet's own
   // wording; the rest are what the blocked card's softened sentence would revert to if someone
   // "restored" the plainer copy without knowing why it was softened — which is the regression this
@@ -1526,10 +1854,12 @@ describe("rotation-readiness banner", () => {
     );
     render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
 
-    // POSITIVE 1 — the banner rendered its real verdict for this state. Without this the negative
-    // below would hold over an empty banner.
-    const banner = await screen.findByTestId("rotation-banner");
-    expect(banner.textContent).toContain("Only 1 account is signed in");
+    // POSITIVE 1 — the header rendered its real verdict for this state. Without this the negative
+    // below would hold over an empty header. `rotation-banner` in main's version; this branch moved
+    // that box into the header as `RotationGlance`, so the carrier of the same claim is the headline.
+    expect((await screen.findByTestId("rotation-headline")).textContent).toBe(
+      "Only 1 account is in rotation",
+    );
 
     // POSITIVE 2 — THE CARRIER. Each expired row renders the blocked card, and that card's second
     // sentence is the expiry-compatible wording. This is DERIVED output (the card renders on
@@ -1541,6 +1871,20 @@ describe("rotation-readiness banner", () => {
       // The remedy has to come with the diagnosis: this card is the only place an expired row is
       // offered a way back, so a card that states the problem without the control is half-useless.
       expect(within(blocked).getByRole("button", { name: /Finish sign-in/ })).toBeTruthy();
+
+      // POSITIVE 3 — THE EXPIRY-DERIVED SURFACE, added when this test was carried onto this branch.
+      // main's comment above claims POSITIVE 2 "fails if the expired handling is removed", and on
+      // this branch that was not true: `account-blocked-<id>` renders on `!signedIn`, a function of
+      // the recorded identity with NO expiry input, and its sentence and button are constants of that
+      // branch. The whole expiry feature could be deleted and everything above would stay green.
+      //
+      // `account-reconnect-<id>` exists ONLY because of the `titleText === EXPIRED_LOGIN_NICKNAME`
+      // branch, so it is the one assertion here that actually reads expired handling. Without it this
+      // is a copy-pin on the blocked card wearing a carrier-anchored test's comment — the same
+      // precondition-as-side-effect shape the comment above warns about, one level up.
+      expect(
+        within(screen.getByTestId(`account-identity-${id}`)).getByTestId(`account-reconnect-${id}`),
+      ).toBeTruthy();
 
       // Scoped to the carrier as well as to the document below — a negative that only ever runs
       // over the whole body cannot say WHERE the wrong sentence would have appeared.
@@ -1559,19 +1903,465 @@ describe("rotation-readiness banner", () => {
     }
   });
 
-  it("offers the fix inline: the banner's own add button opens the add form", async () => {
+  it("the reconnect link opens the login flow", async () => {
+    // The paired positive: a link that looks like a link and does nothing would be worse than the
+    // plain text it replaced. `x1` is NOT the default account, so it logs in with one click rather
+    // than going through the default-account confirm.
+    const onLogin = vi.fn();
+    const deps = makeDeps(
+      [acct("real", { nickname: "Real", isDefault: true }), acct("x1", { nickname: EXPIRED_LOGIN_NICKNAME })],
+      [],
+      [
+        signedInAs("real", "real@example.com", "u1"),
+        { id: "x1", email: null, organization: null, accountUuid: null },
+      ],
+    );
+    render(<AccountsScreen onLogin={onLogin} deps={deps} />);
+
+    fireEvent.click(await screen.findByTestId("account-reconnect-x1"));
+    await waitFor(() => expect(onLogin).toHaveBeenCalledTimes(1));
+    expect(onLogin.mock.calls[0]![0]).toMatchObject({ id: "x1" });
+  });
+
+  // ── THE COUNT AND THE CARDS CANNOT DISAGREE ─────────────────────────────────────────────────
+  // The contradiction the founder screenshotted: "Rotation active — 6 accounts available" over a
+  // list explaining that four of them were not. Taking one out from its kebab is the cheapest way to
+  // create that state, so it is what this drives.
+  it("nets manual opt-outs off the header count", async () => {
+    const deps = makeDeps(
+      [acct("a", { nickname: "One", isDefault: true }), acct("b", { nickname: "Two" })],
+      [],
+      [signedInAs("a", "one@example.com", "u1"), signedInAs("b", "two@example.com", "u2")],
+    );
+    render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
+    expect((await screen.findByTestId("rotation-headline")).textContent).toBe(
+      "Rotation active: 2 accounts available",
+    );
+
+    const menu = await openKebab("b");
+    const toggle = within(menu).getByTestId("account-rotation-toggle-b");
+    expect(toggle.textContent).toBe("Take out of rotation");
+    fireEvent.click(toggle);
+
+    await waitFor(() =>
+      expect(screen.getByTestId("rotation-headline").textContent).toBe(
+        "Only 1 account is in rotation",
+      ),
+    );
+    expect(screen.getByTestId("account-rotation-b").textContent).toMatch(/out of rotation/);
+    expect(screen.getByTestId("account-rotation-reason-b").textContent).toBe("you took it out");
+    expect(screen.getByTestId("account-rotation-a").textContent).toMatch(/in rotation/);
+
+    // …and back again. Without this the test above passes against a toggle that is one-way.
+    fireEvent.click(within(await openKebab("b")).getByTestId("account-rotation-toggle-b"));
+    await waitFor(() =>
+      expect(screen.getByTestId("rotation-headline").textContent).toBe(
+        "Rotation active: 2 accounts available",
+      ),
+    );
+  });
+
+  it("pauses and resumes the fleet from the header icon", async () => {
+    // The founder's control: "there would just be a pause button… then it would say rotation paused
+    // … and if I click it again, then it goes back to rotation active." The icon IS the button.
+    const deps = makeDeps(
+      [acct("a", { nickname: "One", isDefault: true }), acct("b", { nickname: "Two" })],
+      [],
+      [signedInAs("a", "one@example.com", "u1"), signedInAs("b", "two@example.com", "u2")],
+    );
+    render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
+    expect((await screen.findByTestId("rotation-state-label")).textContent).toBe("rotation active");
+
+    fireEvent.click(screen.getByTestId("rotation-toggle"));
+
+    await waitFor(() =>
+      expect(screen.getByTestId("rotation-state-label").textContent).toBe("rotation paused"),
+    );
+    expect(screen.getByTestId("rotation-headline").textContent).toBe(
+      "Rotation paused — 2 accounts available",
+    );
+    // A pause is not a stop, and the copy has to say where agents go instead — otherwise the
+    // reasonable reading is that the fleet is halted.
+    expect(screen.getByTestId("accounts-header").textContent).toMatch(
+      /New agents stay on (one|two)@example\.com until you resume/,
+    );
+
+    fireEvent.click(screen.getByTestId("rotation-toggle"));
+    await waitFor(() =>
+      expect(screen.getByTestId("rotation-state-label").textContent).toBe("rotation active"),
+    );
+  });
+
+  // ── THE HEADER MUST NOT SAY ANYTHING THE ROUTER WOULD CONTRADICT ────────────────────────────
+  // Three ways it could, all reachable, none of them exotic: the pool count and the "nothing signed
+  // in" copy are different facts; a probe-expired row is signed-in by identity and dead in reality;
+  // and a fleet target the spawn path has already discarded is still an account this screen can
+  // name. Each one puts the loudest line on the screen at odds with where agents actually go.
+
+  it("distinguishes 'nothing is signed in' from 'everything has been taken out'", async () => {
+    // One click of the toggle this screen just gained. Taking the last account out used to render
+    // "No account is signed in. Agents will run on whatever your terminal is logged into. Sparkle has
+    // no account of its own to hand them." — false in both sentences, since `outOfRotationIds`
+    // demotes out of `candidates` and never out of `eligible`, so spawns still land on a Sparkle
+    // account. It also points at the wrong remedy: the fix is the ⋮ menu, not signing in.
+    const deps = makeDeps(
+      [acct("a", { nickname: "One", isDefault: true })],
+      [],
+      [signedInAs("a", "one@example.com", "u1")],
+    );
+    render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
+    await screen.findByTestId("account-rotation-a");
+    fireEvent.click(within(await openKebab("a")).getByTestId("account-rotation-toggle-a"));
+
+    await waitFor(() =>
+      expect(screen.getByTestId("rotation-headline").textContent).toBe("No account is in rotation"),
+    );
+    const header = screen.getByTestId("accounts-header");
+    expect(header.textContent).toContain("out of rotation by your own choice");
+    expect(header.textContent).toContain("put one back from its ⋮ menu");
+    // …and it does NOT invent an expiry that is not there. The copy is built from the actual mix.
+    expect(header.textContent).not.toContain("dead — reconnect");
+    expect(header.textContent).not.toContain("whatever your terminal is logged into");
+
+    // The paired negative, in the state that copy IS true for: no login anywhere.
+    cleanup();
+    const none = makeDeps([acct("b", { nickname: "Two" })], [], [neverLoggedIn("b")]);
+    render(<AccountsScreen onLogin={vi.fn()} deps={none} />);
+    expect((await screen.findByTestId("rotation-headline")).textContent).toBe(
+      "No account is signed in",
+    );
+    expect(screen.getByTestId("accounts-header").textContent).toContain(
+      "whatever your terminal is logged into",
+    );
+  });
+
+  it("drops a PROBE-EXPIRED account from the count, not just from its own card", async () => {
+    // `rotationReadiness` decides `usable` from an email being present; `authIsDefinitelyExpired`
+    // exists precisely to catch a row that still HAS an email over a dead OAuth session. So this row
+    // is "usable" by identity and dead in fact, and the header used to count it — printing "Rotation
+    // active: 2 accounts available" directly above a card reading "out of rotation · login expired".
+    const deps = makeDeps(
+      [acct("a", { nickname: "Live", isDefault: true }), acct("b", { nickname: "Dead" })],
+      [],
+      [signedInAs("a", "one@example.com", "u1"), signedInAs("b", "two@example.com", "u2")],
+    );
+    deps.getAuthStatus = vi.fn(async (configDir?: string): Promise<ClaudeAuthStatus> => ({
+      loggedIn: !configDir?.includes("b"),
+      source: "cli",
+      email: "x@example.invalid",
+      authMethod: "oauth",
+      subscriptionType: "max",
+    }));
+    render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
+
+    await waitFor(() =>
+      expect(screen.getByTestId("rotation-headline").textContent).toBe(
+        "Only 1 account is in rotation",
+      ),
+    );
+    expect(screen.getByTestId("account-rotation-reason-b").textContent).toBe("login expired");
+    // …and the healthy sibling is still counted, so this is evidence about the expired row rather
+    // than about the count collapsing whenever a probe runs at all.
+    expect(screen.getByTestId("account-rotation-a").textContent).toMatch(/in rotation/);
+  });
+
+  it("stops naming a manual override once the account hits a real rate limit", async () => {
+    // `usablePreferredAccount` drops a preference for an account at an OBSERVED wall, so every spawn
+    // has already fallen through to auto-pick. The header applied only the pool test, so it kept
+    // announcing "every new agent runs on X" about an account nothing was being routed to.
+    const FUTURE_SECS = Math.floor(Date.now() / 1000) + 3600;
+    const { deps, state } = routableDeps(
+      [acct("a", { nickname: "Walled" }), acct("b", { nickname: "Fine" })],
+      [signedIn("a"), signedIn("b")],
+    );
+    state.preferred = "a";
+    deps.getUsage = vi.fn(async () => [
+      { id: "a", tokens5h: 10, tokens7d: 10, exhaustedUntil: FUTURE_SECS * 1000 },
+      { id: "b", tokens5h: 10, tokens7d: 10, exhaustedUntil: null },
+    ]);
+    render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
+    await screen.findByTestId("account-rotation-a");
+
+    expect(screen.getByTestId("accounts-header").textContent).not.toContain("Manual override");
+
+    // The paired positive: the SAME override, on an account that is not walled, IS announced —
+    // without it this would pass against a header that never says "Manual override" at all.
+    cleanup();
+    const ok = routableDeps(
+      [acct("a", { nickname: "Walled" }), acct("b", { nickname: "Fine" })],
+      [signedIn("a"), signedIn("b")],
+    );
+    ok.state.preferred = "a";
+    render(<AccountsScreen onLogin={vi.fn()} deps={ok.deps} />);
+    await screen.findByTestId("account-rotation-a");
+    await waitFor(() =>
+      expect(screen.getByTestId("accounts-header").textContent).toContain("Manual override"),
+    );
+  });
+
+  it("stops naming a frozen account once it is taken out of rotation", async () => {
+    // The copy half of a contradiction whose ROUTING half is fixed in `usablePausedAccount`. Pause
+    // while the fleet is on an account, then take that account out from its kebab: the freeze stops
+    // biting and every spawn falls through to the other account — so a header still reading "New
+    // agents stay on X until you resume", above X's own card reading "out of rotation", would be
+    // wrong about the one thing this line exists to state.
+    const deps = makeDeps(
+      [acct("a", { nickname: "One", isDefault: true }), acct("b", { nickname: "Two" })],
+      [],
+      [signedInAs("a", "one@example.com", "u1"), signedInAs("b", "two@example.com", "u2")],
+    );
+    render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
+    await screen.findByTestId("account-rotation-a");
+
+    fireEvent.click(screen.getByTestId("rotation-toggle"));
+    await waitFor(() =>
+      expect(screen.getByTestId("rotation-state-label").textContent).toBe("rotation paused"),
+    );
+    // The control: it names SOME account while the freeze is real.
+    const frozen = screen.getByTestId("accounts-header").textContent ?? "";
+    const match = /New agents stay on (\S+) until you resume/.exec(frozen);
+    expect(match).not.toBeNull();
+    const frozenId = match![1] === "one@example.com" ? "a" : "b";
+
+    fireEvent.click(
+      within(await openKebab(frozenId)).getByTestId(`account-rotation-toggle-${frozenId}`),
+    );
+
+    await waitFor(() =>
+      expect(screen.getByTestId("accounts-header").textContent).toContain(
+        "Nothing was in rotation to hold them",
+      ),
+    );
+    expect(screen.getByTestId("accounts-header").textContent).not.toContain("New agents stay on");
+    // Still paused — taking the target out ends the FREEZE, not the pause.
+    expect(screen.getByTestId("rotation-state-label").textContent).toBe("rotation paused");
+  });
+
+  it("an all-EXPIRED pool points at reconnecting, not at the ⋮ menu", async () => {
+    // The case a two-way zero branch gets wrong, and it is not exotic: a one-account install whose
+    // OAuth session has died is `usable` by identity (an email is recorded) and out of the pool by
+    // probe. It used to be told its only account had "been taken out or is a duplicate" — neither
+    // true — and sent to a menu item that does not apply, past the Reconnect button on the card.
+    const deps = makeDeps(
+      [acct("a", { nickname: "Only", isDefault: true })],
+      [],
+      [signedInAs("a", "one@example.com", "u1")],
+    );
+    deps.getAuthStatus = vi.fn(async (): Promise<ClaudeAuthStatus> => ({
+      loggedIn: false,
+      source: "cli",
+      email: "one@example.com",
+      authMethod: "oauth",
+      subscriptionType: "max",
+    }));
+    render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
+
+    await waitFor(() =>
+      expect(screen.getByTestId("rotation-headline").textContent).toBe(
+        "This account's login has expired",
+      ),
+    );
+    const header = screen.getByTestId("accounts-header").textContent ?? "";
+    expect(header).toContain("dead — reconnect from the card");
+    // The remedy it must NOT name: the ⋮ toggle is greyed out for an expired row, so pointing at it
+    // sends the user to a control disabled for exactly the reason they are there.
+    expect(header).not.toContain("⋮ menu");
+    expect(header).not.toContain("whatever your terminal is logged into");
+    // …and the remedy it points at is really there.
+    expect(screen.getByTestId("account-renew-a")).toBeTruthy();
+  });
+
+  it("an expired account that ALSO holds the override still points at reconnecting", async () => {
+    // THE COLLISION between this branch's two halves, and it is the likely state rather than a
+    // contrived one: `setPreferredAccountId` is written by the auto-switch path as well as by the
+    // button, so a one-account install can hold a preference nobody clicked for. With the fleet-
+    // target line evaluated first, the header read "This account's login has expired" over "Manual
+    // override: every new agent runs on Only…" — two lines contradicting each other, with the
+    // reconnect remedy unreachable.
+    const { deps, state } = routableDeps([acct("only", { nickname: "Only" })], [signedIn("only")]);
+    state.preferred = "only";
+    deps.getAuthStatus = vi.fn(async (): Promise<ClaudeAuthStatus> => ({
+      loggedIn: false,
+      source: "cli",
+      email: "only@example.invalid",
+      authMethod: "oauth",
+      subscriptionType: "max",
+    }));
+    render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
+
+    await waitFor(() =>
+      expect(screen.getByTestId("rotation-headline").textContent).toBe(
+        "This account's login has expired",
+      ),
+    );
+    const header = screen.getByTestId("accounts-header").textContent ?? "";
+    expect(header).toContain("dead — reconnect from the card");
+    // AND WHERE THE WORK IS ACTUALLY GOING. `usablePreferredAccount` does not gate on the auth probe,
+    // so this expired account still takes every spawn — an earlier cut of this branch replaced that
+    // fact with a flat "New agents still run on the least-bad account", which was simply false.
+    expect(header).toContain("Every new agent still runs on");
+    expect(header).not.toContain("least-bad account");
+  });
+
+  it("names BOTH reasons when the pool is empty for two different ones", async () => {
+    // An empty pool is almost never single-cause once there is more than one account. With A expired
+    // and B taken out, asserting either cause alone is false about the other — and naming the ⋮ menu
+    // for A sends the user to a toggle that is greyed out precisely BECAUSE A is expired.
+    const deps = makeDeps(
+      [acct("a", { nickname: "Dead", isDefault: true }), acct("b", { nickname: "Parked" })],
+      [],
+      [signedInAs("a", "dead@example.com", "u1"), signedInAs("b", "parked@example.com", "u2")],
+    );
+    deps.getAuthStatus = vi.fn(async (configDir?: string): Promise<ClaudeAuthStatus> => ({
+      loggedIn: !configDir?.includes("/cfg/a"),
+      source: "cli",
+      email: "x@example.invalid",
+      authMethod: "oauth",
+      subscriptionType: "max",
+    }));
+    render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
+    await screen.findByTestId("account-rotation-b");
+
+    fireEvent.click(within(await openKebab("b")).getByTestId("account-rotation-toggle-b"));
+
+    await waitFor(() =>
+      expect(screen.getByTestId("rotation-headline").textContent).toBe("No account is in rotation"),
+    );
+    const header = screen.getByTestId("accounts-header").textContent ?? "";
+    expect(header).toContain("One account's session is dead — reconnect from the card.");
+    expect(header).toContain("One account is out of rotation by your own choice");
+    // The claim the single-cause copy used to make about BOTH of them.
+    expect(header).not.toContain("Every signed-in account");
+  });
+
+  it("still names a manual override onto the redundant half of a duplicate pair", async () => {
+    // The header must not be STRICTER than the router. `rotationPool` drops duplicates; the router's
+    // own gate does not, and the Manual Override button is enabled on a readable email alone — so
+    // activating the redundant row is one click and every spawn really does go there. A header that
+    // dropped the line would print "New agents go to whichever account has the most room left" while
+    // a fixed target was in force, which is the same false claim pointing the other way.
+    const UUID = "5fb3d67c-f4ed-417b-9bf2-f9156450eb73";
+    const { deps, state } = routableDeps(
+      [acct("s", { nickname: "First", isDefault: true }), acct("g", { nickname: "Second" })],
+      [
+        { id: "s", email: "drodio@gmail.com", organization: null, accountUuid: UUID },
+        { id: "g", email: "drodio@gmail.com", organization: null, accountUuid: UUID },
+      ],
+    );
+    state.preferred = "g"; // the REDUNDANT half — out of the pool, in force with the router
+    render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
+
+    await screen.findByTestId("account-rotation-reason-g");
+    expect(screen.getByTestId("account-rotation-reason-g").textContent).toBe("duplicate");
+    expect(screen.getByTestId("accounts-header").textContent).toContain(
+      "Manual override: every new agent runs on",
+    );
+  });
+
+  it("an override made while PAUSED is reported as winning, because it does", async () => {
+    // `chooseAccountForAgent` consults the preference BEFORE the freeze, so an activation made while
+    // rotation is paused really does take every spawn. Stated the other way round — and it was — the
+    // header read "New agents stay on X until you resume" while agents were going to Y. An accepted
+    // `switch_all` from the concierge reaches exactly that state without anyone touching this screen.
+    const { deps, state } = routableDeps(
+      [acct("a", { nickname: "Frozen", isDefault: true }), acct("b", { nickname: "Chosen" })],
+      [signedIn("a"), signedIn("b")],
+    );
+    render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
+    await screen.findByTestId("account-rotation-a");
+
+    fireEvent.click(screen.getByTestId("rotation-toggle"));
+    await waitFor(() =>
+      expect(screen.getByTestId("rotation-state-label").textContent).toBe("rotation paused"),
+    );
+    // The control: with no override, the freeze is what the body reports.
+    expect(screen.getByTestId("accounts-header").textContent).toContain("New agents stay on");
+
+    fireEvent.click(within(screen.getByTestId("account-row-b")).getByText("Manual Override"));
+    expect(state.preferred).toBe("b");
+
+    await waitFor(() =>
+      expect(screen.getByTestId("accounts-header").textContent).toContain("Manual override"),
+    );
+    const header = screen.getByTestId("accounts-header").textContent ?? "";
+    expect(header).not.toContain("New agents stay on");
+    // …and the pause is not hidden by the override winning — it is still true, and still says so.
+    expect(header).toContain("this override outranks the freeze");
+    expect(screen.getByTestId("rotation-state-label").textContent).toBe("rotation paused");
+  });
+
+  it("promotes the sibling when a duplicate's FIRST registration is taken out", async () => {
+    // The screen's half of the order-dependence: `aa` is the redundant row until `a` leaves, at which
+    // point `aa` represents the login and must stop reading "out of rotation · duplicate" — otherwise
+    // the count includes a row whose own card says it is excluded.
+    const UUID = "5fb3d67c-f4ed-417b-9bf2-f9156450eb73";
+    const deps = makeDeps(
+      [acct("a", { nickname: "First", isDefault: true }), acct("aa", { nickname: "Second" })],
+      [],
+      [
+        { id: "a", email: "shared@example.com", organization: null, accountUuid: UUID },
+        { id: "aa", email: "shared@example.com", organization: null, accountUuid: UUID },
+      ],
+    );
+    render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
+    expect((await screen.findByTestId("account-rotation-reason-aa")).textContent).toBe("duplicate");
+
+    fireEvent.click(within(await openKebab("a")).getByTestId("account-rotation-toggle-a"));
+
+    await waitFor(() =>
+      expect(screen.getByTestId("account-rotation-reason-a").textContent).toBe("you took it out"),
+    );
+    // `aa` now holds the login, so it is in rotation and the count still says one.
+    expect(screen.getByTestId("account-rotation-aa").textContent).toMatch(/in rotation/);
+    expect(screen.queryByTestId("account-rotation-reason-aa")).toBeNull();
+    expect(screen.getByTestId("rotation-headline").textContent).toBe(
+      "Only 1 account is in rotation",
+    );
+  });
+
+  it("an EMPTY pool with a surviving override names both the target and the remedy", async () => {
+    // The two-account version of the state above, and the one the reviewer's fix is aimed at: A's
+    // session is dead AND A holds the preference (which the auto-switch arm writes without a click);
+    // B is taken out from the kebab. The pool is empty, yet `usablePreferredAccount` pins every spawn
+    // to A — so the header owes both facts: what is wrong with A, and that A is nonetheless where
+    // the work is going.
+    const { deps, state } = routableDeps(
+      [acct("a", { nickname: "Dead", isDefault: true }), acct("b", { nickname: "Parked" })],
+      [signedIn("a"), signedIn("b")],
+    );
+    state.preferred = "a";
+    deps.getAuthStatus = vi.fn(async (configDir?: string): Promise<ClaudeAuthStatus> => ({
+      loggedIn: !configDir?.includes("/cfg/a"),
+      source: "cli",
+      email: "x@example.invalid",
+      authMethod: "oauth",
+      subscriptionType: "max",
+    }));
+    render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
+    await screen.findByTestId("account-rotation-b");
+
+    fireEvent.click(within(await openKebab("b")).getByTestId("account-rotation-toggle-b"));
+
+    await waitFor(() =>
+      expect(screen.getByTestId("rotation-headline").textContent).toBe("No account is in rotation"),
+    );
+    const header = screen.getByTestId("accounts-header").textContent ?? "";
+    // Both reasons, each with its own remedy…
+    expect(header).toContain("session is dead — reconnect from the card");
+    expect(header).toContain("out of rotation by your own choice");
+    // …and the truth about routing, which is NOT least-bad here.
+    expect(header).toContain("Every new agent still runs on");
+    expect(header).not.toContain("least-bad account");
+  });
+
+  it("offers the fix inline: the header's add button opens the add form", async () => {
     const deps = makeDeps([acct("a")], [], [signedInAs("a", "one@example.com")]);
     render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
-    fireEvent.click(await screen.findByRole("button", { name: /Add another account/ }));
+    fireEvent.click(await screen.findByRole("button", { name: /\+ Add account/ }));
     // The form is open and ready to type into — the remedy is one click from the diagnosis.
     expect(screen.getByLabelText("New account nickname")).toBeTruthy();
   });
 
-  // THE PROSE IS GONE, THE CONTROLS ARE NOT (sparkle-cjpte). The founder cut the "Adding a Claude
-  // account takes two minutes" step list and the "Each account is a separate Claude login…"
-  // paragraph: the controls carry the meaning now. That makes this a PAIRED test on purpose —
-  // asserting only the absence would stay green if the controls the copy used to name disappeared
-  // with it, which is the actual risk when you delete the text that explains a screen.
   it("drops the explanatory prose but keeps the controls it used to describe", async () => {
     const deps = makeDeps([acct("a")], [], [signedInAs("a", "one@example.com")]);
     const { container } = render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
@@ -1587,39 +2377,12 @@ describe("rotation-readiness banner", () => {
     expect(text).not.toContain("never sees your Claude credentials");
   });
 
-  it("the rotation box shows NO per-account 'counted out' bullets, even with excluded rows present", async () => {
-    // The founder emptied the box (2026-08-21 live session): headline + routing line only. Seed the
-    // exact state that USED to produce bullets — one usable login plus a never-signed-in row and a
-    // same-login duplicate — and assert the box renders no <li> and none of the removed sentences.
-    // Paired with a positive assertion (the headline is present) so it cannot pass by rendering
-    // nothing. Restoring groupExcluded + the <ul> reds this.
-    const UUID = "5fb3d67c-f4ed-417b-9bf2-f9156450eb73";
-    const deps = makeDeps(
-      [
-        acct("a", { nickname: "Real", isDefault: true }),
-        acct("dup", { nickname: "Dupe" }),
-        acct("new", { nickname: PENDING_NICKNAME }),
-      ],
-      [],
-      [
-        signedInAs("a", "drodio@gmail.com", UUID),
-        signedInAs("dup", "drodio@gmail.com", UUID), // same login → would have been a "share one quota" bullet
-        neverLoggedIn("new"), // would have been a "never signed in" bullet
-      ],
-    );
-    render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
-    const banner = await screen.findByTestId("rotation-banner");
-    // Positive control: the box still renders its headline (cannot pass by rendering nothing).
-    expect(banner.textContent).toContain("signed in");
-    // The deletion, asserted on the rendered box: no bullet list, and none of the removed sentences.
-    expect(within(banner).queryAllByRole("listitem")).toHaveLength(0);
-    const t = banner.textContent ?? "";
-    expect(t).not.toContain("never been signed in");
-    expect(t).not.toContain("share one quota");
-    expect(t).not.toContain("no readable email");
-    expect(t).not.toContain("registered but");
-  });
-
+  // main's "no counted-out bullets" test asserted `rotation-banner`, the box this branch replaces
+  // with the in-header `RotationGlance`. Its GUARANTEE is kept, not dropped: "names excluded
+  // registrations on their own cards, not as bullets in the header" drives the same fixture (one
+  // usable login, a never-signed-in row, a same-login duplicate) and asserts the header renders no
+  // <li> and none of the removed sentences — plus the per-card reasons that replaced them, which
+  // main's version could not assert because that half did not exist yet.
   it("still reaches the per-row Finish sign-in control the deleted copy pointed at", async () => {
     // An account with a config dir but no identity = registered, never logged in. That is the exact
     // row the removed step 4 told the user to click "Finish sign-in" on.
@@ -2106,49 +2869,66 @@ describe("the spawn-history panel is actually mounted", () => {
 // Every assertion below is on a state the screen could NOT have rendered before the click: the deps
 // are backed by mutable state (`routableDeps`), so a badge that was hard-coded, or a button wired to
 // nothing, fails rather than passing on a fixture.
+// ── `account-active-state-*` IS GONE, AND WHAT IT WAS PROTECTING IS NOT ──────────────────────────
+// That line read "Active — new agents run here" / "Not taking new agents" / "Automatic — new agents
+// may run here", and the tests below it are the scar tissue of three separate roborev findings
+// (65216, 65221, 65223) — each one a case where the label contradicted something else on the same
+// card. The founder read the survivor and could not tell what it meant: "when it says not taking new
+// agents, I don't think I know what that means. Does it mean that it's not available to take new
+// agents? Or that it's just not currently selected?… Let's just delete those two lines."
+//
+// He is describing the defect the three findings kept circling. The line was answering TWO questions
+// in one three-way string — CAN this account receive an agent, and is it the one being routed to —
+// and no single wording can do that without being false about one of them. They are now two separate
+// unambiguous things in two places: the rotation dot at the top of the card answers the first, and
+// the Manual Override / Back to automatic button answers the second by its own state.
+//
+// So these tests keep their SUBJECTS and change their SURFACE. Every "must not contradict" case
+// below is re-aimed at the dot, and the override cases at the button — which is why they are
+// rewritten rather than deleted.
 describe("AccountsScreen — activation", () => {
-  it("Manual Override records the account and marks that card Active (no PRIMARY badge)", async () => {
+  it("Manual Override records the account, and the button itself says which card holds it", async () => {
     const { deps, state } = routableDeps(
       [acct("a", { nickname: "Personal", isDefault: true }), acct("b", { nickname: "Work" })],
       [signedIn("a"), signedIn("b")],
     );
     render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
 
-    // Before: no card is active, and both offer the control.
-    // `.textContent`, not jest-dom's `toHaveTextContent` — this repo does not load jest-dom.
-    // No override is set yet, so this is AUTOMATIC mode — the card must not claim it takes none.
-    expect((await screen.findByTestId("account-active-state-b")).textContent).toBe(
-      "Automatic — new agents may run here",
-    );
+    // Before: no card holds the override, so both offer to take it.
+    const cardB = await screen.findByTestId("account-row-b");
+    expect(within(cardB).getByText("Manual Override")).toBeTruthy();
     // The PRIMARY badge was removed — it must not exist in either state.
     expect(screen.queryByTestId("account-primary-badge-b")).toBeNull();
 
-    const cardB = screen.getByTestId("account-row-b");
     fireEvent.click(within(cardB).getByText("Manual Override"));
 
-    // The lever ran with the right account — and the SCREEN now reflects it, which it can only do
-    // by re-reading the preference the lever wrote. The subtle active-state line is the ONLY marker.
+    // The lever ran with the right account — and the SCREEN reflects it, which it can only do by
+    // re-reading the preference the lever wrote.
     expect(deps.activateAccount).toHaveBeenCalledWith("b");
     expect(state.preferred).toBe("b");
-    expect((await screen.findByTestId("account-active-state-b")).textContent).toBe(
-      "Active — new agents run here",
+    await waitFor(() =>
+      expect(within(screen.getByTestId("account-row-b")).getByText("Back to automatic")).toBeTruthy(),
     );
-    // Still no crown — the removed badge must not have crept back.
+    // …and ONLY that card. The other still offers the control rather than claiming anything.
+    expect(within(screen.getByTestId("account-row-a")).getByText("Manual Override")).toBeTruthy();
     expect(screen.queryByTestId("account-primary-badge-b")).toBeNull();
-    // …and only that card is active. The DEFAULT account is a different idea.
-    expect(screen.getByTestId("account-active-state-a").textContent).toBe("Not taking new agents");
+
+    // THE HEADER STOPS CLAIMING PLAIN ROTATION. Two accounts are still in the pool, so the count is
+    // honest — but every new agent is going to one of them, and a header that said only "Rotation
+    // active: 2 accounts available" would be the count-contradicts-the-rows defect arriving from the
+    // other direction.
+    expect(screen.getByTestId("accounts-header").textContent).toContain(
+      "Manual override: every new agent runs on",
+    );
   });
 
-  // ── THE LABEL MUST NOT CONTRADICT THE LINE BELOW IT ─────────────────────────────────────────
+  // ── THE DOT MUST NOT CONTRADICT THE LINE BELOW IT ───────────────────────────────────────────
   //
   // The founder screenshotted a card reading "Inactive" directly above "Running agents: Concierge"
-  // and reported the state as a bug. The state was right — the label is about ROUTING (where the
-  // NEXT agent starts), not about activity — but it made a claim the very next line disproved.
-  //
-  // This asserts the two lines together on ONE card, which is the only arrangement that can catch
-  // it: asserting the label alone passes with any wording, and asserting the running list alone
-  // never looks at the label. A revert to the bare word "Inactive" fails here.
-  it("a non-routed account that IS running agents does not describe itself as inactive", async () => {
+  // and reported the state as a bug. The old label was about ROUTING and made a claim the next line
+  // disproved. The dot is about the POOL, which is the question that has a stable answer — and this
+  // asserts the two together on ONE card, the only arrangement that can catch a regression.
+  it("a non-routed account that IS running agents does not read as out of rotation", async () => {
     const { deps, state } = routableDeps(
       [acct("a", { nickname: "Routed" }), acct("b", { nickname: "Busy" })],
       [signedIn("a"), signedIn("b")],
@@ -2159,34 +2939,28 @@ describe("AccountsScreen — activation", () => {
     state.names = { agent1: "Concierge" };
     render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
 
-    const label = await screen.findByTestId("account-active-state-b");
-    const card = screen.getByTestId("account-row-b");
-
+    const card = await screen.findByTestId("account-row-b");
     // The card really is showing a running agent…
     expect(card.textContent).toContain("Concierge");
-    // …so the label above it must not assert the account is inactive.
-    expect(label.textContent).not.toMatch(/inactive/i);
-    // It states the routing fact instead, which is what is actually true of this card.
-    expect(label.textContent).toBe("Not taking new agents");
+    // …so nothing on it may say the account is out of the pool. It is signed in and unique; the
+    // override on the OTHER card is a routing fact, and the header is where that is stated.
+    expect(screen.getByTestId("account-rotation-b").textContent).toMatch(/in rotation/);
+    expect(screen.queryByTestId("account-rotation-reason-b")).toBeNull();
   });
 
-  // AUTOMATIC MODE IS THE DEFAULT STATE, AND IT HAS ITS OWN LABEL.
-  //
-  // With no manual override anywhere, `preferredId` is unset, so NO card is primary. A two-way
-  // label therefore tells EVERY card it takes no new agents while `chooseAccountForAgent` is
-  // auto-picking one of them by lowest usage. The single-account fleet is the sharpest case: the
-  // one card receiving 100% of spawns declaring it receives none.
-  it("does not tell a lone auto-picked account that it takes no new agents", async () => {
+  it("does not tell a lone auto-picked account it is out of rotation", async () => {
+    // The sharpest case for the deleted label: one signed-in account receiving 100% of spawns, being
+    // told it takes none. Whatever the dot says here, it cannot be "out of rotation".
     const { deps } = routableDeps([acct("solo", { nickname: "Only" })], [signedIn("solo")]);
     render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
-    const label = await screen.findByTestId("account-active-state-solo");
-    expect(label.textContent).not.toMatch(/not taking new agents/i);
-    expect(label.textContent).toBe("Automatic — new agents may run here");
+    expect((await screen.findByTestId("account-rotation-solo")).textContent).toMatch(/in rotation/);
+    expect(screen.queryByTestId("account-rotation-reason-solo")).toBeNull();
   });
 
-  it("says 'not taking new agents' only when ANOTHER card actually holds the override", async () => {
-    // The paired direction: the strict wording is correct here and must not be lost. Without this,
-    // "always say automatic" would pass the test above.
+  it("an override on ANOTHER card does not take this one out of the pool", async () => {
+    // The paired direction. An override is not an exclusion: `usablePreferredAccount` can drop the
+    // preference on the very next spawn (exhausted, signed out), and rotation then falls back to
+    // exactly this pool. Marking the other cards "out" would be false the moment that happened.
     const { deps } = routableDeps(
       [acct("a", { nickname: "Chosen" }), acct("b", { nickname: "Other" })],
       [signedIn("a"), signedIn("b")],
@@ -2194,54 +2968,52 @@ describe("AccountsScreen — activation", () => {
     render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
     fireEvent.click(within(await screen.findByTestId("account-row-a")).getByText("Manual Override"));
     await waitFor(() =>
-      expect(screen.getByTestId("account-active-state-b").textContent).toBe("Not taking new agents"),
+      expect(within(screen.getByTestId("account-row-a")).getByText("Back to automatic")).toBeTruthy(),
+    );
+    expect(screen.getByTestId("account-rotation-b").textContent).toMatch(/in rotation/);
+    expect(screen.getByTestId("rotation-headline").textContent).toBe(
+      "Rotation active: 2 accounts available",
     );
   });
 
-  // A SIGNED-OUT CARD CANNOT RECEIVE AGENTS AT ALL, so the automatic wording must not reach it.
-  // `chooseAccountForAgent` filters both `eligibleAccounts` and `autoPick` on `signedInIds`, and
-  // this same card renders "Not signed in — this account cannot receive agents". Claiming
-  // "Automatic — new agents may run here" above that banner rebuilds the founder's original
-  // complaint INSIDE one card (roborev 65221). Every other test on this label uses a signed-in
-  // identity, so this direction was unguarded.
-  it("does not tell a signed-OUT account that new agents may run there", async () => {
+  // A SIGNED-OUT CARD CANNOT RECEIVE AGENTS AT ALL. `chooseAccountForAgent` filters both
+  // `eligibleAccounts` and `autoPick` on `signedInIds`, and this same card renders "Not signed in —
+  // this account cannot receive agents" (roborev 65221).
+  it("marks a signed-OUT account out of rotation, agreeing with its own banner", async () => {
     const { deps } = routableDeps([acct("blocked", { nickname: "Dead" })], [neverLoggedIn("blocked")]);
     render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
 
     // The card really is rendering the cannot-receive banner…
     expect(await screen.findByText(/Not signed in — this account cannot receive agents/)).toBeTruthy();
-    // …so the routing label must not contradict it.
-    const label = screen.getByTestId("account-active-state-blocked");
-    expect(label.textContent).not.toMatch(/may run here/i);
-    expect(label.textContent).toBe("Not taking new agents");
+    // …and the dot above it agrees, in the founder's own two words.
+    expect(screen.getByTestId("account-rotation-blocked").textContent).toMatch(/out of rotation/);
+    expect(screen.getByTestId("account-rotation-reason-blocked").textContent).toBe("not signed in");
   });
 
   // A STORED PREFERENCE CAN OUTLIVE THE LOGIN IT POINTED AT. Nothing clears it when an account's
   // identity goes away — `handleActivate` checks eligibility at CLICK time only — and
-  // `usablePreferredAccount` then drops that preference from routing. So the card would read the
-  // unqualified "Active — new agents run here" directly above its own "cannot receive agents"
-  // banner: the same contradiction as the automatic case, in the loudest possible wording
-  // (roborev 65223).
-  it("does not call a signed-OUT account Active even when the preference still points at it", async () => {
+  // `usablePreferredAccount` then drops that preference from routing. The card must not claim
+  // anything the router has already discarded (roborev 65223).
+  it("does not announce an override onto an account that is signed OUT", async () => {
     const { deps, state } = routableDeps([acct("blocked", { nickname: "Dead" })], [neverLoggedIn("blocked")]);
     state.preferred = "blocked"; // the preference survived; the login did not
     render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
 
     expect(await screen.findByText(/Not signed in — this account cannot receive agents/)).toBeTruthy();
-    const label = screen.getByTestId("account-active-state-blocked");
-    expect(label.textContent).not.toBe("Active — new agents run here");
-    expect(label.textContent).toBe("Not taking new agents");
+    expect(screen.getByTestId("account-rotation-blocked").textContent).toMatch(/out of rotation/);
+    // The header applies the SAME gate the spawn path does, so it does not announce an override that
+    // is not in force. Without this the loudest line on the screen would be the wrong one.
+    expect(screen.getByTestId("accounts-header").textContent).not.toContain("Manual override");
   });
 
-  it("the Active indicator and the default tag are distinct (active is not standing in for default)", async () => {
+  it("the rotation dot and the default tag are distinct (neither stands in for the other)", async () => {
     const { deps } = routableDeps([acct("a", { nickname: "Personal", isDefault: true })], [signedIn("a")]);
     render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
     fireEvent.click(within(await screen.findByTestId("account-row-a")).getByText("Manual Override"));
-    // The active-state line and the separate `default` tag both render, so neither stands in for the
-    // other (the confusion the removed "primary" badge used to cause with an exhausted default).
-    expect((await screen.findByTestId("account-active-state-a")).textContent).toBe(
-      "Active — new agents run here",
-    );
+    // Both render, so neither is standing in for the other — the confusion the removed "primary"
+    // badge used to cause with an exhausted default.
+    await waitFor(() => expect(screen.getByText("Back to automatic")).toBeTruthy());
+    expect(screen.getByTestId("account-rotation-a").textContent).toMatch(/in rotation/);
     expect(screen.getByText("default")).toBeTruthy();
   });
 
@@ -2252,19 +3024,11 @@ describe("AccountsScreen — activation", () => {
     fireEvent.click(await screen.findByText("Back to automatic"));
 
     expect(state.preferred).toBeUndefined();
-    // What this test is ABOUT is the preference being cleared, so assert the card stops claiming to
-    // be the override target — NOT the exact non-primary string. Pinning that string here locked in
-    // a label that is false for the state this test creates (a single account, automatic mode, so it
-    // receives 100% of new spawns), which would have made the wording uncorrectable without the
-    // suite going red for the wrong reason (roborev 65216).
-    await waitFor(() =>
-      expect(screen.getByTestId("account-active-state-a").textContent).not.toBe(
-        "Active — new agents run here",
-      ),
-    );
-    expect(screen.getByTestId("account-active-state-a").textContent).not.toMatch(
-      /not taking new agents/i,
-    );
+    // The control returns to offering the override, and the header stops announcing one — asserted
+    // on the SCREEN rather than only on the state, since a lever that writes correctly while the UI
+    // keeps showing the old answer is the failure this pair exists to catch.
+    await waitFor(() => expect(screen.getByText("Manual Override")).toBeTruthy());
+    expect(screen.getByTestId("accounts-header").textContent).not.toContain("Manual override");
   });
 
   it("…and the pins the activation wrote, or nothing actually goes back to automatic", async () => {
@@ -2449,12 +3213,18 @@ describe("AccountsScreen — activation", () => {
     expect(cardB.match(/Improve Sparkle/g) ?? []).toHaveLength(1);
   });
 
-  it("says an account is empty rather than leaving the question unanswered", async () => {
+  it("renders nothing at all for an account with nothing running on it", async () => {
+    // "Nothing is running on this account right now." went with the routing label above it — the
+    // founder named both in the same breath ("let's just delete those two lines"). An empty list
+    // rendering as nothing says the same thing without a line, and this is the paired negative for
+    // the running-agents tests above: without it, "renders the list" could be satisfied by a
+    // component that renders the list AND a sentence contradicting it.
     const { deps } = routableDeps([acct("a", { nickname: "Personal" })], [signedIn("a")]);
     render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
-    expect((await screen.findByTestId("account-routing-a")).textContent).toContain(
-      "Nothing is running on this account right now.",
-    );
+    const routing = await screen.findByTestId("account-routing-a");
+    expect(routing.textContent).not.toContain("Nothing is running");
+    expect(routing.textContent).not.toContain("Running agents");
+    expect(routing.textContent?.trim()).toBe("");
   });
 
   it("no longer shows the mounted-panes coverage caption (removed in the overhaul)", async () => {
@@ -2538,10 +3308,10 @@ describe("AccountsScreen — the sticky consumers", () => {
 
     // The concierge is still listed on `a`, and no pin was written for it. Moving it mid-
     // conversation nulls both session pointers and re-probes, which is why it gets its own control.
+    // The override really did land on `b` — without waiting for that, the assertions below would
+    // describe a screen where nothing happened yet and pass for the wrong reason.
     await waitFor(() =>
-      expect(screen.getByTestId("account-active-state-b").textContent).toBe(
-        "Active — new agents run here",
-      ),
+      expect(within(screen.getByTestId("account-row-b")).getByText("Back to automatic")).toBeTruthy(),
     );
     expect(screen.getByTestId("account-routing-a").textContent).toContain("Concierge");
     expect(screen.getByTestId("account-routing-b").textContent).not.toContain("Concierge");

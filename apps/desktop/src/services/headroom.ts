@@ -254,6 +254,24 @@ export function bestHealthyTarget(
     for (const sib of siblingIds.get(id) ?? [id]) excluded.add(sib);
   }
 
+  // THE ROTATION OPT-OUT IS DELIBERATELY *NOT* CONSULTED HERE, and that is a correction of an earlier
+  // cut of this branch which excluded opted-out accounts from this oracle.
+  //
+  // Excluding here BLOCKS, and every other consumer of `outOfRotationIds` DEMOTES — the invariant the
+  // routing suite calls the single most important property of the feature: an opt-out must never be
+  // able to stop the app spawning. This function has no least-bad fallback, it returns null, and it
+  // feeds four consumers including the advisory banner a human accepts by hand and the stranded-helper
+  // rescue (neither of which writes the fleet preference at all). So with the fleet walled on A and B
+  // the only healthy account but opted out, excluding it produced: no banner, no rescue, the in-flight
+  // plan retired — a fleet stranded on a dead account with nothing on screen offering the escape it
+  // used to offer. That is a worse failure than the one the exclusion was reaching for.
+  //
+  // The failure it WAS reaching for — an automatic switch naming an opted-out account, whose
+  // preference is then inert while running panes migrate anyway — is closed at the write instead:
+  // every write of the fleet preference now routes through `recordActivation`, which puts the target
+  // back in rotation. See `useAccountSwitch.recordActivation`. One rule, no inert preferences, and
+  // this oracle stays a pure function of its arguments rather than mixing a snapshot up to
+  // HEADROOM_POLL_MS old with a live localStorage read.
   const candidates = accounts
     .filter((a) => signedIn.has(a.id) && !excluded.has(a.id))
     .map((a) => ({

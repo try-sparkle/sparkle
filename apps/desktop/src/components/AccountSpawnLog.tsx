@@ -42,6 +42,10 @@ const REASON_LABEL: Record<SelectionReason, string> = {
   // "you activated this account", not "pinned": the founder chose it for the whole fleet, and the
   // ledger's job here is to show him that his choice was actually in force at this spawn.
   preferred: "your activated account",
+  // Not "you chose this account" — you chose to STOP CHOOSING, and this is where that left the fleet.
+  // Added with the `paused` SelectionReason on this branch; `Record<SelectionReason, string>` is what
+  // makes the pair impossible to forget.
+  paused: "rotation paused — frozen here",
   // Says WHY it outranked a lower usage tally, because that is the surprising part: this account was
   // not the cheapest, it is the one holding the agent's conversation. Picking any other starts the
   // agent blank.

@@ -66,12 +66,14 @@ import {
   signedInAccountIds,
   loginSiblingIds,
   getPreferredAccountId,
-  setPreferredAccountId,
+  clearPreferredAccount,
   type Account,
   type Identity,
   type Usage,
   type PickOptions,
 } from "../services/accountStore";
+import { markRescuedOnto, rescuedOntoIds, rotationOutIds } from "../services/rotationState";
+import { recordPreference } from "../hooks/useAccountSwitch";
 import { C, FONT_WEIGHT, ON_BRAND_FILL_DARK } from "../theme/colors";
 import { ClaudeSignIn } from "./ClaudeSignIn";
 
@@ -308,15 +310,91 @@ export function ReadinessGate({ children }: { children: ReactNode }) {
 }
 
 /** Move the fleet-wide preference onto a healthy account so future spawns stop landing on the expired
- *  default. Reuses `setPreferredAccountId` (the "Activate this account" lever) — no new switch logic —
+ *  default. Reuses `recordPreference` (the durable half of the "Activate this account" lever, minus its
+ *  fleet-wide pin sweep) — no new switch logic —
  *  and does nothing when the current preference already names a usable account, so a choice the user
  *  made on purpose is never overwritten. `alternatives` are already the eligible non-default accounts;
  *  `pickAccount` orders them lowest-usage-first exactly as a real spawn would. */
-function ensureUsablePreferred(alternatives: Account[], usage: Usage[], base: PickOptions): void {
+/** EXPORTED FOR ITS TEST, and the export earns itself: this is a silent write on an automatic path,
+ *  so the only way to see it go wrong is to call it — which is how it shipped for a while both
+ *  ignoring the rotation opt-out on the way in AND able to name an opted-out account on the way out. */
+export function ensureUsablePreferred(
+  alternatives: Account[],
+  usage: Usage[],
+  base: PickOptions,
+): void {
+  // THE ROTATION OPT-OUT IS PART OF "usable" HERE TOO, in both directions, and it was in neither.
+  //
+  // An opted-out `current` used to read as "already usable → leave it", so the rescue did not even
+  // try to re-point; and the pick below ran without `outOfRotationIds`, so it could NAME an
+  // opted-out account — producing exactly the inert preference the rest of this feature is built to
+  // make impossible (`usablePreferredAccount` declines it on every spawn, so the "keep the app
+  // working" steer silently did nothing and the fleet stayed on the expired default).
+  const takenOut = rotationOutIds();
   const current = getPreferredAccountId();
-  if (current && alternatives.some((x) => x.id === current)) return; // already usable → leave it
-  const best = pickAccount(alternatives, usage, base);
-  if (best) setPreferredAccountId(best.id);
+  if (current && !takenOut.has(current) && alternatives.some((x) => x.id === current)) return;
+  const best = pickAccount(alternatives, usage, { ...base, outOfRotationIds: takenOut });
+  // NOTHING TO RESCUE WHEN THE PREFERENCE ALREADY NAMES THE PICK, and this guard is what keeps the
+  // kebab's "Take out of rotation" from being a toggle that cannot hold.
+  //
+  // `probe()` re-runs on EVERY window focus. In the common two-account install — an expired default
+  // and one alternative `b` — the gate writes `b`, the user takes `b` out, alt-tabs away and back,
+  // and without this: the early return no longer applies (the preference is opted out), `pickAccount`
+  // DEMOTES rather than blocks so it returns `b` again (the only alternative), and `recordPreference`
+  // puts `b` straight back in rotation. No gesture behind the revision and no bound on the
+  // repetition — the control reverts itself on focus, indefinitely, for as long as the default stays
+  // expired.
+  //
+  // ── NOTHING TO RESCUE ONTO ───────────────────────────────────────────────────────────────────
+  // The guard has to key on the PICK being opted out, not on it matching `current`, or it does not
+  // hold. `pickAccount` DEMOTES rather than blocks, so with one alternative it returns that account
+  // however the user has marked it — and an earlier cut keyed on `best?.id === current`, which is
+  // false the moment the preference is cleared. That merely delayed the loop by one focus event:
+  //
+  //   focus 2 — current "b", pick "b" → matched, cleared the preference
+  //   focus 3 — current undefined, pick still "b" → no longer matches → wrote it back AND
+  //             `recordPreference` put "b" back in rotation
+  //
+  // `probe()` runs on every window focus for as long as the default stays expired, so the user's
+  // kebab click survived exactly one alt-tab. Keying on the opt-out is stable: there is no state in
+  // which this writes an account the user has taken out.
+  //
+  // The preference is still CLEARED when it names an opted-out account, because leaving one is the
+  // inert-preference state this codebase declares impossible in two places — one of which
+  // (`headroom.bestHealthyTarget`) leans on that claim to justify not consulting the opt-out itself.
+  // Selection then auto-picks, where the account is merely demoted, which is what the user asked for.
+  if (best && takenOut.has(best.id)) {
+    // ONCE, NOT NEVER, AND NOT EVERY TIME. Declining outright was tried and it strands the fleet on
+    // the expired default: `leastBad` runs only when `candidates` is EMPTY, and at
+    // `chooseAccountForAgent` the lapsed default is still a candidate (recorded email, no wall, no
+    // live-spent row), so the opted-out alternative is filtered out and every agent opens on a login
+    // prompt. Rescuing every time was also tried and it re-clears the opt-out on every window focus,
+    // so the kebab click cannot hold. See `rescuedOnto`.
+    if (rescuedOntoIds().has(best.id)) {
+      // We already steered here once and the user answered by taking it out again. That is a
+      // deliberate second statement and it stands — even though the fleet will now land on the
+      // expired default, which is at least VISIBLE (that card renders its own Reconnect button).
+      if (current && takenOut.has(current)) clearPreferredAccount();
+      return;
+    }
+    // ORDER MATTERS: `recordPreference` puts the account back in rotation, and that clears this
+    // account's rescue memory (so a deliberate human put-back starts a fresh episode). Marking after
+    // it is what lets the rescue's own write keep its mark.
+    recordPreference(best.id);
+    markRescuedOnto(best.id);
+    return;
+  }
+  // Already naming the pick — the rescue's job is done, there is nothing to move it to.
+  if (best?.id === current) return;
+  // Through the shared helper, so the preference and the account's rotation membership are written
+  // together — the invariant `headroom.bestHealthyTarget` now leans on. `pickAccount` DEMOTES rather
+  // than blocks, so `best` can still be an opted-out account when it is the only one left; putting it
+  // back in rotation is what keeps that honest instead of inert.
+  // NO MARK ON THIS PATH. It steers onto an account the user has said nothing about, which is not
+  // the rescue-over-an-opt-out the memory is for — and spending the one-shot here meant the user's
+  // FIRST kebab click was read as their second, so the very next focus declined and the fleet
+  // stranded on the expired default. Permanently, since nothing clears the memory.
+  if (best) recordPreference(best.id);
 }
 
 /** Name the probed (default) account from the account store's verified identity. Prefers the store

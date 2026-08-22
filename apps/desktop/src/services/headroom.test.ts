@@ -1,6 +1,7 @@
-import { describe, it, expect } from "vitest";
+import { afterEach, describe, it, expect } from "vitest";
 import {
   assessHeadroom,
+  bestHealthyTarget,
   switchRecommendation,
   describeRecommendation,
   rotationReadiness,
@@ -11,8 +12,13 @@ import {
 } from "./headroom";
 import { accountDisplay, CEILING_AVOID_FRACTION, LIVE_AVOID_PERCENT } from "./accountStore";
 import type { Account, Usage, Identity } from "./accountStore";
+import { setAccountInRotation, ROTATION_OUT_STORAGE_KEY } from "./rotationState";
 
 const NOW = 1_000_000;
+
+// The opt-out persists in localStorage by design (the spawn path reads it and is not React), so a
+// test that sets one would otherwise leak into its neighbours.
+afterEach(() => localStorage.removeItem(ROTATION_OUT_STORAGE_KEY));
 
 function acct(id: string, over: Partial<Account> = {}): Account {
   return { id, nickname: id, configDir: `/cfg/${id}`, isDefault: false, createdAt: 0, ...over };
@@ -763,5 +769,37 @@ describe("exhaustionOutlook (AC8)", () => {
     );
     expect(got.allAtLimit).toBe(false);
     expect(got.earliestReset).toBeNull();
+  });
+});
+
+describe("bestHealthyTarget — the AUTOMATIC switch's choice", () => {
+  const ACCOUNTS = [acct("a"), acct("b")];
+  const USAGE = [usage("a", 10), usage("b", 10)];
+  const IDENTS = [ident("a"), ident("b")];
+
+  // ── THE OPT-OUT DEMOTES; IT DOES NOT BLOCK — HERE TOO ────────────────────────────────────────
+  // An earlier cut of this branch excluded opted-out accounts from this oracle, and it was wrong in
+  // the most expensive direction. This function has no least-bad fallback — it returns null — and it
+  // feeds the advisory banner a human accepts by hand and the stranded-helper rescue, neither of
+  // which writes the fleet preference. So with the fleet walled on `a` and `b` the only healthy
+  // account but opted out, excluding it produced no banner, no rescue, and a retired plan: a fleet
+  // stranded on a dead account with nothing on screen offering the escape it used to offer.
+  //
+  // The failure that exclusion reached for is closed at the WRITE instead — every preference write
+  // routes through `recordActivation`, which puts the target back in rotation, so an inert
+  // preference cannot exist. This asserts the oracle stays out of it.
+  it("still offers an opted-out account as an escape rather than stranding the fleet", () => {
+    setAccountInRotation("b", false);
+    expect(bestHealthyTarget(ACCOUNTS, USAGE, [], IDENTS, NOW, [], ["a"])?.id).toBe("b");
+  });
+
+  it("is decidable from its arguments alone", () => {
+    // The other half of the same correction: callers pass a snapshot up to HEADROOM_POLL_MS old, so
+    // mixing in a live localStorage read made the answer depend on when it was called rather than on
+    // what it was given. Same inputs, same answer, whatever the stored state says.
+    setAccountInRotation("b", false);
+    const withOptOut = bestHealthyTarget(ACCOUNTS, USAGE, [], IDENTS, NOW, [], ["a"])?.id;
+    setAccountInRotation("b", true);
+    expect(bestHealthyTarget(ACCOUNTS, USAGE, [], IDENTS, NOW, [], ["a"])?.id).toBe(withOptOut);
   });
 });
