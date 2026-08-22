@@ -20,6 +20,7 @@ import { refreshRoborevAuth, backfillImprovementConsentMirror } from "./services
 import { pollMemoryAdmission } from "./services/agentCapacity";
 import { MEMORY_ADMISSION_POLL_MS } from "./services/memoryAdmission";
 import { refreshAgentWatchdog } from "./services/agentMemoryWatchdog";
+import { recordPeakConcurrency } from "./services/peakConcurrency";
 import { safeUnlisten } from "./services/safeUnlisten";
 import {
   AppBoot,
@@ -653,6 +654,28 @@ export function App() {
       // throws (older backends reject the command every tick). Shares this one interval — no new
       // thread — because the two are the same cadence and the same "watch the machine" job.
       void refreshAgentWatchdog();
+      // THE PERSISTENT RECORD (docs/peak-concurrency.md). Everything above this line MEASURES and
+      // then throws the reading away — the admission sample expires in 15s, the watchdog report is
+      // replaced wholesale on the next tick, and neither survives a relaunch. **This call is the
+      // only thing in the app that ever writes a peak or a memory observation DOWN**, which is why
+      // it exists at all: before it, nothing recorded how many agents had ever run at once, so
+      // every number anyone quoted was a recollection, and the per-agent RSS the watchdog is
+      // already computing was discarded 17,280 times a day rather than accumulated into the
+      // distribution that would let the ceiling's assumed divisor be re-grounded.
+      //
+      // The sample carries the watchdog report's per-agent tree RSS through to Rust, because
+      // running `agent_footprints`' uncached `ps -axo` a second time every 5s is the cost its own
+      // doc comment warns about. NOTE the ordering above is INCIDENTAL, not a guarantee: the
+      // watchdog call is `void`-ed and writes its store only after awaiting its own IPC, while
+      // this call builds its payload synchronously on entry — so the RSS half is ALWAYS the
+      // previous tick's report no matter which line comes first, exactly as peakConcurrency.ts's
+      // header states. Do not "fix" a staleness bug by re-ordering these two; it changes nothing.
+      // Each report is folded at most once (the watchdog store's `seq`), so a stalled watchdog
+      // repeats a reading rather than compounding it. It shares
+      // this interval for the same reason the watchdog does — same cadence, same "watch the
+      // machine" job, no new thread. Fire-and-forget: it never throws, and an older backend
+      // without the command rejects on every tick.
+      void recordPeakConcurrency();
     };
     tick(); // don't make the first reading wait a whole interval
     const id = window.setInterval(tick, MEMORY_ADMISSION_POLL_MS);

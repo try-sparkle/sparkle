@@ -828,7 +828,7 @@ pub fn install_sampler(s: Box<dyn MemorySampler>) -> bool {
     SAMPLER.set(s).is_ok()
 }
 
-fn sampler() -> &'static dyn MemorySampler {
+pub(crate) fn sampler() -> &'static dyn MemorySampler {
     SAMPLER.get_or_init(|| Box::new(SystemSampler)).as_ref()
 }
 

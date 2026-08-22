@@ -33,6 +33,7 @@ import {
   isStateScope,
 } from "@sparkle/core";
 import { safeUnlisten } from "./safeUnlisten";
+import { peakSummary, type PeakSummary } from "./peakConcurrency";
 import { startControlBridge, controlRespond } from "./orchestrationLaunch";
 import { useProjectStore } from "../stores/projectStore";
 import { useAppOwnedAgentStore } from "../stores/appOwnedAgentStore";
@@ -1183,6 +1184,22 @@ function handleGetState(req: ControlRequest): {
   statusFilter: Record<StatusBand, boolean>;
   /** Text size PER COLUMN — see handleSetZoom for why this is a map and not a number. */
   zoomByColumn: Record<ZoomColumn, number>;
+  /** THE PERSISTENT CONCURRENCY + PER-AGENT MEMORY RECORD (docs/peak-concurrency.md), so the
+   *  concierge can quote the peak without shelling out to `scripts/peak-concurrency.sh`.
+   *
+   *  A SYNCHRONOUS cached read (`currentPeakRecord` behind `peakSummary`), because this handler is
+   *  synchronous; the 5s tick is what keeps the cache fresh. Flat and ~13 scalars: this reply is the
+   *  single largest thing the control API puts in a context window and it is PERMANENT, so the
+   *  129-bucket histogram and the 720-entry hourly series stay out of it.
+   *
+   *  TWO FLAGS, and a reader must branch on both. `observed: false` means NO PEAK HAS BEEN RECORDED
+   *  — say exactly that, never "the peak is 0"; a peak of zero agents is a thing that never happens,
+   *  and reporting one is how a real 41 gets contradicted by a fresh install. `agentRssObserved:
+   *  false` says the same about the memory block. And `meanProcsPerAgent` is the per-process tell
+   *  (`sparkle-mjmuj`): an agent is a process TREE at ~1.95 processes, so a value near 1.0 means
+   *  per-process data got in and the RSS figures beside it are wrong — say so rather than quoting
+   *  them. */
+  concurrency: PeakSummary;
 } {
   const { projects } = useProjectStore.getState();
   const status = useRuntimeStore.getState().status;
@@ -1233,6 +1250,12 @@ function handleGetState(req: ControlRequest): {
       models: getModelCatalog().map((m) => m.id),
       statusFilter: ui.statusFilter,
       zoomByColumn: ui.zoomByColumn,
+      // ON THIS SCOPE TOO. "fleet" returns from its own early exit, so a field added only at the
+      // bottom of the function would be present on some scopes and absent on others — and a caller
+      // that read it once and then asked a different scope would see it vanish, which reads as "no
+      // peak recorded" rather than as "you asked the wrong scope". The record is app-global; no
+      // scope narrows it.
+      concurrency: peakSummary(),
     };
   }
 
@@ -1551,6 +1574,9 @@ function handleGetState(req: ControlRequest): {
     statusFilter: ui.statusFilter,
     // PER COLUMN — there is no single zoom any more. See handleSetZoom.
     zoomByColumn: ui.zoomByColumn,
+    // The persistent peak + per-agent memory summary — see the field's note on the return type. The
+    // "fleet" early return above carries it too, deliberately: app-global, so no scope narrows it.
+    concurrency: peakSummary(),
   };
 }
 

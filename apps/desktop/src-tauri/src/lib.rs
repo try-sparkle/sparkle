@@ -83,6 +83,7 @@ mod model;
 mod model_catalog;
 mod naming;
 mod onepassword;
+mod peak_concurrency;
 mod pr_claims;
 mod pr_dismissal;
 mod pr_owner;
@@ -1209,6 +1210,11 @@ pub fn run() {
             agent_goal_record::write_agent_goal_record,
             agent_goal_record::list_agent_goal_records,
             agent_goal_record::delete_agent_goal_record,
+            // The persistent concurrency + per-agent-memory record (docs/peak-concurrency.md):
+            // nothing else in the app writes a peak down, and one that resets on relaunch is
+            // worthless. MEASURES ONLY — it changes no ceiling (sparkle-mjmuj).
+            peak_concurrency::record_agent_concurrency,
+            peak_concurrency::agent_concurrency_peak,
             hooks::ensure_default_plugins_installed,
             hooks::plugin_install_outcomes,
             hooks::read_events_since,

@@ -19,6 +19,12 @@ import { useAppOwnedAgentStore } from "../stores/appOwnedAgentStore";
 // in sparkleBusy.test.ts, so standing this in tests the contract rather than restating it.
 import { sparkleActivityLine } from "./sparkleBusy";
 import { ZOOM_COLUMNS } from "../engine/columnZoom";
+// The persistent concurrency + per-agent memory record (docs/peak-concurrency.md). The unit
+// behaviour lives in peakConcurrency.test.ts; what this file owns is that `get_state` PUBLISHES it,
+// on every scope — the "fleet" scope returns from its own early exit, so a field added at the bottom
+// of the handler is present on four scopes and missing on the fifth.
+import { refreshPeakRecord, resetPeakConcurrency } from "./peakConcurrency";
+import peakFixture from "../../../../scripts/tests/fixtures/peak-concurrency.json";
 import { LIFECYCLE_OPS } from "./conciergeTools/lifecycle";
 import { SCREENSHOT_OPS } from "./conciergeTools/screenshot";
 
@@ -48,6 +54,8 @@ interface InboxSendArgs {
 const inboxSends: InboxSendArgs[] = [];
 /** Set to make the next `inbox_send` reject, standing in for a full recipient inbox. */
 let inboxSendError: string | null = null;
+/** What `agent_concurrency_peak` answers. `null` = a backend that has recorded nothing. */
+let peakRecordReply: unknown = null;
 const invokeMock = vi.fn(async (cmd: string, args?: unknown) => {
   switch (cmd) {
     case "start_control_bridge":
@@ -69,6 +77,11 @@ const invokeMock = vi.fn(async (cmd: string, args?: unknown) => {
       inboxSends.push(args as InboxSendArgs);
       if (inboxSendError) throw new Error(inboxSendError);
       return `msg-${inboxSends.length}`;
+    // The persistent concurrency record (docs/peak-concurrency.md). `null` stands in for a backend
+    // that has never been read — services/peakConcurrency refuses to cache a payload that isn't
+    // shaped like a record, so the default leaves `get_state`'s block reporting `observed: false`.
+    case "agent_concurrency_peak":
+      return peakRecordReply;
     default:
       return undefined;
   }
@@ -363,6 +376,97 @@ describe("controlListener", () => {
     expect(caller).toMatchObject({ name: expect.any(String), kind: "build", status: "working", parentId: null, activity: null });
     const worker = res.agents.find((a) => a.id === otherId)!;
     expect(worker).toMatchObject({ kind: "worker", parentId: callerId, status: "waiting" });
+  });
+
+  // ── THE PERSISTENT CONCURRENCY + PER-AGENT MEMORY RECORD ──────────────────────────────────────
+  //
+  // docs/peak-concurrency.md. `get_state` is how the concierge quotes the peak without shelling out
+  // to scripts/peak-concurrency.sh, and the failure this guards is structural rather than numeric:
+  // scope "fleet" returns from its OWN early exit ~60 lines above the main return, so a field added
+  // once at the bottom is present on four scopes and silently absent on the fifth. A caller that
+  // read the block on `active` and then asked `fleet` would see it vanish — indistinguishable, from
+  // the caller's seat, from "no peak recorded".
+  describe("get_state — the concurrency block", () => {
+    const SCOPES = ["active", "all", "self", "project", "fleet"] as const;
+
+    afterEach(() => {
+      peakRecordReply = null;
+      // Module-level cache: without this a record read here would leak into every later case in
+      // this file (and into whatever runs next in this worker).
+      resetPeakConcurrency();
+    });
+
+    it("carries `concurrency` on EVERY scope, fleet included", async () => {
+      for (const [i, scope] of SCOPES.entries()) {
+        fire({ reqId: `pc${i}`, op: "get_state", callerAgentId: callerId, payload: { scope } });
+        await flush();
+        const res = lastReply() as { concurrency?: Record<string, unknown> };
+        // Named in the assertion message, so a failure says WHICH scope dropped it rather than
+        // sending the reader back to count return statements.
+        expect(res.concurrency, `scope ${scope}`).toBeDefined();
+        expect(res.concurrency, `scope ${scope}`).toMatchObject({
+          observed: expect.any(Boolean),
+          peakProcesses: expect.any(Number),
+          peakAtIso: expect.any(String),
+          agentRssObserved: expect.any(Boolean),
+          meanProcsPerAgent: expect.any(Number),
+          live: expect.any(Number),
+          used: expect.any(Number),
+          limit: expect.any(Number),
+          basis: expect.any(String),
+        });
+      }
+    });
+
+    it("says NOT OBSERVED before anything has been read — never 'the peak is 0'", async () => {
+      fire({ reqId: "pcN", op: "get_state", callerAgentId: callerId, payload: { scope: "all" } });
+      await flush();
+      const c = (lastReply() as { concurrency: Record<string, unknown> }).concurrency;
+      // `peakProcesses: 0` is only readable as "nothing has been observed yet" BECAUSE the flag is
+      // there beside it. A peak of zero agents is a thing that never happens, so a reader without
+      // the flag would report a fresh install as contradicting a real recorded 41.
+      expect(c.observed).toBe(false);
+      expect(c.peakProcesses).toBe(0);
+      expect(c.peakAtIso).toBe("");
+      expect(c.agentRssObserved).toBe(false);
+    });
+
+    it("publishes the cached record's peak on every scope once one has been read", async () => {
+      // Driven through the REAL read path against the canonical fixture — the same bytes the Rust
+      // and shell suites parse — rather than by reaching into the cache.
+      peakRecordReply = peakFixture;
+      await refreshPeakRecord();
+
+      for (const [i, scope] of SCOPES.entries()) {
+        fire({ reqId: `pcF${i}`, op: "get_state", callerAgentId: callerId, payload: { scope } });
+        await flush();
+        const c = (lastReply() as { concurrency: Record<string, unknown> }).concurrency;
+        expect(c.observed, `scope ${scope}`).toBe(true);
+        expect(c.peakProcesses, `scope ${scope}`).toBe(41);
+        expect(c.peakAtIso, `scope ${scope}`).toBe("2026-08-22T18:40:00Z");
+        // ~1.95 processes per agent. NEAR 1.0 would mean per-process data got in and the RSS
+        // figures beside it are wrong (`sparkle-mjmuj`).
+        expect(c.meanProcsPerAgent, `scope ${scope}`).toBe(1.95);
+        expect(c.agentRssObserved, `scope ${scope}`).toBe(true);
+        expect(c.agentRssP50Bytes, `scope ${scope}`).toBe(1_308_622_848);
+      }
+    });
+
+    it("stays FLAT — the histogram and the hourly series never reach the wire", async () => {
+      peakRecordReply = peakFixture;
+      await refreshPeakRecord();
+      fire({ reqId: "pcFlat", op: "get_state", callerAgentId: callerId, payload: { scope: "self" } });
+      await flush();
+      const c = (lastReply() as { concurrency: Record<string, unknown> }).concurrency;
+      // This reply is the single largest thing the control API puts in a context window and it is
+      // PERMANENT. 129 histogram buckets plus up to 720 hourly entries would dwarf the roster.
+      expect(c).not.toHaveProperty("hist");
+      expect(c).not.toHaveProperty("hourly");
+      expect(c).not.toHaveProperty("peak");
+      for (const v of Object.values(c)) expect(["number", "string", "boolean"]).toContain(typeof v);
+      // The SPAN is published as a count instead, which is what a reader actually wants to know.
+      expect(c.hourlySpanHours).toBe(2);
+    });
   });
 
   // ONE AGENT, ONE NAME. `get_state` named rows off `agent.name` while the concierge's needs-you
