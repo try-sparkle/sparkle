@@ -86,11 +86,18 @@ const read = (rel: string) => readFileSync(resolve(here, rel), "utf8");
  *  list never had:
  *
  *    PropertyAccessExpression  `deps.calmStatus`      — the `.name` is a MEMBER, not a binding
- *    QualifiedName             `Foo.calmStatus`       — same, in type space
  *    PropertyAssignment        `{ calmStatus: x }`    — an object-literal KEY
  *    ShorthandPropertyAssignment `{ calmStatus }`     — a key AND a use; the binding is elsewhere
  *    JsxAttribute              `<X calmStatus={…} />` — an attribute name
  *    PropertySignature / MethodSignature              — TYPE members, no runtime binding
+ *
+ *  A QUALIFIED NAME (`Foo.calmStatus`, in type space) was on this list and has been REMOVED, not
+ *  because it should count but because the entry could never fire: `ts.QualifiedName` is
+ *  `{ left, right }` and carries no `.name` at all, so it is rejected one line earlier by the
+ *  `p.name !== id` guard. An unreachable exclusion is worse than no exclusion — its test case passed
+ *  for an unrelated reason, so "delete an entry and its case reds" was true of six entries and
+ *  quietly false of the seventh. That is the exact vacuity the classifier suite was added to end,
+ *  reproduced inside it.
  *
  *  ⚠️ AND A PARAMETER IN A TYPE POSITION IS NOT A BINDING EITHER. `type P = { onCalm: (calmStatus:
  *  Map) => void }` parses to a real `ts.Parameter`, and counting it would red this guard on an
@@ -122,7 +129,6 @@ function isDeclaredHere(id: ts.Identifier): boolean {
   if (p === undefined || p.name !== id) return false;
   if (
     ts.isPropertyAccessExpression(p) ||
-    ts.isQualifiedName(p) ||
     ts.isPropertyAssignment(p) ||
     ts.isShorthandPropertyAssignment(p) ||
     ts.isJsxAttribute(p) ||
@@ -287,7 +293,9 @@ describe("bindingsOf — what counts as declaring the name", () => {
     // Each of these carries a `.name` that is this identifier while naming something that is NOT a
     // new binding — the exclusion list. Delete an entry and its case here reds.
     ["a member access", "use(deps.calmStatus);"],
-    ["a qualified name in type space", "let x: Foo.calmStatus;"],
+    // Pins the `p.name !== id` GUARD, not an exclusion — `ts.QualifiedName` is `{ left, right }`
+    // and has no `.name`, so it never reaches the list. Labelled for what it actually tests.
+    ["a qualified name in type space (rejected by the name guard, not the list)", "let x: Foo.calmStatus;"],
     ["an object-literal key", "const o = { calmStatus: 1 };"],
     ["a shorthand property USE", "const o = { calmStatus };"],
     ["a JSX attribute", "const el = <X calmStatus={y} />;"],
