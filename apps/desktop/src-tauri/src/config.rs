@@ -1512,6 +1512,13 @@ pub struct ReviewConfig {
     /// a future reviewer can be named here without a schema migration; any value that is not the
     /// word `none` means "a reviewer is expected", which is the fail-closed direction.
     pub pr_reviewer: String,
+    /// Whether a PR carrying NO review at all is refused rather than waved through.
+    ///
+    /// `false` by default, and the default is the decision: the coverage half only applies when at
+    /// least one review exists, so until this key is set, "never run the reviewer" is a free pass.
+    /// Measured the day it landed, 31 of 32 open PRs in this repo were in exactly that state, so
+    /// defaulting it on would have blocked the open fleet the moment it shipped.
+    pub require_review: bool,
 }
 
 impl ReviewConfig {
@@ -1529,6 +1536,29 @@ impl ReviewConfig {
     /// ON rather than silently off.
     pub fn has_no_pr_reviewer(&self) -> bool {
         self.pr_reviewer.trim().eq_ignore_ascii_case("none")
+    }
+
+    /// True when a PR with NO review must be REFUSED rather than waved through.
+    ///
+    /// SUBORDINATE TO [`Self::has_no_pr_reviewer`], and the caller must check that FIRST. A repo
+    /// nobody reviews cannot produce the review this would demand, so arming the key there would
+    /// make every PR permanently unmergeable — the opposite of what the `none` hatch is for.
+    ///
+    /// THE TYPO DIRECTION IS INVERTED relative to its sibling above, deliberately. There, anything
+    /// that is not `none` leaves the gate ON, because a misspelling must not silently DISARM a
+    /// gate. Here the key ARMS one, so nothing but the word `true` counts — a misspelling must not
+    /// silently start refusing every PR in a repo that never asked for it. One rule, both ways: a
+    /// typo may never change behaviour by accident.
+    ///
+    /// NO NORMALISATION TO DO, unlike its sibling. This is a TOML *boolean*, whose grammar admits
+    /// only the bare lowercase tokens `true` and `false` — `TRUE` and `"true"` are not booleans and
+    /// this `Option<bool>` refuses them outright. `scripts/probe-gate.sh` reads the file as text
+    /// rather than as TOML, so it compares against the exact string `true` and deliberately does
+    /// NOT case-fold: folding there would arm the gate on input this side rejects, which is the
+    /// two-implementations-disagree failure the shared corpus exists to prevent. Change one side
+    /// and you must change both.
+    pub fn requires_review(&self) -> bool {
+        self.require_review
     }
 }
 
@@ -1930,6 +1960,10 @@ impl Default for SparkleConfig {
                 // writes this key keeps its coverage gate. Keep in sync with the bash fallback
                 // passed by scripts/probe-gate.sh.
                 pr_reviewer: "knightwatch".to_string(),
+                // OFF: a repo that never writes this key keeps waving unreviewed PRs through,
+                // exactly as it did before the key existed. Keep in sync with the bash fallback
+                // passed by scripts/probe-gate.sh.
+                require_review: false,
             },
             // Pre-warm a small pool by default so the common fan-out spawn skips `git worktree add`.
             worktree_pool: WorktreePoolConfig { enabled: true, size: 2 },
@@ -2292,6 +2326,7 @@ struct PartialMention {
 #[derive(Debug, Default, Deserialize)]
 struct PartialReview {
     pr_reviewer: Option<String>,
+    require_review: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -2531,6 +2566,9 @@ fn apply_review(into: &mut ReviewConfig, p: Option<PartialReview>) {
     let Some(p) = p else { return };
     if let Some(v) = p.pr_reviewer {
         into.pr_reviewer = v;
+    }
+    if let Some(v) = p.require_review {
+        into.require_review = v;
     }
 }
 
@@ -5619,6 +5657,18 @@ auto_fast_forward         = true
 # not the word "none" — including a typo like "nonesuch" — means a reviewer IS expected.
 [review]
 pr_reviewer = "knightwatch"
+
+# Whether a PR that has NEVER been reviewed is refused too. Off by default: the convergence half
+# above only applies once at least one review exists, so until you set this, a PR nobody ever
+# reviewed merges freely — running the reviewer ONCE arms the gate for every later push, while
+# never running it leaves the PR ungated.
+#
+# Turning it on refuses an unreviewed PR and names a command the author can run themselves. It does
+# nothing where pr_reviewer = "none": a repo nobody reviews cannot be asked to produce a review.
+#
+# Only the exact word true arms it — the opposite leniency to pr_reviewer above, on purpose. A typo
+# there must not silently disarm a gate; a typo here must not silently arm one.
+require_review = false
 
 # --- Pre-warmed worktree pool (repo-scoped; overridable in a project file) --------------
 # The slow part of spawning an agent is `git worktree add`, which materializes the whole working
@@ -8718,7 +8768,7 @@ quit_app = 42
             ("nonesuch", false),
             ("", false),
         ] {
-            let cfg = ReviewConfig { pr_reviewer: value.to_string() };
+            let cfg = ReviewConfig { pr_reviewer: value.to_string(), require_review: false };
             assert_eq!(
                 cfg.has_no_pr_reviewer(),
                 expect_off,

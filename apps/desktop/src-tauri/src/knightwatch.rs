@@ -54,6 +54,11 @@
 //!
 //!   * NOT-APPLICABLE — the read SUCCEEDED and the PR carries no knightwatch comment at all
 //!     (`applicable: false`). Every non-Sparkle project is in this state and must merge freely.
+//!     ONE KEY OVERRIDES THAT, and only for the coverage half: with `[review].require_review` on,
+//!     `coverage_for_repo` turns this state into a REFUSAL, because a repo that asked to gate
+//!     unreviewed PRs is asking for exactly this case. It is still gated behind
+//!     `has_no_pr_reviewer` first, so a project with no reviewer keeps merging freely whatever the
+//!     key says — see the ordering note on `coverage_for_repo`. The probe half is untouched.
 //!   * UNKNOWN — the `gh` read FAILED, or came back saturated (`applicable: true, probes: None`).
 //!     This BLOCKS, consistent with the sibling roborev gate's "unknown blocks" doctrine, and it is
 //!     survivable because the override below exists.
@@ -996,9 +1001,24 @@ pub(crate) fn coverage_for_repo(
     gate: &ProbeGate,
     head: Option<&str>,
     no_pr_reviewer: bool,
+    require_review: bool,
 ) -> Coverage {
+    // THIS ARM STAYS FIRST, and `require_review` is exactly why it now matters. A repo with no
+    // PR-scoped reviewer cannot produce the review the arm below would demand — there is nobody to
+    // post it — so honouring `require_review` there would make every PR in that repo permanently
+    // unmergeable, which is the opposite of what the `none` hatch exists for. Asking "is anyone
+    // watching this repo at all?" before "did they show up on this PR?" keeps the hatch above the
+    // gate it is a hatch for. `scripts/probe-gate.sh`'s `compute_coverage` orders its guards the
+    // same way and says so in the same terms.
     if no_pr_reviewer {
         return Coverage::NotApplicable;
+    }
+    // NEVER REVIEWED AT ALL. `coverage` below reads this as `NotApplicable` — the deliberate
+    // departure documented on that variant — and until this key existed, that was the only
+    // answer. It is still the DEFAULT answer; `require_review` is what turns "nobody looked" from
+    // a free pass into a refusal, for a repo that has asked for that.
+    if !gate.applicable && require_review {
+        return Coverage::NotCovered(NEVER_REVIEWED_REASON.to_string());
     }
     coverage(gate, head)
 }
@@ -1008,6 +1028,17 @@ fn short_sha(sha: &str) -> String {
     sha.chars().take(7).collect()
 }
 
+/// Why a PR with NO review of any kind is refused when `[review].require_review` is on.
+///
+/// A CONSTANT RATHER THAN AN INLINE LITERAL because [`coverage_refusal`] compares against it to
+/// choose its headline: "has not converged" is advice about a review that EXISTS and has gone out
+/// of date, and printed at a PR nobody has ever reviewed it describes a sequence of events that
+/// never happened. Comparing against the same constant that produced the string makes that match
+/// exact by construction rather than by keeping two copies of the sentence in step.
+pub(crate) const NEVER_REVIEWED_REASON: &str =
+    "no review of any kind has been posted on this PR, so nothing has ever read this code. \
+     [review].require_review is on, which gates an unreviewed PR instead of waving it through";
+
 /// The refusal for an unreviewed head. Says what to do, and the remedy is one a caller can follow.
 ///
 /// THE REMEDY IS A PARAMETER, NOT A LITERAL. It used to name `/srosro-update-review` unconditionally
@@ -1015,6 +1046,19 @@ fn short_sha(sha: &str) -> String {
 /// printed for months. [`ReviewTrigger`] carries the answer for the reviewer this repo actually has.
 fn coverage_refusal(number: u64, reason: &str, trigger: ReviewTrigger) -> String {
     let clear_it = trigger.clear_it(number);
+    // TWO HEADLINES, ONE REMEDY. `clear_it` is right for both — running the reviewer is what
+    // clears an unreviewed PR and a moved head alike — but the paragraph between them is not.
+    if reason == NEVER_REVIEWED_REASON {
+        return format!(
+            "Merge blocked: PR #{number} is UNREVIEWED — no review has ever been posted on \
+             it.\n\n  {reason}\n\n\
+             This is not \"the review is out of date\"; there is no review. Nothing has read this \
+             diff, so nothing has had the chance to object to it.\n\n\
+             To clear this, {clear_it}. Then merge again.\n\
+             To merge anyway, supply a knightwatch override reason (at least {MIN_OVERRIDE_REASON} \
+             characters)."
+        );
+    }
     format!(
         "Merge blocked: PR #{number} has not CONVERGED — no review covers its current \
          head.\n\n  {reason}\n\n\
@@ -1505,14 +1549,20 @@ pub(crate) fn enforce(
     // unreachable remedy is the defect this repo has already shipped once (`sparkle-8bvh`).
     let project_config = crate::config::for_project(root);
     let no_pr_reviewer = project_config.config.review.has_no_pr_reviewer();
+    // OFF unless this repo asked for it. It decides whether a PR with NO review is refused; see
+    // `ReviewConfig::requires_review`, and note `coverage_for_repo` checks `no_pr_reviewer` first.
+    let require_review = project_config.config.review.requires_review();
     let trigger = ReviewTrigger::from_reviewer(&project_config.config.review.pr_reviewer);
     let coverage_verdict = if gate.applicable && !no_pr_reviewer {
-        coverage_for_repo(&gate, read_head(root, number).as_deref(), false)
+        coverage_for_repo(&gate, read_head(root, number).as_deref(), false, require_review)
     } else {
         // The head read is skipped entirely when the reviewer was never here, or when this repo has
         // no PR-scoped reviewer at all, so a repo it does not watch pays no extra `gh` call per
         // merge just to be told the gate is not the thing holding it up.
-        coverage_for_repo(&gate, None, no_pr_reviewer)
+        // NO HEAD READ on this arm, and that stays true with `require_review` on: the
+        // never-reviewed refusal is decided from the comment list alone, so a repo the reviewer
+        // never visited still pays no extra `gh` call per merge.
+        coverage_for_repo(&gate, None, no_pr_reviewer, require_review)
     };
 
     match decide(&gate, number, knightwatch_override) {
@@ -2657,13 +2707,88 @@ mod tests {
         let head = Some("1867679aabbccddeeff00112233445566778899a");
 
         assert!(
-            matches!(coverage_for_repo(&gate, head, false), Coverage::NotCovered(_)),
+            matches!(coverage_for_repo(&gate, head, false, false), Coverage::NotCovered(_)),
             "with a reviewer expected, an uncovered head is still NOT COVERED"
         );
         assert_eq!(
-            coverage_for_repo(&gate, head, true),
+            coverage_for_repo(&gate, head, true, false),
             Coverage::NotApplicable,
             "with no PR-scoped reviewer, the same uncovered head must not block"
+        );
+    }
+
+    /// `[review].require_review` — the key that turns "nobody ever reviewed this" from a free pass
+    /// into a refusal. FOUR CASES ON ONE GATE, because the armed one is the only assertion that
+    /// proves the mechanism exists: "off never refuses" passes just as well against a key wired to
+    /// nothing at all, and "on always refuses" passes against one that ignores every other input.
+    #[test]
+    fn require_review_gates_a_pr_that_carries_no_review() {
+        let unreviewed = ProbeGate::not_applicable();
+
+        // OFF — the default every repo has, and byte-for-byte what shipped before the key existed.
+        assert_eq!(
+            coverage_for_repo(&unreviewed, None, false, false),
+            Coverage::NotApplicable,
+            "off: an unreviewed PR is still not gated by the coverage half"
+        );
+
+        // ON — the refusal exists, and it carries the never-reviewed reason rather than a
+        // convergence one. Matching the CONSTANT, not a substring, is what lets `coverage_refusal`
+        // key its headline off the same value without two copies of the sentence drifting apart.
+        assert_eq!(
+            coverage_for_repo(&unreviewed, None, false, true),
+            Coverage::NotCovered(NEVER_REVIEWED_REASON.to_string()),
+            "on: an unreviewed PR is NOT COVERED, for the never-reviewed reason"
+        );
+
+        // ON, BUT NOBODY WATCHES THIS REPO — `no_pr_reviewer` outranks the key. There is no one to
+        // post the review the refusal would demand, so honouring it here would make every PR in
+        // such a repo permanently unmergeable. This is the guard ORDER inside `coverage_for_repo`,
+        // and it is the one thing about this change that reordering two adjacent ifs would break.
+        assert_eq!(
+            coverage_for_repo(&unreviewed, None, true, true),
+            Coverage::NotApplicable,
+            "on + no reviewer: the `none` hatch sits ABOVE this key, not beside it"
+        );
+
+        // ON, AND THE PR *IS* REVIEWED AT THE CURRENT HEAD — the key must not disturb the covered
+        // path. Without this, an implementation that simply refused everything passes the rest.
+        let covered = covering("275f462");
+        assert_eq!(
+            coverage_for_repo(&covered, Some("275f462aabbccddeeff00112233445566778899a"), false, true),
+            Coverage::Covered,
+            "on: a review naming the current head still clears the gate"
+        );
+    }
+
+    /// THE REFUSAL COPY FOR A PR NOBODY HAS EVER REVIEWED, which is not the convergence copy.
+    ///
+    /// "Addressed is not converged: applying a fix moves the head, which invalidates the coverage of
+    /// the review that asked for it" is advice about a review that EXISTS. Printed at a PR with no
+    /// review it narrates a sequence of events that never happened and sends the reader looking for
+    /// the review it refers to — the "user-facing copy is code" defect this gate shipped once
+    /// already (bead sparkle-8bvh). Asserted in BOTH directions: the new copy is present AND the
+    /// convergence copy is absent, because either alone passes against a refusal that prints both.
+    #[test]
+    fn a_never_reviewed_refusal_does_not_use_the_convergence_copy() {
+        let msg = coverage_refusal(1273, NEVER_REVIEWED_REASON, ReviewTrigger::SparkleScript);
+        assert!(msg.contains("is UNREVIEWED"), "the headline must say what is actually wrong: {msg}");
+        assert!(
+            !msg.contains("has not CONVERGED") && !msg.contains("\"Addressed\" is not"),
+            "a PR with no review has nothing to have diverged FROM: {msg}"
+        );
+        // The remedy is the SAME one, and it must survive the new branch — a refusal whose
+        // alternative cannot be followed is the shape this whole gate exists to avoid.
+        assert!(
+            msg.contains("pr-review.sh"),
+            "the never-reviewed refusal still names a command the author can run: {msg}"
+        );
+
+        // AND THE OTHER BRANCH IS UNTOUCHED — a moved head still gets the convergence explanation.
+        let moved = coverage_refusal(1273, "the newest review read abc1234", ReviewTrigger::SparkleScript);
+        assert!(
+            moved.contains("has not CONVERGED") && !moved.contains("is UNREVIEWED"),
+            "an out-of-date review keeps the convergence copy: {moved}"
         );
     }
 
@@ -2883,7 +3008,7 @@ mod tests {
         let body = &body[..end];
 
         assert!(
-            body.contains("coverage_for_repo(&gate, read_head(root, number).as_deref(), false)"),
+            body.contains("coverage_for_repo(&gate, read_head(root, number).as_deref(), false, require_review)"),
             "enforce must actually READ the head and compute coverage; without this call the whole \
              gate is inert while every `coverage` unit test stays green"
         );
