@@ -33,7 +33,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Markdown } from "../Markdown";
 import { BeadPillHost, BeadPillProvider, type BeadPillContextValue } from "./BeadPill";
 import { useBeadsStore } from "../../stores/beadsStore";
-import { useUiStore } from "../../stores/uiStore";
+import { focusedBeadIdForSide, useUiStore } from "../../stores/uiStore";
 import { useProjectStore } from "../../stores/projectStore";
 import type { Bead } from "../../services/beads";
 
@@ -84,6 +84,7 @@ beforeEach(() => {
   } as never);
   useUiStore.setState({
     epicFocusBySide: { left: null, right: null },
+    beadFocusBySide: { left: null, right: null },
     workModeBySide: { left: "build", right: "build" },
   } as never);
 });
@@ -126,35 +127,44 @@ describe("Open links — only an epic, and epic means MEMBERSHIP not type", () =
     expect(onBoard()).not.toBeNull();
   });
 
-  // THE ROW A LOCAL `bead.type === "epic"` GATE FAILS. This bead was never declared an epic; it is
-  // one because `` points at it. `isEpicIndexed` is the only check that sees that, and
-  // it is why `scripts/lib/epic-membership-guard.sh` forbids a second definition.
+  // THE ROW A RAW `type`-FIELD TEST FAILS. This bead was never declared an epic; it is one because
+  // `` points at it. `isEpicIndexed` is the only check that sees that, and it is why
+  // `scripts/lib/epic-membership-guard.sh` forbids a second definition. The rung no longer gates
+  // whether the link RENDERS, but it still picks which store key the click writes — see part 3.
   it("a STRUCTURAL epic — children but no epic type — gets both links", () => {
     openCard(STRUCTURAL.id);
     expect(inColumn()).not.toBeNull();
     expect(onBoard()).not.toBeNull();
   });
 
-  it("a plain task gets NO Open group", () => {
+  // A TASK GETS IT TOO, and this row is the one that changed. It was "a plain task gets NO Open
+  // group", on the reading that both destinations are epic-shaped. The founder named the missing
+  // half — *"see what actual active building is being done against any given task"* — and the
+  // column can narrow to a task, so withholding the link hid a view it could already render.
+  it("a plain TASK gets the Open group too", () => {
     openCard(TASK.id);
-    expect(inColumn()).toBeNull();
-    expect(onBoard()).toBeNull();
+    expect(inColumn()).not.toBeNull();
+    expect(onBoard()).not.toBeNull();
   });
 
-  // THE OTHER HALF OF THE PREVIOUS ROW, and it is a separate fact: absence of the new group would
-  // also be satisfied by the card having lost its board affordance ENTIRELY. A task must still be
-  // able to reach the board exactly as it could before this feature existed.
-  it("a plain task KEEPS the standalone View on board button", () => {
-    openCard(TASK.id);
-    expect(standaloneBoard()).not.toBeNull();
-  });
-
-  // …and the mirror: on an epic the standalone button must STAND DOWN, or "on board" appears twice
-  // on one card doing one thing. This is the assertion that pins the hand-off between the two.
-  it("an epic does NOT also render the standalone button — no duplicate board control", () => {
+  // The standalone button stands down for ANY card that has both destinations, or "on board"
+  // appears twice on one card doing one thing.
+  it("no card renders the standalone button AND the group — no duplicate board control", () => {
     openCard(DECLARED.id);
     expect(standaloneBoard()).toBeNull();
     expect(onBoard()).not.toBeNull();
+    cleanup();
+    openCard(TASK.id);
+    expect(standaloneBoard()).toBeNull();
+    expect(onBoard()).not.toBeNull();
+  });
+
+  // …and the standalone button is still what a surface with NO column destination gets, which is
+  // every caller but the concierge. Deleting that fallback would strand the board overlay.
+  it("a surface with no column destination still gets the standalone board button", () => {
+    openCard(TASK.id, ctx(ALL, { onViewInColumn: undefined }));
+    expect(inColumn()).toBeNull();
+    expect(standaloneBoard()).not.toBeNull();
   });
 
   // ONE LINK WHEN ONLY ONE DESTINATION IS MEANINGFUL. A surface with no board still offers the
@@ -239,6 +249,99 @@ describe("viewInColumn — the two writes, and why one is not enough", () => {
     const onViewInColumn = vi.fn(() => true);
     openCard(STRUCTURAL.id, ctx(ALL, { onViewInColumn }));
     fireEvent.click(inColumn()!);
-    expect(onViewInColumn).toHaveBeenCalledWith({ beadId: STRUCTURAL.id, projectId: "p1" });
+    // `isEpic: true` travels WITH the call — STRUCTURAL is an epic only because a child points at
+    // it, so this also pins that the rung came from the shared resolver rather than from the raw
+    // `type` field, which would have said false here.
+    expect(onViewInColumn).toHaveBeenCalledWith({
+      beadId: STRUCTURAL.id,
+      projectId: "p1",
+      isEpic: true,
+    });
+  });
+
+  // THE MIRROR, and it is the assertion that catches a rung hard-coded to `true` — which would
+  // typecheck, render identically, and write every task into the epic key.
+  it("hands the link isEpic:false for a TASK", () => {
+    const onViewInColumn = vi.fn(() => true);
+    openCard(TASK.id, ctx(ALL, { onViewInColumn }));
+    fireEvent.click(inColumn()!);
+    expect(onViewInColumn).toHaveBeenCalledWith({
+      beadId: TASK.id,
+      projectId: "p1",
+      isEpic: false,
+    });
+  });
+});
+
+// ── 3. THE TASK RUNG — THE FOUNDER'S SECOND ASK ─────────────────────────────────────────────────
+//
+// *"Be able to see what actual active building is being done against any given task."*
+//
+// Everything here is about the DIFFERENCE between the two rungs, because that difference is
+// invisible on screen: both links look identical and both narrow the column. What separates them is
+// WHICH STORE KEY the click writes, and getting that backwards has two distinct visible costs —
+// a task written into the epic key would blow away the epic card the reader has open, and an epic
+// written into the child key would be swallowed the moment the child is cleared.
+describe("viewInColumn — a TASK narrows one rung further, and leaves the epic alone", () => {
+  function realHost(id: string) {
+    render(
+      <BeadPillHost>
+        <Markdown text={`see ${id}`} />
+      </BeadPillHost>,
+    );
+    fireEvent.click(screen.getAllByTestId("concierge-bead-pill")[0]!);
+  }
+
+  it("opening a TASK writes the CHILD rung, not the epic one", () => {
+    realHost(TASK.id);
+    fireEvent.click(inColumn()!);
+    expect(useUiStore.getState().beadFocusBySide.right).toBe(TASK.id);
+    expect(useUiStore.getState().epicFocusBySide.right).toBeNull();
+  });
+
+  it("opening an EPIC still writes the epic rung", () => {
+    realHost(DECLARED.id);
+    fireEvent.click(inColumn()!);
+    expect(useUiStore.getState().epicFocusBySide.right).toBe(DECLARED.id);
+  });
+
+  // ══ THE GOAL'S OWN WORDING: "WITHOUT CLOSING THE OPEN EPIC CARD" ══════════════════════════════
+  // The epics column decides which card is open from `epicFocusBySide` alone. Writing a TASK into
+  // that key is the bug this pins: the open epic card would snap shut under the reader, because no
+  // epic matches a task id. Asserted on the key the column actually reads, not on a rendered card,
+  // so it holds regardless of which column happens to be mounted.
+  it("leaves an OPEN EPIC's card open — the epic key is untouched by a task click", () => {
+    useUiStore.getState().openEpicFocus("right", STRUCTURAL.id);
+    realHost(TASK.id);
+    fireEvent.click(inColumn()!);
+    expect(useUiStore.getState().epicFocusBySide.right).toBe(STRUCTURAL.id);
+    // …and the column is nonetheless narrowed to the TASK, because the child rung wins.
+    expect(focusedBeadIdForSide(useUiStore.getState(), "right")).toBe(TASK.id);
+  });
+
+  // RULE 2, from the reader's side: clearing the task hands the column back to the epic it was
+  // drilled into, rather than to everything. That is what makes it a drill-DOWN.
+  it("clearing the task returns the column to the epic underneath", () => {
+    useUiStore.getState().openEpicFocus("right", STRUCTURAL.id);
+    realHost(TASK.id);
+    fireEvent.click(inColumn()!);
+    useUiStore.getState().setBeadFocus("right", null);
+    expect(focusedBeadIdForSide(useUiStore.getState(), "right")).toBe(STRUCTURAL.id);
+  });
+
+  // IDEMPOTENT, like its epic sibling. Wired to the toggling `setBeadFocus`, this second press
+  // would hand the column back to the epic — which is the link undoing itself.
+  it("stays on the task when Open is pressed TWICE", () => {
+    realHost(TASK.id);
+    fireEvent.click(inColumn()!);
+    fireEvent.click(inColumn()!);
+    expect(useUiStore.getState().beadFocusBySide.right).toBe(TASK.id);
+  });
+
+  it("puts the side into Build, so the narrowing is visible", () => {
+    useUiStore.setState({ workModeBySide: { left: "build", right: "plan" } } as never);
+    realHost(TASK.id);
+    fireEvent.click(inColumn()!);
+    expect(useUiStore.getState().workModeBySide.right).toBe("build");
   });
 });

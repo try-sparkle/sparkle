@@ -777,7 +777,12 @@ export function BeadCard({
             // It is worth the words because "in column" is the ambiguous half of the pair. The
             // build column is off-screen-right of the concierge at most widths, so the label alone
             // names neither the column nor what will change about it.
-            aria-label="in column — narrow the Build column to the agents working this epic"
+            // "this card" rather than "this epic": the link is offered for a TASK too, where it
+            // narrows one rung further — to just the agents on that task. Naming the rung here
+            // would mean this component deciding what a bead IS, which is the one question it must
+            // never answer for itself (`epic-membership-guard.sh`), and the sentence is true of
+            // both either way.
+            aria-label="in column — narrow the Build column to the agents working this card"
             style={openLinkStyle}
           >
             in column
@@ -799,7 +804,7 @@ export function BeadCard({
               data-testid={`${t}-open-on-board`}
               onClick={onViewOnBoard}
               // Composed like its sibling above — see that note for why `title` cannot work here.
-              aria-label="on board — open the Plan board focused on this epic"
+              aria-label="on board — open the Plan board focused on this card"
               style={openLinkStyle}
             >
               on board

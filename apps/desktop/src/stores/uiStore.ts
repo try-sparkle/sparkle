@@ -503,6 +503,29 @@ interface UiState {
   // was not per-side would leak into the column the user is not looking at.
   beadFocusBySide: Record<PairSide, string | null>;
   setBeadFocus: (side: PairSide, beadId: string | null) => void;
+  /**
+   * FOCUS THIS CHILD TASK — idempotently. Exactly the relationship {@link openEpicFocus} has to
+   * {@link setEpicFocus}, one rung down, and it exists for the same reason.
+   *
+   * `setBeadFocus` TOGGLES, which is right for a ROW that is its own off-switch. A LINK labelled
+   * **Open** is the opposite promise: pressing it twice must leave the task open, not hand the
+   * column back to the epic. The founder asked for that link — *"be able to see what actual active
+   * building is being done against any given task"* — so the two gestures want two verbs rather
+   * than a caller-side `if`, which is the same toggle bug re-derived one call site at a time.
+   *
+   * ══ IT WRITES ONLY THIS KEY — RULE 2, NOT RULE 3 ═══════════════════════════════════════════════
+   * The asymmetry with `openEpicFocus` is deliberate and is the whole composition rule. Moving the
+   * EPIC clears the child beneath it (rule 3), because a child of epic A is not a narrowing of epic
+   * B. Moving the CHILD must NOT touch the epic (rule 2): the epic underneath is what the column
+   * returns to when this is cleared, and that is what makes a child selection feel like a
+   * drill-DOWN rather than a jump. It is also why opening a task from the concierge leaves an open
+   * epic card open — `epicFocusBySide` is what the epics column reads to decide that, and this
+   * never touches it.
+   *
+   * Takes a NON-NULL id: "open nothing" is not a gesture. Clearing stays with
+   * `setBeadFocus(side, null)`, which is what both Show-Epic controls already call.
+   */
+  openBeadFocus: (side: PairSide, beadId: string) => void;
   // Whether ANY "+ New Build Agent" button is currently hovered. Shared so hovering the empty-state
   // start button on the Workspace also lights up the sidebar's button blue (and vice versa),
   // pointing the user at where that affordance normally lives. Transient — NOT persisted.
@@ -955,6 +978,17 @@ export const useUiStore = create<UiState>()(
           if (st.beadFocusBySide[side] === next) return {};
           return { beadFocusBySide: { ...st.beadFocusBySide, [side]: next } };
         }),
+      // IDEMPOTENT — see the interface note. Identity-stable on a no-op, so pressing Open twice is
+      // genuinely nothing rather than a re-assert that re-runs every consumer's narrowing memo.
+      //
+      // NO RULE-3 CLAUSE HERE, unlike `openEpicFocus`: this moves the CHILD, and the epic beneath it
+      // is deliberately left in force so clearing this returns the column to that epic (rule 2).
+      openBeadFocus: (side, beadId) =>
+        set((st) =>
+          st.beadFocusBySide[side] === beadId
+            ? {}
+            : { beadFocusBySide: { ...st.beadFocusBySide, [side]: beadId } },
+        ),
       // IDEMPOTENT — see the interface note. Identity-stable when the epic is already focused AND
       // no child selection is left over, so pressing Open twice is genuinely nothing rather than a
       // re-assert that re-runs every consumer's narrowing memo (`agentIdsInEpic` in AgentSidebar

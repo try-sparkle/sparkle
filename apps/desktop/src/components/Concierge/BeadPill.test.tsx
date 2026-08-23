@@ -736,7 +736,12 @@ describe("BeadPill — view on board", () => {
       </BeadPillHost>,
     );
     fireEvent.click(pills()[0]!);
-    fireEvent.click(screen.getByTestId("concierge-bead-card-view-on-board"));
+    // THE **Open** GROUP'S board link, not the standalone button — this row mounts the REAL
+    // `BeadPillHost`, which supplies both destinations, so the standalone button correctly stands
+    // down and "on board" lives in the group. The rows above still use the standalone testid
+    // because they mount a context that offers no column destination, which is the other half of
+    // the same rule.
+    fireEvent.click(screen.getByTestId("concierge-bead-card-open-on-board"));
 
     expect(calls).toEqual(["openPlanBoard", "setBoardFocusBeadId"]);
     openPlanBoard.mockRestore();

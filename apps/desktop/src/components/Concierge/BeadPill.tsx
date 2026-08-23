@@ -167,7 +167,11 @@ export interface BeadPillContextValue {
    *  question about the BEAD, answered by the shared resolver where the card is assembled
    *  (`ConciergeBeadCard`), not a property of the surface. This field says only that a build column
    *  exists to narrow — the same thing `onViewOnBoard` says about a board. */
-  onViewInColumn?: (target: { beadId: string; projectId: string }) => boolean;
+  onViewInColumn?: (target: {
+    beadId: string;
+    projectId: string;
+    isEpic: boolean;
+  }) => boolean;
 }
 
 /** One project the reader is NOT currently in: `[id, rootPath, name]`. The sweep needs the first
@@ -627,7 +631,19 @@ function viewOnBoard(target: { beadId: string; projectId: string }): boolean {
 }
 
 /**
- * Open the epic in the BUILD column on its own side — the other half of the founder's pair.
+ * Open this bead in the BUILD column on its own side — the other half of the founder's pair.
+ *
+ * ══ IT SERVES BOTH RUNGS, AND THE RUNG PICKS THE SETTER ════════════════════════════════════════
+ * An EPIC narrows the column to the epic (`openEpicFocus`); a TASK narrows it one rung further, to
+ * just the agents on that task (`openBeadFocus`). The founder asked for the second explicitly —
+ * *"be able to see what actual active building is being done against any given task"* — and the
+ * two are one gesture from the reader's side, so they are one function here.
+ *
+ * The asymmetry between the two setters is the store's composition rule, not a detail: focusing an
+ * epic CLEARS a stale child beneath it (rule 3), while focusing a task LEAVES the epic in force
+ * (rule 2), so clearing the task hands the column back to its epic. That second half is also what
+ * keeps an open epic CARD open when a task is opened from chat — the epics column decides that from
+ * `epicFocusBySide`, which the task path never touches.
  *
  * *"I have the option to open the epic in the build column or open the epic on the planning
  * board."* This is the first of those two, and it is the exact mirror of {@link viewOnBoard} above:
@@ -656,7 +672,13 @@ function viewOnBoard(target: { beadId: string; projectId: string }): boolean {
  * writes here commute — but they are still both required, and the order is kept the same as the
  * board's so the two functions read as one pattern.
  */
-function viewInColumn(target: { beadId: string; projectId: string }): boolean {
+function viewInColumn(target: {
+  beadId: string;
+  projectId: string;
+  /** Which RUNG this bead is — see the note above. The caller already knows (it holds the shared
+   *  resolver's answer), so this is passed rather than re-derived here. */
+  isEpic: boolean;
+}): boolean {
   const projects = useProjectStore.getState();
   // Same reported-not-assumed contract as `viewOnBoard`: `false` becomes a sentence on the card.
   if (!projects.projects.some((p) => p.id === target.projectId)) return false;
@@ -664,7 +686,9 @@ function viewInColumn(target: { beadId: string; projectId: string }): boolean {
   const ui = useUiStore.getState();
   const side = sideOf(ui.pairAssignment, target.projectId);
   ui.showBuildStage(side);
-  ui.openEpicFocus(side, target.beadId);
+  // THE RUNG DECIDES THE SETTER, and both are the IDEMPOTENT ones because this is a link.
+  if (target.isEpic) ui.openEpicFocus(side, target.beadId);
+  else ui.openBeadFocus(side, target.beadId);
   return true;
 }
 
@@ -921,8 +945,17 @@ export function BeadPill({ beadId }: { beadId: string }) {
           onViewInColumn={
             onViewInColumn === undefined
               ? undefined
-              : () => {
-                  const landed = onViewInColumn({ beadId: bead.id, projectId: resolved.projectId });
+              : (isEpic: boolean) => {
+                  // `isEpic` ARRIVES FROM THE CARD rather than being computed here. The pill holds
+                  // no project backlog, and epic membership is a question about the BEAD that only
+                  // the shared resolver may answer — `ConciergeBeadCard` already has that answer
+                  // memoized, so it is threaded down rather than re-derived (a second derivation
+                  // here would be the extra definition `epic-membership-guard.sh` fails CI on).
+                  const landed = onViewInColumn({
+                    beadId: bead.id,
+                    projectId: resolved.projectId,
+                    isEpic,
+                  });
                   setMisses((n) => (landed ? 0 : n + 1));
                 }
           }
@@ -970,9 +1003,9 @@ function ConciergeBeadCard({
   /** Absent when the surface has no board to open. The card is still the result of the click, so
    *  this is a missing SECOND step, not a dead end. */
   onViewOnBoard?: () => void;
-  /** Absent when the surface has no build column to narrow. Passed through to the card ONLY for an
-   *  epic — see the `isEpic` gate in the body, which is where the bead question is asked. */
-  onViewInColumn?: () => void;
+  /** Absent when the surface has no build column to narrow. Takes the RUNG, because the epic and
+   *  task paths write different store keys and only this component holds the resolver's answer. */
+  onViewInColumn?: (isEpic: boolean) => void;
   onClose: () => void;
   notice?: string;
   noticeKey: number;
@@ -1012,21 +1045,26 @@ function ConciergeBeadCard({
       // shows six lines of a description is a card you have to open the board to read.
       descMaxHeight={DESC_MAX_H}
       onViewOnBoard={onViewOnBoard}
-      // ══ THE EPIC GATE — READ OFF THE SHARED RESOLVER, NEVER RE-DERIVED ═════════════════════════
-      // `build.isEpic` is `isEpicIndexed(epicIndexOf(allBeads), bead)`, memoized inside the hook
-      // that is already mounted here. Asking it any other way would be a second definition of epic
-      // membership, which `scripts/lib/epic-membership-guard.sh` fails CI on — and the tempting
-      // wrong answer — comparing the bead's raw `type` field — is a DIFFERENT question
-      // (`isTypedEpic`) that misses every structural epic nobody declared.
+      // ══ EVERY BEAD GETS IT NOW — AND THE RUNG IS READ OFF THE SHARED RESOLVER ═════════════════
+      // This was gated on `build.isEpic`, on the reading that "both destinations are epic-shaped".
+      // Half of that was wrong, and the founder named the missing half himself: *"be able to see
+      // what actual active building is being done against any given TASK."* The build column can
+      // narrow to a task — `beadIdsInEpic` seeds with whatever id it is handed — so a task card
+      // withholding this link was hiding a view the column could already render.
       //
-      // WHY ONLY AN EPIC: the build column narrows by epic, and both destinations are epic-shaped.
-      // The founder scoped it himself — "if it is an epic". A task card is untouched by all of
-      // this and keeps the standalone "View on board" button it already had, because
-      // `onOpenInColumn` arriving `undefined` is what puts that button back.
+      // The rung still has to be ANSWERED, because it picks the setter (epic clears a stale child,
+      // task leaves the epic in force), and it travels with the call rather than gating it.
+      // `build.isEpic` is `isEpicIndexed(epicIndexOf(allBeads), bead)`, memoized inside the hook
+      // already mounted here. Asking it any other way would be a second definition of epic
+      // membership, which `scripts/lib/epic-membership-guard.sh` fails CI on — and the tempting
+      // wrong answer, comparing the bead's raw `type` field, is a DIFFERENT question
+      // (`isTypedEpic`) that misses every structural epic nobody declared.
       //
       // NOT gated on `canWrite`, unlike Chat and the priority control: this navigates, it does not
       // write, so a project with no `bd` path can still send the reader to the column or the board.
-      onOpenInColumn={build.isEpic ? onViewInColumn : undefined}
+      onOpenInColumn={
+        onViewInColumn === undefined ? undefined : () => onViewInColumn(build.isEpic)
+      }
       onClose={onClose}
       // ══ YES, EVEN INSIDE THE CONCIERGE ═══════════════════════════════════════════════════════
       // Clicking Chat on a card that is ALREADY in a concierge thread looks like a loop, and it
