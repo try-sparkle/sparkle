@@ -96,3 +96,18 @@ export function recentFailureForAgent(
 ): { message: string; at: number } | undefined {
   return engines.get(agentId)?.recentFailureNow(now);
 }
+
+/**
+ * Does this agent's engine report a CLEAN, RESUMABLE STOP — its PTY has exited and the viewport still
+ * shows Claude Code's `claude --resume <id>` graceful-exit affordance?
+ *
+ * Sibling of {@link quotaBlockForAgent}, reached the same way and `false` for the same two cases — no
+ * banner, and no engine registered in this window (a Think agent, a pane this window never mounted or
+ * has torn down). Both read as "no clean-stop evidence", and that is the SAFE default: the
+ * resurrection sweep uses a true reading to fast-track recovery of a cleanly-stopped pane
+ * (sparkle-tab3nm), so a missing reading simply falls back to the conservative slow rung — a missed
+ * fast-track costs a wait, never a wrong restart.
+ */
+export function resumeBannerForAgent(agentId: string): boolean {
+  return engines.get(agentId)?.showsResumeBanner() ?? false;
+}

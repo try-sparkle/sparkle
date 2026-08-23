@@ -1930,3 +1930,31 @@ describe("recentFailureNow — the banner outlives the recovery that clears the 
     expect(engine.recentFailureNow(Date.now())).toMatchObject({ message: ENOTFOUND });
   });
 });
+
+
+// ── showsResumeBanner — the DETECT liveness gate for the resume-banner fast-track (sparkle-tab3nm) ──
+// The pure text match lives in screenClassifier.isStoppedResumeBanner; this pins the half StatusEngine
+// owns: the banner counts ONLY once the PTY has actually exited, so a live agent that merely rendered
+// the string is never read as a stopped, resumable session (which would fork-bomb a working agent).
+describe("StatusEngine — showsResumeBanner gates the resume banner on an actual exit (sparkle-tab3nm)", () => {
+  const BANNER = ["work done.", "", "Resume this session with:", "  claude --resume 4c1f6312-e927-47c2-aa8b-4a08cbdb3df9", ""].join("\n");
+
+  it("THE TEST: false while the process is ALIVE even though the banner text is on the grid…", () => {
+    const engine = new StatusEngine({ agentId: "rb-alive", onStatus: () => {}, getScreen: () => BANNER });
+    // The banner is right there, but the PTY has not exited — a live agent that printed it must not be
+    // mistaken for a stopped one. Drop the `!this.exited` gate and this reads true (the fork-bomb risk).
+    expect(engine.showsResumeBanner()).toBe(false);
+  });
+
+  it("…and true only AFTER exit(), when the banner is still the last content on screen", () => {
+    const engine = new StatusEngine({ agentId: "rb-dead", onStatus: () => {}, getScreen: () => BANNER });
+    engine.exit();
+    expect(engine.showsResumeBanner()).toBe(true);
+  });
+
+  it("false after exit() when the screen carries NO banner (an ordinary clean turn-end)", () => {
+    const engine = new StatusEngine({ agentId: "rb-nobanner", onStatus: () => {}, getScreen: () => "> \n" });
+    engine.exit();
+    expect(engine.showsResumeBanner()).toBe(false);
+  });
+});

@@ -287,3 +287,69 @@ describe("every resurrectable cause can actually reach a respawn", () => {
     },
   );
 });
+
+
+describe("a CLEAN, resumable stop (the on-screen resume banner) lifts `unknown` off the slow rung (sparkle-tab3nm)", () => {
+  // The founder's P0: a watched PTY exit classifies `unknown`, which `armsOnSlowestRung` holds on the
+  // 30-minute ceiling — so a cleanly-stopped pane sat dead 45+ minutes before auto-resume. When the
+  // pane still shows Claude's `claude --resume <id>` banner (`cleanResumableStop`), that is positive
+  // evidence of a graceful stop, so recovery uses the normal FAST ladder instead.
+  const FIRST = RESURRECT_LADDER_MS[0]!; // 60s
+
+  it("THE TEST: nextRungDueAt for an `unknown` death is the 30-min ceiling by default…", () => {
+    const at = nextRungDueAt({
+      cause: "unknown",
+      attemptsThisEpisode: 0,
+      lastAttemptAt: undefined,
+      diedAt: NOW,
+    });
+    expect(at).toBe(NOW + RESURRECT_LADDER_CEILING_MS);
+  });
+
+  it("…but the FAST first rung when the resume banner is present", () => {
+    const at = nextRungDueAt({
+      cause: "unknown",
+      attemptsThisEpisode: 0,
+      lastAttemptAt: undefined,
+      diedAt: NOW,
+      cleanResumableStop: true,
+    });
+    // Drop the `cleanResumableStop` line and this reads NOW + ceiling (30m) — the exact 45-min-dead bug.
+    expect(at).toBe(NOW + FIRST);
+    expect(at).not.toBe(NOW + RESURRECT_LADDER_CEILING_MS);
+  });
+
+  it("decideResurrection RESPAWNS a banner-confirmed `unknown` stop at the first rung, and only WAITS without the banner", () => {
+    const base = input({ cause: "unknown", diedAt: NOW, now: NOW + FIRST });
+    // With the banner: the fast rung is due, so it respawns.
+    expect(decideResurrection({ ...base, cleanResumableStop: true })).toEqual({
+      action: "respawn",
+      attempt: 1,
+    });
+    // Without it: still on the 30-min ceiling, so it is between rungs — the paired negative.
+    expect(decideResurrection({ ...base, cleanResumableStop: false })).toEqual({
+      action: "none",
+      reason: "waiting-for-next-rung",
+    });
+  });
+
+  it("does NOT change a cause that was never on the slow rung — a transport fault ignores the banner", () => {
+    // `transport-transient` already uses the fast ladder, so the banner must be a no-op here: proves
+    // the override is scoped to the slow-rung cause and not a blanket speed-up.
+    const withBanner = nextRungDueAt({
+      cause: "transport-transient",
+      attemptsThisEpisode: 0,
+      lastAttemptAt: undefined,
+      diedAt: NOW,
+      cleanResumableStop: true,
+    });
+    const without = nextRungDueAt({
+      cause: "transport-transient",
+      attemptsThisEpisode: 0,
+      lastAttemptAt: undefined,
+      diedAt: NOW,
+    });
+    expect(withBanner).toBe(without);
+    expect(withBanner).toBe(NOW + FIRST);
+  });
+});

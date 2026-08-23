@@ -1662,7 +1662,7 @@ mod tests {
             "GITHUB_SPARKLE_", "GOOGLE_OAUTH_SECRET", "EXPO_TOKEN", "CLOUDFLARE", "E2B_API",
             "SOCKET_IO_SECRET", "DESKTOP_TOKEN_SECRET", "RESEND", "APPLE_SPARKLE_NOTARY",
             "VERCEL_OIDC_TOKEN", "DEEPGRAM_API", "CHIEF_API", "VITE_CHIEF_PAT", "NEON_",
-            "BEADS_CREDENTIAL",
+            "BEADS_CREDENTIAL", "SPARKLE_PUBLISH_TOKEN",
         ] {
             assert!(
                 SPARKLE_SECRET_ENV_PREFIXES.contains(&required),
@@ -1675,7 +1675,7 @@ mod tests {
         // the number".
         assert_eq!(
             SPARKLE_SECRET_ENV_PREFIXES.len(),
-            23,
+            24,
             "a prefix was added or removed — pin it in the list above rather than editing this count"
         );
     }

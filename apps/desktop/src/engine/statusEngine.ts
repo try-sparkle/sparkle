@@ -33,7 +33,7 @@
 // UI without saying why it fired.
 import { classifyLine } from "@sparkle/core";
 import type { AgentTabStatus } from "@sparkle/ui";
-import { isSessionLimitPicker, screenAwaitsInput } from "./screenClassifier";
+import { isSessionLimitPicker, isStoppedResumeBanner, screenAwaitsInput } from "./screenClassifier";
 import { parseDelegatedWorkCount } from "./backgroundTaskFooter";
 import {
   noteBackgroundTasks,
@@ -546,6 +546,11 @@ export class StatusEngine {
   // pane remounted — and this engine's `set()` would then overwrite the LIVE agent's status with a
   // terminal `done`/`errored`, which opens the destructive-op gate on its own (roborev 55076).
   private disposed = false;
+  // Latched by exit(): this engine's PTY has closed. Read by showsResumeBanner() so the
+  // graceful-exit resume banner is only ever consulted for a process that is ACTUALLY gone —
+  // a LIVE agent that merely rendered `claude --resume` mid-turn is never mistaken for a
+  // stopped one (sparkle-tab3nm). Never cleared: a restart mounts a FRESH engine.
+  private exited = false;
   private sawRecentRisk = false;
   // STREAM-SIDE evidence that a menu is painting: an option row ("❯ 1. Yes") went past in the
   // ingested lines. Parallel to `sawRecentRisk` and consumed on the same boundaries, because the
@@ -830,6 +835,26 @@ export class StatusEngine {
     } catch {
       // Swallowed by design; see above.
     }
+  }
+
+  /**
+   * Is this a CLEAN, RESUMABLE STOP right now — the PTY has exited AND the rendered viewport still
+   * carries Claude Code's graceful-exit resume affordance (`claude --resume <id>`)?
+   *
+   * The positive evidence the resurrection sweep reads (through `engineRegistry.resumeBannerForAgent`)
+   * to fast-track recovery of a cleanly-stopped pane instead of holding it on the 30-minute `unknown`
+   * slow rung — the founder's P0, where a stopped row sat dead for 45+ minutes (sparkle-tab3nm).
+   *
+   * BOTH halves are required and the split is deliberate. `isStoppedResumeBanner` is the pure,
+   * bottom-anchored SCREEN-TEXT half; `this.exited` is the LIVENESS half. A segfault or a `pty_kill`
+   * closes the PTY but prints no resume line, so it stays `unknown`/slow; a live agent that merely
+   * rendered the string mid-turn has `exited === false`, so it is never read as stopped. Only Claude
+   * exiting on its own satisfies both.
+   */
+  showsResumeBanner(): boolean {
+    if (!this.exited) return false;
+    const screen = this.opts.getScreen?.();
+    return screen !== undefined && isStoppedResumeBanner(screen);
   }
 
   /** The account-limit wall this agent last reported, if any. Read by the surfaces that must explain
@@ -1646,8 +1671,12 @@ export class StatusEngine {
     // AFTER the status is set, so a listener that reads the row sees the terminal value rather than
     // the pre-exit one. The PTY closing is the strongest death signal there is, and it carries NO
     // exit code — `pty.rs` emits none — so it names the terminator and lets `classifyDeath` decide
-    // what, if anything, it means. Most of the time the answer is `unknown`, which is deliberately
-    // NOT resurrectable: a human clicking stop produces exactly this observation.
+    // what, if anything, it means. Most of the time the answer is `unknown` — which IS resurrectable
+    // now (deathTypes.isResurrectable, since 2026-08-13; a deliberate human stop is recorded as
+    // `human-stopped` via `pty_kill`, so `unknown` no longer has to stand in for it). It recovers on
+    // the most conservative pace unless the viewport carries the graceful-exit resume banner — see
+    // showsResumeBanner() and resurrection.armsOnSlowestRung's cleanResumableStop input.
+    this.exited = true;
     this.reportDeath("pty-exit");
   }
 

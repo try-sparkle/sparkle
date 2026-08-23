@@ -584,3 +584,43 @@ function isCursoredOptionRow(line: string): boolean {
 function isShellPrompt(line: string): boolean {
   return SHELL_PROMPTS.filter((re) => re.test(line)).length > 0;
 }
+
+// ── THE GRACEFUL-EXIT RESUME BANNER (sparkle-tab3nm) ──────────────────────────────────────────────
+//
+// When Claude Code exits on its own it leaves its recovery affordance on the grid — the founder's P0
+// screenshot: a "Terminal stopped" footer over `Resume this session with: claude --resume <id>`. The
+// bead names this exact string as the signal: "The app already prints the exact recovery command on
+// screen — that string is a reliable detector." It is the discriminator between a CLEAN, resumable
+// stop (Claude wrote its own resume line before exiting) and a silent crash or kill (a segfault or
+// `pty_kill` prints no such line), and that distinction is what makes fast auto-resume safe for the
+// former while the latter stays on the conservative `unknown` slow rung — see
+// `engine/resurrection.armsOnSlowestRung` and its `cleanResumableStop` input.
+//
+// BOTTOM-ANCHORED, exactly like `isSessionLimitPicker` and for the same reason its header gives: an
+// agent that merely MENTIONED `claude --resume` mid-turn (this repo's own code, a doc, a shell
+// history line) prints past it, so the banner is not in the live tail. Scrollback has no bottom.
+//
+// This is the SCREEN-TEXT half only. The liveness half — "and the PTY has actually exited" — is
+// applied by the one caller (`StatusEngine.showsResumeBanner`, gated on `exited`), so a live agent
+// that renders the string at the bottom for an instant is never read as stopped. Keeping the text
+// matcher pure and the liveness gate at the caller mirrors how `screenAwaitsInput` is paired with
+// the settle/exit state that decides what to do with it.
+
+// `claude --resume <session-id>`, the command the founder is told to run. The id is a Claude session
+// uuid; matched loosely (>= 8 id-ish chars) so a build/font-driven glyph drift in the id cannot drop
+// the match. Case-folded because a copy of the line can be lower/upper-cased by the terminal font.
+const RESUME_COMMAND = /\bclaude\s+--resume\s+[0-9A-Za-z][0-9A-Za-z-]{7,}/i;
+// The header Claude prints directly above it. A second, independent witness: if a future Claude build
+// wraps or reflows the command line, the header still anchors the state.
+const RESUME_HEADER = /\bresume this session with\b/i;
+
+/**
+ * True when the rendered viewport carries Claude Code's graceful-exit resume affordance in its live
+ * tail — `claude --resume <id>` (or the "Resume this session with" header above it). Pure and
+ * bottom-anchored; see the header block. The caller supplies the liveness gate.
+ */
+export function isStoppedResumeBanner(snapshot: string): boolean {
+  if (!snapshot.trim()) return false;
+  const tail = tailContent(snapshot, LIVE_TAIL_LINES);
+  return tail.some((l) => RESUME_COMMAND.test(l) || RESUME_HEADER.test(l));
+}

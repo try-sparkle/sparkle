@@ -35,7 +35,7 @@ import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 // and the sentence that carries it cannot drift (packages/core/pusherBlocker's own rule).
 import { routeRecoveryExhausted } from "@sparkle/core";
 import { agentDisplayName } from "../engine/agentDisplayName";
-import { lastFailureForAgent, quotaBlockForAgent } from "../engine/engineRegistry";
+import { lastFailureForAgent, quotaBlockForAgent, resumeBannerForAgent } from "../engine/engineRegistry";
 import {
   MAX_RESURRECTS_PER_AGENT_PER_DAY,
   type NoResurrectReason,
@@ -186,6 +186,16 @@ export interface ResurrectionSweepOptions {
   suppress?: (agentId: string, untilMs: number) => void;
   /** What was observed about a canary during its probation window. */
   probationEvidence?: (canaryId: string, spawnedAt: number, now: number) => ProbationEvidence;
+  /**
+   * Does this agent's mounted pane currently show Claude Code's graceful-exit resume banner —
+   * a CLEAN, resumable stop (sparkle-tab3nm)? Defaults to `engineRegistry.resumeBannerForAgent`,
+   * the live per-window read, so every production sweep exercises it; injected by tests. A true
+   * reading fast-tracks an `unknown` death off the 30-minute slow rung — see
+   * `resurrection.armsOnSlowestRung`. It is a LIVE read (never the durable ledger) because the
+   * banner is on-screen state that only a mounted engine can see, and it clears itself the
+   * instant the pane resumes.
+   */
+  resumeBannerShown?: (agentId: string) => boolean;
   /**
    * Hand one finding to the concierge. Returns whether it was ACCEPTED — `false` means it went
    * nowhere and stays owed, which is `notifyConcierge`'s own published contract.
@@ -451,6 +461,9 @@ function liveOptions(opts: ResurrectionSweepOptions): Required<ResurrectionSweep
     probationEvidence: opts.probationEvidence ?? defaultProbationEvidence,
     // The REAL notifier by default, so every production sweep drives the escalation path.
     escalate: opts.escalate ?? ((text) => notifyConcierge(text)),
+    // The REAL live per-window banner read by default, so every production sweep fast-tracks a
+    // cleanly-stopped pane; injected only so a test can drive the fast/slow split directly.
+    resumeBannerShown: opts.resumeBannerShown ?? resumeBannerForAgent,
   };
 }
 
@@ -469,7 +482,12 @@ function lastAttemptAt(attemptsAt: readonly number[]): number | undefined {
 
 /** The per-agent gate's input, built in ONE place so the canary probe above and the admission loop
  *  below cannot drift into asking two different questions. */
-function resurrectionInputFor(d: DueAgent, processAlive: boolean, now: number) {
+function resurrectionInputFor(
+  d: DueAgent,
+  processAlive: boolean,
+  now: number,
+  cleanResumableStop: boolean,
+) {
   return {
     cause: d.cause,
     processAlive,
@@ -478,6 +496,10 @@ function resurrectionInputFor(d: DueAgent, processAlive: boolean, now: number) {
     lastAttemptAt: lastAttemptAt(d.attemptsAt),
     diedAt: d.diedAt,
     recentAttemptsAt: d.attemptsAt,
+    // The graceful-exit resume banner, read LIVE from the mounted pane's engine (sparkle-tab3nm). A
+    // cleanly-stopped pane recovers on the fast ladder instead of the 30-minute `unknown` slow rung;
+    // every death without the banner is unchanged. See resurrection.armsOnSlowestRung.
+    cleanResumableStop,
     now,
   };
 }
@@ -820,7 +842,7 @@ export async function sweepResurrections(
         continue;
       }
       const probe = decideResurrection(
-        resurrectionInputFor(member, liveIds.has(m.agentId), o.now),
+        resurrectionInputFor(member, liveIds.has(m.agentId), o.now, o.resumeBannerShown(m.agentId)),
       );
       if (probe.action !== "none") continue;
       if (PERMANENT_NO_RESURRECT.has(probe.reason)) {
@@ -1092,7 +1114,9 @@ export async function sweepResurrections(
     // because the due-list order is stable, starve a revivable agent behind it every sweep forever.
     // Refuse it here (which also spends no `planned`); the final loop re-checks as the double-spawn
     // backstop.
-    const decision = decideResurrection(resurrectionInputFor(d, liveIds.has(d.agentId), o.now));
+    const decision = decideResurrection(
+      resurrectionInputFor(d, liveIds.has(d.agentId), o.now, o.resumeBannerShown(d.agentId)),
+    );
     if (decision.action === "none") {
       pushRefusal(outcomes, d, decision.reason satisfies NoResurrectReason, o.escalate);
       continue;
@@ -1133,7 +1157,9 @@ export async function sweepResurrections(
     // surface in the app because nothing holds a handle to it any more.
     const processAlive = liveIds.has(d.agentId) ? true : false;
 
-    const decision = decideResurrection(resurrectionInputFor(d, processAlive, o.now));
+    const decision = decideResurrection(
+      resurrectionInputFor(d, processAlive, o.now, o.resumeBannerShown(d.agentId)),
+    );
 
     if (decision.action === "none") {
       // REFUSAL SITE 2 OF 2 — the admission path, and the one a SOLO death always takes, because

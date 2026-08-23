@@ -423,6 +423,7 @@ mod main_thread_guard {
     /// the sweep's job is to make every sync body visible, and a per-entry rationale field would
     /// invite writing one for the ones that need converting too.
     const EXEMPT: &[&str] = &[
+        "account_record_oauth_identity",
         "accounts_add",
         "accounts_import_default",
         "accounts_mark_exhausted",
@@ -464,6 +465,8 @@ mod main_thread_guard {
         "hide_helper",
         "is_capture_open",
         "log_dir",
+        "note_staged_update",
+        "note_update_install_started",
         "notify_attention",
         "notify_frontend_shown",
         "nudger_clear_flag",
@@ -489,6 +492,7 @@ mod main_thread_guard {
         "refresh_preflight",
         "reset_config",
         "reset_window_size",
+        "resume_exit_after_update",
         "reveal_logs",
         "set_allow_virtual_input",
         "set_audio_input",

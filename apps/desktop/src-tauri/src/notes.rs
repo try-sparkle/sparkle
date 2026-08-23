@@ -2306,12 +2306,17 @@ mod tests {
     fn no_bd_invocation_in_this_module_is_unbounded() {
         let (probes, offenders) = unbounded_output_calls_in(production_source());
         // POSITIVE assertion first, so "the matcher found nothing" FAILS instead of passing
-        // silently — the vacuous shape this repo hits most. Both resolver probes are in the source
-        // text regardless of which one `cfg` compiles.
+        // silently — the vacuous shape this repo hits most. `windows_which_bd` still resolves bd
+        // with an unbounded `.output()` (present in the source text regardless of which target
+        // `cfg` compiles). `login_shell_which_bd` USED to be the second such probe, but it was
+        // bounded to route through `which_via_login_shell`'s `output_with_timeout` — so exactly ONE
+        // raw-`.output()` resolver probe remains in this file, and the floor tracks that. Red here
+        // means the scanner matched nothing, not that a probe should be re-added.
         assert!(
-            probes >= 2,
-            "expected the two bd RESOLVER probes (login_shell_which_bd, windows_which_bd), found \
-             {probes} — the scanner matched nothing, so this guard is not guarding anything"
+            probes >= 1,
+            "expected the bd RESOLVER probe (windows_which_bd) to still read as an allowed \
+             unbounded `.output()`, found {probes} — the scanner matched nothing, so this guard is \
+             not guarding anything"
         );
         assert!(
             offenders.is_empty(),

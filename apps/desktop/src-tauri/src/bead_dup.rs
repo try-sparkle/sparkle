@@ -633,8 +633,19 @@ pub(crate) mod tests {
     /// able to satisfy the guard on the production function's behalf.
     fn production_source(module: &str) -> &'static str {
         let src = module_source(module);
-        let cut = src.find("\n#[cfg(test)]").map(|i| &src[..i]).unwrap_or(src);
-        assert!(cut.len() < src.len(), "{module}: no test-module marker, so the scan region is wrong");
+        // Cut at the test MODULE declaration, NOT the first `#[cfg(test)]`. That attribute also
+        // gates ordinary PRODUCTION items — beads_cmd.rs carries `#[cfg(test)] static BD_LIMITER`
+        // hundreds of lines above its test module — so cutting at the first `#[cfg(test)]` dropped
+        // `fn create_bead` out of the scanned region and made this guard panic "no top-level fn"
+        // on a create path that was in fact wired correctly. The test module is `mod tests {`
+        // (optionally `pub(crate)`/`pub`), so anchor on that instead.
+        let cut = ["\nmod tests {", "\npub(crate) mod tests {", "\npub mod tests {"]
+            .iter()
+            .filter_map(|m| src.find(m))
+            .min()
+            .map(|i| &src[..i])
+            .unwrap_or(src);
+        assert!(cut.len() < src.len(), "{module}: no `mod tests` marker, so the scan region is wrong");
         cut
     }
 

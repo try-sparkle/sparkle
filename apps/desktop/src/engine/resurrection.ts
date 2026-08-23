@@ -137,6 +137,22 @@ export interface ResurrectionInput {
   diedAt: number;
   /** Epoch-ms timestamps of respawns in the rolling window, from the DURABLE ledger. */
   recentAttemptsAt: readonly number[];
+  /**
+   * POSITIVE evidence that this death is a CLEAN, RESUMABLE STOP — the pane's PTY exited and its
+   * viewport still carries Claude Code's `claude --resume <id>` graceful-exit banner
+   * (`engineRegistry.resumeBannerForAgent`, sparkle-tab3nm). It lifts an `unknown` death OFF the
+   * 30-minute slowest rung onto the normal fast ladder — see {@link armsOnSlowestRung}. Absent /
+   * false for every other death, so nothing else changes pace.
+   *
+   * WHY IT IS SAFE TO SPEED UP HERE and nowhere else in `unknown`: Claude writes that resume line
+   * only when it exits on its OWN — a segfault, an OOM-kill or a `pty_kill` prints nothing — so the
+   * banner is exactly the witness that separates a session that stopped cleanly (resume almost
+   * always works, and a resumed agent then waits on input rather than re-exiting, so it does not
+   * fork-bomb) from a silent crash that must stay conservative. The daily cap
+   * ({@link MAX_RESURRECTS_PER_AGENT_PER_DAY}) still bounds a pathological resume-then-exit loop and
+   * hands it to the concierge when spent.
+   */
+  cleanResumableStop?: boolean;
   now: number;
 }
 
@@ -163,6 +179,15 @@ export interface ResurrectionInput {
  * IMPLEMENTED HERE RATHER THAN AT A CALL SITE, deliberately. A caller that special-cased `unknown`
  * before calling would leave `nextRungDueAt` — which is exported precisely so a surface can say
  * "next try in 3m" — telling every reader the wrong number for the most common cause there is.
+ *
+ * ── THE ONE ESCAPE HATCH: A CLEAN, RESUMABLE STOP (sparkle-tab3nm) ──────────────────────────────
+ * This answers the CAUSE, which is the right default: without any further evidence an `unknown`
+ * death may be a silent crash and must recover slowly. But `nextRungDueAt` lifts the penalty when
+ * `cleanResumableStop` is set — the pane's PTY exited AND its viewport still shows Claude's
+ * `claude --resume <id>` banner, which Claude writes only when it exits on its OWN. That witness
+ * distinguishes a graceful, resumable stop (safe to fast-track: resume works, and a resumed agent
+ * waits on input rather than re-exiting) from a silent crash, so the fast ladder is applied ONLY
+ * to the former. The founder's P0 — a stopped row sitting dead 45+ minutes — is exactly this case.
  */
 export function armsOnSlowestRung(cause: DeathCause): boolean {
   return cause === "unknown";
@@ -182,8 +207,15 @@ export function nextRungDueAt(input: {
   attemptsThisEpisode: number;
   lastAttemptAt: number | undefined;
   diedAt: number;
+  /** See {@link ResurrectionInput.cleanResumableStop}. A true reading takes an `unknown` death off
+   *  the slowest rung and onto the normal fast ladder; every other cause is unaffected. */
+  cleanResumableStop?: boolean;
 }): number {
-  const gap = armsOnSlowestRung(input.cause)
+  // The slowest-rung penalty applies to `unknown` ONLY when there is no positive clean-stop witness.
+  // A resume banner (`cleanResumableStop`) means Claude exited on its own and is safe to resume fast
+  // — see {@link armsOnSlowestRung} and {@link ResurrectionInput.cleanResumableStop}.
+  const slowest = armsOnSlowestRung(input.cause) && !input.cleanResumableStop;
+  const gap = slowest
     ? RESURRECT_LADDER_CEILING_MS
     : (RESURRECT_LADDER_MS[input.attemptsThisEpisode] ?? RESURRECT_LADDER_CEILING_MS);
   // Gaps are measured from the LAST attempt, or from the death itself for the first rung — the same

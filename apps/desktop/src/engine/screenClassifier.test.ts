@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
 import { describe, it, expect } from "vitest";
-import { screenAwaitsInput, isSessionLimitPicker, PICKER_FOOTER, pickerFooterAt, pickerFooterSpan } from "./screenClassifier";
+import { screenAwaitsInput, isSessionLimitPicker, isStoppedResumeBanner, PICKER_FOOTER, pickerFooterAt, pickerFooterSpan } from "./screenClassifier";
 import {
   MAX_OPTION_FOOTER_GAP,
   MAX_CHROME_BELOW_FOOTER,
@@ -1067,5 +1067,60 @@ describe("screenAwaitsInput — a footer inside a \\r-framed stream partial", ()
   it("survives more redraw frames than MAX_CHROME_BELOW_FOOTER", () => {
     const frames = Array.from({ length: 12 }, (_, i) => `✻ Churning… (${i}s)`).join("\r");
     expect(screenAwaitsInput(`${FOOTER}\r${frames}`)).toBe(true);
+  });
+});
+
+
+// ── isStoppedResumeBanner (sparkle-tab3nm) ────────────────────────────────────────────────────────
+// The graceful-exit resume affordance Claude Code leaves on the grid when it exits on its own — the
+// founder's P0 screenshot. This is the pure SCREEN-TEXT half; the liveness gate lives in
+// StatusEngine.showsResumeBanner. See the classifier's header block.
+describe("isStoppedResumeBanner", () => {
+  const RESUME_ID = "4c1f6312-e927-47c2-aa8b-4a08cbdb3df9";
+
+  it("THE TEST: detects `claude --resume <id>` as the last content on the grid (the founder's screen)", () => {
+    const screen = [
+      "⏺ I've opened the PR. Handing back.",
+      "",
+      "Resume this session with:",
+      `  claude --resume ${RESUME_ID}`,
+      "",
+    ].join("\n");
+    // Against the code before this classifier existed there was no detector at all, so a stopped pane
+    // showing exactly this pinned GREEN. Now it is recognised.
+    expect(isStoppedResumeBanner(screen)).toBe(true);
+  });
+
+  it("matches on the `claude --resume` command line alone (header scrolled off)", () => {
+    const screen = ["some earlier output", "", `claude --resume ${RESUME_ID}`, ""].join("\n");
+    expect(isStoppedResumeBanner(screen)).toBe(true);
+  });
+
+  it("matches on the `Resume this session with` header alone (command line reflowed away)", () => {
+    const screen = ["work done.", "", "Resume this session with:", ""].join("\n");
+    expect(isStoppedResumeBanner(screen)).toBe(true);
+  });
+
+  it("is FALSE for an empty screen", () => {
+    expect(isStoppedResumeBanner("")).toBe(false);
+    expect(isStoppedResumeBanner("   \n  \n")).toBe(false);
+  });
+
+  it("is FALSE for an ordinary working / idle screen with no banner", () => {
+    const screen = [
+      "✻ Cogitating… (12s · ↑ 1.2k tokens · esc to interrupt)",
+      "",
+      "> ",
+    ].join("\n");
+    expect(isStoppedResumeBanner(screen)).toBe(false);
+  });
+
+  it("is FALSE when the banner is only in SCROLLBACK, far above the live tail (bottom-anchored)", () => {
+    // The bead's own discipline: an agent that merely MENTIONED the command mid-turn (this repo's
+    // code, a doc, shell history) prints past it, so it is not in the tail. `LIVE_TAIL_LINES` is 12;
+    // bury the banner well above that with fresh output below it.
+    const filler = Array.from({ length: 20 }, (_, i) => `later output line ${i}`);
+    const screen = [`claude --resume ${RESUME_ID}`, ...filler].join("\n");
+    expect(isStoppedResumeBanner(screen)).toBe(false);
   });
 });
