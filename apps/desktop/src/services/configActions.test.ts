@@ -55,6 +55,7 @@ import {
   setAutoApprovePreset,
   setMaxConcurrentWorkers,
   setPluginEnabled,
+  setToolEnabled,
   setRoborevEnabled,
   setDrainerEnabled,
   setResumeRule,
@@ -877,6 +878,28 @@ describe("configActions", () => {
       expect(setConfigValue).toHaveBeenCalledWith("approvals.resume", "summary");
       expect(setProjectConfigValue).not.toHaveBeenCalled();
     });
+  });
+});
+
+describe("setToolEnabled — the [tools] flags", () => {
+  it("persists humanebench to tools.humanebench and flips the store optimistically", () => {
+    // The dotted path is the whole contract: a wrong leaf writes a key Rust's PartialTools does
+    // not claim, which parses fine, applies nothing, and is reported only as an ignored key. The
+    // switch still moves, so the row looks like it works and the gate silently stays on.
+    useSettingsStore.setState({ humanebenchEnabled: true });
+    const pending = setToolEnabled("humanebench", false);
+    // Optimistic: already flipped, without waiting on IPC.
+    expect(useSettingsStore.getState().humanebenchEnabled).toBe(false);
+    expect(setConfigValue).toHaveBeenCalledWith("tools.humanebench", false);
+    return pending;
+  });
+
+  it("writes the same path turning it back ON", () => {
+    vi.mocked(setConfigValue).mockClear();
+    const pending = setToolEnabled("humanebench", true);
+    expect(useSettingsStore.getState().humanebenchEnabled).toBe(true);
+    expect(setConfigValue).toHaveBeenCalledWith("tools.humanebench", true);
+    return pending;
   });
 });
 

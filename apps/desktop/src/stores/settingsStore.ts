@@ -137,6 +137,7 @@ export type ToolKey =
   | "beads"
   | "github"
   | "guardrails"
+  | "humanebench"
   | "roborev"
   | "onepassword"
   | "builderIndex"
@@ -149,6 +150,7 @@ export const TOOL_FIELD: Record<
   | "beadsEnabled"
   | "githubEnabled"
   | "guardrailsEnabled"
+  | "humanebenchEnabled"
   | "roborevEnabled"
   | "onepasswordEnabled"
   | "builderIndexEnabled"
@@ -158,6 +160,7 @@ export const TOOL_FIELD: Record<
   beads: "beadsEnabled",
   github: "githubEnabled",
   guardrails: "guardrailsEnabled",
+  humanebench: "humanebenchEnabled",
   roborev: "roborevEnabled",
   onepassword: "onepasswordEnabled",
   builderIndex: "builderIndexEnabled",
@@ -784,6 +787,13 @@ interface SettingsState {
    *  "done") is appended to every coding agent's system prompt; off omits it. Mirrors
    *  [tools].guardrails. */
   guardrailsEnabled: boolean;
+  /** The HumaneBench reviewer's preference. TODAY THIS RECORDS A CHOICE AND NOTHING ELSE — no
+   *  code reads it yet, because the reviewer is still being built. PLANNED: a pull request that
+   *  changes what Sparkle says or does to a person is scored against HumaneBench's 8
+   *  humane-technology principles, and a score below the bar holds the merge until a human
+   *  overrides it; off skips the review. Mirrors [tools].humanebench — machine-wide, so a cloned
+   *  repo cannot switch its own gate off. */
+  humanebenchEnabled: boolean;
   /** roborev — the per-commit AI code-review daemon. On (default) → the Tools toggle is on and
    *  the daemon reviews each BUILD-agent commit; off → dormant. Mirrors [tools].roborev. Config-
    *  backed, NOT persisted — re-read from the file each launch. */
@@ -1036,6 +1046,7 @@ export const useSettingsStore = create<SettingsState>()(
       beadsEnabled: true,
       githubEnabled: true,
       guardrailsEnabled: true,
+      humanebenchEnabled: true,
       roborevEnabled: true,
       // Ships ON — the founder's directive (zero human steps, on by default); the shell engine's
       // worker cap + rest floor bound the worst case and `enabled=false` is the rebuild-free switch.
@@ -1379,6 +1390,9 @@ export const useSettingsStore = create<SettingsState>()(
           beadsEnabled: config.tools?.beads ?? true,
           githubEnabled: config.tools?.github ?? true,
           guardrailsEnabled: config.tools?.guardrails ?? true,
+          // `?? true` like its on-by-default siblings: an absent key — an older backend, or a
+          // hand-written [tools] block that never mentions it — is NOT an opt-out of the gate.
+          humanebenchEnabled: config.tools?.humanebench ?? true,
           roborevEnabled: config.tools?.roborev ?? true,
           // `?? true` like its on-by-default siblings: an absent [drainer] (older backend) keeps ON.
           drainerEnabled: config.drainer?.enabled ?? true,

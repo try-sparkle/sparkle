@@ -31,7 +31,10 @@
 //!      and a record that named its probes in citation form would silently answer them on the next
 //!      read — so a second merge attempt after a failed one would sail through with no refusal and
 //!      no second record. Both halves are guarded: the record is excluded from the replier set, AND
-//!      it names probes in a form the grammar does not match.
+//!      it names probes in a form the grammar does not match. NOR can a record belonging to a
+//!      DIFFERENT gate — a HumaneBench verdict or its bypass ([`HUMANEBENCH_VERDICT_MARKER`],
+//!      [`HUMANEBENCH_OVERRIDE_MARKER`]): the same argument generalises, and per-principle
+//!      reasoning prose about a PR is precisely where an incidental "probe 1" turns up.
 //!   4. WHOLE bodies are scanned. Real data (PR #1104) puts a citation more than 1500 chars into a
 //!      reply; truncating the scan loses answers and turns an answered probe into a false refusal.
 //!      BLOCKQUOTED lines are the one exception: a citation that exists only inside a `>` line is
@@ -166,6 +169,37 @@ impl ReviewTrigger {
 /// Stamped into the comment that records an override, in the [`crate::pr_owner`] marker style: one
 /// line, machine-findable, invisible in rendered markdown.
 pub const OVERRIDE_MARKER: &str = "<!-- sparkle:probe-gate-override -->";
+
+/// SPARKLE'S HUMANEBENCH VERDICT, posted by a DIFFERENT reviewer than knightwatch (see bead
+/// `sparkle-4g9ppx`, epic `sparkle-9o0649`). Registered here for the same reason
+/// [`SPARKLE_REVIEW_MARKER`] is, and the reasoning is worth stating plainly because the marker's
+/// name makes it look unrelated to this module:
+///
+/// Rule 3 sorts every comment into REVIEWS (marker-carrying) and EVERYTHING ELSE, and
+/// everything-else is a candidate ANSWER whose body gets scanned for `probes?\s*#?\s*<N>`. So a
+/// verdict comment this module has never heard of is not merely ignored — it is read as somebody
+/// replying to the outstanding probes. A HumaneBench verdict carries per-principle reasoning prose
+/// about the PR under review, and prose about a PR is exactly where "probe 1" turns up. One
+/// incidental phrase would mark an unanswered `[blocking]` probe answered and flip a refusal into a
+/// merge, silently, on the path that gates every in-app merge.
+///
+/// IT IS NOT A KNIGHTWATCH REVIEW EITHER, and must not be added to [`is_knightwatch`]. That would
+/// make a HumaneBench post satisfy the COVERAGE half of the gate — `parse_review_coverage` would
+/// look for a reviewed sha in a body that names none, and a verdict would count as "this head has
+/// been reviewed" when knightwatch has not looked at it.
+///
+/// So the correct classification is the THIRD one this module already has: exactly what
+/// [`OVERRIDE_MARKER`] gets — excluded from the replier set, contributing no probes, contributing
+/// no coverage. The rationale there ("a bypass is the opposite of an answer") generalises: a
+/// verdict from a different reviewer is not an answer to knightwatch's question either.
+pub const HUMANEBENCH_VERDICT_MARKER: &str = "<!-- sparkle:humanebench-verdict -->";
+
+/// The HumaneBench gate's OWN bypass record. Excluded for both reasons at once: it is a bypass (so
+/// the [`OVERRIDE_MARKER`] argument applies verbatim) and it belongs to a different gate (so the
+/// verdict argument applies too). It must NOT be confused with [`OVERRIDE_MARKER`] — a HumaneBench
+/// bypass says nothing about knightwatch's probes and must never clear THIS gate, which is why the
+/// two are separate strings tested separately rather than one prefix match.
+pub const HUMANEBENCH_OVERRIDE_MARKER: &str = "<!-- sparkle:humanebench-override -->";
 
 /// Bound the comment read. A paginated GitHub read of a busy PR is a handful of round-trips; the
 /// case this guards is a hung remote, where a merge gate that hangs is worse than one that says
@@ -426,6 +460,132 @@ fn is_knightwatch(body: &str) -> bool {
     body.contains(REVIEW_MARKER) || body.contains(SPARKLE_REVIEW_MARKER)
 }
 
+/// Is this line blockquoted? One `>` after optional leading whitespace, the same shape
+/// [`cites_probe`] and [`cites_probe_id`] already use to drop quoted citations.
+fn is_blockquoted(line: &str) -> bool {
+    line.trim_start().starts_with('>')
+}
+
+/// A blockquoted line with ONE `>` level stripped and the remainder trimmed. `""` for a bare `>`,
+/// which is what GitHub's Quote-reply emits for a blank line inside the quoted body.
+fn dequote(line: &str) -> &str {
+    line.trim_start().strip_prefix('>').unwrap_or("").trim()
+}
+
+/// THE OLD RULE, kept as a TEST-ONLY helper: does `body` carry `marker` on a line that is NOT
+/// blockquoted?
+///
+/// This WAS the whole of [`is_foreign_gate_record`], and it failed open — see that function. It is
+/// retained deliberately, and deliberately `#[cfg(test)]` so it cannot be reached from production
+/// by accident, because the fixtures that pin the fail-open assert on it as a PRECONDITION: a
+/// bypass body must make this return `false`, which is what proves the fixture exercises the hole
+/// rather than passing for some unrelated reason. Deleting it would leave those tests unable to
+/// state what they are testing.
+#[cfg(test)]
+fn has_unquoted_marker(body: &str, marker: &str) -> bool {
+    body.lines().any(|l| !is_blockquoted(l) && l.contains(marker))
+}
+
+/// Is EVERY occurrence of `marker` inside a blockquote run that CONTINUES PAST IT with non-empty
+/// quoted content — i.e. does this body quote a WHOLE record rather than just its header?
+///
+/// This is the structural invariant that separates the two shapes [`is_foreign_gate_record`] has to
+/// tell apart, and it is worth stating why it holds rather than treating it as a heuristic.
+///
+/// GitHub's Quote-reply reproduces the quoted comment's RAW markdown with every line prefixed
+/// `> `. A HumaneBench record is never just its marker: `scripts/humanebench-pr-comment.sh` emits
+/// the marker and then a heading, a per-principle table, an override region and a footer. So a
+/// FAITHFUL QUOTE of a record always has quoted content AFTER the quoted marker line.
+///
+/// The bypass shape does not. A producer that wraps its own header in `>` — or that inverts its
+/// heading and marker lines — puts the marker at the END of a short quoted block and leaves the
+/// record's own body UNQUOTED below it:
+///
+/// ```text
+/// > ## HumaneBench verdict
+/// > <!-- sparkle:humanebench-verdict -->
+///
+/// **Reasoning** … prose about the PR that happens to say "probe 1" …
+/// ```
+///
+/// The marker is quoted, so an unquoted-line test alone reads that as a human's quote-reply and
+/// lets the verdict's own reasoning prose answer an unanswered `[blocking]` probe. The run test
+/// sees the quoted block end at the marker and refuses.
+///
+/// Residual, stated so it is a choice: someone who quotes ONLY the marker line of a verdict (and
+/// nothing of the record around it) while genuinely answering a probe has their reply dropped and
+/// gets a refusal telling them to cite the probe they just cited. That is recoverable in one edit;
+/// a silent merge past a `[blocking]` probe is not, so this fails toward the refusal.
+fn marker_quoted_with_record_body(body: &str, marker: &str) -> bool {
+    let lines: Vec<&str> = body.lines().collect();
+    let mut saw_any = false;
+    for (i, line) in lines.iter().enumerate() {
+        if !line.contains(marker) {
+            continue;
+        }
+        saw_any = true;
+        if !is_blockquoted(line) {
+            return false;
+        }
+        let run_continues = lines[i + 1..]
+            .iter()
+            .take_while(|l| is_blockquoted(l))
+            .any(|l| !dequote(l).is_empty());
+        if !run_continues {
+            return false;
+        }
+    }
+    saw_any
+}
+
+/// Does this body contain at least one non-blank line of its OWN — unquoted prose the author wrote
+/// rather than reproduced?
+///
+/// Deliberately the grammar-free form: NOT "an unquoted line citing a probe". Coupling the
+/// exception to the citation grammar would put a second copy of that grammar in this file and a
+/// third in `probe-gate.sh`, and the two implementations are already required to agree exactly.
+/// What this buys is real anyway: a record whose body is quoted in its ENTIRETY, with nothing of
+/// the author's own beneath it, is classified as the record it is instead of as an answer — and it
+/// could never have answered anything, because [`cites_probe`] and [`cites_probe_id`] both drop
+/// blockquoted lines.
+fn has_own_unquoted_prose(body: &str) -> bool {
+    body.lines().any(|l| !is_blockquoted(l) && !l.trim().is_empty())
+}
+
+/// Is this comment a record from a gate OTHER than knightwatch's probe list — a HumaneBench verdict
+/// or a HumaneBench bypass? Such a comment is neither a review nor an answer; see
+/// [`HUMANEBENCH_VERDICT_MARKER`] for why treating it as the latter is a merge-gate bypass.
+///
+/// THIS FAILS CLOSED, and that is the whole point of its shape. The rule this replaced asked "does
+/// the marker appear on a NON-blockquoted line?", so a verdict whose marker happened to be quoted
+/// FAILED the test and was classified as an ANSWER — the unsafe direction, and the exact bypass
+/// registering the marker exists to prevent, reached through a format this repo does not pin.
+/// The doc comment on the old rule reasoned about ONE producer-format hazard (a heading line ABOVE
+/// the marker, which the unquoted test survives) and not its mirror image (a header wrapped in `>`,
+/// which it does not).
+///
+/// So the default is inverted. THE MARKER ANYWHERE — quoted or not — MAKES THIS A FOREIGN GATE
+/// RECORD, and exactly one narrow exception is carved out, for the case the unquoted test existed
+/// to protect: a HUMAN quoting a verdict while genuinely answering a probe. That exception is
+/// structural, not a guess about wording, and it needs BOTH halves:
+///
+///   * [`marker_quoted_with_record_body`] — the marker is quoted AND the quoted block continues
+///     past it, so what was quoted is a whole record and not merely a header; and
+///   * [`has_own_unquoted_prose`] — the body carries words of the author's own beneath the quote.
+///
+/// A body that satisfies both is a quote-reply and stays in the replier set
+/// (`quoted-humanebench-verdict-still-answers.json`). Everything else carrying the marker is a
+/// record: no probes, no coverage, out of the replier set.
+///
+/// The two markers are tested SEPARATELY rather than folded into one prefix match, for the reason
+/// [`HUMANEBENCH_OVERRIDE_MARKER`] gives: a HumaneBench bypass must never clear THIS gate.
+fn is_foreign_gate_record(body: &str) -> bool {
+    [HUMANEBENCH_VERDICT_MARKER, HUMANEBENCH_OVERRIDE_MARKER]
+        .into_iter()
+        .filter(|m| body.contains(m))
+        .any(|m| !(marker_quoted_with_record_body(body, m) && has_own_unquoted_prose(body)))
+}
+
 /// ASCII word character, for the `\b` boundaries in rule 3. Deliberately ASCII-only: the shell
 /// implementation's `grep -E` uses the same definition, and a Unicode-aware boundary would let the
 /// two answers diverge on the emoji-laden bodies knightwatch actually posts.
@@ -645,7 +805,9 @@ fn evaluate(comments: &[Comment]) -> ProbeGate {
         // STARTING with the marker, so anchoring excludes every real record and no quote of one.
         let repliers: Vec<&Comment> = comments[pos + 1..window_end]
             .iter()
-            .filter(|c| !c.body.trim_start().starts_with(OVERRIDE_MARKER))
+            .filter(|c| {
+                !c.body.trim_start().starts_with(OVERRIDE_MARKER) && !is_foreign_gate_record(&c.body)
+            })
             .collect();
 
         for line in review.body.lines() {
@@ -662,6 +824,7 @@ fn evaluate(comments: &[Comment]) -> ProbeGate {
                     .filter(|c| {
                         !is_knightwatch(&c.body)
                             && !c.body.trim_start().starts_with(OVERRIDE_MARKER)
+                            && !is_foreign_gate_record(&c.body)
                     })
                     .any(|c| cites_probe_id(&c.body, review.id, index));
             probes.push(Probe {
@@ -1808,6 +1971,217 @@ mod tests {
         assert_eq!(decide(&gate, 997, None), Decision::Allow);
     }
 
+    /// THE BYPASS REGRESSION for the HumaneBench verdict marker (bead `sparkle-4g9ppx`).
+    ///
+    /// Rule 3 sorts every non-review comment into the candidate-ANSWER set, so a verdict comment
+    /// whose marker this module does not know is SCANNED for `Probe <N>` citations. A HumaneBench
+    /// verdict carries per-principle reasoning prose ABOUT THE PR UNDER REVIEW, which is exactly
+    /// where an incidental "probe 1" appears — and one such phrase would mark an unanswered
+    /// `[blocking]` probe answered, turning [`decide`]'s refusal into an Allow. Silently, on the
+    /// single sink every in-app merge path goes through.
+    ///
+    /// The fixture cites BOTH citation forms, so a registration wired into only one of the two
+    /// replier filters (windowed `Probe N`, durable `<commentId>#<index>`) still fails here. It
+    /// also puts the marker BELOW a heading line, so an anchored `starts_with` test — which passes
+    /// every other case in the corpus — fails here, in the unsafe direction.
+    #[test]
+    fn a_humanebench_verdict_can_never_answer_a_probe() {
+        let gate = gate_for("humanebench-verdict-does-not-answer.json");
+        // Sanity FIRST: the citation really is present, so this test cannot pass merely because the
+        // fixture forgot to cite anything. Both forms.
+        let verdict = &parse_comments(&read_fixture("humanebench-verdict-does-not-answer.json"))
+            .expect("a fixture must parse")[1];
+        assert!(cites_ignoring_quoting(&verdict.body, 1), "precondition: the verdict cites probe 1");
+        assert!(
+            verdict.body.contains("1#1"),
+            "precondition: the verdict also carries the durable citation"
+        );
+        // …and it still does not count.
+        assert_eq!(ids(&gate.unanswered_blocking()), vec!["1#1"]);
+        assert!(!gate.overridden, "a verdict is not a probe-gate override record");
+        assert!(
+            matches!(decide(&gate, 998, None), Decision::Refuse { .. }),
+            "the merge must still be REFUSED — a verdict answering a probe is a gate bypass"
+        );
+    }
+
+    /// The HumaneBench gate has its OWN bypass record, and it bypasses THAT gate. Two things must
+    /// hold at once and they are separate: it cannot ANSWER a knightwatch probe, and it must not
+    /// set `overridden` — only [`OVERRIDE_MARKER`] clears this gate. Folding the two markers into
+    /// one prefix test would merge past an unanswered `[blocking]` probe on the strength of a
+    /// bypass of a different gate entirely.
+    #[test]
+    fn a_humanebench_bypass_neither_answers_nor_clears_this_gate() {
+        let gate = gate_for("humanebench-override-does-not-answer.json");
+        assert_eq!(ids(&gate.unanswered_blocking()), vec!["1#1"]);
+        assert!(!gate.overridden, "a HumaneBench bypass must not clear the KNIGHTWATCH gate");
+        assert!(matches!(decide(&gate, 998, None), Decision::Refuse { .. }));
+    }
+
+    /// THE POSITIVE CONTROL. Without it, both tests above are satisfied by a gate that refuses
+    /// EVERYTHING — including a change that broke answering outright.
+    #[test]
+    fn an_ordinary_reply_still_answers_a_probe() {
+        let gate = gate_for("plain-reply-still-answers.json");
+        assert!(gate.unanswered_blocking().is_empty(), "a plain `Probe 1 — applied` reply answers");
+        assert_eq!(decide(&gate, 998, None), Decision::Allow);
+    }
+
+    /// The FALSE-REFUSAL half, mirroring [`quoted-override-still-answers`]. GitHub Quote-reply
+    /// reproduces the quoted body's raw markdown, HTML marker included, every line prefixed `> `.
+    /// A whole-body `contains` test would reclassify this genuine answer as a verdict record and
+    /// drop it — refusing the merge and telling the author to cite the probe they just cited, the
+    /// failure rule 4 exists to prevent. So the marker test ignores blockquoted lines.
+    #[test]
+    fn quoting_a_humanebench_verdict_does_not_disqualify_an_answer() {
+        let comments = parse_comments(&read_fixture("quoted-humanebench-verdict-still-answers.json"))
+            .expect("a fixture must parse");
+        assert!(
+            comments[2].body.contains(HUMANEBENCH_VERDICT_MARKER),
+            "precondition: the human reply reproduces the marker, only inside a blockquote"
+        );
+        let gate = evaluate(&comments);
+        assert!(gate.unanswered_blocking().is_empty(), "the quoting reply still answers");
+        assert_eq!(decide(&gate, 998, None), Decision::Allow);
+    }
+
+    /// THE RESIDUAL FAIL-OPEN, closed (roborev on the commit that registered the marker; epic
+    /// `sparkle-9o0649`).
+    ///
+    /// Registering the marker was not sufficient on its own. The first discriminator asked whether
+    /// the marker appeared on a NON-blockquoted line, and a verdict that FAILED that test was
+    /// classified as an ANSWER — the unsafe direction. Its doc comment reasoned about one
+    /// producer-format hazard (a heading line ABOVE the marker, which the unquoted test survives)
+    /// and not the symmetric one: a producer that emits its marker INSIDE a leading quoted block.
+    ///
+    /// That shape is not hypothetical. It is this repo's own reviewer-body convention — an HTML
+    /// marker beside a `> ` header block — with the two lines inverted, which is one formatting
+    /// choice away. The fixture is that body: the marker is quoted, and the verdict's OWN reasoning
+    /// prose sits unquoted below it citing both `probe 1` and `1#1`. Under the old rule the verdict
+    /// entered the replier set, its incidental prose marked the unanswered `[blocking]` probe
+    /// answered, and `decide` returned `Allow` — with nothing in the corpus, the shell suite or this
+    /// suite going red.
+    ///
+    /// THE PRECONDITIONS BELOW ARE THE MUTATION PROOF, in the test itself: this body carries the
+    /// marker on NO unquoted line, so [`has_unquoted_marker`] — the whole of the old rule — returns
+    /// false for it. Restore that rule as the discriminator and this test flips to `Allow`.
+    #[test]
+    fn a_blockquoted_humanebench_verdict_can_never_answer_a_probe() {
+        let name = "blockquoted-humanebench-verdict-does-not-answer.json";
+        let comments = parse_comments(&read_fixture(name)).expect("a fixture must parse");
+        let verdict = &comments[1];
+
+        assert!(
+            verdict.body.contains(HUMANEBENCH_VERDICT_MARKER),
+            "precondition: the body carries the verdict marker"
+        );
+        assert!(
+            !has_unquoted_marker(&verdict.body, HUMANEBENCH_VERDICT_MARKER),
+            "precondition: the marker is on NO unquoted line — this is exactly the body the old \
+             unquoted-line rule classified as an ANSWER"
+        );
+        assert!(
+            cites_ignoring_quoting(&verdict.body, 1),
+            "precondition: the verdict's own prose cites probe 1"
+        );
+        assert!(
+            verdict.body.contains("1#1"),
+            "precondition: it carries the durable citation too, so both replier filters are pinned"
+        );
+        assert!(
+            cites_probe(&verdict.body, 1),
+            "precondition: the citation is on an UNQUOTED line, so the blockquote rule in the \
+             citation scan is NOT what produces the refusal — the classification is"
+        );
+
+        assert!(is_foreign_gate_record(&verdict.body), "it is a record, not a reply");
+        let gate = evaluate(&comments);
+        assert_eq!(ids(&gate.unanswered_blocking()), vec!["1#1"]);
+        assert!(!gate.overridden, "a verdict is not a probe-gate override record");
+        assert!(
+            matches!(decide(&gate, 998, None), Decision::Refuse { .. }),
+            "the merge must still be REFUSED — a blockquoted marker is still a foreign gate record"
+        );
+    }
+
+    /// The same inversion applied to the STANDALONE HumaneBench bypass record. The two markers are
+    /// tested separately (see [`HUMANEBENCH_OVERRIDE_MARKER`]), so a fix covering only the verdict
+    /// would leave half the door open. Both halves must hold at once: it cannot ANSWER a probe, and
+    /// it must not set `overridden` — only [`OVERRIDE_MARKER`] clears THIS gate.
+    #[test]
+    fn a_blockquoted_humanebench_bypass_can_never_answer_a_probe() {
+        let name = "blockquoted-humanebench-override-does-not-answer.json";
+        let comments = parse_comments(&read_fixture(name)).expect("a fixture must parse");
+        let record = &comments[1];
+
+        assert!(
+            !has_unquoted_marker(&record.body, HUMANEBENCH_OVERRIDE_MARKER),
+            "precondition: the marker is on NO unquoted line"
+        );
+        assert!(
+            cites_probe(&record.body, 1) && record.body.contains("1#1"),
+            "precondition: both citation forms are present on UNQUOTED lines"
+        );
+
+        assert!(is_foreign_gate_record(&record.body));
+        let gate = evaluate(&comments);
+        assert_eq!(ids(&gate.unanswered_blocking()), vec!["1#1"]);
+        assert!(!gate.overridden, "a HumaneBench bypass must not clear the KNIGHTWATCH gate");
+        assert!(matches!(decide(&gate, 998, None), Decision::Refuse { .. }));
+    }
+
+    /// THE OTHER HALF OF THE EXCEPTION, asserted where it can actually fail.
+    ///
+    /// The quote-reply exception needs BOTH [`marker_quoted_with_record_body`] and
+    /// [`has_own_unquoted_prose`]. This body has the first and not the second: a record quoted in
+    /// its ENTIRETY with nothing of the author's own beneath it. That is the record, not a reply to
+    /// it, and dropping `has_own_unquoted_prose` from the conjunction flips this assertion.
+    ///
+    /// It is asserted on the CLASSIFIER rather than on the gate verdict on purpose. On the gate the
+    /// refusal is over-determined — every citation in this body is blockquoted and the citation
+    /// scan already drops `>` lines — so a gate-level assertion would go green with the
+    /// classification wrong. The corpus keeps the fixture as the cross-rule regression guard; this
+    /// is where the rule itself is pinned.
+    #[test]
+    fn a_wholly_quoted_record_is_a_record_not_a_reply() {
+        let name = "wholly-quoted-humanebench-verdict-does-not-answer.json";
+        let comments = parse_comments(&read_fixture(name)).expect("a fixture must parse");
+        let record = &comments[1];
+
+        assert!(
+            marker_quoted_with_record_body(&record.body, HUMANEBENCH_VERDICT_MARKER),
+            "precondition: the marker IS wholly quoted with the record around it — the first half \
+             of the exception is satisfied, so only the second half can produce the verdict"
+        );
+        assert!(
+            !has_own_unquoted_prose(&record.body),
+            "precondition: the author wrote nothing of their own"
+        );
+        assert!(is_foreign_gate_record(&record.body));
+    }
+
+    /// THE POSITIVE CONTROL FOR THE CLASSIFIER, without which every assertion above is satisfied by
+    /// a rule that calls EVERY body a foreign record. A human quote-reply — the whole record
+    /// quoted, their own answer beneath it — must classify as a reply, and
+    /// `quoted-humanebench-verdict-still-answers.json` must stay green end to end.
+    #[test]
+    fn a_human_quote_reply_is_still_a_reply() {
+        let comments = parse_comments(&read_fixture("quoted-humanebench-verdict-still-answers.json"))
+            .expect("a fixture must parse");
+        assert!(
+            comments[2].body.contains(HUMANEBENCH_VERDICT_MARKER),
+            "precondition: the reply reproduces the marker"
+        );
+        assert!(
+            !is_foreign_gate_record(&comments[2].body),
+            "a faithful quote of a record, answered beneath, is a REPLY"
+        );
+        // …and the record it quotes is still a record.
+        assert!(is_foreign_gate_record(&comments[1].body));
+        // An ordinary reply that never touches the marker is untouched by any of this.
+        assert!(!is_foreign_gate_record("Probe 1 — applied: the marker is registered now."));
+    }
+
     /// THE RECORDED PROBE OVERRIDE MUST NOT WAIVE AN UNREVIEWED HEAD — and this is a PARITY pin,
     /// not a new rule.
     ///
@@ -2821,6 +3195,71 @@ mod tests {
             "this literal is duplicated in scripts/pr-review.sh (the producer) and \
              scripts/probe-gate.sh (the shell consumer); changing one without the others makes the \
              in-app gate stop recognising Sparkle's own reviews"
+        );
+    }
+
+    /// THE PRODUCER PIN for the HumaneBench markers, READ FROM DISK rather than restated.
+    ///
+    /// Two consumers (this file and `scripts/probe-gate.sh`) and one producer
+    /// (`scripts/humanebench-pr-comment.sh`) each hardcode these strings separately, and drift
+    /// between them fails SILENTLY IN THE UNSAFE DIRECTION: a renamed producer marker makes the
+    /// registration inert, every fixture in the corpus stays green (the corpus is hand-written and
+    /// cannot see a producer it does not contain), and the merge-gate bypass the registration
+    /// exists to close is live again. A literal-vs-literal assertion cannot catch that — it only
+    /// restates one of the copies — so this reads the other two files.
+    ///
+    /// The shell suite drives the producer end to end (`scripts/tests/probe-gate.test.sh`); this is
+    /// the half that fails in the Rust suite, where a change to this file is most likely made.
+    ///
+    /// HB_OVERRIDE_MARKER IS DELIBERATELY NOT WHAT THE PRODUCER EMITS. The producer writes its
+    /// override record as a region INSIDE the verdict comment, delimited by
+    /// `<!-- sparkle:humanebench-override:begin -->` / `...:end -->`, neither of which contains
+    /// [`HUMANEBENCH_OVERRIDE_MARKER`]. That is not a gap: such a body always carries the VERDICT
+    /// marker too, so it is already excluded. This marker covers the other shape — a STANDALONE
+    /// bypass comment — which nothing emits yet. Asserted here so the next reader does not "fix"
+    /// the mismatch by deleting a live guard.
+    #[test]
+    fn the_humanebench_markers_match_the_producer_and_the_shell_consumer() {
+        let scripts = fixture_dir().join("../../..");
+        let read = |name: &str| {
+            let path = scripts.join(name);
+            std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("{} must exist: {e}", path.display()))
+        };
+        // `NAME='<value>'` out of a shell assignment, anchored at the start of a line.
+        let shell_const = |src: &str, name: &str| -> String {
+            let line = src
+                .lines()
+                .find(|l| l.starts_with(&format!("{name}=")))
+                .unwrap_or_else(|| panic!("no `{name}=` assignment found"));
+            line[name.len() + 1..].trim_matches('\'').to_string()
+        };
+
+        let producer = read("humanebench-pr-comment.sh");
+        let consumer = read("probe-gate.sh");
+
+        assert_eq!(
+            shell_const(&producer, "MARKER"),
+            HUMANEBENCH_VERDICT_MARKER,
+            "the producer emits a marker this gate does not look for — the registration is INERT \
+             and a verdict can answer a probe again"
+        );
+        assert_eq!(
+            shell_const(&consumer, "HB_VERDICT_MARKER"),
+            HUMANEBENCH_VERDICT_MARKER,
+            "the shell gate and the in-app gate disagree about the verdict marker"
+        );
+        assert_eq!(
+            shell_const(&consumer, "HB_OVERRIDE_MARKER"),
+            HUMANEBENCH_OVERRIDE_MARKER,
+            "the shell gate and the in-app gate disagree about the bypass marker"
+        );
+        assert!(
+            producer.contains("<!-- sparkle:humanebench-override:begin -->")
+                && !producer.contains(HUMANEBENCH_OVERRIDE_MARKER),
+            "the producer's override region is still the `:begin`/`:end` pair, so \
+             HUMANEBENCH_OVERRIDE_MARKER still covers only the standalone shape — if this fails, \
+             the producer started emitting the standalone record and this comment needs revisiting"
         );
     }
 

@@ -1,0 +1,110 @@
+{
+  "_readme": [
+    "STARTER PACK \u2014 authored to be REPLACED by upstream. JSON has no comment syntax, so this",
+    "key is the header comment; the loader ignores unknown keys.",
+    "Nobody at Sparkle is an authority on what the law says. The HumaneBench project and",
+    "community are expected to define and maintain the real packs; this exists so the",
+    "mechanism has something to run against on day one.",
+    "Every 'guidance' string below is a NON-AUTHORITATIVE PLAIN-LANGUAGE PARAPHRASE. The",
+    "'source' URL governs.",
+    "THE DATES MATTER HERE AND ARE THE PACK AUTHOR'S READING OF ART. 113. The Act applies in",
+    "stages: the Art. 5 prohibitions from 2 Feb 2025; Chapter IV \u2014 which contains ALL of",
+    "Art. 50, both 50(1) and 50(2) \u2014 from 2 Aug 2026; and the Art. 6(1) high-risk",
+    "classification rules with their Chapter III obligations from 2 Aug 2027.",
+    "Art. 50(2) is dated 2 Aug 2026 with the rest of Chapter IV. Its marking duty is",
+    "conditioned on technical feasibility and on harmonised standards still in development,",
+    "but that is a question about what the duty REQUIRES, not about when it applies, and a",
+    "later date here would make every citation say 'Not yet in force' about a duty that is.",
+    "Confirm every date against the source before relying on it \u2014 that is exactly what the",
+    "citation asks counsel to do.",
+    "There is no deterministic detector for either Art. 50 duty \u2014 whether a disclosure is",
+    "adequate, or whether output is marked machine-readably, is a judgement about the whole",
+    "product rather than a string match. Both are therefore authored as JUDGED checks. The",
+    "loader REJECTS a pack naming an unregistered detector, so a check can no longer point at",
+    "a detector that does not exist and sit silent forever.",
+    "This pack never asserts compliance. A check that does not fire means nothing fired \u2014",
+    "not that a product is lawful.",
+    "REMOVED 2026-08-22: a speculative Art. 6 / Annex III high-risk check. It was added only to exercise the future-dated advisory path against shipped data, and it was wrong twice over \u2014 Annex III classification is Art. 6(2), not 6(1), and its date was a guess. It also asked about a CLASSIFICATION rather than an unmet duty, so unlike every other check here it would fire on any AI-touching PR instead of only when something is wrong. Shipping a legal claim we are not sure of is exactly what this pack format exists to avoid; the advisory mechanism is covered by fixture tests and needs no shipped example."
+  ],
+  "pack": "eu-ai-act",
+  "version": "2026.08.2",
+  "maintainer": "buildinghumanetech",
+  "jurisdiction": [
+    "EU",
+    "EEA"
+  ],
+  "instrument": "Regulation (EU) 2024/1689 (AI Act)",
+  "source": "https://eur-lex.europa.eu/eli/reg/2024/1689/oj",
+  "notice": "Guidance text is a non-authoritative paraphrase and the effective dates are the pack author's reading of the Act's staged applicability; the source URL governs.",
+  "reviewRequired": true,
+  "checks": [
+    {
+      "id": "aiact-art50-1-ai-interaction-disclosure",
+      "article": "Art. 50(1)",
+      "title": "People must be told they are interacting with an AI system",
+      "principles": [
+        "be-transparent-and-honest",
+        "foster-healthy-relationships"
+      ],
+      "effectiveFrom": "2026-08-02",
+      "detect": {
+        "kind": "judged",
+        "question": "Does this change put a person into direct interaction with an AI system \u2014 a chat, an assistant, a generated reply, a synthetic voice \u2014 without telling them so, in a situation where it would not already be obvious to a reasonably well-informed person?"
+      },
+      "onFire": "blocking",
+      "guidance": "that a person interacting with an AI system be informed of that fact, unless it is obvious to a reasonably well-informed person in the circumstances",
+      "reviewRequired": true
+    },
+    {
+      "id": "aiact-art50-2-synthetic-content-marking",
+      "article": "Art. 50(2)",
+      "title": "Synthetic content must be marked as machine-readable",
+      "principles": [
+        "be-transparent-and-honest",
+        "protect-dignity-and-safety"
+      ],
+      "effectiveFrom": "2026-08-02",
+      "detect": {
+        "kind": "judged",
+        "question": "Does this change emit synthetic audio, image, video or text to people without marking it in a machine-readable format as artificially generated or manipulated?"
+      },
+      "onFire": "blocking",
+      "guidance": "that synthetic audio, image, video or text output be marked in a machine-readable format and detectable as artificially generated, so far as that is technically feasible",
+      "reviewRequired": true
+    },
+    {
+      "id": "aiact-art5-1-a-manipulative-techniques",
+      "article": "Art. 5(1)(a)",
+      "title": "No subliminal, purposefully manipulative or deceptive techniques",
+      "principles": [
+        "enable-meaningful-choices",
+        "protect-dignity-and-safety"
+      ],
+      "effectiveFrom": "2025-02-02",
+      "detect": {
+        "kind": "judged",
+        "question": "Does this change use subliminal, purposefully manipulative or deceptive techniques that materially distort a person's behaviour and impair their ability to make an informed decision \u2014 for example a countdown, a shamed decline button, or a hidden default?"
+      },
+      "onFire": "blocking",
+      "guidance": "that an AI system not deploy subliminal, purposefully manipulative or deceptive techniques that materially distort behaviour and cause or are likely to cause significant harm",
+      "reviewRequired": true
+    },
+    {
+      "id": "aiact-art5-1-b-exploiting-vulnerability",
+      "article": "Art. 5(1)(b)",
+      "title": "No exploitation of age, disability or social or economic situation",
+      "principles": [
+        "protect-dignity-and-safety",
+        "prioritize-long-term-wellbeing"
+      ],
+      "effectiveFrom": "2025-02-02",
+      "detect": {
+        "kind": "judged",
+        "question": "Does this change exploit a vulnerability arising from a person's age, disability, or social or economic situation in order to distort their behaviour?"
+      },
+      "onFire": "blocking",
+      "guidance": "that an AI system not exploit vulnerabilities of age, disability, or a specific social or economic situation in a way that materially distorts behaviour and causes or is likely to cause significant harm",
+      "reviewRequired": true
+    }
+  ]
+}

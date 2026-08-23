@@ -666,59 +666,63 @@ describe("hydrateFromConfig — reflect config.toml into the store", () => {
     });
   });
 
-  describe("[tools].builder_index hydration", () => {
-    /** A minimal effective config whose [tools] block is whatever the caller passes. */
-    const eff = (tools?: Record<string, boolean>) =>
-      ({
-        config: {
-          workflow: {
-            require_pr: true,
-            worktree_isolation: true,
-            default_branch: "",
-            born_fresh_from_base: true,
-            delete_merged_branch: true,
-            drift: { behind_nudge: 10, ahead_nudge: 15, changed_lines: 1000 },
-          },
-          workers: { max_concurrent: 5 },
-          ai: {
-            auto_rename: true,
-            voice_dictation: true,
-            composer: true,
-            suggested_actions: true,
-            auto_approve: true,
-          },
-          ...(tools
-            ? {
-                tools: {
-                  analytics: true,
-                  beads: true,
-                  github: true,
-                  guardrails: true,
-                  roborev: true,
-                  onepassword: false,
-                  ...tools,
-                },
-              }
-            : {}),
-          roborev: { consent_prompted: false },
-          freshness: {
-            staleness_warn_commits: 25,
-            stale_build_block_commits: 25,
-            require_fresh_branch: true,
-          },
-          capture: { popover_shortcut: "ctrl+shift+r" },
-          done: { description: null, criteria: [] },
-          delivered: {
-            description: null,
-            detected_method: null,
-            confidence: null,
-            confidence_note: null,
-            learned: false,
-            criteria: [],
-          },
+  /** A minimal effective config whose [tools] block is whatever the caller passes. Hoisted out of
+   *  the builder_index block so the humanebench block below reads the SAME payload shape — two
+   *  hand-kept copies is how one of them stops modelling what the backend actually sends. */
+  const toolsEff = (tools?: Record<string, boolean>) =>
+    ({
+      config: {
+        workflow: {
+          require_pr: true,
+          worktree_isolation: true,
+          default_branch: "",
+          born_fresh_from_base: true,
+          delete_merged_branch: true,
+          drift: { behind_nudge: 10, ahead_nudge: 15, changed_lines: 1000 },
         },
-        warnings: [],
-      }) satisfies EffectiveConfig;
+        workers: { max_concurrent: 5 },
+        ai: {
+          auto_rename: true,
+          voice_dictation: true,
+          composer: true,
+          suggested_actions: true,
+          auto_approve: true,
+        },
+        ...(tools
+          ? {
+              tools: {
+                analytics: true,
+                beads: true,
+                github: true,
+                guardrails: true,
+                roborev: true,
+                onepassword: false,
+                ...tools,
+              },
+            }
+          : {}),
+        roborev: { consent_prompted: false },
+        freshness: {
+          staleness_warn_commits: 25,
+          stale_build_block_commits: 25,
+          require_fresh_branch: true,
+        },
+        capture: { popover_shortcut: "ctrl+shift+r" },
+        done: { description: null, criteria: [] },
+        delivered: {
+          description: null,
+          detected_method: null,
+          confidence: null,
+          confidence_note: null,
+          learned: false,
+          criteria: [],
+        },
+      },
+      warnings: [],
+    }) satisfies EffectiveConfig;
+
+  describe("[tools].builder_index hydration", () => {
+    const eff = toolsEff;
 
     it("mirrors an explicit true", () => {
       useSettingsStore.getState().hydrateFromConfig(eff({ builder_index: true }));
@@ -736,6 +740,41 @@ describe("hydrateFromConfig — reflect config.toml into the store", () => {
       useSettingsStore.getState().hydrateFromConfig(eff({ builder_index: true }));
       useSettingsStore.getState().hydrateFromConfig(eff());
       expect(useSettingsStore.getState().builderIndexEnabled).toBe(false);
+    });
+  });
+
+  describe("[tools].humanebench hydration — the on-by-default humaneness gate", () => {
+    it("mirrors an explicit false", () => {
+      useSettingsStore.getState().hydrateFromConfig(toolsEff({ humanebench: false }));
+      expect(useSettingsStore.getState().humanebenchEnabled).toBe(false);
+    });
+
+    it("reads an ABSENT key as ON — the claim this tool lives or dies by", () => {
+      // Seeded OFF FIRST, deliberately. The store already initialises `humanebenchEnabled: true`,
+      // so hydrating a key-less payload into a pristine store would go green against a hydrate
+      // that read nothing at all — the vacuous version of this exact test.
+      useSettingsStore.getState().hydrateFromConfig(toolsEff({ humanebench: false }));
+      expect(useSettingsStore.getState().humanebenchEnabled).toBe(false);
+
+      // A [tools] block that talks about other tools and never mentions this one…
+      useSettingsStore.getState().hydrateFromConfig(toolsEff({}));
+      expect(useSettingsStore.getState().humanebenchEnabled).toBe(true);
+
+      // …and a payload with no [tools] block at all (a backend predating the key). Neither is an
+      // opt-out: a safety review that a missing line can switch off is not a gate.
+      useSettingsStore.getState().hydrateFromConfig(toolsEff({ humanebench: false }));
+      useSettingsStore.getState().hydrateFromConfig(toolsEff());
+      expect(useSettingsStore.getState().humanebenchEnabled).toBe(true);
+    });
+
+    it("routes setToolEnabled('humanebench') to the humanebenchEnabled field", () => {
+      // TOOL_FIELD is the only thing joining the key to the field. A wrong entry writes a stray
+      // key onto the store: the config write still lands, so the row looks like it works while
+      // the switch never moves.
+      useSettingsStore.getState().setToolEnabled("humanebench", false);
+      expect(useSettingsStore.getState().humanebenchEnabled).toBe(false);
+      useSettingsStore.getState().setToolEnabled("humanebench", true);
+      expect(useSettingsStore.getState().humanebenchEnabled).toBe(true);
     });
   });
 

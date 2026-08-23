@@ -140,6 +140,12 @@ export interface ToolsConfig {
   beads: boolean;
   github: boolean;
   guardrails: boolean;
+  /** Score a pull request that changes what Sparkle says or does to a person against
+   *  HumaneBench's 8 humane-technology principles, and block a below-the-bar merge until a human
+   *  overrides it. Defaults ON. Optional so callers guard: a Rust backend predating the key omits
+   *  it, and the hydrate resolves an absent value through `?? true` — the same back-compat rule
+   *  the `builder_index`/`straude` pair uses, in the opposite direction. */
+  humanebench?: boolean;
   roborev: boolean;
   /** Back your `.env*` files up to a 1Password vault. The one tool here that defaults OFF — it
    *  needs a 1Password account, the `op` CLI, and a chosen vault before it can do anything. */

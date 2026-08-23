@@ -1,0 +1,80 @@
+{
+  "_readme": [
+    "STARTER PACK — authored to be REPLACED by upstream. JSON has no comment syntax, so this",
+    "key is the header comment; the loader ignores unknown keys.",
+    "Nobody at Sparkle is an authority on what the law says. The HumaneBench project and",
+    "community are expected to define and maintain the real packs; this exists so the",
+    "mechanism has something to run against on day one.",
+    "Every 'guidance' string below is a NON-AUTHORITATIVE PLAIN-LANGUAGE PARAPHRASE. The",
+    "'source' URL governs. Effective dates are the pack author's reading of the instrument",
+    "and must be confirmed by counsel.",
+    "The Directive itself sets functional accessibility requirements; conformity is presumed",
+    "via the harmonised standard EN 301 549, which incorporates WCAG 2.1 level AA. The",
+    "checks below name the WCAG success criterion because that is the testable artefact, and",
+    "cite the Directive as the instrument because that is what has legal force.",
+    "A check binds to a detector by ID, and there is no deterministic detector for every",
+    "criterion. SC 4.1.3 is therefore authored as a JUDGED check rather than pointed at a",
+    "detector id that does not exist: a judged check that asks is honest, a detector check",
+    "that can never fire is a silent hole. The loader REJECTS a pack naming an unregistered",
+    "detector, so this cannot regress quietly.",
+    "This pack never asserts compliance. A check that does not fire means nothing fired —",
+    "not that a product is lawful."
+  ],
+  "pack": "eu-accessibility-act",
+  "version": "2026.08.2",
+  "maintainer": "buildinghumanetech",
+  "jurisdiction": ["EU", "EEA"],
+  "instrument": "Directive (EU) 2019/882 (European Accessibility Act), via EN 301 549 / WCAG 2.1 AA",
+  "source": "https://eur-lex.europa.eu/eli/dir/2019/882/oj",
+  "notice": "Guidance text is a non-authoritative paraphrase; the source URL governs. WCAG criteria are cited as the testable expression of the Directive's functional requirements, not as law in themselves.",
+  "reviewRequired": true,
+  "checks": [
+    {
+      "id": "eaa-wcag-2-1-1-keyboard",
+      "article": "Annex I (EN 301 549 / WCAG 2.1 SC 2.1.1 Keyboard)",
+      "title": "Every control must be operable from the keyboard",
+      "principles": ["design-for-equity-and-inclusion", "enhance-human-capabilities"],
+      "effectiveFrom": "2025-06-28",
+      "detect": { "kind": "detector", "detectorId": "interactive-no-keyboard-path" },
+      "onFire": "blocking",
+      "guidance": "that all functionality be operable through a keyboard interface, without requiring specific timings for individual keystrokes",
+      "reviewRequired": true
+    },
+    {
+      "id": "eaa-wcag-1-1-1-non-text-content",
+      "article": "Annex I (EN 301 549 / WCAG 2.1 SC 1.1.1 Non-text Content)",
+      "title": "Non-text content needs a text alternative",
+      "principles": ["design-for-equity-and-inclusion"],
+      "effectiveFrom": "2025-06-28",
+      "detect": { "kind": "detector", "detectorId": "meaningful-image-no-alt" },
+      "onFire": "blocking",
+      "guidance": "that images, icons and other non-text content carry a text alternative serving the equivalent purpose, so it can be rendered as speech, braille or larger text",
+      "reviewRequired": true
+    },
+    {
+      "id": "eaa-wcag-4-1-3-status-messages",
+      "article": "Annex I (EN 301 549 / WCAG 2.1 SC 4.1.3 Status Messages)",
+      "title": "Status messages must reach assistive technology",
+      "principles": ["design-for-equity-and-inclusion", "respect-user-attention"],
+      "effectiveFrom": "2025-06-28",
+      "detect": {
+        "kind": "judged",
+        "question": "Does this change show a status update a sighted user would notice — a save confirmation, an inline validation error, a progress or result count — without exposing it to assistive technology, so a screen-reader user would never learn it happened?"
+      },
+      "onFire": "review",
+      "guidance": "that a status change a sighted user would see — a saved confirmation, an error, a progress update — be exposed to assistive technology without moving focus",
+      "reviewRequired": true
+    },
+    {
+      "id": "eaa-wcag-1-4-1-use-of-colour",
+      "article": "Annex I (EN 301 549 / WCAG 2.1 SC 1.4.1 Use of Color)",
+      "title": "Colour must not be the only way meaning is conveyed",
+      "principles": ["design-for-equity-and-inclusion"],
+      "effectiveFrom": "2025-06-28",
+      "detect": { "kind": "detector", "detectorId": "state-by-color-alone" },
+      "onFire": "review",
+      "guidance": "that colour never be the only visual means of conveying information, indicating an action, prompting a response or distinguishing an element",
+      "reviewRequired": true
+    }
+  ]
+}

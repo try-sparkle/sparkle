@@ -1,0 +1,63 @@
+{
+  "_readme": [
+    "STARTER PACK — authored to be REPLACED by upstream. JSON has no comment syntax, so this",
+    "key is the header comment; the loader ignores unknown keys.",
+    "Nobody at Sparkle is an authority on what the law says. The HumaneBench project and",
+    "community are expected to define and maintain the real packs; this exists so the",
+    "mechanism has something to run against on day one.",
+    "Every 'guidance' string below is a NON-AUTHORITATIVE PLAIN-LANGUAGE PARAPHRASE. The",
+    "'source' URL governs. Effective dates are the pack author's reading of the instrument",
+    "and must be confirmed by counsel.",
+    "This pack never asserts compliance. A check that does not fire means nothing fired —",
+    "not that a product is lawful."
+  ],
+  "pack": "eu-gdpr",
+  "version": "2026.08.1",
+  "maintainer": "buildinghumanetech",
+  "jurisdiction": ["EU", "EEA"],
+  "instrument": "Regulation (EU) 2016/679",
+  "source": "https://eur-lex.europa.eu/eli/reg/2016/679/oj",
+  "notice": "Guidance text is a non-authoritative paraphrase; the source URL governs.",
+  "reviewRequired": true,
+  "checks": [
+    {
+      "id": "gdpr-art7-3-withdrawal-symmetry",
+      "article": "Art. 7(3)",
+      "title": "Withdrawing consent must be as easy as giving it",
+      "principles": ["enable-meaningful-choices"],
+      "effectiveFrom": "2018-05-25",
+      "detect": { "kind": "detector", "detectorId": "consent-withdrawal-asymmetry" },
+      "onFire": "blocking",
+      "guidance": "that a person can withdraw consent as easily as they gave it, and that they be told so before they consent",
+      "reviewRequired": true
+    },
+    {
+      "id": "gdpr-art25-protection-by-design-and-default",
+      "article": "Art. 25",
+      "title": "Data protection by design and by default",
+      "principles": ["protect-dignity-and-safety", "enable-meaningful-choices"],
+      "effectiveFrom": "2018-05-25",
+      "detect": {
+        "kind": "judged",
+        "question": "Does this change collect, store, share or expose personal data BY DEFAULT — that is, without the person having deliberately turned it on?"
+      },
+      "onFire": "review",
+      "guidance": "that privacy-protective settings be the default, so that personal data is not made accessible to more people, or kept for longer, than the feature actually needs",
+      "reviewRequired": true
+    },
+    {
+      "id": "gdpr-art5-1-c-data-minimisation",
+      "article": "Art. 5(1)(c)",
+      "title": "Data minimisation",
+      "principles": ["protect-dignity-and-safety", "prioritize-long-term-wellbeing"],
+      "effectiveFrom": "2018-05-25",
+      "detect": {
+        "kind": "judged",
+        "question": "Does this change capture personal data fields that the feature it implements does not actually need in order to work?"
+      },
+      "onFire": "review",
+      "guidance": "that personal data be adequate, relevant and limited to what is necessary for the stated purpose",
+      "reviewRequired": true
+    }
+  ]
+}

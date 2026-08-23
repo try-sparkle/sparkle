@@ -1,0 +1,184 @@
+// Guards the ONE local delta Sparkle carries against upstream HumaneBench: `formatPrompt` must
+// splice the payload in with replacer FUNCTIONS, not replacement STRINGS.
+//
+// Why this test compiles the vendored source instead of importing it: the evaluator is a
+// standalone CLI whose module scope `require()`s three optional npm packages this repo does not
+// install, and `formatPrompt` is not exported. So we lift the two production constructs the patch
+// lives in -- `HUMANEBENCH_TEMPLATE` and `formatPrompt` -- out of the vendored file BY THEIR REAL
+// BYTES, transpile them, and drive them. Revert the patch in humanebench_evaluator.ts and these
+// tests go red; that is the point.
+
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { beforeAll, describe, expect, it } from "vitest";
+import { transformWithEsbuild } from "vite";
+
+const HERE = dirname(fileURLToPath(import.meta.url));
+const EVALUATOR = join(HERE, "humanebench_evaluator.ts");
+const SOURCE = readFileSync(EVALUATOR, "utf8");
+
+/** Slice out `[startMarker … endMarker]` from the vendored source, inclusive of both. */
+function lift(startMarker: string, endMarker: string): string {
+  const start = SOURCE.indexOf(startMarker);
+  if (start === -1) {
+    throw new Error(
+      `humanebench_evaluator.ts no longer contains ${JSON.stringify(startMarker)} — the vendored ` +
+        `file was re-vendored or restructured; re-point this guard before trusting it.`,
+    );
+  }
+  const end = SOURCE.indexOf(endMarker, start + startMarker.length);
+  if (end === -1) {
+    throw new Error(
+      `could not find ${JSON.stringify(endMarker)} after ${JSON.stringify(startMarker)} in ` +
+        `humanebench_evaluator.ts — re-point this guard.`,
+    );
+  }
+  return SOURCE.slice(start, end + endMarker.length);
+}
+
+let formatPrompt: (userPrompt: string, messageContent: string) => string;
+let template: string;
+
+beforeAll(async () => {
+  const ts = [
+    lift("const HUMANEBENCH_TEMPLATE = `", "\n`;\n"),
+    lift("function formatPrompt(", "\n}\n"),
+  ].join("\n");
+  const { code } = await transformWithEsbuild(ts, "humanebench_evaluator_excerpt.ts", {
+    loader: "ts",
+  });
+  const built = new Function(`${code}\nreturn { HUMANEBENCH_TEMPLATE, formatPrompt };`)() as {
+    HUMANEBENCH_TEMPLATE: string;
+    formatPrompt: typeof formatPrompt;
+  };
+  formatPrompt = built.formatPrompt;
+  template = built.HUMANEBENCH_TEMPLATE;
+});
+
+// Every special pattern `String.prototype.replace` honours in a replacement STRING. Sparkle feeds
+// this evaluator source code and unified diffs, so all of these occur in real payloads.
+const DOLLAR_SOUP = [
+  "const price = `$${amount}`;",
+  "sed -i 's/$&/AMP/' file.ts",
+  "backtick form: $` and quote form: $'",
+  'result.replace(/(a)(b)/, "$1-$2")',
+  "awk '{print $1, $2}' < in.txt",
+  "$$ is a literal dollar in a replacement string",
+].join("\n");
+
+describe("formatPrompt (SPARKLE PATCH: humanebench-gate)", () => {
+  it("carries the patch marker so a naive re-vendor cannot silently revert it", () => {
+    expect(SOURCE).toContain("// SPARKLE PATCH (humanebench-gate)");
+  });
+
+  it("preserves a $-dense user prompt byte-for-byte", () => {
+    const out = formatPrompt(DOLLAR_SOUP, "irrelevant response");
+    expect(out).toContain(DOLLAR_SOUP);
+  });
+
+  it("preserves a $-dense assistant response byte-for-byte", () => {
+    const out = formatPrompt("irrelevant prompt", DOLLAR_SOUP);
+    expect(out).toContain(DOLLAR_SOUP);
+  });
+
+  it("does not let $& expand to the placeholder it replaced", () => {
+    // Upstream's replacement-string form turns "$&" into the matched text, i.e. the literal
+    // "{user_prompt}" / "{message_content}". Both placeholders must be gone from the output.
+    const out = formatPrompt("before $& after", "response $& tail");
+    expect(out).toContain("before $& after");
+    expect(out).toContain("response $& tail");
+    expect(out).not.toContain("{user_prompt}");
+    expect(out).not.toContain("{message_content}");
+  });
+
+  it("does not let $` splice the rubric preamble into the payload", () => {
+    // "$`" expands to everything PRECEDING the match -- here, the whole rubric preamble, silently
+    // duplicated into the middle of the prompt. Count a distinctive preamble line to catch it.
+    const marker = "You are a HumaneBench v3.0 rubric evaluator";
+    expect(template.split(marker)).toHaveLength(2); // sanity: appears once upstream
+    const out = formatPrompt("lead $` trail", "resp $' tail");
+    expect(out.split(marker)).toHaveLength(2);
+    expect(out).toContain("lead $` trail");
+    expect(out).toContain("resp $' tail");
+  });
+
+  // ---------------------------------------------------------------------------------------------
+  // The OTHER half of the same silent-corruption family: the two substitutions used to run
+  // SEQUENTIALLY, each replacing the FIRST occurrence, with `{user_prompt}` earlier in the
+  // template than `{message_content}`. So a user-prompt payload containing the literal string
+  // `{message_content}` was spliced in first, and the SECOND substitution then matched the
+  // placeholder that had just arrived FROM THE PAYLOAD -- putting the assistant response inside
+  // the user-prompt section and leaving the real response slot as literal placeholder text.
+  //
+  // Payload-controlled, and not hypothetical for Sparkle: the gate is fed source code and unified
+  // diffs, so a diff touching this very file -- or any repo whose prompt templates use these
+  // tokens -- carries both placeholders verbatim.
+
+  /** The prompt text that follows the response heading, i.e. what lands in the response slot. */
+  const RESPONSE_HEADING = "## LLM Assistant's Response";
+  function responseSection(out: string): string {
+    const parts = out.split(RESPONSE_HEADING);
+    expect(parts).toHaveLength(2); // the heading must occur exactly once, or the split lies
+    return parts[1];
+  }
+  function userSection(out: string): string {
+    const start = out.indexOf("## User's Original Prompt");
+    expect(start).toBeGreaterThan(-1);
+    const end = out.indexOf(RESPONSE_HEADING, start);
+    expect(end).toBeGreaterThan(start);
+    return out.slice(start, end);
+  }
+
+  it("a user prompt containing {message_content} cannot capture the response slot", () => {
+    const out = formatPrompt("lead {message_content} trail", "RESPONSE-SENTINEL");
+
+    // The response actually reaches the response slot...
+    expect(responseSection(out)).toContain("RESPONSE-SENTINEL");
+    // ...and no UNSUBSTITUTED placeholder is left standing there. Note the assertion is scoped to
+    // the section: the literal `{message_content}` legitimately survives inside the USER section,
+    // because payload text is preserved byte-for-byte -- that is the whole point of the payload.
+    expect(responseSection(out)).not.toContain("{message_content}");
+
+    // ...and the response did NOT get spliced into the user's section, which is where the
+    // sequential form put it.
+    expect(userSection(out)).not.toContain("RESPONSE-SENTINEL");
+    expect(userSection(out)).toContain("lead {message_content} trail");
+  });
+
+  it("an assistant response containing {user_prompt} is not spliced into the user section", () => {
+    // The symmetric direction. Today the template happens to list `{user_prompt}` FIRST, so this
+    // direction survived even the sequential form -- which is exactly why it needs pinning: it is
+    // safe by an accident of template ordering, not by construction, and reordering the two
+    // headings would have turned the defect around without touching formatPrompt at all.
+    const out = formatPrompt("PROMPT-SENTINEL", "resp {user_prompt} tail");
+
+    expect(responseSection(out)).toContain("resp {user_prompt} tail");
+    expect(userSection(out)).toContain("PROMPT-SENTINEL");
+    expect(userSection(out)).not.toContain("resp {user_prompt} tail");
+  });
+
+  it("survives a payload carrying BOTH hazards at once ($& and a placeholder)", () => {
+    // Proves the two patches coexist: one pass over an alternation (no rescanning of inserted
+    // text) AND a replacer function (no `$`-pattern interpretation). Either patch alone leaves
+    // this payload corrupted.
+    const payload = "diff: $& and {message_content} and $` and $1";
+    const out = formatPrompt(payload, "RESPONSE-SENTINEL");
+
+    expect(userSection(out)).toContain(payload); // byte-for-byte, `$` sequences intact
+    expect(responseSection(out)).toContain("RESPONSE-SENTINEL");
+    expect(responseSection(out)).not.toContain("{message_content}");
+    // `$`` would have duplicated the rubric preamble; the placeholder capture would have moved
+    // the response. Neither happened.
+    expect(out.split("You are a HumaneBench v3.0 rubric evaluator")).toHaveLength(2);
+  });
+
+  it("still substitutes ordinary payloads into both slots", () => {
+    // Anti-vacuity in the other direction: a guard that only proves "nothing was mangled" would
+    // also pass if formatPrompt substituted nothing at all.
+    const out = formatPrompt("PROMPT-SENTINEL", "RESPONSE-SENTINEL");
+    expect(out).toContain("PROMPT-SENTINEL");
+    expect(out).toContain("RESPONSE-SENTINEL");
+    expect(out).not.toBe(template);
+  });
+});

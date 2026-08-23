@@ -8,6 +8,7 @@ import {
   FiShield,
   FiRefreshCw,
   FiCheckCircle,
+  FiHeart,
   FiBookOpen,
   FiLayout,
   FiExternalLink,
@@ -85,6 +86,11 @@ export const TOOL_META = {
     name: "Guardrails",
     desc: "Opinionated quality workflow for the code Sparkle writes: test-first, run the tests and typechecks before committing, and never call a red build done. Off removes it.",
     keywords: "guardrails tests typecheck quality",
+  },
+  humanebench: {
+    name: "HumaneBench",
+    desc: "Scores pull requests that change what Sparkle says or does to a person against HumaneBench's 8 humane-technology principles. Still being built — no review runs yet, so this records your preference rather than gating anything today.",
+    keywords: "humane humanebench ethics principles review gate wellbeing",
   },
   roborev: {
     name: "Roborev",
@@ -502,6 +508,7 @@ export function ToolsPane({ query = "" }: { query?: string }) {
   const beadsEnabled = useSettingsStore((s) => s.beadsEnabled);
   const githubEnabled = useSettingsStore((s) => s.githubEnabled);
   const guardrailsEnabled = useSettingsStore((s) => s.guardrailsEnabled);
+  const humanebenchEnabled = useSettingsStore((s) => s.humanebenchEnabled);
   const roborevEnabled = useSettingsStore((s) => s.roborevEnabled);
   const roborevAuthWarning = useSettingsStore((s) => s.roborevAuthWarning);
   const drainerEnabled = useSettingsStore((s) => s.drainerEnabled);
@@ -602,6 +609,17 @@ export function ToolsPane({ query = "" }: { query?: string }) {
       Icon: FiCheckCircle,
       checked: guardrailsEnabled,
       onToggle: () => void setToolEnabled("guardrails", !guardrailsEnabled),
+    },
+    {
+      // Sits beside Guardrails deliberately: both are on-by-default review gates over what an
+      // agent is about to land, and this pane is where a user sees the pair together. Plain
+      // `setToolEnabled` like Guardrails — no daemon to install, no consent modal, nothing to
+      // publish; the flag IS the whole tool.
+      ...TOOL_META.humanebench,
+      key: "humanebench",
+      Icon: FiHeart,
+      checked: humanebenchEnabled,
+      onToggle: () => void setToolEnabled("humanebench", !humanebenchEnabled),
     },
     {
       ...TOOL_META.roborev,

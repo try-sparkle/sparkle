@@ -265,6 +265,20 @@ pub struct ToolsConfig {
     /// "done". On (default) appends the guardrails workflow to every coding agent's system prompt;
     /// off omits it. Adaptive — strict where a test setup exists, a nudge where one doesn't.
     pub guardrails: bool,
+    /// The HumaneBench reviewer's preference. TODAY THIS FLAG RECORDS A CHOICE AND NOTHING ELSE —
+    /// nothing in the repo reads it, because the reviewer that would consume it is still being
+    /// built. Do not describe it, here or in user-facing copy, as gating anything.
+    ///
+    /// PLANNED, once the consumer lands: a pull request changing what Sparkle says or does to a
+    /// person is scored against HumaneBench's 8 humane-technology principles, and a score below
+    /// the bar holds the merge until a human overrides it; off skips the review. Whoever lands
+    /// that consumer MUST read this through the EFFECTIVE config, so the machine-wide scope below
+    /// holds at the point of use and not merely at the point of storage.
+    ///
+    /// Machine-wide like every key in this table, and here that scope is load-bearing rather than
+    /// incidental: a cloned repo must not be able to switch off its own humaneness gate simply by
+    /// being cloned, which is exactly what a per-project `[tools]` value would let it do.
+    pub humanebench: bool,
     /// The roborev per-commit AI code-review daemon. On (default) installs + runs reviews on your
     /// BUILD-agent commits using your existing `claude login`; off tears the daemon down and stops
     /// reviewing.
@@ -1951,6 +1965,7 @@ impl Default for SparkleConfig {
                 beads: true,
                 github: true,
                 guardrails: true,
+                humanebench: true,
                 // The default-OFF reporting tools: nothing about this machine reaches EITHER public
                 // leaderboard until the user turns one on AND answers its consent modal. They are
                 // independent destinations — turning one on says nothing about the other.
@@ -2305,6 +2320,7 @@ struct PartialTools {
     beads: Option<bool>,
     github: Option<bool>,
     guardrails: Option<bool>,
+    humanebench: Option<bool>,
     roborev: Option<bool>,
     builder_index: Option<bool>,
     straude: Option<bool>,
@@ -3347,6 +3363,9 @@ fn apply_tools(into: &mut ToolsConfig, p: Option<PartialTools>) {
     }
     if let Some(v) = p.guardrails {
         into.guardrails = v;
+    }
+    if let Some(v) = p.humanebench {
+        into.humanebench = v;
     }
     if let Some(v) = p.roborev {
         into.roborev = v;
@@ -5569,6 +5588,9 @@ beads      = true   # the in-repo work graph behind the Plan board; off hides it
 github     = true   # import a project from your GitHub repositories; off hides that path
 guardrails = true   # opinionated quality workflow (test-first, run tests+typecheck before commit,
                     # never call a red build "done") appended to every coding agent; off omits it
+humanebench = true  # score pull requests that change what Sparkle says or does to a person against
+                    # HumaneBench's 8 humane-technology principles. STILL BEING BUILT: no review runs
+                    # yet, so this records your preference. Off will skip the review entirely.
 roborev    = true   # per-commit AI code review of your BUILD-agent commits (uses your claude login)
 # One of the two default-OFF tools, and the only one that publishes anything about you. On, Sparkle
 # posts your DAILY TOKEN TOTALS (per day, per model — never file paths, prompts, code, or keys) to the
@@ -7907,6 +7929,85 @@ quit_app = 42
         assert!(warns.is_empty());
         assert!(!cfg.tools.guardrails);
         assert!(cfg.tools.analytics, "untouched tool keeps its default");
+    }
+
+    #[test]
+    fn humanebench_is_on_when_the_key_is_absent() {
+        // THE "on by default" CLAIM, asserted where it is most likely to regress: no config file
+        // at all, and a [tools] block that talks about some OTHER tool. Both must still review.
+        let (cfg, _, hard) = effective(None, None);
+        assert!(!hard);
+        assert!(cfg.tools.humanebench, "no config at all must still ship the reviewer on");
+
+        let g = "[tools]\nbeads = false\n";
+        let (cfg, warns, hard) = effective(Some(g), None);
+        assert!(!hard);
+        assert!(warns.is_empty());
+        assert!(
+            cfg.tools.humanebench,
+            "a [tools] block that never mentions humanebench must leave it ON — an absent key is \
+             not an opt-out"
+        );
+
+        // …and the shipped template, which is what `reset_config` actually writes, agrees.
+        let (cfg, _, hard) = effective(Some(DEFAULT_TEMPLATE), None);
+        assert!(!hard);
+        assert!(cfg.tools.humanebench, "DEFAULT_TEMPLATE disagrees with SparkleConfig::default()");
+    }
+
+    #[test]
+    fn the_templates_humanebench_line_is_a_live_key_not_a_lookalike() {
+        // The template is what a user actually edits, so a key misspelled THERE silently does
+        // nothing — and the default-true round-trip above cannot see it, because a dead key and a
+        // live one both leave the tool on. Flipping the shipped line is the only assertion that
+        // separates them. (Same reasoning as `the_generated_template_documents_the_denylist_and_
+        // parses`, which proves its commented example works verbatim once uncommented.)
+        let flipped = DEFAULT_TEMPLATE.replace("humanebench = true", "humanebench = false");
+        assert_ne!(
+            flipped, DEFAULT_TEMPLATE,
+            "DEFAULT_TEMPLATE carries no `humanebench = true` line for a user to edit"
+        );
+        let (cfg, warns, hard) = effective(Some(&flipped), None);
+        assert!(!hard, "the edited template must still parse: {warns:?}");
+        assert!(
+            !cfg.tools.humanebench,
+            "editing the template's humanebench line changed nothing — the key is spelled wrong \
+             there, and the line is decoration rather than configuration"
+        );
+    }
+
+    #[test]
+    fn global_can_disable_humanebench() {
+        // On by default; the MACHINE's owner can turn the gate off. Modelled on
+        // `global_can_disable_guardrails` — the same shape, because it is the same kind of tool.
+        let g = "[tools]\nhumanebench = false\n";
+        let (cfg, warns, hard) = effective(Some(g), None);
+        assert!(!hard);
+        assert!(warns.is_empty());
+        assert!(!cfg.tools.humanebench);
+        assert!(cfg.tools.guardrails, "untouched tool keeps its default");
+    }
+
+    #[test]
+    fn a_project_cannot_disable_humanebench() {
+        // THE SCOPE PROPERTY THAT MAKES THIS A SAFETY GATE RATHER THAN A PREFERENCE. [tools] is
+        // machine-wide, so a cloned repo cannot switch off its own humaneness review just by being
+        // cloned. Asserted in BOTH the states a project layer can find the machine in:
+        //   • no global opinion at all — the default stands;
+        let p = "[tools]\nhumanebench = false\n";
+        let (cfg, warns, hard) = effective(None, Some(p));
+        assert!(!hard);
+        assert!(cfg.tools.humanebench, "a project file must not be able to turn the reviewer off");
+        assert!(
+            warns.iter().any(|w| w.contains("[tools]") && w.contains("machine-wide")),
+            "the ignored project value must be REPORTED, or it reads as having taken effect: {warns:?}"
+        );
+
+        //   • and a global that deliberately turned it ON — the project still loses.
+        let g = "[tools]\nhumanebench = true\n";
+        let (cfg, _, hard) = effective(Some(g), Some(p));
+        assert!(!hard);
+        assert!(cfg.tools.humanebench, "the global layer stands over the project layer");
     }
 
     #[test]

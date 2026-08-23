@@ -63,6 +63,7 @@ function seedAllOn() {
     beadsEnabled: true,
     githubEnabled: true,
     guardrailsEnabled: true,
+    humanebenchEnabled: true,
     roborevEnabled: true,
     // NOT part of "all on": Builder Index and 1Password are the two tools that ship off, and
     // seeding either on here would hide a regression that flipped its default.
@@ -94,6 +95,7 @@ function seedAiOff() {
     beadsEnabled: true,
     githubEnabled: true,
     guardrailsEnabled: true,
+    humanebenchEnabled: true,
     roborevEnabled: true,
     // Every plugin on, derived from the store's own key set — a hand-listed pair would quietly
     // stop meaning "all on" the next time a plugin is added.
@@ -116,6 +118,7 @@ function seedAiSome() {
     beadsEnabled: true,
     githubEnabled: true,
     guardrailsEnabled: true,
+    humanebenchEnabled: true,
     roborevEnabled: true,
     pluginsEnabled: {
       ...useSettingsStore.getState().pluginsEnabled,
@@ -177,7 +180,7 @@ describe("ToolsPane", () => {
     expect(screen.getByText("Your tools")).toBeTruthy();
     expect(screen.getByText("Built into Sparkle")).toBeTruthy();
 
-    // Exactly the eighteen toggleable tools carry a switch. Superpowers is one of them: it used
+    // Exactly the twenty toggleable tools carry a switch. Superpowers is one of them: it used
     // to be an info-only showcase row, and is a real [plugins] toggle since the plugin pre-enable
     // work — a stale showcase copy would claim Sparkle ships something the user can't turn off.
     // The seven "sparkle*" rows come from Sparkle's own published marketplace.
@@ -185,10 +188,15 @@ describe("ToolsPane", () => {
     // Hand-listed on purpose, unlike the derived counts further down: this is the one assertion
     // that says WHICH rows the pane offers, so a new plugin must be added here deliberately. A
     // count derived from the store's key set would accept any row set at all.
-    expect(screen.getAllByRole("switch")).toHaveLength(19);
+    // 19 -> 20. A SILENT SEMANTIC MERGE: `HumaneBench` (this branch) and `Backlog drainer`
+    // (origin/main) were added to the hand-listed set on opposite sides, git took both names
+    // cleanly, and the count came from one side alone. The list is the source of truth — it is
+    // the assertion that says WHICH rows exist — so the number follows it, not the reverse.
+    expect(screen.getAllByRole("switch")).toHaveLength(20);
     for (const name of [
       "Deepgram voice",
       "Guardrails",
+      "HumaneBench",
       "Roborev",
       // Machine-wide autonomous loop, beside Roborev — the user-facing kill-switch for the
       // background backlog drainer (default ON; off uninstalls its launchd supervisor).
@@ -349,6 +357,54 @@ describe("ToolsPane", () => {
     expect(guardrails.disabled).toBe(false);
     fireEvent.click(guardrails);
     expect(setToolEnabled).toHaveBeenCalledWith("guardrails", false);
+  });
+
+  it("HumaneBench copy does not claim to gate a merge while nothing reads the flag", () => {
+    // A safety switch that says it is protecting you while doing nothing is worse than no switch:
+    // a user reads an on-by-default row, concludes their PRs are being scored and gated, and stops
+    // looking. Nothing reads `tools.humanebench` yet — the reviewer is still being built — so the
+    // row must not promise gating.
+    //
+    // DELETE THIS TEST when the consumer lands, and in the SAME change restore the gating language
+    // to TOOL_META.humanebench.desc. Until then this is the ratchet that stops the claim quietly
+    // coming back: the copy was written with it once already and roborev caught it.
+    const desc = TOOL_META.humanebench.desc;
+    // The alternation must cover the phrasing THIS REPO uses for the planned behaviour, not just
+    // the phrasing the copy happened to use when it was over-claiming. config.rs and settingsStore
+    // both say "holds the merge until a human overrides it" — `holds? back` does not match that,
+    // so the original ratchet would have waved through the exact sentence most likely to be pasted.
+    expect(desc).not.toMatch(
+      /blocks? the merge|holds? (?:back|the merge)|gates? the merge|until a human overrides/i,
+    );
+    expect(desc).toMatch(/still being built|not.{0,12}yet/i);
+  });
+
+  it("toggles HumaneBench through the [tools].humanebench flag (never AI-locked)", () => {
+    // seedAiOff FIRST, because this is the ONLY interleaving in which the claim is falsifiable.
+    // The row's disabled state is `disabled={t.ai ? aiOff : false}`, so under the file's default
+    // seedAllOn the expression is false for EVERY row whatever `ai` says — adding `ai: true` to
+    // the humanebench row (the exact regression this test names) would leave it green.
+    seedAiOff();
+    render(<ToolsPane />);
+    const humanebench = screen.getByRole("switch", { name: "HumaneBench" }) as HTMLButtonElement;
+    // NOT an `ai: true` row: the humaneness gate must not go dark just because the AI master is
+    // off, and it must not be reachable only through some other tool's consent modal.
+    expect(humanebench.disabled).toBe(false);
+    expect(humanebench.getAttribute("aria-checked")).toBe("true");
+    fireEvent.click(humanebench);
+    expect(setToolEnabled).toHaveBeenCalledWith("humanebench", false);
+  });
+
+  it("paints HumaneBench ON when nothing has ever been configured", () => {
+    // The shipped default, read off the row the user actually sees. Seeded to the store's OWN
+    // initial value rather than a hand-set `true`, so a regression that flipped the default to
+    // false lands here rather than being papered over by the seed.
+    useSettingsStore.setState({
+      humanebenchEnabled: useSettingsStore.getInitialState().humanebenchEnabled,
+    });
+    render(<ToolsPane />);
+    const humanebench = screen.getByRole("switch", { name: "HumaneBench" });
+    expect(humanebench.getAttribute("aria-checked")).toBe("true");
   });
 
   it("toggles Deepgram through the [ai].voice_dictation feature", () => {

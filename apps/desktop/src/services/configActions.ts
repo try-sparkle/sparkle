@@ -419,6 +419,7 @@ const TOOLS_CONFIG_PATH: Record<ToolKey, string> = {
   beads: "tools.beads",
   github: "tools.github",
   guardrails: "tools.guardrails",
+  humanebench: "tools.humanebench",
   roborev: "tools.roborev",
   onepassword: "tools.onepassword",
   builderIndex: "tools.builder_index",
