@@ -20,6 +20,7 @@ import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
 import type { AgentTab, Project } from "../types";
+import { resolveSideProject } from "../engine/pairs";
 
 function mkAgent(id: string): AgentTab {
   return {
@@ -276,5 +277,64 @@ describe("selectProjectOnItsSide", () => {
     useUiStore.setState({ pairAssignment: { p2: "left" }, leftProjectId: "p2" } as never);
     selectProjectOnItsSide("p2");
     expect(useUiStore.getState().leftProjectId).toBe("p2");
+  });
+
+  // ── THE MARK-OPEN HALF OF THE PAIR (bead sparkle-oymzw2) ──────────────────────────────────────
+  //
+  // The helper used to write ONLY the selection. `resolveSideProject` (engine/pairs) filters a side
+  // to its OPEN projects BEFORE resolving the selection, so a selection written for a project whose
+  // tab is CLOSED was discarded and the side fell back to its own first project — the reveal landed
+  // on a DIFFERENT project (right) or an EMPTY pair (left) while the caller still reported success.
+  // Every other fixture here runs with the default all-open open set (`openProjectIds === null`),
+  // which is exactly why the suite could never see the bug: these two CLOSE a tab first.
+  it("marks a CLOSED right-assigned project's tab open so the side resolver keeps the selection", () => {
+    useUiStore.setState({
+      pairAssignment: {}, // p2 right-assigned (upgrade path)
+      leftProjectId: null,
+      openProjectIds: ["p1"], // p2's tab is CLOSED
+    } as never);
+
+    selectProjectOnItsSide("p2");
+
+    // Direct side effect: the tab is now open.
+    expect(useUiStore.getState().openProjectIds).toContain("p2");
+
+    // End-to-end: the right side resolves to p2, not back to p1 — proof the selection survived the
+    // open-filter rather than being discarded. Before the fix this returned p1.
+    const ui = useUiStore.getState();
+    const projects = useProjectStore.getState().projects;
+    const resolved = resolveSideProject(
+      "right",
+      projects,
+      ui.openProjectIds,
+      ui.pairAssignment,
+      useProjectStore.getState().selectedProjectId,
+    );
+    expect(resolved?.id).toBe("p2");
+  });
+
+  it("marks a CLOSED left-assigned project's tab open so its pair is not left empty", () => {
+    useUiStore.setState({
+      pairAssignment: { p2: "left" },
+      leftProjectId: null,
+      openProjectIds: ["p1"], // p2's tab is CLOSED (p1 is on the right)
+    } as never);
+
+    selectProjectOnItsSide("p2");
+
+    expect(useUiStore.getState().openProjectIds).toContain("p2");
+
+    const ui = useUiStore.getState();
+    const projects = useProjectStore.getState().projects;
+    const resolved = resolveSideProject(
+      "left",
+      projects,
+      ui.openProjectIds,
+      ui.pairAssignment,
+      ui.leftProjectId,
+    );
+    // Before the fix the left pair resolved to null — an empty column — because p2 was filtered out
+    // as closed and no other project is on the left.
+    expect(resolved?.id).toBe("p2");
   });
 });

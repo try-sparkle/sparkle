@@ -68,8 +68,27 @@ import { sideOf } from "../engine/pairs";
  * selection should be a one-line call, not a re-derivation.
  *
  * Idempotent for a project already selected on its own side, so callers need no guard.
+ *
+ * It also OPENS the project's tab (services/projectTabs.markProjectOpen) before writing the
+ * selection: `resolveSideProject` filters a side to its OPEN projects before resolving the
+ * selection, so selecting a CLOSED project without opening it first has the side resolver throw the
+ * selection away and fall back to the side's first project — a reveal that lands elsewhere while
+ * reporting success (bead sparkle-oymzw2). Folding the mark-open in here is what keeps the pair from
+ * being split at a future call site, the way it was at EpicInlineCard's task focus.
  */
 export function selectProjectOnItsSide(projectId: string): void {
+  // MARK THE TAB OPEN BEFORE WRITING THE SELECTION — the two are one gesture, folded here so the
+  // pair cannot be split (bead sparkle-oymzw2). `resolveSideProject` (engine/pairs) filters a side
+  // to its OPEN projects FIRST and only then resolves the selection, so a selection written for a
+  // project whose tab is CLOSED is discarded and the side falls back to its own first project: the
+  // reveal lands on a DIFFERENT project (or, for a left-assigned one, an empty pair) while the
+  // caller still reports success. Every paired seam — openProjectTab, useReplaceCurrentProject,
+  // buildAgentSpawn's foreground spawn, BeadPill.viewOnBoard/viewInColumn — called markProjectOpen
+  // by hand immediately before this; the copy that forgot (EpicInlineCard's task focus) was the
+  // live bug. markProjectOpen is IDEMPOTENT (it writes nothing for an already-open project and
+  // keeps the set `null` until a tab is actually closed), so the hand-paired callers are unchanged
+  // and no ordinary tab click seeds the open set.
+  markProjectOpen(projectId);
   const ui = useUiStore.getState();
   if (sideOf(ui.pairAssignment, projectId) === "left") ui.setLeftProject(projectId);
   else useProjectStore.getState().selectProject(projectId);
