@@ -1008,7 +1008,13 @@ pub fn screen_is_working(text: &str) -> bool {
 /// TRAILING BLANKS ARE DROPPED FIRST. A rendered grid is padded to its full height, so the last rows
 /// of the buffer are usually empty; counting them would push the live line out of the window and make
 /// this silently never fire — the failure mode with no symptom.
-pub fn screen_shows_bare_spinner_frame(text: &str) -> bool {
+/// NO CALLER OF RECORD until movement corroboration exists — see the warning above. Kept PRIVATE
+/// (a `pub` item in this private module is unreachable from the crate root anyway, and would only
+/// invite the very wiring that warning forbids) and marked dead deliberately, so `cargo check`,
+/// `cargo build --release` and the Windows compile gate do not carry a permanent `never used`
+/// warning in exactly the builds where a REAL new warning has to stand out.
+#[cfg_attr(not(test), allow(dead_code))]
+fn screen_shows_bare_spinner_frame(text: &str) -> bool {
     let rows: Vec<&str> = text.lines().collect();
     let end = rows
         .iter()
@@ -1653,6 +1659,61 @@ mod tests {
     /// and say nothing about whether the matcher itself still works.
     fn any_working_matcher(frame: &str) -> bool {
         screen_is_working(frame) || screen_shows_bare_spinner_frame(frame)
+    }
+
+    /// THE WINDOW'S VALUE IS PINNED TO THE SHARED FIXTURE, NOT TO A SECOND LOCAL LITERAL.
+    ///
+    /// roborev raised this: the boundary test below BUILDS its grids from `LIVE_TAIL_ROWS`, so
+    /// changing 12 to 6 or 40 moves the test with the constant and both assertions stay green. It
+    /// pins the MECHANISM (the window is measured from the last non-blank row) and bounds the VALUE
+    /// no more than the test it replaced did. The value is the one number BOTH scrapers must agree
+    /// on, and neither language could pin it — `statusEngine.ts` had it module-private and this file
+    /// had its own copy, so a one-sided retune was silent. It now lives in the fixture and both sides
+    /// assert against it.
+    #[test]
+    fn the_live_tail_window_matches_the_value_the_ts_side_reads() {
+        let want = spinner_fixture()["liveTailRows"]
+            .as_u64()
+            .expect("fixture carries liveTailRows") as usize;
+        assert_eq!(
+            LIVE_TAIL_ROWS, want,
+            "this side's live-tail window drifted from the shared fixture — retune BOTH scrapers, \
+             or they disagree about the same screen"
+        );
+    }
+
+    /// WHERE THE TWO SIDES DELIBERATELY DISAGREE, ASSERTED IN BOTH DIRECTIONS.
+    ///
+    /// roborev's third finding, and it was the sharpest: the fixture's contract promised both sides
+    /// agree, `screen_is_working` answers FALSE for every bare 2.1.237 frame, and `any_working_matcher`
+    /// — a test-only composition with no production counterpart — papered over it. That is the same
+    /// shape the fixture's own contract warns against.
+    ///
+    /// BOTH DIRECTIONS MATTER. If someone wires the arm into `screen_is_working`, the first assertion
+    /// reds and sends them back to the fixture to update the list (and to the warning explaining why
+    /// they should not). If the MATCHER breaks, the second reds. Either way the gap stays a decision.
+    #[test]
+    fn the_known_gap_between_the_matcher_and_the_veto_path_is_exactly_as_recorded() {
+        let gaps = spinner_fixture()["knownGaps"]["screenIsWorkingMisses"]
+            .as_array()
+            .expect("fixture records the known gaps")
+            .iter()
+            .map(|v| v.as_str().expect("each gap is a string").to_string())
+            .collect::<Vec<_>>();
+        assert!(!gaps.is_empty(), "an empty gap list would make this test vacuous");
+
+        for frame in gaps {
+            assert!(
+                !screen_is_working(&frame),
+                "the veto path now SEES {frame:?} — if that is deliberate, remove it from the \
+                 fixture's knownGaps and read the warning above screen_shows_bare_spinner_frame first"
+            );
+            assert!(
+                screen_shows_bare_spinner_frame(&frame),
+                "the MATCHER stopped recognising {frame:?} — the gap is supposed to be about wiring, \
+                 not about the matcher rotting"
+            );
+        }
     }
 
     /// THE BOUNDARY, IN BOTH DIRECTIONS, ON SYNTHETIC GRIDS.

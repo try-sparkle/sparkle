@@ -22,7 +22,7 @@ import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { isSpinnerFrame } from "./statusEngine";
+import { isSpinnerFrame, LIVE_TAIL_ROWS } from "./statusEngine";
 
 const FIXTURE = resolve(
   dirname(fileURLToPath(import.meta.url)),
@@ -37,6 +37,8 @@ interface Sample {
 const fixture = JSON.parse(readFileSync(FIXTURE, "utf8")) as {
   working: Sample[];
   notWorking: Sample[];
+  liveTailRows: number;
+  knownGaps: { why: string; screenIsWorkingMisses: string[] };
 };
 
 describe("the shared spinner fixture — the same bytes nudge_gate.rs asserts", () => {
@@ -58,6 +60,25 @@ describe("the shared spinner fixture — the same bytes nudge_gate.rs asserts", 
   it.each(fixture.notWorking)("refuses $frame ($why)", ({ frame, why }) => {
     expect(isSpinnerFrame(frame), `this must never read as working — ${why}`).toBe(false);
   });
+
+  // THE ONE NUMBER BOTH SCRAPERS MUST AGREE ON. It was module-private here and a separate literal
+  // in `nudge_gate.rs`, so a one-sided retune of the live-tail window was completely silent — and a
+  // boundary test that BUILDS its grids from the constant cannot catch that either, because changing
+  // the value moves the test with it. The fixture is now the source and both sides assert against it.
+  it("agrees with the Rust scraper about how far up a live status line may sit", () => {
+    expect(LIVE_TAIL_ROWS).toBe(fixture.liveTailRows);
+  });
+
+  // THE RECORDED ASYMMETRY, FROM THIS SIDE. `nudge_gate::screen_is_working` deliberately does not
+  // consult its bare-frame matcher (a positional match cannot tell a live spinner from the remnant a
+  // finished turn leaves behind), so these frames are seen HERE and not THERE. Asserting it from this
+  // side too means the list cannot quietly stop describing reality on the side that reads it.
+  it.each(fixture.knownGaps.screenIsWorkingMisses)(
+    "still recognises %s, which the Rust veto path deliberately does not",
+    (frame) => {
+      expect(isSpinnerFrame(frame)).toBe(true);
+    },
+  );
 
   // The fixture's own contract prose is load-bearing — it is where the retune instruction lives —
   // so an edit that guts it should be deliberate rather than silent.

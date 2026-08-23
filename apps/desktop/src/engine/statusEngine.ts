@@ -290,7 +290,10 @@ export function isSpinnerFrame(frame: string): boolean {
  *  transcript cannot latch the row green; it can at most delay one settle by `SPINNER_GRACE_MS`.
  *  That guarantee depends on the ingest path NOT clearing `heldSpinnerTail` — see the comment on
  *  the reset there, which is what keeps this rationale true. */
-const LIVE_TAIL_ROWS = 12;
+/** EXPORTED so `shared/spinner-frames.fixture.json` can pin it against the Rust twin's copy. It was
+ *  module-private, and `nudge_gate.rs` carried its own literal — so a one-sided retune of the one
+ *  number both scrapers must agree on was completely silent. Exported for the test, not for callers. */
+export const LIVE_TAIL_ROWS = 12;
 
 /**
  * Is Claude's live status line STILL PAINTED on this viewport snapshot?

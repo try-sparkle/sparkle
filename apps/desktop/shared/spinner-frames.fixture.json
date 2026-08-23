@@ -22,7 +22,10 @@
     "TODAY's shape HERE, and both languages are forced to keep up together. Do not add a frame to one",
     "suite alone; that is the drift this file exists to make impossible.",
     "",
-    "`working` -- every one of these MUST read as 'a turn is running' on BOTH sides.",
+    "`working` -- every one of these MUST be recognised as a spinner frame by BOTH sides' MATCHERS.",
+    "  Read `knownGaps` below before assuming that means both sides' PRODUCTION entry points agree:",
+    "  as of 2026-08-23 they do NOT, deliberately, and that asymmetry is recorded here rather than",
+    "  only in a Rust comment a TypeScript reader would never open.",
     "`notWorking` -- every one of these MUST NOT. These are the false-green guards: a matcher widened",
     "until it accepts ordinary output is worse than one that is too narrow, because it paints a",
     "finished agent green and nothing retracts it.",
@@ -31,22 +34,85 @@
     "subagent roster. Both mean the agent is busy and NEITHER scraper recognises them -- but the",
     "roster is handled as DELEGATED WORK on its own channel (engine/backgroundTaskFooter), not as a",
     "spinner, and listing either under `notWorking` would PIN a known gap as though it were the",
-    "intended answer. A test that pins the defect passes cleanly while the defect ships."
+    "intended answer. A test that pins the defect passes cleanly while the defect ships.",
+    "",
+    "`liveTailRows` -- HOW FAR UP FROM THE LAST NON-BLANK ROW A LIVE STATUS LINE MAY SIT, and it lives",
+    "here because it is the one number BOTH scrapers must agree on and neither language could pin it.",
+    "`statusEngine.ts` had it module-private and `nudge_gate.rs` had its own copy, so a one-sided",
+    "retune was silent -- and a boundary test that BUILDS its grids from the constant cannot catch",
+    "that either, because changing the value moves the test with it. Both sides now assert their",
+    "local constant equals this field, so a one-sided change goes red on the other side.",
+    "",
+    "`knownGaps` -- WHERE THE TWO SIDES DELIBERATELY DISAGREE TODAY, listed so the disagreement is a",
+    "decision rather than a discovery. `nudge_gate::screen_is_working` does NOT consult the bare-frame",
+    "matcher: a positional match alone cannot tell a LIVE spinner from the remnant a finished turn",
+    "leaves in its transcript, and a false positive there suppresses nudges and returns `calm` for an",
+    "agent standing at a real prompt. The TS twin can afford the same window because its caller also",
+    "requires the tail to have MOVED between settles; this side has no such corroboration yet.",
+    "Both directions are asserted: closing the gap OR widening it reds the Rust suite, which forces",
+    "whoever changes it to come back here and update this list."
   ],
   "working": [
-    { "why": "2.1.237, bare, no elapsed clause at all.", "frame": "✶ Schlepping…" },
-    { "why": "2.1.237, a different beat glyph.", "frame": "✽ Enchanting…" },
-    { "why": "2.1.237's `for <n>s` tail, which has NO parentheses — the exact shape the Rust arm missed.", "frame": "✻ Crunched for 2s" },
-    { "why": "The m/s arm of the same tail.", "frame": "✽ Baked for 2m 24s" },
-    { "why": "The `·` beat. Excluding it once left a whole slice of frames rejected by both arms.", "frame": "· Thinking…" },
-    { "why": "2.1.218's parenthetical shape — still shipped, must not regress.", "frame": "✢ Metamorphosing… (40m 17s · ↓ 66.9k tokens)" },
-    { "why": "The legacy shape, carrying the interrupt hint inside the parenthetical.", "frame": "✻ Cogitating… (12s · ↑ 1.2k tokens · esc to interrupt)" }
+    {
+      "why": "2.1.237, bare, no elapsed clause at all.",
+      "frame": "✶ Schlepping…"
+    },
+    {
+      "why": "2.1.237, a different beat glyph.",
+      "frame": "✽ Enchanting…"
+    },
+    {
+      "why": "2.1.237's `for <n>s` tail, which has NO parentheses — the exact shape the Rust arm missed.",
+      "frame": "✻ Crunched for 2s"
+    },
+    {
+      "why": "The m/s arm of the same tail.",
+      "frame": "✽ Baked for 2m 24s"
+    },
+    {
+      "why": "The `·` beat. Excluding it once left a whole slice of frames rejected by both arms.",
+      "frame": "· Thinking…"
+    },
+    {
+      "why": "2.1.218's parenthetical shape — still shipped, must not regress.",
+      "frame": "✢ Metamorphosing… (40m 17s · ↓ 66.9k tokens)"
+    },
+    {
+      "why": "The legacy shape, carrying the interrupt hint inside the parenthetical.",
+      "frame": "✻ Cogitating… (12s · ↑ 1.2k tokens · esc to interrupt)"
+    }
   ],
   "notWorking": [
-    { "why": "An ordinary finished line. The commonest false green.", "frame": "⏺ Done — all three landed." },
-    { "why": "A markdown bullet that happens to carry an elapsed reading. `*` is an ASCII fallback the bare arm must refuse — it is how ordinary output starts lines.", "frame": "* Rebuilt the parser for 3s" },
-    { "why": "Prose quoting a duration.", "frame": "The build finished in 3s." },
-    { "why": "A bare glyph with no word and no clock.", "frame": "✻" },
-    { "why": "Blank.", "frame": "" }
-  ]
+    {
+      "why": "An ordinary finished line. The commonest false green.",
+      "frame": "⏺ Done — all three landed."
+    },
+    {
+      "why": "A markdown bullet that happens to carry an elapsed reading. `*` is an ASCII fallback the bare arm must refuse — it is how ordinary output starts lines.",
+      "frame": "* Rebuilt the parser for 3s"
+    },
+    {
+      "why": "Prose quoting a duration.",
+      "frame": "The build finished in 3s."
+    },
+    {
+      "why": "A bare glyph with no word and no clock.",
+      "frame": "✻"
+    },
+    {
+      "why": "Blank.",
+      "frame": ""
+    }
+  ],
+  "liveTailRows": 12,
+  "knownGaps": {
+    "why": "Frames the Rust MATCHER recognises but the Rust PRODUCTION entry point `screen_is_working` deliberately does not — see the contract note above. Closing this gap needs movement corroboration, not a wider window.",
+    "screenIsWorkingMisses": [
+      "✶ Schlepping…",
+      "✽ Enchanting…",
+      "✻ Crunched for 2s",
+      "✽ Baked for 2m 24s",
+      "· Thinking…"
+    ]
+  }
 }
