@@ -1712,10 +1712,20 @@ mod tests {
         }
     }
 
-    /// Every arm that can say "a turn is running", so the shared fixture pins the MATCHERS rather
-    /// than one caller's composition of them. `screen_is_working` deliberately excludes the bare arm
-    /// (see its warning); asserting the fixture through it would therefore red every 2.1.237 frame
-    /// and say nothing about whether the matcher itself still works.
+    /// Both arms that can say "a turn is running" — **for the NEGATIVE direction only.**
+    ///
+    /// ⚠️ DO NOT ROUTE THE `working` SET BACK THROUGH THIS. It used to run both directions, and that
+    /// is exactly what left the gap's WIDENING direction unguarded for three review rounds: a
+    /// composition that ORs in the bare matcher swallows a `screen_is_working` miss, so a new frame
+    /// added when the TUI next moves would be missed by the production entry point in silence.
+    /// The positive direction is deliberately PARTITIONED instead — see
+    /// `every_shared_working_frame_is_either_handled_or_a_declared_gap`, which asserts the fixture
+    /// through `screen_is_working` and routes the known 2.1.237 frames via
+    /// `knownGaps.screenIsWorkingMisses` rather than by composing the matchers.
+    ///
+    /// WHY IT IS STILL RIGHT HERE. A negative must be impossible through EITHER matcher: a false
+    /// green is the expensive direction, so "no arm may accept this" is the honest question to ask of
+    /// the `notWorking` set, and there is no gap concept on that side to partition by.
     fn any_working_matcher(frame: &str) -> bool {
         screen_is_working(frame) || screen_shows_bare_spinner_frame(frame)
     }
