@@ -34,19 +34,13 @@ import { useUiStore } from "../stores/uiStore";
 import { useInteractionStore } from "../stores/interactionStore";
 import { useCableStore } from "../stores/cableStore";
 import { mountsOnRowActivation } from "../engine/cable";
-import { useBeadsStore } from "../stores/beadsStore";
 import { useCloudAgentsEnabled } from "../hooks/useCloudAgents";
 import { usePreviewStore } from "../stores/previewStore";
 import { openPreviewServer, PREVIEW_ALREADY_STARTING } from "../services/preview";
 import { refreshAgentBranch } from "../services/branchStatus";
 import { cachedReceipt } from "../services/retroReceipts";
 import { retirementPill } from "../engine/retirementReadiness";
-// The FEEDBACK pill's count and the retire dialog's "it did report: N" read ONE predicate — see
-// `feedbackCount` below and `engine/retroEvidence` (bead `sparkle-y2p4f`).
-import { countAgentFeedbackBeads } from "../engine/retroEvidence";
 import { askFor, FOUNDER_ASK_LABEL, FOUNDER_ASK_DETAIL } from "../engine/founderAsk";
-import { beadLabel, epicForBuild, epicPillFor } from "../services/planView";
-import { type Bead } from "../services/beads";
 import { applyModelToRunningAgent } from "../services/agentModel";
 import {
   DEPTH_INDENT,
@@ -112,10 +106,6 @@ import {
  * `workers` inline: a bare indented progress line each (collapsed) and a stacked detail block each
  * (expanded), so the whole build reads as one card and selecting any part opens the orchestrator.
  */
-// Stable empty fallback for the beads selector — a `?? []` literal in a zustand selector returns a
-// fresh reference every render and loops the store. Reuse one array.
-export const NO_BEADS: Bead[] = [];
-
 /**
  * WHAT COUNTS AS "A CONTROL, NOT THE ROW" for the double-click mount (`onRowDoubleClick`).
  *
@@ -232,6 +222,7 @@ export const AgentRow = memo(function AgentRow({
   onDragEndAgent,
   onDropAgent,
   editing,
+  beadFacts,
   setEditing,
   onSelect,
   onMount,
@@ -241,29 +232,31 @@ export const AgentRow = memo(function AgentRow({
   const renameAgent = useProjectStore((s) => s.renameAgent);
   const setAgentModel = useProjectStore((s) => s.setAgentModel);
   const pollBranchStatus = useRuntimeStore((s) => s.pollBranchStatus);
-  // Beads for this project (stable fallback to avoid a re-render loop). Drives the Build-tab
-  // linkage hovers: a worker shows the bead it's on; an orchestrator shows its epic.
-  const beads = useBeadsStore((s) => s.byProject[project.id]?.beads ?? NO_BEADS);
-  const beadHover = a.kind === "worker" ? beadLabel(beads, a.beadId) : null;
-  const epicHover = a.kind === "build" ? epicForBuild(beads, project.agents, a.id) : null;
-  // Always-visible epic pill on orchestrator rows (spec §8): prefers the agent's own epicId (set at
-  // sendToBuild handoff, so it shows before any worker binds a bead), else the worker-derived epic.
-  // Click jumps to the Plan board and opens that epic's DetailOverlay via the boardFocusBeadId handoff.
-  const board = useBeadsStore((s) => s.byProject[project.id]?.board ?? null);
-  const epicPillData = a.kind === "build" ? epicPillFor(a, board, project.agents) : null;
-  // How many beads carry THIS build-agent's feedback label (`agent:<id>`), stamped on every bead it
-  // created or commented on. Drives the FEEDBACK pill below: shown only when the count is ≥1, and the
-  // count itself is the pill's number. Computed from the raw beads list (not the bucketed board) so it
-  // still counts feedback on auto-labeled/closed beads the board's own bucketing drops.
+  // ── THE BEADS-STORE FACTS ARRIVE AS A PROP; THIS ROW DOES NOT SUBSCRIBE (bead sparkle-nkoxqs) ──
   //
-  // ── ONE PREDICATE, SHARED WITH THE RETIRE DIALOG (bead `sparkle-y2p4f`) ────────────────────────
-  // This used to be a hand-written `labels.includes` here and a second one in `engine/retroEvidence`,
-  // whose doc claimed the two "cannot answer differently" while nothing enforced it. The bug that
-  // module exists to fix WAS two surfaces disagreeing about this exact number — the dialog saying
-  // nothing had been recorded while this pill read FEEDBACK 2 — so a second copy of the rule is the
-  // shape of the original defect, not a tidiness question. The `build` gate stays at the call site:
-  // it is about which rows get a pill, not about what counts as feedback.
-  const feedbackCount = a.kind === "build" ? countAgentFeedbackBeads(beads, a.id) : 0;
+  // All four used to be derived HERE, off two of this row's own `useBeadsStore` selectors:
+  // `beadLabel(beads, a.beadId)`, `epicForBuild(beads, project.agents, a.id)`,
+  // `epicPillFor(a, board, project.agents)` and `countAgentFeedbackBeads(beads, a.id)`. Each is a
+  // full-store scan, and `epicPillFor` additionally allocated a fresh 4-way concatenation of the
+  // whole board — so the founder's ~60 rows against a ~7,400-bead store cost 60 full scans and 60
+  // whole-board allocations for every single store notification, on the main thread.
+  //
+  // The selectors were also WHY this row's `React.memo` could not help: they reach past
+  // `agentRowPropsEqual` straight into the store, and zustand notifies on identity, so a poll that
+  // minted a new `beads` array re-ran this entire body no matter what the comparator said. Reading
+  // them as a prop puts them back under the comparator (`engine/agentBeadFacts` keeps an entry's
+  // identity stable while its facts are unchanged), and `components/AgentSidebar` derives all of
+  // them for the whole fleet in ONE indexed pass. The `kind` gating that used to sit on these lines
+  // moved there with them — a worker row's `epicPill` is null because it is a worker, exactly as
+  // before.
+  //
+  // The FEEDBACK count still comes from `engine/retroEvidence`'s one predicate, shared with the
+  // retire dialog (bead `sparkle-y2p4f`): two surfaces disagreeing about that number is the defect
+  // that module exists to remove, and hoisting the call did not fork it. The epic pill itself is
+  // unchanged: it still prefers the agent's own `epicId` (set at sendToBuild handoff, so it shows
+  // before any worker binds a bead), and clicking it still jumps to the Plan board via the
+  // `boardFocusBeadId` handoff below.
+  const { beadHover, epicHover, epicPill: epicPillData, feedbackCount } = beadFacts;
 
   const rowRef = useRef<HTMLDivElement>(null);
   const hideTimer = useRef<number | null>(null);

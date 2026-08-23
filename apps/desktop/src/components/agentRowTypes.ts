@@ -4,6 +4,7 @@ import type { BuildSectionId } from "../engine/buildSections";
 import type { WorkflowStageId } from "../engine/workflowStage";
 import type { PairSide } from "../engine/rowGeometry";
 import type { WorkerDetail } from "./workerDetail";
+import type { AgentBeadFacts } from "../engine/agentBeadFacts";
 
 /**
  * AgentRow's props and the memo comparator that decides when a row may skip a re-render.
@@ -106,6 +107,22 @@ export type AgentRowProps = {
    *  probe 6). Subscribing in the column alone was not enough — it re-renders the PARENT, and the
    *  memo comparator then finds every prop unchanged and skips the row. */
   receiptVersion: number;
+  /**
+   * This row's beads-store facts (bead hover, epic hover, epic pill, feedback count), derived for
+   * the WHOLE fleet in one pass by `engine/agentBeadFacts` and handed down.
+   *
+   * A PROP RATHER THAN A SELECTOR, AND THAT IS THE POINT (bead sparkle-nkoxqs). This row used to
+   * subscribe to `beads` and `board` itself and recompute all four per render, which is O(agents ×
+   * beads) plus a whole-board allocation per row on every store notification — and, because the row
+   * reached PAST this comparator to get them, no amount of memoization could suppress it. Threading
+   * them through here puts them back under `agentRowPropsEqual`, where an unchanged fact is a
+   * skipped render.
+   *
+   * REQUIRED, not optional-with-a-default: a defaulted seam here would leave the one line that
+   * supplies the real value covered by nothing (bead sparkle-lgbwf), so every caller — production
+   * and test alike — has to say what this row's facts are.
+   */
+  beadFacts: AgentBeadFacts;
   setEditing: (id: string | null) => void;
   /** Called on activation — a CLICK, a keyboard Enter/Space, or a right-click opening the card.
    *  There is no hover caller: selection is click-only (see HOVER_INTENT_MS's headstone).
@@ -212,6 +229,12 @@ export function agentRowPropsEqual(prev: AgentRowProps, next: AgentRowProps): bo
     prev.editing === next.editing &&
     // The receipt cache is not a prop — this token is how its change crosses the memo boundary.
     prev.receiptVersion === next.receiptVersion &&
+    // BY IDENTITY, and that is safe only because `buildAgentBeadFacts` guarantees it: it reuses the
+    // previous entry object whenever an agent's facts are field-for-field unchanged, so a fresh
+    // reference here really does mean this row's bead data moved. A structural compare would work
+    // too but would be strictly weaker — it cannot make the parent's Map cheap, and this one line
+    // is what turns a backlog change from 60 re-renders into only the rows it touched.
+    prev.beadFacts === next.beadFacts &&
     workerDetailsEqual(prev.workers, next.workers)
   );
 }

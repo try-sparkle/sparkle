@@ -37,6 +37,12 @@ import {
 import { ZOOM_COLUMN_ATTR } from "../engine/columnZoom";
 import { PAIR_COLUMN_ATTR } from "../engine/pairColumns";
 import { useBeadsStore } from "../stores/beadsStore";
+import {
+  buildAgentBeadFacts,
+  EMPTY_AGENT_BEAD_FACTS,
+  NO_AGENT_BEAD_FACTS,
+  type AgentBeadFacts,
+} from "../engine/agentBeadFacts";
 import { agentIdsInEpic } from "../engine/epicFocus";
 import { formatElapsed, useRowClock, ROLLUP_DOT_COLOR, dotFillFor } from "./rowClock";
 import { useColumnZoom, useZoomColumnForSide } from "../hooks/useZoomColumn";
@@ -2356,6 +2362,41 @@ export function AgentSidebar({
     [project?.agents, epicBeads, focusBeadId],
   );
 
+  // ── ONE DERIVATION FOR THE WHOLE FLEET, NOT ONE PER ROW (bead sparkle-nkoxqs) ────────────────
+  //
+  // `AgentRow` used to select `beads` and `board` from the store ITSELF, once per row, and then run
+  // a full-store scan per row (`beadLabel` / `epicForBuild` / `countAgentFeedbackBeads`) plus a
+  // fresh 4-way concatenation of the entire board per BUILD row (`epicPillFor`). Against the
+  // founder's ~60 agents and ~7,400 beads that is 60 full-store scans and 60 whole-board
+  // allocations for a single store notification — the reason switching Plan → Build stayed slow
+  // even after the board unmounted. `stores/beadsStore.ts` documents the same hazard from the
+  // store's end and fixed the other half of it (an UNCHANGED poll no longer notifies at all).
+  //
+  // Hoisting it here makes the fleet cost O(beads + agents) ONCE, and — because `buildAgentBeadFacts`
+  // hands back the PREVIOUS entry object for any agent whose facts did not move — it is also what
+  // finally lets `agentRowPropsEqual` bite: a poll that changes one bead re-renders the rows that
+  // bead affects and leaves the other rows alone, instead of re-rendering all 60.
+  //
+  // `epicBeads` is REUSED rather than re-subscribed: it is already this component's subscription to
+  // exactly the slice these facts are derived from, and a second identical selector would be a
+  // second notification for one store write.
+  const rowBoard = useBeadsStore((s) => (project ? (s.byProject[project.id]?.board ?? null) : null));
+  // The previous map, so unchanged agents keep their object identity across polls. A ref rather
+  // than state: writing it must not itself schedule a render, and the value is only ever read by
+  // the very `useMemo` that replaces it. Re-running the memo against the map it just produced is a
+  // no-op (every entry compares equal and is reused), so React's development double-invoke is safe.
+  const beadFactsPrev = useRef<ReadonlyMap<string, AgentBeadFacts>>(NO_AGENT_BEAD_FACTS);
+  const agentBeadFacts = useMemo(() => {
+    const next = buildAgentBeadFacts(
+      epicBeads ?? [],
+      rowBoard,
+      project?.agents ?? [],
+      beadFactsPrev.current,
+    );
+    beadFactsPrev.current = next;
+    return next;
+  }, [epicBeads, rowBoard, project?.agents]);
+
 
 
   // Which orchestrators have their worker subtree collapsed. Subscribed (not read via getState) so
@@ -3683,6 +3724,10 @@ export function AgentSidebar({
               onDropAgent={onAgentDrop}
               editing={editing === a.id}
               receiptVersion={receiptVersion}
+              // O(1) lookup — the derivation above already did the whole fleet's work. The
+              // fallback is a shared frozen singleton, so a row for an agent outside
+              // `project.agents` still gets a STABLE reference and stays memoizable.
+              beadFacts={agentBeadFacts.get(a.id) ?? EMPTY_AGENT_BEAD_FACTS}
               setEditing={setEditing}
               onSelect={() => onSelect(a.id)}
               onMount={() => onMount(a.id)}

@@ -123,8 +123,22 @@ export function countAgentFeedbackBeads(
   beads: readonly LabelledBead[],
   agentId: string,
 ): number {
-  const label = `agent:${agentId}`;
+  const label = agentFeedbackLabel(agentId);
   return beads.filter((b) => b.labels.includes(label)).length;
+}
+
+/**
+ * THE label a bead carries when `agentId` filed it — the one spelling of the rule.
+ *
+ * Extracted so a caller that needs the count for MANY agents at once can invert the scan (count
+ * every label once, then look each agent's up) WITHOUT writing a second `agent:` prefix test. The
+ * header above explains why that matters here specifically: two hand-written copies of this
+ * predicate disagreeing about one number is the exact defect this module exists to remove, and an
+ * inverted copy would disagree in precisely the same way while looking nothing like a duplicate.
+ * `components/AgentSidebar` reads it that way for the fleet's feedback pills.
+ */
+export function agentFeedbackLabel(agentId: string): string {
+  return `agent:${agentId}`;
 }
 
 /**

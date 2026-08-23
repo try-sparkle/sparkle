@@ -143,49 +143,153 @@ export function workersInEpic(
   return out;
 }
 
+// ── ONE RULE, INDEXED ONCE ─────────────────────────────────────────────────────────────────────
+//
+// ══ WHY AN INDEX EXISTS AT ALL ═════════════════════════════════════════════════════════════════
+// Every helper below used to answer its question with a linear `beads.find(...)`, which is correct
+// and was cheap when the backlog was small. It is not small: the founder's store holds ~7,400 beads
+// and he runs ~60 agents, and `components/AgentRow` called `epicForBuild` + `epicPillFor` +
+// `beadLabel` ONCE PER ROW on every beads-store notification. That is 60 full-store scans per poll,
+// and `epicPillFor` additionally allocated a fresh 4-way concatenation of the whole board PER ROW —
+// ~6,600 elements × 60 rows of pure garbage, every time the store moved. `stores/beadsStore.ts`
+// documents the same hazard from the store's end; this is the other half of that fix.
+//
+// ══ WHY THE INDEX IS THE IMPLEMENTATION AND THE OLD SIGNATURES ARE WRAPPERS ═════════════════════
+// The `*Indexed` functions below are now the ONLY place each rule is written; `epicForBuild`,
+// `epicPillFor` and `beadLabel` keep their old signatures and delegate, building a throwaway index
+// for their one query. That is deliberately NOT a second copy of the rule: a caller with one
+// question pays O(beads) exactly as it did before, a caller with N questions (the sidebar) pays
+// O(beads) once, and neither can drift from the other because there is one body.
+//
+// The precedent for caring about this is `scripts/lib/epic-membership-guard.sh`: this codebase
+// shipped three incompatible definitions of epic membership because each local copy was locally
+// reasonable. A hand-rolled `Map<id, bead>` in the sidebar would have been the fourth.
+
+/**
+ * O(1) lookups over ONE bead snapshot plus ONE agent list.
+ *
+ * `beadById` keeps the FIRST bead for a duplicated id, because that is what the `beads.find(...)`
+ * it replaces returned. Ids are unique in practice; preserving the tie-break keeps this a pure
+ * refactor rather than a behaviour change nobody would notice until it mattered.
+ */
+export interface PlanViewIndex {
+  beadById: Map<string, Pick<Bead, "id" | "title" | "parent">>;
+  /** Worker agents grouped by the orchestrator they belong to, in their original list order —
+   *  `workerDerivedEpicIdIndexed` takes the FIRST bound worker, so order is load-bearing. */
+  workersByParent: Map<string, Pick<AgentTab, "kind" | "parentId" | "beadId">[]>;
+}
+
+function indexAgents(
+  agents: readonly Pick<AgentTab, "kind" | "parentId" | "beadId">[],
+): Map<string, Pick<AgentTab, "kind" | "parentId" | "beadId">[]> {
+  const workersByParent = new Map<string, Pick<AgentTab, "kind" | "parentId" | "beadId">[]>();
+  for (const a of agents) {
+    if (a.kind !== "worker" || !a.parentId) continue;
+    const bucket = workersByParent.get(a.parentId);
+    if (bucket) bucket.push(a);
+    else workersByParent.set(a.parentId, [a]);
+  }
+  return workersByParent;
+}
+
+/** Index a raw bead list (the store's `beads`) plus the agent list. */
+export function buildPlanViewIndex(
+  beads: readonly Pick<Bead, "id" | "title" | "parent">[],
+  agents: readonly Pick<AgentTab, "kind" | "parentId" | "beadId">[],
+): PlanViewIndex {
+  const beadById = new Map<string, Pick<Bead, "id" | "title" | "parent">>();
+  for (const b of beads) if (!beadById.has(b.id)) beadById.set(b.id, b);
+  return { beadById, workersByParent: indexAgents(agents) };
+}
+
+/**
+ * Index a BOARD, walking its columns in place.
+ *
+ * COLUMN SET AND ORDER ARE LOAD-BEARING, and both are inherited rather than chosen: `epicPillFor`
+ * read `[...backlog, ...inProgress, ...done, ...delivered]`, so `blocked` and `archived` are
+ * deliberately absent and backlog wins a tie. Walking the columns instead of spreading them is the
+ * whole allocation saving — same reads, no ~6,600-element temporary.
+ */
+export function buildBoardPlanViewIndex(
+  board: Board | null,
+  agents: readonly Pick<AgentTab, "kind" | "parentId" | "beadId">[],
+): PlanViewIndex {
+  const beadById = new Map<string, Pick<Bead, "id" | "title" | "parent">>();
+  if (board) {
+    for (const column of [board.backlog, board.inProgress, board.done, board.delivered]) {
+      for (const b of column) if (!beadById.has(b.id)) beadById.set(b.id, b);
+    }
+  }
+  return { beadById, workersByParent: indexAgents(agents) };
+}
+
 /** The id of the epic a build agent's workers are on — the first worker bound to a bead with a
  *  parent wins (they all share one parent epic). Null when no worker is bound yet. */
-function workerDerivedEpicId(
-  beads: Pick<Bead, "id" | "parent">[],
-  agents: Pick<AgentTab, "kind" | "parentId" | "beadId">[],
-  buildAgentId: string,
-): string | null {
-  for (const a of agents) {
-    if (a.kind !== "worker" || a.parentId !== buildAgentId || !a.beadId) continue;
-    const epicId = beads.find((b) => b.id === a.beadId)?.parent;
+function workerDerivedEpicIdIndexed(index: PlanViewIndex, buildAgentId: string): string | null {
+  for (const a of index.workersByParent.get(buildAgentId) ?? []) {
+    if (!a.beadId) continue;
+    const epicId = index.beadById.get(a.beadId)?.parent;
     if (epicId) return epicId;
   }
   return null;
 }
 
+/** {@link epicForBuild} against a prebuilt index. */
+export function epicForBuildIndexed(index: PlanViewIndex, buildAgentId: string): string | null {
+  const epicId = workerDerivedEpicIdIndexed(index, buildAgentId);
+  if (!epicId) return null;
+  const epic = index.beadById.get(epicId);
+  return epic ? `${epic.id} · ${epic.title}` : epicId;
+}
+
+/** {@link epicPillFor} against a prebuilt BOARD index (see {@link buildBoardPlanViewIndex}). */
+export function epicPillForIndexed(
+  index: PlanViewIndex,
+  agent: Pick<AgentTab, "id" | "kind" | "epicId">,
+): { id: string; title: string } | null {
+  const epicId = agent.epicId ?? workerDerivedEpicIdIndexed(index, agent.id);
+  if (!epicId) return null;
+  const epic = index.beadById.get(epicId);
+  return { id: epicId, title: epic?.title ?? epicId };
+}
+
+/** {@link beadLabel} against a prebuilt index. */
+export function beadLabelIndexed(
+  index: PlanViewIndex,
+  beadId: string | null | undefined,
+): string | null {
+  if (!beadId) return null;
+  const b = index.beadById.get(beadId);
+  return b ? `${b.id} · ${b.title}` : beadId;
+}
+
 /** The epic a build (orchestrator) agent is working, derived from its workers' beads — they all
  *  share one parent epic. Returns an "id · title" label for the Build-tab orchestrator hover, or
- *  null when none of its workers are bound to a bead yet. */
+ *  null when none of its workers are bound to a bead yet.
+ *
+ *  Asking about MANY agents? Build the index once and call {@link epicForBuildIndexed} — this
+ *  wrapper reindexes the whole store per call by design. */
 export function epicForBuild(
   beads: Pick<Bead, "id" | "title" | "parent">[],
   agents: Pick<AgentTab, "kind" | "parentId" | "beadId">[],
   buildAgentId: string,
 ): string | null {
-  const epicId = workerDerivedEpicId(beads, agents, buildAgentId);
-  if (!epicId) return null;
-  const epic = beads.find((b) => b.id === epicId);
-  return epic ? `${epic.id} · ${epic.title}` : epicId;
+  return epicForBuildIndexed(buildPlanViewIndex(beads, agents), buildAgentId);
 }
 
 /** The epic pill shown on an orchestrator's sidebar row (spec §8). Prefers the agent's own
  *  `epicId` — set at sendToBuild handoff, so the pill shows immediately, before any worker binds
  *  to a bead and even before the first board poll (the bare id stands in for the title until the
- *  epic appears on the board). Falls back to the worker-derived epic, else null (no pill). */
+ *  epic appears on the board). Falls back to the worker-derived epic, else null (no pill).
+ *
+ *  Asking about MANY agents? Use {@link buildBoardPlanViewIndex} + {@link epicPillForIndexed} —
+ *  this wrapper walks the whole board per call by design. */
 export function epicPillFor(
   agent: Pick<AgentTab, "id" | "kind" | "epicId">,
   board: Board | null,
   agents: Pick<AgentTab, "kind" | "parentId" | "beadId">[],
 ): { id: string; title: string } | null {
-  const beads = board ? [...board.backlog, ...board.inProgress, ...board.done, ...board.delivered] : [];
-  const epicId = agent.epicId ?? workerDerivedEpicId(beads, agents, agent.id);
-  if (!epicId) return null;
-  const epic = beads.find((b) => b.id === epicId);
-  return { id: epicId, title: epic?.title ?? epicId };
+  return epicPillForIndexed(buildBoardPlanViewIndex(board, agents), agent);
 }
 
 /** One child row of an epic's live status view (spec §7): the child bead + the names of the
@@ -217,8 +321,15 @@ export function orchestratorNameForEpic(
 ): string | null {
   const direct = agents.find((a) => a.kind === "build" && a.epicId === epicId);
   if (direct) return direct.name;
+  // Indexed ONCE outside the `find`, not once per candidate: the reverse path asks the same
+  // question of every build agent, and rebuilding the bead map inside the predicate is how the
+  // sidebar's O(agents × beads) got there in the first place.
+  const index = buildPlanViewIndex(
+    beads as Pick<Bead, "id" | "title" | "parent">[],
+    agents,
+  );
   const derived = agents.find(
-    (a) => a.kind === "build" && workerDerivedEpicId(beads, agents, a.id) === epicId,
+    (a) => a.kind === "build" && workerDerivedEpicIdIndexed(index, a.id) === epicId,
   );
   return derived ? derived.name : null;
 }
@@ -227,7 +338,8 @@ export function orchestratorNameForEpic(
  *  Returns null when the worker isn't bound to a bead, and falls back to the bare id if the
  *  bead isn't in the current snapshot. */
 export function beadLabel(beads: Pick<Bead, "id" | "title">[], beadId: string | null | undefined): string | null {
-  if (!beadId) return null;
-  const b = beads.find((x) => x.id === beadId);
-  return b ? `${b.id} · ${b.title}` : beadId;
+  return beadLabelIndexed(
+    buildPlanViewIndex(beads as Pick<Bead, "id" | "title" | "parent">[], []),
+    beadId,
+  );
 }
