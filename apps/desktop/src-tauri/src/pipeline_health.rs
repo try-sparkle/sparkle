@@ -448,6 +448,21 @@ fn first_line(s: &str) -> String {
 struct RunnerPoolReading {
     online_idle: usize,
     online_busy: usize,
+    /// Did we see the WHOLE registration list, or only a page of it?
+    ///
+    /// The endpoint reports `total_count` — every registration on the repo — beside the page of
+    /// runners it actually returned. Registrations exceed the live-VM ceiling because stale/offline
+    /// ghosts accrue until the reaper clears them (a live diagnosis in `pick-runner.sh` saw 61
+    /// against a ~26 ceiling), so ONE page can silently drop the `sparkle-release` runner onto an
+    /// unfetched page. That produced the measured false positive this field exists to kill: the
+    /// monitor announced "the macOS release runner (sparkle-release) is offline — wake the release
+    /// Mac" while a direct read showed `status=online, busy=false`.
+    ///
+    /// A truncated page can prove PRESENCE but can NEVER prove ABSENCE, so `false` here must
+    /// downgrade an "everything is offline" verdict to `Unknown` rather than publish an outage.
+    /// An ABSENT `total_count` counts as complete: a stub or a hand-written fixture that omits it
+    /// is a complete answer about the world it describes, not a truncated one.
+    complete: bool,
 }
 
 impl RunnerPoolReading {
@@ -459,12 +474,35 @@ impl RunnerPoolReading {
 /// Read one labelled pool from the runners-endpoint JSON. Returns `None` when the payload is not the
 /// `{ "runners": [ … ] }` shape — an error object (`{"message": "…"}`) or truncated body must classify
 /// as UNKNOWN downstream, never as "no runners online".
+///
+/// TWO SHAPES ARE ACCEPTED, and both are real:
+///   * a lone `{total_count, runners:[…]}` object — one un-paginated page, and what every stub and
+///     fixture hands us;
+///   * an ARRAY of such page objects — what `gh api --paginate … --slurp` returns, which is how
+///     [`runner_components`] now reads the endpoint (mirroring `pr_query_runners`). Every page's
+///     `runners` are merged; `total_count` comes from the first element, because GitHub reports the
+///     same repo-wide count on every page.
 fn read_runner_pool(json: &str, label: &str) -> Option<RunnerPoolReading> {
     let value: serde_json::Value = serde_json::from_str(json.trim()).ok()?;
-    let runners = value.get("runners")?.as_array()?;
+    let pages: Vec<&serde_json::Value> = match value.as_array() {
+        Some(items) => items.iter().collect(),
+        None => vec![&value],
+    };
+    // An empty array carries no page at all — a shape we cannot read, not an empty pool.
+    let first = pages.first().copied()?;
+    let total_count = first.get("total_count").and_then(|t| t.as_u64());
+    let mut merged: Vec<&serde_json::Value> = Vec::new();
+    for page in pages {
+        // A page without a `runners` array is a shape we do not understand; fail the WHOLE read
+        // rather than quietly merging the pages we happened to parse, which would under-report the
+        // pool exactly like the truncation this function exists to detect.
+        let runners = page.get("runners").and_then(|r| r.as_array())?;
+        merged.extend(runners.iter());
+    }
+    let complete = total_count.map(|t| t as usize <= merged.len()).unwrap_or(true);
     let mut online_idle = 0;
     let mut online_busy = 0;
-    for r in runners {
+    for r in merged {
         if r.get("status").and_then(|s| s.as_str()) != Some("online") {
             continue;
         }
@@ -484,53 +522,146 @@ fn read_runner_pool(json: &str, label: &str) -> Option<RunnerPoolReading> {
             online_idle += 1;
         }
     }
-    Some(RunnerPoolReading { online_idle, online_busy })
+    Some(RunnerPoolReading { online_idle, online_busy, complete })
 }
 
-/// Classify the CI test pool (`linux-ci`). This pool runs the real tests, so its absence is
-/// BLOCKING; saturation (all busy) is merely slow → WARNING.
-fn classify_ci_pool(reading: Option<RunnerPoolReading>) -> (HealthState, String) {
-    match reading {
-        None => (
+/// Read `.total_count` from `gh api "repos/<repo>/actions/runs?status=queued&per_page=1"`.
+///
+/// `None` for ANY shape we do not understand, and the caller must keep that distinct from `0`: a
+/// failed read that presented as "no backlog" would restore precisely the false RECOVERED this input
+/// exists to prevent.
+fn read_queued_runs(json: &str) -> Option<usize> {
+    let value: serde_json::Value = serde_json::from_str(json.trim()).ok()?;
+    let n = value.get("total_count")?.as_u64()?;
+    Some(n as usize)
+}
+
+/// Below this many queued runs, a backlog is NOT worth a warning even when it exceeds free capacity.
+///
+/// The autoscaler dispatches on a ~300s grace (`CIA_STOCKOUT_GRACE_S` in `scripts/lib/ci-autoscale.sh`,
+/// whose own comment puts the normal look of a healthy scale-up at ~3 minutes), so a handful of queued
+/// runs clears inside one dispatch cycle without anyone doing anything. Warning on that would be
+/// exactly the paper-cut flapping this whole component is being fixed to remove: an amber chip that
+/// blinks several times an hour on a pipeline that is working teaches its reader to skim past it, and
+/// then a REAL stockout arrives into a channel nobody watches.
+const CI_QUEUE_BACKLOG_MIN: usize = 5;
+
+/// Classify the CI test pool (`linux-ci`) from the runner pool AND the repo-wide queued-run count.
+///
+/// WHY QUEUE DEPTH IS AN INPUT (bead `sparkle-1xg2f6`). Reading only the pool, this returned Healthy
+/// the moment ONE runner was idle, and announced "CI test runners RECOVERED — 1 of 21 idle and ready.
+/// No action needed; close the pipeline-health bead" while 43 runs were queued, 20 of 21 runners were
+/// busy, and main's three newest runs were all queued. One idle runner out of twenty-one against
+/// forty-three queued runs is not recovery, and a verdict that also tells you to close the bead
+/// erases its own evidence.
+///
+/// The ladder, in order — the same one `scripts/lib/pipeline-health-scan` mirrors:
+///   1. no reading at all → Unknown.
+///   2. nothing online but the list was TRUNCATED → Unknown. Absence is unprovable from a page.
+///   3. nothing online on a complete list → Blocking. Real tests cannot run.
+///   4. all busy → Warning, naming the queue when we could read it.
+///   5. idle runners but the queue is UNREADABLE → Unknown. Unknown never alarms and never fires a
+///      recovery notice, so an unreadable queue produces SILENCE rather than a false RECOVERED.
+///   6. queue deeper than free capacity (and past [`CI_QUEUE_BACKLOG_MIN`]) → Warning.
+///   7. otherwise → Healthy, stating the queue depth it was judged against.
+fn classify_ci_pool(
+    reading: Option<RunnerPoolReading>,
+    queued: Option<usize>,
+) -> (HealthState, String) {
+    let Some(r) = reading else {
+        return (
             HealthState::Unknown,
             "could not read CI runner status from GitHub — pipeline visibility is degraded."
                 .to_string(),
-        ),
-        Some(r) if r.online_total() == 0 => (
+        );
+    };
+    if r.online_total() == 0 && !r.complete {
+        return (
+            HealthState::Unknown,
+            format!(
+                "the runner list was TRUNCATED and no CI runner ({CI_RUNNER_LABEL}) appeared on the \
+                 page read — this is a limit of the probe, not proof the pool is down. Re-read with \
+                 pagination."
+            ),
+        );
+    }
+    if r.online_total() == 0 {
+        return (
             HealthState::Blocking,
             format!(
                 "no self-hosted CI runners ({CI_RUNNER_LABEL}) are online — CI cannot run tests, so \
                  nothing can be verified for merge or release."
             ),
-        ),
-        Some(r) if r.online_idle == 0 => (
+        );
+    }
+    if r.online_idle == 0 {
+        let queue_clause = match queued {
+            Some(q) => format!(" with {q} run(s) queued"),
+            None => String::new(),
+        };
+        return (
             HealthState::Warning,
             format!(
-                "all {} self-hosted CI runners ({CI_RUNNER_LABEL}) are busy — CI is queued and slow \
-                 but still running; merges and deploys are not blocked.",
+                "all {} self-hosted CI runners ({CI_RUNNER_LABEL}) are busy{queue_clause} — CI is \
+                 queued and slow but still running; merges and deploys are not blocked.",
                 r.online_busy
             ),
-        ),
-        Some(r) => (
-            HealthState::Healthy,
+        );
+    }
+    let Some(queued) = queued else {
+        return (
+            HealthState::Unknown,
             format!(
-                "{} of {} CI runners ({CI_RUNNER_LABEL}) idle and ready.",
+                "{} of {} CI runners ({CI_RUNNER_LABEL}) idle, but the queued-run count could not be \
+                 read — readiness cannot be confirmed, so this is not reported as ready.",
                 r.online_idle,
                 r.online_total()
             ),
-        ),
+        );
+    };
+    if queued > r.online_idle && queued >= CI_QUEUE_BACKLOG_MIN {
+        return (
+            HealthState::Warning,
+            format!(
+                "{queued} runs are queued against only {} idle CI runner(s) ({CI_RUNNER_LABEL}) of \
+                 {} — the backlog exceeds free capacity, so work is waiting. CI is slow but still \
+                 running; merges and deploys are not blocked.",
+                r.online_idle,
+                r.online_total()
+            ),
+        );
     }
+    (
+        HealthState::Healthy,
+        format!(
+            "{} of {} CI runners ({CI_RUNNER_LABEL}) idle and ready ({queued} run(s) queued).",
+            r.online_idle,
+            r.online_total()
+        ),
+    )
 }
 
 /// Classify the release runner (`sparkle-release`). The notarized DMG builds only here on `auto`, so
 /// offline is BLOCKING to releases. Busy is not a problem — a busy release runner is a release in
 /// flight.
+///
+/// The TRUNCATION arm comes first and is the measured bug: an unpaginated read dropped this runner
+/// onto page 2 and the monitor filed a P1 "wake the release Mac" against a Mac that was online and
+/// idle. A page that did not contain the runner is not evidence the runner is gone.
 fn classify_release_runner(reading: Option<RunnerPoolReading>) -> (HealthState, String) {
     match reading {
         None => (
             HealthState::Unknown,
             "could not read release-runner status from GitHub — pipeline visibility is degraded."
                 .to_string(),
+        ),
+        Some(r) if r.online_total() == 0 && !r.complete => (
+            HealthState::Unknown,
+            format!(
+                "the runner list was TRUNCATED and the release runner ({RELEASE_RUNNER_LABEL}) did \
+                 not appear on the page read — this is a limit of the probe, not proof the Mac is \
+                 offline. Re-read with pagination."
+            ),
         ),
         Some(r) if r.online_total() == 0 => (
             HealthState::Blocking,
@@ -697,6 +828,341 @@ fn name_versions(versions: &[Version]) -> String {
     }
 }
 
+/// The workflow whose conclusion the release gate reads. `scripts/lib/ci-gate.sh` filters on exactly
+/// this name, and so must we — a repo's head SHA carries runs from several workflows and any other
+/// one's conclusion says nothing about whether the tree passed CI.
+const CI_WORKFLOW_NAME: &str = "CI";
+
+/// What `scripts/lib/ci-gate.sh`'s `cc_gate` would decide about a draft's tag.
+///
+/// WHY THIS EXISTS, AND WHY IT WAS THE MOST EXPENSIVE VERDICT OF THE NIGHT. The monitor said
+/// "v0.131.0 built and STAGED as a draft… release-finalize.yml publishes v0.131.0 once its CI
+/// concludes green." CI concluded green TWICE and nothing published, because the gate certifies the
+/// draft's BUILD BASE and that base is red — permanently. The measured chain: tag v0.131.0 →
+/// d2f98e73, which has ZERO workflow runs, so the gate falls back to its build base e3e8f146, whose
+/// run named "CI" concluded `failure`; release-finalize run 32605085872 logged `gate rc=1 → BLOCKED`.
+/// A false reassurance is worse than no message: it stops anyone from acting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GateVerdict {
+    /// The newest completed CI run for the SHA concluded `success`.
+    Green,
+    /// It concluded anything else. The draft will NEVER be auto-published.
+    Red,
+    /// A CI run exists but has not completed. Never read THROUGH a pending run to an older green —
+    /// a red result could still be in flight, which is `cc_verdict`'s own discipline.
+    Pending,
+    /// No CI run exists for the SHA at all.
+    None,
+    /// We could not read the signal. NEVER Red and never Green: an unreadable gate must not
+    /// manufacture either a false all-clear or a false permanent hold.
+    Unknown,
+}
+
+/// Decide a gate verdict from `gh api "repos/<repo>/actions/runs?head_sha=<sha>&per_page=100"`.
+///
+/// PURE, and it mirrors `cc_verdict` rather than approximating it: filter to the workflow named
+/// exactly [`CI_WORKFLOW_NAME`]; no run at all → `None`; ANY matching run not `completed` → `Pending`
+/// (never read through to an older green); otherwise the newest run — GitHub returns them
+/// newest-first, which covers reruns — and ONLY the literal conclusion `success` passes.
+fn read_ci_gate_verdict(runs_json: &str) -> GateVerdict {
+    read_ci_gate_reading(runs_json).0
+}
+
+/// The same decision, plus the id of the run the verdict came from. The id is what lets a `Red` be
+/// re-examined at the JOBS level (see [`run_judged_nothing`]) — the reclassification `cc_gate`
+/// performs and `cc_verdict` alone does not.
+fn read_ci_gate_reading(runs_json: &str) -> (GateVerdict, Option<u64>) {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(runs_json.trim()) else {
+        return (GateVerdict::Unknown, None);
+    };
+    let Some(runs) = value.get("workflow_runs").and_then(|r| r.as_array()) else {
+        return (GateVerdict::Unknown, None);
+    };
+    let matches: Vec<&serde_json::Value> = runs
+        .iter()
+        .filter(|r| r.get("name").and_then(|n| n.as_str()) == Some(CI_WORKFLOW_NAME))
+        .collect();
+    let Some(newest) = matches.first() else {
+        return (GateVerdict::None, None);
+    };
+    if matches.iter().any(|r| r.get("status").and_then(|s| s.as_str()) != Some("completed")) {
+        return (GateVerdict::Pending, None);
+    }
+    let id = newest.get("id").and_then(|i| i.as_u64());
+    if newest.get("conclusion").and_then(|c| c.as_str()) == Some("success") {
+        (GateVerdict::Green, id)
+    } else {
+        (GateVerdict::Red, id)
+    }
+}
+
+/// Did this run JUDGE ANYTHING, or did it merely fail to start?
+///
+/// WHY THIS EXISTS, and why omitting it inverts the whole feature. `cc_gate` is the function that
+/// actually decides whether a draft publishes, and it is strictly weaker than `cc_verdict`: a
+/// completed-`failure` run whose jobs never reached a runner is reclassified rather than treated as
+/// a red tree (`_cc_blocked_check`, internal `rc=4`; the base-side twin `_cc_base_red_class` turns
+/// a pure-infra base red into a HOLD, `rc=5/6`). The shell's own header records the unreclassified
+/// shape as the one that made "EVERY release structurally unpublishable" — the common case, not a
+/// corner.
+///
+/// Porting only `cc_verdict` therefore produced the exact harm this module exists to remove, merely
+/// inverted: a draft whose tag run died at `Set up job` over a GREEN base would read `Blocking` with
+/// "cut a NEW version from green main", telling an operator to burn a full signed, notarized build
+/// to replace a release that was about to publish itself.
+///
+/// The test mirrors the shell's: a run judged nothing when it executed ZERO steps — no jobs at all,
+/// or every job's step list empty, or the single synthetic `Set up job` step being the only one and
+/// itself failed. A step-less job BESIDE a sibling that did execute is NOT this shape (that is a
+/// real, if odd, failure) and returns false, which is the fail-closed direction: we only ever soften
+/// a Red when we can positively see that nothing was judged.
+fn run_judged_nothing(jobs_json: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(jobs_json.trim()) else {
+        return false;
+    };
+    // Accept the `{total_count, jobs:[…]}` envelope OR a bare array, exactly as the shell does.
+    let (jobs, total_count) = match value.as_array() {
+        Some(arr) => (arr.clone(), None),
+        None => (
+            value.get("jobs").and_then(|j| j.as_array()).cloned().unwrap_or_default(),
+            value.get("total_count").and_then(|t| t.as_u64()),
+        ),
+    };
+    // TRUNCATION IS NOT ZERO — and this is the one misread the shell calls the most dangerous
+    // available here. The jobs endpoint is paginated; a short page must never read as "nothing else
+    // failed", or a genuinely red run is waved through to the base fallback. A payload carrying NO
+    // total_count (a bare array, a hand-built fixture) is never treated as truncated: the guard
+    // requires the field to be PRESENT before it can fire.
+    if let Some(total) = total_count {
+        if total > jobs.len() as u64 {
+            return false;
+        }
+    }
+    // THE NUMERATOR IS THE FAILED JOBS, NOT THE WHOLE RUN. Counting executed steps across every job
+    // makes this predicate INERT for the shape it exists to catch: one green sibling contributes
+    // executed steps and the run reads as "judged". The measured release-bump run is exactly that —
+    // nine self-hosted jobs PASS with full step lists while the hosted Rust jobs fail having
+    // executed nothing — so a whole-run count answers "judged" on precisely the case that blocks
+    // the release. Green siblings are STRONGER evidence, not weaker: they prove the suite really
+    // ran, leaving only jobs that were never placed on a runner and judged no code at all.
+    //
+    // Succeeded, SKIPPED and NEUTRAL jobs are excluded deliberately: a path-filtered job is
+    // `completed/skipped` with zero steps, so counting it as "never ran" would make almost every run
+    // look unjudged. Jobs that are not `completed` are excluded too — they have rendered no verdict.
+    let failed: Vec<&serde_json::Value> = jobs
+        .iter()
+        .filter(|j| j.get("status").and_then(|s| s.as_str()) == Some("completed"))
+        .filter(|j| {
+            let c = j
+                .get("conclusion")
+                .and_then(|c| c.as_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            c != "success" && c != "skipped" && c != "neutral"
+        })
+        .collect();
+    // At least one FAILED job is required. An empty jobs array, or a run whose failure is not
+    // attributable to any completed-failed job (a `startup_failure` from a broken workflow file),
+    // establishes NOTHING positively — and softening is the fail-OPEN direction, so it stays Red.
+    if failed.is_empty() {
+        return false;
+    }
+    // A job that never got a runner reports either NO steps, or exactly ONE — GitHub's synthetic
+    // `Set up job` — concluding failure. Every other step counts, INCLUDING a SUCCEEDED `Set up
+    // job`, so a job dying at its first real step counts 2 and can never be mistaken for one that
+    // never started. (The measured shape is steps=1, not steps=0, so a literal `steps == 0` is wrong.)
+    failed.iter().all(|job| {
+        let steps = job.get("steps").and_then(|s| s.as_array());
+        let executed = match steps {
+            None => 0,
+            Some(steps) => steps
+                .iter()
+                .filter(|st| {
+                    let is_synthetic_setup_failure = st.get("number").and_then(|n| n.as_u64())
+                        == Some(1)
+                        && st.get("name").and_then(|n| n.as_str()) == Some("Set up job")
+                        && st
+                            .get("conclusion")
+                            .and_then(|c| c.as_str())
+                            .unwrap_or("")
+                            .to_ascii_lowercase()
+                            != "success";
+                    !is_synthetic_setup_failure
+                })
+                .count(),
+        };
+        executed == 0
+    })
+}
+
+/// Read `.sha` and the FIRST parent's `.sha` from `gh api "repos/<repo>/commits/<tag>"`. The first
+/// parent is the BUILD BASE: the tagged commit is the version bump sitting on top of it, which is
+/// why `cc_gate` certifies the base when the tag itself has no run.
+fn read_commit_and_base(json: &str) -> Option<(String, Option<String>)> {
+    let value: serde_json::Value = serde_json::from_str(json.trim()).ok()?;
+    let sha = value.get("sha")?.as_str()?.to_string();
+    let base = value
+        .get("parents")
+        .and_then(|p| p.as_array())
+        .and_then(|p| p.first())
+        .and_then(|p| p.get("sha"))
+        .and_then(|s| s.as_str())
+        .map(str::to_string);
+    Some((sha, base))
+}
+
+/// Resolve one draft tag's gate verdict, following `cc_gate`'s ORDER **and its reclassifications**:
+/// the tag commit first, falling back to the build base when the tag has no CI run — or when its run
+/// FAILED WITHOUT JUDGING ANYTHING (see [`run_judged_nothing`]). Any read failure is `Unknown`.
+///
+/// THE RECLASSIFICATION IS NOT OPTIONAL. `cc_gate`, not `cc_verdict`, is what decides whether a
+/// draft publishes, and it routes an unjudged red past itself rather than blocking on it. Mirroring
+/// only `cc_verdict` reported a draft over a GREEN base as a permanent hold and told the operator to
+/// cut a new signed build to replace a release that was about to ship itself.
+///
+/// A `Red` that judged nothing NEVER becomes `Red` here. On the tag it triggers the base fallback
+/// (`cc_gate`'s `rc=4`); on the BASE it becomes `Unknown`, which is the HOLD direction (`rc=5/6`) —
+/// unknown never claims a permanent block and never claims an all-clear.
+///
+/// `fetch` maps a `gh api` path to its body, so the whole decision is testable without a network —
+/// the shell that actually runs `gh` is the only uncovered part.
+fn resolve_draft_gate<F>(tag: &str, fetch: &F) -> GateVerdict
+where
+    F: Fn(&str) -> Option<String>,
+{
+    // Returns the verdict with an unjudged red already collapsed to `None`, so the caller's match
+    // treats "no run" and "a run that judged nothing" identically — which is what `cc_gate` does.
+    let gate_at = |sha: &str| -> GateVerdict {
+        let Some(body) =
+            fetch(&format!("repos/{RELEASE_REPO}/actions/runs?head_sha={sha}&per_page=100"))
+        else {
+            return GateVerdict::Unknown;
+        };
+        let (verdict, run_id) = read_ci_gate_reading(&body);
+        if verdict != GateVerdict::Red {
+            return verdict;
+        }
+        // A red we cannot re-examine stays Red: we only ever SOFTEN on positive evidence that the
+        // run judged nothing, never on a failed lookup.
+        let Some(run_id) = run_id else { return GateVerdict::Red };
+        match fetch(&format!("repos/{RELEASE_REPO}/actions/runs/{run_id}/jobs?per_page=100")) {
+            Some(jobs) if run_judged_nothing(&jobs) => GateVerdict::None,
+            _ => GateVerdict::Red,
+        }
+    };
+    let Some(commit) = fetch(&format!("repos/{RELEASE_REPO}/commits/{tag}")) else {
+        return GateVerdict::Unknown;
+    };
+    let Some((sha, base)) = read_commit_and_base(&commit) else {
+        return GateVerdict::Unknown;
+    };
+    match gate_at(&sha) {
+        // No run, or a run that judged nothing: both route to the build base.
+        GateVerdict::None => match base {
+            Some(base) if base != sha => match gate_at(&base) {
+                // The BASE judged nothing either — that is a HOLD, not a permanent block. Reporting
+                // Red here is what would manufacture the false "cut a NEW version" instruction.
+                GateVerdict::None => GateVerdict::Unknown,
+                v => v,
+            },
+            _ => GateVerdict::None,
+        },
+        verdict => verdict,
+    }
+}
+
+/// Resolve the gate for EVERY draft version. Drafts are normally zero or one, so the two `gh api`
+/// calls each costs are not a hot path.
+fn resolve_draft_gates<F>(
+    drafts: &[Version],
+    fetch: &F,
+) -> std::collections::BTreeMap<Version, GateVerdict>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    drafts.iter().map(|v| (*v, resolve_draft_gate(&v.to_string(), fetch))).collect()
+}
+
+/// The acceptance file `.github/workflows/release-reconcile.yml` already honours, read relative to
+/// the project root. Landed by PR #2451; its header is the spec this module implements.
+const ORPHAN_BASELINE_PATH: &str = ".github/release-orphan-baseline.txt";
+
+/// The parsed acceptance file: which orphan tags, and which stuck drafts, have already been DECIDED
+/// about.
+///
+/// TWO NAMESPACES, AND KEEPING THEM APART IS LOAD-BEARING — the file header says so and the shell
+/// side enforces it by test. A bare `vX.Y.Z` line records "this tag was abandoned"; only a
+/// `draft:vX.Y.Z` line records "this draft will never publish and we accept that". Sharing one flat
+/// list would let every tag already recorded as an abandoned orphan retroactively silence a stuck
+/// draft on that same tag — and release.yml's documented `existing_tag` recovery re-cuts against
+/// exactly those tags, so a real FUTURE draft would be pre-cleared before anyone decided anything.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ReleaseBaseline {
+    /// Accepted ORPHAN TAGS — a tag with no release object behind it, and only that.
+    tags: std::collections::BTreeSet<Version>,
+    /// Accepted STUCK DRAFTS — a draft that can never publish, and only that.
+    drafts: std::collections::BTreeSet<Version>,
+}
+
+/// Parse `.github/release-orphan-baseline.txt`. PURE, and deliberately the same parse as
+/// `rr_baseline_tags` in `scripts/lib/release-reconcile.sh`: strip `#` comments (whole-line or
+/// trailing), strip surrounding whitespace and a trailing CR, drop blank lines. A `draft:` prefix
+/// selects the drafts namespace; anything else is read as a bare tag. A line we cannot parse as a
+/// version is IGNORED rather than fatal — the file is prose-heavy by design, and a typo must not
+/// take the whole acceptance list down with it.
+fn read_orphan_baseline(text: &str) -> ReleaseBaseline {
+    let mut baseline = ReleaseBaseline::default();
+    for raw in text.lines() {
+        let line = match raw.find('#') {
+            Some(i) => &raw[..i],
+            None => raw,
+        };
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("draft:") {
+            if let Some(v) = parse_version(rest.trim()) {
+                baseline.drafts.insert(v);
+            }
+        } else if let Some(v) = parse_version(line) {
+            baseline.tags.insert(v);
+        }
+    }
+    baseline
+}
+
+/// The sentence that states what the baseline accepted — or that it could not be read at all.
+///
+/// THE FILE ACCEPTS HISTORY, IT DOES NOT FORGIVE IT, so the accepted counts are ALWAYS stated
+/// wherever there was anything to accept: filtering an orphan out of the finding must never make it
+/// invisible. And a MISSING OR UNREADABLE baseline FAILS LOUD rather than green — nothing is
+/// accepted, every orphan still counts, and the detail says the file could not be read, because an
+/// unreadable acceptance file silently read as blanket acceptance is how a real orphan would vanish.
+fn baseline_note(
+    baseline: Option<&ReleaseBaseline>,
+    accepted_tags: usize,
+    accepted_drafts: usize,
+) -> String {
+    if baseline.is_none() {
+        return format!(
+            " {ORPHAN_BASELINE_PATH} could not be read, so nothing is treated as accepted and every \
+             orphan below is still counted."
+        );
+    }
+    let mut parts = Vec::new();
+    if accepted_tags > 0 {
+        parts.push(format!("{accepted_tags} orphan tag(s)"));
+    }
+    if accepted_drafts > 0 {
+        parts.push(format!("{accepted_drafts} stuck draft(s)"));
+    }
+    if parts.is_empty() {
+        return String::new();
+    }
+    format!(" {} are accepted in {ORPHAN_BASELINE_PATH}.", parts.join(" and "))
+}
+
 /// Classify RELEASE PUBLICATION: is what was BUILT actually PUBLISHED where users can get it?
 ///
 /// WHY THIS COMPONENT EXISTS (2026-08-20): a fully built, fully NOTARIZED v0.120.0 DMG was discarded
@@ -721,6 +1187,8 @@ fn name_versions(versions: &[Version]) -> String {
 fn classify_release_publication(
     releases: Option<&ReleasesReading>,
     tags: Option<&[String]>,
+    baseline: Option<&ReleaseBaseline>,
+    draft_gates: &std::collections::BTreeMap<Version, GateVerdict>,
 ) -> (HealthState, String) {
     let Some(releases) = releases else {
         return (
@@ -795,17 +1263,34 @@ fn classify_release_publication(
     drafts.sort_unstable();
     drafts.dedup();
 
-    if orphans.is_empty() && drafts.is_empty() {
-        let detail = match high_water {
-            Some(h) => format!(
-                "every version tag has a published release on {PUBLIC_RELEASE_REPO}; the newest \
-                 users can get is {h}."
-            ),
-            None => "no version tags and no releases yet — nothing is waiting to be published."
-                .to_string(),
-        };
-        return (HealthState::Healthy, detail);
-    }
+    // THE ACCEPTANCE FILTER (bead `sparkle-6yit8m`). Every claim in the hourly warning "20 tags with
+    // no release … all below the newest published release v0.132.0" was TRUE, and that was the
+    // problem: those 20 orphans are discarded builds nobody will ever publish, and
+    // `scripts/release-reconcile.sh` is report-only by design because a tag is the ONLY surviving
+    // evidence of what a discarded build was cut from. A WARNING on a permanent accepted condition
+    // is indistinguishable from one on a new failure, so the channel that would report a genuine
+    // publication failure became noise everyone skims past.
+    //
+    // The filter is applied BEFORE the above/below-high-water split, deliberately: a baseline entry
+    // is a recorded decision that the version is abandoned, and that decision does not depend on
+    // where the version happens to sit relative to what shipped afterwards.
+    let (accepted_orphans, orphans): (Vec<Version>, Vec<Version>) = orphans
+        .into_iter()
+        .partition(|v| baseline.map(|b| b.tags.contains(v)).unwrap_or(false));
+    let (accepted_drafts, drafts): (Vec<Version>, Vec<Version>) = drafts
+        .into_iter()
+        .partition(|v| baseline.map(|b| b.drafts.contains(v)).unwrap_or(false));
+    let note = baseline_note(baseline, accepted_orphans.len(), accepted_drafts.len());
+    let nothing_accepted = accepted_orphans.is_empty() && accepted_drafts.is_empty();
+
+    // HELD BY GATE vs IN FLIGHT (bead `sparkle-6yit8m`, FIX 4). The old message said
+    // "release-finalize.yml publishes v0.131.0 once its CI concludes green". CI concluded green
+    // TWICE and nothing published, because the gate certifies the draft's BUILD BASE and that base
+    // is red — permanently. A draft whose gate is RED is the DESIGNED end state: release-finalize
+    // deliberately keeps it for forensics and will never auto-publish it. So it is informational,
+    // not debris implying someone should act, and it must never be described as pending on CI.
+    let (held_drafts, drafts): (Vec<Version>, Vec<Version>) =
+        drafts.into_iter().partition(|v| draft_gates.get(v) == Some(&GateVerdict::Red));
 
     // Strictly ABOVE the published high-water mark is built work users cannot get. With NOTHING
     // published, every tag and draft is above the (empty) mark.
@@ -819,55 +1304,70 @@ fn classify_release_publication(
     //
     // The discriminator needs no clock: a DRAFT existing for that version means the release object
     // is there with its assets attached and something will flip it (release.yml on a green gate, or
-    // release-finalize.yml once CI concludes). That is in-flight or deliberately held -> Warning.
-    // A tag with NO release object at all has nothing staged and nothing scheduled to act; it stays
-    // stranded until a human re-dispatches -> Blocking. That is precisely the v0.119.0 / v0.120.0
-    // shape, and precisely NOT the shape of a release that is merely mid-flight.
-    let above_orphans: Vec<Version> = orphans
-        .iter()
-        .copied()
-        .filter(|v| high_water.map(|h| *v > h).unwrap_or(true))
-        .collect();
-    let above_drafts: Vec<Version> = drafts
-        .iter()
-        .copied()
-        .filter(|v| high_water.map(|h| *v > h).unwrap_or(true))
-        .collect();
-    let above: Vec<Version> = above_orphans.iter().chain(above_drafts.iter()).copied().collect();
+    // release-finalize.yml once CI concludes). That is in-flight -> Warning. A tag with NO release
+    // object at all has nothing staged and nothing scheduled to act; it stays stranded until a human
+    // re-dispatches -> Blocking. That is precisely the v0.119.0 / v0.120.0 shape, and precisely NOT
+    // the shape of a release that is merely mid-flight.
+    let is_above = |v: &Version| high_water.map(|h| *v > h).unwrap_or(true);
+    let above_orphans: Vec<Version> = orphans.iter().copied().filter(|v| is_above(v)).collect();
+    let above_drafts: Vec<Version> = drafts.iter().copied().filter(|v| is_above(v)).collect();
+    let above_held: Vec<Version> = held_drafts.iter().copied().filter(|v| is_above(v)).collect();
+    let below_held: Vec<Version> = held_drafts.iter().copied().filter(|v| !is_above(v)).collect();
+    let shipped = match high_water {
+        Some(h) => format!("the newest release users can get is {h}"),
+        None => format!("{PUBLIC_RELEASE_REPO} has no published release at all"),
+    };
+    let held = held_clause(&below_held);
 
-    if above_orphans.is_empty() {
-        if let Some(newest) = above_drafts.iter().copied().max() {
-            let shipped = match high_water {
-                Some(h) => format!("the newest release users can get is {h}"),
-                None => format!("{PUBLIC_RELEASE_REPO} has no published release at all"),
-            };
-            return (
-                HealthState::Warning,
-                format!(
-                    "{} built and STAGED as a draft, not yet published — {shipped}. The assets are                      attached, so no rebuild is needed: release-finalize.yml publishes {newest} once                      its CI concludes green. If this persists across several CI runs, read that                      workflow's summary.",
-                    name_versions(&above_drafts)
-                ),
-            );
-        }
-    }
-
+    // 1. A STRANDED TAG above the mark. Nothing is staged and nothing is scheduled to act, so this
+    //    is the worst fact available and it outranks every draft state.
     if let Some(newest) = above_orphans.iter().copied().max() {
-        let shipped = match high_water {
-            Some(h) => format!("the newest release users can get is {h}"),
-            None => format!("{PUBLIC_RELEASE_REPO} has no published release at all"),
-        };
         return (
             HealthState::Blocking,
             format!(
                 "{} built but NOT published — {shipped}. The auto-updater serves \
                  {PUBLIC_RELEASE_REPO}'s newest release, so this work has shipped to nobody. \
                  There is no release object at all for {newest} — not even a draft — so nothing is \
-                 scheduled to publish it. Re-dispatch release.yml with existing_tag={newest}.",
+                 scheduled to publish it. Re-dispatch release.yml with existing_tag={newest}.{held}{note}",
                 name_versions(&above_orphans)
             ),
         );
     }
 
+    // 2. A RED-GATED DRAFT above the mark. Built work users cannot get, which will NEVER publish
+    //    itself — Blocking. And the remediation must NOT send anyone back to this tag: release.yml's
+    //    own error text says "re-dispatching this tag re-hits the same red run", and anyone who
+    //    follows the old advice burns a full signed, notarized build for nothing.
+    if !above_held.is_empty() {
+        return (
+            HealthState::Blocking,
+            format!(
+                "{} built and staged as a draft but HELD BY GATE — {shipped}. The build base's CI \
+                 concluded RED, so release-finalize.yml will NEVER publish it: this is built work \
+                 users cannot get and nothing will ship it on its own. Cut a NEW version from green \
+                 main — building this same tag again would only hit the same red run.{note}",
+                name_versions(&above_held)
+            ),
+        );
+    }
+
+    // 3. An IN-FLIGHT draft above the mark: gate green, pending, run-less or unreadable. Something
+    //    may yet flip it, so the existing in-flight wording is still true in those states.
+    if let Some(newest) = above_drafts.iter().copied().max() {
+        return (
+            HealthState::Warning,
+            format!(
+                "{} built and STAGED as a draft, not yet published — {shipped}. The assets are \
+                 attached, so no rebuild is needed: release-finalize.yml publishes {newest} once \
+                 its CI concludes green. If this persists across several CI runs, read that \
+                 workflow's summary.{held}{note}",
+                name_versions(&above_drafts)
+            ),
+        );
+    }
+
+    // 4. Nothing above the mark. What is left is debris below it — plus, possibly, a held draft,
+    //    which is stated but does NOT itself raise a warning.
     let mut parts = Vec::new();
     if !orphans.is_empty() {
         parts.push(format!(
@@ -885,22 +1385,76 @@ fn classify_release_publication(
             name_versions(&drafts)
         ));
     }
+
+    if parts.is_empty() {
+        let detail = match high_water {
+            // Nothing found, nothing accepted, nothing held: the plain all-clear, unchanged.
+            Some(h) if nothing_accepted && below_held.is_empty() && baseline.is_some() => format!(
+                "every version tag has a published release on {PUBLIC_RELEASE_REPO}; the newest \
+                 users can get is {h}."
+            ),
+            // Everything outstanding is either accounted for in the baseline or held by a red gate.
+            // Healthy — but the accepted counts and the held draft are stated, so nothing is hidden.
+            Some(h) => format!(
+                "no unaccounted orphan tag or stuck draft on {PUBLIC_RELEASE_REPO}; the newest \
+                 users can get is {h}.{held}{note}"
+            ),
+            None if nothing_accepted => {
+                "no version tags and no releases yet — nothing is waiting to be published."
+                    .to_string()
+            }
+            // Accepted debris with NOTHING published at all: we have no high-water mark, so we
+            // cannot say whether anything current is stuck. Fail toward "cannot tell", never green.
+            None => {
+                return (
+                    HealthState::Unknown,
+                    format!(
+                        "accepted orphan tags or drafts exist but {PUBLIC_RELEASE_REPO} has no \
+                         published release at all — cannot rank them.{note}"
+                    ),
+                )
+            }
+        };
+        return (HealthState::Healthy, detail);
+    }
+
     match high_water {
         Some(h) => (
             HealthState::Warning,
             format!(
                 "{} — all below the newest published release {h}, so nothing current is stuck. \
-                 Stale publication debris worth clearing.",
+                 Stale publication debris worth clearing.{held}{note}",
                 parts.join(" and ")
             ),
         ),
         // Unreachable: with nothing published, every orphan/draft is above the empty high-water mark
-        // and was reported Blocking above. Fail toward the honest "cannot tell", never toward green.
+        // and was reported above. Fail toward the honest "cannot tell", never toward green.
         None => (
             HealthState::Unknown,
             "orphan tags or drafts exist but nothing is published — cannot rank them.".to_string(),
         ),
     }
+}
+
+/// The sentence for a draft that is HELD BY GATE below the high-water mark.
+///
+/// It must read as "there is nothing to do here", because there genuinely is not: the draft cannot
+/// publish, nothing in this repo discards it, and release-finalize deliberately keeps it for
+/// forensics. It names the TWO real remedies, and it never suggests re-dispatching the tag — that is
+/// the one action release.yml explicitly forbids, and following it burns a full signed notarized
+/// build for nothing.
+fn held_clause(held: &[Version]) -> String {
+    let Some(newest) = held.iter().copied().max() else {
+        return String::new();
+    };
+    format!(
+        " {} {} HELD BY GATE — the build base's CI concluded RED, so release-finalize.yml keeps the \
+         draft for forensics and will never auto-publish it. That is the designed end state, not \
+         something to chase: either cut a NEW version from green main, or record it as \
+         draft:{newest} in {ORPHAN_BASELINE_PATH}.",
+        name_versions(held),
+        if held.len() == 1 { "is a draft" } else { "are drafts" }
+    )
 }
 
 // ── knightwatch (the PR-scoped reviewer bot) ────────────────────────────────────────────────────
@@ -1039,11 +1593,21 @@ fn runner_components(
     gh_program: Option<String>,
     root: &str,
 ) -> (Vec<ComponentHealth>, Option<bool>) {
-    // One network read feeds both pools.
+    let gh_program_for_queue = gh_program.clone();
+    // One network read feeds both pools. `--paginate` + `--slurp` mirrors `pr_query_runners` in
+    // `scripts/lib/pick-runner.sh`, and it is a CORRECTNESS fix rather than tuning: registrations
+    // exceed the live-VM ceiling because stale/offline ghosts accrue until the reaper clears them, so
+    // even `per_page=100` can drop the `sparkle-release` runner onto an unfetched page — which is
+    // exactly how this module came to file an hourly P1 against a release Mac that was online and
+    // idle. With `--slurp` the reply is a JSON ARRAY of `{total_count, runners}` page objects, which
+    // `read_runner_pool` merges (it still accepts a lone object, so every stub and fixture is
+    // unaffected).
     let json = gh_program.and_then(|program| {
-        let mut cmd = Command::new(program);
+        let mut cmd = Command::new(&program);
         cmd.arg("api")
+            .arg("--paginate")
             .arg(format!("repos/{RELEASE_REPO}/actions/runners?per_page=100"))
+            .arg("--slurp")
             .current_dir(root);
         apply_noninteractive(&mut cmd);
         match crate::worktree::output_with_timeout(cmd, RUNNER_QUERY_TIMEOUT) {
@@ -1052,9 +1616,24 @@ fn runner_components(
         }
     });
 
+    // The SECOND bounded read: how deep is the repo-wide queue? A failed read is `None`, never `0` —
+    // "I could not see the backlog" and "there is no backlog" are the two facts whose collapse
+    // produced the false RECOVERED (bead `sparkle-1xg2f6`).
+    let queued = gh_program_for_queue.and_then(|program| {
+        let mut cmd = Command::new(program);
+        cmd.arg("api")
+            .arg(format!("repos/{RELEASE_REPO}/actions/runs?status=queued&per_page=1"))
+            .current_dir(root);
+        apply_noninteractive(&mut cmd);
+        match crate::worktree::output_with_timeout(cmd, RUNNER_QUERY_TIMEOUT) {
+            Ok(o) if o.status.success() => read_queued_runs(&String::from_utf8_lossy(&o.stdout)),
+            _ => None,
+        }
+    });
+
     let ci = json.as_deref().and_then(|j| read_runner_pool(j, CI_RUNNER_LABEL));
     let release = json.as_deref().and_then(|j| read_runner_pool(j, RELEASE_RUNNER_LABEL));
-    let (ci_state, ci_detail) = classify_ci_pool(ci);
+    let (ci_state, ci_detail) = classify_ci_pool(ci, queued);
     let (rel_state, rel_detail) = classify_release_runner(release);
 
     let components = vec![
@@ -1099,21 +1678,66 @@ fn gh_api_text(program: &str, root: &str, path: &str) -> Option<String> {
     }
 }
 
+/// Load the acceptance file from a project root.
+///
+/// A MISSING OR UNREADABLE BASELINE IS `None`, WHICH ACCEPTS NOTHING. Reading it as blanket
+/// acceptance would make the one channel that reports a genuine publication failure go quiet the
+/// moment the file was deleted or renamed — the opposite of what an acceptance file is for.
+/// Separated from [`release_publication_component`] so the wiring itself is covered: with the read
+/// inlined there, deleting it would pass `None` and every classifier test would stay green.
+fn read_baseline_at(root: &str) -> Option<ReleaseBaseline> {
+    let text = std::fs::read_to_string(std::path::Path::new(root).join(ORPHAN_BASELINE_PATH)).ok()?;
+    Some(read_orphan_baseline(&text))
+}
+
 /// Build the release-publication component from two reads: the PUBLIC repo's Releases (what users
 /// can actually get) and the PRIVATE repo's tags (what was built). One page each — the BLOCKING
 /// direction only ever concerns versions above the published high-water mark, which are by
 /// construction the newest, and [`classify_release_publication`] refuses to judge tags older than
 /// the oldest release it read.
 fn release_publication_component(gh_program: Option<&str>, root: &str) -> ComponentHealth {
-    let releases = gh_program
-        .and_then(|p| gh_api_text(p, root, &format!("repos/{PUBLIC_RELEASE_REPO}/releases?per_page=100")))
-        .as_deref()
-        .and_then(read_releases);
-    let tags = gh_program
-        .and_then(|p| gh_api_text(p, root, &format!("repos/{RELEASE_REPO}/tags?per_page={TAG_PAGE_SIZE}")))
-        .as_deref()
-        .and_then(read_version_tags);
-    let (state, detail) = classify_release_publication(releases.as_ref(), tags.as_deref());
+    let releases_json = gh_program
+        .and_then(|p| gh_api_text(p, root, &format!("repos/{PUBLIC_RELEASE_REPO}/releases?per_page=100")));
+    let tags_json = gh_program
+        .and_then(|p| gh_api_text(p, root, &format!("repos/{RELEASE_REPO}/tags?per_page={TAG_PAGE_SIZE}")));
+    // The gate reads are per DRAFT and drafts are normally zero or one, so `fetch` is called at most
+    // twice per draft. With no `gh` it is never called at all and every draft stays in-flight, which
+    // is the pre-FIX-4 behaviour.
+    let fetch = |path: &str| gh_program.and_then(|p| gh_api_text(p, root, path));
+    release_publication_from_json(releases_json.as_deref(), tags_json.as_deref(), root, &fetch)
+}
+
+/// Everything [`release_publication_component`] does EXCEPT talk to `gh`: parse the two payloads,
+/// load the acceptance file from `root`, classify, and fail closed on a truncated tag page.
+///
+/// Split out so the FILE READ is covered. With that read inlined in the shell above, deleting it
+/// would silently pass `None` (accept nothing) and every classifier test would stay green, because
+/// none of them go through the shell — the "defaulted seam every test injects" shape AGENTS.md
+/// names. Here the seam is the two JSON payloads, which the shell supplies from `gh` and a test
+/// supplies from a fixture, while `root` is the SAME real argument on both paths.
+fn release_publication_from_json<F>(
+    releases_json: Option<&str>,
+    tags_json: Option<&str>,
+    root: &str,
+    fetch: &F,
+) -> ComponentHealth
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let releases = releases_json.and_then(read_releases);
+    let tags = tags_json.and_then(read_version_tags);
+    let baseline = read_baseline_at(root);
+    let draft_versions: Vec<Version> = releases
+        .as_ref()
+        .map(|r| r.drafts.iter().filter_map(|t| parse_version(t)).collect())
+        .unwrap_or_default();
+    let draft_gates = resolve_draft_gates(&draft_versions, fetch);
+    let (state, detail) = classify_release_publication(
+        releases.as_ref(),
+        tags.as_deref(),
+        baseline.as_ref(),
+        &draft_gates,
+    );
     // Fail closed on a possibly-truncated tag page before this reaches the panel.
     let (state, detail) =
         apply_tag_page_truncation(state, detail, tags.as_deref().map(<[String]>::len).unwrap_or(0));
@@ -1497,13 +2121,28 @@ mod tests {
         format!(r#"{{"total_count":{},"runners":[{}]}}"#, entries.len(), items.join(","))
     }
 
+    /// The same page, but with a `total_count` the caller chooses — the shape of a TRUNCATED read,
+    /// where GitHub reports every registration on the repo beside the page it actually returned.
+    fn runners_page(total_count: usize, entries: &[(&str, &str, bool)]) -> String {
+        let items: Vec<String> = entries
+            .iter()
+            .map(|(label, status, busy)| {
+                format!(
+                    r#"{{"name":"r","status":"{status}","busy":{busy},"labels":[{{"name":"{label}"}}]}}"#
+                )
+            })
+            .collect();
+        format!(r#"{{"total_count":{total_count},"runners":[{}]}}"#, items.join(","))
+    }
+
     /// An error payload (no `.runners` array) must read UNKNOWN, never "zero online". This is the
     /// three-way split `pick-runner.sh` exists for: a 503/auth error is not proof the pool is empty.
     #[test]
     fn an_error_payload_is_unknown_not_an_empty_pool() {
         assert_eq!(read_runner_pool(r#"{"message":"Not Found"}"#, CI_RUNNER_LABEL), None);
         assert_eq!(read_runner_pool("{not json", CI_RUNNER_LABEL), None);
-        let (state, _) = classify_ci_pool(read_runner_pool(r#"{"message":"503"}"#, CI_RUNNER_LABEL));
+        let (state, _) =
+            classify_ci_pool(read_runner_pool(r#"{"message":"503"}"#, CI_RUNNER_LABEL), Some(0));
         assert_eq!(state, HealthState::Unknown, "an unreadable read is UNKNOWN, not blocking");
     }
 
@@ -1513,19 +2152,19 @@ mod tests {
     fn ci_pool_empty_blocks_saturated_warns_idle_is_healthy() {
         // No linux-ci runner online (an unrelated label online does not count).
         let none = runners_json(&[("sparkle-release", "online", false)]);
-        let (state, detail) = classify_ci_pool(read_runner_pool(&none, CI_RUNNER_LABEL));
+        let (state, detail) = classify_ci_pool(read_runner_pool(&none, CI_RUNNER_LABEL), Some(0));
         assert_eq!(state, HealthState::Blocking, "no CI runner online cannot run tests");
         assert!(detail.contains("cannot run tests"), "{detail}");
 
         // All linux-ci runners busy → saturated, slow but functioning.
         let busy = runners_json(&[("linux-ci", "online", true), ("linux-ci", "online", true)]);
-        let (state, detail) = classify_ci_pool(read_runner_pool(&busy, CI_RUNNER_LABEL));
+        let (state, detail) = classify_ci_pool(read_runner_pool(&busy, CI_RUNNER_LABEL), Some(0));
         assert_eq!(state, HealthState::Warning, "saturated is slow, not blocking");
         assert!(detail.contains("not blocked"), "{detail}");
 
         // At least one idle → healthy.
         let idle = runners_json(&[("linux-ci", "online", true), ("linux-ci", "online", false)]);
-        let (state, _) = classify_ci_pool(read_runner_pool(&idle, CI_RUNNER_LABEL));
+        let (state, _) = classify_ci_pool(read_runner_pool(&idle, CI_RUNNER_LABEL), Some(0));
         assert_eq!(state, HealthState::Healthy);
     }
 
@@ -1563,6 +2202,180 @@ mod tests {
         assert_eq!((rel.online_idle, rel.online_busy), (0, 1), "only the sparkle-release runner");
     }
 
+    /// A `linux-ci` pool of `busy` busy runners and `idle` idle ones, as ONE complete page.
+    fn ci_pool(idle: usize, busy: usize) -> Option<RunnerPoolReading> {
+        let mut entries: Vec<(&str, &str, bool)> = Vec::new();
+        for _ in 0..busy {
+            entries.push(("linux-ci", "online", true));
+        }
+        for _ in 0..idle {
+            entries.push(("linux-ci", "online", false));
+        }
+        read_runner_pool(&runners_json(&entries), CI_RUNNER_LABEL)
+    }
+
+    /// FIX 1, THE MEASURED CONTRADICTION FED BACK IN. The monitor announced "the macOS release
+    /// runner (sparkle-release) is offline — wake the release Mac" at a moment when a direct read of
+    /// the same endpoint showed `status=online, busy=false`. Feed exactly that reading in: it must
+    /// come out Healthy, and the word "offline" must not appear anywhere in what the founder reads.
+    #[test]
+    fn an_online_idle_release_runner_is_never_reported_offline() {
+        let json = runners_json(&[("sparkle-release", "online", false)]);
+        let (state, detail) = classify_release_runner(read_runner_pool(&json, RELEASE_RUNNER_LABEL));
+        assert_eq!(state, HealthState::Healthy, "online + not busy is a healthy Mac: {detail}");
+        assert!(
+            !detail.to_lowercase().contains("offline"),
+            "an online runner must never be described as offline: {detail}"
+        );
+    }
+
+    /// FIX 1, THE OTHER HALF. The measured truncation: 61 registrations against a page carrying 30,
+    /// none of them the release runner. A page that did not contain the runner PROVES NOTHING about
+    /// the Mac — absence is unprovable from a truncated list — so this must be Unknown (which never
+    /// escalates the icon to red and files nothing), not the Blocking "wake the release Mac".
+    #[test]
+    fn a_truncated_runner_page_is_unknown_not_an_offline_verdict() {
+        let entries: Vec<(&str, &str, bool)> = (0..30).map(|_| ("linux-ci", "online", true)).collect();
+        let json = runners_page(61, &entries);
+
+        let reading = read_runner_pool(&json, RELEASE_RUNNER_LABEL).expect("a readable page");
+        assert!(!reading.complete, "61 registrations against 30 read is a truncated list");
+        let (state, detail) = classify_release_runner(Some(reading));
+        assert_eq!(state, HealthState::Unknown, "a truncated page cannot prove absence: {detail}");
+        assert_ne!(state, HealthState::Blocking, "and must never publish an outage: {detail}");
+        // The frozen string DOES contain the word "offline", inside the clause that denies it
+        // ("not proof the Mac is offline"). What must never appear is the CLAIM: the Blocking
+        // wording that asserts the runner is down and sends someone to the Mac.
+        assert!(
+            !detail.contains(&format!("({RELEASE_RUNNER_LABEL}) is offline")),
+            "it must not assert the runner is offline: {detail}"
+        );
+        assert!(
+            !detail.contains("Wake the release Mac"),
+            "and must not dispatch anyone to a Mac that is probably fine: {detail}"
+        );
+        assert!(detail.contains("TRUNCATED"), "it must say WHY it cannot tell: {detail}");
+
+        // The CI half of the same arm: a truncated page with no linux-ci runner on it.
+        let rel_only: Vec<(&str, &str, bool)> =
+            (0..30).map(|_| ("sparkle-release", "online", false)).collect();
+        let (state, detail) =
+            classify_ci_pool(read_runner_pool(&runners_page(61, &rel_only), CI_RUNNER_LABEL), Some(0));
+        assert_eq!(state, HealthState::Unknown, "same discipline for the CI pool: {detail}");
+        assert!(detail.contains("TRUNCATED"), "{detail}");
+    }
+
+    /// The PAIRED negative, so the truncation arm cannot be satisfied by downgrading everything: a
+    /// COMPLETE page with nothing online is still the real outage, and still Blocking. An absent
+    /// `total_count` (every hand-written stub) counts as complete for the same reason.
+    #[test]
+    fn a_complete_page_with_nothing_online_still_blocks() {
+        let entries: Vec<(&str, &str, bool)> = (0..30).map(|_| ("linux-ci", "online", true)).collect();
+        let (state, detail) =
+            classify_release_runner(read_runner_pool(&runners_page(30, &entries), RELEASE_RUNNER_LABEL));
+        assert_eq!(state, HealthState::Blocking, "a complete list CAN prove absence: {detail}");
+        assert!(detail.contains("offline"), "{detail}");
+
+        let no_count = r#"{"runners":[{"name":"r","status":"offline","busy":false,"labels":[{"name":"sparkle-release"}]}]}"#;
+        let reading = read_runner_pool(no_count, RELEASE_RUNNER_LABEL).expect("readable");
+        assert!(reading.complete, "an absent total_count is a complete answer, not a truncated one");
+        let (state, _) = classify_release_runner(Some(reading));
+        assert_eq!(state, HealthState::Blocking, "so existing fixtures keep their verdicts");
+    }
+
+    /// FIX 1(a)'s wire shape. `gh api --paginate … --slurp` returns an ARRAY of
+    /// `{total_count, runners}` page objects; every page's runners must be MERGED and `total_count`
+    /// taken from the first. Merging is what makes the reading complete — read only page 1 and the
+    /// release runner is missing, which is the whole bug.
+    #[test]
+    fn a_slurped_page_array_is_merged_into_one_pool() {
+        let page1 = runners_page(2, &[("linux-ci", "online", false)]);
+        let page2 = runners_page(2, &[("sparkle-release", "online", false)]);
+        let slurped = format!("[{page1},{page2}]");
+
+        let rel = read_runner_pool(&slurped, RELEASE_RUNNER_LABEL).expect("readable");
+        assert_eq!((rel.online_idle, rel.online_busy), (1, 0), "page 2's runner is merged in");
+        assert!(rel.complete, "2 registrations, 2 runners merged — nothing was dropped");
+        let (state, detail) = classify_release_runner(Some(rel));
+        assert_eq!(state, HealthState::Healthy, "{detail}");
+
+        // Page 1 ALONE is the pre-fix read: the same runner is missing and the list is short of its
+        // own total_count, so it must be Unknown rather than the false "offline".
+        let (state, _) = classify_release_runner(read_runner_pool(&page1, RELEASE_RUNNER_LABEL));
+        assert_eq!(state, HealthState::Unknown, "one page of two cannot prove absence");
+
+        // An empty array carries no page at all — unreadable, not an empty pool.
+        assert_eq!(read_runner_pool("[]", RELEASE_RUNNER_LABEL), None);
+        // …and a page array with one unreadable member fails the WHOLE read.
+        assert_eq!(read_runner_pool(&format!("[{page1},{{\"message\":\"503\"}}]"), CI_RUNNER_LABEL), None);
+    }
+
+    /// FIX 2, THE MEASURED CONTRADICTION FED BACK IN (bead `sparkle-1xg2f6`). "CI test runners
+    /// RECOVERED — 1 of 21 idle and ready. No action needed; close the pipeline-health bead" was
+    /// announced with 43 runs queued and 20 of 21 runners busy. One idle runner against forty-three
+    /// queued runs is not recovery, and the notice told its reader to close the bead — a wrong
+    /// verdict that erases its own evidence.
+    #[test]
+    fn one_idle_runner_against_a_deep_queue_is_not_recovery() {
+        let (state, detail) = classify_ci_pool(ci_pool(1, 20), Some(43));
+        assert_ne!(state, HealthState::Healthy, "43 queued against 1 idle is not healthy: {detail}");
+        assert_eq!(state, HealthState::Warning, "{detail}");
+        assert!(
+            !detail.contains("idle and ready"),
+            "the RECOVERED wording must not be reachable in this state: {detail}"
+        );
+        assert!(detail.contains("43"), "and the queue depth must be named: {detail}");
+    }
+
+    /// The autoscaler's own measured line: `queue health: healthy — queued=94 idle=0`. Zero idle
+    /// runners is already a Warning, but the depth is what tells an operator this is a stockout
+    /// rather than a busy minute, so the saturated wording must carry it.
+    #[test]
+    fn a_saturated_pool_names_the_queue_depth() {
+        let (state, detail) = classify_ci_pool(ci_pool(0, 21), Some(94));
+        assert_ne!(state, HealthState::Healthy, "{detail}");
+        assert_eq!(state, HealthState::Warning, "{detail}");
+        assert!(detail.contains("94"), "the depth is the diagnosis: {detail}");
+        assert!(detail.contains("not blocked"), "but merges still are not blocked: {detail}");
+    }
+
+    /// The PAIRED positives, so the queue rule is not vacuously always-unhealthy — and the grace
+    /// window that keeps it from flapping. A backlog under CI_QUEUE_BACKLOG_MIN clears inside one
+    /// autoscaler dispatch cycle and must NOT warn, even when it exceeds free capacity.
+    #[test]
+    fn a_drained_queue_is_healthy_and_a_small_backlog_is_within_grace() {
+        let (state, detail) = classify_ci_pool(ci_pool(5, 1), Some(0));
+        assert_eq!(state, HealthState::Healthy, "spare capacity and no queue is ready: {detail}");
+        assert!(detail.contains("idle and ready"), "{detail}");
+
+        // 2 queued > 1 idle, but 2 < CI_QUEUE_BACKLOG_MIN — one dispatch cycle clears it.
+        let (state, detail) = classify_ci_pool(ci_pool(1, 20), Some(2));
+        assert_eq!(state, HealthState::Healthy, "a backlog inside the grace does not warn: {detail}");
+
+        // And the grace is a THRESHOLD, not a blanket: at CI_QUEUE_BACKLOG_MIN it warns.
+        let (state, detail) = classify_ci_pool(ci_pool(1, 20), Some(CI_QUEUE_BACKLOG_MIN));
+        assert_eq!(state, HealthState::Warning, "the threshold itself is over budget: {detail}");
+    }
+
+    /// AN UNREADABLE QUEUE IS SILENCE, NOT A FALSE RECOVERED. `Unknown` never alarms and never fires
+    /// a recovery notice, so a failed queue read produces nothing rather than "1 of 21 idle and
+    /// ready". That is the fail-safe direction, and it is why `read_queued_runs` must answer `None`
+    /// — never `0` — for a shape it does not understand.
+    #[test]
+    fn an_unreadable_queue_is_unknown_never_ready() {
+        let (state, detail) = classify_ci_pool(ci_pool(5, 1), None);
+        assert_eq!(state, HealthState::Unknown, "readiness cannot be confirmed: {detail}");
+        assert!(!detail.contains("idle and ready"), "{detail}");
+        assert!(detail.contains("could not be read"), "and it must say so: {detail}");
+
+        // The reader's own contract, both directions.
+        assert_eq!(read_queued_runs(r#"{"total_count":0,"workflow_runs":[]}"#), Some(0));
+        assert_eq!(read_queued_runs(r#"{"total_count":43,"workflow_runs":[]}"#), Some(43));
+        assert_eq!(read_queued_runs(r#"{"message":"Bad credentials"}"#), None, "an error is not 0");
+        assert_eq!(read_queued_runs("{not json"), None);
+        assert_eq!(read_queued_runs("[]"), None);
+    }
+
 
     // ── release publication ───────────────────────────────────────────────────────────────────────
 
@@ -1588,6 +2401,21 @@ mod tests {
         v.iter().map(|s| s.to_string()).collect()
     }
 
+    /// Most release-publication tests care about the orphan/draft ladder, not about acceptance, so
+    /// they run against an EMPTY-but-READABLE baseline (nothing accepted) — which is exactly the
+    /// behaviour the classifier had before the baseline existed, so their verdicts are unchanged.
+    fn classify_pub(
+        releases: Option<&ReleasesReading>,
+        tags: Option<&[String]>,
+    ) -> (HealthState, String) {
+        classify_release_publication(
+            releases,
+            tags,
+            Some(&ReleaseBaseline::default()),
+            &std::collections::BTreeMap::new(),
+        )
+    }
+
     /// THE incident this component exists for. A fully built, fully notarized v0.120.0 (and the
     /// v0.119.0 before it) is TAGGED on the private repo with no Release behind it, while the newest
     /// thing a user can install is v0.118.0. That must be BLOCKING — built work nobody can get is a
@@ -1598,7 +2426,7 @@ mod tests {
     fn tags_above_the_published_high_water_mark_block_and_name_the_versions() {
         let tags = strings(&["v0.120.0", "v0.119.0", "v0.118.0", "v0.116.3", "v0.113.0", "v0.108.0"]);
         let (state, detail) =
-            classify_release_publication(Some(&measured_releases()), Some(&tags));
+            classify_pub(Some(&measured_releases()), Some(&tags));
         assert_eq!(state, HealthState::Blocking, "built-but-unpublished work is blocking: {detail}");
         assert!(detail.contains("v0.120.0"), "names the newest stuck version: {detail}");
         assert!(detail.contains("v0.119.0"), "and the one behind it: {detail}");
@@ -1623,7 +2451,7 @@ mod tests {
         // ONCE, as the stuck draft, not also as a tag with no release.
         let tags = strings(&["v0.118.0", "v0.116.3", "v0.113.0", "v0.111.0", "v0.108.0"]);
         let (state, detail) =
-            classify_release_publication(Some(&measured_releases()), Some(&tags));
+            classify_pub(Some(&measured_releases()), Some(&tags));
         assert_ne!(state, HealthState::Blocking, "nothing is above what shipped: {detail}");
         assert_eq!(state, HealthState::Warning, "but the debris is still worth saying: {detail}");
         assert!(
@@ -1648,7 +2476,7 @@ mod tests {
             drafts: Vec::new(),
         };
         let tags = strings(&["v0.118.0", "v0.114.0", "v0.113.0", "v0.108.0"]);
-        let (state, detail) = classify_release_publication(Some(&releases), Some(&tags));
+        let (state, detail) = classify_pub(Some(&releases), Some(&tags));
         assert_eq!(state, HealthState::Warning, "{detail}");
         assert!(detail.contains("2 tags with no release"), "plural: {detail}");
         assert!(detail.contains("v0.114.0"), "{detail}");
@@ -1663,7 +2491,7 @@ mod tests {
             drafts: strings(&["v0.111.0", "v0.110.0"]),
         };
         let tags = strings(&["v0.118.0", "v0.108.0"]);
-        let (state, detail) = classify_release_publication(Some(&releases), Some(&tags));
+        let (state, detail) = classify_pub(Some(&releases), Some(&tags));
         assert_eq!(state, HealthState::Warning, "{detail}");
         assert!(detail.contains("2 stuck draft releases"), "plural: {detail}");
     }
@@ -1679,7 +2507,7 @@ mod tests {
             drafts: strings(&["v0.111.0"]),
         };
         let tags = strings(&["v0.118.0", "v0.116.3", "v0.108.0"]);
-        let (state, detail) = classify_release_publication(Some(&releases), Some(&tags));
+        let (state, detail) = classify_pub(Some(&releases), Some(&tags));
         assert_eq!(state, HealthState::Warning);
         assert!(detail.contains("v0.111.0"), "names the stuck draft: {detail}");
         assert!(detail.to_lowercase().contains("draft"), "and says it is a draft: {detail}");
@@ -1696,7 +2524,7 @@ mod tests {
             drafts: Vec::new(),
         };
         let tags = strings(&["v0.118.0", "v0.116.3", "v0.108.0"]);
-        let (state, detail) = classify_release_publication(Some(&releases), Some(&tags));
+        let (state, detail) = classify_pub(Some(&releases), Some(&tags));
         assert_eq!(state, HealthState::Healthy, "{detail}");
         assert!(detail.contains("v0.118.0"), "names what users can get: {detail}");
     }
@@ -1713,7 +2541,7 @@ mod tests {
     fn version_comparison_is_semantic_not_lexicographic() {
         // The silent direction: v0.110.0 IS newer than the shipped v0.99.0, so it blocks.
         let shipped_99 = ReleasesReading { published: strings(&["v0.99.0"]), drafts: Vec::new() };
-        let (state, detail) = classify_release_publication(
+        let (state, detail) = classify_pub(
             Some(&shipped_99),
             Some(&strings(&["v0.110.0", "v0.99.0"])),
         );
@@ -1728,7 +2556,7 @@ mod tests {
         // published, so nothing is stuck.
         let shipped_110 =
             ReleasesReading { published: strings(&["v0.110.0", "v0.99.0"]), drafts: Vec::new() };
-        let (state, detail) = classify_release_publication(
+        let (state, detail) = classify_pub(
             Some(&shipped_110),
             Some(&strings(&["v0.110.0", "v0.99.0"])),
         );
@@ -1744,11 +2572,11 @@ mod tests {
     #[test]
     fn unreadable_releases_or_tags_are_unknown_never_healthy() {
         let tags = strings(&["v0.120.0"]);
-        let (state, detail) = classify_release_publication(None, Some(&tags));
+        let (state, detail) = classify_pub(None, Some(&tags));
         assert_eq!(state, HealthState::Unknown, "unreadable releases are not green: {detail}");
         assert!(detail.contains("could not read"), "{detail}");
 
-        let (state, detail) = classify_release_publication(Some(&measured_releases()), None);
+        let (state, detail) = classify_pub(Some(&measured_releases()), None);
         assert_eq!(state, HealthState::Unknown, "unreadable tags are not green: {detail}");
         assert!(detail.contains("could not read"), "{detail}");
 
@@ -1760,7 +2588,7 @@ mod tests {
         // A non-empty array we cannot pull a single tag out of is a shape we do not understand.
         assert_eq!(read_releases(r#"[{"id":1}]"#), None);
         assert_eq!(read_version_tags(r#"[{"id":1}]"#), None);
-        let (state, _) = classify_release_publication(
+        let (state, _) = classify_pub(
             read_releases(r#"{"message":"503"}"#).as_ref(),
             Some(&tags),
         );
@@ -1775,12 +2603,12 @@ mod tests {
         let releases =
             ReleasesReading { published: strings(&["latest", "nightly"]), drafts: Vec::new() };
         let (state, detail) =
-            classify_release_publication(Some(&releases), Some(&strings(&["v0.120.0"])));
+            classify_pub(Some(&releases), Some(&strings(&["v0.120.0"])));
         assert_eq!(state, HealthState::Unknown, "{detail}");
         assert!(detail.contains("recognizable"), "{detail}");
 
         // Same discipline on the tags side.
-        let (state, detail) = classify_release_publication(
+        let (state, detail) = classify_pub(
             Some(&measured_releases()),
             Some(&strings(&["nightly", "latest"])),
         );
@@ -1792,7 +2620,7 @@ mod tests {
             published: strings(&["v0.118.0", "v0.108.0"]),
             drafts: strings(&["untagged-draft"]),
         };
-        let (state, detail) = classify_release_publication(
+        let (state, detail) = classify_pub(
             Some(&releases),
             Some(&strings(&["v0.118.0", "v0.108.0"])),
         );
@@ -1818,7 +2646,7 @@ mod tests {
             // a version it would be v0.130.0 — above the high-water mark, and a false red.
             "v0.130.0.1",
         ]);
-        let (state, detail) = classify_release_publication(Some(&releases), Some(&tags));
+        let (state, detail) = classify_pub(Some(&releases), Some(&tags));
         assert_eq!(state, HealthState::Healthy, "archive tags are not releases: {detail}");
         assert!(!detail.contains("v0.130.0"), "a four-component tag is not a version: {detail}");
         assert_eq!(parse_version("v0.130.0.1"), None, "and the parser says so directly");
@@ -1834,7 +2662,7 @@ mod tests {
             drafts: Vec::new(),
         };
         // v0.4.0 predates every release in our page; v0.118.0/v0.108.0 are both published.
-        let (state, detail) = classify_release_publication(
+        let (state, detail) = classify_pub(
             Some(&releases),
             Some(&strings(&["v0.118.0", "v0.108.0", "v0.4.0"])),
         );
@@ -1842,7 +2670,7 @@ mod tests {
 
         // But a tag INSIDE the window with no release behind it still warns — that is what proves
         // the window is a window and not a blanket exemption.
-        let (state, detail) = classify_release_publication(
+        let (state, detail) = classify_pub(
             Some(&releases),
             Some(&strings(&["v0.118.0", "v0.113.0", "v0.108.0"])),
         );
@@ -1868,7 +2696,7 @@ mod tests {
 
         // …and that empty answer reaches the classifier as "nothing waiting", not as UNKNOWN.
         let releases = ReleasesReading { published: Vec::new(), drafts: Vec::new() };
-        let (state, _) = classify_release_publication(
+        let (state, _) = classify_pub(
             Some(&releases),
             read_version_tags("[]").as_deref(),
         );
@@ -1889,7 +2717,7 @@ mod tests {
         assert_eq!(reading.drafts, strings(&["v0.111.0"]), "and the draft is a draft");
 
         let (state, detail) =
-            classify_release_publication(Some(&reading), Some(&strings(&["v0.120.0", "v0.118.0"])));
+            classify_pub(Some(&reading), Some(&strings(&["v0.120.0", "v0.118.0"])));
         assert_eq!(state, HealthState::Blocking, "a prerelease does not ship it: {detail}");
         assert!(detail.contains("v0.120.0"), "{detail}");
     }
@@ -1901,12 +2729,12 @@ mod tests {
     fn nothing_published_at_all_blocks_when_a_tag_exists() {
         let releases = ReleasesReading { published: Vec::new(), drafts: Vec::new() };
         let (state, detail) =
-            classify_release_publication(Some(&releases), Some(&strings(&["v0.1.0"])));
+            classify_pub(Some(&releases), Some(&strings(&["v0.1.0"])));
         assert_eq!(state, HealthState::Blocking, "{detail}");
         assert!(detail.contains("no published release at all"), "{detail}");
 
         // …and a repo with nothing tagged and nothing released has nothing waiting — green.
-        let (state, detail) = classify_release_publication(Some(&releases), Some(&[]));
+        let (state, detail) = classify_pub(Some(&releases), Some(&[]));
         assert_eq!(state, HealthState::Healthy, "{detail}");
     }
 
@@ -1918,7 +2746,7 @@ mod tests {
         let tags = strings(&[
             "v0.100.0", "v0.101.0", "v0.102.0", "v0.103.0", "v0.104.0", "v0.105.0", "v0.106.0",
         ]);
-        let (state, detail) = classify_release_publication(Some(&releases), Some(&tags));
+        let (state, detail) = classify_pub(Some(&releases), Some(&tags));
         assert_eq!(state, HealthState::Blocking, "{detail}");
         assert!(detail.contains("v0.106.0"), "the highest is always named: {detail}");
         assert!(detail.contains("(+2 more)"), "and the elided ones are counted: {detail}");
@@ -1938,6 +2766,715 @@ mod tests {
         let json = serde_json::to_string(&comp).unwrap();
         assert!(json.contains(r#""id":"release_publication""#), "{json}");
         assert!(json.contains(r#""state":"blocking""#), "{json}");
+    }
+
+    // ── the orphan baseline ───────────────────────────────────────────────────────────────────────
+
+    /// THE REAL ACCEPTANCE FILE, not a paraphrase of it. `include_str!` resolves against this source
+    /// file, so this test reads the same bytes `release-reconcile.yml` reads — if the two ever
+    /// disagree about what is accepted, that is the bug this exists to catch.
+    const REAL_BASELINE: &str = include_str!("../../../../.github/release-orphan-baseline.txt");
+
+    /// THE MEASURED FALSE WARNING, FED BACK IN (bead `sparkle-6yit8m`). Every claim in "20 tags with
+    /// no release (v0.129.0, v0.126.0, …) — all below the newest published release v0.132.0" was
+    /// TRUE. That is the problem: the condition is permanent and accepted, and a WARNING on a
+    /// permanent accepted condition is indistinguishable from one on a new failure, so the channel
+    /// that would report a genuine publication failure became noise.
+    ///
+    /// The orphan list is DERIVED from the real file rather than retyped, so it cannot drift out of
+    /// agreement with it — and the derived list is asserted non-empty first, because a fixture whose
+    /// orphan list is silently empty would pass this test while proving nothing at all.
+    #[test]
+    fn a_baselined_orphan_never_raises_a_warning() {
+        let baseline = read_orphan_baseline(REAL_BASELINE);
+        assert!(
+            baseline.tags.len() >= 20,
+            "the real baseline must still carry the accepted orphans; got {}",
+            baseline.tags.len()
+        );
+        assert!(baseline.tags.contains(&parse_version("v0.129.0").unwrap()), "the newest orphan");
+        assert!(baseline.tags.contains(&parse_version("v0.59.0").unwrap()), "and the oldest");
+
+        // Today's published state: v0.132.0 is live, and the window reaches back past every orphan.
+        let releases =
+            ReleasesReading { published: strings(&["v0.132.0", "v0.58.0"]), drafts: Vec::new() };
+        let mut tags: Vec<String> = baseline.tags.iter().map(|v| v.to_string()).collect();
+        tags.push("v0.132.0".to_string());
+        tags.push("v0.58.0".to_string());
+
+        let (state, detail) =
+            classify_release_publication(
+            Some(&releases),
+            Some(&tags),
+            Some(&baseline),
+            &std::collections::BTreeMap::new(),
+        );
+        assert_ne!(state, HealthState::Warning, "a baselined orphan must not warn: {detail}");
+        assert_eq!(state, HealthState::Healthy, "{detail}");
+        assert!(detail.contains("v0.132.0"), "the high-water mark is still named: {detail}");
+        // THE FILE ACCEPTS HISTORY, IT DOES NOT FORGIVE IT — the accepted count is still stated, so
+        // filtering never makes an orphan invisible.
+        assert!(
+            detail.contains(&format!("{} orphan tag(s) are accepted", baseline.tags.len())),
+            "the accepted count must still be stated: {detail}"
+        );
+        assert!(detail.contains(ORPHAN_BASELINE_PATH), "and where to read the decisions: {detail}");
+    }
+
+    /// THE PAIRED DIRECTION, and the one that makes the filter a filter rather than a mute button:
+    /// an UNACCOUNTED orphan in the same fixture still warns and is still named. Without this, a
+    /// classifier that simply never warned would pass the test above.
+    #[test]
+    fn an_unaccounted_orphan_still_warns_beside_the_baselined_ones() {
+        let baseline = read_orphan_baseline(REAL_BASELINE);
+        let releases =
+            ReleasesReading { published: strings(&["v0.132.0", "v0.58.0"]), drafts: Vec::new() };
+        let mut tags: Vec<String> = baseline.tags.iter().map(|v| v.to_string()).collect();
+        tags.push("v0.132.0".to_string());
+        tags.push("v0.58.0".to_string());
+        // v0.130.0 is a real gap in the baseline: an orphan nobody has decided about yet.
+        assert!(!baseline.tags.contains(&parse_version("v0.130.0").unwrap()), "still unaccounted");
+        tags.push("v0.130.0".to_string());
+
+        let (state, detail) =
+            classify_release_publication(
+            Some(&releases),
+            Some(&tags),
+            Some(&baseline),
+            &std::collections::BTreeMap::new(),
+        );
+        assert_eq!(state, HealthState::Warning, "a NEW orphan is the signal: {detail}");
+        assert!(detail.contains("1 tag with no release"), "counted alone: {detail}");
+        assert!(detail.contains("v0.130.0"), "and named: {detail}");
+        assert!(!detail.contains("v0.129.0"), "the accepted ones are not re-listed: {detail}");
+        assert!(detail.contains("are accepted in"), "but their count is still stated: {detail}");
+    }
+
+    /// THE TWO NAMESPACES, ASSERTED IN BOTH DIRECTIONS — the file header says the split is enforced
+    /// by test on the shell side, and it must be enforced here too. Sharing one flat list would let
+    /// a tag already recorded as an abandoned orphan retroactively silence a stuck draft on that
+    /// same tag, and release.yml's `existing_tag` recovery re-cuts against exactly those tags — so a
+    /// real future draft would be pre-cleared before anyone decided anything.
+    #[test]
+    fn the_baseline_namespaces_do_not_leak_into_each_other() {
+        let published = strings(&["v0.132.0", "v0.58.0"]);
+        let tag_only = read_orphan_baseline("v0.131.0");
+        let draft_only = read_orphan_baseline("draft:v0.131.0");
+        assert_eq!(tag_only.tags.len(), 1, "a bare line is a TAG decision");
+        assert!(tag_only.drafts.is_empty(), "and only a tag decision");
+        assert_eq!(draft_only.drafts.len(), 1, "a draft: line is a DRAFT decision");
+        assert!(draft_only.tags.is_empty(), "and only a draft decision");
+
+        // A bare `v0.131.0` line must NOT silence the v0.131.0 STUCK DRAFT.
+        let with_draft =
+            ReleasesReading { published: published.clone(), drafts: strings(&["v0.131.0"]) };
+        let tags = strings(&["v0.132.0", "v0.131.0", "v0.58.0"]);
+        let (state, detail) =
+            classify_release_publication(
+            Some(&with_draft),
+            Some(&tags),
+            Some(&tag_only),
+            &std::collections::BTreeMap::new(),
+        );
+        assert_eq!(state, HealthState::Warning, "a tag decision does not accept a draft: {detail}");
+        assert!(detail.contains("1 stuck draft release (v0.131.0)"), "{detail}");
+
+        // …and the `draft:` line DOES silence it, so the assertion above is about the namespace and
+        // not about the classifier being unable to accept a draft at all.
+        let (state, detail) =
+            classify_release_publication(
+            Some(&with_draft),
+            Some(&tags),
+            Some(&draft_only),
+            &std::collections::BTreeMap::new(),
+        );
+        assert_eq!(state, HealthState::Healthy, "the draft decision accepts it: {detail}");
+        assert!(detail.contains("1 stuck draft(s) are accepted"), "and says so: {detail}");
+
+        // The mirror image: a `draft:v0.131.0` line must NOT silence a v0.131.0 ORPHAN TAG.
+        let no_draft = ReleasesReading { published, drafts: Vec::new() };
+        let (state, detail) =
+            classify_release_publication(
+            Some(&no_draft),
+            Some(&tags),
+            Some(&draft_only),
+            &std::collections::BTreeMap::new(),
+        );
+        assert_eq!(state, HealthState::Warning, "a draft decision does not accept a tag: {detail}");
+        assert!(detail.contains("1 tag with no release (v0.131.0)"), "{detail}");
+
+        // …and the bare line DOES accept that orphan tag.
+        let (state, detail) =
+            classify_release_publication(
+            Some(&no_draft),
+            Some(&tags),
+            Some(&tag_only),
+            &std::collections::BTreeMap::new(),
+        );
+        assert_eq!(state, HealthState::Healthy, "{detail}");
+        assert!(detail.contains("1 orphan tag(s) are accepted"), "{detail}");
+    }
+
+    /// AN UNREADABLE BASELINE FAILS LOUD, NOT GREEN. `None` accepts nothing — every orphan still
+    /// counts — and the detail says the file could not be read, so a deleted or renamed acceptance
+    /// file cannot silently become blanket acceptance for everything.
+    #[test]
+    fn a_missing_baseline_accepts_nothing_and_says_so() {
+        let releases =
+            ReleasesReading { published: strings(&["v0.132.0", "v0.58.0"]), drafts: Vec::new() };
+        let tags = strings(&["v0.132.0", "v0.129.0", "v0.58.0"]);
+        let (state, detail) = classify_release_publication(
+            Some(&releases),
+            Some(&tags),
+            None,
+            &std::collections::BTreeMap::new(),
+        );
+        assert_eq!(state, HealthState::Warning, "an unreadable baseline accepts nothing: {detail}");
+        assert!(detail.contains("v0.129.0"), "the orphan is still counted: {detail}");
+        assert!(detail.contains("could not be read"), "and the reason is stated: {detail}");
+        assert!(detail.contains(ORPHAN_BASELINE_PATH), "naming the file: {detail}");
+    }
+
+    /// The parser's own contract, mirroring `rr_baseline_tags`: `#` comments (whole-line AND
+    /// trailing), blank lines, surrounding whitespace and a trailing CR are all stripped; a line
+    /// that is not a version is ignored rather than fatal, because the real file is prose-heavy and
+    /// one typo must not take the whole acceptance list down with it.
+    #[test]
+    fn the_baseline_parser_strips_comments_blank_lines_and_carriage_returns() {
+        let b = read_orphan_baseline(
+            "# a whole-line comment\r\n\
+             \r\n\
+             v0.129.0\r\n\
+             \t v0.126.0  # trailing comment\r\n\
+             draft:v0.131.0\r\n\
+             draft: v0.111.0 \r\n\
+             not-a-version\r\n\
+             #v0.999.0\r\n",
+        );
+        assert_eq!(
+            b.tags,
+            ["v0.129.0", "v0.126.0"].iter().map(|v| parse_version(v).unwrap()).collect(),
+            "two tag decisions, whitespace and trailing comments stripped"
+        );
+        assert_eq!(
+            b.drafts,
+            ["v0.131.0", "v0.111.0"].iter().map(|v| parse_version(v).unwrap()).collect(),
+            "two draft decisions, with and without a space after the prefix"
+        );
+        assert!(
+            !b.tags.contains(&parse_version("v0.999.0").unwrap()),
+            "a commented-out line is not a decision"
+        );
+        // An empty file is a real, usable answer — "this baseline accepts nothing" — and must be
+        // kept distinct from an UNREADABLE one, which is the `None` the caller passes instead.
+        assert_eq!(read_orphan_baseline(""), ReleaseBaseline::default());
+    }
+
+    /// THE WIRING, not just the parser. With the file read inlined in the component, deleting that
+    /// line would pass `None` to the classifier and every test above would stay green — so the read
+    /// is its own function and this drives it against the REAL repo root.
+    #[test]
+    fn the_component_reads_the_acceptance_file_from_the_project_root() {
+        let repo_root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../..");
+        let baseline = read_baseline_at(repo_root).expect("the real repo carries the baseline file");
+        assert!(baseline.tags.len() >= 20, "and it is the real one: {}", baseline.tags.len());
+        assert_eq!(baseline, read_orphan_baseline(REAL_BASELINE), "the same bytes, parsed the same");
+
+        // A root without the file accepts NOTHING — never blanket acceptance.
+        assert_eq!(read_baseline_at(concat!(env!("CARGO_MANIFEST_DIR"), "/src")), None);
+    }
+
+    /// …and the CALL SITE, driven end-to-end. The payloads are fixtures; `root` is the real repo, so
+    /// the acceptance file is really read from disk. Drop the `read_baseline_at(root)` line and this
+    /// goes from Healthy to Warning — which is precisely the hourly false alarm being removed.
+    #[test]
+    fn the_component_honours_the_acceptance_file_end_to_end() {
+        let repo_root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../..");
+        let baseline = read_baseline_at(repo_root).expect("the real baseline");
+
+        // Published: v0.132.0 (today's high-water mark) and an old floor so every orphan is
+        // in-window. Tagged: those two plus every accepted orphan.
+        let releases_json =
+            r#"[{"tag_name":"v0.132.0","draft":false,"prerelease":false},
+                {"tag_name":"v0.58.0","draft":false,"prerelease":false}]"#;
+        let mut names: Vec<String> = baseline.tags.iter().map(|v| v.to_string()).collect();
+        names.push("v0.132.0".to_string());
+        names.push("v0.58.0".to_string());
+        assert!(names.len() < TAG_PAGE_SIZE, "short of the page limit, so truncation is not the reason");
+        let tags_json = format!(
+            "[{}]",
+            names.iter().map(|n| format!(r#"{{"name":"{n}"}}"#)).collect::<Vec<_>>().join(",")
+        );
+
+        let no_gh = |_: &str| None;
+        let c = release_publication_from_json(
+            Some(releases_json),
+            Some(&tags_json),
+            repo_root,
+            &no_gh,
+        );
+        assert_eq!(c.id, "release_publication");
+        assert_eq!(c.state, HealthState::Healthy, "the baseline must reach the classifier: {}", c.detail);
+        assert!(c.detail.contains("are accepted in"), "{}", c.detail);
+
+        // The paired direction, through the SAME entry point: a root with no acceptance file accepts
+        // nothing, so the identical payloads warn.
+        let c = release_publication_from_json(
+            Some(releases_json),
+            Some(&tags_json),
+            concat!(env!("CARGO_MANIFEST_DIR"), "/src"),
+            &no_gh,
+        );
+        assert_eq!(c.state, HealthState::Warning, "no file means nothing accepted: {}", c.detail);
+        assert!(c.detail.contains("could not be read"), "{}", c.detail);
+    }
+
+    // ── the CI gate behind a held draft ───────────────────────────────────────────────────────────
+
+    /// The MEASURED chain behind v0.131.0, verbatim: the tag commit, its build base (the first
+    /// parent), and the run named exactly "CI" on that base.
+    const TAG_SHA: &str = "d2f98e732f4e30526e8769971b12a83d6cda9d70";
+    const BASE_SHA: &str = "e3e8f146d94e2d8fd7b9a0777f1954a46d872a45";
+
+    fn gate_map(pairs: &[(&str, GateVerdict)]) -> std::collections::BTreeMap<Version, GateVerdict> {
+        pairs.iter().map(|(v, g)| (parse_version(v).unwrap(), *g)).collect()
+    }
+
+    /// A `fetch` standing in for `gh api` over the measured v0.131.0 chain: the tag commit has ZERO
+    /// workflow runs, so the gate must fall back to the build base, whose CI run concluded FAILURE.
+    fn measured_gate_fetch(path: &str) -> Option<String> {
+        if path == format!("repos/{RELEASE_REPO}/commits/v0.131.0") {
+            return Some(format!(r#"{{"sha":"{TAG_SHA}","parents":[{{"sha":"{BASE_SHA}"}}]}}"#));
+        }
+        if path.contains(TAG_SHA) {
+            return Some(r#"{"total_count":0,"workflow_runs":[]}"#.to_string());
+        }
+        if path.contains(BASE_SHA) {
+            return Some(
+                r#"{"total_count":1,"workflow_runs":[
+                    {"name":"CI","status":"completed","conclusion":"failure"}]}"#
+                    .to_string(),
+            );
+        }
+        None
+    }
+
+    /// A `fetch` whose TAG run concluded `failure` having executed nothing (the job died at the
+    /// synthetic `Set up job` step), over a build base whose CI is GREEN. This is the shape
+    /// `cc_gate` reclassifies and routes to the base — `rc=4`.
+    fn unjudged_tag_red_over_green_base(path: &str) -> Option<String> {
+        if path == format!("repos/{RELEASE_REPO}/commits/v0.140.0") {
+            return Some(format!(r#"{{"sha":"{TAG_SHA}","parents":[{{"sha":"{BASE_SHA}"}}]}}"#));
+        }
+        if path.contains("runs/77/jobs") {
+            // THE MEASURED SHAPE: green self-hosted siblings with full step lists, beside hosted
+            // jobs that failed having executed nothing. A whole-run step count reads this as
+            // "judged" and is therefore inert on exactly the case that blocks a release.
+            return Some(
+                r#"{"total_count":2,"jobs":[
+                    {"name":"shell","status":"completed","conclusion":"success","steps":[
+                        {"number":1,"name":"Set up job","conclusion":"success"},
+                        {"number":2,"name":"run tests","conclusion":"success"}]},
+                    {"name":"rust","status":"completed","conclusion":"failure","steps":[
+                        {"number":1,"name":"Set up job","conclusion":"failure"}]}]}"#
+                    .to_string(),
+            );
+        }
+        if path.contains(TAG_SHA) {
+            return Some(
+                r#"{"total_count":1,"workflow_runs":[
+                    {"id":77,"name":"CI","status":"completed","conclusion":"failure"}]}"#
+                    .to_string(),
+            );
+        }
+        if path.contains(BASE_SHA) {
+            return Some(
+                r#"{"total_count":1,"workflow_runs":[
+                    {"id":88,"name":"CI","status":"completed","conclusion":"success"}]}"#
+                    .to_string(),
+            );
+        }
+        None
+    }
+
+    /// THE INVERTED HARM THIS MODULE EXISTS TO PREVENT (roborev 68157, High).
+    ///
+    /// Porting `cc_verdict` alone rather than `cc_gate` made a tag run that FAILED WITHOUT JUDGING
+    /// ANYTHING read as a permanent block. The panel would then say "cut a NEW version from green
+    /// main" about a release sitting over a green base that the real gate publishes on its next
+    /// tick — instructing an operator to burn a full signed, notarized build for nothing. That is
+    /// the same wrong-because-approximated verdict this whole change removes, merely inverted.
+    #[test]
+    fn an_unjudged_tag_red_over_a_green_base_is_not_a_false_permanent_hold() {
+        let verdict = resolve_draft_gate("v0.140.0", &unjudged_tag_red_over_green_base);
+        assert_ne!(
+            verdict,
+            GateVerdict::Red,
+            "a tag run that executed ZERO steps judged nothing about the tree; cc_gate routes it to \
+             the build base rather than blocking on it"
+        );
+        assert_eq!(
+            verdict,
+            GateVerdict::Green,
+            "and the base it routes to is green, so this draft publishes on the next finalize tick"
+        );
+    }
+
+    /// THE PAIRED NEGATIVE, without which the test above passes for code that never blocks at all.
+    /// A tag run that really did execute its steps and failed is a red TREE and must still block.
+    #[test]
+    fn a_tag_red_that_actually_judged_the_tree_still_blocks() {
+        let fetch = |path: &str| -> Option<String> {
+            if path == format!("repos/{RELEASE_REPO}/commits/v0.141.0") {
+                return Some(format!(r#"{{"sha":"{TAG_SHA}","parents":[{{"sha":"{BASE_SHA}"}}]}}"#));
+            }
+            if path.contains("runs/99/jobs") {
+                return Some(
+                    r#"{"total_count":1,"jobs":[
+                        {"name":"test","status":"completed","conclusion":"failure","steps":[
+                            {"number":1,"name":"Set up job","conclusion":"success"},
+                            {"number":2,"name":"cargo test","conclusion":"failure"}]}]}"#
+                        .to_string(),
+                );
+            }
+            if path.contains(TAG_SHA) {
+                return Some(
+                    r#"{"total_count":1,"workflow_runs":[
+                        {"id":99,"name":"CI","status":"completed","conclusion":"failure"}]}"#
+                        .to_string(),
+                );
+            }
+            None
+        };
+        assert_eq!(
+            resolve_draft_gate("v0.141.0", &fetch),
+            GateVerdict::Red,
+            "a run whose steps executed and failed judged the tree RED and must still block"
+        );
+    }
+
+    /// A BASE red that judged nothing is a HOLD (`cc_gate` rc=5/6), never a permanent block. Unknown
+    /// is the honest answer: it claims neither an all-clear nor a block.
+    #[test]
+    fn an_unjudged_base_red_holds_rather_than_claiming_a_permanent_block() {
+        let fetch = |path: &str| -> Option<String> {
+            if path == format!("repos/{RELEASE_REPO}/commits/v0.142.0") {
+                return Some(format!(r#"{{"sha":"{TAG_SHA}","parents":[{{"sha":"{BASE_SHA}"}}]}}"#));
+            }
+            if path.contains(TAG_SHA) {
+                return Some(r#"{"total_count":0,"workflow_runs":[]}"#.to_string());
+            }
+            if path.contains("runs/55/jobs") {
+                return Some(
+                    r#"{"total_count":1,"jobs":[
+                        {"name":"rust","status":"completed","conclusion":"failure","steps":[
+                            {"number":1,"name":"Set up job","conclusion":"failure"}]}]}"#
+                        .to_string(),
+                );
+            }
+            if path.contains(BASE_SHA) {
+                return Some(
+                    r#"{"total_count":1,"workflow_runs":[
+                        {"id":55,"name":"CI","status":"completed","conclusion":"failure"}]}"#
+                        .to_string(),
+                );
+            }
+            None
+        };
+        assert_eq!(
+            resolve_draft_gate("v0.142.0", &fetch),
+            GateVerdict::Unknown,
+            "an infra-only base red must HOLD, not manufacture a permanent block with a rebuild remedy"
+        );
+    }
+
+    /// The softening is deliberately narrow, and this pins the boundary: a step-less job BESIDE a
+    /// sibling that really executed is a genuine failure, not an unstarted run. Softening there
+    /// would let a real red publish.
+    #[test]
+    fn the_unjudged_predicate_mirrors_cc_run_unjudged_failure() {
+        // THE NUMERATOR IS THE FAILED JOBS. A succeeded multi-step sibling beside a setup-failed job
+        // is the MEASURED release-bump shape; counting steps across the whole run reads it as
+        // "judged" and makes the predicate inert on exactly the case that blocks a release.
+        assert!(
+            run_judged_nothing(
+                r#"{"total_count":2,"jobs":[
+                    {"name":"shell","status":"completed","conclusion":"success","steps":[
+                        {"number":1,"name":"Set up job","conclusion":"success"},
+                        {"number":2,"name":"run tests","conclusion":"success"}]},
+                    {"name":"rust","status":"completed","conclusion":"failure","steps":[
+                        {"number":1,"name":"Set up job","conclusion":"failure"}]}]}"#
+            ),
+            "green siblings are STRONGER evidence, not weaker: the only red job never reached a \
+             runner, so this run judged no code at all"
+        );
+
+        // A failed job that reached its first REAL step judged the tree. Note it counts 2, not 0 —
+        // a succeeded synthetic `Set up job` is an executed step, which is why a literal
+        // `steps == 0` test would be wrong.
+        assert!(
+            !run_judged_nothing(
+                r#"{"total_count":1,"jobs":[
+                    {"name":"rust","status":"completed","conclusion":"failure","steps":[
+                        {"number":1,"name":"Set up job","conclusion":"success"},
+                        {"number":2,"name":"build","conclusion":"failure"}]}]}"#
+            ),
+            "this job executed a real step and failed — a red TREE, which must still block"
+        );
+
+        // SOFTENING IS THE FAIL-OPEN DIRECTION, so every "could not tell" answers NO.
+        assert!(
+            !run_judged_nothing(r#"{"total_count":0,"jobs":[]}"#),
+            "no failed job establishes NOTHING positively (cc_run_unjudged_failure requires n_failed > 0)"
+        );
+        assert!(
+            !run_judged_nothing(r#"{"total_count":9,"jobs":[]}"#),
+            "a TRUNCATED page must never read as 'nothing else failed' — the single most dangerous \
+             misread available here, and the same truncation lesson as the runner-pool read"
+        );
+        assert!(
+            !run_judged_nothing(
+                r#"{"total_count":3,"jobs":[
+                    {"name":"rust","status":"completed","conclusion":"failure","steps":[
+                        {"number":1,"name":"Set up job","conclusion":"failure"}]}]}"#
+            ),
+            "a SHORT page is truncated too: the unread jobs could each be a judging red"
+        );
+        assert!(
+            !run_judged_nothing("not json"),
+            "an unreadable jobs payload must never soften a Red — fail closed"
+        );
+
+        // A path-filtered job is `completed/skipped` carrying zero steps. Counting it as "never
+        // ran" would make almost every run look unjudged.
+        assert!(
+            !run_judged_nothing(
+                r#"{"total_count":1,"jobs":[
+                    {"name":"skipped-leg","status":"completed","conclusion":"skipped","steps":[]}]}"#
+            ),
+            "a skipped job is not a failed one, so nothing failed and nothing is proven"
+        );
+
+        // A bare ARRAY carries no total_count and is never treated as truncated — the guard needs
+        // the field PRESENT before it can fire.
+        assert!(
+            run_judged_nothing(
+                r#"[{"name":"rust","status":"completed","conclusion":"failure","steps":[
+                    {"number":1,"name":"Set up job","conclusion":"failure"}]}]"#
+            ),
+            "a bare array is the CC_JOB_LIST seam shape and must still be judgeable"
+        );
+    }
+
+    /// `read_ci_gate_verdict` must REPRODUCE `cc_verdict`, not approximate it. The two rules that
+    /// are easy to get wrong are both asserted: a run still in flight is Pending and must NEVER be
+    /// read through to an older green (a red result could still be coming), and ONLY the literal
+    /// conclusion "success" passes.
+    #[test]
+    fn the_gate_reader_reproduces_cc_verdict() {
+        let green = r#"{"workflow_runs":[{"name":"CI","status":"completed","conclusion":"success"}]}"#;
+        assert_eq!(read_ci_gate_verdict(green), GateVerdict::Green);
+
+        let red = r#"{"workflow_runs":[{"name":"CI","status":"completed","conclusion":"failure"}]}"#;
+        assert_eq!(read_ci_gate_verdict(red), GateVerdict::Red);
+
+        // Cancelled / timed_out / neutral / skipped all FAIL — only "success" passes.
+        for c in ["cancelled", "timed_out", "neutral", "skipped", "startup_failure"] {
+            let j = format!(
+                r#"{{"workflow_runs":[{{"name":"CI","status":"completed","conclusion":"{c}"}}]}}"#
+            );
+            assert_eq!(read_ci_gate_verdict(&j), GateVerdict::Red, "{c} is not success");
+        }
+
+        // A run in flight is Pending EVEN BESIDE an older completed green — never read through.
+        let in_flight = r#"{"workflow_runs":[
+            {"name":"CI","status":"in_progress","conclusion":null},
+            {"name":"CI","status":"completed","conclusion":"success"}]}"#;
+        assert_eq!(read_ci_gate_verdict(in_flight), GateVerdict::Pending);
+
+        // Only the workflow named "CI" counts: another workflow's green says nothing about the tree.
+        let other = r#"{"workflow_runs":[{"name":"Secret scan","status":"completed","conclusion":"success"}]}"#;
+        assert_eq!(read_ci_gate_verdict(other), GateVerdict::None, "a different workflow is no run");
+        assert_eq!(read_ci_gate_verdict(r#"{"workflow_runs":[]}"#), GateVerdict::None);
+
+        // And an unreadable payload is Unknown — never Red, never Green.
+        assert_eq!(read_ci_gate_verdict(r#"{"message":"Bad credentials"}"#), GateVerdict::Unknown);
+        assert_eq!(read_ci_gate_verdict("{not json"), GateVerdict::Unknown);
+    }
+
+    /// THE MEASURED CHAIN, END TO END, in the order `cc_gate` walks it: the tag commit first, and
+    /// only a RUN-LESS tag falls back to the build base. This is what makes "release-finalize
+    /// publishes it once its CI concludes green" false — the base is red, permanently.
+    #[test]
+    fn a_run_less_tag_falls_back_to_its_red_build_base() {
+        assert_eq!(resolve_draft_gate("v0.131.0", &measured_gate_fetch), GateVerdict::Red);
+        assert_eq!(
+            read_commit_and_base(&measured_gate_fetch(&format!(
+                "repos/{RELEASE_REPO}/commits/v0.131.0"
+            ))
+            .unwrap()),
+            Some((TAG_SHA.to_string(), Some(BASE_SHA.to_string()))),
+        );
+
+        // The PAIRED direction: a tag that DOES have a run of its own is answered by that run, and
+        // the base is never consulted — so a green base cannot rescue a red tag.
+        let tag_red = |path: &str| -> Option<String> {
+            if path.contains(TAG_SHA) && path.contains("runs?") {
+                return Some(
+                    r#"{"workflow_runs":[{"name":"CI","status":"completed","conclusion":"failure"}]}"#
+                        .to_string(),
+                );
+            }
+            if path.contains(BASE_SHA) {
+                panic!("the build base must not be consulted when the tag has its own run");
+            }
+            measured_gate_fetch(path)
+        };
+        assert_eq!(resolve_draft_gate("v0.131.0", &tag_red), GateVerdict::Red);
+
+        // …and a run-less tag whose BASE is green is Green, so the fallback is a real fallback and
+        // not a hard-coded Red.
+        let base_green = |path: &str| -> Option<String> {
+            if path.contains(BASE_SHA) {
+                return Some(
+                    r#"{"workflow_runs":[{"name":"CI","status":"completed","conclusion":"success"}]}"#
+                        .to_string(),
+                );
+            }
+            measured_gate_fetch(path)
+        };
+        assert_eq!(resolve_draft_gate("v0.131.0", &base_green), GateVerdict::Green);
+
+        // Any read failure is Unknown — never Red (a false permanent hold) and never Green.
+        assert_eq!(resolve_draft_gate("v0.131.0", &|_: &str| None), GateVerdict::Unknown);
+        let bad_commit = |_: &str| Some(r#"{"message":"Not Found"}"#.to_string());
+        assert_eq!(resolve_draft_gate("v0.131.0", &bad_commit), GateVerdict::Unknown);
+    }
+
+    /// THE MOST EXPENSIVE VERDICT OF THE NIGHT, FED BACK IN. The monitor said "v0.131.0 built and
+    /// STAGED as a draft… release-finalize.yml publishes v0.131.0 once its CI concludes green." CI
+    /// concluded green TWICE and nothing published. A red-gated draft BELOW the high-water mark is
+    /// the DESIGNED end state — kept for forensics, never auto-published — so it is stated inside an
+    /// otherwise-Healthy verdict, and the false reassurance must be unreachable.
+    #[test]
+    fn a_red_gated_draft_reads_as_held_and_never_promises_publication() {
+        let releases = ReleasesReading {
+            published: strings(&["v0.132.0", "v0.58.0"]),
+            drafts: strings(&["v0.131.0"]),
+        };
+        let tags = strings(&["v0.132.0", "v0.131.0", "v0.58.0"]);
+        let (state, detail) = classify_release_publication(
+            Some(&releases),
+            Some(&tags),
+            Some(&ReleaseBaseline::default()),
+            &gate_map(&[("v0.131.0", GateVerdict::Red)]),
+        );
+        assert_eq!(state, HealthState::Healthy, "a held draft is expected, not debris: {detail}");
+        assert!(detail.contains("HELD"), "and it is named as held: {detail}");
+        assert!(detail.contains("v0.131.0"), "{detail}");
+        assert!(
+            !detail.contains("once its CI concludes green"),
+            "the false reassurance must be unreachable in this state: {detail}"
+        );
+        assert!(
+            !detail.to_lowercase().contains("re-dispatch") && !detail.contains("existing_tag"),
+            "and it must never send anyone back to the held tag: {detail}"
+        );
+        // The two remedies that actually work.
+        assert!(detail.contains("cut a NEW version from green main"), "{detail}");
+        assert!(detail.contains(&format!("draft:v0.131.0 in {ORPHAN_BASELINE_PATH}")), "{detail}");
+    }
+
+    /// ABOVE the high-water mark the SAME red-gated draft is BLOCKING: built work users cannot get
+    /// that will never publish itself. Its remediation still must not name the tag — release.yml's
+    /// own error text says re-dispatching it re-hits the same red run, and anyone who follows the
+    /// old advice burns a full signed, notarized build for nothing.
+    #[test]
+    fn a_red_gated_draft_above_the_mark_blocks_without_naming_the_tag_as_the_remedy() {
+        let releases =
+            ReleasesReading { published: strings(&["v0.130.0"]), drafts: strings(&["v0.131.0"]) };
+        let tags = strings(&["v0.131.0", "v0.130.0"]);
+        let (state, detail) = classify_release_publication(
+            Some(&releases),
+            Some(&tags),
+            Some(&ReleaseBaseline::default()),
+            &gate_map(&[("v0.131.0", GateVerdict::Red)]),
+        );
+        assert_eq!(state, HealthState::Blocking, "users cannot get it and nothing will ship it: {detail}");
+        assert!(detail.contains("HELD"), "{detail}");
+        assert!(detail.contains("v0.131.0"), "{detail}");
+        assert!(detail.contains("Cut a NEW version from green main"), "{detail}");
+        assert!(
+            !detail.to_lowercase().contains("re-dispatch") && !detail.contains("existing_tag"),
+            "never re-dispatch a held tag: {detail}"
+        );
+        assert!(!detail.contains("once its CI concludes green"), "{detail}");
+    }
+
+    /// The PAIRED negative for the gate split: Pending, None and Unknown all keep TODAY'S in-flight
+    /// wording, which is true in those states — something may yet flip the draft. Without this, a
+    /// classifier that called every draft "held" would pass the two tests above.
+    #[test]
+    fn a_draft_whose_gate_is_not_red_keeps_the_in_flight_wording() {
+        let releases =
+            ReleasesReading { published: strings(&["v0.130.0"]), drafts: strings(&["v0.131.0"]) };
+        let tags = strings(&["v0.131.0", "v0.130.0"]);
+        for verdict in [GateVerdict::Pending, GateVerdict::None, GateVerdict::Unknown, GateVerdict::Green] {
+            let (state, detail) = classify_release_publication(
+                Some(&releases),
+                Some(&tags),
+                Some(&ReleaseBaseline::default()),
+                &gate_map(&[("v0.131.0", verdict)]),
+            );
+            assert_eq!(state, HealthState::Warning, "{verdict:?} is in flight, not held: {detail}");
+            assert!(detail.contains("once its CI concludes green"), "{verdict:?}: {detail}");
+            assert!(!detail.contains("HELD"), "{verdict:?}: {detail}");
+        }
+
+        // And an EMPTY gate map — no gate was resolved at all — is in-flight too, so the pre-FIX-4
+        // behaviour is what a gh-less probe still produces.
+        let (state, detail) = classify_pub(Some(&releases), Some(&tags));
+        assert_eq!(state, HealthState::Warning, "{detail}");
+        assert!(detail.contains("once its CI concludes green"), "{detail}");
+    }
+
+    /// TODAY'S REAL STATE, THROUGH THE REAL ENTRY POINT: the 20 baselined orphan tags, the v0.131.0
+    /// draft whose build base is red, and v0.132.0 published — the exact world that produced an
+    /// hourly Warning all night. It must be HEALTHY, state the accepted count, and name the held
+    /// draft without promising it will publish.
+    #[test]
+    fn todays_real_state_is_healthy_end_to_end() {
+        let repo_root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../..");
+        let baseline = read_baseline_at(repo_root).expect("the real baseline");
+        assert!(baseline.tags.len() >= 20, "not a vacuous fixture: {}", baseline.tags.len());
+
+        let releases_json = r#"[{"tag_name":"v0.132.0","draft":false,"prerelease":false},
+                                {"tag_name":"v0.131.0","draft":true,"prerelease":false},
+                                {"tag_name":"v0.58.0","draft":false,"prerelease":false}]"#;
+        let mut names: Vec<String> = baseline.tags.iter().map(|v| v.to_string()).collect();
+        names.extend(["v0.132.0".to_string(), "v0.131.0".to_string(), "v0.58.0".to_string()]);
+        let tags_json = format!(
+            "[{}]",
+            names.iter().map(|n| format!(r#"{{"name":"{n}"}}"#)).collect::<Vec<_>>().join(",")
+        );
+
+        let c = release_publication_from_json(
+            Some(releases_json),
+            Some(&tags_json),
+            repo_root,
+            &measured_gate_fetch,
+        );
+        assert_eq!(
+            c.state,
+            HealthState::Healthy,
+            "the whole night's Warning must be gone: {}",
+            c.detail
+        );
+        assert!(c.detail.contains("v0.132.0"), "the high-water mark: {}", c.detail);
+        assert!(c.detail.contains("are accepted in"), "the accepted count: {}", c.detail);
+        assert!(c.detail.contains("HELD"), "and the held draft: {}", c.detail);
+        assert!(!c.detail.contains("once its CI concludes green"), "{}", c.detail);
+        assert!(!c.detail.to_lowercase().contains("re-dispatch"), "{}", c.detail);
     }
 
     // ── knightwatch ───────────────────────────────────────────────────────────────────────────────
@@ -1983,12 +3520,12 @@ mod tests {
     #[test]
     fn release_in_progress_is_busy_true_idle_false_unknown_none() {
         assert_eq!(
-            release_in_progress(Some(RunnerPoolReading { online_idle: 0, online_busy: 1 })),
+            release_in_progress(Some(RunnerPoolReading { online_idle: 0, online_busy: 1, complete: true })),
             Some(true),
             "a busy release VM means a DMG is building — the fleet must pause"
         );
         assert_eq!(
-            release_in_progress(Some(RunnerPoolReading { online_idle: 1, online_busy: 0 })),
+            release_in_progress(Some(RunnerPoolReading { online_idle: 1, online_busy: 0, complete: true })),
             Some(false),
             "online but idle is NOT a release in progress"
         );
@@ -2015,7 +3552,7 @@ mod tests {
         // release-finalize.yml will publish it. Not an emergency.
         let staged = ReleasesReading { published: published.clone(), drafts: strings(&["v0.121.0"]) };
         let (state, detail) =
-            classify_release_publication(Some(&staged), Some(&strings(&["v0.121.0", "v0.118.0"])));
+            classify_pub(Some(&staged), Some(&strings(&["v0.121.0", "v0.118.0"])));
         assert_eq!(state, HealthState::Warning, "a staged draft above the mark is in-flight, not stranded: {detail}");
         assert!(detail.contains("v0.121.0"), "detail must name the version: {detail}");
         assert!(detail.contains("no rebuild"), "detail must say no rebuild is needed: {detail}");
@@ -2024,7 +3561,7 @@ mod tests {
         // measured v0.119.0 / v0.120.0 shape.
         let bare = ReleasesReading { published, drafts: Vec::new() };
         let (state, detail) =
-            classify_release_publication(Some(&bare), Some(&strings(&["v0.121.0", "v0.118.0"])));
+            classify_pub(Some(&bare), Some(&strings(&["v0.121.0", "v0.118.0"])));
         assert_eq!(state, HealthState::Blocking, "a tag with no release object is stranded: {detail}");
         assert!(detail.contains("existing_tag=v0.121.0"), "detail must name the remedy: {detail}");
     }
@@ -2035,7 +3572,7 @@ mod tests {
     fn a_stranded_tag_outranks_a_staged_draft() {
         let releases =
             ReleasesReading { published: strings(&["v0.118.0"]), drafts: strings(&["v0.121.0"]) };
-        let (state, _) = classify_release_publication(
+        let (state, _) = classify_pub(
             Some(&releases),
             Some(&strings(&["v0.121.0", "v0.120.0", "v0.118.0"])),
         );

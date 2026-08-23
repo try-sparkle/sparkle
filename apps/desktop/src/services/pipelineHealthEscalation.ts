@@ -127,7 +127,24 @@ export function remediationFor(componentId: string): string | null {
     case "knightwatch":
       return "The PR reviewer (knightwatch) is unavailable — reprovision it with `scripts/knightwatch/provision-vm.sh`.";
     case "release_publication":
-      return "Release publication is failing — read the latest `release.yml` run (`gh run list --workflow release.yml`) and the tagged commit's CI gate before re-dispatching.";
+      // NEVER SAY "RE-DISPATCH" HERE. This string used to end "…and the tagged commit's CI gate
+      // before re-dispatching", and re-dispatching a HELD tag is the one action release.yml
+      // explicitly forbids. Its own error text (.github/workflows/release.yml, the CI-RED branch)
+      // reads: "Fix the tree and cut a NEW version; re-dispatching this tag re-hits the same red
+      // run." AGENTS.md's rule is that a remedy string is an instruction someone will follow, so a
+      // remedy that burns a full signed, notarized build (~27 minutes on the founder's own Mac) to
+      // land back on the identical red gate is worse than no remedy at all.
+      //
+      // The two remedies below are the ones that actually terminate. Cutting a new version from
+      // green main is the fix when the work should ship; recording the tag in the baseline is the
+      // fix when it should not — and that file is the same one the probe reads to decide whether
+      // an orphan is accepted, so writing to it also stops this alarm recurring.
+      return (
+        "Release publication is stuck — read the latest `release.yml` run (`gh run list --workflow release.yml`) " +
+        "and the tagged commit's CI gate (`scripts/lib/ci-gate.sh`) to see WHY. Do NOT re-dispatch a held tag: " +
+        "release.yml refuses it and it re-hits the same red run. Either cut a NEW version from green main " +
+        "(`scripts/cut-dmg.sh --yes`), or record the tag as abandoned in `.github/release-orphan-baseline.txt`."
+      );
     default:
       return null;
   }
@@ -145,10 +162,25 @@ function severityWord(state: HealthState): string {
  */
 export function composeEscalationMessage(ev: EscalationEvent): string {
   if (ev.severity === "recovery") {
+    // THE READING, THEN THE CONCLUSION — and never an unconditional "no action needed".
+    //
+    // This message used to end "No action needed; close the pipeline-health bead for this
+    // component if one is open." It was measured announcing "CI test runners RECOVERED — 1 of 21
+    // idle and ready" at an instant when 43 runs were queued, 20 of 21 runners were busy, and
+    // main's three newest CI runs were all sitting queued. A wrong verdict that ALSO instructs the
+    // reader to stop tracking the thing it was wrong about erases its own evidence, which is the
+    // single most expensive shape this module can produce.
+    //
+    // The predicate that produced that verdict is fixed upstream (classify_ci_pool now reads queue
+    // depth, so "idle > 0" alone can no longer mean healthy). This half is the belt: an all-clear
+    // is derived from ONE poll of ONE component, which is never by itself grounds to close a
+    // durable finding, so it hands over the reading it was computed from and asks the reader to
+    // confirm rather than asserting there is nothing left to do.
     return (
       `Pipeline health — ${ev.name} RECOVERED (was ${severityWord(ev.from)}, now ${ev.to}).\n` +
       `${ev.detail}\n` +
-      `No action needed; close the pipeline-health bead for this component if one is open.`
+      `This is one poll of one component. Confirm against that reading before closing any ` +
+      `pipeline-health bead for it.`
     );
   }
   const head = `Pipeline health — ${ev.name} just went ${severityWord(ev.to)} (was ${ev.from}).`;

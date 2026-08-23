@@ -137,6 +137,35 @@ describe("composeEscalationMessage + remediationFor", () => {
     expect(msg).toContain("RECOVERED");
     expect(msg).not.toContain("Remediation:");
   });
+
+  // ── The two strings that were measured doing HARM ────────────────────────────────────────────
+  // Both of these assert on the ABSENCE of specific advice, which is the side effect that matters:
+  // a reader following either of the old strings took a costly or evidence-destroying action. They
+  // fail against the previous wording, which is what makes them worth having.
+
+  it("the release-publication remedy NEVER tells anyone to re-dispatch a held tag", () => {
+    const remedy = remediationFor("release_publication")!;
+    // release.yml's own error: "Fix the tree and cut a NEW version; re-dispatching this tag
+    // re-hits the same red run." Following the old remedy burned a full signed notarized build.
+    expect(remedy).not.toMatch(/before re-dispatching/i);
+    expect(remedy).toMatch(/do not re-dispatch a held tag/i);
+    // …and it names the two remedies that actually terminate.
+    expect(remedy).toMatch(/cut a NEW version from green main/i);
+    expect(remedy).toContain(".github/release-orphan-baseline.txt");
+  });
+
+  it("a RECOVERY never asserts 'no action needed' or orders a bead closed off one poll", () => {
+    const ev = detectEscalations(snap("warning"), snap("healthy", "1 of 21 idle and ready"))[0]!;
+    const msg = composeEscalationMessage(ev);
+    // Measured: this exact shape announced recovery while 43 runs were queued and 20 of 21 runners
+    // were busy — and then told the reader to close the bead that was tracking it.
+    expect(msg).not.toMatch(/no action needed/i);
+    expect(msg).not.toMatch(/close the pipeline-health bead/i);
+    // It hands over the reading it was computed from and asks for confirmation instead.
+    expect(msg).toContain("1 of 21 idle and ready");
+    expect(msg).toMatch(/one poll of one component/i);
+    expect(msg).toMatch(/confirm against that reading before closing/i);
+  });
 });
 
 describe("escalatePipelineHealth — an alarm that reached NO sink is not `delivered`", () => {
