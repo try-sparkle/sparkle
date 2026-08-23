@@ -306,8 +306,8 @@ fn run_bd(project_path: &str, args: &[&str]) -> Result<BdOutput, String> {
 }
 
 /// `run_bd` with extra environment for the child. Exists for `bd comment`, which falls back to
-/// `$EDITOR` when its `-m` is empty — and an editor opened from a Tauri command has no terminal
-/// attached, so it would hang until the bd timeout with nothing to show for it. Pinning
+/// `$EDITOR` when no comment text is supplied — and an editor opened from a Tauri command has no
+/// terminal attached, so it would hang until the bd timeout with nothing to show for it. Pinning
 /// `EDITOR=true` turns that into an immediate, readable "empty comment, aborting" instead.
 fn run_bd_env(
     project_path: &str,
@@ -1149,16 +1149,19 @@ pub async fn bead_label(
         .map_err(|e| format!("bd task failed: {e}"))?
 }
 
-/// Append a comment to a bead: `bd comment <id> -m <text>`.
+/// Append a comment to a bead: `bd comment <id> -- <text>`.
 ///
 /// The durable audit trail for machine-driven actions — the epic sweep's auto-restart records what
 /// it restarted and why here, because a console log dies with the app session and a label can only
 /// carry a timestamp. The store is shared by every worktree, so the note is readable from anywhere.
 ///
-/// TWO GUARDS, both about the same failure. `bd comment`'s `-m` "opens editor if not provided", and
-/// because `-m` is a plain string flag an EMPTY value takes that path too — indistinguishable from
-/// unset. An editor spawned from a Tauri command has no terminal attached, so it would sit there
-/// until the bd timeout expires and report nothing useful:
+/// The text is passed POSITIONALLY after a `--` separator: `bd comment` takes `<id> [text...]` and
+/// has NO `-m` flag (its shorthand is git's, not bd's — this is the sparkle-s8n643 trap). The `--`
+/// stops flag parsing so a note that happens to begin with a dash is still a comment, not an option.
+///
+/// TWO GUARDS, both about the editor fallback. `bd comment` with no text can open an editor, and an
+/// editor spawned from a Tauri command has no terminal attached, so it would sit there until the bd
+/// timeout expires and report nothing useful:
 ///   1. A blank message is refused HERE, before spawning, so the common case never reaches bd.
 ///   2. `EDITOR=true` is pinned on the child, so any path that still reaches the fallback exits
 ///      immediately with bd's own "empty comment, aborting" rather than blocking.
@@ -1171,7 +1174,7 @@ fn bead_comment_inner(project_path: String, id: String, text: String) -> Result<
     if text.trim().is_empty() {
         return Err("refusing to write an empty bead comment".to_string());
     }
-    let output = run_bd_env(&project_path, &["comment", &id, "-m", &text], &[("EDITOR", "true")])?;
+    let output = run_bd_env(&project_path, &["comment", &id, "--", &text], &[("EDITOR", "true")])?;
     select_bd_action(output.success, output.stdout.trim(), output.stderr.trim())
 }
 
@@ -1670,9 +1673,9 @@ mod tests {
 
     #[test]
     fn bead_comment_refuses_an_empty_message() {
-        // The whole reason this guard exists: `bd comment -m ""` is indistinguishable from a missing
-        // -m, which opens $EDITOR — and an editor spawned from a Tauri command hangs until the bd
-        // timeout with nothing to show. Refuse before spawning. Whitespace counts as empty.
+        // The whole reason this guard exists: `bd comment` with no text opens $EDITOR — and an
+        // editor spawned from a Tauri command hangs until the bd timeout with nothing to show.
+        // Refuse before spawning. Whitespace counts as empty.
         for blank in ["", "   ", "\n\t "] {
             let r = bead_comment_inner("/proj".into(), "sparkle-x".into(), blank.into());
             assert!(r.is_err(), "must refuse blank comment {blank:?}");
@@ -1693,7 +1696,7 @@ mod tests {
     fn bead_comment_is_classified_as_a_mutation() {
         // `comment` is not in BD_READ_SUBCOMMANDS, so a failure must be described as a write that
         // may have landed — which is what stops a caller blindly retrying it into a duplicate.
-        assert!(bd_subcommand_mutates(&["comment", "sparkle-x", "-m", "note"]));
+        assert!(bd_subcommand_mutates(&["comment", "sparkle-x", "--", "note"]));
     }
 
     #[test]
@@ -2650,6 +2653,41 @@ mod tests {
         let shown = ws.bd(&bd, &["show", &first_id, "--json", "--include-comments"]).expect("bd show");
         let text = String::from_utf8_lossy(&shown.stdout);
         assert!(text.contains("Duplicate folded by Sparkle"), "no fold comment on the match: {text}");
+    }
+
+    /// sparkle-s8n643: the epic audit-note writer must invoke `bd comment` with a flag bd actually
+    /// defines. The pre-fix body passed `-m`, which bd (Go/Cobra) rejects with "unknown shorthand
+    /// flag: 'm' in -m", so an epic restart silently failed to record what it restarted or why.
+    /// This drives the PRODUCTION body against a REAL store and reads the note back — it goes RED on
+    /// the `-m` form because the write never lands, and the `--` separator keeps a note that begins
+    /// with a dash a comment rather than an option.
+    #[cfg(unix)]
+    #[test]
+    fn bead_comment_inner_writes_the_note_to_the_store() {
+        let Some(ws) = crate::beads_cmd::tests::TempWorkspace::new("notes-comment") else {
+            eprintln!("SKIP: bd not installed or could not init a workspace");
+            return;
+        };
+        let Some(bd) = cached_bd_path() else { return };
+        let path = ws.dir.to_string_lossy().to_string();
+
+        let created =
+            create_bead_inner(&path, "A bead the sweep will annotate", "body", None, None, beads_cmd::NO_EXTRA_ENV)
+                .expect("create ran");
+        let id = crate::bead_dup::tests::id_of(&created);
+
+        // A realistic audit note, deliberately beginning with a dash to also exercise the `--` guard.
+        let note = "-- advisor:reviewed — epic restarted by the sweep; model=x verdict=go";
+        bead_comment_inner(path.clone(), id.clone(), note.to_string())
+            .expect("bead_comment_inner must succeed with a flag bd defines");
+
+        let shown =
+            ws.bd(&bd, &["show", &id, "--json", "--include-comments"]).expect("bd show");
+        let text = String::from_utf8_lossy(&shown.stdout);
+        assert!(
+            text.contains("advisor:reviewed — epic restarted by the sweep"),
+            "the audit note was not written to the store: {text}"
+        );
     }
 
     #[cfg(unix)]

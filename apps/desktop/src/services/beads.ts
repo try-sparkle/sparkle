@@ -318,7 +318,7 @@ export async function labelBead(
   await invoke("bead_label", { projectPath, action, id, label });
 }
 
-/** `bd comment <id> -m <text>` — append a note to a bead.
+/** `bd comment <id> -- <text>` — append a note to a bead (positional text; bd has no `-m`).
  *
  *  The DURABLE audit channel for a machine-driven action. A `log.warn` dies with the app session and
  *  a label can only carry a timestamp, so neither answers "why did it do that, three days ago?".
