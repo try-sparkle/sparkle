@@ -25,7 +25,7 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke: () => Promise.resolve(null) }))
 const { EpicInlineCard } = await import("./EpicInlineCard");
 const { useProjectStore } = await import("../stores/projectStore");
 const { useRuntimeStore } = await import("../stores/runtimeStore");
-const { useUiStore } = await import("../stores/uiStore");
+const { focusedBeadIdForSide, useUiStore } = await import("../stores/uiStore");
 type Bead = import("../services/beads").Bead;
 type AgentTab = import("../types").AgentTab;
 
@@ -109,6 +109,13 @@ beforeEach(() => {
     boardFocusBeadId: null,
     pairAssignment: {},
     leftProjectId: null,
+    // THE TWO FOCUS RUNGS, AND THEY MATTER MORE THAN THE KEYS ABOVE, because `setBeadFocus`
+    // TOGGLES: a value left behind by an earlier case (or by a vitest RETRY of this one) makes the
+    // next click CLEAR the focus instead of setting it, so the suite alternates pass/fail on the
+    // same code. That is the cross-test hygiene this block exists for, extended to the rung the
+    // Tasks pill now writes.
+    epicFocusBySide: { left: null, right: null },
+    beadFocusBySide: { left: null, right: null },
   } as never);
 });
 afterEach(cleanup);
@@ -138,18 +145,19 @@ describe("the epic card's Tasks row", () => {
     expect(screen.getByTestId("epics-bead-card-tasks").textContent).not.toContain(KID_A);
   });
 
-  it("HANDS THE TASK OFF TO THE BOARD when its pill is clicked", async () => {
-    // The column has no card of its own for a child task, so "open that bead's card" means the
-    // board's overlay — the same one-shot handoff the concierge's bead pill performs. The write is
-    // the assertion: a `boardFocusBeadId` naming the clicked bead, on a board that was made
-    // visible first (the id is consumed and cleared by a board that never mounts otherwise).
+  // ══ THIS ROW CHANGED DESTINATION, DELIBERATELY ════════════════════════════════════════════════
+  // It asserted that the pill HANDED THE TASK OFF TO THE BOARD. The founder asked for the other
+  // thing by name — *"if I click on one of the children, I can see the exact build agent or agents
+  // that are working on that child"* — so in THIS column the pill now narrows the build column.
+  // The board remains where a task's own CARD is read; it is not what this gesture is for.
+  it("NARROWS THE BUILD COLUMN to the task when its pill is clicked", async () => {
     seed([]);
     // THE OPPOSITE OF EVERY ANSWER BELOW, so each one is a TRANSITION rather than a restatement of
-    // the seed: Build mode (the click must reach Plan) and the Improve-Sparkle pane up (the click
+    // the seed: Plan mode (the click must reach Build) and the Improve-Sparkle pane up (the click
     // must take it down). The pane matters on its own — it renders into the same stage as the
-    // board, so a Plan mode set underneath it is a chevron that lies about what is on screen.
+    // column, so a Build mode set underneath it is a chevron that lies about what is on screen.
     useUiStore.setState({
-      workModeBySide: { left: "build", right: "build" },
+      workModeBySide: { left: "plan", right: "plan" },
       activeSpecial: "sparkle",
     } as never);
     mount();
@@ -161,22 +169,29 @@ describe("the epic card's Tasks row", () => {
       pill.click();
     });
 
-    expect(useUiStore.getState().boardFocusBeadId).toBe(KID_B);
-    // The board is actually SHOWING — a focus id set against a covered board is spent on a surface
-    // nobody mounted, and the click looks like it did nothing.
-    const side = useUiStore.getState().pairAssignment;
-    const shown = useUiStore.getState().workModeBySide;
-    expect(shown[side[PROJECT] === "left" ? "left" : "right"]).toBe("plan");
+    const side = useUiStore.getState().pairAssignment[PROJECT] === "left" ? "left" : "right";
+    // THE NARROWING ITSELF, read through the composition rule rather than the raw key, because
+    // `child ?? epic` is what the column actually renders from.
+    expect(useUiStore.getState().beadFocusBySide[side]).toBe(KID_B);
+    expect(focusedBeadIdForSide(useUiStore.getState(), side)).toBe(KID_B);
+    // The column is actually SHOWING — the focus banner and its only clear control are gated on
+    // `mode !== "plan"`, so a narrowing set under the board is one the reader can neither see nor
+    // undo.
+    expect(useUiStore.getState().workModeBySide[side]).toBe("build");
     expect(useUiStore.getState().activeSpecial).toBeNull();
   });
 
-  it("opens the LEFT pair's board without disturbing what the RIGHT pair is showing", async () => {
-    // THE TWO WRITES HAVE TO AGREE ON A SIDE. `openPlanBoard` reads it from `sideOf`; the selection
-    // used to be a bare `projectStore.selectProject`, which writes `selectedProjectId` — the RIGHT
-    // pair's slot. So this click opened the left board correctly AND shoved a left project into the
-    // right pair's selection, which `Workspace` then discards, dropping the right pair onto its own
-    // first project: clicking a task on one half of the cockpit silently re-navigated the other.
-    seedTwoPairs();
+  // ══ THE FOUNDER'S OTHER CONSTRAINT, IN ITS OWN ROW ════════════════════════════════════════════
+  // *"…without closing the open epic card."* This card IS that card: the column expands it while
+  // `focusedEpicId === epic.id`, which it reads from `epicFocusBySide`. A task id written into that
+  // key matches no epic and would snap the card shut under the reader mid-click. Asserted on the
+  // key the column reads, so it holds however the card is mounted.
+  it("leaves the OPEN EPIC's own key untouched, so its card stays open", async () => {
+    seed([]);
+    const side = useUiStore.getState().pairAssignment[PROJECT] === "left" ? "left" : "right";
+    act(() => {
+      useUiStore.getState().openEpicFocus(side, EPIC_ID);
+    });
     mount();
 
     const pill = (await waitFor(() => screen.getAllByTestId(TASKS_PILL))).find(
@@ -186,15 +201,43 @@ describe("the epic card's Tasks row", () => {
       pill.click();
     });
 
-    // The LEFT pair moved — the card's own project is now the left selection.
+    expect(useUiStore.getState().epicFocusBySide[side]).toBe(EPIC_ID);
+    // …and the column is nonetheless narrowed to the TASK, because the child rung wins while it
+    // holds. Both halves, or this passes for a click that did nothing at all.
+    expect(focusedBeadIdForSide(useUiStore.getState(), side)).toBe(KID_B);
+  });
+
+  // THE DESTINATION CHANGED ABOVE; THIS GUARANTEE DID NOT, and it is the expensive one, so the row
+  // is re-aimed rather than retired.
+  it("narrows the LEFT pair without disturbing what the RIGHT pair is showing", async () => {
+    // THE TWO WRITES HAVE TO AGREE ON A SIDE. The focus write reads it from `sideOf`; the selection
+    // used to be a bare `projectStore.selectProject`, which writes `selectedProjectId` — the RIGHT
+    // pair's slot. So this click narrowed the left column correctly AND shoved a left project into
+    // the right pair's selection, which `Workspace` then discards, dropping the right pair onto its
+    // own first project: clicking a task on one half of the cockpit silently re-navigated the
+    // other. `selectProjectOnItsSide` is what keeps the two writes on one side.
+    seedTwoPairs();
+    useUiStore.setState({ workModeBySide: { left: "plan", right: "build" } } as never);
+    mount();
+
+    const pill = (await waitFor(() => screen.getAllByTestId(TASKS_PILL))).find(
+      (p) => p.textContent === "Ship the rows",
+    )!;
+    act(() => {
+      pill.click();
+    });
+
+    // The LEFT pair moved — the card's own project is now the left selection, its column is showing
+    // Build, and it is narrowed to the clicked task.
     expect(useUiStore.getState().leftProjectId).toBe(PROJECT);
-    expect(useUiStore.getState().workModeBySide.left).toBe("plan");
-    expect(useUiStore.getState().boardFocusBeadId).toBe(KID_B);
-    // ...and the RIGHT pair was NOT touched: neither its selection nor its mode. This is the pair
-    // that fails with `selectProject`, and it is the whole point of the test — the left-side
-    // assertions above pass either way.
+    expect(useUiStore.getState().workModeBySide.left).toBe("build");
+    expect(useUiStore.getState().beadFocusBySide.left).toBe(KID_B);
+    // ...and the RIGHT pair was NOT touched: not its selection, not its mode, and NOT its narrowing.
+    // This is the pair that fails with `selectProject`, and it is the whole point of the test — the
+    // left-side assertions above pass either way.
     expect(useProjectStore.getState().selectedProjectId).toBe(RIGHT_PROJECT);
     expect(useUiStore.getState().workModeBySide.right).toBe("build");
+    expect(useUiStore.getState().beadFocusBySide.right).toBeNull();
   });
 });
 

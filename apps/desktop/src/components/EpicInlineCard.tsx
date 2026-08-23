@@ -190,12 +190,22 @@ export function EpicInlineCard({
         onBuildAllPrd={canWrite ? (build.buildAllPrd ?? undefined) : undefined}
         prdEpicCount={build.prdEpics.length}
         lineage={lineage}
-        // ── A TASK PILL OPENS THAT TASK'S OWN CARD, ON THE BOARD ─────────────────────────────
-        // The Epics column opens EPIC rows in place (`EpicRow` → this card); a child task has no
-        // row of its own here, so "open that bead's card" means the board's `DetailOverlay` —
-        // exactly what `Concierge/BeadPill` does from the other column that has no board of its
-        // own. See `openBeadCardOnBoard` for why the two writes are ordered the way they are.
-        onOpenBead={(beadId) => openBeadCardOnBoard(beadId, projectId)}
+        // ── A TASK PILL NARROWS THE BUILD COLUMN TO THAT TASK ────────────────────────────────
+        // THE FOUNDER ASKED FOR THIS GESTURE BY NAME: *"if I click on one of the children, I can
+        // see the exact build agent or agents that are working on that child… that's one way for me
+        // to get a view that I need, which is to be able to see what actual active building is
+        // being done against any given task."*
+        //
+        // It previously opened the task's own card on the BOARD, which is a defensible reading of
+        // "open that bead" and the wrong one for THIS column. The Epics column exists to drive the
+        // build column's focus — `uiStore.epicFocusBySide` calls it "the point of the epics column
+        // rather than a refinement of it" — so its rows narrow, and a child row narrowing one rung
+        // further is that same gesture rather than a jump to a different surface.
+        //
+        // NOTHING IS LOST: the task's card is still one click away wherever cards are read (the
+        // concierge's own card carries `Open · on board`), whereas the per-task build view had no
+        // entry point anywhere in the app before this line.
+        onOpenBead={(beadId) => focusChildTaskInColumn(beadId, projectId)}
         // ── A BUILD-AGENT PILL IS A REAL LINK ────────────────────────────────────────────────
         // The founder: build-agent pills *"are REAL LINKS: clicking one jumps to that agent, the
         // same affordance the concierge uses in chat."* `openProjectTab` IS that affordance — the
@@ -226,24 +236,36 @@ export function EpicInlineCard({
 }
 
 /**
- * OPEN A BEAD'S CARD THE WAY THE BOARD OPENS ONE — from a column that has no board of its own.
+ * NARROW THE BUILD COLUMN TO ONE CHILD TASK — the epics column's own gesture, one rung down.
  *
- * ══ THE ORDER IS LOAD-BEARING ═══════════════════════════════════════════════════════════════════
- * `openPlanBoard` FIRST, `setBoardFocusBeadId` SECOND. The focus id is a ONE-SHOT that `BoardView`
- * consumes and clears as soon as the bead appears in a snapshot; set against a board that is not
- * rendering yet, the handoff is spent on a surface nobody mounted and the card simply never opens.
- * `openPlanBoard`, never a bare `setWorkMode(side, "plan")` — the latter moves the chevron and
- * leaves the board invisible, which is the identical failure by a different route.
+ * The founder: *"if I click on one of the children, I can see the exact build agent or agents that
+ * are working on that child."* This is that click. It REPLACED a version that opened the task's
+ * card on the board; see the call site for why this column narrows rather than jumps.
+ *
+ * ══ WHY IT LEAVES THE OPEN EPIC CARD OPEN, WHICH IS THE FOUNDER'S OTHER CONSTRAINT ══════════════
+ * It writes ONLY `beadFocusBySide`. The epics column decides which card is expanded from
+ * `epicFocusBySide` (`focusedEpicId === epic.id`), so a task id written into THAT key would match
+ * no epic and snap shut the very card the reader just clicked into. Keeping the two rungs in two
+ * keys is what makes this a drill-DOWN: `focusedBeadIdForSide` is `child ?? epic`, so the narrower
+ * one wins while it holds and clearing it hands the column back to the epic (rule 2).
+ *
+ * ══ BOTH WRITES ARE REQUIRED ════════════════════════════════════════════════════════════════════
+ * `showBuildStage` FIRST, then the focus. The narrowing is real but INVISIBLE while that side shows
+ * the Plan board: `AgentSidebar` gates the focus banner — the only thing on screen that says a
+ * filter is in force, and the only place its clear control lives — on `mode !== "plan"`. Unlike the
+ * board path this file used to hold, neither write is a one-shot, so the order is for legibility
+ * rather than correctness; both writes, however, are mandatory.
  *
  * ══ THE SIDE IS READ, NOT PICKED — BY BOTH WRITES ═══════════════════════════════════════════════
- * `boardFocusBeadId` is app-global, so the side has to come from somewhere. It comes from where the
+ * The focus is per-side, so the side has to come from somewhere. It comes from where the
  * bead's project already lives (`sideOf`, total, defaulting to the historical single-pair "right"),
  * which is the only answer that stays correct in a two-pair cockpit. The project is SELECTED first
- * for the same reason: a board showing a different project would never contain the bead, the
- * one-shot would sit unconsumed, and the click would look like it did nothing.
+ * for the same reason: a build column showing a different project holds none of this bead's agents,
+ * so the narrowing would empty a column the reader never asked about and the click would look like
+ * it did nothing.
  *
  * The selection therefore goes through `services/openProjectTab.selectProjectOnItsSide`, NOT
- * `projectStore.selectProject`. That heading used to be a half-truth: only the `openPlanBoard` line
+ * `projectStore.selectProject`. That heading used to be a half-truth here: only the side-aware line
  * read the side, while the bare `selectProject` wrote `selectedProjectId` — which is the RIGHT
  * pair's selection. For a LEFT-assigned project the two writes then DISAGREED, and the disagreement
  * was not confined to this card: `Workspace`'s reconcile effect discards a left id it finds there
@@ -252,24 +274,34 @@ export function EpicInlineCard({
  * helper is idempotent for a project already selected on its own side, so there is no guard here.
  *
  * ══ THIS IS THE SECOND COPY OF THIS SEQUENCE, KNOWINGLY ═════════════════════════════════════════
- * `Concierge/BeadPill` holds a module-private `viewOnBoard` doing the same three writes for the same
- * reason (a column beside the board, with no board of its own). It belongs in a shared service and
- * this comment is the marker for the extraction; it was not done in this change because that file
- * is owned by concurrent work and a rewrite of it here would delete edits nobody had read.
- * `selectProjectOnItsSide` is what that extraction should look like when it happens — one exported
- * helper the callers reach for, rather than a rule re-derived per surface. It was itself extracted
- * after four copy-pasted derivations of the same rule, one of which was wrong (roborev 55192).
+ * `Concierge/BeadPill.viewInColumn` does the same select-then-show-then-focus for the same reason
+ * (a column beside the build column, reached from somewhere that is neither). The two differ only
+ * in which setter they end on — a LINK there wants the idempotent `openBeadFocus`, a ROW here wants
+ * the toggling `setBeadFocus` — so the shared part is the first two writes. It belongs in a shared
+ * service and this comment is the marker for that extraction; `selectProjectOnItsSide` is what it
+ * should look like when it happens — one exported helper the callers reach for, rather than a rule
+ * re-derived per surface. It was itself extracted after four copy-pasted derivations of the same
+ * rule, one of which was wrong (roborev 55192).
  *
- * Returns whether a board could be opened at all, so a caller that wants to say something can.
+ * Returns whether the column could be narrowed at all, so a caller that wants to say something can.
  */
-function openBeadCardOnBoard(beadId: string, projectId: string): boolean {
+function focusChildTaskInColumn(beadId: string, projectId: string): boolean {
   const projects = useProjectStore.getState();
-  // No such project: there is no board to open, and nothing is written.
+  // No such project: there is no column to narrow, and nothing is written.
   if (!projects.projects.some((p) => p.id === projectId)) return false;
   selectProjectOnItsSide(projectId);
   const ui = useUiStore.getState();
-  ui.openPlanBoard(sideOf(ui.pairAssignment, projectId));
-  ui.setBoardFocusBeadId(beadId);
+  const side = sideOf(ui.pairAssignment, projectId);
+  // BOTH WRITES, and the first is the one that is easy to drop: `AgentSidebar` gates the focus
+  // banner — the only thing on screen that says a filter is in force, and the only place its clear
+  // control lives — on `mode !== "plan"`. Narrowing a side that is showing the board is a filter
+  // the reader can neither see nor undo.
+  ui.showBuildStage(side);
+  // `setBeadFocus`, the TOGGLING setter, deliberately: this is a ROW-like control that is its own
+  // off-switch, exactly like the epic rows above it, so pressing the same task again hands the
+  // column back to the epic (rule 2). A LINK labelled "Open" would want the idempotent
+  // `openBeadFocus` instead — that is the distinction between the two setters, not an oversight.
+  ui.setBeadFocus(side, beadId);
   return true;
 }
 
