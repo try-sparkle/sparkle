@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Open in column — the two focus rungs, in a real browser</title>
+  </head>
+  <body>
+    <!--
+      Driven by task-focus-probe.mjs. It mounts the REAL BeadPillHost, so pressing "in column" runs
+      the shipped viewInColumn against the shipped stores — see the harness module for why this
+      exists beside the unit tests (jsdom has no layout, so it cannot tell a reachable control from
+      a zero-sized or covered one).
+    -->
+    <div id="root"></div>
+    <script type="module" src="./task-focus-harness.jsx"></script>
+  </body>
+</html>
