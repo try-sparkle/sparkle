@@ -992,6 +992,76 @@ describe("AccountsScreen", () => {
     expect(deps.setNickname).not.toHaveBeenCalled();
   });
 
+  // ── LOGIN-EXPIRED "reconnect" MUST ACTUALLY TAKE ────────────────────────────────────────────
+  //
+  // The founder's report: an account showing "Login expired — reconnect" (the sticky
+  // `EXPIRED_LOGIN_NICKNAME` placeholder) — he clicked reconnect and "it didn't do anything", the
+  // card stayed expired. The reconnect DID persist a fresh token, but nothing rewrote the stored
+  // placeholder nickname, and the title is rendered verbatim from it — so the card kept offering
+  // "reconnect" forever, even across a restart. Two halves, one durable and one cosmetic:
+  //
+  //   (A) the WRITE — a successful reconnect renames the row to its real email, exactly as the
+  //       pending-placeholder recovery does. Driven through the REAL reconnect button so deleting
+  //       the rename branch reds this test (the untested-production-seam shape the pending pair
+  //       above guards against);
+  //   (B) the DISPLAY — a row still STORING the expired placeholder but now signed in stops
+  //       rendering the expired affordance, so the fix reads on screen even before (A) persists.
+  it("renames an expired row to its real email when 'reconnect' actually succeeds", async () => {
+    let recovered = false;
+    // Non-default so "reconnect" calls handleLogin directly (the default routes through a confirm).
+    const deps = makeDeps([acct("x1", { nickname: EXPIRED_LOGIN_NICKNAME })]);
+    deps.getIdentities = vi.fn(async () =>
+      recovered
+        ? [signedInAs("x1", "someone@example.com")]
+        : [{ id: "x1", email: null, organization: null, accountUuid: null }],
+    );
+    const onLogin = vi.fn(async () => {
+      recovered = true; // the reconnect lands a fresh credential in the account's own dir
+    });
+    render(<AccountsScreen onLogin={onLogin} deps={deps} />);
+
+    fireEvent.click(await screen.findByTestId("account-reconnect-x1"));
+
+    await waitFor(() =>
+      expect(deps.setNickname).toHaveBeenCalledWith("x1", "someone@example.com"),
+    );
+  });
+
+  it("does NOT rename an expired row when the reconnect was cancelled or failed", async () => {
+    // The paired negative for the write above: renaming unconditionally would pass that test while
+    // stamping an email onto a row whose reconnect never completed.
+    const deps = makeDeps([acct("x1", { nickname: EXPIRED_LOGIN_NICKNAME })]);
+    deps.getIdentities = vi.fn(async () => [
+      { id: "x1", email: null, organization: null, accountUuid: null }, // never resolves an identity
+    ]);
+    const onLogin = vi.fn(async () => {});
+    render(<AccountsScreen onLogin={onLogin} deps={deps} />);
+
+    fireEvent.click(await screen.findByTestId("account-reconnect-x1"));
+
+    // Wait for the post-login identity re-read (immediately before the rename branch), so absence
+    // afterwards is real rather than a race — same reasoning as the pending pair above.
+    await waitFor(() => expect(deps.getIdentities).toHaveBeenCalledTimes(3));
+    expect(deps.setNickname).not.toHaveBeenCalled();
+  });
+
+  it("stops showing the expired affordance on a row that is stored expired but now signed in", async () => {
+    // The DISPLAY half (Gap B). A row whose STORED nickname is still the expired placeholder but
+    // whose identity now resolves an email must render the email, not "Login expired — reconnect" —
+    // otherwise the reconnect that just persisted a token still shows the user an expired card.
+    const deps = makeDeps(
+      [acct("x1", { nickname: EXPIRED_LOGIN_NICKNAME })],
+      [],
+      [signedInAs("x1", "someone@example.com")],
+    );
+    render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
+
+    const title = await screen.findByTestId("account-identity-x1");
+    expect(title.textContent).toBe("someone@example.com");
+    // The reconnect affordance is gone precisely because the title is no longer the expired string.
+    expect(within(title).queryByTestId("account-reconnect-x1")).toBeNull();
+  });
+
   // ── THE DEFAULT ACCOUNT'S DIRECTORY CAN BE RE-LOGGED-IN UNDERNEATH SPARKLE ──────────────────
   //
   // The founder found his "FC Superadmin" (DEFAULT) card reporting a DIFFERENT account's email,

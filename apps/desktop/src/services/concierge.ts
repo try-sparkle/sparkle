@@ -24,6 +24,7 @@ import { conciergeSessionInfo, type ClaudeSessionInfo } from "../preflight";
 import {
   accountConfigDirFor,
   conciergeFallbackConfigDirs,
+  rotateStickyConsumerOffSpentAccount,
   CONCIERGE_ACCOUNT_KEY,
   type ResolvedConfigDir,
 } from "./accountSelection";
@@ -815,9 +816,28 @@ export async function startConciergeTurn(
     // `claude` CLI, so a terminal login clobbers the OAuth Sparkle expects. Prefer a dedicated account
     // and route away from a clobbered default — recorded state still reads it healthy, so nothing else
     // would (see accountSelection `clobberedDefaultIds`).
-    const resolved = await accountConfigDirFor(CONCIERGE_ACCOUNT_KEY, {
+    let resolved = await accountConfigDirFor(CONCIERGE_ACCOUNT_KEY, {
       avoidClobberedDefault: true,
     });
+    // PROACTIVE HEALTH ROTATION (bug: first-prompt-after-restart hard limit error). The resolve
+    // above reads the process-COLD live-usage and dead-login caches, so on the FIRST turn after a
+    // restart a spend-limited or expired-login account reads healthy — an expired login even ranks
+    // as the HEALTHIEST account on the machine — and gets chosen; the turn then spawns into the hard
+    // "out of room / login expired" error and only self-heals ~1-2 min later once those caches warm.
+    // On the first turn it warms the probes (bounded) and, if the chosen account is spent with a
+    // healthy alternative, rotates to it so the re-resolve below lands healthy. Best-effort: the
+    // blocking probe warm-up runs at most once per process (see `rotateStickyConsumerOffSpentAccount`),
+    // it bails before any probe when there is no second account to rotate to, and a hung probe can
+    // never wedge the turn — so this adds no per-turn latency to the chat path.
+    if (
+      (
+        await rotateStickyConsumerOffSpentAccount(CONCIERGE_ACCOUNT_KEY, {
+          avoidClobberedDefault: true,
+        })
+      ).rotated
+    ) {
+      resolved = await accountConfigDirFor(CONCIERGE_ACCOUNT_KEY, { avoidClobberedDefault: true });
+    }
     // `effectiveConfigDir`, not `resolved`: an unreadable accounts backend must not silently move
     // the turn to the DEFAULT account while the session pointer still names another one.
     rebindSessionToAccount(resolved);

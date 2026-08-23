@@ -14,6 +14,7 @@ import {
   resetStickyAccounts,
   isStickyAccountKey,
   rotateStickyConsumerOffFailedAccount,
+  rotateStickyConsumerOffSpentAccount,
   refreshLiveUsage,
   refreshDeadLogins,
   deadLoginIds,
@@ -1372,5 +1373,239 @@ describe("a fleet preference / pause pointing at a DEFINITELY-expired login fall
     pauseRotation("dead", 40_000_000);
     const { chosen } = await chooseAccountForAgent("agent-y", { now: 40_000_000 });
     expect(chosen?.id).toBe("live");
+  });
+});
+
+// ── PROACTIVE rotation off a spent/expired account BEFORE the first turn dispatches ──────────────
+// The first prompt after an app restart resolves an account while the live-usage and dead-login
+// caches are process-COLD, so a spend-limited account reads as "no live figure yet" and an EXPIRED
+// login reads as the HEALTHIEST account on the machine (no wall, no utilization, signed-in by email).
+// It gets chosen, the turn spawns into the hard "out of room / login expired" error, and only
+// ~1-2 min later does the reactive/poll path rotate off it. `rotateStickyConsumerOffSpentAccount`
+// closes that window: it warms the probes and, if the account is spent with a healthy alternative,
+// rotates BEFORE dispatch. These assert the SIDE EFFECT (the selection MOVES to the healthy account)
+// with a paired negative so a rotation that always fires cannot pass.
+describe("proactive rotation off a spent/expired concierge account", () => {
+  // `def` is the cheaper account, so a cold first resolve parks the concierge there — exactly the
+  // account that is actually spent/expired in each case below.
+  const TWO = [
+    { id: "def", nickname: "Personal", configDir: "/home/.claude", isDefault: true, createdAt: 1 },
+    { id: "work", nickname: "Work", configDir: "/data/accounts/work", isDefault: false, createdAt: 2 },
+  ];
+
+  let exhausted: Record<string, number | null>;
+  /** `dead` = config dirs whose `claude auth status` returns a live CLI "no"; `live` = per-config-dir
+   *  utilization percentages the live-usage probe reports. Everything else is healthy. */
+  function mockFleet(opts: { dead?: string[]; live?: Record<string, number>; signedIn?: string[] } = {}) {
+    exhausted = {};
+    const dead = new Set(opts.dead ?? []);
+    const live = opts.live ?? {};
+    const signedIn = opts.signedIn ?? ["def", "work"];
+    invoke.mockImplementation((cmd: string, args?: { id?: string; untilEpoch?: number; configDir?: string }) => {
+      if (cmd === "accounts_list") return Promise.resolve(TWO);
+      if (cmd === "accounts_usage")
+        return Promise.resolve([
+          { id: "def", tokens5h: 0, tokens7d: 10, exhaustedUntil: exhausted["def"] ?? null },
+          { id: "work", tokens5h: 0, tokens7d: 50, exhaustedUntil: exhausted["work"] ?? null },
+        ]);
+      if (cmd === "accounts_identities")
+        return Promise.resolve(
+          signedIn.map((id) => ({ id, email: `${id}@example.com`, organization: null })),
+        );
+      if (cmd === "accounts_ceilings") return Promise.resolve([]);
+      if (cmd === "claude_auth_status") {
+        const cfg = args?.configDir ?? "";
+        const isDead = dead.has(cfg);
+        return Promise.resolve({
+          loggedIn: !isDead,
+          source: "cli", // only a live CLI reading is trusted to say NO — see authIsDefinitelyExpired
+          email: isDead ? null : "someone@example.com",
+          authMethod: null,
+          subscriptionType: null,
+        } satisfies ClaudeAuthStatus);
+      }
+      if (cmd === "account_usage_live") {
+        const cfg = args?.configDir ?? "";
+        const pct = live[cfg];
+        if (pct == null) return Promise.reject(new Error("no live figure in tests"));
+        return Promise.resolve({
+          fiveHourPercent: pct,
+          fiveHourResetsAt: null,
+          sevenDayPercent: pct,
+          sevenDayResetsAt: null,
+          limits: [],
+        });
+      }
+      if (cmd === "accounts_mark_exhausted") {
+        exhausted[args!.id!] = args!.untilEpoch!;
+        return Promise.resolve();
+      }
+      return Promise.reject(new Error(`unexpected ${cmd}`));
+    });
+    invalidateAccountState();
+  }
+
+  function markExhaustedIds(): string[] {
+    return invoke.mock.calls
+      .filter((c) => c[0] === "accounts_mark_exhausted")
+      .map((c) => (c[1] as { id: string }).id);
+  }
+
+  beforeEach(() => {
+    invoke.mockReset();
+    invalidateAccountState();
+    resetStickyAccounts();
+    clearAllPins();
+  });
+
+  it("rotates the concierge off an EXPIRED-login account before dispatch", async () => {
+    // `def`'s OAuth is dead (a live CLI "no"), `work` is healthy. The cold first resolve parks on
+    // `def` because recorded state (and the still-cold dead-login cache) reads it healthiest.
+    mockFleet({ dead: ["/home/.claude"] });
+    const t = 30_000_000;
+    expect(await accountConfigDirFor(CONCIERGE_ACCOUNT_KEY, { now: t })).toBe("/home/.claude");
+
+    const result = await rotateStickyConsumerOffSpentAccount(CONCIERGE_ACCOUNT_KEY, { now: t + 1 });
+
+    // SIDE EFFECT: warmed the dead-login probe, saw `def` is unusable, benched it and re-resolved to
+    // the healthy account — the sticky pointer moved with it.
+    expect(result.rotated).toBe(true);
+    expect(result.from).toBe("def");
+    expect(result.to).toBe("work");
+    expect(markExhaustedIds()).toEqual(["def"]);
+    expect(await accountConfigDirFor(CONCIERGE_ACCOUNT_KEY, { now: t + 2 })).toBe(
+      "/data/accounts/work",
+    );
+  });
+
+  it("rotates the concierge off a SPEND-LIMITED account before dispatch", async () => {
+    // `def` is at 95% of its real Anthropic quota (≥ LIVE_AVOID_PERCENT), `work` is at 5%. The cold
+    // first resolve parks on `def` because the live-usage cache is empty at that instant.
+    mockFleet({ live: { "/home/.claude": 95, "/data/accounts/work": 5 } });
+    const t = 31_000_000;
+    expect(await accountConfigDirFor(CONCIERGE_ACCOUNT_KEY, { now: t })).toBe("/home/.claude");
+
+    const result = await rotateStickyConsumerOffSpentAccount(CONCIERGE_ACCOUNT_KEY, { now: t + 1 });
+
+    expect(result.rotated).toBe(true);
+    expect(result.from).toBe("def");
+    expect(result.to).toBe("work");
+    expect(await accountConfigDirFor(CONCIERGE_ACCOUNT_KEY, { now: t + 2 })).toBe(
+      "/data/accounts/work",
+    );
+  });
+
+  it("does NOT rotate when the chosen account is HEALTHY (paired negative)", async () => {
+    // Both accounts authenticate and are well under quota. Warming the probes reveals nothing spent,
+    // so the imminent turn stays on the account it already had — a rotation that always fired would
+    // fail here. `def` (95%? no — 5%) stays chosen.
+    mockFleet({ live: { "/home/.claude": 5, "/data/accounts/work": 5 } });
+    const t = 32_000_000;
+    expect(await accountConfigDirFor(CONCIERGE_ACCOUNT_KEY, { now: t })).toBe("/home/.claude");
+
+    const result = await rotateStickyConsumerOffSpentAccount(CONCIERGE_ACCOUNT_KEY, { now: t + 1 });
+
+    expect(result.rotated).toBe(false);
+    expect(result.reason).toBe("not-unusable");
+    expect(markExhaustedIds()).toEqual([]);
+    expect(await accountConfigDirFor(CONCIERGE_ACCOUNT_KEY, { now: t + 2 })).toBe("/home/.claude");
+  });
+
+  it("does NOT rotate when there is no healthy alternative (never benches the last account)", async () => {
+    // Both logins are dead. Rotating anywhere just relocates the 401, and benching the last account
+    // would strand the concierge on a null account — so it must leave selection alone.
+    mockFleet({ dead: ["/home/.claude", "/data/accounts/work"] });
+    const t = 33_000_000;
+    expect(await accountConfigDirFor(CONCIERGE_ACCOUNT_KEY, { now: t })).toBe("/home/.claude");
+
+    const result = await rotateStickyConsumerOffSpentAccount(CONCIERGE_ACCOUNT_KEY, { now: t + 1 });
+
+    expect(result.rotated).toBe(false);
+    expect(markExhaustedIds()).toEqual([]);
+    expect(await accountConfigDirFor(CONCIERGE_ACCOUNT_KEY, { now: t + 2 })).toBe("/home/.claude");
+  });
+
+  it("respects a human pin (Manual Override) and does not rotate off an expired account", async () => {
+    mockFleet({ dead: ["/home/.claude"] });
+    const t = 34_000_000;
+    expect(await accountConfigDirFor(CONCIERGE_ACCOUNT_KEY, { now: t })).toBe("/home/.claude");
+    setPin(CONCIERGE_ACCOUNT_KEY, "def"); // the human deliberately put the concierge on `def`
+
+    const result = await rotateStickyConsumerOffSpentAccount(CONCIERGE_ACCOUNT_KEY, { now: t + 1 });
+
+    expect(result).toEqual({ rotated: false, reason: "pinned" });
+    expect(markExhaustedIds()).toEqual([]);
+  });
+
+  it("does not touch the probes at all when there is no second account to rotate to", async () => {
+    // The founder's single-signed-in-account machine: `bestHealthyTarget` can only return null, so
+    // the check is a no-op and must pay NO `claude auth status` subprocess to discover that. This
+    // guards the early bail placed BEFORE the probe warm-up.
+    mockFleet({ signedIn: ["def"], dead: ["/home/.claude"] });
+    const t = 35_000_000;
+    expect(await accountConfigDirFor(CONCIERGE_ACCOUNT_KEY, { now: t })).toBe("/home/.claude");
+    const deadSpy = vi.fn(refreshDeadLogins);
+    const liveSpy = vi.fn(refreshLiveUsage);
+
+    const result = await rotateStickyConsumerOffSpentAccount(CONCIERGE_ACCOUNT_KEY, {
+      now: t + 1,
+      deps: { refreshDeadLogins: deadSpy, refreshLiveUsage: liveSpy },
+    });
+
+    expect(result.reason).toBe("no-healthy-alternative");
+    expect(deadSpy).not.toHaveBeenCalled();
+    expect(liveSpy).not.toHaveBeenCalled();
+  });
+
+  it("AWAITS the cold probes only ONCE per process, not on every turn", async () => {
+    // The latency guard (roborev 68216): the cache TTLs (90s/120s) are shorter than the gap between
+    // typed turns, so awaiting the probes on EVERY turn would block the chat path on a subprocess
+    // whenever a turn lands after the TTL. The blocking warm-up must run at most once per process.
+    mockFleet({ live: { "/home/.claude": 5, "/data/accounts/work": 5 } }); // both healthy
+    const t = 36_000_000;
+    expect(await accountConfigDirFor(CONCIERGE_ACCOUNT_KEY, { now: t })).toBe("/home/.claude");
+    const deadSpy = vi.fn(refreshDeadLogins);
+    const liveSpy = vi.fn(refreshLiveUsage);
+    const deps = { refreshDeadLogins: deadSpy, refreshLiveUsage: liveSpy };
+
+    // First turn after "restart": the warm-up is awaited.
+    await rotateStickyConsumerOffSpentAccount(CONCIERGE_ACCOUNT_KEY, { now: t + 1, deps });
+    expect(deadSpy).toHaveBeenCalledTimes(1);
+    expect(liveSpy).toHaveBeenCalledTimes(1);
+
+    // A later turn, deliberately PAST both cache TTLs so nothing but the once-per-process flag can
+    // suppress the wait: the probes are NOT awaited again.
+    await rotateStickyConsumerOffSpentAccount(CONCIERGE_ACCOUNT_KEY, {
+      now: t + DEAD_LOGIN_TTL_MS + 200_000,
+      deps,
+    });
+    expect(deadSpy).toHaveBeenCalledTimes(1);
+    expect(liveSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("rotates even when the SPENT sticky account itself is not signed in (dead default)", async () => {
+    // The divergence the early bail must respect (roborev 68233): a terminal `claude logout` cleared
+    // the shared default's oauthAccount, so `def` is NOT in signedInAccountIds (email null) yet the
+    // concierge is still parked on it and its login is dead; `work` is signed in and healthy. A naive
+    // "< 2 signed-in accounts" bail would give up here (only `work` is signed in) and dispatch onto
+    // the dead account — the exact hard-error window this branch closes. The correct bail is weaker,
+    // so the rotation still fires.
+    mockFleet({ signedIn: ["work"], dead: ["/home/.claude"] });
+    const t = 37_000_000;
+    // Prime the sticky pointer onto `def` even though it is unauthed: pin it (a pin overrides the
+    // signed-in filter), resolve once to write the sticky slot, then drop the pin so the proactive
+    // path — not the pin — governs.
+    setPin(CONCIERGE_ACCOUNT_KEY, "def");
+    expect(await accountConfigDirFor(CONCIERGE_ACCOUNT_KEY, { now: t })).toBe("/home/.claude");
+    clearAllPins();
+
+    const result = await rotateStickyConsumerOffSpentAccount(CONCIERGE_ACCOUNT_KEY, { now: t + 1 });
+
+    expect(result.rotated).toBe(true);
+    expect(result.from).toBe("def");
+    expect(result.to).toBe("work");
+    expect(await accountConfigDirFor(CONCIERGE_ACCOUNT_KEY, { now: t + 2 })).toBe(
+      "/data/accounts/work",
+    );
   });
 });

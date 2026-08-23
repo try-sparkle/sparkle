@@ -36,7 +36,7 @@ import { getAccountUsageLive } from "./accountUsage";
 // why that discipline, and why neither is allowed to block a spawn.
 import { rotationOutIds, rotationPause } from "./rotationState";
 import { claudeSessionAccounts, checkClaudeAuthStatus, authIsDefinitelyExpired } from "../preflight";
-import type { Ceiling } from "./headroom";
+import { switchRecommendation, type Ceiling } from "./headroom";
 import type { ConciergeFailureKind } from "../engine/conciergeFailureNotice";
 import {
   recordSelection,
@@ -1123,6 +1123,7 @@ const lastResolvedAccount = new Map<string, Account>();
 export function resetStickyAccounts(): void {
   stickySelections.clear();
   lastResolvedAccount.clear();
+  proactiveWarmDone = false;
 }
 
 /** How long a reactively-detected-dead account is benched so a sticky consumer rotates OFF it.
@@ -1263,6 +1264,190 @@ export async function rotateStickyConsumerOffFailedAccount(
     return { rotated: !!to && to !== from, from, to };
   } catch (e) {
     console.warn("reactive rotation failed; leaving account selection unchanged", e);
+    return { rotated: false, reason: "backend-unreadable" };
+  }
+}
+
+/** How long the proactive health check waits for the cold `claude auth status` / live-usage probes
+ *  before proceeding with whatever landed. Bounded so a hung probe can never wedge the first prompt
+ *  after a restart — on timeout it degrades to "proceed as before" (the pre-existing behaviour),
+ *  never a block. */
+export const PROACTIVE_PROBE_BUDGET_MS = 6_000;
+
+/** Whether {@link rotateStickyConsumerOffSpentAccount} has already AWAITED the cold health probes
+ *  once in this process. The bug it closes is the FIRST turn after a restart, when the live-usage /
+ *  dead-login caches are process-cold; after that the background refreshers (kicked by every
+ *  {@link loadAccountState}) and the 120s auto-switch poll keep them warm, and awaiting a
+ *  `claude auth status` subprocess + keychain read on EVERY user turn would be a latency regression
+ *  on the chat path — the exact "a subprocess must never gate a spawn" invariant these caches exist
+ *  to hold. So the blocking warm-up runs at most once; later turns read whatever the caches already
+ *  hold, and a verdict that changes mid-session is the reactive handler's / poll's job, not this
+ *  one's. Reset by {@link resetStickyAccounts} for tests. */
+let proactiveWarmDone = false;
+
+/** Resolve when `p` settles OR after `ms`, whichever comes first — so a hung background probe cannot
+ *  block the caller. The probes write their own module caches on resolution, so abandoning the wait
+ *  loses nothing: a late verdict simply lands for the next pick. */
+function withProbeBudget(p: Promise<unknown>, ms: number): Promise<void> {
+  return new Promise<void>((resolve) => {
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      resolve();
+    };
+    const t = setTimeout(finish, ms);
+    void p.finally(() => {
+      clearTimeout(t);
+      finish();
+    });
+  });
+}
+
+/**
+ * PROACTIVE cousin of {@link rotateStickyConsumerOffFailedAccount}: rotate a sticky consumer (the
+ * concierge) OFF a spend-limited or expired account BEFORE its next turn dispatches, instead of
+ * after the turn has already failed with the hard "out of room / login expired" error.
+ *
+ * ══ THE BUG THIS CLOSES ═══════════════════════════════════════════════════════════════════════
+ * The two health signals that would demote a spent/expired account — real Anthropic utilization
+ * ({@link liveUsageRows}) and the live `claude auth status` verdict ({@link deadLoginIds}) — are
+ * process-lifetime caches, COLD on the first turn after a restart, and both are refreshed
+ * fire-and-forget (kicked, never awaited) by {@link loadAccountState}. So the first pick reads a
+ * spend-limited account as merely "no live figure yet" and an EXPIRED login as the HEALTHIEST
+ * account on the machine (no wall, no utilization, signed-in by email); it gets chosen, the turn
+ * spawns into the hard limit error, and only ~1-2 min later — once the caches warm and either the
+ * reactive failure handler or the 120s auto-switch poll fires — does it rotate to a healthy account.
+ *
+ * ══ HOW ══════════════════════════════════════════════════════════════════════════════════════
+ * Warm the two probes here (bounded — the "reconnecting…" moment; the blocking warm-up runs at most
+ * ONCE per process — see `proactiveWarmDone` — so it never gates a later turn on a subprocess), then
+ * ask the SAME oracle the fleet auto-switch
+ * uses ({@link switchRecommendation}) whether the sticky account is spent AND a healthy alternative
+ * exists. If so, bench the dead login group and re-resolve so the sticky pointer moves — exactly as
+ * the reactive path does — and the imminent turn lands healthy. Never a new "is spent" predicate:
+ * the trigger is the founder-named oracle, reused.
+ *
+ * ══ SAFETY — every guard fails safe ═══════════════════════════════════════════════════════════
+ *  - A human PIN wins; a pinned consumer is left where the human put it.
+ *  - Nothing resolved yet (cold sticky slot) → nothing to move; the caller resolves first, then this
+ *    runs, so on the first turn the sticky pointer already names the (possibly spent) account.
+ *  - Unreadable backend → leave selection alone (can't identify healthy or trust "spent").
+ *  - {@link switchRecommendation} returns null when the account is HEALTHY or when there is NO
+ *    healthy alternative — either way this does nothing, so it never benches the fleet down to
+ *    nothing and never manufactures a null account.
+ *  - Bounded probe wait, best-effort throughout: a probe that hangs or throws degrades to "proceed
+ *    as before" (the pre-existing hard-error-then-self-heal behaviour), never a blocked turn.
+ */
+export async function rotateStickyConsumerOffSpentAccount(
+  key: string,
+  opts: {
+    now?: number;
+    probeBudgetMs?: number;
+    avoidClobberedDefault?: boolean;
+    /** Injectable refreshers so a test can assert the once-per-process warm-up without a subprocess.
+     *  Default to the real background probes. */
+    deps?: {
+      refreshDeadLogins?: typeof refreshDeadLogins;
+      refreshLiveUsage?: typeof refreshLiveUsage;
+    };
+  } = {},
+): Promise<StickyRotationResult> {
+  const refreshDead = opts.deps?.refreshDeadLogins ?? refreshDeadLogins;
+  const refreshLive = opts.deps?.refreshLiveUsage ?? refreshLiveUsage;
+  try {
+    // A human's explicit Manual Override outranks proactive rotation, exactly as it does the reactive
+    // one — a pinned consumer stays where the human put it, spent or not.
+    if (getPin(key)) return { rotated: false, reason: "pinned" };
+    // The sticky selection is the account the consumer will run under. On the first turn the caller
+    // has already resolved once, so this names the (possibly spent) account; with nothing resolved
+    // there is nothing to move off of.
+    const from = stickySelections.get(key);
+    if (!from) return { rotated: false, reason: "nothing-resolved" };
+
+    const now = opts.now ?? Date.now();
+    // CACHED load, not `force`: the caller (the concierge turn) just resolved this key, so the 5s
+    // account snapshot is warm and free. `force` would pay the expensive `getIdentities` parse on
+    // EVERY turn for a guard that only bites on the cold-cache first one.
+    const state = await loadAccountState({ now });
+    if (state.failed) return { rotated: false, from, reason: "backend-unreadable" };
+
+    // NOTHING TO ROTATE TO — decided BEFORE any probe wait. If no signed-in account exists OUTSIDE
+    // `from`'s own login group, `bestHealthyTarget` can only ever return null (it requires a signed-in
+    // candidate that is not a sibling of the vacated login), so the whole check is a no-op and must
+    // not pay a `claude auth status` subprocess to discover that. This is the founder's single-account
+    // machine at zero cost. It is deliberately the EXACT complement of the oracle's precondition, not
+    // "fewer than two accounts total": the two diverge precisely when `from` itself is not signed in
+    // (a terminal `claude logout` cleared the shared default's `oauthAccount`), where a stronger
+    // "< 2 signed-in" test would wrongly bail while a healthy OTHER account sits right there — the
+    // headline case this branch exists to close (roborev 68233).
+    const fromGroup = new Set(loginSiblingIds(state.accounts, state.identities).get(from) ?? [from]);
+    if (!signedInAccountIds(state.identities).some((id) => !fromGroup.has(id))) {
+      return { rotated: false, from, reason: "no-healthy-alternative" };
+    }
+
+    // Warm the two health caches the resolver reads — but AWAIT the probes at most ONCE per process,
+    // because that is the only turn this bug touches: the FIRST one after a restart, when the caches
+    // are genuinely cold. The caches' TTLs (90s / 120s) are shorter than the gap between typed turns,
+    // so awaiting on every turn would block the chat path on a subprocess + keychain read whenever a
+    // turn lands after the TTL — the exact invariant these background caches exist to hold. On every
+    // later turn read whatever the caches already hold (kept warm by the background refreshers and
+    // the 120s poll); a verdict that changes mid-session is handled reactively on the turn failure,
+    // not here. Bounded so a hung probe cannot wedge even that first prompt: on timeout we proceed
+    // with whatever landed. Awaiting a refresh the caller's load already kicked returns that same
+    // in-flight probe, so this starts no extra subprocess.
+    if (!proactiveWarmDone) {
+      proactiveWarmDone = true;
+      await withProbeBudget(
+        Promise.all([
+          refreshDead(state.accounts, now).catch(() => {}),
+          refreshLive(state.accounts, now).catch(() => {}),
+        ]),
+        opts.probeBudgetMs ?? PROACTIVE_PROBE_BUDGET_MS,
+      );
+    }
+
+    // Detect "spent, with a healthy place to go" via the SAME oracle the fleet auto-switch uses —
+    // never a second predicate. Null = the account is healthy, or nothing better exists; leave it.
+    const rec = switchRecommendation(
+      from,
+      state.accounts,
+      state.usage,
+      state.ceilings,
+      state.identities,
+      now,
+      liveUsageRows(),
+      deadLoginIds(),
+    );
+    if (!rec) return { rotated: false, from, reason: "not-unusable" };
+
+    // Bench the whole dead LOGIN group (a wall/expiry belongs to the login, not the one config dir)
+    // so the ordinary eligibility predicate evicts it, then re-resolve so the sticky pointer moves —
+    // the same mechanism the reactive path uses, on the same primitives.
+    const siblings = loginSiblingIds(state.accounts, state.identities);
+    const deadIds = new Set(siblings.get(from) ?? [from]);
+    const until = now + REACTIVE_BENCH_MS;
+    await Promise.all(
+      [...deadIds]
+        .filter((id) => state.accounts.some((a) => a.id === id))
+        .map((id) =>
+          markExhausted(id, until).catch((e) =>
+            console.warn("proactive rotation: markExhausted failed for", id, e),
+          ),
+        ),
+    );
+    // A bench changes USAGE, not credentials — keep the dead-login verdict (see the reactive path's
+    // note) so the re-resolve does not land straight back on a dead account.
+    invalidateAccountState({ credentials: false });
+    const { chosen } = await chooseAccountForAgent(key, {
+      force: true,
+      now,
+      avoidClobberedDefault: opts.avoidClobberedDefault,
+    });
+    const to = chosen?.id;
+    return { rotated: !!to && to !== from, from, to };
+  } catch (e) {
+    console.warn("proactive rotation failed; leaving account selection unchanged", e);
     return { rotated: false, reason: "backend-unreadable" };
   }
 }

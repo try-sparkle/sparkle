@@ -1629,13 +1629,20 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
         return;
       }
 
-      // A row still carrying the sign-in PLACEHOLDER has just been recovered by this login, so give
-      // it its real name. `AccountLimitModal.onSignedIn` is the only other place that renames, and
-      // it is bound to that modal's own `pending` state — so an account rescued from THIS card's
-      // "Finish sign-in" button would otherwise keep "Signing in…" as its stored nickname forever.
-      // Best-effort on purpose: a failed rename must not fail a login that actually succeeded, and
-      // the card's own display rule already refuses to show a stale placeholder on a signed-in row.
-      if (a.nickname === PENDING_NICKNAME && newIdentity?.email) {
+      // A row still carrying the sign-in PLACEHOLDER — or the EXPIRED-login placeholder — has just
+      // been recovered by this login, so give it its real name. `AccountLimitModal.onSignedIn` is the
+      // only other place that renames, and it is bound to that modal's own `pending` state — so an
+      // account rescued from THIS card's "Finish sign-in" or "reconnect" button would otherwise keep
+      // its placeholder ("Signing in…" / "Login expired — reconnect") as its stored nickname forever.
+      // The expired case is the founder's "clicked reconnect, it didn't do anything": the reconnect
+      // persisted the token but nothing rewrote the sticky `EXPIRED_LOGIN_NICKNAME`, so the card kept
+      // offering "reconnect" even after the account authenticated again. Best-effort on purpose: a
+      // failed rename must not fail a login that actually succeeded, and the card's own display rule
+      // already refuses to show a stale placeholder on a signed-in row.
+      if (
+        (a.nickname === PENDING_NICKNAME || a.nickname === EXPIRED_LOGIN_NICKNAME) &&
+        newIdentity?.email
+      ) {
         try {
           await io.setNickname(a.id, newIdentity.email);
           await refresh();
@@ -2071,9 +2078,17 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
         // the placeholder as its stored nickname until something renames it (handleLogin now does,
         // best-effort), so this display rule is what guarantees the card is right either way.
         const pendingPlaceholder = a.nickname === PENDING_NICKNAME;
+        // A row still STORING the expired-login placeholder but now actually signed in — a reconnect
+        // that just succeeded, in the window before its rename persists, or one whose cosmetic rename
+        // write failed — must stop rendering "Login expired — reconnect", exactly as the pending
+        // placeholder is suppressed on a recovered row. Without this the card keeps offering the
+        // reconnect affordance over an account that authenticates fine, so a successful reconnect
+        // reads on screen as "did nothing". A genuinely expired login is NOT `signedIn`, so it still
+        // shows the reconnect card. (bug: login-expired reconnect does not take)
+        const recoveredExpiredPlaceholder = a.nickname === EXPIRED_LOGIN_NICKNAME && signedIn;
         const titleText = stalledSignIn
           ? STALLED_SIGN_IN_TITLE
-          : pendingPlaceholder && signedIn
+          : (pendingPlaceholder && signedIn) || recoveredExpiredPlaceholder
             ? primary
             : display.nickname || primary;
         const secondaryText = titleText === primary ? null : primary;
