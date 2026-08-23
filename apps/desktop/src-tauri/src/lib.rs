@@ -164,6 +164,9 @@ mod concierge_inbox;
 mod mention;
 mod concierge_lint_log;
 mod webview_drop_gate;
+/// Keeps WebKit's `localStorage` SQLite WAL from growing unbounded (`sparkle-i061ug`) by owning the
+/// `PRAGMA wal_checkpoint(TRUNCATE)` WebKit failed to complete on its own.
+mod webkit_localstorage;
 
 use pty::PtyManager;
 use tauri::{Emitter, Manager};
@@ -502,6 +505,12 @@ pub fn run() {
     if cmd_timing::init_from_env() {
         tracing::info!(target: "perf", "per-command main-thread timing armed (SPARKLE_CMD_TIMING)");
     }
+    // Own WebKit's localStorage WAL checkpoint. HERE, before the Builder opens any window: the first
+    // pass runs while nothing has touched the localStorage DB yet, which is the cleanest window for a
+    // full TRUNCATE. Left to WebKit's own passive checkpoint the WAL reached 3.65 GB against a 4.4 MB
+    // store and kept growing (`sparkle-i061ug`); this thread truncates it now and on an interval so
+    // it cannot. Best-effort and off-thread — it never blocks boot, and it is a no-op off macOS.
+    webkit_localstorage::spawn_maintenance();
     tauri::Builder::default()
         // The app menu. `app_menu::build` starts from Tauri's platform default and only INSERTS
         // into it — setting any menu here REPLACES the default outright, and a hand-rolled one that
