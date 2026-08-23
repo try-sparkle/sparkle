@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { AgentGoal } from "./agentGoal";
-import { type DeathObservation, classifyDeath } from "./deathRecord";
+import { type DeathObservation, classifyDeath, exitedMidTask } from "./deathRecord";
 import { verdictIsSupported } from "./deathTypes";
 import { quotaBlocksIn } from "./quotaBlock";
 
@@ -365,5 +365,43 @@ describe("every verdict this module can produce satisfies the honesty rule", () 
     // Guards against the loop silently collapsing to nothing — a green pass over zero cases is the
     // classic vacuous test.
     expect(checked).toBe(3 * 3 * 3 * 2 * 4 * 3);
+  });
+});
+
+describe("exitedMidTask — a clean self-exit that left the goal unmet is a surfaced signal (sparkle-ffm5bn)", () => {
+  // The bead's exact case: `unknown` (a quiet self-exit) + the graceful resume banner on screen + a
+  // still-unmet goal. Each of the three inputs is toggled on its own below, so the test reds if ANY
+  // of the three guards is dropped — it does not merely re-assert one true precondition.
+  const midTask = { cause: "unknown", goal: goal(), resumeBanner: true, now: NOW } as const;
+
+  it("is true only for an unknown-cause exit that shows the resume banner with an unmet goal", () => {
+    expect(exitedMidTask(midTask)).toBe(true);
+  });
+
+  it("is false without the resume banner — a silent crash is a different, noisier failure", () => {
+    // The #2492 witness that Claude exited on its OWN. Drop it and a segfault/OOM/kill (which prints
+    // no resume line) would be surfaced as lost in-flight work, which it is not.
+    expect(exitedMidTask({ ...midTask, resumeBanner: false })).toBe(false);
+  });
+
+  it("is false when the goal was already met — nothing was in flight to lose", () => {
+    expect(exitedMidTask({ ...midTask, goal: goal({ metAt: NOW - 1_000 }) })).toBe(false);
+  });
+
+  it("is false when the agent had no goal at all", () => {
+    expect(exitedMidTask({ ...midTask, goal: undefined })).toBe(false);
+  });
+
+  it.each(["clean-goal-met", "human-stopped", "wall-session", "blocked-on-human", "transport-transient"] as const)(
+    "is false for cause=%s even with the banner and an unmet goal — those carry their own surfaced reason",
+    (cause) => {
+      expect(exitedMidTask({ ...midTask, cause })).toBe(false);
+    },
+  );
+
+  it("is false once the unmet goal has expired past its ttl — it is no longer live work", () => {
+    // `hasUnmetGoal` is true ONLY for the live `unmet` state; an expired goal is not in-flight work.
+    const expired = goal({ setAt: NOW - 5 * 60 * 60_000, ttlMs: 60_000 });
+    expect(exitedMidTask({ ...midTask, goal: expired })).toBe(false);
   });
 });

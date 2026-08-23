@@ -27,6 +27,7 @@ import {
   type DeathObservation,
   type Terminator,
   classifyDeath,
+  exitedMidTask,
 } from "../engine/deathRecord";
 import type { DeathVerdict } from "../engine/deathTypes";
 // The window-local mirror of the two ledger edges this module writes. Kept in step by being written
@@ -36,8 +37,10 @@ import {
   lastFailureForAgent,
   quotaBlockForAgent,
   recentFailureForAgent,
+  resumeBannerForAgent,
 } from "../engine/engineRegistry";
 import type { QuotaBlock } from "../engine/quotaBlock";
+import { notifyConcierge } from "./conciergeNotifier";
 import { log } from "../logger";
 import { useProjectStore } from "../stores/projectStore";
 import {
@@ -78,6 +81,20 @@ export interface DeathRecordDeps {
    * a pill's colour would let a labelling change silently reclassify deaths.
    */
   blockingTool: (agentId: string) => BlockingTool | undefined;
+  /**
+   * Does this agent's mounted pane show Claude Code's graceful-exit resume banner right now —
+   * `engineRegistry.resumeBannerForAgent`, the same live per-window read PR #2492 fast-tracks
+   * recovery on (sparkle-tab3nm). Read HERE, on the death path, so a session that exited on its own
+   * mid-task can be told from a silent crash and surfaced as such — see {@link exitedMidTask} and
+   * the mid-task-exit escalation in {@link recordDeath}.
+   */
+  resumeBanner: (agentId: string) => boolean;
+  /**
+   * Hand one HARD SIGNAL to the concierge. Returns whether it was ACCEPTED — `false` means it went
+   * nowhere, which `notifyConcierge` publishes as its own contract. Injected so a test can assert the
+   * mid-task-exit surface fired without a registered sink. Defaults to the real `conciergeNotifier`.
+   */
+  escalate: (text: string) => boolean;
   invoke: <T>(cmd: string, args: Record<string, unknown>) => Promise<T>;
   now: () => number;
 }
@@ -105,6 +122,8 @@ export function liveDeps(): DeathRecordDeps {
       return undefined;
     },
     blockingTool: () => undefined,
+    resumeBanner: resumeBannerForAgent,
+    escalate: (text) => notifyConcierge(text),
     invoke: (cmd, args) => tauriInvoke(cmd, args),
     now: () => Date.now(),
   };
@@ -252,6 +271,14 @@ export async function recordDeath(
       terminator,
       now,
     };
+    // Read SYNCHRONOUSLY, alongside every other observation and BEFORE the first `await` — never
+    // after `agent_life_close` (roborev 68290/68291). `resumeBannerForAgent` resolves through the
+    // LIVE engine's current screen, and both inputs it depends on change during that IPC await:
+    // pane/window teardown `dispose()`s the engine (→ false) and #2492's fast-track resurrection
+    // repaints the screen and clears the banner (→ false) — the two scenarios the bead names. A read
+    // taken after the await would therefore suppress the signal in exactly those cases, off a verdict
+    // computed from a snapshot milliseconds earlier.
+    const resumeBanner = deps.resumeBanner(agentId);
     const verdict = classifyDeath(observation);
 
     // Refusal 1. `evidence: "none"` is the shape Gate 0 returns, and it means "this window has
@@ -291,6 +318,15 @@ export async function recordDeath(
         cause: verdict.cause,
         evidence: verdict.evidence,
         at: now,
+        // MUST stay `verdict.message`. `Death.message` is NOT a display field — it is half the
+        // resurrection COHORT KEY (`resurrectionCohort.cohortKeyOf` = `${cause}:${message ?? ""}`,
+        // exact-equality, documented byte-for-byte on both sides of the wire). Stamping a mid-task
+        // marker here would repartition the `unknown:` bucket into `unknown:` and `unknown:<marker>`,
+        // and a partition refinement can only SPLIT clusters — a cohort that met SHARED_FAILURE_MIN_
+        // VICTIMS can then fall below the floor, be discarded by `groupCohorts`, and be respawned as
+        // lone deaths with no canary: exactly the resume-flood the cohort machinery exists to prevent
+        // (roborev 68295/68296). The mid-task signal is the concierge push below, which is off the
+        // recovery path entirely.
         message: verdict.message,
         goalMetAt: verdict.goalMetAt,
       },
@@ -310,6 +346,40 @@ export async function recordDeath(
       cause: verdict.cause,
       evidence: verdict.evidence,
     });
+
+    // ── THE MID-TASK EXIT, SURFACED (sparkle-ffm5bn) ──────────────────────────────────────────────
+    // A session that exited on its OWN while its goal was still unmet — the resume banner is on
+    // screen but the deliverable was in flight — recovers silently through PR #2492's fast-track and,
+    // before this, left ONLY that resume line: the founder had to re-derive hours of lost work on
+    // restart. `exitedMidTask` is the exact discriminator (unknown-cause quiet self-exit + banner +
+    // unmet goal), and here it becomes a HARD SIGNAL so a human knows the in-flight work may be lost
+    // even as recovery resumes the session. Fired once, on the one call that actually closed the
+    // record, so a window that wrote nothing (Refusal 1) or noted a wall (Refusal 2) never emits it.
+    // The mid-task-exit discriminator, from the resume-banner SNAPSHOT taken before the close await
+    // (never a fresh live read here — see the `resumeBanner` const above). This is the ONLY effect of
+    // a mid-task exit: an ephemeral concierge push, entirely off the durable recovery path, so it can
+    // never perturb the cohort key or resurrection pace.
+    const midTaskExit = exitedMidTask({
+      cause: verdict.cause,
+      goal: observation.goal,
+      resumeBanner,
+      now,
+    });
+    if (midTaskExit) {
+      const accepted = deps.escalate(
+        `An agent session exited mid-task with its goal still unmet, leaving only a \`claude --resume\` line — its in-flight deliverable may not have been written. Recovery will resume the session; verify the work before relying on it. (agent ${agentId})`,
+      );
+      if (accepted) {
+        log.info("resurrection", "surfaced a mid-task exit", { agentId });
+      } else {
+        // `notifyConcierge` returning false means the push went NOWHERE and, per its own contract, is
+        // owed. A dropped HARD signal is a WARN, never an INFO (a delivered one), so a lost mid-task
+        // notice is visible in the log rather than silent. It is deliberately NOT persisted onto the
+        // death record: `Death.message` is a resurrection cohort key, not a display field (see the
+        // close payload above and roborev 68295/68296).
+        log.warn("resurrection", "a mid-task exit signal was refused and is owed", { agentId });
+      }
+    }
     return verdict;
   } catch (e) {
     log.warn("resurrection", "could not record the death", { agentId, error: String(e) });

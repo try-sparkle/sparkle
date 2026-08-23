@@ -22,9 +22,9 @@
 // PURE. Data in, data out; the clock arrives as a parameter. No timers, no I/O, no registry reads —
 // the caller gathers the observation, which is what makes Gate 0 below enforceable.
 import type { AgentGoal } from "./agentGoal";
-import { goalStateOf } from "./agentGoal";
+import { goalStateOf, hasUnmetGoal } from "./agentGoal";
 import { classifyApiFailure } from "./apiRecovery";
-import type { DeathEvidence, DeathVerdict, DeathWall } from "./deathTypes";
+import type { DeathCause, DeathEvidence, DeathVerdict, DeathWall } from "./deathTypes";
 import type { QuotaBlock } from "./quotaBlock";
 import { quotaBlocksIn } from "./quotaBlock";
 import type { AgentLiveness } from "../services/agentLiveness";
@@ -277,4 +277,39 @@ export function classifyDeath(o: DeathObservation): DeathVerdict {
   if (o.terminator === "pty-exit") return { cause: "unknown", evidence: "pty-exit" };
   if (o.terminator === "session-end") return { cause: "unknown", evidence: "session-end-hook" };
   return UNOBSERVED;
+}
+
+/**
+ * Is this death a MID-TASK EXIT — a clean, resumable self-exit that left the agent's goal UNMET?
+ *
+ * The bead's exact case (sparkle-ffm5bn): a session exited on its OWN mid-task, leaving only the
+ * `claude --resume <id>` banner in the pane, with an in-flight deliverable never written and hours of
+ * live work lost. PR #2492 (sparkle-tab5..tab3nm) already RECOVERS this fast through the resume
+ * banner; this predicate is the SURFACE half — the positive signal that a human's in-flight work may
+ * be lost, so the death is escalated as a hard signal rather than left as a bare resume line.
+ *
+ * NOT folded into `classifyDeath`'s cause vocabulary on purpose: the cause crosses the serde boundary
+ * to `revival.rs` and drives resurrection pace, and this is a display/notify concern that must not
+ * change either. It is a pure read OVER a verdict, exactly like the finished/blocked distinctions the
+ * surfaces already draw from the same cause.
+ *
+ * Requires ALL THREE, each excluding a case that must NOT be surfaced as lost work:
+ *   • `cause === "unknown"` — the quiet fall-through of {@link classifyDeath} Gate 5. `clean-goal-met`
+ *     FINISHED, `human-stopped` was deliberate, and `wall-*` / `blocked-on-human` already carry their
+ *     own surfaced reason, so none of them is silent lost work.
+ *   • `resumeBanner` — the graceful-exit banner is on screen, the #2492 witness that Claude exited on
+ *     its OWN (a segfault / OOM / `pty_kill` prints none). This is the literal "leaving only a resume
+ *     line" of the bead, and it is what keeps a silent crash — a different, noisier failure — out.
+ *   • `hasUnmetGoal` — the goal is still live-and-unmet. An agent with no goal, or one it already met,
+ *     had no in-flight deliverable to lose, so surfacing it would be false noise.
+ */
+export function exitedMidTask(input: {
+  cause: DeathCause;
+  goal: AgentGoal | undefined;
+  resumeBanner: boolean;
+  now: number;
+}): boolean {
+  if (input.cause !== "unknown") return false;
+  if (!input.resumeBanner) return false;
+  return hasUnmetGoal(input.goal, input.now);
 }

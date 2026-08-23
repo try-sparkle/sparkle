@@ -14,6 +14,8 @@
 // a fake would assert my own understanding of that wiring rather than the wiring.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import type { AgentGoal } from "../engine/agentGoal";
+
 import { TRANSPORT_FAILURE_WINDOW_MS } from "../engine/deathTypes";
 import {
   lastFailureForAgent,
@@ -32,6 +34,10 @@ import {
   readRetirementLog,
   recordDeath,
 } from "./deathRecordWriter";
+import {
+  clearConciergeNotifier,
+  setConciergeNotifier,
+} from "./conciergeNotifier";
 
 const NOW = 1_754_534_400_000;
 const SESSION_WALL = "You've hit your session limit · resets 10:30pm (America/Los_Angeles)";
@@ -56,6 +62,8 @@ function deps(over: Partial<DeathRecordDeps> = {}): Calls {
     liveness: () => "local",
     goal: () => undefined,
     blockingTool: () => undefined,
+    resumeBanner: () => false,
+    escalate: () => true,
     invoke: (cmd, args) => {
       invoked.push([cmd, args]);
       return Promise.resolve(undefined as never);
@@ -744,5 +752,219 @@ describe("readRetirementLog", () => {
     const r = await readRetirementLog(c.deps);
     expect(r.records).toHaveLength(250);
     expect(r.records[0]!.agentId).toBe("a249");
+  });
+});
+
+describe("a mid-task exit is surfaced as a hard signal, not left as a bare resume line (sparkle-ffm5bn)", () => {
+  // An unmet goal, live and within its ttl — the in-flight-work case.
+  function unmetGoal(over: Partial<AgentGoal> = {}): AgentGoal {
+    return {
+      text: "land the retry PR",
+      setAt: NOW - 60_000,
+      ttlMs: 4 * 60 * 60_000,
+      continues: 0,
+      totalContinues: 0,
+      ...over,
+    };
+  }
+
+  it("escalates when a pty-exit with the resume banner leaves the goal unmet — and still closes the record", async () => {
+    const escalations: string[] = [];
+    const c = deps({
+      goal: () => unmetGoal(),
+      resumeBanner: () => true,
+      escalate: (text) => {
+        escalations.push(text);
+        return true;
+      },
+    });
+
+    const verdict = await recordDeath("a1", "pty-exit", c.deps);
+
+    // THE SURFACE — the whole point of the change. A silent auto-resume left the founder to re-derive
+    // hours of lost work; the hard signal is what says the in-flight deliverable may be gone.
+    expect(escalations).toHaveLength(1);
+    expect(escalations[0]).toMatch(/exited mid-task/i);
+    expect(escalations[0]).toContain("a1");
+    // Recovery is NOT suppressed: the record still closes with the resurrectable `unknown` cause, so
+    // #2492's fast-track still resumes the session. Surfacing and recovering are both true here.
+    expect(verdict?.cause).toBe("unknown");
+    expect(c.closes()).toHaveLength(1);
+  });
+
+  it("reads the resume banner BEFORE the close await, so a teardown mid-await cannot suppress the signal", async () => {
+    // The read-order race (roborev 68290/68291). `resumeBannerForAgent` is a LIVE read that goes
+    // false the instant the engine is disposed or #2492's fast-track repaints the pane — both of which
+    // can happen during the `agent_life_close` IPC await. If the read were taken AFTER that await this
+    // escalation would vanish in exactly the scenarios the bead names. The stub flips the banner
+    // source to false the moment `invoke` runs; the signal must still fire, proving the read is
+    // snapshotted synchronously with the rest of the observation.
+    let bannerNow = true;
+    const escalations: string[] = [];
+    const c = deps({
+      goal: () => unmetGoal(),
+      resumeBanner: () => bannerNow,
+      escalate: (text) => {
+        escalations.push(text);
+        return true;
+      },
+      invoke: () => {
+        // The teardown that clears the banner, happening DURING the close await.
+        bannerNow = false;
+        return Promise.resolve(undefined as never);
+      },
+    });
+
+    await recordDeath("a1", "pty-exit", c.deps);
+
+    expect(escalations).toHaveLength(1);
+  });
+
+  it("does NOT stamp the death record's message — that field is the resurrection COHORT KEY, not display", async () => {
+    // roborev 68295/68296: `resurrectionCohort.cohortKeyOf` is `${cause}:${message ?? ""}` (exact
+    // equality). A mid-task exit is `unknown`, and `unknown` is resurrectable and DOES go through
+    // `groupCohorts`. Writing a marker onto `message` would split the `unknown:` bucket, drop a cohort
+    // below SHARED_FAILURE_MIN_VICTIMS, and respawn lone deaths in parallel — the resume-flood the
+    // cohort machinery exists to prevent. So a mid-task exit must key IDENTICALLY to a bare stop.
+    const midTask = deps({ goal: () => unmetGoal(), resumeBanner: () => true, escalate: () => true });
+    const bareStop = deps({ goal: () => unmetGoal(), resumeBanner: () => false, escalate: () => true });
+
+    await recordDeath("a1", "pty-exit", midTask.deps);
+    await recordDeath("a1", "pty-exit", bareStop.deps);
+
+    const midMsg = (midTask.closes()[0]!.death as { message?: string }).message;
+    const bareMsg = (bareStop.closes()[0]!.death as { message?: string }).message;
+    // Both leave `message` exactly as classifyDeath set it (undefined for a bare pty-exit) — the mid-
+    // task surface must not perturb the byte the cohort key reads.
+    expect(midMsg).toBeUndefined();
+    expect(midMsg).toBe(bareMsg);
+  });
+
+  it("closes the record normally when the concierge push is REFUSED — the signal is owed, not persisted", async () => {
+    // A refused push (no sink in this window) must not change what is written or throw. The finding is
+    // owed via the WARN log; nothing durable is stamped, precisely because `message` is a cohort key.
+    const c = deps({ goal: () => unmetGoal(), resumeBanner: () => true, escalate: () => false });
+
+    const verdict = await recordDeath("a1", "pty-exit", c.deps);
+
+    expect(verdict?.cause).toBe("unknown");
+    expect(c.closes()).toHaveLength(1);
+    expect((c.closes()[0]!.death as { message?: string }).message).toBeUndefined();
+  });
+
+  it("does NOT escalate without the resume banner — a silent crash is not a clean mid-task exit", async () => {
+    // The paired negative that pins the banner gate: same unmet goal, same pty-exit, banner absent.
+    const escalations: string[] = [];
+    const c = deps({
+      goal: () => unmetGoal(),
+      resumeBanner: () => false,
+      escalate: (text) => {
+        escalations.push(text);
+        return true;
+      },
+    });
+
+    const verdict = await recordDeath("a1", "pty-exit", c.deps);
+
+    expect(escalations).toEqual([]);
+    // The death is still recorded — only the extra surface is withheld.
+    expect(verdict?.cause).toBe("unknown");
+    expect(c.closes()).toHaveLength(1);
+  });
+
+  it("does NOT escalate when the goal was already met — nothing was in flight", async () => {
+    // The paired negative that pins the goal gate: banner present, but a met goal makes this an
+    // ordinary finish (`clean-goal-met`), not lost work.
+    const escalations: string[] = [];
+    const c = deps({
+      goal: () => unmetGoal({ metAt: NOW - 1_000 }),
+      resumeBanner: () => true,
+      escalate: (text) => {
+        escalations.push(text);
+        return true;
+      },
+    });
+
+    const verdict = await recordDeath("a1", "pty-exit", c.deps);
+
+    expect(escalations).toEqual([]);
+    expect(verdict?.cause).toBe("clean-goal-met");
+  });
+
+  it("does NOT escalate on a window that did not watch the agent (Refusal 1)", async () => {
+    // No record is written for an unobserved death, so no surface may fire off it either.
+    const escalations: string[] = [];
+    const c = deps({
+      liveness: () => "other-window",
+      goal: () => unmetGoal(),
+      resumeBanner: () => true,
+      escalate: (text) => {
+        escalations.push(text);
+        return true;
+      },
+    });
+
+    await expect(recordDeath("a1", "pty-exit", c.deps)).resolves.toBeNull();
+    expect(escalations).toEqual([]);
+    expect(c.closes()).toEqual([]);
+  });
+});
+
+// The graceful-exit banner Claude Code leaves on screen, verbatim shape from #2492's own fixture.
+const RESUME_SCREEN_FOR_SEAM = [
+  "work done.",
+  "",
+  "Resume this session with:",
+  "  claude --resume 4c1f6312-e927-47c2-aa8b-4a08cbdb3df9",
+  "",
+].join("\n");
+
+describe("the PRODUCTION default deps for the mid-task surface are wired (sparkle-ffm5bn)", () => {
+  // The defaulted-seam trap (AGENTS.md, roborev 68291): every test above injects `resumeBanner` and
+  // `escalate`, so the two lines in `liveDeps()` that supply the REAL edges are covered by nothing —
+  // replace `resumeBannerForAgent` with `() => false` (feature permanently inert for real agents) or
+  // drop the `notifyConcierge` wiring (signal goes nowhere) and the whole suite above stays green.
+  // These drive the real defaults, in the style of the two seam tests already in this file.
+  const seamEngines: StatusEngine[] = [];
+  afterEach(() => {
+    for (const e of seamEngines.splice(0)) unregisterStatusEngine("seam-mte", e);
+  });
+
+  it("resumeBanner reads the live registered engine: false unregistered, false alive, true once exited with the banner", () => {
+    // The SAFE default first: no engine registered → no fast-track, no surface.
+    expect(liveDeps().resumeBanner("seam-mte")).toBe(false);
+
+    const engine = new StatusEngine({
+      agentId: "seam-mte",
+      onStatus: () => {},
+      getScreen: () => RESUME_SCREEN_FOR_SEAM,
+    });
+    registerStatusEngine("seam-mte", engine);
+    seamEngines.push(engine);
+
+    // Registered but ALIVE → still false (the `exited` liveness gate #2492 added).
+    expect(liveDeps().resumeBanner("seam-mte")).toBe(false);
+
+    engine.exit();
+    // Registered AND exited AND banner on screen → the production read answers true.
+    expect(liveDeps().resumeBanner("seam-mte")).toBe(true);
+  });
+
+  it("escalate is the real notifier: false with no sink, true once a sink accepts the text", () => {
+    // No sink registered → the push goes nowhere, which is `false` (the refusal the WARN path handles).
+    expect(liveDeps().escalate("mid-task exit test")).toBe(false);
+
+    const seen: string[] = [];
+    const sink = (text: string) => {
+      seen.push(text);
+      return true;
+    };
+    setConciergeNotifier(sink);
+    try {
+      expect(liveDeps().escalate("mid-task exit test")).toBe(true);
+      expect(seen).toEqual(["mid-task exit test"]);
+    } finally {
+      clearConciergeNotifier(sink);
+    }
   });
 });
