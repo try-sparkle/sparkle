@@ -33,6 +33,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use serde::Serialize;
 use tauri::AppHandle;
 
 /// The launchd job label the shell engine installs under. MUST match `INSTALL_LABEL` in
@@ -130,11 +131,23 @@ pub fn ensure_backlog_drainer_core(
 ) -> Result<Option<String>, String> {
     if let Some(script) = drainer_script_path(repo_root) {
         let mode = drainer_mode(enabled);
-        let run = Command::new("/bin/bash")
-            .arg(&script)
-            .arg(mode)
-            .current_dir(repo_root)
-            .output();
+        let mut cmd = Command::new("/bin/bash");
+        cmd.arg(&script).arg(mode).current_dir(repo_root);
+        if enabled {
+            // WIRE THE DISPATCH BRIDGE. Now that the app CONSUMES the drainer queue (the
+            // `read_drainer_queue` command + the frontend `drainerBridge`), declare a dispatch
+            // consumer so the scheduled `--watchdog` actually CLAIMS the worst-first bead and spools a
+            // queue file for it — the shell engine refuses to claim at all with no consumer, because a
+            // claim no spawner honours wedges the fleet to "full" forever. The shell bakes this env var
+            // into the installed plist's `EnvironmentVariables`, so the launchd-run watchdog inherits it
+            // (launchd hands a job none of the installing shell's environment otherwise).
+            cmd.env("SPARKLE_DRAINER_QUEUE_CONSUMER", "1");
+        } else {
+            // An uninstall tears the job down and declares NO consumer — drop the var explicitly so an
+            // ambient one in the app's environment can never make a teardown look like a wiring.
+            cmd.env_remove("SPARKLE_DRAINER_QUEUE_CONSUMER");
+        }
+        let run = cmd.output();
         // Success is the only clean path. A spawn error OR a non-zero exit (the shell engine exits 4
         // on an unknown arg, 126/127 on a broken/missing script, non-zero on an early set -e abort)
         // is a FAILURE that, on the DISABLE path, must still tear the LaunchAgent down — otherwise the
@@ -197,6 +210,250 @@ pub async fn ensure_backlog_drainer(app: AppHandle, enabled: bool) -> Result<Opt
     })
     .await
     .map_err(|e| format!("backlog-drainer ensure task failed: {e}"))?
+}
+
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// DISPATCH BRIDGE — the app-side consumer that turns a claimed+queued bead into a worker spawn.
+//
+// The shell engine (`scripts/backlog-drainer.sh --watchdog`, run on a schedule by the LaunchAgent
+// this module installs) is the deterministic BRAIN: it counts the agent-feedback backlog, respects
+// the rest floor and worker cap, selects the worst-first UNCLAIMED ready bead, CLAIMS it (the
+// `draining` label + a claim file — dedupe-safe, claim-BEFORE-spawn), and spools a request file
+// `<git-common-dir>/sparkle-drainer/queue/<beadId>.json` describing the drain task. There is no
+// shell/CLI path to launch a Claude worker, so the app is the only place the spawn can live.
+//
+// This half is the CONSUMER: `read_drainer_queue` hands the frontend `drainerBridge` the pending
+// queue entries (worst-first) plus the kill-switch state and the cap; the bridge spawns one
+// background worker per entry via the sanctioned `spawnBuildAgentInProject` path and then calls
+// `ack_drainer_queue_file` to remove the request so it is never handed out twice. Because the shell
+// claimed the bead before writing the file, and the app deletes the file on spawn, a bead is
+// dispatched at most once even across app restarts (a still-`draining` bead is not re-spooled).
+//
+// KILL-SWITCH, FAIL-CLOSED: when the drainer is disabled (`[drainer] enabled=false` /
+// `SPARKLE_DRAINER_ENABLED=0`) `read_drainer_queue` hands out NO entries and touches nothing, so the
+// bridge can never spawn — the same switch that (via `ensure_backlog_drainer`) uninstalls the
+// LaunchAgent so nothing is even spooled. The gate is enforced here AND in the frontend bridge.
+
+/// The drainer STATE dir the shell engine writes under — `<git-common-dir>/sparkle-drainer`,
+/// honouring `DRAINER_STATE_DIR` (the shell's own override/test seam) so the app and the shell
+/// always resolve the SAME dir. Mirrors `resolve_state_dir` in `scripts/backlog-drainer.sh`.
+fn drainer_state_dir(repo_root: &Path) -> PathBuf {
+    if let Some(dir) = std::env::var_os("DRAINER_STATE_DIR") {
+        if !dir.is_empty() {
+            return PathBuf::from(dir);
+        }
+    }
+    // git-common-dir (shared by every worktree, never tracked) — resolved absolutely, exactly as the
+    // shell does; fall back to `<repo_root>/.git` for a plain clone if git can't be run.
+    let common = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .arg("rev-parse")
+        .arg("--path-format=absolute")
+        .arg("--git-common-dir")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| {
+            let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if s.is_empty() {
+                None
+            } else {
+                Some(PathBuf::from(s))
+            }
+        })
+        .unwrap_or_else(|| repo_root.join(".git"));
+    common.join("sparkle-drainer")
+}
+
+/// The drainer QUEUE dir — `<state-dir>/queue`, matching `QUEUE_DIR` in `scripts/backlog-drainer.sh`.
+fn drainer_queue_dir(repo_root: &Path) -> PathBuf {
+    drainer_state_dir(repo_root).join("queue")
+}
+
+/// A bead id is joined into a filesystem path, so accept ONLY the shape bd actually mints
+/// (`sparkle-abc123`, plus `.`/`_`), and reject anything that could traverse out of the queue dir.
+/// Fail-closed: an id that isn't provably safe is refused rather than sanitised into something else.
+fn is_safe_bead_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id != "."
+        && id != ".."
+        && !id.contains("..")
+        && !id.contains('/')
+        && !id.contains('\\')
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+}
+
+/// Read + parse the spooled queue requests, WORST-FIRST (lowest priority number = P0 = first). A
+/// file that is missing a `beadId`, is not valid JSON, or is not `*.json` is skipped rather than
+/// failing the whole read — one malformed request must never stall the drain. Each returned object
+/// carries an added `_queueFile` (its absolute path) so the caller can `ack` (delete) exactly it.
+pub fn read_queue_entries(queue_dir: &Path) -> Vec<serde_json::Value> {
+    let Ok(rd) = std::fs::read_dir(queue_dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<(i64, String, serde_json::Value)> = Vec::new();
+    for entry in rd.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(mut val) = serde_json::from_str::<serde_json::Value>(&text) else {
+            continue;
+        };
+        let bead_id = match val.get("beadId").and_then(|v| v.as_str()) {
+            // Reject an unsafe id here, not only at ack: it is interpolated into the worker's mission
+            // prompt (`bd show <id>`) and is the request's key, so a dispatchable-but-un-ackable id
+            // would re-spawn a worker on every restart. Skip it (a later reconcile releases the claim).
+            Some(s) if is_safe_bead_id(s) => s.to_string(),
+            _ => continue,
+        };
+        // priority is emitted as a STRING by the shell's json_str ("0".."4"); tolerate a number too.
+        let prio = val
+            .get("priority")
+            .and_then(|v| v.as_str().and_then(|s| s.trim().parse::<i64>().ok()).or_else(|| v.as_i64()))
+            .unwrap_or(99);
+        if let Some(obj) = val.as_object_mut() {
+            obj.insert(
+                "_queueFile".to_string(),
+                serde_json::Value::String(path.to_string_lossy().into_owned()),
+            );
+        }
+        out.push((prio, bead_id, val));
+    }
+    // Worst-first, tie-broken by bead id for a deterministic order across polls.
+    out.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    out.into_iter().map(|(_, _, v)| v).collect()
+}
+
+/// What the frontend bridge needs for one dispatch pass: the kill-switch state, the worker cap, and
+/// the worst-first pending requests. When `enabled` is false the entries are ALWAYS empty (the
+/// kill-switch, fail-closed) so a disabled drainer can never spawn.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DrainerQueueSnapshot {
+    pub enabled: bool,
+    pub max_workers: u32,
+    pub entries: Vec<serde_json::Value>,
+}
+
+/// Pure core (testable): assemble the snapshot. The kill-switch is enforced HERE — a disabled
+/// drainer reads no entries and does not even touch the queue dir.
+pub fn queue_snapshot_core(enabled: bool, max_workers: u32, queue_dir: &Path) -> DrainerQueueSnapshot {
+    let entries = if enabled {
+        read_queue_entries(queue_dir)
+    } else {
+        Vec::new()
+    };
+    DrainerQueueSnapshot { enabled, max_workers, entries }
+}
+
+/// The drainer kill-switch as the CONSUMER must read it: `SPARKLE_DRAINER_ENABLED` (the shell's env
+/// override) wins, else the effective `[drainer] enabled` config. Off tokens match the shell's
+/// (`0/false/off/no`). This is the same switch `ensure_backlog_drainer` uses to install/uninstall
+/// the LaunchAgent, read a second time here so a disabled drainer hands out nothing even if a stale
+/// queue file survived a disable.
+fn drainer_enabled_effective() -> bool {
+    if let Some(v) = std::env::var_os("SPARKLE_DRAINER_ENABLED") {
+        let v = v.to_string_lossy().trim().to_ascii_lowercase();
+        return !matches!(v.as_str(), "0" | "false" | "off" | "no");
+    }
+    crate::config::current_effective().config.drainer.enabled
+}
+
+/// The worker cap the bridge must not exceed: `SPARKLE_DRAINER_MAX_WORKERS` env wins, else
+/// `[drainer] max_workers` from the global config file, else the shell engine's conservative default
+/// of 3. Mirrors `worker_cap`/`cfg_int` in `scripts/backlog-drainer.sh` so the app and the shell
+/// agree on the bound. Floored at 1.
+fn drainer_max_workers(app_data: &Path) -> u32 {
+    if let Some(v) = std::env::var_os("SPARKLE_DRAINER_MAX_WORKERS") {
+        if let Ok(n) = v.to_string_lossy().trim().parse::<u32>() {
+            if n >= 1 {
+                return n;
+            }
+        }
+    }
+    let path = crate::config::global_path(app_data);
+    if let Ok(text) = std::fs::read_to_string(&path) {
+        if let Ok(val) = text.parse::<toml::Value>() {
+            if let Some(n) = val
+                .get("drainer")
+                .and_then(|d| d.get("max_workers"))
+                .and_then(|m| m.as_integer())
+            {
+                if n >= 1 {
+                    return n as u32;
+                }
+            }
+        }
+    }
+    3
+}
+
+/// Frontend-facing: the pending drainer queue for one dispatch pass. Fail-closed — when the
+/// kill-switch is off, `enabled` is false and `entries` is empty (no spawn possible).
+#[tauri::command]
+pub async fn read_drainer_queue(app: AppHandle) -> Result<DrainerQueueSnapshot, String> {
+    let app_data = crate::dev_identity::app_data_dir(&app)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let enabled = drainer_enabled_effective();
+        let max_workers = drainer_max_workers(&app_data);
+        let repo = sparkle_repo_root(&app_data);
+        queue_snapshot_core(enabled, max_workers, &drainer_queue_dir(&repo))
+    })
+    .await
+    .map_err(|e| format!("read_drainer_queue task failed: {e}"))
+}
+
+/// Frontend-facing: remove ONE spooled request AFTER its worker actually ran, so the same bead is
+/// never dispatched twice. Takes the exact `_queueFile` path the reader returned (NOT a bead id
+/// re-derived into a path — a file whose name did not match its content beadId would then survive and
+/// re-spawn forever). Returns `true` if a file was removed, `false` if it was already gone.
+#[tauri::command]
+pub async fn ack_drainer_queue_file(app: AppHandle, queue_file: String) -> Result<bool, String> {
+    let app_data = crate::dev_identity::app_data_dir(&app)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let repo = sparkle_repo_root(&app_data);
+        ack_queue_file_core(&drainer_queue_dir(&repo), Path::new(&queue_file))
+    })
+    .await
+    .map_err(|e| format!("ack_drainer_queue_file task failed: {e}"))?
+}
+
+/// Pure core (testable): remove one queue request file, idempotently. `true` = removed, `false` =
+/// already gone. Refuses anything that is not a `*.json` DIRECTLY inside the queue dir, so a path
+/// from the frontend can never escape it (traversal-safe without trusting the caller).
+pub fn ack_queue_file_core(queue_dir: &Path, queue_file: &Path) -> Result<bool, String> {
+    if queue_file.extension().and_then(|e| e.to_str()) != Some("json") {
+        return Err(format!("refusing to ack a non-json path: {}", queue_file.display()));
+    }
+    let parent = queue_file
+        .parent()
+        .ok_or_else(|| format!("queue file has no parent: {}", queue_file.display()))?;
+    // The queue dir exists (we read from it); the file's parent exists even if the file is gone.
+    // Comparing the CANONICAL dirs rejects `../` traversal without trusting the string.
+    let canon_dir = std::fs::canonicalize(queue_dir)
+        .map_err(|e| format!("queue dir unreadable ({}): {e}", queue_dir.display()))?;
+    let canon_parent = std::fs::canonicalize(parent)
+        .map_err(|e| format!("queue file parent unreadable ({}): {e}", parent.display()))?;
+    if canon_parent != canon_dir {
+        return Err(format!(
+            "refusing to ack outside the queue dir: {}",
+            queue_file.display()
+        ));
+    }
+    match std::fs::remove_file(queue_file) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(format!("failed to remove {}: {e}", queue_file.display())),
+    }
 }
 
 #[cfg(test)]
@@ -393,4 +650,169 @@ mod tests {
         );
         assert_eq!(got, Path::new("/tmp/app-data/sparkle-self/repo"));
     }
+
+    // ── DISPATCH BRIDGE (queue consumer) tests ──────────────────────────────────────────────────
+
+    fn write_queue_file(queue_dir: &Path, bead: &str, prio: &str, body_extra: &str) {
+        fs::create_dir_all(queue_dir).unwrap();
+        let json = format!(
+            "{{\"beadId\":\"{bead}\",\"title\":\"fix {bead}\",\"priority\":\"{prio}\",\
+             \"task\":\"do the thing\",\"goal\":\"landed\"{body_extra}}}"
+        );
+        fs::write(queue_dir.join(format!("{bead}.json")), json).unwrap();
+    }
+
+    #[test]
+    fn read_queue_entries_parses_valid_skips_garbage_and_sorts_worst_first() {
+        let tmp = tempfile::tempdir().unwrap();
+        let q = tmp.path().join("queue");
+        // Two valid requests, out of priority order on disk.
+        write_queue_file(&q, "sparkle-p2", "2", "");
+        write_queue_file(&q, "sparkle-p0", "0", "");
+        // Garbage / non-request files that must be SKIPPED, not fail the read.
+        fs::create_dir_all(&q).unwrap();
+        fs::write(q.join("broken.json"), "{ not json").unwrap();
+        fs::write(q.join("nobead.json"), "{\"title\":\"x\"}").unwrap();
+        fs::write(q.join("notqueue.txt"), "{\"beadId\":\"sparkle-x\"}").unwrap();
+
+        let got = read_queue_entries(&q);
+        // Exactly the two valid requests, worst-first (P0 before P2) — the SIDE EFFECT of parsing.
+        let ids: Vec<&str> = got.iter().map(|v| v["beadId"].as_str().unwrap()).collect();
+        assert_eq!(ids, vec!["sparkle-p0", "sparkle-p2"], "worst-first, garbage skipped");
+        // Each entry carries the _queueFile path so the caller can ack exactly it.
+        assert!(got[0]["_queueFile"].as_str().unwrap().ends_with("sparkle-p0.json"));
+    }
+
+    #[test]
+    fn read_queue_entries_on_absent_dir_is_empty_not_an_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Before the first watchdog pass the queue dir does not exist yet.
+        assert!(read_queue_entries(&tmp.path().join("queue")).is_empty());
+    }
+
+    #[test]
+    fn queue_snapshot_enabled_returns_the_queued_requests() {
+        let tmp = tempfile::tempdir().unwrap();
+        let q = tmp.path().join("queue");
+        write_queue_file(&q, "sparkle-a", "1", "");
+        let snap = queue_snapshot_core(true, 3, &q);
+        assert!(snap.enabled);
+        assert_eq!(snap.entries.len(), 1, "enabled hands out the queued request");
+        assert_eq!(snap.entries[0]["beadId"].as_str().unwrap(), "sparkle-a");
+    }
+
+    #[test]
+    fn queue_snapshot_disabled_hands_out_no_entries_even_with_files() {
+        // THE KILL-SWITCH, FAIL-CLOSED, ON THE RUST SIDE: a disabled drainer with a full queue on
+        // disk must still hand the bridge NOTHING, so no worker can ever be spawned. Paired with the
+        // enabled test above so flipping the gate reddens one of them.
+        let tmp = tempfile::tempdir().unwrap();
+        let q = tmp.path().join("queue");
+        write_queue_file(&q, "sparkle-a", "1", "");
+        write_queue_file(&q, "sparkle-b", "0", "");
+        let snap = queue_snapshot_core(false, 3, &q);
+        assert!(!snap.enabled);
+        assert!(snap.entries.is_empty(), "disabled must expose no dispatchable requests");
+    }
+
+    #[test]
+    fn ack_removes_the_request_file_by_path_and_is_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let q = tmp.path().join("queue");
+        write_queue_file(&q, "sparkle-a", "1", "");
+        let qf = q.join("sparkle-a.json");
+        assert!(qf.exists());
+        // Ack by the exact path (the reader's _queueFile): removes it (the SIDE EFFECT that stops a
+        // re-spawn); a second ack of the same path is a no-op success.
+        assert_eq!(ack_queue_file_core(&q, &qf).unwrap(), true);
+        assert!(!qf.exists(), "ack must remove the request file");
+        assert_eq!(ack_queue_file_core(&q, &qf).unwrap(), false, "idempotent");
+    }
+
+    #[test]
+    fn ack_removes_a_file_whose_name_differs_from_its_bead_id() {
+        // The bug ack-by-path fixes: a file named foo.json carrying beadId sparkle-a. Ack-by-beadId
+        // would remove sparkle-a.json (absent) and leave foo.json to re-spawn forever; ack-by-path
+        // removes the real file.
+        let tmp = tempfile::tempdir().unwrap();
+        let q = tmp.path().join("queue");
+        fs::create_dir_all(&q).unwrap();
+        let odd = q.join("foo.json");
+        fs::write(&odd, "{\"beadId\":\"sparkle-a\",\"priority\":\"1\"}").unwrap();
+        assert_eq!(ack_queue_file_core(&q, &odd).unwrap(), true);
+        assert!(!odd.exists(), "ack must remove the actual file the reader returned");
+    }
+
+    #[test]
+    fn ack_refuses_a_path_outside_the_queue_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let q = tmp.path().join("queue");
+        fs::create_dir_all(&q).unwrap();
+        // A sibling file OUTSIDE the queue dir must be refused, not removed, even via `..`.
+        let outside = tmp.path().join("secret.json");
+        fs::write(&outside, "x").unwrap();
+        assert!(ack_queue_file_core(&q, &outside).is_err());
+        assert!(ack_queue_file_core(&q, &q.join("../secret.json")).is_err());
+        assert!(outside.exists(), "a path outside the queue dir must never be removed");
+        // A non-json path is refused too.
+        assert!(ack_queue_file_core(&q, &q.join("sparkle-a.txt")).is_err());
+    }
+
+    #[test]
+    fn read_queue_entries_skips_an_unsafe_bead_id() {
+        // An unsafe beadId is interpolated into the mission prompt and is the ack key, so the reader
+        // must drop it entirely rather than hand back a dispatchable-but-un-ackable request.
+        let tmp = tempfile::tempdir().unwrap();
+        let q = tmp.path().join("queue");
+        fs::create_dir_all(&q).unwrap();
+        fs::write(q.join("bad.json"), "{\"beadId\":\"../../etc/passwd\",\"priority\":\"0\"}").unwrap();
+        write_queue_file(&q, "sparkle-ok", "1", "");
+        let got = read_queue_entries(&q);
+        let ids: Vec<&str> = got.iter().map(|v| v["beadId"].as_str().unwrap()).collect();
+        assert_eq!(ids, vec!["sparkle-ok"], "unsafe bead id must be skipped");
+    }
+
+    /// A fake `backlog-drainer.sh` that records whether `SPARKLE_DRAINER_QUEUE_CONSUMER` was set in
+    /// its environment (the wire that makes the watchdog actually claim + spool).
+    fn write_env_recording_script(repo_root: &Path) -> PathBuf {
+        let scripts = repo_root.join("scripts");
+        fs::create_dir_all(&scripts).unwrap();
+        let rec = repo_root.join("consumer.log");
+        let body = format!(
+            "#!/bin/bash\nprintf '%s=%s\\n' \"$1\" \"${{SPARKLE_DRAINER_QUEUE_CONSUMER:-<unset>}}\" >> '{rec}'\n",
+            rec = rec.display(),
+        );
+        let script = scripts.join("backlog-drainer.sh");
+        fs::write(&script, body).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        rec
+    }
+
+    #[test]
+    fn enable_wires_the_queue_consumer_and_disable_does_not() {
+        // The load-bearing bridge wiring: an ENABLE (install) must declare the dispatch consumer so
+        // the scheduled watchdog claims + spools; a DISABLE (uninstall) must NOT. Asserted on the env
+        // the script actually received.
+        let tmp = tempfile::tempdir().unwrap();
+        let la = tempfile::tempdir().unwrap();
+        let rec = write_env_recording_script(tmp.path());
+
+        call(tmp.path(), la.path(), true).unwrap();
+        call(tmp.path(), la.path(), false).unwrap();
+
+        let log = fs::read_to_string(&rec).unwrap();
+        assert!(
+            log.contains("--install=1"),
+            "install must pass SPARKLE_DRAINER_QUEUE_CONSUMER=1 (got: {log:?})"
+        );
+        assert!(
+            log.contains("--uninstall=<unset>"),
+            "uninstall must NOT declare a consumer (got: {log:?})"
+        );
+    }
+
 }

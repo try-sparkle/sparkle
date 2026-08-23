@@ -1021,7 +1021,8 @@ describe("runImprovementPass watchdog", () => {
         const pass = runImprovementPass("always");
         await untilRunInvoked();
         await vi.advanceTimersByTimeAsync(PASS_TIMEOUT_MS);
-        await expect(pass).resolves.toBeUndefined();
+        // A timed-out (lapsed) pass did not run to a reported completion, so it resolves false.
+        await expect(pass).resolves.toBe(false);
 
         expect(isPassRunning()).toBe(false);
         expect(useRuntimeStore.getState().status[SPARKLE_AGENT_ID]).toBe("lapsed");

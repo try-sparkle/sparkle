@@ -59,6 +59,7 @@ import { startInboxWatch } from "./stores/inboxStore";
 import { startPipelineHealthWatch } from "./stores/pipelineHealthStore";
 import { startCiBudgetGovernor } from "./services/ciBudgetGovernorInit";
 import { startPusher } from "./services/pusherMount";
+import { startDrainerBridge } from "./services/drainerBridge";
 import { startAuthRecovery } from "./services/authRecovery";
 import { startSocialSync } from "./services/socialSync";
 
@@ -333,6 +334,18 @@ function FleetResurrection() {
 // election, so a satellite window observes without double-pushing.
 function Pusher() {
   useEffect(() => startPusher(), []);
+  return null;
+}
+
+// THE BACKLOG-DRAINER DISPATCH BRIDGE — the consumer half that makes the shipped drainer actually
+// spawn a worker. The LaunchAgent supervisor (installed by src-tauri/src/drainer.rs while
+// `[drainer] enabled`) CLAIMS the worst-first agent-feedback bead and spools it; without this mount
+// nothing consumed that queue, so the app installed the drainer but never drained. Single-owner and
+// single-flight; every gate (`[drainer] enabled`, consent, cap) is re-read per pass inside the loop,
+// so it stays inert whenever the kill-switch is off. Beside Pusher for the same reason: a decision
+// core that ships tested but unmounted runs for nobody.
+function DrainerBridge() {
+  useEffect(() => startDrainerBridge(), []);
   return null;
 }
 
@@ -696,6 +709,7 @@ export function App() {
       <GoalDiskMirror />
       <FleetResurrection />
       <Pusher />
+      <DrainerBridge />
       <AuthRecovery />
       <ApiRecovery />
       <DisplayRespan />

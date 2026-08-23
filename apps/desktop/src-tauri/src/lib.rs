@@ -1343,6 +1343,8 @@ pub fn run() {
             babysit_lease::babysit_leases,
             sparkle_agent::ensure_sparkle_repo,
             drainer::ensure_backlog_drainer,
+            drainer::read_drainer_queue,
+            drainer::ack_drainer_queue_file,
             sparkle_agent::reap_secondary_sparkle_worktrees,
             sparkle_agent::sparkle_submit_capability,
             // Per-project concierge tool policy: the frontend's synchronous slug cache is filled

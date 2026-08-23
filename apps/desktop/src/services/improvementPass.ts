@@ -149,14 +149,19 @@ const passBudgetClause = () =>
 /** The one-shot mission for an hourly pass. Mode-specific ONLY in what happens to a finished
  *  change — the persona (sparklePersona) already carries the hard rules; this restates the
  *  operative ones so a fresh `-p` session can't miss them, and demands the structured trailer. */
-export function hourlyMissionPrompt(
+/** What to do with a FINISHED change — propose-only, auto-submit, or draft-and-stop. Shared by the
+ *  hourly mission and the backlog-drainer mission so the disposition copy (which restates the
+ *  persona's operative rules for a fresh `-p` session) can never drift between the two paths — the
+ *  AGENTS.md "user-facing copy is code" rule: a change to WHEN/whether a PR is submitted must land in
+ *  every place that narrates it. */
+export function passDisposition(
   consent: SparkleImprovementConsent,
   submit: SubmitVerdict = "unknown",
 ): string {
-  // The persona already carries a propose-only override, but this prompt is the LAST thing the
+  // The persona already carries a propose-only override, but the mission prompt is the LAST thing the
   // model reads — leaving "submit the PR yourself" in it would have the mission contradict the
   // system prompt on the one instruction that cannot succeed. Say the same thing in both places.
-  const disposition = isSubmitBlocked(submit)
+  return isSubmitBlocked(submit)
     ? "Pull requests cannot be opened from this machine, so this is a PROPOSE-ONLY pass: do the " +
       "full job and COMMIT to a local branch, then stop. Do not run `gh pr create` or `git push`. " +
       "Report the branch name and the scrubbed PR title + body you would have submitted, and " +
@@ -169,6 +174,13 @@ export function hourlyMissionPrompt(
         "body, run the scrub gate (scripts/sparkle-scrub.sh), then STOP — do NOT run " +
         "`gh pr create`. Leave the draft as your final message so the user can review and " +
         "approve it when they open this conversation.";
+}
+
+export function hourlyMissionPrompt(
+  consent: SparkleImprovementConsent,
+  submit: SubmitVerdict = "unknown",
+): string {
+  const disposition = passDisposition(consent, submit);
   return [
     "Hourly improvement pass (unattended — no user is watching; never wait for input except as",
     "your final state).",
@@ -206,6 +218,64 @@ export function hourlyMissionPrompt(
     disposition,
     "Never include PII or user-specific content anywhere outward-facing, per your standing",
     "privacy rules.",
+    "End your final message with exactly one line of the form:",
+    'IMPROVE_RESULT: {"submitted": <n>, "awaitingApproval": <n>, "summary": "<one line, no PII>"}',
+  ].join(" ");
+}
+
+/** The one bead a backlog-drainer dispatch targets — already CLAIMED (labelled `draining`) and
+ *  spooled by the deterministic supervisor (scripts/backlog-drainer.sh). */
+export interface DrainFocus {
+  beadId: string;
+  title?: string;
+  /** The task string the shell engine spooled, if any (informational — the brief re-derives it). */
+  task?: string;
+  goal?: string;
+}
+
+/** The one-shot mission for a BACKLOG-DRAINER dispatch: the supervisor has already selected and
+ *  claimed this specific worst-first agent-feedback bead, so — unlike the hourly pass, which
+ *  DISCOVERS its target — this pass is TOLD its target and fixes exactly it. Same disposition,
+ *  budget and scrub/trailer structure as the hourly mission (shared helpers) so the two behave
+ *  identically once the target is fixed. */
+export function drainMissionPrompt(
+  focus: DrainFocus,
+  consent: SparkleImprovementConsent,
+  submit: SubmitVerdict = "unknown",
+): string {
+  const disposition = passDisposition(consent, submit);
+  const title = focus.title ? ` (${focus.title})` : "";
+  return [
+    "Backlog-drainer pass (unattended — no user is watching; never wait for input except as your",
+    "final state).",
+    `The backlog drainer has already CLAIMED agent-feedback bead ${focus.beadId}${title} for you to`,
+    "fix — it is labelled `draining`, so no other agent will take it, and your job THIS pass is to",
+    "resolve exactly it (not to go hunting for other work).",
+    `FIRST read it: \`bd show ${focus.beadId}\`.`,
+    "If bd shows the bead is ALREADY fixed, or its fix already MERGED/LANDED on main, do NOT redo",
+    `finished work: \`bd close ${focus.beadId}\` citing that sha and stop.`,
+    // The supervisor's slot accounting depends on these transitions: scripts/backlog-drainer.sh
+    // `count_running` counts non-closed `draining`-labelled beads as OCCUPIED slots, and
+    // `reconcile_claims` separates a live-but-slow worker (in_progress, 24h horizon) from one that
+    // NEVER PICKED UP (still `open` past claim_max_age ~6h => released and re-dispatched to a SECOND
+    // worker). So move the bead to in_progress the moment you start, and close it when the fix lands —
+    // otherwise a drained bead pins its slot forever (the fleet stops dispatching once cap beads sit
+    // open+draining) or an in-flight bead is re-claimed as "never started" (duplicate work). (roborev 68223)
+    `Otherwise, the MOMENT you start work, mark it in progress: \`bd update ${focus.beadId} --status in_progress\`.`,
+    "Then find the root cause and implement a small, focused fix on a fresh branch in this worktree,",
+    "and verify it (run the relevant tests).",
+    `When your fix has landed (PR merged), \`bd close ${focus.beadId}\` citing the merge sha; in a`,
+    "propose-only or case-by-case pass where you stop before merge, leave it in_progress for the",
+    "merge to close.",
+    `Name ${focus.beadId} — and any DUPLICATES you find of the same finding — in a \`Refs:\` trailer`,
+    "on your commit(s), so the finding stops being rediscovered by later passes.",
+    "Belt and braces, one line, before anything else: run `bash scripts/session-beads-consolidate.sh`",
+    "(the bead consolidation watcher — cadence-gated and lock-guarded, a no-op if it already ran).",
+    LEFTOVER_CLAUSE,
+    passBudgetClause(),
+    disposition,
+    "Never include PII or user-specific content anywhere outward-facing, per your standing privacy",
+    "rules.",
     "End your final message with exactly one line of the form:",
     'IMPROVE_RESULT: {"submitted": <n>, "awaitingApproval": <n>, "summary": "<one line, no PII>"}',
   ].join(" ");
@@ -882,23 +952,34 @@ export async function buildPassControlMcp(): Promise<string | undefined> {
 export async function runImprovementPass(
   consent: SparkleImprovementConsent,
   freshSlot = false,
-): Promise<void> {
-  if (consent === "never") return;
+  focusBead?: DrainFocus,
+): Promise<boolean> {
+  // Returns whether a pass actually RAN (reached the worker and it reported) — false on every early
+  // bail (consent off, latch busy, no claude, park refused, cancelled, failed). The drainer bridge
+  // relies on this to ack (delete) a spooled request ONLY when a worker really ran, so a bead is
+  // never silently lost to a bail. The hourly scheduler ignores the value (fire-and-forget).
+  if (consent === "never") return false;
   // Claim-or-bail in ONE call: the check and the set used to be two statements, which is the shape
   // a second pass can slip between.
-  if (!claimPass()) return;
+  if (!claimPass()) return false;
   // Consume the armed retry before anything can fail: whatever happens next re-decides the
   // wait, and leaving it armed would make the gate fire again on the very next tick.
   //
   // `freshSlot` is what keeps a STALE arm from eating a later slot's retry: an armed retry can
   // go unconsumed for the rest of the hour (the pane guard suppresses it, say), and without the
   // flag the next hourly run would look like "the retry" and inherit its spent budget.
-  if (freshSlot || retryDueAt === null) retryUsed = false;
-  retryDueAt = null;
+  //
+  // A DRAIN pass (focusBead set) is NOT an hourly slot, so it must NOT touch this latch — doing so
+  // would disarm/consume the hourly scheduler's one connectivity re-attempt (roborev 68224).
+  if (!focusBead) {
+    if (freshSlot || retryDueAt === null) retryUsed = false;
+    retryDueAt = null;
+  }
+  let ran = false;
   const setStatus = useRuntimeStore.getState().setStatus;
   try {
     const claude = await checkClaude();
-    if (!claude.installed || !claude.path) return; // not set up yet — skip quietly
+    if (!claude.installed || !claude.path) return false; // not set up yet — skip quietly
     // GREEN FROM THE FIRST STEP OF ACTUAL WORK, not from the last one.
     //
     // The headless pass has no PTY and no StatusEngine (see the module header + the `sparkle_improve:*`
@@ -1023,7 +1104,7 @@ export async function runImprovementPass(
       // of `readAgentTerminal` reads the capture without asking whether the row is red.
       setStatus(SPARKLE_AGENT_ID, status);
       useRuntimeStore.getState().setAttentionScreen(SPARKLE_AGENT_ID, screen);
-      return; // `finally` still clears the passRunning latch.
+      return false; // `finally` still clears the passRunning latch.
     }
     // The park cleared (a fresh base, or one already fresh) — the consecutive-decline streak the hourly
     // loop may have been accumulating is broken. Reset it so a later first refusal starts a new count
@@ -1217,7 +1298,9 @@ export async function runImprovementPass(
               persona: controlUp
                 ? `${headlessPersona}\n\n${sparkleControlProtocol()}`
                 : headlessPersona,
-              prompt: hourlyMissionPrompt(consent, submit?.verdict ?? "unknown"),
+              prompt: focusBead
+                ? drainMissionPrompt(focusBead, consent, submit?.verdict ?? "unknown")
+                : hourlyMissionPrompt(consent, submit?.verdict ?? "unknown"),
               logDir: ws.logDir,
               mcpConfig,
               configDir,
@@ -1231,6 +1314,7 @@ export async function runImprovementPass(
     if (outcome.ok) {
       const result = parseImproveResult(outcome.text);
       // A pass that COMPLETED is proof the loop is not stuck, whatever it reported.
+      ran = true; // a worker ran and reported — the drainer bridge may ack the spooled request.
       clearRunFailureStreak();
       setStatus(
         SPARKLE_AGENT_ID,
@@ -1282,4 +1366,5 @@ export async function runImprovementPass(
   } finally {
     releasePass();
   }
+  return ran;
 }
