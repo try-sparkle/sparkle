@@ -8024,6 +8024,305 @@ pub async fn commit_worktree_wip(
         .map_err(|e| format!("commit_worktree_wip task failed: {e}"))?
 }
 
+/// How a periodic autosave differs from the teardown snapshot above, and why it needs its own path.
+///
+/// The teardown snapshot ([`commit_worktree_wip_at`]) runs a real `git add`/`git commit` against the
+/// agent's OWN index and branch. That is correct there — the worker is already dead or being killed,
+/// so nothing is reading the tree it mutates (`workerSpawn.ts` documents the precondition). A
+/// PERIODIC autosave has no such guarantee: it fires while the agent is actively working, so it must
+/// not touch the agent's index, HEAD, branch, or fire the user's `post-commit` hook (which
+/// `--no-verify` does NOT skip — see the commit note above; on this machine that hook is the roborev
+/// review loop, and one review per live agent every few minutes is the amplification the review
+/// cadence doc rules out). It also must not clear the uncommitted diff the agent's own workflow reads.
+///
+/// So this builds a commit entirely out of band and anchors it to a SIDE REF:
+///   1. a TEMPORARY index (its own `GIT_INDEX_FILE`), so the agent's real index is never staged and
+///      the two never contend on `index.lock`;
+///   2. `write-tree` + `commit-tree` — plumbing that fires NO hooks — with the current HEAD as parent;
+///   3. `update-ref refs/sparkle-autosave/<agentId>`, which is on no branch and is never pushed by any
+///      Sparkle path, so the working branch, HEAD and the agent's staged/unstaged state are untouched.
+/// The side ref survives a hard kill exactly as a branch commit would, so the crash-recovery floor is
+/// preserved with zero effect on a live agent.
+///
+/// A worktree that is MID-OPERATION (merge/rebase/cherry-pick/revert, or any unmerged index entry) is
+/// SKIPPED, not snapshotted: staging it could only ever be read back as garbage, and the operation's
+/// own state files are the real record. A skipped tick is the documented-cheap failure here.
+#[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum AutosaveKind {
+    /// Uncommitted work was captured to the side ref. `sha`/`ref_name` are set.
+    Snapshotted,
+    /// The working tree was clean (after excluding seeded env files). Nothing written.
+    NothingToCommit,
+    /// No worktree at that slot (already torn down, or never cut).
+    NoWorktree,
+    /// A git operation is in progress (merge/rebase/cherry-pick/revert/unmerged paths). Left ALONE so
+    /// the autosave cannot corrupt the operation's state or commit conflict markers.
+    SkippedMidOperation,
+}
+
+/// The observed result of an autosave. `sha` and `ref_name` are `Option` (they cross the wire as
+/// `null`, per AGENTS.md), set only for `Snapshotted`.
+#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AutosaveOutcome {
+    pub kind: AutosaveKind,
+    pub sha: Option<String>,
+    pub ref_name: Option<String>,
+    pub files: usize,
+}
+
+/// `git` for the autosave, bounded by the shared deadline, with an optional `GIT_INDEX_FILE` so the
+/// staging steps write a throwaway index instead of the agent's real one. Lenient like `git_wip` and
+/// for the same reason (a mutating call whose child left the pipes held must not be reported as a
+/// failure after it already ran).
+fn git_autosave(
+    cwd: &str,
+    args: &[&str],
+    deadline: Instant,
+    index_file: Option<&str>,
+) -> Result<String, String> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(format!("git {} skipped: autosave deadline reached", args.join(" ")));
+    }
+    note_git_spawn();
+    let mut cmd = Command::new(crate::preflight::git_program());
+    cmd.arg("-C").arg(cwd).args(args);
+    apply_noninteractive(&mut cmd);
+    if let Some(idx) = index_file {
+        cmd.env("GIT_INDEX_FILE", idx);
+    }
+    let captured = output_with_timeout_lenient(cmd, remaining)
+        .map_err(|e| format!("git {} failed: {e}", args.join(" ")))?;
+    let output = captured.output;
+    if output.status.success() {
+        return Ok(String::from_utf8_lossy(&output.stdout).trim().to_string());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let msg = if stderr.is_empty() {
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    } else {
+        stderr
+    };
+    Err(format!("git {} failed: {msg}", args.join(" ")))
+}
+
+/// Does `<git-dir>/<name>` exist? Resolved via `git rev-parse --git-path`, which is the only correct
+/// way for a LINKED worktree — its per-worktree operation files (`MERGE_HEAD`, `rebase-merge/`, …)
+/// live under `.git/worktrees/<id>/`, not under the worktree's own `.git`.
+fn git_path_exists(worktree: &str, name: &str, deadline: Instant) -> bool {
+    match git_autosave(worktree, &["rev-parse", "--git-path", name], deadline, None) {
+        Ok(rel) if !rel.trim().is_empty() => {
+            let p = Path::new(rel.trim());
+            let abs = if p.is_absolute() { p.to_path_buf() } else { Path::new(worktree).join(p) };
+            abs.exists()
+        }
+        _ => false,
+    }
+}
+
+/// A `git status --porcelain` line describes an UNMERGED path (a conflict): either side of the XY
+/// pair is `U`, or the pair is `AA`/`DD`. See `git status` porcelain v1.
+fn is_unmerged_status_line(line: &str) -> bool {
+    if line.len() < 2 {
+        return false;
+    }
+    let xy = &line[..2];
+    let b = xy.as_bytes();
+    b[0] == b'U' || b[1] == b'U' || xy == "AA" || xy == "DD"
+}
+
+/// The side ref an agent's autosave snapshot is anchored to. On no branch, never pushed by any
+/// Sparkle path. The id is sanitised to the ref-name-safe set so an unexpected agent id can never
+/// produce an invalid or path-traversing ref.
+fn autosave_ref_for(agent_id: &str) -> String {
+    let safe: String = agent_id
+        .chars()
+        // '.' is excluded on purpose: git forbids `..` in a ref name, and allowing '.' would let
+        // it through. Agent ids are hex + hyphens, so nothing legitimate is lost.
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+        .collect();
+    format!("refs/sparkle-autosave/{safe}")
+}
+
+/// How long a whole autosave snapshot may take. Smaller than the teardown snapshot's budget because
+/// it runs on a timer against a LIVE tree and must never become a drag on the agent it is protecting.
+const AUTOSAVE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Core (testable): snapshot a LIVE worktree's uncommitted work to its side ref without touching the
+/// agent's index, HEAD, branch, or hooks. See [`AutosaveKind`] for the design rationale.
+pub fn autosave_worktree_wip_at(worktree: &str, agent_id: &str) -> Result<AutosaveOutcome, String> {
+    autosave_worktree_wip_within(worktree, agent_id, Instant::now() + AUTOSAVE_TIMEOUT)
+}
+
+/// [`autosave_worktree_wip_at`] with the deadline supplied, so the exhausted-budget behaviour is
+/// drivable by a test. Both go through this body — the production entry point is the only caller that
+/// picks the deadline, so it is not a seam every test injects past.
+pub fn autosave_worktree_wip_within(
+    worktree: &str,
+    agent_id: &str,
+    deadline: Instant,
+) -> Result<AutosaveOutcome, String> {
+    let none = |kind| AutosaveOutcome { kind, sha: None, ref_name: None, files: 0 };
+    if Instant::now() >= deadline {
+        return Err("autosave deadline reached before it started".to_string());
+    }
+    if !Path::new(worktree).is_dir() {
+        return Ok(none(AutosaveKind::NoWorktree));
+    }
+    if let Err(e) = git_autosave(worktree, &["rev-parse", "--git-dir"], deadline, None) {
+        return if Path::new(worktree).join(".git").exists() {
+            Err(format!("autosave could not read the worktree: {e}"))
+        } else {
+            Ok(none(AutosaveKind::NoWorktree))
+        };
+    }
+    // MID-OPERATION GUARD. Committing over a merge/rebase/cherry-pick/revert would stage conflict
+    // markers and complete or rewrite the operation out from under the agent — the core hazard a
+    // live autosave has that the teardown snapshot does not. Left entirely alone.
+    for op in ["MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "rebase-merge", "rebase-apply"] {
+        if git_path_exists(worktree, op, deadline) {
+            return Ok(none(AutosaveKind::SkippedMidOperation));
+        }
+    }
+    let status = git_autosave(worktree, &["status", "--porcelain"], deadline, None)?;
+    let lines: Vec<&str> = status.lines().filter(|l| !l.trim().is_empty()).collect();
+    if lines.iter().any(|l| is_unmerged_status_line(l)) {
+        return Ok(none(AutosaveKind::SkippedMidOperation));
+    }
+    let files = lines.len();
+    if files == 0 {
+        return Ok(none(AutosaveKind::NothingToCommit));
+    }
+    // A throwaway index in the system temp dir (absolute, as GIT_INDEX_FILE requires), unique per
+    // call so two windows sweeping the same worktree never collide on it. Removed at the end.
+    let idx_path = std::env::temp_dir().join(format!(
+        "sparkle-autosave-{}-{}.index",
+        autosave_ref_for(agent_id).replace('/', "_"),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let idx = idx_path.to_string_lossy().to_string();
+    let cleanup = |idx: &str| {
+        let _ = std::fs::remove_file(idx);
+    };
+
+    // Parent = current HEAD (may be detached — fine; unborn → no parent). Seed the temp index from it
+    // so the snapshot tree is HEAD + the working changes, then stage the working tree into the TEMP
+    // index only.
+    let parent = git_autosave(worktree, &["rev-parse", "-q", "--verify", "HEAD"], deadline, None)
+        .ok()
+        .filter(|s| !s.trim().is_empty());
+    if let Some(p) = parent.as_deref() {
+        if let Err(e) = git_autosave(worktree, &["read-tree", p], deadline, Some(&idx)) {
+            cleanup(&idx);
+            return Err(format!("autosave read-tree failed: {e}"));
+        }
+    }
+    let add = git_autosave(
+        worktree,
+        &["add", "-A", "--", ".", ":(exclude).env", ":(exclude).env.*", ":(exclude)*/.env", ":(exclude)*/.env.*"],
+        deadline,
+        Some(&idx),
+    );
+    if let Err(e) = add {
+        cleanup(&idx);
+        return Err(format!("autosave add failed: {e}"));
+    }
+    // Drop any env file that was already TRACKED (seeded from HEAD above); `:(exclude)` only governs
+    // what the add stages, not what read-tree brought in. Best-effort — an unborn HEAD staged nothing.
+    let _ = git_autosave(
+        worktree,
+        &["rm", "--cached", "-q", "--ignore-unmatch", "--", ".env", ".env.*", "*/.env", "*/.env.*"],
+        deadline,
+        Some(&idx),
+    );
+    let tree = match git_autosave(worktree, &["write-tree"], deadline, Some(&idx)) {
+        Ok(t) if !t.trim().is_empty() => t.trim().to_string(),
+        Ok(_) => {
+            cleanup(&idx);
+            return Err("autosave write-tree produced no tree".to_string());
+        }
+        Err(e) => {
+            cleanup(&idx);
+            return Err(format!("autosave write-tree failed: {e}"));
+        }
+    };
+    // If the resulting tree equals the parent's tree, the only dirt was an excluded env file — no snapshot.
+    if let Some(p) = parent.as_deref() {
+        if let Ok(parent_tree) =
+            git_autosave(worktree, &["rev-parse", &format!("{p}^{{tree}}")], deadline, None)
+        {
+            if parent_tree.trim() == tree {
+                cleanup(&idx);
+                return Ok(none(AutosaveKind::NothingToCommit));
+            }
+        }
+    }
+    // commit-tree is PLUMBING: it fires no hooks (unlike `git commit --no-verify`, which still runs
+    // post-commit), so this cannot trigger the user's review/notify hook on a timer.
+    let has_identity = git_autosave(worktree, &["var", "GIT_AUTHOR_IDENT"], deadline, None)
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
+    let message = format!("wip: {agent_id} periodic autosave");
+    let mut args: Vec<String> = Vec::new();
+    if !has_identity {
+        args.extend(["-c".into(), "user.email=agent@sparkle.local".into(), "-c".into(), "user.name=Sparkle".into()]);
+    }
+    args.push("commit-tree".into());
+    args.push(tree.clone());
+    if let Some(p) = parent.as_deref() {
+        args.push("-p".into());
+        args.push(p.to_string());
+    }
+    args.push("-m".into());
+    args.push(message);
+    let argrefs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let commit = match git_autosave(worktree, &argrefs, deadline, None) {
+        Ok(c) if !c.trim().is_empty() => c.trim().to_string(),
+        Ok(_) => {
+            cleanup(&idx);
+            return Err("autosave commit-tree produced no commit".to_string());
+        }
+        Err(e) => {
+            cleanup(&idx);
+            return Err(format!("autosave commit-tree failed: {e}"));
+        }
+    };
+    let ref_name = autosave_ref_for(agent_id);
+    if let Err(e) = git_autosave(worktree, &["update-ref", &ref_name, &commit], deadline, None) {
+        cleanup(&idx);
+        return Err(format!("autosave update-ref failed: {e}"));
+    }
+    cleanup(&idx);
+    Ok(AutosaveOutcome {
+        kind: AutosaveKind::Snapshotted,
+        sha: Some(commit),
+        ref_name: Some(ref_name),
+        files,
+    })
+}
+
+/// Periodic autosave of a LIVE agent's uncommitted work to its side ref. Best-effort by contract:
+/// the caller (the background sweep) treats any failure as "nothing was saved this tick" and moves on.
+#[tauri::command]
+pub async fn autosave_worktree_wip(
+    app: AppHandle,
+    project_id: String,
+    agent_id: String,
+) -> Result<AutosaveOutcome, String> {
+    let app_data = app_data_dir(&app)?;
+    let path = worktree_path(&app_data, &project_id, &agent_id)?;
+    let worktree = path.to_string_lossy().to_string();
+    let aid = agent_id.clone();
+    tauri::async_runtime::spawn_blocking(move || autosave_worktree_wip_at(&worktree, &aid))
+        .await
+        .map_err(|e| format!("autosave_worktree_wip task failed: {e}"))?
+}
+
 /// WHAT A DELETE ACTUALLY DID. Both delete commands below succeed (`Ok`) in cases where the branch
 /// is still there — `delete_agent_branch_if_merged_at` keeps an unlanded branch by design, and both
 /// are idempotent for a branch that was already gone. A caller that reads "the call resolved" as
@@ -11453,6 +11752,133 @@ mod tests {
         // A real directory that is not a git worktree answers the same way rather than erroring.
         std::fs::create_dir_all(&missing).unwrap();
         assert_eq!(commit_worktree_wip_at(&missing, "wip").unwrap().kind, WipCommitKind::NoWorktree);
+    }
+
+    // ── autosave_worktree_wip_at ─────────────────────────────────────────────────────────────────
+    //
+    // The property under test is TWO-sided: the work is captured to the side ref (the recovery floor),
+    // AND the agent's branch, HEAD and working tree are left exactly as they were (a live autosave must
+    // be invisible to the agent it protects). Every test asserts both halves.
+
+    #[test]
+    fn autosave_snapshots_to_the_side_ref_without_touching_branch_or_working_tree() {
+        let (_root, wt, _app_data) = repo_with_worktree("autosave-sideref");
+        std::fs::write(format!("{wt}/new.txt"), "several hundred lines").unwrap();
+        std::fs::write(format!("{wt}/tracked.txt"), "v1").unwrap();
+        git(&wt, &["add", "tracked.txt"]).unwrap();
+        git(&wt, &["commit", "-m", "add tracked"]).unwrap();
+        std::fs::write(format!("{wt}/tracked.txt"), "v2").unwrap();
+
+        let branch_before = git(&wt, &["rev-parse", "HEAD"]).unwrap();
+        let index_before = git(&wt, &["rev-parse", ":0:tracked.txt"]).unwrap(); // staged blob id
+
+        let out = autosave_worktree_wip_at(&wt, "a1").unwrap();
+
+        // SIDE EFFECT: the work is captured, anchored to the side ref.
+        assert_eq!(out.kind, AutosaveKind::Snapshotted);
+        assert_eq!(out.ref_name.as_deref(), Some("refs/sparkle-autosave/a1"));
+        assert!(out.sha.is_some(), "a Snapshotted outcome names the commit it made");
+        assert_eq!(out.files, 2, "both the untracked file and the tracked edit are captured");
+        assert_eq!(
+            git(&wt, &["show", "refs/sparkle-autosave/a1:new.txt"]).unwrap(),
+            "several hundred lines",
+            "the untracked work is recoverable from the side ref"
+        );
+        assert_eq!(git(&wt, &["show", "refs/sparkle-autosave/a1:tracked.txt"]).unwrap(), "v2");
+
+        // SAFETY: the branch tip, the staged index, and the working tree are all untouched — a live
+        // agent sees no change. This is what a real `git commit` (the teardown path) could NOT promise.
+        assert_eq!(git(&wt, &["rev-parse", "HEAD"]).unwrap(), branch_before, "branch tip is unmoved");
+        assert_eq!(git(&wt, &["rev-parse", ":0:tracked.txt"]).unwrap(), index_before, "index is untouched");
+        assert_eq!(std::fs::read_to_string(format!("{wt}/tracked.txt")).unwrap(), "v2");
+        assert!(
+            !git(&wt, &["status", "--porcelain"]).unwrap().trim().is_empty(),
+            "the uncommitted diff the agent reasons about still exists after autosave"
+        );
+    }
+
+    #[test]
+    fn autosave_on_a_clean_worktree_writes_nothing() {
+        let (_root, wt, _app_data) = repo_with_worktree("autosave-clean");
+        let out = autosave_worktree_wip_at(&wt, "a1").unwrap();
+        assert_eq!(out.kind, AutosaveKind::NothingToCommit);
+        assert_eq!(out.sha, None);
+        assert_eq!(out.files, 0);
+        assert!(
+            git(&wt, &["rev-parse", "--verify", "-q", "refs/sparkle-autosave/a1"]).is_err(),
+            "a clean tree creates no side ref"
+        );
+    }
+
+    #[test]
+    fn autosave_skips_a_worktree_with_a_merge_in_progress() {
+        let (_root, wt, _app_data) = repo_with_worktree("autosave-midmerge");
+        std::fs::write(format!("{wt}/work.txt"), "real uncommitted work").unwrap();
+        // Simulate a paused merge: MERGE_HEAD is the signal git itself uses. Written at the per-worktree
+        // git path so the linked-worktree resolution is exercised.
+        let head = git(&wt, &["rev-parse", "HEAD"]).unwrap();
+        let merge_head_path = git(&wt, &["rev-parse", "--git-path", "MERGE_HEAD"]).unwrap();
+        let abs = if Path::new(&merge_head_path).is_absolute() {
+            PathBuf::from(&merge_head_path)
+        } else {
+            Path::new(&wt).join(&merge_head_path)
+        };
+        std::fs::write(&abs, format!("{head}\n")).unwrap();
+
+        let out = autosave_worktree_wip_at(&wt, "a1").unwrap();
+        assert_eq!(out.kind, AutosaveKind::SkippedMidOperation, "a mid-merge worktree is left alone");
+        assert_eq!(out.sha, None);
+        assert!(
+            git(&wt, &["rev-parse", "--verify", "-q", "refs/sparkle-autosave/a1"]).is_err(),
+            "no side ref is written for a skipped tick — the merge's own state is the record"
+        );
+    }
+
+    #[test]
+    fn autosave_never_captures_a_seeded_env_file() {
+        let (_root, wt, _app_data) = repo_with_worktree("autosave-env");
+        std::fs::write(format!("{wt}/.env"), "SECRET=leak-me").unwrap();
+        std::fs::write(format!("{wt}/code.txt"), "safe to save").unwrap();
+
+        let out = autosave_worktree_wip_at(&wt, "a1").unwrap();
+        assert_eq!(out.kind, AutosaveKind::Snapshotted);
+        assert_eq!(
+            git(&wt, &["show", "refs/sparkle-autosave/a1:code.txt"]).unwrap(),
+            "safe to save"
+        );
+        assert!(
+            git(&wt, &["show", "refs/sparkle-autosave/a1:.env"]).is_err(),
+            "the seeded env file must never reach the snapshot"
+        );
+    }
+
+    #[test]
+    fn autosave_with_only_an_env_change_writes_nothing() {
+        let (_root, wt, _app_data) = repo_with_worktree("autosave-env-only");
+        std::fs::write(format!("{wt}/.env"), "SECRET=only-change").unwrap();
+        let out = autosave_worktree_wip_at(&wt, "a1").unwrap();
+        assert_eq!(
+            out.kind,
+            AutosaveKind::NothingToCommit,
+            "if the only dirt is an excluded env file, there is nothing to snapshot"
+        );
+        assert!(git(&wt, &["rev-parse", "--verify", "-q", "refs/sparkle-autosave/a1"]).is_err());
+    }
+
+    #[test]
+    fn autosave_answers_no_worktree_for_a_missing_dir() {
+        let missing = unique_root("autosave-missing").to_string_lossy().to_string();
+        assert_eq!(autosave_worktree_wip_at(&missing, "a1").unwrap().kind, AutosaveKind::NoWorktree);
+        std::fs::create_dir_all(&missing).unwrap();
+        assert_eq!(autosave_worktree_wip_at(&missing, "a1").unwrap().kind, AutosaveKind::NoWorktree);
+    }
+
+    #[test]
+    fn autosave_ref_name_sanitises_an_unexpected_agent_id() {
+        // A ref name may not contain '..', spaces, or a leading '/'; anything outside the safe set
+        // becomes '-' so a surprising id can never produce an invalid or traversing ref.
+        assert_eq!(autosave_ref_for("a1"), "refs/sparkle-autosave/a1");
+        assert_eq!(autosave_ref_for("../evil head"), "refs/sparkle-autosave/---evil-head");
     }
 
     // NOT COVERED HERE, DELIBERATELY: the `--no-verify` behaviour. A pre-commit hook is the one

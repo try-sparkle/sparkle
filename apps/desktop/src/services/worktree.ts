@@ -223,6 +223,36 @@ export function commitWorktreeWip(
   return invoke<WipCommitOutcome>("commit_worktree_wip", { projectId, agentId, message });
 }
 
+/**
+ * The result of a PERIODIC autosave (`autosave_worktree_wip`). Unlike the teardown snapshot, this
+ * never touches the agent's index, HEAD, branch, or hooks — it anchors the work to a side ref
+ * (`refs/sparkle-autosave/<agentId>`) built out of band. Every field is `string | null` because a
+ * Rust `Option` crosses the wire as `null`, never an absent key (AGENTS.md).
+ */
+export interface AutosaveOutcome {
+  /** `snapshotted` captured work to the side ref; `nothing-to-commit` a clean tree; `no-worktree`
+   *  none at that slot; `skipped-mid-operation` a merge/rebase/cherry-pick was in progress so the
+   *  worktree was left entirely alone. */
+  kind: "snapshotted" | "nothing-to-commit" | "no-worktree" | "skipped-mid-operation";
+  /** The snapshot commit — set only for `snapshotted`. */
+  sha: string | null;
+  /** The side ref holding the snapshot — set only for `snapshotted`. */
+  refName: string | null;
+  files: number;
+}
+
+/**
+ * Periodic autosave of a LIVE agent's uncommitted work to its side ref
+ * (`refs/sparkle-autosave/<agentId>`). Safe to run while the agent is working: it stages into a
+ * throwaway index and uses `write-tree`/`commit-tree` plumbing (which fires NO hooks) + `update-ref`,
+ * so the agent's index, HEAD, branch and working diff are untouched, and it never triggers the
+ * project's `post-commit` review hook. Best-effort: the caller treats any rejection as "nothing saved
+ * this tick". See `autosave_worktree_wip_at` in `worktree.rs`.
+ */
+export function autosaveWorktreeWip(projectId: string, agentId: string): Promise<AutosaveOutcome> {
+  return invoke<AutosaveOutcome>("autosave_worktree_wip", { projectId, agentId });
+}
+
 /** Tripwire: throws if the worktree's git toplevel isn't the worktree itself. */
 export function assertWorkspaceIntegrity(worktree: string): Promise<void> {
   return invoke("assert_workspace_integrity", { worktree });

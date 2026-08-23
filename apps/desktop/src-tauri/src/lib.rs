@@ -1309,6 +1309,7 @@ pub fn run() {
             worktree::land_agent_branch,
             worktree::push_agent_branch,
             worktree::commit_worktree_wip,
+            worktree::autosave_worktree_wip,
             worktree::delete_agent_branch,
             worktree::delete_agent_branch_if_merged,
             worktree::open_agent_pr,

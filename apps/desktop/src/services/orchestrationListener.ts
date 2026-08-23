@@ -15,6 +15,7 @@ import { safeUnlisten } from "./safeUnlisten";
 import { shouldHandleInThisWindow } from "./windowOwnership";
 import { findWindowForProject, clearWindowProject } from "./windowRegistry";
 import { spawnWorker, spinDownWorker } from "./workerSpawn";
+import { startWorkerAutosave, stopWorkerAutosave } from "./workerAutosave";
 import { scanWorkerManifests, type WorkerManifest } from "./worktree";
 import { parseWorkerResult } from "./buildAgent";
 import { useProjectStore, isLocallyRemoved } from "../stores/projectStore";
@@ -1037,6 +1038,7 @@ function teardown(): void {
     clearInterval(reapTimer);
     reapTimer = undefined;
   }
+  stopWorkerAutosave();
   if (graceTimer) {
     clearTimeout(graceTimer);
     graceTimer = undefined;
@@ -1110,6 +1112,12 @@ async function doStart(): Promise<() => void> {
     // is also what bounds how long an expired spawn can wait for its error reply on a quiet store.
     void reapOrphanedWorkers().catch((e) => console.warn("[orchestration] periodic reap failed", e));
   }, REAP_INTERVAL_MS);
+  // Periodic WIP autosave: enforce "commit incrementally" at the harness level so a HARD
+  // death (session-limit crash, app/OOM kill) that never runs an orderly teardown still leaves
+  // a worker's work committed on its branch rather than only as uncommitted worktree edits
+  // (bead sparkle-piliqq). Reuses the same best-effort snapshot the teardown path uses; a clean
+  // tree is a no-op. Stopped in teardown alongside the reaper.
+  startWorkerAutosave({ ownsProject: ownsRequest });
   return teardown;
 }
 
