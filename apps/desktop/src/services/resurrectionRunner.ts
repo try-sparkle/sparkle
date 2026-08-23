@@ -60,6 +60,7 @@ import type { QuotaBlock } from "../engine/quotaBlock";
 import { hasTurnEndAuthority, processAliveOf } from "../engine/turnEndAuthority";
 import { log } from "../logger";
 import { useProjectStore } from "../stores/projectStore";
+import { mountedPaneIds as mountedPaneIdsFromRegistry } from "./paneControl";
 import { notifyAttention } from "./attention";
 import { notifyConcierge } from "./conciergeNotifier";
 import { mountAgent, type MountResult } from "./agentMount";
@@ -81,6 +82,31 @@ export const RESURRECT_SWEEP_INTERVAL_MS = 15_000;
  * deaths would all be admitted in one tick, which is the flood by another route.
  */
 export const MAX_RESPAWNS_PER_SWEEP = RELEASE_BATCH;
+
+/**
+ * The most panes this window will let the resurrector MOUNT INTO before it stops adding new ones.
+ *
+ * ── WHY A CEILING AND NOT JUST A RATE (bead sparkle-5j6re3) ──────────────────────────────────
+ * `MAX_RESPAWNS_PER_SWEEP` bounds how many respawns start per 15s tick; it does NOT bound how many
+ * panes end up mounted, and the two costs are different. Every NEW `AgentPane` mount forces a
+ * full-document layout across every OTHER mounted pane (sparkle-gw36j: ~39 of 40 terminals are
+ * DOM-rendered text grids, one layout measured at ~0.37s), so resurrecting into an already-large
+ * fleet is an O(N) cost paid once per admitted mount, with N climbing on every tick. An app restart
+ * that leaves hundreds of agents due is the shape that bites: measured on v0.130.0, a burst of
+ * mounts drove a 7.7s main-thread stall after the fleet reached 40 panes, and the PTY spawns the
+ * founder actually asked for landed ~7s late behind it.
+ *
+ * The mounted set only ever GROWS within a session (`Workspace.tsx` — a Terminal unmount kills its
+ * PTY, so panes are sticky), so once the fleet is this large the cheapest safe thing is to stop
+ * ADDING to it. Refused agents are not dropped: they stay due (the Rust ledger republishes the due
+ * list every scan), and come back on the next app run with a fresh mounted set, or once the
+ * amplifier bead lands and each mount is cheap again. Deferring some recoveries is strictly better
+ * than melting the renderer for everyone.
+ *
+ * 40 is the fleet size at which the stall was measured. It bounds only NEW-pane mounts — see the
+ * gate in {@link sweepResurrections}.
+ */
+export const MAX_MOUNTED_PANES_FOR_RESURRECTION = 40;
 
 /** One dead agent the Rust ledger says is DUE. Mirrors `revival::DueAgent` field for field. */
 export interface DueAgent {
@@ -140,6 +166,13 @@ export interface ResurrectionSweepOptions {
   due?: () => Promise<DueAgent[]>;
   /** EVERY live PTY session id in this PROCESS. See the guard in {@link admit}. */
   liveSessions?: () => Promise<string[]>;
+  /** Every agent id whose pane is MOUNTED right now IN THIS PROCESS (services/paneControl's restart
+   *  registry — NOT the persisted `openAgentIds`, which survives a restart and would make the gate
+   *  inert; see {@link mountedPaneIdsFromRegistry}). Its size is the fleet the per-mount layout cost
+   *  scales with, and membership says whether resurrecting an agent needs a brand-new pane (absent →
+   *  route 2, an O(N) mount) or a cheap route-1 restart (present). See the mount-ceiling gate in
+   *  {@link sweepResurrections}. */
+  mountedPaneIds?: () => Iterable<string>;
   /** Take the durable claim. `false` means a live epoch holds it — a refusal, not an error. */
   claim?: (agentId: string) => Promise<boolean>;
   /** Give the claim back, recording the attempt durably when `spawned`. */
@@ -399,6 +432,12 @@ function liveOptions(opts: ResurrectionSweepOptions): Required<ResurrectionSweep
     projectTornOut: opts.projectTornOut ?? ((projectId) => isTornOut(projectId)),
     due: opts.due ?? (() => tauriInvoke<DueAgent[]>("revival_due")),
     liveSessions: opts.liveSessions ?? (() => tauriInvoke<string[]>("pty_live_sessions")),
+    // The IN-PROCESS pane registry (services/paneControl), NOT the persisted `openAgentIds`: the
+    // latter is restored from localStorage at boot and names last session's open agents, none of
+    // which has a pane in this process — which would make the ceiling inert in the restart storm it
+    // exists for (bead sparkle-5j6re3). This registry is the exact set `restartPane` consults, so
+    // membership matches `mountAgent`'s route-1 vs route-2 choice.
+    mountedPaneIds: opts.mountedPaneIds ?? (() => mountedPaneIdsFromRegistry()),
     claim:
       opts.claim ??
       ((agentId) => tauriInvoke<boolean>("agent_life_claim", { agentId, by: "resurrectionRunner" })),
@@ -605,6 +644,32 @@ export async function sweepResurrections(
     return outcomes;
   }
 
+  // ── THE MOUNT CEILING (bead sparkle-5j6re3), READ ONCE FOR THE WHOLE SWEEP ───────────────────
+  // The fleet the per-mount layout cost scales with. Every new `AgentPane` mount forces a
+  // full-document layout across every OTHER mounted pane (sparkle-gw36j), so an app restart that
+  // leaves hundreds of agents due turns resurrection into an O(N) layout paid once per mount — the
+  // storm this bead exists to end. `newMountHeadroom` is how many BRAND-NEW panes this sweep may
+  // still add before the fleet reaches `MAX_MOUNTED_PANES_FOR_RESURRECTION`; the selection loops
+  // below spend it, counting ONLY new-pane (route 2) mounts — a route-1 restart of an
+  // already-mounted pane adds no pane and pays no layout, so the common one-at-a-time death still
+  // recovers on a full fleet. Refused agents are not dropped: they stay due (the Rust ledger
+  // republishes every scan) and return on the next app run or once each mount is cheap again.
+  const mountedNow = new Set(o.mountedPaneIds());
+  const newMountHeadroom = Math.max(0, MAX_MOUNTED_PANES_FOR_RESURRECTION - mountedNow.size);
+  let newMountsPlanned = 0;
+  // Reserve a mount slot against the ceiling, returning whether the caller may proceed. An agent
+  // already in the pane registry recovers via a cheap route-1 restart (no new pane, no layout) and
+  // always passes; a brand-new pane passes only while headroom remains, and consumes one slot when
+  // it does. Callers that get `false` refuse the agent WITHOUT spending the sweep's respawn budget —
+  // one shared definition so the cohort loop and the lone-death loop cannot drift, and so a backlog
+  // of new-pane deaths can never starve the cheap route-1 restarts of the whole budget.
+  const reserveMount = (agentId: string): boolean => {
+    if (mountedNow.has(agentId)) return true;
+    if (newMountsPlanned >= newMountHeadroom) return false;
+    newMountsPlanned += 1;
+    return true;
+  };
+
   // ── the two gates that are about THIS WINDOW, applied before anything is grouped ────────────
   const mine: DueAgent[] = [];
   for (const d of due) {
@@ -765,6 +830,15 @@ export async function sweepResurrections(
       } else if (TRANSIENT_NO_RESURRECT.has(probe.reason)) {
         // Excluded from election this sweep, and NOT written down anywhere.
         unelectable.add(m.agentId);
+        refusedReason.set(m.agentId, probe.reason);
+      } else {
+        // Any OTHER decline — `waiting-for-next-rung`, `wall-not-yet-reset` — clears on its own, so
+        // it must NOT make the member unelectable (rotating over a member that just needs to wait
+        // would burn victims for nothing). But it is recorded so the member loop refuses it BY
+        // REASON before it can reserve a mount slot it cannot use this sweep (bead sparkle-5j6re3):
+        // an elected canary the gate declines for a timing reason would otherwise consume the
+        // ceiling's headroom every sweep and starve a revivable agent behind it, then be declined
+        // again in the final loop. It reserves nothing now and mounts as soon as its rung clears.
         refusedReason.set(m.agentId, probe.reason);
       }
     }
@@ -982,6 +1056,13 @@ export async function sweepResurrections(
         });
         continue;
       }
+      // THE MOUNT CEILING, AT SELECTION (bead sparkle-5j6re3) — a new-pane admission that cannot
+      // land must not consume this sweep's respawn budget, so it is refused here (before `planned`)
+      // exactly like the live/refused/not-allowed cases above. See {@link reserveMount}.
+      if (!reserveMount(m.agentId)) {
+        outcomes.push({ agentId: m.agentId, action: "none", detail: "fleet-at-mount-ceiling" });
+        continue;
+      }
       admissible.push({ due: d, cohortKey: key });
       planned += 1;
     }
@@ -1004,8 +1085,28 @@ export async function sweepResurrections(
       outcomes.push({ agentId: d.agentId, action: "none", detail: "no-agent-row" });
       continue;
     }
+    // PROBE THE PER-AGENT GATE BEFORE RESERVING A MOUNT SLOT (bead sparkle-5j6re3). The cohort loop
+    // gets this from its election pre-pass; the lone-death path has none, so without this probe an
+    // agent the gate will decline — `daily-cap-spent` (stable for HOURS), `waiting-for-next-rung`,
+    // `wall-not-yet-reset` — would reserve one of the ceiling's headroom slots, mount nothing, and,
+    // because the due-list order is stable, starve a revivable agent behind it every sweep forever.
+    // Refuse it here (which also spends no `planned`); the final loop re-checks as the double-spawn
+    // backstop.
+    const decision = decideResurrection(resurrectionInputFor(d, liveIds.has(d.agentId), o.now));
+    if (decision.action === "none") {
+      pushRefusal(outcomes, d, decision.reason satisfies NoResurrectReason, o.escalate);
+      continue;
+    }
     if (planned >= MAX_RESPAWNS_PER_SWEEP) {
       outcomes.push({ agentId: d.agentId, action: "none", detail: "sweep-cap" });
+      continue;
+    }
+    // THE MOUNT CEILING, AT SELECTION (bead sparkle-5j6re3) — see {@link reserveMount}. Reached only
+    // after the gate has APPROVED this agent, so a slot is reserved only for a mount that can happen;
+    // a `false` here refuses the new pane without touching `planned`, so a backlog of new-pane deaths
+    // cannot starve the cheap route-1 restarts later in the stable due-list order.
+    if (!reserveMount(d.agentId)) {
+      outcomes.push({ agentId: d.agentId, action: "none", detail: "fleet-at-mount-ceiling" });
       continue;
     }
     planned += 1;

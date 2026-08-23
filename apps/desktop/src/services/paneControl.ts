@@ -41,6 +41,23 @@ export function unregisterPaneRestart(agentId: string): void {
   restarts.delete(agentId);
 }
 
+/**
+ * Every agent id whose pane is mounted RIGHT NOW, in THIS process — exactly the ids for which
+ * {@link restartPane} takes the cheap route-1 path (a registered lever) rather than mounting a
+ * brand-new pane.
+ *
+ * ── WHY THIS AND NOT `runtimeStore.openAgentIds` (bead sparkle-5j6re3) ────────────────────────
+ * `openAgentIds` is PERSISTED to localStorage and restored at boot, and nothing removes an id when
+ * its PTY exits — so after an app restart it names every agent that was open in the PREVIOUS
+ * process, none of which has a pane in THIS one. A caller asking "does this agent already have a
+ * mounted pane" (to skip the O(N) new-mount cost) would read a restart-storm's due agents as
+ * already-mounted and admit the whole flood. This registry is process-local and unregistered on
+ * unmount, so it is empty at boot and grows only as panes actually mount — the honest answer to
+ * that question. */
+export function mountedPaneIds(): string[] {
+  return [...restarts.keys()];
+}
+
 /** Re-spawn an agent's PTY, FIRE-AND-FORGET. Returns false when no pane is mounted for it — a
  *  closed agent simply picks up its new account the next time it spawns, so this is a no-op, never
  *  an error.
