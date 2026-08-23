@@ -2679,6 +2679,13 @@
             "build_and_install(",
             "reconcile_capture(",
             "reacquire_capture(",
+            // AND WAITING ON THE WORKER, which is the same block wearing the hand-off's clothes.
+            // `spawn(move || { build_and_install(..) }).join()` puts the build INSIDE the closure —
+            // satisfying the containment assertion below — while the calling thread sits on the
+            // join for the full 160-990 ms. Semantically it is the inlined call this whole test
+            // forbids. The `.join(` lands in `outside` (it follows the closure's closing brace),
+            // so banning it there catches both that form and `let h = spawn(..); …; h.join();`.
+            ".join(",
         ];
 
         /// The CODE of one `impl` method: from its signature to the first line that is exactly
