@@ -1631,12 +1631,71 @@ mod tests {
         assert!(frames("notWorking").len() >= 3, "too few negative frames to catch a false green");
     }
 
+    fn declared_gaps() -> Vec<String> {
+        spinner_fixture()["knownGaps"]["screenIsWorkingMisses"]
+            .as_array()
+            .expect("fixture records the known gaps")
+            .iter()
+            .map(|v| v.as_str().expect("each gap is a string").to_string())
+            .collect()
+    }
+
+    /// EVERY SHARED `working` FRAME, PARTITIONED BY THE DECLARED GAP — **derived, never listed**.
+    ///
+    /// roborev's third round, and it was right twice over. The previous shape looped through
+    /// `any_working_matcher`, a test-only composition, so the one direction that matters most was
+    /// unguarded: **the gap WIDENING reded nothing.** Add a new bare frame to `working` when the TUI
+    /// next moves — exactly what the contract instructs the next agent to do — and `screen_is_working`
+    /// misses it silently, because the composition swallows the miss and the hand-written gap list
+    /// never sees the new frame. That is contract prose promising an enforcement that does not exist:
+    /// the very defect the commit before this one was written to fix.
+    ///
+    /// So the relationship is DERIVED here. A frame is either handled by the production entry point
+    /// or it is a DECLARED gap; there is no third state, and the fixture is the only place the
+    /// partition is written down.
     #[test]
-    fn every_shared_working_frame_reads_as_working_here_too() {
+    fn every_shared_working_frame_is_either_handled_or_a_declared_gap() {
+        let gaps = declared_gaps();
         for (frame, why) in frames("working") {
+            if gaps.contains(&frame) {
+                // A declared gap: the MATCHER must still see it (the gap is about wiring, not rot)…
+                assert!(
+                    screen_shows_bare_spinner_frame(&frame),
+                    "declared gap {frame:?} is no longer recognised by the matcher at all — {why}"
+                );
+                // …and the veto path must still miss it, or the gap is CLOSED and the fixture is stale.
+                assert!(
+                    !screen_is_working(&frame),
+                    "{frame:?} is no longer a gap — screen_is_working now sees it. Remove it from \
+                     knownGaps.screenIsWorkingMisses, and read the warning above \
+                     screen_shows_bare_spinner_frame before widening the veto path further"
+                );
+            } else {
+                // Not declared: the PRODUCTION entry point owes an answer. This is the arm that makes
+                // a newly-missed frame red until somebody declares it.
+                assert!(
+                    screen_is_working(&frame),
+                    "{frame:?} is not handled by screen_is_working and is not a declared gap — {why}\n  \
+                     Either fix the matcher wiring or add it to knownGaps.screenIsWorkingMisses"
+                );
+            }
+        }
+    }
+
+    /// THE LIST CANNOT DRIFT AWAY FROM THE FRAMES IT DESCRIBES. A `working` frame whose text is
+    /// edited would otherwise leave a stale string in `knownGaps` that BOTH assertions above still
+    /// satisfy — the regex matches any well-formed bare frame and the veto path rejects all of them —
+    /// so the list could stop describing the shipped frames with the suite green.
+    #[test]
+    fn every_declared_gap_is_a_frame_the_fixture_actually_carries() {
+        let working: Vec<String> = frames("working").into_iter().map(|(f, _)| f).collect();
+        let gaps = declared_gaps();
+        assert!(!gaps.is_empty(), "an empty gap list would make the partition test vacuous");
+        for g in gaps {
             assert!(
-                any_working_matcher(&frame),
-                "the TS scraper calls this WORKING and no matcher here does — {why}\n  frame: {frame:?}"
+                working.contains(&g),
+                "knownGaps names {g:?}, which is not in the fixture's `working` set — the list has \
+                 drifted from the frames it claims to describe"
             );
         }
     }
@@ -1680,40 +1739,6 @@ mod tests {
             "this side's live-tail window drifted from the shared fixture — retune BOTH scrapers, \
              or they disagree about the same screen"
         );
-    }
-
-    /// WHERE THE TWO SIDES DELIBERATELY DISAGREE, ASSERTED IN BOTH DIRECTIONS.
-    ///
-    /// roborev's third finding, and it was the sharpest: the fixture's contract promised both sides
-    /// agree, `screen_is_working` answers FALSE for every bare 2.1.237 frame, and `any_working_matcher`
-    /// — a test-only composition with no production counterpart — papered over it. That is the same
-    /// shape the fixture's own contract warns against.
-    ///
-    /// BOTH DIRECTIONS MATTER. If someone wires the arm into `screen_is_working`, the first assertion
-    /// reds and sends them back to the fixture to update the list (and to the warning explaining why
-    /// they should not). If the MATCHER breaks, the second reds. Either way the gap stays a decision.
-    #[test]
-    fn the_known_gap_between_the_matcher_and_the_veto_path_is_exactly_as_recorded() {
-        let gaps = spinner_fixture()["knownGaps"]["screenIsWorkingMisses"]
-            .as_array()
-            .expect("fixture records the known gaps")
-            .iter()
-            .map(|v| v.as_str().expect("each gap is a string").to_string())
-            .collect::<Vec<_>>();
-        assert!(!gaps.is_empty(), "an empty gap list would make this test vacuous");
-
-        for frame in gaps {
-            assert!(
-                !screen_is_working(&frame),
-                "the veto path now SEES {frame:?} — if that is deliberate, remove it from the \
-                 fixture's knownGaps and read the warning above screen_shows_bare_spinner_frame first"
-            );
-            assert!(
-                screen_shows_bare_spinner_frame(&frame),
-                "the MATCHER stopped recognising {frame:?} — the gap is supposed to be about wiring, \
-                 not about the matcher rotting"
-            );
-        }
     }
 
     /// THE BOUNDARY, IN BOTH DIRECTIONS, ON SYNTHETIC GRIDS.

@@ -69,16 +69,34 @@ describe("the shared spinner fixture — the same bytes nudge_gate.rs asserts", 
     expect(LIVE_TAIL_ROWS).toBe(fixture.liveTailRows);
   });
 
-  // THE RECORDED ASYMMETRY, FROM THIS SIDE. `nudge_gate::screen_is_working` deliberately does not
-  // consult its bare-frame matcher (a positional match cannot tell a live spinner from the remnant a
-  // finished turn leaves behind), so these frames are seen HERE and not THERE. Asserting it from this
-  // side too means the list cannot quietly stop describing reality on the side that reads it.
-  it.each(fixture.knownGaps.screenIsWorkingMisses)(
-    "still recognises %s, which the Rust veto path deliberately does not",
-    (frame) => {
-      expect(isSpinnerFrame(frame)).toBe(true);
-    },
-  );
+  // THE RECORDED ASYMMETRY — ASSERTED ON THE ONE THING THIS SIDE CAN ACTUALLY DRIFT ON.
+  //
+  // roborev's third round caught the previous version as VACUOUS, correctly: every
+  // `screenIsWorkingMisses` entry is also a `working` entry, and the `it.each(fixture.working)` case
+  // above already asserts `isSpinnerFrame` is true for all of them — so no mutation could red this
+  // test without reding that one first. It read as coverage of the cross-language asymmetry while
+  // covering nothing.
+  //
+  // What this side CAN prove is that the gap list still describes frames this fixture carries. Edit
+  // a `working` frame's text and the stale entry left in `knownGaps` would satisfy the Rust
+  // assertions anyway (its regex matches any well-formed bare frame, and the veto path rejects all
+  // of them), so the list could stop describing the shipped frames with both suites green.
+  it("declares gaps that are real `working` frames, not stale or invented strings", () => {
+    expect(
+      fixture.knownGaps.screenIsWorkingMisses.length,
+      "an empty gap list would make the Rust partition test vacuous",
+    ).toBeGreaterThan(0);
+    const working = new Set(fixture.working.map((s) => s.frame));
+    const notWorking = new Set(fixture.notWorking.map((s) => s.frame));
+    for (const frame of fixture.knownGaps.screenIsWorkingMisses) {
+      expect(working.has(frame), `knownGaps names ${frame}, which is not a \`working\` frame`).toBe(
+        true,
+      );
+      // A gap is a frame the Rust VETO PATH misses; a frame nobody should match at all belongs in
+      // `notWorking`. Listing one in both would make the partition incoherent.
+      expect(notWorking.has(frame), `${frame} is declared both a gap and a negative`).toBe(false);
+    }
+  });
 
   // The fixture's own contract prose is load-bearing — it is where the retune instruction lives —
   // so an edit that guts it should be deliberate rather than silent.
