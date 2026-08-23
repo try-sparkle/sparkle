@@ -297,6 +297,41 @@ describe("spawnBuildAgent", () => {
     expect(useRuntimeStore.getState().openAgentIds).toContain(r.data.agentId);
   });
 
+  // ══ A PRESENT-BUT-BLANK BRIEF IS REFUSED, NOTHING IS CREATED (sparkle-esrsnv) ══════════════════
+  // The incident: an agent spawned "with a brief" that arrived empty and answered the nudge ladder
+  // `no-task-assigned`, so a human had to paste the brief in by hand. A whitespace-only `prompt`
+  // clears the route schema's `.min(1)` (whitespace counts toward length) and would be delivered
+  // verbatim as the agent's opening message. This asserts the SIDE EFFECT, not the input: the spawn
+  // primitive is never reached, so no agent, no slot, no taskless row.
+  it("refuses a present-but-blank brief and creates NOTHING", async () => {
+    const pid = seedProject();
+    const r = await spawnBuildAgent({ projectId: pid, prompt: "   \n\t  " });
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.reason).toBe("empty-brief");
+    // THE SIDE EFFECT. `spawnBuildAgentInProject` is the only thing that mints an agent + slot, and
+    // it was never called — so the blank brief cost the store nothing. Asserting the refusal reason
+    // alone would pass even if a taskless agent had been created and then the reply relabelled.
+    expect(spawnOpts).toHaveLength(0);
+    expect(useProjectStore.getState().projects.find((p) => p.id === pid)!.agents).toHaveLength(0);
+  });
+
+  // THE PAIRED CASE: the same setup DOES reach the spawn when the brief is real, so the guard is
+  // keyed on blankness and not on merely having a `prompt`. `spawnOverride` returns null to stop the
+  // path before its ~45s brief-delivery await — we only need to see the brief forwarded, verbatim,
+  // into the spawn primitive (which the empty-brief guard would have prevented for a blank one).
+  it("forwards a real brief into the spawn — the empty-brief guard fires only on a blank one", async () => {
+    const pid = seedProject();
+    spawnOverride = () => null;
+    const r = await spawnBuildAgent({ projectId: pid, prompt: "Fix the login redirect loop" });
+    expect(spawnOpts).toHaveLength(1);
+    expect(spawnOpts[0]).toMatchObject({ prompt: "Fix the login redirect loop" });
+    // Whatever this spawn's outcome is, it is NOT the blank-brief refusal — the guard let it through.
+    expect(r.ok).toBe(false); // spawnOverride returned null → action-failed, not empty-brief
+    if (r.ok) return;
+    expect(r.reason).not.toBe("empty-brief");
+  });
+
   // ══ THE NAME IS PROVISIONAL, AND THE PAYLOAD SAYS SO ══════════════════════════════════════════
   // This reply used to carry a plain `name`, and that one word produced a real failure: the
   // concierge read it and told the founder "Build 17" — a spawn-time placeholder the agent had

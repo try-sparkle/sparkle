@@ -267,6 +267,12 @@ export type LifecycleRefusalReason =
   | "cloud-goal-required" //    a cloud agent's goal is delivered by the runner at start and cannot
   //                            be sent afterwards, so a spawn with no `prompt` is refused rather
   //                            than given one this layer invented
+  | "empty-brief" //            a LOCAL spawn whose `prompt` was PROVIDED but is blank (whitespace
+  //                            only). The route schema's `.min(1)` counts whitespace toward length,
+  //                            so a blank brief passes bad-args, is delivered verbatim, and boots the
+  //                            agent taskless while the reply still claims `briefed` (sparkle-esrsnv).
+  //                            Refused rather than delivered; the ABSENCE of `prompt` is still
+  //                            legitimate (an empty agent the human types into) and never reaches this.
   | "cloud-no-repo" //          the project has no GitHub remote for the sandbox to clone
   | "needs-decision" //         closing would put work at risk: the human picks ship/save/discard
   | "needs-human-confirm" //    the agent LANDED its work, so only a person may take its row off the
@@ -677,6 +683,35 @@ export async function spawnBuildAgent(
         `"${input.model}" isn't a model this app offers. Available: ${known.join(", ")}.`,
       );
     }
+  }
+
+  // ══ A PRESENT-BUT-BLANK BRIEF IS REFUSED, NEVER DELIVERED ═══════════════════════════════════════
+  // `prompt` is the whole point of a briefed spawn, and a whitespace-only string is the one input
+  // that slips past every check between here and the agent's terminal: the route schema's `.min(1)`
+  // counts whitespace toward length so it clears bad-args, `Boolean(input.prompt)` is true so the
+  // reply below would claim `briefed: true`, and the string is handed to the launch verbatim — so the
+  // agent boots with a blank opening message, reads it as no task, and answers the nudge ladder
+  // `no-task-assigned` while the reply insists it was briefed. That is exactly the incident this
+  // guard closes (bead sparkle-esrsnv): an agent spawned "with a brief" that arrived empty, which a
+  // human then had to paste in by hand mid-turn.
+  //
+  // The cloud path already refuses this — `spawnCloudBuildAgent` derives its goal via
+  // `input.prompt?.trim()` and returns `cloud-goal-required` when it is empty. The LOCAL path did
+  // not, and that asymmetry is what shipped the bug; this restores the symmetry.
+  //
+  // Fires ONLY when a brief was PROVIDED and is blank — OMITTING `prompt` is still legitimate (an
+  // empty agent the human types into) and must not be refused. Checked ABOVE the capacity gate for
+  // the same reason as the torn-out and unknown-model guards: it depends only on the caller's input
+  // and can never be satisfied by freeing a slot, so a blank brief must not consume one, and nothing
+  // is created before it is caught.
+  if (input.prompt !== undefined && input.prompt.trim() === "") {
+    return refuse(
+      "spawn_build_agent",
+      "empty-brief",
+      "The brief came through blank, so I didn't start an agent — a blank brief boots it with no " +
+        "task, and it would just sit there asking what to do. Tell me what the agent should work on " +
+        "and I'll start it, or say to start an empty agent and I'll open one for you to type into.",
+    );
   }
 
   // The cap is checked BEFORE anything is created, so an over-cap request leaves the store exactly
