@@ -859,6 +859,7 @@ describe("mergePr — the knightwatch override is passed THROUGH", () => {
   it("carries the reason to the Rust command as `knightwatchOverride`", async () => {
     await mergePr(
       "/repo",
+      "proj-1",
       1176,
       "the probe asks about a file this PR does not touch",
     );
@@ -869,18 +870,19 @@ describe("mergePr — the knightwatch override is passed THROUGH", () => {
     expect(cmd).toBe("merge_pr");
     expect(payload).toEqual({
       root: "/repo",
+      projectId: "proj-1",
       number: 1176,
       knightwatchOverride: "the probe asks about a file this PR does not touch",
     });
   });
 
-  it("OMITS the key entirely on an ordinary merge", async () => {
-    await mergePr("/repo", 1176);
+  it("OMITS the override key on an ordinary merge but ALWAYS sends projectId", async () => {
+    await mergePr("/repo", "proj-1", 1176);
     const payload = h.invoke.mock.calls[0]?.[1] as Record<string, unknown>;
-    // `in`, not `=== undefined`: the existing callers assert the exact payload `{ root, number }`,
-    // and a key that is present-but-undefined is a different object on the wire.
+    // `in`, not `=== undefined`: a key that is present-but-undefined is a different object on the
+    // wire. projectId is required (base-branch scoping, bead sparkle-hvenv2), so it is always there.
     expect("knightwatchOverride" in payload).toBe(false);
-    expect(payload).toEqual({ root: "/repo", number: 1176 });
+    expect(payload).toEqual({ root: "/repo", projectId: "proj-1", number: 1176 });
   });
 
   // ── AND SO DOES THE HEAD THE DECISION WAS MADE AGAINST ─────────────────────────────────────
@@ -890,16 +892,17 @@ describe("mergePr — the knightwatch override is passed THROUGH", () => {
   // PR reading MERGED. There is no visible symptom, so the payload is the only place to assert it.
   it("carries the polled head to the Rust command as `expectedHeadOid`", async () => {
     const oid = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0";
-    await mergePr("/repo", 1176, undefined, oid);
+    await mergePr("/repo", "proj-1", 1176, undefined, oid);
     const payload = h.invoke.mock.calls[0]?.[1] as Record<string, unknown>;
-    expect(payload).toEqual({ root: "/repo", number: 1176, expectedHeadOid: oid });
+    expect(payload).toEqual({ root: "/repo", projectId: "proj-1", number: 1176, expectedHeadOid: oid });
   });
 
   it("sends BOTH when a red PR is waived at a known head", async () => {
-    await mergePr("/repo", 1176, "answered in the thread", "deadbeefcafe");
+    await mergePr("/repo", "proj-1", 1176, "answered in the thread", "deadbeefcafe");
     const payload = h.invoke.mock.calls[0]?.[1] as Record<string, unknown>;
     expect(payload).toEqual({
       root: "/repo",
+      projectId: "proj-1",
       number: 1176,
       knightwatchOverride: "answered in the thread",
       expectedHeadOid: "deadbeefcafe",
@@ -909,12 +912,12 @@ describe("mergePr — the knightwatch override is passed THROUGH", () => {
   it("OMITS an unknown head — empty means 'cannot compare', never a merge that gh rejects", async () => {
     for (const oid of [undefined, ""]) {
       h.invoke.mockClear();
-      await mergePr("/repo", 1176, undefined, oid);
+      await mergePr("/repo", "proj-1", 1176, undefined, oid);
       const payload = h.invoke.mock.calls[0]?.[1] as Record<string, unknown>;
       expect("expectedHeadOid" in payload, `oid=${JSON.stringify(oid)}`).toBe(
         false,
       );
-      expect(payload).toEqual({ root: "/repo", number: 1176 });
+      expect(payload).toEqual({ root: "/repo", projectId: "proj-1", number: 1176 });
     }
   });
 
@@ -922,7 +925,7 @@ describe("mergePr — the knightwatch override is passed THROUGH", () => {
     h.invoke.mockRejectedValueOnce(
       new Error("knightwatch: 1 unanswered [blocking] probe"),
     );
-    await expect(mergePr("/repo", 1176)).rejects.toThrow(
+    await expect(mergePr("/repo", "proj-1", 1176)).rejects.toThrow(
       /unanswered \[blocking\] probe/,
     );
   });

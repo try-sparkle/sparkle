@@ -1296,6 +1296,96 @@ fn gh_failure_hint(stderr: &[u8], code: Option<i32>) -> String {
     }
 }
 
+/// The `owner/repo` slug for the repo checked out at `dir`, read straight from its `origin` remote
+/// so a `gh` call can be pinned to it EXPLICITLY rather than left to resolve owner/repo from its own
+/// working directory.
+///
+/// WHY THIS EXISTS. `gh pr list` and `gh api repos/{owner}/{repo}/…` both derive the current
+/// repository from the cwd's git remotes, so the moment this module's cwd is not a usable git
+/// checkout — a linked worktree whose admin gitdir was pruned to a husk, or a checkout gh's own
+/// base-repo heuristic cannot disambiguate — every call fails with "not a git repository" or
+/// "unable to expand placeholder in path", and the conflict monitor goes blind while it persists.
+/// Reading the slug once and passing it explicitly takes gh's cwd-based resolution out of the path.
+///
+/// `None` — never a guess — when `git` cannot read an `origin` url here (a husk, or no remote) or
+/// the url is not a GitHub one. The caller then leaves gh to its own resolution exactly as before,
+/// so a repo we cannot slug is no worse off than it is today, and [`probe_repo`] still falls through
+/// to the project's next worktree.
+fn repo_slug(dir: &Path) -> Option<String> {
+    let url = crate::worktree::git(dir.to_str()?, &["remote", "get-url", "origin"]).ok()?;
+    parse_repo_slug(&url)
+}
+
+/// A git `origin` url → its `owner/repo` slug, for the two forms git writes: the `https://…` and the
+/// `git@…:` (scp-like) one, each with or without a trailing `.git`. PURE so the parse is unit-tested
+/// without a git binary — the whole point being that this slug is now what pins the `gh` call.
+///
+/// `None` for anything that is not recognisably `github.com/owner/repo` — a non-GitHub or malformed
+/// remote falls back to gh's own resolution rather than pinning gh to a bad `--repo`.
+fn parse_repo_slug(remote_url: &str) -> Option<String> {
+    let u = remote_url.trim();
+    let rest = [
+        "https://github.com/",
+        "http://github.com/",
+        "ssh://git@github.com/",
+        "git@github.com:",
+        "github.com:",
+        "github.com/",
+    ]
+    .iter()
+    .find_map(|prefix| u.strip_prefix(prefix))?;
+    let rest = rest.strip_suffix(".git").unwrap_or(rest);
+    let mut parts = rest.trim_matches('/').split('/');
+    let owner = parts.next().filter(|s| !s.is_empty())?;
+    let repo = parts.next().filter(|s| !s.is_empty())?;
+    // Exactly owner/repo — a remote url carries no further path, and a stray one would make a bad
+    // slug that pins gh to the wrong place, so refuse it rather than pass it through.
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(format!("{owner}/{repo}"))
+}
+
+/// The `gh pr list` argument vector, carrying `--repo <slug>` when a slug was resolved.
+///
+/// Extracted PURE (a subprocess spawn is unreachable from a unit test) so the ONE thing this fix
+/// asserts — that the command carries an EXPLICIT repo instead of relying on the cwd — is checked
+/// directly. With no slug the args are exactly what shipped before, so gh resolves from cwd as it
+/// always did.
+fn pr_list_args(limit: u32, repo_slug: Option<&str>) -> Vec<String> {
+    let mut args: Vec<String> = vec!["pr".into(), "list".into()];
+    if let Some(slug) = repo_slug {
+        args.push("--repo".into());
+        args.push(slug.into());
+    }
+    let limit_s = limit.to_string();
+    args.extend(
+        [
+            "--state",
+            "open",
+            "--limit",
+            limit_s.as_str(),
+            "--json",
+            // `statusCheckRollup` is the ONLY source for `has_ci`, which is what turns "this PR is
+            // untested" from an inference into an observation — see `ConflictFlag::untested`.
+            "number,title,headRefName,headRefOid,baseRefOid,mergeable,mergeStateStatus,isDraft,url,statusCheckRollup",
+        ]
+        .map(str::to_string),
+    );
+    args
+}
+
+/// A `gh api` path with gh's `{owner}/{repo}` placeholder pre-expanded to `slug`, so `gh api` need
+/// not resolve the current repo from its cwd — the exact expansion that failed with "unable to
+/// expand placeholder in path". With no slug the template is returned unchanged and gh expands it
+/// from the working directory as before.
+fn api_path_for(path: &str, repo_slug: Option<&str>) -> String {
+    match repo_slug {
+        Some(slug) => path.replace("{owner}/{repo}", slug),
+        None => path.to_string(),
+    }
+}
+
 /// Every open PR in `dir`'s repo, plus whether the list was TRUNCATED at [`PROBE_LIMIT`].
 ///
 /// `Err(reason)` — never an empty list — when `gh` is absent, unauthenticated, offline, or slow.
@@ -1303,18 +1393,11 @@ fn gh_failure_hint(stderr: &[u8], code: Option<i32>) -> String {
 /// conflict from a repo we could not read.
 fn probe_open_prs(dir: &Path) -> Result<Probed, &'static str> {
     let mut cmd = Command::new(crate::preflight::gh_program());
-    cmd.arg("pr")
-        .args([
-            "list",
-            "--state",
-            "open",
-            "--limit",
-            &PROBE_LIMIT.to_string(),
-            "--json",
-            // `statusCheckRollup` is the ONLY source for `has_ci`, which is what turns "this PR is
-            // untested" from an inference into an observation — see `ConflictFlag::untested`.
-            "number,title,headRefName,headRefOid,baseRefOid,mergeable,mergeStateStatus,isDraft,url,statusCheckRollup",
-        ])
+    // Pin the repo EXPLICITLY when we can read its slug, so gh does not have to derive owner/repo
+    // from `dir` — which is not always a usable git checkout (a pruned-to-husk worktree). See
+    // [`repo_slug`]. `current_dir(dir)` is kept for the local git the sweep also runs there and as
+    // the fallback path when the slug is unknown.
+    cmd.args(pr_list_args(PROBE_LIMIT, repo_slug(dir).as_deref()))
         .current_dir(dir)
         .env("GH_PROMPT_DISABLED", "1")
         .env("GH_NO_UPDATE_NOTIFIER", "1");
@@ -1359,12 +1442,16 @@ const REST_CHECK_BUDGET: usize = 20;
 
 /// One `gh api <path>` against the repo `dir` belongs to, returning stdout.
 ///
-/// `{owner}/{repo}` placeholders are resolved by `gh` from the working directory, so this needs no
-/// slug lookup of its own.
+/// Any `{owner}/{repo}` in `path` is pre-expanded from `dir`'s resolved slug (see [`api_path_for`]
+/// and [`repo_slug`]) so gh does not have to expand it from the working directory — the expansion
+/// that failed "unable to expand placeholder in path" when the cwd was not a usable git checkout.
+/// When the slug cannot be read the template is left for gh to expand from cwd, exactly as before.
 fn gh_api(dir: &Path, path: &str) -> Result<String, &'static str> {
     let mut cmd = Command::new(crate::preflight::gh_program());
+    // Pre-expand gh's `{owner}/{repo}` placeholder from the resolved slug so `gh api` does not have
+    // to work it out from `dir`; falls back to the raw template (gh resolves from cwd) when unknown.
     cmd.arg("api")
-        .arg(path)
+        .arg(api_path_for(path, repo_slug(dir).as_deref()))
         .current_dir(dir)
         .env("GH_PROMPT_DISABLED", "1")
         .env("GH_NO_UPDATE_NOTIFIER", "1");
@@ -4285,16 +4372,17 @@ mod tests {
         assert_eq!(flag.target, "agent", "and it still reaches somebody");
     }
 
-    /// The cap is now read from one constant on the argv, so a future edit cannot move the query's
-    /// limit without moving the number saturation is detected at. A literal in the argv is exactly
-    /// how the two drifted apart before.
+    /// The cap is read from one constant, so a future edit cannot move the query's limit without
+    /// moving the number saturation is detected at. A literal in the argv is exactly how the two
+    /// drifted apart before. The `--limit` value now lives in [`pr_list_args`], which
+    /// [`probe_open_prs`] calls with `PROBE_LIMIT` and then judges saturation against the SAME
+    /// constant via `probe_from_stdout(…, PROBE_LIMIT)` — so this asserts both call sites name it.
     /// SCANS ONLY THE NON-TEST HALF OF THE FILE, and that is load-bearing rather than tidiness.
     /// The first version of this test read the whole of `include_str!` — including itself — so the
     /// literal it searched for was present *because the assertion quoted it*, and the test failed
-    /// against correct source. The positive half was worse: `src.contains("&PROBE_LIMIT…")` is
-    /// satisfied by the assertion's own text, so it could never fail no matter what the argv said.
-    /// Self-reading source scans are vacuous in one direction and self-defeating in the other;
-    /// cutting the test module off leaves a needle that only real code can satisfy.
+    /// against correct source. The positive half was worse: it could never fail no matter what the
+    /// argv said. Self-reading source scans are vacuous in one direction and self-defeating in the
+    /// other; cutting the test module off leaves a needle that only real code can satisfy.
     #[test]
     fn the_probe_asks_for_exactly_the_limit_saturation_is_judged_against() {
         let whole = include_str!("conflict_watch.rs");
@@ -4303,8 +4391,12 @@ mod tests {
             .expect("the test module marker anchors this scan")
             .0;
         assert!(
-            code.contains("&PROBE_LIMIT.to_string(),"),
-            "the --limit argument must be PROBE_LIMIT itself, not a literal beside it"
+            code.contains("pr_list_args(PROBE_LIMIT,"),
+            "the --limit argument must be built from PROBE_LIMIT itself, not a literal beside it"
+        );
+        assert!(
+            code.contains("PROBE_LIMIT).ok_or"),
+            "saturation must be judged against the SAME PROBE_LIMIT the query asked for"
         );
         // Any bare numeric literal on the argv is the drift this guards: the query's ceiling and the
         // number saturation is judged against must be ONE constant, or a future edit moves one and
@@ -4504,4 +4596,81 @@ mod tests {
             "every value `evidence` can take must be one the field's own doc enumerates"
         );
     }
+    // ══ EXPLICIT-REPO PINNING (bead sparkle-axiu5s) ═════════════════════════════════════════════
+
+    /// The slug parser handles the two forms git writes for `origin`, with and without `.git` and
+    /// with surrounding whitespace, and refuses anything that is not `github.com/owner/repo`.
+    #[test]
+    fn parse_repo_slug_reads_both_remote_url_forms() {
+        for url in [
+            "https://github.com/octo-org/octo-repo.git",
+            "https://github.com/octo-org/octo-repo",
+            "git@github.com:octo-org/octo-repo.git",
+            "ssh://git@github.com/octo-org/octo-repo.git",
+            "  https://github.com/octo-org/octo-repo.git\n",
+        ] {
+            assert_eq!(
+                parse_repo_slug(url).as_deref(),
+                Some("octo-org/octo-repo"),
+                "failed to slug {url}"
+            );
+        }
+        // A non-GitHub, incomplete, or over-long remote yields None, so the caller falls back to
+        // gh's own resolution rather than pinning gh to a bad --repo.
+        assert_eq!(parse_repo_slug("https://gitlab.com/a/b.git"), None);
+        assert_eq!(parse_repo_slug("git@github.com:only-owner"), None);
+        assert_eq!(parse_repo_slug("https://github.com/o/r/extra"), None);
+        assert_eq!(parse_repo_slug(""), None);
+    }
+
+    /// THE FIX, asserted on the SIDE EFFECT: a resolved slug makes `gh pr list` carry `--repo
+    /// <slug>`, so gh resolves owner/repo from the flag instead of from a cwd that may not be a git
+    /// checkout at all. Without a slug the flag is absent and the query still ships intact.
+    #[test]
+    fn pr_list_args_pin_the_repo_when_a_slug_is_known() {
+        let pinned = pr_list_args(300, Some("octo-org/octo-repo"));
+        let i = pinned
+            .iter()
+            .position(|a| a == "--repo")
+            .expect("--repo must be passed when the slug is known");
+        assert_eq!(
+            pinned.get(i + 1).map(String::as_str),
+            Some("octo-org/octo-repo"),
+            "--repo must be followed by the slug, or gh reads the next flag as its value"
+        );
+        // Pinning must not drop the query the decoder depends on.
+        assert!(
+            pinned.iter().any(|a| a.contains("statusCheckRollup")),
+            "the --json field list must survive pinning"
+        );
+        assert!(pinned.iter().any(|a| a == "--limit") && pinned.iter().any(|a| a == "300"));
+
+        // Unresolved slug → no --repo, so a repo we cannot slug is no worse off than before.
+        let unpinned = pr_list_args(300, None);
+        assert!(
+            !unpinned.iter().any(|a| a == "--repo"),
+            "with no slug there is nothing to pin and gh resolves from cwd as before"
+        );
+    }
+
+    /// THE OTHER HALF: `gh api repos/{owner}/{repo}/…` gets its placeholder pre-expanded, so gh
+    /// never has to expand it from the cwd — the exact call that failed "unable to expand
+    /// placeholder in path". With no slug the template is untouched for gh to expand as before.
+    #[test]
+    fn api_path_pre_expands_the_owner_repo_placeholder() {
+        assert_eq!(
+            api_path_for("repos/{owner}/{repo}/pulls?state=open", Some("octo-org/octo-repo")),
+            "repos/octo-org/octo-repo/pulls?state=open"
+        );
+        assert!(
+            !api_path_for("repos/{owner}/{repo}/pulls", Some("octo-org/octo-repo")).contains("{owner}"),
+            "no placeholder may survive once we know the slug, or gh still resolves from cwd"
+        );
+        assert_eq!(
+            api_path_for("repos/{owner}/{repo}/pulls", None),
+            "repos/{owner}/{repo}/pulls",
+            "with no slug the template is left for gh to expand from cwd"
+        );
+    }
 }
+

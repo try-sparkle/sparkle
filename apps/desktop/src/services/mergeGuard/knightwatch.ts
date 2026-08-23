@@ -56,6 +56,25 @@ export function isKnightwatchRefusal(message: string): boolean {
 }
 
 /**
+ * Whether `message` is Rust's cross-agent base-branch refusal (bead sparkle-hvenv2): a `merge_pr`
+ * declined because the PR's base is a peer agent's in-flight branch, so merging would clobber it.
+ *
+ * Same heuristic discipline as {@link isKnightwatchRefusal}, and the same asymmetry: a false positive
+ * costs nothing (the merge was refused either way), a false negative only lets the concierge report it
+ * as `unknown-error` instead of a coded `foreign-base-branch`. The bead id is embedded in the refusal
+ * text deliberately as a stable marker, paired with the phrase for what it refuses over so an
+ * unrelated error that happens to name the bead cannot match.
+ */
+export function isBaseBranchRefusal(message: string): boolean {
+  const m = (message || "").toLowerCase();
+  // The bead id is embedded in the refusal deliberately as a stable marker; pairing it with the
+  // "Refusing merge_pr" opener (present in BOTH the single-owner and contested-base variants — the
+  // contested one says "a branch multiple agents are working", not "in-flight branch") means an
+  // unrelated note that merely mentions the bead cannot match.
+  return m.includes("sparkle-hvenv2") && m.includes("refusing merge_pr");
+}
+
+/**
  * The floor a written override has to clear before the UI will submit it, mirroring the Rust side's
  * own rule rather than replacing it.
  *

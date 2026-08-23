@@ -591,7 +591,7 @@ describe("merge_pr", () => {
     // a row that carries `headRefOid` and a merge that drops it look identical from here — the mock
     // resolves either way — while in production the dropped case merges whatever the branch points
     // at now. That is the `--match-head-commit` this PR exists to send.
-    expect(m.mergePr).toHaveBeenCalledWith("/repo", 7, undefined, HEAD_OID);
+    expect(m.mergePr).toHaveBeenCalledWith("/repo", "p1", 7, undefined, HEAD_OID);
   });
 
   it("sends the head the GATE READ, not one refetched after the gates ran", async () => {
@@ -607,7 +607,7 @@ describe("merge_pr", () => {
       return [];
     });
     expect(await mergePrTool({ root: "/repo", projectId: "p1", number: 7 })).toMatchObject({ ok: true });
-    expect(m.mergePr).toHaveBeenCalledWith("/repo", 7, undefined, "aaaa111");
+    expect(m.mergePr).toHaveBeenCalledWith("/repo", "p1", 7, undefined, "aaaa111");
   });
 
   it("merges UNGUARDED when the head is unknown — an absent oid must not become an empty flag", async () => {
@@ -620,7 +620,7 @@ describe("merge_pr", () => {
       m.fetchOpenPrs.mockResolvedValue([{ ...openPr, headRefOid: oid }]);
       m.mergePr.mockResolvedValue(undefined);
       expect(await mergePrTool({ root: "/repo", projectId: "p1", number: 7 })).toMatchObject({ ok: true });
-      expect(m.mergePr, JSON.stringify(oid)).toHaveBeenCalledWith("/repo", 7, undefined, oid);
+      expect(m.mergePr, JSON.stringify(oid)).toHaveBeenCalledWith("/repo", "p1", 7, undefined, oid);
     }
   });
 
@@ -795,7 +795,7 @@ describe("merge_pr honours roborev, not just CI", () => {
   it("MERGES when roborev is not in play on this machine — the gate is a no-op, not a deadlock", async () => {
     m.fetchRoborevProbe.mockResolvedValue({ enabled: false, jobs: null });
     expect(await mergePrTool({ root: "/repo", projectId: "p1", number: 806 })).toMatchObject({ ok: true });
-    expect(m.mergePr).toHaveBeenCalledWith("/repo", 806, undefined, openPr.headRefOid);
+    expect(m.mergePr).toHaveBeenCalledWith("/repo", "p1", 806, undefined, openPr.headRefOid);
   });
 
   it("MERGES when a closed FAIL is all that is left — roborev close is somebody's judgement", async () => {
@@ -947,7 +947,7 @@ describe("merge_pr and unanswered knightwatch probes", () => {
     expect(r).toMatchObject({ ok: true });
     // POSITIONALLY. A reason collected, validated and then dropped looks identical from here — the
     // merge succeeds either way in this mock — and in production Rust would refuse it forever.
-    expect(m.mergePr).toHaveBeenCalledWith("/repo", 1176, REASON, openPr.headRefOid);
+    expect(m.mergePr).toHaveBeenCalledWith("/repo", "p1", 1176, REASON, openPr.headRefOid);
   });
 
   it("trims the reason rather than recording the caller's whitespace on the PR", async () => {
@@ -957,7 +957,7 @@ describe("merge_pr and unanswered knightwatch probes", () => {
       number: 1176,
       knightwatchOverride: { reason: `  ${REASON}  ` },
     });
-    expect(m.mergePr).toHaveBeenCalledWith("/repo", 1176, REASON, openPr.headRefOid);
+    expect(m.mergePr).toHaveBeenCalledWith("/repo", "p1", 1176, REASON, openPr.headRefOid);
   });
 
   it("rejects a BOOLEAN override — a waiver has to say why", async () => {

@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import {
+  isBaseBranchRefusal,
   isKnightwatchRefusal,
   knightwatchReasonIssue,
   refusalLines,
@@ -217,5 +218,37 @@ describe("knightwatchReasonFor", () => {
   it("is undefined when no override was given at all", () => {
     expect(knightwatchReasonFor(1176)).toBeUndefined();
     expect(knightwatchReasonFor(1176, undefined)).toBeUndefined();
+  });
+});
+
+
+describe("isBaseBranchRefusal — the cross-agent base-branch clobber (bead sparkle-hvenv2)", () => {
+  // Shaped like Rust's `base_branch_refusal`, BOTH variants: the single named owner and the
+  // contested base (two agents), which does NOT say "in-flight branch". The exact wording is Rust's
+  // and is not asserted — only that this module recognises both by their stable markers.
+  const SINGLE_OWNER =
+    "Refusing merge_pr #42: its base `sparkle/agent-abc` is agent abc's in-flight branch, not " +
+    "the integration branch. Merging would move that branch's head ... (bead sparkle-hvenv2). " +
+    "Retarget this PR at `main` ... `gh pr edit 42 --base main` ...";
+  const CONTESTED =
+    "Refusing merge_pr #42: its base `shared/lane` is a branch multiple agents are working, not " +
+    "the integration branch. ... (bead sparkle-hvenv2). Retarget this PR at `main` ...";
+
+  it("recognises both refusal variants", () => {
+    expect(isBaseBranchRefusal(SINGLE_OWNER)).toBe(true);
+    expect(isBaseBranchRefusal(CONTESTED)).toBe(true);
+  });
+
+  it("does not match unrelated merge errors", () => {
+    for (const other of [
+      "Refused: PR #1176 still carries 1 unanswered knightwatch [blocking] probe.",
+      "merge failed: not mergeable, conflict in file.rs",
+      "Head branch was modified; expected match-head-commit",
+      // The bead id alone, without the "Refusing merge_pr" opener, must not match.
+      "some unrelated note mentioning sparkle-hvenv2 in passing",
+      "",
+    ]) {
+      expect(isBaseBranchRefusal(other), other).toBe(false);
+    }
   });
 });

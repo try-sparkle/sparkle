@@ -5698,6 +5698,107 @@ pub async fn pr_owner(
     .map_err(|e| format!("pr_owner task failed: {e}"))
 }
 
+/// Read a PR's base branch, head branch and body — everything the base-branch merge guard
+/// ([`base_branch_gate`]) resolves against. A failed probe yields `None`, which the guard reads as
+/// "cannot tell", NOT as a foreign base: it must never block the common, safe base=`main` merge on a
+/// transient `gh` failure.
+fn probe_pr_merge_facts(root: &str, number: u64) -> Option<(String, String, String)> {
+    let mut cmd = Command::new(crate::preflight::gh_program());
+    cmd.arg("pr")
+        .args(["view", &number.to_string(), "--json", "baseRefName,headRefName,body"])
+        .current_dir(root)
+        .env("GH_PROMPT_DISABLED", "1")
+        .env("GH_NO_UPDATE_NOTIFIER", "1");
+    apply_noninteractive(&mut cmd);
+    let output = output_with_timeout(cmd, NETWORK_TIMEOUT).ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let v: Value = serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).ok()?;
+    let field = |k: &str| v.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+    Some((field("baseRefName"), field("headRefName"), field("body")))
+}
+
+/// The refusal text for a `merge_pr` whose base is positively a peer agent's in-flight branch. A
+/// refusal is an instruction the reader will follow (AGENTS.md: a remedy must be safe under the same
+/// conditions that triggered it), so it offers ONLY the reachable remedy — retargeting the PR at the
+/// integration branch — and never an override that no merge surface can currently supply (roborev
+/// 68245): merging onto a DIFFERENT agent's branch has no legitimate in-app path to enable.
+fn base_branch_refusal(
+    number: u64,
+    base_ref: &str,
+    default_branch: &str,
+    base_owner: Option<&str>,
+) -> String {
+    let whose = match base_owner {
+        Some(a) => format!("agent {a}'s in-flight branch"),
+        // A CONTESTED base: two agents have been seen on it, so no single owner is nameable.
+        None => "a branch multiple agents are working".to_string(),
+    };
+    format!(
+        "Refusing merge_pr #{number}: its base `{base_ref}` is {whose}, not the integration branch. \
+         Merging would move that branch's head with no signal to whoever is working it, and their next \
+         `git push --force-with-lease` after a rebase would silently discard your merge (bead \
+         sparkle-hvenv2). Retarget this PR at `{default_branch}` and merge that instead: \
+         `gh pr edit {number} --base {default_branch}` (its checks re-run against the new base)."
+    )
+}
+
+/// PURE core of [`base_branch_gate`], extracted so the gate's DECISION — not merely the classifier —
+/// is unit-testable without spawning `gh` (roborev 68245 asked for exactly this). `facts` is the PR's
+/// `(base_ref, head_ref, body)`, or `None` when the `gh` probe failed — which reads as the safe
+/// integration case, so a probe hiccup never blocks the common base=`main` merge.
+fn base_branch_verdict(
+    store: &crate::pr_owner::PrOwnerStore,
+    project_id: &str,
+    default_branch: &str,
+    facts: Option<(&str, &str, &str)>,
+) -> crate::pr_owner::MergeBaseVerdict {
+    let Some((base_ref, head_ref, body)) = facts else {
+        return crate::pr_owner::MergeBaseVerdict::IntegrationBranch;
+    };
+    // Everything is scoped to THIS PR's project (roborev 68273): a same-named branch in another
+    // registered repo is a different branch, not shared work. Head owner: the PR body marker is
+    // first-hand (it records the true opening agent AND its project), used only when its project
+    // matches; otherwise this project's branch table.
+    let head_owner = crate::pr_owner::parse_pr_body_marker(body)
+        .filter(|(_agent, proj)| proj == project_id)
+        .map(|(agent, _proj)| agent)
+        .or_else(|| crate::pr_owner::branch_owner_in_project(store, project_id, head_ref));
+    // The base needs the THREE-valued view: a branch two of THIS project's agents are on is
+    // Contested, not Unknown, so the guard does not fail open on its own headline clobber (68270).
+    let base_ownership = crate::pr_owner::resolve_base_branch_ownership(store, project_id, base_ref);
+    crate::pr_owner::classify_merge_base(default_branch, base_ref, head_owner.as_deref(), &base_ownership)
+}
+
+/// **THE CROSS-AGENT MERGE-CLOBBER BACKSTOP** (bead sparkle-hvenv2). Refuse a `merge_pr` whose BASE
+/// is positively a peer agent's in-flight branch.
+///
+/// Called as a statement with `?` in [`merge_pr`], BEFORE anything irreversible, so — like
+/// [`merge_policy_gate`] and [`crate::knightwatch::enforce`] — it covers every one of the in-app
+/// merge sinks at once (the three UI buttons, the concierge tool, the approval-resume path, MCP).
+///
+/// **ONLY POSITIVE EVIDENCE REFUSES.** The integration branch, a same-owner stack, a non-default base
+/// that no agent is known to own (a project's own `develop`/`release/x`, or a descriptive branch), and
+/// a PR whose facts `gh` could not read all PASS — so neither a `gh` hiccup nor an ordinary non-agent
+/// PR is blocked. Only a base POSITIVELY owned by an agent that is not the head's own is refused.
+fn base_branch_gate(app_data: &Path, project_id: &str, root: &str, number: u64) -> Result<(), String> {
+    let default_branch = resolve_default_branch(root);
+    let facts = probe_pr_merge_facts(root, number);
+    let store = crate::pr_owner::load_store(app_data);
+    let facts_ref = facts.as_ref().map(|(b, h, y)| (b.as_str(), h.as_str(), y.as_str()));
+    match base_branch_verdict(&store, project_id, &default_branch, facts_ref) {
+        crate::pr_owner::MergeBaseVerdict::IntegrationBranch
+        | crate::pr_owner::MergeBaseVerdict::SameOwnerStack
+        | crate::pr_owner::MergeBaseVerdict::UnownedBase => Ok(()),
+        crate::pr_owner::MergeBaseVerdict::ForeignInflightBase { base_owner } => {
+            // ForeignInflightBase only arises when `facts` was `Some`, so the base ref is present.
+            let base_ref = facts.as_ref().map(|(b, _, _)| b.as_str()).unwrap_or_default();
+            Err(base_branch_refusal(number, base_ref, &default_branch, base_owner.as_deref()))
+        }
+    }
+}
+
 /// Wall-clock ceiling for a user-initiated `gh pr merge`. Longer than `NETWORK_TIMEOUT`: a merge does
 /// more server-side work than a read, and this path is one deliberate click (not a background poll),
 /// so a slightly longer wait is acceptable where a stalled poll would not be.
@@ -5756,25 +5857,36 @@ fn merge_argv(number: u64, expected_head_oid: Option<&str>) -> Vec<String> {
 /// the merge runs) is the way past it. `[open]` probes only warn — see the `knightwatch` module
 /// header for where that warning goes.
 ///
-/// FROM TYPESCRIPT: `invoke("merge_pr", { root, number, knightwatchOverride })`. Both halves of that
-/// were verified against the vendored crates rather than assumed. `tauri-macros` 2.6.3 derives the
-/// JS key with `to_lower_camel_case()` by default (`command/wrapper.rs:507`), so `knightwatchOverride`
-/// is the key this parameter is read from; and `tauri` 2.11.3's `CommandItem::deserialize_option`
-/// (`ipc/command.rs:134`) calls `visit_none()` when the key is ABSENT, so the existing caller —
-/// `invoke("merge_pr", { root, number })` in `services/openPrs.ts` — keeps working and arrives here
-/// as `None`. Adding the parameter is not a breaking change for callers that ignore it.
+/// GATED ON THE MERGE BASE. Also here (bead sparkle-hvenv2): [`base_branch_gate`] refuses a merge
+/// whose BASE is positively a peer agent's in-flight branch, since merging moves that branch's head
+/// out from under its owner with no signal, and their next force-push silently discards the merge.
+/// The only remedy is to retarget the PR at the integration branch; there is no in-app override.
+///
+/// FROM TYPESCRIPT: `invoke("merge_pr", { root, projectId, number, knightwatchOverride })`. Verified
+/// against the vendored crates rather than assumed. `tauri-macros` 2.6.3 derives the JS key with
+/// `to_lower_camel_case()` (`command/wrapper.rs:507`), so `projectId`/`knightwatchOverride` are the
+/// keys read; and `tauri` 2.11.3's `CommandItem::deserialize_option` (`ipc/command.rs:134`) calls
+/// `visit_none()` when a key is ABSENT, so `knightwatch_override`/`expected_head_oid` stay optional.
+/// `project_id` is REQUIRED — it scopes the base-branch ownership lookup to this PR's own repo, so a
+/// same-named branch in another registered project cannot be misread as shared work (roborev 68273).
+/// `app: AppHandle` is injected by tauri, never sent from JS.
 #[tauri::command]
 pub async fn merge_pr(
+    app: AppHandle,
     root: String,
+    project_id: String,
     number: u64,
     knightwatch_override: Option<String>,
     expected_head_oid: Option<String>,
 ) -> Result<(), String> {
+    let app_data = app_data_dir(&app)?;
     tauri::async_runtime::spawn_blocking(move || {
         // BEFORE the merge, and returning `Err` on refusal: the merge is the irreversible half.
         // The policy backstop runs FIRST — a repo we will never merge in is a cheaper, more
         // definitive refusal than a review-coverage question about a PR in it.
         merge_policy_gate(&root, "merge_pr")?;
+        // Then WHERE the merge would land: never onto a peer agent's in-flight branch (sparkle-hvenv2).
+        base_branch_gate(&app_data, &project_id, &root, number)?;
         crate::knightwatch::enforce(&root, number, knightwatch_override.as_deref())?;
         let mut cmd = Command::new(crate::preflight::gh_program());
         cmd.args(merge_argv(number, expected_head_oid.as_deref()))
@@ -20928,6 +21040,105 @@ mod merge_policy_tests {
         assert!(
             body[..merge].lines().any(|l| l.trim() == CALL),
             "merge_pr must call merge_policy_gate as a STATEMENT, with `?`, BEFORE `gh pr merge`"
+        );
+    }
+
+    /// The gate's DECISION (not merely the pure classifier) — driven directly, per roborev 68245,
+    /// which flagged that only the classifier and a structural pin were covered. `base_branch_verdict`
+    /// is the composition the gate runs: probe facts + ownership store → verdict.
+
+    #[test]
+    fn base_branch_verdict_allows_when_the_gh_probe_failed() {
+        // A `gh` hiccup (facts == None) must read as the safe integration case, never a refusal.
+        let store = crate::pr_owner::PrOwnerStore::default();
+        assert_eq!(
+            base_branch_verdict(&store, "p1", "main", None),
+            crate::pr_owner::MergeBaseVerdict::IntegrationBranch
+        );
+    }
+
+    #[test]
+    fn base_branch_verdict_refuses_a_merge_onto_a_peer_agents_minted_branch() {
+        // THE BEAD: base is agent-a's minted branch, head is agent-b's — both resolved by the
+        // `sparkle/agent-<id>` convention with no store or body marker needed.
+        let store = crate::pr_owner::PrOwnerStore::default();
+        let facts = Some((
+            "sparkle/agent-aaaaaaaa-0000-0000-0000-000000000001",
+            "sparkle/agent-bbbbbbbb-0000-0000-0000-000000000002",
+            "",
+        ));
+        assert_eq!(
+            base_branch_verdict(&store, "p1", "main", facts),
+            crate::pr_owner::MergeBaseVerdict::ForeignInflightBase {
+                base_owner: Some("aaaaaaaa-0000-0000-0000-000000000001".into())
+            }
+        );
+    }
+
+    #[test]
+    fn base_branch_verdict_allows_an_ordinary_non_agent_base() {
+        // roborev 68245: a PR targeting a project's own integration lane is nobody's in-flight
+        // branch and must merge. Before the fix this over-refused every non-`main` base.
+        let store = crate::pr_owner::PrOwnerStore::default();
+        let facts = Some(("develop", "sparkle/agent-bbbbbbbb-0000-0000-0000-000000000002", ""));
+        assert_eq!(
+            base_branch_verdict(&store, "p1", "main", facts),
+            crate::pr_owner::MergeBaseVerdict::UnownedBase
+        );
+    }
+
+    #[test]
+    fn base_branch_verdict_refuses_a_contested_base_two_agents_are_on() {
+        // roborev 68270: the app can hand two agents the same branch name, latching it `ambiguous`.
+        // A PR based on that shared branch must be refused — merging clobbers whichever agent is not
+        // the merger — and no single owner is nameable, so the refusal carries `None`.
+        let mut store = crate::pr_owner::PrOwnerStore::default();
+        assert!(crate::pr_owner::record_branch(&mut store, "p1", "shared/lane", "agent-a", 1));
+        // Second agent on the same branch latches it ambiguous (returns true = store changed).
+        assert!(crate::pr_owner::record_branch(&mut store, "p1", "shared/lane", "agent-b", 2));
+        let facts = Some(("shared/lane", "sparkle/agent-cccccccc-0000-0000-0000-000000000003", ""));
+        assert_eq!(
+            base_branch_verdict(&store, "p1", "main", facts),
+            crate::pr_owner::MergeBaseVerdict::ForeignInflightBase { base_owner: None }
+        );
+    }
+
+    #[test]
+    fn base_branch_verdict_reads_the_body_marker_for_a_same_owner_stack() {
+        // A PR opened by raw `gh pr create` carries no minted head branch, so the head owner comes
+        // from the body marker. Base recorded under the same agent → an allowed stack, not a clobber.
+        let mut store = crate::pr_owner::PrOwnerStore::default();
+        assert!(crate::pr_owner::record_branch(&mut store, "p1", "feature/part-1", "agent-a", 1));
+        let body = crate::pr_owner::pr_body_marker("agent-a", "p1");
+        let facts = Some(("feature/part-1", "feature/part-2", body.as_str()));
+        assert_eq!(
+            base_branch_verdict(&store, "p1", "main", facts),
+            crate::pr_owner::MergeBaseVerdict::SameOwnerStack
+        );
+        // Flip the head owner to a DIFFERENT agent via the marker: now it is the clobber.
+        let body_b = crate::pr_owner::pr_body_marker("agent-b", "p1");
+        let facts_b = Some(("feature/part-1", "feature/part-2", body_b.as_str()));
+        assert_eq!(
+            base_branch_verdict(&store, "p1", "main", facts_b),
+            crate::pr_owner::MergeBaseVerdict::ForeignInflightBase { base_owner: Some("agent-a".into()) }
+        );
+    }
+
+    /// The cross-agent merge-clobber guard (bead sparkle-hvenv2) is only worth anything if it
+    /// actually RUNS before the merge. Same body-scoped whole-line technique as the policy-gate pin:
+    /// a substring test would pass for `let _ = base_branch_gate(…);` (which swallows the refusal) or
+    /// a commented-out call.
+    #[test]
+    fn merge_pr_actually_runs_the_base_branch_gate() {
+        const CALL: &str = "base_branch_gate(&app_data, &project_id, &root, number)?;";
+        let src = include_str!("worktree.rs");
+        let start = src.find("pub async fn merge_pr(").expect("merge_pr's signature");
+        let body = &src[start..];
+        // `merge_argv(number,` is the irreversible-half landmark, so this proves "before the merge".
+        let merge = body.find("merge_argv(number,").expect("the merge argv");
+        assert!(
+            body[..merge].lines().any(|l| l.trim() == CALL),
+            "merge_pr must call base_branch_gate as a STATEMENT, with `?`, BEFORE `gh pr merge`"
         );
     }
 

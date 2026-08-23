@@ -161,10 +161,11 @@ export function fetchPrOwner(
  * past it. It is not a boolean and not a flag: Rust records the sentence ON THE PULL REQUEST and
  * validates that it costs one, so an override is always attributable to whoever wrote it.
  *
- * OMITTED, NOT `undefined`, when absent. The Rust parameter is an `Option<String>`, so either would
- * decode — but every existing caller and test asserts the exact payload `{ root, number }`, and a
- * key that materialises on every merge is a change to the wire for no gain. Passing a reason is the
- * exceptional path and it looks like one.
+ * `projectId` is REQUIRED and always sent: Rust scopes the base-branch ownership lookup to this PR's
+ * own repo with it, so a same-named branch in another registered project cannot be misread as shared
+ * work (bead sparkle-hvenv2 / roborev 68273). `knightwatchOverride` is OMITTED, NOT `undefined`, when
+ * absent — the Rust parameter is an `Option<String>`, and a key that materialises on every merge is a
+ * change to the wire for no gain. Passing a reason is the exceptional path and it looks like one.
  *
  * `expectedHeadOid` is the head commit THIS merge decision was made against — the polled row's
  * `headRefOid`, i.e. the sha the checks-green/mergeable gate read. Rust turns it into
@@ -178,12 +179,14 @@ export function fetchPrOwner(
  */
 export async function mergePr(
   root: string,
+  projectId: string,
   number: number,
   knightwatchOverride?: string,
   expectedHeadOid?: string,
 ): Promise<void> {
   await invoke("merge_pr", {
     root,
+    projectId,
     number,
     ...(knightwatchOverride === undefined ? {} : { knightwatchOverride }),
     ...(expectedHeadOid ? { expectedHeadOid } : {}),

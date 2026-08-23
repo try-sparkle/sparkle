@@ -183,6 +183,7 @@ describe("OpenPrMenu", () => {
     await waitFor(() =>
       expect(h.invoke).toHaveBeenCalledWith("merge_pr", {
         root: "/repo",
+        projectId: "p1",
         number: 1,
       }),
     );
@@ -198,12 +199,14 @@ describe("OpenPrMenu", () => {
     await waitFor(() =>
       expect(h.invoke).toHaveBeenCalledWith("merge_pr", {
         root: "/repo",
+        projectId: "p1",
         number: 1,
       }),
     );
     // The failing PR (#2) must never be merged by "merge all".
     expect(h.invoke).not.toHaveBeenCalledWith("merge_pr", {
       root: "/repo",
+      projectId: "p1",
       number: 2,
     });
   });
@@ -2026,13 +2029,13 @@ describe("OpenPrMenu — fleet-wide, grouped by project tab", () => {
     const siteRow = rows[1]!;
     fireEvent.click(within(siteRow).getByTestId("merge-12"));
     await waitFor(() => expect(mergeCalls()).toHaveLength(1));
-    expect(mergeCalls()[0]).toEqual({ root: "/code/site", number: 12 });
+    expect(mergeCalls()[0]).toEqual({ root: "/code/site", projectId: "p2", number: 12 });
 
     // …and the first #12 goes to the other repo, not to whichever one happened to be "current".
     const sparkleRow = rows[0]!;
     fireEvent.click(within(sparkleRow).getByTestId("merge-12"));
     await waitFor(() => expect(mergeCalls()).toHaveLength(2));
-    expect(mergeCalls()[1]).toEqual({ root: "/code/sparkle", number: 12 });
+    expect(mergeCalls()[1]).toEqual({ root: "/code/sparkle", projectId: "p1", number: 12 });
   });
 
   it("scopes 'Merge all ready' to ITS OWN GROUP — never across repositories", async () => {
@@ -2791,6 +2794,7 @@ describe("OpenPrMenu — unanswered knightwatch probes", () => {
     // and dropped looks identical on screen and leaves the gate refusing forever.
     expect(mergeCalls()[1]).toEqual({
       root: "/repo",
+      projectId: "p1",
       number: 1176,
       knightwatchOverride: REASON,
     });

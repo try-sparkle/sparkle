@@ -80,7 +80,7 @@ import {
   summarizeRoborev,
 } from "../mergeGuard/roborev";
 import { fetchPrClaims, findClaim, viewClaim } from "../mergeGuard/prClaims";
-import { isKnightwatchRefusal, knightwatchReasonIssue } from "../mergeGuard/knightwatch";
+import { isBaseBranchRefusal, isKnightwatchRefusal, knightwatchReasonIssue } from "../mergeGuard/knightwatch";
 import type {
   KnightwatchOverride,
   PrClaimView,
@@ -357,6 +357,10 @@ export type WorkflowFailureCode =
   // rows and re-gates against the NEW head. Uncoded it reads as a tool error, which is the one
   // thing it is not.
   | "head-moved"
+  // The PR's base is a peer agent's in-flight branch, so merging would move it out from under its
+  // owner (bead sparkle-hvenv2). DISTINCT from head-moved: retrying is futile — the base does not
+  // change on its own — and the remedy is to retarget the PR at the integration branch.
+  | "foreign-base-branch"
   | "gh-unavailable" // the gh CLI is missing or unusable
   | "auth-failed" // credentials expired / rejected
   | "rejected-non-fast-forward"
@@ -1101,7 +1105,7 @@ export async function mergePrTool(
     // that loses work: a commit pushed while the merge settles is simply absent from the default
     // branch afterwards and NOTHING looks wrong — the PR reads MERGED and the branch is back,
     // recreated by the push. Absent or empty merges unguarded, exactly as before.
-    await mergePr(root, req.number, knightwatch?.reason, pr.headRefOid);
+    await mergePr(root, req.projectId, req.number, knightwatch?.reason, pr.headRefOid);
     return ok(op, { number: req.number, method: "merge", url: pr.url });
   } catch (e) {
     const msg = errText(e);
@@ -1110,6 +1114,12 @@ export async function mergePrTool(
     // `unknown-error` with Rust's prose and no code, which is a message a model retries verbatim.
     if (isKnightwatchRefusal(msg))
       return refused(op, "knightwatch-unanswered", knightwatchRefusalMessage(req.number, msg));
+    // A REFUSAL too (bead sparkle-hvenv2): the base is a peer agent's in-flight branch, so the merge
+    // would clobber it. Nothing merged, and — unlike head-moved — retrying is futile: the base does
+    // not change on its own. It gets a code so the concierge does not loop on `unknown-error` (the
+    // "message a model retries verbatim" the comment above names). The remedy is in Rust's prose:
+    // retarget the PR at the integration branch. There is no override to offer, by design.
+    if (isBaseBranchRefusal(msg)) return refused(op, "foreign-base-branch", msg);
     // ALSO A REFUSAL, for the same reason and one more. GitHub evaluates `--match-head-commit`
     // BEFORE it merges anything, so a moved head means the repo did not move either — reporting it
     // as `failed` would tell the model an operation half-happened when none of it did. And it is

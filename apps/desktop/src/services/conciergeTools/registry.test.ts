@@ -652,7 +652,7 @@ describe("dispatchConciergeTool — normalization", () => {
     // The FOURTH argument is the polled head the merge decision was gated on, forwarded for the
     // same reason and equally invisible from the result: dropped, the merge lands at whatever the
     // branch points at when `gh` runs rather than the sha this dispatch approved.
-    expect(mergePrMock).toHaveBeenCalledWith("/repos/app", 7, reason, HEAD_OID);
+    expect(mergePrMock).toHaveBeenCalledWith("/repos/app", projectId, 7, reason, HEAD_OID);
   });
 
   it("workflow: a malformed knightwatchOverride is refused by the DOMAIN, not by the schema", async () => {

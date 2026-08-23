@@ -1435,6 +1435,7 @@ export function OpenPrMenu({
         // batch WITH an override. A batch and a single-row merge take this same line.
         await mergePr(
           scope.rootPath,
+          scope.projectId,
           n,
           knightwatchReasonFor(n, override),
           headOidOf(n),

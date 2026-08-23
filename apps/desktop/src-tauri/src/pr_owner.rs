@@ -575,6 +575,142 @@ pub fn answer_for(
     }
 }
 
+// ── merge-base safety (bead sparkle-hvenv2) ───────────────────────────────────────────────────
+
+/// The safety verdict for the BASE branch a `gh pr merge` would land on.
+///
+/// A merge moves the PR's BASE branch. The sanctioned target is the repo's integration branch
+/// (`main`), whose whole job is to receive merges. Any OTHER base is a topic branch — and merging a
+/// PR onto a topic branch that a DIFFERENT agent is actively working moves that agent's branch head
+/// with no signal to them; a routine post-rebase `git push --force-with-lease` on their side then
+/// silently discards the merge (bead `sparkle-hvenv2`, and the same class as `sparkle-80ek3u`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MergeBaseVerdict {
+    /// Base is the repo's default integration branch — the sanctioned target. Always safe.
+    IntegrationBranch,
+    /// Base is a topic branch, but the SAME agent owns both it and the head — a deliberate stack.
+    SameOwnerStack,
+    /// Base is a non-default branch that NO agent is positively known to own — a project's own
+    /// integration lane (`develop`, `release/x`), or a descriptive branch never observed under any
+    /// agent. There is no positive evidence it is anyone's in-flight work, so it is NOT refused: the
+    /// guard exists to stop a cross-agent clobber, not to forbid every non-`main` base.
+    UnownedBase,
+    /// Base is POSITIVELY an agent's in-flight branch AND not confirmed to be the PR head's own.
+    /// Merging it moves that branch's head with no signal to its owner; refuse. `base_owner` names
+    /// the single owner when there is one, and is `None` for a CONTESTED base — one two agents have
+    /// been seen on, so no single owner is nameable but the shared-branch evidence is the strongest
+    /// there is (roborev 68270 / 65183).
+    ForeignInflightBase { base_owner: Option<String> },
+}
+
+/// What is known about who owns a branch, for the merge guard's base-branch decision. Three-valued
+/// because the guard must tell "no evidence at all" (a human integration lane → allow) apart from
+/// "positively an agent branch whose owner is not nameable" (ambiguous/disputed → refuse). Collapsing
+/// the latter to the former is exactly the fail-open roborev 68270 caught, and the same collapse
+/// `claim_then_observe` refuses to make (roborev 65183).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BaseBranchOwnership {
+    /// No row in any project, and not a minted `sparkle/agent-<id>` name. Nothing marks it as an
+    /// agent's in-flight branch.
+    Unknown,
+    /// Exactly one agent positively owns it — a minted name, or one unambiguous store row.
+    Owned(String),
+    /// Positively a SHARED in-flight branch, but no single owner is nameable: the PR's own project has
+    /// latched this branch `ambiguous` (two of its agents seen on it). The STRONGEST evidence of a
+    /// shared branch, and the guard's own headline clobber — never treat it as unknown.
+    Contested,
+}
+
+/// Resolve who owns `branch` for the merge guard, SCOPED to `project_id` — the project the PR being
+/// merged lives in.
+///
+/// Scoping is not optional (roborev 68273): `store.branches` is keyed `projectId → branch → owner`,
+/// so distinct project ids are distinct registered REPOS. Two rows under the same branch *name* in
+/// different projects are two independent branches in two different repos — a pure name collision, not
+/// a shared branch. A cross-project scan would fold that collision into `Contested` and permanently
+/// refuse a legitimate same-owner stack the moment any other repo had a same-named branch.
+///
+/// Signals, strongest first: the minted `sparkle/agent-<id>` convention (globally unique, so it needs
+/// no project), then THIS project's branch table. An `ambiguous` row is `Contested` (two of this
+/// repo's agents on one branch — real shared-branch evidence, roborev 68270/65183). A single
+/// unambiguous row is `Owned`. No row for this branch in this project (and no minted name) is
+/// `Unknown` — a `develop`/`release/x` lane, or a descriptive branch nobody here has been seen on.
+pub fn resolve_base_branch_ownership(
+    store: &PrOwnerStore,
+    project_id: &str,
+    branch: &str,
+) -> BaseBranchOwnership {
+    if let Some(id) = agent_id_from_branch(branch) {
+        return BaseBranchOwnership::Owned(id);
+    }
+    match store.branches.get(project_id).and_then(|m| m.get(branch)) {
+        // A latched-ambiguous row names no single current owner but IS positive evidence of a shared
+        // branch. Reading it as Unknown would erase the only refusal this design has (roborev 65183).
+        Some(o) if o.ambiguous => BaseBranchOwnership::Contested,
+        Some(o) if is_agent_id(&o.agent_id) => BaseBranchOwnership::Owned(o.agent_id.clone()),
+        // No row for this branch in this project, or a corrupt row — no positive evidence.
+        _ => BaseBranchOwnership::Unknown,
+    }
+}
+
+/// Decide, PURELY from the branch names, the head owner, and the base's resolved ownership, whether
+/// merging a PR onto `base_ref` is safe.
+///
+/// **ONLY POSITIVE EVIDENCE REFUSES** (the doctrine `base_branch_gate` documents, and the fix for
+/// roborev 68245): a non-default base with NO ownership row is `UnownedBase`, not a refusal — an
+/// ordinary PR targeting `develop`/`release/x`, or a descriptive stacked branch, must still merge. A
+/// refusal requires the base to be POSITIVELY an agent's in-flight branch — `Owned` by an agent that
+/// is not the head's own, or `Contested` (two agents on it, which is refused unconditionally, since
+/// merging clobbers whichever of them is not the merger, roborev 68270).
+///
+/// `default_branch` is the repo's integration branch. An EMPTY `base_ref` is the integration case: a
+/// `baseRefName` we could not read must never block the common, safe base=main merge.
+pub fn classify_merge_base(
+    default_branch: &str,
+    base_ref: &str,
+    head_owner: Option<&str>,
+    base_ownership: &BaseBranchOwnership,
+) -> MergeBaseVerdict {
+    let base = base_ref.trim();
+    if base.is_empty() || base == default_branch.trim() {
+        return MergeBaseVerdict::IntegrationBranch;
+    }
+    match base_ownership {
+        // No positive evidence the base is an agent's in-flight branch → do not refuse.
+        BaseBranchOwnership::Unknown => MergeBaseVerdict::UnownedBase,
+        // Two agents on the base: refuse regardless of the head, since merging clobbers the other one.
+        BaseBranchOwnership::Contested => MergeBaseVerdict::ForeignInflightBase { base_owner: None },
+        // Base positively owned, and confirmed to be the head's OWN agent — a deliberate stack.
+        BaseBranchOwnership::Owned(b) if !b.is_empty() && head_owner == Some(b.as_str()) => {
+            MergeBaseVerdict::SameOwnerStack
+        }
+        // Base positively owned by an agent NOT confirmed to be the head's — the cross-agent clobber.
+        BaseBranchOwnership::Owned(b) => {
+            MergeBaseVerdict::ForeignInflightBase { base_owner: Some(b.clone()) }
+        }
+    }
+}
+
+/// The single owner of `branch` in `project_id`, for the PR HEAD (see [`resolve_base_branch_ownership`]
+/// for the three-valued view the BASE needs). Project-scoped for the same reason (roborev 68273):
+/// a same-named branch in a different repo is a different branch.
+///
+/// Signals: the minted `sparkle/agent-<id>` convention (globally unique), then one unambiguous row in
+/// THIS project. An `ambiguous`/absent/corrupt row yields `None` — harmless for the head, since it
+/// only means "cannot confirm the head is the base's owner", so a stack is not asserted and the base
+/// decides the verdict.
+pub fn branch_owner_in_project(store: &PrOwnerStore, project_id: &str, branch: &str) -> Option<String> {
+    if let Some(id) = agent_id_from_branch(branch) {
+        return Some(id);
+    }
+    store
+        .branches
+        .get(project_id)
+        .and_then(|m| m.get(branch))
+        .filter(|o| !o.ambiguous && is_agent_id(&o.agent_id))
+        .map(|o| o.agent_id.clone())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -810,6 +946,193 @@ mod tests {
         // …and is still writable afterwards, so one bad write doesn't wedge ownership forever.
         record_pr_created(d.path(), "p1", 1, "a", "b").unwrap();
         assert_eq!(resolve_owner(&load_store(d.path()), "p1", 1, "b", "").unwrap().agent_id, "a");
+    }
+
+    // ── merge-base safety (bead sparkle-hvenv2) ──────────────────────────────────────────────
+
+    // Shorthands for the base-ownership arg classify_merge_base now takes.
+    fn owned(a: &str) -> BaseBranchOwnership {
+        BaseBranchOwnership::Owned(a.to_string())
+    }
+
+    #[test]
+    fn merging_onto_the_default_branch_is_always_the_integration_case() {
+        // The sanctioned target, allowed regardless of who owns the head.
+        assert_eq!(
+            classify_merge_base("main", "main", Some("agent-a"), &BaseBranchOwnership::Unknown),
+            MergeBaseVerdict::IntegrationBranch
+        );
+        // An empty base (a gh field we could not read) must NOT be treated as a topic branch —
+        // otherwise a probe hiccup would block every safe merge. Even a Contested ownership does not
+        // matter once the base ref is empty/default.
+        assert_eq!(
+            classify_merge_base("main", "", Some("agent-a"), &BaseBranchOwnership::Contested),
+            MergeBaseVerdict::IntegrationBranch
+        );
+        // Whitespace/casing of the default is tolerated on the base side.
+        assert_eq!(
+            classify_merge_base("main", "  main  ", None, &BaseBranchOwnership::Unknown),
+            MergeBaseVerdict::IntegrationBranch
+        );
+    }
+
+    #[test]
+    fn merging_onto_a_different_agents_branch_is_a_foreign_inflight_base() {
+        // THE HEADLINE CASE: agent-b's PR based on agent-a's in-flight branch. This is the exact
+        // clobber the guard exists to refuse — base POSITIVELY owned by a different agent.
+        assert_eq!(
+            classify_merge_base(
+                "main",
+                "sparkle/agent-aaaaaaaa-0000-0000-0000-000000000001",
+                Some("bbbbbbbb-0000-0000-0000-000000000002"),
+                &owned("aaaaaaaa-0000-0000-0000-000000000001"),
+            ),
+            MergeBaseVerdict::ForeignInflightBase {
+                base_owner: Some("aaaaaaaa-0000-0000-0000-000000000001".into())
+            }
+        );
+        // The bead's raw-`gh pr create` variant: the head owner could not be resolved (no body
+        // marker, descriptive head branch), but the base is POSITIVELY agent-a's. An unknown head is
+        // NOT confirmed to be agent-a, so this is still the clobber and must be refused.
+        assert_eq!(
+            classify_merge_base("main", "feature/x", None, &owned("agent-a")),
+            MergeBaseVerdict::ForeignInflightBase { base_owner: Some("agent-a".into()) }
+        );
+    }
+
+    #[test]
+    fn merging_onto_a_contested_base_is_refused_regardless_of_the_head() {
+        // roborev 68270: a base two agents have been seen on is the STRONGEST clobber evidence, and
+        // must be refused even when the head is one of them — merging clobbers the OTHER agent. No
+        // single owner is nameable, so the refusal carries `None`.
+        assert_eq!(
+            classify_merge_base("main", "shared/lane", Some("agent-a"), &BaseBranchOwnership::Contested),
+            MergeBaseVerdict::ForeignInflightBase { base_owner: None }
+        );
+        assert_eq!(
+            classify_merge_base("main", "shared/lane", None, &BaseBranchOwnership::Contested),
+            MergeBaseVerdict::ForeignInflightBase { base_owner: None }
+        );
+    }
+
+    #[test]
+    fn a_non_default_base_that_no_agent_owns_is_not_refused() {
+        // roborev 68245: only POSITIVE evidence refuses. An ordinary PR targeting a project's own
+        // integration lane, or a descriptive branch never observed under any agent, resolves to no
+        // ownership row and must NOT be refused — the guard forbids a cross-agent clobber, not every
+        // non-`main` base.
+        assert_eq!(
+            classify_merge_base("main", "develop", Some("agent-b"), &BaseBranchOwnership::Unknown),
+            MergeBaseVerdict::UnownedBase
+        );
+        assert_eq!(
+            classify_merge_base("main", "release/1.2", None, &BaseBranchOwnership::Unknown),
+            MergeBaseVerdict::UnownedBase
+        );
+    }
+
+    #[test]
+    fn the_same_agent_stacking_onto_its_own_topic_branch_is_allowed() {
+        // A deliberate stack — one agent basing a follow-up PR on its own earlier branch, both sides
+        // positively owned by that agent — moves only its own branch, so it is not the cross-agent
+        // clobber and must not be refused.
+        assert_eq!(
+            classify_merge_base("main", "feature/part-1", Some("agent-a"), &owned("agent-a")),
+            MergeBaseVerdict::SameOwnerStack
+        );
+        // An empty owner id is not a real owner and cannot form a stack.
+        assert_eq!(
+            classify_merge_base("main", "feature/part-1", Some(""), &owned("")),
+            MergeBaseVerdict::ForeignInflightBase { base_owner: Some("".into()) }
+        );
+    }
+
+    #[test]
+    fn resolve_base_branch_ownership_tells_unknown_owned_and_contested_apart() {
+        // Minted name → Owned by convention, no store needed (globally unique, project irrelevant).
+        assert_eq!(
+            resolve_base_branch_ownership(
+                &PrOwnerStore::default(),
+                "p1",
+                "sparkle/agent-9e48bf5c-02fb-499b-9bc7-d24034577799"
+            ),
+            owned("9e48bf5c-02fb-499b-9bc7-d24034577799")
+        );
+        // No row in this project, not minted → Unknown (the develop/release case).
+        assert_eq!(
+            resolve_base_branch_ownership(&PrOwnerStore::default(), "p1", "develop"),
+            BaseBranchOwnership::Unknown
+        );
+        // One unambiguous row in this project → Owned.
+        let d = tmp();
+        observe_branch(d.path(), "p1", "sparkle/left-pair", "agent-cockpit").unwrap();
+        assert_eq!(
+            resolve_base_branch_ownership(&load_store(d.path()), "p1", "sparkle/left-pair"),
+            owned("agent-cockpit")
+        );
+        // Two agents on ONE branch in one project → ambiguous → Contested, NOT Unknown (roborev
+        // 68270): this is the guard's headline clobber and must never fail open.
+        let d2 = tmp();
+        observe_branch(d2.path(), "p1", "shared", "agent-a").unwrap();
+        observe_branch(d2.path(), "p1", "shared", "agent-b").unwrap();
+        assert_eq!(
+            resolve_base_branch_ownership(&load_store(d2.path()), "p1", "shared"),
+            BaseBranchOwnership::Contested
+        );
+    }
+
+    #[test]
+    fn a_same_named_branch_in_another_project_is_a_different_branch_not_a_clobber() {
+        // roborev 68273: `store.branches` is keyed by projectId, so two rows under one branch NAME in
+        // two projects are two branches in two repos — a name collision, not a shared branch. Scoping
+        // to the PR's own project is what keeps a legitimate same-owner stack mergeable when some
+        // other repo happens to have a same-named branch. This test pins the CAPABILITY (the stack
+        // stays allowed), not the old defect (which folded the collision into Contested).
+        let d = tmp();
+        observe_branch(d.path(), "p1", "feature/auth", "agent-a").unwrap();
+        observe_branch(d.path(), "p2", "feature/auth", "agent-b").unwrap();
+        let store = load_store(d.path());
+        // For a p1 PR the base is p1's `feature/auth`, owned by agent-a — NOT contested.
+        assert_eq!(
+            resolve_base_branch_ownership(&store, "p1", "feature/auth"),
+            owned("agent-a")
+        );
+        // p1's agent-a stacking onto p1's own `feature/auth` is a same-owner stack, still allowed.
+        assert_eq!(
+            classify_merge_base("main", "feature/auth", Some("agent-a"), &owned("agent-a")),
+            MergeBaseVerdict::SameOwnerStack
+        );
+        // A project with no such row sees it as Unknown, not borrowed from another repo.
+        assert_eq!(
+            resolve_base_branch_ownership(&store, "p3", "feature/auth"),
+            BaseBranchOwnership::Unknown
+        );
+    }
+
+    #[test]
+    fn branch_owner_in_project_reads_the_minted_name_and_this_projects_rows_only() {
+        // Minted name → owner by convention, no store needed.
+        let store = PrOwnerStore::default();
+        assert_eq!(
+            branch_owner_in_project(
+                &store,
+                "p1",
+                "sparkle/agent-9e48bf5c-02fb-499b-9bc7-d24034577799"
+            )
+            .as_deref(),
+            Some("9e48bf5c-02fb-499b-9bc7-d24034577799")
+        );
+        // A descriptive branch with no row in THIS project is None, even if another project has it.
+        let d = tmp();
+        observe_branch(d.path(), "p1", "sparkle/left-pair", "agent-cockpit").unwrap();
+        let s2 = load_store(d.path());
+        assert_eq!(branch_owner_in_project(&s2, "p1", "sparkle/left-pair").as_deref(), Some("agent-cockpit"));
+        assert_eq!(branch_owner_in_project(&s2, "p2", "sparkle/left-pair"), None);
+        // An ambiguous row names nobody for the head view.
+        let d2 = tmp();
+        observe_branch(d2.path(), "p1", "shared", "agent-a").unwrap();
+        observe_branch(d2.path(), "p1", "shared", "agent-b").unwrap();
+        assert_eq!(branch_owner_in_project(&load_store(d2.path()), "p1", "shared"), None);
     }
 
     #[test]
