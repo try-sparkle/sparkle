@@ -1242,6 +1242,36 @@ fn gh_stderr_hint(stderr: &[u8]) -> Option<String> {
     Some(out)
 }
 
+/// The line to log when a `gh` invocation exits non-zero — ALWAYS a line, never nothing.
+///
+/// THE DEFECT THIS EXISTS TO REMOVE: both call sites logged their hint under `if let Some(hint)`,
+/// so a non-zero exit whose stderr was EMPTY logged nothing whatsoever. The reason code
+/// `gh-failed` then reached the sweep's warning with no companion line saying why, and the repo
+/// went blind for the whole backoff on the strength of it. That is not the rare arm — measured
+/// across four days of one machine's logs, `gh-failed` was reported 13 times and the hint line
+/// appeared ZERO times, because every one of those failures was silent on stderr. Precisely when
+/// the prose is missing is when the reader has least to go on, and it was the case that dropped
+/// the diagnostic entirely.
+///
+/// With no prose, the EXIT STATUS is the only remaining evidence, and it was never recorded.
+/// It is weak, but it separates causes the reason code cannot: gh exits 4 for an auth fault and 1
+/// for a generic one, so a silent 4 still says "log in" where a silent 1 says "look elsewhere".
+///
+/// Takes the code rather than the `ExitStatus` so it stays pure and portable — `ExitStatus` has no
+/// cross-platform constructor, and a helper only testable on unix is one the windows leg cannot
+/// guard.
+fn gh_failure_hint(stderr: &[u8], code: Option<i32>) -> String {
+    if let Some(hint) = gh_stderr_hint(stderr) {
+        return hint;
+    }
+    match code {
+        Some(code) => format!("(no stderr; gh exited {code})"),
+        // A `None` code means a signal killed gh, which no exit code can express and which points
+        // somewhere else entirely — a kill or an OOM, not an auth or network fault.
+        None => "(no stderr; gh terminated by signal)".to_string(),
+    }
+}
+
 /// Every open PR in `dir`'s repo, plus whether the list was TRUNCATED at [`PROBE_LIMIT`].
 ///
 /// `Err(reason)` — never an empty list — when `gh` is absent, unauthenticated, offline, or slow.
@@ -1272,10 +1302,13 @@ fn probe_open_prs(dir: &Path) -> Result<Probed, &'static str> {
         // text is prose we would have to parse. One honest reason beats a guessed taxonomy.
         //
         // But the prose is still the only thing that says WHY, so it goes to the log even though it
-        // does not go into the reason — see [`gh_stderr_hint`].
-        if let Some(hint) = gh_stderr_hint(&output.stderr) {
-            tracing::warn!(target: "conflict_watch", hint = %hint, "`gh pr list` exited non-zero");
-        }
+        // does not go into the reason — see [`gh_failure_hint`], which is UNCONDITIONAL: a silent
+        // failure is the one that most needs a line, not the one that gets none.
+        tracing::warn!(
+            target: "conflict_watch",
+            hint = %gh_failure_hint(&output.stderr, output.status.code()),
+            "`gh pr list` exited non-zero"
+        );
         return Err("gh-failed");
     }
     probe_from_stdout(&String::from_utf8_lossy(&output.stdout), PROBE_LIMIT).ok_or("gh-unreadable")
@@ -1318,9 +1351,12 @@ fn gh_api(dir: &Path, path: &str) -> Result<String, &'static str> {
         // Same seam as [`probe_open_prs`]: the reason stays one honest code, the WHY goes to the
         // log. `path` is the literal `{owner}/{repo}` template gh resolves itself, so naming it
         // says which endpoint failed without naming which repo.
-        if let Some(hint) = gh_stderr_hint(&output.stderr) {
-            tracing::warn!(target: "conflict_watch", path = %path, hint = %hint, "`gh api` exited non-zero");
-        }
+        tracing::warn!(
+            target: "conflict_watch",
+            path = %path,
+            hint = %gh_failure_hint(&output.stderr, output.status.code()),
+            "`gh api` exited non-zero"
+        );
         return Err("gh-failed");
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
@@ -1600,8 +1636,13 @@ mod rest_fallback_tests {
         assert_ne!(unauth, no_remote, "or the hint adds nothing the reason code did not already say");
     }
 
-    /// SILENCE STAYS SILENT. A failure with nothing on stderr must log NO hint field, rather than
-    /// an empty one that reads as "gh said something blank".
+    /// SILENCE IS NOT PROSE. This layer reports "gh said nothing" as `None` rather than an empty
+    /// string that would read as "gh said something blank".
+    ///
+    /// Note this is NOT the call sites' behaviour: `None` here does not mean nothing is logged —
+    /// [`gh_failure_hint`] turns it into the exit status instead. See
+    /// `a_silent_failure_still_produces_something_to_log`, which is the assertion that guards what
+    /// actually reaches the log.
     #[test]
     fn stderr_with_nothing_in_it_yields_no_hint() {
         assert_eq!(gh_stderr_hint(b""), None, "empty");
@@ -1640,6 +1681,68 @@ mod rest_fallback_tests {
         let hint = gh_stderr_hint(&[0xff, 0xfe, b'g', b'h', b':', b' ', b'b', b'a', b'd'])
             .expect("lossy decoding still leaves a readable line");
         assert!(hint.contains("gh: bad"), "the readable part survives: {hint}");
+    }
+
+    // ── gh_failure_hint ──────────────────────────────────────────────────────────────────────
+    // What the CALL SITES log. The layer above returns `Option`; this one must not, because an
+    // `Option` at the call site is what let the whole diagnostic be dropped.
+
+    /// THE HEADLINE CASE, AND THE ONE THAT ACTUALLY HAPPENED.
+    ///
+    /// Measured over four days of one machine's logs: `gh-failed` was reported 13 times and the
+    /// hint line appeared ZERO times, because gh had exited non-zero with an EMPTY stderr every
+    /// time. Under the old `if let Some(hint)` that logged nothing at all, so the sweep's
+    /// `primary_reason="gh-failed" fallback_reason="gh-failed"` was the reader's entire evidence
+    /// before the repo went blind for the backoff.
+    ///
+    /// Asserting on the OUTPUT, not on the input: `gh_stderr_hint(b"") == None` was already true
+    /// before this change and proves nothing about what reaches the log.
+    #[test]
+    fn a_silent_failure_still_produces_something_to_log() {
+        let hint = gh_failure_hint(b"", Some(1));
+        assert!(!hint.is_empty(), "a silent failure is the one that most needs a line");
+        assert!(hint.contains('1'), "and the exit status is the only evidence left: {hint}");
+    }
+
+    /// …AND THE STATUS MUST DISCRIMINATE, or recording it bought nothing over a fixed string.
+    ///
+    /// gh exits 4 for an auth fault and 1 for a generic one. Both return the same `gh-failed`
+    /// reason code and both have empty stderr, so this line is the ONLY place they differ — a
+    /// silent 4 says "log in", a silent 1 says "look somewhere else". A single-status assertion
+    /// passes for a constant, which is exactly what the old code logged (nothing).
+    #[test]
+    fn two_silent_failures_with_different_statuses_read_differently() {
+        let auth = gh_failure_hint(b"", Some(4));
+        let generic = gh_failure_hint(b"", Some(1));
+        assert_ne!(auth, generic, "one string for every silent failure is no better than none");
+        assert!(auth.contains('4'), "{auth}");
+        assert!(generic.contains('1'), "{generic}");
+    }
+
+    /// A SIGNAL IS NOT AN EXIT CODE. `code()` is `None` when something killed gh, and that points
+    /// somewhere else entirely — a kill or an OOM, not an auth or network fault. It must not
+    /// render as one of the numbered arms, and it must not be silent either.
+    #[test]
+    fn a_signalled_failure_says_so_rather_than_borrowing_an_exit_code() {
+        let signalled = gh_failure_hint(b"", None);
+        assert!(!signalled.is_empty(), "still never nothing");
+        assert!(signalled.contains("signal"), "and it names the cause it can name: {signalled}");
+        assert_ne!(
+            signalled,
+            gh_failure_hint(b"", Some(1)),
+            "a signal kill and a generic exit are different diagnoses"
+        );
+    }
+
+    /// PROSE STILL WINS. When gh does explain itself, the explanation is what gets logged — the
+    /// exit status is the fallback for silence, not a replacement for the message. Guarding this
+    /// direction too, because a helper that always reported the status would satisfy every
+    /// assertion above while throwing away the better evidence.
+    #[test]
+    fn real_stderr_is_preferred_over_the_exit_status() {
+        let hint = gh_failure_hint(b"gh: Bad credentials (HTTP 401)\n", Some(1));
+        assert_eq!(hint, "gh: Bad credentials (HTTP 401)");
+        assert!(!hint.contains("no stderr"), "the status arm must not fire when prose exists");
     }
 
     /// The fallback costs O(N) network calls, so a healthy primary must never pay for it.
