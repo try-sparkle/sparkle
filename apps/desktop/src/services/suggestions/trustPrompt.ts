@@ -99,14 +99,22 @@ const TRUST_SAFE_YES_LABEL =
  *  directory and its subdirectories", "…don't ask again". A SECONDARY check on top of
  *  {@link TRUST_SAFE_YES_LABEL}'s allowlist — belt-and-braces, no longer the guard itself.
  *
- *  ── THE ALTERNATION MUST COVER EVERY PHRASING THIS COMMENT ENUMERATES ────────────────────────
- *  It did not. The subdirectory-tree wording above was listed as excluded while matching none of
- *  the branches, so an option reading "Yes, I trust this directory and its subdirectories" passed
- *  the old blacklist affirmative, escaped this guard, and would have been auto-pressed — granting a
- *  RECURSIVE trust for a whole tree in answer to a question about one folder. A doc comment is not
- *  a matcher; every phrasing named here has a branch below, and `trustPrompt.test.ts` asserts each
- *  one is refused. Add the branch and the case together when a new wording appears. */
-const TRUST_STICKY_LABEL =
+ *  ── IT IS PINNED DIRECTLY, BECAUSE THE ALLOWLIST SHORT-CIRCUITS IT ───────────────────────────
+ *  Read this before trusting a green suite here. `TRUST_SAFE_YES_LABEL` anchors with `$` right
+ *  after `folder|directory|project`, so NO label can satisfy the allowlist and still contain one of
+ *  the branches below — every one of them needs extra tokens the anchor forbids. That makes
+ *  `!TRUST_STICKY_LABEL.test(...)` at the call site unreachable in practice, and it means the
+ *  `detectTrustPrompt` refusal cases say NOTHING about this alternation: they would all stay green
+ *  with this constant deleted outright.
+ *
+ *  So it is exported and asserted DIRECTLY, phrasing by phrasing, in `trustPrompt.test.ts`. That is
+ *  the only thing keeping it honest, and it matters because this layer becomes load-bearing again
+ *  the moment someone loosens the allowlist to accept a renamed upstream label (say
+ *  "Yes, I trust this folder (recommended)"). Without direct assertions it could rot unnoticed for
+ *  an unbounded period and be silently useless at exactly that moment.
+ *
+ *  Add the branch AND its direct assertion together when a new wording appears. */
+export const TRUST_STICKY_LABEL =
   /\b(?:every|all)\s+folders?\b|\bdon['’]?t\s+ask\s+again\b|\balways\s+trust\b|\bsub-?director(?:y|ies)\b|\brecursive(?:ly)?\b|\bparent\s+director(?:y|ies)\b|\ball\s+(?:its\s+)?(?:sub)?directories\b/i;
 
 /** The refusal — "No, exit". Only used to corroborate that a two-row trust menu is on screen. */

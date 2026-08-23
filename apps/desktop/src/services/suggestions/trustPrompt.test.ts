@@ -5,6 +5,7 @@ import {
   workspacePathFromDialog,
   isManagedWorktreePath,
   trustAnswerFor,
+  TRUST_STICKY_LABEL,
 } from "./trustPrompt";
 import {
   FOLDER_TRUST_PROMPT,
@@ -179,5 +180,38 @@ describe("trustAnswerFor — THE SAFETY SCOPE", () => {
 
   it("accepts a subdirectory OF the managed worktree", () => {
     expect(trustAnswerFor(folderTrustPromptFor(`${MANAGED}/apps/desktop`), AGENT, MANAGED)).toBe("1\n");
+  });
+});
+
+// The belt-and-braces layer, pinned DIRECTLY — the only assertions that can fail for it.
+//
+// `TRUST_SAFE_YES_LABEL` anchors with `$`, so no label can pass the allowlist and still contain a
+// sticky phrasing: the `detectTrustPrompt` refusal cases above are decided entirely by the allowlist
+// and would ALL stay green with `TRUST_STICKY_LABEL` deleted. That makes them worthless as evidence
+// about this alternation — including for the curly-apostrophe class, whose widening a previous
+// commit claimed those cases pinned when they could not.
+//
+// This layer becomes load-bearing again the moment the allowlist is loosened for a renamed upstream
+// label, so it is asserted on its own terms here.
+describe("TRUST_STICKY_LABEL — the secondary widening check, asserted directly", () => {
+  it.each([
+    ["every folder", "Yes, and trust every folder in this directory"],
+    ["all folders", "Yes, trust all folders here"],
+    ["straight apostrophe", "Yes, I trust this folder and don't ask again"],
+    ["curly apostrophe (U+2019)", "Yes, I trust this folder and don’t ask again"],
+    ["always trust", "Yes, always trust this folder"],
+    ["subdirectories", "Yes, I trust this directory and its subdirectories"],
+    ["sub-directories, hyphenated", "Yes, trust this folder and its sub-directories"],
+    ["recursive", "Yes, trust this folder recursively"],
+    ["parent directory", "Yes, and trust the parent directory"],
+    ["all directories", "Yes, and trust all directories below it"],
+  ])("matches the %s phrasing", (_name, label) => {
+    expect(TRUST_STICKY_LABEL.test(label)).toBe(true);
+  });
+
+  it("does NOT match the plain single-folder answer", () => {
+    // Without this the alternation could be widened into matching everything and still pass above,
+    // which would make the secondary check refuse the one label it must let through.
+    expect(TRUST_STICKY_LABEL.test("Yes, I trust this folder")).toBe(false);
   });
 });
