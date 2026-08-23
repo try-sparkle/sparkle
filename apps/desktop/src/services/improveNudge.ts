@@ -36,11 +36,14 @@
 // off signals ATTRIBUTABLE to this agent, never a project-wide quantity that would churn from other
 // agents and re-stamp the clock forever (roborev 66016) — see `pusherMount.improveAdvanceFingerprint`.
 //
-// ── SHIPS INERT (AGENTS.md "A hook that WRITES ships inert") ──────────────────────────────────────
-// A nudge is a WRITE — it auto-resumes the agent's next turn. So the decision requires `armed`, and
-// the wiring defaults it OFF: the feature is dormant until a human explicitly arms it (the in-app
-// analogue of `scripts/arm-hook.sh`). `armed === false` is the FIRST thing the decision checks, so an
-// unarmed build can compute every other signal and still never send.
+// ── ARMED BY DEFAULT, VIA RUNTIME CONFIG ─────────────────────────────────────────────────────────
+// A nudge is a WRITE — it auto-resumes the agent's next turn — so the decision still requires
+// `armed`, and `armed === false` is the FIRST thing it checks, so a disarmed build computes every
+// other signal and still never sends. What changed: the arm is no longer a build-time flag that
+// ships OFF. It is config.toml `[improvement].never_idle_armed`, which the founder reviewed and
+// DEFAULTS ON (pusherMount.neverIdleArmed resolves it; false only when config says so). The
+// still-strict guards below — an actually-idle agent with ready backlog — are what make an
+// armed-by-default watcher safe.
 //
 // ── THE FAILURE DIRECTION IS "MISS A NUDGE", NEVER "NUDGE A BUSY AGENT" ───────────────────────────
 // Every absent or ambiguous signal resolves toward "do not nudge": an unread pane status (undefined)
@@ -136,7 +139,8 @@ const RESTING: ReadonlySet<AgentTabStatus> = new Set<AgentTabStatus>(["idle", "u
 
 /** Everything the decision reads. Pure inputs so the whole rule tests as arithmetic. */
 export interface ImproveNudgeInput {
-  /** Ships-inert gate. `false` (the default until a human arms it) always refuses — checked FIRST. */
+  /** Arm gate, from config.toml `[improvement].never_idle_armed` (defaults ON). `false` always
+   *  refuses — checked FIRST — so an explicitly disarmed config mutes every other signal. */
   armed: boolean;
   /** Does THIS window own the sparkle-self project? Only the owner nudges, so two windows cannot
    *  double-send — the same single-owner election the Pusher and goal runner use. */
@@ -184,7 +188,7 @@ export type ImproveNudgeRefusal =
  * PURE. Refuses toward silence at every step, and each refusal names a distinct reason so a log or a
  * test can tell "nothing to do" from "already working" from "not armed". The guardrails, in order:
  *
- *   1. `not-armed`         — ships inert; nothing is sent until a human arms the feature.
+ *   1. `not-armed`         — config.toml explicitly set never_idle_armed = false (default is ON).
  *   2. `not-owner`         — another window owns sparkle-self; it will decide.
  *   3. `consent-never`     — chat-only mode may not be told to mine backlog.
  *   4. `not-idle`          — the agent's own pane is not at rest (working / waiting / approval / unknown).

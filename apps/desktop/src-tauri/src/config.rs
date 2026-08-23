@@ -1420,6 +1420,14 @@ pub struct ImprovementConfig {
     /// (`"always"|"case_by_case"|"never"`) is the contract, and the reader fail-closes on anything
     /// outside it.
     pub consent: Option<String>,
+    /// Runtime arm for the never-idle watcher (the in-app nudge that auto-resumes an idle Improve
+    /// Sparkle agent). A plain `bool` — always serialized, never `null` — so the TS reader sees
+    /// `true`/`false`, not an absent key. Defaults `true`: the founder chose to arm it by default,
+    /// replacing the old build-time `VITE_SPARKLE_NEVER_IDLE` flag so it can be toggled from this
+    /// file without cutting a new DMG. The watcher's other guards (an actually-idle Improve Sparkle
+    /// agent with ready backlog, in the window that owns sparkle-self) are what keep an armed build
+    /// from nudging when there is nothing to do.
+    pub never_idle_armed: bool,
 }
 
 /// The BACKLOG DRAINER's master switch (`[drainer]`) — bead-backlog auto-drain, ON by default.
@@ -1960,7 +1968,7 @@ impl Default for SparkleConfig {
             roborev: RoborevConfig { consent_prompted: false },
             // No consent mirrored until the user sets it — see ImprovementConfig on why this stays
             // None rather than defaulting to "case_by_case" (it must not clobber a persisted choice).
-            improvement: ImprovementConfig { consent: None },
+            improvement: ImprovementConfig { consent: None, never_idle_armed: true },
             babysit: BabysitConfig {
                 enabled: true,
                 cooldown_minutes: 30,
@@ -2324,6 +2332,7 @@ struct PartialRoborev {
 #[derive(Debug, Default, Deserialize)]
 struct PartialImprovement {
     consent: Option<String>,
+    never_idle_armed: Option<bool>,
 }
 
 /// `[drainer]` as read from TOML. EVERY value is `toml::Value` for the reason `PartialPushers`/
@@ -3397,8 +3406,14 @@ fn apply_roborev(into: &mut RoborevConfig, p: Option<PartialRoborev>) {
 }
 
 fn apply_improvement(into: &mut ImprovementConfig, p: Option<PartialImprovement>) {
-    if let Some(PartialImprovement { consent: Some(v) }) = p {
+    let Some(p) = p else { return };
+    if let Some(v) = p.consent {
         into.consent = Some(v);
+    }
+    // A present key wins; an absent one (older file, or a [improvement] section that only sets
+    // consent) leaves the `true` default in place — the founder's chosen armed-by-default.
+    if let Some(v) = p.never_idle_armed {
+        into.never_idle_armed = v;
     }
 }
 
@@ -5702,6 +5717,8 @@ consent_prompted = false   # set true once the one-time "review your commits?" p
 # here — the app writes this key when you pick a mode.
 # [improvement]
 # consent = "case_by_case"   # "always" | "case_by_case" | "never"
+# never_idle_armed = true    # arm the never-idle watcher (auto-resumes an idle Improve Sparkle
+#                            # agent when there is ready backlog). Defaults true; set false to mute.
 
 # --- Reading preferences (per-machine; ignored in a project file) -----------------------
 # How a BEAD CARD draws when the concierge names a bead id in its reply.
@@ -7656,6 +7673,32 @@ quit_app = 42
         assert!(!hard);
         assert!(warns.is_empty());
         assert_eq!(cfg.improvement.consent.as_deref(), Some("always"));
+    }
+
+    #[test]
+    fn never_idle_armed_defaults_true_and_config_can_mute_it() {
+        // Founder's armed-by-default: an absent [improvement] section (or one that sets only
+        // consent) leaves the arm ON, so the never-idle watcher works out of the box in a build
+        // that ships this key.
+        let (cfg, _, _) = effective(None, None);
+        assert!(cfg.improvement.never_idle_armed, "absent section => armed by default");
+
+        let only_consent = "[improvement]\nconsent = \"always\"\n";
+        let (cfg, _, _) = effective(Some(only_consent), None);
+        assert!(cfg.improvement.never_idle_armed, "consent-only section keeps the armed default");
+
+        // An explicit false is the mute switch — the whole point of moving off the build-time flag.
+        let muted = "[improvement]\nnever_idle_armed = false\n";
+        let (cfg, warns, hard) = effective(Some(muted), None);
+        assert!(!hard);
+        assert!(warns.is_empty());
+        assert!(!cfg.improvement.never_idle_armed, "explicit false disarms");
+
+        // It serializes as a plain bool (never null), so the TS reader sees true/false, not an
+        // absent key — the Rust->TS seam contract for this field.
+        let (cfg, _, _) = effective(None, None);
+        let json = serde_json::to_string(&cfg.improvement).expect("serialize");
+        assert!(json.contains("\"never_idle_armed\":true"), "emits a concrete bool, got {json}");
     }
 
     #[test]

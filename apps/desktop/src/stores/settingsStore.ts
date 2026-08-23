@@ -695,6 +695,10 @@ interface SettingsState {
   /** Consent for the Sparkle self-improvement agent to use the user's anonymous logs. See
    *  SparkleImprovementConsent. Persisted; defaults to "case_by_case". */
   sparkleImprovementConsent: SparkleImprovementConsent;
+  /** Runtime arm for the never-idle watcher, mirrored from config.toml `[improvement].never_idle_armed`
+   *  (source of truth). NOT persisted — re-hydrated from config each launch. Defaults true (the
+   *  founder's armed-by-default), and pusherMount.neverIdleArmed reads it synchronously. */
+  improvementNeverIdleArmed: boolean;
   /** Epoch ms of the last hourly improvement-pass ATTEMPT (recorded at pass start, success or
    *  not, so a failing setup retries next hour instead of hot-looping). null = never — the
    *  scheduler seeds it on its first tick, so the first pass lands ~1h after consent is active
@@ -1011,6 +1015,7 @@ export const useSettingsStore = create<SettingsState>()(
       windowIsSpanned: false,
       notifyStatuses: { ...DEFAULT_NOTIFY_STATUSES },
       sparkleImprovementConsent: DEFAULT_SPARKLE_CONSENT,
+      improvementNeverIdleArmed: true,
       improvementLastRunAt: null,
       improvementLaunchWarm: null,
       lastSeenChangelogVersion: null,
@@ -1426,6 +1431,9 @@ export const useSettingsStore = create<SettingsState>()(
             mirroredConsent === "never"
               ? mirroredConsent
               : s.sparkleImprovementConsent,
+          // Config is the source of truth for the arm (not persisted, so no clobber concern like
+          // consent above): take the file's value, defaulting ON for a backend predating the key.
+          improvementNeverIdleArmed: config.improvement?.never_idle_armed ?? true,
           configWarnings: warnings,
         }));
       },

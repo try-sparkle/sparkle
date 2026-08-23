@@ -270,7 +270,10 @@ describe("hydrateFromConfig — [improvement].consent mirror", () => {
       criteria: [],
     },
   };
-  const eff = (improvement?: { consent: "always" | "case_by_case" | "never" | null }) =>
+  const eff = (improvement?: {
+    consent?: "always" | "case_by_case" | "never" | null;
+    never_idle_armed?: boolean;
+  }) =>
     ({
       config: { ...baseConfig, ...(improvement ? { improvement } : {}) },
       warnings: [],
@@ -294,6 +297,20 @@ describe("hydrateFromConfig — [improvement].consent mirror", () => {
     useSettingsStore.setState({ sparkleImprovementConsent: "never" });
     useSettingsStore.getState().hydrateFromConfig(eff({ consent: null }));
     expect(useSettingsStore.getState().sparkleImprovementConsent).toBe("never");
+  });
+
+  it("arms the never-idle watcher by default when the key is absent (founder's armed-by-default)", () => {
+    // Config is the source of truth for the arm (unlike consent it is NOT persisted), so an absent
+    // key must resolve to the ON default — and must OVERWRITE a stale false, not preserve it.
+    useSettingsStore.setState({ improvementNeverIdleArmed: false });
+    useSettingsStore.getState().hydrateFromConfig(eff());
+    expect(useSettingsStore.getState().improvementNeverIdleArmed).toBe(true);
+  });
+
+  it("disarms the never-idle watcher when config sets never_idle_armed = false", () => {
+    useSettingsStore.setState({ improvementNeverIdleArmed: true });
+    useSettingsStore.getState().hydrateFromConfig(eff({ never_idle_armed: false }));
+    expect(useSettingsStore.getState().improvementNeverIdleArmed).toBe(false);
   });
 });
 

@@ -22,6 +22,14 @@ const startBabysitDispatcher = vi.hoisted(() =>
   vi.fn<(cfg?: unknown) => () => void>(() => stopBabysit),
 );
 const stopBabysit = vi.hoisted(() => vi.fn());
+// `ensureSparkleRepo` is `invoke<SparkleWorkspace>("ensure_sparkle_repo")`, so under the bare
+// `invoke: vi.fn()` mock below it returns `undefined` and `startPusher`'s `.then(...)` throws.
+// That path was unreachable here until this branch: `neverIdleArmed()` used to read a build-time
+// env flag, false under unit tests, so `backlogFeedWanted()` was never true and the whole branch
+// was dormant. Defaulting the arm ON is what first reaches it.
+const ensureSparkleRepo = vi.hoisted(() =>
+  vi.fn(async () => ({ repoPath: "/tmp/sparkle-repo", logDir: "/tmp/sparkle-logs", defaultBranch: "main" })),
+);
 
 vi.mock("./pusherRunner", async (orig) => ({
   ...(await orig<Record<string, unknown>>()),
@@ -32,6 +40,12 @@ vi.mock("./babysitDispatcher", () => ({
   startBabysitDispatcher: (cfg?: unknown) => startBabysitDispatcher(cfg),
 }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
+// SPREAD the real module rather than replacing it: `pusherMount` imports several other names from
+// here, and a bare factory would make them undefined at import time.
+vi.mock("./sparkleAgent", async (orig) => ({
+  ...(await orig<Record<string, unknown>>()),
+  ensureSparkleRepo,
+}));
 vi.mock("../logger", () => ({
   log: { info: vi.fn(), warn: vi.fn(), debug: vi.fn(), error: vi.fn() },
 }));
@@ -65,6 +79,7 @@ beforeEach(() => {
   startBabysitDispatcher.mockImplementation(() => stopBabysit);
   getConfig.mockResolvedValue({ config: { pushers: {} } });
   onConfigChanged.mockResolvedValue(unlisten);
+  ensureSparkleRepo.mockClear();
 });
 afterEach(() => vi.clearAllMocks());
 
@@ -264,5 +279,42 @@ describe("startPusher — babysit config written before the listener exists", ()
     await vi.waitFor(() =>
       expect(startBabysitDispatcher.mock.calls.at(-1)?.[0]).toMatchObject({ enabled: false }),
     );
+  });
+});
+
+// ── THE ARM ACTUALLY REACHES THE BACKLOG POLL ───────────────────────────────────────────────────
+//
+// WHY THIS EXISTS, and why it is not ceremony. The fix that made this file compile again was to
+// mock `ensureSparkleRepo` so it returns a promise. That mock is also the exact shape that could
+// hide this branch AGAIN, one layer down: with it in place the suite is green whether the arm
+// reaches the poll or not, which is precisely the state this branch exists to end — the arm was
+// previously gated by a build-time env flag that is false under unit tests, so the whole branch
+// sat dormant and every test here passed without ever entering it.
+//
+// So assert the SIDE EFFECT the arm is supposed to produce, and pair it with the negative. One
+// direction alone proves nothing: "it is called" would pass for code that calls it unconditionally,
+// and "it is not called" would pass for code that never calls it at all.
+describe("never-idle arm — the backlog poll is actually reached", () => {
+  it("armed by default: startPusher resolves the sparkle repo for the backlog poll", async () => {
+    const { startPusher } = await freshStartPusher();
+    const stop = startPusher();
+    await vi.waitFor(() => expect(ensureSparkleRepo).toHaveBeenCalled());
+    stop();
+  });
+
+  it("...and does NOT when improvement consent is 'never' — the gate still refuses", async () => {
+    const { useSettingsStore } = await import("../stores/settingsStore");
+    const prev = useSettingsStore.getState().sparkleImprovementConsent;
+    useSettingsStore.setState({ sparkleImprovementConsent: "never" });
+    try {
+      const { startPusher } = await freshStartPusher();
+      const stop = startPusher();
+      // Give the same window the positive case needs, so this is a real absence rather than a race.
+      await new Promise((r) => setTimeout(r, 50));
+      expect(ensureSparkleRepo).not.toHaveBeenCalled();
+      stop();
+    } finally {
+      useSettingsStore.setState({ sparkleImprovementConsent: prev });
+    }
   });
 });

@@ -234,19 +234,22 @@ function duties(): readonly StandingDuty[] {
 }
 
 /**
- * SHIPS-INERT ARM for the never-idle watcher (AGENTS.md "A hook that WRITES ships inert").
+ * RUNTIME ARM for the never-idle watcher, read from config.toml `[improvement].never_idle_armed`.
  *
- * A nudge auto-resumes the Improve Sparkle agent's next turn — a write — so the feature is dormant
- * until a human explicitly arms it. This is the in-app analogue of `scripts/arm-hook.sh`: a build
- * ships with `armed === false`, and the founder flips `VITE_SPARKLE_NEVER_IDLE=1` to enable it after
- * reviewing the operating-contract change. Guarded so a context without `import.meta.env` (a bare
- * unit test) reads as UNARMED — the fail-closed direction.
+ * A nudge auto-resumes the Improve Sparkle agent's next turn — a write — so this used to ship inert
+ * behind a build-time `VITE_SPARKLE_NEVER_IDLE` flag (AGENTS.md "A hook that WRITES ships inert").
+ * The founder has now reviewed the operating-contract change and armed it BY DEFAULT, and moved the
+ * switch to config so it can be toggled without cutting a new DMG. So the default is ON: armed
+ * unless config explicitly sets the key to false. The other guards below — an actually-idle Improve
+ * Sparkle agent, ready backlog, this window owning sparkle-self — are what keep an armed build from
+ * nudging when there is nothing to do. Guarded so a store not yet hydrated reads the ON default
+ * rather than throwing.
  */
 function neverIdleArmed(): boolean {
   try {
-    return (import.meta.env?.VITE_SPARKLE_NEVER_IDLE as string | undefined) === "1";
+    return useSettingsStore.getState().improvementNeverIdleArmed !== false;
   } catch {
-    return false;
+    return true;
   }
 }
 

@@ -183,6 +183,10 @@ export interface RoborevConfig {
  *  import cycle, and typed `| null` for the unset case. */
 export interface ImprovementConfig {
   consent: "always" | "case_by_case" | "never" | null;
+  /** Runtime arm for the never-idle watcher. Rust sends it as a plain bool (always present, never
+   *  null); optional here only to tolerate a backend predating the key, which the reader treats as
+   *  the `true` default (`?? true`). Replaces the old build-time `VITE_SPARKLE_NEVER_IDLE` flag. */
+  never_idle_armed?: boolean;
 }
 /** The backlog drainer's kill-switch (`[drainer]`). Machine-wide (like `[roborev]`/`[babysit]`);
  *  ignored in a per-project file. Ships `enabled: true`. Config-backed and NOT persisted to
