@@ -725,8 +725,39 @@ describe("projectStore — the cross-repo assignment latch", () => {
     const { pid, aid } = seed();
     useProjectStore.getState().appendPrompt(pid, aid, "fix the flaky test");
     useProjectStore.getState().appendPrompt(pid, aid, "port the fix from owner/other#253");
-    // Without the `assignmentRepos !== undefined` clause this would become ["owner/other"] and the
-    // row's ladder rung would move because of something the human typed mid-conversation.
+    // ⚠️ THIS CASE DOES NOT ISOLATE `assignmentRepos !== undefined` — an earlier revision of this
+    // comment claimed it did, and that claim was false (roborev on 0893e81). The first
+    // `appendPrompt` writes `assignmentRepos` AND a `{source: "composer"}` history entry in the SAME
+    // `set()`, so by the second prompt the promptHistory clause already blocks the re-latch on its
+    // own: delete the `assignmentRepos !== undefined` clause and this test still passes. What it
+    // pins is the OUTCOME the human cares about — the rung does not move mid-conversation — which is
+    // worth a test regardless of which clause delivers it. The clause itself is isolated below.
+    expect(agent(pid, aid).assignmentRepos).toEqual([]);
+  });
+
+  it("a LATCHED agent with no composer history still does not re-latch — the clause's own contract", () => {
+    // THE ISOLATING CASE for `assignmentRepos !== undefined`, and the reason it is written by hand:
+    // no action on this store can currently produce this state. `appendPrompt` is the ONLY writer of
+    // `assignmentRepos` (grep it — one write site), and it always lands together with a composer
+    // history entry, so today the promptHistory clause happens to cover every reachable path and the
+    // undefined clause is redundant *by coincidence of that coupling*, not by design.
+    //
+    // The clause states the latch's PRIMARY invariant — "once latched, never rewritten" — and this
+    // test is what keeps that invariant resting on the field it is actually about. Without it, a
+    // future second writer of `assignmentRepos`, or any path that clears `promptHistory` while
+    // keeping the rest of the row (agent reuse already rebuilds rows with `promptHistory: []`),
+    // silently re-opens a latch that is documented as permanent, with a green suite. Synthesizing
+    // the state directly is the only way to assert the clause rather than the coincidence.
+    const { pid, aid } = seed();
+    useProjectStore.getState().appendPrompt(pid, aid, "fix the flaky test");
+    expect(agent(pid, aid).assignmentRepos).toEqual([]); // latched, by the opening prompt
+    useProjectStore.setState((st) => ({
+      projects: st.projects.map((p) => ({
+        ...p,
+        agents: p.agents.map((a) => (a.id === aid ? { ...a, promptHistory: [] } : a)),
+      })),
+    }));
+    useProjectStore.getState().appendPrompt(pid, aid, "port the fix from owner/other#253");
     expect(agent(pid, aid).assignmentRepos).toEqual([]);
   });
 

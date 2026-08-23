@@ -2614,6 +2614,15 @@ export const useProjectStore = create<ProjectState>()(
               // deep into its life — would latch as its "opening assignment", permanently. That is
               // the very hazard this guard exists to close, surviving in the one population the store
               // already has a durable marker for. This clause is what makes the claim above true.
+              //
+              // THE FIRST CLAUSE IS REDUNDANT TODAY, AND ON PURPOSE. `appendPrompt` is the only
+              // writer of `assignmentRepos` and always lands it beside a composer history entry, so
+              // every reachable re-latch is already blocked by the last clause. It states the latch's
+              // PRIMARY invariant — once latched, never rewritten — so that the invariant rests on
+              // the field it is about rather than on that coupling; a second writer, or any path
+              // clearing `promptHistory` while keeping the row, would otherwise silently re-open a
+              // latch documented as permanent. `projectStore.test.ts` pins it with a synthesized
+              // state, since no store action can currently produce one.
               ...(isPicker ||
               a.assignmentRepos !== undefined ||
               a.terminalBriefedAt !== undefined ||
