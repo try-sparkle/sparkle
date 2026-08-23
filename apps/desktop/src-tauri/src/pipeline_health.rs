@@ -3059,6 +3059,34 @@ mod tests {
         None
     }
 
+    /// The MEASURED chain behind v0.133.0, the draft that replaced v0.131.0 as the held one: the
+    /// tag commit, its build base (the first parent), and the run named exactly "CI" on that base.
+    /// Read from the API on 2026-08-23 — the tag commit has ZERO workflow runs and the base's CI
+    /// concluded `failure`, the identical shape v0.131.0 had. That is why v0.133.0 is recorded as
+    /// abandoned in the baseline rather than re-dispatched.
+    const TAG_SHA_133: &str = "71fc24896150f20975c3aeb4203425b708c029af";
+    const BASE_SHA_133: &str = "baa82b32ef1804bec5882ecec18745a97f52fa75";
+
+    /// The same `gh api` stand-in as `measured_gate_fetch`, over the v0.133.0 chain.
+    fn measured_gate_fetch_133(path: &str) -> Option<String> {
+        if path == format!("repos/{RELEASE_REPO}/commits/v0.133.0") {
+            return Some(format!(
+                r#"{{"sha":"{TAG_SHA_133}","parents":[{{"sha":"{BASE_SHA_133}"}}]}}"#
+            ));
+        }
+        if path.contains(TAG_SHA_133) {
+            return Some(r#"{"total_count":0,"workflow_runs":[]}"#.to_string());
+        }
+        if path.contains(BASE_SHA_133) {
+            return Some(
+                r#"{"total_count":1,"workflow_runs":[
+                    {"name":"CI","status":"completed","conclusion":"failure"}]}"#
+                    .to_string(),
+            );
+        }
+        None
+    }
+
     /// A `fetch` whose TAG run concluded `failure` having executed nothing (the job died at the
     /// synthetic `Set up job` step), over a build base whose CI is GREEN. This is the shape
     /// `cc_gate` reclassifies and routes to the base — `rc=4`.
@@ -3438,31 +3466,58 @@ mod tests {
         assert!(detail.contains("once its CI concludes green"), "{detail}");
     }
 
-    /// TODAY'S REAL STATE, THROUGH THE REAL ENTRY POINT: the 20 baselined orphan tags, the v0.131.0
-    /// draft whose build base is red, and v0.132.0 published — the exact world that produced an
-    /// hourly Warning all night. It must be HEALTHY, state the accepted count, and name the held
-    /// draft without promising it will publish.
+    /// TODAY'S REAL STATE, THROUGH THE REAL ENTRY POINT: the baselined orphan tags, v0.134.0
+    /// published, v0.133.0 drafted over a RED build base, and v0.131.0 — the draft that produced
+    /// an hourly Warning all night — now RECORDED as abandoned in the baseline. It must be
+    /// HEALTHY, state the accepted count, and name the held draft without promising it will
+    /// publish.
+    ///
+    /// AND IT PINS THE PRECEDENCE, which is the one thing this state changed. v0.133.0's gate
+    /// really does resolve RED here — the fetch below is the measured API shape, not a hand-set
+    /// verdict — yet it is reported as ACCEPTED rather than HELD, because a recorded decision
+    /// outranks the held-by-gate presentation. That is only safe while nothing is hidden, so the
+    /// count of accepted drafts and the file that holds the decisions are both asserted: the file
+    /// accepts history, it does not forgive it. The HELD wording itself stays covered, against an
+    /// EMPTY acceptance set, by `a_red_gated_draft_reads_as_held_and_never_promises_publication`
+    /// and its above-the-mark sibling; and `an_unrecorded_draft_below_the_mark_is_still_reported`
+    /// is the paired direction proving the acceptance file — not the passage of a release — is
+    /// what moves a draft out of the report.
     #[test]
     fn todays_real_state_is_healthy_end_to_end() {
         let repo_root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../..");
         let baseline = read_baseline_at(repo_root).expect("the real baseline");
         assert!(baseline.tags.len() >= 20, "not a vacuous fixture: {}", baseline.tags.len());
+        assert!(
+            baseline.drafts.contains(&parse_version("v0.131.0").unwrap()),
+            "the abandoned draft is recorded: {:?}",
+            baseline.drafts
+        );
 
-        let releases_json = r#"[{"tag_name":"v0.132.0","draft":false,"prerelease":false},
+        let releases_json = r#"[{"tag_name":"v0.134.0","draft":false,"prerelease":false},
+                                {"tag_name":"v0.133.0","draft":true,"prerelease":false},
                                 {"tag_name":"v0.131.0","draft":true,"prerelease":false},
                                 {"tag_name":"v0.58.0","draft":false,"prerelease":false}]"#;
         let mut names: Vec<String> = baseline.tags.iter().map(|v| v.to_string()).collect();
-        names.extend(["v0.132.0".to_string(), "v0.131.0".to_string(), "v0.58.0".to_string()]);
+        names.extend([
+            "v0.134.0".to_string(),
+            "v0.133.0".to_string(),
+            "v0.131.0".to_string(),
+            "v0.58.0".to_string(),
+        ]);
         let tags_json = format!(
             "[{}]",
             names.iter().map(|n| format!(r#"{{"name":"{n}"}}"#)).collect::<Vec<_>>().join(",")
         );
 
+        // Either measured chain answers for its own tag and `None` for anything else, so the gate
+        // resolves v0.133.0 RED from the real API shape rather than from a hand-set verdict.
+        let fetch = |path: &str| measured_gate_fetch(path).or_else(|| measured_gate_fetch_133(path));
+
         let c = release_publication_from_json(
             Some(releases_json),
             Some(&tags_json),
             repo_root,
-            &measured_gate_fetch,
+            &fetch,
         );
         assert_eq!(
             c.state,
@@ -3470,11 +3525,68 @@ mod tests {
             "the whole night's Warning must be gone: {}",
             c.detail
         );
-        assert!(c.detail.contains("v0.132.0"), "the high-water mark: {}", c.detail);
+        assert!(c.detail.contains("v0.134.0"), "the high-water mark: {}", c.detail);
         assert!(c.detail.contains("are accepted in"), "the accepted count: {}", c.detail);
-        assert!(c.detail.contains("HELD"), "and the held draft: {}", c.detail);
+        assert!(c.detail.contains(ORPHAN_BASELINE_PATH), "and where the decisions are: {}", c.detail);
+        // NOTHING IS HIDDEN: both drafts are still counted, by number, in the verdict a human
+        // reads. An implementation that filtered them out silently would satisfy Healthy above and
+        // fail right here.
+        assert!(
+            c.detail.contains("2 stuck draft(s) are accepted"),
+            "both recorded drafts are still counted: {}",
+            c.detail
+        );
         assert!(!c.detail.contains("once its CI concludes green"), "{}", c.detail);
         assert!(!c.detail.to_lowercase().contains("re-dispatch"), "{}", c.detail);
+
+        // THE PRECEDENCE, asserted rather than assumed: v0.133.0's gate resolves RED from the
+        // measured shape, so without its baseline line this same call would read HELD. Remove the
+        // draft: entries and the assertion below goes red — which is what makes the acceptance
+        // file, and not the gate, the thing doing the work here.
+        assert_eq!(
+            resolve_draft_gate("v0.133.0", &fetch),
+            GateVerdict::Red,
+            "the fixture really is a red-gated draft"
+        );
+        assert!(
+            !c.detail.contains("HELD"),
+            "a recorded decision outranks the held-by-gate wording: {}",
+            c.detail
+        );
+    }
+
+    /// THE PAIRED DIRECTION, and the one that stops the assertion above from being a snapshot: with
+    /// the SAME fixture and the v0.133.0 line removed from the acceptance set, an accepted draft
+    /// goes back to being an unaccepted one. Recording a decision must be what moves it — not the
+    /// mere passage of a release.
+    #[test]
+    fn an_unrecorded_draft_below_the_mark_is_still_reported() {
+        let repo_root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../..");
+        let releases =
+            ReleasesReading { published: strings(&["v0.134.0"]), drafts: strings(&["v0.131.0"]) };
+        let tags = strings(&["v0.134.0", "v0.131.0"]);
+
+        // An EMPTY acceptance set and no gate verdict: v0.131.0 is neither accepted nor held, so it
+        // must still be named as a stuck draft.
+        let (state, detail) = classify_release_publication(
+            Some(&releases),
+            Some(&tags),
+            Some(&ReleaseBaseline::default()),
+            &std::collections::BTreeMap::new(),
+        );
+        assert_eq!(state, HealthState::Warning, "an unrecorded draft still warns: {detail}");
+        assert!(detail.contains("v0.131.0"), "and is named: {detail}");
+
+        // The REAL acceptance file, which now records it — the only difference — clears it.
+        let baseline = read_baseline_at(repo_root).expect("the real baseline");
+        let (state, detail) = classify_release_publication(
+            Some(&releases),
+            Some(&tags),
+            Some(&baseline),
+            &std::collections::BTreeMap::new(),
+        );
+        assert_eq!(state, HealthState::Healthy, "recording the decision clears it: {detail}");
+        assert!(detail.contains("stuck draft(s) are accepted"), "still counted: {detail}");
     }
 
     // ── knightwatch ───────────────────────────────────────────────────────────────────────────────
