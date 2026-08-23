@@ -25,6 +25,18 @@ type ToolFn = (args: Record<string, unknown>) => string;
 const tools = new Map<string, ToolFn>();
 const calls: { tool: string; args: Record<string, unknown> }[] = [];
 
+/** What `destination_probe` answers. Mutable because the media tests turn one affordance on and
+ *  off, and that affordance IS the gate under test. */
+let affordances: string[] = ["project-picker", "take-down"];
+/** What `destination_list_tools` answers — the descriptors whose `inputSchema.required` the media
+ *  path reads. */
+let descriptors: { name: string; description: string; inputSchema: unknown }[] = [
+  { name: "create_content", description: "", inputSchema: {} },
+];
+/** What `load_attachment` returns, keyed by path. Empty by default, so a path that was never
+ *  staged also fails to load — the two guards are independent and both are tested. */
+const stagedFiles = new Map<string, { path: string; name: string; data_url: string | null }>();
+
 let publishSection: unknown = {
   active: "drodio",
   destinations: {
@@ -51,10 +63,18 @@ const invoke = vi.fn(async (cmd: string, args: Record<string, unknown>) => {
       presentOptional: ["unpublish_content"],
       missingOptional: [],
       argShapeProblems: [],
-      affordances: ["project-picker", "take-down"],
+      affordances: [...affordances],
     };
   }
-  if (cmd === "destination_list_tools") return [{ name: "create_content", description: "", inputSchema: {} }];
+  if (cmd === "destination_list_tools") return [...descriptors];
+  // The staged-image read, reached through `LIVE_PUBLISH_DEPS.readStagedImage` — which is the point
+  // of driving the handlers with their DEFAULT deps. Mocking the domain's own dep instead would
+  // leave that wiring line covered by nothing.
+  if (cmd === "load_attachment") {
+    const entry = stagedFiles.get(args.path as string);
+    if (!entry) throw new Error(`load_attachment: cannot read ${String(args.path)}`);
+    return entry;
+  }
   throw new Error(`unexpected command ${cmd}`);
 });
 vi.mock("@tauri-apps/api/core", () => ({
@@ -68,9 +88,13 @@ import {
   defaultDecisionFor,
 } from "./policy";
 import {
+  MAX_ENCODED_IMAGE_BYTES,
   MAX_PUBLISH_TAGS,
   PUBLISH_OPS,
   PUBLISH_RISK,
+  UPLOAD_IMAGE_BEST_EFFORT_ARGS,
+  attachMedia,
+  buildUploadImageArgs,
   clearPublishSnapshots,
   contentHash,
   createDraft,
@@ -83,6 +107,8 @@ import {
   publishApprovalGuard,
   readPublishSnapshot,
   readVisibility,
+  requiredProperties,
+  splitDataUrl,
   summarizePublishArgLines,
   takeDown,
   updateDraft,
@@ -90,6 +116,7 @@ import {
   type PublishOp,
 } from "./publish";
 import { clearConciergeApprovals, useConciergeApprovals } from "../../stores/conciergeApprovals";
+import { usePendingAttachmentsStore } from "../../stores/pendingAttachmentsStore";
 
 /** A content object as the destination echoes it. */
 function post(over: Record<string, unknown> = {}): Record<string, unknown> {
@@ -130,6 +157,8 @@ function serve(initial: Record<string, unknown> = post()): { current: Record<str
 }
 
 const wrote = () => calls.filter((c) => c.tool === "update_content");
+/** THE SIDE EFFECT EVERY MEDIA REFUSAL TEST ASSERTS ON: the upload never left. */
+const uploaded = () => calls.filter((c) => c.tool === "upload_image");
 const published = () => calls.filter((c) => c.tool === "publish_content");
 
 beforeEach(() => {
@@ -138,6 +167,10 @@ beforeEach(() => {
   invoke.mockClear();
   clearPublishSnapshots();
   clearConciergeApprovals();
+  affordances = ["project-picker", "take-down"];
+  descriptors = [{ name: "create_content", description: "", inputSchema: {} }];
+  stagedFiles.clear();
+  usePendingAttachmentsStore.setState({ pending: {} });
   publishSection = {
     active: "drodio",
     destinations: {
@@ -653,6 +686,395 @@ describe("destination resolution", () => {
     expect(res.ok).toBe(false);
     if (res.ok) throw new Error("unreachable");
     expect(res.reason).toBe("no-destination");
+  });
+});
+
+// ═════════════════════════════════════════════════════════════════════════════════════════════
+// MEDIA — the affordance gate, the schema-driven call, the draft proof, the staging boundary
+// ═════════════════════════════════════════════════════════════════════════════════════════════
+//
+// EVERY REFUSAL BELOW ASSERTS THAT `upload_image` WAS NEVER CALLED, not merely that `ok` was false.
+// A refusal suite is the easiest place in this file to write a vacuous test: `expect(res.ok).toBe(
+// false)` passes for a handler that refuses everything, including one whose gate has been deleted
+// and which now fails somewhere else for an unrelated reason.
+//
+// AND EVERY GATE IS PAIRED WITH A POSITIVE running the SAME setup, which is what pins the cause.
+// Absence on its own is ambiguous — an earlier guard short-circuiting the path produces the same
+// observation (bead `sparkle-rvf6n`, seen 6×) — and here the ordering makes that a live risk:
+// affordance → staged → readable → size → draft → schema, six gates in front of one call.
+
+/** Turn the fake destination into one that CAN take an image: the affordance, the descriptor, and a
+ *  tool that records what it was sent. `required` is the schema's own list — the whole point of the
+ *  op is that these names come from the destination and not from this codebase. */
+function serveUploadImage(required: string[] | null): void {
+  affordances = ["project-picker", "image-attach", "take-down"];
+  descriptors = [
+    { name: "create_content", description: "", inputSchema: {} },
+    {
+      name: "upload_image",
+      description: "",
+      inputSchema: required === null ? null : { type: "object", required },
+    },
+  ];
+  tools.set("upload_image", () => JSON.stringify({ ok: true, imageId: "img-1" }));
+}
+
+/** Stage one file the way `attachments.ts` would have, and make it loadable. `bytes` is the size of
+ *  the BASE64 payload, which is what the cap is expressed in. */
+function stage(path: string, opts: { bytes?: number; mime?: string; dataUrl?: string | null } = {}): string {
+  const mime = opts.mime ?? "image/png";
+  const payload = "A".repeat(opts.bytes ?? 12);
+  const dataUrl = opts.dataUrl === undefined ? `data:${mime};base64,${payload}` : opts.dataUrl;
+  usePendingAttachmentsStore.getState().add("agent-1", [path]);
+  stagedFiles.set(path, { path, name: path.split("/").pop() ?? path, data_url: dataUrl });
+  return path;
+}
+
+const SHOT = "/Users/x/project/shot.png";
+
+describe("publish_attach_media — the affordance probe is the gate, not a try/catch", () => {
+  it("refuses when the destination does not expose upload_image, and names the tool", async () => {
+    serve(post({ visibility: "draft" }));
+    stage(SHOT); // staged and loadable: the ONLY thing missing is the affordance.
+
+    const res = await attachMedia("p1", SHOT);
+
+    expect(res.ok).toBe(false);
+    if (res.ok) throw new Error("unreachable");
+    expect(res.reason).toBe("media-unsupported");
+    // NAMING THE TOOL IS THE CONTRACT. "Not supported" without the tool name is unactionable for
+    // the destination author, who is the only person who can fix it.
+    expect(res.message).toContain("upload_image");
+    // THE SIDE EFFECT: nothing was uploaded — and nothing was even read, because the gate is the
+    // probe rather than a caught failure from the call.
+    expect(uploaded()).toHaveLength(0);
+    expect(calls).toHaveLength(0);
+  });
+
+  // THE PAIRED POSITIVE. Without it the refusal above is satisfied by a handler that refuses every
+  // media call, and turning the affordance on would change nothing.
+  it("DOES upload when the affordance is present", async () => {
+    serve(post({ visibility: "draft" }));
+    serveUploadImage(["contentId", "imageBase64"]);
+    stage(SHOT);
+
+    const res = await attachMedia("p1", SHOT);
+
+    expect(res.ok).toBe(true);
+    expect(uploaded()).toHaveLength(1);
+  });
+
+  it("refuses video by name, pointing at both tools and the video-attach affordance", async () => {
+    serve(post({ visibility: "draft" }));
+    serveUploadImage(["contentId", "imageBase64"]); // even fully capable for images.
+    stage(SHOT);
+
+    const res = await attachMedia("p1", SHOT, { mediaKind: "video" });
+
+    expect(res.ok).toBe(false);
+    if (res.ok) throw new Error("unreachable");
+    expect(res.reason).toBe("media-unsupported");
+    expect(res.message).toContain("create_video_upload_token");
+    expect(res.message).toContain("attach_video");
+    expect(res.message).toContain("video-attach");
+    expect(uploaded()).toHaveLength(0);
+  });
+});
+
+describe("publish_attach_media — the arguments come from the destination's own schema", () => {
+  // ⚠️ THE `sparkle-16y6h` TRAP, ASSERTED. `upload_image` does not exist on the reference
+  // destination and its argument names have never been observed, so a hardcoded `{contentId,
+  // imageBase64}` would pass every test written against itself and never once run in production.
+  // This asserts the ARGS, not that the call happened.
+  it("sends exactly the properties the schema asked for — snake_case spelling", async () => {
+    serve(post({ visibility: "draft" }));
+    serveUploadImage(["post_id", "image_base64", "file_name", "mime_type"]);
+    stage(SHOT, { bytes: 8, mime: "image/png" });
+
+    const res = await attachMedia("p1", SHOT);
+
+    expect(res.ok).toBe(true);
+    expect(uploaded()).toHaveLength(1);
+    // EXACTLY these keys, and the right VALUE behind each one.
+    expect(Object.keys(uploaded()[0]!.args).sort()).toEqual(
+      ["file_name", "image_base64", "mime_type", "post_id"],
+    );
+    expect(uploaded()[0]!.args).toEqual({
+      post_id: "p1",
+      image_base64: "AAAAAAAA",
+      file_name: "shot.png",
+      mime_type: "image/png",
+    });
+  });
+
+  it("sends a DIFFERENT schema's spelling — the names track the destination, not this codebase", async () => {
+    serve(post({ visibility: "draft" }));
+    serveUploadImage(["contentId", "dataUrl"]);
+    stage(SHOT, { bytes: 4, mime: "image/jpeg" });
+
+    const res = await attachMedia("p1", SHOT);
+
+    expect(res.ok).toBe(true);
+    expect(uploaded()[0]!.args).toEqual({
+      contentId: "p1",
+      dataUrl: "data:image/jpeg;base64,AAAA",
+    });
+  });
+
+  // Doc §5: "an absent `required` array reads as 'requires nothing'". Refusing there would be
+  // wrong — the destination said it needs nothing.
+  it.each([
+    ["no schema at all", null as string[] | null],
+    ["a schema with no required array", [] as string[] | null],
+  ])("falls back to the documented best-effort set when the tool declares %s", async (_l, req) => {
+    serve(post({ visibility: "draft" }));
+    serveUploadImage(req);
+    stage(SHOT);
+
+    const res = await attachMedia("p1", SHOT);
+
+    expect(res.ok).toBe(true);
+    expect(Object.keys(uploaded()[0]!.args).sort()).toEqual([...UPLOAD_IMAGE_BEST_EFFORT_ARGS].sort());
+  });
+
+  // THE REFUSAL BRANCH — the one the task calls load-bearing, and the one a hardcoded call could
+  // never reach.
+  it("refuses a required property it has no value for, NAMES it, and never calls the tool", async () => {
+    serve(post({ visibility: "draft" }));
+    serveUploadImage(["contentId", "imageBase64", "altText"]);
+    stage(SHOT);
+
+    const res = await attachMedia("p1", SHOT);
+
+    expect(res.ok).toBe(false);
+    if (res.ok) throw new Error("unreachable");
+    expect(res.reason).toBe("media-arg-unsupported");
+    // THE EXACT PROPERTY. "The shape didn't match" is unactionable; this tells the next reader
+    // precisely what to add.
+    expect(res.message).toContain("altText");
+    // THE SIDE EFFECT: the spy proves no half-filled call left.
+    expect(uploaded()).toHaveLength(0);
+  });
+
+  it("refuses when the probe claims the affordance but the tool list has no upload_image", async () => {
+    serve(post({ visibility: "draft" }));
+    affordances = ["project-picker", "image-attach"];
+    descriptors = [{ name: "create_content", description: "", inputSchema: {} }];
+    stage(SHOT);
+
+    const res = await attachMedia("p1", SHOT);
+
+    expect(res.ok).toBe(false);
+    if (res.ok) throw new Error("unreachable");
+    expect(res.reason).toBe("media-unsupported");
+    expect(uploaded()).toHaveLength(0);
+  });
+});
+
+describe("publish_attach_media — DRAFT-ONLY, proved host-side", () => {
+  it("refuses a LIVE post, names publish_update_live, and never uploads", async () => {
+    serve(post({ visibility: "public" }));
+    serveUploadImage(["contentId", "imageBase64"]);
+    stage(SHOT);
+
+    const res = await attachMedia("p1", SHOT);
+
+    expect(res.ok).toBe(false);
+    if (res.ok) throw new Error("unreachable");
+    expect(res.reason).toBe("post-is-live");
+    expect(res.message).toContain("publish_update_live");
+    expect(uploaded()).toHaveLength(0);
+  });
+
+  it.each(["PUBLIC", "live", "scheduled", "unlisted", "archived"])(
+    "refuses %s too — the literals a naive equality check misses — and never uploads",
+    async (visibility) => {
+      serve(post({ visibility }));
+      serveUploadImage(["contentId", "imageBase64"]);
+      stage(SHOT);
+
+      const res = await attachMedia("p1", SHOT);
+
+      expect(res.ok).toBe(false);
+      expect(uploaded()).toHaveLength(0);
+    },
+  );
+
+  it("refuses an UNKNOWN literal, saying what it saw, and never uploads", async () => {
+    serve(post({ visibility: "embargoed" }));
+    serveUploadImage(["contentId", "imageBase64"]);
+    stage(SHOT);
+
+    const res = await attachMedia("p1", SHOT);
+
+    expect(res.ok).toBe(false);
+    if (res.ok) throw new Error("unreachable");
+    expect(res.reason).toBe("unknown-visibility");
+    expect(res.message).toContain("embargoed");
+    expect(uploaded()).toHaveLength(0);
+  });
+
+  // THE PERMISSIVE PATH THAT WILL ACTUALLY HAPPEN — a timeout, a 5xx, a revoked token.
+  it("refuses when the visibility LOOKUP FAILS, and never uploads", async () => {
+    serve(post({ visibility: "draft" }));
+    serveUploadImage(["contentId", "imageBase64"]);
+    stage(SHOT);
+    tools.set("get_content", () => {
+      throw new Error("gateway timeout");
+    });
+
+    const res = await attachMedia("p1", SHOT);
+
+    expect(res.ok).toBe(false);
+    if (res.ok) throw new Error("unreachable");
+    expect(res.reason).toBe("visibility-unreadable");
+    expect(uploaded()).toHaveLength(0);
+  });
+});
+
+describe("publish_attach_media — the model cannot name an arbitrary path", () => {
+  it("refuses a path that was never staged, and never reads or uploads it", async () => {
+    serve(post({ visibility: "draft" }));
+    serveUploadImage(["contentId", "imageBase64"]);
+    // Loadable, but NOT staged: this is exactly the shape of the exfiltration attempt — a real,
+    // readable file the model simply named.
+    stagedFiles.set("/Users/x/.ssh/id_rsa", {
+      path: "/Users/x/.ssh/id_rsa",
+      name: "id_rsa",
+      data_url: "data:image/png;base64,AAAA",
+    });
+
+    const res = await attachMedia("p1", "/Users/x/.ssh/id_rsa");
+
+    expect(res.ok).toBe(false);
+    if (res.ok) throw new Error("unreachable");
+    expect(res.reason).toBe("media-not-staged");
+    expect(uploaded()).toHaveLength(0);
+    // Never even read: `load_attachment` was not invoked for it.
+    expect(invoke.mock.calls.filter((c) => c[0] === "load_attachment")).toHaveLength(0);
+  });
+
+  // THE PAIRED POSITIVE, over the SAME path — staging is the only difference, which is what pins
+  // the staged-set check as the cause rather than something about the path itself.
+  it("accepts that same path once it IS staged", async () => {
+    serve(post({ visibility: "draft" }));
+    serveUploadImage(["contentId", "imageBase64"]);
+    stage("/Users/x/.ssh/id_rsa");
+
+    const res = await attachMedia("p1", "/Users/x/.ssh/id_rsa");
+
+    expect(res.ok).toBe(true);
+    expect(uploaded()).toHaveLength(1);
+  });
+
+  it("narrows to ONE agent's queue when an agentId is given", async () => {
+    serve(post({ visibility: "draft" }));
+    serveUploadImage(["contentId", "imageBase64"]);
+    stage(SHOT); // staged for agent-1
+
+    const res = await attachMedia("p1", SHOT, { agentId: "agent-2" });
+
+    expect(res.ok).toBe(false);
+    if (res.ok) throw new Error("unreachable");
+    expect(res.reason).toBe("media-not-staged");
+    expect(uploaded()).toHaveLength(0);
+  });
+
+  it("refuses a staged file that does not come back as an image", async () => {
+    serve(post({ visibility: "draft" }));
+    serveUploadImage(["contentId", "imageBase64"]);
+    stage("/Users/x/project/notes.pdf", { dataUrl: null });
+
+    const res = await attachMedia("p1", "/Users/x/project/notes.pdf");
+
+    expect(res.ok).toBe(false);
+    if (res.ok) throw new Error("unreachable");
+    expect(res.reason).toBe("media-unreadable");
+    expect(uploaded()).toHaveLength(0);
+  });
+});
+
+describe("publish_attach_media — the size cap is client-side and names its own cause", () => {
+  it("refuses an over-cap payload BEFORE any destination call at all", async () => {
+    serve(post({ visibility: "draft" }));
+    serveUploadImage(["contentId", "imageBase64"]);
+    stage(SHOT, { bytes: MAX_ENCODED_IMAGE_BYTES + 1 });
+
+    const res = await attachMedia("p1", SHOT);
+
+    expect(res.ok).toBe(false);
+    if (res.ok) throw new Error("unreachable");
+    expect(res.reason).toBe("media-too-large");
+    // THE MESSAGE STATES BOTH NUMBERS — that is the whole point of a client-side cap over an
+    // unexplained 413.
+    expect(res.message).toContain(String(MAX_ENCODED_IMAGE_BYTES + 1));
+    expect(res.message).toContain(String(MAX_ENCODED_IMAGE_BYTES));
+    // BEFORE THE REQUEST IS SENT: no destination tool was called, not even the visibility read.
+    expect(calls).toHaveLength(0);
+  });
+
+  // THE BOUNDARY, paired: exactly at the cap goes through, so the refusal above is the cap and not
+  // "anything large".
+  it("accepts a payload exactly at the cap", async () => {
+    serve(post({ visibility: "draft" }));
+    serveUploadImage(["contentId", "imageBase64"]);
+    stage(SHOT, { bytes: MAX_ENCODED_IMAGE_BYTES });
+
+    const res = await attachMedia("p1", SHOT);
+
+    expect(res.ok).toBe(true);
+    expect(uploaded()).toHaveLength(1);
+  });
+
+  it("caps where the destination's 4.5 MB request-body limit forces it to", () => {
+    expect(MAX_ENCODED_IMAGE_BYTES).toBe(3_300_000);
+  });
+});
+
+describe("publish_attach_media — the pure pieces", () => {
+  it.each([
+    ["no schema", null],
+    ["a bare object", {}],
+    ["a non-array required", { required: "contentId" }],
+    ["a string", "nope"],
+    ["required with non-strings", { required: [1, "contentId", ""] }],
+  ])("reads required properties out of %s without throwing", (_l, schema) => {
+    const r = requiredProperties(schema);
+    expect(Array.isArray(r)).toBe(true);
+    if (schema && typeof schema === "object" && Array.isArray((schema as { required?: unknown }).required)) {
+      expect(r).toEqual(["contentId"]);
+    } else {
+      expect(r).toEqual([]);
+    }
+  });
+
+  it("parses a data URL, and refuses anything that is not one", () => {
+    expect(splitDataUrl("data:image/png;base64,QUJD")).toEqual({
+      mimeType: "image/png",
+      base64: "QUJD",
+    });
+    expect(splitDataUrl("data:image/png;base64,")).toBeNull();
+    expect(splitDataUrl("https://example.com/x.png")).toBeNull();
+    expect(splitDataUrl("")).toBeNull();
+  });
+
+  it("never returns partial args — an unknown property yields no args at all", () => {
+    const values = {
+      contentId: "p1",
+      base64: "QUJD",
+      dataUrl: "data:image/png;base64,QUJD",
+      filename: "x.png",
+      mimeType: "image/png",
+    };
+    const good = buildUploadImageArgs(["contentId", "imageBase64"], values);
+    expect(good).toEqual({
+      ok: true,
+      args: { contentId: "p1", imageBase64: "QUJD" },
+      keys: ["contentId", "imageBase64"],
+    });
+    const bad = buildUploadImageArgs(["contentId", "altText"], values);
+    expect(bad).toEqual({ ok: false, property: "altText" });
+    expect("args" in bad).toBe(false);
   });
 });
 

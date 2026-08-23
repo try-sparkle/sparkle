@@ -491,6 +491,10 @@ const PUBLISH_PHRASES: Record<PublishOp, OpPhrase> = {
   publish_list: phrase("Listing your posts", "Listed your posts"),
   publish_create_draft: phrase("Creating a draft on your site", "Created a draft on your site"),
   publish_update_draft: phrase("Editing a draft on your site", "Edited a draft on your site"),
+  publish_attach_media: phrase(
+    "Attaching an image to a draft on your site",
+    "Attached an image to a draft on your site",
+  ),
   publish_update_live: phrase("Rewriting a live post", "Rewrote a live post"),
   publish_go_live: phrase("Publishing a post to your site", "Published a post to your site"),
   publish_take_down: phrase("Taking a post down", "Took a post down"),

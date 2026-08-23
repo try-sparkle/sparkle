@@ -561,6 +561,10 @@ const PUBLISH_TOOL_SUMMARY: Record<PublishOp, string> = {
   publish_update_draft:
     "Edit a draft on your site. Editing a post that is already LIVE is refused here and needs " +
     "`publish_update_live`, which always asks first — even if you allow this tool.",
+  publish_attach_media:
+    "Attach an image to a DRAFT on your site. It can only upload a file you have already staged as " +
+    "an attachment, and attaching to a post that is already LIVE is refused — nothing a stranger " +
+    "can see changes.",
   publish_update_live:
     "Rewrite a post that is ALREADY PUBLIC on your site. People may be reading the old text; the " +
     "new text replaces it the moment this runs.",

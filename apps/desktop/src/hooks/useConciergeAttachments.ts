@@ -42,6 +42,10 @@ import {
 import { describePaths } from "../services/logSafePaths";
 import { withDropPaths } from "../services/dropPaths";
 import { safeUnlisten } from "../services/safeUnlisten";
+import {
+  publishComposerAttachmentPaths,
+  clearComposerAttachmentPaths,
+} from "../stores/composerAttachmentsMirror";
 import { log } from "../logger";
 import type { Attachment } from "../components/composer/attachments";
 import type { ConciergeAttachKind } from "../components/Concierge/types";
@@ -151,6 +155,11 @@ export function useConciergeAttachments(): ConciergeAttachments {
   const [stagedSeq, setStagedSeq] = useState(0);
   // Mirror of the list that is readable synchronously (see the header note on take()).
   const ref = useRef<Attachment[]>([]);
+  // This box's identity in `stores/composerAttachmentsMirror` — never inspected, only compared, so
+  // an outgoing instance's cleanup cannot wipe the incoming one's reading. Stable for this mount.
+  const mirrorOwner = useRef({}).current;
+  // Is THIS box still mounted? The mirror publish is gated on it — see `apply`.
+  const mirrorAlive = useRef(true);
 
   // ── HOW MANY NATIVE PICKERS ARE OPEN ────────────────────────────────────────────────────────
   //
@@ -178,7 +187,55 @@ export function useConciergeAttachments(): ConciergeAttachments {
   const apply = useCallback((fn: (cur: Attachment[]) => Attachment[]) => {
     ref.current = fn(ref.current);
     setAttachments(ref.current);
-  }, []);
+    // Publish the chip paths where a SERVICE can read them (stores/composerAttachmentsMirror).
+    //
+    // This is inside `apply` rather than in a `useEffect` on `attachments` for two reasons, and
+    // both are load-bearing. (1) `apply` is the single funnel all four mutators go through — add,
+    // remove, take, restore — so nothing can change the box without this running; an effect would
+    // have to re-derive that guarantee from a dependency array. (2) It is SYNCHRONOUS with the
+    // ref, so a tool call landing in the same tick as a stage sees the file, which an effect
+    // (running after paint) would miss.
+    //
+    // See that store's header for why a mirror is not the "second staging queue" that
+    // `conciergeTools/attachments.ts` rejects: nothing is staged into it and it is never drained.
+    //
+    // GATED ON LIVENESS, and that guard is the load-bearing half. `apply` is reachable AFTER the
+    // unmount cleanup has run: both async producers are uncancelled — `attach` resolves
+    // `pickAttachments(kind).then(settle)` and `attachPaths` resolves
+    // `loadAttachmentPaths(paths).then(settle)`, and `settle -> add -> apply`. So a human who
+    // clicks Upload (or drops a large image still being read) and then closes the project would
+    // otherwise have the dead hook's late resolve RE-TAKE ownership after the clear, and that
+    // cleanup has already run and never runs again — the phantom would stand for the life of the
+    // window, and would poison the next mount too, since the live box's identity-checked cleanup
+    // would then decline to clear a store owned by the dead token (roborev 68221).
+    if (!mirrorAlive.current) return;
+    publishComposerAttachmentPaths(mirrorOwner, ref.current.map((a) => a.path));
+    // `mirrorOwner` is a ref's `.current`, stable for this mount, so listing it changes nothing at
+    // runtime — it is here so the dependency list stays honest rather than silenced.
+  }, [mirrorOwner]);
+
+  // OWN the mirror for as long as this box is mounted, and HAND IT BACK on the way out.
+  //
+  // `apply` above is the live update, but it runs only on a mutation of a MOUNTED box — so on its
+  // own it would leave the last reading standing forever once `ConciergeHost` unmounts (which it
+  // does: "ConciergeHost unmounts when no project is open", App.tsx). That phantom would be read by
+  // `publish_attach_media` as a legitimately staged file, and it is the SOLE gate on a model-supplied
+  // path reaching a public upload — so a file the human dropped, never sent, and closed the project
+  // on could be published with no box, no chip and no human gesture (roborev 68186).
+  //
+  // The clear is identity-checked because React mounts the NEW instance before running the OLD
+  // one's cleanup: without it, a remount's survivor is the dead instance's clear. Empty deps — this
+  // owns the mount/unmount edges only; `apply` carries every change in between.
+  useEffect(() => {
+    // Set on ENTRY, not just cleared on exit: under strict mode's double-invoke the effect runs,
+    // cleans up, and runs again, so a flag only ever cleared would leave a live box marked dead.
+    mirrorAlive.current = true;
+    publishComposerAttachmentPaths(mirrorOwner, ref.current.map((a) => a.path));
+    return () => {
+      mirrorAlive.current = false;
+      clearComposerAttachmentPaths(mirrorOwner);
+    };
+  }, [mirrorOwner]);
 
   const add = useCallback(
     (atts: Attachment[]) => {

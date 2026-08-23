@@ -339,6 +339,7 @@ import {
   PUBLISH_RISK,
   PUBLISH_KINDS,
   MAX_PUBLISH_TAGS,
+  attachMedia,
   createDraft,
   getPost,
   goLive,
@@ -2437,6 +2438,30 @@ const publishDestinationArgs = z
   .object({ destinationId: z.string().min(1).optional() })
   .strict();
 
+/**
+ * `publish_attach_media`'s arguments.
+ *
+ * `path` IS NOT A FREE PATH ARGUMENT, whatever this schema looks like. The handler refuses any path
+ * that is not already in the attachment staging queue — see the media section of publish.ts, note
+ * 4. The schema's job is only to make sure a string arrived; the containment rule is
+ * `attachments.ts`'s and is enforced host-side, because a schema cannot know what is staged.
+ *
+ * `mediaKind` accepts `"video"` DELIBERATELY. Refusing it here would produce a bad-args error that
+ * says nothing about why; letting it reach the handler produces a refusal that names both video
+ * tools, names the `video-attach` affordance, and says what it is blocked on.
+ */
+const publishAttachMediaArgs = z
+  .object({
+    contentId: z.string().min(1, "a post id is required"),
+    path: z.string().min(1, "name the staged file to attach"),
+    /** Narrows which agent's staging queue is consulted. Omitted = every queue; the containment
+     *  rule is unchanged either way, since it was applied when the file was staged. */
+    agentId: z.string().min(1).optional(),
+    mediaKind: z.enum(["image", "video"]).optional(),
+    destinationId: z.string().min(1).optional(),
+  })
+  .strict();
+
 const publishListArgs = z
   .object({
     destinationId: z.string().min(1).optional(),
@@ -2528,6 +2553,13 @@ const PUBLISH_ROUTES: Record<PublishOp, Handler> = {
   publish_update_draft: route(publishUpdateArgs, async (a, ctx) => {
     const { contentId, destinationId, ...fields } = a;
     return fromPublish(ctx, await updateDraft(contentId, destinationId, fields));
+  }),
+  // ⚠️ `routine`, AND THAT IS ONLY DEFENSIBLE BECAUSE `attachMedia` REFUSES A LIVE POST HOST-SIDE.
+  // Adding an image to something strangers are already reading is a public act; the risk table
+  // cannot see visibility, so the host does. See publish.ts's media section.
+  publish_attach_media: route(publishAttachMediaArgs, async (a, ctx) => {
+    const { contentId, path, ...rest } = a;
+    return fromPublish(ctx, await attachMedia(contentId, path, rest));
   }),
   publish_update_live: route(publishUpdateArgs, async (a, ctx) => {
     const { contentId, destinationId, ...fields } = a;

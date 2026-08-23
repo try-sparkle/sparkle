@@ -149,6 +149,8 @@ import { invoke } from "@tauri-apps/api/core";
 
 import { getConfig } from "../config";
 import { findApproval } from "../../stores/conciergeApprovals";
+import { usePendingAttachmentsStore } from "../../stores/pendingAttachmentsStore";
+import { composerAttachmentPaths } from "../../stores/composerAttachmentsMirror";
 import type { ApprovalArgLine } from "../../stores/conciergeApprovals";
 
 // ---------------------------------------------------------------------------------------------
@@ -223,6 +225,8 @@ export const PUBLISH_OPS = [
   // Draft writes — the drafting loop stays free-flowing, which is the founder's explicit call.
   "publish_create_draft",
   "publish_update_draft",
+  // A DRAFT-ONLY media write — see {@link attachMedia} for why it sits with the draft writes.
+  "publish_attach_media",
   // The three a human rules on.
   "publish_update_live",
   "publish_go_live",
@@ -247,7 +251,10 @@ export type PublishRisk = "read-only" | "routine" | "disruptive" | "irreversible
  *   read-only    → allow    the five reads
  *   routine      → allow    the two DRAFT writes: local to the founder, invisible to anyone else,
  *                           and one `update_content` from undone. Asking about each keystroke of a
- *                           draft is how the compose loop stops being a conversation.
+ *                           draft is how the compose loop stops being a conversation. AND
+ *                           `publish_attach_media`, whose `routine` word is defensible ONLY because
+ *                           {@link attachMedia} refuses host-side unless the target PROVES it is a
+ *                           draft — see the note on its entry below.
  *   irreversible → ask      `publish_update_live` and `publish_go_live` — see the header for why
  *                           this word and not `outward-facing`.
  *   disruptive   → ask      `publish_take_down`. It stops something that is live and being read.
@@ -264,6 +271,15 @@ export const PUBLISH_RISK: Record<PublishOp, PublishRisk> = {
   publish_list: "read-only",
   publish_create_draft: "routine",
   publish_update_draft: "routine",
+  // ⚠️ `routine` IS ONLY DEFENSIBLE BECAUSE OF THE HOST REFUSAL IN {@link attachMedia}. Putting an
+  // image on a post that is already public is a public act, and a static risk table cannot see
+  // visibility — it is server state. So this op reuses {@link readVisibility} exactly as
+  // `publish_update_draft` does and refuses `post-is-live` before it uploads anything. Delete that
+  // refusal and this word is wrong: the model would be able to change what strangers see, on the
+  // auto-allowed path, by picking the cheap name. There is deliberately no gated sibling to fall
+  // back to (no `publish_attach_media_live`), because the destination has no media tool at all yet
+  // — so the honest answer for a live post is "no", not "ask".
+  publish_attach_media: "routine",
   publish_update_live: "irreversible",
   publish_go_live: "irreversible",
   publish_take_down: "disruptive",
@@ -316,7 +332,20 @@ export type PublishRefusalCode =
   /** `publish_content` returned without the post reading as public. Never settle this as success. */
   | "publish-unconfirmed"
   /** The destination's answer was not a content object we can read. */
-  | "unreadable-response";
+  | "unreadable-response"
+  /** The destination exposes no media tool for what was asked — the `image-attach` affordance (or,
+   *  for video, `video-attach`) is absent. THE HONEST STATE OF THE REFERENCE DESTINATION TODAY. */
+  | "media-unsupported"
+  /** The named file is not in the attachment staging queue, so this build will not read it. */
+  | "media-not-staged"
+  /** The staged file could not be read as an image. */
+  | "media-unreadable"
+  /** The BASE64-ENCODED payload is over {@link MAX_ENCODED_IMAGE_BYTES}. Refused before the
+   *  request leaves, so the failure names its cause instead of arriving as an unexplained 413. */
+  | "media-too-large"
+  /** `upload_image`'s own `inputSchema` requires a property Sparkle has no value for. Refused
+   *  NAMING THAT PROPERTY rather than sending a half-filled call. */
+  | "media-arg-unsupported";
 
 function ok<T>(op: PublishOp, data: T): PublishOk<T> {
   return { ok: true, op, risk: PUBLISH_RISK[op], data };
@@ -351,6 +380,14 @@ export const DESTINATION_TOOLS = {
   updateContent: "update_content",
   publishContent: "publish_content",
   unpublishContent: "unpublish_content",
+  /** OPTIONAL (doc §4). Absent on the reference destination today — its presence is what earns the
+   *  `image-attach` affordance, and {@link attachMedia} gates on that affordance rather than on a
+   *  try/catch around the call. */
+  uploadImage: "upload_image",
+  /** OPTIONAL, and NOT IMPLEMENTED on this side — see {@link attachMedia}'s video refusal. Named
+   *  here only so the refusal can quote both tools without spelling string literals twice. */
+  createVideoUploadToken: "create_video_upload_token",
+  attachVideo: "attach_video",
 } as const;
 
 /**
@@ -611,6 +648,30 @@ export interface PublishDeps {
   /** The approval ledger, read at execution time to re-check the raise-time snapshot. */
   findApproval: typeof findApproval;
   now: () => number;
+  /**
+   * Read one STAGED file's bytes, as the base64 data URL `load_attachment` already produces.
+   *
+   * ⚠️ ON THE DEPS OBJECT, NOT `invoke(...)` AT THE CALL SITE — AGENTS.md's "defaulted seam"
+   * finding (`sparkle-lgbwf`, seen 4×). The default is {@link LIVE_PUBLISH_DEPS} and
+   * `publish.test.ts` drives the handler with its DEFAULT deps over a mocked
+   * `@tauri-apps/api/core`, so the line wiring the real command in is itself under test.
+   *
+   * REUSES `load_attachment` rather than adding a command: it already returns
+   * `data:<mime>;base64,<payload>` for an image and `null` for anything it will not preview, and it
+   * runs Rust's own `validate_read_path` allow-list on the way. Its known weakness — it ECHOES the
+   * path it was handed, so it cannot be trusted to canonicalize — does not bite here, because the
+   * only paths that reach it are ones already found in the staging queue, which holds the RESOLVED
+   * paths `attachments.ts` put there.
+   */
+  readStagedImage: (path: string) => Promise<StagedImageWire>;
+}
+
+/** `load_attachment`'s wire shape. `data_url` is a Rust `Option`, so it crosses as `null` and never
+ *  as an absent key — see the note on {@link PublishAffordance}. */
+export interface StagedImageWire {
+  path: string;
+  name: string;
+  data_url: string | null;
 }
 
 export const LIVE_PUBLISH_DEPS: PublishDeps = {
@@ -625,6 +686,7 @@ export const LIVE_PUBLISH_DEPS: PublishDeps = {
   },
   findApproval,
   now: () => Date.now(),
+  readStagedImage: (path) => invoke("load_attachment", { path }),
 };
 
 /**
@@ -1446,4 +1508,450 @@ export async function takeDown(
   if (!res.ok) return res.refusal;
   absorbContent(dest.id, res.decoded, deps.now());
   return ok(op, { destinationId: dest.id, content: res.decoded });
+}
+
+// ---------------------------------------------------------------------------------------------
+// MEDIA — attach a STAGED image to a DRAFT, by reading the destination's own schema
+// ---------------------------------------------------------------------------------------------
+//
+// ⚠️ FOUR THINGS HERE ARE THE POINT, NOT DETAILS. Each one is a named failure this build has
+// already paid for somewhere else.
+//
+// 1. `upload_image`'s ARGUMENT NAMES ARE NOT HARDCODED. The tool does not exist on the reference
+//    destination and its argument shape has never been observed. Writing `{ contentId, imageBase64 }`
+//    from the design doc would be `sparkle-16y6h` exactly: two halves built in parallel against a
+//    frozen field list, both suites green, the merge clean, and the shipped feature never once ran.
+//    So the call is built FROM THE DESTINATION'S OWN `inputSchema.required`, through the declared
+//    name table {@link UPLOAD_IMAGE_ARG_SOURCES}, and a required property that table does not know
+//    is a LOUD REFUSAL naming that exact property — never a half-filled call, never an invented
+//    value. Doc §5 says an absent `required` reads as "requires nothing", so that case sends
+//    {@link UPLOAD_IMAGE_BEST_EFFORT_ARGS} instead of refusing.
+//
+// 2. THE GATE IS THE PROBE, NOT A TRY/CATCH. `image-attach` is an OPTIONAL affordance
+//    (`publish_capabilities.rs`), and its absence is the honest state of the reference destination
+//    TODAY — so this is the branch that will actually run. It has to read as a clean explanation,
+//    which a caught transport error never does: "the tool call failed" and "your site does not
+//    offer this yet" are different sentences and only one of them is actionable.
+//
+// 3. DRAFT-ONLY, ENFORCED HOST-SIDE. See the note on `publish_attach_media` in {@link PUBLISH_RISK}:
+//    the `routine` classification is only defensible because of the {@link readVisibility} refusal
+//    below, which is the same load-bearing member the whole live-edit split rests on.
+//
+// 4. THE MODEL CANNOT NAME AN ARBITRARY PATH. Uploading a model-chosen absolute path to a public
+//    website is an exfiltration hole with a URL at the end of it. The only paths this op will read
+//    are ones already in the attachment STAGING QUEUE — put there by the human's own drop or by
+//    `attach_to_message`, which vets absoluteness, traversal, project containment, symlink escape,
+//    hidden segments and size (see `attachments.ts`). This op adds no second drop target and no
+//    second containment rule; it inherits that one, and refuses anything outside it.
+
+/**
+ * The BASE64-ENCODED ceiling, ≈3.3 MB — about 2.4 MB of image.
+ *
+ * Vercel's request-body limit is 4.5 MB and the destination runs there, so a larger payload is
+ * refused by infrastructure as an unexplained 413 that names nothing. Enforced CLIENT-SIDE, before
+ * the request is sent, so the failure states the encoded size and the cap. One exported constant,
+ * so the doc, the message and the check cannot drift.
+ */
+export const MAX_ENCODED_IMAGE_BYTES = 3_300_000;
+
+/** What Sparkle can actually put in an `upload_image` argument. A closed set: anything a schema
+ *  asks for that is not one of these is a refusal, because the alternative is inventing a value. */
+export type UploadImageValue = "contentId" | "base64" | "dataUrl" | "filename" | "mimeType";
+
+/**
+ * PROPERTY NAME → WHICH SPARKLE VALUE SATISFIES IT. The whole schema-driven mapping, in one table.
+ *
+ * DECLARED, NOT GUESSED AT CALL TIME. Every entry is a spelling whose meaning is unambiguous, so
+ * satisfying it cannot send the wrong thing. Ambiguous names are deliberately ABSENT — a bare
+ * `data` could mean raw base64 or a full data URL, and a wrong guess uploads a corrupt image and
+ * reports success, which is worse than the refusal. Widening this table is a one-line change once
+ * a real `upload_image` schema has been OBSERVED; widening it on a hunch is the trap.
+ */
+export const UPLOAD_IMAGE_ARG_SOURCES: Readonly<Record<string, UploadImageValue>> = {
+  // The post the image is being attached to.
+  contentId: "contentId",
+  content_id: "contentId",
+  postId: "contentId",
+  post_id: "contentId",
+  id: "contentId",
+  // The payload, base64 with no `data:` prefix.
+  imageBase64: "base64",
+  image_base64: "base64",
+  base64: "base64",
+  imageBase64Data: "base64",
+  // The payload as a whole data URL, prefix included.
+  dataUrl: "dataUrl",
+  data_url: "dataUrl",
+  imageDataUrl: "dataUrl",
+  image_data_url: "dataUrl",
+  // The file's own name.
+  filename: "filename",
+  fileName: "filename",
+  file_name: "filename",
+  name: "filename",
+  // Its media type.
+  mimeType: "mimeType",
+  mime_type: "mimeType",
+  contentType: "mimeType",
+  content_type: "mimeType",
+};
+
+/**
+ * What to send when the tool declares NO schema, or a schema with no `required` array.
+ *
+ * Doc §5: "an absent `required` array reads as 'requires nothing'". Refusing there would be wrong —
+ * the destination said it needs nothing, so the honest move is a best-effort call rather than a
+ * refusal. These four are the values the design doc names, under their canonical spellings.
+ * `dataUrl` is left out on purpose: it carries the same bytes as `base64` + `mimeType`, and sending
+ * a redundant property to a tool that never asked for one is the way to fail a strict schema.
+ */
+export const UPLOAD_IMAGE_BEST_EFFORT_ARGS: readonly string[] = [
+  "contentId",
+  "imageBase64",
+  "filename",
+  "mimeType",
+];
+
+/** What this op did, or would have done. The payload is NEVER echoed — `sentArgKeys` names the
+ *  properties that were filled, which is the assertable fact, without putting megabytes of base64
+ *  into a model's context window. */
+export interface AttachMediaOutcome {
+  destinationId: string;
+  contentId: string;
+  tool: string;
+  /** The property names the call was built from — the schema's own `required`, or the best-effort
+   *  set when it declared none. */
+  sentArgKeys: string[];
+  filename: string;
+  mimeType: string;
+  encodedBytes: number;
+  /** The destination's own answer, decoded. */
+  result: unknown;
+  detail: string;
+}
+
+/** The staged paths this op will consider, from the SAME queue `attachments.ts` writes.
+ *
+ *  With an agent named, only that agent's queue; without one, every queue — v1 has one compose box
+ *  and a model that has just staged a screenshot does not necessarily know which agent id it landed
+ *  under. Widening across agents does not widen the CONTAINMENT rule, which is `attachments.ts`'s
+ *  and is applied per agent at staging time; it only widens which already-vetted file may be named.
+ *
+ *  ⚠️ THIS IS THE ONLY SOURCE OF PATHS. Not a fallback, not a preference — a path that is not in
+ *  here is refused, which is what stops the model naming `~/.ssh/id_rsa` and getting a public URL
+ *  back. */
+export function stagedAttachmentPaths(agentId?: string): string[] {
+  // TWO SOURCES, AND THE FIRST ONE IS THE ONE THAT ACTUALLY ANSWERS (roborev 68164).
+  //
+  // The first cut of this function read ONLY `pendingAttachmentsStore`, which reads like "what is
+  // staged" and is not: `ConciergeHost` SUBSCRIBES to that store and drains the target agent's
+  // entry on any write (a subscription added deliberately by roborev 55403 so an
+  // `attach_to_message` add reaches the box immediately). So the entry is gone before any later
+  // tool call can look, and a human's own drop never lands there at all — it goes straight to
+  // `useConciergeAttachments` local state. Every real invocation refused `media-not-staged`.
+  //
+  // `composerAttachmentPaths()` is the compose box's CURRENT chips, which is what a human means by
+  // "the file I attached" and what the refusal message tells them to produce. It is a read-only
+  // mirror written from the box's single mutation funnel — see that store's header for why it is
+  // not a second staging queue.
+  //
+  // The handoff queue stays as an ADDITIONAL source, never the exclusive one, for the window it
+  // genuinely owns: files dropped on "+ New Build Agent" for an agent whose composer has not
+  // mounted yet, which are legitimately staged and not yet chips.
+  const onTheBox = composerAttachmentPaths();
+  const pending = usePendingAttachmentsStore.getState().pending;
+  const queued = agentId ? (pending[agentId] ?? []) : Object.values(pending).flat();
+  // Deduped: a path can be in both for the instant between the queue write and the drain.
+  return [...new Set([...onTheBox, ...queued])];
+}
+
+/** The `required` property names a tool descriptor declares, or `[]` when it declares none.
+ *
+ *  TOTAL over arbitrary JSON — this is a network peer's answer. `[]` is doc §5's "requires
+ *  nothing", and the caller turns that into the best-effort set rather than into a refusal. */
+export function requiredProperties(inputSchema: unknown): string[] {
+  if (!inputSchema || typeof inputSchema !== "object" || Array.isArray(inputSchema)) return [];
+  const req = (inputSchema as Record<string, unknown>).required;
+  if (!Array.isArray(req)) return [];
+  return req.filter((r): r is string => typeof r === "string" && r.trim() !== "");
+}
+
+/** A data URL split into its media type and its base64 payload, or null when it is not one.
+ *  Total; `load_attachment` produces `data:<mime>;base64,<payload>` and nothing else, but this
+ *  parses rather than assumes because the alternative is uploading a prefix as image bytes. */
+export function splitDataUrl(dataUrl: string): { mimeType: string; base64: string } | null {
+  const m = /^data:([^;,]+);base64,(.*)$/s.exec(dataUrl);
+  if (!m) return null;
+  const mimeType = m[1]!.trim();
+  const base64 = m[2]!;
+  if (!mimeType || !base64) return null;
+  return { mimeType, base64 };
+}
+
+/**
+ * Build `upload_image`'s arguments from the properties it says it requires.
+ *
+ * Returns the args, or the FIRST required property that Sparkle has no value for. Nothing partial
+ * is ever returned: a caller cannot accidentally send a half-filled call, because the failure shape
+ * carries no args at all.
+ */
+export function buildUploadImageArgs(
+  required: readonly string[],
+  values: Record<UploadImageValue, string>,
+): { ok: true; args: Record<string, unknown>; keys: string[] } | { ok: false; property: string } {
+  const names = required.length > 0 ? required : UPLOAD_IMAGE_BEST_EFFORT_ARGS;
+  const args: Record<string, unknown> = {};
+  for (const name of names) {
+    const source = UPLOAD_IMAGE_ARG_SOURCES[name];
+    if (!source) return { ok: false, property: name };
+    args[name] = values[source];
+  }
+  return { ok: true, args, keys: names.slice() };
+}
+
+/** What {@link attachMedia} was asked to attach. `video` exists so the refusal can be specific —
+ *  see the video block in {@link attachMedia}. */
+export type MediaKind = "image" | "video";
+
+/**
+ * Attach a STAGED IMAGE to a DRAFT post, by calling the destination's own `upload_image`.
+ *
+ * Read the four numbered notes at the top of this section before changing anything here. The order
+ * of the checks below is part of the design, not incidental:
+ *
+ *   destination → video refusal → AFFORDANCE PROBE → staged-path check → read bytes → SIZE CAP →
+ *   DRAFT PROOF → schema read → the call.
+ *
+ * The size cap sits BEFORE the draft proof deliberately: it is a purely local fact, so an
+ * over-sized payload is refused without spending a round trip, and the refusal cannot be confused
+ * with a destination problem. The affordance probe sits first among the network calls because its
+ * refusal is the one that will actually happen today, and it is the cheapest true answer.
+ */
+export async function attachMedia(
+  contentId: string,
+  path: string,
+  opts: { destinationId?: string; agentId?: string; mediaKind?: MediaKind } = {},
+  deps: PublishDeps = LIVE_PUBLISH_DEPS,
+): Promise<PublishResult<AttachMediaOutcome>> {
+  const op: PublishOp = "publish_attach_media";
+  const dest = await resolveDestination(op, deps, opts.destinationId);
+  if (!dest.ok) return dest.refusal;
+
+  // ── VIDEO IS OUT OF SCOPE, AND SAYS SO ─────────────────────────────────────────────────────
+  // `create_video_upload_token` + `attach_video` need a STREAMING client-upload path (a scoped
+  // token, straight to Vercel Blob) that does not exist on the destination side: the design
+  // specified extending `app/api/admin/blob-upload/route.ts` to accept agent keys and that
+  // extension was never built. There is deliberately no base64 path for video — 5 GB through
+  // JSON-RPC is not sensible — so there is nothing here to half-build. Blocked on drodio-website.
+  if (opts.mediaKind === "video") {
+    return refuse(
+      op,
+      "media-unsupported",
+      `I can't attach video to ${dest.id}. That needs \`${DESTINATION_TOOLS.createVideoUploadToken}\` ` +
+        `and \`${DESTINATION_TOOLS.attachVideo}\` — the \`video-attach\` affordance — and it needs a ` +
+        "streaming upload path that is not built on either side yet (video deliberately has no " +
+        "base64 route). Images work once the site exposes `upload_image`; video is blocked on the " +
+        "site adding agent-key support to its blob upload.",
+    );
+  }
+
+  // ── (2) THE GATE IS THE PROBE ──────────────────────────────────────────────────────────────
+  let caps: DestinationCapabilities;
+  try {
+    caps = await deps.probe(dest.id);
+  } catch (e) {
+    return refuse(
+      op,
+      "destination-refused",
+      `I couldn't ask ${dest.id} what it supports, so I don't know whether it can take an image: ` +
+        `${errText(e)}`,
+    );
+  }
+  if (!caps.affordances.includes("image-attach")) {
+    // THE HONEST STATE OF THE REFERENCE DESTINATION TODAY. A clean explanation, not an error.
+    return refuse(
+      op,
+      "media-unsupported",
+      `${dest.id} does not expose \`${DESTINATION_TOOLS.uploadImage}\`, so it can't take an image ` +
+        "attachment — that tool is optional in the destination contract and this site has not " +
+        "implemented it yet. Nothing is wrong with the post or the file; there is simply nowhere " +
+        "to upload it. The post's text can still be drafted and published as normal.",
+    );
+  }
+
+  // ── (4) THE PATH MUST ALREADY BE STAGED ────────────────────────────────────────────────────
+  const wanted = path.trim();
+  const staged = stagedAttachmentPaths(opts.agentId);
+  if (!wanted || !staged.includes(wanted)) {
+    return refuse(
+      op,
+      "media-not-staged",
+      `I won't upload \`${wanted || "(no path)"}\` — it is not one of the ${staged.length} file(s) ` +
+        "staged as attachments, and this is the only place I read files from. Uploading a path I " +
+        "was simply handed would put an arbitrary file from this machine on a public website. " +
+        "Attach the image first (drop it on the compose box, or `attach_to_message`), then name " +
+        "the staged path.",
+    );
+  }
+
+  let loaded: StagedImageWire;
+  try {
+    loaded = await deps.readStagedImage(wanted);
+  } catch (e) {
+    return refuse(op, "media-unreadable", `I couldn't read that staged file: ${errText(e)}`);
+  }
+  const parts = loaded.data_url ? splitDataUrl(loaded.data_url) : null;
+  if (!parts) {
+    // `load_attachment` returns a data URL only for an image it could read whole. A null means the
+    // staged file is not an image (or is past the preview ceiling), and there is no image to send.
+    return refuse(
+      op,
+      "media-unreadable",
+      `\`${loaded.name || wanted}\` didn't come back as image data, so there is nothing to upload. ` +
+        "Only images can be attached to a post, and only ones small enough to read in one piece.",
+    );
+  }
+
+  // ── (5) THE SIZE CAP, CLIENT-SIDE, BEFORE ANYTHING IS SENT ─────────────────────────────────
+  const encodedBytes = parts.base64.length;
+  if (encodedBytes > MAX_ENCODED_IMAGE_BYTES) {
+    return refuse(
+      op,
+      "media-too-large",
+      `\`${loaded.name || wanted}\` is ${encodedBytes} bytes once base64-encoded, over the ` +
+        `${MAX_ENCODED_IMAGE_BYTES}-byte cap, so I did not send it. The cap is a client-side one: ` +
+        "the site runs behind a 4.5 MB request-body limit, and a payload past it comes back as a " +
+        "bare 413 that names nothing. Use a smaller or more compressed image (roughly 2.4 MB of " +
+        "image or less).",
+    );
+  }
+
+  // ── (3) PROVE IT IS A DRAFT — the same gate the whole live-edit split rests on ──────────────
+  const before = await callDestinationTool(op, deps, dest.id, DESTINATION_TOOLS.getContent, {
+    [DESTINATION_CONTENT_ID_ARG]: contentId,
+  });
+  if (!before.ok) {
+    return refuse(
+      op,
+      "visibility-unreadable",
+      `I couldn't read ${contentId} on ${dest.id} to check whether it is still a draft, so I did ` +
+        `not attach anything: ${before.refusal.message}`,
+    );
+  }
+  absorbContent(dest.id, before.decoded, deps.now());
+  const reading = readVisibility(contentObject(before.decoded));
+  // ⚠️ ONE LINE, AND IT IS THE GATE. Same shape as `updateDraft`'s, kept as a single guarded return
+  // so `scripts/mutation-check.sh --line` can delete it in isolation and show the suite goes red.
+  if (!reading.ok) return mediaDraftProofRefusal(op, dest.id, contentId, reading);
+
+  // ── (1) SCHEMA-DRIVEN ARGUMENTS ────────────────────────────────────────────────────────────
+  let descriptors: ToolDescriptorDto[];
+  try {
+    descriptors = await deps.listTools(dest.id);
+  } catch (e) {
+    return refuse(
+      op,
+      "destination-refused",
+      `I couldn't read ${dest.id}'s tool list, so I don't know what \`${DESTINATION_TOOLS.uploadImage}\` ` +
+        `expects and won't guess: ${errText(e)}`,
+    );
+  }
+  const descriptor = descriptors.find((t) => t.name === DESTINATION_TOOLS.uploadImage);
+  if (!descriptor) {
+    // The probe said the affordance is there and the tool list disagrees. Refuse rather than call:
+    // two readings of the same destination that contradict each other is not a state to write in.
+    return refuse(
+      op,
+      "media-unsupported",
+      `${dest.id}'s capability probe reports the \`image-attach\` affordance, but ` +
+        `\`${DESTINATION_TOOLS.uploadImage}\` is not in its tool list — the two answers disagree, so ` +
+        "I did not upload anything. Re-run `publish_probe`.",
+    );
+  }
+
+  const required = requiredProperties(descriptor.inputSchema);
+  const built = buildUploadImageArgs(required, {
+    contentId,
+    base64: parts.base64,
+    dataUrl: loaded.data_url ?? "",
+    filename: loaded.name || basenameOf(wanted),
+    mimeType: parts.mimeType,
+  });
+  if (!built.ok) {
+    // NAMING THE EXACT PROPERTY IS THE CONTRACT. A refusal that says "the shape didn't match" is
+    // unactionable; this one tells whoever adds the next spelling precisely what to add, and it is
+    // reached WITHOUT the call having been made.
+    return refuse(
+      op,
+      "media-arg-unsupported",
+      `${dest.id}'s \`${DESTINATION_TOOLS.uploadImage}\` requires an argument called ` +
+        `\`${built.property}\`, and I have no value for it. I will not send a half-filled upload or ` +
+        `invent one. What I can supply is: the post id, the image as base64, the image as a data ` +
+        `URL, the filename, and the MIME type. Required by that tool: ${required.join(", ") || "(nothing declared)"}.`,
+    );
+  }
+
+  const res = await callDestinationTool(
+    op,
+    deps,
+    dest.id,
+    DESTINATION_TOOLS.uploadImage,
+    built.args,
+  );
+  if (!res.ok) return res.refusal;
+  absorbContent(dest.id, res.decoded, deps.now());
+  return ok(op, {
+    destinationId: dest.id,
+    contentId,
+    tool: DESTINATION_TOOLS.uploadImage,
+    sentArgKeys: built.keys,
+    filename: loaded.name || basenameOf(wanted),
+    mimeType: parts.mimeType,
+    encodedBytes,
+    result: res.decoded,
+    detail:
+      `Uploaded ${loaded.name || basenameOf(wanted)} (${parts.mimeType}, ${encodedBytes} encoded ` +
+      `bytes) to ${contentId} on ${dest.id} via \`${DESTINATION_TOOLS.uploadImage}\`. The post is ` +
+      "still a draft — publishing it is a separate, approved act.",
+  });
+}
+
+/** The draft-proof refusal for the media path. Split out for the same two reasons
+ *  {@link draftProofRefusal} is: the gate stays one mutatable line, and the two arms genuinely say
+ *  different things. Note what this one does NOT say: there is no gated sibling to send the caller
+ *  to, because the destination has no media tool for a live post either. It still names
+ *  `publish_update_live` as the op that exists for editing something public. */
+function mediaDraftProofRefusal(
+  op: PublishOp,
+  destinationId: string,
+  contentId: string,
+  reading: Extract<VisibilityReading, { ok: false }>,
+): PublishRefusal {
+  if (reading.reason === "post-is-live") {
+    return refuse(
+      op,
+      "post-is-live",
+      `${contentId} is not a draft — ${destinationId} reports it as "${reading.seen}", so people ` +
+        "can read it right now, and adding an image to it would change what they see. I won't do " +
+        "that on the auto-allowed path, and there is no gated media sibling to fall back to. Edits " +
+        "to a live post go through `publish_update_live`, which asks the human first; take the post " +
+        "down with `publish_take_down` if you want to add an image and re-publish.",
+    );
+  }
+  return refuse(
+    op,
+    "unknown-visibility",
+    `I can't tell whether ${contentId} is a draft: ${destinationId} reported its visibility as ` +
+      `${reading.seen}, which this build does not recognise. Refusing rather than guessing — an ` +
+      "unrecognised value could just as easily mean it is live, and an image on a live post is " +
+      "something strangers see.",
+  );
+}
+
+/** The last path segment. Local rather than imported from the composer's `basename`, which this
+ *  module has no other reason to depend on; used only as a fallback when `load_attachment` returned
+ *  no name. */
+function basenameOf(path: string): string {
+  const parts = path.split("/").filter((p) => p !== "");
+  return parts[parts.length - 1] ?? path;
 }
