@@ -48,6 +48,8 @@ import { bucketBeads, type Bead, type BeadStatus } from "../services/beads";
 import { useDictationStore } from "../stores/dictationStore";
 import { useInboxStore } from "../stores/inboxStore";
 import { useConciergeQueueStore } from "../stores/conciergeQueueStore";
+import { useConciergeThreadStore } from "../stores/conciergeThreadStore";
+import type { ConciergeMessage } from "../components/Concierge/types";
 import { useResearchStore } from "../services/research/store";
 import type { ResearchTask } from "../services/research/types";
 // THE APP'S OWN KEYS AND FLOOR, imported rather than re-spelled. `engine/columnResize` is a true
@@ -243,6 +245,29 @@ export function visualPrsRequested(search: string): boolean {
 }
 
 /** The query parameter that seeds a queued Level 2 inbox: `?inbox=1`. */
+/** The query parameter that seeds a bead CARD with real lineage: `?beadcard=1`. */
+export const VISUAL_BEAD_CARD_PARAM = "beadcard";
+
+/**
+ * Whether this capture wants the bead-card lineage seed — an epic with children, workers bound to
+ * those children, and a concierge message naming the epic so its card renders in the thread.
+ *
+ * OPT-IN, for the reason spelled out on {@link visualInboxRequested} and paid for once already:
+ * the beads seeded here would otherwise land in the SELECTED project's snapshot, which four
+ * existing sidebar/workspace surfaces photograph. Worse, the agents it binds would add rows to the
+ * build sidebar and the chat message would put a card into `concierge-column`, whose approved
+ * baseline has an empty thread. An unconditional seed would move all of those permanently, with no
+ * way to turn it off.
+ *
+ * It is also why the beads below carry NO `agent:<id>` label: that label is what
+ * `feedbackCount` counts, and the row FEEDBACK pill's widest measured form is pinned by the
+ * twelve-bead seed above. A lineage bead wearing that label would silently re-measure it.
+ */
+export function visualBeadCardRequested(search: string): boolean {
+  const v = new URLSearchParams(search).get(VISUAL_BEAD_CARD_PARAM);
+  return v === "1" || v === "true";
+}
+
 export const VISUAL_INBOX_PARAM = "inbox";
 
 /**
@@ -969,6 +994,138 @@ export function buildLeftPairFixture(): {
  * {@link FIXTURE_SECOND_PRS}): a PR number is unique per repo and an agent id is unique globally,
  * so a collision is a fixture bug in one case and the thing under test in the other.
  */
+/**
+ * THE BEAD-CARD LINEAGE SEED — an epic, its children, the workers building them, and a concierge
+ * message that names the epic so its card renders in the thread.
+ *
+ * ══ WHAT IT HAS TO CONTAIN, AND WHY EACH PART ══════════════════════════════════════════════
+ * The card being photographed draws two lineage rows, and each has a precondition that this fixture
+ * is the only thing that can satisfy:
+ *   • `Tasks:` needs an epic with CHILDREN, and the parent-child edge is the ONLY representation of
+ *     epic membership the app can see (`services/beads.ts`) — so the children carry a real `parent`,
+ *     not an `epic:` label, which nothing reads.
+ *   • `Build agents:` needs WORKER agents whose `beadId` points at those CHILDREN. Binding them to
+ *     the epic's own id instead would render an empty row — that is the exact bug `workersInEpic`
+ *     was written to fix, and a fixture that made it look fine would hide the regression.
+ *
+ * ══ ENOUGH CHILDREN TO OVERFLOW, ON PURPOSE ════════════════════════════════════════════════
+ * NINE tasks and SIX agents, because the whole point of the row is "as many pills as fit, then
+ * +N more". A seed of two would fit at every width the harness captures, so the overflow affordance
+ * — the founder's second expand path — would never appear in a single baseline and the capture
+ * would flatter the layout exactly the way the one-digit FEEDBACK pill did.
+ *
+ * ══ TITLES ARE REALISTIC LENGTHS ═══════════════════════════════════════════════════════════
+ * Mixed short and long, because the packer measures actual pill widths. A set of uniformly tiny
+ * titles photographs a row that no real backlog produces.
+ */
+export function buildBeadCardFixture(): {
+  beads: Bead[];
+  agents: AgentTab[];
+  chat: ConciergeMessage[];
+} {
+  // ONE HYPHEN, DELIBERATELY. `BEAD_ID_IN_PROSE_RE` is
+  // `[a-z][a-z0-9_]{1,30}-[a-z0-9]{3,16}(?:\.[0-9]{1,3})*` — it stops at the SECOND hyphen, so an
+  // id like "vfx-epic-cards" is linkified as "vfx-epic", which resolves against no bead and renders
+  // as bare prose. The capture then succeeds and photographs a sentence. Measured: that is exactly
+  // what happened on this surface's first run, and the `waitFor` on the card is what caught it.
+  const EPIC_ID = "vfxepic-cards";
+  const epic: Bead = {
+    id: EPIC_ID,
+    title: "Bead cards collapse to half height and always show their lineage",
+    description:
+      "The cards the concierge posts into chat take up too much real estate. Collapse them to " +
+      "roughly half height, expand on a click anywhere in the card, and show the tasks and build " +
+      "agents on every card surface.",
+    // `open`, NOT `in_progress`, and the reason is the whole point of this surface: `isStartable`
+    // in `useBeadBuildActions` returns false for any bead whose status is not "open", so a card
+    // seeded as in_progress renders with NO Build It button — and the founder's "move Build It to
+    // the top left" would then be UNPHOTOGRAPHABLE here. Measured: that is what the first baseline
+    // showed. The `Build agents:` row does not depend on this — it keys on workers bound to the
+    // CHILDREN — so an open epic still photographs both halves of the ask at once.
+    status: "open",
+    type: "epic",
+    labels: [],
+    priority: 1,
+    commentCount: 3,
+  };
+
+  const childTitles = [
+    "Merge the status row and the build-state row onto one line",
+    "Move Build It to the top left",
+    "Click the card body to expand",
+    "Tasks row: one line of pills plus +N more",
+    "Build agents row, shown only in active build",
+    "Parent epic rides the merged meta line",
+    "Writable comment composer in the chat card",
+    "Drop the inner scroller when collapsed",
+    "Visual capture surface for the bead card",
+  ];
+  // `closed` on two of them so the card's open/total ratio is not a round number, and so a reader
+  // can tell the row is reporting real statuses rather than a constant.
+  const children: Bead[] = childTitles.map((title, i) => ({
+    id: `${EPIC_ID}.${i + 1}`,
+    title,
+    description: "Seeded by dev/visualFixtures for the bead-card lineage capture.",
+    status: i < 2 ? "closed" : i < 5 ? "in_progress" : "open",
+    type: "task",
+    labels: [],
+    parent: EPIC_ID,
+    priority: 2,
+    commentCount: 0,
+  }));
+
+  // WORKERS BOUND TO THE CHILDREN, never to the epic — see the header. `parentId` points at the
+  // build agent that owns them, mirroring how `workerSpawn` actually writes these rows.
+  const agentNames = [
+    "Merged Meta Line",
+    "Build It Top Left",
+    "Card Click Expand",
+    "Tasks Pill Row",
+    "Build Agents Row",
+    "Parent Chip",
+  ];
+  const agents: AgentTab[] = agentNames.map((name, i) => ({
+    id: `vfx-bc-worker-${i + 1}`,
+    name,
+    kind: "worker",
+    parentId: "vfx-agent-1",
+    beadId: `${EPIC_ID}.${i + 3}`,
+    runtime: "local",
+    worktreePath: `/tmp/sparkle-visual/vfx-bc-worker-${i + 1}`,
+    branch: `sparkle/vfx-bc-worker-${i + 1}`,
+    baseBranch: "main",
+    lastPrompt: childTitles[i + 2] ?? "Build it",
+    promptHistory: [],
+    activity: "Building",
+    task: childTitles[i + 2] ?? "Build it",
+    parentBranch: "sparkle/vfx-agent-1",
+    namePinned: false,
+    autoNameBasis: name,
+    autoNameVariants: { title: name, description: name },
+    shellCommand: null,
+    createdAt: FIXTURE_NOW - (i + 1) * MINUTE,
+  }));
+
+  // THE BEAD ID IS BARE TEXT, NEVER BACKTICKED. `remarkBeadRefs` walks TEXT nodes only and skips
+  // inline-code spans, so a backticked id renders as dead monospace instead of the card this
+  // surface exists to photograph — the one failure mode that would make the capture silently empty
+  // while still succeeding.
+  const chat: ConciergeMessage[] = [
+    {
+      id: "vfx-bc-you-1",
+      kind: "you",
+      text: "where are we on the bead card work?",
+    },
+    {
+      id: "vfx-bc-sparkle-1",
+      kind: "sparkle",
+      text: `Here is where it stands — ${EPIC_ID} is in active build with six agents on it.`,
+    },
+  ];
+
+  return { beads: [epic, ...children], agents, chat };
+}
+
 export function buildSecondProjectFixture(): {
   project: Project;
   status: Record<string, AgentTabStatus>;
@@ -1066,7 +1223,21 @@ export function detachPersistence(): void {
   // holding two projects they have never opened and missing the ones they had, which reads as data
   // loss rather than as a fixture. It has no exported persist-key constant, so the test that proves
   // this reads the key off the store's own persist options rather than re-spelling it.
-  for (const store of [useProjectStore, useRuntimeStore, useDictationStore, useUiStore]) {
+  // useConciergeThreadStore IS IN THIS LIST because the bead-card capture SEEDS A THREAD.
+  //
+  // It persists the visible conversation, so writing `chat` for `?beadcard=1` through the live
+  // middleware would REPLACE the developer's real concierge thread on disk — a thread this app
+  // deliberately keeps across quit and relaunch, and which nothing else can reconstruct. That is
+  // the plainest case of the clobber this function's header promises to prevent, and it is worse
+  // than the `sparkle-ui` one above: an open-tab set is an annoyance to rebuild, a lost
+  // conversation is not rebuildable at all.
+  for (const store of [
+    useProjectStore,
+    useRuntimeStore,
+    useDictationStore,
+    useUiStore,
+    useConciergeThreadStore,
+  ]) {
     (store as unknown as PersistApi).persist?.setOptions({ storage: noop });
   }
 }
@@ -1092,6 +1263,14 @@ export function applyVisualFixtures(
   const second = visualProjectCount(search) === 2 ? buildSecondProjectFixture() : null;
   const extras = [left, second].filter((x): x is NonNullable<typeof x> => x !== null);
 
+  // THE BEAD-CARD SEED — its own opt-in axis (`?beadcard=1`), composed like the two above.
+  // Its agents are appended to the PRIMARY project's roster rather than replacing it, so the build
+  // sidebar keeps every row the other surfaces are baselined against and simply gains the workers
+  // whose pills the `Build agents:` row draws.
+  const beadCard = visualBeadCardRequested(search) ? buildBeadCardFixture() : null;
+  const primary: Project =
+    beadCard === null ? project : { ...project, agents: [...project.agents, ...beadCard.agents] };
+
   // FIRST — before a single write. See "SAFETY, PART TWO" at the top of this file.
   detachPersistence();
 
@@ -1102,7 +1281,7 @@ export function applyVisualFixtures(
     // The PRIMARY project stays first and stays `selectedProjectId`, so the single-project,
     // single-pair layout — and every surface baselined against it — is untouched when neither
     // `?pairs=2` nor `?projects=2` is asked for.
-    projects: [project, ...extras.map((e) => e.project)],
+    projects: [primary, ...extras.map((e) => e.project)],
     selectedProjectId: project.id,
     removedIds: {},
   });
@@ -1215,9 +1394,26 @@ export function applyVisualFixtures(
     boardBead("vfx-left-bead-5", "Terminal scrollback survives a pane move", "in_progress", 2),
     boardBead("vfx-left-bead-6", "Retire the preview segment", "closed", 2),
   ];
+  // The lineage beads join the SELECTED project's snapshot only when asked for, so `BeadPillHost`
+  // can resolve the id the seeded chat message names. Appended, never substituted: the feedback
+  // beads above are what the row FEEDBACK pill's measured width depends on.
+  const projectBeads: Bead[] = beadCard === null ? fixtureBeads : [...fixtureBeads, ...beadCard.beads];
+  // ── THE SEEDED THREAD, SO THERE IS A CARD IN THE CHAT TO PHOTOGRAPH ─────────────────────────
+  //
+  // `concierge-column`'s existing baseline has an EMPTY thread, which is why this is behind the
+  // opt-in and why it is written with `setState` rather than through the store's append action —
+  // that action stamps ids and clock values, the exact non-determinism this file exists to remove.
+  //
+  // SAFE ONLY BECAUSE `detachPersistence()` NOW COVERS THIS STORE (see its list): the concierge
+  // thread is persisted across quit and relaunch, so an attached write here would replace the
+  // developer's real conversation on disk with two fixture lines.
+  if (beadCard !== null) {
+    useConciergeThreadStore.setState({ chat: beadCard.chat });
+  }
+
   useBeadsStore.setState({
     byProject: {
-      [project.id]: { beads: fixtureBeads, board: bucketBeads(fixtureBeads), loadedAt: 0 },
+      [project.id]: { beads: projectBeads, board: bucketBeads(projectBeads), loadedAt: 0 },
       ...(left
         ? {
             [left.project.id]: {

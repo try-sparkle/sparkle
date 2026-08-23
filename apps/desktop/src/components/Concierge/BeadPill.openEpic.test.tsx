@@ -81,11 +81,24 @@ beforeEach(() => {
   useBeadsStore.setState({ byProject: { p1: { beads: ALL, board: {} as never, loadedAt: 1 } } });
   useProjectStore.setState({
     projects: [{ id: "p1", name: "Sparkle", rootPath: "/tmp/p1", agents: [] }],
+    // RESET, and it is what gives the left-side rows below any grip at all. `setState` SHALLOW
+    // MERGES, so without this `selectedProjectId` survives from the previous row — and the rows
+    // above run with `pairAssignment: {}`, which `sideOf` resolves to "right", so by the time a
+    // left-side row starts the selection is already "p1". A `toBe(captured-before)` assertion then
+    // passes against the narrow `selectProject` writing "p1" again (roborev 68125).
+    selectedProjectId: null,
   } as never);
   useUiStore.setState({
     epicFocusBySide: { left: null, right: null },
     beadFocusBySide: { left: null, right: null },
     workModeBySide: { left: "build", right: "build" },
+    // RESET, because one row below deliberately assigns p1 to the LEFT pair — the only fixture the
+    // side-vs-selection defect is visible in. Without this it leaks into every later row, which
+    // then asserts against the right pair and reads null.
+    pairAssignment: {},
+    leftProjectId: null,
+    // Two rows below close every tab; without this reset that leaks into the rest of the file.
+    openProjectIds: null,
   } as never);
 });
 afterEach(() => {
@@ -218,6 +231,74 @@ describe("viewInColumn — the two writes, and why one is not enough", () => {
     realHost(DECLARED.id);
     fireEvent.click(inColumn()!);
     expect(useUiStore.getState().workModeBySide.right).toBe("build");
+  });
+
+  // ══ THE LEFT-ASSIGNED PROJECT — THE ONLY FIXTURE THIS DEFECT IS VISIBLE IN ═══════════════════
+  // Every other row here runs with the DEFAULT `pairAssignment`, which `sideOf` resolves to
+  // "right" — and `projectStore.selectProject` writes the RIGHT pair's slot, so it is accidentally
+  // correct in all of them. That is why a High-severity defect sat green through this whole suite
+  // (roborev 68120): the side and the write only disagree when the project is on the LEFT.
+  //
+  // What goes wrong without `selectProjectOnItsSide`: the left project's id is written into the
+  // RIGHT pair's `selectedProjectId`, `Workspace`'s reconcile effect discards it, and the right
+  // half of the cockpit silently re-navigates — while `leftProjectId` never moves, so the left
+  // build column narrows to an epic the project it is showing does not contain.
+  it("puts a LEFT-assigned project on its OWN side, leaving the right pair alone", () => {
+    // Keyed PROJECT -> SIDE, not side -> project: `sideOf` reads `assignment[projectId]`.
+    useUiStore.setState({ pairAssignment: { p1: "left" } } as never);
+
+    realHost(DECLARED.id);
+    fireEvent.click(inColumn()!);
+
+    const ui = useUiStore.getState();
+    // The side that actually moved is the LEFT one…
+    expect(ui.leftProjectId).toBe("p1");
+    expect(ui.epicFocusBySide.left).toBe(DECLARED.id);
+    // …and the RIGHT pair's selection was never touched. ABSOLUTE, not a captured prior: `null` is a
+    // value the narrow `selectProject` cannot produce, whereas `toBe(before)` was satisfied by it
+    // writing the same id twice.
+    expect(useProjectStore.getState().selectedProjectId).toBeNull();
+  });
+
+  // THE SAME RULE ON THE OTHER DESTINATION. `viewOnBoard` carries its own copy of the narrow write,
+  // and every board-path store test seeds `pairAssignment: {}` — which resolves to "right", making
+  // `selectProject` accidentally correct in all of them. So reverting that line alone left the whole
+  // suite green: unpinned, and therefore losable in exactly the merge that reintroduced it once
+  // already (roborev 68125). The two copies move together or neither is guarded.
+  it("puts a LEFT-assigned project on its own side for the BOARD link too", () => {
+    useUiStore.setState({ pairAssignment: { p1: "left" } } as never);
+
+    realHost(DECLARED.id);
+    fireEvent.click(onBoard()!);
+
+    expect(useUiStore.getState().leftProjectId).toBe("p1");
+    expect(useProjectStore.getState().selectedProjectId).toBeNull();
+  });
+
+  // ══ A CLOSED TAB — THE CASE THE ALL-OPEN DEFAULT HIDES ═══════════════════════════════════════
+  // `openProjectIds` is `null` (meaning "all open") until the reader closes a tab, so every other
+  // row here runs with the project already open and cannot see this. `selectProjectOnItsSide` writes
+  // only the selection; `Workspace` resolves a side through `resolveSideProject`, which filters to
+  // OPEN projects first and DISCARDS a selection that is not on that side's open list. Without
+  // `markProjectOpen` the click therefore lands the focus writes on a side showing a different
+  // project — an empty column and a board focused on a bead it does not contain — while the
+  // function still returns `true`, so the card reports success (roborev 68127).
+  it("OPENS the project's tab, not just selects it, when the reader had closed it", () => {
+    useUiStore.setState({ openProjectIds: [] } as never);
+
+    realHost(DECLARED.id);
+    fireEvent.click(inColumn()!);
+
+    expect(useUiStore.getState().openProjectIds).toContain("p1");
+  });
+
+  it("opens the tab for the BOARD link too — both destinations carry the same rule", () => {
+    useUiStore.setState({ openProjectIds: [] } as never);
+
+    realHost(DECLARED.id);
+    fireEvent.click(onBoard()!);
+
+    expect(useUiStore.getState().openProjectIds).toContain("p1");
   });
 
   // ══ IDEMPOTENCE — THE TOGGLE BUG, CAUGHT AT THE ONLY PLACE IT SHOWS ═══════════════════════════

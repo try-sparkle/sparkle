@@ -1,45 +1,62 @@
 // @vitest-environment jsdom
 //
-// Bead cards render EXPANDED when the concierge names them (`[ui].bead_cards_expanded`).
+// COLLAPSED BY DEFAULT — AND EXPANDED IS THE FULL, WRITABLE CARD.
 //
-// The founder's ask, verbatim: "I wanna try changing things such that you show these bead cards as
-// expanded by default and of me having to click on them to expand them… Let's give that a try."
+// The founder, 2026-08-22 (beads sparkle-lm78sq / sparkle-h9wgyf): *"they're just taking up too much
+// real estate, and I love them, but I want them to be click to expandable… maybe half the height
+// when it's closed."* And, about the other half of the gesture: *"When I click to expand the card in
+// the chat, I should see the full card. I should be able to make a comment. I should be able to do
+// everything in the card when it's expanded in the chat view."*
 //
-// ══ WHY THIS IS ITS OWN FILE ════════════════════════════════════════════════════════════════════
-// "Let's give that a try" is an experiment with a revert path (`bead_cards_expanded = false`), and
-// a file boundary keeps the guard for the experiment separable from the guard for the pill itself.
-// `BeadPill.test.tsx`'s rows deliberately mount WITHOUT the auto-expand provider — they describe
-// click-to-expand, which is still exactly what every non-concierge surface does — so nothing here
-// belongs beside them.
+// ══ THE REVERSAL THIS FILE RECORDS, AND THE TRAP INSIDE IT ══════════════════════════════════════
+// This file used to guard the OPPOSITE rule — every named bead's card rendered already-open, over a
+// per-message budget (`[ui].bead_cards_expanded`, `bead_cards_expanded_max`). That instruction is
+// superseded. But the thing it was reacting to is NOT coming back: the old default was a BARE PILL,
+// a card collapsed so far it showed nothing. The new default is a HALF-HEIGHT CARD. So the
+// assertions below are written to fail on EITHER end of the spectrum — a card that opens itself, and
+// a bead that renders as a pill with no card at all.
 //
-// ══ WHAT THESE TESTS ARE GUARDING AGAINST, SPECIFICALLY ═════════════════════════════════════════
-// Every rule this feature has is INVISIBLE in the rendered output: a collapsed card, a card whose
-// budget was spent on an id-shaped English word, and an id that never resolved at all are the same
-// three pixels of pill. So the assertions below are on the CARD's own contents and on the specific
-// gestures that must and must not close it — never on "a pill exists", which was true before any of
-// this and would stay true with the whole feature deleted.
-import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+// ══ WHAT THESE ROWS ARE GUARDING, SPECIFICALLY ═════════════════════════════════════════════════
+// Nothing here asserts "a pill exists": that was true before any of this and would stay true with
+// the whole feature deleted. Every row below is on a SIDE EFFECT — a card in the DOM, a
+// `beads_detail` read that did or did not happen, a `beads_comment` write that reached the wire, a
+// thread that re-read afterwards, a jump that carried the right bead's id.
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { StrictMode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+const beadsDetail = vi.fn();
+const beadsComment = vi.fn();
+vi.mock("../../services/beadsCommands", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../services/beadsCommands")>();
+  return {
+    ...actual,
+    beadsDetail: (...a: unknown[]) => beadsDetail(...a),
+    beadsComment: (...a: unknown[]) => beadsComment(...a),
+  };
+});
+
+const openProjectTab = vi.fn();
+vi.mock("../../services/openProjectTab", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../services/openProjectTab")>();
+  return { ...actual, openProjectTab: (...a: unknown[]) => openProjectTab(...a) };
+});
+
 import { Markdown } from "../Markdown";
+// THE REAL THREAD, not a stand-in. Two rows below mount this instead of `mountReply` precisely
+// because it is the only thing that can answer "does `ConciergeMessageRow` still wrap its markdown?"
 import { ConciergeThread } from "./ConciergeThread";
 import {
-  BeadAutoExpandProvider,
+  BeadChatSurfaceProvider,
   BeadPillProvider,
-  autoExpandedBeadIds,
   type BeadPillContextValue,
-  type ResolvedBead,
 } from "./BeadPill";
-import { useBeadsStore } from "../../stores/beadsStore";
-import { useSettingsStore } from "../../stores/settingsStore";
-import {
-  DEFAULT_BEAD_CARDS_EXPANDED,
-  DEFAULT_BEAD_CARDS_EXPANDED_MAX,
-  normalizeBeadCardsExpandedMax,
-} from "../../stores/settingsStore";
-import type { Bead } from "../../services/beads";
 import type { ConciergeMessage } from "./types";
+import { useBeadsStore } from "../../stores/beadsStore";
+import { useProjectStore } from "../../stores/projectStore";
+import { useSettingsStore } from "../../stores/settingsStore";
+import type { Bead } from "../../services/beads";
+import type { AgentTab, Project } from "../../types";
 
 afterEach(() => cleanup());
 
@@ -54,18 +71,22 @@ const settingsBefore = {
   beadCardsExpanded: useSettingsStore.getState().beadCardsExpanded,
   beadCardsExpandedMax: useSettingsStore.getState().beadCardsExpandedMax,
 };
+const projectsBefore = useProjectStore.getState().projects;
+
 beforeEach(() => {
+  beadsDetail.mockReset();
+  beadsComment.mockReset();
+  openProjectTab.mockReset();
+  beadsDetail.mockResolvedValue({ comments: [] });
+  beadsComment.mockResolvedValue(undefined);
   useBeadsStore.setState({ startPolling: () => {}, stopPolling: () => {} });
-  // The SHIPPED defaults, restated rather than assumed: these rows describe what the founder gets
-  // out of the box, so reading them from the constants keeps the file honest if the default moves.
-  useSettingsStore.setState({
-    beadCardsExpanded: DEFAULT_BEAD_CARDS_EXPANDED,
-    beadCardsExpandedMax: DEFAULT_BEAD_CARDS_EXPANDED_MAX,
-  });
 });
 afterEach(() => {
   useBeadsStore.setState(realPoller);
   useSettingsStore.setState(settingsBefore);
+  act(() => {
+    useProjectStore.setState({ projects: projectsBefore, selectedProjectId: null });
+  });
 });
 
 function bead(over: Partial<Bead> & { id: string }): Bead {
@@ -84,25 +105,83 @@ function bead(over: Partial<Bead> & { id: string }): Bead {
 
 const QOGAH = bead({ id: "sparkle-qogah" });
 
+function worker(over: Partial<AgentTab> & { id: string }): AgentTab {
+  return {
+    name: "worker-one",
+    kind: "worker",
+    beadId: null,
+    ...over,
+  } as AgentTab;
+}
+
+function project(agents: AgentTab[]): Project {
+  return {
+    id: "p1",
+    name: "sparkle",
+    rootPath: "/repo",
+    defaultBranch: "main",
+    createdAt: "2026-01-01T00:00:00.000Z",
+    agents,
+    selectedAgentId: null,
+  } as Project;
+}
+
+/** Put a project's backlog and roster where `ConciergeBeadCard` reads them. The card resolves its
+ *  own lineage from the LIVE stores (never from the pill's fixture), so a lineage row that is not
+ *  seeded here cannot appear — which is exactly what the leaf-card row below asserts. */
+function seedStores(beads: Bead[], agents: AgentTab[] = []) {
+  act(() => {
+    useSettingsStore.setState({ beadsEnabled: true });
+    useProjectStore.setState({ projects: [project(agents)], selectedProjectId: "p1" });
+    useBeadsStore.setState({ byProject: { p1: { beads, board: {} as never, loadedAt: 1 } } });
+  });
+}
+
 /** A board holding `beads`. `rootPath` is supplied on purpose — WITHOUT it the card renders
- *  read-only and "Build It" is absent, which would make the goal assertion below unsatisfiable for
- *  a reason that has nothing to do with expansion. */
+ *  read-only, and every write assertion below would be unsatisfiable for a reason that has nothing
+ *  to do with expansion. */
 function ctx(beads: Bead[], over: Partial<BeadPillContextValue> = {}): BeadPillContextValue {
   return {
     beads: new Map(beads.map((b) => [b.id, { bead: b, projectId: "p1", rootPath: "/repo" }])),
     onViewOnBoard: vi.fn(() => true),
+    onOpenAgent: vi.fn(),
     ...over,
   };
 }
 
-/** The concierge path: the auto-expand provider wrapped around the reply's markdown, which is what
- *  `ConciergeMessageRow` mounts in production. */
+/** THE CHAT PATH — the marker `ConciergeMessageRow` wraps every answer's markdown in. It is what
+ *  makes a resolved bead draw a collapsed card at all, so every row below that expects a card
+ *  mounts through here. `mountBare` is its other half. */
 function mountReply(value: BeadPillContextValue, text: string) {
   return render(
     <BeadPillProvider value={value}>
-      <BeadAutoExpandProvider text={text}>
+      <BeadChatSurfaceProvider text={text}>
         <Markdown text={text} />
-      </BeadAutoExpandProvider>
+      </BeadChatSurfaceProvider>
+    </BeadPillProvider>,
+  );
+}
+
+/** ══ THE PRODUCTION WIRING, WITH NOTHING MOUNTED BY HAND ═══════════════════════════════════════
+ *  `mountReply` above supplies `BeadChatSurfaceProvider` ITSELF, which makes every row built on it
+ *  blind to the one production line that actually supplies it — the wrap around each `<Markdown>`
+ *  call site in `ConciergeMessageRow`. Delete that wrap and all of them stay green while the feature
+ *  is dead for everyone; this helper is the defaulted-seam antidote, so it must NEVER grow a
+ *  provider of its own. It renders the real thread and lets `ConciergeMessageRow` do the wrapping. */
+function mountThread(value: BeadPillContextValue, messages: ConciergeMessage[]) {
+  return render(
+    <BeadPillProvider value={value}>
+      <ConciergeThread messages={messages} onNudgeClick={vi.fn()} onNudgeAction={vi.fn()} />
+    </BeadPillProvider>,
+  );
+}
+
+/** EVERY OTHER `<Markdown>` IN THE APP — a support modal, an agent's own scrollback, a user's own
+ *  bubble. No marker, so the pill behaves exactly as it did before this change. */
+function mountBare(value: BeadPillContextValue, text: string) {
+  return render(
+    <BeadPillProvider value={value}>
+      <Markdown text={text} />
     </BeadPillProvider>,
   );
 }
@@ -110,447 +189,432 @@ function mountReply(value: BeadPillContextValue, text: string) {
 const pills = () => screen.queryAllByTestId("concierge-bead-pill");
 const cards = () => screen.queryAllByTestId("concierge-bead-card");
 const card = () => screen.queryByTestId("concierge-bead-card");
+const thread = () => screen.queryByTestId("concierge-bead-card-comments");
+const composer = () => screen.queryByTestId("concierge-bead-card-comments-input");
+const submit = () => screen.getByTestId("concierge-bead-card-comments-submit");
+const description = () => screen.queryByTestId("concierge-bead-card-description");
+const closers = () => screen.queryAllByTestId("concierge-bead-card-close");
 
-// ── 1. THE GOAL ─────────────────────────────────────────────────────────────────────────────────
+// ── 1. THE DEFAULT ──────────────────────────────────────────────────────────────────────────────
 
-describe("expanded by default — the card is there without a click", () => {
-  // THE GOAL, stated as one assertion per thing the founder's screenshot shows. Deliberately not
-  // "a card exists": every one of these fields is a separate render path on `BeadCard`, and the
-  // screenshot is the spec.
-  it("shows title, id, status, priority, type, progress and Build It with no click", () => {
-    mountReply(
-      ctx([
-        bead({
-          id: "sparkle-qogah",
-          title: "Never hide a row that needs action",
-          // OPEN, and that is load-bearing rather than incidental. "Build It" is offered on any
-          // bead that has NOT BEEN STARTED YET (`isStartable` in `useBeadBuildActions`) — the type
-          // no longer gates it, but the status does. This fixture used to be `in_progress`, which
-          // passed only while the concierge surface checked nothing about status and so offered
-          // the button on work already underway; the sibling test below pins that it no longer
-          // does. Using a state that HAS the action is what makes "…and Build It, with no click"
-          // an assertion about EXPANSION rather than an accident of the fixture.
-          status: "open",
-          priority: 0,
-          type: "task",
-        }),
-      ]),
-      "One thing only you can settle: sparkle-qogah",
-    );
-
-    // NO CLICK HAPPENS ANYWHERE IN THIS TEST. That absence is the assertion.
-    const c = card();
-    expect(c).not.toBeNull();
-    expect(screen.getByTestId("concierge-bead-card-title").textContent).toBe(
-      "Never hide a row that needs action",
-    );
-    expect(screen.getByTestId("concierge-bead-card-id").textContent).toContain("sparkle-qogah");
-    const meta = screen.getByTestId("concierge-bead-card-meta").textContent ?? "";
-    // THE BOARD STAGE, not bd's wire status (bead sparkle-az6di8). This bead is open and unblocked,
-    // so it sits in Backlog and the chip says so; `open` is a wire value and never words on screen.
-    expect(meta).toContain("Backlog");
-    expect(meta).not.toContain("open");
-    expect(meta).toContain("P0");
-    expect(meta).toContain("task");
-    expect(screen.getByTestId("concierge-bead-card-stage")).not.toBeNull();
-    expect(screen.getByTestId("concierge-bead-card-build-it")).not.toBeNull();
-  });
-
-  // THE PAIRED NEGATIVE, and it is the half with the power. The assertion above says the expanded
-  // card CAN carry Build It; on its own that is satisfied just as well by a surface that offers the
-  // button unconditionally — which is exactly what the concierge used to do. This bead differs from
-  // that one in ONE field, so a rule that stopped reading `status` would light both up and this
-  // test is the only thing that would go red.
-  //
-  // It is the concierge half of the shared gate: `BeadPill` has no COLUMN to read (it is a card in
-  // a chat thread, not a board lane), which is how the status question came to be asked on the
-  // board card and nowhere else. Everything else about the card must still render, so this is not
-  // "the card is missing" passing for "the button is missing".
-  it("withholds Build It once the work has started — the card is otherwise unchanged", () => {
-    mountReply(
-      ctx([
-        bead({
-          id: "sparkle-qogah",
-          title: "Never hide a row that needs action",
-          status: "in_progress",
-          priority: 0,
-          type: "task",
-        }),
-      ]),
-      "One thing only you can settle: sparkle-qogah",
-    );
-
-    expect(card()).not.toBeNull();
-    expect(screen.getByTestId("concierge-bead-card-title").textContent).toBe(
-      "Never hide a row that needs action",
-    );
-    // Same axis as the row above: an in_progress bead sits in the board's "Being built" column, so
-    // that is the chip's word. The point of THIS row is the withheld Build It — the meta assertion
-    // is here to prove the rest of the card still rendered, and it has to speak the same vocabulary.
-    expect(screen.getByTestId("concierge-bead-card-meta").textContent ?? "").toContain(
-      "Build: Active",
-    );
-    expect(screen.queryByTestId("concierge-bead-card-build-it")).toBeNull();
-  });
-
-  // THE LOAD-BEARING ONE. Everything above renders the provider by hand, so it would keep passing
-  // with `ConciergeMessageRow` never wired at all — i.e. with the feature firing on nothing the
-  // founder will ever see. This drives the real thread instead. If it is deleted as redundant, the
-  // feature can regress to a component nobody mounts.
-  it("expands inside a real concierge reply, through ConciergeMessageRow's own wiring", () => {
-    render(
-      <BeadPillProvider value={ctx([QOGAH])}>
-        <ConciergeThread
-          messages={
-            [
-              { id: "s1", kind: "sparkle", text: "settled on sparkle-qogah so nobody re-litigates" },
-            ] as ConciergeMessage[]
-          }
-          onNudgeClick={vi.fn()}
-          onNudgeAction={vi.fn()}
-        />
-      </BeadPillProvider>,
-    );
-    expect(card()).not.toBeNull();
-    expect(screen.getByTestId("concierge-bead-card-title").textContent).toBe(
-      "Never hide a row that needs action",
-    );
-  });
-
-  // A proactive push is the same words arrived unasked, and it renders through the OTHER of the two
-  // `<Markdown>` call sites in `ConciergeMessageRow`. Wrapping only one of them is the likeliest
-  // way to half-ship this.
-  it("expands in a proactive push too — the second Markdown call site", () => {
-    render(
-      <BeadPillProvider value={ctx([QOGAH])}>
-        <ConciergeThread
-          messages={
-            [{ id: "s1", kind: "sparkle", text: "filed sparkle-qogah", proactive: true }] as ConciergeMessage[]
-          }
-          onNudgeClick={vi.fn()}
-          onNudgeAction={vi.fn()}
-        />
-      </BeadPillProvider>,
-    );
-    expect(card()).not.toBeNull();
-  });
-
-  // A surface OUTSIDE the concierge — SupportModal, an agent's own reply — mounts no provider and
-  // must be untouched by any of this.
-  it("leaves a non-concierge surface on click-to-expand", () => {
-    render(
-      <BeadPillProvider value={ctx([QOGAH])}>
-        <Markdown text="see sparkle-qogah" />
-      </BeadPillProvider>,
-    );
-    expect(card()).toBeNull();
-    fireEvent.click(pills()[0]!);
-    expect(card()).not.toBeNull();
-  });
-});
-
-// ── 2. THE COLLAPSE AFFORDANCE STILL WORKS ──────────────────────────────────────────────────────
-
-describe("the collapse control — he is changing the default, not removing the affordance", () => {
-  it("collapses on the pill, and STAYS collapsed", () => {
+describe("collapsed by default — a CARD, not a pill, and not an open one", () => {
+  // THE HALF THE OLD RULE GOT RIGHT. A bead the concierge names is worth a card without a click;
+  // what changed is how much of the card. This row fails if anyone "reverts" to the bare pill.
+  it("draws a card with no click at all", () => {
+    seedStores([QOGAH]);
     mountReply(ctx([QOGAH]), "see sparkle-qogah");
-    expect(card()).not.toBeNull();
-    fireEvent.click(pills()[0]!);
-    expect(card()).toBeNull();
-    // The founder's requirement in his own terms: it stays collapsed while that message is on
-    // screen. A re-render (any state change anywhere above) must not re-open it — which is what a
-    // plain `useState(autoOpen)` recomputed on render would do.
-    act(() => {
-      useSettingsStore.setState({ beadCardsExpandedMax: 7 });
-    });
-    expect(card()).toBeNull();
-    // …and it is still a toggle, not a one-way door.
-    fireEvent.click(pills()[0]!);
-    expect(card()).not.toBeNull();
+    expect(cards()).toHaveLength(1);
+    expect(pills()).toHaveLength(1);
   });
 
-  it("collapses on the card's × — the control the screenshot shows", () => {
+  // THE HALF THAT IS NEW. `collapsed` is not directly observable from outside `BeadCard`, so this
+  // asserts the two things the concierge itself withholds while collapsed — and both are things the
+  // founder explicitly assigned to the expanded state.
+  it("withholds the comment thread and the composer while collapsed", () => {
+    seedStores([QOGAH]);
     mountReply(ctx([QOGAH]), "see sparkle-qogah");
-    fireEvent.click(screen.getByTestId("concierge-bead-card-close"));
-    expect(card()).toBeNull();
+    expect(thread()).toBeNull();
+    expect(composer()).toBeNull();
   });
 
-  it("keeps aria-expanded honest without a click", () => {
+  // *"When it's collapsed, it would not scroll — would just have less of the actual text."* A
+  // scrollable region nested inside a scrolling thread captures the wheel and stops the thread.
+  it("renders NO description at all when collapsed, so nothing can nest a scroller in the thread", () => {
+    seedStores([QOGAH]);
     mountReply(ctx([QOGAH]), "see sparkle-qogah");
-    expect(pills()[0]!.getAttribute("aria-expanded")).toBe("true");
+    // STRONGER THAN "no clamp", and it is what actually shipped. This assertion used to read
+    // `description()?.style.maxHeight === ""`, which was written before the collapsed card existed
+    // — and optional chaining made it pass on a NULL element by accident of syntax. The founder's
+    // rule is "less of the actual text", not the same text in a smaller window, so the honest check
+    // is that the element is absent: with no description there is no `descMaxHeight` to apply and
+    // no inner scroller to steal the thread's wheel.
+    expect(description()).toBeNull();
+    // …and it comes back on expand, so the absence above is the collapse, not a card that lost it.
     fireEvent.click(pills()[0]!);
+    expect(description()).not.toBeNull();
+  });
+
+  // THE READ THAT MUST NOT HAPPEN. This card is now mounted for EVERY bead the concierge ever named,
+  // so a fetch-on-mount would be one `beads_detail` per bead per thread against a single-writer bd
+  // store. Asserting the call count is the only way to see it: the DOM looks identical either way.
+  it("reads no comments on mount — the fetch is the reader's gesture, not the render", () => {
+    seedStores([QOGAH]);
+    mountReply(ctx([QOGAH]), "see sparkle-qogah");
+    expect(beadsDetail).not.toHaveBeenCalled();
+  });
+
+  // ── THE SURFACE BOUNDARY, AND WHY IT IS NOT A HEDGE ────────────────────────────────────────
+  // `BeadPill` draws inside EVERY `<Markdown>` in the app, and the founder's ruling is about the
+  // chat thread. Rendering a card unconditionally puts one inside a mounted agent's terminal, whose
+  // contract is that it declares no face but the terminal's — a straight regression, and the reason
+  // this gate exists rather than a blanket "always draw the card".
+  it("draws NO card outside a chat message, where the pill is still click-to-open", () => {
+    seedStores([QOGAH]);
+    mountBare(ctx([QOGAH]), "see sparkle-qogah");
+    expect(cards()).toHaveLength(0);
+    expect(pills()).toHaveLength(1);
+    fireEvent.click(pills()[0]!);
+    expect(cards()).toHaveLength(1);
+  });
+
+  it("advertises itself as collapsed to a screen reader", () => {
+    seedStores([QOGAH]);
+    mountReply(ctx([QOGAH]), "see sparkle-qogah");
     expect(pills()[0]!.getAttribute("aria-expanded")).toBe("false");
   });
 });
 
-// ── 3. THE OUTSIDE CLICK ────────────────────────────────────────────────────────────────────────
+// ── 2. THE BUDGET IS RETIRED ────────────────────────────────────────────────────────────────────
 
-describe("an auto-expanded card survives the click that answers the message", () => {
-  // THE BUG THIS FEATURE WOULD OTHERWISE SHIP WITH. The very next thing the founder does after
-  // reading a reply is click his composer to answer it. Under the ungated listener that one press
-  // collapsed every card in the thread — the feature would appear to work for a few seconds and
-  // then delete itself.
-  it("ignores a mousedown outside it", () => {
-    mountReply(ctx([QOGAH]), "see sparkle-qogah");
-    expect(card()).not.toBeNull();
-    fireEvent.mouseDown(document.body);
-    expect(card()).not.toBeNull();
-  });
+describe("no exceptions — the auto-expand budget decides nothing any more", () => {
+  const MANY = ["sparkle-aaaa1", "sparkle-bbbb2", "sparkle-cccc3"].map((id) => bead({ id }));
 
-  // THE PAIRED ASSERTION, and the one that makes the row above mean something. Absence of a close
-  // proves nothing on its own — a listener that was never registered at all, for either kind of
-  // card, passes the row above perfectly. This shows the mechanism is live and merely gated: a card
-  // the reader OPENED BY HAND still closes on an outside press, exactly as it did before.
-  it("still closes a HAND-OPENED card on a mousedown outside it", () => {
-    mountReply(ctx([QOGAH]), "see sparkle-qogah");
-    fireEvent.click(pills()[0]!); // collapse it…
-    expect(card()).toBeNull();
-    fireEvent.click(pills()[0]!); // …and re-open it BY HAND
-    expect(card()).not.toBeNull();
-    fireEvent.mouseDown(document.body);
-    expect(card()).toBeNull();
-  });
-
-  // Escape closes either kind — the reader's keyboard exit, which does not depend on finding a pill
-  // that may have scrolled off screen.
-  it("closes on Escape", () => {
-    mountReply(ctx([QOGAH]), "see sparkle-qogah");
-    fireEvent.keyDown(window, { key: "Escape" });
-    expect(card()).toBeNull();
-  });
-});
-
-// ── 4. MANY BEADS IN ONE REPLY ──────────────────────────────────────────────────────────────────
-
-describe("a reply that names many beads", () => {
-  const ids = ["sparkle-aaa11", "sparkle-bbb22", "sparkle-ccc33", "sparkle-ddd44"];
-
-  it("expands every one when uncapped — the shipped default", () => {
-    mountReply(ctx(ids.map((id) => bead({ id }))), ids.join(" and "));
-    expect(pills()).toHaveLength(4);
-    expect(cards()).toHaveLength(4);
-  });
-
-  it("expands the first N and leaves the tail as pills when capped", () => {
-    useSettingsStore.setState({ beadCardsExpandedMax: 2 });
-    mountReply(ctx(ids.map((id) => bead({ id }))), ids.join(" and "));
-    // Every id is still a pill — the cap changes the card, never the linkification.
-    expect(pills()).toHaveLength(4);
-    expect(cards()).toHaveLength(2);
-    // DOCUMENT ORDER: the cap truncates the tail of his list, not an arbitrary subset of it.
-    expect(cards().map((c) => c.getAttribute("data-bead-id"))).toEqual([
-      "sparkle-aaa11",
-      "sparkle-bbb22",
-    ]);
-  });
-
-  it("still opens a capped-out bead on a click", () => {
+  // ONE RULE, NO SURPRISES. Under the retired budget a cap of 1 left the tail as bare pills with no
+  // card; this row fails if any of that machinery is still wired to anything.
+  it("draws a card for every named bead even with the old cap set to 1", () => {
     useSettingsStore.setState({ beadCardsExpandedMax: 1 });
-    mountReply(ctx(ids.map((id) => bead({ id }))), ids.join(" and "));
-    expect(cards()).toHaveLength(1);
-    fireEvent.click(pills()[3]!);
-    expect(cards()).toHaveLength(2);
+    seedStores(MANY);
+    mountReply(ctx(MANY), "see sparkle-aaaa1 and sparkle-bbbb2 and sparkle-cccc3");
+    expect(cards()).toHaveLength(3);
   });
-});
 
-// ── 5. THE OFF SWITCH ───────────────────────────────────────────────────────────────────────────
+  // …and every one of them starts COLLAPSED, which the cap used to be the only thing producing.
+  it("starts every one of them collapsed", () => {
+    useSettingsStore.setState({ beadCardsExpandedMax: 1 });
+    seedStores(MANY);
+    mountReply(ctx(MANY), "see sparkle-aaaa1 and sparkle-bbbb2 and sparkle-cccc3");
+    expect(screen.queryAllByTestId("concierge-bead-card-comments")).toHaveLength(0);
+  });
 
-describe("[ui].bead_cards_expanded = false is the whole revert", () => {
-  it("restores click-to-expand exactly", () => {
+  // The old revert switch. It used to restore click-to-expand; there is nothing left for it to
+  // switch, and a card must still appear.
+  it("still draws the card with [ui].bead_cards_expanded = false", () => {
     useSettingsStore.setState({ beadCardsExpanded: false });
+    seedStores([QOGAH]);
     mountReply(ctx([QOGAH]), "see sparkle-qogah");
-    expect(card()).toBeNull();
+    expect(cards()).toHaveLength(1);
+  });
+});
+
+// ── 3. THE GESTURE ──────────────────────────────────────────────────────────────────────────────
+
+describe("click to expand, click to collapse", () => {
+  it("expands on the pill and reads the thread exactly once", async () => {
+    seedStores([QOGAH]);
+    mountReply(ctx([QOGAH]), "see sparkle-qogah");
     fireEvent.click(pills()[0]!);
-    expect(card()).not.toBeNull();
-    fireEvent.mouseDown(document.body);
-    expect(card()).toBeNull();
-  });
-});
-
-// ── 6. THE RULE ITSELF ──────────────────────────────────────────────────────────────────────────
-
-describe("autoExpandedBeadIds — the rules that are invisible on screen", () => {
-  const board = (ids: string[]): ReadonlyMap<string, ResolvedBead> =>
-    new Map(ids.map((id) => [id, { bead: bead({ id }), projectId: "p1" }]));
-  const on = { enabled: true, max: 0 };
-
-  // THE RULE THE WHOLE CAP DEPENDS ON. `remarkBeadRefs` is loose by design and yields every
-  // id-SHAPED token, so a budget spent on ordinary hyphenated English would collapse the one card
-  // the founder actually wanted. Here `auto-heal` and `one-shot` come FIRST in the text and would
-  // eat a cap of 2 entirely.
-  it("spends the cap only on ids that RESOLVE, never on id-shaped English", () => {
-    const text = "the auto-heal path is one-shot; see sparkle-qogah and sparkle-aaa11";
-    const got = autoExpandedBeadIds(text, board(["sparkle-qogah", "sparkle-aaa11"]), {
-      enabled: true,
-      max: 2,
-    });
-    expect([...got]).toEqual(["sparkle-qogah", "sparkle-aaa11"]);
+    await waitFor(() => expect(thread()).not.toBeNull());
+    expect(beadsDetail).toHaveBeenCalledTimes(1);
+    expect(beadsDetail).toHaveBeenCalledWith("/repo", "sparkle-qogah");
+    expect(pills()[0]!.getAttribute("aria-expanded")).toBe("true");
   });
 
-  it("counts a repeated id once against the cap", () => {
-    const text = "sparkle-qogah, then sparkle-qogah again, then sparkle-aaa11";
-    const got = autoExpandedBeadIds(text, board(["sparkle-qogah", "sparkle-aaa11"]), {
-      enabled: true,
-      max: 2,
-    });
-    expect([...got]).toEqual(["sparkle-qogah", "sparkle-aaa11"]);
+  it("restores the description clamp when expanded", async () => {
+    seedStores([QOGAH]);
+    mountReply(ctx([QOGAH]), "see sparkle-qogah");
+    fireEvent.click(pills()[0]!);
+    await waitFor(() => expect(description()?.style.maxHeight).toBe("180px"));
   });
 
-  it("takes them in document order", () => {
-    const text = "sparkle-ccc33 before sparkle-aaa11 before sparkle-bbb22";
-    const got = autoExpandedBeadIds(text, board(["sparkle-aaa11", "sparkle-bbb22", "sparkle-ccc33"]), {
-      enabled: true,
-      max: 2,
-    });
-    expect([...got]).toEqual(["sparkle-ccc33", "sparkle-aaa11"]);
-  });
-
-  it("is empty when disabled, whatever the text says", () => {
-    const got = autoExpandedBeadIds("sparkle-qogah", board(["sparkle-qogah"]), {
-      enabled: false,
-      max: 0,
-    });
-    expect(got.size).toBe(0);
-  });
-
-  it("treats max <= 0 as no cap", () => {
-    const ids = ["sparkle-aaa11", "sparkle-bbb22", "sparkle-ccc33"];
-    expect(autoExpandedBeadIds(ids.join(" "), board(ids), on).size).toBe(3);
-  });
-});
-
-// ── 7. A HAND-EDITED CAP ────────────────────────────────────────────────────────────────────────
-
-describe("normalizeBeadCardsExpandedMax — config.toml is untrusted input", () => {
-  it("keeps a sane cap", () => {
-    expect(normalizeBeadCardsExpandedMax(3)).toBe(3);
-    expect(normalizeBeadCardsExpandedMax(0)).toBe(0);
-  });
-
-  // THE DANGEROUS ONE. A negative cap makes every `size >= max` test true at the first id — so NO
-  // card expands and the symptom is indistinguishable from the feature having been switched off,
-  // with the config file plainly saying it is on.
-  it("floors a negative to 0 (= no cap) rather than expanding nothing", () => {
-    expect(normalizeBeadCardsExpandedMax(-1)).toBe(0);
-    expect(normalizeBeadCardsExpandedMax(-99)).toBe(0);
-  });
-
-  it("rounds a fraction DOWN, so 2.9 is a cap of 2 rather than 3", () => {
-    expect(normalizeBeadCardsExpandedMax(2.9)).toBe(2);
-  });
-
-  it("falls back to the default for an absent or non-numeric value", () => {
-    expect(normalizeBeadCardsExpandedMax(undefined)).toBe(DEFAULT_BEAD_CARDS_EXPANDED_MAX);
-    expect(normalizeBeadCardsExpandedMax("3")).toBe(DEFAULT_BEAD_CARDS_EXPANDED_MAX);
-    expect(normalizeBeadCardsExpandedMax(Number.NaN)).toBe(DEFAULT_BEAD_CARDS_EXPANDED_MAX);
-  });
-});
-
-// ── 8. THE CONSTRAINT THIS CHANGE MUST NOT BREAK ────────────────────────────────────────────────
-
-describe("the linkifier's own boundaries are untouched", () => {
-  // `remarkBeadRefs` deliberately visits TEXT nodes only, so a backticked id stays dead monospace.
-  // This change is about the DEFAULT OPEN STATE of a rendered card, not about what gets matched —
-  // and an auto-expand pass that re-scanned the raw text could quietly start expanding cards for
-  // ids that were never linkified at all.
-  it("does not expand a card for a backticked id", () => {
-    mountReply(ctx([QOGAH]), "the bead is `sparkle-qogah` in code");
-    expect(pills()).toHaveLength(0);
-    expect(cards()).toHaveLength(0);
-  });
-
-  // THE HALF THE ROW ABOVE DOES NOT COVER, and the one that actually bites (roborev 65335). "No
-  // card for a backticked id" is true for a reason that has nothing to do with the cap: no pill is
-  // drawn there, so no card can be. The question the cap asks is different — did that id CONSUME A
-  // SLOT on its way to drawing nothing? It did, because the rule read the raw markdown source while
-  // the linkifier reads the mdast tree and never visits an `inlineCode` node.
-  //
-  // Latent at the shipped default (uncapped), and the config template points the founder straight
-  // at the case that triggers it ("3 is a good first try"). The symptom is the worst kind: with a
-  // cap of 1 and a reply that opens `bd show sparkle-qogah`, ZERO cards expand while the config
-  // plainly says the feature is on — indistinguishable from having switched it off.
-  it("does not spend a cap slot on a backticked id, which can never become a card", () => {
-    useSettingsStore.setState({ beadCardsExpandedMax: 1 });
-    mountReply(
-      ctx([QOGAH, bead({ id: "sparkle-aaa11", title: "The one he actually wanted" })]),
-      "run `bd show sparkle-qogah` first — the live one is sparkle-aaa11",
-    );
-    expect(cards()).toHaveLength(1);
-    expect(cards()[0]!.getAttribute("data-bead-id")).toBe("sparkle-aaa11");
-  });
-
-  // The same defect in its other shape: a FENCED block. Same cause, different node type, and worth
-  // its own row because a fence is what the concierge writes when it quotes a command to run.
-  it("does not spend a cap slot on an id inside a fenced block", () => {
-    useSettingsStore.setState({ beadCardsExpandedMax: 1 });
-    mountReply(
-      ctx([QOGAH, bead({ id: "sparkle-aaa11", title: "The one he actually wanted" })]),
-      "```\nbd show sparkle-qogah\n```\n\nthe live one is sparkle-aaa11",
-    );
-    expect(cards()).toHaveLength(1);
-    expect(cards()[0]!.getAttribute("data-bead-id")).toBe("sparkle-aaa11");
-  });
-
-  // And inside a LINK, where the linkifier's `inLink` guard stops it from nesting an anchor in an
-  // anchor. An id in the label or the URL draws no pill, so it must not cost a slot either.
-  it("does not spend a cap slot on an id inside a link", () => {
-    useSettingsStore.setState({ beadCardsExpandedMax: 1 });
-    mountReply(
-      ctx([QOGAH, bead({ id: "sparkle-aaa11", title: "The one he actually wanted" })]),
-      "[the sparkle-qogah work](https://example.test/x) — the live one is sparkle-aaa11",
-    );
-    expect(cards()).toHaveLength(1);
-    expect(cards()[0]!.getAttribute("data-bead-id")).toBe("sparkle-aaa11");
-  });
-
-  // An id that resolves to nothing is prose, exactly as before — no pill, no card, no wrapper.
-  it("does not expand a card for an id that does not resolve", () => {
-    const { container } = mountReply(ctx([]), "recorded on sparkle-17hm1 today");
-    expect(pills()).toHaveLength(0);
-    expect(cards()).toHaveLength(0);
-    expect(container.textContent).toContain("recorded on sparkle-17hm1 today");
-  });
-});
-
-// ── 9. A BEAD THAT RESOLVES LATE ────────────────────────────────────────────────────────────────
-
-describe("a bead filed after the message was written", () => {
-  // THE TRAP A PLAIN `useState(autoOpen)` FALLS INTO, and it is the common case rather than an edge
-  // one: `beadsStore` polls, so a bead the concierge just filed resolves SECONDS after its message
-  // renders. A seeded initial state reads `false` at mount and sits collapsed forever.
-  it("opens its card when the board catches up, with no click", () => {
-    const text = "just filed sparkle-qogah";
-    const { rerender } = render(
-      <BeadPillProvider value={ctx([])}>
-        <BeadAutoExpandProvider text={text}>
-          <Markdown text={text} />
-        </BeadAutoExpandProvider>
-      </BeadPillProvider>,
-    );
-    expect(pills()).toHaveLength(0);
-    expect(cards()).toHaveLength(0);
-
-    rerender(
-      <BeadPillProvider value={ctx([QOGAH])}>
-        <BeadAutoExpandProvider text={text}>
-          <Markdown text={text} />
-        </BeadAutoExpandProvider>
-      </BeadPillProvider>,
-    );
-    expect(pills()).toHaveLength(1);
+  // COLLAPSE TAKES BACK THE HEIGHT, IT DOES NOT DISMISS THE CARD. The card survives every exit —
+  // that is the difference between this and the popover the old code closed.
+  it("collapses on a second press and leaves the card standing", async () => {
+    seedStores([QOGAH]);
+    mountReply(ctx([QOGAH]), "see sparkle-qogah");
+    fireEvent.click(pills()[0]!);
+    await waitFor(() => expect(thread()).not.toBeNull());
+    fireEvent.click(pills()[0]!);
+    expect(thread()).toBeNull();
     expect(cards()).toHaveLength(1);
   });
 
-  it("survives StrictMode's double-invoke", () => {
+  it("collapses on Escape, and consumes the press", async () => {
+    seedStores([QOGAH]);
+    mountReply(ctx([QOGAH]), "see sparkle-qogah");
+    fireEvent.click(pills()[0]!);
+    await waitFor(() => expect(thread()).not.toBeNull());
+    const e = new KeyboardEvent("keydown", { key: "Escape", cancelable: true, bubbles: true });
+    act(() => {
+      window.dispatchEvent(e);
+    });
+    expect(e.defaultPrevented).toBe(true);
+    expect(thread()).toBeNull();
+    expect(cards()).toHaveLength(1);
+  });
+
+  it("collapses on a press outside it", async () => {
+    seedStores([QOGAH]);
+    mountReply(ctx([QOGAH]), "see sparkle-qogah");
+    fireEvent.click(pills()[0]!);
+    await waitFor(() => expect(thread()).not.toBeNull());
+    act(() => {
+      document.body.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+    });
+    expect(thread()).toBeNull();
+  });
+
+  // ── THE STOP-PROPAGATION REQUIREMENT, FROM THIS SURFACE'S SIDE ─────────────────────────────
+  // The whole card body is the expand target, so a press on anything INSIDE it must not reach the
+  // collapse paths this component owns. Mutating away the `closest(CARD_TESTID)` guard in
+  // `BeadPill`'s click-outside listener turns this row red.
+  it("stays expanded when the press lands INSIDE the card — including on its composer", async () => {
+    seedStores([QOGAH]);
+    mountReply(ctx([QOGAH]), "see sparkle-qogah");
+    fireEvent.click(pills()[0]!);
+    await waitFor(() => expect(composer()).not.toBeNull());
+    act(() => {
+      composer()!.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+    });
+    // THE INVARIANT THIS TEST IS ACTUALLY ABOUT: a press inside the composer left the card open.
+    // Without `stopPropagation` on the comment thread this collapses the card mid-sentence.
+    expect(thread()).not.toBeNull();
+    expect(composer()).not.toBeNull();
+  });
+
+  it("collapses when the press lands on the card BODY — the body is the toggle, both ways", async () => {
+    seedStores([QOGAH]);
+    mountReply(ctx([QOGAH]), "see sparkle-qogah");
+    fireEvent.click(pills()[0]!);
+    await waitFor(() => expect(composer()).not.toBeNull());
+    // The PAIRED case, and the reason the one above is not vacuous: the same gesture on the body
+    // DOES toggle, so "the composer press did nothing" is a statement about the composer rather
+    // than about a card that never collapses at all.
+    fireEvent.click(card()!);
+    expect(composer()).toBeNull();
+  });
+});
+
+// ── 4. EXPANDED MEANS WRITABLE ──────────────────────────────────────────────────────────────────
+
+describe("the expanded card in chat is the full, writable card", () => {
+  it("renders the comments it read", async () => {
+    beadsDetail.mockResolvedValue({
+      comments: [{ id: "c1", author: "DROdio", text: "ship it", createdAt: null }],
+    });
+    seedStores([QOGAH]);
+    mountReply(ctx([QOGAH]), "see sparkle-qogah");
+    fireEvent.click(pills()[0]!);
+    await waitFor(() =>
+      expect(screen.getByTestId("concierge-bead-card-comments-item-text").textContent).toBe("ship it"),
+    );
+  });
+
+  // THE WRITE, END TO END, THROUGH THE REAL COMPOSER. Deliberately not "a textarea exists": the
+  // concierge chrome shipped for months WITH a card and WITHOUT this path, so the presence of the
+  // card proves nothing about the write. What is asserted is that the text reached `beads_comment`
+  // with this project's path and this bead's id, AND that the thread re-read afterwards.
+  it("posts a comment through beadsComment and re-reads the thread", async () => {
+    seedStores([QOGAH]);
+    mountReply(ctx([QOGAH]), "see sparkle-qogah");
+    fireEvent.click(pills()[0]!);
+    await waitFor(() => expect(composer()).not.toBeNull());
+    expect(beadsDetail).toHaveBeenCalledTimes(1);
+
+    beadsDetail.mockResolvedValue({
+      comments: [{ id: "c9", author: "DROdio", text: "half height, click to expand", createdAt: null }],
+    });
+    fireEvent.change(composer()!, { target: { value: "half height, click to expand" } });
+    fireEvent.click(submit());
+
+    await waitFor(() =>
+      expect(beadsComment).toHaveBeenCalledWith("/repo", "sparkle-qogah", "half height, click to expand"),
+    );
+    // THE REFRESH IS THE SECOND HALF AND IS EASY TO OMIT: without the reload bump the write lands in
+    // `bd` and the reader stares at a thread that never shows it.
+    await waitFor(() => expect(beadsDetail).toHaveBeenCalledTimes(2));
+    await waitFor(() =>
+      expect(screen.getByTestId("concierge-bead-card-comments-item-text").textContent).toBe(
+        "half height, click to expand",
+      ),
+    );
+  });
+
+  // CALLBACK-IS-THE-SWITCH. A surface with no project path cannot address `bd`, so it gets a
+  // read-only thread rather than a composer whose send can only fail.
+  it("offers no composer on a card with no project path, and reads nothing", async () => {
+    seedStores([QOGAH]);
+    const value: BeadPillContextValue = {
+      beads: new Map([["sparkle-qogah", { bead: QOGAH, projectId: "p1" }]]),
+      onViewOnBoard: vi.fn(() => true),
+    };
+    mountReply(value, "see sparkle-qogah");
+    fireEvent.click(pills()[0]!);
+    await waitFor(() => expect(cards()).toHaveLength(1));
+    expect(composer()).toBeNull();
+    expect(beadsDetail).not.toHaveBeenCalled();
+  });
+
+  it("survives StrictMode's double-invoke without double-posting", async () => {
+    seedStores([QOGAH]);
     render(
       <StrictMode>
         <BeadPillProvider value={ctx([QOGAH])}>
-          <BeadAutoExpandProvider text="see sparkle-qogah">
-            <Markdown text="see sparkle-qogah" />
-          </BeadAutoExpandProvider>
+          <Markdown text="see sparkle-qogah" />
         </BeadPillProvider>
       </StrictMode>,
     );
+    fireEvent.click(pills()[0]!);
+    await waitFor(() => expect(composer()).not.toBeNull());
+    fireEvent.change(composer()!, { target: { value: "once" } });
+    fireEvent.click(submit());
+    await waitFor(() => expect(beadsComment).toHaveBeenCalledTimes(1));
+  });
+});
+
+// ── 5. LINEAGE ──────────────────────────────────────────────────────────────────────────────────
+
+describe("the two lineage rows, resolved from the live stores", () => {
+  const EPIC = bead({ id: "sparkle-epic1", title: "The epic", type: "epic" });
+  const KID_A = bead({ id: "sparkle-kida1", title: "Kid A", parent: "sparkle-epic1" });
+  const KID_B = bead({ id: "sparkle-kidb2", title: "Kid B", parent: "sparkle-epic1" });
+  const AGENT = worker({ id: "agent-7", name: "Kid A builder", beadId: "sparkle-kida1" });
+
+  it("draws the children as pills, collapsed, with no click", () => {
+    seedStores([EPIC, KID_A, KID_B]);
+    mountReply(ctx([EPIC, KID_A, KID_B]), "see sparkle-epic1");
+    const taskPills = screen.getAllByTestId("concierge-bead-card-tasks-pill");
+    expect(taskPills.map((p) => p.textContent)).toEqual(["Kid A", "Kid B"]);
+  });
+
+  // REAL LINKS, not decoration — and the id it carries is the CHILD's, which is the thing a
+  // hard-coded `bead.id` would get wrong while still looking like it worked.
+  it("jumps to the CHILD's bead when its pill is clicked", () => {
+    const onViewOnBoard = vi.fn(() => true);
+    seedStores([EPIC, KID_A, KID_B]);
+    mountReply(ctx([EPIC, KID_A, KID_B], { onViewOnBoard }), "see sparkle-epic1");
+    fireEvent.click(screen.getAllByTestId("concierge-bead-card-tasks-pill")[1]!);
+    expect(onViewOnBoard).toHaveBeenCalledWith({ beadId: "sparkle-kidb2", projectId: "p1" });
+  });
+
+  it("draws the build agents on the children, and jumps to one on a click", () => {
+    const onOpenAgent = vi.fn();
+    seedStores([EPIC, KID_A, KID_B], [AGENT]);
+    mountReply(ctx([EPIC, KID_A, KID_B], { onOpenAgent }), "see sparkle-epic1");
+    const agentPills = screen.getAllByTestId("concierge-bead-card-build-agents-pill");
+    expect(agentPills.map((p) => p.textContent)).toEqual(["Kid A builder"]);
+    fireEvent.click(agentPills[0]!);
+    expect(onOpenAgent).toHaveBeenCalledWith({ agentId: "agent-7", projectId: "p1" });
+  });
+
+  // A LEAF COSTS NO HEIGHT. Rendering an empty lineage region on every leaf card is the exact height
+  // this whole change is reclaiming.
+  it("draws no lineage rows at all for a bead with no parent and no children", () => {
+    seedStores([QOGAH]);
+    mountReply(ctx([QOGAH]), "see sparkle-qogah");
+    expect(screen.queryByTestId("concierge-bead-card-tasks")).toBeNull();
+    expect(screen.queryByTestId("concierge-bead-card-build-agents")).toBeNull();
+  });
+
+  // A lineage pill is inside the card body, which is the expand target. Clicking one must open the
+  // task and NOT also toggle the card it was opened from.
+  it("does not collapse the card when a lineage pill is clicked", async () => {
+    seedStores([EPIC, KID_A, KID_B]);
+    mountReply(ctx([EPIC, KID_A, KID_B]), "see sparkle-epic1");
+    fireEvent.click(pills()[0]!);
+    await waitFor(() => expect(thread()).not.toBeNull());
+    fireEvent.click(screen.getAllByTestId("concierge-bead-card-tasks-pill")[0]!);
+    expect(thread()).not.toBeNull();
+  });
+});
+
+// ── 6. THE WIRING ITSELF — NO PROVIDER MOUNTED BY HAND ──────────────────────────────────────────
+//
+// Every row above this point reaches `BeadChatSurfaceProvider` through `mountReply`, which supplies
+// it. That makes all of them blind to the ONE production line that supplies it for real: the wrap
+// around each `<Markdown>` call site in `ConciergeMessageRow`. The classic defaulted-seam trap —
+// delete the wrap and the whole suite above stays green while the feature is dead for everyone, and
+// it is a live risk because this file's own header names the rename of those call sites (and the
+// retirement of the `BeadAutoExpandProvider` alias) as the follow-up.
+//
+// There are TWO call sites and they are on different branches of `ConciergeMessageRow`, so one row
+// each. The neighbours do not cover this: `BeadPill.test.tsx`'s `ConciergeThread` describe asserts
+// only that a PILL is drawn (true before any of this, and true with the wrap gone), and
+// `ConciergeThread.mentions.test.tsx` drives a `kind: "you"` bubble, which is deliberately unwrapped.
+describe("the collapsed card appears through ConciergeMessageRow's OWN wiring", () => {
+  // CALL SITE ONE — an ordinary answer. Asserting a CARD, not a pill, and with NO click: those two
+  // words are the whole test. Verified to go red by removing the provider wrap at this call site.
+  it("draws a card in a real sparkle reply, with nothing mounted by hand", () => {
+    seedStores([QOGAH]);
+    mountThread(ctx([QOGAH]), [
+      { id: "s1", kind: "sparkle", text: "settled and recorded on sparkle-qogah" },
+    ]);
     expect(cards()).toHaveLength(1);
+    // …and it arrived COLLAPSED, so this row also fails on the other end of the spectrum — a thread
+    // that wires the surface up but opens every card it draws.
+    expect(thread()).toBeNull();
+  });
+
+  // CALL SITE TWO — the proactive push, a different `return` in `ConciergeMessageRow` with its own
+  // separate wrap. Wiring only the reply branch leaves every unprompted line a bare pill, which no
+  // row driving the reply branch can see.
+  it("draws a card in a proactive push too — the second Markdown call site", () => {
+    seedStores([QOGAH]);
+    mountThread(ctx([QOGAH]), [
+      { id: "s1", kind: "sparkle", text: "filed sparkle-qogah", proactive: true },
+    ]);
+    expect(cards()).toHaveLength(1);
+    expect(thread()).toBeNull();
+  });
+
+  // THE PAIRED NEGATIVE, and the reason the two rows above are not vacuous: the SAME thread, the
+  // SAME bead, on the branch that is deliberately NOT wrapped. A `kind: "you"` bubble renders
+  // through `MentionedText` and never touches markdown, so "a card appeared" above is a statement
+  // about the wrap rather than about anything that mounts a card unconditionally.
+  it("draws no card in the user's own bubble, which is deliberately unwrapped", () => {
+    seedStores([QOGAH]);
+    mountThread(ctx([QOGAH]), [{ id: "u1", kind: "you", text: "what about sparkle-qogah" }]);
+    expect(cards()).toHaveLength(0);
+  });
+});
+
+// ── 7. NO DEAD CONTROL ON THE MOST COMMON STATE IN THE APP ──────────────────────────────────────
+//
+// `BeadCard` draws its `×` on the PRESENCE of an `onClose` callback and nowhere else, so a surface
+// with nothing for it to do must pass none — this codebase's callback-is-the-switch convention.
+//
+// The regression this guards (roborev job 68044): the concierge kept passing
+// `() => setExpanded(false)` in both states. On the collapsed card that writes `false` onto a state
+// already `false`, React bails out on the identical value, and the button's own handler calls
+// `stopPropagation` so the card body's expand toggle never sees the press either. One click, no
+// repaint, no state change, nothing announced — on every bead the concierge has ever named, in its
+// default state. The old suite would have passed with that button wired to a no-op forever.
+describe("the × on a collapsed chat card", () => {
+  it("is absent while collapsed — there is nothing for it to close", () => {
+    seedStores([QOGAH]);
+    mountReply(ctx([QOGAH]), "see sparkle-qogah");
+    expect(cards()).toHaveLength(1);
+    expect(closers()).toHaveLength(0);
+  });
+
+  // THE PAIRED POSITIVE. Absence alone is satisfied by a card that never draws a `×` at all, or by
+  // a `BeadCard` whose chrome row stopped rendering — neither of which is the rule. Expanded, the
+  // control is back AND it changes observable state.
+  it("returns on expand and COLLAPSES the card — an observable change, not a no-op", async () => {
+    seedStores([QOGAH]);
+    mountReply(ctx([QOGAH]), "see sparkle-qogah");
+    fireEvent.click(pills()[0]!);
+    await waitFor(() => expect(thread()).not.toBeNull());
+    expect(closers()).toHaveLength(1);
+
+    fireEvent.click(closers()[0]!);
+    // COLLAPSED, NOT DISMISSED — the card survives every exit, and the `×` is no exception. The
+    // thread and the composer are the two things the concierge withholds while collapsed, so their
+    // disappearance IS the state change.
+    expect(thread()).toBeNull();
+    expect(composer()).toBeNull();
+    expect(cards()).toHaveLength(1);
+    // …and the affordance goes with it, so a second press cannot be the dead one.
+    expect(closers()).toHaveLength(0);
+    expect(pills()[0]!.getAttribute("aria-expanded")).toBe("false");
+  });
+
+  // OUTSIDE A CHAT MESSAGE the card exists only while open, so the `×` is unconditional there and
+  // must not have been swept up by the gate above.
+  it("keeps the × on a bare-Markdown card, which is only ever open", () => {
+    seedStores([QOGAH]);
+    mountBare(ctx([QOGAH]), "see sparkle-qogah");
+    fireEvent.click(pills()[0]!);
+    expect(cards()).toHaveLength(1);
+    expect(closers()).toHaveLength(1);
   });
 });

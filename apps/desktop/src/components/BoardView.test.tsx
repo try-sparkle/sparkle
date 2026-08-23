@@ -152,7 +152,7 @@ import { bucketBeads, claimBead, labelBead, closeBead, markBeadDelivered } from 
 import { useCriteriaStore } from "../services/criteriaStore";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
-import { useUiStore } from "../stores/uiStore";
+import { DEFAULT_WORK_MODE_BY_SIDE, useUiStore } from "../stores/uiStore";
 import { NO_BOARD_FILTER } from "../services/boardFilters";
 import { dismissibleSurfaceOpen, unbindsOnKey } from "../engine/cable";
 import { useCableStore } from "../stores/cableStore";
@@ -257,6 +257,14 @@ beforeEach(() => {
   if (useProjectStore.getState().projects[0]?.rootPath !== project.rootPath) {
     throw new Error("BoardView tests: project store seed did not take effect — claim assertions would be vacuous");
   }
+
+  // which from the green (roborev 68041). Reset here so a test that wants to assert one of these is
+  // free to seed the OPPOSITE value in its own body and get a real transition.
+  useUiStore.setState({
+    workModeBySide: { ...DEFAULT_WORK_MODE_BY_SIDE },
+    activeSpecial: null,
+    boardFocusBeadId: null,
+  });
 });
 
 // ══ TERMINAL-COLUMN RENDER CAP ════════════════════════════════════════════════════════════════
@@ -3490,5 +3498,175 @@ describe("BoardView — the child-task health square on an expanded epic card", 
     const label = squareIn(rows.get("Child red")!)?.getAttribute("aria-label") ?? "";
     expect(label).toContain("this task");
     expect(label).not.toContain("this epic");
+  });
+});
+
+// ── THE OPEN CARD'S LINEAGE ROWS, AND THE TWO JUMPS THEY OFFER ──────────────────────────────────
+//
+// bead sparkle-h9wgyf. The founder: *"I SHOULD ALWAYS BE ABLE TO SEE THE CHILDREN OR PARENT OF ANY
+// CARD"*, and about the pills themselves: build-agent pills *"are REAL LINKS: clicking one jumps to
+// that agent, the same affordance the concierge uses in chat."*
+//
+// ══ WHAT THESE TESTS ARE FOR, AND WHAT THEY DELIBERATELY DO NOT ASSERT ════════════════════════
+// `engine/beadLineage.test.ts` already proves the resolver answers the right question and
+// `BeadLineageRows` has its own suite for the packing. Neither can prove THIS overlay asks — the
+// whole class of defect here is a surface that renders a correct component from a wrong argument,
+// or wires a link to nothing. So every assertion below is on the SIDE EFFECT the click produced:
+// the store the reveal wrote, or the bead the overlay swapped to. Asserting "a prop was passed"
+// would stay green with `openProjectTab` deleted.
+//
+// ══ jsdom NEVER LAYS OUT ══════════════════════════════════════════════════════════════════════
+// So every pill's `offsetWidth` reads 0 and the row's available width reads 0. `usePacking` FAILS
+// OPEN on an unmeasured row and renders everything, which is exactly why these tests can read the
+// names at all — see its own comment. Nothing here may assert a "+N more" count.
+describe("BoardView — the open card's Tasks and Build agents rows", () => {
+  const EPIC = "p1-lin";
+  const KID_A = `${EPIC}.1`;
+  const KID_B = `${EPIC}.2`;
+  const STRANGER = "p1-other.1";
+
+  function seedLineageBoard() {
+    const epic = bead({ id: EPIC, title: "Lineage epic", type: "epic" });
+    const kidA = bead({ id: KID_A, title: "Wire the rows", parent: EPIC });
+    const kidB = bead({ id: KID_B, title: "Ship the rows", parent: EPIC });
+    const strangerEpic = bead({ id: "p1-other", title: "Someone else's epic", type: "epic" });
+    const stranger = bead({ id: STRANGER, title: "Not my task", parent: "p1-other" });
+    snapshot = {
+      beads: [epic, kidA, kidB, strangerEpic, stranger],
+      board: {
+        // `kidB` and the stranger's child are deliberately NOT on the board. A card found in a
+        // dialog for "Ship the rows" can therefore only be the overlay a Tasks pill opened, never
+        // one that was already painted behind it.
+        backlog: [epic, kidA, strangerEpic],
+        blocked: [],
+        inProgress: [],
+        done: [],
+        delivered: [],
+        archived: [],
+      },
+      loadedAt: Date.now(),
+    };
+  }
+
+  /** Seed the roster BOTH cases need: one worker inside this epic, one inside the stranger's. */
+  function seedAgents() {
+    useProjectStore.setState({
+      projects: [
+        {
+          ...project,
+          agents: [
+            { id: "ag-mine", name: "rows-worker", kind: "worker", beadId: KID_A },
+            { id: "ag-theirs", name: "stranger-worker", kind: "worker", beadId: STRANGER },
+          ] as unknown as AgentTab[],
+        },
+      ],
+      selectedProjectId: project.id,
+    });
+  }
+
+  /** Open the EPIC's full card — through the child card's "Part of Epic" link, which is the walk
+   *  this file already pins ("opens the EPIC's card when the parent link is clicked"). Reusing a
+   *  proven interaction keeps these tests about the lineage rows rather than about card chrome. */
+  function openEpicCard() {
+    render(<BoardView project={project} side="right" />);
+    const child = screen
+      .getAllByTestId("board-card-task")
+      .find((c) => c.textContent?.includes("Wire the rows"))!;
+    fireEvent.click(within(child).getByTestId("part-of-epic"));
+    return screen.getByTestId("board-bead-card");
+  }
+
+  it("names the epic's OWN children on the Tasks row and leaves another epic's child out", () => {
+    // Both epics' children exist in the same snapshot, so "the stranger is absent" is a statement
+    // about the filter and not about a card that renders no tasks under any circumstances.
+    seedLineageBoard();
+    openEpicCard();
+
+    const pills = screen.getAllByTestId("board-bead-card-tasks-pill");
+    const labels = pills.map((p) => p.textContent);
+    expect(labels).toContain("Wire the rows");
+    expect(labels).toContain("Ship the rows");
+    expect(labels).not.toContain("Not my task");
+    // The NAME, never the raw id — "the name of each task as a pill".
+    expect(screen.getByTestId("board-bead-card-tasks").textContent).not.toContain(KID_A);
+  });
+
+  it("SWAPS the overlay to the child's own card when its Tasks pill is clicked", () => {
+    seedLineageBoard();
+    openEpicCard();
+    const pill = screen
+      .getAllByTestId("board-bead-card-tasks-pill")
+      .find((p) => p.textContent === "Ship the rows")!;
+    fireEvent.click(pill);
+
+    // The child is NOT on the board in this fixture, so finding it inside the dialog can only be
+    // the card the click opened. The id is asserted too: a title alone would also be satisfied by
+    // the pill still sitting on the epic's own card.
+    const dialog = screen.getByRole("dialog");
+    expect(within(dialog).getByTestId("board-bead-card-title").textContent).toBe("Ship the rows");
+    expect(within(dialog).getByText(KID_B)).toBeTruthy();
+  });
+
+  it("names the workers inside the epic on the Build agents row, and no one else's", () => {
+    seedLineageBoard();
+    seedAgents();
+    openEpicCard();
+
+    const labels = screen
+      .getAllByTestId("board-bead-card-build-agents-pill")
+      .map((p) => p.textContent);
+    // Bound to a CHILD, not to the epic's own id — the normal dispatch shape, and the case that
+    // used to render blank everywhere it was asked with `workersForBead(agents, bead.id)`.
+    expect(labels).toContain("rows-worker");
+    expect(labels).not.toContain("stranger-worker");
+  });
+
+  it("REALLY JUMPS to the agent when a Build agents pill is clicked, and drops the overlay", () => {
+    seedLineageBoard();
+    seedAgents();
+    // PLAN FIRST, ON BOTH SIDES. The reveal's job is to SHOW the agent, so it leaves the board and
+    // lands on Build — which is only assertable if the column was somewhere else when the pill was
+    // clicked. "build" is the store's default, so asserting it from an unseeded start (what this
+    // test did) restates the default and stays green with the whole jump deleted.
+    useUiStore.setState({ workModeBySide: { left: "plan", right: "plan" } });
+    openEpicCard();
+
+    const pill = screen
+      .getAllByTestId("board-bead-card-build-agents-pill")
+      .find((p) => p.textContent === "rows-worker")!;
+    act(() => {
+      fireEvent.click(pill);
+    });
+
+    // THE REVEAL'S OWN WRITES, not "a callback fired". These are exactly what `selectAndOpen`
+    // performs, which is what `Concierge/AgentPill` reaches through `openProjectTab` — so this is
+    // the same landing the chat surface gives, asserted where a no-op wiring cannot fake it.
+    expect(useRuntimeStore.getState().openAgentIds).toContain("ag-mine");
+    expect(useProjectStore.getState().projects[0]?.selectedAgentId).toBe("ag-mine");
+    expect(useUiStore.getState().workModeBySide.right).toBe("build");
+    // ...and the modal that was covering the agent came down.
+    expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
+  it("renders NO lineage block on an open card with no children and no workers", () => {
+    // The card IS mounted and open — absence in a component that is not in the tree proves nothing.
+    const loner = bead({ id: "p1-loner", title: "All by itself" });
+    snapshot = {
+      beads: [loner],
+      board: {
+        backlog: [loner],
+        blocked: [],
+        inProgress: [],
+        done: [],
+        delivered: [],
+        archived: [],
+      },
+      loadedAt: Date.now(),
+    };
+    render(<BoardView project={project} side="right" />);
+    fireEvent.click(screen.getByText("All by itself"));
+
+    expect(screen.getByTestId("board-bead-card")).toBeTruthy();
+    expect(screen.queryByTestId("board-bead-card-lineage")).toBeNull();
   });
 });

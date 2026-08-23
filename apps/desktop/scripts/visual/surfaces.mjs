@@ -626,6 +626,38 @@ export const SURFACES = [
     },
     mock: null,
   },
+  {
+    // ── THE BEAD CARD IN THE CHAT THREAD ──────────────────────────────────────────────────────
+    // The founder's 2026-08-22 ask (beads sparkle-lm78sq, sparkle-h9wgyf): the cards the concierge
+    // posts "are just taking up too much real estate" and must collapse to about half height, with
+    // a `Tasks:` row and a `Build agents:` row.
+    //
+    // WHY THIS SURFACE HAD TO BE ADDED AT ALL: `concierge-column` above photographs an EMPTY
+    // thread. Nothing in it can render a bead card, so a before/after taken there is two identical
+    // pictures of a change that landed — the failure this registry keeps paying for, where a
+    // capture succeeds and proves nothing.
+    //
+    // `beadcard=1` seeds an epic with nine children, six workers bound to those CHILDREN, and a
+    // two-line thread naming the epic in bare text. See `visualBeadCardRequested` for why every
+    // part of that is behind an opt-in.
+    name: "concierge-bead-card",
+    query: "beadcard=1",
+    description:
+      "A bead card in the concierge thread: the merged meta line, Tasks and Build agents rows.",
+    app: {
+      steps: [
+        { waitFor: 'section[aria-label="Sparkle concierge"]' },
+        // WAIT FOR THE CARD ITSELF, NOT JUST THE COLUMN. The bead id becomes a card through a
+        // remark plugin plus a store lookup, and BOTH can fail silently: an id that resolves to
+        // nothing renders as BARE TEXT, and the column would still be there to photograph. This
+        // `waitFor` is what turns "the fixture did not take" into a FAILED capture instead of a
+        // picture of a sentence.
+        { waitFor: "[data-testid=concierge-bead-card]" },
+      ],
+      clip: 'section[aria-label="Sparkle concierge"]',
+    },
+    mock: null,
+  },
 ];
 
 export const THEMES = ["light", "dark"];

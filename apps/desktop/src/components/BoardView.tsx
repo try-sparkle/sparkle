@@ -81,6 +81,8 @@ import { useBeadBuildActions } from "./BeadCard/useBeadBuildActions";
 import { setBeadPriority } from "./BeadCard/beadPriority";
 import { beadCardMenuIsOpen } from "./BeadCard/PriorityPill";
 import { beadsComment, beadsDetail, type BeadComment } from "../services/beadsCommands";
+import { beadLineageOf } from "../engine/beadLineage";
+import { openProjectTab } from "../services/openProjectTab";
 import { FONT_MONO, FONT_UI } from "../theme/scale";
 
 /** The next board stage a card in `columnKey` is progressing toward (whose criteria we evaluate):
@@ -2026,6 +2028,24 @@ function DetailOverlay({
 }) {
   const beadIsEpic = isEpicIndexed(epicIndexOf(allBeads), bead);
   const workers = workersForBead(agents, bead.id);
+
+  // ── THIS CARD'S LINEAGE: THE `Tasks:` AND `Build agents:` ROWS ───────────────────────────────
+  // The founder, 2026-08-22: *"I should ALWAYS be able to see the children or parent of any card"*
+  // — and, about the two rows, *"whether it's in the concierge chat or on the planning board, I
+  // think it would still just show me two rows."* So the board's full card resolves the SAME data
+  // through the SAME engine the concierge and the Epics column use; a second derivation here is
+  // exactly the drift `BeadCard` was written to end.
+  //
+  // `epicIndexOf` is WeakMap-cached on the ARRAY IDENTITY, so this shares the one index the line
+  // above already built for `isEpicIndexed` and the board's cards already built for theirs. That is
+  // the whole reason the index is a parameter of `beadLineageOf` rather than something it makes:
+  // a raw per-card scan measured 3.4–4.0s on a 7,364-bead store, and this overlay re-renders on the
+  // 5s poll. `allBeads` is passed STRAIGHT THROUGH — copying, slicing or re-sorting it first would
+  // mint a new identity every render and defeat the cache silently.
+  const lineage = useMemo(
+    () => beadLineageOf({ beads: allBeads, bead, agents, projectId }),
+    [allBeads, bead, agents, projectId],
+  );
   // The project's checkout root — every WRITE is addressed by PATH. Looked up here because the
   // overlay only receives a projectId.
   const rootPath = useProjectStore(
@@ -2195,6 +2215,34 @@ function DetailOverlay({
           // project has no path, degrading the card to a read-only thread.
           comments={comments}
           onComment={handleComment}
+          lineage={lineage}
+          // ── A TASK PILL OPENS THAT TASK'S OWN CARD ────────────────────────────────────────────
+          // Through `onOpen`, which is the overlay's EXISTING "swap to another bead" seam — the
+          // same one the epic child roll-up and the parent-epic link already use, so the epic↔task
+          // walk behaves identically however the reader started it. Resolved against `allBeads`
+          // because the row carries an id while `onOpen` takes the bead; a pill whose bead has
+          // fallen out of the snapshot does nothing rather than opening an empty card.
+          onOpenBead={(beadId) => {
+            const hit = allBeads.find((b) => b.id === beadId);
+            if (hit) onOpen(hit);
+          }}
+          // ── A BUILD-AGENT PILL IS A REAL LINK ────────────────────────────────────────────────
+          // The founder: build-agent pills *"are REAL LINKS: clicking one jumps to that agent, the
+          // same affordance the concierge uses in chat."* `openProjectTab` is that affordance —
+          // `Concierge/AgentPill` reaches the same `selectAndOpen` through it — so the board and
+          // the chat land the reader in exactly the same place.
+          //
+          // AND THE OVERLAY COMES DOWN, on a reveal that landed. Leaving a modal scrim over the
+          // agent the click just jumped to would make the jump invisible, which is the dead-click
+          // failure `agentReveal.RevealOutcome` exists to prevent. Gated on the return value: a
+          // `false` means nothing moved (unknown project, or the agent is gone), and closing the
+          // card the reader was reading would then be the only thing the click did.
+          //
+          // The pill's own `projectId` is preferred, with this overlay's as the fallback: an agent
+          // pill is addressed by project because the roster it came from is a project's roster.
+          onOpenAgent={({ agentId, projectId: pillProjectId }) => {
+            if (openProjectTab(pillProjectId ?? projectId, agentId)) onClose();
+          }}
         />
 
         {/* BOARD-ONLY, and the reason this overlay still exists as more than a frame: the per-child

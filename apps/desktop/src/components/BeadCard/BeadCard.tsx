@@ -21,10 +21,26 @@
 // `<button>` is already phrasing content, so the controls need no special handling.
 //
 // ══ WHAT SCROLLS, AND WHAT MUST NOT ════════════════════════════════════════════════════════════
-// Only the DESCRIPTION. Everything above it — title, id, priority, the status line, and the
-// View-on-board button — stays pinned outside the scroll region. This is deliberate and follows
-// bead `sparkle-qogah`'s rule that a row needing action is never hidden: a card whose whole body
-// scrolled would take the priority control and the way out of the card with it.
+// Only the DESCRIPTION, and only when the card is EXPANDED. Everything above it — title, id,
+// priority, the status line, and the View-on-board button — stays pinned outside the scroll region.
+// This is deliberate and follows bead `sparkle-qogah`'s rule that a row needing action is never
+// hidden: a card whose whole body scrolled would take the priority control and the way out of the
+// card with it.
+//
+// A COLLAPSED CARD SCROLLS NOTHING AT ALL — it renders no description, so there is no inner
+// scroller for `descMaxHeight` to create. See `collapsed`.
+//
+// ══ THE WHOLE BODY IS THE EXPAND TARGET, SO EVERY CONTROL MUST STOP THE BUBBLE ═════════════════
+// The founder asked for click-the-card rather than a chevron. That makes the card root's `onClick`
+// an ancestor of every button on it, and React bubbles through the COMPONENT tree — including the
+// priority menu, which is portaled to `document.body`. So each control (and each wrapper around a
+// child component that owns its own controls) calls `stopPropagation`, or pressing Build It fires
+// the build AND collapses the card in the same gesture.
+//
+// THAT CLICK IS A MOUSE CONVENIENCE AND NOTHING ELSE. The root carries NO `role="button"` and no
+// `tabIndex`: ARIA gives the `button` role presentational children, so one on the root deletes the
+// announced semantics of every control inside the card and displaces the chrome's `role="status"`.
+// The disclosure semantics live on the TITLE BUTTON instead — see the root element and the title.
 import { useEffect, useState, type CSSProperties, type ReactNode } from "react";
 import { FiExternalLink, FiMessageSquare, FiUsers, FiX } from "react-icons/fi";
 import { C, FONT_WEIGHT, ON_BRAND_FILL } from "../../theme/colors";
@@ -34,11 +50,13 @@ import type { BeadComment } from "../../services/beadsCommands";
 import type { WorkflowStageId } from "../../engine/workflowStage";
 import type { EpicGoal, EpicGoalSource } from "../../engine/epicGoal";
 import type { EpicLadderKey } from "../../services/epicBoard";
+import type { BeadLineage } from "../../engine/beadLineage";
 import { PriorityPill } from "./PriorityPill";
 import { BeadSeverityBadge } from "./BeadSeverityBadge";
 import { CommentThread } from "./CommentThread";
 import { EpicCardGoal } from "./EpicCardGoal";
 import { EpicPill } from "./EpicPill";
+import { BeadLineageRows } from "./BeadLineageRows";
 import { StageLine } from "./StageLine";
 import { stageLabel, statusDot } from "./beadStatus";
 
@@ -251,6 +269,56 @@ export interface BeadCardProps {
    * card — and is the same shape `goal`/`onSetGoal` and `onChat` already take.
    */
   showStageLine?: boolean;
+  /**
+   * DRAW THE HALF-HEIGHT CARD. Default `false`, i.e. the full card every surface renders today.
+   *
+   * The founder, 2026-08-22, about the cards the concierge posts into chat: *"they're just taking
+   * up too much real estate, and I love them, but I want them to be click to expandable… maybe half
+   * the height when it's closed."*
+   *
+   * COLLAPSED IS LESS CONTENT, NOT THE SAME CONTENT IN A SMALLER WINDOW — *"when it's collapsed, it
+   * would not scroll — would just have less of the actual text."* A scrollable region nested inside
+   * a scrolling thread captures the wheel and stops the thread, so a collapsed card must NOT set
+   * `descMaxHeight` and must not clip a description behind an inner scroller.
+   *
+   * WHAT SURVIVES THE COLLAPSE: Build It (top left), the title, the id, the single merged metadata
+   * line, and the two lineage rows. Everything else — description, labels, comments, composer —
+   * belongs to the expanded state. This supersedes the earlier "title, id and status only" note.
+   *
+   * A PROP, NOT A BRANCH ON `chrome`, per this file's header: the surface supplies the state, the
+   * card never decides from where it is mounted.
+   */
+  collapsed?: boolean;
+  /**
+   * Toggle {@link collapsed}. THE WHOLE CARD BODY IS THE TARGET — *"best might be that you just
+   * click on the card. Right? Instead of having a Chevron."*
+   *
+   * ITS PRESENCE IS ALSO THE SWITCH, like every other callback here: a surface that cannot expand
+   * passes nothing and the card is inert rather than advertising a gesture that does nothing.
+   *
+   * THE TRAP TO SOLVE RATHER THAN DISCOVER: with the body as the target, EVERY interactive child —
+   * Build It, the priority pill, the id, a lineage pill, the close X — must stop propagation, or
+   * the same click fires the control AND toggles the card.
+   */
+  onToggleCollapsed?: () => void;
+  /**
+   * THIS CARD'S PARENT, CHILDREN AND BUILD AGENTS, resolved by the caller via
+   * `beadLineageOf(...)` in `engine/beadLineage.ts`.
+   *
+   * Passed in rather than derived here because resolution needs the project's full bead snapshot
+   * and its agent roster — neither of which a card should reach for — and because the `EpicIndex`
+   * it walks must be built ONCE per snapshot, not once per card (a raw per-card scan measured
+   * 3.4–4.0s on the founder's store).
+   *
+   * THE SAME TWO ROWS COLLAPSED AND EXPANDED. *"If I click to expand the card, I think I would
+   * still see those same fidelity of information… it would still just show me two rows."* Expansion
+   * adds the rest of the card, NOT more lineage — so nothing here keys on {@link collapsed}.
+   */
+  lineage?: BeadLineage;
+  /** Jump to a task on the `Tasks:` row. Absent renders those pills as static text. */
+  onOpenBead?: (beadId: string) => void;
+  /** Jump to a build agent — the same affordance the concierge uses in chat. */
+  onOpenAgent?: (agent: { agentId: string; projectId?: string }) => void;
   /** A sentence the caller wants under the controls — today, "that board could not be opened". */
   notice?: string;
   /** Bumped by the caller so a REPEAT of the same notice re-registers as a live-region update
@@ -258,10 +326,122 @@ export interface BeadCardProps {
   noticeKey?: number;
 }
 
+/**
+ * A DRAG-SELECTION IS NOT A CLICK — and, just as importantly, A KEYPRESS IS NOT A DRAG.
+ *
+ * `click` is dispatched to the nearest common ancestor of mousedown and mouseup, so sweeping across
+ * the title, the description, or the bead id — which this file calls "a handle you copy" — ends on
+ * whichever element encloses the sweep. Collapsing there hides the text the reader just selected,
+ * before they can copy it.
+ *
+ * ══ WHY IT TAKES THE EVENT ═════════════════════════════════════════════════════════════════
+ * The title's toggle is a native `<button>`, so it is ALSO activated by Enter and Space — the
+ * whole reason it is a button rather than a div with a role. A keyboard activation never touches
+ * the document's selection, so a guard that only reads `getSelection()` suppresses it whenever a
+ * selection happens to exist anywhere on the page: sweep the description with the mouse, tab to the
+ * title, press Enter, and the control is silently dead. `detail` is 0 for a keyboard-generated
+ * click and >= 1 for a real pointer click, which is what separates the two.
+ *
+ * SHARED because the card has TWO toggle entry points: the card root and the title's disclosure
+ * button. The button stops the bubble, so it never reaches the root's copy of this check — a guard
+ * written only on the root leaves the title, the most natural thing to sweep across, unprotected.
+ */
+function gestureSelectedText(e: { detail: number }): boolean {
+  // A KEYBOARD ACTIVATION IS ALWAYS ALLOWED THROUGH. It cannot have produced a selection, so there
+  // is nothing here to protect, and suppressing it breaks the affordance the button exists for.
+  if (e.detail === 0) return false;
+  const sel = typeof window.getSelection === "function" ? window.getSelection() : null;
+  return sel !== null && !sel.isCollapsed && sel.toString() !== "";
+}
+
 /** A block-level span. Written once so no call site below can reach for a `<div>` by reflex. */
 const block = (extra: CSSProperties = {}): CSSProperties => ({ display: "block", ...extra });
 
 const rowStyle: CSSProperties = { display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" };
+
+/**
+ * KEEP A CLICK OFF THE CARD BODY.
+ *
+ * The card root is the expand/collapse target, so every control on the card — and every child
+ * component that owns controls of its own (the priority pill and its portaled menu, the goal
+ * editor, the comment composer) — has to swallow the bubble. Written once, because "I added a
+ * button and forgot the `stopPropagation`" is the exact defect the founder asked to have solved
+ * rather than discovered later.
+ *
+ * `display: contents` on the wrappers below, NOT `block`: the wrapper must not become a flex item
+ * of its own or it would change the spacing of a component it is only listening on.
+ */
+const swallow = (e: { stopPropagation: () => void }): void => {
+  e.stopPropagation();
+};
+
+/** A wrapper that exists only to swallow clicks — see {@link swallow}. */
+const SWALLOW_BOX: CSSProperties = { display: "contents" };
+
+/** THE TITLE'S OWN METRICS, shared by the plain span and by the disclosure BUTTON that stands in
+ *  for it when the card can expand — so the control is pixel-for-pixel the text it replaces. */
+const TITLE_STYLE: CSSProperties = {
+  display: "block",
+  minWidth: 0,
+  color: C.cream,
+  fontWeight: FONT_WEIGHT.semibold,
+  fontSize: TYPE.title,
+  lineHeight: 1.3,
+};
+
+/** …and everything a `<button>` drags in that a `<span>` does not: it never inherits the card's
+ *  font, and it arrives with a UA border, background, padding and centred text. */
+const TITLE_BUTTON_RESET: CSSProperties = {
+  width: "100%",
+  textAlign: "left",
+  background: "transparent",
+  border: "none",
+  padding: 0,
+  margin: 0,
+  fontFamily: FONT_UI,
+  cursor: "pointer",
+  // ══ A BUTTON LABEL IS NOT A SELECTION TARGET, AND THE TITLE MUST STAY ONE ═════════════════
+  // Without these the drag-selection guard beside the toggle is protecting a capability the
+  // runtime has already removed: in the Tauri WKWebView a `<button>`'s label cannot be swept at
+  // all, so "select the title and copy it" — the exact thing the guard exists for — is impossible.
+  // jsdom applies no UA stylesheet for `user-select`, so no behavioural test can show this; it is
+  // pinned as a style value beside the card's other layout-invisible rules.
+  userSelect: "text",
+  WebkitUserSelect: "text",
+};
+
+/**
+ * ONE ITEM ON THE MERGED META LINE.
+ *
+ * The founder, 2026-08-22: *"we have backlog, p two, task — and then we have the row that says
+ * planned. I think we can all make that one line. So the row would not be the full width of the
+ * card, but it would be to the right of where it says task. Let's make that on the same line so the
+ * row is just as wide, but we save a row of height."* — so the build-state row and the metadata row
+ * are ONE row, in both states, and the saving applies collapsed AND expanded.
+ */
+interface MetaItem {
+  key: string;
+  node: ReactNode;
+  /** Take the line's remaining width. Exactly one item wants this — the progress rule, which is a
+   *  bar and therefore the only item with no intrinsic width worth keeping. */
+  grow?: boolean;
+  /**
+   * GIVE GROUND RATHER THAN CLIP. Set on the two items whose length is CONTENT, not a fixed label:
+   * the parent-epic chip (its text is a bead TITLE, and "A TITLE CAN BE A SENTENCE") and
+   * `in ${projectName}`.
+   *
+   * WITHOUT IT THE CHIP'S ELLIPSIS CANNOT FIRE. `maxWidth: "100%"` resolves against the item's own
+   * wrapper, so an unshrinkable `flex: "0 0 auto"` wrapper is always exactly as wide as its text —
+   * `text-overflow` has nothing to overflow. Under the row's `nowrap` + `overflow: hidden` a long
+   * epic title then clipped silently at the card's edge, and the chip is the LAST item on the line,
+   * so it is precisely the thing that disappeared.
+   *
+   * The short fixed labels (Build It, the status word, `P1`, `epic`) must NOT take this: they are
+   * already minimal, and letting them shrink is what broke words mid-letter ("Backl/og", "e/pi/c")
+   * in the `concierge-bead-card` capture.
+   */
+  shrink?: boolean;
+}
 
 /** THE **Open** GROUP'S LINK SHAPE, written once so the two destinations cannot drift apart — a
  *  pair of navigation links that differ by a shade or a weight stops reading as one choice.
@@ -319,6 +499,11 @@ export function BeadCard({
   comments,
   onComment,
   showStageLine = true,
+  collapsed = false,
+  onToggleCollapsed,
+  lineage,
+  onOpenBead,
+  onOpenAgent,
   notice,
   noticeKey,
 }: BeadCardProps) {
@@ -380,54 +565,282 @@ export function BeadCard({
   }
 
   const shownPriority = optimistic ?? bead.priority;
-  const meta: ReactNode[] = [];
-  meta.push(
-    <span key="status" style={{ ...rowStyle, gap: 5 }}>
-      <span style={{ ...statusDot(bead.status), display: "inline-block" }} aria-hidden />
-      {stageLabel(bead, placedIn)}
-    </span>,
-  );
+
+  // ── THE MERGED LINE ───────────────────────────────────────────────────────────────────────────
+  // Build It, then status, priority, severity, type, project, the build state, and the parent epic.
+  // What used to be TWO rows — the metadata row and the full-bleed progress rule beneath it — is
+  // one, which is the row of height this whole change reclaims. It is merged in BOTH states, per
+  // the founder: he described the saving on the card as such, not on the collapsed card.
+  const meta: MetaItem[] = [];
+
+  // ══ BUILD IT COMES FIRST, AND SURVIVES THE COLLAPSE ═════════════════════════════════════════
+  // *"I think build it should probably actually be in the top left corner instead of the bottom
+  // left because if it's long, and we're doing a click to expand, that's a lot… And in that case,
+  // it COULD still say build it when it's collapsed, so that would be okay."* He reversed himself
+  // mid-thought and the SECOND position is the decision. The reasoning is load-bearing rather than
+  // cosmetic: an action at the BOTTOM of a long card cannot be reached without expanding first,
+  // which is precisely what collapsing was supposed to save.
+  //
+  // `Build all N epics` deliberately does NOT come with it — it is the secondary action, it names a
+  // number that needs the rest of the card to make sense of, and it stays where it was, expanded.
+  if (onBuildIt !== undefined) {
+    meta.push({
+      key: "build-it",
+      node: (
+        <button
+          type="button"
+          data-testid={`${t}-build-it`}
+          onClick={(e) => {
+            // THE TRAP, SOLVED HERE. Without this the same click builds AND collapses the card.
+            e.stopPropagation();
+            void runBuild(onBuildIt);
+          }}
+          disabled={buildBusy}
+          title="Build It — claim this unit of work and hand it to the Build orchestrator"
+          style={{
+            flex: "0 0 auto",
+            background: C.teal,
+            color: ON_BRAND_FILL,
+            border: "none",
+            borderRadius: RADIUS.modal,
+            // THE LINE'S OWN METRICS, not the old standalone row's `5px 14px`. It now shares a line
+            // with `TYPE.small` metadata, and a taller button would put back the height the merge
+            // just saved — the row is only as short as its tallest item.
+            padding: "3px 10px",
+            fontSize: TYPE.small,
+            fontWeight: FONT_WEIGHT.semibold,
+            cursor: buildBusy ? "default" : "pointer",
+            opacity: buildBusy ? 0.7 : 1,
+            fontFamily: FONT_UI,
+          }}
+        >
+          {buildBusy ? "Building…" : "Build It"}
+        </button>
+      ),
+    });
+  }
+
+  meta.push({
+    key: "status",
+    node: (
+      <span style={{ ...rowStyle, gap: 5 }}>
+        <span style={{ ...statusDot(bead.status), display: "inline-block" }} aria-hidden />
+        {stageLabel(bead, placedIn)}
+      </span>
+    ),
+  });
   if (onSetPriority !== undefined) {
-    meta.push(
-      <PriorityPill
-        key="priority"
-        testId={`${t}-priority`}
-        priority={shownPriority}
-        disabled={priorityBusy}
-        onChange={(p) => void pickPriority(p)}
-      />,
-    );
+    meta.push({
+      key: "priority",
+      node: (
+        // WRAPPED TO SWALLOW THE CLICK. The pill's menu is PORTALED to `document.body`, and React
+        // bubbles through the component tree rather than the DOM tree — so without this, picking a
+        // priority from a menu that is not even inside the card still toggles the card.
+        <span style={SWALLOW_BOX} onClick={swallow}>
+          <PriorityPill
+            testId={`${t}-priority`}
+            priority={shownPriority}
+            disabled={priorityBusy}
+            onChange={(p) => void pickPriority(p)}
+          />
+        </span>
+      ),
+    });
   } else if (shownPriority !== undefined) {
     // READ-ONLY, and it must still SAY the priority. A surface with no project path cannot write,
     // but the number is the single most decision-relevant field on the card.
-    meta.push(
-      <span key="priority" data-testid={`${t}-priority-readonly`}>{`P${shownPriority}`}</span>,
-    );
+    meta.push({
+      key: "priority",
+      node: <span data-testid={`${t}-priority-readonly`}>{`P${shownPriority}`}</span>,
+    });
   }
   // SEVERITY — a distinct axis beside priority (the founder asked for both visible), read from the
   // `sev-<N>` label. Renders nothing when the bead carries no score, so it adds a meta item only when
   // there is one to show; `severityOf` returns null otherwise.
   const severity = severityOf(bead);
   if (severity !== null) {
-    meta.push(<BeadSeverityBadge key="severity" severity={severity} testId={`${t}-severity`} />);
+    meta.push({
+      key: "severity",
+      node: <BeadSeverityBadge severity={severity} testId={`${t}-severity`} />,
+    });
   }
-  if (bead.type) meta.push(<span key="type">{bead.type}</span>);
-  // LAST, and only when the bead is somewhere else. "View on board" calls `selectProject`, so this
-  // is the line that turns a silent whole-project jump into a choice.
+  if (bead.type) meta.push({ key: "type", node: <span>{bead.type}</span> });
+  // Only when the bead is somewhere else. "View on board" calls `selectProject`, so this is the
+  // line that turns a silent whole-project jump into a choice.
   if (projectName !== undefined && projectName !== "") {
-    meta.push(<span key="project">{`in ${projectName}`}</span>);
+    // SHRINKABLE — a project name is content, not a fixed label. See `MetaItem.shrink`.
+    meta.push({
+      key: "project",
+      shrink: true,
+      // TRUNCATION RULES, because this item is `shrink: true`. A shrinkable box with no
+      // `overflow`/`text-overflow` does not ellipsise — it just renders past its own width, so a
+      // long project name pushed the merged line out under `nowrap` instead of giving way.
+      node: (
+        <span
+          data-testid={`${t}-project`}
+          title={`in ${projectName}`}
+          style={{
+            display: "block",
+            minWidth: 0,
+            // …and a CEILING, matching the parent chip. `minWidth: 0` lets it give ground but does
+            // not bound it, so without this the text can still lay itself out wider than the
+            // wrapper and paint over the items after it on the line.
+            maxWidth: "100%",
+            overflow: "hidden",
+            textOverflow: "ellipsis",
+            whiteSpace: "nowrap",
+          }}
+        >
+          {`in ${projectName}`}
+        </span>
+      ),
+    });
+  }
+
+  // ══ THE BUILD STATE, TO THE RIGHT OF `type` — HIS ITEM, VERBATIM ════════════════════════════
+  // *"the row would not be the full width of the card, but it would be to the right of where it
+  // says task."* So the progress rule keeps its bar AND its stage word; what it loses is the
+  // full-bleed row of its own. `grow` is what makes it "not the full width of the card": it takes
+  // whatever the named fields left over, and no more.
+  //
+  // STILL GOVERNED BY `showStageLine`, unchanged. The epics column passes `false` and gets no bar
+  // and no stage word at all — see that prop, and item 22 in `BeadCardChrome.test.tsx`.
+  if (showStageLine) {
+    meta.push({
+      key: "stage",
+      grow: true,
+      node: <StageLine stage={stage} height={3} testId={`${t}-stage`} />,
+    });
+  }
+
+  // ══ THE PARENT EPIC RIDES THIS LINE TOO, AT ITS RIGHT END ═══════════════════════════════════
+  // The founder settled this on 2026-08-22 when asked — he had never specified it. A chip here
+  // costs ZERO extra height and keeps *"just two rows, one for tasks and one for build agents"*
+  // literally true; a third lineage row would have cost height on the MAJORITY of cards, since most
+  // beads are tasks inside an epic — the exact height this change is reclaiming.
+  //
+  // ONE PARENT TREATMENT, NOT TWO. This replaces the expanded-only `Field label="Epic"` that
+  // printed `bead.parent` as raw mono id text.
+  //
+  // IT READS THE TITLE, and falls back to the raw id: `lineage.parent` is a whole `Bead`, so the
+  // chip can say what the epic IS. A surface that passes no lineage has only ever known the id —
+  // that is not a reason to say nothing, so the id is what it shows.
+  const parentBead = lineage?.parent ?? null;
+  const parentId = parentBead?.id ?? bead.parent ?? null;
+  const parentLabel = parentBead === null ? parentId : parentBead.title || parentBead.id;
+  if (parentId !== null && parentLabel !== null && parentLabel !== "") {
+    const openParent = onOpenBead;
+    meta.push({
+      key: "parent",
+      // SHRINKABLE, or the ellipsis below is decoration. See `MetaItem.shrink`.
+      shrink: true,
+      node: (
+        <span
+          data-testid={`${t}-parent`}
+          data-bead-id={parentId}
+          title={`Epic: ${parentLabel}`}
+          aria-label={`Epic: ${parentLabel}`}
+          role={openParent === undefined ? undefined : "button"}
+          tabIndex={openParent === undefined ? undefined : 0}
+          onClick={
+            openParent === undefined
+              ? undefined
+              : (e) => {
+                  e.stopPropagation();
+                  openParent(parentId);
+                }
+          }
+          onKeyDown={
+            openParent === undefined
+              ? undefined
+              : (e) => {
+                  if (e.key !== "Enter" && e.key !== " ") return;
+                  e.preventDefault();
+                  e.stopPropagation();
+                  openParent(parentId);
+                }
+          }
+          style={{
+            display: "inline-block",
+            flex: "0 1 auto",
+            minWidth: 0,
+            maxWidth: "100%",
+            // A TITLE CAN BE A SENTENCE. It ellipsises rather than wrapping the merged line onto a
+            // second one, which would give back the height this change exists to save.
+            overflow: "hidden",
+            textOverflow: "ellipsis",
+            whiteSpace: "nowrap",
+            background: "transparent",
+            border: `1px solid ${C.hairline}`,
+            borderRadius: RADIUS.input,
+            color: C.cream,
+            padding: "1px 7px",
+            fontSize: TYPE.small,
+            lineHeight: 1.5,
+            cursor: openParent === undefined ? "default" : "pointer",
+          }}
+        >
+          {parentLabel}
+        </span>
+      ),
+    });
   }
 
   // The batch is offered only when there is a batch: one epic sharing a PRD with itself is not one.
   // Narrowed to a callback rather than to a boolean so the JSX below needs no non-null assertion.
   const buildAllPrd = (prdEpicCount ?? 0) > 1 ? onBuildAllPrd : undefined;
 
+  // ── WHAT THE COLLAPSED CARD IS ────────────────────────────────────────────────────────────────
+  // Derived from WHICH FIELDS ARE SHOWN, never from a pixel height — the founder left the number
+  // open (*"maybe I don't know, half the height"*) and the concierge column is user-resizable, so a
+  // hard-coded height would be wrong at every width but one.
+  //
+  // COLLAPSED KEEPS: the chrome row (the id and the way out of the card), the title, the merged
+  // line — Build It included — and the two lineage rows. EXPANDED ADDS: the goal, the description,
+  // the labels, the workers row, `Build all N epics`, and the comment thread. That is roughly half
+  // the rows on a typical card and it shrinks further on a bead with less to say, which is the
+  // property a fixed height cannot have.
+  //
+  // A COLLAPSED CARD THEREFORE SCROLLS NOTHING: *"when it's collapsed, it would not scroll — would
+  // just have less of the actual text."* A scroller nested inside the scrolling thread captures the
+  // wheel and stops the thread, so the fix is not a shorter clamp — it is NO clamped element. The
+  // description is the only thing `descMaxHeight` ever reaches, and `expanded` is what decides
+  // whether it is drawn at all, so the prop simply has nothing to act on here.
+  const expanded = !collapsed;
+  const toggles = onToggleCollapsed !== undefined;
+
   return (
     <span
       id={id}
+      // ══ THE CARD BODY IS A MOUSE CONVENIENCE — THE TOGGLE ITSELF IS THE TITLE BUTTON ═════════
+      // *"best might be that you just click on the card. Right? Instead of having a Chevron, you
+      // just click on each of these cards to expand it."* That gesture is kept, exactly: a click
+      // anywhere on the body still opens the card.
+      //
+      // WHAT IS **NOT** HERE, AND WHY: `role="button"` + `tabIndex={0}`. ARIA gives the `button`
+      // role PRESENTATIONAL CHILDREN — assistive tech drops the semantics of everything inside it.
+      // Putting it on the ROOT therefore silenced every control on the card at once (Build It, the
+      // priority pill, Chat, View on board, Close, the parent chip, the goal editor, the comment
+      // box) the moment a caller wired `onToggleCollapsed`, and made the whole card ONE tab stop
+      // wrapping other tabbable elements. It also DISPLACED the chrome's `role="status"` on every
+      // card, expanded ones included, so a card posted into the concierge thread stopped announcing
+      // itself. The root keeps `spec.role` and the disclosure semantics live on the TITLE BUTTON
+      // below — a real `<button aria-expanded aria-controls>` that gets Enter and Space for free.
+      //
+      // THE CALLBACK IS STILL THE SWITCH: a surface that cannot expand passes nothing and the card
+      // is INERT — no handler, no pointer cursor, and a title that is plain text again.
       role={spec.role}
+      onClick={
+        toggles
+          ? (e: { detail: number }) => {
+              if (gestureSelectedText(e)) return;
+              onToggleCollapsed();
+            }
+          : undefined
+      }
       data-testid={t}
       data-bead-id={bead.id}
+      data-collapsed={collapsed ? "true" : "false"}
       style={{
         display: "flex",
         flexDirection: "column",
@@ -437,6 +850,7 @@ export function BeadCard({
         background: spec.surface,
         ...spec.edge,
         fontFamily: FONT_UI,
+        cursor: toggles ? "pointer" : undefined,
         // The card carries prose, and a pill it may sit beside is `nowrap`.
         whiteSpace: "normal",
         // Bead titles carry paths, branch names and identifiers with no break opportunity at all.
@@ -508,6 +922,13 @@ export function BeadCard({
               `TYPE.small`; it is now the left half of the top-right cluster. */}
           <span
             data-testid={`${t}-id`}
+            // RECOVERABLE WHEN IT TRUNCATES. The corner cluster is the narrowest real estate on the
+            // card and the id is the only shrinkable thing in it, so in the concierge's default
+            // 360px column it ellipsises to a couple of characters — measured in the
+            // `concierge-bead-card` capture. An id is a HANDLE the founder copies and greps, so a
+            // truncated one with no way to read it is the same as not rendering it at all. The
+            // cluster's own layout is a separate, larger question (see the note on this bead).
+            title={bead.id}
             style={{
               color: C.muted,
               opacity: 0.8,
@@ -544,7 +965,12 @@ export function BeadCard({
             <button
               type="button"
               data-testid={`${t}-chat`}
-              onClick={onChat}
+              // STOPS THE BUBBLE. The card body is the expand target; without this, asking
+              // Sparkle about the bead also collapses the card you asked from.
+              onClick={(e) => {
+                e.stopPropagation();
+                onChat();
+              }}
               title="Chat with Sparkle about this bead — starts a message that references it"
               style={{
                 flex: "0 0 auto",
@@ -585,7 +1011,10 @@ export function BeadCard({
             <button
               type="button"
               data-testid={`${t}-view-on-board`}
-              onClick={onViewOnBoard}
+              onClick={(e) => {
+                e.stopPropagation();
+                onViewOnBoard();
+              }}
               title="Open the Plan board focused on this card"
               style={{
                 flex: "0 0 auto",
@@ -613,7 +1042,10 @@ export function BeadCard({
               data-testid={`${t}-close`}
               aria-label="Close"
               title="Close"
-              onClick={onClose}
+              onClick={(e) => {
+                e.stopPropagation();
+                onClose();
+              }}
               style={{
                 flex: "0 0 auto",
                 display: "inline-flex",
@@ -635,20 +1067,45 @@ export function BeadCard({
         </span>
       </span>
 
-      {/* ── TITLE ─────────────────────────────────────────────────────────────────────────── */}
-        <span
+      {/* ── TITLE — AND, WHEN THE CARD CAN EXPAND, THE DISCLOSURE CONTROL ITSELF ──────────────
+          A REAL `<button aria-expanded aria-controls>`, rather than a `role` on the card root.
+          The root carried both until ARIA's PRESENTATIONAL CHILDREN rule was pointed at it: one
+          `button` wrapped around the whole card silences the semantics of every control inside it
+          — see the root above. An accordion header is what this actually is, and the title is the
+          honest label for it, since it names the thing that opens. A native button also brings
+          Enter, Space and a focus ring with it instead of re-implementing them on a span.
+
+          NOTHING MOVES. The button is reset back to the span's own metrics, and `<button>` is
+          already phrasing content, so it is exactly as valid inside `<Markdown>`'s `<p>` as the
+          span it replaces (this file's header).
+
+          CALLBACK-IS-THE-SWITCH, like every other affordance here: a surface that cannot expand
+          gets plain text back rather than a control that does nothing. */}
+      {toggles ? (
+        <button
+          type="button"
           data-testid={`${t}-title`}
-          style={{
-            display: "block",
-            minWidth: 0,
-            color: C.cream,
-            fontWeight: FONT_WEIGHT.semibold,
-            fontSize: TYPE.title,
-            lineHeight: 1.3,
+          aria-expanded={expanded}
+          aria-controls={id}
+          onClick={(e) => {
+            // STOPS THE BUBBLE, like every other control on this card. The root's own `onClick` is
+            // an ancestor of this one, so without it the gesture toggles TWICE and nets to nothing.
+            e.stopPropagation();
+            // …and BECAUSE it stops the bubble, the root's selection guard never runs for this
+            // gesture. The title is the most natural thing on the card to sweep across, so without
+            // its own check, selecting the title collapsed the card and hid it.
+            if (gestureSelectedText(e)) return;
+            onToggleCollapsed();
           }}
+          style={{ ...TITLE_STYLE, ...TITLE_BUTTON_RESET }}
         >
           {bead.title || bead.id}
+        </button>
+      ) : (
+        <span data-testid={`${t}-title`} style={TITLE_STYLE}>
+          {bead.title || bead.id}
         </span>
+      )}
 
       {/* ── THE GOAL ───────────────────────────────────────────────────────────────────────────
           DIRECTLY UNDER THE TITLE, which is where the founder put it: [05:44] "the title is gonna
@@ -658,33 +1115,102 @@ export function BeadCard({
 
           ABOVE THE ID, not below, so the two things a person reads about an epic — what it is
           called and what it is FOR — are adjacent. The id is a handle you copy, not prose. */}
-      {onSetGoal !== undefined && (
-        <EpicCardGoal goal={goal} onSetGoal={onSetGoal} testId={t} />
+      {expanded && onSetGoal !== undefined && (
+        // WRAPPED TO SWALLOW THE CLICK — the goal editor is a text field and a Save button, and a
+        // click landing on either of them must not also collapse the card out from under the edit.
+        <span style={SWALLOW_BOX} onClick={swallow}>
+          <EpicCardGoal goal={goal} onSetGoal={onSetGoal} testId={t} />
+        </span>
       )}
 
       {/* ── META ─────────────────────────────────────────────────────────────────────────────── */}
       <span
         data-testid={`${t}-meta`}
-        style={{ ...rowStyle, color: C.conciergeMuted, fontSize: TYPE.small }}
+        style={{
+          ...rowStyle,
+          // ══ ONE LINE MEANS `nowrap`, AND THAT IS THE WHOLE POINT OF THE MERGE ═══════════════
+          // `rowStyle` wraps, and inherited here it undid the change: at the concierge's DEFAULT
+          // 360px the merged line broke onto THREE lines — worse than the two rows it replaced.
+          // Measured in the `concierge-bead-card` capture. The founder merged these to SAVE a row
+          // ("I think we can all make that one line"), so a line that wraps is not a narrower
+          // version of the feature, it is the absence of it.
+          //
+          // Nothing is silently clipped by this: the stage item carries `flex: 1 1 96px;
+          // minWidth: 0` and gives up its width first — exactly the "not the full width of the
+          // card" behaviour he asked for — and the two content-length items (the parent chip and
+          // `in <project>`) are `flex: 0 1 auto; minWidth: 0`, which is what lets the chip's
+          // ellipsis actually fire rather than clipping the title at the card's edge.
+          flexWrap: "nowrap",
+          minWidth: 0,
+          // The backstop, and it is deliberately CLIPPING rather than wrapping: a merged line that
+          // wraps is the absence of the feature, while a clipped tail still reads as one line and
+          // still says the things that matter first (Build It, status, priority).
+          overflow: "hidden",
+          color: C.conciergeMuted,
+          fontSize: TYPE.small,
+        }}
       >
-        {meta.map((node, i) => (
+        {meta.map((item, i) => (
           // A separator BETWEEN items rather than after each: the priority pill is a bordered
           // control, and a trailing interpunct beside it reads as a broken sentence.
-          <span key={i} style={{ ...rowStyle, gap: 8 }}>
-            {i > 0 && <span aria-hidden style={{ opacity: 0.6 }}>·</span>}
-            {node}
+          <span
+            key={item.key}
+            style={{
+              ...rowStyle,
+              gap: 8,
+              // A SEPARATOR MUST NEVER WRAP AWAY FROM THE ITEM IT INTRODUCES. Inheriting
+              // `rowStyle`'s wrap let the `·` break onto its own line while its item went to the
+              // next — a stray interpunct floating alone, visible in the capture.
+              flexWrap: "nowrap",
+              // ONE ITEM TAKES THE SLACK — the progress rule. Everything else keeps its intrinsic
+              // width, which is what makes the merged line read as named fields followed by a bar
+              // rather than as a row of things fighting for space. `minWidth: 0` is what lets the
+              // bar actually shrink in the narrowest column the app has.
+              //
+              // ══ EVERY FIXED LABEL MUST BE `0 0 auto` AND `nowrap` ══════════════════════════
+              // A flex item's DEFAULT is `0 1 auto` — it shrinks. Under the `nowrap` row above that
+              // squeezed each label below its own text width and the words broke mid-letter:
+              // "Backl/og", "e/pi/c", the status dot on a line of its own. Measured in the
+              // `concierge-bead-card` capture, and it is strictly worse than the wrap it replaced.
+              // The named fields are short and already minimal; the stage bar is the one thing with
+              // slack to give, which is precisely the founder's "not the full width of the card".
+              //
+              // ══ …BUT THE TWO CONTENT-LENGTH ITEMS MUST GIVE GROUND ═════════════════════════
+              // The parent-epic chip and `in <project>` are as long as what they say, and a
+              // `0 0 auto` wrapper is always exactly as wide as its own text — which is why the
+              // chip's `text-overflow: ellipsis` could never fire and a long epic title clipped at
+              // the card's edge instead. `0 1 auto` + `minWidth: 0` is what gives the ellipsis
+              // something to work with; `nowrap` is what keeps it on this line. See `MetaItem`.
+              ...(item.grow === true
+                ? { flex: "1 1 96px", minWidth: 0 }
+                : item.shrink === true
+                  ? { flex: "0 1 auto", minWidth: 0, whiteSpace: "nowrap" as const }
+                  : { flex: "0 0 auto", whiteSpace: "nowrap" as const }),
+            }}
+          >
+            {/* NO SEPARATOR BEFORE THE GROWING ITEM. The stage is a BAR, not a word, so an
+                interpunct introducing it buys nothing even at full width — and at the concierge's
+                narrow default the bar is squeezed to a sliver, leaving the "·" dangling at the end
+                of the line with nothing visibly after it. Measured in the capture. */}
+            {i > 0 && item.grow !== true && (
+              <span aria-hidden style={{ opacity: 0.6 }}>
+                ·
+              </span>
+            )}
+            {item.node}
           </span>
         ))}
       </span>
 
-      {/* ── THE STATUS LINE — THE POINT OF THE WHOLE COMPONENT ────────────────────────────────
-          The founder screenshotted this on the CLOSED board card and asked why it disappears when
-          the card opens. It is the answer to "how far along is this?", and it now sits on every
-          surface that draws a bead — bar one, which asked for it off by name: see `showStageLine`. */}
-      {showStageLine && <StageLine stage={stage} height={3} testId={`${t}-stage`} />}
+      {/* ── THE STATUS LINE IS NOW *ON* THE META LINE ABOVE ───────────────────────────────────
+          It used to be a full-bleed row of its own directly here. The founder merged the two:
+          *"we have backlog, p two, task — and then we have the row that says planned. I think we
+          can all make that one line."* It is still the answer to "how far along is this?", still on
+          every surface that draws a bead, and still switched off by name on one — `showStageLine`
+          gates the meta item exactly as it gated this row. What changed is a row of height. */}
 
-      {/* ── DESCRIPTION — THE ONLY THING THAT SCROLLS ────────────────────────────────────────── */}
-      {bead.description !== "" && (
+      {/* ── DESCRIPTION — THE ONLY THING THAT SCROLLS, AND ONLY WHEN EXPANDED ────────────────── */}
+      {expanded && bead.description !== "" && (
         <span
           data-testid={`${t}-description`}
           style={block({
@@ -704,20 +1230,17 @@ export function BeadCard({
         </span>
       )}
 
-      {/* ── THE REMAINING FIELDS — all three were missing from the concierge card ────────────── */}
-      {bead.labels.length > 0 && (
+      {/* ── THE REMAINING FIELDS — EXPANDED ONLY ──────────────────────────────────────────────
+          THE `Epic` FIELD IS GONE FROM HERE ON PURPOSE. It printed `bead.parent` as a raw mono id
+          on a row of its own; the parent is now a chip on the merged line, reading the epic's
+          TITLE. ONE parent treatment, not two — and one fewer row. The `${t}-parent` testid moved
+          with it, so every caller that addressed the field still addresses the chip. */}
+      {expanded && bead.labels.length > 0 && (
         <Field label="Labels">
           <span data-testid={`${t}-labels`}>{bead.labels.join(", ")}</span>
         </Field>
       )}
-      {bead.parent && (
-        <Field label="Epic">
-          <span data-testid={`${t}-parent`} style={{ fontFamily: FONT_MONO }}>
-            {bead.parent}
-          </span>
-        </Field>
-      )}
-      {workers.length > 0 && (
+      {expanded && workers.length > 0 && (
         <Field label="Workers">
           <span data-testid={`${t}-workers`} style={{ color: C.tealInk }}>
             <FiUsers size={11} style={{ verticalAlign: "-2px", marginRight: 4 }} aria-hidden />
@@ -764,7 +1287,14 @@ export function BeadCard({
           <button
             type="button"
             data-testid={`${t}-open-in-column`}
-            onClick={onOpenInColumn}
+            // STOPS THE BUBBLE, like every other control on this card. The root is the
+            // expand/collapse target, so without this the press navigates AND folds the card in one
+            // gesture — measured: the second press in `BeadPill.openEpic.test.tsx`'s idempotence row
+            // found no link at all, because the first had collapsed the card out from under it.
+            onClick={(e) => {
+              e.stopPropagation();
+              onOpenInColumn();
+            }}
             // ══ `aria-label`, NOT `title` — A NATIVE TOOLTIP HERE WOULD BE DEAD CODE ══════════
             // `disableNativeTooltips()` strips every `title` app-wide on the first `mouseover`,
             // and it only rescues the text into `aria-label` for a control that has NO other
@@ -802,7 +1332,11 @@ export function BeadCard({
             <button
               type="button"
               data-testid={`${t}-open-on-board`}
-              onClick={onViewOnBoard}
+              // Same reason as its sibling above — see that note.
+              onClick={(e) => {
+                e.stopPropagation();
+                onViewOnBoard();
+              }}
               // Composed like its sibling above — see that note for why `title` cannot work here.
               aria-label="on board — open the Plan board focused on this card"
               style={openLinkStyle}
@@ -813,37 +1347,22 @@ export function BeadCard({
         </span>
       )}
 
-      {/* ── BUILD ────────────────────────────────────────────────────────────────────────────── */}
-      {(onBuildIt !== undefined || buildAllPrd !== undefined) && (
+      {/* ── THE PRD BATCH — THE SECONDARY BUILD, EXPANDED ONLY ────────────────────────────────
+          `Build It` is NOT here any more: it is the first item on the merged line, top-left, and it
+          survives the collapse. This one does not, and the asymmetry is the point — *"if it's long,
+          and we're doing a click to expand, that's a lot"* is an argument about the PRIMARY action
+          being unreachable, and a batch button that names a count only makes sense beside the rest
+          of the card that explains the count. */}
+      {expanded && buildAllPrd !== undefined && (
         <span style={rowStyle}>
-          {onBuildIt !== undefined && (
-            <button
-              type="button"
-              data-testid={`${t}-build-it`}
-              onClick={() => void runBuild(onBuildIt)}
-              disabled={buildBusy}
-              title="Build It — claim this unit of work and hand it to the Build orchestrator"
-              style={{
-                background: C.teal,
-                color: ON_BRAND_FILL,
-                border: "none",
-                borderRadius: RADIUS.modal,
-                padding: "5px 14px",
-                fontSize: TYPE.small,
-                fontWeight: FONT_WEIGHT.semibold,
-                cursor: buildBusy ? "default" : "pointer",
-                opacity: buildBusy ? 0.7 : 1,
-                fontFamily: FONT_UI,
-              }}
-            >
-              {buildBusy ? "Building…" : "Build It"}
-            </button>
-          )}
-          {buildAllPrd !== undefined && (
+          {
             <button
               type="button"
               data-testid={`${t}-build-all-prd`}
-              onClick={() => void runBuild(buildAllPrd)}
+              onClick={(e) => {
+                e.stopPropagation();
+                void runBuild(buildAllPrd);
+              }}
               disabled={buildBusy}
               title={`Claim and build all ${prdEpicCount} epics that share this PRD`}
               style={{
@@ -861,8 +1380,24 @@ export function BeadCard({
             >
               {`Build all ${prdEpicCount} epics in this PRD`}
             </button>
-          )}
+          }
         </span>
+      )}
+
+      {/* ── LINEAGE: `Tasks:` AND `Build agents:` ────────────────────────────────────────────────
+          ABOVE THE COMMENTS, which the founder restated so it would not be lost. The SAME two rows
+          collapsed and expanded — expanding adds the rest of the card, never more lineage — so this
+          deliberately does not consult `collapsed`. Empty rows draw nothing at all, which is what
+          keeps a leaf card free of the height this whole change is reclaiming. */}
+      {lineage !== undefined && (
+        <BeadLineageRows
+          testId={t}
+          tasks={lineage.tasks}
+          buildAgents={lineage.buildAgents}
+          onExpand={collapsed ? onToggleCollapsed : undefined}
+          onOpenBead={onOpenBead}
+          onOpenAgent={onOpenAgent}
+        />
       )}
 
       {/* ── COMMENT THREAD + COMPOSE ─────────────────────────────────────────────────────────────
@@ -870,12 +1405,16 @@ export function BeadCard({
           near-duplicate. Rendered only when the caller wired EITHER a thread to show or a way to
           write — a bare read-only surface (a test fixture, a board with no project path) omits it.
           Comments are read lazily by the caller on open; nothing here fetches on the 5s poll. */}
-      {(comments !== undefined || onComment !== undefined) && (
-        <CommentThread
-          testId={`${t}-comments`}
-          comments={comments}
-          onComment={onComment}
-        />
+      {expanded && (comments !== undefined || onComment !== undefined) && (
+        // WRAPPED TO SWALLOW THE CLICK. The composer is a textarea and a submit button; clicking
+        // into a half-typed comment must not collapse the card and throw the draft away.
+        <span style={SWALLOW_BOX} onClick={swallow}>
+          <CommentThread
+            testId={`${t}-comments`}
+            comments={comments}
+            onComment={onComment}
+          />
+        </span>
       )}
 
       {/* THE ERROR SITS BESIDE THE CONTROLS, not in a toast — this app has no toast system, and the

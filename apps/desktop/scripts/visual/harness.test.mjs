@@ -341,6 +341,12 @@ describe("surface registry", () => {
       // is the ONLY place a horizontal-alignment defect in it can be photographed — the right
       // pair's board has been flush left throughout. Needs the second pair to exist at all.
       "plan-board-left",
+      // THE BEAD CARD IN THE CHAT THREAD (beads sparkle-lm78sq, sparkle-h9wgyf): the collapsed
+      // half-height card, its merged meta line, and the `Tasks:` / `Build agents:` rows. It exists
+      // because `concierge-column` above photographs an EMPTY thread — nothing in it can render a
+      // bead card, so a before/after taken there is two identical pictures. Carries `beadcard=1`
+      // so the epic, its nine children and their six workers stay off every other capture.
+      "concierge-bead-card",
     ]);
     expect(THEMES).toEqual(["light", "dark"]);
   });

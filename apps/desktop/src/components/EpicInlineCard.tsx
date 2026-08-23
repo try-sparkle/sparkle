@@ -20,7 +20,7 @@
 // The board's own card documents the same constraint. The caller therefore renders this AFTER the
 // row inside the stage group, which is also what makes the push-down free: it is in normal flow,
 // so the rows below simply move.
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useShallow } from "zustand/react/shallow";
 import { BeadCard } from "./BeadCard/BeadCard";
 import { beadsComment, beadsDetail, type BeadComment } from "../services/beadsCommands";
@@ -31,6 +31,10 @@ import { setBeadPriority } from "./BeadCard/beadPriority";
 import { useBeadBuildActions } from "./BeadCard/useBeadBuildActions";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
+import { useUiStore } from "../stores/uiStore";
+import { sideOf } from "../engine/pairs";
+import { beadLineageOf } from "../engine/beadLineage";
+import { openProjectTab, selectProjectOnItsSide } from "../services/openProjectTab";
 import type { WorkflowStageId } from "../engine/workflowStage";
 import type { AgentTab } from "../types";
 
@@ -88,6 +92,23 @@ export function EpicInlineCard({
   // per call, and two identical reads per render is the shape that later drifts into two different
   // answers.
   const beadIsEpic = isEpic(allBeads, bead);
+
+  // ── THIS CARD'S LINEAGE: THE `Tasks:` AND `Build agents:` ROWS ───────────────────────────────
+  // The founder, 2026-08-22: *"I should ALWAYS be able to see the children or parent of any card"*
+  // — and the rows must be the SAME two rows here as in the concierge thread and on the board:
+  // *"whether it's in the concierge chat or on the planning board, I think it would still just show
+  // me two rows."* One engine, three surfaces; a card that resolved its own lineage is a card that
+  // can disagree with the next one.
+  //
+  // `allBeads` is passed STRAIGHT THROUGH from the
+  // store. The index is WeakMap-cached on the array's IDENTITY, so copying, slicing or re-sorting it
+  // first would mint a fresh key on every render and silently defeat the cache — and this column
+  // re-reads its ladder on the beads store's 5s poll. A raw per-card scan measured 3.4–4.0s on the
+  // founder's 7,364-bead store.
+  const lineage = useMemo(
+    () => beadLineageOf({ beads: allBeads, bead, agents, projectId }),
+    [allBeads, bead, agents, projectId],
+  );
 
   // ── THE COMMENT THREAD, READ PER-OPEN ───────────────────────────────────────────────────────
   // `beads_detail` carries `--include-comments`, and this effect runs when a card is OPENED rather
@@ -168,6 +189,28 @@ export function EpicInlineCard({
         onBuildIt={canWrite ? (build.buildIt ?? undefined) : undefined}
         onBuildAllPrd={canWrite ? (build.buildAllPrd ?? undefined) : undefined}
         prdEpicCount={build.prdEpics.length}
+        lineage={lineage}
+        // ── A TASK PILL OPENS THAT TASK'S OWN CARD, ON THE BOARD ─────────────────────────────
+        // The Epics column opens EPIC rows in place (`EpicRow` → this card); a child task has no
+        // row of its own here, so "open that bead's card" means the board's `DetailOverlay` —
+        // exactly what `Concierge/BeadPill` does from the other column that has no board of its
+        // own. See `openBeadCardOnBoard` for why the two writes are ordered the way they are.
+        onOpenBead={(beadId) => openBeadCardOnBoard(beadId, projectId)}
+        // ── A BUILD-AGENT PILL IS A REAL LINK ────────────────────────────────────────────────
+        // The founder: build-agent pills *"are REAL LINKS: clicking one jumps to that agent, the
+        // same affordance the concierge uses in chat."* `openProjectTab` IS that affordance — the
+        // concierge's `AgentPill` reaches the same `selectAndOpen` through it — so a pill clicked
+        // in this column and the same pill clicked in chat land the reader in the same place.
+        //
+        // No `onClose` here, unlike the board's overlay: this card is not a modal over the thing
+        // being revealed. `selectAndOpen` switches this pair to Build, which paints the agent's
+        // pane over the column the card sits in, so the jump is visible without closing anything.
+        //
+        // The pill's own `projectId` first, this card's as the fallback — an agent is addressed by
+        // the project whose roster it came from.
+        onOpenAgent={({ agentId, projectId: pillProjectId }) => {
+          openProjectTab(pillProjectId ?? projectId, agentId);
+        }}
         comments={comments}
         onComment={
           canWrite
@@ -180,6 +223,54 @@ export function EpicInlineCard({
       />
     </EpicCardFrame>
   );
+}
+
+/**
+ * OPEN A BEAD'S CARD THE WAY THE BOARD OPENS ONE — from a column that has no board of its own.
+ *
+ * ══ THE ORDER IS LOAD-BEARING ═══════════════════════════════════════════════════════════════════
+ * `openPlanBoard` FIRST, `setBoardFocusBeadId` SECOND. The focus id is a ONE-SHOT that `BoardView`
+ * consumes and clears as soon as the bead appears in a snapshot; set against a board that is not
+ * rendering yet, the handoff is spent on a surface nobody mounted and the card simply never opens.
+ * `openPlanBoard`, never a bare `setWorkMode(side, "plan")` — the latter moves the chevron and
+ * leaves the board invisible, which is the identical failure by a different route.
+ *
+ * ══ THE SIDE IS READ, NOT PICKED — BY BOTH WRITES ═══════════════════════════════════════════════
+ * `boardFocusBeadId` is app-global, so the side has to come from somewhere. It comes from where the
+ * bead's project already lives (`sideOf`, total, defaulting to the historical single-pair "right"),
+ * which is the only answer that stays correct in a two-pair cockpit. The project is SELECTED first
+ * for the same reason: a board showing a different project would never contain the bead, the
+ * one-shot would sit unconsumed, and the click would look like it did nothing.
+ *
+ * The selection therefore goes through `services/openProjectTab.selectProjectOnItsSide`, NOT
+ * `projectStore.selectProject`. That heading used to be a half-truth: only the `openPlanBoard` line
+ * read the side, while the bare `selectProject` wrote `selectedProjectId` — which is the RIGHT
+ * pair's selection. For a LEFT-assigned project the two writes then DISAGREED, and the disagreement
+ * was not confined to this card: `Workspace`'s reconcile effect discards a left id it finds there
+ * and the right pair falls back to its own first project, so opening a left-pair epic's task
+ * silently changed what the OTHER half of the screen was showing (roborev 55149 / 68041). The
+ * helper is idempotent for a project already selected on its own side, so there is no guard here.
+ *
+ * ══ THIS IS THE SECOND COPY OF THIS SEQUENCE, KNOWINGLY ═════════════════════════════════════════
+ * `Concierge/BeadPill` holds a module-private `viewOnBoard` doing the same three writes for the same
+ * reason (a column beside the board, with no board of its own). It belongs in a shared service and
+ * this comment is the marker for the extraction; it was not done in this change because that file
+ * is owned by concurrent work and a rewrite of it here would delete edits nobody had read.
+ * `selectProjectOnItsSide` is what that extraction should look like when it happens — one exported
+ * helper the callers reach for, rather than a rule re-derived per surface. It was itself extracted
+ * after four copy-pasted derivations of the same rule, one of which was wrong (roborev 55192).
+ *
+ * Returns whether a board could be opened at all, so a caller that wants to say something can.
+ */
+function openBeadCardOnBoard(beadId: string, projectId: string): boolean {
+  const projects = useProjectStore.getState();
+  // No such project: there is no board to open, and nothing is written.
+  if (!projects.projects.some((p) => p.id === projectId)) return false;
+  selectProjectOnItsSide(projectId);
+  const ui = useUiStore.getState();
+  ui.openPlanBoard(sideOf(ui.pairAssignment, projectId));
+  ui.setBoardFocusBeadId(beadId);
+  return true;
 }
 
 /** A little breathing room from the rows above and below, and nothing else — the card paints its

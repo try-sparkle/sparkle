@@ -131,6 +131,27 @@ describe("items 15+16 — the id and the Chat button, top right, id on the LEFT"
     expect(precedes(id, title)).toBe(true);
   });
 
+  // ══ THE TITLE MUST STAY SELECTABLE, EVEN AS A BUTTON ══════════════════════════════════════
+  // The disclosure control is a native `<button>` so it gets Enter, Space and a focus ring — but a
+  // button's LABEL is not a selection target, so in the Tauri WKWebView the title could no longer
+  // be swept at all. That silently removed the very capability the card's drag-selection guard
+  // exists to protect ("select the title, copy it"), and left that guard protecting nothing.
+  // jsdom applies no UA stylesheet for `user-select`, so no behavioural test can demonstrate it —
+  // this pins the style value the way the card's other layout-invisible rules are pinned.
+  it("keeps the title's text selectable, so the copy gesture the guard protects still exists", () => {
+    mount("epics", { onToggleCollapsed: () => {} });
+    const title = screen.getByTestId(`${t}-title`);
+
+    expect(title.tagName).toBe("BUTTON");
+    expect(title.style.userSelect).toBe("text");
+    // THE WEBKIT PREFIX IS NOT ASSERTED, and that is a jsdom limit rather than an oversight worth
+    // hiding: its cssstyle implementation drops `-webkit-user-select` from both the property list
+    // and the serialized inline style, so there is nothing here to read. React still writes it to
+    // the real node, which is where it matters — the Tauri WKWebView is the runtime this rule
+    // exists for. The unprefixed value above is what jsdom CAN see, and it is what a refactor of
+    // this reset would take out alongside it.
+  });
+
   // [05:17] "make it smaller font size… It can be that career style font" — courier, i.e. keep mono.
   it("shrinks the id to the micro step and keeps it MONO", () => {
     mount("epics");

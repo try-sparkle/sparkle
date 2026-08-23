@@ -8,6 +8,11 @@ import { GRAY_LEGAL_SECTIONS, grayFloorFor } from "../engine/stallEscalation";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { DEV_BYPASS_AUTH_FLAG } from "./devBypassAuth";
+import { useConciergeThreadStore } from "../stores/conciergeThreadStore";
+
+/** The thread store's persist key, re-spelled here for the same reason the others are: the test
+ *  must fail if the key DRIFTS from the one production writes. */
+const CONCIERGE_THREAD_PERSIST_KEY = "sparkle-concierge-thread";
 import {
   FIXTURE_NOW,
   FIXTURE_PRS,
@@ -19,9 +24,11 @@ import {
   FIXTURE_SECOND_PROJECT_ID,
   FIXTURE_SECOND_PROJECT_ROOT,
   applyVisualFixtures,
+  buildBeadCardFixture,
   buildSecondProjectFixture,
   buildVisualFixture,
   fixturePrsForRoot,
+  visualBeadCardRequested,
   visualConciergeWidth,
   visualFixturesRequested,
   visualPairCount,
@@ -383,7 +390,16 @@ describe("seeding never reaches disk", () => {
     // earlier test in this file has already detached it, so without re-attaching, the assertion
     // below would hold no matter what applyVisualFixtures did — the vacuousness this block's own
     // header warns about.
-    for (const store of [useProjectStore, useRuntimeStore, useDictationStore, useUiStore]) {
+    // useConciergeThreadStore joins this loop for the same reason, and it is the one with the most
+    // to lose: `?beadcard=1` writes its PERSISTED `chat`, and that store holds the developer's real
+    // concierge conversation across quit and relaunch. Nothing can reconstruct it.
+    for (const store of [
+      useProjectStore,
+      useRuntimeStore,
+      useDictationStore,
+      useUiStore,
+      useConciergeThreadStore,
+    ]) {
       (store as unknown as { persist: { setOptions: (o: unknown) => void } }).persist.setOptions({
         storage: live,
       });
@@ -391,6 +407,21 @@ describe("seeding never reaches disk", () => {
     localStorage.removeItem(PROJECTS_PERSIST_KEY);
     localStorage.removeItem(RUNTIME_PERSIST_KEY);
     localStorage.removeItem(DICTATION_PERSIST_KEY);
+    localStorage.removeItem(CONCIERGE_THREAD_PERSIST_KEY);
+  });
+
+  it("leaves the developer's real concierge THREAD untouched when a capture seeds one", () => {
+    // The bead-card surface seeds two chat messages. Undetached, that setState writes THROUGH and
+    // replaces a conversation this app deliberately keeps forever — the plainest instance of the
+    // clobber `detachPersistence` exists to prevent, and the reason that store had to join its list.
+    const REAL = JSON.stringify({ state: { chat: [{ id: "real-1", kind: "you", text: "mine" }] } });
+    localStorage.setItem(CONCIERGE_THREAD_PERSIST_KEY, REAL);
+    // ASSERT THE FIXTURE ACTUALLY RAN. Without this the test passes when applyVisualFixtures
+    // returns early for any reason at all — nothing is seeded, so nothing is clobbered, and the
+    // guard reports success about a path it never took.
+    expect(applyVisualFixtures("?visual=1&beadcard=1", ON)).toBe(true);
+    expect(useConciergeThreadStore.getState().chat.length).toBeGreaterThan(0);
+    expect(localStorage.getItem(CONCIERGE_THREAD_PERSIST_KEY)).toBe(REAL);
   });
 
   it("leaves the persisted project blob untouched", () => {
@@ -1270,5 +1301,97 @@ describe("the sparkle-biezi capture row — its ONE load-bearing property", () =
     );
     expect(chip?.text).toMatch(/^\S+\.\w+/);
     expect(chip?.files.length).toBeGreaterThan(0);
+  });
+});
+
+// ── THE BEAD-CARD LINEAGE SEED ────────────────────────────────────────────────────────────────
+// Every assertion here guards a trap that was actually hit while building the surface, not a
+// hypothetical one. The seed's job is to make a bead CARD appear in the concierge thread with real
+// children and real workers; each of these is a way that job silently fails while the capture still
+// succeeds and files a plausible-looking picture.
+describe("buildBeadCardFixture", () => {
+  // The app's own rule for turning an id in prose into a card, copied from
+  // `components/Concierge/beadRefs.ts`. Re-spelled deliberately: the point is to catch the id and
+  // the pattern DRIFTING APART, which importing the real one could not do.
+  const BEAD_ID_IN_PROSE_RE = /[a-z][a-z0-9_]{1,30}-[a-z0-9]{3,16}(?:\.[0-9]{1,3})*/g;
+
+  it("uses ids the prose linkifier matches WHOLE, or the card never renders", () => {
+    const { beads } = buildBeadCardFixture();
+    for (const b of beads) {
+      const hit = b.id.match(BEAD_ID_IN_PROSE_RE);
+      // A two-hyphen id like "vfx-epic-cards" matches only its first eight characters, which
+      // resolves against no bead and renders as BARE PROSE — the capture then photographs a
+      // sentence and passes. That shipped once; this is the guard.
+      expect(hit).toEqual([b.id]);
+    }
+  });
+
+  it("names the epic in the seeded chat as BARE TEXT, never inside backticks", () => {
+    const { beads, chat } = buildBeadCardFixture();
+    const epic = beads[0]!;
+    const said = chat.map((m) => ("text" in m ? m.text : "")).join("\n");
+    expect(said).toContain(epic.id);
+    // `remarkBeadRefs` walks text nodes only and SKIPS inline code, so a backticked id renders as
+    // dead monospace instead of a card.
+    expect(said).not.toContain(`\`${epic.id}\``);
+  });
+
+  it("binds every worker to a CHILD, never to the epic's own id", () => {
+    const { beads, agents } = buildBeadCardFixture();
+    const epicId = beads[0]!.id;
+    const childIds = new Set(beads.slice(1).map((b) => b.id));
+    expect(agents.length).toBeGreaterThan(0);
+    for (const a of agents) {
+      expect(a.kind).toBe("worker");
+      // Workers are dispatched against CHILDREN. A fixture binding them to the epic would make the
+      // `Build agents:` row render from `workersForBead(agents, epic.id)`-shaped code and look
+      // fine — hiding the exact bug `workersInEpic` exists to fix.
+      expect(a.beadId).not.toBe(epicId);
+      expect(childIds.has(a.beadId ?? "")).toBe(true);
+    }
+  });
+
+  it("gives the epic real children through the PARENT EDGE, the only membership the app can see", () => {
+    const { beads } = buildBeadCardFixture();
+    const epic = beads[0]!;
+    const children = beads.slice(1);
+    expect(children.length).toBeGreaterThan(1);
+    // An `epic:<name>` label is the form 4,348 beads in the real store carry and NOTHING reads.
+    for (const c of children) {
+      expect(c.parent).toBe(epic.id);
+      expect(c.labels.some((l) => l.startsWith("epic:"))).toBe(false);
+    }
+  });
+
+  it("keeps the epic STARTABLE, so the Build It button it is meant to photograph exists", () => {
+    // `isStartable` in useBeadBuildActions returns false for any status other than "open", and a
+    // card with no Build It cannot show where Build It moved to.
+    expect(buildBeadCardFixture().beads[0]!.status).toBe("open");
+  });
+
+  it("wears no `agent:` label, so the row FEEDBACK pill's measured width does not move", () => {
+    // `feedbackCount` counts that label, and the twelve-bead seed above pins the pill's widest
+    // two-digit form. A lineage bead carrying it would silently re-measure a different surface.
+    for (const b of buildBeadCardFixture().beads) {
+      expect(b.labels.some((l) => l.startsWith("agent:"))).toBe(false);
+    }
+  });
+
+  it("seeds ENOUGH children and agents to overflow one row", () => {
+    const { beads, agents } = buildBeadCardFixture();
+    // The whole point of the row is "as many pills as fit, then +N more". A seed of two would fit
+    // at every captured width, so the overflow affordance would never appear in any baseline.
+    expect(beads.length - 1).toBeGreaterThanOrEqual(6);
+    expect(agents.length).toBeGreaterThanOrEqual(4);
+  });
+
+  it("is OPT-IN — `?beadcard=1` and nothing else turns it on", () => {
+    expect(visualBeadCardRequested("?beadcard=1")).toBe(true);
+    expect(visualBeadCardRequested("?beadcard=true")).toBe(true);
+    // Off by default is what keeps the epic, its children and its six worker rows out of
+    // `concierge-column`, `agent-sidebar` and every workspace surface's approved baseline.
+    expect(visualBeadCardRequested("")).toBe(false);
+    expect(visualBeadCardRequested("?visual=1")).toBe(false);
+    expect(visualBeadCardRequested("?beadcard=0")).toBe(false);
   });
 });

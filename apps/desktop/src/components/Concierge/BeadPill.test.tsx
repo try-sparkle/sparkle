@@ -216,7 +216,7 @@ describe("BeadPill — the card opens in place", () => {
     expect(screen.getByTestId("concierge-bead-card-title").textContent).toBe("Clickable bead ids");
     const meta = screen.getByTestId("concierge-bead-card-meta").textContent ?? "";
     // THE STAGE THE CARD SITS IN, never a bd wire value (bead sparkle-az6di8). An in_progress bead
-    // is in the board's "Being built" column, so that is what the chip says — the founder's own
+    // is in the board's "Build: Active" column, so that is what the chip says — the founder's own
     // phrase and the exact string the column header above it uses.
     expect(meta).toContain("Build: Active");
     expect(meta).not.toContain("in_progress");
