@@ -556,6 +556,38 @@ pattern!(
     r"(?m)^\s*[✻✽✢✶✳·*∗+]\s.*\(\s*(?:\d+\s*[hms]\s*)+"
 );
 
+// ── THE BARE FRAME — 2.1.237 DROPPED THE PARENTHETICAL (bead sparkle-s4c0xe) ─────────────────────
+//
+// THE PORT THIS IS. `spinner_line` above REQUIRES a parenthesised clock, and Claude Code 2.1.237
+// stopped drawing one: the status line is now `✻ Crunched for 2s` / `✶ Schlepping…`. The TypeScript
+// side grew `SPINNER_BARE_FRAME` (engine/statusEngine.ts) for exactly this; THIS SIDE NEVER DID, and
+// `screen_is_working`'s only other arm needs a literal `(esc to interrupt` — which 2.1.237 moved into
+// unparenthesised chrome. Net effect: this function was effectively DEAD on the shipped TUI.
+//
+// WHY THAT MATTERED MORE HERE THAN THERE. This is the MOUNT-INDEPENDENT scraper — the one that can
+// judge an agent nobody has opened (observed_attention::classify reads it off a headless vt100 grid
+// for every PTY). The TS twin only ever runs inside a mounted pane. So the half that was blind was
+// the half with no backstop.
+//
+// ── THE THREE RULES, MIRRORED FROM THE TS TWIN, EACH LOAD-BEARING ────────────────────────────────
+//   1. NO ASCII FALLBACKS. `spinner_line` tolerates `*` and `+` because its parenthetical clock
+//      corroborates the glyph. This arm has NO corroboration, so it must not accept the characters
+//      ordinary output starts lines with — a markdown bullet, a diff line.
+//   2. ONE CAPITALISED WORD. Claude's verb is a single capitalised gerund. Allowing a phrase would
+//      match most prose that happens to begin with a glyph.
+//   3. AT LEAST ONE TAIL IS MANDATORY — the ellipsis, the `for <clock>`, or both. A glyph plus a
+//      word alone is a bullet list, and matching it would paint every finished agent green.
+//
+// `\r?` before the anchor, which the TS twin does not need: it tests one line at a time, while this
+// scans a whole rendered grid that may carry CRLF.
+//
+// ⚠️ RETUNE TOGETHER. `apps/desktop/shared/spinner-frames.fixture.json` is asserted by BOTH this
+// module's tests and the TS suite, so a frame added to one is added to both or the other goes red.
+pattern!(
+    spinner_bare_frame,
+    r"(?m)^[ \t]*[✻✽✢✶✳∗·][ \t]+[A-Z][A-Za-z'’\-]{1,40}(?:(?:…|\.\.\.)(?:[ \t]+for[ \t]+(?:\d{1,3}[ \t]*h[ \t]*)?(?:\d{1,3}[ \t]*m[ \t]*)?\d{1,3}[ \t]*s)?|[ \t]+for[ \t]+(?:\d{1,3}[ \t]*h[ \t]*)?(?:\d{1,3}[ \t]*m[ \t]*)?\d{1,3}[ \t]*s)[ \t]*\r?$"
+);
+
 // ── THE INPUT BOX ─────────────────────────────────────────────────────────────────────────────
 
 // Claude Code's input line: the box the user types into. Captures whatever is on it.
@@ -934,8 +966,53 @@ pub fn screen_shows_credential_prompt(text: &str) -> bool {
 /// Is a turn currently RUNNING? Derived from the screen alone, so it holds when the WebView does
 /// not.
 pub fn screen_is_working(text: &str) -> bool {
-    esc_to_interrupt().is_match(text) || spinner_line().is_match(text)
+    esc_to_interrupt().is_match(text)
+        || spinner_line().is_match(text)
+        || screen_shows_bare_spinner_frame(text)
 }
+
+/// The bare 2.1.237 frame, **BOTTOM-ANCHORED** — see {@link spinner_bare_frame} for the shape.
+///
+/// ══ WHY THIS IS NOT A WHOLE-SCREEN MATCH, WHICH IS HOW IT WAS FIRST WRITTEN ══════════════════════
+/// The first cut simply added `spinner_bare_frame()` to `screen_is_working`'s whole-screen `||`
+/// chain, and FIVE existing tests caught it immediately. The captured `IDLE_AFTER_TURN_2_1_220`
+/// screen — a real, FINISHED turn — carries `✻ Churned for 3s` in its SCROLLBACK, because that is
+/// where the spinner's last frame is left once the turn ends. A whole-screen match therefore reads
+/// every finished agent as working, permanently, and nothing retracts it.
+///
+/// This is the same trap `engine/statusEngine`'s `LIVE_TAIL_ROWS` exists for, and its header says so
+/// in as many words: "a whole-viewport scan would match a spinner left in the scrollback and latch
+/// every finished agent green". The TS twin was born bottom-anchored; the port has to be too, or it
+/// is not a port.
+///
+/// The OTHER two arms stay whole-screen deliberately, and are left alone. `spinner_line` requires a
+/// parenthesised clock and `esc_to_interrupt` a literal interrupt hint — both far stronger evidence
+/// than a bare glyph-plus-word, and both shipped that way. Narrowing them is a separate change with
+/// its own blast radius, not a passenger on this one.
+///
+/// TRAILING BLANKS ARE DROPPED FIRST. A rendered grid is padded to its full height, so the "last
+/// rows" of the buffer are usually empty — counting them would push the live line out of the window
+/// and make this silently never fire, which is the failure mode that has no symptom.
+fn screen_shows_bare_spinner_frame(text: &str) -> bool {
+    let rows: Vec<&str> = text.lines().collect();
+    let end = rows
+        .iter()
+        .rposition(|r| !r.trim().is_empty())
+        .map_or(0, |i| i + 1);
+    let start = end.saturating_sub(LIVE_TAIL_ROWS);
+    rows[start..end]
+        .iter()
+        .any(|r| spinner_bare_frame().is_match(r))
+}
+
+/// How far up from the last non-blank row a LIVE status line may sit.
+///
+/// Kept at `engine/statusEngine.LIVE_TAIL_ROWS`'s value, and for its reason: it is the distance from
+/// Claude Code's status line to the bottom of the viewport. That file records a retune from 6 to 12
+/// after 6 "sat ONE ROW from the cliff", so the spinner fell outside the tail and a live agent
+/// settled straight to gray. Both sides move together or the two scrapers disagree about the same
+/// screen — which is the drift `shared/spinner-frames.fixture.json` exists to make loud.
+const LIVE_TAIL_ROWS: usize = 12;
 
 /// Does the screen carry Claude Code's own prompt signature?
 ///
@@ -1493,6 +1570,124 @@ pub fn escape_refusal(screen: Option<&Screen>) -> Option<Refusal> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ══ THE SHARED SPINNER FIXTURE — ONE FILE, TWO SUITES (bead sparkle-s4c0xe) ═══════════════════
+    // `apps/desktop/shared/spinner-frames.fixture.json` is parsed by THIS module and by
+    // `apps/desktop/src/engine/statusEngine.spinnerFixture.test.ts`. The two scrapers drifted once —
+    // the TS side was retuned for Claude Code 2.1.237 and this side was not, leaving
+    // `screen_is_working` effectively dead on the shipped TUI — and the drift was invisible for as
+    // long as nothing compared them. A frame added to one side now reds the other.
+
+    fn spinner_fixture() -> serde_json::Value {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("shared")
+            .join("spinner-frames.fixture.json");
+        let raw = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        serde_json::from_str(&raw).expect("spinner fixture is valid JSON")
+    }
+
+    fn frames(key: &str) -> Vec<(String, String)> {
+        spinner_fixture()[key]
+            .as_array()
+            .unwrap_or_else(|| panic!("fixture has a `{key}` array"))
+            .iter()
+            .map(|s| {
+                (
+                    s["frame"].as_str().expect("every sample has a frame").to_string(),
+                    s["why"].as_str().expect("every sample explains itself").to_string(),
+                )
+            })
+            .collect()
+    }
+
+    /// NON-VACUITY FIRST. Every assertion below is a loop, and a loop over an empty array passes
+    /// while proving nothing — which is exactly how a fixture-driven guard dies silently.
+    #[test]
+    fn the_shared_spinner_fixture_is_not_empty_on_either_side() {
+        assert!(frames("working").len() >= 5, "too few working frames to prove anything");
+        assert!(frames("notWorking").len() >= 3, "too few negative frames to catch a false green");
+    }
+
+    #[test]
+    fn every_shared_working_frame_reads_as_working_here_too() {
+        for (frame, why) in frames("working") {
+            assert!(
+                screen_is_working(&frame),
+                "the TS scraper calls this WORKING and this one does not — {why}\n  frame: {frame:?}"
+            );
+        }
+    }
+
+    /// THE FALSE-GREEN GUARD, and it is the more expensive direction. A matcher widened until it
+    /// accepts ordinary output paints a FINISHED agent green, and nothing retracts it.
+    #[test]
+    fn no_shared_negative_frame_is_mistaken_for_working() {
+        for (frame, why) in frames("notWorking") {
+            assert!(
+                !screen_is_working(&frame),
+                "this must never read as working — {why}\n  frame: {frame:?}"
+            );
+        }
+    }
+
+    /// THE FALSE GREEN THIS CHANGE NEARLY SHIPPED, pinned so it cannot come back.
+    ///
+    /// The first cut matched the bare frame across the WHOLE screen, and five existing tests went
+    /// red at once: the captured `IDLE_AFTER_TURN_2_1_220` — a real FINISHED turn — carries
+    /// `✻ Churned for 3s` in its scrollback, because that is where the spinner's last frame is left
+    /// when a turn ends. Whole-screen matching therefore reads every finished agent as working,
+    /// forever, and nothing retracts it.
+    ///
+    /// THE PAIR IS THE POINT. Asserting only that the idle screen is calm would also pass for an arm
+    /// that had stopped matching altogether, so the same frame is asserted to READ AS WORKING when
+    /// it sits at the bottom instead. Position is the whole discriminator.
+    #[test]
+    fn a_spinner_frame_left_in_scrollback_is_not_a_live_agent() {
+        let idle = fixture_screen("IDLE_AFTER_TURN_2_1_220");
+        assert!(
+            idle.contains("✻ Churned for 3s"),
+            "fixture no longer carries the scrollback frame this test exists for — re-point it"
+        );
+        assert!(
+            !screen_is_working(&idle),
+            "a spinner left in the scrollback of a FINISHED turn must not latch the row green"
+        );
+
+        // …and the SAME frame at the bottom of the grid IS a live agent.
+        let live = format!("some earlier output\n\n{}", "✻ Churned for 3s");
+        assert!(
+            screen_is_working(&live),
+            "the bottom-anchored arm must still fire, or this is narrowing to the point of inert"
+        );
+    }
+
+    /// Trailing blank padding must not push the live line out of the window. A rendered grid is
+    /// padded to its full height, so this is the ordinary case, not an edge one — and getting it
+    /// wrong makes the arm silently never fire, which is the failure mode with no symptom.
+    #[test]
+    fn blank_padding_below_the_status_line_does_not_hide_it() {
+        let padded = format!("✶ Schlepping…{}", "\n".repeat(30));
+        assert!(screen_is_working(&padded));
+    }
+
+    /// THE REGRESSION THIS SHIPPED FOR, named on its own so a failure says WHICH arm died rather
+    /// than only that the fixture stopped agreeing.
+    #[test]
+    fn the_bare_2_1_237_frame_is_matched_by_the_bare_arm_specifically() {
+        // The old `spinner_line` cannot see it — it requires a parenthesised clock. If this ever
+        // starts passing, the two arms have been merged and this test is no longer pinning anything.
+        assert!(!spinner_line().is_match("✻ Crunched for 2s"));
+        assert!(spinner_bare_frame().is_match("✻ Crunched for 2s"));
+        assert!(spinner_bare_frame().is_match("✶ Schlepping…"));
+        // ASCII fallbacks stay OUT of the uncorroborated arm — rule 1 in its header.
+        assert!(!spinner_bare_frame().is_match("* Rebuilt the parser for 3s"));
+        // …and a glyph plus a word with no tail at all is a bullet list — rule 3.
+        assert!(!spinner_bare_frame().is_match("✻ Crunched"));
+    }
+
+    use super::*;
     use std::path::PathBuf;
 
     // == ANSWERING AN ORDINARY PERMISSION PROMPT =================================================
@@ -2013,6 +2208,7 @@ mod tests {
             );
         }
     }
+
 
     #[test]
     fn a_finished_turn_at_the_idle_box_permits_a_write() {

@@ -1,0 +1,52 @@
+{
+  "contract": [
+    "WHAT A 'CLAUDE IS WORKING' FRAME LOOKS LIKE, frozen here so the TypeScript scraper and the Rust",
+    "scraper fail TOGETHER rather than silently disagreeing about the same screen.",
+    "",
+    "WHY THIS FIXTURE EXISTS (bead sparkle-s4c0xe). The two sides drifted, and the drift was invisible",
+    "for as long as nothing compared them. `statusEngine.ts` grew SPINNER_BARE_FRAME when Claude Code",
+    "2.1.237 dropped the parenthetical from its status line ('✻ Crunched for 2s'), and",
+    "`nudge_gate.rs`'s `spinner_line` never got that arm -- it still REQUIRES a parenthesised clock.",
+    "Its only other arm needs a literal '(esc to interrupt', which 2.1.237 moved into unparenthesised",
+    "chrome. So `screen_is_working` was effectively DEAD on the shipped TUI, which matters because it",
+    "is the mount-independent half: it is what can judge an agent nobody has opened.",
+    "",
+    "THE FAILURE MODE IS SILENCE, which is why a shared fixture rather than two test files. A matcher",
+    "that stops matching raises no error and fails no assertion of its own -- it simply reports 'not",
+    "working' forever, and the row goes gray on a live agent. AGENTS.md records the same shape for the",
+    "Rust->TS wire payload: two halves built in parallel, both suites green, the feature never once",
+    "ran. One file, two suites, no drift.",
+    "",
+    "RETUNE POINT. Claude Code rotates its glyph set and rewords its status line between releases --",
+    "2.1.218 -> 2.1.237 is this fixture's whole premise. When the wording moves, add the frame in",
+    "TODAY's shape HERE, and both languages are forced to keep up together. Do not add a frame to one",
+    "suite alone; that is the drift this file exists to make impossible.",
+    "",
+    "`working` -- every one of these MUST read as 'a turn is running' on BOTH sides.",
+    "`notWorking` -- every one of these MUST NOT. These are the false-green guards: a matcher widened",
+    "until it accepts ordinary output is worse than one that is too narrow, because it paints a",
+    "finished agent green and nothing retracts it.",
+    "",
+    "DELIBERATELY ABSENT: 'Running 1 shell command · 1m 24s' and Claude's '◯ <kind> <label> <elapsed>'",
+    "subagent roster. Both mean the agent is busy and NEITHER scraper recognises them -- but the",
+    "roster is handled as DELEGATED WORK on its own channel (engine/backgroundTaskFooter), not as a",
+    "spinner, and listing either under `notWorking` would PIN a known gap as though it were the",
+    "intended answer. A test that pins the defect passes cleanly while the defect ships."
+  ],
+  "working": [
+    { "why": "2.1.237, bare, no elapsed clause at all.", "frame": "✶ Schlepping…" },
+    { "why": "2.1.237, a different beat glyph.", "frame": "✽ Enchanting…" },
+    { "why": "2.1.237's `for <n>s` tail, which has NO parentheses — the exact shape the Rust arm missed.", "frame": "✻ Crunched for 2s" },
+    { "why": "The m/s arm of the same tail.", "frame": "✽ Baked for 2m 24s" },
+    { "why": "The `·` beat. Excluding it once left a whole slice of frames rejected by both arms.", "frame": "· Thinking…" },
+    { "why": "2.1.218's parenthetical shape — still shipped, must not regress.", "frame": "✢ Metamorphosing… (40m 17s · ↓ 66.9k tokens)" },
+    { "why": "The legacy shape, carrying the interrupt hint inside the parenthetical.", "frame": "✻ Cogitating… (12s · ↑ 1.2k tokens · esc to interrupt)" }
+  ],
+  "notWorking": [
+    { "why": "An ordinary finished line. The commonest false green.", "frame": "⏺ Done — all three landed." },
+    { "why": "A markdown bullet that happens to carry an elapsed reading. `*` is an ASCII fallback the bare arm must refuse — it is how ordinary output starts lines.", "frame": "* Rebuilt the parser for 3s" },
+    { "why": "Prose quoting a duration.", "frame": "The build finished in 3s." },
+    { "why": "A bare glyph with no word and no clock.", "frame": "✻" },
+    { "why": "Blank.", "frame": "" }
+  ]
+}
