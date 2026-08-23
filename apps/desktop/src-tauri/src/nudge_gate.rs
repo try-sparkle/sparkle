@@ -966,34 +966,49 @@ pub fn screen_shows_credential_prompt(text: &str) -> bool {
 /// Is a turn currently RUNNING? Derived from the screen alone, so it holds when the WebView does
 /// not.
 pub fn screen_is_working(text: &str) -> bool {
-    esc_to_interrupt().is_match(text)
-        || spinner_line().is_match(text)
-        || screen_shows_bare_spinner_frame(text)
+    esc_to_interrupt().is_match(text) || spinner_line().is_match(text)
 }
 
-/// The bare 2.1.237 frame, **BOTTOM-ANCHORED** — see {@link spinner_bare_frame} for the shape.
+// ⚠️ `screen_shows_bare_spinner_frame` IS DELIBERATELY **NOT** IN THE CHAIN ABOVE, AND WIRING IT IN
+// IS A REGRESSION. It was, for one commit, and roborev raised it High against that commit; the
+// argument was correct and is preserved here so nobody re-derives it the expensive way.
+//
+// WHY POSITION IS NOT ENOUGH, WHICH IS THE WHOLE OF IT. The TS twin uses a 12-row live tail, and
+// `statusEngine.ts` says in as many words that widening it "costs little HERE because PRESENCE ALONE
+// NO LONGER HOLDS ANYTHING — the hold also requires the tail to have CHANGED between settles."
+// `screen_is_working` is PURE PRESENCE. Porting the window without the movement corroboration ports
+// the number and not the guarantee.
+//
+// AND THE REMNANT IS INSIDE THE WINDOW ON AN ORDINARY SCREEN. This module's own premise is that a
+// finished turn leaves its last spinner frame in the transcript. On a scrolled viewport that remnant
+// sits just above the composer chrome, which the 2.1.237 captures show is only 4-5 rows deep — well
+// inside 12. `IDLE_AFTER_TURN_2_1_220` escapes only by layout luck: its short transcript leaves ~15
+// blank rows between the remnant and the chrome.
+//
+// WHY THAT IS WORSE THAN THE DEAD MATCHER IT REPLACED. A false `working` does not merely paint a row
+// green. It suppresses nudges (`nudge_ladder` records `blocked = Some("status-working")` with
+// `counts_as_attempt == false`, so escalation never advances) AND it short-circuits `write_refusal`
+// ahead of the awaiting-prompt arm, so `observed_attention::classify` returns `Calm` for an agent
+// standing at a REAL PROMPT. That is the founder's original invisible-green bug, re-created through a
+// new route — strictly worse than the arm simply not firing.
+//
+// WHAT WIRING IT IN REQUIRES: corroboration that the tail MOVED, which is state this pure function
+// does not have and its caller does (the observer already hashes the grid). Until that exists the
+// matcher stays here, tested and pinned against the shared fixture so it cannot rot, and out of the
+// veto path where a stale positive can latch.
+
+/// The bare 2.1.237 frame, bottom-anchored — Claude Code dropped the parenthetical
+/// (`✻ Crunched for 2s`, `✶ Schlepping…`) and `spinner_line` still requires one.
 ///
-/// ══ WHY THIS IS NOT A WHOLE-SCREEN MATCH, WHICH IS HOW IT WAS FIRST WRITTEN ══════════════════════
-/// The first cut simply added `spinner_bare_frame()` to `screen_is_working`'s whole-screen `||`
-/// chain, and FIVE existing tests caught it immediately. The captured `IDLE_AFTER_TURN_2_1_220`
-/// screen — a real, FINISHED turn — carries `✻ Churned for 3s` in its SCROLLBACK, because that is
-/// where the spinner's last frame is left once the turn ends. A whole-screen match therefore reads
-/// every finished agent as working, permanently, and nothing retracts it.
+/// NOT CURRENTLY A CALLER OF RECORD — see the warning above for why it is not in `screen_is_working`.
+/// It exists, and is tested, because the matcher itself is correct and hard-won, and because
+/// `shared/spinner-frames.fixture.json` pins it against the TypeScript twin so the two cannot drift
+/// silently the way they already did once.
 ///
-/// This is the same trap `engine/statusEngine`'s `LIVE_TAIL_ROWS` exists for, and its header says so
-/// in as many words: "a whole-viewport scan would match a spinner left in the scrollback and latch
-/// every finished agent green". The TS twin was born bottom-anchored; the port has to be too, or it
-/// is not a port.
-///
-/// The OTHER two arms stay whole-screen deliberately, and are left alone. `spinner_line` requires a
-/// parenthesised clock and `esc_to_interrupt` a literal interrupt hint — both far stronger evidence
-/// than a bare glyph-plus-word, and both shipped that way. Narrowing them is a separate change with
-/// its own blast radius, not a passenger on this one.
-///
-/// TRAILING BLANKS ARE DROPPED FIRST. A rendered grid is padded to its full height, so the "last
-/// rows" of the buffer are usually empty — counting them would push the live line out of the window
-/// and make this silently never fire, which is the failure mode that has no symptom.
-fn screen_shows_bare_spinner_frame(text: &str) -> bool {
+/// TRAILING BLANKS ARE DROPPED FIRST. A rendered grid is padded to its full height, so the last rows
+/// of the buffer are usually empty; counting them would push the live line out of the window and make
+/// this silently never fire — the failure mode with no symptom.
+pub fn screen_shows_bare_spinner_frame(text: &str) -> bool {
     let rows: Vec<&str> = text.lines().collect();
     let end = rows
         .iter()
@@ -1614,8 +1629,8 @@ mod tests {
     fn every_shared_working_frame_reads_as_working_here_too() {
         for (frame, why) in frames("working") {
             assert!(
-                screen_is_working(&frame),
-                "the TS scraper calls this WORKING and this one does not — {why}\n  frame: {frame:?}"
+                any_working_matcher(&frame),
+                "the TS scraper calls this WORKING and no matcher here does — {why}\n  frame: {frame:?}"
             );
         }
     }
@@ -1626,50 +1641,84 @@ mod tests {
     fn no_shared_negative_frame_is_mistaken_for_working() {
         for (frame, why) in frames("notWorking") {
             assert!(
-                !screen_is_working(&frame),
+                !any_working_matcher(&frame),
                 "this must never read as working — {why}\n  frame: {frame:?}"
             );
         }
     }
 
-    /// THE FALSE GREEN THIS CHANGE NEARLY SHIPPED, pinned so it cannot come back.
+    /// Every arm that can say "a turn is running", so the shared fixture pins the MATCHERS rather
+    /// than one caller's composition of them. `screen_is_working` deliberately excludes the bare arm
+    /// (see its warning); asserting the fixture through it would therefore red every 2.1.237 frame
+    /// and say nothing about whether the matcher itself still works.
+    fn any_working_matcher(frame: &str) -> bool {
+        screen_is_working(frame) || screen_shows_bare_spinner_frame(frame)
+    }
+
+    /// THE BOUNDARY, IN BOTH DIRECTIONS, ON SYNTHETIC GRIDS.
     ///
-    /// The first cut matched the bare frame across the WHOLE screen, and five existing tests went
-    /// red at once: the captured `IDLE_AFTER_TURN_2_1_220` — a real FINISHED turn — carries
-    /// `✻ Churned for 3s` in its scrollback, because that is where the spinner's last frame is left
-    /// when a turn ends. Whole-screen matching therefore reads every finished agent as working,
-    /// forever, and nothing retracts it.
-    ///
-    /// THE PAIR IS THE POINT. Asserting only that the idle screen is calm would also pass for an arm
-    /// that had stopped matching altogether, so the same frame is asserted to READ AS WORKING when
-    /// it sits at the bottom instead. Position is the whole discriminator.
+    /// roborev raised this as a Medium against the first cut and it was right: the earlier test used
+    /// a real fixture whose remnant happens to sit ~20 non-blank rows above the bottom, so the
+    /// assertion survived any window up to 20 and bounded nothing between 1 and 20. Layout luck is
+    /// not a guard. The TS twin has `statusEngine.liveSpinner.test.ts` pinning exactly this; the port
+    /// owes the same.
     #[test]
-    fn a_spinner_frame_left_in_scrollback_is_not_a_live_agent() {
-        let idle = fixture_screen("IDLE_AFTER_TURN_2_1_220");
+    fn the_live_tail_window_is_bounded_in_both_directions() {
+        let frame = "✻ Crunched for 2s";
+
+        // The OLDEST row still inside the window reads as working…
+        let filler = vec!["some transcript output"; LIVE_TAIL_ROWS - 1];
+        let inside = format!("{frame}\n{}", filler.join("\n"));
         assert!(
-            idle.contains("✻ Churned for 3s"),
-            "fixture no longer carries the scrollback frame this test exists for — re-point it"
-        );
-        assert!(
-            !screen_is_working(&idle),
-            "a spinner left in the scrollback of a FINISHED turn must not latch the row green"
+            screen_shows_bare_spinner_frame(&inside),
+            "a frame exactly at the window's edge must still count, or the arm is narrower than it says"
         );
 
-        // …and the SAME frame at the bottom of the grid IS a live agent.
-        let live = format!("some earlier output\n\n{}", "✻ Churned for 3s");
+        // …and one row further up does not. Without this the window could widen to the whole screen
+        // and nothing would notice.
+        let filler = vec!["some transcript output"; LIVE_TAIL_ROWS];
+        let outside = format!("{frame}\n{}", filler.join("\n"));
         assert!(
-            screen_is_working(&live),
-            "the bottom-anchored arm must still fire, or this is narrowing to the point of inert"
+            !screen_shows_bare_spinner_frame(&outside),
+            "a frame beyond the window must NOT count — that is the scrollback latch this arm avoids"
         );
     }
 
-    /// Trailing blank padding must not push the live line out of the window. A rendered grid is
-    /// padded to its full height, so this is the ordinary case, not an edge one — and getting it
-    /// wrong makes the arm silently never fire, which is the failure mode with no symptom.
+    /// TRAILING BLANK PADDING MUST NOT HIDE THE STATUS LINE. A rendered grid is padded to its full
+    /// height, so this is the ordinary case, not an edge one — and getting it wrong makes the arm
+    /// silently never fire, which is the failure mode with no symptom.
     #[test]
     fn blank_padding_below_the_status_line_does_not_hide_it() {
         let padded = format!("✶ Schlepping…{}", "\n".repeat(30));
-        assert!(screen_is_working(&padded));
+        assert!(screen_shows_bare_spinner_frame(&padded));
+    }
+
+    /// THE CASE THE WHOLE ARM IS KEPT OUT OF THE VETO PATH FOR, pinned so the limitation is visible
+    /// rather than folklore. A finished 2.1.237 turn on a SCROLLED screen leaves its last spinner
+    /// frame just above the composer chrome — well inside the window — so position alone cannot tell
+    /// it from a live one. This asserts the matcher's honest behaviour: it says "working", and that
+    /// is exactly why `screen_is_working` must not consult it until movement corroborates presence.
+    #[test]
+    fn a_remnant_above_the_composer_still_fools_the_positional_arm() {
+        let finished = [
+            "⏺ Done — all three landed.",
+            "✻ Churned for 3s",
+            "⏺ I have committed the change.",
+            "",
+            "────────────────────────────────",
+            "❯ ",
+        ]
+        .join("\n");
+        assert!(
+            screen_shows_bare_spinner_frame(&finished),
+            "if this ever goes false the positional arm got stronger — revisit whether it can now be \
+             wired into screen_is_working"
+        );
+        // THE POINT: the veto path is NOT fooled, because it does not ask.
+        assert!(
+            !screen_is_working(&finished),
+            "a finished turn must not read as working — this is the regression that was reverted"
+        );
     }
 
     /// THE REGRESSION THIS SHIPPED FOR, named on its own so a failure says WHICH arm died rather
