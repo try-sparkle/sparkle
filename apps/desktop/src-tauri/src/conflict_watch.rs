@@ -1002,6 +1002,30 @@ fn probe_retry_secs(consecutive_failures: u32) -> u64 {
         .min(top)
 }
 
+/// How many consecutive sweeps this project's PR probe has failed. `0` means it is reading fine.
+///
+/// THE GAP THIS FILLS: the unreadable warning already says a repo could not be read and that its
+/// tracked PRs keep climbing blind, but it says so in exactly the same words on the FIRST failure
+/// and on the twentieth. A repo having one bad minute and a repo that has been blind since last
+/// night are the same sentence, so the reader cannot tell a blip that will clear itself from a
+/// standing outage that needs a human — which is the only decision the line exists to inform.
+///
+/// Measured across four days of one machine's logs: 26 unreadable warnings, on a flat ~2-hour
+/// cadence matching the capped backoff, every one of them indistinguishable from a first failure.
+/// The evidence that they were ONE continuous outage rather than 26 unrelated ones was never in the
+/// log — it had to be reconstructed by hand from the timestamps.
+///
+/// [`ProbeBackoff`] has carried this count since it was introduced; it drove [`probe_retry_secs`]
+/// and nothing else. Reading it costs a map lookup, so the number the module already keeps stops
+/// being invisible to the person reading the log.
+///
+/// Note the count is one the SWEEP owns: `sweep_probes` writes it before this is read, so a warning
+/// for a probe that just failed reports a streak INCLUDING that failure, and `1` honestly means
+/// "first failure" rather than "none yet".
+fn blind_streak(backoff: &ProbeBackoff, project: &str) -> u32 {
+    backoff.get(project).map_or(0, |&(_, n, _)| n)
+}
+
 /// Ask a project's worktrees for its open PRs, taking the first that ANSWERS.
 ///
 /// Only a probe that fails in every worktree it TRIES declares the project unreadable, so one
@@ -2269,9 +2293,14 @@ fn tick<R: Runtime>(app: &AppHandle<R>, watch: &mut Watch, now: u64) {
                         project = %repo.project_id,
                         reason,
                         retry_in_secs,
+                        consecutive_failures = blind_streak(&watch.probe_backoff, &repo.project_id),
                         "not re-probing this repo yet; it is inside its failure backoff and its \
                          tracked PRs keep climbing on the cached reason"
                     ),
+                    // `consecutive_failures` is what separates a blip from a standing outage — see
+                    // [`blind_streak`]. Without it this sentence is identical on the first failure
+                    // and on the twentieth, which is how 26 warnings over four days read as 26
+                    // unrelated events rather than the one continuous outage they were.
                     _ => tracing::warn!(
                         target: "conflict_watch",
                         project = %repo.project_id,
@@ -2281,6 +2310,7 @@ fn tick<R: Runtime>(app: &AppHandle<R>, watch: &mut Watch, now: u64) {
                             .probe_backoff
                             .get(&repo.project_id)
                             .map_or(0, |&(at, _, _)| at.saturating_sub(now).div_ceil(1000)),
+                        consecutive_failures = blind_streak(&watch.probe_backoff, &repo.project_id),
                         "could not read this repo's PRs in ANY of its worktrees; its tracked PRs \
                          keep climbing rather than being reported clean"
                     ),
@@ -3782,6 +3812,72 @@ mod tests {
         let swept = sweep(&mut backoff, recovered, false, 0);
         assert_eq!(calls.get(), 4, "no window survives a success");
         assert_eq!(swept.outcomes[0].2, Disposition::Asked);
+    }
+
+    /// The unreadable warning must be able to tell a BLIP from a STANDING OUTAGE.
+    ///
+    /// The number is the point, not the lookup: the log line said the same thing on the first
+    /// failure and on the twentieth, so this drives the real `sweep_probes` across an outage and
+    /// asserts [`blind_streak`] reports the streak that sweep actually recorded — including the
+    /// reset, which is what stops a recovered repo from reading as permanently broken.
+    #[test]
+    fn the_blind_streak_separates_a_blip_from_a_standing_outage() {
+        use std::cell::Cell;
+        let repos = vec![repo_of("p", 1)];
+        let mut backoff = ProbeBackoff::new();
+        let clock = Cell::new(0u64);
+        let fail = Cell::new(true);
+        let mut sweep = |backoff: &mut ProbeBackoff, now: u64| {
+            clock.set(now);
+            sweep_probes(
+                &repos,
+                backoff,
+                0,
+                10_000_000,
+                |_| {
+                    if fail.get() {
+                        Err("gh-failed")
+                    } else {
+                        Ok(Probed {
+                            prs: vec![],
+                            saturated: false,
+                            saturated_by: SATURATED_BY_LIST_WINDOW,
+                        })
+                    }
+                },
+                || clock.get(),
+            );
+            // Discarded deliberately: this test asserts on the BACKOFF the sweep wrote, not on the
+            // looks it returned — those are already covered by the tests above.
+        };
+
+        assert_eq!(
+            blind_streak(&backoff, "p"),
+            0,
+            "a repo nobody has failed to read yet has no streak at all"
+        );
+
+        // Each sweep lands past the previous doubled window, so every one of them really probes.
+        sweep(&mut backoff, 0);
+        assert_eq!(blind_streak(&backoff, "p"), 1, "the FIRST failure reports 1, not 0");
+
+        let mut at = 0u64;
+        for expected in 2..=4u32 {
+            at += probe_retry_secs(expected - 1) * 1000;
+            sweep(&mut backoff, at);
+            assert_eq!(
+                blind_streak(&backoff, "p"),
+                expected,
+                "a repo blind across {expected} consecutive sweeps must not read like a first failure"
+            );
+        }
+
+        // Recovery resets it — a streak that only ever climbs would report a healthy repo as one
+        // that has been blind all night, which is the same lie in the other direction.
+        fail.set(false);
+        at += probe_retry_secs(4) * 1000;
+        sweep(&mut backoff, at);
+        assert_eq!(blind_streak(&backoff, "p"), 0, "reading again clears the streak");
     }
 
     /// ONE BROKEN REPO MUST NOT SLOW A HEALTHY ONE — the reason the backoff is keyed per project.

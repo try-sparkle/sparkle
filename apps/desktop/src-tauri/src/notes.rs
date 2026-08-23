@@ -111,21 +111,56 @@ fn first_executable(candidates: &[PathBuf]) -> Option<String> {
         .map(|p| p.to_string_lossy().into_owned())
 }
 
-/// Probe the user's LOGIN shell ONCE for `bd`'s absolute path. macOS GUI apps inherit no shell
-/// PATH, so a bare `Command::new("bd")` misses a Homebrew/user-local bd; the login shell resolves
-/// whatever PATH the user actually configured. Mirrors preflight.rs's
-/// `run_in_login_shell("command -v …")`.
+/// How long the login-shell probe may take before it is abandoned in favour of [`known_bd_paths_for`].
+///
+/// A `command -v` is microseconds of work; everything this bound is spending is the user's rc files.
+/// Generous enough for a heavy-but-finite profile (nvm, rbenv, conda all init well inside it), short
+/// enough that a wedged one costs a startup hiccup instead of the session.
 #[cfg(unix)]
-fn login_shell_which_bd() -> Option<String> {
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
-    Command::new(shell)
-        .args(["-lc", "command -v bd"])
-        .output()
+const BD_WHICH_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Probe a login shell for `bd`'s absolute path, BOUNDED. Shell and script are parameters so the
+/// bound is testable without a machine whose real login shell hangs on demand.
+///
+/// THE DEFECT THIS REMOVES: this probe ended in `.output()`, which waits FOREVER. That is the same
+/// unbounded call this module already eliminated from [`run_bd`] — see its doc on
+/// `bridge request timeout: concierge_tool` — but it survived one level DOWN, in the resolver, where
+/// it is strictly worse. `-lc` runs the user's full rc files, which routinely block on a network
+/// mount, a VPN-gated prompt or a version manager reaching for a registry; and because every bd call
+/// funnels through [`cached_bd_path`] on a cold cache, one such hang wedges the FIRST bd call of the
+/// session with `BD_TIMEOUT` never even started — the bound lives above the resolver, so it cannot
+/// fire on a resolver that has not returned. The whole timeout ladder sits above this line.
+///
+/// The fallback makes the bound cheap rather than lossy: giving up here does not mean "no bd", it
+/// means [`resolve_bd_uncached`] goes on to check the canonical install locations, which is where a
+/// Homebrew or user-local bd already is. Answering from that list beats waiting on a shell that is
+/// never coming back.
+///
+/// `output_with_timeout` rather than this module's `run_cmd_bounded`: that one routes through
+/// `run_cmd_timed`, which sets `PATH` from [`bd_exec_path`] — which resolves bd — so using it inside
+/// the resolver would re-enter it. It also puts the child in its own process group, so expiry kills
+/// the rc files' descendants too rather than leaving the shell's children behind.
+#[cfg(unix)]
+fn which_via_login_shell(shell: &str, script: &str, timeout: Duration) -> Option<String> {
+    let mut cmd = Command::new(shell);
+    cmd.args(["-lc", script]);
+    crate::worktree::output_with_timeout(cmd, timeout)
         .ok()
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .filter(|s| !s.is_empty())
         .filter(|p| Path::new(p).is_absolute() && is_executable(Path::new(p)))
+}
+
+/// Probe the user's LOGIN shell ONCE for `bd`'s absolute path. macOS GUI apps inherit no shell
+/// PATH, so a bare `Command::new("bd")` misses a Homebrew/user-local bd; the login shell resolves
+/// whatever PATH the user actually configured. Mirrors preflight.rs's
+/// `run_in_login_shell("command -v …")` — except that this one is BOUNDED; see
+/// [`which_via_login_shell`].
+#[cfg(unix)]
+fn login_shell_which_bd() -> Option<String> {
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+    which_via_login_shell(&shell, "command -v bd", BD_WHICH_TIMEOUT)
 }
 
 /// Windows: resolve `bd` via `where` (GUI apps inherit PATH). Returns the first hit.
@@ -1786,6 +1821,57 @@ mod tests {
         assert!(paths.iter().any(|p| p.ends_with("opt/homebrew/bin/bd")));
         assert!(!paths.iter().any(|p| p.to_string_lossy().contains(".local")));
         assert!(!paths.iter().any(|p| p.to_string_lossy().contains("go/bin")));
+    }
+
+    // ── The login-shell probe is BOUNDED ────────────────────────────────────────────────────
+    // These assert the SIDE EFFECT of the bound — that a hanging rc file is ABANDONED and the
+    // caller gets control back — rather than that a fast shell resolves, which passed against the
+    // unbounded `.output()` too and is why the hang survived this long. Drop the timeout and the
+    // first of these does not fail, it HANGS, which is precisely the production symptom.
+
+    #[cfg(unix)]
+    #[test]
+    fn a_hanging_login_shell_is_abandoned_at_the_bound() {
+        let bound = Duration::from_secs(1);
+        let started = Instant::now();
+        // Prints a plausible answer, but only after far longer than any caller will wait. The sleep
+        // dwarfs the bound so a slow machine cannot make this flaky in the direction of passing.
+        let got = which_via_login_shell("/bin/sh", "sleep 60; echo /usr/local/bin/bd", bound);
+        let waited = started.elapsed();
+        assert_eq!(got, None, "an expired probe has no answer to give");
+        assert!(
+            waited < Duration::from_secs(30),
+            "the probe must come back at its bound, not run to completion; waited {waited:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn giving_up_on_the_shell_still_leaves_the_known_paths_to_try() {
+        // The bound is only affordable because abandoning the shell is not the end of resolution.
+        // If this list were empty, timing out WOULD mean "no bd" and the bound would cost answers.
+        let after = known_bd_paths_for(Some(PathBuf::from("/Users/x")));
+        assert!(!after.is_empty(), "the fallback is what makes the bound cheap rather than lossy");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_prompt_shell_answer_is_still_accepted() {
+        // The paired case: the bound must not reject a shell that answers normally, or every probe
+        // would "time out" and the fallback would be doing all the work unnoticed.
+        let got = which_via_login_shell("/bin/sh", "echo /bin/sh", Duration::from_secs(5));
+        assert_eq!(got.as_deref(), Some("/bin/sh"), "a fast, valid, executable answer survives");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_relative_or_missing_answer_is_rejected() {
+        // `command -v` can print a shell builtin or a relative name; neither is a path to spawn.
+        assert_eq!(which_via_login_shell("/bin/sh", "echo bd", Duration::from_secs(5)), None);
+        assert_eq!(
+            which_via_login_shell("/bin/sh", "echo /nonexistent/bd", Duration::from_secs(5)),
+            None
+        );
     }
 
     // ── Negative-resolution cache (PERF) ────────────────────────────────────────────────────
