@@ -244,30 +244,84 @@ interface Measurement {
   perKeystroke: number;
 }
 
-/** Type `KEYSTROKES` characters onto the end of `seed` and report what it cost. */
+/** Type `KEYSTROKES` characters onto the end of `seed` and report what it cost.
+ *
+ * ══ WHY THE COUNTING WINDOW FREEZES THE MACROTASK CLOCK ═════════════════════════════════════════
+ * The number this file exists to assert is scans-PER-KEYSTROKE — the work ONE dispatched character
+ * synchronously does. That is what a regression (a second consumer scanning, a memo widened to the
+ * draft) would move, and it is fixed by the design under test regardless of how long the machine
+ * takes to run the loop.
+ *
+ * What is NOT per-keystroke is background timer work: the host arms an auto-dispatch `setInterval`
+ * (AUTO_DISPATCH_TICK_MS) at mount and re-renders reschedule short timers, and every such callback
+ * that fires re-renders the host against a rebuilt roster, missing the single-entry `scanMentions`
+ * cache and charging another `findMentionSpans`. On a developer laptop the loop finishes in a few
+ * ms and none of those fire inside it, so the count is a clean 1.00/keystroke. Under the 4-shard ×
+ * 2-worker instrumented coverage job the shard is CPU-starved, the SAME loop's wall clock stretches
+ * to seconds, those timer callbacks fire dozens to hundreds of times DURING the window, and the
+ * count exploded to ~601/keystroke — reddening the required "Node — coverage" gate on unrelated PRs
+ * (bead sparkle-shs9ax). The count was never per-keystroke on a slow machine; it was per-keystroke
+ * PLUS however many background ticks the wall clock happened to admit.
+ *
+ * So the counting window installs fake timers: every macrotask/animation callback scheduled during
+ * it is parked on a clock that is never advanced, and cannot fire no matter how long the real wall
+ * clock takes. What remains inside the window is exactly the synchronous per-keystroke work — the
+ * thing being measured — so the count is 1.00/keystroke on any machine at any load. It is NOT a
+ * weakening: a rogue second SYNCHRONOUS scan per keystroke still runs synchronously and is still
+ * counted, so the regression this file guards still reds (verified by /mutation-check at
+ * 2.00–3.00/keystroke). `performance` and microtasks are left real: `ms` stays a true reading, and
+ * `act`'s `await Promise.resolve()` flush still drains, so effects still commit each keystroke.
+ *
+ * Setup and the SEED keystroke run on the REAL clock, before the freeze — the seed mounts pickers
+ * and runs one-shot effects whose steady state the window then measures (the 26th character of a
+ * paragraph), and it is deliberately OUTSIDE the counted window so mounting is never charged to a
+ * keystroke. A single real-timer flush after the seed drains any 0ms timers it scheduled so they
+ * cannot leak into the frozen window. */
 async function measureTyping(seed: string = BASE_DRAFT): Promise<Measurement> {
   render(<ConciergeHost feed={FEED} promptTarget={SELECTED} />);
   // Seed the draft OUTSIDE the measured window: the first keystroke also mounts pickers and runs
   // one-shot effects, and counting that would flatter or slander the steady state depending on the
   // day. What is measured is the steady state — the 26th character of a paragraph.
   await typeOne(seed);
+  // Drain any real 0ms timers the mount/seed scheduled, on the REAL clock, so none of them can fire
+  // inside the frozen window below and be miscounted as keystroke work.
+  await act(async () => {
+    await new Promise((r) => setTimeout(r, 0));
+  });
 
-  const before = { ...mentionScanStats };
-  const t0 = performance.now();
-  let draft = seed;
-  for (let i = 0; i < KEYSTROKES; i += 1) {
-    draft += "x";
-    await typeOne(draft);
+  // Freeze the macrotask/animation clock for the counting window ONLY (see the block comment above).
+  // `Date`, `performance` and microtasks are intentionally NOT faked: microtasks keep `act`'s flush
+  // working so each keystroke still commits, and `performance.now()` stays a real reading for `ms`.
+  vi.useFakeTimers({
+    toFake: [
+      "setTimeout",
+      "clearTimeout",
+      "setInterval",
+      "clearInterval",
+      "requestAnimationFrame",
+      "cancelAnimationFrame",
+    ],
+  });
+  try {
+    const before = { ...mentionScanStats };
+    const t0 = performance.now();
+    let draft = seed;
+    for (let i = 0; i < KEYSTROKES; i += 1) {
+      draft += "x";
+      await typeOne(draft);
+    }
+    const ms = performance.now() - t0;
+    const scans = mentionScanStats.spans - before.spans;
+    return {
+      scans,
+      rosterSorts: mentionScanStats.rosterSorts - before.rosterSorts,
+      beadScores: mentionScanStats.beadScores - before.beadScores,
+      ms,
+      perKeystroke: scans / KEYSTROKES,
+    };
+  } finally {
+    vi.useRealTimers();
   }
-  const ms = performance.now() - t0;
-  const scans = mentionScanStats.spans - before.spans;
-  return {
-    scans,
-    rosterSorts: mentionScanStats.rosterSorts - before.rosterSorts,
-    beadScores: mentionScanStats.beadScores - before.beadScores,
-    ms,
-    perKeystroke: scans / KEYSTROKES,
-  };
 }
 
 /**
