@@ -788,7 +788,10 @@ describe("ConciergeHost", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const record = vi
       .spyOn(useHistoryStore.getState(), "record")
-      .mockImplementation(async () => undefined);
+      // `record` now returns a RecordOutcome (src/services/history.ts): a same-id/different-text
+      // capture is a reported COLLISION rather than a silent discard. These specs only assert that
+      // record was CALLED, so the landed verdict is the neutral stand-in.
+      .mockImplementation(async () => ({ inserted: true, collided: false }));
     try {
       vi.mocked(captureAsksFrom).mockRejectedValueOnce(new Error("bd is not available"));
       h.feed = feedWith("approval");
@@ -1020,7 +1023,10 @@ describe("ConciergeHost", () => {
   it("indexes a streamed reply at its FINAL text, not at its first chunk", () => {
     const record = vi
       .spyOn(useHistoryStore.getState(), "record")
-      .mockImplementation(async () => undefined);
+      // `record` now returns a RecordOutcome (src/services/history.ts): a same-id/different-text
+      // capture is a reported COLLISION rather than a silent discard. These specs only assert that
+      // record was CALLED, so the landed verdict is the neutral stand-in.
+      .mockImplementation(async () => ({ inserted: true, collided: false }));
     try {
       h.feed = feedWith("approval");
       render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
@@ -1052,7 +1058,10 @@ describe("ConciergeHost", () => {
     // green, which is why the two are separate.
     const record = vi
       .spyOn(useHistoryStore.getState(), "record")
-      .mockImplementation(async () => undefined);
+      // `record` now returns a RecordOutcome (src/services/history.ts): a same-id/different-text
+      // capture is a reported COLLISION rather than a silent discard. These specs only assert that
+      // record was CALLED, so the landed verdict is the neutral stand-in.
+      .mockImplementation(async () => ({ inserted: true, collided: false }));
     try {
       h.feed = feedWith("approval");
       render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
@@ -1087,7 +1096,10 @@ describe("ConciergeHost", () => {
     // `endStreamsThrough` marks them. Delete that call and this row goes red.
     const record = vi
       .spyOn(useHistoryStore.getState(), "record")
-      .mockImplementation(async () => undefined);
+      // `record` now returns a RecordOutcome (src/services/history.ts): a same-id/different-text
+      // capture is a reported COLLISION rather than a silent discard. These specs only assert that
+      // record was CALLED, so the landed verdict is the neutral stand-in.
+      .mockImplementation(async () => ({ inserted: true, collided: false }));
     try {
       h.feed = feedWith("approval");
       render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
@@ -1116,7 +1128,10 @@ describe("ConciergeHost", () => {
     // row ever goes red, the sweep has started eating live replies.
     const record = vi
       .spyOn(useHistoryStore.getState(), "record")
-      .mockImplementation(async () => undefined);
+      // `record` now returns a RecordOutcome (src/services/history.ts): a same-id/different-text
+      // capture is a reported COLLISION rather than a silent discard. These specs only assert that
+      // record was CALLED, so the landed verdict is the neutral stand-in.
+      .mockImplementation(async () => ({ inserted: true, collided: false }));
     try {
       h.feed = feedWith("approval");
       render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
@@ -1170,7 +1185,10 @@ describe("ConciergeHost", () => {
     // its braces are the primary guard for.
     const record = vi
       .spyOn(useHistoryStore.getState(), "record")
-      .mockImplementation(async () => undefined);
+      // `record` now returns a RecordOutcome (src/services/history.ts): a same-id/different-text
+      // capture is a reported COLLISION rather than a silent discard. These specs only assert that
+      // record was CALLED, so the landed verdict is the neutral stand-in.
+      .mockImplementation(async () => ({ inserted: true, collided: false }));
     try {
       h.feed = feedWith("approval");
       render(<ConciergeHost feed={h.feed as ConciergeFeed} />);

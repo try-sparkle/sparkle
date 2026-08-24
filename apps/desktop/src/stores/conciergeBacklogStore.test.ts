@@ -18,6 +18,11 @@ import { setConciergeChat, useConciergeThreadStore } from "./conciergeThreadStor
 import { resetConciergeIdentityState } from "../services/conciergeIdentityReset";
 import type { HistoryRangeRow } from "../services/history";
 import type { ConciergeMessage } from "../components/Concierge/types";
+import {
+  __resetConciergeSessionTokenForTest,
+  conciergeSessionToken,
+  historyRowId,
+} from "../services/conciergeSessionToken";
 
 const NOW = 1_700_000_000_000;
 const MINUTE = 60_000;
@@ -49,14 +54,39 @@ beforeEach(() => {
   useConciergeBacklogStore.getState().clear();
   setConciergeChat([]);
   setConciergeBacklogIo({ now: () => NOW });
+  // One token per test, so a case cannot inherit the id namespace another minted.
+  __resetConciergeSessionTokenForTest();
 });
 
 describe("rowToMessage", () => {
   // THE JUMP MECHANISM. A prefixed or re-minted id is a rail that silently scrolls to nothing —
   // ConciergeThread's `jumpTo` scans for `[data-message-id]` and matches on the exact string.
-  it("carries the row id through verbatim, on both kinds", () => {
+  it("carries a legacy un-namespaced row id through verbatim, on both kinds", () => {
     expect(rowToMessage(row("you-17", NOW)).id).toBe("you-17");
     expect(rowToMessage(row("brain-4", NOW, "response")).id).toBe("brain-4");
+  });
+
+  // ── THE KEY AND THE BUBBLE ID CAME APART ──────────────────────────────────────────────────────
+  // `conciergeHistoryCapture` no longer writes the bubble id as the row's primary key — it writes
+  // `${sessionToken}:${bubbleId}`, because the bubble counter restarts at 0 on every app reload and
+  // the un-namespaced key was being discarded by the `INSERT OR IGNORE` sink. The rail and the
+  // dedupe both still speak BUBBLE ids, so the row id has to be mapped back here.
+  //
+  // The fixture is built by `historyRowId` rather than hand-written, deliberately: a hand-written
+  // `"tok:you-17"` would keep passing if the capture side changed its key format again, which is
+  // exactly the seam that broke silently the first time.
+  it("recovers the live bubble id from a row THIS app load wrote", () => {
+    expect(rowToMessage(row(historyRowId("you-17"), NOW)).id).toBe("you-17");
+    expect(rowToMessage(row(historyRowId("brain-4"), NOW, "response")).id).toBe("brain-4");
+  });
+
+  // A PREVIOUS load's row cannot be mapped back — its bubble id was only ever unique within that
+  // load, and this load is minting `you-1` again right now. The namespaced key is itself unique and
+  // stable, so it is kept whole and the rail jumps to it under that name.
+  it("keeps a previous app load's row id whole rather than guessing a bubble id", () => {
+    const mine = conciergeSessionToken();
+    const theirs = `${mine}-earlier:you-17`;
+    expect(rowToMessage(row(theirs, NOW)).id).toBe(theirs);
   });
 
   it("maps prompt→you and response→sparkle", () => {
@@ -290,6 +320,26 @@ describe("loadBack", () => {
 });
 
 describe("dedupe against the live thread", () => {
+  // ── THE REGRESSION THIS SEAM ALREADY SHIPPED ONCE ─────────────────────────────────────────────
+  // Rows are fetched up to `io.now()` on a first `loadBack`, so the window REACHES the turns the
+  // reader can already see. Their row ids are namespaced; the live bubbles' are not. Without the
+  // mapping in `bubbleIdForRow` the membership test matches nothing and every turn of the current
+  // session draws a second time above the live thread — silently, with no failing assertion
+  // anywhere, which is why the fixture here goes through `historyRowId` rather than a bare id.
+  it("drops a paged-in turn the live thread shows, when the row carries THIS load's key", async () => {
+    setConciergeChat([{ id: "you-9", kind: "you", text: "still on screen" }]);
+    const { query } = tableQuery([
+      row(historyRowId("you-9"), NOW - 10 * MINUTE),
+      row(historyRowId("you-8"), NOW - 11 * MINUTE),
+    ]);
+    setConciergeBacklogIo({ entriesInRange: query });
+
+    await useConciergeBacklogStore.getState().loadBack(NOW - 60 * MINUTE);
+
+    // `you-8` survives under its BUBBLE id — the rail hands that string to `jumpTo`.
+    expect(useConciergeBacklogStore.getState().backlog.map((m) => m.id)).toEqual(["you-8"]);
+  });
+
   it("drops a paged-in turn the live thread already shows under the same id", async () => {
     setConciergeChat([{ id: "you-9", kind: "you", text: "still on screen" }]);
     const { query } = tableQuery([row("you-9", NOW - 10 * MINUTE), row("you-8", NOW - 11 * MINUTE)]);

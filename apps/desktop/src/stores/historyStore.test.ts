@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, vi } from "vitest";
 
 // Mock the Tauri-backed service so the store is tested in isolation (no invoke).
 vi.mock("../services/history", () => ({
-  recordHistory: vi.fn(async () => {}),
+  recordHistory: vi.fn(async () => ({ inserted: true, collided: false })),
   searchHistory: vi.fn(async () => []),
   pruneHistory: vi.fn(async () => 0),
 }));
@@ -37,7 +37,7 @@ const reset = () =>
 
 beforeEach(() => {
   reset();
-  mockRecord.mockReset().mockResolvedValue(undefined);
+  mockRecord.mockReset().mockResolvedValue({ inserted: true, collided: false });
   mockSearch.mockReset().mockResolvedValue([]);
   mockPrune.mockReset().mockResolvedValue(0);
   mockEntitlement.mockReset().mockResolvedValue("24h");
@@ -55,20 +55,56 @@ describe("windowMsForTier", () => {
 });
 
 describe("historyStore", () => {
+  const entry = {
+    id: "id1",
+    kind: "prompt" as const,
+    source: "brainstorm" as const,
+    projectId: "p1",
+    agentId: "a1",
+    projectName: "Proj",
+    agentName: "Think",
+    text: "hello",
+    createdAt: 42,
+  };
+
   it("record() delegates to recordHistory", async () => {
-    const entry = {
-      id: "id1",
-      kind: "prompt" as const,
-      source: "brainstorm" as const,
-      projectId: "p1",
-      agentId: "a1",
-      projectName: "Proj",
-      agentName: "Think",
-      text: "hello",
-      createdAt: 42,
-    };
     await useHistoryStore.getState().record(entry);
     expect(mockRecord).toHaveBeenCalledWith(entry);
+  });
+
+  // ── THE OUTCOME MUST REACH THE CALLER ────────────────────────────────────────────────────────
+  // `record` used to return `Promise<void>`, so a caller had no way to learn that its message was
+  // discarded — which is how 199 of 200 on-screen concierge messages were dropped in silence.
+  // Asserting only `toHaveBeenCalledWith` above was true before this change and proves nothing
+  // about it; these assert the value that comes BACK.
+  it("record() returns the outcome the service reported, collisions included", async () => {
+    mockRecord.mockResolvedValue({ inserted: false, collided: true });
+    await expect(useHistoryStore.getState().record(entry)).resolves.toEqual({
+      inserted: false,
+      collided: true,
+    });
+
+    mockRecord.mockResolvedValue({ inserted: true, collided: false });
+    await expect(useHistoryStore.getState().record(entry)).resolves.toEqual({
+      inserted: true,
+      collided: false,
+    });
+
+    mockRecord.mockResolvedValue({ inserted: false, collided: false });
+    await expect(useHistoryStore.getState().record(entry)).resolves.toEqual({
+      inserted: false,
+      collided: false,
+    });
+  });
+
+  // It runs inside a zustand listener chain, so it still must never throw — and a failed write is
+  // not a collision: nothing is known to have been overwritten, so it must not raise the alarm.
+  it("record() still resolves — neutrally, never as a collision — when the service rejects", async () => {
+    mockRecord.mockRejectedValue(new Error("history: DB unavailable (init failed at boot)"));
+    await expect(useHistoryStore.getState().record(entry)).resolves.toEqual({
+      inserted: false,
+      collided: false,
+    });
   });
 
   it("search() populates results and clears the searching flag", async () => {

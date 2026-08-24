@@ -64,9 +64,76 @@ export interface HistoryHit {
   createdAt: number;
 }
 
-/** Persist one prompt/response entry. Idempotent on `id` (INSERT OR IGNORE in Rust). */
-export async function recordHistory(e: HistoryEntry): Promise<void> {
-  await invoke("history_record", { entry: e });
+/**
+ * What one {@link recordHistory} call actually did — the return value that makes a NON-LANDING
+ * write observable instead of silent.
+ *
+ * ── WHY THIS EXISTS (silent data loss, measured) ─────────────────────────────────────────────────
+ * `id` is minted HERE, in the frontend, and the Rust side is `INSERT OR IGNORE` on a TEXT PRIMARY
+ * KEY. It used to return nothing, so a second message arriving under an id that was already taken
+ * was discarded with no error, no log and no return value anyone could inspect. Measured against
+ * the founder's live DB: **199 of 200** on-screen concierge messages carried the same id as an
+ * existing row but DIFFERENT text. The id scheme is fixed separately; `collided` is what makes the
+ * drop impossible to miss if it ever recurs.
+ *
+ * Exactly three states are reachable — see `RecordOutcome` in `src-tauri/src/history.rs`:
+ * - `{ inserted: true,  collided: false }` — the row was written.
+ * - `{ inserted: false, collided: false }` — the id exists with BYTE-IDENTICAL text. Benign
+ *   idempotent re-capture (a re-render, a rehydrate, a double subscribe). NOT an alarm.
+ * - `{ inserted: false, collided: true }` — the id exists with DIFFERENT text. **DATA LOSS.**
+ *
+ * Both fields are plain Rust `bool`s, never `Option`, so serde always emits both keys with a
+ * true/false value — which is why these are `boolean` and not `boolean | null`. (Were either to
+ * become an `Option`, it would cross the wire as an EXPLICIT `null`, never as an absent key, and
+ * the type here would have to become `boolean | null` — `boolean | undefined` excludes `null` and
+ * would describe a payload the wire cannot produce. AGENTS.md, bead sparkle-16y6h.)
+ */
+export type RecordOutcome = { inserted: boolean; collided: boolean };
+
+/** Neither written nor lost — the verdict that asserts nothing. Every unreadable payload lands here. */
+const NEUTRAL_OUTCOME: RecordOutcome = { inserted: false, collided: false };
+
+/**
+ * Read a `history_record` reply defensively.
+ *
+ * ── THE ASYMMETRY THIS ENCODES ───────────────────────────────────────────────────────────────────
+ * `collided: true` is an ALARM meaning "we threw away something the founder said". A parser that
+ * can raise it on a payload it merely failed to understand — an older backend that still returns
+ * `null`, a shape nobody anticipated — spends the alarm's entire credibility on noise, and the one
+ * signal that is supposed to mean data loss stops meaning anything. So every unreadable input
+ * resolves to {@link NEUTRAL_OUTCOME}, and only an explicit `true` on a well-formed reply sets a
+ * flag. It never throws: capture is fire-and-forget, and a parse error must not break a chat turn.
+ *
+ * Exported for the seam test (`history.recordOutcome.test.ts`), which parses the SAME fixture the
+ * Rust suite does — `apps/desktop/shared/history-record-outcome.fixture.json`.
+ */
+export function parseRecordOutcome(raw: unknown): RecordOutcome {
+  if (raw === null || raw === undefined || typeof raw !== "object") return { ...NEUTRAL_OUTCOME };
+  const o = raw as Record<string, unknown>;
+  // BOTH keys must be present AND actually boolean. Neither is an `Option` on the Rust side, so
+  // serde emits both on every reply — a payload missing one, or carrying `null` / `"true"` / `1`
+  // for one, is a shape this contract does not describe, and a verdict is not something to salvage
+  // out of half a message. (`=== "boolean"` rather than truthiness is the same rule: `null` is what
+  // an Option would put on the wire, and it is NOT `false`.)
+  if (typeof o.inserted !== "boolean" || typeof o.collided !== "boolean") {
+    return { ...NEUTRAL_OUTCOME };
+  }
+  // `inserted && collided` is UNREPRESENTABLE on the Rust side, so seeing it means the reply is not
+  // one this contract describes either. Fall to the non-alarm verdict rather than reporting a loss
+  // the backend never claimed.
+  if (o.inserted && o.collided) return { ...NEUTRAL_OUTCOME };
+  return { inserted: o.inserted, collided: o.collided };
+}
+
+/**
+ * Persist one prompt/response entry. Idempotent on `id` — but the result now SAYS which kind of
+ * idempotent it was, so a same-id/different-text discard is no longer silent. See
+ * {@link RecordOutcome}.
+ *
+ * Rejects only if the invoke itself fails; a reply it cannot read yields the neutral outcome.
+ */
+export async function recordHistory(e: HistoryEntry): Promise<RecordOutcome> {
+  return parseRecordOutcome(await invoke("history_record", { entry: e }));
 }
 
 /** Full-text search across all live history. Blank query → []. Default limit 50 (Rust-side). */

@@ -301,7 +301,10 @@ describe("the linter's block path — a blocked reply is re-prompted, once", () 
   it("indexes the CORRECTED reply, never the blocked draft", async () => {
     const record = vi
       .spyOn(useHistoryStore.getState(), "record")
-      .mockImplementation(async () => undefined);
+      // `record` now returns a RecordOutcome (src/services/history.ts): a same-id/different-text
+      // capture is a reported COLLISION rather than a silent discard. These specs only assert that
+      // record was CALLED, so the landed verdict is the neutral stand-in.
+      .mockImplementation(async () => ({ inserted: true, collided: false }));
     try {
       h.runReplyLint.mockImplementation((i: { text: string }) =>
         i.text === OFFER ? blocked(i.text) : clean(i.text),

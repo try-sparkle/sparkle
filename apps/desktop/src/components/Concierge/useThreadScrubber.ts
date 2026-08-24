@@ -21,7 +21,7 @@
 // continuous gesture to track.
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { historyExtent, promptDensity, promptsInRange } from "../../services/history";
-import { useConciergeBacklogStore } from "../../stores/conciergeBacklogStore";
+import { bubbleIdForRow, useConciergeBacklogStore } from "../../stores/conciergeBacklogStore";
 import { useConciergeThreadStore } from "../../stores/conciergeThreadStore";
 import type { ConciergeMessage } from "./types";
 import {
@@ -343,8 +343,16 @@ export function useThreadScrubber(deps: ThreadScrubberDeps = {}): ThreadScrubber
         const from = scopeFromMs(at, scope, extent.oldestMs);
         const rows = await io.promptsInRange(from, at, "concierge", MARKER_FETCH_LIMIT);
         if (mine !== ticket.current) return;
+        // KEYED BY BUBBLE ID, NOT BY ROW ID. `enriched` looks this up with a mark id read off
+        // `data-message-id`, which is the bubble id — and a history row's primary key stopped being
+        // the bubble id when concierge rows were namespaced per app load to stop the
+        // `INSERT OR IGNORE` sink discarding them. `bubbleIdForRow` is the one inverse; keying on
+        // `r.id` here misses EVERY mark of the current session, silently, leaving each card with no
+        // age and the rendered node's chrome in place of the prompt.
         const map = new Map<string, { createdAt: number; textPrefix: string }>();
-        for (const r of rows) map.set(r.id, { createdAt: r.createdAt, textPrefix: r.textPrefix });
+        for (const r of rows) {
+          map.set(bubbleIdForRow(r.id), { createdAt: r.createdAt, textPrefix: r.textPrefix });
+        }
         setStored(map);
         setFailed(false);
         setLoading(false);

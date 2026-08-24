@@ -40,16 +40,33 @@
 // proactive — because it is what the human ends up seeing. Capturing from there means the invariant
 // is the one that actually matters: IF IT IS ON SCREEN, IT IS IN THE INDEX.
 //
-// Idempotence is structural rather than defended: the bubble's own id becomes the history row id,
-// and `record_into` is `INSERT OR IGNORE` on that primary key (pinned by `duplicate_id_is_ignored`
-// in src-tauri/src/history.rs). So a re-render, a rehydrate on restart, or a double subscribe
-// cannot produce duplicate rows.
+// IDEMPOTENCE IS STRUCTURAL — BUT ONLY ONCE THE ROW ID IS NAMESPACED PER APP LOAD.
+//
+// `record_into` is `INSERT OR IGNORE` on the history row's primary key (pinned by
+// `duplicate_id_is_ignored` in src-tauri/src/history.rs), so whatever id this module writes decides
+// both what dedupes and what is silently DROPPED. This module used to write the bubble's own id,
+// and the comment here claimed that made a re-render, a rehydrate on restart or a double subscribe
+// unable to produce duplicate rows. That argument holds WITHIN one session and was FALSE ACROSS
+// them, because `ConciergeHost`'s `nextId` counter restarts at 0 on every app reload: the second
+// load's `you-1` is a different message with the same key, and `INSERT OR IGNORE` threw it away.
+//
+// Measured before the fix: of 200 on-screen bubbles, 199 shared an id with an existing row but held
+// DIFFERENT text, and only one new row was written. Responses stopped being recorded entirely once
+// the `sparkle-N`/`brain-N` id space filled. One day of the founder's conversation — 41 prompts —
+// left ZERO rows. Ten days ran that way with nothing anywhere saying so.
+//
+// So the row id is now `historyRowId(m.id)` = `${sessionToken}:${bubbleId}` (see
+// services/conciergeSessionToken.ts, which also carries the inverse the scrubber rail needs and the
+// reason the BUBBLE ids themselves were deliberately left alone). Within one app load the id is
+// still a pure function of the bubble id, so every dedupe property above is retained; across loads
+// the messages no longer collide. Existing un-namespaced rows are untouched and need no migration.
 import {
   useConciergeThreadStore,
   RESTORED_ID_PREFIX,
   BRAIN_ID_PREFIX,
 } from "../stores/conciergeThreadStore";
 import { useHistoryStore } from "../stores/historyStore";
+import { historyRowId } from "./conciergeSessionToken";
 import { log } from "../logger";
 import type { ConciergeMessage } from "../components/Concierge/types";
 import type { HistoryEntry } from "./history";
@@ -119,13 +136,22 @@ function conversationEntry(m: ConciergeMessage): HistoryEntry | null {
   // rewritten on rehydrate (`RESTORED_ID_PREFIX`), so it would NOT collide with the original row and
   // the INSERT OR IGNORE above could not dedupe it — every restart would re-index the whole visible
   // thread under fresh ids. Skipping them is what keeps idempotence structural.
+  //
+  // STILL RIGHT UNDER NAMESPACED ROW IDS, and for a sharper reason: the restored bubble was already
+  // written during the session that created it, under THAT session's token. Capturing it again now
+  // would namespace it with THIS load's token, so it could not dedupe against the original even in
+  // principle — it would be a genuine duplicate row of the same words. `rehydrateThread`'s
+  // `restored:N` reindex likewise stays: it solves React-key and upsert collisions among ON-SCREEN
+  // bubbles, which is a different problem from storage identity.
   if (m.id.startsWith(RESTORED_ID_PREFIX)) return null;
 
   const text = (m.text ?? "").trim();
   if (!text) return null;
 
   return {
-    id: m.id,
+    // NOT `m.id`. The bubble id is only unique within one app load; the primary key must be unique
+    // across all of them. See the header note and services/conciergeSessionToken.ts.
+    id: historyRowId(m.id),
     kind: m.kind === "you" ? "prompt" : "response",
     source: "concierge",
     // The concierge is cross-project by construction — it is the one surface that is not scoped to a
@@ -157,11 +183,15 @@ export function startConciergeHistoryCapture(
   const record = deps.record ?? ((e: HistoryEntry) => void useHistoryStore.getState().record(e));
   const subscribe = deps.subscribe ?? useConciergeThreadStore.subscribe;
 
+  // Keyed on the NAMESPACED row id, not the bubble id, so it stays in agreement with what is
+  // actually written. Within one app load the two are in bijection, so nothing about the
+  // within-session dedupe changes; keying on the stored id is simply the honest key.
   const seen = new Set<string>();
 
   const drain = (chat: ConciergeMessage[]): void => {
     for (const m of chat) {
-      if (seen.has(m.id)) continue;
+      const rowId = historyRowId(m.id);
+      if (seen.has(rowId)) continue;
       // NOT YET — come back on the next store write. A streaming reply is skipped until its turn
       // settles, so what lands in the index is the text the founder was actually shown rather than
       // its first token chunk. See `isFinalText`.
@@ -176,7 +206,7 @@ export function startConciergeHistoryCapture(
       // throws is not retried on every subsequent store write (a permanently-failing row would
       // otherwise re-throw for the life of the session), but after the two skips above, so nothing
       // is retired before it had a chance to be recorded.
-      seen.add(m.id);
+      seen.add(rowId);
       // THIS SUBSCRIBER MUST NEVER THROW.
       //
       // It runs inside the thread store's listener chain, and zustand propagates a listener's

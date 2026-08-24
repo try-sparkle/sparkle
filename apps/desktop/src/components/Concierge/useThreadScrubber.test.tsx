@@ -36,6 +36,11 @@ const NOW = 1_700_000_000_000;
 const MINUTE = 60_000;
 const DAY = 86_400_000;
 
+import {
+  __resetConciergeSessionTokenForTest,
+  historyRowId,
+} from "../../services/conciergeSessionToken";
+
 function marker(id: string, atMs: number): PromptMarkerRow {
   return { id, createdAt: atMs, textPrefix: `prefix of ${id}` };
 }
@@ -407,6 +412,36 @@ describe("enriching a measured mark with what the store knows", () => {
     // The STORED prefix wins over the rendered node's textContent, which carries the row's chrome.
     expect(mark.textPrefix).toBe("prefix of you-1");
     expect(mark.fraction).toBe(0.5);
+  });
+
+  // ── THE ROW ID IS NOT THE BUBBLE ID ───────────────────────────────────────────────────────────
+  // The map is filled from history rows and read with a mark id off `data-message-id`. Concierge
+  // row ids are namespaced per app load (`${sessionToken}:${bubbleId}`) so the `INSERT OR IGNORE`
+  // sink stops discarding a reloaded session's turns, so keying the map on the raw row id misses
+  // EVERY mark of the current session: no age on the card, and the rendered node's chrome standing
+  // in for the prompt. Nothing throws, which is why this case is pinned separately from the one
+  // above rather than folded into it — that one's fixture happens to use a bare id, so it stays
+  // green either way.
+  it("enriches a mark whose history row carries this load's namespaced key", async () => {
+    __resetConciergeSessionTokenForTest();
+    const AT = NOW - 3 * DAY;
+    const rowId = historyRowId("you-1");
+    expect(rowId).not.toBe("you-1"); // the whole premise of this test
+    setThreadScrubberIo({
+      historyExtent: async () => ({ oldestMs: AT, newestMs: NOW, count: 1 }),
+      promptsInRange: async () => [marker(rowId, AT)],
+    });
+    const el = fakeScroller({
+      scrollHeight: 1000,
+      clientHeight: 400,
+      rows: [["you-1", 300]], // the DOM knows the BUBBLE id, and only that
+    });
+    const h = mount({ initialScope: "all" });
+    await act(async () => {});
+    act(() => h.latest().attachScroller(el));
+    const mark = h.latest().marks[0]!;
+    expect(mark.createdAt).toBe(AT);
+    expect(mark.textPrefix).toBe(`prefix of ${rowId}`);
   });
 
   // A live bubble has a rendered row before it has a history row. It must still get a mark — the

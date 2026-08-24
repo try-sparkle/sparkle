@@ -261,9 +261,58 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
     )
 }
 
-/// INSERT the entry; a duplicate `id` (idempotent re-capture) is silently ignored.
-pub(crate) fn record_into(conn: &Connection, e: &EntryInput) -> rusqlite::Result<()> {
-    conn.execute(
+/// What one [`record_into`] call actually did — the return value that makes a NON-LANDING write
+/// observable instead of silent.
+///
+/// ── WHY THIS TYPE EXISTS (silent data loss, measured) ─────────────────────────────────────────
+/// `id` is a TEXT PRIMARY KEY minted by the FRONTEND, and this function was `INSERT OR IGNORE`
+/// returning `rusqlite::Result<()>` — the rows-changed count was read by nobody. So a second
+/// message arriving under an id that was already taken was DISCARDED with no error, no log and no
+/// return value to inspect. Measured against the founder's live DB: **199 of 200** on-screen
+/// concierge messages carried the same id as an existing row but DIFFERENT text — ten days of his
+/// own words dropped, with nothing written down anywhere. The id scheme is fixed separately; this
+/// type is what makes the drop impossible to miss if it ever recurs.
+///
+/// ── EXACTLY THREE REACHABLE STATES ────────────────────────────────────────────────────────────
+/// | `inserted` | `collided` | meaning |
+/// |---|---|---|
+/// | `true`  | `false` | the row was written. |
+/// | `false` | `false` | the id exists and its stored `text` is BYTE-IDENTICAL. Benign idempotent
+/// |         |         | re-capture (a re-render, a rehydrate, a double subscribe) — the case the
+/// |         |         | original `INSERT OR IGNORE` was designed for. |
+/// | `false` | `true`  | the id exists with DIFFERENT text. **THIS IS DATA LOSS.** An alarm, not an
+/// |         |         | expected path: it must never happen once the id fix lands. |
+///
+/// `inserted: true, collided: true` is UNREPRESENTABLE by construction — never build it.
+///
+/// The field names cross the wire as `inserted` / `collided` (both plain bools, never `Option`, so
+/// the TS side is `boolean` and no `null` is possible). `apps/desktop/shared/history-record-outcome.fixture.json`
+/// is the ONE payload both halves parse — see `record_outcome_matches_the_shared_fixture` below and
+/// `src/services/history.recordOutcome.test.ts`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordOutcome {
+    pub inserted: bool,
+    pub collided: bool,
+}
+
+/// INSERT the entry and REPORT what happened — see [`RecordOutcome`] for the three states.
+///
+/// ── WHY ONE TRANSACTION, AND WHY THE SELECT IS OFF THE HOT PATH ───────────────────────────────
+/// The common path (a fresh id) is ONE round trip: `INSERT OR IGNORE`, read the rows-changed count,
+/// done — no pre-flight `SELECT`, so this costs what it always did. Only the 0-rows-changed branch
+/// pays for a `SELECT text`, because only there is there anything to compare.
+///
+/// Both statements run inside ONE transaction so the pair is atomic. Without it a concurrent writer
+/// could delete or rewrite the row between the ignored insert and the comparison, and the verdict
+/// would describe a row that no longer exists — a TOCTOU that would report `collided` for a benign
+/// re-capture (a false alarm on the one signal that is supposed to mean "we lost your words") or,
+/// worse, benign for a real loss.
+pub(crate) fn record_into(conn: &Connection, e: &EntryInput) -> rusqlite::Result<RecordOutcome> {
+    // `unchecked_transaction` takes `&Connection`; this module hands out `&Connection` from behind
+    // the managed `Mutex<Connection>`, and every caller here is already serialized by that mutex.
+    let tx = conn.unchecked_transaction()?;
+    let changed = tx.execute(
         "INSERT OR IGNORE INTO entries
             (id, kind, source, project_id, agent_id, project_name, agent_name, text, created_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
@@ -279,7 +328,54 @@ pub(crate) fn record_into(conn: &Connection, e: &EntryInput) -> rusqlite::Result
             e.created_at,
         ],
     )?;
-    Ok(())
+
+    let outcome = if changed == 1 {
+        RecordOutcome { inserted: true, collided: false }
+    } else {
+        // 0 rows changed means the PRIMARY KEY conflicted, so the row is there; read its text and
+        // compare. `query_row` erroring `QueryReturnedNoRows` is unreachable inside the transaction
+        // (the insert only reports 0 on a conflict, and nothing else holds the write lock), but map
+        // it to the BENIGN verdict rather than the alarm: a false collision would cry data loss on
+        // a path that lost nothing, and this signal is worth nothing if it can be wrong that way.
+        let stored: Option<String> = match tx.query_row(
+            "SELECT text FROM entries WHERE id = ?1",
+            rusqlite::params![e.id],
+            |r| r.get(0),
+        ) {
+            Ok(t) => Some(t),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(err) => return Err(err),
+        };
+        match stored {
+            // Byte-identical: the idempotent re-capture this INSERT OR IGNORE was written for.
+            Some(ref t) if *t == e.text => RecordOutcome { inserted: false, collided: false },
+            Some(t) => {
+                // ── THE ALARM. NOTHING HERE MAY CARRY THE TEXT. ───────────────────────────────
+                // These rows are the founder's private chat with his own minder. The log is a file
+                // on disk that gets attached to support tickets (see support.rs), so the two texts
+                // are logged only as LENGTHS — enough to tell "the same message re-rendered" from
+                // "a genuinely different message was thrown away", and enough to find the row by
+                // id, without reproducing a word of it. Pinned by
+                // `collision_warning_never_carries_either_text`.
+                tracing::warn!(
+                    target: "history",
+                    id = %e.id,
+                    kind = %e.kind,
+                    source = %e.source,
+                    incoming_len = e.text.len(),
+                    stored_len = t.len(),
+                    created_at = e.created_at,
+                    "history: DUPLICATE id with DIFFERENT content — the incoming capture was \
+                     DISCARDED and is LOST (lengths only; content is never logged)"
+                );
+                RecordOutcome { inserted: false, collided: true }
+            }
+            None => RecordOutcome { inserted: false, collided: false },
+        }
+    };
+
+    tx.commit()?;
+    Ok(outcome)
 }
 
 /// FTS5 search over live (non-tombstoned) rows. Blank query → empty. Punctuation in the query is
@@ -688,7 +784,7 @@ fn history_db(app: &AppHandle) -> Result<tauri::State<'_, HistoryDb>, String> {
 }
 
 #[tauri::command]
-pub async fn history_record(app: AppHandle, entry: EntryInput) -> Result<(), String> {
+pub async fn history_record(app: AppHandle, entry: EntryInput) -> Result<RecordOutcome, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let db = history_db(&app)?;
         // Poison-tolerant: a panic mid-query poisons the Mutex<Connection>; the recovered guard
@@ -908,17 +1004,189 @@ mod tests {
         assert_eq!(search_in(&conn, "rust!", 50).unwrap().len(), 1);
     }
 
+    // ══ RECORD OUTCOME — a non-landing write must be OBSERVABLE ═════════════════════════════════
+    //
+    // `record_into` used to return `Result<()>`, so the three cases below were INDISTINGUISHABLE to
+    // every caller: a fresh row, a harmless re-capture, and the founder's words being thrown away
+    // all looked like `Ok(())`. Each test here asserts the SIDE EFFECT of the change — the verdict
+    // the call now reports, and (for the alarm) the warning it actually emits — not merely that the
+    // row count is 1, which was already true before any of this.
+
+    /// Read what `tracing` REALLY emitted while `body` ran, so a "we log the alarm" claim is
+    /// checked against emitted bytes rather than against the presence of a `warn!` line in source.
+    ///
+    /// `with_default` installs a THREAD-LOCAL dispatcher, which is right here only because
+    /// `record_into` is called synchronously on this same thread (audio.rs:2171 records the case
+    /// where it is not, and why that needs `set_global_default` instead).
+    fn captured_logs(body: impl FnOnce()) -> String {
+        use std::io::Write as _;
+        use std::sync::{Arc, Mutex};
+
+        /// A `MakeWriter` over a shared buffer — the idiom `concierge_lint_log` and
+        /// `claude_oneshot` already use for exactly this assertion.
+        #[derive(Clone)]
+        struct Shared(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Shared {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap_or_else(|e| e.into_inner()).extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Shared {
+            type Writer = Shared;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(Shared(Arc::clone(&buf)))
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        tracing::subscriber::with_default(subscriber, body);
+        let out = buf.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    fn stored_text(conn: &Connection, id: &str) -> String {
+        conn.query_row("SELECT text FROM entries WHERE id = ?1", rusqlite::params![id], |r| r.get(0))
+            .unwrap()
+    }
+
     #[test]
-    fn duplicate_id_is_ignored() {
+    fn fresh_id_reports_inserted_and_lands_the_row() {
         let conn = mem();
-        record_into(&conn, &entry("1", "prompt", "first text", 1000)).unwrap();
-        // INSERT OR IGNORE: same id, different text — the second write is a no-op.
-        record_into(&conn, &entry("1", "prompt", "second text", 2000)).unwrap();
-        let n: i64 = conn.query_row("SELECT COUNT(*) FROM entries", [], |r| r.get(0)).unwrap();
-        assert_eq!(n, 1);
-        // Original row survived; the FTS index still points at the original text.
-        assert_eq!(search_in(&conn, "first", 50).unwrap().len(), 1);
-        assert_eq!(search_in(&conn, "second", 50).unwrap().len(), 0);
+        let out = record_into(&conn, &entry("1", "prompt", "alpha original words", 1000)).unwrap();
+        assert_eq!(out, RecordOutcome { inserted: true, collided: false });
+        assert_eq!(count(&conn), 1);
+        assert_eq!(stored_text(&conn, "1"), "alpha original words");
+    }
+
+    #[test]
+    fn duplicate_id_with_identical_text_is_benign_and_silent() {
+        // The case `INSERT OR IGNORE` was written for: a re-render / rehydrate / double subscribe
+        // re-offers the SAME row. Nothing was lost, so this must NOT raise the alarm — a signal
+        // that fires on the benign path is worth nothing on the path that matters.
+        let conn = mem();
+        record_into(&conn, &entry("1", "prompt", "alpha original words", 1000)).unwrap();
+        let logs = captured_logs(|| {
+            let out =
+                record_into(&conn, &entry("1", "prompt", "alpha original words", 2000)).unwrap();
+            assert_eq!(out, RecordOutcome { inserted: false, collided: false });
+        });
+        assert!(logs.trim().is_empty(), "a benign re-capture must log nothing; got {logs:?}");
+        assert_eq!(count(&conn), 1);
+        assert_eq!(stored_text(&conn, "1"), "alpha original words");
+    }
+
+    #[test]
+    fn duplicate_id_with_different_text_reports_a_collision_and_warns() {
+        // THE MEASURED DEFECT: 199 of 200 on-screen concierge messages had the same id as an
+        // existing row but DIFFERENT text, and every one was dropped in silence. The row assertions
+        // below are the ORIGINAL `duplicate_id_is_ignored` pins — the discard itself is still the
+        // correct behaviour and must not change. What is new is that the call now SAYS SO.
+        let conn = mem();
+        record_into(&conn, &entry("1", "prompt", "alpha original words", 1000)).unwrap();
+        let logs = captured_logs(|| {
+            let out =
+                record_into(&conn, &entry("1", "prompt", "beta replacement lines", 2000)).unwrap();
+            assert_eq!(out, RecordOutcome { inserted: false, collided: true });
+        });
+
+        // Unchanged store: one row, still the ORIGINAL text, FTS still pointing at it.
+        assert_eq!(count(&conn), 1);
+        assert_eq!(stored_text(&conn, "1"), "alpha original words");
+        assert_eq!(search_in(&conn, "alpha", 50).unwrap().len(), 1);
+        assert_eq!(search_in(&conn, "beta", 50).unwrap().len(), 0);
+
+        // A warning was actually EMITTED — asserting only the return value would leave the whole
+        // "fail loudly" deliverable unproven.
+        assert!(logs.contains("WARN"), "expected a WARN line; got {logs:?}");
+        assert!(logs.contains("DISCARDED"), "the warning must say the capture was lost: {logs:?}");
+        // Enough to ACT on: which row, from where, and how the two sizes differ.
+        assert!(logs.contains("id=1"), "warning must name the id: {logs:?}");
+        assert!(logs.contains("kind=prompt"), "warning must name the kind: {logs:?}");
+        assert!(logs.contains("source=build"), "warning must name the source: {logs:?}");
+        assert!(logs.contains("incoming_len=22"), "incoming text LENGTH: {logs:?}");
+        assert!(logs.contains("stored_len=20"), "stored text LENGTH: {logs:?}");
+        assert!(logs.contains("created_at=2000"), "warning must name created_at: {logs:?}");
+    }
+
+    #[test]
+    fn collision_warning_never_carries_either_text() {
+        // These rows are the founder's private conversation, and the unified log is a file on disk
+        // that support.rs attaches to tickets. The alarm must be actionable WITHOUT reproducing a
+        // word of what was said — lengths, not content.
+        let conn = mem();
+        let original = "peregrine falcons nesting on the bridge";
+        let incoming = "quinoa harvest yields in the altiplano";
+        record_into(&conn, &entry("1", "prompt", original, 1000)).unwrap();
+        let logs = captured_logs(|| {
+            assert!(record_into(&conn, &entry("1", "prompt", incoming, 2000)).unwrap().collided);
+        });
+        assert!(!logs.is_empty(), "the collision must warn, or this test proves nothing");
+        assert!(!logs.contains(original), "STORED text leaked into the log: {logs:?}");
+        assert!(!logs.contains(incoming), "INCOMING text leaked into the log: {logs:?}");
+        // Not even a distinctive fragment of either.
+        assert!(!logs.contains("peregrine"), "stored text fragment leaked: {logs:?}");
+        assert!(!logs.contains("altiplano"), "incoming text fragment leaked: {logs:?}");
+    }
+
+    /// THE SEAM PIN for `RecordOutcome`, mirroring `range_row_shapes_match_the_shared_wire_fixture`
+    /// above. Both halves of a wire stay green while disagreeing — the Rust suite never sees the TS
+    /// types and vice versa — which is how a feature ships completely inert (bead sparkle-16y6h).
+    /// `apps/desktop/shared/history-record-outcome.fixture.json` is the ONE payload both suites
+    /// parse; `src/services/history.recordOutcome.test.ts` is the other half. Rename or re-case a
+    /// field on either side and BOTH go red.
+    #[test]
+    fn record_outcome_matches_the_shared_fixture() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("shared")
+            .join("history-record-outcome.fixture.json");
+        let raw = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let fixture: serde_json::Value = serde_json::from_str(&raw).expect("fixture is valid JSON");
+        assert_eq!(fixture["version"].as_i64(), Some(1), "wire version is frozen at 1");
+
+        let outcomes = fixture["outcomes"].as_array().expect("outcomes is an array");
+        assert_eq!(outcomes.len(), 3, "exactly the three reachable states are pinned");
+
+        // Round-trip EACH entry: serde must DESERIALIZE the fixture's wire object into the struct,
+        // and SERIALIZING that struct back must reproduce the fixture byte-for-byte. The second
+        // half is what a key re-cased on the Rust side fails on; the first is what a key re-cased
+        // in the FIXTURE fails on, which is what drags the TS suite red alongside it.
+        for o in outcomes {
+            let case = o["case"].as_str().expect("each entry names its case");
+            let wire = &o["wire"];
+            let parsed: RecordOutcome = serde_json::from_value(wire.clone())
+                .unwrap_or_else(|e| panic!("{case} did not deserialize into RecordOutcome: {e}"));
+            assert_eq!(
+                serde_json::to_value(parsed).unwrap(),
+                *wire,
+                "{case} drifted from apps/desktop/shared/history-record-outcome.fixture.json"
+            );
+            // …and the values are the ones the three states actually mean, so a fixture whose
+            // booleans were swapped cannot round-trip its way to green.
+            let expected = match case {
+                "inserted" => RecordOutcome { inserted: true, collided: false },
+                "duplicateIdenticalText" => RecordOutcome { inserted: false, collided: false },
+                "collidedDifferentText" => RecordOutcome { inserted: false, collided: true },
+                other => panic!("unknown fixture case {other:?} — add it here deliberately"),
+            };
+            assert_eq!(parsed, expected, "{case} carries the wrong booleans");
+        }
+
+        // `inserted: true, collided: true` is unrepresentable and must never be pinned as a state.
+        assert!(
+            !outcomes.iter().any(|o| o["wire"]["inserted"] == true && o["wire"]["collided"] == true),
+            "inserted+collided together is not a reachable state"
+        );
     }
 
     #[test]

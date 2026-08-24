@@ -20,6 +20,12 @@ import {
 } from "../stores/conciergeThreadStore";
 import type { HistoryEntry } from "./history";
 import type { ConciergeMessage } from "../components/Concierge/types";
+import {
+  conciergeSessionToken,
+  historyRowId,
+  bubbleIdForCurrentSession,
+  __resetConciergeSessionTokenForTest,
+} from "./conciergeSessionToken";
 
 const you = (id: string, text: string): ConciergeMessage =>
   ({ id, kind: "you", text }) as ConciergeMessage;
@@ -36,6 +42,8 @@ function capture() {
 
 beforeEach(() => {
   useConciergeThreadStore.setState({ chat: [] });
+  // A fresh namespace per test, so no test depends on a token another one happened to mint.
+  __resetConciergeSessionTokenForTest();
 });
 
 describe("the two invariants the search_history gate depends on", () => {
@@ -112,13 +120,20 @@ describe("what it captures, and what it declines to", () => {
     expect(recorded).toHaveLength(3);
   });
 
-  it("uses the bubble id as the row id, which is what makes dedupe structural", () => {
-    // `record_into` is INSERT OR IGNORE on this primary key, so a re-render or a second subscribe
-    // cannot produce a duplicate row. Any other id scheme silently gives up that property.
+  it("keys the row on `<sessionToken>:<bubbleId>`, NOT on the bare bubble id", () => {
+    // `record_into` is INSERT OR IGNORE on this primary key. The bubble id alone is unique only
+    // WITHIN one app load — `ConciergeHost`'s `nextId` counter restarts at 0 on reload — so using it
+    // bare made the next load's `you-1` collide with, and be silently dropped in favour of, the
+    // previous load's. Namespacing keeps the within-session dedupe (the token is constant for the
+    // load) while making the key unique across loads. See the cross-load suite at the bottom.
     const { recorded, stop } = capture();
     useConciergeThreadStore.setState({ chat: [you("bubble-42", "x")] });
     stop();
-    expect(recorded[0]!.id).toBe("bubble-42");
+    expect(recorded[0]!.id).not.toBe("bubble-42");
+    expect(recorded[0]!.id).toBe(`${conciergeSessionToken()}:bubble-42`);
+    // And the row is still resolvable back to the live bubble, which is what the scrubber rail
+    // needs — namespacing must not cost us the ability to jump to the message.
+    expect(bubbleIdForCurrentSession(recorded[0]!.id)).toBe("bubble-42");
   });
 
   it("skips RESTORED bubbles, whose ids are rewritten and so could never dedupe", () => {
@@ -281,5 +296,136 @@ describe("a streamed reply is captured at its FINAL text, not its first chunk", 
     useConciergeThreadStore.setState({ chat: [you("you-1", "what needs me?")] });
     expect(recorded.map((e) => e.text)).toEqual(["what needs me?"]);
     stop();
+  });
+});
+
+// ══ TWO APP LOADS, THE SAME BUBBLE IDS, AND ALL FOUR MESSAGES SURVIVE ════════════════════════════
+// The regression this pins ran silently for ten days and cost the founder his own words.
+//
+// `ConciergeHost.tsx` mints bubble ids from `let seq = 0; nextId(p) => `${p}-${++seq}``, a
+// MODULE-LEVEL counter that restarts at 0 on every app reload. This module used the bubble id as the
+// history row's primary key, and the Rust sink is `INSERT OR IGNORE` on that key. So load #2's
+// `you-1` was a different message under an already-taken key, and the write was discarded with no
+// error anywhere. Measured on the live DB: 199 of 200 on-screen bubbles shared an id with a row
+// holding DIFFERENT text; one whole day of conversation left zero rows.
+//
+// Nothing in the pre-existing suite above could see this — every test lives inside a single app
+// load, which is exactly the scope in which the old scheme was correct.
+describe("row ids survive an app reload that restarts the bubble counter", () => {
+  /** Run one app load's worth of conversation through the REAL capture entry point. */
+  function appLoad(record: (e: HistoryEntry) => void, chat: ConciergeMessage[]): void {
+    // A reload starts with an empty thread and a fresh subscription, same as mount.
+    useConciergeThreadStore.setState({ chat: [] });
+    const stop = startConciergeHistoryCapture({ record });
+    useConciergeThreadStore.setState({ chat });
+    stop();
+  }
+
+  it("records four DISTINCT rows, and all four texts, from two loads using ids you-1/sparkle-1", () => {
+    const recorded: HistoryEntry[] = [];
+    const record = (e: HistoryEntry) => void recorded.push(e);
+
+    appLoad(record, [you("you-1", "load one: what needs me?"), sparkle("sparkle-1", "load one: two things.")]);
+
+    // ── THE APP RELOADED ── `seq` is back at 0, so the next conversation reuses the same ids.
+    __resetConciergeSessionTokenForTest();
+
+    appLoad(record, [you("you-1", "load two: ship the fix"), sparkle("sparkle-1", "load two: on it.")]);
+
+    expect(recorded).toHaveLength(4);
+    // The MECHANISM: four keys, so nothing can be ignored as a duplicate.
+    expect(new Set(recorded.map((e) => e.id)).size).toBe(4);
+    // The DELIVERABLE: four messages. Asserting on the texts is the point — distinct ids are only
+    // how we get here, and a test that stopped at id inequality would not notice a capture that
+    // dropped a message for some other reason.
+    expect(recorded.map((e) => e.text).sort()).toEqual(
+      [
+        "load one: what needs me?",
+        "load one: two things.",
+        "load two: ship the fix",
+        "load two: on it.",
+      ].sort(),
+    );
+  });
+
+  it("SURVIVES A SINK THAT REALLY BEHAVES LIKE `INSERT OR IGNORE` — first write on a key wins", () => {
+    // The test above pushes into an array, so it can only prove the ids differ. This one models the
+    // sink's actual semantics (src-tauri/src/history.rs `record_into`, pinned there by
+    // `duplicate_id_is_ignored`): a Map keyed on the row id where a second write on a taken key is
+    // DISCARDED. That is the machine that ate the founder's messages, and it is the only shape in
+    // which the loss is visible as loss rather than as an id detail.
+    //
+    // Against the pre-fix `id: m.id` this holds 2 entries — load two's prompt and reply are gone —
+    // so it fails on the size assertion AND on the two missing texts.
+    const db = new Map<string, HistoryEntry>();
+    const insertOrIgnore = (e: HistoryEntry) => {
+      if (db.has(e.id)) return; // OR IGNORE
+      db.set(e.id, e);
+    };
+
+    appLoad(insertOrIgnore, [you("you-1", "day one prompt"), sparkle("sparkle-1", "day one reply")]);
+    __resetConciergeSessionTokenForTest();
+    appLoad(insertOrIgnore, [you("you-1", "day two prompt"), sparkle("sparkle-1", "day two reply")]);
+
+    expect(db.size).toBe(4);
+    const stored = [...db.values()].map((e) => e.text);
+    for (const text of ["day one prompt", "day one reply", "day two prompt", "day two reply"]) {
+      expect(stored).toContain(text);
+    }
+  });
+
+  it("still ignores a genuine re-write of the SAME bubble within ONE load", () => {
+    // The paired half: namespacing must not have bought cross-load uniqueness by giving up the
+    // within-load dedupe. Without this, "four rows from two loads" is also satisfied by a capture
+    // that writes a fresh id every time it sees a bubble — which would re-index the whole thread on
+    // every store write.
+    const db = new Map<string, HistoryEntry>();
+    const insertOrIgnore = (e: HistoryEntry) => {
+      if (db.has(e.id)) return;
+      db.set(e.id, e);
+    };
+
+    // Two separate subscriptions over one load, both seeing the same bubble.
+    useConciergeThreadStore.setState({ chat: [] });
+    const stopA = startConciergeHistoryCapture({ record: insertOrIgnore });
+    const stopB = startConciergeHistoryCapture({ record: insertOrIgnore });
+    useConciergeThreadStore.setState({ chat: [you("you-1", "said once")] });
+    useConciergeThreadStore.setState({ chat: [you("you-1", "said once"), sparkle("sparkle-1", "answered")] });
+    stopA();
+    stopB();
+
+    expect(db.size).toBe(2);
+  });
+
+  it("keys its own `seen` set on the namespaced id, so a reload is not mistaken for a re-render", () => {
+    // `seen` is module-local to one `startConciergeHistoryCapture` call, so the two-load tests above
+    // never exercise it across a reload. This drives ONE long-lived subscription across a token
+    // reset — the shape a capture that outlived a reload would have — and pins that the second
+    // load's identically-idded message is still recorded rather than swallowed as already-seen.
+    const recorded: HistoryEntry[] = [];
+    const stop = startConciergeHistoryCapture({ record: (e) => void recorded.push(e) });
+    useConciergeThreadStore.setState({ chat: [you("you-1", "before reload")] });
+    __resetConciergeSessionTokenForTest();
+    useConciergeThreadStore.setState({ chat: [you("you-1", "after reload")] });
+    stop();
+
+    expect(recorded.map((e) => e.text)).toEqual(["before reload", "after reload"]);
+    expect(new Set(recorded.map((e) => e.id)).size).toBe(2);
+  });
+
+  it("does not re-capture a RESTORED bubble, which its own load already wrote", () => {
+    // A restored bubble is a replay of a message a PREVIOUS load already recorded under that load's
+    // token. Capturing it now would stamp it with THIS load's token, so it could not dedupe against
+    // the original even in principle — a real duplicate row of the same words, once per restart,
+    // forever. The skip is why namespacing does not reopen the problem it used to guard.
+    const recorded: HistoryEntry[] = [];
+    const stop = startConciergeHistoryCapture({ record: (e) => void recorded.push(e) });
+    useConciergeThreadStore.setState({
+      chat: [you(`${RESTORED_ID_PREFIX}1`, "replayed from last load"), you("you-1", "typed just now")],
+    });
+    stop();
+
+    expect(recorded.map((e) => e.text)).toEqual(["typed just now"]);
+    expect(recorded[0]!.id).toBe(historyRowId("you-1"));
   });
 });

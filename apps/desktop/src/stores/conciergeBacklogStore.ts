@@ -21,6 +21,7 @@
 import { create } from "zustand";
 import type { ConciergeMessage } from "../components/Concierge/types";
 import { entriesInRange, type HistoryRangeRow } from "../services/history";
+import { bubbleIdForCurrentSession } from "../services/conciergeSessionToken";
 import {
   RESTORED_ID_PREFIX,
   useConciergeThreadStore,
@@ -106,19 +107,42 @@ export function setConciergeBacklogIo(next: Partial<ConciergeBacklogIo>): () => 
   return () => Object.assign(io, previous);
 }
 
-/** One history row, as a bubble the thread can draw. The `id` is carried VERBATIM — see below. */
+/** One history row, as a bubble the thread can draw. See {@link bubbleIdForRow} for the id. */
 export function rowToMessage(row: HistoryRangeRow): ConciergeMessage {
-  // THE ID IS THE WHOLE JUMP MECHANISM, so it is copied and never re-minted or prefixed.
-  //
-  // For `source: "concierge"` the history row id IS the concierge message id:
-  // `conciergeHistoryCapture.conversationEntry` writes `m.id` straight through. That is what lets a
-  // marker id off the rail be handed to `ConciergeThread`'s `jumpTo`, which scans for
-  // `[data-message-id]` — the same string, end to end. Prefixing these (the way `rehydrateThread`
-  // has to, because it is mixing restored bubbles with ids a live session will mint) would break the
-  // rail for every message it pages in, and nothing would fail loudly.
+  const id = bubbleIdForRow(row.id);
   return row.kind === "prompt"
-    ? { id: row.id, kind: "you", text: row.text }
-    : { id: row.id, kind: "sparkle", text: row.text, settled: true };
+    ? { id, kind: "you", text: row.text }
+    : { id, kind: "sparkle", text: row.text, settled: true };
+}
+
+/**
+ * A history row id, as the bubble id the live thread would know it by.
+ *
+ * ── THE ID IS THE WHOLE JUMP MECHANISM ─────────────────────────────────────────────────────────
+ * A marker id off the rail is handed to `ConciergeThread`'s `jumpTo`, which scans for
+ * `[data-message-id]` — so whatever this returns has to be the same string the bubble renders, end
+ * to end. It also has to be the string the LIVE thread uses, because `dedupePairsAgainstLive` finds
+ * an already-visible turn by a set membership test on exactly these ids.
+ *
+ * ── WHY THIS IS NO LONGER THE IDENTITY IT ONCE WAS ─────────────────────────────────────────────
+ * It used to be, and this function used to be `row.id` verbatim: `conciergeHistoryCapture` wrote the
+ * bubble id straight through as the row's primary key. That is precisely the defect that lost ten
+ * days of the founder's messages — `ConciergeHost` mints bubble ids from a counter that RESTARTS AT
+ * 0 on every app reload, so the second load's `you-1` collided with the first's in an
+ * `INSERT OR IGNORE` sink and was dropped. Row ids are now namespaced per app load,
+ * `${sessionToken}:${bubbleId}` (see `services/conciergeSessionToken`).
+ *
+ * So the storage key and the bubble id have come apart, and this is the ONE place that puts them
+ * back together. `bubbleIdForCurrentSession` returns the bare bubble id for a row THIS app load
+ * wrote — which is what makes a turn the reader can already see dedupe against its live twin
+ * instead of rendering a second time — and `null` for a previous load's row or a legacy
+ * un-namespaced one, where the row id is itself unique and stable and is kept as the bubble id.
+ *
+ * Getting this wrong fails SILENTLY in both directions: too clever and the rail stops jumping, too
+ * literal and every turn of the current session draws twice above the live thread.
+ */
+export function bubbleIdForRow(rowId: string): string {
+  return bubbleIdForCurrentSession(rowId) ?? rowId;
 }
 
 /**
@@ -139,8 +163,10 @@ function textKey(kind: string, text: string): string {
  * Drop every backlog entry the live thread is ALREADY showing.
  *
  * ── TWO MATCHES, BECAUSE A RESTORED BUBBLE HAS LOST ITS ID ─────────────────────────────────────
- * The easy half is by id: a turn from this session is in `chat` under the same id its history row
- * carries, so a set membership test finds it.
+ * The easy half is by id: a turn from this session is in `chat` under the same id
+ * {@link bubbleIdForRow} recovers from its history row, so a set membership test finds it. That
+ * recovery is load-bearing here, not cosmetic — the row's own primary key is namespaced per app
+ * load and would match nothing.
  *
  * The half that is easy to get wrong is the RESTORED thread. `rehydrateThread` re-ids every
  * persisted bubble as `restored:<i>` — deliberately, so a replayed message cannot collide with an id

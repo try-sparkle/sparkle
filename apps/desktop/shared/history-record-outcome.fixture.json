@@ -1,0 +1,42 @@
+{
+  "version": 1,
+  "_why": [
+    "ONE fixture, parsed by BOTH halves of the history_record Rust->TS seam.",
+    "src-tauri/src/history.rs asserts serde PRODUCES and CONSUMES exactly these objects for",
+    "RecordOutcome; src/services/history.recordOutcome.test.ts asserts parseRecordOutcome READS",
+    "them and yields the same two booleans. Change the key casing on one side and BOTH suites go",
+    "red together -- which is the entire point. AGENTS.md records the alternative (bead",
+    "sparkle-16y6h): two agents built the two halves of a wire against a frozen field list, both",
+    "suites passed, the merge was clean, and the shipped feature never once ran.",
+    "",
+    "THE THREE STATES ARE THE WHOLE REACHABLE SPACE. history_record used to be INSERT OR IGNORE",
+    "returning nothing, so a second message under an already-taken id was discarded with no error,",
+    "no log and no return value -- 199 of 200 on-screen concierge messages in the founder's live DB",
+    "had the same id as an existing row but DIFFERENT text. `collided` is the alarm for exactly",
+    "that. `{inserted: true, collided: true}` is UNREPRESENTABLE and is deliberately NOT here.",
+    "",
+    "NO NULLS, BY CONSTRUCTION. Both fields are plain Rust bools, never Option, so serde always",
+    "emits both keys with a true/false value and the TS side is `boolean`, not `boolean | null`.",
+    "If either ever becomes an Option, it crosses the wire as an EXPLICIT null (never as an absent",
+    "key), the TS type must become `boolean | null` -- NOT `boolean | undefined`, which excludes",
+    "null -- and a null case must be added to this file. See shared/history-range-wire.json's",
+    "historyExtentEmpty for that shape."
+  ],
+  "outcomes": [
+    {
+      "case": "inserted",
+      "why": "A fresh id: the row was written.",
+      "wire": { "inserted": true, "collided": false }
+    },
+    {
+      "case": "duplicateIdenticalText",
+      "why": "The id exists and its stored text is byte-identical. Benign idempotent re-capture (a re-render, a rehydrate, a double subscribe) -- the case INSERT OR IGNORE was designed for. NOT an alarm.",
+      "wire": { "inserted": false, "collided": false }
+    },
+    {
+      "case": "collidedDifferentText",
+      "why": "The id exists with DIFFERENT text. THIS IS DATA LOSS: the incoming capture was discarded. Rust logs a WARN carrying the id, kind, source and the two text LENGTHS -- never the text itself, because these rows are private chat.",
+      "wire": { "inserted": false, "collided": true }
+    }
+  ]
+}

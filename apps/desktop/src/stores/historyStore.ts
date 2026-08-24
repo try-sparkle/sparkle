@@ -9,6 +9,7 @@ import {
   pruneHistory,
   type HistoryEntry,
   type HistoryHit,
+  type RecordOutcome,
   type RetentionTier,
 } from "../services/history";
 import { getRetentionEntitlement } from "../services/credits";
@@ -41,8 +42,14 @@ interface HistoryState {
   results: HistoryHit[];
   entitlement: RetentionTier;
   searching: boolean;
-  /** Fire-and-forget capture; never throws into the caller. */
-  record: (e: HistoryEntry) => Promise<void>;
+  /** Fire-and-forget capture; never throws into the caller.
+   *
+   *  It DOES return, though: the {@link RecordOutcome} says whether the row landed, was a benign
+   *  identical re-capture, or COLLIDED — an existing row under the same id holding different text,
+   *  which means the incoming words were thrown away. A caller that wants to know can await it; one
+   *  that doesn't can keep ignoring it exactly as before. A failed write still reports the neutral
+   *  outcome rather than throwing, because this runs inside a zustand listener chain. */
+  record: (e: HistoryEntry) => Promise<RecordOutcome>;
   /** Update the query immediately and schedule a debounced search. */
   setQuery: (q: string) => void;
   /** Run a search now. Blank query clears results without hitting the backend. */
@@ -66,9 +73,12 @@ export const useHistoryStore = create<HistoryState>((set, get) => ({
 
   record: async (e) => {
     try {
-      await recordHistory(e);
+      return await recordHistory(e);
     } catch {
-      // Capture is best-effort: a failed write must never surface to the chat / agent flow.
+      // Capture is best-effort: a failed write must never surface to the chat / agent flow. The
+      // neutral verdict is the honest one here — nothing was written, and nothing is known to have
+      // been overwritten either, so this must not read as a collision.
+      return { inserted: false, collided: false };
     }
   },
 
