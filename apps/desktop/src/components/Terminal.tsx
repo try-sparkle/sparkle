@@ -71,6 +71,10 @@ import {
 import { PtyAckBatcher, PtyFlowController } from "./terminalFlow";
 import { SelectionPopup } from "./SelectionPopup";
 import {
+  SELECTION_AFFORDANCE_ATTR,
+  SELECTION_AFFORDANCE_OWN,
+} from "./understandGesture";
+import {
   forceFullRepaint,
   settleRepaintPlan,
   releaseGlContext,
@@ -1988,7 +1992,15 @@ export function Terminal({
           focused node answers both questions — see voice/dictationFocus.focusedTerminalAgentId. */}
       <div
         ref={containerRef}
-        {...{ [TERMINAL_SURFACE_ATTR]: "", [TERMINAL_AGENT_ATTR]: agentId }}
+        {...{
+          [TERMINAL_SURFACE_ATTR]: "",
+          [TERMINAL_AGENT_ATTR]: agentId,
+          // THIS PANE ANSWERS ITS OWN SELECTIONS — a finished selection here is copied by
+          // `copySelectionToClipboard` and answered by the ten-action `SelectionPopup`. Declared
+          // rather than inferred so drag-to-understand's global affordance stands down here; see
+          // understandGesture.ts for why this is an attribute and not a selector list kept there.
+          [SELECTION_AFFORDANCE_ATTR]: SELECTION_AFFORDANCE_OWN,
+        }}
         style={{ width: "100%", height: "100%", overflow: "hidden" }}
       />
       {/* Affordance over the still-blank terminal. Loading: from spawn until the first PTY byte

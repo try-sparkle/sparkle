@@ -18,6 +18,10 @@ import type { AgentTab, Project } from "../types";
 import { useProjectStore } from "../stores/projectStore";
 import { ConciergeHost } from "./ConciergeHost";
 import { ColumnPullTab, publishColumnWidthVar, HEADER_H } from "./ColumnPullTab";
+import {
+  SELECTION_AFFORDANCE_ATTR,
+  SELECTION_AFFORDANCE_OWN,
+} from "./understandGesture";
 import { CommandPalette, PaletteTrigger, useCommandPalette } from "./Concierge";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { focusedBeadIdForSide, useUiStore } from "../stores/uiStore";
@@ -2164,7 +2168,15 @@ export function Workspace() {
             must have a rail immediately either side of it. Keeping this out of that group means
             nothing has to special-case it. */}
         <style>{`[data-concierge-box] > section{width:100% !important}`}</style>
-        <div data-concierge-root style={{ display: "flex", minHeight: 0 }}>
+        <div
+          data-concierge-root
+          // THIS COLUMN ANSWERS ITS OWN SELECTIONS — `useCopyOnSelection` copies a finished
+          // selection here and toasts it, and `useQuoteOnSelection` offers the quote chiclet.
+          // Both were tuned over several roborev rounds against a real founder bug report, so
+          // drag-to-understand stands down rather than stacking a third affordance on top.
+          {...{ [SELECTION_AFFORDANCE_ATTR]: SELECTION_AFFORDANCE_OWN }}
+          style={{ display: "flex", minHeight: 0 }}
+        >
         {pairCount === 2 && (
           <ColumnPullTab
             // IT OWNS THE CONCIERGE NOW, NOT THE LEFT PAIR — this is "I want to drag out from the

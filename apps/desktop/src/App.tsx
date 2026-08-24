@@ -42,6 +42,7 @@ import { UpdateBanner } from "./components/UpdateBanner";
 import { StaleBuildBanner } from "./components/StaleBuildBanner";
 import { AccountSwitchHost } from "./components/AccountSwitchHost";
 import { HintOverlay } from "./components/HintOverlay";
+import { DragToUnderstand } from "./components/DragToUnderstand";
 import { RoborevConsentModal } from "./components/RoborevConsentModal";
 import { BuilderIndexConsentModal } from "./components/BuilderIndexConsentModal";
 import { StraudeConsentModal } from "./components/StraudeConsentModal";
@@ -751,6 +752,12 @@ export function App() {
         {/* Vimium-style keyboard hints: a clean ⌘ tap overlays gold chiclets on the primary
             controls. Mounted last so its portal sits above the whole UI. */}
         <HintOverlay />
+        {/* DRAG-TO-UNDERSTAND, rung one (epic sparkle-0kbf4s): drag over any text and a copy
+            affordance offers itself. Mounted ONCE, here, because the gesture is deliberately not
+            scoped to a container — the founder's claim is that you can "click and drag over
+            ANYTHING". Surfaces that already answer their own selections (the terminal, the concierge
+            thread) opt out with `data-selection-affordance="own"`; see understandGesture.ts. */}
+        <DragToUnderstand />
         </AuthGate>
       </ReadinessGate>
     </AppBoot>
