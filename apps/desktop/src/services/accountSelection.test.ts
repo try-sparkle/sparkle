@@ -1366,13 +1366,14 @@ describe("a fleet preference / pause pointing at a DEFINITELY-expired login fall
     expect(chosen?.id).toBe("live");
   });
 
-  it("does not route a non-sticky spawn to a PAUSED-frozen account when its login is dead", async () => {
-    // The pause gate — the symmetric half, separately covered per sparkle-50m03 (test each site). A
-    // freeze is routed through pickAccount's pin slot too, so without the dead-login gate in
-    // `usablePausedAccount` a pause frozen onto an expired account keeps spawning agents there to 401.
+  it("HOLDS a non-sticky spawn while paused instead of routing it anywhere", async () => {
+    // The pause is now a SPEND HALT, not a "freeze onto the leading account": a brand-new non-sticky
+    // agent is HELD outright while paused, so it is never routed to a frozen account at all — dead
+    // login or otherwise — and the spawn path refuses to start rather than spending on the default.
     pauseRotation("dead", 40_000_000);
-    const { chosen } = await chooseAccountForAgent("agent-y", { now: 40_000_000 });
-    expect(chosen?.id).toBe("live");
+    const { chosen, held } = await chooseAccountForAgent("agent-y", { now: 40_000_000 });
+    expect(chosen).toBeNull();
+    expect(held).toBe(true);
   });
 });
 

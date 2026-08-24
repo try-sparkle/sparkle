@@ -34,7 +34,7 @@ import { getAccountUsageLive } from "./accountUsage";
 // The user's own steering of the pool: the accounts taken out of rotation from the accounts screen,
 // and the fleet-wide pause. Both read through localStorage on every call — see `rotationState.ts` for
 // why that discipline, and why neither is allowed to block a spawn.
-import { rotationOutIds, rotationPause } from "./rotationState";
+import { rotationOutIds, isRotationPaused } from "./rotationState";
 import { claudeSessionAccounts, checkClaudeAuthStatus, authIsDefinitelyExpired } from "../preflight";
 import { switchRecommendation, type Ceiling } from "./headroom";
 import type { ConciergeFailureKind } from "../engine/conciergeFailureNotice";
@@ -467,7 +467,7 @@ export async function chooseAccountForAgent(
      *  unchanged. `leastBad` still returns the clobbered default when it is genuinely the only account. */
     avoidClobberedDefault?: boolean;
   } = {},
-): Promise<{ chosen: Account | null; state: AccountState }> {
+): Promise<{ chosen: Account | null; held?: boolean; state: AccountState }> {
   const state = await loadAccountState(opts);
   // RIDE OUT A HICCUP, HERE, so both callers of a key get the same answer.
   //
@@ -590,29 +590,37 @@ export async function chooseAccountForAgent(
     pinnedAccountId || preferredAccountId
       ? undefined
       : firstUsableHolder(holders, state, base, opts.now)?.id;
-  // ROTATION IS PAUSED — the fleet-wide control the founder asked for ("I could pause the fleet
-  // rotation… it pauses the rotation across all of them").
+  // ── ROTATION PAUSED = SPEND HALT ─────────────────────────────────────────────────────────────
+  // The founder's fleet-wide pause (the accounts-screen "rotation active / paused" toggle) is a SPEND
+  // SWITCH, not a re-ranking freeze. While it is on, a brand-new rotation spawn is HELD rather than
+  // handed an account: no new build agent starts and no new account spend begins until Restart. This
+  // supersedes the earlier "freeze onto the leading account" reading — that kept sending new agents
+  // (and kept spending) while paused, which is the opposite of what a spend cap needs.
   //
-  // WHAT PAUSING MEANS, precisely, because the word admits a much worse reading. It does NOT stop
-  // spawns: a glance-level toggle that silently takes the fleet down is the one outcome nobody would
-  // forgive, and "pause" is not what anyone would call it. It stops the thing rotation actually DOES
-  // — re-ranking accounts by headroom on every spawn — and keeps sending new agents to the account
-  // rotation was on when it was paused.
+  // WHAT IT DELIBERATELY DOES NOT TOUCH — each carve-out is a gate this resolver already draws above,
+  // so pausing changes ONLY which brand-new build agents may start:
+  //   • an already-running agent — it is never re-evaluated here, so the pause cannot interrupt it;
+  //   • an agent RESUMING its own conversation (transcript affinity) — that is an existing agent, and
+  //     holding it would strand the very work a spend pause was never meant to reach;
+  //   • a hand PIN or the fleet PREFERENCE — deliberate "send it here" human choices outrank the
+  //     pause, exactly as they outrank every other rotation decision here (and as the header states);
+  //   • the STICKY keys (concierge / Improve Sparkle) — holding those would wedge the app itself,
+  //     which a spend pause must never do; they keep their own control in the accounts modal. This is
+  //     the same exemption `usablePreferredAccount` draws at its condition 1.
   //
-  // FOURTH IN PRECEDENCE, below transcript affinity, and that placement is the load-bearing part. A
-  // freeze is a statement about WHICH ACCOUNT ROTATION PICKS, and transcript affinity is not a
-  // rotation decision at all — it is the only account that can resume an agent's existing
-  // conversation. Ranking the freeze above it would answer "don't re-rank the pool" by silently
-  // starting agents blank, which is the failure `transcript` exists to prevent and the one no UI
-  // surface can show.
-  //
-  // Degrades exactly like the preference above it: `usablePausedAccount` drops a frozen id that no
-  // longer names a real, signed-in, unexhausted account, and the spawn falls through to ordinary
-  // auto-pick. A pause whose target went away must not strand the fleet.
-  const pausedAccountId =
-    pinnedAccountId || preferredAccountId || transcriptAccountId
-      ? undefined
-      : usablePausedAccount(agentId, state, base.signedInIds, opts.now);
+  // Returns `chosen: null` WITH `held: true` so the spawn path can tell "hold, do not start" apart
+  // from "no accounts configured" (both are chosen: null) and REFUSE to spawn — rather than falling
+  // through to the DEFAULT account, which would spend the very quota the pause exists to protect.
+  if (
+    isRotationPaused() &&
+    !isStickyAccountKey(agentId) &&
+    !pinnedAccountId &&
+    !preferredAccountId &&
+    !transcriptAccountId
+  ) {
+    logSelection(agentId, null, "paused-hold", state, candidates);
+    return { chosen: null, held: true, state };
+  }
   const chosen = pinnedAccountId
     ? pickAccount(state.accounts, state.usage, { ...base, pinnedAccountId })
     : preferredAccountId
@@ -625,24 +633,20 @@ export async function chooseAccountForAgent(
             ...base,
             pinnedAccountId: transcriptAccountId,
           })
-        : pausedAccountId
-          ? pickAccount(state.accounts, state.usage, { ...base, pinnedAccountId: pausedAccountId })
-          : autoPick(agentId, state, base);
+        : autoPick(agentId, state, base);
   const reason: SelectionReason = pinnedAccountId
     ? "pinned"
     : preferredAccountId
       ? "preferred"
       : transcriptAccountId
         ? "transcript"
-        : pausedAccountId
-          ? "paused"
-          : !chosen
-            ? "none"
-            : isStickyAccountKey(agentId) && previousSticky === chosen.id
-              ? "sticky"
-              : candidates != null && candidates.length === 0
-                ? "fallback"
-                : "auto";
+        : !chosen
+          ? "none"
+          : isStickyAccountKey(agentId) && previousSticky === chosen.id
+            ? "sticky"
+            : candidates != null && candidates.length === 0
+              ? "fallback"
+              : "auto";
   // NEVER SILENT. We are about to launch under an account that does NOT hold this agent's
   // conversation, so it will come up FRESH — the exact state that read as "spawned with no task",
   // and the one thing no UI surface can show (the row, the header and the brief all keep rendering).
@@ -985,56 +989,9 @@ function usablePreferredAccount(
   return preferred;
 }
 
-/** The account rotation was FROZEN onto when it was paused, if it is still safe to honour — else
- *  undefined, and the caller falls through to auto-pick.
- *
- *  THE SAME GATE, FOR A WEAKER CLAIM. `usablePreferredAccount` above guards a human saying "run my
- *  agents HERE"; this guards a human saying "stop moving them", which names an account only as a side
- *  effect. So every way that gate can fail safely, this one must too — an unreadable backend, an
- *  account that was removed, a login that went away, an observed rate limit — and each falls through
- *  to ordinary auto-pick rather than stranding the spawn. A pause is a convenience; it is never worth
- *  a dead agent.
- *
- *  STICKY KEYS ARE EXEMPT, exactly as they are from the preference (condition 1 there). The concierge
- *  and Improve Sparkle are sticky by design and moving the concierge mid-conversation re-probes both
- *  session pointers. Pausing rotation is a statement about the AGENT FLEET; those two have their own
- *  explicit control in the accounts modal.
- *
- *  NOT PRUNED HERE when the frozen account is gone, for the reason spelled out at (3) above: `state`
- *  is served from a cache that another window may not have invalidated, so a silent, irreversible
- *  write to shared `localStorage` derived from a stale read is exactly the wrong move. Declining to
- *  act is enough — the pause simply stops biting, and the header still says rotation is paused, which
- *  is true. */
-function usablePausedAccount(
-  agentId: string,
-  state: AccountState,
-  signedInIds: readonly string[],
-  now: number | undefined,
-): string | undefined {
-  if (isStickyAccountKey(agentId)) return undefined;
-  const pause = rotationPause();
-  if (!pause?.accountId) return undefined; // not paused, or paused with nothing frozen
-  const frozen = pause.accountId;
-  if (state.failed) return undefined;
-  if (!state.accounts.some((a) => a.id === frozen)) return undefined;
-  // TAKEN OUT OF ROTATION BEATS THE FREEZE, and this gate cannot be left to `partitionAccounts`:
-  // the frozen id is routed through `pickAccount`'s pin slot, which returns a pinned account
-  // OUTRIGHT, before the partition runs. Without this, one gesture produces the exact contradiction
-  // this whole screen was rebuilt to remove — pause the fleet while it is on X, then take X out from
-  // its kebab, and every spawn keeps landing on X under a card reading "out of rotation — you took
-  // it out". A pause names an account only as a SIDE EFFECT of declining to re-rank, so it has no
-  // standing to override a choice the user made about that account directly.
-  if (rotationOutIds().has(frozen)) return undefined;
-  if (signedInFilterApplies(state.accounts, signedInIds) && !signedInIds.includes(frozen))
-    return undefined;
-  if (isAccountExhausted(state.usage, frozen, now ?? Date.now())) return undefined;
-  // A DEAD LOGIN fails the freeze the same way it fails the preference above, and for the same reason:
-  // the frozen id is routed through `pickAccount`'s pin slot, which overrides the demotion. Without
-  // this, a pause frozen onto an account whose login later expires keeps spawning every new agent
-  // there to 401. (roborev 67535)
-  if (deadLoginIds().has(frozen)) return undefined;
-  return frozen;
-}
+// The fleet-wide pause is no longer a "freeze onto the leading account" — it is a SPEND HALT that
+// holds brand-new rotation spawns outright (see the pause gate in `chooseAccountForAgent`). The
+// old `usablePausedAccount` helper that resolved a frozen target was removed with that change.
 
 // ── Consumers that have no agent pane ────────────────────────────────────────────────────────
 //

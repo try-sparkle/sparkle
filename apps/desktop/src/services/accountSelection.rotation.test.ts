@@ -54,9 +54,6 @@ const USAGE = [
   { id: "cloud", tokens5h: 90, tokens7d: 900, exhaustedUntil: null as number | null },
 ];
 
-// SECONDS on the wire — `getUsage` multiplies by 1000. A fixture written in ms lands ~1000× further
-// out than intended and quietly turns "already reset" into "exhausted for two months".
-const FUTURE_S = NOW / 1000 + 60;
 
 const identity = (id: string) => ({
   id,
@@ -234,110 +231,67 @@ describe("taking an account OUT of rotation", () => {
   });
 });
 
-describe("pausing rotation", () => {
-  it("freezes new agents onto the account it was paused on", async () => {
-    pauseRotation("cloud", NOW);
-    // `cloud` is the BUSIEST account, so auto-pick would never choose it. Naming it proves the
-    // freeze decided the outcome.
-    expect((await resolve("agent-1"))?.id).toBe("cloud");
-    // …and the ledger records the freeze DISTINCTLY from a preference or an ordinary pick. "The
-    // founder paused the fleet" and "this account kept winning" produce identical-looking runs of
-    // rows otherwise.
-    expect(ledger().at(-1)).toMatchObject({ accountId: "cloud", reason: "paused" });
-  });
+describe("the fleet-wide pause = SPEND HALT", () => {
+  // `resolve` above drops `held`; this surfaces it so a HOLD (chosen: null, held: true) can be told
+  // apart from a fall-through to the default (chosen: null, held: falsy).
+  async function resolveFull(key: string) {
+    invalidateAccountState();
+    return chooseAccountForAgent(key, { now: NOW });
+  }
 
-  it("goes back to ranking by headroom when resumed", async () => {
-    pauseRotation("cloud", NOW);
-    expect((await resolve("agent-1"))?.id).toBe("cloud");
-    resumeRotation();
-    expect((await resolve("agent-2"))?.id).toBe("work");
-  });
-
-  // ── EVERY WAY THE FREEZE HAS TO FAIL SAFELY ──────────────────────────────────────────────────
-  // A pause is a convenience. It is never worth a dead agent, so each of these falls through to
-  // ordinary auto-pick rather than honouring a target that cannot serve.
-
-  it("falls through to auto-pick when the frozen account was signed out", async () => {
-    mockBackend({ notSignedIn: ["cloud"] });
-    pauseRotation("cloud", NOW);
-    expect((await resolve("agent-1"))?.id).toBe("work");
-  });
-
-  it("falls through to auto-pick when the frozen account hit a real rate limit", async () => {
-    mockBackend({
-      usage: USAGE.map((u) => (u.id === "cloud" ? { ...u, exhaustedUntil: FUTURE_S } : u)),
-    });
-    pauseRotation("cloud", NOW);
-    expect((await resolve("agent-1"))?.id).toBe("work");
-  });
-
-  it("falls through to auto-pick when the frozen account no longer exists", async () => {
-    pauseRotation("deleted-account", NOW);
-    expect((await resolve("agent-1"))?.id).toBe("work");
-  });
-
-  it("falls through to auto-pick when paused with nothing frozen", async () => {
+  it("HOLDS a brand-new agent — no account handed out — while paused", async () => {
     pauseRotation(null, NOW);
-    expect((await resolve("agent-1"))?.id).toBe("work");
+    const { chosen, held } = await resolveFull("agent-1");
+    // NOT "picked the busy account" and NOT "fell through to the default": nothing is chosen at all,
+    // and `held` says WHY, so the spawn path can refuse to start rather than spending on the default.
+    expect(chosen).toBeNull();
+    expect(held).toBe(true);
+    // Recorded DISTINCTLY from "none" (no accounts configured) so a reader can tell a deliberate
+    // fleet hold apart from an absence of accounts.
+    expect(ledger().at(-1)).toMatchObject({ reason: "paused-hold" });
   });
 
-  it("does not move the sticky consumers — they have their own control", async () => {
-    // Moving the concierge mid-conversation nulls both session pointers and re-probes. Pausing
-    // ROTATION is a statement about the agent fleet; the concierge and Improve Sparkle are sticky by
-    // design and are steered from their own pins in the accounts modal.
-    pauseRotation("cloud", NOW);
-    expect((await resolve(CONCIERGE_ACCOUNT_KEY))?.id).toBe("work");
+  it("holds NOTHING once rotation is running again — the paired negative", async () => {
+    // The SAME brand-new agent, with no pause set, is assigned normally. This is what makes the hold
+    // above evidence about the PAUSE and not about the agent or the fixture.
+    const { chosen, held } = await resolveFull("agent-1");
+    expect(held).toBeFalsy();
+    expect(chosen?.id).toBe("work");
   });
 
-  it("taking the FROZEN account out of rotation beats the freeze", async () => {
-    // ONE GESTURE produces the worst contradiction these two controls can make together: pause the
-    // fleet while it is on `cloud`, then take `cloud` out from its kebab. The frozen id is routed
-    // through `pickAccount`'s PIN slot, which returns a pinned account outright — before
-    // `partitionAccounts` and therefore before `outOfRotationIds` — so without an explicit gate every
-    // spawn keeps landing on a card that reads "out of rotation — you took it out".
-    //
-    // A pause names an account only as a side effect of declining to re-rank. It has no standing to
-    // override a choice the user made about that account directly.
-    pauseRotation("cloud", NOW);
-    setAccountInRotation("cloud", false);
-    expect((await resolve("agent-1"))?.id).toBe("work");
-    // The paired positive is the freeze test at the top of this block: without the opt-out, the same
-    // pause DOES land on `cloud`. So this is evidence about the gate, not about the freeze being
-    // broken generally.
+  it("the same agent gets an account the moment rotation is restarted", async () => {
+    pauseRotation(null, NOW);
+    expect((await resolveFull("agent-1")).held).toBe(true);
+    resumeRotation();
+    const { chosen, held } = await resolveFull("agent-1");
+    expect(held).toBeFalsy();
+    expect(chosen?.id).toBe("work");
   });
 
-  it("honours the opt-out on a sticky consumer's FIRST pick, where nothing is stranded", async () => {
-    // The exemption below is about not MOVING a live session. It is not a licence to ignore the
-    // user's choice when there is no session yet — and this branch is not exotic:
-    // `stickySelections` is process-lifetime memory, so it runs on the concierge's first turn after
-    // every single launch. Exempting the whole options object would put the concierge on `work`
-    // while `work`'s own card reads "out of rotation, you took it out".
-    setAccountInRotation("work", false);
-    expect((await resolve(CONCIERGE_ACCOUNT_KEY))?.id).toBe("def");
+  it("does NOT hold the sticky consumers — a spend pause must not wedge the app", async () => {
+    // Pausing rotation is a statement about the BUILD-AGENT fleet. The concierge / Improve Sparkle are
+    // sticky by design; holding them would freeze the whole app, so they pick normally while paused.
+    pauseRotation(null, NOW);
+    const { chosen, held } = await resolveFull(CONCIERGE_ACCOUNT_KEY);
+    expect(held).toBeFalsy();
+    expect(chosen?.id).toBe("work");
   });
 
-  it("does not relocate a sticky consumer when its account is taken out of rotation", async () => {
-    // `outOfRotationIds` also reaches the branch that decides whether a sticky key KEEPS its account.
-    // Relocating the concierge mid-conversation nulls both session pointers and re-probes, with no
-    // stale-resume retry by design — until now only OBSERVED facts (a rate limit, real utilization)
-    // could trigger that, and a menu click is not one.
-    //
-    // Establish the sticky key on `work` first, THEN take `work` out. Asserting on a fresh key would
-    // pass whatever the exemption did, since there would be no existing account to keep.
-    expect((await resolve(CONCIERGE_ACCOUNT_KEY))?.id).toBe("work");
-    setAccountInRotation("work", false);
-    expect((await resolve(CONCIERGE_ACCOUNT_KEY))?.id).toBe("work");
-    // The paired positive, in the same state: an ORDINARY agent does move off it. Without this the
-    // exemption could be doing nothing at all and the assertion above would still hold.
-    expect((await resolve("agent-ordinary"))?.id).toBe("def");
+  it("does NOT hold an agent a human PINNED — an explicit per-agent choice outranks the pause", async () => {
+    setPin("agent-1", "cloud");
+    pauseRotation(null, NOW);
+    const { chosen, held } = await resolveFull("agent-1");
+    expect(held).toBeFalsy();
+    // `cloud` is the BUSIEST account, so naming it proves the pin decided the outcome, not auto-pick.
+    expect(chosen?.id).toBe("cloud");
   });
 
-  it("an activated account still outranks the freeze", async () => {
-    // Precedence, asserted rather than assumed. The preference is a human naming ONE account; the
-    // pause is a human declining to name one. The more specific instruction wins.
+  it("does NOT hold when a fleet PREFERENCE is active — the override outranks the pause", async () => {
     setPreferredAccountId("def");
-    pauseRotation("cloud", NOW);
-    expect((await resolve("agent-1"))?.id).toBe("def");
+    pauseRotation(null, NOW);
+    const { chosen, held } = await resolveFull("agent-1");
+    expect(held).toBeFalsy();
+    expect(chosen?.id).toBe("def");
     expect(ledger().at(-1)?.reason).toBe("preferred");
   });
 });

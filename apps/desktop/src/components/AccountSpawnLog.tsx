@@ -46,6 +46,9 @@ const REASON_LABEL: Record<SelectionReason, string> = {
   // Added with the `paused` SelectionReason on this branch; `Record<SelectionReason, string>` is what
   // makes the pair impossible to forget.
   paused: "rotation paused — frozen here",
+  // The spend-halt pause: no account was handed out at all, so this spawn was HELD rather than
+  // started. Distinct from "none" (no accounts configured) — the fleet was deliberately held.
+  "paused-hold": "rotation paused — new agent held",
   // Says WHY it outranked a lower usage tally, because that is the surprising part: this account was
   // not the cheapest, it is the one holding the agent's conversation. Picking any other starts the
   // agent blank.

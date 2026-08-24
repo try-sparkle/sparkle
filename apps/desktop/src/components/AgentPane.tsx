@@ -52,6 +52,7 @@ import {
   unregisterPaneAccount,
 } from "../services/paneControl";
 import { chooseAccountForAgent, loadAccountState } from "../services/accountSelection";
+import { isRotationPaused, ROTATION_CHANGED_EVENT } from "../services/rotationState";
 import { readWorkerResult } from "../pty";
 import { judgeNeedsFollowup } from "../services/turnFollowup";
 import { noteAgentSessionId, noteAgentTranscriptPath } from "../services/conciergeTools/terminal";
@@ -112,7 +113,7 @@ import { useTerminalOverlayStore } from "../stores/terminalOverlayStore";
 import { perfRender, perfMark, perfEnd, perfCancel } from "../perfTrace";
 import { registerMountedPane, unregisterMountedPane } from "../services/agentPaneRegistry";
 
-type Phase = "preparing" | "ready" | "no-claude" | "error";
+type Phase = "preparing" | "ready" | "no-claude" | "error" | "paused";
 
 // macOS default login shell (shared SHELL from claudeSpawn): we launch `claude` through
 // `zsh -l -c 'exec …'` so the agent (and the tools claude itself shells out to) inherit the user's
@@ -792,11 +793,23 @@ function AgentPaneInner({
       // is empty, and launches claude fresh while the agent's real history (and the opening brief it
       // carried) sits intact under the previous account. See accountSelection.accountsHoldingTranscript.
       // Started right after the worktree existed, so it has been running under the block above.
-      const { chosen, state } = await accountP;
+      const { chosen, held, state } = await accountP;
       perfMark(agent.id, "account resolved");
       setAccounts(state.accounts);
       setIdentities(state.identities);
       setChosenAccount(chosen);
+      // ROTATION PAUSED (the accounts-screen spend switch): the resolver HELD this brand-new
+      // agent rather than handing it an account. Do NOT spawn — that is the whole point of the
+      // pause — and do NOT mark the pane failed (it is intentionally held, not broken): a held
+      // pane must not trip `giveUpOnLaunch`, so any brief typed for it waits rather than being
+      // abandoned. It resumes automatically the instant rotation is restarted (see the
+      // ROTATION_CHANGED_EVENT effect below). Running agents never reach this prepare(), so they
+      // are untouched. Falling through here would spawn on the DEFAULT account and spend the very
+      // quota the pause exists to protect.
+      if (held) {
+        setPhase("paused");
+        return;
+      }
       chosenAccountIdRef.current = chosen?.id ?? null;
       // Publish the account this PTY will actually run under, so a global switch can tell which
       // agents have to move. Not derivable from the pin map — most agents auto-pick and have no pin.
@@ -1262,6 +1275,22 @@ function AgentPaneInner({
     return () => unregisterPaneRestart(agent.id);
   }, [agent.id]);
 
+  // AUTO-RESUME A HELD PANE. When rotation is paused, a brand-new agent is HELD in the "paused" phase
+  // (no PTY, no account spend) by chooseAccountForAgent. The moment the founder restarts rotation from
+  // the accounts screen, re-run prepare() so the agent it was holding actually starts — otherwise
+  // "Restart" would clear the pause while this pane sat held forever. Guarded on BOTH the live pause
+  // state and this pane's own phase so an unrelated pause/resume elsewhere never re-prepares a running
+  // agent. Empty deps: the refs it reads are stable and always hold the latest values.
+  useEffect(() => {
+    const onRotationChange = () => {
+      if (phaseRef.current === "paused" && !isRotationPaused()) {
+        void prepareRef.current();
+      }
+    };
+    window.addEventListener(ROTATION_CHANGED_EVENT, onRotationChange);
+    return () => window.removeEventListener(ROTATION_CHANGED_EVENT, onRotationChange);
+  }, []);
+
   // A spawn that ERRORS or finds no Claude will never flip ptyReady, so a held prompt would dangle
   // with no outcome. Report it the moment the pane gives up (roborev 46311).
   //
@@ -1491,6 +1520,25 @@ function AgentPaneInner({
         </Centered>
       )}
       {phase === "no-claude" && <Onboarding onRetry={() => void prepare()} />}
+      {phase === "paused" && (
+        <Centered>
+          <div
+            style={{
+              color: termMuted(resolvedTheme),
+              fontSize: TERM_TYPE.body,
+              maxWidth: 480,
+              textAlign: "center",
+            }}
+          >
+            <div style={{ marginBottom: 8 }}>Rotation is paused</div>
+            <div>
+              This agent is held so no new account spend starts while the fleet is paused. It starts
+              automatically when you restart rotation from the Accounts screen. Agents already running
+              are not affected.
+            </div>
+          </div>
+        </Centered>
+      )}
       {(phase === "preparing" || (phase === "ready" && spawn)) && (
         // Relative stage: the terminal fills it; the composer floats over the bottom as an
         // overlay (so dragging the composer never resizes/reflows the terminal beneath it). The

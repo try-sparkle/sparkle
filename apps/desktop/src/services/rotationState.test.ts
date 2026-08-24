@@ -19,6 +19,7 @@ import {
   resumeRotation,
   ROTATION_OUT_STORAGE_KEY,
   ROTATION_PAUSED_STORAGE_KEY,
+  ROTATION_CHANGED_EVENT,
 } from "./rotationState";
 
 const IN = { signedIn: true, loginExpired: false, duplicate: false, manuallyOut: false };
@@ -145,6 +146,31 @@ describe("the fleet-wide pause", () => {
 
     localStorage.setItem(ROTATION_PAUSED_STORAGE_KEY, JSON.stringify({ at: "soon", accountId: 7 }));
     expect(rotationPause()).toEqual({ at: 0, accountId: null });
+  });
+});
+
+describe("ROTATION_CHANGED_EVENT", () => {
+  it("dispatches on BOTH pause and resume, so a held pane in the same window learns to re-check", () => {
+    // localStorage's own `storage` event does not fire in the window that wrote the key, and the
+    // accounts toggle and the build-agent panes share one window — so without this same-window event a
+    // pane HELD by the pause would never learn that Restart was clicked. Assert both edges: a resume
+    // that stayed silent would strand every held agent forever. This suite runs under node (no DOM), so
+    // stub `dispatchEvent` — the production guard short-circuits when it is absent, which is why the
+    // pause still works headless.
+    const types: string[] = [];
+    const g = globalThis as unknown as { dispatchEvent?: (e: Event) => boolean };
+    const orig = g.dispatchEvent;
+    g.dispatchEvent = (e: Event) => {
+      types.push(e.type);
+      return true;
+    };
+    try {
+      pauseRotation(null, 1);
+      resumeRotation();
+    } finally {
+      g.dispatchEvent = orig;
+    }
+    expect(types).toEqual([ROTATION_CHANGED_EVENT, ROTATION_CHANGED_EVENT]);
   });
 });
 

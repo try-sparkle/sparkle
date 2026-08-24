@@ -2166,12 +2166,12 @@ describe("the rotation glance in the header", () => {
       expect(screen.getByTestId("rotation-state-label").textContent).toBe("rotation paused"),
     );
     expect(screen.getByTestId("rotation-headline").textContent).toBe(
-      "Rotation paused — 2 accounts available",
+      "Rotation paused — new agents are held",
     );
-    // A pause is not a stop, and the copy has to say where agents go instead — otherwise the
-    // reasonable reading is that the fleet is halted.
-    expect(screen.getByTestId("accounts-header").textContent).toMatch(
-      /New agents stay on (one|two)@example\.com until you resume/,
+    // A pause HOLDS new agents (and stops new spend) rather than freezing them onto an account — the
+    // copy must say so, or the reasonable reading is that nothing changed or that running agents died.
+    expect(screen.getByTestId("accounts-header").textContent).toContain(
+      "New agents are held — none will start, and no new account spend begins, until you restart.",
     );
 
     fireEvent.click(screen.getByTestId("rotation-toggle"));
@@ -2287,12 +2287,11 @@ describe("the rotation glance in the header", () => {
     );
   });
 
-  it("stops naming a frozen account once it is taken out of rotation", async () => {
-    // The copy half of a contradiction whose ROUTING half is fixed in `usablePausedAccount`. Pause
-    // while the fleet is on an account, then take that account out from its kebab: the freeze stops
-    // biting and every spawn falls through to the other account — so a header still reading "New
-    // agents stay on X until you resume", above X's own card reading "out of rotation", would be
-    // wrong about the one thing this line exists to state.
+  it("holds new agents while paused and never names a frozen account, even after one is taken out", async () => {
+    // The spend-halt pause names no "frozen" account — new agents are HELD regardless of which accounts
+    // are in the pool — so taking one out while paused must not change that copy or the paused state.
+    // This replaces the old "freeze onto the leading account" behaviour, where the header did name a
+    // target and had to stop naming it when the target was taken out.
     const deps = makeDeps(
       [acct("a", { nickname: "One", isDefault: true }), acct("b", { nickname: "Two" })],
       [],
@@ -2305,24 +2304,17 @@ describe("the rotation glance in the header", () => {
     await waitFor(() =>
       expect(screen.getByTestId("rotation-state-label").textContent).toBe("rotation paused"),
     );
-    // The control: it names SOME account while the freeze is real.
-    const frozen = screen.getByTestId("accounts-header").textContent ?? "";
-    const match = /New agents stay on (\S+) until you resume/.exec(frozen);
-    expect(match).not.toBeNull();
-    const frozenId = match![1] === "one@example.com" ? "a" : "b";
-
-    fireEvent.click(
-      within(await openKebab(frozenId)).getByTestId(`account-rotation-toggle-${frozenId}`),
-    );
-
-    await waitFor(() =>
-      expect(screen.getByTestId("accounts-header").textContent).toContain(
-        "Nothing was in rotation to hold them",
-      ),
-    );
+    // Held, and no account is named as frozen.
+    expect(screen.getByTestId("accounts-header").textContent).toContain("New agents are held");
     expect(screen.getByTestId("accounts-header").textContent).not.toContain("New agents stay on");
-    // Still paused — taking the target out ends the FREEZE, not the pause.
-    expect(screen.getByTestId("rotation-state-label").textContent).toBe("rotation paused");
+
+    // Take one account out; the pause is unchanged and the copy still says agents are held.
+    fireEvent.click(within(await openKebab("a")).getByTestId("account-rotation-toggle-a"));
+    await waitFor(() =>
+      expect(screen.getByTestId("rotation-state-label").textContent).toBe("rotation paused"),
+    );
+    expect(screen.getByTestId("accounts-header").textContent).toContain("New agents are held");
+    expect(screen.getByTestId("accounts-header").textContent).not.toContain("New agents stay on");
   });
 
   it("an all-EXPIRED pool points at reconnecting, not at the ⋮ menu", async () => {
@@ -2462,8 +2454,8 @@ describe("the rotation glance in the header", () => {
     await waitFor(() =>
       expect(screen.getByTestId("rotation-state-label").textContent).toBe("rotation paused"),
     );
-    // The control: with no override, the freeze is what the body reports.
-    expect(screen.getByTestId("accounts-header").textContent).toContain("New agents stay on");
+    // The control: with no override, the pause hold is what the body reports.
+    expect(screen.getByTestId("accounts-header").textContent).toContain("New agents are held");
 
     fireEvent.click(within(screen.getByTestId("account-row-b")).getByText("Manual Override"));
     expect(state.preferred).toBe("b");
@@ -2472,9 +2464,9 @@ describe("the rotation glance in the header", () => {
       expect(screen.getByTestId("accounts-header").textContent).toContain("Manual override"),
     );
     const header = screen.getByTestId("accounts-header").textContent ?? "";
-    expect(header).not.toContain("New agents stay on");
+    expect(header).not.toContain("New agents are held");
     // …and the pause is not hidden by the override winning — it is still true, and still says so.
-    expect(header).toContain("this override outranks the freeze");
+    expect(header).toContain("this override outranks the hold");
     expect(screen.getByTestId("rotation-state-label").textContent).toBe("rotation paused");
   });
 

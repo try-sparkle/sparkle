@@ -601,7 +601,6 @@ function RotationGlance({
   available,
   soleName,
   paused,
-  frozenName,
   onToggle,
   onAdd,
   adding,
@@ -624,12 +623,10 @@ function RotationGlance({
   expiredOut: number;
   takenOut: number;
   paused: boolean;
-  /** The account new agents are frozen onto while paused, or null when there was none to freeze. */
-  frozenName: string | null;
   /** The account a MANUAL OVERRIDE is sending every new agent to, or null when routing is automatic.
    *
-   *  Distinct from `frozenName` and it has to be: a pause stops re-ranking, an override replaces the
-   *  ranking with one account. The reason it is stated up here at all is that without it the header
+   *  Distinct from the pause and it has to be: a pause HOLDS new agents entirely, an override
+   *  replaces the ranking with one account. The reason it is stated up here at all is that without it the header
    *  reads "Rotation active: 2 accounts available" while a card down the list is quietly taking every
    *  spawn — the same count-contradicts-the-rows defect the count itself was fixed for, arriving
    *  from the other direction. Only ever set when the override names an account that is genuinely in
@@ -670,7 +667,7 @@ function RotationGlance({
   const headline = loading
     ? "Reading your accounts…"
     : paused
-    ? `Rotation paused — ${available} ${available === 1 ? "account" : "accounts"} available`
+    ? "Rotation paused — new agents are held"
     : available === 0
       ? // See `expiredOut` / `takenOut` for why this is a mix rather than a single cause.
         expiredOut > 0 && takenOut === 0
@@ -685,7 +682,7 @@ function RotationGlance({
         : `Rotation active: ${available} accounts available`;
 
   // ORDER IS LOAD-BEARING, and getting it wrong put two contradicting sentences on screen. The
-  // fleet-target lines (`frozenName` / `overrideName`) used to be evaluated FIRST, and once
+  // the fleet-target line (`overrideName`) used to be evaluated FIRST, and once
   // `honouredFleetTarget` was loosened to match the router it can name an account that is NOT in the
   // pool — a duplicate, or one whose live session is dead. On a one-account install with a dead
   // session and that account preferred (which the auto-switch path writes on its own), the header
@@ -719,8 +716,8 @@ function RotationGlance({
             // back in through the one state the user is most likely to be reading.
             overrideName
               ? `Every new agent still runs on ${overrideName} — the manual override outranks all of this.`
-              : frozenName
-                ? `New agents are still held on ${frozenName} by the pause — resume to let rotation pick again.`
+              : paused
+                ? "New agents are held by the pause — none will start until you restart rotation."
                 : "New agents still run on the least-bad account until then.",
           ]
             .filter(Boolean)
@@ -732,11 +729,9 @@ function RotationGlance({
         // spawn was going to Y — and an accepted `switch_all` from the concierge reaches exactly that
         // state without anyone touching this screen.
         overrideName
-        ? `Manual override: every new agent runs on ${overrideName} until you switch that card back to automatic.${paused ? " Rotation is paused, and this override outranks the freeze." : ""}`
+        ? `Manual override: every new agent runs on ${overrideName} until you switch that card back to automatic.${paused ? " Rotation is paused, and this override outranks the hold." : ""}`
         : paused
-          ? frozenName
-            ? `New agents stay on ${frozenName} until you resume.`
-            : "Nothing was in rotation to hold them, so new agents are picked as usual until you resume."
+          ? "New agents are held — none will start, and no new account spend begins, until you restart. Running agents keep going."
           : available === 1
             ? `Every agent runs on ${soleName ?? "it"} until it hits its limit. Sign in another account to enable rotation.`
             : "New agents go to whichever account has the most room left.";
@@ -753,8 +748,8 @@ function RotationGlance({
         onClick={onToggle}
         title={
           paused
-            ? "Resume rotation — go back to sending each new agent to the account with the most room."
-            : "Pause rotation — keep sending new agents to the account rotation is on now. Running agents are not moved."
+            ? "Restart rotation — resume handing accounts to new agents so the fleet can spawn again."
+            : "Pause rotation — hold new agents so no new account spend starts. Running agents keep going; restart any time."
         }
         style={{
           display: "flex",
@@ -1497,31 +1492,14 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
     if (outOfRotation.has(id)) return null;
     return isAccountExhausted(usage, id, now) ? null : a;
   };
-  const frozenAccount = honouredFleetTarget(paused?.accountId);
-  /** Pause freezes onto the account rotation is on RIGHT NOW, which is the healthiest one in the
-   *  pool — the same account the next spawn would have gone to anyway. Pausing therefore changes
-   *  nothing about the next agent and everything about the one after it, which is what "pause"
-   *  should mean. With an empty pool there is nothing to freeze onto and the pause records null,
-   *  which `usablePausedAccount` reads as "fall through to auto-pick". */
+  /** Pause is a SPEND HALT: while it is on, `chooseAccountForAgent` HOLDS every brand-new rotation
+   *  spawn instead of handing it an account, so no new build agent starts and no new account spend
+   *  begins until Restart. It does not touch running agents, an agent resuming its own conversation,
+   *  a hand pin, the fleet preference, or the sticky concierge / Improve Sparkle keys — so nothing is
+   *  "frozen onto" any account any more and the pause records no target. */
   const handleToggleRotation = () => {
     if (paused) resumeRotation();
-    else {
-      // The SAME "most space first" projection the row order uses, so the account the header freezes
-      // onto is the one sitting at the top of the list the user is looking at. Deriving it a second
-      // way would let the pause land on an account the screen does not present as the leader.
-      const lead =
-        orderBySpace(rotationPool, (a) => {
-          const data = liveUsageData(liveUsage[a.id]);
-          return {
-            id: a.id,
-            alias: displayFor(a).nickname || displayFor(a).primary || a.id,
-            usable: true, // every member of `rotationPool` is signed in by construction
-            sessionUsedPct: data ? data.fiveHourPercent : null,
-            weeklyUsedPct: data ? data.sevenDayPercent : null,
-          };
-        })[0] ?? null;
-      pauseRotation(lead?.id ?? null, now);
-    }
+    else pauseRotation(null, now);
     setRotationTick((t) => t + 1);
   };
   const handleToggleAccountRotation = (id: string, inRotation: boolean) => {
@@ -1959,7 +1937,6 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
         takenOut={takenOut}
         soleName={rotationPool.length === 1 ? displayFor(rotationPool[0]!).primary : null}
         paused={paused != null}
-        frozenName={frozenAccount ? displayFor(frozenAccount).primary : null}
         // Only when the override names an account genuinely in the pool — the same gate
         // `usablePreferredAccount` applies on the spawn path. A preference can outlive the login it
         // pointed at (nothing clears it when an account signs out), and routing silently discards it

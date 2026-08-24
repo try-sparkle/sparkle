@@ -197,6 +197,24 @@ export function isRotationPaused(): boolean {
   return rotationPause() != null;
 }
 
+/** Fired on `globalThis` whenever the pause is turned on or off, so surfaces OUTSIDE React — the
+ *  build-agent panes, which read the pause through localStorage on the spawn path rather than through
+ *  a store — can react the instant it changes. localStorage's own `storage` event does not fire in
+ *  the SAME window that wrote the key, and the toggle and the panes share one window, so a pane held
+ *  by the pause would otherwise never learn that Restart was clicked. */
+export const ROTATION_CHANGED_EVENT = "sparkle:rotation-changed";
+
+/** Announce a pause on/off change to same-window listeners. Best-effort: a non-DOM host (a test that
+ *  stubbed only localStorage, say) simply gets no event, and the pane's next natural remount is the
+ *  fallback. */
+function announceRotationChange(): void {
+  try {
+    globalThis.dispatchEvent?.(new Event(ROTATION_CHANGED_EVENT));
+  } catch {
+    // No event bus here — nothing to announce to.
+  }
+}
+
 /** Pause rotation, freezing new agents onto `accountId` (null when nothing is usable). */
 export function pauseRotation(accountId: string | null, now: number = Date.now()): void {
   try {
@@ -207,6 +225,7 @@ export function pauseRotation(accountId: string | null, now: number = Date.now()
   } catch {
     // Same as above — recording a pause must never break a spawn.
   }
+  announceRotationChange();
 }
 
 /** Resume rotation and forget the frozen account. */
@@ -216,6 +235,7 @@ export function resumeRotation(): void {
   } catch {
     // Same as above.
   }
+  announceRotationChange();
 }
 
 // ── ELECTING THE POOL, PER LOGIN RATHER THAN PER ROW ────────────────────────────────────────────
