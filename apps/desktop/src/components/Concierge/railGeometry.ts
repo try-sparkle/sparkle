@@ -27,12 +27,27 @@
 // is NUMERIC, and numeric coverage needs a module a node-environment test can import without
 // dragging React, the theme or the concierge stores in behind it.
 
-/** One prompt as the rail draws it: a position on the content axis and enough text for the card. */
+/** One prompt as the rail draws it: a position on the time axis and enough text for the card. */
 export interface RailMark {
   /** The concierge message id — what a pick scrolls to. */
   id: string;
-  /** 0..1 down the scroller's SCROLLABLE range. 0 = top of the loaded thread. */
+  /**
+   * WHERE THE RAIL DRAWS IT: 0..1 down the SELECTED TIME WINDOW. 0 = `now - scope`, 1 = `now`.
+   *
+   * This was the content fraction until 2026-08-24, and that is the whole of the bug the founder
+   * reported — a pixel offset cannot be moved by a dropdown, so widening 1h → 12h relabelled the
+   * control and left every mark exactly where it was. `contentFraction` below keeps the pixel
+   * reading, which the rail still needs to SCROLL to a mark; it is simply no longer where the mark
+   * is painted.
+   */
   fraction: number;
+  /**
+   * Where the prompt sits in the transcript: 0..1 down the scroller's SCROLLABLE range.
+   *
+   * Optional because only a MEASURED mark has one — a prompt known solely from SQLite (paged in but
+   * not yet rendered) has a time and no pixels. Pairs with `fraction` to form an {@link AxisAnchor}.
+   */
+  contentFraction?: number;
   /** First ~160 chars of the prompt. Truncated by the caller; this module never touches text. */
   textPrefix: string;
   /** 1-based ordinal within the loaded thread, oldest first — the card's "Prompt N". */
@@ -184,4 +199,122 @@ export function nearestBand(fraction: number, bands: MarkBand[]): MarkBand | nul
  */
 export function pickFromBand(band: MarkBand): RailMark {
   return band.marks[band.marks.length - 1]!;
+}
+
+// ══ THE TWO AXES, AND THE MAP BETWEEN THEM ══════════════════════════════════════════════════════
+//
+// On 2026-08-24 the founder ruled that the MARKS go back onto the TIME axis: *"when i change from
+// 1h to 12h it doesn't change the previous prompt horizontal lines at all., but it should be"*. A
+// mark's position is therefore `fractionFor(createdAt, scopeWindow)` again, and a wider scope
+// redistributes every mark whether or not more history loads.
+//
+// That alone would break the thing he asked for two days earlier — *"It replaces the scroll... I
+// just have this draggable handle"* — because a handle measured in content pixels and marks measured
+// in time do not name the same place, so dragging to a mark would land somewhere else. The rail
+// would be a control fighting its reader, which is the exact failure `railGeometry.ts`'s own header
+// warned about when it moved OFF the time axis.
+//
+// So both live at once, joined here. The loaded prompts are ANCHORS: each one knows where it sits in
+// the transcript (content) and when it happened (time), and between two anchors we interpolate. The
+// handle is drawn on the TIME axis with the marks, and a drag converts back to content to write
+// `scrollTop` — so the gesture still scrolls the thread in real time, and it still lands on the mark
+// it was dragged to.
+//
+// WHY INTERPOLATION AND NOT A FORMULA: there is no closed-form relation between the two. A quiet
+// hour occupies a third of a 3h ruler and zero pixels of transcript; a burst of long replies is the
+// reverse. The anchors are the only place the two axes are known to agree, and between them a
+// straight line is the honest guess — it is monotonic, it is exact AT every prompt (which is where
+// every pick and every mark actually is), and it degrades to "park at the top" when there is nothing
+// to interpolate from rather than dividing by zero.
+
+/** One prompt's position on BOTH axes — the only instants where content and time are known to agree. */
+export interface AxisAnchor {
+  /** 0..1 down the scroller's scrollable range. */
+  contentFraction: number;
+  /** 0..1 down the selected time window. */
+  timeFraction: number;
+}
+
+/**
+ * Sort anchors and drop the ones that cannot define a segment.
+ *
+ * Both axes must be ASCENDING together for interpolation to be monotonic. Prompts are appended in
+ * time order and rendered in that order, so they normally are — but a mark whose history row has not
+ * landed, or a backlog page inserted above the live thread mid-measurement, can briefly present a
+ * pair that disagrees. Dropping the offender is better than interpolating across an inversion, which
+ * would make the handle run backwards as the reader scrolls forwards.
+ */
+function usableAnchors(anchors: AxisAnchor[]): AxisAnchor[] {
+  const sorted = [...anchors].sort(
+    (a, b) => a.contentFraction - b.contentFraction || a.timeFraction - b.timeFraction,
+  );
+  const out: AxisAnchor[] = [];
+  for (const a of sorted) {
+    const last = out[out.length - 1];
+    if (last && a.timeFraction < last.timeFraction) continue;
+    out.push(a);
+  }
+  return out;
+}
+
+/**
+ * Piecewise-linear map along one axis of the anchor list.
+ *
+ * `pick` reads the axis being searched, `read` the axis being produced, so ONE implementation serves
+ * both directions and they cannot drift apart — a hand-written inverse is exactly the kind of
+ * duplicate that goes subtly non-invertible and puts the handle a few pixels off every mark.
+ *
+ * ── THE ENDS ARE CLAMPED, NOT EXTRAPOLATED ─────────────────────────────────────────────────────
+ * Outside the anchors there is no evidence about the relationship at all, and extrapolating a slope
+ * measured between two prompts across an empty week produces positions that are confidently wrong.
+ * Clamping says the honest thing: above the oldest loaded prompt the rail is at its top.
+ */
+function interpolate(
+  value: number,
+  anchors: AxisAnchor[],
+  pick: (a: AxisAnchor) => number,
+  read: (a: AxisAnchor) => number,
+): number {
+  const pts = usableAnchors(anchors);
+  // NOTHING TO MAP. Zero anchors is a thread with no prompt in the window; one anchor fixes a point
+  // but no slope. Both collapse to the top of the track, which is what a scrollbar with nowhere to
+  // go does, rather than to a fabricated midpoint.
+  if (pts.length === 0) return 0;
+  if (pts.length === 1) return clamp01(read(pts[0]!));
+  const first = pts[0]!;
+  const last = pts[pts.length - 1]!;
+  if (value <= pick(first)) return clamp01(read(first));
+  if (value >= pick(last)) return clamp01(read(last));
+  for (let i = 1; i < pts.length; i++) {
+    const lo = pts[i - 1]!;
+    const hi = pts[i]!;
+    if (value > pick(hi)) continue;
+    const span = pick(hi) - pick(lo);
+    // A DEGENERATE SEGMENT IS NOT A DIVISION BY ZERO. Two prompts in the same millisecond share a
+    // time fraction, and two in one un-scrollable thread share a content fraction; either way the
+    // segment has no interior, so its far end is the answer.
+    if (span <= 0) return clamp01(read(hi));
+    return clamp01(read(lo) + ((value - pick(lo)) / span) * (read(hi) - read(lo)));
+  }
+  return clamp01(read(last));
+}
+
+/** Where a scroll position sits on the TIME axis — what the handle is drawn at. */
+export function contentToTime(contentFraction: number, anchors: AxisAnchor[]): number {
+  return interpolate(
+    clamp01(contentFraction),
+    anchors,
+    (a) => a.contentFraction,
+    (a) => a.timeFraction,
+  );
+}
+
+/** Where a point on the TIME axis sits in the transcript — what a drag writes as `scrollTop`. */
+export function timeToContent(timeFraction: number, anchors: AxisAnchor[]): number {
+  return interpolate(
+    clamp01(timeFraction),
+    anchors,
+    (a) => a.timeFraction,
+    (a) => a.contentFraction,
+  );
 }

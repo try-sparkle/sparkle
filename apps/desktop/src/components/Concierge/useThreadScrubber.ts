@@ -148,10 +148,17 @@ export function measurePromptMarks(scroller: HTMLElement): RailMark[] {
   const scrollTop = scroller.scrollTop;
   return rows.map((el, i) => {
     const offset = el.getBoundingClientRect().top - scrollerTop + scrollTop;
+    // A thread with nothing to scroll has every row at the top — 0, not a division by zero.
+    const contentFraction = range > 0 ? Math.min(1, Math.max(0, offset / range)) : 0;
     return {
       id: el.dataset.messageId ?? `row-${i}`,
-      // A thread with nothing to scroll has every row at the top — 0, not a division by zero.
-      fraction: range > 0 ? Math.min(1, Math.max(0, offset / range)) : 0,
+      // BOTH, and they are the same number HERE on purpose. This function measures the CONTENT axis
+      // and nothing else — it has no clock and no window, so it cannot know a time fraction. `enrich`
+      // in the hook overwrites `fraction` with the mark's position on the selected time window once
+      // the store has answered; until then the content reading is the best available guess and is
+      // strictly better than a 0 that would pile every mark at the top of the rail.
+      contentFraction,
+      fraction: contentFraction,
       // The rendered words are ALWAYS available, where the history row may not be (a bubble exists
       // before its history write lands). `enrich` below prefers the stored prefix when there is one.
       textPrefix: (el.textContent ?? "").trim().slice(0, 160),
