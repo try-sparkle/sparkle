@@ -2770,6 +2770,45 @@ describe("quit_alternate_screen", () => {
     expect(r.reason).toBe("not-a-pager");
   });
 
+  // ══ THE INCIDENT'S OWN SCREEN SHAPE, WHERE GATES 1-4 ALL PASS (roborev 68360, High) ══════════
+  //
+  // This is the case the module header used to say was impossible, and it is the one the two wedged
+  // agents were actually described as being in. Every one of the first four gates lets it through:
+  //
+  //   gate 1  alternateBuffer is TRUE — and NOT because a pager is running. conciergeDispatch.ts
+  //           records, measured on v2.1.237 at a bare idle prompt, a fleet where "Claude Code holds
+  //           the alternate buffer at all times". So gate 1 is true for ordinary Claude Code panes.
+  //   gate 2  FALSE BY HYPOTHESIS — this is H2, a recognition false negative, forced here by the
+  //           same stub the other H2 cases use.
+  //   gate 3  no option block and no cursored row in the visible tail, so nothing to answer.
+  //   gate 4  isPlanExitDialog bails under two options and isPlanModeDialog matches on labels, so
+  //           an option block scrolled off the TOP of a viewport over plans/*.md leaves it false.
+  //
+  // Only gate 5 stands between `q` and a live Claude Code session — and, because the buffer would
+  // never clear, between `ctrl+c` and whatever work that session had in flight. If this test ever
+  // goes green while asserting a write, the escape hatch has become the incident.
+  it("writes NOTHING into a Claude Code pane holding the alt buffer with recognition WRONG", async () => {
+    vi.mocked(isClaudeCodeScreen).mockReturnValue(false);
+    vi.mocked(hasClaudeCodeLiveTui).mockReturnValue(false);
+    mountScreen(
+      [
+        "  the option block for this plan has scrolled off the top of the viewport",
+        "",
+        "## Step 3 — wire the listener",
+        "",
+        "Read the relevant guide before writing any code.",
+        "",
+        "  ⏵⏵ bypass permissions on (shift+tab to cycle)",
+      ].join("\n"),
+      true,
+    );
+    const r = await quitAlternateScreen(AGENT, ALLOWED);
+    expect(written()).toEqual([]);
+    // Named explicitly: the refusal must come from PAGER EVIDENCE, not from a Claude Code check
+    // that this test has deliberately made useless.
+    expect(r.reason).toBe("not-a-pager");
+  });
+
   it("escalates to ctrl+c when q leaves a PAGER on the alternate buffer", async () => {
     // A real pager that swallowed the q. Nothing changes between reads — the wedged case — and the
     // fixture stays a pager throughout, so the escalation is reached legitimately.

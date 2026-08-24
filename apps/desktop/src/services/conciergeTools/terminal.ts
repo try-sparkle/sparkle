@@ -1698,11 +1698,23 @@ export async function sendControlKey(
 //
 // ══ WHY THIS CANNOT FIRE ON A REAL CLAUDE CODE DIALOG — the argument, gate by gate ════════════
 //
-//   1. BUFFER MODE, NOT CONTENT. Claude Code renders its prompt, its permission dialogs and its
-//      pickers on the NORMAL buffer; it does not issue DECSET 1049 for them. `alternateBuffer` is
-//      the emulator's own mode bit (`term.buffer.active.type !== "normal"`, components/Terminal),
-//      never a heuristic over text. Gate 1 alone excludes every real Claude Code dialog before a
-//      single byte is written.
+//   1. BUFFER MODE, NOT CONTENT. `alternateBuffer` is the emulator's own mode bit
+//      (`term.buffer.active.type !== "normal"`, components/Terminal), never a heuristic over text.
+//
+//      READ THE NEXT SENTENCE BEFORE RELYING ON THIS GATE (roborev 68360, High). An earlier version
+//      of this comment claimed gate 1 "alone excludes every real Claude Code dialog, before a single
+//      byte is written", on the reasoning that Claude Code renders its prompt and dialogs on the
+//      NORMAL buffer. THAT IS FALSE ON A MODERN FLEET, and this file's own neighbour says so:
+//      `conciergeDispatch.ts` records, measured on v2.1.237 at a bare idle prompt, a fleet where
+//      "Claude Code holds the alternate buffer at all times". So gate 1 is TRUE for ordinary Claude
+//      Code panes and excludes nothing by itself.
+//
+//      That wrong claim was worse than no claim, because it presented the cheapest gate as
+//      sufficient — which is exactly how a later reader deletes gate 5 as redundant. Gate 1 is a
+//      NECESSARY precondition ("there is some full-screen thing to quit"), never a sufficient one.
+//      What actually keeps `q` out of a Claude Code pane is gate 5's POSITIVE pager evidence: an
+//      idle Claude Code prompt has no `(END)`, no `--More--`, no `lines n/m` status row, so it is
+//      refused as `not-a-pager` no matter what gates 1-4 concluded.
 //   2. THE PREDICATE THE DISPATCHER ALREADY TRUSTS. `isClaudeCodeScreen` is exactly what
 //      `conciergeDispatch` uses to decide Claude Code owns the buffer, and its job is telling a live
 //      TUI from a document QUOTING one — `nothingUnrecognizedBelowFooter`: a pager draws its own
