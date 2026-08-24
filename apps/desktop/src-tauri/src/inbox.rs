@@ -47,16 +47,22 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use tauri::AppHandle;
 
-/// Max messages held per agent. Beyond this a send is refused rather than silently dropping the
-/// oldest: a concierge that believes it delivered something it did not is worse than one told no.
+/// Max messages held per agent — the hard total cap, which no path ever exceeds.
+///
+/// An `Act` send beyond this is REFUSED rather than silently dropping the oldest: an `act` is
+/// consequential, and a concierge that believes it delivered something it did not is worse than one
+/// told no. `Fyi` is different — see `FYI_CEILING`: within its own ceiling it is a ring buffer that
+/// evicts its stalest message rather than refusing, because dropping one piece of stale context to
+/// admit a live message is correct where dropping an action is not. Eviction removes one before the
+/// append, so the total still never crosses this line.
 pub(crate) const MAX_PER_AGENT: usize = 50;
 
 /// Ceiling for [`Severity::Fyi`] alone, leaving `MAX_PER_AGENT - FYI_CEILING` slots that only
 /// [`Severity::Act`] can occupy.
 ///
-/// WHY THE CEILING HAD TO SPLIT. The refusal above is the right call and stays — nothing is ever
-/// evicted. But a single ceiling makes the refusal SEVERITY-BLIND, and the two message classes do
-/// not fail equally when they are turned away. `Fyi` is context: the agent reads it or it expires,
+/// WHY THE CEILING SPLITS BY SEVERITY. The two message classes do not fail equally when a queue is
+/// full, so one ceiling cannot serve both — and the fix is two mechanisms, not one (see below).
+/// `Fyi` is context: the agent reads it or it expires,
 /// and one more piece of context that did not arrive costs nothing. `Act` exists precisely because
 /// something needs doing before the agent continues.
 ///
@@ -64,12 +70,18 @@ pub(crate) const MAX_PER_AGENT: usize = 50;
 /// the concierge's own default send `fyi`; the pipeline-health escalation and the mention watch
 /// send `act`. So the class that can flood is the class that does not matter, and the one that
 /// gets locked out is the one that does — observed on this machine as a saturated queue refusing a
-/// blocked-deployment alert while fifty pieces of context sat in front of it, undrained.
+/// blocked-deployment alert while forty pieces of context sat in front of it, and worse, as an
+/// agent unable to reach a long-running peer AT ALL because that peer's inbox had filled with
+/// undelivered FYIs.
 ///
-/// A RESERVE, NOT A RAISE. `MAX_PER_AGENT` is unchanged, so the worst case an agent can be handed
-/// is exactly what it was; all this does is stop the cheap class from consuming the last slots.
-/// Sizing it as a reserve rather than a per-class quota also keeps the invariant one number:
-/// `pending().len() <= MAX_PER_AGENT` still holds for every combination of severities.
+/// TWO MECHANISMS, ONE INVARIANT. (1) A RESERVE: `MAX_PER_AGENT - FYI_CEILING` slots only `Act` can
+/// occupy, so `fyi` traffic can never consume the last slots an action message needs. (2) A RING
+/// BUFFER: an `fyi` arriving with the allowance already spent EVICTS the stalest pending `fyi`
+/// (oldest `ts` first) rather than being refused, mirroring the app's events buffer which holds N
+/// and drops oldest-first — so a live coordination message is never turned away for want of room a
+/// stale one holds. `Act` is never evicted and never evicts: when its slots are genuinely full of
+/// `act`, that send alone is refused. The invariant stays one number, because eviction removes one
+/// before the append: `pending().len() <= MAX_PER_AGENT` for every combination of severities.
 pub(crate) const FYI_CEILING: usize = 40;
 
 /// How long an undelivered message stays worth delivering. A "main has moved, rebase" message is
@@ -592,6 +604,74 @@ fn append_jsonl<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
     f.write_all(format!("{line}\n").as_bytes()).map_err(|e| format!("inbox write: {e}"))
 }
 
+/// Remove one message from an agent's queue file by id, rewriting the file without it.
+///
+/// The `Fyi` ring buffer's eviction step (see `enqueue`): drop the stalest `fyi` to make room for a
+/// fresh one, so the class holds at most `FYI_CEILING` and a live message is never refused for want
+/// of room a stale one occupies.
+///
+/// Operates on RAW LINES, not parsed records: it removes only the single line whose parsed `id`
+/// matches, leaving every other record — a torn line `read_jsonl` would skip, an expired record not
+/// yet reaped, an `act` message — as it was. Writes to a sibling temp file and renames it over the
+/// original, so a concurrent reader never sees a half-written queue. If the victim is already gone
+/// (a racing claim, reap, or evict), this is a no-op success: the slot the caller wanted freed is
+/// free either way.
+fn evict_message(path: &Path, victim_id: &str) -> Result<(), String> {
+    use std::io::Write;
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        // No file, or unreadable: nothing to evict, and the caller's goal — a free slot — holds.
+        return Ok(());
+    };
+    let mut kept: Vec<&str> = Vec::new();
+    let mut removed = false;
+    for line in raw.lines() {
+        if !removed {
+            if let Some((id, _)) = record_id_and_ts(line.trim()) {
+                if id == victim_id {
+                    removed = true;
+                    continue; // drop exactly this one record
+                }
+            }
+        }
+        kept.push(line);
+    }
+    if !removed {
+        return Ok(());
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| "inbox evict: queue path has no parent".to_string())?;
+    std::fs::create_dir_all(parent).map_err(|e| format!("inbox evict mkdir: {e}"))?;
+    // A unique temp name so two concurrent evictions to the same agent cannot collide on it; the
+    // rename below is atomic within the directory, which is what keeps a reader from seeing a
+    // half-written queue.
+    let tmp = parent.join(format!(".evict-{}.tmp", uuid_v4()));
+    let mut body = kept.join("\n");
+    if !body.is_empty() {
+        body.push('\n');
+    }
+    let mut f = match std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&tmp)
+    {
+        Ok(f) => f,
+        Err(e) => return Err(format!("inbox evict open: {e}")),
+    };
+    if let Err(e) = f.write_all(body.as_bytes()) {
+        std::fs::remove_file(&tmp).ok();
+        return Err(format!("inbox evict write: {e}"));
+    }
+    f.sync_all().ok();
+    drop(f);
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        std::fs::remove_file(&tmp).ok();
+        return Err(format!("inbox evict rename: {e}"));
+    }
+    Ok(())
+}
+
 /// Messages still worth delivering: not expired, not already claimed.
 pub fn pending(app_data: &Path, agent_id: &str, now: i64) -> Vec<InboxMessage> {
     if refuse_escape("pending", agent_id) {
@@ -609,9 +689,12 @@ pub fn pending(app_data: &Path, agent_id: &str, now: i64) -> Vec<InboxMessage> {
 
 /// Queue a message. Returns its id.
 ///
-/// Refuses rather than evicts when full: see `MAX_PER_AGENT`. The ceiling it is judged against
-/// depends on `severity` — `Fyi` stops at `FYI_CEILING` so context traffic cannot occupy the slots
-/// an `Act` message needs.
+/// CAPACITY IS SEVERITY-AWARE (see `FYI_CEILING`). `Act` is judged against the full `MAX_PER_AGENT`
+/// and REFUSED when those slots are genuinely full of `act`. `Fyi` is judged against `FYI_CEILING`
+/// and is a RING BUFFER: at the ceiling it evicts the stalest pending `fyi` and admits the new one,
+/// so context traffic can neither lock out an action message (the reserve) nor turn a live one away
+/// (the eviction). An `fyi` never evicts an `act`; if the ceiling is reached with no `fyi` to evict
+/// — every slot is `act` — that lone case stays a refusal.
 pub fn enqueue(
     app_data: &Path,
     agent_id: &str,
@@ -628,32 +711,51 @@ pub fn enqueue(
     if text.is_empty() {
         return Err("inbox: refusing to queue an empty message".into());
     }
-    // SEVERITY-AWARE CAPACITY (see `FYI_CEILING`). `Act` is judged against the full ceiling; `Fyi`
-    // stops short of it, so context traffic can never occupy the slots an action message needs.
-    // Both are still REFUSALS — nothing queued is evicted or reordered by this.
-    let queued = pending(app_data, agent_id, now).len();
+    // SEVERITY-AWARE CAPACITY (see `FYI_CEILING`). `Act` is judged against the full ceiling and
+    // REFUSED when its slots are genuinely full; `Fyi` is judged against `FYI_CEILING` and is a
+    // RING BUFFER — at the ceiling it evicts its own stalest message rather than being refused.
+    let queued = pending(app_data, agent_id, now);
     let ceiling = match severity {
         Severity::Act => MAX_PER_AGENT,
         Severity::Fyi => FYI_CEILING,
     };
-    if queued >= ceiling {
-        // Name WHICH ceiling was hit and what it means, because the two refusals ask the reader for
-        // different things: a full inbox means the agent is not reaching turn boundaries at all,
-        // while a full FYI allowance means it is merely behind on context and an `act` message
-        // would still get through — advice a single shared string cannot give.
-        return Err(if matches!(severity, Severity::Fyi) {
-            format!(
-                "inbox: {agent_id} already has {queued} undelivered messages, at or over the \
-                 {FYI_CEILING} the `fyi` class is allowed; the remaining slots are reserved for \
-                 `act` messages — resend as `act` only if it genuinely needs doing before the \
-                 agent continues"
-            )
-        } else {
-            format!(
-                "inbox: {agent_id} already has {MAX_PER_AGENT} undelivered messages; \
-                 it is not draining them — check its Level 0 verdict before sending more"
-            )
-        });
+    if queued.len() >= ceiling {
+        match severity {
+            // `Fyi` IS A RING BUFFER, NOT A WALL. An FYI is fire-and-forget context; dropping the
+            // stalest one to admit a live one is correct, and refusing a live coordination message
+            // because `FYI_CEILING` pieces of undrained context sit in front of it is not — that
+            // refusal is the incident this fixes (an agent could not reach a long-running peer whose
+            // inbox had filled with undelivered FYIs). So evict the OLDEST pending `fyi` (by `ts`,
+            // oldest first) and fall through to the append, mirroring the app's events buffer which
+            // holds N and drops oldest-first. `min_by_key` returns the FIRST element on a tie and
+            // `pending` preserves file order, so equal-`ts` FYIs evict in append order — oldest first.
+            Severity::Fyi => {
+                match queued.iter().filter(|m| m.severity == Severity::Fyi).min_by_key(|m| m.ts) {
+                    Some(victim) => {
+                        evict_message(&messages_path(app_data, agent_id), &victim.id)?;
+                    }
+                    // No `fyi` to evict means every slot up to the ceiling is `act`. An incoming
+                    // `fyi` may NEVER evict an `act`, nor consume an Act-reserved slot — so this lone
+                    // case stays a refusal for the `fyi` class.
+                    None => {
+                        return Err(format!(
+                            "inbox: {agent_id} is at the {FYI_CEILING} `fyi` ceiling with no `fyi` \
+                             message to evict — every queued slot holds an `act` message, which is \
+                             never evicted; resend as `act` only if it genuinely needs doing before \
+                             the agent continues"
+                        ));
+                    }
+                }
+            }
+            // `Act` is consequential: never evicted, and it never evicts. When its slots are
+            // genuinely full of `act`, that send alone is refused, exactly as before.
+            Severity::Act => {
+                return Err(format!(
+                    "inbox: {agent_id} already has {MAX_PER_AGENT} undelivered messages; \
+                     it is not draining them — check its Level 0 verdict before sending more"
+                ));
+            }
+        }
     }
     let msg = InboxMessage {
         id: id.clone(),
@@ -1938,10 +2040,15 @@ mod tests {
         for i in 0..FYI_CEILING {
             send(&base, "a1", "context", 1_000, &format!("f{i}")).unwrap();
         }
-        // The cheap class has spent its allowance...
-        let err = send(&base, "a1", "more context", 1_000, "f-overflow").unwrap_err();
-        assert!(err.contains("reserved for"), "got: {err}");
-        assert!(err.contains("`act`"), "the refusal must name the way through: {err}");
+        // The cheap class is at its allowance, so a further `fyi` now EVICTS the stalest one (the
+        // ring-buffer fix) rather than being refused — the queue stays AT the ceiling, it does not
+        // grow, the newcomer is present, and the oldest (f0) is gone.
+        send(&base, "a1", "more context", 1_000, "f-overflow")
+            .expect("an fyi at the ceiling must evict, not refuse");
+        let after = pending(&base, "a1", 1_000);
+        assert_eq!(after.len(), FYI_CEILING, "the fyi class is a ring buffer, held at its ceiling");
+        assert!(after.iter().any(|m| m.text == "more context"), "the newcomer was not admitted");
+        assert!(!after.iter().any(|m| m.id == "f0"), "the stalest fyi (f0) was not evicted");
 
         // ...and the class that needs doing still gets through, all the way to the full ceiling.
         for i in FYI_CEILING..MAX_PER_AGENT {
@@ -1960,6 +2067,104 @@ mod tests {
         let err = send_act(&base, "a1", "one too many", 1_000, "a-overflow").unwrap_err();
         assert!(err.contains("not draining"), "got: {err}");
         std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// THE RING-BUFFER SIDE EFFECT: a queue full of `fyi` ADMITS another `fyi` by evicting the
+    /// oldest, so a live coordination message is never refused for want of room a stale one holds.
+    ///
+    /// Non-vacuous by construction: the pre-change code REFUSED this send, so the `expect` below
+    /// panics against it. Distinct `ts` per message makes "the oldest" unambiguous — the assertion
+    /// is not resting on the file-order tie-break — and all three outcomes are pinned: newcomer
+    /// present, stalest gone, count unchanged.
+    #[test]
+    fn a_full_fyi_queue_evicts_the_oldest_fyi_to_admit_a_new_one() {
+        let base = tmp("fyi-ring");
+        for i in 0..FYI_CEILING {
+            // ts ascending, so f0 is unambiguously the oldest and f{CEILING-1} the newest.
+            send(&base, "a1", &format!("ctx {i}"), 1_000 + i as i64, &format!("f{i}")).unwrap();
+        }
+        assert_eq!(pending(&base, "a1", 10_000).len(), FYI_CEILING);
+
+        // One more `fyi`, newer than every queued one.
+        send(&base, "a1", "live message", 5_000, "f-new")
+            .expect("an fyi at the ceiling must evict the oldest, not be refused");
+
+        let after = pending(&base, "a1", 10_000);
+        assert_eq!(after.len(), FYI_CEILING, "a ring buffer holds at its cap — no growth, no loss");
+        assert!(after.iter().any(|m| m.id == "f-new"), "the newcomer must be admitted");
+        assert!(!after.iter().any(|m| m.id == "f0"), "the OLDEST fyi (f0) must be the one evicted");
+        // And nothing but the oldest went: the second-oldest is still here.
+        assert!(after.iter().any(|m| m.id == "f1"), "only the single oldest fyi may be evicted");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// An `act` message is NEVER evicted, even when it is the OLDEST record in the queue and a storm
+    /// of `fyi`s arrives. Asserts the side effect — the old `act` is still readable after repeated
+    /// `fyi` eviction cycles — which the pre-change code cannot reach (it refuses the first `fyi`).
+    #[test]
+    fn an_act_message_is_never_evicted_by_incoming_fyis() {
+        let base = tmp("act-immune");
+        // The oldest record in the queue is an `act`, at ts 1_000.
+        send_act(&base, "a1", "blocked deployment", 1_000, "act-old").unwrap();
+        // Fill the rest of the fyi allowance with fyis that are all NEWER than the act.
+        for i in 0..(FYI_CEILING - 1) {
+            send(&base, "a1", &format!("ctx {i}"), 1_100 + i as i64, &format!("f{i}")).unwrap();
+        }
+        assert_eq!(pending(&base, "a1", 10_000).len(), FYI_CEILING);
+
+        // Hammer the queue with fyis. Each is at the ceiling, so each evicts an oldest FYI — but the
+        // act, though older than every fyi, must be passed over every single time.
+        for i in 0..5 {
+            send(&base, "a1", &format!("more ctx {i}"), 5_000 + i as i64, &format!("g{i}"))
+                .unwrap_or_else(|e| panic!("fyi {i} should evict a fyi and succeed, got: {e}"));
+        }
+
+        let after = pending(&base, "a1", 10_000);
+        assert!(
+            after.iter().any(|m| m.id == "act-old"),
+            "the act was evicted despite being immune: {:?}",
+            after.iter().map(|m| &m.id).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            after.iter().filter(|m| m.severity == Severity::Act).count(),
+            1,
+            "the single act must survive every fyi eviction cycle"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// A queue at the `fyi` ceiling still ACCEPTS an `act` into its reserved slots — evicting a
+    /// stale `fyi` never touches the reserve — AND the mirror case: when the ceiling is reached with
+    /// nothing but `act` messages, an incoming `fyi` has nothing it is allowed to evict, so it is
+    /// refused rather than displacing an `act` or stealing a reserved slot.
+    #[test]
+    fn a_full_fyi_queue_accepts_an_act_but_an_all_act_ceiling_refuses_a_fyi() {
+        let base = tmp("fyi-reserve");
+        for i in 0..FYI_CEILING {
+            send(&base, "a1", "ctx", 1_000, &format!("f{i}")).unwrap();
+        }
+        // The reserve is intact: an `act` is admitted beyond the fyi ceiling, into a reserved slot.
+        send_act(&base, "a1", "blocked deployment", 1_000, "act-reserve")
+            .expect("an act must reach its reserved slots even with fyi at the ceiling");
+        let after = pending(&base, "a1", 1_000);
+        assert_eq!(after.len(), FYI_CEILING + 1, "the act took a reserved slot, it did not evict a fyi");
+        assert!(after.iter().any(|m| m.id == "act-reserve"));
+
+        // The no-fyi-to-evict case: a fresh queue whose ceiling is filled ENTIRELY with acts.
+        let base2 = tmp("fyi-all-act");
+        for i in 0..FYI_CEILING {
+            send_act(&base2, "a1", "act", 1_000, &format!("a{i}")).unwrap();
+        }
+        let err = send(&base2, "a1", "context", 1_000, "fyi-blocked")
+            .expect_err("a fyi at the ceiling with no fyi to evict must be refused, not evict an act");
+        assert!(err.contains("no `fyi` message to evict"), "the refusal must say why: {err}");
+        // The side effect that matters: no act was displaced and the fyi was not queued.
+        let q2 = pending(&base2, "a1", 1_000);
+        assert_eq!(q2.len(), FYI_CEILING, "nothing was evicted or added");
+        assert!(!q2.iter().any(|m| m.id == "fyi-blocked"), "the refused fyi must not be on disk");
+        assert_eq!(q2.iter().filter(|m| m.severity == Severity::Act).count(), FYI_CEILING);
+        std::fs::remove_dir_all(&base).ok();
+        std::fs::remove_dir_all(&base2).ok();
     }
 
     #[test]
