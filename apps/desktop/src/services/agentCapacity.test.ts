@@ -103,6 +103,36 @@ describe("localAgentCapacity — the static baseline (unchanged behavior)", () =
   });
 });
 
+describe("localAgentCapacity — narrowed by the live CPU run queue", () => {
+  const LOAD_BASIS =
+    "refused: the CPU run queue is 387.0 deep across 18 cores (21.5× per core, refusing past 2.0×)";
+
+  it("applies a run-queue narrowing that carries NO memory sample at all", async () => {
+    // THE REGRESSION THIS FILE EXISTS TO PIN (roborev 68367, High). The Rust `sample_now()` forks
+    // four processes and returns None if any fails — and the machine this bound was built for is
+    // one that cannot fork (46 shell launches dead with SIGBUS at load 387). So the realistic
+    // saturated-machine payload is `sample: null`, and the gate has to honour it anyway.
+    expect(localAgentCapacity().limit).toBe(STATIC_LIMIT); // baseline: provably not already 2
+
+    await sample({ effective: 2, bound: "load", basis: LOAD_BASIS, sample: null, sampled: true });
+
+    const cap = localAgentCapacity();
+    // The run-queue ceiling binds with no memory reading behind it…
+    expect(cap.limit).toBe(2);
+    // …and the refusal names the run queue, not memory and not cores.
+    expect(cap.basis).toBe(LOAD_BASIS);
+  });
+
+  it("still declines to narrow when NOTHING measured — sampled:false is not a load reading", async () => {
+    // The paired case, so the test above cannot pass for a gate that simply ignores `sampled`.
+    expect(localAgentCapacity().limit).toBe(STATIC_LIMIT);
+    await sample({ effective: 2, bound: "load", basis: LOAD_BASIS, sample: null, sampled: false });
+    // An unmeasured machine is not a squeezed one.
+    expect(localAgentCapacity().limit).toBe(STATIC_LIMIT);
+    expect(localAgentCapacity().basis).toBe(STATIC_BASIS);
+  });
+});
+
 describe("localAgentCapacity — narrowed by the live memory reading", () => {
   it("a FRESH narrowing reading lowers the limit AND names memory as the cause", async () => {
     // Baseline first, so the assertions below are provably about the change and not about a

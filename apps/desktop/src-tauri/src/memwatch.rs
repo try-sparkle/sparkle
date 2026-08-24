@@ -198,6 +198,173 @@ pub fn classify_pressure(available_bytes: u64, total_bytes: u64, swap_used_bytes
     PressureLevel::Normal
 }
 
+// ============================== the CPU run queue ==============================
+//
+// THE DIMENSION NOTHING WATCHED. Everything above this line measures a QUANTITY of memory. None of
+// it can see a machine whose cores are the constraint, and that blind spot is documented in the
+// codebase rather than hypothetical: `config.rs`'s `AGENT_TEST_WORKER_CAP` names "the process/CPU
+// storm behind the 2026 swap-thrash incident (438 → 1600+ processes, load 15 → 55), which the
+// memory-only admission gate cannot see because reclaimable file cache reads as 'available'".
+//
+// Measured on the founder's 18-core dev machine, 2026-08-23, while agents were dying mid-task and
+// being auto-resumed: **load average 387 across 18 cores — 21.5× per core** — with 69 concurrent
+// `claude` processes and 1241 processes overall. `memory_pressure` reported 48% free at that
+// instant, so the memory gate was correctly reporting a machine with room while the machine was
+// unable to start a process: 46 `/bin/bash` launches died with SIGBUS that day inside the
+// `ai.sparkle.desktop` coalition, and none on any prior day.
+//
+// WHY THE STATIC PREDICTION DOES NOT COVER THIS. `AGENTS_PER_CORE = 6` prices an agent as "a
+// mostly-idle process blocked on model round-trips" — its own words — so an 18-core box derives a
+// CPU ceiling of 108 and the RAM bound (81) is what the human is told. That pricing is right for an
+// agent that is waiting on a model and wrong for the same agent thirty seconds later when it runs
+// `cargo test`. The static number cannot tell those apart because it is computed once, at startup,
+// from hardware. This can: it reads what the cores are actually carrying.
+
+/// One reading of the machine's CPU run queue at an instant. The load-average twin of
+/// [`MemorySample`], and distinct from `config.rs`'s core count in the only way that matters: this
+/// one changes.
+///
+/// No `Eq`/`Serialize`: `load1` is a float, and this deliberately does NOT ride on
+/// [`ConcurrencyAdmission`] (which derives `Eq`). The reading's job is to narrow a number and
+/// explain itself in `basis`; adding a float to a serialized, equality-compared payload would buy
+/// nothing and cost both derives.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LoadSample {
+    /// The 1-minute load average — the mean number of threads runnable-or-running. The 1-minute
+    /// figure rather than 5/15 because admission is a decision about RIGHT NOW: a machine that was
+    /// slammed ten minutes ago and is idle now should admit, and one that has just been slammed
+    /// should not wait ten minutes to say so.
+    pub load1: f64,
+    /// Logical cores, so the ratio below is a per-core depth rather than a raw number that means
+    /// something different on every machine.
+    pub cores: u32,
+}
+
+/// How deep the per-core run queue may get before another agent is REFUSED.
+///
+/// A per-core load of 1.0 means the cores are exactly saturated — every core has one thread to run
+/// and nothing is queued behind it. 2.0 means each core has a full extra thread waiting its turn.
+/// Past that, admitting another agent does not buy throughput, it buys context switches: the work
+/// already accepted finishes later, which is the failure this gate exists to prevent.
+///
+/// DELIBERATELY GENEROUS, because agents really are mostly idle most of the time and this must not
+/// throttle a healthy fleet. `AGENTS_PER_CORE = 6` already bets that six agents share one core
+/// without any of them being runnable at once; a sustained per-core depth of 2 means that bet has
+/// already failed. The measured failure was 21.5× — an order of magnitude past this line — so the
+/// threshold has a very wide margin before it can misfire on a busy-but-healthy machine.
+///
+/// THE ESCAPE HATCH, stated so it is not rediscovered as a mystery throttle: if this proves too
+/// tight, raise the constant — it is the only number that governs, and nothing else changes. If the
+/// gate needs to be off entirely, `[memory].pressure_gate = false` already disables the sampling
+/// that feeds it (see [`memory_admission`]), because an unmeasured machine is not a squeezed one.
+pub const LOAD_REFUSE_PER_CORE: f64 = 2.0;
+
+/// The seam for the load reading, so the narrowing below is unit-tested without a real machine.
+pub trait LoadSampler: Send + Sync {
+    fn sample(&self) -> Option<LoadSample>;
+}
+
+/// A sampler that returns a fixed reading — the [`FixedSampler`] twin, and `allow(dead_code)` for
+/// the same reason: the app constructs only the real one.
+#[allow(dead_code)]
+pub struct FixedLoadSampler(pub Option<LoadSample>);
+
+impl LoadSampler for FixedLoadSampler {
+    fn sample(&self) -> Option<LoadSample> {
+        self.0
+    }
+}
+
+/// The real reading: `getloadavg(3)`, which is a cheap in-process syscall — NOT a fork. That
+/// matters here more than it looks: this runs on every spawn and every capacity render, and the one
+/// thing a saturated machine is worst at is starting a process, so a sampler that shelled out to
+/// `sysctl` would be slowest exactly when it is most needed (the same reasoning
+/// [`memory_admission`] gives for `spawn_blocking`).
+/// `#[cfg(unix)]` ON THE IMPL, NOT ON THE TYPE, so `load_sampler()` resolves on every target and
+/// `mod memwatch` (unconditional at `lib.rs`) still compiles for Windows. `libc` is declared only
+/// under `[target.'cfg(unix)'.dependencies]` and `getloadavg` exists only in the crate's `src/unix/`
+/// tree, so an ungated `libc::getloadavg` is `E0433` on `x86_64-pc-windows-msvc`. Every other
+/// `libc::` use in this crate carries the same gate; this one was the exception (roborev 68367).
+///
+/// Nothing on a PR would have caught it: the Windows compile job is gated behind
+/// `ENABLE_HOSTED_RUST_CI` and is paused under the spend cap, so the first signal would have been
+/// `release.yml`'s `build-windows` — which runs `needs: release`, i.e. AFTER the macOS DMG has
+/// published. That is the v0.55.0 failure shape verbatim.
+pub struct SysLoadSampler;
+
+#[cfg(unix)]
+impl LoadSampler for SysLoadSampler {
+    fn sample(&self) -> Option<LoadSample> {
+        let mut avg = [0f64; 3];
+        // SAFETY: `getloadavg` writes at most `nelem` doubles into the caller's buffer; we pass a
+        // 3-element array and ask for 1. It returns the number written, or -1 when unavailable.
+        let n = unsafe { libc::getloadavg(avg.as_mut_ptr(), 1) };
+        if n < 1 {
+            return None;
+        }
+        let cores = std::thread::available_parallelism().ok()?.get() as u32;
+        Some(LoadSample { load1: avg[0], cores })
+    }
+}
+
+/// FAIL-OPEN on a platform with no `getloadavg`: "no basis to narrow", the same answer every other
+/// unreadable shape gives. A Windows build therefore behaves exactly as it did before this dimension
+/// existed, rather than refusing spawns on a reading it cannot take.
+#[cfg(not(unix))]
+impl LoadSampler for SysLoadSampler {
+    fn sample(&self) -> Option<LoadSample> {
+        None
+    }
+}
+
+fn load_sampler() -> &'static dyn LoadSampler {
+    &SysLoadSampler
+}
+
+/// Does the run queue refuse another agent? `Some(ceiling)` to hard-stop at what is already
+/// running, `None` for "no basis to narrow".
+///
+/// FAILS OPEN, and every arm of that is deliberate — an unmeasured machine is not a squeezed one,
+/// which is this module's standing contract for a missing reading. No sample, no cores, and a
+/// non-finite average (a garbage `getloadavg`, or a divide that produced NaN) all decline to
+/// narrow rather than refusing every spawn on a machine we simply could not read. Failing the other
+/// way would turn an unreadable load average into a fleet-wide outage.
+///
+/// A RATE, NOT A QUANTITY — so this hard-stops rather than computing headroom. `sampled_admission`
+/// can say "available ÷ per-agent = room for N more" because bytes divide into agent-sized pieces.
+/// A run queue does not: there is no honest way to say a load of 4.0/core "fits two more agents".
+/// So the answer is binary and the number it returns is `in_use` — hold the line at what is already
+/// running, and let the queue drain.
+///
+/// Floored at 1 for the identical reason [`sampled_admission`] floors: a ceiling of zero deadlocks
+/// the orchestrator instead of degrading it, and a user on a busy machine must still be able to
+/// start the one agent they asked for.
+pub fn load_narrowed(in_use: u32, sample: Option<&LoadSample>) -> Option<u32> {
+    let s = sample?;
+    if s.cores == 0 || !s.load1.is_finite() {
+        return None;
+    }
+    let per_core = s.load1 / f64::from(s.cores);
+    if !per_core.is_finite() || per_core < LOAD_REFUSE_PER_CORE {
+        return None;
+    }
+    Some(in_use.max(1))
+}
+
+/// The sentence a human reads when the run queue is what stood in their way. Composed next to the
+/// number it explains, for the same reason every other basis here is.
+fn load_basis(in_use: u32, s: &LoadSample) -> String {
+    format!(
+        "refused: the CPU run queue is {:.1} deep across {} cores ({:.1}× per core, refusing past \
+         {:.1}×) — the {in_use} agent(s) already running are contending for the cores, so another \
+         would finish everything later rather than sooner",
+        s.load1,
+        s.cores,
+        s.load1 / f64::from(s.cores.max(1)),
+        LOAD_REFUSE_PER_CORE,
+    )
+}
+
 // ============================== admission ==============================
 
 /// What the RUNTIME sample says about admitting another agent, on top of whatever the static
@@ -210,9 +377,10 @@ pub struct Admission {
     pub admitted: u32,
     /// The static ceiling this narrowed (or didn't), carried so a consumer can show both numbers.
     pub static_max: u32,
-    /// Which dimension binds `admitted`. `Bound::Pressure` / `Bound::Available` are the two this
-    /// module can introduce; anything else means the static derivation still binds and is passed
-    /// through unchanged by [`sampled_concurrency`].
+    /// Which dimension binds `admitted`. `Bound::Pressure` / `Bound::Available` are the two THIS
+    /// FUNCTION can introduce — it sees only memory. `Bound::Load` is the third the MODULE can, but
+    /// it is applied one level up in [`sampled_concurrency`], not here. Anything else means the
+    /// static derivation still binds and is passed through unchanged by [`sampled_concurrency`].
     pub bound: Bound,
     /// One human sentence. The point of the whole exercise: the human must be able to read
     /// "refused: memory pressure", not just "at capacity".
@@ -381,16 +549,58 @@ pub fn sampled_concurrency(
     in_use: u32,
     per_agent_bytes: u64,
     sample: Option<&MemorySample>,
+    load: Option<&LoadSample>,
 ) -> ConcurrencyAdmission {
     let a = sampled_admission(static_max, in_use, per_agent_bytes, sample);
-    let narrowed = a.admitted < static_max;
+
+    // THE TWO RUNTIME DIMENSIONS COMPOSE AS A MIN, and the load half may only ever take the number
+    // DOWN — same "can only refuse, never raise" contract the memory half is built on, so a load
+    // reading that is absent, unreadable or generous degrades to exactly the pre-existing behaviour.
+    // `load_narrowed` already floors at 1; the `min` cannot lift `a.admitted`, so the invariant
+    // `effective <= static_max` still holds by construction.
+    //
+    // WHICH ONE GETS TO EXPLAIN ITSELF: whichever is actually binding, and ties go to memory. A tie
+    // means both dimensions independently landed on the same ceiling, and memory is the one with a
+    // remedy the human can act on ("close something") — telling them the run queue is deep when the
+    // machine is equally out of RAM sends them to tune the wrong thing, which is precisely the
+    // mis-attribution `Bound` was introduced to prevent.
+    let by_load = load_narrowed(in_use, load);
+    let load_binds = by_load.is_some_and(|l| l < a.admitted);
+    let effective = by_load.map_or(a.admitted, |l| a.admitted.min(l));
+    let narrowed = effective < static_max;
+
     ConcurrencyAdmission {
-        effective: a.admitted,
+        effective,
         static_max,
         static_bound,
-        bound: if narrowed { a.bound } else { static_bound },
-        basis: if narrowed { a.basis } else { static_basis.to_string() },
-        sampled: a.sampled,
+        bound: match (narrowed, load_binds) {
+            (true, true) => Bound::Load,
+            (true, false) => a.bound,
+            (false, _) => static_bound,
+        },
+        basis: match (narrowed, load_binds) {
+            // `load_binds` is only ever true when `load` was `Some`, so the expect is unreachable;
+            // it is written this way rather than with a default sentence so a future edit that
+            // breaks that coupling fails loudly instead of printing a basis about no reading.
+            (true, true) => load_basis(in_use, load.expect("load_binds implies a load sample")),
+            (true, false) => a.basis,
+            (false, _) => static_basis.to_string(),
+        },
+        // `sampled` MUST mean "some runtime dimension spoke", NOT "memory spoke" — and getting that
+        // wrong made this whole gate inert in exactly the condition it was built for (roborev 68367,
+        // High). The only consumer, `services/agentCapacity.localAgentCapacity`, applies the
+        // narrowing inside `if (admission && admission.sampled)`. Meanwhile `sample_now()` FORKS FOUR
+        // PROCESSES (`sysctl` ×3, `vm_stat`) and `?`-bails to `None` if any fails — and this
+        // module's own premise is a machine that cannot start a process (46 `/bin/bash` SIGBUS
+        // launch failures at load 387). So on the saturated machine the memory sample is precisely
+        // the thing most likely to be `None`, `sampled` would read false, and the frontend would
+        // discard a perfectly good load narrowing wholesale. Every Rust test still passed, because
+        // they stop at this function's return value and never cross the seam.
+        //
+        // `sample` stays `a.sample`, so a load-only narrowing still claims NO memory reading — the
+        // honest half of the original instinct is kept. What changes is only the "did anything
+        // measure this?" flag, which is the question the consumer is actually asking.
+        sampled: a.sampled || load_binds,
         sample: a.sample,
     }
 }
@@ -868,6 +1078,12 @@ pub async fn memory_admission(in_use: u32) -> ConcurrencyAdmission {
     } else {
         None
     };
+    // Gated by the SAME switch as the memory sample: `pressure_gate` is the user's "do not let
+    // runtime measurement narrow my ceiling" control, and a second runtime narrowing that ignored it
+    // would quietly re-impose what they turned off. Read inline rather than through
+    // `spawn_blocking`: `getloadavg` is a syscall, not a fork, so there is no blocking half to move
+    // off the runtime (see `SysLoadSampler`).
+    let load = if eff.config.memory.pressure_gate { load_sampler().sample() } else { None };
     sampled_concurrency(
         eff.effective_max_concurrent,
         eff.concurrency_bound,
@@ -875,6 +1091,7 @@ pub async fn memory_admission(in_use: u32) -> ConcurrencyAdmission {
         in_use,
         per_agent,
         sample.as_ref(),
+        load.as_ref(),
     )
 }
 
@@ -1584,15 +1801,170 @@ mod tests {
     #[test]
     fn sampled_concurrency_passes_the_static_basis_through_when_memory_does_not_bind() {
         let s = sample(128 * GIB, 100 * GIB, PressureLevel::Normal);
-        let c = sampled_concurrency(36, Bound::Cpu, "CPU-bound: 18 cores × 2 agents per core", 0, PER_AGENT, Some(&s));
+        let c = sampled_concurrency(36, Bound::Cpu, "CPU-bound: 18 cores × 2 agents per core", 0, PER_AGENT, Some(&s), None);
         assert_eq!(c.effective, 36);
         assert_eq!(c.bound, Bound::Cpu, "the static attribution survives");
         assert!(c.basis.starts_with("CPU-bound"));
 
         let tight = sample(128 * GIB, 3 * GIB, PressureLevel::Normal);
-        let c2 = sampled_concurrency(36, Bound::Cpu, "CPU-bound: …", 1, PER_AGENT, Some(&tight));
+        let c2 = sampled_concurrency(36, Bound::Cpu, "CPU-bound: …", 1, PER_AGENT, Some(&tight), None);
         assert_eq!(c2.effective, 3);
         assert_eq!(c2.bound, Bound::Available, "…and is replaced when memory takes over");
         assert_eq!(c2.static_bound, Bound::Cpu, "both are reported, so neither is lost");
+    }
+
+    // ── the CPU run queue (sparkle-tab3nm PREVENT half) ─────────────────────────────────────────
+    //
+    // THE MEASUREMENT THESE ARE BUILT FROM, so the numbers are not invented: the founder's 18-core
+    // dev machine on 2026-08-23, while agents were exiting mid-task and being auto-resumed, sat at
+    // load average 387 with 69 concurrent `claude` processes — and `memory_pressure` reported 48%
+    // free at that same instant. That combination is the whole point: the memory gate was correctly
+    // saying "there is room" about a machine that could not start `/bin/bash` (46 SIGBUS launch
+    // failures that day, none on any prior day).
+
+    /// A roomy 128 GiB reading, so ONLY the run queue can be what narrows.
+    fn roomy() -> MemorySample {
+        sample(128 * GIB, 100 * GIB, PressureLevel::Normal)
+    }
+
+    #[test]
+    fn a_saturated_run_queue_refuses_another_agent_while_memory_still_reads_roomy() {
+        let mem = roomy();
+        // The measured machine: 387 across 18 cores = 21.5× per core.
+        let load = LoadSample { load1: 387.0, cores: 18 };
+
+        // Memory alone would admit the full static ceiling — assert that FIRST, or this test could
+        // pass on a machine the memory gate was already narrowing and prove nothing about load.
+        let memory_only =
+            sampled_concurrency(81, Bound::Ram, "RAM-bound: …", 69, PER_AGENT, Some(&mem), None);
+        assert_eq!(memory_only.effective, 81, "precondition: memory is not the constraint here");
+
+        let c = sampled_concurrency(81, Bound::Ram, "RAM-bound: …", 69, PER_AGENT, Some(&mem), Some(&load));
+        assert_eq!(c.effective, 69, "held at what is already running — no 70th agent");
+        assert_eq!(c.bound, Bound::Load, "and the human is told WHICH dimension refused");
+        assert_eq!(c.static_bound, Bound::Ram, "the static attribution is still reported");
+        assert!(
+            c.basis.contains("run queue") && c.basis.contains("21.5"),
+            "the refusal states the reading it acted on: {}",
+            c.basis
+        );
+    }
+
+    #[test]
+    fn a_healthy_run_queue_narrows_nothing() {
+        // The PAIRED case. Without it, a gate that simply always refused would pass the test above.
+        let mem = roomy();
+        let load = LoadSample { load1: 9.0, cores: 18 }; // 0.5× per core — half idle
+        let c = sampled_concurrency(81, Bound::Ram, "RAM-bound: …", 69, PER_AGENT, Some(&mem), Some(&load));
+        assert_eq!(c.effective, 81, "a busy-but-healthy fleet is not throttled");
+        assert_eq!(c.bound, Bound::Ram, "and nothing claims the run queue bound it");
+        assert!(c.basis.starts_with("RAM-bound"), "the static basis survives: {}", c.basis);
+    }
+
+    #[test]
+    fn the_threshold_is_the_line_between_those_two() {
+        let mem = roomy();
+        let cores = 18u32;
+        let just_under = LoadSample { load1: (LOAD_REFUSE_PER_CORE - 0.01) * f64::from(cores), cores };
+        let just_over = LoadSample { load1: LOAD_REFUSE_PER_CORE * f64::from(cores), cores };
+        assert_eq!(load_narrowed(69, Some(&just_under)), None, "below the line: no opinion");
+        assert_eq!(load_narrowed(69, Some(&just_over)), Some(69), "at the line: refuse");
+        // …and it reaches the composed answer, not just the predicate.
+        let c = sampled_concurrency(81, Bound::Ram, "RAM-bound: …", 69, PER_AGENT, Some(&mem), Some(&just_under));
+        assert_eq!(c.effective, 81);
+    }
+
+    #[test]
+    fn an_unreadable_run_queue_narrows_nothing_rather_than_refusing_everything() {
+        // FAILS OPEN, in every shape of "we could not read it". The opposite direction would turn a
+        // broken `getloadavg` into a fleet-wide refusal.
+        assert_eq!(load_narrowed(69, None), None, "no sample");
+        assert_eq!(
+            load_narrowed(69, Some(&LoadSample { load1: 999.0, cores: 0 })),
+            None,
+            "no core count — the ratio is meaningless, not alarming"
+        );
+        assert_eq!(
+            load_narrowed(69, Some(&LoadSample { load1: f64::NAN, cores: 18 })),
+            None,
+            "a garbage average is not evidence of a busy machine"
+        );
+        assert_eq!(
+            load_narrowed(69, Some(&LoadSample { load1: f64::INFINITY, cores: 18 })),
+            None,
+            "nor is an infinite one"
+        );
+
+        // And the composed path degrades to exactly the pre-existing memory answer.
+        let tight = sample(128 * GIB, 3 * GIB, PressureLevel::Normal);
+        let with = sampled_concurrency(36, Bound::Cpu, "CPU-bound: …", 1, PER_AGENT, Some(&tight), None);
+        assert_eq!(with.effective, 3, "unchanged from before this dimension existed");
+        assert_eq!(with.bound, Bound::Available);
+    }
+
+    #[test]
+    fn the_run_queue_may_only_refuse_never_raise() {
+        // The module's standing contract, now that a SECOND dimension can speak: a calm run queue
+        // must not lift a ceiling memory has already narrowed.
+        let tight = sample(128 * GIB, 3 * GIB, PressureLevel::Normal);
+        let calm = LoadSample { load1: 0.2, cores: 18 };
+        let c = sampled_concurrency(36, Bound::Cpu, "CPU-bound: …", 1, PER_AGENT, Some(&tight), Some(&calm));
+        assert_eq!(c.effective, 3, "memory's narrowing stands");
+        assert_eq!(c.bound, Bound::Available, "and memory keeps the attribution");
+        assert!(c.effective <= c.static_max, "the invariant holds with both dimensions live");
+    }
+
+    #[test]
+    fn the_stricter_dimension_binds_and_ties_go_to_memory() {
+        let busy = LoadSample { load1: 387.0, cores: 18 };
+        // Memory admits 3; the run queue would hold at in_use = 1. The run queue is stricter.
+        let tight = sample(128 * GIB, 3 * GIB, PressureLevel::Normal);
+        let c = sampled_concurrency(36, Bound::Cpu, "CPU-bound: …", 1, PER_AGENT, Some(&tight), Some(&busy));
+        assert_eq!(c.effective, 1, "the stricter of the two wins");
+        assert_eq!(c.bound, Bound::Load);
+
+        // A TIE: memory also lands exactly on in_use, so both say 2. Memory explains it, because its
+        // remedy ("close something") is the one the human can act on.
+        let tie = sample(128 * GIB, 0, PressureLevel::Critical);
+        let c2 = sampled_concurrency(36, Bound::Cpu, "CPU-bound: …", 2, PER_AGENT, Some(&tie), Some(&busy));
+        assert_eq!(c2.effective, 2);
+        assert_eq!(c2.bound, Bound::Pressure, "a tie is attributed to memory, not the run queue");
+    }
+
+    #[test]
+    fn a_load_only_narrowing_still_reports_itself_as_sampled() {
+        // REGRESSION GUARD for the defect that made this gate inert in the one condition it exists
+        // for (roborev 68367). `sample_now()` forks four processes and returns None if any fails —
+        // and a machine at 21.5x per-core load is precisely a machine that cannot fork. If `sampled`
+        // tracked only the MEMORY sampler, the frontend's `if (admission.sampled)` would throw the
+        // load narrowing away exactly when it is the only reading anyone got.
+        let load = LoadSample { load1: 387.0, cores: 18 };
+        let c = sampled_concurrency(81, Bound::Ram, "RAM-bound: …", 69, PER_AGENT, None, Some(&load));
+
+        assert_eq!(c.effective, 69, "the run queue still narrows with no memory reading at all");
+        assert_eq!(c.bound, Bound::Load);
+        assert!(c.sampled, "…and says a measurement happened, or the consumer discards it");
+        assert!(c.sample.is_none(), "while still claiming NO memory reading, because there was none");
+    }
+
+    #[test]
+    fn no_reading_from_either_dimension_is_still_not_sampled() {
+        // The paired case: `sampled` must not become a constant true. With nothing measured at all
+        // the gate has to degrade to the untouched static ceiling.
+        let c = sampled_concurrency(81, Bound::Ram, "RAM-bound: …", 69, PER_AGENT, None, None);
+        assert_eq!(c.effective, 81);
+        assert_eq!(c.bound, Bound::Ram);
+        assert!(!c.sampled, "nothing measured — the consumer must leave the ceiling alone");
+    }
+
+    #[test]
+    fn a_saturated_machine_can_still_start_the_first_agent() {
+        // Floored at 1: refusing everything presents as a hung app, and an idle-but-loaded machine
+        // must still honour the one agent the user asked for.
+        let load = LoadSample { load1: 387.0, cores: 18 };
+        assert_eq!(load_narrowed(0, Some(&load)), Some(1), "never zero — that deadlocks the orchestrator");
+        let mem = roomy();
+        let c = sampled_concurrency(81, Bound::Ram, "RAM-bound: …", 0, PER_AGENT, Some(&mem), Some(&load));
+        assert_eq!(c.effective, 1);
     }
 }

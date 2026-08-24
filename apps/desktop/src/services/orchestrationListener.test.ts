@@ -17,6 +17,16 @@ vi.mock("@tauri-apps/api/event", () => ({
     return Promise.resolve(unlistenMock);
   }),
 }));
+// --- the LIVE admission reading the worker gate now consults. `null` is the default and is what
+//     every pre-existing test below runs with, so they exercise the untouched static-ceiling path
+//     byte-for-byte. `importActual` is spread first so the module's other exports (used elsewhere in
+//     this import graph) keep working; only the one accessor is overridden. ---
+let admissionReading: import("./memoryAdmission").ConcurrencyAdmission | null = null;
+vi.mock("./memoryAdmission", async (importActual) => ({
+  ...(await importActual<typeof import("./memoryAdmission")>()),
+  currentMemoryAdmission: () => admissionReading,
+}));
+
 // vi.fn() with no impl → typed as Mock<any[], any>, so spreading unknown[] into it is allowed.
 // (vi.fn(() => impl) would infer [] for Args and break the spread — see workerSpawn.test.ts.)
 const invokeMock = vi.fn();
@@ -645,6 +655,60 @@ describe("orchestrationListener", () => {
     await flush();
     expect(spawnWorkerMock).toHaveBeenCalledTimes(1); // held at the RAM cap, not the configured 4
     expect(invokeMock).not.toHaveBeenCalled(); // m2's reply deferred until a slot frees
+  });
+
+  it("refuses a worker spawn when the CPU RUN QUEUE is saturated, not just when RAM is (sparkle-tab3nm)", async () => {
+    // THE POPULATION THAT CAUSED THE MEASURED INCIDENT. 69 concurrent model processes at load 387
+    // on 18 cores (21.5× per core) were ORCHESTRATOR WORKERS — and this gate, documented as "the
+    // ONLY concurrency gate for worker spawns", compared against the STATIC ceiling alone. Every
+    // runtime measurement was invisible to it, so the run-queue bound could not refuse the very
+    // spawns it was built to refuse (roborev 68367, High).
+    //
+    // THE NUMBERS ENCODE THE POPULATION MISMATCH, and they have to, or this test cannot tell the
+    // run-queue branch from the ordinary `min` clamp beside it. `Bound::Load`'s `effective` is
+    // `in_use` — the WHOLE fleet (build agents + workers), 69 in the measurement — while
+    // `globalUsedSlots()` counts `kind === "worker"` only. So: a roomy static cap of 20, a fleet
+    // `in_use` of 8, and ONE live worker. Clamping `20 → 8` and comparing the worker count against
+    // it gives `1 >= 8` → admits, which is exactly the silent under-bind. Reading the DIMENSION
+    // instead refuses. (Verified by mutation: with the `bound === "load"` line removed this test
+    // goes red; an earlier version using a cap of 4 stayed green, because there the clamp happened
+    // to land on the same answer and the test proved nothing about the branch.)
+    useSettingsStore.setState({ maxConcurrentWorkers: 20, effectiveMaxConcurrentWorkers: 20 });
+
+    // Baseline: with no reading, the roomy static cap admits. This is the vacuous-test guard — it
+    // proves the refusal that follows is caused by the reading and not by the seeded fixture.
+    admissionReading = null;
+    fire({ reqId: "l0", op: "spawn_worker", buildAgentId: buildId, projectId, payload: { task: "ok" } });
+    await flush();
+    expect(spawnWorkerMock).toHaveBeenCalledTimes(1);
+
+    admissionReading = {
+      // The whole fleet's `in_use`, NOT the worker count — see the note on the numbers above.
+      effective: 8,
+      static_max: 20,
+      static_bound: "cpu",
+      bound: "load",
+      basis: "refused: the CPU run queue is 387.0 deep across 18 cores (21.5× per core…)",
+      sampled: true,
+      // NO memory sample — the realistic saturated-machine payload, since `sample_now()` forks four
+      // processes and a machine at this load is one that cannot fork.
+      sample: null,
+    };
+    invokeMock.mockClear();
+    fire({ reqId: "l1", op: "spawn_worker", buildAgentId: buildId, projectId, payload: { task: "no" } });
+    await flush();
+    expect(spawnWorkerMock).toHaveBeenCalledTimes(1); // held: the cores are the constraint
+    expect(invokeMock).not.toHaveBeenCalled(); // reply deferred until the queue drains
+
+    // …and it RETRACTS, RELEASING THE HELD SPAWN RATHER THAN DROPPING IT. A gate that cannot release
+    // is a wedged app, and one that silently discards what it queued is worse than one that refused
+    // outright. So once the queue drains, BOTH the spawn held above and the new one go through — 3
+    // total, not 2. (An earlier draft of this test asserted 2 and was wrong about the mechanism: the
+    // deferred `l1` reply is resumed by the same drain, which is the whole point of deferring it.)
+    admissionReading = null;
+    fire({ reqId: "l2", op: "spawn_worker", buildAgentId: buildId, projectId, payload: { task: "again" } });
+    await flush();
+    expect(spawnWorkerMock).toHaveBeenCalledTimes(3);
   });
 
   it("counts workers MACHINE-WIDE against the RAM cap, not per build agent (sparkle-hfhs)", async () => {

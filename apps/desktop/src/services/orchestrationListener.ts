@@ -22,6 +22,7 @@ import { useProjectStore, isLocallyRemoved } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import type { AgentTabStatus } from "../types";
 import { useSettingsStore, enforcedWorkerCap } from "../stores/settingsStore";
+import { currentMemoryAdmission } from "./memoryAdmission";
 import { workersNeedingOpen, isNotYetLiveWorker } from "../engine/workerAttention";
 
 const EVENT = "orchestration:request";
@@ -263,7 +264,43 @@ function atCapacity(): boolean {
  *  needs its OWN key — e.g. `[workers].max_per_agent` — because one key cannot carry both dimensions.
  *  That ambiguity is the defect this ratification closes; do not re-overload this one. */
 function globalGateBinds(): boolean {
-  return globalUsedSlots() >= Math.max(1, enforcedWorkerCap(useSettingsStore.getState()));
+  const staticCap = Math.max(1, enforcedWorkerCap(useSettingsStore.getState()));
+  const admission = currentMemoryAdmission();
+
+  // ── THE RUNTIME NARROWING REACHES WORKER SPAWNS TOO (roborev 68367, High) ────────────────────
+  //
+  // Until this, the static `enforcedWorkerCap` was the ONLY thing this gate compared against, so
+  // every runtime measurement — the pre-existing memory narrowing and the run-queue bound alike —
+  // was invisible to the one gate that admits workers. `localAgentCapacity` consulted it; this did
+  // not. That mattered because the 69 concurrent model processes in the measurement behind
+  // `Bound::Load` WERE orchestrator workers: the gate that could have refused them was the gate
+  // reading a number computed once at startup from hardware.
+  //
+  // STRICTLY TIGHTER, NEVER LOOSER — the same one-directional contract the Rust side and
+  // `localAgentCapacity` are built on. `Math.min` against `staticCap` means a backend bug, a version
+  // skew or a tampered payload cannot RAISE a ceiling that exists to stop the machine being
+  // jetsam-killed; and an absent, stale or unsampled reading leaves this expression byte-for-byte
+  // what it was before. An unmeasured machine is not a squeezed one.
+  if (!admission || !admission.sampled) return globalUsedSlots() >= staticCap;
+
+  // A SATURATED RUN QUEUE REFUSES OUTRIGHT rather than through the count, and the asymmetry with the
+  // memory bounds is deliberate. The memory dimensions are QUANTITIES: `effective` is a genuine
+  // "this many fit", so comparing a count against it is meaningful. `Bound::Load` is a RATE, and its
+  // `effective` is just `in_use` — the agents already running, counted over a DIFFERENT population
+  // than `globalUsedSlots()` (which counts `kind === "worker"` only; see the unresolved mismatch
+  // documented above and in bead `sparkle-dv65b`). Comparing a worker-only count against a
+  // whole-fleet `in_use` would silently under-bind — 40 workers against an `in_use` of 69 admits
+  // more workers onto a machine at 21.5x per-core load, which is the exact spawn this bound exists
+  // to refuse. So when the run queue is what binds, the answer is "no more", read off the DIMENSION
+  // rather than off two counts that do not mean the same thing.
+  //
+  // `globalUsedSlots() > 0` keeps the "you can always start the first one" floor that
+  // `load_narrowed` establishes on the Rust side: a loaded-but-worker-less box still admits one, so
+  // a busy machine can never present as an app that refuses everything.
+  if (admission.bound === "load") return globalUsedSlots() > 0;
+
+  const narrowed = Math.max(1, Math.min(staticCap, Math.floor(admission.effective)));
+  return globalUsedSlots() >= narrowed;
 }
 
 /** Status token surfaced by list_workers: the terminal completion VERDICT when the worker has

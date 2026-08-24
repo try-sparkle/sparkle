@@ -506,7 +506,12 @@ export type ConcurrencyBound =
   | "pinned"
   | "unknown"
   | "available"
-  | "pressure";
+  | "pressure"
+  // The CPU RUN QUEUE bound it: load average per core is past what the cores can retire, so another
+  // agent would add contention rather than throughput. The third narrowing bound and the first that
+  // is not about memory — `memwatch::Bound::Load`. Distinct from `"cpu"`, which is how many cores
+  // the machine HAS; this is how busy they are right now, and the remedy is to wait, not to buy.
+  | "load";
 export interface ConfigPaths {
   global: string;
   /** Present only when a project root is in context. */

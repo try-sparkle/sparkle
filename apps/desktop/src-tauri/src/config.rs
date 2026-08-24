@@ -3956,6 +3956,21 @@ pub enum Bound {
     /// PRESSURE, so no further agent is admitted regardless of what the arithmetic allows. The one
     /// bound that says "refused: memory pressure" rather than "at capacity".
     Pressure,
+    /// The CPU RUN QUEUE is the constraint: load average per core is past what the cores can
+    /// retire, so another agent would add contention rather than throughput.
+    ///
+    /// THE DIMENSION THE MEMORY-ONLY GATE CANNOT SEE, and the gap is documented rather than
+    /// theoretical — `AGENT_TEST_WORKER_CAP`'s comment names "the process/CPU storm behind the 2026
+    /// swap-thrash incident (438 → 1600+ processes, load 15 → 55), which the memory-only admission
+    /// gate cannot see because reclaimable file cache reads as 'available'". Every other runtime
+    /// bound here is a QUANTITY (bytes left to hand out); this one is a RATE, which is why it
+    /// hard-stops at the agents already running instead of computing how many more "fit" — you
+    /// cannot divide a run queue into agent-sized pieces.
+    ///
+    /// Distinct from [`Bound::Cpu`], which is a fact about how many cores the machine HAS. This one
+    /// is a fact about how busy they are RIGHT NOW, and the remedy is to wait or stop something,
+    /// not to buy a bigger machine.
+    Load,
     /// Nothing measurable (unsupported platform / sysctl failure) and no pin either.
     Unknown,
 }
@@ -9003,6 +9018,12 @@ quit_app = 42
             // these exact strings in services/config.ts's `ConcurrencyBound` union.
             (Bound::Available, "\"available\""),
             (Bound::Pressure, "\"pressure\""),
+            // …and the run-queue bound is the third of that family, added deliberately HERE at the
+            // same time as the variant rather than left for the next roborev to catch. This table is
+            // hand-written and NOT compiler-checked (`bound_wire_string` below is the exhaustive
+            // one), so it is the half that silently rots — which is exactly what happened to the two
+            // lines above.
+            (Bound::Load, "\"load\""),
             (Bound::Unknown, "\"unknown\""),
         ] {
             assert_eq!(serde_json::to_string(&b).unwrap(), s);
@@ -9029,6 +9050,7 @@ quit_app = 42
             Bound::Pinned => "\"pinned\"",
             Bound::Available => "\"available\"",
             Bound::Pressure => "\"pressure\"",
+            Bound::Load => "\"load\"",
             Bound::Unknown => "\"unknown\"",
         }
     }
@@ -9040,13 +9062,14 @@ quit_app = 42
         // ALL_BOUNDS is checked against the match above by construction: if a variant were missing
         // here, `bound_wire_string` would still compile — so the real guard is that adding a variant
         // breaks `bound_wire_string`, and whoever fixes that lands here next.
-        const ALL_BOUNDS: [Bound; 7] = [
+        const ALL_BOUNDS: [Bound; 8] = [
             Bound::Cpu,
             Bound::Ram,
             Bound::Both,
             Bound::Pinned,
             Bound::Available,
             Bound::Pressure,
+            Bound::Load,
             Bound::Unknown,
         ];
         let mut seen = std::collections::HashSet::new();
