@@ -3,6 +3,15 @@
 // screenshot]"*, where *"clicking on the preview card would take me out to the actual localhost URL
 // and I could click on the builder agent name to go into that builder agent."*
 //
+// ══ THE GESTURES WERE SPLIT LATER (sparkle-7kn6bk) ══════════════════════════════════════════════
+// The card first shipped at a small fixed size whose single click opened the browser — and that was
+// the wrong default for a card too small to judge anything by: the reader's first instinct is to
+// make it bigger, not to leave the app. So now the card is ~1/3 the chat column and a SINGLE CLICK
+// EXPANDS it in place to full width; the browser is a DOUBLE CLICK, plus an explicit "Open in
+// browser" button so the gesture is discoverable and keyboard-reachable rather than resting on a
+// double-click nobody guesses. The founder quote above still describes the destination; only which
+// gesture reaches it has moved.
+//
 // ══ WHAT WAS ACTUALLY BROKEN ════════════════════════════════════════════════════════════════════
 // Not the preview subsystem — that works. The url. It is printed once into a terminal that keeps
 // scrolling, so the one fact worth acting on ("there is something to LOOK at, right now") is gone
@@ -30,7 +39,7 @@
 // wraps — so a renamed agent's card renames itself and there is no second roster to go stale.
 import { useCallback, useEffect, useRef, useState, type CSSProperties } from "react";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { FiRefreshCw } from "react-icons/fi";
+import { FiExternalLink, FiRefreshCw } from "react-icons/fi";
 
 import { AgentPill } from "./AgentPill";
 // The SAME "time ago" the prompt-history dropdown uses. It takes `nowMs` as an argument rather than
@@ -85,6 +94,24 @@ export const PREVIEW_CARD_REFRESH_FAILED_TESTID = "concierge-preview-refresh-fai
 /** The "didn't open, and here is why" line. Present ONLY after a click this card refused — see
  *  {@link PREVIEW_OPEN_REFUSAL_COPY} for why a refusal has to be visible rather than silent. */
 export const PREVIEW_CARD_REFUSED_TESTID = "concierge-preview-refused";
+
+/** The explicit "Open in browser" control. The card's PRIMARY click now expands in place rather
+ *  than navigating (bead sparkle-7kn6bk), so the escape hatch to a real browser has to be a
+ *  discoverable, keyboard-reachable button of its own — a double-click is a gesture nobody guesses
+ *  and no keyboard can make. */
+export const PREVIEW_CARD_OPEN_TESTID = "concierge-preview-open";
+
+/**
+ * THE TWO WIDTHS A CARD OCCUPIES, exported so a test can assert the SIZE rather than eyeballing it.
+ *
+ * The founder's ask (sparkle-7kn6bk): a card is ~1/3 the chat column collapsed and the full column
+ * expanded, expanding IN PLACE on a single click. These are `width` values on a card that also sets
+ * `alignSelf: "flex-start"`, so the collapsed card does NOT stretch to fill the flex column — the
+ * fraction is real, not merely a max. `100%` is the whole column, not a modal: the shared chat-thread
+ * contract on this bead is "collapsed = identity, expand in place, never a modal".
+ */
+export const PREVIEW_CARD_COLLAPSED_WIDTH = "33%";
+export const PREVIEW_CARD_EXPANDED_WIDTH = "100%";
 
 /**
  * WHAT THE CARD SAYS WHEN IT WILL NOT OPEN, in the reader's language rather than the wire's.
@@ -187,11 +214,18 @@ export const PREVIEW_CARD_LEAD = "has a preview for you to review:";
  *  push the composer off screen. */
 const MAX_ZONE_HEIGHT = 260;
 
-const card = (): CSSProperties => ({
+const card = (expanded: boolean): CSSProperties => ({
   display: "flex",
   flexDirection: "column",
   gap: 6,
   minWidth: 0,
+  // ~1/3 THE CHAT COLUMN COLLAPSED, THE WHOLE COLUMN EXPANDED (sparkle-7kn6bk). `alignSelf` is the
+  // half that makes the fraction real: the strip is a flex column, so without it a `width` below
+  // 100% is still stretched to fill by `align-items: stretch`, and the card would read full-width
+  // whatever the number said. Anchored to the start so the collapsed card sits where the reader's
+  // eye already is rather than centring itself.
+  width: expanded ? PREVIEW_CARD_EXPANDED_WIDTH : PREVIEW_CARD_COLLAPSED_WIDTH,
+  alignSelf: "flex-start",
   padding: "7px 9px",
   borderRadius: RADIUS.sm,
   border: `1px solid ${C.hairline}`,
@@ -202,13 +236,16 @@ const card = (): CSSProperties => ({
   overflow: "hidden",
 });
 
-const shot = (): CSSProperties => ({
+const shot = (expanded: boolean): CSSProperties => ({
   display: "block",
   width: "100%",
-  // The picture is a CUE, not the artefact. It exists so the reader can tell at a glance which of
-  // two previews is theirs; the real thing is one click away, full size, in a real browser.
-  maxHeight: 150,
-  objectFit: "cover",
+  // COLLAPSED: the picture is a CUE, not the artefact — capped and top-cropped so the card stays a
+  // recognisable thumbnail the reader can tell apart from a sibling's at a glance.
+  // EXPANDED: height follows the preview's OWN aspect ratio (`height: auto`, no crop), which is the
+  // founder's ask — the expanded card is the closest thing to the real page short of the browser.
+  maxHeight: expanded ? undefined : 150,
+  height: expanded ? "auto" : undefined,
+  objectFit: expanded ? "contain" : "cover",
   objectPosition: "top",
   borderRadius: RADIUS.sm,
   border: `1px solid ${C.hairline}`,
@@ -243,6 +280,11 @@ function PreviewCard({
    * It is still a value read at RENDER time — which is why it is checked again below. See `open`.
    */
   const heldPort = usePreviewStore((s) => s.byAgent[agentId]?.port ?? null);
+  /** EXPANDED IN PLACE, per this card's own id and ephemeral (bead sparkle-7kn6bk + the shared
+   *  chat-thread contract on it: expanded state is per-item and does not survive a remount). A
+   *  single click toggles it; the card grows to the full chat-column width and the screenshot to the
+   *  preview's own height, with scroll position untouched — it is never a modal. */
+  const [expanded, setExpanded] = useState(false);
   const [shotState, setShotState] = useState<{ dataUrl: string; capturedAt: number } | null>(null);
   /** Why the last click did not open anything. Null until a click is refused, and deliberately NOT
    *  cleared when the url changes — the `moved` refusal's whole point is that the card corrected
@@ -388,6 +430,24 @@ function PreviewCard({
       });
   };
 
+  /**
+   * THE PRIMARY GESTURE NOW: expand the card in place, or collapse it again — never navigate.
+   *
+   * A single click used to open the browser, which is the wrong default for a card too small to
+   * judge anything by (sparkle-7kn6bk): the reader's first instinct is to make it bigger, not to
+   * leave the app. So a click grows the card to the full chat-column width at the preview's own
+   * height, and a second click puts it back.
+   *
+   * IT STAMPS ACTIVITY, exactly as `open`/`capture` do. Expanding a card is a human saying "I am
+   * looking at this right now", which is the one signal `previewIdleGrace` has to keep the dev
+   * server alive — see the block comment on `notePreviewActivity`'s import. Synchronous and first,
+   * so nothing about the toggle can cost the signal.
+   */
+  const toggleExpanded = () => {
+    notePreviewActivity(agentId);
+    setExpanded((v) => !v);
+  };
+
   return (
     <div
       data-testid={PREVIEW_CARD_TESTID}
@@ -398,22 +458,34 @@ function PreviewCard({
       // right agent, which is the claim that actually failed. Absent rather than `"null"` when
       // there is none, so "no port" and the string "null" cannot be confused.
       data-preview-port={heldPort === null ? undefined : String(heldPort)}
+      // WHICH SIZE THIS CARD IS, published as a fact so a test asserts the expand SIDE EFFECT rather
+      // than eyeballing a width. Absent rather than `"false"` when collapsed, so the attribute's
+      // presence is itself the signal.
+      data-expanded={expanded ? "true" : undefined}
       role="button"
       tabIndex={0}
-      // THE URL IS IN THE ACCESSIBLE NAME. A card whose whole promise is "this opens somewhere
-      // outside the app" has to say where before it is activated, not after.
-      aria-label={`Open ${name}'s preview at ${url}`}
-      onClick={open}
+      // THE CARD IS A TOGGLE NOW, so it announces its expanded state and what activating it does.
+      // The url is NOT in this name any more — a single click no longer navigates there; the
+      // "Open in browser" button below carries the url in its own accessible name instead.
+      aria-expanded={expanded}
+      aria-label={`${expanded ? "Collapse" : "Expand"} ${name}'s preview`}
+      // SINGLE CLICK EXPANDS, DOUBLE CLICK OPENS (sparkle-7kn6bk). React fires `onDoubleClick` from
+      // the browser's own `dblclick`, which arrives AFTER the two clicks — so a double-click toggles
+      // twice (a no-op, back to where it started) and then opens, which is the intended net effect.
+      onClick={toggleExpanded}
+      onDoubleClick={open}
       onKeyDown={(e) => {
-        // ONLY THE CARD ITSELF — a keydown on the nested pill or the ⟳ bubbles here, and
-        // preventDefault would cancel their own Enter/Space activation. Same rule as
-        // `PinnedBlockers`/`NudgeCard`.
+        // ONLY THE CARD ITSELF — a keydown on the nested pill, the ⟳ or the open button bubbles
+        // here, and preventDefault would cancel their own Enter/Space activation. Same rule as
+        // `PinnedBlockers`/`NudgeCard`. Enter/Space EXPANDS (the primary gesture); the keyboard path
+        // to the browser is the focusable "Open in browser" button, since a double-click has no
+        // keyboard equivalent.
         if (e.target !== e.currentTarget) return;
         if (e.key !== "Enter" && e.key !== " ") return;
         e.preventDefault();
-        open();
+        toggleExpanded();
       }}
-      style={card()}
+      style={card(expanded)}
     >
       <div style={{ display: "flex", alignItems: "center", gap: 6, minWidth: 0, flexWrap: "wrap" }}>
         {/* A FENCE around the pill's own click, exactly as the pinned blocker row does it. Without
@@ -437,7 +509,7 @@ function PreviewCard({
           data-testid={PREVIEW_CARD_SHOT_TESTID}
           src={shotState.dataUrl}
           alt={`Preview of ${name}`}
-          style={shot()}
+          style={shot(expanded)}
         />
       ) : (
         // NO SPINNER, and no empty box holding a place. A capture needs a headless Chromium that
@@ -512,6 +584,42 @@ function PreviewCard({
             couldn&apos;t refresh
           </span>
         )}
+        {/* THE ESCAPE HATCH TO A REAL BROWSER — the discoverable half of "double-click opens".
+            The card's own click expands rather than navigates now (sparkle-7kn6bk), so opening the
+            preview externally needs a control a reader can see and a keyboard can reach; a
+            double-click satisfies neither. FENCED on its own span for the exact reason the ⟳ is:
+            a click here must open the url and NOT also toggle the card's size. `marginLeft: auto`
+            pushes both controls to the trailing edge, clear of the caption. It runs the SAME `open`
+            path the double-click does — the click-time ownership re-derivation and every refusal are
+            shared, so this button can never open a stale or wrong-agent address either. */}
+        <span
+          onClick={(e) => e.stopPropagation()}
+          style={{ display: "inline-flex", marginLeft: "auto" }}
+        >
+          <button
+            type="button"
+            data-testid={PREVIEW_CARD_OPEN_TESTID}
+            aria-label={`Open ${name}'s preview at ${url} in the browser`}
+            title="Open in browser"
+            onClick={(e) => {
+              e.stopPropagation();
+              open();
+            }}
+            style={{
+              appearance: "none",
+              border: "none",
+              background: "transparent",
+              color: C.conciergeMuted,
+              cursor: "pointer",
+              padding: 0,
+              display: "inline-flex",
+              alignItems: "center",
+              flex: "0 0 auto",
+            }}
+          >
+            <FiExternalLink size={11} />
+          </button>
+        </span>
         {/* FENCED, like the pill: a click here must re-capture and NOT also launch a browser.
             DISABLED WHILE ONE IS IN FLIGHT — see `busy`; a capture is a whole browser process.
 

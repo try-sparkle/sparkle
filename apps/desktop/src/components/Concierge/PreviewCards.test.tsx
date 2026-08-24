@@ -32,6 +32,9 @@ import {
   PREVIEW_CARD_REFRESH_TESTID,
   PREVIEW_CARD_REFRESH_FAILED_TESTID,
   PREVIEW_CARD_REFUSED_TESTID,
+  PREVIEW_CARD_OPEN_TESTID,
+  PREVIEW_CARD_COLLAPSED_WIDTH,
+  PREVIEW_CARD_EXPANDED_WIDTH,
   PREVIEW_OPEN_REFUSAL_COPY,
   PREVIEW_CARD_AGE_TICK_MS,
   PREVIEW_NOTICES_TESTID,
@@ -254,9 +257,10 @@ describe("a live preview becomes a card", () => {
 });
 
 describe("the two click targets", () => {
-  it("clicking the card opens THAT card's loopback url", async () => {
+  it("DOUBLE-clicking the card opens THAT card's loopback url", async () => {
     // Two live cards, so a handler wired to "the first preview" rather than to this card's own url
-    // fails here instead of passing by coincidence.
+    // fails here instead of passing by coincidence. Opening is the DOUBLE click now (sparkle-7kn6bk)
+    // — a single click expands in place and must not navigate, which the size describe asserts.
     mount();
     fire(KRAKEN, "ready", "http://127.0.0.1:5173", 5173);
     fire(OTTER, "ready", "http://localhost:4321", 4321);
@@ -265,7 +269,7 @@ describe("the two click targets", () => {
       .getAllByTestId(PREVIEW_CARD_TESTID)
       .find((el) => el.getAttribute("data-agent-id") === OTTER);
     expect(otter).toBeTruthy();
-    fireEvent.click(otter!);
+    fireEvent.dblClick(otter!);
 
     // AWAITED, because the open is no longer a straight hand-off: the card re-reads THIS agent's
     // live status first and opens only if the address it is showing is still that agent's own.
@@ -721,9 +725,9 @@ describe("a preview that is NOT openable still says something", () => {
     fireEvent.keyDown(failed, { key: "Enter" });
     expect(openUrlMock).not.toHaveBeenCalled();
 
-    // …while the LIVE card mounted beside it still opens on the same gesture. Without this half the
-    // absence above would be satisfied by an `openUrl` that is broken everywhere.
-    fireEvent.click(screen.getByTestId(PREVIEW_CARD_TESTID));
+    // …while the LIVE card mounted beside it still opens on its own open gesture (a double-click).
+    // Without this half the absence above would be satisfied by an `openUrl` broken everywhere.
+    fireEvent.dblClick(screen.getByTestId(PREVIEW_CARD_TESTID));
     await waitFor(() => expect(openUrlMock).toHaveBeenCalledTimes(1));
     expect(openUrlMock).toHaveBeenCalledWith("http://127.0.0.1:5173");
   });
@@ -872,7 +876,7 @@ describe("neither strip is painted for an empty projection", () => {
 // neither could cross). Both sites are pinned, per `sparkle-50m03`: checking one would go green on
 // the first covered site while its sibling carried the same hole.
 describe("PreviewCards — a human touching a card counts as activity", () => {
-  it("clicking through to the url stamps activity", async () => {
+  it("opening through to the url (a double-click) stamps activity", async () => {
     mount();
     fire(KRAKEN, "ready", "http://127.0.0.1:5173");
 
@@ -888,18 +892,21 @@ describe("PreviewCards — a human touching a card counts as activity", () => {
       const card = screen
         .getAllByTestId(PREVIEW_CARD_TESTID)
         .find((el) => el.getAttribute("data-agent-id") === KRAKEN);
-      fireEvent.click(card!);
+      // The OPEN gesture is a double-click now (sparkle-7kn6bk). `fireEvent.dblClick` dispatches
+      // only the `dblclick`, so it drives `open` alone — the single-click expand path is covered
+      // separately below.
+      fireEvent.dblClick(card!);
     } finally {
       spy.mockRestore();
     }
 
     // STAMPED SYNCHRONOUSLY, before the click-time ownership read — the spy above is restored the
-    // instant `fireEvent.click` returns, so an implementation that stamped after the await would
-    // record the real clock and this assertion would fail. The click happened either way, which is
-    // the fact the grace clock is asking about.
+    // instant `fireEvent.dblClick` returns, so an implementation that stamped after the await would
+    // record the real clock and this assertion would fail. The gesture happened either way, which
+    // is the fact the grace clock is asking about.
     expect(usePreviewStore.getState().byAgent[KRAKEN]?.lastActivityAt).toBe(later);
-    // …and the click still did its real job. Asserting both together is what stops a future edit
-    // from swapping one for the other.
+    // …and the double-click still did its real job. Asserting both together is what stops a future
+    // edit from swapping one for the other.
     await waitFor(() => expect(openUrlMock).toHaveBeenCalledWith("http://127.0.0.1:5173"));
   });
 
@@ -1021,11 +1028,11 @@ describe("a preview card opens its own agent's port, or refuses", () => {
     expect(cardFor(KRAKEN)?.getAttribute("data-preview-port")).toBe("5173");
     expect(cardFor(OTTER)?.getAttribute("data-preview-port")).toBe("5174");
 
-    fireEvent.click(cardFor(KRAKEN)!);
+    fireEvent.dblClick(cardFor(KRAKEN)!);
     await waitFor(() => expect(openUrlMock).toHaveBeenCalledTimes(1));
     expect(openUrlMock).toHaveBeenLastCalledWith("http://127.0.0.1:5173");
 
-    fireEvent.click(cardFor(OTTER)!);
+    fireEvent.dblClick(cardFor(OTTER)!);
     await waitFor(() => expect(openUrlMock).toHaveBeenCalledTimes(2));
     expect(openUrlMock).toHaveBeenLastCalledWith("http://127.0.0.1:5174");
     // Neither click ever reached the other agent's address — the founder's exact failure, stated
@@ -1044,7 +1051,7 @@ describe("a preview card opens its own agent's port, or refuses", () => {
     fire(KRAKEN, "ready", "http://127.0.0.1:5173", 5173);
     setLive(KRAKEN, { url: "http://127.0.0.1:5199", port: 5199, state: "serving" });
 
-    fireEvent.click(cardFor(KRAKEN)!);
+    fireEvent.dblClick(cardFor(KRAKEN)!);
 
     await waitFor(() => expect(refusalFor(KRAKEN)).toBeTruthy());
     // THE SIDE EFFECT, both directions: nothing was opened — not the stale address, and not the
@@ -1062,13 +1069,13 @@ describe("a preview card opens its own agent's port, or refuses", () => {
     fire(KRAKEN, "ready", "http://127.0.0.1:5173", 5173);
     setLive(KRAKEN, { url: "http://127.0.0.1:5199", port: 5199, state: "serving" });
 
-    fireEvent.click(cardFor(KRAKEN)!);
+    fireEvent.dblClick(cardFor(KRAKEN)!);
     await waitFor(() => expect(refusalFor(KRAKEN)).toBeTruthy());
     await waitFor(() =>
       expect(cardFor(KRAKEN)?.getAttribute("data-preview-url")).toBe("http://127.0.0.1:5199"),
     );
 
-    fireEvent.click(cardFor(KRAKEN)!);
+    fireEvent.dblClick(cardFor(KRAKEN)!);
     await waitFor(() => expect(openUrlMock).toHaveBeenCalledTimes(1));
     // THE NEW PORT, and only it. The stale one is never opened, on either click.
     expect(openUrlMock).toHaveBeenCalledWith("http://127.0.0.1:5199");
@@ -1083,7 +1090,7 @@ describe("a preview card opens its own agent's port, or refuses", () => {
     fire(KRAKEN, "ready", "http://127.0.0.1:5173", 5173);
     setLive(KRAKEN, null);
 
-    fireEvent.click(cardFor(KRAKEN)!);
+    fireEvent.dblClick(cardFor(KRAKEN)!);
 
     await waitFor(() => expect(refusalFor(KRAKEN)?.textContent).toBe(PREVIEW_OPEN_REFUSAL_COPY.gone));
     expect(openUrlMock).not.toHaveBeenCalled();
@@ -1104,7 +1111,7 @@ describe("a preview card opens its own agent's port, or refuses", () => {
     fire(OTTER, "ready", "http://127.0.0.1:5174", 5174);
     setLive(KRAKEN, { state: "crashed", error: "exit 1" });
 
-    fireEvent.click(cardFor(KRAKEN)!);
+    fireEvent.dblClick(cardFor(KRAKEN)!);
 
     // THE SIDE EFFECT: no navigation to the dead address, ever.
     await waitFor(() => expect(cardFor(KRAKEN)).toBeUndefined());
@@ -1124,7 +1131,7 @@ describe("a preview card opens its own agent's port, or refuses", () => {
     fire(KRAKEN, "ready", "http://127.0.0.1:5173", 5173);
     setLive(KRAKEN, { agentId: OTTER });
 
-    fireEvent.click(cardFor(KRAKEN)!);
+    fireEvent.dblClick(cardFor(KRAKEN)!);
 
     await waitFor(() =>
       expect(refusalFor(KRAKEN)?.textContent).toBe(PREVIEW_OPEN_REFUSAL_COPY["wrong-agent"]),
@@ -1144,7 +1151,7 @@ describe("a preview card opens its own agent's port, or refuses", () => {
     mount();
     fire(KRAKEN, "ready", "http://127.0.0.1:5173", 5173);
 
-    fireEvent.click(cardFor(KRAKEN)!);
+    fireEvent.dblClick(cardFor(KRAKEN)!);
 
     await waitFor(() =>
       expect(refusalFor(KRAKEN)?.textContent).toBe(PREVIEW_OPEN_REFUSAL_COPY.unreadable),
@@ -1161,11 +1168,11 @@ describe("a preview card opens its own agent's port, or refuses", () => {
     fire(OTTER, "ready", "http://127.0.0.1:5174", 5174);
     setLive(KRAKEN, null);
 
-    fireEvent.click(cardFor(KRAKEN)!);
+    fireEvent.dblClick(cardFor(KRAKEN)!);
     await waitFor(() => expect(refusalFor(KRAKEN)).toBeTruthy());
     expect(openUrlMock).not.toHaveBeenCalled();
 
-    fireEvent.click(cardFor(OTTER)!);
+    fireEvent.dblClick(cardFor(OTTER)!);
     await waitFor(() => expect(openUrlMock).toHaveBeenCalledTimes(1));
     expect(openUrlMock).toHaveBeenCalledWith("http://127.0.0.1:5174");
     // The refusal did not spread to the healthy card, and the healthy click did not clear the
@@ -1260,5 +1267,116 @@ describe("PreviewCards — a running preview the card cannot open", () => {
       .getAllByTestId(PREVIEW_NOTICE_DETAIL_TESTID)
       .find((el) => el.closest(`[data-agent-id="${NEWT}"]`) !== null);
     expect(detail?.textContent).toContain("EADDRINUSE");
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// THE CARD SIZES TO ~1/3 THE CHAT COLUMN AND EXPANDS IN PLACE — sparkle-7kn6bk
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+//
+// The founder's ask: a card too small to judge anything by should not spend its single click leaving
+// the app. So the DEFAULT is ~1/3 the chat column, a SINGLE CLICK expands it in place to the full
+// column width, and the browser moved to a DOUBLE click plus an explicit "Open in browser" button.
+//
+// Every row asserts the SIDE EFFECT and its opposite together: the width the card actually carries,
+// the toggle actually flipping, and — the pair that stops the primary gesture from silently opening
+// again — that a single click expands WITHOUT navigating while the button navigates WITHOUT
+// expanding. jsdom does not lay out, so these read the INLINE style the component sets directly
+// (never `getComputedStyle` off a stylesheet, which jsdom leaves empty), which is exactly the value
+// under test.
+describe("PreviewCards — the card sizes to a third and expands in place", () => {
+  const cardFor = (agentId: string) =>
+    screen
+      .queryAllByTestId(PREVIEW_CARD_TESTID)
+      .find((el) => el.getAttribute("data-agent-id") === agentId) as HTMLElement | undefined;
+  const openBtnFor = (agentId: string) =>
+    screen
+      .queryAllByTestId(PREVIEW_CARD_OPEN_TESTID)
+      .find((el) => el.closest(`[data-agent-id="${agentId}"]`) !== null) as HTMLElement | undefined;
+
+  it("defaults to ~1/3 the chat column width and is not expanded", () => {
+    mount();
+    fire(KRAKEN, "ready", "http://127.0.0.1:5173");
+
+    const card = cardFor(KRAKEN)!;
+    // THE FRACTION, read off the inline style the component set — a value below 100% that a
+    // full-width default would never carry. `alignSelf` is what makes the fraction real in a flex
+    // column; both are asserted so a future edit cannot keep the width while letting the card
+    // stretch (or vice versa).
+    expect(card.style.width).toBe(PREVIEW_CARD_COLLAPSED_WIDTH);
+    expect(PREVIEW_CARD_COLLAPSED_WIDTH).not.toBe(PREVIEW_CARD_EXPANDED_WIDTH);
+    expect(card.style.alignSelf).toBe("flex-start");
+    // Collapsed carries no expanded marker, so the presence of the attribute is itself the signal.
+    expect(card.getAttribute("data-expanded")).toBeNull();
+  });
+
+  it("a single click expands it to the full column width, a second click collapses it", () => {
+    mount();
+    fire(KRAKEN, "ready", "http://127.0.0.1:5173");
+    const card = cardFor(KRAKEN)!;
+    expect(card.style.width).toBe(PREVIEW_CARD_COLLAPSED_WIDTH);
+
+    fireEvent.click(card);
+    expect(cardFor(KRAKEN)!.style.width).toBe(PREVIEW_CARD_EXPANDED_WIDTH);
+    expect(cardFor(KRAKEN)!.getAttribute("data-expanded")).toBe("true");
+
+    // TOGGLES BACK — the click is a toggle, not a one-way switch, so the reader can put the card
+    // away again. Asserting only the expand would pass for a switch that never collapses.
+    fireEvent.click(cardFor(KRAKEN)!);
+    expect(cardFor(KRAKEN)!.style.width).toBe(PREVIEW_CARD_COLLAPSED_WIDTH);
+    expect(cardFor(KRAKEN)!.getAttribute("data-expanded")).toBeNull();
+  });
+
+  it("a single click expands but never opens the browser", () => {
+    // THE PAIR THAT STOPS A REGRESSION TO THE OLD DEFAULT. Before this bead a single click opened
+    // the url; the whole change is that it must NOT. So the expand and the absence of a navigation
+    // are asserted from ONE gesture — an implementation that still opened on single click fails
+    // here even though the card also grew.
+    mount();
+    fire(KRAKEN, "ready", "http://127.0.0.1:5173");
+
+    fireEvent.click(cardFor(KRAKEN)!);
+
+    expect(cardFor(KRAKEN)!.getAttribute("data-expanded")).toBe("true");
+    expect(openUrlMock).not.toHaveBeenCalled();
+  });
+
+  it("a single click stamps activity without opening — expanding is 'still wanted' too", () => {
+    // GUARDS THE `notePreviewActivity` CALL IN THE TOGGLE (AGENTS.md's `sparkle-lgbwf` shape). A
+    // human enlarging a card is exactly the "I am looking at this now" signal `previewIdleGrace`
+    // needs, and it is stamped synchronously in the toggle — delete that line and this goes red
+    // while every other suite stays green. The clock is advanced so the stamp is distinguishable
+    // from the one the fold already wrote.
+    mount();
+    fire(KRAKEN, "ready", "http://127.0.0.1:5173");
+    const before = usePreviewStore.getState().byAgent[KRAKEN]?.lastActivityAt ?? 0;
+    const later = before + 60_000;
+    const spy = vi.spyOn(Date, "now").mockReturnValue(later);
+    try {
+      fireEvent.click(cardFor(KRAKEN)!);
+    } finally {
+      spy.mockRestore();
+    }
+    expect(usePreviewStore.getState().byAgent[KRAKEN]?.lastActivityAt).toBe(later);
+    expect(openUrlMock).not.toHaveBeenCalled();
+  });
+
+  it("the 'Open in browser' button opens the url and does NOT expand the card", async () => {
+    // THE DISCOVERABLE, KEYBOARD-REACHABLE ESCAPE HATCH. Two live cards, so a button wired to "the
+    // first card" rather than to its own agent fails here instead of passing by coincidence. The
+    // button runs the same click-time ownership read as the double-click, so it is AWAITED.
+    mount();
+    fire(KRAKEN, "ready", "http://127.0.0.1:5173", 5173);
+    fire(OTTER, "ready", "http://localhost:4321", 4321);
+
+    fireEvent.click(openBtnFor(OTTER)!);
+
+    await waitFor(() => expect(openUrlMock).toHaveBeenCalledTimes(1));
+    expect(openUrlMock).toHaveBeenCalledWith("http://localhost:4321");
+    // …and the fence held: the button opened without also toggling the card's size. Without
+    // `stopPropagation` on the button, this click would ALSO expand the card — the exact two-effects
+    // -from-one-gesture surprise the fence exists to prevent.
+    expect(cardFor(OTTER)!.getAttribute("data-expanded")).toBeNull();
+    expect(cardFor(OTTER)!.style.width).toBe(PREVIEW_CARD_COLLAPSED_WIDTH);
   });
 });
