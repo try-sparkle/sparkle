@@ -74,8 +74,6 @@ export interface UnderstandGestureInput {
   selection: Selection | null;
   /** What the press that began this gesture landed on — `null` when no press was seen. */
   pressTarget: EventTarget | null;
-  /** Was a control gesture (scrubber, resizer, slider) in flight? See controlGesture.ts. */
-  controlGestureActive?: boolean;
 }
 
 /**
@@ -87,7 +85,6 @@ export interface UnderstandGestureInput {
 export function understandGesture({
   selection,
   pressTarget,
-  controlGestureActive = false,
 }: UnderstandGestureInput): UnderstandGesture | null {
   // A PLAIN CLICK IS NOT A DRAG. A click collapses the selection, and firing an affordance for one
   // would put a chip on screen every time the user clicked anything at all — the single fastest way
@@ -99,10 +96,14 @@ export function understandGesture({
   // and scrolling the scroll bar, I don't want it to be implementing drag to understand. So anything
   // where there is an action that is click drag should not trigger drag to understand."
   //
-  // Asked TWICE, of two different sources, because they answer at different moments. The press
-  // target is what this gesture actually began on; the latch covers a gesture already in flight
-  // whose press this caller never saw. Either one is disqualifying.
-  if (controlGestureActive) return null;
+  // ASKED OF THE PRESS TARGET, AND ONLY OF IT. The caller's job is to supply a press this cannot
+  // be hidden from — `DragToUnderstand.tsx` takes it from a capture-phase `pointerdown`, because a
+  // control that calls `preventDefault()` there suppresses the compatibility `mousedown` entirely.
+  // The shared `controlGesture.ts` latch is deliberately NOT consulted as a second opinion: it is
+  // armed from the same `pointerdown` target, so it can only ever hold the same bit this line
+  // already reads, and a second guard that cannot decide an extra case is a comment claiming
+  // coverage it does not have. See that file's header for who the latch IS for (consumers of
+  // `selectionchange`, which carries no target).
   if (isControlGestureTarget(pressTarget)) return null;
 
   // THE SURFACE ALREADY ANSWERS FOR ITSELF — don't put a second affordance over the terminal's

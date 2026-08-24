@@ -13,7 +13,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { CONTROL_GESTURE_ATTR, watchControlGesture } from "./Concierge/controlGesture";
+import { CONTROL_GESTURE_ATTR } from "./Concierge/controlGesture";
 import {
   SELECTION_AFFORDANCE_ATTR,
   SELECTION_AFFORDANCE_OWN,
@@ -111,16 +111,6 @@ describe("understandGesture", () => {
     expect(understandGesture({ selection: sel("some words"), pressTarget: leaf })).toBeNull();
   });
 
-  it("refuses while a control gesture is in flight, whatever the press landed on", () => {
-    expect(
-      understandGesture({
-        selection: sel("some words"),
-        pressTarget: content(),
-        controlGestureActive: true,
-      }),
-    ).toBeNull();
-  });
-
   it("refuses a surface that owns its own affordance", () => {
     const leaf = mount(
       `<div ${SELECTION_AFFORDANCE_ATTR}="${SELECTION_AFFORDANCE_OWN}"><p data-leaf>some words</p></div>`,
@@ -128,19 +118,19 @@ describe("understandGesture", () => {
     expect(understandGesture({ selection: sel("some words"), pressTarget: leaf })).toBeNull();
   });
 
-  // The latch is a live module singleton shared with the concierge; prove this consumer reads the
-  // real one rather than only the injected flag above.
-  it("reads the live control-gesture latch", () => {
-    const dispose = watchControlGesture(document);
-    try {
-      const leaf = mount(`<div ${CONTROL_GESTURE_ATTR}="yes"><p data-leaf>x</p></div>`);
-      leaf.dispatchEvent(new MouseEvent("pointerdown", { bubbles: true, button: 0 }));
-      // The press is on the control, so the target test alone would also refuse — what this pins is
-      // that the module-level latch is armed and readable by the component's `isControlGestureActive`.
-      expect(understandGesture({ selection: sel("x"), pressTarget: leaf })).toBeNull();
-    } finally {
-      dispose();
-    }
+  // A press rarely lands on the control's own root — it lands on a label, an icon or a text node
+  // inside it. The refusal has to climb, or every control with a child is unguarded.
+  it("refuses a press on a node nested deep inside a control", () => {
+    const leaf = mount(
+      `<div ${CONTROL_GESTURE_ATTR}="yes"><span><em><p data-leaf>some words</p></em></span></div>`,
+    );
+    expect(understandGesture({ selection: sel("some words"), pressTarget: leaf })).toBeNull();
+    // …and the same shape WITHOUT the control still reaches the affordance, so the refusal above
+    // cannot be passing because of the nesting itself.
+    const plain = mount(`<div><span><em><p data-leaf>some words</p></em></span></div>`);
+    expect(understandGesture({ selection: sel("some words"), pressTarget: plain })).toEqual({
+      text: "some words",
+    });
   });
 });
 

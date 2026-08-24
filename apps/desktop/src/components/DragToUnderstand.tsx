@@ -28,7 +28,6 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react
 import { createPortal } from "react-dom";
 import { FiCheck, FiCopy } from "react-icons/fi";
 import { copyToClipboard } from "../clipboard";
-import { isControlGestureActive, watchControlGesture } from "./Concierge/controlGesture";
 import { understandGesture } from "./understandGesture";
 import { popupPosition } from "./selectionPopupPosition";
 import { C, FONT_WEIGHT, ON_BRAND_FILL } from "../theme/colors";
@@ -75,34 +74,45 @@ export function useUnderstandOffer(): { offer: Offer | null; dismiss: () => void
   const dismiss = useCallback(() => setOffer(null), []);
 
   useEffect(() => {
-    // What the in-flight gesture began on. `mouseup` does not carry it: a drag that overshoots ends
-    // on whatever the pointer happens to be over, which for a selection dragged past its surface is
-    // routinely some other surface entirely. Only the press knows what the user aimed at.
+    /**
+     * What this gesture began on — and the ONE question that disqualifies a control drag.
+     *
+     * ── WHY IT IS TAKEN AT `pointerdown`, IN CAPTURE ───────────────────────────────────────────
+     * The founder's rule (bead sparkle-bjbhw6, DEFECT 4) is that a drag aimed at a control is not a
+     * text selection. Answering it needs the press, and `mouseup` cannot supply one: a drag that
+     * overshoots ends on whatever the pointer happens to be over, which for a selection dragged
+     * past its surface is routinely some other surface entirely.
+     *
+     * `mousedown` cannot be trusted to supply one either, and that is the subtle half. A control
+     * that calls `preventDefault()` on `pointerdown` SUPPRESSES the compatibility `mousedown`
+     * (ColumnPullTab and the compose-box handle both do exactly that) while the release still
+     * arrives — so a press recorded at `mousedown` is simply never written for those gestures, and
+     * the scrubber drag that swept a selection across the text underneath would be offered a copy
+     * chip. `pointerdown` is the one press event every such control still emits, and CAPTURE on the
+     * document runs before any handler bound deeper, so nothing can hide it with `stopPropagation`.
+     *
+     * ── WHY THE SHARED `controlGesture.ts` LATCH IS NOT READ HERE ──────────────────────────────
+     * That latch exists for consumers of `selectionchange`, which carries no target at all. This
+     * component keys on a gesture's own press and release, so it can ask the target directly — and
+     * a latch read would be strictly redundant with that: the latch is armed FROM the `pointerdown`
+     * target, so at any moment this component could sample it, it holds the same bit
+     * `isControlGestureTarget(pressTarget)` already returns. Reading it anyway would be a guard
+     * that cannot decide a case the target test does not, with a comment implying otherwise —
+     * and, sampled at `mouseup`, it would be worse than redundant: `controlGesture.ts` releases on
+     * `pointerup`, which UI Events orders BEFORE `mouseup`, so the read is always `false` while a
+     * jsdom test still passes it (jsdom fires no compatibility pointer events — AGENTS.md, bead
+     * sparkle-40va0, "the test picks a reading order the browser does not produce").
+     */
     let pressTarget: EventTarget | null = null;
     // Did this gesture begin ON the chip? Then it is a click on the affordance, not a new selection,
     // and the release must not re-evaluate (which would re-offer over the still-standing selection).
     let pressOnChip = false;
 
-    /**
-     * Was a control gesture in flight when this one STARTED?
-     *
-     * SAMPLED AT THE PRESS, AND THAT TIMING IS THE WHOLE GUARD. UI Events specifies the
-     * compatibility sequence as `pointerdown -> mousedown -> pointerup -> mouseup -> click`, so
-     * `pointerup` — which is where `controlGesture.ts` RELEASES the latch — has already run by the
-     * time `mouseup` arrives. Reading the latch at release therefore always reads `false`, and the
-     * guard is inert in production while a jsdom test that dispatches no compatibility `pointerup`
-     * still passes (AGENTS.md, bead sparkle-40va0: "the test picks a reading order the browser does
-     * not produce"). At `mousedown` the capture-phase `pointerdown` HAS armed it and no `pointerup`
-     * has fired, so this is the one moment the answer exists.
-     */
-    let controlAtPress = false;
-
-    const onMouseDown = (e: MouseEvent) => {
+    const onPointerDown = (e: Event) => {
       pressOnChip = insideChip(e.target);
       // A press on the chip leaves the offer standing so the click can land on it.
       if (pressOnChip) return;
       pressTarget = e.target;
-      controlAtPress = isControlGestureActive();
       // ANY other press retires the current offer: the user has moved on, and an affordance that
       // outlived the selection it describes would copy words that are no longer highlighted.
       setOffer(null);
@@ -113,31 +123,19 @@ export function useUnderstandOffer(): { offer: Offer | null; dismiss: () => void
         pressOnChip = false;
         return;
       }
-      const gesture = understandGesture({
-        selection: window.getSelection(),
-        pressTarget,
-        controlGestureActive: controlAtPress,
-      });
+      const gesture = understandGesture({ selection: window.getSelection(), pressTarget });
       pressTarget = null;
-      controlAtPress = false;
       if (!gesture) return;
       setOffer({ text: gesture.text, x: e.clientX, y: e.clientY });
     };
 
-    // Armed here rather than by a caller, so the founder's control-drag rule cannot be left unwired
-    // by whoever mounts this next. Ref-counted — it shares one set of listeners with the concierge.
-    const unwatchControlGesture = watchControlGesture(document);
-    // CAPTURE PHASE, both of them. A control that handles its own press routinely calls
-    // `stopPropagation()` (ColumnPullTab and the compose-box handle both do), and a bubble-phase
-    // document listener never hears those at all — which would leave `pressTarget` stale from the
-    // PREVIOUS gesture and `controlAtPress` unsampled for exactly the drags this guard is for.
-    // Capture on the document runs before any handler bound deeper, so nothing can hide a press.
-    document.addEventListener("mousedown", onMouseDown, true);
+    // CAPTURE on both, so a control handling its own press cannot hide the gesture from this
+    // listener — see the note on `pressTarget` above.
+    document.addEventListener("pointerdown", onPointerDown, true);
     document.addEventListener("mouseup", onMouseUp, true);
     return () => {
-      document.removeEventListener("mousedown", onMouseDown, true);
+      document.removeEventListener("pointerdown", onPointerDown, true);
       document.removeEventListener("mouseup", onMouseUp, true);
-      unwatchControlGesture();
     };
   }, []);
 

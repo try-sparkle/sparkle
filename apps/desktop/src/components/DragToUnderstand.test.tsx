@@ -37,8 +37,18 @@ const TEXT = "the agent is waiting on a review";
  * own-affordance rules are asked about); the Range is built by hand because jsdom has no pointer
  * that could sweep one out.
  */
-function dragSelect(node: HTMLElement, { collapsed = false } = {}) {
-  fireEvent.mouseDown(node, { button: 0 });
+function dragSelect(
+  node: HTMLElement,
+  { collapsed = false, pressOn = node, suppressMouseDown = false } = {},
+) {
+  // The press, in the order a browser sends it. `pressOn` defaults to the text itself; a control
+  // drag passes the control, so `pointerdown` and `mousedown` share ONE consistent target the way a
+  // real mouse guarantees — dispatching them at two different elements would manufacture a
+  // divergence no pointer can produce, and prove nothing about production.
+  pressOn.dispatchEvent(new MouseEvent("pointerdown", { bubbles: true, button: 0 }));
+  // `suppressMouseDown` reproduces a control that calls `preventDefault()` on `pointerdown`: the
+  // compatibility `mousedown` is never sent, while the release still arrives.
+  if (!suppressMouseDown) fireEvent.mouseDown(pressOn, { button: 0 });
   const range = document.createRange();
   const text = node.firstChild!;
   range.setStart(text, 0);
@@ -125,6 +135,31 @@ describe("drag-to-understand, rung one", () => {
     );
   });
 
+  // PRESSING THE CHIP IS ITSELF A PRESS, and every press retires the standing offer — so without
+  // the chip-press guard the affordance destroys itself on `pointerdown` and the click that was
+  // supposed to copy lands on nothing. The user-visible failure is a chip that cannot be clicked at
+  // all, which is why this drives the REAL gesture (pointerdown -> mouseup -> click on the chip)
+  // rather than a bare `fireEvent.click`.
+  it("the affordance survives its own press, so the click can copy", async () => {
+    const content = mountContent();
+    render(<DragToUnderstand />);
+    dragSelect(content);
+    const chip = screen.getByTestId(DRAG_TO_UNDERSTAND_TESTID);
+
+    await act(async () => {
+      chip.dispatchEvent(new MouseEvent("pointerdown", { bubbles: true, button: 0 }));
+    });
+    // Still there — the press on the chip did not retire the offer it belongs to.
+    expect(screen.queryByTestId(DRAG_TO_UNDERSTAND_TESTID)).toBeTruthy();
+
+    await act(async () => {
+      fireEvent.mouseUp(chip, { button: 0 });
+      fireEvent.click(chip);
+    });
+
+    expect(copyToClipboard).toHaveBeenCalledWith(TEXT);
+  });
+
   it("a plain click offers nothing", () => {
     const content = mountContent();
     render(<DragToUnderstand />);
@@ -143,17 +178,12 @@ describe("drag-to-understand, rung one", () => {
     expect(screen.queryByTestId(DRAG_TO_UNDERSTAND_TESTID)).toBeNull();
   });
 
-  // THE OTHER HALF OF THE FOUNDER'S RULE — the LATCH, not the press target.
+  // THE OTHER HALF OF THE FOUNDER'S RULE — a drag that BEGAN on a control and released over text.
   //
   // Dragging a scrubber handle sweeps a text selection across the content underneath it as a pure
-  // side effect. The press that began that gesture landed on the CONTROL, but the release this
-  // component hears can land anywhere, so a press-target test alone cannot see it: the two guards
-  // answer at different moments and `controlGesture.ts` exists precisely because `selectionchange`
-  // and a stray `mouseup` carry no reference to what the user actually grabbed.
-  //
-  // Expressed as production does it: `pointerdown` on the control arms the latch (capture phase),
-  // and no `pointerup` has released it by the time the selection resolves.
-  it("a control drag already in flight offers nothing, even when the release lands on text", () => {
+  // side effect. The press landed on the CONTROL and the release lands on the TEXT, which is the
+  // shape the founder described. One consistent press target throughout, as a real mouse sends it.
+  it("a drag begun on a control offers nothing when the release lands on text", () => {
     const control = document.createElement("div");
     control.setAttribute(CONTROL_GESTURE_ATTR, "yes");
     document.body.appendChild(control);
@@ -161,10 +191,38 @@ describe("drag-to-understand, rung one", () => {
     const content = mountContent();
     render(<DragToUnderstand />);
 
-    control.dispatchEvent(new MouseEvent("pointerdown", { bubbles: true, button: 0 }));
-    dragSelect(content);
+    dragSelect(content, { pressOn: control });
 
     expect(screen.queryByTestId(DRAG_TO_UNDERSTAND_TESTID)).toBeNull();
+  });
+
+  // ── THE CASE THAT DISTINGUISHES THE TWO GUARDS ────────────────────────────────────────────────
+  // A control that calls `preventDefault()` on `pointerdown` suppresses the compatibility
+  // `mousedown` — ColumnPullTab and the compose-box handle both do exactly that — while `mouseup`
+  // still arrives. Nothing that samples at `mousedown` is ever written in this shape, so the
+  // press-target test has nothing to read and the scrubber's incidental selection gets offered a
+  // copy chip. Only a disqualification LATCHED at `pointerdown` and HELD survives it.
+  it("a control drag that suppresses its mousedown still offers nothing", () => {
+    const control = document.createElement("div");
+    control.setAttribute(CONTROL_GESTURE_ATTR, "yes");
+    document.body.appendChild(control);
+    hosts.push(control);
+    const content = mountContent();
+    render(<DragToUnderstand />);
+
+    dragSelect(content, { pressOn: control, suppressMouseDown: true });
+
+    expect(screen.queryByTestId(DRAG_TO_UNDERSTAND_TESTID)).toBeNull();
+  });
+
+  // The PAIRED positive for both refusals above: the identical sequence, minus the control, DOES
+  // reach the affordance — so a chip that failed to appear for some unrelated reason would fail
+  // this too, and the two refusals cannot be passing vacuously.
+  it("the same sequence with no control still offers the affordance", () => {
+    const content = mountContent();
+    render(<DragToUnderstand />);
+    dragSelect(content, { suppressMouseDown: true });
+    expect(screen.getByTestId(DRAG_TO_UNDERSTAND_TESTID)).toBeTruthy();
   });
 
   // Whitespace is an accident of dragging, never an intent — the same rule useCopyOnSelection
@@ -196,7 +254,16 @@ describe("drag-to-understand, rung one", () => {
     dragSelect(content);
     expect(screen.getByTestId(DRAG_TO_UNDERSTAND_TESTID)).toBeTruthy();
 
-    fireEvent.mouseDown(content, { button: 0 });
+    // `pointerdown` is where the offer is retired — it is the press event a browser sends first and
+    // the one no control can suppress. See the note on `pressTarget` in DragToUnderstand.tsx.
+    //
+    // Wrapped in `act`, because a raw `dispatchEvent` is not: `fireEvent` wraps its dispatch so
+    // React flushes the resulting state update before the next line, and without that the retire
+    // is still queued when the assertion reads the DOM — which fails here as a chip that "did not
+    // retire" while the code is correct.
+    act(() => {
+      content.dispatchEvent(new MouseEvent("pointerdown", { bubbles: true, button: 0 }));
+    });
     expect(screen.queryByTestId(DRAG_TO_UNDERSTAND_TESTID)).toBeNull();
   });
 });
