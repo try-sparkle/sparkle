@@ -23,6 +23,12 @@
     "                Reporting an unreadable screen as calm is the founder's bug: an agent that needs",
     "                him renders as fine because nothing could see it.",
     "  calm       -- the grid was read and carries no prompt. A POSITIVE reading, not an absence.",
+    "  delegating -- the grid was read, carries no prompt, AND shows live delegated work: Claude",
+    "                Code's own `N background task(s) live` footer or its running-subagent roster.",
+    "                The founder's rule is that DELEGATED WORK COUNTS AS ACTIVITY, so a row holding",
+    "                this must not be gray. It is produced ONLY where `calm` would otherwise be, so",
+    "                it can never mask an `awaiting`; a consumer may treat it as `calm` and be",
+    "                merely less useful, never wrong.",
     "  gone       -- THIS AGENT'S TERMINAL NO LONGER EXISTS. Not a statement about a screen; there",
     "                is no screen. Discard any reading held for this agent. It exists because the",
     "                producer emits on CHANGE, and 'the agent stopped existing' is a change the",
@@ -86,6 +92,10 @@
     {
       "why": "Read the grid, found no prompt. The ONLY verdict that may lower a row.",
       "payload": { "agentId": "a4", "verdict": "calm", "alternate": false, "atMs": 1787251270002 }
+    },
+    {
+      "why": "DELEGATED WORK IS VISIBLE -- subagents are running, so this agent is ACTIVE even though its own turn produced nothing. `apps/desktop/shared/delegated-work.fixture.json` holds the screens; this pins the WIRE TOKEN both halves must agree on.",
+      "payload": { "agentId": "a7", "verdict": "delegating", "alternate": false, "atMs": 1787251288044 }
     },
     {
       "why": "The agent's PTY was swept. The retraction, so a held verdict cannot outlive its terminal.",

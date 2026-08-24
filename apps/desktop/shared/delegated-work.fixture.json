@@ -1,0 +1,194 @@
+{
+  "contract": [
+    "DELEGATED WORK ON A RENDERED GRID, frozen here so the Rust reader and the TypeScript reader",
+    "answer the SAME question about the SAME screens -- or fail together.",
+    "",
+    "WHY THIS FIXTURE EXISTS. The founder's rule is 'DELEGATED WORK COUNTS AS ACTIVITY': an agent",
+    "that fans out must render GREEN both while it is working with subagents live and while it is",
+    "BLOCKED WAITING on them. The second state is the one that was missed, because from the parent's",
+    "own PTY it looks exactly like doing nothing -- no spinner, no output, no tool calls, for",
+    "minutes. The evidence that it is NOT doing nothing is on the grid, and two different languages",
+    "now read it: TypeScript for a MOUNTED pane (engine/backgroundTaskFooter.parseDelegatedWorkCount)",
+    "and Rust for every agent whether or not anyone has opened it",
+    "(observed_attention::delegated_work_visible).",
+    "",
+    "AGENTS.md records what happens without a shared fixture, measured: two agents built the two",
+    "halves of a Rust->TS feature in parallel against a frozen field list, both suites passed, the",
+    "merge was clean, and the shipped feature never once ran. So both suites parse THIS file and",
+    "assert the same partition of the same screens.",
+    "",
+    "DERIVE THE PARTITION, DO NOT RESTATE IT. Each screen carries `delegating`, and each suite must",
+    "compute its own answer and compare. A test that lists which screens are delegating and then",
+    "asserts that list is vacuous -- it passes with the matcher deleted. Both directions must red:",
+    "a matcher that stops recognising a delegating screen, AND one that starts recognising an idle",
+    "one.",
+    "",
+    "TWO SURFACES, AND THEY ARE NOT INTERCHANGEABLE:",
+    "  footer -- `N background task(s) live [ctrl+b to manage]`, work Claude has BACKGROUNDED. The",
+    "            count must be strictly POSITIVE; `0 background tasks live` is not live work.",
+    "  roster -- `<circle> <kind>  <label>  <elapsed>`, subagents running right now. This block",
+    "            REPLACES the composer box, which is why a screen showing it has no other sign of",
+    "            life on it at all.",
+    "",
+    "BOTH SURFACES ARE POSITION-CHECKED, in both languages. Each is easy to QUOTE: this very file",
+    "reproduces a roster row and a footer verbatim, and so does the TypeScript reader's own header,",
+    "so a pager -- or a plain `cat` -- showing either document trips the pattern. Claude draws both",
+    "as the LAST thing on a live grid, so the last matching line must terminate it.",
+    "",
+    "TERMINATES HAS TWO SHAPES, and requiring only the first is a NARROW-PANE BUG. A strictly",
+    "line-anchored walk rejects Claude's own status bar when Ink WRAPS it -- at 12 columns the bar",
+    "becomes three rows and only the first carries a glyph -- so a real pane with subagents running",
+    "answers `null`, the mounted reader forgets the count, and the row goes gray while its delegates",
+    "run. Both readers therefore accept EITHER the line-anchored walk OR a rejoined tail that OPENS",
+    "with one of Claude's own bar phrases. The anchor is what keeps a document out: a paragraph",
+    "about the footer opens with its own prose.",
+    "",
+    "AND THE ANCHOR USES THE BAR GLYPHS ONLY, not the wider status-glyph class. That class contains",
+    "ordinary text bullets, and the permission-mode phrase is purely structural, so together they",
+    "would accept any tail opening with a bullet and a short run of letters ending in ` on` -- an",
+    "ordinary sentence. Where this gate is the SOLE reason a row turns green, and where the pane is",
+    "static so nothing can scroll the line away, that is a latch rather than a wrong guess.",
+    "",
+    "AND THE WHOLE TAIL IS ACCOUNTED FOR, not only its opening. The anchor says where the rejoined",
+    "tail STARTS; everything after it was joined and never examined, so a document that opens with a",
+    "real bar and then keeps going cleared the gate. A wrapped bar is ONE logical line, so its",
+    "rejoined length is bounded by what a bar can be -- the longest captured from a real pane is 48",
+    "characters. A false negative here costs only the gray row that shipped for months.",
+    "",
+    "NOTE WHAT THIS FILE DOES *NOT* GOVERN: whether it is safe to TYPE into a pane. That question",
+    "belongs to `isClaudeCodeScreen`, whose subagent-roster family keeps the strict line-anchored",
+    "walk. Colour and authorization have different costs -- a wrong colour is a wrong colour, a wrong",
+    "authorization is a line pasted and submitted into a pager -- so they must not share a threshold.",
+    "",
+    "The footer was briefly exempted, on the argument that its wording is far less quotable than a",
+    "bullet row. The commit making that argument falsified it in the same breath by adding those",
+    "exact bytes to two files agents routinely read. Unchecked it is worse than a wrong answer, it",
+    "is a LATCH: the viewport is static, so nothing scrolls the line off, and the rows this feature",
+    "promotes are precisely the ones with no mounted writer to correct them."
+  ],
+  "screens": [
+    {
+      "why": "FOUNDER STATE 1 -- working, with backgrounded work outliving the turn. The footer form.",
+      "delegating": true,
+      "lines": [
+        "✻ Crunched for 2s",
+        "",
+        "╭─ > ─╮",
+        "",
+        "3 background tasks live [ctrl+b to manage]"
+      ]
+    },
+    {
+      "why": "The SINGULAR footer. Claude pluralizes task(s) at render, so both forms are real bytes.",
+      "delegating": true,
+      "lines": ["1 background task live [ctrl+b to manage]"]
+    },
+    {
+      "why": "FOUNDER STATE 2 -- blocked waiting on subagents. The roster, terminating the grid. This is the founder's own screenshot shape: no spinner, no output, nothing but the list.",
+      "delegating": true,
+      "lines": [
+        "⏺ main",
+        "  ◯ general-purpose  Concierge agents as clickable rows  21m 55s",
+        "  ◯ general-purpose  Trustworthy status dot: bg-task si… 10m 29s"
+      ]
+    },
+    {
+      "why": "A roster of ONE, with trailing blank rows. Blanks are free below the list in both readers.",
+      "delegating": true,
+      "lines": ["⏺ main", "  ◯ general-purpose  Draining roborev findings  3m 04s", "", ""]
+    },
+    {
+      "why": "A REAL NARROW PANE. Claude's status bar WRAPS below the footer -- at 12 columns `  <pause> manual mode on . ? for shortcuts` renders as three rows and only the first carries a glyph, so a strictly line-anchored walk rejects it and the row goes GRAY with three subagents running. Both readers rejoin the tail and require the JOIN to open with one of Claude's own bar phrases, which a document's tail does not.",
+      "delegating": true,
+      "lines": [
+        "╭──────────╮",
+        "│ >        │",
+        "╰──────────╯",
+        "3 background tasks live [ctrl+b to manage]",
+        "  ⏸ manual",
+        "mode on · ?",
+        "for shortcuts"
+      ]
+    },
+    {
+      "why": "A NARROW PANE SHOWING ONLY THE ROSTER. Same pane, same width, same wrapped status bar -- and a roster commonly appears with NO footer under it to fall back on, so the roster arm needs the identical accommodation the footer arm got. Without it a row goes GRAY with its subagents visibly listed on the grid.",
+      "delegating": true,
+      "lines": [
+        "⏺ main",
+        "  ◯ general-purpose  Draining roborev findings  3m 04s",
+        "  ⏸ manual",
+        "mode on · ?",
+        "for shortcuts"
+      ]
+    },
+    {
+      "why": "A DOCUMENT WHOSE TAIL OPENS WITH A TEXT BULLET. `all tests pass on main` is ordinary prose, but a bullet plus <=29 letters ending in ` on` satisfies a structural permission-mode bar -- so anchoring on the WIDE status-glyph class would clear this and latch the row green. The anchor uses the BAR glyphs only.",
+      "delegating": false,
+      "lines": [
+        "3 background tasks live [ctrl+b to manage]",
+        "✓ all tests pass on main",
+        "and the release is cut."
+      ]
+    },
+    {
+      "why": "A DOCUMENT THAT OPENS ITS TAIL WITH A REAL BAR AND KEEPS GOING. The anchor constrains where the rejoined tail STARTS; without a length bound everything after it is joined and never examined, so this cleared the gate. Not hypothetical -- this branch's own commit messages reproduce a wrapped bar verbatim.",
+      "delegating": false,
+      "lines": [
+        "⏺ main",
+        "  ◯ general-purpose  Draining roborev findings  3m 04s",
+        "⏸ manual mode on · ? for shortcuts",
+        "and the row must go green while that is on screen."
+      ]
+    },
+    {
+      "why": "ZERO background tasks. The footer is present and the work is not -- both readers must call this idle, and a `\\d`-for-`[1-9]` port is exactly what this screen catches.",
+      "delegating": false,
+      "lines": ["0 background tasks live [ctrl+b to manage]"]
+    },
+    {
+      "why": "An ordinary finished turn at the idle composer. No delegation of any kind.",
+      "delegating": false,
+      "lines": [
+        "⏺ Done. The tests pass.",
+        "",
+        "╭──────────────╮",
+        "│ >            │",
+        "╰──────────────╯"
+      ]
+    },
+    {
+      "why": "A PAGER QUOTING the FOOTER -- this repo carries those exact bytes in the fixture above and in the TypeScript reader's own header, so an agent that `cat`s either file ends its turn with the phrase on screen. Unchecked it is a LATCH: the viewport is static, no prompt is present, and the promoted row has no mounted writer to correct it. Position is the discriminator for BOTH surfaces.",
+      "delegating": false,
+      "lines": [
+        "3 background tasks live [ctrl+b to manage]",
+        "",
+        "That footer is what Claude Code draws while backgrounded work outlives the",
+        "turn, and it is quoted here so the matcher can be tested against it."
+      ]
+    },
+    {
+      "why": "A DOCUMENT THAT MENTIONS A BAR PHRASE. The tail contains `? for shortcuts`, one of Claude's own chrome phrases, but does not OPEN with it -- which is the whole reason the rejoined tail is anchored. Without the anchor a document quoting the phrase clears the test and the row latches green.",
+      "delegating": false,
+      "lines": [
+        "3 background tasks live [ctrl+b to manage]",
+        "The status bar reads ? for shortcuts, which is Claude's own chrome,",
+        "and it is quoted here so the matcher can be tested against it."
+      ]
+    },
+    {
+      "why": "A PAGER QUOTING a roster row -- this very fixture, or the bead, on screen. The row pattern matches and the position rule is what rejects it: real prose follows the row, so the list is not live.",
+      "delegating": false,
+      "lines": [
+        "  ◯ general-purpose  Concierge agents as clickable rows  21m 55s",
+        "",
+        "That row is what Claude Code draws while it is running subagents, and it is",
+        "reproduced here so the matcher can be tested against it."
+      ]
+    },
+    {
+      "why": "An empty grid. Nothing was read, so nothing is claimed.",
+      "delegating": false,
+      "lines": [""]
+    }
+  ]
+}

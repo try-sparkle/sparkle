@@ -46,7 +46,7 @@ import { isRedStatus } from "../services/windowStatus";
 import { overlaidRowIds } from "./overlayRows";
 
 /** What the grid said. Mirrors `observed_attention::Verdict` in Rust, lowercase on the wire. */
-export type ObservedVerdict = "awaiting" | "unreadable" | "calm" | "gone";
+export type ObservedVerdict = "awaiting" | "unreadable" | "calm" | "delegating" | "gone";
 
 /** One agent's reading, exactly as it crosses the wire. */
 export type ObservedReading = {
@@ -57,10 +57,24 @@ export type ObservedReading = {
   atMs: number;
 };
 
-const VERDICTS: ReadonlySet<string> = new Set<ObservedVerdict>([
+/**
+ * EVERY verdict the wire can carry, as a VALUE — so a guard can iterate them instead of restating
+ * them.
+ *
+ * `parityAcrossRowKinds` (the founder's hard rule: the self row and a build row must derive colour
+ * identically) used to carry its own hand-typed list of three. A list is a restatement, and a
+ * restatement goes stale silently: the verdict added after it was written would simply not have
+ * been covered by the guard he asked for by name. Deriving the guard's cases from this array makes
+ * a new verdict covered by construction, and a type error if it is ever spelled wrong.
+ */
+export const OBSERVED_VERDICTS: readonly ObservedVerdict[] = [
   "awaiting",
   "unreadable",
   "calm",
+  // DELEGATED WORK IS VISIBLE — subagents are running, so this agent is active. The founder's rule:
+  // "DELEGATED WORK COUNTS AS ACTIVITY. If liveness derives only from the parent's own tool calls or
+  // hook events, an agent that fans out goes gray precisely when it is most productive."
+  "delegating",
   // A RETRACTION, not a reading: this agent's terminal is gone, so any held verdict must be
   // DISCARDED. It exists because the producer emits on change and "the agent stopped existing" is a
   // change the other three cannot carry — without it a spun-down agent whose last reading was
@@ -68,7 +82,9 @@ const VERDICTS: ReadonlySet<string> = new Set<ObservedVerdict>([
   // than storing this, so the overlay below should never see it; it is handled there anyway,
   // because "should never" is not a guarantee.
   "gone",
-]);
+];
+
+const VERDICTS: ReadonlySet<string> = new Set<string>(OBSERVED_VERDICTS);
 
 /**
  * Parse ONE payload off the wire.
@@ -213,6 +229,34 @@ export function applyVerdict(
     // agent blocked on a human going red with no pane mounted — is the `awaiting` arm above and is
     // unaffected. What is lost is only the latch-break on a green nobody can verify, which is a
     // strictly smaller harm than mislabelling a live agent as a finished one.
+    return undefined;
+  }
+  if (verdict === "delegating") {
+    // ⚠️ PROMOTES `idle` AND NOTHING ELSE — deliberately the SAME rule as
+    // `workerRollup.withBackgroundTaskGreen`, because the founder's hard rule is that the self row
+    // and build rows behave identically and the two promotions must therefore not diverge:
+    //
+    //   • RED stays red. A live subagent does not answer a question the agent is asking, and this
+    //     verdict is produced only where the grid carried no prompt anyway — but a row can be red
+    //     for reasons this grid never saw (an `errored` process, a worker's red bubbled up), and
+    //     motion must never paint over one. Red wins over motion, always.
+    //   • BLUE (`questions`) is the one attention state that is good news; `tokens.ts` is explicit
+    //     it must never be repainted.
+    //   • AMBER (`lapsed`), `unmerged` and `new` each carry a distinct calm MEANING — "machinery
+    //     stopped", "PR owed", "never briefed" — that background motion must not overwrite.
+    //   • `done`/`stopped` are terminal lifecycle claims. Promoting one would resurrect a finished
+    //     agent to green off a grid that may be the last frame it ever drew.
+    //
+    // `idle` — "finished its turn, nothing left for you" — is the ONE gray the bug produces: the
+    // turn closed while delegated work ran on. That is precisely the case to repaint, and only it.
+    //
+    // …PLUS `undefined`, which `withBackgroundTaskGreen` has no equivalent of and could not need.
+    // That map always has an entry, because a mounted pane has been writing one. THIS overlay
+    // exists for rows where no writer ever ran, so "no entry at all" is not an edge case here, it
+    // is the population: `AgentSidebar` renders a missing entry as gray, so leaving it alone would
+    // leave the founder's report unfixed for exactly the agents nobody has opened. The `awaiting`
+    // arm above already treats `undefined` as promotable for the same reason.
+    if (current === undefined || current === "idle") return "working";
     return undefined;
   }
   // `calm` — see rule 3 above. `gone` too: it is a retraction the LISTENER acts on by deleting the

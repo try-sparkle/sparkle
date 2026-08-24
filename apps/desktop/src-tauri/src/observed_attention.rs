@@ -48,6 +48,8 @@ use std::sync::Mutex;
 use serde::Serialize;
 
 use crate::nudge_gate;
+use crate::support::pattern;
+use regex::Regex;
 
 /// The event name. MUST match `OBSERVED_ATTENTION_EVENT` in
 /// `apps/desktop/src/services/observedAttentionListener.ts` and the `event` key of
@@ -65,6 +67,26 @@ pub enum Verdict {
     Awaiting,
     Unreadable,
     Calm,
+    /// DELEGATED WORK IS VISIBLE ON THE GRID — subagents are running, so this agent is ACTIVE.
+    ///
+    /// The founder's rule, verbatim: "DELEGATED WORK COUNTS AS ACTIVITY. If liveness derives only
+    /// from the parent's own tool calls or hook events, an agent that fans out goes gray precisely
+    /// when it is most productive." Two states must both read green — working WITH subagents live,
+    /// and BLOCKED WAITING on them — and the second is the one that was missed, because from the
+    /// parent's own PTY it looks exactly like doing nothing: no spinner, no output, for minutes.
+    ///
+    /// For a MOUNTED pane the app already answers this (`engine/workerRollup.withBackgroundTaskGreen`
+    /// off `services/backgroundTaskRegistry`). This verdict is the complement and nothing more: the
+    /// overlay that consumes it skips any agent with a live writer, so this covers exactly the rows
+    /// nobody has opened — the case this module exists for.
+    ///
+    /// STRICTLY SUBORDINATE TO EVERY OTHER VERDICT, by construction: it is produced ONLY from the
+    /// arm where `write_refusal` returned `None`, i.e. we read the grid and there is no prompt, no
+    /// credential box, no foreign full-screen app and no running-turn marker. So it can never mask
+    /// an `awaiting`, and a consumer may treat it as "green if this row is otherwise gray" without
+    /// re-deriving that ordering. See `delegated_work_visible` for why it is NOT produced
+    /// from the `Working` arm, which sits ABOVE the prompt gates.
+    Delegating,
     /// THIS AGENT'S TERMINAL IS GONE — discard any reading you hold for it.
     ///
     /// Not a statement about a screen; there is no screen. It exists because the producer emits on
@@ -84,6 +106,7 @@ impl Verdict {
             Verdict::Awaiting => "awaiting",
             Verdict::Unreadable => "unreadable",
             Verdict::Calm => "calm",
+            Verdict::Delegating => "delegating",
             Verdict::Gone => "gone",
         }
     }
@@ -107,6 +130,257 @@ pub struct ObservedAttention {
     /// not have to re-derive that from the verdict alone.
     pub alternate: bool,
     pub at_ms: u64,
+}
+
+// ── DELEGATED WORK ON THE GRID (the founder's "it has many sub agents working" report) ──────────
+//
+// TWO SURFACES, BOTH DRAWN BY CLAUDE CODE ITSELF, ported from the TypeScript readers so the two
+// languages answer this question the same way. `apps/desktop/shared/delegated-work.fixture.json`
+// is what holds them together: every screen in it is classified by BOTH halves, and the Rust test
+// at the bottom of this file and `engine/delegatedWorkFixture.test.ts` assert the SAME partition.
+// Without that, this is the shape AGENTS.md records as measured: two halves built in parallel
+// against a frozen list, both suites green, the shipped feature never once running.
+//
+// ── WHY THIS IS NOT AN ARM OF `nudge_gate::screen_is_working` ────────────────────────────────────
+// Because that function is a VETO — it decides whether the nudger may type. A false positive there
+// suppresses a nudge AND makes this module report `Calm` for an agent standing at a real prompt.
+// That exact regression shipped and was reverted (PR #2465): a spinner remnant in scrollback sat
+// inside the bottom-rows window and made a prompt screen read as working. So the delegated-work
+// reading lives HERE, on the attention side only, where its worst case is a green row rather than
+// a swallowed prompt — and it is consulted only after every prompt gate has already declined.
+
+// Claude Code's live-background-task footer. Mirrors TS `backgroundTaskFooter.BACKGROUND_TASK_FOOTER`.
+// `tasks?` covers the singular and plural forms; `live` is required, which is what keeps this off
+// the FOREGROUND "Running 1 shell command…" status line. Digits are bounded so a pathological run
+// cannot backtrack. TS spells the leading guard `(?<!\d)`; Rust's regex crate has no lookbehind, and
+// `\b` is exactly equivalent here — inside `13` there is no word boundary before the `3`, so the
+// match still starts at the `1`.
+//
+// THE COUNT MUST BE STRICTLY POSITIVE, which is why the digits are spelled `0*[1-9][0-9]{0,3}`
+// rather than `\d{1,4}`. TS parses the number and normalises `0` to `null` — "0 background tasks
+// live" is not live work — so a plain `\d` port would call that screen delegating while the TS
+// reader called it idle. A one-character divergence, and the shared fixture carries the screen that
+// would catch it.
+pattern!(
+    background_task_footer,
+    r"(?i)\b0*[1-9][0-9]{0,3}\s+background\s+tasks?\s+live\b"
+);
+
+// One row of Claude Code's live subagent roster: `◯ <kind>  <label>  <elapsed>`. Byte-for-byte the
+// TS `claudeCodeScreen.BACKGROUND_TASK_ROW`. The ELAPSED SUFFIX is what makes the row structural
+// rather than lexical — a document can quote a bullet glyph, but a live clock at the end of a
+// gutter-glyph line is Claude Code's own.
+pattern!(background_task_row, r"^\s*◯\s+\S.*\d+m\s*\d+s\s*$");
+
+// ── THE WRAPPED STATUS BAR, PORTED FROM `claudeCodeScreen.chromeBarTailBelow` ────────────────────
+//
+// `nothing_unrecognized_below` is strictly LINE-ANCHORED, and on a narrow grid Claude Code's chrome
+// does not arrive on one line: at 12 columns `  ⏸ manual mode on · ? for shortcuts` renders as three
+// rows and only the FIRST carries a glyph the walk recognises (roborev 64464, High). Requiring that
+// walk alone under the background-task footer therefore rejects a REAL narrow pane with subagents
+// running (roborev 68275, High) — so the footer accepts EITHER the walk or this rejoined-tail test.
+//
+// WHAT KEEPS IT FROM ACCEPTING A DOCUMENT: the rows below are REJOINED (Ink split one logical bar
+// across them) and the JOIN must OPEN with one of Claude's own bar phrases. "The tail contains one
+// of Claude's phrases" is a weaker claim that a quoting document can satisfy; "the tail IS the bar"
+// is what the anchor buys. `  ⏸ manual` + `mode on · ?` + `for shortcuts` rejoins to a line these
+// recognise, while a paragraph about the footer opens with its own prose and does not.
+//
+// PORTED, so it can drift. `the_chrome_bar_catalogue_has_not_drifted_from_typescript` reads
+// `engine/claudeCodeScreen.ts` and fails if an entry is added, removed or reworded there.
+
+/// TS `claudeCodeScreen.BAR_GLYPHS` — the glyphs Claude Code actually OPENS a status bar with, as
+/// escapes rather than literals for the reason that file gives: these are bytes we RECOGNIZE, not
+/// bytes we render.
+///
+/// ⚠️ A STRICT SUBSET OF `STATUS_GLYPHS`, AND THAT IS THE POINT (roborev 68289, High). The wider
+/// class contains ordinary text bullets — `●` `✓` `✗` `◆` `✻` — and the permission-mode bar is
+/// purely STRUCTURAL, so together they accept any tail opening with a bullet and ≤29 letters ending
+/// in ` on`: `✓ all tests pass on main`. In the TS scoring heuristic that costs one family; HERE it
+/// would be the sole gate on a promotion that LATCHES, since a static pane quoting the footer has
+/// nothing that could ever scroll the line away.
+const BAR_GLYPHS: &str = "\\u{26a0}\\u{23f8}\\u{23f5}\\u{23f4}\\u{25b6}";
+
+/// TS `MAX_NARROW_CHROME_ROWS`.
+const MAX_NARROW_CHROME_ROWS: usize = 12;
+
+/// TS `MAX_BAR_CHARS`. How long ONE logical status bar may be, rejoined from however many rows it
+/// wrapped across.
+///
+/// ⚠️ THIS BOUNDS ONE BAR, NOT THE WHOLE TAIL (roborev 68308, High). The previous constant bounded
+/// the entire rejoined tail at 64 and justified it with "the longest bar is 48 characters". Both
+/// halves were wrong: the TS fixture's own catalogue of things only Claude Code draws OPENS with a
+/// 74-character bar, and `MAX_NARROW_CHROME_ROWS` is 12 precisely because "there are two of them",
+/// so a legitimate two-bar tail rejoins to ~150. Both errors point toward a false NEGATIVE, and a
+/// false negative on THIS path is the founder's bug on the surface that works with no pane open:
+/// the row goes gray while its subagents are listed on it.
+///
+/// No whole-tail number can work — two stacked real bars rejoin LONGER than the bar-plus-prose
+/// document the bound exists to reject — so the tail is segmented per logical bar.
+const MAX_BAR_CHARS: usize = 96;
+
+pattern!(rule_line, r"^\s*[─━═]{8,}\s*$");
+pattern!(box_bottom, r"^\s*[╰└][─━═]{6,}[╯┘]\s*$");
+
+/// TS `claudeCodeScreen.BAR_OPENS_STRICT` — `CHROME_BAR`'s five phrases, re-anchored onto the BAR
+/// glyphs only. One combined alternation rather than five accessors: nothing here needs to know
+/// WHICH bar matched, and the drift test below pins the individual sources against the TS file.
+fn chrome_bar_opens() -> &'static Regex {
+    static CELL: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    CELL.get_or_init(|| {
+        let g = BAR_GLYPHS;
+        let alts = [
+            r"\?\s+for shortcuts\b".to_string(),
+            // TS `PERMISSION_MODE_BAR` — matched by SHAPE rather than by mode name, so it covers
+            // the modes the two old literals missed.
+            format!(r"[{g}][{g}]?\s+[a-z][a-z ]{{1,28}}\son\b"),
+            r"\btranscript saving is off\b".to_string(),
+            r"\bclaude is using your computer\b".to_string(),
+            r"\bpaste again to expand\b".to_string(),
+        ];
+        Regex::new(&format!(r"(?i)^[\s{g}]*(?:{})", alts.join("|")))
+            .expect("static pattern must compile")
+    })
+}
+
+/// Is everything below `idx` the wrapped remainder of Claude's own status bar, or nothing at all?
+fn chrome_bar_tail_below(all: &[&str], idx: usize) -> bool {
+    let mut below: Vec<&str> = Vec::new();
+    for l in all.iter().skip(idx + 1) {
+        let t = l.trim();
+        if t.is_empty() {
+            continue;
+        }
+        if below.len() >= MAX_NARROW_CHROME_ROWS {
+            return false;
+        }
+        below.push(t);
+    }
+    // Nothing below, or only rules: the footer still terminates the grid. Neither is a document.
+    if below.is_empty() {
+        return true;
+    }
+    let is_rule = |l: &str| rule_line().is_match(l) || box_bottom().is_match(l);
+    if below.iter().all(|l| is_rule(l)) {
+        return true;
+    }
+    // A divider between the footer and the bar is skipped first (roborev 64501): a leading rule is
+    // already accepted on its own, so letting one push the bar out of the anchor's reach would
+    // answer false on a screen a rules-only tail would have kept.
+    let first = below.iter().position(|l| !is_rule(l)).unwrap_or(0);
+    every_row_is_chrome_bar(&below[first..])
+}
+
+/// Does this row START a new logical status bar — i.e. open with one of Claude's bar glyphs?
+///
+/// ⚠️ SEGMENT ON THE GLYPH, NOT ON `chrome_bar_opens`. The obvious rule — "a new bar begins wherever
+/// a row matches the anchor" — is WRONG: the WRAP pushes the words the anchor needs onto the next
+/// row, so the first row of a wrapped `▶▶ bypass` / `permissions on` matches nothing on its own.
+/// That is exactly why the original code joined before testing. The glyph survives the wrap.
+fn bar_starts() -> &'static Regex {
+    static CELL: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    CELL.get_or_init(|| {
+        Regex::new(&format!(r"^\s*[{}]", BAR_GLYPHS)).expect("static pattern must compile")
+    })
+}
+
+/// A continuation row that is PROSE rather than the rest of a wrapped bar.
+///
+/// Length alone cannot separate them: the document case rejoins to ~85 characters while a single
+/// REAL bar reaches 74, and no threshold fits in an 11-character gap. Sentence shape does: no
+/// captured bar ends in a full stop, and a wrapped fragment never does. The word count keeps a
+/// terse fragment that merely ends in `.` from reading as prose.
+fn looks_like_prose(line: &str) -> bool {
+    line.trim_end().ends_with('.') && line.split_whitespace().count() >= 5
+}
+
+/// TS `everyRowIsChromeBar`. Split the tail into logical bars; every one must BE a bar.
+fn every_row_is_chrome_bar(rows: &[&str]) -> bool {
+    if rows.is_empty() {
+        return true;
+    }
+    let mut segments: Vec<Vec<&str>> = Vec::new();
+    for row in rows {
+        if segments.is_empty() || bar_starts().is_match(row) {
+            segments.push(vec![row]);
+        } else {
+            segments
+                .last_mut()
+                .expect("segments is non-empty here")
+                .push(row);
+        }
+    }
+    segments.iter().all(|seg| {
+        if seg.iter().skip(1).any(|l| looks_like_prose(l)) {
+            return false;
+        }
+        let join = seg.join(" ");
+        join.chars().count() <= MAX_BAR_CHARS && chrome_bar_opens().is_match(&join)
+    })
+}
+
+/// Is DELEGATED WORK visible on this rendered grid — either of Claude Code's two surfaces?
+///
+/// 1. the `N background task(s) live [ctrl+b to manage]` footer — work Claude has BACKGROUNDED;
+/// 2. the `◯ <kind>  <label>  <elapsed>` roster — subagents running right now. This roster REPLACES
+///    the composer box, so a screen showing it has no other sign of life on it at all, which is
+///    precisely why the parent looks idle while it is blocked waiting on its fan-out.
+///
+/// ── BOTH SURFACES ARE POSITION-CHECKED ──────────────────────────────────────────────────────────
+/// A bare row match alone would be a lexical test, and the bead describing this feature reproduces
+/// `◯ general-purpose  Concierge agents as clickable rows  21m 55s` verbatim — so a pager showing
+/// that document, or this file, trips the pattern. Claude's roster is always the LAST thing drawn
+/// while it is live, so the last matching row must TERMINATE the grid
+/// (`nudge_gate::nothing_unrecognized_below`, the same walk the dialog families use). The TS reader
+/// applies the identical rule and the shared fixture pins them together.
+///
+/// ── BOTH SURFACES ARE POSITION-CHECKED, AND THE FOOTER'S EXEMPTION DID NOT SURVIVE REVIEW ──────
+/// The footer was briefly exempted on the argument that `N background tasks live` is far less
+/// likely to appear in quoted prose than a bullet row. That argument was falsified by the very
+/// commit that made it (roborev 68247): the exact bytes now sit in this repo's shared fixture and
+/// in `engine/backgroundTaskFooter.ts`'s header, so an agent reading either file ends its turn with
+/// the phrase on screen. Both surfaces now take the LAST match and require it to terminate the
+/// grid, and `parseBackgroundTaskCount` was changed in the same commit so the two cannot drift.
+pub fn delegated_work_visible(text: &str) -> bool {
+    if text.is_empty() {
+        return false;
+    }
+    let all: Vec<&str> = nudge_gate::lines(text).collect();
+    // The footer, BOTTOM-ANCHORED like the roster below it. It was exempted at first on the
+    // argument that its wording is far less quotable than a bullet row — and the commit that added
+    // this reader made that false in the same breath (roborev 68247, High): the exact bytes
+    // `3 background tasks live [ctrl+b to manage]` now sit in the shared fixture AND in
+    // `engine/backgroundTaskFooter.ts`'s own header, two files an agent routinely `cat`s.
+    //
+    // Unchecked, that is a LATCH rather than a blip. The quoted line stays on a static viewport, no
+    // prompt is present so every gate declines, and the row this promotes has no mounted writer to
+    // correct it — green forever for an agent doing nothing, which is exactly what the roster's
+    // walk exists to prevent. Claude's real footer TERMINATES the grid; a quoted one has prose
+    // under it.
+    if let Some(i) = all
+        .iter()
+        .rposition(|l| background_task_footer().is_match(l))
+    {
+        // EITHER shape of "terminates the grid". The line-anchored walk alone is a narrow-pane
+        // false negative (roborev 68275) — see `chrome_bar_tail_below` directly above.
+        if nudge_gate::nothing_unrecognized_below(&all, i) || chrome_bar_tail_below(&all, i) {
+            return true;
+        }
+    }
+    // Walk from the BOTTOM to the last roster row, exactly as TS `backgroundTaskRowCount` does: the
+    // first row found from below is the end of the live list, and everything under it must be
+    // recognised chrome or the list is a quoted one.
+    match all.iter().rposition(|l| background_task_row().is_match(l)) {
+        // EITHER shape of "terminates the grid", exactly as the footer arm above requires — and for
+        // the same reason, in the SAME pane at the SAME width (roborev 68289, High). The
+        // line-anchored walk cannot see Claude's Ink-wrapped status bar, and a roster commonly
+        // appears with NO footer under it to fall back on, so requiring the walk alone left a narrow
+        // pane's row gray with its subagents visibly listed on the grid.
+        Some(i) => {
+            nudge_gate::nothing_unrecognized_below(&all, i) || chrome_bar_tail_below(&all, i)
+        }
+        None => false,
+    }
 }
 
 /// Read one rendered grid.
@@ -185,9 +459,25 @@ pub fn classify(text: &str, alternate: bool, reader_parked: bool) -> Verdict {
                 Verdict::Calm
             }
         }
-        // The gate found nothing to refuse: the grid was read and carries no prompt. A POSITIVE
-        // reading — the only verdict that says "fine".
-        None => Verdict::Calm,
+        // The gate found nothing to refuse: the grid was read and carries no prompt.
+        //
+        // THIS IS THE ONLY ARM THAT MAY REPORT `Delegating`, and the placement is the safety
+        // argument. Reaching here means every gate above declined: not the alternate buffer, not a
+        // running-turn marker, not a credential box, not a picker, not a live-region question. So
+        // promoting a grid that ALSO shows subagents cannot mask a prompt — there is provably none.
+        //
+        // In particular it is NOT reported from the `Working` arm, which sits ABOVE the credential
+        // and prompt gates: a false `Working` (a spinner remnant in scrollback) would there turn a
+        // screen with a real prompt on it GREEN. That is the regression PR #2465 reverted, one
+        // layer down, and this ordering is what keeps it from coming back through the colour.
+        None => {
+            if delegated_work_visible(text) {
+                Verdict::Delegating
+            } else {
+                // A POSITIVE reading — the verdict that says "fine".
+                Verdict::Calm
+            }
+        }
     }
 }
 
@@ -339,6 +629,7 @@ mod tests {
                 "awaiting" => Verdict::Awaiting,
                 "unreadable" => Verdict::Unreadable,
                 "calm" => Verdict::Calm,
+                "delegating" => Verdict::Delegating,
                 "gone" => Verdict::Gone,
                 other => panic!("fixture carries a verdict this enum cannot produce: {other}"),
             };
@@ -658,5 +949,282 @@ mod tests {
         state.record(reading("a1", Verdict::Awaiting, false, 1));
         let live: HashSet<&str> = ["a1"].into();
         assert!(state.sweep(&live, 9_000).is_empty());
+    }
+
+    // ── DELEGATED WORK: THE CROSS-LANGUAGE CONTRACT ─────────────────────────────────────────────
+    //
+    // These read `apps/desktop/shared/delegated-work.fixture.json`, and so does
+    // `apps/desktop/src/engine/delegatedWorkFixture.test.ts`. One file, two suites: a matcher that
+    // drifts in EITHER language reds one of them, which is the only structure that stops the two
+    // halves from silently agreeing to disagree (AGENTS.md's measured incident).
+
+    fn delegated_fixture() -> serde_json::Value {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("shared")
+            .join("delegated-work.fixture.json");
+        let raw = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        serde_json::from_str(&raw).expect("fixture is valid JSON")
+    }
+
+    /// (screen text, expected `delegating`, why) for every screen in the shared fixture.
+    fn delegated_screens() -> Vec<(String, bool, String)> {
+        delegated_fixture()["screens"]
+            .as_array()
+            .expect("fixture has a screens array")
+            .iter()
+            .map(|s| {
+                let text = s["lines"]
+                    .as_array()
+                    .expect("screen has a lines array")
+                    .iter()
+                    .map(|l| l.as_str().expect("line is a string"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                (
+                    text,
+                    s["delegating"].as_bool().expect("screen has `delegating`"),
+                    s["why"].as_str().unwrap_or("").to_string(),
+                )
+            })
+            .collect()
+    }
+
+    /// THE PARTITION IS DERIVED, NOT RESTATED. Listing which screens are delegating and asserting
+    /// that list is the vacuous shape AGENTS.md calls the #1 fleet-wide finding — it passes with the
+    /// matcher deleted. This asks the matcher and compares, and the two guards below make BOTH
+    /// directions of drift red: a fixture with no delegating screens (so a matcher stuck on `false`
+    /// would pass) or none idle (so one stuck on `true` would).
+    #[test]
+    fn the_matcher_agrees_with_every_screen_in_the_shared_fixture() {
+        let screens = delegated_screens();
+        assert!(
+            screens.iter().any(|(_, want, _)| *want),
+            "fixture carries no DELEGATING screen — a matcher that always returned false would pass"
+        );
+        assert!(
+            screens.iter().any(|(_, want, _)| !*want),
+            "fixture carries no IDLE screen — a matcher that always returned true would pass"
+        );
+        for (text, want, why) in &screens {
+            assert_eq!(
+                delegated_work_visible(text),
+                *want,
+                "delegated_work_visible disagreed with apps/desktop/shared/delegated-work.fixture.json\n\
+                 screen: {why}\n---\n{text}\n---"
+            );
+        }
+    }
+
+    /// THE WIRING, not just the matcher: a delegating grid must reach the WIRE as `delegating`.
+    /// Without this the matcher could be perfect and `classify` still report `calm`, which is the
+    /// state this whole change exists to leave behind — and every other test here would stay green.
+    #[test]
+    fn a_delegating_grid_classifies_as_delegating_and_an_idle_one_does_not() {
+        for (text, want, why) in delegated_screens() {
+            let verdict = classify(&text, false, false);
+            if want {
+                assert_eq!(
+                    verdict,
+                    Verdict::Delegating,
+                    "a grid showing live delegated work must not be reported as {}: {why}",
+                    verdict.as_str()
+                );
+            } else {
+                assert_ne!(
+                    verdict,
+                    Verdict::Delegating,
+                    "a grid with no live delegated work was reported as delegating: {why}"
+                );
+            }
+        }
+    }
+
+    /// A PROMPT OUTRANKS DELEGATED WORK, and this is the arm that keeps the new verdict from ever
+    /// costing the founder a red row. The same roster is on screen either way; the difference is a
+    /// question underneath it. Reporting `delegating` here would paint an agent that is BLOCKED ON A
+    /// HUMAN green — the exact invisible-green state this module was written to remove.
+    #[test]
+    fn a_prompt_beneath_a_live_roster_is_still_awaiting() {
+        let with_prompt = "⏺ main\n  ◯ general-purpose  Draining findings  3m 04s\n\n\
+             Do you want to proceed?\n❯ 1. Yes\n  2. No\n  3. No, and tell Claude what to do differently";
+        assert_eq!(
+            classify(with_prompt, false, false),
+            Verdict::Awaiting,
+            "a prompt must outrank delegated work — otherwise a blocked agent renders green"
+        );
+    }
+
+    /// AND A PARKED READER STILL WINS. `unreadable` means the grid is arbitrarily stale, so a roster
+    /// on it proves nothing about NOW. Ordering this after the parked check is what stops a frozen
+    /// screenshot of a finished fan-out from holding a row green forever.
+    #[test]
+    fn a_parked_reader_outranks_delegated_work() {
+        let roster = "⏺ main\n  ◯ general-purpose  Draining findings  3m 04s";
+        assert_eq!(classify(roster, false, false), Verdict::Delegating);
+        assert_eq!(
+            classify(roster, false, true),
+            Verdict::Unreadable,
+            "a parked PTY reader means the grid is stale — no claim may be made from it"
+        );
+    }
+
+    /// The token is the wire. A rename here is a silent no-op on every consumer that switches on it.
+    #[test]
+    fn the_delegating_token_is_the_one_the_wire_carries() {
+        assert_eq!(Verdict::Delegating.as_str(), "delegating");
+        assert_eq!(
+            serde_json::to_value(Verdict::Delegating).expect("serializes"),
+            serde_json::json!("delegating")
+        );
+    }
+
+    /// THE PORTED CHROME-BAR CATALOGUE MUST NOT DRIFT FROM `engine/claudeCodeScreen.ts`.
+    ///
+    /// The Rust copy exists only because the mount-independent reader cannot call the TypeScript
+    /// one. A phrase added, removed or reworded on the TS side and not here means the two readers
+    /// disagree about the same narrow pane — one keeps the row green, the other lets it go gray —
+    /// and nothing else in either suite can see it. Pinned by SOURCE TEXT, the same technique
+    /// `nudge_gate::ported_typescript_patterns_have_not_drifted` uses.
+    #[test]
+    fn the_chrome_bar_catalogue_has_not_drifted_from_typescript() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("src")
+            .join("engine")
+            .join("claudeCodeScreen.ts");
+        let ts = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        for needle in [
+            r"/\?\s+for shortcuts\b/i,",
+            r"/\btranscript saving is off\b/i,",
+            r"/\bclaude is using your computer\b/i,",
+            r"/\bpaste again to expand\b/i,",
+            // The SHAPE pattern, which subsumes the mode literals it replaced.
+            r"[a-z][a-z ]{1,28}\\son\\b",
+            // The glyph class, which the anchoring depends on.
+            // The STRICT glyph class this module anchors on, and the fact that the tail test uses
+            // it rather than the wider one. Either edit on the TS side silently widens that gate.
+            r#"const BAR_GLYPHS = "\\u26a0\\u23f8\\u23f5\\u23f4\\u25b6";"#,
+            // THE SEGMENTATION RULE itself, not just its members. A whole-tail bound could never
+            // fit both a two-bar tail (~150 chars) and the bar-plus-prose document (~85), so
+            // collapsing this back to one join is the defect, and it must red here (roborev 68308).
+            "return [...join].length <= MAX_BAR_CHARS && matchesAny(BAR_OPENS_STRICT, join);",
+            // The per-segment PROSE guard. Length alone cannot reject the document case, so
+            // deleting this leaves the bound intact and the gate wrong.
+            "if (seg.slice(1).some(looksLikeProse)) return false;",
+            // SEGMENT ON THE GLYPH. Segmenting on the anchor instead silently breaks every WRAPPED
+            // bar, because the wrap pushes the anchor's words onto the next row.
+            "if (segments.length === 0 || BAR_STARTS.test(row)) segments.push([row]);",
+            // The BOUND and its value, pinning the WHOLE declaration so a flag/value edit reds.
+            "const MAX_BAR_CHARS = 96;",
+            // THE SPLIT THAT KEEPS FAMILY F STRICT. `hasBackgroundTaskList` gates a WRITE, so its
+            // default must stay the line-anchored walk; only the attention reader passes the looser
+            // test. Deleting the parameter would leave every literal above intact.
+            "terminates: (lines: readonly string[], i: number) => boolean = nothingUnrecognizedBelowFooter,",
+        ] {
+            assert!(
+                ts.contains(needle),
+                "claudeCodeScreen.ts changed something this module ported: {needle}\n\
+                 Port the change into observed_attention.rs rather than editing this expectation."
+            );
+        }
+        // …and the count, so an ADDED bar cannot slip through the per-literal loop above.
+        let entries = ts
+            .split("const CHROME_BAR: RegExp[] = [")
+            .nth(1)
+            .expect("CHROME_BAR array not found")
+            .split("];")
+            .next()
+            .expect("CHROME_BAR array not closed")
+            .lines()
+            .filter(|l| {
+                let t = l.trim();
+                !t.is_empty() && !t.starts_with("//") && !t.starts_with("*")
+            })
+            .count();
+        assert_eq!(
+            entries, 5,
+            "CHROME_BAR gained or lost an entry — mirror it in `chrome_bar_opens` in the SAME commit"
+        );
+    }
+
+    /// The wrapped narrow-pane bar is the case the strict walk cannot see, so assert BOTH halves:
+    /// the walk rejects it (which is why the second arm exists) and the rejoined test accepts it.
+    #[test]
+    fn a_wrapped_status_bar_is_accepted_only_by_the_rejoined_tail() {
+        let all = ["3 background tasks live [ctrl+b to manage]", "  ⏸ manual", "mode on · ?", "for shortcuts"];
+        assert!(
+            !nudge_gate::nothing_unrecognized_below(&all, 0),
+            "if the line-anchored walk ever accepts this, the second arm is untested — and a test \
+             that cannot fail is worse than no test"
+        );
+        assert!(chrome_bar_tail_below(&all, 0));
+        assert!(delegated_work_visible(&all.join("\n")));
+    }
+
+    /// …and the anchor is what keeps a DOCUMENT out. A tail that merely CONTAINS one of Claude's
+    /// phrases is prose; one that OPENS with it is the bar.
+    #[test]
+    fn a_tail_that_merely_mentions_a_bar_phrase_is_still_a_document() {
+        let quoting = [
+            "3 background tasks live [ctrl+b to manage]",
+            "The status bar reads ? for shortcuts, which is Claude's own chrome and",
+            "is quoted here so the matcher can be tested against it.",
+        ];
+        assert!(!chrome_bar_tail_below(&quoting, 0));
+        assert!(!delegated_work_visible(&quoting.join("\n")));
+    }
+
+    /// THE WHOLE TAIL IS ACCOUNTED FOR, not only its opening (roborev 68294, High). A document that
+    /// opens its tail with a REAL bar and then keeps going cleared the anchor, because everything
+    /// after the opening was joined and never examined again.
+    #[test]
+    fn a_tail_that_opens_with_a_real_bar_and_keeps_going_is_still_a_document() {
+        let bar_only = ["⏸ manual mode on · ? for shortcuts"];
+        assert!(
+            chrome_bar_tail_below(&["x", bar_only[0]], 0),
+            "the bar alone must still be accepted, or this test proves nothing about the tail"
+        );
+        let bar_then_prose = [
+            "  ◯ general-purpose  Draining roborev findings  3m 04s",
+            "⏸ manual mode on · ? for shortcuts",
+            "and the row must go green while that is on screen.",
+        ];
+        assert!(!chrome_bar_tail_below(&bar_then_prose, 0));
+        assert!(!delegated_work_visible(&bar_then_prose.join("\n")));
+    }
+
+    /// The bound is a claim about how long ONE bar can be, so pin it against the LONGEST bar this
+    /// repo has actually captured — not the shortest one that happened to be quoted.
+    ///
+    /// ⚠️ THE OLD VERSION OF THIS TEST IS WHY THE DEFECT SHIPPED. It measured
+    /// `Claude is using your computer · press Esc to stop` (49 chars) and pronounced the bound safe,
+    /// while `capturedScreens.fixture.ts` opened its catalogue with a 74-character bar that the
+    /// bound REJECTED. A test that picks its own witness cannot falsify the claim it is guarding.
+    #[test]
+    fn the_bound_admits_the_longest_captured_bar_and_is_not_unbounded() {
+        // The real maximum, verbatim from NON_PICKER_HINT_LINES_2_1_220[0].
+        let longest = "▶▶ bypass permissions on (shift+tab to cycle) · PR #730 · esc to interrupt";
+        assert_eq!(longest.chars().count(), 74, "the captured maximum moved; re-measure the bound");
+        assert!(
+            longest.chars().count() <= MAX_BAR_CHARS,
+            "the longest captured bar ({} chars) no longer fits MAX_BAR_CHARS ({})",
+            longest.chars().count(),
+            MAX_BAR_CHARS
+        );
+        assert!(chrome_bar_tail_below(&["x", longest], 0));
+        // TWO of them, which MAX_NARROW_CHROME_ROWS's own comment says is the real shape.
+        assert!(chrome_bar_tail_below(&["x", longest, "⏸ manual mode on · ? for shortcuts"], 0));
+        // And the WRAP, which is the entire reason this loose arm exists.
+        assert!(chrome_bar_tail_below(
+            &["x", "▶▶ bypass", "permissions on", "(shift+tab to", "cycle) · PR", "#730 · esc to", "interrupt"],
+            0
+        ));
+        assert!(
+            MAX_BAR_CHARS < 128,
+            "an effectively unbounded segment is the defect this constant exists to close"
+        );
     }
 }

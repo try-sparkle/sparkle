@@ -4,9 +4,18 @@
 // `htop`/`lazygit` must NOT be — including a pager displaying a file that talks ABOUT Claude Code,
 // which is the content-heuristic fool `dictationTerminalRoute`'s header was right to worry about.
 import { describe, expect, it } from "vitest";
-import { claudeCodeMarkerFamilies, isClaudeCodeScreen } from "./claudeCodeScreen";
+import {
+  chromeBarTailBelow,
+  claudeCodeMarkerFamilies,
+  isClaudeCodeScreen,
+  liveBackgroundSubagentCount,
+} from "./claudeCodeScreen";
 import { screenBlocksWrite } from "../voice/dictationTerminalRoute";
-import { APPROVAL_2_1_220, IDLE_AFTER_TURN_2_1_220 } from "./capturedScreens.fixture";
+import {
+  APPROVAL_2_1_220,
+  IDLE_AFTER_TURN_2_1_220,
+  NON_PICKER_HINT_LINES_2_1_220,
+} from "./capturedScreens.fixture";
 
 // ══ THE FOUNDER'S SECOND SCREEN (bead sparkle-tbsvf) ═══════════════════════════════════════════
 // RECONSTRUCTED from the concierge's own read of the Improve Sparkle pane, not a captured viewport
@@ -229,5 +238,115 @@ describe("isClaudeCodeScreen — genuine full-screen apps are not Claude Code", 
 
   it("rejects an empty screen", () => {
     expect(isClaudeCodeScreen("")).toBe(false);
+  });
+});
+
+// ══ FAMILY F AUTHORIZES A WRITE, SO IT KEEPS THE STRICT WALK (roborev 68294, High) ══════════════
+//
+// `isClaudeCodeScreen` returns true on family F STANDING ALONE — no corroborating family, no
+// composer box — and `screenBlocksWrite` reads it, so a false positive here is not a wrong colour,
+// it is "a line pasted AND SUBMITTED" into whatever is really on screen.
+//
+// The wrapped-status-bar accommodation added for the ATTENTION reader is strictly weaker than the
+// line-anchored walk: it constrains where the rejoined tail STARTS. Routing it into family F would
+// let a pager showing a document that quotes a roster row and a status bar be written into. The two
+// questions are therefore asked separately — `liveBackgroundSubagentCount` takes the looser test,
+// `hasBackgroundTaskList` does not — and these pin that split from the side that matters.
+describe("family F keeps the strict walk while the attention reader takes the loose one", () => {
+  // THE SCREEN WHERE THE TWO READERS LEGITIMATELY DISAGREE, which is the only shape that can prove
+  // the split. Its tail is a genuinely wrapped status bar — short, anchored, indistinguishable from
+  // a live one — so the loose test ACCEPTS it and must: refusing it is the narrow-pane gray row.
+  // Family F cannot afford the same benefit of the doubt, because it authorizes a keystroke.
+  const ROSTER_UNDER_A_WRAPPED_BAR = [
+    "  ◯ general-purpose  Draining roborev findings  3m 04s",
+    "⏸ manual",
+    "mode on · ?",
+    "for shortcuts",
+  ].join("\n");
+
+  it("the ATTENTION reader counts it — that is the narrow-pane fix", () => {
+    expect(liveBackgroundSubagentCount(ROSTER_UNDER_A_WRAPPED_BAR)).toBe(1);
+  });
+
+  it("…and family F still does NOT fire on it, so no write is authorized", () => {
+    // `dictationTerminalRoute:403` is the consumer: `viewport.alternateBuffer &&
+    // !isClaudeCodeScreen(text)` is what refuses an alternate-buffer write. A true here would let a
+    // pager showing this be typed into — "a line pasted AND SUBMITTED", per this file's own header.
+    expect(isClaudeCodeScreen(ROSTER_UNDER_A_WRAPPED_BAR)).toBe(false);
+  });
+
+  // NON-VACUITY: the real roster DOES satisfy family F, so the assertions above are about the tail
+  // rather than about the roster pattern never matching anything.
+  it("…while the real roster, terminating the grid, still does", () => {
+    expect(isClaudeCodeScreen(BACKGROUND_TASK_LIST)).toBe(true);
+  });
+
+  // The longer document tail is rejected by BOTH readers — the join bound catches it before the
+  // split ever matters. Kept so the two mechanisms are visibly separate.
+  it("a document that opens its tail with a bar and keeps going is rejected by both", () => {
+    const document = [
+      "  ◯ general-purpose  Draining roborev findings  3m 04s",
+      "⏸ manual mode on · ? for shortcuts",
+      "and the row must go green while that is on screen.",
+    ].join("\n");
+    expect(liveBackgroundSubagentCount(document)).toBeNull();
+    expect(isClaudeCodeScreen(document)).toBe(false);
+  });
+});
+
+
+// ══ THE CHROME TAIL IS SEGMENTED PER LOGICAL BAR (roborev 68308, High) ═════════════════════════
+//
+// The bound this replaces was applied to the WHOLE rejoined tail and sized from a bar that is not
+// the longest one. Both errors point the same way — toward a FALSE NEGATIVE — and a false negative
+// here is the exact bug this surface exists to fix: a narrow pane takes its row GRAY while its
+// subagents are visibly listed on it.
+//
+// These drive `chromeBarTailBelow` itself, and every case is a tail under a real roster row, so
+// what is asserted is the thing the row's colour actually depends on.
+describe("chromeBarTailBelow — a tail is one or more logical status bars", () => {
+  const ROSTER = ["⏺ main", "  ◯ general-purpose  Draining roborev findings  3m 04s"];
+  const ROW = 1;
+  const tail = (...rows: string[]): boolean => chromeBarTailBelow([...ROSTER, ...rows], ROW);
+
+  const SHORT_BAR = "⏸ manual mode on · ? for shortcuts";
+  const LONG_BAR = NON_PICKER_HINT_LINES_2_1_220[0]!;
+
+  it("the fixture's longest bar is the one the bound must clear — measured, not quoted", () => {
+    // THE GUARD ON THE GUARD. The replaced constant's comment asserted "the longest bar is 48
+    // characters" while this very list opened with a 74-character one. Recomputing it here means a
+    // longer sample added later reds this test instead of silently taking a row gray.
+    const longest = Math.max(...NON_PICKER_HINT_LINES_2_1_220.map((l) => l.trim().length));
+    expect(longest).toBeGreaterThan(64);
+    expect(LONG_BAR.trim().length).toBe(74);
+  });
+
+  it("accepts a short bar — the only shape the previous tests covered", () => {
+    expect(tail(SHORT_BAR)).toBe(true);
+  });
+
+  it("accepts the real 74-character captured bar, which the 64-char bound REJECTED", () => {
+    expect(tail(LONG_BAR)).toBe(true);
+  });
+
+  it("accepts TWO stacked bars — MAX_NARROW_CHROME_ROWS exists because there are two of them", () => {
+    expect(tail(SHORT_BAR, SHORT_BAR)).toBe(true);
+    expect(tail(LONG_BAR, SHORT_BAR)).toBe(true);
+  });
+
+  it("accepts a bar WRAPPED across rows, which is why the loose arm exists at all", () => {
+    expect(tail("▶▶ bypass", "permissions on", "(shift+tab to", "cycle) · PR", "#730 · esc to", "interrupt")).toBe(true);
+  });
+
+  it("still REJECTS a bar followed by prose — the document case the bound was added for", () => {
+    expect(tail(SHORT_BAR, "and the row must go green while that is on screen.")).toBe(false);
+  });
+
+  it("still REJECTS a tail that opens with an unanchored fragment", () => {
+    expect(tail("and the row must go green while that is on screen.", SHORT_BAR)).toBe(false);
+  });
+
+  it("still REJECTS one absurdly long run that no real bar reaches", () => {
+    expect(tail(`${SHORT_BAR} ${"x".repeat(120)}`)).toBe(false);
   });
 });

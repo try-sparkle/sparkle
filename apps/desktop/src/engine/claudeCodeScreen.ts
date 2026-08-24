@@ -193,6 +193,37 @@ const CHROME_BAR_OPENS: readonly RegExp[] = CHROME_BAR.map(
   (re) => new RegExp(`^[\\s${STATUS_GLYPHS}]*(?:${re.source})`, re.flags),
 );
 
+/** The glyphs Claude Code actually OPENS a status bar with — a strict subset of
+ *  {@link STATUS_GLYPHS}, which is a recognition class for status lines generally.
+ *
+ *  ══ WHY THE WIDER CLASS IS TOO WEAK TO GATE A LATCHING PROMOTION (roborev 68289, High) ═════════
+ *  `STATUS_GLYPHS` contains ordinary text bullets — `●` `✓` `✗` `◆` `✻` — and `PERMISSION_MODE_BAR`
+ *  is purely STRUCTURAL (`[glyph][glyph]?\s+[a-z][a-z ]{1,28}\son\b`, case-insensitive). Together
+ *  they accept any tail opening with a bullet and ≤29 letters ending in ` on`:
+ *
+ *      ✓ all tests pass on main
+ *      ● delegated work is green on idle rows
+ *
+ *  In `narrowBoxTerminatesGrid` that weakness costs one family toward `isClaudeCodeScreen`'s `>= 2`
+ *  — a scoring heuristic with other evidence beside it. {@link chromeBarTailBelow} promotes it to
+ *  the SOLE gate on a promotion that LATCHES: a static pane quoting the background-task footer, no
+ *  prompt and no spinner on it, would go green and stay green with nothing able to scroll the line
+ *  away. So this call site anchors on the bar glyphs only.
+ *
+ *  DELIBERATELY NOT APPLIED TO `CHROME_BAR_OPENS` ITSELF. Tightening the shared constant would
+ *  narrow `narrowBoxTerminatesGrid` in the same edit, and that arm's thresholds have their own
+ *  measured history (roborev 64464/64475/64487/64501). One consumer needing a stricter gate is a
+ *  reason to give that consumer one, not to re-tune a neighbour that did not ask. */
+const BAR_GLYPHS = "\\u26a0\\u23f8\\u23f5\\u23f4\\u25b6";
+
+const BAR_OPENS_STRICT: readonly RegExp[] = [
+  /\?\s+for shortcuts\b/i,
+  new RegExp(`[${BAR_GLYPHS}][${BAR_GLYPHS}]?\\s+[a-z][a-z ]{1,28}\\son\\b`, "i"),
+  /\btranscript saving is off\b/i,
+  /\bclaude is using your computer\b/i,
+  /\bpaste again to expand\b/i,
+].map((re) => new RegExp(`^[\\s${BAR_GLYPHS}]*(?:${re.source})`, re.flags));
+
 /** ══ FAMILY D — THE COMPOSER BOX ════════════════════════════════════════════════════════════════
  *  Claude Code's input line is a `❯ ` (or `>` ) prompt sandwiched between two full-width box rules —
  *  see IDLE_AFTER_TURN_2_1_220, where the three lines are consecutive.
@@ -355,10 +386,24 @@ function hasBackgroundTaskList(lines: readonly string[]): boolean {
  *  — this module's header notes that the bead describing this feature reproduces a row verbatim, so
  *  a doc on screen trips the row pattern. A quoted list must not park a count that paints a finished
  *  agent green forever. Position is the discriminator, exactly as it is for the dialog family. */
-function backgroundTaskRowCount(lines: readonly string[]): number | null {
+function backgroundTaskRowCount(
+  lines: readonly string[],
+  /** How strictly the list must TERMINATE the grid — and the two callers genuinely differ, because
+   *  they are asking different questions with different costs (roborev 68294, High).
+   *
+   *  ⚠️ THE DEFAULT IS THE STRICT WALK, AND IT MUST STAY THAT WAY. `hasBackgroundTaskList` is
+   *  FAMILY F, and `isClaudeCodeScreen` returns true on family F STANDING ALONE — no corroborating
+   *  family, no composer box. That predicate gates the WRITE path (`dictationTerminalRoute` treats
+   *  an alternate-buffer viewport as safe when it holds), and this file's own header prices a false
+   *  positive there as "a line pasted AND SUBMITTED" into a pager. The wrapped-bar accommodation is
+   *  strictly weaker than the walk — it constrains the tail's OPENING, not all of it — so routing
+   *  it into family F traded a gray row for a keystroke into `less`. Colour and authorization are
+   *  not the same question and must not share one threshold. */
+  terminates: (lines: readonly string[], i: number) => boolean = nothingUnrecognizedBelowFooter,
+): number | null {
   for (let i = lines.length - 1; i >= 0; i--) {
     if (!BACKGROUND_TASK_ROW.test(lines[i] ?? "")) continue;
-    if (!nothingUnrecognizedBelowFooter(lines, i)) return null;
+    if (!terminates(lines, i)) return null;
     // Walk UP the contiguous block. Blank rows inside the list are tolerated; the first non-blank
     // line that is not a row ends it (in practice the `⏺ <branch>` header the list hangs under).
     let n = 0;
@@ -372,11 +417,120 @@ function backgroundTaskRowCount(lines: readonly string[]): number | null {
   return null;
 }
 
+/**
+ * Is everything below `idx` the WRAPPED REMAINDER of Claude Code's own status bar (or nothing at
+ * all)?
+ *
+ * ══ WHY THIS EXISTS BESIDE `nothingUnrecognizedBelowFooter` RATHER THAN INSTEAD OF IT ═══════════
+ * That walk is strictly LINE-ANCHORED, and this file already records (roborev 64464, High) that on
+ * a narrow grid Claude's chrome does not arrive on one line: at 12 columns
+ * `"  ⏸ manual mode on · ? for shortcuts"` renders as three rows and only the FIRST carries a glyph
+ * `AMBIENT_CHROME_LINE` recognises. {@link narrowBoxTerminatesGrid} refuses to call the walk for
+ * exactly that reason — and when `backgroundTaskFooter` began requiring the walk under the live
+ * `N background task(s) live` footer, it inherited the same defect (roborev 68275, High): a real
+ * narrow pane with three subagents running would answer `null`, `forgetBackgroundTasks` would fire,
+ * and the row would go GRAY while its delegates ran. That is bead sparkle-262p7's bug, reintroduced
+ * by the fix for a different one.
+ *
+ * So the footer accepts EITHER shape: the line-anchored walk, or this rejoined-tail test. Both
+ * reject a QUOTED footer, which is the property that must not be lost — a document's tail opens
+ * with its own prose, and `CHROME_BAR_OPENS` is anchored precisely so that "the tail CONTAINS one
+ * of Claude's phrases" is not enough.
+ *
+ * Extracted from {@link narrowBoxTerminatesGrid}'s tail logic rather than copied, minus the
+ * grid-width bound — a footer has no rules of its own to measure a pane against, and this file
+ * already records that the bound is vacuous at narrow widths anyway (roborev 64475).
+ */
+/** A row that STARTS a new logical status bar, i.e. opens with one of Claude's bar glyphs.
+ *
+ *  ⚠️ SEGMENT ON THE GLYPH, NOT ON `BAR_OPENS_STRICT`. The obvious rule — "a new bar begins wherever
+ *  a row matches the bar anchor" — is WRONG, and the wrapped-bar tests catch it: the anchor needs
+ *  words that the WRAP pushed onto the next row, so the first row of
+ *
+ *      ▶▶ bypass
+ *      permissions on
+ *
+ *  matches nothing on its own. That is the whole reason the original code joined before testing.
+ *  The glyph survives the wrap because it is the first thing drawn, so it is the one marker that
+ *  reliably separates "a second bar started" from "the first bar continued". */
+const BAR_STARTS = new RegExp(`^[\\s]*[${BAR_GLYPHS}]`);
+
+/** A continuation row that is PROSE rather than the rest of a wrapped bar.
+ *
+ *  Length alone cannot separate these: the document case this rejects — a bar followed by `and the
+ *  row must go green while that is on screen.` — rejoins to ~85 characters while a single REAL bar
+ *  reaches 74, and no threshold fits in an 11-character gap. Sentence shape does fit: no entry in
+ *  `capturedScreens.fixture.ts` ends in a full stop, and a wrapped fragment (`cycle) · PR`,
+ *  `esc to interrupt`) never does. The word count keeps a terse fragment that merely ends in `.`
+ *  from being read as prose. */
+function looksLikeProse(line: string): boolean {
+  return /\.\s*$/.test(line) && line.split(/\s+/).filter(Boolean).length >= 5;
+}
+
+/** Split the tail into logical status bars and require EVERY one of them to be a status bar.
+ *
+ *  ⚠️ THE OLD SHAPE CHECKED ONLY WHERE THE TAIL OPENED (roborev 68294, then 68308). It rejoined the
+ *  whole tail into one string and tested `BAR_OPENS_STRICT` against it — a regex anchored at `^`, so
+ *  it only ever described the FIRST bar — then bounded that entire join. Everything after the
+ *  opening was joined and never examined, and the bound then rejected legitimate tails: the real
+ *  74-character `bypass permissions on … · PR #730 · esc to interrupt`, and any two stacked bars.
+ *
+ *  No whole-tail number can work, which is why this is a segmentation and not a bigger constant:
+ *  two stacked real bars rejoin LONGER than the bar-plus-prose document the bound exists to reject.
+ *  Per bar, the two shapes separate cleanly.
+ *
+ *  Each segment must itself look like a bar and stay within one bar's length; a continuation that
+ *  reads as prose disqualifies its segment. */
+function everyRowIsChromeBar(rows: readonly string[]): boolean {
+  if (rows.length === 0) return true;
+  const segments: string[][] = [];
+  for (const row of rows) {
+    if (segments.length === 0 || BAR_STARTS.test(row)) segments.push([row]);
+    else segments[segments.length - 1]!.push(row);
+  }
+  return segments.every((seg) => {
+    if (seg.slice(1).some(looksLikeProse)) return false;
+    const join = seg.join(" ");
+    // ⚠️ CODE POINTS, NOT `.length`. Rust's port counts `.chars()`, so measuring UTF-16 units here
+    // would let one astral character make the two readers disagree about the SAME screen — and this
+    // module's whole contract is that the mount-independent Rust path and the mounted TS path answer
+    // identically. Today's glyphs are all BMP so the two agree, which is exactly why a divergence
+    // here would sit unnoticed until the character that triggers it appears (VADE, PR #2498).
+    return [...join].length <= MAX_BAR_CHARS && matchesAny(BAR_OPENS_STRICT, join);
+  });
+}
+
+export function chromeBarTailBelow(lines: readonly string[], idx: number): boolean {
+  const below: string[] = [];
+  for (let i = idx + 1; i < lines.length; i++) {
+    const line = (lines[i] ?? "").trim();
+    if (!line) continue;
+    if (below.length >= MAX_NARROW_CHROME_ROWS) return false;
+    below.push(line);
+  }
+  // Nothing below, or only rules: the footer still terminates the grid. Neither is a document.
+  if (below.length === 0) return true;
+  if (below.every((l) => RULE_LINE.test(l) || BOX_BOTTOM.test(l))) return true;
+  // A divider between the footer and the bar is skipped first, for the reason roborev 64501 gives:
+  // a leading rule is already accepted on its own, so letting one push the bar out of the anchor's
+  // reach would answer `false` on a screen a rules-only tail would have kept.
+  const firstNonRule = below.findIndex((l) => !RULE_LINE.test(l) && !BOX_BOTTOM.test(l));
+  return everyRowIsChromeBar(below.slice(firstNonRule));
+}
+
 /** {@link backgroundTaskRowCount} over a rendered snapshot. See its header for why this is a count
  *  and why `null` is not zero. */
 export function liveBackgroundSubagentCount(snapshot: string): number | null {
   if (!snapshot) return null;
-  return backgroundTaskRowCount(snapshot.split("\n"));
+  // THE ATTENTION READER, and the ONLY caller that takes the looser test. A roster commonly appears
+  // with no footer beneath it to fall back on, and the line-anchored walk cannot see Claude's
+  // Ink-wrapped status bar — so on a narrow pane the walk alone took a row GRAY with its subagents
+  // visibly listed. That is a colour bug; it never authorizes a write, which is why this and family
+  // F ask the question differently. See `backgroundTaskRowCount`'s parameter.
+  return backgroundTaskRowCount(
+    snapshot.split("\n"),
+    (lines, i) => nothingUnrecognizedBelowFooter(lines, i) || chromeBarTailBelow(lines, i),
+  );
 }
 
 function hasLiveDialog(lines: readonly string[]): boolean {
@@ -548,6 +702,31 @@ function closingRuleIdx(
  *  role in the walk this narrow arm stands in for, with room for the WRAP: one status bar that fits
  *  on a single row at 120 columns occupies several at 12, and there are two of them. */
 const MAX_NARROW_CHROME_ROWS = 12;
+
+/** How long ONE logical status bar may be, rejoined from however many rows it wrapped across.
+ *
+ *  ⚠️ THIS BOUNDS ONE BAR, NOT THE WHOLE TAIL, and the difference is what makes it correct
+ *  (roborev 68308, High). The previous constant bounded the ENTIRE rejoined tail at 64 and was
+ *  justified by "the longest bar Claude draws is 48 characters". Both halves were wrong:
+ *
+ *    • `capturedScreens.fixture.ts`'s `NON_PICKER_HINT_LINES_2_1_220` — the list this module's own
+ *      comment calls an unusually well-evidenced catalogue of things only Claude Code draws —
+ *      OPENS with a 74-character bar, `bypass permissions on (shift+tab to cycle) · PR #730 · esc
+ *      to interrupt`, whose leading glyph is in `BAR_GLYPHS` and which matches `BAR_OPENS_STRICT`.
+ *      So one real, unwrapped, live bar already exceeded the bound.
+ *    • `MAX_NARROW_CHROME_ROWS` is 12 precisely because a bar occupies several rows at 12 columns
+ *      "and there are two of them" — so a legitimate two-bar tail rejoins to ~150 characters and
+ *      could never pass a 64-char whole-tail bound.
+ *
+ *  There is no whole-tail number that works: two stacked real bars rejoin longer than the
+ *  bar-plus-prose document this bound exists to reject. The tail is therefore SEGMENTED per logical
+ *  bar and this bounds each segment.
+ *
+ *  ⚠️ DO NOT RE-DERIVE THIS FROM A BAR YOU HAPPEN TO BE LOOKING AT. `theLongestCapturedBar` in
+ *  `claudeCodeScreen.test.ts` recomputes the maximum FROM the fixture and fails if it exceeds this,
+ *  so a longer sample added later reds the suite instead of silently taking a row gray. That test is
+ *  the reason this number is allowed to be a literal at all. */
+const MAX_BAR_CHARS = 96;
 
 /** HOW a narrow box terminated the grid, because the two ways are not equal evidence (roborev
  *  64487, High).

@@ -15,6 +15,7 @@ import type { AgentTabStatus } from "../types";
 import { AGENT_STATUS } from "@sparkle/ui/tokens";
 import { needsAttention } from "./attention";
 import {
+  OBSERVED_VERDICTS,
   applyVerdict,
   parseObservedReading,
   withObservedAttention,
@@ -66,7 +67,11 @@ describe("the shared wire fixture", () => {
     const seen = new Set(
       fixture.samples.map((s) => parseObservedReading(s.payload)?.reading.verdict),
     );
-    expect(seen).toEqual(new Set(["awaiting", "unreadable", "calm", "gone"]));
+    // DERIVED from the module's own verdict list, not restated. A hand-typed set here is a second
+    // place to remember, and the point of this assertion is that the FIXTURE covers the wire — so
+    // adding a verdict must red this until the fixture carries a sample of it, which is exactly
+    // what a copy of the list would silently stop doing.
+    expect(seen).toEqual(new Set(OBSERVED_VERDICTS));
   });
 
   it("gives each sample a DIFFERENT atMs, so a consumer that ignores it is detectable", () => {
@@ -319,7 +324,11 @@ describe("applyVerdict — the decision, directly", () => {
 // row — it is genuinely never in the roster — so a version of this test that puts the sparkle id in
 // `agents` would pass against the very bug it exists to catch.
 describe("parityAcrossRowKinds — the founder's hard rule", () => {
-  const VERDICTS = ["awaiting", "unreadable", "calm"] as const;
+  // DERIVED, NOT LISTED. This was a hand-typed list of three, and a hand-typed list is how a guard
+  // goes stale in silence: the `delegating` verdict added later would simply not have been covered
+  // by the guard the founder asked for BY NAME. Iterating the module's own export means every
+  // verdict — including every future one — passes through the hard rule by construction.
+  const VERDICTS = OBSERVED_VERDICTS;
   // Both spellings resolve through `isSparkleAgentId`: the bare namespace and the per-window form.
   const SELF_IDS = ["__sparkle_self__", "__sparkle_self__-main"];
 
@@ -386,5 +395,77 @@ describe("parityAcrossRowKinds — the founder's hard rule", () => {
   it("still ignores a reading for a foreign agent that is in no roster", () => {
     const out = withObservedAttention([], { other: "working" }, { other: reading("awaiting") }, NO_PANE);
     expect(out.other).toBe("working");
+  });
+});
+
+
+// ══ GUARD 3 — DELEGATED WORK COUNTS AS ACTIVITY, FOR BOTH ROW KINDS ════════════════════════════
+//
+// The founder, verbatim: "DELEGATED WORK COUNTS AS ACTIVITY. If liveness derives only from the
+// parent's own tool calls or hook events, an agent that fans out goes gray precisely when it is
+// most productive." Two states must read green — working WITH subagents live, and BLOCKED WAITING
+// on them — and this overlay is the half that covers rows NOBODY HAS OPENED, where no pane-local
+// writer exists at all.
+//
+// GUARD 2 above proves the two row kinds AGREE. It cannot prove they agree on the right answer:
+// with a base of `working` every verdict is inert, so "working === working" would pass against an
+// overlay that had been deleted. These assert the MOVEMENT, from the one gray the bug produces.
+describe("delegating — the gray a fanned-out agent settles into, for both row kinds", () => {
+  const SELF_IDS = ["__sparkle_self__", "__sparkle_self__-main"];
+
+  it("repaints an `idle` build row green", () => {
+    const out = withObservedAttention(
+      [{ id: "a1" }],
+      { a1: "idle" },
+      { a1: reading("delegating") },
+      NO_PANE,
+    );
+    expect(out.a1).toBe("working");
+    expect(colorOf(out.a1)).toBe(AGENT_STATUS.working.color);
+  });
+
+  it.each(SELF_IDS)("repaints the self row `%s` green, with an EMPTY roster", (selfId) => {
+    // The empty `agents` array is the point: the app-owned row is genuinely never in the roster, so
+    // a version of this test that put the id in `agents` would pass against the very bug it catches.
+    const out = withObservedAttention([], { [selfId]: "idle" }, { [selfId]: reading("delegating") }, NO_PANE);
+    expect(out[selfId]).toBe("working");
+  });
+
+  it("supplies a colour for a row that has NO status entry at all", () => {
+    // The population this overlay exists for: nobody ever opened the agent, so nothing ever wrote a
+    // status. `AgentSidebar` renders a missing entry gray, so holding no opinion here would leave
+    // the report unfixed for exactly those rows.
+    const out = withObservedAttention([{ id: "a1" }], {}, { a1: reading("delegating") }, NO_PANE);
+    expect(out.a1).toBe("working");
+  });
+
+  it("never repaints a row that is red, blue, amber, terminal, or already green", () => {
+    // Motion must not overwrite a MEANING. Each of these is a distinct claim a live subagent does
+    // not answer — and red in particular: "red wins over motion, always".
+    for (const status of [
+      "waiting",
+      "approval",
+      "blocked",
+      "errored",
+      "questions",
+      "lapsed",
+      "unmerged",
+      "new",
+      "done",
+      "stopped",
+      "working",
+    ] as const) {
+      expect(applyVerdict(status, "delegating"), `delegating repainted \`${status}\``).toBeUndefined();
+    }
+  });
+
+  it("leaves a MOUNTED agent entirely alone — that pane's own reading is richer", () => {
+    const out = withObservedAttention(
+      [{ id: "a1" }],
+      { a1: "idle" },
+      { a1: reading("delegating") },
+      () => true,
+    );
+    expect(out.a1).toBe("idle");
   });
 });

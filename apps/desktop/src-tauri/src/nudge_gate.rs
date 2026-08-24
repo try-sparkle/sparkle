@@ -513,15 +513,28 @@ pub fn screen_is_session_limit_picker(text: &str) -> bool {
         return false;
     }
     // Rule (4): bottom-anchored — nothing UNRECOGNIZED may follow the footer.
-    //
-    // Free below the footer, in any order: blanks; up to `MAX_CHROME_BELOW_FOOTER` ambient-chrome
-    // rows; and ONE closing border, which is not chrome (a corner is outside the chrome class) but
-    // is the bordered dialog's own bottom edge. An OPENING border is never free at all — a frame
-    // starting below the footer is the shape that would arm Esc at a dialog somebody is answering
-    // (roborev 58557/58571). The old rule allowed none of the chrome and rejected the real screen.
+    nothing_unrecognized_below(&all, footer_idx)
+}
+
+/// TS `screenClassifier.nothingUnrecognizedBelowFooter`, EXTRACTED so there is one implementation
+/// rather than a copy per caller — the same move the TS side made, for the same reason: its second
+/// caller shipped a partial copy that omitted the closing-border allowance, so it was STRICTER than
+/// the rule it claimed to mirror and drifted from this twin silently (roborev 59690).
+///
+/// True when everything below `idx` belongs to a still-open frame. Free below it, in any order:
+/// blanks (unbounded); up to `MAX_CHROME_BELOW_FOOTER` ambient-chrome rows; and ONE closing border,
+/// which is not chrome (a corner is outside the chrome class) but is the bordered dialog's own
+/// bottom edge. An OPENING border is never free at all — a frame starting below is the shape that
+/// would arm Esc at a dialog somebody is answering (roborev 58557/58571). The old rule allowed none
+/// of the chrome and rejected the real screen.
+///
+/// This is what separates a LIVE bottom-of-grid frame from a PAGER QUOTING one, which is why
+/// `observed_attention`'s subagent-roster reading depends on it too: the bead describing that
+/// feature reproduces a roster row verbatim, so a doc on screen trips the row pattern.
+pub(crate) fn nothing_unrecognized_below(all: &[&str], idx: usize) -> bool {
     let mut chrome_below = 0usize;
     let mut closing_border_budget = 1usize;
-    for l in &all[footer_idx + 1..] {
+    for l in all.iter().skip(idx + 1) {
         if l.trim().is_empty() {
             continue; // a blank line was always free, and stays free
         }
@@ -628,7 +641,7 @@ const CREDENTIAL_TAIL_ROWS: usize = 3;
 /// `\r` matters: the PTY stream redraws in place, and a chunk can carry several frames separated by
 /// carriage returns alone. Treating such a chunk as one line is what let a real picker footer be
 /// suppressed by a spinner belonging to a different frame (roborev 54749).
-fn lines(text: &str) -> impl Iterator<Item = &str> {
+pub(crate) fn lines(text: &str) -> impl Iterator<Item = &str> {
     text.split(['\n', '\r'])
 }
 
@@ -996,6 +1009,14 @@ pub fn screen_is_working(text: &str) -> bool {
 // does not have and its caller does (the observer already hashes the grid). Until that exists the
 // matcher stays here, tested and pinned against the shared fixture so it cannot rot, and out of the
 // veto path where a stale positive can latch.
+//
+// AND NOTE WHAT DID NOT NEED IT. `observed_attention::Verdict::Delegating` reports an unopened agent
+// as ACTIVE off Claude Code's own background-task footer and subagent roster, with no movement
+// corroboration at all — because it is produced ONLY from the arm where `write_refusal` already
+// returned `None`. Every gate above has declined by then, so there is provably no prompt to mask
+// and the worst case is a green row rather than a swallowed one. That ordering is the difference,
+// not the strength of the evidence: the same reading placed HERE, ahead of the prompt arms, would
+// carry the identical hazard this block describes.
 
 /// The bare 2.1.237 frame, bottom-anchored — Claude Code dropped the parenthetical
 /// (`✻ Crunched for 2s`, `✶ Schlepping…`) and `spinner_line` still requires one.

@@ -35,7 +35,8 @@
 // shape whenever the wording moves, or the signal silently goes dead (a green suite that says
 // nothing — the failure mode WORKING_PATTERNS' own header records from 2026-07-28).
 
-import { liveBackgroundSubagentCount } from "./claudeCodeScreen";
+import { chromeBarTailBelow, liveBackgroundSubagentCount } from "./claudeCodeScreen";
+import { nothingUnrecognizedBelowFooter } from "./screenClassifier";
 
 /**
  * Claude Code's live-background-task footer, with the count captured.
@@ -66,13 +67,43 @@ export function parseBackgroundTaskCount(screen: string): number | null {
   if (!screen) return null;
   // Scan per line and take the LAST match: the footer is at the bottom, and reading the last
   // occurrence means a stale earlier line (were one ever present) never wins over the live footer.
+  const lines = screen.split(/[\r\n]/);
+  let at = -1;
   let count: number | null = null;
-  for (const line of screen.split(/[\r\n]/)) {
-    const m = BACKGROUND_TASK_FOOTER.exec(line);
+  for (let i = 0; i < lines.length; i++) {
+    const m = BACKGROUND_TASK_FOOTER.exec(lines[i] ?? "");
     if (!m?.[1]) continue;
     const n = Number.parseInt(m[1], 10);
-    if (Number.isFinite(n) && n > 0) count = n;
+    if (Number.isFinite(n) && n > 0) {
+      count = n;
+      at = i;
+    }
   }
+  if (at < 0) return null;
+  // ⚠️ POSITION-CHECKED, exactly like the subagent roster — and this arm was added because the
+  // commit that introduced the Rust twin made the old "the wording is not quotable" argument false
+  // IN THE SAME COMMIT (roborev 68247, High). `apps/desktop/shared/delegated-work.fixture.json` and
+  // this file's own header now both carry `3 background tasks live [ctrl+b to manage]` verbatim, so
+  // an agent that `cat`s either one ends its turn with the phrase still on the viewport.
+  //
+  // On a MOUNTED pane that is a transient wrong answer a live writer corrects. On the mount-
+  // independent path it is a LATCH: the screen is static, nothing scrolls the line off, and the row
+  // stays green forever for an agent doing nothing — the precise failure the roster's walk exists
+  // to prevent, arriving through the surface that had been exempted from it.
+  //
+  // Claude's real footer TERMINATES the grid; a quoted one has prose under it. Both readers apply
+  // this rule and the shared fixture pins them together, so they cannot drift apart again.
+  //
+  // ── TWO SHAPES OF "TERMINATES", BECAUSE THE LINE-ANCHORED WALK ALONE IS A NARROW-PANE BUG ──────
+  // `nothingUnrecognizedBelowFooter` is strictly line-anchored, and `claudeCodeScreen` records that
+  // on a narrow grid Claude's status bar WRAPS: `  ⏸ manual mode on · ? for shortcuts` becomes three
+  // rows and only the first carries a glyph the walk recognises (roborev 64464). Requiring the walk
+  // alone therefore answered `null` on a REAL narrow pane with subagents running — which fires
+  // `forgetBackgroundTasks` and takes the row GRAY, reintroducing sparkle-262p7's bug through the
+  // fix for the quote-latch (roborev 68275). `chromeBarTailBelow` rejoins those rows and requires
+  // the JOIN to open with one of Claude's own bar phrases, so it accepts the wrapped bar while
+  // still rejecting a document, whose tail opens with its own prose.
+  if (!nothingUnrecognizedBelowFooter(lines, at) && !chromeBarTailBelow(lines, at)) return null;
   return count;
 }
 
