@@ -10,7 +10,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -8224,6 +8224,89 @@ fn autosave_ref_for(agent_id: &str) -> String {
 /// it runs on a timer against a LIVE tree and must never become a drag on the agent it is protecting.
 const AUTOSAVE_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// The per-agent, in-process lock serialising autosave ref writes, so two sweeps of the SAME agent in
+/// this process never race `update-ref` on one ref. Cross-process contention is handled by git's own
+/// `core.filesRefLockTimeout` retry in [`autosave_write_ref`], and a LEAKED lock by the stale-clear
+/// there.
+fn autosave_ref_mutex(ref_name: &str) -> Arc<Mutex<()>> {
+    static LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
+    let map = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = map.lock().unwrap_or_else(|e| e.into_inner());
+    guard.entry(ref_name.to_string()).or_insert_with(|| Arc::new(Mutex::new(()))).clone()
+}
+
+/// The loose-ref lock `git update-ref <ref>` creates: `<git-common-dir>/<ref>.lock`. Refs live in the
+/// COMMON dir, shared by every linked worktree, so it is resolved there rather than under the
+/// worktree's own `.git`. `None` if the common dir cannot be read (the caller then cannot clear a
+/// leaked lock and surfaces the original error unchanged).
+fn autosave_ref_lock_path(worktree: &str, ref_name: &str, deadline: Instant) -> Option<PathBuf> {
+    let common = git_autosave(worktree, &["rev-parse", "--git-common-dir"], deadline, None).ok()?;
+    let common = common.trim();
+    if common.is_empty() {
+        return None;
+    }
+    let base = Path::new(common);
+    let base = if base.is_absolute() { base.to_path_buf() } else { Path::new(worktree).join(base) };
+    Some(base.join(format!("{ref_name}.lock")))
+}
+
+/// Write the snapshot commit to the side ref, robust against a contended or LEAKED loose-ref lock.
+///
+/// `update-ref` holds `<ref>.lock` for the duration of the write, and two failure modes produce the
+/// observed *"cannot lock ref … File exists"*:
+///   * a genuinely concurrent writer holds it — absorbed by `core.filesRefLockTimeout`, which makes
+///     git WAIT for the holder to release instead of failing instantly;
+///   * a PRIOR autosave's `update-ref` was KILLED mid-write — the exact event this feature exists to
+///     survive — leaking the lock so every later write fails FOREVER. Nothing live holds the lock past
+///     the timed retry above, so a lock still on disk afterwards is stale: clear it and retry once.
+///
+/// Serialised per-agent within this process by [`autosave_ref_mutex`]; the git-level retry covers
+/// other processes. Only these `sparkle-autosave/*` refs are ever written by this path, so no other
+/// writer's lock is ever cleared.
+fn autosave_write_ref(
+    worktree: &str,
+    ref_name: &str,
+    commit: &str,
+    deadline: Instant,
+) -> Result<(), String> {
+    let mtx = autosave_ref_mutex(ref_name);
+    let _held = mtx.lock().unwrap_or_else(|e| e.into_inner());
+
+    let write = |d: Instant| {
+        git_autosave(
+            worktree,
+            &["-c", "core.filesRefLockTimeout=1000", "update-ref", ref_name, commit],
+            d,
+            None,
+        )
+    };
+
+    let first = match write(deadline) {
+        Ok(_) => return Ok(()),
+        Err(e) => e,
+    };
+    // Only a lock/exists failure is recoverable this way; a real error (bad object, permissions) is
+    // returned untouched so it is not silently retried into the same failure.
+    let lockish = first.contains("cannot lock ref")
+        || first.contains("File exists")
+        || first.contains("Unable to create")
+        || first.contains("unable to create");
+    if !lockish {
+        return Err(first);
+    }
+    // The timed retry already waited out any LIVE holder, so a lock still present is stale (leaked by
+    // a killed prior write). Remove it and retry exactly once.
+    match autosave_ref_lock_path(worktree, ref_name, deadline) {
+        Some(lock) if lock.exists() => {
+            if std::fs::remove_file(&lock).is_err() {
+                return Err(first);
+            }
+            write(deadline).map(|_| ()).map_err(|e| format!("{e} (after clearing a stale ref lock)"))
+        }
+        _ => Err(first),
+    }
+}
+
 /// Core (testable): snapshot a LIVE worktree's uncommitted work to its side ref without touching the
 /// agent's index, HEAD, branch, or hooks. See [`AutosaveKind`] for the design rationale.
 pub fn autosave_worktree_wip_at(worktree: &str, agent_id: &str) -> Result<AutosaveOutcome, String> {
@@ -8270,10 +8353,16 @@ pub fn autosave_worktree_wip_within(
         return Ok(none(AutosaveKind::NothingToCommit));
     }
     // A throwaway index in the system temp dir (absolute, as GIT_INDEX_FILE requires), unique per
-    // call so two windows sweeping the same worktree never collide on it. Removed at the end.
+    // call so two sweeps of the SAME agent never collide on it (a collision fails identically to the
+    // ref-lock bug: `read-tree` cannot create `<idx>.lock`, "File exists"). The clock ALONE is not
+    // enough — two concurrent sweeps can read the same coarse timestamp — so the pid and a
+    // process-monotonic counter make it genuinely unique within and across processes. Removed at the end.
+    static AUTOSAVE_IDX_SEQ: AtomicU64 = AtomicU64::new(0);
     let idx_path = std::env::temp_dir().join(format!(
-        "sparkle-autosave-{}-{}.index",
+        "sparkle-autosave-{}-{}-{}-{}.index",
         autosave_ref_for(agent_id).replace('/', "_"),
+        std::process::id(),
+        AUTOSAVE_IDX_SEQ.fetch_add(1, Ordering::Relaxed),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
@@ -8367,7 +8456,7 @@ pub fn autosave_worktree_wip_within(
         }
     };
     let ref_name = autosave_ref_for(agent_id);
-    if let Err(e) = git_autosave(worktree, &["update-ref", &ref_name, &commit], deadline, None) {
+    if let Err(e) = autosave_write_ref(worktree, &ref_name, &commit, deadline) {
         cleanup(&idx);
         return Err(format!("autosave update-ref failed: {e}"));
     }
@@ -11953,6 +12042,59 @@ mod tests {
         // becomes '-' so a surprising id can never produce an invalid or traversing ref.
         assert_eq!(autosave_ref_for("a1"), "refs/sparkle-autosave/a1");
         assert_eq!(autosave_ref_for("../evil head"), "refs/sparkle-autosave/---evil-head");
+    }
+
+    #[test]
+    fn autosave_recovers_from_a_leaked_ref_lock_and_updates_the_snapshot() {
+        // REGRESSION: a prior autosave whose `update-ref` was KILLED mid-write leaks
+        // `refs/sparkle-autosave/<id>.lock`. Before the fix, every later autosave for that agent failed
+        // FOREVER with "cannot lock ref … File exists", so the killed worker still lost its work — the
+        // exact defect this feature was meant to cure. The write path must clear the stale lock and
+        // update the snapshot.
+        let (_root, wt, _app_data) = repo_with_worktree("autosave-leaked-lock");
+        std::fs::write(format!("{wt}/work.txt"), "first slice of work").unwrap();
+
+        // First autosave: captures the work and leaves a valid side ref.
+        let first = autosave_worktree_wip_at(&wt, "a1").unwrap();
+        assert_eq!(first.kind, AutosaveKind::Snapshotted);
+        let sha1 = first.sha.clone().unwrap();
+        assert_eq!(git(&wt, &["show", "refs/sparkle-autosave/a1:work.txt"]).unwrap(), "first slice of work");
+
+        // Simulate the killed prior write: forge the loose-ref lock git would have left behind.
+        let common = git(&wt, &["rev-parse", "--git-common-dir"]).unwrap();
+        let common_abs = if Path::new(&common).is_absolute() {
+            PathBuf::from(&common)
+        } else {
+            Path::new(&wt).join(&common)
+        };
+        let lock = common_abs.join("refs/sparkle-autosave/a1.lock");
+        std::fs::create_dir_all(lock.parent().unwrap()).unwrap();
+        std::fs::write(&lock, "leaked by a killed update-ref\n").unwrap();
+        assert!(lock.exists(), "the leaked lock is in place before the second autosave");
+
+        // More work accrues, then the periodic autosave fires again.
+        std::fs::write(format!("{wt}/work.txt"), "second slice of work").unwrap();
+        let second = autosave_worktree_wip_at(&wt, "a1").unwrap();
+
+        // SIDE EFFECT: the snapshot is written despite the leaked lock, and it advances to the new work.
+        assert_eq!(
+            second.kind,
+            AutosaveKind::Snapshotted,
+            "a leaked ref lock must not permanently defeat the autosave"
+        );
+        let sha2 = second.sha.clone().unwrap();
+        assert_ne!(sha2, sha1, "the side ref advanced to a new snapshot commit");
+        assert_eq!(
+            git(&wt, &["show", "refs/sparkle-autosave/a1:work.txt"]).unwrap(),
+            "second slice of work",
+            "the latest uncommitted work is recoverable from the updated side ref"
+        );
+        assert_eq!(
+            git(&wt, &["rev-parse", "refs/sparkle-autosave/a1"]).unwrap(),
+            sha2,
+            "the side ref points at the new snapshot"
+        );
+        assert!(!lock.exists(), "the stale lock was cleared, not left to defeat the next tick too");
     }
 
     // NOT COVERED HERE, DELIBERATELY: the `--no-verify` behaviour. A pre-commit hook is the one
