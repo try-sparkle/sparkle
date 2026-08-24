@@ -1426,10 +1426,10 @@ pub(crate) fn bench_config_dir_auth_dead(
         return Ok(false);
     };
     let home = std::env::var_os("HOME").map(PathBuf::from);
-    mark_exhausted_at(&path, &id, now_secs() + secs, home.as_deref())?;
-    if let Some(h) = home.as_deref() {
-        republish_roborev_candidates(&app_data, h);
-    }
+    // The SAME write-then-republish core `accounts_mark_exhausted` runs, so the order guard that
+    // pins it (`the_offloaded_exhaustion_write_lands_before_the_republish_reads_it`) covers this
+    // path too rather than leaving a second, unpinned copy of the ordering to drift.
+    mark_exhausted_and_republish(&app_data, &id, now_secs() + secs, home.as_deref())?;
     Ok(true)
 }
 
@@ -3932,28 +3932,85 @@ pub fn accounts_import_default(
     import_default_at(&accounts_path, effective, id, now_secs())
 }
 
+/// Run `work` on Tauri's BLOCKING POOL and await its result — never inline on the caller's thread.
+///
+/// WHY THIS EXISTS (`sparkle-dkxuf6`). A captured multi-day UI freeze put 221 of 401 samples on
+/// `com.apple.main-thread`, parked in `accounts_mark_exhausted` -> `account_usage::read_access_token`
+/// -> `keyring` -> `find_generic_password`. A Keychain lookup is a synchronous XPC round trip to
+/// `securityd`, and with the ACL ungranted it does not return until a human answers a modal — so
+/// ANY of it reached from a plain (non-`async`) `#[tauri::command]` freezes the entire UI for as
+/// long as that takes. `cmd_timing.rs`'s header has the mechanism: tauri-macros compiles a plain
+/// `fn` command to `body_blocking`, whose body runs INLINE on the thread that dispatched the invoke
+/// (the AppKit main thread), and an `async fn` to `body_async`, which hands the work to the runtime.
+///
+/// AWAITED, never fire-and-forget. Moving work off the main thread must not weaken the caller's
+/// contract: `accounts_mark_exhausted`'s whole point is that the exhaustion write has HAPPENED by
+/// the time the command resolves, because the rest of the fleet reads that file next.
+pub(crate) async fn offload_blocking<T, F>(what: &'static str, work: F) -> Result<T, String>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(work)
+        .await
+        .map_err(|e| format!("the {what} task didn't finish: {e}"))
+}
+
+/// The blocking body of [`accounts_mark_exhausted`]: the exhaustion write FIRST, then the
+/// best-effort republish.
+///
+/// Extracted from the command so a test can drive the real work through the real [`offload_blocking`]
+/// against temp dirs — the command itself resolves app-data from a live `AppHandle`, which a unit
+/// test must never write into.
+///
+/// THE ORDER IS LOAD-BEARING, and it is what the test asserts on rather than on the source:
+/// `republish_roborev_candidates` re-reads `accounts.json` from disk, so a republish that ran BEFORE
+/// the write would publish the account that was just walled — the exact regression the rotation loop
+/// exists to prevent. An observed wall is the moment roborev must stop using that account, and the
+/// daemon is a launchd agent Sparkle cannot signal, so republishing here is how the next review job
+/// discovers the change.
+///
+/// Republish errors are swallowed by design: a failed republish leaves the previous candidate list
+/// in place (stale, but valid) and must never fail the exhaustion write the whole fleet depends on.
+fn mark_exhausted_and_republish(
+    app_data: &Path,
+    id: &str,
+    until_epoch: i64,
+    home: Option<&Path>,
+) -> Result<(), String> {
+    mark_exhausted_at(&accounts_json_path(app_data), id, until_epoch, home)?;
+    if let Some(h) = home {
+        republish_roborev_candidates(app_data, h);
+    }
+    Ok(())
+}
+
 /// Record that an account hit a real rate limit, resetting at `until_epoch`.
 /// (Tauri maps the JS `untilEpoch` camelCase arg to this snake_case param.)
+///
+/// `async fn` + [`offload_blocking`], NOT a plain `fn`: this command is the captured
+/// `sparkle-dkxuf6` main-thread hang (see [`offload_blocking`]). Everything it does — resolving
+/// app-data, the read-modify-write of `accounts.json`, and the republish that probes every account's
+/// keychain credential — happens inside the blocking closure, so nothing but the dispatch hop is
+/// left on the event-loop thread.
+///
+/// `AccountsLock` is taken from managed state INSIDE the closure rather than as a `State<'_, _>`
+/// parameter: that borrow is tied to the invoke and cannot be moved across the await, and the guard
+/// has to be held for the whole read-modify-write anyway — which now lives on the blocking pool.
 #[tauri::command]
-pub fn accounts_mark_exhausted(
+pub async fn accounts_mark_exhausted(
     app: AppHandle,
-    lock: State<'_, AccountsLock>,
     id: String,
     until_epoch: i64,
 ) -> Result<(), String> {
-    let _guard = lock.guard();
-    let app_data = crate::worktree::app_data_dir_pub(&app)?;
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-    mark_exhausted_at(&accounts_json_path(&app_data), &id, until_epoch, home.as_deref())?;
-    // An observed wall is exactly the moment roborev must stop using that account. Republishing the
-    // shim's candidate list HERE is what closes the rotation loop: the daemon is a launchd agent
-    // Sparkle cannot signal, so the next review job discovers the change by reading this file.
-    // Best-effort — a failed republish leaves the previous list in place (stale, but valid), and
-    // must never fail the exhaustion write that the whole fleet depends on.
-    if let Some(h) = home.as_deref() {
-        republish_roborev_candidates(&app_data, h);
-    }
-    Ok(())
+    offload_blocking("accounts_mark_exhausted", move || -> Result<(), String> {
+        let lock = app.state::<AccountsLock>();
+        let _guard = lock.guard();
+        let app_data = crate::worktree::app_data_dir_pub(&app)?;
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        mark_exhausted_and_republish(&app_data, &id, until_epoch, home.as_deref())
+    })
+    .await?
 }
 
 /// Recompute the roborev shim's account candidates from the accounts on disk.
@@ -4585,6 +4642,11 @@ mod tests {
 
     fn assert_async_command<A, Fut: std::future::Future>(_f: fn(A) -> Fut) {}
 
+    /// Same coercion for a three-argument command. Needed because the commands guarded here used to
+    /// be uniformly one-argument, and `accounts_mark_exhausted` — the one this module's main-thread
+    /// hang was captured in (`sparkle-dkxuf6`) — takes three.
+    fn assert_async_command3<A, B, C, Fut: std::future::Future>(_f: fn(A, B, C) -> Fut) {}
+
     #[test]
     fn every_async_command_stays_off_the_event_loop() {
         // EXHAUSTIVE by intent, not a sample: every `async` command in this module belongs here, so
@@ -4608,6 +4670,12 @@ mod tests {
         assert_async_command(accounts_limit_events);
         // Documented in-module as "the heaviest read in this module by a wide margin".
         assert_async_command(accounts_ceilings);
+        // THE CAPTURED HANG (`sparkle-dkxuf6`): as a plain `pub fn` this command ran its whole body
+        // — including the republish's per-account KEYCHAIN probe, a synchronous XPC round trip to
+        // `securityd` that blocks on a modal when the ACL is ungranted — inline on the AppKit main
+        // thread. 221 of 401 samples of a wedged app were parked in exactly that frame. Reverting it
+        // to `pub fn` must not compile.
+        assert_async_command3(accounts_mark_exhausted);
     }
 
     #[test]
@@ -8911,6 +8979,147 @@ mod tests {
         assert!(!published.contains(crate::roborev_account::STANDDOWN), "unexpected stand-down: {published}");
         assert!(published.contains(dir_d.to_str().unwrap()), "healthy D missing: {published}");
         assert!(published.contains(dir_e.to_str().unwrap()), "healthy E missing: {published}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // ── The main-thread offload (`sparkle-dkxuf6`) ──────────────────────────────────────────────
+    //
+    // `every_async_command_stays_off_the_event_loop` above is a COMPILE-time guard: it proves the
+    // command still returns a future, which is what makes tauri-macros compile it to `body_async`
+    // instead of running it inline on the AppKit main thread. That is necessary and it is cheap, but
+    // it observes a SIGNATURE, not a thread. The two tests below observe the thread and the effect.
+
+    /// [`offload_blocking`] must actually MOVE the work off the calling thread and hand its value
+    /// back — the whole of the `sparkle-dkxuf6` fix, and the one property no signature check can see.
+    ///
+    /// Mutation-provable in one edit: replace the body with `Ok(work())` and the `assert_ne` below
+    /// goes red, because `tauri::async_runtime::block_on` drives the future on THIS thread.
+    #[test]
+    fn offload_blocking_runs_the_work_off_the_calling_thread_and_returns_its_value() {
+        let caller = std::thread::current().id();
+
+        let (ran_on, value) =
+            tauri::async_runtime::block_on(offload_blocking("offload-test", move || {
+                (std::thread::current().id(), 41 + 1)
+            }))
+            .expect("the blocking task must not fail");
+
+        assert_ne!(
+            ran_on, caller,
+            "the blocking work ran on the CALLING thread — for a command that is the AppKit main \
+             thread, which is the captured `sparkle-dkxuf6` freeze"
+        );
+        assert_eq!(
+            value, 42,
+            "the awaited value must travel back out: the offload must not become fire-and-forget"
+        );
+
+        // PAIRED. Without this the `assert_ne` above is ambiguous: it would also pass if
+        // `ThreadId`s simply never compared equal. The identical closure invoked INLINE reports the
+        // caller's own id, so the inequality above is a statement about the offload, not about
+        // `ThreadId`.
+        let inline = (move || std::thread::current().id())();
+        assert_eq!(
+            inline, caller,
+            "a closure called inline must report the caller's thread — otherwise the assert_ne \
+             above proves nothing"
+        );
+    }
+
+    /// Drive the REAL blocking body of `accounts_mark_exhausted` through the REAL offload and assert
+    /// both halves of the contract survived the move off the main thread.
+    ///
+    /// The ORDER assertion is the sharp one, and it is asserted on the SIDE EFFECT rather than on
+    /// the source: `republish_roborev_candidates` re-reads `accounts.json` from disk, so the walled
+    /// account can only be absent from the published candidate list if the write landed FIRST.
+    /// Swapping the two statements in [`mark_exhausted_and_republish`] — or dropping the `.await` so
+    /// the write became fire-and-forget — republishes the account that was just walled, and this
+    /// goes red.
+    ///
+    /// Scope, stated honestly: this pins the offloaded body's contract and ordering. It does NOT
+    /// drive the `#[tauri::command]` wrapper — that resolves app-data from a live `AppHandle` and
+    /// would write into the developer's REAL `accounts.json`. The wrapper's own "not inline on the
+    /// event loop" property is the compile-time guard above.
+    #[test]
+    fn the_offloaded_exhaustion_write_lands_before_the_republish_reads_it() {
+        let base = unique_dir("offload-mark-exhausted");
+        let app_data = base.join("app_data");
+        std::fs::create_dir_all(&app_data).unwrap();
+        let home = base.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+
+        // Three distinct logins: A gets walled, D and E stay healthy — two is exactly
+        // `roborev_account::MIN_HEALTHY_TO_RUN`, so the publish is a real list and not a STANDDOWN.
+        let dir_a = base.join("a");
+        let dir_d = base.join("d");
+        let dir_e = base.join("e");
+        write_claude_json(&dir_a, r#"{"oauthAccount":{"emailAddress":"a@x.com","accountUuid":"uuid-a"}}"#);
+        write_claude_json(&dir_d, r#"{"oauthAccount":{"emailAddress":"d@x.com","accountUuid":"uuid-d"}}"#);
+        write_claude_json(&dir_e, r#"{"oauthAccount":{"emailAddress":"e@x.com","accountUuid":"uuid-e"}}"#);
+
+        let accounts = vec![
+            sample("a", false, dir_a.to_str().unwrap()),
+            sample("d", false, dir_d.to_str().unwrap()),
+            sample("e", false, dir_e.to_str().unwrap()),
+        ];
+        let accounts_path = accounts_json_path(&app_data);
+        write_accounts_at(&accounts_path, &accounts).unwrap();
+
+        // NON-VACUITY, established BEFORE the change: with nothing walled, A *is* published. Without
+        // this the "A is absent" assertion below could pass because A was never publishable at all.
+        republish_roborev_candidates(&app_data, &home);
+        let before = std::fs::read_to_string(crate::roborev_account::candidates_path(&home))
+            .expect("candidate file written");
+        assert!(
+            before.contains(dir_a.to_str().unwrap()),
+            "A must be publishable before it is walled, or this test proves nothing: {before}"
+        );
+
+        let until = now_secs() + 3_600;
+        let (work_app_data, work_home) = (app_data.clone(), home.clone());
+        let caller = std::thread::current().id();
+        let (ran_on, result) =
+            tauri::async_runtime::block_on(offload_blocking("mark-exhausted-test", move || {
+                (
+                    std::thread::current().id(),
+                    mark_exhausted_and_republish(&work_app_data, "a", until, Some(&work_home)),
+                )
+            }))
+            .expect("the blocking task must not fail");
+        result.expect("the exhaustion write must succeed");
+
+        assert_ne!(
+            ran_on, caller,
+            "the exhaustion write + republish ran on the calling thread — this is the frame the \
+             captured hang was parked in"
+        );
+
+        // (1) The write HAPPENED by the time the await resolved — not fire-and-forget.
+        let on_disk = read_accounts_at(&accounts_path).unwrap();
+        assert_eq!(
+            on_disk.iter().find(|a| a.id == "a").unwrap().exhausted_until,
+            Some(until),
+            "the exhaustion the whole fleet reads was not on disk when the offload resolved"
+        );
+
+        // (2) ORDER: the republish read the file AFTER the write, so the walled account is gone from
+        // the candidate list the roborev shim will read next.
+        let published = std::fs::read_to_string(crate::roborev_account::candidates_path(&home))
+            .expect("candidate file written");
+        assert!(
+            !published.contains(dir_a.to_str().unwrap()),
+            "walled A is still a roborev candidate — the republish read `accounts.json` BEFORE the \
+             write landed: {published}"
+        );
+        // PAIRED: the healthy pair IS still published, so (2) cannot pass via an empty or
+        // stood-down list.
+        assert!(
+            !published.contains(crate::roborev_account::STANDDOWN),
+            "unexpected stand-down: {published}"
+        );
+        assert!(published.contains(dir_d.to_str().unwrap()), "healthy D missing: {published}");
+        assert!(published.contains(dir_e.to_str().unwrap()), "healthy E missing: {published}");
+
         let _ = std::fs::remove_dir_all(&base);
     }
 

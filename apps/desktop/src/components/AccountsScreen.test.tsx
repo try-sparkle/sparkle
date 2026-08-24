@@ -63,8 +63,15 @@ function makeDeps(
     // "Real usage unavailable" note, and since the two "(local estimate)" bars were removed there is
     // now NO progressbar at all in that state — Anthropic's figures are the only usage on the card.
     // Tests that need a bar override this per case.
-    getUsageLive: vi.fn(async () => {
+    getUsageLive: vi.fn(async (_configDir: string) => {
       throw new Error("live usage unavailable in test");
+    }),
+    // The INTERACTIVE reader — the only dep on this screen that may raise a macOS keychain prompt.
+    // Separate from `getUsageLive` on purpose: it is reachable ONLY from the ⋮ "Check usage levels"
+    // gesture, so a test that sees it called from a mount effect has caught a real regression.
+    // Default: unavailable, same as the quiet reader. The check-usage suite overrides it.
+    getUsageLiveForced: vi.fn(async (_configDir: string) => {
+      throw new Error("forced live usage unavailable in test");
     }),
     // Default: the live auth probe errors (no Tauri bridge), which `deriveRowLogin` treats as "no
     // decisive signal" — every row falls back to its recorded identity, exactly as before this probe
@@ -433,13 +440,14 @@ describe("AccountsScreen", () => {
   });
 
   it("Check usage levels (⋮ menu) force-refreshes ONLY that card's account and updates its bar", async () => {
-    // Item 14: the per-card ⋮ → "Check usage levels" must call the FORCE path — the arg the Rust
-    // command reads to bypass the TTL cache — for THAT account only, and the new figure must reach the
-    // card's bar. Non-vacuous on force: the mount effect calls getUsageLive WITHOUT force, so a handler
-    // that forgot `force` (or reused the cached path) leaves zero force=true calls and fails below.
+    // Item 14: the per-card ⋮ → "Check usage levels" must call the INTERACTIVE reader — the separate
+    // export that bypasses the TTL cache and may prompt — for THAT account only, and the new figure
+    // must reach the card's bar. THIS IS THE PAIR to "the mount effect never touches the interactive
+    // reader" below: one test proving absence is ambiguous (it passes for a screen that force-reads
+    // nothing at all), so the pair pins the cause — the loud read happens, and only on a click.
     // Non-vacuous on the update: the returned percent changes between mount and check, so a handler
     // that fetched but never wrote state would still show the old number. Non-vacuous on SCOPE: only
-    // /cfg/a is forced — a handler that force-refreshed every account would fail the scope assertion.
+    // /cfg/a is checked — a handler that force-refreshed every account would fail the scope assertion.
     const deps = makeDeps(
       [acct("a", { nickname: "A" }), acct("b", { nickname: "B" })],
       [],
@@ -450,21 +458,19 @@ describe("AccountsScreen", () => {
     );
     // First round (mount, unforced) → 10%; forced check → 88%. Keyed on the force arg so the two
     // rounds are distinguishable and the assertion can't pass on the mount data alone.
-    deps.getUsageLive = vi.fn(async (_configDir: string, force?: boolean) =>
-      liveUsage(force ? 88 : 10, force ? 88 : 10),
-    );
+    deps.getUsageLive = vi.fn(async (_configDir: string) => liveUsage(10, 10));
+    deps.getUsageLiveForced = vi.fn(async (_configDir: string) => liveUsage(88, 88));
     render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
-    // Mount fetch landed (unforced).
+    // Mount fetch landed, and it used the QUIET reader — the interactive one is untouched so far.
     await waitFor(() => expect(screen.getAllByText("10%").length).toBeGreaterThan(0));
-    expect(vi.mocked(deps.getUsageLive).mock.calls.filter((c) => c[1] === true)).toHaveLength(0);
+    expect(deps.getUsageLiveForced).not.toHaveBeenCalled();
 
     fireEvent.click(within(await openKebab("a")).getByText("Check usage levels"));
 
-    // Exactly one force=true call, and only for account a's config dir — b is untouched.
-    await waitFor(() => {
-      const forced = vi.mocked(deps.getUsageLive).mock.calls.filter((c) => c[1] === true);
-      expect(forced.map((c) => c[0])).toEqual(["/cfg/a"]);
-    });
+    // Exactly one interactive read, and only for account a's config dir — b is untouched.
+    await waitFor(() =>
+      expect(vi.mocked(deps.getUsageLiveForced).mock.calls.map((c) => c[0])).toEqual(["/cfg/a"]),
+    );
     // …and the forced figure reached account a's own bar (scoped to its card, not b's).
     await waitFor(() =>
       expect(
@@ -487,10 +493,11 @@ describe("AccountsScreen", () => {
         { id: "b", email: "b@x.com", organization: null, accountUuid: "ub" },
       ],
     );
-    // A forced read of a is denied; a forced read of b succeeds → 55%. Unforced (mount) → 10%.
-    deps.getUsageLive = vi.fn(async (configDir: string, force?: boolean) => {
-      if (force && configDir === "/cfg/a") throw new Error("keychain denied");
-      return liveUsage(force ? 55 : 10, force ? 55 : 10);
+    // A forced read of a is denied; a forced read of b succeeds → 55%. The quiet (mount) read → 10%.
+    deps.getUsageLive = vi.fn(async (_configDir: string) => liveUsage(10, 10));
+    deps.getUsageLiveForced = vi.fn(async (configDir: string) => {
+      if (configDir === "/cfg/a") throw new Error("keychain denied");
+      return liveUsage(55, 55);
     });
     render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
     await waitFor(() => expect(screen.getAllByText("10%").length).toBeGreaterThan(0));
@@ -521,9 +528,9 @@ describe("AccountsScreen", () => {
       [],
       [{ id: "a", email: "a@x.com", organization: null, accountUuid: "ua" }],
     );
-    deps.getUsageLive = vi.fn(async (_c: string, force?: boolean) => {
-      if (force) throw new Error("keychain access denied");
-      return liveUsage(10, 10);
+    deps.getUsageLive = vi.fn(async (_c: string) => liveUsage(10, 10));
+    deps.getUsageLiveForced = vi.fn(async (_c: string) => {
+      throw new Error("keychain access denied");
     });
     render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
     // Let the mount fetch settle first so the check's fetch is the one we assert on.
@@ -534,6 +541,116 @@ describe("AccountsScreen", () => {
     const err = await screen.findByTestId("account-usage-error-a");
     expect(err.textContent).toBe("Couldn't refresh usage. Check your connection or sign in again.");
     expect(err.getAttribute("role")).toBe("alert");
+  });
+
+  // ── "usage unknown" IS NOT AN ERROR ───────────────────────────────────────────────────────────
+  //
+  // The quiet reader never touches the keychain, so an account whose cached OAuth token has lapsed
+  // rejects EVERY polled read with `usage unknown: …` until the user checks it by hand. That account
+  // is very probably perfectly healthy. Rendering "Couldn't refresh usage. Check your connection or
+  // sign in again." for it would be actively wrong — it sends the user chasing a problem that does
+  // not exist, constantly, on the exact path that fires several times a minute. Each of these is
+  // PAIRED with the same fixture failing a DIFFERENT way, because an assertion that only ever sees
+  // one outcome also passes for a screen that renders that outcome unconditionally.
+
+  it("a quiet `usage unknown:` rejection renders the unknown affordance, not the failure copy", async () => {
+    const deps = makeDeps(
+      [acct("a", { nickname: "A" })],
+      [],
+      [{ id: "a", email: "a@x.com", organization: null, accountUuid: "ua" }],
+    );
+    // Exactly what the Rust command returns on a quiet miss: the stable `usage unknown: ` prefix.
+    deps.getUsageLive = vi.fn(async (_c: string) => {
+      throw new Error("usage unknown: no cached token for /cfg/a");
+    });
+    render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
+
+    const unknown = await screen.findByTestId("account-usage-unknown-a");
+    // It names the state plainly AND points at the one action that trues it up — the gesture is the
+    // remedy, so the affordance has to mention it or the user is told nothing actionable.
+    expect(unknown.textContent).toContain("Usage unknown");
+    expect(unknown.textContent).toContain("Check usage levels");
+    // …and NOT the genuine-failure surfaces. Both are checked: the row-level "unavailable" note and
+    // the card-level alert, since either one would read as "something is broken".
+    expect(screen.queryByTestId("account-usage-unavailable-a")).toBeNull();
+    expect(screen.queryByTestId("account-usage-error-a")).toBeNull();
+    expect(screen.queryByText(/Check your connection or sign in again/)).toBeNull();
+  });
+
+  it("…while a GENUINE quiet failure on the same fixture still renders the unavailable note", async () => {
+    // THE PAIR. Identical fixture, identical path — only the rejection differs. Without this, the
+    // test above passes for a screen that renders "Usage unknown" for every failure, which would
+    // silently swallow real network/401 breakage.
+    const deps = makeDeps(
+      [acct("a", { nickname: "A" })],
+      [],
+      [{ id: "a", email: "a@x.com", organization: null, accountUuid: "ua" }],
+    );
+    deps.getUsageLive = vi.fn(async (_c: string) => {
+      throw new Error("error sending request: connection refused");
+    });
+    render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
+
+    expect(await screen.findByTestId("account-usage-unavailable-a")).toBeTruthy();
+    expect(screen.queryByTestId("account-usage-unknown-a")).toBeNull();
+  });
+
+  it("a FORCED check that comes back `usage unknown:` gets a calm status, never the amber alert", async () => {
+    // The interactive read reaching `usage unknown: ` means even the credential re-read produced no
+    // token — the prompt was declined, or nothing is stored. Still not "your connection is broken",
+    // so it must not borrow the alert. PAIRED with "a failed Check usage surfaces THIS card's inline
+    // alert" directly above, which drives the SAME gesture on the SAME fixture into a genuine error
+    // and asserts role=alert + the connection copy: together they pin that the handler branches on
+    // the rejection rather than always producing one shape.
+    const deps = makeDeps(
+      [acct("a", { nickname: "A" })],
+      [],
+      [{ id: "a", email: "a@x.com", organization: null, accountUuid: "ua" }],
+    );
+    deps.getUsageLive = vi.fn(async (_c: string) => liveUsage(10, 10));
+    deps.getUsageLiveForced = vi.fn(async (_c: string) => {
+      throw new Error("usage unknown: keychain read declined");
+    });
+    render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
+    await waitFor(() => expect(deps.getUsageLive).toHaveBeenCalled());
+
+    fireEvent.click(within(await openKebab("a")).getByText("Check usage levels"));
+
+    const note = await screen.findByTestId("account-usage-unknown-note-a");
+    expect(note.getAttribute("role")).toBe("status"); // NOT "alert"
+    expect(note.textContent).toContain("Usage unknown");
+    expect(note.textContent).not.toContain("Check your connection");
+    expect(screen.queryByTestId("account-usage-error-a")).toBeNull();
+  });
+
+  it("the mount effect never touches the INTERACTIVE reader — only the ⋮ gesture does", async () => {
+    // The whole point of the split (sparkle-dkxuf6 / sparkle-oe9y1k): the keychain-touching read must
+    // be unreachable from anything that fires on its own. This drives the real component through its
+    // real mount (and a login, which re-fires the live effect via `liveNonce`) and asserts the loud
+    // dep was never called. PAIRED with "Check usage levels (⋮ menu) force-refreshes ONLY that
+    // card's account" above, which proves the loud dep IS called on a click — absence alone would
+    // also pass for a build where the forced path had simply been deleted.
+    const deps = makeDeps(
+      [acct("a", { nickname: "A" }), acct("b", { nickname: "B" })],
+      [],
+      [
+        { id: "a", email: "a@x.com", organization: null, accountUuid: "ua" },
+        { id: "b", email: "b@x.com", organization: null, accountUuid: "ub" },
+      ],
+    );
+    deps.getUsageLive = vi.fn(async (_c: string) => liveUsage(10, 10));
+    render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
+    await waitFor(() => expect(screen.getAllByText("10%").length).toBeGreaterThan(0));
+
+    // Every quiet read landed (so the effect really ran), and none of them was the loud one.
+    expect(vi.mocked(deps.getUsageLive).mock.calls.map((c) => c[0]).sort()).toEqual([
+      "/cfg/a",
+      "/cfg/b",
+    ]);
+    expect(deps.getUsageLiveForced).not.toHaveBeenCalled();
+    // Arity too: a quiet reader handed a second argument has been written against the OLD force-as-a-
+    // parameter signature, which is how a timer path used to reach the keychain.
+    for (const call of vi.mocked(deps.getUsageLive).mock.calls) expect(call).toHaveLength(1);
   });
 
   it("a Check usage SUPERSEDED by a newer check writes no stale row", async () => {
@@ -551,12 +668,13 @@ describe("AccountsScreen", () => {
       ],
     );
     // a's forced fetch is held pending (controllable); b's forced fetch resolves immediately → 50%.
-    deps.getUsageLive = vi.fn((configDir: string, force?: boolean) => {
-      if (force && configDir === "/cfg/a")
+    deps.getUsageLive = vi.fn((_configDir: string) => Promise.resolve(liveUsage(10, 10)));
+    deps.getUsageLiveForced = vi.fn((configDir: string) => {
+      if (configDir === "/cfg/a")
         return new Promise<AccountUsageLive>((res) => {
           resolveForcedA = res;
         });
-      return Promise.resolve(liveUsage(force ? 50 : 10, force ? 50 : 10));
+      return Promise.resolve(liveUsage(50, 50));
     });
     render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
     // Mount (unforced) fetch → both rows show 10%.
@@ -566,7 +684,7 @@ describe("AccountsScreen", () => {
     fireEvent.click(within(await openKebab("a")).getByText("Check usage levels"));
     await waitFor(() =>
       expect(
-        vi.mocked(deps.getUsageLive).mock.calls.filter((c) => c[1] === true && c[0] === "/cfg/a"),
+        vi.mocked(deps.getUsageLiveForced).mock.calls.filter((c) => c[0] === "/cfg/a"),
       ).toHaveLength(1),
     );
 

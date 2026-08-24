@@ -258,23 +258,26 @@ pub struct Me {
     cloud_agent_pricing: Option<Value>,
 }
 
-/// True if a (non-empty) desktop bearer token is stored.
-#[tauri::command]
-pub fn desktop_has_token() -> bool {
-    read_token().is_some()
-}
+// ── The blocking keychain work, and the async commands that wrap it ───────────────────────────
+//
+// The cache above removes the keychain from the WARM path; it does not remove it from the main
+// thread. A `#[tauri::command]` declared as a plain `fn` has its body compiled `body_blocking` and
+// runs INLINE on the AppKit main thread (see `cmd_timing`'s module note), so on a cache MISS the
+// main thread parks in a synchronous XPC round trip to securityd — the same shape as the captured
+// `sparkle-dkxuf6` stack and the 2026-07-29 watchdog root cause. `socialSync.ts` calls
+// `desktop_has_token` from a 60s `setInterval`, so that miss is reached by a TIMER, not only by a
+// gesture: nothing a user does can be blamed for the freeze, and nothing they do can avoid it.
+//
+// So the keychain halves stay plain sync fns and the commands become thin async wrappers, exactly
+// as `publish_credential.rs` does. `spawn_blocking` is what puts them on a pool thread.
 
-/// The stored desktop bearer (or null if signed out). Exposed ONLY to the trusted local
-/// webview so the in-app Socket.IO relay client can authenticate to the orchestration relay
-/// as this user's Mac (role "host"). The token never leaves the device beyond that TLS socket.
-#[tauri::command]
-pub fn desktop_bearer_token() -> Option<String> {
-    read_token()
-}
+/// A joined task that never produced an answer. Distinct from "signed out": a caller that treats
+/// the two alike would report a sign-out that did not happen.
+const JOIN_FAILED: &str = "the keychain task didn't finish";
 
-/// Clear the stored token (local sign-out). Missing entry is treated as success.
-#[tauri::command]
-pub fn desktop_sign_out() -> Result<(), String> {
+/// The blocking half of sign-out. Split from the command so the command is a wrapper with no
+/// keychain call of its own, and so this stays unit-testable as a plain function.
+fn sign_out_blocking() -> Result<(), String> {
     let deleted = entry()?.delete_credential();
     // Invalidate UNCONDITIONALLY, before inspecting the outcome. A cached bearer that outlives the
     // keychain item is a security bug, not merely a stale read: every `read_token` caller would go
@@ -286,6 +289,37 @@ pub fn desktop_sign_out() -> Result<(), String> {
         Err(keyring::Error::NoEntry) => Ok(()),
         Err(e) => Err(e.to_string()),
     }
+}
+
+/// True if a (non-empty) desktop bearer token is stored.
+///
+/// `false` on a join failure, matching the signed-out rendering: the UI's fallback for "we could
+/// not establish that you are signed in" is the sign-in affordance, which is the safe direction.
+#[tauri::command]
+pub async fn desktop_has_token() -> bool {
+    tauri::async_runtime::spawn_blocking(|| read_token().is_some())
+        .await
+        .unwrap_or(false)
+}
+
+/// The stored desktop bearer (or null if signed out). Exposed ONLY to the trusted local
+/// webview so the in-app Socket.IO relay client can authenticate to the orchestration relay
+/// as this user's Mac (role "host"). The token never leaves the device beyond that TLS socket.
+#[tauri::command]
+pub async fn desktop_bearer_token() -> Option<String> {
+    tauri::async_runtime::spawn_blocking(read_token).await.unwrap_or(None)
+}
+
+/// Clear the stored token (local sign-out). Missing entry is treated as success.
+///
+/// A join failure is an ERROR here, never `Ok`: the delete and the cache invalidation both live in
+/// the task that did not finish, so reporting success would leave a live bearer behind a UI that
+/// says signed out.
+#[tauri::command]
+pub async fn desktop_sign_out() -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(sign_out_blocking)
+        .await
+        .unwrap_or_else(|_| Err(JOIN_FAILED.to_string()))
 }
 
 /// Redeem a one-time auth code (from the sparkle:// deep link) for the long-lived bearer, which

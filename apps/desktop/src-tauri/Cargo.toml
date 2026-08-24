@@ -125,6 +125,13 @@ vt100 = "0.16.2"
 # Notification Center banners (see attention.rs).
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { version = "3", features = ["apple-native"] }
+# Security.framework, for the ATTRIBUTES-ONLY keychain existence probe in account_usage.rs. `keyring`
+# only exposes a `get_password` — a `SecItemCopyMatching` WITH DATA, which is the ACL-gated call that
+# pops "Sparkle wants to access key …" and blocks the caller until a human answers (sparkle-dkxuf6).
+# Asking for kSecReturnAttributes with kSecReturnData UNSET answers "does this item exist" out of the
+# keychain index with no authorization check and no dialog, which is the whole point. This adds NO
+# new package: keyring's own apple-native backend already depends on exactly this version.
+security-framework = "3"
 # We use mac-notification-sys directly rather than tauri-plugin-notification because on desktop
 # the plugin discards click events — and we need the click to route to the specific worker that
 # asked. It returns the interaction (Click / ActionButton) so we can emit a focus-agent event.

@@ -1,4 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 
 // Mock the Tauri boundary the same way the rest of the desktop suite does.
 const invokeMock = vi.fn();
@@ -8,6 +10,11 @@ vi.mock("@tauri-apps/api/core", () => ({
 
 import {
   getAccountUsageLive,
+  getAccountUsageLiveForced,
+  isUsageUnknownError,
+  USAGE_UNKNOWN_PREFIX,
+  KEYCHAIN_DENIED_PREFIX,
+  KEYCHAIN_MAIN_THREAD_PREFIX,
   summarizeMeter,
   scopedModelName,
   type AccountUsageLive,
@@ -51,10 +58,40 @@ describe("getAccountUsageLive", () => {
     expect(out.limits[0]?.isActive).toBe(true);
   });
 
-  it("passes force=true so the Rust command BYPASSES the TTL cache (the 'Refresh usage' path)", async () => {
-    // The whole point of the force flag: a manual refresh must re-read the keychain and re-query
-    // Anthropic instead of serving a cached token. Non-vacuous — the default call above proves the
-    // flag is NOT always true, so a wrapper that dropped `force` would fail one of the two.
+  it("takes NO force argument — the quiet reader cannot be turned into the loud one", () => {
+    // THE STRUCTURAL PIN. `force` used to be a boolean parameter, so every timer path on this screen
+    // was one argument away from raising a macOS keychain prompt several times a minute, with nothing
+    // but prose stopping it (sparkle-dkxuf6 / sparkle-oe9y1k). Splitting it into two exports makes
+    // that unreachable rather than merely discouraged. Arity is the machine-checkable half of that
+    // claim: `tsc` rejects a second argument at every call site, and this asserts the same fact at
+    // runtime so the guarantee survives a stray `as any` too.
+    //
+    // NON-VACUOUS against the pair below: the forced reader is a DIFFERENT function, so this cannot
+    // pass by there being no force path at all.
+    expect(getAccountUsageLive.length).toBe(1);
+    expect(getAccountUsageLiveForced.length).toBe(1);
+    expect(getAccountUsageLiveForced).not.toBe(getAccountUsageLive);
+  });
+
+  it("propagates a rejection so the caller can fall back to the local estimate", async () => {
+    invokeMock.mockRejectedValueOnce(new Error("no access token in stored credentials"));
+    await expect(getAccountUsageLive("/some/config/dir")).rejects.toThrow(
+      "no access token",
+    );
+  });
+});
+
+describe("getAccountUsageLiveForced", () => {
+  beforeEach(() => invokeMock.mockReset());
+
+  it("passes force=true so the Rust command re-reads credentials (the user-initiated path)", async () => {
+    // The whole point of the interactive reader: an on-demand check must bypass the cached token and
+    // re-read the account's credentials — keychain included — instead of serving a stale one. A macOS
+    // prompt HERE is expected and wanted, because a click asked for it.
+    //
+    // PAIRED with the quiet-path assertion above, which pins `force: false` on the very same invoke
+    // for the very same command. Neither test can pass by the wrapper hard-coding one value: a
+    // wrapper stuck on false fails this, and one stuck on true fails that.
     invokeMock.mockResolvedValueOnce({
       fiveHourPercent: 1,
       fiveHourResetsAt: null,
@@ -63,19 +100,105 @@ describe("getAccountUsageLive", () => {
       limits: [],
     } satisfies AccountUsageLive);
 
-    await getAccountUsageLive("/some/config/dir", true);
+    await getAccountUsageLiveForced("/some/config/dir");
 
     expect(invokeMock).toHaveBeenCalledWith("account_usage_live", {
       configDir: "/some/config/dir",
       force: true,
     });
   });
+});
 
-  it("propagates a rejection so the caller can fall back to the local estimate", async () => {
-    invokeMock.mockRejectedValueOnce(new Error("no access token in stored credentials"));
-    await expect(getAccountUsageLive("/some/config/dir")).rejects.toThrow(
-      "no access token",
-    );
+// ── "usage unknown" vs a GENUINE error ──────────────────────────────────────────────────────────
+// The quiet path rejects with a stable `usage unknown: ` prefix when it has no usable cached token —
+// the ordinary outcome for a healthy account whose OAuth token lapsed, since answering it would mean
+// reading the keychain and a background poll must never do that. Misclassifying it as an error is
+// what put "Check your connection or sign in again" in front of users with nothing wrong.
+describe("isUsageUnknownError", () => {
+  it("recognises the prefix on the three shapes a rejected Tauri invoke can hand back", () => {
+    // Rust `Err(String)` reaches JS as a bare string; wrapped by some callers into an Error; and any
+    // object carrying a string `message` must behave the same, or the classification would depend on
+    // which layer re-threw.
+    expect(isUsageUnknownError(`${USAGE_UNKNOWN_PREFIX}no cached token for /cfg/a`)).toBe(true);
+    expect(isUsageUnknownError(new Error(`${USAGE_UNKNOWN_PREFIX}token expired`))).toBe(true);
+    expect(isUsageUnknownError({ message: `${USAGE_UNKNOWN_PREFIX}token expired` })).toBe(true);
+  });
+
+  it("does NOT claim a genuine failure is merely unknown", () => {
+    // The other half of the pair — without it, `() => true` would pass the test above. Each of these
+    // is a real problem the user should hear about, and each must keep the error state.
+    expect(isUsageUnknownError(new Error("error sending request: connection refused"))).toBe(false);
+    expect(isUsageUnknownError("HTTP 401 from usage endpoint")).toBe(false);
+    expect(isUsageUnknownError(new Error("failed to parse usage response"))).toBe(false);
+    // …and the prefix has to be at the FRONT. A message that merely mentions the phrase is not the
+    // command's structured signal, so a `includes()` implementation must fail here.
+    expect(isUsageUnknownError(new Error("network down, so usage unknown: retry later"))).toBe(false);
+    // Non-string / absent rejections classify as a genuine failure (fail toward telling the user).
+    expect(isUsageUnknownError(undefined)).toBe(false);
+    expect(isUsageUnknownError(null)).toBe(false);
+    expect(isUsageUnknownError({ code: 500 })).toBe(false);
+  });
+
+  // ── THE INTERACTIVE PATH'S TWO OTHER NOT-AN-ERROR OUTCOMES ──────────────────────────────────
+  // The quiet path can only ever reject with `usage unknown: `, which is why matching that alone
+  // looked complete. It is not: a FORCED read has two further outcomes that are equally not the
+  // user's problem, and both used to fall through to the amber "Check your connection or sign in
+  // again" — advice that is wrong in both halves, shown to someone who had just answered a keychain
+  // dialog. A remedy message is an instruction people follow, so this is a user-facing defect.
+  it("treats a DECLINED keychain prompt as unknown, never as a broken connection", () => {
+    expect(isUsageUnknownError(`${KEYCHAIN_DENIED_PREFIX}: user declined`)).toBe(true);
+    expect(
+      isUsageUnknownError(
+        new Error(`${KEYCHAIN_DENIED_PREFIX}: a previous prompt was declined; suppressed until 12`),
+      ),
+    ).toBe(true);
+    expect(isUsageUnknownError({ message: `${KEYCHAIN_DENIED_PREFIX}: -25308` })).toBe(true);
+  });
+
+  it("treats a main-thread REFUSAL as unknown — it is our bug report, not their account", () => {
+    expect(isUsageUnknownError(`${KEYCHAIN_MAIN_THREAD_PREFIX}`)).toBe(true);
+    expect(
+      isUsageUnknownError(new Error(`${KEYCHAIN_MAIN_THREAD_PREFIX} (config /cfg/a)`)),
+    ).toBe(true);
+  });
+
+  it("still requires these prefixes at the FRONT, like the first one", () => {
+    // Pairs with the two above: without this they would also pass an `includes()` implementation,
+    // which would start swallowing genuine errors that merely quote the phrase.
+    expect(isUsageUnknownError(new Error(`http 500 — ${KEYCHAIN_DENIED_PREFIX}`))).toBe(false);
+    expect(isUsageUnknownError(new Error(`panic: ${KEYCHAIN_MAIN_THREAD_PREFIX}`))).toBe(false);
+  });
+});
+
+// ── CROSS-LANGUAGE DRIFT GUARD ────────────────────────────────────────────────────────────────
+// These three literals are a contract with `src-tauri/src/account_usage.rs`, and the failure mode
+// if they drift is SILENT: the Rust side keeps rejecting with a prefix this file no longer matches,
+// every affected account flips back into the scary error state, and nothing throws. Nothing in the
+// Rust suite can see this side, and nothing in this suite can see that side — so the only thing
+// that can catch a reword is a test that reads both. Assert on the Rust source directly rather than
+// on a copied fixture, because a fixture is one more thing that can drift.
+describe("the keychain-outcome prefixes match the Rust constants that produce them", () => {
+  const RUST = readFileSync(
+    join(__dirname, "..", "..", "src-tauri", "src", "account_usage.rs"),
+    "utf8",
+  );
+
+  it.each([
+    ["USAGE_UNKNOWN_PREFIX", USAGE_UNKNOWN_PREFIX],
+    ["KEYCHAIN_DENIED_PREFIX", KEYCHAIN_DENIED_PREFIX],
+    ["KEYCHAIN_MAIN_THREAD_PREFIX", KEYCHAIN_MAIN_THREAD_PREFIX],
+  ])("%s is spelled identically on both sides", (rustName, tsValue) => {
+    const decl = new RegExp(`const ${rustName}: &str = "([^"]*)"`).exec(RUST);
+    expect(
+      decl,
+      `${rustName} is gone from account_usage.rs — if it was renamed, rename it here too; if the ` +
+        `outcome it named no longer exists, delete this row rather than leaving a dead contract`,
+    ).not.toBeNull();
+    expect(
+      decl?.[1],
+      `${rustName} was reworded in Rust but not here, so this outcome now falls through to the ` +
+        `amber "Check your connection or sign in again" for every affected account, silently`,
+    ).toBe(tsValue);
   });
 });
 

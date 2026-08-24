@@ -59,6 +59,8 @@ import {
 } from "../services/headroom";
 import {
   getAccountUsageLive,
+  getAccountUsageLiveForced,
+  isUsageUnknownError,
   type AccountUsageLive,
 } from "../services/accountUsage";
 import {
@@ -123,7 +125,19 @@ const DEPS = {
   // dir. Augments the relative token-tally bars with each account's ACTUAL server-side percent +
   // reset time. Injectable/mockable like every other IO; a per-account failure degrades that row to
   // "usage unavailable" and never blocks the screen (the local-tally `getUsage` stays the fallback).
+  //
+  // THE QUIET READER. It takes no `force` argument and cannot reach the keychain, so the mount
+  // effect below — which re-fires on every account add/remove and every login — can never raise a
+  // macOS confidential-information prompt. An account whose cached token has lapsed rejects with
+  // `usage unknown: ` and its row degrades to the "usage unknown" affordance, which POINTS AT the
+  // ⋮ → "Check usage levels" gesture rather than pretending something is broken.
   getUsageLive: getAccountUsageLive,
+  // THE INTERACTIVE READER, and the ONLY dep on this screen that may prompt. Bound to exactly one
+  // call site — the per-card ⋮ → "Check usage levels" handler, a click. Separate from `getUsageLive`
+  // on purpose (see accountUsage.ts's header): with force as a boolean parameter, a later refactor
+  // could hand a timer the loud behaviour by flipping an argument and nothing would fail. Wiring
+  // THIS into an effect, poll or interval reintroduces `sparkle-dkxuf6` — don't.
+  getUsageLiveForced: getAccountUsageLiveForced,
   // LIVE per-account login health: `claude auth status --json` for one config dir. This is what
   // tells an EXPIRED login (was signed in, the CLI now says no — `authIsDefinitelyExpired`) apart
   // from one that was NEVER signed in, so the card can say "reconnect" honestly instead of "never
@@ -430,16 +444,36 @@ function LiveUsageBar({
   );
 }
 
-/** The REAL live-usage block for one account row. Three states, none of which may break the screen:
+/** What one row's live-usage cell can hold. `"unknown"` and `"error"` are DELIBERATELY distinct —
+ *  see {@link LiveUsageSection}. */
+export type LiveUsageCell = AccountUsageLive | "error" | "unknown" | undefined;
+
+/** The payload in a live cell, or null when the cell holds no figures (loading / unknown / error).
+ *  One helper so every derivation that projects percentages folds the non-data states identically —
+ *  a site that only checked `!== "error"` would read the string `"unknown"` as a usage object. */
+function liveUsageData(live: LiveUsageCell): AccountUsageLive | null {
+  return live === undefined || live === "error" || live === "unknown" ? null : live;
+}
+
+/** The REAL live-usage block for one account row. FOUR states, none of which may break the screen:
  *   - `undefined` (not fetched yet) → a muted "Loading real usage…";
- *   - `"error"` (no token / offline / 401 / keychain declined) → "Real usage unavailable", and the
- *     relative token-tally bars below remain the fallback;
- *   - data → the two real percent bars. */
+ *   - `"unknown"` — the QUIET read had no usable cached token (`usage unknown: `). This is the
+ *     ordinary, expected outcome for a healthy account whose cached OAuth token has lapsed: reading
+ *     the keychain would answer it, and a background poll must never do that (see accountUsage.ts).
+ *     So the row says so plainly and names the gesture that trues it up. It is NOT an error, and
+ *     must not read like one — the polled path hits this constantly, and "check your connection or
+ *     sign in again" would send the user chasing a problem that does not exist;
+ *   - `"error"` (offline / 401 / unparseable body) → "Real usage unavailable", a genuine failure;
+ *   - data → the two real percent bars.
+ *
+ *  In every non-data state the relative token-tally bars below remain the fallback. */
 function LiveUsageSection({
   live,
+  accountId,
   now,
 }: {
-  live: AccountUsageLive | "error" | undefined;
+  live: LiveUsageCell;
+  accountId: string;
   now: number;
 }) {
   if (live === undefined) {
@@ -447,9 +481,25 @@ function LiveUsageSection({
       <div style={{ marginTop: 6, fontSize: 12, color: C.muted }}>Loading real usage…</div>
     );
   }
+  if (live === "unknown") {
+    return (
+      <div
+        data-testid={`account-usage-unknown-${accountId}`}
+        style={{ marginTop: 6, fontSize: 12, color: C.muted }}
+      >
+        <span style={{ marginRight: 6 }}>—</span>
+        Usage unknown. Use “Check usage levels” in this card’s ⋮ menu to true it up.
+      </div>
+    );
+  }
   if (live === "error") {
     return (
-      <div style={{ marginTop: 6, fontSize: 12, color: C.muted }}>Real usage unavailable.</div>
+      <div
+        data-testid={`account-usage-unavailable-${accountId}`}
+        style={{ marginTop: 6, fontSize: 12, color: C.muted }}
+      >
+        Real usage unavailable.
+      </div>
     );
   }
   // The "REAL USAGE (ANTHROPIC)" section label was removed (overhaul item 5) — the two labelled bars
@@ -857,11 +907,15 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
   // Real authenticated identity (email + org) per account id — the trustworthy label read from each
   // account's own .claude.json oauthAccount. The nickname is only a secondary alias.
   const [identities, setIdentities] = useState<Identity[]>([]);
-  // REAL live usage per account id. A value is Anthropic's own utilization; the literal "error"
-  // means the fetch failed (no token / offline / 401) and the row shows "usage unavailable"; a
-  // MISSING entry is "not fetched yet". Kept separate from the token-tally `usage` above because it
-  // fetches per account and each account can fail independently without blanking the others.
-  const [liveUsage, setLiveUsage] = useState<Record<string, AccountUsageLive | "error">>({});
+  // REAL live usage per account id. A value is Anthropic's own utilization; the literal "unknown"
+  // means the QUIET read had no usable cached token (`usage unknown: `) and the row shows the "—
+  // Usage unknown" affordance; the literal "error" means a GENUINE failure (offline / 401 /
+  // unparseable body) and the row shows "usage unavailable"; a MISSING entry is "not fetched yet".
+  // Kept separate from the token-tally `usage` above because it fetches per account and each account
+  // can fail independently without blanking the others.
+  const [liveUsage, setLiveUsage] = useState<Record<string, AccountUsageLive | "error" | "unknown">>(
+    {},
+  );
   // LIVE login health per account id, from `claude auth status --json` for that config dir. This is
   // the signal that catches the case the recorded identity CANNOT: an account whose `.claude.json`
   // still shows an email (so it reads "signed in") while its OAuth session is actually dead. A value
@@ -877,8 +931,19 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
   // separate from the per-account `liveUsage` map so a check never blanks the row while it runs —
   // the row keeps its last figures and updates in place when the forced fetch returns. Replaces the
   // old global "Refresh usage" button — each card checks its own account independently.
+  //
+  // THE ONLY PROMPT-CAPABLE PATH ON THIS SCREEN. Everything else reads usage quietly, so this menu
+  // item is also the remedy the "usage unknown" row points at: it is what a user with a lapsed cached
+  // token clicks to true their figures up.
   const [checkingUsage, setCheckingUsage] = useState<Record<string, boolean>>({});
-  const [usageError, setUsageError] = useState<Record<string, string | null>>({});
+  // The outcome note for the LAST check on that card, or null. DISCRIMINATED rather than a bare
+  // string because the two outcomes must not read alike: `"error"` is a genuine failure and gets the
+  // amber `role="alert"` treatment, while `"unknown"` means the read could not produce a token at all
+  // and gets a muted `role="status"` — telling a user with a merely-lapsed token to check their
+  // connection is worse than saying nothing.
+  const [usageError, setUsageError] = useState<
+    Record<string, { kind: "error" | "unknown"; text: string } | null>
+  >({});
   // Which card's ⋮ kebab menu is open (item 11); only one at a time, null = none.
   const [openMenuId, setOpenMenuId] = useState<string | null>(null);
   // PER-CARD expand state for the "Running agents" one-line collapse (item 13): the set of account
@@ -949,6 +1014,9 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
   const getIdentitiesFn = deps?.getIdentities ?? DEPS.getIdentities;
   const listCeilingsFn = deps?.listCeilings ?? DEPS.listCeilings;
   const getUsageLiveFn = deps?.getUsageLive ?? DEPS.getUsageLive;
+  // The interactive reader. Deliberately NOT wired into any effect below — `checkUsageLevels` (a
+  // click handler) is its only caller, and that is the property that keeps the keychain quiet.
+  const getUsageLiveForcedFn = deps?.getUsageLiveForced ?? DEPS.getUsageLiveForced;
   const getAuthStatusFn = deps?.getAuthStatus ?? DEPS.getAuthStatus;
   // ── REMOVED IDS, SO A STALE RE-READ CANNOT RESURRECT A ROW ──────────────────────────────────
   //
@@ -1005,10 +1073,11 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
           /* the exhausted line simply does not render; the screen is already up */
         });
       // NOTE: the REAL live-usage fetch is deliberately NOT awaited here. It reads each account's
-      // OAuth secret (a keychain read that can raise a macOS prompt) and hits the network per
-      // account — up to 15s each — so folding it into refresh's critical path would gate every
-      // add/rename/remove/login flow (each awaits refresh) behind N blocking round-trips. It runs in
-      // its own effect below, keyed on the account SET so a rename doesn't re-hit the endpoint.
+      // cached OAuth token and hits the network per account — up to 15s each — so folding it into
+      // refresh's critical path would gate every add/rename/remove/login flow (each awaits refresh)
+      // behind N blocking round-trips. It runs in its own effect below, keyed on the account SET so a
+      // rename doesn't re-hit the endpoint. It does NOT read the keychain and cannot raise a macOS
+      // prompt — that is the quiet reader's guarantee; only the ⋮ "Check usage levels" gesture can.
     } catch (e) {
       setError(errText(e, "Failed to load accounts"));
     }
@@ -1030,7 +1099,13 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
   //     identity-signature key would miss it — `accountStore.identityKey` exists precisely because
   //     the uuid is null for such logins) and (b) re-authenticating the SAME account after a 401 /
   //     offline error, the recovery path a user actually takes from the "unavailable" row.
-  //   • a plain RENAME calls neither, so it still doesn't re-hit the keychain / endpoint.
+  //   • a plain RENAME calls neither, so it still doesn't re-hit the endpoint.
+  // NONE of these reach the keychain: `getUsageLiveFn` is the QUIET reader, which takes no force
+  // argument and stops at Sparkle's token cache / the account's creds file. That is why re-firing it
+  // on every add / remove / login is safe — it cannot raise a macOS prompt however often it runs. An
+  // account whose cached token has lapsed rejects with `usage unknown: ` and lands "unknown", not
+  // "error": the row asks the user to check it by hand rather than reporting a failure that isn't
+  // one. The keychain-touching read lives in `checkUsageLevels` below, behind a click.
   // Each result is written per-id as it settles, so rows fill independently and one hung account
   // doesn't blank the column. A generation ref discards a stale batch's late results (and any write
   // after unmount): with a 15s-per-account window an older batch can resolve after a newer one.
@@ -1044,8 +1119,12 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
         .then((r) => {
           if (liveGenRef.current === gen) setLiveUsage((prev) => ({ ...prev, [acct.id]: r }));
         })
-        .catch(() => {
-          if (liveGenRef.current === gen) setLiveUsage((prev) => ({ ...prev, [acct.id]: "error" }));
+        .catch((e: unknown) => {
+          // The ONE place the two rejection classes part company on the quiet path. `usage unknown: `
+          // is the expected answer for a lapsed cached token — degrade to "unknown". Anything else
+          // (network, 401, unparseable body) is a real error and keeps the error state honest.
+          const cell = isUsageUnknownError(e) ? "unknown" : "error";
+          if (liveGenRef.current === gen) setLiveUsage((prev) => ({ ...prev, [acct.id]: cell }));
         });
     }
     // `accountsKey` is the content signature of the account SET (not the array identity, so a rename
@@ -1077,13 +1156,20 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
   }, [accountsKey, liveNonce, getAuthStatusFn]);
 
   // ── "Check usage levels" — per-card, on-demand true-up of ONE account's REAL usage (item 14) ─────
-  // The founder's ask, now surfaced from each card's ⋮ menu instead of a global button. Force-fetches
-  // that account's live usage with `force=true`, so the read bypasses the cached OAuth token and
-  // re-reads the account's keychain — the macOS prompt that may raise is the acknowledged, wanted
-  // signal of a real re-check, not an error.
+  // The founder's ask, surfaced from each card's ⋮ menu. THE ONLY CALLER of the interactive reader
+  // anywhere in the app: `getUsageLiveForcedFn` bypasses the cached OAuth token and re-reads the
+  // account's credentials, keychain included, so the macOS prompt that may raise here is the
+  // acknowledged, wanted signal of a real re-check — the user just asked for it by clicking.
+  //
+  // WHY THIS IS A DIFFERENT DEP AND NOT A BOOLEAN: everything else that fetches live usage runs on a
+  // timer (this screen's mount effect, and `refreshLiveUsage` behind three separate polls), and a
+  // prompt raised by a timer is the constant-keychain-dialog bug (`sparkle-dkxuf6`). With `force` as
+  // a parameter, prose was the only thing keeping those callers honest; with two exports, a timer
+  // holds a reference to a function that CANNOT prompt. Do not call `getUsageLiveForcedFn` from an
+  // effect, an interval, or anything else that is not a gesture.
   //
   // HONEST SCOPE: the cache holds only the TOKEN, never the usage numbers (`account_usage_live` hits
-  // Anthropic on every call), so `force` guarantees a fresh keychain-backed token read rather than
+  // Anthropic on every call), so forcing guarantees a fresh credential-backed token read rather than
   // adding data freshness. Shares the live effect's `liveGenRef` guard so a login that re-fires the
   // effect mid-check discards this late write; the in-flight flag is always cleared so it can't wedge.
   async function checkUsageLevels(a: Account) {
@@ -1093,14 +1179,31 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
     setUsageError((m) => ({ ...m, [a.id]: null }));
     const gen = ++liveGenRef.current;
     try {
-      const r = await getUsageLiveFn(a.configDir, true);
+      const r = await getUsageLiveForcedFn(a.configDir);
       if (liveGenRef.current === gen) setLiveUsage((prev) => ({ ...prev, [a.id]: r }));
-    } catch {
+    } catch (e: unknown) {
       if (liveGenRef.current === gen) {
-        setLiveUsage((prev) => ({ ...prev, [a.id]: "error" }));
+        // Same split as the quiet path, but the FORCED read has a WIDER unknown set — and getting
+        // that set wrong is what this branch exists to avoid. Three Rust outcomes land here and none
+        // of them is "your connection is broken": no token even interactively (`usage unknown: `),
+        // the user DECLINED the keychain prompt or a prior decline is still suppressed
+        // (`keychain access not granted`), and a read refused for running on the main thread
+        // (`keychain read refused on the main thread`, which is our bug, not their account).
+        // `isUsageUnknownError` matches all three; it once matched only the first, which showed
+        // someone who had just answered a dialog an amber "check your connection or sign in again".
+        const unknown = isUsageUnknownError(e);
+        setLiveUsage((prev) => ({ ...prev, [a.id]: unknown ? "unknown" : "error" }));
         setUsageError((m) => ({
           ...m,
-          [a.id]: "Couldn't refresh usage. Check your connection or sign in again.",
+          [a.id]: unknown
+            ? {
+                kind: "unknown" as const,
+                text: "Usage unknown — Sparkle couldn't read this account's saved credentials. Allow the keychain prompt when it appears, or sign in to this account again.",
+              }
+            : {
+                kind: "error" as const,
+                text: "Couldn't refresh usage. Check your connection or sign in again.",
+              },
         }));
       }
     } finally {
@@ -1408,14 +1511,13 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
       // way would let the pause land on an account the screen does not present as the leader.
       const lead =
         orderBySpace(rotationPool, (a) => {
-          const live = liveUsage[a.id];
-          const hasData = live !== undefined && live !== "error";
+          const data = liveUsageData(liveUsage[a.id]);
           return {
             id: a.id,
             alias: displayFor(a).nickname || displayFor(a).primary || a.id,
             usable: true, // every member of `rotationPool` is signed in by construction
-            sessionUsedPct: hasData ? live.fiveHourPercent : null,
-            weeklyUsedPct: hasData ? live.sevenDayPercent : null,
+            sessionUsedPct: data ? data.fiveHourPercent : null,
+            weeklyUsedPct: data ? data.sevenDayPercent : null,
           };
         })[0] ?? null;
       pauseRotation(lead?.id ?? null, now);
@@ -1429,10 +1531,13 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
   // The REAL Anthropic rows we have fetched, in the shape selection uses. Feeding these into the
   // AC8 verdict keeps "all accounts are at their limit" tracking the SAME signal the spawn gate now
   // excludes on (`partitionAccounts` → `isLiveSpent`), rather than only the observed wall — so the
-  // banner and the gate cannot disagree. Rows still loading ("undefined") or failed ("error") are
-  // simply absent, which reads as "no live evidence" for that account, never as spent.
+  // banner and the gate cannot disagree. Rows still loading ("undefined"), unknown ("unknown") or
+  // failed ("error") are
+  // simply absent, which reads as "no live evidence" for that account, never as spent. So are rows
+  // that came back "unknown" (a lapsed cached token on the quiet path) — an account we could not read
+  // without prompting is one we know NOTHING about, which is the opposite of "at its limit".
   const liveRows: LiveUsage[] = Object.entries(liveUsage)
-    .filter((e): e is [string, AccountUsageLive] => e[1] !== "error")
+    .filter((e): e is [string, AccountUsageLive] => e[1] !== "error" && e[1] !== "unknown")
     .map(([id, l]) => ({
       id,
       fiveHourPercent: l.fiveHourPercent,
@@ -1803,14 +1908,13 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
   // derivation above (readiness, duplicates, headroom) still reads the unordered `accounts`, which
   // are order-independent. The projection reads live usage + sign-in exactly as the row render does.
   const freshOrder = orderBySpace(accounts, (a) => {
-    const live = liveUsage[a.id];
-    const hasData = live !== undefined && live !== "error";
+    const data = liveUsageData(liveUsage[a.id]);
     return {
       id: a.id,
       alias: displayFor(a).nickname || displayFor(a).primary || a.id,
       usable: isSignedIn(identityFor(a.id)),
-      sessionUsedPct: hasData ? live.fiveHourPercent : null,
-      weeklyUsedPct: hasData ? live.sevenDayPercent : null,
+      sessionUsedPct: data ? data.fiveHourPercent : null,
+      weeklyUsedPct: data ? data.sevenDayPercent : null,
     };
   });
   // FREEZE the order while a rename is in progress. The sort key depends on liveUsage/identities
@@ -2656,9 +2760,12 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
                 a number that confidently contradicts the real one beside it is a liability, not a
                 fallback. (The same inversion was steering the ROUTER; that is fixed separately, in
                 `accountStore.pickAccount`.) */}
-            <LiveUsageSection live={liveUsage[a.id]} now={now} />
-            {/* Per-card "Check usage levels" status (item 14): a brief in-flight line, then an inline
-                error if the forced fetch failed — never a browser dialog. */}
+            <LiveUsageSection live={liveUsage[a.id]} accountId={a.id} now={now} />
+            {/* Per-card "Check usage levels" status (item 14): a brief in-flight line, then the
+                outcome note if the forced fetch didn't produce figures — never a browser dialog.
+                TWO SHAPES, and the distinction is the point: an "unknown" outcome (no readable
+                credential) is a muted status, while a genuine failure is the amber alert. Rendering
+                the alarm copy for both is what sent users chasing a non-existent outage. */}
             {checkingUsage[a.id] ? (
               <div
                 data-testid={`account-usage-checking-${a.id}`}
@@ -2667,6 +2774,14 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
               >
                 Checking usage…
               </div>
+            ) : usageError[a.id]?.kind === "unknown" ? (
+              <div
+                data-testid={`account-usage-unknown-note-${a.id}`}
+                role="status"
+                style={{ marginTop: 6, fontSize: 12, color: C.muted }}
+              >
+                {usageError[a.id]?.text}
+              </div>
             ) : (
               usageError[a.id] && (
                 <div
@@ -2674,7 +2789,7 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
                   role="alert"
                   style={{ marginTop: 6, fontSize: 12, color: C.amber }}
                 >
-                  {usageError[a.id]}
+                  {usageError[a.id]?.text}
                 </div>
               )
             )}

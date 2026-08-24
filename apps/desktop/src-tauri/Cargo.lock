@@ -4454,6 +4454,7 @@ dependencies = [
  "rand 0.8.6",
  "regex",
  "rusqlite",
+ "security-framework 3.7.0",
  "serde",
  "serde_json",
  "sha2",

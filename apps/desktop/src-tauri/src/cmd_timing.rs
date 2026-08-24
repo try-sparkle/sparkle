@@ -426,16 +426,12 @@ mod main_thread_guard {
         "account_record_oauth_identity",
         "accounts_add",
         "accounts_import_default",
-        "accounts_mark_exhausted",
         "accounts_remove",
         "accounts_set_nickname",
         "app_version",
         "append_concierge_guideline",
         "append_note",
         "chief_pat",
-        "chief_pat_secure_clear",
-        "chief_pat_secure_get",
-        "chief_pat_secure_set",
         "claude_chat_cancel",
         "clear_window_roster",
         "concierge_guidelines_path",
@@ -447,10 +443,7 @@ mod main_thread_guard {
         "control_mcp_paths",
         "control_respond",
         "copy_capture_asset",
-        "desktop_bearer_token",
         "desktop_begin_signin",
-        "desktop_has_token",
-        "desktop_sign_out",
         "desktop_take_pending_deeplink",
         "display_layout",
         "fit_window_to_current_display",
@@ -817,6 +810,68 @@ mod main_thread_guard {
         assert!(
             !EXEMPT.contains(&"frontend_log"),
             "`frontend_log` must never be exempted — it is the command this sweep was built for"
+        );
+    }
+
+    /// ── NO KEYCHAIN READ ON THE MAIN THREAD ───────────────────────────────────────────────────
+    /// The sweep above counts these among ~330 commands; name them, because what makes them
+    /// different is not frequency but WHAT THEY BLOCK ON. A keychain call is a synchronous XPC
+    /// round trip to securityd that can additionally park on an ACL prompt or a locked keychain,
+    /// so a sync one does not merely cost microseconds on the main thread — it can hold the AppKit
+    /// main thread for as long as a dialog sits unanswered, which is the captured `sparkle-dkxuf6`
+    /// stack and the same shape `watchdogHeartbeat.ts` recorded as the 2026-07-29 root cause.
+    ///
+    /// `desktop_has_token` is the one that makes this non-negotiable: `services/socialSync.ts`
+    /// invokes it from a `setInterval(…, SOCIAL_POLL_MS)`, so the block is reached by a TIMER. No
+    /// gesture causes it and no gesture avoids it — which is exactly the class of freeze a user
+    /// cannot correlate with anything they did, and cannot work around.
+    ///
+    /// A revert to `pub fn` on any of these would still be caught by the sweep, but only as one
+    /// more line in a list of six; here it is named, with the reason attached.
+    #[test]
+    fn no_keychain_touching_command_runs_on_the_main_thread() {
+        let auth = include_str!("auth.rs");
+        let chief = include_str!("chief.rs");
+        for (file, src, name) in [
+            ("auth.rs", auth, "desktop_has_token"),
+            ("auth.rs", auth, "desktop_bearer_token"),
+            ("auth.rs", auth, "desktop_sign_out"),
+            ("chief.rs", chief, "chief_pat_secure_get"),
+            ("chief.rs", chief, "chief_pat_secure_set"),
+            ("chief.rs", chief, "chief_pat_secure_clear"),
+        ] {
+            assert_eq!(
+                command_is_async(src, name),
+                Some(true),
+                "{file}: `{name}` reaches the OS keychain. Sync, its body runs inline on the \
+                 AppKit main thread and parks there for the whole securityd round trip — and for \
+                 as long as any ACL prompt stays unanswered (bead sparkle-dkxuf6)"
+            );
+            assert!(
+                !EXEMPT.contains(&name),
+                "`{name}` must never be exempted — a keychain call is the one thing that can hold \
+                 the main thread for an unbounded time"
+            );
+        }
+    }
+
+    /// ANTI-VACUITY FOR THE PIN ABOVE, and it is not the scanner this time — the scanner already
+    /// has its own anchors. The claim "`desktop_has_token` is reached by a timer" is what makes
+    /// that pin load-bearing rather than tidy, and it lives in a DIFFERENT LANGUAGE, so nothing in
+    /// the Rust suite would notice if the polling loop were rewritten to something else. Pin the
+    /// two halves that make the sentence true: the timer, and the call inside it.
+    #[test]
+    fn the_social_poll_that_reaches_the_keychain_is_still_a_timer() {
+        let src = include_str!("../../src/services/socialSync.ts");
+        assert!(
+            src.contains("setInterval(") && src.contains("SOCIAL_POLL_MS"),
+            "socialSync no longer polls on an interval — re-read \
+             `no_keychain_touching_command_runs_on_the_main_thread`, whose rationale rests on it"
+        );
+        assert!(
+            src.contains("hasToken()"),
+            "the social poll no longer calls `hasToken()` (which invokes `desktop_has_token`); the \
+             timer→keychain path this guard describes has moved and the description is now wrong"
         );
     }
 

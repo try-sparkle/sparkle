@@ -94,37 +94,72 @@ fn normalize_pat(raw: &str) -> Option<String> {
     Some(pat.to_string())
 }
 
+// ── The blocking keychain work ────────────────────────────────────────────────────────────────
+// A `#[tauri::command]` declared as a plain `fn` runs its body INLINE on the AppKit main thread
+// (see `cmd_timing`'s module note), and a keychain call is a synchronous XPC round trip to
+// securityd that can additionally block on an ACL prompt or a locked keychain. These three had no
+// cache of any kind, so EVERY call paid it on the main thread. Keep the keychain halves as plain
+// sync fns and let the commands below be thin `spawn_blocking` wrappers, mirroring
+// `publish_credential.rs` (bead sparkle-dkxuf6).
+
+/// A joined task that never produced an answer. Distinct from "no PAT stored": a caller that
+/// treated the two alike would report a disconnection that did not happen.
+const JOIN_FAILED: &str = "the keychain task didn't finish";
+
+/// The keychain half of the read path. Validated on READ as well as write — see the command's doc.
+fn keychain_pat() -> Option<String> {
+    let stored = entry().ok()?.get_password().ok()?;
+    normalize_pat(&stored)
+}
+
+/// The keychain half of the write path. Validation happens here rather than in the command so a
+/// bad paste is rejected by the same function the tests drive.
+fn store_pat(pat: &str) -> Result<(), String> {
+    let Some(pat) = normalize_pat(pat) else {
+        return Err("that PAT is empty or contains spaces/line breaks; check the paste".to_string());
+    };
+    entry()?.set_password(&pat).map_err(|e| e.to_string())
+}
+
+/// The keychain half of the disconnect path. `NoEntry` is the state the caller wanted.
+fn erase_pat() -> Result<(), String> {
+    match entry()?.delete_credential() {
+        Ok(()) => Ok(()),
+        Err(keyring::Error::NoEntry) => Ok(()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
 /// Read the user-entered Chief PAT from the OS keychain. `None` when none is stored (fresh install
 /// or signed-out) or when the stored value fails validation, so the frontend treats an empty result
 /// as "nothing in the secure store" and falls back to the env / build PAT. Validated on READ as
 /// well as write so a value written by an older build with an interior newline can't malform the
 /// header forever (mirrors builder_index).
 #[tauri::command]
-pub fn chief_pat_secure_get() -> Option<String> {
-    let stored = entry().ok()?.get_password().ok()?;
-    normalize_pat(&stored)
+pub async fn chief_pat_secure_get() -> Option<String> {
+    tauri::async_runtime::spawn_blocking(keychain_pat).await.unwrap_or(None)
 }
 
 /// Store the user-entered Chief PAT in the OS keychain. Rejects an empty / header-invalid value
 /// before it reaches the keychain so a bad paste fails loudly rather than turning into a confusing
 /// transport error on every later request.
 #[tauri::command]
-pub fn chief_pat_secure_set(pat: String) -> Result<(), String> {
-    let Some(pat) = normalize_pat(&pat) else {
-        return Err("that PAT is empty or contains spaces/line breaks; check the paste".to_string());
-    };
-    entry()?.set_password(&pat).map_err(|e| e.to_string())
+pub async fn chief_pat_secure_set(pat: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || store_pat(&pat))
+        .await
+        .unwrap_or_else(|_| Err(JOIN_FAILED.to_string()))
 }
 
 /// Delete the user-entered Chief PAT from the OS keychain (disconnect). A missing item is the state
 /// the caller wanted, so `NoEntry` is success.
+///
+/// A join failure is an ERROR, never `Ok`: the delete lives in the task that did not finish, so
+/// reporting success would show "disconnected" over a PAT that is still stored.
 #[tauri::command]
-pub fn chief_pat_secure_clear() -> Result<(), String> {
-    match entry()?.delete_credential() {
-        Ok(()) => Ok(()),
-        Err(keyring::Error::NoEntry) => Ok(()),
-        Err(e) => Err(e.to_string()),
-    }
+pub async fn chief_pat_secure_clear() -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(erase_pat)
+        .await
+        .unwrap_or_else(|_| Err(JOIN_FAILED.to_string()))
 }
 
 #[cfg(test)]

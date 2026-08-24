@@ -76,9 +76,19 @@ export const ACCOUNT_CACHE_TTL_MS = 5_000;
 //
 // `pickAccount` needs this to avoid routing at the most exhausted account on the machine (see
 // `PickOptions.live`), but fetching it is expensive in a way the local tally is not: it reads an
-// OAuth secret — a keychain read that can raise a macOS confidential-info prompt — and then makes a
-// network call with a 15s ceiling, PER ACCOUNT. Awaiting that before every spawn would gate each
-// agent behind N blocking round-trips and, worse, would make a spawn fail when the network does.
+// OAuth token and then makes a network call with a 15s ceiling, PER ACCOUNT. Awaiting that before
+// every spawn would gate each agent behind N blocking round-trips and, worse, would make a spawn
+// fail when the network does.
+//
+// IT IS ALSO THE QUIET PATH, AND MUST STAY THAT WAY. This refresh is kicked by `loadAccountState`,
+// which is driven by three independent polls (the 10s provider banner, the 60s limit sync, the 120s
+// account switch) — so anything it can reach, it reaches several times a minute forever. It uses
+// `getAccountUsageLive`, which takes NO force argument and cannot touch the keychain, so none of
+// those timers can raise a macOS confidential-information prompt. The interactive read that CAN
+// prompt is a different export (`getAccountUsageLiveForced`) reachable only from a user gesture —
+// see the header of accountUsage.ts, and `sparkle-dkxuf6` / `sparkle-oe9y1k` for the bug that split
+// them. An account whose cached token has lapsed simply has NO ROW here until the user checks it by
+// hand; that reads as "unknown", which selection already handles, and is the accepted trade.
 //
 // So it is a BACKGROUND cache with a read that never blocks. `liveUsageRows()` returns whatever is
 // currently known, and an empty result is a perfectly good answer: `pickAccount` degrades to the
@@ -109,7 +119,14 @@ function invalidateLiveUsage(): void {
  *
  *  Per-account failures are ABSORBED rather than dropping the whole batch — one account whose token
  *  is missing or whose fetch 401s must not blind selection to the other nine. A failed account
- *  simply has no row, which reads as "unknown".
+ *  simply has no row, which reads as "unknown". After the quiet/forced split that now includes the
+ *  `usage unknown: ` rejection a lapsed cached token produces: no row, no prompt, no error.
+ *
+ *  `deps.fetch` IS THE QUIET READER AND ITS TYPE SAYS SO — `(configDir: string) => …`, one argument,
+ *  no `force`. Do not widen it to accept one and do not swap in `getAccountUsageLiveForced`: this
+ *  function is on a timer, and forcing here is exactly the constant-keychain-prompt bug the split
+ *  fixed. `accountSelection.quietUsage.test.ts` drives the real function with a spy dep and asserts
+ *  on the ARGUMENTS it actually received, so a reintroduced force goes red rather than shipping.
  *
  *  `now` is INJECTED rather than read from `Date.now()` inside, and both clocks in this module have
  *  to move together: `loadAccountState` already takes one, so a refresh reading the real clock while

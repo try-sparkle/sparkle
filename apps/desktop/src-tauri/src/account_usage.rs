@@ -27,6 +27,25 @@
 //! written 0600 in the account's own config dir. It is never placed on a shared, cross-user, or
 //! world-readable path. Low incremental risk relative to the keychain copy it mirrors.
 //!
+//! ## Why the cache was NOT enough (`sparkle-dkxuf6`)
+//!
+//! The cache suppresses the common case and nothing else. Three paths still reached the keychain on
+//! a timer, and each one is a synchronous XPC round trip to `securityd` that, with the ACL ungranted,
+//! BLOCKS until a human dismisses a modal — a captured stack has 221 of 401 samples parked in
+//! `find_generic_password` under `com.apple.main-thread`. Three changes close that:
+//!
+//!  * **Existence is no longer answered by decryption.** [`has_readable_credential`] — a boolean
+//!    "is this account signed in", asked on every roborev rotation publish — used to DECRYPT the
+//!    token to answer it. It now probes for the keychain ITEM with an attributes-only query
+//!    (`kSecReturnAttributes`, `kSecReturnData` unset), which is not ACL-gated and raises no dialog.
+//!  * **Polling reads are [`TokenAccess::Quiet`] and never touch the keychain at all.** The poll
+//!    chain is 10s/60s/120s and fans out one token read PER ACCOUNT; a lapsed token there degrades
+//!    to an `usage unknown: …` error the UI renders as an unknown reading, never to a prompt. Only
+//!    the explicitly user-initiated "Check usage levels" ([`TokenAccess::Interactive`]) may prompt.
+//!  * **A keychain read is REFUSED on the AppKit main thread**, and a DECLINED prompt is remembered
+//!    for [`KEYCHAIN_DENIAL_BACKOFF_MS`] so dismissing the dialog no longer guarantees it returns on
+//!    the very next tick.
+//!
 //! The parser (`parse_usage_response`) is deliberately DEFENSIVE: Anthropic sends nullable fields as
 //! the key with a `null` VALUE (not an absent key), so every optional field is `Option<T>`. A parser
 //! that rejected the whole payload when one field is null would silently make the feature inert — the
@@ -483,6 +502,17 @@ fn write_cache_file(path: &Path, creds: &CachedCreds) {
         Ok(j) => j,
         Err(_) => return,
     };
+    write_owner_only_best_effort(path, json.as_bytes());
+}
+
+/// Best-effort write of `bytes` to `path` at mode 0600 (same user), swallowing every failure.
+///
+/// Shared by the token cache and the keychain-denial marker: both are pure optimizations whose
+/// absence costs at most one extra read, so a write failure must never surface as an error — but
+/// both hold state about a credential, so neither may ever land at a looser mode. Unlike
+/// [`write_secret_file`] this truncates in place rather than renaming a temp file: nothing here is
+/// the credential itself, and the re-assert below covers a pre-existing file created loosely.
+fn write_owner_only_best_effort(path: &Path, bytes: &[u8]) {
     #[cfg(unix)]
     {
         use std::io::Write;
@@ -494,7 +524,7 @@ fn write_cache_file(path: &Path, creds: &CachedCreds) {
             .mode(0o600)
             .open(path)
         {
-            let _ = f.write_all(json.as_bytes());
+            let _ = f.write_all(bytes);
         }
         // Re-assert 0600 in case the file pre-existed with looser permissions.
         use std::os::unix::fs::PermissionsExt;
@@ -502,7 +532,52 @@ fn write_cache_file(path: &Path, creds: &CachedCreds) {
     }
     #[cfg(not(unix))]
     {
-        let _ = std::fs::write(path, json.as_bytes());
+        let _ = std::fs::write(path, bytes);
+    }
+}
+
+// ---- keychain-denial backoff --------------------------------------------------------------------
+
+/// Basename of the marker recording that macOS DECLINED us this account's keychain item.
+const KEYCHAIN_DENIED_FILE: &str = ".sparkle-keychain-denied.json";
+
+/// How long to stay silent after a keychain prompt was declined or dismissed.
+///
+/// Before this existed, a denial wrote NOTHING: the cache is only written after a SUCCESSFUL read,
+/// so dismissing the dialog guaranteed the very same dialog on the next poll tick — which is the
+/// founder's actual report ("I click Always Allow and it comes back"). 30 minutes is chosen against
+/// the two failure directions: it must comfortably outlast the 10s/60s/120s poll cadence that
+/// produced the loop, and it must be short enough that a user who then fixes the grant sees usage
+/// come back without restarting Sparkle. A SUCCESSFUL keychain read clears the marker immediately,
+/// so the window never delays a machine that has been repaired.
+const KEYCHAIN_DENIAL_BACKOFF_MS: i64 = 30 * 60 * 1000;
+
+/// The durable "macOS said no" marker for one account, written 0600 beside the token cache.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct KeychainDenial {
+    /// Epoch MILLISECONDS until which no keychain prompt may be raised for this account.
+    denied_until: i64,
+}
+
+/// Read the denial marker. `None` on any miss (absent, unreadable, malformed) — a corrupt marker
+/// degrades to "no backoff", i.e. one prompt, never to a permanent silence. Production seam for
+/// [`read_access_token_cached`]'s `read_denial`.
+fn read_denial_file(path: &Path) -> Option<KeychainDenial> {
+    serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
+}
+
+/// Record (`Some`) or CLEAR (`None`) the denial marker. Best-effort — see
+/// [`write_owner_only_best_effort`]. Production seam for [`read_access_token_cached`]'s
+/// `write_denial`.
+fn write_denial_file(path: &Path, denial: Option<&KeychainDenial>) {
+    let Some(d) = denial else {
+        // Clearing is a delete: absent is the "no backoff" state the reader already handles.
+        let _ = std::fs::remove_file(path);
+        return;
+    };
+    if let Ok(json) = serde_json::to_string(d) {
+        write_owner_only_best_effort(path, json.as_bytes());
     }
 }
 
@@ -550,38 +625,220 @@ fn resolve_config_dir_with(config_dir: &str, home: Option<&str>) -> Result<Strin
 /// same seam the tests drive — so the precedence and fallback logic (the part most likely to be
 /// wrong, and the path the default account with `config_dir: ""` depends on) is exercised without a
 /// keychain, and the production call site is not left untested by construction.
-/// Is there a usable credential for this config dir?
+/// Is there a credential for this config dir — answered WITHOUT decrypting one?
 ///
 /// Used by roborev account rotation to drop registrations that are not actually signed in. That
 /// filter is load-bearing, not cosmetic: an unauthenticated account has consumed ZERO tokens, so a
 /// headroom ranking scores it as the emptiest account available and would route every review to the
 /// one account guaranteed to fail. See [`crate::roborev_account`].
+///
+/// It asks an EXISTENCE question, and it used to answer it by DECRYPTING the token
+/// (`credential_is_usable(read_access_token(…))`). On macOS that is an in-process
+/// `SecItemCopyMatching` **with data**, from the signed Sparkle binary, against an item Sparkle is
+/// not on the ACL of — so a boolean "is this account signed in", asked on every rotation publish,
+/// cost a blocking "Sparkle wants to access key …" modal and parked the AppKit main thread until a
+/// human answered it (`sparkle-dkxuf6`). Reading the secret to answer an existence question is not a
+/// trade worth a modal, and this no longer makes it.
+///
+/// The layered probe reads a token only where one is already lying in plaintext on disk, and
+/// otherwise asks the keychain for ATTRIBUTES ONLY (see [`keychain_item_exists`]). In order:
+///  1. Sparkle's own `<dir>/.sparkle-usage-cache.json` carries a non-empty token. TRUE even when
+///     that token has LAPSED — [`cache_is_fresh`] is deliberately NOT consulted here, because a
+///     lapsed token still proves the account HAS a credential, which is the only question asked.
+///  2. `<dir>/.credentials.json` carries a non-empty token.
+///  3. A keychain ITEM exists under any candidate service for this account.
+///  4. Otherwise false.
+///
+/// FAIL OPEN on anything unanswerable — see [`credential_presence`] for why an UNKNOWN outcome must
+/// never be read as "not signed in".
 pub(crate) fn has_readable_credential(config_dir: &str) -> bool {
-    // A liveness probe, not a refresh: serve the cached token if fresh (no keychain prompt).
-    // Treat an ACL DENIAL as usable (see `credential_is_usable`) so a missing keychain grant
-    // does not silently drop the account from the rotation pool.
-    credential_is_usable(read_access_token(config_dir, false))
+    let home = std::env::var("HOME").ok();
+    let user = std::env::var("USER").ok();
+    has_readable_credential_with(
+        config_dir,
+        home.as_deref(),
+        user.as_deref(),
+        read_cache_file,
+        |p| std::fs::read_to_string(p),
+        keychain_item_exists,
+    )
 }
 
-/// Decide the sign-in filter from a token read. PURE, so the three outcomes are testable without a
-/// keychain — and the middle one is the point:
-///  * `Ok` → signed in.
-///  * an ACL DENIAL → **UNKNOWN, and we keep the account.** Sparkle could not read the credential,
-///    but `claude` — which owns that keychain item — still can, so the account is very likely usable.
-///    Reading a denial as "not signed in" silently shrinks the rotation pool by every account whose
-///    ACL grant is missing, which on an unattended machine is potentially all of them.
-///  * any other error → not signed in.
-fn credential_is_usable(read: Result<String, String>) -> bool {
-    match read {
-        Ok(_) => true,
-        Err(e) => is_keychain_permission_error(&e),
+/// Whether a keychain ITEM exists for one (service, account) pair. The answer to the existence
+/// question — never the secret.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ItemPresence {
+    /// An item is stored under this service/account.
+    Present,
+    /// The keychain answered, and nothing is stored here.
+    Absent,
+    /// We could not look — a query error, no `USER`, or a platform with no attributes-only probe.
+    /// UNKNOWN, which is emphatically not "no".
+    Unknown,
+}
+
+/// [`has_readable_credential`] with its three IO seams injected, so every layer AND its
+/// short-circuit is testable without a keychain.
+fn has_readable_credential_with(
+    config_dir: &str,
+    home: Option<&str>,
+    user: Option<&str>,
+    read_cache: impl Fn(&Path) -> Option<CachedCreds>,
+    read_file: impl Fn(&Path) -> std::io::Result<String>,
+    item_exists: impl Fn(&str, &str) -> ItemPresence,
+) -> bool {
+    let was_empty = config_dir.is_empty();
+    // Cannot even resolve the dir (no HOME for the default account) → we could not look at all.
+    // UNKNOWN, and unknown keeps the account: see `credential_presence`.
+    let Ok(dir) = resolve_config_dir_with(config_dir, home) else {
+        return true;
+    };
+
+    // (a) Sparkle's own cache. Freshness deliberately NOT required — see the doc above.
+    let cache_has_token = read_cache(&Path::new(&dir).join(SPARKLE_USAGE_CACHE_FILE))
+        .is_some_and(|c| !c.access_token.is_empty());
+
+    // (b) The account's own plaintext credentials file.
+    let creds_has_token = read_file(&Path::new(&dir).join(".credentials.json"))
+        .ok()
+        .and_then(|blob| extract_access_token(&blob))
+        .is_some();
+
+    credential_presence(cache_has_token, creds_has_token, || {
+        // (c) The keychain, ATTRIBUTES ONLY. Probing EVERY candidate service is free here precisely
+        // because an attributes query is not ACL-gated: unlike the data read (which stops on the
+        // first denial to avoid a second modal — see `read_access_token_cached`), it cannot raise a
+        // dialog at all, so the default account's two candidates cost nothing.
+        let Some(user) = user.filter(|u| !u.is_empty()) else {
+            return ItemPresence::Unknown;
+        };
+        let mut outcome = ItemPresence::Absent;
+        for service in keychain_services(was_empty, &dir) {
+            match item_exists(&service, user) {
+                ItemPresence::Present => return ItemPresence::Present,
+                // One service being unanswerable poisons an otherwise-absent verdict: we cannot
+                // claim "nothing is stored anywhere" when one of the places went unread.
+                ItemPresence::Unknown => outcome = ItemPresence::Unknown,
+                ItemPresence::Absent => {}
+            }
+        }
+        outcome
+    })
+}
+
+/// Decide the sign-in filter from the layered probes. PURE — the keychain layer arrives as a
+/// closure, so "the on-disk layers short-circuit before anything asks the keychain" is a structural
+/// property a test can assert with a call counter rather than a mock that panics.
+///
+/// The UNKNOWN case is the point, and it is inherited verbatim from the ACL-denial reasoning this
+/// replaced: Sparkle failing to establish whether an item exists says nothing about whether `claude`
+/// — which owns the item — can still use it. Reading unknown as "not signed in" silently shrinks
+/// roborev's rotation pool by every account we could not probe, which on an unattended machine is
+/// potentially all of them, leaving a pool of zero.
+fn credential_presence(
+    cache_has_token: bool,
+    creds_has_token: bool,
+    keychain: impl FnOnce() -> ItemPresence,
+) -> bool {
+    if cache_has_token || creds_has_token {
+        return true;
+    }
+    match keychain() {
+        // The item is there. Whether its DATA would be released to us is a different question, and
+        // deliberately not asked: an ACL-denied item still belongs to a signed-in account.
+        ItemPresence::Present => true,
+        ItemPresence::Unknown => true,
+        ItemPresence::Absent => false,
     }
 }
 
-/// Read the account's OAuth access token. `bypass_cache` skips serving Sparkle's cached token (the
-/// forced "Refresh usage" path) — it still writes the cache on a successful read, and never deletes
-/// it, so a failed forced read leaves any prior cached token intact.
-fn read_access_token(config_dir: &str, bypass_cache: bool) -> Result<String, String> {
+/// `errSecItemNotFound` from Apple's `SecBase.h` — the one status that PROVES nothing is stored.
+#[cfg(target_os = "macos")]
+const ERR_SEC_ITEM_NOT_FOUND: i32 = -25300;
+
+/// Does a generic-password item EXIST for this (service, account)? ATTRIBUTES ONLY — never the data.
+///
+/// This is the one keychain query in this module that is deliberately not a secret read: it asks
+/// `SecItemCopyMatching` for `kSecReturnAttributes` and never sets `kSecReturnData` (verified in
+/// `security_framework::item::ItemSearchOptions::to_dictionary` — `load_data` is the only thing that
+/// adds that key). The macOS ACL gate is on RELEASING THE DATA, so an attributes query is answered
+/// out of the keychain index with no authorization check and therefore no modal. That asymmetry is
+/// the whole reason the existence question can be answered where the decryption cannot.
+///
+/// Any failure other than "no such item" is [`ItemPresence::Unknown`], never `Absent`: an
+/// unanswerable probe must not read as "this account is signed out".
+#[cfg(target_os = "macos")]
+fn keychain_item_exists(service: &str, account: &str) -> ItemPresence {
+    use security_framework::item::{ItemClass, ItemSearchOptions};
+    let mut opts = ItemSearchOptions::new();
+    opts.class(ItemClass::generic_password())
+        .service(service)
+        .account(account)
+        .load_attributes(true)
+        .limit(1);
+    match opts.search() {
+        Ok(found) if found.is_empty() => ItemPresence::Absent,
+        Ok(_) => ItemPresence::Present,
+        Err(e) if e.code() == ERR_SEC_ITEM_NOT_FOUND => ItemPresence::Absent,
+        Err(_) => ItemPresence::Unknown,
+    }
+}
+
+/// No attributes-only keychain probe outside macOS (the prompt this exists to avoid is a macOS
+/// phenomenon). Fail OPEN rather than dropping every account from the rotation pool.
+#[cfg(not(target_os = "macos"))]
+fn keychain_item_exists(_service: &str, _account: &str) -> ItemPresence {
+    ItemPresence::Unknown
+}
+
+/// Whether a token read is allowed to reach the macOS keychain.
+///
+/// The live-usage poll chain is 10s (`ProviderUnavailableBanner`/`usageLimit`), 60s (`useLimitSync`)
+/// and 120s (`useAccountSwitch`), all funnelling into `loadAccountState → refreshLiveUsage` — ONE
+/// keychain-eligible read PER ACCOUNT, throttled only by the TTL cache. So the moment a token
+/// lapses, that cadence turns into a modal per account, forever, with nobody having asked for one.
+/// This enum is what makes the poll path structurally incapable of prompting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TokenAccess {
+    /// May read Sparkle's TTL cache and `<dir>/.credentials.json`. MUST NOT touch the keychain,
+    /// ever. On a miss it returns an `Err` starting [`USAGE_UNKNOWN_PREFIX`] and the UI degrades to
+    /// an unknown reading — an accepted trade: usage may read unknown until the user asks once.
+    Quiet,
+    /// May read the keychain, and therefore may raise a macOS prompt. Reserved for an explicitly
+    /// user-initiated action. It also BYPASSES the TTL cache: the user asked for a real re-check,
+    /// which is both what makes a prompt acceptable and what makes serving a cached token wrong.
+    Interactive,
+}
+
+impl TokenAccess {
+    /// May the TTL cache serve this read? Only `Quiet` reads it. `Interactive` SKIPS it — skips,
+    /// never deletes, so a forced read that then fails leaves the prior cached token in place.
+    fn may_serve_cache(self) -> bool {
+        matches!(self, Self::Quiet)
+    }
+
+    /// May this read reach the keychain?
+    fn may_read_keychain(self) -> bool {
+        matches!(self, Self::Interactive)
+    }
+}
+
+/// Stable prefix for the error a QUIET read returns when it cannot answer without the keychain.
+///
+/// The frontend keys on this exact spelling to render "usage unknown" plus the affordance that runs
+/// an [`TokenAccess::Interactive`] read, so it is a wire contract: do not reword it.
+const USAGE_UNKNOWN_PREFIX: &str = "usage unknown: ";
+
+/// Prefix for the refusal when a keychain read would have run on the AppKit main thread. Distinct
+/// and matchable so it is never confused with a denial or an absence — it is a Sparkle-side bug
+/// report, not a statement about the account.
+const KEYCHAIN_MAIN_THREAD_PREFIX: &str = "keychain read refused on the main thread";
+
+/// Read the account's OAuth access token under `access` — see [`TokenAccess`].
+///
+/// A thin wrapper over [`read_access_token_cached`] that passes the REAL environment, clock, IO and
+/// main-thread answer through the same seams the tests drive.
+fn read_access_token(config_dir: &str, access: TokenAccess) -> Result<String, String> {
     let home = std::env::var("HOME").ok();
     let user = std::env::var("USER").ok();
     read_access_token_cached(
@@ -589,7 +846,8 @@ fn read_access_token(config_dir: &str, bypass_cache: bool) -> Result<String, Str
         home.as_deref(),
         user.as_deref(),
         now_epoch_ms(),
-        bypass_cache,
+        access,
+        crate::cmd_timing::on_main_thread(),
         read_cache_file,
         write_cache_file,
         |p| std::fs::read_to_string(p),
@@ -598,6 +856,8 @@ fn read_access_token(config_dir: &str, bypass_cache: bool) -> Result<String, Str
                 .map_err(|e| KeychainMiss::Other(e.to_string()))?;
             entry.get_password().map_err(classify_keychain_error)
         },
+        read_denial_file,
+        write_denial_file,
     )
 }
 
@@ -646,9 +906,14 @@ fn classify_keychain_error(err: keyring::Error) -> KeychainMiss {
     }
 }
 
-/// The precedence + fallback logic WITHOUT the Sparkle cache — kept as a thin wrapper over
-/// [`read_access_token_cached`] with the cache disabled (never a cache hit, writes discarded), so the
-/// existing creds-file → keychain precedence tests exercise exactly that path unchanged.
+/// The precedence + fallback logic WITHOUT the Sparkle cache — a thin wrapper over
+/// [`read_access_token_cached`] with the cache disabled (never a cache hit, writes discarded) and no
+/// denial marker on disk, so the creds-file → keychain precedence tests exercise exactly that path.
+///
+/// It reads as [`TokenAccess::Interactive`] off the main thread, because those tests are about the
+/// keychain PROBE ORDER and a `Quiet` read never reaches the probe at all. The Quiet/Interactive
+/// split and the main-thread guard have their own paired tests against
+/// [`read_access_token_cached`] directly.
 #[cfg(test)]
 fn read_access_token_with(
     config_dir: &str,
@@ -662,11 +927,14 @@ fn read_access_token_with(
         home,
         user,
         0,
+        TokenAccess::Interactive,
         false,
         |_p| None,
         |_p, _c| {},
         read_file,
         read_keychain,
+        |_p| None,
+        |_p, _d| {},
     )
 }
 
@@ -678,34 +946,45 @@ fn read_access_token_with(
 ///  2. otherwise the keychain, trying each service in [`keychain_services`] until one yields a token.
 /// On a hit from (1) or (2) the resolved credential is WRITTEN to the cache so the next fetch takes
 /// path (0). A creds file present but carrying no usable token FALLS THROUGH to the keychain rather
-/// than failing. The `read_*`/`write_cache` params are the real implementations in production and
-/// fakes in tests.
+/// than failing. The `read_*`/`write_*` params are the real implementations in production and fakes
+/// in tests.
 ///
-/// `bypass_cache` SKIPS step (0) — the forced "Refresh usage" path reads the creds file / keychain
-/// directly instead of serving a still-fresh cached token, then rewrites the cache from what it read.
-/// It never deletes the cache, so a forced read that fails leaves the prior cached token in place.
+/// `access` gates steps (0) and (2) — see [`TokenAccess`]. [`TokenAccess::Quiet`] serves the cache
+/// and stops at step (1), returning a [`USAGE_UNKNOWN_PREFIX`] error rather than ever reaching the
+/// keychain. [`TokenAccess::Interactive`] SKIPS step (0) (the forced "Check usage levels" path reads
+/// from source, then rewrites the cache) and is the only mode that may reach step (2). It never
+/// deletes the cache, so a forced read that fails leaves the prior cached token in place.
+///
+/// `on_main_thread` is INJECTED rather than read from `crate::cmd_timing` here so the guard sits on
+/// the tested path and tests are deterministic instead of racing a process-global `OnceLock`. The
+/// production wrapper [`read_access_token`] passes `crate::cmd_timing::on_main_thread()`. The guard
+/// deliberately lives in this function and not inside the `read_keychain` closure: tests replace
+/// that closure, so a guard placed there would be untested by construction.
 #[allow(clippy::too_many_arguments)]
 fn read_access_token_cached(
     config_dir: &str,
     home: Option<&str>,
     user: Option<&str>,
     now_ms: i64,
-    bypass_cache: bool,
+    access: TokenAccess,
+    on_main_thread: bool,
     read_cache: impl Fn(&Path) -> Option<CachedCreds>,
     write_cache: impl Fn(&Path, &CachedCreds),
     read_file: impl Fn(&Path) -> std::io::Result<String>,
     read_keychain: impl Fn(&str, &str) -> Result<String, KeychainMiss>,
+    read_denial: impl Fn(&Path) -> Option<KeychainDenial>,
+    write_denial: impl Fn(&Path, Option<&KeychainDenial>),
 ) -> Result<String, String> {
     let was_empty = config_dir.is_empty();
     let dir = resolve_config_dir_with(config_dir, home)?;
 
     // 0. Sparkle's own cache FIRST — a plain file, so no keychain access and no macOS prompt. Only a
     // FRESH entry short-circuits; a stale/absent/corrupt one falls through to re-read below. SKIPPED
-    // entirely when `bypass_cache` (the forced refresh): the read falls through to the keychain so the
-    // token is re-resolved from source. The cache file is left ON DISK — not deleted — so a forced
-    // read that then fails does not cost the account its previously-working cached token.
+    // entirely by an INTERACTIVE read (the forced refresh): it falls through so the token is
+    // re-resolved from source. The cache file is left ON DISK — not deleted — so a forced read that
+    // then fails does not cost the account its previously-working cached token.
     let cache_path = Path::new(&dir).join(SPARKLE_USAGE_CACHE_FILE);
-    if !bypass_cache {
+    if access.may_serve_cache() {
         if let Some(cached) = read_cache(&cache_path) {
             if cache_is_fresh(&cached, now_ms) {
                 return Ok(cached.access_token);
@@ -726,6 +1005,46 @@ fn read_access_token_cached(
     // default account needs the BARE name first, then the hashed form — see keychain_services); the
     // first that yields a usable token wins. A missing/failed entry falls through to the next.
     if blob.is_none() {
+        // QUIET reads STOP HERE. This is the change that takes the founder's recurring modal off the
+        // 10s/60s/120s poll cadence: a lapsed token degrades to an "unknown" reading the UI can
+        // render, and the keychain is reached only when the user asks for it. See `TokenAccess`.
+        if !access.may_read_keychain() {
+            return Err(format!(
+                "{USAGE_UNKNOWN_PREFIX}no cached credential for this account (a keychain read needs \
+                 an explicit \"Check usage levels\")"
+            ));
+        }
+
+        // MAIN-THREAD GUARD. A keychain read is a synchronous XPC round trip to `securityd`; with
+        // the ACL ungranted it blocks until a human dismisses a modal. On the AppKit main thread
+        // that is the entire UI wedged — the captured stack in `sparkle-dkxuf6` is exactly this,
+        // 221 of 401 samples parked in `find_generic_password` beneath `Webview::on_message`. Refuse
+        // rather than freeze: the caller must hop to the blocking pool first (as `account_usage_live`
+        // does with `spawn_blocking`) and try again there.
+        if on_main_thread {
+            tracing::warn!(
+                "refusing a keychain credential read on the AppKit main thread: it would block every \
+                 frame until the macOS prompt is answered — run it on the blocking pool instead"
+            );
+            return Err(format!(
+                "{KEYCHAIN_MAIN_THREAD_PREFIX}: a keychain read must not run on the AppKit main thread"
+            ));
+        }
+
+        // DENIAL BACKOFF. Before this, a DENIED or dismissed prompt wrote nothing at all — the cache
+        // is only written after a SUCCESSFUL read — so dismissing the dialog GUARANTEED the same
+        // dialog on the next tick. Short-circuit while the recorded window is live, and return the
+        // denial's own prefix so callers classify it exactly as they classify a live denial.
+        let denial_path = Path::new(&dir).join(KEYCHAIN_DENIED_FILE);
+        if let Some(denial) = read_denial(&denial_path) {
+            if now_ms < denial.denied_until {
+                return Err(format!(
+                    "{KEYCHAIN_DENIED_PREFIX}: a previous prompt was declined; suppressed until {}",
+                    denial.denied_until
+                ));
+            }
+        }
+
         let user = user
             .filter(|u| !u.is_empty())
             .ok_or_else(|| "no USER env for keychain lookup".to_string())?;
@@ -757,13 +1076,28 @@ fn read_access_token_cached(
         if blob.is_none() {
             // A denial outranks an absence: it is an UNKNOWN outcome, not "this account has no
             // credential", and the prefix is what lets a caller tell the two apart.
-            if let Some(e) = denied {
-                return Err(format!("{KEYCHAIN_DENIED_PREFIX}: {e}"));
+            let err = match denied {
+                Some(e) => format!("{KEYCHAIN_DENIED_PREFIX}: {e}"),
+                None => last_err
+                    .unwrap_or_else(|| "no access token in stored credentials".to_string()),
+            };
+            // RECORD the denial durably, keyed off the SAME classifier callers use, so the next tick
+            // does not re-raise the modal the user just dismissed. An absence records nothing: it
+            // raised no dialog, so there is nothing to back off from.
+            if is_keychain_permission_error(&err) {
+                write_denial(
+                    &denial_path,
+                    Some(&KeychainDenial {
+                        denied_until: now_ms + KEYCHAIN_DENIAL_BACKOFF_MS,
+                    }),
+                );
             }
-            return Err(
-                last_err.unwrap_or_else(|| "no access token in stored credentials".to_string())
-            );
+            return Err(err);
         }
+        // The keychain RELEASED the secret, so whatever was declined before has since been granted.
+        // Clear the marker immediately rather than serving out a window that no longer describes
+        // this machine.
+        write_denial(&denial_path, None);
     }
 
     // A credential was resolved from disk or the keychain. Cache it (with its expiry) so the NEXT
@@ -783,13 +1117,14 @@ fn read_access_token_cached(
 /// On ANY failure (no token, network error, 401, unparseable body) returns `Err(String)` — the UI
 /// degrades to "usage unavailable" and the local-tally estimate remains the fallback. Never panics.
 ///
-/// `force` (default `false`, so an absent JS key behaves exactly as before) makes the token read
-/// BYPASS Sparkle's `<dir>/.sparkle-usage-cache.json`: it skips serving the cached token and reads
-/// the account's creds file / keychain directly, then rewrites the cache with whatever it read. This
-/// is the "Refresh usage" button's path — the founder wants a deliberate, keychain-backed re-check on
-/// demand, and a macOS keychain prompt on the forced read is EXPECTED and acceptable, not something
-/// to suppress. A non-forced fetch keeps serving a fresh cached token with no keychain access (the
-/// default, quiet path the per-account effect uses on every screen open).
+/// `force` (default `false`, so an absent JS key behaves exactly as before) selects the
+/// [`TokenAccess`] mode. `false` → [`TokenAccess::Quiet`]: serve the TTL cache, else the creds file,
+/// else degrade to a [`USAGE_UNKNOWN_PREFIX`] error — this path is structurally incapable of raising
+/// a keychain prompt, which is what takes the founder's recurring modal off the 10s/60s/120s poll
+/// cadence. `true` → [`TokenAccess::Interactive`]: skip the cached token and read the creds file /
+/// keychain directly, then rewrite the cache with whatever it read. That is the "Check usage levels"
+/// button's path — the founder wants a deliberate, keychain-backed re-check on demand, and a macOS
+/// prompt on THAT read is EXPECTED and acceptable, not something to suppress.
 ///
 /// HONEST SCOPE (do not overstate this): the cache holds only the OAuth **token**, never the usage
 /// figures — `http_get_usage` runs on EVERY call, forced or not — so an un-forced fetch already
@@ -811,8 +1146,12 @@ pub async fn account_usage_live(
     config_dir: String,
     force: Option<bool>,
 ) -> Result<AccountUsageLive, String> {
-    let force = force.unwrap_or(false);
-    tauri::async_runtime::spawn_blocking(move || fetch_usage_blocking(&config_dir, force))
+    let access = if force.unwrap_or(false) {
+        TokenAccess::Interactive
+    } else {
+        TokenAccess::Quiet
+    };
+    tauri::async_runtime::spawn_blocking(move || fetch_usage_blocking(&config_dir, access))
         .await
         .map_err(|e| format!("usage task failed: {e}"))?
 }
@@ -845,14 +1184,17 @@ fn http_get_usage(token: &str) -> Result<String, UsageFetchError> {
 }
 
 /// The blocking body of [`account_usage_live`]: read the token, GET the endpoint, parse. Synchronous
-/// on purpose — it runs on the blocking-task pool, never a shared async worker. `force` makes the
-/// token read bypass the TTL cache (see [`account_usage_live`]); it is threaded into the read, NOT a
-/// pre-emptive cache delete, so a failed forced read leaves the cached token intact.
-fn fetch_usage_blocking(config_dir: &str, force: bool) -> Result<AccountUsageLive, String> {
+/// on purpose — it runs on the blocking-task pool, never a shared async worker. `access` is threaded
+/// into the read (see [`account_usage_live`]), NOT a pre-emptive cache delete, so a failed forced
+/// read leaves the cached token intact.
+fn fetch_usage_blocking(
+    config_dir: &str,
+    access: TokenAccess,
+) -> Result<AccountUsageLive, String> {
     fetch_usage_with(
         config_dir,
-        force,
-        |cd, bypass_cache| read_access_token(cd, bypass_cache),
+        access,
+        |cd, access| read_access_token(cd, access),
         |cd| invalidate_cache(cd),
         |token| http_get_usage(token),
     )
@@ -864,26 +1206,31 @@ fn fetch_usage_blocking(config_dir: &str, force: bool) -> Result<AccountUsageLiv
 /// re-reads the keychain, popping exactly one prompt) and try once more. A second 401 is terminal —
 /// we never loop.
 ///
-/// `bypass_cache` is passed straight to the token read: when set, the read SKIPS Sparkle's cached
-/// token and reads the creds file / keychain directly (rewriting the cache on success). This is the
-/// forced "Refresh usage" path. Crucially it does NOT delete the cache up front — a forced read that
-/// fails leaves the prior cached token in place — which is why it is a read flag rather than the
-/// `invalidate` the 401 path (correctly) uses only after the server has PROVEN the token dead.
+/// `access` is passed straight to the token read, unchanged, on BOTH attempts. That is what keeps
+/// the 401 recovery honest: under [`TokenAccess::Quiet`] the re-read after an invalidation must not
+/// suddenly become keychain-eligible — it degrades to a [`USAGE_UNKNOWN_PREFIX`] error instead, and
+/// the retry-once-never-loop shape is unchanged. Under [`TokenAccess::Interactive`] the read SKIPS
+/// Sparkle's cached token and reads the creds file / keychain directly (rewriting the cache on
+/// success). Crucially it does NOT delete the cache up front — a forced read that fails leaves the
+/// prior cached token in place — which is why it is a read mode rather than the `invalidate` the 401
+/// path (correctly) uses only after the server has PROVEN the token dead.
 fn fetch_usage_with(
     config_dir: &str,
-    bypass_cache: bool,
-    read_token: impl Fn(&str, bool) -> Result<String, String>,
+    access: TokenAccess,
+    read_token: impl Fn(&str, TokenAccess) -> Result<String, String>,
     invalidate: impl Fn(&str),
     http_get: impl Fn(&str) -> Result<String, UsageFetchError>,
 ) -> Result<AccountUsageLive, String> {
-    let token = read_token(config_dir, bypass_cache)?;
+    let token = read_token(config_dir, access)?;
     match http_get(&token) {
         Ok(text) => parse_usage_response(&text),
         Err(UsageFetchError::Other(e)) => Err(e),
         Err(UsageFetchError::Unauthorized) => {
-            // Cached token rejected — drop the cache so the re-read hits the keychain, then retry ONCE.
+            // Cached token rejected — drop the cache so the re-read resolves from source, then retry
+            // ONCE. Quiet stays quiet: with the cache gone and no creds file, that re-read returns
+            // "usage unknown" rather than reaching for the keychain.
             invalidate(config_dir);
-            let token = read_token(config_dir, bypass_cache)?;
+            let token = read_token(config_dir, access)?;
             match http_get(&token) {
                 Ok(text) => parse_usage_response(&text),
                 Err(UsageFetchError::Other(e)) => Err(e),
@@ -1636,17 +1983,182 @@ mod tests {
     }
 
     #[test]
-    fn the_signin_filter_keeps_an_acl_denied_account_and_drops_a_credential_less_one() {
-        // The consequence of the classification, at the one place it changes production behavior:
-        // an unreadable-because-ungranted account must NOT be filtered out of roborev rotation.
-        assert!(credential_is_usable(Ok("tok".to_string())));
+    fn the_signin_filter_keeps_an_unprovable_account_and_drops_a_credential_less_one() {
+        // MEANING PRESERVED, SUBJECT MOVED. This used to assert on `credential_is_usable`, which
+        // classified the outcome of DECRYPTING the token — the read this change exists to stop. The
+        // filter's load-bearing property is unchanged and still asserted here against its new pure
+        // decision point: an account we could not disprove stays in roborev's rotation pool, and
+        // only a positively-answered absence drops one.
         assert!(
-            credential_is_usable(Err(format!("{KEYCHAIN_DENIED_PREFIX}: user declined"))),
-            "a denial is UNKNOWN, not signed-out: dropping it removes a usable account"
+            credential_presence(true, false, || panic!("the cache layer must short-circuit")),
+            "a cached token is proof enough"
         );
-        assert!(!credential_is_usable(Err(
-            "no access token in stored credentials".to_string()
-        )));
+        assert!(
+            credential_presence(false, true, || panic!("the creds-file layer must short-circuit")),
+            "a creds file with a token is proof enough"
+        );
+        assert!(
+            credential_presence(false, false, || ItemPresence::Present),
+            "an item that EXISTS means signed in, whether or not its data would be released to us"
+        );
+        assert!(
+            credential_presence(false, false, || ItemPresence::Unknown),
+            "UNKNOWN is not signed-out: dropping it removes an account `claude` can still use"
+        );
+        assert!(
+            !credential_presence(false, false, || ItemPresence::Absent),
+            "a positively-answered absence is the ONE case that drops an account"
+        );
+    }
+
+    #[test]
+    fn the_existence_probe_never_decrypts_and_a_lapsed_cached_token_still_counts() {
+        // THE POINT OF (1). A cached token answers the question with the keychain seam NEVER
+        // invoked — asserted with a COUNTER, not a panicking mock, so the paired case below can use
+        // the identical fixture. And the cached token is deliberately LAPSED (expiresAt in the far
+        // past): a token that has expired still proves the account HAS a credential, which is all
+        // `has_readable_credential` asks.
+        let probes = std::cell::Cell::new(0usize);
+        let answer = has_readable_credential_with(
+            "/cfg/a",
+            None,
+            Some("tester"),
+            |_p| {
+                Some(CachedCreds {
+                    access_token: "lapsed-but-present".to_string(),
+                    refresh_token: None,
+                    expires_at: 1, // long expired — and still proof of a credential
+                })
+            },
+            |_p| Err(std::io::Error::new(std::io::ErrorKind::NotFound, "no creds file")),
+            |_s, _u| {
+                probes.set(probes.get() + 1);
+                ItemPresence::Absent
+            },
+        );
+        assert!(answer, "a cached token — even a lapsed one — proves the account has a credential");
+        assert_eq!(
+            probes.get(),
+            0,
+            "the keychain must not be touched when a plain file already answers the question"
+        );
+    }
+
+    #[test]
+    fn the_existence_probe_does_ask_the_keychain_when_no_file_answers() {
+        // THE PAIR that makes the zero above non-vacuous: same fixture, but with NO cache entry the
+        // seam IS invoked. Without this, a `has_readable_credential` that never probed at all would
+        // pass the test above.
+        let probes = std::cell::Cell::new(0usize);
+        let answer = has_readable_credential_with(
+            "/cfg/a",
+            None,
+            Some("tester"),
+            |_p| None,
+            |_p| Err(std::io::Error::new(std::io::ErrorKind::NotFound, "no creds file")),
+            |_s, _u| {
+                probes.set(probes.get() + 1);
+                ItemPresence::Present
+            },
+        );
+        assert!(answer, "an existing keychain item means signed in");
+        assert_eq!(probes.get(), 1, "with nothing on disk the keychain MUST be probed");
+    }
+
+    #[test]
+    fn an_item_that_exists_but_whose_data_would_be_denied_still_reads_as_signed_in() {
+        // THE ATTRIBUTES-ONLY PROPERTY, at the level that matters: the answer is derived from
+        // EXISTENCE, never from readability. The seam here reports `Present` for an item whose data
+        // read would have been `KeychainMiss::Denied` — the founder's exact machine state — and the
+        // account is kept. Paired with the `Absent` case, which is the only thing that drops one, so
+        // this is not a function that returns true unconditionally.
+        let exists = has_readable_credential_with(
+            "",
+            Some("/home/tester"),
+            Some("tester"),
+            |_p| None,
+            |_p| Err(std::io::Error::new(std::io::ErrorKind::NotFound, "no creds file")),
+            |_s, _u| ItemPresence::Present,
+        );
+        assert!(exists, "an ACL-denied item still belongs to a signed-in account");
+
+        let absent = has_readable_credential_with(
+            "",
+            Some("/home/tester"),
+            Some("tester"),
+            |_p| None,
+            |_p| Err(std::io::Error::new(std::io::ErrorKind::NotFound, "no creds file")),
+            |_s, _u| ItemPresence::Absent,
+        );
+        assert!(!absent, "nothing anywhere means the account really is not signed in");
+    }
+
+    #[test]
+    fn the_existence_probe_asks_every_candidate_service_and_fails_open_without_a_user() {
+        // Attributes-only probes raise no dialog, so unlike the DATA read (which stops on the first
+        // denial to avoid a second modal) the default account's two candidate services are both
+        // asked. Asserts the services BY NAME, so a probe that silently asked only one — the bug
+        // shape that once missed the default account's bare-name credential — fails here.
+        let asked = std::cell::RefCell::new(Vec::<String>::new());
+        let answer = has_readable_credential_with(
+            "",
+            Some("/home/tester"),
+            Some("tester"),
+            |_p| None,
+            |_p| Err(std::io::Error::new(std::io::ErrorKind::NotFound, "no creds file")),
+            |service, user| {
+                assert_eq!(user, "tester");
+                asked.borrow_mut().push(service.to_string());
+                ItemPresence::Absent
+            },
+        );
+        assert!(!answer);
+        assert_eq!(
+            asked.borrow().as_slice(),
+            &[
+                BARE_KEYCHAIN_SERVICE.to_string(),
+                keychain_service("/home/tester/.claude"),
+            ],
+            "the default account must probe the bare service AND the hashed fallback"
+        );
+
+        // No USER → we could not look → UNKNOWN → keep the account, and never call the seam.
+        let probes = std::cell::Cell::new(0usize);
+        let unknown = has_readable_credential_with(
+            "/cfg/a",
+            None,
+            None,
+            |_p| None,
+            |_p| Err(std::io::Error::new(std::io::ErrorKind::NotFound, "no creds file")),
+            |_s, _u| {
+                probes.set(probes.get() + 1);
+                ItemPresence::Absent
+            },
+        );
+        assert!(unknown, "no USER is an unanswerable probe, and unknown keeps the account");
+        assert_eq!(probes.get(), 0, "there is no account name to probe with");
+    }
+
+    #[test]
+    fn one_unanswerable_service_poisons_an_otherwise_absent_verdict() {
+        // Non-vacuous against the `Absent`-everywhere case above: if ANY candidate went unread we
+        // cannot claim "nothing is stored anywhere", so the verdict must be UNKNOWN (keep), not
+        // absent (drop). A `fold` that let the last service win would drop the account here.
+        let answer = has_readable_credential_with(
+            "",
+            Some("/home/tester"),
+            Some("tester"),
+            |_p| None,
+            |_p| Err(std::io::Error::new(std::io::ErrorKind::NotFound, "no creds file")),
+            |service, _u| {
+                if service == BARE_KEYCHAIN_SERVICE {
+                    ItemPresence::Unknown
+                } else {
+                    ItemPresence::Absent
+                }
+            },
+        );
+        assert!(answer, "an unread candidate must not be reported as a proven absence");
     }
 
     #[test]
@@ -1726,7 +2238,8 @@ mod tests {
             None,
             Some("tester"),
             now,
-            false, // not a forced refresh → the fresh cache is allowed to serve
+            TokenAccess::Quiet, // the poll path → the fresh cache is allowed to serve
+            false,              // off the main thread; the guard is not what this test is about
             move |_p| {
                 Some(CachedCreds {
                     access_token: "cached-token".to_string(),
@@ -1737,19 +2250,21 @@ mod tests {
             |_p, _c| panic!("must not WRITE the cache when a fresh entry already served the token"),
             |_p| panic!("must not read the creds file when the cache is fresh"),
             |_s, _u| panic!("must not read the keychain when the cache is fresh"),
+            |_p| panic!("must not consult the denial marker when the cache is fresh"),
+            |_p, _d| panic!("must not write the denial marker when the cache is fresh"),
         )
         .unwrap();
         assert_eq!(token, "cached-token");
     }
 
     #[test]
-    fn bypass_cache_skips_a_fresh_cache_reads_the_keychain_and_does_not_delete() {
-        // THE FORCED "Refresh usage" PATH, non-destructive. Same fresh cache as the test above, but
-        // bypass_cache=true: the fresh entry must NOT be served (the keychain IS read), the freshly
+    fn an_interactive_read_skips_a_fresh_cache_reads_the_keychain_and_does_not_delete() {
+        // THE FORCED "Check usage levels" PATH, non-destructive. Same fresh cache as the test above,
+        // but Interactive: the fresh entry must NOT be served (the keychain IS read), the freshly
         // read token is returned and REWRITTEN to the cache, and — the non-destructive property that
         // the review flagged — nothing ever deletes the cache file (there is no invalidate seam in
-        // this read path at all). Non-vacuous against the previous test: flip bypass_cache back to
-        // false with this exact setup and the keychain closure's panic fires instead.
+        // this read path at all). Non-vacuous against the previous test: flip the mode back to Quiet
+        // with this exact setup and the read returns "usage unknown" instead.
         let now = 1_000_000i64;
         let wrote: RefCell<Option<CachedCreds>> = RefCell::new(None);
         let token = read_access_token_cached(
@@ -1757,7 +2272,8 @@ mod tests {
             None,
             Some("tester"),
             now,
-            true, // forced refresh → skip the fresh cache, read the keychain
+            TokenAccess::Interactive, // forced refresh → skip the fresh cache, read the keychain
+            false,
             move |_p| {
                 Some(CachedCreds {
                     access_token: "stale-but-cached".to_string(),
@@ -1770,6 +2286,8 @@ mod tests {
             |_s, _u| {
                 Ok(r#"{"claudeAiOauth":{"accessToken":"forced-from-keychain","expiresAt":9999999999999}}"#.to_string())
             },
+            |_p| None,
+            |_p, _d| {},
         )
         .unwrap();
         // Returned the KEYCHAIN token, not the (still-fresh) cached one — the cache was bypassed.
@@ -1780,10 +2298,14 @@ mod tests {
     }
 
     #[test]
-    fn stale_cache_falls_back_to_keychain_and_repopulates_the_cache() {
-        // (b) A cache entry whose token has lapsed must NOT be served. We fall through to the keychain
-        // and REWRITE the cache with the freshly-read credential (token + its expiresAt), so the very
-        // next fetch takes the cache path again. Asserts the WRITE side effect, not just the return.
+    fn a_lapsed_cache_is_replaced_by_the_full_credential_the_keychain_returns() {
+        // (b) A cache entry whose token has lapsed must NOT be served. UPDATED DELIBERATELY: this
+        // used to run un-forced, because an un-forced read was allowed to reach the keychain. It no
+        // longer is — a lapsed token on the poll path now degrades to "usage unknown", which is
+        // asserted by its own paired test below — so the fall-through-and-repopulate behaviour this
+        // test guards now lives on the Interactive path. What it uniquely covers is the WRITE: the
+        // FULL triple (token + refreshToken + expiresAt) is rewritten, so the very next quiet fetch
+        // is served from the cache again.
         let now = 2_000_000i64;
         let written: RefCell<Option<CachedCreds>> = RefCell::new(None);
         let token = read_access_token_cached(
@@ -1791,7 +2313,8 @@ mod tests {
             None,
             Some("tester"),
             now,
-            false, // stale-cache fallback is exercised without forcing
+            TokenAccess::Interactive,
+            false,
             move |_p| {
                 Some(CachedCreds {
                     access_token: "expired-cached".to_string(),
@@ -1804,6 +2327,8 @@ mod tests {
             |_s, _u| {
                 Ok(r#"{"claudeAiOauth":{"accessToken":"fresh-from-keychain","refreshToken":"kc-refresh","expiresAt":9999999999999}}"#.to_string())
             },
+            |_p| None,
+            |_p, _d| {},
         )
         .unwrap();
         // Returned the keychain token, NOT the stale cached one.
@@ -1817,14 +2342,18 @@ mod tests {
 
     #[test]
     fn absent_cache_reads_keychain_and_writes_the_cache() {
-        // No cache file at all (cold start) → keychain read, and the cache is created.
+        // No cache file at all (cold start) → keychain read, and the cache is created. UPDATED
+        // DELIBERATELY to Interactive: a cold start on the POLL path must not reach the keychain at
+        // all any more (see the Quiet/Interactive pair below), so the cold-start population this
+        // test guards is now the user-initiated read's job.
         let wrote = RefCell::new(false);
         let token = read_access_token_cached(
             "",
             Some("/home/tester"),
             Some("tester"),
             0,
-            false, // cold start (no cache file) — bypass is irrelevant here
+            TokenAccess::Interactive,
+            false,
             |_p| None,
             |_p, c| {
                 assert_eq!(c.access_token, "default-token");
@@ -1838,10 +2367,325 @@ mod tests {
                     Err(KeychainMiss::NoEntry)
                 }
             },
+            |_p| None,
+            |_p, _d| {},
         )
         .unwrap();
         assert_eq!(token, "default-token");
         assert!(wrote.into_inner(), "cold-start read must populate the cache");
+    }
+
+    // ---- Quiet vs Interactive: the poll path may never prompt ------------------------------------
+
+    /// The fixture both halves of the Quiet/Interactive pair run against: nothing cached, no creds
+    /// file, and a keychain that WOULD answer. Returns `(result, keychain call count)`.
+    fn read_with_nothing_on_disk(
+        access: TokenAccess,
+        on_main_thread: bool,
+    ) -> (Result<String, String>, usize) {
+        let calls = std::cell::Cell::new(0usize);
+        let out = read_access_token_cached(
+            "/cfg/a",
+            None,
+            Some("tester"),
+            1_000_000,
+            access,
+            on_main_thread,
+            |_p| None,
+            |_p, _c| {},
+            |_p| Err(std::io::Error::new(std::io::ErrorKind::NotFound, "no creds file")),
+            |_s, _u| {
+                calls.set(calls.get() + 1);
+                Ok(r#"{"claudeAiOauth":{"accessToken":"from-keychain","expiresAt":9999999999999}}"#
+                    .to_string())
+            },
+            |_p| None,
+            |_p, _d| {},
+        );
+        (out, calls.get())
+    }
+
+    #[test]
+    fn a_quiet_read_with_nothing_cached_degrades_to_usage_unknown_and_never_asks_the_keychain() {
+        // THE POINT OF (2). The 10s/60s/120s poll chain funnels one token read per account into this
+        // path; the moment a token lapses, ANY keychain eligibility here is a modal per account
+        // forever. Assert the SIDE EFFECT (the seam was not called), not just the error text.
+        let (out, calls) = read_with_nothing_on_disk(TokenAccess::Quiet, false);
+        assert_eq!(calls, 0, "a Quiet read must never reach the keychain");
+        let err = out.unwrap_err();
+        assert!(
+            err.starts_with(USAGE_UNKNOWN_PREFIX),
+            "the frontend keys on this exact prefix; got {err:?}"
+        );
+    }
+
+    #[test]
+    fn an_interactive_read_on_the_same_fixture_does_reach_the_keychain() {
+        // THE PAIR that makes the zero above non-vacuous. Identical fixture, only the mode differs:
+        // the user-initiated read DOES consult the keychain and returns the token. Without this, a
+        // build that had simply deleted the keychain probe would pass the Quiet test.
+        let (out, calls) = read_with_nothing_on_disk(TokenAccess::Interactive, false);
+        assert_eq!(calls, 1, "the user asked for a real re-check: the keychain must be read");
+        assert_eq!(out.unwrap(), "from-keychain");
+    }
+
+    #[test]
+    fn a_quiet_read_is_still_served_by_the_creds_file() {
+        // Quiet is not "read nothing": the plaintext credentials file is a plain file like the cache,
+        // so it still answers with no prompt. Non-vacuous against the degrade test above, which uses
+        // the same fixture minus this file.
+        let calls = std::cell::Cell::new(0usize);
+        let token = read_access_token_cached(
+            "/cfg/a",
+            None,
+            Some("tester"),
+            1_000_000,
+            TokenAccess::Quiet,
+            false,
+            |_p| None,
+            |_p, _c| {},
+            |_p| Ok(r#"{"claudeAiOauth":{"accessToken":"from-creds-file"}}"#.to_string()),
+            |_s, _u| {
+                calls.set(calls.get() + 1);
+                Ok("unused".to_string())
+            },
+            |_p| None,
+            |_p, _d| {},
+        )
+        .unwrap();
+        assert_eq!(token, "from-creds-file");
+        assert_eq!(calls.get(), 0, "the creds file answered; nothing may touch the keychain");
+    }
+
+    // ---- the AppKit main-thread guard -----------------------------------------------------------
+
+    #[test]
+    fn an_interactive_read_on_the_main_thread_is_refused_before_the_keychain() {
+        // THE POINT OF (3). A keychain read is a synchronous XPC round trip to securityd that, with
+        // the ACL ungranted, blocks until a human answers a modal — the captured stack has it parked
+        // on com.apple.main-thread beneath Webview::on_message. Refuse rather than freeze, and prove
+        // it by the SIDE EFFECT: the seam is never reached, so nothing can block.
+        let (out, calls) = read_with_nothing_on_disk(TokenAccess::Interactive, true);
+        assert_eq!(calls, 0, "the guard must fire BEFORE the blocking call, not around it");
+        let err = out.unwrap_err();
+        assert!(
+            err.starts_with(KEYCHAIN_MAIN_THREAD_PREFIX),
+            "the refusal needs its own matchable prefix; got {err:?}"
+        );
+        assert!(
+            !is_keychain_permission_error(&err),
+            "this is a Sparkle-side thread bug, NOT a statement about the account's ACL"
+        );
+    }
+
+    #[test]
+    fn the_same_interactive_read_off_the_main_thread_proceeds() {
+        // THE PAIR. Identical fixture with on_main_thread=false: the read goes through. Without it,
+        // a guard that refused unconditionally — or an implementation with no keychain probe left at
+        // all — would pass the test above.
+        let (out, calls) = read_with_nothing_on_disk(TokenAccess::Interactive, false);
+        assert_eq!(calls, 1, "off the main thread there is nothing to refuse");
+        assert_eq!(out.unwrap(), "from-keychain");
+    }
+
+    #[test]
+    fn the_main_thread_guard_does_not_block_a_read_a_plain_file_can_answer() {
+        // The guard is scoped to the KEYCHAIN probe, not to the whole read: a cached token is a plain
+        // 0600 file and cannot stall on securityd, so it must still be served on the main thread.
+        // Non-vacuous against the refusal test: same on_main_thread=true, different fixture.
+        let now = 1_000_000i64;
+        let token = read_access_token_cached(
+            "/cfg/a",
+            None,
+            Some("tester"),
+            now,
+            TokenAccess::Quiet,
+            true,
+            move |_p| {
+                Some(CachedCreds {
+                    access_token: "cached-on-main".to_string(),
+                    refresh_token: None,
+                    expires_at: now + 10 * 60 * 1000,
+                })
+            },
+            |_p, _c| {},
+            |_p| Err(std::io::Error::new(std::io::ErrorKind::NotFound, "no creds file")),
+            |_s, _u| panic!("no keychain read is involved here"),
+            |_p| None,
+            |_p, _d| {},
+        )
+        .unwrap();
+        assert_eq!(token, "cached-on-main");
+    }
+
+    // ---- denial backoff --------------------------------------------------------------------------
+
+    /// Run an Interactive keychain read against a machine that DENIES the item, with the denial
+    /// marker's read/write injected. Returns `(result, keychain calls, what was written)`.
+    #[allow(clippy::type_complexity)]
+    fn read_against_a_denying_keychain(
+        now_ms: i64,
+        recorded: Option<KeychainDenial>,
+    ) -> (Result<String, String>, usize, Option<Option<KeychainDenial>>) {
+        let calls = std::cell::Cell::new(0usize);
+        let wrote: RefCell<Option<Option<KeychainDenial>>> = RefCell::new(None);
+        let out = read_access_token_cached(
+            "/cfg/a",
+            None,
+            Some("tester"),
+            now_ms,
+            TokenAccess::Interactive,
+            false,
+            |_p| None,
+            |_p, _c| {},
+            |_p| Err(std::io::Error::new(std::io::ErrorKind::NotFound, "no creds file")),
+            |_s, _u| {
+                calls.set(calls.get() + 1);
+                Err(KeychainMiss::Denied("user declined".to_string()))
+            },
+            move |_p| recorded,
+            |_p, d| *wrote.borrow_mut() = Some(d.copied()),
+        );
+        (out, calls.get(), wrote.into_inner())
+    }
+
+    #[test]
+    fn a_declined_prompt_is_recorded_so_the_next_tick_does_not_re_raise_it() {
+        // THE BUG (4) FIXES: a denial used to write NOTHING — the cache is only written after a
+        // SUCCESSFUL read — so dismissing the dialog guaranteed the same dialog next tick. Assert the
+        // WRITE, and assert the deadline it carries.
+        let now = 5_000_000i64;
+        let (out, calls, wrote) = read_against_a_denying_keychain(now, None);
+        assert_eq!(calls, 1, "with no marker on disk the probe must actually run");
+        assert!(is_keychain_permission_error(&out.unwrap_err()));
+        assert_eq!(
+            wrote,
+            Some(Some(KeychainDenial {
+                denied_until: now + KEYCHAIN_DENIAL_BACKOFF_MS
+            })),
+            "a denial must be recorded durably, with a real deadline"
+        );
+    }
+
+    #[test]
+    fn a_live_denial_backoff_short_circuits_before_the_keychain() {
+        // Inside the window: the probe must not run at all. Asserted by the CALL COUNTER, so a build
+        // that read the marker and then prompted anyway fails here.
+        let now = 5_000_000i64;
+        let (out, calls, wrote) = read_against_a_denying_keychain(
+            now,
+            Some(KeychainDenial {
+                denied_until: now + 1,
+            }),
+        );
+        assert_eq!(calls, 0, "inside the backoff window nothing may reach the keychain");
+        assert!(
+            is_keychain_permission_error(&out.unwrap_err()),
+            "a suppressed read is a denial outcome, so callers classify it exactly as one"
+        );
+        assert_eq!(
+            wrote, None,
+            "the short-circuit must NOT re-record, or the window would roll forward forever"
+        );
+    }
+
+    #[test]
+    fn an_expired_denial_backoff_lets_the_keychain_be_asked_again() {
+        // THE PAIR that makes the zero above non-vacuous: the same marker, one millisecond past its
+        // deadline, and the probe runs again. Without this, "never probe once a marker exists" would
+        // pass the test above and lock the account out permanently.
+        let now = 5_000_000i64;
+        let (_out, calls, _wrote) = read_against_a_denying_keychain(
+            now,
+            Some(KeychainDenial {
+                denied_until: now, // now is NOT < denied_until → expired
+            }),
+        );
+        assert_eq!(calls, 1, "past the deadline the user gets to be asked again");
+    }
+
+    #[test]
+    fn a_successful_keychain_read_clears_the_denial_record() {
+        // The other direction: once macOS releases the secret, the recorded window no longer
+        // describes this machine and must be cleared IMMEDIATELY — otherwise a user who clicks
+        // "Always Allow" keeps being told "usage unknown" for the rest of the window.
+        let wrote: RefCell<Option<Option<KeychainDenial>>> = RefCell::new(None);
+        let token = read_access_token_cached(
+            "/cfg/a",
+            None,
+            Some("tester"),
+            5_000_000,
+            TokenAccess::Interactive,
+            false,
+            |_p| None,
+            |_p, _c| {},
+            |_p| Err(std::io::Error::new(std::io::ErrorKind::NotFound, "no creds file")),
+            |_s, _u| {
+                Ok(r#"{"claudeAiOauth":{"accessToken":"granted","expiresAt":9999999999999}}"#
+                    .to_string())
+            },
+            |_p| None,
+            |_p, d| *wrote.borrow_mut() = Some(d.copied()),
+        )
+        .unwrap();
+        assert_eq!(token, "granted");
+        assert_eq!(
+            wrote.into_inner(),
+            Some(None),
+            "a successful read must CLEAR the marker (None = delete), not leave it standing"
+        );
+    }
+
+    #[test]
+    fn an_absent_credential_records_no_denial() {
+        // Non-vacuous against the recording test: an ABSENCE raised no dialog, so there is nothing to
+        // back off from. A build that recorded on every failed read would silently suppress the
+        // keychain for accounts that were merely not stored there yet.
+        let wrote: RefCell<Option<Option<KeychainDenial>>> = RefCell::new(None);
+        let err = read_access_token_cached(
+            "/cfg/a",
+            None,
+            Some("tester"),
+            5_000_000,
+            TokenAccess::Interactive,
+            false,
+            |_p| None,
+            |_p, _c| {},
+            |_p| Err(std::io::Error::new(std::io::ErrorKind::NotFound, "no creds file")),
+            |_s, _u| Err(KeychainMiss::NoEntry),
+            |_p| None,
+            |_p, d| *wrote.borrow_mut() = Some(d.copied()),
+        )
+        .unwrap_err();
+        assert!(!is_keychain_permission_error(&err));
+        assert_eq!(wrote.into_inner(), None, "an absence must not arm the backoff");
+    }
+
+    #[test]
+    fn the_denial_marker_round_trips_at_0600_with_a_camel_case_key() {
+        // The on-disk marker must be same-user-only and readable back by our own reader, and its key
+        // is `deniedUntil` — pinned because the file is the contract between two Sparkle runs.
+        let dir = std::env::temp_dir().join(format!("sparkle-denial-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(KEYCHAIN_DENIED_FILE);
+        let denial = KeychainDenial {
+            denied_until: 1_712_000_000_000,
+        };
+        write_denial_file(&path, Some(&denial));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "the denial marker must be mode 0600");
+        }
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("deniedUntil"), "expected a camelCase key, got {raw}");
+        assert_eq!(read_denial_file(&path), Some(denial));
+
+        // Clearing deletes it, and the reader then reports "no backoff" rather than erroring.
+        write_denial_file(&path, None);
+        assert_eq!(read_denial_file(&path), None);
+        let _ = std::fs::remove_dir(&dir);
     }
 
     #[test]
@@ -1854,8 +2698,8 @@ mod tests {
         let invalidated = RefCell::new(false);
         let out = fetch_usage_with(
             "/cfg/a",
-            false,
-            |_cd, _bypass| {
+            TokenAccess::Quiet,
+            |_cd, _access| {
                 let mut n = reads.borrow_mut();
                 *n += 1;
                 Ok(if *n == 1 {
@@ -1887,8 +2731,8 @@ mod tests {
         let invalidated = RefCell::new(false);
         let err = fetch_usage_with(
             "/cfg/a",
-            false,
-            |_cd, _bypass| {
+            TokenAccess::Quiet,
+            |_cd, _access| {
                 *reads.borrow_mut() += 1;
                 Ok("tok".to_string())
             },
@@ -1908,8 +2752,8 @@ mod tests {
         let reads = RefCell::new(0);
         let err = fetch_usage_with(
             "/cfg/a",
-            false,
-            |_cd, _bypass| {
+            TokenAccess::Quiet,
+            |_cd, _access| {
                 *reads.borrow_mut() += 1;
                 Ok("tok".to_string())
             },
@@ -1922,20 +2766,20 @@ mod tests {
     }
 
     #[test]
-    fn fetch_threads_bypass_cache_into_the_token_read_and_never_pre_invalidates() {
-        // THE PLUMBING that carries the "Refresh usage" force flag: fetch_usage_with must hand its
-        // `bypass_cache` straight to the token read (so the read skips the cached token) and must NOT
-        // invalidate up front on the happy path — the review flagged the old pre-invalidate as
-        // destructive-on-failure. Non-vacuous: the read closure records the bypass value it received,
-        // and the invalidate seam records if it ran. force=true → read saw bypass=true, invalidate
-        // never ran; the paired false case below proves the flag, not a hard-coded value, drives it.
-        let saw_bypass = RefCell::new(None);
+    fn fetch_threads_interactive_into_the_token_read_and_never_pre_invalidates() {
+        // THE PLUMBING that carries the "Check usage levels" force flag: fetch_usage_with must hand
+        // its `access` straight to the token read (so the read skips the cached token and may reach
+        // the keychain) and must NOT invalidate up front on the happy path — the review flagged the
+        // old pre-invalidate as destructive-on-failure. Non-vacuous: the read closure records the
+        // mode it received, and the invalidate seam records if it ran. The paired Quiet case below
+        // proves the value tracks the argument rather than being hard-coded.
+        let saw_access = RefCell::new(None);
         let invalidated = RefCell::new(false);
         let out = fetch_usage_with(
             "/cfg/a",
-            true,
-            |_cd, bypass| {
-                *saw_bypass.borrow_mut() = Some(bypass);
+            TokenAccess::Interactive,
+            |_cd, access| {
+                *saw_access.borrow_mut() = Some(access);
                 Ok("tok".to_string())
             },
             |_cd| *invalidated.borrow_mut() = true,
@@ -1943,7 +2787,11 @@ mod tests {
         )
         .expect("a forced fetch must succeed");
         assert_eq!(out.five_hour_percent, Some(3.0));
-        assert_eq!(*saw_bypass.borrow(), Some(true), "force must reach the read as bypass_cache=true");
+        assert_eq!(
+            *saw_access.borrow(),
+            Some(TokenAccess::Interactive),
+            "force must reach the read as Interactive"
+        );
         assert!(
             !*invalidated.borrow(),
             "a successful forced fetch must NOT delete the cache (non-destructive)"
@@ -1951,16 +2799,17 @@ mod tests {
     }
 
     #[test]
-    fn non_forced_fetch_reads_with_bypass_false() {
-        // The default (quiet) path the per-account effect uses: bypass_cache=false reaches the read,
-        // so a still-fresh cached token keeps being served with no keychain prompt. Pairs with the
-        // test above to pin that the read's bypass value tracks the flag rather than a constant.
-        let saw_bypass = RefCell::new(None);
+    fn non_forced_fetch_reads_quietly() {
+        // The default path the per-account effect uses on every screen open and every poll tick:
+        // Quiet reaches the read, so a still-fresh cached token keeps being served and a lapsed one
+        // degrades rather than prompting. Pairs with the test above to pin that the read's mode
+        // tracks the flag rather than a constant.
+        let saw_access = RefCell::new(None);
         let out = fetch_usage_with(
             "/cfg/a",
-            false,
-            |_cd, bypass| {
-                *saw_bypass.borrow_mut() = Some(bypass);
+            TokenAccess::Quiet,
+            |_cd, access| {
+                *saw_access.borrow_mut() = Some(access);
                 Ok("tok".to_string())
             },
             |_cd| {},
@@ -1968,7 +2817,48 @@ mod tests {
         )
         .expect("a non-forced fetch must succeed");
         assert_eq!(out.five_hour_percent, Some(9.0));
-        assert_eq!(*saw_bypass.borrow(), Some(false), "an un-forced fetch reads with bypass_cache=false");
+        assert_eq!(
+            *saw_access.borrow(),
+            Some(TokenAccess::Quiet),
+            "an un-forced fetch reads Quiet"
+        );
+    }
+
+    #[test]
+    fn the_401_retry_stays_quiet_instead_of_reaching_for_the_keychain() {
+        // The 401 recovery path invalidates the cache and re-reads ONCE. Under Quiet that re-read
+        // must NOT become keychain-eligible — otherwise a server-rejected token turns the poll chain
+        // straight back into the modal this change removes. Asserts the mode on BOTH attempts and
+        // that the retry-once-never-loop shape is unchanged.
+        let modes = RefCell::new(Vec::<TokenAccess>::new());
+        let invalidated = RefCell::new(false);
+        let err = fetch_usage_with(
+            "/cfg/a",
+            TokenAccess::Quiet,
+            |_cd, access| {
+                modes.borrow_mut().push(access);
+                // Attempt 1 hands over the cached token; the invalidated re-read then has nothing
+                // left on disk and degrades exactly as read_access_token_cached does.
+                if modes.borrow().len() == 1 {
+                    Ok("cached-token".to_string())
+                } else {
+                    Err(format!("{USAGE_UNKNOWN_PREFIX}no cached credential for this account"))
+                }
+            },
+            |_cd| *invalidated.borrow_mut() = true,
+            |_token| Err(UsageFetchError::Unauthorized),
+        )
+        .unwrap_err();
+        assert!(*invalidated.borrow(), "a 401 must still invalidate the cache");
+        assert_eq!(
+            modes.into_inner(),
+            vec![TokenAccess::Quiet, TokenAccess::Quiet],
+            "the retry must NOT escalate to Interactive"
+        );
+        assert!(
+            err.starts_with(USAGE_UNKNOWN_PREFIX),
+            "the degraded re-read is what the user sees; got {err:?}"
+        );
     }
 
     #[test]
