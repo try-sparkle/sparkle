@@ -121,7 +121,20 @@ export function remediationFor(componentId: string): string | null {
     case "roborev":
       return "Code review is degraded — run `scripts/roborev-maintenance.sh --watchdog` to restart/compact the wedged daemon.";
     case "ci_runners":
-      return "The self-hosted CI pool is degraded (all runners busy or a stockout) — `scripts/runner/ci-autoscale-tick.sh` drives the autoscaler cascade to add capacity.";
+      // DO NOT PROMISE THE AUTOSCALER WILL ADD CAPACITY (bead `sparkle-ot4dxb`). This alarm now only
+      // fires on a genuine backlog free runners are not draining, and the measured cause of that is a
+      // pool already HELD at its GCP quota ceiling (CPUS_ALL_REGIONS) with all Spot regions stocked
+      // out — a condition under which `ci-autoscale-tick.sh` correctly declines and adds nothing.
+      // AGENTS.md's rule is that a remedy string is an instruction someone will follow, so pointing
+      // at a script that no-ops under exactly the condition that triggered the alert is worse than
+      // no remedy: it burns the reader's trust in the line. Name the real blocker instead.
+      return (
+        "CI test capacity is short — a real backlog is queued that free runners are not draining. " +
+        "Check the autoscaler's verdict with `scripts/runner/ci-autoscale-tick.sh` (dry run): if it " +
+        "reports HOLD because the pool is ceiling-clamped (CPUS_ALL_REGIONS) or every Spot region is " +
+        "stocked out, it is already at the GCP quota ceiling and re-running it adds nothing — the ONLY " +
+        "remediation is raising that quota, which is a founder spend decision tracked on sparkle-skcxyj."
+      );
     case "release_runner":
       return "The release runner (DMG build) is offline — wake the founder's Mac, and repair the runner with `sudo scripts/runner/setup-self-hosted-runner.sh` if it does not re-register.";
     case "knightwatch":

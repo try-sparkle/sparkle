@@ -15,7 +15,8 @@
 //! THE SEVERITY DISCIPLINE — blocking vs warning is decided by ONE question: does the failure
 //! PREVENT a deployment, or merely degrade/pause a non-deploy function?
 //!   * roborev down/wedged → WARNING. Code review stops, but merges and deploys still work.
-//!   * CI self-hosted pool saturated (all runners busy) → WARNING. Tests are slow, not impossible.
+//!   * CI self-hosted pool saturated (all runners busy) with a DRAINED queue → HEALTHY: every
+//!     runner is on a real job and nothing waits. Only queued work free capacity is not draining warns.
 //!   * CI self-hosted pool empty (no runner online) → BLOCKING. Real tests cannot run at all.
 //!   * release runner (`MacBook-Pro-sparkle-release`) offline → BLOCKING. The notarized DMG builds
 //!     there and nowhere else on `auto`, so no release can be cut.
@@ -731,11 +732,14 @@ const CI_QUEUE_BACKLOG_MIN: usize = 5;
 ///   1. no reading at all → Unknown.
 ///   2. nothing online but the list was TRUNCATED → Unknown. Absence is unprovable from a page.
 ///   3. nothing online on a complete list → Blocking. Real tests cannot run.
-///   4. all busy → Warning, naming the queue when we could read it.
-///   5. idle runners but the queue is UNREADABLE → Unknown. Unknown never alarms and never fires a
-///      recovery notice, so an unreadable queue produces SILENCE rather than a false RECOVERED.
-///   6. queue deeper than free capacity (and past [`CI_QUEUE_BACKLOG_MIN`]) → Warning.
-///   7. otherwise → Healthy, stating the queue depth it was judged against.
+///   4. queue UNREADABLE → Unknown (whether or not the pool is saturated). Unknown never alarms and
+///      never fires a recovery notice, so an unreadable queue produces SILENCE, not a false RECOVERED.
+///   5. queue deeper than free capacity and past [`CI_QUEUE_BACKLOG_MIN`] → Warning. When zero
+///      runners are idle this reduces to "any backlog past the floor", the queued-not-dispatching case.
+///   6. all busy but the queue is drained (below the floor) → Healthy SATURATION. Not an incident:
+///      this is the ceiling-clamped operating point that flapped ~15x/night when it was a Warning
+///      (bead `sparkle-ot4dxb`).
+///   7. otherwise (idle runners, drained queue) → Healthy, stating the queue depth it was judged against.
 fn classify_ci_pool(
     reading: Option<RunnerPoolReading>,
     queued: Option<usize>,
@@ -766,20 +770,14 @@ fn classify_ci_pool(
             ),
         );
     }
-    if r.online_idle == 0 {
-        let queue_clause = match queued {
-            Some(q) => format!(" with {q} run(s) queued"),
-            None => String::new(),
-        };
-        return (
-            HealthState::Warning,
-            format!(
-                "all {} self-hosted CI runners ({CI_RUNNER_LABEL}) are busy{queue_clause} — CI is \
-                 queued and slow but still running; merges and deploys are not blocked.",
-                r.online_busy
-            ),
-        );
-    }
+    // FROM HERE THE QUEUE DECIDES — INCLUDING WHEN ZERO RUNNERS ARE IDLE (bead `sparkle-ot4dxb`).
+    // A fully-busy pool with a drained queue is HEALTHY SATURATION, not an incident: every runner is
+    // on a real in-flight job and nothing is waiting, which is exactly the operating point the
+    // autoscaler holds at when it is ceiling-clamped by a GCP quota or a Spot stockout. Returning
+    // WARNING on it flapped WARNING<->RECOVERED ~15 times in six hours — the pool tipping between 0
+    // and 1 idle against an empty queue — and named a remediation (`ci-autoscale-tick.sh`) that is a
+    // guaranteed no-op at the ceiling. So `online_idle == 0` no longer warns by itself; only queued
+    // work that free capacity is NOT draining (past [`CI_QUEUE_BACKLOG_MIN`]) is a real problem.
     let Some(queued) = queued else {
         return (
             HealthState::Unknown,
@@ -800,6 +798,17 @@ fn classify_ci_pool(
                  running; merges and deploys are not blocked.",
                 r.online_idle,
                 r.online_total()
+            ),
+        );
+    }
+    if r.online_idle == 0 {
+        return (
+            HealthState::Healthy,
+            format!(
+                "all {} CI runners ({CI_RUNNER_LABEL}) are busy on in-flight jobs with {queued} \
+                 run(s) queued — the pool is fully utilised, not degraded; merges and deploys are \
+                 not blocked.",
+                r.online_busy
             ),
         );
     }
@@ -3049,26 +3058,58 @@ mod tests {
         assert_eq!(state, HealthState::Unknown, "an unreadable read is UNKNOWN, not blocking");
     }
 
-    /// The CI pool severity ladder: empty → BLOCKING (nothing can test), all-busy → WARNING (slow),
-    /// some-idle → HEALTHY. The empty case is the one red state CI runners produce.
+    /// The CI pool severity ladder: empty → BLOCKING (nothing can test), all-busy WITH A DRAINED
+    /// QUEUE → HEALTHY saturation (bead `sparkle-ot4dxb` — not an incident), some-idle → HEALTHY.
+    /// The empty case is the one red state a runner pool produces on its own; saturation is not.
     #[test]
-    fn ci_pool_empty_blocks_saturated_warns_idle_is_healthy() {
+    fn ci_pool_empty_blocks_saturated_is_healthy_idle_is_healthy() {
         // No linux-ci runner online (an unrelated label online does not count).
         let none = runners_json(&[("sparkle-release", "online", false)]);
         let (state, detail) = classify_ci_pool(read_runner_pool(&none, CI_RUNNER_LABEL), Some(0));
         assert_eq!(state, HealthState::Blocking, "no CI runner online cannot run tests");
         assert!(detail.contains("cannot run tests"), "{detail}");
 
-        // All linux-ci runners busy → saturated, slow but functioning.
+        // All linux-ci runners busy but the queue is drained → HEALTHY saturation, NOT a warning.
+        // This is the flap this bead fixes: the pool is fully utilised on real jobs, nothing waits.
         let busy = runners_json(&[("linux-ci", "online", true), ("linux-ci", "online", true)]);
         let (state, detail) = classify_ci_pool(read_runner_pool(&busy, CI_RUNNER_LABEL), Some(0));
-        assert_eq!(state, HealthState::Warning, "saturated is slow, not blocking");
-        assert!(detail.contains("not blocked"), "{detail}");
+        assert_eq!(state, HealthState::Healthy, "fully-busy with nothing queued is not an incident");
+        assert!(detail.contains("fully utilised"), "{detail}");
 
         // At least one idle → healthy.
         let idle = runners_json(&[("linux-ci", "online", true), ("linux-ci", "online", false)]);
         let (state, _) = classify_ci_pool(read_runner_pool(&idle, CI_RUNNER_LABEL), Some(0));
         assert_eq!(state, HealthState::Healthy);
+    }
+
+    /// bead `sparkle-ot4dxb`: HEALTHY SATURATION MUST NOT ALARM, but the SAME pool WITH a real
+    /// backlog still must. A fully-busy pool with a drained queue is every runner on a real
+    /// in-flight job and nothing waiting — the ceiling-clamped operating point that flapped
+    /// WARNING<->RECOVERED ~15x in six hours and named a no-op remediation. The paired backlog case
+    /// is what proves the healthy verdict is the DRAINED QUEUE's doing, not a blanket "busy is fine":
+    /// revert the fix (make `online_idle == 0` warn again) and the first assertion goes red.
+    #[test]
+    fn busy_pool_with_a_drained_queue_is_healthy_not_a_warning() {
+        // 21 busy, 0 idle, 0 queued → healthy saturation.
+        let (state, detail) = classify_ci_pool(ci_pool(0, 21), Some(0));
+        assert_eq!(state, HealthState::Healthy, "fully utilised, nothing queued, is not an incident: {detail}");
+        assert!(!detail.contains("CI is queued and slow"), "the old saturation-warning wording must be unreachable: {detail}");
+        assert!(detail.contains("not blocked"), "{detail}");
+        assert!(!detail.contains("idle and ready"), "0 idle must not claim 'idle and ready': {detail}");
+
+        // A backlog INSIDE the grace against zero idle still clears in one dispatch cycle → healthy.
+        let (state, _) = classify_ci_pool(ci_pool(0, 21), Some(CI_QUEUE_BACKLOG_MIN - 1));
+        assert_eq!(state, HealthState::Healthy, "a sub-floor backlog does not warn even at zero idle");
+
+        // THE PAIR: the SAME fully-busy pool with a backlog AT the floor DOES warn — queued work
+        // that free capacity is not draining is the genuine problem.
+        let (state, detail) = classify_ci_pool(ci_pool(0, 21), Some(CI_QUEUE_BACKLOG_MIN));
+        assert_eq!(state, HealthState::Warning, "queued work not dispatching must warn: {detail}");
+        assert!(detail.contains("waiting"), "{detail}");
+
+        // And an all-busy pool with an UNREADABLE queue is Unknown (silence), never a false verdict.
+        let (state, _) = classify_ci_pool(ci_pool(0, 21), None);
+        assert_eq!(state, HealthState::Unknown, "an unreadable queue at zero idle is silence, not an alarm");
     }
 
     /// The release runner: offline → BLOCKING (no DMG can build), online (idle or busy) → HEALTHY.
