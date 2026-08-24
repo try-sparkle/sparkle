@@ -36,7 +36,7 @@
 //! reproduce on a healthy machine.
 
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// The CI/release repository whose runners gate deployments. NOT `SPARKLE_REPO_URL`
 /// (`try-sparkle/sparkle`, the open-source mirror) — that repo has no runners. Mirrors the default in
@@ -777,33 +777,34 @@ fn read_version_tags(json: &str) -> Option<Vec<String>> {
 /// request that produces it can never drift apart.
 const TAG_PAGE_SIZE: usize = 100;
 
-/// Refuse to report `Healthy` off a tag page that may have been truncated (roborev finding, Medium).
+/// Refuse to report `Healthy` off a tag list we could NOT read in full (roborev finding, Medium).
 ///
-/// WHY THIS IS NOT HYPOTHETICAL. The tag read is ONE page of [`TAG_PAGE_SIZE`], and this repo
-/// currently carries 141 `v*` tags plus non-version `archive/...` refs. So the page IS truncated
-/// today. GitHub does not document the ordering of `GET /repos/{owner}/{repo}/tags`, so a newest
-/// version tag falling outside page 1 is not something the caller can rule out.
+/// HISTORY. The tag read used to be ONE page of [`TAG_PAGE_SIZE`], and this repo carries 159 `v*`
+/// tags plus non-version `archive/...` refs — so page 1 always dropped ~59 tags. A truncated page
+/// is a perfectly well-formed array that `read_version_tags` cannot tell from a complete one, so
+/// `classify_release_publication` saw a short tag list, found no orphans, and reported **Healthy**
+/// — and this guard then had to blanket-downgrade any Healthy verdict read from a full page to
+/// Unknown, which is why RELEASE PUBLICATION showed "Unknown" on every scan.
 ///
-/// A truncated page is a perfectly well-formed array, so `read_version_tags` cannot detect it and
-/// `classify_release_publication` would see a short tag list, find no orphans, and report
-/// **Healthy** — the exact false-green this component exists to prevent, delivered silently.
+/// [`release_publication_component`] now PAGINATES the tag read (`gh api --paginate`), so the read
+/// is COMPLETE and `tags_complete` is `true`, and a real Healthy verdict survives. This guard stays
+/// as the fail-safe: if a read is ever marked incomplete (`tags_complete == false`), an "all clear"
+/// is still downgraded to Unknown rather than shipped as a silent false-green.
 ///
 /// Only the HEALTHY verdict is downgraded. A positive finding (Blocking/Warning) was reached from
-/// tags we actually read and stays true whatever else was on page 2; Unknown and NotApplicable are
+/// tags we actually read and stays true whatever else went unread; Unknown and NotApplicable are
 /// already non-committal. Downgrading only the "all clear" is the fail-closed direction.
 fn apply_tag_page_truncation(
     state: HealthState,
     detail: String,
-    tags_read: usize,
+    tags_complete: bool,
 ) -> (HealthState, String) {
-    if state == HealthState::Healthy && tags_read >= TAG_PAGE_SIZE {
+    if state == HealthState::Healthy && !tags_complete {
         return (
             HealthState::Unknown,
-            format!(
-                "read {tags_read} tags in one page (the page limit), so the tag list may be \
-                 truncated — cannot rule out a built version that was never published. This is a \
-                 limit of the probe, not a fault in the pipeline."
-            ),
+            "the tag list could not be read in full, so a built version that was never published \
+             cannot be ruled out. This is a limit of the probe, not a fault in the pipeline."
+                .to_string(),
         );
     }
     (state, detail)
@@ -1457,31 +1458,218 @@ fn held_clause(held: &[Version]) -> String {
     )
 }
 
-// ── knightwatch (the PR-scoped reviewer bot) ────────────────────────────────────────────────────
+// ── knightwatch / sparkle-reviewer (the PR-scoped reviewer) ─────────────────────────────────────
+//
+// The configured reviewer today is `sparkle-reviewer` (`scripts/pr-review.sh`): ONE local `claude`
+// call under the user's own login, dispatched per push by the app's babysit sweep. It is not a
+// daemon this app can ping, so its liveness is read from its OUTPUT — the review comments it posts,
+// each stamped `<!-- sparkle-reviewer:auto-post -->`. A reviewer that is live has posted a review
+// recently; one that has stopped leaves open PRs sitting unreviewed. That is the freshness signal
+// [`classify_knightwatch`] classifies, replacing the flat "liveness is not yet monitored" Unknown.
 
-/// Classify the PR reviewer from config. It is NOT a daemon this app can reach — it runs as a remote
-/// bot that posts GitHub comments — so its only local signal is whether it is configured at all.
+/// Marker every sparkle-reviewer review comment carries (stamped by `scripts/pr-review.sh`). It is
+/// how both merge gates already recognise a review, so it is the right liveness fingerprint too.
+const REVIEWER_COMMENT_MARKER: &str = "sparkle-reviewer:auto-post";
+
+/// How fresh the newest review must be for the reviewer to read as live. Reviews are dispatched per
+/// push by the app's babysit sweep, so a couple of days without one — WHILE PRs wait — is the signal
+/// that the reviewer has stopped, not a quiet minute. Generous on purpose: a probe that cries wolf
+/// on an idle afternoon gets muted, and then misses the real outage.
+const KNIGHTWATCH_FRESH_SECS: u64 = 48 * 3600;
+
+/// The liveness reading for the PR reviewer, assembled from GitHub by [`read_knightwatch_liveness`].
+/// A `None` from that reader means the signal was UNREADABLE (-> Unknown); this struct is built only
+/// once a reading succeeded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct KnightwatchLiveness {
+    /// Age in seconds of the newest sparkle-reviewer review comment found, or `None` when none was
+    /// seen in the scanned window (never posted, or older than the window).
+    last_review_age_secs: Option<u64>,
+    /// Whether the repo has at least one OPEN PR — work the reviewer would be expected to cover.
+    /// Distinguishes a genuinely-idle reviewer (no PRs) from a silent-but-should-be-working one.
+    has_open_prs: bool,
+}
+
+/// Current wall-clock as a Unix epoch in seconds. `0` if the clock is before the epoch (never on a
+/// real machine); an age computed against it then clamps to `0` and reads as "just now" — the
+/// fail-safe direction for a liveness probe (Healthy, not a false stale-warning).
+fn now_epoch_secs() -> i64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
+}
+
+/// Days since the Unix epoch for a civil (proleptic Gregorian) date — Howard Hinnant's algorithm,
+/// exact for every date GitHub emits. This crate has no date/time dependency, so the arithmetic
+/// lives here.
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = (if y >= 0 { y } else { y - 399 }) / 400;
+    let yoe = y - era * 400; // [0, 399]
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    era * 146_097 + doe - 719_468
+}
+
+/// Parse a GitHub RFC3339 timestamp (`YYYY-MM-DDTHH:MM:SSZ`) to a Unix epoch in seconds. `None` on
+/// any shape we do not recognise — a timestamp we cannot parse must never read as "just now".
+fn github_ts_to_epoch(ts: &str) -> Option<i64> {
+    let ts = ts.trim().trim_end_matches('Z');
+    let (date, time) = ts.split_once('T')?;
+    let mut dp = date.split('-');
+    let y: i64 = dp.next()?.parse().ok()?;
+    let mo: i64 = dp.next()?.parse().ok()?;
+    let d: i64 = dp.next()?.parse().ok()?;
+    let mut tp = time.split(':');
+    let h: i64 = tp.next()?.parse().ok()?;
+    let mi: i64 = tp.next()?.parse().ok()?;
+    // Seconds may carry a fractional part on some payloads; take the integer part.
+    let s: i64 = tp.next().unwrap_or("0").split('.').next()?.parse().ok()?;
+    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) {
+        return None;
+    }
+    Some(days_from_civil(y, mo, d) * 86_400 + h * 3600 + mi * 60 + s)
+}
+
+/// Age in seconds of `ts` measured against `now_epoch`. `None` if `ts` is unparseable; clamped to
+/// `0` for a timestamp in the future (clock skew), which reads as fresh — the fail-safe direction.
+fn github_ts_age_secs(ts: &str, now_epoch: i64) -> Option<u64> {
+    let then = github_ts_to_epoch(ts)?;
+    Some((now_epoch - then).max(0) as u64)
+}
+
+/// The newest sparkle-reviewer review timestamp in a `gh api .../issues/comments` payload, or `None`
+/// if no comment in the page carries the marker. Takes the MAX `updated_at` (RFC3339 sorts
+/// chronologically as text) rather than trusting the request's sort order.
+fn newest_reviewer_comment_ts(json: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(json.trim()).ok()?;
+    let items = value.as_array()?;
+    let mut newest: Option<String> = None;
+    for c in items {
+        let body = c.get("body").and_then(|b| b.as_str()).unwrap_or("");
+        if !body.contains(REVIEWER_COMMENT_MARKER) {
+            continue;
+        }
+        let ts = c
+            .get("updated_at")
+            .and_then(|t| t.as_str())
+            .or_else(|| c.get("created_at").and_then(|t| t.as_str()));
+        if let Some(ts) = ts {
+            if newest.as_deref().map_or(true, |n| ts > n) {
+                newest = Some(ts.to_string());
+            }
+        }
+    }
+    newest
+}
+
+/// Whether a `gh api .../pulls?state=open` payload lists at least one open PR. A non-array (an error
+/// body) reads as `false` — the fail-safe direction: it never manufactures "work is waiting".
+fn has_open_prs_from_json(json: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(json.trim())
+        .ok()
+        .and_then(|v| v.as_array().map(|a| !a.is_empty()))
+        .unwrap_or(false)
+}
+
+/// Render a seconds age as a short human string for the panel detail.
+fn humanize_age(secs: u64) -> String {
+    if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h", secs / 3600)
+    } else {
+        format!("{}d", secs / 86_400)
+    }
+}
+
+/// Classify the PR reviewer from its liveness reading.
 ///
-///   * `pr_reviewer = "none"` (today's state) → `NotApplicable`. The reviewer is deliberately off;
-///     showing it green would be a lie and showing it amber would be noise.
-///   * any other value → `Unknown`. A reviewer is expected but this app has no liveness signal for
-///     it yet, and claiming green for a bot we cannot see is exactly the silent-failure this whole
-///     surface exists to prevent. Honest "not monitored" beats fake green.
-fn classify_knightwatch(has_no_reviewer: bool, reviewer_name: &str) -> (HealthState, String) {
+///   * `pr_reviewer = "none"` → `NotApplicable`. The reviewer is deliberately off; excluded from the
+///     fold rather than dragging the icon amber.
+///   * `liveness == None` → `Unknown`. The signal could not be read (auth lapse / 503) — honest
+///     visibility gap, never a fabricated verdict.
+///   * a review posted within [`KNIGHTWATCH_FRESH_SECS`] → `Healthy` — the reviewer is demonstrably
+///     posting reviews.
+///   * no fresh review WHILE open PRs wait → `Warning` — it appears to have stopped, with the exact
+///     manual-restart command in the detail.
+///   * no fresh review and NO open PRs → `Healthy` (idle): nothing to review, and the reviewer runs
+///     on demand, so silence is expected and not a fault.
+fn classify_knightwatch(
+    has_no_reviewer: bool,
+    reviewer_name: &str,
+    liveness: Option<&KnightwatchLiveness>,
+) -> (HealthState, String) {
     if has_no_reviewer {
-        (
+        return (
             HealthState::NotApplicable,
             "no PR-review bot is configured for this repo (pr_reviewer = none).".to_string(),
-        )
-    } else {
-        (
+        );
+    }
+    let Some(l) = liveness else {
+        return (
             HealthState::Unknown,
             format!(
-                "PR reviewer '{reviewer_name}' is configured, but its liveness is not yet monitored \
-                 from the app — check its host directly."
+                "could not read '{reviewer_name}' review activity from GitHub — pipeline visibility \
+                 is degraded; check its host directly."
             ),
-        )
+        );
+    };
+    const RESTART: &str = "Reviews are dispatched by the app's babysit sweep; run \
+                           `scripts/pr-review.sh <PR#> --post` to review manually.";
+    match l.last_review_age_secs {
+        Some(age) if age <= KNIGHTWATCH_FRESH_SECS => (
+            HealthState::Healthy,
+            format!("'{reviewer_name}' posted a review {} ago — the reviewer is live.", humanize_age(age)),
+        ),
+        Some(age) if l.has_open_prs => (
+            HealthState::Warning,
+            format!(
+                "'{reviewer_name}' last posted a review {} ago and open PR(s) are waiting — the \
+                 reviewer may not be running. {}",
+                humanize_age(age),
+                RESTART
+            ),
+        ),
+        Some(age) => (
+            HealthState::Healthy,
+            format!(
+                "'{reviewer_name}' last posted a review {} ago; no open PRs are awaiting review.",
+                humanize_age(age)
+            ),
+        ),
+        None if l.has_open_prs => (
+            HealthState::Warning,
+            format!(
+                "no recent '{reviewer_name}' review was found and open PR(s) are waiting — the \
+                 reviewer may not be running. {}",
+                RESTART
+            ),
+        ),
+        None => (
+            HealthState::Healthy,
+            format!("no open PRs are awaiting review; '{reviewer_name}' runs on demand."),
+        ),
     }
+}
+
+/// Read the PR reviewer's liveness from GitHub. `None` (-> Unknown) ONLY when the PRIMARY read (the
+/// repo's recent issue comments) could not be performed — an auth lapse or a 503, the same fail-safe
+/// as every other component. A successful read with no reviewer comment in it is a real answer
+/// ("no recent review"), not an unreadable one.
+fn read_knightwatch_liveness(gh_program: Option<&str>, root: &str) -> Option<KnightwatchLiveness> {
+    let program = gh_program?;
+    let comments = gh_api_text(
+        program,
+        root,
+        &format!("repos/{RELEASE_REPO}/issues/comments?sort=updated&direction=desc&per_page=100"),
+    )?;
+    let last_review_age_secs =
+        newest_reviewer_comment_ts(&comments).and_then(|ts| github_ts_age_secs(&ts, now_epoch_secs()));
+    // Open-PR presence refines stale/never into warn-vs-idle. A failed read defaults to `false` —
+    // the fail-safe direction, so an unreadable PR list never manufactures a stale-warning.
+    let has_open_prs = gh_api_text(program, root, &format!("repos/{RELEASE_REPO}/pulls?state=open&per_page=1"))
+        .map(|j| has_open_prs_from_json(&j))
+        .unwrap_or(false);
+    Some(KnightwatchLiveness { last_review_age_secs, has_open_prs })
 }
 
 // ── The command ─────────────────────────────────────────────────────────────────────────────────
@@ -1654,9 +1842,17 @@ fn runner_components(
 }
 
 /// Build the knightwatch (PR reviewer) component from config.
-fn knightwatch_component(root: &str) -> ComponentHealth {
+fn knightwatch_component(gh_program: Option<&str>, root: &str) -> ComponentHealth {
     let review = crate::config::for_project(root).config.review;
-    let (state, detail) = classify_knightwatch(review.has_no_pr_reviewer(), review.pr_reviewer.trim());
+    // A reviewer that is deliberately off (`pr_reviewer = none`) is NotApplicable, so skip the
+    // network entirely; otherwise read its liveness from GitHub.
+    let liveness = if review.has_no_pr_reviewer() {
+        None
+    } else {
+        read_knightwatch_liveness(gh_program, root)
+    };
+    let (state, detail) =
+        classify_knightwatch(review.has_no_pr_reviewer(), review.pr_reviewer.trim(), liveness.as_ref());
     ComponentHealth {
         id: "knightwatch".to_string(),
         name: "PR reviewer (knightwatch)".to_string(),
@@ -1671,6 +1867,21 @@ fn knightwatch_component(root: &str) -> ComponentHealth {
 fn gh_api_text(program: &str, root: &str, path: &str) -> Option<String> {
     let mut cmd = Command::new(program);
     cmd.arg("api").arg(path).current_dir(root);
+    apply_noninteractive(&mut cmd);
+    match crate::worktree::output_with_timeout(cmd, RELEASE_QUERY_TIMEOUT) {
+        Ok(o) if o.status.success() => Some(String::from_utf8_lossy(&o.stdout).into_owned()),
+        _ => None,
+    }
+}
+
+/// Like [`gh_api_text`] but follows pagination with `--paginate`. For an endpoint that returns a
+/// JSON ARRAY (e.g. `/tags`), `gh` concatenates every page into ONE array, so the caller parses it
+/// exactly as it would a single page — but now sees EVERY item, not just the first page. `None` on
+/// ANY failure (including a mid-pagination 4xx/5xx, which fails the whole `gh` invocation), so a
+/// partial read can never masquerade as a complete one.
+fn gh_api_paginated_text(program: &str, root: &str, path: &str) -> Option<String> {
+    let mut cmd = Command::new(program);
+    cmd.arg("api").arg("--paginate").arg(path).current_dir(root);
     apply_noninteractive(&mut cmd);
     match crate::worktree::output_with_timeout(cmd, RELEASE_QUERY_TIMEOUT) {
         Ok(o) if o.status.success() => Some(String::from_utf8_lossy(&o.stdout).into_owned()),
@@ -1698,13 +1909,21 @@ fn read_baseline_at(root: &str) -> Option<ReleaseBaseline> {
 fn release_publication_component(gh_program: Option<&str>, root: &str) -> ComponentHealth {
     let releases_json = gh_program
         .and_then(|p| gh_api_text(p, root, &format!("repos/{PUBLIC_RELEASE_REPO}/releases?per_page=100")));
-    let tags_json = gh_program
-        .and_then(|p| gh_api_text(p, root, &format!("repos/{RELEASE_REPO}/tags?per_page={TAG_PAGE_SIZE}")));
+    // PAGINATE the tag read. `drodio/sparkle` carries 159 tags today, and a single page of
+    // TAG_PAGE_SIZE (100) dropped the other ~59 — which forced [`apply_tag_page_truncation`] to
+    // downgrade an otherwise-Healthy verdict to Unknown on EVERY scan (the "Release publication:
+    // Unknown" the founder saw). `gh api --paginate` on `/tags` (a JSON ARRAY endpoint) concatenates
+    // every page into ONE array, so `read_version_tags` parses it unchanged but now sees EVERY tag.
+    // The read is therefore COMPLETE on success (`gh` fails the whole read if any page 4xx/5xxs, and
+    // a failed read is `None` -> Unknown), so `tags_complete = true` below.
+    let tags_json = gh_program.and_then(|p| {
+        gh_api_paginated_text(p, root, &format!("repos/{RELEASE_REPO}/tags?per_page={TAG_PAGE_SIZE}"))
+    });
     // The gate reads are per DRAFT and drafts are normally zero or one, so `fetch` is called at most
     // twice per draft. With no `gh` it is never called at all and every draft stays in-flight, which
     // is the pre-FIX-4 behaviour.
     let fetch = |path: &str| gh_program.and_then(|p| gh_api_text(p, root, path));
-    release_publication_from_json(releases_json.as_deref(), tags_json.as_deref(), root, &fetch)
+    release_publication_from_json(releases_json.as_deref(), tags_json.as_deref(), true, root, &fetch)
 }
 
 /// Everything [`release_publication_component`] does EXCEPT talk to `gh`: parse the two payloads,
@@ -1718,6 +1937,7 @@ fn release_publication_component(gh_program: Option<&str>, root: &str) -> Compon
 fn release_publication_from_json<F>(
     releases_json: Option<&str>,
     tags_json: Option<&str>,
+    tags_complete: bool,
     root: &str,
     fetch: &F,
 ) -> ComponentHealth
@@ -1738,9 +1958,10 @@ where
         baseline.as_ref(),
         &draft_gates,
     );
-    // Fail closed on a possibly-truncated tag page before this reaches the panel.
-    let (state, detail) =
-        apply_tag_page_truncation(state, detail, tags.as_deref().map(<[String]>::len).unwrap_or(0));
+    // Fail closed on a tag list we could not read in full before this reaches the panel. With the
+    // paginated read above (`release_publication_component`) `tags_complete` is `true`, so a real
+    // Healthy verdict survives; only an incomplete read is downgraded.
+    let (state, detail) = apply_tag_page_truncation(state, detail, tags_complete);
     ComponentHealth {
         id: "release_publication".to_string(),
         name: "Release publication".to_string(),
@@ -1766,7 +1987,7 @@ pub async fn pipeline_health_probe(root: String) -> Result<PipelineHealth, Strin
         let (runner_comps, release_in_progress) = runner_components(gh_program.clone(), &root);
         components.extend(runner_comps);
         components.push(release_publication_component(gh_program.as_deref(), &root));
-        components.push(knightwatch_component(&root));
+        components.push(knightwatch_component(gh_program.as_deref(), &root));
         let overall = overall_state(&components);
         Ok(PipelineHealth { overall, components, release_in_progress })
     })
@@ -3010,6 +3231,7 @@ mod tests {
         let c = release_publication_from_json(
             Some(releases_json),
             Some(&tags_json),
+            true,
             repo_root,
             &no_gh,
         );
@@ -3022,6 +3244,7 @@ mod tests {
         let c = release_publication_from_json(
             Some(releases_json),
             Some(&tags_json),
+            true,
             concat!(env!("CARGO_MANIFEST_DIR"), "/src"),
             &no_gh,
         );
@@ -3516,6 +3739,7 @@ mod tests {
         let c = release_publication_from_json(
             Some(releases_json),
             Some(&tags_json),
+            true,
             repo_root,
             &fetch,
         );
@@ -3591,19 +3815,103 @@ mod tests {
 
     // ── knightwatch ───────────────────────────────────────────────────────────────────────────────
 
-    /// `pr_reviewer = none` (today) → NotApplicable, so it is EXCLUDED from the fold rather than
-    /// dragging the icon amber. A configured-but-unmonitored reviewer is honest UNKNOWN, never a fake
-    /// green.
+    fn liveness(age: Option<u64>, open: bool) -> KnightwatchLiveness {
+        KnightwatchLiveness { last_review_age_secs: age, has_open_prs: open }
+    }
+
+    /// `pr_reviewer = none` → NotApplicable (excluded from the fold), and an UNREADABLE signal is
+    /// honest Unknown — never a fake green.
     #[test]
-    fn knightwatch_none_is_not_applicable_configured_is_unknown() {
-        let (state, detail) = classify_knightwatch(true, "none");
+    fn knightwatch_none_is_not_applicable_unreadable_is_unknown() {
+        let (state, detail) = classify_knightwatch(true, "none", None);
         assert_eq!(state, HealthState::NotApplicable, "a disabled reviewer is not part of the fold");
         assert!(detail.contains("none"), "{detail}");
 
-        let (state, detail) = classify_knightwatch(false, "knightwatch");
-        assert_eq!(state, HealthState::Unknown, "configured but unmonitored is honest UNKNOWN");
-        assert!(detail.contains("knightwatch"), "names the reviewer: {detail}");
-        assert!(detail.contains("not yet monitored"), "and says why it is unknown: {detail}");
+        // Configured but the signal could not be read (gh down) → Unknown, and it names the reviewer.
+        let (state, detail) = classify_knightwatch(false, "sparkle-reviewer", None);
+        assert_eq!(state, HealthState::Unknown, "an unreadable signal is honest UNKNOWN");
+        assert!(detail.contains("sparkle-reviewer"), "names the reviewer: {detail}");
+        assert!(detail.contains("could not read"), "and says why it is unknown: {detail}");
+    }
+
+    /// FIX 2 (knightwatch liveness). The freshness ladder, each band asserted on its SIDE EFFECT (the
+    /// verdict), so mutating a band flips the state:
+    ///   * a review within the window        → Healthy
+    ///   * stale/never WHILE open PRs wait    → Warning (the real "reviewer is down" case), and the
+    ///     detail carries the exact manual-restart command
+    ///   * stale/never with NO open PRs       → Healthy (idle; on-demand reviewer, nothing to do)
+    #[test]
+    fn knightwatch_freshness_ladder() {
+        // Fresh review → live, whatever the PR state.
+        let (state, detail) = classify_knightwatch(false, "sparkle-reviewer", Some(&liveness(Some(3600), true)));
+        assert_eq!(state, HealthState::Healthy, "a fresh review is live: {detail}");
+        assert!(detail.contains("live"), "{detail}");
+
+        // Stale review, open PRs waiting → the reviewer appears down.
+        let stale = KNIGHTWATCH_FRESH_SECS + 3600;
+        let (state, detail) = classify_knightwatch(false, "sparkle-reviewer", Some(&liveness(Some(stale), true)));
+        assert_eq!(state, HealthState::Warning, "stale + open PRs is a down reviewer: {detail}");
+        assert!(detail.contains("pr-review.sh"), "and names the restart command: {detail}");
+
+        // NEVER posted, open PRs waiting → down (this is TODAY's live state on drodio/sparkle).
+        let (state, detail) = classify_knightwatch(false, "sparkle-reviewer", Some(&liveness(None, true)));
+        assert_eq!(state, HealthState::Warning, "never-posted + open PRs is a down reviewer: {detail}");
+        assert!(detail.contains("pr-review.sh"), "and names the restart command: {detail}");
+
+        // Stale/never but NO open PRs → idle, not a fault.
+        let (state, _) = classify_knightwatch(false, "sparkle-reviewer", Some(&liveness(None, false)));
+        assert_eq!(state, HealthState::Healthy, "no open PRs to review → idle is fine");
+        let (state, _) = classify_knightwatch(false, "sparkle-reviewer", Some(&liveness(Some(stale), false)));
+        assert_eq!(state, HealthState::Healthy, "no open PRs to review → an old last-review is fine");
+    }
+
+    /// The liveness PARSERS, so the reads feeding the ladder above are covered too.
+    #[test]
+    fn knightwatch_liveness_parsers() {
+        // A known epoch: 2021-01-01T00:00:00Z == 1609459200.
+        assert_eq!(github_ts_to_epoch("2021-01-01T00:00:00Z"), Some(1_609_459_200));
+        // Fractional seconds and missing Z tolerated; garbage is None (never "just now").
+        assert_eq!(github_ts_to_epoch("2021-01-01T00:00:00.123Z"), Some(1_609_459_200));
+        assert_eq!(github_ts_to_epoch("not-a-date"), None);
+        // Age clamps a future timestamp to 0 and returns None for an unparseable one.
+        assert_eq!(github_ts_age_secs("2021-01-01T00:00:00Z", 1_609_459_260), Some(60));
+        assert_eq!(github_ts_age_secs("2021-01-01T00:00:00Z", 1_609_459_100), Some(0), "future clamps to 0");
+        assert_eq!(github_ts_age_secs("nonsense", 1_609_459_260), None);
+
+        // newest_reviewer_comment_ts: only marker-bearing comments count, and the MAX ts wins even
+        // when the payload is not sorted.
+        let comments = r#"[
+            {"body":"just a human comment","updated_at":"2026-01-05T00:00:00Z"},
+            {"body":"review <!-- sparkle-reviewer:auto-post -->","updated_at":"2026-01-02T00:00:00Z"},
+            {"body":"newer review <!-- sparkle-reviewer:auto-post -->","updated_at":"2026-01-04T00:00:00Z"}
+        ]"#;
+        assert_eq!(newest_reviewer_comment_ts(comments).as_deref(), Some("2026-01-04T00:00:00Z"));
+        // No marker anywhere → None (real "no review", distinct from an unreadable read).
+        assert_eq!(newest_reviewer_comment_ts(r#"[{"body":"hi","updated_at":"2026-01-01T00:00:00Z"}]"#), None);
+        // An error body (not an array) → None.
+        assert_eq!(newest_reviewer_comment_ts(r#"{"message":"Bad credentials"}"#), None);
+
+        // has_open_prs_from_json: non-empty array true, empty false, error body false.
+        assert!(has_open_prs_from_json(r#"[{"number":1}]"#));
+        assert!(!has_open_prs_from_json("[]"));
+        assert!(!has_open_prs_from_json(r#"{"message":"Not Found"}"#));
+    }
+
+    /// The knightwatch CONSTRUCTOR on its no-gh path: with no `gh` there is no reading, and no
+    /// reading must be Unknown — never a fake green (the "not monitored" flat-Unknown is gone, but
+    /// an UNREADABLE signal is still honestly Unknown). Drives the real component wiring.
+    #[test]
+    fn the_knightwatch_constructor_is_unknown_without_gh() {
+        let c = knightwatch_component(None, concat!(env!("CARGO_MANIFEST_DIR"), "/../../.."));
+        assert_eq!(c.id, "knightwatch", "the panel keys on this id");
+        // The real repo config sets pr_reviewer = sparkle-reviewer (not "none"), so with no gh the
+        // liveness read fails and the honest verdict is Unknown.
+        assert_eq!(
+            c.state,
+            HealthState::Unknown,
+            "a configured reviewer with no readable signal is Unknown, not green: {}",
+            c.detail
+        );
     }
 
     /// The whole payload serialises to the camelCase shape the TS side reads, and the state enum is
@@ -3691,31 +3999,89 @@ mod tests {
         assert_eq!(state, HealthState::Blocking, "v0.120.0 has nothing staged; that must dominate");
     }
 
-    /// FINDING 2. The tag read is ONE page of TAG_PAGE_SIZE and this repo has 141 v* tags, so the
-    /// page IS truncated today. A truncated page is a well-formed array, so nothing downstream can
-    /// see it, and the classifier would find no orphans and report Healthy — a silent false-green.
+    /// FINDING 2. An INCOMPLETE tag read must never report Healthy — that is the silent false-green
+    /// this guard exists to prevent (the classifier would see a short list, find no orphans, and
+    /// call it all-clear). `tags_complete == false` is the fail-closed signal.
     #[test]
-    fn a_full_tag_page_can_never_report_healthy() {
+    fn an_incomplete_tag_read_can_never_report_healthy() {
         let (state, detail) =
-            apply_tag_page_truncation(HealthState::Healthy, "all published".into(), TAG_PAGE_SIZE);
-        assert_eq!(state, HealthState::Unknown, "a full page must not report all-clear: {detail}");
-        assert!(detail.contains("truncated"), "and must say why: {detail}");
+            apply_tag_page_truncation(HealthState::Healthy, "all published".into(), false);
+        assert_eq!(state, HealthState::Unknown, "an incomplete read must not report all-clear: {detail}");
+        assert!(detail.contains("could not be read in full"), "and must say why: {detail}");
     }
 
     /// The paired negatives, so the guard cannot be satisfied by downgrading everything.
     #[test]
     fn truncation_downgrades_only_the_all_clear() {
-        // A short page is a complete read; Healthy survives.
+        // A COMPLETE read (what the paginated tag read now produces) keeps its Healthy verdict.
         let (state, _) =
-            apply_tag_page_truncation(HealthState::Healthy, "all published".into(), TAG_PAGE_SIZE - 1);
-        assert_eq!(state, HealthState::Healthy, "a short page is a complete read");
+            apply_tag_page_truncation(HealthState::Healthy, "all published".into(), true);
+        assert_eq!(state, HealthState::Healthy, "a complete read keeps its all-clear");
 
-        // A positive finding was reached from tags we DID read and stays true regardless of page 2.
+        // A positive finding was reached from tags we DID read and stays true even if incomplete.
         for kept in [HealthState::Blocking, HealthState::Warning] {
-            let (state, detail) = apply_tag_page_truncation(kept, "keep me".into(), TAG_PAGE_SIZE);
-            assert_eq!(state, kept, "a positive finding must survive truncation");
+            let (state, detail) = apply_tag_page_truncation(kept, "keep me".into(), false);
+            assert_eq!(state, kept, "a positive finding must survive an incomplete read");
             assert_eq!(detail, "keep me", "and keep its own detail");
         }
+    }
+
+    /// FIX 1 (release publication). The whole bug: the tag read capped at ONE page of TAG_PAGE_SIZE
+    /// while `drodio/sparkle` carries 159 tags, so `apply_tag_page_truncation` downgraded a real
+    /// Healthy verdict to Unknown on every scan. Now the read PAGINATES, so it hands the classifier
+    /// EVERY tag and marks the read complete — and a fixture of MORE than a page of tags, all
+    /// published, must verdict Healthy, not "Unknown-by-truncation".
+    ///
+    /// The side effect asserted is the VERDICT off a >page-size tag set, driven through the real
+    /// `release_publication_from_json` entry point (not the guard in isolation): revert the
+    /// pagination — pass `false` for `tags_complete` — and this same call goes Unknown, which is the
+    /// bug returning.
+    #[test]
+    fn a_paginated_tag_read_over_the_page_limit_is_not_truncated() {
+        // A tag set LARGER than one page (TAG_PAGE_SIZE + 40), every one of which has a PUBLISHED
+        // release behind it — so there is no orphan (a built tag with no release), and the honest
+        // verdict is Healthy. v0.134.0 is the high-water mark; v0.10.0 an old floor so nothing is
+        // out of window.
+        let mut names = vec!["v0.134.0".to_string(), "v0.10.0".to_string()];
+        let mut minor = 11u64;
+        while names.len() < TAG_PAGE_SIZE + 40 {
+            names.push(format!("v0.{minor}.0"));
+            minor += 1;
+        }
+        assert!(names.len() > TAG_PAGE_SIZE, "the fixture must exceed one page: {}", names.len());
+        // Publish every tag, so the set is genuinely clean (no orphan drives Blocking/Warning).
+        let releases_json = format!(
+            "[{}]",
+            names
+                .iter()
+                .map(|n| format!(r#"{{"tag_name":"{n}","draft":false,"prerelease":false}}"#))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let tags_json = format!(
+            "[{}]",
+            names.iter().map(|n| format!(r#"{{"name":"{n}"}}"#)).collect::<Vec<_>>().join(",")
+        );
+        let no_gh = |_: &str| None;
+
+        // COMPLETE read (paginated, production): a >page-size clean set is Healthy, NOT Unknown.
+        let c = release_publication_from_json(Some(&releases_json), Some(&tags_json), true, ".", &no_gh);
+        assert_eq!(
+            c.state,
+            HealthState::Healthy,
+            "a fully-read tag set with no orphan is Healthy, not Unknown-by-truncation: {}",
+            c.detail
+        );
+        assert!(
+            !c.detail.contains("could not be read in full"),
+            "the truncation downgrade must not fire on a complete read: {}",
+            c.detail
+        );
+
+        // The MUTATION that proves the pagination is load-bearing: mark the SAME read incomplete and
+        // the verdict collapses to Unknown — the exact bug this fix removes.
+        let c = release_publication_from_json(Some(&releases_json), Some(&tags_json), false, ".", &no_gh);
+        assert_eq!(c.state, HealthState::Unknown, "an incomplete read of the same tags is Unknown: {}", c.detail);
     }
 
     /// FINDING 3. The serialisation test hand-built a ComponentHealth and asserted serde's output,
