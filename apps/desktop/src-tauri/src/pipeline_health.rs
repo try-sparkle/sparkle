@@ -64,6 +64,16 @@ const PUBLIC_RELEASE_REPO: &str = "try-sparkle/sparkle";
 const ROBOREV_STATUS_TIMEOUT: Duration = Duration::from_secs(8);
 const ROBOREV_STATUS_TIMEOUT_SECS: u64 = 8;
 
+/// The roborev store size at which a cold sqlite open can plausibly outrun the probe bound above —
+/// i.e. above which "the daemon is merely SLOW" is a live explanation for a silent `roborev status`.
+/// Arithmetic, not a guess: the measured 860MB store took ~20s to open (~43MB/s on this machine), so
+/// an 8s bound is exhausted somewhere around 340MB. 300MB is the round number just under that.
+/// Mirrored by `PH_ROBOREV_DB_BLOAT_BYTES` in scripts/lib/pipeline-health.sh.
+const ROBOREV_DB_BLOAT_BYTES: u64 = 314_572_800;
+
+/// How the roborev store is referred to in verdict text (the path a human would go look at).
+const ROBOREV_DB_LABEL: &str = "~/.roborev/reviews.db";
+
 /// Bound the `gh api` runner read. `gh` has no deadline of its own; this is the Rust twin of
 /// `runner-health.sh`'s `rh_status_bounded`. A timeout reads as "could not tell" (Unknown), never as
 /// "offline".
@@ -161,29 +171,49 @@ pub enum StatusProbe {
     Text(String),
 }
 
-/// Classify roborev's health from a `status` probe and, when we could ask it, whether launchd still
-/// has the daemon LaunchAgent loaded (`daemon_loaded`). PURE, so every branch is tested without a
-/// daemon.
+/// What we could learn about the daemon BESIDES the fact that it did not answer. A silent
+/// `roborev status` has three causes that need OPPOSITE remedies (see [`classify_not_answering`]),
+/// and these are the readings that separate them. Every field is an `Option` because every one of
+/// them can fail to be read, and a failed read must produce "we do not know", never a confident
+/// wrong answer.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DaemonEvidence {
+    /// `launchctl print gui/<uid>/co.plow.roborev-daemon` succeeded — the LaunchAgent is REGISTERED.
+    /// Registration is not the same fact as a running process, which is why `alive` exists.
+    loaded: Option<bool>,
+    /// A `roborev daemon` PROCESS actually exists. Outranks `loaded` when both are present.
+    alive: Option<bool>,
+    /// Size of the roborev store (`reviews.db` plus its `-wal` sidecar), in bytes.
+    db_bytes: Option<u64>,
+}
+
+impl DaemonEvidence {
+    /// Only the LaunchAgent reading — used where no process/store reading was taken.
+    fn loaded(loaded: Option<bool>) -> Self {
+        Self { loaded, ..Default::default() }
+    }
+
+    /// Is a daemon process there? The direct process reading WINS over the LaunchAgent
+    /// registration; the registration is only the fallback when no process reading was taken.
+    fn is_alive(&self) -> Option<bool> {
+        self.alive.or(self.loaded)
+    }
+}
+
+/// Classify roborev's health from a `status` probe plus whatever [`DaemonEvidence`] we could
+/// collect. PURE, so every branch is tested without a daemon.
 ///
 /// roborev is NEVER `Blocking`: review stopping does not stop merges or deploys, so its worst state
 /// is `Warning`. The caller decides `NotApplicable` (roborev disabled) before reaching here.
-///
-/// `daemon_loaded` only refines the WORDING of a not-running result — wedged (registered but
-/// unresponsive) vs plainly down — and the remedy that follows. Both are `Warning`.
-fn classify_roborev(status: &StatusProbe, daemon_loaded: Option<bool>) -> (HealthState, String) {
+fn classify_roborev(status: &StatusProbe, evidence: DaemonEvidence) -> (HealthState, String) {
     match status {
-        StatusProbe::TimedOut => (
-            HealthState::Warning,
-            format!(
-                "roborev status did not respond within {ROBOREV_STATUS_TIMEOUT_SECS}s — the review \
-                 daemon appears wedged. Code review is stopped; merges and deploys are unaffected. \
-                 Recover with `roborev daemon stop && roborev daemon start`."
-            ),
-        ),
+        // A TIMEOUT is not a diagnosis. See `classify_not_answering` for why this no longer says
+        // "wedged" on its own evidence.
+        StatusProbe::TimedOut => classify_not_answering(true, evidence),
         StatusProbe::Failed(err) => {
-            // roborev's own "failed to connect to daemon" wording — the daemon is down or wedged.
+            // roborev's own "failed to connect to daemon" wording — down, wedged, or merely slow.
             if err.to_lowercase().contains("connect to daemon") {
-                down_or_wedged(daemon_loaded)
+                classify_not_answering(false, evidence)
             } else {
                 (
                     HealthState::Unknown,
@@ -198,7 +228,7 @@ fn classify_roborev(status: &StatusProbe, daemon_loaded: Option<bool>) -> (Healt
                 .unwrap_or("")
                 .to_ascii_lowercase();
             if daemon_line.contains("not running") {
-                down_or_wedged(daemon_loaded)
+                classify_not_answering(false, evidence)
             } else if daemon_line.contains("running") {
                 classify_running(out)
             } else {
@@ -398,29 +428,122 @@ fn classify_running(out: &str) -> (HealthState, String) {
     }
 }
 
-/// The not-running result. Wedged vs down changes only the wording and the remedy; both `Warning`.
-fn down_or_wedged(daemon_loaded: Option<bool>) -> (HealthState, String) {
-    let detail = match daemon_loaded {
-        // The LaunchAgent is loaded but the daemon does not answer — the classic wedge (a lingering
-        // process holding the port). A plain `start` cannot recover this; only stop-then-start does.
-        Some(true) => {
-            "roborev daemon is registered but not responding — it appears wedged. Code review is \
-             stopped; merges and deploys are unaffected. Recover with `roborev daemon stop && \
-             roborev daemon start`."
-        }
-        // Not loaded and not answering — genuinely down. A plain start brings it back.
-        Some(false) => {
-            "roborev daemon is not running — code review is stopped. Merges and deploys are \
-             unaffected. Start it with `roborev daemon start`."
-        }
-        // We could not ask launchd (non-macOS, or the probe failed). Give the recovery that works in
-        // both cases.
-        None => {
-            "roborev daemon is not responding — code review is stopped. Merges and deploys are \
-             unaffected. Recover with `roborev daemon stop && roborev daemon start`."
-        }
+/// THE NOT-ANSWERING RESULT — three causes, three remedies (bead `sparkle-4i8kd6`).
+///
+/// This used to fold every silent-daemon shape onto one word ("wedged") and one instruction
+/// ("Recover with `roborev daemon stop && roborev daemon start`"). Measured on the founder's
+/// machine, both halves were wrong at once:
+///   * `~/.roborev/reviews.db` had grown to 860MB (17589 completed + 4377 failed jobs). Opening a
+///     store that size takes ~20s, so the 8s bound above expires first and the probe reports its OWN
+///     client-side timeout as a dead daemon — while the launchd-supervised process is alive and
+///     serving reviews throughout. The chip flapped WARNING→healthy three times in an hour.
+///   * The prescribed remedy is HARMFUL. `roborev daemon start` is broken on this macOS (it needs
+///     `setsid`; scripts/roborev-maintenance.sh's header records the finding), launchd's KeepAlive
+///     re-starts whatever `stop` stopped, and each failed `start` leaves an ORPHAN that cannot bind
+///     127.0.0.1:7373. Three were created by following this very text before it was noticed.
+///
+/// A remedy is an INSTRUCTION the reader will follow, so it must be safe under the conditions that
+/// produced it (AGENTS.md, bead `sparkle-8bvh`). So the verdict now splits on evidence:
+///   SLOW  — process alive + a bloated store → name the store, point at compaction, forbid a restart
+///   WEDGE — process alive + a small store   → a real wedge; `launchctl kickstart -k`
+///   DOWN  — no daemon process               → start it via launchd, not the broken subcommand
+///   UNDETERMINED — the evidence is unreadable → say so and diagnose; NEVER restart blind
+/// All four are `Warning`: a down or unreadable daemon must never read as "nothing to do".
+///
+/// Mirrored by `ph_classify_roborev_not_answering` in scripts/lib/pipeline-health.sh.
+fn classify_not_answering(timed_out: bool, ev: DaemonEvidence) -> (HealthState, String) {
+    let why = if timed_out {
+        format!("roborev status did not answer within {ROBOREV_STATUS_TIMEOUT_SECS}s")
+    } else {
+        "roborev could not reach its review daemon".to_string()
     };
-    (HealthState::Warning, detail.to_string())
+    let db_mb = ev.db_bytes.map(|b| b / 1_048_576);
+    let bloated = ev.db_bytes.is_some_and(|b| b >= ROBOREV_DB_BLOAT_BYTES);
+
+    // DOWN — no process at all. Not a wedge, and the remedy is launchd's, because `roborev daemon
+    // start` cannot bring it back on this machine.
+    if ev.is_alive() == Some(false) {
+        let detail = if ev.loaded == Some(false) {
+            format!(
+                "{why}, and there is no roborev daemon process and launchd does not have the agent \
+                 loaded — the review daemon is not running. Code review is stopped; merges and \
+                 deploys are unaffected. Start it with `launchctl bootstrap gui/$(id -u) \
+                 ~/Library/LaunchAgents/co.plow.roborev-daemon.plist`; `roborev daemon start` is \
+                 broken on this machine (it needs setsid) and each failed attempt leaves an orphan \
+                 holding 127.0.0.1:7373."
+            )
+        } else {
+            format!(
+                "{why}, and there is no roborev daemon process — the review daemon is not running. \
+                 Code review is stopped; merges and deploys are unaffected. Start it with \
+                 `launchctl kickstart -k gui/$(id -u)/co.plow.roborev-daemon`; `roborev daemon \
+                 start` is broken on this machine (it needs setsid) and each failed attempt leaves \
+                 an orphan holding 127.0.0.1:7373."
+            )
+        };
+        return (HealthState::Warning, detail);
+    }
+
+    if ev.is_alive() == Some(true) {
+        if let Some(mb) = db_mb {
+            // SLOW — the store alone explains the silence, and a restart cannot shrink a store.
+            if bloated {
+                return (
+                    HealthState::Warning,
+                    format!(
+                        "{why}, but the daemon process is ALIVE and {ROBOREV_DB_LABEL} is {mb} MB — \
+                         this is SLOW, not wedged: a store that size takes longer to open than the \
+                         {ROBOREV_STATUS_TIMEOUT_SECS}s probe waits, so the probe is reporting its \
+                         own timeout. Reviews are queued behind a contended store; merges and \
+                         deploys are unaffected. Do NOT run `roborev daemon stop && roborev daemon \
+                         start` — it is broken on this machine, launchd restarts whatever you stop, \
+                         and the failed start orphans a process holding 127.0.0.1:7373. The store \
+                         size is the disease: check `scripts/roborev-maintenance.sh --status`, then \
+                         shrink it offline with `scripts/roborev-maintenance.sh --compact`."
+                    ),
+                );
+            }
+            // WEDGE — alive, and the store is demonstrably small, so the daemon itself is stuck.
+            return (
+                HealthState::Warning,
+                format!(
+                    "{why}, the daemon process is ALIVE, and {ROBOREV_DB_LABEL} is only {mb} MB — so \
+                     this is a genuine WEDGE, not store slowness. Code review is stopped; merges \
+                     and deploys are unaffected. Restart it with `launchctl kickstart -k \
+                     gui/$(id -u)/co.plow.roborev-daemon` — NOT `roborev daemon stop && roborev \
+                     daemon start`, which is broken on this machine (launchd restarts what you \
+                     stopped, and the failed start orphans a process holding 127.0.0.1:7373)."
+                ),
+            );
+        }
+    }
+
+    // UNDETERMINED — we cannot tell SLOW from WEDGED, and they need opposite remedies. Say so.
+    let evidence = match (ev.is_alive(), db_mb, bloated) {
+        (Some(true), _, _) => {
+            format!("the daemon process is alive, but {ROBOREV_DB_LABEL} could not be read")
+        }
+        (_, Some(mb), true) => format!(
+            "no process reading was taken, though {ROBOREV_DB_LABEL} is {mb} MB, which on its own \
+             can explain the silence"
+        ),
+        (_, Some(mb), false) => {
+            format!("no process reading was taken, and {ROBOREV_DB_LABEL} is only {mb} MB")
+        }
+        _ => format!("neither the daemon process nor {ROBOREV_DB_LABEL} could be read"),
+    };
+    (
+        HealthState::Warning,
+        format!(
+            "{why}, and the cause is UNDETERMINED: {evidence}. A daemon that is merely slow behind \
+             a bloated store and one that is genuinely wedged look identical from here and need \
+             opposite remedies, so diagnose before restarting: \
+             `scripts/roborev-maintenance.sh --status`, and `pgrep -fl \"roborev daemon\"`. Code \
+             review may be stopped; merges and deploys are unaffected. Do not restart blind — \
+             `roborev daemon stop && roborev daemon start` is broken on this machine and orphans a \
+             process holding 127.0.0.1:7373."
+        ),
+    )
 }
 
 /// Pull the `Jobs:` line out of `roborev status` for the panel detail, e.g.
@@ -1721,6 +1844,26 @@ fn roborev_daemon_loaded() -> Option<bool> {
     None
 }
 
+/// Is there a `roborev daemon` PROCESS? This is the reading that separates a daemon that is merely
+/// SLOW (alive, behind a bloated store) from one that is genuinely DOWN — and the LaunchAgent
+/// registration cannot answer it, because a registered agent whose process died still prints as
+/// loaded. `None` when `pgrep` is unavailable or could not be run: unknown, never a guessed `false`.
+fn roborev_daemon_alive() -> Option<bool> {
+    let out = Command::new("pgrep").args(["-f", "roborev daemon"]).output().ok()?;
+    Some(out.status.success())
+}
+
+/// Size of the roborev store in bytes — `reviews.db` plus its `-wal` sidecar, because an
+/// uncheckpointed WAL is part of what has to be opened. `None` when it cannot be read (no `HOME`,
+/// no such file): unknown, never `0`, which would be a positive claim that the store is small.
+fn roborev_db_bytes() -> Option<u64> {
+    let home = std::env::var("HOME").ok()?;
+    let db = std::path::Path::new(&home).join(".roborev").join("reviews.db");
+    let main = std::fs::metadata(&db).ok()?.len();
+    let wal = std::fs::metadata(db.with_extension("db-wal")).map(|m| m.len()).unwrap_or(0);
+    Some(main + wal)
+}
+
 /// The current user's numeric uid, for the launchd `gui/<uid>` domain. `None` if `id -u` is
 /// unreadable.
 #[cfg(target_os = "macos")]
@@ -1750,13 +1893,28 @@ fn roborev_component(root: &str) -> ComponentHealth {
         // Safe to unwrap: `enabled` proved the path resolves.
         let program = crate::preflight::cached_roborev_path().unwrap();
         let status = probe_roborev_status(&program, root);
-        let loaded = if matches!(status, StatusProbe::Text(_) | StatusProbe::Failed(_)) {
-            roborev_daemon_loaded()
-        } else {
-            // A timeout already tells us it is wedged; no need to also ask launchd.
-            None
+        // Collect the WHY-evidence for every non-answering shape, INCLUDING a timeout. A timeout
+        // used to short-circuit to "wedged" without asking anything further, which is precisely how
+        // a healthy daemon behind an 860MB store got reported as wedged (bead sparkle-4i8kd6).
+        // Each reading costs a subprocess, so they are taken only for the shapes whose remedy
+        // depends on them: a daemon that did not answer, or one that says it is not running.
+        let not_answering = match &status {
+            StatusProbe::TimedOut | StatusProbe::Failed(_) => true,
+            StatusProbe::Text(out) => out
+                .lines()
+                .find(|l| l.trim_start().starts_with("Daemon:"))
+                .is_some_and(|l| l.to_ascii_lowercase().contains("not running")),
         };
-        classify_roborev(&status, loaded)
+        let evidence = if not_answering {
+            DaemonEvidence {
+                loaded: roborev_daemon_loaded(),
+                alive: roborev_daemon_alive(),
+                db_bytes: roborev_db_bytes(),
+            }
+        } else {
+            DaemonEvidence::default()
+        };
+        classify_roborev(&status, evidence)
     };
     ComponentHealth {
         id: "roborev".to_string(),
@@ -2080,51 +2238,122 @@ mod tests {
 
     // ── roborev ─────────────────────────────────────────────────────────────────────────────────
 
-    /// THE seed incident: `roborev status` hangs (the daemon's socket accepts but never replies).
-    /// That timeout must classify as WEDGED → WARNING, and the detail must name the stop-then-start
-    /// recovery that actually works (a plain `start` cannot reclaim the held port).
+    /// Does this text TELL the reader to run the restart that is broken on this machine? NOT a bare
+    /// substring test: every verdict below NAMES `roborev daemon stop && roborev daemon start` in
+    /// order to warn the reader OFF it, so a substring test would pin the defect while reading
+    /// green. What separates the two is the imperative.
+    fn prescribes_daemon_restart(detail: &str) -> bool {
+        detail.contains("Recover with `roborev daemon stop")
+            || detail.contains("Start it with `roborev daemon start`")
+    }
+
+    /// The helper above must keep recognising the OLD prescription (or every negative assertion
+    /// below is vacuous) and must NOT fire on a prohibition (or every positive one is unreachable).
     #[test]
-    fn a_timed_out_status_is_a_wedge_warning_with_the_recovery_that_works() {
-        let (state, detail) = classify_roborev(&StatusProbe::TimedOut, None);
-        assert_eq!(state, HealthState::Warning, "a wedged daemon is a warning, not healthy");
-        assert!(detail.contains("wedged"), "the detail must name the wedge: {detail}");
+    fn prescribes_daemon_restart_recognises_the_prescription_but_not_the_prohibition() {
+        assert!(prescribes_daemon_restart(
+            "x. Recover with `roborev daemon stop && roborev daemon start`."
+        ));
+        assert!(prescribes_daemon_restart("x. Start it with `roborev daemon start`."));
+        assert!(!prescribes_daemon_restart(
+            "Do NOT run `roborev daemon stop && roborev daemon start` — it orphans a process."
+        ));
+    }
+
+    fn evidence(alive: Option<bool>, loaded: Option<bool>, db_bytes: Option<u64>) -> DaemonEvidence {
+        DaemonEvidence { loaded, alive, db_bytes }
+    }
+
+    const RB_BLOATED: u64 = 901_775_360; // 860 MB — the measured size of the founder's store
+    const RB_SMALL: u64 = 5_242_880; // 5 MB
+
+    /// THE MEASURED PRODUCTION SHAPE (bead `sparkle-4i8kd6`): `roborev status` times out while the
+    /// daemon is ALIVE and its store is 860MB. That is SLOW, not wedged — and the old verdict's
+    /// remedy (`roborev daemon stop && roborev daemon start`) is broken on this machine and orphans
+    /// a process holding the port, so it must not be prescribed here.
+    #[test]
+    fn a_timed_out_status_behind_a_bloated_store_is_slow_not_wedged() {
+        let (state, detail) =
+            classify_roborev(&StatusProbe::TimedOut, evidence(Some(true), Some(true), Some(RB_BLOATED)));
+        assert_eq!(state, HealthState::Warning, "a degraded review daemon is a warning, not healthy");
+        assert!(detail.contains("860 MB"), "the store SIZE is the actionable number: {detail}");
+        assert!(detail.contains(ROBOREV_DB_LABEL), "and the store itself must be named: {detail}");
         assert!(
-            detail.contains("roborev daemon stop && roborev daemon start"),
-            "and the recovery that works — a plain start cannot reclaim the port: {detail}"
+            detail.contains("scripts/roborev-maintenance.sh --compact"),
+            "the remedy must be the one that shrinks the store: {detail}"
         );
-        // Non-blocking: review stops but deploys proceed. This is the severity crux for roborev.
+        assert!(
+            !prescribes_daemon_restart(&detail),
+            "a restart cannot shrink a store, and this one orphans a process: {detail}"
+        );
+        assert!(!detail.contains("appears wedged"), "a slow daemon is not a wedged one: {detail}");
+        // Non-blocking: review degrades but deploys proceed. The severity crux for roborev.
         assert!(
             detail.contains("merges and deploys are unaffected"),
-            "roborev down must say deploys still work: {detail}"
+            "roborev degradation must say deploys still work: {detail}"
         );
     }
 
-    /// The OTHER wedge shape observed in the seed session: `roborev status` returns cleanly but says
-    /// "Daemon: not running" while the process lingers. With launchd reporting the agent still
-    /// loaded, that is a wedge (registered but unresponsive) → WARNING, stop-then-start.
+    /// THE PAIRED CASE, differing ONLY in the store size: the same alive-but-silent daemon behind a
+    /// SMALL store IS a wedge and must still be reported as one — otherwise "never say wedged" would
+    /// pass just as well. The restart it names is the one that works here.
     #[test]
-    fn status_says_not_running_while_launchd_says_loaded_is_a_wedge() {
+    fn not_running_while_alive_with_a_small_store_is_a_real_wedge() {
         let out = "Daemon: not running\n".to_string();
-        let (state, detail) = classify_roborev(&StatusProbe::Text(out), Some(true));
+        let (state, detail) =
+            classify_roborev(&StatusProbe::Text(out), evidence(Some(true), Some(true), Some(RB_SMALL)));
         assert_eq!(state, HealthState::Warning);
-        assert!(detail.contains("wedged"), "registered-but-unresponsive is a wedge: {detail}");
-        assert!(detail.contains("stop && roborev daemon start"), "needs stop+start: {detail}");
+        assert!(detail.contains("WEDGE"), "alive + a small store is the genuine wedge: {detail}");
+        assert!(
+            detail.contains("launchctl kickstart -k"),
+            "the wedge remedy must be the restart that works on this machine: {detail}"
+        );
+        assert!(!prescribes_daemon_restart(&detail), "even a wedge must not prescribe it: {detail}");
     }
 
-    /// Not running AND not loaded is genuinely down — still WARNING (review only), but the remedy is
-    /// a plain start, not stop-then-start. Pins that `daemon_loaded` actually changes the outcome.
+    /// No daemon process at all is genuinely DOWN — still WARNING (review only), never "wedged", and
+    /// the remedy is launchd's, because `roborev daemon start` cannot bring it back here.
     #[test]
-    fn not_running_and_not_loaded_is_down_with_a_plain_start() {
+    fn no_daemon_process_is_down_not_wedged() {
         let out = "Daemon: not running\n".to_string();
-        let (state, detail) = classify_roborev(&StatusProbe::Text(out), Some(false));
+        let (state, detail) =
+            classify_roborev(&StatusProbe::Text(out), evidence(Some(false), Some(false), Some(RB_SMALL)));
         assert_eq!(state, HealthState::Warning);
         assert!(detail.contains("not running"), "{detail}");
+        assert!(detail.contains("launchctl bootstrap"), "start it through launchd: {detail}");
+        assert!(!detail.to_lowercase().contains("wedge"), "a dead daemon is not wedged: {detail}");
+        assert!(!prescribes_daemon_restart(&detail), "the roborev subcommand is broken here: {detail}");
+    }
+
+    /// THE UNREADABLE CASE — no evidence at all. SLOW and WEDGED need opposite remedies, so the only
+    /// honest verdict is "diagnose first", and it must still be a WARNING: an unreadable or down
+    /// review daemon must never render as "nothing to do".
+    #[test]
+    fn no_evidence_is_undetermined_and_never_restarts_blind() {
+        for probe in [StatusProbe::TimedOut, StatusProbe::Text("Daemon: not running\n".into())] {
+            let (state, detail) = classify_roborev(&probe, DaemonEvidence::default());
+            assert_eq!(state, HealthState::Warning, "never silent: {detail}");
+            assert!(detail.contains("UNDETERMINED"), "say what we do not know: {detail}");
+            assert!(
+                detail.contains("scripts/roborev-maintenance.sh --status"),
+                "and name the diagnostic that settles it: {detail}"
+            );
+            assert!(!prescribes_daemon_restart(&detail), "never restart blind: {detail}");
+        }
+    }
+
+    /// A PROCESS reading outranks the LaunchAgent registration: a registered agent whose process
+    /// died still prints as loaded, so `loaded` alone must not keep a dead daemon out of the DOWN
+    /// verdict. Pins that `alive` is actually consulted rather than being decoration.
+    #[test]
+    fn a_process_reading_outranks_the_launchagent_registration() {
+        let out = "Daemon: not running\n".to_string();
+        let (_, detail) =
+            classify_roborev(&StatusProbe::Text(out), evidence(Some(false), Some(true), Some(RB_SMALL)));
         assert!(
-            detail.contains("Start it with `roborev daemon start`"),
-            "a plain start recovers a down (not wedged) daemon: {detail}"
+            detail.contains("there is no roborev daemon process"),
+            "a loaded agent with no process is DOWN, not wedged: {detail}"
         );
-        // And it must NOT prescribe the wedge remedy — that is what proves loaded/not-loaded diverge.
-        assert!(!detail.contains("stop && roborev daemon start"), "down is not wedged: {detail}");
     }
 
     /// THE healthy negative case, so the classifier is not vacuously always-unhealthy: the real
@@ -2138,7 +2367,7 @@ mod tests {
                    \n\
                    Health: OK\n  + database: healthy\n  + workers: healthy\n"
             .to_string();
-        let (state, detail) = classify_roborev(&StatusProbe::Text(out), Some(true));
+        let (state, detail) = classify_roborev(&StatusProbe::Text(out), DaemonEvidence::loaded(Some(true)));
         assert_eq!(state, HealthState::Healthy, "a running, OK daemon is green");
         assert!(detail.contains("14 queued"), "the panel detail carries the queue: {detail}");
         assert!(detail.contains("15488 completed"), "{detail}");
@@ -2151,7 +2380,7 @@ mod tests {
         let out = "Daemon: running (uptime: 1h) [v0.53.1]\n\
                    Health: DEGRADED\n  - database: unhealthy\n"
             .to_string();
-        let (state, detail) = classify_roborev(&StatusProbe::Text(out), Some(true));
+        let (state, detail) = classify_roborev(&StatusProbe::Text(out), DaemonEvidence::loaded(Some(true)));
         assert_eq!(state, HealthState::Warning);
         assert!(detail.to_lowercase().contains("degraded"), "{detail}");
     }
@@ -2173,7 +2402,7 @@ mod tests {
                    Recent Errors (last 24h): 100\n  \
                    [11m0s ago] worker: claim job: database is locked (5) (SQLITE_BUSY)\n"
             .to_string();
-        let (state, detail) = classify_roborev(&StatusProbe::Text(out), Some(true));
+        let (state, detail) = classify_roborev(&StatusProbe::Text(out), DaemonEvidence::loaded(Some(true)));
         assert_eq!(
             state,
             HealthState::Healthy,
@@ -2194,7 +2423,7 @@ mod tests {
                    Health: DEGRADED\n  - database: unhealthy\n  \
                    ! workers: 7 stalled job(s) running > 30 min\n"
             .to_string();
-        let (state, detail) = classify_roborev(&StatusProbe::Text(out), Some(true));
+        let (state, detail) = classify_roborev(&StatusProbe::Text(out), DaemonEvidence::loaded(Some(true)));
         assert_eq!(state, HealthState::Warning, "a sick database is not debris: {detail}");
         assert!(detail.to_lowercase().contains("degraded"), "{detail}");
     }
@@ -2206,7 +2435,7 @@ mod tests {
         let out = "Daemon: running [v0.53.1]\n\
                    Health: DEGRADED\n  ! database: replication lag 40s\n"
             .to_string();
-        let (state, _) = classify_roborev(&StatusProbe::Text(out), Some(true));
+        let (state, _) = classify_roborev(&StatusProbe::Text(out), DaemonEvidence::loaded(Some(true)));
         assert_eq!(state, HealthState::Warning);
     }
 
@@ -2215,7 +2444,7 @@ mod tests {
     #[test]
     fn a_bare_degraded_with_no_subsystems_stays_a_warning() {
         let out = "Daemon: running [v0.53.1]\nHealth: DEGRADED\n".to_string();
-        let (state, _) = classify_roborev(&StatusProbe::Text(out), Some(true));
+        let (state, _) = classify_roborev(&StatusProbe::Text(out), DaemonEvidence::loaded(Some(true)));
         assert_eq!(state, HealthState::Warning, "unconfirmable degradation is honest amber");
     }
 
@@ -2230,7 +2459,7 @@ mod tests {
                    Health: DEGRADED\n  ! workers: 7 stalled job(s) running > 30 min\n  \
                    - database: unhealthy\n"
             .to_string();
-        let (state, _) = classify_roborev(&StatusProbe::Text(out), Some(true));
+        let (state, _) = classify_roborev(&StatusProbe::Text(out), DaemonEvidence::loaded(Some(true)));
         assert_eq!(state, HealthState::Warning, "a hard line below the debris must be seen");
     }
 
@@ -2243,7 +2472,7 @@ mod tests {
                    Health: DEGRADED\n  ! workers: 7 stalled job(s) running > 30 min\n  \
                    \u{2717} database: connection refused\n"
             .to_string();
-        let (state, _) = classify_roborev(&StatusProbe::Text(out), Some(true));
+        let (state, _) = classify_roborev(&StatusProbe::Text(out), DaemonEvidence::loaded(Some(true)));
         assert_eq!(state, HealthState::Warning, "an unclassifiable line is not proof of benign");
     }
 
@@ -2255,7 +2484,7 @@ mod tests {
         let out = "Daemon: running\nWorkers: 2/4 active\n\
                    Health: DEGRADED\n  ! workers: 2 workers down, 7 stalled job(s) running > 30 min\n"
             .to_string();
-        let (state, _) = classify_roborev(&StatusProbe::Text(out), Some(true));
+        let (state, _) = classify_roborev(&StatusProbe::Text(out), DaemonEvidence::loaded(Some(true)));
         assert_eq!(state, HealthState::Warning, "an explicit fault word is not benign debris");
     }
 
@@ -2267,7 +2496,7 @@ mod tests {
         let out = "Daemon: running\nWorkers: 4/4 active\n\
                    Health: DEGRADED\n  ! workers: 4/4 active, 7 stalled job(s) running > 30 min\n"
             .to_string();
-        let (state, detail) = classify_roborev(&StatusProbe::Text(out), Some(true));
+        let (state, detail) = classify_roborev(&StatusProbe::Text(out), DaemonEvidence::loaded(Some(true)));
         assert_eq!(state, HealthState::Healthy, "a healthy worker count is not a fault: {detail}");
     }
 
@@ -2288,7 +2517,7 @@ mod tests {
                 "Daemon: running\nWorkers: 4/4 active\n{h}\n  \
                  ! workers: 7 stalled job(s) running > 30 min\n"
             );
-            let (state, _) = classify_roborev(&StatusProbe::Text(out), Some(true));
+            let (state, _) = classify_roborev(&StatusProbe::Text(out), DaemonEvidence::loaded(Some(true)));
             assert_eq!(state, HealthState::Warning, "{tag}");
         }
     }
@@ -2303,14 +2532,14 @@ mod tests {
                    Health: DEGRADED\n  ! workers: 7 stalled job(s) running > 30 min\n  \
                    ! disk usage above 95%\n"
             .to_string();
-        let (state, _) = classify_roborev(&StatusProbe::Text(out), Some(true));
+        let (state, _) = classify_roborev(&StatusProbe::Text(out), DaemonEvidence::loaded(Some(true)));
         assert_eq!(state, HealthState::Warning, "a colon-less marker line is unclassifiable");
 
         let with_hard = "Daemon: running\nWorkers: 4/4 active\n\
                          Health: DEGRADED\n  ! disk usage above 95%\n  \
                          - database: unhealthy\n"
             .to_string();
-        let (state, _) = classify_roborev(&StatusProbe::Text(with_hard), Some(true));
+        let (state, _) = classify_roborev(&StatusProbe::Text(with_hard), DaemonEvidence::loaded(Some(true)));
         assert_eq!(state, HealthState::Warning, "the hard line below is still collected");
     }
 
@@ -2319,10 +2548,10 @@ mod tests {
     #[test]
     fn connect_failure_is_down_but_an_unrelated_failure_is_unknown() {
         let (down, _) =
-            classify_roborev(&StatusProbe::Failed("failed to connect to daemon: x".into()), Some(true));
+            classify_roborev(&StatusProbe::Failed("failed to connect to daemon: x".into()), DaemonEvidence::loaded(Some(true)));
         assert_eq!(down, HealthState::Warning);
         let (unknown, detail) =
-            classify_roborev(&StatusProbe::Failed("some other CLI explosion".into()), None);
+            classify_roborev(&StatusProbe::Failed("some other CLI explosion".into()), DaemonEvidence::loaded(None));
         assert_eq!(unknown, HealthState::Unknown, "an unrelated error is not a daemon verdict");
         assert!(detail.contains("some other CLI explosion"), "carries the tool's words: {detail}");
     }

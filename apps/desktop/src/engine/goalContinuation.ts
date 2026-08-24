@@ -164,7 +164,20 @@ export type NoContinueReason =
    *  reading expired). Fails closed — see `CloudEvidence.sessionStatus`. */
   | "cloud-session-unknown"
   /** The desktop's relay socket is down, so `CloudTransport.write` would silently no-op. */
-  | "cloud-offline";
+  | "cloud-offline"
+  /**
+   * PARKED BEHIND A GATE THIS AGENT CANNOT HURRY — see {@link ExternalWait}.
+   *
+   * The one refusal on this list that is a statement about the agent's HEALTH rather than about an
+   * obstacle to resuming it: the agent is fine, its work is in front of CI or a reviewer, and the
+   * correct thing for it to do is nothing. It is neither continued (a resume would re-bill a whole
+   * context to say "still waiting") nor escalated (nobody can hurry the queue).
+   *
+   * NOT `already-escalated`, and not silence either. The concierge reads these reasons out, and
+   * "auto-continue gave up and a human owns this now" and "it is waiting on CI and will pick itself
+   * up when the run concludes" are opposite claims about whether anyone needs to act.
+   */
+  | "external-wait";
 
 export type ContinuationDecision =
   | { action: "continue"; prompt: string; attempt: number }
@@ -209,12 +222,73 @@ export type ContinuationDecision =
  * of the agent's hands and in front of a gate. A red or conflicted PR is inside that proxy too, and
  * that is a deliberate trade — being wrong there costs a LATE page at the ceiling; being wrong the
  * other way is the false page this exists to remove.
+ *
+ * ── WHAT THE FIRST CUT OF THIS GATE STILL GOT WRONG (sparkle-yxl05z) ────────────────────────────
+ * It suppressed the streak DIAGNOSIS and left the two things the founder went on to measure:
+ *
+ *   • THE CEILING STILL PAGED HIM — five agents in one day, each holding a MERGEABLE PR whose only
+ *     outstanding job was a coverage run on a runner pool with all 21 runners busy. The ceiling's
+ *     sentence is about the SPEND, which is true, and it is still a page a human can do nothing
+ *     with. Worse, it is a FEEDBACK LOOP: more agents → more PRs → a longer queue → longer waits →
+ *     more agents hitting the ceiling, so the ladder gets loudest exactly when the fleet is most
+ *     productive. Raising the ceiling cannot fix that; the wait is a function of queue depth and no
+ *     constant is both big enough for a saturated pool and small enough to catch a wedged agent.
+ *   • IT KEPT RESUMING, AND EACH RESUME COST A WHOLE CONTEXT — measured first-hand: ~2 hours
+ *     legitimately blocked on CI wall-clock across several PRs, woken again and again by "your goal
+ *     is not met yet, so you are being resumed automatically", every wake re-billing the entire
+ *     session context to produce the sentence "still waiting on CI".
+ *
+ * So the gate now PARKS: while it is live and nothing has moved, the ladder neither pages a human
+ * nor spends a turn ({@link NoContinueReason} `external-wait`). It un-parks by itself, because the
+ * PR reading is folded into the progress mark — a gate that ANSWERS changes the mark, the streak
+ * resets, and the ordinary resume fires. That is the bead's "park on a CI-conclusion watch rather
+ * than a resume timer" with no second clock to drift.
  */
 export type ExternalWait = {
   kind: "open-pr";
   /** For the log line and the resume banner; null when the state was read without a number. */
   prNumber: number | null;
+  /**
+   * Epoch ms this window first saw THIS gate — the same PR, unchanged — or `null` when it cannot
+   * say (it has not swept the agent since the gate appeared; see the runner's ledger).
+   *
+   * ⚠️ `null` MUST NOT BUY SILENCE, and that is the whole reason this is required-but-nullable
+   * rather than optional. Parking is unbounded without an age, so a producer that forgot to measure
+   * one would strand the agent forever behind a gate nobody will ever clear — the one direction
+   * this file's own rule forbids ("a missed stall strands work"). Absent age therefore keeps
+   * TODAY'S behaviour exactly: resume as before, and let {@link MAX_CONTINUES_TOTAL} end at a human.
+   */
+  since: number | null;
 };
+
+/**
+ * How long a gate that has not moved may go on suppressing the escalation.
+ *
+ * THE SAFETY VALVE ON THE PARK ABOVE, and the reason this change is a gate and not a hole. An agent
+ * parked behind a PR nobody will ever merge must still reach a person; without a bound it would sit
+ * silent forever, which is strictly worse than the false page it replaces because at least a false
+ * page is visible.
+ *
+ * THREE HOURS, AND IT IS PINNED FROM BOTH SIDES — neither end is taste.
+ *
+ *   • THE FLOOR is the measurement. The founder's own blocked stretch was ~2 hours across several
+ *     PRs on a pool with all 21 runners busy, and the bead's five specimens were coverage jobs
+ *     queued behind that same pool. A grace at or under two hours would re-create the false page it
+ *     exists to remove, on exactly the fleet conditions that produce the most of them.
+ *   • THE CEILING is `agentGoal.DEFAULT_GOAL_TTL_MS`, which is FOUR hours. A grace at or above the
+ *     TTL is unreachable in production: `goalStateOf` answers `expired` first and `decideContinuation`
+ *     returns `goal-expired` before any bound here is read, so the handover this constant promises
+ *     would never once fire. (Measured — a four-hour draft of this constant produced exactly that,
+ *     and only the loop test that advances a real clock could see it. A test that jumps straight to
+ *     `now = since + GRACE` passes against the unreachable version, because it never lets the TTL
+ *     elapse. Advance the clock in steps.)
+ *
+ * Three sits an hour above the worst observed queue and an hour below the TTL, so a genuinely
+ * wedged agent is handed over while its goal is still live. This is deliberately NOT a
+ * re-derivation of the ceiling: that bound counts restarts, and a parked agent stops spending them.
+ * This one is a WALL-CLOCK claim about the gate, and what it must outlast is a CI queue.
+ */
+export const EXTERNAL_WAIT_GRACE_MS = 3 * 60 * 60 * 1_000;
 
 /**
  * What this window knows about a CLOUD agent's sandbox. Required whenever `runtime` is `"cloud"`.
@@ -488,23 +562,58 @@ export function decideContinuation(input: ContinuationInput): ContinuationDecisi
   // fresh one (mirroring agentGoal.noteContinue, which applies the same rule when recording).
   const progressed = live.mark !== undefined && live.mark !== mark;
   const consecutive = progressed ? 0 : live.continues;
+  // ── HOW OLD IS THE GATE, AND IS IT STILL AN EXPLANATION? ────────────────────────────────────
+  // Three states, and they are NOT two — collapsing the middle one is how this fails unsafely.
+  //   LIVE    — a gate we have watched for less than the grace. Waiting explains the quiet.
+  //   STALE   — a gate that has not moved for longer than the grace. Waiting no longer explains
+  //             anything, so somebody has to look; see EXTERNAL_WAIT_GRACE_MS.
+  //   UNTIMED — a gate whose age this window cannot state (`since: null`). NOT the same as LIVE:
+  //             parking on it would be unbounded, so it buys nothing at all and the ladder behaves
+  //             exactly as it did before this change.
+  // `typeof === "number"`, not `!== null`, and the difference is load-bearing at RUNTIME rather than
+  // in the types. `since` is required-but-nullable, so a missing key is a compile error — but this
+  // decision is also fed by persisted and cross-window data, and `now - undefined` is `NaN`, which
+  // compares false against BOTH bounds. That would land silently in the UNTIMED arm, which is the
+  // safe one, so nothing would ever look wrong; it would simply mean an omission could never be
+  // found. Reading the type explicitly makes "no age" one state with one spelling.
+  const waitSince = input.externalWait?.since;
+  const waitAgeMs = typeof waitSince === "number" ? now - waitSince : null;
+  const gateLive = waitAgeMs !== null && waitAgeMs < EXTERNAL_WAIT_GRACE_MS;
+  const gateStale = waitAgeMs !== null && waitAgeMs >= EXTERNAL_WAIT_GRACE_MS;
+
   // THE STREAK BOUND IS A DIAGNOSIS, SO IT MUST NOT FIRE WHERE THE DIAGNOSIS IS FALSE. It says
   // "something is blocking it that restarting cannot fix", which is a statement about the agent —
   // and for an agent parked behind an open PR the thing not moving is a CI queue, which the human
-  // this pages can do nothing about either. See {@link ExternalWait}: the gate suppresses the
-  // ESCALATION only, so the agent keeps being restarted (polling the gate and landing the work is
-  // its job) and `MAX_CONTINUES_TOTAL` below still ends the goal at a human — with a sentence about
-  // the spend, which is the one claim the evidence supports.
-  if (consecutive >= MAX_CONTINUES_WITHOUT_PROGRESS && input.externalWait === undefined) {
-    return {
-      action: "escalate",
-      reason:
-        `Auto-continued ${consecutive} times with no sign of progress. The goal is still unmet: ` +
-        `"${live.text}". Something is blocking it that restarting cannot fix.` +
-        whereItRuns(input.runtime),
-    };
+  // this pages can do nothing about either.
+  if (consecutive >= MAX_CONTINUES_WITHOUT_PROGRESS) {
+    if (input.externalWait === undefined) {
+      return {
+        action: "escalate",
+        reason:
+          `Auto-continued ${consecutive} times with no sign of progress. The goal is still unmet: ` +
+          `"${live.text}". Something is blocking it that restarting cannot fix.` +
+          whereItRuns(input.runtime),
+      };
+    }
+    // A GATE THAT HAS OUTLASTED THE GRACE IS NO LONGER AN EXPLANATION. Its own sentence, because
+    // neither of the other two is true here: the streak's diagnosis is still a claim about the
+    // agent that this evidence cannot support, and the ceiling's is about a budget that may be
+    // nowhere near spent — parking stops the spend, so a gated agent typically reaches this arm
+    // holding most of its continues.
+    if (gateStale) return { action: "escalate", reason: staleGateReason(live.text, input) };
+    // PARK: no page, and no resume either. The un-park is the MARK, not a timer — `progressMark`
+    // folds the PR reading in, so the moment the gate answers, `progressed` is true, `consecutive`
+    // resets to 0 and this arm is not reached at all.
+    if (gateLive) return { action: "none", reason: "external-wait" };
+    // UNTIMED: fall through and resume, exactly as before this change.
   }
   if (live.totalContinues >= MAX_CONTINUES_TOTAL) {
+    // THE CEILING IS A CLAIM ABOUT SPEND, AND SPEND IS NOT THE FOUNDER'S PROBLEM TO SOLVE AT 3AM.
+    // This is the arm the bead's five specimens hit: agents that kept making progress (so the
+    // streak above never fired) and hit twenty restarts while a coverage job sat in a queue. The
+    // grace still bounds it — a gate this old escalates through `gateStale` above, or through this
+    // arm once `gateLive` lapses — so the ceiling is deferred, never removed.
+    if (gateLive) return { action: "none", reason: "external-wait" };
     return {
       action: "escalate",
       reason:
@@ -536,6 +645,27 @@ export function decideContinuation(input: ContinuationInput): ContinuationDecisi
     prompt: continuePrompt(live, attempt, input.externalWait),
     attempt,
   };
+}
+
+/**
+ * What to tell a human about an agent whose gate has outlasted {@link EXTERNAL_WAIT_GRACE_MS}.
+ *
+ * NAMES THE GATE AND THE DURATION, because that is the only claim this evidence supports and it is
+ * also the only one that tells the reader where to look. "No sign of progress" would send them
+ * inside the agent's work; "the per-goal ceiling" would send them to a budget. The thing that has
+ * actually not moved is a pull request, and whether it is the gate that is stuck or the agent is
+ * the question a person has to answer by opening it.
+ */
+function staleGateReason(goalText: string, input: ContinuationInput): string {
+  const wait = input.externalWait;
+  const gate = wait === undefined || wait.prNumber === null ? "an open pull request" : `PR #${wait.prNumber}`;
+  const hours = Math.floor(EXTERNAL_WAIT_GRACE_MS / 3_600_000);
+  return (
+    `Parked behind ${gate} for over ${hours}h with nothing moving, and the goal is still unmet: ` +
+    `"${goalText}". A wait that long is no longer an explanation — check whether the gate is stuck ` +
+    `or the agent is.` +
+    whereItRuns(input.runtime)
+  );
 }
 
 /** The resting statuses an auto-continue may act on. See the note at the `not-idle` gate for why
@@ -708,13 +838,22 @@ function repeatedResumeLine(attempt: number, externalWait?: ExternalWait): strin
   // and the ceiling that DOES still apply.
   if (externalWait !== undefined) {
     const pr = externalWait.prNumber === null ? "an open pull request" : `PR #${externalWait.prNumber}`;
+    const hours = Math.floor(EXTERNAL_WAIT_GRACE_MS / 3_600_000);
+    // ⚠️ THE TIMING PROMISE MOVED, SO THIS SENTENCE MOVED WITH IT (sparkle-yxl05z). It used to end
+    // "Resumes on one goal stop at 20", which was the truth while a gated agent went on being
+    // resumed to the ceiling. It no longer does: past the streak bound the ladder PARKS, and the
+    // next resume is caused by the gate's state changing rather than by any count. An agent told
+    // the old sentence would keep waiting for a resume that is not coming, and would read its own
+    // silence as the ceiling approaching. AGENTS.md: a fix that changes WHEN something happens must
+    // update every string that described the old timing.
     return (
       `THIS IS AUTO-RESUME ${attempt} on this goal. Sparkle can see ${pr} on your branch, so it is ` +
       `NOT counting this as a stall — waiting on review or CI is not something you are doing ` +
-      `wrong, and you will not be escalated to a human for it. An identical message arriving twice ` +
-      `is this timer, not the human repeating themselves. If the gate has moved, land the work; if ` +
-      `it is still pending, say so and stop — do not invent work to look busy. Resumes on one goal ` +
-      `stop at ${MAX_CONTINUES_TOTAL}.\n\n`
+      `wrong. An identical message arriving twice is this timer, not the human repeating ` +
+      `themselves. If the gate has moved, land the work; if it is still pending, say so and stop — ` +
+      `do not invent work to look busy. Sparkle will then leave you alone until the gate's state ` +
+      `actually changes, so stopping costs you nothing. If nothing has moved for ${hours}h it goes ` +
+      `to a human.\n\n`
     );
   }
   return (

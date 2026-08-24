@@ -6,6 +6,7 @@ import {
   acknowledgeRemovals,
   PROMPT_HISTORY_LIMIT,
 } from "./projectStore";
+import { crossRepoReading } from "../engine/crossRepo";
 
 describe("projectStore default/base branch", () => {
   beforeEach(() => useProjectStore.setState({ projects: [], selectedProjectId: null }));
@@ -761,34 +762,78 @@ describe("projectStore — the cross-repo assignment latch", () => {
     expect(agent(pid, aid).assignmentRepos).toEqual([]);
   });
 
-  it("an agent that ALREADY has composer history never latches — the migration guard", () => {
-    // Every row persisted before this feature reads `assignmentRepos === undefined`, so the
-    // undefined check alone would latch a mid-conversation prompt as an "opening assignment",
-    // permanently. Simulated here by giving the agent prior composer history and then clearing the
-    // field the way a pre-feature persisted record would have it.
+  // ── THE FALSE NEGATIVE THIS BLOCK USED TO ENSHRINE (bead `sparkle-4htkl3`)
+  //
+  // The two tests that stood here asserted that a hand-briefed agent, and an agent with prior
+  // composer history, never latch. The second of those was reachable ONLY from a pre-latch
+  // persisted row, and the first was catastrophically over-broad: `noteTerminalBrief` fires from
+  // AgentPane's `onSubmitLine` on the FIRST non-empty line typed into the PTY, and that pane has
+  // no composer at all — so `terminalBriefedAt` is set for essentially EVERY hand-started agent,
+  // not for the migration population the clause was written for. The suppression they pinned was
+  // therefore the whole hand-driven fleet, permanently, and no test covered the false negative.
+  //
+  // The migration population is now identified EXACTLY, by the v14 persist step that backfills
+  // `assignmentRepos: []` onto every pre-existing row, and the pair below is what pins the
+  // difference: the latch fires for a terminal-started agent, and still does not fire for a row
+  // that predates the feature.
+
+  it("a TERMINAL-STARTED agent DOES latch on its opening prompt — the false negative", () => {
     const { pid, aid } = seed();
-    useProjectStore.getState().appendPrompt(pid, aid, "some earlier instruction");
-    useProjectStore.setState((st) => ({
-      projects: st.projects.map((p) => ({
-        ...p,
-        agents: p.agents.map((a) =>
-          a.id === aid ? { ...a, assignmentRepos: undefined } : a,
-        ),
-      })),
-    }));
-    useProjectStore.getState().appendPrompt(pid, aid, "port the fix from owner/other#253");
-    expect(agent(pid, aid).assignmentRepos).toBeUndefined();
+    // The human starts this agent the ordinary way: they type straight into its terminal. That is
+    // the stamp — one line, before any prompt is ever recorded for the row.
+    useProjectStore.getState().noteTerminalBrief(pid, aid);
+    expect(agent(pid, aid).terminalBriefedAt).toBeTypeOf("number"); // the earlier gate is satisfied
+    // Its first recorded prompt genuinely IS its opening assignment.
+    useProjectStore.getState().appendPrompt(pid, aid, "ship it in https://github.com/owner/other");
+
+    expect(agent(pid, aid).assignmentRepos).toEqual(["owner/other"]);
+    // …and assert the SIDE EFFECT the latch exists to produce, not just the stored field: the row
+    // reads as assigned to the other repo, which is what puts it under "Tracked Elsewhere".
+    expect(
+      crossRepoReading({
+        assignmentRepos: agent(pid, aid).assignmentRepos,
+        boundSlug: "owner/sparkle",
+      }).assignedRepo,
+    ).toBe("owner/other");
   });
 
-  it("a HAND-BRIEFED agent never latches either — promptHistory alone does not cover it", () => {
-    // An agent driven entirely through its terminal has EMPTY promptHistory (see
-    // `terminalBriefedAt` in types.ts), so the composer-history clause misses exactly that
-    // population and the first composer prompt it ever gets would latch arbitrarily deep into its
-    // life (roborev 67730).
-    const { pid, aid } = seed();
-    useProjectStore.getState().noteTerminalBrief(pid, aid);
-    useProjectStore.getState().appendPrompt(pid, aid, "port the fix from owner/other#253");
-    expect(agent(pid, aid).assignmentRepos).toBeUndefined();
+  it("…and a row PERSISTED BEFORE the latch shipped still never latches — through the real migration", () => {
+    // THE PAIRED CASE, and the reason the terminalBriefedAt heuristic could be dropped rather than
+    // merely narrowed. The hazard was never "this agent was briefed by hand"; it was "this row
+    // existed before `assignmentRepos` did, so `undefined` means UNKNOWN rather than UNLATCHED".
+    // `migratePersisted` answers that exactly — every legacy row comes back latched-EMPTY — so this
+    // drives the real migration rather than synthesizing the post-state by hand.
+    const legacy = migratePersisted(
+      {
+        projects: [
+          {
+            id: "p1",
+            name: "Demo",
+            rootPath: "/tmp/demo",
+            agents: [
+              // A long-running agent from before the feature: no `assignmentRepos` key at all, and
+              // (deliberately) never terminal-briefed, so the ONLY thing that can suppress the
+              // latch here is the migration's backfill.
+              { id: "a1", name: "Build 1", kind: "build", promptHistory: [] },
+            ],
+          },
+        ],
+      },
+      13,
+    ) as { projects: { id: string; agents: { id: string; assignmentRepos?: string[] }[] }[] };
+    expect(legacy.projects[0]!.agents[0]!.assignmentRepos).toEqual([]); // latched empty by upgrade
+
+    useProjectStore.setState({ projects: legacy.projects as never, selectedProjectId: "p1" });
+    // The very prompt the hazard is about: a mid-life instruction naming another repo.
+    useProjectStore.getState().appendPrompt("p1", "a1", "port the fix from owner/other#253");
+
+    expect(agent("p1", "a1").assignmentRepos).toEqual([]); // NOT ["owner/other"] — never re-latched
+    expect(
+      crossRepoReading({
+        assignmentRepos: agent("p1", "a1").assignmentRepos,
+        boundSlug: "owner/sparkle",
+      }).assignedRepo,
+    ).toBeUndefined();
   });
 
   it("a PICKER answer latches nothing — it answers the agent's question, not the human's", () => {

@@ -182,10 +182,21 @@ export function localAgentCapacity(): CapacityReading {
     const narrowed = Math.max(1, Math.min(staticLimit, Math.floor(admission.effective)));
     if (narrowed < staticLimit) {
       limit = narrowed;
-      // Take the sampled basis ONLY when it actually binds, so the refusal names memory instead of
-      // cores. A reading that agrees with the static ceiling must not relabel a CPU-bound machine
-      // as memory-bound — naming the wrong dimension is the exact bug `basis` exists to close, and
-      // it already sent one human chasing memory that was 94% free (roborev 54175).
+    }
+    // Take the sampled basis ONLY when something actually refused, so the refusal names memory
+    // instead of cores. A reading that agrees with the static ceiling must not relabel a CPU-bound
+    // machine as memory-bound — naming the wrong dimension is the exact bug `basis` exists to close,
+    // and it already sent one human chasing memory that was 94% free (roborev 54175).
+    //
+    // `bound === "load"` IS such a refusal even when its number does not undercut `staticLimit`
+    // (bead `sparkle-iyxxin`). The run queue is a RATE, so its `effective` is "hold at what is
+    // already running" — on a fleet already past the enforced cap that lands at or above
+    // `staticLimit`, the number-based guard above discards it, and the refusal that DOES happen
+    // (`used >= limit`) then cites the static ceiling. That tells a human at 21.5x per-core load to
+    // think about hardware they cannot change, when the answer is to wait for the queue to drain.
+    // Note this can only ever fire while at capacity: `narrowed >= staticLimit` requires the
+    // resident count to be at least `staticLimit`, and `used >= live` always.
+    if (narrowed < staticLimit || admission.bound === "load") {
       basis = admission.basis?.trim() || basis;
     }
   }

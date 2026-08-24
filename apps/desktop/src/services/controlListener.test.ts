@@ -4468,11 +4468,15 @@ describe("controlListener", () => {
       });
     });
 
-    it("…and an OPEN PR flips it to willResume:true, exactly as the sweep would", async () => {
-      // THE GATE HALF. Its partner above is what carries the mark-parity claim: this case answers
-      // `willResume: true` in BOTH worlds, by different routes (post-fix the gate suppresses the
-      // escalate arm; pre-fix the mark simply differed and the arm was skipped), so on its own it
-      // discriminates nothing. Kept because it pins the gate, which nothing else here does.
+    it("…and an OPEN PR reads as PARKED, exactly as the sweep would", async () => {
+      // THE GATE HALF, and since sparkle-yxl05z it discriminates rather than merely pinning: the
+      // sweep no longer RESUMES a gated agent past the streak bound (each resume re-billed a whole
+      // context to say "still waiting on CI"), it PARKS it. So the prediction must say the same
+      // thing, with the same reason — the entire value of this function is that it does not drift
+      // from the sweep, and `willResume: true` here would promise a resume that is not coming.
+      //
+      // The age is real, not stubbed: `openTheGatesBeforeTheBounds` drives two actual sweeps, and
+      // those are what fold the external-gate ledger. So this also fails if that fold is dropped.
       useRuntimeStore.setState({
         workflowState: { [callerId]: { prState: "open", prNumber: 2117 } },
       } as never);
@@ -4482,7 +4486,11 @@ describe("controlListener", () => {
       clear("e6-gated", CONCIERGE_CALLER_AGENT_ID);
       await flush();
 
-      expect(lastReply()).toMatchObject({ ok: true, willResume: true });
+      expect(lastReply()).toMatchObject({
+        ok: true,
+        willResume: false,
+        blockedBy: "external-wait",
+      });
     });
 
     it("…and a different blocker for a different state — a busy agent reads not-idle", async () => {

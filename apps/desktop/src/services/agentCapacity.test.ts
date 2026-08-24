@@ -123,6 +123,36 @@ describe("localAgentCapacity — narrowed by the live CPU run queue", () => {
     expect(cap.basis).toBe(LOAD_BASIS);
   });
 
+  it("names the run queue even when its ceiling is not below the static cap", async () => {
+    // THE PINNED-CAP HOLE (bead `sparkle-iyxxin`). A run-queue refusal holds the line at what is
+    // ALREADY RUNNING, so on a fleet that is already past the enforced cap its number lands at or
+    // above `staticLimit` and the `narrowed < staticLimit` guard threw the basis away. The refusal
+    // still happened — `used >= limit` — but it cited the STATIC ceiling, so a human on a machine at
+    // 21.5x per-core load was told their ceiling is "6 cores × 2 agents per core" and sent to think
+    // about hardware they cannot change, when the answer is to wait. Naming the wrong dimension is
+    // the exact bug `basis` exists to close, and it has already sent one human chasing memory that
+    // was 94% free.
+    seedMachine(14); // 14 rows against a static cap of 12 — already over
+    await sample({ effective: 14, bound: "load", basis: LOAD_BASIS, sample: null, sampled: true });
+
+    const cap = localAgentCapacity();
+    expect(cap.atCapacity).toBe(true);
+    expect(cap.basis).toBe(LOAD_BASIS);
+    expect(cap.limit).toBe(STATIC_LIMIT); // still never RAISED — the min holds
+  });
+
+  it("leaves the static basis alone when the same non-narrowing reading is a MEMORY one", async () => {
+    // THE PAIRED CASE, identical in every respect but the dimension. Without it the test above
+    // passes for a gate that simply always adopts the sampled basis — which would relabel a
+    // CPU-bound machine as memory-bound the moment any reading arrived, the mirror image of the bug.
+    seedMachine(14);
+    await sample({ effective: 14, bound: "pressure", basis: MEMORY_BASIS, sampled: true });
+
+    const cap = localAgentCapacity();
+    expect(cap.atCapacity).toBe(true);
+    expect(cap.basis).toBe(STATIC_BASIS); // memory narrowed nothing, so it explains nothing
+  });
+
   it("still declines to narrow when NOTHING measured — sampled:false is not a load reading", async () => {
     // The paired case, so the test above cannot pass for a gate that simply ignores `sampled`.
     expect(localAgentCapacity().limit).toBe(STATIC_LIMIT);

@@ -676,6 +676,27 @@ export function migratePersisted(persisted: unknown, version: number): unknown {
       ),
     }));
   }
+  if (version < 14) {
+    // THE CROSS-REPO ASSIGNMENT LATCH'S MIGRATION POPULATION, IDENTIFIED EXACTLY (bead
+    // `sparkle-4htkl3`). `appendPrompt` latches `assignmentRepos` from an agent's OPENING prompt
+    // and never rewrites it, which needs a way to tell "never latched" from "latched, nothing
+    // found". `undefined` cannot carry both: on a row persisted before the feature existed it means
+    // UNKNOWN, so latching that row's next prompt would file an arbitrarily mid-life instruction
+    // ("port the fix from owner/repo#253") as its opening assignment, permanently.
+    //
+    // This backfill answers it once, at the upgrade boundary, instead of guessing forever: every
+    // pre-existing row becomes latched-EMPTY — the conservative arm, and exactly the status those
+    // rows have today. After it, `assignmentRepos !== undefined` is a COMPLETE test for "already
+    // latched", so the two heuristic clauses `appendPrompt` used to stack on top of it are gone.
+    //
+    // ⚠️ IT MUST STAY VERSION-GATED. Run unconditionally (as the normalizers at the bottom of this
+    // function are), it would re-latch every genuinely-new agent to `[]` on the next rehydrate and
+    // kill the feature outright — the opposite failure from the one it closes.
+    state.projects = state.projects.map((p) => ({
+      ...p,
+      agents: (p.agents ?? []).map((a) => ({ ...a, assignmentRepos: a.assignmentRepos ?? [] })),
+    }));
+  }
   // Version-collision safety net. PR #62 shipped shellCommand as v4 on its own branch while main
   // independently used v4=autoNameVariants and v5=promptHistory. A store persisted under #62's v4
   // would report version===4, so the version-gated `< 4` block above (now autoNameVariants) is
@@ -2586,16 +2607,30 @@ export const useProjectStore = create<ProjectState>()(
               // (roborev 67500).
               //
               // ⚠️ "NOT LATCHED YET" IS NOT THE SAME QUESTION AS "IS THIS THE FIRST PROMPT", AND
-              // CONFLATING THEM IS A MIGRATION HAZARD (roborev 67613). Every agent already persisted
-              // when this ships has `assignmentRepos === undefined`, so an `undefined` check alone
-              // would latch the NEXT prompt of an existing conversation — arbitrarily far in — as
-              // that agent's "opening assignment", permanently and irreversibly. The very example
-              // the paragraph above calls out ("port the fix from owner/repo#253"), typed at a
-              // long-running agent, would file it under "Tracked Elsewhere" FOREVER rather than for
-              // one turn: strictly worse than the oscillation this replaced, because nothing clears
-              // it. So the latch additionally requires that no composer prompt has been recorded at
-              // all, which leaves every pre-existing row simply unlatched — the conservative arm, and
-              // the one where those rows keep exactly the status they have today.
+              // CONFLATING THEM IS A MIGRATION HAZARD (roborev 67613). A row persisted before this
+              // feature reads `assignmentRepos === undefined` meaning UNKNOWN, not UNLATCHED, so an
+              // `undefined` check alone would latch the NEXT prompt of an existing conversation —
+              // arbitrarily far in — as that agent's "opening assignment", permanently. The very
+              // example the paragraph above calls out ("port the fix from owner/repo#253"), typed
+              // at a long-running agent, would file it under "Tracked Elsewhere" FOREVER rather
+              // than for one turn: strictly worse than the oscillation this replaced.
+              //
+              // THAT POPULATION IS NOW NAMED BY THE PERSIST MIGRATION, NOT GUESSED AT HERE (bead
+              // `sparkle-4htkl3`). The v14 step backfills `assignmentRepos: []` onto every row that
+              // existed at upgrade time, so `undefined` afterwards means UNLATCHED and nothing
+              // else — and this guard is one clause again.
+              //
+              // THE TWO CLAUSES THAT USED TO SIT HERE WERE A FALSE NEGATIVE, AND A LOUD ONE. They
+              // asked "has this agent any composer history" and "does it carry `terminalBriefedAt`"
+              // as proxies for "is this row pre-existing". The second was catastrophically broad:
+              // `noteTerminalBrief` fires from AgentPane's `onSubmitLine` on the FIRST non-empty
+              // line typed into the PTY, and that pane has no composer at all — so the stamp lands
+              // on essentially EVERY hand-started agent, before any prompt is ever recorded for it.
+              // The latch could then never fire for the entire hand-driven fleet, including a
+              // brand-new agent whose next prompt genuinely IS its opening assignment. A proxy that
+              // fires for the whole population cannot select a subset of it. (It also read the
+              // field differently from engine/newAgentAttention, which treats `0` as NOT briefed —
+              // two readings of one persisted number, now down to one reader.)
               //
               // Picker answers are excluded, and do not count as the opening prompt either: they are
               // answers to the agent's OWN question, not a statement of the work. A missing `source`
@@ -2604,29 +2639,18 @@ export const useProjectStore = create<ProjectState>()(
               // `humanAuthored` is deliberately NOT required. The concierge dispatching work to a
               // build agent IS that agent's assignment — it is the ordinary "send to build" path —
               // so demanding a human typist would leave precisely the orchestrated agents unlatched.
-              // What must not latch is a LATER prompt, whoever wrote it, and the first-prompt guard
-              // is what enforces that.
-              // ⚠️ AND `terminalBriefedAt`, because "no recorded composer prompt" IS NOT "new agent"
-              // (roborev 67730). Only four call sites ever write `promptHistory`, and
-              // `terminalBriefedAt`'s own doc says it outright: an agent driven entirely BY HAND has
-              // empty `lastPrompt`/`promptHistory`. So a long-running terminal-briefed agent reads
-              // `promptHistory === []`, and the first composer prompt it ever received — arbitrarily
-              // deep into its life — would latch as its "opening assignment", permanently. That is
-              // the very hazard this guard exists to close, surviving in the one population the store
-              // already has a durable marker for. This clause is what makes the claim above true.
+              // What must not latch is a LATER prompt, whoever wrote it, and `assignmentRepos !==
+              // undefined` is what enforces that: the first prompt writes the field in this same
+              // `set()`, so every later one is blocked by the value it wrote.
               //
-              // THE FIRST CLAUSE IS REDUNDANT TODAY, AND ON PURPOSE. `appendPrompt` is the only
-              // writer of `assignmentRepos` and always lands it beside a composer history entry, so
-              // every reachable re-latch is already blocked by the last clause. It states the latch's
-              // PRIMARY invariant — once latched, never rewritten — so that the invariant rests on
-              // the field it is about rather than on that coupling; a second writer, or any path
-              // clearing `promptHistory` while keeping the row, would otherwise silently re-open a
-              // latch documented as permanent. `projectStore.test.ts` pins it with a synthesized
-              // state, since no store action can currently produce one.
-              ...(isPicker ||
-              a.assignmentRepos !== undefined ||
-              a.terminalBriefedAt !== undefined ||
-              (a.promptHistory ?? []).some((e) => (e.source ?? "composer") === "composer")
+              // KNOWN, ACCEPTED RESIDUE: an agent created AFTER the upgrade, driven by hand through
+              // its terminal for a long time, and only then given its first concierge prompt, will
+              // latch on that prompt rather than on the terminal line that actually briefed it. The
+              // terminal line is not recorded anywhere (Terminal's `onSubmitLine` carries no text —
+              // see AgentPane), so no signal in the store can distinguish it; the deliberate
+              // trade is a narrow, self-correcting mis-latch over silencing the feature for every
+              // hand-started agent, which is what the removed clauses did.
+              ...(isPicker || a.assignmentRepos !== undefined
                 ? {}
                 : { assignmentRepos: assignmentRepos(text) }),
               // Append newest-last, then cap PER SOURCE so the persisted record stays bounded without
@@ -2667,7 +2691,10 @@ export const useProjectStore = create<ProjectState>()(
       // heal dead code on every existing install — which is exactly the population that has the
       // escaped names. A test that calls `migratePersisted` directly passes either way, so it
       // proves the function works, not that it ever runs.
-      version: 13,
+      // v14 backfills assignmentRepos: [] onto every pre-existing agent row, so the cross-repo
+      // latch can tell "never latched" from "pre-dates the feature" without a heuristic
+      // (sparkle-4htkl3). Same bump-is-the-fix reasoning as v13.
+      version: 14,
       migrate: (persisted, version) =>
         perfSpan("persist.migrate", () => migratePersisted(persisted, version), { version }) as ProjectState,
       // sparkle-pckz: a UNION merge, so no rehydrate (startup or cross-window) can evict a record

@@ -274,3 +274,46 @@ describe("the entity heal is actually WIRED, not just implemented", () => {
     expect(useProjectStore.persist.getOptions().version).toBeGreaterThan(12);
   });
 });
+
+describe("migratePersisted — v14 assignmentRepos backfill (the cross-repo latch's migration population)", () => {
+  type WithLatch = { projects: { agents: { id: string; assignmentRepos?: string[] }[] }[] };
+
+  const blob = () => ({
+    projects: [
+      {
+        id: "p1",
+        agents: [
+          { id: "a1", name: "Build 1", kind: "build" }, // pre-feature row — no key at all
+          { id: "a2", name: "Build 2", kind: "build", assignmentRepos: ["owner/other"] }, // already latched
+          { id: "a3", name: "Build 3", kind: "build", assignmentRepos: [] }, // latched, empty
+        ],
+      },
+    ],
+  });
+
+  it("backfills an EMPTY list onto a row that predates the feature — 'latched, nothing found'", () => {
+    // This is the whole point of the step. `undefined` on a legacy row means UNKNOWN, and
+    // `appendPrompt` reads `undefined` as "never latched" — so without this the next prompt such a
+    // row receives, arbitrarily deep into its life, is filed as its opening assignment forever.
+    const a = agentsWithLatch(migratePersisted(blob(), 13));
+    expect(a.find((x) => x.id === "a1")!.assignmentRepos).toEqual([]);
+  });
+
+  it("never overwrites a latch that already exists", () => {
+    const a = agentsWithLatch(migratePersisted(blob(), 13));
+    expect(a.find((x) => x.id === "a2")!.assignmentRepos).toEqual(["owner/other"]);
+    expect(a.find((x) => x.id === "a3")!.assignmentRepos).toEqual([]);
+  });
+
+  it("DOES NOT RUN once the blob is at v14 — the gate is what keeps new agents latchable", () => {
+    // The inverse failure, and the more damaging one: applied unconditionally (the way the
+    // normalizers at the bottom of migratePersisted are) this backfill would stamp `[]` onto every
+    // genuinely-new agent on the next rehydrate, and the latch could never fire for anyone.
+    const a = agentsWithLatch(migratePersisted(blob(), 14));
+    expect(a.find((x) => x.id === "a1")!.assignmentRepos).toBeUndefined();
+  });
+
+  function agentsWithLatch(out: unknown) {
+    return (out as WithLatch).projects[0]!.agents;
+  }
+});

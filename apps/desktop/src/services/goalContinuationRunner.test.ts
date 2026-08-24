@@ -65,6 +65,7 @@ vi.mock("./attention", async (importOriginal) => {
 import { notifyAttention } from "./attention";
 import { resetWindowRegistry, setWindowProject } from "./windowRegistry";
 import { dispatchConciergeAnswer } from "./conciergeDispatch";
+import { EXTERNAL_WAIT_GRACE_MS } from "../engine/goalContinuation";
 import {
   _resetGoalContinuationRunnerForTests,
   idleSinceFor,
@@ -76,6 +77,8 @@ import {
   undeliveredStreakFor,
   continuationEvidenceFor,
   externalWaitOf,
+  externalWaitSinceFor,
+  noteExternalWait,
   noteToolActivity,
   prMarkOf,
 } from "./goalContinuationRunner";
@@ -899,23 +902,73 @@ describe("evidence the sweep must actually gather", () => {
     expect(goalOf(projectId, agentId)!.escalatedAt).toBeDefined();
   });
 
-  it("an agent with an OPEN PR is restarted instead — nothing reaches the 'needs you' list", async () => {
+  it("an agent with an OPEN PR is PARKED — nothing reaches the 'needs you' list, and no context is re-billed", async () => {
     // THE FOUNDER'S VERIFIABLE GOAL, end to end. Identical to the pair above except that the store
     // holds the one fact the predicate never consulted.
+    //
+    // ⚠️ REVISED 2026-08-24 (sparkle-yxl05z). This asserted a RESTART, on the rule that "never
+    // continued AND never escalated" is the silent-forever state this module exists to abolish.
+    // That rule is right and this is not an exception to it — but the restart it prescribes is
+    // itself the second half of the founder's report: blocked on CI wall-clock for ~2 hours, he was
+    // woken again and again by "your goal is not met yet, so you are being resumed automatically",
+    // each wake re-billing an entire session context to produce the sentence "still waiting on CI".
+    //
+    // So the agent is parked, and parking is NOT silence in the sense that rule forbids: it is
+    // named in the sweep's outcomes, it ends by itself when the gate moves (the PR reading is part
+    // of the progress mark), and it is bounded by EXTERNAL_WAIT_GRACE_MS — which the next test
+    // proves end to end rather than leaving as a claim in a comment.
     const { projectId, agentId } = seed({ goal: "land the PR" });
     evidence({
       workflowState: { [agentId]: { prState: "open", prNumber: 2117 } },
     });
     burn(projectId, agentId, 3, progressMark({ promptHistoryLength: 0, prMark: "open#2117" }));
 
-    await settleThenSweep();
+    await sweepGoalContinuations({ now: T0, ownsProject: ownsEverything });
+    const outcomes = await sweepGoalContinuations({ now: SETTLED, ownsProject: ownsEverything });
 
     expect(notifyMock).not.toHaveBeenCalled();
     expect(goalOf(projectId, agentId)!.escalatedAt).toBeUndefined();
-    // Restarted, not merely left alone: "never continued AND never escalated" is the
-    // silent-forever state this whole module exists to abolish.
-    expect(sendMock).toHaveBeenCalledTimes(1);
-    expect(sendMock.mock.calls[0]![1]).toContain("PR #2117");
+    // NOT restarted: the whole cost of the old behaviour was one full context per wake.
+    expect(sendMock).not.toHaveBeenCalled();
+    // …and not silent either — the state is reported, so a human or the concierge can ask.
+    expect(outcomes.find((o) => o.agentId === agentId)).toEqual({
+      agentId,
+      action: "none",
+      detail: "external-wait",
+    });
+  });
+
+  it("PAIR — the park is BOUNDED: a gate that never moves reaches the human after the grace", async () => {
+    // The hole this change could have been. Same setup as the park above, run forward past
+    // EXTERNAL_WAIT_GRACE_MS with the gate unchanged, through the REAL ledger — so this fails if
+    // the sweep stops folding the age, or if the age is re-stamped on every sweep (verified: both
+    // mutations turn this red).
+    //
+    // ⚠️ IT CANNOT SEE THE GRACE-VS-TTL INTERACTION, and saying so is the point. `seed` sets the
+    // goal through the store, which stamps `setAt` from the REAL clock, while these sweeps use a
+    // tiny synthetic `now` — so the goal's 4h TTL never elapses here however far the sweep clock is
+    // advanced. A grace raised past DEFAULT_GOAL_TTL_MS is unreachable in production
+    // (`goal-expired` is answered before any bound) and this test stays green through it; the
+    // engine's "gate DEFERS the ceiling" loop, which advances one clock in real steps, is what
+    // catches that. Verified by mutation: a 5h grace reds that test and not this one.
+    const { projectId, agentId } = seed({ goal: "land the PR" });
+    evidence({ workflowState: { [agentId]: { prState: "open", prNumber: 2117 } } });
+    burn(projectId, agentId, 3, progressMark({ promptHistoryLength: 0, prMark: "open#2117" }));
+
+    await sweepGoalContinuations({ now: T0, ownsProject: ownsEverything });
+    await sweepGoalContinuations({ now: SETTLED, ownsProject: ownsEverything });
+    expect(notifyMock).not.toHaveBeenCalled();
+
+    await sweepGoalContinuations({
+      now: T0 + EXTERNAL_WAIT_GRACE_MS + 60_000,
+      ownsProject: ownsEverything,
+    });
+
+    expect(notifyMock).toHaveBeenCalledTimes(1);
+    const body = notifyMock.mock.calls[0]![0].body;
+    expect(body).toContain("PR #2117");
+    expect(body).not.toContain("no sign of progress");
+    expect(goalOf(projectId, agentId)!.escalatedAt).toBeDefined();
   });
 
   it("a MERGED PR is not a gate — the agent escalates normally", async () => {
@@ -1162,21 +1215,22 @@ describe("the unreachable-terminal escalation is untouched", () => {
 
 describe("reading the store's PR state honestly", () => {
   it("only `open` is a gate", () => {
-    expect(externalWaitOf({ prState: "open", prNumber: 7 } as never)).toEqual({
+    expect(externalWaitOf({ prState: "open", prNumber: 7 } as never, "a1")).toEqual({
       kind: "open-pr",
       prNumber: 7,
+      since: null,
     });
-    expect(externalWaitOf({ prState: "merged", prNumber: 7 } as never)).toBeUndefined();
-    expect(externalWaitOf({ prState: "closed", prNumber: 7 } as never)).toBeUndefined();
+    expect(externalWaitOf({ prState: "merged", prNumber: 7 } as never, "a1")).toBeUndefined();
+    expect(externalWaitOf({ prState: "closed", prNumber: 7 } as never, "a1")).toBeUndefined();
   });
 
   it("`prState: null` yields NO gate and NO mark — it is ambiguous, not a negative finding", () => {
     // Rust sends null both for "probed, found nothing" and for a poll that never probed
     // (`probePrState` is gated), and those are indistinguishable here. Turning it into either a gate
     // or a stable "there is no PR" token would be inventing an answer.
-    expect(externalWaitOf({ prState: null, prNumber: null } as never)).toBeUndefined();
+    expect(externalWaitOf({ prState: null, prNumber: null } as never, "a1")).toBeUndefined();
     expect(prMarkOf({ prState: null, prNumber: null } as never)).toBeNull();
-    expect(externalWaitOf(undefined)).toBeUndefined();
+    expect(externalWaitOf(undefined, "a1")).toBeUndefined();
     expect(prMarkOf(undefined)).toBeNull();
   });
 
@@ -1185,5 +1239,84 @@ describe("reading the store's PR state honestly", () => {
     const merged = prMarkOf({ prState: "merged", prNumber: 2117 } as never);
     expect(opened).not.toBeNull();
     expect(merged).not.toBe(opened);
+  });
+});
+
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+// HOW LONG HAS THE GATE BEEN THERE — sparkle-yxl05z.
+//
+// The pure ladder decides whether a CI wait excuses an agent's quiet, and it decides it from an
+// AGE. This file is where that age is actually measured, so these tests exist because the ladder's
+// own tests cannot see them: every one of those passes its own `since`, which means the line that
+// supplies the REAL one would be covered by nothing (bead sparkle-lgbwf, seen 4x here — delete the
+// producer and the engine suite stays green while the fix is inert).
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+describe("the external-gate ledger", () => {
+  const OPEN_7 = { prState: "open", prNumber: 7 } as never;
+
+  it("stamps first sighting and does NOT re-stamp an unchanged gate", () => {
+    // The re-stamp is the failure that would make the grace unreachable: at a 15s sweep the age
+    // would reset to zero fifteen seconds at a time and never reach three hours.
+    noteExternalWait("a1", OPEN_7, T0);
+    expect(externalWaitSinceFor("a1")).toBe(T0);
+    noteExternalWait("a1", OPEN_7, T0 + 60_000);
+    noteExternalWait("a1", OPEN_7, T0 + 120_000);
+    expect(externalWaitSinceFor("a1")).toBe(T0);
+    expect(externalWaitOf(OPEN_7, "a1")).toEqual({ kind: "open-pr", prNumber: 7, since: T0 });
+  });
+
+  it("a DIFFERENT PR restarts the clock, and a closed gate clears it", () => {
+    // Otherwise an agent that landed #7 and opened #8 inherits #7's age and can be handed to a
+    // human for a gate that is minutes old.
+    noteExternalWait("a1", OPEN_7, T0);
+    noteExternalWait("a1", { prState: "open", prNumber: 8 } as never, T0 + 90_000);
+    expect(externalWaitSinceFor("a1")).toBe(T0 + 90_000);
+    noteExternalWait("a1", { prState: "merged", prNumber: 8 } as never, T0 + 120_000);
+    expect(externalWaitSinceFor("a1")).toBeUndefined();
+  });
+
+  it("a gate the ledger has not seen reads `since: null`, never a fresh stamp", () => {
+    // A window that has just booted must say "I cannot tell you how long", because claiming the
+    // gate appeared just now would restart the grace on every relaunch — an agent in a crash loop
+    // would then be parked forever. `null` keeps the pre-fix behaviour instead.
+    expect(externalWaitOf(OPEN_7, "never-swept")).toEqual({
+      kind: "open-pr",
+      prNumber: 7,
+      since: null,
+    });
+    // …and a STALE entry for another gate is not borrowed either.
+    noteExternalWait("a1", OPEN_7, T0);
+    expect(externalWaitOf({ prState: "open", prNumber: 9 } as never, "a1")).toEqual({
+      kind: "open-pr",
+      prNumber: 9,
+      since: null,
+    });
+  });
+
+  it("the SWEEP folds it — an agent holding an open PR accrues a real age", async () => {
+    // THE PRODUCTION LINE. `continuationEvidenceFor` is read-only, so if the sweep ever stops
+    // calling `noteExternalWait` every gate reports `since: null` and the whole park is dead code
+    // that still typechecks. This is the assertion that would go red.
+    const { projectId, agentId } = seed({ goal: "land the PR" });
+    useRuntimeStore.setState({
+      workflowState: { [agentId]: { prState: "open", prNumber: 2117 } },
+    } as never);
+
+    await sweepGoalContinuations({ now: T0, ownsProject: ownsEverything });
+    expect(externalWaitSinceFor(agentId)).toBe(T0);
+
+    await sweepGoalContinuations({ now: T0 + 30_000, ownsProject: ownsEverything });
+    // Still T0: an unchanged gate is thirty seconds older, not newly born.
+    expect(externalWaitSinceFor(agentId)).toBe(T0);
+
+    const agent = useProjectStore
+      .getState()
+      .projects.find((p) => p.id === projectId)!
+      .agents.find((a) => a.id === agentId)!;
+    expect(continuationEvidenceFor(agent).externalWait).toEqual({
+      kind: "open-pr",
+      prNumber: 2117,
+      since: T0,
+    });
   });
 });

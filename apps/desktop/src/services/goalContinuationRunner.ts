@@ -398,6 +398,7 @@ export function _resetGoalContinuationRunnerForTests(): void {
   inFlight.clear();
   undelivered.clear();
   suppressedUntil.clear();
+  externalWaitSeen.clear();
   toolActivity.clear();
 }
 
@@ -435,6 +436,24 @@ export function _resetGoalContinuationRunnerForTests(): void {
  * stated ordering.
  */
 const toolActivity = new Map<string, { lastSeen: number; bursts: number }>();
+
+/**
+ * agentId → the external gate this window is currently watching, and WHEN it first saw that exact
+ * gate. See `engine/goalContinuation.ExternalWait.since` for what the age buys.
+ *
+ * A FIRST-SEEN LEDGER, NOT A DURATION, and the distinction is what makes it honest across a
+ * restart: nothing here is persisted, so a window that has just booted reports `since: null` — "I
+ * cannot say how long" — rather than "the gate appeared just now", which would silently restart the
+ * grace on every relaunch and could park an agent forever in a crash loop.
+ *
+ * KEYED ON THE GATE'S IDENTITY, so a DIFFERENT PR restarts the clock. Without the signature an
+ * agent that landed #10 and opened #11 would inherit #10's age and could be escalated for a gate
+ * that is minutes old. `undefined` clears the entry: a gate that goes away has no age to keep.
+ *
+ * WRITTEN ONLY BY THE SWEEP (see the fold at its call site) and garbage-collected beside its
+ * siblings, for the reason spelled out there: an id reused by a new agent must not inherit an age.
+ */
+const externalWaitSeen = new Map<string, { signature: string; since: number }>();
 
 /**
  * Fold ONE tick's windowed tool count into {@link toolActivity} and return the burst counter.
@@ -525,7 +544,7 @@ export function continuationEvidenceFor(agent: AgentTab): ContinuationEvidence {
       commitsAhead: rt.branchStatus?.[agent.id]?.ahead ?? null,
       prMark: prMarkOf(ws),
     }),
-    externalWait: externalWaitOf(ws),
+    externalWait: externalWaitOf(ws, agent.id),
   };
 }
 
@@ -631,9 +650,58 @@ export function prMarkOf(ws: WorkflowState | undefined): string | null {
  *
  * Exported as a test seam for the same reason as {@link prMarkOf}.
  */
-export function externalWaitOf(ws: WorkflowState | undefined): ExternalWait | undefined {
+export function externalWaitOf(ws: WorkflowState | undefined, agentId: string): ExternalWait | undefined {
+  const gate = externalGateOf(ws);
+  if (gate === undefined) return undefined;
+  const seen = externalWaitSeen.get(agentId);
+  // THE SIGNATURE MUST MATCH, not merely exist. A stale entry for a PREVIOUS gate would hand this
+  // one somebody else's age — see the ledger's note — and the fold below only rewrites the entry on
+  // a sweep, so a prediction taken between sweeps can legitimately see a gate the ledger has not
+  // caught up with. Unmatched reads as `null`: "I cannot say", which keeps today's behaviour.
+  const since = seen !== undefined && seen.signature === signatureOf(gate) ? seen.since : null;
+  return { ...gate, since };
+}
+
+/** The gate's IDENTITY, with no age attached — the half `noteExternalWait` and `externalWaitOf`
+ *  must agree on. One reader, one writer, one derivation. */
+function externalGateOf(ws: WorkflowState | undefined): Omit<ExternalWait, "since"> | undefined {
   if (ws?.prState !== "open") return undefined;
   return { kind: "open-pr", prNumber: ws.prNumber };
+}
+
+function signatureOf(gate: Omit<ExternalWait, "since">): string {
+  return `${gate.kind}#${gate.prNumber ?? ""}`;
+}
+
+/**
+ * FOLD the external-gate ledger for one agent — the ONLY writer, called once per agent per sweep.
+ *
+ * Same shape and the same reason as {@link noteToolActivity} directly above: the sweep advances the
+ * ledger, and `continuationEvidenceFor` — which `controlListener.resumeReading` also calls to
+ * PREDICT what the sweep will decide — only ever reads it. A prediction that folded would age a
+ * gate on a schedule nothing else shares, and the two answers would drift.
+ *
+ * Idempotent for an unchanged gate: re-stamping `since` on every sweep is precisely the bug that
+ * would make the grace unreachable, because the age would reset to zero fifteen seconds at a time.
+ */
+export function noteExternalWait(
+  agentId: string,
+  ws: WorkflowState | undefined,
+  now: number,
+): void {
+  const gate = externalGateOf(ws);
+  if (gate === undefined) {
+    externalWaitSeen.delete(agentId);
+    return;
+  }
+  const signature = signatureOf(gate);
+  if (externalWaitSeen.get(agentId)?.signature === signature) return;
+  externalWaitSeen.set(agentId, { signature, since: now });
+}
+
+/** Test/introspection seam: when did this window first see the gate it is currently watching? */
+export function externalWaitSinceFor(agentId: string): number | undefined {
+  return externalWaitSeen.get(agentId)?.since;
 }
 
 /** Test/introspection seam: how many auto-continues in a row have failed to reach `agentId`? */
@@ -850,6 +918,11 @@ export async function sweepGoalContinuations(opts: SweepOptions = {}): Promise<S
   // and three sweeps later a WORKING agent is escalated with "no sign of progress". That is
   // verbatim the false page this whole feature exists to end, reintroduced by a stale map entry.
   for (const id of toolActivity.keys()) if (!composite.has(id)) toolActivity.delete(id);
+  // …and the external-gate ledger, where the stale-entry failure is the one that matters MOST: an
+  // inherited `since` is an inherited AGE, so a brand-new agent could be handed to a human for a
+  // gate that had been open for minutes — or, if the grace had not yet elapsed, be parked on
+  // somebody else's evidence.
+  for (const id of externalWaitSeen.keys()) if (!composite.has(id)) externalWaitSeen.delete(id);
 
   const outcomes: SweepOutcome[] = [];
   const pending: Promise<void>[] = [];
@@ -896,6 +969,11 @@ export async function sweepGoalContinuations(opts: SweepOptions = {}): Promise<S
         rt.agentMovement?.[agent.id]?.toolsRecent ?? null,
         burstsOf(agent.goal?.mark),
       );
+      // …and the SAME fold-then-read for the external gate, whose age decides whether a quiet agent
+      // is parked behind CI or has to be handed to a human. Without this line the ledger is never
+      // written, every gate reports `since: null`, and the whole park is dead code that still
+      // typechecks — the shape `ContinuationInput.quotaBlock` warns about two dozen lines below.
+      noteExternalWait(agent.id, rt.workflowState?.[agent.id], now);
       // ONE builder, shared with the prediction surface, so the two cannot drift. Computed ONCE
       // here and passed below rather than re-derived: two reads of the same store can disagree,
       // and the mark that is DECIDED on must be the mark that is RECORDED.

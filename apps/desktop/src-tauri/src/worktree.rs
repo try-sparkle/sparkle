@@ -3329,6 +3329,41 @@ fn worktree_head_branch(wt_str: &str, exists: bool) -> String {
     }
 }
 
+/// Index the batch `git worktree list --porcelain` records BY DIRECTORY, so an agent's HEAD branch
+/// is a map hit instead of a [`worktree_head_branch`] fork inside its own tree (`sparkle-xwnawc`).
+///
+/// Keyed on BOTH the path git printed and its symlink-resolved form. Ours are built from app-data
+/// and are not necessarily the shape git reports (macOS prints `/private/var/...` for a `/var/...`
+/// tree), and keeping the raw key spares the overwhelmingly common exact-match case a `realpath`
+/// walk. Two worktrees can never name the same directory, so the doubled keys cannot collide across
+/// records.
+fn head_branch_index(records: &[WorktreeRecord]) -> HashMap<PathBuf, String> {
+    let mut idx: HashMap<PathBuf, String> = HashMap::with_capacity(records.len() * 2);
+    for r in records {
+        idx.insert(PathBuf::from(&r.path), r.branch.clone());
+        if let Some(c) = &r.canonical {
+            idx.insert(c.clone(), r.branch.clone());
+        }
+    }
+    idx
+}
+
+/// The HEAD branch of `wt` from the batch listing, or `None` when no record names that directory —
+/// in which case the caller must fall back to the per-worktree fork.
+///
+/// `None` is NOT the same as "detached": a detached checkout HAS a record, whose `branch` is `""`,
+/// and that empty string is the right answer (it is exactly what [`worktree_head_branch`] reports
+/// for a detached HEAD). So this keys on whether the DIRECTORY is listed, never on whether the
+/// branch is empty — otherwise every detached tree would fall through and re-fork forever.
+fn batch_head_branch(idx: &HashMap<PathBuf, String>, wt: &Path) -> Option<String> {
+    if let Some(b) = idx.get(wt) {
+        return Some(b.clone());
+    }
+    // Only now pay the walk, and only for a tree whose printed path we did not match verbatim.
+    let c = std::fs::canonicalize(wt).ok()?;
+    idx.get(&c).cloned()
+}
+
 /// Does `refs/heads/<branch>` exist in this repo?
 fn local_branch_exists(root: &str, branch: &str) -> bool {
     !branch.trim().is_empty()
@@ -7007,6 +7042,9 @@ pub fn project_agents_status_at(
     // Symlink-resolve every path ONCE here rather than per agent per record — see
     // `WorktreeRecord::canonical`.
     canonicalize_records(&mut worktree_records);
+    // ...and index those same records by directory, so each agent's HEAD BRANCH is a map hit rather
+    // than its own `git rev-parse --abbrev-ref HEAD` fork - see the call site below.
+    let head_by_path = head_branch_index(&worktree_records);
     // ONE `for-each-ref` for the WHOLE batch resolves every agent's MINTED-branch tip, replacing the
     // per-agent `rev_parse_tip(root, "sparkle/agent-<id>")` fork that ran BEFORE the fingerprint skip
     // (so it was paid on every tick even for the idle-and-unchanged majority this batch exists to keep
@@ -7101,7 +7139,36 @@ pub fn project_agents_status_at(
         // From the ONE batch `for-each-ref` above, not a per-agent fork. Absent ⇒ empty ⇒ the
         // renamed/parked else-branch, exactly as a `rev_parse_tip` miss behaved.
         let minted_tip = minted_tips.get(&a.agent_id).cloned().unwrap_or_default();
-        let head = worktree_head_branch(&wt.to_string_lossy(), wt.exists());
+        // ZERO FORKS for the head (`sparkle-xwnawc`, the residual half of loop 2). This used to be
+        // `worktree_head_branch(&wt.to_string_lossy(), wt.exists())` - one `git rev-parse
+        // --abbrev-ref HEAD` per agent, and because the head decides `branch` (which feeds the
+        // fingerprint) it ran BEFORE the skip, so an N-agent tick paid N posix_spawns every 15s
+        // even with the whole fleet idle. That is the `__wait4` fan-out the founder's hang sample
+        // recorded (~38 git children in one window).
+        //
+        // The batch `worktree list --porcelain` above already carries it: `WorktreeRecord.branch`
+        // is the checkout's short branch name, and it is EQUIVALENT to what the fork returned -
+        // attached => `branch refs/heads/<n>` => `<n>`, same as `--abbrev-ref`; DETACHED => no
+        // branch line => `""`, which is what `worktree_head_branch` maps git's literal "HEAD" to.
+        // It is a batched READ, not a cache: the listing is re-run every tick, so a tree that
+        // switches branch is seen on the very next one.
+        //
+        // The `exists` guard is kept AHEAD of the lookup and is load-bearing: git keeps listing a
+        // worktree whose directory has been deleted until someone runs `worktree prune`, so a
+        // record alone would start reporting a branch for a GONE tree where the fork reported "".
+        // That would flip such agents from the parked/renamed `else` arm to the cheap
+        // `head == minted` arm - a behaviour change, not a speedup. `wt.exists()` was already paid
+        // here as the fork's own argument, so this costs nothing new.
+        //
+        // An unlisted-but-present directory (a separate repo sitting at that path, an unreadable
+        // listing => empty index) falls back to the original fork, so the answer is never degraded -
+        // only the forks the batch can already answer are removed.
+        let head = if wt.exists() {
+            batch_head_branch(&head_by_path, wt.as_path())
+                .unwrap_or_else(|| worktree_head_branch(&wt.to_string_lossy(), true))
+        } else {
+            String::new()
+        };
         let (branch, tip) = if head == minted && !minted_tip.is_empty() {
             (minted, minted_tip)
         } else {
@@ -13728,6 +13795,136 @@ mod tests {
              worktree HEAD read) — the minted tip is batched. Restoring the per-agent \
              rev_parse_tip(minted) makes this 2. (one={forks_one}, two={forks_two}, \
              marginal={marginal})"
+        );
+
+        let _ = std::fs::remove_dir_all(&app_data);
+    }
+
+
+    // sparkle-xwnawc, the RESIDUAL half of loop 2. PR #2419 batched the minted-branch TIP into one
+    // `for-each-ref`, which left exactly ONE per-agent fork on the fingerprint-skip path:
+    // `worktree_head_branch` shelling `git rev-parse --abbrev-ref HEAD` inside each agent's tree.
+    // It runs BEFORE the skip (the head decides `branch`, which feeds the fingerprint), so an
+    // N-agent tick paid N posix_spawns EVERY 15s sidebar tick even with every agent idle — ~38 of
+    // them on the founder's machine, which is the `__wait4` fan-out the hang sample recorded.
+    //
+    // The fact it forks for is ALREADY in the batch `git worktree list --porcelain` the tick has
+    // run anyway: `WorktreeRecord.branch` is that checkout's short branch name (empty when
+    // detached, exactly as `worktree_head_branch` reports a detached HEAD). So the head must cost
+    // ZERO forks per agent.
+    //
+    // Measured as the MARGINAL fork cost of one extra idle agent — the difference between a
+    // 2-agent skip tick and a 1-agent skip tick — which cancels every fixed per-BATCH fork (the
+    // `worktree list`, the `for-each-ref`, the default tips, the origin probe) and isolates the
+    // per-AGENT cost. Restore `worktree_head_branch(&wt.to_string_lossy(), wt.exists())` at the
+    // call site and this reads 1, which is what `== 0` fails on — so the assertion grips the
+    // batching itself and not incidental arithmetic.
+    #[test]
+    fn the_worktree_head_branch_is_read_once_per_batch_not_once_per_agent() {
+        let r = init_repo("batch-head-branch");
+        let app_data = unique_root("batch-head-branch-appdata");
+
+        for id in ["h1", "h2"] {
+            let wt = create_worktree_at(&r, "p1", id, "main", &app_data).unwrap().path;
+            std::fs::write(format!("{wt}/w.txt"), "work").unwrap();
+            git(&wt, &["add", "."]).unwrap();
+            git(&wt, &["commit", "-q", "-m", "work"]).unwrap();
+        }
+
+        let input = |id: &str| AgentStatusInput {
+            agent_id: id.into(),
+            base_branch: "main".into(),
+            parent_branch: String::new(),
+            kind: "build".into(),
+            force: false,
+            created_at_ms: None,
+        };
+
+        // Cold tick over BOTH so the fingerprint cache is warm for each worktree path.
+        let cold =
+            project_agents_status_at(&r, "p1", &[input("h1"), input("h2")], false, &app_data);
+        assert!(cold[0].changed && cold[1].changed, "cold tick computes both");
+
+        let forks = |agents: &[AgentStatusInput]| {
+            let before = git_spawns_on_this_thread();
+            let out = project_agents_status_at(&r, "p1", agents, false, &app_data);
+            (git_spawns_on_this_thread() - before, out)
+        };
+
+        let (forks_one, out_one) = forks(&[input("h1")]);
+        let (forks_two, out_two) = forks(&[input("h1"), input("h2")]);
+
+        // PRECONDITION / anti-vacuity: the marginal comparison only isolates the per-agent fork if
+        // BOTH ticks actually skipped. An agent that recomputed would drag in the full status
+        // ladder and swamp the single fork under test.
+        assert!(!out_one[0].changed, "h1 must be skipped on the warm tick");
+        assert!(
+            !out_two[0].changed && !out_two[1].changed,
+            "both agents must be skipped on the warm 2-agent tick"
+        );
+
+        let marginal = forks_two - forks_one;
+        assert_eq!(
+            marginal, 0,
+            "one extra idle agent must add ZERO git forks on the skip path — its HEAD branch comes \
+             from the batch `worktree list` record. Restoring the per-agent \
+             worktree_head_branch() fork makes this 1. (one={forks_one}, two={forks_two}, \
+             marginal={marginal})"
+        );
+
+        let _ = std::fs::remove_dir_all(&app_data);
+    }
+
+    // The PAIRED test for the batching above: a batched read is only safe if it still SEES a
+    // change. `git worktree list --porcelain` is re-run every tick, so this is a batched READ and
+    // not a cache — but that is exactly the claim worth pinning, because the failure mode of
+    // getting it wrong (serving a stale head forever) is worse than the fork it removes.
+    //
+    // An agent that checks its worktree out onto a DIFFERENT branch must be reported on that
+    // branch on the very next tick. Freeze the head — return a constant, or memoize the record map
+    // across ticks — and this goes red.
+    #[test]
+    fn the_batched_head_branch_still_sees_a_worktree_that_switched_branch() {
+        let r = init_repo("batch-head-switch");
+        let app_data = unique_root("batch-head-switch-appdata");
+
+        let wt = create_worktree_at(&r, "p1", "s1", "main", &app_data).unwrap().path;
+        std::fs::write(format!("{wt}/w.txt"), "work").unwrap();
+        git(&wt, &["add", "."]).unwrap();
+        git(&wt, &["commit", "-q", "-m", "work"]).unwrap();
+
+        // A fresh value per tick: `AgentStatusInput` is Deserialize-only, not Clone.
+        let input = || AgentStatusInput {
+            agent_id: "s1".into(),
+            base_branch: "main".into(),
+            parent_branch: String::new(),
+            kind: "build".into(),
+            force: false,
+            created_at_ms: None,
+        };
+
+        let first = project_agents_status_at(&r, "p1", &[input()], false, &app_data);
+        assert_eq!(
+            first[0].branch.as_ref().map(|b| b.branch.clone()),
+            Some("sparkle/agent-s1".to_string()),
+            "precondition: the tree starts on its minted branch"
+        );
+
+        // Rename the working branch — the case AGENTS.md actively encourages. The minted ref is
+        // left behind by `git checkout -b`, so this is the RENAME-AFTER-COMMIT shape, and the head
+        // is the only thing that distinguishes it.
+        git(&wt, &["checkout", "-q", "-b", "descriptive/name"]).unwrap();
+        std::fs::write(format!("{wt}/w2.txt"), "more").unwrap();
+        git(&wt, &["add", "."]).unwrap();
+        git(&wt, &["commit", "-q", "-m", "more"]).unwrap();
+
+        let after = project_agents_status_at(&r, "p1", &[input()], false, &app_data);
+        assert!(after[0].changed, "the switched-and-committed tree must recompute");
+        assert_eq!(
+            after[0].branch.as_ref().map(|b| b.branch.clone()),
+            Some("descriptive/name".to_string()),
+            "the batched head must track a worktree that switched branch — a frozen or memoized \
+             head would still report sparkle/agent-s1"
         );
 
         let _ = std::fs::remove_dir_all(&app_data);

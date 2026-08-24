@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import {
+  type AgentGoal,
   DEFAULT_GOAL_TTL_MS,
   dischargeGoal,
   escalateGoal,
@@ -16,6 +17,7 @@ import { REARM_TTL_MS } from "./goalExpiry";
 import { isSystemAuthoredPrompt } from "./agentOriginated";
 import {
   CLOUD_MIN_CONTINUE_CENTS,
+  EXTERNAL_WAIT_GRACE_MS,
   IDLE_SETTLE_MS,
   MAX_CONTINUES_TOTAL,
   MAX_CONTINUES_WITHOUT_PROGRESS,
@@ -24,6 +26,7 @@ import {
   progressMark,
   type CloudEvidence,
   type ContinuationInput,
+  type ExternalWait,
 } from "./goalContinuation";
 
 const T0 = 1_700_000_000_000;
@@ -852,65 +855,99 @@ describe("an external gate is not absence of progress", () => {
     expect(d.reason).toContain("no sign of progress");
   });
 
-  it("an agent holding an OPEN PR is restarted, not paged as 'no sign of progress'", () => {
+  it("an agent holding an OPEN PR is not paged as 'no sign of progress'", () => {
     // THE FOUNDER'S VERIFIABLE GOAL. Identical state to the pair above plus the one fact that was
     // never consulted: the work is out in front of a gate.
+    //
+    // ⚠️ REVISED 2026-08-24 (sparkle-yxl05z). This asserted `continue`, because the first cut of the
+    // gate suppressed the escalation and went on resuming. That resume is itself the second half of
+    // the defect — every one re-bills a whole context to say "still waiting on CI" — so the gated
+    // agent now PARKS. What this test is really about is unchanged and is what is asserted: the
+    // false diagnosis does not fire.
     const d = decideContinuation(
       ready({
         goal: stuckGoal(),
         mark: "stuck",
-        externalWait: { kind: "open-pr", prNumber: 2117 },
+        externalWait: { kind: "open-pr", prNumber: 2117, since: T0 },
       }),
     );
-    expect(d.action).toBe("continue");
+    expect(d.action).not.toBe("escalate");
+    expect(d).toEqual({ action: "none", reason: "external-wait" });
   });
 
-  it("the gate suppresses the DIAGNOSIS, not the ceiling — it still ends at a human", () => {
+  it("the gate DEFERS the ceiling, it does not remove it — an unmoving gate still ends at a human", () => {
     // A hole, not a gate, is the way this change could be wrong: an agent parked forever on an open
-    // PR must still reach somebody. It does, through MAX_CONTINUES_TOTAL — whose sentence is about
-    // the SPEND rather than the false claim that restarting cannot fix it.
+    // PR must still reach somebody.
+    //
+    // It does — but through the GRACE rather than through MAX_CONTINUES_TOTAL, and that swap is the
+    // fix. The ceiling counts restarts, and a parked agent stops spending them, so a ladder that
+    // only ever ended at the ceiling would end at a human within an hour of a busy CI queue and
+    // then never again. This loop advances the CLOCK instead of the counter and asserts the handover
+    // still happens, with a sentence that names the thing that actually has not moved.
     let goal = newGoal("land the retry PR", T0);
     let escalated: string | null = null;
-    for (let round = 0; round < MAX_CONTINUES_TOTAL * 3; round++) {
+    let escalatedAtMs: number | null = null;
+    const gateSince = T0;
+    // Sweep every ten minutes for a full day — far past the grace, and past the ceiling too.
+    for (let tick = 0; tick < 24 * 6; tick++) {
+      const now = T0 + IDLE_SETTLE_MS + tick * 10 * 60_000;
       const d = decideContinuation(
         ready({
           goal,
           mark: "stuck",
-          now: T0 + IDLE_SETTLE_MS + round,
-          externalWait: { kind: "open-pr", prNumber: 2117 },
+          now,
+          idleSince: now - IDLE_SETTLE_MS - 1,
+          externalWait: { kind: "open-pr", prNumber: 2117, since: gateSince },
         }),
       );
       if (d.action === "continue") {
         goal = noteContinue(goal, "stuck");
         continue;
       }
-      expect(d.action).toBe("escalate");
-      if (d.action === "escalate") escalated = d.reason;
+      if (d.action === "none") {
+        // The parked state, which is the point: no page AND no spend.
+        expect(d.reason).toBe("external-wait");
+        continue;
+      }
+      escalated = d.reason;
+      escalatedAtMs = now - gateSince;
       break;
     }
     expect(escalated).not.toBeNull();
-    expect(escalated).toContain("per-goal ceiling");
-    // …and specifically NOT the diagnosis this gate exists to withhold.
+    expect(escalated).toContain("PR #2117");
+    // …and specifically NOT either diagnosis this gate exists to withhold.
     expect(escalated).not.toContain("no sign of progress");
+    expect(escalated).not.toContain("per-goal ceiling");
+    // It waited out the grace before handing over, and did not sit silent much beyond it.
+    expect(escalatedAtMs).toBeGreaterThanOrEqual(EXTERNAL_WAIT_GRACE_MS);
+    // Within one sweep of the grace, not merely "eventually" — a bound that only asserts the upper
+    // half would pass against a grace that had drifted up past the goal's own 4h TTL, where the
+    // handover can never fire at all because `goal-expired` is answered first.
+    expect(escalatedAtMs).toBeLessThan(EXTERNAL_WAIT_GRACE_MS + 20 * 60_000);
   });
 
-  it("the resume banner past the bound tells the agent the truth about the ceiling", () => {
+  it("the resume banner tells the gated agent the truth about what happens next", () => {
     // AGENTS.md: a fix that changes WHEN something happens must update every string describing the
-    // old timing. `attempt` is `consecutive + 1`, so a gated agent reaches resume 4 — and the
-    // ordinary copy would read "AUTO-RESUME 4 OF 3 … at 3 this stops and escalates to a human",
-    // which is arithmetically absurd AND promises an escalation the gate just cancelled.
+    // old timing. The ordinary copy would read "AUTO-RESUME 2 OF 3 … at 3 this stops and escalates
+    // to a human", which promises an escalation the gate cancels — and the gated copy's own former
+    // ending, "Resumes on one goal stop at 20", is now equally false: past the streak bound the
+    // ladder parks, so the next resume is caused by the GATE moving, not by any count.
+    let goal = newGoal("land the retry PR", T0);
+    goal = noteContinue(goal, "stuck");
     const d = decideContinuation(
       ready({
-        goal: stuckGoal(),
+        goal,
         mark: "stuck",
-        externalWait: { kind: "open-pr", prNumber: 2117 },
+        externalWait: { kind: "open-pr", prNumber: 2117, since: T0 },
       }),
     );
     if (d.action !== "continue") throw new Error("expected a continue");
-    expect(d.attempt).toBe(MAX_CONTINUES_WITHOUT_PROGRESS + 1);
+    expect(d.attempt).toBe(2);
     expect(d.prompt).toContain("PR #2117");
     expect(d.prompt).not.toContain(`OF ${MAX_CONTINUES_WITHOUT_PROGRESS} on this goal`);
-    expect(d.prompt).toContain(String(MAX_CONTINUES_TOTAL));
+    // The promise that is now true, and the one that is not.
+    expect(d.prompt).toContain("until the gate's state actually changes");
+    expect(d.prompt).not.toContain(`Resumes on one goal stop at ${MAX_CONTINUES_TOTAL}`);
     // It must not tell an agent that is waiting on CI to invent work.
     expect(d.prompt).toContain("do not invent work");
   });
@@ -1083,5 +1120,115 @@ describe("goal-awaiting-close — a landed goal awaiting a person's close stops 
       action: "none",
       reason: "goal-awaiting-close",
     });
+  });
+});
+
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+// A CI WAIT IS NOT A STALL — sparkle-yxl05z, and it is the SECOND half of the gate above.
+//
+// The first half taught the STREAK bound to stop diagnosing a CI queue as a stuck agent. It left
+// two things it should not have, and the founder measured both:
+//
+//   1. THE CEILING STILL PAGED HIM. Five agents in one day were escalated at `MAX_CONTINUES_TOTAL`
+//      while holding a MERGEABLE PR whose only outstanding job was a coverage run on a saturated
+//      runner pool. The sentence was about the SPEND, which is true — but the human it reaches can
+//      do nothing about a queue, and a "needs you" list that is mostly this trains its reader to
+//      stop opening it.
+//   2. IT KEPT RESUMING, AND EVERY RESUME COST A FULL CONTEXT. Blocked on CI wall-clock for ~2
+//      hours across several PRs, the founder's own session was woken again and again by "your goal
+//      is not met yet, so you are being resumed automatically" — each wake re-billing the ENTIRE
+//      context to produce the sentence "still waiting on CI". Nothing distinguished "blocked on an
+//      external system I cannot hurry" from "stopped working".
+//
+// Both halves are one rule: while a gate the agent cannot hurry is in evidence AND nothing has
+// moved, the ladder PARKS — it neither pages a human nor spends a turn. It un-parks the moment the
+// gate moves, because the gate's identity is part of the progress mark, so "resume when the run's
+// status actually changes" needs no second clock.
+//
+// EVERY SUPPRESSION BELOW HAS ITS PAIR, because a test that only proves silence passes just as well
+// against a ladder that has simply stopped firing.
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+
+/** The gate as the runner reports it: an open PR this window has been watching since `since`. */
+function openPr(since: number | null): ExternalWait {
+  return { kind: "open-pr", prNumber: 2117, since };
+}
+
+/** A goal that has spent its whole per-goal budget — specimens 2-5, which kept making progress
+ *  (so the streak never fired) and hit the ceiling anyway while CI churned. */
+function spentGoal(text = "land the retry PR"): AgentGoal {
+  return { ...newGoal(text, T0), continues: 0, totalContinues: MAX_CONTINUES_TOTAL };
+}
+
+describe("a CI wait is not a stall", () => {
+  const NOW = T0 + IDLE_SETTLE_MS + 1_000;
+
+  it("PAIR — at the per-goal ceiling with NO gate known, it still escalates to a human", () => {
+    // THE TRUE POSITIVE. A genuinely stalled agent that has burned twenty restarts still reaches
+    // somebody; without this, every assertion below is satisfied by a ladder that never fires.
+    const d = decideContinuation(ready({ goal: spentGoal(), mark: "stuck" }));
+    expect(d.action).toBe("escalate");
+    if (d.action !== "escalate") throw new Error("unreachable");
+    expect(d.reason).toContain("per-goal ceiling");
+  });
+
+  it("at the per-goal ceiling behind a LIVE gate, it parks instead of paging the founder", () => {
+    // Identical state to the pair above plus the one fact the ceiling arm never consulted.
+    const d = decideContinuation(
+      ready({ goal: spentGoal(), mark: "stuck", externalWait: openPr(NOW - 60 * 60_000) }),
+    );
+    expect(d).toEqual({ action: "none", reason: "external-wait" });
+  });
+
+  it("past the streak bound behind a LIVE gate it stops RESUMING too, not just escalating", () => {
+    // The founder's own two hours: the old gate suppressed the escalation and then resumed the
+    // agent on every settle, re-billing a whole context each time to say "still waiting on CI".
+    const d = decideContinuation(
+      ready({ goal: stuckGoal(), mark: "stuck", externalWait: openPr(NOW - 60 * 60_000) }),
+    );
+    expect(d).toEqual({ action: "none", reason: "external-wait" });
+  });
+
+  it("PAIR — the gate MOVING un-parks it, so the resume is driven by the gate, not a timer", () => {
+    // `progressMark` folds the PR reading in, so a gate that answers CHANGES the mark. That is the
+    // whole "park on a CI-conclusion watch rather than a resume timer" requirement, and it needs no
+    // second clock. Same parked state as above, one thing different: the mark has moved.
+    const d = decideContinuation(
+      ready({ goal: stuckGoal(), mark: "moved", externalWait: openPr(NOW - 60 * 60_000) }),
+    );
+    expect(d.action).toBe("continue");
+  });
+
+  it("PAIR — a gate that has not moved past the grace escalates, naming the gate", () => {
+    // A hole, not a gate, is how this change could be wrong: an agent parked forever behind a PR
+    // nobody will ever merge must still reach a person. It does, and the sentence is about the WAIT
+    // — the one claim the evidence supports — rather than the false "restarting cannot fix it".
+    const d = decideContinuation(
+      ready({
+        goal: stuckGoal(),
+        mark: "stuck",
+        externalWait: openPr(NOW - EXTERNAL_WAIT_GRACE_MS - 1),
+      }),
+    );
+    expect(d.action).toBe("escalate");
+    if (d.action !== "escalate") throw new Error("unreachable");
+    expect(d.reason).toContain("PR #2117");
+    expect(d.reason).not.toContain("no sign of progress");
+  });
+
+  it("an UNTRACKED gate age keeps today's behaviour rather than silently going quiet", () => {
+    // FAIL IN THE SAFE DIRECTION. `since: null` is a window that has not been sweeping this agent
+    // long enough to say when the gate appeared — see the runner's ledger. A missed stall strands
+    // work, so an unmeasurable wait must not buy silence: the streak arm keeps resuming exactly as
+    // it did before this change, and the ceiling still ends at a human.
+    const resumed = decideContinuation(
+      ready({ goal: stuckGoal(), mark: "stuck", externalWait: openPr(null) }),
+    );
+    expect(resumed.action).toBe("continue");
+
+    const capped = decideContinuation(
+      ready({ goal: spentGoal(), mark: "stuck", externalWait: openPr(null) }),
+    );
+    expect(capped.action).toBe("escalate");
   });
 });

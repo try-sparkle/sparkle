@@ -559,15 +559,33 @@ pub fn sampled_concurrency(
     // `load_narrowed` already floors at 1; the `min` cannot lift `a.admitted`, so the invariant
     // `effective <= static_max` still holds by construction.
     //
-    // WHICH ONE GETS TO EXPLAIN ITSELF: whichever is actually binding, and ties go to memory. A tie
-    // means both dimensions independently landed on the same ceiling, and memory is the one with a
-    // remedy the human can act on ("close something") — telling them the run queue is deep when the
-    // machine is equally out of RAM sends them to tune the wrong thing, which is precisely the
-    // mis-attribution `Bound` was introduced to prevent.
+    // A REFUSAL IS NOT THE SAME QUESTION AS "WHICH NUMBER IS SMALLEST" (bead `sparkle-iyxxin`).
+    // `by_load` is `Some` exactly when the run queue REFUSED — it is a rate, and its number is only
+    // ever "hold at what is already running". The first version of this asked `l < a.admitted`
+    // instead, which is a question about two NUMBERS, and the two come apart the moment `in_use`
+    // sits at or above the static ceiling — the normal state of a machine carrying a
+    // `[workers].max_concurrent` pin. There the hold-at-`in_use` ceiling lands ABOVE the static cap,
+    // `min` discards it, and the refusal disappeared from all three fields the consumer reads:
+    // `bound`, `basis` and `sampled`. `services/orchestrationListener.globalGateBinds` then fell
+    // through to comparing a WORKER-ONLY count against the static cap, and a saturated machine with
+    // build agents making up the difference went right back to admitting workers — the exact defect
+    // this dimension was added to close, surviving inside it.
     let by_load = load_narrowed(in_use, load);
-    let load_binds = by_load.is_some_and(|l| l < a.admitted);
     let effective = by_load.map_or(a.admitted, |l| a.admitted.min(l));
-    let narrowed = effective < static_max;
+
+    // WHO GETS TO EXPLAIN IT, with the tie rule kept but stated in terms of what it actually meant:
+    // memory wins a tie only when memory ITSELF narrowed. A tie was always "both dimensions
+    // independently landed on the same ceiling, and memory's remedy ('close something') is the
+    // actionable one" — but when memory did not narrow at all, there is no tie to award it, only a
+    // static ceiling that happens to sit at or below where the run queue is holding. Handing the
+    // attribution to the static bound there tells a human the ceiling is their pin when the truth
+    // is that the cores are 21.5x oversubscribed.
+    let memory_narrowed = a.admitted < static_max;
+    let load_binds = by_load.is_some_and(|l| !(memory_narrowed && a.admitted <= l));
+
+    // `load_binds` implies `narrowed`, so a refusing run queue always reaches the arms below. That
+    // is the point: the number alone cannot carry a rate's verdict, so the BOUND has to.
+    let narrowed = effective < static_max || load_binds;
 
     ConcurrencyAdmission {
         effective,
@@ -1955,6 +1973,101 @@ mod tests {
         assert_eq!(c.effective, 81);
         assert_eq!(c.bound, Bound::Ram);
         assert!(!c.sampled, "nothing measured — the consumer must leave the ceiling alone");
+    }
+
+    // ── the pinned-cap hole: a refusal the consumer never hears (sparkle-iyxxin) ────────────────
+    //
+    // `load_binds` used to mean "did the run queue take the number BELOW what memory allowed", which
+    // is a question about two NUMBERS. The question the consumer actually asks is "did the run queue
+    // REFUSE" — and those come apart the moment `in_use` is at or above the static ceiling, which is
+    // the normal state of a machine with a `[workers].max_concurrent` pin. There the run queue's
+    // hold-at-`in_use` lands ABOVE the static cap, `min` discards it, and the refusal vanished from
+    // all three fields the frontend reads: `bound`, `basis` and `sampled`.
+    //
+    // What that costs is not cosmetic. `orchestrationListener.globalGateBinds` refuses outright on
+    // `bound === "load"` and otherwise compares a WORKER-ONLY count against the ceiling — so with
+    // build agents making up the difference, a saturated machine went straight back to admitting
+    // workers while reporting the static basis. That is bead `sparkle-iyxxin` verbatim, surviving
+    // inside the very dimension added to close it.
+
+    /// The pinned ceiling from `config.rs`'s own worked example, and a fleet already past it.
+    const PINNED: u32 = 32;
+
+    #[test]
+    fn a_refusing_run_queue_is_reported_even_when_it_is_not_the_smallest_number() {
+        let busy = LoadSample { load1: 387.0, cores: 18 };
+        let mem = roomy(); // 48% free — the measured reading that made the memory gate say "room"
+        let c = sampled_concurrency(PINNED, Bound::Pinned, "pinned to 32 in config.toml", 69, PER_AGENT, Some(&mem), Some(&busy));
+
+        assert_eq!(c.bound, Bound::Load, "the run queue refused, so the run queue explains it");
+        assert!(
+            c.basis.contains("run queue"),
+            "the refusal must NAME the signal that refused, not read as a pin: {}",
+            c.basis
+        );
+        assert!(c.sampled, "a measurement refused; the consumer must not discard it");
+        assert_eq!(c.effective, PINNED, "and it still may not raise the static ceiling");
+    }
+
+    #[test]
+    fn a_healthy_run_queue_at_the_same_pinned_cap_still_admits_and_names_the_pin() {
+        // THE PAIRED CASE. Identical fleet, identical ceiling, identical memory — only the run-queue
+        // reading differs. One test showing a refusal is ambiguous; this pins the CAUSE to the load
+        // sample rather than to the pin, the fleet size, or the memory reading.
+        let calm = LoadSample { load1: 9.0, cores: 18 }; // 0.5x per core — busy, healthy
+        let mem = roomy();
+        let c = sampled_concurrency(PINNED, Bound::Pinned, "pinned to 32 in config.toml", 69, PER_AGENT, Some(&mem), Some(&calm));
+
+        assert_eq!(c.bound, Bound::Pinned, "nothing refused, so the static attribution stands");
+        assert!(!c.basis.contains("run queue"), "and the run queue must not claim a refusal it did not make");
+        assert_eq!(c.effective, PINNED);
+    }
+
+    #[test]
+    fn a_saturated_run_queue_with_no_memory_reading_still_reports_a_measurement() {
+        // THE WORST SHAPE, and the one the machine actually produces: `sample_now()` forks four
+        // processes and `?`-bails to None, so on a box that cannot fork the memory reading is the
+        // one most likely to be missing. With `in_use` past a pinned ceiling, `sampled` then read
+        // FALSE — and `globalGateBinds`'s first line is `if (!admission.sampled) return
+        // globalUsedSlots() >= staticCap`, i.e. straight back to the number computed at startup.
+        let busy = LoadSample { load1: 387.0, cores: 18 };
+        let c = sampled_concurrency(PINNED, Bound::Pinned, "pinned to 32 in config.toml", 69, PER_AGENT, None, Some(&busy));
+
+        assert!(c.sampled, "the run queue WAS read and it refused — that is a measurement");
+        assert_eq!(c.bound, Bound::Load);
+        assert!(c.basis.contains("run queue"), "basis: {}", c.basis);
+        assert!(c.sample.is_none(), "while still claiming no MEMORY reading, because there was none");
+    }
+
+    #[test]
+    fn nothing_readable_at_a_pinned_cap_is_still_not_sampled() {
+        // The paired case for the one above: `sampled` must not have become a constant true. With
+        // neither dimension readable the gate degrades to the untouched static ceiling.
+        let c = sampled_concurrency(PINNED, Bound::Pinned, "pinned to 32 in config.toml", 69, PER_AGENT, None, None);
+        assert!(!c.sampled, "nothing measured — the consumer must leave the ceiling alone");
+        assert_eq!(c.bound, Bound::Pinned);
+        assert_eq!(c.effective, PINNED);
+    }
+
+    #[test]
+    fn the_load_bound_crosses_the_wire_as_the_string_the_frontend_matches_on() {
+        // THE SEAM, which neither suite covered. Rust's tests stop at this struct; the TypeScript
+        // tests hand-write `bound: "load"` into a fixture. So the one fact both halves depend on —
+        // that serde emits exactly `"load"` — was asserted by nothing, and a rename or a change to
+        // the `rename_all` attribute would leave BOTH suites green while
+        // `orchestrationListener.globalGateBinds`'s `admission.bound === "load"` silently stopped
+        // matching. A saturated machine would go back to admitting, permanently, with no log line.
+        let busy = LoadSample { load1: 387.0, cores: 18 };
+        let c = sampled_concurrency(81, Bound::Ram, "RAM-bound: …", 69, PER_AGENT, None, Some(&busy));
+        let wire = serde_json::to_value(&c).expect("ConcurrencyAdmission serializes");
+
+        assert_eq!(
+            wire.get("bound").and_then(|v| v.as_str()),
+            Some("load"),
+            "services/orchestrationListener.ts matches this string literally; \
+             services/config.ts's ConcurrencyBound union spells it \"load\""
+        );
+        assert_eq!(wire.get("sampled").and_then(|v| v.as_bool()), Some(true));
     }
 
     #[test]
