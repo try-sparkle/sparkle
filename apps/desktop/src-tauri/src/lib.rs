@@ -599,6 +599,28 @@ mod updater_quit {
                 !hold_second_exit(),
                 "and that second exit passes, or the hold is never released"
             );
+
+            // THE ACK LANDED IN TIME — the paired case for "the webview never answered", and the
+            // only one that drives the OTHER side of phase 1's conditional (roborev 67772). Without
+            // it the guard itself is unpinned: every case above enters with `install_started()`
+            // false, so replacing `if !install_started() { exit(); }` with a bare `exit();` leaves
+            // all of them byte-identically green — and the watchdog would then fire an exit request
+            // into a LIVE bundle swap at the 5s boundary, which is the whole thing the two-phase
+            // split exists to prevent.
+            reset_for_test();
+            note_staged(true);
+            assert!(should_defer_exit(true));
+            note_install_started();
+            let log = RefCell::new(Vec::<Ev>::new());
+            run_exit_watchdog(
+                &mut |ms| log.borrow_mut().push(Ev::Slept(ms)),
+                &mut || log.borrow_mut().push(Ev::Exited),
+            );
+            assert_eq!(
+                *log.borrow(),
+                vec![Ev::Slept(ACK_BUDGET_MS), Ev::Slept(INSTALL_BUDGET_MS), Ev::Exited],
+                "MUTATION: drop the `if !install_started()` guard and exit unconditionally. An                  install that acked INSIDE the budget is then killed at the 5s boundary —                  mid-swap, between `install_inner`'s remove_dir_all and its final rename — and                  the only thing left standing is the independent `hold_second_exit` arm."
+            );
         }
 
         /// The one part of the sequence a unit test CANNOT execute: `has_webview` is derived from a
