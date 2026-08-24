@@ -2672,8 +2672,10 @@ describe("quit_alternate_screen", () => {
 
   // ── 4. GATE 1 ALONE — the buffer-mode bit ───────────────────────────────────────────────────
   // The pager TEXT with the buffer bit false. Every other gate passes, so this case can only be
-  // green because the buffer check refused: Claude Code draws its prompt and its dialogs on the
-  // NORMAL buffer, which is why gate 1 alone already excludes all of them.
+  // green because the buffer check refused. That is ALL it proves, and the distinction matters:
+  // gate 1 refusing when the bit is FALSE says nothing about it excluding Claude Code when the bit
+  // is TRUE — which it does not, since Claude Code holds the alternate buffer at a bare idle prompt
+  // on a modern fleet (see the case eleven lines below, and roborev 68360/68368).
   it("writes nothing when the terminal is on the NORMAL buffer, pager text or not", async () => {
     mountScreen(LESS_ON_A_MARKDOWN_FILE, false);
     const r = await quitAlternateScreen(AGENT, ALLOWED);

@@ -1306,13 +1306,17 @@ export const CONCIERGE_TERMINAL_TOOLS = [
     description:
       "Get an agent OUT of a full-screen pager (less, more, man, git's pager) that it is wedged on. " +
       "This is the only way q ever reaches a terminal, and it is not a general keypress: it refuses " +
-      "unless ALL FOUR of these hold — the terminal is genuinely on the alternate screen buffer (the " +
+      "unless ALL FIVE of these hold — the terminal is genuinely on the alternate screen buffer (the " +
       "emulator's own mode bit, not a guess from the text), the screen is NOT Claude Code's own " +
-      "interface, the screen offers NO choice to answer, and it is not a plan-mode surface. A " +
-      "permission dialog, a picker and a plan prompt all offer a choice, so none of them can be " +
-      "reached through this op even if the Claude Code check were wrong. Each refusal names WHICH of " +
-      "those it was. It presses q, re-reads the screen, and only then escalates to ctrl+c if the " +
-      "terminal is still full-screen and all four still hold. It re-reads again afterwards and tells " +
+      "interface, the screen offers NO choice to answer, it is not a plan-mode surface, and there is " +
+      "POSITIVE evidence it is a pager (a less/more/man status row), with full-screen EDITORS " +
+      "refused outright. That last gate is the load-bearing one, NOT the buffer bit: Claude Code " +
+      "holds the alternate buffer at all times on a modern fleet, so the buffer bit does not exclude " +
+      "a Claude Code pane — what excludes it is that an idle prompt carries no pager status row. In " +
+      "an editor q is not a quit key but a character written into the file, which is why an editor " +
+      "is refused even though it offers no choice to answer. Each refusal names WHICH of those it " +
+      "was. It presses q, re-reads the screen, and only then escalates to ctrl+c if the terminal is " +
+      "still full-screen and all five still hold. It re-reads again afterwards and tells " +
       "you whether the screen ACTUALLY cleared — vim quits on neither key, and it will say so rather " +
       "than claiming success. Requires an authorized tool policy.",
     write: true,
@@ -1746,8 +1750,9 @@ export async function sendControlKey(
 //
 // Gates 1-4 establish "not Claude Code, not answerable, not a plan surface". NONE of them
 // establishes that the alternate screen is a PAGER — and the first version of this op shipped with
-// exactly that hole. Every other full-screen program passes all four, and the dangerous family is
-// FULL-SCREEN EDITORS, where `q` is not a quit key at all but A CHARACTER INSERTED INTO THE FILE.
+// exactly that hole. Every other full-screen program passes all four of them, and the dangerous
+// family is FULL-SCREEN EDITORS, where `q` is not a quit key at all but A CHARACTER INSERTED INTO
+// THE FILE.
 //
 // The concrete failure, and it is live in this repo: an agent runs `git commit` or `roborev comment`
 // with no `-m`, `$EDITOR` opens `nano` (or vim already in insert mode) on the alternate buffer.
@@ -1875,7 +1880,7 @@ export interface QuitAlternateScreenResult {
   detail: string;
 }
 
-/** The four gates, over ONE viewport snapshot.
+/** The five gates, over ONE viewport snapshot.
  *
  *  ONE SNAPSHOT IS THE CONTRACT. `TerminalViewport` exists precisely so `text` and `alternateBuffer`
  *  describe the same instant; re-reading between checks could straddle a `less` launch and mix a
@@ -1896,8 +1901,12 @@ function quitGateRefusal(
         "would land in. That has to be done in the agent's own pane.",
     };
   }
-  // GATE 1 — the emulator's buffer-mode bit. See the header: Claude Code does not issue DECSET 1049
-  // for its prompt, its permission dialogs or its pickers, so this alone excludes all of them.
+  // GATE 1 — the emulator's buffer-mode bit. NECESSARY, NOT SUFFICIENT, and the difference is the
+  // whole point (roborev 68360/68368): Claude Code HOLDS the alternate buffer at all times on a
+  // modern fleet — conciergeDispatch.ts records it, measured on v2.1.237 at a bare idle prompt — so
+  // this gate is TRUE for ordinary Claude Code panes and excludes none of them. All it establishes
+  // is that there is some full-screen thing to quit. GATE 5 is what keeps `q` out of a Claude Code
+  // pane. An earlier version of this very comment claimed the opposite; do not restore it.
   if (!screen.alternateBuffer) {
     return {
       reason: "normal-buffer",
@@ -1957,7 +1966,7 @@ const settle = () => new Promise<void>((r) => setTimeout(r, QUIT_SETTLE_MS));
 
 /**
  * Get an agent out of a full-screen pager it is wedged on — the ONLY route by which `q` reaches a
- * terminal. Read the module section above before changing anything here: the four gates are the
+ * terminal. Read the module section above before changing anything here: the five gates are the
  * safety argument, not an optimisation.
  *
  * Rides the SAME authority and `agentCanAcceptInput` gates as `sendControlKey`, and writes through
@@ -2017,7 +2026,7 @@ export async function quitAlternateScreen(
   // RE-READ, AND RE-GATE. Not just "is it still alternate": the screen may have CHANGED into
   // something this op must not press into — a pager that exited straight back into a Claude Code
   // dialog, say. Escalating on a stale verdict would be exactly the H2 mistake one step later, so
-  // the second key has to clear all four gates against a FRESH single snapshot of its own.
+  // the second key has to clear all five gates against a FRESH single snapshot of its own.
   const afterQ = getAgentViewport(agentId);
   if (!afterQ) {
     return no(
