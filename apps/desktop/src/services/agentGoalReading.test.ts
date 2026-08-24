@@ -434,3 +434,80 @@ describe("landedEvidenceFor — a stale watermark must not veto a landed tip", (
     expect(landedEvidenceFor(A)).toBe(false);
   });
 });
+
+describe("landedEvidenceFor — a LIVE origin landing beats an UNLATCHED watermark (sparkle-lh0fdg)", () => {
+  // The half `sparkle-qh6j7g` left standing. Its fix hardened the VETO (`unlandedWorkEvidence`) to
+  // prefer a live origin reading over the stale stage watermark — but the POSITIVE half of this gate
+  // still short-circuited: `if (shipped !== true) return false`. `workflowShipped` is a MONOTONIC
+  // latch set only the first time a poll HAPPENS TO OBSERVE the stage cross `merged` on origin, and
+  // `branchStatus`/`workflowState` boot clean on relaunch while the two watermarks persist. So a
+  // branch that merged seconds ago, or any pane that has not polled since the merge, has
+  // `shipped:false` while git already reports the tip on origin/main — and the gate answered `false`,
+  // sending a finished agent back to "go land it" on already-merged work, which is the 20-resume
+  // escalation loop this bead names. The fix accepts live origin reachability in the watermark's place.
+
+  it("a just-merged branch (watermark UNLATCHED, tip on origin) is markable met", () => {
+    // The lh0fdg repro: PR merged, no poll has observed the crossing yet (no stage, no shipped
+    // watermark), but the live reading says the tip IS in origin main with nothing ahead.
+    seed({
+      branchStatus: { [A]: CLEAN_BS },
+      workflowState: {
+        [A]: { ...BARE_WS, inOriginMain: true, aheadOfBase: 0, pushed: true, prState: "merged" },
+      },
+      // workflowStage and workflowShipped deliberately ABSENT — the unlatched-watermark state.
+    });
+    expect(landedEvidenceFor(A)).toBe(true);
+  });
+
+  it("a SQUASH-landed branch (watermark UNLATCHED, landedOnOrigin) is markable met", () => {
+    // Squash/rebase defeats ancestor reachability, so `inOriginMain` is false and `ahead` stays >0
+    // forever; `landedOnOrigin` is the cherry-equivalence proof that carries the fact. Same
+    // unlatched-watermark state.
+    seed({
+      branchStatus: { [A]: { ...CLEAN_BS, ahead: 3 } },
+      workflowState: {
+        [A]: {
+          ...BARE_WS,
+          landedOnOrigin: true,
+          inOriginMain: false,
+          aheadOfBase: 3,
+          pushed: true,
+          prState: "merged",
+        },
+      },
+    });
+    expect(landedEvidenceFor(A)).toBe(true);
+  });
+
+  it("PAIRED: the SAME committed-work setup with the tip NOT on origin stays unmet", () => {
+    // Committed work is present (pushed, a PR, commits ahead) — so `committedWorkSeen` is satisfied —
+    // but NEITHER origin proof is true. This pins that it is the origin reachability, not merely the
+    // presence of work, that flips the answer to `true`. Without it the goal correctly stays unmet.
+    seed({
+      branchStatus: { [A]: { ...CLEAN_BS, ahead: 2 } },
+      workflowState: {
+        [A]: {
+          ...BARE_WS,
+          inOriginMain: false,
+          landedOnOrigin: false,
+          aheadOfBase: 2,
+          pushed: true,
+          prState: "open",
+        },
+      },
+    });
+    expect(landedEvidenceFor(A)).toBe(false);
+  });
+
+  it("NO-OP GUARD: a bare branch on main's HEAD (inOriginMain, no work) stays unmet", () => {
+    // A branch freshly cut from main and never committed to has its tip == main's HEAD, so
+    // `inOriginMain` is trivially true. With no `pushed`, no PR, no commits ahead and no watermark,
+    // `committedWorkSeen` is false — so the live-reachability path must NOT let it close a landed
+    // goal. This is the guard the monotonic watermark provided and the fix must preserve.
+    seed({
+      branchStatus: { [A]: CLEAN_BS },
+      workflowState: { [A]: { ...BARE_WS, inOriginMain: true, aheadOfBase: 0 } },
+    });
+    expect(landedEvidenceFor(A)).toBe(false);
+  });
+});

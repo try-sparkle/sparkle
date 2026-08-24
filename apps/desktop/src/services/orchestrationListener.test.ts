@@ -231,6 +231,40 @@ describe("orchestrationListener", () => {
     expect(useRuntimeStore.getState().openAgentIds).toContain(workerId);
   });
 
+  it("spawn_worker → STILL launches the worker when a reconcile evicts its record mid-spawn (sparkle-ynytw)", async () => {
+    // THE FIRST-HALF DEFECT: spawn_worker returned a clean handle for a worker that never took a
+    // turn. It happens when a concurrent reconcile/relocation removes the freshly-spawned worker's
+    // in-memory store record in the microtask gap after spawnWorker resolves (the sparkle-yk3x race).
+    // The launch is `open(workerId)` — it mounts the pane and starts the session. The OLD code
+    // re-read the store for the record and skipped open() when it was missing, so the worker was
+    // never opened, never launched, and later reported never_started — yet the reply was a success.
+    // spawnWorker only returns a workerId AFTER it has durably written the worker's manifest to disk,
+    // so the id is proven materialized and MUST be launched even when the in-memory record is gone.
+    spawnWorkerMock.mockImplementationOnce(async (args: { projectId: string; parentAgentId: string; task: string }) => {
+      const id = useProjectStore.getState().addAgent(args.projectId, {
+        kind: "worker",
+        parentId: args.parentAgentId,
+        task: args.task,
+      })!;
+      const branch = `sparkle/agent-${id}`;
+      const worktree = `/wt/${id}`;
+      useProjectStore.getState().setAgentWorktree(args.projectId, id, worktree, branch);
+      // The concurrent reconcile wipes the in-memory record right after the (disk-durable) cut.
+      useProjectStore.getState().removeAgent(args.projectId, id);
+      return { workerId: id, branch, worktree };
+    });
+    fire({ reqId: "ynytw", op: "spawn_worker", buildAgentId: buildId, projectId, payload: { task: "launch me" } });
+    await flush();
+    const [, args] = invokeMock.mock.calls.at(-1)!;
+    const result = (args as { result: { workerId: string; error?: string } }).result;
+    expect(result.error).toBeUndefined();
+    const workerId = result.workerId;
+    expect(workerId).toBeTruthy();
+    // THE SIDE EFFECT: the launch call fired despite the evicted record, so the worker's session
+    // starts instead of stranding behind "Start this agent" with a phantom-success handle.
+    expect(useRuntimeStore.getState().openAgentIds).toContain(workerId);
+  });
+
   it("self-heals: a materialized worker that isn't open is auto-opened on a store change", async () => {
     // Simulate a worker that was spawned + had its worktree cut but never made it into openAgentIds
     // (the reconcile/remount eviction strand) — the listener's subscription must re-open it. The

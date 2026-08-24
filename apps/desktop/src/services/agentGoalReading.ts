@@ -30,7 +30,12 @@ import type { ExpiryProof } from "../engine/goalExpiry";
 import { quotaBlockForAgent } from "../engine/engineRegistry";
 import { humanBlockFor } from "./humanBlockFor";
 import { thrashReportFor, type ThrashReport } from "../engine/agentThrash";
-import { unlandedWorkEvidence, type WorkflowStageId } from "../engine/workflowStage";
+import {
+  committedWorkSeen,
+  gitDerivedStage,
+  unlandedWorkEvidence,
+  type WorkflowStageId,
+} from "../engine/workflowStage";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useInteractionStore } from "../stores/interactionStore";
 import { calmNewAgent } from "../engine/newAgentAttention";
@@ -257,7 +262,34 @@ export function landedEvidenceFor(agentId: string): boolean | undefined {
   // is nullable), so that is a reachable state, not a hypothetical. Require the field the veto
   // actually consumes; `ws` remains an INPUT to the evidence, never an alternative to `bs`.
   if (bs === undefined) return undefined;
-  if (shipped !== true) return false;
+  // A LIVE, ORIGIN-SCOPED LANDING READING OUTRANKS THE MONOTONIC `shipped` WATERMARK (sparkle-lh0fdg,
+  // sparkle-qh6j7g). `workflowShipped` only latches the first time a poll HAPPENS TO OBSERVE the stage
+  // reach `merged` on ORIGIN — a latch that moves only when something is watching. So a branch that
+  // merged seconds ago, or any pane that has not polled since the merge (including right after a
+  // relaunch, when the two watermarks persist but `workflowState` boots clean and then repopulates a
+  // tick later), reads `shipped:false` while git ALREADY reports the tip on origin/main. Returning
+  // `false` there told a finished agent to "go land it," reopening the 20-resume escalation loop this
+  // gate exists to stop — over work that was already merged. The rule (founder, sparkle-lh0fdg): a
+  // verifier whose inputs the agent cannot influence must prefer a LIVE measurement over a latch.
+  //
+  // The live substitute is `ws.landedOnOrigin` (the squash/rebase/ancestry-against-origin proof) or
+  // `ws.inOriginMain` (tip is an ancestor of origin/main) — both are exactly "work is on origin/main".
+  // Both are trivially true for a no-op branch sitting on main's HEAD, so gate them behind
+  // `committedWorkSeen`, the SAME no-op guard `deriveLiveStage` applies before it latches the
+  // watermark (one implementation, shared). `pushed`/`prState` in that guard are never true for a
+  // no-op branch, so a genuinely-landed branch clears it while a bare cut from main does not. The
+  // new-work-cycle veto (`unlandedWorkEvidence`, below) still runs, so a branch that landed PR #1 and
+  // kept committing is still refused.
+  const liveLandedOnOrigin =
+    (ws?.landedOnOrigin === true || ws?.inOriginMain === true) &&
+    committedWorkSeen({
+      gitStage: gitDerivedStage(bs),
+      prev: stage,
+      aheadOfBase: ws?.aheadOfBase,
+      pushed: ws?.pushed,
+      prState: ws?.prState,
+    });
+  if (shipped !== true && !liveLandedOnOrigin) return false;
   return unlandedWorkEvidence({ bs, ws, stageOverride: stage }) === true ? false : true;
 }
 

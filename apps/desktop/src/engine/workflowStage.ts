@@ -371,6 +371,45 @@ function planningFloor(input: LiveStageInputs): number {
 // reading as "landed" (its tip is just main's HEAD). The monotonic watermark (`prev`) absorbs the
 // post-merge `ahead→0` dip, except when a NEW work cycle starts (prior work landed, but fresh
 // un-landed commits exist) — then the bar tracks the new cycle rather than staying pinned green.
+/**
+ * "Real committed work has EVER existed for this branch" — the shared no-op-branch guard.
+ *
+ * A branch freshly cut from main and never committed to is trivially tree-identical to main, so the
+ * reachability signals (`inLocalMain` / `landed` / `landedOnOrigin` / `inOriginMain`) all read true
+ * for it without it having authored anything. Any consumer that trusts a reachability signal as
+ * "this work landed" must FIRST confirm work was actually authored, or a seconds-old no-op branch
+ * sitting on main's HEAD reads as merged.
+ *
+ * ONE IMPLEMENTATION, TWO CONSUMERS (roborev: don't write a third copy): `deriveLiveStage` (the
+ * stage ladder) and `agentGoalReading.landedEvidenceFor` (the self-mark-met gate). They MUST agree —
+ * a stage reading "merged" while the goal gate reads "no work" is the cross-surface disagreement this
+ * module exists to forbid.
+ *
+ * The ACTION signals (`pushed`, `prState`, a cross-repo landing stamp) are load-bearing: a
+ * squash/rebase re-land drives `ahead`/`aheadOfBase` to 0 and, after a relaunch, the stage watermark
+ * boots empty — yet NONE of these three is ever true for a no-op branch (Rust guarantees each is
+ * agent-scoped; see the ⚠️ inside deriveLiveStage), so the guard survives the post-merge dip intact.
+ */
+export function committedWorkSeen(args: {
+  gitStage?: WorkflowStageId | undefined;
+  prev?: WorkflowStageId | null | undefined;
+  aheadOfBase?: number | undefined;
+  pushed?: boolean | undefined;
+  prState?: WorkflowState["prState"] | undefined;
+  crossRepoStamp?: boolean | undefined;
+}): boolean {
+  const idx = args.gitStage ? stageIndex(args.gitStage) : -1;
+  const prevIdx = args.prev ? stageIndex(args.prev) : -1;
+  return (
+    idx >= stageIndex("building_saved") ||
+    prevIdx >= stageIndex("building_saved") ||
+    (args.aheadOfBase ?? 0) > 0 ||
+    args.pushed === true ||
+    args.prState != null ||
+    args.crossRepoStamp === true
+  );
+}
+
 export function deriveLiveStage(input: LiveStageInputs): WorkflowStageId {
   const { kind, bs, ws, prev, parentReachedMain, parentOnOriginMain } = input;
   // Git floor only when a worktree/branch exists (bs present). With no worktree yet there is no
@@ -400,13 +439,14 @@ export function deriveLiveStage(input: LiveStageInputs): WorkflowStageId {
   // demands of any new source: it is never true for a no-op branch, because nothing writes it except
   // an agent explicitly naming the repository and pull request its work landed in. A branch sitting
   // on main's HEAD has no such record; only a deliberate `set_agent_landed` call produces one.
-  const committedSeen =
-    idx >= stageIndex("building_saved") ||
-    prevIdx >= stageIndex("building_saved") ||
-    (ws?.aheadOfBase ?? 0) > 0 ||
-    input.pushed === true ||
-    ws?.prState != null ||
-    input.crossRepo?.stamp != null;
+  const committedSeen = committedWorkSeen({
+    gitStage: bs ? gitDerivedStage(bs) : undefined,
+    prev,
+    aheadOfBase: ws?.aheadOfBase,
+    pushed: input.pushed,
+    prState: ws?.prState,
+    crossRepoStamp: input.crossRepo?.stamp != null,
+  });
 
   const bump = (id: WorkflowStageId) => {
     idx = Math.max(idx, stageIndex(id));

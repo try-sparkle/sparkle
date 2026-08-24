@@ -364,17 +364,28 @@ async function runSpawn(req: OrchestrationRequest): Promise<void> {
       // its reason would make an unverifiable worker look verifiable.
       goal: req.payload.goal,
     });
-    const project = useProjectStore.getState().projects.find((p) => p.id === req.projectId);
-    const worker = project?.agents.find((a) => a.id === workerId);
     // Auto-start the worker: opening it adds it to openAgentIds, which mounts its AgentPane and
     // launches the PTY (worker persona + stored task). Without this the orchestrated worker sits
     // idle in the sidebar showing "Start this agent" until a human clicks it — the manual spawn
-    // paths in AgentSidebar already call open() for exactly this reason. Gate on the worker record
-    // existing so a never-materialized id can't be stranded in openAgentIds; the per-build-agent
-    // concurrency cap is already enforced upstream (handleSpawn queues over-cap requests, and
-    // runSpawn reserves its slot via incInFlight before reaching here), so opening cannot exceed it.
-    // (If a reconcile race evicted the record, ensureWorkersOpen's self-heal re-opens it.)
-    if (worker) useRuntimeStore.getState().open(workerId);
+    // paths in AgentSidebar already call open() for exactly this reason.
+    //
+    // OPEN THE AUTHORITATIVE id UNCONDITIONALLY — this is the FIRST half of sparkle-ynytw
+    // ("verify the session actually started before returning a handle"). `spawnWorker` returns a
+    // workerId only AFTER writeWorkerManifest has durably persisted the worker to disk
+    // (.sparkle/worker.json — see workerSpawn.ts), so a returned id is PROVEN materialized. The
+    // previous guard here re-read the store for the record and skipped open() when it was missing —
+    // but the one way it is missing on THIS path is a concurrent reconcile/relocation evicting the
+    // in-memory record in the microtask gap after the await (the sparkle-yk3x race). That is exactly
+    // the case that MUST launch: the record is durable on disk and reconcileWorkersFromDisk will
+    // re-adopt it, but the re-adopted pane only mounts (and the session only takes its first turn)
+    // if the id is already in openAgentIds. The old guard instead returned a clean success handle
+    // for a worker that never launched — spawn_worker's core defect: a handle with no turn, later
+    // reported never_started. The guard's stated fear (a "never-materialized id stranded in
+    // openAgentIds") cannot occur on the success path, because a spawnWorker that failed to
+    // materialize throws and is caught below, never reaching here with a workerId. The per-build-agent
+    // concurrency cap is enforced upstream (handleSpawn queues over-cap requests; runSpawn reserves
+    // its slot via incInFlight before reaching here), so opening cannot exceed the bound.
+    useRuntimeStore.getState().open(workerId);
     // Reply with the AUTHORITATIVE identity spawnWorker captured from the worktree cut — do NOT
     // re-derive branch/worktree from the store lookup above. That record can be concurrently mutated
     // (worktreePath reset to null on relocation, or rebuilt by a cross-window reconcile) between the
