@@ -141,7 +141,7 @@ describe("AccountBadge — the shell fork warning", () => {
     shellAccountUuid: "5fb3d67c",
   });
   const NOTICE =
-    "Sparkle runs this account as drodio@storytell.ai; your terminal is signed in as drodio@gmail.com.";
+    "Sparkle runs this account as drodio@storytell.ai, but Claude's shared base sign-in (~/.claude.json) is currently drodio@gmail.com. This account follows that base login — signing it in as a different account changes this one too.";
 
   it("says so, in the dropdown and the tooltip, when the terminal is a DIFFERENT login", () => {
     mount([DEFAULT], [FORKED]);

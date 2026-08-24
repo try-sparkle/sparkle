@@ -482,7 +482,7 @@ describe("accountDisplay — the shell fork (default account only)", () => {
     );
     expect(d.shellForked).toBe(true);
     expect(forkNotice(d)).toBe(
-      "Sparkle runs this account as drodio@storytell.ai; your terminal is signed in as drodio@gmail.com.",
+      "Sparkle runs this account as drodio@storytell.ai, but Claude's shared base sign-in (~/.claude.json) is currently drodio@gmail.com. This account follows that base login — signing it in as a different account changes this one too.",
     );
   });
 
@@ -506,7 +506,7 @@ describe("accountDisplay — the shell fork (default account only)", () => {
     const d = accountDisplay(DEFAULT, ident("d", { email: "a@example.com", shellEmail: "b@example.com" }));
     expect(d.shellForked).toBe(true);
     expect(forkNotice(d)).toBe(
-      "Sparkle runs this account as a@example.com; your terminal is signed in as b@example.com.",
+      "Sparkle runs this account as a@example.com, but Claude's shared base sign-in (~/.claude.json) is currently b@example.com. This account follows that base login — signing it in as a different account changes this one too.",
     );
   });
 
@@ -528,7 +528,7 @@ describe("accountDisplay — the shell fork (default account only)", () => {
     const notice = forkNotice(d);
     expect(notice).not.toContain("isn't signed in");
     expect(notice).toBe(
-      "Sparkle runs this account as the account Sparkle is signed into; your terminal is signed in as them@example.com.",
+      "Sparkle runs this account as the account Sparkle is signed into, but Claude's shared base sign-in (~/.claude.json) is currently them@example.com. This account follows that base login — signing it in as a different account changes this one too.",
     );
   });
 
@@ -776,7 +776,7 @@ describe("hasLogin — availability is a WIDER question than 'can I name it'", (
     const notice = forkNotice(d);
     expect(notice).not.toContain("isn't signed in");
     expect(notice).toBe(
-      "Sparkle runs this account as the account Sparkle is signed into; your terminal is signed in as them@example.com.",
+      "Sparkle runs this account as the account Sparkle is signed into, but Claude's shared base sign-in (~/.claude.json) is currently them@example.com. This account follows that base login — signing it in as a different account changes this one too.",
     );
   });
 

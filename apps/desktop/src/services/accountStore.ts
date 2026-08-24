@@ -73,6 +73,12 @@ export interface Identity {
    *  learn window, so any learned headroom/ceiling number was partly measured against someone
    *  else. Absent (older backend) means "not known to have changed" — never assume it did. */
   identityChanged?: boolean;
+  /** True when this config dir is CURRENTLY signed into a DIFFERENT Anthropic account than the one it
+   *  was first bound to — its login was replaced under it. The DURABLE counterpart to
+   *  {@link Identity.identityChanged}: it never ages out of the ceiling learn window, so a dir left on
+   *  the wrong login keeps reporting drift until it is put back or re-attached. Absent (older backend)
+   *  means "no drift known" — never assume it drifted. See Rust `AccountIdentity::identity_drifted`. */
+  identityDrifted?: boolean;
 }
 
 /** Raw shape the Rust side returns — mapped to {@link Usage} at the boundary. `AccountUsage` in
@@ -390,6 +396,14 @@ export function identityChanged(identity: Identity | undefined): boolean {
   return identity?.identityChanged ?? false;
 }
 
+/** Whether this account's config dir is CURRENTLY signed into a different Anthropic account than the
+ *  one it was first bound to (a login swapped under it). Absent → false ("not known to have
+ *  drifted"), so an older backend never manufactures the warning. The durable counterpart to
+ *  {@link identityChanged}. */
+export function identityDrifted(identity: Identity | undefined): boolean {
+  return identity?.identityDrifted ?? false;
+}
+
 /** Ids of DEFAULT accounts that are CLOBBERED — the shared `$HOME/.claude` folder whose on-disk login
  *  is now a different Anthropic account than the one Sparkle runs it as ({@link accountDisplay}'s
  *  `shellForked`), or one whose dir a different account signed into recently ({@link identityChanged}).
@@ -427,7 +441,11 @@ export function forkNotice(display: AccountDisplay): string | null {
   if (!display.shellForked) return null;
   const sparkleAs = accountSentenceName(display);
   const shellAs = display.shellEmail ?? "a different account";
-  return `Sparkle runs this account as ${sparkleAs}; your terminal is signed in as ${shellAs}.`;
+  // NO "terminal": this account follows Claude's SHARED BASE sign-in (~/.claude.json), and the fork
+  // is that Sparkle runs it as one account while that base file currently holds another. Naming the
+  // base file and the consequence is the whole point — signing the base in as someone else silently
+  // becomes this account's identity too, which is exactly the drift this notice exists to make visible.
+  return `Sparkle runs this account as ${sparkleAs}, but Claude's shared base sign-in (~/.claude.json) is currently ${shellAs}. This account follows that base login — signing it in as a different account changes this one too.`;
 }
 
 /** How to name an account inside PROSE. {@link NOT_SIGNED_IN} is a slot label, not a name — dropped

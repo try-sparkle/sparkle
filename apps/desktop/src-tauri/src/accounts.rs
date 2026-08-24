@@ -206,6 +206,21 @@ pub struct AccountIdentity {
     /// is tracked by email rather than being skipped, and one merely *gaining* a uuid it did not
     /// report before is a ladder climb, not a takeover — so this stays `false` through it.
     pub identity_changed: bool,
+
+    /// True when this account's config dir is CURRENTLY signed into a DIFFERENT Anthropic account
+    /// than the one it was first bound to — its login was replaced under it (a reconnect into another
+    /// account, or, for the shared-`~/.claude` default, a terminal `claude` login into someone else).
+    ///
+    /// The DURABLE counterpart to [`identity_changed`]. Both read the same identity-epoch ledger, but
+    /// `identity_changed` is gated to the ceiling learn window because it drives a ceiling reset; this
+    /// one never ages out, so a dir left on the wrong login keeps reporting drift until it is put back
+    /// or re-attached. See [`bound_identity_key`] for what "first bound to" means and why a login
+    /// merely GAINING an `accountUuid` (a ladder climb) is not drift.
+    ///
+    /// `false` whenever either side is unresolvable — a dir never signed into, or one with no recorded
+    /// history (a legacy install predating the ledger) — so an older state never manufactures a drift
+    /// claim. A wrong identity is worse than none: we only assert drift on positive evidence both ways.
+    pub identity_drifted: bool,
 }
 
 /// The `oauthAccount` fields we read out of an account's `.claude.json`. A present value means
@@ -3517,6 +3532,23 @@ fn identity_key_for(acct: &Account, home: Option<&Path>) -> Option<String> {
     identity_for_account(acct, home).as_ref().map(identity_key)
 }
 
+/// The identity KEY a config dir was FIRST bound to — the OLDEST epoch recorded for it in the
+/// identity-epoch ledger, i.e. the account it was originally set up to run as. This is the durable
+/// anchor [`AccountIdentity::identity_drifted`] measures the dir's CURRENT login against.
+///
+/// `None` when the dir has no recorded history at all: a registration whose dir was never signed
+/// into, or a legacy install whose ledger has not yet observed it. Both degrade to "no drift known"
+/// rather than a false claim.
+///
+/// The key is an `accountUuid` when the login records one and the `email:` form otherwise (see
+/// [`identity_key`]), so a login predating `accountUuid` is anchored by email rather than skipped.
+/// The ledger rekeys an epoch IN PLACE when a uuid first appears for that email (a ladder climb —
+/// `identity_log::apply_observation`), so the first-bound key follows the same account across that
+/// climb and gaining a uuid never reads as drift.
+fn bound_identity_key<'a>(log: &'a identity_log::IdentityLog, config_dir: &str) -> Option<&'a str> {
+    log.get(config_dir)?.first().map(|e| e.account_uuid.as_str())
+}
+
 /// [`identity_key`] for the identity behind the user's LOGIN SHELL, or `None` when it has none.
 ///
 /// Extracted as its own seam purely so it can be TESTED. It is the one derivation that is unique to
@@ -3649,6 +3681,13 @@ fn identities_at(
                 .as_deref()
                 .and_then(|k| identity_log::takeover_at(&log, &a.config_dir, k))
                 .is_some_and(|t| t > since);
+            // DURABLE drift: the dir's CURRENT identity key vs the one it was first bound to. Never
+            // window-gated (unlike `identity_changed`), and asserted only when BOTH sides resolve —
+            // an unresolved side is unknown, never a difference (the `identities_differ` discipline).
+            let identity_drifted = match (bound_identity_key(&log, &a.config_dir), key.as_deref()) {
+                (Some(bound), Some(live)) => bound != live,
+                _ => false,
+            };
             let (shell_email, shell_account_uuid) = if a.is_default {
                 (
                     shell.as_ref().map(|s| s.email.clone()),
@@ -3665,6 +3704,7 @@ fn identities_at(
                 shell_email,
                 shell_account_uuid,
                 identity_changed,
+                identity_drifted,
             }
         })
         .collect()
@@ -10036,6 +10076,109 @@ mod tests {
     }
 
     #[test]
+    fn a_dir_relogged_into_a_different_account_reports_durable_drift() {
+        // The founder's symptom: a config dir now signed into a DIFFERENT account than the one it was
+        // set up as. Distinct from `identity_changed` in the two ways this test pins — it survives
+        // PAST the ceiling learn window (a dir left on the wrong login keeps warning), and it CLEARS
+        // when the dir is put back. If `identity_drifted` were secretly the window-gated signal, the
+        // middle assertion would fail: that is the mutation this test is built to catch.
+        let home = unique_dir("identities-drift");
+        let dir = home.join("acct");
+        let log_path = home.join("account-identity-log.json");
+        let acct = sample("a", false, dir.to_str().unwrap());
+        let t0 = 1_700_000_000;
+
+        // First sighting BINDS the account to uuid-one — never drift.
+        write_identity(&dir, "uuid-one");
+        let got = identities_at(std::slice::from_ref(&acct), None, "", &log_path, t0);
+        assert!(!got[0].identity_drifted, "a first sighting is the binding, not drift");
+
+        // Re-logged into a DIFFERENT account — the takeover happens NOW (t0 + 3600).
+        write_identity(&dir, "uuid-two");
+        let takeover_at = t0 + 3600;
+        let got = identities_at(std::slice::from_ref(&acct), None, "", &log_path, takeover_at);
+        assert_eq!(got[0].account_uuid.as_deref(), Some("uuid-two"), "the LIVE login is what is shown");
+        assert!(got[0].identity_drifted, "current login != first binding is drift");
+        assert!(got[0].identity_changed, "and the takeover is still inside the learn window here");
+
+        // Re-observed, still uuid-two, FAR past the learn window: `identity_changed` has now aged out
+        // (the takeover is old), but drift is still lit. If `identity_drifted` were secretly the
+        // window-gated field this assertion would fail — the mutation this test exists to catch.
+        let long_after = takeover_at + CEILING_LEARN_WINDOW + 24 * 60 * 60;
+        let got = identities_at(std::slice::from_ref(&acct), None, "", &log_path, long_after);
+        assert!(
+            got[0].identity_drifted,
+            "current login != first binding is drift, and it must NOT age out"
+        );
+        assert!(
+            !got[0].identity_changed,
+            "the window-gated signal HAS aged out — proving the two are different fields"
+        );
+
+        // Put back to the account it was bound to: drift clears.
+        write_identity(&dir, "uuid-one");
+        let got = identities_at(std::slice::from_ref(&acct), None, "", &log_path, long_after + 3600);
+        assert!(!got[0].identity_drifted, "restored to its binding — no longer drifted");
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn two_dirs_on_the_same_login_are_not_drift() {
+        // Two registrations both signed into ONE account are a real DUPLICATE (handled by
+        // `duplicateAccountGroups`), NOT drift: neither dir's CURRENT login differs from its own
+        // binding. Asserting absence here keeps drift from swallowing the duplicate signal.
+        let home = unique_dir("identities-same-login");
+        let d1 = home.join("one");
+        let d2 = home.join("two");
+        write_identity(&d1, "uuid-shared");
+        write_identity(&d2, "uuid-shared");
+        let log_path = home.join("account-identity-log.json");
+        let got = identities_at(
+            &[
+                sample("a", false, d1.to_str().unwrap()),
+                sample("b", false, d2.to_str().unwrap()),
+            ],
+            None,
+            "",
+            &log_path,
+            1_700_000_000,
+        );
+        assert!(!got[0].identity_drifted && !got[1].identity_drifted);
+        assert_eq!(got[0].account_uuid.as_deref(), Some("uuid-shared"));
+        assert_eq!(got[1].account_uuid.as_deref(), Some("uuid-shared"));
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_login_gaining_an_account_uuid_is_not_drift() {
+        // A login predating `accountUuid` is anchored by its email; when the field later appears the
+        // ledger rekeys the epoch IN PLACE (a ladder climb), so the binding follows the same account.
+        // Without the email-form anchoring this would false-alarm on every account the first time
+        // Claude Code refreshes its profile and the uuid appears.
+        let home = unique_dir("identities-drift-ladder");
+        let dir = home.join("acct");
+        let log_path = home.join("account-identity-log.json");
+        let acct = sample("a", false, dir.to_str().unwrap());
+        let t0 = 1_700_000_000;
+
+        write_claude_json(&dir, r#"{"oauthAccount":{"emailAddress":"me@example.com"}}"#);
+        let got = identities_at(std::slice::from_ref(&acct), None, "", &log_path, t0);
+        assert!(!got[0].identity_drifted, "email-only first sighting is the binding, not drift");
+
+        write_claude_json(
+            &dir,
+            r#"{"oauthAccount":{"emailAddress":"me@example.com","accountUuid":"uuid-me"}}"#,
+        );
+        let got = identities_at(std::slice::from_ref(&acct), None, "", &log_path, t0 + 3600);
+        assert_eq!(got[0].account_uuid.as_deref(), Some("uuid-me"));
+        assert!(!got[0].identity_drifted, "gaining a uuid for the same email is a ladder climb, not drift");
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
     fn a_ledger_write_failure_never_breaks_the_identity_read() {
         // Identity DISPLAY must not depend on the ledger. Point it at a path that cannot be created
         // (a directory where the file should be) and the emails still come back.
@@ -10094,12 +10237,18 @@ mod tests {
             shell_email: Some("personal@example.com".into()),
             shell_account_uuid: Some("5fb3d67c".into()),
             identity_changed: true,
+            identity_drifted: true,
         })
         .unwrap();
         assert_eq!(v.get("shellEmail").unwrap(), "personal@example.com");
         assert_eq!(v.get("shellAccountUuid").unwrap(), "5fb3d67c");
         assert_eq!(v.get("identityChanged").unwrap(), true);
-        assert!(v.get("shell_email").is_none() && v.get("identity_changed").is_none());
+        assert_eq!(v.get("identityDrifted").unwrap(), true);
+        assert!(
+            v.get("shell_email").is_none()
+                && v.get("identity_changed").is_none()
+                && v.get("identity_drifted").is_none()
+        );
     }
 
     #[test]
