@@ -20,6 +20,7 @@ import { ConciergeThread, BACKLOG_DIVIDER_TESTID, THREAD_RAIL_TESTID } from "./C
 import { useConciergeScrubberWiring, type RailMark } from "./useThreadScrubber";
 import { setThreadScrubberIo } from "./useThreadScrubber";
 import {
+  HISTORY_ROW_ID_PREFIX,
   setConciergeBacklogIo,
   useConciergeBacklogStore,
 } from "../../stores/conciergeBacklogStore";
@@ -30,10 +31,24 @@ import type { ConciergeMessage } from "./types";
 const NOW = 1_700_000_000_000;
 const DAY = 86_400_000;
 
-/** The mark the stand-in rail commits. `fraction` is a CONTENT-axis position now (see
+// ── ROW ID vs BUBBLE ID (bead sparkle-jmah0e) ─────────────────────────────────────────────────
+// `ANCIENT_ROWS` below are what SQLite returns, keyed by ROW id. What the thread renders — and what
+// the rail therefore reads back off `data-message-id` — is the BUBBLE id, and for a row this app
+// load did not write those are no longer the same string: `rowToMessage` namespaces it, so a legacy
+// `you-ancient` cannot be claimed by the `you-ancient` this session's restarted counter is minting.
+//
+// So these two constants are the BUBBLE ids, and the fixtures below are the ROW ids. Written as the
+// exported prefix plus the row id rather than by calling `bubbleIdForRow`, so this file states the
+// scheme instead of agreeing with whatever that function currently does.
+const ANCIENT_BUBBLE = `${HISTORY_ROW_ID_PREFIX}you-ancient`;
+const ANCIENT_REPLY_BUBBLE = `${HISTORY_ROW_ID_PREFIX}brain-ancient`;
+
+/** The mark the stand-in rail commits. Its id is the BUBBLE id, because in production the rail
+ *  measures its marks off `data-message-id` — see the note above.
+ *  `fraction` is a CONTENT-axis position now (see
  *  railGeometry.ts) — 0 because a three-day-old prompt is at the top of everything loaded. */
 const ANCIENT: RailMark = {
-  id: "you-ancient",
+  id: ANCIENT_BUBBLE,
   createdAt: NOW - 3 * DAY,
   textPrefix: "what did we decide about the rail",
   index: 1,
@@ -148,15 +163,15 @@ describe("picking a dot older than the live window", () => {
 
     // THE PRECONDITION, STATED. Without this the assertion below could be true of a thread that had
     // the message all along, which is the vacuous shape AGENTS.md warns about.
-    expect(bubble("you-ancient")).toBeNull();
+    expect(bubble(ANCIENT_BUBBLE)).toBeNull();
 
     fireEvent.click(screen.getByTestId("pick-ancient"));
     await settle();
 
     // ── THE SIDE EFFECT ──
-    expect(bubble("you-ancient")).not.toBeNull();
-    expect(bubble("you-ancient")!.textContent).toContain("what did we decide about the rail");
-    expect(scrolledTo).toEqual(["you-ancient"]);
+    expect(bubble(ANCIENT_BUBBLE)).not.toBeNull();
+    expect(bubble(ANCIENT_BUBBLE)!.textContent).toContain("what did we decide about the rail");
+    expect(scrolledTo).toEqual([ANCIENT_BUBBLE]);
   });
 
   it("brings the REPLY in with it, not just the question", async () => {
@@ -166,7 +181,7 @@ describe("picking a dot older than the live window", () => {
     await settle();
 
     // A paged-in window showing only the prompts is half a conversation.
-    expect(bubble("brain-ancient")).not.toBeNull();
+    expect(bubble(ANCIENT_REPLY_BUBBLE)).not.toBeNull();
   });
 
   it("keeps the live thread on screen below the paged-in turns", async () => {
@@ -178,7 +193,7 @@ describe("picking a dot older than the live window", () => {
     const ids = Array.from(
       thread().querySelectorAll<HTMLElement>("[data-message-id]"),
     ).map((el) => el.dataset.messageId);
-    expect(ids).toEqual(["you-ancient", "brain-ancient", "you-now"]);
+    expect(ids).toEqual([ANCIENT_BUBBLE, ANCIENT_REPLY_BUBBLE, "you-now"]);
   });
 
   it("draws the seam between history and the live window", async () => {
@@ -206,7 +221,7 @@ describe("picking a dot older than the live window", () => {
     fireEvent.click(screen.getByTestId("pick-ancient"));
     await settle();
 
-    expect(scrolledTo).toEqual(["you-ancient", "you-ancient"]);
+    expect(scrolledTo).toEqual([ANCIENT_BUBBLE, ANCIENT_BUBBLE]);
   });
 
   it("does not re-query SQLite for a turn it has already paged in", async () => {

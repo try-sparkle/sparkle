@@ -26,6 +26,7 @@ import {
   type ThreadScrubberController,
 } from "./useThreadScrubber";
 import {
+  HISTORY_ROW_ID_PREFIX,
   setConciergeBacklogIo,
   useConciergeBacklogStore,
 } from "../../stores/conciergeBacklogStore";
@@ -297,7 +298,9 @@ describe("the scope", () => {
       h.latest().setScope("7d");
     });
     await act(async () => {});
-    expect(useConciergeBacklogStore.getState().backlog.map((m) => m.id)).toContain("old-1");
+    expect(useConciergeBacklogStore.getState().backlog.map((m) => m.id)).toContain(
+      `${HISTORY_ROW_ID_PREFIX}old-1`,
+    );
     expect(asked[0]![0]).toBeLessThanOrEqual(NOW - SCOPE_MS["7d"]);
     expect(h.latest().scope).toBe("7d");
   });
@@ -399,10 +402,14 @@ describe("enriching a measured mark with what the store knows", () => {
       historyExtent: async () => ({ oldestMs: AT, newestMs: NOW, count: 1 }),
       promptsInRange: async () => [marker("you-1", AT)],
     });
+    // The scroller row is the id the BACKLOG BUBBLE renders, not the raw row id: a legacy row is
+    // namespaced by `rowToMessage` precisely so it cannot be confused with the live `you-1` this
+    // session's restarted counter has already minted (bead sparkle-jmah0e). The map is keyed the
+    // same way, so the card still finds its instant and its prompt.
     const el = fakeScroller({
       scrollHeight: 1000,
       clientHeight: 400,
-      rows: [["you-1", 300]],
+      rows: [[`${HISTORY_ROW_ID_PREFIX}you-1`, 300]],
     });
     const h = mount({ initialScope: "all" });
     await act(async () => {});
@@ -442,6 +449,39 @@ describe("enriching a measured mark with what the store knows", () => {
     const mark = h.latest().marks[0]!;
     expect(mark.createdAt).toBe(AT);
     expect(mark.textPrefix).toBe(`prefix of ${rowId}`);
+  });
+
+  // ── THE FOUNDER'S OWN SYMPTOM: "some random prompts" (bead sparkle-jmah0e, READ side) ─────────
+  // A LEGACY history row `you-1` and the LIVE bubble `you-1` are DIFFERENT MESSAGES. The counter
+  // that mints bubble ids restarts at 0 on every app reload, so the DB's oldest rows wear the very
+  // ids this session is handing out right now. Keying `stored` on the raw row id therefore
+  // captioned the founder's newest message with a prompt from weeks ago and stamped it with that
+  // row's age — his report, verbatim: "it's giving me, like, some random prompts".
+  //
+  // PAIRED with the case directly above, deliberately. On its own, "the legacy row did not enrich
+  // this mark" is equally satisfied by enrichment being broken outright; the case above shows the
+  // SAME setup DOES enrich when the row genuinely belongs to this load. Together they pin the cause.
+  it("does not caption a live bubble with a legacy row that reused its id", async () => {
+    __resetConciergeSessionTokenForTest();
+    const LONG_AGO = NOW - 30 * DAY;
+    setThreadScrubberIo({
+      historyExtent: async () => ({ oldestMs: LONG_AGO, newestMs: NOW, count: 1 }),
+      promptsInRange: async () => [marker("you-1", LONG_AGO)], // un-namespaced: a previous load wrote it
+    });
+    // The bubble THIS session minted, rendered under the bare counter id — same string, other message.
+    const el = fakeScroller({
+      scrollHeight: 1000,
+      clientHeight: 400,
+      rows: [["you-1", 300]],
+    });
+    const h = mount({ initialScope: "all" });
+    await act(async () => {});
+    act(() => h.latest().attachScroller(el));
+    const mark = h.latest().marks.find((m) => m.id === "you-1")!;
+
+    // POSITIVE assertions: the mark keeps its OWN measured identity instead of borrowing the row's.
+    expect(mark.textPrefix).toBe("the text of you-1");
+    expect(mark.createdAt).toBeUndefined();
   });
 
   // A live bubble has a rendered row before it has a history row. It must still get a mark — the
@@ -571,17 +611,19 @@ describe("picking a mark", () => {
         { id: "old-1", kind: "prompt", createdAt: AT, text: "nine days ago" },
       ],
     });
+    // A legacy row's bubble id, which is what the rail reads off `data-message-id` and hands back.
+    const bubble = `${HISTORY_ROW_ID_PREFIX}old-1`;
     const loadedWhenJumped: boolean[] = [];
     const h = mount({
       onJump: () => {
         loadedWhenJumped.push(
-          useConciergeBacklogStore.getState().backlog.some((m) => m.id === "old-1"),
+          useConciergeBacklogStore.getState().backlog.some((m) => m.id === bubble),
         );
       },
     });
     await act(async () => {});
     await act(async () => {
-      await h.latest().onPick({ id: "old-1", fraction: 0, textPrefix: "x", index: 1, createdAt: AT });
+      await h.latest().onPick({ id: bubble, fraction: 0, textPrefix: "x", index: 1, createdAt: AT });
     });
     expect(loadedWhenJumped).toEqual([true]);
   });

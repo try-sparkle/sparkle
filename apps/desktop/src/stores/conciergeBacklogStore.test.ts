@@ -10,6 +10,7 @@ import {
   CONCIERGE_BACKLOG_MAX_PAGES,
   CONCIERGE_BACKLOG_PAGE,
   dedupeAgainstLive,
+  HISTORY_ROW_ID_PREFIX,
   rowToMessage,
   setConciergeBacklogIo,
   useConciergeBacklogStore,
@@ -59,11 +60,21 @@ beforeEach(() => {
 });
 
 describe("rowToMessage", () => {
-  // THE JUMP MECHANISM. A prefixed or re-minted id is a rail that silently scrolls to nothing —
-  // ConciergeThread's `jumpTo` scans for `[data-message-id]` and matches on the exact string.
-  it("carries a legacy un-namespaced row id through verbatim, on both kinds", () => {
-    expect(rowToMessage(row("you-17", NOW)).id).toBe("you-17");
-    expect(rowToMessage(row("brain-4", NOW, "response")).id).toBe("brain-4");
+  // ── THE ID A LEGACY ROW MUST NOT KEEP (bead sparkle-jmah0e, READ side) ────────────────────────
+  // This used to assert the opposite — that `you-17` came through VERBATIM — on the reasoning that
+  // "a prefixed or re-minted id is a rail that silently scrolls to nothing". That reasoning does not
+  // survive reading the rail: the mark ids are read off `data-message-id`, which the bubble renders
+  // from THIS function's output, and `stored`/`isLoaded`/`jumpTo` all key on it too. Both sides move
+  // together, so the jump is unaffected by a prefix applied here.
+  //
+  // What the verbatim id DID do is collide. `ConciergeHost`'s counter restarts at 0 on every reload,
+  // so `you-17` is an id this session is minting again right now for a different message — and the
+  // membership test in `dedupePairsAgainstLive` then silently drops the founder's older one.
+  it("namespaces a legacy un-namespaced row so a reissued counter id cannot claim it", () => {
+    expect(rowToMessage(row("you-17", NOW)).id).toBe(`${HISTORY_ROW_ID_PREFIX}you-17`);
+    expect(rowToMessage(row("brain-4", NOW, "response")).id).toBe(`${HISTORY_ROW_ID_PREFIX}brain-4`);
+    // THE PROPERTY, not the spelling: whatever the prefix is, it may not be an id `nextId` mints.
+    expect(rowToMessage(row("you-17", NOW)).id).not.toBe("you-17");
   });
 
   // ── THE KEY AND THE BUBBLE ID CAME APART ──────────────────────────────────────────────────────
@@ -81,12 +92,13 @@ describe("rowToMessage", () => {
   });
 
   // A PREVIOUS load's row cannot be mapped back — its bubble id was only ever unique within that
-  // load, and this load is minting `you-1` again right now. The namespaced key is itself unique and
-  // stable, so it is kept whole and the rail jumps to it under that name.
-  it("keeps a previous app load's row id whole rather than guessing a bubble id", () => {
+  // load, and this load is minting `you-1` again right now. Its namespaced key is already unique, so
+  // the prefix buys nothing here beyond ONE rule instead of a case analysis: a row this load did not
+  // write never renders under a bare bubble id, whatever shape its key happens to have.
+  it("namespaces a previous app load's row rather than guessing a bubble id", () => {
     const mine = conciergeSessionToken();
     const theirs = `${mine}-earlier:you-17`;
-    expect(rowToMessage(row(theirs, NOW)).id).toBe(theirs);
+    expect(rowToMessage(row(theirs, NOW)).id).toBe(`${HISTORY_ROW_ID_PREFIX}${theirs}`);
   });
 
   it("maps prompt→you and response→sparkle", () => {
@@ -107,9 +119,9 @@ describe("loadBack", () => {
     await useConciergeBacklogStore.getState().loadBack(NOW - 60 * MINUTE);
 
     expect(useConciergeBacklogStore.getState().backlog.map((m) => m.id)).toEqual([
-      "old-1",
-      "old-2",
-      "old-3",
+      `${HISTORY_ROW_ID_PREFIX}old-1`,
+      `${HISTORY_ROW_ID_PREFIX}old-2`,
+      `${HISTORY_ROW_ID_PREFIX}old-3`,
     ]);
   });
 
@@ -134,10 +146,15 @@ describe("loadBack", () => {
     setConciergeBacklogIo({ entriesInRange: query });
 
     await useConciergeBacklogStore.getState().loadBack(NOW - 60 * MINUTE);
-    expect(useConciergeBacklogStore.getState().backlog.map((m) => m.id)).toEqual(["old"]);
+    expect(useConciergeBacklogStore.getState().backlog.map((m) => m.id)).toEqual([
+      `${HISTORY_ROW_ID_PREFIX}old`,
+    ]);
 
     await useConciergeBacklogStore.getState().loadBack(NOW - 6 * 60 * MINUTE);
-    expect(useConciergeBacklogStore.getState().backlog.map((m) => m.id)).toEqual(["older", "old"]);
+    expect(useConciergeBacklogStore.getState().backlog.map((m) => m.id)).toEqual([
+      `${HISTORY_ROW_ID_PREFIX}older`,
+      `${HISTORY_ROW_ID_PREFIX}old`,
+    ]);
   });
 
   // ── THE TRUNCATION WALK ────────────────────────────────────────────────────────────────────────
@@ -155,7 +172,7 @@ describe("loadBack", () => {
     await useConciergeBacklogStore.getState().loadBack(target);
 
     const ids = useConciergeBacklogStore.getState().backlog.map((m) => m.id);
-    expect(ids).toContain("r0");
+    expect(ids).toContain(`${HISTORY_ROW_ID_PREFIX}r0`);
     expect(useConciergeBacklogStore.getState().loadedFromMs).toBe(target);
   });
 
@@ -183,8 +200,8 @@ describe("loadBack", () => {
 
     const ids = useConciergeBacklogStore.getState().backlog.map((m) => m.id);
     expect(ids.length).toBe(CONCIERGE_BACKLOG_MAX);
-    expect(ids[0]).toBe("r0");
-    expect(ids).not.toContain(`r${total - 1}`);
+    expect(ids[0]).toBe(`${HISTORY_ROW_ID_PREFIX}r0`);
+    expect(ids).not.toContain(`${HISTORY_ROW_ID_PREFIX}r${total - 1}`);
   });
 
   // VADE r3827348136. `loadedToMs` was derived from the newest FETCHED row, but the trim can drop
@@ -228,7 +245,9 @@ describe("loadBack", () => {
     // and then trims it straight back off, which is what a blind trim-the-new-end does here
     // (roborev 66541) — the fetched turn IS the newest on this path.
     const after = useConciergeBacklogStore.getState();
-    expect(after.backlog.map((m) => m.id)).toContain(newestDropped.id);
+    expect(after.backlog.map((m) => m.id)).toContain(
+      `${HISTORY_ROW_ID_PREFIX}${newestDropped.id}`,
+    );
 
     // …and the window must stay a WINDOW. An inverted from > to can never satisfy covered(), so
     // idempotence would be dead for the rest of the session and every drag would re-query.
@@ -315,7 +334,10 @@ describe("loadBack", () => {
       useConciergeBacklogStore.getState().loadBack(NOW - 60 * MINUTE),
     ]);
 
-    expect(useConciergeBacklogStore.getState().backlog.map((m) => m.id)).toEqual(["old-1", "old-2"]);
+    expect(useConciergeBacklogStore.getState().backlog.map((m) => m.id)).toEqual([
+      `${HISTORY_ROW_ID_PREFIX}old-1`,
+      `${HISTORY_ROW_ID_PREFIX}old-2`,
+    ]);
   });
 });
 
@@ -340,14 +362,35 @@ describe("dedupe against the live thread", () => {
     expect(useConciergeBacklogStore.getState().backlog.map((m) => m.id)).toEqual(["you-8"]);
   });
 
-  it("drops a paged-in turn the live thread already shows under the same id", async () => {
-    setConciergeChat([{ id: "you-9", kind: "you", text: "still on screen" }]);
+  // NOTE: a test asserting that a LEGACY `you-9` row is DROPPED because the live thread shows a
+  // bubble under that id used to sit here. It pinned the defect — those are two different messages,
+  // and discarding one is the data loss this bead is about. The legitimate same-id dedupe is the
+  // case directly above (a row carrying THIS load's key); the legacy case is the one below.
+
+  // ── THE LEGACY ROW THE RESTARTED COUNTER STEALS (bead sparkle-jmah0e, READ side) ───────────────
+  // The write half of this bead namespaced NEW rows per app load, and deliberately left the
+  // thousands of un-namespaced rows already in the founder's DB alone — `you-1`, `brain-7` — on the
+  // recorded argument that they "still read fine". They do not, and this is the assertion that says
+  // so. `bubbleIdForCurrentSession` correctly reports a legacy row as NOT-on-screen; `bubbleIdForRow`
+  // then hands the RAW `you-9` back downstream, where THIS session's restarted counter has already
+  // minted a live `you-9` for a completely different message. The membership test below throws the
+  // founder's older message away — silently, the same failure mode as the `INSERT OR IGNORE` sink,
+  // one layer up and on the read side.
+  //
+  // ASSERTS THE TEXT, NOT THE ID. The claim is that the founder can still READ the older message; an
+  // id-only assertion would pass against any scheme that merely renames it.
+  it("keeps a legacy row whose id this session's restarted counter has reissued", async () => {
+    setConciergeChat([{ id: "you-9", kind: "you", text: "a message sent thirty seconds ago" }]);
     const { query } = tableQuery([row("you-9", NOW - 10 * MINUTE), row("you-8", NOW - 11 * MINUTE)]);
     setConciergeBacklogIo({ entriesInRange: query });
 
     await useConciergeBacklogStore.getState().loadBack(NOW - 60 * MINUTE);
 
-    expect(useConciergeBacklogStore.getState().backlog.map((m) => m.id)).toEqual(["you-8"]);
+    const backlog = useConciergeBacklogStore.getState().backlog;
+    expect(backlog.map((m) => ("text" in m ? m.text : ""))).toEqual(["prompt you-8", "prompt you-9"]);
+    // …and under an id that CANNOT be confused with the live bubble that stole it, so the rail's
+    // hover card and `jumpTo` address the two separately.
+    expect(backlog.map((m) => m.id)).not.toContain("you-9");
   });
 
   // ── THE RESTORED TWIN ─────────────────────────────────────────────────────────────────────────
@@ -362,7 +405,9 @@ describe("dedupe against the live thread", () => {
       { id: "you-4", kind: "you", text: "what is the state of the fleet" } as ConciergeMessage,
     ];
 
-    expect(dedupeAgainstLive(paged, live).map((m) => m.id)).toEqual(["you-3"]);
+    expect(dedupeAgainstLive(paged, live).map((m) => m.id)).toEqual([
+      `${HISTORY_ROW_ID_PREFIX}you-3`,
+    ]);
   });
 
   it("matches a restored twin whose live copy was clipped by the persist cap", () => {

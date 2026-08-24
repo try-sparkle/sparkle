@@ -116,6 +116,13 @@ export function rowToMessage(row: HistoryRangeRow): ConciergeMessage {
 }
 
 /**
+ * The namespace a history row draws under when THIS app load did not write it. See
+ * {@link bubbleIdForRow} for why it exists — in short, a bare row id is one the bubble counter is
+ * reissuing right now. Any string no id `nextId` mints can equal would do; this one reads.
+ */
+export const HISTORY_ROW_ID_PREFIX = "history:";
+
+/**
  * A history row id, as the bubble id the live thread would know it by.
  *
  * ── THE ID IS THE WHOLE JUMP MECHANISM ─────────────────────────────────────────────────────────
@@ -136,13 +143,38 @@ export function rowToMessage(row: HistoryRangeRow): ConciergeMessage {
  * back together. `bubbleIdForCurrentSession` returns the bare bubble id for a row THIS app load
  * wrote — which is what makes a turn the reader can already see dedupe against its live twin
  * instead of rendering a second time — and `null` for a previous load's row or a legacy
- * un-namespaced one, where the row id is itself unique and stable and is kept as the bubble id.
+ * un-namespaced one.
  *
  * Getting this wrong fails SILENTLY in both directions: too clever and the rail stops jumping, too
  * literal and every turn of the current session draws twice above the live thread.
+ *
+ * ── WHY A ROW THAT IS NOT OURS IS PREFIXED RATHER THAN PASSED THROUGH (bead sparkle-jmah0e) ─────
+ * This used to be `?? rowId`, handing a LEGACY un-namespaced row id — `you-9`, `brain-4` — straight
+ * back out. Those are exactly the ids `ConciergeHost`'s counter is minting again RIGHT NOW, because
+ * it restarts at 0 on every app reload. So the founder's message from a previous load arrived here
+ * wearing the same id as a live bubble holding completely different text, and the membership test in
+ * `dedupePairsAgainstLive` threw the older one away — the same silent discard as the
+ * `INSERT OR IGNORE` sink this bead fixed, one layer up and on the READ side. The scrubber's
+ * `stored` map collided the same way, captioning a live mark with a legacy row's prompt and age,
+ * which is the founder's own report: "it's giving me, like, some random prompts".
+ *
+ * The write half of the bead namespaced NEW rows and deliberately left the thousands of legacy rows
+ * in place, on the argument that they "still read fine". That argument holds at the helper — which
+ * correctly reports them not-on-screen — and was lost at this caller's `??`.
+ *
+ * The prefix is applied to EVERY row this load did not write, not just the legacy ones, so the
+ * invariant is one sentence with no case analysis: A BACKLOG BUBBLE ID EQUALS A LIVE BUBBLE ID ONLY
+ * WHEN THEY ARE THE SAME TURN. A previous load's namespaced key happens not to collide with any id
+ * `nextId` mints today, but that is an accident of two formats, not a rule anything enforces.
+ *
+ * It stays UNIQUE and STABLE, which is all the rail needs: the row id is a primary key, and the
+ * prefixed string is what the bubble RENDERS as `data-message-id`, what `stored` is keyed by, what
+ * `isLoaded` tests and what `jumpTo` scans for — every one of those goes through this function, so
+ * the two sides cannot drift apart.
  */
 export function bubbleIdForRow(rowId: string): string {
-  return bubbleIdForCurrentSession(rowId) ?? rowId;
+  const mine = bubbleIdForCurrentSession(rowId);
+  return mine ?? `${HISTORY_ROW_ID_PREFIX}${rowId}`;
 }
 
 /**
