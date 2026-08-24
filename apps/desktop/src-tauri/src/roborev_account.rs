@@ -158,6 +158,43 @@ pub const SESSION_WALL_PHRASES: &[&str] = &[
     "session limit reached",
 ];
 
+/// Did this failure come from the API being TRANSIENTLY OVERLOADED — a 529 — rather than from
+/// anything about the account, the session, or the request?
+///
+/// This is the third member of the family, and it is the one whose remedy runs OPPOSITE to the
+/// others. An auth expiry is fatal to the account; a session wall is fatal until its reset instant;
+/// an overload is fatal to NOTHING. The server was busy for a moment, so the same account, the same
+/// session and the same prompt are all still good — the only thing that was wrong was the timing.
+///
+/// It therefore has to be distinguishable, because the generic non-auth remedy is LOSSY: it retries
+/// without `--resume`, on the theory that a stale resume id is the usual cause of an unexplained
+/// failure. Applied to an overload that theory is simply false, and acting on it discards a healthy
+/// conversation to work around a problem the conversation never had.
+///
+/// DISJOINT from [`is_auth_expired`] and [`is_session_wall`] by construction, and the disjointness
+/// is pinned by a test — all three are matched against the same two text sources, so a phrase that
+/// landed in two families would make the remedy depend on classification order.
+///
+/// Matches by lowercasing the INPUT and testing each [`OVERLOAD_PHRASES`] entry verbatim, so the
+/// table stays greppable and case never enters the caller's problem.
+pub fn is_overloaded(text: &str) -> bool {
+    let t = text.to_lowercase();
+    OVERLOAD_PHRASES.iter().any(|p| t.contains(p))
+}
+
+/// The transient-overload phrases [`is_overloaded`] matches, all lowercase.
+///
+/// `"529"` is deliberately carried WITH its surrounding words rather than bare. A bare `"529"`
+/// would match any transcript that merely contains those three digits — an elapsed_ms, a token
+/// count, a line number — and a false overload classification is not harmless: it would keep a
+/// genuinely stale `--resume` instead of dropping it, turning this fix into the very bug it
+/// replaces for some unrelated failure.
+pub const OVERLOAD_PHRASES: &[&str] = &[
+    "529 overloaded",
+    "overloaded_error",
+    "error: overloaded",
+];
+
 /// Rank the accounts roborev may use, best headroom first.
 ///
 /// `headroom` maps account id → fraction of its ceiling already consumed (0.0 = untouched,
@@ -734,6 +771,32 @@ mod tests {
 
     /// The subscription session wall — the text the module header records as matching NO existing
     /// quota classifier, which is why it "never fired once in 63,000+ jobs".
+    #[test]
+    fn is_overloaded_matches_the_transient_529_family_and_stays_disjoint() {
+        // The measured line, verbatim in shape.
+        assert!(is_overloaded(
+            "API Error: 529 Overloaded. This is a server-side issue, usually temporary"
+        ));
+        assert!(is_overloaded("{\"type\":\"overloaded_error\"}"));
+        assert!(is_overloaded("Error: Overloaded"));
+        assert!(is_overloaded("api error: 529 OVERLOADED")); // case-insensitive
+
+        // DISJOINTNESS — the load-bearing half. All three classifiers read the same two text
+        // sources, so a phrase landing in two families would make the remedy depend on the order
+        // they happen to be checked in.
+        assert!(!is_overloaded("OAuth session expired and could not be refreshed"));
+        assert!(!is_overloaded("You've hit your session limit · resets 2am"));
+        assert!(!is_auth_expired("API Error: 529 Overloaded"));
+        assert!(!is_session_wall("API Error: 529 Overloaded"));
+
+        // A BARE 529 must not match: those three digits appear in elapsed_ms, token counts and line
+        // numbers, and a false overload keeps a genuinely stale --resume instead of dropping it.
+        assert!(!is_overloaded("elapsed_ms=529"));
+        assert!(!is_overloaded("transcript line 529: unexpected token"));
+        assert!(!is_overloaded("error: unknown flag --nope"));
+        assert!(!is_overloaded(""));
+    }
+
     #[test]
     fn is_session_wall_matches_the_subscription_wall_and_nothing_else() {
         assert!(is_session_wall("You've hit your session limit · resets 2am"));

@@ -952,6 +952,15 @@ fn outcome_is_session_wall(stderr: &str, error_detail: Option<&str>) -> bool {
         || error_detail.is_some_and(crate::roborev_account::is_session_wall)
 }
 
+/// Did this turn die on a TRANSIENT API OVERLOAD (a 529)? Classified off the SAME two sources
+/// [`failure_detail`] prefers — the child's stderr and claude's own `result` error text — reusing the
+/// shared [`crate::roborev_account::is_overloaded`] so the concierge and the roborev shim can never
+/// disagree about what "overloaded" means. Pure for tests.
+fn outcome_is_overloaded(stderr: &str, error_detail: Option<&str>) -> bool {
+    crate::roborev_account::is_overloaded(stderr)
+        || error_detail.is_some_and(crate::roborev_account::is_overloaded)
+}
+
 /// What ONE post-failure retry should do — the whole decision as a pure value so every arm is
 /// unit-testable without spawning a real `claude` (AGENTS.md: assert the SIDE EFFECT, which here is
 /// the config dir the retry actually runs under, and whether the dead account gets benched).
@@ -962,6 +971,13 @@ struct RetryPlan {
     /// The account the concierge is rotating OFF (auth-dead) and must bench so every consumer routes
     /// around it. `None` for the plain stale-resume self-heal, which does not change account.
     bench_config_dir: Option<String>,
+    /// Whether the retry KEEPS this turn's `--resume <sid>` instead of starting a fresh session.
+    ///
+    /// `false` for every arm that predates it, which is why the field exists rather than the spawn
+    /// site simply always passing the resume id: dropping `--resume` is load-bearing for those arms
+    /// (the id belongs to a dead account's transcript tree, or is itself the suspected cause), and
+    /// only the transient-overload arm can say the session is known-good.
+    keep_resume: bool,
 }
 
 /// Decide the single post-failure retry. `None` means DO NOT retry — surface the failure.
@@ -995,6 +1011,7 @@ fn plan_retry(
     ok: bool,
     auth_expired: bool,
     session_wall: bool,
+    overloaded: bool,
     primary_config_dir: Option<&str>,
     fallback_config_dirs: &[String],
     resume_session_id: Option<&str>,
@@ -1004,6 +1021,35 @@ fn plan_retry(
     }
     if session_wall {
         return None;
+    }
+    // TRANSIENT OVERLOAD (a 529), checked before arm 3 and after the two fatal classifications.
+    // Ordered here because it is a REFINEMENT of arm 3, not a competitor to it: an overload is a
+    // non-auth failure that carries a resume id, so arm 3 already claims it and would retry the
+    // same account WITHOUT `--resume`. That remedy is not merely unnecessary here, it is lossy —
+    // the session id is perfectly good, and dropping it starts a fresh session, so the retry answers
+    // with no memory of the conversation it is continuing. Because the retry is emitted under the
+    // ORIGINAL turn id as a transparent continuation, the human sees a normal reply and never learns
+    // the thread was severed; only the transcript tree shows the break.
+    //
+    // Measured on one machine in one day: four concierge turns and one improvement pass died on a
+    // 529 after 196-284 seconds of work each, every one of them landing in arm 3.
+    //
+    // Auth-expiry and the session wall still outrank it: a message can carry an overload phrase
+    // alongside a fatal one, and keeping a resume id into a rotated or walled account is exactly
+    // what arms 1 and 2 exist to prevent. The retry stays on the SAME account — an overload is a
+    // property of the server at that instant, not of the subscription, so rotating would bench a
+    // healthy account for something it did not do.
+    //
+    // With NO resume id there is nothing to preserve, so this arm declines and leaves the decision
+    // to arm 3 — which also declines, exactly as it does today. That is deliberate: this change is
+    // about WHICH session the retry runs in, and it must not quietly add a retry where there was
+    // none.
+    if overloaded && resume_session_id.is_some_and(|sid| !sid.is_empty()) {
+        return Some(RetryPlan {
+            config_dir: primary_config_dir.map(str::to_string),
+            bench_config_dir: None,
+            keep_resume: true,
+        });
     }
     if auth_expired {
         // The first fallback that is a real, DIFFERENT account than the one that just failed. The
@@ -1021,12 +1067,17 @@ fn plan_retry(
             bench_config_dir: primary_config_dir
                 .filter(|p| !p.is_empty())
                 .map(str::to_string),
+            // The rotated retry MUST start fresh: this session id lives in the dead account's
+            // transcript tree, so the healthy account cannot resume it.
+            keep_resume: false,
         });
     }
     if should_retry_without_resume(ok, resume_session_id) {
         return Some(RetryPlan {
             config_dir: primary_config_dir.map(str::to_string),
             bench_config_dir: None,
+            // The stale resume id is the SUSPECT here; keeping it would retry the hypothesis.
+            keep_resume: false,
         });
     }
     None
@@ -1729,6 +1780,7 @@ pub async fn concierge_turn(
         // retired, so a turn the user has moved past never retries.
         let auth_expired = outcome_is_auth_expired(&outcome.stderr, outcome.error_detail.as_deref());
         let session_wall = outcome_is_session_wall(&outcome.stderr, outcome.error_detail.as_deref());
+        let overloaded = outcome_is_overloaded(&outcome.stderr, outcome.error_detail.as_deref());
         if session_wall {
             // Logged at the point the classification is MADE, not inferred later from the absence of
             // a retry: "did not retry" and "did not retry BECAUSE it was walled" are different facts,
@@ -1742,6 +1794,7 @@ pub async fn concierge_turn(
                 outcome.ok,
                 auth_expired,
                 session_wall,
+                overloaded,
                 config_dir.as_deref(),
                 &fallback,
                 resume_session_id.as_deref(),
@@ -1767,6 +1820,11 @@ pub async fn concierge_turn(
                         "concierge_turn: rotating to a healthy account, but could not bench the dead one"
                     ),
                 }
+            } else if plan.keep_resume {
+                tracing::info!(
+                    id = %id,
+                    "concierge_turn: turn hit a transient overload; retrying once, resuming the same session"
+                );
             } else {
                 tracing::info!(
                     id = %id,
@@ -1774,17 +1832,25 @@ pub async fn concierge_turn(
                 );
             }
             let (kind2, token2) = continuation_install(token);
-            // The retry ALWAYS drops `--resume`: the session id belongs to the previous account's (or
-            // the now-stale) transcript tree, so it must start a fresh session — created under
-            // `plan.config_dir`, which is the ROTATED healthy account on an auth failure and the same
-            // account on a stale-resume self-heal. Passing the wrong dir here is the original bug: the
-            // retry inheriting the dead pinned account (roborev — see `plan_retry`).
+            // WHICH SESSION the retry runs in is `plan.keep_resume`, decided in `plan_retry` — not a
+            // constant here. Every arm but one drops `--resume`, because the session id belongs to
+            // the previous account's (or the now-stale) transcript tree and must be abandoned. The
+            // transient-overload arm is the exception: nothing was wrong with the session, so
+            // dropping it would throw away the conversation to work around a busy server.
+            // `plan.config_dir` is the ROTATED healthy account on an auth failure and the same
+            // account otherwise. Passing the wrong dir here is the original bug: the retry inheriting
+            // the dead pinned account (roborev — see `plan_retry`).
+            let resume2 = if plan.keep_resume {
+                resume_session_id.as_deref()
+            } else {
+                None
+            };
             match spawn_turn(
                 &read_app,
                 &prompt,
                 &cwd,
                 &claude_path,
-                None,
+                resume2,
                 plan.config_dir.as_deref(),
                 kind2,
                 token2,
@@ -2243,7 +2309,7 @@ mod tests {
     /// that landed anywhere but a healthy account is exactly the bug.
     #[test]
     fn plan_retry_rotates_to_a_healthy_account_and_benches_the_dead_one_on_auth_expiry() {
-        let plan = plan_retry(false, true, false, Some("/acct/A"), &dirs(&["/acct/B", "/acct/C"]), Some("sid-1"))
+        let plan = plan_retry(false, true, false, false, Some("/acct/A"), &dirs(&["/acct/B", "/acct/C"]), Some("sid-1"))
             .expect("an auth failure with a healthy fallback must retry, not surface");
         assert_eq!(plan.config_dir.as_deref(), Some("/acct/B"), "the retry must rotate to the first healthy fallback, not stay on the dead account");
         assert_eq!(plan.bench_config_dir.as_deref(), Some("/acct/A"), "the dead pinned account must be benched so every consumer routes around it");
@@ -2255,7 +2321,7 @@ mod tests {
     /// only the auth signature spends a fallback.
     #[test]
     fn plan_retry_does_not_rotate_a_non_auth_failure() {
-        let plan = plan_retry(false, false, false, Some("/acct/A"), &dirs(&["/acct/B"]), Some("sid-1"))
+        let plan = plan_retry(false, false, false, false, Some("/acct/A"), &dirs(&["/acct/B"]), Some("sid-1"))
             .expect("a non-auth failure with a resume id must still do the stale-resume self-heal");
         assert_eq!(plan.config_dir.as_deref(), Some("/acct/A"), "a non-auth self-heal must keep the same account");
         assert_eq!(plan.bench_config_dir, None, "a non-auth failure must never bench an account");
@@ -2267,16 +2333,16 @@ mod tests {
     /// guard: never bench the fleet down to nothing.
     #[test]
     fn plan_retry_surfaces_signin_when_no_healthy_alternative_on_auth_expiry() {
-        assert_eq!(plan_retry(false, true, false, Some("/acct/A"), &[], Some("sid-1")), None, "auth-dead with no fallback must surface the sign-in, not retry the dead account");
+        assert_eq!(plan_retry(false, true, false, false, Some("/acct/A"), &[], Some("sid-1")), None, "auth-dead with no fallback must surface the sign-in, not retry the dead account");
         // A fallback list that is only the dead account itself is not an alternative either.
-        assert_eq!(plan_retry(false, true, false, Some("/acct/A"), &dirs(&["/acct/A"]), None), None, "a fallback equal to the failed account is not a rotation target");
+        assert_eq!(plan_retry(false, true, false, false, Some("/acct/A"), &dirs(&["/acct/A"]), None), None, "a fallback equal to the failed account is not a rotation target");
     }
 
     /// An auth failure can hit the FIRST turn, before any resume id exists — the rotation must still
     /// fire there (it does not depend on `resume_session_id`, unlike the stale-resume self-heal).
     #[test]
     fn plan_retry_rotates_on_a_first_turn_auth_failure_with_no_resume_id() {
-        let plan = plan_retry(false, true, false, Some("/acct/A"), &dirs(&["/acct/B"]), None)
+        let plan = plan_retry(false, true, false, false, Some("/acct/A"), &dirs(&["/acct/B"]), None)
             .expect("a first-turn auth failure must rotate even with no resume id");
         assert_eq!(plan.config_dir.as_deref(), Some("/acct/B"));
         assert_eq!(plan.bench_config_dir.as_deref(), Some("/acct/A"));
@@ -2285,8 +2351,8 @@ mod tests {
     /// A successful turn is never retried, whatever the other inputs say.
     #[test]
     fn plan_retry_never_retries_a_successful_turn() {
-        assert_eq!(plan_retry(true, false, false, Some("/acct/A"), &dirs(&["/acct/B"]), Some("sid")), None);
-        assert_eq!(plan_retry(true, true, false, Some("/acct/A"), &dirs(&["/acct/B"]), Some("sid")), None);
+        assert_eq!(plan_retry(true, false, false, false, Some("/acct/A"), &dirs(&["/acct/B"]), Some("sid")), None);
+        assert_eq!(plan_retry(true, true, false, false, Some("/acct/A"), &dirs(&["/acct/B"]), Some("sid")), None);
     }
 
     /// The rotation skips empty fallback entries (the shared `$HOME/.claude` default records `""`) and
@@ -2294,7 +2360,7 @@ mod tests {
     /// benched by id — the clobbered-default guard steers away from it instead.
     #[test]
     fn plan_retry_skips_empty_dirs_and_does_not_bench_the_default() {
-        let plan = plan_retry(false, true, false, Some(""), &dirs(&["", "/acct/B"]), None)
+        let plan = plan_retry(false, true, false, false, Some(""), &dirs(&["", "/acct/B"]), None)
             .expect("must rotate to the first non-empty fallback");
         assert_eq!(plan.config_dir.as_deref(), Some("/acct/B"), "an empty fallback dir must be skipped");
         assert_eq!(plan.bench_config_dir, None, "an empty (default) primary must not be benched by id");
@@ -2324,14 +2390,85 @@ mod tests {
     #[test]
     fn plan_retry_does_not_spend_a_retry_on_a_session_wall_but_still_self_heals_without_one() {
         assert_eq!(
-            plan_retry(false, false, true, Some("/acct/A"), &dirs(&["/acct/B"]), Some("sid-1")),
+            plan_retry(false, false, true, false, Some("/acct/A"), &dirs(&["/acct/B"]), Some("sid-1")),
             None,
             "a session wall must not be retried: the same account cannot succeed until it resets",
         );
         // Same call, wall cleared — the stale-resume self-heal must be untouched.
-        let plan = plan_retry(false, false, false, Some("/acct/A"), &dirs(&["/acct/B"]), Some("sid-1"))
+        let plan = plan_retry(false, false, false, false, Some("/acct/A"), &dirs(&["/acct/B"]), Some("sid-1"))
             .expect("a non-walled non-auth failure with a resume id must still self-heal");
         assert_eq!(plan.config_dir.as_deref(), Some("/acct/A"));
+    }
+
+    /// THE SIDE EFFECT THIS PINS is `keep_resume` — which session the retry runs in — not merely that
+    /// a retry happens. A retry happened before this change too; it just silently started a fresh
+    /// session, so asserting `is_some()` would pass against the defect.
+    ///
+    /// The inputs are the measured shape: a failed turn, non-auth, not walled, WITH a resume id. The
+    /// PAIRED half is what makes it a proof rather than a coincidence — the identical call with the
+    /// overload classifier cleared must still drop `--resume`, so the assertion is attributable to
+    /// the overload flag and nothing else.
+    #[test]
+    fn plan_retry_keeps_the_session_on_a_transient_overload_and_drops_it_otherwise() {
+        let plan = plan_retry(false, false, false, true, Some("/acct/A"), &dirs(&["/acct/B"]), Some("sid-1"))
+            .expect("a transient overload with a live session must retry");
+        assert!(
+            plan.keep_resume,
+            "an overload must RESUME the same session: the server was busy, the conversation was fine",
+        );
+        assert_eq!(
+            plan.config_dir.as_deref(),
+            Some("/acct/A"),
+            "an overload is not the account's fault, so the retry stays on the same account",
+        );
+        assert_eq!(
+            plan.bench_config_dir, None,
+            "benching a healthy account for a server-side overload would route every consumer off it",
+        );
+
+        // Paired negative: same call, overload cleared. This is the pre-existing stale-resume
+        // self-heal, and it must still start FRESH — keeping a suspected-stale id would retry the
+        // very hypothesis that arm exists to test.
+        let stale = plan_retry(false, false, false, false, Some("/acct/A"), &dirs(&["/acct/B"]), Some("sid-1"))
+            .expect("a plain non-auth failure with a resume id must still self-heal");
+        assert!(
+            !stale.keep_resume,
+            "only the overload arm keeps the session; the stale-resume self-heal must drop it",
+        );
+    }
+
+    /// An overload with NO session to preserve must not invent a retry. The arm is about WHICH
+    /// session the retry uses, so with nothing to keep it has to decline and leave the outcome
+    /// exactly as it was — otherwise this change quietly adds a `claude` spawn on a path that had
+    /// none, which is a different behaviour change than the one being made.
+    #[test]
+    fn plan_retry_does_not_invent_a_retry_for_an_overload_with_no_session() {
+        for sid in [None, Some("")] {
+            assert_eq!(
+                plan_retry(false, false, false, true, Some("/acct/A"), &dirs(&["/acct/B"]), sid),
+                None,
+                "an overload with no resume id must behave exactly as it did before this change",
+            );
+        }
+    }
+
+    /// Both FATAL classifications outrank a transient one. A 529 can arrive in the same text as an
+    /// auth expiry or a wall, and carrying a resume id into a rotated account (whose transcript tree
+    /// does not hold it) or into a walled one is precisely what arms 1 and 2 exist to prevent.
+    #[test]
+    fn plan_retry_lets_the_fatal_classifications_outrank_a_transient_overload() {
+        assert_eq!(
+            plan_retry(false, false, true, true, Some("/acct/A"), &dirs(&["/acct/B"]), Some("sid-1")),
+            None,
+            "a wall must not be retried just because an overload phrase also matched",
+        );
+        let rotated = plan_retry(false, true, false, true, Some("/acct/A"), &dirs(&["/acct/B"]), Some("sid-1"))
+            .expect("auth-dead with a healthy fallback still rotates");
+        assert_eq!(rotated.config_dir.as_deref(), Some("/acct/B"), "the rotation still happens");
+        assert!(
+            !rotated.keep_resume,
+            "a rotated retry must never keep a session id that lives in the dead account's tree",
+        );
     }
 
     /// A wall outranks an auth expiry when both classify, because the wall's remedy (wait) is the only
@@ -2339,7 +2476,7 @@ mod tests {
     #[test]
     fn plan_retry_treats_a_session_wall_as_outranking_an_auth_expiry() {
         assert_eq!(
-            plan_retry(false, true, true, Some("/acct/A"), &dirs(&["/acct/B"]), Some("sid-1")),
+            plan_retry(false, true, true, false, Some("/acct/A"), &dirs(&["/acct/B"]), Some("sid-1")),
             None,
             "a wall must not spend a rotation, even when the auth classifier also fired",
         );
