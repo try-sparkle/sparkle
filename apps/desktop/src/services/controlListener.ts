@@ -146,6 +146,7 @@ import {
 // CALM FIRST, THEN ROLL UP — applied to the raw status map before any bucketing, so a row's own
 // status, its rollup dot and its stall verdict cannot disagree about a never-briefed agent.
 import { withNewAgentCalm } from "../engine/newAgentAttention";
+import { withBusyLivenessReconciliation } from "../engine/busyLiveness";
 import { normalizeAgentName } from "../engine/decodeEntities";
 import { useInteractionStore } from "../stores/interactionStore";
 import { setPrClaim, releasePrClaim, fetchPrClaims, findClaim } from "./mergeGuard/prClaims";
@@ -1305,11 +1306,28 @@ function handleGetState(req: ControlRequest): {
   // at the same time, and because the same map feeds `descendantsOf`, an unbriefed WORKER bubbled a
   // red dot into its head's row. That false "an agent needs you" is precisely what
   // engine/newAgentAttention exists to remove.
-  const calmStatus = withNewAgentCalm(
+  const calmStatusRaw = withNewAgentCalm(
     allAgents,
     status,
     now,
     useInteractionStore.getState().lastAt,
+  );
+  // THEN RECONCILE LIVENESS, before anything is bucketed or folded (bead sparkle-dlze6u, PR #2548
+  // retro). `status` is a FROZEN last reading for any agent this window is not hosting — and for a
+  // worker whose PTY died without the status engine seeing a clean exit — so a killed worker keeps
+  // reporting `working`, a healthy busy pill, for as long as its row lives (measured: sixty-eight
+  // minutes). An orchestrator reading this roster then trusts a dead worker as running. `agentMovement`
+  // (services/fleetWatch off `fleet_digest`) is the fleet's OWN off-disk liveness read over the whole
+  // open set, so a `working` row with no artifact for `busyLiveness.STALE_AFTER_MS` is downgraded to
+  // `stopped` here. Applied to the RAW-but-calmed map, BEFORE `dotOf` below, so a dead worker also
+  // stops bubbling a green dot into its head's roll-up — the mirror image of withMovementRetraction,
+  // which retracts a stale RED one tier over. See engine/busyLiveness for why absent evidence never
+  // downgrades and why the bound is fleetVerdict's own silence line.
+  const calmStatus = withBusyLivenessReconciliation(
+    allAgents,
+    calmStatusRaw,
+    (id) => useRuntimeStore.getState().agentMovement[id],
+    now,
   );
   // `ownStatusOf` is left at its default (== `statusOf`) because no `withRedWorkerAttention` has been
   // composited into this map, which is the case that parameter exists to defend against. It is also

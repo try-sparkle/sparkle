@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import type { DeathCause } from "./deathTypes";
 import {
+  MAX_MIDTASK_RESUMES,
   MAX_RESURRECTS_PER_AGENT_PER_DAY,
   RESURRECT_LADDER_CEILING_MS,
   RESURRECT_LADDER_MS,
@@ -351,5 +352,70 @@ describe("a CLEAN, resumable stop (the on-screen resume banner) lifts `unknown` 
     });
     expect(withBanner).toBe(without);
     expect(withBanner).toBe(NOW + FIRST);
+  });
+});
+
+
+describe("Gate 4b — the resume-then-exit loop, bounded early and cause-specific (sparkle-y5dk8x)", () => {
+  // A clean-resumable mid-task exit (unknown + a resume banner) counted over the ROLLING window,
+  // because a per-episode count resets every cycle and cannot see the loop. `recentAttemptsAt` are all
+  // OLDER than the current death, mirroring a real loop where each exit is a fresh episode.
+  const windowAttempts = (n: number) =>
+    Array.from({ length: n }, (_, i) => NOW - MIN - (i + 1) * MIN);
+
+  function loop(over: Partial<ResurrectionInput> = {}): ResurrectionInput {
+    return input({
+      cause: "unknown",
+      cleanResumableStop: true,
+      diedAt: NOW - 1_000,
+      recentAttemptsAt: windowAttempts(MAX_MIDTASK_RESUMES),
+      ...over,
+    });
+  }
+
+  /** The refusal reason, or "respawn" for the recover branch — so a negative can assert "not a loop"
+   *  across the whole union without narrowing at each call site. */
+  const reasonOf = (over: Partial<ResurrectionInput>) => {
+    const d = decideResurrection(loop(over));
+    return d.action === "none" ? d.reason : "respawn";
+  };
+
+  it("refuses at MAX_MIDTASK_RESUMES rolling-window respawns", () => {
+    expect(decideResurrection(loop())).toEqual({ action: "none", reason: "midtask-loop" });
+  });
+
+  it("PAIRED: one below the ceiling still respawns", () => {
+    // Same clean-resume shape, one fewer attempt: the loop bound has not been crossed, so a few
+    // automatic recoveries remain free and the agent comes back. Proves the CEILING fires it.
+    // `lastAttemptAt` a couple minutes back so the fast first rung is already due — a respawn is what
+    // it SHOULD do here, which is exactly what the loop bound is stopping one attempt later.
+    const almost = loop({
+      recentAttemptsAt: windowAttempts(MAX_MIDTASK_RESUMES - 1),
+      lastAttemptAt: NOW - 2 * MIN,
+    });
+    expect(decideResurrection(almost).action).toBe("respawn");
+  });
+
+  it("PAIRED: without the resume banner it is NOT a loop — a silent crash stays on the slow rung", () => {
+    // No clean-resume witness -> the cause-specific ceiling does not apply, and an unknown death arms
+    // on the slowest rung, so this is between rungs rather than a loop hand-off.
+    expect(reasonOf({ cleanResumableStop: false })).not.toBe("midtask-loop");
+  });
+
+  it("cause-specific: a WALL with the same count keeps probing — its budget is never shortened", () => {
+    // The gate is keyed on cause `unknown` alone: a wall recovers by probing and legitimately needs
+    // the full daily budget, so it must never be re-labelled a loop even with a banner on screen.
+    expect(reasonOf({ cause: "wall-spend" })).not.toBe("midtask-loop");
+  });
+
+  it("sits BELOW the daily cap, which outranks it when both would fire", () => {
+    expect(MAX_MIDTASK_RESUMES).toBeLessThan(MAX_RESURRECTS_PER_AGENT_PER_DAY);
+    const spent = loop({
+      recentAttemptsAt: Array.from(
+        { length: MAX_RESURRECTS_PER_AGENT_PER_DAY },
+        (_, i) => NOW - MIN - (i + 1) * 1_000,
+      ),
+    });
+    expect(decideResurrection(spent)).toEqual({ action: "none", reason: "daily-cap-spent" });
   });
 });

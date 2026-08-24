@@ -610,6 +610,45 @@ export function routeRecoveryExhausted(input: {
 }
 
 /**
+ * A DEAD SESSION stuck in a RESUME-THEN-EXIT LOOP — it keeps exiting mid-task on its own, is resumed,
+ * and exits mid-task again, so automatic recovery is NOT converging. The early sibling of
+ * {@link routeRecoveryExhausted}: that one fires when the whole daily budget is gone; this one fires
+ * FAR EARLIER, the moment a clean-resumable death has already been respawned many times in the
+ * rolling window and is dead yet again.
+ *
+ * ── WHY EARLIER MATTERS (sparkle-y5dk8x) ────────────────────────────────────────────────────────
+ * Each mid-task exit is its OWN death episode, so the per-episode ladder restarts at its first rung
+ * every cycle and the loop respawns FAST. Left to the daily cap alone, a human hears nothing for
+ * hours while every cycle loses the agent's in-flight work — the fan-out of background subagents a
+ * resumed parent cannot reclaim. Pausing the hot loop and handing it over early is the bound the
+ * daily cap is too coarse to give.
+ *
+ * ── CONCIERGE, NOT FOUNDER, AND "PAUSED", NOT "DEAD FOR GOOD" ────────────────────────────────────
+ * Same preference order as every route here: the concierge can read the terminal and restart it or
+ * take its branch over; the founder cannot type into a process that is not running. And the pause is
+ * over a ROLLING window — `resurrectionRunner` classifies this reason as transient — so the sentence
+ * says automatic recovery is paused, never that the agent is unrecoverable.
+ */
+export function routeMidTaskLoop(input: {
+  label: string;
+  /** Respawns actually spent in the rolling window — the real figure from the ledger, not a
+   *  constant, so nothing the router says can be doubled by an interpolated count. */
+  attempts: number;
+}): BlockerRoute {
+  return {
+    target: "concierge",
+    reason: "midtask-exit-loop",
+    text:
+      `${input.label} keeps exiting mid-task and coming back only to exit again — ${input.attempts} ` +
+      `respawns in the rolling window and it has still not finished. Automatic recovery is NOT ` +
+      `converging, so it is PAUSED for this agent until the window frees up, and each cycle loses the ` +
+      `in-flight work a resumed session cannot reclaim. This is yours now, not the founder's: read ` +
+      `what it was doing, then restart it or take its branch over. Do not retire it without checking ` +
+      `for unlanded work.`,
+  };
+}
+
+/**
  * Does this failure read as self-clearing?
  *
  * MATCHED ON THE VERBATIM MESSAGE, because that is the only durable channel: an agent that dies

@@ -33,7 +33,7 @@ import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 // The SHARED router for findings handed to the concierge — extended additively with
 // `routeRecoveryExhausted` rather than given a second copy of the words, so the routing decision
 // and the sentence that carries it cannot drift (packages/core/pusherBlocker's own rule).
-import { routeRecoveryExhausted } from "@sparkle/core";
+import { routeMidTaskLoop, routeRecoveryExhausted } from "@sparkle/core";
 import { agentDisplayName } from "../engine/agentDisplayName";
 import { lastFailureForAgent, quotaBlockForAgent, resumeBannerForAgent } from "../engine/engineRegistry";
 import {
@@ -253,6 +253,17 @@ const inFlight = new Set<string>();
  */
 let recoveryExhaustedReported = new Map<string, number>();
 
+/**
+ * agentId -> the `diedAt` of the resume-then-exit-loop episode ALREADY handed to the concierge.
+ *
+ * Same shape and same reasoning as {@link recoveryExhaustedReported}, and it works for the identical
+ * reason: the `midtask-loop` refusal PAUSES respawns, so the agent stays dead with a STABLE `diedAt`
+ * across every 15s sweep of the pause -- one finding per loop, not one every sweep. A genuinely new
+ * loop after the window frees up carries a new `diedAt` and re-escalates, which it should: the agent
+ * got another chance and burned it. A refused delivery is NOT latched, exactly as above.
+ */
+let midTaskLoopReported = new Map<string, number>();
+
 /** Test seam: forget every cohort phase, binding, burned set and in-flight admission. */
 export function _resetResurrectionRunnerForTests(): void {
   cohortPhases = new Map();
@@ -260,6 +271,7 @@ export function _resetResurrectionRunnerForTests(): void {
   burnedCanaries = new Map();
   cohortAttempts = new Map();
   recoveryExhaustedReported = new Map();
+  midTaskLoopReported = new Map();
   inFlight.clear();
   _resetResurrectionDecisionLogForTests();
 }
@@ -532,6 +544,10 @@ const PERMANENT_NO_RESURRECT: ReadonlySet<NoResurrectReason> = new Set<NoResurre
  *  from election, never written down. */
 const TRANSIENT_NO_RESURRECT: ReadonlySet<NoResurrectReason> = new Set<NoResurrectReason>([
   "daily-cap-spent",
+  // A resume-then-exit loop clears as the rolling window rolls off, exactly like the daily cap -- so
+  // it is a bad canary THIS sweep but says nothing about later ones, and must never be written down
+  // as permanent. Marking it permanent would abandon an agent that only needed the window to free up.
+  "midtask-loop",
 ]);
 
 /** This agent's display name, or its id when no row holds it. Mirrors `apiRecoveryRunner`'s helper
@@ -569,6 +585,40 @@ function labelForAgent(agentId: string): string {
  * over. That is the preference order every route in `pusherBlocker` follows — agent, concierge,
  * then the human.
  */
+/**
+ * A RESUME-THEN-EXIT LOOP -- the early sibling of {@link reportRecoveryExhausted}.
+ *
+ * `midtask-loop` is refused FAR below the daily cap (see `decideResurrection` Gate 4b), on the one
+ * shape that will not converge: a clean-resumable mid-task exit that has already been respawned many
+ * times in the rolling window and is dead again. Because that refusal PAUSES respawns, nothing else
+ * is coming to act on the row -- so, exactly like the exhausted case, the row is de-redded on a
+ * promise something else will act, and this hand-off is what keeps that promise. Latched per episode
+ * on `diedAt` (stable through the pause), and a refused delivery stays owed.
+ */
+function reportMidTaskLoop(d: DueAgent, escalate: (text: string) => boolean): void {
+  if (midTaskLoopReported.get(d.agentId) === d.diedAt) return;
+  const route = routeMidTaskLoop({
+    label: labelForAgent(d.agentId),
+    // The real figure from the durable ledger -- the router quotes it to a human, so it must be read
+    // rather than restated from the constant.
+    attempts: d.attemptsAt.length,
+  });
+  // Always the concierge; a self-check rather than a branch, so a re-point at the founder stops
+  // delivering instead of quietly paging him -- same guard the exhausted hand-off uses.
+  if (route.target !== "concierge") return;
+  if (!escalate(route.text)) {
+    log.warn("resurrection", "resume-then-exit loop and the concierge could not be told", {
+      agentId: d.agentId,
+    });
+    return;
+  }
+  midTaskLoopReported.set(d.agentId, d.diedAt);
+  log.info("resurrection", "handed a resume-then-exit loop to the concierge", {
+    agentId: d.agentId,
+    attempts: d.attemptsAt.length,
+  });
+}
+
 function reportRecoveryExhausted(d: DueAgent, escalate: (text: string) => boolean): void {
   if (recoveryExhaustedReported.get(d.agentId) === d.diedAt) return;
   const route = routeRecoveryExhausted({
@@ -622,6 +672,9 @@ function pushRefusal(
   // itself or is a fact about what the agent IS; this one is the moment automatic recovery stopped
   // trying, and the row has just been de-redded on the promise that something else is acting.
   if (reason === "daily-cap-spent") reportRecoveryExhausted(d, escalate);
+  // The other refusal that reaches somebody rather than clearing on its own: a resume-then-exit loop,
+  // paused early and handed over while there is still in-flight work to save (sparkle-y5dk8x).
+  if (reason === "midtask-loop") reportMidTaskLoop(d, escalate);
   outcomes.push({ agentId: d.agentId, action: "none", detail: reason });
 }
 

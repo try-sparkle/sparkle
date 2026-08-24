@@ -71,6 +71,27 @@ export const RESURRECT_LADDER_CEILING_MS =
 export const MAX_RESURRECTS_PER_AGENT_PER_DAY = 24;
 export const RESURRECT_DAY_MS = 24 * 60 * 60_000;
 
+/**
+ * The EARLY, cause-specific ceiling for a RESUME-THEN-EXIT LOOP (sparkle-y5dk8x).
+ *
+ * A mid-task self-exit (`unknown` + a `claude --resume` banner) that keeps recurring is not
+ * converging: each exit is its OWN death episode, so the per-episode ladder restarts at its first
+ * rung every cycle and the loop respawns on the FAST curve. The daily cap
+ * ({@link MAX_RESURRECTS_PER_AGENT_PER_DAY}) would bound it eventually, but only after hours — and
+ * every cycle in between loses the agent's in-flight work. This bounds the LOOP far earlier and hands
+ * it to the concierge, WITHOUT touching the daily cap the wall-probing case depends on.
+ *
+ * Counted over the SAME rolling window as the daily cap, deliberately: a per-episode count resets
+ * every cycle and so is blind to a loop. Smaller than the daily cap by construction, so the two
+ * ceilings never collide — the loop is caught here first, and only a non-loop history reaches 24.
+ *
+ * Why 6. A genuinely transient one-off hiccup resumes and CONTINUES rather than re-exiting, so a
+ * handful of automatic recoveries costs nothing and self-heals; a sixth clean-resume respawn still
+ * ending in a mid-task death is a loop, not a blip. Six fast-ladder rungs span ~35 minutes, so a
+ * human hears about a stuck agent within the half hour instead of the ten-plus hours 24 attempts run.
+ */
+export const MAX_MIDTASK_RESUMES = 6;
+
 /** Why no respawn happened. A named reason rather than a bare `false`, mirroring
  *  `apiRecovery.NoReviveReason` and `goalContinuation.NoContinueReason` — this is the field a human
  *  reads when they ask why a dead row was left alone. */
@@ -109,7 +130,13 @@ export type NoResurrectReason =
   | "waiting-for-next-rung"
   /** The rolling 24h per-agent cap is exhausted. This is the ONLY terminal bound on retrying — the
    *  ladder plateaus rather than ending, so there is deliberately no "ladder-spent". */
-  | "daily-cap-spent";
+  | "daily-cap-spent"
+  /** A RESUME-THEN-EXIT LOOP: a clean-resumable mid-task exit (`unknown` + a resume banner) that has
+   *  been respawned past {@link MAX_MIDTASK_RESUMES} in the rolling window and is dead AGAIN. Bounded
+   *  EARLIER than the daily cap and cause-specific — see {@link decideResurrection} Gate 4b
+   *  (sparkle-y5dk8x). Transient, exactly like `daily-cap-spent`: it clears as the window rolls off,
+   *  so `resurrectionRunner` must NOT write it down as permanent. */
+  | "midtask-loop";
 
 export type ResurrectionDecision =
   | { action: "respawn"; attempt: number }
@@ -268,6 +295,23 @@ export function decideResurrection(input: ResurrectionInput): ResurrectionDecisi
   // ── 4. Caps. The durable one first, so a misidentified episode cannot outrun it ──────────────
   if (attemptsInWindow(input.recentAttemptsAt, input.now) >= MAX_RESURRECTS_PER_AGENT_PER_DAY) {
     return { action: "none", reason: "daily-cap-spent" };
+  }
+
+  // ── 4b. The resume-then-exit loop, bounded EARLY and cause-specific (sparkle-y5dk8x) ─────────
+  // A clean, resumable mid-task exit (`unknown` + a resume banner) that has ALREADY been respawned
+  // MAX_MIDTASK_RESUMES times in the rolling window and is dead AGAIN is a loop that will not
+  // converge. The per-episode ladder below cannot see it — each exit is a fresh episode, so its
+  // per-episode count is ~1 every cycle — which is why this is counted over the SAME rolling window
+  // as the daily cap, and refused far below that cap so a human is told while there is still work to
+  // save. Gated on the clean-resume shape ALONE: a wall recovers by probing and legitimately needs
+  // all 24 attempts, so this must never shorten its budget. Kept BELOW the daily-cap gate so a fully
+  // spent loop still surfaces as the stronger `daily-cap-spent`.
+  if (
+    cause === "unknown" &&
+    input.cleanResumableStop === true &&
+    attemptsInWindow(input.recentAttemptsAt, input.now) >= MAX_MIDTASK_RESUMES
+  ) {
+    return { action: "none", reason: "midtask-loop" };
   }
 
   // ── 5. The ladder, which plateaus rather than ending ────────────────────────────────────────

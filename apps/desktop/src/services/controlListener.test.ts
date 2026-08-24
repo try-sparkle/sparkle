@@ -330,6 +330,9 @@ describe("controlListener", () => {
     // reason.
     useRuntimeStore.setState({
       status: {},
+      // Reset with the rest: get_state now reconciles a stale `working` row against `agentMovement`
+      // (busyLiveness), so a leaked snapshot from one case would silently downgrade another's worker.
+      agentMovement: {},
       openAgentIds: [],
       branchStatus: {},
       workflowState: {},
@@ -376,6 +379,38 @@ describe("controlListener", () => {
     expect(caller).toMatchObject({ name: expect.any(String), kind: "build", status: "working", parentId: null, activity: null });
     const worker = res.agents.find((a) => a.id === otherId)!;
     expect(worker).toMatchObject({ kind: "worker", parentId: callerId, status: "waiting" });
+  });
+
+  // LIVENESS RECONCILIATION ON THE ROSTER (bead sparkle-dlze6u, PR #2548 retro). A spawned worker
+  // that reports `working` but has produced no artifact for longer than the staleness bound is a
+  // DEAD worker still wearing a healthy busy pill — measured at up to sixty-eight minutes — and an
+  // orchestrator reading get_state must not trust it as running. Paired: the genuinely-running
+  // sibling, fresh artifact, stays `working`. Uses scope "all" so a downgraded (→ "stopped") row is
+  // still present to assert on rather than filtered out of the "active" default.
+  it("get_state downgrades a stale-busy worker to stopped, and keeps a fresh-busy one working", async () => {
+    const deadId = otherId; // a worker under callerId (see beforeEach)
+    const liveId = useProjectStore.getState().addAgent(projectId, { kind: "worker", parentId: callerId })!;
+    useRuntimeStore.getState().setStatus(callerId, "idle");
+    useRuntimeStore.getState().setStatus(deadId, "working");
+    useRuntimeStore.getState().setStatus(liveId, "working");
+    // STALE_AFTER_MS aliases fleetVerdict.SILENT_AFTER_MS (10 min). Dead worker: last hook ~30 min
+    // ago. Live worker: last hook 20 s ago.
+    const now = Date.now();
+    useRuntimeStore.getState().setAgentMovement({
+      [deadId]: { lastEvent: "PostToolUse", lastEventMs: now - 30 * 60_000, sessionId: "s1", toolsRecent: 3 },
+      [liveId]: { lastEvent: "PostToolUse", lastEventMs: now - 20_000, sessionId: "s2", toolsRecent: 3 },
+    });
+    fire({ reqId: "live1", op: "get_state", callerAgentId: callerId, payload: { scope: "all" } });
+    await flush();
+    const res = lastReply() as { agents: Array<Record<string, unknown>> };
+    const dead = res.agents.find((a) => a.id === deadId)!;
+    const live = res.agents.find((a) => a.id === liveId)!;
+    // THE SIDE EFFECT: the dead worker no longer reads busy; the live one is untouched.
+    expect(dead.status).toBe("stopped");
+    expect(live.status).toBe("working");
+    // …and the dead worker no longer bubbles a green dot into its head's roll-up (it was reconciled
+    // into the same map dotOf reads). The live worker keeps the head green.
+    expect(live.rollupDot).toBe("green");
   });
 
   // ── THE PERSISTENT CONCURRENCY + PER-AGENT MEMORY RECORD ──────────────────────────────────────

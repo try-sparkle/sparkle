@@ -2182,6 +2182,41 @@ mod tests {
         assert!(!is_foreign_gate_record("Probe 1 — applied: the marker is registered now."));
     }
 
+    /// A KNIGHTWATCH REVIEW IS A REVIEW FIRST, even when it carries a HumaneBench marker (bead
+    /// `sparkle-pf3g5g`).
+    ///
+    /// A review that quotes a verdict — here the verdict's header and marker in a leading
+    /// blockquote, the bypass shape that fails the quote-reply carve-out — has a body that
+    /// [`is_foreign_gate_record`] alone calls a record. What keeps it in the review set is
+    /// STRUCTURE: [`evaluate`] builds `review_positions` from [`is_knightwatch`] BEFORE the foreign
+    /// filter is ever applied, so a marker-carrying review is never handed to that filter as a
+    /// review candidate. The shell (`scripts/probe-gate.sh`) applies the foreign filter over one
+    /// flat comment list and had to exempt reviews explicitly to reach the same answer; this is the
+    /// parity pin, and `review-quoting-humanebench-verdict-is-still-a-review.json` in the shared
+    /// corpus is what keeps the two from drifting apart again.
+    #[test]
+    fn a_review_carrying_a_humanebench_marker_is_still_a_review() {
+        let name = "review-quoting-humanebench-verdict-is-still-a-review.json";
+        let comments = parse_comments(&read_fixture(name)).expect("a fixture must parse");
+        let review = &comments[0];
+
+        // Preconditions that make this non-vacuous: it genuinely IS a review, and its body genuinely
+        // WOULD be called a foreign record by the classifier taken in isolation. So only the
+        // review-first ordering can keep its probe in the gate.
+        assert!(is_knightwatch(&review.body), "precondition: it carries the review marker");
+        assert!(
+            is_foreign_gate_record(&review.body),
+            "precondition: the classifier alone would call this body a foreign record"
+        );
+
+        // The side effect: the review's [blocking] probe is counted and reported UNANSWERED, rather
+        // than the review being dropped and the head read as unreviewed.
+        let gate = evaluate(&comments);
+        assert!(gate.applicable, "a marker-carrying review still makes the gate applicable");
+        assert_eq!(ids(&gate.unanswered_blocking()), vec!["700#1"]);
+        assert!(matches!(decide(&gate, 998, None), Decision::Refuse { .. }));
+    }
+
     /// THE RECORDED PROBE OVERRIDE MUST NOT WAIVE AN UNREVIEWED HEAD — and this is a PARITY pin,
     /// not a new rule.
     ///
