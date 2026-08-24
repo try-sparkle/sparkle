@@ -535,6 +535,38 @@ describe("sparklePersona — agent-feedback inbox drain", () => {
     expect(p).toMatch(/LOCKED, do NOT raw-list/);
   });
 
+  // ...AND IT MUST EXCLUDE THE OTHER REFUSING VERDICT, WHICH THE LOCKED RULE DOES NOT COVER.
+  // Triage classifies a store whose schema is behind the `bd` binary as DEGRADED, and that is the
+  // verdict this machine actually produces. The LOCKED rule is justified to the agent by "an
+  // unbounded `bd list` HANGS", so an agent reasoning from it concludes the raw list is safe
+  // whenever nothing hangs — and DEGRADED does not hang. It returns promptly with a label-blind,
+  // TRUNCATED slice (measured: 79 rows against a queue holding 1500+), which reads as a
+  // nearly-drained inbox and retires the drain on a read that saw nothing. That is strictly worse
+  // than the convoy LOCKED causes, so the guidance must name DEGRADED and say why it is worse.
+  it.each(MINING_MODES)("%s: the raw-list fallback also excludes a DEGRADED store", (mode) => {
+    const p = sparklePersona(LOG_DIR, REPO, mode, "unknown", { attended: false });
+    expect(p).toMatch(/DEGRADED/);
+    // The refusal is what changes behaviour — naming the verdict without forbidding the raw list
+    // would leave the agent exactly where the defect found it.
+    expect(p).toMatch(/Treat DEGRADED exactly like\s+LOCKED: do NOT raw-list/);
+    // And the REASON, because the LOCKED rationale ("it hangs") is the thing that misleads here.
+    expect(p).toMatch(/DOES NOT HANG/);
+    // Dropping `--label` is the specific wrong repair an agent reaches for once it learns the
+    // labelled query came back empty; it has to be refused by name, not merely left unmentioned.
+    expect(p).toMatch(/Dropping the `--label` filter is NOT the/);
+  });
+
+  // A DEGRADED store also silently defeats the two WRITES this section instructs: a pain point
+  // parks instead of filing, and `--apply` closes and comments nothing. An agent that does not know
+  // that reports the inbox drained and its findings filed, when neither happened.
+  it.each(MINING_MODES)("%s: says a DEGRADED store blocks the drain's own writes", (mode) => {
+    const p = sparklePersona(LOG_DIR, REPO, mode, "unknown", { attended: false });
+    expect(p).toMatch(/PARKS instead of filing/);
+    expect(p).toMatch(/`--apply` closes and comments nothing/);
+    // The repair is human-gated, so point at the script rather than implying the agent can fix it.
+    expect(p).toMatch(/scripts\/beads-doctor\.sh/);
+  });
+
   it.each(MINING_MODES)("%s: each arm's step 1 references the drain, ordered before log review", (mode) => {
     const p = sparklePersona(LOG_DIR, REPO, mode, "unknown", { attended: false });
     // The whatYouDo arm names the drain STEP (not just the section), so the ordered numbered list
