@@ -469,6 +469,67 @@ describe("controlListener", () => {
     });
   });
 
+  // ── THE FLEET DIRECTORY ACCOUNTS FOR THE LIVE AGENTS IT DOES NOT LIST (bead sparkle-u1p68f) ──────
+  //
+  // The "fleet" scope is the app-GLOBAL address book: the two ids that live outside any project (the
+  // concierge and Improve Sparkle). It used to hard-code `omitted: 0` / `omittedIds: []`, so a reply
+  // could read `agents: [2], omitted: 0` at the very instant `concurrency.live` reported 45
+  // project-resident agents running — asserting the fleet is EMPTY while it is busy, which is the one
+  // roster an orchestrator has. Now it reports the live agents it does not list, reconciled against
+  // the SAME population `concurrency.live` counts, so the two numbers in one body cannot silently
+  // disagree.
+  //
+  // NON-VACUOUS: the seeding below (open + a selected project) is what makes `concurrency.live`
+  // non-zero, and against the OLD hard-coded `omitted: 0` every assertion tying omitted/omittedIds/
+  // totalAgents to the live set fails. Drop the seeding and `live` is 0, so the bug and the fix read
+  // alike — which is exactly the interleaving this test exists to forbid.
+  describe("get_state — the fleet directory accounts for live agents", () => {
+    it("reports the live agents it does not list instead of asserting there are none", async () => {
+      // callerId (build) + otherId (worker) are in the SELECTED project (addProject selects it), so
+      // marking them open makes them `live` in localAgentCapacity — the population `concurrency.live`
+      // counts. Neither is in the app-global address book, so both are legitimately omitted here.
+      useRuntimeStore.setState({ openAgentIds: [callerId, otherId] } as never);
+
+      fire({ reqId: "flt1", op: "get_state", callerAgentId: CONCIERGE_CALLER_AGENT_ID, payload: { scope: "fleet" } });
+      await flush();
+      const res = lastReply() as {
+        agents: Array<Record<string, unknown>>;
+        scope: string;
+        totalAgents: number;
+        omitted: number;
+        omittedIds: string[];
+        concurrency: { live: number };
+      };
+
+      expect(res.scope).toBe("fleet");
+      // The address book itself is unchanged: the two app-owned rows.
+      const shownIds = res.agents.map((a) => a.id as string);
+      expect(shownIds).toContain(CONCIERGE_CALLER_AGENT_ID);
+      expect(shownIds).toContain(SPARKLE_AGENT_ID);
+
+      // THE FIX: the live project agents are not silently dropped — they are counted, and named.
+      expect(res.concurrency.live).toBe(2);
+      expect(res.omitted).toBe(2);
+      // ...and it is the SAME population, not a coincidentally-equal number. The two figures in one
+      // body must reconcile — the founder's acceptance: "the two numbers cannot silently disagree".
+      expect(res.omitted).toBe(res.concurrency.live);
+      expect([...res.omittedIds].sort()).toEqual([callerId, otherId].sort());
+      // The whole world this directory describes: what it listed plus what it omitted.
+      expect(res.totalAgents).toBe(res.agents.length + res.omitted);
+    });
+
+    it("cannot report omitted: 0 while agents are live — the exact 'asserting there are none' lie", async () => {
+      // The narrowest statement of the bug, kept separate so a regression names it directly: any
+      // non-zero live count forbids omitted: 0. This is the assertion the OLD hard-coded 0 fails.
+      useRuntimeStore.setState({ openAgentIds: [callerId] } as never);
+      fire({ reqId: "flt2", op: "get_state", callerAgentId: CONCIERGE_CALLER_AGENT_ID, payload: { scope: "fleet" } });
+      await flush();
+      const res = lastReply() as { omitted: number; concurrency: { live: number } };
+      expect(res.concurrency.live).toBeGreaterThan(0);
+      expect(res.omitted).toBeGreaterThan(0);
+    });
+  });
+
   // ONE AGENT, ONE NAME. `get_state` named rows off `agent.name` while the concierge's needs-you
   // feed named them through `agentDisplayName` — two rules, so the same id could carry two names on
   // screen at once. It did: an agent that had renamed itself "Concierge Issue Triage" was still

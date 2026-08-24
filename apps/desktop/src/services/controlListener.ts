@@ -34,6 +34,7 @@ import {
 } from "@sparkle/core";
 import { safeUnlisten } from "./safeUnlisten";
 import { peakSummary, type PeakSummary } from "./peakConcurrency";
+import { localAgentRowIds } from "./agentCapacity";
 import { startControlBridge, controlRespond } from "./orchestrationLaunch";
 import { useProjectStore } from "../stores/projectStore";
 import { useAppOwnedAgentStore } from "../stores/appOwnedAgentStore";
@@ -903,8 +904,9 @@ export function resolveScope(raw: unknown): StateScope {
  *  agent, not a second roster — left unbounded it would grow with the dormant-tab backlog and give
  *  back the context cost the scope was added to remove. This CAP does not change `omitted`; what
  *  `omitted` means per scope is stated once in `OMITTED_CONTRACT` (`@sparkle/core`) and deliberately
- *  not paraphrased here. This comment previously asserted the absolute, which is wrong for the two
- *  scopes that hard-code 0 below. */
+ *  not paraphrased here. This comment previously asserted the absolute, which is wrong for the
+ *  'project' scope that hard-codes 0 below (and for 'fleet', which now counts the live agents it
+ *  does not list — see the fleet branch). */
 const OMITTED_IDS_CAP = 20;
 
 /** How much this window actually KNOWS about a row's status — reported per agent alongside `status`.
@@ -1237,15 +1239,30 @@ function handleGetState(req: ControlRequest): {
         appOwned: true as const,
       })),
     ];
+    // WHICH LIVE AGENTS THIS DIRECTORY DOES NOT LIST (bead sparkle-u1p68f). The address book above is
+    // the two app-global ids; every OTHER running agent is project-resident and lives in
+    // `projectStore`, counted by the SAME `localAgentRowIds().live` population that `concurrency.live`
+    // reports below. Deriving the tally from that one source is what stops this reply contradicting
+    // itself: the defect this closes was a body reading `agents: [2], omitted: 0` beside
+    // `concurrency.live: 45` — asserting the fleet is empty at the instant 45 agents are running, which
+    // is worse than a truncation because it does not say "I left some out", it says there are none.
+    //
+    // WHY NOT HARD-CODE 0 LIKE SCOPE "project". That scope withholds its tally because a project
+    // boundary that publishes its own size is not a boundary. "fleet" is app-global — there is no
+    // boundary here to protect, and the orchestrator whose ONLY roster this is cannot coordinate a
+    // fleet a directory tells it is empty. So it publishes the tally, and the ids (capped) so a caller
+    // can resolve a specific live agent it could not otherwise see. The address-book rows are
+    // app-owned and never members of `projectStore`, so the two sets are disjoint and this equals
+    // `concurrency.live`; the filter is belt-and-braces against ever double-counting a shown row.
+    const fleetShown = new Set(fleetAgents.map((a) => (a as { id: string }).id));
+    const omittedLiveIds = localAgentRowIds().live.filter((id) => !fleetShown.has(id));
     return {
       agents: fleetAgents,
       self: selfIdentity(req),
       scope,
-      // This scope's world IS the address book it returned, so — like scope "project" — it does not
-      // publish a headcount of anything it withheld (there is nothing withheld to count).
-      totalAgents: fleetAgents.length,
-      omitted: 0,
-      omittedIds: [],
+      totalAgents: fleetAgents.length + omittedLiveIds.length,
+      omitted: omittedLiveIds.length,
+      omittedIds: omittedLiveIds.slice(0, OMITTED_IDS_CAP),
       theme: ui.themePref,
       models: getModelCatalog().map((m) => m.id),
       statusFilter: ui.statusFilter,
@@ -1534,8 +1551,9 @@ function handleGetState(req: ControlRequest): {
   // 56 ids (~600 permanently-resident tokens) back to the scope that is supposed to be nearly free.
   // Capped as well, so the field can never grow with the dormant-tab backlog. That CAP is not what
   // decides the reported value — `OMITTED_CONTRACT` (`@sparkle/core`) is the one statement of what
-  // this field means per scope, and `scopedOmitted` below hard-codes 0 for "project" exactly as the
-  // "fleet" branch does. Deliberately not restated here. roborev #53441.
+  // this field means per scope, and `scopedOmitted` below hard-codes 0 for "project" (the "fleet"
+  // branch above no longer does — it counts the live agents it does not list, bead sparkle-u1p68f).
+  // Deliberately not restated here. roborev #53441.
   const omittedIds = scope === "active" ? omittedAll.slice(0, OMITTED_IDS_CAP) : [];
   // SCOPE "project" MUST NOT COUNT WHAT IT REFUSED TO SHOW. `totalAgents`/`omitted` are honest
   // book-keeping for every other scope — they exist so a truncated roster does not read as "that's

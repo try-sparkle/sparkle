@@ -83,24 +83,48 @@ export interface CapacityReading {
  *
  * `live` mirrors Workspace's `live` memo EXACTLY — in `openAgentIds` AND in a project whose tab has
  * been visited this session (or is the current tab, which Workspace unions in at render time). The
- * project id has to survive the flatten for that, which is why this is a nested loop rather than a
- * flatMap: the visited half is per-PROJECT, and dropping it is what let a persisted `openAgentIds`
- * report every restored row as a running process (roborev 54225).
+ * walk that decides membership (and why it must stay per-project rather than a flatMap) lives in
+ * `localAgentRowIds`; this reads the LENGTHS of its two lists.
  */
-export function localAgentCapacity(): CapacityReading {
+/**
+ * The ids of the local build/worker rows this machine's budget counts, split by liveness.
+ *
+ * `used` is EVERY local build/worker row (cloud agents and non-agent kinds excluded, exactly as
+ * `localAgentProcessIds` does); `live` is the subset Workspace would mount a pane for right now (the
+ * project is selected or has been visited this session) AND that carries an entry in `openAgentIds`.
+ * `localAgentCapacity`'s `used`/`live` are the LENGTHS of these two lists, so a surface that needs
+ * the IDS behind the live count — get_state's "fleet" directory has to say WHICH live agents it does
+ * not list rather than assert there are none (bead sparkle-u1p68f) — reconciles with the capacity
+ * reading BY CONSTRUCTION, not through a second predicate that can drift out of step with this one.
+ *
+ * A NESTED LOOP rather than a flatMap, and that is load-bearing: `mounted` is per-PROJECT, and a
+ * flatten that discarded `p` is what once let a persisted `openAgentIds` report every restored row
+ * as a running process (roborev 54225).
+ */
+export function localAgentRowIds(): { used: string[]; live: string[] } {
   const { projects, selectedProjectId } = useProjectStore.getState();
   const open = new Set(useRuntimeStore.getState().openAgentIds);
-  let used = 0;
-  let live = 0;
+  const used: string[] = [];
+  const live: string[] = [];
   for (const p of projects) {
     // Whether Workspace would mount ANY pane for this project right now.
     const mounted = p.id === selectedProjectId || wasProjectVisited(p.id);
     for (const a of p.agents) {
       if (a.runtime === "cloud" || (a.kind !== "build" && a.kind !== "worker")) continue;
-      used += 1;
-      if (mounted && open.has(a.id)) live += 1;
+      used.push(a.id);
+      if (mounted && open.has(a.id)) live.push(a.id);
     }
   }
+  return { used, live };
+}
+
+export function localAgentCapacity(): CapacityReading {
+  // ONE population, counted once — `used`/`live` are the lengths of `localAgentRowIds`'s two lists,
+  // so every surface that reports the live COUNT and every surface that needs the live IDS behind it
+  // read from the same walk (see `localAgentRowIds`).
+  const { used: usedIds, live: liveIds } = localAgentRowIds();
+  const used = usedIds.length;
+  const live = liveIds.length;
   const settings = useSettingsStore.getState();
   // `enforcedWorkerCap`, and the reason it stays is worth recording (roborev 54780 → 55036).
   //

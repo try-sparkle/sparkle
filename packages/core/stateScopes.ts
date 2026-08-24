@@ -68,10 +68,15 @@ export function stateScopesNamedIn(text: string): string[] {
  *  WHY A CONSTANT (roborev 66361/66378/66384/66385). This contract reached NINE restatements across
  *  the tool description, its own tail sentence, `types.ts`, SKILL.md and two comments in
  *  `controlListener.ts`. Three of them asserted the absolute — "`omitted` is always the exact count"
- *  — which is FALSE for `'project'` and `'fleet'`, both of which hard-code `omitted: 0` by design
- *  (a boundary that publishes its own size is not a boundary). One round of fixes even qualified the
- *  head of a description and left its tail asserting the opposite, so a single string contradicted
- *  itself.
+ *  — which is FALSE for `'project'`, which hard-codes `omitted: 0` by design (a boundary that
+ *  publishes its own size is not a boundary). One round of fixes even qualified the head of a
+ *  description and left its tail asserting the opposite, so a single string contradicted itself.
+ *
+ *  `'fleet'` used to hard-code `0` for the same-looking reason, and that was the bug in
+ *  `sparkle-u1p68f`: fleet is the app-GLOBAL address book, not a project boundary, so there is no
+ *  size to protect — and reporting `omitted: 0` beside `concurrency.live: 45` told the orchestrator
+ *  whose only roster this is that the fleet was empty while it was running. Fleet now reports the
+ *  count of live agents it does not list (and their ids, capped), so 0 there means what it says.
  *
  *  The fail-closed case is the one that costs something: an unresolvable caller under `'project'`
  *  gets `agents: []`, `totalAgents: 0`, `omitted: 0` — a REFUSAL, which the absolute wording invites
@@ -81,10 +86,11 @@ export function stateScopesNamedIn(text: string): string[] {
  *  interpolate it, and let the guard assert that no OTHER sentence claims exactness without the
  *  qualifier. */
 export const OMITTED_CONTRACT =
-  "omitted is the exact count for 'self'/'active'/'all'; 'project' and 'fleet' always report " +
-  "omitted: 0 BY DESIGN, so 0 there never means nothing was hidden, and an unresolvable caller " +
-  "under 'project' gets an empty roster with omitted: 0 as a fail-closed REFUSAL rather than an " +
-  "affirmative 'there are no agents'";
+  "omitted is the exact count of rows filtered out for 'self'/'active'/'all', and for 'fleet' it is " +
+  "the count of live agents the app-global address book does not list, which is never 0 while agents " +
+  "are running; 'project' alone always reports omitted: 0 BY DESIGN, so 0 there never means nothing " +
+  "was hidden, and an unresolvable caller under 'project' gets an empty roster with omitted: 0 as a " +
+  "fail-closed REFUSAL rather than an affirmative 'there are no agents'";
 
 /** Phrasings that assert something about how COMPLETE `omitted` is.
  *
