@@ -74,6 +74,27 @@ const ROBOREV_DB_BLOAT_BYTES: u64 = 314_572_800;
 /// How the roborev store is referred to in verdict text (the path a human would go look at).
 const ROBOREV_DB_LABEL: &str = "~/.roborev/reviews.db";
 
+/// How recent a lock line in roborev's RAW ERROR LOG must be to be evidence about NOW.
+///
+/// Two minutes, not an hour, and the difference is the whole point. `~/.roborev/errors.log` is a
+/// 14MB append-only file whose 200-line tail was MEASURED to span **~59 minutes**, so any window on
+/// the order of an hour makes that tail permanently "evidence" — a wedged daemon's pre-wedge
+/// collisions then read as current contention. Contention that is actually starving the status RPC
+/// is losing the lock RIGHT NOW, within seconds.
+/// Mirrored by `PH_LOCK_EVIDENCE_WINDOW_SECS` in scripts/pipeline-health-scan.sh.
+const LOCK_EVIDENCE_WINDOW_SECS: i64 = 120;
+
+/// How many SERVER-path lock lines inside that window before the raw log is called proof.
+///
+/// Kept low because [`is_server_lock_line`] — not volume — is what removes the idle background.
+/// MEASURED over 40 days of this machine's log (13,227 lock lines): 13,096 worker vs 131 server.
+/// Conditioned on the mtime fail-fast passing, a trailing-120s window holds ≥2 WORKER lock lines in
+/// **99.97%** of seconds on an idle, healthy daemon, against **0.76%** for ≥2 SERVER lines. Raising
+/// the number instead would be tuning against one machine's noise floor, which rises on a busier
+/// machine; filtering by component does not.
+/// Mirrored by `PH_MIN_SERVER_LOCK_LINES` in scripts/pipeline-health-scan.sh.
+const MIN_SERVER_LOCK_LINES: usize = 2;
+
 /// Bound the `gh api` runner read. `gh` has no deadline of its own; this is the Rust twin of
 /// `runner-health.sh`'s `rh_status_bounded`. A timeout reads as "could not tell" (Unknown), never as
 /// "offline".
@@ -185,6 +206,9 @@ pub struct DaemonEvidence {
     alive: Option<bool>,
     /// Size of the roborev store (`reviews.db` plus its `-wal` sidecar), in bytes.
     db_bytes: Option<u64>,
+    /// Is roborev's own error log showing SERVER-path lock collisions RIGHT NOW? `None` = we could
+    /// not tell, which is never read as "no contention". See [`roborev_recent_lock_evidence`].
+    lock_evidence: Option<bool>,
 }
 
 impl DaemonEvidence {
@@ -485,6 +509,31 @@ fn classify_not_answering(timed_out: bool, ev: DaemonEvidence) -> (HealthState, 
     }
 
     if ev.is_alive() == Some(true) {
+        // CONTENDED — the daemon is alive and its SERVER path is losing the SQLite lock right now,
+        // so the silence is a STARVED read, not a stuck process. This arm exists because the WEDGE
+        // arm below otherwise calls a live daemon "a genuine WEDGE" on the ABSENCE of store bloat
+        // alone, and a small store is not evidence that the daemon is stuck — it only rules out the
+        // one alternative explanation that main's ladder could see. Ranked BELOW the bloated case
+        // deliberately: when the store IS oversized, SLOW already names the disease and prescribes
+        // the compaction that actually fixes it, and lock collisions are a symptom of that same
+        // store rather than a competing diagnosis.
+        if !bloated && ev.lock_evidence == Some(true) {
+            return (
+                HealthState::Warning,
+                format!(
+                    "{why}, but the daemon process is ALIVE and its own error log shows the SERVER \
+                     path losing the SQLite write lock within the last \
+                     {LOCK_EVIDENCE_WINDOW_SECS}s — so the status read is being THROTTLED by lock \
+                     contention, not answered by a wedged daemon. Review is slowed, NOT stopped; \
+                     merges and deploys are unaffected. A restart does not clear contention and \
+                     `roborev daemon stop && roborev daemon start` is broken on this machine \
+                     besides (launchd restarts what you stopped, and the failed start orphans a \
+                     process holding 127.0.0.1:7373). If it persists, shrink the store offline with \
+                     `scripts/roborev-maintenance.sh --compact` — write-lock contention is what a \
+                     growing store causes."
+                ),
+            );
+        }
         if let Some(mb) = db_mb {
             // SLOW — the store alone explains the silence, and a restart cannot shrink a store.
             if bloated {
@@ -1848,6 +1897,157 @@ fn roborev_daemon_loaded() -> Option<bool> {
 /// SLOW (alive, behind a bloated store) from one that is genuinely DOWN — and the LaunchAgent
 /// registration cannot answer it, because a registered agent whose process died still prints as
 /// loaded. `None` when `pgrep` is unavailable or could not be run: unknown, never a guessed `false`.
+/// `2026-08-23T19:58:53.437835-07:00` → epoch seconds. Accepts `Z`, `+HH:MM` and `+HHMM`, and an
+/// optional fractional part. `None` on anything it cannot fully account for — an un-parseable
+/// timestamp must never be treated as recent.
+///
+/// SEPARATE FROM [`github_ts_to_epoch`] deliberately, and not a duplicate of it: that one parses the
+/// `YYYY-MM-DDTHH:MM:SSZ` GitHub emits and rejects everything else, while roborev writes a LOCAL
+/// timestamp with a numeric UTC offset and microseconds. Feeding roborev's shape to the GitHub
+/// parser returns `None` for every line, which fails safe but would make this evidence permanently
+/// absent. Both share the crate's one [`days_from_civil`].
+fn parse_rfc3339_epoch(s: &str) -> Option<i64> {
+    let b = s.as_bytes();
+    if b.len() < 20 {
+        return None;
+    }
+    if b[4] != b'-' || b[7] != b'-' || b[13] != b':' || b[16] != b':' {
+        return None;
+    }
+    if !matches!(b[10], b'T' | b't' | b' ') {
+        return None;
+    }
+    let num = |a: usize, z: usize| -> Option<i64> {
+        let f = s.get(a..z)?;
+        if f.bytes().all(|c| c.is_ascii_digit()) { f.parse::<i64>().ok() } else { None }
+    };
+    let (y, mo, d) = (num(0, 4)?, num(5, 7)?, num(8, 10)?);
+    let (h, mi, sec) = (num(11, 13)?, num(14, 16)?, num(17, 19)?);
+    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) || h > 23 || mi > 59 || sec > 60 {
+        return None;
+    }
+    // Fractional seconds carry no information we need, but an empty `.` is malformed.
+    let rest = match s[19..].strip_prefix('.') {
+        Some(frac) => {
+            let n = frac.bytes().take_while(|c| c.is_ascii_digit()).count();
+            if n == 0 {
+                return None;
+            }
+            &frac[n..]
+        }
+        None => &s[19..],
+    };
+    let off = if rest.eq_ignore_ascii_case("z") {
+        0
+    } else {
+        let sign: i64 = match rest.as_bytes().first()? {
+            b'+' => 1,
+            b'-' => -1,
+            _ => return None,
+        };
+        let body: String = rest[1..].chars().filter(|c| *c != ':').collect();
+        if body.len() != 4 || !body.bytes().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        let oh: i64 = body[0..2].parse().ok()?;
+        let om: i64 = body[2..4].parse().ok()?;
+        if oh > 23 || om > 59 {
+            return None;
+        }
+        sign * (oh * 3600 + om * 60)
+    };
+    Some(days_from_civil(y, mo, d) * 86_400 + h * 3600 + mi * 60 + sec - off)
+}
+
+/// The value of a top-level `"<key>":"<value>"` string field on one line of roborev's error log
+/// (it is line-delimited JSON). Tolerates whitespace after the colon; `None` when absent.
+fn json_str_field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+    let needle = format!("\"{key}\":");
+    let at = line.find(&needle)?;
+    let inner = line[at + needle.len()..].trim_start().strip_prefix('"')?;
+    let end = inner.find('"')?;
+    Some(&inner[..end])
+}
+
+/// The `"ts":"…"` field of one roborev error-log line, as epoch seconds.
+fn json_ts_epoch(line: &str) -> Option<i64> {
+    parse_rfc3339_epoch(json_str_field(line, "ts")?)
+}
+
+/// Does this line carry roborev's SQLite lock signature at all?
+fn has_lock_contention(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    lower.contains("sqlite_busy") || lower.contains("database is locked")
+}
+
+/// Is this log line a lock collision on the SERVER path — the path that answers `roborev status`?
+///
+/// THIS PREDICATE IS THE WHOLE DISCRIMINATOR, and volume or recency alone could never be. Two
+/// components log the lock signature and they answer DIFFERENT QUESTIONS:
+///
+/// * `worker: claim job: database is locked` — a worker losing the job-claim lock. At
+///   `busy_timeout = 0` this is the EXPECTED idle background of a perfectly healthy daemon, because
+///   workers poll for work continuously. It says nothing about whether a status read can get through.
+/// * `server: get repo: database is locked` — the SERVER losing the lock. That is the same path
+///   `roborev status` is starved on, so it is the only line that is evidence for the claim made here.
+///
+/// MEASURED (see [`MIN_SERVER_LOCK_LINES`]): 13,096 worker against 131 server lines over 40 days, and
+/// ≥2 worker lines are present in 99.97% of idle 120-second windows. Ageing alone does not remove
+/// that background — only the component does.
+///
+/// FAILS SAFE: if roborev ever drops or renames the `component` field this returns false, the
+/// evidence goes absent, and the classifier keeps whichever verdict still offers a recovery command
+/// — never the "do not restart" that a genuinely wedged daemon must not receive.
+fn is_server_lock_line(line: &str) -> bool {
+    has_lock_contention(line) && json_str_field(line, "component") == Some("server")
+}
+
+/// PURE half of [`roborev_recent_lock_evidence`]: does this log tail prove the STATUS PATH is losing
+/// the lock right NOW?
+///
+/// Two independent fences, both load-bearing. Every line is aged by its OWN timestamp — a line whose
+/// timestamp cannot be parsed is NOT counted, because the log is the one input where "cannot be aged"
+/// and "is recent" must not collapse together, its tail being arbitrarily old bytes rather than a
+/// window roborev chose to report. And only SERVER-path collisions count.
+fn log_proves_recent_contention(text: &str, now_epoch: i64) -> bool {
+    text.lines()
+        .filter(|l| is_server_lock_line(l))
+        .filter(|l| match json_ts_epoch(l) {
+            // Absolute difference, so a clock skewed into the future is not read as ancient.
+            Some(ts) => (now_epoch - ts).abs() <= LOCK_EVIDENCE_WINDOW_SECS,
+            None => false,
+        })
+        .count()
+        >= MIN_SERVER_LOCK_LINES
+}
+
+/// POSITIVE lock evidence, read from roborev's own error log.
+///
+/// This is the reading that separates a STARVED status read from a WEDGED daemon when the store is
+/// NOT bloated — the one case where [`classify_not_answering`] would otherwise call a live daemon a
+/// "genuine WEDGE" on the absence of store bloat alone. `None` = could not tell, which the
+/// classifier treats as "not proven", never as "no contention".
+fn roborev_recent_lock_evidence() -> Option<bool> {
+    let home = std::env::var("HOME").ok()?;
+    let log = std::path::Path::new(&home).join(".roborev/errors.log");
+    let meta = std::fs::metadata(&log).ok()?;
+    // Cheap fail-fast only: a log nobody has appended to since the window opened cannot hold a line
+    // inside it. NECESSARY, NEVER SUFFICIENT — the per-line fence below is what actually decides.
+    let age = std::time::SystemTime::now().duration_since(meta.modified().ok()?).ok()?;
+    if age.as_secs() as i64 > LOCK_EVIDENCE_WINDOW_SECS {
+        return Some(false);
+    }
+    let now = now_epoch_secs();
+    let mut cmd = Command::new("tail");
+    cmd.arg("-n").arg("200").arg(&log);
+    match crate::worktree::output_with_timeout(cmd, Duration::from_secs(3)) {
+        Ok(o) if o.status.success() => {
+            Some(log_proves_recent_contention(&String::from_utf8_lossy(&o.stdout), now))
+        }
+        _ => None,
+    }
+}
+
 fn roborev_daemon_alive() -> Option<bool> {
     let out = Command::new("pgrep").args(["-f", "roborev daemon"]).output().ok()?;
     Some(out.status.success())
@@ -1910,6 +2110,7 @@ fn roborev_component(root: &str) -> ComponentHealth {
                 loaded: roborev_daemon_loaded(),
                 alive: roborev_daemon_alive(),
                 db_bytes: roborev_db_bytes(),
+                lock_evidence: roborev_recent_lock_evidence(),
             }
         } else {
             DaemonEvidence::default()
@@ -2261,11 +2462,263 @@ mod tests {
     }
 
     fn evidence(alive: Option<bool>, loaded: Option<bool>, db_bytes: Option<u64>) -> DaemonEvidence {
-        DaemonEvidence { loaded, alive, db_bytes }
+        DaemonEvidence { loaded, alive, db_bytes, lock_evidence: None }
+    }
+
+    /// The same evidence WITH a lock-evidence reading. Separate constructor so every pre-existing
+    /// test keeps passing `None` — "we did not look" — and none of them silently acquires a verdict
+    /// it was not written to assert.
+    fn evidence_with_lock(
+        alive: Option<bool>,
+        loaded: Option<bool>,
+        db_bytes: Option<u64>,
+        lock_evidence: Option<bool>,
+    ) -> DaemonEvidence {
+        DaemonEvidence { loaded, alive, db_bytes, lock_evidence }
     }
 
     const RB_BLOATED: u64 = 901_775_360; // 860 MB — the measured size of the founder's store
     const RB_SMALL: u64 = 5_242_880; // 5 MB
+
+    // ── RAW-LOG LOCK EVIDENCE ────────────────────────────────────────────────────────────────────
+
+    /// 2026-08-23T20:00:00-07:00, the wall clock of the measured production read below. Fixed so the
+    /// whole log-evidence path is tested without a clock.
+    const NOW: i64 = 1_787_540_400;
+
+    /// One `~/.roborev/errors.log` line, built so each test varies exactly ONE fence. Two fences
+    /// guard this path (age, and component), so a fixture that trips both makes its test vacuous.
+    fn log_line(ts: &str, component: &str, message: &str) -> String {
+        format!(
+            "{{\"ts\":\"{ts}\",\"level\":\"error\",\"component\":\"{component}\",\
+             \"message\":\"{message}\"}}"
+        )
+    }
+    /// The SERVER-path collision — the only shape that is evidence about a starved status read.
+    fn server_lock(ts: &str) -> String {
+        log_line(ts, "server", "get repo: database is locked (5) (SQLITE_BUSY)")
+    }
+    /// The WORKER-path collision — the healthy idle background on this machine.
+    fn worker_lock(ts: &str) -> String {
+        log_line(ts, "worker", "claim job: database is locked (5) (SQLITE_BUSY)")
+    }
+    fn repeat(line: &str, n: usize) -> String {
+        std::iter::repeat(line).take(n).collect::<Vec<_>>().join("\n")
+    }
+
+    /// The RFC3339 parser, against values computed independently of it. Every downstream fence is
+    /// only as good as this, and a parser that silently returned `None` would make the log evidence
+    /// permanently absent — which fails SAFE but would also make the tests below vacuous, so the
+    /// known-value table is what keeps them honest.
+    #[test]
+    fn rfc3339_timestamps_parse_to_known_epochs() {
+        assert_eq!(parse_rfc3339_epoch("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(parse_rfc3339_epoch("2000-01-01T00:00:00Z"), Some(946_684_800));
+        // A leap day, which a naive month-length table gets wrong.
+        assert_eq!(parse_rfc3339_epoch("2024-02-29T12:00:00Z"), Some(1_709_208_000));
+        // The exact shape roborev writes: fractional seconds and a colon-bearing offset.
+        assert_eq!(parse_rfc3339_epoch("2026-08-23T19:58:53.437835-07:00"), Some(1_787_540_333));
+        // The colon-less offset `date +%z` prints, which the shell mirror's fixtures use.
+        assert_eq!(parse_rfc3339_epoch("2026-08-23T19:58:53-0700"), Some(1_787_540_333));
+        for bad in [
+            "",
+            "not a timestamp at all",
+            "2026-08-23 19:58:53",        // no offset
+            "2026-08-23T19:58:53.-07:00", // empty fraction
+            "2026-13-01T00:00:00Z",       // month 13
+            "2026-08-23T25:00:00Z",       // hour 25
+            "2026-08-23T19:58:53+7:00",   // one-digit offset hour
+        ] {
+            assert_eq!(parse_rfc3339_epoch(bad), None, "must not parse: {bad:?}");
+        }
+    }
+
+    /// The field reader both fences depend on.
+    #[test]
+    fn json_string_fields_are_read_by_key_not_by_position() {
+        let line = server_lock("2026-08-23T19:59:55-07:00");
+        assert_eq!(json_str_field(&line, "component"), Some("server"));
+        assert_eq!(json_str_field(&line, "level"), Some("error"));
+        assert_eq!(json_str_field(&line, "ts"), Some("2026-08-23T19:59:55-07:00"));
+        assert_eq!(json_str_field(&line, "nope"), None);
+        assert_eq!(
+            json_str_field("{\"component\": \"server\"}", "component"),
+            Some("server"),
+            "a space after the colon must not read as a missing field"
+        );
+        // A prefix of a real key must not match it.
+        assert_eq!(json_str_field("{\"tsx\":\"x\"}", "ts"), None);
+        assert!(is_server_lock_line(&server_lock("2026-08-23T19:59:55-07:00")));
+        assert!(!is_server_lock_line(&worker_lock("2026-08-23T19:59:55-07:00")));
+        // A server line with no lock signature is not a lock line at all.
+        assert!(!is_server_lock_line(&log_line(
+            "2026-08-23T19:59:55-07:00",
+            "server",
+            "get repo: no such repo"
+        )));
+    }
+
+    /// THE MEASURED PRODUCTION SHAPE, AND THE DEFECT IT CAUSED. `~/.roborev/errors.log` is 14 MB and
+    /// its last 200 lines span ~59 MINUTES. An mtime-only fence made that tail always "evidence".
+    /// SERVER lines on purpose here, so AGE is the only fence under test.
+    #[test]
+    fn a_tail_of_fifty_minute_old_collisions_is_not_evidence_about_now() {
+        let stale = repeat(&server_lock("2026-08-23T19:10:00-07:00"), 200);
+        assert!(
+            !log_proves_recent_contention(&stale, NOW),
+            "200 collisions from 50 minutes ago say nothing about NOW — and reading them as current \
+             contention is what told the operator not to restart a wedged daemon"
+        );
+    }
+
+    /// THE SECOND FENCE, AND THE ONE THE MEASUREMENT FORCED. Per-line ageing alone was NOT enough:
+    /// 13,096 `worker: claim job` collisions against 131 `server: get repo` over 40 days, and ≥2
+    /// WORKER lock lines are present in 99.97% of idle 120-second windows. A freshly-written wall of
+    /// worker collisions is the NORMAL state here.
+    #[test]
+    fn fresh_worker_job_claim_collisions_are_the_idle_background_not_evidence() {
+        let fresh_workers = repeat(&worker_lock("2026-08-23T19:59:55-07:00"), 200);
+        assert!(
+            !log_proves_recent_contention(&fresh_workers, NOW),
+            "200 job-claim collisions from 5 seconds ago are what a HEALTHY idle daemon looks like \
+             at busy_timeout=0 — not evidence that the STATUS read is being starved"
+        );
+        // The paired positive: same timestamp, same count, ONLY the component differs — so the pair
+        // pins the component as the cause and nothing else.
+        let fresh_servers = repeat(&server_lock("2026-08-23T19:59:55-07:00"), 200);
+        assert!(
+            log_proves_recent_contention(&fresh_servers, NOW),
+            "the identical tail on the SERVER path IS a starved status read"
+        );
+        // Server lines buried in worker background are still evidence…
+        let mixed = format!(
+            "{}\n{}",
+            repeat(&worker_lock("2026-08-23T19:59:55-07:00"), 198),
+            repeat(&server_lock("2026-08-23T19:59:55-07:00"), 2)
+        );
+        assert!(log_proves_recent_contention(&mixed, NOW), "server lines buried in background count");
+        // …and the background can never top a single server line up to the threshold.
+        let one_server = format!(
+            "{}\n{}",
+            repeat(&worker_lock("2026-08-23T19:59:55-07:00"), 199),
+            server_lock("2026-08-23T19:59:55-07:00")
+        );
+        assert!(
+            !log_proves_recent_contention(&one_server, NOW),
+            "199 worker collisions cannot top a single server collision up to the threshold"
+        );
+    }
+
+    /// A LOG LINE THAT CANNOT BE AGED IS NOT RECENT — and a log roborev has reformatted must go to a
+    /// verdict that still offers the restart, never to "do not restart".
+    #[test]
+    fn unstampable_log_lines_are_never_counted_as_recent() {
+        let unstamped = repeat(&server_lock("not-a-timestamp"), 200);
+        assert!(
+            !log_proves_recent_contention(&unstamped, NOW),
+            "200 un-ageable lines are 200 unknowns, not proof of a live throttle"
+        );
+        let no_ts = repeat(
+            "{\"level\":\"error\",\"component\":\"server\",\
+             \"message\":\"get repo: database is locked (5) (SQLITE_BUSY)\"}",
+            200,
+        );
+        assert!(!log_proves_recent_contention(&no_ts, NOW), "no ts field → unknown, not recent");
+        let no_component = repeat(
+            "{\"ts\":\"2026-08-23T19:59:55-07:00\",\"level\":\"error\",\
+             \"message\":\"get repo: database is locked (5) (SQLITE_BUSY)\"}",
+            200,
+        );
+        assert!(
+            !log_proves_recent_contention(&no_component, NOW),
+            "no component field means the server path cannot be established — fail SAFE"
+        );
+    }
+
+    /// THE WIRING ONTO MAIN'S LADDER, without which every fence above is unreachable in production.
+    ///
+    /// The arm this pins is the one main's ladder could not reach: a live daemon behind a SMALL store
+    /// is called "a genuine WEDGE" on the ABSENCE of store bloat alone, and prescribes a kickstart.
+    /// A small store rules out the slow-store explanation; it is NOT evidence that the process is
+    /// stuck. Positive lock evidence supplies the third reading, and the PAIR below is what pins it:
+    /// identical evidence apart from the lock reading must produce the two OPPOSITE verdicts.
+    #[test]
+    fn a_live_daemon_with_fresh_server_lock_evidence_is_throttled_not_wedged() {
+        let (state, detail) = classify_roborev(
+            &StatusProbe::TimedOut,
+            evidence_with_lock(Some(true), Some(true), Some(RB_SMALL), Some(true)),
+        );
+        assert_eq!(state, HealthState::Warning, "contention is amber, never blocking: {detail}");
+        let lower = detail.to_ascii_lowercase();
+        assert!(lower.contains("throttled"), "must name the throttle: {detail}");
+        assert!(!lower.contains("genuine wedge"), "a starved read is not a wedge: {detail}");
+        assert!(
+            detail.contains("merges and deploys are unaffected"),
+            "roborev is never blocking: {detail}"
+        );
+        assert!(
+            !prescribes_daemon_restart(&detail),
+            "a restart cannot clear lock contention, and the command is broken here: {detail}"
+        );
+
+        // THE PAIRED NEGATIVE — the SAME evidence with NO lock reading is still the WEDGE verdict.
+        // Without this, the test above also passes for a change that made every alive+small-store
+        // daemon read as throttled, which would withhold the recovery from a real wedge.
+        let (_, wedged) = classify_roborev(
+            &StatusProbe::TimedOut,
+            evidence_with_lock(Some(true), Some(true), Some(RB_SMALL), None),
+        );
+        assert!(
+            wedged.contains("genuine WEDGE"),
+            "no lock evidence must leave main's WEDGE verdict exactly as it was: {wedged}"
+        );
+        // `prescribes_daemon_restart` matches the HARMFUL `roborev daemon` imperative, which main's
+        // verdicts deliberately avoid — so the recovery a real wedge must still receive is the
+        // launchd one, asserted by name.
+        assert!(
+            wedged.contains("launchctl kickstart -k"),
+            "and a real wedge must still be handed its recovery command: {wedged}"
+        );
+        // …and PROVEN-ABSENT evidence is the same as no evidence: still a wedge, never "throttled".
+        let (_, absent) = classify_roborev(
+            &StatusProbe::TimedOut,
+            evidence_with_lock(Some(true), Some(true), Some(RB_SMALL), Some(false)),
+        );
+        assert!(absent.contains("genuine WEDGE"), "Some(false) is not contention: {absent}");
+    }
+
+    /// PRECEDENCE: a BLOATED store outranks lock evidence. The two are not competing diagnoses — a
+    /// growing store is what CAUSES write-lock contention — and SLOW is the arm that names the
+    /// disease and prescribes the compaction that actually fixes it.
+    #[test]
+    fn a_bloated_store_still_reads_slow_even_with_lock_evidence() {
+        let (state, detail) = classify_roborev(
+            &StatusProbe::TimedOut,
+            evidence_with_lock(Some(true), Some(true), Some(RB_BLOATED), Some(true)),
+        );
+        assert_eq!(state, HealthState::Warning, "{detail}");
+        assert!(detail.contains("SLOW, not wedged"), "the store verdict outranks: {detail}");
+        assert!(detail.contains("--compact"), "and still names the real remedy: {detail}");
+        assert!(!prescribes_daemon_restart(&detail), "{detail}");
+    }
+
+    /// A daemon with NO PROCESS is DOWN whatever the log says. Lock evidence must never resurrect a
+    /// dead daemon into "merely throttled" and withhold the start command.
+    #[test]
+    fn lock_evidence_never_overrides_a_missing_process() {
+        let (_, detail) = classify_roborev(
+            &StatusProbe::TimedOut,
+            evidence_with_lock(Some(false), Some(false), Some(RB_SMALL), Some(true)),
+        );
+        assert!(
+            detail.contains("not running"),
+            "no process is DOWN, regardless of stale log contention: {detail}"
+        );
+        assert!(
+            detail.contains("launchctl bootstrap"),
+            "and must still say how to start it: {detail}"
+        );
+    }
 
     /// THE MEASURED PRODUCTION SHAPE (bead `sparkle-4i8kd6`): `roborev status` times out while the
     /// daemon is ALIVE and its store is 860MB. That is SLOW, not wedged — and the old verdict's
