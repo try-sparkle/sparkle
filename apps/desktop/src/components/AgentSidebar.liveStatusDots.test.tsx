@@ -84,8 +84,18 @@ function seed(): Project {
     branchStatus: {},
     // `building_saved` is the committed-but-unlanded stage withUnmergedWork escalates on; `merged`
     // is past it.
+    //
+    // ⚠️ `a4` (the RED row) IS DELIBERATELY *NOT* AT `merged`, and that is a semantic requirement
+    // rather than a tidy-up. `merged` now means PROVEN LANDED, which `engine/landedRedVeto` reads as
+    // "this row's work is on main, so it is finished rather than blocked" and de-reds it. This
+    // fixture originally said `merged` for a4 only to put it past `building_saved`, which a `blocked`
+    // row never needed — `withUnmergedWork` escalates RESTING rows, and `blocked` is not one. So the
+    // stage was incidental to what this block asserts, and stating it as `pushed` makes the fixture
+    // mean what the test has always been about: a GENUINELY blocked row, with work still outstanding,
+    // is RED. The landed case is pinned separately below, where it is the point rather than an
+    // accident.
     workflowStage: {
-      a1: "building_saved", a2: "merged", a3: "merged", a4: "merged",
+      a1: "building_saved", a2: "merged", a3: "merged", a4: "pushed",
     } as Record<string, WorkflowStageId>,
     status: {
       a1: "idle", a2: "idle", a3: "working", a4: "blocked",
@@ -282,6 +292,39 @@ describe("AgentSidebar — the disc colour matches the founder's three-tier rule
     // the founder cannot tell "running" from "idle" from "needs me" at a glance.
     const inks = new Set([dotInk(working), dotInk(idle), dotInk(blocked)]);
     expect(inks.size).toBe(3);
+  });
+
+  // ── AND THE FOURTH TIER THE RULE IMPLIES: RED REQUIRES OUTSTANDING WORK ───────────────────────
+  //
+  // The block above pins "genuinely blocked → RED". This pins the other half of the founder's
+  // sentence — *only a human can unblock it* — for the case where that is no longer true because the
+  // work already SHIPPED. He has repeatedly been handed rows wearing the loudest signal the app has
+  // whose PRs already read MERGED, and a red that fires on finished rows is how red stops meaning
+  // anything.
+  //
+  // Asserted at the RENDERED DISC rather than at `landedRedVetoFor`, deliberately: the predicate has
+  // its own unit tests, and what those cannot witness is whether the overlay is actually WIRED into
+  // the chain this column paints from. That distinction is not hypothetical here — the sibling
+  // dead-session overlay was correct, thoroughly unit-tested, and absent from this very chain for
+  // months, so every one of its tests passed while the dot stayed red.
+  it("a BLOCKED row whose work is already merged is NOT red — red means work is still outstanding", () => {
+    const project = seed();
+    // The ONLY change from the seed: a4's work is now proven landed. Same status, same everything
+    // else — so a difference in the disc can only come from the landing.
+    useRuntimeStore.setState({
+      workflowStage: {
+        a1: "building_saved", a2: "merged", a3: "merged", a4: "merged",
+      } as Record<string, WorkflowStageId>,
+    } as never);
+    render(<AgentSidebar project={project} />);
+
+    // Same selector `dotOfRow` uses in the block below — the row's own leading disc, read through
+    // `dotInk` rather than off `style.background`, because a ring variant paints the colour into
+    // `boxShadow` instead (that helper's docblock records the trap).
+    const disc = rowFor("Blocked").querySelector<HTMLElement>("span[title]")!;
+    expect(dotInk(disc)).not.toBe(expectedDotColor("blocked"));
+    // …and it lands in the calm terminal tier rather than some third colour of its own.
+    expect(dotInk(disc)).toBe(expectedDotColor("done"));
   });
 
   it("no filter dims the working OR the blocked disc — live signal and alarm both survive", () => {

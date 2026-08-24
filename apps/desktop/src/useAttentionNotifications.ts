@@ -65,6 +65,7 @@ import { hasLiveBackgroundTasksForAgent } from "./services/backgroundTaskRegistr
 import { withUnmergedWork } from "./engine/unmergedAttention";
 import { withNewAgentCalm } from "./engine/newAgentAttention";
 import { withDeadSessionCalm } from "./engine/deadSessionAttention";
+import { withLandedRedVeto } from "./engine/landedRedVeto";
 import { deathCauseForAgent } from "./services/deadSessionRegistry";
 import { isHumanBlockedIn, type NudgeFlagSnapshot } from "./services/humanBlockFor";
 import { nudgeFlagsSnapshot } from "./services/authRecovery";
@@ -391,15 +392,27 @@ function composeRollup(
   // against. `engine/observedAttention.ts` carries the current contract; read it there rather than
   // trusting a restatement here.
   const observedCorrected = withObservedAttention(agents, status, observed, (id) => openIds.has(id));
-  const calm = withBackgroundTaskGreen(
-    agents,
-    withDeadSessionCalm(
-      agents,
-      withNewAgentCalm(agents, observedCorrected, now, interaction),
-      deathCauseOf,
-    ),
-    hasBackgroundTasksOf,
-  );
+  // (0b-ii) is the landed veto, and it sits INSIDE this expression rather than beside it so the two
+  // chains apply it at the same point — `hooks/useOverlaidStatus` runs it in the identical slot,
+  // between the dead-session calm and the background-task green. That symmetry is the whole lesson
+  // of `withDeadSessionCalm`, which lived HERE and nowhere else for its entire life: the dock badge
+  // read a 529-killed agent as amber while the Build row painted it red, and no test could see it
+  // because both maps `publishedRollupAgreement` compares come out of this one function.
+  // `engine/observedAttentionChainParity` now guards the position of both.
+  // ⚠️ SEQUENTIAL BINDINGS, NOT NESTED CALLS, AND THAT IS NOT A STYLE PREFERENCE. Nested, this
+  // composed inside-out: the step written FIRST ran LAST, so reading order and evaluation order
+  // disagreed. That is not a hypothetical readability complaint — the omission this chain is famous
+  // for (withDeadSessionCalm present here and absent from the sidebar for months) lived inside
+  // exactly such an expression, and `observedAttentionChainParity` cannot compare two chains'
+  // ordering by source position while one of them is written backwards. Flattened, each step reads
+  // in the order it runs and matches `hooks/useOverlaidStatus` line for line.
+  const calmNew = withNewAgentCalm(agents, observedCorrected, now, interaction);
+  // (0b) a session the app is about to restart is amber, never red.
+  const calmDead = withDeadSessionCalm(agents, calmNew, deathCauseOf);
+  // (0b-ii) a row whose work is proven landed is finished, not blocked.
+  const calmLanded = withLandedRedVeto(agents, calmDead, stageOf);
+  // (0c) green while delegating.
+  const calm = withBackgroundTaskGreen(agents, calmLanded, hasBackgroundTasksOf);
   // (1)+(2): the two worker-attention bubbles. Kept as its own binding because the rollup below
   // needs exactly this map — pre-unmerged, pre-dismissal — to answer "is this parent in motion?" and
   // "which reds has the user dismissed?".
