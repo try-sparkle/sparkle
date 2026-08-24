@@ -569,6 +569,17 @@ fn install_git_blocking(_app: &AppHandle) -> Result<GitInstallResult, String> {
 /// The label for the roborev launchd LaunchAgent (also the plist basename stem).
 const ROBOREV_DAEMON_LABEL: &str = "co.plow.roborev-daemon";
 
+/// launchd `ThrottleInterval` for the roborev daemon, in seconds. This is a BACK-OFF for the
+/// crash-loop case, and inert otherwise: `ThrottleInterval` only delays a RESPAWN when the job
+/// exited within the interval, so a healthy daemon (uptime measured in hours) is never throttled,
+/// while a daemon that cannot start — e.g. a second launchd copy that can never bind the port
+/// because a foreign process already owns it (sparkle-u9epsg) — is respawned at most once every
+/// this-many seconds instead of hot-looping every ~90s. Each doomed attempt opens the ~900MB
+/// `reviews.db` for ~20s before discovering the port is taken, so the interval directly caps that
+/// write-heavy DB-open rate and the SQLITE_BUSY pressure it puts on the workers already contending
+/// on the store. 300s recovers within five minutes once the foreign owner exits, without hot-looping.
+const ROBOREV_DAEMON_THROTTLE_SECS: u32 = 300;
+
 /// The published (asset filename, pinned sha256) for an (os, arch) pair, or None when no asset is
 /// published for that target. At v0.1 ONLY Apple Silicon macOS ships an asset; Intel/darwin-x64 has
 /// none (so the UI surfaces a clean "Apple Silicon only" error rather than downloading a 404). `os`
@@ -626,7 +637,9 @@ pub fn daemon_path_env(home: &Path) -> String {
 }
 
 /// Generate the launchd LaunchAgent plist for the roborev daemon. `ProgramArguments` runs
-/// `<roborev> daemon run`; `RunAtLoad`+`KeepAlive` keep it alive across logout/reboot. The
+/// `<roborev> daemon run`; `RunAtLoad`+`KeepAlive` keep it alive across logout/reboot, and
+/// `ThrottleInterval` (see [`ROBOREV_DAEMON_THROTTLE_SECS`]) backs a crash-looping copy off instead
+/// of hot-looping it. The
 /// `EnvironmentVariables → PATH` comes from [`daemon_path_env`]. Pure (takes the roborev path +
 /// home explicitly) — unit-tested.
 pub fn roborev_daemon_plist(roborev_path: &str, home: &Path) -> String {
@@ -649,6 +662,8 @@ pub fn roborev_daemon_plist(roborev_path: &str, home: &Path) -> String {
     <true/>
     <key>KeepAlive</key>
     <true/>
+    <key>ThrottleInterval</key>
+    <integer>{ROBOREV_DAEMON_THROTTLE_SECS}</integer>
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
@@ -1796,6 +1811,11 @@ cccc3333  node-v22.12.0-darwin-x64.tar.gz
         // RunAtLoad + KeepAlive so the daemon survives logout/reboot.
         assert!(plist.contains("<key>RunAtLoad</key>\n    <true/>"));
         assert!(plist.contains("<key>KeepAlive</key>\n    <true/>"));
+        // ThrottleInterval so a copy that can never start (sparkle-u9epsg: a foreign process
+        // already owns the port) backs off instead of hot-looping every ~90s.
+        assert!(plist.contains(&format!(
+            "<key>ThrottleInterval</key>\n    <integer>{ROBOREV_DAEMON_THROTTLE_SECS}</integer>"
+        )));
         // A NORMAL user PATH, with Sparkle's account-selecting shim ahead of it so roborev's
         // `claude` lookup can be pointed at a healthy account per review job.
         assert!(plist.contains(
@@ -1817,6 +1837,32 @@ cccc3333  node-v22.12.0-darwin-x64.tar.gz
         let plist = roborev_daemon_plist("/Users/a&b/.local/bin/roborev", std::path::Path::new("/Users/a&b"));
         assert!(plist.contains("/Users/a&amp;b/.local/bin/roborev"));
         assert!(!plist.contains("a&b/.local")); // the raw ampersand must be gone
+    }
+
+    #[test]
+    fn roborev_daemon_plist_throttles_the_crash_loop() {
+        // sparkle-u9epsg: when a foreign process owns 127.0.0.1:7373, the launchd copy can never
+        // bind and KeepAlive respawns it forever, each doomed attempt opening the ~900MB reviews.db
+        // for ~20s. A ThrottleInterval caps that respawn rate. This asserts the SIDE EFFECT of the
+        // fix (the back-off is actually present in the generated plist), not just that a key exists:
+        // the value must be a real, non-trivial back-off, so both deleting the key and shrinking it
+        // toward launchd's ~10s hot-loop floor turn this red.
+        let plist = roborev_daemon_plist(
+            "/Users/x/.local/bin/roborev",
+            std::path::Path::new("/Users/x"),
+        );
+        assert!(
+            plist.contains(&format!(
+                "<key>ThrottleInterval</key>\n    <integer>{ROBOREV_DAEMON_THROTTLE_SECS}</integer>"
+            )),
+            "plist must carry the ThrottleInterval back-off: {plist}"
+        );
+        // A meaningful back-off, not launchd's default ~10s (which is effectively still hot-looping
+        // against a 20s-per-attempt DB open). 60s+ is the floor that makes this a real relief.
+        assert!(
+            ROBOREV_DAEMON_THROTTLE_SECS >= 60,
+            "ThrottleInterval {ROBOREV_DAEMON_THROTTLE_SECS}s is too short to relieve the crash loop"
+        );
     }
 
     #[test]
