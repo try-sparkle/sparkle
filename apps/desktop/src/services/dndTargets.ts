@@ -136,12 +136,21 @@ export function dragPositionScale(position?: { x: number; y: number }): number {
   return /Windows/i.test(navigator.userAgent || "") ? dpr : 1;
 }
 
-/** True when the drag position (as Tauri reports it) is over an element inside the named target. */
+/** True when the drag position (as Tauri reports it) resolves to the named target — and to NO more
+ *  specific one nested inside it. `closest()` walks ANCESTORS, so `[data-dnd-target="${target}"]`
+ *  matched an OUTER target even when a nested, more-specific one sat between the point and it: a
+ *  single point inside the Sparkle pane's terminal (which renders INSIDE the workspace terminal
+ *  stage) satisfied BOTH `sparkle-terminal` and `terminal-stage`, so one drop was claimed by two
+ *  hooks and pasted into two agents' terminals — the founder's file landing in an agent it was
+ *  never dropped on (sparkle-xnjspc). Resolving to the INNERMOST marked target instead gives every
+ *  drop exactly one owner: the nearest one, which is the one the user aimed at. */
 export function isOverDndTarget(position: { x: number; y: number }, target: string): boolean {
   const scale = dragPositionScale(position);
   // Optional call: jsdom lacks elementFromPoint — tests stub it; real webviews always have it.
   const el = document.elementFromPoint?.(position.x / scale, position.y / scale);
-  return !!el?.closest(`[data-dnd-target="${target}"]`);
+  // The FIRST data-dnd-target walking up from the point — a nested target SHADOWS its ancestors — so
+  // this is true only for the one target that actually owns the pixel, never for an outer container.
+  return el?.closest("[data-dnd-target]")?.getAttribute("data-dnd-target") === target;
 }
 
 /** Surfaces a window-global listener must stand DOWN over, because something else owns the drop.

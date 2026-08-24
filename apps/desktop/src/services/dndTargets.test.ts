@@ -19,6 +19,7 @@ import {
   FILE_DROP_TARGETS,
   NEW_BUILD_AGENT_DND_TARGET,
   SPARKLE_TERMINAL_DND_TARGET,
+  TERMINAL_STAGE_DND_TARGET,
   dragPositionScale,
   isOverDndTarget,
   isOverFileDropTarget,
@@ -191,6 +192,30 @@ describe("isOverDndTarget", () => {
 
   it("does not match a DIFFERENT target under the cursor", () => {
     expect(isOverDndTarget(at(100), NEW_BUILD_AGENT_DND_TARGET)).toBe(false);
+  });
+
+  // THE DOUBLE-DROP (sparkle-xnjspc). The Sparkle pane's terminal renders INSIDE the workspace
+  // stage, so a point inside it has TWO marked ancestors. `closest()` walks up, so the old
+  // `[data-dnd-target="${target}"]` matched the OUTER stage too — one drop was claimed by both the
+  // build agent's hook and the Sparkle pane's and pasted into two terminals. A point must resolve to
+  // its INNERMOST marked target and to that one only.
+  it("resolves to the INNERMOST target and does NOT also claim an outer container", () => {
+    const stage = document.createElement("div");
+    stage.setAttribute("data-dnd-target", TERMINAL_STAGE_DND_TARGET);
+    const sparkle = document.createElement("div");
+    sparkle.setAttribute("data-dnd-target", SPARKLE_TERMINAL_DND_TARGET);
+    const point = document.createElement("span"); // the cursor is over a child, not the marked root
+    sparkle.append(point);
+    stage.append(sparkle);
+    document.body.append(stage);
+    document.elementFromPoint = vi.fn(() => point) as unknown as typeof document.elementFromPoint;
+    try {
+      expect(isOverDndTarget(at(1), SPARKLE_TERMINAL_DND_TARGET)).toBe(true);
+      // The outer stage is a real ancestor of the point, yet must NOT claim it — the inner wins.
+      expect(isOverDndTarget(at(1), TERMINAL_STAGE_DND_TARGET)).toBe(false);
+    } finally {
+      stage.remove();
+    }
   });
 
   it("is false over nothing at all (the terminal)", () => {

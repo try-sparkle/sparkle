@@ -304,6 +304,59 @@ describe("a pane that names its own drop region", () => {
   });
 });
 
+// THE DOUBLE-DROP (sparkle-xnjspc). The Sparkle pane's terminal renders INSIDE the workspace stage,
+// and both panes' hooks are live at once. `closest()` walks ancestors, so a point inside the nested
+// sparkle-terminal used to satisfy the OUTER stage's hit test too — Tauri fanned the ONE drop to
+// both handlers, and the paths were typed into TWO agents' terminals, including the Improve-Sparkle
+// agent the user never dropped on. This asserts the SIDE EFFECT: exactly one agent's PTY is written.
+describe("a drop on a NESTED terminal target reaches exactly one agent", () => {
+  // The real DOM nesting: sparkle-terminal is a descendant of the workspace stage.
+  const nestedSparkleEl = document.createElement("div");
+  nestedSparkleEl.setAttribute("data-dnd-target", SPARKLE_TERMINAL_DND_TARGET);
+  const innerPoint = document.createElement("span"); // the cursor is over a child, not the root
+  nestedSparkleEl.appendChild(innerPoint);
+
+  function SparklePane() {
+    useTerminalDrop(true, "sparkle-self", undefined, SPARKLE_TERMINAL_DND_TARGET);
+    return null;
+  }
+
+  beforeEach(() => {
+    stageEl.appendChild(nestedSparkleEl);
+    document.elementFromPoint = vi.fn(() => innerPoint); // the point lands inside the nested region
+  });
+  afterEach(() => nestedSparkleEl.remove());
+
+  it("the INNER target's predicate claims it while the OUTER stage's stands down", () => {
+    // The precedence at the exact seam both hooks branch on: the nested region wins the point.
+    expect(isTerminalDropPosition(at, SPARKLE_TERMINAL_DND_TARGET)).toBe(true);
+    expect(isTerminalDropPosition(at, TERMINAL_STAGE_DND_TARGET)).toBe(false);
+  });
+
+  it("pastes into ONLY the inner agent — never the outer stage's build agent too", async () => {
+    // Both panes are visible and BOTH register a live handler; render order puts the build agent's
+    // at index 0 and the Sparkle pane's at index 1, and Tauri fans a single drop to both. Before the
+    // fix the outer stage's hook ALSO matched (closest walked past the nested target up to the
+    // stage) and wrote the same bytes into the build agent. The assertion that goes red on the old
+    // code is `pastedInto("build-agent") === []` — and paste called once rather than twice.
+    render(
+      <>
+        <Pane agentId="build-agent" visible />
+        <SparklePane />
+      </>,
+    );
+    expect(captured.handlers).toHaveLength(2); // both panes' handlers are live with Tauri
+
+    const paths = ["/tmp/notes.md"];
+    await fireAt({ type: "drop", position: at, paths }, 0); // the build agent's stage handler
+    await fireAt({ type: "drop", position: at, paths }, 1); // the Sparkle pane's handler
+
+    expect(pastedInto("sparkle-self")).toEqual(["/tmp/notes.md "]);
+    expect(pastedInto("build-agent")).toEqual([]); // the stage no longer claims the nested drop
+    expect(captured.paste).toHaveBeenCalledTimes(1); // exactly one agent, exactly once
+  });
+});
+
 describe("resolving to the VISIBLE pane", () => {
   it("a background pane never listens, so it can never claim the drop", async () => {
     // Both panes stay MOUNTED and stacked at the same coordinates (Workspace keeps them alive so a
