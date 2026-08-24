@@ -340,13 +340,94 @@ mod updater_quit {
     /// Mark the exit we are about to make ourselves as sanctioned. Call IMMEDIATELY before the
     /// `exit(0)` it describes — anything between the two is a window in which a real user quit
     /// would be let through mid-install.
+    ///
+    /// IT IS A ONE-WAY LATCH, so only an exit whose safety is DECIDED may set it, and exactly two
+    /// are: the webview's `resume_exit_after_update` (the install is over — that is the message)
+    /// and the watchdog's LONG phase (the install had its full budget and never came back). An exit
+    /// taken merely because nothing had started yet is NOT decided — see `run_exit_watchdog`.
     pub fn note_resuming() {
         RESUMING.store(true, Ordering::SeqCst);
+    }
+
+    /// THE DEFERRAL WATCHDOG'S WHOLE SEQUENCE, with the two effects it cannot own injected.
+    ///
+    /// WHY IT IS SHAPED LIKE THIS. The safety this module adds is not a property of any one
+    /// predicate — it is a property of the ORDER in which these are called, and that ordering was
+    /// covered by nothing: deleting a `note_resuming()` left every test in the crate green while a
+    /// real quit silently stopped being protected. A `tauri::AppHandle` cannot be constructed in a
+    /// unit test, so a closure is where the boundary has to be: `run()` supplies a real sleep and a
+    /// real `handle.exit(0)`; the test supplies fakes and asserts the SIDE EFFECTS — did an exit
+    /// happen, and would a user's second ⌘Q arriving at that instant have been held?
+    ///
+    /// PHASE 1 DELIBERATELY SANCTIONS NOTHING, and that is the fix rather than an omission.
+    /// It used to call `note_resuming()` before its `exit(0)`, which is a claim it is not entitled
+    /// to make: `handle.exit(0)` only POSTS `Message::RequestExit` to the main event loop, while
+    /// the webview's ack and its `Update.install()` run on tauri worker threads. An ack landing
+    /// just after the 5s boundary — precisely the case phase 1 exists for — means the queued exit
+    /// is dispatched with a bundle swap in progress, and the one-way `RESUMING` latch waved it
+    /// straight through `hold_second_exit`: /Applications/Sparkle.app deleted between
+    /// `install_inner`'s `remove_dir_all` and its final rename, by the very line whose comment
+    /// claimed the hold required it.
+    ///
+    /// No sanction is needed, because `hold_second_exit` requires `INSTALL_STARTED`: while that
+    /// stays false this exit cannot be caught, and if it flips in the gap then being caught is
+    /// exactly right. So the read-then-act is not made atomic — the transition is REMOVED, which is
+    /// strictly stronger than making it atomic would have been.
+    ///
+    /// AND PHASE 1 DOES NOT RETURN. If the gap above happens, its exit is HELD, and this thread is
+    /// the only thing that would ever release it — returning here would leave an app that cannot
+    /// quit, the one outcome this module rates worse than a missed update. So it falls through to
+    /// the long budget and becomes that releaser. If the exit did go through, the process is gone
+    /// and the sleep below never finishes.
+    pub fn run_exit_watchdog(sleep_ms: &mut dyn FnMut(u64), exit: &mut dyn FnMut()) {
+        // Phase 1 — did the webview even answer? If not, nothing is installing and killing the
+        // process is safe.
+        sleep_ms(ACK_BUDGET_MS);
+        if !install_started() {
+            tracing::warn!("the webview never started the staged install; exiting without updating");
+            exit();
+        }
+        // Phase 2 — an install IS running (or started in the gap above, and our exit is being
+        // held). Give it room, because exiting between its remove_dir_all and its rename would
+        // leave /Applications/Sparkle.app deleted.
+        sleep_ms(INSTALL_BUDGET_MS);
+        tracing::warn!("the staged install never reported back; exiting anyway");
+        note_resuming();
+        exit();
+    }
+
+    /// The webview reporting it is done with the staged update, as a SEQUENCE rather than two
+    /// statements at a call site: sanction, then exit. Same reason as `run_exit_watchdog` — the
+    /// order is the safety property, and the `AppHandle` in `resume_exit_after_update` is what kept
+    /// it out of every test.
+    pub fn resume_now(exit: &mut dyn FnMut()) {
+        tracing::info!("webview finished with the staged update; resuming exit");
+        // Announce the sanctioned exit BEFORE requesting it: this `exit(0)` re-enters
+        // `ExitRequested`, where `hold_second_exit` would otherwise treat it exactly like a user's
+        // second ⌘Q and prevent it — an app that can never quit.
+        note_resuming();
+        exit();
     }
 
     #[cfg(test)]
     mod tests {
         use super::*;
+        use std::cell::{Cell, RefCell};
+
+        /// ONE ORDERED LOG OF BOTH INJECTED EFFECTS, because the property under test is their
+        /// INTERLEAVING and separate collectors cannot see it (roborev 67452).
+        ///
+        /// The first version of these cases recorded sleeps into a `Vec<u64>` and exits into a
+        /// `usize`. Nothing then related the two, so hoisting BOTH sleeps to the top of
+        /// `run_exit_watchdog` — destroying the two-phase structure altogether — left every
+        /// assertion green: `slept[0] == ACK_BUDGET_MS` still held, `exits >= 1` still held, and a
+        /// wedged webview would have cost the user 125s of apparently-hung app instead of 5s. The
+        /// two-phase shape IS the feature, so the test has to be able to see it.
+        #[derive(Debug, PartialEq, Eq)]
+        enum Ev {
+            Slept(u64),
+            Exited,
+        }
 
         /// ONE test drives the whole sequence deliberately, and every new case belongs IN it:
         /// these are process-wide statics and cargo runs tests in parallel threads, so a second
@@ -420,6 +501,138 @@ mod updater_quit {
                 !hold_second_exit(),
                 "an exit may only be held while something is on the hook to release it"
             );
+
+            // ── THE SEQUENCING, not just the predicates ──────────────────────────────────────
+            // Everything above tests what the flags MEAN. Everything below drives the real
+            // `run()` sequences through their injected-effect seams, because the property this
+            // module actually adds is the ORDER of those calls — and deleting a `note_resuming()`
+            // used to leave the entire crate green while a real quit stopped being protected.
+            // Every assertion is a side effect: did an exit happen, and would a user's ⌘Q landing
+            // at that instant have been HELD or let through?
+
+            // THE SANCTIONED RESUME. The webview says the install is over; that exit must pass, or
+            // the app can never be quit.
+            reset_for_test();
+            note_staged(true);
+            assert!(should_defer_exit(true));
+            note_install_started();
+            assert!(hold_second_exit(), "a user's second ⌘Q mid-swap is held — the setup for the case below");
+            let mut resume_exits = 0usize;
+            let mut held_at_resume: Option<bool> = None;
+            resume_now(&mut || {
+                resume_exits += 1;
+                held_at_resume = Some(hold_second_exit());
+            });
+            assert_eq!(resume_exits, 1, "the resume must actually request the exit");
+            assert_eq!(
+                held_at_resume,
+                Some(false),
+                "MUTATION: delete `note_resuming()` from `resume_now`. The resume's own exit is then                  caught by `hold_second_exit` and only the 120s phase-2 timeout releases it — an app                  that will not quit, which this module rates worse than a missed update."
+            );
+
+            // THE WEBVIEW NEVER ANSWERED. Nothing on disk was touched, so the short phase exits —
+            // and it does NOT return, because if the ack lands in the gap (next case) this thread
+            // is the only thing that would ever release the exit it just requested.
+            reset_for_test();
+            note_staged(true);
+            assert!(should_defer_exit(true));
+            let log = RefCell::new(Vec::<Ev>::new());
+            run_exit_watchdog(
+                &mut |ms| log.borrow_mut().push(Ev::Slept(ms)),
+                &mut || log.borrow_mut().push(Ev::Exited),
+            );
+            // ONE assertion, and it pins the whole shape: the SHORT budget comes first, the user
+            // gets their quit out of a wedged webview at that boundary rather than 125s later, and
+            // the thread does not stop there.
+            assert_eq!(
+                *log.borrow(),
+                vec![
+                    Ev::Slept(ACK_BUDGET_MS),
+                    Ev::Exited,
+                    Ev::Slept(INSTALL_BUDGET_MS),
+                    Ev::Exited,
+                ],
+                "MUTATION: hoist both sleeps to the top of `run_exit_watchdog`, so it has no                  two-phase structure at all. A wedged webview then costs the user 125s of an                  apparently-hung app instead of 5s. Separate `slept`/`exits` collectors could not                  see that at all — the ORDER is the property, so the log has to be ordered."
+            );
+
+            // THE FINDING (roborev 67425). The short phase decided to abandon because nothing had
+            // started — and then the ack lands while its exit is still only a QUEUED
+            // `Message::RequestExit` on a contended main loop (the webview's ack and its
+            // `Update.install()` run on tauri worker threads; `handle.exit(0)` merely posts). What
+            // the main loop must decide when it finally dispatches that request is HOLD.
+            reset_for_test();
+            note_staged(true);
+            assert!(should_defer_exit(true));
+            let log = RefCell::new(Vec::<Ev>::new());
+            let held_when_the_queued_exit_lands = Cell::new(None::<bool>);
+            run_exit_watchdog(
+                &mut |ms| log.borrow_mut().push(Ev::Slept(ms)),
+                &mut || {
+                    let first = {
+                        let mut l = log.borrow_mut();
+                        l.push(Ev::Exited);
+                        l.iter().filter(|e| **e == Ev::Exited).count() == 1
+                    };
+                    if first {
+                        // The install starts between our exit REQUEST and its dispatch.
+                        note_install_started();
+                        held_when_the_queued_exit_lands.set(Some(hold_second_exit()));
+                    }
+                },
+            );
+            assert_eq!(
+                held_when_the_queued_exit_lands.get(),
+                Some(true),
+                "MUTATION: restore the `note_resuming()` the short phase used to call before its                  `exit(0)`. That one-way latch waves the queued exit through mid-swap and the                  process dies between `install_inner`'s remove_dir_all and its final rename —                  /Applications/Sparkle.app DELETED, by the line whose comment claimed the hold                  required it."
+            );
+            assert_eq!(
+                *log.borrow(),
+                vec![
+                    Ev::Slept(ACK_BUDGET_MS),
+                    Ev::Exited,
+                    Ev::Slept(INSTALL_BUDGET_MS),
+                    Ev::Exited,
+                ],
+                "MUTATION: restore the `return` after the short phase's exit. That exit is now HELD                  (previous assertion), and this thread is the only thing that would release it —                  returning leaves an app that cannot be quit at all. Asserted as ONE ORDERED LOG                  rather than a sleep list plus an exit count, so that a `run_exit_watchdog` with no                  phase boundary left in it cannot satisfy this."
+            );
+            assert!(
+                !hold_second_exit(),
+                "and that second exit passes, or the hold is never released"
+            );
+        }
+
+        /// The one part of the sequence a unit test CANNOT execute: `has_webview` is derived from a
+        /// live `tauri::AppHandle`, which cannot be constructed here. So it is pinned against
+        /// `lib.rs`'s own bytes instead — honestly weaker than driving it, and named as such rather
+        /// than dressed up as coverage.
+        ///
+        /// It fails on exactly the edit that matters: passing a literal `true` restores the
+        /// last-window-destroyed bug (an exit deferred for a webview that is already gone, so the
+        /// emit reaches zero listeners, nothing ever acks, and a windowless process hangs for the
+        /// whole ack budget installing nothing).
+        #[test]
+        fn the_exit_arm_asks_whether_a_webview_is_still_there() {
+            const LIB_RS: &str = include_str!("lib.rs");
+            // EVERY NEEDLE IS ASSEMBLED AT RUNTIME. A test that greps the file it lives in
+            // otherwise matches its OWN literal: the positive assertions would be satisfied by
+            // this very function and the negative one would be defeated by it — three assertions
+            // that cannot fail, in the file about vacuous tests. Split so no assembled needle
+            // appears verbatim anywhere in the source.
+            let derives_it = format!("let has_webview = !app.{}().is_empty();", "webview_windows");
+            let passes_it = format!("updater_quit::should_defer_exit({})", "has_webview");
+            let hardcodes_it = format!("updater_quit::should_defer_exit({})", "true");
+            assert!(
+                LIB_RS.contains(&derives_it),
+                "the ExitRequested arm must derive `has_webview` from the live window map"
+            );
+            assert!(
+                LIB_RS.contains(&passes_it),
+                "...and pass THAT to should_defer_exit"
+            );
+            assert!(
+                !LIB_RS.contains(&hardcodes_it),
+                "a literal `true` there defers exits for a webview that is already gone"
+            );
         }
 
         /// The short phase must stay short and the long phase must stay long — inverting them would
@@ -472,12 +685,9 @@ fn note_update_install_started() {
 /// the exit proceeds; the frontend calls this in a `finally`.
 #[tauri::command]
 fn resume_exit_after_update(app: tauri::AppHandle) {
-    tracing::info!("webview finished with the staged update; resuming exit");
-    // Announce the sanctioned exit BEFORE requesting it: this `exit(0)` re-enters `ExitRequested`,
-    // where `hold_second_exit` would otherwise treat it exactly like a user's second ⌘Q and
-    // prevent it — an app that can never quit.
-    updater_quit::note_resuming();
-    app.exit(0);
+    // The sanction-then-exit ORDER lives in `resume_now`, where a test can drive it. This line is
+    // only the `AppHandle` binding — the part no unit test can construct.
+    updater_quit::resume_now(&mut || app.exit(0));
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -1633,32 +1843,16 @@ pub fn run() {
                             );
                             let handle = app.clone();
                             std::thread::spawn(move || {
-                                // Phase 1 — did the webview even answer? If not, nothing is
-                                // installing and killing the process is safe.
-                                std::thread::sleep(std::time::Duration::from_millis(
-                                    updater_quit::ACK_BUDGET_MS,
-                                ));
-                                if !updater_quit::install_started() {
-                                    tracing::warn!(
-                                        "the webview never started the staged install; exiting without updating"
-                                    );
-                                    // Sanctioned exit — say so first or `hold_second_exit` would
-                                    // prevent the very timeout that exists to un-wedge the quit.
-                                    updater_quit::note_resuming();
-                                    handle.exit(0);
-                                    return;
-                                }
-                                // Phase 2 — an install IS running. Give it room, because exiting
-                                // between its remove_dir_all and its rename would leave
-                                // /Applications/Sparkle.app deleted.
-                                std::thread::sleep(std::time::Duration::from_millis(
-                                    updater_quit::INSTALL_BUDGET_MS,
-                                ));
-                                tracing::warn!(
-                                    "the staged install never reported back; exiting anyway"
+                                // The two-phase sequence lives in `run_exit_watchdog`, which a test
+                                // drives with fake effects: the ORDER of its calls IS the safety
+                                // property, and it used to be covered by nothing. Supplied here are
+                                // only the two things it cannot own.
+                                updater_quit::run_exit_watchdog(
+                                    &mut |ms| {
+                                        std::thread::sleep(std::time::Duration::from_millis(ms))
+                                    },
+                                    &mut || handle.exit(0),
                                 );
-                                updater_quit::note_resuming();
-                                handle.exit(0);
                             });
                         }
                         Err(e) => tracing::warn!(
