@@ -1730,6 +1730,83 @@ export async function sendControlKey(
 // after each write and reports what it actually found. A truthful "still in full-screen mode after
 // both keys" is the useful answer there; looping or claiming success is not.
 
+// ══ GATE 5 EXISTS BECAUSE THE OTHER FOUR ARE ALL NEGATIVE (roborev 68359, High) ═══════════════
+//
+// Gates 1-4 establish "not Claude Code, not answerable, not a plan surface". NONE of them
+// establishes that the alternate screen is a PAGER — and the first version of this op shipped with
+// exactly that hole. Every other full-screen program passes all four, and the dangerous family is
+// FULL-SCREEN EDITORS, where `q` is not a quit key at all but A CHARACTER INSERTED INTO THE FILE.
+//
+// The concrete failure, and it is live in this repo: an agent runs `git commit` or `roborev comment`
+// with no `-m`, `$EDITOR` opens `nano` (or vim already in insert mode) on the alternate buffer.
+// `isClaudeCodeScreen` is false, `screenOffersAnswer` is false — nano's `^X Exit` footer is neither
+// a picker block nor a `(y/n)` prompt — and it is no plan surface. So the op pressed `q`, which nano
+// INSERTED INTO THE COMMIT MESSAGE, then escalated to ctrl+c. It then reported `still-alternate`,
+// which reads to the caller as a harmless no-op, while the agent's file had silently gained a `q`.
+//
+// So the gate is POSITIVE: prove it is a pager before writing, and REFUSE when the evidence is
+// absent. That direction is the safe one — a false refusal costs a human pressing `q` in a pane,
+// a false accept corrupts a file nobody is watching. It also strictly SHRINKS the write set, so the
+// subset invariant against `dispatchConciergeAnswer` still holds a fortiori.
+
+/** The status row a pager leaves on the last line. Anchored to that ROW, the way `hasLiveDialog`
+ *  anchors to the grid terminator, because these tokens are unremarkable in body text and only mean
+ *  "pager" in the position a pager puts them. */
+const PAGER_STATUS_ROW: RegExp[] = [
+  /^\(END\)$/,                       // less, at EOF
+  /^:$/,                             // less's own prompt, waiting for a command
+  /^--More--(\(\d+%\))?$/,           // more(1)
+  /\blines?\s+\d+([-–]\d+)?\/\d+/, // less -M: "lines 1-40/1061"
+  /\bbyte\s+\d+/,                   // less -M: "byte 1234"
+  /^\S.*\s\d{1,3}%$/,                // a trailing percentage — less's default -m ruler
+  /\(press h for help or q to quit\)/, // man(1)
+  /^Manual page\b.*\bline\s+\d+/,   // man(1), long form
+];
+
+/** Full-screen EDITOR chrome. A denylist beside the allowlist above, and deliberately redundant:
+ *  the allowlist's weakest arm is the bare filename `less` prints when it has not been scrolled, and
+ *  a bare filename is exactly what an editor's ruler starts with too. This is what separates them.
+ *
+ *  Measured on the captured fixtures, which differ ONLY in their last row:
+ *      less →  `AGENTS.md`
+ *      vim  →  `"AGENTS.md" 1061L, 78092B`
+ *  so the quoted-name-plus-size ruler is the discriminator, not the filename. */
+const EDITOR_CHROME: RegExp[] = [
+  /"[^"]+"\s+\d+L,\s*\d+B/,          // vim's opening ruler
+  /^\s*--\s*(INSERT|VISUAL|REPLACE)\b/im, // vim modes — where `q` is literally typed into the file
+  /\^[GOXKWV]\s+(Get Help|WriteOut|Write Out|Exit|Cut|Where Is)/, // nano / pico footer
+  /^-[-U*:]{2,}.*\s\(.*\)\s*$/m,      // emacs mode line, e.g. `-UUU:----F1  file  (Text)`
+  /\bNORMAL\b.*\b\d+:\d+\b/,        // helix / kakoune style mode + cursor ruler
+];
+
+/** The last non-empty row of the screen — where every pager puts its status line. */
+function lastNonEmptyRow(text: string): string {
+  const rows = text.split("\n");
+  for (let i = rows.length - 1; i >= 0; i--) {
+    const row = rows[i]!.trim();
+    if (row) return row;
+  }
+  return "";
+}
+
+/** Is there POSITIVE evidence this alternate screen is a pager?
+ *
+ *  Two conditions, and the denylist is checked over the WHOLE screen rather than just the status
+ *  row: vim's `-- INSERT --` sits on the last row, but its opening ruler can be scrolled off while
+ *  the buffer is still an editor, and emacs' mode line is not the final row when the minibuffer is
+ *  in use. Refusing on editor chrome ANYWHERE is the conservative reading, and conservative is the
+ *  correct direction for a gate whose false-accept corrupts a file. */
+export function looksLikePager(text: string): boolean {
+  if (EDITOR_CHROME.some((re) => re.test(text))) return false;
+  const status = lastNonEmptyRow(text);
+  if (!status) return false;
+  if (PAGER_STATUS_ROW.some((re) => re.test(status))) return true;
+  // The weak arm, reachable only because the editor denylist above already ran: `less` opened on a
+  // file and not yet scrolled prints the BARE FILENAME and nothing else. One token, no spaces, and
+  // a file-ish shape — anything wordier is prose, not a status row.
+  return /^[\w.@+-]+(\/[\w.@+-]+)*$/.test(status) && /[./]/.test(status) && status.length <= 120;
+}
+
 /** The keys this op may press, in the order it presses them. NOT added to `CONTROL_KEYS`: the whole
  *  safety argument above is that `q` is reachable ONLY through this gate. A `q` in the freely
  *  pressable enum could land in a permission prompt, which is the thing we are protecting. */
@@ -1765,6 +1842,9 @@ export type QuitAlternateScreenRefusal =
   | "offers-an-answer"
   /** Gate 4 — a plan-mode / plan-exit surface, the one we have live evidence of. */
   | "plan-mode-surface"
+  /** Gate 5 — nothing positively identifies this as a pager, and `q` is a destructive keystroke in
+   *  an editor. Refusing without pager evidence is the safe direction (roborev 68359). */
+  | "not-a-pager"
   /** Not a gate: both keys went out and the terminal is STILL on the alternate buffer. Something
    *  like `vim` quits on neither. Reported honestly rather than retried. */
   | "still-alternate";
@@ -1841,6 +1921,18 @@ function quitGateRefusal(
       detail:
         "Not pressed: that is Claude Code's plan surface. Whether a plan runs is the human's " +
         "decision, and q is not how it is made.",
+    };
+  }
+  // GATE 5 — POSITIVE PAGER EVIDENCE. Read the section above before relaxing this: gates 1-4 only
+  // ever prove what the screen ISN'T, and a full-screen editor satisfies all of them while turning
+  // `q` into a character written to the user's file.
+  if (!looksLikePager(screen.text)) {
+    return {
+      reason: "not-a-pager",
+      detail:
+        "Not pressed: that is a full-screen program but nothing about it says pager — no status " +
+        "row, or it looks like an editor. In an editor q is typed INTO the file, so I won't guess. " +
+        "It needs a human in that pane.",
     };
   }
   return null;

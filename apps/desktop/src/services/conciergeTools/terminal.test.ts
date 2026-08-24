@@ -2694,14 +2694,103 @@ describe("quit_alternate_screen", () => {
   });
 
   // ── 6. ESCALATION, BOTH DIRECTIONS ──────────────────────────────────────────────────────────
-  it("escalates to ctrl+c when q leaves the terminal on the alternate buffer", async () => {
-    // `vim` ignores q. Nothing changes between reads, which is exactly the wedged case.
+  // ══ THE DEFECT THIS TEST USED TO PIN (roborev 68359, High) ═══════════════════════════════════
+  //
+  // This case previously asserted `written()` equals `[Q, CTRL_C]` on the vim fixture — a green test
+  // with a perfect grip on the WRONG answer. vim is not a pager: in normal mode `q` starts a macro
+  // recording, and in insert mode it is written INTO THE FILE. The op must not press anything here.
+  // AGENTS.md names this exact shape: a mutation PASS proves grip, not intent.
+  it("writes NOTHING into vim — q there is a keystroke in a file, not a quit", async () => {
     mountScreen(VIM_ON_A_MARKDOWN_FILE, true);
+    const r = await quitAlternateScreen(AGENT, ALLOWED);
+    expect(written()).toEqual([]);
+    expect([r.ok, r.reason]).toEqual([false, "not-a-pager"]);
+  });
+
+  // The `$EDITOR` case that is LIVE IN THIS REPO: AGENTS.md documents that `roborev comment` with no
+  // `-m` opens $EDITOR, and `git commit` with no `-m` does the same. A `q` pressed here lands in the
+  // user's commit message, and the op's own return value would have called it a harmless no-op.
+  it("writes NOTHING into nano opened by $EDITOR on a commit message", async () => {
+    mountScreen(
+      [
+        "  GNU nano 7.2                 .git/COMMIT_EDITMSG",
+        "",
+        "fix(agents): force a non-interactive pager into the spawn environment",
+        "",
+        "# Please enter the commit message for your changes.",
+        "",
+        "^G Get Help  ^O WriteOut  ^X Exit  ^W Where Is  ^K Cut Text",
+      ].join("\n"),
+      true,
+    );
+    const r = await quitAlternateScreen(AGENT, ALLOWED);
+    expect(written()).toEqual([]);
+    expect(r.reason).toBe("not-a-pager");
+  });
+
+  it("writes NOTHING into vim in INSERT mode, where q is inserted verbatim", async () => {
+    mountScreen(["some text being typed", "", "-- INSERT --"].join("\n"), true);
+    expect((await quitAlternateScreen(AGENT, ALLOWED)).reason).toBe("not-a-pager");
+    expect(written()).toEqual([]);
+  });
+
+  // A full-screen program with NO recognisable status row at all. Absence of pager evidence is a
+  // refusal, not a licence — the gate is positive on purpose.
+  it("writes NOTHING into an unidentifiable full-screen program", async () => {
+    mountScreen(["┌─ some TUI ─┐", "│ working... │", "└────────────┘"].join("\n"), true);
+    expect((await quitAlternateScreen(AGENT, ALLOWED)).reason).toBe("not-a-pager");
+    expect(written()).toEqual([]);
+  });
+
+  // ══ WHAT THE EDITOR DENYLIST IS FOR, and the only case that proves it ════════════════════════
+  //
+  // The positive matcher reads the LAST ROW; the denylist reads the WHOLE screen. That difference
+  // only matters when an editor's last row happens to look like a pager status row — and this repo
+  // already knows that adversarial shape, because its own captured `less` fixture pages a document
+  // that QUOTES Claude Code's chrome. Same trick, one layer down: an agent editing documentation
+  // ABOUT `less`, in vim, in insert mode, whose visible text ends on a quoted status line.
+  //
+  // Without the denylist the last row matches `lines 1-40/1061` and the op presses `q` — INTO THE
+  // FILE, in insert mode. This test is the reason EDITOR_CHROME is not dead code: delete it and this
+  // goes red while every other case stays green.
+  it("refuses an EDITOR whose last row imitates a pager status line", async () => {
+    mountScreen(
+      [
+        "# Reading a long file",
+        "",
+        "Run `less -M AGENTS.md`. The ruler along the bottom then reads:",
+        "",
+        "-- INSERT --",
+        "lines 1-40/1061",
+      ].join("\n"),
+      true,
+    );
+    const r = await quitAlternateScreen(AGENT, ALLOWED);
+    expect(written()).toEqual([]);
+    expect(r.reason).toBe("not-a-pager");
+  });
+
+  it("escalates to ctrl+c when q leaves a PAGER on the alternate buffer", async () => {
+    // A real pager that swallowed the q. Nothing changes between reads — the wedged case — and the
+    // fixture stays a pager throughout, so the escalation is reached legitimately.
+    mountScreen(LESS_ON_A_MARKDOWN_FILE, true);
     const r = await quitAlternateScreen(AGENT, ALLOWED);
     expect(written()).toEqual([Q, CTRL_C]);
     // AND IT DOES NOT CLAIM SUCCESS. Both keys went out and the screen never cleared; saying so is
     // the useful answer, and looping would be the useless one.
     expect([r.ok, r.cleared, r.reason]).toEqual([false, false, "still-alternate"]);
+  });
+
+  // THE ESCALATION RE-GATES, and gate 5 is part of that. A pager that exits straight into an editor
+  // between the two reads must not receive the ctrl+c.
+  it("does not escalate when the screen turned into an editor after q", async () => {
+    const set = mountScreen(LESS_ON_A_MARKDOWN_FILE, true);
+    vi.mocked(writePtyChainedStrict).mockImplementationOnce(async () => {
+      set({ alternateBuffer: true, text: VIM_ON_A_MARKDOWN_FILE });
+    });
+    const r = await quitAlternateScreen(AGENT, ALLOWED);
+    expect(written()).toEqual([Q]);
+    expect(r.reason).toBe("not-a-pager");
   });
 
   it("does NOT send ctrl+c once q has cleared the alternate screen", async () => {
