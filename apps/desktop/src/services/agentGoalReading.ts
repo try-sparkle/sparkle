@@ -280,6 +280,26 @@ export function landedEvidenceFor(agentId: string): boolean | undefined {
   // no-op branch, so a genuinely-landed branch clears it while a bare cut from main does not. The
   // new-work-cycle veto (`unlandedWorkEvidence`, below) still runs, so a branch that landed PR #1 and
   // kept committing is still refused.
+  //
+  // THE LANDING STAMP IS PART OF THAT GUARD, because for a MERGED-THEN-DELETED branch it is the only
+  // signal left (sparkle-qh6j7g and sparkle-lh0fdg, third instalment). Deleting the remote head on
+  // merge — GitHub's default — drives every other input back to a bare cut's values: `ahead` 0,
+  // `pushed` false (no remote ref to be ahead of), and `prState` null, because `worktree.rs`
+  // deliberately suppresses the commit probe for a branch carrying no work of its own so a no-op
+  // branch cannot inherit main's merge commit. The row then reads as "never authored anything" and
+  // the agent is refused with "git says it is not on origin/main yet" — permanently, over merged
+  // work, which is the escalation loop both earlier beads were filed to end.
+  //
+  // It is SAFE here for the same reason `deriveLiveStage` already trusts it (`workflowStage.ts`:
+  // `crossRepoStamp: input.crossRepo?.stamp != null`): nothing writes a stamp except an agent
+  // explicitly naming the repository and pull request its work landed in, so it is never true for a
+  // no-op branch. Passing it is also what `committedWorkSeen`'s own contract REQUIRES of its two
+  // consumers — "a stage reading `merged` while the goal gate reads `no work` is the cross-surface
+  // disagreement this module exists to forbid". This gate was the half not passing it.
+  //
+  // It establishes only that WORK EXISTS. Both origin proofs above still gate the positive answer,
+  // and the new-work veto below still has the last word, so a stamp can neither self-certify a
+  // landing the bound repo can see is absent nor close a goal over fresh unlanded commits.
   const liveLandedOnOrigin =
     (ws?.landedOnOrigin === true || ws?.inOriginMain === true) &&
     committedWorkSeen({
@@ -288,6 +308,7 @@ export function landedEvidenceFor(agentId: string): boolean | undefined {
       aheadOfBase: ws?.aheadOfBase,
       pushed: ws?.pushed,
       prState: ws?.prState,
+      crossRepoStamp: findRosterAgent(agentId)?.landedElsewhere != null,
     });
   if (shipped !== true && !liveLandedOnOrigin) return false;
   return unlandedWorkEvidence({ bs, ws, stageOverride: stage }) === true ? false : true;

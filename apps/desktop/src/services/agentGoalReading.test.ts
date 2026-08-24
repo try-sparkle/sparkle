@@ -25,6 +25,7 @@ import { useInteractionStore } from "../stores/interactionStore";
 import { escalateGoal, newGoal } from "../engine/agentGoal";
 import type { AgentTab, Project } from "../types";
 import type { BranchStatus, WorkflowState } from "./branchStatus";
+import type { LandedElsewhere } from "../engine/crossRepo";
 
 const A = "agent-1";
 
@@ -508,6 +509,79 @@ describe("landedEvidenceFor — a LIVE origin landing beats an UNLATCHED waterma
       branchStatus: { [A]: CLEAN_BS },
       workflowState: { [A]: { ...BARE_WS, inOriginMain: true, aheadOfBase: 0 } },
     });
+    expect(landedEvidenceFor(A)).toBe(false);
+  });
+});
+
+describe("landedEvidenceFor — a LANDING STAMP is committed-work evidence (parity with deriveLiveStage)", () => {
+  // The third instalment of the same defect (`sparkle-qh6j7g`, then `sparkle-lh0fdg`). Both earlier
+  // fixes taught this gate to trust a LIVE origin reading over a latch. What neither reached is the
+  // no-op guard underneath: `committedWorkSeen` is what separates "landed, and the branch now sits on
+  // main" from "never authored anything", and it needs at least one signal that is never true for a
+  // bare cut. For a branch whose PR merged and whose REMOTE HEAD WAS THEN DELETED, every one of the
+  // signals this gate passes has gone back to zero — `ahead` 0, `pushed` false (no remote ref left),
+  // `prState` null (the Rust probe suppresses the commit probe for a branch carrying no work of its
+  // own, precisely so a no-op branch cannot inherit main's merge commit). So a finished agent reads
+  // as a no-op branch and is refused "git says it is not on origin/main yet" forever.
+  //
+  // The signal that survives is the agent's OWN landing stamp: nothing writes it except an agent
+  // naming the repo and PR its work landed in, so it is never true for a no-op branch — which is
+  // exactly why `deriveLiveStage` already feeds it to this same guard (`workflowStage.ts`,
+  // `crossRepoStamp: input.crossRepo?.stamp != null`). This gate did not, and `committedWorkSeen`'s
+  // own contract says the two consumers MUST agree: "a stage reading `merged` while the goal gate
+  // reads `no work` is the cross-surface disagreement this module exists to forbid."
+  const STAMP: LandedElsewhere = {
+    repo: "drodio/sparkle",
+    prNumber: 2353,
+    sha: "210cedbf",
+    state: "merged",
+    stampedAt: NOW - 1_000,
+  };
+
+  it("a stamped landing survives the remote branch being deleted", () => {
+    // The live repro. Tip IS in origin main, nothing ahead, and no push/PR signal is left to prove
+    // work ever existed — only the stamp. Without it this is indistinguishable from a bare cut.
+    seed({
+      branchStatus: { [A]: CLEAN_BS },
+      workflowState: { [A]: { ...BARE_WS, inOriginMain: true, aheadOfBase: 0 } },
+    });
+    seedRoster({ landedElsewhere: STAMP });
+    expect(landedEvidenceFor(A)).toBe(true);
+  });
+
+  it("PAIRED: the SAME setup with NO stamp stays unmet — the no-op guard is intact", () => {
+    // The pair that pins the cause. One test proving the stamp flips the answer is ambiguous on its
+    // own: it cannot tell "the stamp did it" from "this setup was already landed". Identical seed,
+    // stamp removed, and the answer must go back to `false`.
+    seed({
+      branchStatus: { [A]: CLEAN_BS },
+      workflowState: { [A]: { ...BARE_WS, inOriginMain: true, aheadOfBase: 0 } },
+    });
+    seedRoster();
+    expect(landedEvidenceFor(A)).toBe(false);
+  });
+
+  it("a stamp does NOT let the new-work cycle close — the veto still outranks it", () => {
+    // The false-"done" every layer of this gate exists to prevent: prior work landed (stamp present,
+    // tip on origin) while three fresh commits sit unlanded. `committedWorkSeen` being satisfied must
+    // never be read as "landed"; the veto still has the last word.
+    seed({
+      branchStatus: { [A]: { ...CLEAN_BS, ahead: 3 } },
+      workflowState: { [A]: { ...BARE_WS, inOriginMain: true, aheadOfBase: 3 } },
+    });
+    seedRoster({ landedElsewhere: STAMP });
+    expect(landedEvidenceFor(A)).toBe(false);
+  });
+
+  it("a stamp alone, with the tip NOT on origin, is not a landing", () => {
+    // The stamp establishes that WORK EXISTS, never that it reached origin. Neither origin proof is
+    // true here, so the gate must stay closed — otherwise a stamp becomes a way to self-certify a
+    // landing the bound repo can see is absent.
+    seed({
+      branchStatus: { [A]: { ...CLEAN_BS, ahead: 2 } },
+      workflowState: { [A]: { ...BARE_WS, inOriginMain: false, landedOnOrigin: false, aheadOfBase: 2 } },
+    });
+    seedRoster({ landedElsewhere: { ...STAMP, state: "open" } });
     expect(landedEvidenceFor(A)).toBe(false);
   });
 });
