@@ -3681,7 +3681,45 @@ fn identities_at(
 pub async fn accounts_list(app: AppHandle) -> Result<Vec<Account>, String> {
     let app_data = crate::worktree::app_data_dir_pub(&app)?;
     tauri::async_runtime::spawn_blocking(move || {
-        // ══ ADOPT ORPHANED CREDENTIALED DIRS — ONCE PER PROCESS ══════════════════════════════════
+        // The pane's `loaded` flip waits on THIS call resolving, so it must cost only the cheap
+        // `read_accounts_at` — not the once-per-process orphan-adoption scan, the per-account heal
+        // loop, or the folder-trust sweep, all of which read ~35 KB-per-dir `.claude.json` files and,
+        // on the first read after a restart, collide with the beads-store compaction. Left inline,
+        // that stall left the pane in "Loading your accounts…" for many seconds — looking like there
+        // are NO accounts — before the 12 finally appeared. So return the recorded accounts now and
+        // hand every heavy piece to a fire-and-forget background task; the app's own 5s poll (plus
+        // the spawn-time re-heal backstop) re-reads the result, including any dir just adopted.
+        let ad = app_data.clone();
+        accounts_list_fast(&app_data, move || dispatch_account_maintenance(ad))
+    })
+    .await
+    .map_err(|e| format!("accounts_list task failed: {e}"))?
+}
+
+/// The cheap half of `accounts_list`: read the recorded accounts and hand the heavy first-load work
+/// to `dispatch_heavy` WITHOUT waiting on it. Split out so a unit test can prove the recorded
+/// accounts come back before — and independently of — the orphan-adoption/heal work: the command
+/// passes a closure that spawns that work on the blocking pool, a test passes one that merely records
+/// it was dispatched. The heavy work is `dispatch`ed, never `.await`ed, so nothing on this return
+/// path reads a `.claude.json`.
+fn accounts_list_fast<F: FnOnce()>(
+    app_data: &Path,
+    dispatch_heavy: F,
+) -> Result<Vec<Account>, String> {
+    let accounts = read_accounts_at(&accounts_json_path(app_data))?;
+    // OFF the return path — see `dispatch_account_maintenance`. Dispatch it, do not await it.
+    dispatch_heavy();
+    Ok(accounts)
+}
+
+/// Fire-and-forget every piece of heavy first-load account maintenance on Tauri's blocking pool, so
+/// the `accounts_list` return path never waits on it. BEST-EFFORT throughout: a failure here must
+/// never surface, let alone hide the user's accounts. Correctness is preserved — the adoption, the
+/// heals and the trust sweep all still happen, just after the list has already been returned, and the
+/// app's 5s poll re-reads whatever they changed.
+fn dispatch_account_maintenance(app_data: PathBuf) {
+    tauri::async_runtime::spawn_blocking(move || {
+        // ADOPT ORPHANED CREDENTIALED DIRS — ONCE PER PROCESS.
         // A dir holding a real login with no `accounts.json` record is invisible to everything, and
         // re-adding "the same" account mints a fresh empty one instead of reusing it. See
         // `adopt_orphan_dirs_at` for how they arise.
@@ -3701,24 +3739,9 @@ pub async fn accounts_list(app: AppHandle) -> Result<Vec<Account>, String> {
                 Err(e) => tracing::warn!(error = %e, "could not scan for orphaned account dirs"),
             }
         });
-        let accounts = read_accounts_at(&accounts_json_path(&app_data))?;
-        // Heal accounts added BEFORE Sparkle seeded its allowlist at creation. Seeding only on
-        // `accounts_add` would leave every already-registered identity permanently grant-less, and
-        // this list is read before the picker chooses one — so an account is repaired before it can
-        // be spawned on. Idempotent (a current file is not rewritten) and best-effort: never fail
-        // the listing over it, or a bad file would hide the user's accounts entirely.
-        for a in accounts.iter().filter(|a| !a.is_default && !a.config_dir.is_empty()) {
-            if let Err(e) = ensure_account_allowlist_at(Path::new(&a.config_dir)) {
-                tracing::warn!(account = %a.id, error = %e, "could not heal the account's Sparkle allowlist");
-            }
-            // Heal the onboarding marker on the SAME pass, and for a strictly larger population than
-            // "accounts added before the fix": a dir can lose the marker at any time, because
-            // `.claude.json` is Claude Code's own file and a fresh one starts without it. This runs
-            // before the picker chooses, so an account is repaired before it can be spawned on.
-            if let Err(e) = ensure_onboarding_marker_at(Path::new(&a.config_dir)) {
-                tracing::warn!(account = %a.id, error = %e, "could not heal the account's onboarding marker");
-            }
-        }
+        // Heal the registered accounts — re-reading AFTER adoption so a dir just adopted is healed
+        // too. See `heal_registered_accounts_at`.
+        heal_registered_accounts_at(&app_data);
         // FOLDER-TRUST BACKSTOP, on the same "repair before it can be spawned on" pass and for the
         // same reason — but keyed by WORKTREE rather than by account, because trust is recorded per
         // (config dir × key) and an account healed here would still meet an unseeded worktree.
@@ -3732,10 +3755,37 @@ pub async fn accounts_list(app: AppHandle) -> Result<Vec<Account>, String> {
             Ok(n) => tracing::info!(config_dirs = n, "swept folder trust for managed worktrees"),
             Err(e) => tracing::warn!(error = %e, "could not sweep folder trust"),
         });
-        Ok(accounts)
-    })
-    .await
-    .map_err(|e| format!("accounts_list task failed: {e}"))?
+    });
+}
+
+/// The per-account allowlist + onboarding-marker heal loop, split out of `accounts_list` so it can
+/// run OFF the return path (see `dispatch_account_maintenance`). Re-reads accounts so it also heals a
+/// dir the orphan-adoption sweep just added. Idempotent and best-effort: never fail over it, or a bad
+/// file would hide the user's accounts.
+fn heal_registered_accounts_at(app_data: &Path) {
+    let accounts = match read_accounts_at(&accounts_json_path(app_data)) {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::warn!(error = %e, "could not read accounts for the heal pass");
+            return;
+        }
+    };
+    // Heal accounts added BEFORE Sparkle seeded its allowlist at creation. Seeding only on
+    // `accounts_add` would leave every already-registered identity permanently grant-less, and this
+    // list is read before the picker chooses one — so an account is repaired before it can be
+    // spawned on. Idempotent (a current file is not rewritten).
+    for a in accounts.iter().filter(|a| !a.is_default && !a.config_dir.is_empty()) {
+        if let Err(e) = ensure_account_allowlist_at(Path::new(&a.config_dir)) {
+            tracing::warn!(account = %a.id, error = %e, "could not heal the account's Sparkle allowlist");
+        }
+        // Heal the onboarding marker on the SAME pass, and for a strictly larger population than
+        // "accounts added before the fix": a dir can lose the marker at any time, because
+        // `.claude.json` is Claude Code's own file and a fresh one starts without it. This runs
+        // before the picker chooses, so an account is repaired before it can be spawned on.
+        if let Err(e) = ensure_onboarding_marker_at(Path::new(&a.config_dir)) {
+            tracing::warn!(account = %a.id, error = %e, "could not heal the account's onboarding marker");
+        }
+    }
 }
 
 /// Pre-seed folder-trust acceptance for a worker's `worktree` into the account it will run under, so
@@ -4747,6 +4797,97 @@ mod tests {
         exhausted_identity: None,
         }
     }
+
+    // ── accounts_list fast-return decouple (fix for the "Loading your accounts…" stall) ───────────
+
+    /// THE FIX, ASSERTED ON THE SIDE EFFECT: `accounts_list_fast` returns the RECORDED accounts from
+    /// the cheap `read_accounts_at` without running — or waiting on — the heavy orphan-adoption/heal
+    /// work that used to sit on the pane's `loaded`-flip path. Seeds a signed-in ORPHAN dir that
+    /// adoption WOULD register, passes a dispatch closure that only records it fired (the background
+    /// seam, deliberately NOT run here), and asserts the return value is exactly the two recorded
+    /// accounts, the orphan is absent, and `accounts.json` on disk is UNCHANGED.
+    ///
+    /// Non-vacuous — three independent mutation guards: moving adoption back inline before the read
+    /// puts `aaa111` in the return value AND rewrites `accounts.json` to three rows (two asserts go
+    /// red); dropping the `dispatch_heavy()` call leaves `dispatched` false (the third goes red).
+    #[test]
+    fn accounts_list_fast_returns_recorded_accounts_without_running_the_heavy_work() {
+        let tmp = unique_dir("list-fast-decouple");
+        let accounts_path = accounts_json_path(&tmp);
+        let recorded = vec![
+            sample("rec-1", true, ""),
+            sample("rec-2", false, &tmp.join("accounts").join("rec-2").to_string_lossy()),
+        ];
+        write_accounts_at(&accounts_path, &recorded).unwrap();
+        // A signed-in orphan dir (`aaa111`) with no record — adoption WOULD register it if it ran.
+        seed_orphans(&tmp);
+
+        let dispatched = std::cell::Cell::new(false);
+        let returned = accounts_list_fast(&tmp, || dispatched.set(true)).unwrap();
+
+        assert!(
+            dispatched.get(),
+            "the heavy maintenance was never handed to the background seam"
+        );
+        assert_eq!(
+            returned.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(),
+            vec!["rec-1", "rec-2"],
+            "the fast path returned something other than the recorded accounts: {returned:?}"
+        );
+        assert!(
+            !returned.iter().any(|a| a.id == "aaa111"),
+            "the orphan was adopted ON the return path — adoption is back on the critical path: {returned:?}"
+        );
+        let on_disk = read_accounts_at(&accounts_path).unwrap();
+        assert_eq!(
+            on_disk.len(),
+            2,
+            "accounts.json was rewritten by an inline adoption — the heavy scan ran before returning: {on_disk:?}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// PAIRED CORRECTNESS: the heal work that moved off the return path still HAPPENS when the
+    /// background maintenance runs it. Drives `heal_registered_accounts_at` directly against a
+    /// recorded non-default account whose config dir has no `settings.json`, and asserts the
+    /// control-plane allowlist rule is now on disk. Deleting the allowlist call from the loop leaves
+    /// no `settings.json` and reddens this — the guard the "heals still happen, just async"
+    /// requirement rides on. (Adoption's own move is covered by the adoption tests plus the
+    /// fast-return test above; this pins the per-account heal loop.)
+    #[test]
+    fn heal_registered_accounts_at_still_heals_a_recorded_account() {
+        let tmp = unique_dir("heal-decoupled");
+        let acct_dir = tmp.join("accounts").join("heal-me");
+        std::fs::create_dir_all(&acct_dir).unwrap();
+        // No settings.json in the account dir — the un-healed state.
+        let recorded = vec![
+            sample("default", true, ""),
+            sample("heal-me", false, &acct_dir.to_string_lossy()),
+        ];
+        write_accounts_at(&accounts_json_path(&tmp), &recorded).unwrap();
+
+        heal_registered_accounts_at(&tmp);
+
+        let settings = acct_dir.join("settings.json");
+        assert!(
+            settings.exists(),
+            "the decoupled heal loop did not seed the account's settings.json"
+        );
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        let rules: Vec<&str> = v["permissions"]["allow"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|r| r.as_str())
+            .collect();
+        assert!(
+            rules.contains(&"mcp__sparkle-control"),
+            "control-plane allowlist rule not healed onto the account: {rules:?}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
 
     /// The one piece of NEW logic on the concierge's rotation-bench path: map the failed
     /// `config_dir` back to the account id `mark_exhausted_at` benches. Asserts the SIDE EFFECT — the
