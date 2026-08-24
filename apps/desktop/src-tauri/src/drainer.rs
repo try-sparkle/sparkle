@@ -341,18 +341,28 @@ pub fn read_queue_entries(queue_dir: &Path) -> Vec<serde_json::Value> {
 pub struct DrainerQueueSnapshot {
     pub enabled: bool,
     pub max_workers: u32,
+    /// How many in-app drain workers may run in PARALLEL (the bounded fleet size), BEFORE the
+    /// frontend narrows it further by the healthy-account count and free slots. `[drainer]
+    /// max_concurrency` (app-side knob), floored at 1 and hard-capped at `DRAIN_CONCURRENCY_HARD_CAP`.
+    /// The effective fleet size the bridge dispatches is `min(max_workers, max_concurrency, accounts)`.
+    pub max_concurrency: u32,
     pub entries: Vec<serde_json::Value>,
 }
 
 /// Pure core (testable): assemble the snapshot. The kill-switch is enforced HERE — a disabled
 /// drainer reads no entries and does not even touch the queue dir.
-pub fn queue_snapshot_core(enabled: bool, max_workers: u32, queue_dir: &Path) -> DrainerQueueSnapshot {
+pub fn queue_snapshot_core(
+    enabled: bool,
+    max_workers: u32,
+    max_concurrency: u32,
+    queue_dir: &Path,
+) -> DrainerQueueSnapshot {
     let entries = if enabled {
         read_queue_entries(queue_dir)
     } else {
         Vec::new()
     };
-    DrainerQueueSnapshot { enabled, max_workers, entries }
+    DrainerQueueSnapshot { enabled, max_workers, max_concurrency, entries }
 }
 
 /// The drainer kill-switch as the CONSUMER must read it: `SPARKLE_DRAINER_ENABLED` (the shell's env
@@ -397,6 +407,45 @@ fn drainer_max_workers(app_data: &Path) -> u32 {
     3
 }
 
+/// A HARD ceiling on the in-app parallel drain fleet, independent of config. `max_concurrency` and the
+/// shell's `max_workers` are advisory bounds a human sets; this is the floor of last resort so a
+/// fat-fingered `max_concurrency = 500` can never spawn 500 unattended `claude` children on the
+/// founder's quota. Deliberately small — the machine and the account pool are the real limits.
+pub const DRAIN_CONCURRENCY_HARD_CAP: u32 = 6;
+
+/// How many in-app drain workers may run in PARALLEL: `SPARKLE_DRAINER_MAX_CONCURRENCY` env wins, else
+/// `[drainer] max_concurrency` from the global config file, else a conservative default of 3. Floored
+/// at 1 and clamped to `DRAIN_CONCURRENCY_HARD_CAP`. This is an APP-SIDE knob (the shell engine does
+/// not read it) — the parallel fleet lives entirely in the app-side bridge, so unlike `max_workers`
+/// (which the shell also honours) this bound is read here and nowhere in scripts/backlog-drainer.sh.
+/// It is only ONE of the bounds on the fleet; the bridge further narrows it by the shell's worker cap,
+/// the healthy pool-account count, and the number of free slots (see drainerBridge planDrainDispatch).
+fn drainer_max_concurrency(app_data: &Path) -> u32 {
+    let clamp = |n: u32| n.clamp(1, DRAIN_CONCURRENCY_HARD_CAP);
+    if let Some(v) = std::env::var_os("SPARKLE_DRAINER_MAX_CONCURRENCY") {
+        if let Ok(n) = v.to_string_lossy().trim().parse::<u32>() {
+            if n >= 1 {
+                return clamp(n);
+            }
+        }
+    }
+    let path = crate::config::global_path(app_data);
+    if let Ok(text) = std::fs::read_to_string(&path) {
+        if let Ok(val) = text.parse::<toml::Value>() {
+            if let Some(n) = val
+                .get("drainer")
+                .and_then(|d| d.get("max_concurrency"))
+                .and_then(|m| m.as_integer())
+            {
+                if n >= 1 {
+                    return clamp(n as u32);
+                }
+            }
+        }
+    }
+    3
+}
+
 /// Frontend-facing: the pending drainer queue for one dispatch pass. Fail-closed — when the
 /// kill-switch is off, `enabled` is false and `entries` is empty (no spawn possible).
 #[tauri::command]
@@ -405,8 +454,9 @@ pub async fn read_drainer_queue(app: AppHandle) -> Result<DrainerQueueSnapshot, 
     tauri::async_runtime::spawn_blocking(move || {
         let enabled = drainer_enabled_effective();
         let max_workers = drainer_max_workers(&app_data);
+        let max_concurrency = drainer_max_concurrency(&app_data);
         let repo = sparkle_repo_root(&app_data);
-        queue_snapshot_core(enabled, max_workers, &drainer_queue_dir(&repo))
+        queue_snapshot_core(enabled, max_workers, max_concurrency, &drainer_queue_dir(&repo))
     })
     .await
     .map_err(|e| format!("read_drainer_queue task failed: {e}"))
@@ -695,10 +745,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let q = tmp.path().join("queue");
         write_queue_file(&q, "sparkle-a", "1", "");
-        let snap = queue_snapshot_core(true, 3, &q);
+        let snap = queue_snapshot_core(true, 3, 4, &q);
         assert!(snap.enabled);
         assert_eq!(snap.entries.len(), 1, "enabled hands out the queued request");
         assert_eq!(snap.entries[0]["beadId"].as_str().unwrap(), "sparkle-a");
+        // The parallel-fleet bound is carried through verbatim so the bridge can narrow it.
+        assert_eq!(snap.max_concurrency, 4, "max_concurrency is reported to the bridge");
     }
 
     #[test]
@@ -710,7 +762,7 @@ mod tests {
         let q = tmp.path().join("queue");
         write_queue_file(&q, "sparkle-a", "1", "");
         write_queue_file(&q, "sparkle-b", "0", "");
-        let snap = queue_snapshot_core(false, 3, &q);
+        let snap = queue_snapshot_core(false, 3, 4, &q);
         assert!(!snap.enabled);
         assert!(snap.entries.is_empty(), "disabled must expose no dispatchable requests");
     }

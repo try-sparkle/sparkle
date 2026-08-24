@@ -1224,7 +1224,11 @@ export async function runImprovementPass(
         else unlisteners.push(u);
       };
       Promise.all([
-        listen<{ sessionId: string; text: string }>("sparkle_improve:done", (ev) => {
+        listen<{ sessionId: string; text: string; slot?: string }>("sparkle_improve:done", (ev) => {
+          // SLOT ROUTING. The drain fleet now shares these event names, tagging each with its
+          // slot; a non-empty slot belongs to a drain worker, so the HOURLY listener ignores
+          // it (and each drain worker likewise ignores every slot but its own).
+          if (ev.payload.slot) return;
           // BIND BEFORE SETTLING, and both orderings matter for a different reason.
           //
           // Bind at all: `done` carries the id of the session the pass FINISHED writing, and it is
@@ -1248,7 +1252,11 @@ export async function runImprovementPass(
           if (ev.payload.sessionId) noteAgentSessionId(SPARKLE_AGENT_ID, ev.payload.sessionId);
           settle({ ok: true, text: ev.payload.text });
         }).then(track),
-        listen<{ message: string; sessionId?: string }>("sparkle_improve:error", (ev) => {
+        listen<{ message: string; sessionId?: string; slot?: string }>("sparkle_improve:error", (ev) => {
+          // SLOT ROUTING. The drain fleet now shares these event names, tagging each with its
+          // slot; a non-empty slot belongs to a drain worker, so the HOURLY listener ignores
+          // it (and each drain worker likewise ignores every slot but its own).
+          if (ev.payload.slot) return;
           // THE SAME BIND ON THE FAILING PATH, and it matters more here (roborev 63251). A pass that
           // fails still wrote a conversation, and a failure is the ending someone actually opens the
           // pane to read. Rust had the id in scope on this branch and dropped it, so the very case
@@ -1273,7 +1281,11 @@ export async function runImprovementPass(
         // It does NOT settle the pass. It is a binding, not an outcome, and it arrives ~a second in
         // — treating it as a result would end every pass immediately. It is tracked like its
         // siblings so it cannot outlive the run.
-        listen<{ sessionId: string }>("sparkle_improve:session", (ev) => {
+        listen<{ sessionId: string; slot?: string }>("sparkle_improve:session", (ev) => {
+          // SLOT ROUTING. The drain fleet now shares these event names, tagging each with its
+          // slot; a non-empty slot belongs to a drain worker, so the HOURLY listener ignores
+          // it (and each drain worker likewise ignores every slot but its own).
+          if (ev.payload.slot) return;
           if (ev.payload.sessionId) noteAgentSessionId(SPARKLE_AGENT_ID, ev.payload.sessionId);
         }).then(track),
       ]).then(

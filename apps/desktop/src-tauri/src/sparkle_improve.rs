@@ -30,6 +30,7 @@
 //! CSP, no remote origins) — these checks stop obvious misuse and bugs, not a compromised
 //! webview (see the `pty.rs` module docs).
 
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -54,6 +55,13 @@ const SHELL: &str = "/bin/zsh";
 /// pass as `SPARKLE_INBOX_AGENT` — see `build_improve_exec`.
 const SPARKLE_CANONICAL_AGENT_ID: &str = "__sparkle_self__";
 
+/// The reserved slot key for the HOURLY / interactive-pane pass — the empty string. It occupies
+/// the manager exactly as it always did (one at a time, in the SPARKLE_AGENT_ID worktree the
+/// interactive pane shares), while each non-empty key is one BACKLOG-DRAIN worker running in its
+/// OWN worktree. Keying by slot is what lets the drain fleet run in parallel WITHOUT touching the
+/// hourly pass's process-wide-single guarantee: distinct keys never contend.
+const HOURLY_SLOT: &str = "";
+
 /// A pass older than this is presumed hung (network stall, wedged subprocess) and is killed +
 /// reclaimed by the next `sparkle_improve_run`. Generous: a legitimate pass — review logs,
 /// implement one small change, draft/submit a PR — finishes well inside it. MUST strictly
@@ -76,12 +84,16 @@ struct RunningPass {
     token: u64,
 }
 
-/// At most one improvement pass in flight, process-wide. `sparkle_improve_cancel` and the
-/// stale reclaim `take()` the slot (whoever takes the pass kills/reaps it); the reader thread
-/// takes it on EOF only under a matching token.
+/// The in-flight improvement passes, keyed by SLOT. The empty key ([`HOURLY_SLOT`]) is the hourly /
+/// interactive pass and is still at-most-one (nothing else uses that key); each non-empty key is one
+/// backlog-drain worker in its own worktree, so the map holds one hourly + up to
+/// `crate::drainer::DRAIN_CONCURRENCY_HARD_CAP` drains. `sparkle_improve_cancel` and the stale reclaim
+/// `remove()` a slot (whoever takes the pass kills/reaps it); the reader thread takes its own slot on
+/// EOF only under a matching token. Keyed rather than a single `Option` so parallel drains never
+/// contend — the whole point of the bounded fleet.
 #[derive(Default)]
 pub struct SparkleImproveManager {
-    pass: Mutex<Option<RunningPass>>,
+    passes: Mutex<HashMap<String, RunningPass>>,
 }
 
 /// THE PROCESS'S OWN ANSWER to "is a pass working right now" — the reading the pinned
@@ -143,11 +155,14 @@ impl SparkleImproveManager {
     /// than a stale flag. Read-only on purpose: it never `try_wait`s the child, which would reap it
     /// out from under the reader thread that owns that.
     pub fn liveness(&self) -> ImproveLiveness {
-        liveness_for(lock_pass(&self.pass).as_ref().map(|p| p.started.elapsed()))
+        // The pinned "Improve Sparkle" row tracks the HOURLY slot only; drain workers have no row.
+        liveness_for(lock_passes(&self.passes).get(HOURLY_SLOT).map(|p| p.started.elapsed()))
     }
 
     pub fn end_in_flight_pass(&self) {
-        if let Some(pass) = lock_pass(&self.pass).take() {
+        // Drain EVERY slot — the hourly pass and every drain-fleet worker — so no unattended
+        // --dangerously-skip-permissions child outlives the app in any worktree.
+        for (_slot, pass) in lock_passes(&self.passes).drain() {
             end_pass_early(pass, PassEnd::AppTeardown);
         }
     }
@@ -212,7 +227,7 @@ fn end_pass_early(mut pass: RunningPass, end: PassEnd) {
     kill_pass_group(&mut pass.child);
 }
 
-fn lock_pass(m: &Mutex<Option<RunningPass>>) -> MutexGuard<'_, Option<RunningPass>> {
+fn lock_passes(m: &Mutex<HashMap<String, RunningPass>>) -> MutexGuard<'_, HashMap<String, RunningPass>> {
     // Recover from poisoning rather than panicking (same rationale as claude_chat.rs): a
     // panicked reader must not brick the hourly pass for the rest of the process.
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -231,6 +246,10 @@ fn kill_pass_group(child: &mut Child) {
 struct ImproveDone {
     session_id: String,
     text: String,
+    /// Which slot finished — empty for the hourly pass, the drain slot id otherwise. The frontend
+    /// routes the event by this: the hourly listener ignores a non-empty slot, and each drain
+    /// worker's listener ignores every slot but its own.
+    slot: String,
 }
 
 /// Payload of `sparkle_improve:error`.
@@ -253,6 +272,8 @@ struct ImproveDone {
 struct ImproveError {
     message: String,
     session_id: String,
+    /// Which slot failed — see `ImproveDone::slot`. The frontend routes on it.
+    slot: String,
 }
 
 /// Payload of `sparkle_improve:session` — the id of the Claude session THIS pass is writing,
@@ -269,6 +290,8 @@ struct ImproveError {
 #[serde(rename_all = "camelCase")]
 struct ImproveSession {
     session_id: String,
+    /// Which slot is announcing its session — see `ImproveDone::slot`. The frontend routes on it.
+    slot: String,
 }
 
 /// The session-id announcement a stream line should produce, if any — `Some(id)` exactly ONCE, the
@@ -434,7 +457,12 @@ pub fn sparkle_improve_run(
     // resolved by the frontend through the SAME `pickAccount` the build-agent spawn uses. Optional
     // so a build with no accounts configured spawns exactly as before.
     config_dir: Option<String>,
+    // Which manager SLOT this pass occupies. Omitted / None ⇒ the hourly pass ([`HOURLY_SLOT`], the
+    // legacy behaviour). A non-empty id ⇒ one backlog-drain worker; each drain worker uses a DISTINCT
+    // id (and a distinct worktree) so the fleet runs in parallel without contending.
+    slot: Option<String>,
 ) -> Result<(), String> {
+    let slot_key = slot.unwrap_or_default();
     let worktrees = crate::dev_identity::app_data_dir(&app)
         .map_err(|e| format!("sparkle_improve_run: {e}"))?
         .join("worktrees");
@@ -453,12 +481,13 @@ pub fn sparkle_improve_run(
 
     let mut cmd = build_pass_command(&script, &real_cwd, config_dir.as_deref());
 
-    // Claim the singleton slot BEFORE spawning so two racing invokes can't both launch.
+    // Claim this SLOT before spawning so two racing invokes can't both launch into it. Distinct
+    // slots never contend, so the hourly pass and each drain worker each guard their own key.
     {
-        let mut slot = lock_pass(&manager.pass);
-        if let Some(prior) = slot.as_ref() {
+        let mut passes = lock_passes(&manager.passes);
+        if let Some(prior) = passes.get(&slot_key) {
             if prior.started.elapsed() < STALE_PASS_MAX {
-                return Err("sparkle_improve_run: a pass is already running".into());
+                return Err("sparkle_improve_run: a pass is already running for this slot".into());
             }
             // Stale: presume hung and reclaim. Once we take the slot, the stale reader EOFs,
             // fails its token match, and stays silent. Deliberately NO error event here: on
@@ -469,9 +498,23 @@ pub fn sparkle_improve_run(
             // we take the slot still token-matches and emits, a milliseconds-wide untagged-
             // event race accepted as-is (roborev #25141); don't add an emit back here, and if
             // that race ever matters, the fix is token-tagging the done/error payloads.
-            tracing::warn!("sparkle_improve_run: reclaiming a stale pass (older than {STALE_PASS_MAX:?})");
-            if let Some(stale) = slot.take() {
+            tracing::warn!(slot = %slot_key, "sparkle_improve_run: reclaiming a stale pass (older than {STALE_PASS_MAX:?})");
+            if let Some(stale) = passes.remove(&slot_key) {
                 end_pass_early(stale, PassEnd::Reclaimed);
+            }
+        }
+        // HARD CAP on the parallel DRAIN fleet — defense in depth BENEATH the frontend's bound, so a
+        // frontend bug can never spawn an unbounded number of unattended children. The hourly slot
+        // (empty key) is exempt and always admitted; a NEW drain slot is refused once the fleet is
+        // already at the ceiling (a stale same-key reclaim above frees its own seat first, so a
+        // retrying worker is never counted against itself).
+        if !slot_key.is_empty() {
+            let drain_slots = passes.keys().filter(|k| !k.is_empty()).count() as u32;
+            if drain_slots >= crate::drainer::DRAIN_CONCURRENCY_HARD_CAP {
+                return Err(format!(
+                    "sparkle_improve_run: drain fleet is at its hard cap of {}",
+                    crate::drainer::DRAIN_CONCURRENCY_HARD_CAP
+                ));
             }
         }
         let mut child = cmd
@@ -494,7 +537,9 @@ pub fn sparkle_improve_run(
             }
         };
         let token = PASS_SEQ.fetch_add(1, Ordering::Relaxed);
-        *slot = Some(RunningPass { child, started: Instant::now(), token });
+        passes.insert(slot_key.clone(), RunningPass { child, started: Instant::now(), token });
+        // The reader thread reaps + emits under THIS slot; give it its own owned copy of the key.
+        let reader_slot = slot_key.clone();
 
         // Drain stderr on its own thread so a full pipe can't deadlock the child.
         let stderr_handle = std::thread::spawn(move || {
@@ -543,7 +588,7 @@ pub fn sparkle_improve_run(
                             // frontend binds it as this agent's own so a mounted pane can read the
                             // pass while it works; see `ImproveSession`.
                             if let Some(sid) = session_announcement(&session_id, &mut session_announced) {
-                                let _ = read_app.emit("sparkle_improve:session", ImproveSession { session_id: sid });
+                                let _ = read_app.emit("sparkle_improve:session", ImproveSession { session_id: sid, slot: reader_slot.clone() });
                             }
                             capture_result_status(
                                 &ev,
@@ -565,9 +610,9 @@ pub fn sparkle_improve_run(
             // teardown was initiated elsewhere, so we stay silent and leave the slot alone.
             let taken = {
                 let manager = read_app.state::<SparkleImproveManager>();
-                let mut slot = lock_pass(&manager.pass);
-                match slot.as_ref() {
-                    Some(p) if p.token == token => slot.take().map(|p| (p.child, p.started)),
+                let mut passes = lock_passes(&manager.passes);
+                match passes.get(&reader_slot) {
+                    Some(p) if p.token == token => passes.remove(&reader_slot).map(|p| (p.child, p.started)),
                     _ => None,
                 }
             };
@@ -581,7 +626,7 @@ pub fn sparkle_improve_run(
 
             if ok {
                 tracing::info!(chars = text.len(), elapsed_ms, "sparkle_improve: pass finished");
-                let _ = read_app.emit("sparkle_improve:done", ImproveDone { session_id, text });
+                let _ = read_app.emit("sparkle_improve:done", ImproveDone { session_id, text, slot: reader_slot });
             } else {
                 let stderr_text = stderr_handle.join().unwrap_or_default();
                 let message = failure_message(
@@ -600,6 +645,7 @@ pub fn sparkle_improve_run(
                     ImproveError {
                         message,
                         session_id,
+                        slot: reader_slot,
                     },
                 );
             }
@@ -635,8 +681,14 @@ pub async fn sparkle_improve_active(manager: State<'_, SparkleImproveManager>) -
 /// by the client-side pass timeout — the reader thread finds the slot token changed (entry
 /// gone) on EOF and stays silent.
 #[tauri::command]
-pub fn sparkle_improve_cancel(manager: State<SparkleImproveManager>) -> Result<(), String> {
-    let pass = lock_pass(&manager.pass).take();
+pub fn sparkle_improve_cancel(
+    manager: State<SparkleImproveManager>,
+    // Which slot to cancel — None / omitted ⇒ the hourly pass ([`HOURLY_SLOT`], the legacy call the
+    // interactive pane makes). A drain worker cancels its OWN slot so it never kills a sibling.
+    slot: Option<String>,
+) -> Result<(), String> {
+    let slot_key = slot.unwrap_or_default();
+    let pass = lock_passes(&manager.passes).remove(&slot_key);
     if let Some(pass) = pass {
         end_pass_early(pass, PassEnd::Cancelled);
     }
@@ -825,10 +877,36 @@ mod tests {
     fn manager_liveness_follows_a_real_pass_in_and_out_of_the_slot() {
         let manager = SparkleImproveManager::default();
         assert!(!manager.liveness().active, "nothing spawned yet");
-        *lock_pass(&manager.pass) = Some(spawn_sleeper());
+        lock_passes(&manager.passes).insert(HOURLY_SLOT.to_string(), spawn_sleeper());
         assert!(manager.liveness().active, "an occupied slot reads live");
         manager.end_in_flight_pass();
         assert!(!manager.liveness().active, "and a taken slot stops reading live");
+    }
+
+    /// The bounded-fleet invariant: a DRAIN worker occupies a non-empty slot alongside the hourly
+    /// slot, must NOT light the pinned hourly row, and teardown must kill EVERY slot — an orphaned
+    /// drain child would keep mutating its worktree with nothing holding a handle to stop it.
+    #[cfg(unix)]
+    #[test]
+    fn drain_slots_coexist_with_the_hourly_slot_and_teardown_kills_all() {
+        let manager = SparkleImproveManager::default();
+        // A drain worker in a non-empty slot must not read as the hourly pass being live — this pins
+        // that `liveness()` reads HOURLY_SLOT specifically, not "any occupied slot".
+        let d0 = spawn_sleeper();
+        let d0_pid = d0.child.id() as i32;
+        lock_passes(&manager.passes).insert("__sparkle_self__-drain-0".to_string(), d0);
+        assert!(!manager.liveness().active, "a drain worker must not read as the hourly pass being live");
+        // The hourly slot drives the row; the two coexist in the map (parallel by construction).
+        let h = spawn_sleeper();
+        let h_pid = h.child.id() as i32;
+        lock_passes(&manager.passes).insert(HOURLY_SLOT.to_string(), h);
+        assert!(manager.liveness().active, "the hourly slot drives the row");
+        assert_eq!(lock_passes(&manager.passes).len(), 2, "hourly + one drain coexist in the map");
+        // Teardown kills every slot, not just the hourly one.
+        manager.end_in_flight_pass();
+        assert!(!is_alive(h_pid), "hourly child survived teardown");
+        assert!(!is_alive(d0_pid), "drain child survived teardown — an orphaned mutator");
+        assert!(lock_passes(&manager.passes).is_empty(), "teardown must drain every slot");
     }
 
     #[test]
@@ -866,7 +944,7 @@ mod tests {
         let manager = SparkleImproveManager::default();
         let pass = spawn_sleeper();
         let pid = pass.child.id() as i32;
-        *lock_pass(&manager.pass) = Some(pass);
+        lock_passes(&manager.passes).insert(HOURLY_SLOT.to_string(), pass);
         assert!(is_alive(pid));
         manager.end_in_flight_pass();
         assert!(!is_alive(pid), "quit path did not kill the in-flight pass");
@@ -882,7 +960,7 @@ mod tests {
         let manager = SparkleImproveManager::default();
         let pass = spawn_sleeper();
         let pid = pass.child.id() as i32;
-        *lock_pass(&manager.pass) = Some(pass);
+        lock_passes(&manager.passes).insert(HOURLY_SLOT.to_string(), pass);
         assert!(is_alive(pid));
         drop(manager);
         assert!(!is_alive(pid), "pass outlived the app that spawned it");

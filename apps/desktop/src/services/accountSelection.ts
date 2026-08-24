@@ -1448,6 +1448,24 @@ export type ResolvedConfigDir = string | null | undefined;
  *  NEVER REJECTS, and that is load-bearing rather than defensive habit. Both callers await this on
  *  the path that starts the work — a concierge turn, an hourly pass — so a throw here would not
  *  degrade the account choice, it would kill the turn outright. */
+/** How many pool accounts the backlog-drain fleet may rotate across right now: the count of
+ *  SIGNED-IN accounts, floored at 1 so the shared default account alone still runs ONE worker.
+ *
+ *  This bounds the PARALLEL drain fleet (drainerBridge.planDrainDispatch) so N workers are never
+ *  spawned onto fewer than N accounts — the fleet spreads across the pool via the SAME per-key
+ *  rotation `accountConfigDirFor` uses, rather than piling onto one account and exhausting it. Reads
+ *  the cached account state (no force); an unreadable/empty backend yields 1 (one worker on the
+ *  default), never 0, so a momentary backend hiccup can never wedge the drainer to "no accounts".
+ */
+export async function availablePoolAccountCount(): Promise<number> {
+  try {
+    const state = await loadAccountState();
+    return Math.max(1, signedInAccountIds(state.identities).length);
+  } catch {
+    return 1;
+  }
+}
+
 export async function accountConfigDirFor(
   key: string,
   opts: { force?: boolean; now?: number; avoidClobberedDefault?: boolean } = {},

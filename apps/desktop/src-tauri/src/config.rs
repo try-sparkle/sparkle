@@ -3475,15 +3475,23 @@ fn apply_drainer(into: &mut DrainerConfig, p: Option<PartialDrainer>) -> Vec<Str
     // real, honoured [drainer] settings — so they must NOT be reported as "has no effect" (telling a
     // user their `feedback_floor = 20` is inert, when deleting it makes the fleet drain to empty
     // instead of resting, is worse than saying nothing). Skip them; warn only on genuinely unknown keys.
-    const ENGINE_KEYS: &[&str] =
-        &["feedback_floor", "max_workers", "claim_max_age", "inprogress_max_age", "lock_ttl"];
+    // `max_concurrency` is read APP-SIDE (drainer.rs `drainer_max_concurrency`), the others by the
+    // SHELL watchdog; both are real honoured [drainer] settings, so neither may be flagged "no effect".
+    const ENGINE_KEYS: &[&str] = &[
+        "feedback_floor",
+        "max_workers",
+        "max_concurrency",
+        "claim_max_age",
+        "inprogress_max_age",
+        "lock_ttl",
+    ];
     for (field, _) in p.rest {
         if ENGINE_KEYS.contains(&field.as_str()) {
             continue;
         }
         warnings.push(format!(
             "[drainer].{field} is not a drainer setting (enabled, feedback_floor, max_workers, \
-             claim_max_age, inprogress_max_age, lock_ttl), so it has no effect"
+             max_concurrency, claim_max_age, inprogress_max_age, lock_ttl), so it has no effect"
         ));
     }
     warnings
@@ -5592,6 +5600,10 @@ model   = "claude-opus-5"   # must differ from the planner's model, and be one S
 # the SPARKLE_DRAINER_ENABLED=0 environment variable.
 [drainer]
 enabled = true              # master switch — false makes the in-app drain loop fully inert
+# max_concurrency: how many in-app drain workers run in PARALLEL (a bounded fleet). Default 3, floored
+# at 1 and hard-capped in the app. The effective bound is the strictest of this, the shell's
+# max_workers cap, and the number of healthy pool accounts available to rotate across.
+# max_concurrency = 3
 
 # --- Opinionated tools (per-machine; ignored in a project file) -------------------------
 # The non-AI tools Sparkle leans on, surfaced in ⋯ Settings → "Tools". Each defaults on for a
