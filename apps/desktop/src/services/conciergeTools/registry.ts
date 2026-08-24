@@ -110,6 +110,7 @@ import {
   readPickerOptions,
   selectPickerOption,
   sendControlKey,
+  quitAlternateScreen,
   type ControlKeyName,
   sendToAgentTerminal,
 } from "./terminal";
@@ -1290,6 +1291,28 @@ const controlKeyArgs = z
   .strict();
 
 const TERMINAL_ROUTES: Record<TerminalOp, Handler> = {
+  // NO KEY ARGUMENT, and that is the design (bead sparkle-w11lll). The op presses `q` and only `q`,
+  // behind four gates it evaluates itself. Taking a key here — even a narrowed one — would put the
+  // choice of byte back in the model's hands, which is exactly what widening `CONTROL_KEYS` would
+  // have done and what `conciergeTools/terminal`'s header refuses.
+  quit_alternate_screen: route(agentOnly, async (a, ctx) => {
+    // Same authority as any other terminal write: this changes what a running process does next and
+    // cannot be un-pressed, so it is not a lesser act than typing.
+    const authority = conciergeToolAuthority(ctx.toolCallId, ctx.decision);
+    if (!authority) {
+      log.warn("concierge-tools", "quit-alternate-screen refused — no authority could be built", {
+        agentId: a.agentId,
+        tier: ctx.decision.tier,
+      });
+      return err(
+        ctx,
+        REGISTRY_CODES.unauthorized,
+        "Not pressed: nothing authorized this write. A concierge tool write needs a tool-call id and a resolved allow/approved policy.",
+      );
+    }
+    const r = await quitAlternateScreen(a.agentId, authority);
+    return r.ok ? ok(ctx, r) : err(ctx, r.reason ?? "action-failed", r.detail);
+  }),
   send_control_key: route(controlKeyArgs, async (a, ctx) => {
     // Same authority as any other terminal write: pressing esc can discard work in flight, so it is
     // not a lesser act than typing and does not get a lesser gate.

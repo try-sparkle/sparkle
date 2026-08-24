@@ -105,6 +105,13 @@ fn apply_noninteractive(cmd: &mut Command) {
     cmd.env("GIT_TERMINAL_PROMPT", "0");
     cmd.env("GIT_ASKPASS", "true");
     cmd.env("GIT_SSH_COMMAND", "ssh -oBatchMode=yes");
+    // MAKING THE DOCUMENTED GUARANTEE TRUE (bead `sparkle-w11lll`). `git`'s doc comment below says
+    // this env "disables hooks, credential prompts and pagers" — and until now it set no pager
+    // variable at all. Harmless in practice, because every caller here captures with `.output()`
+    // and git detects the pipe and self-disables its pager. But a docstring that overstates a
+    // guarantee is how the next caller gets it wrong: the moment one of these runs on a TTY, or is
+    // copied to a path that does, the promise silently stops holding. Cheaper to make it true.
+    crate::claude_oneshot::apply_noninteractive_pager(cmd);
     #[cfg(test)]
     apply_test_hook_isolation(cmd);
 }

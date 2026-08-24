@@ -401,6 +401,7 @@ export const TERMINAL_TOOL_NAMES = [
   "read_picker_options",
   "select_picker_option",
   "send_control_key",
+  "quit_alternate_screen",
   "send_to_agent_terminal",
 ] as const;
 
@@ -422,6 +423,11 @@ export const TERMINAL_TOOL_RISK: Record<TerminalToolName, ConciergeRiskClass> = 
   select_picker_option: "disruptive",
   // `esc` can discard work in flight; this is at least as consequential as typing.
   send_control_key: "disruptive",
+  // `disruptive`, NOT `read-only`, even though its four gates make it the narrowest write in this
+  // domain (bead sparkle-w11lll). It presses a key into a live process and cannot be un-pressed;
+  // the gates decide WHERE it may do that, and a risk class is about WHAT the act is. Classifying it
+  // below a send would let an autonomy policy gate typing while waving this through.
+  quit_alternate_screen: "disruptive",
   send_to_agent_terminal: "disruptive",
 };
 
@@ -433,6 +439,9 @@ const TERMINAL_TOOL_SUMMARY: Record<TerminalToolName, string> = {
   read_picker_options: "Read the menu an agent is showing right now.",
   select_picker_option: "Answer a menu an agent is showing, as if you had picked it.",
   send_control_key: "Press esc, shift+tab, ctrl+b, enter or an arrow key in an agent's terminal.",
+  quit_alternate_screen:
+    "Press q to get an agent out of a full-screen pager it is stuck in. Refuses on any screen that " +
+    "is Claude Code's own, or that offers a choice to answer.",
   send_to_agent_terminal:
     "Type a message into an agent's terminal, as if you had typed it. State `goal` (a verifiable " +
     "completion criterion) or `notWork: { reason }`.",

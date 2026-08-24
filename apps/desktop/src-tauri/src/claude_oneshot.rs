@@ -779,6 +779,53 @@ pub(crate) fn scrub_anthropic_env_for(cmd: &mut Command) {
     }
 }
 
+/// Environment forced on every child Sparkle spawns so that NOTHING it runs can open an
+/// interactive PAGER.
+///
+/// THE INCIDENT (bead `sparkle-w11lll`). Two agents were found wedged in a pager, both showing a
+/// markdown file with a scroll viewport. A pager puts the terminal in the ALTERNATE SCREEN, and an
+/// agent parked there is unreachable by EVERY automated path Sparkle has:
+/// `dispatchConciergeAnswer` refuses each write with `alternate-screen` (correctly — typed text
+/// would execute as pager commands), auto-resume refuses the same way and burns its retry budget
+/// until it escalates to a human, and the only key that quits a pager is `q`, which
+/// `send_control_key`'s named vocabulary could not send. So the agent sat until a human physically
+/// pressed `q` in the pane — and one of the two was holding five uncommitted files at the time,
+/// which is how a cosmetic-looking wedge costs work.
+///
+/// FIXED IN THE ENVIRONMENT, NOT AT THE CALL SITES, and that is the whole design. A pager can be
+/// launched by `git log`, `git diff`, `gh`, `man`, `journalctl`, `bd`, or any of the hundreds of
+/// commands an autonomous agent types that nobody here will ever enumerate. Patching the call sites
+/// we happen to know about leaves the next one open; setting the environment once closes all of
+/// them, including commands that do not exist yet.
+///
+/// WHY BOTH `PAGER` AND THE PER-TOOL NAMES: each tool checks its own variable FIRST and only falls
+/// back to `PAGER`, so `PAGER=cat` alone is silently overridden by a user's `GIT_PAGER=less` (and
+/// by `core.pager`, which `GIT_PAGER` outranks and `PAGER` does not).
+///
+/// `LESS=FRX` IS THE BACKSTOP FOR A DIRECT EXEC — a tool that runs `less` itself, ignoring every
+/// variable above. `X` is the load-bearing letter: it stops `less` from switching to the alternate
+/// screen at all, which is precisely the state that made the agent unreachable. `F` quits
+/// immediately when the content fits one screen and `R` keeps colour escapes readable.
+pub(crate) const NONINTERACTIVE_PAGER_ENV: &[(&str, &str)] = &[
+    ("PAGER", "cat"),
+    ("GIT_PAGER", "cat"),
+    ("GH_PAGER", "cat"),
+    ("SYSTEMD_PAGER", "cat"),
+    ("MANPAGER", "cat"),
+    ("LESS", "FRX"),
+];
+
+/// Force [`NONINTERACTIVE_PAGER_ENV`] onto a `std::process::Command` about to be spawned.
+///
+/// `env` and not `env_remove`: the parent's value is the thing being defended against, so removing
+/// the name merely falls back to the tool's compiled-in default, which for `git` and `man` IS a
+/// pager. The value has to be set.
+pub(crate) fn apply_noninteractive_pager(cmd: &mut Command) {
+    for (name, value) in NONINTERACTIVE_PAGER_ENV {
+        cmd.env(name, value);
+    }
+}
+
 /// Run one call and return the model's reply text. `Err` on every failure so callers degrade.
 pub(crate) fn run(req: OneShot<'_>) -> Result<OneShotReply, String> {
     let claude_path = crate::preflight::cached_claude_path().ok_or_else(|| {
@@ -3000,6 +3047,84 @@ mod tests {
                 "{name} is scrubbed in Rust but NOT unset before `claude auth login` in \
                  claudeSpawn.ts. Add it to ANTHROPIC_ENV_UNSET (and its test's UNSET_PREFIX), or \
                  the login writes a credential the auth probe does not read."
+            );
+        }
+    }
+
+    #[test]
+    fn apply_noninteractive_pager_sets_every_pager_variable_on_the_spawned_command() {
+        // The SIDE EFFECT — what the child's environment actually becomes — not that the const has
+        // entries. Asserted against the whole const so a pair added there without being applied
+        // fails here.
+        let mut cmd = Command::new("/bin/echo");
+        apply_noninteractive_pager(&mut cmd);
+        let set: Vec<(String, String)> = cmd
+            .get_envs()
+            .filter_map(|(k, v)| {
+                v.map(|v| (k.to_string_lossy().to_string(), v.to_string_lossy().to_string()))
+            })
+            .collect();
+        for (name, value) in NONINTERACTIVE_PAGER_ENV {
+            assert!(
+                set.contains(&(name.to_string(), value.to_string())),
+                "{name}={value} not applied; got {set:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_pager_values_are_actually_non_interactive() {
+        // A NAME-ONLY check would pass for `PAGER=less`, which is the defect, so pin the VALUES.
+        let pairs: std::collections::HashMap<&str, &str> =
+            NONINTERACTIVE_PAGER_ENV.iter().copied().collect();
+        // The two that a real agent hits first: `git` reads GIT_PAGER before PAGER and before
+        // `core.pager`, so GIT_PAGER is the one that has to be right.
+        assert_eq!(pairs.get("PAGER"), Some(&"cat"));
+        assert_eq!(pairs.get("GIT_PAGER"), Some(&"cat"));
+        // `X` is the load-bearing letter — it keeps `less` off the ALTERNATE SCREEN even when a
+        // tool execs it directly and consults no pager variable at all. Losing it re-opens the
+        // exact wedge this closes, while every other assertion here would stay green.
+        let less = pairs.get("LESS").expect("LESS must be pinned — it is the direct-exec backstop");
+        assert!(less.contains('X'), "LESS={less} must contain X (no alternate screen)");
+        // Nothing here may name a real pager.
+        for (name, value) in NONINTERACTIVE_PAGER_ENV {
+            assert!(
+                !matches!(*value, "less" | "more" | "bat" | "most"),
+                "{name}={value} IS a pager"
+            );
+        }
+    }
+
+    #[test]
+    fn every_pager_variable_is_also_exported_before_the_typescript_agent_spawn() {
+        // THE DRIFT THIS CATCHES, and why setting the env in Rust is not sufficient on its own.
+        // `pty.rs` applies NONINTERACTIVE_PAGER_ENV to the CommandBuilder — but the command it
+        // spawns is `zsh -l -c <script>`, a LOGIN shell, which sources the user's profile AFTER
+        // that environment is applied. A `.zprofile` line as ordinary as `export GIT_PAGER=less`
+        // clobbers the Rust value. The TypeScript-side export runs INSIDE the script, after the
+        // profile, so it wins — and this test is what keeps the two lists saying the same thing.
+        let ts = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../src/services/claudeSpawn.ts");
+        let src = std::fs::read_to_string(&ts)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", ts.display()));
+        // Scope to the export constant, not the whole file: a name merely MENTIONED in a comment
+        // elsewhere must not satisfy this.
+        let start = src
+            .find("const PAGER_ENV_EXPORT")
+            .expect("claudeSpawn.ts must define PAGER_ENV_EXPORT — the login-shell pager export");
+        let block = &src[start..];
+        // End at the string's own closing quote-then-semicolon, NOT at the first `;` — the exported
+        // shell string CONTAINS a `;`, so `find(';')` would truncate the last pair and make this
+        // vacuous for exactly one variable.
+        let end = block.find("\";").expect("PAGER_ENV_EXPORT must be a terminated string literal");
+        let export = &block[..end];
+        for (name, value) in NONINTERACTIVE_PAGER_ENV {
+            let pair = format!("{name}={value}");
+            assert!(
+                export.contains(&pair),
+                "{pair} is forced on the Rust PTY spawn but NOT exported in claudeSpawn.ts's \
+                 PAGER_ENV_EXPORT. A login profile can then clobber it and the agent gets a pager \
+                 — the wedge this exists to prevent. Add it there (and to the test's PAGER_PREFIX)."
             );
         }
     }

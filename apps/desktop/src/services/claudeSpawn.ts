@@ -252,7 +252,7 @@ export function buildClaudeExec(
       ? `export CLAUDE_CODE_RESUME_THRESHOLD_MINUTES=${RESUME_PROMPT_SUPPRESS_MINUTES}; ` +
         `export CLAUDE_CODE_RESUME_TOKEN_THRESHOLD=${RESUME_PROMPT_SUPPRESS_TOKENS}; `
       : "";
-  return `${configExport}${beadsReadonlyExport}${inboxAgentExport}${resumeThresholdExport}export PATH="$HOME/.local/bin:$PATH"; ${cmd}`;
+  return `${configExport}${beadsReadonlyExport}${inboxAgentExport}${resumeThresholdExport}${PAGER_ENV_EXPORT}export PATH="$HOME/.local/bin:$PATH"; ${cmd}`;
 }
 
 /**
@@ -298,7 +298,7 @@ export function buildClaudeLoginExec(claudePath: string, opts: { configDir?: str
   // ANTHROPIC_ENV_UNSET is load-bearing and came from the parallel auth-gate fix: with an API-key
   // env var set, `claude` authenticates with THAT instead of running the OAuth browser flow, so the
   // sign-in silently does nothing. Both halves of this bug had to be fixed for a login to work.
-  return `${configExport}${ANTHROPIC_ENV_UNSET}export PATH="$HOME/.local/bin:$PATH"; exec ${shellQuote(claudePath)} ${CLAUDE_LOGIN_ARGV}`;
+  return `${configExport}${ANTHROPIC_ENV_UNSET}${PAGER_ENV_EXPORT}export PATH="$HOME/.local/bin:$PATH"; exec ${shellQuote(claudePath)} ${CLAUDE_LOGIN_ARGV}`;
 }
 
 /** FNV-1a 32-bit, hex. Not a security hash — just a short, stable, collision-resistant token for a
@@ -366,6 +366,37 @@ export function claudeSignInPtyId(configDir: string | undefined, attempt: number
 const ANTHROPIC_ENV_UNSET =
   "unset ANTHROPIC_API_KEY ANTHROPIC_API ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL " +
   "ANTHROPIC_CUSTOM_HEADERS CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX; ";
+
+/**
+ * Force a NON-INTERACTIVE PAGER on the spawned `claude` and everything it shells out to.
+ *
+ * THE INCIDENT (bead `sparkle-w11lll`). Two agents were found wedged on the ALTERNATE SCREEN, the
+ * state a pager puts a terminal in. An agent parked there is unreachable by EVERY automated path
+ * Sparkle has: `dispatchConciergeAnswer` refuses each write with `alternate-screen` (correctly —
+ * typed text would execute as pager commands), auto-resume refuses identically and burns its retry
+ * budget until it escalates to a human, and the only key that quits a pager is `q`, which
+ * `send_control_key`'s named vocabulary could not send. A human had to press `q` in the pane, and
+ * one of the two agents was holding five uncommitted files while it waited.
+ *
+ * WHY THIS EXISTS IN ADDITION TO THE RUST-SIDE ENV, which is the part worth reading before deleting
+ * it as a duplicate. `pty.rs` sets these same pairs on the `CommandBuilder` — but this string is
+ * handed to `zsh -l -c`, a LOGIN shell, which sources the user's `.zprofile`/`.zlogin` AFTER that
+ * environment is applied. A profile line as ordinary as `export GIT_PAGER=less` therefore CLOBBERS
+ * the Rust value, and the agent gets a pager anyway. Exporting here runs after the profile has run,
+ * so it wins. Exactly the argument {@link ANTHROPIC_ENV_UNSET} makes for using `unset` inside the
+ * script rather than `env -u` outside it — same shell, same ordering trap.
+ *
+ * WHY BOTH `PAGER` AND THE PER-TOOL NAMES: each tool reads its own variable FIRST and only falls
+ * back to `PAGER`, so `PAGER=cat` alone is overridden by a user's `GIT_PAGER=less` — and by git's
+ * `core.pager`, which `GIT_PAGER` outranks and `PAGER` does not.
+ *
+ * `LESS=FRX` IS THE BACKSTOP FOR A DIRECT EXEC — a tool that runs `less` itself and consults none
+ * of the above. `X` is the load-bearing letter: it keeps `less` OFF the alternate screen, which is
+ * the exact state that made the agent unreachable. `F` quits when the content fits one screen, `R`
+ * keeps colour readable.
+ */
+const PAGER_ENV_EXPORT =
+  "export PAGER=cat GIT_PAGER=cat GH_PAGER=cat SYSTEMD_PAGER=cat MANPAGER=cat LESS=FRX; ";
 
 /** Build the inline JSON for `claude --mcp-config` that launches the Sparkle orchestrator MCP
  *  server (a stdio child) wired to this build agent's bridge. The bridge socket + token ride in

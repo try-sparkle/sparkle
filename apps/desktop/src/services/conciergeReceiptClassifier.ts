@@ -183,6 +183,10 @@ const TERMINAL_RULES: Record<TerminalToolName, OpRule> = {
   read_picker_options: null,
   select_picker_option: null,
   send_control_key: null,
+  // `null` for the same reason as its two neighbours, and more clearly so: "Sent a message to X" for
+  // quitting a pager on X's behalf describes something the concierge did not do. The vocabulary has
+  // no arm for "unstuck an agent"; silence beats a wrong sentence.
+  quit_alternate_screen: null,
   send_to_agent_terminal: { kind: "sent", channel: "terminal" },
 };
 

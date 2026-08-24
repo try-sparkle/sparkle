@@ -284,6 +284,10 @@ const TERMINAL_PHRASES: Record<TerminalOp, OpPhrase> = {
   read_picker_options: phrase("Reading %s's options", "Read %s's options", AGENT),
   select_picker_option: phrase("Answering %s's prompt", "Answered %s's prompt", AGENT),
   send_control_key: phrase("Pressing a key in %s", "Pressed a key in %s", AGENT),
+  // "a pager", not "a key": the human reading this column needs to know the concierge is UNSTICKING
+  // an agent, not steering one. The two acts look identical in a generic "pressed a key" line, and
+  // the whole reason this op exists is that the first was impossible (bead sparkle-w11lll).
+  quit_alternate_screen: phrase("Getting %s out of a pager", "Got %s out of a pager", AGENT),
   send_to_agent_terminal: phrase("Writing to %s", "Wrote to %s", AGENT),
 };
 

@@ -1133,6 +1133,35 @@ fn apply_test_worker_cap(cmd: &mut CommandBuilder, user_already_set: bool, cap: 
     }
 }
 
+/// Force a NON-INTERACTIVE PAGER on an agent's PTY child.
+///
+/// THE INCIDENT (bead `sparkle-w11lll`). This is the ONE spawn in the app that hands its child a
+/// REAL TTY. Every other child Sparkle starts is captured with `.output()`, where `git` and `gh`
+/// detect the pipe and disable their pagers unasked — which is why this gap survived: the pager
+/// question genuinely does not arise anywhere else. Here it does, and the consequences are the
+/// worst in the app, because an agent that opens a pager enters the ALTERNATE SCREEN and every
+/// automated route to it closes at once: `dispatchConciergeAnswer` refuses each write with
+/// `alternate-screen`, auto-resume refuses identically and burns its retry budget escalating to a
+/// human, and the key that quits a pager — `q` — was not in `send_control_key`'s named vocabulary.
+/// The agent then sits until a human presses `q` in the pane, holding whatever uncommitted work it
+/// had.
+///
+/// SET IN THE ENVIRONMENT, NOT AT THE CALL SITES. The commands that can open a pager are whatever
+/// an autonomous agent decides to type — `git log`, `git diff`, `gh`, `man`, `journalctl`, `bd` —
+/// and several of this repo's own SessionStart scripts hand agents bare `git diff`/`git show`
+/// remedies with no `--no-pager`. Enumerating them fixes the ones we know and leaves the next one
+/// open; setting the environment once closes the whole class, including commands not written yet.
+///
+/// Shares [`crate::claude_oneshot::NONINTERACTIVE_PAGER_ENV`] with the `std::process::Command`
+/// path rather than restating the pairs, because the two cannot then drift — the same reason the
+/// secret scrub above borrows its list instead of copying it. Only the *loop* differs, because
+/// `CommandBuilder` is `portable_pty`'s type and the shared `&mut Command` helper cannot take it.
+fn apply_noninteractive_pager(cmd: &mut CommandBuilder) {
+    for (name, value) in crate::claude_oneshot::NONINTERACTIVE_PAGER_ENV {
+        cmd.env(name, value);
+    }
+}
+
 /// What a reader thread does about its observer once it knows [`Reap`]'s verdict.
 ///
 /// TWO LINES, EXTRACTED SO THEY CAN BE TESTED — and that is the whole point, not tidiness. The bug
@@ -1284,6 +1313,11 @@ pub async fn pty_spawn(
             for name in crate::claude_oneshot::secret_env_names_now() {
                 cmd.env_remove(&name);
             }
+            // NOTHING THIS AGENT RUNS MAY OPEN A PAGER (bead `sparkle-w11lll`). This is the only
+            // child in the app with a real TTY, so it is the only one whose `git log` would page —
+            // and a paged agent is unreachable by every automated path Sparkle has. See
+            // `apply_noninteractive_pager`.
+            apply_noninteractive_pager(&mut cmd);
             // Bound the child's V8 heap so a runaway agent can't run itself up to Node's ~4 GiB
             // default ceiling (sparkle-01xv). Merges with — never clobbers — a NODE_OPTIONS the
             // user already set; see node_options_with_cap.
@@ -2146,7 +2180,7 @@ mod epoch_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        acquire_writer, apply_heap_cap, apply_test_worker_cap, config_dir_from_args, spawn_account_from_args, write_watched, SpawnAccount,
+        acquire_writer, apply_heap_cap, apply_noninteractive_pager, apply_test_worker_cap, config_dir_from_args, spawn_account_from_args, write_watched, SpawnAccount,
         guard_resize_size, guard_spawn_size,
         insert_or_cancel,
         next_pty_epoch,
@@ -2261,6 +2295,47 @@ mod tests {
         // agent_heap_mb = 0 is the documented escape hatch: no cap, and no NODE_OPTIONS churn.
         assert_eq!(node_options_with_cap(None, 0), None);
         assert_eq!(node_options_with_cap(Some("--enable-source-maps"), 0), None);
+    }
+
+    // ══ NO AGENT MAY BE ABLE TO OPEN A PAGER (bead sparkle-w11lll) ══════════════════════════════
+    //
+    // This is the only child in the app handed a REAL TTY, so it is the only one where `git log`
+    // pages. An agent that pages enters the alternate screen, and then every automated route to it
+    // closes at once — concierge writes refuse, auto-resume refuses and burns its retries, and the
+    // key that quits a pager was not one Sparkle could send. A human had to free it by hand.
+    #[test]
+    fn agent_pty_children_get_a_non_interactive_pager() {
+        let mut cmd = CommandBuilder::new("/bin/echo");
+        apply_noninteractive_pager(&mut cmd);
+        for (name, value) in crate::claude_oneshot::NONINTERACTIVE_PAGER_ENV {
+            assert_eq!(
+                cmd.get_env(name).and_then(|v| v.to_str()),
+                Some(*value),
+                "{name} must be {value} on an agent PTY child"
+            );
+        }
+    }
+
+    // THE VALUE, NOT JUST THE NAME — and the OVERRIDE, which is the part a name-only check misses.
+    //
+    // `CommandBuilder` inherits the parent environment and `get_env` surfaces the inherited value,
+    // so "PAGER is set" is satisfied on any machine whose shell exports `PAGER=less` — green while
+    // shipping the exact defect. Seeding a decoy pager first makes the assertion unambiguous: the
+    // value afterwards can only be ours.
+    #[test]
+    fn the_pty_pager_env_overrides_a_pager_the_app_inherited() {
+        let mut cmd = CommandBuilder::new("/bin/echo");
+        cmd.env("PAGER", "less");
+        cmd.env("GIT_PAGER", "less");
+        cmd.env("LESS", "");
+        apply_noninteractive_pager(&mut cmd);
+        assert_eq!(cmd.get_env("PAGER").and_then(|v| v.to_str()), Some("cat"));
+        assert_eq!(cmd.get_env("GIT_PAGER").and_then(|v| v.to_str()), Some("cat"));
+        // `X` is the letter that matters: it keeps `less` off the ALTERNATE SCREEN when some tool
+        // execs it directly, consulting none of the variables above. Drop it and the wedge returns
+        // while every other assertion here stays green.
+        let less = cmd.get_env("LESS").and_then(|v| v.to_str()).unwrap_or_default().to_string();
+        assert!(less.contains('X'), "LESS={less} must contain X — no alternate screen");
     }
 
     #[test]

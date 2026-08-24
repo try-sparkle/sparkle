@@ -30,6 +30,20 @@ vi.mock("../terminalScrollback", async (orig) => ({
   ...(await orig<typeof import("../terminalScrollback")>()),
   getAgentScrollback: vi.fn<(id: string) => string | null>(() => null),
 }));
+// ── THE H2 SEAM (bead sparkle-w11lll) ─────────────────────────────────────────────────────────
+// REAL BY DEFAULT — the factory wraps the shipping functions rather than replacing them, so every
+// other case in this file, and the dispatcher's own use of them, runs the production predicates.
+// The `quit_alternate_screen` H2 regression cases override them for one assertion each: the whole
+// question that test asks is "what happens when Claude Code recognition is WRONG", and the only
+// honest way to ask it is to make it wrong.
+vi.mock("../../engine/claudeCodeScreen", async (orig) => {
+  const real = await orig<typeof import("../../engine/claudeCodeScreen")>();
+  return {
+    ...real,
+    isClaudeCodeScreen: vi.fn(real.isClaudeCodeScreen),
+    hasClaudeCodeLiveTui: vi.fn(real.hasClaudeCodeLiveTui),
+  };
+});
 vi.mock("../trialMeter", () => ({ trialSendAllowed: () => true, recordTrialSend: vi.fn() }));
 vi.mock("../history", () => ({ searchHistory: vi.fn(async () => []) }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn(async () => "") }));
@@ -53,6 +67,31 @@ import { searchHistory } from "../history";
 import { useRuntimeStore, readPersistedOpenAgentIds } from "../../stores/runtimeStore";
 import { getAgentScrollback } from "../terminalScrollback";
 import { FOOTER_ONLY_SCREEN } from "../../engine/incidentScreens.fixture";
+import { isClaudeCodeScreen, hasClaudeCodeLiveTui } from "../../engine/claudeCodeScreen";
+import {
+  APPROVAL_2_1_220,
+  IDLE_AFTER_TURN_2_1_220,
+  LESS_ON_A_MARKDOWN_FILE,
+  VIM_ON_A_MARKDOWN_FILE,
+} from "../../engine/capturedScreens.fixture";
+import {
+  BASH_PERMISSION_PROMPT,
+  PLAN_EXIT_PROMPT,
+  PLAN_EXIT_PROMPT_OLD_SHAPE,
+} from "../suggestions/planPrompt.fixture";
+// The REAL viewport registry, not a mock of it: `quitAlternateScreen` and `dispatchConciergeAnswer`
+// both read screens through it, and the complement invariant below is only worth anything if the two
+// are looking at the same thing by the same route.
+import { registerViewport, resetViewportRegistry } from "../terminalViewport";
+// THE REAL PREDICATES, kept so the H2 cases can put them BACK. `vi.clearAllMocks()` in this file's
+// top-level `beforeEach` resets call history but KEEPS any implementation a case installed — the
+// leak its own comment warns about two mocks up. Without this, the first case that forces Claude
+// Code recognition to `false` would leave every later case blind to Claude Code, and the gate-2 test
+// would fail pointing nowhere near its cause. (It did, exactly once, before this line existed.)
+const REAL_SCREEN =
+  await vi.importActual<typeof import("../../engine/claudeCodeScreen")>(
+    "../../engine/claudeCodeScreen",
+  );
 import type { PickerOptionsRead } from "./terminal";
 import {
   CONTROL_KEYS,
@@ -88,6 +127,7 @@ import {
   noteAgentTranscriptPath,
   noteAgentTranscriptWorktree,
   readAgentTerminal,
+  quitAlternateScreen,
   sendToAgentTerminal,
   type AgentTerminalRead,
   type ReadAgentTerminalOptions,
@@ -1248,6 +1288,7 @@ describe("CONCIERGE_TERMINAL_TOOLS — the descriptor seam", () => {
       "read_picker_options",
       "select_picker_option",
       "send_control_key",
+      "quit_alternate_screen",
       "send_to_agent_terminal",
       "get_agent_status",
     ].sort());
@@ -1258,7 +1299,14 @@ describe("CONCIERGE_TERMINAL_TOOLS — the descriptor seam", () => {
   // allowed silently wherever a send would have been asked about.
   it("marks exactly the write tools as writes", () => {
     const writes = CONCIERGE_TERMINAL_TOOLS.filter((t) => t.write).map((t) => t.name).sort();
-    expect(writes).toEqual(["select_picker_option", "send_control_key", "send_to_agent_terminal"]);
+    expect(writes).toEqual([
+      // Four gates narrower than everything else on this list, and still a WRITE: it presses a key
+      // into a live process and cannot be un-pressed (bead sparkle-w11lll).
+      "quit_alternate_screen",
+      "select_picker_option",
+      "send_control_key",
+      "send_to_agent_terminal",
+    ]);
   });
 
   it("gives every tool a description worth putting in a context window", () => {
@@ -2475,5 +2523,287 @@ describe("a picker whose option rows are separated by description lines", () => 
 
     const r = await selectPickerOption(AGENT, 0, fp, ALLOWED);
     expect(r.ok).toBe(true);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+// QUITTING AN ALTERNATE SCREEN (bead sparkle-w11lll)
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+//
+// Two agents were found WEDGED on an alternate screen with every automated route shut: the
+// dispatcher refuses all text there, the goal auto-resume burns its retry budget taking that same
+// refusal, and `q` — the one key that quits a pager — was not in `send_control_key`'s vocabulary.
+//
+// THE DIAGNOSIS IS UNSETTLED, and these tests exist because of that. Both wedged screens showed a
+// viewport on `$CLAUDE_CONFIG_DIR/plans/*.md`, and no pager is invoked anywhere in this repo. So
+// either a real `less` was open (H1), or it was CLAUDE CODE'S OWN plan surface and
+// `isClaudeCodeScreen` failed to recognise it (H2). An escape hatch gated only on
+// `!isClaudeCodeScreen` would, under H2, press `q` into a Claude Code plan dialog.
+//
+// Every assertion below is on the SIDE EFFECT — the bytes that reached the PTY, or did not. A test
+// that only checked `ok: false` would pass against an implementation that wrote `q` and then
+// mislabelled the result, which is the exact failure this op must not have.
+describe("quit_alternate_screen", () => {
+  const Q = "\x71";
+  const CTRL_C = "\x03";
+
+  /** Install a viewport for AGENT. Returns a setter so a case can change what the NEXT read sees —
+   *  which is how the escalation cases model "q worked" vs "q did nothing". */
+  function mountScreen(text: string, alternateBuffer: boolean) {
+    let cur = { text, alternateBuffer };
+    registerViewport(AGENT, () => cur);
+    return (next: Partial<typeof cur>) => {
+      cur = { ...cur, ...next };
+    };
+  }
+
+  /** The bytes this op actually put on the wire, in order. Nothing else in these cases writes, so an
+   *  empty array is a real "wrote nothing" rather than a filtered view of one. */
+  const written = () => vi.mocked(writePtyChainedStrict).mock.calls.map(([, bytes]) => bytes);
+
+  /** A plan dialog whose option block has scrolled UP while the agent kept printing beneath it.
+   *
+   *  THE GATE-4 SCREEN, and a realistic one: it is what the incident's own description — a scrolling
+   *  viewport over a plan file — looks like. `isClaudeCodeScreen` and `hasClaudeCodeLiveTui` are both
+   *  FALSE on it (no composer box, no grid-terminating footer) and `screenOffersAnswer` is FALSE too
+   *  (the footer has genuine new output below it). So gates 1-3 all pass and ONLY the plan predicate
+   *  stands between this screen and a `q` — no stubbing required to isolate it. */
+  const scrolledPast = (dialog: string) =>
+    [
+      dialog,
+      "Reading terminal.ts",
+      "Read 1637 lines of it, then patched the registry.",
+      "The descriptor prose is hand written, so it took a while.",
+      "Then I wired the policy risk map.",
+      "Then the activity line and the receipt classifier.",
+      "Then the mcp-control op list.",
+      "Then the hand written server description.",
+      "Then I ran the typechecker.",
+      "It came back clean on the first pass.",
+      "Now writing the tests.",
+      "",
+    ].join("\n");
+
+  const PLAN_EXIT_SCROLLED_PAST = scrolledPast(PLAN_EXIT_PROMPT);
+  const PLAN_OLD_SHAPE_SCROLLED_PAST = scrolledPast(PLAN_EXIT_PROMPT_OLD_SHAPE);
+
+  beforeEach(() => {
+    seedAgent();
+    resetViewportRegistry();
+    vi.mocked(isClaudeCodeScreen).mockImplementation(REAL_SCREEN.isClaudeCodeScreen);
+    vi.mocked(hasClaudeCodeLiveTui).mockImplementation(REAL_SCREEN.hasClaudeCodeLiveTui);
+  });
+  afterEach(() => resetViewportRegistry());
+
+  // ── 1. THE SCREEN THIS OP EXISTS FOR ────────────────────────────────────────────────────────
+  it("presses q on a real pager, and only q when the pager quits", async () => {
+    const set = mountScreen(LESS_ON_A_MARKDOWN_FILE, true);
+    vi.mocked(writePtyChainedStrict).mockImplementation(async () => {
+      // `less` leaves the alternate buffer the moment it sees q. Modelling that here is what makes
+      // the ctrl+c assertion below meaningful rather than a coincidence of ordering.
+      set({ alternateBuffer: false, text: "$ " });
+    });
+    const r = await quitAlternateScreen(AGENT, ALLOWED);
+    expect(written()).toEqual([Q]);
+    expect([r.ok, r.cleared, r.sent]).toEqual([true, true, ["q"]]);
+    // A key is bytes, not a line — it must never get submitPrompt's bracketed-paste + CR framing.
+    expect(submitPrompt).not.toHaveBeenCalled();
+  });
+
+  // ── 2. A CLAUDE CODE PERMISSION DIALOG — NOTHING WRITTEN ────────────────────────────────────
+  it("writes NOTHING into a Claude Code permission dialog", async () => {
+    mountScreen(APPROVAL_2_1_220, true);
+    const r = await quitAlternateScreen(AGENT, ALLOWED);
+    expect(written()).toEqual([]);
+    expect(r.ok).toBe(false);
+    expect(r.sent).toEqual([]);
+  });
+
+  // …AND STILL NOTHING WHEN CLAUDE CODE RECOGNITION IS TOTALLY BROKEN. This is the H2 shape applied
+  // to a permission prompt: both recognition predicates are forced FALSE, so gate 2 is gone
+  // entirely, and the refusal has to come from `screenOffersAnswer` — a dialog offers a choice, a
+  // pager does not. Asserting the REASON as well as the bytes is what makes this test isolate gate
+  // 3: without it, a future change that leaned back on gate 2 would keep it green.
+  it("writes nothing into a permission dialog even with isClaudeCodeScreen totally wrong", async () => {
+    vi.mocked(isClaudeCodeScreen).mockReturnValue(false);
+    vi.mocked(hasClaudeCodeLiveTui).mockReturnValue(false);
+    mountScreen(APPROVAL_2_1_220, true);
+    const r = await quitAlternateScreen(AGENT, ALLOWED);
+    expect(written()).toEqual([]);
+    expect(r.reason).toBe("offers-an-answer");
+  });
+
+  // ── 3. THE PLAN SURFACE — THE MOST IMPORTANT CASE IN THIS UNIT ──────────────────────────────
+  it("writes NOTHING into Claude Code's plan-exit dialog", async () => {
+    mountScreen(PLAN_EXIT_PROMPT, true);
+    const r = await quitAlternateScreen(AGENT, ALLOWED);
+    expect(written()).toEqual([]);
+    expect(r.ok).toBe(false);
+  });
+
+  // THE H2 REGRESSION TEST. If `isClaudeCodeScreen` had recognised the wedged screens, the write
+  // would never have been refused as `alternate-screen` in the first place — so under H2 the
+  // predicate is WRONG on exactly the screen this op is pointed at. Both recognition predicates are
+  // forced false here, which is a stronger break than H2 requires, and `q` must STILL not go out.
+  it("writes nothing into a plan dialog when Claude Code recognition returns FALSE (H2)", async () => {
+    vi.mocked(isClaudeCodeScreen).mockReturnValue(false);
+    vi.mocked(hasClaudeCodeLiveTui).mockReturnValue(false);
+    mountScreen(PLAN_EXIT_PROMPT, true);
+    const r = await quitAlternateScreen(AGENT, ALLOWED);
+    expect(written()).toEqual([]);
+    expect(r.ok).toBe(false);
+    // Gate 3 caught it, with gate 2 removed — which is the property the whole design rests on.
+    expect(r.reason).toBe("offers-an-answer");
+  });
+
+  // GATE 4 STANDING ALONE, with NO stub at all. On these two screens gates 1-3 genuinely pass —
+  // Claude Code recognition is false because the dialog no longer terminates the grid, and
+  // `screenOffersAnswer` is false because there is real output below the footer. The only thing
+  // holding a `q` back is the plan predicate.
+  it.each([
+    ["the current plan-exit shape", PLAN_EXIT_SCROLLED_PAST],
+    ["the older keep-planning shape", PLAN_OLD_SHAPE_SCROLLED_PAST],
+  ])("writes nothing on a plan dialog that has scrolled past — %s", async (_name, screen) => {
+    mountScreen(screen, true);
+    const r = await quitAlternateScreen(AGENT, ALLOWED);
+    expect(written()).toEqual([]);
+    expect(r.reason).toBe("plan-mode-surface");
+  });
+
+  // ── 4. GATE 1 ALONE — the buffer-mode bit ───────────────────────────────────────────────────
+  // The pager TEXT with the buffer bit false. Every other gate passes, so this case can only be
+  // green because the buffer check refused: Claude Code draws its prompt and its dialogs on the
+  // NORMAL buffer, which is why gate 1 alone already excludes all of them.
+  it("writes nothing when the terminal is on the NORMAL buffer, pager text or not", async () => {
+    mountScreen(LESS_ON_A_MARKDOWN_FILE, false);
+    const r = await quitAlternateScreen(AGENT, ALLOWED);
+    expect(written()).toEqual([]);
+    expect(r.reason).toBe("normal-buffer");
+  });
+
+  // ── 5. GATE 2 ALONE — a screen isClaudeCodeScreen accepts ───────────────────────────────────
+  // An idle Claude Code pane after a turn: it offers no choice and is no plan surface, so gates 3
+  // and 4 both pass on it. Only the recognition predicate refuses. (It is also the measured shape
+  // behind the founder's rule that Claude Code can hold the alternate buffer at a bare idle prompt —
+  // which is why this op must refuse it rather than "helpfully" quitting it.)
+  it("writes nothing on a screen Claude Code owns, even though it offers no answer", async () => {
+    mountScreen(IDLE_AFTER_TURN_2_1_220, true);
+    const r = await quitAlternateScreen(AGENT, ALLOWED);
+    expect(written()).toEqual([]);
+    expect(r.reason).toBe("claude-code-screen");
+  });
+
+  // ── 6. ESCALATION, BOTH DIRECTIONS ──────────────────────────────────────────────────────────
+  it("escalates to ctrl+c when q leaves the terminal on the alternate buffer", async () => {
+    // `vim` ignores q. Nothing changes between reads, which is exactly the wedged case.
+    mountScreen(VIM_ON_A_MARKDOWN_FILE, true);
+    const r = await quitAlternateScreen(AGENT, ALLOWED);
+    expect(written()).toEqual([Q, CTRL_C]);
+    // AND IT DOES NOT CLAIM SUCCESS. Both keys went out and the screen never cleared; saying so is
+    // the useful answer, and looping would be the useless one.
+    expect([r.ok, r.cleared, r.reason]).toEqual([false, false, "still-alternate"]);
+  });
+
+  it("does NOT send ctrl+c once q has cleared the alternate screen", async () => {
+    const set = mountScreen(LESS_ON_A_MARKDOWN_FILE, true);
+    vi.mocked(writePtyChainedStrict).mockImplementationOnce(async () => {
+      set({ alternateBuffer: false, text: "$ " });
+    });
+    await quitAlternateScreen(AGENT, ALLOWED);
+    expect(written()).toEqual([Q]);
+    expect(written()).not.toContain(CTRL_C);
+  });
+
+  // A SCREEN THAT CHANGED UNDER US IS RE-GATED, NOT ESCALATED INTO. If the pager exits straight
+  // into a Claude Code dialog that itself holds the alternate buffer, escalating on the verdict from
+  // BEFORE the q would put ctrl+c into that dialog — the H2 mistake, one step later.
+  it("re-runs every gate against a FRESH snapshot before escalating", async () => {
+    const set = mountScreen(LESS_ON_A_MARKDOWN_FILE, true);
+    vi.mocked(writePtyChainedStrict).mockImplementationOnce(async () => {
+      set({ text: APPROVAL_2_1_220 });
+    });
+    const r = await quitAlternateScreen(AGENT, ALLOWED);
+    expect(written()).toEqual([Q]);
+    expect(written()).not.toContain(CTRL_C);
+    expect(r.reason).toBe("claude-code-screen");
+  });
+
+  // ── THE SHARED GATES, which this op does not get a lesser version of ────────────────────────
+  it("refuses without a valid authority, and writes nothing", async () => {
+    mountScreen(LESS_ON_A_MARKDOWN_FILE, true);
+    const r = await quitAlternateScreen(AGENT, null as never);
+    expect([r.ok, r.reason]).toEqual([false, "unauthorized"]);
+    expect(written()).toEqual([]);
+  });
+
+  it("refuses an unknown agent, and a cloud agent, without writing", async () => {
+    mountScreen(LESS_ON_A_MARKDOWN_FILE, true);
+    expect((await quitAlternateScreen("nope", ALLOWED)).reason).toBe("unknown-agent");
+    seedAgent("cloud");
+    expect((await quitAlternateScreen(AGENT, ALLOWED)).reason).toBe("cloud-agent");
+    expect(written()).toEqual([]);
+  });
+
+  // BLIND IS A REFUSAL, never an empty screen — `getAgentViewport`'s own rule. A write decided on no
+  // evidence is the shape this whole module exists to avoid.
+  it("refuses when this window cannot see the terminal at all", async () => {
+    const r = await quitAlternateScreen(AGENT, ALLOWED);
+    expect(written()).toEqual([]);
+    expect(r.reason).toBe("pane-not-mounted");
+  });
+
+  // Only a real PtyGoneError may claim the terminal closed — that sentence is an instruction a human
+  // acts on, and a transient IPC failure must not send them to discard a live agent.
+  it("reports a vanished PTY as a refusal, and an IPC hiccup as something else", async () => {
+    mountScreen(LESS_ON_A_MARKDOWN_FILE, true);
+    vi.mocked(writePtyChainedStrict).mockRejectedValueOnce(new PtyGoneError(AGENT));
+    expect((await quitAlternateScreen(AGENT, ALLOWED)).reason).toBe("pty-gone");
+    vi.mocked(writePtyChainedStrict).mockRejectedValueOnce(new Error("ipc hiccup"));
+    const r = await quitAlternateScreen(AGENT, ALLOWED);
+    expect(r.reason).toBe("send-failed");
+    expect(r.detail).not.toMatch(/terminal has closed/i);
+  });
+
+  // ── 7. THE COMPLEMENT INVARIANT ─────────────────────────────────────────────────────────────
+  //
+  // THE PROPERTY THE WHOLE DESIGN RESTS ON, stated as one sweep: the set of screens where this op
+  // may write is a strict SUBSET of the set where `dispatchConciergeAnswer` already refuses ALL text
+  // with `alternate-screen`. It can never write where a text write is permitted.
+  //
+  // Driven through the REAL dispatcher (this suite does not mock `conciergeDispatch`) and the REAL
+  // viewport registry, so the two verdicts come from the same screen by the same route. Asserting it
+  // per-fixture rather than once means a future fixture that breaks the invariant fails HERE, on the
+  // property, instead of silently widening what the op may press into.
+  it.each([
+    ["a less session", LESS_ON_A_MARKDOWN_FILE],
+    ["a vim session", VIM_ON_A_MARKDOWN_FILE],
+    ["a permission dialog", APPROVAL_2_1_220],
+    ["a bash permission prompt", BASH_PERMISSION_PROMPT],
+    ["the plan-exit dialog", PLAN_EXIT_PROMPT],
+    ["a plan dialog scrolled past", PLAN_EXIT_SCROLLED_PAST],
+    ["an idle Claude Code pane", IDLE_AFTER_TURN_2_1_220],
+  ])("may write only where a text send is already refused as alternate-screen — %s", async (_n, screen) => {
+    mountScreen(screen, true);
+    const quit = await quitAlternateScreen(AGENT, ALLOWED);
+    const quitWrote = quit.sent.length > 0;
+
+    vi.mocked(writePtyChainedStrict).mockClear();
+    resetViewportRegistry();
+    mountScreen(screen, true);
+    const send = await sendToAgentTerminal(AGENT, "carry on", ALLOWED);
+
+    if (quitWrote) {
+      expect(send.path, `${_n}: quit wrote, so a text send MUST be refused`).toBe("alternate-screen");
+    }
+    // THE CONTRAPOSITIVE, which is the arm that actually bites. Wherever the dispatcher PERMITTED
+    // text — the idle Claude Code pane holding the alternate buffer is exactly that screen — this op
+    // must have pressed nothing at all. Asserting only the first arm would leave a widened gate
+    // green, because a gate that writes everywhere still satisfies "if it wrote, the send was
+    // refused" on the fixtures where the send happens to be refused anyway.
+    if (send.path !== "alternate-screen") {
+      expect(quit.sent, `${_n}: a text send is permitted here, so quit must press NOTHING`).toEqual([]);
+    }
+    // Subset, not equality, and deliberately so: the dispatcher refuses `vim` too, and this op does
+    // write there. The invariant is one-directional.
   });
 });

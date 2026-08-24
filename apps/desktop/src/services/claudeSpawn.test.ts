@@ -15,6 +15,12 @@ import {
   RESUME_PROMPT_SUPPRESS_TOKENS,
 } from "./claudeSpawn";
 
+/** Mirrors PAGER_ENV_EXPORT in claudeSpawn.ts. Every agent spawn must force a non-interactive
+ *  pager: an agent that opens one enters the alternate screen, where every automated route to it
+ *  (concierge writes, auto-resume) refuses and only a human pressing `q` can free it
+ *  (bead sparkle-w11lll). */
+const PAGER_PREFIX =
+  "export PAGER=cat GIT_PAGER=cat GH_PAGER=cat SYSTEMD_PAGER=cat MANPAGER=cat LESS=FRX; ";
 const PATH_PREFIX = `export PATH="$HOME/.local/bin:$PATH"; `;
 /** Mirrors ANTHROPIC_ENV_UNSET in claudeSpawn.ts — the login must write the same credential the
  *  Rust-side auth probe reads. */
@@ -46,19 +52,19 @@ describe("buildClaudeLoginExec (first-run setup)", () => {
 
   it("runs `claude auth login` — NOT `claude login`, which is a prompt, not a command", () => {
     expect(buildClaudeLoginExec("/usr/local/bin/claude")).toBe(
-      `${UNSET_PREFIX}${PATH_PREFIX}exec '/usr/local/bin/claude' auth login`,
+      `${UNSET_PREFIX}${PAGER_PREFIX}${PATH_PREFIX}exec '/usr/local/bin/claude' auth login`,
     );
   });
 
   it("single-quotes a claude path containing a space", () => {
     expect(buildClaudeLoginExec("/path with space/claude")).toBe(
-      `${UNSET_PREFIX}${PATH_PREFIX}exec '/path with space/claude' auth login`,
+      `${UNSET_PREFIX}${PAGER_PREFIX}${PATH_PREFIX}exec '/path with space/claude' auth login`,
     );
   });
 
   it("exports CLAUDE_CONFIG_DIR before login when a config dir is given", () => {
     expect(buildClaudeLoginExec("/bin/claude", { configDir: "/acc/dir" })).toBe(
-      `export CLAUDE_CONFIG_DIR='/acc/dir'; ${UNSET_PREFIX}${PATH_PREFIX}exec '/bin/claude' auth login`,
+      `export CLAUDE_CONFIG_DIR='/acc/dir'; ${UNSET_PREFIX}${PAGER_PREFIX}${PATH_PREFIX}exec '/bin/claude' auth login`,
     );
   });
 
@@ -92,13 +98,13 @@ describe("buildClaudeLoginExec (first-run setup)", () => {
 describe("buildClaudeExec ()", () => {
   it("appends --continue when a prior session exists", () => {
     expect(buildClaudeExec("/usr/local/bin/claude", true)).toBe(
-      `${PATH_PREFIX}exec '/usr/local/bin/claude' --continue`,
+      `${PAGER_PREFIX}${PATH_PREFIX}exec '/usr/local/bin/claude' --continue`,
     );
   });
 
   it("spawns plain claude when there is no session", () => {
     expect(buildClaudeExec("/usr/local/bin/claude", false)).toBe(
-      `${PATH_PREFIX}exec '/usr/local/bin/claude'`,
+      `${PAGER_PREFIX}${PATH_PREFIX}exec '/usr/local/bin/claude'`,
     );
   });
 
@@ -111,7 +117,7 @@ describe("buildClaudeExec ()", () => {
 
   it("single-quotes paths with awkward characters", () => {
     expect(buildClaudeExec("/path with space/claude", false)).toBe(
-      `${PATH_PREFIX}exec '/path with space/claude'`,
+      `${PAGER_PREFIX}${PATH_PREFIX}exec '/path with space/claude'`,
     );
     // An embedded single quote is escaped, not left to break the shell string.
     expect(shellQuote("/a'b")).toBe("'/a'\\''b'");
@@ -127,7 +133,7 @@ describe("buildClaudeExec ()", () => {
     // `--` terminates the variadic `--add-dir` so the positional prompt isn't swallowed as a
     // directory (which made `claude` stat the prompt as a path → ENAMETOOLONG; bead ).
     expect(cmd).toBe(
-      `${PATH_PREFIX}exec '/bin/claude' --append-system-prompt 'be helpful' --add-dir '/logs' -- 'start now'`,
+      `${PAGER_PREFIX}${PATH_PREFIX}exec '/bin/claude' --append-system-prompt 'be helpful' --add-dir '/logs' -- 'start now'`,
     );
   });
 
@@ -142,13 +148,13 @@ describe("buildClaudeExec ()", () => {
 
   it("still emits `--` before a prompt even with no --add-dir, guarding prompts that start with '-'", () => {
     const cmd = buildClaudeExec("/bin/claude", false, { initialPrompt: "-oops looks like a flag" });
-    expect(cmd).toBe(`${PATH_PREFIX}exec '/bin/claude' -- '-oops looks like a flag'`);
+    expect(cmd).toBe(`${PAGER_PREFIX}${PATH_PREFIX}exec '/bin/claude' -- '-oops looks like a flag'`);
   });
 
   // Unattended workers auto-approve tool calls so an approval prompt can't silently deadlock them.
   it("emits --dangerously-skip-permissions when dangerouslySkipPermissions is set (worker auto-approve)", () => {
     const cmd = buildClaudeExec("/bin/claude", false, { dangerouslySkipPermissions: true });
-    expect(cmd).toBe(`${PATH_PREFIX}exec '/bin/claude' --dangerously-skip-permissions`);
+    expect(cmd).toBe(`${PAGER_PREFIX}${PATH_PREFIX}exec '/bin/claude' --dangerously-skip-permissions`);
   });
 
   it("omits --dangerously-skip-permissions by default (Think/Build agents keep permission prompts)", () => {
@@ -160,7 +166,7 @@ describe("buildClaudeExec ()", () => {
 
   it("keeps auto-approve on a resumed worker (after --continue, before the prompt)", () => {
     const cmd = buildClaudeExec("/bin/claude", true, { dangerouslySkipPermissions: true });
-    expect(cmd).toBe(`${PATH_PREFIX}exec '/bin/claude' --continue --dangerously-skip-permissions`);
+    expect(cmd).toBe(`${PAGER_PREFIX}${PATH_PREFIX}exec '/bin/claude' --continue --dangerously-skip-permissions`);
   });
 
   // suppressResumePrompt (restart-wedge, second half). On `--continue`/`--resume` of an OLD, LARGE
@@ -200,14 +206,14 @@ describe("buildClaudeExec ()", () => {
   it("exports CLAUDE_CONFIG_DIR before PATH when a configDir is given", () => {
     const cmd = buildClaudeExec("/bin/claude", false, { configDir: "/data/accounts/ab12" });
     expect(cmd).toBe(
-      `export CLAUDE_CONFIG_DIR='/data/accounts/ab12'; ${PATH_PREFIX}exec '/bin/claude'`,
+      `export CLAUDE_CONFIG_DIR='/data/accounts/ab12'; ${PAGER_PREFIX}${PATH_PREFIX}exec '/bin/claude'`,
     );
   });
 
   it("omits the CLAUDE_CONFIG_DIR export entirely when no configDir is given (default behavior)", () => {
     const cmd = buildClaudeExec("/bin/claude", false);
     expect(cmd).not.toContain("CLAUDE_CONFIG_DIR");
-    expect(cmd).toBe(`${PATH_PREFIX}exec '/bin/claude'`);
+    expect(cmd).toBe(`${PAGER_PREFIX}${PATH_PREFIX}exec '/bin/claude'`);
   });
 
   it("treats an empty-string configDir as no account (omits the export)", () => {
@@ -215,7 +221,7 @@ describe("buildClaudeExec ()", () => {
     // against a later refactor to `!== undefined` that would export an empty (relative) config dir.
     const cmd = buildClaudeExec("/bin/claude", false, { configDir: "" });
     expect(cmd).not.toContain("CLAUDE_CONFIG_DIR");
-    expect(cmd).toBe(`${PATH_PREFIX}exec '/bin/claude'`);
+    expect(cmd).toBe(`${PAGER_PREFIX}${PATH_PREFIX}exec '/bin/claude'`);
   });
 
   it("single-quotes a configDir with awkward characters and combines with other opts", () => {
@@ -224,7 +230,7 @@ describe("buildClaudeExec ()", () => {
       appendSystemPrompt: "persona",
     });
     expect(cmd).toBe(
-      `export CLAUDE_CONFIG_DIR='/path with space/.claude'; ${PATH_PREFIX}exec '/bin/claude' --continue --append-system-prompt 'persona'`,
+      `export CLAUDE_CONFIG_DIR='/path with space/.claude'; ${PAGER_PREFIX}${PATH_PREFIX}exec '/bin/claude' --continue --append-system-prompt 'persona'`,
     );
   });
 
@@ -234,7 +240,7 @@ describe("buildClaudeExec ()", () => {
       initialPrompt: "start now",
     });
     // --continue + persona, but NO trailing positional prompt.
-    expect(cmd).toBe(`${PATH_PREFIX}exec '/bin/claude' --continue --append-system-prompt 'persona'`);
+    expect(cmd).toBe(`${PAGER_PREFIX}${PATH_PREFIX}exec '/bin/claude' --continue --append-system-prompt 'persona'`);
     expect(cmd).not.toContain("start now");
   });
 
@@ -244,17 +250,17 @@ describe("buildClaudeExec ()", () => {
       resumeSessionId: "4b2a247c-ed39-4abc-9f01-deadbeef0000",
     });
     expect(cmd).toBe(
-      `${PATH_PREFIX}exec '/bin/claude' --resume '4b2a247c-ed39-4abc-9f01-deadbeef0000'`,
+      `${PAGER_PREFIX}${PATH_PREFIX}exec '/bin/claude' --resume '4b2a247c-ed39-4abc-9f01-deadbeef0000'`,
     );
     expect(cmd).not.toContain("--continue");
   });
 
   it("falls back to --continue when resume is true but no session id is available", () => {
     const cmd = buildClaudeExec("/bin/claude", true, { resumeSessionId: undefined });
-    expect(cmd).toBe(`${PATH_PREFIX}exec '/bin/claude' --continue`);
+    expect(cmd).toBe(`${PAGER_PREFIX}${PATH_PREFIX}exec '/bin/claude' --continue`);
     // An empty-string id is treated as absent (falsy) → still --continue, never `--resume ''`.
     expect(buildClaudeExec("/bin/claude", true, { resumeSessionId: "" })).toBe(
-      `${PATH_PREFIX}exec '/bin/claude' --continue`,
+      `${PAGER_PREFIX}${PATH_PREFIX}exec '/bin/claude' --continue`,
     );
   });
 
@@ -263,7 +269,7 @@ describe("buildClaudeExec ()", () => {
       resumeSessionId: "should-be-ignored",
       initialPrompt: "start now",
     });
-    expect(cmd).toBe(`${PATH_PREFIX}exec '/bin/claude' -- 'start now'`);
+    expect(cmd).toBe(`${PAGER_PREFIX}${PATH_PREFIX}exec '/bin/claude' -- 'start now'`);
     expect(cmd).not.toContain("--resume");
   });
 
@@ -274,20 +280,20 @@ describe("buildClaudeExec ()", () => {
       initialPrompt: "start now",
     });
     expect(cmd).toBe(
-      `${PATH_PREFIX}exec '/bin/claude' --resume 'sess-123' --append-system-prompt 'persona'`,
+      `${PAGER_PREFIX}${PATH_PREFIX}exec '/bin/claude' --resume 'sess-123' --append-system-prompt 'persona'`,
     );
     expect(cmd).not.toContain("start now");
   });
 
   it("shell-quotes a session id (defense in depth, though ids are uuids)", () => {
     const cmd = buildClaudeExec("/bin/claude", true, { resumeSessionId: "a'b" });
-    expect(cmd).toBe(`${PATH_PREFIX}exec '/bin/claude' --resume 'a'\\''b'`);
+    expect(cmd).toBe(`${PAGER_PREFIX}${PATH_PREFIX}exec '/bin/claude' --resume 'a'\\''b'`);
   });
 
   // Per-agent model selection (bead sparkle-i6rw).
   it("emits --model <id>, shell-quoted, when a model is set", () => {
     const cmd = buildClaudeExec("/bin/claude", false, { model: "claude-opus-4-8" });
-    expect(cmd).toBe(`${PATH_PREFIX}exec '/bin/claude' --model 'claude-opus-4-8'`);
+    expect(cmd).toBe(`${PAGER_PREFIX}${PATH_PREFIX}exec '/bin/claude' --model 'claude-opus-4-8'`);
   });
 
   it("omits --model when the model is undefined or the 'default' sentinel", () => {
@@ -304,7 +310,7 @@ describe("buildClaudeExec ()", () => {
       appendSystemPrompt: "persona",
     });
     expect(cmd).toBe(
-      `${PATH_PREFIX}exec '/bin/claude' --continue --model 'claude-haiku-4-5' --append-system-prompt 'persona'`,
+      `${PAGER_PREFIX}${PATH_PREFIX}exec '/bin/claude' --continue --model 'claude-haiku-4-5' --append-system-prompt 'persona'`,
     );
   });
 
@@ -313,7 +319,7 @@ describe("buildClaudeExec ()", () => {
       model: "claude-sonnet-5",
       initialPrompt: "go",
     });
-    expect(cmd).toBe(`${PATH_PREFIX}exec '/bin/claude' --model 'claude-sonnet-5' -- 'go'`);
+    expect(cmd).toBe(`${PAGER_PREFIX}${PATH_PREFIX}exec '/bin/claude' --model 'claude-sonnet-5' -- 'go'`);
   });
 
   // BD_READONLY makes a child's `bd` read-only: bd refuses close/update/create/label (exit 1) while
@@ -327,7 +333,7 @@ describe("buildClaudeExec ()", () => {
   // re-enabling it.
   it("exports BD_READONLY=1 before PATH when beadsReadonly is set", () => {
     const cmd = buildClaudeExec("/bin/claude", false, { beadsReadonly: true });
-    expect(cmd).toBe(`export BD_READONLY=1; ${PATH_PREFIX}exec '/bin/claude'`);
+    expect(cmd).toBe(`export BD_READONLY=1; ${PAGER_PREFIX}${PATH_PREFIX}exec '/bin/claude'`);
   });
 
   it("omits the BD_READONLY export by default (every agent keeps beads write access today)", () => {
@@ -347,7 +353,7 @@ describe("buildClaudeExec ()", () => {
       initialPrompt: "do the task",
     });
     expect(cmd).toBe(
-      `export CLAUDE_CONFIG_DIR='/acc/dir'; export BD_READONLY=1; ${PATH_PREFIX}exec '/bin/claude' --dangerously-skip-permissions -- 'do the task'`,
+      `export CLAUDE_CONFIG_DIR='/acc/dir'; export BD_READONLY=1; ${PAGER_PREFIX}${PATH_PREFIX}exec '/bin/claude' --dangerously-skip-permissions -- 'do the task'`,
     );
   });
 });
@@ -361,7 +367,7 @@ describe("SPARKLE_INBOX_AGENT — the Stop hook's ownership proof (bead sparkle-
 
   it("exports SPARKLE_INBOX_AGENT when inboxAgentId is set", () => {
     const cmd = buildClaudeExec("/bin/claude", false, { inboxAgentId: "3ab86d6b-9ff7" });
-    expect(cmd).toBe(`export SPARKLE_INBOX_AGENT='3ab86d6b-9ff7'; ${PATH_PREFIX}exec '/bin/claude'`);
+    expect(cmd).toBe(`export SPARKLE_INBOX_AGENT='3ab86d6b-9ff7'; ${PAGER_PREFIX}${PATH_PREFIX}exec '/bin/claude'`);
   });
 
   it("omits the export entirely when no inboxAgentId is given", () => {
@@ -408,7 +414,7 @@ describe("SPARKLE_INBOX_AGENT — the Stop hook's ownership proof (bead sparkle-
       configDir: "/accounts/B",
     });
     expect(a).toBe(
-      `export CLAUDE_CONFIG_DIR='/accounts/A'; export SPARKLE_INBOX_AGENT='agent-1'; ${PATH_PREFIX}exec '/bin/claude'`,
+      `export CLAUDE_CONFIG_DIR='/accounts/A'; export SPARKLE_INBOX_AGENT='agent-1'; ${PAGER_PREFIX}${PATH_PREFIX}exec '/bin/claude'`,
     );
     // The SAME agent id under a different account — the id is not re-keyed by the account.
     expect(b).toContain("export SPARKLE_INBOX_AGENT='agent-1'; ");
@@ -425,7 +431,7 @@ describe("SPARKLE_INBOX_AGENT — the Stop hook's ownership proof (bead sparkle-
     });
     expect(cmd).toBe(
       `export CLAUDE_CONFIG_DIR='/acc/dir'; export BD_READONLY=1; export SPARKLE_INBOX_AGENT='agent-1'; ` +
-        `${PATH_PREFIX}exec '/bin/claude' --dangerously-skip-permissions -- 'do the task'`,
+        `${PAGER_PREFIX}${PATH_PREFIX}exec '/bin/claude' --dangerously-skip-permissions -- 'do the task'`,
     );
   });
 });
@@ -438,7 +444,7 @@ describe("buildClaudeExec --mcp-config (orchestrator launch)", () => {
       appendSystemPrompt: "be an orchestrator",
     });
     expect(cmd).toBe(
-      `${PATH_PREFIX}exec '/bin/claude' --mcp-config '{"mcpServers":{}}' --strict-mcp-config --append-system-prompt 'be an orchestrator'`,
+      `${PAGER_PREFIX}${PATH_PREFIX}exec '/bin/claude' --mcp-config '{"mcpServers":{}}' --strict-mcp-config --append-system-prompt 'be an orchestrator'`,
     );
   });
 
@@ -449,13 +455,13 @@ describe("buildClaudeExec --mcp-config (orchestrator launch)", () => {
       appendSystemPrompt: "persona",
     });
     expect(cmd).toBe(
-      `${PATH_PREFIX}exec '/bin/claude' --continue --mcp-config '{}' --strict-mcp-config --append-system-prompt 'persona'`,
+      `${PAGER_PREFIX}${PATH_PREFIX}exec '/bin/claude' --continue --mcp-config '{}' --strict-mcp-config --append-system-prompt 'persona'`,
     );
   });
 
   it("omits --strict-mcp-config when not requested", () => {
     const cmd = buildClaudeExec("/bin/claude", false, { mcpConfig: "{}" });
-    expect(cmd).toBe(`${PATH_PREFIX}exec '/bin/claude' --mcp-config '{}'`);
+    expect(cmd).toBe(`${PAGER_PREFIX}${PATH_PREFIX}exec '/bin/claude' --mcp-config '{}'`);
   });
 
   it("initialPrompt is separated by `--` even when mcpConfig is present, so it isn't swallowed", () => {
@@ -463,7 +469,7 @@ describe("buildClaudeExec --mcp-config (orchestrator launch)", () => {
     // initialPrompt path) terminates option parsing entirely so the prompt is never swallowed as
     // another MCP config file or `--add-dir` path.
     const cmd = buildClaudeExec("/bin/claude", false, { mcpConfig: "{}", initialPrompt: "go" });
-    expect(cmd).toBe(`${PATH_PREFIX}exec '/bin/claude' --mcp-config '{}' -- 'go'`);
+    expect(cmd).toBe(`${PAGER_PREFIX}${PATH_PREFIX}exec '/bin/claude' --mcp-config '{}' -- 'go'`);
   });
 });
 
@@ -635,5 +641,69 @@ describe("CLAUDE_CONFIG_DIR is emitted byte-identically by every spawn path", ()
     // Usable as a session key and a React key: no separators, no quoting hazards.
     expect(claudeSignInPtyId(DIR, 0)).toMatch(/^claude-signin-[0-9a-f]{8}-0$/);
     expect(claudeSignInPtyId(undefined, 0)).toBe("claude-signin-default-0");
+  });
+});
+
+// ══ NO SPAWNED AGENT MAY BE ABLE TO OPEN A PAGER (bead sparkle-w11lll) ═══════════════════════════
+//
+// THE INCIDENT. Two agents were found wedged on the ALTERNATE SCREEN — the state a pager puts a
+// terminal in. An agent parked there is unreachable by EVERY automated path this app has:
+// `dispatchConciergeAnswer` refuses each write with `alternate-screen`, auto-resume refuses
+// identically and burns its retry budget until it escalates to a human, and the one key that quits
+// a pager (`q`) was not in `send_control_key`'s vocabulary. A human had to press it by hand, while
+// one of the two agents sat on five uncommitted files.
+//
+// WHAT THESE ASSERT, and why it is the side effect rather than a precondition: the exported STRING
+// the login shell will run. That is the artifact — nothing else in this process decides whether the
+// child gets a pager. Deleting PAGER_ENV_EXPORT from either builder turns every case below red.
+describe("non-interactive pager (bead sparkle-w11lll)", () => {
+  const PAGER_VARS = [
+    ["PAGER", "cat"],
+    ["GIT_PAGER", "cat"],
+    ["GH_PAGER", "cat"],
+    ["SYSTEMD_PAGER", "cat"],
+    ["MANPAGER", "cat"],
+    // FRX, and `X` is the letter that matters: it keeps `less` OFF the alternate screen even when
+    // some tool execs it directly, ignoring every variable above. `F` quits when the content fits
+    // one screen; `R` keeps colour readable.
+    ["LESS", "FRX"],
+  ] as const;
+
+  it.each(PAGER_VARS)("exports %s=%s before the agent exec", (name, value) => {
+    const exec = buildClaudeExec("/bin/claude", false);
+    expect(exec).toContain(`${name}=${value}`);
+    // BEFORE the exec, or it accomplishes nothing — the same ordering requirement the ANTHROPIC
+    // unset has, for the same reason.
+    expect(exec.indexOf(`${name}=${value}`)).toBeLessThan(exec.indexOf("exec "));
+  });
+
+  it.each(PAGER_VARS)("exports %s=%s before the login exec too", (name, value) => {
+    const exec = buildClaudeLoginExec("/bin/claude");
+    expect(exec).toContain(`${name}=${value}`);
+    expect(exec.indexOf(`${name}=${value}`)).toBeLessThan(exec.indexOf("exec "));
+  });
+
+  // THE ORDERING THIS REALLY PINS, and the reason the Rust-side `pty.rs` env is NOT enough on its
+  // own. This string is handed to `zsh -l -c` — a LOGIN shell, which sources the user's
+  // `.zprofile`/`.zlogin` AFTER `pty.rs` has applied its environment. A profile line as ordinary as
+  // `export GIT_PAGER=less` therefore clobbers the Rust value. The export has to happen INSIDE the
+  // script, after the profile has run, which is what this asserts.
+  it("exports the pager vars inside the script, so a login profile cannot clobber them", () => {
+    const exec = buildClaudeExec("/bin/claude", false);
+    expect(exec).toMatch(/export [^;]*\bGIT_PAGER=cat\b/);
+  });
+
+  // A resumed agent is exactly as capable of running `git log` as a fresh one, and resume is the
+  // path a wedged agent is most likely to be on.
+  it("forces the pager on a RESUMED agent too", () => {
+    expect(buildClaudeExec("/bin/claude", true)).toContain("GIT_PAGER=cat");
+  });
+
+  // The unattended worker is the case that actually cost work: it auto-approves its own tool calls,
+  // so nothing stands between it and a `git diff` that pages.
+  it("forces the pager on an unattended --dangerously-skip-permissions worker", () => {
+    const exec = buildClaudeExec("/bin/claude", false, { dangerouslySkipPermissions: true });
+    expect(exec).toContain("PAGER=cat");
+    expect(exec.indexOf("PAGER=cat")).toBeLessThan(exec.indexOf("exec "));
   });
 });

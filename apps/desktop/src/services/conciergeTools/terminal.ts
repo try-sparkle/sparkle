@@ -115,6 +115,19 @@ import type { SuggestionButton } from "../suggestions/types";
 // header. `conciergeDispatch` has to run it too, and this file imports the dispatcher, so keeping it
 // here would have made that a cycle (bead sparkle-jk8zt).
 import { pickerFingerprint } from "../pickerFingerprint";
+// ── THE `quit_alternate_screen` GATE'S FOUR PREDICATES (bead sparkle-w11lll) ─────────────────────
+// Every one of these is REUSED, never re-derived. A private copy of any of them would drift away
+// from the module that owns it, and the gate's whole safety argument is that it agrees with the
+// dispatcher, the answerability band and the plan router about what is on screen.
+import { getAgentViewport, type TerminalViewport } from "../terminalViewport";
+// `hasClaudeCodeLiveTui` alongside `isClaudeCodeScreen` on purpose: it is the same evidence without
+// the `>= 2` corroboration bar, so it is the arm that still says "Claude Code" in the H2
+// false-negative case that motivated this op.
+import { hasClaudeCodeLiveTui, isClaudeCodeScreen } from "../../engine/claudeCodeScreen";
+import { screenOffersAnswer } from "../../engine/screenAnswerable";
+import { isPlanExitDialog } from "../suggestions/planPrompt";
+import { isPlanModeDialog } from "../suggestions/conciergeEscalation";
+import { parsePickerOptions } from "../suggestions/heuristics";
 
 // ---------------------------------------------------------------------------------------------
 // Budgets
@@ -1289,6 +1302,22 @@ export const CONCIERGE_TERMINAL_TOOLS = [
     write: true,
   },
   {
+    name: "quit_alternate_screen",
+    description:
+      "Get an agent OUT of a full-screen pager (less, more, man, git's pager) that it is wedged on. " +
+      "This is the only way q ever reaches a terminal, and it is not a general keypress: it refuses " +
+      "unless ALL FOUR of these hold — the terminal is genuinely on the alternate screen buffer (the " +
+      "emulator's own mode bit, not a guess from the text), the screen is NOT Claude Code's own " +
+      "interface, the screen offers NO choice to answer, and it is not a plan-mode surface. A " +
+      "permission dialog, a picker and a plan prompt all offer a choice, so none of them can be " +
+      "reached through this op even if the Claude Code check were wrong. Each refusal names WHICH of " +
+      "those it was. It presses q, re-reads the screen, and only then escalates to ctrl+c if the " +
+      "terminal is still full-screen and all four still hold. It re-reads again afterwards and tells " +
+      "you whether the screen ACTUALLY cleared — vim quits on neither key, and it will say so rather " +
+      "than claiming success. Requires an authorized tool policy.",
+    write: true,
+  },
+  {
     name: "send_to_agent_terminal",
     description:
       "Type a message into an agent's terminal, as if the human had typed it. " +
@@ -1634,4 +1663,315 @@ export async function sendControlKey(
       detail: `I couldn't press ${key} in that agent's terminal: ${e instanceof Error ? e.message : String(e)}`,
     };
   }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+// QUITTING AN ALTERNATE SCREEN (bead sparkle-w11lll)
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+//
+// THE INCIDENT. Two agents were found WEDGED on an alternate screen with no automated way out.
+// While one sits there, EVERY automated route is shut:
+//
+//   • `dispatchConciergeAnswer` refuses every write with path `alternate-screen` — correctly, since
+//     typed text in a pager runs as commands.
+//   • the goal auto-resume (`goalContinuationRunner`) takes the same refusal and BURNS its retry
+//     budget doing so, until `MAX_UNDELIVERED_CONTINUES` escalates a human out of bed.
+//   • the one key that quits a pager is `q`, and `sendControlKey` cannot send it: its vocabulary is
+//     exactly esc/enter/shift+tab/ctrl+b/arrows, and widening that enum is NOT the fix. A freely
+//     pressable `q` is a keystroke the concierge could put into a Claude Code permission prompt.
+//
+// So this is a NARROW, GATED op rather than a new key. The gate IS the safety boundary; the byte it
+// writes is incidental.
+//
+// ══ THE DIAGNOSIS IS UNSETTLED, AND THAT DRIVES THE GATE ══════════════════════════════════════
+// Both wedged screens showed a scrolling viewport on `<app data>/accounts/<hash>/plans/*.md`. No
+// pager is invoked anywhere in this repo, and that path is `$CLAUDE_CONFIG_DIR/plans/` — written by
+// CLAUDE CODE ITSELF in plan mode, into the account dir Sparkle hands it. Two live hypotheses:
+//
+//   H1 — a genuine pager (`less`) really was open on that file.
+//   H2 — it was CLAUDE CODE'S OWN PLAN-MODE / ExitPlanMode surface, and `isClaudeCodeScreen` FAILED
+//        TO RECOGNISE IT (a false negative) — which is why the write was refused at all.
+//
+// This op must be safe under BOTH. An escape hatch gated only on `!isClaudeCodeScreen` would, under
+// H2, press `q` INTO A CLAUDE CODE PLAN DIALOG. That is the regression we must not ship, so the gate
+// below deliberately does not depend on `isClaudeCodeScreen` being right.
+//
+// ══ WHY THIS CANNOT FIRE ON A REAL CLAUDE CODE DIALOG — the argument, gate by gate ════════════
+//
+//   1. BUFFER MODE, NOT CONTENT. Claude Code renders its prompt, its permission dialogs and its
+//      pickers on the NORMAL buffer; it does not issue DECSET 1049 for them. `alternateBuffer` is
+//      the emulator's own mode bit (`term.buffer.active.type !== "normal"`, components/Terminal),
+//      never a heuristic over text. Gate 1 alone excludes every real Claude Code dialog before a
+//      single byte is written.
+//   2. THE PREDICATE THE DISPATCHER ALREADY TRUSTS. `isClaudeCodeScreen` is exactly what
+//      `conciergeDispatch` uses to decide Claude Code owns the buffer, and its job is telling a live
+//      TUI from a document QUOTING one — `nothingUnrecognizedBelowFooter`: a pager draws its own
+//      status row beneath the footer, a live dialog does not. Paired here with
+//      `hasClaudeCodeLiveTui`, which is the same evidence WITHOUT the `>= 2` corroboration bar —
+//      i.e. precisely the arm that stays TRUE in the H2 false-negative case, because H2 is a screen
+//      that carries the composer box or the live dialog and fails only the corroboration count.
+//   3. THE GATE THAT SURVIVES GATE 2 BEING WRONG. A permission prompt, a plan-approval dialog and a
+//      picker all OFFER A CHOICE; a pager offers none. `screenOffersAnswer` is measured true on
+//      every captured Claude Code dialog in `capturedScreens.fixture.ts` and false on the captured
+//      `vim` and `less` screens. So even a TOTAL false negative in `isClaudeCodeScreen` cannot get
+//      `q` into a dialog.
+//   4. THE SURFACE WE HAVE LIVE EVIDENCE OF, named explicitly. `isPlanExitDialog` covers today's
+//      plan-exit prompt (and the renamed shapes it anticipates); `isPlanModeDialog` covers the older
+//      "No, keep planning" triple. Reusing those predicates rather than writing a fifth regex is the
+//      point — a private copy would drift away from the ones the router and the answerer use.
+//
+//   INVARIANT, stated here and TESTED in terminal.test.ts: the set of screens where this op may
+//   write is a strict SUBSET of the set where `dispatchConciergeAnswer` already refuses all text
+//   with `alternate-screen`. It can never write where a text write is permitted. Gates 1 and 2 are
+//   the dispatcher's own two conditions; gates 3 and 4 only narrow further.
+//
+// ══ AND IT NEVER CLAIMS SUCCESS IT DID NOT OBSERVE ════════════════════════════════════════════
+// `q` quits `less`. It does NOT quit `vim`, and neither does ctrl+c. So the op RE-READS the viewport
+// after each write and reports what it actually found. A truthful "still in full-screen mode after
+// both keys" is the useful answer there; looping or claiming success is not.
+
+/** The keys this op may press, in the order it presses them. NOT added to `CONTROL_KEYS`: the whole
+ *  safety argument above is that `q` is reachable ONLY through this gate. A `q` in the freely
+ *  pressable enum could land in a permission prompt, which is the thing we are protecting. */
+const QUIT_KEYS = {
+  /** `q` — how every common pager (`less`, `more`, `man`, `git log`'s pager) exits. */
+  q: "\x71",
+  /** The fallback. Interrupts a foreground program that ignored `q`. */
+  "ctrl+c": "\x03",
+} as const;
+
+export type QuitKeyName = keyof typeof QUIT_KEYS;
+
+/** How long to wait for the emulator to repaint after a key before re-reading the buffer bit.
+ *
+ *  BOUNDED AND SMALL, deliberately. A pager clears the alternate buffer within one frame; anything
+ *  that needs longer than this is not going to be rescued by waiting, and the whole op has to stay
+ *  well inside a concierge turn. Two settles + two reads is the entire budget. */
+const QUIT_SETTLE_MS = 150;
+
+/** Which gate refused, in this op's own vocabulary. Every value names ONE gate, so a caller (and a
+ *  human reading a receipt) can tell "there is nothing to quit" from "I refused to press into a
+ *  dialog" — two very different facts that a single `refused` would collapse. */
+export type QuitAlternateScreenRefusal =
+  /** Gate 0 — this window cannot see that terminal at all. Blind is a REFUSAL, never an empty
+   *  screen: `getAgentViewport`'s own doc says so, and a write decided on no evidence is the shape
+   *  this whole module exists to avoid. */
+  | "pane-not-mounted"
+  /** Gate 1 — the terminal is on the normal buffer. There is no alternate screen to quit. */
+  | "normal-buffer"
+  /** Gate 2 — Claude Code owns this buffer (or shows live-TUI evidence that it does). */
+  | "claude-code-screen"
+  /** Gate 3 — the screen presents an answerable choice. A pager offers none. */
+  | "offers-an-answer"
+  /** Gate 4 — a plan-mode / plan-exit surface, the one we have live evidence of. */
+  | "plan-mode-surface"
+  /** Not a gate: both keys went out and the terminal is STILL on the alternate buffer. Something
+   *  like `vim` quits on neither. Reported honestly rather than retried. */
+  | "still-alternate";
+
+export interface QuitAlternateScreenResult {
+  /** True ONLY when the alternate screen was observed to clear. Never inferred from a successful
+   *  write — a write that lands and changes nothing is exactly the `vim` case. */
+  ok: boolean;
+  agentId: string;
+  /** What was actually written, in order. Empty on every refusal. */
+  sent: QuitKeyName[];
+  /** Did the alternate buffer clear? `null` means COULD NOT TELL — the pane stopped being readable
+   *  mid-op — and is never reported as either outcome. */
+  cleared: boolean | null;
+  reason?: ConciergeSendPath | "send-failed" | QuitAlternateScreenRefusal;
+  detail: string;
+}
+
+/** The four gates, over ONE viewport snapshot.
+ *
+ *  ONE SNAPSHOT IS THE CONTRACT. `TerminalViewport` exists precisely so `text` and `alternateBuffer`
+ *  describe the same instant; re-reading between checks could straddle a `less` launch and mix a
+ *  normal-buffer prompt's text with an alternate-buffer bit. The caller reads once and passes the
+ *  snapshot in, and the escalation step re-runs this whole function against a NEW single snapshot
+ *  rather than reusing any part of the old one.
+ *
+ *  Returns null when every gate passes. */
+function quitGateRefusal(
+  screen: TerminalViewport | null,
+): { reason: QuitAlternateScreenRefusal; detail: string } | null {
+  // GATE 0 — blind.
+  if (!screen) {
+    return {
+      reason: "pane-not-mounted",
+      detail:
+        "Not pressed: this window can't see that agent's terminal, so I can't tell what pressing q " +
+        "would land in. That has to be done in the agent's own pane.",
+    };
+  }
+  // GATE 1 — the emulator's buffer-mode bit. See the header: Claude Code does not issue DECSET 1049
+  // for its prompt, its permission dialogs or its pickers, so this alone excludes all of them.
+  if (!screen.alternateBuffer) {
+    return {
+      reason: "normal-buffer",
+      detail:
+        "Not pressed: that terminal isn't in full-screen mode, so there is no pager to quit. A q " +
+        "there would just be typed into whatever is on the line.",
+    };
+  }
+  // GATE 2 — the dispatcher's own predicate, PLUS the un-corroborated form that survives H2.
+  if (isClaudeCodeScreen(screen.text) || hasClaudeCodeLiveTui(screen.text)) {
+    return {
+      reason: "claude-code-screen",
+      detail:
+        "Not pressed: that screen is Claude Code's own interface, not a pager. Pressing q there " +
+        "would go to Claude Code as a keystroke.",
+    };
+  }
+  // GATE 3 — THE ONE THAT HOLDS WHEN GATE 2 IS WRONG. Anything offering a choice is something to be
+  // answered, not something to be quit.
+  if (screenOffersAnswer(screen.text)) {
+    return {
+      reason: "offers-an-answer",
+      detail:
+        "Not pressed: that screen is offering a choice, so it is a dialog to answer rather than a " +
+        "pager to quit. Read it with read_picker_options, or leave it for the human.",
+    };
+  }
+  // GATE 4 — the plan surfaces, by the predicates the router and the answerer already use.
+  const planOptions = parsePickerOptions(screen.text).map((o) => ({ index: o.n, label: o.label }));
+  if (isPlanExitDialog(screen.text) || isPlanModeDialog(planOptions)) {
+    return {
+      reason: "plan-mode-surface",
+      detail:
+        "Not pressed: that is Claude Code's plan surface. Whether a plan runs is the human's " +
+        "decision, and q is not how it is made.",
+    };
+  }
+  return null;
+}
+
+/** Wait for the emulator to repaint. Bounded by {@link QUIT_SETTLE_MS} and nothing else — no
+ *  polling loop, no retry ladder. AGENTS.md: bound every wait so a wrong assumption fails in
+ *  seconds instead of hanging. */
+const settle = () => new Promise<void>((r) => setTimeout(r, QUIT_SETTLE_MS));
+
+/**
+ * Get an agent out of a full-screen pager it is wedged on — the ONLY route by which `q` reaches a
+ * terminal. Read the module section above before changing anything here: the four gates are the
+ * safety argument, not an optimisation.
+ *
+ * Rides the SAME authority and `agentCanAcceptInput` gates as `sendControlKey`, and writes through
+ * the SAME `writePtyChainedStrict` queue, for the same reasons: this changes what a running process
+ * does next, it cannot be un-pressed, and a key must never land between another write's paste and
+ * its carriage return.
+ */
+export async function quitAlternateScreen(
+  agentId: string,
+  authority: ConciergeToolAuthority,
+): Promise<QuitAlternateScreenResult> {
+  const no = (
+    reason: QuitAlternateScreenResult["reason"],
+    detail: string,
+    sent: QuitKeyName[] = [],
+    cleared: boolean | null = null,
+  ): QuitAlternateScreenResult => ({ ok: false, agentId, sent, cleared, reason, detail });
+
+  if (!isDispatchAuthority(authority) || authority.kind !== "concierge-tool") {
+    log.warn("concierge", "quit-alternate-screen refused — no valid authority", { agentId });
+    return no("unauthorized", sendDetail("unauthorized", agentId));
+  }
+  if (!agentCanAcceptInput(agentId)) {
+    const path: ConciergeSendPath =
+      findAgent(agentId) === undefined ? "unknown-agent" : "cloud-agent";
+    return no(path, sendDetail(path, agentId));
+  }
+
+  const first = quitGateRefusal(getAgentViewport(agentId));
+  if (first) return no(first.reason, first.detail);
+
+  const sent: QuitKeyName[] = [];
+  /** One write, with the SAME narrow error handling `sendControlKey` uses: only a real
+   *  `PtyGoneError` may claim the terminal closed, because that sentence is an instruction a human
+   *  acts on and a transient IPC failure must not send them to discard a live agent. */
+  const press = async (key: QuitKeyName): Promise<QuitAlternateScreenResult | null> => {
+    try {
+      await writePtyChainedStrict(agentId, QUIT_KEYS[key]);
+      sent.push(key);
+      return null;
+    } catch (e) {
+      log.warn("concierge", "quit-alternate-screen write failed", { agentId, key, error: String(e) });
+      if (e instanceof PtyGoneError) return no("pty-gone", sendDetail("pty-gone", agentId), sent);
+      return no(
+        "send-failed",
+        `I couldn't press ${key} in that agent's terminal: ${e instanceof Error ? e.message : String(e)}`,
+        sent,
+      );
+    }
+  };
+
+  const qFailed = await press("q");
+  if (qFailed) return qFailed;
+
+  await settle();
+
+  // RE-READ, AND RE-GATE. Not just "is it still alternate": the screen may have CHANGED into
+  // something this op must not press into — a pager that exited straight back into a Claude Code
+  // dialog, say. Escalating on a stale verdict would be exactly the H2 mistake one step later, so
+  // the second key has to clear all four gates against a FRESH single snapshot of its own.
+  const afterQ = getAgentViewport(agentId);
+  if (!afterQ) {
+    return no(
+      "pane-not-mounted",
+      "I pressed q, then lost sight of that terminal before I could check whether it worked. I " +
+        "can't say either way.",
+      sent,
+    );
+  }
+  if (!afterQ.alternateBuffer) {
+    return {
+      ok: true,
+      agentId,
+      sent,
+      cleared: true,
+      detail: "Pressed q; that terminal is out of full-screen mode and back at a normal prompt.",
+    };
+  }
+  const second = quitGateRefusal(afterQ);
+  if (second) {
+    return no(
+      second.reason,
+      `I pressed q and it stayed in full-screen mode. I stopped there rather than escalating to ` +
+        `ctrl+c: ${second.detail.replace(/^Not pressed: /, "")}`,
+      sent,
+    );
+  }
+
+  const ctrlCFailed = await press("ctrl+c");
+  if (ctrlCFailed) return ctrlCFailed;
+
+  await settle();
+
+  const afterCtrlC = getAgentViewport(agentId);
+  if (!afterCtrlC) {
+    return no(
+      "pane-not-mounted",
+      "I pressed q and then ctrl+c, then lost sight of that terminal before I could check whether " +
+        "it worked. I can't say either way.",
+      sent,
+    );
+  }
+  if (!afterCtrlC.alternateBuffer) {
+    return {
+      ok: true,
+      agentId,
+      sent,
+      cleared: true,
+      detail:
+        "q didn't take, so I pressed ctrl+c; that terminal is out of full-screen mode now.",
+    };
+  }
+  // THE HONEST DEAD END. `vim` quits on neither key, and no amount of repeating them changes that.
+  return no(
+    "still-alternate",
+    "I pressed q and then ctrl+c and that terminal is STILL in full-screen mode — something like " +
+      "vim quits on neither. It needs a human in that pane.",
+    sent,
+    false,
+  );
 }
