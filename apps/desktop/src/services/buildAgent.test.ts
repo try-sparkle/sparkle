@@ -435,6 +435,102 @@ describe("the preview protocol — an agent that is never TOLD about previews ne
     expect(brief).toContain(`{ ${key}: "open" }`);
   });
 
+  it("EVERY argument the brief instructs is one the schema accepts — not just the first", () => {
+    // THE HOLE THIS CLOSES (bead sparkle-i4n7xf). The test above derives ONE name — the FIRST key
+    // of the preview inputSchema — and the bead asked for the brief's "documented argumentS". The
+    // brief instructs TWO: `{ op: "open" }` and `{ op: "open", path: "/settings" }`. Rename `path`
+    // in the schema tomorrow and the brief keeps telling every agent to send it; both packages stay
+    // green and nothing fails until an agent makes a real call and takes MCP -32602. That is the
+    // SAME defect as the original, one argument over — the original was only ever caught because it
+    // happened to land on the argument someone had thought to pin.
+    //
+    // So derive the WHOLE key set from the registration and check containment, rather than pinning
+    // names. A test that enumerates the expected names by hand cannot see an argument added to the
+    // brief later, which is the direction drift actually travels.
+    const serverSrc = readFileSync(
+      fileURLToPath(new URL("../../../mcp-control/src/server.ts", import.meta.url)),
+      "utf8",
+    );
+    const reg = serverSrc.indexOf('registerTool(\n    "preview"');
+    expect(reg, "could not find the preview tool registration in mcp-control/src/server.ts").toBeGreaterThan(-1);
+
+    // Brace-match the inputSchema object rather than regexing a fixed number of keys: the block
+    // spans several lines and contains nested `z.enum([...])` calls, so a line- or count-based scan
+    // silently reads too little. Fail CLOSED on anything it cannot parse.
+    const schemaAt = serverSrc.indexOf("inputSchema: {", reg);
+    expect(schemaAt, "could not find the preview tool's inputSchema").toBeGreaterThan(-1);
+    const open = serverSrc.indexOf("{", schemaAt);
+    let depth = 0;
+    let close = -1;
+    for (let i = open; i < serverSrc.length; i++) {
+      if (serverSrc[i] === "{") depth++;
+      else if (serverSrc[i] === "}") {
+        depth--;
+        if (depth === 0) {
+          close = i;
+          break;
+        }
+      }
+    }
+    expect(close, "inputSchema braces never balanced — refusing to guess the key set").toBeGreaterThan(open);
+    const schemaBody = serverSrc.slice(open + 1, close);
+
+    // TOP-LEVEL keys only: a key sits at depth 0 within the object body, so anything inside a
+    // nested call (`z.enum([...])`, `.describe(...)`) is skipped rather than mistaken for an
+    // argument name.
+    const registered = new Set<string>();
+    let d = 0;
+    for (const line of schemaBody.split("\n")) {
+      const m = /^\s*([A-Za-z_$][\w$]*)\s*:/.exec(line);
+      const name = m?.[1];
+      if (d === 0 && name) registered.add(name);
+      for (const ch of line) {
+        if (ch === "{" || ch === "(" || ch === "[") d++;
+        else if (ch === "}" || ch === ")" || ch === "]") d--;
+      }
+    }
+    expect(
+      registered.size,
+      "parsed zero keys out of the preview inputSchema — the guard would be vacuous",
+    ).toBeGreaterThan(0);
+    // Anti-vacuity anchor, deliberately NOT an exact list. Pinning `["op","path"]` would red the
+    // moment someone legitimately ADDS a third argument to the schema — a guard that fails on a
+    // correct change is one people learn to edit, which is how it gets weakened for real. A
+    // degenerate parse is already caught from the other side: if it missed `path`, the containment
+    // check below would report the brief's own `path` as unknown and fail loudly.
+    expect(registered.has("op"), `parsed ${JSON.stringify([...registered])} — expected the required argument`).toBe(true);
+
+    // Now the other side: every argument name the brief actually INSTRUCTS. Scoped to object
+    // literals carrying a preview op, so unrelated `{ … }` prose elsewhere in the brief cannot
+    // wander in.
+    const brief = orchestrationPersona(base);
+    const instructed = new Set<string>();
+    for (const match of brief.matchAll(/\{([^{}]*\bop:\s*"(?:open|close|list)"[^{}]*)\}/g)) {
+      const body = match[1];
+      if (!body) continue;
+      for (const keyMatch of body.matchAll(/([A-Za-z_$][\w$]*)\s*:/g)) {
+        const k = keyMatch[1];
+        if (k) instructed.add(k);
+      }
+    }
+    expect(
+      instructed.size,
+      "found no `{ op: … }` examples in the brief — either the fragment moved or this scan broke; " +
+        "either way it must fail rather than certify nothing.",
+    ).toBeGreaterThan(0);
+
+    // THE CONTRACT. Not equality: the schema may offer arguments the brief chooses not to mention,
+    // and that is an editorial call, not drift. Drift is the brief instructing something the tool
+    // would REJECT.
+    const unknown = [...instructed].filter((k) => !registered.has(k));
+    expect(
+      unknown,
+      `the brief tells agents to send ${JSON.stringify(unknown)}, which mcp-control's preview ` +
+        `schema does not accept (it registers ${JSON.stringify([...registered].sort())}). An agent ` +
+        "following the brief would get MCP -32602 on its first call.",
+    ).toEqual([]);
+  });
+
   it("CHANGES the composed brief with the config knob — all three modes differ", () => {
     const visual = orchestrationPersona({ ...base, previewEagerness: "visual" });
     const always = orchestrationPersona({ ...base, previewEagerness: "always" });
