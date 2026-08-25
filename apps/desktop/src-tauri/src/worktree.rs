@@ -5129,6 +5129,52 @@ fn check_name(c: &Value) -> String {
         .to_string()
 }
 
+/// PURE ROLL-UP CHECKS — a job whose only purpose is to fail when one of its fan-in checks failed.
+///
+/// `.github/workflows/ci.yml`'s `node:` job carries the required-check NAME
+/// "Node — typecheck · test · build", declares `needs: [node-static, node-coverage, node-build,
+/// node-shell]`, and its entire body is a roll call followed by
+/// `[ "${{ contains(needs.*.result, 'failure') || ... }}" = "false" ]`. It therefore carries NO
+/// signal of its own: when `Node — shell` fails, that one cause is reported twice.
+///
+/// Measured on live PRs the day this was written: #2556 listed `["Node — shell", "Action cache
+/// freshness (advisory)", "Node — typecheck · test · build"]` — one real cause, one infra advisory,
+/// and one echo of the real cause, rendered as "3 checks failing". Inflating the count is not
+/// cosmetic: it is what teaches a reader that the number is noise.
+///
+/// SUPPRESSED ONLY WHEN AN INPUT IS ALSO FAILING. A rollup that fails while every fan-in check
+/// passed is NOT an echo — it means the gate itself broke, and ci.yml records a measured run where
+/// the aggregate's own worker could not spawn a shell for its step. That case must still be
+/// counted or a real gate failure becomes invisible, which is strictly worse than double-counting.
+///
+/// THIS CHANGES ONLY WHAT A HUMAN IS SHOWN. `classify_checks` is deliberately untouched, so the
+/// rollup still colours the dot red and still blocks the merge exactly as it did before.
+///
+/// Kept honest against ci.yml by `rollup_table_matches_the_ci_workflow` below, so a rename or a new
+/// fan-in job fails a test instead of silently restoring the double count.
+const ROLLUP_CHECKS: &[(&str, &[&str])] = &[(
+    "Node — typecheck · test · build",
+    &[
+        "Node — static",
+        "Node — coverage",
+        "Node — build",
+        "Node — shell",
+    ],
+)];
+
+/// Drop any rollup check whose failure is fully explained by a fan-in check that is failing too.
+fn without_rollup_echoes(failing: Vec<String>) -> Vec<String> {
+    let is_echo = |name: &String| -> bool {
+        match ROLLUP_CHECKS.iter().find(|(rollup, _)| rollup == name) {
+            // Not a rollup at all — it stands on its own and is always counted.
+            None => false,
+            // A rollup echoes only if at least one of the checks it fans in on also failed.
+            Some((_, inputs)) => inputs.iter().any(|i| failing.iter().any(|f| f == i)),
+        }
+    };
+    failing.iter().filter(|n| !is_echo(n)).cloned().collect()
+}
+
 /// `(failing, pending)` check names, in rollup order, deduplicated.
 ///
 /// Deduplicated because the same check can appear twice in a rollup (a re-run, or a job reported
@@ -5148,7 +5194,9 @@ fn collect_check_names(rollup: &[Value]) -> (Vec<String>, Vec<String>) {
             bucket.push(name);
         }
     }
-    (failing, pending)
+    // Only the FAILING list is de-echoed. A pending rollup is genuinely still waiting on its
+    // fan-in jobs, so naming it is accurate rather than inflationary.
+    (without_rollup_echoes(failing), pending)
 }
 
 /// GitHub's `mergeStateStatus` enum → the lowercase word the UI reads. An unrecognised or absent
@@ -5405,6 +5453,163 @@ mod rest_pr_rows_tests {
         .unwrap();
         assert_eq!(rows[0].checks, "failing");
         assert_eq!(rows[0].failing_checks, vec!["CI".to_string()]);
+    }
+
+    // ── ROLL-UP ECHOES ──────────────────────────────────────────────────────────────────────
+    // `Node — typecheck · test · build` is an aggregate whose only job is to fail when one of the
+    // four Node jobs failed. Counting it beside its own cause reported 3 failures on live PR #2556
+    // where there was 1 real cause, 1 infra advisory, and 1 echo.
+
+    fn check_run(name: &str, conclusion: &str) -> serde_json::Value {
+        serde_json::json!({
+            "__typename": "CheckRun",
+            "name": name,
+            "status": "COMPLETED",
+            // A Rust Option crosses the wire as an explicit null, never as an absent key, so the
+            // fixture carries the same shape the real payload does.
+            "conclusion": conclusion,
+            "detailsUrl": serde_json::Value::Null,
+        })
+    }
+
+    /// THE CENTRAL PIN: one real cause is reported once.
+    #[test]
+    fn a_rollup_echo_is_not_counted_as_a_second_failure() {
+        let rollup = vec![
+            check_run("Node — shell", "FAILURE"),
+            check_run("Action cache freshness (advisory)", "FAILURE"),
+            check_run("Node — typecheck · test · build", "FAILURE"),
+            check_run("Node — static", "SUCCESS"),
+        ];
+        let (failing, _pending) = collect_check_names(&rollup);
+        assert_eq!(
+            failing,
+            vec![
+                "Node — shell".to_string(),
+                "Action cache freshness (advisory)".to_string()
+            ],
+            "the aggregate must not be listed beside the fan-in job that caused it — that is the \
+             same failure counted twice"
+        );
+
+        // AND THE MERGE VERDICT IS UNMOVED. Suppressing the echo from what a human is SHOWN must
+        // never suppress it from what gates the merge: the aggregate is this repo's one required
+        // check, and the dot must stay red.
+        assert_eq!(
+            classify_checks(&rollup),
+            "failing",
+            "de-duplicating the human-facing list must not launder the rollup's failure into green"
+        );
+    }
+
+    /// THE OTHER HALF, and it is not symmetry for its own sake. A rollup failing while every job it
+    /// fans in on SUCCEEDED means the gate itself broke — ci.yml records a measured run where the
+    /// aggregate's own worker could not spawn a shell for its step. Suppressing that would make a
+    /// real gate failure invisible, which is worse than the double count this fix removes.
+    #[test]
+    fn a_rollup_that_fails_alone_is_still_counted() {
+        let rollup = vec![
+            check_run("Node — shell", "SUCCESS"),
+            check_run("Node — static", "SUCCESS"),
+            check_run("Node — typecheck · test · build", "FAILURE"),
+        ];
+        let (failing, _pending) = collect_check_names(&rollup);
+        assert_eq!(
+            failing,
+            vec!["Node — typecheck · test · build".to_string()],
+            "a rollup with no failing input is not an echo — it is the gate itself failing"
+        );
+    }
+
+    /// A pending rollup is genuinely still waiting on its fan-in jobs, so naming it is accurate.
+    #[test]
+    fn a_pending_rollup_is_left_alone() {
+        let rollup = vec![
+            serde_json::json!({"name": "Node — shell", "status": "IN_PROGRESS"}),
+            serde_json::json!({"name": "Node — typecheck · test · build", "status": "QUEUED"}),
+        ];
+        let (_failing, pending) = collect_check_names(&rollup);
+        assert_eq!(pending.len(), 2, "the de-echo is scoped to the failing list only");
+    }
+
+    /// ANTI-DRIFT. The table is a hand-written mirror of ci.yml, so a renamed job or a new fan-in
+    /// leg would silently restore the double count. Read the workflow and check the mirror.
+    #[test]
+    fn rollup_table_matches_the_ci_workflow() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../.github/workflows/ci.yml");
+        let yaml = std::fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("cannot read {path}: {e}"));
+
+        // Deliberately a line scan, not a YAML parse: this crate has no YAML dependency and adding
+        // one to read two keys would cost more than it explains. Job ids sit at 2-space indent and
+        // their keys at 4, which is the same indent discipline scripts/pr-checks.sh keys on.
+        let mut current = String::new();
+        let mut name_of: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let mut needs_of: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        for line in yaml.lines() {
+            if let Some(rest) = line.strip_prefix("  ") {
+                if !rest.starts_with(' ') && rest.ends_with(':') && !rest.starts_with('#') {
+                    current = rest.trim_end_matches(':').to_string();
+                    // A job with no `name:` shows under its job id.
+                    name_of.insert(current.clone(), current.clone());
+                    continue;
+                }
+            }
+            if current.is_empty() {
+                continue;
+            }
+            if let Some(v) = line.strip_prefix("    name: ") {
+                name_of.insert(current.clone(), v.trim().to_string());
+            }
+            if let Some(v) = line.strip_prefix("    needs: [") {
+                let ids = v
+                    .trim_end()
+                    .trim_end_matches(']')
+                    .split(',')
+                    .map(|t| t.trim().to_string())
+                    .filter(|t| !t.is_empty())
+                    .collect::<Vec<_>>();
+                needs_of.insert(current.clone(), ids);
+            }
+        }
+
+        let node_name = name_of
+            .get("node")
+            .unwrap_or_else(|| panic!("ci.yml has no `node:` job"));
+        let node_needs = needs_of
+            .get("node")
+            .unwrap_or_else(|| panic!("ci.yml's `node:` job declares no `needs:` list"));
+        let expected_inputs: Vec<String> = node_needs
+            .iter()
+            .map(|id| {
+                name_of
+                    .get(id)
+                    .unwrap_or_else(|| panic!("ci.yml's node job needs `{id}`, which has no job"))
+                    .clone()
+            })
+            .collect();
+
+        let (rollup_name, inputs) = ROLLUP_CHECKS
+            .iter()
+            .find(|(n, _)| n == node_name)
+            .unwrap_or_else(|| {
+                panic!(
+                    "ROLLUP_CHECKS has no entry for ci.yml's aggregate job, which is now named \
+                     {node_name:?}. Update the table or a renamed aggregate silently starts being \
+                     counted beside the very job that caused it again."
+                )
+            });
+        assert_eq!(*rollup_name, node_name.as_str());
+        let mut got: Vec<String> = inputs.iter().map(|s| s.to_string()).collect();
+        let mut want = expected_inputs;
+        got.sort();
+        want.sort();
+        assert_eq!(
+            got, want,
+            "ROLLUP_CHECKS' fan-in list has drifted from ci.yml's `node:` job `needs:`. A fan-in \
+             job that is missing here is one whose failure still double-counts."
+        );
     }
 
     /// MERGEABILITY IS NEVER CLAIMED. REST's list cannot supply it, and `"unknown"` is what the UI
