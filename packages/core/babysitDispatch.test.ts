@@ -801,3 +801,132 @@ describe("evidence — commits pushed since the last review", () => {
     ]);
   });
 });
+
+// -------------------------------------------------------------------------------------------------
+// `never-reviewed` — the FIRST review, which nothing else in the repo produces
+// -------------------------------------------------------------------------------------------------
+//
+// WHY THIS BLOCK EXISTS. `[review].require_review` (knightwatch.rs `coverage_for_repo`,
+// probe-gate.sh `compute_coverage`) refuses a PR that carries no review of any kind. The gate is
+// correct and its test is non-vacuous under mutation — but it ships OFF and cannot safely be armed,
+// because NOTHING produces a first review: no CI workflow runs `scripts/pr-review.sh`, and every
+// `BabysitEvidenceKind` above presupposes either a review that already exists
+// (`commits-pushed-since-last-review` is defined against the head the newest review read) or a
+// failing/absent check. A green, unreviewed, non-conflicting PR therefore generates no evidence at
+// all, is never picked up, and would be born blocked the moment the key is turned on.
+//
+// THE SHAPE THAT KEEPS RULE 1 INTACT. "This PR carries no review of any kind" is a STANDING FACT
+// re-derived every sweep, not an event: it is false forever once any review lands. That is the same
+// test `commits-pushed-since-last-review` passes and `pr-opened` fails, so admitting it does not
+// re-open the dispatch-on-schedule door the header closes.
+//
+// EVERY ASSERTION READS THE EMITTED EVIDENCE, and the inert cases are paired with a live one on the
+// SAME fixture — a test that only proved absence would stay green if the rule were keyed to the
+// wrong field entirely (AGENTS.md, "an earlier guard short-circuits the path").
+describe("`never-reviewed` — a PR nobody has ever reviewed", () => {
+  /** A full 40-char head, as `headRefOid` sends it. Local: the sibling block's copy is not in scope. */
+  const HEAD_NEW = `4d3030a${"1".repeat(33)}`;
+  /** The armed repo: the key is on AND a reviewer exists to satisfy it. */
+  const ARMED = { requireReview: true, prReviewer: "sparkle-reviewer" } as const;
+
+  it("fires when the repo has armed require_review and the PR carries no review at all", () => {
+    const pr = snapshot({ headSha: HEAD_NEW, gate: NOT_APPLICABLE_GATE, ...ARMED });
+    const evidence = babysitEvidenceFor(pr);
+    expect(evidence.map((e) => e.kind)).toEqual(["never-reviewed"]);
+    expect(evidence[0]?.id).toBe(`never-reviewed:${HEAD_NEW}`);
+    // Case-insensitive on purpose: the phrase is the claim, its position in the sentence is not.
+    expect(evidence[0]?.detail).toMatch(/no review of any kind/i);
+    // The head is NAMED — a refusal an author has to act on must say which commit is unreviewed.
+    expect(evidence[0]?.detail).toContain(HEAD_NEW.slice(0, 7));
+  });
+
+  it("PAIRED WITH THE ABOVE: that same PR actually reaches a dispatch", () => {
+    // Absence-only assertions pass for a rule that never fires at all. This proves the evidence
+    // survives every LATER gate in `decideBabysitDispatch` and produces the driver the key needs.
+    const pr = snapshot({ headSha: HEAD_NEW, gate: NOT_APPLICABLE_GATE, ...ARMED });
+    const d = decide({ pr });
+    expect(d.dispatch).toBe(true);
+    if (!d.dispatch) throw new Error(`expected a dispatch, got ${d.hold}`);
+    expect(d.evidence.map((e) => e.kind)).toContain("never-reviewed");
+  });
+
+  it("is INERT when the repo has not armed the key — the shipped default", () => {
+    // `requireReview: undefined` is the state of every repo today, and of every non-Sparkle project.
+    const pr = snapshot({ headSha: HEAD_NEW, gate: NOT_APPLICABLE_GATE });
+    expect(babysitEvidenceFor(pr)).toEqual([]);
+    expect(holdOf(decide({ pr }))).toBe("no-evidence");
+  });
+
+  it("is INERT when the key is explicitly off", () => {
+    const pr = snapshot({
+      headSha: HEAD_NEW,
+      gate: NOT_APPLICABLE_GATE,
+      requireReview: false,
+      prReviewer: "sparkle-reviewer",
+    });
+    expect(babysitEvidenceFor(pr)).toEqual([]);
+  });
+
+  it("THE `none` HATCH SITS ABOVE THE KEY: a repo with no reviewer never dispatches", () => {
+    // Mirrors the ordering `coverage_for_repo` states in its own words: a repo with no PR-scoped
+    // reviewer cannot produce the review this evidence would demand, so honouring the key there
+    // would dispatch a driver forever against work nobody can ever satisfy. AGENTS.md: collapsing
+    // the hatch into the gate is "the one way to get this gate wrong".
+    const pr = snapshot({ headSha: HEAD_NEW, gate: NOT_APPLICABLE_GATE, requireReview: true, prReviewer: "none" });
+    expect(babysitEvidenceFor(pr)).toEqual([]);
+    expect(holdOf(decide({ pr }))).toBe("no-evidence");
+  });
+
+  it("does NOT fire once ANY review exists — that is the other kind's job", () => {
+    // The whole point of the key is telling "never reviewed" apart from "reviewed and passed". A
+    // PR whose review covers its head is CLEAR, and must stay clear with the key armed.
+    const pr = snapshot({
+      headSha: HEAD_NEW,
+      gate: gate([], { reviewedHead: HEAD_NEW.slice(0, 7) }),
+      ...ARMED,
+    });
+    expect(babysitEvidenceFor(pr)).toEqual([]);
+  });
+
+  it("holds when we never read the head — no stable id to carry across sweeps", () => {
+    const pr = snapshot({ headSha: undefined, gate: NOT_APPLICABLE_GATE, ...ARMED });
+    expect(babysitEvidenceFor(pr)).toEqual([]);
+  });
+
+  it("holds on an UNKNOWN gate read — `applicable: true, probes: undefined` is not `no review`", () => {
+    // "We could not look" must never render as "nobody has ever looked": the first is a broken read,
+    // the second is a claim about the PR. Collapsing them is the bug this module repeatedly guards.
+    const pr = snapshot({ headSha: HEAD_NEW, gate: UNKNOWN_GATE, ...ARMED });
+    expect(babysitEvidenceFor(pr).map((e) => e.kind)).not.toContain("never-reviewed");
+  });
+
+  it("ranks with the review-coverage facts, ahead of the CI and merge conditions", () => {
+    const pr = snapshot({
+      headSha: HEAD_NEW,
+      gate: NOT_APPLICABLE_GATE,
+      mergeStateStatus: "dirty",
+      checks: "failing",
+      ...ARMED,
+    });
+    expect(babysitEvidenceFor(pr).map((e) => e.kind)).toEqual([
+      "never-reviewed",
+      "merge-conflicting",
+      "checks-failing",
+    ]);
+  });
+
+  it("the id is STANDING, not an event: it survives a sweep and clears when a review lands", () => {
+    const before = snapshot({ headSha: HEAD_NEW, gate: NOT_APPLICABLE_GATE, ...ARMED });
+    // Same condition, second sweep — the id must be EQUAL or rule 3 could never be satisfied.
+    expect(babysitEvidenceIds(babysitEvidenceFor(before))).toEqual(
+      babysitEvidenceIds(babysitEvidenceFor(before)),
+    );
+    // A review lands on the very same head: the fact is now false, forever.
+    const after = snapshot({
+      headSha: HEAD_NEW,
+      gate: gate([], { reviewedHead: HEAD_NEW.slice(0, 7) }),
+      ...ARMED,
+    });
+    expect(babysitEvidenceIds(babysitEvidenceFor(after))).toEqual([]);
+  });
+});

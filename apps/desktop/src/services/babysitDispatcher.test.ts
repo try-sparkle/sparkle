@@ -120,8 +120,19 @@ function wireInvoke(opts: {
   leases?: unknown[];
   acquired?: boolean;
   acquireThrows?: boolean;
+  /** The project's `[review]` table. Omitted = the shipped default: a reviewer, key NOT armed. */
+  review?: { pr_reviewer?: string; require_review?: boolean };
+  /** Make `get_config` throw, so the fail-closed path in `readReviewPolicy` is drivable. */
+  configThrows?: boolean;
 }): void {
   invokeMock.mockImplementation(async (cmd: string) => {
+    if (cmd === "get_config") {
+      if (opts.configThrows) throw new Error("config unreadable");
+      return {
+        config: { review: opts.review ?? { pr_reviewer: "sparkle-reviewer", require_review: false } },
+        warnings: [],
+      };
+    }
     if (cmd === BABYSIT_LEASE_LIST_COMMAND) {
       if (opts.leases === undefined) throw new Error("unreadable");
       return opts.leases;
@@ -1405,5 +1416,78 @@ describe("readProbeGate — a reply that drifted from the contract is UNKNOWN", 
     expect(out.holds["probe-read-unknown"]).toBe(1);
     expect(out.failed).toBe(0);
     expect(out.holds["no-evidence"]).toBeUndefined();
+  });
+});
+
+
+// -------------------------------------------------------------------------------------------------
+// The producer half of `never-reviewed` — the wiring, which is the part that was missing
+// -------------------------------------------------------------------------------------------------
+//
+// The core owns the DECISION and is tested there. What cannot be tested there is whether this module
+// ever supplies the two fields the decision reads: a snapshot that never carries them renders the
+// whole feature permanently inert while every core test stays green. That is the "defaulted seam"
+// shape AGENTS.md names — delete the line that supplies the real value and the suite says nothing —
+// so these assertions drive the REAL sweep and read the dispatch it produces.
+describe("`never-reviewed` — the sweep carries the repo's review policy into the snapshot", () => {
+  /** A PR with NO review of any kind: `applicable: false` is the gate's "asked; nobody has looked". */
+  function prNeverReviewed(number = 1400) {
+    return {
+      number,
+      title: "add the thing",
+      url: `https://github.com/drodio/sparkle/pull/${number}`,
+      headRefOid: "c0ffee11".padEnd(40, "0"),
+      mergeStateStatus: "CLEAN",
+      statusCheckRollup: [{ __typename: "CheckRun", status: "COMPLETED", conclusion: "SUCCESS", name: "ci" }],
+    };
+  }
+  const NOT_APPLICABLE = { applicable: false, probes: [], error: null, overridden: false };
+
+  it("dispatches on an unreviewed PR when the repo has ARMED require_review", async () => {
+    fetchOpenPrsMock.mockResolvedValue([prNeverReviewed()]);
+    wireInvoke({
+      gate: NOT_APPLICABLE,
+      leases: [],
+      review: { pr_reviewer: "sparkle-reviewer", require_review: true },
+    });
+    const out = await sweepTwice();
+    expect(out.dispatched).toHaveLength(1);
+  });
+
+  it("PAIRED: the SAME PR does NOT dispatch while the key is unarmed — the shipped default", async () => {
+    // Without this pair the test above would pass for a sweep that dispatches on every PR, which is
+    // the failure the key exists to avoid. Identical fixture; only the policy differs.
+    fetchOpenPrsMock.mockResolvedValue([prNeverReviewed()]);
+    wireInvoke({
+      gate: NOT_APPLICABLE,
+      leases: [],
+      review: { pr_reviewer: "sparkle-reviewer", require_review: false },
+    });
+    const out = await sweepTwice();
+    expect(out.dispatched).toHaveLength(0);
+    expect(out.holds["no-evidence"]).toBe(1);
+  });
+
+  it("THE `none` HATCH survives the wiring: an armed key with no reviewer still never dispatches", async () => {
+    fetchOpenPrsMock.mockResolvedValue([prNeverReviewed()]);
+    wireInvoke({ gate: NOT_APPLICABLE, leases: [], review: { pr_reviewer: "none", require_review: true } });
+    const out = await sweepTwice();
+    expect(out.dispatched).toHaveLength(0);
+    expect(out.holds["no-evidence"]).toBe(1);
+  });
+
+  it("FAILS CLOSED: an unreadable config dispatches nothing, rather than the whole fleet", async () => {
+    // The dangerous direction. A config read that throws must not be read as "armed" — that would
+    // put a driver on every open PR at once on the strength of a failure.
+    fetchOpenPrsMock.mockResolvedValue([prNeverReviewed()]);
+    wireInvoke({ gate: NOT_APPLICABLE, leases: [], configThrows: true });
+    const out = await sweepTwice();
+    expect(out.dispatched).toHaveLength(0);
+    // THE HOLD REASON IS THE ASSERTION, not just the empty dispatch list. A sweep that THREW while
+    // reading the config would also dispatch nothing — but it would land in `failed`, having judged
+    // the PR not at all. `no-evidence` is the only outcome that says the PR was judged and the
+    // unreadable policy was correctly read as NOT ARMED.
+    expect(out.holds["no-evidence"]).toBe(1);
+    expect(out.failed).toBe(0);
   });
 });

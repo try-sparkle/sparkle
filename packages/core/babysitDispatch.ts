@@ -239,6 +239,19 @@ export interface BabysitPrSnapshot {
    */
   headSha?: string;
   gate: BabysitProbeGate;
+  /**
+   * The repo's resolved `[review].require_review`. `undefined` = NOT LOOKED, and like every other
+   * unknown here it manufactures no evidence — which is also the shipped default, so this field
+   * being absent leaves every existing caller's behaviour byte-for-byte unchanged.
+   */
+  requireReview?: boolean;
+  /**
+   * The repo's resolved `[review].pr_reviewer`. FREE-FORM, and only the exact word `none` is
+   * special — mirroring the config's own rule. Carried separately from `requireReview` rather than
+   * pre-ANDed by the producer because the PRECEDENCE is the part that is easy to get wrong, and it
+   * belongs where it can be tested: see the hatch in [`babysitEvidenceFor`].
+   */
+  prReviewer?: string | null;
 }
 
 /**
@@ -282,6 +295,16 @@ export type BabysitEvidenceKind =
   | "checks-failing"
   /** The read succeeded and this PR has NO checks at all — CI never ran for it. */
   | "checks-absent"
+  /**
+   * NO REVIEW OF ANY KIND has ever been posted on this PR, in a repo whose `[review].require_review`
+   * is armed. Distinct from `commits-pushed-since-last-review`, which is about a review that EXISTS
+   * and has gone out of date — telling those two apart is the entire point of the key.
+   *
+   * A STANDING FACT, not an event, which is what admits it under rule 1: it is re-derived every
+   * sweep from the gate's own `applicable`, and becomes false forever the moment any review lands.
+   * `pr-opened` fails that test and stays excluded.
+   */
+  | "never-reviewed"
   /** `DIRTY`: the PR conflicts, so GitHub never fired a `pull_request` event and it is untested. */
   | "merge-conflicting";
 
@@ -389,6 +412,30 @@ export function babysitEvidenceFor(pr: BabysitPrSnapshot): BabysitEvidence[] {
     }
   }
 
+  // HAS ANYONE EVER REVIEWED THIS AT ALL? The branch above asks whether a review covers the CURRENT
+  // head; this one asks whether a review exists. `applicable: false` is exactly "the read succeeded
+  // and this PR carries no reviewer comment", which is why it is the signal rather than an absent
+  // `reviewedHead` — an UNKNOWN read leaves `applicable` true and must never land here.
+  //
+  // THE HATCH SITS ABOVE THE KEY, in the same order and for the same reason `coverage_for_repo`
+  // gives: a repo with no PR-scoped reviewer cannot produce the review this would demand, so
+  // honouring the key there would dispatch a driver forever against work nobody can satisfy.
+  // Collapsing the two is, in AGENTS.md's words, the one way to get this gate wrong.
+  //
+  // Fails CLOSED three times over, matching the branch above: the key must be explicitly `true`
+  // (an unarmed or unread repo emits nothing, which is every repo today and every non-Sparkle
+  // project), a reviewer must exist, and `headSha` must be known so the id is stable across sweeps.
+  const reviewerIsNone = (pr.prReviewer ?? "").trim().toLowerCase() === "none";
+  if (pr.requireReview === true && !reviewerIsNone && !pr.gate.applicable && pr.headSha !== undefined) {
+    out.push({
+      kind: "never-reviewed",
+      // KEYED ON THE HEAD, for the reason the sibling above gives: while a branch is being pushed the
+      // id changes every sweep and never clears rule 3, so a driver starts once the branch SETTLES.
+      id: `never-reviewed:${pr.headSha}`,
+      detail: `No review of any kind has been posted on this PR, so nothing has ever read head ${pr.headSha.slice(0, 7)}.`,
+    });
+  }
+
   const conflicting = pr.mergeStateStatus?.toLowerCase() === "dirty";
   if (conflicting) {
     out.push({
@@ -424,15 +471,16 @@ export function babysitEvidenceFor(pr: BabysitPrSnapshot): BabysitEvidence[] {
 }
 
 // Review-coverage facts group together at the top — an unanswered probe, then an unanswered probe of
-// lesser severity, then "nobody has read this code at all" — ahead of the CI and merge conditions.
-// The relative order of the original five is unchanged.
+// lesser severity, then "this head is unreviewed", then "nobody has EVER reviewed this" — ahead of
+// the CI and merge conditions. The relative order of the original five is unchanged.
 const EVIDENCE_RANK: Record<BabysitEvidenceKind, number> = {
   "unanswered-blocking-probe": 0,
   "unanswered-open-probe": 1,
   "commits-pushed-since-last-review": 2,
-  "merge-conflicting": 3,
-  "checks-failing": 4,
-  "checks-absent": 5,
+  "never-reviewed": 3,
+  "merge-conflicting": 4,
+  "checks-failing": 5,
+  "checks-absent": 6,
 };
 
 function rankOf(kind: BabysitEvidenceKind): number {

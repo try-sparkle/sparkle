@@ -255,6 +255,20 @@ export interface FreshnessConfig {
  *  is a plain Rust `String`, so it is always present on the wire (never null). */
 export interface ReviewConfig {
   pr_reviewer: string;
+  /**
+   * Is a PR carrying NO review of any kind REFUSED rather than waved through?
+   *
+   * A plain Rust `bool` (`ReviewConfig::require_review`), never an `Option`, so it is always present
+   * on the wire and can never arrive as `null` — see AGENTS.md's Rust-`Option` seam, which is why
+   * this is `boolean` and not `boolean | null`. It stays OPTIONAL here for the same back-compat
+   * reason as its siblings: a Rust backend predating the key omits it, and a consumer must read that
+   * absence as NOT ARMED rather than crash or guess.
+   *
+   * READ IT WITH THE `pr_reviewer` HATCH ABOVE IT, never beside it: a repo whose reviewer is `none`
+   * cannot produce the review this key would demand, so honouring the key there refuses a merge
+   * nobody can ever unblock. `coverage_for_repo` orders its guards that way and says so.
+   */
+  require_review?: boolean;
 }
 // NOTE: there is no `VoiceConfig` mirror here any more. It described exactly three keys — the wake
 // word, the stop word and pause-on-submit — and all three were retired with the wake word itself.

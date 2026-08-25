@@ -63,6 +63,7 @@ import {
   BABYSIT_RATE_WINDOW_MS,
 } from "@sparkle/core";
 import { fetchOpenPrs, OPEN_PR_POLL_MS, type PrRow } from "./openPrs";
+import { getConfig } from "./config";
 // ONE adapter for `knightwatch_probe_gate`, owned by `probeGate.ts` — see `readProbeGate` there.
 import { readProbeGate } from "./probeGate";
 import { spawnBuildAgentInProject } from "./buildAgentSpawn";
@@ -387,6 +388,30 @@ export interface BabysitSweepOutcome {
 }
 
 /**
+ * This project's `[review]` policy, as the two fields the core's `never-reviewed` evidence reads.
+ *
+ * ONE READ PER SWEEP, not per PR: the answer is a property of the repo, and re-invoking the config
+ * command for every PR in a 14-PR fleet would be 14 round-trips for one unchanging value.
+ *
+ * FAILS CLOSED. An unreadable config yields `{}`, which the core reads as NOT ARMED and turns into
+ * no evidence at all — the module's standing rule that an unknown never manufactures evidence,
+ * honoured here at the boundary rather than in the decision. Getting this backwards would dispatch a
+ * driver at every PR in the fleet on the strength of a config read that failed.
+ */
+async function readReviewPolicy(
+  projectRoot: string,
+): Promise<{ requireReview?: boolean; prReviewer?: string }> {
+  try {
+    const eff = await getConfig(projectRoot);
+    const review = eff.config.review;
+    if (!review) return {};
+    return { requireReview: review.require_review === true, prReviewer: review.pr_reviewer };
+  } catch {
+    return {};
+  }
+}
+
+/**
  * ONE sweep over one project's open PRs.
  *
  * `now` is passed in rather than read, so the whole thing is drivable from a test without faking a
@@ -426,6 +451,9 @@ export async function babysitSweepProject(
     return out;
   }
   if (prs.length === 0) return out;
+
+  // After the early returns: a project with nothing open needs no policy read at all.
+  const reviewPolicy = await readReviewPolicy(project.rootPath);
 
   const leases = await readLeases();
 
@@ -501,6 +529,12 @@ export async function babysitSweepProject(
         // states, defeated at the boundary rather than in the decision.
         headSha: pr.headRefOid || undefined,
         gate,
+        // THE REPO'S REVIEW POLICY, which is what makes `never-reviewed` reachable at all. Both
+        // fields are carried through unresolved: the core owns the precedence between them (the
+        // `none` hatch above the key), so pre-ANDing them here would move the one part that is easy
+        // to get wrong out of the module that tests it.
+        requireReview: reviewPolicy.requireReview,
+        prReviewer: reviewPolicy.prReviewer,
       };
       const k = key(repo, pr.number);
       const lease = standingFor(leases, repo, pr.number);
