@@ -636,6 +636,21 @@ pub fn daemon_path_env(home: &Path) -> String {
     )
 }
 
+/// Where the roborev daemon's own stdout/stderr are captured, under the same
+/// `~/Library/Logs/ai.sparkle.desktop/` directory the maintenance and drainer LaunchAgents use.
+///
+/// WITHOUT THIS THE JOB DIES SILENTLY. A LaunchAgent with no `StandardErrorPath` sends its output
+/// nowhere, so `launchctl print` can say `last exit code = 1` sixty-one times over and there is no
+/// way to learn WHY from outside the process — measured (`sparkle-ec1olc`): the answer turned out to
+/// be a one-line `Error: daemon already running (pid N on 127.0.0.1:7373)` that nothing had ever
+/// been in a position to read.
+pub fn roborev_daemon_log_path(home: &Path) -> PathBuf {
+    home.join("Library")
+        .join("Logs")
+        .join("ai.sparkle.desktop")
+        .join("roborev-daemon.log")
+}
+
 /// Generate the launchd LaunchAgent plist for the roborev daemon. `ProgramArguments` runs
 /// `<roborev> daemon run`; `RunAtLoad`+`KeepAlive` keep it alive across logout/reboot, and
 /// `ThrottleInterval` (see [`ROBOREV_DAEMON_THROTTLE_SECS`]) backs a crash-looping copy off instead
@@ -645,6 +660,7 @@ pub fn daemon_path_env(home: &Path) -> String {
 pub fn roborev_daemon_plist(roborev_path: &str, home: &Path) -> String {
     let prog = xml_escape(roborev_path);
     let path_env = xml_escape(&daemon_path_env(home));
+    let log_path = xml_escape(&roborev_daemon_log_path(home).to_string_lossy());
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -664,6 +680,10 @@ pub fn roborev_daemon_plist(roborev_path: &str, home: &Path) -> String {
     <true/>
     <key>ThrottleInterval</key>
     <integer>{ROBOREV_DAEMON_THROTTLE_SECS}</integer>
+    <key>StandardOutPath</key>
+    <string>{log_path}</string>
+    <key>StandardErrorPath</key>
+    <string>{log_path}</string>
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
@@ -693,16 +713,76 @@ fn current_uid() -> Result<String, String> {
     Ok(uid)
 }
 
-/// Is the roborev LaunchAgent currently loaded in the user's gui domain? `launchctl print` exits 0
-/// only when the service is bootstrapped, so this lets the (idempotent) install skip a disruptive
-/// bootout/bootstrap when the daemon is already healthy — e.g. the every-launch startup ensure.
+/// The roborev LaunchAgent's state in the user's gui domain, reduced to the one distinction that
+/// decides whether the install may take its early-out.
+///
+/// BOOTSTRAPPED IS NOT RUNNING, and conflating them is a fail-open that was measured on the
+/// founder's Mac (`sparkle-ec1olc`). `launchctl print` exits **0** for a job that is bootstrapped
+/// and failing to start: the block it printed there read `active count = 0`, `state = spawn
+/// scheduled`, `runs = 61`, `last exit code = 1` and carried **no `pid = ` line at all**, while the
+/// command still exited 0. Testing the exit status alone therefore reported "already running" about
+/// a daemon that had never once stayed up — so [`install_roborev`]'s every-launch self-heal skipped
+/// its reload forever, on exactly the machine that needed it.
 #[cfg(unix)]
-fn roborev_daemon_loaded(uid: &str) -> bool {
-    Command::new("launchctl")
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RoborevDaemonState {
+    /// `launchctl print` failed — the service is not bootstrapped in this domain (or launchctl is
+    /// unreachable, which we treat the same way: reload rather than skip).
+    NotBootstrapped,
+    /// The service IS bootstrapped, but launchd has no live process for it. This is the failing
+    /// job: `KeepAlive` keeps respawning it and it keeps exiting.
+    BootstrappedNotRunning,
+    /// launchd has a live process for the job.
+    Running,
+}
+
+/// The pid launchd reports for the job itself, or `None` when it has no live process.
+///
+/// PARSED, not grepped, and split out PURE so it can be tested — `launchctl print` NESTS blocks
+/// whose lines look exactly like the job's own. The real output contains `resource coalition = { …
+/// state = active … active count = 1 … }` and a `jetsam coalition` block with the same shape, so a
+/// `contains("state = active")` or a bare scan for `active count = 1` matches those nested lines and
+/// reports RUNNING for a dead job. Brace depth is what says whose field a line is: depth 1 is the
+/// job's own, anything deeper belongs to a sub-block. Indentation is deliberately NOT the key —
+/// keying on a leading tab would break the moment launchctl changed its formatting.
+#[cfg(unix)]
+fn launchd_print_job_pid(stdout: &str) -> Option<u32> {
+    let mut depth: i32 = 0;
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        // Read the line at the depth it is written at, THEN apply its own braces — otherwise a
+        // `key = {` line would be attributed to the block it opens.
+        if depth == 1 {
+            if let Some(rest) = trimmed.strip_prefix("pid = ") {
+                if let Ok(pid) = rest.trim().parse::<u32>() {
+                    return Some(pid);
+                }
+            }
+        }
+        depth += trimmed.matches('{').count() as i32;
+        depth -= trimmed.matches('}').count() as i32;
+    }
+    None
+}
+
+/// Ask launchd what state the roborev LaunchAgent is actually in. See [`RoborevDaemonState`] for
+/// why the exit status alone is not enough.
+#[cfg(unix)]
+fn roborev_daemon_state(uid: &str) -> RoborevDaemonState {
+    match Command::new("launchctl")
         .args(["print", &format!("gui/{uid}/{ROBOREV_DAEMON_LABEL}")])
         .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    {
+        Ok(out) if out.status.success() => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            if launchd_print_job_pid(&stdout).is_some() {
+                RoborevDaemonState::Running
+            } else {
+                RoborevDaemonState::BootstrappedNotRunning
+            }
+        }
+        _ => RoborevDaemonState::NotBootstrapped,
+    }
 }
 
 /// Install roborev on macOS: fetch the pinned Apple-Silicon asset, verify its sha256, drop it at
@@ -829,7 +909,13 @@ fn install_roborev_blocking(app: &AppHandle) -> Result<String, String> {
     // check, rotation would only reach machines that happened to reinstall roborev.
     let uid = current_uid()?;
     let plist_current = std::fs::read_to_string(&plist_path).unwrap_or_default();
-    if !freshly_installed && roborev_daemon_loaded(&uid) && plist_current == desired_plist {
+    // RUNNING, not merely bootstrapped: a job that launchd is respawning and that keeps exiting is
+    // the exact case this early-out must NOT take, or the self-heal never runs (`sparkle-ec1olc`).
+    let daemon_state = roborev_daemon_state(&uid);
+    if !freshly_installed
+        && daemon_state == RoborevDaemonState::Running
+        && plist_current == desired_plist
+    {
         emit(app, "roborev", "roborev daemon already running.");
         return Ok(roborev_path);
     }
@@ -844,6 +930,12 @@ fn install_roborev_blocking(app: &AppHandle) -> Result<String, String> {
 
     // (5) Write + (re)load the launchd daemon so reviews run in the background across reboots.
     if let Some(parent) = plist_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("cannot create {parent:?}: {e}"))?;
+    }
+    // launchd creates the log FILE but not its directory: a `StandardErrorPath` whose parent is
+    // missing makes the job fail to spawn, so this mkdir is part of the plist, not a nicety.
+    if let Some(parent) = roborev_daemon_log_path(&home).parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("cannot create {parent:?}: {e}"))?;
     }
@@ -2059,4 +2151,163 @@ cccc3333  node-v22.12.0-darwin-x64.tar.gz
         assert!(ProjectLanguage::from_key("kotlin").is_none());
         assert!(ProjectLanguage::from_key("").is_none());
     }
+
+    /// A LaunchAgent with no `StandardErrorPath` sends its output nowhere, so `last exit code = 1`
+    /// is all anyone outside the process can ever learn. That is exactly what happened
+    /// (`sparkle-ec1olc`): the daemon had been printing a one-line reason 61 times and nothing was
+    /// in a position to read it.
+    #[test]
+    fn roborev_daemon_plist_captures_the_daemons_own_stderr() {
+        let home = std::path::Path::new("/Users/x");
+        let plist = roborev_daemon_plist("/Users/x/.local/bin/roborev", home);
+        let log = roborev_daemon_log_path(home);
+        let log = log.to_string_lossy();
+        assert_eq!(log, "/Users/x/Library/Logs/ai.sparkle.desktop/roborev-daemon.log");
+        assert!(plist.contains("<key>StandardErrorPath</key>"));
+        assert!(plist.contains("<key>StandardOutPath</key>"));
+        // Both point at the same file, so a reason printed on either stream is recoverable.
+        assert_eq!(plist.matches(&format!("<string>{log}</string>")).count(), 2);
+    }
+
+    /// The log path goes through the same XML escaping as everything else in the plist — a home dir
+    /// with an `&` in it would otherwise produce a plist launchd refuses to parse, which fails the
+    /// job in a way that once again says nothing about why.
+    #[test]
+    fn roborev_daemon_plist_xml_escapes_the_log_path_too() {
+        let plist = roborev_daemon_plist(
+            "/Users/a&b/.local/bin/roborev",
+            std::path::Path::new("/Users/a&b"),
+        );
+        assert!(plist.contains("/Users/a&amp;b/Library/Logs/ai.sparkle.desktop/roborev-daemon.log"));
+        assert!(!plist.contains("a&b/Library"));
+    }
+
+    // ── launchd job state: BOOTSTRAPPED IS NOT RUNNING ─────────────────────────────────────────
+    // Fixtures are real `launchctl print` output shapes captured on the founder's Mac
+    // (`sparkle-ec1olc`). The nested `resource coalition` / `jetsam coalition` blocks are kept
+    // deliberately: they carry `state = active` and `active count = 1` and are what a naive
+    // substring test matches, reporting a dead job as running.
+
+    #[cfg(unix)]
+    const LAUNCHCTL_PRINT_RUNNING: &str = "\
+gui/501/co.plow.roborev-daemon = {
+\tactive count = 1
+\tpath = /Users/x/Library/LaunchAgents/co.plow.roborev-daemon.plist
+\ttype = LaunchAgent
+\tstate = running
+
+\tprogram = /Users/x/.local/bin/roborev
+\tpid = 56079
+\timmediate reason = speculative
+\tforks = 0
+\texecs = 1
+\tlast exit code = (never exited)
+
+\tresource coalition = {
+\t\tID = 64295
+\t\ttype = resource
+\t\tstate = active
+\t\tactive count = 1
+\t\tname = co.plow.roborev-daemon
+\t}
+
+\tjetsam coalition = {
+\t\tID = 64296
+\t\ttype = jetsam
+\t\tstate = active
+\t\tactive count = 1
+\t\tname = co.plow.roborev-daemon
+\t}
+
+\tproperties = keepalive | runatload | inferred program
+}
+";
+
+    // The one actually measured: bootstrapped, KeepAlive respawning it, exiting 1 every time, and
+    // NO `pid = ` line anywhere. `launchctl print` still exits 0 for this.
+    #[cfg(unix)]
+    const LAUNCHCTL_PRINT_BOOTSTRAPPED_DEAD: &str = "\
+gui/501/co.plow.roborev-daemon = {
+\tactive count = 0
+\tpath = /Users/x/Library/LaunchAgents/co.plow.roborev-daemon.plist
+\ttype = LaunchAgent
+\tstate = spawn scheduled
+
+\tprogram = /Users/x/.local/bin/roborev
+\targuments = {
+\t\t/Users/x/.local/bin/roborev
+\t\tdaemon
+\t\trun
+\t}
+
+\tdefault environment = {
+\t\tPATH => /usr/bin:/bin:/usr/sbin:/sbin
+\t}
+
+\tdomain = gui/501 [100026]
+\tminimum runtime = 300
+\texit timeout = 5
+\truns = 61
+\tlast exit code = 1
+
+\tresource coalition = {
+\t\tID = 64295
+\t\ttype = resource
+\t\tstate = active
+\t\tactive count = 1
+\t\tname = co.plow.roborev-daemon
+\t}
+
+\tjetsam coalition = {
+\t\tID = 64296
+\t\ttype = jetsam
+\t\tstate = active
+\t\tactive count = 1
+\t\tname = co.plow.roborev-daemon
+\t}
+
+\tproperties = keepalive | runatload | inferred program
+}
+";
+
+    #[cfg(unix)]
+    #[test]
+    fn launchd_print_job_pid_reads_the_live_pid() {
+        assert_eq!(launchd_print_job_pid(LAUNCHCTL_PRINT_RUNNING), Some(56079));
+    }
+
+    /// THE WHOLE POINT. This is the block `launchctl print` emits for the failing job, and it
+    /// exits 0 while emitting it. Before this fix the caller read that 0 as "already running" and
+    /// the every-launch self-heal never ran.
+    #[cfg(unix)]
+    #[test]
+    fn launchd_print_job_pid_is_none_when_the_job_is_bootstrapped_but_dead() {
+        assert_eq!(launchd_print_job_pid(LAUNCHCTL_PRINT_BOOTSTRAPPED_DEAD), None);
+    }
+
+    /// The nested-block trap, asserted on its own so a regression names itself. Both fixtures carry
+    /// `state = active` and `active count = 1` INSIDE the coalition sub-blocks; keying on those
+    /// would call the dead job running. Depth, not indentation and not substring presence.
+    #[cfg(unix)]
+    #[test]
+    fn nested_coalition_blocks_do_not_make_a_dead_job_look_running() {
+        assert!(LAUNCHCTL_PRINT_BOOTSTRAPPED_DEAD.contains("state = active"));
+        assert!(LAUNCHCTL_PRINT_BOOTSTRAPPED_DEAD.contains("active count = 1"));
+        // …and it is still not running: those two lines belong to the coalitions, and the job
+        // itself has no `pid` field at all.
+        assert_eq!(launchd_print_job_pid(LAUNCHCTL_PRINT_BOOTSTRAPPED_DEAD), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn launchd_print_job_pid_handles_empty_and_garbage() {
+        assert_eq!(launchd_print_job_pid(""), None);
+        assert_eq!(launchd_print_job_pid("Could not find service"), None);
+        // A `pid = ` that is not the job's own field (depth 2) must not count.
+        assert_eq!(
+            launchd_print_job_pid("job = {\n\tsub = {\n\t\tpid = 42\n\t}\n}\n"),
+            None
+        );
+    }
+
 }
