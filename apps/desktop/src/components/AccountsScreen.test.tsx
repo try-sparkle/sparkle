@@ -554,6 +554,41 @@ describe("AccountsScreen", () => {
     expect(err.getAttribute("role")).toBe("alert");
   });
 
+  it("a RATE-LIMITED (429) Check usage shows an honest rate-limited note, never 'check your connection'", async () => {
+    // THE FOUNDER'S INCIDENT, and the PAIR to the transient-failure test directly above: identical
+    // signed-in, non-exhausted fixture and identical gesture — only the rejection differs. A 429 means
+    // Anthropic refused the read because the account is at a session/weekly cap; the account is signed
+    // in and authenticating fine (a 429 proves it). So it must render the CALM `exhausted` status
+    // (role=status, not the amber alert), name the rate-limit honestly, and NEVER say "check your
+    // connection" or "sign in again". Non-vacuous: the paired test above drives the SAME fixture into a
+    // generic error and asserts the amber alert + "temporary problem" copy, so a handler that ignored
+    // the 429 class would land there and fail every assertion here (no exhausted note, wrong role,
+    // wrong text).
+    const deps = makeDeps(
+      [acct("a", { nickname: "A" })],
+      [],
+      [{ id: "a", email: "a@x.com", organization: null, accountUuid: "ua" }],
+    );
+    deps.getUsageLive = vi.fn(async (_c: string) => liveUsage(10, 10));
+    // Exactly the string the Rust command sends on a 429 (`RATE_LIMITED_MSG`).
+    deps.getUsageLiveForced = vi.fn(async (_c: string) => {
+      throw new Error("usage fetch failed: rate-limited (usage temporarily unavailable)");
+    });
+    render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
+    await waitFor(() => expect(deps.getUsageLive).toHaveBeenCalled());
+
+    fireEvent.click(within(await openKebab("a")).getByText("Check usage levels"));
+
+    const note = await screen.findByTestId("account-usage-exhausted-note-a");
+    expect(note.getAttribute("role")).toBe("status"); // calm, NOT the amber alert
+    expect(note.textContent).toContain("rate-limited");
+    expect(note.textContent).not.toContain("check your connection");
+    expect(note.textContent).not.toContain("Check your connection");
+    expect(note.textContent).not.toContain("sign in again");
+    // And it is NOT routed to the amber error surface reserved for a genuine transport failure.
+    expect(screen.queryByTestId("account-usage-error-a")).toBeNull();
+  });
+
   // ── "usage unknown" IS NOT AN ERROR ───────────────────────────────────────────────────────────
   //
   // The quiet reader never touches the keychain, so an account whose cached OAuth token has lapsed

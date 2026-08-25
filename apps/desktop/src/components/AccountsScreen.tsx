@@ -61,6 +61,7 @@ import {
   getAccountUsageLive,
   getAccountUsageLiveForced,
   isUsageUnknownError,
+  isUsageRateLimitError,
   type AccountUsageLive,
 } from "../services/accountUsage";
 import {
@@ -1286,7 +1287,21 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
           const loginDead =
             isUsageAuthError(e) ||
             deriveRowLogin(isSignedIn(identity), authStatus[a.id]) !== "healthy";
-          if (exReset) {
+          if (isUsageRateLimitError(e)) {
+            // Anthropic 429'd the usage read: the account is at (or over) a session/weekly cap. It is
+            // signed in and authenticating fine — a 429 PROVES that — so this must NOT read as "sign
+            // in again" (loginDead) or "check your connection" (generic error). It is the founder's
+            // exact incident: a weekly-capped account showing a connectivity error. The calm
+            // `exhausted` status is the honest one; it wins over both branches below precisely because
+            // a live rate-limit is more authoritative than a stale local wall or a login heuristic.
+            setUsageError((m) => ({
+              ...m,
+              [a.id]: {
+                kind: "exhausted" as const,
+                text: "Account is rate-limited (usage temporarily unavailable). This account is signed in — its limit will reset soon.",
+              },
+            }));
+          } else if (exReset) {
             setUsageError((m) => ({
               ...m,
               [a.id]: {

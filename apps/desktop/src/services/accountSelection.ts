@@ -30,7 +30,7 @@ import {
   type PickOptions,
   type LiveUsage,
 } from "./accountStore";
-import { getAccountUsageLive } from "./accountUsage";
+import { getAccountUsageLive, isUsageRateLimitError } from "./accountUsage";
 // The user's own steering of the pool: the accounts taken out of rotation from the accounts screen,
 // and the fleet-wide pause. Both read through localStorage on every call — see `rotationState.ts` for
 // why that discipline, and why neither is allowed to block a spawn.
@@ -149,7 +149,17 @@ export function refreshLiveUsage(
             fiveHourPercent: r?.fiveHourPercent ?? null,
             sevenDayPercent: r?.sevenDayPercent ?? null,
           }))
-          .catch(() => null),
+          .catch((e): LiveUsage | null =>
+            // A RATE-LIMIT (HTTP 429) is not a reason to drop the row — it is the strongest possible
+            // "this account is at a cap" signal, and dropping it (as every other failure rightly is)
+            // left the capped account looking available so rotation kept picking it. Emit a row that
+            // marks it near-cap; `isAccountLiveSpent` then excludes it. Every OTHER rejection (no
+            // token, network, 401, unparseable body) still degrades to no row, which reads as
+            // "unknown" and correctly does NOT exclude — an unreadable figure must never look full.
+            isUsageRateLimitError(e)
+              ? { id: a.id, fiveHourPercent: null, sevenDayPercent: null, rateLimited: true }
+              : null,
+          ),
       ),
     );
     liveCache = { at: now, rows: rows.filter((r): r is LiveUsage => r !== null) };

@@ -1157,16 +1157,32 @@ pub async fn account_usage_live(
 }
 
 /// Outcome of one usage HTTP call, distinguishing the ONE status that means "this token is stale"
-/// (401 → drop the cache and re-read the keychain once) from every other failure (surfaced as-is).
+/// (401 → drop the cache and re-read the keychain once) and the ONE that means "this account is at a
+/// limit right now" (429 → a distinct, honest signal) from every other failure (surfaced as-is).
 enum UsageFetchError {
     /// The server rejected the bearer token (HTTP 401). The cached token may have gone stale before
     /// its recorded `expiresAt` (e.g. `claude` rotated it); invalidate the cache and retry once.
     Unauthorized,
-    /// Any other failure — network error, non-401 status, unreadable body.
+    /// The server RATE-LIMITED the read (HTTP 429). This is Anthropic itself refusing because the
+    /// account is at (or over) a session/weekly cap — the cleanest "this account is near its limit"
+    /// signal there is. It is emphatically NOT a connectivity fault, so it must never be surfaced as
+    /// "check your connection", and it must NOT trigger the 401 invalidate-and-retry (the token is
+    /// fine; retrying just earns a second 429). Surfaced as [`RATE_LIMITED_MSG`] for the frontend to
+    /// classify (`USAGE_RATE_LIMITED_MARKER` in `services/accountUsage.ts`) and route AWAY from for
+    /// rotation.
+    RateLimited,
+    /// Any other failure — network error, non-401/429 status, unreadable body.
     Other(String),
 }
 
-/// One bearer-authed GET of the usage endpoint, mapping a 401 to [`UsageFetchError::Unauthorized`].
+/// The error text a 429 becomes on the way to JS. The `rate-limited` token is a cross-language
+/// contract with `services/accountUsage.ts` (`USAGE_RATE_LIMITED_MARKER`): the frontend keys on it to
+/// show an honest "rate-limited" message instead of "check your connection", and the rotation cache
+/// keys on it to mark the account near-cap. Do not reword the token half without updating that side.
+const RATE_LIMITED_MSG: &str = "usage fetch failed: rate-limited (usage temporarily unavailable)";
+
+/// One bearer-authed GET of the usage endpoint, mapping a 401 to [`UsageFetchError::Unauthorized`]
+/// and a 429 to [`UsageFetchError::RateLimited`].
 fn http_get_usage(token: &str) -> Result<String, UsageFetchError> {
     match ureq::get(USAGE_URL)
         .timeout(HTTP_TIMEOUT)
@@ -1179,6 +1195,7 @@ fn http_get_usage(token: &str) -> Result<String, UsageFetchError> {
             .into_string()
             .map_err(|e| UsageFetchError::Other(e.to_string())),
         Err(ureq::Error::Status(401, _)) => Err(UsageFetchError::Unauthorized),
+        Err(ureq::Error::Status(429, _)) => Err(UsageFetchError::RateLimited),
         Err(e) => Err(UsageFetchError::Other(format!("usage fetch failed: {e}"))),
     }
 }
@@ -1225,6 +1242,10 @@ fn fetch_usage_with(
     match http_get(&token) {
         Ok(text) => parse_usage_response(&text),
         Err(UsageFetchError::Other(e)) => Err(e),
+        // A 429 is the account being rate-limited, not a stale token — surface it with its honest
+        // marker and DO NOT invalidate or retry (the token is valid; a retry just earns a second
+        // 429, and dropping the cache would cost a needless keychain read next time).
+        Err(UsageFetchError::RateLimited) => Err(RATE_LIMITED_MSG.to_string()),
         Err(UsageFetchError::Unauthorized) => {
             // Cached token rejected — drop the cache so the re-read resolves from source, then retry
             // ONCE. Quiet stays quiet: with the cache gone and no creds file, that re-read returns
@@ -1234,6 +1255,8 @@ fn fetch_usage_with(
             match http_get(&token) {
                 Ok(text) => parse_usage_response(&text),
                 Err(UsageFetchError::Other(e)) => Err(e),
+                // The re-read token can itself hit a 429 — same honest marker, still no loop.
+                Err(UsageFetchError::RateLimited) => Err(RATE_LIMITED_MSG.to_string()),
                 Err(UsageFetchError::Unauthorized) => {
                     Err("usage fetch failed: unauthorized after keychain re-read".to_string())
                 }
@@ -2743,6 +2766,34 @@ mod tests {
         assert_eq!(err, "network down");
         assert!(!*invalidated.borrow(), "a non-401 must NOT invalidate the cache");
         assert_eq!(*reads.borrow(), 1, "a non-401 must NOT re-read the token");
+    }
+
+    #[test]
+    fn fetch_surfaces_a_429_as_rate_limited_without_invalidating_or_retrying() {
+        // A 429 means the account is at a session/weekly cap — Anthropic refusing the read, not a
+        // stale token and not a connectivity fault. It must surface with the `rate-limited` marker
+        // the frontend keys on, and — UNLIKE a 401 — must NOT invalidate the cache and must NOT
+        // re-read the token (the token is valid; a retry just earns a second 429). Non-vacuous: the
+        // invalidate seam and the read counter both record, so a "treat 429 like 401" implementation
+        // (invalidate + second read) fails on both assertions, and a "fold 429 into Other" one fails
+        // the marker assertion.
+        let reads = RefCell::new(0);
+        let invalidated = RefCell::new(false);
+        let err = fetch_usage_with(
+            "/cfg/a",
+            TokenAccess::Quiet,
+            |_cd, _access| {
+                *reads.borrow_mut() += 1;
+                Ok("tok".to_string())
+            },
+            |_cd| *invalidated.borrow_mut() = true,
+            |_token| Err(UsageFetchError::RateLimited),
+        )
+        .unwrap_err();
+        assert_eq!(err, RATE_LIMITED_MSG);
+        assert!(err.contains("rate-limited"), "the marker the frontend keys on must survive: {err:?}");
+        assert!(!*invalidated.borrow(), "a 429 must NOT invalidate the cache (the token is fine)");
+        assert_eq!(*reads.borrow(), 1, "a 429 must NOT re-read the token");
     }
 
     #[test]

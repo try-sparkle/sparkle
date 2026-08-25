@@ -179,16 +179,44 @@ const UNANSWERABLE_PREFIXES = [
  *  else (a network failure, a 401, an unparseable body) is a GENUINE error and returns false, which is
  *  what keeps the real error state meaningful. */
 export function isUsageUnknownError(err: unknown): boolean {
-  const msg =
-    typeof err === "string"
-      ? err
-      : err instanceof Error
-        ? err.message
-        : typeof (err as { message?: unknown } | null)?.message === "string"
-          ? ((err as { message: string }).message)
-          : "";
+  const msg = usageErrorMessage(err);
   const trimmed = msg.trimStart();
   return UNANSWERABLE_PREFIXES.some((p) => trimmed.startsWith(p));
+}
+
+/** The token the Rust side stamps on a 429 (`RATE_LIMITED_MSG` in `src-tauri/src/account_usage.rs`).
+ *
+ *  A cross-language contract, like {@link USAGE_UNKNOWN_PREFIX}: a 429 from the OAuth usage endpoint
+ *  is Anthropic REFUSING the read because the account is at (or over) a session/weekly cap. It is the
+ *  cleanest "this account is near its limit" signal there is — and it is emphatically NOT a
+ *  connectivity fault, so the copy it routes must never be "check your connection". A SUBSTRING (not a
+ *  prefix): the Rust message wraps it in a sentence, and this stays matchable either way. */
+export const USAGE_RATE_LIMITED_MARKER = "rate-limited";
+
+/** True when `err` is the Rust command's 429/rate-limited rejection.
+ *
+ *  DISTINCT from {@link isUsageUnknownError} ("we could not answer") and from a proven-dead 401: a
+ *  rate-limit means we asked, reached Anthropic, and were told the account is at a limit right now.
+ *  That drives two honest behaviours it must be separable for — an accurate on-screen message
+ *  (AccountsScreen) and routing new spawns AWAY from the account (`refreshLiveUsage`) — instead of the
+ *  misleading "check your connection or sign in again" a generic-error fold produced.
+ *
+ *  Tolerates the same three shapes a rejected Tauri `invoke` hands back as {@link isUsageUnknownError}. */
+export function isUsageRateLimitError(err: unknown): boolean {
+  return usageErrorMessage(err).toLowerCase().includes(USAGE_RATE_LIMITED_MARKER);
+}
+
+/** Extract a comparable message from the three shapes a rejected Tauri `invoke` can hand back — the
+ *  bare string a Rust `Err(String)` becomes, an `Error` wrapping it, or an object carrying a string
+ *  `message`. Shared so every usage-error classifier reads the payload identically. */
+function usageErrorMessage(err: unknown): string {
+  return typeof err === "string"
+    ? err
+    : err instanceof Error
+      ? err.message
+      : typeof (err as { message?: unknown } | null)?.message === "string"
+        ? (err as { message: string }).message
+        : "";
 }
 
 /** Fetch REAL live usage for `configDir` on the QUIET path — the one every automatic caller uses.

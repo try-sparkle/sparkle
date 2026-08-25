@@ -775,6 +775,14 @@ export interface LiveUsage {
   id: string;
   fiveHourPercent: number | null;
   sevenDayPercent: number | null;
+  /** TRUE when the usage fetch for this dir was RATE-LIMITED (HTTP 429) rather than returning
+   *  figures — Anthropic itself refusing the read because the account is at (or over) a session/weekly
+   *  cap. It is a direct exhaustion signal that needs no percentage and no threshold: {@link
+   *  isAccountLiveSpent} treats it as spent so rotation routes AWAY from a capped account, instead of
+   *  the old behaviour where a 429 dropped the row entirely and left the account looking available.
+   *  Optional and defaulted-falsy so every existing construction (a successful fetch) is unchanged —
+   *  a row only ever carries `true`, never `false`. */
+  rateLimited?: boolean;
 }
 
 /** Utilization (percent of Anthropic's OWN limit) at or above which an account stops receiving new
@@ -797,10 +805,19 @@ export const LIVE_AVOID_PERCENT = 90;
  *
  *  The MAX, not the 7-day figure alone: an account at 0% weekly but 100% of its 5-hour session is
  *  just as unable to take a spawn right now. The founder's measured card showed exactly this split
- *  (session 0%, weekly 100%), so reading either window on its own would have missed one of them. */
+ *  (session 0%, weekly 100%), so reading either window on its own would have missed one of them.
+ *
+ *  A RATE-LIMITED row (HTTP 429 — see {@link LiveUsage.rateLimited}) reads as at-avoid-threshold: it
+ *  carries no percentages (Anthropic refused the read) but IS a direct "this account is at a cap"
+ *  signal, so it must never read as null ("unknown", which every consumer scores as healthy). Pinning
+ *  it to exactly {@link LIVE_AVOID_PERCENT} — not a fabricated 100 — makes it the ONE source every
+ *  `>= LIVE_AVOID_PERCENT` consumer already honours (the spawn gate {@link isAccountLiveSpent}, the
+ *  rotation oracle `switchRecommendation`, `exhaustionOutlook`), so the exclusion cannot drift between
+ *  them; a real reported window above the line still wins via the `Math.max`. */
 export function liveWorstPercent(l: LiveUsage | undefined): number | null {
   if (!l) return null;
   const vals = [l.fiveHourPercent, l.sevenDayPercent].filter((v): v is number => v != null);
+  if (l.rateLimited) return Math.max(LIVE_AVOID_PERCENT, ...vals);
   return vals.length === 0 ? null : Math.max(...vals);
 }
 
@@ -1570,6 +1587,9 @@ export function isAccountLiveSpent(
   siblingIds?: ReadonlyMap<string, readonly string[]>,
 ): boolean {
   const liveById = new Map((live ?? []).map((l) => [l.id, l]));
+  // A RATE-LIMITED row (HTTP 429) reads as `LIVE_AVOID_PERCENT` through `liveWorstPercent` — the ONE
+  // source this and the rotation oracle share — so a capped account (previously dropped as no-row and
+  // left looking available) is now excluded here without a second, driftable predicate.
   const p = loginLiveWorstPercent(accountId, liveById, siblingIds);
   return p != null && p >= LIVE_AVOID_PERCENT;
 }

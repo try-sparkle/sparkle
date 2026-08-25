@@ -1505,10 +1505,20 @@ describe("proactive rotation off a spent/expired concierge account", () => {
   let exhausted: Record<string, number | null>;
   /** `dead` = config dirs whose `claude auth status` returns a live CLI "no"; `live` = per-config-dir
    *  utilization percentages the live-usage probe reports. Everything else is healthy. */
-  function mockFleet(opts: { dead?: string[]; live?: Record<string, number>; signedIn?: string[] } = {}) {
+  function mockFleet(
+    opts: {
+      dead?: string[];
+      live?: Record<string, number>;
+      signedIn?: string[];
+      /** Config dirs whose `account_usage_live` is RATE-LIMITED (429) — the Rust command rejects with
+       *  its `rate-limited` marker, exactly as a capped account produces in production. */
+      rateLimited?: string[];
+    } = {},
+  ) {
     exhausted = {};
     const dead = new Set(opts.dead ?? []);
     const live = opts.live ?? {};
+    const rateLimited = new Set(opts.rateLimited ?? []);
     const signedIn = opts.signedIn ?? ["def", "work"];
     invoke.mockImplementation((cmd: string, args?: { id?: string; untilEpoch?: number; configDir?: string }) => {
       if (cmd === "accounts_list") return Promise.resolve(TWO);
@@ -1535,6 +1545,10 @@ describe("proactive rotation off a spent/expired concierge account", () => {
       }
       if (cmd === "account_usage_live") {
         const cfg = args?.configDir ?? "";
+        if (rateLimited.has(cfg))
+          return Promise.reject(
+            new Error("usage fetch failed: rate-limited (usage temporarily unavailable)"),
+          );
         const pct = live[cfg];
         if (pct == null) return Promise.reject(new Error("no live figure in tests"));
         return Promise.resolve({
@@ -1592,6 +1606,28 @@ describe("proactive rotation off a spent/expired concierge account", () => {
     // first resolve parks on `def` because the live-usage cache is empty at that instant.
     mockFleet({ live: { "/home/.claude": 95, "/data/accounts/work": 5 } });
     const t = 31_000_000;
+    expect(await accountConfigDirFor(CONCIERGE_ACCOUNT_KEY, { now: t })).toBe("/home/.claude");
+
+    const result = await rotateStickyConsumerOffSpentAccount(CONCIERGE_ACCOUNT_KEY, { now: t + 1 });
+
+    expect(result.rotated).toBe(true);
+    expect(result.from).toBe("def");
+    expect(result.to).toBe("work");
+    expect(await accountConfigDirFor(CONCIERGE_ACCOUNT_KEY, { now: t + 2 })).toBe(
+      "/data/accounts/work",
+    );
+  });
+
+  it("rotates the concierge off a RATE-LIMITED account before dispatch", async () => {
+    // `def`'s usage read is 429'd by Anthropic — the account is at a session/weekly cap. This is the
+    // founder's incident: before the fix a 429 dropped the live row entirely, so `def` looked
+    // available (lowest local tally, no exhaustedUntil wall) and kept winning the pick. Now the 429 is
+    // classified and the row is marked `rateLimited`, which `isAccountLiveSpent` excludes. `work`
+    // reads a healthy 5%. NON-VACUOUS end-to-end: revert either the `refreshLiveUsage` rate-limit
+    // emit or the `isAccountLiveSpent` clause and `def` gets no row → is not excluded → the concierge
+    // stays parked on it and `rotated` is false, reddening this test.
+    mockFleet({ rateLimited: ["/home/.claude"], live: { "/data/accounts/work": 5 } });
+    const t = 32_000_000;
     expect(await accountConfigDirFor(CONCIERGE_ACCOUNT_KEY, { now: t })).toBe("/home/.claude");
 
     const result = await rotateStickyConsumerOffSpentAccount(CONCIERGE_ACCOUNT_KEY, { now: t + 1 });

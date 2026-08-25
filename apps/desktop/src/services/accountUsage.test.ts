@@ -12,13 +12,19 @@ import {
   getAccountUsageLive,
   getAccountUsageLiveForced,
   isUsageUnknownError,
+  isUsageRateLimitError,
   USAGE_UNKNOWN_PREFIX,
+  USAGE_RATE_LIMITED_MARKER,
   KEYCHAIN_DENIED_PREFIX,
   KEYCHAIN_MAIN_THREAD_PREFIX,
   summarizeMeter,
   scopedModelName,
   type AccountUsageLive,
 } from "./accountUsage";
+
+// The exact string the Rust side (`RATE_LIMITED_MSG` in `src-tauri/src/account_usage.rs`) sends on a
+// 429 — pinned here so this suite fails if the two ends of the cross-language contract drift apart.
+const RUST_RATE_LIMITED_MSG = "usage fetch failed: rate-limited (usage temporarily unavailable)";
 
 describe("getAccountUsageLive", () => {
   beforeEach(() => invokeMock.mockReset());
@@ -124,6 +130,13 @@ describe("isUsageUnknownError", () => {
     expect(isUsageUnknownError({ message: `${USAGE_UNKNOWN_PREFIX}token expired` })).toBe(true);
   });
 
+  it("does NOT confuse a RATE-LIMIT with an unanswerable read", () => {
+    // A 429 is "we asked and Anthropic said the account is at a cap" — a genuine, actionable outcome,
+    // NOT one of the "we could not answer" set. So the unknown classifier must reject it (otherwise it
+    // would render the calm "usage unknown" affordance instead of the honest rate-limited message).
+    expect(isUsageUnknownError(new Error(RUST_RATE_LIMITED_MSG))).toBe(false);
+  });
+
   it("does NOT claim a genuine failure is merely unknown", () => {
     // The other half of the pair — without it, `() => true` would pass the test above. Each of these
     // is a real problem the user should hear about, and each must keep the error state.
@@ -170,6 +183,33 @@ describe("isUsageUnknownError", () => {
   });
 });
 
+describe("isUsageRateLimitError", () => {
+  it("recognises the Rust 429 rejection on the three shapes a rejected invoke hands back", () => {
+    // The side effect this guards: a 429 must classify as rate-limited so the UI shows the honest
+    // "Account is rate-limited" note (not "check your connection") and rotation routes AWAY from the
+    // account. Assert on the ACTUAL Rust message, not just the bare marker, so the real wire payload
+    // is what gets classified.
+    expect(isUsageRateLimitError(RUST_RATE_LIMITED_MSG)).toBe(true);
+    expect(isUsageRateLimitError(new Error(RUST_RATE_LIMITED_MSG))).toBe(true);
+    expect(isUsageRateLimitError({ message: RUST_RATE_LIMITED_MSG })).toBe(true);
+    // Case-insensitive, so an upstream reword to "Rate-Limited" still classifies.
+    expect(isUsageRateLimitError("HTTP 429: Rate-Limited by the endpoint")).toBe(true);
+  });
+
+  it("does NOT claim every failure is a rate-limit", () => {
+    // The other half of the pair — without it `() => true` would pass. Each of these is a DIFFERENT
+    // class that must keep its own remedy: an unanswerable read, a dead login, a real network fault,
+    // a parse failure. None may be swallowed as "rate-limited".
+    expect(isUsageRateLimitError(`${USAGE_UNKNOWN_PREFIX}no cached token`)).toBe(false);
+    expect(isUsageRateLimitError(new Error("unauthorized after keychain re-read"))).toBe(false);
+    expect(isUsageRateLimitError(new Error("error sending request: connection refused"))).toBe(false);
+    expect(isUsageRateLimitError(new Error("failed to parse usage response"))).toBe(false);
+    expect(isUsageRateLimitError(undefined)).toBe(false);
+    expect(isUsageRateLimitError(null)).toBe(false);
+    expect(isUsageRateLimitError({ code: 429 })).toBe(false);
+  });
+});
+
 // ── CROSS-LANGUAGE DRIFT GUARD ────────────────────────────────────────────────────────────────
 // These three literals are a contract with `src-tauri/src/account_usage.rs`, and the failure mode
 // if they drift is SILENT: the Rust side keeps rejecting with a prefix this file no longer matches,
@@ -199,6 +239,17 @@ describe("the keychain-outcome prefixes match the Rust constants that produce th
       `${rustName} was reworded in Rust but not here, so this outcome now falls through to the ` +
         `amber "Check your connection or sign in again" for every affected account, silently`,
     ).toBe(tsValue);
+  });
+
+  it("the Rust 429 message CONTAINS the TS rate-limit marker", () => {
+    // The 429 contract is a SUBSTRING match, not an exact prefix: Rust wraps the marker in a sentence
+    // (`RATE_LIMITED_MSG`) while the TS side keys on the `rate-limited` token. If Rust reworded the
+    // token half, a 429 would silently fall back to the generic "temporary problem" error AND stop
+    // excluding the capped account from rotation — the exact founder incident, re-introduced quietly.
+    const decl = /const RATE_LIMITED_MSG: &str = "([^"]*)"/.exec(RUST);
+    const marker = decl?.[1];
+    expect(marker, "RATE_LIMITED_MSG is gone from account_usage.rs").toBeTruthy();
+    expect(marker?.toLowerCase()).toContain(USAGE_RATE_LIMITED_MARKER);
   });
 });
 
