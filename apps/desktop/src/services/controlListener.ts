@@ -161,6 +161,7 @@ import {
   releasePeerSend,
   sendPeerInboxMessage,
 } from "./peerMessaging";
+import { logPeerMessage, peerMessageEntry } from "./peerMessageLog";
 // The preview supervisor's wrappers — the ONE module that invokes the Rust preview commands, so
 // this handler never touches `invoke` directly (services/preview's own header explains why).
 import {
@@ -3772,10 +3773,17 @@ async function handleSendPeerMessage(req: ControlRequest): Promise<Record<string
   const callerIsAppOwned = isSparkleAgentId(req.callerAgentId);
   let callerProjectId: string | null;
   let callerLabel: string;
+  // The caller's BARE display name, split from `callerLabel` for the concierge log's row. The label
+  // is `Name [id]` because that is what the RECIPIENT needs in its inbox — both the name to reply
+  // with and the exact id to address. The row needs the name alone: it draws the id as a clickable
+  // `AgentPill`, so a label carrying the uuid in its text would print it twice, once as a control
+  // and once as noise.
+  let callerName: string;
   if (req.callerAgentId === CONCIERGE_CALLER_AGENT_ID) {
     const { projects, selectedProjectId } = useProjectStore.getState();
     callerProjectId = projects.find((p) => p.id === selectedProjectId)?.id ?? null;
     callerLabel = CONCIERGE_SELF_NAME;
+    callerName = CONCIERGE_SELF_NAME;
   } else if (callerIsAppOwned) {
     // THE APP-OWNED IMPROVE SPARKLE AGENT, special-cased BEFORE findAgent for the SAME reason the
     // concierge is: its id is a documented, stable address that is deliberately not a projectStore
@@ -3786,6 +3794,7 @@ async function handleSendPeerMessage(req: ControlRequest): Promise<Record<string
     const { projects } = useProjectStore.getState();
     callerProjectId = projects.find((p) => p.id === SPARKLE_PROJECT_ID)?.id ?? SPARKLE_PROJECT_ID;
     callerLabel = peerLabel(SPARKLE_AGENT_DISPLAY_NAME, req.callerAgentId);
+    callerName = SPARKLE_AGENT_DISPLAY_NAME;
   } else {
     const caller = findAgent(req.callerAgentId);
     if (!caller) {
@@ -3796,7 +3805,8 @@ async function handleSendPeerMessage(req: ControlRequest): Promise<Record<string
       );
     }
     callerProjectId = caller.projectId;
-    callerLabel = peerLabel(agentDisplayName(caller.agent), req.callerAgentId);
+    callerName = agentDisplayName(caller.agent);
+    callerLabel = peerLabel(callerName, req.callerAgentId);
   }
 
   // WHICH REFUSAL COPY THIS CALLER CAN ACT ON. Improve Sparkle belongs to the app-owned
@@ -3827,6 +3837,15 @@ async function handleSendPeerMessage(req: ControlRequest): Promise<Record<string
         "coordination, not a document handoff — say what you need and point at the file or bead",
     );
   }
+
+  // THE SENDER'S OWN ONE-LINE SUMMARY, for the row the human reads. OPTIONAL, AND NEVER A REFUSAL:
+  // a non-string, an empty string and an absent field all collapse to "no gist", and
+  // `peerMessageEntry` then falls back to the message's opening lines. A parameter that could refuse
+  // a delivery because its SUMMARY was malformed would make the coordination channel less reliable
+  // in exchange for a nicer-looking log, which is the wrong trade in a feature whose entire purpose
+  // is that the human sees the traffic. Its cap is enforced by truncation in `peerMessageEntry`.
+  const rawGist = req.payload.gist;
+  const gist = typeof rawGist === "string" ? rawGist : undefined;
 
   const rawTo = req.payload.to;
   const to = typeof rawTo === "string" ? rawTo.trim() : "";
@@ -3938,6 +3957,44 @@ async function handleSendPeerMessage(req: ControlRequest): Promise<Record<string
     // inbox" is actionable and "send failed" is not.
     return peerRefusal("send_failed", errMsg(e));
   }
+  // SHOW IT TO THE HUMAN. Until this call, a peer message went into the recipient's inbox and
+  // NOWHERE ELSE: the founder could see two agents converge on one file but never the sentence where
+  // one of them said so, and his only view of cross-agent coordination was the concierge repeating
+  // it by hand (services/peerMessageLog's header).
+  //
+  // AFTER THE ENQUEUE, AND DELIBERATELY UNABLE TO AFFECT IT. Everything above this line decides
+  // whether a message is DELIVERED; this decides whether it is DRAWN. It is a plain synchronous
+  // append with no `await` and nothing to reject, placed after the one call that can fail, so there
+  // is no shape of this function in which a display concern turns a successful send into a refusal —
+  // which would invert the whole point of the feature.
+  //
+  // THE `appGlobal` FLAG IS COMPUTED FROM BOTH ENDS. The concierge and Improve Sparkle are not rows
+  // in any project, so a project comparison alone can only ever exclude them — and the concierge's
+  // own traffic is the half the human is most likely to be reading the column for.
+  // WHICH ENDS ARE APP-GLOBAL — the concierge and Improve Sparkle, neither of which is a row in any
+  // project's roster. Computed once and used for BOTH questions: whether the row is drawn at all,
+  // and how each end is labelled. The second is not cosmetic — an app-global id handed to
+  // `AgentPill` is reported as CLOSED, because "not in the roster I was given" is the only evidence
+  // a pill has (roborev 68628). Deriving this twice is how the two answers would drift.
+  const fromAppGlobal = req.callerAgentId === CONCIERGE_CALLER_AGENT_ID || callerIsAppOwned;
+  const toAppGlobal = targetId === CONCIERGE_CALLER_AGENT_ID || isSparkleAgentId(targetId);
+  logPeerMessage(
+    peerMessageEntry({
+      // The inbox's own message id, so a row and the delivery it reports are the same event rather
+      // than two records that can be reconciled only by timestamp.
+      id: `peer-${messageId}`,
+      from: { id: req.callerAgentId, name: callerName, appGlobal: fromAppGlobal },
+      to: { id: targetId, name: targetName, appGlobal: toAppGlobal },
+      message,
+      gist,
+    }),
+    {
+      callerProjectId,
+      selectedProjectId: useProjectStore.getState().selectedProjectId,
+      appGlobal: fromAppGlobal || toAppGlobal,
+    },
+  );
+
   // AN ENQUEUE RECEIPT, NOT A DELIVERY RECEIPT (bead `sparkle-0fm9ke`, reprising `sparkle-ei7keg`).
   // This used to answer a bare `{ ok, messageId, to }`, which carried no field that could ever have
   // been FALSE — "an enqueue receipt wearing a delivery receipt's clothes", in the words of

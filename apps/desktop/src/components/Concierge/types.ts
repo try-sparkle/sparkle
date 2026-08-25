@@ -554,6 +554,12 @@ export interface ConciergeDigestMessage {
  *  drift. Re-exported so consumers of this module's public surface get it from one place. */
 export type { ConciergeRecapMessage } from "../../services/conciergeRecap";
 import type { ConciergeRecapMessage } from "../../services/conciergeRecap";
+
+/** One agent's message to another, drawn inline so the human can SEE cross-agent coordination
+ *  instead of being told about it second-hand. Its shape lives with the producer
+ *  (services/peerMessageLog) for the same reason `ConciergeRecapMessage` above does. */
+export type { ConciergePeerMessage } from "../../services/peerMessageLog";
+import type { ConciergePeerMessage } from "../../services/peerMessageLog";
 // TYPE ONLY — this directory stays store-free; the union is defined beside the function that
 // produces it so both sides of the seam cannot drift.
 import type { RevealOutcome } from "../../services/agentReveal";
@@ -591,6 +597,7 @@ export type ConciergeMessage =
   | ConciergeBatchMessage
   | ConciergeDigestMessage
   | ConciergeRecapMessage
+  | ConciergePeerMessage
   | ConciergeNudge;
 
 export type ConciergeAttachKind = "screenshot" | "image" | "files";

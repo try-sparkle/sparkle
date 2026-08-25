@@ -40,6 +40,7 @@ import { NoticeAttribution, NOTICE_INK_VARS, NOTICE_ROW_TESTID } from "./NoticeA
 import { isConciergeAddressed } from "./noticeRecipient";
 import { NudgeCard } from "./NudgeCard";
 import { RecapCard } from "./RecapCard";
+import { PeerMessageRow } from "./PeerMessageRow";
 import { RoutingReceipt } from "./RoutingReceipt";
 import { SentToAgentRow, sentToAgent, SENT_CARD_INK_VARS } from "./SentToAgentRow";
 import { LintMark } from "./LintMark";
@@ -474,6 +475,11 @@ export const ConciergeMessageRow = memo(function ConciergeMessageRow({
   if (m.kind === "nudge")
     return <NudgeCard nudge={m} onNudgeClick={onNudgeClick} onNudgeAction={onNudgeAction} />;
   if (m.kind === "recap") return <RecapCard recap={m} onRevealAgent={onRevealAgent} />;
+  // ONE AGENT TALKING TO ANOTHER (./PeerMessageRow). Before this branch existed a peer message had
+  // no way into this column at all, so the human's only view of cross-agent coordination was the
+  // concierge repeating it by hand — which meant the traffic he could see was exactly the traffic
+  // that had already cost somebody a turn.
+  if (m.kind === "peer") return <PeerMessageRow message={m} />;
   if (m.kind === "you") {
     // THE `unanswered` STAMP IS WITHDRAWN ONCE A REPLY NAMES THIS MESSAGE, and this is the seam
     // where the two facts meet.

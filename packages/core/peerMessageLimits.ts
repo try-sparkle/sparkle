@@ -15,3 +15,18 @@
 /** Max characters in one peer message. A peer message is coordination ("I am taking the Rust
  *  half"), not a document handoff — say what you need and point at the file, PR or bead. */
 export const PEER_MESSAGE_MAX_CHARS = 2000;
+
+/**
+ * Max characters in a peer message's `gist` — the sender's one-line summary, drawn as the two-line
+ * clamp on the row the human reads (`components/Concierge/PeerMessageRow`).
+ *
+ * HERE FOR THE SAME REASON THE CAP ABOVE IS: enforced in the desktop app, described in the MCP tool
+ * schema, two packages, one number.
+ *
+ * OVER-LENGTH IS TRUNCATED, NOT REFUSED, and that asymmetry with `too_long` is deliberate. The
+ * message is the payload and a caller that exceeds its cap has to be told; the gist is metadata for
+ * a row, and failing a DELIVERY because its summary ran long would let a display concern break the
+ * coordination channel — the exact inversion this feature must not introduce. The number is small
+ * because two clamped lines is all any of it can occupy.
+ */
+export const PEER_GIST_MAX_CHARS = 200;

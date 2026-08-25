@@ -1,6 +1,10 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { useAuthStore } from "../stores/authStore";
 import { useProjectStore } from "../stores/projectStore";
+// The VISIBLE concierge thread. Peer traffic is drawn inline in it (services/peerMessageLog), and
+// the row is the only evidence the human ever sees of one agent talking to another — so it is
+// asserted here, at the real dispatch, rather than only where the row is rendered.
+import { useConciergeThreadStore } from "../stores/conciergeThreadStore";
 import { buildConciergeFeed } from "./conciergeFeed";
 import { useRuntimeStore, RUNTIME_PERSIST_KEY } from "../stores/runtimeStore";
 import { continuationEvidenceFor, sweepGoalContinuations } from "./goalContinuationRunner";
@@ -6921,6 +6925,7 @@ describe("send_peer_message", () => {
     inboxSends.length = 0;
     inboxSendError = null;
     _resetPeerRateLimitsForTests();
+    useConciergeThreadStore.setState({ chat: [] });
     vi.mocked(sparkleActivityLine).mockReturnValue(null);
     useSettingsStore.setState({ conciergeToolPolicy: {}, conciergeToolPolicyHydrated: true });
     useProjectStore.setState({ projects: [], selectedProjectId: null } as never);
@@ -6956,6 +6961,110 @@ describe("send_peer_message", () => {
             },
       ),
     }));
+
+  // ── THE ROW THE HUMAN SEES ──────────────────────────────────────────────────────────────────
+  //
+  // Delivery and VISIBILITY are two different facts, and until this feature only the first existed:
+  // `send_peer_message` put the text in the recipient's inbox and nowhere else, so the founder could
+  // not see cross-agent traffic at all. These assert the second one at the REAL dispatch — the row
+  // component's own tests cannot tell whether anything ever builds a row to hand it.
+  const peerRows = () =>
+    useConciergeThreadStore.getState().chat.filter((m) => m.kind === "peer");
+
+  it("draws the send in the concierge log, naming both ends and the sender's gist", async () => {
+    rename(callerId, "Orchestrator");
+    rename(otherId, "Rust Half");
+    send({ to: otherId, message: "I am claiming src/parser.rs", gist: "taking the parser" });
+    await flush();
+
+    expect(peerRows()).toHaveLength(1);
+    expect(peerRows()[0]).toMatchObject({
+      kind: "peer",
+      from: { id: callerId, name: "Orchestrator" },
+      to: { id: otherId, name: "Rust Half" },
+      gist: "taking the parser",
+      text: "I am claiming src/parser.rs",
+    });
+  });
+
+  it("falls back to the message's opening lines when the sender wrote no gist", async () => {
+    // Proves the gist really travels from the PAYLOAD rather than being invented downstream: with
+    // the payload field dropped, the row above keeps its shape and only this one can tell.
+    send({ to: otherId, message: "line one\nline two\nline three" });
+    await flush();
+    expect(peerRows()[0]).toMatchObject({ gist: "line one\nline two" });
+  });
+
+  it("names the caller WITHOUT the bracketed id the inbox label carries", async () => {
+    // The recipient's inbox needs `Name [id]`; the row draws the id as a clickable pill, so a label
+    // carrying the uuid in its text would print it twice — once as a control and once as noise.
+    rename(callerId, "Orchestrator");
+    send({ to: otherId, message: "hello" });
+    await flush();
+    expect(inboxSends[0]!.from).toContain(callerId);
+    expect((peerRows()[0] as { from: { name: string } }).from.name).toBe("Orchestrator");
+  });
+
+  it("stamps an app-global end so the row does not call the concierge closed", async () => {
+    // The row labels an app-global end as prose rather than an AgentPill, because a pill reads
+    // "not in the roster I was given" as evidence the agent is GONE — and the concierge's id is
+    // deliberately not a roster row. The PRODUCER is what knows which end that is; if this stamp
+    // stops arriving, the row silently goes back to announcing that Sparkle is closed.
+    send({ to: CONCIERGE_CALLER_AGENT_ID, message: "founder asked for the parser split" });
+    await flush();
+
+    const row = peerRows()[0] as { from: { appGlobal?: boolean }; to: { appGlobal?: boolean } };
+    expect(row.to.appGlobal).toBe(true);
+    // The ORDINARY end is not stamped — a spun-down worker SHOULD still read as closed, so the
+    // repair must stay scoped to the ids for which that claim is false.
+    expect(row.from.appGlobal).toBe(false);
+  });
+
+  it("draws NOTHING for a refused send", async () => {
+    // The log's whole value is that the founder can read it as a complete record of what was said.
+    // A row for a message that never left would make it a record of what was ATTEMPTED, which is a
+    // different and much less useful claim — and one he would not know he was reading.
+    send({ to: "no-such-agent", message: "into the void" });
+    await flush();
+    expect(inboxSends).toHaveLength(0);
+    expect(peerRows()).toHaveLength(0);
+  });
+
+  it("draws NOTHING when the enqueue itself fails", async () => {
+    // The recipient's inbox is at its cap: `ok` is false and nothing was delivered, so nothing may
+    // be drawn. This is the case a row appended BEFORE the await would get wrong.
+    inboxSendError = "inbox full";
+    send({ to: otherId, message: "undeliverable" });
+    await flush();
+    expect(lastReply()).toMatchObject({ ok: false });
+    expect(peerRows()).toHaveLength(0);
+  });
+
+  it("draws nothing for a send in a project the human is not looking at", async () => {
+    // Scoped to the SELECTED project — the column belongs to one project, and traffic from another
+    // would read as coordination about the work on screen.
+    const other = useProjectStore.getState().addProject("Elsewhere", "/tmp/elsewhere");
+    const a = useProjectStore.getState().addAgent(other, { kind: "build" })!;
+    const b = useProjectStore.getState().addAgent(other, { kind: "build" })!;
+    useProjectStore.setState({ selectedProjectId: projectId } as never);
+
+    send({ to: b, message: "not your project" }, a);
+    await flush();
+
+    // DELIVERED — the scoping is about what is DRAWN, never about what is sent. A rule that
+    // silently dropped the delivery would break coordination in projects nobody is looking at.
+    expect(inboxSends).toHaveLength(1);
+    expect(peerRows()).toHaveLength(0);
+  });
+
+  it("delivers even when the row cannot be drawn, so the log can never break the channel", async () => {
+    useProjectStore.setState({ selectedProjectId: null } as never);
+    send({ to: otherId, message: "still delivered" });
+    await flush();
+    expect(lastReply()).toMatchObject({ ok: true });
+    expect(inboxSends).toHaveLength(1);
+    expect(peerRows()).toHaveLength(0);
+  });
 
   it("delivers to a sibling, naming the sender and marking it FYI", async () => {
     send({ to: otherId, message: "taking the Rust half" });

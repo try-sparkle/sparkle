@@ -52,7 +52,7 @@ import { COPY_TOAST_MS } from "./useCopyOnSelection";
 const RESTING_OPACITY = 0.45;
 
 /** WHOSE words this button copies. Drives the label, the test id and the alignment — see below. */
-export type CopyButtonKind = "answer" | "message";
+export type CopyButtonKind = "answer" | "message" | "peer";
 
 /**
  * The wording, per kind.
@@ -70,6 +70,11 @@ export type CopyButtonKind = "answer" | "message";
 const LABELS: Record<CopyButtonKind, { idle: string; copied: string; testid: string }> = {
   answer: { idle: "Copy answer", copied: "Answer copied", testid: "concierge-copy-answer" },
   message: { idle: "Copy message", copied: "Message copied", testid: "concierge-copy-message" },
+  // THE THIRD KIND EARNS ITS OWN LABEL BY THE RULE ABOVE, not by symmetry. A peer row's words are
+  // neither the user's nor Sparkle's — they are one agent's message to another — and a reader
+  // tabbing a thread that now carries all three needs to hear which is under the cursor. "Copy
+  // message" would be actively wrong here: it is the label for the user's OWN words.
+  peer: { idle: "Copy peer message", copied: "Peer message copied", testid: "concierge-copy-peer" },
 };
 
 export function CopyAnswerButton({
