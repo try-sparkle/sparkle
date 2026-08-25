@@ -160,6 +160,49 @@ export function useAccountSwitch(pollMs: number = HEADROOM_POLL_MS): AccountSwit
           liveUsageRows(),
           deadIds,
         );
+        // ══ CLEAR AN ORPHANED LIMIT MODAL — the silent-re-resolve case the two resolves below miss ══
+        // The modal is raised (by `useLimitSync`) only when NOTHING could rescue the walled account
+        // at that instant. But a sticky helper (Improve Sparkle, the concierge pane) re-resolves onto
+        // a healthy account via its OWN auto-pick: the work moves off the exhausted account silently,
+        // WITHOUT a switch plan. Once it has moved there is nothing left on the walled account for
+        // `planStrandedHelperRescue` or `planSwitch` to migrate, so BOTH `resolveByAutoSwitch` calls
+        // below stay silent — they fire only when THIS tick starts a plan — and the "log in to another
+        // account" modal stands orphaned. That is the founder's exact report: agents on other accounts
+        // keep running (the modal itself says so) yet the modal never clears.
+        //
+        // So on every believable tick, ask the SAME oracle the raise deferred to, keyed on the account
+        // the MODAL is about rather than on `busiestPaneAccount()`: is that account at an OBSERVED WALL
+        // with a healthy, signed-in, different-identity account to route its work to?
+        // `switchRecommendation(modalAccount)` with `reason === "exhausted"` answers exactly that, and
+        // does NOT require any agent to still be on the walled account — so it sees the escape a silent
+        // re-resolve used. `reason === "exhausted"` is load-bearing, not `!= null`: the SAME distinction
+        // the fleet path draws at "AN OBSERVED WALL MOVES THE FLEET; AN ESTIMATE STILL ASKS". An
+        // `"approaching"` estimate is not an escape anything is taking, so it must NOT dismiss a real
+        // limit modal — and a modal is only ever raised for an account that genuinely walled, so this
+        // is the matching signal. When it holds, the modal is moot and clears; when there is nowhere to
+        // go — a full-pool cascade, a same-identity sibling on one shared quota, or a live-spent target
+        // — the oracle returns null and the modal correctly STANDS, the one case "log in to another
+        // account" is the right ask. Deliberately ABOVE the in-plan early return, so a modal orphaned by
+        // a silent re-resolve is cleared even while an unrelated migration is advancing.
+        if (!state.failed) {
+          const modal = useAccountLimitStore.getState().current;
+          const escape =
+            modal &&
+            switchRecommendation(
+              modal.accountId,
+              state.accounts,
+              state.usage,
+              ceilings,
+              state.identities,
+              Date.now(),
+              liveUsageRows(),
+              deadIds,
+            );
+          if (escape && escape.reason === "exhausted") {
+            useAccountLimitStore.getState().resolveByAutoSwitch(modal!.accountId);
+          }
+        }
+
         // Suppress while a switch is already running — the answer is "we're on it", not a new ask.
         if (planRef.current) return;
 
