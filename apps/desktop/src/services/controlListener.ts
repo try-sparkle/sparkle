@@ -907,8 +907,8 @@ export function resolveScope(raw: unknown): StateScope {
  *  back the context cost the scope was added to remove. This CAP does not change `omitted`; what
  *  `omitted` means per scope is stated once in `OMITTED_CONTRACT` (`@sparkle/core`) and deliberately
  *  not paraphrased here. This comment previously asserted the absolute, which is wrong for the
- *  'project' scope that hard-codes 0 below (and for 'fleet', which now counts the live agents it
- *  does not list — see the fleet branch). */
+ *  'project' scope that hard-codes 0 below. ('fleet' now LISTS the live agents, so what it counts
+ *  here is the dormant rows — see the fleet notes in `handleGetState`.) */
 const OMITTED_IDS_CAP = 20;
 
 /** How much this window actually KNOWS about a row's status — reported per agent alongside `status`.
@@ -1210,73 +1210,44 @@ function handleGetState(req: ControlRequest): {
   const ui = useUiStore.getState();
   const scope = resolveScope(req.payload.scope);
 
-  // ── SCOPE "fleet" — the CROSS-PROJECT ADDRESS BOOK (bead sparkle-179b2s) ──────────────────────
+  // ── SCOPE "fleet" — THE CROSS-PROJECT DIRECTORY (bead sparkle-179b2s, then sparkle-u1p68f) ──────
   //
-  // Every other scope answers "which of MY siblings can I see"; this one answers "which APP-GLOBAL
-  // participants can I address" — the two ids that live outside any project: the concierge and each
-  // live Improve-Sparkle. It is a deliberately separate scope rather than extra rows on "project",
-  // because those rows are NOT project siblings and folding them into the project roster would blur
-  // the boundary the project scope exists to keep (a caller could no longer tell an in-project peer
-  // from an app-global one). It short-circuits here: it needs none of the roll-up/calm machinery the
-  // roster scopes build, only the liveness set and the caller's identity.
+  // It answers "who is out there, and how do I address them" across every project boundary: the
+  // app-global participants that live outside any project (the concierge, and each live Improve
+  // Sparkle), PLUS a row for every agent that is LIVE right now.
   //
-  // These are exactly the ids `send_peer_message` resolves app-globally (`resolveSpecialAddressee`)
-  // and `inboxSend` treats as addressable, so a name read here always resolves at send time. The
-  // canonical Sparkle id is listed unconditionally — the headless pass drains it (see
-  // `build_improve_exec`) — and per-window Sparkle ids only while their pane is live.
-  if (scope === "fleet") {
-    const openIds = new Set(
-      mergeOpenAgentIds(useRuntimeStore.getState().openAgentIds, readPersistedOpenAgentIds()),
-    );
-    const liveSparkleIds = [
-      SPARKLE_AGENT_ID,
-      ...[...openIds].filter((id) => isSparkleAgentId(id) && id !== SPARKLE_AGENT_ID),
-    ];
-    const fleetAgents: unknown[] = [
-      { id: CONCIERGE_CALLER_AGENT_ID, name: CONCIERGE_SELF_NAME, kind: "concierge", appOwned: true },
-      ...liveSparkleIds.map((id) => ({
-        id,
-        name: SPARKLE_AGENT_DISPLAY_NAME,
-        kind: "build" as const,
-        appOwned: true as const,
-      })),
-    ];
-    // WHICH LIVE AGENTS THIS DIRECTORY DOES NOT LIST (bead sparkle-u1p68f). The address book above is
-    // the two app-global ids; every OTHER running agent is project-resident and lives in
-    // `projectStore`, counted by the SAME `localAgentRowIds().live` population that `concurrency.live`
-    // reports below. Deriving the tally from that one source is what stops this reply contradicting
-    // itself: the defect this closes was a body reading `agents: [2], omitted: 0` beside
-    // `concurrency.live: 45` — asserting the fleet is empty at the instant 45 agents are running, which
-    // is worse than a truncation because it does not say "I left some out", it says there are none.
-    //
-    // WHY NOT HARD-CODE 0 LIKE SCOPE "project". That scope withholds its tally because a project
-    // boundary that publishes its own size is not a boundary. "fleet" is app-global — there is no
-    // boundary here to protect, and the orchestrator whose ONLY roster this is cannot coordinate a
-    // fleet a directory tells it is empty. So it publishes the tally, and the ids (capped) so a caller
-    // can resolve a specific live agent it could not otherwise see. The address-book rows are
-    // app-owned and never members of `projectStore`, so the two sets are disjoint and this equals
-    // `concurrency.live`; the filter is belt-and-braces against ever double-counting a shown row.
-    const fleetShown = new Set(fleetAgents.map((a) => (a as { id: string }).id));
-    const omittedLiveIds = localAgentRowIds().live.filter((id) => !fleetShown.has(id));
-    return {
-      agents: fleetAgents,
-      self: selfIdentity(req),
-      scope,
-      totalAgents: fleetAgents.length + omittedLiveIds.length,
-      omitted: omittedLiveIds.length,
-      omittedIds: omittedLiveIds.slice(0, OMITTED_IDS_CAP),
-      theme: ui.themePref,
-      models: getModelCatalog().map((m) => m.id),
-      statusFilter: ui.statusFilter,
-      zoomByColumn: ui.zoomByColumn,
-      // ON THIS SCOPE TOO. "fleet" returns from its own early exit, so a field added only at the
-      // bottom of the function would be present on some scopes and absent on others — and a caller
-      // that read it once and then asked a different scope would see it vanish, which reads as "no
-      // peak recorded" rather than as "you asked the wrong scope". The record is app-global; no
-      // scope narrows it.
-      concurrency: peakSummary(),
-    };
-  }
+  // TWO FIXES DEEP, AND THE SECOND IS WHY THIS IS NO LONGER AN EARLY EXIT. Originally the scope
+  // short-circuited above this whole roster build and returned just the two app-owned rows with a
+  // hard-coded `omitted: 0` — so two consecutive calls returned two rows and "nothing withheld"
+  // while the SAME response body reported `concurrency.live: 45`. The `0` is what made it a defect
+  // rather than a narrow scope: it was not saying "I left some out", it was asserting there were
+  // none. `edc4741a5` closed that half by deriving the tally from `localAgentRowIds().live`, so the
+  // two numbers in one body could no longer disagree.
+  //
+  // WHAT COUNTING THEM DID NOT FIX. `omittedIds` carries ids, capped, and no names. The bead's
+  // blocked work was NAME RESOLUTION: the concierge could not turn a name into an id, so it could
+  // not render an agent pill, could not address `send_peer_message`, and could not unstick an agent
+  // that had hit its auto-continue ceiling — it fell back on ids carried in from conversation
+  // context and guessed. And an orchestrator sizing its next spawn still had no roster to sweep,
+  // which is the input every capacity decision needs: with each orchestrator blind to the shared
+  // denominator, load reached 20.3x per core with swap 99% consumed (bead `sparkle-iyxxin`).
+  //
+  // SO IT LISTS THEM. The live rows are exactly `localAgentRowIds().live` — the population
+  // `concurrency.live` counts — so the roster and that headcount remain the same statement by
+  // construction. They are ORDINARY ROSTER ROWS (`status`, `liveness`, `rollupDot`, `goal`, `stall`
+  // — the shapes every other scope returns), which is why the scope has to see the roster and can no
+  // longer return before it is built. `omitted`/`omittedIds` now count and name what is genuinely
+  // left over: the DORMANT rows, in project tabs Workspace would not mount right now.
+  //
+  // WHAT IT STILL CANNOT SEE, stated so a caller does not over-read it: the agents THIS APP knows
+  // about. A model process started outside Sparkle is invisible to it, and no field here claims
+  // otherwise — `concurrency.peakProcesses` is the machine-wide sampler, and it reports a PEAK, not
+  // a present reading.
+  //
+  // The app-global ids are exactly the ones `send_peer_message` resolves app-globally
+  // (`resolveSpecialAddressee`) and `inboxSend` treats as addressable, so a name read here always
+  // resolves at send time. The canonical Sparkle id is listed unconditionally — the headless pass
+  // drains it (see `build_improve_exec`) — and per-window Sparkle ids only while their pane is live.
 
   // Liveness for scope "active" must NOT come from `status` alone. That map is window-local and
   // never persisted (runtimeStore: "live-only"), while control:request is broadcast to EVERY window
@@ -1529,6 +1500,43 @@ function handleGetState(req: ControlRequest): {
     appOwned: true as const,
   };
   const all = [...rosterAgents, sparkleRow];
+  // THE LIVE POPULATION, FROM THE SAME WALK `concurrency.live` COUNTS (services/agentCapacity). One
+  // reading, used for both the rows and the tally, so scope "fleet" and the `concurrency` block
+  // below can never be derived from two reads of the store taken at two different moments.
+  const liveAgentIds = new Set(localAgentRowIds().live);
+  // The app-global rows scope "fleet" adds on top of the roster: the concierge (whose reserved id is
+  // a row in no project) and any per-window Improve Sparkle beyond the one `sparkleRow` covers.
+  // Built only for that scope — every other scope's contract is unchanged.
+  //
+  // THEY CARRY `liveness` AND NO `status`, and that pairing is deliberate. These are address-book
+  // entries: this window holds no PTY for them, so it has no status to report — and reporting one
+  // anyway would be a defaulted "stopped" masquerading as a reading, the exact trap the `liveness`
+  // field exists to close on the roster rows. So the reading it DOES have is published ("unknown"
+  // means this window has no entry for that id, NOT that the agent is dead) and the reading it does
+  // not have is left off rather than invented.
+  const fleetAppOwnedRows =
+    scope === "fleet"
+      ? [
+          {
+            id: CONCIERGE_CALLER_AGENT_ID,
+            name: CONCIERGE_SELF_NAME,
+            kind: "concierge" as const,
+            liveness: livenessOf(CONCIERGE_CALLER_AGENT_ID, status, openIds),
+            appOwned: true as const,
+          },
+          ...[SPARKLE_AGENT_ID, ...openIds]
+            .filter(
+              (id, i, xs) => isSparkleAgentId(id) && id !== sparkleRow.id && xs.indexOf(id) === i,
+            )
+            .map((id) => ({
+              id,
+              name: SPARKLE_AGENT_DISPLAY_NAME,
+              kind: "build" as const,
+              liveness: livenessOf(id, status, openIds),
+              appOwned: true as const,
+            })),
+        ]
+      : [];
   const callerProjectId = projectOf.get(req.callerAgentId);
   const agents = all.filter((a) => {
     if (scope === "all") return true;
@@ -1544,6 +1552,11 @@ function handleGetState(req: ControlRequest): {
     if (scope === "project") {
       return callerProjectId !== undefined && projectOf.get(a.id) === callerProjectId;
     }
+    // "fleet" = every LIVE agent, plus the app-owned Improve Sparkle row (the other app-global rows
+    // are prepended below — they are not members of `all`). Liveness is `localAgentRowIds`'s, not a
+    // predicate of this filter's own, because this scope's contract is that its live-row count IS
+    // `concurrency.live`. A row that is not live is not dropped silently: it lands in `omittedIds`.
+    if (scope === "fleet") return a.id === sparkleRow.id || liveAgentIds.has(a.id);
     // "active" = has a live status, OR is open in ANY window, OR is one of the caller's own
     // children. That last clause is not a nicety: "stopped" is also what an agent with NO runtime
     // entry reads as, which is exactly a just-spawned worker (no pane mounted yet) or a permanently
@@ -1564,16 +1577,21 @@ function handleGetState(req: ControlRequest): {
     );
   });
   const omittedAll = all.filter((a) => !agents.includes(a)).map((a) => a.id);
-  // `omittedIds` exists so a caller can resolve a SPECIFIC dropped agent instead of re-reading the
-  // whole roster — which only makes sense for "active". Under "self" the caller asked for a single
-  // agent, so every other agent is dropped: on the motivating 57-agent roster that would ship
-  // 56 ids (~600 permanently-resident tokens) back to the scope that is supposed to be nearly free.
-  // Capped as well, so the field can never grow with the dormant-tab backlog. That CAP is not what
-  // decides the reported value — `OMITTED_CONTRACT` (`@sparkle/core`) is the one statement of what
-  // this field means per scope, and `scopedOmitted` below hard-codes 0 for "project" (the "fleet"
-  // branch above no longer does — it counts the live agents it does not list, bead sparkle-u1p68f).
+  // The app-global rows go FIRST and are not drawn from `all`, so they do not disturb `omittedAll`
+  // above (nothing in `all` is dropped on their account) and they are counted by `scopedTotal`
+  // below, which sizes the array actually returned.
+  const scopedAgents = scope === "fleet" ? [...fleetAppOwnedRows, ...agents] : agents;
+  // "fleet" JOINS "active" HERE (bead sparkle-u1p68f). Both narrow a roster the caller did not ask
+  // to have narrowed, so both owe it the ids they dropped — that is what lets a caller resolve one
+  // dormant agent without paying for a scope:"all" re-read. Under "self" the caller asked for
+  // exactly one agent, so every other agent is dropped: on the motivating 57-agent roster that would
+  // ship 56 ids (~600 permanently-resident tokens) back to the scope that is supposed to be nearly
+  // free. Capped as well, so the field can never grow with the dormant-tab backlog. That CAP is not
+  // what decides the reported COUNT — `OMITTED_CONTRACT` (`@sparkle/core`) is the one statement of
+  // what this field means per scope, and `scopedOmitted` below hard-codes 0 for "project" alone.
   // Deliberately not restated here. roborev #53441.
-  const omittedIds = scope === "active" ? omittedAll.slice(0, OMITTED_IDS_CAP) : [];
+  const omittedIds =
+    scope === "active" || scope === "fleet" ? omittedAll.slice(0, OMITTED_IDS_CAP) : [];
   // SCOPE "project" MUST NOT COUNT WHAT IT REFUSED TO SHOW. `totalAgents`/`omitted` are honest
   // book-keeping for every other scope — they exist so a truncated roster does not read as "that's
   // everyone". Here they would be a side channel: the rows are withheld precisely because they belong
@@ -1581,7 +1599,13 @@ function handleGetState(req: ControlRequest): {
   // that the scope's whole purpose is to withhold. Same reasoning as `not_in_project` being
   // indistinguishable from "no such agent" — a boundary that leaks its own size is not a boundary.
   // For this scope the caller's project IS the world, so the totals describe that world.
-  const scopedTotal = scope === "project" ? agents.length : all.length;
+  //
+  // "fleet" also sizes itself by what it RETURNED — but for the opposite reason, and the difference
+  // matters. "project" does it to withhold the fleet-wide headcount. "fleet" does it because its
+  // world is not `all`: it prepends app-global rows that are members of no project, so `all.length`
+  // would both miss them and count dormant rows it did not return. What it withheld is published in
+  // full beside this, in `omitted`/`omittedIds`.
+  const scopedTotal = scope === "project" || scope === "fleet" ? scopedAgents.length : all.length;
   const scopedOmitted = scope === "project" ? 0 : omittedAll.length;
   // Additive Phase-3 fields so an agent can read before writing: the model ids it may pass to
   // set_agent_model and the current zoom. Existing fields (agents, theme) are unchanged.
@@ -1592,7 +1616,7 @@ function handleGetState(req: ControlRequest): {
   // silently truncated roster reads as "that's everyone" when it isn't. Reporting what was dropped
   // is what lets a caller resolve a specific agent without re-asking with scope:"all".
   return {
-    agents,
+    agents: scopedAgents,
     // WHO IS ASKING — sent on EVERY scope, not only "self". The roster answers "who else is there";
     // nothing answered "who am I", and for the concierge nothing could: its reserved id matches no
     // row, so `scope: "self"` returned an empty roster and a caller reading it learned nothing

@@ -508,25 +508,28 @@ describe("controlListener", () => {
     });
   });
 
-  // ── THE FLEET DIRECTORY ACCOUNTS FOR THE LIVE AGENTS IT DOES NOT LIST (bead sparkle-u1p68f) ──────
+  // ── THE FLEET DIRECTORY ACCOUNTS FOR EVERY LIVE AGENT (bead sparkle-u1p68f) ─────────────────────
   //
-  // The "fleet" scope is the app-GLOBAL address book: the two ids that live outside any project (the
-  // concierge and Improve Sparkle). It used to hard-code `omitted: 0` / `omittedIds: []`, so a reply
-  // could read `agents: [2], omitted: 0` at the very instant `concurrency.live` reported 45
+  // The scope used to hard-code `omitted: 0` / `omittedIds: []` beside a two-row address book, so a
+  // reply could read `agents: [2], omitted: 0` at the very instant `concurrency.live` reported 45
   // project-resident agents running — asserting the fleet is EMPTY while it is busy, which is the one
-  // roster an orchestrator has. Now it reports the live agents it does not list, reconciled against
-  // the SAME population `concurrency.live` counts, so the two numbers in one body cannot silently
-  // disagree.
+  // roster an orchestrator has.
   //
-  // NON-VACUOUS: the seeding below (open + a selected project) is what makes `concurrency.live`
-  // non-zero, and against the OLD hard-coded `omitted: 0` every assertion tying omitted/omittedIds/
-  // totalAgents to the live set fails. Drop the seeding and `live` is 0, so the bug and the fix read
-  // alike — which is exactly the interleaving this test exists to forbid.
+  // FIXED IN TWO STEPS, AND THESE TESTS NOW PIN THE SECOND. `edc4741a5` made the directory COUNT the
+  // live agents it did not list. That stopped the reply contradicting itself but left the bead's
+  // actual blocked work open: `omittedIds` carries ids, capped, with no names, so a caller still
+  // could not resolve a name to an id. The scope now LISTS them, so the assertions below moved from
+  // "they are counted" to "they are returned" — the strictly stronger claim, which still implies the
+  // reconciliation the first fix established.
+  //
+  // NON-VACUOUS: the seeding (open ids + a selected project) is what makes `concurrency.live`
+  // non-zero. Drop it and `live` is 0, so the bug and the fix read alike — exactly the interleaving
+  // these tests exist to forbid.
   describe("get_state — the fleet directory accounts for live agents", () => {
-    it("reports the live agents it does not list instead of asserting there are none", async () => {
+    it("RETURNS the live agents rather than only counting them, reconciled with concurrency.live", async () => {
       // callerId (build) + otherId (worker) are in the SELECTED project (addProject selects it), so
-      // marking them open makes them `live` in localAgentCapacity — the population `concurrency.live`
-      // counts. Neither is in the app-global address book, so both are legitimately omitted here.
+      // marking them open makes them `live` in localAgentRowIds — the population `concurrency.live`
+      // counts.
       useRuntimeStore.setState({ openAgentIds: [callerId, otherId] } as never);
 
       fire({ reqId: "flt1", op: "get_state", callerAgentId: CONCIERGE_CALLER_AGENT_ID, payload: { scope: "fleet" } });
@@ -541,31 +544,52 @@ describe("controlListener", () => {
       };
 
       expect(res.scope).toBe("fleet");
-      // The address book itself is unchanged: the two app-owned rows.
+      // The address book is still there — widening must not cost the two ids this scope was built to
+      // publish, which no other scope can list.
       const shownIds = res.agents.map((a) => a.id as string);
       expect(shownIds).toContain(CONCIERGE_CALLER_AGENT_ID);
       expect(shownIds).toContain(SPARKLE_AGENT_ID);
 
-      // THE FIX: the live project agents are not silently dropped — they are counted, and named.
+      // THE FIX, in its strongest form: the live project agents are RETURNED, by id, so a caller can
+      // read their names off this reply instead of guessing.
       expect(res.concurrency.live).toBe(2);
-      expect(res.omitted).toBe(2);
-      // ...and it is the SAME population, not a coincidentally-equal number. The two figures in one
-      // body must reconcile — the founder's acceptance: "the two numbers cannot silently disagree".
-      expect(res.omitted).toBe(res.concurrency.live);
-      expect([...res.omittedIds].sort()).toEqual([callerId, otherId].sort());
-      // The whole world this directory describes: what it listed plus what it omitted.
-      expect(res.totalAgents).toBe(res.agents.length + res.omitted);
+      expect(shownIds).toContain(callerId);
+      expect(shownIds).toContain(otherId);
+
+      // ...and it is the SAME population, not a coincidentally-equal number. The non-app-owned rows
+      // ARE what `concurrency.live` counts — the founder's acceptance: "the two numbers cannot
+      // silently disagree".
+      const projectRows = res.agents.filter((a) => a.appOwned !== true);
+      expect(projectRows).toHaveLength(res.concurrency.live);
+
+      // Nothing is withheld in this fixture (both rows are live), so 0 here is the TRUE statement it
+      // never used to be. `totalAgents` sizes what came back.
+      expect(res.omitted).toBe(0);
+      expect(res.omittedIds).toEqual([]);
+      expect(res.totalAgents).toBe(res.agents.length);
     });
 
-    it("cannot report omitted: 0 while agents are live — the exact 'asserting there are none' lie", async () => {
-      // The narrowest statement of the bug, kept separate so a regression names it directly: any
-      // non-zero live count forbids omitted: 0. This is the assertion the OLD hard-coded 0 fails.
+    it("never asserts an empty fleet while agents are live — every live id is listed or named", async () => {
+      // The narrowest statement of the bug, kept separate so a regression names it directly, and
+      // written as the invariant that survives BOTH designs: a live agent must be reachable from the
+      // reply — either as a row, or as an id in `omittedIds`. The old hard-coded `omitted: 0` beside
+      // a two-row address book fails it; counting-without-listing satisfies it; listing satisfies it
+      // more strongly. Phrased this way it cannot be quietly satisfied by a scope that stops
+      // returning rows again.
       useRuntimeStore.setState({ openAgentIds: [callerId] } as never);
       fire({ reqId: "flt2", op: "get_state", callerAgentId: CONCIERGE_CALLER_AGENT_ID, payload: { scope: "fleet" } });
       await flush();
-      const res = lastReply() as { omitted: number; concurrency: { live: number } };
+      const res = lastReply() as {
+        agents: Array<{ id: string }>;
+        omitted: number;
+        omittedIds: string[];
+        concurrency: { live: number };
+      };
       expect(res.concurrency.live).toBeGreaterThan(0);
-      expect(res.omitted).toBeGreaterThan(0);
+      const reachable = new Set([...res.agents.map((a) => a.id), ...res.omittedIds]);
+      expect(reachable.has(callerId)).toBe(true);
+      // And the reply is never the bare address book while something is running.
+      expect(res.agents.length).toBeGreaterThan(2);
     });
   });
 
@@ -7896,5 +7920,120 @@ describe("get_state scope: fleet — the cross-project address book (bead sparkl
     await flush();
     expect(ids(lastReply())).not.toContain(SPARKLE_AGENT_ID);
     expect(ids(lastReply())).not.toContain(CONCIERGE_CALLER_AGENT_ID);
+  });
+
+  // ── THE 45-LIVE / 2-LISTED DEFECT (bead sparkle-u1p68f) ────────────────────────────────────────
+  //
+  // Two consecutive fleet calls returned exactly the two app-owned rows with `omitted: 0` while the
+  // SAME response body reported `concurrency.live: 45`. `omitted: 0` is what makes that a defect
+  // rather than a narrow scope: the directory was not saying "I left some out", it was asserting
+  // there were none, so an orchestrator sizing a spawn against it reasoned from a denominator 20x
+  // too small while the machine went to swap.
+  //
+  // ONE FIXTURE, EVERY CANDIDATE MOUNTED AT ONCE (bead sparkle-foqoe): live locals, a dormant local,
+  // and both app-owned ids are all present in the same store, so an absence assertion below is about
+  // a row that really exists and could have been returned.
+  describe("reconciles with concurrency.live instead of asserting omitted: 0", () => {
+    let liveIds: string[];
+    let dormantId: string;
+
+    beforeEach(() => {
+      const store = useProjectStore.getState();
+      // The caller is live too — it is definitionally running, it is making the call.
+      const second = store.addAgent(projectId, { kind: "build" })!;
+      const worker = store.addAgent(projectId, { kind: "worker", parentId: callerId })!;
+      dormantId = store.addAgent(projectId, { kind: "build" })!;
+      liveIds = [callerId, second, worker];
+      // `live` in agentCapacity is (in openAgentIds) AND (project mounted). `addProject` selected
+      // this project, so the second half holds; this sets the first for three of the four rows.
+      useRuntimeStore.setState({ openAgentIds: liveIds } as never);
+    });
+
+    const reply = () =>
+      lastReply() as {
+        agents: Array<{ id: string; appOwned?: boolean }>;
+        totalAgents: number;
+        omitted: number;
+        omittedIds: string[];
+        concurrency: { live: number; used: number };
+      };
+
+    it("lists a row per live agent, so the roster count matches concurrency.live", async () => {
+      fire({ reqId: "u1", op: "get_state", callerAgentId: callerId, payload: { scope: "fleet" } });
+      await flush();
+      const r = reply();
+
+      // THE SIDE EFFECT, not the precondition: the fixture's live agents are actually in the reply.
+      expect(r.concurrency.live).toBe(3);
+      for (const id of liveIds) expect(ids(r)).toContain(id);
+      // The app-owned address book is still there — widening must not cost the two ids this scope
+      // was built to publish.
+      expect(ids(r)).toEqual(expect.arrayContaining([SPARKLE_AGENT_ID, CONCIERGE_CALLER_AGENT_ID]));
+
+      // THE INVARIANT THE BEAD ASKS FOR: the two numbers in one body cannot silently disagree. The
+      // non-app-owned rows ARE the population `concurrency.live` counts, by construction.
+      const projectRows = r.agents.filter((a) => a.appOwned !== true);
+      expect(projectRows).toHaveLength(r.concurrency.live);
+      expect(r.totalAgents).toBe(r.agents.length);
+    });
+
+    it("declares the dormant rows it withheld rather than reporting omitted: 0", async () => {
+      fire({ reqId: "u2", op: "get_state", callerAgentId: callerId, payload: { scope: "fleet" } });
+      await flush();
+      const r = reply();
+
+      // A row that exists and was NOT returned must be counted and named — this is the half that
+      // `omitted: 0` was actively lying about.
+      expect(ids(r)).not.toContain(dormantId);
+      expect(r.omitted).toBe(r.concurrency.used - r.concurrency.live);
+      expect(r.omitted).toBeGreaterThan(0);
+      expect(r.omittedIds).toContain(dormantId);
+    });
+
+    // ── PAIRED CONTROLS: widening `fleet` must not widen anything else ────────────────────────────
+    it("leaves scope self returning ONLY the caller", async () => {
+      fire({ reqId: "u3", op: "get_state", callerAgentId: callerId, payload: { scope: "self" } });
+      await flush();
+      const r = reply();
+      expect(ids(r)).toEqual([callerId]);
+      // Every other candidate is mounted in this fixture, so these absences are real.
+      expect(ids(r)).not.toContain(dormantId);
+      expect(ids(r)).not.toContain(SPARKLE_AGENT_ID);
+      expect(ids(r)).not.toContain(CONCIERGE_CALLER_AGENT_ID);
+    });
+
+    it("renders an unobserved app-owned row's liveness as unknown, never as an absent field", async () => {
+      // The contract this scope must not break: `status` defaults to "stopped" for an agent this
+      // window simply cannot see, so `liveness` is the field that says whether any reading happened
+      // at all. An address-book row holds no PTY here, so it publishes the reading it HAS
+      // ("unknown" = no entry in this window) and omits the one it does not, rather than shipping a
+      // defaulted "stopped" that a caller would read as "it died".
+      fire({ reqId: "u5", op: "get_state", callerAgentId: callerId, payload: { scope: "fleet" } });
+      await flush();
+      const rows = (
+        lastReply() as {
+          agents: Array<{ id: string; liveness?: string; status?: string }>;
+        }
+      ).agents;
+
+      const concierge = rows.find((a) => a.id === CONCIERGE_CALLER_AGENT_ID)!;
+      expect(concierge.liveness).toBe("unknown");
+      expect(concierge).not.toHaveProperty("status");
+
+      // The paired half — a LIVE row in the same reply carries a real status, so the absence above
+      // is a property of the address-book row and not of the scope having dropped the field.
+      const liveRow = rows.find((a) => a.id === callerId)!;
+      expect(liveRow.liveness).toBeDefined();
+      expect(liveRow.status).toBeDefined();
+    });
+
+    it("leaves scope active filtering as documented — open or live rows in, dormant rows out", async () => {
+      fire({ reqId: "u4", op: "get_state", callerAgentId: callerId, payload: { scope: "active" } });
+      await flush();
+      const r = reply();
+      for (const id of liveIds) expect(ids(r)).toContain(id);
+      expect(ids(r)).not.toContain(dormantId);
+      expect(r.omittedIds).toContain(dormantId);
+    });
   });
 });

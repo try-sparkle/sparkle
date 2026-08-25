@@ -75,8 +75,19 @@ export function stateScopesNamedIn(text: string): string[] {
  *  `'fleet'` used to hard-code `0` for the same-looking reason, and that was the bug in
  *  `sparkle-u1p68f`: fleet is the app-GLOBAL address book, not a project boundary, so there is no
  *  size to protect — and reporting `omitted: 0` beside `concurrency.live: 45` told the orchestrator
- *  whose only roster this is that the fleet was empty while it was running. Fleet now reports the
- *  count of live agents it does not list (and their ids, capped), so 0 there means what it says.
+ *  whose only roster this is that the fleet was empty while it was running.
+ *
+ *  THE FIRST FIX COUNTED THEM; THIS ONE LISTS THEM, and the contract moved with it. Reporting "45
+ *  live agents I am not naming" stopped the reply contradicting itself, but it did not restore what
+ *  the bead was actually blocked on: `omittedIds` carries ids, capped, with no names, so the
+ *  concierge still could not resolve a name to an id — it could not render an agent pill, address
+ *  `send_peer_message`, or unstick an agent that had hit its auto-continue ceiling. So `'fleet'` now
+ *  RETURNS a row per live agent (the same `localAgentRowIds().live` population `concurrency.live`
+ *  counts) beside the app-global rows. `omitted` therefore counts what is genuinely left over — the
+ *  DORMANT rows — and unlike the previous wording it CAN legitimately be 0, when every row this app
+ *  knows of is live. That is why the sentence below no longer says "never 0 while agents are
+ *  running": under the new behaviour that would be false, and a stale absolute in this contract is
+ *  the exact failure this constant exists to prevent.
  *
  *  The fail-closed case is the one that costs something: an unresolvable caller under `'project'`
  *  gets `agents: []`, `totalAgents: 0`, `omitted: 0` — a REFUSAL, which the absolute wording invites
@@ -86,11 +97,12 @@ export function stateScopesNamedIn(text: string): string[] {
  *  interpolate it, and let the guard assert that no OTHER sentence claims exactness without the
  *  qualifier. */
 export const OMITTED_CONTRACT =
-  "omitted is the exact count of rows filtered out for 'self'/'active'/'all', and for 'fleet' it is " +
-  "the count of live agents the app-global address book does not list, which is never 0 while agents " +
-  "are running; 'project' alone always reports omitted: 0 BY DESIGN, so 0 there never means nothing " +
-  "was hidden, and an unresolvable caller under 'project' gets an empty roster with omitted: 0 as a " +
-  "fail-closed REFUSAL rather than an affirmative 'there are no agents'";
+  "omitted is the exact count of rows filtered out for 'self'/'active'/'all'/'fleet' — under 'fleet' " +
+  "that is the DORMANT rows, because it lists every live agent, so 0 there means every agent this " +
+  "app knows of is live rather than that nothing was checked; 'project' alone always reports " +
+  "omitted: 0 BY DESIGN, so 0 there never means nothing was hidden, and an unresolvable caller " +
+  "under 'project' gets an empty roster with omitted: 0 as a fail-closed REFUSAL rather than an " +
+  "affirmative 'there are no agents'";
 
 /** Phrasings that assert something about how COMPLETE `omitted` is.
  *
