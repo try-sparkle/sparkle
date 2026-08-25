@@ -96,7 +96,7 @@ describe("BeadCard — only the description scrolls", () => {
 
   // bead sparkle-qogah: never hide a row that needs action. The priority control and the way out of
   // the card must be OUTSIDE the scrolling region, which is a containment fact, not a style fact.
-  it("keeps the priority control, the id and View-on-board outside the scroll region", () => {
+  it("keeps the priority control, the id and Board view outside the scroll region", () => {
     mount({
       descMaxHeight: 180,
       onSetPriority: vi.fn(async () => {}),
@@ -104,7 +104,7 @@ describe("BeadCard — only the description scrolls", () => {
     });
     const desc = screen.getByTestId(`${t}-description`);
     expect(desc.contains(screen.getByTestId(`${t}-priority`))).toBe(false);
-    expect(desc.contains(screen.getByTestId(`${t}-view-on-board`))).toBe(false);
+    expect(desc.contains(screen.getByTestId(`${t}-open-on-board`))).toBe(false);
     expect(desc.contains(screen.getByTestId(`${t}-id`))).toBe(false);
     expect(desc.contains(screen.getByTestId(`${t}-stage`))).toBe(false);
   });
@@ -155,7 +155,9 @@ describe("BeadCard — every field, on both surfaces", () => {
 describe("BeadCard — a surface with no project renders read-only", () => {
   it("renders no control at all when no callback is supplied", () => {
     mount();
-    expect(screen.queryByTestId(`${t}-view-on-board`)).toBeNull();
+    expect(screen.queryByTestId(`${t}-destinations`)).toBeNull();
+    expect(screen.queryByTestId(`${t}-open-on-board`)).toBeNull();
+    expect(screen.queryByTestId(`${t}-open-in-column`)).toBeNull();
     expect(screen.queryByTestId(`${t}-close`)).toBeNull();
     expect(screen.queryByTestId(`${t}-priority-trigger`)).toBeNull();
     expect(screen.queryByTestId(`${t}-build-it`)).toBeNull();
@@ -173,9 +175,16 @@ describe("BeadCard — a surface with no project renders read-only", () => {
     expect(screen.getByTestId(`${t}-priority-readonly`).textContent).toBe("P2");
   });
 
-  it("renders View on board as a BUTTON, not a link", () => {
+  // A REAL `<button>`, PAINTED AS A LINK. The founder asked for a link — *"'Board view' where
+  // 'Board' is hyperlink"* — and the honest element is still a button: it moves the app rather than
+  // following an href, so an `<a>` here would lie to a screen reader about what pressing it does.
+  // The link READING comes from the style, which the row below pins.
+  it("renders Board view as a BUTTON, never an anchor", () => {
     mount({ onViewOnBoard: vi.fn() });
-    expect(screen.getByTestId(`${t}-view-on-board`).tagName).toBe("BUTTON");
+    const board = screen.getByTestId(`${t}-open-on-board`);
+    expect(board.tagName).toBe("BUTTON");
+    expect(board.getAttribute("type")).toBe("button");
+    expect(screen.getByTestId(t).querySelectorAll("a")).toHaveLength(0);
   });
 });
 
@@ -503,18 +512,23 @@ describe("BeadCard — the Chat button", () => {
   //
   // The corner span is the row, and DOM order inside it IS the visual order along it. jsdom has no
   // layout, so an x-coordinate assertion would be theatre (every rect here is zeroes).
-  it("sits in the corner cluster, after the id and before View on board", () => {
+  it("sits in the corner cluster, after the id and before Close", () => {
     mount({ onChat: vi.fn(), onViewOnBoard: vi.fn(), onClose: vi.fn() });
     const corner = screen.getByTestId(`${t}-corner`);
     const kids = Array.from(corner.children);
     const at = (id: string) => kids.indexOf(screen.getByTestId(`${t}-${id}`));
 
     expect(at("chat")).toBeGreaterThan(at("id"));
-    expect(at("chat")).toBeLessThan(at("view-on-board"));
-    expect(at("view-on-board")).toBeLessThan(at("close"));
+    expect(at("chat")).toBeLessThan(at("close"));
     // Every one of them is really IN this cluster — `indexOf` returns -1 for a node that is not a
     // child, and -1 satisfies two of the three comparisons above on its own.
-    for (const id of ["id", "chat", "view-on-board", "close"]) expect(at(id)).toBeGreaterThan(-1);
+    for (const id of ["id", "chat", "close"]) expect(at(id)).toBeGreaterThan(-1);
+    // …AND THE BOARD LINK IS NOT. It used to be the chat button's right-hand neighbour here; the
+    // founder moved it to the other end of the chrome row, beside the epic pill. Asserting only the
+    // three survivors above would stay green with a board link still sitting in this cluster, so
+    // its ABSENCE from the corner is the half of the move this row has to state (the presence half
+    // is `BeadCardChrome.test.tsx`, which pins it beside the pill).
+    expect(corner.contains(screen.getByTestId(`${t}-open-on-board`))).toBe(false);
   });
 
   // "THE SAME BLUE AS BUILD IT" — asserted against the Build It button rendered in the SAME tree,
@@ -544,9 +558,11 @@ describe("BeadCard — the Chat button", () => {
   // …but at the TITLE ROW's scale, so it reads as a corner control rather than a second
   // call-to-action shouting over the title it sits beside.
   it("wears the title row's compact metrics, not Build It's", () => {
-    mount({ onChat: vi.fn(), onViewOnBoard: vi.fn(), onBuildIt: vi.fn(async () => {}) });
+    mount({ onChat: vi.fn(), onClose: vi.fn(), onBuildIt: vi.fn(async () => {}) });
     const chat = screen.getByTestId(`${t}-chat`);
-    const neighbour = screen.getByTestId(`${t}-view-on-board`);
+    // The CLOSE button, since the board link left this cluster — the corner's other bordered
+    // control, and the one the compact metrics have to agree with now.
+    const neighbour = screen.getByTestId(`${t}-close`);
     expect(chat.style.padding).toBe(neighbour.style.padding);
     expect(chat.style.fontSize).toBe(neighbour.style.fontSize);
     expect(chat.style.flex).toBe("0 0 auto");
@@ -1067,7 +1083,7 @@ describe("BeadCard — the card body is the toggle", () => {
 
   // ══ EVERY NESTED CONTROL IS STILL A CONTROL ═════════════════════════════════════════════════
   // The concrete damage of a root `button` is not visible in a snapshot: assistive tech simply
-  // stops announcing Build It, the priority pill, Chat, View on board, Close, the parent chip, the
+  // stops announcing Build It, the priority pill, Chat, Board view, Close, the parent chip, the
   // goal editor and the comment box, because they are all INSIDE it. So the assertion is about
   // ANCESTRY — no control on this card may sit inside anything claiming button semantics.
   it("leaves every control on the card reachable — nothing sits inside a button", () => {
@@ -1089,7 +1105,7 @@ describe("BeadCard — the card body is the toggle", () => {
       "build-it",
       "priority-trigger",
       "chat",
-      "view-on-board",
+      "open-on-board",
       "close",
       "parent",
       "goal",
@@ -1252,7 +1268,7 @@ describe("BeadCard — no control on the card ever toggles it", () => {
       "build-it": vi.fn(async () => {}),
       "build-all-prd": vi.fn(async () => {}),
       close: vi.fn(),
-      "view-on-board": vi.fn(),
+      "open-on-board": vi.fn(),
       chat: vi.fn(),
       parent: vi.fn(),
     };
@@ -1263,7 +1279,7 @@ describe("BeadCard — no control on the card ever toggles it", () => {
       onBuildAllPrd: fired["build-all-prd"],
       prdEpicCount: 4,
       onClose: fired["close"],
-      onViewOnBoard: fired["view-on-board"],
+      onViewOnBoard: fired["open-on-board"],
       onChat: fired["chat"],
       onOpenBead: fired["parent"],
       lineage: { parent: PARENT, tasks: [], buildAgents: [] },

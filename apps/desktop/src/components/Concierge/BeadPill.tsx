@@ -63,6 +63,11 @@ import { beadsComment, beadsDetail, type BeadComment } from "../../services/bead
 import { beadLineageOf } from "../../engine/beadLineage";
 import { openProjectTab, selectProjectOnItsSide } from "../../services/openProjectTab";
 import { markProjectOpen } from "../../services/projectTabs";
+// THE BOARD HANDOFF, SHARED. Extracted from this file (it was `viewOnBoard`, right here) the day
+// the Epics column needed the identical sequence — the note the function carried asked for
+// exactly that, having already been copy-derived WRONGLY once (roborev 55149 / 55192). A third
+// hand-written copy is how `selectProject` and `selectProjectOnItsSide` diverged before.
+import { openBeadOnBoard } from "../../services/openBeadOnBoard";
 import { EPIC_LADDER, type EpicLadderKey } from "../../services/epicBoard";
 import { beadStage, workersForBead } from "../../services/planView";
 import { dispatchBeadChat } from "../../services/beadChat";
@@ -470,7 +475,7 @@ export function BeadPillHost({ children }: { children: ReactNode }) {
       beads: beadsEnabled
         ? indexBeads(byProject, foreignProjects(others), projectId, rootPath)
         : EMPTY_BEADS,
-      onViewOnBoard: viewOnBoard,
+      onViewOnBoard: openBeadOnBoard,
       onOpenAgent: openAgent,
       onViewInColumn: viewInColumn,
     }),
@@ -566,75 +571,6 @@ function placementIndex(board: Board | undefined): ReadonlyMap<string, EpicLadde
  *  exactly one definition of "which projects are foreign". */
 function foreignProjects(others: string): readonly ForeignProject[] {
   return JSON.parse(others) as ForeignProject[];
-}
-
-/**
- * Open the Plan board on the bead's own side, focused on the card.
- *
- * ══ THE ORDER IS LOAD-BEARING ═══════════════════════════════════════════════════════════════════
- * `openPlanBoard` FIRST, `setBoardFocusBeadId` SECOND. The focus id is a ONE-SHOT that `BoardView`
- * consumes and clears once the bead is present; set against a board the Sparkle pane is still
- * covering, the handoff is spent on a surface that never renders and the overlay simply never opens
- * (roborev 55887, the same trap the sidebar's epic pill documents).
- *
- * `openPlanBoard`, never a bare `setWorkMode(side, "plan")` — the latter only moves the chevron and
- * leaves the board invisible, which is the identical failure by a different route.
- *
- * ══ WHICH SIDE, AND WHY IT IS DERIVED RATHER THAN PICKED ════════════════════════════════════════
- * This is the real design question in the handoff, and it is worth naming: `boardFocusBeadId` is
- * GLOBAL while its sibling `boardAgentFilterBySide` is keyed by side, and the concierge column has
- * no natural `PairSide` at all — it sits BETWEEN the two pairs and belongs to neither.
- *
- * So the side is not chosen; it is READ from where the bead's project already lives.
- * `sideOf(pairAssignment, projectId)` is total and defaults to `"right"` (the historical single-pair
- * home), so every install answers, including one that has never assigned anything. That beats a
- * hard-coded side on the case that actually matters — a two-pair cockpit, where a fixed choice
- * would open the board in the wrong half of the screen for exactly the projects the second pair
- * exists to hold.
- *
- * The bead's project is also SELECTED first. The board is per-side and shows that side's current
- * project, so focusing a bead in a project the side is not displaying would open a board that never
- * contains it — the handoff would sit unconsumed and the click would look like it did nothing.
- */
-function viewOnBoard(target: { beadId: string; projectId: string }): boolean {
-  const projects = useProjectStore.getState();
-  // Nothing to open a board FOR. Reported rather than assumed: the caller turns `false` into a
-  // sentence, which is the whole point of the boolean.
-  if (!projects.projects.some((p) => p.id === target.projectId)) return false;
-  // ══ OPEN THE TAB BEFORE SELECTING IT — `markProjectOpen` IS NOT OPTIONAL ══════════════════
-  // `selectProjectOnItsSide` writes only `selectedProjectId` / `leftProjectId`. Neither marks the
-  // project OPEN, and `Workspace` resolves a side through `resolveSideProject`, which filters to
-  // OPEN projects first and then discards a selection that is not on that side's open list — it
-  // falls back to `onSide[0]`. So for a project whose tab the reader has CLOSED, the selection is
-  // thrown away, the focus writes land on a side displaying a DIFFERENT project, and the column
-  // empties out while the board opens focused on a bead it does not contain. The existence guard
-  // above asks "does this project exist", not "is it open", so the function still returns `true`
-  // and the card shows no notice.
-  //
-  // `buildAgentSpawn.ts` states the rule outright: markProjectOpen BEFORE selectProject, never
-  // bare — the two are paired at every other seam. `openAgent` below is already immune because it
-  // goes through `openProjectTab`, which does both.
-  markProjectOpen(target.projectId);
-  // ══ `selectProjectOnItsSide`, NEVER `selectProject` ═══════════════════════════════════════
-  // `projectStore.selectProject` writes the RIGHT pair's `selectedProjectId` and nothing else, so
-  // pairing it with a side DERIVED from `pairAssignment` makes the two writes disagree for any
-  // LEFT-assigned project: the left project's id lands in the right pair's slot, `Workspace`'s
-  // reconcile effect discards it, and the right half of the cockpit silently re-navigates to its
-  // own first project — while the left side narrows to an epic the project it shows does not
-  // contain. `selectProjectOnItsSide` is the helper extracted for exactly this (roborev 55149 /
-  // 55158 / 55192), and this branch already fixed the identical defect in
-  // `EpicInlineCard.openBeadCardOnBoard` (roborev 68041).
-  //
-  // IT CAME BACK THROUGH A MERGE, WHICH IS THE PART WORTH REMEMBERING: main's copy of the narrow
-  // form arrived here without the widened rule, and git resolved it silently because the two sides
-  // never touched the same line. Every fixture in `BeadPill.openEpic.test.tsx` runs with the
-  // default `pairAssignment`, which resolves to "right" — so `selectProject` is accidentally
-  // correct in all of them and the suite stayed green.
-  selectProjectOnItsSide(target.projectId);
-  const ui = useUiStore.getState();
-  ui.openPlanBoard(sideOf(ui.pairAssignment, target.projectId));
-  ui.setBoardFocusBeadId(target.beadId);
-  return true;
 }
 
 /**

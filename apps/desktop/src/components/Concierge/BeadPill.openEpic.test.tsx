@@ -67,8 +67,8 @@ const DECLARED = bead({ id: "sparkle-decl", type: "epic" });
  *  `bead.type === "epic"` says no. A local gate would silently drop this card's links. */
 const STRUCTURAL = bead({ id: "sparkle-struct", type: "feature" });
 const STRUCTURAL_CHILD = bead({ id: "", parent: "sparkle-struct" });
-/** A plain task — no children, not declared. Must get NO Open group, and must KEEP the standalone
- *  "View on board" button it had before any of this. */
+/** A plain task — no children, not declared. It gets the destinations too: the column can narrow to
+ *  a task, so withholding them hid a view it could already render. */
 const TASK = bead({ id: "sparkle-task" });
 
 const ALL = [DECLARED, STRUCTURAL, STRUCTURAL_CHILD, TASK];
@@ -129,6 +129,11 @@ function openCard(id: string, value: BeadPillContextValue = ctx(ALL)) {
 
 const inColumn = () => screen.queryByTestId("concierge-bead-card-open-in-column");
 const onBoard = () => screen.queryByTestId("concierge-bead-card-open-on-board");
+/** THE RETIRED CORNER BUTTON. It no longer exists anywhere — the founder moved both destinations up
+ *  beside the epic pill on 2026-08-24 (bead sparkle-42onk2) and the bordered `View on board` in the
+ *  corner cluster was deleted, not hidden. The probe is KEPT rather than removed so the rows below
+ *  stay a live guard against it coming back: a card carrying both it and the pill-side link would
+ *  offer one destination twice, which is what the pair-vs-standalone stand-down rule existed for. */
 const standaloneBoard = () => screen.queryByTestId("concierge-bead-card-view-on-board");
 
 // ── 1. WHO GETS THE PAIR ────────────────────────────────────────────────────────────────────────
@@ -160,9 +165,10 @@ describe("Open links — only an epic, and epic means MEMBERSHIP not type", () =
     expect(onBoard()).not.toBeNull();
   });
 
-  // The standalone button stands down for ANY card that has both destinations, or "on board"
-  // appears twice on one card doing one thing.
-  it("no card renders the standalone button AND the group — no duplicate board control", () => {
+  // ONE BOARD CONTROL PER CARD, whatever the bead's shape. This used to be a stand-down rule (the
+  // corner button hid itself when the group appeared); it is now a deletion, and this row is what
+  // would catch the corner button being restored beside the new link.
+  it("no card renders the retired corner button AND the pill-side link", () => {
     openCard(DECLARED.id);
     expect(standaloneBoard()).toBeNull();
     expect(onBoard()).not.toBeNull();
@@ -172,12 +178,19 @@ describe("Open links — only an epic, and epic means MEMBERSHIP not type", () =
     expect(onBoard()).not.toBeNull();
   });
 
-  // …and the standalone button is still what a surface with NO column destination gets, which is
-  // every caller but the concierge. Deleting that fallback would strand the board overlay.
-  it("a surface with no column destination still gets the standalone board button", () => {
+  // …and a surface with NO column destination gets the board link ALONE, in the same place — which
+  // is the case the EPICS COLUMN is (it passes only `onViewOnBoard`). Before the move this fell
+  // back to the corner button; there is one drawing now, so the fallback is the SAME control with
+  // one fewer sibling rather than a different control somewhere else on the card.
+  it("a surface with no column destination gets the board link alone, still beside the pill", () => {
     openCard(TASK.id, ctx(ALL, { onViewInColumn: undefined }));
     expect(inColumn()).toBeNull();
-    expect(standaloneBoard()).not.toBeNull();
+    expect(standaloneBoard()).toBeNull();
+    expect(onBoard()).not.toBeNull();
+    // Still in the chrome row, not relocated to the corner — the whole point of the move.
+    const chrome = screen.getByTestId("concierge-bead-card-chrome");
+    expect(chrome.contains(onBoard())).toBe(true);
+    expect(screen.getByTestId("concierge-bead-card-corner").contains(onBoard())).toBe(false);
   });
 
   // ONE LINK WHEN ONLY ONE DESTINATION IS MEANINGFUL. A surface with no board still offers the

@@ -202,7 +202,7 @@ describe("items 15+16 — the id and the Chat button, top right, id on the LEFT"
 
     // …and every BUTTON holds its size, so the squeeze never costs the reader a control. The close
     // button is the way out of the card; losing it to an overflowing id is the worst outcome here.
-    for (const control of ["chat", "view-on-board", "close"]) {
+    for (const control of ["chat", "close"]) {
       expect(screen.getByTestId(`${ct}-${control}`).style.flex).toBe("0 0 auto");
     }
   });

@@ -42,7 +42,7 @@
 // announced semantics of every control inside the card and displaces the chrome's `role="status"`.
 // The disclosure semantics live on the TITLE BUTTON instead — see the root element and the title.
 import { useEffect, useState, type CSSProperties, type ReactNode } from "react";
-import { FiExternalLink, FiMessageSquare, FiUsers, FiX } from "react-icons/fi";
+import { FiMessageSquare, FiUsers, FiX } from "react-icons/fi";
 import { C, FONT_WEIGHT, ON_BRAND_FILL } from "../../theme/colors";
 import { FONT_MONO, FONT_UI, RADIUS, TYPE } from "../../theme/scale";
 import { severityOf, type Bead } from "../../services/beads";
@@ -181,10 +181,18 @@ export interface BeadCardProps {
    *  which is right for a card that already sits in its own scrolling panel. */
   descMaxHeight?: number;
   /**
+   * OPEN THIS CARD'S BEAD ON THE PLANNING BOARD. Draws the `Board` link — and the plain `view`
+   * beside it — in the chrome row, immediately right of the epic pill.
+   *
    * EVERY OPTIONAL CALLBACK IS ALSO THE SWITCH FOR ITS AFFORDANCE. An absent one renders no
    * control at all, which preserves the property the concierge already had: a surface with no
    * board behind it (a support modal, an agent reply, a test fixture) shows a READ-ONLY card
    * rather than buttons that cannot work.
+   *
+   * IT NO LONGER HAS A SECOND DRAWING. This used to render a bordered `View on board` button in
+   * the top-right corner cluster, which stood down whenever `onOpenInColumn` was also supplied so
+   * that the card never showed two board links at once. The founder moved both destinations up
+   * beside the pill (2026-08-24), so there is one drawing and the stand-down rule is gone with it.
    */
   onViewOnBoard?: () => void;
   /**
@@ -193,9 +201,14 @@ export interface BeadCardProps {
    * ══ THE FOUNDER ASKED FOR THE PAIR, NOT FOR THIS ONE ALONE ══════════════════════════════════
    * *"maybe instead of build it, because it's already building… it could say something like Open.
    * And then there's two options, and maybe they're just two clickable links. One is in column, and
-   * the other is on board."* So this prop's real job is to turn the card's single board link into
-   * the two-destination **Open** group below: supplied, the card offers *in column* and *on board*
-   * together; absent, it keeps the standalone board button it has always had.
+   * the other is on board."* So this prop's real job is to add the SECOND destination beside the
+   * first: supplied, the chrome row reads `Column | Board view`; absent, it reads `Board view`
+   * alone. It is a pair or a single, never two separate controls in two places on one card.
+   *
+   * WHERE THEY LIVE IS THE FOUNDER'S LATER CALL. This pair used to be an `Open · in column · on
+   * board` group sitting above Build It, halfway down the card. On 2026-08-24 he moved it to the
+   * chrome row and renamed both halves — *"`[EPIC] Column | Board view` where 'Column' and 'Board'
+   * are hyperlinks"*. The group is deleted, not hidden; see the chrome row for the full quote.
    *
    * ══ WHY IT IS A SECOND CALLBACK AND NOT A FLAG ══════════════════════════════════════════════
    * Callback-is-the-switch, exactly like `onChat`, `onComment` and `goal` above. TWO different
@@ -443,8 +456,8 @@ interface MetaItem {
   shrink?: boolean;
 }
 
-/** THE **Open** GROUP'S LINK SHAPE, written once so the two destinations cannot drift apart — a
- *  pair of navigation links that differ by a shade or a weight stops reading as one choice.
+/** THE DESTINATION LINK SHAPE, written once so `Column` and `Board` cannot drift apart — a pair of
+ *  navigation links that differ by a shade or a weight stops reading as one choice.
  *
  *  A `<button>` painted as a link, which is the honest combination here: it moves the app rather
  *  than following an href (so it is not an `<a>`), but it offers a CHOICE BETWEEN destinations
@@ -889,6 +902,132 @@ export function BeadCard({
             "epic" has had three competing meanings in this codebase and `services/beads.ts` is the
             one place allowed to say which is meant. */}
         <TypePill type={bead.type} testId={`${t}-type-pill`} />
+        {/* ── WHERE THIS CARD CAN BE OPENED — RIGHT OF THE PILL, WHICH IS THE FOUNDER'S PLACEMENT ──
+            2026-08-24, reading the epics column: *"For epics on the epic column, I want a [link] to
+            the right of the yellow epic pill that says 'board view' and opens the epic on the
+            planning board"*, and then, asked where the concierge's existing pair should live:
+            *"for concierge card view do `[EPIC] Column | Board view` where 'Column' and 'Board' are
+            hyperlinks. then in the epic column just have 'Board view' where 'Board' is hyperlink."*
+
+            ══ THIS IS A MOVE, NOT A SECOND CONTROL ═══════════════════════════════════════════════
+            Two board affordances used to live further down this card: a standalone `View on board`
+            BUTTON in the corner cluster, and an `Open · in column · on board` group above Build.
+            Both are GONE — deleted, not hidden — because the founder chose this row for them. A
+            card that drew either of them as well would offer the same destination twice, inches
+            apart, which is the exact duplication the group was itself introduced to prevent.
+
+            ══ THE LINK IS THE NOUN; THE WORD AFTER IT IS NOT ═════════════════════════════════════
+            *"'Board view' where 'Board' is hyperlink"* — asked to choose between whole-phrase links
+            and noun-only links, he picked noun-only explicitly. So `Board` is the control and
+            `view` is plain muted text beside it, `aria-hidden` so a screen reader is not read the
+            word twice (the button's `aria-label` already carries the full phrase). `Column` takes
+            no trailing word, exactly as he wrote it.
+
+            ══ `aria-label`, NOT `title` ══════════════════════════════════════════════════════════
+            `disableNativeTooltips()` strips every `title` app-wide on the first `mouseover` and
+            only rescues one into `aria-label` for a control that has NO other accessible name.
+            These have visible text, so a `title` here is dropped outright — no tooltip, and nothing
+            moved to the AX tree. The name is composed as `<label> — <description>` instead, which
+            is what the retired group already did and for the same reason: a one-word link named
+            `Column` or `Board` says neither which column nor what will change about it.
+
+            ══ CALLBACK-IS-THE-SWITCH, LIKE EVERY OTHER AFFORDANCE ON THIS CARD ═══════════════════
+            Nothing here reads `chrome` and nothing reads `bead.type`. A surface supplies the
+            destinations that are real for it and gets exactly those: the concierge passes both and
+            sees `Column | Board view`; the epics column passes only the board and sees `Board view`;
+            a read-only fixture passes neither and sees no links at all. That is what keeps this
+            file out of the business of deciding what an epic is (`epic-membership-guard.sh`).
+
+            ══ IT MUST BE ABLE TO GIVE GROUND ═════════════════════════════════════════════════════
+            `flex: "0 1 auto"` + `minWidth: 0`, for the reason the corner cluster below documents at
+            length: the epics column is ~280px and the concierge column is user-resizable, so a run
+            that cannot shrink pushes itself through the card's padding box. `nowrap` keeps the pair
+            on the pill's line rather than wrapping `view` onto its own. */}
+        {(onOpenInColumn !== undefined || onViewOnBoard !== undefined) && (
+          <span
+            data-testid={`${t}-destinations`}
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 4,
+              flex: "0 1 auto",
+              minWidth: 0,
+              whiteSpace: "nowrap",
+              overflow: "hidden",
+            }}
+          >
+            {onOpenInColumn !== undefined && (
+              <button
+                type="button"
+                data-testid={`${t}-open-in-column`}
+                // STOPS THE BUBBLE, like every other control on this card. The card body is the
+                // expand/collapse target, so without this the press navigates AND folds the card
+                // in one gesture — measured in `BeadPill.openEpic.test.tsx`'s idempotence row,
+                // where the second press found no link because the first had collapsed the card
+                // out from under it.
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onOpenInColumn();
+                }}
+                // "this card" rather than "this epic": the link is offered for a TASK too, where it
+                // narrows one rung further — to just the agents on that task. Naming the rung would
+                // mean this component deciding what a bead IS, the one question it must never
+                // answer for itself.
+                aria-label="Column — narrow the Build column to the agents working this card"
+                style={openLinkStyle}
+              >
+                Column
+              </button>
+            )}
+            {/* THE SEPARATOR IS NOT A LINK and must never be read as one. `aria-hidden` keeps it out
+                of the accessibility tree entirely, so the two controls read as two controls. */}
+            {onOpenInColumn !== undefined && onViewOnBoard !== undefined && (
+              <span aria-hidden style={{ color: C.hairline, fontSize: TYPE.small, lineHeight: 1.4 }}>
+                |
+              </span>
+            )}
+            {/* ══ ONE FLEX ITEM, SO THE SPACE BETWEEN THE TWO WORDS IS A REAL SPACE ═══════════
+                The group's own `gap` separates `Column`, the bar and this PHRASE — but it must not
+                also separate `Board` from `view`, because those two are one thing the reader is
+                meant to read as one thing. A flex gap is not text: it renders a visual space and
+                leaves `textContent` reading "Boardview", so the card's plain-text rendering (and
+                any test or copy-paste that reads it) loses the word break the founder asked for.
+                A plain inline wrapper puts the two words back in normal inline flow, where the
+                literal space below is the space on screen — one mechanism, not two that can drift
+                to different widths. The wrapper is blockified as a flex item, which is why the
+                nested `display` is `inline` rather than `inline-flex`: inside an inline-flex,
+                whitespace between items is discarded and the fix would be undone. */}
+            {onViewOnBoard !== undefined && (
+              <span data-testid={`${t}-open-on-board-phrase`} style={{ display: "inline", minWidth: 0 }}>
+                <button
+                  type="button"
+                  data-testid={`${t}-open-on-board`}
+                  // Same reason as its sibling above — see that note.
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onViewOnBoard();
+                  }}
+                  aria-label="Board view — open the Plan board focused on this card"
+                  style={openLinkStyle}
+                >
+                  Board
+                </button>
+                {/* `view` — VISIBLE TEXT, NOT PART OF THE LINK. The founder's wording, chosen
+                    explicitly over a whole-phrase link. Muted rather than `accentInk` so the eye
+                    reads exactly one clickable word, and `aria-hidden` so the phrase is announced
+                    ONCE — the button's `aria-label` already carries it in full, and without this a
+                    screen reader says "Board view … view". */}
+                <span
+                  aria-hidden
+                  data-testid={`${t}-open-on-board-suffix`}
+                  style={{ color: C.muted, fontSize: TYPE.small, lineHeight: 1.4 }}
+                >
+                  {" view"}
+                </span>
+              </span>
+            )}
+          </span>
+        )}
         {/* THE SPACER IS THE WHOLE LAYOUT. It takes the slack, so the cluster is pinned right and
             the pill left with no positioning and no `justify-content` fighting a wrapped pill.
             `aria-hidden` because it says nothing. */}
@@ -996,50 +1135,6 @@ export function BeadCard({
             >
               <FiMessageSquare size={12} aria-hidden />
               Chat
-            </button>
-          )}
-          {onViewOnBoard !== undefined && onOpenInColumn === undefined && (
-            // A BUTTON, not a fake link. It was an underlined `accentInk` run — which reads as
-            // navigation to somewhere else on the page and is the founder's item 3. It performs an
-            // action inside the app, so it is drawn as the control it is.
-            //
-            // ══ AND IT STANDS DOWN WHEN THE **Open** GROUP IS DRAWING BOTH DESTINATIONS ═══════
-            // `onOpenInColumn` is the signal that this card has TWO places to go (an epic in the
-            // concierge). The founder asked for those two as a pair — *"there's two options… one
-            // is in column, and the other is on board"* — so when both exist they belong in the
-            // one group below, and rendering the board here as well would put "on board" on the
-            // card twice, three inches apart, doing the same thing. This is the whole reason the
-            // group takes over rather than sitting alongside.
-            //
-            // The condition is on the NEW prop, never on `chrome`: this file's header forbids the
-            // surface deciding what is shown, and a board overlay that never passes
-            // `onOpenInColumn` keeps this button unchanged — which is every caller but one.
-            <button
-              type="button"
-              data-testid={`${t}-view-on-board`}
-              onClick={(e) => {
-                e.stopPropagation();
-                onViewOnBoard();
-              }}
-              title="Open the Plan board focused on this card"
-              style={{
-                flex: "0 0 auto",
-                display: "inline-flex",
-                alignItems: "center",
-                gap: 4,
-                background: "transparent",
-                border: `1px solid ${C.hairline}`,
-                borderRadius: RADIUS.input,
-                color: C.accentInk,
-                cursor: "pointer",
-                padding: "2px 8px",
-                fontFamily: FONT_UI,
-                fontSize: TYPE.small,
-                lineHeight: 1.4,
-              }}
-            >
-              <FiExternalLink size={12} aria-hidden />
-              View on board
             </button>
           )}
           {onClose !== undefined && (
@@ -1253,104 +1348,6 @@ export function BeadCard({
             {workers.join(", ")}
           </span>
         </Field>
-      )}
-
-      {/* ── OPEN ─────────────────────────────────────────────────────────────────────────────────
-          THE TWO PLACES AN EPIC CAN BE OPENED, as one group.
-
-          ══ WHY IT SITS HERE, DIRECTLY ABOVE BUILD ═════════════════════════════════════════════
-          The founder read this off the card himself: *"instead of Build It, because it's already
-          building… it could say something like Open."* `useBeadBuildActions` returns
-          `buildIt: startable ? … : null`, and that null is documented as "a RENDER instruction as
-          much as a capability one" — so a card for an epic that is ALREADY RUNNING has an empty
-          slot exactly here, where its primary action used to be. This group fills that slot with
-          the thing he actually wants at that moment: not a way to start the work again, but a way
-          to go and watch it.
-
-          ══ IT IS NOT GATED ON `startable`, AND THAT IS DELIBERATE ═════════════════════════════
-          *"for an epic, no matter what state it's in, it could say something like open."* An epic
-          that has not started, one mid-flight and one finished are all worth opening — the column
-          and the board are views, not actions, and nothing about them can fail on a closed bead.
-          So this appears whenever the caller says both destinations are real, and it can sit
-          BESIDE Build It on an epic that has not started yet. That is the founder's reading; the
-          two controls answer different questions ("start it" vs "show me it") and never compete.
-
-          ══ LINKS, NOT BUTTONS — THE ONE PLACE THIS CARD DRAWS THEM ════════════════════════════
-          `onViewOnBoard` above is deliberately a BUTTON because it performs an action, and the
-          note there is right. These are the exception the founder named twice — *"maybe they're
-          just two clickable links"* — and the distinction survives scrutiny: that button is one
-          control doing one thing, while this is a choice BETWEEN destinations, which is what a
-          run of links reads as. They are still real `<button>`s underneath, because they move the
-          app rather than following an href, and a fake `<a>` here would lie to a screen reader
-          about what pressing it does. */}
-      {/* GATED ON `onOpenInColumn` ALONE. "Only a board" is not this group's case — it is the
-          standalone button above, unchanged since before this existed — so the group appears
-          exactly when the column destination is real, and decides internally whether it is drawing
-          one link or two. */}
-      {onOpenInColumn !== undefined && (
-        <span style={rowStyle} data-testid={`${t}-open-links`}>
-          <span style={{ color: C.muted, fontSize: TYPE.small, lineHeight: 1.4 }}>Open</span>
-          <button
-            type="button"
-            data-testid={`${t}-open-in-column`}
-            // STOPS THE BUBBLE, like every other control on this card. The root is the
-            // expand/collapse target, so without this the press navigates AND folds the card in one
-            // gesture — measured: the second press in `BeadPill.openEpic.test.tsx`'s idempotence row
-            // found no link at all, because the first had collapsed the card out from under it.
-            onClick={(e) => {
-              e.stopPropagation();
-              onOpenInColumn();
-            }}
-            // ══ `aria-label`, NOT `title` — A NATIVE TOOLTIP HERE WOULD BE DEAD CODE ══════════
-            // `disableNativeTooltips()` strips every `title` app-wide on the first `mouseover`,
-            // and it only rescues the text into `aria-label` for a control that has NO other
-            // accessible name. These links have visible text, so a `title` on them is dropped
-            // outright: no tooltip, and nothing moved to the AX tree. (The `title`s on this card's
-            // older buttons are inert for the same reason — pre-existing, and not this change's to
-            // fix.) `HeaderLink` already solved it the way this copies: compose the accessible
-            // name as `<label> — <description>`.
-            //
-            // It is worth the words because "in column" is the ambiguous half of the pair. The
-            // build column is off-screen-right of the concierge at most widths, so the label alone
-            // names neither the column nor what will change about it.
-            // "this card" rather than "this epic": the link is offered for a TASK too, where it
-            // narrows one rung further — to just the agents on that task. Naming the rung here
-            // would mean this component deciding what a bead IS, which is the one question it must
-            // never answer for itself (`epic-membership-guard.sh`), and the sentence is true of
-            // both either way.
-            aria-label="in column — narrow the Build column to the agents working this card"
-            style={openLinkStyle}
-          >
-            in column
-          </button>
-          {/* THE SEPARATOR IS NOT A LINK and must never be read as one. `aria-hidden` keeps it
-              out of the accessibility tree entirely, so the two controls read as two controls. */}
-          {onViewOnBoard !== undefined && (
-            <span aria-hidden style={{ color: C.hairline, fontSize: TYPE.small }}>
-              ·
-            </span>
-          )}
-          {/* ONE LINK WHEN ONLY ONE DESTINATION IS MEANINGFUL, TWO WHEN BOTH ARE. A surface that
-              can narrow the column but has no board to open (none today, but the props allow it)
-              shows "in column" alone rather than a dead second link — which is the same
-              callback-is-the-switch rule every other affordance on this card follows. */}
-          {onViewOnBoard !== undefined && (
-            <button
-              type="button"
-              data-testid={`${t}-open-on-board`}
-              // Same reason as its sibling above — see that note.
-              onClick={(e) => {
-                e.stopPropagation();
-                onViewOnBoard();
-              }}
-              // Composed like its sibling above — see that note for why `title` cannot work here.
-              aria-label="on board — open the Plan board focused on this card"
-              style={openLinkStyle}
-            >
-              on board
-            </button>
-          )}
-        </span>
       )}
 
       {/* ── THE PRD BATCH — THE SECONDARY BUILD, EXPANDED ONLY ────────────────────────────────

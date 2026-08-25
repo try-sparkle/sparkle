@@ -680,14 +680,16 @@ describe("BeadPill — a bead in a project the founder is not looking at", () =>
   });
 });
 
-// ── 5. VIEW ON BOARD ────────────────────────────────────────────────────────────────────────────
+// ── 5. BOARD VIEW ───────────────────────────────────────────────────────────────────────────────
 
-describe("BeadPill — view on board", () => {
+describe("BeadPill — Board view", () => {
   it("is absent when the surface has no board to open, and the card still opens", () => {
     mountMarkdown(ctx([T6], { onViewOnBoard: undefined }), "see sparkle-t6wje");
     fireEvent.click(pills()[0]!);
     // NOT a dead end: the click already produced the card. Only the second step is missing.
     expect(card()).not.toBeNull();
+    expect(screen.queryByTestId("concierge-bead-card-open-on-board")).toBeNull();
+    // The retired corner button by name too, so restoring it here would be caught.
     expect(screen.queryByTestId("concierge-bead-card-view-on-board")).toBeNull();
   });
 
@@ -695,7 +697,7 @@ describe("BeadPill — view on board", () => {
     const onViewOnBoard = vi.fn(() => true);
     mountMarkdown(ctx([T6], { onViewOnBoard }), "see sparkle-t6wje");
     fireEvent.click(pills()[0]!);
-    fireEvent.click(screen.getByTestId("concierge-bead-card-view-on-board"));
+    fireEvent.click(screen.getByTestId("concierge-bead-card-open-on-board"));
     expect(onViewOnBoard).toHaveBeenCalledWith({ beadId: "sparkle-t6wje", projectId: "p1" });
   });
 
@@ -703,7 +705,7 @@ describe("BeadPill — view on board", () => {
     mountMarkdown(ctx([T6], { onViewOnBoard: vi.fn(() => false) }), "see sparkle-t6wje");
     fireEvent.click(pills()[0]!);
     expect(screen.queryByTestId("concierge-bead-card-notice")).toBeNull();
-    fireEvent.click(screen.getByTestId("concierge-bead-card-view-on-board"));
+    fireEvent.click(screen.getByTestId("concierge-bead-card-open-on-board"));
     expect(screen.getByTestId("concierge-bead-card-notice").textContent).toContain(
       "not on an open board",
     );
@@ -743,11 +745,11 @@ describe("BeadPill — view on board", () => {
       </BeadPillHost>,
     );
     fireEvent.click(pills()[0]!);
-    // THE **Open** GROUP'S board link, not the standalone button — this row mounts the REAL
-    // `BeadPillHost`, which supplies both destinations, so the standalone button correctly stands
-    // down and "on board" lives in the group. The rows above still use the standalone testid
-    // because they mount a context that offers no column destination, which is the other half of
-    // the same rule.
+    // THE PILL-SIDE `Board` LINK — the card's ONE board control since the founder moved both
+    // destinations up beside the epic pill (bead sparkle-42onk2). This row mounts the REAL
+    // `BeadPillHost`, which supplies both, so the row reads `Column | Board view`; the rows above
+    // mount a context with no column destination and reach the same testid, because the fallback is
+    // now the same control with one fewer sibling rather than a different control in the corner.
     fireEvent.click(screen.getByTestId("concierge-bead-card-open-on-board"));
 
     expect(calls).toEqual(["openPlanBoard", "setBoardFocusBeadId"]);
@@ -769,7 +771,7 @@ describe("BeadPill — view on board", () => {
       </StrictMode>,
     );
     fireEvent.click(pills()[0]!);
-    fireEvent.click(screen.getByTestId("concierge-bead-card-view-on-board"));
+    fireEvent.click(screen.getByTestId("concierge-bead-card-open-on-board"));
     expect(onViewOnBoard).toHaveBeenCalledTimes(1);
   });
 });

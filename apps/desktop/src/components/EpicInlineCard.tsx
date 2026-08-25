@@ -35,6 +35,7 @@ import { useUiStore } from "../stores/uiStore";
 import { sideOf } from "../engine/pairs";
 import { beadLineageOf } from "../engine/beadLineage";
 import { openProjectTab, selectProjectOnItsSide } from "../services/openProjectTab";
+import { openBeadOnBoard } from "../services/openBeadOnBoard";
 import type { WorkflowStageId } from "../engine/workflowStage";
 import type { AgentTab } from "../types";
 
@@ -186,6 +187,41 @@ export function EpicInlineCard({
             : undefined
         }
         onSetPriority={canWrite ? (p) => setBeadPriority(rootPath, bead.id, p) : undefined}
+        // ── `Board view` — RIGHT OF THE YELLOW EPIC PILL ─────────────────────────────────────
+        // The founder, 2026-08-24, with a screenshot of this very card: *"For epics on the epic
+        // column, I want a [link] to the right of the yellow epic pill that says 'board view' and
+        // opens the epic on the planning board"* — and, on how it should read: *"in the epic column
+        // just have 'Board view' where 'Board' is hyperlink."*
+        //
+        // THIS COLUMN HAD NO WAY TO THE BOARD AT ALL. Not a rename and not a move: `EpicInlineCard`
+        // passed neither destination callback, so the epic card here offered the board nowhere,
+        // while the concierge's copy of the same `BeadCard` had carried one since it was written.
+        // The card draws the link itself, in its chrome row, off this callback alone.
+        //
+        // ══ ONLY THE BOARD, NOT THE PAIR — AND THAT IS DELIBERATE ═══════════════════════════════
+        // `onOpenInColumn` is NOT passed, so no `Column` link is drawn here and the row reads
+        // `Board view` alone. Asked directly, the founder chose just the board link: this column's
+        // whole job is already to narrow the build column — clicking an epic ROW does exactly that
+        // (`uiStore.epicFocusBySide` calls it *"the point of the epics column rather than a
+        // refinement of it"*) — so a `Column` link on the card would be a second, quieter way to do
+        // what the reader just did to open the card.
+        //
+        // ══ NOT GATED ON `canWrite`, UNLIKE ITS NEIGHBOURS ══════════════════════════════════════
+        // Chat, the priority control and the goal field all take `canWrite` because they WRITE
+        // through `bd` and a card with no project path can only fail. This navigates. A project
+        // with no `bd` path still has a board and still has this bead on it, so gating it would
+        // remove a working destination to protect a write that never happens — the same reading
+        // `Concierge/BeadPill` records for its own copy of this link.
+        //
+        // `openBeadOnBoard` is the SHARED service, not a sequence written out here. Its four writes
+        // have a load-bearing order and have already been mis-derived once in this very file (it
+        // used to hold an `openBeadCardOnBoard` that called the wrong project selector — roborev
+        // 68041). It returns whether a board could be opened at all; there is nothing on this card
+        // to say so with, and the bead came FROM this project's own ladder, so the answer is always
+        // true here and is deliberately dropped rather than pretended to be handled.
+        onViewOnBoard={() => {
+          openBeadOnBoard({ beadId: bead.id, projectId });
+        }}
         onBuildIt={canWrite ? (build.buildIt ?? undefined) : undefined}
         onBuildAllPrd={canWrite ? (build.buildAllPrd ?? undefined) : undefined}
         prdEpicCount={build.prdEpics.length}
