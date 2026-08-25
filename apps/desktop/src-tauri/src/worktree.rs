@@ -5056,6 +5056,69 @@ pub struct PrRow {
     pub body: String,
 }
 
+/// A rollup entry's timestamps. RFC3339 UTC (`2026-08-24T22:10:02Z`) sorts LEXICALLY in
+/// chronological order, which is why these are compared as `&str` and not parsed — GitHub always
+/// emits the `Z` form here, and an unparseable or absent value must fall through to "cannot tell"
+/// rather than to a guess.
+fn entry_started(c: &Value) -> Option<&str> {
+    c.get("startedAt").and_then(Value::as_str).filter(|v| !v.is_empty())
+}
+fn entry_completed(c: &Value) -> Option<&str> {
+    c.get("completedAt").and_then(Value::as_str).filter(|v| !v.is_empty())
+}
+
+/// The rollup entries that still SPEAK FOR a check, with superseded re-runs dropped.
+///
+/// THE ROLLUP KEEPS SUPERSEDED ENTRIES, AND THE STALE ONE OUT-VOTES THE NEWER ONE. Measured on live
+/// PR #2576: `Vercel review findings` appears TWICE — `FAILURE` completed 22:10:02, then `SUCCESS`
+/// completed 22:12:38. A reader that ORs any failure reports that PR red while it is genuinely
+/// green, and #2581/#2580 showed the same shape as `CANCELLED,SUCCESS`. Five PRs were reported to
+/// the founder as carrying "a genuine red" on this basis; none of them did. A surface that is red
+/// for reasons that are not real teaches everyone to stop reading it — the same failure mode as an
+/// always-red advisory, arrived at from the other direction.
+///
+/// SUPERSESSION IS PROVEN BY TIME, NOT BY ARRAY ORDER. An entry is dropped only when another entry
+/// with the SAME name demonstrably STARTED AT OR AFTER this one FINISHED — i.e. it is a re-run, not
+/// a sibling. That distinction is load-bearing: a matrix leg or a second workflow can legitimately
+/// publish two concurrently-running checks under one name, and collapsing those to "the latest" would
+/// HIDE A REAL FAILURE. Overlapping entries are therefore both kept.
+///
+/// FAIL CLOSED: if either timestamp is missing or empty, nothing is dropped. The cost of keeping a
+/// stale entry is a red that needs a second look; the cost of dropping a live one is a failure that
+/// nobody sees.
+fn live_entries(rollup: &[Value]) -> Vec<&Value> {
+    // `later` is the ONLY supersession test: `other` demonstrably began at or after `c` finished.
+    // Both timestamps must be present — a missing one proves nothing and must not drop an entry.
+    let later = |c: &Value, other: &Value| -> bool {
+        match (entry_completed(c), entry_started(other)) {
+            (Some(done), Some(started)) => started >= done,
+            _ => false,
+        }
+    };
+
+    let mut out: Vec<&Value> = Vec::new();
+    for (i, c) in rollup.iter().enumerate() {
+        let name = check_name(c);
+        let superseded = rollup.iter().enumerate().any(|(j, other)| {
+            if i == j || check_name(other) != name {
+                return false;
+            }
+            // ASYMMETRY IS REQUIRED, and it is what keeps the degenerate case fail-CLOSED. Two
+            // entries carrying identical timestamps each satisfy `later` against the other, so a
+            // bare `later(c, other)` would drop BOTH and hand `classify_checks` an empty rollup —
+            // "none", a green-ish verdict, over a pair that may include a real failure. Demanding
+            // that the relation hold in one direction only makes such a pair a tie, and a tie keeps
+            // both. It also re-states the sibling rule the doc comment promises: overlapping runs
+            // satisfy `later` in neither direction, so neither is dropped.
+            later(c, other) && !later(other, c)
+        });
+        if !superseded {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// Aggregate a `gh` `statusCheckRollup` array into one word. A failing check dominates (red beats
 /// everything); else any still-running check makes the whole rollup "pending"; else if there are any
 /// checks they have all succeeded → "passing"; an empty rollup is "none". Pure so the CI-shaping is
@@ -5064,7 +5127,9 @@ fn classify_checks(rollup: &[Value]) -> &'static str {
     let mut saw_any = false;
     let mut saw_pending = false;
     let mut saw_failing = false;
-    for c in rollup {
+    // Superseded re-runs are dropped FIRST, and by the same helper `collect_check_names` uses, so the
+    // dot and the label beside it cannot disagree about which entries are live.
+    for c in live_entries(rollup) {
         saw_any = true;
         match check_state(c) {
             CheckState::Failing => saw_failing = true,
@@ -5183,7 +5248,7 @@ fn without_rollup_echoes(failing: Vec<String>) -> Vec<String> {
 fn collect_check_names(rollup: &[Value]) -> (Vec<String>, Vec<String>) {
     let mut failing: Vec<String> = Vec::new();
     let mut pending: Vec<String> = Vec::new();
-    for c in rollup {
+    for c in live_entries(rollup) {
         let bucket = match check_state(c) {
             CheckState::Failing => &mut failing,
             CheckState::Pending => &mut pending,
@@ -5530,6 +5595,122 @@ mod rest_pr_rows_tests {
         ];
         let (_failing, pending) = collect_check_names(&rollup);
         assert_eq!(pending.len(), 2, "the de-echo is scoped to the failing list only");
+    }
+
+    // ── SUPERSEDED RE-RUNS ──────────────────────────────────────────────────────────────────
+    // The rollup KEEPS superseded entries and the stale one out-votes the newer one. These fixtures
+    // are the MEASURED shape from live PR #2576, timestamps included.
+
+    fn run_at(name: &str, conclusion: &str, started: &str, completed: &str) -> serde_json::Value {
+        serde_json::json!({
+            "__typename": "CheckRun",
+            "name": name,
+            "status": "COMPLETED",
+            "conclusion": conclusion,
+            "startedAt": started,
+            "completedAt": completed,
+        })
+    }
+
+    /// THE CENTRAL PIN, and it is not hypothetical: five PRs were reported to the founder as
+    /// carrying "a genuine red" from `Vercel review findings` on exactly this shape, and none of
+    /// them did. A surface that reds for reasons that are not real teaches people to stop reading
+    /// it — the same failure as an always-red advisory, reached from the other direction.
+    #[test]
+    fn a_superseded_failure_does_not_red_the_pr() {
+        let rollup = vec![
+            run_at(
+                "Vercel review findings",
+                "FAILURE",
+                "2026-08-24T22:09:54Z",
+                "2026-08-24T22:10:02Z",
+            ),
+            run_at(
+                "Vercel review findings",
+                "SUCCESS",
+                "2026-08-24T22:12:31Z",
+                "2026-08-24T22:12:38Z",
+            ),
+        ];
+        assert_eq!(
+            classify_checks(&rollup),
+            "passing",
+            "the re-run started 2.5 minutes AFTER the failed attempt finished, so it supersedes it — \
+             this PR is genuinely green and must not read red"
+        );
+        let (failing, _) = collect_check_names(&rollup);
+        assert!(
+            failing.is_empty(),
+            "and nothing may be named as failing either, got {failing:?}"
+        );
+    }
+
+    /// THE OTHER HALF, and the reason supersession is proven by TIME rather than by array order or
+    /// by "keep the last one". A matrix leg or a second workflow can legitimately publish two
+    /// CONCURRENT checks under one name; collapsing those to "the latest" would hide a real failure.
+    #[test]
+    fn concurrent_siblings_sharing_a_name_are_both_counted() {
+        let rollup = vec![
+            run_at("shared name", "FAILURE", "2026-08-24T22:09:00Z", "2026-08-24T22:12:00Z"),
+            // Starts BEFORE the other finished — overlapping, so a sibling, not a re-run.
+            run_at("shared name", "SUCCESS", "2026-08-24T22:10:00Z", "2026-08-24T22:11:00Z"),
+        ];
+        assert_eq!(
+            classify_checks(&rollup),
+            "failing",
+            "overlapping entries are concurrent siblings; dropping one would hide a real failure"
+        );
+    }
+
+    /// FAIL CLOSED. The cost of keeping a stale entry is a red that needs a second look; the cost of
+    /// dropping a live one is a failure nobody sees. A Rust Option crosses the wire as an explicit
+    /// null, never an absent key, so the fixture uses null rather than omitting the fields.
+    #[test]
+    fn entries_without_timestamps_are_never_dropped() {
+        let rollup = vec![
+            serde_json::json!({
+                "name": "no timestamps", "status": "COMPLETED", "conclusion": "FAILURE",
+                "startedAt": serde_json::Value::Null, "completedAt": serde_json::Value::Null,
+            }),
+            serde_json::json!({
+                "name": "no timestamps", "status": "COMPLETED", "conclusion": "SUCCESS",
+                "startedAt": serde_json::Value::Null, "completedAt": serde_json::Value::Null,
+            }),
+        ];
+        assert_eq!(
+            classify_checks(&rollup),
+            "failing",
+            "with no timestamps nothing PROVES supersession, so the failure must still count"
+        );
+    }
+
+    /// THE DEGENERATE TIE, and it is the one shape that fails OPEN rather than closed if the
+    /// supersession test is not ASYMMETRIC.
+    ///
+    /// The fixture is ZERO-DURATION on purpose, and that is the whole bug: `later` asks whether the
+    /// other entry STARTED AT OR AFTER this one FINISHED, and `>=` makes that true in BOTH
+    /// directions only when start and finish are the same instant. GitHub truncates these stamps to
+    /// whole seconds, so any check that begins and ends inside one second — a legacy commit status
+    /// is routinely stamped this way — lands exactly here. A naive `later(c, other)` then drops BOTH
+    /// entries and hands `classify_checks` an EMPTY rollup, which classifies as "none", not
+    /// "failing": a real failure vanishing into a verdict that reads like nothing ever ran.
+    /// Requiring the relation to hold in one direction only makes this a tie, and a tie keeps both.
+    #[test]
+    fn entries_with_identical_timestamps_are_a_tie_and_both_survive() {
+        let rollup = vec![
+            run_at("same clock", "FAILURE", "2026-08-24T22:09:00Z", "2026-08-24T22:09:00Z"),
+            run_at("same clock", "SUCCESS", "2026-08-24T22:09:00Z", "2026-08-24T22:09:00Z"),
+        ];
+        assert_eq!(
+            live_entries(&rollup).len(),
+            2,
+            "neither entry proves it supersedes the other, so dropping either is unjustified"
+        );
+        assert_eq!(
+            classify_checks(&rollup),
+            "failing",
+            "and the failure must survive — collapsing both would report an empty rollup as \"none\""
+        );
     }
 
     /// ANTI-DRIFT. The table is a hand-written mirror of ci.yml, so a renamed job or a new fan-in
