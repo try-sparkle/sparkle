@@ -275,6 +275,34 @@ fn mint_id(now: i64) -> String {
     format!("rsh_{now:013}_{:016x}", rand::random::<u64>())
 }
 
+/// Serialises every READ-MODIFY-WRITE and every publish of a task record (bead `sparkle-v0yzpd`).
+///
+/// WHY A LOCK AND NOT JUST AN ATOMIC RENAME. The rename already gives a *reader* an all-or-nothing
+/// record. What it cannot give is an all-or-nothing *decision*: [`update_task_where`] reads the
+/// record, asks `may_write` whether the record it just read permits this write, and only then
+/// writes. Two threads doing that concurrently both read the same non-terminal record, both are
+/// told yes, and both write — so FIRST TERMINAL WRITE WINS, the rule that whole function exists to
+/// enforce, is decided by whichever rename happened to land second. That is not a hypothetical
+/// pairing: `cancel_task` runs on the caller's thread and `finish` runs on the runner thread, and
+/// the module's own comments describe them racing.
+///
+/// One global lock rather than one per task id: writes here are a serde encode, a small write, a
+/// rename and a read-back — microseconds — and they happen at dispatch, at the running mark, and
+/// once at the end of a child that ran for minutes. A per-id map would add a second shared
+/// structure (and its own lifetime question) to save contention that does not exist.
+fn store_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+/// Take [`store_lock`], TOLERATING POISON. A writer that panicked mid-write left the store in
+/// whatever state the atomic rename left it — a complete old record or a complete new one, never a
+/// torn one — so refusing every subsequent write would wedge research for the life of the process
+/// in exchange for no safety at all.
+fn lock_store() -> std::sync::MutexGuard<'static, ()> {
+    store_lock().lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Persist a task, and REFUSE TO ACKNOWLEDGE IT UNTIL IT READS BACK (bead `sparkle-bbghz`).
 ///
 /// WHY A SUCCESSFUL WRITE IS NOT ENOUGH EVIDENCE. `write` returning `Ok` proves the bytes left this
@@ -288,6 +316,16 @@ fn mint_id(now: i64) -> String {
 /// rather than a cheaper stat or byte compare. A check that agreed with the WRITER instead of with
 /// the READER would re-open the same hole one layer down.
 fn write_task(app_data: &Path, task: &ResearchTask) -> Result<(), String> {
+    let _store = lock_store();
+    write_task_locked(app_data, task)
+}
+
+/// [`write_task`]'s body, for the callers that already hold [`lock_store`].
+///
+/// Split out rather than made re-entrant: [`std::sync::Mutex`] is NOT reentrant, so an
+/// `update_task_where` that took the lock and then called the public `write_task` would deadlock
+/// the whole store on its own first write.
+fn write_task_locked(app_data: &Path, task: &ResearchTask) -> Result<(), String> {
     valid_task_id(&task.id)?;
     let dir = research_dir(app_data);
     std::fs::create_dir_all(&dir).map_err(|e| format!("research: cannot create {dir:?}: {e}"))?;
@@ -298,12 +336,26 @@ fn write_task(app_data: &Path, task: &ResearchTask) -> Result<(), String> {
     // Write-then-rename so a reader never observes a half-written record. The temp name carries the
     // `.tmp` suffix that `list_tasks` filters out, so an abandoned temp is inert rather than a task
     // that parses as garbage.
+    //
+    // THE NONCE IS LOAD-BEARING (bead `sparkle-v0yzpd`). This temp used to be named from the task id
+    // ALONE, so every writer of one record shared ONE temp path — and two of them are ordinary here,
+    // since `cancel_task` and the runner thread both write the same file by design. The measured
+    // interleaving is write(A) → write(B) → rename(A) → rename(B): A publishes B's BYTES under its
+    // own decision, and B's rename finds nothing left to move and fails
+    // `No such file or directory (os error 2)`, surfacing as a cancel button that reports failure
+    // for a cancellation that happened. [`lock_store`] closes that window inside this process; the
+    // nonce is what makes the write safe against a writer this process cannot lock against at all
+    // (a second Sparkle instance on the same app-data directory), and it costs one `rand` call.
     let final_path = task_path(app_data, &task.id);
-    let tmp_path = dir.join(format!("{}.json.tmp", task.id));
+    let tmp_path = dir.join(format!("{}.json.{:016x}.tmp", task.id, rand::random::<u64>()));
     std::fs::write(&tmp_path, &body)
         .map_err(|e| format!("research: cannot write {tmp_path:?}: {e}"))?;
-    std::fs::rename(&tmp_path, &final_path)
-        .map_err(|e| format!("research: cannot commit {final_path:?}: {e}"))?;
+    if let Err(e) = std::fs::rename(&tmp_path, &final_path) {
+        // A uniquely-named temp is never reused, so a failed commit would otherwise leak one file
+        // per attempt into a directory `list_tasks` scans on every poll.
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(format!("research: cannot commit {final_path:?}: {e}"));
+    }
 
     match read_task(app_data, &task.id) {
         Some(back) if &back == task => Ok(()),
@@ -376,13 +428,16 @@ fn update_task_where(
     may_write: impl FnOnce(&ResearchTask) -> bool,
     mutate: impl FnOnce(&mut ResearchTask),
 ) -> Result<ResearchTask, String> {
+    // Held across read → decide → write: see [`store_lock`]. Dropping it between the read and the
+    // write is exactly the defect, not an optimisation.
+    let _store = lock_store();
     let mut task = read_task(app_data, id)
         .ok_or_else(|| format!("research: no task with id {id}"))?;
     if !may_write(&task) {
         return Ok(task);
     }
     mutate(&mut task);
-    write_task(app_data, &task)?;
+    write_task_locked(app_data, &task)?;
     Ok(task)
 }
 
@@ -2023,6 +2078,129 @@ mod tests {
             "the runner must not overwrite a cancellation with a failure"
         );
         assert_eq!(settled.findings, None);
+    }
+
+    // ── THE STORE UNDER CONCURRENCY (bead sparkle-v0yzpd) ─────────────────────────────────────────
+    //
+    // `cancel_stops_a_running_task_and_records_it_as_cancelled_not_failed` above is the SYMPTOM:
+    // it drives two real writers at one record and, under a loaded machine, fails with
+    // `cannot commit ...: No such file or directory`. It is a poor regression guard for the cause
+    // because it only collides when the scheduler happens to interleave them. These two drive the
+    // collision deliberately.
+
+    /// THE SIDE EFFECT: a write that was never allowed to fail returns `Err`.
+    ///
+    /// Every writer of one task derived its temp file from the TASK ID alone, so two concurrent
+    /// writers shared `<id>.json.tmp`. The interleaving is write(A) → write(B) → rename(A) →
+    /// rename(B): A's rename publishes B's BYTES, and B's rename finds nothing left to move and
+    /// fails ENOENT. Both halves are wrong, and the ENOENT is what reaches the founder — a cancel
+    /// button that reports failure for a cancellation that happened.
+    ///
+    /// Asserting on the returned `Err` rather than on the temp file's name: the fix is free to name
+    /// the temp anything it likes, and a test pinned to the name would fail the next rename.
+    #[test]
+    fn concurrent_writers_of_one_record_never_collide_on_a_shared_temp_file() {
+        const WRITERS: usize = 8;
+        const ROUNDS: usize = 30;
+        let dir = tempfile::tempdir().unwrap();
+        for round in 0..ROUNDS {
+            let gate = Arc::new(std::sync::Barrier::new(WRITERS));
+            let errs = Arc::new(Mutex::new(Vec::<String>::new()));
+            let handles: Vec<_> = (0..WRITERS)
+                .map(|i| {
+                    let app_data = dir.path().to_path_buf();
+                    let gate = Arc::clone(&gate);
+                    let errs = Arc::clone(&errs);
+                    std::thread::spawn(move || {
+                        // Distinct bodies, so a write that publishes someone else's bytes is a
+                        // read-back MISMATCH rather than an accidental pass.
+                        let mut t = a_task("rsh_contended");
+                        t.findings = Some(format!("writer {i} of round {round}"));
+                        gate.wait();
+                        if let Err(e) = write_task(&app_data, &t) {
+                            errs.lock().unwrap_or_else(|p| p.into_inner()).push(e);
+                        }
+                    })
+                })
+                .collect();
+            for h in handles {
+                h.join().unwrap();
+            }
+            let errs = errs.lock().unwrap_or_else(|p| p.into_inner());
+            assert!(
+                errs.is_empty(),
+                "round {round}: {} of {WRITERS} concurrent writes failed, first: {}",
+                errs.len(),
+                errs[0],
+            );
+        }
+        let settled = read_task(dir.path(), "rsh_contended")
+            .expect("the record must exist and parse after every writer has run");
+        assert!(
+            settled.findings.is_some(),
+            "a surviving record must be one writer's WHOLE body, not a blend",
+        );
+    }
+
+    /// THE OTHER HALF, and the one that costs correctness rather than an error message.
+    ///
+    /// `update_task` is a read-modify-write, and its whole reason to exist is FIRST TERMINAL WRITE
+    /// WINS — a cancellation must not be relabelled `failed` by the runner thread coming home. Read
+    /// and write were not atomic with respect to each other, so both racers could pass the
+    /// `is_terminal` guard against the SAME queued record and both go on to mutate. The loser then
+    /// overwrote the winner, which is precisely the outcome the guard is written to prevent.
+    ///
+    /// The assertion is a COUNT OF MUTATIONS, not the final status: with the guard defeated the
+    /// surviving status is whichever thread happened to rename last, so asserting a status would
+    /// pass roughly half the time against the defect.
+    #[test]
+    fn a_racing_update_is_stopped_by_the_terminal_guard_and_never_mutates_at_all() {
+        const ROUNDS: usize = 30;
+        let dir = tempfile::tempdir().unwrap();
+        for round in 0..ROUNDS {
+            let id = format!("rsh_race{round:04}");
+            write_task(dir.path(), &a_task(&id)).expect("seed");
+            let mutations = Arc::new(AtomicUsize::new(0));
+            let gate = Arc::new(std::sync::Barrier::new(2));
+            let handles: Vec<_> = [ResearchStatus::Cancelled, ResearchStatus::Failed]
+                .into_iter()
+                .map(|status| {
+                    let app_data = dir.path().to_path_buf();
+                    let id = id.clone();
+                    let mutations = Arc::clone(&mutations);
+                    let gate = Arc::clone(&gate);
+                    std::thread::spawn(move || {
+                        gate.wait();
+                        update_task(&app_data, &id, |t| {
+                            mutations.fetch_add(1, Ordering::AcqRel);
+                            t.status = status;
+                            t.finished_at = Some(7);
+                        })
+                    })
+                })
+                .collect();
+            let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+            assert_eq!(
+                mutations.load(Ordering::Acquire),
+                1,
+                "round {round}: both racers mutated a record only one of them was allowed to write",
+            );
+            for r in &results {
+                r.as_ref().unwrap_or_else(|e| panic!("round {round}: an update failed: {e}"));
+            }
+            let settled = read_task(dir.path(), &id).expect("the record must survive the race");
+            assert!(settled.status.is_terminal(), "round {round}: the winner's terminal write must stand");
+            assert_eq!(settled.finished_at, Some(7), "round {round}");
+            // Both racers must AGREE with disk — a returned value describing a record that was
+            // then overwritten is what a caller renders, and it would be a lie.
+            for r in &results {
+                assert_eq!(
+                    r.as_ref().unwrap().status,
+                    settled.status,
+                    "round {round}: a racer returned a status the store does not hold",
+                );
+            }
+        }
     }
 
     #[test]
