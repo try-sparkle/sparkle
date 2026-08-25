@@ -8610,6 +8610,57 @@ fn autosave_ref_for(agent_id: &str) -> String {
 /// it runs on a timer against a LIVE tree and must never become a drag on the agent it is protecting.
 const AUTOSAVE_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// The MOST the post-`commit-tree` ref write may add to the autosave's budget, in total.
+///
+/// THE SAME DEFECT AS [`POST_COMMIT_TAIL_TOTAL_MS`], on the autosave twin (bead sparkle-tcupn3, from
+/// the PR #1986 retro). That retro's lesson — "after any step that has already changed the world,
+/// give the remaining calls a reserve that cannot be exhausted by the work before them" — was applied
+/// to [`commit_worktree_wip_within`] and never carried across to this path, which repeats the shape
+/// verbatim: ~10 git calls share [`AUTOSAVE_TIMEOUT`], `commit-tree` mints a real commit object part
+/// way through, and the `update-ref` that makes it REACHABLE used to draw on whatever was left.
+///
+/// Why that loses work rather than merely erroring: `commit-tree` is cheap plumbing and needs only a
+/// non-zero remainder, so on a large or contended tree `add -A` burns the budget, the commit is still
+/// created, and then [`git_autosave`] sees zero remaining and returns its "skipped" error WITHOUT
+/// EVER SPAWNING git. The commit object is then dangling — reachable from nothing, collectable by
+/// `git gc` — so the autosave tick destroys the very snapshot it just took, in exactly the contended
+/// state the feature exists to survive.
+const AUTOSAVE_TAIL_TOTAL_MS: u64 = 5_000;
+
+/// The lock-path lookup (`rev-parse --git-common-dir`) is REPORT-ONLY in the same sense as
+/// [`POST_COMMIT_TAIL_REPORT`]: failing it costs the ability to clear a STALE lock, never the commit.
+/// It is weighted small for the reason the equal split was wrong there — the call whose failure loses
+/// real work must not have its budget cut to buy headroom for one that only affects recovery.
+const AUTOSAVE_TAIL_LOOKUP_MS: u64 = 500;
+
+/// The divisors of [`AUTOSAVE_TAIL_TOTAL_MS`]: one lock-path lookup, and TWO writes — the first
+/// `update-ref` and the single retry after a stale lock is cleared. Counted here rather than trusted
+/// to hand-maintenance, because a call site added without updating them silently raises the worst
+/// case above what this file documents; a test counts the call sites in this source to enforce it.
+const AUTOSAVE_TAIL_LOOKUP_CALLS: u64 = 1;
+const AUTOSAVE_TAIL_WRITE_CALLS: u64 = 2;
+
+/// What each `update-ref` gets: everything the lookup does not, split across however many writes there
+/// are, so the aggregate stays bounded by the total no matter which count changes.
+const AUTOSAVE_TAIL_WRITE_MS: u64 = (AUTOSAVE_TAIL_TOTAL_MS
+    - AUTOSAVE_TAIL_LOOKUP_MS * AUTOSAVE_TAIL_LOOKUP_CALLS)
+    / AUTOSAVE_TAIL_WRITE_CALLS;
+
+/// The reserve for the stale-lock path lookup, INDEPENDENT of the shared budget.
+const AUTOSAVE_TAIL_LOOKUP: Duration = Duration::from_millis(AUTOSAVE_TAIL_LOOKUP_MS);
+
+/// The reserve for an `update-ref` that anchors a freshly minted commit — the call whose starvation IS
+/// the work loss, and which the split therefore favours.
+const AUTOSAVE_TAIL_WRITE: Duration = Duration::from_millis(AUTOSAVE_TAIL_WRITE_MS);
+
+/// The deadline for one post-`commit-tree` call, deliberately INDEPENDENT of the autosave's shared
+/// budget. As with [`post_commit_tail`], taking a `_shared` it does not use is the point: funding
+/// these calls from whatever the sequence had left is the whole defect, so the parameter exists to
+/// make "and it ignores that" explicit and testable — a mutation returning `_shared` must fail a test.
+fn autosave_tail(_shared: Instant, reserve: Duration) -> Instant {
+    Instant::now() + reserve
+}
+
 /// The per-agent, in-process lock serialising autosave ref writes, so two sweeps of the SAME agent in
 /// this process never race `update-ref` on one ref. Cross-process contention is handled by git's own
 /// `core.filesRefLockTimeout` retry in [`autosave_write_ref`], and a LEAKED lock by the stale-clear
@@ -8625,8 +8676,16 @@ fn autosave_ref_mutex(ref_name: &str) -> Arc<Mutex<()>> {
 /// COMMON dir, shared by every linked worktree, so it is resolved there rather than under the
 /// worktree's own `.git`. `None` if the common dir cannot be read (the caller then cannot clear a
 /// leaked lock and surfaces the original error unchanged).
-fn autosave_ref_lock_path(worktree: &str, ref_name: &str, deadline: Instant) -> Option<PathBuf> {
-    let common = git_autosave(worktree, &["rev-parse", "--git-common-dir"], deadline, None).ok()?;
+fn autosave_ref_lock_path(worktree: &str, ref_name: &str, shared: Instant) -> Option<PathBuf> {
+    // Reserve, not `shared`: this runs AFTER `commit-tree`, and an exhausted budget here means the
+    // stale-lock recovery is starved in precisely the contention it was written for.
+    let common = git_autosave(
+        worktree,
+        &["rev-parse", "--git-common-dir"],
+        autosave_tail(shared, AUTOSAVE_TAIL_LOOKUP),
+        None,
+    )
+    .ok()?;
     let common = common.trim();
     if common.is_empty() {
         return None;
@@ -8653,21 +8712,26 @@ fn autosave_write_ref(
     worktree: &str,
     ref_name: &str,
     commit: &str,
-    deadline: Instant,
+    shared: Instant,
 ) -> Result<(), String> {
     let mtx = autosave_ref_mutex(ref_name);
     let _held = mtx.lock().unwrap_or_else(|e| e.into_inner());
 
-    let write = |d: Instant| {
+    // EVERY git call below runs on a RESERVE, never on `shared`. By the time this function is entered
+    // `commit-tree` has already minted the commit, so a `shared` that the preceding `add -A` exhausted
+    // would skip the write that makes that commit reachable and leave it dangling (bead
+    // sparkle-tcupn3). `shared` is threaded in only so the reserves are derived from a declared
+    // origin — `autosave_tail` ignores its value by design.
+    let write = || {
         git_autosave(
             worktree,
             &["-c", "core.filesRefLockTimeout=1000", "update-ref", ref_name, commit],
-            d,
+            autosave_tail(shared, AUTOSAVE_TAIL_WRITE),
             None,
         )
     };
 
-    let first = match write(deadline) {
+    let first = match write() {
         Ok(_) => return Ok(()),
         Err(e) => e,
     };
@@ -8682,12 +8746,12 @@ fn autosave_write_ref(
     }
     // The timed retry already waited out any LIVE holder, so a lock still present is stale (leaked by
     // a killed prior write). Remove it and retry exactly once.
-    match autosave_ref_lock_path(worktree, ref_name, deadline) {
+    match autosave_ref_lock_path(worktree, ref_name, shared) {
         Some(lock) if lock.exists() => {
             if std::fs::remove_file(&lock).is_err() {
                 return Err(first);
             }
-            write(deadline).map(|_| ()).map_err(|e| format!("{e} (after clearing a stale ref lock)"))
+            write().map(|_| ()).map_err(|e| format!("{e} (after clearing a stale ref lock)"))
         }
         _ => Err(first),
     }
@@ -8896,7 +8960,16 @@ pub fn autosave_worktree_wip_within(
     let ref_name = autosave_ref_for(agent_id);
     if let Err(e) = autosave_write_ref(worktree, &ref_name, &commit, deadline) {
         cleanup(&idx);
-        return Err(format!("autosave update-ref failed: {e}"));
+        // NAME THE DANGLING COMMIT. The reserve above makes starvation the unlikely case, but a write
+        // can still fail for a real reason (bad object, permissions, a lock we could not clear) — and
+        // by then `commit-tree` HAS run, so a snapshot of the user's work exists and is reachable from
+        // nothing. Discarding the sha here is what made that loss unrecoverable: with it in the error,
+        // the object is still in the odb until `git gc` and one `git update-ref <ref> <sha>` restores
+        // it. This is the recoverable half of "never let the bookkeeping's failure destroy the work".
+        return Err(format!(
+            "autosave update-ref failed: {e} (snapshot commit {commit} was created but is \
+             unreferenced — recover it with: git update-ref {ref_name} {commit})"
+        ));
     }
     cleanup(&idx);
     Ok(AutosaveOutcome {
@@ -12360,6 +12433,148 @@ mod tests {
     // The property under test is TWO-sided: the work is captured to the side ref (the recovery floor),
     // AND the agent's branch, HEAD and working tree are left exactly as they were (a live autosave must
     // be invisible to the agent it protects). Every test asserts both halves.
+
+    #[test]
+    fn the_autosave_ref_write_survives_an_ALREADY_SPENT_shared_budget() {
+        // THE WORK-LOSS PATH, end to end (bead sparkle-tcupn3 — the PR #1986 lesson never carried
+        // across to the autosave twin). `commit-tree` mints a real commit part way through a sequence
+        // that shares ONE 15s budget; it is cheap plumbing and needs only a non-zero remainder, so on
+        // a large or contended tree `add -A` burns the budget, the commit is still created, and the
+        // `update-ref` that makes it REACHABLE then sees zero and is skipped WITHOUT SPAWNING git.
+        // The commit is left dangling — collectable by `git gc` — so the tick destroys the snapshot
+        // it just took.
+        //
+        // This drives the REAL `autosave_write_ref` with a budget that is already spent, which is
+        // exactly the state the starved call saw, and asserts the SIDE EFFECT: the ref exists and
+        // resolves to the commit. Before the reserve, this returned "skipped: autosave deadline
+        // reached" and the ref was never created.
+        let (_root, wt, _app_data) = repo_with_worktree("autosave-spent-budget");
+        std::fs::write(format!("{wt}/f.txt"), "work worth keeping").unwrap();
+        git(&wt, &["add", "f.txt"]).unwrap();
+        git(&wt, &["commit", "-m", "base"]).unwrap();
+        let commit = git(&wt, &["rev-parse", "HEAD"]).unwrap();
+
+        let spent = Instant::now() - Duration::from_secs(60);
+        let res = autosave_write_ref(&wt, "refs/sparkle-autosave/spent", &commit, spent);
+
+        assert!(
+            res.is_ok(),
+            "an exhausted SHARED budget must not starve the write that anchors an already-created \
+             commit — that is the work loss this reserve exists to prevent: {res:?}"
+        );
+        assert_eq!(
+            git(&wt, &["rev-parse", "refs/sparkle-autosave/spent"]).unwrap(),
+            commit,
+            "the side ref must actually resolve to the commit; an Ok that wrote nothing would leave \
+             the object dangling just the same"
+        );
+    }
+
+    #[test]
+    fn the_autosave_bookkeeping_reserve_is_bounded_and_favours_the_write() {
+        // The same three properties the WIP path pins, on the autosave twin: the reserve is real (not
+        // inherited), the aggregate is bounded (a reserve is a budget extension, so it cannot be
+        // unbounded), and the split favours the call whose starvation loses work.
+        let spent = Instant::now() - Duration::from_secs(60);
+        assert!(
+            autosave_tail(spent, AUTOSAVE_TAIL_WRITE) > Instant::now(),
+            "the ref write must get its own reserve, not the sequence's remainder"
+        );
+        assert!(
+            autosave_tail(spent, AUTOSAVE_TAIL_LOOKUP) > Instant::now(),
+            "and so must the stale-lock lookup, which is starved in exactly the contention it \
+             exists for"
+        );
+        assert!(
+            !AUTOSAVE_TAIL_WRITE.is_zero() && !AUTOSAVE_TAIL_LOOKUP.is_zero(),
+            "a zero reserve is the defect wearing the fix's name"
+        );
+
+        // BOUNDED. Counted from the source, not from the constants, so a call site added without
+        // updating the divisors cannot silently raise the worst case above what the file documents.
+        //
+        // COUNT ONLY THE PRODUCTION HALF. `include_str!` pulls in this test module too, and these very
+        // assertions name both reserves — so counting the whole file scores the test's own mentions as
+        // call sites and the totals never reconcile (measured: 4 real sites vs 6 counted). Splitting at
+        // the test module is what makes this count mean "what production asks for".
+        let whole = include_str!("worktree.rs");
+        let prod = whole.split("\nmod tests {").next().unwrap();
+        let needle = format!("{}_tail(", "autosave");
+        assert!(prod.contains(&format!("fn {needle}")), "the definition itself is one occurrence");
+        let sites = prod.matches(&needle).count() - 1; // minus the `fn` definition
+        let write_sites = prod.matches("AUTOSAVE_TAIL_WRITE)").count();
+        let lookup_sites = prod.matches("AUTOSAVE_TAIL_LOOKUP)").count();
+        assert!(sites > 0, "a count of zero would make every assertion below vacuously true");
+        assert_eq!(
+            sites,
+            write_sites + lookup_sites,
+            "{sites} tail call site(s) exist but only {} take a reserve this test knows about — a \
+             site taking some third reserve escapes the bound below",
+            write_sites + lookup_sites
+        );
+        let requested = AUTOSAVE_TAIL_WRITE * u32::try_from(write_sites).unwrap()
+            + AUTOSAVE_TAIL_LOOKUP * u32::try_from(lookup_sites).unwrap();
+        assert!(
+            requested <= Duration::from_millis(AUTOSAVE_TAIL_TOTAL_MS),
+            "the call sites request {requested:?} of tail, more than the \
+             {AUTOSAVE_TAIL_TOTAL_MS}ms documented"
+        );
+
+        // AND WEIGHTED TOWARD THE WRITE. An equal split satisfies the bound while cutting the only
+        // call whose failure loses a real commit, to fund a lookup that only affects recovery —
+        // the precise mistake the WIP path made and had to repair.
+        assert!(
+            AUTOSAVE_TAIL_WRITE > AUTOSAVE_TAIL_LOOKUP,
+            "the write must outrank the lookup: {AUTOSAVE_TAIL_WRITE:?} vs {AUTOSAVE_TAIL_LOOKUP:?}"
+        );
+    }
+
+    #[test]
+    fn a_failed_autosave_ref_write_NAMES_the_dangling_commit_so_it_is_recoverable() {
+        // The recoverable half of "never let the bookkeeping's failure destroy the work". A write can
+        // still fail for a real reason, and by then `commit-tree` HAS run — so a snapshot exists,
+        // reachable from nothing. The error used to discard the sha, which is what made that loss
+        // unrecoverable: the object sits in the odb until `git gc`, but nobody knows its hash.
+        let (_root, wt, _app_data) = repo_with_worktree("autosave-names-dangling");
+        std::fs::write(format!("{wt}/f.txt"), "v1").unwrap();
+        git(&wt, &["add", "f.txt"]).unwrap();
+        git(&wt, &["commit", "-m", "base"]).unwrap();
+        std::fs::write(format!("{wt}/f.txt"), "v2").unwrap();
+
+        // Force the ref write to fail for a REAL reason (not starvation): create a ref UNDERNEATH the
+        // name this autosave will write, making it a git directory/file conflict — `refs/…/blocked`
+        // cannot become a ref while `refs/…/blocked/child` is one. An empty directory does NOT work
+        // (measured: git prunes it and the write succeeds), which is why this plants a real ref.
+        let base = git(&wt, &["rev-parse", "HEAD"]).unwrap();
+        git(&wt, &["update-ref", "refs/sparkle-autosave/blocked/child", &base]).unwrap();
+
+        let err = match autosave_worktree_wip_at(&wt, "blocked") {
+            Err(e) => e,
+            Ok(o) => panic!("the ref write should have failed, got {o:?}"),
+        };
+
+        // THE ASSERTION: the message carries the sha AND the command that restores it. Asserting only
+        // "it errored" would pass against the old message, which is the defect.
+        let sha = err
+            .split_whitespace()
+            .find(|t| t.len() == 40 && t.chars().all(|c| c.is_ascii_hexdigit()))
+            .unwrap_or_else(|| panic!("the error must NAME the dangling commit, got: {err}"));
+        assert!(
+            err.contains("git update-ref"),
+            "and must give the command that recovers it, got: {err}"
+        );
+        assert_eq!(
+            git(&wt, &["cat-file", "-t", sha]).unwrap(),
+            "commit",
+            "the named sha must be a real commit object still in the odb — otherwise the message \
+             points at nothing"
+        );
+        assert_eq!(
+            git(&wt, &["show", &format!("{sha}:f.txt")]).unwrap(),
+            "v2",
+            "and it must hold the user's uncommitted work, which is the thing being recovered"
+        );
+    }
 
     #[test]
     fn autosave_snapshots_to_the_side_ref_without_touching_branch_or_working_tree() {
