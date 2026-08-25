@@ -214,10 +214,20 @@ export function aggregateScore(principles: readonly PrincipleAssessment[]): numb
 /**
  * The whole gate, in one pure function.
  *
- * FAILURE CONTRACT: a missing verdict is NOT a pass. Sparkle learned this on 2026-07-28,
- * when a fail-closed guess became the only verdict any agent got. If too few judges
- * answered, or the aggregate could not be computed, this BLOCKS and says so — it never
- * launders silence into approval.
+ * FAILURE CONTRACT — FAIL OPEN WHEN NO MODEL WAS REACHABLE (founder decision, 2026-08-25;
+ * beads `sparkle-4xvu29`, `sparkle-g6cc8q`). HumaneBench is real but half-built, and the
+ * founder's explicit instruction is that a gate which cannot reach its model must NOT become a
+ * repository-wide merge block: an exhausted API key, a non-2xx endpoint or a network fault is a
+ * billing/infra state, not a humaneness finding about the diff. So when too few judges answered
+ * (below quorum), or a quorum answered but produced nothing scoreable, this returns a NEUTRAL
+ * could-not-evaluate — `blocked: false`, no reasons — which the surfaces render as a
+ * non-blocking `neutral` check rather than a red one. It is NOT laundered into a pass: no verdict
+ * exists, and the PR comment / check summary say exactly that.
+ *
+ * This deliberately REVERSES the earlier fail-closed contract (2026-07-28), by the founder's
+ * decision above. What still blocks is a GENUINE verdict from a REACHABLE, scoring model: an
+ * aggregate below the bar, a single principle below the floor, a not-applicable dismissal that a
+ * deterministic detector refutes, or a blocking regulatory citation.
  */
 export function verdictBlocks(v: HumaneVerdict): BlockDecision {
   const reasons: string[] = [];
@@ -227,19 +237,20 @@ export function verdictBlocks(v: HumaneVerdict): BlockDecision {
   // that scores database migrations for humaneness gets switched off within a week.
   if (!v.scored) return { blocked: false, reasons: [] };
 
+  // NO MODEL REACHED — FAIL OPEN. Below quorum there is no judged verdict: every judge attempt
+  // errored, so nothing was actually scored. That is a could-not-evaluate, and by the founder
+  // decision above it must NOT block or red the pull request. Step aside as a neutral; a
+  // reachable model returning a real low score still blocks below.
   if (v.judgesAnswered < MIN_JUDGE_QUORUM) {
-    reasons.push(
-      `could not evaluate — ${v.judgesAnswered} of ${v.judgesAttempted} judges answered, ` +
-        `quorum is ${MIN_JUDGE_QUORUM}`,
-    );
+    return { blocked: false, reasons: [] };
   }
 
   const aggregate = v.humaneScore;
-  if (aggregate === null || !Number.isFinite(aggregate)) {
-    if (v.judgesAnswered >= MIN_JUDGE_QUORUM) {
-      reasons.push('could not evaluate — no principle produced a score');
-    }
-  } else if (aggregate < AGGREGATE_THRESHOLD) {
+  // A null aggregate WITH quorum means the reachable judges produced nothing scoreable — another
+  // could-not-evaluate, not a violation, so it no longer blocks on its own. The per-principle
+  // floor and the applicability cross-check below still fire on anything the judges or the
+  // deterministic detectors actually did find.
+  if (aggregate !== null && Number.isFinite(aggregate) && aggregate < AGGREGATE_THRESHOLD) {
     reasons.push(`HumaneScore ${aggregate.toFixed(2)} is below ${AGGREGATE_THRESHOLD}`);
   }
 

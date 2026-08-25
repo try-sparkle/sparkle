@@ -22,14 +22,17 @@
  * So the mapping is EXHAUSTIVE IN BOTH DIRECTIONS AND TESTED IN BOTH DIRECTIONS, and an
  * unrecognised code is neither dropped nor guessed — it is REPORTED. See `unmappedCodes`.
  *
- * ── FAILURE CONTRACT, INHERITED AND NON-NEGOTIABLE ─────────────────────────────────────
+ * ── FAILURE CONTRACT ───────────────────────────────────────────────────────────────────
  *
- * NO REACHABLE MODEL MEANS NO VERDICT, NEVER A PASS (`scripts/humanebench-check-run.sh`).
- * A judge that threw, timed out, or returned unparseable JSON is an ATTEMPT THAT DID NOT
- * ANSWER — it never contributes a score, and it never quietly lowers the denominator. Below
+ * A judge that threw, timed out, returned a non-2xx or unparseable JSON is an ATTEMPT THAT DID
+ * NOT ANSWER — it never contributes a score, and it never quietly lowers the denominator. Below
  * `MIN_JUDGE_QUORUM` answers this module still returns a verdict object, but with
- * `humaneScore: null`, which `verdictBlocks` reads as "could not evaluate" and BLOCKS on.
- * Nothing here may return a score that was not actually produced by an answering judge.
+ * `humaneScore: null`. This module is UNCHANGED by the fail-open decision: it faithfully reports
+ * how many judges answered and refuses to invent a score. What changed is downstream —
+ * `verdictBlocks` now reads a below-quorum `humaneScore: null` as a NEUTRAL could-not-evaluate
+ * that does NOT block (founder decision, 2026-08-25; `sparkle-4xvu29`, `sparkle-g6cc8q`), because
+ * an unreachable model is a billing/infra state, not a humaneness finding. It is still never a
+ * pass. Nothing here may return a score that was not actually produced by an answering judge.
  */
 
 import {

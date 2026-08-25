@@ -119,8 +119,9 @@ export interface TrendOptions {
  *   `scored: false`        — the change touched no human-affecting surface, so it was never
  *                            evaluated. Authoritative over any numbers the record carries.
  *   `humaneScore === null` — NO VERDICT EXISTS. Per `HumaneVerdict.humaneScore`, null means
- *                            too few judges answered, and `verdictBlocks` treats it as
- *                            blocking. Null is never a pass, and it is never a data point.
+ *                            too few judges answered (the model was unreachable); `verdictBlocks`
+ *                            now treats it as a non-blocking could-not-evaluate neutral. Null is
+ *                            never a pass, and it is never a data point either way.
  *
  * THE SECOND ONE IS WHY THIS FUNCTION IS NOT AN `if (!v.scored)` INLINE. A quorum-failed
  * verdict still carries whatever partial scores the one judge that answered produced. It is

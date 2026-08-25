@@ -67,12 +67,31 @@ describe('quorum — below it there is no verdict, and no verdict is not a pass'
     expect(verdict.principles.every((p) => p.score === null)).toBe(true);
   });
 
-  it('BLOCKS on a sub-quorum verdict rather than passing it', () => {
+  it('does NOT block a sub-quorum verdict — fail open, the model was unreachable', () => {
+    // Founder decision (sparkle-4xvu29, sparkle-g6cc8q): below quorum no model was reached, so
+    // there is no verdict to gate on. That is a neutral could-not-evaluate, not a merge block —
+    // an exhausted key or a non-2xx endpoint must not become a repository-wide block.
     const { verdict } = summarizeJudgements([answered('j1', allPrinciples(1)), silent('j2')], OPTS);
+    expect(verdict.judgesAnswered).toBe(1);
+    expect(verdict.humaneScore).toBeNull();
     const decision = verdictBlocks(verdict);
+    expect(decision.blocked).toBe(false);
+    expect(decision.reasons).toEqual([]);
+  });
 
+  it('STILL blocks once the model IS reachable and returns a low score — the paired positive', () => {
+    // The fail-open above is specific to UNREACHABILITY, not a blanket "never block". Cross the
+    // quorum with a genuine low score and the same gate blocks — otherwise a bug that simply
+    // never blocked would pass the fail-open test above for the wrong reason.
+    const { verdict } = summarizeJudgements(
+      [answered('j1', allPrinciples(-0.5)), answered('j2', allPrinciples(-0.5))],
+      OPTS,
+    );
+    expect(verdict.judgesAnswered).toBe(2);
+    expect(verdict.humaneScore).toBe(-0.5);
+    const decision = verdictBlocks(verdict);
     expect(decision.blocked).toBe(true);
-    expect(decision.reasons.join(' ')).toContain('could not evaluate');
+    expect(decision.reasons.join(' ')).toContain('below');
   });
 
   it('is NOT degraded below quorum — there is no number to caveat', () => {

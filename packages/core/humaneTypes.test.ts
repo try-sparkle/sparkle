@@ -152,11 +152,20 @@ describe('verdictBlocks — the per-principle floor', () => {
   });
 });
 
-describe('verdictBlocks — the failure contract', () => {
-  it('blocks when too few judges answered, rather than laundering silence into a pass', () => {
-    const d = verdictBlocks(verdict({ judgesAnswered: 1, judgesAttempted: 3 }));
-    expect(d.blocked).toBe(true);
-    expect(d.reasons.join(' ')).toMatch(/could not evaluate — 1 of 3 judges answered/);
+describe('verdictBlocks — the fail-open contract when no model was reachable', () => {
+  // Founder decision (2026-08-25, sparkle-4xvu29 / sparkle-g6cc8q): a gate that cannot reach its
+  // model must NOT become a repository-wide merge block. Below quorum there is no judged verdict,
+  // so this is a NEUTRAL could-not-evaluate — non-blocking — not a red check.
+  it('does NOT block when too few judges answered — it fails open, model unreachable', () => {
+    const d = verdictBlocks(verdict({ judgesAnswered: 1, judgesAttempted: 3, humaneScore: null }));
+    expect(d.blocked).toBe(false);
+    expect(d.reasons).toEqual([]);
+  });
+
+  it('does NOT block when ZERO judges answered — the exhausted-key / non-2xx case', () => {
+    const d = verdictBlocks(verdict({ judgesAnswered: 0, judgesAttempted: 3, humaneScore: null }));
+    expect(d.blocked).toBe(false);
+    expect(d.reasons).toEqual([]);
   });
 
   it(`scores on a quorum of ${MIN_JUDGE_QUORUM} and says it is degraded`, () => {
@@ -165,11 +174,25 @@ describe('verdictBlocks — the failure contract', () => {
     expect(v.degraded).toBe(true);
   });
 
-  it('blocks a null aggregate even when the ensemble answered', () => {
+  it('does NOT block a null aggregate at quorum with nothing else found — still a could-not-evaluate', () => {
+    // The reachable judges produced nothing scoreable, and no detector fired. That is another
+    // could-not-evaluate, not a violation: neutral, not a block.
     const principles = PRINCIPLE_IDS.map((id) => na(id));
-    const d = verdictBlocks(verdict({ principles, humaneScore: null }));
+    const d = verdictBlocks(verdict({ judgesAnswered: 3, principles, humaneScore: null, detectors: [] }));
+    expect(d.blocked).toBe(false);
+    expect(d.reasons).toEqual([]);
+  });
+
+  it('DOES block a null aggregate at quorum when a detector refutes an N/A dismissal — the paired positive', () => {
+    // With the model REACHABLE (quorum met), the deterministic detector still holds the judged
+    // layer to account: a principle dismissed as N/A that a detector found evidence for blocks.
+    // Without this pair, the neutral cases above could be satisfied by a gate that never blocks.
+    const principles = PRINCIPLE_IDS.map((id) => na(id));
+    const d = verdictBlocks(
+      verdict({ judgesAnswered: 3, principles, humaneScore: null, detectors: [A11Y_DETECTOR] }),
+    );
     expect(d.blocked).toBe(true);
-    expect(d.reasons.join(' ')).toMatch(/no principle produced a score/);
+    expect(d.reasons.join(' ')).toMatch(/marked not-applicable, but a detector found evidence/);
   });
 });
 
