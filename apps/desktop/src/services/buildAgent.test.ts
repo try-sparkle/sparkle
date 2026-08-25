@@ -392,6 +392,26 @@ describe("the preview protocol — an agent that is never TOLD about previews ne
     expect(brief).toMatch(/OPEN A LIVE PREVIEW/);
   });
 
+  it("warns that DISJOINT FILES does not mean independent — a unit can depend on a premise", () => {
+    // THE MEASURED FAILURE (bead sparkle-7r5qn). One bead split by directory across two apps gave
+    // two workers perfectly disjoint file sets. The client worker removed a gate the SERVER still
+    // enforced: nothing collided, both halves were correct in isolation, and the shipped result
+    // RELOCATED the dead end instead of removing it. Disjointness did not prevent the dependency,
+    // it HID it — a file-collision check cannot see a premise.
+    //
+    // Asserted on the ORCHESTRATION persona because it is the orchestrator that splits a bead and
+    // writes each worker's task string. Pinned rather than left to prose because the task text is
+    // FROZEN AT SPAWN: a constraint the orchestrator keeps in its own head reaches nobody, so the
+    // instruction to write it down is the only thing standing between a split bead and this bug.
+    const brief = orchestrationPersona(base);
+    expect(brief).toMatch(/DISJOINT FILES IS NOT THE ONLY AXIS/);
+    expect(brief).toContain("sparkle-7r5qn");
+    // The actionable half — naming the sibling and the order in the task text. Without this the
+    // rule states a hazard and gives no remedy, which is the shape that reads as advice and gets
+    // skipped.
+    expect(brief).toMatch(/SAY THE CONSTRAINT IN THE TASK TEXT/);
+  });
+
   it("tells the agent HOW, by tool name and the argument the MCP schema actually takes", () => {
     // An instruction an agent cannot act on is worse than none — and for a year this test asserted
     // the WRONG name, so it passed while every agent's FIRST preview call failed MCP -32602.
