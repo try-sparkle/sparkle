@@ -8,12 +8,17 @@ import {
   EmptyJurisdictionScopeError,
   evaluatePacks,
   judgedAnswerKey,
+  jurisdictionScopeProblem,
   loadPacks,
   packInScope,
   parseIsoDate,
   parsePack,
   pendingJudgedQuestions,
+  scopeUsable,
+  type LoadResult,
   type Pack,
+  type PacksInScope,
+  type UnusableScope,
 } from './humanePacks';
 import {
   aggregateScore,
@@ -79,7 +84,26 @@ function only<T>(items: readonly T[]): T {
   return items[0] as T;
 }
 
+/** The arm of a `LoadResult` that has packs; fails loudly naming the refusal otherwise. */
+function mustLoad(result: LoadResult): PacksInScope {
+  if (!scopeUsable(result)) {
+    throw new Error(`expected packs in scope, got ${result.scope.reason}: ${result.scope.message}`);
+  }
+  return result;
+}
+
+/** The scope of a `LoadResult` that MUST have refused; fails loudly if it loaded anything. */
+function mustRefuse(result: LoadResult): UnusableScope {
+  if (scopeUsable(result)) {
+    throw new Error(
+      `expected a scope refusal, but the load put [${result.scope.matched.join(', ')}] in scope`,
+    );
+  }
+  return result.scope;
+}
+
 const IN_SCOPE = ['EU'];
+const NOW = new Date('2026-08-22T00:00:00Z');
 const FIRED = { firedDetectorIds: ['consent-withdrawal-asymmetry'], jurisdictions: IN_SCOPE };
 
 describe('parsePack — a pack is remote-authored, untrusted data', () => {
@@ -254,7 +278,7 @@ describe('a detector-backed check must name a detector that actually exists', ()
   it('loadPacks drops the pack and reports it, rather than loading a silent hole', () => {
     const raw = rawPack();
     firstCheck(raw)['detect'] = { kind: 'detector', detectorId: 'no-such-detector' };
-    const { packs, errors } = loadPacks([raw]);
+    const { packs, errors } = mustLoad(loadPacks([raw]));
     expect(packs).toEqual([]);
     expect(only(errors)).toContain('no-such-detector');
   });
@@ -558,11 +582,18 @@ describe('an EMPTY jurisdictions list is a caller error, never a clean pass', ()
     expect(() => pendingJudgedQuestions([pack], [])).toThrow(EmptyJurisdictionScopeError);
   });
 
-  it('refuses in loadPacks too, rather than pre-filtering every pack away', () => {
-    expect(loadPacks([rawPack()]).packs).toHaveLength(1);
-    expect(() => loadPacks([rawPack()], { jurisdictions: [] })).toThrow(
-      EmptyJurisdictionScopeError,
-    );
+  // loadPacks is the one entry point with an error CHANNEL, and its own doc comment always
+  // said bad input "is REPORTED AND SKIPPED rather than failing the batch". It threw anyway.
+  // A caller written against the documented contract got an unhandled throw; this pins the
+  // contract the comment describes.
+  it('REPORTS in loadPacks rather than throwing, because loadPacks has somewhere to report', () => {
+    expect(mustLoad(loadPacks([rawPack()])).packs).toHaveLength(1);
+
+    const result = loadPacks([rawPack()], { jurisdictions: [] });
+    const scope = mustRefuse(result);
+    expect(scope.reason).toBe('empty-scope');
+    expect(scope.jurisdictions).toEqual([]);
+    expect(result.errors.join('\n')).toContain('names no jurisdiction');
   });
 
   it('refuses in packInScope, so no path into the filter can bypass it', () => {
@@ -580,8 +611,8 @@ describe('an EMPTY jurisdictions list is a caller error, never a clean pass', ()
     );
     expect(pendingJudgedQuestions([], undefined)).toEqual([]);
     expect(() => pendingJudgedQuestions([], [])).toThrow(EmptyJurisdictionScopeError);
-    expect(loadPacks([]).packs).toEqual([]);
-    expect(() => loadPacks([], { jurisdictions: [] })).toThrow(EmptyJurisdictionScopeError);
+    expect(mustLoad(loadPacks([])).packs).toEqual([]);
+    expect(mustRefuse(loadPacks([], { jurisdictions: [] })).reason).toBe('empty-scope');
   });
 
   // Same silence, one step earlier: a config path that produced blank entries.
@@ -608,7 +639,7 @@ describe('loadPacks', () => {
     delete bad['reviewRequired'];
     const good = rawPack();
 
-    const { packs, errors } = loadPacks([bad, good]);
+    const { packs, errors } = mustLoad(loadPacks([bad, good]));
     expect(packs.map((p) => p.pack)).toEqual(['test-pack']);
     expect(only(errors)).toContain('broken-pack.reviewRequired');
     expect(only(errors)).toContain('pack[0]');
@@ -617,12 +648,12 @@ describe('loadPacks', () => {
   it('labels errors with the caller-supplied name', () => {
     const bad = rawPack();
     delete bad['reviewRequired'];
-    const { errors } = loadPacks([bad], { label: (i) => `eu-gdpr.json#${i}` });
+    const { errors } = mustLoad(loadPacks([bad], { label: (i) => `eu-gdpr.json#${i}` }));
     expect(only(errors)).toContain('eu-gdpr.json#0');
   });
 
   it('rejects a second pack claiming an id already loaded', () => {
-    const { packs, errors } = loadPacks([rawPack(), rawPack()]);
+    const { packs, errors } = mustLoad(loadPacks([rawPack(), rawPack()]));
     expect(packs).toHaveLength(1);
     expect(only(errors)).toContain('duplicate pack id "test-pack"');
   });
@@ -633,13 +664,129 @@ describe('loadPacks', () => {
     other['pack'] = 'us-ccpa';
     other['jurisdiction'] = ['US-CA'];
 
-    expect(loadPacks([rawPack(), other]).packs.map((p) => p.pack)).toEqual([
+    expect(mustLoad(loadPacks([rawPack(), other])).packs.map((p) => p.pack)).toEqual([
       'test-pack',
       'us-ccpa',
     ]);
     expect(
-      loadPacks([rawPack(), other], { jurisdictions: ['US-CA'] }).packs.map((p) => p.pack),
+      mustLoad(loadPacks([rawPack(), other], { jurisdictions: ['US-CA'] })).packs.map((p) => p.pack),
     ).toEqual(['us-ccpa']);
+  });
+
+  it('reports the packs it actually looked at, so "we looked" is a readable fact', () => {
+    const other = rawPack();
+    other['pack'] = 'us-ccpa';
+    other['jurisdiction'] = ['US-CA'];
+
+    const wide = mustLoad(loadPacks([rawPack(), other]));
+    expect(wide.scope.matched).toEqual(['test-pack', 'us-ccpa']);
+    expect(wide.scope.jurisdictions).toBeUndefined();
+
+    const narrow = mustLoad(loadPacks([rawPack(), other], { jurisdictions: ['US-CA'] }));
+    expect(narrow.scope.matched).toEqual(['us-ccpa']);
+    expect(narrow.scope.jurisdictions).toEqual(['US-CA']);
+  });
+});
+
+// THE GAP THE EMPTY-LIST GUARD LEFT WIDE OPEN, and the one that matters more.
+//
+// The old guard fired only when the jurisdiction list named NOTHING. A list naming something
+// perfectly real that no shipped pack covers — ['US'] against a bundle of eu-gdpr, eu-ai-act
+// and eu-accessibility-act — filtered every pack away, emitted zero citations, and came back
+// { packs: [], errors: [] }: byte-identical to "every check passed". A compliance gate that
+// reports a clean pass because it looked at nothing is worse than no gate at all, and that is
+// precisely the state the empty-list guard was added to close.
+describe('a jurisdiction scope matching NO pack is the same silence, and is refused too', () => {
+  it('refuses ["US"] against EU-only packs, where the old guard saw nothing wrong', () => {
+    const scope = mustRefuse(loadPacks([rawPack()], { jurisdictions: ['US'] }));
+    expect(scope.reason).toBe('no-matching-pack');
+    expect(scope.jurisdictions).toEqual(['US']);
+  });
+
+  it('names the jurisdictions given AND the packs available, because both are the fix', () => {
+    const result = loadPacks([rawPack()], { jurisdictions: ['US'] });
+    const scope = mustRefuse(result);
+    // The message has to answer "what did I ask for" and "what could I have asked for".
+    expect(scope.message).toContain('"US"');
+    expect(scope.message).toContain('test-pack');
+    expect(scope.message).toContain('EU');
+    expect(scope.message).toMatch(/omit/i);
+    expect(scope.message).toMatch(/at least one/i);
+    // It goes down the DOCUMENTED channel, not just onto the scope object.
+    expect(result.errors).toContain(scope.message);
+    expect(scope.available).toEqual([{ pack: 'test-pack', jurisdiction: ['EU', 'EEA'] }]);
+  });
+
+  it('says "nothing was checked" in words, since the number alone reads as a pass', () => {
+    const scope = mustRefuse(loadPacks([rawPack()], { jurisdictions: ['US'] }));
+    expect(scope.message).toMatch(/nothing was checked/i);
+    expect(scope.message).toMatch(/looked at NOTHING/);
+  });
+
+  // "I looked and found nothing" vs "I could not look" — the whole distinction, side by side
+  // on the SAME two packs. Both used to produce an empty pack list and no error.
+  it('is DISTINGUISHABLE from a scope that matched and simply cited nothing', () => {
+    const looked = mustLoad(loadPacks([rawPack()], { jurisdictions: ['EU'] }));
+    expect(looked.scope.usable).toBe(true);
+    expect(looked.scope.matched).toEqual(['test-pack']);
+    expect(looked.errors).toEqual([]);
+    // It looked, and evaluating found nothing to cite. That is a real, earned clean pass.
+    expect(evaluatePacks(looked.packs, { jurisdictions: ['EU'] }, NOW)).toEqual([]);
+
+    const blind = mustRefuse(loadPacks([rawPack()], { jurisdictions: ['US'] }));
+    expect(blind.usable).toBe(false);
+  });
+
+  // THE TYPE IS THE GUARD. `result.packs` does not compile on an un-narrowed LoadResult, so a
+  // caller cannot reach an empty pack list without having read scope.usable first. This pins
+  // the runtime half of that: the field is genuinely ABSENT, not an empty array wearing a flag.
+  it('offers no packs field at all to read, so there is no empty list to mistake for a pass', () => {
+    const result: LoadResult = loadPacks([rawPack()], { jurisdictions: ['US'] });
+    expect(scopeUsable(result)).toBe(false);
+    expect('packs' in result).toBe(false);
+  });
+
+  it('reports a malformed pack alongside the refusal — two things are wrong, not one', () => {
+    const bad = rawPack();
+    bad['pack'] = 'broken-pack';
+    delete bad['reviewRequired'];
+
+    const result = loadPacks([bad, rawPack()], { jurisdictions: ['US'] });
+    expect(mustRefuse(result).reason).toBe('no-matching-pack');
+    expect(result.errors.join('\n')).toContain('broken-pack.reviewRequired');
+    expect(result.errors.length).toBe(2);
+    // The pack that failed to parse is not offered as something to have named.
+    expect(mustRefuse(result).available.map((a) => a.pack)).toEqual(['test-pack']);
+  });
+
+  // Zero packs supplied is the emptiest look of all, and a declared scope cannot match it.
+  it('refuses a real jurisdiction when no pack was loaded at all', () => {
+    const scope = mustRefuse(loadPacks([], { jurisdictions: ['EU'] }));
+    expect(scope.reason).toBe('no-matching-pack');
+    expect(scope.message).toContain('no pack was loaded at all');
+  });
+
+  // PAIRED with the refusals: matching is still trimmed and case-insensitive, and one usable
+  // entry beside a blank is enough. A guard that refused these would be worse than the gap.
+  it('accepts a scope that matches on case, whitespace, or one entry out of several', () => {
+    expect(mustLoad(loadPacks([rawPack()], { jurisdictions: ['  eu  '] })).scope.matched).toEqual([
+      'test-pack',
+    ]);
+    expect(mustLoad(loadPacks([rawPack()], { jurisdictions: ['US', 'EEA'] })).scope.matched).toEqual(
+      ['test-pack'],
+    );
+  });
+
+  it('jurisdictionScopeProblem is the one place both refusals are decided', () => {
+    const pack = mustParse(rawPack());
+    expect(jurisdictionScopeProblem(undefined, [pack], 'here')).toBeNull();
+    expect(jurisdictionScopeProblem(['EU'], [pack], 'here')).toBeNull();
+    expect(jurisdictionScopeProblem([], [pack], 'here')?.reason).toBe('empty-scope');
+    expect(jurisdictionScopeProblem(['  ', ''], [pack], 'here')?.reason).toBe('empty-scope');
+    expect(jurisdictionScopeProblem(['US'], [pack], 'here')?.reason).toBe('no-matching-pack');
+    expect(jurisdictionScopeProblem(['US'], [pack], 'evaluatePacks')?.message).toContain(
+      'evaluatePacks',
+    );
   });
 });
 
@@ -838,7 +985,7 @@ function allJudgedYes(all: readonly Pack[]): Record<string, boolean> {
 }
 
 describe('the bundled starter packs', () => {
-  const { packs, errors } = loadBundledPacks();
+  const { packs, errors } = mustLoad(loadBundledPacks());
   const now = new Date('2026-08-22T00:00:00Z');
   const byId = new Map(packs.map((p) => [p.pack, p]));
 
@@ -1041,6 +1188,49 @@ describe('the bundled starter packs', () => {
 
   it('emits nothing when no detector fired and no question was answered yes', () => {
     expect(evaluatePacks(packs, { jurisdictions: ['EU'] }, now)).toEqual([]);
+  });
+
+  // Reads the pack documents OFF DISK, for the same reason the detector guard does: asking the
+  // LOADER which jurisdictions it loaded is tautological — it can only ever report what it just
+  // filtered on. The shipped FILES are the fact under test, and they are what a pack author
+  // edits. Ship a US pack tomorrow and this test tells you so, loudly, instead of a fixture
+  // quietly ceasing to be a fixture.
+  it('ships no pack covering "US", which is what makes the refusal below a real one', () => {
+    const declared = new Set<string>();
+    for (const file of bundledPackFiles()) {
+      const raw = JSON.parse(readFileSync(file, 'utf8')) as { jurisdiction: string[] };
+      for (const j of raw.jurisdiction) declared.add(j.trim().toLowerCase());
+    }
+    expect(declared.size).toBeGreaterThan(0);
+    expect([...declared].sort()).toEqual(['eea', 'eu']);
+    expect(declared.has('us')).toBe(false);
+  });
+
+  // THE FAILURE THE GATE EXISTS TO PREVENT, against the packs that actually ship. A US project
+  // pointing the gate at this bundle used to get zero citations and no error — "no citations
+  // because everything is fine" is what that looks like, and it was "no citations because
+  // nothing was ever read".
+  it('refuses a US scope against the EU-only bundle instead of reporting a clean pass', () => {
+    const result = loadBundledPacks({ jurisdictions: ['US'] });
+    const scope = mustRefuse(result);
+    expect(scope.reason).toBe('no-matching-pack');
+    for (const id of ['eu-gdpr', 'eu-ai-act', 'eu-accessibility-act']) {
+      expect(scope.message, `the message must name ${id} as an available pack`).toContain(id);
+    }
+    expect(result.errors).toContain(scope.message);
+  });
+
+  // PAIRED: the same bundle, a scope it does cover. "I looked at three packs and cited nothing"
+  // is a clean pass that was earned, and it has to stay readable as one.
+  it('loads all three and says so when the scope does match', () => {
+    const loaded = mustLoad(loadBundledPacks({ jurisdictions: ['EEA'] }));
+    expect([...loaded.scope.matched].sort()).toEqual([
+      'eu-accessibility-act',
+      'eu-ai-act',
+      'eu-gdpr',
+    ]);
+    expect(loaded.errors).toEqual([]);
+    expect(evaluatePacks(loaded.packs, { jurisdictions: ['EEA'] }, now)).toEqual([]);
   });
 
   it('never emits the word "compliant" from shipped pack text, in either direction', () => {

@@ -89,7 +89,7 @@ export const TOOL_META = {
   },
   humanebench: {
     name: "HumaneBench",
-    desc: "Scores pull requests that change what Sparkle says or does to a person against HumaneBench's 8 humane-technology principles. Still being built — no review runs yet, so this records your preference rather than gating anything today.",
+    desc: "Scores every pull request that changes what Sparkle says or does to a person against HumaneBench's 8 humane-technology principles, and posts the per-principle reasoning onto the PR. A score below 0.5 fails the HumaneBench check; that check holds a merge once an admin adds it to the branch ruleset.",
     keywords: "humane humanebench ethics principles review gate wellbeing",
   },
   roborev: {

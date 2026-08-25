@@ -141,10 +141,12 @@ export interface ToolsConfig {
   github: boolean;
   guardrails: boolean;
   /** Score a pull request that changes what Sparkle says or does to a person against
-   *  HumaneBench's 8 humane-technology principles, and block a below-the-bar merge until a human
-   *  overrides it. Defaults ON. Optional so callers guard: a Rust backend predating the key omits
-   *  it, and the hydrate resolves an absent value through `?? true` — the same back-compat rule
-   *  the `builder_index`/`straude` pair uses, in the opposite direction. */
+   *  HumaneBench's 8 humane-technology principles, post the per-principle reasoning onto the PR,
+   *  and publish a failing `HumaneBench` check run below 0.5. That check holds a merge only once
+   *  an admin adds it to the branch ruleset's required contexts. Defaults ON. Optional so callers
+   *  guard: a Rust backend predating the key omits it, and the hydrate resolves an absent value
+   *  through `?? true` — the same back-compat rule the `builder_index`/`straude` pair uses, in
+   *  the opposite direction. */
   humanebench?: boolean;
   roborev: boolean;
   /** Back your `.env*` files up to a 1Password vault. The one tool here that defaults OFF — it

@@ -265,15 +265,17 @@ pub struct ToolsConfig {
     /// "done". On (default) appends the guardrails workflow to every coding agent's system prompt;
     /// off omits it. Adaptive — strict where a test setup exists, a nudge where one doesn't.
     pub guardrails: bool,
-    /// The HumaneBench reviewer's preference. TODAY THIS FLAG RECORDS A CHOICE AND NOTHING ELSE —
-    /// nothing in the repo reads it, because the reviewer that would consume it is still being
-    /// built. Do not describe it, here or in user-facing copy, as gating anything.
+    /// The HumaneBench reviewer. ON, a pull request changing what Sparkle says or does to a
+    /// person is scored against HumaneBench's 8 humane-technology principles by
+    /// `.github/workflows/humane-gate.yml`, the per-principle reasoning is posted onto the PR by
+    /// `scripts/humanebench-pr-comment.sh`, and a score below 0.5 publishes a FAILING
+    /// `HumaneBench` check run. Off skips the review entirely.
     ///
-    /// PLANNED, once the consumer lands: a pull request changing what Sparkle says or does to a
-    /// person is scored against HumaneBench's 8 humane-technology principles, and a score below
-    /// the bar holds the merge until a human overrides it; off skips the review. Whoever lands
-    /// that consumer MUST read this through the EFFECTIVE config, so the machine-wide scope below
-    /// holds at the point of use and not merely at the point of storage.
+    /// WHAT THIS FLAG DOES NOT DO, stated precisely because the difference is the whole gate:
+    /// a failing check run does not by itself hold a merge. `HumaneBench` is deliberately NOT in
+    /// ruleset 18343818's required contexts yet — bead `sparkle-4eqjil` requires it to run green
+    /// on real pull requests twice before an admin adds it. Until then this scores and reports
+    /// but does not block, and no copy anywhere may say otherwise.
     ///
     /// Machine-wide like every key in this table, and here that scope is load-bearing rather than
     /// incidental: a cloned repo must not be able to switch off its own humaneness gate simply by
@@ -5616,8 +5618,9 @@ github     = true   # import a project from your GitHub repositories; off hides 
 guardrails = true   # opinionated quality workflow (test-first, run tests+typecheck before commit,
                     # never call a red build "done") appended to every coding agent; off omits it
 humanebench = true  # score pull requests that change what Sparkle says or does to a person against
-                    # HumaneBench's 8 humane-technology principles. STILL BEING BUILT: no review runs
-                    # yet, so this records your preference. Off will skip the review entirely.
+                    # HumaneBench's 8 humane-technology principles, and post the reasoning on the PR.
+                    # Below 0.5 fails the HumaneBench check; that check holds a merge once an admin
+                    # adds it to the branch ruleset. Off skips the review entirely.
 roborev    = true   # per-commit AI code review of your BUILD-agent commits (uses your claude login)
 # One of the two default-OFF tools, and the only one that publishes anything about you. On, Sparkle
 # posts your DAILY TOKEN TOTALS (per day, per model — never file paths, prompts, code, or keys) to the

@@ -17,7 +17,7 @@ import { readdirSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { loadPacks, type LoadOptions, type LoadResult } from '../humanePacks';
+import { loadPacks, scopeUsable, type LoadOptions, type LoadResult } from '../humanePacks';
 
 export const BUNDLED_PACK_DIR = dirname(fileURLToPath(import.meta.url));
 
@@ -32,6 +32,11 @@ export function bundledPackFiles(): string[] {
 /**
  * Parses each bundled pack. A file that is not valid JSON is reported as an error rather
  * than thrown, so one broken document cannot take the whole gate down.
+ *
+ * The scope verdict is PASSED THROUGH untouched. This wrapper only adds read errors; it is
+ * not entitled to decide that a jurisdiction scope which put no pack in scope is fine, and
+ * flattening the two arms back into one `{ packs, errors }` here would hand every caller of
+ * the bundled loader exactly the empty pack list `loadPacks` refuses to hand out.
  */
 export function loadBundledPacks(opts: LoadOptions = {}): LoadResult {
   const files = bundledPackFiles();
@@ -52,5 +57,8 @@ export function loadBundledPacks(opts: LoadOptions = {}): LoadResult {
     ...opts,
     label: opts.label ?? ((i) => kept[i] ?? `pack[${i}]`),
   });
-  return { packs: result.packs, errors: [...readErrors, ...result.errors] };
+  const errors = [...readErrors, ...result.errors];
+  return scopeUsable(result)
+    ? { scope: result.scope, packs: result.packs, errors }
+    : { scope: result.scope, errors };
 }

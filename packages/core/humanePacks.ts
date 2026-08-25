@@ -95,18 +95,79 @@ export type ParseResult = { ok: true; pack: Pack } | { ok: false; errors: string
 export interface LoadOptions {
   /**
    * Jurisdictions the project declares it operates in. When given, packs that overlap none
-   * of them are dropped. Matching is trimmed and case-insensitive. OMIT for no filtering —
-   * an empty (or all-blank) list throws `EmptyJurisdictionScopeError` rather than quietly
-   * dropping every pack.
+   * of them are dropped. Matching is trimmed and case-insensitive. OMIT for no filtering.
+   *
+   * Two shapes are REFUSED rather than quietly applied, and both are reported through
+   * `LoadResult.errors` with `scope.usable: false` — see `jurisdictionScopeProblem`:
+   * a list that names NOTHING, and a list that names something NO loaded pack covers.
    */
   jurisdictions?: readonly string[];
   /** Labels each raw in error messages, e.g. a filename. Defaults to `pack[i]`. */
   label?: (index: number) => string;
 }
 
-export interface LoadResult {
+/** Why a jurisdiction filter left the regulatory axis with nothing to look at. */
+export type ScopeRefusal =
+  /** `jurisdictions` was given but names no jurisdiction — `[]`, or all-blank entries. */
+  | 'empty-scope'
+  /** `jurisdictions` names something real that no loaded pack covers. */
+  | 'no-matching-pack';
+
+/** One loaded pack reduced to the two fields a scope message has to be able to name. */
+export interface PackScope {
+  pack: string;
+  jurisdiction: readonly string[];
+}
+
+/** The filter applied, and left at least one pack to look at. */
+export interface LoadedScope {
+  usable: true;
+  /** What the caller declared, or `undefined` when no filter was applied. */
+  jurisdictions?: readonly string[];
+  /** Ids of the packs that survived the filter — the packs that were actually LOOKED AT. */
+  matched: readonly string[];
+}
+
+/** The filter left nothing to look at, so no pack list is offered at all. */
+export interface UnusableScope {
+  usable: false;
+  reason: ScopeRefusal;
+  /** Exactly what the caller declared, blanks and all. */
+  jurisdictions: readonly string[];
+  /** Every pack that parsed, whatever its jurisdiction — what the caller could have named. */
+  available: readonly PackScope[];
+  /** The actionable sentence. Also present in `errors`. */
+  message: string;
+}
+
+/** A load that put at least one pack in scope. */
+export interface PacksInScope {
+  scope: LoadedScope;
   packs: Pack[];
   errors: string[];
+}
+
+/**
+ * A load that put NO pack in scope — and therefore carries NO `packs` field at all.
+ *
+ * The absence is load-bearing, not tidiness. `result.packs` on an un-narrowed `LoadResult`
+ * does not compile, so a caller cannot reach an empty pack list without first having read
+ * `scope.usable` and decided what "we never looked" means for its gate. "Zero citations
+ * because we looked and found nothing" and "zero citations because we never looked" are the
+ * two outcomes this whole axis exists to keep apart, and a `packs: []` that BOTH shapes
+ * share is exactly how they got confused: a gate that reports a clean pass because it looked
+ * at nothing is worse than no gate at all.
+ */
+export interface NoPacksInScope {
+  scope: UnusableScope;
+  errors: string[];
+}
+
+export type LoadResult = PacksInScope | NoPacksInScope;
+
+/** Narrows a `LoadResult` onto the arm that actually has packs. */
+export function scopeUsable(result: LoadResult): result is PacksInScope {
+  return result.scope.usable;
 }
 
 /** A judged check's answer. The object form lets a judge attach a one-line rationale. */
@@ -125,6 +186,13 @@ export interface PackInput {
    * Jurisdictions the project operates in. Authoritative filter — a pack for a
    * jurisdiction not selected emits nothing. OMIT to disable filtering; an empty (or
    * all-blank) list throws `EmptyJurisdictionScopeError` rather than reading as a pass.
+   *
+   * WHAT THIS DOES NOT CATCH, because the return type has nowhere to report it: a
+   * NON-EMPTY list that no supplied pack covers (`['US']` against EU-only packs) filters
+   * every pack away and returns `[]`, indistinguishable from "no check fired". A caller
+   * that loads UNFILTERED and scopes here must ask `jurisdictionScopeProblem` before
+   * treating an empty citation list as a pass. A caller that scopes at LOAD time gets this
+   * for free — `loadPacks` refuses both shapes through `LoadResult.errors`.
    */
   jurisdictions?: readonly string[];
 }
@@ -204,6 +272,94 @@ function normalizeJurisdiction(value: string): string {
   return value.trim().toLowerCase();
 }
 
+/** True when the list names at least one usable (non-blank) jurisdiction. */
+function namesAnyJurisdiction(jurisdictions: readonly string[]): boolean {
+  return jurisdictions.some((j) => normalizeJurisdiction(j).length > 0);
+}
+
+function declaredSet(jurisdictions: readonly string[]): ReadonlySet<string> {
+  return new Set(jurisdictions.map(normalizeJurisdiction));
+}
+
+/** The matching half of the filter, with no assertion in it, so a REPORTING caller can reuse it. */
+function packMatches(pack: Pack, declared: ReadonlySet<string>): boolean {
+  return pack.jurisdiction.some((j) => declared.has(normalizeJurisdiction(j)));
+}
+
+function packScope(pack: Pack): PackScope {
+  return { pack: pack.pack, jurisdiction: pack.jurisdiction };
+}
+
+/** Names what the caller could have declared a jurisdiction for. */
+function describeAvailable(available: readonly PackScope[]): string {
+  if (available.length === 0) return 'no pack was loaded at all';
+  return available.map((p) => `${p.pack} [${p.jurisdiction.join(', ')}]`).join('; ');
+}
+
+function emptyScopeMessage(
+  jurisdictions: readonly string[],
+  where: string,
+  available: readonly PackScope[] | undefined,
+): string {
+  return (
+    `${where}: jurisdictions was given but names no jurisdiction ` +
+    `(${JSON.stringify(jurisdictions)}), which would silently disable the entire ` +
+    `regulatory axis — every pack falls out of scope, nothing is cited, and the run reads ` +
+    `as a clean pass it never earned. ` +
+    (available === undefined ? '' : `Packs available: ${describeAvailable(available)}. `) +
+    `OMIT jurisdictions entirely to apply every pack, or name at least one jurisdiction.`
+  );
+}
+
+function noMatchingPackMessage(
+  jurisdictions: readonly string[],
+  where: string,
+  available: readonly PackScope[],
+): string {
+  return (
+    `${where}: jurisdictions ${JSON.stringify(jurisdictions)} match none of the packs ` +
+    `loaded, so the entire regulatory axis looked at NOTHING — no citation can be emitted, ` +
+    `and "no citations" here means "nothing was checked", not "everything is fine". ` +
+    `Packs available: ${describeAvailable(available)}. ` +
+    `Ship a pack covering ${JSON.stringify(jurisdictions)}, name at least one jurisdiction a ` +
+    `loaded pack already covers, or OMIT jurisdictions entirely to apply every pack.`
+  );
+}
+
+/**
+ * The problem a jurisdiction filter has against a set of packs, or `null` when the filter is
+ * usable. The one place both refusals are decided.
+ *
+ * THE TWO REFUSALS ARE ONE FAILURE WEARING TWO FACES, AND ONLY ONE WAS EVER GUARDED. `[]`
+ * names nothing. `['US']` against a bundle shipping only `eu-gdpr`, `eu-ai-act` and
+ * `eu-accessibility-act` names something perfectly real that nothing covers. Either way every
+ * pack falls out of scope, zero citations are emitted, and the result is byte-identical to
+ * "every check passed" — so the second shape walked straight through a guard built for the
+ * first. A compliance gate that reports a clean pass because it looked at nothing is worse
+ * than no gate at all, which is the whole reason this axis exists.
+ *
+ * Exported because `evaluatePacks` filters again and is authoritative for a caller that
+ * loaded UNFILTERED and scopes at evaluation time: that caller holds no `LoadResult` to read,
+ * and must ask this before treating an empty citation list as a pass.
+ */
+export function jurisdictionScopeProblem(
+  jurisdictions: readonly string[] | undefined,
+  packs: readonly Pack[],
+  where: string,
+): { reason: ScopeRefusal; message: string } | null {
+  if (jurisdictions === undefined) return null;
+  const available = packs.map(packScope);
+  if (!namesAnyJurisdiction(jurisdictions)) {
+    return { reason: 'empty-scope', message: emptyScopeMessage(jurisdictions, where, available) };
+  }
+  const declared = declaredSet(jurisdictions);
+  if (packs.some((p) => packMatches(p, declared))) return null;
+  return {
+    reason: 'no-matching-pack',
+    message: noMatchingPackMessage(jurisdictions, where, available),
+  };
+}
+
 /**
  * Thrown when a caller declares a jurisdiction list that names nothing.
  *
@@ -211,8 +367,15 @@ function normalizeJurisdiction(value: string): string {
  * adjacent states at OPPOSITE extremes, one keystroke apart. Read as a filter, `[]` drops
  * every pack, emits no citation, and the run goes green with no error and no warning:
  * indistinguishable from "no check fired". That is silence laundered into approval, which
- * is the failure this whole axis exists to prevent, so it is raised rather than returned —
- * a value a caller can ignore is how it read as a pass in the first place.
+ * is the failure this whole axis exists to prevent.
+ *
+ * STILL THROWN, AND STILL EXPORTED, BY THE THREE ENTRY POINTS THAT HAVE NO ERROR CHANNEL.
+ * `packInScope`, `pendingJudgedQuestions` and `evaluatePacks` each return a bare value with
+ * nowhere to put a report, so for them a throw is the only way the caller cannot ignore it.
+ * `loadPacks` is the one that DOES have a channel — `LoadResult.errors`, which its own doc
+ * comment promised all along — so it reports there instead, and reaches the second, wider
+ * refusal (`no-matching-pack`) that a throw at this seam could never see, because this
+ * function is handed a jurisdiction list and never the packs to compare it against.
  */
 export class EmptyJurisdictionScopeError extends Error {
   constructor(message: string) {
@@ -226,21 +389,17 @@ export class EmptyJurisdictionScopeError extends Error {
  * entries is the same silence one step earlier — a config path that parsed nothing, or a
  * `.filter()` that removed everything — so it is refused on the same terms.
  *
- * A caller that means "every pack applies" omits `jurisdictions` entirely.
+ * A caller that means "every pack applies" omits `jurisdictions` entirely. This sees only
+ * the list, never the packs, so it cannot answer the `no-matching-pack` half — that needs
+ * `jurisdictionScopeProblem`.
  */
 export function assertJurisdictionScope(
   jurisdictions: readonly string[] | undefined,
   where: string,
 ): void {
   if (jurisdictions === undefined) return;
-  if (jurisdictions.some((j) => normalizeJurisdiction(j).length > 0)) return;
-  throw new EmptyJurisdictionScopeError(
-    `${where}: jurisdictions was given but names no jurisdiction ` +
-      `(${JSON.stringify(jurisdictions)}), which would silently disable the entire ` +
-      `regulatory axis — every pack falls out of scope, nothing is cited, and the run reads ` +
-      `as a clean pass it never earned. OMIT jurisdictions entirely to apply every pack, or ` +
-      `name at least one jurisdiction.`,
-  );
+  if (namesAnyJurisdiction(jurisdictions)) return;
+  throw new EmptyJurisdictionScopeError(emptyScopeMessage(jurisdictions, where, undefined));
 }
 
 /**
@@ -252,8 +411,7 @@ export function assertJurisdictionScope(
 export function packInScope(pack: Pack, jurisdictions: readonly string[] | undefined): boolean {
   assertJurisdictionScope(jurisdictions, 'packInScope');
   if (jurisdictions === undefined) return true;
-  const declared = new Set(jurisdictions.map(normalizeJurisdiction));
-  return pack.jurisdiction.some((j) => declared.has(normalizeJurisdiction(j)));
+  return packMatches(pack, declaredSet(jurisdictions));
 }
 
 /**
@@ -475,13 +633,23 @@ export function parsePack(raw: unknown): ParseResult {
  * Parses many raw pack documents. A malformed pack is REPORTED AND SKIPPED rather than
  * failing the batch — one bad document must not silence the packs that are fine.
  *
+ * A JURISDICTION SCOPE THAT LEAVES NOTHING TO LOOK AT GOES DOWN THAT SAME CHANNEL. It used
+ * to throw, which contradicted this very comment two lines up: the loud-but-recoverable
+ * channel existed and was bypassed, so a caller written against the documented contract got
+ * an unhandled throw instead. It now reports — but through a return type that will not let
+ * the report be skipped. `errors` carries the sentence, `scope.usable` is `false`, and the
+ * refusing arm has no `packs` field to read, so the reason "we never looked" cannot be
+ * mistaken for "nothing fired". See `NoPacksInScope` and `jurisdictionScopeProblem`.
+ *
+ * Documents are parsed BEFORE the scope is judged, so a refused scope still reports every
+ * malformed pack it found. Two things are wrong with the run, and it says so.
+ *
  * The `jurisdictions` option is a pre-filter for callers that already know the project's
  * scope. `evaluatePacks` filters again and is authoritative; this only avoids carrying
  * packs that can never emit.
  */
 export function loadPacks(raws: readonly unknown[], opts: LoadOptions = {}): LoadResult {
-  assertJurisdictionScope(opts.jurisdictions, 'loadPacks(opts.jurisdictions)');
-  const packs: Pack[] = [];
+  const parsed: Pack[] = [];
   const errors: string[] = [];
   const label = opts.label ?? ((i: number) => `pack[${i}]`);
   const seen = new Map<string, number>();
@@ -501,11 +669,41 @@ export function loadPacks(raws: readonly unknown[], opts: LoadOptions = {}): Loa
       return;
     }
     seen.set(result.pack.pack, i);
-    if (!packInScope(result.pack, opts.jurisdictions)) return;
-    packs.push(result.pack);
+    parsed.push(result.pack);
   });
 
-  return { packs, errors };
+  const problem = jurisdictionScopeProblem(
+    opts.jurisdictions,
+    parsed,
+    'loadPacks(opts.jurisdictions)',
+  );
+  if (problem !== null) {
+    return {
+      scope: {
+        usable: false,
+        reason: problem.reason,
+        jurisdictions: [...(opts.jurisdictions ?? [])],
+        available: parsed.map(packScope),
+        message: problem.message,
+      },
+      // First, because it is the headline: whatever else this batch says, nothing was read.
+      errors: [problem.message, ...errors],
+    };
+  }
+
+  const declared = opts.jurisdictions === undefined ? undefined : declaredSet(opts.jurisdictions);
+  const packs =
+    declared === undefined ? parsed : parsed.filter((pack) => packMatches(pack, declared));
+
+  return {
+    scope: {
+      usable: true,
+      jurisdictions: opts.jurisdictions,
+      matched: packs.map((pack) => pack.pack),
+    },
+    packs,
+    errors,
+  };
 }
 
 function judgedFired(answer: JudgedAnswer | undefined): boolean {
@@ -561,7 +759,9 @@ export function pendingJudgedQuestions(
  *      emit 'blocking'; it downgrades to 'advisory' and says how many days remain. That is
  *      how "regulations that are coming" works.
  *   2. Jurisdiction filtering. A pack for a jurisdiction the project did not declare emits
- *      nothing at all.
+ *      nothing at all — which is why a caller scoping HERE rather than at load time must ask
+ *      `jurisdictionScopeProblem` first: a jurisdiction list no supplied pack covers filters
+ *      everything away and returns `[]`, and `[]` is what a clean pass looks like too.
  *   3. `reviewRequired` is always the literal `true`, and the guidance always asks for
  *      counsel rather than concluding.
  *

@@ -359,24 +359,35 @@ describe("ToolsPane", () => {
     expect(setToolEnabled).toHaveBeenCalledWith("guardrails", false);
   });
 
-  it("HumaneBench copy does not claim to gate a merge while nothing reads the flag", () => {
-    // A safety switch that says it is protecting you while doing nothing is worse than no switch:
-    // a user reads an on-by-default row, concludes their PRs are being scored and gated, and stops
-    // looking. Nothing reads `tools.humanebench` yet — the reviewer is still being built — so the
-    // row must not promise gating.
+  it("HumaneBench copy states what the gate now does, and does not overclaim that it blocks", () => {
+    // THE RATCHET, INVERTED — and inverted rather than deleted on purpose.
     //
-    // DELETE THIS TEST when the consumer lands, and in the SAME change restore the gating language
-    // to TOOL_META.humanebench.desc. Until then this is the ratchet that stops the claim quietly
-    // coming back: the copy was written with it once already and roborev caught it.
+    // Its previous job was to stop the copy promising protection while nothing read the flag.
+    // The consumer has landed (.github/workflows/humane-gate.yml runs scope -> render -> judge
+    // on every pull request), so that under-claim is now the false one: a user reading "still
+    // being built" concludes their PRs are NOT being scored, and they are.
+    //
+    // But the OPPOSITE over-claim is still available and still wrong. A failing `HumaneBench`
+    // check does not hold a merge until an admin adds it to ruleset 18343818's required
+    // contexts, which bead sparkle-4eqjil deliberately orders LAST — after two green runs on
+    // real pull requests. So the copy must claim the scoring (true today) and must qualify the
+    // blocking (not true today). A switch that overstates its protection is the exact failure
+    // this test was written for; only the direction of the lie has changed.
     const desc = TOOL_META.humanebench.desc;
-    // The alternation must cover the phrasing THIS REPO uses for the planned behaviour, not just
-    // the phrasing the copy happened to use when it was over-claiming. config.rs and settingsStore
-    // both say "holds the merge until a human overrides it" — `holds? back` does not match that,
-    // so the original ratchet would have waved through the exact sentence most likely to be pasted.
-    expect(desc).not.toMatch(
-      /blocks? the merge|holds? (?:back|the merge)|gates? the merge|until a human overrides/i,
-    );
-    expect(desc).toMatch(/still being built|not.{0,12}yet/i);
+
+    // The stale under-claim must not come back.
+    expect(desc).not.toMatch(/still being built|no review runs yet|records your preference/i);
+
+    // The true claim must be present: it scores, and it posts the reasoning.
+    expect(desc).toMatch(/scores/i);
+    expect(desc).toMatch(/posts|reasoning/i);
+
+    // Any claim about holding a merge must carry the condition that makes it true.
+    if (/blocks? the merge|holds? (?:back|a merge|the merge)|gates? the merge/i.test(desc)) {
+      expect(desc).toMatch(/once an admin|ruleset|required check/i);
+    }
+    // And it must never assert the unconditional present tense.
+    expect(desc).not.toMatch(/always blocks|blocks every|holds every merge/i);
   });
 
   it("toggles HumaneBench through the [tools].humanebench flag (never AI-locked)", () => {
