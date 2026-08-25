@@ -23,14 +23,13 @@
 // reason: `AgentPill` carries the live status dot, tracks a rename, and is already wired to open the
 // agent. Anything that merely LOOKED like a pill would be a dead label in a new costume, which is
 // precisely the bug that made the founder work out routing by hand.
-import { useState, type CSSProperties } from "react";
+import { useLayoutEffect, useRef, useState, type CSSProperties } from "react";
 import { FiChevronDown, FiChevronRight } from "react-icons/fi";
 import { C } from "../../theme/colors";
 import { TYPE } from "../../theme/scale";
 import { AgentPill } from "./AgentPill";
 import { CopyAnswerButton } from "./CopyAnswerButton";
 import {
-  PEER_CLAMP_SAFE_CHARS_PER_LINE,
   PEER_GIST_FALLBACK_LINES,
   type ConciergePeerMessage,
   type PeerParty,
@@ -73,47 +72,84 @@ const EXPANDED_STYLE: CSSProperties = {
 };
 
 /**
- * Is there anything behind the clamp?
+ * Is there anything behind the clamp? ASK THE LAYOUT ENGINE — DO NOT MODEL IT.
  *
- * TWO QUESTIONS, AND THE SECOND ONE IS WHY THIS IS NOT A STRING COMPARE (roborev 68628).
+ * THIS IS THE FOURTH ANSWER TO ONE QUESTION, and the first three were all wrong in the SAME
+ * direction — the one that hides text from the reader with no way to reach it. The history is the
+ * argument for the shape, so it is recorded rather than summarised:
  *
- * The first is easy: if the gist and the message are DIFFERENT text, expanding certainly shows
- * something new. Trimmed, because a derived gist is built from the message's own opening lines and
- * can differ from it by nothing but trailing whitespace.
+ *   1. `text !== gist` (roborev 68628). A one-line message with no gist derives a gist equal to
+ *      itself, so the compare said "nothing hidden" while the clamp ate everything past line two.
+ *   2. An AGGREGATE character budget (roborev 68649). A hard newline costs a whole rendered line
+ *      however short the other line is, so 64 + 7 characters cleared an 80-character total while
+ *      line one alone wrapped past the clamp.
+ *   3. `ceil(len / PER_LINE)` per source line (roborev 68701). Characters do not pack into lines —
+ *      CSS breaks at WORD boundaries, so the count is a LOWER bound on rendered lines, not the
+ *      upper bound its "deliberately pessimistic" comment claimed. `taking <44-char path> and its
+ *      test` is 63 characters, computes 2, and wraps to 3.
  *
- * The second is the one a string compare answered wrongly, and it shipped as a High. The clamp hides
- * by RENDERED LINES; the compare reasons about STRINGS, and for the commonest shape in the whole
- * feature the two disagree completely. A message that is ONE long line — which is what every agent
- * that has not been updated to send a `gist` produces, up to `PEER_MESSAGE_MAX_CHARS` of 2000 —
- * derives a gist equal to itself. The strings match, so the old code concluded there was nothing
- * behind the clamp and drew no control, while `-webkit-line-clamp: 2` silently ate everything past
- * the second visual line. The reader got a sentence cut off mid-word with no way to read the rest:
- * worse than the invisibility this feature replaces, because it looks like the whole message.
+ * The pattern is not three bugs, it is one: **whether the clamp hid something is a LAYOUT fact**,
+ * and every attempt to predict it from the string was optimistic somewhere. Each round's tests
+ * missed the next shape because they were built from the same model as the code — round 3's cases
+ * are all `"a".repeat(n)`, the single input for which character packing and word wrap coincide.
  *
- * So when the two strings match, fall through to the only thing that IS knowable without layout —
- * whether the text is short enough that two lines could not have hidden any of it. See
- * `PEER_CLAMP_SAFE_CHARS` for why that bound leans the way it does.
+ * So this asks the element. `scrollHeight > clientHeight` is the browser's own answer, after its own
+ * wrapping, at the reader's actual column width, zoom and font — the facts no constant can carry.
+ *
+ * AND IT FAILS SAFE WHERE THERE IS NO ANSWER. jsdom performs no layout and reports 0 for both
+ * (docs/jsdom-test-caveats.md), and a real element has not been measured on the first paint either.
+ * `null` means NOT MEASURED, and it is deliberately NOT the same as "it fits": only a positive,
+ * affirmative measurement can retire the control. Anything else keeps it, because showing a control
+ * that reveals nothing is a shrug and hiding a message is the bug this feature exists to remove.
  */
-export function peerRowExpandable(m: ConciergePeerMessage): boolean {
-  if (m.text.trim() !== m.gist.trim()) return true;
-  return !fitsClamp(m.gist);
+function useClampFits(gist: string, open: boolean) {
+  const bodyRef = useRef<HTMLDivElement | null>(null);
+  // `null` = no answer yet (or no layout engine). `true` ONLY on an affirmative measurement.
+  const [fits, setFits] = useState<boolean | null>(null);
+  useLayoutEffect(() => {
+    const el = bodyRef.current;
+    // While expanded there is no clamp to measure, and the answer for the collapsed state is the
+    // one already held — re-measuring here would record the expanded body as "fitting".
+    if (!el || open) return;
+    const measure = () => {
+      // A real layout engine gives a positive scrollHeight. Zero means nothing laid out, which must
+      // never read as "it fits" — that is the whole safety property.
+      if (el.scrollHeight <= 0) {
+        setFits(null);
+        return;
+      }
+      // The +1 absorbs sub-pixel rounding, which reports a 1px overflow on a body that visibly fits.
+      setFits(el.scrollHeight <= el.clientHeight + 1);
+    };
+    measure();
+    // RE-MEASURE ON RESIZE, because the answer is only true of the width it was taken at. The
+    // concierge column is user-resizable, so a measurement from a wide column goes STALE the moment
+    // the reader drags it narrower — and stale in the familiar direction: the text starts being
+    // clamped while the control that would reveal it has already been retired. Same bug as the three
+    // character heuristics, arriving through time rather than through arithmetic.
+    //
+    // GUARDED, because `ResizeObserver` does not exist in every environment this renders in and a
+    // bare `new` would throw during render setup. Its absence is not a fallback to anything: the
+    // initial measurement above still stands, and `null` still fails safe.
+    if (typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [gist, open]);
+  return { bodyRef, fits };
 }
 
 /**
- * Could two clamped lines have hidden part of this? `false` means they certainly could.
+ * Does this row need an expand control?
  *
- * COUNTS RENDERED LINES, NOT CHARACTERS (roborev 68649). An aggregate character budget was
- * optimistic for the multi-line case and shipped the same unreachable-text bug one round later: a
- * message of 64 + 7 characters clears an 80-character total, yet its first line alone wraps to two
- * visual lines and pushes the second out of the clamp. Each source line costs
- * `ceil(len / PER_LINE)` rendered lines — so a single 45-character line correctly costs 2 and still
- * FITS, while 64 + 7 correctly costs 3 and does not.
+ * TWO INDEPENDENT REASONS, either sufficient. The gist and the message being DIFFERENT text means
+ * expanding certainly shows something new, whatever the layout did — that is knowable from the
+ * strings and needs no measurement. Otherwise it comes down to the clamp, where only an affirmative
+ * "it fits" retires the control.
  */
-function fitsClamp(text: string): boolean {
-  const rendered = text
-    .split("\n")
-    .reduce((n, line) => n + Math.max(1, Math.ceil([...line].length / PEER_CLAMP_SAFE_CHARS_PER_LINE)), 0);
-  return rendered <= PEER_GIST_FALLBACK_LINES;
+export function peerRowExpandable(m: ConciergePeerMessage, fits: boolean | null): boolean {
+  if (m.text.trim() !== m.gist.trim()) return true;
+  return fits !== true;
 }
 
 export const PEER_APP_PARTY_TESTID = "concierge-peer-app-party";
@@ -153,7 +189,8 @@ function PartyLabel({ party }: { party: PeerParty }) {
 
 export function PeerMessageRow({ message }: { message: ConciergePeerMessage }) {
   const [expanded, setExpanded] = useState(false);
-  const canExpand = peerRowExpandable(message);
+  const { bodyRef, fits } = useClampFits(message.gist, expanded);
+  const canExpand = peerRowExpandable(message, fits);
   // A row with nothing behind the clamp is never "expanded", whatever the state says — the flag can
   // only have been set while the control existed, and the control cannot exist here.
   const open = expanded && canExpand;
@@ -199,6 +236,7 @@ export function PeerMessageRow({ message }: { message: ConciergePeerMessage }) {
       </div>
 
       <div
+        ref={bodyRef}
         data-testid={PEER_BODY_TESTID}
         style={open ? EXPANDED_STYLE : PEER_CLAMP_STYLE}
       >

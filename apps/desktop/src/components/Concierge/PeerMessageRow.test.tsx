@@ -16,10 +16,7 @@ import {
   PEER_APP_PARTY_TESTID,
 } from "./PeerMessageRow";
 import { ConciergeMessageRow } from "./ConciergeMessageRow";
-import {
-  peerMessageEntry,
-  PEER_CLAMP_SAFE_CHARS_PER_LINE,
-} from "../../services/peerMessageLog";
+import { peerMessageEntry } from "../../services/peerMessageLog";
 import type { MentionAgent } from "./mentions";
 import type { RevealOutcome } from "../../services/agentReveal";
 
@@ -30,7 +27,63 @@ beforeEach(() => {
   Object.assign(navigator, { clipboard: { writeText } });
 });
 
-afterEach(() => cleanup());
+/**
+ * Stand in for a layout engine. jsdom performs no layout and reports 0 for both heights, which the
+ * row reads as NOT MEASURED — so these are what let the measurement path be driven at all, in both
+ * directions. Without them only the fail-safe branch would ever be exercised, and "it fits, so no
+ * control" would be covered by nothing.
+ */
+function stubLayout(scrollHeight: number, clientHeight: number): void {
+  for (const [prop, value] of [
+    ["scrollHeight", scrollHeight],
+    ["clientHeight", clientHeight],
+  ] as const) {
+    Object.defineProperty(HTMLElement.prototype, prop, {
+      configurable: true,
+      get: () => value,
+    });
+  }
+}
+
+function clearLayoutStub(): void {
+  for (const prop of ["scrollHeight", "clientHeight"]) {
+    Object.defineProperty(HTMLElement.prototype, prop, { configurable: true, get: () => 0 });
+  }
+}
+
+/**
+ * A fake `ResizeObserver` that hands the callback back, so the RE-MEASURE path can be driven.
+ *
+ * jsdom never lays out and therefore never fires a real one (docs/jsdom-test-caveats.md), so without
+ * this the resize branch would be covered by nothing — and "the observer exists" is not the claim
+ * that matters. What matters is that firing it re-reads the heights and brings the control back.
+ */
+let resizeCallbacks: Array<() => void> = [];
+
+function stubResizeObserver(): void {
+  (globalThis as unknown as { ResizeObserver: unknown }).ResizeObserver = class {
+    constructor(cb: () => void) {
+      resizeCallbacks.push(cb);
+    }
+    observe() {}
+    disconnect() {}
+  };
+}
+
+/** Narrow the column: change what the element measures, then fire the observer. */
+function resizeTo(scrollHeight: number, clientHeight: number): void {
+  stubLayout(scrollHeight, clientHeight);
+  act(() => {
+    for (const cb of resizeCallbacks) cb();
+  });
+}
+
+afterEach(() => {
+  cleanup();
+  clearLayoutStub();
+  resizeCallbacks = [];
+  delete (globalThis as unknown as { ResizeObserver?: unknown }).ResizeObserver;
+});
 
 function agent(over: Partial<MentionAgent> & { id: string; name: string }): MentionAgent {
   return { projectId: "p1", projectName: "web", band: "running", canAcceptInput: true, ...over };
@@ -113,9 +166,15 @@ describe("PeerMessageRow — expanding in place", () => {
     );
   });
 
-  it("renders no expand control when the gist IS the whole message", () => {
+  it("renders no expand control when the gist IS the whole message AND it measurably fits", () => {
     // Nothing to reveal. A control that opens a row onto the text already on screen is a promise
     // the row cannot keep, and the reader learns to stop trusting the affordance.
+    //
+    // THE MEASUREMENT IS NOW PART OF THE CLAIM, and that is the correction roborev 68701 forced.
+    // This case used to assert the same absence with no layout at all, which quietly encoded "if the
+    // strings match, nothing is hidden" — the assumption that shipped unreachable text three times.
+    // Identical strings are necessary but NOT sufficient; the clamp must also be measured to fit.
+    stubLayout(36, 36);
     mount(entry({ gist: "", message: "one short line" }));
     expect(screen.queryByTestId(PEER_EXPAND_TESTID)).toBeNull();
   });
@@ -131,62 +190,95 @@ describe("PeerMessageRow — expanding in place", () => {
   });
 });
 
-describe("PeerMessageRow — a long single line is still reachable (roborev 68628)", () => {
-  // THE SHIPPED HIGH. Expandability was a STRING compare while the clamp hides by RENDERED LINES,
-  // and for the commonest shape in the feature the two disagree: a one-line message with no gist
-  // derives a gist equal to itself, so the compare said "nothing behind the clamp" and drew no
-  // control while `-webkit-line-clamp: 2` ate everything past the second visual line. Every agent
-  // that has not been updated to send a gist produces exactly this, up to 2000 characters.
-  const ONE_LONG_LINE = "x".repeat(PEER_CLAMP_SAFE_CHARS_PER_LINE * 4);
+describe("PeerMessageRow — text is never clamped out of reach (roborev 68628 / 68649 / 68701)", () => {
+  // ONE BUG, FOUR ROUNDS. Every string-based prediction of "did the clamp hide something" was
+  // optimistic in the direction that hides text: the string compare, the aggregate character budget,
+  // and ceil(len/width). The question is a LAYOUT fact, so the row measures instead — and these pin
+  // both halves of that: the fail-safe when nothing can be measured, and the measurement itself.
 
-  it("offers the control for a long single line sent with NO gist", () => {
-    mount(entry({ gist: "", message: ONE_LONG_LINE }));
+  it("offers the control when nothing can be measured, whatever the text looks like", () => {
+    // THE SAFETY PROPERTY. With no layout engine the row cannot know, and "cannot know" must never
+    // resolve to "it fits" — that resolution is what shipped three times.
+    mount(entry({ gist: "", message: "ok" }));
     expect(screen.getByTestId(PEER_EXPAND_TESTID)).toBeTruthy();
   });
 
-  it("and expanding it drops the clamp, so the hidden tail is actually reachable", () => {
-    // The control existing is not the fix — reaching the text is. Asserts the body stops carrying
-    // the clamp, which is the thing that was hiding it.
-    mount(entry({ gist: "", message: ONE_LONG_LINE }));
+  it("offers it for the word-wrap shape a character budget got wrong (roborev 68701)", () => {
+    // The literal message the peer-messaging contract prescribes. 63 characters on ONE source line:
+    // `ceil(63/40)` is 2 and "fits", but greedy wrap puts `taking`, the path, and `and its test` on
+    // three rendered lines. No arithmetic on the string sees that; the layout engine does.
+    const real = "taking apps/desktop/src/services/controlListener.ts and its test";
+    expect([...real].length).toBeLessThan(80);
+    mount(entry({ gist: "", message: real }));
+    expect(screen.getByTestId(PEER_EXPAND_TESTID)).toBeTruthy();
+  });
+
+  it("offers it when the clamp IS measurably hiding text", () => {
+    stubLayout(90, 36);
+    mount(entry({ gist: "", message: "a message the clamp is cutting off" }));
+    expect(screen.getByTestId(PEER_EXPAND_TESTID)).toBeTruthy();
+  });
+
+  it("retires the control ONLY on an affirmative measurement that it fits", () => {
+    // The nicety the first three rounds were reaching for, now earned rather than guessed: when the
+    // browser says the body is not overflowing, there is genuinely nothing to reveal.
+    stubLayout(36, 36);
+    mount(entry({ gist: "", message: "short" }));
+    expect(screen.queryByTestId(PEER_EXPAND_TESTID)).toBeNull();
+  });
+
+  it("keeps the control when the gist and message differ, even if the clamp fits", () => {
+    // The other, measurement-free reason: a sender-written gist is DIFFERENT CONTENT, so expanding
+    // shows something new no matter what the layout did.
+    stubLayout(36, 36);
+    mount(entry({ gist: "taking the parser", message: LONG }));
+    expect(screen.getByTestId(PEER_EXPAND_TESTID)).toBeTruthy();
+  });
+
+  it("and expanding drops the clamp, so the hidden tail is actually reachable", () => {
+    const real = "taking apps/desktop/src/services/controlListener.ts and its test";
+    mount(entry({ gist: "", message: real }));
     fireEvent.click(screen.getByTestId(PEER_EXPAND_TESTID));
     const body = screen.getByTestId(PEER_BODY_TESTID);
     expect(body.style.getPropertyValue("-webkit-line-clamp")).toBe("");
-    expect(body.textContent).toBe(ONE_LONG_LINE);
+    expect(body.textContent).toBe(real);
   });
+});
 
-  it("offers it for TWO long lines too — line count alone was never the question", () => {
-    const two = `${"a".repeat(PEER_CLAMP_SAFE_CHARS_PER_LINE * 2)}\n${"b".repeat(
-      PEER_CLAMP_SAFE_CHARS_PER_LINE * 2,
-    )}`;
-    mount(entry({ gist: "", message: two }));
+describe("PeerMessageRow — the measurement follows the column's width", () => {
+  // THE VERCEL FINDING ON #2602. A measurement is only true of the WIDTH it was taken at, and the
+  // concierge column is user-resizable — so a `fits` recorded in a wide column goes stale the moment
+  // the reader drags it narrower, retiring the control exactly as the text starts being clamped.
+  // The same failure as the three character heuristics, arriving through time rather than arithmetic.
+
+  it("brings the control back when the column narrows enough to clamp the text", () => {
+    stubResizeObserver();
+    stubLayout(36, 36); // wide: it fits, so no control
+    mount(entry({ gist: "", message: "taking the parser and its test" }));
+    expect(screen.queryByTestId(PEER_EXPAND_TESTID)).toBeNull();
+
+    resizeTo(90, 36); // narrowed: now clamped
+
     expect(screen.getByTestId(PEER_EXPAND_TESTID)).toBeTruthy();
   });
 
-  it("offers it when ONE source line wraps and pushes a short second line out (roborev 68649)", () => {
-    // THE SECOND ROUND'S BUG, and the shape an AGGREGATE character budget got wrong: this message
-    // is short in TOTAL — comfortably under two lines' worth of characters — but its first line
-    // alone wraps to two rendered lines, so the clamp eats the second line entirely. Budgeting the
-    // whole string passed it; budgeting per rendered line catches it.
-    const wraps = `${"a".repeat(PEER_CLAMP_SAFE_CHARS_PER_LINE + 24)}\nthanks`;
-    expect([...wraps].length).toBeLessThan(PEER_CLAMP_SAFE_CHARS_PER_LINE * 2);
-    mount(entry({ gist: "", message: wraps }));
+  it("retires it again when the column widens back out", () => {
+    // Both directions, so the observer is re-reading the heights rather than latching one answer.
+    stubResizeObserver();
+    stubLayout(90, 36);
+    mount(entry({ gist: "", message: "taking the parser and its test" }));
     expect(screen.getByTestId(PEER_EXPAND_TESTID)).toBeTruthy();
-  });
 
-  it("does NOT offer it for a single line that wraps to exactly two — that still fits", () => {
-    // The accounting is `ceil(len / perLine)` rather than "any line over the width", so a single
-    // 1.5-line message correctly costs two rendered lines and needs no control. Without this, the
-    // repair would over-correct into a control on almost every row, which is how the affordance
-    // stops meaning anything.
-    mount(entry({ gist: "", message: "a".repeat(PEER_CLAMP_SAFE_CHARS_PER_LINE + 5) }));
+    resizeTo(36, 36);
+
     expect(screen.queryByTestId(PEER_EXPAND_TESTID)).toBeNull();
   });
 
-  it("still draws NO control for a genuinely short message", () => {
-    // The other direction still holds: a message two lines could not have clamped gets no control,
-    // so the affordance keeps meaning something.
-    mount(entry({ gist: "", message: "one short line" }));
-    expect(screen.queryByTestId(PEER_EXPAND_TESTID)).toBeNull();
+  it("still renders where ResizeObserver does not exist, keeping the fail-safe", () => {
+    // Its absence must not throw during render setup, and must not resolve to "it fits".
+    expect((globalThis as { ResizeObserver?: unknown }).ResizeObserver).toBeUndefined();
+    mount(entry({ gist: "", message: "ok" }));
+    expect(screen.getByTestId(PEER_EXPAND_TESTID)).toBeTruthy();
   });
 });
 
