@@ -25,7 +25,7 @@
 // defined per-theme (theme/colors), and `theme/chromeContrast.test` already sweeps it over both the
 // concierge plane and the lifted one for AA. A new ink would have to earn all of that again.
 import type { CSSProperties } from "react";
-import { FiCornerUpRight } from "react-icons/fi";
+import { FiClock, FiCornerUpRight } from "react-icons/fi";
 
 import { NOTICE_SENDER_LABEL, type NoticeSender } from "./noticeRecipient";
 import { C } from "../../theme/colors";
@@ -33,6 +33,12 @@ import { TYPE } from "../../theme/scale";
 
 export const NOTICE_ROW_TESTID = "concierge-notice";
 export const NOTICE_ATTRIBUTION_TESTID = "concierge-notice-attribution";
+export const NOTICE_AUTHORSHIP_TESTID = "concierge-notice-authorship";
+// "Sparkle reminder", NOT a bare "Sparkle". `ConciergeThread.roleLabels.test` bans any LEAF node
+// whose ENTIRE text is a speaker name (`/^(sparkle|you)[\s:·—-]*$/i`), which a lone "Sparkle" span
+// would match — the same reason the sibling headers are "Sparkle → Concierge" and "Sparkle noticed"
+// rather than "Sparkle". The trailing word both keeps it out of that rule and names the channel.
+export const NOTICE_AUTHORSHIP_LABEL = "Sparkle reminder";
 
 /**
  * THE GREY, APPLIED TO A WHOLE MESSAGE SUBTREE.
@@ -124,6 +130,52 @@ export function NoticeAttribution({
     >
       <FiCornerUpRight size={11} aria-hidden />
       <span>{NOTICE_SENDER_LABEL[sender]}</span>
+    </div>
+  );
+}
+
+/**
+ * THE AUTHORSHIP MARK on an APP-AUTHORED line addressed to the FOUNDER — today the promise-ledger
+ * nudge (bead sparkle-hxypas).
+ *
+ * ══ WHY THIS IS NOT `NoticeAttribution` ═════════════════════════════════════════════════════════
+ * `NoticeAttribution` answers "who is this addressed to" for a line the founder is reading over the
+ * concierge's shoulder — it names a ROUTE ("Sparkle → Concierge") and comes with the grey ink of
+ * `NOTICE_INK_VARS`. This is the other axis: the line IS addressed to the founder and stays at full
+ * weight (he must act on it), and the only thing being said is that the APP wrote it, not the
+ * concierge. So it names a SENDER alone ("Sparkle") and touches no ink. `./noticeRecipient`'s
+ * header comment argues exactly this split — emphasis (recipient) and authorship (sender) are two
+ * dimensions, and greying a nudge to distinguish it would de-emphasise the one class of app line he
+ * has to act on.
+ *
+ * ══ IT IS COMPATIBLE WITH THE NO-CAPTIONS RULE ══════════════════════════════════════════════════
+ * `ConciergeThread.roleLabels.test` bans the all-caps shipped form (`SPARKLE`, `YOU`) and any LEAF
+ * node whose ENTIRE text is a speaker's name (`/^(sparkle|you)[\s:·—-]*$/i`). {@link
+ * NOTICE_AUTHORSHIP_LABEL} is "Sparkle reminder" precisely so it is NOT that name-only leaf — a
+ * mixed-case authorship mark carried beside a decorative glyph in a muted header, the same
+ * position, size and `conciergeMuted` colour as the shipped "Sparkle noticed" push header one arm
+ * up in ConciergeMessageRow, which passes that suite today.
+ *
+ * A CLOCK, NOT A BELL. The bell is the proactive PUSH's glyph ("Sparkle noticed" — the brain
+ * speaking unprompted). A promise nudge is the app noting that time passed and an owed thing did
+ * not happen, so it carries a clock — a different glyph keeps the two app-voice lines from reading
+ * as the same channel.
+ */
+export function NoticeAuthorship() {
+  return (
+    <div
+      data-testid={NOTICE_AUTHORSHIP_TESTID}
+      style={{
+        display: "flex",
+        alignItems: "center",
+        gap: 5,
+        fontSize: TYPE.small,
+        color: C.conciergeMuted,
+        marginBottom: 3,
+      }}
+    >
+      <FiClock size={11} aria-hidden />
+      <span>{NOTICE_AUTHORSHIP_LABEL}</span>
     </div>
   );
 }

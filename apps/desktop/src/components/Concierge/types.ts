@@ -376,6 +376,28 @@ export interface ConciergeSparkleMessage {
   /** Set when this line is an action receipt — see {@link ConciergeReceiptMark}. Absent on every
    *  other app-authored line and on every brain reply, which is what keeps those out of a fold. */
   actionReceipt?: ConciergeReceiptMark;
+  /**
+   * Set when this line is an APP-AUTHORED notice addressed to the FOUNDER — today the promise-ledger
+   * nudge ("You said you'd … — and that hasn't happened.") posted by `ConciergeHost.postSparkle`
+   * (bead sparkle-hxypas).
+   *
+   * WHY IT EXISTS. A `postSparkle` promise nudge is an ordinary `kind: "sparkle"` message with no
+   * mark — `actionReceipt` is only stamped on concierge-ADDRESSED lines, and this line is addressed
+   * to the founder — so at the render site it is indistinguishable from a brain reply and reads as
+   * the concierge talking to him. The founder reported exactly that: these lines "look like messages
+   * from the concierge to me when they're not." This flag carries the AUTHORSHIP so the row can draw
+   * a muted "Sparkle" mark above the sentence, the way a proactive push carries `proactive`.
+   *
+   * ORTHOGONAL TO `actionReceipt`/`./noticeRecipient`, ON PURPOSE. Those split by RECIPIENT and
+   * decide grey-vs-full-weight; this is the AUTHORSHIP axis and changes nothing about the ink. A
+   * promise nudge stays at full weight — the founder must act on it — while still being visibly
+   * not-the-concierge. The two never co-occur: a concierge-addressed line carries `actionReceipt`
+   * and this does not.
+   *
+   * `undefined` on an ordinary line, matching every other optional field here — this thread is
+   * persisted, and rebuilds in `conciergeThreadStore` are spreads, so the flag survives for free.
+   */
+  appNotice?: true;
   /** True when the brain authored this WITHOUT a user message behind it — the proactive push
    *  channel (services/conciergeProactive). An ordinary reply leaves it unset. */
   proactive?: boolean;

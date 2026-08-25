@@ -36,7 +36,7 @@ import { BeadAutoExpandProvider, BeadPill } from "./BeadPill";
 import { bandColor } from "../../engine/statusBandLabels";
 import { CopyAnswerButton } from "./CopyAnswerButton";
 import { MessageStatusLive, type ConciergeMessageStatusText } from "./MessageStatus";
-import { NoticeAttribution, NOTICE_INK_VARS, NOTICE_ROW_TESTID } from "./NoticeAttribution";
+import { NoticeAttribution, NoticeAuthorship, NOTICE_INK_VARS, NOTICE_ROW_TESTID } from "./NoticeAttribution";
 import { isConciergeAddressed } from "./noticeRecipient";
 import { NudgeCard } from "./NudgeCard";
 import { RecapCard } from "./RecapCard";
@@ -951,6 +951,12 @@ export const ConciergeMessageRow = memo(function ConciergeMessageRow({
           is correct once the line above it has established that the app is addressing the
           concierge. Without the header that sentence is simply wrong from where he is sitting. */}
       {conciergeAddressed && <NoticeAttribution />}
+      {/* AUTHORSHIP, for an app-authored line addressed to the FOUNDER (a promise-ledger nudge) —
+          it stays full-weight (he must act on it), and this only says the APP wrote it, not the
+          concierge, so it does not read as concierge prose (bead sparkle-hxypas). Mutually
+          exclusive with the header above: a concierge-addressed line carries `actionReceipt`, this
+          does not, so the two conditions never both hold. */}
+      {!conciergeAddressed && m.appNotice && <NoticeAuthorship />}
       {/* WHAT THIS REPLY IS ANSWERING, above its own words — the iMessage idiom, and the reason this
           component exists (see ./replyAnchors). One quoted stub per message it covers, in the order
           they were sent, so a single reply to a burst of five is legible as five answers rather than

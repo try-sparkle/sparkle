@@ -2736,7 +2736,11 @@ export function ConciergeHost({
           toolCalls: toLintToolCalls(toolCalls),
           at: Date.now(),
         })) {
-          postSparkle(line`You said you'd ${plain(promiseVerbPhrase(p.family))} — ${plain(oneLine(p.sentence))} — and that hasn't happened.`);
+          // `appNotice` so the row draws a muted "Sparkle" authorship mark: this nudge is the APP's
+          // bookkeeping about a promise the CONCIERGE made, and without the mark the founder reads it
+          // as the concierge talking to him (bead sparkle-hxypas). It stays full-weight — he must act
+          // on it — the mark only makes the authorship legible.
+          postSparkle(line`You said you'd ${plain(promiseVerbPhrase(p.family))} — ${plain(oneLine(p.sentence))} — and that hasn't happened.`, undefined, undefined, { appNotice: true });
         }
       } catch (err) {
         console.warn("concierge: promise ledger failed; the reply is unaffected", err);
@@ -3277,7 +3281,11 @@ export function ConciergeHost({
         })) {
           // Quotes the sentence back, which is what makes it checkable rather than abstract —
           // "You said you'd …" is the founder's own complaint, answered in his terms.
-          postSparkle(line`You said you'd ${plain(promiseVerbPhrase(p.family))} — ${plain(oneLine(p.sentence))} — and that hasn't happened.`);
+          // `appNotice` so the row draws a muted "Sparkle" authorship mark: this nudge is the APP's
+          // bookkeeping about a promise the CONCIERGE made, and without the mark the founder reads it
+          // as the concierge talking to him (bead sparkle-hxypas). It stays full-weight — he must act
+          // on it — the mark only makes the authorship legible.
+          postSparkle(line`You said you'd ${plain(promiseVerbPhrase(p.family))} — ${plain(oneLine(p.sentence))} — and that hasn't happened.`, undefined, undefined, { appNotice: true });
         }
       } catch (err) {
         console.warn("concierge: promise ledger failed; the reply is unaffected", err);
@@ -3930,10 +3938,16 @@ export function ConciergeHost({
   // `ConciergeUserMessage.receipt` is the ROUTING receipt (where a message the USER sent went), a
   // different type on a different kind. Reusing the word made a spread across the message union fail
   // to typecheck, which was the honest signal that two unrelated things were being called one name.
-  const postSparkle = useCallback((l: Line, collapsed?: TextBlock, actionReceipt?: ConciergeReceiptMark) => {
+  // `opts.appNotice` MARKS THIS LINE AS AN APP-AUTHORED NOTICE ADDRESSED TO THE FOUNDER (bead
+  // sparkle-hxypas) — today the promise-ledger nudge. Like `actionReceipt`, it survives this
+  // function so the render site can draw an authorship mark; unlike it, it says nothing about
+  // RECIPIENT or ink — the line stays full-weight and founder-addressed, it is only visibly
+  // authored by the app rather than the concierge. Carried as an options bag rather than a fourth
+  // positional so the ~25 receipt/status call sites are not forced to pad it with `undefined`.
+  const postSparkle = useCallback((l: Line, collapsed?: TextBlock, actionReceipt?: ConciergeReceiptMark, opts?: { appNotice?: true }) => {
     setChat((prev) => [
       ...prev,
-      { id: nextId("sparkle"), kind: "sparkle", text: l.md, collapsed, actionReceipt },
+      { id: nextId("sparkle"), kind: "sparkle", text: l.md, collapsed, actionReceipt, appNotice: opts?.appNotice },
     ]);
     // A send outcome is exactly what a screen-reader user needs told, and it arrives whole. Two
     // sends to the same pinned agent produce the same line twice; both must be announced.
