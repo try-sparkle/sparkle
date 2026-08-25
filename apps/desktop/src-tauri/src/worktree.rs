@@ -10801,6 +10801,55 @@ pub fn read_worker_manifest_at(worktree: &Path) -> Result<Option<Value>, String>
 /// written at spawn is stale), so the reconcile pass can re-adopt the worker at its real path.
 /// Worktrees without a manifest (legacy workers, agent worktrees) or with unparseable JSON are
 /// skipped — the scan is a best-effort self-heal, never fatal. A missing worktrees dir -> empty.
+/// The branch a worktree's HEAD is actually ON, or `None` when there is no branch to name.
+///
+/// THE SILENT WORK-LOSS THIS CLOSES (bead sparkle-m15bfj). A worker manifest's `branch` is written
+/// ONCE, at spawn. AGENTS.md instructs every agent to name a branch for the WORK rather than for an
+/// agent id, so a worker that follows the convention cuts its own branch and leaves the agent-named
+/// one fast-forwarded to the default branch. A roster that reports the spawn name then sends its
+/// reader to `git merge <that branch>`, which answers "Already up to date" — so the orchestrator
+/// concludes the worker produced nothing while the branch holding all of the work goes unmerged and
+/// is destroyed with the worktree. Every step reads exactly like success.
+///
+/// ONE RULE, TWO IMPLEMENTATIONS — and this is the second. `discoverWorkersFromDisk` in
+/// apps/mcp-orchestrator/src/workerScan.ts does the same job for the socket-independent path and
+/// carries the same fix. They are separate because they serve different callers, not because they
+/// may disagree: a fix applied to only one is exactly the shape of sparkle-16y6h, where two halves
+/// built independently against a frozen contract were both green and the feature never once ran.
+///
+/// FAILS SOFT, against this file's usual fail-closed habit, deliberately: the caller ENUMERATES
+/// workers, so a worktree whose HEAD is unreadable or detached is still one the app must see.
+/// `None` leaves the manifest's name in place. Mis-naming a worker is recoverable; dropping one
+/// from the roster is the failure the scan exists to prevent.
+fn branch_from_worktree_head(worktree: &Path) -> Option<String> {
+    let dot_git = worktree.join(".git");
+    // A LINKED worktree's `.git` is a FILE holding `gitdir: <path>`; a plain clone's is a DIRECTORY.
+    let head_path = if dot_git.is_file() {
+        let text = std::fs::read_to_string(&dot_git).ok()?;
+        let rest = text.lines().find_map(|l| l.trim().strip_prefix("gitdir:"))?;
+        let gitdir = Path::new(rest.trim());
+        // git accepts a RELATIVE gitdir; resolve it against the worktree, never the process cwd.
+        if gitdir.is_absolute() {
+            gitdir.join("HEAD")
+        } else {
+            worktree.join(gitdir).join("HEAD")
+        }
+    } else {
+        dot_git.join("HEAD")
+    };
+    let head = std::fs::read_to_string(head_path).ok()?;
+    // No `ref:` prefix means a DETACHED head — a raw sha, with no branch name to report. Returning
+    // the sha would be worse than returning nothing: it reads as a branch and merging one is not
+    // what the caller means.
+    let name = head.lines().find_map(|l| l.trim().strip_prefix("ref: refs/heads/"))?;
+    let name = name.trim();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
+}
+
 pub fn scan_worker_manifests_at(app_data: &Path, project_id: &str) -> Result<Vec<Value>, String> {
     validate_id("project_id", project_id)?;
     let dir = app_data.join("worktrees").join(project_id);
@@ -10826,6 +10875,13 @@ pub fn scan_worker_manifests_at(app_data: &Path, project_id: &str) -> Result<Vec
             "worktree".to_string(),
             Value::String(wt.to_string_lossy().to_string()),
         );
+        // …and `branch` with the one HEAD is actually on, for the SAME reason: both fields were
+        // recorded at spawn and both can be stale by the time anyone reads them. Only `worktree`
+        // got this precedence originally, which left the branch half of the staleness live
+        // (sparkle-m15bfj). `None` keeps the manifest's value — see branch_from_worktree_head.
+        if let Some(head) = branch_from_worktree_head(&wt) {
+            obj.insert("branch".to_string(), Value::String(head));
+        }
         out.push(v);
     }
     Ok(out)
@@ -21690,12 +21746,53 @@ detached
         // Worker B: a bare worktree dir with NO manifest (legacy worker) → skipped.
         std::fs::create_dir_all(wt_root.join("worker-b")).unwrap();
 
+        // Worker A also gets a HEAD naming a DIFFERENT branch than its manifest — the shape that
+        // caused sparkle-m15bfj. A worker following AGENTS.md names its branch for the WORK, so the
+        // spawn-time name in the manifest goes stale and `git merge <it>` answers "Already up to
+        // date": the orchestrator reads that as "produced nothing" and the real branch is lost.
+        // `.git` as a FILE is the linked-worktree shape, which is what every spawned worker is.
+        let a_gitdir = wa.join("__gitdir");
+        std::fs::create_dir_all(&a_gitdir).unwrap();
+        std::fs::write(wa.join(".git"), format!("gitdir: {}\n", a_gitdir.display())).unwrap();
+        std::fs::write(a_gitdir.join("HEAD"), "ref: refs/heads/feature/actual-work\n").unwrap();
+
         let found = scan_worker_manifests_at(&app_data, project_id).unwrap();
         assert_eq!(found.len(), 1, "only the dir with a manifest is returned");
         let m = &found[0];
         assert_eq!(m["workerId"], "worker-a");
         // `worktree` is the REAL directory found, not the stale value written into the file.
         assert_eq!(m["worktree"], wa.to_string_lossy().to_string());
+        // …and `branch` is the one HEAD is on, not the stale spawn name. Same precedence, same
+        // reason; only `worktree` had it before.
+        assert_eq!(
+            m["branch"], "feature/actual-work",
+            "the roster must report the branch the worker COMMITTED to, not its spawn name"
+        );
+
+        // FAIL-SOFT half, and it is the assertion that stops the fix from hiding workers. A
+        // detached HEAD holds a raw sha and names no branch; a worktree with no .git at all names
+        // nothing either. Both must keep the manifest's branch and both must still be REPORTED —
+        // returning the sha would read as a branch, and dropping the row loses the worker entirely.
+        let wc = wt_root.join("worker-c");
+        std::fs::create_dir_all(wc.join(".git")).unwrap();
+        write_worker_manifest_at(
+            &wc,
+            &json!({ "workerId": "worker-c", "buildAgentId": "b1", "projectId": project_id,
+                     "branch": "sparkle/agent-c", "worktree": "/stale", "task": "t",
+                     "createdAt": "x" }),
+        )
+        .unwrap();
+        std::fs::write(wc.join(".git").join("HEAD"), "9f8e7d6c5b4a39281706fedcba0987654321abcd\n").unwrap();
+
+        let found2 = scan_worker_manifests_at(&app_data, project_id).unwrap();
+        let c = found2
+            .iter()
+            .find(|v| v["workerId"] == "worker-c")
+            .expect("a worktree with a detached HEAD must still be REPORTED, not dropped");
+        assert_eq!(
+            c["branch"], "sparkle/agent-c",
+            "a detached HEAD names no branch, so the manifest value stands"
+        );
 
         // A project with no worktrees dir yet → empty (not an error).
         assert!(scan_worker_manifests_at(&app_data, "no-such-project").unwrap().is_empty());
