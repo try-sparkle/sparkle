@@ -1403,8 +1403,12 @@ export function AgentSidebar({
    * session before a tab exists, so at click time there is nothing to plug into. The row click that
    * follows its arrival does it.
    */
-  const spawnBuildAgent = () => {
-    const id = spawnBuildAgentRaw();
+  const spawnBuildAgent = (epicId?: string) => {
+    // When the sidebar is focused on an epic, a new build agent JOINS that epic: its auto-minted
+    // bead is parented to `epicId` so `agentsForEpicSlices` finds it and the epic square leaves gray
+    // (sparkle-f2tzxg). `epicId` is passed at CLICK time from the render below, where the per-side
+    // `epicFocusId` is in scope; undefined (nothing focused) keeps the top-level spawn unchanged.
+    const id = spawnBuildAgentRaw({ epicId });
     if (id) selectAndWire(id);
     return id;
   };
@@ -2978,7 +2982,7 @@ export function AgentSidebar({
       // FRAGMENT, not a wrapper element: both placement slots are already flex columns and the
       // rows must stay THEIR direct children (the sticky/below-the-list placement is asserted on a
       // button's parent in AgentSidebar.newAgentPlacement.test.tsx).
-      <NewAgentButtons onLocalClick={spawnBuildAgent} projectId={project.id} dataHint />
+      <NewAgentButtons onLocalClick={() => spawnBuildAgent(epicFocusId ?? undefined)} projectId={project.id} dataHint />
     ) : null;
 
   return (

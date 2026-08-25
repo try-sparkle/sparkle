@@ -114,6 +114,22 @@ export interface SpawnBuildAgentOpts {
    * `background` is the stronger, separate statement that nobody asked at all.
    */
   attention?: "user" | "auto";
+  /**
+   * The epic this agent is being spawned AGAINST, when the gesture came from an epic (an epic card /
+   * epic-focused sidebar's "+ New Build Agent"). Names the epic's bead id.
+   *
+   * Two things follow from it, and BOTH are required for the epic square to leave gray — epic
+   * membership is a bead PARENT-CHILD edge and nothing else (`services/beads.ts`), so an agent that
+   * merely renders in the column is not linked:
+   *   1. The auto-minted bead below is created with this id as its PARENT, so the new bead is a child
+   *      slice of the epic and `agentsForEpicSlices` finds the agent by its `beadId` edge. Left as the
+   *      empty string every auto-bead was a top-level task and every epic read `gray` (sparkle-f2tzxg).
+   *   2. `AgentTab.epicId` is set NOW, synchronously — mirroring the sendToBuild path — so the epic
+   *      pill shows immediately, before the async `bd create` resolves and binds `beadId`.
+   *
+   * Absent (the generic "+ New Build Agent"/drop/babysit spawn) the bead stays top-level, unchanged.
+   */
+  epicId?: string;
 }
 
 /** Create + open a local Build agent in `project`, returning its id — or null when the spawn did not
@@ -249,6 +265,10 @@ export function spawnBuildAgentInProject(
     ...(opts.mode === "plan" ? { permissionMode: "plan" as const } : {}),
   });
   if (!id) return null;
+  // Spawned AGAINST an epic: set `epicId` NOW, synchronously — exactly as sendToBuild does — so the
+  // sidebar epic pill shows before the async `bd create` below resolves and binds `beadId`. The
+  // durable epic→agent link is the bead PARENT edge minted below; this is the immediate-display half.
+  if (opts.epicId) store.setAgentEpicId(project.id, id, opts.epicId);
   // "A NULL OR A THROW MEANS NOTHING WAS CREATED" — HELD BY CONSTRUCTION, NOT BY ASSERTION
   // (roborev 59548 then 59562).
   //
@@ -433,7 +453,7 @@ export function spawnBuildAgentInProject(
         ?.agents.find((a) => a.id === id)?.name ?? "Build task";
     // Labeled `sparkle-auto` so the board can tell app-generated telemetry from beads a human filed —
     // see AUTO_LABEL. Without it these are indistinguishable from real backlog once the agent is gone.
-    void createBeadFull(project.rootPath, title, "", "task", "", "", AUTO_LABEL)
+    void createBeadFull(project.rootPath, title, "", "task", opts.epicId ?? "", "", AUTO_LABEL)
       .then((beadId) => useProjectStore.getState().setAgentBeadId(project.id, id, beadId))
       .catch((e) => {
         // A project with no beads DB is a normal, supported state (bd is optional) — don't cry WARN on

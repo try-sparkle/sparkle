@@ -15,6 +15,12 @@ import type { Project } from "../types";
 // callers and tests that import it from this module keep working.
 export { isBeadsUnavailable };
 
-export function useSpawnBuildAgent(project: Project | null): () => string | null {
-  return () => (project ? spawnBuildAgentInProject(project) : null);
+export function useSpawnBuildAgent(
+  project: Project | null,
+): (opts?: { epicId?: string }) => string | null {
+  // `opts.epicId` names an epic to spawn this agent AGAINST: the auto-minted bead is parented to it
+  // and the agent's `epicId` is set, so `agentsForEpicSlices` finds it and the epic square leaves gray
+  // (sparkle-f2tzxg). Omitted (the empty-state and drop callers), the spawn is a top-level agent as
+  // before — the field is optional and defaults to today's behaviour.
+  return (opts) => (project ? spawnBuildAgentInProject(project, opts) : null);
 }
