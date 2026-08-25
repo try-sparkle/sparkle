@@ -48,6 +48,7 @@ import { PASS_TIMEOUT_MS, type DrainFocus } from "./improvementPass";
 import { SPARKLE_PROJECT_ID } from "./sparkleAgent";
 import { busyDrainSlots } from "./drainSlotLatch";
 import { drainSlotAgentId, runDrainSlot } from "./drainSlotRunner";
+import { localAgentCapacity } from "./agentCapacity";
 
 /** One spooled drain request, as `read_drainer_queue` returns it. */
 export interface DrainQueueEntry {
@@ -92,6 +93,15 @@ export interface DrainerBridgeDeps {
   busySlots: () => Set<string>;
   /** How many healthy pool accounts the fleet may rotate across — the account bound. */
   availableAccounts: () => Promise<number>;
+  /** How many MORE agents the machine can sustain RIGHT NOW, across every spawn source — the
+   *  machine-wide bound. Production reads `localAgentCapacity()` (`limit − used`), whose `limit` is
+   *  the live memory+CPU-run-queue admission the interactive spawn gate already enforces. Drain
+   *  workers run in their own worktrees and are NOT projectStore rows, so without this bound the
+   *  drain fleet was a SEPARATE budget that summed ON TOP of the interactive agents and ignored live
+   *  load entirely — the oversubscription that put an 18-core box at run-queue 179.9 with ~52 agents
+   *  (sparkle-eo268r and siblings). Folding it in makes the drainer decrement the ONE machine-wide
+   *  budget and honour the run-queue gate. Re-read per pass. */
+  machineHeadroom: () => number;
   /** Beads dispatched this session and not yet finished — the dedup set. */
   claimed: Set<string>;
   /** Start ONE drain worker for a bead in a slot. Resolves to whether a worker actually RAN (so the
@@ -106,9 +116,15 @@ export interface DrainerBridgeDeps {
  * bounded fleet size. Returns [] when the kill-switch is off, the fleet is full, or nothing eligible
  * is queued. Side-effect-free and injection-free so every branch is unit- and mutation-testable.
  *
- * Fleet size = min(maxWorkers, maxConcurrency, availableAccounts); free capacity = that minus the
- * slots already in flight. Each chosen bead is UNCLAIMED and DISTINCT, and is assigned a DISTINCT
- * FREE slot, so two workers never share a bead or a slot.
+ * Fleet size = min(maxWorkers, maxConcurrency, availableAccounts, machineHeadroom); free capacity is
+ * that minus the slots already in flight. Each chosen bead is UNCLAIMED and DISTINCT, and is assigned
+ * a DISTINCT FREE slot, so two workers never share a bead or a slot.
+ *
+ * `machineHeadroom` is the term that keeps the drain fleet from oversubscribing the machine: it is
+ * how many more agents the box can sustain across EVERY spawn source right now, so at zero headroom
+ * (the interactive gate is already at its live limit, or the CPU run queue is saturated) this plans
+ * nothing even when workers/accounts/beads are all available — the drainer stops being a separate
+ * budget that stacks on top of the interactive agents (sparkle-eo268r and siblings).
  */
 export function planDrainDispatch(args: {
   enabled: boolean;
@@ -118,11 +134,17 @@ export function planDrainDispatch(args: {
   maxWorkers: number;
   maxConcurrency: number;
   availableAccounts: number;
+  machineHeadroom: number;
 }): DrainAssignment[] {
   if (!args.enabled) return []; // kill-switch — no spawn, ever
   const cap = Math.max(
     0,
-    Math.min(args.maxWorkers, args.maxConcurrency, args.availableAccounts),
+    Math.min(
+      args.maxWorkers,
+      args.maxConcurrency,
+      args.availableAccounts,
+      args.machineHeadroom,
+    ),
   );
   if (cap <= 0) return [];
   // The fleet's slots are drain-0..drain-(cap-1); a slot already in flight is not free. This bounds
@@ -173,6 +195,7 @@ export async function runDrainerBridgePass(
   if (hold !== null) return { dispatched: [] }; // consent-off / offline
 
   const availableAccounts = await deps.availableAccounts();
+  const machineHeadroom = deps.machineHeadroom();
   const plan = planDrainDispatch({
     enabled: true,
     entries: snap.entries,
@@ -181,6 +204,7 @@ export async function runDrainerBridgePass(
     maxWorkers: snap.maxWorkers,
     maxConcurrency: snap.maxConcurrency,
     availableAccounts,
+    machineHeadroom,
   });
   if (plan.length === 0) return { dispatched: [] };
 
@@ -246,6 +270,14 @@ const PRODUCTION_DEPS: DrainerBridgeDeps = {
   holdReason: productionHoldReason,
   busySlots: () => new Set(busyDrainSlots()),
   availableAccounts: () => availablePoolAccountCount(),
+  // The machine-wide bound: how many more agents the box can carry RIGHT NOW, across every spawn
+  // source. `localAgentCapacity().limit` is the live memory+CPU-run-queue admission the interactive
+  // spawn gate enforces; `used` is every interactive build/worker row. Drain workers are not those
+  // rows, so `limit − used` is exactly the room left for them without oversubscribing.
+  machineHeadroom: () => {
+    const c = localAgentCapacity();
+    return Math.max(0, c.limit - c.used);
+  },
   claimed: claimedBeads,
   dispatch: productionDispatch,
   ack: async (entry: DrainQueueEntry) => {

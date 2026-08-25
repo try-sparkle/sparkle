@@ -42,6 +42,7 @@ function makeDeps(
     holdReason: over.holdReason ?? (() => null),
     busySlots: over.busySlots ?? (() => new Set<string>()),
     availableAccounts: over.availableAccounts ?? (async () => over.accounts ?? 5),
+    machineHeadroom: over.machineHeadroom ?? (() => 100),
     claimed,
     dispatch: over.dispatch ?? dispatch,
     ack: over.ack ?? ack,
@@ -57,6 +58,7 @@ describe("planDrainDispatch (the pure bounded-fleet decision)", () => {
     maxWorkers: 5,
     maxConcurrency: 5,
     availableAccounts: 5,
+    machineHeadroom: 100,
   };
 
   it("fills N distinct beads onto N distinct slots, worst-first", () => {
@@ -100,6 +102,38 @@ describe("planDrainDispatch (the pure bounded-fleet decision)", () => {
     expect(planDrainDispatch({ ...base, entries, maxWorkers: 5, maxConcurrency: 5, availableAccounts: 3 })).toHaveLength(3);
     // a zero bound ⇒ nothing
     expect(planDrainDispatch({ ...base, entries, availableAccounts: 0 })).toEqual([]);
+  });
+
+  // The machine-wide bound — the fix for fleet oversubscription (sparkle-eo268r + siblings). The
+  // drain fleet must decrement the ONE machine-wide budget, not stack on top of the interactive
+  // agents. These two are a PAIR: the first shows the refusal, the second shows the SAME setup does
+  // dispatch when headroom returns — pinning the cause to machineHeadroom, not an upstream gate.
+  it("REFUSES the whole drain fleet when the machine has no headroom, even with slots/accounts/beads free", () => {
+    const entries = [entry("a"), entry("b"), entry("c")];
+    const plan = planDrainDispatch({
+      ...base,
+      entries,
+      maxWorkers: 5,
+      maxConcurrency: 5,
+      availableAccounts: 5,
+      machineHeadroom: 0, // interactive gate already at its live limit / run queue saturated
+    });
+    expect(plan).toEqual([]); // no worker planned — the drainer does not oversubscribe the machine
+  });
+
+  it("dispatches exactly the machine's headroom when that is the strictest bound", () => {
+    const entries = [entry("a"), entry("b"), entry("c"), entry("d")];
+    // Same generous worker/account bounds as above; only headroom changed from 0 → 2.
+    const plan = planDrainDispatch({
+      ...base,
+      entries,
+      maxWorkers: 5,
+      maxConcurrency: 5,
+      availableAccounts: 5,
+      machineHeadroom: 2,
+    });
+    expect(plan).toHaveLength(2); // headroom binds: 2 workers, "c"/"d" held
+    expect(plan.map((a) => a.entry.beadId)).toEqual(["a", "b"]);
   });
 
   it("does not re-dispatch a bead already claimed this session", () => {
@@ -167,6 +201,18 @@ describe("runDrainerBridgePass (asserts the parallel spawn SIDE EFFECT)", () => 
     expect(out.dispatched).toEqual([]);
   });
 
+  it("machine at capacity (headroom 0) ⇒ ZERO spawns even with beads queued and slots free", async () => {
+    const { deps, dispatch, ack } = makeDeps({
+      machineHeadroom: () => 0, // the interactive gate is already at its live limit
+      snapshot: { maxConcurrency: 5, maxWorkers: 5, entries: [entry("a"), entry("b")] },
+      accounts: 5,
+    });
+    const out = await runDrainerBridgePass(deps);
+    expect(dispatch).not.toHaveBeenCalled(); // the drainer refuses rather than oversubscribe
+    expect(ack).not.toHaveBeenCalled();
+    expect(out.dispatched).toEqual([]);
+  });
+
   it("Rust kill-switch (snapshot.enabled=false) ⇒ ZERO spawns even with beads queued", async () => {
     const { deps, dispatch } = makeDeps({ snapshot: { enabled: false, entries: [entry("a")] } });
     await runDrainerBridgePass(deps);
@@ -217,6 +263,7 @@ describe("runDrainerBridgePass (asserts the parallel spawn SIDE EFFECT)", () => 
       holdReason: () => null,
       busySlots: () => busy,
       availableAccounts: async () => 5,
+      machineHeadroom: () => 100,
       claimed,
       dispatch,
       ack: async () => {},
