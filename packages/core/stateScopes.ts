@@ -82,8 +82,13 @@ export function stateScopesNamedIn(text: string): string[] {
  *  the bead was actually blocked on: `omittedIds` carries ids, capped, with no names, so the
  *  concierge still could not resolve a name to an id — it could not render an agent pill, address
  *  `send_peer_message`, or unstick an agent that had hit its auto-continue ceiling. So `'fleet'` now
- *  RETURNS a row per live agent (the same `localAgentRowIds().live` population `concurrency.live`
- *  counts) beside the app-global rows. `omitted` therefore counts what is genuinely left over — the
+ *  RETURNS a row per LIVE-OR-ADDRESSABLE agent beside the app-global rows — anything with a live
+ *  status, an open pane in ANY window, or that is the caller or the caller's own worker. What that
+ *  owes a caller sizing a spawn is CONTAINMENT, NOT EQUALITY: every agent `concurrency.live` counts
+ *  is a row here, so the directory can never list FEWER than that headcount; it may list more, which
+ *  is correct rather than a discrepancy, because `concurrency.live` is a RAM-BUDGET reading that
+ *  deliberately excludes cloud agents, shell agents and panes mounted in other windows. Reading the
+ *  two as equal is what made this scope report those as dormant. `omitted` therefore counts what is genuinely left over — the
  *  DORMANT rows — and unlike the previous wording it CAN legitimately be 0, when every row this app
  *  knows of is live. That is why the sentence below no longer says "never 0 while agents are
  *  running": under the new behaviour that would be false, and a stale absolute in this contract is
