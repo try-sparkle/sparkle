@@ -895,6 +895,31 @@ describe("controlListener", () => {
     });
   });
 
+  // ── "fleet" IS THE SCOPE YOU SIZE A SPAWN FROM, SO IT MUST CONTAIN YOU AND YOUR WORKERS ──────
+  // roborev on sparkle-u1p68f. `liveAgentIds` needs a runtime entry PLUS a mounted project, and a
+  // just-spawned worker has neither. So an orchestrator that calls spawn_worker twice and then
+  // reads scope "fleet" to decide whether it has room got back a roster containing neither itself
+  // nor the two workers it had just created — all three in `omittedIds`, which the tool description
+  // and SKILL.md both call "the dormant rows". It then sizes its next spawn against a live count
+  // that excludes the agents it just started: the same under-counting as bead sparkle-iyxxin, which
+  // is the incident this whole scope was widened to prevent.
+  //
+  // NOTE WHAT THE FIXTURE DOES *NOT* DO. `openAgentIds` is set EMPTY, deliberately. The pre-existing
+  // fleet tests write `[callerId, otherId]` by hand, so the caller is live only because the fixture
+  // forced it — which is exactly why they passed while this was broken.
+  it("get_state scope 'fleet' contains the caller and its own workers with NO runtime entry", async () => {
+    useRuntimeStore.setState({ openAgentIds: [] } as never); // otherId: worker, parentId=callerId
+    fire({ reqId: "flt3", op: "get_state", callerAgentId: callerId, payload: { scope: "fleet" } });
+    await flush();
+    const res = lastReply() as { agents: Array<Record<string, unknown>>; omittedIds: string[] };
+    const ids = res.agents.map((a) => a.id);
+    expect(ids).toContain(callerId);
+    expect(ids).toContain(otherId);
+    // The other half of the failure: they must not be presented as DORMANT either.
+    expect(res.omittedIds ?? []).not.toContain(callerId);
+    expect(res.omittedIds ?? []).not.toContain(otherId);
+  });
+
   // roborev #53407: "stopped" is ALSO what an agent with no runtime entry reads as — a just-spawned
   // worker (pane not mounted yet) or a stranded one. An orchestrator that spawns workers and then
   // calls get_state() must never be told its own fleet does not exist.

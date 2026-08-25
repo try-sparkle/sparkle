@@ -1556,7 +1556,28 @@ function handleGetState(req: ControlRequest): {
     // are prepended below — they are not members of `all`). Liveness is `localAgentRowIds`'s, not a
     // predicate of this filter's own, because this scope's contract is that its live-row count IS
     // `concurrency.live`. A row that is not live is not dropped silently: it lands in `omittedIds`.
-    if (scope === "fleet") return a.id === sparkleRow.id || liveAgentIds.has(a.id);
+    //
+    // THE CALLER AND ITS OWN CHILDREN ARE ALWAYS MEMBERS, for the SAME reason "active" carries the
+    // clause below — and it matters MORE here, because this is the scope documented as the one to
+    // read before sizing a spawn. `liveAgentIds` requires a runtime entry plus a mounted project,
+    // and a just-spawned worker has neither yet. Without this an orchestrator calls spawn_worker
+    // twice, reads scope "fleet" to decide whether it has room, and gets back a roster containing
+    // NEITHER ITSELF NOR THE TWO WORKERS IT JUST CREATED — all three landing in `omittedIds`, which
+    // the tool description and SKILL.md both describe as "the dormant rows it did not list". It then
+    // sizes its next spawn against a live count that excludes the agents it just started: the exact
+    // under-counting shape as bead sparkle-iyxxin, reintroduced by the fix for it. Measured in that
+    // incident: one orchestrator saw 9 of its own workers while the machine ran 86 model processes.
+    // It also makes SKILL.md's unqualified "You are always in your own roster, and so are your
+    // workers" false for this scope alone. roborev on sparkle-u1p68f.
+    if (
+      scope === "fleet"
+    )
+      return (
+        a.id === sparkleRow.id ||
+        a.id === req.callerAgentId ||
+        a.parentId === req.callerAgentId ||
+        liveAgentIds.has(a.id)
+      );
     // "active" = has a live status, OR is open in ANY window, OR is one of the caller's own
     // children. That last clause is not a nicety: "stopped" is also what an agent with NO runtime
     // entry reads as, which is exactly a just-spawned worker (no pane mounted yet) or a permanently
