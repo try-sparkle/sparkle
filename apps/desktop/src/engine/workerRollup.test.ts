@@ -14,6 +14,10 @@ import {
   rollupDotAccessor,
   withWorkerRollupGreen,
 } from "./workerRollup";
+// The peek lives in a DIFFERENT module on purpose, and importing it here is deliberate rather than
+// sloppy: the law this file's last block pins is a coupling BETWEEN the two, and a coupling asserted
+// on only one side of itself is not asserted at all. See that block for the full story.
+import { attentionWorkersOf } from "./workerExpansion";
 import type { AgentTabStatus } from "../types";
 
 /** A worker set built from statuses; the helper exists so each case reads as its truth-table row. */
@@ -92,10 +96,12 @@ describe("rollupDot — a childless row is just itself", () => {
   // until 2026-07-26, when 27 of 51 agents sat in that band and made red meaningless). The rollup
   // inherits that judgement for the row's own status and does not re-escalate it.
   //
-  // ⚠️ THIS CLAUSE IS ABOUT THE ROW'S OWN STATUS ONLY. A CHILD's `unmerged` now escalates — see the
-  // "a child that owes a merge" block at the bottom, and the header of workerRollup.ts for why the
-  // two are deliberately asymmetric (a head's own unmerged already has a row and a "Needs merge"
-  // label; a folded child has neither).
+  // ⚠️ THIS COMMENT USED TO SAY "a CHILD's `unmerged` now escalates — see the 'a child that owes a
+  // merge' block at the bottom". BOTH HALVES WERE FALSE. That escalation shipped and was reverted
+  // the same day (c7bd3e50c, "satisfy the never-hide rule with the peek, not the rollup dot") and
+  // its block went with it, so the pointer dangled at nothing while asserting the opposite of the
+  // law. A child's `unmerged` does NOT escalate this dot, and that is the DECISION — see the
+  // "gray dot is licensed BY the peek" block at the bottom, which now pins it.
   it("keeps a row's OWN `unmerged` calm", () => {
     expect(rollupDot("unmerged", w())).toBe("gray");
     expect(rollupDot("unmerged", w("idle", "done"))).toBe("gray");
@@ -310,5 +316,90 @@ describe("rollupDot — green does NOT override `unmerged`", () => {
   // carries a real "Needs merge" you can act on.
   it("rolls unmerged + green up to gray, which bands done", () => {
     expect(bandOfRollup(rollupDot("unmerged", w("working")))).toBe("done");
+  });
+});
+
+// ── The gray dot is LICENSED BY the peek — a folded head that owes a merge ─────────────────────
+//
+// THE THREE-FILE CONSPIRACY THIS BLOCK EXISTS TO MAKE UN-REINTRODUCIBLE (bead sparkle-qogah.3).
+// Worker rows default to COLLAPSED, so a worker has no row of its own. Three modules each made a
+// locally defensible choice and together they erased a worker the user owes an action to:
+//
+//   1. buildSections  — `unmerged` bands `done` (it is GRAY: a landing state, not an alarm).
+//   2. workerRollup   — a gray worker contributes nothing to its parent's dot, so the head is gray.
+//   3. workerExpansion — the peek admitted the `needs_you` band ONLY, so no peek line either.
+//
+// Net: an orchestrator with three workers each holding an un-landed PR rendered as ONE collapsed
+// gray row filed under the "Done" chip. Three things the user owes, zero pixels — "he cannot know
+// what he was not shown."
+//
+// HOW IT WAS FIXED, AND WHY ONLY HALF OF IT SURVIVED. 47bac7f85 changed (2) AND (3): the peek
+// admits `unmerged`, and a child's `unmerged` escalated the parent dot. The dot half was reverted
+// hours later by c7bd3e50c — `anyRed` is what `bandOfRollup` files under NEEDS YOU, so a folded
+// head with an un-landed PR started counting as an ask, rebuilding one level up the wall of red
+// that tokens.ts had torn down on 2026-07-26 (27 of 51 agents in that band) and making the chip
+// mean two things at once (sparkle-345q5). Asked which surface was right, the founder endorsed the
+// peek, verbatim: "it just peaks the one that's red and needs me and that's fine the way that it's
+// working now."
+//
+// SO THE CURRENT LAW IS A COUPLED PAIR, AND NOTHING PINNED THE COUPLING. The head's dot is allowed
+// to stay gray ONLY BECAUSE the peek names the worker. Those two facts live in two modules with two
+// test files, so tightening the peek back to `needs_you`-only would have left every rollup test
+// green and silently restored the original bug. Both halves are asserted here, in one test, over
+// one fixture — mutate either module and this block goes red.
+describe("a folded head whose worker owes a MERGE — the peek/dot pair", () => {
+  // EVERY CANDIDATE IS MOUNTED AT ONCE. Asserting that an informational worker is absent from a
+  // peek it was never offered to proves nothing (AGENTS.md, the `sparkle-foqoe` shape): a blanket
+  // "peek everything" and a blanket "peek nothing" both satisfy a one-worker fixture. One head,
+  // one owed worker, two calm ones — so the assertion pins the RULE rather than a headcount.
+  const FOLDED = [
+    { id: "head", kind: "build" as const, parentId: null },
+    { id: "w-merge", kind: "worker" as const, parentId: "head" }, // owes: un-landed PR
+    { id: "w-idle", kind: "worker" as const, parentId: "head" }, // informational: "Done — your turn"
+    { id: "w-done", kind: "worker" as const, parentId: "head" }, // informational: finished
+  ];
+  const OWED: Record<string, AgentTabStatus> = {
+    "w-merge": "unmerged",
+    "w-idle": "idle",
+    "w-done": "done",
+  };
+  const peek = (map: Record<string, AgentTabStatus>) =>
+    attentionWorkersOf(FOLDED, "head", (id) => map[id] ?? "stopped", () => true).map((a) => a.id);
+
+  it("names the unmerged worker and ONLY it, while the head stays gray", () => {
+    // The half that satisfies the founder's rule: the row is not hidden, it is peeked. Tighten
+    // `isOwedAsk` back to `needs_you`-only and this line goes red.
+    expect(peek(OWED)).toEqual(["w-merge"]);
+    // The half c7bd3e50c decided: the dot does NOT shout. Re-escalate a child's `unmerged` and
+    // this line goes red — which is the point, because that escalation was tried and reverted.
+    expect(rollupDot("idle", w("unmerged", "idle", "done"))).toBe("gray");
+  });
+
+  // THE COUPLING, STATED AS ONE IMPLICATION rather than two independent facts. Read the two
+  // assertions above apart and the gray dot looks like plain absorption; read them together and
+  // gray is a CLAIM — "nothing here is hidden from you" — that only the peek can make true.
+  it("only lets the dot be calm because the peek is not empty", () => {
+    const peeked = peek(OWED);
+    const dot = rollupDot("idle", w("unmerged", "idle", "done"));
+    expect(dot).toBe("gray");
+    expect(peeked.length).toBeGreaterThan(0);
+  });
+
+  // THE NEGATIVE PAIR. Gray + no peek line is CORRECT when nothing is owed — that is a settled
+  // fleet, and this is what stops the fix above from being satisfied by "peek everything", which
+  // would turn the peek into the second, sneakier expansion the founder explicitly did not ask for
+  // ("it's not expanded to show all workers").
+  it("draws no peek line and stays gray when every worker is merely informational", () => {
+    expect(peek({ "w-merge": "done", "w-idle": "idle", "w-done": "stopped" })).toEqual([]);
+    expect(rollupDot("idle", w("done", "idle", "stopped"))).toBe("gray");
+  });
+
+  // …and the pair is not blanket in the other direction either: a worker that owes an ANSWER is
+  // both peeked and escalated, because `needs_you` is an alarm and `unmerged` is a landing state.
+  // Without this the "dot stays gray" assertion above would also pass for a rollup that had
+  // stopped escalating everything.
+  it("still paints the head red for a worker in the needs_you band", () => {
+    expect(peek({ "w-merge": "blocked", "w-idle": "idle", "w-done": "done" })).toEqual(["w-merge"]);
+    expect(rollupDot("idle", w("blocked", "idle", "done"))).toBe("red");
   });
 });
