@@ -180,10 +180,12 @@ describe("ToolsPane", () => {
     expect(screen.getByText("Your tools")).toBeTruthy();
     expect(screen.getByText("Built into Sparkle")).toBeTruthy();
 
-    // Exactly the twenty toggleable tools carry a switch. Superpowers is one of them: it used
-    // to be an info-only showcase row, and is a real [plugins] toggle since the plugin pre-enable
-    // work — a stale showcase copy would claim Sparkle ships something the user can't turn off.
-    // The seven "sparkle*" rows come from Sparkle's own published marketplace.
+    // Exactly the twenty-seven toggleable tools carry a switch. Superpowers is one of them: it
+    // used to be an info-only showcase row, and is a real [plugins] toggle since the plugin
+    // pre-enable work — a stale showcase copy would claim Sparkle ships something the user can't
+    // turn off. The seven "sparkle*" rows come from Sparkle's own published marketplace; the last
+    // five in the list below come from four THIRD-PARTY marketplaces (sparkle-s3g2.7), which is
+    // why each of those rows names its owner in its own description.
     //
     // Hand-listed on purpose, unlike the derived counts further down: this is the one assertion
     // that says WHICH rows the pane offers, so a new plugin must be added here deliberately. A
@@ -192,7 +194,8 @@ describe("ToolsPane", () => {
     // (origin/main) were added to the hand-listed set on opposite sides, git took both names
     // cleanly, and the count came from one side alone. The list is the source of truth — it is
     // the assertion that says WHICH rows exist — so the number follows it, not the reverse.
-    expect(screen.getAllByRole("switch")).toHaveLength(20);
+    // 20 -> 27: the seven Tier 2 plugin rows (sparkle-s3g2.7).
+    expect(screen.getAllByRole("switch")).toHaveLength(27);
     for (const name of [
       "Deepgram voice",
       "Guardrails",
@@ -208,6 +211,9 @@ describe("ToolsPane", () => {
       "Straude",
       "Superpowers",
       "Frontend design",
+      // Tier 2, Anthropic's official marketplace.
+      "Hookify",
+      "Code simplifier",
       "Guardrails skill",
       "Branch freshness",
       "Mutation check",
@@ -215,6 +221,13 @@ describe("ToolsPane", () => {
       "Secrets skill",
       "Review probes",
       "Pusher",
+      // Tier 2, third-party marketplaces — obra/superpowers-marketplace,
+      // EveryInc/compound-engineering-plugin, trailofbits/skills, 2389-research/claude-plugins.
+      "Elements of style",
+      "Double shot latte",
+      "Compound engineering",
+      "Differential review",
+      "Review squad",
       "1Password env backup",
       "Beads",
       "GitHub import",

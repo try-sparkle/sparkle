@@ -1172,11 +1172,69 @@ const OFFICIAL_SOURCE: MarketplaceSource =
 const SPARKLE_SOURCE: MarketplaceSource =
     MarketplaceSource { name: SPARKLE_MARKETPLACE, repo: SPARKLE_MARKETPLACE_REPO };
 
-/// The plugins Sparkle knows how to pre-enable. Two live in Anthropic's official marketplace
-/// (verified against anthropics/claude-plugins-official's marketplace.json on 2026-07-24) — the
-/// official listing for `superpowers` pins the exact same commit obra/superpowers is at, and
-/// official marketplaces auto-update by default, so sourcing it there costs nothing in freshness.
-/// The rest live in Sparkle's own marketplace ([`SPARKLE_MARKETPLACE`]).
+// ── Third-party marketplaces (Tier 2, sparkle-s3g2.7) ────────────────────────────────────────
+//
+// Four marketplaces owned by NEITHER Anthropic NOR Sparkle. Each `name` below is the top-level
+// `"name"` field of that repo's `.claude-plugin/marketplace.json` — re-verified by fetching the
+// raw file on 2026-08-25 — and it is the `@<marketplace>` half of every `enabledPlugins` key, so a
+// plausible-but-wrong guess produces a settings file Claude Code silently ignores. Three of the
+// four do NOT match their repo name, which is exactly the trap:
+//   * `trailofbits`, from a repo called `skills` (not "trailofbits/skills", not "skills")
+//   * `2389-research`, from a repo called `claude-plugins`
+//   * `compound-engineering-plugin`, whose single plugin is named `compound-engineering`
+// Sparkle pins none of these. `declared_source()` returns `Some` for every non-official
+// marketplace, so all four are written into each worktree's `extraKnownMarketplaces` — which is
+// what makes their plugin ids resolvable at all.
+
+/// obra's marketplace — the upstream home of superpowers, and of the two writing/reasoning
+/// plugins Sparkle pre-enables from it (`elements-of-style`, `double-shot-latte`).
+pub const SUPERPOWERS_MARKETPLACE: &str = "superpowers-marketplace";
+pub const SUPERPOWERS_MARKETPLACE_REPO: &str = "obra/superpowers-marketplace";
+
+/// Every Inc's marketplace. NOTE the asymmetry: the marketplace is named
+/// `compound-engineering-plugin` and the one plugin inside it is named `compound-engineering`.
+pub const COMPOUND_ENGINEERING_MARKETPLACE: &str = "compound-engineering-plugin";
+pub const COMPOUND_ENGINEERING_MARKETPLACE_REPO: &str = "EveryInc/compound-engineering-plugin";
+
+/// Trail of Bits' security-skills marketplace. Named `trailofbits`, hosted in `trailofbits/skills`.
+pub const TRAIL_OF_BITS_MARKETPLACE: &str = "trailofbits";
+pub const TRAIL_OF_BITS_MARKETPLACE_REPO: &str = "trailofbits/skills";
+
+/// 2389 Research's marketplace. Named `2389-research`, hosted in `2389-research/claude-plugins`.
+pub const RESEARCH_2389_MARKETPLACE: &str = "2389-research";
+pub const RESEARCH_2389_MARKETPLACE_REPO: &str = "2389-research/claude-plugins";
+
+/// obra's marketplace as a source value.
+const SUPERPOWERS_SOURCE: MarketplaceSource =
+    MarketplaceSource { name: SUPERPOWERS_MARKETPLACE, repo: SUPERPOWERS_MARKETPLACE_REPO };
+
+/// Every Inc's marketplace as a source value.
+const COMPOUND_ENGINEERING_SOURCE: MarketplaceSource = MarketplaceSource {
+    name: COMPOUND_ENGINEERING_MARKETPLACE,
+    repo: COMPOUND_ENGINEERING_MARKETPLACE_REPO,
+};
+
+/// Trail of Bits' marketplace as a source value.
+const TRAIL_OF_BITS_SOURCE: MarketplaceSource =
+    MarketplaceSource { name: TRAIL_OF_BITS_MARKETPLACE, repo: TRAIL_OF_BITS_MARKETPLACE_REPO };
+
+/// 2389 Research's marketplace as a source value.
+const RESEARCH_2389_SOURCE: MarketplaceSource =
+    MarketplaceSource { name: RESEARCH_2389_MARKETPLACE, repo: RESEARCH_2389_MARKETPLACE_REPO };
+
+/// The plugins Sparkle knows how to pre-enable, across SIX marketplaces:
+///
+///   * Anthropic's official one ([`OFFICIAL_MARKETPLACE`]) — `superpowers`, `frontend-design`,
+///     `hookify`, `code-simplifier`. Verified against anthropics/claude-plugins-official's
+///     marketplace.json (2026-07-24, re-verified 2026-08-25). The official listing for
+///     `superpowers` pins the exact same commit obra/superpowers is at, and official marketplaces
+///     auto-update by default, so sourcing it there costs nothing in freshness.
+///   * Sparkle's own ([`SPARKLE_MARKETPLACE`]) — the `sparkle-*` rows.
+///   * Four THIRD-PARTY marketplaces owned by neither Anthropic nor Sparkle
+///     ([`SUPERPOWERS_MARKETPLACE`], [`COMPOUND_ENGINEERING_MARKETPLACE`],
+///     [`TRAIL_OF_BITS_MARKETPLACE`], [`RESEARCH_2389_MARKETPLACE`]). Sparkle pins none of them,
+///     and the `[plugins]` TRUST block in `DEFAULT_TEMPLATE` has to keep saying so — that is
+///     user-facing copy about whose content lands in every agent worktree, not documentation.
 ///
 /// Every row carries its `source`. It was tempting to leave the official rows at `None` ("Claude
 /// Code pre-registers it"), but that only holds on a machine where Claude Code has already been run
@@ -1195,6 +1253,27 @@ pub const KNOWN_PLUGINS: &[KnownPlugin] = &[
     KnownPlugin {
         toggle: "frontend_design",
         plugin: "frontend-design",
+        marketplace: OFFICIAL_MARKETPLACE,
+        source: Some(OFFICIAL_SOURCE),
+        default_on: true,
+    },
+    // Tier 2 (sparkle-s3g2.7): default INSTALLED, invoked on demand. Unlike superpowers (a
+    // methodology that shapes how an agent works throughout), these carry skills and commands an
+    // agent reaches for when the situation calls for them — so the cost of shipping them on is one
+    // idempotent install, and the benefit is that they are there at the moment they are relevant
+    // rather than needing to be discovered and installed first.
+    //
+    // Both names confirmed present in anthropics/claude-plugins-official's marketplace.json.
+    KnownPlugin {
+        toggle: "hookify",
+        plugin: "hookify",
+        marketplace: OFFICIAL_MARKETPLACE,
+        source: Some(OFFICIAL_SOURCE),
+        default_on: true,
+    },
+    KnownPlugin {
+        toggle: "code_simplifier",
+        plugin: "code-simplifier",
         marketplace: OFFICIAL_MARKETPLACE,
         source: Some(OFFICIAL_SOURCE),
         default_on: true,
@@ -1308,6 +1387,57 @@ pub const KNOWN_PLUGINS: &[KnownPlugin] = &[
         marketplace: SPARKLE_MARKETPLACE,
         source: Some(SPARKLE_SOURCE),
         default_on: false,
+    },
+    // ── Tier 2, third-party marketplaces (sparkle-s3g2.7) ────────────────────────────────────
+    //
+    // These five ship ON, and unlike the `sparkle_*` rows above there is nothing provisional about
+    // it: every plugin name below was confirmed present in its marketplace's live
+    // `.claude-plugin/marketplace.json` on 2026-08-25, so the install pass resolves each on the
+    // first try rather than retrying a failing `claude plugin install` every launch. The warning
+    // above the four unpublished `sparkle_*` rows — "do not flip one of these ON without first
+    // confirming its name appears in that marketplace listing" — is what that confirmation
+    // satisfies; it does not apply to a row whose content already exists.
+    //
+    // What IS different about them: Sparkle neither owns nor pins these marketplaces, so turning
+    // them on by default means Sparkle fetches third-party content into every agent worktree. The
+    // `[plugins]` TRUST block in `DEFAULT_TEMPLATE` names each owner for exactly that reason.
+    KnownPlugin {
+        toggle: "elements_of_style",
+        plugin: "elements-of-style",
+        marketplace: SUPERPOWERS_MARKETPLACE,
+        source: Some(SUPERPOWERS_SOURCE),
+        default_on: true,
+    },
+    KnownPlugin {
+        toggle: "double_shot_latte",
+        plugin: "double-shot-latte",
+        marketplace: SUPERPOWERS_MARKETPLACE,
+        source: Some(SUPERPOWERS_SOURCE),
+        default_on: true,
+    },
+    // The marketplace is `compound-engineering-plugin`; the plugin inside it is
+    // `compound-engineering`. They are NOT the same string, and swapping them writes an
+    // `enabledPlugins` key Claude Code ignores without complaint.
+    KnownPlugin {
+        toggle: "compound_engineering",
+        plugin: "compound-engineering",
+        marketplace: COMPOUND_ENGINEERING_MARKETPLACE,
+        source: Some(COMPOUND_ENGINEERING_SOURCE),
+        default_on: true,
+    },
+    KnownPlugin {
+        toggle: "differential_review",
+        plugin: "differential-review",
+        marketplace: TRAIL_OF_BITS_MARKETPLACE,
+        source: Some(TRAIL_OF_BITS_SOURCE),
+        default_on: true,
+    },
+    KnownPlugin {
+        toggle: "review_squad",
+        plugin: "review-squad",
+        marketplace: RESEARCH_2389_MARKETPLACE,
+        source: Some(RESEARCH_2389_SOURCE),
+        default_on: true,
     },
 ];
 
@@ -5715,21 +5845,40 @@ seed_worktrees = false # restore backed-up env files into each newly created age
 # writes nothing about it and never installs it — it does NOT turn off a plugin you enabled
 # yourself. Toggle these here or in ⋯ Settings → "Tools".
 #
-# The first two come from Anthropic's official marketplace. The sparkle_* ones come from Sparkle's
-# own public marketplace (github.com/try-sparkle/marketplace, Apache-2.0) — the same opinions
-# Sparkle applies internally, published so you can read, fork, or use them without Sparkle.
+# These rows come from SIX different marketplaces, and who owns each one is the thing to read:
+#   • Anthropic's official marketplace (anthropics/claude-plugins-official): superpowers,
+#     frontend_design, hookify, code_simplifier.
+#   • Sparkle's own public marketplace (github.com/try-sparkle/marketplace, Apache-2.0): the
+#     sparkle_* rows — the same opinions Sparkle applies internally, published so you can read,
+#     fork, or use them without Sparkle.
+#   • FOUR THIRD-PARTY marketplaces, owned by neither Anthropic nor Sparkle:
+#       obra/superpowers-marketplace ............ elements_of_style, double_shot_latte
+#       EveryInc/compound-engineering-plugin .... compound_engineering
+#       trailofbits/skills ...................... differential_review
+#       2389-research/claude-plugins ............ review_squad
 #
 # TRUST: a default-on plugin means Sparkle fetches that content and enables it in every agent
-# worktree. Two limits worth knowing, both stated as what is actually true rather than as
+# worktree. Three limits worth knowing, all stated as what is actually true rather than as
 # reassurance:
 #   • Content from SPARKLE'S marketplace is pinned; content from Anthropic's is not pinned by us.
 #     Sparkle's marketplace names each plugin by an exact ref + commit sha, enforced by that repo's
 #     CI, so editing a skill or hook file alone does not reach you. Anthropic's official marketplace
-#     (superpowers, frontend_design) is registered the same way any marketplace is — by repo name —
-#     and what it serves is Anthropic's to decide; Sparkle adds no pin of its own there.
+#     (superpowers, frontend_design, hookify, code_simplifier) is registered the same way any
+#     marketplace is — by repo name — and what it serves is Anthropic's to decide; Sparkle adds no
+#     pin of its own there.
 #     Neither LISTING is pinned either way: Sparkle registers a marketplace by repo name, so a
 #     change to the listing itself (a new row, or a row re-pointed at a different sha) is picked up
 #     on the next fetch.
+#   • THE FOUR THIRD-PARTY MARKETPLACES ARE PINNED BY NOBODY HERE. Sparkle does not own, audit, or
+#     pin obra/superpowers-marketplace, EveryInc/compound-engineering-plugin, trailofbits/skills or
+#     2389-research/claude-plugins. Sparkle registers each by repo name and installs whatever that
+#     listing points at, at the time of the fetch — so what those five rows run in your agent
+#     worktrees is whatever their owners publish, and it can change without Sparkle changing.
+#     Setting a row false below stops SPARKLE fetching it for this config layer — read the next
+#     point before relying on that, because a project you clone can turn it back on. These rows
+#     ship ON because their skills and commands are useful at the moment they become relevant and
+#     an agent will not stop to go install one; what you are trading for that is the paragraph
+#     above, which is why it is stated rather than summarized as "trusted".
 #   • A row set false here stops Sparkle for THIS config layer. [plugins] is repo-overridable, so a
 #     .sparkle/config.toml checked into a project you clone can turn a row back on for that project
 #     — the same way it can for [workflow]. If that matters to you, check a cloned repo's
@@ -5737,6 +5886,8 @@ seed_worktrees = false # restore backed-up env files into each newly created age
 [plugins]
 superpowers            = true    # the most-used agent methodology plugin: plan → TDD → review
 frontend_design        = true    # Anthropic's official UI-quality skill
+hookify                = true    # turn a "always do X after Y" instruction into a real Claude Code hook
+code_simplifier        = true    # cut accidental complexity out of code you just wrote, on request
 sparkle_guardrails     = false   # public copy of the built-in guardrails; on only if you want it as a skill
 sparkle_freshness      = true    # warn when your branch is far behind the default branch
 sparkle_mutation_check = false   # /mutation-check — prove a given test can actually fail
@@ -5752,6 +5903,14 @@ sparkle_secrets        = false   # the SKILL for restoring a project's .env from
                                  # the [tools].onepassword switch above is what performs backups
 sparkle_review_probes  = false   # don't merge a PR that still carries unanswered [blocking] review probes
 sparkle_pusher         = false   # surface a fleet condition to you proactively instead of waiting to be asked
+
+# Third-party rows — see the ownership list and the TRUST note above. Sparkle pins none of these.
+elements_of_style      = true    # Strunk & White for what an agent writes back to you: prose that says
+                                 # the thing instead of padding around it
+double_shot_latte      = true    # a second, adversarial pass over an answer before it reaches you
+compound_engineering   = true    # capture what a session learned so the next one starts from it
+differential_review    = true    # Trail of Bits' review of what a diff CHANGED, security-first
+review_squad           = true    # several reviewer personas over one change instead of a single pass
 
 # --- roborev first-run consent (per-machine; ignored in a project file) -----------------
 # roborev reviews your BUILD-agent commits locally. The first time it's about to turn on, Sparkle
@@ -7428,6 +7587,55 @@ quit_app = 42
             t.contains("repo-overridable"),
             "the template must say a project layer can re-enable a globally disabled row"
         );
+
+        // THIRD-PARTY OWNERSHIP, keyed off the table for the same reason the Anthropic clause is:
+        // the moment a DEFAULT-ON row comes from a marketplace owned by neither Anthropic nor
+        // Sparkle, the trust paragraph's two-marketplace story is false BY OMISSION — it describes
+        // what Sparkle fetches into every worktree and would be silently missing four owners. So
+        // each such repo must be named in the prose, and adding a fifth third-party marketplace
+        // forces this sentence to be revisited instead of quietly going stale.
+        //
+        // Asserted on the REPO string, not the marketplace name: `trailofbits` names both a
+        // marketplace and an org, so a paragraph mentioning the org in passing would satisfy a
+        // name check while never telling the reader which repo the content comes from.
+        //
+        // ...and asserted against the TRUST BLOCK ALONE, not the whole template. The ownership
+        // list higher up in the same `[plugins]` comment names these repos too, so a
+        // `DEFAULT_TEMPLATE.contains(repo)` check is satisfied by that list and CANNOT fail when
+        // the trust paragraph — the part that tells the reader nobody pins this content — quietly
+        // stops naming them. Measured: that exact mutation survived, which is the vacuous shape
+        // this file's own guidance warns about, so the haystack is narrowed to the paragraph the
+        // assertion message claims to be about.
+        let trust = {
+            let start = t.find("# TRUST:").expect("the [plugins] block must carry a TRUST paragraph");
+            let rest = &t[start..];
+            let end = rest.find("\n[plugins]\n").expect("the TRUST paragraph precedes the [plugins] table");
+            &rest[..end]
+        };
+        let third_party_repos: std::collections::BTreeSet<&str> = KNOWN_PLUGINS
+            .iter()
+            .filter(|p| p.default_on)
+            .filter(|p| p.marketplace != OFFICIAL_MARKETPLACE && p.marketplace != SPARKLE_MARKETPLACE)
+            .filter_map(|p| p.source.map(|s| s.repo))
+            .collect();
+        assert!(
+            !third_party_repos.is_empty(),
+            "the Tier 2 rows ship from third-party marketplaces; if that stopped being true, the \
+             trust paragraph naming them is what to revisit"
+        );
+        for repo in &third_party_repos {
+            assert!(
+                trust.contains(repo),
+                "`{repo}` is a DEFAULT-ON marketplace owned by neither Anthropic nor Sparkle, so \
+                 the [plugins] trust block must name it — a user deciding whether to keep these \
+                 rows on cannot see the owner anywhere else in this file"
+            );
+        }
+        assert!(
+            trust.contains("THE FOUR THIRD-PARTY MARKETPLACES ARE PINNED BY NOBODY HERE"),
+            "the trust block must say plainly that Sparkle pins none of the third-party \
+             marketplaces; naming the repos without that is still an omission"
+        );
         // The behavior the second claim describes, pinned right next to it — if this stops holding,
         // the sentence above is the thing to change.
         let g = "[plugins]\nsuperpowers = false\n";
@@ -7437,6 +7645,130 @@ quit_app = 42
             cfg.plugins.is_enabled("superpowers"),
             "a project layer really can re-enable what the global layer turned off"
         );
+    }
+
+    /// The seven Tier 2 rows (sparkle-s3g2.7), pinned by their EXACT `<plugin>@<marketplace>` id
+    /// and by the fact that they SHIP ON.
+    ///
+    /// The ids are the load-bearing part and are literal on purpose. Three of the four third-party
+    /// marketplace names do not match their repo name — `trailofbits` lives in `trailofbits/skills`,
+    /// `2389-research` in `2389-research/claude-plugins`, and `compound-engineering-plugin` holds a
+    /// plugin called `compound-engineering` — so the plausible guess is wrong in each case, and a
+    /// wrong `@marketplace` half writes a settings file Claude Code SILENTLY ignores: no error, no
+    /// missing-plugin message, the plugin simply never loads. Every string below was confirmed
+    /// against the live `.claude-plugin/marketplace.json` of each repo on 2026-08-25.
+    ///
+    /// Deriving the expectation from `KNOWN_PLUGINS` would make this agree with any table at all,
+    /// including one with a typo — which is the whole failure mode. Hence literals.
+    #[test]
+    fn the_tier_two_plugins_resolve_to_their_exact_marketplace_ids_and_ship_on() {
+        let (cfg, _, _) = effective(None, None);
+        let shipped: Vec<String> = cfg.plugins.enabled().iter().map(|p| p.id()).collect();
+
+        for (toggle, want_id, want_repo) in [
+            ("hookify", "hookify@claude-plugins-official", "anthropics/claude-plugins-official"),
+            (
+                "code_simplifier",
+                "code-simplifier@claude-plugins-official",
+                "anthropics/claude-plugins-official",
+            ),
+            (
+                "elements_of_style",
+                "elements-of-style@superpowers-marketplace",
+                "obra/superpowers-marketplace",
+            ),
+            (
+                "double_shot_latte",
+                "double-shot-latte@superpowers-marketplace",
+                "obra/superpowers-marketplace",
+            ),
+            (
+                "compound_engineering",
+                "compound-engineering@compound-engineering-plugin",
+                "EveryInc/compound-engineering-plugin",
+            ),
+            ("differential_review", "differential-review@trailofbits", "trailofbits/skills"),
+            ("review_squad", "review-squad@2389-research", "2389-research/claude-plugins"),
+        ] {
+            let row = KNOWN_PLUGINS
+                .iter()
+                .find(|p| p.toggle == toggle)
+                .unwrap_or_else(|| panic!("no KNOWN_PLUGINS row for `{toggle}`"));
+            assert_eq!(row.id(), want_id, "`{toggle}` must resolve to the exact Claude Code key");
+            let src = row.source.unwrap_or_else(|| {
+                panic!("`{toggle}` needs a source — the installer `marketplace add`s from it")
+            });
+            assert_eq!(
+                src.repo, want_repo,
+                "`{toggle}` must be installed from the repo whose marketplace.json actually lists it"
+            );
+            assert!(
+                shipped.contains(&want_id.to_string()),
+                "`{toggle}` ships ON: the bead is `default installed, invoked on demand`, so the \
+                 plugin has to be installed and enabled for the model to reach for it at all"
+            );
+        }
+
+        // The four unpublished `sparkle_*` rows are NOT part of this change and must stay off —
+        // this test would otherwise be satisfied by a blanket flip of the whole table.
+        for id in [
+            "sparkle-conflict-watch@sparkle",
+            "sparkle-secrets@sparkle",
+            "sparkle-review-probes@sparkle",
+            "sparkle-pusher@sparkle",
+        ] {
+            assert!(!shipped.contains(&id.to_string()), "{id} must stay off — content unpublished");
+        }
+    }
+
+    /// Every marketplace named by a row is BACKED by a declared source, and the non-official ones
+    /// are the exact set the four new consts describe.
+    ///
+    /// `every_known_plugin_has_a_live_toggle` already asserts `src.name == p.marketplace` per row,
+    /// which catches a source pointing at the wrong marketplace. What it CANNOT catch is a row
+    /// whose marketplace name is a typo consistently repeated in its own source — `trailofbit`
+    /// twice — because the two agree with each other. This pins the resulting set against the
+    /// verified constants, so a name that is not one of the six known marketplaces fails loudly.
+    #[test]
+    fn every_marketplace_in_the_table_is_one_of_the_six_declared_ones() {
+        let mut names: Vec<&str> = KNOWN_PLUGINS.iter().map(|p| p.marketplace).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(
+            names,
+            vec![
+                RESEARCH_2389_MARKETPLACE,
+                OFFICIAL_MARKETPLACE,
+                COMPOUND_ENGINEERING_MARKETPLACE,
+                SPARKLE_MARKETPLACE,
+                SUPERPOWERS_MARKETPLACE,
+                TRAIL_OF_BITS_MARKETPLACE,
+            ],
+            "a marketplace name no declared source backs is one Claude Code cannot resolve"
+        );
+
+        // The `@<marketplace>` half of an id must be the marketplace's own top-level `name`, never
+        // its repo or the repo's trailing path segment — the two differ for three of these four.
+        for (name, repo) in [
+            (SUPERPOWERS_MARKETPLACE, "obra/superpowers-marketplace"),
+            (COMPOUND_ENGINEERING_MARKETPLACE, "EveryInc/compound-engineering-plugin"),
+            (TRAIL_OF_BITS_MARKETPLACE, "trailofbits/skills"),
+            (RESEARCH_2389_MARKETPLACE, "2389-research/claude-plugins"),
+        ] {
+            let rows: Vec<&KnownPlugin> =
+                KNOWN_PLUGINS.iter().filter(|p| p.marketplace == name).collect();
+            assert!(!rows.is_empty(), "`{name}` is declared but no row uses it");
+            for row in rows {
+                let src = row.source.expect("every row needs a source");
+                assert_eq!(src.repo, repo, "`{}` must install from `{repo}`", row.toggle);
+                assert!(
+                    row.declared_source().is_some(),
+                    "`{}` lives in a marketplace Claude Code does not know; without a per-worktree \
+                     declaration the settings file names a marketplace the agent cannot resolve",
+                    row.id()
+                );
+            }
+        }
     }
 
     #[test]

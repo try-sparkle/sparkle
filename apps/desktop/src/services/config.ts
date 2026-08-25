@@ -170,6 +170,8 @@ export /** The `[plugins]` table as Rust serializes it.
 interface PluginsConfig {
   superpowers?: boolean;
   frontend_design?: boolean;
+  hookify?: boolean;
+  code_simplifier?: boolean;
   sparkle_guardrails?: boolean;
   sparkle_freshness?: boolean;
   sparkle_mutation_check?: boolean;
@@ -177,6 +179,11 @@ interface PluginsConfig {
   sparkle_secrets?: boolean;
   sparkle_review_probes?: boolean;
   sparkle_pusher?: boolean;
+  elements_of_style?: boolean;
+  double_shot_latte?: boolean;
+  compound_engineering?: boolean;
+  differential_review?: boolean;
+  review_squad?: boolean;
 }
 /** roborev machine-wide state (the one-time consent flag), its own section so Rust can gate the
  *  first-run modal on it. Machine-wide (like [tools]); ignored in a per-project file. */

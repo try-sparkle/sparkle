@@ -20,6 +20,13 @@ import {
   FiKey,
   FiMessageSquare,
   FiBell,
+  FiAnchor,
+  FiScissors,
+  FiEdit3,
+  FiCoffee,
+  FiLayers,
+  FiSearch,
+  FiUsers,
 } from "react-icons/fi";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { C, ON_BRAND_FILL } from "../theme/colors";
@@ -147,6 +154,18 @@ export const TOOL_META = {
     desc: "Anthropic's official UI-quality skill.",
     keywords: "frontend design ui quality plugin skill anthropic official marketplace",
   },
+  hookify: {
+    name: "Hookify",
+    desc: "Turn a \"always do X after Y\" instruction into a real Claude Code hook, so the rule runs instead of being remembered. Anthropic's official marketplace.",
+    keywords:
+      "hookify hook hooks automation rule posttooluse pretooluse settings claude code anthropic official marketplace plugin",
+  },
+  codeSimplifier: {
+    name: "Code simplifier",
+    desc: "Cut accidental complexity out of code on request — dead branches, redundant layers, over-general abstractions. Anthropic's official marketplace.",
+    keywords:
+      "code simplifier simplify complexity refactor cleanup dead code abstraction anthropic official marketplace plugin",
+  },
   sparkleGuardrails: {
     name: "Guardrails skill",
     desc: "The same discipline as Guardrails above, packaged as an installable skill you can use in plain Claude Code. Off by default — Guardrails already applies it to Sparkle's agents.",
@@ -193,6 +212,39 @@ export const TOOL_META = {
     desc: "Surface a fleet condition to a human proactively instead of waiting to be asked.",
     keywords:
       "pusher push notify proactive fleet condition surface alert human attention sparkle marketplace plugin",
+  },
+  // The five rows below come from THIRD-PARTY marketplaces — neither Anthropic's nor Sparkle's.
+  // Each desc names its owner, because that is the fact a user needs to decide whether they want
+  // that content fetched into every agent worktree, and nothing else on this row says it.
+  elementsOfStyle: {
+    name: "Elements of style",
+    desc: "Strunk & White for what an agent writes back to you: prose that says the thing instead of padding around it. From obra/superpowers-marketplace, a third-party marketplace Sparkle does not pin.",
+    keywords:
+      "elements of style writing prose strunk white editing clarity concise obra superpowers marketplace third party plugin",
+  },
+  doubleShotLatte: {
+    name: "Double shot latte",
+    desc: "A second, adversarial pass over an answer before it reaches you. From obra/superpowers-marketplace, a third-party marketplace Sparkle does not pin.",
+    keywords:
+      "double shot latte second pass adversarial critique verify answer review obra superpowers marketplace third party plugin",
+  },
+  compoundEngineering: {
+    name: "Compound engineering",
+    desc: "Capture what a session learned so the next one starts from it instead of rediscovering it. From EveryInc/compound-engineering-plugin, a third-party marketplace Sparkle does not pin.",
+    keywords:
+      "compound engineering learning capture memory retrospective every inc third party marketplace plugin",
+  },
+  differentialReview: {
+    name: "Differential review",
+    desc: "Review what a diff CHANGED, security-first, rather than re-reading the whole file. From trailofbits/skills, a third-party marketplace Sparkle does not pin.",
+    keywords:
+      "differential review diff security audit trail of bits trailofbits code review third party marketplace plugin",
+  },
+  reviewSquad: {
+    name: "Review squad",
+    desc: "Several reviewer personas over one change instead of a single pass. From 2389-research/claude-plugins, a third-party marketplace Sparkle does not pin.",
+    keywords:
+      "review squad personas multiple reviewers panel code review 2389 research third party marketplace plugin",
   },
 } as const satisfies Record<string, { name: string; desc: string; keywords: string }>;
 
@@ -431,6 +483,20 @@ const OFFICIAL_MARKETPLACE_REPO = "anthropics/claude-plugins-official";
 const SPARKLE_MARKETPLACE_URL = "https://github.com/try-sparkle/marketplace";
 
 const FRONTEND_DESIGN_URL = `https://github.com/${OFFICIAL_MARKETPLACE_REPO}/tree/main/plugins/frontend-design`;
+const HOOKIFY_URL = `https://github.com/${OFFICIAL_MARKETPLACE_REPO}/tree/main/plugins/hookify`;
+const CODE_SIMPLIFIER_URL = `https://github.com/${OFFICIAL_MARKETPLACE_REPO}/tree/main/plugins/code-simplifier`;
+
+/** The four THIRD-PARTY marketplaces the Tier 2 rows come from — owned by neither Anthropic nor
+ *  Sparkle, and pinned by neither. The repo strings must stay identical to the `*_MARKETPLACE_REPO`
+ *  constants in Rust's config.rs: this is the "Learn more" link a user follows to decide whether
+ *  they want that content in their worktrees, so pointing it at the wrong repo is worse than
+ *  omitting it. The `[plugins]` TRUST block in DEFAULT_TEMPLATE states the same ownership in prose. */
+const SUPERPOWERS_MARKETPLACE_URL = "https://github.com/obra/superpowers-marketplace";
+const ELEMENTS_OF_STYLE_URL = `${SUPERPOWERS_MARKETPLACE_URL}/tree/main/plugins/elements-of-style`;
+const DOUBLE_SHOT_LATTE_URL = `${SUPERPOWERS_MARKETPLACE_URL}/tree/main/plugins/double-shot-latte`;
+const COMPOUND_ENGINEERING_URL = "https://github.com/EveryInc/compound-engineering-plugin";
+const DIFFERENTIAL_REVIEW_URL = "https://github.com/trailofbits/skills/tree/main/plugins/differential-review";
+const REVIEW_SQUAD_URL = "https://github.com/2389-research/claude-plugins";
 
 /** Both plugin rows carry this. Sparkle writes `enabledPlugins` into an agent worktree's
  *  settings.local.json at prepare time and never removes an entry (insert-if-absent, so a plugin
@@ -701,6 +767,24 @@ export function ToolsPane({ query = "" }: { query?: string }) {
       onToggle: () => void setPluginEnabled("frontendDesign", !pluginsEnabled.frontendDesign),
     },
     {
+      ...TOOL_META.hookify,
+      key: "hookify",
+      Icon: FiAnchor,
+      url: HOOKIFY_URL,
+      hint: pluginHint(pluginInstallState.hookify),
+      checked: pluginsEnabled.hookify,
+      onToggle: () => void setPluginEnabled("hookify", !pluginsEnabled.hookify),
+    },
+    {
+      ...TOOL_META.codeSimplifier,
+      key: "codeSimplifier",
+      Icon: FiScissors,
+      url: CODE_SIMPLIFIER_URL,
+      hint: pluginHint(pluginInstallState.codeSimplifier),
+      checked: pluginsEnabled.codeSimplifier,
+      onToggle: () => void setPluginEnabled("codeSimplifier", !pluginsEnabled.codeSimplifier),
+    },
+    {
       ...TOOL_META.sparkleGuardrails,
       key: "sparkleGuardrails",
       Icon: FiShield,
@@ -766,6 +850,53 @@ export function ToolsPane({ query = "" }: { query?: string }) {
       hint: pluginHint(pluginInstallState.sparklePusher),
       checked: pluginsEnabled.sparklePusher,
       onToggle: () => void setPluginEnabled("sparklePusher", !pluginsEnabled.sparklePusher),
+    },
+    {
+      ...TOOL_META.elementsOfStyle,
+      key: "elementsOfStyle",
+      Icon: FiEdit3,
+      url: ELEMENTS_OF_STYLE_URL,
+      hint: pluginHint(pluginInstallState.elementsOfStyle),
+      checked: pluginsEnabled.elementsOfStyle,
+      onToggle: () => void setPluginEnabled("elementsOfStyle", !pluginsEnabled.elementsOfStyle),
+    },
+    {
+      ...TOOL_META.doubleShotLatte,
+      key: "doubleShotLatte",
+      Icon: FiCoffee,
+      url: DOUBLE_SHOT_LATTE_URL,
+      hint: pluginHint(pluginInstallState.doubleShotLatte),
+      checked: pluginsEnabled.doubleShotLatte,
+      onToggle: () => void setPluginEnabled("doubleShotLatte", !pluginsEnabled.doubleShotLatte),
+    },
+    {
+      ...TOOL_META.compoundEngineering,
+      key: "compoundEngineering",
+      Icon: FiLayers,
+      url: COMPOUND_ENGINEERING_URL,
+      hint: pluginHint(pluginInstallState.compoundEngineering),
+      checked: pluginsEnabled.compoundEngineering,
+      onToggle: () =>
+        void setPluginEnabled("compoundEngineering", !pluginsEnabled.compoundEngineering),
+    },
+    {
+      ...TOOL_META.differentialReview,
+      key: "differentialReview",
+      Icon: FiSearch,
+      url: DIFFERENTIAL_REVIEW_URL,
+      hint: pluginHint(pluginInstallState.differentialReview),
+      checked: pluginsEnabled.differentialReview,
+      onToggle: () =>
+        void setPluginEnabled("differentialReview", !pluginsEnabled.differentialReview),
+    },
+    {
+      ...TOOL_META.reviewSquad,
+      key: "reviewSquad",
+      Icon: FiUsers,
+      url: REVIEW_SQUAD_URL,
+      hint: pluginHint(pluginInstallState.reviewSquad),
+      checked: pluginsEnabled.reviewSquad,
+      onToggle: () => void setPluginEnabled("reviewSquad", !pluginsEnabled.reviewSquad),
     },
     {
       ...TOOL_META.onepassword,

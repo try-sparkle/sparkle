@@ -172,22 +172,33 @@ export const TOOL_FIELD: Record<
 // section ([plugins], repo-overridable) than [tools] (machine-wide), so a single key type would
 // make the wrong dotted path reachable. Same shape and same hydrate/optimistic-write pattern.
 
-/** Stable identifiers for the config-backed [plugins] flags.
+/** Stable identifiers for the config-backed [plugins] flags, across six marketplaces.
  *
  *  The `sparkle*` ones come from Sparkle's OWN public marketplace
  *  (github.com/try-sparkle/marketplace, Apache-2.0) rather than Anthropic's official one — the
  *  same opinions Sparkle applies internally, published so they can be read, forked, or used
- *  without Sparkle. */
+ *  without Sparkle. `superpowers`/`frontendDesign`/`hookify`/`codeSimplifier` come from
+ *  Anthropic's official marketplace. The last five come from THIRD-PARTY marketplaces Sparkle
+ *  neither owns nor pins — obra/superpowers-marketplace, EveryInc/compound-engineering-plugin,
+ *  trailofbits/skills and 2389-research/claude-plugins; the `[plugins]` TRUST block in
+ *  config.rs's DEFAULT_TEMPLATE is where that is spelled out for the user. */
 export type PluginKey =
   | "superpowers"
   | "frontendDesign"
+  | "hookify"
+  | "codeSimplifier"
   | "sparkleGuardrails"
   | "sparkleFreshness"
   | "sparkleMutationCheck"
   | "sparkleConflictWatch"
   | "sparkleSecrets"
   | "sparkleReviewProbes"
-  | "sparklePusher";
+  | "sparklePusher"
+  | "elementsOfStyle"
+  | "doubleShotLatte"
+  | "compoundEngineering"
+  | "differentialReview"
+  | "reviewSquad";
 
 /** Defaults, mirroring the `default_on` column of Rust's `KNOWN_PLUGINS`. Used until the first
  *  config hydrate answers for real.
@@ -203,6 +214,8 @@ export type PluginKey =
 export const PLUGIN_DEFAULTS: Record<PluginKey, boolean> = {
   superpowers: true,
   frontendDesign: true,
+  hookify: true,
+  codeSimplifier: true,
   // OFF: [tools].guardrails already injects this same prose (see the Rust table).
   sparkleGuardrails: false,
   sparkleFreshness: true,
@@ -217,6 +230,13 @@ export const PLUGIN_DEFAULTS: Record<PluginKey, boolean> = {
   sparkleSecrets: false,
   sparkleReviewProbes: false,
   sparklePusher: false,
+  // Tier 2, third-party marketplaces (see the PluginKey note above). ON: their content is
+  // published and confirmed present in each listing, so the install resolves on the first try.
+  elementsOfStyle: true,
+  doubleShotLatte: true,
+  compoundEngineering: true,
+  differentialReview: true,
+  reviewSquad: true,
 };
 
 // --- Chief sync state (replacing the legacy markdown-sync watermark) -----------------------
@@ -1410,6 +1430,8 @@ export const useSettingsStore = create<SettingsState>()(
           pluginsEnabled: {
             superpowers: config.plugins?.superpowers ?? PLUGIN_DEFAULTS.superpowers,
             frontendDesign: config.plugins?.frontend_design ?? PLUGIN_DEFAULTS.frontendDesign,
+            hookify: config.plugins?.hookify ?? PLUGIN_DEFAULTS.hookify,
+            codeSimplifier: config.plugins?.code_simplifier ?? PLUGIN_DEFAULTS.codeSimplifier,
             sparkleGuardrails:
               config.plugins?.sparkle_guardrails ?? PLUGIN_DEFAULTS.sparkleGuardrails,
             sparkleFreshness: config.plugins?.sparkle_freshness ?? PLUGIN_DEFAULTS.sparkleFreshness,
@@ -1421,6 +1443,13 @@ export const useSettingsStore = create<SettingsState>()(
             sparkleReviewProbes:
               config.plugins?.sparkle_review_probes ?? PLUGIN_DEFAULTS.sparkleReviewProbes,
             sparklePusher: config.plugins?.sparkle_pusher ?? PLUGIN_DEFAULTS.sparklePusher,
+            elementsOfStyle: config.plugins?.elements_of_style ?? PLUGIN_DEFAULTS.elementsOfStyle,
+            doubleShotLatte: config.plugins?.double_shot_latte ?? PLUGIN_DEFAULTS.doubleShotLatte,
+            compoundEngineering:
+              config.plugins?.compound_engineering ?? PLUGIN_DEFAULTS.compoundEngineering,
+            differentialReview:
+              config.plugins?.differential_review ?? PLUGIN_DEFAULTS.differentialReview,
+            reviewSquad: config.plugins?.review_squad ?? PLUGIN_DEFAULTS.reviewSquad,
           },
           // NOTE THE ASYMMETRY: every tool above falls back to `?? true`, this one to `?? false`.
           // 1Password backup needs an external account, the `op` CLI, and a chosen vault before it

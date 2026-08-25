@@ -525,6 +525,8 @@ export async function setStraudeEnabled(on: boolean): Promise<void> {
 const PLUGINS_CONFIG_PATH: Record<PluginKey, string> = {
   superpowers: "plugins.superpowers",
   frontendDesign: "plugins.frontend_design",
+  hookify: "plugins.hookify",
+  codeSimplifier: "plugins.code_simplifier",
   sparkleGuardrails: "plugins.sparkle_guardrails",
   sparkleFreshness: "plugins.sparkle_freshness",
   sparkleMutationCheck: "plugins.sparkle_mutation_check",
@@ -532,6 +534,11 @@ const PLUGINS_CONFIG_PATH: Record<PluginKey, string> = {
   sparkleSecrets: "plugins.sparkle_secrets",
   sparkleReviewProbes: "plugins.sparkle_review_probes",
   sparklePusher: "plugins.sparkle_pusher",
+  elementsOfStyle: "plugins.elements_of_style",
+  doubleShotLatte: "plugins.double_shot_latte",
+  compoundEngineering: "plugins.compound_engineering",
+  differentialReview: "plugins.differential_review",
+  reviewSquad: "plugins.review_squad",
 };
 
 /** Store key → the `[plugins]` TOML key Rust reports back in a `PluginInstallOutcome`.

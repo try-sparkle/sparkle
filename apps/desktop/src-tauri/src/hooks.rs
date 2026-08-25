@@ -2894,6 +2894,20 @@ mod tests {
         );
         assert!(got.contains("superpowers@claude-plugins-official"));
         assert!(got.contains("sparkle-freshness@sparkle"));
+        // Tier 2 (sparkle-s3g2.7) — `default installed, invoked on demand`, so these are part of
+        // the deliberate record of WHICH plugins land in every worktree. Named literally, next to
+        // the rows they were added beside, for the same reason as everything else in this block.
+        for id in [
+            "hookify@claude-plugins-official",
+            "code-simplifier@claude-plugins-official",
+            "elements-of-style@superpowers-marketplace",
+            "double-shot-latte@superpowers-marketplace",
+            "compound-engineering@compound-engineering-plugin",
+            "differential-review@trailofbits",
+            "review-squad@2389-research",
+        ] {
+            assert!(got.contains(id), "{id} must ship on — its content is published and verified");
+        }
 
         // The four newer Sparkle rows are absent from the default set, by their exact Claude Code
         // keys. Named literally, not derived from the table, because this test is the deliberate
@@ -2916,6 +2930,87 @@ mod tests {
                 "{id} must NOT ship on until it exists in try-sparkle/marketplace"
             );
         }
+    }
+
+    /// THE Tier 2 test (sparkle-s3g2.7): what the shipped default set actually WRITES into every
+    /// agent worktree's settings.local.json for the seven new rows.
+    ///
+    /// This asserts the SIDE EFFECT, not the catalog. Reading a row back out of `KNOWN_PLUGINS`
+    /// proves the row exists; what decides whether the plugin ever loads is the two literal keys
+    /// below, and they are the pair that can be independently wrong:
+    ///
+    ///   * `enabledPlugins` must be keyed by the exact `<plugin>@<marketplace>` id, where
+    ///     `<marketplace>` is the marketplace's own top-level `name`. For three of these four
+    ///     third-party marketplaces that name is NOT the repo's trailing path segment — the
+    ///     `trailofbits` marketplace lives in `trailofbits/skills`, `2389-research` in
+    ///     `2389-research/claude-plugins`, and `compound-engineering-plugin` holds a plugin named
+    ///     `compound-engineering`. Every plausible shorthand is wrong, and a wrong key is accepted
+    ///     silently: no error, no missing-plugin message, the plugin simply never loads.
+    ///   * `extraKnownMarketplaces` must carry each of those four names in the NESTED
+    ///     `{"source":{"source":"github","repo":"owner/repo"}}` shape. Without the declaration the
+    ///     ids above name a marketplace the agent cannot resolve, so a perfectly-spelled
+    ///     `enabledPlugins` key still enables nothing.
+    ///
+    /// Driven off `SparkleConfig::default()` — the real input a real worktree gets — rather than
+    /// `with_all(true)`, so a row that stopped shipping ON fails here instead of passing on a
+    /// forced set no user has.
+    #[test]
+    fn the_tier_two_rows_land_in_a_worktree_with_their_exact_keys_and_declared_marketplaces() {
+        let out = merge_plugin_settings(None, &shipped_defaults());
+        let v: Value = serde_json::from_str(&out).unwrap();
+
+        for id in [
+            "hookify@claude-plugins-official",
+            "code-simplifier@claude-plugins-official",
+            "elements-of-style@superpowers-marketplace",
+            "double-shot-latte@superpowers-marketplace",
+            "compound-engineering@compound-engineering-plugin",
+            "differential-review@trailofbits",
+            "review-squad@2389-research",
+        ] {
+            assert_eq!(
+                v["enabledPlugins"][id],
+                json!(true),
+                "`{id}` must be enabled by its exact Claude Code key — a wrong marketplace half is \
+                 accepted silently and the plugin never loads"
+            );
+        }
+
+        let mk = v
+            .get("extraKnownMarketplaces")
+            .expect("four third-party marketplaces must be declared per worktree");
+        for (name, repo) in [
+            ("superpowers-marketplace", "obra/superpowers-marketplace"),
+            ("compound-engineering-plugin", "EveryInc/compound-engineering-plugin"),
+            ("trailofbits", "trailofbits/skills"),
+            ("2389-research", "2389-research/claude-plugins"),
+        ] {
+            assert_eq!(
+                mk[name],
+                json!({ "source": { "source": "github", "repo": repo } }),
+                "`{name}` must be declared in the nested github shape, or every id ending \
+                 `@{name}` names a marketplace the agent cannot resolve"
+            );
+        }
+
+        // The official marketplace is still never re-declared — Claude Code owns it, and the two
+        // new official rows must not change that.
+        assert!(
+            mk.get(crate::config::OFFICIAL_MARKETPLACE).is_none(),
+            "never re-declare Claude Code's own marketplace, even now that four rows use it"
+        );
+
+        // A third-party marketplace is declared ONLY because a row that ships ON needs it. Sparkle's
+        // own marketplace still appears (sparkle_freshness ships on); an entry for a marketplace no
+        // enabled row uses would be a settings key pointing at content nobody fetches.
+        let declared: std::collections::BTreeSet<&str> =
+            mk.as_object().expect("must be an object").keys().map(String::as_str).collect();
+        let needed: std::collections::BTreeSet<&str> = shipped_defaults()
+            .iter()
+            .filter_map(|p| p.declared_source())
+            .map(|s| s.name)
+            .collect();
+        assert_eq!(declared, needed, "declare exactly the marketplaces the shipped set needs");
     }
 
     #[test]

@@ -85,7 +85,7 @@ import {
   removeRepoHooks,
 } from "./roborev";
 import { ensureBacklogDrainer } from "./drainer";
-import { useSettingsStore, DEFAULT_SPARKLE_CONSENT } from "../stores/settingsStore";
+import { useSettingsStore, DEFAULT_SPARKLE_CONSENT, PLUGIN_DEFAULTS } from "../stores/settingsStore";
 import { useProjectStore } from "../stores/projectStore";
 
 beforeEach(() => {
@@ -125,6 +125,60 @@ describe("setPluginEnabled — the [plugins] flags", () => {
       vi.mocked(setConfigValue).mockClear();
       void setPluginEnabled(key, false);
       expect(setConfigValue).toHaveBeenCalledWith(path, false);
+    }
+  });
+
+  it("maps every Tier 2 plugin key to its exact [plugins] TOML key", () => {
+    // Same boundary as the test above, and the same silent death — but these seven keys
+    // (sparkle-s3g2.7) are the ones a reader is most likely to "fix" into something plausible.
+    // `codeSimplifier` is `code_simplifier`, not `code-simplifier` (that is the PLUGIN name, and
+    // the hyphenated form is a [plugins] key Rust's KNOWN_PLUGINS does not claim — it parses,
+    // applies nothing, and only shows up as an "unknown [plugins] key" warning in a log nobody
+    // reads, while the switch still moves). Literal strings on both sides on purpose: deriving the
+    // expectation from PLUGINS_CONFIG_PATH would make this agree with any mapping, wrong ones
+    // included.
+    for (const [key, path] of [
+      ["hookify", "plugins.hookify"],
+      ["codeSimplifier", "plugins.code_simplifier"],
+      ["elementsOfStyle", "plugins.elements_of_style"],
+      ["doubleShotLatte", "plugins.double_shot_latte"],
+      ["compoundEngineering", "plugins.compound_engineering"],
+      ["differentialReview", "plugins.differential_review"],
+      ["reviewSquad", "plugins.review_squad"],
+    ] as const) {
+      vi.mocked(setConfigValue).mockClear();
+      void setPluginEnabled(key, false);
+      expect(setConfigValue).toHaveBeenCalledWith(path, false);
+    }
+  });
+
+  it("ships every Tier 2 plugin ON by default", () => {
+    // The bead is "default installed, invoked on demand" — the plugin has to be enabled for its
+    // skills and commands to be AVAILABLE at all. PLUGIN_DEFAULTS is what the toggle paints before
+    // the config hydrate answers, so a `false` here shows the user an off switch for a plugin that
+    // is in fact installed and running. Rust's
+    // `the_frontend_plugin_defaults_mirror_matches_this_tables_default_on_column` pins the other
+    // direction (this file against KNOWN_PLUGINS); this pins the intended VALUE, so flipping both
+    // mirrors to false in lockstep still fails here.
+    for (const key of [
+      "hookify",
+      "codeSimplifier",
+      "elementsOfStyle",
+      "doubleShotLatte",
+      "compoundEngineering",
+      "differentialReview",
+      "reviewSquad",
+    ] as const) {
+      expect(PLUGIN_DEFAULTS[key]).toBe(true);
+    }
+    // ...and this change must not have flipped the four unpublished sparkle_* rows along with them.
+    for (const key of [
+      "sparkleConflictWatch",
+      "sparkleSecrets",
+      "sparkleReviewProbes",
+      "sparklePusher",
+    ] as const) {
+      expect(PLUGIN_DEFAULTS[key]).toBe(false);
     }
   });
 
