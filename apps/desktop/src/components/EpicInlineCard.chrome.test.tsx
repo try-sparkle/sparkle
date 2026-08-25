@@ -211,7 +211,7 @@ describe("items 17+18 — the gold EPIC pill on the card the column mounts", () 
   // [10:08] "it should look the same when it's open as it does when it's closed."
   it("sits above the title, on the card's top-left", () => {
     mount();
-    const pill = screen.getByTestId(`${T}-epic-pill`);
+    const pill = screen.getByTestId(`${T}-type-pill`);
     const title = screen.getByTestId(`${T}-title`);
 
     expect(pill.textContent).toBe("EPIC");

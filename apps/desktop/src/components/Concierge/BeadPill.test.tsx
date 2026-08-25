@@ -222,7 +222,14 @@ describe("BeadPill — the card opens in place", () => {
     expect(meta).not.toContain("in_progress");
     expect(meta).not.toContain("in progress");
     expect(meta).toContain("P1");
-    expect(meta).toContain("feature");
+    // THE TYPE IS A PILL NOW, AND ON THIS SURFACE TOO — which is the point of `sparkle-huw924.8`:
+    // the founder asked for the type badge to read the same on the board, the Epics column AND the
+    // concierge card. So the type left this metadata row by design; asserting it is still HERE would
+    // be asserting the inconsistency he asked to have removed.
+    expect(meta).not.toContain("feature");
+    const typePill = screen.getByTestId("concierge-bead-card-type-pill");
+    expect(typePill.textContent).toBe("FEATURE");
+    expect(typePill.getAttribute("data-bead-type")).toBe("feature");
   });
 
   it("shows the description", () => {

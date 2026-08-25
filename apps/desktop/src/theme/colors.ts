@@ -205,6 +205,8 @@ export const THEME_HEX = {
     mixedInk: "#ecb968", violetInk: "#a185f5", questionsInk: "#7dd3fc",
     // See the EPIC CARD block below `C` for why these three exist and how each value was derived.
     epicCardFill: "#1d3362", epicPillFill: "#e0982f", onEpicPillFill: "#0a1a3f",
+    // EVERY OTHER TYPE'S PILL — cool slate, so the epic's warm badge stays the loud one.
+    typePillFill: "#7690b9", onTypePillFill: "#04101f",
   },
   light: {
     inputSurface: BLUEPRINT.light.input,
@@ -234,6 +236,9 @@ export const THEME_HEX = {
     mixedInk: "#ab4e07", violetInk: "#5636b8", questionsInk: "#075985",
     // LIGHT DIFFERENTIATES BY HUE, NOT BY LUMINANCE — see the EPIC CARD block below `C`.
     epicCardFill: "#dce0ff", epicPillFill: "#664200", onEpicPillFill: "#ffffff",
+    // The cool-slate pair, inverted for light: a DARK fill under white ink, because every
+    // ground it sits on here is pale. See the block below `C`.
+    typePillFill: "#546b8e", onTypePillFill: "#ffffff",
   },
 } as const;
 
@@ -567,6 +572,24 @@ export const C = {
   // ink it was measured with: near-navy on dark's amber (7.06:1), white on light's ochre (8.96:1).
   epicPillFill: "var(--c-epic-pill-fill)",
   onEpicPillFill: "var(--c-on-epic-pill-fill)",
+  // EVERY OTHER TYPE'S PILL — `BUG`, `TASK`, `FEATURE`. The founder's ruling (sparkle-huw924.8) is
+  // that the top-left pill is the general treatment for a bead's type and not an epic-only badge,
+  // so this is the pair the non-epic majority takes.
+  //
+  // COOL SLATE, DELIBERATELY, and that is the whole design decision in this pair. The epic pill is
+  // the only WARM fill on a card; if the type pill were warm too, a board of tasks would shout as
+  // loudly as its one epic and the gold would stop meaning anything. Slate reads as neutral
+  // metadata beside it while still being a filled badge rather than a second register.
+  //
+  // THE BINDING CONSTRAINT IS THE EPIC CARD, NOT THE ORDINARY ONE. `BeadCard` has three chrome
+  // surfaces — `dialogSurface` (the board's overlay), `forest` (the concierge) and `epicCardFill`
+  // (the epics column) — and the pill must clear CONTROL_MIN_CONTRAST on ALL THREE. On dark,
+  // `epicCardFill` (#1d3362) is the lightest of them, and nothing DARKER than it can clear 3:1
+  // against it without also disappearing into `forest` (#030913); so dark's fill goes LIGHTER than
+  // its grounds while light's goes darker, and each carries the ink it was measured with. Both
+  // directions are asserted in theme/epicCardContrast.test.ts.
+  typePillFill: "var(--c-type-pill-fill)",
+  onTypePillFill: "var(--c-on-type-pill-fill)",
 };
 
 // ── THE OVERLAY SCRIM AND THE MODAL SHADOW ────────────────────────────────────────────────────

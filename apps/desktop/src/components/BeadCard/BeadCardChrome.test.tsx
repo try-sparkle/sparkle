@@ -216,9 +216,9 @@ describe("items 15+16 — the id and the Chat button, top right, id on the LEFT"
   });
 });
 
-// ── ITEMS 17 + 18 — THE GOLD EPIC PILL ──────────────────────────────────────────────────────────
+// ── ITEMS 17 + 18 — THE TYPE PILL ───────────────────────────────────────────────────────────────
 
-describe("items 17+18 — the gold EPIC pill, top LEFT, above the title", () => {
+describe("items 17+18 — the TYPE pill, top LEFT, above the title", () => {
   const t = ID("epics");
 
   // [08:42] "We have it above the title. So that should be above the title… And then in the top
@@ -226,7 +226,7 @@ describe("items 17+18 — the gold EPIC pill, top LEFT, above the title", () => 
   // closed."
   it("sits above the title and left of the corner cluster", () => {
     mount("epics", { onChat: () => {} });
-    const pill = screen.getByTestId(`${t}-epic-pill`);
+    const pill = screen.getByTestId(`${t}-type-pill`);
 
     expect(pill.textContent).toBe("EPIC");
     expect(precedes(pill, screen.getByTestId(`${t}-title`))).toBe(true);
@@ -240,7 +240,7 @@ describe("items 17+18 — the gold EPIC pill, top LEFT, above the title", () => 
   // anything once two surfaces draw it.
   it("carries the board's own treatment, not a second one drawn by eye", () => {
     mount("epics");
-    const pill = screen.getByTestId(`${t}-epic-pill`);
+    const pill = screen.getByTestId(`${t}-type-pill`);
 
     expect(pill.style.background).toBe(C.epicPillFill);
     expect(pill.style.color).toBe(C.onEpicPillFill);
@@ -248,13 +248,49 @@ describe("items 17+18 — the gold EPIC pill, top LEFT, above the title", () => 
     expect(pill.style.letterSpacing).toBe(TAG.letterSpacing);
   });
 
-  // Mounted and checked, per this file's header: the TASK card is fully on screen, so the missing
-  // pill is a statement about `bead.type` and not about an empty tree.
-  it("is absent on a TASK card that is otherwise fully rendered", () => {
-    render(<BeadCard bead={TASK} chrome="epics" stage="planned" workers={[]} />);
+  // ══ NOT AN EPIC-ONLY BADGE — bead `sparkle-huw924.8` ══════════════════════════════════════════
+  // This row used to assert the pill was ABSENT on a task card. The founder's next screenshot was an
+  // OPEN card of type `bug` with that corner empty and the type printed as plain lowercase text in
+  // the metadata row: *"an epic reads EPIC, a bug reads BUG, a task reads TASK. Do not special-case
+  // epics."* So the assertion is inverted, and it is on the two things that actually distinguish a
+  // TASK pill from the EPIC one — its LABEL and its FILL.
+  it.each([
+    ["task", "TASK"],
+    ["bug", "BUG"],
+    ["feature", "FEATURE"],
+  ])("labels a %s card %s, in the non-epic fill", (type, label) => {
+    render(
+      <BeadCard bead={{ ...TASK, type }} chrome="epics" stage="planned" workers={[]} />,
+    );
+    expect(screen.getByTestId(`${t}-title`).textContent).toBe(TASK.title);
+    const pill = screen.getByTestId(`${t}-type-pill`);
+    expect(pill.textContent).toBe(label);
+    expect(pill.style.background).toBe(C.typePillFill);
+    expect(pill.style.color).toBe(C.onTypePillFill);
+    // The gold is the EPIC's, and only the epic's — the whole point of the two-token split.
+    expect(pill.style.background).not.toBe(C.epicPillFill);
+  });
+
+  // THE OTHER HALF: the type is shown ONCE. The metadata row printed `bead.type` as plain lowercase
+  // prose, which is the duplicate the founder was looking at. Mounted and checked — the row IS on
+  // screen with its other items, so this is a statement about the type item and not an empty tree.
+  it("does NOT also print the type as plain text in the metadata row", () => {
+    render(<BeadCard bead={{ ...TASK, type: "bug" }} chrome="epics" stage="planned" workers={[]} />);
+    const meta = screen.getByTestId(`${t}-meta`);
+    expect(meta.textContent).toContain("P1");
+    expect(meta.textContent).not.toContain("bug");
+    expect(screen.getByTestId(`${t}-type-pill`).textContent).toBe("BUG");
+  });
+
+  // Mounted and checked, per this file's header: the card is fully on screen, so the missing pill is
+  // a statement about a bead bd gave no type at all — the one case that still renders no pill.
+  it("is absent on a card with NO type, which is otherwise fully rendered", () => {
+    render(
+      <BeadCard bead={{ ...TASK, type: undefined }} chrome="epics" stage="planned" workers={[]} />,
+    );
     expect(screen.getByTestId(`${t}-title`).textContent).toBe(TASK.title);
     expect(screen.getByTestId(`${t}-meta`)).toBeTruthy();
-    expect(screen.queryByTestId(`${t}-epic-pill`)).toBeNull();
+    expect(screen.queryByTestId(`${t}-type-pill`)).toBeNull();
   });
 
   // It is drawn from the BEAD, never from the surface — so the board's expanded card gets it too.
@@ -262,7 +298,7 @@ describe("items 17+18 — the gold EPIC pill, top LEFT, above the title", () => 
     for (const chrome of ["board", "concierge", "epics"] as const) {
       cleanup();
       mount(chrome);
-      expect(screen.getByTestId(`${ID(chrome)}-epic-pill`).textContent).toBe("EPIC");
+      expect(screen.getByTestId(`${ID(chrome)}-type-pill`).textContent).toBe("EPIC");
     }
   });
 });

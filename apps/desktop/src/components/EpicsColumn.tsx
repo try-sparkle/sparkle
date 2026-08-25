@@ -68,6 +68,17 @@ import {
   readStoredEpicsWidth,
 } from "../engine/columnResize";
 import { EPIC_LADDER_COLUMNS, bucketEpics, type EpicLadderKey } from "../services/epicBoard";
+// ── THE ORDER IS THE PLAN BOARD'S, NOT A SECOND ONE ───────────────────────────────────────────
+// `sortEpicBoard` is `sparkle-hhb5re`'s comparator — the same one `BoardView` applies to the same
+// `EpicBoard` shape — and `BoardSort`/`SORT_LABEL` are the same identifiers and words its chip
+// offers. This column contributes a CONTROL (`EpicsColumnSortControl`) and nothing about ordering;
+// see that file's header for why `type` is the one option it does not offer.
+import { sortEpicBoard } from "../services/boardSort";
+import type { BoardSort } from "../services/boardFilters";
+import { EpicsColumnSortControl } from "./EpicsColumnSortControl";
+// WHERE a bead sits, decided once, as data — see that module's header for the founder's ruling that
+// this question is answered by MOVING THE COLUMN and never by a sentence on screen.
+import { flashTargetId, revealFor } from "../engine/epicReveal";
 // ── THE HEALTH WIRING IS ONE HOOK, SHARED WITH THE PLAN BOARD ─────────────────────────────────
 // It used to be a memo right here, which was correct while this column was the only surface asking.
 // `BoardView`'s Epics mode now renders the same ladder and needs the same answer for its Unstaffed
@@ -98,6 +109,87 @@ const NO_BEADS: Bead[] = [];
 /** The same trick for the roster: a pair with no project must not hand a fresh `[]` to the health
  *  memos each render and rebuild the whole rollup for a column that has nothing in it. */
 const NO_AGENTS: AgentTab[] = [];
+
+// ══ THE REVEAL — "SHOW ME WHERE THIS SITS", NEVER A SENTENCE SAYING WHERE ══════════════════════
+//
+// The founder pressed **Open in column** on a TASK, the column lists epics, and nothing moved. He
+// was offered an explanatory message ("this is a task, not an epic") and rejected it by name:
+//
+//   *"instead of saying this is a task, not an epic […] it should open the parent epic […] And then
+//   I should already be able to see all the children that are attached to that epic. So maybe it
+//   scrolls me to that child […] And then it flashes it briefly […] So it draws my attention to it
+//   […] I would just want you to show me where it sits inside of the Epic."*
+//
+// So the four verbs below are the whole feature: OPEN the parent epic, EXPAND it, SCROLL to the
+// child, FLASH the child. `engine/epicReveal` decides WHAT; everything from here down is HOW.
+
+/** How long the highlight is held. ~1.2s: long enough that an eye arriving late still catches it,
+ *  short enough that it reads as a flash rather than as a new selected state (the row already has
+ *  one of those, and two persistent highlights in one column is the ambiguity this must not add). */
+const FLASH_MS = 1200;
+
+/** The reveal target may not be in the DOM on the commit that asks for it: expanding a collapsed
+ *  stage, opening the epic's card and PACKING its task pills each take a render, and the pills are
+ *  packed by a measurement pass rather than painted straight out. So the lookup RETRIES — briefly,
+ *  and then gives up silently. Giving up is the correct end state: the alternative is a notice
+ *  saying the reveal failed, which is the message the founder ruled out wearing a different hat. */
+const FLASH_FIND_ATTEMPTS = 20;
+const FLASH_FIND_INTERVAL_MS = 16;
+
+/** Does this reader want motion suppressed? Read at flash time rather than subscribed to: the
+ *  answer only matters for the 1.2s a flash lasts, and the OS setting does not change mid-flash.
+ *  Same probe `SendModeTray` uses, and guarded the same way — `matchMedia` is absent in some test
+ *  environments and a missing accessibility probe must never take the reveal down with it. */
+function prefersReducedMotion(): boolean {
+  return typeof matchMedia === "function" && matchMedia("(prefers-reduced-motion: reduce)").matches;
+}
+
+/** The first of `selectors` that resolves inside `root`, or null. ORDERED, and the order carries
+ *  the fallback: a child reveal asks for the task's pill INSIDE the open card first and settles for
+ *  the epic's row only if the pill is not drawn (it can be packed behind "+N more"). Landing on the
+ *  row is still an answer to "where does this sit"; landing nowhere is not. */
+function findFlashTarget(root: HTMLElement, selectors: readonly string[]): HTMLElement | null {
+  for (const sel of selectors) {
+    const el = root.querySelector<HTMLElement>(sel);
+    if (el !== null) return el;
+  }
+  return null;
+}
+
+/**
+ * Paint the flash onto `el` and hand back the undo.
+ *
+ * WRITTEN IMPERATIVELY, ONTO A NODE THIS FILE DOES NOT RENDER — because the child being revealed is
+ * a task pill inside `EpicInlineCard`'s `BeadCard`, several components away and owned by neither
+ * this file nor this change. Threading a "are you the flashed one" prop down that chain would put
+ * a transient viewport concern into three components' APIs; setting one attribute and two style
+ * properties on the resolved node, and putting them back afterwards, keeps it entirely here.
+ *
+ * `data-bead-flash` is the marker the tests read, and it carries WHICH treatment was applied so
+ * that the reduced-motion path is observable rather than merely believed.
+ */
+function applyFlash(el: HTMLElement, motion: "animate" | "static"): () => void {
+  const prevBackground = el.style.backgroundColor;
+  const prevColor = el.style.color;
+  const prevTransition = el.style.transition;
+  el.setAttribute("data-bead-flash", motion);
+  // UNDER `reduce` THE HIGHLIGHT IS STILL PAINTED, AND HELD FOR THE SAME 1.2s — only the fade is
+  // dropped. Skipping the reveal for a reduced-motion reader would take away the ONLY confirmation
+  // the click did anything, which is a strictly worse outcome than the movement it avoids.
+  el.style.transition =
+    motion === "animate" ? "background-color 220ms ease-out, color 220ms ease-out" : "";
+  // The epic pill's fill and its PAIRED ink, so the flashed row does not lose its text for 1.2s.
+  // These two are themed together for exactly this reason; a hand-picked highlight here would be a
+  // fourth un-themed colour in a column the repaint just finished cleaning up.
+  el.style.backgroundColor = C.epicPillFill;
+  el.style.color = C.onEpicPillFill;
+  return () => {
+    el.removeAttribute("data-bead-flash");
+    el.style.backgroundColor = prevBackground;
+    el.style.color = prevColor;
+    el.style.transition = prevTransition;
+  };
+}
 
 /** Which stages start OPEN.
  *
@@ -241,19 +333,44 @@ export function EpicsColumn({
   // NO WRITE TO BD HAPPENS ANYWHERE ON THIS PATH. The rung is purely derived, which is what makes it
   // honest for every existing `in_progress` bead the instant it ships, and what makes a card slide
   // back to "Being built" by itself the moment an agent binds.
-  const ladder = useMemo(
+  // ── THE ORDER WITHIN EACH RUNG ───────────────────────────────────────────────────────────────
+  // The founder, item 4 of `sparkle-huw924`: a sort-by control belongs in this header. The
+  // SELECTION lives here, in the column's own state, rather than in `uiStore`: it is a reading
+  // posture for one column on one side — the same argument `collapsed` above makes — and it is
+  // deliberately NOT folded into `boardFilterBySide`, which is the PLAN BOARD's control and would
+  // then swing this column from a chip the user cannot see while the board is up.
+  const [sortBy, setSortBy] = useState<BoardSort>("priority");
+  // READ, NEVER WRITTEN. The date sorts have to read SOME timestamp field, and the app already
+  // holds exactly one answer to "created or updated" — the board's own chip. Minting a second
+  // switch here would let the two surfaces disagree about what "Newest" means, which is the whole
+  // reason `boardFilters` keeps `sortBy` and `dateField` in one object.
+  const dateField = useUiStore((s) => s.boardFilterBySide[side].dateField);
+
+  const ladder = useMemo(() => {
     // ONE RULE DECIDES THE RUNG, and it is `engine/epicHealth`'s. This passed a BOOLEAN
     // (`healthOf(id) !== "unstaffed"`), which could only ever say inProgress-or-unstaffed — so the
     // founder's *"if the agents are Red then it would go into blocked"* had nowhere to land, and
     // `rungForEpicHealth` sat with zero production callers while its tests asserted it as live.
-    () => (board ? bucketEpics(board, allBeads, (id) => rungForEpicHealth(healthOf(id))) : null),
-    [board, allBeads, healthOf],
-  );
+    const bucketed = board
+      ? bucketEpics(board, allBeads, (id) => rungForEpicHealth(healthOf(id)))
+      : null;
+    // SORTED WITHIN EACH RUNG, NOT FLATTENED. `sortEpicBoard` walks the ladder's own key list and
+    // orders each column's array in place of itself, so the seven stages, their counts and their
+    // collapse state are all exactly as they were — only the rows inside one stage move. Applied
+    // HERE rather than at the render loop so the rendering below reads one `ladder` as it always
+    // has, and so the sort's own cache is keyed on the bucketed arrays' identity.
+    return bucketed ? sortEpicBoard(bucketed, sortBy, dateField, allBeads) : null;
+  }, [board, allBeads, healthOf, sortBy, dateField]);
 
   // ── SELECTION ────────────────────────────────────────────────────────────────────────────────
   const focusedEpicId = useUiStore((s) => s.epicFocusBySide[side]);
   const setEpicFocus = useUiStore((s) => s.setEpicFocus);
   const openPlanBoard = useUiStore((s) => s.openPlanBoard);
+  // ── THE REVEAL REQUEST ───────────────────────────────────────────────────────────────────────
+  // An EVENT, not a selection — `uiStore.columnRevealBySide` explains at length why those cannot be
+  // the same key, and the short version is that a bead already on screen must still flash.
+  const revealRequest = useUiStore((s) => s.columnRevealBySide[side]);
+  const focusEpicWithChild = useUiStore((s) => s.focusEpicWithChild);
 
   const [collapsed, setCollapsed] = useState<ReadonlySet<EpicLadderKey>>(
     () => new Set(EPIC_LADDER_COLUMNS.map((c) => c.key).filter((k) => !OPEN_BY_DEFAULT.has(k))),
@@ -326,6 +443,155 @@ export function EpicsColumn({
     });
     setRevealEpicId(target.id);
   }, [ladder, projectId]);
+
+  // ── "OPEN IN COLUMN" ON ANY BEAD — RESOLVE, FOCUS, EXPAND ────────────────────────────────────
+  //
+  // Step one of the founder's four. `engine/epicReveal` says WHICH epic (or, for a parentless task,
+  // that there is none); this writes the focus that opens that epic's card and un-collapses the
+  // stage holding it. The scroll and the flash are step two, in the effect below, because they can
+  // only run once this one's render has put the row and the card in the DOM.
+  //
+  // THE REQUEST IS RE-TRIED UNTIL IT RESOLVES, NOT DROPPED. `revealFor` returns null while the id
+  // names nothing in this snapshot — which is the ordinary state for the first seconds after launch,
+  // when the link fires against a store that has not polled yet. Marking the nonce handled only on
+  // a successful resolve means the next snapshot completes the gesture, instead of the reveal being
+  // silently lost to a race the user cannot see and would have no way to retry except by pressing
+  // the link again.
+  const [standaloneRevealId, setStandaloneRevealId] = useState<string | null>(null);
+  const [flash, setFlash] = useState<{ selectors: readonly string[]; nonce: number } | null>(null);
+  const handledRevealNonce = useRef<number>(0);
+
+  useEffect(() => {
+    if (!revealRequest || revealRequest.nonce === handledRevealNonce.current) return;
+    const resolved = revealFor(allBeads, revealRequest.beadId);
+    // NO ELSE BRANCH, AND THAT IS THE FOUNDER'S RULING. An unresolvable id does nothing at all —
+    // there is no "couldn't find it" notice anywhere on this path, by design.
+    if (resolved === null) return;
+    handledRevealNonce.current = revealRequest.nonce;
+
+    // NARROWED ON THE DISCRIMINANT, NOT ON `revealedEpicId(resolved) === null`. The two agree at
+    // runtime — that helper returns null for exactly the standalone variant and nothing else — but
+    // only the tag test narrows the union for the COMPILER, so the `epicId === null` form cannot
+    // read `.beadId` in one branch or pass a non-null `epicId` in the other. Keeping the tag test
+    // also means a future variant carrying no epic id fails to compile here rather than silently
+    // taking the standalone path.
+    if (resolved.kind === "standalone") {
+      // A PARENTLESS, CHILDLESS TASK — today the COMMON case (45 of 46 agent-linked beads), so this
+      // is the main path wearing the name of an edge case. It is revealed as its OWN row with its
+      // own card open, rendered above the ladder: "where it sits" is still answered positionally,
+      // and the answer is "on its own".
+      setStandaloneRevealId(resolved.beadId);
+      focusEpicWithChild(side, resolved.beadId, null);
+    } else {
+      setStandaloneRevealId(null);
+      // `focusEpicWithChild`, NOT `openEpicFocus` — the latter clears the child rung (rule 3), which
+      // would undo the very narrowing the link just performed on the task the user clicked. See the
+      // action's own note; the child here is known to be inside this epic, so rule 3 does not apply.
+      focusEpicWithChild(side, resolved.epicId, resolved.kind === "child" ? resolved.childId : null);
+      // ── EXPAND: "I should already be able to see all the children attached to that epic" ──────
+      // The stage holding the epic is un-collapsed, so a reveal into a stage the reader had closed
+      // (or that starts closed — Done, Shipped, Archived) still lands on a visible row rather than
+      // behind a chevron with a count beside it.
+      if (ladder) {
+        const stage = EPIC_LADDER_COLUMNS.find(({ key }) =>
+          ladder[key].some((e) => e.id === resolved.epicId),
+        );
+        if (stage) {
+          setCollapsed((prev) => {
+            if (!prev.has(stage.key)) return prev; // already open; don't churn the set
+            const next = new Set(prev);
+            next.delete(stage.key);
+            return next;
+          });
+        }
+      }
+    }
+
+    const targetId = flashTargetId(resolved);
+    setFlash({
+      // ORDERED FALLBACK — see `findFlashTarget`. The task's pill inside the open card first; the
+      // epic's own row if that pill is not drawn.
+      selectors:
+        resolved.kind === "child"
+          ? [`[data-pill-id="${resolved.childId}"]`, `[data-reveal-id="${resolved.epicId}"]`]
+          : [`[data-reveal-id="${targetId}"]`],
+      nonce: revealRequest.nonce,
+    });
+  }, [revealRequest, allBeads, ladder, side, focusEpicWithChild]);
+
+  // ── SCROLL AND FLASH ─────────────────────────────────────────────────────────────────────────
+  //
+  // Steps three and four, and they are one effect because they act on the same node: the thing that
+  // gets scrolled to is the thing that gets highlighted, or the gesture points the reader's eye at
+  // one place and their attention at another.
+  //
+  // KEYED ON THE NONCE, so pressing the link on a bead that is ALREADY revealed flashes it again.
+  // The founder was explicit that a task he can already see must still flash, because the flash is
+  // the only confirmation the click did anything — and a reveal derived from the focus keys cannot
+  // do that, since re-focusing the current value is correctly a no-op.
+  const listRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    if (flash === null) return;
+    const root = listRef.current;
+    if (root === null) return;
+    const motion = prefersReducedMotion() ? "static" : "animate";
+    let undo: (() => void) | null = null;
+    let findTimer: ReturnType<typeof setTimeout> | undefined;
+    let holdTimer: ReturnType<typeof setTimeout> | undefined;
+    let attempts = 0;
+    const tick = () => {
+      const el = findFlashTarget(root, flash.selectors);
+      if (el === null) {
+        attempts += 1;
+        if (attempts >= FLASH_FIND_ATTEMPTS) return; // silently, on purpose — see the constant
+        findTimer = setTimeout(tick, FLASH_FIND_INTERVAL_MS);
+        return;
+      }
+      // CALLED DEFENSIVELY for the same reason `EpicRow` calls it that way — the target can be
+      // unmounted between the state write and this timer, and jsdom has no layout at all, which is
+      // why the test for this spies on the CALL and never on a scroll position.
+      el.scrollIntoView?.({ block: "nearest" });
+      undo = applyFlash(el, motion);
+      holdTimer = setTimeout(() => {
+        undo?.();
+        undo = null;
+      }, FLASH_MS);
+    };
+    tick();
+    return () => {
+      if (findTimer !== undefined) clearTimeout(findTimer);
+      if (holdTimer !== undefined) clearTimeout(holdTimer);
+      // PUT THE NODE BACK ON THE WAY OUT. The flash writes inline styles onto a node this component
+      // does not render, so an unmount (or a second reveal) mid-flash would otherwise leave a task
+      // pill permanently painted gold.
+      undo?.();
+    };
+  }, [flash]);
+
+  // The standalone row is a REVEAL, not a pinned view: it tidies itself away as soon as the reader
+  // moves off it, so a task row does not sit above the ladder for the rest of the session. Guarded
+  // on having actually been focused once, because the focus write above lands in the same batch as
+  // `setStandaloneRevealId` and an unguarded check would fire on the frame between them.
+  const standaloneWasFocused = useRef(false);
+  useEffect(() => {
+    if (standaloneRevealId === null) {
+      standaloneWasFocused.current = false;
+      return;
+    }
+    if (focusedEpicId === standaloneRevealId) {
+      standaloneWasFocused.current = true;
+      return;
+    }
+    if (standaloneWasFocused.current) setStandaloneRevealId(null);
+  }, [standaloneRevealId, focusedEpicId]);
+
+  const standaloneBead = useMemo(
+    () =>
+      standaloneRevealId === null
+        ? null
+        : (allBeads.find((b) => b.id === standaloneRevealId) ?? null),
+    [standaloneRevealId, allBeads],
+  );
 
   return (
     <div
@@ -447,6 +713,17 @@ export function EpicsColumn({
               Clear
             </button>
           )}
+          {/* SORT SITS RIGHTMOST, after the epic filter's own control — the founder's item 4 on
+              `sparkle-huw924` ("a sort-by control belongs to the right of the filter"), and the
+              same placement `BoardFilterBar` records for the board's chip: what sits to its LEFT
+              decides WHICH epics you are looking at, this decides in what ORDER.
+
+              It renders unconditionally, unlike `Clear`. `Clear` is the exit from a state you are
+              in; a sort has no off position — the column is always in one of these orders — so a
+              control that appeared only once you had used it could never be the thing you reach
+              for the first time. That is exactly the founder's report: he went looking for it and
+              it was not there. */}
+          <EpicsColumnSortControl value={sortBy} onPick={setSortBy} />
         </span>
       </div>
 
@@ -456,6 +733,8 @@ export function EpicsColumn({
           padded on both, because the seam mirrors with the row and symmetric padding would waste
           6px of a 280px column on the side that has no tab. */}
       <div
+        ref={listRef}
+        data-testid="epics-column-list"
         style={{
           flex: 1,
           overflowY: "auto",
@@ -474,6 +753,41 @@ export function EpicsColumn({
         {/* "Loading" is now only the GENUINELY still-loading case: beads on, no error, no snapshot
             yet. The two branches above take the two states that never resolve. */}
         {project && beadsEnabled && !ladder && !readError && <EmptyNote>Loading epics…</EmptyNote>}
+        {/* ── A REVEALED TASK THAT BELONGS TO NO EPIC ────────────────────────────────────────────
+            The founder's "where does this sit?" still gets a positional answer when the answer is
+            "on its own" — the task is drawn as its own row, with its own card open, ABOVE the
+            ladder rather than inside a rung it is not a member of. Above, because it is the thing
+            the reader just asked for and a reveal that arrives below seven collapsible stages is
+            a reveal they have to hunt for.
+
+            NO LABEL, NO EXPLANATION. There is deliberately nothing here saying "this task has no
+            epic" — that is the sentence the founder rejected, and a heading is the same sentence
+            in a smaller font. The row's own position says it.
+
+            IT REUSES `EpicRow` RATHER THAN DRAWING A SECOND KIND OF ROW: two row treatments in one
+            column is exactly the drift `EpicInlineCard`'s header describes ending. `total` comes
+            out at 0 for a childless bead, so the count slot simply does not render. */}
+        {project && beadsEnabled && standaloneBead && (
+          <div data-testid="epics-standalone-reveal">
+            <EpicRow
+              epic={standaloneBead}
+              allBeads={allBeads}
+              /* No health square: a bead with no children has no roll-up to report, and an empty
+                 gutter beside a single row would read as a missing reading rather than as none. */
+              health={null}
+              selected={focusedEpicId === standaloneBead.id}
+              onSelect={() => setEpicFocus(side, standaloneBead.id)}
+            />
+            {focusedEpicId === standaloneBead.id && (
+              <EpicInlineCard
+                bead={standaloneBead}
+                projectId={project.id}
+                rootPath={project.rootPath ?? null}
+                allBeads={allBeads}
+              />
+            )}
+          </div>
+        )}
         {project &&
           beadsEnabled &&
           ladder &&
@@ -695,6 +1009,12 @@ function EpicRow({
       ref={rowRef}
       data-testid="epic-row"
       data-epic-id={epic.id}
+      /* THE REVEAL'S ANCHOR. `data-epic-id` beside it is what the column's own selection reads;
+         this one is what the "show me where this sits" lookup resolves against, and they are two
+         attributes rather than one because the reveal also has to anchor a STANDALONE task row
+         that is not an epic at all. One name for both would make the selector claim something
+         about the bead that is not true. */
+      data-reveal-id={epic.id}
       data-revealed={reveal ? "true" : undefined}
       data-selected={String(selected)}
       aria-pressed={selected}
@@ -720,13 +1040,13 @@ function EpicRow({
           FIRST IN THE ROW, before the name, because it is the only thing here meant to be read
           without reading. A leading slot puts every epic's mark in one vertical line down a 280px
           column, so "which of these is nobody building" is answered by scanning an edge rather than
-          by reading nineteen titles. The founder's own placements — the priority chiclet "to the
-          right of the epic name, before the count" — are all TRAILING, and none of them was asked
-          for as a glance surface; this one was ("the statuses should be showing next to the epic
+          by reading nineteen titles. The founder's own placements — the count, and the priority
+          chiclet "farthest thing on the right" — are all TRAILING, and none of them was asked for
+          as a glance surface; this one was ("the statuses should be showing next to the epic
           row").
 
           NOTHING ELSE MOVES. The slot is `flex: "0 0 auto"` at 9px + the row's 6px gap, so the
-          title (already ellipsised at `flex: 1`) truncates 15px sooner and the chiclet and count
+          title (already ellipsised at `flex: 1`) truncates 15px sooner and the count and chiclet
           keep their positions exactly.
 
           NO SLOT IS RESERVED ON A TERMINAL RUNG. `health === null` renders nothing at all rather
@@ -746,30 +1066,8 @@ function EpicRow({
       >
         {epicDisplayTitle(epic.title)}
       </span>
-      {/* THE FOUNDER'S PLACEMENT: name, then the priority chiclet, then the count ("to the right of
-          the epic name, before the count like, the 9/10"). Nothing else in the row moves.
-
-          A CHICLET, NOT A CAPSULE. `BeadPriorityChip` is built on `tag()` at `RADIUS.sm` — a
-          near-square corner, and the 999-radius capsule is the thing this codebase purged. Do not
-          override the radius to round it off.
-
-          THE LITERAL IS SPELLED AROUND ON PURPOSE. `labelTreatment.test.ts` ratchets the tree-wide
-          count of that literal and skips comment lines by testing whether the line STARTS with
-          `//`, `/*` or `*` — which a JSX block comment's continuation lines do not. So writing the
-          literal in prose here counts as a USE and reddens the ratchet on an unrelated PR, which is
-          exactly what it did on this one.
-
-          IT SITS INSIDE THE ROW'S `alignItems: "baseline"`, which is correct rather than tolerated:
-          an inline-flex box takes the baseline of its first line, so the chip's "P2" sits on the
-          same baseline as the title beside it. Its 6px dot is centred within the chip, not against
-          the row, so it does not drag the alignment.
-
-          IT IS `flex: "0 0 auto"`, so its ~28px comes permanently out of the title's width — the
-          title is already ellipsised at `flex: 1` in a 280px column, so a long epic name truncates
-          slightly sooner. That is the trade the founder asked for. */}
-      <BeadPriorityChip priority={epic.priority} testId="epic-row-priority" />
       {/* ── THE GOAL IS NOT ON THE ROW, AND ITS ABSENCE IS THE FIX ──────────────────────────────
-          `EpicGoalRowForEpic` (PR #2244) used to mount here, between the chiclet and the count.
+          `EpicGoalRowForEpic` (PR #2244) used to mount here, after the title.
           It is gone, and this comment stands in its place because putting it back would restore a
           bug the founder hit live (`sparkle-huw924.3`).
 
@@ -805,7 +1103,7 @@ function EpicRow({
           IF YOU MOUNT ANYTHING CLICKABLE HERE, read `Workspace.epicsColumn.test.tsx`'s "opens the
           card wherever inside the row the click lands" first. It clicks every descendant of this
           row in turn, so a child that swallows the row's click reds immediately — which is exactly
-          what the goal span did. `BeadPriorityChip` above is safe because it is a readout with no
+          what the goal span did. `BeadPriorityChip` below is safe because it is a readout with no
           handler, by its own documented design. */}
       {/* ── THE COUNT SLOT BECOMES THE CLOSE X WHILE THE CARD IS OPEN ────────────────────────────
           Item 15 of the 2026-08-20 self-interview, and the founder placed it by pointing AT this
@@ -825,7 +1123,8 @@ function EpicRow({
           It does not need to be a button. The row's own `onSelect` already TOGGLES, so a click
           anywhere on an open row closes it — including on these pixels. The X therefore has to
           *look* like the close control and do nothing itself; the row underneath it is what acts.
-          Same rule `BeadPriorityChip` above follows, and the comment block above says why any
+          Same rule `BeadPriorityChip` follows in the slot BELOW this one, and the comment block
+          above says why any
           clickable child here reds `Workspace.epicsColumn.test.tsx`'s "opens the card wherever
           inside the row the click lands" — a guard this change deliberately leaves at full
           strength rather than narrowing.
@@ -856,6 +1155,58 @@ function EpicRow({
           </span>
         )
       )}
+      {/* ── THE PRIORITY CHICLET IS THE LAST THING IN THE ROW, AND IT IS PINNED THERE ────────────
+          THIS SUPERSEDES ITEM 8 of `sparkle-huw924`, which put the chiclet to the LEFT of the count
+          ("a little priority chicklet pill to the right of the epic name, before the count like,
+          the 9/10"). The founder changed his mind after seeing it (`sparkle-5izbbz`): *"The
+          priority pills need to be to the right of the '9/13' etc, not to the left"*, then *"The
+          pills should be the farthest thing on the right. For that column."* Nothing above this
+          line describes the old order any more; if you are re-reading item 8, this bead outranks it.
+
+          ══ IT IS RIGHT-ALIGNED, NOT MERELY REORDERED — THAT IS THE WHOLE BEAD ══════════════════
+          `total > 0` means MANY ROWS CARRY NO COUNT AT ALL, and the founder's screenshot is full of
+          them (an epic with no children renders a chiclet and nothing else). Swapping two siblings
+          satisfies the with-count rows and leaves the without-count rows sitting wherever the flow
+          happens to end — which is the case he could already see on screen. So the pin is
+          `marginLeft: "auto"` on this wrapper: the slot eats every pixel of free space to its left,
+          so the chiclet lands on the column's right edge on EVERY row, with a count, without one,
+          and whatever the title's own flex is later changed to. Do not replace it with a plain
+          reorder that "looks the same" — it only looks the same on the rows that have a count.
+
+          THE WRAPPER EXISTS BECAUSE THE CHIP TAKES NO `style`. `BeadPriorityChip` owns its own
+          treatment by design (see its header), so the alignment lives on a slot around it rather
+          than being threaded through as a prop no other call site wants.
+
+          IT SITS AFTER THE COUNT SLOT, WHICH INCLUDES THE OPEN ROW'S X. Item 15 put the close X
+          *in the count slot* ("where it says the six out of six when it's closed"), which is a
+          statement about that slot, not about the row's right edge — so the X keeps its slot and
+          the chiclet stays farthest right whether the row is open or closed. One rule, no branch.
+
+          A CHICLET, NOT A CAPSULE. `BeadPriorityChip` is built on `tag()` at `RADIUS.sm` — a
+          near-square corner, and the 999-radius capsule is the thing this codebase purged. Do not
+          override the radius to round it off.
+
+          THE LITERAL IS SPELLED AROUND ON PURPOSE. `labelTreatment.test.ts` ratchets the tree-wide
+          count of that literal and skips comment lines by testing whether the line STARTS with
+          `//`, `/*` or `*` — which a JSX block comment's continuation lines do not. So writing the
+          literal in prose here counts as a USE and reddens the ratchet on an unrelated PR, which is
+          exactly what it did on the PR that introduced this chiclet.
+
+          IT SITS INSIDE THE ROW'S `alignItems: "baseline"`, which is correct rather than tolerated:
+          an inline-flex box takes the baseline of its first line, so the chip's rendered level sits
+          on the same baseline as the title beside it. Its 6px dot is centred within the chip, not
+          against the row, so it does not drag the alignment — and the wrapper is `inline-flex` for
+          the same reason, so it forwards the chip's baseline rather than inventing one.
+
+          IT IS `flex: "0 0 auto"`, so its ~28px comes permanently out of the title's width — the
+          title is already ellipsised at `flex: 1` in a 280px column, so a long epic name truncates
+          slightly sooner. That is the trade the founder asked for. */}
+      <span
+        data-testid="epic-row-priority-slot"
+        style={{ flex: "0 0 auto", display: "inline-flex", marginLeft: "auto" }}
+      >
+        <BeadPriorityChip priority={epic.priority} testId="epic-row-priority" />
+      </span>
     </button>
   );
 }

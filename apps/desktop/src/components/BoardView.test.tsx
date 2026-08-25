@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Bead, Board } from "../services/beads";
 import { C } from "../theme/colors";
 import { TAG } from "./labelTreatment";
+import { DOUBLE_CLICK_GRACE_MS, NO_BUILD_AGENTS } from "./EpicTaskCard";
 import type { AgentTab, Project } from "../types";
 
 // Mock the beads store so no real `bd`/Tauri invoke happens. startPolling/stopPolling are spies;
@@ -721,7 +722,14 @@ describe("BoardView", () => {
     fireEvent.click(screen.getByText("Detailed task"));
     // After click, the detail overlay shows the full description plus metadata.
     expect(screen.getByText(fullDesc)).toBeTruthy();
-    expect(screen.getByText("feature")).toBeTruthy();
+    // THE TYPE IS A PILL NOW, NOT PLAIN LOWERCASE TEXT — `sparkle-huw924.8` item 4 removed the
+    // duplicated mid-row word so the type is stated once, in the card's top-left badge. Asserting
+    // the RENDERED pill (uppercased label + the `data-bead-type` it carries) rather than the old
+    // bare string: `getByText("feature")` would pass again the moment anyone reintroduced the
+    // duplicate this bead deleted.
+    const typePill = within(screen.getByRole("dialog")).getByTestId("board-bead-card-type-pill");
+    expect(typePill.textContent).toBe("FEATURE");
+    expect(typePill.getAttribute("data-bead-type")).toBe("feature");
     expect(screen.getByText("ui, kanban")).toBeTruthy();
     // A close affordance exists.
     expect(screen.getByLabelText("Close")).toBeTruthy();
@@ -2728,7 +2736,7 @@ describe("BoardView — epic vs task card treatment", () => {
   it("puts the EPIC pill on the epic card and on no task card", () => {
     seedEpicBoard();
     render(<BoardView project={project} side="right" />);
-    const pill = within(epicCard()).getByTestId("epic-pill");
+    const pill = within(epicCard()).getByTestId("type-pill");
     expect(pill.textContent).toBe("EPIC");
     // ── THE PILL'S APPEARANCE, NOT JUST ITS TEXT (roborev 65326) ────────────────────────────────
     // `textContent === "EPIC"` was the only rendered assertion, and it survives deleting the fill,
@@ -2745,8 +2753,13 @@ describe("BoardView — epic vs task card treatment", () => {
     expect(pill.style.color).toBe(C.onEpicPillFill);
     expect(pill.style.fontFamily).toBe(TAG.fontFamily);
     expect(pill.style.letterSpacing).toBe(TAG.letterSpacing);
+    // ── THE COLLAPSED BOARD CARD STAYS EPIC-ONLY (bead `sparkle-huw924.8`) ──────────────────────
+    // The pill component is now the general TYPE pill and the OPEN card wears one for every type —
+    // but the founder's ask there was about the card when it is OPEN, and this ladder is a few
+    // hundred dense cards whose epic badge exists to make the epics findable in it. A pill on every
+    // card is a change he did not ask for, so the gate here is deliberate rather than an oversight.
     for (const task of screen.getAllByTestId("board-card-task")) {
-      expect(within(task).queryByTestId("epic-pill")).toBeNull();
+      expect(within(task).queryByTestId("type-pill")).toBeNull();
     }
   });
 
@@ -2788,15 +2801,15 @@ describe("BoardView — epic vs task card treatment", () => {
     render(<BoardView project={project} side="right" />);
     const card = epicCard();
     // Collapsed: the child rows are not in the tree at all.
-    expect(within(card).queryAllByTestId("epic-child-row")).toHaveLength(0);
+    expect(within(card).queryAllByTestId("epic-task-card")).toHaveLength(0);
     expect(
       within(card).getByTestId("epic-contains-tasks").getAttribute("aria-expanded"),
     ).toBe("false");
     fireEvent.click(within(card).getByTestId("epic-contains-tasks"));
-    expect(within(epicCard()).queryAllByTestId("epic-child-row").length).toBeGreaterThan(0);
+    expect(within(epicCard()).queryAllByTestId("epic-task-card").length).toBeGreaterThan(0);
     // ...and collapses again, so the toggle is a toggle and not a one-way door.
     fireEvent.click(within(epicCard()).getByTestId("epic-contains-tasks"));
-    expect(within(epicCard()).queryAllByTestId("epic-child-row")).toHaveLength(0);
+    expect(within(epicCard()).queryAllByTestId("epic-task-card")).toHaveLength(0);
   });
 
   it("says so plainly for an epic with no children, with no expander", () => {
@@ -2818,15 +2831,17 @@ describe("BoardView — epic vs task card treatment", () => {
     expect(screen.queryByTestId("epic-contains-tasks")).toBeNull();
   });
 
-  it("opens the CHILD's own card when an expanded child row is clicked", () => {
+  it("opens the CHILD's own card when an expanded task card is DOUBLE-clicked", () => {
+    // SINGLE CLICK NOW EXPANDS IN PLACE, DOUBLE CLICK OPENS (bead sparkle-huw924.9). The gesture
+    // this test drives changed with the behaviour; the side effect it asserts did not.
     seedEpicBoard();
     render(<BoardView project={project} side="right" />);
     fireEvent.click(within(epicCard()).getByTestId("epic-contains-tasks"));
-    const rows = within(epicCard()).getAllByTestId("epic-child-row");
+    const rows = within(epicCard()).getAllByTestId("epic-task-card");
     // "Child two" is in_progress and is NOT rendered as a board card in this fixture, so finding it
-    // in a dialog can only be the overlay the click opened.
+    // in a dialog can only be the overlay the gesture opened.
     const row = rows.find((r) => r.textContent?.includes("Child two"))!;
-    fireEvent.click(row);
+    fireEvent.doubleClick(row);
     expect(within(screen.getByRole("dialog")).getByText("Child two")).toBeTruthy();
   });
 
@@ -2854,6 +2869,254 @@ describe("BoardView — epic vs task card treatment", () => {
     fireEvent.click(within(child).getByTestId("part-of-epic"));
     const dialog = screen.getByRole("dialog");
     expect(within(dialog).getByText("p1-e1")).toBeTruthy();
+  });
+});
+
+// ── THE EPIC CARD SHOWS TASK CARDS, AND EACH TASK OWNS ITS BUILD AGENTS ─────────────────────────
+//
+// bead sparkle-huw924.9. The founder, 2026-08-24, looking at an open epic card: *"When I see
+// orchestrator, it makes me think of build agents… But the build agents should be on the task. Like,
+// the way that it should work is a hierarchy where epics have tasks and tasks get built… I think
+// what I would wanna see where it says orchestrator I would want that to be task cards. And then
+// each task card would have the orchestrator, like, the orchestrator agents, the actual build
+// agents, that are attached to it. Within that task card… click to expand a task card within the
+// epic and have it and see it embedded inside the epic. And then be able to double click on it to
+// have it open on its own."*
+//
+// ══ WHAT THESE ASSERT, AND WHY EACH ONE CAN FAIL ══════════════════════════════════════════════
+// Every assertion is on a SIDE EFFECT of a gesture — the agent names that appeared inside a card,
+// the bead the overlay swapped to, the `aria-expanded` the card is left in — never on a prop having
+// been passed. The zero-agent case is asserted against a card that IS in the tree and IS expanded,
+// because absence in an unmounted component proves nothing (AGENTS.md).
+//
+// ══ FAKE TIMERS ARE NOT A CONVENIENCE HERE ════════════════════════════════════════════════════
+// A single click DEFERS its expand by `DOUBLE_CLICK_GRACE_MS` so the first click of a double click
+// cannot toggle on the way past. Without advancing the clock, a single click does nothing at all —
+// which is exactly the property the double-click test needs to be able to observe.
+describe("BoardView — the open epic card's TASK CARDS", () => {
+  const EPIC = "p1-tc";
+  const KID_STAFFED = `${EPIC}.1`;
+  const KID_BARE = `${EPIC}.2`;
+
+  /** Six children, deliberately: the founder's screenshot had six, and the row this replaces
+   *  truncated at one plus "+5 more". Two of them carry the cases that matter (one with agents on
+   *  it, one with none); the other four exist so "renders ALL of them" is a real count. */
+  const KID_TITLES = [
+    "Wire the task cards",
+    "Nobody is on this one",
+    "Third task",
+    "Fourth task",
+    "Fifth task",
+    "Sixth task",
+  ];
+
+  function seedTaskCardBoard() {
+    const epic = bead({ id: EPIC, title: "Task card epic", type: "epic" });
+    const kids = KID_TITLES.map((title, i) =>
+      bead({ id: `${EPIC}.${i + 1}`, title, parent: EPIC }),
+    );
+    // A SECOND EPIC WITH ITS OWN CHILD, so "only this epic's tasks render" is a statement about the
+    // membership filter rather than about a fixture that holds nothing else.
+    const otherEpic = bead({ id: "p1-other", title: "Someone else's epic", type: "epic" });
+    const otherKid = bead({ id: "p1-other.1", title: "Not my task", parent: "p1-other" });
+    snapshot = {
+      beads: [epic, ...kids, otherEpic, otherKid],
+      board: {
+        // Only the FIRST child is painted on the board. Every other child found in the dialog can
+        // therefore only have come from the epic card itself.
+        backlog: [epic, kids[0]!, otherEpic],
+        blocked: [],
+        inProgress: [],
+        done: [],
+        delivered: [],
+        archived: [],
+      },
+      loadedAt: Date.now(),
+    };
+  }
+
+  /** Two workers on `KID_STAFFED`, none on `KID_BARE` — the two arms of the expanded body. */
+  function seedAgents() {
+    useProjectStore.setState({
+      projects: [
+        {
+          ...project,
+          agents: [
+            { id: "ag-1", name: "task-worker-one", kind: "worker", beadId: KID_STAFFED },
+            { id: "ag-2", name: "task-worker-two", kind: "worker", beadId: KID_STAFFED },
+            { id: "ag-3", name: "stranger-worker", kind: "worker", beadId: "p1-other.1" },
+          ] as unknown as AgentTab[],
+        },
+      ],
+      selectedProjectId: project.id,
+    });
+  }
+
+  /** Open the EPIC's full card through the child card's "Part of Epic" link — the walk this file
+   *  already pins elsewhere, so these tests are about the task cards and not about card chrome. */
+  function openEpicCard(): HTMLElement {
+    render(<BoardView project={project} side="right" />);
+    const child = screen
+      .getAllByTestId("board-card-task")
+      .find((c) => c.textContent?.includes(KID_TITLES[0]!))!;
+    fireEvent.click(within(child).getByTestId("part-of-epic"));
+    return screen.getByRole("dialog");
+  }
+
+  const cardFor = (dialog: HTMLElement, beadId: string) =>
+    within(dialog)
+      .getAllByTestId("epic-task-card")
+      .find((c) => c.getAttribute("data-bead-id") === beadId)!;
+
+  /** Let the deferred single-click land. */
+  function settle() {
+    act(() => {
+      vi.advanceTimersByTime(DOUBLE_CLICK_GRACE_MS + 50);
+    });
+  }
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    seedTaskCardBoard();
+    seedAgents();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("renders one task card per direct child — ALL of them, none truncated", () => {
+    const dialog = openEpicCard();
+    const titles = within(dialog)
+      .getAllByTestId("epic-task-card")
+      .map((c) => c.getAttribute("data-bead-id"));
+    // Every child, and the count itself — a subset would satisfy "contains" alone, and a truncated
+    // list is precisely the defect this replaced.
+    expect(titles).toHaveLength(KID_TITLES.length);
+    for (let i = 0; i < KID_TITLES.length; i++) {
+      expect(titles).toContain(`${EPIC}.${i + 1}`);
+      expect(within(dialog).getByText(KID_TITLES[i]!)).toBeTruthy();
+    }
+    // ...and the other epic's child is not among them.
+    expect(within(dialog).queryByText("Not my task")).toBeNull();
+    // NO "+N more" ANYWHERE ON THE EPIC CARD. jsdom never lays out, so `BeadLineageRows` fails open
+    // and would have rendered every pill rather than an overflow — meaning this cannot pass merely
+    // because the row is unmeasured. It passes because the `Tasks:` row is not drawn at all.
+    expect(within(dialog).queryByTestId("board-bead-card-tasks")).toBeNull();
+    expect(within(dialog).queryByTestId("board-bead-card-tasks-more")).toBeNull();
+    // SCOPED TO THE TASK LIST, NOT THE WHOLE DIALOG. A bare
+    // `expect(dialog.textContent).not.toContain("more")` reads as the stronger claim but is a
+    // DIFFERENT one: the surviving `Build agents:` row renders its own "+N more" overflow, so that
+    // form fails on a card whose task list is in fact complete — and it would equally have passed
+    // for the wrong reason on a card with one agent. The claim this bead makes is about TASKS.
+    for (const card of within(dialog).getAllByTestId("epic-task-card")) {
+      expect(card.textContent ?? "").not.toContain("+");
+    }
+  });
+
+  it("no longer says 'Orchestrator' anywhere on the epic card", () => {
+    // The label was the whole bug: it headed a list of TASKS. Its disappearance is the change.
+    const dialog = openEpicCard();
+    expect(dialog.textContent).not.toContain("Orchestrator");
+    expect(dialog.textContent).not.toContain("not started");
+  });
+
+  it("SINGLE CLICK expands a task card in place and its build agents appear INSIDE it", () => {
+    const dialog = openEpicCard();
+    const card = cardFor(dialog, KID_STAFFED);
+    // Collapsed to begin with: the agents are not in the tree at all, so their appearance below is
+    // caused by the click rather than by a card that always renders them.
+    expect(card.getAttribute("aria-expanded")).toBe("false");
+    expect(within(card).queryAllByTestId("epic-task-card-agent")).toHaveLength(0);
+
+    fireEvent.click(card);
+    // NOTHING YET — the expand is deferred so a double click can overtake it.
+    expect(cardFor(dialog, KID_STAFFED).getAttribute("aria-expanded")).toBe("false");
+    settle();
+
+    const open = cardFor(dialog, KID_STAFFED);
+    expect(open.getAttribute("aria-expanded")).toBe("true");
+    const names = within(open)
+      .getAllByTestId("epic-task-card-agent")
+      .map((n) => n.textContent);
+    // INSIDE THIS CARD, and only the agents bound to THIS task — the hierarchy the bead is about.
+    expect(names).toEqual(["task-worker-one", "task-worker-two"]);
+    expect(names).not.toContain("stranger-worker");
+    // The sibling stayed shut, so the state is per-task and not a single card-wide flag.
+    expect(cardFor(dialog, KID_BARE).getAttribute("aria-expanded")).toBe("false");
+    // ...and it toggles back, so the gesture is a toggle and not a one-way door.
+    fireEvent.click(cardFor(dialog, KID_STAFFED));
+    settle();
+    expect(cardFor(dialog, KID_STAFFED).getAttribute("aria-expanded")).toBe("false");
+  });
+
+  it("a task with ZERO agents still expands, and says so explicitly", () => {
+    const dialog = openEpicCard();
+    fireEvent.click(cardFor(dialog, KID_BARE));
+    settle();
+    const open = cardFor(dialog, KID_BARE);
+    // SHOW, DO NOT HIDE. An expander that silently does nothing reads as broken, and "nobody is on
+    // this" is exactly what an epic card is opened to learn.
+    expect(open.getAttribute("aria-expanded")).toBe("true");
+    expect(within(open).getByTestId("epic-task-card-body")).toBeTruthy();
+    expect(within(open).getByTestId("epic-task-card-no-agents").textContent).toBe(NO_BUILD_AGENTS);
+    expect(within(open).queryAllByTestId("epic-task-card-agent")).toHaveLength(0);
+  });
+
+  it("DOUBLE CLICK opens the task on its own and does NOT leave the card expanded", () => {
+    // ══ DRIVEN FROM THE BOARD'S OWN EPIC CARD, NOT THE MODAL ═══════════════════════════════════
+    // Same `EpicLiveStatus`, but this card STAYS MOUNTED under the overlay the double click opens —
+    // so "no task was left expanded" is a fact about a live component rather than about one that
+    // unmounted, which would be true however the gesture behaved.
+    render(<BoardView project={project} side="right" />);
+    const epic = screen.getAllByTestId("board-card-epic")[0]!;
+    fireEvent.click(within(epic).getByTestId("epic-contains-tasks"));
+    const card = within(epic)
+      .getAllByTestId("epic-task-card")
+      .find((c) => c.getAttribute("data-bead-id") === KID_BARE)!;
+
+    // THE REAL BROWSER SEQUENCE: click(detail 1) → click(detail 2) → dblclick. Firing only
+    // `doubleClick` would never arm the deferred expand, so the race this defends against would go
+    // untested — the test would pass with the cancellation deleted.
+    fireEvent.click(card, { detail: 1 });
+    fireEvent.click(card, { detail: 2 });
+    fireEvent.doubleClick(card);
+    settle();
+
+    // The task opened on its own. `KID_BARE` is NOT painted on the board in this fixture, so
+    // finding its id inside a dialog can only be the card the gesture opened.
+    const dialog = screen.getByRole("dialog");
+    expect(within(dialog).getByTestId("board-bead-card-title").textContent).toBe(KID_TITLES[1]!);
+    expect(within(dialog).getByText(KID_BARE)).toBeTruthy();
+    // AND THE SIDE EFFECT THAT MUST NOT HAPPEN — the deferred toggle was cancelled, not merely
+    // outrun. Every task card behind the overlay is still shut.
+    for (const c of within(epic).getAllByTestId("epic-task-card")) {
+      expect(c.getAttribute("aria-expanded")).toBe("false");
+    }
+  });
+
+  it("drops ONLY the tasks row — the Build agents row still renders on the epic card", () => {
+    // WHAT THIS GUARDS, and why it is not the test it looks like. The obvious version — "a NON-epic
+    // card keeps its Tasks row" — CANNOT BE WRITTEN against this board: `beadIsEpic` here is
+    // STRUCTURAL (`isEpic` = typed epic OR has children), so any bead with children renders as an
+    // epic card, and a bead without children has an empty tasks list anyway. There is no third
+    // shape. The first draft of this test seeded a parent task with one child, then looked for
+    // `board-card-task`, and failed because that fixture IS an epic card.
+    //
+    // So the real risk the epic-only removal carries is that someone drops the whole lineage block
+    // instead of just `tasks`, taking the `Build agents:` row with it. That row is a statement
+    // about the whole epic which no single task card makes, so losing it loses information the
+    // task cards do not restore. THAT is what this pins.
+    seedAgents();
+    const dialog = openEpicCard();
+
+    expect(within(dialog).queryByTestId("board-bead-card-tasks")).toBeNull();
+    expect(within(dialog).getByTestId("board-bead-card-build-agents")).toBeTruthy();
+    expect(
+      within(dialog)
+        .getAllByTestId("board-bead-card-build-agents-pill")
+        .map((p) => p.textContent),
+    ).toContain("task-worker-one");
   });
 });
 
@@ -3037,7 +3300,11 @@ describe("BoardView — column order", () => {
     ).map((el) => {
       const id = cards.find((c) => el.textContent?.includes(c.id))?.id;
       if (!id) throw new Error("a rendered card matched no fixture id");
-      return { id, epic: el.querySelector('[data-testid="epic-pill"]') !== null };
+      // READ THE PILL'S OWN `data-bead-type`, not merely its presence. The pill is the general TYPE
+      // pill now, so "a pill is here" would stop meaning "this is an epic" the moment the collapsed
+      // card's epic gate is ever lifted — and this helper would then report every card as an epic
+      // and silently pass, which is the whole failure this file's other selector note is about.
+      return { id, epic: el.querySelector('[data-bead-type="epic"]') !== null };
     });
   }
 
@@ -3424,7 +3691,7 @@ describe("BoardView — the child-task health square on an expanded epic card", 
     const card = screen.getAllByTestId("board-card-epic")[0]!;
     fireEvent.click(within(card).getByTestId("epic-contains-tasks"));
     const rows = within(screen.getAllByTestId("board-card-epic")[0]!).getAllByTestId(
-      "epic-child-row",
+      "epic-task-card",
     );
     const byTitle = new Map<string, HTMLElement>();
     for (const r of rows) {
@@ -3582,26 +3849,38 @@ describe("BoardView — the open card's Tasks and Build agents rows", () => {
     seedLineageBoard();
     openEpicCard();
 
-    const pills = screen.getAllByTestId("board-bead-card-tasks-pill");
-    const labels = pills.map((p) => p.textContent);
-    expect(labels).toContain("Wire the rows");
-    expect(labels).toContain("Ship the rows");
-    expect(labels).not.toContain("Not my task");
-    // The NAME, never the raw id — "the name of each task as a pill".
-    expect(screen.getByTestId("board-bead-card-tasks").textContent).not.toContain(KID_A);
+    // THE SURFACE MOVED, THE RULE DID NOT. `sparkle-huw924.9` retired the truncated `Tasks:` row
+    // on an epic card in favour of TASK CARDS that render every child in full, so the membership
+    // filter this test has always guarded is now asserted where it actually renders. Rewritten
+    // rather than deleted: "this epic shows ITS children and not another epic's" is the invariant,
+    // and the row was only ever the place it happened to be visible.
+    const cards = screen.getAllByTestId("epic-task-card");
+    const labels = cards.map((c) => c.textContent ?? "");
+    expect(labels.some((t) => t.includes("Wire the rows"))).toBe(true);
+    expect(labels.some((t) => t.includes("Ship the rows"))).toBe(true);
+    expect(labels.some((t) => t.includes("Not my task"))).toBe(false);
+    // The NAME, never the raw id — the founder asked for "the name of each task".
+    expect(cards.map((c) => c.getAttribute("data-bead-id"))).toContain(KID_A);
+    expect(labels.join("")).not.toContain(KID_A);
+    // AND THE LOSSY COPY IS GONE, which is the other half of the bead: a `Tasks:` row here would
+    // mean the founder is once again shown the same six items twice.
+    expect(screen.queryByTestId("board-bead-card-tasks")).toBeNull();
   });
 
   it("SWAPS the overlay to the child's own card when its Tasks pill is clicked", () => {
     seedLineageBoard();
     openEpicCard();
-    const pill = screen
-      .getAllByTestId("board-bead-card-tasks-pill")
-      .find((p) => p.textContent === "Ship the rows")!;
-    fireEvent.click(pill);
+    // A DOUBLE CLICK ON THE TASK CARD, which is the founder's gesture for "open it on its own"
+    // (`sparkle-huw924.9`); a single click expands the card in place instead. Same capability the
+    // Tasks pill used to carry, on the surface that replaced it.
+    const card = screen
+      .getAllByTestId("epic-task-card")
+      .find((c) => (c.textContent ?? "").includes("Ship the rows"))!;
+    fireEvent.doubleClick(card);
 
     // The child is NOT on the board in this fixture, so finding it inside the dialog can only be
-    // the card the click opened. The id is asserted too: a title alone would also be satisfied by
-    // the pill still sitting on the epic's own card.
+    // the card the gesture opened. The id is asserted too: a title alone would also be satisfied by
+    // the task card still sitting inside the epic's own card.
     const dialog = screen.getByRole("dialog");
     expect(within(dialog).getByTestId("board-bead-card-title").textContent).toBe("Ship the rows");
     expect(within(dialog).getByText(KID_B)).toBeTruthy();
@@ -3668,5 +3947,75 @@ describe("BoardView — the open card's Tasks and Build agents rows", () => {
 
     expect(screen.getByTestId("board-bead-card")).toBeTruthy();
     expect(screen.queryByTestId("board-bead-card-lineage")).toBeNull();
+  });
+});
+
+// ── THE TYPE PILL ON THE BOARD'S *OPEN* CARD — bead `sparkle-huw924.8` ──────────────────────────
+//
+// THE PLANNING BOARD IS ONE OF THE THREE SURFACES the founder named, and this is the only place its
+// open card actually exists: `BeadCard/BeadCardChrome.test.tsx` drives `BeadCard` with
+// `chrome="board"` by hand, which leaves the line that MOUNTS it — the detail overlay — covered by
+// nothing. Delete the overlay's `<BeadCard>` and that suite stays green with no card on screen at
+// all. So this opens the real overlay by clicking the real card, exactly as a reader would.
+//
+// [10:08] *"it should look the same when it's open as it does when it's closed."* And the type is
+// general, not epic-only: *"an epic reads EPIC, a bug reads BUG, a task reads TASK."*
+describe("BoardView — the type pill survives OPENING a card, for every type", () => {
+  function openBoardCard(b: Bead) {
+    snapshot = {
+      beads: [b],
+      board: { backlog: [b], blocked: [], inProgress: [], done: [], delivered: [], archived: [] },
+      loadedAt: Date.now(),
+    };
+    render(<BoardView project={project} side="right" />);
+    fireEvent.click(screen.getByText(b.title));
+    // THE CARD IS REALLY OPEN before any claim about its contents — an empty tree carries no pills
+    // either, and every row below would "pass" against one.
+    expect(screen.getByTestId("board-bead-card-title").textContent).toBe(b.title);
+    expect(screen.getByTestId("board-bead-card-meta")).toBeTruthy();
+  }
+
+  it.each([
+    ["epic", "EPIC"],
+    ["bug", "BUG"],
+    ["task", "TASK"],
+  ])("opens a %s and finds the pill reading %s in the card's top-left", (type, label) => {
+    openBoardCard(bead({ id: `p1-${type}`, title: `A ${type} on the board`, type }));
+
+    const pill = screen.getByTestId("board-bead-card-type-pill");
+    expect(pill.textContent).toBe(label);
+    // TOP-LEFT is DOCUMENT ORDER in this row: the pill precedes both the title (which moved down a
+    // line for it) and the top-right cluster carrying the id and the controls.
+    const before = (a: HTMLElement, b2: HTMLElement) =>
+      Boolean(a.compareDocumentPosition(b2) & Node.DOCUMENT_POSITION_FOLLOWING);
+    expect(screen.getByTestId("board-bead-card-chrome").contains(pill)).toBe(true);
+    expect(before(pill, screen.getByTestId("board-bead-card-title"))).toBe(true);
+    expect(before(pill, screen.getByTestId("board-bead-card-corner"))).toBe(true);
+  });
+
+  // THE DUPLICATE THE FOUNDER SCREENSHOTTED. His open `bug` card read "· Done · P0 bug ▁▁ Merged" —
+  // the type as plain lowercase prose mid-row, with the pill slot above it empty. Both halves are
+  // asserted together, because deleting the meta item without the pill loses the field entirely.
+  it("shows the type ONCE — as the pill, never also as lowercase text on the metadata row", () => {
+    openBoardCard(bead({ id: "p1-dup", title: "A bug on the board", type: "bug" }));
+    expect(screen.getByTestId("board-bead-card-type-pill").textContent).toBe("BUG");
+    expect(screen.getByTestId("board-bead-card-meta").textContent).not.toContain("bug");
+  });
+
+  // THE EPIC KEEPS ITS GOLD, and every other type takes the cool slate — the fill is what makes an
+  // epic still stand out once every card wears a pill. Pinned as a PAIR so neither can drift onto
+  // the other's token, which would make the badge meaningless while both rows above stayed green.
+  it("gives the epic the gold fill and a bug the non-epic fill", () => {
+    openBoardCard(bead({ id: "p1-e", title: "An epic on the board", type: "epic" }));
+    const epicPill = screen.getByTestId("board-bead-card-type-pill");
+    expect(epicPill.style.background).toBe(C.epicPillFill);
+    expect(epicPill.style.color).toBe(C.onEpicPillFill);
+
+    cleanup();
+    openBoardCard(bead({ id: "p1-b", title: "A bug on the board", type: "bug" }));
+    const bugPill = screen.getByTestId("board-bead-card-type-pill");
+    expect(bugPill.style.background).toBe(C.typePillFill);
+    expect(bugPill.style.color).toBe(C.onTypePillFill);
+    expect(bugPill.style.background).not.toBe(C.epicPillFill);
   });
 });

@@ -83,6 +83,8 @@
   --c-epic-card-fill: #1d3362;
   --c-epic-pill-fill: #e0982f;
   --c-on-epic-pill-fill: #0a1a3f;
+  --c-type-pill-fill: #7690b9;
+  --c-on-type-pill-fill: #04101f;
 }
 :root[data-theme="light"] {
   --c-input-surface: #ffffff;
@@ -125,6 +127,8 @@
   --c-epic-card-fill: #dce0ff;
   --c-epic-pill-fill: #664200;
   --c-on-epic-pill-fill: #ffffff;
+  --c-type-pill-fill: #546b8e;
+  --c-on-type-pill-fill: #ffffff;
 }
 
 * {

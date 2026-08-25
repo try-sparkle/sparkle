@@ -45,7 +45,7 @@ import { useEffect, useState, type CSSProperties, type ReactNode } from "react";
 import { FiExternalLink, FiMessageSquare, FiUsers, FiX } from "react-icons/fi";
 import { C, FONT_WEIGHT, ON_BRAND_FILL } from "../../theme/colors";
 import { FONT_MONO, FONT_UI, RADIUS, TYPE } from "../../theme/scale";
-import { isTypedEpic, severityOf, type Bead } from "../../services/beads";
+import { severityOf, type Bead } from "../../services/beads";
 import type { BeadComment } from "../../services/beadsCommands";
 import type { WorkflowStageId } from "../../engine/workflowStage";
 import type { EpicGoal, EpicGoalSource } from "../../engine/epicGoal";
@@ -55,7 +55,7 @@ import { PriorityPill } from "./PriorityPill";
 import { BeadSeverityBadge } from "./BeadSeverityBadge";
 import { CommentThread } from "./CommentThread";
 import { EpicCardGoal } from "./EpicCardGoal";
-import { EpicPill } from "./EpicPill";
+import { TypePill } from "./TypePill";
 import { BeadLineageRows } from "./BeadLineageRows";
 import { StageLine } from "./StageLine";
 import { stageLabel, statusDot } from "./beadStatus";
@@ -664,7 +664,12 @@ export function BeadCard({
       node: <BeadSeverityBadge severity={severity} testId={`${t}-severity`} />,
     });
   }
-  if (bead.type) meta.push({ key: "type", node: <span>{bead.type}</span> });
+  // NO `type` ITEM ON THIS ROW — the TYPE PILL in the card's top-left corner is where the type is
+  // shown now, and it is shown ONCE. This line printed it a second time, in bd's own lowercase, in
+  // the middle of the metadata row; the founder's screenshot for `sparkle-huw924.8` is exactly that
+  // — a `bug` card reading "· Done · P0 bug ▁▁▁ Merged" with an empty pill slot above it. Removing
+  // the pill without removing this would leave the duplicate; removing this without the pill would
+  // lose the field. See `BeadCard/TypePill.tsx`.
   // Only when the bead is somewhere else. "View on board" calls `selectProject`, so this is the
   // line that turns a silent whole-project jump into a choice.
   if (projectName !== undefined && projectName !== "") {
@@ -870,19 +875,20 @@ export function BeadCard({
           expanded epic gets the identical corner, which is the whole point of one component. */}
       <span data-testid={`${t}-chrome`} style={{ display: "flex", alignItems: "center", gap: 8 }}>
         {/* THE PILL IS DRAWN FROM THE BEAD, NOT FROM THE SURFACE. The board's collapsed card
-            renders this same component from the same test, so the two cannot drift about what an
-            epic looks like — see `BeadCard/EpicPill.tsx` for why it was extracted.
+            renders this same component from the same test, so the two cannot drift about what a
+            type looks like — see `BeadCard/TypePill.tsx` for why it was extracted.
 
-            `isTypedEpic`, never a hand-written comparison against the type field: "epic" has had
-            three competing meanings in this codebase and `services/beads.ts` is the one place
-            allowed to say which is meant. `epic-membership-guard.sh` enforces that, and it is
-            asking the right question here — this badge is about what the bead was DECLARED to be,
-            not about what it contains, which is `isEpic`'s question instead.
+            IT IS THE TYPE PILL, NOT AN EPIC BADGE. The founder's screenshot for `sparkle-huw924.8`
+            was an OPEN card of type `bug`: this corner was empty and the type appeared as plain
+            lowercase text mid-way along the metadata row below. *"An epic reads EPIC, a bug reads
+            BUG, a task reads TASK."* So there is no condition here at all — the component itself
+            renders nothing for a bead bd gave no type — and the metadata row no longer prints the
+            type a second time.
 
-            THE LITERAL IS SPELLED AROUND ON PURPOSE. That guard greps line-wise and does not skip
-            comments, so quoting the idiom in prose here fails the build — the same trap
-            `EpicsColumn.tsx` records for `labelTreatment.test.ts`'s ratchet. */}
-        {isTypedEpic(bead) && <EpicPill testId={`${t}-epic-pill`} />}
+            The epic/other COLOUR decision lives inside the pill, where `isTypedEpic` can own it:
+            "epic" has had three competing meanings in this codebase and `services/beads.ts` is the
+            one place allowed to say which is meant. */}
+        <TypePill type={bead.type} testId={`${t}-type-pill`} />
         {/* THE SPACER IS THE WHOLE LAYOUT. It takes the slack, so the cluster is pinned right and
             the pill left with no positioning and no `justify-content` fighting a wrapped pill.
             `aria-hidden` because it says nothing. */}

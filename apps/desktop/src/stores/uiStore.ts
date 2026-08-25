@@ -111,6 +111,11 @@ const TRANSIENT_UI_KEYS = [
   // does, so a restored one is a column showing the agents of a single task nobody selected this
   // session, with the control that set it in a different column.
   "beadFocusBySide",
+  // The one-shot "bring this bead on screen" request behind Open in column. It is CONSUMED by the
+  // epics column on the very next render — restoring one at launch would expand a stage, scroll a
+  // column and flash a row for a gesture nobody made this session, which is the same argument
+  // `focusedNoticeBySide` above makes and one degree louder because this one MOVES the viewport.
+  "columnRevealBySide",
   "settingsRequest",
   "composeFocusSeq",
   "revealAgentId",
@@ -274,6 +279,36 @@ export const DEFAULT_WORK_MODE_BY_SIDE: WorkModeBySide = { left: "build", right:
 /** The pair whose stage hosts the one Improve-Sparkle pane. Named so `openPlanBoard`'s scoping
  *  reads as a fact about the layout rather than a bare "right" nobody can check. */
 export const SPARKLE_PANE_SIDE: PairSide = "right";
+
+/**
+ * One "show me where this bead sits" request, addressed to the epics column.
+ *
+ * A REQUEST, NOT A SELECTION — see `columnRevealBySide` below for why the two cannot be the same
+ * key. The `nonce` is what makes a repeat of the identical request a new one, which is what lets a
+ * bead that is already on screen flash again.
+ */
+export interface ColumnReveal {
+  beadId: string;
+  /** Monotonic per store instance. Nothing reads its VALUE; consumers only compare it to the last
+   *  one they acted on, so the only property that matters is that it changes on every request. */
+  nonce: number;
+}
+
+/** The next reveal nonce. Module-level rather than derived from the previous value so that a store
+ *  reset (every test's `beforeEach`) cannot hand out a nonce a mounted consumer has already acted
+ *  on — the counter only ever climbs, for the life of the process. */
+let revealSeq = 0;
+
+/** One reveal request written onto `side`, leaving the other side's untouched. Factored out because
+ *  three setters raise it and a hand-inlined copy is how one of them comes to forget the nonce. */
+function nextReveal(
+  prev: Record<PairSide, ColumnReveal | null>,
+  side: PairSide,
+  beadId: string,
+): Record<PairSide, ColumnReveal | null> {
+  revealSeq += 1;
+  return { ...prev, [side]: { beadId, nonce: revealSeq } };
+}
 
 interface UiState {
   composerHeight: number;
@@ -526,6 +561,46 @@ interface UiState {
    * `setBeadFocus(side, null)`, which is what both Show-Epic controls already call.
    */
   openBeadFocus: (side: PairSide, beadId: string) => void;
+  /**
+   * SHOW ME WHERE THIS BEAD SITS — the request half of the founder's "Open in column" on a TASK.
+   *
+   * ══ WHY THIS IS A SEPARATE KEY FROM THE TWO FOCUS RUNGS ABOVE ══════════════════════════════
+   * `epicFocusBySide` / `beadFocusBySide` are STATE: they say what the build column is narrowed
+   * to, and they are steady-state facts that survive until something else changes them. This is an
+   * EVENT: "the user just asked to be shown this bead". The epics column consumes it by expanding
+   * the bead's stage, scrolling to its row and flashing it — none of which is a fact about the
+   * app, all of which must happen again the next time the link is pressed.
+   *
+   * Collapsing the two is the bug this shape exists to prevent. The founder was explicit that a
+   * bead the reader is ALREADY LOOKING AT must still flash — *"it flashes it briefly […] so it
+   * draws my attention to it"* — because the flash is the only confirmation the click did
+   * anything. A reveal derived from the focus keys cannot do that: focusing the value already
+   * held is, correctly, a no-op in both setters above.
+   *
+   * Hence the `nonce`, which is what makes an identical repeat request a NEW request. It is a
+   * monotonic counter rather than a timestamp: `Date.now()` returns the same millisecond for two
+   * presses a frame apart, and a reveal that silently stopped firing on fast double-presses is
+   * exactly the "the link is broken" reading the flash exists to rule out.
+   *
+   * NEVER A MESSAGE. There is deliberately no "not an epic" branch anywhere on this path — the
+   * founder rejected that copy by name, and `engine/epicReveal` answers every shape of bead
+   * positionally, parentless tasks included.
+   */
+  columnRevealBySide: Record<PairSide, ColumnReveal | null>;
+  /** Ask the epics column to reveal `beadId`. ALWAYS a new request, even for the bead already
+   *  revealed — see the flash-on-already-visible note above. */
+  revealBeadInColumn: (side: PairSide, beadId: string) => void;
+  /**
+   * Focus an epic AND a child of it in one write, WITHOUT rule 3's clear.
+   *
+   * `openEpicFocus` drops the child selection because "a child of epic A is not a narrowing of
+   * epic B". That reasoning does not reach this call: the reveal resolver hands over an epic and a
+   * child KNOWN to be inside it (`engine/epicReveal`), so both rungs are true at once and clearing
+   * the child would undo the very narrowing `viewInColumn` just performed on the task the user
+   * clicked. Pass `childId: null` to focus the epic alone without disturbing an unrelated child —
+   * that is the standalone/epic reveal, which has no child to select.
+   */
+  focusEpicWithChild: (side: PairSide, epicId: string, childId: string | null) => void;
   // Whether ANY "+ New Build Agent" button is currently hovered. Shared so hovering the empty-state
   // start button on the Workspace also lights up the sidebar's button blue (and vice versa),
   // pointing the user at where that affordance normally lives. Transient — NOT persisted.
@@ -983,12 +1058,25 @@ export const useUiStore = create<UiState>()(
       //
       // NO RULE-3 CLAUSE HERE, unlike `openEpicFocus`: this moves the CHILD, and the epic beneath it
       // is deliberately left in force so clearing this returns the column to that epic (rule 2).
+      //
+      // ══ IT ALSO RAISES A REVEAL REQUEST, AND THAT IS WHAT MAKES "Open in column" WORK ON A TASK ══
+      // This is the setter behind `BeadPill.viewInColumn` for a non-epic bead, and narrowing the
+      // BUILD column was only ever half of what the founder pressed the link for. The other half —
+      // *"show me where it sits inside of the Epic"* — is the epics column expanding that task's
+      // parent, scrolling to it and flashing it. Stamping the request here rather than at the link
+      // means every existing entry point that means "open this bead in the column" gets the reveal
+      // without each of them having to remember to ask for it separately.
+      //
+      // The stamp is OUTSIDE the no-op guard on purpose: pressing Open on the task already focused
+      // must still flash (the founder's "already visible" case), so the focus write can be skipped
+      // while the reveal never is.
       openBeadFocus: (side, beadId) =>
-        set((st) =>
-          st.beadFocusBySide[side] === beadId
-            ? {}
-            : { beadFocusBySide: { ...st.beadFocusBySide, [side]: beadId } },
-        ),
+        set((st) => {
+          const reveal = nextReveal(st.columnRevealBySide, side, beadId);
+          return st.beadFocusBySide[side] === beadId
+            ? { columnRevealBySide: reveal }
+            : { beadFocusBySide: { ...st.beadFocusBySide, [side]: beadId }, columnRevealBySide: reveal };
+        }),
       // IDEMPOTENT — see the interface note. Identity-stable when the epic is already focused AND
       // no child selection is left over, so pressing Open twice is genuinely nothing rather than a
       // re-assert that re-runs every consumer's narrowing memo (`agentIdsInEpic` in AgentSidebar
@@ -1006,12 +1094,34 @@ export const useUiStore = create<UiState>()(
       openEpicFocus: (side, epicId) =>
         set((st) => {
           const staleChild = st.beadFocusBySide[side] !== null;
-          if (st.epicFocusBySide[side] === epicId && !staleChild) return {};
+          const reveal = nextReveal(st.columnRevealBySide, side, epicId);
+          if (st.epicFocusBySide[side] === epicId && !staleChild) return { columnRevealBySide: reveal };
           return {
             epicFocusBySide: { ...st.epicFocusBySide, [side]: epicId },
             beadFocusBySide: { ...st.beadFocusBySide, [side]: null },
+            columnRevealBySide: reveal,
           };
         }),
+      columnRevealBySide: { left: null, right: null },
+      revealBeadInColumn: (side, beadId) =>
+        set((st) => ({ columnRevealBySide: nextReveal(st.columnRevealBySide, side, beadId) })),
+      // NO IDENTITY-STABLE NO-OP, unlike the two `open*Focus` setters above, and the difference is
+      // the point rather than an omission: this is only ever called BY the reveal effect, which has
+      // already decided that a request is outstanding. Returning `{}` here on a repeat would leave
+      // the column focused correctly and the reveal unperformed — which is precisely the
+      // already-visible case the founder said must still flash.
+      focusEpicWithChild: (side, epicId, childId) =>
+        set((st) => ({
+          epicFocusBySide: { ...st.epicFocusBySide, [side]: epicId },
+          // `childId === null` LEAVES THE CHILD ALONE rather than clearing it. Clearing would be
+          // rule 3, and rule 3 is about the epic MOVING to an unrelated one; the reveal always
+          // hands over an epic the child is genuinely inside, so there is no stale narrowing to
+          // drop. (An epic/standalone reveal has no child of its own to select.)
+          beadFocusBySide:
+            childId === null
+              ? st.beadFocusBySide
+              : { ...st.beadFocusBySide, [side]: childId },
+        })),
       buildAgentHover: false,
       setBuildAgentHover: (v) => set({ buildAgentHover: v }),
       cloudCreateProjectId: null,

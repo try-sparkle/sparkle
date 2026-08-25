@@ -688,17 +688,31 @@ describe("BeadCard — the merged metadata line", () => {
   //
   // THE ASSERTION IS CONTAINMENT, not "both nodes exist" — they both existed before this change,
   // on two different rows, which is the row of height the merge reclaims.
-  it("puts the build state ON the metadata line, to the right of the type", () => {
+  it("puts the build state ON the metadata line, after the priority", () => {
     mount({ stage: "planned" });
     const line = screen.getByTestId(`${t}-meta`);
     const stage = screen.getByTestId(`${t}-stage`);
     expect(line.contains(stage)).toBe(true);
     expect(screen.getByTestId(`${t}-stage-label`).textContent).toBe("Planned");
-    // …and it really is to the RIGHT of the type word, which is the half of the ask that says
-    // WHERE. `type` has no testid of its own, so the line's own text order is what carries it.
+    // THE ANCHOR MOVED, THE ASK DID NOT. This used to read the type WORD off this line and assert
+    // the stage sat to its right. `sparkle-huw924.8` promoted the type to a pill in the card's
+    // top-left corner and deleted the duplicated word, so there is no longer a type on this row to
+    // be right of — and the old form failed with `expected -1 to be greater than -1`, which is the
+    // assertion reporting an absent anchor rather than a misplaced stage.
+    //
+    // Re-anchored on the PRIORITY, which is the element the stage now follows, so the half of the
+    // founder's ask that says WHERE is still pinned rather than quietly dropped.
+    // Anchored on the PRIORITY, matched by shape rather than by a hard-coded value or a testid:
+    // this suite mounts more than one chrome, and the priority is a chip in one (`-priority`) and a
+    // read-only span in another (`-priority-readonly`), so naming either couples this assertion to
+    // which chrome happens to be under test. `P<n>` is the rendered form in both.
     const text = line.textContent ?? "";
-    expect(text.indexOf("task")).toBeGreaterThan(-1);
-    expect(text.indexOf("task")).toBeLessThan(text.indexOf("Planned"));
+    const priorityAt = text.search(/P\d/);
+    expect(priorityAt).toBeGreaterThan(-1);
+    expect(priorityAt).toBeLessThan(text.indexOf("Planned"));
+    // …and the type really is drawn, just not here: once, as the pill.
+    expect(screen.getByTestId(`${t}-type-pill`).textContent).toBe("TASK");
+    expect(text).not.toContain("task");
   });
 
   // THE HEIGHT SAVING IS NOT A COLLAPSED-ONLY FEATURE. He described it about the card, and a merge
