@@ -38,7 +38,9 @@ import { parseDelegatedWorkCount } from "./backgroundTaskFooter";
 import {
   noteBackgroundTasks,
   forgetBackgroundTasks,
+  backgroundTasksForAgent,
 } from "../services/backgroundTaskRegistry";
+import { noteOrphanedSubagents } from "../services/orphanedSubagentRegistry";
 import { screenOffersAnswer, streamOffersAnswer } from "./screenAnswerable";
 import { withScreenReason, type StatusReason } from "./statusRouter";
 import { forgetAgent, noteProcessExit, noteSpinnerSeen, trackAgent } from "./turnEndAuthority";
@@ -1656,9 +1658,19 @@ export class StatusEngine {
     // A late exit from a PTY this engine no longer owns is not this agent's news — see `disposed`.
     if (this.disposed) return;
     this.clearTimers();
+    // SNAPSHOT the live background-task count the INSTANT before it is dropped (bead sparkle-y5dk8x).
+    // Those tasks — dispatched research subagents, backgrounded work — die with this PTY and are NOT
+    // reclaimed by a `claude --resume`, unlike the parent's own tool results. `forgetBackgroundTasks`
+    // below is what would otherwise erase the fact, and it runs BEFORE `reportDeath()` fires the death
+    // path, so the count has to be captured here or the death notice can never read it. Retained in
+    // `orphanedSubagentRegistry` until respawn; read by `deathRecordWriter`'s mid-task-exit surface so
+    // it can name the orphaned fan-out instead of implying the work was merely "not lost".
+    const liveBackgroundTasksAtDeath = backgroundTasksForAgent(this.opts.agentId);
     // The PTY is gone, so no background-task footer can be live — drop any parked count (bead
     // sparkle-262p7). Without this a promoted GREEN would outlive the process it was reporting.
     forgetBackgroundTasks(this.opts.agentId);
+    // …but keep the snapshot for the death notice. A non-positive/undefined count records nothing.
+    noteOrphanedSubagents(this.opts.agentId, liveBackgroundTasksAtDeath);
     // A dead process is the strongest turn-end witness there is: nothing can still be writing the
     // worktree. Without this, an agent that exited on the fallback path (no hooks, no spinner) would
     // be refused every destructive op FOREVER — a dead PTY never emits the spinner frame or hook

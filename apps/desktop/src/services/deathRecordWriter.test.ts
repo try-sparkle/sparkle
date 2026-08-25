@@ -29,11 +29,20 @@ import {
   type DeathRecordDeps,
   type RetiredEvidence,
   liveDeps,
+  midTaskExitNotice,
   openDeathRecord,
   recordAgentRetirement,
   readRetirementLog,
   recordDeath,
 } from "./deathRecordWriter";
+import {
+  _resetOrphanedSubagentRegistryForTests,
+  orphanedSubagentsForAgent,
+} from "./orphanedSubagentRegistry";
+import {
+  _resetBackgroundTaskRegistryForTests,
+  noteBackgroundTasks,
+} from "./backgroundTaskRegistry";
 import {
   clearConciergeNotifier,
   setConciergeNotifier,
@@ -64,6 +73,7 @@ function deps(over: Partial<DeathRecordDeps> = {}): Calls {
     blockingTool: () => undefined,
     resumeBanner: () => false,
     escalate: () => true,
+    orphanedSubagents: () => undefined,
     invoke: (cmd, args) => {
       invoked.push([cmd, args]);
       return Promise.resolve(undefined as never);
@@ -907,6 +917,146 @@ describe("a mid-task exit is surfaced as a hard signal, not left as a bare resum
     await expect(recordDeath("a1", "pty-exit", c.deps)).resolves.toBeNull();
     expect(escalations).toEqual([]);
     expect(c.closes()).toEqual([]);
+  });
+});
+
+describe("the mid-task-exit notice names ORPHANED SUBAGENTS when the parent had fan-out in flight (sparkle-y5dk8x)", () => {
+  function unmetGoal(over: Partial<AgentGoal> = {}): AgentGoal {
+    return {
+      text: "land the retry PR",
+      setAt: NOW - 60_000,
+      ttlMs: 4 * 60 * 60_000,
+      continues: 0,
+      totalContinues: 0,
+      ...over,
+    };
+  }
+
+  beforeEach(() => {
+    _resetOrphanedSubagentRegistryForTests();
+    _resetBackgroundTaskRegistryForTests();
+  });
+  afterEach(() => {
+    _resetOrphanedSubagentRegistryForTests();
+    _resetBackgroundTaskRegistryForTests();
+  });
+
+  // ── THE PURE COPY, both branches (non-vacuous: each assertion fails under the other branch) ──────
+  it("with orphaned subagents: says they did NOT survive and point at the recoverable transcript", () => {
+    const notice = midTaskExitNotice("a1", 3);
+    expect(notice).toContain("3 background tasks/subagents");
+    expect(notice).toMatch(/did NOT survive/);
+    expect(notice).toMatch(/recoverable from this agent's own session transcript/);
+    expect(notice).toContain("a1");
+    // The overclaim the bead was filed about must be GONE on this branch — the work was not merely
+    // "not lost", it was affirmatively orphaned.
+    expect(notice).not.toContain("in-flight deliverable may not have been written");
+  });
+
+  it("pluralizes: a single orphan reads '1 background task/subagent'", () => {
+    expect(midTaskExitNotice("a1", 1)).toContain("1 background task/subagent");
+    expect(midTaskExitNotice("a1", 1)).not.toContain("1 background tasks/subagents");
+  });
+
+  it("with NO fan-out (0 or undefined): the subagent clause is ABSENT — no overclaim", () => {
+    for (const count of [0, undefined] as const) {
+      const notice = midTaskExitNotice("a1", count);
+      expect(notice).toContain("in-flight deliverable may not have been written");
+      expect(notice).not.toMatch(/subagent/i);
+      expect(notice).not.toMatch(/did NOT survive/);
+    }
+  });
+
+  // ── recordDeath THREADS the dep into the escalation (side effect at the real entry point) ────────
+  it("escalation names the orphans when the death path reports a positive orphaned count", async () => {
+    const escalations: string[] = [];
+    const c = deps({
+      goal: () => unmetGoal(),
+      resumeBanner: () => true,
+      orphanedSubagents: () => 2,
+      escalate: (text) => {
+        escalations.push(text);
+        return true;
+      },
+    });
+
+    await recordDeath("a1", "pty-exit", c.deps);
+
+    expect(escalations).toHaveLength(1);
+    expect(escalations[0]).toContain("2 background tasks/subagents");
+    expect(escalations[0]).toMatch(/recoverable/);
+  });
+
+  it("escalation stays the plain copy when the death path reports NO orphaned subagents", async () => {
+    const escalations: string[] = [];
+    const c = deps({
+      goal: () => unmetGoal(),
+      resumeBanner: () => true,
+      // The default dep is `() => undefined`; assert the negative wiring explicitly.
+      orphanedSubagents: () => undefined,
+      escalate: (text) => {
+        escalations.push(text);
+        return true;
+      },
+    });
+
+    await recordDeath("a1", "pty-exit", c.deps);
+
+    expect(escalations).toHaveLength(1);
+    expect(escalations[0]).not.toMatch(/subagent/i);
+  });
+
+  // ── END TO END: statusEngine.exit() CAPTURES the live count, and the notice reads it back ────────
+  it("engine.exit snapshots the live background count → the notice names it (the whole chain)", async () => {
+    // The footer count as it stood the instant before the PTY closed.
+    noteBackgroundTasks("e2e", 3);
+    const engine = new StatusEngine({ agentId: "e2e", onStatus: () => {} });
+    // exit() must capture the 3 into the orphan registry BEFORE it forgets the live footer count.
+    engine.exit();
+    expect(orphanedSubagentsForAgent("e2e")).toBe(3);
+
+    const escalations: string[] = [];
+    const c = deps({
+      goal: () => unmetGoal(),
+      resumeBanner: () => true,
+      // The PRODUCTION dep — reads the real registry the engine just wrote, not a stub.
+      orphanedSubagents: orphanedSubagentsForAgent,
+      escalate: (text) => {
+        escalations.push(text);
+        return true;
+      },
+    });
+
+    await recordDeath("e2e", "pty-exit", c.deps);
+
+    expect(escalations).toHaveLength(1);
+    expect(escalations[0]).toContain("3 background tasks/subagents");
+  });
+
+  it("engine.exit with NO live background tasks records nothing — the paired negative", () => {
+    const engine = new StatusEngine({ agentId: "none", onStatus: () => {} });
+    engine.exit();
+    expect(orphanedSubagentsForAgent("none")).toBeUndefined();
+  });
+
+  // ── The snapshot is cleared at the SPAWN edge, so a recovered episode's count cannot bleed forward ─
+  it("openDeathRecord (respawn) clears the orphaned-subagent snapshot", async () => {
+    noteBackgroundTasks("respawn", 5);
+    new StatusEngine({ agentId: "respawn", onStatus: () => {} }).exit();
+    expect(orphanedSubagentsForAgent("respawn")).toBe(5);
+
+    // A successful open (respawn) must forget it, exactly as it forgets the dead-session mark.
+    const landed = await openDeathRecord("respawn", "proj", "/wt", deps().deps);
+    expect(landed).toBe(true);
+    expect(orphanedSubagentsForAgent("respawn")).toBeUndefined();
+  });
+
+  // ── PRODUCTION default is wired to the real registry (the defaulted-seam trap, AGENTS.md) ─────────
+  it("liveDeps().orphanedSubagents reads the real registry, not a stub", () => {
+    noteBackgroundTasks("seam-orphan", 7);
+    new StatusEngine({ agentId: "seam-orphan", onStatus: () => {} }).exit();
+    expect(liveDeps().orphanedSubagents("seam-orphan")).toBe(7);
+    expect(liveDeps().orphanedSubagents("nobody-here")).toBeUndefined();
   });
 });
 

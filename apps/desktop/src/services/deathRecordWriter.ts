@@ -34,6 +34,10 @@ import type { DeathVerdict } from "../engine/deathTypes";
 // from the SAME two calls — see services/deadSessionRegistry's header.
 import { forgetAgentDeath, noteAgentDeath } from "./deadSessionRegistry";
 import {
+  forgetOrphanedSubagents,
+  orphanedSubagentsForAgent,
+} from "./orphanedSubagentRegistry";
+import {
   lastFailureForAgent,
   quotaBlockForAgent,
   recentFailureForAgent,
@@ -95,6 +99,14 @@ export interface DeathRecordDeps {
    * mid-task-exit surface fired without a registered sink. Defaults to the real `conciergeNotifier`.
    */
   escalate: (text: string) => boolean;
+  /**
+   * How many background tasks this agent had IN FLIGHT the instant its PTY closed —
+   * `orphanedSubagentRegistry.orphanedSubagentsForAgent`, snapshotted in `statusEngine.exit()` before
+   * the live footer count is dropped (bead sparkle-y5dk8x). `undefined` = none, or this window took no
+   * reading. Read on the death path so the mid-task-exit notice can say the dispatched subagents were
+   * orphaned — but ONLY when there were some, so a death with no fan-out never overclaims.
+   */
+  orphanedSubagents: (agentId: string) => number | undefined;
   invoke: <T>(cmd: string, args: Record<string, unknown>) => Promise<T>;
   now: () => number;
 }
@@ -124,6 +136,7 @@ export function liveDeps(): DeathRecordDeps {
     blockingTool: () => undefined,
     resumeBanner: resumeBannerForAgent,
     escalate: (text) => notifyConcierge(text),
+    orphanedSubagents: orphanedSubagentsForAgent,
     invoke: (cmd, args) => tauriInvoke(cmd, args),
     now: () => Date.now(),
   };
@@ -150,6 +163,10 @@ export async function openDeathRecord(
     // what keeps the two from drifting. Cleared AFTER the invoke lands, so a failed open leaves the
     // row amber rather than silently repainting an agent that did not come back.
     forgetAgentDeath(agentId);
+    // Same spawn-edge clear for the orphaned-subagent snapshot (bead sparkle-y5dk8x): a respawn ends
+    // the previous death, so a stale prior count must not let the next mid-task notice claim subagents
+    // were lost using numbers from an episode that already recovered. Mirrors `forgetAgentDeath`.
+    forgetOrphanedSubagents(agentId);
     return true;
   } catch (e) {
     log.warn("resurrection", "could not open the agent-life record", {
@@ -239,6 +256,41 @@ export async function recordAgentRetirement(
 }
 
 /**
+ * THE MID-TASK-EXIT NOTICE, in words a human can act on (bead sparkle-ffm5bn, extended by
+ * sparkle-y5dk8x).
+ *
+ * Pure and exported so the exact copy — and the branch on whether any subagents were orphaned — is
+ * asserted directly rather than through the death path. The whole reason it takes `orphanedSubagents`
+ * is to say the one thing the old copy could not: a resumed parent keeps its OWN tool results, but the
+ * background subagents it had dispatched die with the PTY and produce nothing on resume. The bead was
+ * filed because the notice implied the work was merely "not lost"; when subagents were in flight it
+ * was affirmatively lost, and the recoverable trace is the parent's own session transcript, where the
+ * subagents' partial turns were interleaved (`isSidechain` records) before the exit.
+ *
+ * OVERCLAIM IS THE FAILURE TO AVOID, per the same rule `agentNotices` states: on a death with no
+ * fan-out (`count` undefined/0) the subagent sentence must be ABSENT, or every mid-task exit would
+ * warn about subagents that never existed. So the extra clause is gated on a positive count.
+ */
+export function midTaskExitNotice(agentId: string, orphanedSubagents: number | undefined): string {
+  const base =
+    "An agent session exited mid-task with its goal still unmet, leaving only a " +
+    "`claude --resume` line. Recovery will resume the session — its own tool results survive the " +
+    "resume";
+  const tail = `verify the work before relying on it. (agent ${agentId})`;
+  if (orphanedSubagents !== undefined && orphanedSubagents > 0) {
+    const n = orphanedSubagents;
+    const tasks = n === 1 ? "1 background task/subagent" : `${n} background tasks/subagents`;
+    return (
+      `${base}, but ${tasks} it had dispatched did NOT survive the exit and produced nothing on ` +
+      "resume. Their partial work is recoverable from this agent's own session transcript, where " +
+      "the subagents' turns were interleaved before it exited — re-dispatch or read that rather " +
+      `than assuming the work is merely "not lost". ${tail}`
+    );
+  }
+  return `${base}; its in-flight deliverable may not have been written. ${tail}`;
+}
+
+/**
  * Classify what just ended this agent's session and write the verdict.
  *
  * Returns the verdict it wrote, or `null` when nothing was written — which is what lets the tests
@@ -279,6 +331,11 @@ export async function recordDeath(
     // taken after the await would therefore suppress the signal in exactly those cases, off a verdict
     // computed from a snapshot milliseconds earlier.
     const resumeBanner = deps.resumeBanner(agentId);
+    // Read alongside `resumeBanner`, SYNCHRONOUSLY and BEFORE the first await, for the same two
+    // reasons (roborev 68290/68291, bead sparkle-y5dk8x): the snapshot lives in a window-local
+    // registry that a concurrent respawn clears via `openDeathRecord` during the `agent_life_close`
+    // IPC await, so a read taken after the await could see it already gone.
+    const orphanedSubagents = deps.orphanedSubagents(agentId);
     const verdict = classifyDeath(observation);
 
     // Refusal 1. `evidence: "none"` is the shape Gate 0 returns, and it means "this window has
@@ -366,9 +423,7 @@ export async function recordDeath(
       now,
     });
     if (midTaskExit) {
-      const accepted = deps.escalate(
-        `An agent session exited mid-task with its goal still unmet, leaving only a \`claude --resume\` line — its in-flight deliverable may not have been written. Recovery will resume the session; verify the work before relying on it. (agent ${agentId})`,
-      );
+      const accepted = deps.escalate(midTaskExitNotice(agentId, orphanedSubagents));
       if (accepted) {
         log.info("resurrection", "surfaced a mid-task exit", { agentId });
       } else {
