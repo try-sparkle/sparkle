@@ -321,7 +321,133 @@ if [ ! -x "$ROBOREV" ]; then
     ROBOREV=$(command -v roborev 2>/dev/null)
     if [ -z "$ROBOREV" ] || [ ! -x "$ROBOREV" ]; then exit 0; fi
 fi
-# stderr suppressed and exit status passed straight through, matching roborev's own
-# generated stub — a post-commit hook stays silent (git ignores its exit code
-# anyway); enqueue health is surfaced via `roborev status`, not the hook.
+
+# ── THE ENQUEUE IS REPORTED, NOT ASSUMED ────────────────────────────────────────────────────────
+#
+# `roborev post-commit` EXITS 0 EVEN WHEN THE DAEMON REJECTS THE ENQUEUE, so its status says
+# nothing at all. Measured (bead sparkle-trlumq): for twelve hours the daemon answered every
+# request with HTTP 503 `no review agent available` — it had been started by hand rather than by
+# launchd, so its PATH could not reach the review agent — and 110 CONSECUTIVE COMMITS were refused
+# while the committing agent saw NOTHING. Two silencers in series: that useless exit code, and the
+# `2>/dev/null` on the call below.
+#
+# THE `2>/dev/null` STAYS. It is what keeps the happy path quiet, and this hook fires on every
+# commit on the machine including throwaway fixtures, so noise there is not an option. What
+# replaces the silence is a POSITIVE signal rather than an absent one: roborev APPENDS one JSONL
+# object per commit to ~/.roborev/post-commit.log —
+#
+#   {"ts":"2026-08-24T11:47:17-07:00","repo":"/path/to/worktree","outcome":"fail","message":"daemon returned 503: {…}"}
+#
+# — with `outcome` either "ok" or "fail". Since the exit code is useless, read back the entry this
+# invocation just wrote and, when it says `fail`, say so out loud on stderr.
+#
+# EVERY UNKNOWN IS A SILENT NO-OP: an absent, unreadable or empty log; neither jq nor python3
+# installed; malformed JSON; a log that did not grow; an entry belonging to another repo. A warning
+# that misfires is worse than the silence it replaces, because it gets muted and then the real one
+# is invisible too.
+_pclog="${HOME:-}/.roborev/post-commit.log"
+_pcsize=0
+if [ -n "${HOME:-}" ] && [ -r "$_pclog" ]; then
+    _pcsize=$(wc -c < "$_pclog" 2>/dev/null | tr -d ' ')
+    case "$_pcsize" in ''|*[!0-9]*) _pcsize=0 ;; esac
+fi
+
+_roborev_warn_if_rejected() {
+    [ -n "${HOME:-}" ] || return 0
+    [ -r "$_pclog" ] || return 0
+    _now=$(wc -c < "$_pclog" 2>/dev/null | tr -d ' ')
+    case "$_now" in ''|*[!0-9]*) return 0 ;; esac
+
+    # ONLY the region this call appended is evidence about THIS commit. Re-reporting a `fail` left
+    # by an earlier commit is precisely the misfire that gets a warning muted; and no growth at all
+    # means the CLI recorded nothing, which is not the same as recording a failure. Silent for both.
+    _delta=$((_now - _pcsize))
+    [ "$_delta" -gt 0 ] || return 0
+
+    # BOUND THE READ. The log is append-only and already ~17MB on this machine, so it is never read
+    # whole — only the tail. 64 KiB is orders of magnitude more than a single commit can append,
+    # even with a fleet of agents interleaving their own entries into the same region.
+    [ "$_delta" -gt 65536 ] && _delta=65536
+
+    # MATCH ON THE `repo` FIELD. Dozens of agents commit on this machine concurrently, so the last
+    # line of the log routinely belongs to somebody else — reporting their failure as ours would be
+    # the same muting misfire. Both the logical and the symlink-resolved path are accepted, since
+    # /tmp vs /private/tmp on its own would otherwise lose a legitimate match.
+    _repo=$top
+    [ -n "$_repo" ] || _repo=$(pwd)
+    _repop=$(cd "$_repo" 2>/dev/null && pwd -P 2>/dev/null)
+    [ -n "$_repop" ] || _repop=$_repo
+
+    _entry=""
+    if command -v jq >/dev/null 2>&1; then
+        # -R plus `try fromjson`: a truncated or non-JSON line is skipped rather than aborting the
+        # whole read (the tail cut can land mid-line by construction). @tsv keeps the message on a
+        # single line whatever it contains.
+        _entry=$(tail -c "$_delta" "$_pclog" 2>/dev/null | jq -Rr --arg a "$_repo" --arg b "$_repop" '
+            try (fromjson
+                 | select(type == "object")
+                 | select(.repo == $a or .repo == $b)
+                 | [(.outcome // ""), (.message // "")]
+                 | @tsv) catch empty' 2>/dev/null | tail -n 1)
+    elif command -v python3 >/dev/null 2>&1; then
+        _entry=$(tail -c "$_delta" "$_pclog" 2>/dev/null | python3 -c '
+import json, sys
+a, b = sys.argv[1], sys.argv[2]
+last = None
+for line in sys.stdin:
+    try:
+        o = json.loads(line)
+    except Exception:
+        continue
+    if isinstance(o, dict) and o.get("repo") in (a, b):
+        last = o
+if last is not None:
+    msg = str(last.get("message", ""))
+    for ch in ("\t", "\n", "\r"):
+        msg = msg.replace(ch, " ")
+    sys.stdout.write(str(last.get("outcome", "")) + "\t" + msg + "\n")
+' "$_repo" "$_repop" 2>/dev/null)
+    fi
+    [ -n "$_entry" ] || return 0
+
+    _tab=$(printf '\t')
+    _outcome=${_entry%%"$_tab"*}
+    [ "$_outcome" = "fail" ] || return 0
+    _message=${_entry#*"$_tab"}
+    [ "$_message" = "$_entry" ] && _message=""
+
+    # ONLY AN UNAMBIGUOUS REFUSAL EARNS THE LOUD LINE. `outcome:"fail"` is dominated by something
+    # else entirely: measured on the real journal's last 20,000 records, 3,496 failures are
+    # `enqueue request failed: Post ".../api/enqueue": context deadline exceeded` — a CLIENT-SIDE
+    # TIMEOUT against a busy daemon, which may well have accepted the job — against just 110 actual
+    # HTTP 503 refusals. A 32:1 ratio, running 5-11 per hour for days. Warning on `fail` alone would
+    # print "THE DAEMON REFUSED THE ENQUEUE" on roughly one commit in four, and be wrong ~95% of the
+    # time. This function's own header says a warning that misfires is worse than the silence it
+    # replaces, because it gets muted and then the real one is invisible too — so this is that rule
+    # applied to itself.
+    #
+    # A timeout is therefore SILENT here, deliberately. It is not ignored: it is a RATE question,
+    # and scripts/roborev-enqueue-health.sh answers rate questions — it requires a streak before it
+    # will call an outage. One noisy commit is the hook's business only when the daemon said no.
+    case "$_message" in
+      *"daemon returned 5"*|*"no review agent available"*|*"daemon unavailable"*) ;;
+      *) return 0 ;;
+    esac
+
+    printf '%s\n' "roborev: THIS COMMIT WAS NOT ENQUEUED FOR REVIEW — the daemon refused the enqueue." >&2
+    [ -n "$_message" ] && printf '%s\n' "roborev: reason: $_message" >&2
+    printf '%s\n' "roborev: 'roborev post-commit' exits 0 even when it is refused, so nothing else would have told you. Diagnose with scripts/roborev-enqueue-health.sh" >&2
+    return 0
+}
+
+# stderr suppressed, matching roborev's own generated stub — the happy path stays silent (git
+# ignores a post-commit hook's exit code anyway). The OUTCOME is read back from the log above
+# instead of being inferred from the exit status, which is always 0.
 "$ROBOREV" post-commit 2>/dev/null
+
+# Never fail a commit. This is the LAST line on purpose and there is deliberately NO `exit 0` after
+# it: _roborev_warn_if_rejected returns 0 on every one of its paths, so the hook's status is 0
+# either way — and a bare `exit` here would also swallow the trailing `_roborev_hook` call of an
+# injection the self-heal could not strip, silently changing behaviour this file does not own. Any
+# line added below must keep the guaranteed-zero status.
+_roborev_warn_if_rejected
