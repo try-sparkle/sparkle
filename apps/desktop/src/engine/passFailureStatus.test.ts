@@ -91,6 +91,26 @@ describe("classifyPassFailure", () => {
     expect(statusFor(msg)).toBe("blocked");
   });
 
+  // PROSE ABOUT AN OVERLOAD IS NOT AN OVERLOAD. `sparkle_improve.rs::failure_message` falls back
+  // to the child's PLAIN STDOUT when stderr is empty and the stream carried no structured detail —
+  // and the crate's own comment records that the hourly pass's child "frequently dies with EMPTY
+  // stderr". So the string this classifier is handed is, on that path, the AGENT'S OWN NARRATION.
+  // A bare `overloaded` substring therefore matches a pass that merely discussed the topic — and
+  // `engine/streamFailure` already reached this conclusion for the same keyword and deliberately
+  // dropped it ("they false-trip on prose and on logs the agent is reading").
+  //
+  // The cost is not cosmetic: a false transient burns `retryUsed` for the hour, so a genuinely
+  // transient failure arriving later in that same hour gets NO re-attempt — the exact harm the
+  // quota-ordering guard above exists to prevent, reached by a different route.
+  it.each([
+    ["I'll add handling for when the upstream model is overloaded, then retry.", "narration"],
+    ["  ⎿  tail: server.log: 529 Overloaded", "a log line the agent is reading"],
+    ["docs: explain that the API returns overloaded_error under load", "a commit subject"],
+  ])("prose mentioning overload (%s) is NOT transient", (message) => {
+    expect(isTransientPassFailure(message)).toBe(false);
+    expect(classifyPassFailure(message, AT)).toBe("other");
+  });
+
   it("a TIMEOUT is 'other', and 'other' is AMBER too", () => {
     // The 30-minute watchdog. Nothing is armed for it, but the next hourly slot re-attempts by
     // itself within the hour — so the founder is not the actor who clears it either.

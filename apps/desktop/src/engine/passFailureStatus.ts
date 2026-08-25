@@ -62,22 +62,51 @@ const TRANSIENT_FAILURE_PATTERNS = [
   // PRs) before doing anything, so partial work from the dead attempt is deduped, not redone.
   "closed mid-response",
   "stalled mid-stream",
-  // SERVER OVERLOAD (HTTP 529 / `overloaded_error`). The connection was fine and the request was
-  // well-formed — the far side simply refused it for capacity, and its own message says "usually
-  // temporary — try again in a moment". Without this the whole hourly slot is spent on a failure
-  // the API told us to retry, and the row waits out the hour for nothing.
-  //
-  // NOT a quota shape, and it cannot be confused for one: a usage/spend wall is answered by arms 1
-  // and 2 of `classifyPassFailure` before this list is consulted at all, so a message carrying both
-  // still classifies `quota`. Matched on the word rather than on "529" so it also covers the
-  // structured `overloaded_error` type, and because a bare "529" would collide with any number.
-  "overloaded",
+];
+
+/** The same judgement as {@link TRANSIENT_FAILURE_PATTERNS}, for shapes a bare substring cannot
+ *  express safely. A pattern belongs here rather than above when the KEYWORD alone is ambiguous and
+ *  only its surrounding syntax makes it a report of a failure rather than a mention of one.
+ *
+ *  SERVER OVERLOAD (HTTP 529 / `overloaded_error`) is the case that created this list. The
+ *  connection was fine and the request was well-formed — the far side refused it for capacity, and
+ *  its own message says "usually temporary — try again in a moment", so without it the whole hourly
+ *  slot is spent on a failure the API explicitly told us to retry.
+ *
+ *  ⚠️ IT MUST BE ANCHORED, AND A BARE `overloaded` IS NOT. What this classifier is handed is not
+ *  always a machine-generated banner: `sparkle_improve.rs::failure_message` falls back to the
+ *  child's PLAIN STDOUT when stderr is empty and the stream carried no structured detail, and that
+ *  crate's own comment records that the hourly pass's child "frequently dies with EMPTY stderr". On
+ *  that path the string is the AGENT'S OWN NARRATION — and an agent working in this repo writes the
+ *  word constantly (this very comment would match). `engine/streamFailure` reached the identical
+ *  conclusion for the identical keyword and DELIBERATELY DROPPED it, because bare keywords
+ *  "false-trip on prose and on logs the agent is reading"; that reasoning applies here verbatim and
+ *  this list is how it is honoured rather than re-litigated.
+ *
+ *  The cost of getting it wrong is not cosmetic: a false transient burns the slot's one `retryUsed`
+ *  for the hour, so a GENUINELY transient failure arriving later in that same hour gets no
+ *  re-attempt at all — the same harm the quota-before-transient ordering exists to prevent, reached
+ *  by a different route.
+ *
+ *  Ordering is untouched by this: arms 1 and 2 of `classifyPassFailure` answer a usage/spend wall
+ *  before either list is consulted, so a message carrying both shapes still classifies `quota`. */
+const TRANSIENT_FAILURE_REGEXES: readonly RegExp[] = [
+  // The banner, anchored on the "API Error:" prefix exactly as `engine/streamFailure` anchors its
+  // own — the colon is what separates a REPORTED failure from narration about one. Matched on the
+  // word rather than on "529" so a bare number cannot collide with a line number or a sha.
+  /api error:[^\n]*\boverloaded\b/i,
+  // The structured error type, anchored on its JSON quoting. Unquoted, `overloaded_error` is just a
+  // term an agent can type in a commit subject or a design note.
+  /"overloaded_error"/i,
 ];
 
 /** True when a failed pass's message names a connectivity problem rather than a real failure. */
 export function isTransientPassFailure(message: string): boolean {
   const lower = message.toLowerCase();
-  return TRANSIENT_FAILURE_PATTERNS.some((p) => lower.includes(p));
+  return (
+    TRANSIENT_FAILURE_PATTERNS.some((p) => lower.includes(p)) ||
+    TRANSIENT_FAILURE_REGEXES.some((r) => r.test(message))
+  );
 }
 
 /** Why a headless pass failed, coarse enough to decide a colour and nothing finer.
