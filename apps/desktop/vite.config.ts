@@ -1,9 +1,11 @@
 /// <reference types="vitest/config" />
 import react from "@vitejs/plugin-react";
-import { defineConfig, loadEnv } from "vite";
+import { defineConfig, loadEnv, type Plugin } from "vite";
 import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { testPoolOptions } from "../../vitest.pool.mjs";
+import { TAURI_SHIM } from "./scripts/visual/tauriShim.mjs";
+import { PREVIEW_MODE } from "./src/dev/devBypassAuth";
 
 // In dev, surface the user's Chief PAT to the app as VITE_CHIEF_PAT so the Think agent
 // works on localhost without pasting a token. We look (in order) at: the process env
@@ -34,6 +36,50 @@ function devChiefPat(mode: string): string {
   return "";
 }
 
+/**
+ * SERVES THE DEV-ONLY TAURI IPC BRIDGE TO THE AGENT PREVIEW SERVER (bead sparkle-bg6868).
+ *
+ * THE BUG. `.sparkle/config.toml`'s `[preview]` block points every agent's preview at this
+ * package's vite dev server. A plain browser has no Tauri IPC, so `trialApi.fetchTrial()` —
+ * `invoke("trial_status")` — rejects, `trialStore` sets `error`, and `AuthGate` paints
+ * WelcomeScreen: "We couldn't load your free-trial status." That, and not the app, is what every
+ * preview card has been showing, and the founder's screenshots are exactly it.
+ *
+ * WHY NOT JUST THE AUTH BYPASS. Setting `VITE_SPARKLE_DEV_BYPASS_AUTH=1` alone was tried and
+ * MEASURED WORSE (`PRD/sparkle/preview-usable.md`): the tree then mounts and every `invoke()`
+ * inside it throws, so the app lands on its own error boundary ("Something broke", 19 DOM nodes)
+ * instead of the gate's correctly-styled page (38). The bypass gets you PAST the gate; the shim is
+ * what lets the app behind it actually run. The visual harness has always used BOTH — that pairing
+ * is what this reproduces.
+ *
+ * WHAT MAKES IT UNREACHABLE IN A RELEASE BUILD — the point that is not optional, because this
+ * fakes the answer to an entitlement check. Three independent gates, any one of which suffices:
+ *   1. This function returns `undefined` unless `command === "serve"`. `vite build` — the command
+ *      `tauri build` runs to produce the shipped bundle — is `command === "build"`, so the plugin
+ *      is never even constructed and the shim string is never referenced by anything Rollup walks.
+ *   2. `apply: "serve"`, vite's own belt-and-braces for the same thing.
+ *   3. `mode === PREVIEW_MODE`. `--mode preview` is passed by exactly one caller in this repo, the
+ *      `[preview]` override in `.sparkle/config.toml`. A packaged build is mode `production`, and
+ *      a developer's own `pnpm dev` / `pnpm tauri dev` is mode `development` — so neither the
+ *      shipped app nor the ordinary dev loop is touched by this at all.
+ * `previewTauriShimGate.test.ts` asserts all three directions.
+ *
+ * `head-prepend`, not `head`: the shim must be evaluated before `<script type="module"
+ * src="/src/main.tsx">`, which is deferred — so a classic inline script at the top of <head> is
+ * already in place when the first app module runs. That is the same ordering guarantee the harness
+ * gets from `Page.addScriptToEvaluateOnNewDocument`.
+ */
+function previewTauriShim(mode: string, command: "serve" | "build"): Plugin | undefined {
+  if (command !== "serve" || mode !== PREVIEW_MODE) return undefined;
+  return {
+    name: "sparkle-preview-tauri-shim",
+    apply: "serve",
+    transformIndexHtml() {
+      return [{ tag: "script", children: TAURI_SHIM, injectTo: "head-prepend" as const }];
+    },
+  };
+}
+
 // Tauri expects a fixed dev port and an un-cleared console.
 export default defineConfig(({ mode, command }) => {
   // Resolve the Chief PAT once so we can BOTH inject it (dev) and assert it's absent from any
@@ -48,8 +94,12 @@ export default defineConfig(({ mode, command }) => {
         "is dev-serve only. Unset CHIEF_API / VITE_CHIEF_PAT (and don't build with --mode development).",
     );
   }
+  const shim = previewTauriShim(mode, command);
   return {
-  plugins: [react()],
+  // A ternary rather than `[react(), shim].filter(Boolean)`: the filter form types the array as
+  // `(Plugin | undefined)[]`, which hides exactly the thing worth seeing here — that the shim is
+  // in the list only when `previewTauriShim` decided it may be.
+  plugins: shim ? [react(), shim] : [react()],
   build: {
     // The app only ever runs inside a system WebView — WKWebView on macOS (bundle
     // minimumSystemVersion 11.0 ⇒ Safari 14) and evergreen WebView2 on Windows. Target that
