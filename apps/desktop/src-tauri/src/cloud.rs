@@ -29,7 +29,7 @@
 //! Err and the caller falls back to the on-device transcriber; a mid-stream error (or an `exhausted`
 //! control frame) ends the worker and the session is torn down back to on-device.
 use std::collections::VecDeque;
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::sync::Arc;
@@ -701,6 +701,56 @@ pub(crate) fn classify_relay_frame(json: &str) -> RelayFrame {
 /// seconds.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 
+/// Overall wall-clock ceiling on the WHOLE address-connect loop, independent of how many addresses
+/// DNS returns for the relay host.
+///
+/// `CONNECT_TIMEOUT` bounds ONE attempt; the loop below tries EVERY resolved address in turn, so
+/// without a total bound the worst case was `CONNECT_TIMEOUT × N`. A dual-stack / CDN relay hostname
+/// resolving to a dozen-plus records, each black-holed under a contended network, turned the
+/// 8s-per-attempt budget into MINUTES before the fall-back-to-on-device could fire — measured as a
+/// 2-3 minute dead microphone after an app restart, under load average 48 with DNS itself timing out
+/// (sparkle-nimbph). The per-address timeout was doing its job; nothing bounded the SUM.
+///
+/// This caps that sum. Two full-timeout attempts is enough to clear the case the multi-address loop
+/// exists for (an IPv6 record on an IPv4-only path times out, a later IPv4 record connects — see the
+/// loop's own comment). Addresses that FAIL FAST (a connection refused, resolved-but-dead) barely
+/// dent the budget, so "try every address" still holds whenever the failures are cheap; only the
+/// black-holed addresses — the ones that actually stalled the founder — are capped.
+const CONNECT_TOTAL_BUDGET: Duration = Duration::from_secs(16);
+
+/// Try each resolved address in order until one connects, bounding EACH attempt by
+/// `min(CONNECT_TIMEOUT, time left in `total_budget`)` and STOPPING as soon as the total budget is
+/// spent — even with addresses left untried. Returns the first `Ok`, else the last dial error.
+///
+/// Pure over an injected clock (`now`) and dialer (`dial`) so a test can prove the SUM is bounded —
+/// that under many black-holed addresses it stops after the budget instead of dialing all N — with
+/// no real socket, and can also prove the cap does NOT break the live-address-after-a-dead-one case
+/// the loop is here for. The production dialer is `TcpStream::connect_timeout`; the production clock
+/// is `Instant::now`.
+fn connect_within_budget<S>(
+    addrs: &[SocketAddr],
+    total_budget: Duration,
+    now: impl Fn() -> Instant,
+    mut dial: impl FnMut(&SocketAddr, Duration) -> Result<S, String>,
+) -> Result<S, String> {
+    let start = now();
+    let mut last_err = String::from("no address to connect to");
+    for addr in addrs {
+        // `checked_sub` is None once we're past the deadline; `is_zero` catches landing exactly on
+        // it. Either way there is no time left to give an attempt, so stop rather than start a dial
+        // that would run for its own full `CONNECT_TIMEOUT` past the budget.
+        let remaining = match total_budget.checked_sub(now().saturating_duration_since(start)) {
+            Some(r) if !r.is_zero() => r,
+            _ => break,
+        };
+        match dial(addr, remaining.min(CONNECT_TIMEOUT)) {
+            Ok(s) => return Ok(s),
+            Err(e) => last_err = e,
+        }
+    }
+    Err(last_err)
+}
+
 /// WHY a handshake failed, kept as a TYPE rather than flattened into a message string.
 ///
 /// The relay answers every refusal with a DISTINCT status (see `deepgramRelay.ts`: 503 when its own
@@ -862,19 +912,14 @@ fn connect(
     if addrs.is_empty() {
         return Err(RelayError::unreachable("relay dns: no address".to_string()));
     }
-    let mut tcp = None;
-    let mut last_err = String::new();
-    for addr in &addrs {
-        match TcpStream::connect_timeout(addr, CONNECT_TIMEOUT) {
-            Ok(s) => {
-                tcp = Some(s);
-                break;
-            }
-            Err(e) => last_err = e.to_string(),
-        }
-    }
-    let tcp = tcp
-        .ok_or_else(|| RelayError::unreachable(format!("relay connect failed: {last_err}")))?;
+    // Bounded by CONNECT_TOTAL_BUDGET across ALL addresses, not just CONNECT_TIMEOUT per address:
+    // a relay host resolving to many black-holed records must not sum into minutes before we fall
+    // back to on-device (sparkle-nimbph). `connect_within_budget` still tries later addresses (the
+    // IPv6-dead/IPv4-alive case) while the budget holds.
+    let tcp = connect_within_budget(&addrs, CONNECT_TOTAL_BUDGET, Instant::now, |addr, per| {
+        TcpStream::connect_timeout(addr, per).map_err(|e| e.to_string())
+    })
+    .map_err(|last_err| RelayError::unreachable(format!("relay connect failed: {last_err}")))?;
     let _ = tcp.set_read_timeout(Some(CONNECT_TIMEOUT));
     let _ = tcp.set_write_timeout(Some(CONNECT_TIMEOUT));
     if tls {
@@ -1520,6 +1565,88 @@ pub(crate) fn parkable_session() -> (DeepgramSession, ParkedChannel) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+
+    /// THE FIX (sparkle-nimbph): the address-connect loop must stop at CONNECT_TOTAL_BUDGET, not
+    /// dial every DNS record. Before this, a relay host resolving to many black-holed addresses
+    /// spent CONNECT_TIMEOUT (8s) on EACH — 20 records × 8s ≈ 2.7 minutes of a dead microphone
+    /// before the fall-back-to-on-device could fire.
+    ///
+    /// The SIDE EFFECT asserted is the wall-clock bound itself: with an injected clock that advances
+    /// by each attempt's full timeout (a black hole consumes its whole budget), the loop makes only
+    /// as many attempts as fit in the budget and the total elapsed never exceeds it — regardless of
+    /// how many addresses DNS returned. A test that only counted addresses could not see the sum.
+    #[test]
+    fn the_connect_loop_stops_at_the_total_budget_not_after_every_resolved_address() {
+        let start = Instant::now();
+        let elapsed = Cell::new(Duration::ZERO);
+        let now = || start + elapsed.get();
+        // Twenty resolved records, all black-holed: the pathological shape the founder hit.
+        let addrs: Vec<SocketAddr> = (0..20)
+            .map(|i| SocketAddr::from(([10, 0, 0, i as u8], 443)))
+            .collect();
+        let dials = Cell::new(0u32);
+        let budget = Duration::from_secs(16);
+
+        let result: Result<(), String> =
+            connect_within_budget(&addrs, budget, now, |_addr, per| {
+                dials.set(dials.get() + 1);
+                // A black-holed address burns its ENTIRE per-attempt allowance, then fails.
+                elapsed.set(elapsed.get() + per);
+                Err("timed out".to_string())
+            });
+
+        assert!(
+            result.is_err(),
+            "every address black-holed → Err, so the caller falls back to on-device"
+        );
+        // 16s budget ÷ 8s per full-timeout attempt = exactly two attempts, then the budget is spent
+        // and the loop stops with 18 records still untried. The bug dialed all 20 (≈2.7 min).
+        assert_eq!(
+            dials.get(),
+            2,
+            "must stop when the total budget is spent, not dial every resolved address"
+        );
+        assert!(
+            elapsed.get() <= budget,
+            "total connect wall-clock {:?} must not exceed the budget {:?}",
+            elapsed.get(),
+            budget
+        );
+    }
+
+    /// The CAPABILITY the cap must not break: the loop still moves past a dead address to a live one
+    /// (the documented IPv6-record-on-an-IPv4-only-path case). This is the paired test — the bound
+    /// above proves the loop STOPS; this proves it does not stop too soon and strand a reachable
+    /// relay. A budget mistakenly tightened below one full timeout would make attempt #2 unreachable
+    /// and red this test while the bound test stayed green.
+    #[test]
+    fn a_live_address_after_a_black_holed_one_still_connects_within_budget() {
+        let start = Instant::now();
+        let elapsed = Cell::new(Duration::ZERO);
+        let now = || start + elapsed.get();
+        let live = SocketAddr::from(([203, 0, 113, 2], 443));
+        let addrs: Vec<SocketAddr> = vec![SocketAddr::from(([203, 0, 113, 1], 443)), live];
+        let dials = Cell::new(0u32);
+
+        let result = connect_within_budget(&addrs, Duration::from_secs(16), now, |addr, per| {
+            dials.set(dials.get() + 1);
+            if *addr == live {
+                Ok("connected")
+            } else {
+                // The first record is black-holed: it consumes its whole per-attempt allowance.
+                elapsed.set(elapsed.get() + per);
+                Err("timed out".to_string())
+            }
+        });
+
+        assert_eq!(
+            result,
+            Ok("connected"),
+            "the loop must skip past the dead record and connect on the live one"
+        );
+        assert_eq!(dials.get(), 2, "both records were tried within the budget");
+    }
 
     /// Build the shape tungstenite hands us when the relay ANSWERED with a non-101 status.
     fn http_err(status: u16) -> tungstenite::Error {
