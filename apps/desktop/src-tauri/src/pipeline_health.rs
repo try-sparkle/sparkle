@@ -85,6 +85,111 @@ const ROBOREV_DB_LABEL: &str = "~/.roborev/reviews.db";
 /// Mirrored by `PH_LOCK_EVIDENCE_WINDOW_SECS` in scripts/pipeline-health-scan.sh.
 const LOCK_EVIDENCE_WINDOW_SECS: i64 = 120;
 
+/// THE ENQUEUE FENCE — "running" is not "working" (beads sparkle-trlumq P0 / sparkle-ckazb7).
+///
+/// Every other roborev reading — status kind, launchd registration, process liveness, store size,
+/// lock evidence — asks whether the daemon EXISTS and ANSWERS. None asks whether work is ARRIVING,
+/// and that gap published a green chip over a total review outage for roughly twelve hours.
+///
+/// MEASURED. The running daemon had been started outside its LaunchAgent, so it inherited a bare
+/// `PATH=/usr/bin:/bin:/usr/sbin:/sbin` and could reach no review agent. Every enqueue was refused
+/// with `no review agent available` — 110 refusals over twelve hours — while `roborev status`
+/// answered normally and printed `Health: OK`, which [`classify_running`] read as Healthy the whole
+/// time. The CLI the post-commit hook calls swallows that refusal and exits 0, so nothing else said
+/// otherwise either. In one line: A SEVERED ENQUEUE PATH IS INDISTINGUISHABLE FROM AN EMPTY QUEUE.
+///
+/// Both bounds are load-bearing, and neither is taste:
+/// * An idle machine owes nothing. Firing on a quiet queue is how a fence becomes noise and gets
+///   muted — exactly how the earlier WARNING/RECOVERED flap trained everyone off this panel.
+/// * Enqueue is asynchronous, so a commit made seconds ago legitimately has no job yet.
+/// * ONE unenqueued commit is a race or a branch roborev does not watch; TWO across the window is a
+///   pattern. Six commits landed over ten hours in the incident, so 30 minutes / 2 commits fires on
+///   the second one rather than after ten hours and 110 silent refusals.
+/// Mirrored by `PH_ROBOREV_ENQUEUE_GAP_SECS` / `PH_ROBOREV_UNFED_COMMITS` in pipeline-health.sh.
+const ROBOREV_ENQUEUE_GAP_SECS: u64 = 1800;
+const ROBOREV_UNFED_COMMITS: u32 = 2;
+
+/// What we could learn about whether roborev is TAKING IN work. Three states, not two, because
+/// "nobody asked" and "we asked and could not tell" must not collapse (bead sparkle-l2k25q): the
+/// first has to preserve the pre-fence behaviour exactly, the second must never be served as an
+/// all-clear. Mirrors `ph_classify_roborev_enqueue`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum EnqueueEvidence {
+    /// No reading was taken — this caller never asked.
+    #[default]
+    NotTaken,
+    /// The reading was ATTEMPTED and failed. Never an all-clear.
+    Unknown,
+    /// How many commits have landed with nothing enqueued since, and how old that newest enqueue is.
+    Seen { unfed_commits: u32, gap_secs: u64 },
+}
+
+/// The verdict [`EnqueueEvidence`] supports. Split from the evidence so the thresholds live in ONE
+/// place across both the Rust and the shell mirror.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnqueueVerdict {
+    NotTaken,
+    Unknown,
+    Ok,
+    Severed { unfed_commits: u32, gap_secs: u64 },
+}
+
+fn classify_enqueue(ev: EnqueueEvidence) -> EnqueueVerdict {
+    match ev {
+        EnqueueEvidence::NotTaken => EnqueueVerdict::NotTaken,
+        EnqueueEvidence::Unknown => EnqueueVerdict::Unknown,
+        EnqueueEvidence::Seen { unfed_commits, gap_secs } => {
+            if unfed_commits >= ROBOREV_UNFED_COMMITS && gap_secs >= ROBOREV_ENQUEUE_GAP_SECS {
+                EnqueueVerdict::Severed { unfed_commits, gap_secs }
+            } else {
+                EnqueueVerdict::Ok
+            }
+        }
+    }
+}
+
+/// Apply the fence to a verdict that would otherwise be published. Only ever REMOVES a false green:
+/// a state that is already Warning/Unknown is returned untouched, so this can never mask a fault the
+/// rest of the ladder found.
+fn apply_enqueue_fence(
+    state: HealthState,
+    detail: String,
+    ev: EnqueueEvidence,
+) -> (HealthState, String) {
+    if state != HealthState::Healthy {
+        return (state, detail);
+    }
+    match classify_enqueue(ev) {
+        EnqueueVerdict::NotTaken | EnqueueVerdict::Ok => (state, detail),
+        EnqueueVerdict::Unknown => (
+            HealthState::Unknown,
+            "Review daemon running, but whether anything is being ENQUEUED could not be read — so \
+             this is NOT an all-clear: a daemon that answers while refusing every enqueue looks \
+             exactly like one with an empty queue. Code review may be stopped; merges and deploys \
+             are unaffected. Read it directly with `scripts/roborev-authored-findings.sh --branch \
+             <ref>`, which fails closed the same way."
+                .to_string(),
+        ),
+        EnqueueVerdict::Severed { unfed_commits, gap_secs } => (
+            HealthState::Warning,
+            format!(
+                "Review daemon running and reporting Health: OK, but it is DISCONNECTED: \
+                 {unfed_commits} commit(s) have landed in the {gap_secs}s (~{}h) since anything was \
+                 last enqueued. This is NOT an idle queue — those commits have had no review at \
+                 all, and the daemon reports healthy because every signal it publishes is about \
+                 whether it ANSWERS, not whether work is ARRIVING. Code review is stopped; merges \
+                 and deploys are unaffected. The measured cause is a daemon started outside its \
+                 LaunchAgent, which inherits a bare PATH and can reach no review agent, so it \
+                 refuses every enqueue and exits 0; note `roborev check-agents` answers from YOUR \
+                 PATH, not the daemon's, so it reads green while the daemon is blind. Re-own it \
+                 with `launchctl kickstart -k gui/$(id -u)/co.plow.roborev-daemon`, and VERIFY BY \
+                 ENQUEUE, not by status: make a commit and assert the newest job id moves.",
+                gap_secs / 3600
+            ),
+        ),
+    }
+}
+
 /// How many SERVER-path lock lines inside that window before the raw log is called proof.
 ///
 /// Kept low because [`is_server_lock_line`] — not volume — is what removes the idle background.
@@ -210,6 +315,8 @@ pub struct DaemonEvidence {
     /// Is roborev's own error log showing SERVER-path lock collisions RIGHT NOW? `None` = we could
     /// not tell, which is never read as "no contention". See [`roborev_recent_lock_evidence`].
     lock_evidence: Option<bool>,
+    /// Is work ARRIVING? The one reading none of the others carry. See [`EnqueueEvidence`].
+    enqueue: EnqueueEvidence,
 }
 
 impl DaemonEvidence {
@@ -255,7 +362,7 @@ fn classify_roborev(status: &StatusProbe, evidence: DaemonEvidence) -> (HealthSt
             if daemon_line.contains("not running") {
                 classify_not_answering(false, evidence)
             } else if daemon_line.contains("running") {
-                classify_running(out)
+                classify_running(out, evidence.enqueue)
             } else {
                 (
                     HealthState::Unknown,
@@ -400,7 +507,16 @@ fn health_word(health_line: &str) -> Option<String> {
 /// BUSY, not alive, so `0/M active` is a healthy IDLE daemon — blocking on it would re-amber exactly
 /// the drained-queue case this fix greens (`sparkle` roborev finding). A genuinely dead worker
 /// surfaces as a fault word / hard marker in the health block instead.
-fn classify_running(out: &str) -> (HealthState, String) {
+fn classify_running(out: &str, enqueue: EnqueueEvidence) -> (HealthState, String) {
+    let (state, detail) = classify_running_daemon(out);
+    // The daemon's own verdict is about the DAEMON. The fence is the only thing here that asks about
+    // the PIPELINE, and it is applied last so it can strip a false green off every healthy path
+    // above — including the `Health: OK` one that published green through the measured outage.
+    apply_enqueue_fence(state, detail, enqueue)
+}
+
+/// The daemon's self-report, unfenced.
+fn classify_running_daemon(out: &str) -> (HealthState, String) {
     let health_line = out.lines().find(|l| l.trim_start().starts_with("Health:"));
     match health_line {
         Some(h) => {
@@ -2057,6 +2173,73 @@ fn roborev_recent_lock_evidence() -> Option<bool> {
     }
 }
 
+/// IS WORK ARRIVING? — read straight from roborev's store, NOT through the daemon.
+///
+/// Asking `roborev status` or `roborev list` would be asking the accused: the whole failure mode is
+/// a daemon that ANSWERS while enqueueing nothing. `roborev list` is doubly wrong here because it
+/// defaults to the current repo AND BRANCH, so in an agent worktree it reports that branch's own
+/// history — measured as 45 rows whose newest enqueue was a day stale while the store's true newest
+/// was five minutes old.
+///
+/// READ-ONLY (`mode=ro`), and cheap: ~0.08s against the 860MB store. The ~20s open that
+/// [`classify_not_answering`] describes is the daemon's WRITE-mode open with schema init, not a read.
+///
+/// Returns [`EnqueueEvidence::NotTaken`] when there is nothing to read from (no `sqlite3`, no store,
+/// no repo) so the pre-fence behaviour is preserved exactly, and [`EnqueueEvidence::Unknown`] when a
+/// read was attempted and failed — which the classifier refuses to serve as an all-clear.
+fn roborev_enqueue_evidence(root: &str) -> EnqueueEvidence {
+    let Ok(home) = std::env::var("HOME") else { return EnqueueEvidence::NotTaken };
+    let db = std::path::Path::new(&home).join(".roborev").join("reviews.db");
+    if !db.exists() {
+        return EnqueueEvidence::NotTaken;
+    }
+    // ISO-8601 rather than an epoch for the `--since` handoff. Both forms work for a real
+    // timestamp (verified, same count either way), but the ISO form carries an explicit `Z`, so the
+    // UTC the store holds cannot be re-read as local time on the git side, and it needs no second
+    // conversion. It also degrades honestly: an EMPTY store makes the concatenation NULL, which
+    // arrives as an empty string and becomes `Unknown` below rather than a timestamp that would
+    // read as "nothing has landed".
+    let mut q = Command::new("sqlite3");
+    q.arg(format!("file:{}?mode=ro", db.display())).arg(
+        "select strftime('%Y-%m-%dT%H:%M:%SZ', max(enqueued_at)) || ' ' || \
+         cast(strftime('%s','now') - strftime('%s', max(enqueued_at)) as integer) from review_jobs;",
+    );
+    let row = match crate::worktree::output_with_timeout(q, Duration::from_secs(10)) {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+        // A MISSING `sqlite3` is "nothing to read from" — NotTaken, which preserves the pre-fence
+        // verdict. Everything else, a TIMEOUT above all, is a read that was attempted and failed,
+        // and must be Unknown: folding a timeout into NotTaken would silently restore the green
+        // this fence exists to remove, exactly when the machine is too loaded to answer.
+        Err(e) if is_spawn_failure(&e) => return EnqueueEvidence::NotTaken,
+        _ => return EnqueueEvidence::Unknown,
+    };
+    let Some((iso, gap)) = row.split_once(' ') else { return EnqueueEvidence::Unknown };
+    let Ok(gap_secs) = gap.trim().parse::<u64>() else { return EnqueueEvidence::Unknown };
+    if iso.is_empty() {
+        return EnqueueEvidence::Unknown;
+    }
+    let mut g = Command::new("git");
+    g.arg("-C").arg(root).args(["rev-list", "--count"]).arg(format!("--since={iso}")).arg("HEAD");
+    match crate::worktree::output_with_timeout(g, Duration::from_secs(10)) {
+        Ok(o) if o.status.success() => {
+            match String::from_utf8_lossy(&o.stdout).trim().parse::<u32>() {
+                Ok(unfed_commits) => EnqueueEvidence::Seen { unfed_commits, gap_secs },
+                Err(_) => EnqueueEvidence::Unknown,
+            }
+        }
+        // No NotTaken arm here on purpose: by this point the store HAS been read, so a git failure
+        // is a half-answer, never "nobody asked".
+        _ => EnqueueEvidence::Unknown,
+    }
+}
+
+/// Did [`crate::worktree::output_with_timeout`] fail because the binary is not there, as opposed to
+/// failing after it ran? The distinction decides NotTaken vs Unknown, and only the message carries
+/// it — `output_with_timeout_lenient` stringifies the spawn error with this exact prefix.
+fn is_spawn_failure(err: &str) -> bool {
+    err.starts_with("failed to spawn")
+}
+
 fn roborev_daemon_alive() -> Option<bool> {
     let out = Command::new("pgrep").args(["-f", "roborev daemon"]).output().ok()?;
     Some(out.status.success())
@@ -2114,15 +2297,20 @@ fn roborev_component(root: &str) -> ComponentHealth {
                 .find(|l| l.trim_start().starts_with("Daemon:"))
                 .is_some_and(|l| l.to_ascii_lowercase().contains("not running")),
         };
+        // Taken for EVERY shape, unlike the WHY-readings below. A daemon that answers normally is
+        // precisely what hid the measured outage, so skipping this on the healthy path would leave
+        // the fence blind to the only case it exists for.
+        let enqueue = roborev_enqueue_evidence(root);
         let evidence = if not_answering {
             DaemonEvidence {
                 loaded: roborev_daemon_loaded(),
                 alive: roborev_daemon_alive(),
                 db_bytes: roborev_db_bytes(),
                 lock_evidence: roborev_recent_lock_evidence(),
+                enqueue,
             }
         } else {
-            DaemonEvidence::default()
+            DaemonEvidence { enqueue, ..Default::default() }
         };
         classify_roborev(&status, evidence)
     };
@@ -2471,7 +2659,7 @@ mod tests {
     }
 
     fn evidence(alive: Option<bool>, loaded: Option<bool>, db_bytes: Option<u64>) -> DaemonEvidence {
-        DaemonEvidence { loaded, alive, db_bytes, lock_evidence: None }
+        DaemonEvidence { loaded, alive, db_bytes, lock_evidence: None, enqueue: EnqueueEvidence::NotTaken }
     }
 
     /// The same evidence WITH a lock-evidence reading. Separate constructor so every pre-existing
@@ -2483,7 +2671,156 @@ mod tests {
         db_bytes: Option<u64>,
         lock_evidence: Option<bool>,
     ) -> DaemonEvidence {
-        DaemonEvidence { loaded, alive, db_bytes, lock_evidence }
+        DaemonEvidence { loaded, alive, db_bytes, lock_evidence, enqueue: EnqueueEvidence::NotTaken }
+    }
+
+    /// Evidence carrying an ENQUEUE reading. Separate constructor for the same reason as
+    /// `evidence_with_lock`: every pre-existing test keeps `NotTaken` and none silently acquires a
+    /// verdict it was not written to assert.
+    fn evidence_with_enqueue(enqueue: EnqueueEvidence) -> DaemonEvidence {
+        DaemonEvidence { enqueue, ..Default::default() }
+    }
+
+    /// `roborev status` output for a daemon that is up and calls itself healthy — the shape that
+    /// published green through the measured twelve-hour outage.
+    fn healthy_status() -> String {
+        "Daemon: running (uptime: 10h 39m)\nHealth: OK\nJobs: 0 queued, 0 running, 17591 completed, 4385 failed"
+            .to_string()
+    }
+
+    // ── THE ENQUEUE FENCE (beads sparkle-trlumq P0 / sparkle-ckazb7) ─────────────────────────────
+
+    #[test]
+    fn a_daemon_that_answers_while_enqueueing_nothing_is_disconnected_not_healthy() {
+        // Every signal the old ladder had is green: running, Health: OK, nothing else even consulted.
+        // The only thing wrong is that six commits landed and none of them was enqueued.
+        let (state, detail) = classify_roborev(
+            &StatusProbe::Text(healthy_status()),
+            evidence_with_enqueue(EnqueueEvidence::Seen { unfed_commits: 6, gap_secs: 36_000 }),
+        );
+        assert_eq!(state, HealthState::Warning, "up-but-not-enqueueing must not read healthy: {detail}");
+        assert!(detail.contains("DISCONNECTED"), "the verdict must name itself: {detail}");
+        assert!(detail.contains("6 commit(s)"), "and say how many went unenqueued: {detail}");
+        // roborev is never blocking, and the remedy must be safe under the conditions that produced
+        // it — the `stop && start` this module warns about is what MANUFACTURES a blind daemon.
+        assert_ne!(state, HealthState::Blocking);
+        assert!(!detail.contains("Recover with `roborev daemon stop"), "unsafe remedy: {detail}");
+    }
+
+    #[test]
+    fn an_idle_machine_owes_nothing_and_stays_healthy() {
+        // PAIRED with the case above, differing in exactly ONE input. A fence that fires on a quiet
+        // queue becomes noise and gets muted, which is how the earlier flap trained everyone off
+        // this panel — so this is a requirement, not a nicety.
+        let (state, _) = classify_roborev(
+            &StatusProbe::Text(healthy_status()),
+            evidence_with_enqueue(EnqueueEvidence::Seen { unfed_commits: 0, gap_secs: 36_000 }),
+        );
+        assert_eq!(state, HealthState::Healthy, "no commits landed, so nothing is owed");
+    }
+
+    #[test]
+    fn work_in_flight_is_not_a_severed_intake() {
+        // Enqueue is asynchronous: commits made moments ago legitimately have no job yet.
+        let (state, _) = classify_roborev(
+            &StatusProbe::Text(healthy_status()),
+            evidence_with_enqueue(EnqueueEvidence::Seen { unfed_commits: 6, gap_secs: 60 }),
+        );
+        assert_eq!(state, HealthState::Healthy, "a fresh enqueue proves intake is alive");
+    }
+
+    #[test]
+    fn one_unenqueued_commit_is_not_yet_a_disconnection() {
+        // One commit is a race, or a branch roborev does not watch. Two across the window is a
+        // pattern. This pins the commit floor as load-bearing in its own right.
+        let (state, _) = classify_roborev(
+            &StatusProbe::Text(healthy_status()),
+            evidence_with_enqueue(EnqueueEvidence::Seen { unfed_commits: 1, gap_secs: 36_000 }),
+        );
+        assert_eq!(state, HealthState::Healthy);
+    }
+
+    #[test]
+    fn no_enqueue_reading_taken_behaves_exactly_as_before_the_fence() {
+        // NotTaken is not a reading of zero. Every existing call site constructs `NotTaken`, so this
+        // is what keeps the fence from changing any verdict nobody asked it about.
+        let (state, detail) =
+            classify_roborev(&StatusProbe::Text(healthy_status()), DaemonEvidence::default());
+        assert_eq!(state, HealthState::Healthy);
+        assert!(detail.starts_with("Review daemon running."), "unchanged wording: {detail}");
+    }
+
+    #[test]
+    fn an_unreadable_enqueue_reading_never_certifies_green() {
+        // Fail-closed, the distinction bead sparkle-l2k25q is about: "no jobs" and "could not read
+        // jobs" must not render identically.
+        let (state, detail) = classify_roborev(
+            &StatusProbe::Text(healthy_status()),
+            evidence_with_enqueue(EnqueueEvidence::Unknown),
+        );
+        assert_eq!(state, HealthState::Unknown, "an unreadable probe is not an all-clear: {detail}");
+        assert!(detail.contains("ENQUEUED"), "and it must say which evidence: {detail}");
+    }
+
+    #[test]
+    fn the_fence_only_ever_removes_a_false_green() {
+        // A daemon that is already failing must keep ITS diagnosis and remedy. If the fence could
+        // overwrite a Warning it would mask the wedge/slow/down split this module exists for.
+        let severed = EnqueueEvidence::Seen { unfed_commits: 9, gap_secs: 90_000 };
+        let (state, detail) = classify_roborev(
+            &StatusProbe::TimedOut,
+            DaemonEvidence {
+                loaded: Some(true),
+                alive: Some(true),
+                db_bytes: Some(RB_BLOATED),
+                lock_evidence: None,
+                enqueue: severed,
+            },
+        );
+        assert_eq!(state, HealthState::Warning);
+        assert!(detail.contains("SLOW, not wedged"), "the store diagnosis must survive: {detail}");
+        assert!(!detail.contains("DISCONNECTED"), "the fence must not overwrite it: {detail}");
+    }
+
+    #[test]
+    fn a_timeout_reading_the_store_is_unknown_not_not_taken() {
+        // The two error shapes must NOT fold together. `NotTaken` restores the pre-fence green, so
+        // routing a timeout there would hand back a false all-clear precisely when the machine is
+        // too loaded to answer — measured during this work: a ~0.08s query expired a 10s bound
+        // under a concurrent build.
+        assert!(is_spawn_failure("failed to spawn: No such file or directory (os error 2)"));
+        assert!(!is_spawn_failure("timed out after 10s"));
+        // And the verdicts they map to are genuinely different, not merely different words.
+        assert_eq!(
+            apply_enqueue_fence(HealthState::Healthy, "x".into(), EnqueueEvidence::NotTaken).0,
+            HealthState::Healthy,
+        );
+        assert_eq!(
+            apply_enqueue_fence(HealthState::Healthy, "x".into(), EnqueueEvidence::Unknown).0,
+            HealthState::Unknown,
+        );
+    }
+
+    #[test]
+    fn the_enqueue_thresholds_are_the_shell_mirrors() {
+        // Both bounds pinned at the boundary, so a drift from pipeline-health.sh's
+        // PH_ROBOREV_UNFED_COMMITS / PH_ROBOREV_ENQUEUE_GAP_SECS goes red here rather than silently
+        // making the two surfaces disagree.
+        let at = EnqueueEvidence::Seen {
+            unfed_commits: ROBOREV_UNFED_COMMITS,
+            gap_secs: ROBOREV_ENQUEUE_GAP_SECS,
+        };
+        assert!(matches!(classify_enqueue(at), EnqueueVerdict::Severed { .. }), "at the bound");
+        let below_commits = EnqueueEvidence::Seen {
+            unfed_commits: ROBOREV_UNFED_COMMITS - 1,
+            gap_secs: ROBOREV_ENQUEUE_GAP_SECS,
+        };
+        assert_eq!(classify_enqueue(below_commits), EnqueueVerdict::Ok, "one under the commit floor");
+        let below_gap = EnqueueEvidence::Seen {
+            unfed_commits: ROBOREV_UNFED_COMMITS,
+            gap_secs: ROBOREV_ENQUEUE_GAP_SECS - 1,
+        };
+        assert_eq!(classify_enqueue(below_gap), EnqueueVerdict::Ok, "one under the gap floor");
     }
 
     const RB_BLOATED: u64 = 901_775_360; // 860 MB — the measured size of the founder's store
