@@ -186,3 +186,74 @@ describe("both status chains apply the landed veto, at the same position", () =>
     }
   });
 });
+
+// ── THE THIRD FINDING, AND IT IS NOT THE SHAPE THE FIRST TWO WERE ──────────────────────────────
+//
+// After the dead-session overlay turned out to be in one chain and not the other, the two chains'
+// overlay call sets were diffed rather than assuming a one-off. `withBlockedPromptGrace` came out of
+// that diff — but tracing it showed a DIFFERENT defect, and the distinction matters enough to pin.
+//
+// It is not "one chain has it, the other does not". It is in NEITHER status chain. It runs once, in
+// `useAttentionNotifications`'s effect, and what it feeds is the dock-badge count, the banner
+// dispatch skip, and the payment accounting. `composeRollup` never applies it, so the published
+// status map does not carry it either.
+//
+// The user-visible consequence is still real and still the thing the red-dot gate exists to stop:
+// while the concierge is auto-answering a prompt, the BADGE is suppressed and the ROW still paints
+// red — an escalation reaching the founder with no proof he is the actor.
+//
+// ⚠️ WHY THIS IS AN ASSERTION ABOUT `composeRollup` AND NOT A `src.match(...)` COUNT. The first
+// version of this guard counted the string across each whole FILE. That passes for the published
+// side on the strength of the effect's call at a completely different layer — green on a half it
+// never tested, which is this repo's standing "asserts the precondition, not the side effect"
+// failure. Scope the search to the function that IS the chain, or the guard is decoration.
+//
+// ⚠️ AND WHY IT IS NOT BRACE-MATCHED EITHER. Two earlier cuts of this slice were BOTH wrong, in
+// OPPOSITE directions, and both read as obviously correct:
+//   • `ROLLUP.slice(at)` ran to EOF, swallowing `useAttentionNotifications`'s OWN call several
+//     hundred lines below — the body appeared to contain a call it does not make.
+//   • Counting braces from the first `{` after the NAME stopped inside the SIGNATURE, because
+//     `composeRollup`'s parameter list carries `interaction: Record<string, number> = {}` — a
+//     balanced pair that closes two characters later. The slice was then the signature alone, so
+//     the zero-match assertion below could never fail: it stayed green on the very day the grace
+//     LANDED inside `composeRollup`, which is the single event this whole guard exists to catch.
+//     (Skipping the parameter list does not rescue that approach: the next `{` opens the RETURN
+//     TYPE, `): { published: StatusMap; own: StatusMap; … } {`, balanced on one line — the same
+//     silent truncation one step further along.)
+// `composeRollup` is a TOP-LEVEL declaration, so its closing brace is the first `}` in COLUMN 0
+// after it. That anchor is the one thing neither a defaulted parameter nor an inline object type
+// can forge. The anchor test below then proves the slice actually spans the body, so a future
+// reformat that breaks this fails LOUDLY rather than quietly reporting zero matches.
+const composeRollupBody = (() => {
+  const at = ROLLUP.indexOf("\nfunction composeRollup(");
+  if (at === -1) return "";
+  const end = ROLLUP.indexOf("\n}\n", at);
+  return end === -1 ? "" : ROLLUP.slice(at, end + 3);
+})();
+
+describe("the blocked-prompt grace is applied where the two chains can see it", () => {
+  it("is anchored to a real composeRollup body — or every assertion below is vacuous", () => {
+    expect(composeRollupBody, "composeRollup not found in useAttentionNotifications").not.toBe("");
+    // NOT MERELY NON-EMPTY. The truncation this replaces produced a seventeen-line, perfectly
+    // non-empty SIGNATURE, which sailed through a `not.toBe("")` check while containing none of the
+    // code it claimed to be searching. These two overlays are applied deep inside the body and
+    // nowhere else in the file, so their presence is what proves the slice got past the parameter
+    // list and the return type and reached the chain itself.
+    for (const anchor of ["withObservedAttention(", "withNewAgentCalm("]) {
+      expect(composeRollupBody, `slice stopped short of composeRollup's body (no ${anchor})`).toContain(anchor);
+    }
+  });
+
+  // CURRENT, DELIBERATELY-PINNED STATE, NOT AN ENDORSEMENT. Landing the grace inside `composeRollup`
+  // reaches the concierge feed, the banners and the ordering — far past recolouring a dot — so it is
+  // a product decision rather than a wiring chore, and it is recorded as owed rather than made here.
+  // This pins TODAY's truth so the decision is taken deliberately and not drifted into.
+  it("today it is in NEITHER chain — the badge is graced while the row and the published map are not", () => {
+    expect(composeRollupBody.match(/withBlockedPromptGrace\(/g) ?? []).toHaveLength(0);
+    expect(SIDEBAR.match(/withBlockedPromptGrace\(/g) ?? []).toHaveLength(0);
+    // …and the effect DOES grace the badge, which is what makes the asymmetry a real bug rather
+    // than a uniformly-missing feature. Without this line the two above would also pass if the whole
+    // mechanism had been deleted.
+    expect(ROLLUP.match(/withBlockedPromptGrace\(/g) ?? []).toHaveLength(1);
+  });
+});
