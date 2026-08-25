@@ -1103,6 +1103,114 @@ describe("reactive rotation off a failed concierge account", () => {
     expect(result.rotated).toBe(true);
     expect(result.to).toBe("alt");
   });
+
+  // ══ BURST ATTRIBUTION (the founder's fleet-exhaustion cause) ══════════════════════════════════
+  // On a burst, the async handler for failure #2 runs AFTER an earlier rotation has already moved the
+  // sticky pointer to a HEALTHY account. Attributing by the sticky pointer (the old code) benches that
+  // healthy account — and its whole login group, fleet-wide. Attributing by the account that ACTUALLY
+  // ran the failing turn does not. `failedAccount` may be given as an account id OR a config dir (the
+  // concierge's identity form via `turnAccountFor`); both must normalise to the same account.
+  it("does NOT bench the healthy successor when a later burst failure names an account already rotated away", async () => {
+    mockFleet();
+    const t = 25_000_000;
+    expect(await accountConfigDirFor(CONCIERGE_ACCOUNT_KEY, { now: t })).toBe("/home/.claude");
+
+    // Rotation #1: def's quota wall fails → benches def, moves the sticky pointer to work.
+    const r1 = await rotateStickyConsumerOffFailedAccount(CONCIERGE_ACCOUNT_KEY, "quota", {
+      now: t + 1,
+      failedAccount: "def",
+    });
+    expect(r1.rotated).toBe(true);
+    expect(r1.to).toBe("work");
+    expect(markExhaustedIds()).toEqual(["def"]);
+    expect(await accountConfigDirFor(CONCIERGE_ACCOUNT_KEY, { now: t + 2 })).toBe(
+      "/data/accounts/work",
+    );
+
+    // Rotation #2: the burst straggler for the SAME failed turn (def, named here by its CONFIG DIR)
+    // lands late — the pointer is already on healthy work.
+    const r2 = await rotateStickyConsumerOffFailedAccount(CONCIERGE_ACCOUNT_KEY, "quota", {
+      now: t + 3,
+      failedAccount: "/home/.claude",
+    });
+    expect(r2.rotated).toBe(false);
+    expect(r2.reason).toBe("already-rotated");
+
+    // THE POINT: work (healthy) was NEVER benched. The old `stickySelections.get(key)` attribution
+    // read `work` here and benched it — this line reds against pre-fix code.
+    expect(markExhaustedIds()).toEqual(["def"]);
+    expect(await accountConfigDirFor(CONCIERGE_ACCOUNT_KEY, { now: t + 4 })).toBe(
+      "/data/accounts/work",
+    );
+  });
+
+  // ══ SINGLE FAILURE via the CONFIG-DIR identity form (proves the id↔configDir normalisation) ══════
+  it("benches and rotates when the failed account is attributed by config dir", async () => {
+    mockFleet();
+    const t = 26_000_000;
+    expect(await accountConfigDirFor(CONCIERGE_ACCOUNT_KEY, { now: t })).toBe("/home/.claude");
+    const r = await rotateStickyConsumerOffFailedAccount(CONCIERGE_ACCOUNT_KEY, "quota", {
+      now: t + 1,
+      failedAccount: "/home/.claude",
+    });
+    expect(r.rotated).toBe(true);
+    expect(r.from).toBe("def");
+    expect(r.to).toBe("work");
+    expect(markExhaustedIds()).toEqual(["def"]);
+  });
+
+  // ══ RE-ENTRANCY — two failures for the SAME dead account fired concurrently ═══════════════════════
+  it("de-dupes concurrent failures for the same account — one bench, never the healthy successor", async () => {
+    mockFleet();
+    const t = 27_000_000;
+    expect(await accountConfigDirFor(CONCIERGE_ACCOUNT_KEY, { now: t })).toBe("/home/.claude");
+
+    const [a, b] = await Promise.all([
+      rotateStickyConsumerOffFailedAccount(CONCIERGE_ACCOUNT_KEY, "quota", {
+        now: t + 1,
+        failedAccount: "def",
+      }),
+      rotateStickyConsumerOffFailedAccount(CONCIERGE_ACCOUNT_KEY, "quota", {
+        now: t + 1,
+        failedAccount: "def",
+      }),
+    ]);
+
+    // Exactly one pass did the work; the other was deduped as in-flight. def is benched ONCE and work
+    // (healthy) is never benched. Without the guard the second pass re-resolves after the first moved
+    // the pointer and benches work.
+    expect(markExhaustedIds()).toEqual(["def"]);
+    const reasons = [a.reason, b.reason];
+    expect(reasons).toContain("in-flight");
+    expect(a.rotated || b.rotated).toBe(true);
+  });
+
+  // ══ DEGRADE-SAFE — unknown/unmappable attribution falls back to the sticky pointer ═══════════════
+  it("falls back to the sticky pointer when the attributed account maps to nothing", async () => {
+    mockFleet();
+    const t = 28_000_000;
+    expect(await accountConfigDirFor(CONCIERGE_ACCOUNT_KEY, { now: t })).toBe("/home/.claude");
+    const r = await rotateStickyConsumerOffFailedAccount(CONCIERGE_ACCOUNT_KEY, "quota", {
+      now: t + 1,
+      failedAccount: "/no/such/config/dir",
+    });
+    // Pre-fix behaviour: benches the sticky account (def) and rotates to work.
+    expect(r.rotated).toBe(true);
+    expect(r.from).toBe("def");
+    expect(markExhaustedIds()).toEqual(["def"]);
+  });
+
+  it("with no attributed account (undefined) benches the sticky account exactly as before", async () => {
+    mockFleet();
+    const t = 29_000_000;
+    expect(await accountConfigDirFor(CONCIERGE_ACCOUNT_KEY, { now: t })).toBe("/home/.claude");
+    const r = await rotateStickyConsumerOffFailedAccount(CONCIERGE_ACCOUNT_KEY, "quota", {
+      now: t + 1,
+    });
+    expect(r.rotated).toBe(true);
+    expect(r.from).toBe("def");
+    expect(markExhaustedIds()).toEqual(["def"]);
+  });
 });
 
 describe("concierge fallback config dirs (single-turn auth-failover candidates)", () => {

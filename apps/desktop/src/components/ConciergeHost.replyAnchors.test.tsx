@@ -20,6 +20,10 @@ const h = vi.hoisted(() => ({
 }));
 
 vi.mock("../services/concierge", () => ({
+  // The failure handler reads the failed turn's account via turnAccountFor(e.id); a mock that omits
+  // it throws 'No turnAccountFor export' the moment an auth/quota failure reaches that branch. null =
+  // 'turn not remembered', which the rotation degrades on.
+  turnAccountFor: () => null,
   // The LIVE tool channel. A no-op unsubscribe, exactly like its siblings: these suites are about
   // the host's other wiring, and a mock that simply OMITS an export the host calls does not
   // degrade — vitest throws on the missing property and every case in the file dies at mount.

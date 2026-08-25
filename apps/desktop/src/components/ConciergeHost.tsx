@@ -190,6 +190,7 @@ import {
   startProactiveConciergeTurn,
   isProactiveTurn,
   isSupersededDetail,
+  turnAccountFor,
   type ConciergeToolCall,
 } from "../services/concierge";
 import {
@@ -3470,8 +3471,17 @@ export function ConciergeHost({
       // needing an app restart. Guarded internally to `auth`/`quota` (never a transient `unknown`),
       // to skip when a human pinned the concierge, and to never bench the fleet's last usable
       // account — see `rotateStickyConsumerOffFailedAccount`.
+      // ATTRIBUTE TO THE ACCOUNT THAT ACTUALLY RAN THIS TURN, not the current sticky pointer. On a
+      // burst the pointer has already advanced by the time this async handler runs, so passing the
+      // failed turn's own account (`turnAccountFor(e.id)` — the CLAUDE_CONFIG_DIR services/concierge
+      // recorded for this turn) is what stops rotation #2 from benching a HEALTHY account that never
+      // failed. `turnAccountFor` may return null/undefined for an evicted/unknown turn; the rotation
+      // then degrades to the sticky pointer (pre-fix behaviour). `??` maps a null to undefined so the
+      // optional `failedAccount` param stays a `string | undefined`.
       if (notice.kind === "auth" || notice.kind === "quota")
-        void rotateStickyConsumerOffFailedAccount(CONCIERGE_ACCOUNT_KEY, notice.kind);
+        void rotateStickyConsumerOffFailedAccount(CONCIERGE_ACCOUNT_KEY, notice.kind, {
+          failedAccount: turnAccountFor(e.id) ?? undefined,
+        });
       // Through the column's ONE live region, like every other bookkeeping line. The HEADLINE only:
       // the evidence can be a multi-line stderr dump, and a screen reader reading forty lines of
       // warnings aloud buries the sentence that says what to do.

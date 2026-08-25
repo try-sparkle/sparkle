@@ -44,6 +44,10 @@ vi.mock("../services/openProjectTab", () => ({
   requestProjectTabFromOtherWindow: vi.fn(),
 }));
 vi.mock("../services/concierge", async (importOriginal) => ({
+  // The failure handler reads the failed turn's account via turnAccountFor(e.id); a mock that omits
+  // it throws 'No turnAccountFor export' the moment an auth/quota failure reaches that branch. null =
+  // 'turn not remembered', which the rotation degrades on.
+  turnAccountFor: () => null,
   isSupersededDetail: (await importOriginal<typeof import("../services/concierge")>())
     .isSupersededDetail,
   startConciergeTurn: h.startConciergeTurn,

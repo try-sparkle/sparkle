@@ -1086,6 +1086,13 @@ export function stickyAccountSnapshot(key: string): string | undefined {
  *  live conversation to keep continuity with. */
 const stickySelections = new Map<string, string>();
 
+/** Guards {@link rotateStickyConsumerOffFailedAccount} against a burst: a flood of failures can fire
+ *  the reactive handler many times for the SAME dead account before the first pass finishes its
+ *  awaits. Each in-flight rotation is recorded here as `${key}␟${failedAccount}` and a
+ *  concurrent call on the same pair is a no-op, so a stale in-flight pass can never bench the healthy
+ *  successor the first pass rotated onto, and the dead login group is benched at most once. */
+const rotationsInFlight = new Set<string>();
+
 /** The last ACCOUNT each key resolved to, so `chooseAccountForAgent` can carry a key through a
  *  temporarily unreadable accounts backend. The whole record, not just an id: mapping an id back to
  *  its config dir needs the account list we just failed to load, which is precisely the situation
@@ -1097,6 +1104,7 @@ const lastResolvedAccount = new Map<string, Account>();
 export function resetStickyAccounts(): void {
   stickySelections.clear();
   lastResolvedAccount.clear();
+  rotationsInFlight.clear();
   proactiveWarmDone = false;
 }
 
@@ -1131,7 +1139,13 @@ export interface StickyRotationResult {
     | "pinned"
     | "nothing-resolved"
     | "backend-unreadable"
-    | "no-healthy-alternative";
+    | "no-healthy-alternative"
+    /** The failed account is no longer the sticky selection — someone already rotated the consumer
+     *  off it, so benching now would evict the HEALTHY successor it just landed on. */
+    | "already-rotated"
+    /** A rotation for this same (key, failedAccount) is already in flight — a burst fired the handler
+     *  again before the first pass finished; deduped so a stale pass cannot bench a healthy account. */
+    | "in-flight";
 }
 
 /**
@@ -1172,23 +1186,69 @@ export interface StickyRotationResult {
 export async function rotateStickyConsumerOffFailedAccount(
   key: string,
   kind: ConciergeFailureKind,
-  opts: { now?: number } = {},
+  opts: { now?: number; failedAccount?: string } = {},
 ): Promise<StickyRotationResult> {
+  // Set to the dedup entry we own once (and only once) we claim it, so the finally clears exactly
+  // our own entry and never a concurrent pass's. Left undefined on every early return before the
+  // claim, and never set when we find a pass already in flight.
+  let inflightKey: string | undefined;
   try {
     // A transient/unclassified failure is NOT evidence the account is dead — do not evict on it.
     if (kind !== "auth" && kind !== "quota") return { rotated: false, reason: "not-unusable" };
     // A human's explicit Manual Override outranks reactive rotation.
     if (getPin(key)) return { rotated: false, reason: "pinned" };
-    // The account the consumer actually ran under is its sticky selection. With nothing resolved yet
-    // there is no failed account to move off of.
-    const from = stickySelections.get(key);
-    if (!from) return { rotated: false, reason: "nothing-resolved" };
 
+    const sticky = stickySelections.get(key);
     const now = opts.now ?? Date.now();
     const state = await loadAccountState({ force: true, now });
     // Unreadable backend: every account looks absent, so we can neither identify a healthy
-    // alternative nor trust that `from` is really dead. Leave selection alone.
+    // alternative nor trust that the failed account is really dead. Leave selection alone.
     if (state.failed) return { rotated: false, reason: "backend-unreadable" };
+
+    // ══ ATTRIBUTE THE FAILURE TO THE ACCOUNT THAT ACTUALLY RAN THE TURN ═══════════════════════════
+    // The old code used the sticky selection — whatever the pointer holds AT THE MOMENT this async
+    // handler runs. On a BURST of failures the pointer has already advanced (an earlier rotation
+    // moved it), so this benched a HEALTHY successor that never failed — and its whole login group,
+    // fleet-wide via `accounts_mark_exhausted` — walking the fleet down to the last account on ~15
+    // back-to-back quota rejections. The caller now passes the failed turn's own account
+    // (`opts.failedAccount`, resolved from the remembered turn→account record in services/concierge).
+    //
+    // IDENTITY SPACES: this rotation benches and compares by ACCOUNT ID (`stickySelections`,
+    // `loginSiblingIds`, `markExhausted` are all id-keyed), but the concierge remembers a turn by its
+    // CLAUDE_CONFIG_DIR. So normalise here: accept either an id or a config dir and resolve it to the
+    // account's id via the freshly loaded list. When it maps to no known account — an evicted or
+    // unrecorded turn, or `turnAccountFor` returned null/undefined — attribution is unknown and we
+    // degrade to the sticky pointer, i.e. the pre-fix behaviour, which is no worse than before.
+    const attributedId =
+      opts.failedAccount === undefined
+        ? undefined
+        : state.accounts.find(
+            (a) => a.id === opts.failedAccount || a.configDir === opts.failedAccount,
+          )?.id;
+    const from = attributedId ?? sticky;
+    // With nothing resolved and no (mappable) attributed account there is nothing to move off of.
+    if (!from) return { rotated: false, reason: "nothing-resolved" };
+
+    // ══ ALREADY ROTATED AWAY — the burst guard ═══════════════════════════════════════════════════
+    // If we KNOW which account failed and the sticky pointer no longer references it, an earlier
+    // pass already moved the consumer off it. This is the signal that a sibling pass is handling (or
+    // has handled) this failure — so do nothing rather than re-resolve and risk benching the fresh
+    // healthy account the pointer now names.
+    if (attributedId !== undefined && sticky !== undefined && sticky !== from) {
+      return { rotated: false, from, reason: "already-rotated" };
+    }
+
+    // ══ RE-ENTRANCY DEDUP ════════════════════════════════════════════════════════════════════════
+    // Keyed by the FAILED account id (not the sticky pointer), so two distinct dead accounts each
+    // still get their one rotation, while a second failure for the SAME dead account — which a burst
+    // produces before this pass finishes its awaits — is dropped. The check-and-add is synchronous
+    // (no await between), so exactly one concurrent pass claims the pair; without it, two passes both
+    // read `sticky === from`, both bench, and the second re-resolves after the first already moved
+    // the pointer, benching the fresh healthy account.
+    const dedup = `${key}␟${from}`;
+    if (rotationsInFlight.has(dedup)) return { rotated: false, from, reason: "in-flight" };
+    rotationsInFlight.add(dedup);
+    inflightKey = dedup;
 
     // The dead LOGIN group, not just the one config dir — a dead OAuth session or a walled quota is
     // a property of the login, and benching one registration while its twin reads healthy would just
@@ -1239,6 +1299,9 @@ export async function rotateStickyConsumerOffFailedAccount(
   } catch (e) {
     console.warn("reactive rotation failed; leaving account selection unchanged", e);
     return { rotated: false, reason: "backend-unreadable" };
+  } finally {
+    // Release our own dedup claim so a LATER genuine failure of this same account can rotate again.
+    if (inflightKey !== undefined) rotationsInFlight.delete(inflightKey);
   }
 }
 

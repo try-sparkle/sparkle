@@ -160,6 +160,12 @@ vi.mock("../services/concierge", async (importOriginal) => ({
     h.brain.error = cb;
     return () => {};
   },
+  // The turn->account record the failure handler reads to attribute a reactive rotation. Omitting
+  // it makes the host's turnAccountFor(e.id) call throw at the first auth/quota failure (undefined
+  // is not callable) — the exact 'a mock that OMITS an export the host calls dies at mount' trap the
+  // sibling channels above warn about. null = 'this turn is not remembered', which the rotation
+  // degrades on (accountSelection falls back to the sticky pointer).
+  turnAccountFor: () => null,
   onConciergeTurnsAbandoned: () => () => {},
 }));
 vi.mock("../services/conciergeDispatch", () => ({

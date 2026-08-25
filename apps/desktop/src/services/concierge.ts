@@ -180,6 +180,23 @@ function rememberTurnAccount(id: string, configDir: string | null): void {
   }
 }
 
+/** The account (CLAUDE_CONFIG_DIR) a given turn was spawned under, or `undefined` if that turn is
+ *  not remembered (evicted by {@link PROACTIVE_TURN_MEMORY}, or never recorded). Read by the
+ *  concierge error handler so a reactive rotation can bench the account that ACTUALLY ran the
+ *  failing turn rather than whatever the sticky pointer holds by the time the async failure lands —
+ *  the burst-attribution bug where a later failure benches a healthy account that never failed.
+ *
+ *  NOTE (auth-fallback nuance): this returns the account resolved at turn assembly
+ *  ({@link rememberTurnAccount}, stamped with the originally-resolved `configDir`). Rust
+ *  `concierge_turn` may itself rotate to a fallback account on an auth-expiry retry
+ *  (`fallbackConfigDirs` / concierge.rs::plan_retry), so for the AUTH case the account that finally
+ *  failed can differ from what this reports; the authoritative source would be the Rust error
+ *  payload (documented follow-up, out of scope here). For the QUOTA case there is no such retry, so
+ *  this is authoritative — which is the founder's fleet-exhaustion path this fix targets. */
+export function turnAccountFor(id: string): string | null | undefined {
+  return turnAccounts.get(id);
+}
+
 function rememberProactiveTurn(id: string): void {
   if (proactiveTurnIds.includes(id)) return;
   proactiveTurnIds.push(id);

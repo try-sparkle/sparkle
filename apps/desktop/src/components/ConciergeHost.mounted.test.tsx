@@ -81,6 +81,10 @@ vi.mock("../services/concierge", () => ({
     h.conciergeError = cb;
     return () => {};
   },
+  // Same reason as the tool/error channels above: the host calls turnAccountFor(e.id) in its failure
+  // handler to attribute the reactive rotation, so a mock that omits it throws at the first
+  // auth/quota failure. null = 'turn not remembered', which the rotation degrades on.
+  turnAccountFor: () => null,
   onConciergeTurnsAbandoned: () => () => {},
   isSupersededDetail: () => false,
   SUPERSEDED_DETAILS: [],

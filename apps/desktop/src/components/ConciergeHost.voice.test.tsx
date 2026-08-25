@@ -41,6 +41,10 @@ vi.mock("../services/openProjectTab", () => ({
 // host's error handler now calls `isSupersededDetail` (roborev 53460/53462). Pulled from the REAL
 // module rather than stubbed, so this file can't disagree with the sentinels Rust emits.
 vi.mock("../services/concierge", async (importOriginal) => ({
+  // The failure handler reads the failed turn's account via turnAccountFor(e.id); a mock that omits
+  // it throws 'No turnAccountFor export' the moment an auth/quota failure reaches that branch. null =
+  // 'turn not remembered', which the rotation degrades on.
+  turnAccountFor: () => null,
   isSupersededDetail: (await importOriginal<typeof import("../services/concierge")>())
     .isSupersededDetail,
   startConciergeTurn: h.startConciergeTurn,

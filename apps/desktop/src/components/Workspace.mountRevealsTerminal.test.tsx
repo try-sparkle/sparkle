@@ -95,6 +95,10 @@ vi.mock("../services/sparkleAgent", async (orig) => ({
 }));
 // The concierge's PAID brain. Nothing here sends anything; the host still mounts for real.
 vi.mock("../services/concierge", () => ({
+  // The failure handler reads the failed turn's account via turnAccountFor(e.id); a mock that omits
+  // it throws 'No turnAccountFor export' the moment an auth/quota failure reaches that branch. null =
+  // 'turn not remembered', which the rotation degrades on.
+  turnAccountFor: () => null,
   startConciergeTurn: vi.fn(async () => null),
   startProactiveConciergeTurn: vi.fn(async () => null),
   isProactiveTurn: () => false,
