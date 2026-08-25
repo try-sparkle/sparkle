@@ -54,6 +54,7 @@ import {
   type DispatchResearchInput,
 } from "../research/store";
 import { isLive, isTerminal, type ResearchDepth, type ResearchTask } from "../research/types";
+import { recordDispatch } from "../dispatchLedger";
 
 // ---------------------------------------------------------------------------------------------
 // The operation surface
@@ -309,6 +310,12 @@ export async function dispatchResearchTask(
     );
   }
   if (outcome.kind === "unacked") {
+    // NO LEDGER ROW HERE, AND IT IS NOT AN OVERSIGHT. `targetId` is the ledger's one durable handle —
+    // the only field still true after a rename or a restart — and on this branch there is no task id
+    // at all: the runner never answered, so nothing was minted on this side to key a row on. A row
+    // with an invented or empty target is worse than no row, because recall joins on exactly that
+    // field and would report a delegation nobody can look up. The refusal already names the remedy
+    // for this case, and it is a READ (`list`), which is where the lost task turns up.
     return refuse(
       "dispatch",
       "not-acknowledged",
@@ -320,6 +327,32 @@ export async function dispatchResearchTask(
   }
 
   deps.remember(outcome.task);
+  // ══ THE DELEGATION LEDGER (services/dispatchLedger) ═══════════════════════════════════════════
+  //
+  // RESEARCH IS A DELEGATION, and recording it is what makes the 2026-08-22 failure impossible to
+  // repeat in its exact original shape. That incident's second half was the concierge answering a
+  // question by DISPATCHING RESEARCH into work it had already delegated eight minutes earlier — so a
+  // research task is both a thing that must be remembered and the very act that goes wrong when the
+  // memory is missing. `dispatchRecall` reading both channels is what lets a later turn see "I
+  // already asked this" before spending another metered child on it.
+  //
+  // ONLY ON THE `acked` PATH. `dispatch-failed` created nothing — the runner refused or threw, so
+  // there is no task and a row would assert work that does not exist. `not-acknowledged` has no id
+  // to key on; see the comment on that branch.
+  //
+  // `void`, not awaited: this module's ONE structural property is that dispatch returns before the
+  // work is done (see the file header), and it performs exactly one round trip. Awaiting a history
+  // write here would add a second thing this call can wait on, in the one function whose contract is
+  // that it waits for nothing.
+  void recordDispatch({
+    targetId: outcome.task.id,
+    channel: "research",
+    projectId: outcome.task.projectId,
+    // The QUESTION is the brief — it is the entirety of what the child was told, and it is the text
+    // recall matches the founder's subject against.
+    brief: question,
+    by: "concierge",
+  });
   return ok("dispatch", viewOf(outcome.task));
 }
 

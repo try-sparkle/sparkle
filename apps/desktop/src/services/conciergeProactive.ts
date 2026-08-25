@@ -29,6 +29,7 @@ import { rosterLine } from "../engine/conciergeRosterLine";
 import { withResearchPreamble, type ResearchStaging } from "./research/drain";
 import { isTerminal, type ResearchTask } from "./research/types";
 import { withMemoryPreamble } from "../stores/conciergeMemoryStore";
+import { withDispatchPreamble } from "../stores/conciergeDispatchStore";
 import type { ConciergeMessage } from "../components/Concierge/types";
 import type { ConciergeAgent, ConciergeFeed } from "./conciergeFeed";
 
@@ -138,6 +139,30 @@ export interface ProactiveDeps {
    * message re-supplies context). Pure string; claims nothing, so unlike research it needs no staging.
    */
   peekMemoryPreamble?(): string;
+  /**
+   * The OPEN DELEGATIONS section for this turn (`""` when nothing is open), read LIVE.
+   *
+   * ══ WHY THIS ONE IS ASYNC WHEN `peekMemoryPreamble` IS NOT ═════════════════════════════════════
+   *
+   * Not an inconsistency — the two have opposite freshness requirements. A saved memory is still a
+   * true memory a few seconds later, so it is served from a cache. A delegation roster that lags is
+   * WRONG IN EXACTLY THE MEASURED CASE (2026-08-22): the concierge spawns an agent and is asked
+   * about that work minutes later, and a stale roster answers "nothing is running on that" — the
+   * original bug, wearing the fix's clothes. So this is read from `history.db` on the turn that is
+   * about to run. See stores/conciergeDispatchStore's header for the full argument.
+   *
+   * ══ AND WHY IT DOES NOT MAKE `fire` ASYNC ══════════════════════════════════════════════════════
+   *
+   * It is folded in on the hop {@link ProactiveDeps.startTurn} may already be, not before it — so
+   * `fire` stays synchronous and this scheduler keeps the determinism `startTurn`'s own
+   * `boolean | Promise<boolean>` signature exists to protect. OPTIONAL, and when it is absent the
+   * call path is byte-identical to what it was: a host that does not supply it settles synchronously
+   * exactly as before.
+   *
+   * Pure string; claims nothing, so unlike research it needs no staging. Must never reject —
+   * `dispatchPreambleNow` degrades to `""` rather than failing a turn.
+   */
+  readDispatchPreamble?(): Promise<string>;
   /**
    * Start one proactive turn. `digest` is the state it is being authored against — the caller
    * records it against the turn id so the resulting message can be marked stale later.
@@ -1051,7 +1076,26 @@ export function createProactiveScheduler(deps: ProactiveDeps): ProactiveSchedule
     // struck early, rather than a finding that has stopped being true being left standing. This
     // file's own rule is that the app volunteering something false is worse than having said
     // nothing.
-    const outcome = deps.startTurn(prompt, surfaced ?? baselineSurfaced ?? "", research.taskIds);
+    // ══ THE OPEN DELEGATIONS GO IN FRONT OF EVERYTHING (delegation ledger) ═══════════════════════
+    //
+    // BOTH concierge seams fold this in — a roster present on the user turn and missing here is the
+    // kind of half-wiring that reads as done and is not, and an UNPROMPTED turn is precisely where
+    // re-grounding matters most: no human message re-supplies the context. Outermost, so the work
+    // the concierge itself dispatched is line 1 of its own prompt, ahead of memories and findings.
+    //
+    // Composed on the hop `startTurn` may already be, so `fire` stays synchronous — see
+    // `readDispatchPreamble`. When the dep is absent nothing changes, including the synchronous
+    // settle below.
+    const readDispatch = deps.readDispatchPreamble;
+    const start = (p: string) =>
+      deps.startTurn(p, surfaced ?? baselineSurfaced ?? "", research.taskIds);
+    const outcome = readDispatch
+      ? readDispatch().then(
+          (dispatchPreamble) => start(withDispatchPreamble(dispatchPreamble, prompt)),
+          // An unreadable ledger costs the re-grounding, never the turn.
+          () => start(prompt),
+        )
+      : start(prompt);
     if (typeof outcome === "boolean") {
       settle(outcome);
       return;

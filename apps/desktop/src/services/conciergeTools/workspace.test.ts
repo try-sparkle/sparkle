@@ -768,6 +768,24 @@ describe("history", () => {
     expect(res.value.map((h) => h.id)).toEqual(["build-1"]);
   });
 
+  // PINS A DECISION, not an accident. Extending the concierge filter to also drop `dispatch` would
+  // look like prudence and would re-create the exact failure the delegation ledger was built to fix:
+  // the concierge unable to find work it had itself started. A dispatch row is a record of work the
+  // founder asked for, not a private conversation, so the privacy rationale for the filter does not
+  // reach it. If someone ever adds `dispatch` to that filter, this test is what tells them why not.
+  it("default scope KEEPS delegation-ledger rows — they are not private conversation", async () => {
+    search.mockResolvedValueOnce([
+      mkHit("dispatch-1", "dispatch"),
+      mkHit("concierge-1", "concierge"),
+    ]);
+    const res = await searchHistory("preview cards", undefined, {}, deps);
+    if (!res.ok) throw new Error("expected ok");
+    // Both halves in one assertion, the same shape the concierge test above uses: the dispatch row
+    // being PRESENT while the concierge row from the SAME stubbed call is absent is what proves this
+    // is a filter that spared it, and not a read that returned nothing.
+    expect(res.value.map((h) => h.id)).toEqual(["dispatch-1"]);
+  });
+
   it("scope 'all' returns the concierge row", async () => {
     search.mockResolvedValueOnce([mkHit("build-1", "build"), mkHit("concierge-1", "concierge")]);
     const res = await searchHistory("widget", undefined, { scope: "all" }, deps);

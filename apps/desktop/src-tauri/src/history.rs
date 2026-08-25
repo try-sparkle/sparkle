@@ -48,6 +48,14 @@ pub struct Hit {
     pub agent_name: Option<String>,
     pub snippet: String,
     pub created_at: i64,
+    /// The WHOLE row text, populated only when the caller asked for it.
+    ///
+    /// `Option`, so it crosses the wire as an explicit `null` when absent — the TS side declares it
+    /// `text?: string | null` for exactly that reason (AGENTS.md, bead sparkle-16y6h). Default OFF
+    /// because the ordinary search caller renders `snippet`; shipping 50 full texts to draw 50
+    /// one-line results would move megabytes per keystroke. The dispatch ledger opts in because a
+    /// 12-token snippet around the match cannot be relied on to contain the ASK.
+    pub text: Option<String>,
 }
 
 /// One dot on the thread scrubber rail (bead `sparkle-7m719`).
@@ -378,22 +386,67 @@ pub(crate) fn record_into(conn: &Connection, e: &EntryInput) -> rusqlite::Result
     Ok(outcome)
 }
 
+/// FTS5 search over live (non-tombstoned) rows, unfiltered — every source, snippets only.
+///
+/// The shape every existing caller uses; [`search_filtered_in`] is the same query with the two
+/// narrowings applied.
+pub(crate) fn search_in(conn: &Connection, query: &str, limit: u32) -> rusqlite::Result<Vec<Hit>> {
+    search_filtered_in(conn, query, limit, &[], false)
+}
+
 /// FTS5 search over live (non-tombstoned) rows. Blank query → empty. Punctuation in the query is
 /// neutralized (each whitespace term is quoted) so it can never be parsed as FTS5 syntax.
-pub(crate) fn search_in(conn: &Connection, query: &str, limit: u32) -> rusqlite::Result<Vec<Hit>> {
+///
+/// ── WHY `sources` IS APPLIED IN SQL AND NOT BY THE CALLER ────────────────────────────────────────
+/// `LIMIT` runs inside SQLite, before a single row crosses the IPC boundary. A caller that searched
+/// everything and then filtered the results would be filtering rows that had ALREADY lost the
+/// limit contest — so a source with a few thousand rows living beside hundreds of thousands of
+/// louder ones would return an empty array while matching rows sat in the table. That is the exact
+/// shape of the failure this whole feature exists to fix, so it is closed here rather than
+/// documented as a caller's responsibility. An EMPTY slice means "no restriction", which is what
+/// keeps [`search_in`] above a pure delegation.
+///
+/// `include_text` adds the whole `text` column to each hit; see [`Hit::text`].
+pub(crate) fn search_filtered_in(
+    conn: &Connection,
+    query: &str,
+    limit: u32,
+    sources: &[String],
+    include_text: bool,
+) -> rusqlite::Result<Vec<Hit>> {
     let Some(match_expr) = fts_query(query) else {
         return Ok(Vec::new());
     };
-    let mut stmt = conn.prepare(
+    // Positional placeholders, built to match the params pushed below IN ORDER: ?1 is the match
+    // expression, then one per source, then the limit last. Named binding would be safer to read but
+    // the source list is variadic, so the count is only known here.
+    let source_clause = if sources.is_empty() {
+        String::new()
+    } else {
+        let holes = (0..sources.len())
+            .map(|i| format!("?{}", i + 2))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(" AND e.source IN ({holes})")
+    };
+    let sql = format!(
         "SELECT e.id, e.kind, e.source, e.project_id, e.agent_id, e.project_name, e.agent_name,
-                snippet(entries_fts, 0, '<b>', '</b>', '…', 12) AS snippet, e.created_at
+                snippet(entries_fts, 0, '<b>', '</b>', '…', 12) AS snippet, e.created_at, e.text
          FROM entries_fts
          JOIN entries e ON e.rowid = entries_fts.rowid
-         WHERE entries_fts MATCH ?1 AND e.deleted_at IS NULL
+         WHERE entries_fts MATCH ?1 AND e.deleted_at IS NULL{source_clause}
          ORDER BY rank, e.created_at DESC
-         LIMIT ?2",
-    )?;
-    let rows = stmt.query_map(rusqlite::params![match_expr, limit], |r| {
+         LIMIT ?{}",
+        sources.len() + 2
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::with_capacity(sources.len() + 2);
+    params.push(Box::new(match_expr));
+    for src in sources {
+        params.push(Box::new(src.clone()));
+    }
+    params.push(Box::new(limit));
+    let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |r| {
         Ok(Hit {
             id: r.get(0)?,
             kind: r.get(1)?,
@@ -404,6 +457,11 @@ pub(crate) fn search_in(conn: &Connection, query: &str, limit: u32) -> rusqlite:
             agent_name: r.get(6)?,
             snippet: r.get(7)?,
             created_at: r.get(8)?,
+            // Read the column ONLY when asked. `None` here is "you did not ask", and the caller
+            // cannot tell it apart from "empty" — which is fine, because `text` is NOT NULL in the
+            // schema, so an empty string is the only other possibility and it is not a row anyone
+            // searches for.
+            text: if include_text { Some(r.get(9)?) } else { None },
         })
     })?;
     rows.collect()
@@ -670,6 +728,27 @@ pub(crate) fn prompt_density_in(
 /// MB of text) while being far more history than a human conversation will ever revisit.
 pub(crate) const CONCIERGE_HISTORY_MAX: usize = 50_000;
 
+/// How many `source = 'dispatch'` rows we keep, newest-first — the DELEGATION LEDGER's count bound.
+///
+/// Same two-bound scheme as the concierge tier above and for the same reason: age-exempt is only
+/// safe when something else stops the table growing without limit. The number is different because
+/// the ROW RATE is different by orders of magnitude. A dispatch row is written once per SPAWN, not
+/// once per message: at the founder's measured rate (115 agents across two days, an unusually busy
+/// stretch) 20,000 rows is roughly a YEAR of delegating at full tilt, against a few hours for the
+/// same count of conversation rows. Sized so that "did we ever do that work?" reaches back further
+/// than anyone will ask, while the ledger stays small enough to be searched in a few ms.
+pub(crate) const DISPATCH_HISTORY_MAX: usize = 20_000;
+
+/// The sources the AGE prune must never touch — the two keep-forever asset classes, bounded by
+/// COUNT instead (see each constant above).
+///
+/// Named once and spliced into the SQL, rather than written out at each of the age statements. The
+/// previous spelling repeated the literal `AND source <> 'concierge'` in two places, and the
+/// tombstone/delete pair MUST agree: an age bound that tombstones a row it then declines to delete
+/// leaves it alive-but-invisible (`search_filtered_in` filters on `deleted_at IS NULL`), which is
+/// "kept" in name only. One constant makes disagreeing impossible rather than merely discouraged.
+const AGE_EXEMPT_SOURCES: &str = "('concierge', 'dispatch')";
+
 /// Retention prune. Two independent bounds, both applied here so they run on the same existing
 /// schedule and under the same lock:
 ///
@@ -702,17 +781,24 @@ pub(crate) fn prune_in_with_max(
     // soft-deleted row (`search_in` filters on `deleted_at IS NULL`), which is "kept" in name only.
     if let Some(cutoff) = cutoff {
         conn.execute(
-            "UPDATE entries SET deleted_at = ?1
-             WHERE created_at < ?1 AND deleted_at IS NULL AND source <> 'concierge'",
+            &format!(
+                "UPDATE entries SET deleted_at = ?1
+                 WHERE created_at < ?1 AND deleted_at IS NULL AND source NOT IN {AGE_EXEMPT_SOURCES}"
+            ),
             rusqlite::params![cutoff],
         )?;
         deleted += conn.execute(
-            "DELETE FROM entries WHERE created_at < ?1 AND source <> 'concierge'",
+            &format!(
+                "DELETE FROM entries WHERE created_at < ?1 AND source NOT IN {AGE_EXEMPT_SOURCES}"
+            ),
             rusqlite::params![cutoff],
         )?;
     }
-    // The COUNT bound — outside the `if`, because it does not depend on the age tier.
+    // The COUNT bound — outside the `if`, because it does not depend on the age tier. One call per
+    // age-exempt source: they are capped separately because their row RATES differ by orders of
+    // magnitude, so a shared cap would let a busy day of conversation evict a year of delegations.
     deleted += prune_concierge_count_in(conn, concierge_max)?;
+    deleted += prune_source_count_in(conn, "dispatch", DISPATCH_HISTORY_MAX)?;
     Ok(deleted)
 }
 
@@ -726,16 +812,30 @@ pub(crate) fn prune_concierge_count_in(
     conn: &Connection,
     max: usize,
 ) -> rusqlite::Result<usize> {
+    prune_source_count_in(conn, "concierge", max)
+}
+
+/// Delete the OLDEST rows of `source` beyond the newest `max`. Returns rows deleted.
+///
+/// The general form of [`prune_concierge_count_in`], extracted when `dispatch` became the second
+/// age-exempt source. `source` is an INTERNAL literal from this module — never caller-supplied —
+/// but it is still bound as a parameter rather than formatted into the SQL, because a constant that
+/// is safe today is exactly the kind that acquires a caller tomorrow.
+pub(crate) fn prune_source_count_in(
+    conn: &Connection,
+    source: &str,
+    max: usize,
+) -> rusqlite::Result<usize> {
     conn.execute(
         "DELETE FROM entries
-         WHERE source = 'concierge'
+         WHERE source = ?1
            AND rowid NOT IN (
                SELECT rowid FROM entries
-               WHERE source = 'concierge'
+               WHERE source = ?1
                ORDER BY created_at DESC, rowid DESC
-               LIMIT ?1
+               LIMIT ?2
            )",
-        rusqlite::params![max as i64],
+        rusqlite::params![source, max as i64],
     )
 }
 
@@ -796,16 +896,30 @@ pub async fn history_record(app: AppHandle, entry: EntryInput) -> Result<RecordO
     .map_err(|e| format!("history_record task failed: {e}"))?
 }
 
+/// `sources` and `include_text` are both `Option`, so an older frontend that sends neither key gets
+/// exactly today's behaviour: every source, snippets only. `None` and `Some(vec![])` are the same
+/// "no restriction" — an empty list is what a caller building the array dynamically produces when it
+/// has nothing to narrow by, and reading that as "match no source" would return silence.
 #[tauri::command]
 pub async fn history_search(
     app: AppHandle,
     query: String,
     limit: Option<u32>,
+    sources: Option<Vec<String>>,
+    include_text: Option<bool>,
 ) -> Result<Vec<Hit>, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let db = history_db(&app)?;
         let conn = db.conn.lock().unwrap_or_else(|e| e.into_inner());
-        search_in(&conn, &query, limit.unwrap_or(50)).map_err(|e| format!("search: {e}"))
+        let sources = sources.unwrap_or_default();
+        search_filtered_in(
+            &conn,
+            &query,
+            limit.unwrap_or(50),
+            &sources,
+            include_text.unwrap_or(false),
+        )
+        .map_err(|e| format!("search: {e}"))
     })
     .await
     .map_err(|e| format!("history_search task failed: {e}"))?
@@ -950,6 +1064,11 @@ mod tests {
     /// column the retention rules key on.
     fn concierge(id: &str, text: &str, created_at: i64) -> EntryInput {
         sourced_entry("concierge", id, "prompt", text, created_at)
+    }
+
+    /// A DELEGATION-ledger row. The second age-exempt source; see `DISPATCH_HISTORY_MAX`.
+    fn dispatch(id: &str, text: &str, created_at: i64) -> EntryInput {
+        sourced_entry("dispatch", id, "prompt", text, created_at)
     }
 
     fn sourced_entry(
@@ -1275,6 +1394,103 @@ mod tests {
         assert_eq!(deleted_at, None, "concierge row was tombstoned by the soft-delete step");
         assert_eq!(search_in(&conn, "concierge", 50).unwrap().len(), 1);
         assert!(search_in(&conn, "build", 50).unwrap().is_empty());
+    }
+
+    #[test]
+    fn prune_keeps_dispatch_and_deletes_a_build_row_of_the_same_age() {
+        // The delegation ledger's whole reason to exist. The brief that the concierge failed to
+        // recall on 2026-08-22 WAS in this table — as a `build` row, which is age-pruned at 24h, so
+        // it was gone by the time he asked. Same paired shape as the concierge test above: the build
+        // row at the identical `created_at` is the control proving the prune really ran and that
+        // `source` is the only thing that spared the other row.
+        let conn = mem();
+        record_into(&conn, &entry("build-old", "prompt", "build text", 1000)).unwrap();
+        record_into(&conn, &dispatch("disp-old", "DISPATCH preview cards", 1000)).unwrap();
+
+        let deleted = prune_in(&conn, Some(2000)).unwrap();
+
+        assert_eq!(deleted, 1, "only the build row should have been hard-deleted");
+        assert_eq!(ids(&conn), vec!["disp-old".to_string()]);
+        // A LIVE row, not an invisible tombstone. The soft-delete step must carry the same exclusion
+        // as the hard delete or the row is "kept" while being unsearchable — which for this table is
+        // indistinguishable from having lost it, since search is the only way anyone reads it.
+        let deleted_at: Option<i64> = conn
+            .query_row("SELECT deleted_at FROM entries WHERE id = 'disp-old'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(deleted_at, None, "dispatch row was tombstoned by the soft-delete step");
+        assert_eq!(search_in(&conn, "preview", 50).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn dispatch_rows_are_bounded_by_count_so_keep_forever_is_not_unbounded() {
+        // Age-exempt is only SAFE because a count bound exists. Driven through
+        // `prune_source_count_in` directly with a handful of rows rather than 20,000.
+        let conn = mem();
+        for i in 0..5 {
+            record_into(&conn, &dispatch(&format!("d{i}"), "DISPATCH x", 1000 + i)).unwrap();
+        }
+        let deleted = prune_source_count_in(&conn, "dispatch", 2).unwrap();
+        assert_eq!(deleted, 3, "the three OLDEST dispatch rows should fall off");
+        assert_eq!(ids(&conn), vec!["d3".to_string(), "d4".to_string()]);
+    }
+
+    #[test]
+    fn the_two_age_exempt_sources_are_capped_separately() {
+        // They are capped separately BECAUSE their row rates differ by orders of magnitude: a
+        // conversation writes rows per message, a delegation writes one per spawn. A shared cap
+        // would let one busy day of chat evict a year of delegations. Asserted by filling the
+        // concierge tier past its cap and showing the dispatch rows are untouched.
+        let conn = mem();
+        for i in 0..4 {
+            record_into(&conn, &concierge(&format!("c{i}"), "chatter", 1000 + i)).unwrap();
+        }
+        record_into(&conn, &dispatch("d0", "DISPATCH preview cards", 500)).unwrap();
+
+        prune_in_with_max(&conn, None, 1).unwrap();
+
+        // The oldest dispatch row in the table survives a concierge overflow it has nothing to do
+        // with — and it is OLDER than every evicted concierge row, which is what makes the point.
+        assert!(ids(&conn).contains(&"d0".to_string()));
+        assert_eq!(search_in(&conn, "preview", 50).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn search_narrows_by_source_in_sql_so_the_limit_cannot_crowd_a_quiet_source_out() {
+        // The reason this narrowing is in SQL and not in the caller. LIMIT runs inside SQLite,
+        // before a single row crosses the IPC boundary — so a caller that searched everything and
+        // filtered afterwards would be filtering rows that had ALREADY lost the limit contest. Here
+        // three build rows and one dispatch row all match; with a limit of 3 an unfiltered search
+        // could return the dispatch row not at all, while the filtered one must always find it.
+        let conn = mem();
+        for i in 0..3 {
+            record_into(&conn, &entry(&format!("b{i}"), "prompt", "preview cards", 1000 + i)).unwrap();
+        }
+        record_into(&conn, &dispatch("d0", "DISPATCH preview cards", 900)).unwrap();
+
+        let only = search_filtered_in(&conn, "preview cards", 3, &["dispatch".to_string()], false).unwrap();
+        assert_eq!(only.len(), 1);
+        assert_eq!(only[0].id, "d0");
+
+        // An EMPTY source list means "no restriction", never "match nothing" — a caller building the
+        // list dynamically produces an empty one when it has nothing to narrow by, and reading that
+        // as a filter would return silence.
+        assert_eq!(search_filtered_in(&conn, "preview cards", 50, &[], false).unwrap().len(), 4);
+    }
+
+    #[test]
+    fn include_text_is_off_by_default_and_returns_the_whole_row_when_asked() {
+        // A snippet is 12 tokens around the match, wrapped in display markers. The dispatch ledger
+        // parses the row back into fields, so it needs the WHOLE text or it would be parsing
+        // ellipses and <b> tags as data.
+        let conn = mem();
+        let long = format!("DISPATCH — Sparkle Preview Card Inline\nASK: {}", "make the preview cards inline ".repeat(20));
+        record_into(&conn, &dispatch("d0", &long, 1000)).unwrap();
+
+        let lean = search_filtered_in(&conn, "preview", 50, &["dispatch".to_string()], false).unwrap();
+        assert_eq!(lean[0].text, None, "text must not be shipped unless the caller asked");
+
+        let full = search_filtered_in(&conn, "preview", 50, &["dispatch".to_string()], true).unwrap();
+        assert_eq!(full[0].text.as_deref(), Some(long.as_str()));
     }
 
     #[test]

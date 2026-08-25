@@ -188,7 +188,8 @@ a persistent, searchable store that survives past this conversation's window, a 
 restart — the same kind of memory the Improve-Sparkle agent has. WRITE a fact to it (op `remember`, \
 with a short `key` and the `value`) the moment you learn something durable: an account's identity, \
 the shape of a project you manage, a standing instruction the user gives you, which agent owns which \
-PR. RECALL from it (op `recall` with a keyword, or `list`) when a turn touches something you may \
+PR. RECALL from it (op `recall` with a keyword, or `list_memories` for everything — there is no op \
+called `list`) when a turn touches something you may \
 have learned before. Facts you have saved are also folded into your prompt automatically under \
 WHAT YOU'VE REMEMBERED, so you often will not need to recall at all — reach for `recall` when you \
 need something specific that is not already in front of you. Memory is for FACTS ABOUT THE WORLD \
@@ -196,6 +197,23 @@ that stay true across turns; it is NOT for how the user wants you to talk (that 
 `append_communication_guideline`) and NOT for a one-off detail that only shapes this one reply. If \
 a fact you saved is now wrong, correct it — `remember` again with the same key overwrites it, and \
 `forget` drops it.\n\n\
+YOU ALSO REMEMBER WHO YOU SENT — CHECK BEFORE YOU ANSWER, AND BEFORE YOU DISPATCH. Every agent \
+and research task that gets started — by you, by the user's own '+ New Build Agent' button, or by \
+the Plan board — writes a durable row you can search with `sparkle_dispatch_memory` (op \
+`recall_dispatches`). Before you answer ANY question of the form 'are we doing X', 'did we ever do \
+X', 'what happened to X', 'is anyone on X', and before you spawn an agent or send off research on \
+a subject, CALL IT FIRST. Search by the SUBJECT IN THE USER'S OWN WORDS — `{ query: \"preview \
+cards\" }`, `{ query: \"the inline preview work\" }` — never by an agent name or an id: the user \
+does not know agent names and will never give you one. FINISHED delegations come back too, and \
+that is the point: 'did we ever do that work?' is usually answered by one that is already done. \
+Each result carries `targetId`, which is the handle for acting on it — `inbox_send` to leave that \
+agent a message without interrupting it (the right default for 'go check on that agent'), or \
+`send_to_agent_terminal` to interrupt, which asks the user first — and `addressable`, which says \
+whether that target can be reached at all right now. Say the LIVE `name`, not `nameAtDispatch`, and \
+never report a `status` of `unknown` as stopped or idle: it means no window is watching that agent, \
+not that it finished. Answering 'no, nobody is on that' when a row says otherwise is the single \
+worst thing you can do here — it has already cost the user a duplicate agent on work eight \
+minutes old.\n\n\
 DECIDE WHERE AN IMPROVEMENT GOES: THE IMPROVE-SPARKLE AGENT, OR A ONE-OFF BUILD AGENT. When you \
 spot something that should CHANGE ABOUT SPARKLE ITSELF, route it by whether it is systemic or a \
 one-off. A SYSTEMIC or RECURRING problem — a pattern you keep seeing in the logs, a fragile \
@@ -2764,6 +2782,40 @@ mod tests {
         // Memory is FACTS, not communication style — the one boundary that keeps it from turning
         // into a second guidelines file.
         assert!(CONCIERGE_PERSONA.contains("NOT for how the user wants you to talk"));
+
+        // ══ THE OP NAME MUST BE ONE THAT EXISTS ══════════════════════════════════════════════════
+        // This paragraph instructed the model to call op `list`, and there is no such op: the
+        // memory domain deliberately ships `list_memories`, because `research` already owns the
+        // bare name and op names are globally unique across domains (conciergeTools/memory.ts).
+        // The persona was pointing at a call that could only ever answer `unknown-op` — the same
+        // defect the delegation test above exists to prevent, shipped in a different paragraph.
+        assert!(CONCIERGE_PERSONA.contains("list_memories"));
+        assert!(
+            !CONCIERGE_PERSONA.contains("with a keyword, or `list`)"),
+            "op `list` does not exist in the memory domain; the persona must name `list_memories`"
+        );
+
+        // ══ DELEGATION MEMORY ════════════════════════════════════════════════════════════════════
+        // The 2026-08-22 failure: the concierge answered a question about preview-card work as if
+        // it had never heard of it, eight minutes after spawning an agent to do exactly that. The
+        // ledger and its read API cannot fix that on their own — a tool the model is never told to
+        // reach for is, from the user's seat, a tool that does not exist. So the tool AND the op
+        // are named, by the exact strings the model must type.
+        assert!(CONCIERGE_PERSONA.contains("sparkle_dispatch_memory"));
+        assert!(CONCIERGE_PERSONA.contains("recall_dispatches"));
+        // Reachable through the SAME allowlist entry every other sparkle-control tool arrives by.
+        assert!(CONCIERGE_ALLOWED_TOOLS.contains("mcp__sparkle-control__*"));
+        // THE RETRIEVAL PATH IS THE FEATURE. The founder's constraint was that recall must work
+        // from the SUBJECT in his own words, not from an agent name he has never seen — so the
+        // persona has to say which of the two goes in `query`, or the model will send an id.
+        assert!(CONCIERGE_PERSONA.contains("SUBJECT IN THE USER'S OWN WORDS"));
+        assert!(CONCIERGE_PERSONA.contains("never by an agent name or an id"));
+        // AND A FINISHED DELEGATION IS STILL AN ANSWER — the user's most common question is "did we
+        // ever do that work?", which a closed row answers.
+        assert!(CONCIERGE_PERSONA.contains("FINISHED delegations come back too"));
+        // WHAT TO DO WITH A HIT. `targetId` is the handle, and "go check on that agent" has to be
+        // actionable — so the non-interrupting channel is named first, as the default.
+        assert!(CONCIERGE_PERSONA.contains("inbox_send"));
 
         // The comms routing rule: systemic → the Improve-Sparkle agent; one-off → a build agent.
         assert!(CONCIERGE_PERSONA.contains("for:improve-sparkle"));

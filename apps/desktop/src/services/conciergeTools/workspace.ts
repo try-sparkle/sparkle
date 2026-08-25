@@ -836,10 +836,27 @@ export async function quitApp(
 /**
  * HOW MUCH of the durable history one search may see.
  *
- *  • `"default"` — build and brainstorm history. `concierge`-sourced rows are filtered OUT of the
- *    result. This is what the concierge has always been able to see, and it stays the default when
- *    the model omits the argument.
+ *  • `"default"` — build and brainstorm history, AND the delegation ledger. `concierge`-sourced rows
+ *    are filtered OUT of the result. This is what the concierge has always been able to see, and it
+ *    stays the default when the model omits the argument.
  *  • `"all"` — everything, `concierge` rows included.
+ *
+ * `dispatch` ROWS ARE VISIBLE AT DEFAULT SCOPE, AND THAT IS A DECISION RATHER THAN AN OMISSION.
+ * When the delegation ledger was added (services/dispatchLedger.ts) it would have been easy to
+ * extend the filter below to two sources, on the reflex that a narrower default is always the safer
+ * one. It is not, here, and the reasoning below is written out so nobody "tidies" it that way later.
+ *
+ * The gate exists for ONE reason, stated in the next paragraph: the founder's PRIVATE conversations
+ * with his minder must not be silently vacuumed back up by the model. A dispatch row is the exact
+ * opposite kind of object — a record of work the concierge ITSELF started, on the founder's
+ * instruction, which he then asks it about later. Hiding those by default would re-create, in this
+ * one tool, the precise failure the ledger was built to fix: on 2026-08-22 the concierge answered a
+ * question about preview-card work as if it had never heard of it, eight minutes after spawning an
+ * agent to do exactly that. A second route to that answer is a feature, not a leak.
+ *
+ * The dedicated `recall_dispatches` op is still the PRIMARY path — it joins each row to live state,
+ * which a raw hit cannot. This is the incidental one, and every hit carries its own `source` so a
+ * caller can always tell a ledger row from a conversation.
  *
  * WHY THIS ARGUMENT EXISTS. The founder's private conversations with the concierge are TO BE
  * recorded into the same `history.db` that `search_history` queries. His decision was that those

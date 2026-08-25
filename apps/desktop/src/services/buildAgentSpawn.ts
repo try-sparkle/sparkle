@@ -24,6 +24,7 @@ import { isTornOut } from "./satelliteWindows";
 import { log } from "../logger";
 import { perfStart, perfCancel } from "../perfTrace";
 import { removeAgentWithoutPane } from "./agentTeardown";
+import { recordDispatch } from "./dispatchLedger";
 import type { Project } from "../types";
 
 /**
@@ -130,6 +131,37 @@ export interface SpawnBuildAgentOpts {
    * Absent (the generic "+ New Build Agent"/drop/babysit spawn) the bead stays top-level, unchanged.
    */
   epicId?: string;
+  /**
+   * WHO delegated this, for the DELEGATION LEDGER row written below — see services/dispatchLedger.
+   *
+   * Absent, it is DERIVED from `background`: a background spawn is `"machine"` (a sweep, a watchdog,
+   * a timer — that field's own doc defines it as "a spawn THE HUMAN DID NOT INITIATE"), and anything
+   * else is `"human"`, because every other caller of this function today is a direct gesture — the
+   * sidebar's "+ New Build Agent" row, the Workspace empty-state button, `useNewBuildAgentDrop`.
+   *
+   * IT EXISTS BECAUSE THE DERIVATION HAS ONE BLIND SPOT, and it is the one the ledger was built for.
+   * The concierge's `spawn_build_agent` is neither background nor a hand on a control: it is the
+   * machine acting on the founder's behalf, and it comes through this function looking exactly like
+   * a button press. The 2026-08-22 failure was the concierge unable to recall its OWN dispatches, so
+   * a row that cannot say "I did this" is a row that cannot answer the question that caused the
+   * feature. `conciergeTools/lifecycle.spawnBuildAgent` therefore passes `"concierge"` explicitly.
+   *
+   * It changes NOTHING about the spawn itself. `background` and `attention` still decide behaviour;
+   * this is provenance, recorded and never acted on.
+   */
+  dispatchedBy?: "concierge" | "human" | "machine";
+  /**
+   * The words that PROMPTED this delegation — the founder's own sentence, when the caller has it.
+   *
+   * DISTINCT FROM `prompt`, and the difference is the whole reason the ledger keeps both. `prompt` is
+   * what the AGENT was told; `ask` is what the HUMAN said. They diverge every time the concierge
+   * expands a half-sentence into a brief, and recall matches on the SUBJECT — the founder asks about
+   * "the inline preview work", never about the brief that was synthesised from it.
+   *
+   * Omitted where there is nothing honest to put in it: the "+ New Build Agent" button has no ask at
+   * all, and inventing one would put words in his mouth in a record kept for a year.
+   */
+  ask?: string;
 }
 
 /** Create + open a local Build agent in `project`, returning its id — or null when the spawn did not
@@ -451,6 +483,47 @@ export function spawnBuildAgentInProject(
         .getState()
         .projects.find((p) => p.id === project.id)
         ?.agents.find((a) => a.id === id)?.name ?? "Build task";
+    // ══ THE DELEGATION LEDGER (services/dispatchLedger) ══════════════════════════════════════════
+    //
+    // WHY IT IS HERE AND NOT IN THE CONCIERGE'S TOOL WRAPPER. On 2026-08-22 the founder asked the
+    // concierge about making preview cards inline in chat; it answered as if it had never heard of
+    // the work and dispatched fresh research — EIGHT MINUTES after it had itself spawned an agent to
+    // do exactly that. Nothing durable recorded the ACT of delegating, so when the concierge's
+    // context rolled the delegation vanished while the agent it created kept running. His
+    // instruction: *"anything that depends on the concierge choosing to save it will fail exactly
+    // when the concierge is busy — which is precisely when it is spawning agents."*
+    //
+    // So it lives at the SHARED spawn helper, where the model cannot opt out of it and where the two
+    // paths that never touch a concierge tool at all — the human's "+ New Build Agent" button and
+    // the babysit dispatcher — are covered by the same line.
+    //
+    // WHY IT IS *DOWN HERE*, past four refusals and `addAgent`. Every gate above returns `null` with
+    // nothing created, and a ledger row for an agent that does not exist is a FALSE POSITIVE on the
+    // one question this feature answers: "did we ever do that work?". A false negative costs one
+    // round of re-research; a false positive tells the founder work is under way that nobody is
+    // doing. Only the second is unrecoverable, so the row waits until the agent genuinely exists.
+    //
+    // `void`, NOT `await`: this function is synchronous and returns an id, so awaiting would make it
+    // async and change every caller. `recordDispatch` never throws and never rejects — a ledger that
+    // could fail a spawn would trade a real agent for a bookkeeping row.
+    //
+    // `title` is REUSED rather than re-read. It is the same resolved name the auto-bead below takes,
+    // and computing it twice would let the bead and the ledger disagree about what this agent was
+    // called at the one instant both claim to describe.
+    void recordDispatch({
+      targetId: id,
+      channel: "build",
+      nameAtDispatch: title,
+      projectId: project.id,
+      projectName: project.name,
+      brief: opts.prompt ?? "",
+      ...(opts.ask ? { ask: opts.ask } : {}),
+      beads: opts.epicId ? [opts.epicId] : [],
+      mode: opts.mode ?? null,
+      // Derived from `background` unless the caller knows better — see `dispatchedBy`. The concierge
+      // is the caller that knows better, and it is the one whose recall failure started all this.
+      by: opts.dispatchedBy ?? (background ? "machine" : "human"),
+    });
     // Labeled `sparkle-auto` so the board can tell app-generated telemetry from beads a human filed —
     // see AUTO_LABEL. Without it these are indistinguishable from real backlog once the agent is gone.
     void createBeadFull(project.rootPath, title, "", "task", opts.epicId ?? "", "", AUTO_LABEL)

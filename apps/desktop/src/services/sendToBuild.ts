@@ -26,6 +26,7 @@ import { EPIC_RESUME_PROMPT_MARKER } from "../engine/agentOriginated";
 import { processAliveFor } from "./goalContinuationRunner";
 import { attachBrief } from "./agentBrief";
 import { advisorBriefFor, advisorHandoffHook } from "./advisor";
+import { recordDispatch } from "./dispatchLedger";
 
 /** Thrown when the handoff would need a NEW build agent and the machine is at its ceiling. A named
  *  class so callers can map it to their own vocabulary — the concierge to a typed `at-capacity`
@@ -622,6 +623,72 @@ function seedDraft(args: SendToBuildArgs, agentId: string): void {
  *  report to — use {@link sendToBuildAwaited}. */
 export function sendToBuild(args: SendToBuildArgs): string {
   const { agentId } = prepareHandoff(args);
+
+  // ══ THE DELEGATION LEDGER (services/dispatchLedger) ═══════════════════════════════════════════
+  //
+  // ITS OWN WRITE SITE, because this path reaches `projectStore.addAgent` DIRECTLY — through
+  // `prepareHandoff` — and never passes through `spawnBuildAgentInProject`, where every local build
+  // spawn is recorded. Without a line here, "Start"/"Build It" on the Plan board would be a
+  // delegation the founder can ask about and the concierge cannot find, which is exactly the
+  // 2026-08-22 failure the ledger exists to close (see that module's header).
+  //
+  // ── A REUSED ORCHESTRATOR IS RECORDED TOO, AND THAT IS A DECISION ───────────────────────────
+  // `prepareHandoff` has two branches: it adopts the build agent already bound to this epic, or it
+  // creates one. The row is written on BOTH, deliberately. What the ledger records is the ACT OF
+  // DELEGATING — "we handed this plan item to an agent" — not the act of creating a row, and that
+  // act is equally true when the epic went back to the orchestrator that already had it. Recording
+  // only fresh creations would make every RESUMED epic invisible to recall, and a resumed epic is
+  // the likeliest thing to be asked about twice, because it is the work that has been going on
+  // longest. The cost of the choice is two rows for one epic handed over twice; `dispatchRecall`
+  // reads rows keyed by target, so those collapse onto the same agent rather than reading as two
+  // separate delegations.
+  //
+  // `void`, never awaited: this function is synchronous and on the board's click path, for the same
+  // reason `labelBead` and the advisor hook above it are fire-and-forget. `recordDispatch` cannot
+  // throw or reject.
+  void recordDispatch({
+    targetId: agentId,
+    channel: "plan",
+    // The name at dispatch, read from the row `prepareHandoff` just settled — `null` for a fresh
+    // orchestrator, which has no name until auto-naming catches up. The ledger treats a name as a
+    // historical fact and joins to the LIVE one at read time, so a missing one costs nothing.
+    nameAtDispatch:
+      useProjectStore
+        .getState()
+        .projects.find((p) => p.id === args.projectId)
+        ?.agents.find((a) => a.id === agentId)?.name ?? null,
+    projectId: args.projectId,
+    projectName:
+      useProjectStore.getState().projects.find((p) => p.id === args.projectId)?.name ?? null,
+    // The bead in hand IS the ask on this path: the board hands over an epic (or, in "task" mode, a
+    // single bead), and the seed prompt is generated from it below. Naming the id is what makes the
+    // row findable by the work rather than only by the agent.
+    beads: [args.epicId],
+    // ── THE BRIEF IS A SUMMARY, NOT THE SEED PROMPT, AND THAT IS DELIBERATE ────────────────────
+    // `buildSeedPrompt` (below, in `seedDraft`) is mostly `beadsProtocol` — thirty lines of the same
+    // boilerplate on every hand-off. Storing it would spend the row's 1,500-char budget on prose
+    // identical across the whole ledger, which is worse than useless in an FTS index: it matches
+    // every query and distinguishes nothing. What recall actually needs is the SUBJECT, because the
+    // founder asks about "the inline preview work" and never about a bead id. So the row carries the
+    // ids plus the EPIC GOAL — the one sentence in that prompt that says what this work is.
+    brief: [
+      `${args.mode ?? "epic"} ${args.epicId}`,
+      args.prdPath ? `PRD ${args.prdPath}` : null,
+      epicGoalLadder(args)?.text ?? null,
+    ]
+      .filter((x): x is string => x !== null)
+      .join(" — "),
+    // NO `mode`. The ledger's `mode` is the agent's PERMISSION mode ("plan" starts it researching
+    // before it edits), which this path never sets — `SendToBuildArgs.mode` is a different axis
+    // entirely ("epic" fans children out, "task" builds one bead), and it is recorded in the brief
+    // above. Stamping one field with the other's vocabulary would make the row answer a question
+    // nobody asked, wrongly.
+    // `humanAuthored` is this function's existing answer to "did a PERSON trigger this handoff?" —
+    // it defaults to true because every board click is one, and `conciergeTools/plans` is the caller
+    // that passes false. Reusing it keeps one answer to that question rather than a second one that
+    // can disagree with the goal-debt rule it already governs.
+    by: args.humanAuthored === false ? "machine" : "human",
+  });
 
   // No `requestComposeFocus`: the orchestrator arrives with a seeded prompt above, so there is
   // nothing for the user to type and the caret is not ours to take.

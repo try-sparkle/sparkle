@@ -127,6 +127,16 @@ vi.mock("./conciergeDispatch", async (orig) => ({
   dispatchConciergeAnswer: (id: string, text: string, opts: unknown) => dispatchMock(id, text, opts),
 }));
 
+// THE DELEGATION LEDGER'S SEAM, mocked at `./history` rather than at `./dispatchLedger` so the row
+// the tests at the bottom assert on is the one the REAL `formatDispatchText` produced — the text a
+// recall query has to match is the whole point of the row, and stubbing the ledger would leave it
+// untested. Nothing else in this file records history (`appendPrompt` is mocked), so this seam is
+// exclusively the ledger's.
+const recordHistoryMock = vi.fn(async (_e: unknown) => ({ inserted: true, collided: false }));
+vi.mock("./history", () => ({
+  recordHistory: (e: unknown) => recordHistoryMock(e),
+}));
+
 const capacityMock = vi.fn(() => ({ atCapacity: false, used: 1, limit: 8, live: 1, basis: "test" }));
 vi.mock("./agentCapacity", async (orig) => ({
   ...(await orig<typeof import("./agentCapacity")>()),
@@ -174,6 +184,7 @@ describe("sendToBuild", () => {
     appendPromptMock.mockReturnValue("prompt-id");
     projects = [];
     labelBeadMock.mockClear();
+    recordHistoryMock.mockClear();
   });
 
   // ── THE WATCH MARKER IS WRITTEN HERE, AND NOWHERE ELSE ON THE HANDOFF PATH ───────────────────
@@ -1582,5 +1593,120 @@ describe("sendToBuild — epic goal laddering", () => {
 
     expect(setAgentGoalMock).not.toHaveBeenCalled();
     expect(seed()).not.toMatch(/NARROWED SLICE/);
+  });
+});
+
+// ── THE DELEGATION LEDGER (services/dispatchLedger) ─────────────────────────────────────────────
+//
+// The Plan board's "Start"/"Build It" reaches `projectStore.addAgent` DIRECTLY and never passes
+// through `spawnBuildAgentInProject`, where every other local build spawn is recorded. So this path
+// needs — and has — its own write site, and these tests are what keep it from being deleted as
+// redundant. They assert the ROW, not the handoff: a green suite that only proved an agent exists is
+// exactly the vacuous shape that let the 2026-08-22 recall failure ship.
+describe("sendToBuild records the delegation", () => {
+  beforeEach(() => {
+    projects = [];
+    addAgentMock.mockReset();
+    appendPromptMock.mockReset();
+    appendPromptMock.mockReturnValue("prompt-id");
+    setAgentEpicIdMock.mockReset();
+    setAgentBeadIdMock.mockReset();
+    setAgentGoalMock.mockReset();
+    openMock.mockReset();
+    recordHistoryMock.mockClear();
+  });
+
+  /** Only the ledger's rows — see the mock's own note for why this seam carries nothing else. */
+  const rows = () =>
+    recordHistoryMock.mock.calls
+      .map((c) => c[0] as { source: string; agentId: string | null; text: string })
+      .filter((e) => e.source === "dispatch");
+
+  it("writes a `plan`-channel row naming the agent and the bead handed over", () => {
+    projects = [{ id: "proj1", rootPath: "/repo", agents: [] }];
+    addAgentMock.mockReturnValue("build-new");
+
+    sendToBuild({ projectId: "proj1", epicId: "epic-42", prdPath: "PRD/feature.md" });
+
+    expect(rows()).toHaveLength(1);
+    const row = rows()[0]!;
+    expect(row.agentId).toBe("build-new");
+    // `plan` is its own channel rather than a synonym for `build`: this is a different provenance —
+    // a board hand-off of existing planned work, not someone starting a fresh agent.
+    expect(row.text).toContain("channel plan");
+    // THE BEAD IS THE ASK on this path, and naming it is what makes the row findable by the work
+    // rather than only by the agent that happened to get it.
+    expect(row.text).toContain("BEADS: epic-42");
+    expect(row.text).toContain("PRD/feature.md");
+  });
+
+  it("carries the EPIC GOAL into the row, which is the only part a person searches by", () => {
+    // The seed prompt is mostly `beadsProtocol` boilerplate, identical on every hand-off, so it is
+    // deliberately NOT what the row stores. The goal is the one sentence that says what this work
+    // IS — and the founder asks "did we ever look at the inline preview cards", never "epic-42".
+    projects = [
+      {
+        id: "proj1",
+        rootPath: "/repo",
+        agents: [],
+        epicGoals: {
+          "epic-42": { text: "preview cards render inline in chat", setAt: 5, source: "auto" },
+        },
+      },
+    ];
+    addAgentMock.mockReturnValue("build-new");
+
+    sendToBuild({ projectId: "proj1", epicId: "epic-42", prdPath: null });
+
+    expect(rows()[0]!.text).toContain("preview cards render inline in chat");
+  });
+
+  it("records a REUSED orchestrator too — the delegated act is the hand-off, not the row creation", () => {
+    // `prepareHandoff` adopts the build agent already bound to this epic instead of creating one, so
+    // `addAgent` never runs. A ledger keyed on creation would make every RESUMED epic invisible to
+    // recall — and a resumed epic is the likeliest thing to be asked about twice, because it is the
+    // work that has been going on longest.
+    projects = [
+      { id: "proj1", rootPath: "/repo", agents: [{ id: "build-old", kind: "build", epicId: "epic-42" }] },
+    ];
+
+    sendToBuild({ projectId: "proj1", epicId: "epic-42", prdPath: null });
+
+    expect(addAgentMock).not.toHaveBeenCalled();
+    expect(rows().map((r) => r.agentId)).toEqual(["build-old"]);
+  });
+
+  it("attributes a board click to the human and a machine-driven hand-off to the machine", () => {
+    projects = [{ id: "proj1", rootPath: "/repo", agents: [] }];
+    addAgentMock.mockReturnValue("build-new");
+
+    sendToBuild({ projectId: "proj1", epicId: "epic-42", prdPath: null });
+    expect(rows()[0]!.text).toContain("by human");
+
+    recordHistoryMock.mockClear();
+    projects = [{ id: "proj1", rootPath: "/repo", agents: [] }];
+    // `humanAuthored: false` is this module's existing answer to "did a PERSON trigger this?" — the
+    // concierge's `promote_plan_to_build` is the caller that passes it. Reusing it keeps ONE answer
+    // to that question rather than a second one that can disagree with the goal-debt rule.
+    sendToBuild({ projectId: "proj1", epicId: "epic-42", prdPath: null, humanAuthored: false });
+    expect(rows()[0]!.text).toContain("by machine");
+  });
+
+  it("writes NOTHING when the hand-off is refused at capacity — paired with the same call succeeding", () => {
+    // The refusal happens before `addAgent`, so no orchestrator exists. A row here would be a FALSE
+    // POSITIVE on "did we ever start that", which is worse than the false negative the ledger fixes:
+    // it reports work under way that nobody is doing.
+    projects = [{ id: "proj1", rootPath: "/repo", agents: [] }];
+    addAgentMock.mockReturnValue("build-new");
+    capacityMock.mockReturnValueOnce({ atCapacity: true, used: 8, limit: 8, live: 8, basis: "test" });
+
+    expect(() => sendToBuild({ projectId: "proj1", epicId: "epic-42", prdPath: null })).toThrow(
+      AtCapacityError,
+    );
+    expect(rows()).toEqual([]);
+
+    // The other half: without it this passes just as well against a build with no write site at all.
+    sendToBuild({ projectId: "proj1", epicId: "epic-42", prdPath: null });
+    expect(rows()).toHaveLength(1);
   });
 });

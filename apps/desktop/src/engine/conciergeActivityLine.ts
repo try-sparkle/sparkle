@@ -34,6 +34,7 @@ import type { PlansOp } from "../services/conciergeTools/plans";
 import type { ResearchOp } from "../services/conciergeTools/research";
 import type { AccountsOp } from "../services/conciergeTools/accounts";
 import type { MemoryOp } from "../services/conciergeTools/memory";
+import type { DispatchMemoryOp } from "../services/conciergeTools/dispatchMemory";
 import type { PublishOp } from "../services/conciergeTools/publish";
 import { conciergeNativeToolLine } from "./conciergeNativeToolLine";
 
@@ -479,6 +480,18 @@ const MEMORY_PHRASES: Record<MemoryOp, OpPhrase> = {
 };
 
 /**
+ * Dispatch memory. The phrase says WHAT IS BEING LOOKED UP, not that a database is being read: the
+ * user reading this line wants to know the concierge is checking whether it already sent someone,
+ * which is the whole reason the op exists (see conciergeTools/dispatchMemory.ts).
+ */
+const DISPATCH_MEMORY_PHRASES: Record<DispatchMemoryOp, OpPhrase> = {
+  recall_dispatches: phrase(
+    "Checking what I've already sent agents to do",
+    "Checked what I've already sent agents to do",
+  ),
+};
+
+/**
  * Publishing. Every phrase names the USER'S OWN SITE, and the two that reach the public say so.
  *
  * THIS LINE IS READ BY A HUMAN WHO IS NOT THE MODEL, and it is the one place a publish shows up
@@ -551,6 +564,10 @@ const DOMAINS: Record<
   // Reuses the workspace glyph: durable memory is a fact about the concierge's own state, not an
   // agent or a branch. No new glyph, consistent with `board` and `plans`.
   memory: { icon: "workspace", phrases: MEMORY_PHRASES },
+  // Reuses the agents glyph rather than memory's workspace one: the SUBJECT of every row is an
+  // agent the concierge started, so this line belongs with the other lines about agents — the
+  // substrate it happens to be stored in is not what the user is being told about.
+  dispatch_memory: { icon: "agents", phrases: DISPATCH_MEMORY_PHRASES },
 };
 
 /** What an op's `%s` refers to, so the recorder knows which id to resolve into a name.

@@ -82,6 +82,11 @@ import { SCREENSHOT_OPS, SCREENSHOT_RISK, type ScreenshotOp, type ScreenshotRisk
 import { PREVIEW_INSPECT_OPS, PREVIEW_INSPECT_RISK, type PreviewInspectOp } from "./previewInspect";
 import { RESEARCH_OPS, RESEARCH_RISK, type ResearchOp } from "./research";
 import { MEMORY_OPS, MEMORY_RISK, type MemoryOp } from "./memory";
+import {
+  DISPATCH_MEMORY_OPS,
+  DISPATCH_MEMORY_RISK,
+  type DispatchMemoryOp,
+} from "./dispatchMemory";
 // `PublishRisk` is deliberately NOT imported: publishing reuses WORKSPACE's four risk words
 // verbatim, and `translateRisk(PUBLISH_RISK, WORKSPACE_RISK_TO_CLASS)` already fails to compile if
 // publish.ts ever adds a fifth — the vocabulary check is structural, not an annotation.
@@ -212,6 +217,7 @@ export type ConciergeToolDomain =
   | "chief"
   | "accounts"
   | "memory"
+  | "dispatch_memory"
   | "publish"
   | "app";
 
@@ -235,6 +241,7 @@ export const CONCIERGE_TOOL_DOMAINS = [
   { id: "chief", label: "Chief (client work)" },
   { id: "accounts", label: "Claude accounts" },
   { id: "memory", label: "Durable memory" },
+  { id: "dispatch_memory", label: "Delegation memory" },
   { id: "publish", label: "Publishing" },
   { id: "app", label: "App & settings" },
 ] as const satisfies readonly { id: ConciergeToolDomain; label: string }[];
@@ -470,6 +477,19 @@ const MEMORY_TOOL_SUMMARY: Record<MemoryOp, string> = {
   list_memories: "List everything the concierge has saved to its durable memory.",
 };
 
+/**
+ * The dispatch-memory domain's row. Required for the same reason research's and memory's are: the
+ * risk-note fallback ("Local and reversible.") would tell a human deciding whether to gate this
+ * nothing at all — and the thing they need to know is that it reads a record of work THEY may have
+ * started, not just work the concierge started, since the "+ New Build Agent" button writes to the
+ * same ledger.
+ */
+const DISPATCH_MEMORY_TOOL_SUMMARY: Record<DispatchMemoryOp, string> = {
+  recall_dispatches:
+    "Look up agents and research already dispatched about a subject — including finished ones — " +
+    "so the concierge can say what is already under way instead of starting it again.",
+};
+
 const RESEARCH_TOOL_SUMMARY: Record<ResearchOp, string> = {
   dispatch:
     "Send a question off to a background research agent and keep talking — it answers later, and " +
@@ -687,6 +707,7 @@ export type ConciergeToolName =
   | ChiefOp
   | AccountsOp
   | MemoryOp
+  | DispatchMemoryOp
   | PublishOp
   | AppToolName;
 
@@ -792,6 +813,12 @@ const RISK_BY_TOOL: Record<ConciergeToolName, ConciergeRiskClass> = {
   // auto-allow — the whole point is that the concierge accumulates durable context without the
   // human approving each fact; `recall`/`list` are `read-only`. See memory.ts.
   ...translateRisk(MEMORY_RISK, WORKSPACE_RISK_TO_CLASS),
+  // Dispatch memory publishes ONE of workspace's four risk words, `read-only`, so it reuses that
+  // translation. That derives to `allow`, and it is load-bearing rather than incidental: this op's
+  // whole job is to be called BEFORE the concierge answers "are we doing X" or dispatches fresh
+  // work, and an op behind an approval card is an op the model skips — which is the 2026-08-22
+  // incident again, with a ledger sitting right there. See dispatchMemory.ts.
+  ...translateRisk(DISPATCH_MEMORY_RISK, WORKSPACE_RISK_TO_CLASS),
   // Publishing reuses WORKSPACE's four words exactly, so it reuses that translation rather than
   // declaring a table identical to it. The load-bearing rows are the two `irreversible` ones —
   // `publish_update_live` and `publish_go_live` — and publish.ts records at length why that word
@@ -979,6 +1006,7 @@ const DOMAIN_BY_TOOL: Record<ConciergeToolName, ConciergeToolDomain> = {
   ...constantOver(CHIEF_RISK, "chief" as const),
   ...constantOver(ACCOUNTS_RISK, "accounts" as const),
   ...constantOver(MEMORY_RISK, "memory" as const),
+  ...constantOver(DISPATCH_MEMORY_RISK, "dispatch_memory" as const),
   ...constantOver(PUBLISH_RISK, "publish" as const),
   ...constantOver(APP_TOOL_RISK, "app" as const),
 };
@@ -1000,6 +1028,7 @@ const DOMAIN_BY_TOOL: Record<ConciergeToolName, ConciergeToolDomain> = {
 export const SUMMARY_BY_TOOL: Partial<Record<ConciergeToolName, string>> = {
   ...RESEARCH_TOOL_SUMMARY,
   ...MEMORY_TOOL_SUMMARY,
+  ...DISPATCH_MEMORY_TOOL_SUMMARY,
   ...WORKSPACE_TOOL_SUMMARY,
   ...SCREENSHOT_TOOL_SUMMARY,
   ...TERMINAL_TOOL_SUMMARY,
@@ -1031,6 +1060,7 @@ const NAMES_BY_DOMAIN: Record<ConciergeToolDomain, readonly ConciergeToolName[]>
   chief: CHIEF_OPS,
   accounts: ACCOUNTS_OPS,
   memory: MEMORY_OPS,
+  dispatch_memory: DISPATCH_MEMORY_OPS,
   publish: PUBLISH_OPS,
   app: APP_TOOL_NAMES,
 };

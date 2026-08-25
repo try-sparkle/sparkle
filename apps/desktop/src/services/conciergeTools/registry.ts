@@ -269,6 +269,13 @@ import {
   type MemoryOp,
   type MemoryResult,
 } from "./memory";
+import {
+  DISPATCH_MEMORY_OPS,
+  DISPATCH_MEMORY_RISK,
+  recallDispatchesOp,
+  type DispatchMemoryOp,
+  type DispatchMemoryResult,
+} from "./dispatchMemory";
 import { conciergeToolConfigPath } from "./policy";
 // The founder's words go where HE aimed them — see ./relayGate for his ruling and for why this is a
 // refused SEND rather than a relabelled one.
@@ -380,6 +387,10 @@ export const CONCIERGE_TOOL_DOMAINS = [
   "research",
   "accounts",
   "memory",
+  // The DELEGATION LEDGER's read surface — separate from `memory` because it is a search over a
+  // different substrate with a different result shape, and because the settings pane groups by
+  // domain, so the domain is the unit of consent. See dispatchMemory.ts.
+  "dispatch_memory",
   // ⚠️ A REGISTRY DOMAIN, NOT A CONTROL OP — AND MEMBERSHIP OF *THIS LIST* IS WHY (bead
   // `sparkle-131ms.6`). `conciergeApprovalResume.isReplayable` is literally
   // `CONCIERGE_TOOL_DOMAINS.includes(entry.domain)`, and this list omits `chief` and `app`. So an
@@ -866,6 +877,13 @@ function fromResearch<T>(ctx: OpContext, r: ResearchResult<T>): ConciergeToolRep
 
 /** memory: same convention as research/board — the refusal's `reason` becomes the wire code. */
 function fromMemory<T>(ctx: OpContext, r: MemoryResult<T>): ConciergeToolReply {
+  return r.ok ? ok(ctx, r.data) : err(ctx, r.reason, r.message);
+}
+
+/** dispatch_memory: the memory/board convention. Its one refusal code (`recall-failed`) is
+ *  defensive — `recallDispatches` degrades an unreadable ledger to an empty result rather than
+ *  throwing, precisely so the concierge's answer path cannot fail on it. */
+function fromDispatchMemory<T>(ctx: OpContext, r: DispatchMemoryResult<T>): ConciergeToolReply {
   return r.ok ? ok(ctx, r.data) : err(ctx, r.reason, r.message);
 }
 
@@ -2229,6 +2247,33 @@ const MEMORY_ROUTES: Record<MemoryOp, Handler> = {
   list_memories: route(noArgs, async (_a, ctx) => fromMemory(ctx, await listMemories())),
 };
 
+// The dispatch-memory domain's argument schema. `.strict()`, like every other domain — and every
+// field is OPTIONAL, which is the shape the retrieval path needs: `{}` is a legitimate call meaning
+// "what have you got running?", and the useful call is one free-text `query` and nothing else.
+//
+// `includeClosed` IS NOT DEFAULTED HERE. Left absent it reaches `recallDispatches` as `undefined`,
+// whose own documented default is TRUE — closed delegations come back, because "did we ever do that
+// work?" is answered by a finished one. Writing `.default(true)` in this schema would put a second
+// copy of that rule in a second file; writing `.default(false)` would silently undo the feature.
+const recallDispatchesArgs = z
+  .object({
+    query: z
+      .string()
+      .min(1, "give the SUBJECT to search for, in the user's own words — e.g. 'preview cards'")
+      .optional(),
+    targetId: z.string().min(1, "targetId must be an agent or research-task id").optional(),
+    sinceMs: z.number().int().nonnegative().optional(),
+    includeClosed: z.boolean().optional(),
+    limit: z.number().int().positive().optional(),
+  })
+  .strict();
+
+const DISPATCH_MEMORY_ROUTES: Record<DispatchMemoryOp, Handler> = {
+  recall_dispatches: route(recallDispatchesArgs, async (a, ctx) =>
+    fromDispatchMemory(ctx, await recallDispatchesOp(a)),
+  ),
+};
+
 /**
  * Does this op change the world? Written as an exhaustive `Record` rather than derived from
  * `RESEARCH_RISK`, so a fifth op is a TYPECHECK FAILURE here until someone decides — which is the
@@ -2726,6 +2771,15 @@ const DOMAINS: Record<ConciergeToolDomain, DomainEntry> = {
     write: (op) => MEMORY_RISK[op as MemoryOp] !== "read-only",
     ops: MEMORY_OPS,
   },
+  dispatch_memory: {
+    routes: DISPATCH_MEMORY_ROUTES,
+    // Read-only throughout, by construction: the ledger's only writer is the spawn path
+    // (services/dispatchLedger.ts), deliberately, so that recording a delegation cannot depend on
+    // the model remembering to. The risk map is still read here rather than hard-coding `false`, so
+    // a future write-tier op cannot be added without this line noticing.
+    write: (op) => DISPATCH_MEMORY_RISK[op as DispatchMemoryOp] !== "read-only",
+    ops: DISPATCH_MEMORY_OPS,
+  },
   publish: {
     routes: PUBLISH_ROUTES,
     // The risk map answers "is this a write" exactly — the five reads are `read-only` and every
@@ -2773,6 +2827,7 @@ export const CONCIERGE_TOOL_OPS: Record<ConciergeToolDomain, readonly string[]> 
   research: DOMAINS.research.ops,
   accounts: DOMAINS.accounts.ops,
   memory: DOMAINS.memory.ops,
+  dispatch_memory: DOMAINS.dispatch_memory.ops,
   publish: DOMAINS.publish.ops,
 };
 

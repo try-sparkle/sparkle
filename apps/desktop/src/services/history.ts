@@ -36,8 +36,28 @@ export type HistoryKind = "prompt" | "response";
  * NOTE for anyone adding a member here: `source` has no CHECK constraint, so a typo'd literal does
  * not fail — it silently falls into the build-tier ageing above, and the row quietly disappears at
  * 24h. The SQL matches this exact string.
+ *
+ * ── AND `dispatch` IS A THIRD ASSET CLASS — THE DELEGATION LEDGER (bead sparkle-dispatch-memory) ──
+ * On 2026-08-22 the founder asked the concierge about making preview cards inline. It answered as
+ * if it had never heard of the work and dispatched fresh research — EIGHT MINUTES after it had
+ * itself spawned an agent to do exactly that. The brief was already in this table (`prompt`/`build`,
+ * carrying the agent id, the name and the time) and would have been returned by a single FTS query.
+ * It was gone because `build` rows are AGE-pruned at 24h.
+ *
+ * So a delegation gets its own source rather than riding the build tier. Three properties follow,
+ * and each one is the reason a `build` row could not do the job:
+ *   • AGE-EXEMPT. "Did we ever do that work?" is a question about last month, not about today.
+ *   • ONE ROW PER SPAWN, not one per prompt, so the ledger is countable and the count cap below is
+ *     measured in years rather than days (`DISPATCH_HISTORY_MAX`, src-tauri/src/history.rs).
+ *   • IMMUTABLE AND FACT-ONLY. The row holds what was true AT DISPATCH — the ask, the time, the
+ *     agent id — and nothing that can change afterwards. Status, the agent's CURRENT name and
+ *     whether it is still running are DERIVED at read time (services/dispatchRecall.ts). That is
+ *     deliberate: the bug class this feature exists to fix is state stamped once and never
+ *     re-derived, and a ledger that stamped a status would be a fresh instance of it. Three agents
+ *     have been observed simultaneously named "Worker 13", so even the NAME is re-derived; the
+ *     `agent_name` column here is the name at dispatch and is a historical fact, not a handle.
  */
-export type HistorySource = "brainstorm" | "build" | "concierge";
+export type HistorySource = "brainstorm" | "build" | "concierge" | "dispatch";
 export type RetentionTier = "24h" | "7d" | "30d" | "90d" | "1y" | "indefinite";
 
 export interface HistoryEntry {
@@ -62,6 +82,20 @@ export interface HistoryHit {
   agentName: string | null;
   snippet: string; // FTS5 snippet() with <b>..</b> match markers
   createdAt: number;
+  /**
+   * The WHOLE row text — present only when the caller passed `includeText`, `null` otherwise.
+   *
+   * `?: string | null`, not `?: string`: this is a Rust `Option<String>`, and serde emits the key
+   * with an explicit `null` for `None` rather than omitting it (AGENTS.md, bead sparkle-16y6h). A
+   * `?: string` here would describe a payload the wire cannot produce, and an all-or-nothing parser
+   * on the far side would then discard the whole hit.
+   *
+   * Off by default because the ordinary `search_history` caller renders SNIPPETS, and shipping full
+   * texts for 50 hits would move megabytes across the IPC boundary to draw one line each. The
+   * dispatch ledger is the caller that needs it: a snippet is 12 tokens around the match, which
+   * cannot be relied on to contain the ASK.
+   */
+  text?: string | null;
 }
 
 /**
@@ -136,9 +170,35 @@ export async function recordHistory(e: HistoryEntry): Promise<RecordOutcome> {
   return parseRecordOutcome(await invoke("history_record", { entry: e }));
 }
 
-/** Full-text search across all live history. Blank query → []. Default limit 50 (Rust-side). */
-export async function searchHistory(query: string, limit?: number): Promise<HistoryHit[]> {
-  return await invoke<HistoryHit[]>("history_search", { query, limit });
+/** Narrowings for {@link searchHistory}. Both are OPTIONAL and both default to today's behaviour,
+ *  so every existing call site is unchanged. */
+export interface HistorySearchOpts {
+  /**
+   * Restrict the search to these sources. Omitted (or empty) searches everything, as before.
+   *
+   * This is applied IN SQL, not after the fact, and that is the whole point: the `LIMIT` is applied
+   * by SQLite before any result reaches the frontend, so a post-hoc `.filter(h => h.source === …)`
+   * would silently return nothing whenever 50 louder rows of another source outranked the ones the
+   * caller asked for. The dispatch ledger is exactly that case — a few thousand delegation rows
+   * living alongside hundreds of thousands of build and concierge rows.
+   */
+  sources?: HistorySource[];
+  /** Also return each hit's WHOLE text in {@link HistoryHit.text}. See that field for the cost. */
+  includeText?: boolean;
+}
+
+/** Full-text search across live history. Blank query → []. Default limit 50 (Rust-side). */
+export async function searchHistory(
+  query: string,
+  limit?: number,
+  opts?: HistorySearchOpts,
+): Promise<HistoryHit[]> {
+  return await invoke<HistoryHit[]>("history_search", {
+    query,
+    limit,
+    sources: opts?.sources,
+    includeText: opts?.includeText,
+  });
 }
 
 /** Retention prune. Returns rows hard-deleted.

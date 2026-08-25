@@ -109,6 +109,7 @@ import { recordAgentRetirement } from "../deathRecordWriter";
 import { recordConciergeActionReceipt, nextReceiptId } from "../conciergeReceipts";
 import { notifyConcierge } from "../conciergeNotifier";
 import { spawnBuildAgentInProject } from "../buildAgentSpawn";
+import { recordDispatch } from "../dispatchLedger";
 import { awaitBriefDelivery, type BriefDeliveryOutcome } from "../agentBrief";
 import { getModelCatalog, isDefaultModel, DEFAULT_MODEL_ID } from "../models";
 import { isTornOut } from "../satelliteWindows";
@@ -745,6 +746,16 @@ export async function spawnBuildAgent(
     // Every direct gesture (the sidebar row, the empty-state button, a file drop) keeps the default
     // `"user"` and still jumps; see SpawnBuildAgentOpts.attention.
     attention: "auto",
+    // THE DELEGATION LEDGER'S PROVENANCE, and the ONLY thing this path contributes to it.
+    //
+    // `spawnBuildAgentInProject` writes the row itself, so there is deliberately no second
+    // `recordDispatch` here — two writes for one spawn would double-count the delegation and make
+    // the recall path report the same agent twice. All this passes down is the one fact the shared
+    // helper cannot work out for itself: a concierge spawn is neither a background sweep nor a hand
+    // on a control, and without this it would be recorded as a button press. Since the incident this
+    // feature exists for is the concierge failing to recall ITS OWN dispatches, "I did this" is
+    // precisely the fact the row must carry.
+    dispatchedBy: "concierge",
   });
   if (!agentId) {
     // TWO CAUSES REACH THIS LINE NOW, AND THEY READ DIFFERENTLY TO A HUMAN. Capacity and torn-out
@@ -1132,6 +1143,35 @@ async function spawnCloudBuildAgent(
       projectId: project.id,
     });
     const named = input.name?.trim();
+    // ══ THE DELEGATION LEDGER — THE CLOUD PATH'S OWN ROW (services/dispatchLedger) ═══════════════
+    //
+    // A SECOND WRITE SITE, not a duplicate of the local one. The cloud spawn never reaches
+    // `spawnBuildAgentInProject` — it goes `ensureCloudProjectId` → `createCloudAgent` → its own
+    // `addAgent` — so the line that records every local delegation cannot see this one at all. Left
+    // out, "start it in the cloud" would be the one phrasing that makes a dispatch unrememberable,
+    // which is the same class of hole as the incident: a delegation that happened and that the
+    // concierge cannot later find.
+    //
+    // WRITTEN HERE, past `res.ok`, because until the server hands back a session id there is nothing
+    // to key a row on. The refusal above is not a delegation, even the `orphanedSessionId` flavour:
+    // that one carries no id this side can quote, so a row for it would name no agent.
+    //
+    // `by: "concierge"` unconditionally — `spawn_cloud_build_agent` is a concierge tool and has no
+    // button behind it, so unlike the local path there is no ambiguity to derive.
+    //
+    // `brief` is the GOAL, which for a cloud agent is the whole of what it was told: the runner seeds
+    // Claude Code with it via stdin as the sandbox comes up, and `cloud-goal-required` above refuses
+    // the spawn outright when it is empty. So this row can never carry the local path's legitimate
+    // empty brief.
+    void recordDispatch({
+      targetId: res.id,
+      channel: "cloud-build",
+      nameAtDispatch: named ?? null,
+      projectId: project.id,
+      projectName: project.name,
+      brief: goal,
+      by: "concierge",
+    });
     return ok(op, {
       agentId: res.id,
       projectId: project.id,

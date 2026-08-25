@@ -138,6 +138,10 @@ import {
   useConciergeMemoryStore,
   withMemoryPreamble,
 } from "../stores/conciergeMemoryStore";
+// The delegation roster — the concierge's own open dispatches, folded into the front of every turn
+// so "you already spawned an agent for that eight minutes ago" is something it reads rather than
+// something it has to remember to look up. See stores/conciergeDispatchStore.
+import { dispatchPreambleNow, withDispatchPreamble } from "../stores/conciergeDispatchStore";
 import {
   allTasksNow as allResearchTasks,
   markResearchRead,
@@ -3595,6 +3599,11 @@ export function ConciergeHost({
         const s = useConciergeMemoryStore.getState();
         return buildMemoryPreamble(s.memories, s.total);
       },
+      // Fold the open delegations into proactive turns too, from the SAME live read the user-turn
+      // seam uses — a fold-in present on one seam and missing on the other reads as done and is not.
+      // Read fresh rather than cached, for the reason `readDispatchPreamble` documents: a roster
+      // that lags by a turn is wrong in exactly the case this feature exists to fix.
+      readDispatchPreamble: () => dispatchPreambleNow(),
       startTurn: async (prompt, digest, researchTaskIds) => {
         const id = await startProactiveConciergeTurn(prompt);
         // Null means no turn ran — the user owns the conversation, or the bridge failed. Reporting
@@ -5046,35 +5055,56 @@ export function ConciergeHost({
     void maybeRefreshThreadSummary(useConciergeThreadStore.getState().chat);
     // The two compose: research findings lead (they are what came back while he was away), then the
     // fleet + thread snapshot, then his new message last.
-    void startConciergeTurn(
-      // MERGE NOTE (sparkle-yd1ud × sparkle-s7rfc): both branches rewrote this call, and the three
-      // additions compose rather than compete — research findings are what CAME BACK, open asks are
-      // what is still OWED, continuity is what was already SAID. Taking either side verbatim would
-      // have silently dropped the other's argument, which is the conflict git resolves cleanly and
-      // wrongly. `openAsksNow()` is read synchronously from the queue's cache, for the same reason
-      // the fleet picture is read at dispatch rather than at enqueue: the prompt should describe
-      // what is outstanding when the turn actually runs.
-      // THREE SECTIONS, IN THIS ORDER: research findings (what CAME BACK), the Pusher's owed
-      // findings (what he has not been TOLD), then the fleet + thread snapshot ending in his new
-      // message. Both preambles go AHEAD of `buildSnapshot` rather than after it, because his
-      // message is the last thing inside that snapshot — anything appended would sit under the
-      // question and read as part of it.
-      withMemoryPreamble(
-        memoryPreamble,
-        withResearchPreamble(
-          research.preamble,
-          withNoticeSection(
-            owedNotices,
-            buildSnapshot(
-              feedRef.current,
-              entries.map((q) => q.text),
-              openAsksNow(),
-              continuity,
-            ),
+    //
+    // MERGE NOTE (sparkle-yd1ud × sparkle-s7rfc): both branches rewrote this call, and the three
+    // additions compose rather than compete — research findings are what CAME BACK, open asks are
+    // what is still OWED, continuity is what was already SAID. Taking either side verbatim would
+    // have silently dropped the other's argument, which is the conflict git resolves cleanly and
+    // wrongly. `openAsksNow()` is read synchronously from the queue's cache, for the same reason
+    // the fleet picture is read at dispatch rather than at enqueue: the prompt should describe
+    // what is outstanding when the turn actually runs.
+    // THREE SECTIONS, IN THIS ORDER: research findings (what CAME BACK), the Pusher's owed
+    // findings (what he has not been TOLD), then the fleet + thread snapshot ending in his new
+    // message. Both preambles go AHEAD of `buildSnapshot` rather than after it, because his
+    // message is the last thing inside that snapshot — anything appended would sit under the
+    // question and read as part of it.
+    // COMPOSED SYNCHRONOUSLY, HERE, and not inside the `.then` below: every input above is read from
+    // a ref or a store, and reading them one microtask later would describe the fleet as it is after
+    // the delegation roster came back rather than as it was when this turn was dispatched.
+    const composed = withMemoryPreamble(
+      memoryPreamble,
+      withResearchPreamble(
+        research.preamble,
+        withNoticeSection(
+          owedNotices,
+          buildSnapshot(
+            feedRef.current,
+            entries.map((q) => q.text),
+            openAsksNow(),
+            continuity,
           ),
         ),
       ),
-    ).then(
+    );
+    // ══ THE OPEN DELEGATIONS GO IN FRONT OF EVERYTHING (delegation ledger) ════════════════════════
+    //
+    // Outermost, so the work the concierge itself dispatched is LINE 1 of its own prompt. The
+    // measured failure (2026-08-22) was it answering a question about preview-card work as if it had
+    // never heard of it, eight minutes after spawning an agent to do exactly that — and a persona
+    // rule telling it to check is what had already failed. Folded in here, that delegation is in
+    // front of the question before the model reads the question.
+    //
+    // READ LIVE, NOT FROM A CACHE — stores/conciergeDispatchStore's header has the full argument.
+    // The short version: a roster refreshed off the turn path lags by exactly one turn, which is the
+    // measured case (spawn, then ask about it on the next message), and this whole feature exists
+    // inside the bug class "state stamped once and never re-derived".
+    //
+    // The cost is one bounded SQLite read before the turn installs. `dispatchPreambleNow` never
+    // rejects (it degrades to no section), so nothing here can fail the send that could not fail it
+    // before.
+    void dispatchPreambleNow()
+      .then((dispatchPreamble) => startConciergeTurn(withDispatchPreamble(dispatchPreamble, composed)))
+      .then(
       (id) => {
         const n = id !== null && /^\d+$/.test(id) ? Number(id) : null;
         if (n !== null) retireThroughRef.current = Math.max(retireThroughRef.current, n - 1);

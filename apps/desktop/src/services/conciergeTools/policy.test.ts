@@ -68,6 +68,7 @@ import { CHIEF_CALL_TOOL_ARG, CHIEF_OPS, CHIEF_RISK, chiefCallToolName } from ".
 import { CHIEF_DESTRUCTIVE_TOOLS } from "../chiefScope";
 import { ACCOUNTS_OPS } from "./accounts";
 import { MEMORY_OPS } from "./memory";
+import { DISPATCH_MEMORY_OPS } from "./dispatchMemory";
 import { PUBLISH_OPS } from "./publish";
 import { toConciergeToolPolicy } from "../../stores/settingsStore";
 
@@ -338,6 +339,7 @@ describe("risk that depends on the CALL, not on the op name", () => {
       ["research", RESEARCH_OPS],
       ["accounts", ACCOUNTS_OPS],
       ["memory", MEMORY_OPS],
+      ["dispatch_memory", DISPATCH_MEMORY_OPS],
       ["screenshot", SCREENSHOT_OPS],
       ["attachments", ATTACHMENTS_OPS],
       ["workflow", WORKFLOW_OPERATIONS],
@@ -497,6 +499,7 @@ describe("the tool set is derived from the domains", () => {
       "chief",
       "accounts",
       "memory",
+      "dispatch_memory",
       "publish",
       "app",
     ]);
@@ -557,6 +560,7 @@ describe("the tool set is derived from the domains", () => {
         CHIEF_OPS.length +
         ACCOUNTS_OPS.length +
         MEMORY_OPS.length +
+        DISPATCH_MEMORY_OPS.length +
         PUBLISH_OPS.length +
         APP_TOOL_NAMES.length,
     );
