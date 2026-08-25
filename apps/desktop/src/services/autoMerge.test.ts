@@ -162,6 +162,41 @@ describe("chooseAutoMerge — 'no checks at all' is NOT green (roborev 59679)", 
   });
 });
 
+describe("chooseAutoMerge — an UNPINNABLE head is NOT auto-merged (bead sparkle-vo82zo)", () => {
+  // The runner forwards `pr.headRefOid` to `mergePr` → `gh pr merge --match-head-commit`, and that
+  // flag is what refuses a merge when the branch moved since this decision read it. But the flag is
+  // DROPPED for an empty/absent oid, so an unattended merge with no pinnable head lands the LIVE
+  // head unguarded — the exact race: a fix pushed while the merge settled is silently absent from
+  // main afterwards, PR reads MERGED, branch recreated by the push, nothing looks wrong.
+
+  it("refuses a ready PR whose head oid is absent — even though the UI predicate calls it ready", () => {
+    const noOid = ready(10, { headRefOid: undefined });
+    // `prMergeReadiness` does not read headRefOid (PrJudgeable does not carry it), so it still says
+    // ready — this pins an OVERRIDE, not something already true before the change.
+    expect(prMergeReadiness(noOid).tone).toBe("ready");
+    expect(chooseAutoMerge([noOid], ON).kind).toBe("none-ready");
+  });
+
+  it("refuses an empty or whitespace-only head oid (the value that drops --match-head-commit)", () => {
+    expect(chooseAutoMerge([ready(10, { headRefOid: "" })], ON).kind).toBe("none-ready");
+    expect(chooseAutoMerge([ready(10, { headRefOid: "   " })], ON).kind).toBe("none-ready");
+  });
+
+  it("PAIRED: the identical PR merges once it carries a pinnable head — proving the oid is what gates", () => {
+    // Same PR, one field different, to pin the CAUSE rather than mere absence (AGENTS.md).
+    expect(chooseAutoMerge([ready(10, { headRefOid: undefined })], ON).kind).toBe("none-ready");
+    expect(chooseAutoMerge([ready(10, { headRefOid: "sha-10" })], ON).kind).toBe("merge");
+  });
+
+  it("skips the unpinnable PR and merges a pinnable one behind it", () => {
+    const decision = chooseAutoMerge([ready(3, { headRefOid: "" }), ready(8)], ON);
+    // 3 sorts first and would win on age — it is excluded on the missing head, not on order.
+    expect(decision.kind === "merge" && decision.pr.number).toBe(8);
+    expect(decision.kind === "merge" && decision.pr.headRefOid).toBe("sha-8");
+    expect(decision.kind === "merge" && decision.readyCount).toBe(1);
+  });
+});
+
 describe("chooseAutoMerge — a DISMISSED PR is never auto-merged (roborev 59679)", () => {
   // Dismissal is the app's durable "not now", and its revival rule deliberately keeps a PR dismissed
   // even when it is GREEN — so a dismissed PR is exactly the shape this decision would select.

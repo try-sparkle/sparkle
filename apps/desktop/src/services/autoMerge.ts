@@ -123,7 +123,13 @@ export type AutoMergeFailures = Readonly<Record<number, number>>;
 /** A PR the decision can act on: judgeable for readiness, plus the identity a merge needs. */
 export type AutoMergeCandidate = PrJudgeable & {
   number: number;
-  /** Pinned into `gh pr merge --match-head-commit`, so a branch that moved is refused, not merged. */
+  /**
+   * Pinned into `gh pr merge --match-head-commit`, so a branch that moved is refused, not merged.
+   * REQUIRED for unattended eligibility: `chooseAutoMerge` refuses a candidate whose oid is
+   * empty/absent, because that is the case the pin is silently DROPPED for and the merge lands the
+   * live head unguarded (bead sparkle-vo82zo). Optional on the type only because a poll may not have
+   * read it yet — an unread oid is "not looked", not "safe to merge blind".
+   */
   headRefOid?: string;
 };
 
@@ -197,9 +203,21 @@ export function chooseAutoMerge<T extends AutoMergeCandidate>(
     .filter((pr) => {
       // The imported single source of truth — see the header for why it is not re-derived.
       if (prMergeReadiness(pr).tone !== "ready") return false;
-      // ...plus the two rules that are NOT safe to inherit from a UI predicate.
+      // ...plus the rules that are NOT safe to inherit from a UI predicate.
       if (config.requirePassingChecks && pr.checks !== "passing") return false;
       if (dismissed?.has(pr.number)) return false;
+      // An unattended merge MUST be able to PIN the exact head it evaluated (bead sparkle-vo82zo).
+      // The runner forwards `pr.headRefOid` to `mergePr` → `gh pr merge --match-head-commit`, which
+      // makes GitHub refuse the merge if the branch moved since this decision read it. But that flag
+      // is DROPPED for an empty/absent oid (`merge_argv`: "EMPTY IS ABSENT... Unknown head →
+      // unguarded merge"), and an unguarded merge lands whatever the branch points at NOW. That is
+      // the exact race this closes: a fix pushed while the merge settled is simply absent from the
+      // default branch afterwards and NOTHING looks wrong — the PR reads MERGED, the branch is there
+      // again (recreated by the push), so the lost fix reads as landed. A HUMAN click may merge
+      // unguarded because they are watching the outcome; an UNATTENDED sweep has no such witness, so
+      // no pinnable head means not ready. `undefined`/empty is "not looked", handled like every
+      // other unknown here — it manufactures no eligibility.
+      if (!pr.headRefOid || pr.headRefOid.trim() === "") return false;
       return true;
     })
     .sort(byNumberAscending);
