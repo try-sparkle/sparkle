@@ -1971,10 +1971,27 @@ const boardWriteItem = boardWriteScope.extend({ id: z.string().min(1, "an item i
  *  value is a `bad-args` error naming the range rather than an opaque non-zero bd exit. */
 const beadPriority = z.number().int().min(0, "priority is 0-4 (0 = highest)").max(4);
 
+/**
+ * `create_item`'s arguments — AND THE EPIC GATE (bead `sparkle-xelans.3`).
+ *
+ * `epicDecision` / `epicReason` are the required-argument half of the founder's ruling: the
+ * concierge cannot file a task without stating whether it belongs under an epic, and why. The
+ * enforcement is REAL — `board.createItem` refuses and files nothing without them — but it lives in
+ * the DOMAIN rather than in this schema, and the `.optional()` below is that decision, not laxity.
+ *
+ * WHY. Dispatch preflights every call against this schema (see `dispatchConciergeTool`'s GATE 2), so
+ * a `z.string()` here would answer a missing decision with `bad-args: \`epicDecision\`: Required`
+ * and nothing else. The bead's whole point is that the refusal COMPUTES AND RETURNS CANDIDATE
+ * EPICS — "a refusal that just says required teaches nothing" — and candidates need a store read,
+ * which a zod message cannot do. So the parse is lenient by exactly two fields and the domain owns
+ * the verdict. `.strict()` still applies: a misspelled `epic_decision` is refused, not ignored.
+ */
 const createItemArgs = boardWriteScope.extend({
   title: z.string().min(1, "a title is required"),
   body: z.string().optional(),
   priority: beadPriority.optional(),
+  epicDecision: z.string().optional(),
+  epicReason: z.string().optional(),
 });
 
 /** At least one field must actually change — `.refine` rather than all-optional, so an empty update
@@ -2057,7 +2074,13 @@ const BOARD_ROUTES: Record<BoardOp, Handler> = {
   // The writes resolve through `withProject` — no store fallback. See boardWriteScope.
   create_item: route(createItemArgs, (a, ctx) =>
     withProject(ctx, a.projectId, async (p) =>
-      fromBoard(ctx, await createItem(p.rootPath, a.title, a.body ?? "", a.priority)),
+      fromBoard(
+        ctx,
+        await createItem(p.rootPath, a.title, a.body ?? "", a.priority, {
+          decision: a.epicDecision,
+          reason: a.epicReason,
+        }),
+      ),
     ),
   ),
   update_item: route(updateItemArgs, (a, ctx) =>

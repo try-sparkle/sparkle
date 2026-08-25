@@ -24,7 +24,6 @@ import {
   listBeads,
   beadShow,
   blockedBeadIds,
-  createBead,
   claimBead,
   closeBead,
   labelBead,
@@ -33,6 +32,7 @@ import {
   bucketBeads,
   columnFor,
   childrenOf,
+  isEpic,
   isBeadsUnavailable,
   type Bead,
 } from "../beads";
@@ -49,11 +49,22 @@ import {
 // refusal message. `isBeadsError` below is what keeps that from happening.
 import {
   beadsComment,
+  beadsCreate,
   beadsDetail,
   isBeadsError,
   type BeadComment,
   type BeadsError,
 } from "../beadsCommands";
+// THE EPIC GATE (bead `sparkle-xelans.3`). Both modules are PURE — the parser reads the model's
+// answer, the scorer ranks what `services/beads`' one epic resolver hands it — so this file stays
+// the only place that touches the store.
+import {
+  EPIC_DECISION_SYNTAX,
+  formatEpicDecisionComment,
+  parseEpicDecision,
+  type EpicDecision,
+} from "./epicDecision";
+import { candidateEpics, describeCandidates, type EpicCandidate } from "./epicCandidates";
 
 // ---------------------------------------------------------------------------------------------
 // The operation surface
@@ -335,33 +346,217 @@ export async function listComments(
 // ---------------------------------------------------------------------------------------------
 
 /**
- * File a work item.
+ * What the caller answered about epics, exactly as it arrived. Both fields are `string | undefined`
+ * rather than required strings because the WHOLE POINT is that a missing answer is a REFUSAL THIS
+ * DOMAIN PRODUCES — see {@link createItem}.
+ */
+export interface EpicDecisionArgs {
+  /** `<existing-epic-id>` | `new:<title>` | `none`. */
+  decision?: string;
+  /** One line saying WHY. Recorded as a comment on the bead that gets created. */
+  reason?: string;
+}
+
+/** What `create_item` returns. The epic fields are part of the RESULT, not just of the call, so the
+ *  concierge can say what it actually did rather than what it asked for. */
+export interface CreatedItemView {
+  id: string;
+  /** The epic this bead was filed under, read back off the created row. `null` for `none`. */
+  parent: string | null;
+  epicDecision: EpicDecision["kind"];
+  /** True when this create minted the epic named in `parent`. */
+  epicCreated: boolean;
+  /** Whether the decision's reason actually landed on the bead as a comment. Reported rather than
+   *  thrown: the bead exists either way, and a caller told "filed" while the record was lost would
+   *  never know to re-add it. */
+  reasonRecorded: boolean;
+}
+
+/** How the refusals below open, so the three of them cannot drift into three explanations of one
+ *  rule. */
+const EPIC_GATE_PREAMBLE =
+  "Every task needs an explicit epic decision before it can be filed — pass `epicDecision` as " +
+  `${EPIC_DECISION_SYNTAX}, plus a one-line \`epicReason\`. ` +
+  "`none` is a perfectly good answer and nothing is wrong with it; the reason is recorded on the " +
+  "bead so the choice is a decision rather than a default.";
+
+/** Best-effort candidate epics for a refusal. NEVER throws: this runs on a path that is already
+ *  refusing, and a store read that failed must degrade to "no suggestions" rather than replace the
+ *  refusal the caller needs to see with a different error. */
+async function candidatesFor(
+  projectPath: string,
+  title: string,
+  body: string,
+): Promise<EpicCandidate[]> {
+  try {
+    return candidateEpics(await listBeads(projectPath), { title, body });
+  } catch {
+    return [];
+  }
+}
+
+function refuseEpicGate(reason: string, message: string, candidates: readonly EpicCandidate[]) {
+  const listed = describeCandidates(candidates);
+  return refuse(
+    "create_item",
+    reason,
+    listed
+      ? `${message}\n\nExisting epics that look related to this item:\n${listed}`
+      : `${message} I could not find an existing epic that looks related, so \`new:<title>\` or ` +
+        "`none` are the live options.",
+  );
+}
+
+/**
+ * File a work item — BEHIND THE EPIC GATE (bead `sparkle-xelans.3`).
  *
- * `priority` is bd's 0-4 (0 = highest) and is OPTIONAL — omitting it leaves bd's default, which is
- * what every existing caller gets. It is here because filing was the one place priority could not
- * be expressed at all, so nothing that decides how urgent a finding is had anywhere to write it.
+ * ══ WHY THIS FUNCTION REFUSES ═════════════════════════════════════════════════════════════════
+ * The founder asked the concierge to use epics better; it agreed and did not. His ruling was that
+ * the fix is an ENFORCEMENT MECHANISM, not a promise: "a prompt instruction can be ignored, a
+ * required argument cannot". So `epic.decision` is required HERE, in the domain, and not merely in
+ * the registry's zod schema — a zod `Required` error is minted by dispatch's preflight and CANNOT
+ * carry the candidate epics, and a refusal that only says "required" is exactly the refusal that
+ * teaches nothing. The registry therefore parses the two fields leniently and lets this refuse.
  *
- * `number | null | undefined` for the reason `services/beads.ts::createBead` documents: the value
- * crosses into a Rust `Option<i64>`, and that shape travels as an explicit `null`.
+ * The gate is adversarial in ONE direction only. `none` is first-class and unshamed — not every
+ * bead needs an epic — and it is the RECORDED REASON that makes the answer a decision. That comment
+ * is why `reason` is required for `none` too.
+ *
+ * ══ WHY `beadsCreate` AND NOT `createBead` ════════════════════════════════════════════════════
+ * `services/beads.createBead` has no `parent` argument, so it cannot express two of the three
+ * answers. `beadsCreate` can, and it is the same seam `plans.createPlan` already chose for the same
+ * reason: it PROBES the store for the row before reporting anything, so the `parent` this returns
+ * is read off the created bead rather than echoed back from the request.
+ *
+ * `priority` is bd's 0-4 (0 = highest) and stays OPTIONAL — omitting it leaves bd's default.
+ * `number | null | undefined` is preserved from the previous signature; it crosses to bd as a
+ * string because that is what `NewBead` takes.
  */
 export async function createItem(
   projectPath: string,
   title: string,
   body: string,
-  priority?: number | null,
-): Promise<BoardResult<{ id: string }>> {
+  priority: number | null | undefined,
+  epic: EpicDecisionArgs,
+): Promise<BoardResult<CreatedItemView>> {
+  const decision = parseEpicDecision(epic.decision);
+  if (!decision) {
+    const given = (epic.decision ?? "").trim();
+    return refuseEpicGate(
+      "epic-decision-required",
+      given
+        ? `I can't read "${given}" as an epic decision. ${EPIC_GATE_PREAMBLE}`
+        : EPIC_GATE_PREAMBLE,
+      await candidatesFor(projectPath, title, body),
+    );
+  }
+
+  const reason = (epic.reason ?? "").trim();
+  if (!reason) {
+    return refuse(
+      "create_item",
+      "epic-reason-required",
+      "`epicDecision` is set but `epicReason` is empty, so nothing would be recorded about why — " +
+        "and the recorded reason is the whole point of asking. Say in one line why this item " +
+        (decision.kind === "none"
+          ? "does not belong under an epic."
+          : "belongs under that epic."),
+    );
+  }
+
+  // ONE store read answers BOTH questions a named epic raises — does it exist, and is it an epic —
+  // because they are the same list, and a second `bd list` on the create path is seconds. Read only
+  // on this branch: `none` and `new:` name nothing to look up, and must not pay for a list.
+  if (decision.kind === "existing") {
+    const read = await attempt("create_item", () => listBeads(projectPath));
+    if (!read.ok) return read;
+    const store = read.data;
+    const target = store.find((b) => b.id === decision.epicId);
+    if (!target) {
+      return refuseEpicGate(
+        "unknown-epic",
+        `There is no bead called \`${decision.epicId}\` in this project, so I can't file under it.`,
+        candidateEpics(store, { title, body }),
+      );
+    }
+    if (!isEpic(store, target)) {
+      return refuseEpicGate(
+        "not-an-epic",
+        `\`${decision.epicId}\` ("${target.title}") isn't an epic — it has no children and isn't ` +
+          "typed `epic`, so parenting a task under it would invent a hierarchy nobody declared. " +
+          "Pick a real epic, or `new:<title>` to open one.",
+        candidateEpics(store, { title, body }),
+      );
+    }
+  }
+
+  // `new:` mints the epic FIRST and separately: an epic that exists with no child is a plan nobody
+  // has broken down yet (a normal state `isEpic` deliberately admits), whereas a task parented to an
+  // id that was never created is a broken edge. Failing between the two is therefore recoverable.
+  let epicId: string | null = null;
+  let epicCreated = false;
+  if (decision.kind === "existing") epicId = decision.epicId;
+  if (decision.kind === "new") {
+    const madeEpic = await attempt("create_item", () =>
+      beadsCreate(projectPath, {
+        title: decision.title,
+        description: `Opened while filing "${title}". ${reason}`,
+        issueType: "epic",
+      }),
+    );
+    if (!madeEpic.ok) return madeEpic;
+    if (!madeEpic.data?.id) {
+      return refuse(
+        "create_item",
+        "create-failed",
+        "`bd create` ran for the new epic but didn't return an issue id, so I stopped before " +
+          "filing a task under an epic I can't name.",
+      );
+    }
+    epicId = madeEpic.data.id;
+    epicCreated = true;
+  }
+
   const created = await attempt("create_item", () =>
-    createBead(projectPath, title, body, undefined, priority),
+    beadsCreate(projectPath, {
+      title,
+      description: body,
+      // `!= null`, not truthiness: priority 0 is bd's HIGHEST and is the one value a truthiness
+      // test silently drops.
+      priority: priority != null ? String(priority) : undefined,
+      parent: epicId ?? undefined,
+    }),
   );
   if (!created.ok) return created;
-  if (!created.data) {
+  if (!created.data?.id) {
     return refuse(
       "create_item",
       "create-failed",
       "`bd create` ran but didn't return an issue id, so I can't confirm the item was filed.",
     );
   }
-  return ok("create_item", { id: created.data });
+
+  // THE DURABLE HALF. Attempted after the bead exists and never allowed to undo it — a failed
+  // comment is reported through `reasonRecorded`, not raised as a create failure, because a caller
+  // that retried on it would file the item twice.
+  let reasonRecorded = true;
+  try {
+    await beadsComment(
+      projectPath,
+      created.data.id,
+      formatEpicDecisionComment({ decision, epicId, epicCreated, reason }),
+    );
+  } catch {
+    reasonRecorded = false;
+  }
+
+  return ok("create_item", {
+    id: created.data.id,
+    parent: created.data.parent ?? null,
+    epicDecision: decision.kind,
+    epicCreated,
+    reasonRecorded,
+  });
 }
 
 /** What `update_item` may change. Every field is optional; at least one must be present, which the

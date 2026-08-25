@@ -714,11 +714,53 @@ fn classify_not_answering(timed_out: bool, ev: DaemonEvidence) -> (HealthState, 
 
 /// Pull the `Jobs:` line out of `roborev status` for the panel detail, e.g.
 /// "14 queued, 4 running, 15488 completed". Best-effort — an empty string if the line is absent.
+///
+/// The `N failed` term is QUALIFIED on the way through — see {@link qualify_failed_term}. Doing it
+/// here rather than at each call site is deliberate: this is the one function that turns that line
+/// into panel text, so there is no second path by which a bare count can reach a human.
 fn jobs_summary(out: &str) -> String {
     out.lines()
         .find(|l| l.trim_start().starts_with("Jobs:"))
-        .map(|l| l.trim_start().trim_start_matches("Jobs:").trim().to_string())
+        .map(|l| qualify_failed_term(l.trim_start().trim_start_matches("Jobs:").trim()))
         .unwrap_or_default()
+}
+
+/// The caveat stapled to a NON-ZERO `failed` count. Kept as a constant because the test asserts on
+/// the words "not review verdicts": the point of the sentence is to say what the number is NOT.
+const FAILED_TERM_CAVEAT: &str =
+    "cumulative; mostly jobs whose worktree vanished, not review verdicts";
+
+/// Qualify the `N failed` term of a `Jobs:` line, and ONLY that term.
+///
+/// WHY (bead `sparkle-xelans.11`): `roborev status` reports a CUMULATIVE `N failed`, and this panel
+/// published it verbatim. Measured against the real store on 2026-08-24, 3061 of 4509 failed rows
+/// (67.9%) died with `chdir <path>: no such file or directory` — jobs that never entered a repo, so
+/// they never opened a diff and never reached a verdict. They are infrastructure casualties,
+/// overwhelmingly deleted temp repos from this repo's own test suites. A human reading "4385 failed"
+/// in a health panel reads it as a review-failure RATE, which is how two months of deleted temp
+/// dirs became a standing alarm.
+///
+/// Two properties the tests pin, both of which are easy to get wrong in opposite directions:
+///   • The number is NOT suppressed. Hiding it would trade one wrong reading for no data at all.
+///   • The caveat is DERIVED from the value, never stapled on unconditionally. On a daemon with
+///     `0 failed` nothing was abandoned, so claiming otherwise would be its own lie.
+/// And it must not leak onto `queued` / `running` / `completed` / `skipped`, which were never
+/// ambiguous — so this rewrites one term rather than appending to the line.
+fn qualify_failed_term(summary: &str) -> String {
+    summary
+        .split(',')
+        .map(|term| {
+            let term = term.trim();
+            match term.strip_suffix(" failed") {
+                // `0 failed` (and any unparseable count) is left exactly as it was.
+                Some(count) if count.trim().parse::<u64>().is_ok_and(|n| n > 0) => {
+                    format!("{term} ({FAILED_TERM_CAVEAT})")
+                }
+                _ => term.to_string(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// First non-empty line of a possibly-multiline tool message, trimmed — so a panel detail is one
@@ -3170,6 +3212,82 @@ mod tests {
         assert_eq!(state, HealthState::Healthy, "a running, OK daemon is green");
         assert!(detail.contains("14 queued"), "the panel detail carries the queue: {detail}");
         assert!(detail.contains("15488 completed"), "{detail}");
+    }
+
+    // ── THE `failed` TERM IS NOT A REVIEW-FAILURE COUNT (bead `sparkle-xelans.11`) ──────────────
+    //
+    // `roborev status`'s `Jobs:` line ends in a CUMULATIVE `N failed`, and this panel used to
+    // publish it verbatim. Measured against the real store on 2026-08-24: 3061 of 4509 failed rows
+    // (67.9%) died with `chdir <path>: no such file or directory`, and EVERY ENOENT failure in the
+    // store was that shape. Those jobs never entered a repo, so they never opened a diff and never
+    // reached a verdict — they are infrastructure casualties, overwhelmingly deleted temp repos
+    // from this repo's own test suites. A human reading "4385 failed" in a health panel reads it as
+    // a review-failure rate, which is how two months of deleted temp dirs became an alarm.
+
+    /// THE SIDE EFFECT. A positive `failed` count may still be shown — it is real data — but it
+    /// must never reach the panel BARE, because the bare number is the thing that gets misread.
+    #[test]
+    fn a_positive_failed_count_never_reaches_the_panel_unqualified() {
+        let (state, detail) =
+            classify_roborev(&StatusProbe::Text(healthy_status()), DaemonEvidence::loaded(Some(true)));
+        assert_eq!(state, HealthState::Healthy, "{detail}");
+        // The number is not suppressed — suppressing it would trade one wrong reading for no data.
+        let idx = detail
+            .find("4385 failed")
+            .unwrap_or_else(|| panic!("the failed count should still be published: {detail}"));
+        let after = &detail[idx + "4385 failed".len()..];
+        assert!(
+            after.starts_with(" ("),
+            "the cumulative failed count reached the panel BARE, where it reads as a \
+             review-failure rate: {detail}"
+        );
+        assert!(
+            after.to_lowercase().contains("not review verdicts"),
+            "the caveat must say what the number is NOT, in words: {detail}"
+        );
+    }
+
+    /// THE PAIRED NEGATIVE. Without this, the test above also passes for a version that staples the
+    /// caveat on unconditionally — which would be its own lie, claiming abandoned jobs exist on a
+    /// daemon that has none. The qualifier must be DERIVED from the value.
+    #[test]
+    fn a_zero_failed_count_carries_no_caveat() {
+        let out = "Daemon: running (uptime: 3m) [v0.53.1]\n\
+                   Health: OK\n\
+                   Jobs: 1 queued, 0 running, 42 completed, 0 failed, 0 skipped\n"
+            .to_string();
+        let (_, detail) =
+            classify_roborev(&StatusProbe::Text(out), DaemonEvidence::loaded(Some(true)));
+        assert!(detail.contains("0 failed"), "the term is still reported: {detail}");
+        assert!(
+            !detail.to_lowercase().contains("not review verdicts"),
+            "nothing failed, so nothing was abandoned — the caveat must not appear: {detail}"
+        );
+    }
+
+    /// The rewrite must touch ONLY the `failed` term. A caveat that leaked onto `completed` or
+    /// `queued` would corrupt the one part of this line that was never ambiguous.
+    #[test]
+    fn qualifying_the_failed_term_leaves_every_other_queue_term_intact() {
+        let out = "Daemon: running (uptime: 3m 54s) [v0.53.1]\n\
+                   Workers: 4/4 active\n\
+                   Jobs:    14 queued, 4 running, 15488 completed, 3437 failed, 0 skipped\n\
+                   \n\
+                   Health: OK\n  + database: healthy\n"
+            .to_string();
+        let (_, detail) =
+            classify_roborev(&StatusProbe::Text(out), DaemonEvidence::loaded(Some(true)));
+        for term in ["14 queued", "4 running", "15488 completed", "0 skipped"] {
+            let i = detail
+                .find(term)
+                .unwrap_or_else(|| panic!("{term} should survive verbatim: {detail}"));
+            let after = &detail[i + term.len()..];
+            assert!(
+                !after.starts_with(" ("),
+                "the caveat leaked onto `{term}`, which was never ambiguous: {detail}"
+            );
+        }
+        assert!(detail.contains("3437 failed ("), "the failed term is the one qualified: {detail}");
     }
 
     /// A running daemon that reports a non-OK health (a sick subsystem) is degraded → WARNING, not

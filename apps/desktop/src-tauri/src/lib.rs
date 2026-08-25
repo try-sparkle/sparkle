@@ -23,6 +23,7 @@ mod babysit_lease;
 /// See `docs/bead-dedupe-contract.md` §6 and the module docs.
 mod bead_dup;
 mod beads_cmd;
+mod epic_prd;
 /// Recovering the paths of a drag whose Tauri event carried none — wry reads only the deprecated
 /// `NSFilenamesPboardType`, so a modern-only drag source drops silently. See the module docs.
 mod drag_paths;
@@ -1664,6 +1665,16 @@ pub fn run() {
             beads_cmd::beads_update,
             beads_cmd::beads_close,
             beads_cmd::beads_comment,
+            // An epic's PRD path as structured bd metadata rather than prose scraped out of the
+            // description (bead `sparkle-xelans.5`). See epic_prd.rs for why this is metadata and
+            // not the persisted-store shape `epicGoal` picked.
+            epic_prd::set_epic_prd,
+            epic_prd::list_epic_prd,
+            // Re-parent a SET of beads onto an epic in ONE bd invocation, or off their epic
+            // when `parent` is empty (bead sparkle-xelans.2). Same registration hazard as
+            // every line here — an unregistered command still compiles clean and fails only
+            // at runtime; `scripts/lib/tauri-handler-guard.sh` is the check.
+            beads_cmd::beads_reparent,
             ai::anthropic_chat,
             // The planner's model id, so the second-model advisor pass can resolve a DIFFERENT one
             // rather than hardcoding a copy of it (bead `sparkle-revqiv`).

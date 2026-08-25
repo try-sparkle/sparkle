@@ -178,7 +178,11 @@ pub struct BeadsError {
 }
 
 impl BeadsError {
-    fn new(kind: BeadsErrorKind, message: impl Into<String>) -> Self {
+    // `pub(crate)` rather than private: `epic_prd` is a sibling module that constructs the same
+    // error type, and a private constructor forced it to either duplicate the struct literal —
+    // which would bypass the `excerpt` truncation every other error goes through — or invent a
+    // second error type. One error type, one constructor, one truncation rule.
+    pub(crate) fn new(kind: BeadsErrorKind, message: impl Into<String>) -> Self {
         Self { kind, message: excerpt(&message.into(), ERROR_MESSAGE_CHARS).0, exit_code: None }
     }
     fn with_code(kind: BeadsErrorKind, message: impl Into<String>, code: Option<i32>) -> Self {
@@ -449,6 +453,38 @@ fn build_close_args(id: &str, reason: &str) -> Vec<String> {
     if !reason.trim().is_empty() {
         push_flag(&mut args, "--reason", reason);
     }
+    args
+}
+
+/// Assemble the argv for a REPARENT — `bd update <id>... --parent <epic>`. Pure, so the one
+/// property that matters (every selected id rides ONE invocation) is assertable without bd.
+///
+/// ══ ONE CALL, N IDS — AND THAT IS THE CONTRACT, NOT AN OPTIMISATION ═══════════════════════════
+/// `bd update` takes MULTIPLE positional ids and applies the same flags to all of them; verified
+/// against bd directly on three throwaway ephemeral wisps before this was written (`bd update A B
+/// --parent E` answered with one `✓ Updated issue` line per id, and `bd show A --json` then carried
+/// `"parent": "E"` plus a `parent-child` dependency edge). A per-id loop would be N separate
+/// mutations against a single embedded store that every worktree shares and this app polls every
+/// five seconds — so a failure halfway leaves the board holding HALF a move with nothing saying
+/// which half, and the poll can land between two of them and paint an epic mid-assembly.
+///
+/// ══ AN EMPTY PARENT IS THE UNPARENT PATH, AND IT MUST SURVIVE THE ASSEMBLY ════════════════════
+/// bd documents `--parent` as *"New parent issue ID (reparents the issue, use empty string to
+/// remove parent)"* — so the empty string is a VALUE here, never an omission. That is exactly where
+/// `build_update_args` cannot be reused: it filters an empty value out entirely
+/// (`.filter(|s| !s.is_empty())`), which would turn "take these off their epic" into an argv with
+/// no flags at all and then reject it as an empty patch. The precedent for passing an empty flag
+/// value deliberately is `notes::bead_unclaim_args`' `-a ""`, and it is verified the same way: `bd
+/// update A B --parent ""` cleared `parent` on both wisps and dropped the dependency edge.
+///
+/// The parent is TRIMMED but not otherwise altered, so `"  "` reads as "remove the parent" rather
+/// than as a bead named two spaces. The ids are charset-checked by the caller (`require_id`), which
+/// is what stops one being re-read as a flag.
+fn build_reparent_args(ids: &[String], parent: &str) -> Vec<String> {
+    let mut args: Vec<String> = vec!["update".into()];
+    args.extend(ids.iter().cloned());
+    args.push("--parent".into());
+    args.push(parent.trim().to_string());
     args
 }
 
@@ -1397,6 +1433,50 @@ fn update_bead(
     bd_ack(project_path, &args, env)
 }
 
+/// Re-parent a SET of beads onto one epic — or off any epic, when `parent` is empty.
+///
+/// The write half of epic membership. bd has supported this the whole time; the app had no path to
+/// it, so beads filed weeks apart could never be gathered under the theme that connects them once
+/// it became clear (bead `sparkle-xelans.2`, founder: *"I want the individual beads to be able to
+/// be consolidated into a larger epic"*).
+///
+/// EVERY ID IS VALIDATED BEFORE ANYTHING IS SENT, which is a stronger guarantee than validating as
+/// we go: a bad id in the middle of the list would otherwise be discovered only after bd had
+/// already been handed the whole batch. `parent` is validated too whenever it is non-empty — an
+/// empty one is the unparent path and has no id to check.
+///
+/// A bead may not be its own parent. bd does not forbid the cycle (`descendantsOf` in
+/// `services/beads.ts` is cycle-safe precisely because of that), so a self-parent would be accepted
+/// and would then render as an epic containing itself. Refused here rather than downstream, where
+/// it is a data repair rather than a rejected input.
+fn reparent_beads(
+    project_path: &str,
+    ids: &[String],
+    parent: &str,
+    env: ChildEnv<'_>,
+) -> Result<(), BeadsError> {
+    if ids.is_empty() {
+        return Err(BeadsError::new(
+            BeadsErrorKind::InvalidInput,
+            "no beads selected — nothing to re-parent",
+        ));
+    }
+    for id in ids {
+        require_id(id)?;
+    }
+    let parent = parent.trim();
+    if !parent.is_empty() {
+        require_id(parent)?;
+        if let Some(hit) = ids.iter().find(|id| id.as_str() == parent) {
+            return Err(BeadsError::new(
+                BeadsErrorKind::InvalidInput,
+                format!("a bead cannot be its own parent: {hit}"),
+            ));
+        }
+    }
+    bd_ack(project_path, &build_reparent_args(ids, parent), env)
+}
+
 fn close_bead(project_path: &str, id: &str, reason: &str, env: ChildEnv<'_>) -> Result<(), BeadsError> {
     require_id(id)?;
     bd_ack(project_path, &build_close_args(id, reason), env)
@@ -1455,6 +1535,17 @@ pub async fn beads_update(
     blocking(move || update_bead(&project_path, &id, &patch, NO_EXTRA_ENV)).await
 }
 
+/// Move a SET of beads under one epic in a single `bd update`, or off their epic when `parent` is
+/// the empty string. See [`reparent_beads`]; the batching is the contract, not a shortcut.
+#[tauri::command]
+pub async fn beads_reparent(
+    project_path: String,
+    ids: Vec<String>,
+    parent: String,
+) -> Result<(), BeadsError> {
+    blocking(move || reparent_beads(&project_path, &ids, &parent, NO_EXTRA_ENV)).await
+}
+
 /// Close a bead with a reason. The reason is bd's own close-reason field, not a comment.
 #[tauri::command]
 pub async fn beads_close(
@@ -1473,6 +1564,47 @@ pub async fn beads_comment(
     text: String,
 ) -> Result<(), BeadsError> {
     blocking(move || comment_bead(&project_path, &id, &text, NO_EXTRA_ENV)).await
+}
+
+// ── Seams for `epic_prd.rs` ───────────────────────────────────────────────────────────────────
+//
+// `epic_prd` writes and reads ONE bd metadata key and lives in its own module (bead
+// `sparkle-xelans.5`), but it must reach bd exactly the way every command here does — through the
+// same concurrency permit, the same BD_TIMEOUT, the same typed error classification and the same
+// blocking pool. Hand-rolling any of that in another module is how a second, unbounded bd path
+// gets built; these three wrappers hand it the real ones instead. Thin and additive on purpose:
+// they widen visibility without moving a line of the code above them.
+
+/// [`bd_stdout`] for `epic_prd`'s read.
+pub(crate) fn bd_stdout_for_epic_prd(
+    project_path: &str,
+    args: &[String],
+    env: ChildEnv<'_>,
+) -> Result<String, BeadsError> {
+    bd_stdout(project_path, args, env)
+}
+
+/// [`bd_ack`] for `epic_prd`'s write — checks bd's acknowledgement rather than only its exit code.
+pub(crate) fn bd_ack_for_epic_prd(
+    project_path: &str,
+    args: &[String],
+    env: ChildEnv<'_>,
+) -> Result<(), BeadsError> {
+    bd_ack(project_path, args, env)
+}
+
+/// [`require_id`] for `epic_prd`, so both surfaces reject a flag-like id on the SAME charset.
+pub(crate) fn require_id_for_epic_prd(id: &str) -> Result<(), BeadsError> {
+    require_id(id)
+}
+
+/// [`blocking`] for `epic_prd`, so its commands never occupy the async runtime either.
+pub(crate) async fn blocking_for_epic_prd<T, F>(f: F) -> Result<T, BeadsError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, BeadsError> + Send + 'static,
+{
+    blocking(f).await
 }
 
 #[cfg(test)]
@@ -2164,7 +2296,9 @@ pub(crate) mod tests {
         // shape bd uses elsewhere (`show`, `create`) arriving here on a version or subcommand that
         // does the same. Hence the same include_str! guard the lib.rs registration test uses.
         let src = include_str!("beads_cmd.rs");
-        for op in ["fn update_bead(", "fn close_bead(", "fn comment_bead("] {
+        for op in
+            ["fn update_bead(", "fn close_bead(", "fn comment_bead(", "fn reparent_beads("]
+        {
             let from = src.find(op).unwrap_or_else(|| panic!("{op} still exists"));
             let body = &src[from..];
             let body = &body[..body.find("\n}\n").expect("the fn body ends")];
@@ -2527,6 +2661,70 @@ pub(crate) mod tests {
         assert!(!is_missing_issue("no beads database found"));
         assert!(!is_missing_issue("database is locked"));
         assert!(!is_missing_issue(""));
+    }
+
+    // ── Re-parenting a SET of beads onto an epic (bead sparkle-xelans.2) ───────────────────
+
+    #[test]
+    fn a_reparent_carries_every_selected_id_in_one_invocation() {
+        // THE side effect this whole feature is: N beads, ONE `bd update`. A per-id loop would
+        // still make the board look right and would still pass any test that only checked the
+        // parent flag, so the assertion is on the SHAPE of the single argv — every id present, in
+        // order, ahead of the flag.
+        let ids: Vec<String> =
+            ["sparkle-a1", "sparkle-b2", "sparkle-c3"].iter().map(|s| s.to_string()).collect();
+        let args = build_reparent_args(&ids, "sparkle-epic");
+        assert_eq!(
+            args,
+            vec!["update", "sparkle-a1", "sparkle-b2", "sparkle-c3", "--parent", "sparkle-epic"]
+        );
+    }
+
+    #[test]
+    fn an_empty_parent_survives_the_assembly_as_the_unparent_value() {
+        // bd's documented "use empty string to remove parent". The hazard is a copy of
+        // `build_update_args`' empty-value filter arriving here, which would silently turn "take
+        // these off their epic" into an argv with no `--parent` at all.
+        for blank in ["", "   "] {
+            let ids = vec!["sparkle-a1".to_string()];
+            let args = build_reparent_args(&ids, blank);
+            assert_eq!(args, vec!["update", "sparkle-a1", "--parent", ""], "blank {blank:?}");
+        }
+        // …and a real parent is trimmed rather than passed with its whitespace.
+        let ids = vec!["sparkle-a1".to_string()];
+        assert_eq!(build_reparent_args(&ids, "  sparkle-epic  ")[3], "sparkle-epic");
+    }
+
+    #[test]
+    fn a_reparent_refuses_the_inputs_bd_would_misread_or_corrupt() {
+        // Nothing here reaches bd: every arm returns before the process is spawned, so these run
+        // on a machine with no bd at all.
+        let empty: Vec<String> = vec![];
+        assert_eq!(
+            reparent_beads("/proj", &empty, "sparkle-epic", NO_EXTRA_ENV).unwrap_err().kind,
+            BeadsErrorKind::InvalidInput,
+            "an empty selection must not shell out to change nothing"
+        );
+        // A flag-like id anywhere in the batch — including the LAST slot, which a validate-as-you-go
+        // implementation would only discover after bd had the whole list.
+        let hostile: Vec<String> = vec!["sparkle-a1".into(), "--force".into()];
+        assert_eq!(
+            reparent_beads("/proj", &hostile, "sparkle-epic", NO_EXTRA_ENV).unwrap_err().kind,
+            BeadsErrorKind::InvalidInput
+        );
+        // A flag-like PARENT.
+        let ok: Vec<String> = vec!["sparkle-a1".into()];
+        assert_eq!(
+            reparent_beads("/proj", &ok, "--parent", NO_EXTRA_ENV).unwrap_err().kind,
+            BeadsErrorKind::InvalidInput
+        );
+        // A bead may not be its own parent — bd would accept the cycle and render an epic that
+        // contains itself.
+        let selfish: Vec<String> = vec!["sparkle-a1".into(), "sparkle-epic".into()];
+        assert_eq!(
+            reparent_beads("/proj", &selfish, "sparkle-epic", NO_EXTRA_ENV).unwrap_err().kind,
+            BeadsErrorKind::InvalidInput
+        );
     }
 
     #[test]

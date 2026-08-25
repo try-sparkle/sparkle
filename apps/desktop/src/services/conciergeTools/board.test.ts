@@ -9,7 +9,6 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 const listBeads = vi.fn();
 const blockedBeadIds = vi.fn();
 const beadShow = vi.fn();
-const createBead = vi.fn();
 const claimBead = vi.fn();
 const closeBead = vi.fn();
 const labelBead = vi.fn();
@@ -25,7 +24,6 @@ vi.mock("../beads", async (importOriginal) => {
     listBeads: (...a: unknown[]) => listBeads(...a),
     blockedBeadIds: (...a: unknown[]) => blockedBeadIds(...a),
     beadShow: (...a: unknown[]) => beadShow(...a),
-    createBead: (...a: unknown[]) => createBead(...a),
     claimBead: (...a: unknown[]) => claimBead(...a),
     closeBead: (...a: unknown[]) => closeBead(...a),
     labelBead: (...a: unknown[]) => labelBead(...a),
@@ -39,6 +37,7 @@ vi.mock("../beads", async (importOriginal) => {
 // must get right, and stubbing the recogniser would leave the thing under test untested.
 const beadsComment = vi.fn();
 const beadsDetail = vi.fn();
+const beadsCreate = vi.fn();
 
 vi.mock("../beadsCommands", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../beadsCommands")>();
@@ -46,6 +45,7 @@ vi.mock("../beadsCommands", async (importOriginal) => {
     ...actual,
     beadsComment: (...a: unknown[]) => beadsComment(...a),
     beadsDetail: (...a: unknown[]) => beadsDetail(...a),
+    beadsCreate: (...a: unknown[]) => beadsCreate(...a),
   };
 });
 
@@ -79,12 +79,38 @@ function bead(id: string, over: Partial<import("../beads").Bead> = {}): import("
   };
 }
 
+/** A `BeadSummary` as `beadsCreate` returns one — the READ-BACK row, which is what makes asserting
+ *  the created bead's PARENT (rather than the argument we passed) possible at all. */
+function summary(
+  id: string,
+  over: Partial<import("../beadsCommands").BeadSummary> = {},
+): import("../beadsCommands").BeadSummary {
+  return {
+    id,
+    title: `title ${id}`,
+    status: "open",
+    priority: null,
+    issueType: "task",
+    assignee: null,
+    parent: null,
+    labels: [],
+    description: "",
+    descriptionTruncated: false,
+    dependencyCount: 0,
+    dependentCount: 0,
+    commentCount: 0,
+    createdAt: null,
+    updatedAt: null,
+    closedAt: null,
+    ...over,
+  };
+}
+
 beforeEach(() => {
   vi.clearAllMocks();
   listBeads.mockResolvedValue([]);
   blockedBeadIds.mockResolvedValue(new Set<string>());
   beadShow.mockResolvedValue(null);
-  createBead.mockResolvedValue("");
   claimBead.mockResolvedValue(undefined);
   closeBead.mockResolvedValue(undefined);
   labelBead.mockResolvedValue(undefined);
@@ -92,6 +118,9 @@ beforeEach(() => {
   deleteBead.mockResolvedValue(undefined);
   beadsComment.mockResolvedValue(undefined);
   beadsDetail.mockResolvedValue({ comments: [] });
+  beadsCreate.mockImplementation((_root: string, b: { parent?: string }) =>
+    Promise.resolve(summary("", { parent: b.parent ?? null })),
+  );
 });
 
 describe("classification", () => {
@@ -217,33 +246,49 @@ describe("a project without beads is a supported state, not a failure", () => {
 });
 
 describe("writes", () => {
+  // `none` IS A REAL ANSWER, and these tests carry the epic decision because after bead
+  // `sparkle-xelans.3` there is no such thing as a create without one. See board.epicGate.test.ts
+  // for the gate itself.
+  const NONE = { decision: "none", reason: "a one-off chore that belongs to no larger effort" };
+
   it("create_item returns the new id", async () => {
-    const r = await createItem(ROOT, "a task", "body");
-    // No labels, no priority — the shape every existing caller gets, unchanged.
-    expect(createBead).toHaveBeenCalledWith(ROOT, "a task", "body", undefined, undefined);
-    expect(r.ok && r.data).toEqual({ id: "" });
+    const r = await createItem(ROOT, "a task", "body", undefined, NONE);
+    // No priority, no parent — the shape a `none` decision produces.
+    expect(beadsCreate).toHaveBeenCalledWith(ROOT, {
+      title: "a task",
+      description: "body",
+      priority: undefined,
+      parent: undefined,
+    });
+    expect(r.ok && r.data.id).toBe("");
+    expect(r.ok && r.data.parent).toBeNull();
   });
 
   // THE PRIORITY SEAM AT FILING TIME. Before this, priority could not be expressed at create at
-  // all, so a triage rubric had nothing to write through — this assertion is false against that
-  // code, which passed three arguments and no fourth or fifth.
+  // all, so a triage rubric had nothing to write through.
   it("create_item forwards a priority through to the bd create", async () => {
-    await createItem(ROOT, "a task", "body", 2);
-    expect(createBead).toHaveBeenCalledWith(ROOT, "a task", "body", undefined, 2);
+    await createItem(ROOT, "a task", "body", 2, NONE);
+    expect(beadsCreate).toHaveBeenCalledWith(
+      ROOT,
+      expect.objectContaining({ title: "a task", priority: "2" }),
+    );
   });
 
   // Priority 0 is bd's HIGHEST and is the value a truthiness test silently drops — which would make
   // the seam useless for exactly the findings it exists to raise.
   it("create_item forwards priority 0 rather than treating it as absent", async () => {
-    await createItem(ROOT, "urgent", "body", 0);
-    expect(createBead).toHaveBeenCalledWith(ROOT, "urgent", "body", undefined, 0);
+    await createItem(ROOT, "urgent", "body", 0, NONE);
+    expect(beadsCreate).toHaveBeenCalledWith(
+      ROOT,
+      expect.objectContaining({ title: "urgent", priority: "0" }),
+    );
   });
 
   // `bd create` returning something unparseable must not read as a success with no id — the caller
   // would have no handle to the thing it just filed.
   it("refuses when bd creates nothing it can name", async () => {
-    createBead.mockResolvedValue(null);
-    const r = await createItem(ROOT, "a task", "");
+    beadsCreate.mockResolvedValue(summary(""));
+    const r = await createItem(ROOT, "a task", "", undefined, NONE);
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.reason).toBe("create-failed");
   });
