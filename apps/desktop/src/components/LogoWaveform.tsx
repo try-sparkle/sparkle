@@ -11,6 +11,12 @@ import {
   micCaptionKind,
   micIndicatorFor,
 } from "../voice/micPresentation";
+// THE STAGE'S HEIGHT AND THE RING'S DIAMETER LIVE IN A MODULE NOBODY MOCKS. Roughly forty suites
+// stub this component wholesale (`vi.mock("./LogoWaveform", …)`), and a module mock is TOTAL — a
+// constant exported from here is `undefined` in every one of them. `ConciergeColumn` draws the
+// credit pill on top of this stage and has to know where the ring's edge is (bead sparkle-kk9dg.5),
+// so both numbers are shared from there rather than re-typed on each side.
+import { MIC_RING_DIAMETER, WAVE_HEIGHT } from "./waveGeometry";
 import { useDictationStore } from "../stores/dictationStore";
 import { useUiStore } from "../stores/uiStore";
 import {
@@ -36,9 +42,6 @@ import { BoundDeviceCaption } from "./BoundDeviceCaption";
 // rather than a row of chunky blocks. The rAF loop stays cheap even at this count —
 // it shifts one number per frame and React diffs flat <span>s.
 const BAR_COUNT = 140;
-// Overall height of the waveform strip. Bars are mirrored about the vertical center
-// (they grow up AND down from the middle), so a single bar can reach this full height.
-const WAVE_HEIGHT = 56;
 
 /**
  * Map a raw RMS audio level → bar-height fraction in [0,1].
@@ -544,8 +547,11 @@ export function LogoWaveform({ pttHeld = false }: LogoWaveformProps = {}) {
             left: "50%",
             top: "50%",
             transform: "translate(-50%, -50%)",
-            width: 40,
-            height: 40,
+            // FROM `waveGeometry`, not a literal: `ConciergeColumn` positions the credit pill
+            // against this ring's right edge (bead sparkle-kk9dg.5), and two copies of 40 would
+            // drift into a silent overlap the next time the ring is resized.
+            width: MIC_RING_DIAMETER,
+            height: MIC_RING_DIAMETER,
             display: "grid",
             placeItems: "center",
             borderRadius: "50%",

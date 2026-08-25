@@ -49,6 +49,8 @@ import { ProviderUnavailableBanner } from "./ProviderUnavailableBanner";
 import { AiServiceBanner } from "./AiServiceBanner";
 import { BlockedAgentsBanner } from "./BlockedAgentsBanner";
 import { DictationEngineBanner } from "./DictationEngineBanner";
+import { UpdateBanner } from "./UpdateBanner";
+import { StaleBuildBanner } from "./StaleBuildBanner";
 import { ClosePrompt } from "./ClosePrompt";
 import { StatusStrip } from "./StatusStrip";
 import {
@@ -2013,6 +2015,17 @@ export function Workspace() {
           These stay OUTSIDE the pairs. A pair is one project; an offline banner is a statement
           about the machine, so it spans the window rather than living above one project's columns
           (with two pairs it would otherwise have to be drawn twice, saying the same thing). */}
+      {/* THE UPDATER PAIR LEADS THE STACK (bead sparkle-kk9dg.6). Both used to be mounted in
+          App.tsx as `position: fixed; top: 0; z-index: 1000` bars with an opaque background, so
+          they OVERLAID this column rather than joining it — whichever banner below was showing got
+          the top of its sentence painted over. They are ordinary flow children here now, and they
+          lead rather than trail for two reasons: it is where they have always appeared to the user
+          (pinned at the very top of the window), and UpdateBanner's quit-time variant — the bar
+          that tells the user not to press ⌘Q a second time during a bundle swap — is the single
+          most urgent thing the shell can say. Everything below is a condition; that one is a
+          warning about an action in progress. */}
+      <UpdateBanner />
+      <StaleBuildBanner />
       <OfflineBanner />
       <ZeroCreditBanner />
       {/* The WORST-CASE AI bar, and the reason it leads the AI group: a session/usage limit is

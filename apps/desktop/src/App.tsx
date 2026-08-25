@@ -38,8 +38,6 @@ import { useLimitSync } from "./hooks/useLimitSync";
 import { useApiRecovery } from "./services/apiRecoveryRunner";
 import { useDisplayRespan } from "./hooks/useDisplayRespan";
 import { useSettingsShortcut } from "./hooks/useSettingsShortcut";
-import { UpdateBanner } from "./components/UpdateBanner";
-import { StaleBuildBanner } from "./components/StaleBuildBanner";
 import { AccountSwitchHost } from "./components/AccountSwitchHost";
 import { HintOverlay } from "./components/HintOverlay";
 import { DragToUnderstand } from "./components/DragToUnderstand";
@@ -729,8 +727,15 @@ export function App() {
         <AuthGate>
         <SocialSync />
         <AttentionController />
-        <UpdateBanner />
-        <StaleBuildBanner />
+        {/* THE UPDATE / STALE-BUILD BANNERS ARE NOT MOUNTED HERE ANY MORE (bead sparkle-kk9dg.6).
+            They used to sit right here, as siblings of <Workspace/>, each `position: fixed; top: 0;
+            z-index: 1000` with an opaque background — so they did not push the shell down, they
+            painted OVER the top of it, hiding whichever shell banner (OfflineBanner /
+            ZeroCreditBanner / BlockedAgentsBanner / ProviderUnavailableBanner / AiServiceBanner /
+            DictationEngineBanner) happened to be up. Workspace renders them at the head of that same
+            flex column instead, so every simultaneous banner stacks vertically and none is clipped.
+            Nothing is lost by the move: AuthGate only renders these children on the entitled/trial
+            views, which are exactly the views that mount <Workspace/>. */}
         <AccountSwitchHost />
         {/* Workspace is code-split (React.lazy); Suspense holds the first frame while its chunk
             loads. fallback={null} keeps the transition invisible — the authed UI paints its own

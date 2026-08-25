@@ -13,3 +13,16 @@
  *  stage's own height rather than the strip's, so it sits on the bars instead of drifting with the
  *  caption block underneath them. Two copies of `56` would drift the first time one changed. */
 export const WAVE_HEIGHT = 56;
+
+/** Diameter of the mic ring in px — the disc that floats at the CENTRE of the wave stage.
+ *
+ *  Shared for the same reason `WAVE_HEIGHT` is, and for a second one this module's opening line
+ *  already anticipates: the credit pill is drawn on top of the same stage, and it has to know where
+ *  the ring's edge is in order to stay off it (bead sparkle-kk9dg.5 — at ~190px the pill sat 18px
+ *  inside the ring's right edge, measured by `scripts/visual/credit-pill-mic-probe.mjs`).
+ *
+ *  The ring is centred, so its right edge is at `stripWidth / 2 + MIC_RING_DIAMETER / 2`. That is
+ *  the only fact `ConciergeColumn` needs, and a second copy of `40` would drift the first time the
+ *  ring was resized — silently, because the pill would simply start overlapping again at a width
+ *  nobody happened to be looking at. */
+export const MIC_RING_DIAMETER = 40;

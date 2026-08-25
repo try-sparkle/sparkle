@@ -11,7 +11,14 @@ import { FONT_UI } from "../theme/scale";
 //                                         relaunches.
 //   - phase "available" (auto-apply off): the update is found but not downloaded — "Restart to
 //                                         apply" downloads + installs + relaunches.
-// Pinned to the top via position:fixed so it overlays without reflowing the workspace layout.
+// IT SITS IN THE SHELL BANNER STACK, IN NORMAL FLOW (bead sparkle-kk9dg.6). It used to be
+// `position: fixed; top: 0; z-index: 1000` with an opaque background, mounted in App.tsx as a
+// sibling of <Workspace/> — which meant it did not reflow the shell, it COVERED it. Whenever an
+// OfflineBanner / ZeroCreditBanner / BlockedAgentsBanner / ProviderUnavailableBanner /
+// AiServiceBanner / DictationEngineBanner was up, this bar was painted over its top edge and the
+// user read a truncated sentence about being offline or out of credits. Now it is rendered by
+// Workspace at the head of that same flex column, so N simultaneous banners stack vertically and
+// none of them is hidden. See Workspace.bannerStack.test.tsx.
 //
 // THE COPY IS PART OF THE FIX, NOT DECORATION (bead sparkle-1ueh3). This banner used to say the
 // update was "ready — restart to apply now, or it'll apply on next launch", and label the dismiss
@@ -38,12 +45,15 @@ import { FONT_UI } from "../theme/scale";
 // entirely, with no second event able to bring it back. The store now records WHEN it was dismissed
 // and the updater's next poll clears it (updaterService: DISMISS_TTL_MS / expireDismissal).
 
+export const UPDATE_BANNER_TESTID = "update-banner";
+
 const bar: CSSProperties = {
-  position: "fixed",
-  top: 0,
-  left: 0,
-  right: 0,
-  zIndex: 1000,
+  // IN FLOW, deliberately — see the header. `flex: 0 0 auto` matches every other banner in the
+  // shell stack (OfflineBanner et al) so the bar keeps its own height while the workspace below
+  // absorbs the shrink. `position: relative` is NOT a return to out-of-flow positioning: it is only
+  // so the drop shadow paints over the banner stacked directly beneath instead of under it.
+  flex: "0 0 auto",
+  position: "relative",
   display: "flex",
   alignItems: "center",
   gap: 10,
@@ -98,7 +108,7 @@ export function UpdateBanner() {
   // gesture we must not invite is another quit.
   if (quitInstalling) {
     return (
-      <div role="status" aria-live="assertive" style={bar}>
+      <div role="status" aria-live="assertive" style={bar} data-testid={UPDATE_BANNER_TESTID}>
         <FiRefreshCw aria-hidden size={16} style={{ color: C.accentInk, flex: "0 0 auto" }} />
         <span style={{ flex: 1, minWidth: 0 }}>
           {version ? `Installing update ${version}…` : "Installing update…"} Sparkle will quit on
@@ -118,7 +128,7 @@ export function UpdateBanner() {
   const dismissLabel = "Later";
 
   return (
-    <div role="status" aria-live="polite" style={bar}>
+    <div role="status" aria-live="polite" style={bar} data-testid={UPDATE_BANNER_TESTID}>
       <FiDownload aria-hidden size={16} style={{ color: C.accentInk, flex: "0 0 auto" }} />
       <span style={{ flex: 1, minWidth: 0 }}>{message}</span>
       <button

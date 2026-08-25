@@ -7,16 +7,23 @@ import { FONT_UI } from "../theme/scale";
 // "Restart to finish updating" banner (bead sparkle-jeen). Shows when the build INSTALLED on disk
 // differs from the one this process is RUNNING — i.e. an update landed but the old process is still
 // up. Distinct from UpdateBanner (which only knows about updates IT staged this session); this
-// catches the stale process however it got that way. Pinned to the top via position:fixed so it
-// overlays without reflowing the workspace. Amber, to read as "attention" rather than the updater's
-// "new thing available".
+// catches the stale process however it got that way. Amber, to read as "attention" rather than the
+// updater's "new thing available".
+//
+// IT SITS IN THE SHELL BANNER STACK, IN NORMAL FLOW (bead sparkle-kk9dg.6) — it used to be
+// `position: fixed; top: 0; z-index: 1000` with an opaque background, which OVERLAID the shell's
+// banner column (OfflineBanner / ZeroCreditBanner / BlockedAgentsBanner / ProviderUnavailableBanner
+// / AiServiceBanner / DictationEngineBanner) instead of reflowing it, clipping the top of whichever
+// one was showing. Workspace now renders it at the head of that same flex column; see
+// Workspace.bannerStack.test.tsx.
+
+export const STALE_BUILD_BANNER_TESTID = "stale-build-banner";
 
 const bar: CSSProperties = {
-  position: "fixed",
-  top: 0,
-  left: 0,
-  right: 0,
-  zIndex: 1000,
+  // In flow with the rest of the shell banner stack — see the header. `position: relative` only
+  // keeps the drop shadow above the banner stacked below it; it does not take the bar out of flow.
+  flex: "0 0 auto",
+  position: "relative",
   display: "flex",
   alignItems: "center",
   gap: 10,
@@ -71,7 +78,7 @@ export function StaleBuildBanner() {
     : "You're running an older build than the one installed. Restart to finish updating.";
 
   return (
-    <div role="status" aria-live="polite" style={bar}>
+    <div role="status" aria-live="polite" style={bar} data-testid={STALE_BUILD_BANNER_TESTID}>
       <FiAlertTriangle aria-hidden size={16} style={{ color: C.amberInk, flex: "0 0 auto" }} />
       <span style={{ flex: 1, minWidth: 0 }}>{message}</span>
       <button type="button" style={primaryBtn} onClick={() => void restartToFinishUpdate()}>

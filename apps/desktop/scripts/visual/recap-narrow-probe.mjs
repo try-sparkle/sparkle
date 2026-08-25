@@ -351,6 +351,31 @@ export const EDGE_TOLERANCE = 1;
  */
 export const BASELINE_OFFSET_PX = 2;
 
+/* THE WEBKIT READING — recorded here because this probe drives CHROME, and the app does not.
+ *
+ * Every check in this file is a Chrome measurement (162 green across 7 widths). Sparkle ships in a
+ * WKWebView, and the one declaration whose behaviour actually differs between the two engines is
+ * the pairing the truncation rests on: `text-overflow: ellipsis` on a box whose `overflow`
+ * computes to `clip`. `.clip-no-scroll` (index.css) is `hidden` upgraded to `clip` under
+ * `@supports`, and both `AgentPill.NAME_CLIP_CLASS` and `RecapCard.CLIP_CLASS` set `ellipsis` on
+ * top of it. Neither test tier can see it: jsdom has no layout engine and never loads the
+ * stylesheet, and this probe is the wrong browser. So it was measured on WebKit directly.
+ *
+ *   probe   : apps/desktop/scripts/visual/webkit-clip-ellipsis.mjs (run it to re-take the reading)
+ *   date    : 2026-08-24
+ *   engine  : WebKit 26.5 (AppleWebKit/605.1.15), playwright 1.61.1, browser build webkit-2311
+ *   reading : CSS.supports("overflow","clip") true; #a computes `hidden`, #b computes `clip`;
+ *             both screenshots 2187 bytes, BYTE-IDENTICAL; exit 0
+ *   control : with #b's text-overflow forced to `clip` (a hard cut — the failure mode), the same
+ *             comparison reports 2187 vs 2386 bytes, NOT identical. The instrument can fail.
+ *
+ * VERDICT: WebKit paints the ellipsis under `clip` exactly as under `hidden`. The `clip` upgrade
+ * stays; the fallback of reverting those spans to plain `overflow: hidden` — whose cost here was
+ * measured as BASELINE_OFFSET_PX above, 2.00px unchanged, i.e. Δ0.00 —
+ * was not needed and was not taken. A future agent does not need to re-run either probe to know
+ * this; re-run only if the engine, the `@supports` block, or those two consumers change.
+ */
+
 /** Turn one width's measurement into pass/fail claims. Pure, so the rules are readable and
  *  testable without a browser. */
 export function verdictFor(width, m, clicked) {

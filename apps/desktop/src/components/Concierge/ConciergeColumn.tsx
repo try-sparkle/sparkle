@@ -12,7 +12,7 @@
 // exactly as they did there. Routing them through the view-model would have meant teaching the
 // concierge's data layer about the mic and the entitlement for no gain; the column stays a pure
 // renderer of everything it is actually GIVEN.
-import { useMemo, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { CONCIERGE_COLUMN_DND_TARGET } from "../../services/dndTargets";
 import { BLUEPRINT } from "../../theme/blueprintSpec";
 import { C } from "../../theme/colors";
@@ -22,7 +22,7 @@ import { BalanceBadge } from "../BalanceBadge";
 import { LogoWaveform } from "../LogoWaveform";
 // From its own module, NOT from `../LogoWaveform`: ~40 suites mock that component wholesale, and a
 // module mock is total — a constant re-exported from there is `undefined` in every one of them.
-import { WAVE_HEIGHT } from "../waveGeometry";
+import { MIC_RING_DIAMETER, WAVE_HEIGHT } from "../waveGeometry";
 import { SparkleLogoLink } from "../SparkleLogoLink";
 import { ComposeBox } from "./ComposeBox";
 import { PinnedBlockers } from "./PinnedBlockers";
@@ -104,6 +104,82 @@ const CREDIT_BACKDROP_GUTTER = 10;
  *  narrow column, where the bars run the full strip and reach the pill. Judged by eye in a real
  *  capture at 190px and 280px, light and dark — not derived from a number. */
 const CREDIT_BACKDROP_BLUR = 14;
+
+/** How far the credit pill's BORDER BOX sits inside the strip's right edge while it is overlaid.
+ *
+ *  The badge keeps the column's 16px inset; only the backdrop reaches past it by the gutter, so the
+ *  box's own inset is the difference. Named because the placement rule below has to reason about
+ *  where the box's LEFT edge lands, and `16 - CREDIT_BACKDROP_GUTTER` scattered in two places is a
+ *  number that can silently disagree with itself. */
+const CREDIT_PILL_RIGHT_INSET = 16 - CREDIT_BACKDROP_GUTTER;
+
+/** The clear air the credit pill must keep between its box and the mic ring's, in px.
+ *
+ *  Not zero, and the reason is the same one bead sparkle-kk9dg.3 was about one axis over: two boxes
+ *  that merely fail to intersect still read as collided. The pill carries a 14px backdrop blur, so a
+ *  ring one pixel outside its border box is still sitting in the softened region's falloff.
+ *
+ *  8px is a hair over half the blur radius — enough that the ring's 1.5px border is drawn against
+ *  the column, not against the pill's wash. Judged in real captures at 220px and 240px, the two
+ *  widths where the decision actually changes. */
+export const MIC_RING_CLEARANCE_PX = 8;
+
+/** WHERE THE CREDIT PILL GOES at a given painted strip width — the fix for bead sparkle-kk9dg.5.
+ *
+ *  ══ THE DEFECT ═══════════════════════════════════════════════════════════════════════════════
+ *  The pill is `position: absolute; right: CREDIT_PILL_RIGHT_INSET`, which is exactly what the
+ *  founder asked for on the sibling bead — *"do not shrink the waveform to make room"* — and it is
+ *  why it takes zero width from the bars. The mic ring, meanwhile, floats CENTRED on the same
+ *  stage. So as the column narrows the ring's right edge walks left at half the rate the pill's
+ *  left edge does, and below some width they meet. Measured on the unchanged build by
+ *  `scripts/visual/credit-pill-mic-probe.mjs`: at 190px the pill's box started 18px INSIDE the
+ *  ring's right edge, painting the balance over the microphone.
+ *
+ *  ══ WHY THIS IS NOT A WIDTH THRESHOLD ════════════════════════════════════════════════════════
+ *  The obvious fix is `columnWidth < 200 ? hide : show`, and it is wrong twice over.
+ *
+ *  It is wrong because THE PILL'S WIDTH IS NOT A CONSTANT. It renders the balance, so it is as wide
+ *  as the number: the probe's fixture reads `$200.00` and collides from ~242px down, while the
+ *  founder's own screenshot on the parent bead reads `$9972.67`, which is wider and would therefore
+ *  collide at a width a 200px threshold calls safe. A threshold picked against one balance is a
+ *  latent version of the same bug for everyone with a different one. So the rule takes the pill's
+ *  MEASURED width and computes where the two boxes actually meet.
+ *
+ *  And it is wrong because HIDING IS NOT AVAILABLE. `BalanceBadge` is the shell's only "Open
+ *  credits" entry point and the only surface where a top-up done elsewhere shows up — deleting it
+ *  below a width trades a collision for a lost capability, which is a worse defect than the one
+ *  being fixed. The pill therefore MOVES; it never disappears. The probe pins both halves.
+ *
+ *  ══ THE GEOMETRY ═════════════════════════════════════════════════════════════════════════════
+ *  In the strip's own coordinates: the ring is centred, so its right edge is at
+ *  `strip / 2 + MIC_RING_DIAMETER / 2`; the pill's box runs from
+ *  `strip - CREDIT_PILL_RIGHT_INSET - pill` to `strip - CREDIT_PILL_RIGHT_INSET`. Overlaying is
+ *  allowed exactly while the space between them is at least `MIC_RING_CLEARANCE_PX`. Below that the
+ *  pill drops to its OWN ROW under the waveform, right-aligned to the same edge — the strip gets
+ *  taller, and the waveform keeps every pixel it had.
+ *
+ *  ══ 0 MEANS "NOT MEASURED YET" AND TAKES THE OVERLAID FORM ═══════════════════════════════════
+ *  Matching `rowWidthThresholds.stageChipShows` and `ComposeBox.attachShowsLabels`. Booting into
+ *  the reflowed state and pulling the pill back up a frame later is a visible jump in the strip's
+ *  height on every mount; and the overlaid form is the one that is right at every width the app
+ *  actually opens at. */
+export function creditPillPlacement(
+  stripWidthPx: number,
+  pillWidthPx: number,
+): "overlay" | "row" {
+  if (!(stripWidthPx > 0) || !(pillWidthPx > 0)) return "overlay";
+  const ringRight = stripWidthPx / 2 + MIC_RING_DIAMETER / 2;
+  const pillLeft = stripWidthPx - CREDIT_PILL_RIGHT_INSET - pillWidthPx;
+  // `>=`, NOT `<=`. The gap is what the pill has to spare, so overlaying is allowed while there is
+  // AT LEAST the clearance between the two boxes — the sense the block comment above states. The
+  // inverted form reads plausibly and is wrong at both ends at once: it returns "overlay" for the
+  // colliding narrow column (at 190px the gap is -27px, i.e. already overlapping) and "row" for
+  // every wide one (at 480px the gap is +140px and nothing is near the ring), so it would have
+  // shipped the reported defect unfixed AND made the strip taller at every width bead
+  // sparkle-kk9dg.3 was about. Every assertion in ConciergeColumn.creditPillNarrow.test.tsx fails
+  // against the flipped operator, which is what caught it.
+  return pillLeft - ringRight >= MIC_RING_CLEARANCE_PX ? "overlay" : "row";
+}
 
 /** `--t-title` — the wordmark's type size. The mask is sized by HEIGHT alone (its width follows the
  *  asset's aspect), so this is the mark's height rather than a font-size. */
@@ -252,6 +328,50 @@ export function ConciergeColumn({
   // Why the paid half isn't running, or null when it is. Like the two brand-chrome pieces in the
   // header, this reaches for its own stores rather than the view-model (see ./conciergeAiLock).
   const aiLock = useConciergeAiLock();
+
+  // ── WHERE THE CREDIT PILL GOES, FROM THE PAINTED BOXES (bead sparkle-kk9dg.5) ───────────────
+  //
+  // MEASURED, not taken from the `width` prop. The shell owns the concierge's box and neutralises
+  // this column's own width with an `!important` rule (see Workspace's `data-concierge-box`), so
+  // `width` is what the column ASKED for and the strip's border box is what it GOT. The bead is
+  // about the painted width; reading the prop would grade the wrong number.
+  //
+  // Two observations, because the collision depends on both terms: the strip's width and the
+  // pill's own — and the pill's is the balance string, which is why a width threshold cannot do
+  // this job (see `creditPillPlacement`).
+  const [stripWidth, setStripWidth] = useState(0);
+  const [creditPillWidth, setCreditPillWidth] = useState(0);
+  // `borderBoxSize` FIRST, and the fallback is not decoration. `contentRect` is the CONTENT box, so
+  // it silently omits the strip's 32px of padding and the pill's 20px gutter — a placement computed
+  // from it would be off by half a pill in the direction that lets the overlap back in.
+  const borderBoxWidth = useCallback((entry: ResizeObserverEntry): number => {
+    const box = entry.borderBoxSize?.[0]?.inlineSize;
+    if (typeof box === "number" && box > 0) return box;
+    return entry.target.getBoundingClientRect().width;
+  }, []);
+  const stripRef = useRef<HTMLDivElement | null>(null);
+  const creditPillRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    // GUARDED: `ResizeObserver` does not exist in every environment this renders in — jsdom has
+    // none — and the fail-safe is the unmeasured state, which is the overlaid one.
+    if (typeof ResizeObserver === "undefined") return;
+    const strip = stripRef.current;
+    const pill = creditPillRef.current;
+    if (!strip || !pill) return;
+    const ro = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        if (entry.target === strip) setStripWidth(borderBoxWidth(entry));
+        else if (entry.target === pill) setCreditPillWidth(borderBoxWidth(entry));
+      }
+    });
+    ro.observe(strip);
+    ro.observe(pill);
+    return () => ro.disconnect();
+  }, [borderBoxWidth]);
+  // NO HYSTERESIS, AND IT DOES NOT NEED ANY. Both boxes are shrink-to-fit in BOTH placements — the
+  // pill's padding and content are identical either way and the strip's width is set by the shell —
+  // so switching placement cannot change either input, and the rule cannot oscillate.
+  const creditPlacement = creditPillPlacement(stripWidth, creditPillWidth);
   // Concrete hex for the three spec values with no CSS var of their own — the wordmark's two ends,
   // the terminal register this column floods to, and the lift it drops when it does. See
   // theme/blueprintSpec for why they are not in THEME_HEX, and ./wordmarkRamp for the ramp.
@@ -664,6 +784,13 @@ export function ConciergeColumn({
           precisely to stop carrying everything. */}
       <div
         data-testid="concierge-voice-strip"
+        ref={stripRef}
+        // THE RENDERED READ OF THE PLACEMENT RULE — `data-wired`'s equivalent for this strip. The
+        // decision is geometric and jsdom can measure nothing, so this attribute is how the unit
+        // suite observes which branch was taken and how the CDP probe labels the reading it took
+        // (bead sparkle-kk9dg.5; `ConciergeColumn.creditPillNarrow.test.tsx`,
+        // `scripts/visual/credit-pill-mic-probe.mjs`).
+        data-credit-placement={creditPlacement}
         style={{
           flex: "0 0 auto",
           // The containing block for the floating credit pill below. NOT a flex row any more: the
@@ -691,29 +818,69 @@ export function ConciergeColumn({
         </div>
         <div
           data-testid="concierge-credit-overlay"
+          ref={creditPillRef}
           style={{
-            // OVERLAID, not laid out beside. Absolute so it takes zero width from the waveform —
-            // the ask was explicitly "do not shrink the waveform to make room".
-            position: "absolute",
-            // THE BADGE KEEPS THE COLUMN'S 16px INSET; only its BACKDROP reaches past it. The
-            // gutter below is padding, so it grows this box outward in both directions — pinning
-            // the box at 16 would have shoved the visible pill 10px left of the search field and
-            // the cards under it, i.e. fixed the crowding by breaking the column's one vertical
-            // edge. Offsetting by the same gutter keeps every glyph exactly where it was and lets
-            // the softened region be the only thing that moved.
-            right: 16 - CREDIT_BACKDROP_GUTTER,
-            // Centred on the WAVE STAGE — half the stage down from the strip's top padding, then
-            // pulled back by half of its OWN height. Against the stage rather than the strip so it
-            // sits on the bars instead of drifting with the caption block underneath them; and by
-            // transform rather than by `height: WAVE_HEIGHT` because the box below is a BACKDROP.
-            // Given the stage's height it became a 56px blurred slab with a 999px radius — a large
-            // pale ellipse bleeding over the bars, which is worse than the clipping it replaced.
-            // Sized to the badge, the same treatment reads as a pill behind the text.
-            top: 6 + WAVE_HEIGHT / 2,
-            transform: "translateY(-50%)",
+            // ── OVERLAID, OR ON ITS OWN ROW (bead sparkle-kk9dg.5) ──────────────────────────────
+            // Everything AFTER this switch is shared by both placements: the same box, the same
+            // gutter, the same blur, the same fill. Only how the box is positioned differs — and
+            // both branches land its right edge on the same pixel, so the pill does not jump
+            // sideways when the column crosses the threshold.
+            //
+            // OVERLAID is the design bead `.3` shipped and the one the founder asked for: absolute,
+            // so it takes ZERO width from the waveform. At a narrow enough column that same
+            // property is what puts it on top of the centred mic ring — `creditPillPlacement` has
+            // the geometry — and the answer is NOT to give the bars back some width. It is to give
+            // the pill its own line under them: `position: relative` + `marginLeft: auto` on a
+            // `fit-content` box right-aligns it in the strip's block flow, the strip gets taller,
+            // and the waveform above it is untouched.
+            ...(creditPlacement === "overlay"
+              ? {
+                  position: "absolute" as const,
+                  // THE BADGE KEEPS THE COLUMN'S 16px INSET; only its BACKDROP reaches past it. The
+                  // gutter is padding, so it grows this box outward in both directions — pinning
+                  // the box at 16 would have shoved the visible pill 10px left of the search field
+                  // and the cards under it, i.e. fixed the crowding by breaking the column's one
+                  // vertical edge. Offsetting by the same gutter keeps every glyph exactly where it
+                  // was and lets the softened region be the only thing that moved.
+                  //
+                  // IN THIS BRANCH ONLY. On a `position: relative` box `right` is a NUDGE, not an
+                  // inset — it would shove the row-placed pill 6px further left than the overlaid
+                  // one, so the pill would visibly jump sideways at the threshold. The row branch
+                  // reproduces the same edge with `marginRight` instead.
+                  right: CREDIT_PILL_RIGHT_INSET,
+                  // Centred on the WAVE STAGE — half the stage down from the strip's top padding,
+                  // then pulled back by half of its OWN height. Against the stage rather than the
+                  // strip so it sits on the bars instead of drifting with the caption block
+                  // underneath them; and by transform rather than by `height: WAVE_HEIGHT` because
+                  // the box below is a BACKDROP. Given the stage's height it became a 56px blurred
+                  // slab with a 999px radius — a large pale ellipse bleeding over the bars, which
+                  // is worse than the clipping it replaced. Sized to the badge, the same treatment
+                  // reads as a pill behind the text.
+                  top: 6 + WAVE_HEIGHT / 2,
+                  transform: "translateY(-50%)",
+                  zIndex: 1,
+                }
+              : {
+                  // IN FLOW, BELOW THE WAVEFORM. `fit-content` + `marginLeft: auto` is what
+                  // right-aligns a block box in a block container — the strip is deliberately not
+                  // a flex row (see its own note), so `justify-content` is not available here.
+                  position: "relative" as const,
+                  width: "fit-content",
+                  marginLeft: "auto",
+                  // THE SAME RIGHT EDGE IN BOTH PLACEMENTS. A flow child's margin box stops at the
+                  // strip's 16px padding, so cancelling the gutter here reproduces exactly the
+                  // `right: CREDIT_PILL_RIGHT_INSET` the overlaid form uses — the visible glyphs
+                  // keep the column's 16px inset and the backdrop keeps reaching 10px past them,
+                  // so the pill does not visibly jump sideways as the column crosses the
+                  // threshold.
+                  marginRight: -CREDIT_BACKDROP_GUTTER,
+                  // The strip's own bottom padding is 0 — the caption block above supplies the
+                  // rhythm — so this row has to bring its own.
+                  marginTop: 2,
+                  marginBottom: 6,
+                }),
             display: "flex",
             alignItems: "center",
-            zIndex: 1,
             // LEGIBILITY OVER MOVING BARS. The column's background is dynamic (it floods on
             // data-wired), so a scrim painted in a fixed colour would be wrong half the time. A
             // local backdrop blur is background-agnostic: it turns whatever is behind the pill —

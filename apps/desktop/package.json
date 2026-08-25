@@ -38,7 +38,8 @@
     "tauri:build:fresh": "cargo clean -p sparkle --manifest-path src-tauri/Cargo.toml && tauri build",
     "visual:concierge-header": "node scripts/visual/concierge-header-probe.mjs",
     "visual:scrubber": "node scripts/visual/thread-scrubber-probe.mjs",
-    "visual:notice-attribution": "node scripts/visual/notice-attribution-probe.mjs"
+    "visual:notice-attribution": "node scripts/visual/notice-attribution-probe.mjs",
+    "visual:credit-pill-mic": "node scripts/visual/credit-pill-mic-probe.mjs"
   },
   "dependencies": {
     "@sparkle/core": "workspace:*",

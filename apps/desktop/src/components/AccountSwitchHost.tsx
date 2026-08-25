@@ -2,8 +2,9 @@
 //
 // Kept separate from AccountSwitchBanner so the banner stays a pure presentational component
 // (rendered directly in tests with fixture props) while this host owns the polling hook and the
-// account-label lookup. Mounted once app-wide next to UpdateBanner: a rate limit belongs to an
-// ACCOUNT, so there is exactly one of these regardless of how many projects or panes are open.
+// account-label lookup. Mounted once app-wide in App.tsx, just inside the auth gate: a rate
+// limit belongs to an ACCOUNT, so there is exactly one of these regardless of how many projects or
+// panes are open.
 import { useCallback, useEffect, useState } from "react";
 import { AccountSwitchBanner } from "./AccountSwitchBanner";
 import { useAccountSwitch } from "../hooks/useAccountSwitch";

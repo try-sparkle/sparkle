@@ -42,8 +42,38 @@
 // `overflow: hidden`. Exit 2 = the probe could not run (no webkit build installed), which is NOT a
 // verdict about the CSS — the same three-way convention `recap-narrow-probe.mjs` uses.
 //
-// LAST READING — 2026-08-05, playwright webkit: CSS.supports("overflow","clip") true; #a computes
-// `hidden` and #b computes `clip`; screenshots BYTE-IDENTICAL. Cited from `NAME_CLIP_CLASS`.
+// ── THE READING ─────────────────────────────────────────────────────────────────────────────────
+// MEASURED 2026-08-24 by actually running this file — `node apps/desktop/scripts/visual/webkit-
+// clip-ellipsis.mjs`, exit 0. Before that date the line here recorded a reading no run is known to
+// have produced; it is replaced by this one, which was taken from the output quoted below.
+//
+//   engine            : WebKit 26.5 (AppleWebKit/605.1.15, Version/26.5 Safari/605.1.15),
+//                       playwright 1.61.1, browser build webkit-2311, macOS (darwin arm64)
+//   CSS.supports clip : true
+//   computed #a       : hidden          (overflow: hidden + text-overflow: ellipsis — the control)
+//   computed #b       : clip            (overflow: clip   + text-overflow: ellipsis — the candidate)
+//   #a screenshot     : 2187 bytes
+//   #b screenshot     : 2187 bytes
+//   pixels identical  : true            (Buffer.compare === 0)
+//
+// VERDICT: **WebKit PAINTS the ellipsis under `overflow: clip`**, pixel-for-pixel as it does under
+// `hidden`. `.clip-no-scroll` is safe on an ellipsizing box, so `AgentPill.NAME_CLIP_CLASS` and
+// `RecapCard.CLIP_CLASS` stay as they are. Nothing to revert; the bead's fallback (drop those spans
+// back to `overflow: hidden`, Chrome cost Δ0.00px baseline) was NOT needed and was not taken.
+//
+// THE INSTRUMENT IS NOT VACUOUS — asked separately, because "identical bytes" is also what a probe
+// that rendered two blank boxes would report. Re-run with #b's `text-overflow` set to `clip` (the
+// exact failure mode: a hard cut, no "…"), same engine, same HTML otherwise: 2187 vs 2386 bytes,
+// NOT identical. So the comparison does see a dropped ellipsis when there is one to see, and the
+// PASS above is a measurement rather than an artefact.
+//
+// ONE THING THIS DOES NOT COVER, stated rather than left to be rediscovered: playwright's WebKit
+// is a current build, while the shipped app renders in the OS WKWebView, whose engine tracks the
+// user's Safari. `overflow: clip` arrived in Safari 16, and `tauri.conf.json` allows back to macOS
+// 11 — which is precisely why `.clip-no-scroll` is `hidden` with a `@supports` upgrade rather than
+// bare `clip`. On an engine too old to support `clip` the @supports block is skipped entirely and
+// the box stays `hidden`, so the pairing measured here is the only one that can ever reach a user.
+// Cited from `NAME_CLIP_CLASS`.
 import { pathToFileURL } from "node:url";
 import { webkit } from "playwright";
 
