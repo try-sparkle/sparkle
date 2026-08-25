@@ -479,6 +479,47 @@ describe("a credential prompt refuses on the normal buffer too", () => {
   });
 });
 
+// ══ THE MENU VERDICT THE ESCALATION READS (bead sparkle-j2gase) ═════════════════════════════════
+// Both states reach the SAME `alternate-screen` path, and until now the auto-resume escalation could
+// not tell them apart: it told the human "usually a permission dialog or menu waiting on an answer"
+// for a no-menu pager, sending them to hunt for a dialog that was not there (four agents, one
+// morning). The dispatcher already KNOWS which it is — the same `liveOptionsFor` read the refusal
+// used — so it carries the labels (or undefined) on the result for the escalation to branch on. This
+// is the SEAM the runner test cannot cover: it mocks `dispatchConciergeAnswer` whole, so the line
+// that PRODUCES this field is exercised by nothing but these rows.
+describe("an alternate-screen refusal carries its menu verdict", () => {
+  it("carries the live menu's labels when a dialog is on the alternate screen", async () => {
+    // A Claude Code permission dialog reached by a free-text send: the composer box is replaced, so
+    // it is NOT recognised as Claude Code and takes the alternate-screen path — but `read_picker`
+    // finds its options. The escalation must be able to name them, so they ride on the result.
+    onFullScreenApp();
+    vi.mocked(detectTerminalPrompts).mockReturnValue([
+      { label: "Yes", value: "y" } as unknown as SuggestionButton,
+      { label: "No, and tell Claude what to do differently", value: "n" } as unknown as SuggestionButton,
+    ]);
+    const r = await dispatchConciergeAnswer(AGENT, "continue with the plan", {
+      authority: { kind: "goal-continue", agentId: AGENT },
+    });
+    expect(r.path).toBe("alternate-screen");
+    // THE SIDE EFFECT: the labels, in order, so the escalation names the actual question.
+    expect(r.altScreenMenuLabels).toEqual(["Yes", "No, and tell Claude what to do differently"]);
+    expectNothingWritten();
+  });
+
+  it("carries NO menu labels when a pager or editor holds the screen (blind:'no-menu')", async () => {
+    // `onFullScreenApp` is a vim screen and `detectTerminalPrompts` defaults to `[]` — the exact
+    // `blind:'no-menu'` case the four stalled agents hit. `undefined`, not `[]`, is what the runner
+    // branch keys "a pager/editor is holding it — quitting is safe" off, so pin the distinction.
+    onFullScreenApp();
+    const r = await dispatchConciergeAnswer(AGENT, "continue with the plan", {
+      authority: { kind: "goal-continue", agentId: AGENT },
+    });
+    expect(r.path).toBe("alternate-screen");
+    expect(r.altScreenMenuLabels).toBeUndefined();
+    expectNothingWritten();
+  });
+});
+
 describe("the guard is narrow — it blocks the alternate buffer and nothing else", () => {
   it("delivers free text at an ordinary prompt", async () => {
     atAPrompt();

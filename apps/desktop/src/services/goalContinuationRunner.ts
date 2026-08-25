@@ -709,6 +709,20 @@ export function undeliveredStreakFor(agentId: string): number {
   return undelivered.get(agentId)?.count ?? 0;
 }
 
+/** Quote up to the first few menu labels for the alternate-screen "a dialog is waiting" copy, so the
+ *  human is told WHICH question is on the screen rather than being sent to hunt for it. Empty in →
+ *  empty string out, so the caller can concatenate unconditionally. */
+function namedMenuOptions(labels: string[]): string {
+  const shown = labels
+    .map((l) => l.trim())
+    .filter((l) => l.length > 0)
+    .slice(0, 4);
+  if (shown.length === 0) return "";
+  const quoted = shown.map((l) => `"${l}"`).join(", ");
+  const more = labels.length > shown.length ? ", …" : "";
+  return ` — the options are ${quoted}${more}`;
+}
+
 /**
  * What to tell the human when auto-continue could not DELIVER, keyed on the dispatch path.
  *
@@ -720,7 +734,15 @@ export function undeliveredStreakFor(agentId: string): number {
  * The default arm is deliberately vague rather than guessing: it still says the one fact that
  * matters — nothing was delivered — and names the path so a log or a bug report can identify it.
  */
-function undeliverableReason(goalText: string, path: UndeliveredPath, isCloud: boolean): string {
+function undeliverableReason(
+  goalText: string,
+  path: UndeliveredPath,
+  isCloud: boolean,
+  /** For the `alternate-screen` path only: the live menu labels the dispatcher's screen probe
+   *  found, or `undefined` when it found none (`blind:'no-menu'`). Undefined for every other path.
+   *  See {@link ConciergeDispatchResult.altScreenMenuLabels} and bead sparkle-j2gase. */
+  altScreenMenuLabels?: string[],
+): string {
   // THE SCREEN ARMS ARE RUNTIME-AWARE TOO, not just the closing sentence. Both of these fire for a
   // cloud agent — the guards that produce them run BEFORE the cloud branch and read the RELAYED
   // viewport — so keying only the closing on the runtime produced a message that contradicted
@@ -745,10 +767,18 @@ function undeliverableReason(goalText: string, path: UndeliveredPath, isCloud: b
         // remedy strings applies exactly here: a refusal's suggested action is an instruction the
         // user will follow, and it needs the same scrutiny as the code path it replaces.
         //
-        // So this says what is actually known — the screen is in full-screen mode and could not be
-        // recognised as Claude Code's own prompt — and leads with the likelier of the two causes,
-        // which is also the one whose remedy resolves it in seconds.
-        `${screen} is in full-screen mode and I could not recognise it as Claude Code's own prompt, so I did not type into it. That is usually a permission dialog or menu waiting on an answer: open ${pane} and answer what is on screen. If it really is an editor or pager, quit it — either way the auto-resume will take over again`
+        // ── AND IT BRANCHES ON THE MENU PROBE, because one string for two states cost the human a
+        // trip (bead sparkle-j2gase). BOTH states reach this same `alternate-screen` path, but the
+        // dispatcher already KNOWS which one it is: the SAME `liveOptionsFor` read that made the
+        // refusal decision is carried on `altScreenMenuLabels`. A live menu (a Claude Code permission
+        // dialog, reached by a free-text send) has options — there IS a question, name it and say
+        // "answer it". No menu (`blind:'no-menu'` — a pager or editor holds the buffer) has none —
+        // "answer what is on screen" is a dead instruction there, so say the true remedy: quitting it
+        // is safe and will not lose the turn. Measured: four agents in one morning, every one a
+        // no-menu pager, all told to go find a dialog that was not there.
+        altScreenMenuLabels && altScreenMenuLabels.length > 0
+          ? `${screen} has a dialog waiting for your answer${namedMenuOptions(altScreenMenuLabels)}. It is a menu the auto-resume cannot answer for you — open ${pane} and choose what is on screen, and the auto-resume will take over again`
+          : `${screen} is in full-screen mode with no menu on it — a pager or editor is holding the screen, so nothing is waiting on an answer. Quitting it is safe and will not lose the turn (the goal resumes where it left off): open ${pane} and quit the pager or editor, and the auto-resume will take over again`
       : path === "blocked-prompt"
         ? `${screen} is waiting at a prompt that must not receive free text — a password, a host-key confirmation, a yes/no. Answer that prompt in ${pane}`
         : path === "pty-gone"
@@ -1149,7 +1179,9 @@ async function continueAgent(
       useProjectStore.getState().noteAgentGoalContinue(projectId, agent.id, mark);
       log.info("goals", "auto-continued a stalled agent", { agentId: agent.id, path: result.path });
     } else {
-      noteUndelivered(projectId, agent, result.path, now);
+      // `altScreenMenuLabels` is set only on an `alternate-screen` refusal; undefined everywhere
+      // else, which is exactly what `undeliverableReason` wants for every other arm.
+      noteUndelivered(projectId, agent, result.path, now, result.altScreenMenuLabels);
     }
   } catch (e) {
     outcome.detail = "threw";
@@ -1183,6 +1215,12 @@ function noteUndelivered(
   agent: AgentTab,
   path: UndeliveredPath,
   now: number,
+  /** For the `alternate-screen` path only: the live menu labels the dispatcher found this sweep, or
+   *  undefined for the `blind:'no-menu'` case (and every non-alternate-screen path). Passed straight
+   *  to {@link undeliverableReason} so the escalation names the right remedy — see bead
+   *  sparkle-j2gase. It is the CURRENT sweep's verdict that escalates, so this needs no persisting
+   *  in the streak map: the sweep that trips the bound carries its own menu state. */
+  altScreenMenuLabels?: string[],
 ): void {
   const count = (undelivered.get(agent.id)?.count ?? 0) + 1;
   undelivered.set(agent.id, { count, path });
@@ -1196,7 +1234,12 @@ function noteUndelivered(
   escalateToHuman(
     projectId,
     agent,
-    undeliverableReason(agent.goal?.text ?? "", path, agent.runtime === "cloud"),
+    undeliverableReason(
+      agent.goal?.text ?? "",
+      path,
+      agent.runtime === "cloud",
+      altScreenMenuLabels,
+    ),
     "escalate",
     now,
   );

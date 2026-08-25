@@ -570,7 +570,12 @@ describe("an auto-continue that never REACHES the terminal", () => {
     expect(sendMock).toHaveBeenCalledTimes(MAX_UNDELIVERED_CONTINUES);
   });
 
-  it("names the OBSTACLE, and never the restart copy that would send the human hunting", async () => {
+  it("NO-MENU alternate screen: says a pager/editor is holding it and quitting is safe, never that a dialog is waiting", async () => {
+    // `alwaysRefuse` sets no `altScreenMenuLabels`, which is the `blind:'no-menu'` case — a pager or
+    // editor holds the alternate buffer and there is NO question on the screen. Measured: four agents
+    // in one morning, every one a no-menu pager, all told "usually a permission dialog or menu
+    // waiting on an answer" — sending the founder to open a pane and hunt for a menu that was not
+    // there (bead sparkle-j2gase).
     alwaysRefuse("alternate-screen");
     const { projectId, agentId } = seed({ goal: "land the PR" });
 
@@ -580,19 +585,53 @@ describe("an auto-continue that never REACHES the terminal", () => {
     expect(reason).toContain("full-screen mode");
     expect(reason).toContain("land the PR");
     // ── AND IT MUST NOT NAME AN APP IT HAS NO EVIDENCE OF (bead sparkle-saoe3) ────────────────
-    // This path fires on `alternateBuffer && !isClaudeCodeScreen`, and Claude Code's own permission
-    // dialog satisfies both — so the overwhelmingly common cause is an approval prompt, not an
-    // editor. Naming vim/less/htop as fact sent the founder hunting for an app to quit on five
-    // separate agents in one afternoon, every one of them a normal pane stopped at "Do you want to
-    // proceed?". The remedy has to be one the human can actually carry out.
+    // "a pager or editor" is a category, not a claim about WHICH one — naming vim/less/htop as fact
+    // is still unwarranted and sent the founder hunting for an app to quit.
     expect(reason).not.toContain("vim");
     expect(reason).not.toContain("htop");
-    expect(reason).toMatch(/answer what is on screen/i);
+    // THE OLD, WRONG DIAGNOSIS for this state. There is no menu and no question, so "a permission
+    // dialog or menu waiting on an answer" is exactly the sentence that cost the four trips, and
+    // "answer what is on screen" is a dead instruction when nothing is on screen to answer.
+    expect(reason).not.toMatch(/permission dialog or menu/i);
+    expect(reason).not.toMatch(/answer what is on screen/i);
+    // THE TRUE REMEDY: quitting the pager/editor is safe and loses nothing. This is the assertion the
+    // change exists for.
+    expect(reason).toMatch(/pager or editor is holding the screen/i);
+    expect(reason).toMatch(/quitting it is safe/i);
+    expect(reason).toMatch(/will not lose the turn/i);
     // The diagnosis the progress bound gives is WRONG here — nothing was ever typed, so there is no
-    // "restarting" that failed. This is the assertion the whole change exists for.
+    // "restarting" that failed.
     expect(reason).not.toContain("restarting cannot fix");
     expect(reason).toContain("Nothing was typed into the terminal");
     // The banner the human actually reads carries the same sentence, not a second one that drifts.
+    expect(notifyMock.mock.calls[0]![0].body).toBe(reason);
+  });
+
+  it("MENU-present alternate screen: names the waiting dialog and its options, never the pager remedy", async () => {
+    // The OTHER state on the SAME path: a Claude Code permission dialog reached by a free-text send.
+    // `read_picker_options` succeeds on it, so the dispatcher carries the labels on the result. Here
+    // there IS a question — telling the human to "quit the pager" would be the wrong remedy, and the
+    // no-menu copy's "quitting is safe" would be actively unsafe advice against a live decision.
+    sendMock.mockImplementation(async (agentId: string) => ({
+      ok: false as const,
+      path: "alternate-screen" as const,
+      agentId,
+      altScreenMenuLabels: ["Yes", "No, and tell Claude what to do differently"],
+    }));
+    const { projectId, agentId } = seed({ goal: "land the PR" });
+
+    await sweepUntilEligible(MAX_UNDELIVERED_CONTINUES);
+
+    const reason = goalOf(projectId, agentId)!.escalationReason!;
+    // Names the dialog AND the specific options, so the human knows what is being asked without
+    // opening the pane to find out.
+    expect(reason).toMatch(/dialog waiting for your answer/i);
+    expect(reason).toContain('"Yes"');
+    expect(reason).toContain('"No, and tell Claude what to do differently"');
+    // MUST NOT give the no-menu remedy here — quitting a live permission dialog is the unsafe thing.
+    expect(reason).not.toMatch(/quitting it is safe/i);
+    expect(reason).not.toMatch(/pager or editor/i);
+    expect(reason).toContain("Nothing was typed into the terminal");
     expect(notifyMock.mock.calls[0]![0].body).toBe(reason);
   });
 

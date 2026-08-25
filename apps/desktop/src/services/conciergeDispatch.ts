@@ -188,6 +188,18 @@ export interface ConciergeDispatchResult {
    *  new producer: a hold whose release depends on the same predicate that caused it is how the
    *  founder's message came to be dropped fifteen minutes after he was promised it would arrive. */
   heldReason?: "screen";
+  /** On an `"alternate-screen"` refusal ONLY: the labels of the live menu the screen probe found at
+   *  the instant of the refusal, or `undefined` when it found NONE (the `blind:'no-menu'` case — a
+   *  pager or editor is holding the alternate buffer).
+   *
+   *  The two states reach the SAME `"alternate-screen"` path but need OPPOSITE remedies, and the
+   *  auto-resume escalation had no way to tell them apart: it told the human "usually a permission
+   *  dialog or menu waiting on an answer" for a stuck pager where there is no question to answer,
+   *  sending them to open a pane and hunt for a menu that is not there (bead sparkle-j2gase, four
+   *  agents in one morning). A live menu means "answer the dialog"; no menu means "a pager/editor is
+   *  holding the screen — quitting it is safe". Populated from the SAME `liveOptionsFor` read the
+   *  refusal decision uses, so the copy can never disagree with the guard about whether a menu is up. */
+  altScreenMenuLabels?: string[];
 }
 
 /** How a dispatch should be treated. `userPrompt` marks the text as something the USER authored
@@ -841,7 +853,19 @@ async function routeConciergeAnswer(
     !mountedHumanSend(opts)
   ) {
     log.warn("concierge", "refused a write into a full-screen app", { agentId });
-    return { ok: false, path: "alternate-screen", agentId };
+    // CARRY THE MENU VERDICT ON THE RESULT so the auto-resume escalation can name the right remedy.
+    // `pickerOptions` is the same read this branch's `verifiedPickerPress` check already used, so the
+    // copy downstream cannot disagree with the guard about whether a menu is live. A Claude Code
+    // permission dialog reached by a free-text send lands here WITH options (answer it); a pager or
+    // editor holds the alternate buffer with NONE (`blind:'no-menu'` — quitting it is safe). See
+    // bead sparkle-j2gase.
+    const menuIsLive = pickerOptions.length > 0;
+    return {
+      ok: false,
+      path: "alternate-screen",
+      agentId,
+      altScreenMenuLabels: menuIsLive ? pickerOptions.map((o) => o.label) : undefined,
+    };
   }
   // ══ RECOGNISING CLAUDE CODE IS NOT A SAFETY VERDICT (roborev 57718) ═════════════════════════════
   // `claudeCodeScreen`'s own doc says so — "do not let a true from this function stand in for
