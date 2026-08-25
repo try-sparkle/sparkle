@@ -16,12 +16,17 @@
 // mounts the wrapper the column mounts and counts what the founder would actually see.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { TYPE } from "../theme/scale";
+import { FONT_WEIGHT } from "../theme/colors";
 
 // The Tauri boundary is the only thing stubbed — the same line `EpicInlineCard.goal.test.tsx` takes.
 // Mocking `beadChat` or the card itself would be mocking the wiring this file exists to exercise.
 vi.mock("@tauri-apps/api/core", () => ({ invoke: () => Promise.resolve(null) }));
 
 const { EpicInlineCard } = await import("./EpicInlineCard");
+// The board card, mounted directly, for the PAIRED half of the title-size test below — it must
+// stay at the section-title size when the epics card shrinks.
+const { BeadCard } = await import("./BeadCard/BeadCard");
 const { useProjectStore } = await import("../stores/projectStore");
 const { useComposeHandoffStore } = await import("../stores/composeHandoffStore");
 type Bead = import("../services/beads").Bead;
@@ -218,5 +223,38 @@ describe("items 17+18 — the gold EPIC pill on the card the column mounts", () 
     expect(Boolean(pill.compareDocumentPosition(title) & Node.DOCUMENT_POSITION_FOLLOWING)).toBe(
       true,
     );
+  });
+});
+
+// ── THE EPICS-COLUMN TITLE MATCHES ITS ROW — SAME SIZE, BOLD ONLY (bead sparkle-huw924.13) ───────
+
+describe("the epics-column title is the row's size and bold only (sparkle-huw924.13)", () => {
+  // The founder: *"make the size of the epic title text in the epic column the same size as the
+  // row… Should just be bold."* The card opens directly under its own `EpicRow` (`TYPE.micro`), so
+  // the title drops to that size and leans on `bold` alone rather than on a larger face.
+  it("renders the title at the epic-row size, bold", () => {
+    mount();
+    const title = screen.getByTestId(`${T}-title`);
+    // TYPE.micro (10px) — the size of the `EpicRow` this card opens beneath.
+    expect(title.style.fontSize).toBe(`${TYPE.micro}px`);
+    // It WAS TYPE.title (17px). Spelling that out is what makes this about the CHANGE rather than
+    // about whatever the current value happens to be.
+    expect(title.style.fontSize).not.toBe(`${TYPE.title}px`);
+    // BOLD, not the semibold the section title used.
+    expect(title.style.fontWeight).toBe(String(FONT_WEIGHT.bold));
+    expect(title.style.fontWeight).not.toBe(String(FONT_WEIGHT.semibold));
+  });
+
+  // THE PAIR — the SAME title element on the SAME bead, but `chrome="board"`, is untouched: *"You
+  // don't have to make any changes in the planning board."* Both discriminant values mounted at
+  // once, so dropping the `chrome === "epics"` guard (shrinking EVERY card) reds HERE even though
+  // the row above would stay green — AGENTS.md's fourth vacuous shape, asserting the chosen target
+  // shrank AND the other did not.
+  it("leaves the board card's title at the section-title size", () => {
+    render(<BeadCard bead={EPIC} chrome="board" stage="planned" workers={[]} />);
+    const title = screen.getByTestId("board-bead-card-title");
+    expect(title.style.fontSize).toBe(`${TYPE.title}px`);
+    expect(title.style.fontSize).not.toBe(`${TYPE.micro}px`);
+    expect(title.style.fontWeight).toBe(String(FONT_WEIGHT.semibold));
   });
 });

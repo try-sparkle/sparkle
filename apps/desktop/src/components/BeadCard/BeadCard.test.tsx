@@ -636,6 +636,19 @@ function indexOnMetaLine(id: string): number {
   return Array.from(line.querySelectorAll("*")).indexOf(node);
 }
 
+/** The SLOT an item sits in along the CHROME row (`${t}-chrome`) — its index among the row's DIRECT
+ *  children, which IS its left-to-right order in a flex row (jsdom has no layout, so document order
+ *  is the only honest order — docs/jsdom-test-caveats.md). Matched by direct-child containment, not
+ *  by descendant position, so a pill that nests elements still reports ONE slot and adjacency
+ *  (`parent === type + 1`) means "the next child", not "the next element". Mirrors `chromeOrder` in
+ *  `BeadCardBoardView.test.tsx`. Used to prove the parent-epic pill sits immediately right of the
+ *  type pill. */
+function indexOnChromeRow(id: string): number {
+  const kids = Array.from(screen.getByTestId(`${t}-chrome`).children);
+  const node = screen.getByTestId(`${t}-${id}`);
+  return kids.findIndex((k) => k === node || k.contains(node));
+}
+
 /** THE SLOT an item sits in. The merged line wraps each item in one span, and that span is where
  *  the flex rule lives — `parentElement` is the wrong reach, since the priority pill has boxes of
  *  its own between its trigger and the slot. */
@@ -781,37 +794,27 @@ describe("BeadCard — the merged metadata line", () => {
     }
   });
 
-  // ══ THE TWO CONTENT-LENGTH ITEMS MUST GIVE GROUND ═══════════════════════════════════════════
-  // The blanket `0 0 auto` above is right for the short fixed labels and WRONG for the two items
-  // whose width is their content: the parent chip (a bead TITLE — "A TITLE CAN BE A SENTENCE") and
-  // `in <project>`. An unshrinkable wrapper is always exactly as wide as its own text, so the
-  // chip's `maxWidth: 100%` resolves against it and `text-overflow: ellipsis` can NEVER fire — and
-  // under the row's `nowrap` + `overflow: hidden` the chip is the LAST item, so a long epic title
-  // is exactly what silently disappears off the card's edge.
-  it("lets the parent chip and the project name give ground, so the ellipsis can fire", () => {
+  // ══ THE CONTENT-LENGTH ITEM MUST GIVE GROUND ════════════════════════════════════════════════
+  // The blanket `0 0 auto` above is right for the short fixed labels and WRONG for the one merged-
+  // line item whose width is its content: `in <project>`. An unshrinkable wrapper is always exactly
+  // as wide as its own text, so its `maxWidth: 100%` resolves against it and `text-overflow:
+  // ellipsis` can NEVER fire. (The parent-epic chip used to be the second such item here; it moved
+  // to the chrome row — bead sparkle-huw924.11 — and carries the same shrink rules on ITSELF now,
+  // asserted in the chrome-row describe block below.)
+  it("lets the project name give ground, so the ellipsis can fire", () => {
     mount({
       onBuildIt: vi.fn(async () => {}),
       onSetPriority: vi.fn(async () => {}),
       projectName: "some-other-project",
       lineage: { parent: PARENT, tasks: [], buildAgents: [] },
     });
-    for (const id of ["parent", "project"]) {
+    for (const id of ["project"]) {
       expect(metaSlot(id).style.flex, id).toBe("0 1 auto");
       expect(metaSlot(id).style.minWidth, id).toBe("0");
       // Shrinkable, but still ON THIS LINE — the merge is the whole point.
       expect(metaSlot(id).style.whiteSpace, id).toBe("nowrap");
     }
-    // …and the chip really carries the ellipsis those two rules make reachable. Both halves, or
-    // "it can shrink" is a claim about a chip that would clip anyway.
-    const chip = screen.getByTestId(`${t}-parent`);
-    expect(chip.style.textOverflow).toBe("ellipsis");
-    expect(chip.style.overflow).toBe("hidden");
-    // THE CEILING, and it is load-bearing rather than belt-and-braces: `minWidth: 0` lets a box give
-    // ground but does not BOUND it, so without this the text lays itself out wider than the wrapper
-    // and paints over the items after it on the line. Unpinned, it can be dropped by a future edit —
-    // or lost in a merge conflict, which is exactly how its sibling went missing (roborev 68096).
-    expect(chip.style.maxWidth).toBe("100%");
-    // AND THE PROJECT NAME, which was shrinkable with NO truncation rules of its own — a box that
+    // THE PROJECT NAME, which was shrinkable with NO truncation rules of its own — a box that
     // gives ground but does not ellipsise just renders past its own width, so a long project name
     // pushed the merged line out under `nowrap` instead of yielding. Its wrapper's `0 1 auto` above
     // is only half the fix; this is the half that makes the shrink visible rather than clipped.
@@ -889,29 +892,53 @@ describe("BeadCard — the merged metadata line", () => {
   });
 });
 
-describe("BeadCard — the parent epic rides the merged line", () => {
-  // The founder settled this on 2026-08-22: the parent is one more chip at the right end of the
-  // merged line, NOT a third lineage row — it costs zero extra height and keeps "just two rows" true.
-  it("renders the parent's TITLE as a chip on the merged line, not a row of its own", () => {
+describe("BeadCard — the parent epic pill rides the chrome row, right of the type label", () => {
+  // (bead sparkle-huw924.11) The founder wants the epic a task belongs to shown as a pill
+  // immediately RIGHT OF the type ("feature") label — *"to the right of the feature label. I can
+  // see that it's a feature and I can see to the right which Epic it belongs to."* It used to ride
+  // the right end of the merged metadata line; it moved up to the chrome row. NOT a lineage row.
+  it("renders the parent's TITLE as a chip in the chrome row, not a row of its own", () => {
     mount({ lineage: { parent: PARENT, tasks: [], buildAgents: [] } });
     const chip = screen.getByTestId(`${t}-parent`);
     // THE TITLE, never the raw id — that is the whole difference from the field this replaces.
     expect(chip.textContent).toBe("Bead cards collapse to half height");
     expect(chip.textContent).not.toBe("sparkle-epic1");
-    expect(screen.getByTestId(`${t}-meta`).contains(chip)).toBe(true);
+    // IT IS IN THE CHROME ROW NOW, not on the merged metadata line.
+    expect(screen.getByTestId(`${t}-chrome`).contains(chip)).toBe(true);
+    expect(screen.getByTestId(`${t}-meta`).contains(chip)).toBe(false);
     // …and it did NOT become a third lineage row. `BeadLineageRows` renders exactly two.
     expect(screen.queryByTestId(`${t}-lineage`)).toBeNull();
   });
 
-  it("is the LAST thing on the line — the right end", () => {
+  // THE PLACEMENT HE ASKED FOR: type label first, epic pill immediately to its right. Asserted as
+  // adjacency (pill === type + 1) rather than merely "after", so a control slipping between the two
+  // would red this — the founder was explicit that the epic reads directly off the type.
+  it("sits immediately right of the type pill", () => {
     mount({
       lineage: { parent: PARENT, tasks: [], buildAgents: [] },
-      onSetPriority: vi.fn(async () => {}),
-      onBuildIt: vi.fn(async () => {}),
+      bead: bead({ id: "sparkle-qogah", type: "task", parent: "sparkle-epic1" }),
     });
-    for (const before of ["build-it", "priority-trigger", "stage"]) {
-      expect(indexOnMetaLine(before)).toBeLessThan(indexOnMetaLine("parent"));
-    }
+    const type = indexOnChromeRow("type-pill");
+    const parent = indexOnChromeRow("parent");
+    expect(type).toBeGreaterThanOrEqual(0);
+    expect(parent).toBeGreaterThan(type);
+    expect(parent).toBe(type + 1);
+  });
+
+  // ══ THE PILL CARRIES ITS OWN SHRINK + ELLIPSIS ══════════════════════════════════════════════
+  // The chrome row is `nowrap`, so the pill is a flex item there; without `flex: 0 1 auto` +
+  // `minWidth: 0` its `maxWidth: 100%`/`text-overflow: ellipsis` could never fire and a long epic
+  // title would push the row to a second line — the exact thing "keep it on one line" forbids. It
+  // used to lean on the merged-line renderer for this context; now it owns it.
+  it("keeps its shrink rules so a long epic title ellipsises instead of wrapping the row", () => {
+    mount({ lineage: { parent: PARENT, tasks: [], buildAgents: [] } });
+    const chip = screen.getByTestId(`${t}-parent`);
+    expect(chip.style.flex).toBe("0 1 auto");
+    expect(chip.style.minWidth).toBe("0");
+    expect(chip.style.whiteSpace).toBe("nowrap");
+    expect(chip.style.overflow).toBe("hidden");
+    expect(chip.style.textOverflow).toBe("ellipsis");
+    expect(chip.style.maxWidth).toBe("100%");
   });
 
   // ONE PARENT TREATMENT, NOT TWO. The expanded-only `Epic:` field printed `bead.parent` as raw

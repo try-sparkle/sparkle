@@ -523,6 +523,24 @@ export function BeadCard({
   const spec = CHROME[chrome];
   const t = spec.testId;
 
+  // ══ THE EPICS-COLUMN TITLE MATCHES ITS ROW — SAME SIZE, BOLD ONLY (bead sparkle-huw924.13) ═══
+  // In the Epics column the card opens directly under its own epic ROW (`EpicRow`, `TYPE.micro`),
+  // and the founder's ask is that the card's title stop dwarfing those rows: *"make the size of the
+  // epic title text in the epic column the same size as the row… Should just be bold."* So for
+  // `chrome === "epics"` ONLY, the title drops from `TYPE.title` (17px, the section-title ceiling)
+  // to `TYPE.micro` (10px — the epic row's own size) and leans on `bold` alone to stand apart.
+  //
+  // SCOPE IS THE POINT: he was explicit — *"You don't have to make any changes in the planning
+  // board."* `EpicInlineCard` is the only `chrome === "epics"` instance and lives only in the Epics
+  // column, so keying on `chrome` leaves the board's `chrome === "board"` card (and the concierge
+  // card) at `TYPE.title`, untouched. The column's 1.3× `zoom` is a separate, founder-owned setting
+  // and is NOT touched here — it scales title and row together, so matching the row size holds at
+  // any zoom.
+  const titleStyle: CSSProperties =
+    chrome === "epics"
+      ? { ...TITLE_STYLE, fontSize: TYPE.micro, fontWeight: FONT_WEIGHT.bold }
+      : TITLE_STYLE;
+
   // ── THE PRIORITY WRITE ────────────────────────────────────────────────────────────────────────
   //
   // ══ THE OPTIMISTIC VALUE LIVES HERE, NEVER IN `beadsStore` ══════════════════════════════════
@@ -580,7 +598,9 @@ export function BeadCard({
   const shownPriority = optimistic ?? bead.priority;
 
   // ── THE MERGED LINE ───────────────────────────────────────────────────────────────────────────
-  // Build It, then status, priority, severity, type, project, the build state, and the parent epic.
+  // Build It, then status, priority, severity, type, project, and the build state. (The parent
+  // epic chip used to ride this line at its right end; it moved up to the chrome row, right of the
+  // type label — bead sparkle-huw924.11.)
   // What used to be TWO rows — the metadata row and the full-bleed progress rule beneath it — is
   // one, which is the row of height this whole change reclaims. It is merged in BOTH states, per
   // the founder: he described the saving on the card as such, not on the collapsed card.
@@ -731,78 +751,78 @@ export function BeadCard({
     });
   }
 
-  // ══ THE PARENT EPIC RIDES THIS LINE TOO, AT ITS RIGHT END ═══════════════════════════════════
-  // The founder settled this on 2026-08-22 when asked — he had never specified it. A chip here
-  // costs ZERO extra height and keeps *"just two rows, one for tasks and one for build agents"*
-  // literally true; a third lineage row would have cost height on the MAJORITY of cards, since most
-  // beads are tasks inside an epic — the exact height this change is reclaiming.
+  // ══ THE PARENT EPIC PILL — RIGHT OF THE TYPE LABEL, IN THE CHROME ROW ═══════════════════════
+  // (bead sparkle-huw924.11) The founder wants the epic a task belongs to shown as a pill sitting
+  // immediately RIGHT OF the type ("feature") label — *"I can see that it's a feature and I can
+  // see to the right which Epic it belongs to"* — truncated with an ellipsis so the row stays one
+  // line however long the epic's title is. It USED TO ride the right end of the merged metadata
+  // line; it now rides the chrome row, rendered below right after `<TypePill/>`.
   //
-  // ONE PARENT TREATMENT, NOT TWO. This replaces the expanded-only `Field label="Epic"` that
+  // ONE PARENT TREATMENT, NOT TWO. This replaced the expanded-only `Field label="Epic"` that
   // printed `bead.parent` as raw mono id text.
   //
   // IT READS THE TITLE, and falls back to the raw id: `lineage.parent` is a whole `Bead`, so the
   // chip can say what the epic IS. A surface that passes no lineage has only ever known the id —
   // that is not a reason to say nothing, so the id is what it shows.
+  //
+  // IT KEEPS ITS OWN `flex: 0 1 auto; minWidth: 0`: the chrome row is a `nowrap` flex row, so the
+  // chip is a flex item there and that shrink context is exactly what lets `text-overflow:
+  // ellipsis` fire rather than pushing the row to a second line — the merged-line renderer used
+  // to inject that context, and now the chip carries it itself.
   const parentBead = lineage?.parent ?? null;
   const parentId = parentBead?.id ?? bead.parent ?? null;
   const parentLabel = parentBead === null ? parentId : parentBead.title || parentBead.id;
-  if (parentId !== null && parentLabel !== null && parentLabel !== "") {
-    const openParent = onOpenBead;
-    meta.push({
-      key: "parent",
-      // SHRINKABLE, or the ellipsis below is decoration. See `MetaItem.shrink`.
-      shrink: true,
-      node: (
-        <span
-          data-testid={`${t}-parent`}
-          data-bead-id={parentId}
-          title={`Epic: ${parentLabel}`}
-          aria-label={`Epic: ${parentLabel}`}
-          role={openParent === undefined ? undefined : "button"}
-          tabIndex={openParent === undefined ? undefined : 0}
-          onClick={
-            openParent === undefined
-              ? undefined
-              : (e) => {
-                  e.stopPropagation();
-                  openParent(parentId);
-                }
-          }
-          onKeyDown={
-            openParent === undefined
-              ? undefined
-              : (e) => {
-                  if (e.key !== "Enter" && e.key !== " ") return;
-                  e.preventDefault();
-                  e.stopPropagation();
-                  openParent(parentId);
-                }
-          }
-          style={{
-            display: "inline-block",
-            flex: "0 1 auto",
-            minWidth: 0,
-            maxWidth: "100%",
-            // A TITLE CAN BE A SENTENCE. It ellipsises rather than wrapping the merged line onto a
-            // second one, which would give back the height this change exists to save.
-            overflow: "hidden",
-            textOverflow: "ellipsis",
-            whiteSpace: "nowrap",
-            background: "transparent",
-            border: `1px solid ${C.hairline}`,
-            borderRadius: RADIUS.input,
-            color: C.cream,
-            padding: "1px 7px",
-            fontSize: TYPE.small,
-            lineHeight: 1.5,
-            cursor: openParent === undefined ? "default" : "pointer",
-          }}
-        >
-          {parentLabel}
-        </span>
-      ),
-    });
-  }
+  const openParent = onOpenBead;
+  const parentChip =
+    parentId !== null && parentLabel !== null && parentLabel !== "" ? (
+      <span
+        data-testid={`${t}-parent`}
+        data-bead-id={parentId}
+        title={`Epic: ${parentLabel}`}
+        aria-label={`Epic: ${parentLabel}`}
+        role={openParent === undefined ? undefined : "button"}
+        tabIndex={openParent === undefined ? undefined : 0}
+        onClick={
+          openParent === undefined
+            ? undefined
+            : (e) => {
+                e.stopPropagation();
+                openParent(parentId);
+              }
+        }
+        onKeyDown={
+          openParent === undefined
+            ? undefined
+            : (e) => {
+                if (e.key !== "Enter" && e.key !== " ") return;
+                e.preventDefault();
+                e.stopPropagation();
+                openParent(parentId);
+              }
+        }
+        style={{
+          display: "inline-block",
+          flex: "0 1 auto",
+          minWidth: 0,
+          maxWidth: "100%",
+          // A TITLE CAN BE A SENTENCE. It ellipsises rather than wrapping the chrome row onto a
+          // second line, which is the whole point of keeping it on one line beside the type.
+          overflow: "hidden",
+          textOverflow: "ellipsis",
+          whiteSpace: "nowrap",
+          background: "transparent",
+          border: `1px solid ${C.hairline}`,
+          borderRadius: RADIUS.input,
+          color: C.cream,
+          padding: "1px 7px",
+          fontSize: TYPE.small,
+          lineHeight: 1.5,
+          cursor: openParent === undefined ? "default" : "pointer",
+        }}
+      >
+        {parentLabel}
+      </span>
+    ) : null;
 
   // The batch is offered only when there is a batch: one epic sharing a PRD with itself is not one.
   // Narrowed to a callback rather than to a boolean so the JSX below needs no non-null assertion.
@@ -902,6 +922,14 @@ export function BeadCard({
             "epic" has had three competing meanings in this codebase and `services/beads.ts` is the
             one place allowed to say which is meant. */}
         <TypePill type={bead.type} testId={`${t}-type-pill`} />
+        {/* ── THE PARENT EPIC PILL — IMMEDIATELY RIGHT OF THE TYPE LABEL (bead sparkle-huw924.11) ──
+            *"I want the Epic label to be a pill, just like it is in the current task card, but to
+            the right of the feature label."* Built above as `parentChip` (null when the bead has
+            no parent, e.g. an epic), it carries its own shrink + ellipsis so a long epic title
+            truncates rather than wrapping the row. Nothing here reads `chrome`: the board's task
+            card, the concierge card and the epics column all show the same pill in the same place,
+            which is the surface convergence sparkle-huw924.10 is also driving. */}
+        {parentChip}
         {/* ── WHERE THIS CARD CAN BE OPENED — RIGHT OF THE PILL, WHICH IS THE FOUNDER'S PLACEMENT ──
             2026-08-24, reading the epics column: *"For epics on the epic column, I want a [link] to
             the right of the yellow epic pill that says 'board view' and opens the epic on the
@@ -1198,12 +1226,12 @@ export function BeadCard({
             if (gestureSelectedText(e)) return;
             onToggleCollapsed();
           }}
-          style={{ ...TITLE_STYLE, ...TITLE_BUTTON_RESET }}
+          style={{ ...titleStyle, ...TITLE_BUTTON_RESET }}
         >
           {bead.title || bead.id}
         </button>
       ) : (
-        <span data-testid={`${t}-title`} style={TITLE_STYLE}>
+        <span data-testid={`${t}-title`} style={titleStyle}>
           {bead.title || bead.id}
         </span>
       )}
@@ -1238,9 +1266,10 @@ export function BeadCard({
           //
           // Nothing is silently clipped by this: the stage item carries `flex: 1 1 96px;
           // minWidth: 0` and gives up its width first — exactly the "not the full width of the
-          // card" behaviour he asked for — and the two content-length items (the parent chip and
-          // `in <project>`) are `flex: 0 1 auto; minWidth: 0`, which is what lets the chip's
-          // ellipsis actually fire rather than clipping the title at the card's edge.
+          // card" behaviour he asked for — and the content-length item (`in <project>`) is
+          // `flex: 0 1 auto; minWidth: 0`, which is what lets its ellipsis fire rather than
+          // clipping it at the card's edge. (The parent-epic chip used to be the other such item
+          // here; it moved to the chrome row — bead sparkle-huw924.11.)
           flexWrap: "nowrap",
           minWidth: 0,
           // The backstop, and it is deliberately CLIPPING rather than wrapping: a merged line that
@@ -1276,12 +1305,13 @@ export function BeadCard({
               // The named fields are short and already minimal; the stage bar is the one thing with
               // slack to give, which is precisely the founder's "not the full width of the card".
               //
-              // ══ …BUT THE TWO CONTENT-LENGTH ITEMS MUST GIVE GROUND ═════════════════════════
-              // The parent-epic chip and `in <project>` are as long as what they say, and a
-              // `0 0 auto` wrapper is always exactly as wide as its own text — which is why the
-              // chip's `text-overflow: ellipsis` could never fire and a long epic title clipped at
-              // the card's edge instead. `0 1 auto` + `minWidth: 0` is what gives the ellipsis
-              // something to work with; `nowrap` is what keeps it on this line. See `MetaItem`.
+              // ══ …BUT THE CONTENT-LENGTH ITEM MUST GIVE GROUND ═════════════════════════════
+              // `in <project>` is as long as what it says, and a `0 0 auto` wrapper is always
+              // exactly as wide as its own text — which is why a long value could never ellipsise
+              // and clipped at the card's edge instead. `0 1 auto` + `minWidth: 0` is what gives
+              // the ellipsis something to work with; `nowrap` is what keeps it on this line. See
+              // `MetaItem`. (The parent-epic chip was the other `shrink` item here before it moved
+              // to the chrome row — bead sparkle-huw924.11.)
               ...(item.grow === true
                 ? { flex: "1 1 96px", minWidth: 0 }
                 : item.shrink === true
@@ -1333,9 +1363,10 @@ export function BeadCard({
 
       {/* ── THE REMAINING FIELDS — EXPANDED ONLY ──────────────────────────────────────────────
           THE `Epic` FIELD IS GONE FROM HERE ON PURPOSE. It printed `bead.parent` as a raw mono id
-          on a row of its own; the parent is now a chip on the merged line, reading the epic's
-          TITLE. ONE parent treatment, not two — and one fewer row. The `${t}-parent` testid moved
-          with it, so every caller that addressed the field still addresses the chip. */}
+          on a row of its own; the parent is now a chip in the chrome row, right of the type label,
+          reading the epic's TITLE (bead sparkle-huw924.11). ONE parent treatment, not two — and one
+          fewer row. The `${t}-parent` testid moved with it, so every caller that addressed the
+          field still addresses the chip. */}
       {expanded && bead.labels.length > 0 && (
         <Field label="Labels">
           <span data-testid={`${t}-labels`}>{bead.labels.join(", ")}</span>
