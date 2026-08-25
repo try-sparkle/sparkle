@@ -5372,6 +5372,20 @@ fn decode_open_prs(stdout: &str, limit: u32) -> Option<Vec<PrRow>> {
 /// fallback is O(N) where the primary is O(1). This bounds the menu's cost during an outage.
 const REST_CHECK_BUDGET: usize = 20;
 
+/// Rows the REST list endpoint is asked for in ONE page — and the number a TRUNCATED page is
+/// detected at.
+///
+/// 100 is GitHub's own per-page ceiling, so this is not a tunable; asking for more still returns
+/// 100. The fallback reads one page and does not follow `Link: rel="next"`, so a repo with more
+/// open pull requests than this has its list cut with no signal of any kind — the same silent
+/// truncation [`OPEN_PR_LIST_LIMIT`] guards on the GraphQL side (bead sparkle-qogah).
+///
+/// It bites HARDER here, because the `--author @me` scoping the GraphQL query does server-side is
+/// applied by [`rest_rows_from_parts`] AFTER this cut. A busy repo can fill the entire page with
+/// other people's pull requests and hand back a short — or empty — list of mine that carries no
+/// evidence it was truncated at all.
+const REST_PULLS_PAGE: u32 = 100;
+
 /// One `gh api <path>` against `dir`'s repo. `{owner}/{repo}` is resolved by `gh` from the working
 /// directory, so no slug lookup is needed.
 fn gh_api(dir: &str, path: &str) -> Option<String> {
@@ -5401,18 +5415,35 @@ fn gh_api(dir: &str, path: &str) -> Option<String> {
 /// treats it as a reason to WAIT rather than to offer a one-click merge — so an outage degrades
 /// the menu to "listed, not yet mergeable" instead of inventing a verdict. Reporting `"mergeable"`
 /// here would put a live Merge button under a PR nobody read.
+///
+/// TWO BOUNDS CAN TRUNCATE THIS READ AND ONLY ONE OF THEM IS THE BUDGET. `page` is the row cap the
+/// list call was issued with ([`REST_PULLS_PAGE`]); a page that came back FULL means pull requests
+/// past it were never listed, and no budget covers what was never listed. Judging it on the RAW
+/// page — before the `me` filter — is the whole point: the filter runs after GitHub's cut, so a
+/// page of somebody else's pull requests leaves `mine` short or empty while every row it did keep
+/// had its checks read, which is precisely the shape that reads as a complete answer.
 fn rest_rows_from_parts<F>(
     pulls_body: &str,
     me: &str,
     budget: usize,
+    page: u32,
     mut fetch_checks: F,
 ) -> Option<Vec<PrRow>>
 where
     F: FnMut(&str) -> Option<Vec<Value>>,
 {
     let pulls = crate::gh_rest::decode_pulls(pulls_body)?;
+    let page_full = read_is_saturated(pulls.len(), page);
     let mine: Vec<_> = pulls.into_iter().filter(|p| p.author == me).collect();
     let covered = mine.len().min(budget);
+    // A FULL PAGE WITH NONE OF MINE IS "COULD NOT TELL", NOT "YOU HAVE NO OPEN PULL REQUESTS".
+    // `list_saturated` rides on the rows, so an empty vec carries no disclosure anywhere — it is
+    // the one truncated answer that cannot admit to being one. `None` is the value this file
+    // already means by "the probe did not resolve" (see `decode_open_prs`), and the menu renders
+    // nothing for it rather than a confident empty state.
+    if page_full && mine.is_empty() {
+        return None;
+    }
     Some(
         mine.iter()
             .take(covered)
@@ -5440,7 +5471,7 @@ where
                     failing_checks: failing,
                     pending_checks: pending,
                     head_ref_oid: p.head_oid.clone(),
-                    list_saturated: covered < mine.len(),
+                    list_saturated: page_full || covered < mine.len(),
                     ..Default::default()
                 }
             })
@@ -5454,8 +5485,11 @@ fn rest_open_prs(root: &str) -> Option<Vec<PrRow>> {
         .and_then(|b| serde_json::from_str::<Value>(&b).ok())
         .and_then(|v| v.get("login").and_then(Value::as_str).map(str::to_string))
         .filter(|s| !s.is_empty())?;
-    let pulls = gh_api(root, "repos/{owner}/{repo}/pulls?state=open&per_page=100")?;
-    rest_rows_from_parts(&pulls, &me, REST_CHECK_BUDGET, |sha| {
+    let pulls = gh_api(
+        root,
+        &format!("repos/{{owner}}/{{repo}}/pulls?state=open&per_page={REST_PULLS_PAGE}"),
+    )?;
+    rest_rows_from_parts(&pulls, &me, REST_CHECK_BUDGET, REST_PULLS_PAGE, |sha| {
         let runs = gh_api(root, &format!("repos/{{owner}}/{{repo}}/commits/{sha}/check-runs?per_page=100"))?;
         let statuses = gh_api(root, &format!("repos/{{owner}}/{{repo}}/commits/{sha}/status"))?;
         crate::gh_rest::rollup_from_rest(&runs, &statuses)
@@ -5487,7 +5521,7 @@ mod rest_pr_rows_tests {
     fn a_green_rest_payload_reads_as_passing_end_to_end() {
         let runs = r#"{"check_runs":[{"name":"CI","status":"completed","conclusion":"success"}]}"#;
         let statuses = r#"{"statuses":[{"context":"Vercel","state":"success"}]}"#;
-        let rows = rest_rows_from_parts(PULLS, "me", 10, |_| {
+        let rows = rest_rows_from_parts(PULLS, "me", 10, 100, |_| {
             crate::gh_rest::rollup_from_rest(runs, statuses)
         })
         .unwrap();
@@ -5500,11 +5534,11 @@ mod rest_pr_rows_tests {
     /// it gets its own word, so "we could not look" cannot present as "nothing needs to run".
     #[test]
     fn an_unreadable_rollup_is_unknown_not_none() {
-        let unread = rest_rows_from_parts(PULLS, "me", 10, |_| None).unwrap();
+        let unread = rest_rows_from_parts(PULLS, "me", 10, 100, |_| None).unwrap();
         assert_eq!(unread[0].checks, "unknown");
         assert_ne!(unread[0].checks, "none", "an unread PR must not read as one with no checks");
 
-        let empty = rest_rows_from_parts(PULLS, "me", 10, |_| Some(vec![])).unwrap();
+        let empty = rest_rows_from_parts(PULLS, "me", 10, 100, |_| Some(vec![])).unwrap();
         assert_eq!(empty[0].checks, "none", "but a genuinely empty rollup still reads none");
     }
 
@@ -5512,7 +5546,7 @@ mod rest_pr_rows_tests {
     #[test]
     fn a_failing_rest_check_still_reads_failing() {
         let runs = r#"{"check_runs":[{"name":"CI","status":"completed","conclusion":"failure"}]}"#;
-        let rows = rest_rows_from_parts(PULLS, "me", 10, |_| {
+        let rows = rest_rows_from_parts(PULLS, "me", 10, 100, |_| {
             crate::gh_rest::rollup_from_rest(runs, r#"{"statuses":[]}"#)
         })
         .unwrap();
@@ -5798,7 +5832,7 @@ mod rest_pr_rows_tests {
     /// button under a PR whose mergeability nobody read.
     #[test]
     fn a_rest_row_never_claims_mergeability() {
-        let rows = rest_rows_from_parts(PULLS, "me", 10, |_| Some(vec![])).unwrap();
+        let rows = rest_rows_from_parts(PULLS, "me", 10, 100, |_| Some(vec![])).unwrap();
         for r in &rows {
             assert_eq!(r.mergeable, "unknown");
             assert_eq!(r.merge_state_status, "unknown");
@@ -5809,7 +5843,7 @@ mod rest_pr_rows_tests {
     /// client-side. Without it an outage would silently widen the menu to every open PR in the repo.
     #[test]
     fn only_my_own_prs_survive_the_author_filter() {
-        let rows = rest_rows_from_parts(PULLS, "me", 10, |_| Some(vec![])).unwrap();
+        let rows = rest_rows_from_parts(PULLS, "me", 10, 100, |_| Some(vec![])).unwrap();
         assert_eq!(rows.len(), 2);
         assert!(rows.iter().all(|r| r.number != 9999), "another author's PR is not mine");
     }
@@ -5818,10 +5852,10 @@ mod rest_pr_rows_tests {
     /// everything rather than implying the missing PRs do not exist.
     #[test]
     fn a_budget_cutoff_marks_the_list_saturated() {
-        let full = rest_rows_from_parts(PULLS, "me", 10, |_| Some(vec![])).unwrap();
+        let full = rest_rows_from_parts(PULLS, "me", 10, 100, |_| Some(vec![])).unwrap();
         assert!(!full[0].list_saturated);
 
-        let cut = rest_rows_from_parts(PULLS, "me", 1, |_| Some(vec![])).unwrap();
+        let cut = rest_rows_from_parts(PULLS, "me", 1, 100, |_| Some(vec![])).unwrap();
         assert_eq!(cut.len(), 1);
         assert!(cut[0].list_saturated);
     }
@@ -5830,7 +5864,96 @@ mod rest_pr_rows_tests {
     /// no open PRs".
     #[test]
     fn an_unreadable_pulls_body_is_not_an_empty_menu() {
-        assert!(rest_rows_from_parts("503 Service Unavailable", "me", 10, |_| Some(vec![])).is_none());
+        assert!(rest_rows_from_parts("503 Service Unavailable", "me", 10, 100, |_| Some(vec![])).is_none());
+    }
+
+    /// `n` REST pull rows, the first `mine` of them authored by "me" and the rest by somebody else.
+    /// The page-cap tests need a FULL page, which is past what a literal fixture carries legibly.
+    fn pulls_page(n: usize, mine: usize) -> String {
+        let rows: Vec<String> = (0..n)
+            .map(|i| {
+                let login = if i < mine { "me" } else { "other" };
+                format!(
+                    r#"{{"number":{n0},"title":"t","draft":false,"html_url":"https://gh/{n0}",
+                       "user":{{"login":"{login}"}},"updated_at":"2026-08-17T00:00:00Z",
+                       "head":{{"ref":"b{i}","sha":"aaaa{i}"}},"base":{{"sha":"bbbb2222"}}}}"#,
+                    n0 = 3000 + i,
+                )
+            })
+            .collect();
+        format!("[{}]", rows.join(","))
+    }
+
+    /// THE DEFECT, ON THE FALLBACK PATH (bead sparkle-qogah.5). The GraphQL probe learned to admit
+    /// a full window; REST did not, and REST is what answers during exactly the GraphQL outage
+    /// that makes the menu matter.
+    ///
+    /// The `--author @me` scoping GraphQL does server-side is applied here AFTER GitHub's 100-row
+    /// page cut, so a repo busy with OTHER people's pull requests fills the page, leaves two of
+    /// mine, reads checks for both — and the only bound the old code judged (`covered <
+    /// mine.len()`) is false. A truncated list then presented as the complete one, which is the
+    /// whole bug: mine at position 101 is missing from the menu and nothing says so.
+    #[test]
+    fn a_full_rest_page_is_saturated_even_when_every_row_of_mine_was_covered() {
+        let rows = rest_rows_from_parts(&pulls_page(100, 2), "me", 10, 100, |_| Some(vec![]))
+            .expect("a readable page must produce rows");
+        assert_eq!(rows.len(), 2, "the budget covered every pull request of mine");
+        assert!(
+            rows.iter().all(|r| r.list_saturated),
+            "the PAGE was full, so pull requests past it were never listed and the menu is not \
+             the whole story — the check budget having covered everything it was HANDED is not \
+             evidence that it was handed everything"
+        );
+    }
+
+    /// The other half of the pair: the same shape ONE row short of the cap is authoritative, so the
+    /// flag above is the page filling up rather than a hedge stamped on every REST read.
+    #[test]
+    fn a_rest_page_below_the_cap_stays_authoritative() {
+        let rows = rest_rows_from_parts(&pulls_page(99, 2), "me", 10, 100, |_| Some(vec![]))
+            .expect("a readable page must produce rows");
+        assert_eq!(rows.len(), 2);
+        assert!(
+            rows.iter().all(|r| !r.list_saturated),
+            "a page that did not fill up IS the complete list; hedging it teaches the reader to \
+             ignore the hedge"
+        );
+    }
+
+    /// THE CASE THE PER-ROW FLAG CANNOT CARRY. `list_saturated` rides on the rows, so a full page
+    /// holding NONE of mine returns an empty vec with nowhere to put the disclosure — the one
+    /// truncated answer that cannot admit to being one, rendering as "you have no open pull
+    /// requests" on evidence that cannot support it.
+    #[test]
+    fn a_full_rest_page_with_none_of_mine_is_unknown_not_an_empty_menu() {
+        assert!(
+            rest_rows_from_parts(&pulls_page(100, 0), "me", 10, 100, |_| Some(vec![])).is_none(),
+            "an empty vec here asserts a total; the page was full, so nothing was established"
+        );
+    }
+
+    /// And the honest empty stays empty: a SHORT page with none of mine really is "no open pull
+    /// requests of yours", and turning that into `None` would blank a working menu.
+    #[test]
+    fn a_short_rest_page_with_none_of_mine_is_still_a_real_empty_list() {
+        let rows = rest_rows_from_parts(&pulls_page(99, 0), "me", 10, 100, |_| Some(vec![]))
+            .expect("a complete page with none of mine is a KNOWN empty list");
+        assert!(rows.is_empty());
+    }
+
+    /// THE FLAG HAS TO CROSS THE WIRE UNDER THE NAME THE MENU READS. `OpenPrMenu.tsx` keys off
+    /// `r.listSaturated` to render the count as a FLOOR and to stop dismissal pruning; a rename on
+    /// this side leaves both silently inert with every Rust test still green.
+    #[test]
+    fn a_saturated_rest_read_crosses_the_ipc_boundary_as_list_saturated() {
+        let rows = rest_rows_from_parts(&pulls_page(100, 1), "me", 10, 100, |_| Some(vec![]))
+            .expect("a readable page must produce rows");
+        let json = serde_json::to_value(&rows[0]).expect("a PrRow must serialize");
+        assert_eq!(
+            json.get("listSaturated"),
+            Some(&serde_json::Value::Bool(true)),
+            "the truncation must reach the menu, not just the struct: {json}"
+        );
     }
 }
 

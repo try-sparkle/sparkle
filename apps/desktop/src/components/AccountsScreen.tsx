@@ -199,6 +199,16 @@ export interface AccountsScreenProps {
 
 const fontStack = FONT_UI;
 
+// How often the Accounts screen re-reads each dir's `.claude.json` to keep the DISPLAYED EMAIL live.
+// The identity map is otherwise written only by `refresh()` (mount / add / rename / remove / login),
+// so a login that swaps a dir's login from OUTSIDE this screen — a terminal `claude login`, an
+// automatic rotation/failover, an expiry-and-reauth — would leave the row showing the PREVIOUS
+// account's email until the user happened to trigger one of those gestures. A slow poll of the light
+// `.claude.json`-only read (no keychain, no transcripts) keeps the shown email tracking the dir's
+// CURRENT login instead of a stale cache. Slow on purpose: the email rarely changes, and this is a
+// freshness backstop, not a hot path.
+export const IDENTITY_REFRESH_MS = 15_000;
+
 const card: CSSProperties = {
   border: `1px solid ${C.muted}`,
   borderRadius: 6,
@@ -536,6 +546,28 @@ function LiveUsageSection({
 function exhaustedLabel(usage: Usage | undefined, now: number): string | null {
   if (!usage?.exhaustedUntil || usage.exhaustedUntil <= now) return null;
   return `Exhausted until ${clockTime(usage.exhaustedUntil)}`;
+}
+
+/** True when a live-usage rejection means the account's LOGIN is dead, as opposed to a transient
+ *  network/timeout/5xx or a "we couldn't answer" keychain miss (that last one is
+ *  {@link isUsageUnknownError}, handled first and separately).
+ *
+ *  The one authoritative shape is the terminal-401 string `src-tauri/src/account_usage.rs` returns
+ *  after it has dropped the cached token, re-read from source, and STILL been refused: `usage fetch
+ *  failed: unauthorized after keychain re-read`. That is a cross-language contract — a proven-dead
+ *  bearer token — so it, and not a generic network error, is what routes the "sign in again" remedy.
+ *  Tolerates the three shapes a rejected Tauri `invoke` hands back, exactly like
+ *  {@link isUsageUnknownError}. Anything else is NOT an auth failure and stays a transient error. */
+function isUsageAuthError(err: unknown): boolean {
+  const msg =
+    typeof err === "string"
+      ? err
+      : err instanceof Error
+        ? err.message
+        : typeof (err as { message?: unknown } | null)?.message === "string"
+          ? (err as { message: string }).message
+          : "";
+  return msg.toLowerCase().includes("unauthorized");
 }
 
 /** A bordered notice in one ink — the shape every banner on this screen takes. */
@@ -936,8 +968,17 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
   // amber `role="alert"` treatment, while `"unknown"` means the read could not produce a token at all
   // and gets a muted `role="status"` — telling a user with a merely-lapsed token to check their
   // connection is worse than saying nothing.
+  // FOUR kinds now, because "a forced usage read failed" has four different causes and only ONE of
+  // them is "sign in again": `unknown` (no readable credential — muted status), `exhausted` (the
+  // account is signed in and healthy, just rate-limited — a neutral note naming the reset, never an
+  // alarm), `signedout` (a proven-dead login — the amber "sign in again" remedy), and `error` (a
+  // transient network/timeout/5xx — amber "try again"). Routing them apart is what stops a
+  // rate-limited-but-signed-in account being told to sign in again (the contradiction the founder saw).
   const [usageError, setUsageError] = useState<
-    Record<string, { kind: "error" | "unknown"; text: string } | null>
+    Record<
+      string,
+      { kind: "error" | "unknown" | "exhausted" | "signedout"; text: string } | null
+    >
   >({});
   // Which card's ⋮ kebab menu is open (item 11); only one at a time, null = none.
   const [openMenuId, setOpenMenuId] = useState<string | null>(null);
@@ -1150,6 +1191,38 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [accountsKey, liveNonce, getAuthStatusFn]);
 
+  // ── LIVE identity re-read: keep the DISPLAYED EMAIL current with each dir's `.claude.json` ────────
+  // The email a card shows is `accountDisplay(...).primary`, read from `identities`. That map is
+  // written by `refresh()` (mount / add / rename / remove / login), so a login that swaps a dir's
+  // `.claude.json` from OUTSIDE this screen never reached it — the row kept the PREVIOUS account's
+  // email until the user happened to trigger one of those gestures. This poll re-reads identities on
+  // a slow interval so the shown email tracks the dir's CURRENT login rather than a stale cache.
+  //
+  // NO immediate re-read here: mount and every login already read identities through `refresh()`, so
+  // firing one on effect-setup would only duplicate that read (and would perturb the exact call
+  // counts `AccountsScreen.relogin.test.tsx` pins). The interval is the only new fetch — the "live"
+  // part `refresh()` cannot provide, since nothing calls it on a background `.claude.json` change.
+  // `accounts_identities` opens only each dir's small `.claude.json` (no keychain, no transcripts),
+  // off the event-loop thread. A generation ref discards a stale batch's late write and any write
+  // after unmount; a failed read keeps the last-known labels rather than blanking them.
+  const identityGenRef = useRef(0);
+  useEffect(() => {
+    if (accounts.length === 0) return;
+    const reread = () => {
+      const gen = ++identityGenRef.current;
+      getIdentitiesFn()
+        .then((ids) => {
+          if (identityGenRef.current === gen) setIdentities(ids);
+        })
+        .catch(() => {
+          /* keep the last-known identities; a transient read must not blank the labels */
+        });
+    };
+    const t = setInterval(reread, IDENTITY_REFRESH_MS);
+    return () => clearInterval(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [accountsKey, liveNonce, getIdentitiesFn]);
+
   // ── "Check usage levels" — per-card, on-demand true-up of ONE account's REAL usage (item 14) ─────
   // The founder's ask, surfaced from each card's ⋮ menu. THE ONLY CALLER of the interactive reader
   // anywhere in the app: `getUsageLiveForcedFn` bypasses the cached OAuth token and re-reads the
@@ -1179,27 +1252,66 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
     } catch (e: unknown) {
       if (liveGenRef.current === gen) {
         // Same split as the quiet path, but the FORCED read has a WIDER unknown set — and getting
-        // that set wrong is what this branch exists to avoid. Three Rust outcomes land here and none
-        // of them is "your connection is broken": no token even interactively (`usage unknown: `),
-        // the user DECLINED the keychain prompt or a prior decline is still suppressed
-        // (`keychain access not granted`), and a read refused for running on the main thread
-        // (`keychain read refused on the main thread`, which is our bug, not their account).
+        // that set wrong is what this branch exists to avoid. Three Rust outcomes are "we could not
+        // ANSWER", none of them "your connection is broken": no token even interactively
+        // (`usage unknown: `), the user DECLINED the keychain prompt or a prior decline is still
+        // suppressed (`keychain access not granted`), and a read refused for running on the main
+        // thread (`keychain read refused on the main thread`, our bug, not their account).
         // `isUsageUnknownError` matches all three; it once matched only the first, which showed
         // someone who had just answered a dialog an amber "check your connection or sign in again".
         const unknown = isUsageUnknownError(e);
-        setLiveUsage((prev) => ({ ...prev, [a.id]: unknown ? "unknown" : "error" }));
-        setUsageError((m) => ({
-          ...m,
-          [a.id]: unknown
-            ? {
-                kind: "unknown" as const,
-                text: "Usage unknown — Sparkle couldn't read this account's saved credentials. Allow the keychain prompt when it appears, or sign in to this account again.",
-              }
-            : {
-                kind: "error" as const,
-                text: "Couldn't refresh usage. Check your connection or sign in again.",
+        if (unknown) {
+          setLiveUsage((prev) => ({ ...prev, [a.id]: "unknown" }));
+          setUsageError((m) => ({
+            ...m,
+            [a.id]: {
+              kind: "unknown" as const,
+              text: "Usage unknown — Sparkle couldn't read this account's saved credentials. Allow the keychain prompt when it appears, or sign in to this account again.",
+            },
+          }));
+        } else {
+          // A GENUINE failure — but "sign in again" is right for only ONE of its three causes, so
+          // route the message from the actual cause instead of asserting the worst one for all. The
+          // old single string told a rate-limited (signed-in, healthy) account to sign in again,
+          // contradicting the "Exhausted until …" line right beside it.
+          setLiveUsage((prev) => ({ ...prev, [a.id]: "error" }));
+          const exReset = exhaustedLabel(
+            usage.find((u) => u.id === a.id),
+            Date.now(),
+          );
+          // A proven-dead token from the fetch itself (a terminal 401), OR the row's own login read
+          // (identity + `claude auth status`) saying the session is gone. Either is decisive that
+          // "sign in again" is the correct remedy; a mere network error is neither.
+          const identity = identities.find((i) => i.id === a.id);
+          const loginDead =
+            isUsageAuthError(e) ||
+            deriveRowLogin(isSignedIn(identity), authStatus[a.id]) !== "healthy";
+          if (exReset) {
+            setUsageError((m) => ({
+              ...m,
+              [a.id]: {
+                kind: "exhausted" as const,
+                text: `${exReset} — this account is signed in; its limit resets then.`,
               },
-        }));
+            }));
+          } else if (loginDead) {
+            setUsageError((m) => ({
+              ...m,
+              [a.id]: {
+                kind: "signedout" as const,
+                text: "This account is signed out. Sign in again to see its usage.",
+              },
+            }));
+          } else {
+            setUsageError((m) => ({
+              ...m,
+              [a.id]: {
+                kind: "error" as const,
+                text: "Couldn't refresh usage — a temporary problem reaching Anthropic. Try again in a moment.",
+              },
+            }));
+          }
+        }
       }
     } finally {
       setCheckingUsage((m) => ({ ...m, [a.id]: false }));
@@ -2740,9 +2852,12 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
             <LiveUsageSection live={liveUsage[a.id]} accountId={a.id} now={now} />
             {/* Per-card "Check usage levels" status (item 14): a brief in-flight line, then the
                 outcome note if the forced fetch didn't produce figures — never a browser dialog.
-                TWO SHAPES, and the distinction is the point: an "unknown" outcome (no readable
-                credential) is a muted status, while a genuine failure is the amber alert. Rendering
-                the alarm copy for both is what sent users chasing a non-existent outage. */}
+                FOUR SHAPES, and the distinction is the point: `unknown` (no readable credential) and
+                `exhausted` (signed in, just rate-limited) are calm MUTED statuses — neither is a
+                fault the user must chase — while `signedout` (a dead login) and `error` (a transient
+                network problem) are amber ALERTS. Rendering the alarm copy for all of them, or the
+                "sign in again" remedy for a merely rate-limited account, is what sent users chasing a
+                non-existent outage. */}
             {checkingUsage[a.id] ? (
               <div
                 data-testid={`account-usage-checking-${a.id}`}
@@ -2751,9 +2866,13 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
               >
                 Checking usage…
               </div>
-            ) : usageError[a.id]?.kind === "unknown" ? (
+            ) : usageError[a.id]?.kind === "unknown" || usageError[a.id]?.kind === "exhausted" ? (
               <div
-                data-testid={`account-usage-unknown-note-${a.id}`}
+                data-testid={
+                  usageError[a.id]?.kind === "exhausted"
+                    ? `account-usage-exhausted-note-${a.id}`
+                    : `account-usage-unknown-note-${a.id}`
+                }
                 role="status"
                 style={{ marginTop: 6, fontSize: 12, color: C.muted }}
               >

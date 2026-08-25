@@ -2,9 +2,14 @@
 //
 // Interaction tests for the Accounts settings screen: load/list, add → onLogin seam, inline
 // rename, and the two-step remove confirm (default guarded). IO is injected via the `deps` prop.
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
-import { AccountsScreen, SIGNED_IN_NO_EMAIL, type AccountsDeps } from "./AccountsScreen";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  AccountsScreen,
+  IDENTITY_REFRESH_MS,
+  SIGNED_IN_NO_EMAIL,
+  type AccountsDeps,
+} from "./AccountsScreen";
 import { PENDING_NICKNAME, EXPIRED_LOGIN_NICKNAME } from "./accountsView";
 import { ROTATION_OUT_STORAGE_KEY, ROTATION_PAUSED_STORAGE_KEY } from "../services/rotationState";
 import {
@@ -529,8 +534,11 @@ describe("AccountsScreen", () => {
       [{ id: "a", email: "a@x.com", organization: null, accountUuid: "ua" }],
     );
     deps.getUsageLive = vi.fn(async (_c: string) => liveUsage(10, 10));
+    // A generic, non-auth failure on a signed-in, non-exhausted account: the TRANSIENT cause. The
+    // amber alert must appear, and it must NOT tell a healthy signed-in account to sign in again
+    // (that remedy is now reserved for a proven-dead login — see the usage-clarity suite).
     deps.getUsageLiveForced = vi.fn(async (_c: string) => {
-      throw new Error("keychain access denied");
+      throw new Error("network down");
     });
     render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
     // Let the mount fetch settle first so the check's fetch is the one we assert on.
@@ -539,7 +547,10 @@ describe("AccountsScreen", () => {
     fireEvent.click(within(await openKebab("a")).getByText("Check usage levels"));
 
     const err = await screen.findByTestId("account-usage-error-a");
-    expect(err.textContent).toBe("Couldn't refresh usage. Check your connection or sign in again.");
+    expect(err.textContent).toBe(
+      "Couldn't refresh usage — a temporary problem reaching Anthropic. Try again in a moment.",
+    );
+    expect(err.textContent).not.toContain("sign in again");
     expect(err.getAttribute("role")).toBe("alert");
   });
 
@@ -3605,5 +3616,122 @@ describe("AccountsScreen — the sticky consumers", () => {
       expect(screen.queryByTestId("account-expired-a")).toBeNull();
       expect(screen.queryByTestId("account-blocked-a")).toBeNull();
     });
+  });
+});
+
+// ── FIX A: the displayed email LIVE-REFRESHES off the dir's current .claude.json ─────────────────
+//
+// The email a card shows is read from `identities`, which was written ONLY by `refresh()` (mount /
+// add / rename / remove / login). A login that swaps a dir's `.claude.json` from OUTSIDE this screen
+// — a terminal `claude login`, an automatic rotation/failover, an expiry-and-reauth — reaches none
+// of those, so the row kept showing the PREVIOUS account's email indefinitely. A slow poll re-reads
+// identities so the shown email tracks the dir's CURRENT login. Fake timers drive the poll boundary.
+describe("displayed email live-refreshes off the dir's current .claude.json (FIX A)", () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => {
+    cleanup();
+    vi.useRealTimers();
+  });
+
+  // Advance fake time by `ms` and let the injected promises (getIdentities et al.) settle, all inside
+  // act() so the resulting React state writes are flushed before we assert.
+  async function settle(ms = 0) {
+    await act(async () => {
+      vi.advanceTimersByTime(ms);
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+  }
+
+  it("the poll re-reads identities so a login swapped from OUTSIDE the pane updates the shown email", async () => {
+    // `current` stands in for what each dir's `.claude.json` resolves to right now. It changes with
+    // NO gesture on the pane — the whole point of the fix.
+    let current: Identity[] = [
+      { id: "a", email: "old@x.com", organization: null, accountUuid: "u1" },
+    ];
+    const deps = makeDeps([acct("a", { nickname: "A" })], []);
+    deps.getIdentities = vi.fn(async () => current);
+
+    render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
+    await settle();
+    // The mount read shows the original login's email.
+    expect(screen.getByText("old@x.com")).toBeTruthy();
+
+    // The login behind the dir is replaced from outside this screen — no add/rename/remove/login.
+    current = [{ id: "a", email: "new@x.com", organization: null, accountUuid: "u2" }];
+
+    // Just SHORT of the poll interval: nothing has re-read, so the stale email still stands. This is
+    // what makes the next step's update attributable to the POLL rather than an incidental re-render.
+    await settle(IDENTITY_REFRESH_MS - 1000);
+    expect(screen.getByText("old@x.com")).toBeTruthy();
+
+    // Cross the poll boundary → the row now reflects the dir's CURRENT login, with no user gesture.
+    await settle(2000);
+    expect(screen.getByText("new@x.com")).toBeTruthy();
+    expect(screen.queryByText("old@x.com")).toBeNull();
+  });
+});
+
+// ── FIX B: a failed "Check usage levels" is ROUTED FROM THE ACTUAL CAUSE ──────────────────────────
+//
+// The three tests share one signed-in fixture and one gesture; only the CAUSE differs, and each
+// asserts BOTH its own message AND the absence of the other two — so a handler that hard-coded any
+// single message (the pre-fix behaviour, which said "sign in again" for every failure) fails the
+// other two. That is the paired, mutation-proof shape: the assertion cannot pass against a screen
+// that renders one outcome unconditionally.
+describe("Check usage failure is routed from the actual cause (FIX B)", () => {
+  const identityA: Identity = { id: "a", email: "a@x.com", organization: null, accountUuid: "ua" };
+
+  it("EXHAUSTED: a signed-in but rate-limited account shows 'Exhausted until …', never 'sign in again'", async () => {
+    // exhaustedUntil is read against Date.now() (ms) on the frontend, so a future ms value is a live
+    // wall. The forced fetch fails with a 429 — but the account is signed in and healthy, so the
+    // remedy must NOT be "sign in again".
+    const future = Date.now() + 60 * 60 * 1000;
+    const usage: Usage[] = [{ id: "a", tokens5h: 1, tokens7d: 1, exhaustedUntil: future }];
+    const deps = makeDeps([acct("a", { nickname: "A" })], usage, [identityA]);
+    deps.getUsageLiveForced = vi.fn(async () => {
+      throw new Error("usage fetch failed: HTTP 429 Too Many Requests");
+    });
+    render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
+    fireEvent.click(within(await openKebab("a")).getByText("Check usage levels"));
+
+    const note = await screen.findByTestId("account-usage-exhausted-note-a");
+    expect(note.textContent).toContain("Exhausted until");
+    expect(note.textContent).not.toContain("sign in again");
+    // A calm status, not the amber signed-out/transient alert.
+    expect(note.getAttribute("role")).toBe("status");
+    expect(screen.queryByTestId("account-usage-error-a")).toBeNull();
+  });
+
+  it("SIGNED-OUT: a proven-dead login (terminal 401) shows the 'sign in again' remedy", async () => {
+    const deps = makeDeps([acct("a", { nickname: "A" })], [], [identityA]);
+    // The exact terminal-401 string the Rust side returns after dropping the cache and re-reading.
+    deps.getUsageLiveForced = vi.fn(async () => {
+      throw new Error("usage fetch failed: unauthorized after keychain re-read");
+    });
+    render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
+    fireEvent.click(within(await openKebab("a")).getByText("Check usage levels"));
+
+    const err = await screen.findByTestId("account-usage-error-a");
+    expect(err.textContent).toContain("signed out");
+    expect(err.textContent).toContain("Sign in again");
+    expect(err.getAttribute("role")).toBe("alert");
+    expect(screen.queryByTestId("account-usage-exhausted-note-a")).toBeNull();
+  });
+
+  it("TRANSIENT: a network failure on a signed-in, non-exhausted account says 'try again', not 'sign in again'", async () => {
+    const deps = makeDeps([acct("a", { nickname: "A" })], [], [identityA]);
+    deps.getUsageLiveForced = vi.fn(async () => {
+      throw new Error("usage fetch failed: connection timed out");
+    });
+    render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
+    fireEvent.click(within(await openKebab("a")).getByText("Check usage levels"));
+
+    const err = await screen.findByTestId("account-usage-error-a");
+    expect(err.textContent).toContain("Try again");
+    expect(err.textContent?.toLowerCase()).not.toContain("sign in again");
+    expect(err.getAttribute("role")).toBe("alert");
+    expect(screen.queryByTestId("account-usage-exhausted-note-a")).toBeNull();
   });
 });

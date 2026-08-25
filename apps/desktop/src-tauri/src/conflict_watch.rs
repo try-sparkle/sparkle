@@ -419,6 +419,15 @@ const SATURATED_BY_LIST_WINDOW: &str = "list-window";
 /// [`PROBE_LIMIT`]: the LIST was complete, the per-PR check enrichment was not.
 const SATURATED_BY_CHECK_BUDGET: &str = "rest-check-budget";
 
+/// The REST fallback's own LIST came back full at [`REST_PULLS_PAGE`] (100) — a third bound, and
+/// the OUTERMOST one.
+///
+/// It outranks [`SATURATED_BY_CHECK_BUDGET`] when both fire, because the two send a reader in
+/// different directions and only one of them is reachable: a PR past the page was never listed, so
+/// no amount of check budget can reach it. Naming the budget there would print a remedy that
+/// cannot work — the same misdirection [`Probed::saturated_by`] exists to end.
+const SATURATED_BY_REST_PAGE: &str = "rest-list-page";
+
 /// Did the read come back with its window FULL?
 ///
 /// Same reasoning, and deliberately the same shape, as `knightwatch::read_is_saturated` and
@@ -1440,6 +1449,20 @@ const BOTH_APIS_FAILED: &str = "gh-graphql-and-rest-failed";
 /// rather than running the sweep dry.
 const REST_CHECK_BUDGET: usize = 20;
 
+/// Rows [`REST_PULLS_QUERY`] asks for in ONE page — and the number a TRUNCATED page is detected at.
+///
+/// 100 is GitHub's own per-page ceiling, so this is not a tunable; asking for more still returns
+/// 100. The fallback reads one page and does not follow `Link: rel="next"`, so a repo with more
+/// than this many open pull requests has its list cut with no signal of any kind — the silent
+/// truncation [`read_is_saturated`] exists to refuse (bead sparkle-qogah), one API over.
+///
+/// Today [`REST_CHECK_BUDGET`] (20) is the tighter bound, so a full page is already reported as
+/// saturated by way of the budget. That is a coincidence of two numbers, not a guarantee: raise the
+/// budget to 100 and the page cap becomes the ONLY thing standing between a truncated sweep and a
+/// census it presents as complete. [`rest_probe_from_parts`] judges it in its own right for exactly
+/// that reason.
+const REST_PULLS_PAGE: u32 = 100;
+
 /// One `gh api <path>` against the repo `dir` belongs to, returning stdout.
 ///
 /// Any `{owner}/{repo}` in `path` is pre-expanded from `dir`'s resolved slug (see [`api_path_for`]
@@ -1494,11 +1517,19 @@ fn gh_api(dir: &Path, path: &str) -> Result<String, &'static str> {
 ///    It is tagged [`SATURATED_BY_CHECK_BUDGET`] rather than left to be assumed: the consequence
 ///    is shared with the GraphQL path's full window, but the BOUND is a different number and the
 ///    remedy is a different investigation.
-fn rest_probe_from_parts<F>(pulls_body: &str, budget: usize, mut fetch_checks: F) -> Option<Probed>
+fn rest_probe_from_parts<F>(
+    pulls_body: &str,
+    budget: usize,
+    page: u32,
+    mut fetch_checks: F,
+) -> Option<Probed>
 where
     F: FnMut(&str) -> Option<Vec<Value>>,
 {
     let pulls = crate::gh_rest::decode_pulls(pulls_body)?;
+    // The OUTER bound, judged in its own right — see [`REST_PULLS_PAGE`] for why "the budget is
+    // tighter anyway" is not a reason to leave it implied.
+    let page_full = read_is_saturated(pulls.len(), page);
     let covered = pulls.len().min(budget);
     let prs = pulls
         .iter()
@@ -1527,8 +1558,10 @@ where
         .collect();
     Some(Probed {
         prs,
-        saturated: covered < pulls.len(),
-        saturated_by: SATURATED_BY_CHECK_BUDGET,
+        saturated: page_full || covered < pulls.len(),
+        // The outermost bound that fired, not the innermost: a PR past the page is unreachable by
+        // any budget, so a reader sent after the budget would be chasing the wrong number.
+        saturated_by: if page_full { SATURATED_BY_REST_PAGE } else { SATURATED_BY_CHECK_BUDGET },
     })
 }
 
@@ -1551,7 +1584,7 @@ const REST_PULLS_QUERY: &str =
 /// The real REST fallback: one list call, then two calls per covered PR.
 fn rest_probe_open_prs(dir: &Path) -> Result<Probed, &'static str> {
     let pulls = gh_api(dir, REST_PULLS_QUERY)?;
-    rest_probe_from_parts(&pulls, REST_CHECK_BUDGET, |sha| {
+    rest_probe_from_parts(&pulls, REST_CHECK_BUDGET, REST_PULLS_PAGE, |sha| {
         let runs = gh_api(dir, &format!("repos/{{owner}}/{{repo}}/commits/{sha}/check-runs?per_page=100")).ok()?;
         let statuses = gh_api(dir, &format!("repos/{{owner}}/{{repo}}/commits/{sha}/status")).ok()?;
         crate::gh_rest::rollup_from_rest(&runs, &statuses)
@@ -1674,7 +1707,7 @@ mod rest_fallback_tests {
     /// caller reads the dropped row as a PR that no longer exists.
     #[test]
     fn the_budget_covers_the_front_of_the_list_and_admits_what_it_dropped() {
-        let read = rest_probe_from_parts(PULLS, 1, |_| Some(vec![]))
+        let read = rest_probe_from_parts(PULLS, 1, 100, |_| Some(vec![]))
             .expect("two decodable rows must produce a read");
         assert_eq!(read.prs.len(), 1, "the budget of 1 must cover exactly one PR");
         assert_eq!(
@@ -1874,7 +1907,7 @@ mod rest_fallback_tests {
     /// would report an unread PR as merging cleanly.
     #[test]
     fn a_rest_read_never_claims_a_mergeability_it_did_not_fetch() {
-        let read = rest_probe_from_parts(PULLS, 10, |_| Some(vec![])).unwrap();
+        let read = rest_probe_from_parts(PULLS, 10, 100, |_| Some(vec![])).unwrap();
         for f in &read.prs {
             assert_eq!(f.merge_state, MERGE_STATE_UNKNOWN, "unknown, not clean");
             assert!(!f.is_dirty, "and never a conflict we did not observe");
@@ -1886,11 +1919,11 @@ mod rest_fallback_tests {
     /// never reached cannot read as a PR that no longer exists.
     #[test]
     fn a_budget_cutoff_marks_the_read_saturated() {
-        let full = rest_probe_from_parts(PULLS, 10, |_| Some(vec![])).unwrap();
+        let full = rest_probe_from_parts(PULLS, 10, 100, |_| Some(vec![])).unwrap();
         assert_eq!(full.prs.len(), 2);
         assert!(!full.saturated, "a read that covered everything is authoritative");
 
-        let cut = rest_probe_from_parts(PULLS, 1, |_| Some(vec![])).unwrap();
+        let cut = rest_probe_from_parts(PULLS, 1, 100, |_| Some(vec![])).unwrap();
         assert_eq!(cut.prs.len(), 1);
         assert!(cut.saturated, "a read that ran out of budget is NOT a complete census");
     }
@@ -1907,7 +1940,7 @@ mod rest_fallback_tests {
     /// constant, which is exactly the field the sweep used to have.
     #[test]
     fn the_two_probes_report_different_saturation_bounds() {
-        let cut = rest_probe_from_parts(PULLS, 1, |_| Some(vec![])).unwrap();
+        let cut = rest_probe_from_parts(PULLS, 1, 100, |_| Some(vec![])).unwrap();
         assert_eq!(
             cut.saturated_by, SATURATED_BY_CHECK_BUDGET,
             "a REST read is bounded by its per-PR check budget, never by the list cap"
@@ -1925,17 +1958,94 @@ mod rest_fallback_tests {
         );
     }
 
+    /// `n` REST pull rows. The page-cap tests need a FULL page, which is past what the literal
+    /// `PULLS` fixture carries legibly.
+    fn pulls_page(n: usize) -> String {
+        let rows: Vec<String> = (0..n)
+            .map(|i| {
+                format!(
+                    r#"{{"number":{n0},"title":"t","draft":false,"html_url":"https://gh/{n0}",
+                       "head":{{"ref":"b{i}","sha":"aaaa{i}"}},"base":{{"sha":"bbbb2222"}}}}"#,
+                    n0 = 3000 + i,
+                )
+            })
+            .collect();
+        format!("[{}]", rows.join(","))
+    }
+
+    /// THE THIRD BOUND, AND THE ONLY ONE NO BUDGET CAN REACH (bead sparkle-qogah.5).
+    ///
+    /// The fallback reads ONE page of 100 and does not follow `Link: rel="next"`, so on a repo past
+    /// that ceiling the list is cut before the budget ever sees it. Today the budget of 20 is
+    /// tighter and hides this — which is exactly why it is asserted with a budget WIDE ENOUGH to
+    /// cover the whole page: drop the page check and `covered < pulls.len()` is false, and a sweep
+    /// that never listed PR 101 reports a complete census of the repo.
+    #[test]
+    fn a_full_rest_page_is_saturated_even_when_the_budget_covered_all_of_it() {
+        let read = rest_probe_from_parts(&pulls_page(100), 100, 100, |_| Some(vec![]))
+            .expect("a readable page must produce a read");
+        assert_eq!(read.prs.len(), 100, "the budget covered every row it was HANDED");
+        assert!(
+            read.saturated,
+            "…which is not evidence it was handed every row: the page filled up, so a pull \
+             request past it was never listed and must not read as one that no longer exists"
+        );
+        assert_eq!(
+            read.saturated_by, SATURATED_BY_REST_PAGE,
+            "and the bound named must be the reachable one — a reader sent after the check \
+             budget would be chasing a number that cannot reveal the missing PRs"
+        );
+    }
+
+    /// The other half of the pair: one row short of the page, with the same wide budget, IS a
+    /// complete census — so the flag above is the page filling up rather than a hedge stamped on
+    /// every REST read.
+    #[test]
+    fn a_rest_page_below_the_cap_is_an_authoritative_census() {
+        let read = rest_probe_from_parts(&pulls_page(99), 100, 100, |_| Some(vec![]))
+            .expect("a readable page must produce a read");
+        assert_eq!(read.prs.len(), 99);
+        assert!(!read.saturated, "a page that did not fill up IS the whole list");
+    }
+
+    /// WHEN BOTH BOUNDS FIRE, THE OUTER ONE IS NAMED. This is the production shape — a full page
+    /// against the real budget of 20 — and it is the case the old code got wrong in the diagnostic
+    /// even though it got `saturated` right by accident.
+    #[test]
+    fn a_full_page_outranks_the_check_budget_in_the_diagnostic() {
+        let read = rest_probe_from_parts(&pulls_page(100), REST_CHECK_BUDGET, 100, |_| Some(vec![]))
+            .expect("a readable page must produce a read");
+        assert!(read.saturated);
+        assert_eq!(
+            read.saturated_by, SATURATED_BY_REST_PAGE,
+            "both bounds fired; naming the budget prints a remedy (raise the budget) that cannot \
+             reveal a PR the list never contained"
+        );
+    }
+
+    /// The query and the number the truncation is judged against must be the SAME 100. They live
+    /// apart because a `const &str` cannot interpolate, so nothing but this stops them drifting —
+    /// and a drift is silent in both directions: a query asking for more than the check expects
+    /// under-reports saturation, and one asking for less over-reports it.
+    #[test]
+    fn the_rest_page_size_the_query_asks_for_is_the_one_saturation_is_judged_against() {
+        assert!(
+            REST_PULLS_QUERY.contains(&format!("per_page={REST_PULLS_PAGE}")),
+            "the page cap in the query must be REST_PULLS_PAGE itself: {REST_PULLS_QUERY}"
+        );
+    }
+
     /// Check presence comes from a rollup we actually read. A real empty rollup means "nothing has
     /// run"; an UNREADABLE one must not be dressed up as the same observation.
     #[test]
     fn has_ci_reflects_the_rollup_that_was_read() {
-        let saw = rest_probe_from_parts(PULLS, 1, |_| Some(vec![json!({"name": "CI"})])).unwrap();
+        let saw = rest_probe_from_parts(PULLS, 1, 100, |_| Some(vec![json!({"name": "CI"})])).unwrap();
         assert!(saw.prs[0].has_ci, "a non-empty rollup is a check that exists");
 
-        let empty = rest_probe_from_parts(PULLS, 1, |_| Some(vec![])).unwrap();
+        let empty = rest_probe_from_parts(PULLS, 1, 100, |_| Some(vec![])).unwrap();
         assert!(!empty.prs[0].has_ci, "a genuinely empty rollup is a real observation");
 
-        let unread = rest_probe_from_parts(PULLS, 1, |_| None).unwrap();
+        let unread = rest_probe_from_parts(PULLS, 1, 100, |_| None).unwrap();
         assert!(!unread.prs[0].has_ci, "and an unreadable one claims nothing either");
     }
 
@@ -1943,7 +2053,7 @@ mod rest_fallback_tests {
     /// "this repo has no open PRs".
     #[test]
     fn an_unreadable_pulls_body_is_not_an_empty_repo() {
-        assert!(rest_probe_from_parts("503 Service Unavailable", 10, |_| Some(vec![])).is_none());
+        assert!(rest_probe_from_parts("503 Service Unavailable", 10, 100, |_| Some(vec![])).is_none());
     }
 }
 
@@ -2328,11 +2438,24 @@ fn tick<R: Runtime>(app: &AppHandle<R>, watch: &mut Watch, now: u64) {
                 }
                 if was_saturated {
                     saturated.insert(repo.project_id.clone());
-                    // NAME THE BOUND THAT ACTUALLY FIRED. Both arms describe the same consequence
-                    // — a PR this sweep never reached — but they send a reader to opposite places,
-                    // and the second arm used to render as the first with a `limit` of 300 it had
-                    // never been measured against. See `Probed::saturated_by`.
+                    // NAME THE BOUND THAT ACTUALLY FIRED. All three arms describe the same
+                    // consequence — a PR this sweep never reached — but they send a reader to
+                    // different places, and the budget arm used to render as the list-window one
+                    // with a `limit` of 300 it had never been measured against. See
+                    // `Probed::saturated_by`.
                     match saturated_by {
+                        SATURATED_BY_REST_PAGE => tracing::warn!(
+                            target: "conflict_watch",
+                            project = %repo.project_id,
+                            page = REST_PULLS_PAGE,
+                            covered = rows_read,
+                            "this repo fell back to the REST PR probe and its LIST came back full \
+                             at `page` rows; a pull request past that page was never listed, so no \
+                             check budget can reach it and raising the budget would change \
+                             nothing. Nothing is pruned and every tracked PR the read omitted keeps \
+                             climbing blind. The fallback reads ONE page — the fix is pagination, \
+                             and the underlying fault is whatever made the GraphQL probe fail over"
+                        ),
                         SATURATED_BY_CHECK_BUDGET => tracing::warn!(
                             target: "conflict_watch",
                             project = %repo.project_id,
