@@ -154,11 +154,60 @@ describe("control op: preview", () => {
       projectId,
       worktree: WORKTREE,
       path: "/dashboard",
+      target: null,
     });
     expect(lastReply()).toMatchObject({
       ok: true,
       preview: { id: "pv1", url: "http://127.0.0.1:5199", port: 5199, state: "ready" },
     });
+  });
+
+  // `target` must reach the supervisor SPELLED THE SAME as mcp-control puts it on the wire.
+  // Nothing else executes both sides — mcp-control mocks Bridge and this suite calls dispatch
+  // directly — so a key spelled differently in the two files is lost in transit with both suites
+  // green. That is how `concierge_tool` shipped inert in v0.55.0.
+  it("open with a target → forwards it to the supervisor under that exact key", async () => {
+    fire({
+      reqId: "pt1",
+      op: "preview",
+      callerAgentId: buildId,
+      payload: { previewOp: "open", target: "apps/web" },
+    });
+    await flush();
+    expect(openPreviewServerMock).toHaveBeenCalledWith(
+      expect.objectContaining({ agentId: buildId, target: "apps/web" }),
+    );
+  });
+
+  // A Rust `Option<String>` crosses this bridge as an explicit `null`, never as an absent key
+  // (bead `sparkle-16y6h`), so a caller mirroring that shape must be treated as "not chosen"
+  // rather than refused — and must NOT reach the supervisor as the string "null".
+  it("open with target: null → treated as absent, not as a choice", async () => {
+    fire({
+      reqId: "pt2",
+      op: "preview",
+      callerAgentId: buildId,
+      payload: { previewOp: "open", target: null },
+    });
+    await flush();
+    expect(openPreviewServerMock).toHaveBeenCalledWith(
+      expect.objectContaining({ agentId: buildId, target: null }),
+    );
+  });
+
+  // A non-string target is refused BY NAME and starts nothing. Asserting the side effect (no
+  // spawn), not just the reply: a handler that answered a refusal and still spawned would pass a
+  // reply-only assertion.
+  it("open with a non-string target → refused, and no dev server is started", async () => {
+    fire({
+      reqId: "pt3",
+      op: "preview",
+      callerAgentId: buildId,
+      payload: { previewOp: "open", target: 42 },
+    });
+    await flush();
+    expect(openPreviewServerMock).not.toHaveBeenCalled();
+    expect(lastReply()).toMatchObject({ ok: false, code: "preview_bad_target" });
   });
 
   it("open without a path → opens the dev server root", async () => {
@@ -177,7 +226,9 @@ describe("control op: preview", () => {
   // WHAT IS ASSERTED IS THE SIDE EFFECT, not the reply: that the supervisor wrapper RAN, and ran
   // against the WORKER'S OWN worktree. A reply-only assertion would pass against a handler that
   // answered `ok` and started nothing, and against one that served the wrong checkout — which is
-  // the only thing that could actually go wrong here, the op having no target parameter at all.
+  // the thing that could actually go wrong here. NOTE the op DOES now take a `target`
+  // parameter (bead `sparkle-eqbtqg`) — it selects among enumerated candidates and can never name
+  // another agent's checkout, so the worktree assertion below is still what guards this.
   it("open from a WORKER → starts the dev server in the WORKER's own worktree", async () => {
     fire({
       reqId: "p3",
@@ -192,6 +243,7 @@ describe("control op: preview", () => {
       projectId,
       worktree: WORKER_WORKTREE,
       path: "/x",
+      target: null,
     });
     expect(lastReply()).toMatchObject({ ok: true, preview: { id: "pv1" } });
   });
@@ -212,6 +264,7 @@ describe("control op: preview", () => {
       projectId,
       worktree: WORKER_WORKTREE,
       path: null,
+      target: null,
     });
   });
 

@@ -159,7 +159,21 @@ export async function openPreviewServer(args: {
   agentId: string;
   projectId: string;
   worktree: string;
+  /** A ROUTE on the dev server (`"/settings"`), which reaches the preview's URL. NOT a directory:
+   *  the spawn cwd comes from detection (or `[preview].path`), and joining an absolute route onto
+   *  it is what made the documented `{ op: "open", path: "/settings" }` call fail every time. */
   path?: string | null;
+  /**
+   * WHICH enumerated candidate to run, for this call only, in a repo where detection finds more
+   * than one and would otherwise decline.
+   *
+   * `string | null`, NOT `string`, and the null is not decoration: this value crosses into Rust as
+   * an `Option<String>`, whose absent form on this bridge is an explicit `null` rather than a
+   * missing key (bead `sparkle-16y6h` — a shape mismatch on one field makes an all-or-nothing
+   * parser discard the WHOLE payload and fall back to its "we did not look" default, silently and
+   * permanently). `path` above is typed the same way for the same reason.
+   */
+  target?: string | null;
   /**
    * WHO asked. Absent means "not attributable to a person", and that is the FAIL-CLOSED default on
    * purpose (bead sparkle-3475b.6).
@@ -185,6 +199,9 @@ export async function openPreviewServer(args: {
     projectId: args.projectId,
     worktree: args.worktree,
     path: args.path ?? null,
+    // Always sent, never spread-when-present: this is a Tauri `invoke`, not the control bridge, and
+    // `preview_open`'s parameter is an `Option<String>` whose absent form is an explicit null.
+    target: args.target ?? null,
   });
   if (reply) {
     usePreviewStore.getState().setPreview(args.agentId, {

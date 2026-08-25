@@ -159,17 +159,39 @@ export function renderablePreviewCards(
  * WHY THERE IS NO AUTOMATIC RE-CAPTURE ON HOT RELOAD, stated because it is the obvious next feature
  * and the reason it is missing is not laziness.
  *
- * A dev server re-emits `serving` on every hot reload, but that payload is IDENTICAL to the last
- * one — same id, same url, same port, same state — and `previewStore.setPreview` bails on an
- * unchanged update by design. So the reload never reaches this side at all: there is no event to
- * debounce off, only a store write that does not happen.
+ * THE REASON IS NOT A DEBOUNCE — THE ENGINE EMITS NOTHING TO DEBOUNCE. This header used to claim
+ * that "a dev server re-emits `serving` on every hot reload" and that `previewStore.setPreview`
+ * throws that repeat away. Both halves were false, and the false half had already been inherited
+ * verbatim by a task brief as a settled premise, where it would have shipped a timer with no
+ * signal to time off (bead `sparkle-l7cihu`). What `preview.rs`'s `supervise` (§6) actually does:
  *
- * That leaves three honest options, and picking between them is a product call rather than a
+ *   • the discovery/transition block is guarded by `if bound.is_none()`, so it runs AT MOST ONCE;
+ *   • inside that one block the server goes to `listening` unconditionally, then to `ready` only
+ *     if `http_probe` succeeds ON THAT SAME TICK. The probe is never retried, so a server that
+ *     binds its port before it can answer HTTP LATCHES AT `listening` FOREVER;
+ *   • after that the loop body is only: check stop, check exited, sleep. The one reachable state
+ *     change left is a terminal `finish(…)` — `crashed`, or `failed`.
+ *
+ * So a healthy bound preview emits NOTHING AT ALL until it dies. A hot reload is invisible to Rust,
+ * which never watches the served page; it only watches the process. There is no repeat event to
+ * debounce off and none to stamp from. (`serving` is a red herring in particular: it has NO
+ * production writer on either side of the wire — see the `PreviewState` note in `previewStore` —
+ * so a fixture that hands `serving` in is not evidence that anything ever sends it.)
+ *
+ * That leaves TWO honest options, and picking between them is a product call rather than a
  * mechanical one: poll on a timer while a card is on screen (bounded, but captures nobody asked
- * for), stamp a `lastEventAt` in `applyPreviewStatus` even when the projection is unchanged (the
- * bail's stated reason was to keep a redundant event from re-rendering the framed page, and there
- * is no frame any more), or leave it manual. Today the card refreshes on the transitions the store
- * CAN see — a preview coming back to `ready`/`serving` after a restart — plus the reader's own ⟳.
+ * for), or leave it manual.
+ *
+ * THE OPTION THAT IS NOT ON THAT LIST, named so it is not re-derived: "stamp a `lastEventAt` in
+ * `applyPreviewStatus` even when the projection is unchanged" was the third entry here, and it is
+ * STRUCTURALLY IMPOSSIBLE. A stamp needs an arriving event, and for a healthy server there is
+ * none — the stamp would simply never move, so a re-capture built on it would be dead code that
+ * looks correct. (`PreviewEntry.lastActivityAt` IS written through that bail and does exist — but
+ * read its note: what moves it is a human's or an agent's gesture, plus the app's own re-reads, not
+ * the dev server noticing a file change.)
+ *
+ * Today the card refreshes on the transitions the store CAN see — a preview reaching `ready` again
+ * after a restart — plus the reader's own ⟳.
  */
 export async function previewCardShot(agentId: string): Promise<string | null> {
   try {

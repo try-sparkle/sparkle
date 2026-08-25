@@ -9,6 +9,8 @@
 // app's definition of "a preview the human can OPEN", and `previewIdleGrace` reads that definition
 // to decide which dev servers nothing is watching. So the first row below asserts that adding the
 // notice states did NOT widen it, which is the regression this whole split exists to prevent.
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
 import {
@@ -19,6 +21,7 @@ import {
   renderablePreviewNotices,
   PREVIEW_NOTICE_DETAIL_MAX,
 } from "./previewCards";
+import { isSurfacingState } from "../stores/previewStore";
 import type { PreviewEntry, PreviewState } from "../stores/previewStore";
 
 const ALL_STATES: PreviewState[] = [
@@ -217,5 +220,193 @@ describe("a running preview the card cannot render still says something", () => 
     const byAgent = running("http://127.0.0.1:5173");
     expect(livePreviewCards(byAgent)).toHaveLength(1);
     expect(pendingPreviewNotices(byAgent)).toHaveLength(0);
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// THE ENGINE'S ACTUAL BEHAVIOUR, PINNED — because a comment claiming otherwise already shipped
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+//
+// `previewCardShot`'s header used to assert "a dev server re-emits `serving` on every hot reload",
+// `previewStore`'s `surfacedAt` note leaned on the same sentence for a DIFFERENT decision, and a
+// task brief inherited it verbatim as a settled premise — a fix designed on it would have shipped a
+// timer with no signal to time off (bead `sparkle-l7cihu`). Nothing was red, because prose is not
+// executable and the refutation was sitting 36 lines further down the same file.
+//
+// WHY A FIXTURE CANNOT GUARD THIS. Every other test in this file and in `PreviewCards.test.tsx`
+// feeds `"serving"` in BY HAND, which is exactly how a state with no production writer came to look
+// thoroughly exercised. Asserting anything about a `"serving"` fixture would restate the mistake.
+// The only thing that can go red is a claim about the ENGINE, so this reads `preview.rs` from disk
+// — READ, never written; the Rust half of this bead belongs to another worker — and asserts the
+// three properties the corrected comments now rest on:
+//
+//   1. `supervise` never constructs `PreviewState::Serving`, and neither does anything else in
+//      preview.rs's production half. The variant is live in three predicates and dead as an output.
+//   2. The discovery/transition block is guarded by `if bound.is_none()`, so it runs AT MOST ONCE,
+//      and BOTH of the loop's `transition(` calls live inside it.
+//   3. `http_probe` is called exactly once, inside that same block — so it is never retried, and a
+//      server that binds before it can answer HTTP latches at `listening` forever.
+//
+// Precedent for reading Rust source from a vitest file, including the scoping discipline copied
+// here: `previewSeam.test.ts`, which pins the other Rust↔TS seam this feature has.
+//
+// FAILS CLOSED EVERYWHERE. Every anchor below throws — naming what it could not find — rather than
+// letting a slice silently degrade to the whole file or to nothing, which is the shape that turns a
+// guard into a test that cannot fail.
+describe("preview.rs's supervise loop, as the corrected comments describe it", () => {
+  const RUST_SOURCE = fileURLToPath(new URL("../../src-tauri/src/preview.rs", import.meta.url));
+
+  /** Everything before the test module. Scanning the whole file would let a Rust TEST FIXTURE —
+   *  and preview.rs's tests do construct `PreviewState::Serving` — satisfy a claim about
+   *  production, which is the precise confusion this whole block exists to end. */
+  function productionHalf(whole: string): string {
+    const cut = whole.indexOf("mod tests");
+    if (cut < 0) {
+      throw new Error(
+        "preview.rs no longer carries its `mod tests` marker — this guard cannot scope itself to " +
+          "the production half, and an unscoped scan is satisfied by preview.rs's own test fixtures",
+      );
+    }
+    return whole.slice(0, cut);
+  }
+
+  /** One top-level `fn`'s body, bounded by INDENTATION rather than by brace counting: the signature
+   *  starts at column 0 and the close is the next line that is exactly `}`. Brace counting would
+   *  have to reason about `format!("… {}s. {}", …)`, which is a parser this file has no business
+   *  growing. */
+  function topLevelFn(prod: string, signature: string): string {
+    const start = prod.indexOf(signature);
+    if (start < 0) throw new Error(`preview.rs no longer contains \`${signature}\``);
+    const rest = prod.slice(start);
+    const end = rest.indexOf("\n}\n");
+    if (end < 0) {
+      throw new Error(
+        `\`${signature}\` has no column-0 closing brace, so its body cannot be bounded — refusing ` +
+          "to scan the rest of the file in its name",
+      );
+    }
+    return rest.slice(0, end);
+  }
+
+  /** The `if bound.is_none() { … }` block, bounded the same way one indent level in. */
+  function onceOnlyBlock(body: string): { block: string; after: string } {
+    const guard = "        if bound.is_none() {\n";
+    const start = body.indexOf(guard);
+    if (start < 0) {
+      throw new Error(
+        "supervise no longer opens `if bound.is_none() {` at its expected indent — the whole claim " +
+          "that discovery runs AT MOST ONCE rests on that guard, so this cannot be assumed",
+      );
+    }
+    const rest = body.slice(start);
+    const close = rest.indexOf("\n        }\n");
+    if (close < 0) {
+      throw new Error("the `if bound.is_none()` block has no matching close at its own indent");
+    }
+    return { block: rest.slice(0, close), after: rest.slice(close) };
+  }
+
+  function count(haystack: string, needle: string): number {
+    return haystack.split(needle).length - 1;
+  }
+
+  const whole = readFileSync(RUST_SOURCE, "utf8");
+
+  it("scoped itself to the production half of a file it actually read", () => {
+    // Both bounds are properties the slice does NOT guarantee (see `previewSeam.test.ts`): a
+    // `mod tests` occurring early would truncate the scan to nearly nothing and every assertion
+    // below would pass vacuously, while one near EOF would leave it covering the tests anyway.
+    const prod = productionHalf(whole);
+    expect(prod.length).toBeGreaterThan(1000);
+    expect(whole.length - prod.length).toBeGreaterThan(1000);
+  });
+
+  it("never constructs `PreviewState::Serving` in production — the variant is dead as an output", () => {
+    const prod = productionHalf(whole);
+    // EXACTLY ONE occurrence, and it is a `match` arm in `live_for_reattach` — a READER. Counting
+    // rather than pattern-matching a call is deliberate: `finish(` and `transition(` are wrapped
+    // across several lines in this file, so any same-line test for "is this a writer" would miss
+    // the writer it exists to catch and report a clean bill of health.
+    const sites = count(prod, "PreviewState::Serving");
+    expect(
+      sites,
+      "a new `PreviewState::Serving` site appeared in preview.rs's production half. If it WRITES " +
+        "the state, the comments in previewCards.ts, previewStore.ts and PreviewCards.tsx that say " +
+        "`serving` has no production writer are now false and must be corrected in the same change. " +
+        "If it is another predicate READING it, widen this expectation and say so here.",
+    ).toBe(1);
+    const reader = topLevelFn(prod, "fn live_for_reattach(");
+    expect(
+      reader,
+      "the one `PreviewState::Serving` site must be `live_for_reattach`'s match arm",
+    ).toContain("PreviewState::Serving");
+  });
+
+  it("runs discovery AT MOST ONCE, and both transitions live inside that one block", () => {
+    const body = topLevelFn(productionHalf(whole), "fn supervise(");
+    const { block, after } = onceOnlyBlock(body);
+
+    // Both of the loop's state ADVANCES are inside the once-only guard...
+    expect(count(body, ".transition(")).toBe(2);
+    expect(count(block, ".transition(")).toBe(2);
+    expect(block).toContain("PreviewState::Listening");
+    expect(block).toContain("PreviewState::Ready");
+
+    // ...and after it the loop body only sleeps. This is the assertion the corrected comments rest
+    // on: once the port is bound there is NO further emission of any kind while the server is
+    // healthy, so there is nothing to debounce a re-capture off and nothing to stamp a clock from.
+    expect(after).toContain("std::thread::sleep(");
+    expect(
+      after,
+      "a state change appeared after the once-only discovery block. A healthy bound preview would " +
+        "now emit something, which is exactly what previewCardShot's header says it does not.",
+    ).not.toContain(".transition(");
+    expect(after).not.toContain("finish(");
+  });
+
+  it("probes HTTP exactly once, so `listening` is a state a healthy server can be stuck in", () => {
+    const body = topLevelFn(productionHalf(whole), "fn supervise(");
+    const { block } = onceOnlyBlock(body);
+    expect(count(body, "http_probe(")).toBe(1);
+    expect(count(block, "http_probe(")).toBe(1);
+  });
+
+  // ── THE NEGATIVE CONTROL ───────────────────────────────────────────────────────────────────
+  // Proof that the four assertions above are not vacuous, WITHOUT editing preview.rs: the same
+  // bytes are mutated IN MEMORY into the file the false comment described — a supervisor that
+  // re-emits while the server is healthy — and the checks are re-run against that. `preview.rs`
+  // belongs to another worker right now, so an on-disk mutation is not available to us; this is the
+  // honest substitute, and it fails for the same reason the real assertions would.
+  it("would go red if the engine were changed into the one the false comment described", () => {
+    const mutated = whole.replace(
+      "        std::thread::sleep(if bound.is_some() { LIVENESS_INTERVAL } else { DISCOVERY_INTERVAL });",
+      "        if bound.is_some() {\n" +
+        "            app.state::<PreviewManager>().transition(&app, &id, PreviewState::Serving, bound, None);\n" +
+        "        }\n" +
+        "        std::thread::sleep(if bound.is_some() { LIVENESS_INTERVAL } else { DISCOVERY_INTERVAL });",
+    );
+    expect(mutated, "the sleep line this mutation targets must still exist").not.toBe(whole);
+
+    const prod = productionHalf(mutated);
+    const body = topLevelFn(prod, "fn supervise(");
+    const { block, after } = onceOnlyBlock(body);
+
+    // Each of the three claims, now false, and each detected by the assertion that guards it.
+    expect(count(prod, "PreviewState::Serving")).not.toBe(1);
+    expect(count(body, ".transition(")).not.toBe(count(block, ".transition("));
+    expect(after).toContain(".transition(");
+  });
+});
+
+// The other direction of bead `sparkle-l7cihu`, and a deliberate NON-change: `serving` is dead as
+// an output but must stay live as an INPUT. The wire type still admits it, so a build on the other
+// side of the IPC boundary can send it and a frontend that had quietly dropped the state would
+// paint a live preview as nothing at all. This is recorded, not acted on — see `SURFACING_STATES`.
+describe("`serving` stays handled even though nothing produces it", () => {
+  it("keeps `serving` in the surfacing set and in the card projection", () => {
+    expect(isSurfacingState("serving")).toBe(true);
+    expect(livePreviewCards({ "ag-1": entry({ status: "serving" }) }).map((c) => c.agentId)).toEqual([
+      "ag-1",
+    ]);
   });
 });

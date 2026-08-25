@@ -188,6 +188,42 @@ export function removeAgentWorktree(
   return invoke("remove_agent_worktree", { root, projectId, agentId });
 }
 
+/** What became of the working directory of a process still holding a reserved dev port.
+ *
+ *  Mirrors the Rust `dev_port_preflight::CwdState`, which serializes kebab-case. */
+export type DevPortCwdState = "evacuated" | "deleted" | "live" | "unknown";
+
+/** One process listening on the port. Every optional field is a Rust `Option`, so it crosses the
+ *  wire as `null` and NEVER as an absent key — `| null`, not `?:` (AGENTS.md, "A Rust `Option`
+ *  crosses the wire as `null`"). */
+export interface DevPortHolder {
+  pid: number;
+  addr: string;
+  command?: string | null;
+  cwd?: string | null;
+  cwdState: DevPortCwdState;
+}
+
+/** The preflight's answer.
+ *
+ *  `"undetermined"` is deliberately NOT `"free"`: a probe that could not run must never read as an
+ *  all-clear, which is the shape that turns a broken diagnostic into a false clean bill of health. */
+export interface DevPortReport {
+  port: number;
+  verdict: "free" | "held" | "undetermined";
+  holders: DevPortHolder[];
+  /** The sentence to show a human. Empty ONLY when the port is free. */
+  message: string;
+}
+
+/** Ask who is listening on a reserved dev port (default: Sparkle's own 1420).
+ *
+ *  REPORT ONLY — the Rust command reads `lsof`/`ps` and returns text. It kills nothing, and there is
+ *  no code path from it to a signal (bead `sparkle-r28em`). */
+export function devPortPreflight(port?: number): Promise<DevPortReport> {
+  return invoke("dev_port_preflight", { port: port ?? null });
+}
+
 /**
  * What a WIP snapshot did. `sha` is a Rust `Option<String>`, so it arrives as `null` and NEVER as an
  * absent key — hence `string | null` rather than the `sha?: string` the shape invites (AGENTS.md,
@@ -516,7 +552,51 @@ export function removeAgentWorkspace(
     // teardown holding the per-root lock.
     if (opts?.snapshotWip) await snapshotBeforeTeardown(projectId, agentId);
     return removeAgentWorktree(root, projectId, agentId);
-  });
+    // The dev-port report is chained OUTSIDE this callback, deliberately, so it runs once the
+    // per-root git lock is released — see reportDevPortAfterTeardown.
+  }).then(reportDevPortAfterTeardown);
+}
+
+/**
+ * Say who is still holding the dev port, now that this worktree is gone (bead `sparkle-r28em`).
+ *
+ * A dev server a human or an agent started themselves in a PTY (`pnpm dev`, `tauri dev`) is in no
+ * preview registry, so `stopPreviewBeforeTeardown` above never knew about it and
+ * `preview.ts::sweep_orphans` will never reclaim it. It keeps running with its cwd pointing at a
+ * checkout that has just been renamed into worktree-trash — and because vite is `strictPort` on the
+ * one port `tauri.conf.json` names as `devUrl`, there is NO fallback: every later `tauri dev` on
+ * this machine dies with a bare "port is already in use" that names neither the process nor where it
+ * came from. Somebody then burns an afternoon rediscovering it, which is the incident behind the
+ * bead.
+ *
+ * This is the moment to say so, because it is the moment the orphan is CREATED — hours before the
+ * next `tauri dev` meets the wall.
+ *
+ * OUTSIDE THE PER-ROOT GIT LOCK, and that placement is the point of the `.then` rather than another
+ * line inside the callback: the probe shells out to `lsof` twice and `ps` once, bounded at 5s each,
+ * and every other prepare/remove on this project queues behind that lock. A diagnostic that adds up
+ * to 15s of lock-held latency to every teardown would not survive its first measurement.
+ *
+ * REPORT ONLY, and NEVER REJECTS — the same guarantee `stopPreviewBeforeTeardown` gives, for the
+ * same reason. `removeAgentWorkspace` resolves `void`, so this returns `void` too: a probe that
+ * could turn a completed teardown into a rejected promise would strand the agent's concurrency slot
+ * over a log line.
+ */
+async function reportDevPortAfterTeardown(): Promise<void> {
+  try {
+    const report = await devPortPreflight();
+    // `message` is empty ONLY for a free port, which is the overwhelmingly common outcome. Gating
+    // on the message rather than on `verdict === "held"` is deliberate: it also surfaces
+    // "could not determine", which is a real answer a reader may need, without this call site having
+    // to re-derive which verdicts carry text.
+    if (report?.message) {
+      console.warn(`dev port: ${report.message}`);
+    }
+  } catch (e) {
+    // Includes the case where the command is not registered at all (an older backend). A missing
+    // diagnostic is not worth a word to the user.
+    console.debug("dev port: could not run the post-teardown preflight", e);
+  }
 }
 
 /** Options for {@link removeAgentWorkspace}. */

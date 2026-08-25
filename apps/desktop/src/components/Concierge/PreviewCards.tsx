@@ -352,9 +352,15 @@ function PreviewCard({
 
   useEffect(() => {
     // KEYED ON `surfacedAt` AS WELL, so a preview that goes away and comes back — a restart, or a
-    // rebuild that dropped out of `serving` and returned — re-captures instead of showing the
-    // picture of a page that no longer exists. A same-state hot reload is invisible here by
-    // construction; `previewCardShot`'s header says why, and the ⟳ is the answer to it.
+    // server that dropped out of `ready` and returned — re-captures instead of showing the picture
+    // of a page that no longer exists.
+    //
+    // A HOT RELOAD IS INVISIBLE HERE BECAUSE NOTHING REPORTS ONE — not because a repeat event is
+    // being filtered out. This comment used to say "a same-state hot reload is invisible by
+    // construction" and delegate the reason to `previewCardShot`'s header, which stated it wrongly:
+    // Rust's `supervise` watches the PROCESS, not the served page, and after the port binds it
+    // emits nothing at all until the server dies. So there is no event arriving to key on, and the
+    // ⟳ is the answer to it. See `previewCardShot`'s header (now corrected) for the loop itself.
     const key = `${agentId}|${url}|${surfacedAt}`;
     if (fetchedRef.current === key) return;
     fetchedRef.current = key;

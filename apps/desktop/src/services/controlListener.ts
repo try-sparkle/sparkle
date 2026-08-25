@@ -3083,11 +3083,36 @@ async function handlePreview(req: ControlRequest): Promise<Record<string, unknow
           "path must start with '/' and be a route on the dev server, not a URL — '//host' and '/\\host' are protocol-relative and resolve to another origin",
       };
     }
+    // `target` — which enumerated candidate to run, for this call only.
+    //
+    // SPELLED `target`, THE SAME WORD `apps/mcp-control/src/tools.ts` PUTS ON THE WIRE. Nothing
+    // executes both sides: mcp-control's suite mocks `Bridge` and this suite hands a payload
+    // straight to `dispatch`, so a key spelled differently in the two files is lost in transit with
+    // both suites green. The pair is asserted explicitly instead — see the `target` cases in
+    // `controlListenerPreview.test.ts` and in `tools.test.ts`.
+    //
+    // `null` is accepted as "absent" alongside `undefined`, because a Rust `Option` crosses this
+    // bridge as an explicit `null` and a caller that mirrors that shape must not be rejected.
+    const rawTarget = req.payload.target;
+    if (rawTarget !== undefined && rawTarget !== null && typeof rawTarget !== "string") {
+      return {
+        ok: false,
+        code: "preview_bad_target",
+        error: "target must be the name of one of the candidates preview listed, e.g. 'apps/web'",
+      };
+    }
+    // NOT shape-checked here, deliberately. The only thing `target` can mean is "one of the
+    // candidates THIS worktree enumerates", which only `detect_preview_target` knows; a value
+    // matching none of them is refused there, by name, alongside the list that WOULD have worked.
+    // A syntactic guess here could only refuse a legitimate candidate or admit a value the Rust
+    // side then has to refuse anyway.
+    const target = typeof rawTarget === "string" ? rawTarget : null;
     const opened = await openPreviewServer({
       agentId: req.callerAgentId,
       projectId: found.projectId,
       worktree,
       path,
+      target,
     });
     if (!opened) {
       return { ok: false, code: "preview_not_started", error: "the preview supervisor started nothing" };

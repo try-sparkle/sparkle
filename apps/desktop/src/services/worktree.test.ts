@@ -575,6 +575,138 @@ describe("worktree service — preview teardown interlock", () => {
     warn.mockRestore();
   });
 
+  // ── THE DEV-PORT PREFLIGHT (bead sparkle-r28em) ──────────────────────────────────────────────
+  // A dev server a human or an agent started in a PTY (`pnpm dev`, `tauri dev`) is in no preview
+  // registry, so the stop above never knew about it and `sweep_orphans` will never reclaim it. It
+  // keeps running with its cwd inside a checkout that has just been renamed into worktree-trash,
+  // and because vite is `strictPort` on the one port `tauri.conf.json` names as `devUrl` there is
+  // NO fallback: every later `tauri dev` on the machine dies with a bare port-in-use naming nothing.
+
+  it("names the orphan's pid and cwd after a teardown, rather than logging that a probe ran", async () => {
+    // THE SIDE EFFECT, not the precondition. Asserting merely that `dev_port_preflight` was invoked
+    // would stay green against a version that threw the report away — and the report IS the whole
+    // deliverable, because what the bead cost a human was a failure that named nobody. So the
+    // assertion is on the TEXT that reaches the console: the pid, and the trash path.
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    invoke.mockImplementation((cmd: string) =>
+      cmd === "dev_port_preflight"
+        ? Promise.resolve({
+            port: 1420,
+            verdict: "held",
+            holders: [{ pid: 48213, addr: "127.0.0.1:1420", command: "node vite", cwd: "/wt-trash/p-a", cwdState: "evacuated" }],
+            message:
+              "port 1420 is held by pid 48213 (`node vite`). Its working directory `/wt-trash/p-a` " +
+              "is inside Sparkle's worktree-trash. Run `kill 48213` to free the port.",
+          })
+        : Promise.resolve(undefined),
+    );
+
+    await removeAgentWorkspace("/root-devport-held", "p", "a");
+
+    const said = warn.mock.calls.map((c) => String(c[0])).join("\n");
+    expect(said).toContain("48213");
+    expect(said).toContain("/wt-trash/p-a");
+    expect(said).toContain("kill 48213");
+    warn.mockRestore();
+  });
+
+  it("asks AFTER the removal — a probe run before the rename would name the wrong directory", async () => {
+    // ORDER, not presence. The cwd this report exists to name is the TRASH path, and that path only
+    // exists once `remove_agent_worktree` has renamed the checkout into it. A preflight issued
+    // first would read the live checkout path and report a perfectly innocent-looking `live` cwd —
+    // green on a presence-only assertion, useless in production.
+    const order: string[] = [];
+    invoke.mockImplementation((cmd: string) => {
+      if (cmd === "remove_agent_worktree") order.push("remove");
+      if (cmd === "dev_port_preflight") {
+        order.push("devport");
+        return Promise.resolve({ port: 1420, verdict: "free", holders: [], message: "" });
+      }
+      return Promise.resolve(undefined);
+    });
+
+    await removeAgentWorkspace("/root-devport-order", "p", "a");
+    expect(order).toEqual(["remove", "devport"]);
+  });
+
+  it("says nothing when the port is free", async () => {
+    // The overwhelmingly common outcome. A warning on every healthy teardown is noise that trains a
+    // reader to skip the line that matters, so an empty message must produce no output at all.
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    invoke.mockImplementation((cmd: string) =>
+      cmd === "dev_port_preflight"
+        ? Promise.resolve({ port: 1420, verdict: "free", holders: [], message: "" })
+        : Promise.resolve(undefined),
+    );
+
+    await removeAgentWorkspace("/root-devport-free", "p", "a");
+    expect(warn).not.toHaveBeenCalled();
+    warn.mockRestore();
+  });
+
+  it("surfaces 'could not determine' too, without naming anybody", async () => {
+    // `undetermined` is NOT `free`, and it is not silent either: a reader whose `tauri dev` just
+    // died needs to know the probe could not look, or they read the silence as an all-clear. What it
+    // must never do is name a process it did not establish.
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    invoke.mockImplementation((cmd: string) =>
+      cmd === "dev_port_preflight"
+        ? Promise.resolve({
+            port: 1420,
+            verdict: "undetermined",
+            holders: [],
+            message: "could not determine who is listening on port 1420: could not run /usr/sbin/lsof.",
+          })
+        : Promise.resolve(undefined),
+    );
+
+    await removeAgentWorkspace("/root-devport-unsure", "p", "a");
+
+    const said = warn.mock.calls.map((c) => String(c[0])).join("\n");
+    expect(said).toContain("could not determine");
+    warn.mockRestore();
+  });
+
+  it("a preflight that fails does NOT turn a completed teardown into a rejection", async () => {
+    // The removal already happened. A diagnostic that can reject would strand the agent's
+    // concurrency slot over a log line — the same never-wedge property `stopPreviewBeforeTeardown`
+    // has, and for the same reason. Covers an older backend where the command is not registered.
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const debug = vi.spyOn(console, "debug").mockImplementation(() => {});
+    const order: string[] = [];
+    invoke.mockImplementation((cmd: string) => {
+      if (cmd === "remove_agent_worktree") order.push("remove");
+      if (cmd === "dev_port_preflight") {
+        return Promise.reject(new Error("command dev_port_preflight not found"));
+      }
+      return Promise.resolve(undefined);
+    });
+
+    await expect(
+      removeAgentWorkspace("/root-devport-throws", "p", "a"),
+    ).resolves.toBeUndefined();
+    expect(order).toEqual(["remove"]);
+    expect(warn).not.toHaveBeenCalled();
+    warn.mockRestore();
+    debug.mockRestore();
+  });
+
+  it("does not probe when the removal itself failed — nothing was evacuated", async () => {
+    // The report is about a checkout that was renamed out from under a live server. If the removal
+    // rejected, no rename happened, so there is nothing to attribute and the probe would be pure
+    // cost on a path that is already failing.
+    invoke.mockImplementation((cmd: string) =>
+      cmd === "remove_agent_worktree"
+        ? Promise.reject(new Error("git worktree remove failed"))
+        : Promise.resolve(undefined),
+    );
+
+    await expect(removeAgentWorkspace("/root-devport-noremove", "p", "a")).rejects.toThrow(
+      "git worktree remove failed",
+    );
+    expect(invoke).not.toHaveBeenCalledWith("dev_port_preflight", expect.anything());
+  });
+
   it("asks unconditionally — no local 'did this agent have a preview' guard", async () => {
     // The Rust command is a map lookup that answers "not-found" when the agent has none
     // (preview.rs::preview_stop_for_agent), so the common case is already a cheap no-op. A guard

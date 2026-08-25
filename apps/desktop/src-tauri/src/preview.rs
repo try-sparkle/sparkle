@@ -181,6 +181,57 @@ pub fn preview_url_for(port: u16) -> String {
     format!("http://127.0.0.1:{port}")
 }
 
+/// Is this a ROUTE on the dev server — `/dashboard` — rather than a URL, an origin-relative escape,
+/// or something that would change what `preview_url_with_route` builds an origin out of?
+///
+/// **This is a security check, not validation politeness, and it is the mirror of `previewArgs`'s
+/// regex in `apps/mcp-control/src/tools.ts`.** `preview_url_with_route` builds its URL by
+/// CONCATENATION, which is where the danger is:
+///
+///   * A route not starting with `/` is an authority continuation. `"@evil.example"` appended to
+///     `http://127.0.0.1:5173` yields `http://127.0.0.1:5173@evil.example`, whose host is
+///     `evil.example` — the userinfo trick `preview_url_is_loopback` already documents. The leading
+///     `/` is what terminates the authority, so it is load-bearing rather than cosmetic.
+///   * `//host` and `/\host` are protocol-relative and resolve to another origin for any consumer
+///     that re-resolves the route against a base (`new URL(path, base)`, `history.pushState`).
+///   * ASCII tab/newline/CR are REMOVED by the WHATWG URL parser BEFORE parsing, so `"/\t/evil"`
+///     becomes `"//evil"` at parse time and the `(?![/\\])` lookahead alone does not catch it.
+///     That is why the whole control range is rejected rather than "printable characters only".
+///
+/// `preview_open` is a Tauri command the frontend can call directly, so this check cannot live only
+/// in the TypeScript that happens to be in front of it today. Rejected routes are dropped (the
+/// preview still opens, at the origin) rather than failing the open: a bad route is a bad link, not
+/// a reason to withhold a working dev server.
+pub fn is_preview_route(route: &str) -> bool {
+    let mut chars = route.chars();
+    if chars.next() != Some('/') {
+        return false;
+    }
+    if matches!(chars.clone().next(), Some('/') | Some('\\')) {
+        return false;
+    }
+    !chars.any(|c| c.is_whitespace() || c.is_control() || c == '\u{7f}')
+}
+
+/// The URL for a preview on `port`, landing on `route` if one was asked for.
+///
+/// `route` is the caller's `path` argument, and it is a ROUTE — it belongs in the URL the card and
+/// `openUrl` use, and nowhere else. It used to be joined onto the SPAWN CWD instead
+/// (`real.join(p)`), which made the documented call `{ op: "open", path: "/settings" }` fail every
+/// time: `Path::join` with an absolute argument REPLACES the base, so `/settings` became the cwd
+/// and then failed `validate_worktree`. A cwd subpath is what `[preview].path` is for; it is not
+/// re-added under the route's name.
+///
+/// Guarded, not trusted: a route failing [`is_preview_route`] is dropped and the bare origin is
+/// returned, so this function cannot emit a URL naming another host.
+pub fn preview_url_with_route(port: u16, route: &str) -> String {
+    let base = preview_url_for(port);
+    if route.is_empty() || !is_preview_route(route) {
+        return base;
+    }
+    format!("{base}{route}")
+}
+
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 // §2  SOCKET DISCOVERY
 // ══════════════════════════════════════════════════════════════════════════════════════════════
@@ -649,8 +700,22 @@ pub enum Decline {
     /// Nothing that looks like a dev server anywhere in scan range.
     NoDevScript,
     /// More than one candidate. Guessing among them is worse than declining (§7 rule 4), so every
-    /// candidate is named and the user picks one via `[preview]` in the project's config.
+    /// candidate is named and the caller picks one — per call with `target`, or project-wide via
+    /// `[preview]` in the project's config.
     Ambiguous(Vec<String>),
+    /// A per-call `target` that matches NONE of the enumerated candidates.
+    ///
+    /// Its own variant rather than folding into `Ambiguous`, because the two say opposite things to
+    /// the caller: `Ambiguous` means "you did not choose", this means "what you chose does not
+    /// exist here". It carries BOTH halves — the value asked for and the list actually available —
+    /// so an agent can correct itself in one round trip instead of guessing a second time
+    /// (bead `sparkle-syzpei`: a decline that names no remedy the caller can perform is a decline
+    /// nobody acts on).
+    ///
+    /// It is also the ONLY outcome for an unmatched target. There is deliberately no fallback to
+    /// "detect something anyway": `target` selects from the enumerated list and can do nothing
+    /// else, so a value naming no candidate must never reach a program, an argv or a path.
+    UnknownTarget { requested: String, candidates: Vec<String> },
     /// A `[preview]` override that pins a CONSTANT port and carries no `{port}` token anywhere, so
     /// it would hand every agent on this machine the same number. Carries the offending flag as it
     /// was written, because a refusal that does not name the line to edit is a refusal nobody acts
@@ -672,6 +737,7 @@ impl Decline {
             Decline::NoPackageManager => "no-package-manager",
             Decline::NoDevScript => "no-dev-script",
             Decline::Ambiguous(_) => "ambiguous",
+            Decline::UnknownTarget { .. } => "unknown-target",
             Decline::ConstantPortPin(_) => "constant-port-pin",
         }
     }
@@ -703,10 +769,25 @@ impl Decline {
             Decline::NoDevScript => {
                 "no dev script and no framework config found, so there is nothing to preview".into()
             }
+            // NAMES A REMEDY THE CALLER CAN ACTUALLY PERFORM, and the per-call one comes FIRST.
+            // This message used to offer only `[preview]` in the project's .sparkle/config.toml —
+            // shared, checked-in config that an agent's own contract forbids it to edit
+            // unilaterally. So every agent that hit this was told to do the one thing it was not
+            // allowed to do, and stopped there: that deadlock IS bead `sparkle-syzpei`, and it is
+            // why `target` exists. Keep both remedies named, in this order.
             Decline::Ambiguous(candidates) => format!(
-                "more than one thing here could be previewed ({}) — name the one you want under \
-                 [preview] in this project's .sparkle/config.toml",
+                "more than one thing here could be previewed ({}) — pick one for THIS call with \
+                 {{ op: \"open\", target: \"<one of those>\" }}, or name a project-wide default \
+                 under [preview] in this project's .sparkle/config.toml",
                 candidates.join(", ")
+            ),
+            Decline::UnknownTarget { requested, candidates } => format!(
+                "no previewable target here is called {requested:?} — this worktree offers {}",
+                if candidates.is_empty() {
+                    "nothing to pick from, so there is no target to name".to_string()
+                } else {
+                    candidates.join(", ")
+                }
             ),
             Decline::ConstantPortPin(flag) => format!(
                 "this project's [preview] command pins a constant port (`{flag}`), which hands \
@@ -1038,19 +1119,77 @@ fn exec_invocation(pm: PackageManager, bin: &str) -> (Vec<String>, bool) {
     }
 }
 
+/// One enumerated candidate, resolved to the SHAPE it will be built as.
+///
+/// Two shapes, because enumeration produces two: a workspace package directory (`apps/web`,
+/// displayed as `apps/web (dev)`) and a root `dev:*` script name (`dev:desktop`). Naming the shape
+/// here rather than re-deriving it from the display string is what lets the requested-target path
+/// and the exactly-one-candidate path share one builder — see `build_enumerated`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Chosen {
+    /// A workspace sub-package, as a path relative to the worktree root.
+    Package(String),
+    /// A root `dev:<x>` script, by its script name.
+    RootScript(String),
+}
+
+/// Resolve a caller-supplied `target` to one ENUMERATED candidate, or nothing.
+///
+/// *** THIS IS THE WHOLE OF WHAT `target` CAN DO. *** The string never reaches a program, an argv,
+/// a path or a shell: it is compared against strings this process just enumerated from the
+/// worktree, and the value that travels onward is the ENUMERATED one, never the caller's. A value
+/// matching no candidate returns `None`, which the caller turns into `Decline::UnknownTarget` — a
+/// refusal, never a fallback and never a spawn. So a hostile value (`"; rm -rf /"`, `"../../etc"`,
+/// `"/etc/passwd"`) is refused by construction rather than by a filter that has to anticipate it.
+///
+/// Two spellings are accepted for a package, because both are things the caller has plausibly been
+/// shown: the exact candidate string the `Ambiguous` decline printed (`"apps/web (dev)"`) and the
+/// bare package directory (`"apps/web"`). Root scripts are matched verbatim only — that IS their
+/// displayed form.
+fn choose_candidate(want: &str, root_variants: &[String], packages: &[String]) -> Option<Chosen> {
+    let want = want.trim();
+    if want.is_empty() {
+        return None;
+    }
+    if let Some(pkg) = packages.iter().find(|p| p.as_str() == want || format!("{p} (dev)") == want) {
+        return Some(Chosen::Package(pkg.clone()));
+    }
+    root_variants.iter().find(|s| s.as_str() == want).map(|s| Chosen::RootScript(s.clone()))
+}
+
 /// Decide whether — and how — a worktree can be previewed. Priority order is §7's.
 ///
 /// `enabled` is passed in rather than read here so the function stays pure w.r.t. app state and can
 /// be driven from a test both ways.
-pub fn detect_preview_target(worktree: &Path, enabled: bool) -> Result<PreviewTarget, Decline> {
+///
+/// `requested` is a PER-CALL target — one enumerated candidate, named by the caller for this open
+/// only. When it is `Some`, detection SKIPS steps 1-3 and goes straight to enumeration, and that
+/// ordering is the entire point of the argument rather than an implementation detail:
+///
+///   * If `[preview]` still won, the argument would be INERT in every project that has a
+///     `[preview]` block — including this repo, which has one — so the deadlock it exists to break
+///     (bead `sparkle-eqbtqg`, filed eight times) would survive the fix.
+///   * It is allowed to beat shared config precisely because it is CALLER-SCOPED: it lives for one
+///     `preview_open` and cannot be observed by, or affect, any other agent. Editing
+///     `.sparkle/config.toml` is the opposite — checked-in, shared, and something an agent must not
+///     do unilaterally, which is why being told to do it was a dead end.
+///   * Steps 2 and 3 are skipped for the same reason `target` is refused on close/list: they return
+///     a single answer that ignores the request, which would let a caller believe its target did
+///     something. An unmatched target is `Decline::UnknownTarget`, naming what IS available.
+pub fn detect_preview_target(
+    worktree: &Path,
+    enabled: bool,
+    requested: Option<&str>,
+) -> Result<PreviewTarget, Decline> {
     if !enabled {
         return Err(Decline::Disabled);
     }
 
-    // ── 1. Explicit project config wins. The escape hatch for when detection is wrong, and the
+    // ── 1. Explicit project config wins — UNLESS this call named its own target (see above).
+    // The escape hatch for when detection is wrong, and the
     // only thing the founder should ever have to write. It needs no package.json and no lockfile:
     // by writing it, he has already answered every question detection would ask.
-    let over = read_preview_override(worktree);
+    let over = if requested.is_none() { read_preview_override(worktree) } else { PreviewOverride::default() };
     if let Some(command) = over.command.as_ref().map(|c| c.trim()).filter(|c| !c.is_empty()) {
         let args = over.args.unwrap_or_default();
         // REFUSE A CONSTANT PORT BEFORE IT CAN COLLIDE. A config that names a fixed number and
@@ -1092,7 +1231,9 @@ pub fn detect_preview_target(worktree: &Path, enabled: bool) -> Result<PreviewTa
     let framework = root_framework(worktree);
 
     // ── 2. A single unambiguous root `dev` script. Six of the founder's eleven projects.
-    if root_scripts.contains_key("dev") {
+    // Skipped when this call named a target: a lone root `dev` is not an enumerated candidate, so
+    // returning it here would silently ignore the request.
+    if requested.is_none() && root_scripts.contains_key("dev") {
         if !framework.is_driven() {
             return Err(Decline::UnsupportedFramework(framework));
         }
@@ -1114,7 +1255,8 @@ pub fn detect_preview_target(worktree: &Path, enabled: bool) -> Result<PreviewTa
 
     // ── 3. Framework signature at the root, with an unconventional script name (or none). Only for
     // a framework we actually drive; a recognised-but-undriven one declines BY NAME here.
-    if framework != Framework::Unknown {
+    // Skipped when this call named a target, for the same reason as step 2.
+    if requested.is_none() && framework != Framework::Unknown {
         if !framework.is_driven() {
             return Err(Decline::UnsupportedFramework(framework));
         }
@@ -1140,55 +1282,77 @@ pub fn detect_preview_target(worktree: &Path, enabled: bool) -> Result<PreviewTa
     // `dev`. Both count, and that is what makes Sparkle itself decline: its root carries four
     // `dev:*` scripts and three of its packages have a `dev`, so enumerating only the packages would
     // have found "exactly one" in a repo where the right answer is obviously unknowable.
-    let mut candidates: Vec<String> =
+    // The two enumerated shapes are kept APART as well as joined: `candidates` is the display list
+    // a decline prints, `root_variants`/`packages` are what a requested target is matched against.
+    // Re-deriving the shape from the display string ("does it end in ` (dev)`?") would be a parser
+    // over text we control on both sides, and would misread a script literally named that way.
+    let root_variants: Vec<String> =
         root_scripts.keys().filter(|k| k.starts_with("dev:")).cloned().collect();
     let packages =
         if is_workspace_root(worktree, Some(&root_manifest)) { workspace_dev_packages(worktree) } else { Vec::new() };
-    candidates.extend(packages.iter().map(|p| format!("{p} (dev)")));
+    let candidates: Vec<String> =
+        root_variants.iter().cloned().chain(packages.iter().map(|p| format!("{p} (dev)"))).collect();
 
-    if candidates.len() > 1 {
-        return Err(Decline::Ambiguous(candidates));
-    }
-    if candidates.is_empty() {
-        return Err(Decline::NoDevScript);
-    }
+    // WHICH candidate this run builds. The requested path and the exactly-one path both end at a
+    // single `Chosen`, and everything below is shared: a per-call target therefore cannot reach a
+    // spawn by any route the ordinary single-candidate case does not already use.
+    let chosen = match requested {
+        Some(want) => choose_candidate(want, &root_variants, &packages).ok_or_else(|| {
+            Decline::UnknownTarget { requested: want.to_string(), candidates: candidates.clone() }
+        })?,
+        None => {
+            if candidates.len() > 1 {
+                return Err(Decline::Ambiguous(candidates));
+            }
+            if candidates.is_empty() {
+                return Err(Decline::NoDevScript);
+            }
+            // Exactly one candidate: either a lone root `dev:<x>`, or one package with `dev`.
+            match packages.first() {
+                Some(pkg) => Chosen::Package(pkg.clone()),
+                None => Chosen::RootScript(candidates[0].clone()),
+            }
+        }
+    };
 
     let pm = pm.ok_or(Decline::NoPackageManager)?;
     if !pm.forwards_run_args_verified() {
         return Err(Decline::UnsupportedPackageManager(pm));
     }
-    // Exactly one candidate: either a lone root `dev:<x>`, or one package with `dev`.
-    if let Some(pkg) = packages.first() {
-        let pkg_dir = worktree.join(pkg);
-        let pkg_framework = root_framework(&pkg_dir);
-        if !pkg_framework.is_driven() {
-            return Err(Decline::UnsupportedFramework(pkg_framework));
+    match chosen {
+        Chosen::Package(pkg) => {
+            let pkg_dir = worktree.join(&pkg);
+            let pkg_framework = root_framework(&pkg_dir);
+            if !pkg_framework.is_driven() {
+                return Err(Decline::UnsupportedFramework(pkg_framework));
+            }
+            let (args, needs_arg_separator) = run_script_invocation(pm, "dev");
+            Ok(PreviewTarget {
+                framework: pkg_framework,
+                program: pm.program().to_string(),
+                args,
+                needs_arg_separator,
+                path: pkg,
+                source: "workspace-package",
+                port: None,
+            })
         }
-        let (args, needs_arg_separator) = run_script_invocation(pm, "dev");
-        return Ok(PreviewTarget {
-            framework: pkg_framework,
-            program: pm.program().to_string(),
-            args,
-            needs_arg_separator,
-            path: pkg.clone(),
-            source: "workspace-package",
-            port: None,
-        });
+        Chosen::RootScript(script) => {
+            if !framework.is_driven() {
+                return Err(Decline::UnsupportedFramework(framework));
+            }
+            let (args, needs_arg_separator) = run_script_invocation(pm, &script);
+            Ok(PreviewTarget {
+                framework,
+                program: pm.program().to_string(),
+                args,
+                needs_arg_separator,
+                path: String::new(),
+                source: "root-dev-variant",
+                port: None,
+            })
+        }
     }
-    let script = candidates[0].clone();
-    if !framework.is_driven() {
-        return Err(Decline::UnsupportedFramework(framework));
-    }
-    let (args, needs_arg_separator) = run_script_invocation(pm, &script);
-    Ok(PreviewTarget {
-        framework,
-        program: pm.program().to_string(),
-        args,
-        needs_arg_separator,
-        path: String::new(),
-        source: "root-dev-variant",
-        port: None,
-    })
 }
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════
@@ -1582,9 +1746,12 @@ pub struct PreviewOpened {
 /// `AppHandle` and cannot be unit-tested at all, so the decision that actually reaches the agent —
 /// "do we name an address before anything has bound one?" — would otherwise be untestable. This is
 /// the side effect a test can assert on.
-pub fn opened_reply(id: String, forced: Option<u16>, state: PreviewState) -> PreviewOpened {
+pub fn opened_reply(id: String, forced: Option<u16>, route: &str, state: PreviewState) -> PreviewOpened {
     match forced {
-        Some(port) => PreviewOpened { id, url: preview_url_for(port), port, state },
+        // The route rides the FORCED-port reply for the same reason it rides `transition`'s: an
+        // agent that gets an address back at all must get the one it asked for, or `path` would
+        // work through the event channel and silently not through the call's own answer.
+        Some(port) => PreviewOpened { id, url: preview_url_with_route(port, route), port, state },
         // NOT `preview_url_for(0)`: an empty string is the sentinel the frontend guard keys on, and
         // `http://127.0.0.1:0` would sail through it as a perfectly well-formed loopback URL.
         None => PreviewOpened { id, url: String::new(), port: 0, state },
@@ -1611,6 +1778,19 @@ pub struct PreviewStopOutcome {
 /// A live supervised server.
 struct Server {
     status: PreviewStatus,
+    /// The route this preview was opened on (`"/settings"`), or empty for the origin.
+    ///
+    /// HELD HERE rather than passed to each publish site, because the port arrives LATER than the
+    /// route does: `open_reserved` knows the route immediately and does not learn the real port
+    /// until `supervise` discovers it, and `transition` is the one place that turns a port into a
+    /// URL. Keeping it on the entry is what lets the address the card finally shows carry the route
+    /// the caller asked for, without the route having to travel through the supervisor thread.
+    ///
+    /// A RE-ATTACH KEEPS THE ORIGINAL ROUTE. A second `preview_open` with a different `path` does
+    /// not restart anything (that is the whole point of re-attach), so it cannot move a running
+    /// server's published address either — the caller is handed the live preview, on the route it
+    /// was opened with.
+    route: String,
     /// Shared with the supervisor thread so a stop can kill while the thread is mid-poll.
     child: Arc<Mutex<Option<Child>>>,
     pgid: u32,
@@ -1737,11 +1917,9 @@ impl PreviewManager {
         {
             return Ok(ReserveOutcome::Reattached(PreviewOpened {
                 id: existing.status.id.clone(),
-                url: existing
-                    .status
-                    .url
-                    .clone()
-                    .unwrap_or_else(|| existing.status.port.map(preview_url_for).unwrap_or_default()),
+                url: existing.status.url.clone().unwrap_or_else(|| {
+                    existing.status.port.map(|p| preview_url_with_route(p, &existing.route)).unwrap_or_default()
+                }),
                 port: existing.status.port.unwrap_or(0),
                 state: existing.status.state,
             }));
@@ -1773,7 +1951,11 @@ impl PreviewManager {
             server.status.state = state;
             if let Some(p) = port {
                 server.status.port = Some(p);
-                server.status.url = Some(preview_url_for(p));
+                // THE ROUTE IS APPLIED HERE, at the single place a port becomes a URL, so the
+                // address every consumer sees (event, `preview_status`, `preview_list`, the card)
+                // is the same string. Applying it downstream instead would make a card's held
+                // address differ from a freshly-read one and read as `moved`.
+                server.status.url = Some(preview_url_with_route(p, &server.route));
             }
             if error.is_some() {
                 server.status.error = error;
@@ -2086,11 +2268,12 @@ fn open_blocking(
     agent_id: String,
     project_id: String,
     worktree: String,
-    path_override: Option<String>,
+    route: Option<String>,
+    target: Option<String>,
 ) -> Result<PreviewOpened, String> {
     let state = app.state::<PreviewManager>();
     open_with_reservation(&state, &agent_id, |reservation| {
-        open_reserved(reservation, app.clone(), agent_id.clone(), project_id, worktree, path_override)
+        open_reserved(reservation, app.clone(), agent_id.clone(), project_id, worktree, route.clone(), target.clone())
     })
 }
 
@@ -2107,7 +2290,8 @@ fn open_reserved(
     agent_id: String,
     project_id: String,
     worktree: String,
-    path_override: Option<String>,
+    route_arg: Option<String>,
+    target_arg: Option<String>,
 ) -> Result<PreviewOpened, String> {
     let app_data = crate::dev_identity::app_data_dir(&app)?;
     let real = validate_worktree(&app_data.join("worktrees"), &worktree)?;
@@ -2118,14 +2302,26 @@ fn open_reserved(
     // path it needs (`stopPreviewForAgent`) already exists. Logged so the value being read is a
     // visible fact rather than something the next agent has to infer.
     tracing::info!(idle_grace_min = cfg.idle_grace_min, "preview: idle grace configured (enforced in TS)");
-    let target = detect_preview_target(&real, cfg.enabled).map_err(|d| d.message())?;
+    // A per-call `target`, if one was named. Empty/blank is treated as absent: an argument spelled
+    // `""` is the caller not choosing, and turning that into `UnknownTarget` would refuse an open
+    // that had asked for nothing in particular.
+    let requested = target_arg.as_deref().map(str::trim).filter(|t| !t.is_empty());
+    let target = detect_preview_target(&real, cfg.enabled, requested).map_err(|d| d.message())?;
 
-    let cwd = match path_override.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
-        Some(p) => real.join(p),
-        None if target.path.is_empty() => real.clone(),
-        None => real.join(&target.path),
-    };
-    // The override arrives from the frontend too, so it gets the same containment check.
+    // THE ROUTE IS NOT A CWD. `route_arg` is the caller's `path` — `/settings` — and it travels to
+    // the URL (via the `Server` entry below), never onto the spawn directory. It used to be
+    // `real.join(p)` here, and because `Path::join` with an ABSOLUTE argument replaces the base,
+    // the documented call `{ op: "open", path: "/settings" }` produced cwd `/settings` and then
+    // failed `validate_worktree` as "preview: invalid worktree path" — every single time. A cwd
+    // subpath is `[preview].path`'s job, which `target.path` below already carries.
+    let route = route_arg
+        .as_deref()
+        .map(str::trim)
+        .filter(|r| !r.is_empty() && is_preview_route(r))
+        .unwrap_or_default()
+        .to_string();
+    let cwd = if target.path.is_empty() { real.clone() } else { real.join(&target.path) };
+    // `target.path` can come from a hand-written `[preview].path`, so it gets the containment check.
     let cwd = validate_worktree(&app_data.join("worktrees"), &cwd.to_string_lossy())?;
 
     // THE ENTRY IS CREATED HERE, BEFORE THE PORT IS EVEN ALLOCATED — earlier than every previous
@@ -2161,7 +2357,7 @@ fn open_reserved(
         };
         manager
             .lock()
-            .insert(id.clone(), Server { status: status.clone(), child: Arc::clone(&child), pgid: 0, stop: Arc::clone(&stop) });
+            .insert(id.clone(), Server { status: status.clone(), route: route.clone(), child: Arc::clone(&child), pgid: 0, stop: Arc::clone(&stop) });
         let _ = app.emit("preview:state", status);
     }
 
@@ -2337,7 +2533,7 @@ fn open_reserved(
         supervise(supervisor_app, supervisor_id, child, stop, err_drain, pid, claim, app_data);
     });
 
-    Ok(opened_reply(id, forced, PreviewState::Starting))
+    Ok(opened_reply(id, forced, &route, PreviewState::Starting))
 }
 
 /// Watch one server: discover its port, probe it, then keep noticing whether it died.
@@ -2530,7 +2726,10 @@ pub async fn preview_capability(worktree: String) -> Result<PreviewCapability, S
         // never inside `<app_data>/worktrees`.
         let real = validate_project_dir(&worktree)?;
         let enabled = crate::config::for_project(&real.to_string_lossy()).config.preview.enabled;
-        Ok(match detect_preview_target(&real, enabled) {
+        // `None`: capability answers "could this worktree be previewed AT ALL", which is a
+        // property of the tree rather than of one call, so it must see the project's `[preview]`
+        // override exactly as an ordinary open does.
+        Ok(match detect_preview_target(&real, enabled, None) {
             Ok(target) => PreviewCapability { previewable: true, target: Some(target), decline_reason: None },
             Err(decline) => {
                 tracing::info!(code = decline.code(), "preview: declined");
@@ -2552,9 +2751,14 @@ pub async fn preview_open(
     agent_id: String,
     project_id: String,
     worktree: String,
+    // A ROUTE on the dev server (`/settings`), not a directory — see `preview_url_with_route`.
     path: Option<String>,
+    // WHICH enumerated candidate to run, for THIS call only, in a worktree where detection finds
+    // more than one. It selects from the enumerated list and can do nothing else: see
+    // `choose_candidate`, which is the only thing that reads it.
+    target: Option<String>,
 ) -> Result<PreviewOpened, String> {
-    tauri::async_runtime::spawn_blocking(move || open_blocking(app, agent_id, project_id, worktree, path))
+    tauri::async_runtime::spawn_blocking(move || open_blocking(app, agent_id, project_id, worktree, path, target))
         .await
         .map_err(|e| format!("preview_open task failed: {e}"))?
 }
@@ -2700,6 +2904,59 @@ mod tests {
         // refuses the frame.
         assert_eq!(preview_url_for(5173), "http://127.0.0.1:5173");
         assert!(preview_url_is_loopback(&preview_url_for(5173)));
+    }
+
+    /// `path` IS A ROUTE AND IT HAS TO REACH THE URL. The documented call
+    /// `{ op: "open", path: "/settings" }` used to be joined onto the SPAWN CWD instead
+    /// (`real.join("/settings")`), where `Path::join` replaced the base outright and the open then
+    /// failed `validate_worktree` — so the one call the agent brief instructs verbatim could never
+    /// succeed, and nothing appended the route to the URL either.
+    #[test]
+    fn a_route_lands_on_the_url_rather_than_on_the_spawn_directory() {
+        assert_eq!(preview_url_with_route(5173, "/settings"), "http://127.0.0.1:5173/settings");
+        assert_eq!(preview_url_with_route(5173, "/a/b?c=1#d"), "http://127.0.0.1:5173/a/b?c=1#d");
+        // No route asked for: the bare origin, byte-identical to what every earlier caller got.
+        assert_eq!(preview_url_with_route(5173, ""), preview_url_for(5173));
+        // …and it is still loopback with a route on it, which is what the frontend guard re-asks.
+        assert!(preview_url_is_loopback(&preview_url_with_route(5173, "/settings")));
+    }
+
+    /// *** THE ORIGIN-ESCAPE HALF, AND IT IS NOT HYGIENE. *** `preview_url_with_route` builds by
+    /// CONCATENATION, so a route that does not begin with `/` continues the AUTHORITY instead of
+    /// starting a path: `"@evil.example"` turns `http://127.0.0.1:5173` into a URL whose host is
+    /// `evil.example`. The tab case is the one a `(?![/\\])` lookahead alone misses — the WHATWG
+    /// parser strips U+0009/000A/000D BEFORE parsing, so `"/\t/evil.example"` is `"//evil.example"`
+    /// by the time anyone resolves it.
+    ///
+    /// A rejected route is DROPPED, not fatal: the preview still opens, at the origin. Every case
+    /// is asserted to still be loopback, because "we refused it" and "the URL is safe" are
+    /// different claims and only the second one matters.
+    #[test]
+    fn a_route_that_could_name_another_origin_is_refused_and_the_url_stays_loopback() {
+        let hostile = [
+            "@evil.example",
+            "evil.example",
+            "//evil.example/x",
+            "/\\evil.example",
+            "/\t/evil.example",
+            "/\n/evil.example",
+            "/\r/evil.example",
+            "http://evil.example",
+            "/ /evil.example",
+            "/x\u{7f}y",
+            "/x\u{0}y",
+        ];
+        for route in hostile {
+            assert!(!is_preview_route(route), "{route:?} must not be accepted as a route");
+            let url = preview_url_with_route(5173, route);
+            assert_eq!(url, preview_url_for(5173), "{route:?} must fall back to the bare origin, got {url}");
+            assert!(preview_url_is_loopback(&url), "{route:?} produced a non-loopback url: {url}");
+        }
+        // The paired half: an ordinary route IS accepted, so the assertions above cannot be passing
+        // by the guard refusing everything.
+        for route in ["/", "/settings", "/a/b", "/a?b=c", "/a#b", "/%20", "/a:b"] {
+            assert!(is_preview_route(route), "{route:?} is an ordinary route and must be accepted");
+        }
     }
 
     // ---------------------------------------------------------------- §2 discovery
@@ -2990,7 +3247,7 @@ mod tests {
         write(&dir.join("package.json"), r#"{"scripts":{"dev":"next dev","build":"next build"}}"#);
         write(&dir.join("pnpm-lock.yaml"), "lockfileVersion: '9.0'\n");
         write(&dir.join("next.config.ts"), "export default {}\n");
-        let t = detect_preview_target(&dir, true).expect("a plain `dev` + next.config is the common case");
+        let t = detect_preview_target(&dir, true, None).expect("a plain `dev` + next.config is the common case");
         assert_eq!(t.framework, Framework::Next);
         assert_eq!(t.program, "pnpm");
         assert_eq!(t.args, vec!["run".to_string(), "dev".to_string()]);
@@ -3008,7 +3265,7 @@ mod tests {
         write(&dir.join("package.json"), r#"{"scripts":{"dev":"vite"}}"#);
         write(&dir.join("package-lock.json"), "{}");
         write(&dir.join("vite.config.ts"), "export default {}\n");
-        let t = detect_preview_target(&dir, true).unwrap();
+        let t = detect_preview_target(&dir, true, None).unwrap();
         assert_eq!(t.program, "npm");
         assert!(t.needs_arg_separator, "npm eats the flag NAMES without a `--`");
         let argv = build_argv(&t, 5200);
@@ -3030,7 +3287,7 @@ mod tests {
             write(&dir.join("package.json"), r#"{"scripts":{"dev":"astro dev"}}"#);
             write(&dir.join("pnpm-lock.yaml"), "lockfileVersion: '9.0'\n");
             write(&dir.join(file), "export default {}\n");
-            let d = detect_preview_target(&dir, true).expect_err("not driven in Phase 1");
+            let d = detect_preview_target(&dir, true, None).expect_err("not driven in Phase 1");
             assert_eq!(d.code(), "unsupported-framework");
             assert!(d.message().contains(label), "the decline must name {label}: {}", d.message());
             let _ = std::fs::remove_dir_all(&dir);
@@ -3046,7 +3303,7 @@ mod tests {
             &dir.join(".sparkle").join("config.toml"),
             "[preview]\ncommand = \"bin/serve\"\nargs = [\"--dev\"]\npath = \"site\"\nport = 4321\n",
         );
-        let t = detect_preview_target(&dir, true).expect("an explicit override is always previewable");
+        let t = detect_preview_target(&dir, true, None).expect("an explicit override is always previewable");
         assert_eq!(t.source, "config");
         assert_eq!(t.program, "bin/serve");
         assert_eq!(t.args, vec!["--dev".to_string()]);
@@ -3079,7 +3336,7 @@ mod tests {
                 &dir.join(".sparkle").join("config.toml"),
                 &format!("[preview]\ncommand = \"pnpm\"\nargs = {args}\npath = \"apps/desktop\"\n"),
             );
-            let d = detect_preview_target(&dir, true).expect_err("a constant port must be refused");
+            let d = detect_preview_target(&dir, true, None).expect_err("a constant port must be refused");
             assert_eq!(d.code(), "constant-port-pin");
             let msg = d.message();
             assert!(msg.contains(flag), "the decline must name the offending flag `{flag}`: {msg}");
@@ -3098,7 +3355,7 @@ mod tests {
             &dir.join(".sparkle").join("config.toml"),
             "[preview]\ncommand = \"pnpm\"\nargs = [\"exec\", \"vite\", \"--port\", \"{port}\"]\n",
         );
-        let t = detect_preview_target(&dir, true).expect("`{port}` is the sanctioned spelling");
+        let t = detect_preview_target(&dir, true, None).expect("`{port}` is the sanctioned spelling");
         assert_eq!(build_spawn(&t, 52459).claim, PortClaim::Forced(52459));
         let _ = std::fs::remove_dir_all(&dir);
 
@@ -3109,7 +3366,7 @@ mod tests {
             &dir.join(".sparkle").join("config.toml"),
             "[preview]\ncommand = \"bin/serve\"\nargs = [\"--dev\"]\n",
         );
-        let t = detect_preview_target(&dir, true).expect("no port flag, nothing to refuse");
+        let t = detect_preview_target(&dir, true, None).expect("no port flag, nothing to refuse");
         assert_eq!(build_spawn(&t, 52459).claim, PortClaim::Unknown);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3120,8 +3377,8 @@ mod tests {
         write(&dir.join("package.json"), r#"{"scripts":{"dev":"next dev"}}"#);
         write(&dir.join("pnpm-lock.yaml"), "lockfileVersion: '9.0'\n");
         write(&dir.join("next.config.ts"), "export default {}\n");
-        assert!(detect_preview_target(&dir, true).is_ok(), "…it would otherwise be previewable");
-        assert_eq!(detect_preview_target(&dir, false).unwrap_err().code(), "disabled");
+        assert!(detect_preview_target(&dir, true, None).is_ok(), "…it would otherwise be previewable");
+        assert_eq!(detect_preview_target(&dir, false, None).unwrap_err().code(), "disabled");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3129,7 +3386,7 @@ mod tests {
     fn a_repo_with_no_package_json_declines_rather_than_scanning() {
         let dir = tempdir("rust");
         write(&dir.join("Cargo.toml"), "[package]\nname = \"x\"\n");
-        assert_eq!(detect_preview_target(&dir, true).unwrap_err().code(), "not-a-js-project");
+        assert_eq!(detect_preview_target(&dir, true, None).unwrap_err().code(), "not-a-js-project");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3142,7 +3399,7 @@ mod tests {
         write(&dir.join("apps").join("site").join("package.json"), r#"{"scripts":{"dev":"vite"}}"#);
         write(&dir.join("apps").join("site").join("vite.config.ts"), "export default {}\n");
         write(&dir.join("packages").join("core").join("package.json"), r#"{"scripts":{"test":"vitest"}}"#);
-        let t = detect_preview_target(&dir, true).expect("exactly one candidate is unambiguous");
+        let t = detect_preview_target(&dir, true, None).expect("exactly one candidate is unambiguous");
         assert_eq!(t.source, "workspace-package");
         assert_eq!(t.path, "apps/site");
         assert_eq!(t.framework, Framework::Vite, "the framework is read from the PACKAGE, not the root");
@@ -3169,12 +3426,176 @@ mod tests {
         let dir = tempdir("sparkle-root-manifest");
         std::fs::copy(repo.join("package.json"), dir.join("package.json"))
             .expect("the real root manifest is what makes this test about Sparkle");
-        let decline = detect_preview_target(&dir, true).expect_err("Sparkle must refuse to guess");
+        let decline = detect_preview_target(&dir, true, None).expect_err("Sparkle must refuse to guess");
         assert_eq!(decline.code(), "ambiguous");
         let msg = decline.message();
         for script in ["dev:web", "dev:orchestration", "dev:desktop", "dev:mobile"] {
             assert!(msg.contains(script), "the decline must name {script}: {msg}");
         }
+        // AND IT MUST NAME A REMEDY THE READER IS ALLOWED TO PERFORM. An agent's own contract
+        // forbids it to edit shared checked-in config unilaterally, so a decline offering only
+        // `[preview]` in .sparkle/config.toml told every agent to do the one thing it could not do
+        // — the deadlock of bead `sparkle-syzpei`. The per-call form is the one that has to be
+        // here; the config line stays for the human.
+        assert!(
+            msg.contains("{ op: \"open\", target: \"<one of those>\" }"),
+            "the decline must name the per-call escape hatch verbatim, so an agent can act on it: {msg}"
+        );
+        assert!(
+            msg.contains(".sparkle/config.toml"),
+            "…without dropping the project-wide remedy a human would reach for: {msg}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ------------------------------------------------------- §4b per-call `target`
+
+    /// A workspace with TWO previewable things, which is the only situation `target` exists for.
+    /// Two `dev:*` scripts at the root and one package with a plain `dev`, so enumeration finds
+    /// three candidates and cannot pick.
+    fn ambiguous_workspace(tag: &str) -> PathBuf {
+        let dir = tempdir(tag);
+        write(
+            &dir.join("package.json"),
+            r#"{"private":true,"scripts":{"dev:web":"vite","dev:docs":"vite"}}"#,
+        );
+        // NO framework config at the ROOT, on purpose: a root signature would make step 3 answer
+        // before enumeration ever ran, and this fixture is about enumeration.
+        write(&dir.join("pnpm-workspace.yaml"), "packages:\n  - \"apps/*\"\n");
+        write(&dir.join("pnpm-lock.yaml"), "lockfileVersion: '9.0'\n");
+        write(&dir.join("apps").join("site").join("package.json"), r#"{"scripts":{"dev":"vite"}}"#);
+        write(&dir.join("apps").join("site").join("vite.config.ts"), "export default {}\n");
+        dir
+    }
+
+    /// THE BEAD. Without a target the tree declines (that is the precondition, asserted here so the
+    /// rest cannot pass by the tree having been unambiguous all along); with one, the named
+    /// candidate is built — and BOTH spellings a caller has plausibly been shown resolve to it.
+    #[test]
+    fn a_per_call_target_picks_one_candidate_where_detection_would_otherwise_decline() {
+        let dir = ambiguous_workspace("target-picks");
+
+        let decline = detect_preview_target(&dir, true, None).expect_err("three candidates cannot be guessed");
+        assert_eq!(decline.code(), "ambiguous", "the precondition: this tree is genuinely ambiguous");
+
+        // The exact string the decline printed.
+        let t = detect_preview_target(&dir, true, Some("apps/site (dev)"))
+            .expect("the candidate the decline named must be selectable");
+        assert_eq!(t.source, "workspace-package");
+        assert_eq!(t.path, "apps/site");
+        assert_eq!(t.framework, Framework::Vite, "read from the PACKAGE, as the un-targeted path does");
+
+        // The bare package dir, which is what an agent naturally types.
+        let bare = detect_preview_target(&dir, true, Some("apps/site"))
+            .expect("the bare package dir is the other spelling a caller has been shown");
+        assert_eq!(bare, t, "both spellings must resolve to the SAME target, not two similar ones");
+
+        // A root `dev:*` variant, by its script name.
+        let root = detect_preview_target(&dir, true, Some("dev:docs")).expect("a root dev:* is a candidate too");
+        assert_eq!(root.source, "root-dev-variant");
+        assert_eq!(root.path, "", "a root script runs at the root");
+        assert!(root.args.iter().any(|a| a == "dev:docs"), "…and it is THAT script that runs: {:?}", root.args);
+        assert!(
+            !root.args.iter().any(|a| a == "dev:web"),
+            "…not the other candidate, which would make the argument decorative: {:?}",
+            root.args
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (c) OF THE BEAD, AND THE REASON THE WHOLE THING WORKS. A `[preview]` block wins over
+    /// enumeration for an ordinary open — but a per-call target skips it. If config always won, the
+    /// argument would be INERT in every project carrying a `[preview]` block, this repo included,
+    /// and the deadlock would survive its own fix. It is allowed to win because it is caller-scoped:
+    /// it lives for one open and no other agent can observe it.
+    #[test]
+    fn a_per_call_target_skips_the_project_config_override_that_would_otherwise_win() {
+        let dir = ambiguous_workspace("target-beats-config");
+        write(
+            &dir.join(".sparkle").join("config.toml"),
+            "[preview]\ncommand = \"my-server\"\nargs = [\"--port\", \"{port}\"]\n",
+        );
+
+        // The precondition, and it is the half that makes the assertion below mean anything: with
+        // no target, config wins outright and enumeration never runs.
+        let configured = detect_preview_target(&dir, true, None).expect("an override is always previewable");
+        assert_eq!(configured.source, "config");
+        assert_eq!(configured.program, "my-server");
+
+        let targeted = detect_preview_target(&dir, true, Some("apps/site"))
+            .expect("a per-call target must reach enumeration even here");
+        assert_eq!(targeted.source, "workspace-package", "config must NOT have won: {targeted:?}");
+        assert_ne!(targeted.program, "my-server");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// *** THE SECURITY PROPERTY. *** `target` selects from the enumerated list and can do nothing
+    /// else. A value naming no candidate is a DECLINE — never a fallback, never a spawn — so a
+    /// hostile string cannot become a program, an argv entry or a path.
+    ///
+    /// `detect_preview_target` is the ONLY thing that reads a caller's target, and a `PreviewTarget`
+    /// is the only thing `build_spawn` can turn into an argv, so `Err` here IS "nothing spawns":
+    /// there is no other route from this argument to a process. Each value is asserted twice —
+    /// refused, and no target produced — because the second is the one that stays true if someone
+    /// later adds a fallback arm.
+    #[test]
+    fn a_target_naming_no_candidate_is_refused_and_can_never_reach_a_spawn() {
+        let dir = ambiguous_workspace("target-hostile");
+        let hostile = [
+            "; rm -rf /",
+            "apps/site; rm -rf /",
+            "apps/site (dev) && curl evil.example",
+            "../../etc",
+            "../../../etc/passwd",
+            "/etc/passwd",
+            "/",
+            "$(whoami)",
+            "`id`",
+            "apps/site\n dev:web",
+            "",
+            "   ",
+            "APPS/SITE",
+            "apps/site/",
+            "dev:doc",
+            "dev",
+        ];
+        for want in hostile {
+            let out = detect_preview_target(&dir, true, Some(want));
+            assert!(out.is_err(), "{want:?} names no candidate and must not produce a target: {out:?}");
+            let decline = out.unwrap_err();
+            assert_eq!(decline.code(), "unknown-target", "{want:?} must be refused BY NAME: {decline:?}");
+        }
+
+        // …and the refusal has to be actionable in one round trip: it names the value asked for AND
+        // the list that would have worked. An agent that gets only "no" guesses again.
+        let decline = detect_preview_target(&dir, true, Some("apps/web")).unwrap_err();
+        let msg = decline.message();
+        assert!(msg.contains("apps/web"), "the refusal must quote what was asked for: {msg}");
+        for candidate in ["dev:docs", "dev:web", "apps/site (dev)"] {
+            assert!(msg.contains(candidate), "…and name {candidate}, which WOULD have worked: {msg}");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// THE ARGV IS BUILT FROM THE ENUMERATED STRING, NOT THE CALLER'S. The bare-dir spelling
+    /// `apps/site` resolves to the package, and nothing the caller typed survives into the spawn —
+    /// which is what makes the match a SELECTION rather than a sanitised pass-through.
+    #[test]
+    fn a_matched_target_spawns_the_enumerated_candidate_not_the_string_the_caller_typed() {
+        let dir = ambiguous_workspace("target-argv");
+        let t = detect_preview_target(&dir, true, Some("apps/site (dev)")).expect("a real candidate");
+        let spawn = build_spawn(&t, 5200);
+        assert_eq!(t.program, "pnpm", "the program comes from the lockfile, never from the argument");
+        assert!(
+            !spawn.argv.iter().any(|a| a.contains("apps/site")),
+            "the caller's spelling must not appear in the argv at all: {:?}",
+            spawn.argv
+        );
+        assert!(spawn.argv.iter().any(|a| a == "dev"), "the package's own `dev` script runs: {:?}", spawn.argv);
+        assert_eq!(t.path, "apps/site", "the DIRECTORY is the enumerated path, which is a separate field");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3624,7 +4045,7 @@ mod tests {
             unconveyed.argv
         );
         assert_eq!(
-            opened_reply("pv1".into(), unconveyed.claim.forced(), PreviewState::Starting).url,
+            opened_reply("pv1".into(), unconveyed.claim.forced(), "", PreviewState::Starting).url,
             "",
             "so nothing may be announced for it before discovery runs"
         );
@@ -3708,7 +4129,7 @@ mod tests {
         assert_eq!(spawn.claim, PortClaim::Forced(52459), "the token PROVES the child was told");
         assert_eq!(spawn.claim.forced(), Some(52459));
         assert_eq!(
-            opened_reply("pv1".into(), spawn.claim.forced(), PreviewState::Starting).url,
+            opened_reply("pv1".into(), spawn.claim.forced(), "", PreviewState::Starting).url,
             "http://127.0.0.1:52459",
             "which is exactly what makes the address publishable before a socket exists"
         );
@@ -3737,7 +4158,7 @@ mod tests {
     fn two_concurrent_previews_of_this_repo_are_handed_different_ports_on_their_command_lines() {
         let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..").canonicalize().unwrap();
         assert!(repo.join("pnpm-workspace.yaml").is_file(), "sanity: this is the Sparkle repo root");
-        let target = detect_preview_target(&repo, true)
+        let target = detect_preview_target(&repo, true, None)
             .expect("this repo's own [preview] override must be previewable");
         assert_eq!(target.source, "config");
 
@@ -3889,7 +4310,7 @@ mod tests {
     /// whether a URL is announced before anything has bound a socket.
     #[test]
     fn opened_reply_names_an_address_only_for_a_forced_port() {
-        let unforced = opened_reply("pv1".into(), None, PreviewState::Starting);
+        let unforced = opened_reply("pv1".into(), None, "", PreviewState::Starting);
         assert_eq!(unforced.url, "", "an unforced open must name no address at all");
         assert_eq!(unforced.port, 0);
         assert_eq!(unforced.state, PreviewState::Starting);
@@ -3897,7 +4318,7 @@ mod tests {
         // `isLoopbackPreviewUrl` would both wave `http://127.0.0.1:0` straight through.
         assert!(!unforced.url.contains("127.0.0.1"));
 
-        let forced = opened_reply("pv1".into(), Some(5200), PreviewState::Starting);
+        let forced = opened_reply("pv1".into(), Some(5200), "", PreviewState::Starting);
         assert_eq!(forced.url, "http://127.0.0.1:5200");
         assert_eq!(forced.port, 5200);
     }
@@ -3957,7 +4378,7 @@ mod tests {
             "and never the allocated port itself"
         );
         assert!(
-            body.contains("Ok(opened_reply(id, forced, PreviewState::Starting))"),
+            body.contains("Ok(opened_reply(id, forced, &route, PreviewState::Starting))"),
             "the agent-facing reply must go through opened_reply"
         );
         // And the allocated port must not be published anywhere by name.
@@ -3965,6 +4386,139 @@ mod tests {
             !body.contains("Some(port), None)") && !body.contains("preview_url_for(port)"),
             "no publish site may name the allocated `port` again: {body}"
         );
+    }
+
+    // ------------------------------------------------- §4c what `supervise` can actually emit
+
+    /// `supervise`'s OWN body, sliced the same way `open_reserved`'s is above. Shared by the two
+    /// tests below so the slicing discipline — and its two asserted bounds — exists once.
+    fn supervise_body() -> &'static str {
+        let whole = include_str!("preview.rs");
+        let test_mod = whole
+            .find("#[cfg(test)]\nmod tests {")
+            .expect("preview.rs no longer carries its `#[cfg(test)] mod tests` marker");
+        let prod = &whole[..test_mod];
+        assert!(prod.len() > 1000, "the production half must not have been truncated to nothing");
+        assert!(whole.len() - prod.len() > 1000, "the test module cut away must be substantial too");
+        let fn_start = prod.find("fn supervise(").expect("supervise must still exist");
+        let after_sig = &prod[fn_start..];
+        let fn_end = after_sig.find("\n}\n").expect("supervise must still have a top-level close");
+        let body = &after_sig[..fn_end];
+        assert!(body.len() > 500, "supervise's body must not have been truncated to nothing");
+        body
+    }
+
+    /// *** A STRUCTURAL TEST, DELIBERATELY, AND HERE IS WHY. *** `supervise` takes a live
+    /// `AppHandle` and a real `Child` and spawns no seam for either: `transition` and `finish` both
+    /// go straight to `app.emit`, and `discover_port`/`http_probe` read the actual process table
+    /// and the actual socket. There is no injection point to drive it through, so a behavioural
+    /// test of this loop is not reachable without a refactor larger than the finding — and the
+    /// function has therefore had NO test of any kind. This follows
+    /// `open_reserved_calls_cancel_if_stopped_during_spawn_between_the_registry_write_and_set_pgid`
+    /// directly above, which is this file's precedent for pinning an untestable function's shape
+    /// against its own source.
+    ///
+    /// WHAT IT PINS — three verified facts about the loop's reachability graph, each of which is
+    /// currently true and none of which anything else asserts:
+    ///
+    ///   1. The discovery/transition block is guarded by `if bound.is_none()`, so it runs AT MOST
+    ///      ONCE for the life of the server. Every subsequent iteration only re-checks liveness.
+    ///   2. After binding, the ONLY reachable state change is the `Crashed` finish on exit. Both
+    ///      `transition` calls and both in-block `finish` calls live inside the once-only block.
+    ///   3. `http_probe` is called exactly once and is NEVER retried — so a dev server that binds
+    ///      its socket before it can answer HTTP LATCHES AT `Listening` FOREVER. That is a real
+    ///      behaviour of this loop (see the notes at the top of this file and on `http_probe`), not
+    ///      an oversight this test is smuggling in as correct; it is pinned so that a future edit
+    ///      which adds a retry is a deliberate, visible change rather than an accident.
+    ///
+    /// It goes RED if the loop is made to re-emit, if a second transition is added after bind, or
+    /// if `PreviewState::Serving` is written from here.
+    #[test]
+    fn supervise_binds_once_and_can_emit_nothing_further_except_the_crash() {
+        let body = supervise_body();
+
+        let guard = body.find("if bound.is_none() {").expect("the once-only guard must still exist");
+        assert_eq!(
+            body.matches("if bound.is_none() {").count(),
+            1,
+            "one guard, or 'at most once' stops being a property of the loop"
+        );
+        assert_eq!(
+            body.matches("bound = Some(port);").count(),
+            1,
+            "`bound` is latched in exactly one place — a second write is a second discovery"
+        );
+        assert!(body.find("bound = Some(port);").unwrap() > guard, "…and it happens inside the guard");
+
+        // 2. EVERY state change, located by position relative to the guard.
+        let transitions: Vec<usize> = body.match_indices("transition(&app, &id,").map(|(i, _)| i).collect();
+        assert_eq!(transitions.len(), 2, "exactly two transitions — Listening, then Ready: {transitions:?}");
+        for at in &transitions {
+            assert!(*at > guard, "a transition outside the once-only block would re-emit every poll");
+        }
+        assert!(body.contains("PreviewState::Listening, Some(port), None)"), "the first is Listening");
+        assert!(body.contains("PreviewState::Ready, Some(port), None)"), "the second is Ready");
+
+        let finishes: Vec<usize> = body.match_indices("finish(").map(|(i, _)| i).collect();
+        assert_eq!(finishes.len(), 3, "exactly three terminal finishes: {finishes:?}");
+        assert_eq!(
+            finishes.iter().filter(|at| **at < guard).count(),
+            1,
+            "exactly ONE of them is reachable after binding — the `Crashed`/`Failed` exit check at \
+             the top of the loop. The other two are inside the once-only block."
+        );
+        assert!(
+            body.contains("(PreviewState::Crashed, format!(\"the dev server exited. {tail}\"))"),
+            "and that one is the crash, which is the only post-bind state change there is"
+        );
+
+        // 3. ONE probe, never retried. This is what makes `Listening` a latch.
+        assert_eq!(
+            body.matches("http_probe(").count(),
+            1,
+            "a second `http_probe` call would be a retry, which this loop deliberately does not do"
+        );
+        assert!(body.find("http_probe(").unwrap() > guard, "…and it is inside the once-only block");
+
+        // Nothing here may write the dead variant. See the test below for the finding.
+        assert!(!body.contains("PreviewState::Serving"), "supervise must not be the thing that revives Serving");
+    }
+
+    /// A RECORDED FINDING, NOT A FIX. `PreviewState::Serving` has NO production writer anywhere:
+    /// nothing in this file's production half constructs it (the one mention is
+    /// `live_for_reattach`'s match arm, which READS it), and `supervise` — the only thing that
+    /// advances a running server's state — stops at `Ready`. Yet both `live_for_reattach` here and
+    /// `is_framable` in preview_capture.rs treat it as a live, framable state.
+    ///
+    /// So the variant is dead in one direction and load-bearing in the other, and this test does
+    /// NOT resolve that: deleting the variant or narrowing those two predicates is a product
+    /// decision about what "serving" is supposed to mean, taken by whoever owns those files. What
+    /// this pins is that the situation stays VISIBLE — if someone adds a writer, the count moves
+    /// and this test says so by name rather than the change landing silently.
+    #[test]
+    fn preview_state_serving_still_has_no_production_writer() {
+        let whole = include_str!("preview.rs");
+        let test_mod = whole.find("#[cfg(test)]\nmod tests {").expect("the test module marker must exist");
+        let prod = &whole[..test_mod];
+        assert!(prod.len() > 1000, "the production half must not have been truncated to nothing");
+
+        let mentions: Vec<usize> = prod.match_indices("PreviewState::Serving").map(|(i, _)| i).collect();
+        assert_eq!(
+            mentions.len(),
+            1,
+            "exactly one production mention of PreviewState::Serving is expected — `live_for_reattach`'s \
+             match arm, which READS it. A second mention means someone gave it a writer (good — then \
+             update this test and the note on the variant) or another reader: {mentions:?}"
+        );
+        assert!(
+            prod[mentions[0]..].starts_with("PreviewState::Serving => true,"),
+            "…and that one mention is still the read in live_for_reattach"
+        );
+
+        // The behavioural half, so the finding is not purely textual: the two predicates DO treat it
+        // as live today, and that is the fact that makes the missing writer worth recording.
+        assert!(live_for_reattach(PreviewState::Serving), "reattach treats Serving as live — unchanged here");
+        assert!(!live_for_reattach(PreviewState::Crashed), "…and the predicate is not simply always true");
     }
 
     // ---------------------------------------------------------------- §5 registry + sweep
@@ -4142,6 +4696,7 @@ mod tests {
                 state,
                 error: None,
             },
+            route: String::new(),
             child: Arc::new(Mutex::new(None)),
             pgid: 0,
             stop: Arc::new(AtomicBool::new(false)),

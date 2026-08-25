@@ -61,6 +61,7 @@ mod delivery;
 mod demotion;
 mod deps_bootstrap;
 mod dev_identity;
+mod dev_port_preflight;
 mod dictation;
 mod display_span;
 mod drainer;
@@ -1400,6 +1401,7 @@ pub fn run() {
             preview::preview_open,
             preview::preview_stop,
             preview::preview_stop_for_agent,
+            dev_port_preflight::dev_port_preflight,
             preview::preview_status,
             preview::preview_list,
             preview_capture::preview_screenshot,

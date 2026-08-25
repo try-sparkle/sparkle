@@ -15,12 +15,21 @@
 // Keying by side would have made "the left pane's preview" a fact about the layout.
 import { create } from "zustand";
 
-/** The server-side state machine (design §5), verbatim from the Rust contract. `installing` →
- *  `starting` → `listening` → `ready` → `serving` on the happy path; `installing` is reachable only
- *  when `node_modules` was not yet on disk at open time (Phase 2 — most opens skip straight to
- *  `starting`, since `deps_bootstrap` usually finished long before anyone clicks Preview). `failed`
- *  is reachable from `installing` (the deps wait timed out) / `starting` / `listening` (the process
- *  exited, or no port inside the timeout) and `crashed` from `serving`. */
+/** The server-side state machine (design §5), verbatim from the Rust contract.
+ *
+ *  WHAT THE ENGINE ACTUALLY DRIVES: `installing` → `starting` → `listening` → `ready`, and then
+ *  nothing until the process dies. `installing` is reachable only when `node_modules` was not yet
+ *  on disk at open time (Phase 2 — most opens skip straight to `starting`, since `deps_bootstrap`
+ *  usually finished long before anyone clicks Preview). `failed` is reachable from `installing`
+ *  (the deps wait timed out) / `starting` / `listening` (the process exited, or no port inside the
+ *  timeout); `crashed` is what a server that HAD bound a port becomes when it exits, so it follows
+ *  `listening` or `ready`.
+ *
+ *  `serving` IS PART OF THE WIRE TYPE AND HAS NO WRITER (bead `sparkle-l7cihu`). This doc used to
+ *  put it at the end of the happy path and to hang `crashed` off it; `supervise` reaches `ready`
+ *  and stops, and `http_probe` is never retried, so a server that binds before it can answer HTTP
+ *  latches at `listening` permanently. Keep parsing and handling `"serving"` anyway — see
+ *  `SURFACING_STATES` below for why the set must not be narrowed. */
 export type PreviewState =
   | "installing"
   | "starting"
@@ -111,10 +120,23 @@ export interface PreviewEntry {
    * until it ever has.
    *
    * This is condition 5's clock (design §10: "the request is fresher than a TTL (5s, matching
-   * `REVEAL_REQUEST_TTL_MS`)"), and it is a TRANSITION stamp rather than a last-seen-at. The
-   * difference is the whole point: a dev server re-emits `serving` on every hot reload, so a
-   * last-seen stamp would hold the TTL open indefinitely and the freshness clause — the one thing
-   * standing between "a build finished" and "a pane opened three minutes later" — would never bind.
+   * `REVEAL_REQUEST_TTL_MS`)"), and it is a TRANSITION stamp rather than a last-seen-at. That
+   * conclusion is right; the reason this comment used to give for it was not, and the wrong reason
+   * propagated (bead `sparkle-l7cihu`). It said "a dev server re-emits `serving` on every hot
+   * reload". It does not. `preview.rs`'s `supervise` runs its discovery block at most once (`if
+   * bound.is_none()`) and afterwards only checks for death, so a HEALTHY preview emits nothing
+   * further at all — which is stated correctly 30-odd lines below, on `lastActivityAt`, and was
+   * simply not read here.
+   *
+   * THE REAL REASON is that the repeats which DO exist are the app's own re-reads, and they are
+   * exactly the ones a freshness clause must not be fooled by. `preview_list` re-folds every live
+   * preview through `applyPreviewStatus` whenever a window mounts and reconciles, and
+   * `fetchPreviewStatus` does the same for one agent — including from `resolvePreviewOpenTarget`,
+   * i.e. from the act of opening itself. A last-seen stamp would therefore mark a server that has
+   * sat `ready` for an hour as freshly surfaced the moment anything looked at it, and the freshness
+   * clause — the one thing standing between "a build finished" and "a pane opened three minutes
+   * later" — would never bind. A transition stamp cannot be moved by a re-read, because a re-read
+   * carries the state it already had.
    *
    * `setPreview`'s unchanged-value bail already gives this for free on an identical repeat; the
    * explicit `prev.status !== next.status` test below covers the repeat that carries a new url or
@@ -161,7 +183,26 @@ export interface PreviewEntry {
 /** The states in which a preview is worth putting in front of the user: it has compiled and is
  *  answering. `listening` is deliberately NOT one — a port is bound before the first build
  *  finishes, so surfacing there shows the framework's own "compiling" page, which is the "several
- *  of them showing a broken build" outcome §10 exists to prevent. */
+ *  of them showing a broken build" outcome §10 exists to prevent.
+ *
+ *  `serving` IS IN THIS SET AND MUST STAY IN IT, EVEN THOUGH NOTHING PRODUCES IT TODAY — recorded
+ *  here rather than acted on (bead `sparkle-l7cihu`). Grep both languages: every construction of
+ *  `PreviewState::Serving` outside a test fixture is a PREDICATE reading it, never a writer.
+ *  `supervise` drives `listening` → `ready` and then only terminal failure; the enum's own doc
+ *  comment says "`serving` is set by the frontend once its frame is actually showing the page",
+ *  and that is false too — no frontend code writes `"serving"` outside test fixtures either.
+ *  Several predicates nonetheless treat it as live, and all of them are correct to: this set,
+ *  `previewIdleGrace`'s `LIVE_STATES`, `AgentRow`'s preview affordance, and on the Rust side
+ *  `is_framable` (preview_capture.rs) and `live_for_reattach` (preview.rs).
+ *
+ *  DO NOT NARROW ANY OF THEM ON THE STRENGTH OF THAT. The wire type still ADMITS `"serving"` — it
+ *  is a variant of the serialized `PreviewState`, so a future writer (or an older/newer build on
+ *  the other side of the IPC boundary) can send it at any time, and a frontend that had quietly
+ *  dropped the state would then paint a live preview as nothing at all. Handling a state nobody
+ *  sends costs one set member; failing to handle one somebody sends costs the feature. The real
+ *  hazard is the opposite direction, and it is why the false header above survived a full green
+ *  suite: EVERY existing test feeds `"serving"` in BY HAND, so the dead variant looks thoroughly
+ *  exercised. A fixture using `serving` is not evidence that anything emits it. */
 const SURFACING_STATES: ReadonlySet<PreviewState> = new Set<PreviewState>(["ready", "serving"]);
 
 /** Is this a state whose ARRIVAL should arm the auto-open predictor? See `surfacedAt`. */

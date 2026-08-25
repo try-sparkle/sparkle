@@ -9499,6 +9499,13 @@ pub fn remove_worktree_at(
     };
     // Lock released. The multi-second delete now stalls nothing.
     delete_parked_checkout(parked);
+    // REPORT ONLY, on a detached thread (bead `sparkle-r28em`). A dev server whose cwd was inside
+    // the checkout we just renamed is still running and still holding its port — and Sparkle's own
+    // dev port is `strictPort`, so there is no fallback and every later `tauri dev` on this machine
+    // fails with a bare port-in-use naming nothing. This turns that into a log line naming the pid,
+    // its command and the worktree-trash path it is now sitting in. It kills nothing and it cannot
+    // fail this teardown: the thread is detached and the whole probe is best-effort.
+    crate::dev_port_preflight::report_after_teardown(app_data.to_path_buf());
     Ok(())
 }
 
@@ -9626,6 +9633,13 @@ pub async fn remove_agent_worktree(
 ) -> Result<(), String> {
     tracing::info!(%root, %project_id, %agent_id, "remove_agent_worktree");
     let app_data = app_data_dir(&app)?;
+    // The preview interlock used to be FRONTEND-ONLY: `services/worktree.ts::removeAgentWorkspace`
+    // calls `preview_stop_for_agent` first, so anything reaching this command directly evacuated a
+    // checkout out from under a live dev server (bead `sparkle-r28em`). This closes that by calling
+    // the SAME already-proven stop — not a second killer — and it never propagates a failure, so a
+    // stray preview still cannot wedge cleanup. Harmless when the frontend already stopped it: the
+    // stop is idempotent and answers `already-stopped`/`not-found`.
+    crate::dev_port_preflight::stop_preview_before_teardown(&app, &agent_id).await;
     let started = std::time::Instant::now();
     let outcome = tauri::async_runtime::spawn_blocking(move || {
         remove_worktree_at(&root, &project_id, &agent_id, &app_data)
