@@ -1,7 +1,7 @@
 // The long chat thread: right-aligned user bubbles, left plain Sparkle replies (no
 // "You"/"Sparkle" labels, no left-side glow — alignment and chrome carry authorship), batch
 // dividers, and nudge cards. Auto-follows the newest message.
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { FiCheck } from "react-icons/fi";
 import { useAutoFollow } from "../../hooks/useAutoFollow";
 import { C } from "../../theme/colors";
@@ -42,6 +42,40 @@ export const BACKLOG_DIVIDER_TESTID = "concierge-backlog-divider";
 /** The column to the right of the scroller that the caller fills (the scrubber rail lands here). */
 export const THREAD_RAIL_TESTID = "concierge-thread-rail";
 
+/** The wrapper around ONE caller-supplied artifact drawn inside the transcript. Carries
+ *  `data-artifact-id` so a test can read WHICH artifact without matching on its contents. */
+export const THREAD_ARTIFACT_TESTID = "concierge-thread-artifact";
+
+/**
+ * A NON-MESSAGE ITEM WITH A PLACE IN SCROLL HISTORY — the live preview card is the first one.
+ *
+ * ══ WHY THE THREAD DRAWS IT AND NOT THE COLUMN (bead sparkle-0xbron) ════════════════════════════
+ * The founder, twice: *"the preview must NOT be attached to the compose box — it should render in
+ * the actual chat thread, as a message-like item in the transcript… a thread artifact with its own
+ * place in scroll history, not a fixture pinned above the composer"*, and again on 2026-08-25
+ * *"it's supposed to be in line with chat so that it flows in the chat"*. Anything the COLUMN
+ * renders is a sibling of this scroller and therefore cannot scroll with the conversation, however
+ * it is styled. Only a child of the scroller can.
+ *
+ * ══ WHY IT IS ANCHORED AND NOT APPENDED ═════════════════════════════════════════════════════════
+ * Rendering it after the last row would put it inside the scroller and still leave it pinned to the
+ * bottom of the content — new messages would draw ABOVE it forever and the reader would see very
+ * nearly what they see today. "Its own place in scroll history" means the artifact stays where the
+ * conversation was when it arrived, and everything said afterwards pushes it up. So the producer
+ * names the message it landed after and this component draws it there.
+ *
+ * `afterMessageId: null` — or an id no longer in the window, because the thread is capped at 200
+ * entries and trimmed from the front — draws it at the TOP of the live window, which is the honest
+ * position for something older than everything on screen.
+ */
+export interface ThreadArtifact {
+  /** Stable across re-renders for the same artifact; used as the React key. */
+  id: string;
+  /** Draw immediately after this message. `null` (or an unknown id) draws at the top. */
+  afterMessageId: string | null;
+  node: ReactNode;
+}
+
 // Re-exported: these ids named this module before the per-message rendering moved into its own
 // component, and the thread is still where a reader looks for them.
 export {
@@ -80,6 +114,7 @@ export function ConciergeThread({
   turnFloor,
   backlog,
   rail,
+  artifacts,
   onScrollerAttached,
   jumpRequest,
 }: {
@@ -102,6 +137,14 @@ export function ConciergeThread({
   /** A fixed-width column rendered to the RIGHT of the scroller, full height. The thread owns the
    *  layout; the caller owns what goes in it. (The scrubber rail lands here.) */
   rail?: ReactNode;
+  /**
+   * Non-message items drawn INSIDE the scroller, each anchored to the message it landed after —
+   * see {@link ThreadArtifact} for why they are anchored rather than appended.
+   *
+   * OPTIONAL, and absent means nothing changes: every existing caller and suite renders exactly the
+   * DOM it did before this prop existed, which is the same contract `backlog` and `rail` have.
+   */
+  artifacts?: ThreadArtifact[];
   /**
    * Hand the SCROLLER ITSELF to the caller, once, as it mounts (and `null` as it unmounts).
    *
@@ -365,6 +408,41 @@ export function ConciergeThread({
   // keystroke changed. `visible` is the only thing the fold reads, and it is itself memoized
   // upstream (`useSelectionStableThread`), so it is the whole dependency.
   const rows = useMemo(() => foldReceiptRuns(visible), [visible]);
+  /**
+   * THE ARTIFACTS, BUCKETED BY THE ROW THEY FOLLOW.
+   *
+   * Two things this has to get right, both of which a naive `find` would get wrong:
+   *
+   *   • A FOLDED RUN IS ONE ROW STANDING FOR MANY MESSAGES. An artifact anchored to a message that
+   *     `foldReceiptRuns` swallowed into a run must still draw — after the run — or it would vanish
+   *     the moment the receipts above it collapsed, which is a disappearance nothing on screen
+   *     explains. So the bucket key is a MESSAGE id and the lookup below asks each row for every id
+   *     it covers.
+   *   • AN ANCHOR CAN AGE OUT. The live window is capped at 200 entries and trimmed from the front,
+   *     so the message an artifact landed after is not guaranteed to be here. That artifact is
+   *     older than everything on screen, so it goes to the top rather than being dropped — losing
+   *     it would take a live preview off the screen for no reason the reader could see.
+   *
+   * `backlog` ids count as known: a paged-in turn is on screen, so an artifact anchored to one
+   * belongs beside it rather than above the divider.
+   */
+  const { artifactsByAnchor, headArtifacts } = useMemo(() => {
+    const byAnchor = new Map<string, ThreadArtifact[]>();
+    const head: ThreadArtifact[] = [];
+    if (artifacts && artifacts.length > 0) {
+      const known = new Set<string>();
+      for (const m of visible) known.add(m.id);
+      if (backlog) for (const m of backlog) known.add(m.id);
+      for (const a of artifacts) {
+        if (a.afterMessageId !== null && known.has(a.afterMessageId)) {
+          const list = byAnchor.get(a.afterMessageId);
+          if (list) list.push(a);
+          else byAnchor.set(a.afterMessageId, [a]);
+        } else head.push(a);
+      }
+    }
+    return { artifactsByAnchor: byAnchor, headArtifacts: head };
+  }, [artifacts, visible, backlog]);
 
   /**
    * IS A BUBBLE ALREADY SAYING WHAT THE RAIL WOULD SAY? (sparkle-9ciay)
@@ -526,6 +604,30 @@ export function ConciergeThread({
     />
   );
 
+  /** ONE ARTIFACT, IN ITS OWN ROW BOX. Deliberately a bare wrapper: the artifact owns its width and
+   *  its chrome (a preview card is ~1/3 the column and expands to fill it), and the scroller's own
+   *  `gap` already spaces it from the messages either side. The testid and `data-artifact-id` are
+   *  here so a test can assert WHERE an artifact landed without matching on its contents. */
+  const renderArtifact = (a: ThreadArtifact) => (
+    <div key={a.id} data-testid={THREAD_ARTIFACT_TESTID} data-artifact-id={a.id}>
+      {a.node}
+    </div>
+  );
+
+  /** A row, plus whatever artifacts are anchored to the messages that row covers. Returns the row
+   *  UNTOUCHED when there are none — so a thread with no artifacts renders exactly the DOM it did
+   *  before this prop existed, which is what keeps every existing suite honest. */
+  const withArtifacts = (node: ReactNode, ids: string[], key: string) => {
+    const anchored = ids.flatMap((id) => artifactsByAnchor.get(id) ?? []);
+    if (anchored.length === 0) return node;
+    return (
+      <Fragment key={key}>
+        {node}
+        {anchored.map(renderArtifact)}
+      </Fragment>
+    );
+  };
+
   return (
     // THE POSITIONED ANCESTOR THE TOAST HANGS OFF, and the reason there is a wrapper at all. The
     // confirmation must not shift the layout by a pixel (PRD 1 §1), which rules out a flow element;
@@ -610,6 +712,10 @@ export function ConciergeThread({
             </div>
           </>
         )}
+        {/* ARTIFACTS OLDER THAN THE LIVE WINDOW, or anchored to nothing at all — see
+            `ThreadArtifact` for why an anchor that has aged out draws here rather than being
+            dropped on the floor. */}
+        {headArtifacts.map(renderArtifact)}
         {/* FOLDED FIRST, DRAWN SECOND. `foldReceiptRuns` decides which rows collapse; every message
             it does not fold comes through exactly as it always did, and the folded ones are the
             SAME rows rendered inside a disclosure rather than different ones. A refused or partly
@@ -617,13 +723,19 @@ export function ConciergeThread({
             by anything this JSX has to remember. */}
         {rows.map((row) =>
           row.type === "message" ? (
-            renderRow(row.message)
+            withArtifacts(renderRow(row.message), [row.message.id], row.message.id)
           ) : (
             // KEYED BY THE RUN'S FIRST MEMBER — a message id, so it is unique in the thread and
             // stable while the run is.
-            <ReceiptRunRow key={row.id} run={row}>
-              {row.members.map((m) => renderRow(m))}
-            </ReceiptRunRow>
+            withArtifacts(
+              <ReceiptRunRow key={row.id} run={row}>
+                {row.members.map((m) => renderRow(m))}
+              </ReceiptRunRow>,
+              // EVERY MEMBER, not just the run's first: the run stands for all of them, so an
+              // artifact anchored to any one of them belongs after it.
+              row.members.map((m) => m.id),
+              row.id,
+            )
           ),
         )}
         {/* The pulse, plus what the concierge is actually doing when it is doing something the app

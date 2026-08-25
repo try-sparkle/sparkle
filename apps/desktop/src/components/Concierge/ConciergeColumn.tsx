@@ -26,7 +26,7 @@ import { MIC_RING_DIAMETER, WAVE_HEIGHT } from "../waveGeometry";
 import { SparkleLogoLink } from "../SparkleLogoLink";
 import { ComposeBox } from "./ComposeBox";
 import { PinnedBlockers } from "./PinnedBlockers";
-import { PreviewCards } from "./PreviewCards";
+import { PreviewCards, PreviewThreadArtifacts } from "./PreviewCards";
 import { ConciergeAiLocked } from "./ConciergeAiLocked";
 import { ConciergeUnavailable } from "./ConciergeUnavailable";
 import { useConciergeAiLock } from "./conciergeAiLock";
@@ -963,7 +963,27 @@ export function ConciergeColumn({
         // cover the same subtree; neither depends on the other.
         <BeadPillHost>
           <AgentPillProvider value={agentPills}>
+            {/* LIVE PREVIEWS, AS ITEMS IN THE TRANSCRIPT (bead sparkle-0xbron). The founder:
+                *"the preview must NOT be attached to the compose box — it should render in the
+                actual chat thread, as a message-like item in the transcript… a thread artifact with
+                its own place in scroll history, not a fixture pinned above the composer"*, and again
+                on 2026-08-25 *"it's supposed to be in line with chat so that it flows in the chat.
+                Right now it's still pegged above the compose window."*
+
+                A RENDER PROP AROUND THE THREAD rather than a hook called here: this column is a pure
+                renderer and reads no stores (see `PreviewCards`' header), and `ConciergeThread` is
+                presentational and knows nothing about previews. The wrapper reads the stores, works
+                out where each card belongs, and hands the thread a plain array — so neither of those
+                two rules has to bend.
+
+                INSIDE THE `AgentPillProvider`, which the thread was already wrapped in, so the move
+                off the pinned strip costs no provider work: the card names its agent with an
+                `AgentPill` and would render the `…is closed` dead-end variant outside it — the exact
+                failure `AgentPill.deadEnd.test.tsx` forbids, and it looks like a working pill. */}
+            <PreviewThreadArtifacts messages={model.messages}>
+              {(previewArtifacts) => (
             <ConciergeThread
+              artifacts={previewArtifacts}
               wired={isWired}
               messages={model.messages}
               typing={model.typing}
@@ -1027,6 +1047,8 @@ export function ConciergeColumn({
               // reports the snapshot, the host decides what a staged quote means.
               onQuote={controller.onQuote}
             />
+              )}
+            </PreviewThreadArtifacts>
           </AgentPillProvider>
         </BeadPillHost>
       )}
@@ -1138,8 +1160,20 @@ export function ConciergeColumn({
             onNudgeClick={controller.onNudgeClick}
             onNudgeAction={controller.onNudgeAction}
           />
-          {/* LIVE PREVIEWS, AS CARDS (bead sparkle-3475b.8). *"[dot color] [build agent name] has a
-              preview for you to review: [preview card]"* — the founder's shape.
+          {/* LIVE PREVIEWS, AS CARDS (bead sparkle-3475b.8) — MOUNTED ONLY, since sparkle-0xbron.
+              *"[dot color] [build agent name] has a preview for you to review: [preview card]"* is
+              still the founder's shape; WHERE it renders is not. The preview surface moved into the
+              transcript (`PreviewThreadArtifacts` above), because he asked for a thread artifact
+              rather than a fixture pinned above the composer.
+
+              THIS ROW IS WHAT IS LEFT OF IT, and it is reachable in exactly one state: a build agent
+              is MOUNTED into this column, so the swap above has replaced `ConciergeThread` with that
+              agent's own transcript and there is no concierge chat for a card to flow into. The
+              choice there is between this strip and nothing at all — and nothing is a regression the
+              founder did not ask for, since "there is something to LOOK at right now" matters most
+              while he is watching the agent that built it. The two surfaces are mutually exclusive by
+              construction: `ConciergeThread` and `mountedAgent` never render together, so a card
+              cannot appear twice.
 
               INSIDE THIS PROVIDER, and that is why it is here rather than in a region of its own:
               the card names its agent with an `AgentPill`, which resolves the live name, the status
@@ -1153,7 +1187,7 @@ export function ConciergeColumn({
               NO PROPS: it reads `previewStore`/`projectStore` itself, so `ConciergeColumn` stays a
               pure renderer (the same split `MountedAgentNotices` below uses). It renders nothing at
               all when no preview is live, which is the ordinary state. */}
-          <PreviewCards />
+          {mountedAgent && <PreviewCards />}
         </AgentPillProvider>
       )}
       {/* THE ONE EXPLANATION THAT SURVIVES THE MOUNT SWAP. Mounted, the thread above is the AGENT's

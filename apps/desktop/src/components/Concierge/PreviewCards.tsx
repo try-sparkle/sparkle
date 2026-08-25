@@ -1,12 +1,37 @@
-// A LIVE PREVIEW, AS A CARD IN THE CONCIERGE COLUMN — the founder's shape, verbatim:
+// A LIVE PREVIEW, AS A CARD IN THE CONCIERGE CHAT THREAD — the founder's shape, verbatim:
 // *"[dot color] [build agent name] has a preview for you to review: [localhost preview card image
 // screenshot]"*, where *"clicking on the preview card would take me out to the actual localhost URL
 // and I could click on the builder agent name to go into that builder agent."*
 //
-// ══ THE GESTURES WERE SPLIT LATER (sparkle-7kn6bk) ══════════════════════════════════════════════
+// ══ IT IS A THREAD ARTIFACT, NOT A FIXTURE ABOVE THE COMPOSER (bead sparkle-0xbron) ═════════════
+// This surface first shipped in the PINNED STRIP above the compose box, and the prose that used to
+// sit here argued for that position at length ("WHY THE COLUMN AND NOT A PANE", and a promise that
+// this was "the place that does not scroll"). The founder overruled it, twice, in his own words.
+//
+// 2026-08-21: *"the preview must NOT be attached to the compose box — it should render in the
+// actual chat thread, as a message-like item in the transcript… a thread artifact with its own
+// place in scroll history, not a fixture pinned above the composer."* And again on 2026-08-25,
+// looking at the shipped strip: *"the preview isn't in line with chat. It's supposed to be in line
+// with chat so that it flows in the chat. Right now it's still pegged above the compose window."*
+//
+// So the old argument is RETIRED, not merely relocated. A card does scroll away now, on purpose —
+// he would rather have a conversation that reads in order than a fixture that never moves. What
+// replaces the never-scrolls promise is the ANCHOR (see `ThreadArtifact` in ./ConciergeThread): the
+// card keeps the position the conversation was at when the preview arrived, so everything said
+// afterwards pushes it up and scrolling back to that moment finds it where it happened. Appending
+// it to the bottom of the transcript instead would have satisfied the letter of "inside the
+// scroller" and none of the ask — new messages would draw above it forever and it would sit
+// directly over the composer looking exactly like the thing he asked us to move.
+//
+// {@link PreviewThreadArtifacts}, at the foot of this file, is that surface and is the primary one.
+// {@link PreviewCards} — the pinned strip — survives for ONE state and no other: a MOUNTED build
+// agent, where the concierge transcript is not rendered at all and there is no chat for a card to
+// flow into. Its docstring carries that argument.
+//
+// ══ THE GESTURES WERE SPLIT EARLIER (sparkle-7kn6bk) ════════════════════════════════════════════
 // The card first shipped at a small fixed size whose single click opened the browser — and that was
 // the wrong default for a card too small to judge anything by: the reader's first instinct is to
-// make it bigger, not to leave the app. So now the card is ~1/3 the chat column and a SINGLE CLICK
+// make it bigger, not to leave the app. So the card is ~1/3 the chat column and a SINGLE CLICK
 // EXPANDS it in place to full width; the browser is a DOUBLE CLICK, plus an explicit "Open in
 // browser" button so the gesture is discoverable and keyboard-reachable rather than resting on a
 // double-click nobody guesses. The founder quote above still describes the destination; only which
@@ -15,33 +40,50 @@
 // ══ WHAT WAS ACTUALLY BROKEN ════════════════════════════════════════════════════════════════════
 // Not the preview subsystem — that works. The url. It is printed once into a terminal that keeps
 // scrolling, so the one fact worth acting on ("there is something to LOOK at, right now") is gone
-// within seconds. This surface is the fix, and its whole job is to be the place that does not
-// scroll.
+// within seconds. This surface is the fix: the url lands somewhere the reader can find it again,
+// and since sparkle-0xbron that somewhere is the transcript, which is the app's one durable record
+// of what happened and when.
 //
-// ══ WHY THE COLUMN AND NOT A PANE ═══════════════════════════════════════════════════════════════
+// ══ WHY THE CHAT AND NOT A PANE ════════════════════════════════════════════════════════════════
 // See `services/previewCards`' header for the full argument. In one line: a preview PANE during
 // planning is blocked three independent ways (mutually-exclusive work modes, a concierge with no
-// worktree, and `preview_open` needing a real dev server), and a concierge ROW is not a work mode,
-// so it sidesteps all three by only ever RENDERING a url another agent already owns.
+// worktree, and `preview_open` needing a real dev server), and a card in the concierge chat is not
+// a work mode, so it sidesteps all three by only ever RENDERING a url another agent already owns.
 //
 // ══ RETIREMENT IS DERIVED, NOT SCHEDULED ════════════════════════════════════════════════════════
 // There is no dismiss, no timer and no dead-link sweep, because the cards are a projection of
 // `previewStore.byAgent` — the same store `preview:state` folds into. A preview that stops leaves
 // its surfacing state (or its entry entirely), the projection stops producing a card, and the card
 // is gone on the next render. A card can therefore never outlive the server it points at, which is
-// a property of the shape rather than a rule someone has to remember.
+// a property of the shape rather than a rule someone has to remember. The ANCHOR follows the same
+// rule and is forgotten with it, so a preview that comes back is a NEW arrival and anchors to where
+// the conversation is NOW — which is correct: it is news again.
 //
 // ══ THIS COMPONENT READS ITS OWN STORES ═════════════════════════════════════════════════════════
 // `ConciergeColumn` is a pure renderer and must stay one, so this follows `MountedAgentNotices`
-// (a component that asks the stores itself) rather than growing the view model. The one thing it
-// does NOT own is the reveal: the agent name is an `AgentPill`, which resolves the live name, the
-// live status dot and the click-through from the `AgentPillProvider` the pinned strip already
-// wraps — so a renamed agent's card renames itself and there is no second roster to go stale.
-import { useCallback, useEffect, useRef, useState, type CSSProperties } from "react";
+// (a component that asks the stores itself) rather than growing the view model — which is also why
+// `PreviewThreadArtifacts` is a RENDER-PROP wrapper around the thread rather than a hook the column
+// calls: the store read stays in this file, and `ConciergeThread` stays presentational. The one
+// thing it does NOT own is the reveal: the agent name is an `AgentPill`, which resolves the live
+// name, the live status dot and the click-through from the `AgentPillProvider` — which already
+// wraps the thread (ConciergeColumn.tsx), so the move into the transcript costs no provider work.
+// A renamed agent's card renames itself and there is no second roster to go stale.
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type CSSProperties,
+  type ReactNode,
+} from "react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { FiExternalLink, FiRefreshCw } from "react-icons/fi";
 
 import { AgentPill } from "./AgentPill";
+// THE THREAD SLOT THIS SURFACE NOW LIVES IN. Type-only, and one-directional: `ConciergeThread`
+// knows nothing about previews — it draws whatever artifacts its caller hands it.
+import type { ThreadArtifact } from "./ConciergeThread";
+import type { ConciergeMessage } from "./types";
 // The SAME "time ago" the prompt-history dropdown uses. It takes `nowMs` as an argument rather than
 // reading the clock, which is what lets this card own WHEN the age is recomputed — see
 // `PREVIEW_CARD_AGE_TICK_MS`, because nothing else re-renders a card while a server sits quiet.
@@ -209,9 +251,23 @@ export const PREVIEW_CARD_AGE_TICK_MS = 30_000;
  *  it, and because it is the founder's own wording — not a string to improve in passing. */
 export const PREVIEW_CARD_LEAD = "has a preview for you to review:";
 
-/** Roughly two cards. Past that the strip scrolls INSIDE itself rather than growing, exactly as
- *  `PinnedBlockers` does and for the same non-negotiable reason: nothing above the composer may
- *  push the composer off screen. */
+/**
+ * Roughly two cards. Past that the strip scrolls INSIDE itself rather than growing, exactly as
+ * `PinnedBlockers` does and for the same non-negotiable reason: nothing above the composer may push
+ * the composer off screen.
+ *
+ * ══ IT SURVIVES ONLY THE PINNED PATH, AND THAT IS DELIBERATE (bead sparkle-0xbron) ══════════════
+ * The cap exists because *"the concierge column is a plain flex column with no scroll of its own,
+ * so only `ConciergeThread` can give way"*. Inside the transcript that premise is simply false —
+ * the transcript IS the thing that scrolls — so a card drawn as a `ThreadArtifact` is uncapped, and
+ * capping it there would clip a picture the reader asked to expand for no reason left standing.
+ *
+ * It still applies to {@link PreviewCards}, which draws above the composer while a build agent is
+ * MOUNTED. That state has no concierge transcript on screen; the column is a plain flex column
+ * again, `MountedAgentThread` is the only child that can give way, and the original argument holds
+ * word for word. So the constant is kept rather than deleted, and it is reachable from exactly one
+ * place.
+ */
 const MAX_ZONE_HEIGHT = 260;
 
 const card = (expanded: boolean): CSSProperties => ({
@@ -811,8 +867,20 @@ function PreviewNotices({ notices }: { notices: NamedPreviewNoticeModel[] }) {
 }
 
 /**
- * The strip of live preview cards. Renders nothing when there are none, which is the ordinary
- * state — so this costs an empty render and no layout at all until a preview actually surfaces.
+ * THE PINNED STRIP — no longer the primary surface, and mounted in exactly one state.
+ *
+ * ══ WHY IT STILL EXISTS AFTER sparkle-0xbron ═══════════════════════════════════════════════════
+ * The founder's ask moved the preview into the chat thread, and {@link PreviewThreadArtifacts} is
+ * where it lives now. But the concierge transcript is NOT on screen while a build agent is mounted
+ * into the column — `ConciergeColumn` swaps `ConciergeThread` out for that agent's own transcript —
+ * so in that one state there is no chat for a card to flow into. The choice there is between this
+ * strip and NOTHING, and nothing is a regression the founder did not ask for: "there is something
+ * to LOOK at right now" is at its most useful precisely while he is watching the agent that built
+ * it. So the strip is kept, gated on `mountedAgent`, and the two surfaces are mutually exclusive by
+ * construction — a card can never render twice.
+ *
+ * Renders nothing when there are no previews, which is the ordinary state — so this costs an empty
+ * render and no layout at all until one actually surfaces.
  */
 export function PreviewCards() {
   const byAgent = usePreviewStore((s) => s.byAgent);
@@ -884,4 +952,134 @@ function PreviewCardStrip({ named }: { named: ReturnType<typeof renderablePrevie
       ))}
     </div>
   );
+}
+
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+// THE THREAD SURFACE — the primary one since bead sparkle-0xbron. See this file's header.
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+
+/**
+ * MESSAGE KINDS THAT ARE PROJECTIONS RATHER THAN CONVERSATION, and therefore cannot hold an anchor.
+ *
+ * `ConciergeHost` builds `messages` in ARRIVAL order out of chat, digests and resolved cards, so
+ * the newest entry is genuinely the newest thing that happened — which is what an anchor wants. But
+ * a digest or a nudge is a projection of live fleet state: it RETIRES when the agents behind it
+ * stand down, and an anchor pointing at a retired card resolves to nothing, which would send the
+ * preview card jumping to the top of the transcript for a reason the reader cannot see.
+ *
+ * A chat bubble is only ever appended and trimmed from the FRONT, so anchoring to the newest one is
+ * stable — and when it does eventually age out of the 200-entry window, "above everything on
+ * screen" is the honest position rather than a glitch.
+ */
+const VOLATILE_ANCHOR_KINDS = new Set<ConciergeMessage["kind"]>(["nudge", "digest"]);
+
+/** The newest message an artifact may anchor to, or `null` when the thread holds none yet — see
+ *  {@link VOLATILE_ANCHOR_KINDS}. A card that arrives into an empty conversation anchors to
+ *  nothing, which draws it at the top: correct, because there is nothing for it to be under. */
+function newestAnchorableId(messages: ConciergeMessage[]): string | null {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i]!;
+    if (!VOLATILE_ANCHOR_KINDS.has(m.kind)) return m.id;
+  }
+  return null;
+}
+
+/** One notice, with its own age clock.
+ *
+ *  IN THE STRIP there is ONE interval for all notices ({@link PreviewNotices}) because they are one
+ *  block. As thread artifacts they are not: each is anchored to a different point in the
+ *  conversation and mounts and unmounts on its own, so the clock goes with it — the same shape
+ *  `PreviewCard` already has, and for the same reason its own header gives (a healthy or a stalled
+ *  preview emits no wire events at all, so nothing else would ever re-render the caption). */
+function ThreadPreviewNotice({ notice }: { notice: NamedPreviewNoticeModel }) {
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  useEffect(() => {
+    setNowMs(Date.now());
+    const id = setInterval(() => setNowMs(Date.now()), PREVIEW_CARD_AGE_TICK_MS);
+    return () => clearInterval(id);
+  }, []);
+  return <PreviewNotice notice={notice} nowMs={nowMs} />;
+}
+
+/**
+ * THE LIVE PREVIEW SURFACE, AS ANCHORED ITEMS IN THE CONCIERGE TRANSCRIPT (bead sparkle-0xbron).
+ *
+ * ══ A RENDER PROP, AND THAT IS THE POINT ═══════════════════════════════════════════════════════
+ * The artifacts have to be a PROP of `ConciergeThread` — only a child of the scroller can scroll
+ * with the conversation, and only the thread knows where its rows are. But `ConciergeThread` is
+ * presentational and must stay so (every one of its suites hands it plain props), and
+ * `ConciergeColumn` is a pure renderer that must not grow store reads. A wrapper that reads the
+ * stores here and hands the column a ready-made array satisfies both: the preview knowledge stays
+ * in this file, the thread stays dumb, and the column stays a renderer.
+ *
+ * ══ THE ANCHOR IS CAPTURED ONCE, ON FIRST SIGHT ════════════════════════════════════════════════
+ * `anchors` records where the conversation was the first time each agent's preview became
+ * renderable, and never moves it afterwards — that recorded position IS "its own place in scroll
+ * history". Recomputing it per render would glue the card to the bottom of the transcript, which is
+ * the fixture the founder asked us to get rid of, wearing a different hat.
+ *
+ * A REF MUTATED DURING RENDER, deliberately: the anchor must be known on the SAME render that first
+ * draws the card, and an effect runs after paint — so a card would flash at the wrong position for
+ * one frame every time a preview arrives. The write is idempotent and keyed by agent id (the same
+ * shape a render-time memo cache has), so a double render under StrictMode produces the same map.
+ *
+ * ══ ONE ARTIFACT PER AGENT ═════════════════════════════════════════════════════════════════════
+ * The card projection and the notice projection are disjoint by construction (see
+ * `services/previewCards`: a notice exists exactly where a card cannot), so an agent contributes
+ * one or the other and never both. Sharing ONE anchor map across the two is what lets an artifact
+ * hold its place while an install turns into a running server — the reader watches one item change
+ * state rather than watching it vanish and reappear at the bottom.
+ */
+export function PreviewThreadArtifacts({
+  messages,
+  children,
+}: {
+  messages: ConciergeMessage[];
+  children: (artifacts: ThreadArtifact[]) => ReactNode;
+}) {
+  // BOTH PROJECTIONS, exactly as {@link PreviewCards} reads them — see its comments for why the
+  // roster gate lives in `renderablePreviewCards` and why broadening it would change which dev
+  // servers `previewIdleGrace` reclaims.
+  const byAgent = usePreviewStore((s) => s.byAgent);
+  const projects = useProjectStore((s) => s.projects);
+  const named = renderablePreviewCards(byAgent, projects);
+  const notices = renderablePreviewNotices(byAgent, projects);
+
+  const anchors = useRef(new Map<string, string | null>());
+  const live = new Set<string>();
+  for (const c of named) live.add(c.agentId);
+  for (const n of notices) live.add(n.agentId);
+  // FORGOTTEN WITH THE CARD. Retirement is derived (see the file header), so an agent that drops out
+  // of both projections drops its anchor too — and a preview that comes back is news again and
+  // anchors to wherever the conversation is then.
+  for (const agentId of Array.from(anchors.current.keys())) {
+    if (!live.has(agentId)) anchors.current.delete(agentId);
+  }
+  const newest = newestAnchorableId(messages);
+  for (const agentId of live) {
+    if (!anchors.current.has(agentId)) anchors.current.set(agentId, newest);
+  }
+  const anchorFor = (agentId: string) => anchors.current.get(agentId) ?? null;
+
+  const artifacts: ThreadArtifact[] = [
+    ...named.map((c) => ({
+      id: `preview-card:${c.agentId}`,
+      afterMessageId: anchorFor(c.agentId),
+      node: (
+        <PreviewCard
+          agentId={c.agentId}
+          url={c.url}
+          name={c.name}
+          surfacedAt={c.surfacedAt}
+        />
+      ),
+    })),
+    ...notices.map((n) => ({
+      id: `preview-notice:${n.agentId}`,
+      afterMessageId: anchorFor(n.agentId),
+      node: <ThreadPreviewNotice notice={n} />,
+    })),
+  ];
+
+  return <>{children(artifacts)}</>;
 }
