@@ -304,6 +304,73 @@ export function goalDeadline(goal: AgentGoal): number {
   return (goal.rearmedAt ?? goal.setAt) + goal.ttlMs;
 }
 
+/**
+ * Phrases that mark a string as a STATUS NOTE rather than a goal — a description of the agent's
+ * current STANCE (waiting, standing down, handing work off) instead of a future observable end
+ * state. A status note is unachievable BY CONSTRUCTION: there is no state of the world in which
+ * "awaiting the founder's next task" becomes true-and-done, so once one is set as a goal
+ * auto-continue nudges the agent, sees no progress each time (correctly — there is none to make),
+ * and spends its whole allowance discovering that a tautology cannot be satisfied before escalating
+ * to a human as "something is blocking it" when nothing is (bead sparkle-lzb2qq).
+ *
+ * The entry gate (`validateWorkerGoal`) refuses an ABSENT or over-long goal at dispatch, but a
+ * status note under the length cap passes it, and NOTHING re-checked a goal REPLACED later in an
+ * agent's life — so a well-formed goal could be overwritten by one of these at turn 40 with no
+ * guard firing. Enforcing here, at the substrate every goal write funnels through, closes that.
+ *
+ * These are the shapes the bead named ("awaiting", "stood down", "nothing pending", past-tense
+ * handoff language). They are matched on WORD BOUNDARIES against the normalized text — deliberately
+ * narrow, because a false positive REFUSES a legitimate goal: an agent cannot describe a checkable
+ * end state with any of these, so the list is stance-of-waiting/handoff language, not any word that
+ * could appear in a real criterion (which is why e.g. bare "next task" or "waiting for" is absent —
+ * "waiting for CI to go green" is a real condition — while "waiting for the founder" is not).
+ */
+const STATUS_NOTE_MARKERS: readonly string[] = [
+  "awaiting",
+  "stood down",
+  "standing down",
+  "stand down",
+  "standing by",
+  "on standby",
+  "nothing pending",
+  "nothing further",
+  "nothing to do",
+  "no further work",
+  "no further action",
+  "no work pending",
+  "waiting for the founder",
+  "waiting for the human",
+  "waiting for the next",
+  "waiting for instructions",
+  "waiting for further",
+  "waiting for a new task",
+  "handed off",
+  "handed them",
+  "handed it off",
+  "handed back",
+];
+
+const STATUS_NOTE_RE = new RegExp(
+  "\\b(" +
+    STATUS_NOTE_MARKERS.map((m) => m.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|") +
+    ")\\b",
+  "u",
+);
+
+/**
+ * The offending status-note phrase if `text` reads as a status note (see {@link STATUS_NOTE_MARKERS})
+ * rather than a future observable end state, or `undefined` if it does not. Pure; the caller decides
+ * what to do with a hit (here, {@link newGoal} refuses it).
+ *
+ * Compared against the text lowercased with whitespace collapsed, so casing and spacing cannot
+ * smuggle one past.
+ */
+export function statusNoteMarker(text: string): string | undefined {
+  const norm = text.trim().toLowerCase().replace(/\s+/g, " ");
+  const m = STATUS_NOTE_RE.exec(norm);
+  return m ? m[1] : undefined;
+}
+
 /** Build a fresh goal. Counters start at zero; a new goal is never born escalated or met.
  *
  *  THROWS on empty/whitespace text, rather than producing a goal nobody can act on. An empty goal
@@ -314,7 +381,15 @@ export function goalDeadline(goal: AgentGoal): number {
  *  this is the substrate all three consumers share, a blank from ANY caller — a mis-parsed
  *  `set_agent_goal`, a UI field submitted empty — would reach it, so the refusal belongs here
  *  rather than in each caller. Callers that want "empty means clear the goal" must check first;
- *  `projectStore.setAgentGoal` does exactly that. */
+ *  `projectStore.setAgentGoal` does exactly that.
+ *
+ *  ALSO THROWS on a STATUS-NOTE-shaped string (see {@link statusNoteMarker}) — same reasoning as the
+ *  empty case, one shape worse: an empty goal at least reads as unmet, but a status note reads as a
+ *  plausible goal while being unsatisfiable BY CONSTRUCTION, so it survives the entry gate and then
+ *  burns the whole auto-continue allowance before escalating as a phantom blocker (bead
+ *  sparkle-lzb2qq). Because this is the substrate every goal WRITE funnels through — dispatch AND the
+ *  mid-life `set_agent_goal` replacement that had no gate at all — the refusal belongs here, so a
+ *  status note cannot overwrite a real goal at turn 40 any more than it could be set at brief time. */
 export function newGoal(
   text: string,
   now: number,
@@ -323,6 +398,14 @@ export function newGoal(
 ): AgentGoal {
   const trimmed = text.trim();
   if (trimmed === "") throw new Error("a goal needs text — an empty goal can never be acted on");
+  const note = statusNoteMarker(trimmed);
+  if (note !== undefined) {
+    throw new Error(
+      `a goal must state a future observable end state, not a status note — "${note}" reads as a ` +
+        `standby/handoff note that nothing can ever satisfy. State what will be TRUE when the work ` +
+        `is done and how anyone else could check it.`,
+    );
+  }
   // `verify` is spread conditionally so an unverified goal has NO `verify` key rather than an explicit
   // `undefined`. The two are equivalent to `canSelfMarkMet`, but only the former survives a JSON
   // round-trip through the persisted store identically, and the absence is load-bearing (it is what
