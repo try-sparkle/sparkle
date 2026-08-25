@@ -394,9 +394,11 @@ pub fn delegated_work_visible(text: &str) -> bool {
 /// for `menu_line`/`question_opener` that the copy dropped, so a plain numbered menu with no
 /// selection cursor and no footer bar —
 ///
-///     Select an option:
-///     1) Continue
-///     2) Abort
+/// ```text
+/// Select an option:
+/// 1) Continue
+/// 2) Abort
+/// ```
 ///
 /// — was `AwaitingInput` to the gate and `Calm` here. That is the founder's invisible-green state
 /// re-created inside the module written to remove it, and no test could see it because both halves

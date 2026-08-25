@@ -1022,7 +1022,36 @@ fn plan_retry(
     if session_wall {
         return None;
     }
-    // TRANSIENT OVERLOAD (a 529), checked before arm 3 and after the two fatal classifications.
+    if auth_expired {
+        // The first fallback that is a real, DIFFERENT account than the one that just failed. The
+        // frontend ranks these healthiest-first and already excludes the primary and clobbered
+        // defaults, but guard against an empty or duplicate entry so a rotation can never land back
+        // on the dead account.
+        let rotate_to = fallback_config_dirs
+            .iter()
+            .map(String::as_str)
+            .find(|d| !d.is_empty() && Some(*d) != primary_config_dir);
+        return rotate_to.map(|d| RetryPlan {
+            config_dir: Some(d.to_string()),
+            // Bench only a real dedicated account (non-empty dir). The shared `$HOME/.claude` default
+            // (empty dir) is steered away from by the clobbered-default guard, not benched by id.
+            bench_config_dir: primary_config_dir
+                .filter(|p| !p.is_empty())
+                .map(str::to_string),
+            // The rotated retry MUST start fresh: this session id lives in the dead account's
+            // transcript tree, so the healthy account cannot resume it.
+            keep_resume: false,
+        });
+    }
+    // TRANSIENT OVERLOAD (a 529), checked AFTER both fatal classifications and before arm 3.
+    //
+    // THE ORDER IS THE WHOLE ARM. This block used to sit ABOVE `auth_expired`, and its own test
+    // (`plan_retry_lets_the_fatal_classifications_outrank_a_transient_overload`) failed on main
+    // from the commit that introduced it — nothing caught it because CI was not compiling this
+    // crate at the time (beads sparkle-9lpy7r, sparkle-ozw542). A 529 phrase can arrive in the
+    // SAME message as an auth expiry; with this arm first, that turn retried on the account that
+    // had just died, keeping a session id the dead account owns, so the retry could only fail
+    // again. Both fatal classifications must be settled before a transient one is considered.
     // Ordered here because it is a REFINEMENT of arm 3, not a competitor to it: an overload is a
     // non-auth failure that carries a resume id, so arm 3 already claims it and would retry the
     // same account WITHOUT `--resume`. That remedy is not merely unnecessary here, it is lossy —
@@ -1049,27 +1078,6 @@ fn plan_retry(
             config_dir: primary_config_dir.map(str::to_string),
             bench_config_dir: None,
             keep_resume: true,
-        });
-    }
-    if auth_expired {
-        // The first fallback that is a real, DIFFERENT account than the one that just failed. The
-        // frontend ranks these healthiest-first and already excludes the primary and clobbered
-        // defaults, but guard against an empty or duplicate entry so a rotation can never land back
-        // on the dead account.
-        let rotate_to = fallback_config_dirs
-            .iter()
-            .map(String::as_str)
-            .find(|d| !d.is_empty() && Some(*d) != primary_config_dir);
-        return rotate_to.map(|d| RetryPlan {
-            config_dir: Some(d.to_string()),
-            // Bench only a real dedicated account (non-empty dir). The shared `$HOME/.claude` default
-            // (empty dir) is steered away from by the clobbered-default guard, not benched by id.
-            bench_config_dir: primary_config_dir
-                .filter(|p| !p.is_empty())
-                .map(str::to_string),
-            // The rotated retry MUST start fresh: this session id lives in the dead account's
-            // transcript tree, so the healthy account cannot resume it.
-            keep_resume: false,
         });
     }
     if should_retry_without_resume(ok, resume_session_id) {
