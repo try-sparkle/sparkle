@@ -8693,6 +8693,58 @@ fn autosave_write_ref(
     }
 }
 
+/// Point `refs//<branch>` at an existing snapshot commit, so the SHELL-LAYER recovery
+/// surfaces can find it.
+///
+/// WHY THIS EXISTS AT ALL — a snapshot nobody reads is not a recovery feature. `refs/sparkle-autosave/*`
+/// had exactly two writers and ZERO readers: no script, no command, no UI. The recovery chain that
+/// actually runs — `scripts/session-workstate-check.sh` (R1) and `scripts/session-resume-digest.sh`
+/// (R3) — reads `refs//<branch>` and nothing else, because that is what R2's
+/// `scripts/wip-autosave.sh` writes. Publishing the alias puts the teardown snapshot on the one
+/// surface a fresh session already checks, instead of behind a ref name a human would have to know
+/// to type.
+///
+/// AND IT IS KEYED ON THE BRANCH, WHICH IS THE HALF THAT SURVIVES. `spin_down_worker` deletes the
+/// worktree and keeps the branch, so an agent-id-keyed ref is addressable only via a directory name
+/// that no longer exists, while a branch-keyed one is surfaced by R1 to anyone who checks that
+/// branch out anywhere.
+///
+/// `Ok(None)` on a detached HEAD or unborn branch: there is no stable branch name to key on, the same
+/// documented gap `wip-autosave.sh` has, and the agent-id ref still holds the bytes.
+///
+/// Best-effort by contract — the caller has ALREADY written the durable snapshot before calling this,
+/// so a failure here costs discoverability, never the work. NO STALE-LOCK CLEARING, deliberately,
+/// unlike [`autosave_write_ref`]: R2's Stop hook is a legitimate concurrent writer in this exact
+/// namespace, and a lock this path found "stale" could be that hook's live one.
+pub(crate) fn publish_wip_alias(
+    worktree: &str,
+    commit: &str,
+    deadline: Instant,
+) -> Result<Option<String>, String> {
+    let branch = git_autosave(worktree, &["rev-parse", "--abbrev-ref", "HEAD"], deadline, None)?;
+    let branch = branch.trim();
+    if branch.is_empty() || branch == "HEAD" {
+        return Ok(None);
+    }
+    validate_ref(branch)?;
+    let ref_name = format!("refs//{branch}");
+    git_autosave(
+        worktree,
+        &[
+            "-c",
+            "core.filesRefLockTimeout=1000",
+            "update-ref",
+            "-m",
+            "sparkle teardown autosave",
+            &ref_name,
+            commit,
+        ],
+        deadline,
+        None,
+    )?;
+    Ok(Some(ref_name))
+}
+
 /// Core (testable): snapshot a LIVE worktree's uncommitted work to its side ref without touching the
 /// agent's index, HEAD, branch, or hooks. See [`AutosaveKind`] for the design rationale.
 pub fn autosave_worktree_wip_at(worktree: &str, agent_id: &str) -> Result<AutosaveOutcome, String> {

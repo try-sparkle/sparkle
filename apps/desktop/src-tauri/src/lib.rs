@@ -138,6 +138,7 @@ mod sparkle_agent;
 mod sparkle_improve;
 mod spend;
 mod stale_build;
+mod teardown_guard;
 mod support;
 mod transcript;
 mod roster;
@@ -1913,6 +1914,19 @@ pub fn run() {
                 // measurement run does not depend on someone calling `cmd_timing_report` before
                 // quitting. No-op when disarmed (the default).
                 cmd_timing::log_report_on_exit();
+                // LAST CHANCE TO WRITE UNCOMMITTED AGENT WORK DOWN (bead sparkle-upnz, R5 of
+                // `PRD/sparkle/restart-work-recovery.md`). The shell-layer `Stop` hook checkpoints
+                // an agent's uncommitted work when its TURN ENDS; a quit or restart landing
+                // mid-turn takes everything written since that boundary, from every agent at once
+                // — and `agent_life.rs` measures app restart as the largest single killer of
+                // agents here. This arm is the broader of the two exit arms (the macOS
+                // `terminate:` path reaches `Exit` and never `ExitRequested`; see the
+                // `updater_quit` header), and it still runs before `process::exit()`.
+                //
+                // Bounded by ONE shared deadline (`teardown_guard::DEFAULT_BUDGET`) because this is
+                // the main thread on the way out: blowing the budget costs coverage, which the
+                // module reports, and never a quit that will not finish.
+                teardown_guard::run_on_exit(app);
             }
             _ => {}
         });
