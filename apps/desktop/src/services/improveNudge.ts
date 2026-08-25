@@ -108,6 +108,31 @@ export function neverIdleNudgeText(priorNudgesWithoutAdvance: number): string {
 }
 
 /**
+ * The SPECIFIC "re-spin the drain fleet" push — the fix for bead sparkle-4hwu2i. When the agent is
+ * idle with ready backlog AND the machine has free agent slots AND no drain worker is currently
+ * active, the generic "run an INTAKE→PULL cycle" reminder is too soft: the correct action is to
+ * DISPATCH a drain fleet immediately, and the agent kept responding with a status report instead. So
+ * this message names the exact numbers (ready beads, free slots, the zero active workers) and gives
+ * the one imperative — spin the fleet NOW — with the founder's standing directive baked in so the
+ * machine restates it every interval rather than trusting memory: caps and token cost are NEVER a
+ * factor; machine headroom is the only bound.
+ *
+ * UNLIKE `NEVER_IDLE_NUDGE_TEXT` this DOES carry digits, which is safe here for the same reason the
+ * header gives: `sweepImproveNudge` sends directly via `send`, never through the Pusher's challenge
+ * path, so `checkCitations` never sees it. It must not be routed through the challenge path.
+ */
+export function respinFleetNudgeText(readyCount: number, freeSlots: number): string {
+  return (
+    `You have ${readyCount} ready beads and ${freeSlots} free agent slots and 0 active workers — ` +
+    `spin a drain fleet NOW. Do not reply with a status report, a plan, or a question — DISPATCH. ` +
+    `Fan out one background drain worker per ready item up to the ${freeSlots} free slots, pulling ` +
+    `the highest-value ready work first (open P1/blocking pipeline-health beads, then \`bd ready\`, ` +
+    `then the agent-feedback inbox). Account caps and token cost are NEVER a factor; spin maximally ` +
+    `— machine headroom is the only bound, and thrash from over-spawning is the only thing to avoid.`
+  );
+}
+
+/**
  * How long after a delivered nudge before another may be sent to the same agent.
  *
  * Ten minutes, chosen against the Pusher's 60s tick: without a floor the sweep would re-nudge every
@@ -163,6 +188,14 @@ export interface ImproveNudgeInput {
   /** How many open P1 pipeline-health beads exist — the highest-value ready work, counted separately
    *  so a blocked-but-open P1 still satisfies "there is work" even if the backlog column is empty. */
   p1PipelineHealthCount: number;
+  /** Machine headroom: free local agent slots (`localAgentCapacity` `limit − used`, clamped ≥ 0).
+   *  When > 0 there is room to spawn a drain fleet; when 0 the machine is full and the re-spin push
+   *  would be counterproductive, so the generic reminder is used instead. */
+  freeSlots: number;
+  /** How many local drain workers are currently active (the capacity reading's occupied slots). When
+   *  0 the fleet is idle and re-spinning is exactly the action to push; when > 0 workers are already
+   *  draining, so no re-spin nudge fires. */
+  activeWorkers: number;
   /** When the last nudge was delivered, or `null` if never. */
   lastNudgedAt: number | null;
   now: number;
@@ -170,7 +203,8 @@ export interface ImproveNudgeInput {
 }
 
 export type ImproveNudgeDecision =
-  | { nudge: true }
+  | { nudge: true; kind: "generic" }
+  | { nudge: true; kind: "respin"; readyCount: number; freeSlots: number }
   | { nudge: false; reason: ImproveNudgeRefusal };
 
 export type ImproveNudgeRefusal =
@@ -195,6 +229,12 @@ export type ImproveNudgeRefusal =
  *   5. `advanced-recently` — it advanced a concrete item within the interval (or we could not tell); it IS working.
  *   6. `no-ready-backlog`  — nothing is ready, so resting is CORRECT; it may rest (guardrail a).
  *   7. `rate-limited`      — a nudge was delivered within `cadenceMs`; give the turn room to act.
+ *
+ * On a `nudge` verdict it chooses the SHAPE of the push (bead sparkle-4hwu2i): when there is ready
+ * backlog AND the machine has free agent slots AND no drain worker is currently active, the fleet is
+ * idle-with-work-and-headroom and the correct action is to re-spin the drain fleet — `kind: "respin"`,
+ * carrying the numbers the message names. Otherwise (backlog exists but there is no headroom, or
+ * workers are already draining) it keeps the existing generic INTAKE→PULL reminder — `kind: "generic"`.
  */
 export function decideImproveNudge(input: ImproveNudgeInput): ImproveNudgeDecision {
   if (!input.armed) return { nudge: false, reason: "not-armed" };
@@ -210,7 +250,14 @@ export function decideImproveNudge(input: ImproveNudgeInput): ImproveNudgeDecisi
   if (input.lastNudgedAt !== null && input.now - input.lastNudgedAt < input.cadenceMs) {
     return { nudge: false, reason: "rate-limited" };
   }
-  return { nudge: true };
+  // Idle, with work, past the cadence. Push the SPECIFIC re-spin action when there are ready beads to
+  // drain, machine headroom to run them, and zero workers already draining; otherwise the generic
+  // reminder. `readyBacklogCount > 0` (not the P1 arm) gates re-spin because the message names "N
+  // ready beads" to dispatch — a lone blocked-but-open P1 has nothing to fan a drain fleet across.
+  if (input.readyBacklogCount > 0 && input.freeSlots > 0 && input.activeWorkers === 0) {
+    return { nudge: true, kind: "respin", readyCount: input.readyBacklogCount, freeSlots: input.freeSlots };
+  }
+  return { nudge: true, kind: "generic" };
 }
 
 /** What the sweep gathers from the live app. Every field is a getter so the orchestrator stays pure
@@ -234,6 +281,10 @@ export interface ImproveNudgeDeps {
   advanceFingerprint(): string | null;
   /** The ready-work counts, read from the beads board. */
   readyBacklog(): { ready: number; p1PipelineHealth: number };
+  /** The machine-capacity reading behind the re-spin decision: `freeSlots` is the local agent
+   *  headroom (`localAgentCapacity` `limit − used`, clamped ≥ 0) and `activeWorkers` is how many
+   *  local drain workers are occupying slots right now. */
+  capacity(): { freeSlots: number; activeWorkers: number };
   /** Deliver the nudge to the improve agent's inbox; returns whether delivery was CONFIRMED. */
   send(text: string): Promise<boolean>;
 }
@@ -325,6 +376,7 @@ export async function sweepImproveNudge(deps: ImproveNudgeDeps): Promise<Improve
     // refuses to nudge for some other reason.
     if (advancedRecently) consecutiveIdleNudges = 0;
     const backlog = deps.readyBacklog();
+    const capacity = deps.capacity();
     const decision = decideImproveNudge({
       armed: deps.armed(),
       ownsProject: deps.ownsProject(),
@@ -333,6 +385,8 @@ export async function sweepImproveNudge(deps: ImproveNudgeDeps): Promise<Improve
       advancedRecently,
       readyBacklogCount: backlog.ready,
       p1PipelineHealthCount: backlog.p1PipelineHealth,
+      freeSlots: capacity.freeSlots,
+      activeWorkers: capacity.activeWorkers,
       lastNudgedAt,
       now,
       cadenceMs: NEVER_IDLE_CADENCE_MS,
@@ -345,10 +399,17 @@ export async function sweepImproveNudge(deps: ImproveNudgeDeps): Promise<Improve
     // send is in flight. A private `sending` flag here would be redundant with that and, worse, would
     // stay latched forever if a send never settled — permanently, silently disabling the watcher
     // (roborev 66023). The one serializer is the Pusher's.
-    // ESCALATE by the streak so far: `consecutiveIdleNudges` counts prior deliveries WITHOUT an
-    // advance, so the text hardens the more the agent answers the nudge instead of shipping. Keyed on
-    // the advance fingerprint (what the agent DID), so a reworded deferral cannot dodge it.
-    const delivered = await deps.send(neverIdleNudgeText(consecutiveIdleNudges));
+    // SELECT THE MESSAGE by the decided shape. A `respin` verdict (idle + ready backlog + free slots +
+    // zero active workers) sends the specific, digit-carrying "spin a drain fleet NOW" push naming the
+    // numbers (bead sparkle-4hwu2i). Otherwise the generic INTAKE→PULL reminder, which ESCALATES by the
+    // streak so far: `consecutiveIdleNudges` counts prior deliveries WITHOUT an advance, so the text
+    // hardens the more the agent answers the nudge instead of shipping. Keyed on the advance
+    // fingerprint (what the agent DID), so a reworded deferral cannot dodge it.
+    const text =
+      decision.kind === "respin"
+        ? respinFleetNudgeText(decision.readyCount, decision.freeSlots)
+        : neverIdleNudgeText(consecutiveIdleNudges);
+    const delivered = await deps.send(text);
     if (delivered) {
       lastNudgedAt = now;
       consecutiveIdleNudges += 1;

@@ -6,6 +6,7 @@ import {
   NEVER_IDLE_ESCALATED_NUDGE_TEXT,
   NEVER_IDLE_ESCALATE_AFTER,
   neverIdleNudgeText,
+  respinFleetNudgeText,
   _resetImproveNudgeForTests,
   decideImproveNudge,
   improveLastNudgedAt,
@@ -32,6 +33,8 @@ function makeDeps(
     fingerprint: string | null;
     ready: number;
     p1PipelineHealth: number;
+    freeSlots: number;
+    activeWorkers: number;
     sendResult: boolean;
   }> = {},
 ): { deps: ImproveNudgeDeps; sent: string[] } {
@@ -45,6 +48,11 @@ function makeDeps(
     fingerprint: "idle" as string | null,
     ready: 3,
     p1PipelineHealth: 0,
+    // DEFAULT: workers already draining, so the default idle-with-backlog case takes the GENERIC
+    // reminder path (which the escalation/rate-limit/grace suites below exercise). The re-spin suite
+    // overrides `activeWorkers: 0` to reach the specific push.
+    freeSlots: 4,
+    activeWorkers: 2,
     sendResult: true,
     ...overrides,
   };
@@ -58,6 +66,7 @@ function makeDeps(
       paneStatus: () => o.paneStatus,
       advanceFingerprint: () => o.fingerprint,
       readyBacklog: () => ({ ready: o.ready, p1PipelineHealth: o.p1PipelineHealth }),
+      capacity: () => ({ freeSlots: o.freeSlots, activeWorkers: o.activeWorkers }),
       send: async (text: string) => {
         sent.push(text);
         return o.sendResult;
@@ -87,6 +96,34 @@ describe("sweepImproveNudge — the side effect, keyed off concrete advance not 
     // No commit/edit/bead in the whole interval — the agent is idle-watching or resting. This is the
     // case a 'children exist' gate would have wrongly suppressed; here it nudges.
     const sent = await sweepStaleThen(ADVANCE_IDLE_MS);
+    expect(sent).toEqual([NEVER_IDLE_NUDGE_TEXT]);
+  });
+
+  // ── THE RE-SPIN PUSH (bead sparkle-4hwu2i) — the SIDE EFFECT: given idle + ready backlog + free
+  //    slots + zero active workers, the SPECIFIC "spin a drain fleet NOW" message naming the numbers
+  //    is what actually lands in the inbox, not the generic reminder. ───────────────────────────────
+  it("idle + ready backlog + free slots + ZERO active workers → sends the SPECIFIC re-spin message with the numbers", async () => {
+    const sent = await sweepStaleThen(ADVANCE_IDLE_MS, { ready: 7, freeSlots: 5, activeWorkers: 0 });
+    expect(sent).toEqual([respinFleetNudgeText(7, 5)]);
+    // and it is DISTINCT from the generic reminder — the whole point of the bead.
+    expect(sent[0]).not.toBe(NEVER_IDLE_NUDGE_TEXT);
+  });
+
+  it("the re-spin message names the exact ready-bead and free-slot counts, and 0 workers", async () => {
+    const sent = await sweepStaleThen(ADVANCE_IDLE_MS, { ready: 4, freeSlots: 9, activeWorkers: 0 });
+    expect(sent[0]).toContain("4 ready beads");
+    expect(sent[0]).toContain("9 free agent slots");
+    expect(sent[0]).toContain("0 active workers");
+    expect(sent[0]).toContain("spin maximally");
+  });
+
+  it("idle + ready backlog + free slots but workers ALREADY draining → keeps the GENERIC reminder", async () => {
+    const sent = await sweepStaleThen(ADVANCE_IDLE_MS, { ready: 7, freeSlots: 5, activeWorkers: 3 });
+    expect(sent).toEqual([NEVER_IDLE_NUDGE_TEXT]);
+  });
+
+  it("idle + ready backlog + zero workers but NO free slots (machine full) → keeps the GENERIC reminder", async () => {
+    const sent = await sweepStaleThen(ADVANCE_IDLE_MS, { ready: 7, freeSlots: 0, activeWorkers: 0 });
     expect(sent).toEqual([NEVER_IDLE_NUDGE_TEXT]);
   });
 
@@ -272,6 +309,8 @@ describe("sweepImproveNudge — rate limiting (guardrail c: respect the cadence)
 //    rule is mutation-checkable without spies. `advancedRecently` is a plain boolean here — the
 //    fingerprint→clock derivation is exercised by the sweep tests above. ───────────────────────────
 describe("decideImproveNudge — the idle-and-has-backlog rule", () => {
+  // DEFAULT: workers already draining (activeWorkers > 0), so `base` fires the GENERIC nudge. The
+  // re-spin arm is exercised by its own tests below, which set `activeWorkers: 0` + free slots.
   const base: ImproveNudgeInput = {
     armed: true,
     ownsProject: true,
@@ -280,17 +319,38 @@ describe("decideImproveNudge — the idle-and-has-backlog rule", () => {
     advancedRecently: false,
     readyBacklogCount: 2,
     p1PipelineHealthCount: 0,
+    freeSlots: 4,
+    activeWorkers: 1,
     lastNudgedAt: null,
     now: 1_000_000,
     cadenceMs: NEVER_IDLE_CADENCE_MS,
   };
 
-  it("fires when idle, not recently advanced, with ready backlog and every guardrail clear", () => {
-    expect(decideImproveNudge(base)).toEqual({ nudge: true });
+  it("fires the GENERIC nudge when idle with backlog but workers are already draining", () => {
+    expect(decideImproveNudge(base)).toEqual({ nudge: true, kind: "generic" });
   });
 
   it("fires on an unmerged (resting-with-work) status too", () => {
-    expect(decideImproveNudge({ ...base, paneStatus: "unmerged" })).toEqual({ nudge: true });
+    expect(decideImproveNudge({ ...base, paneStatus: "unmerged" })).toEqual({
+      nudge: true,
+      kind: "generic",
+    });
+  });
+
+  // ── THE RE-SPIN ARM (bead sparkle-4hwu2i), pinned as arithmetic on the pure decision ────────────
+  it("returns kind:respin with the numbers when idle + ready backlog + free slots + zero active workers", () => {
+    expect(
+      decideImproveNudge({ ...base, readyBacklogCount: 6, freeSlots: 8, activeWorkers: 0 }),
+    ).toEqual({ nudge: true, kind: "respin", readyCount: 6, freeSlots: 8 });
+  });
+
+  it.each<[Partial<ImproveNudgeInput>, string]>([
+    [{ readyBacklogCount: 6, freeSlots: 8, activeWorkers: 1 }, "active workers present"],
+    [{ readyBacklogCount: 6, freeSlots: 0, activeWorkers: 0 }, "no free slots"],
+    // P1-only work (no ready backlog to dispatch a fleet across) is generic even with slots + 0 workers.
+    [{ readyBacklogCount: 0, p1PipelineHealthCount: 1, freeSlots: 8, activeWorkers: 0 }, "P1-only, no ready backlog"],
+  ])("stays GENERIC when the re-spin condition is not fully met (%o — %s)", (patch) => {
+    expect(decideImproveNudge({ ...base, ...patch })).toEqual({ nudge: true, kind: "generic" });
   });
 
   it.each<[Partial<ImproveNudgeInput>, string]>([
@@ -316,6 +376,6 @@ describe("decideImproveNudge — the idle-and-has-backlog rule", () => {
   it("a nudge exactly at the cadence boundary is allowed (>=, not >)", () => {
     expect(
       decideImproveNudge({ ...base, lastNudgedAt: 0, now: NEVER_IDLE_CADENCE_MS }),
-    ).toEqual({ nudge: true });
+    ).toEqual({ nudge: true, kind: "generic" });
   });
 });

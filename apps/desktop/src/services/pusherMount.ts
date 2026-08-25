@@ -61,6 +61,7 @@ import {
   SPARKLE_PROJECT_ID,
 } from "./sparkleAgent";
 import { sweepImproveNudge, type ImproveNudgeDeps } from "./improveNudge";
+import { localAgentCapacity } from "./agentCapacity";
 import { getConfig, onConfigChanged, type BabysitConfigPayload } from "./config";
 import { startConflictFlags } from "./conflictFlags";
 import { startBabysitDispatcher } from "./babysitDispatcher";
@@ -293,6 +294,19 @@ function improveAdvanceFingerprint(agentId: string): string | null {
 }
 
 /**
+ * The machine-capacity reading behind the re-spin push (bead sparkle-4hwu2i), projected from the ONE
+ * `localAgentCapacity` gate every spawn path shares. `freeSlots` is `limit − used` clamped ≥ 0 — the
+ * headroom to fan out a drain fleet; `activeWorkers` is `used`, every local build/worker ROW the
+ * budget counts (an unmounted row is still a spawned worker occupying a slot), so `activeWorkers === 0`
+ * means the fleet is genuinely empty and re-spinning is the right push — the conservative reading for
+ * an aggressive "spin maximally" nudge.
+ */
+function improveLocalCapacity(): { freeSlots: number; activeWorkers: number } {
+  const cap = localAgentCapacity();
+  return { freeSlots: Math.max(0, cap.limit - cap.used), activeWorkers: cap.used };
+}
+
+/**
  * The never-idle watcher's evidence, bound to the live stores. Resolves THIS window's own Improve
  * Sparkle id the same way the ownership election does (`sparkleAgentIdFor(currentWindowLabel())`) and
  * uses that ONE id for the pane read, the advance read AND the send — so the agent whose idleness is
@@ -309,6 +323,7 @@ export function buildImproveNudgeDeps(): ImproveNudgeDeps {
     paneStatus: () => useRuntimeStore.getState().status[improveAgentId()],
     advanceFingerprint: () => improveAdvanceFingerprint(improveAgentId()),
     readyBacklog: improveReadyBacklog,
+    capacity: improveLocalCapacity,
     // Reuses `sendVerified`, so the nudge is confirmed to land exactly like a Pusher challenge, and it
     // does NOT append `BLOCKER_ASK` (that is the challenge path's job).
     send: (text) => sendVerified(improveAgentId(), text),

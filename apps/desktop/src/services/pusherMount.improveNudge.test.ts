@@ -18,6 +18,8 @@ import { SPARKLE_AGENT_ID, SPARKLE_PROJECT_ID, PIPELINE_HEALTH_LABEL } from "./s
 import { useBeadsStore } from "../stores/beadsStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useSettingsStore } from "../stores/settingsStore";
+import { useProjectStore } from "../stores/projectStore";
+import { localAgentCapacity } from "./agentCapacity";
 import type { Bead, Board } from "./beads";
 
 const bead = (over: Partial<Bead>): Bead => ({
@@ -45,6 +47,7 @@ const IMPROVE_ID = SPARKLE_AGENT_ID;
 beforeEach(() => {
   useBeadsStore.setState({ byProject: {} });
   useRuntimeStore.setState({ status: {} });
+  useProjectStore.setState({ selectedProjectId: null, projects: [] } as never);
 });
 afterEach(() => vi.restoreAllMocks());
 
@@ -91,5 +94,39 @@ describe("buildImproveNudgeDeps — the real readers reach the live stores", () 
     expect(buildImproveNudgeDeps().consentIsNever()).toBe(true);
     useSettingsStore.setState({ sparkleImprovementConsent: "always" });
     expect(buildImproveNudgeDeps().consentIsNever()).toBe(false);
+  });
+
+  it("capacity() projects the live localAgentCapacity — activeWorkers = used, freeSlots = max(0, limit − used)", () => {
+    // Seed local build/worker ROWS so `used` is provably > 0 — a constant `{freeSlots, activeWorkers}`
+    // or a reader pointed at the wrong store field could not track this. The oracle is
+    // `localAgentCapacity()` itself: the wiring must PROJECT it, not re-derive a different number.
+    useProjectStore.setState({
+      selectedProjectId: "p1",
+      projects: [
+        {
+          id: "p1",
+          agents: [
+            { id: "w1", kind: "worker", runtime: "local" },
+            { id: "w2", kind: "build", runtime: "local" },
+            { id: "c1", kind: "build", runtime: "cloud" }, // cloud excluded from the budget
+          ],
+        },
+      ],
+    } as never);
+
+    const cap = localAgentCapacity();
+    expect(cap.used).toBe(2); // the two local rows; the cloud row is not counted
+    const got = buildImproveNudgeDeps().capacity();
+    expect(got.activeWorkers).toBe(cap.used);
+    expect(got.freeSlots).toBe(Math.max(0, cap.limit - cap.used));
+  });
+
+  it("capacity() reports zero active workers and full headroom when no local agents exist", () => {
+    useProjectStore.setState({ selectedProjectId: null, projects: [] } as never);
+    const cap = localAgentCapacity();
+    const got = buildImproveNudgeDeps().capacity();
+    expect(got.activeWorkers).toBe(0);
+    expect(got.freeSlots).toBe(cap.limit);
+    expect(got.freeSlots).toBeGreaterThan(0);
   });
 });
