@@ -13,7 +13,14 @@
 // THE SCORER IS DELIBERATELY DUMB — token overlap, no model call. The bead is explicit that a
 // per-task LLM review is NOT wanted: this runs on the create path, in front of a human waiting for
 // a bead to be filed, and a wrong ranking costs a scroll while a paid call costs seconds every time.
+//
+// SIZE GUIDANCE RIDES ALONG HERE (bead `sparkle-o05vcs.4`). This module already knows each
+// candidate's child count, and the refusal it feeds is the exact moment the model is CHOOSING which
+// epic to file a new child under — i.e. file time. So the guidance is computed from counts already
+// in hand, with no extra store read and no extra call. It is ADVISORY: `engine/epicSizeGuidance`
+// returns a sentence, never a verdict, and nothing here may be read as a reason to refuse a create.
 import { childrenOf, isEpic, type Bead } from "../beads";
+import { assessEpicForNewChild, type EpicSizeAssessment } from "../../engine/epicSizeGuidance";
 
 /** Words that overlap between ANY two work items and therefore carry no signal. Kept short on
  *  purpose: an aggressive list starts deleting the domain words ("agent", "bead", "board") that are
@@ -51,6 +58,18 @@ export interface EpicCandidate {
   /** Direct children, and how many of those are still open. */
   totalChildren: number;
   openChildren: number;
+  /**
+   * What this epic WOULD BECOME if the proposed item were filed under it — `totalChildren + 1`
+   * assessed against the 3-8 band and its flex allowance (`engine/epicSizeGuidance`).
+   *
+   * The projected count, not the current one, because this is the one moment the advice can still
+   * change the outcome: an epic sitting at exactly 8 is fine to look at and out of band the instant
+   * you file into it.
+   *
+   * ADVISORY ONLY. `sizeIfFiledHere.shouldSuggestSplit` means "show the suggestion"; it is never a
+   * reason to refuse — the founder's decision is explicit that a refusal here would be a bug.
+   */
+  sizeIfFiledHere: EpicSizeAssessment;
   /** The shared terms that produced the score, so the model can see WHY this was offered. */
   overlap: string[];
 }
@@ -116,6 +135,7 @@ export function candidateEpics(
       score: Math.min(1, Math.round(score * 1000) / 1000),
       totalChildren: kids.length,
       openChildren: kids.filter((k) => k.status !== "closed").length,
+      sizeIfFiledHere: assessEpicForNewChild(kids.length),
       overlap: [...strong, ...weak].sort(),
     });
   }
@@ -127,14 +147,45 @@ export function candidateEpics(
   return scored.slice(0, Math.max(0, limit));
 }
 
-/** The candidate list as one line per epic, for a refusal message a model reads as prose. */
+/**
+ * The candidate list as one line per epic, for a refusal message a model reads as prose.
+ *
+ * An oversized candidate carries its guidance as an indented continuation line rather than a
+ * separate block: the advice is only useful ATTACHED to the epic it is about, and a footnote below
+ * five candidates is a footnote the model has to re-associate. Candidates inside the band add
+ * nothing, so the common case is byte-identical to what this printed before.
+ *
+ * The continuation marker is ASCII `->` and not an arrow glyph, deliberately. `components/
+ * glyphIcons.test.ts` ratchets every arrow-range codepoint in `.ts`/`.tsx` source, and while its own
+ * rules would read this one as prose, the scanner cannot: it counts characters, not positions, and
+ * one more hit reds the fleet. ASCII costs this line nothing and keeps the ceiling where it is.
+ */
 export function describeCandidates(candidates: readonly EpicCandidate[]): string {
   if (candidates.length === 0) return "";
   return candidates
-    .map(
-      (c) =>
+    .map((c) => {
+      const line =
         `  • ${c.id} — "${c.title}" (${c.openChildren} open / ${c.totalChildren} children; ` +
-        `shared terms: ${c.overlap.join(", ")})`,
-    )
+        `shared terms: ${c.overlap.join(", ")})`;
+      return c.sizeIfFiledHere.message ? `${line}\n    -> ${c.sizeIfFiledHere.message}` : line;
+    })
     .join("\n");
+}
+
+/**
+ * The guidance for ONE epic named by id, ready to append to a message a caller is already building
+ * — `""` when the epic is inside the band, or is not among the candidates.
+ *
+ * Exposed separately because the candidate list is shown while the model is still CHOOSING, whereas
+ * a caller that has already filed under a known epic wants the one sentence about that epic and
+ * nothing else. Kept here so both readings come from one computation of the band.
+ *
+ * NEVER a reason to refuse or unwind a create — see this file's header and
+ * `engine/epicSizeGuidance`.
+ */
+export function sizeGuidanceForEpic(
+  candidates: readonly EpicCandidate[],
+  epicId: string,
+): string {
+  return candidates.find((c) => c.id === epicId)?.sizeIfFiledHere.message ?? "";
 }

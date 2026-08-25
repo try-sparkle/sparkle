@@ -210,7 +210,12 @@ describe("`none` is first-class and unshamed", () => {
     expect(beadsComment).toHaveBeenCalledWith(
       ROOT,
       "",
-      `${EPIC_DECISION_MARKER}: no epic — a standalone chore with no larger effort behind it`,
+      // `stringContaining`, not equality: the CLASSIFY STEP (bead `sparkle-o05vcs.2`) rides the
+      // same comment under its own marker. The gate's line is still asserted in full — what is
+      // relaxed is only the claim that nothing else may share the thread.
+      expect.stringContaining(
+        `${EPIC_DECISION_MARKER}: no epic — a standalone chore with no larger effort behind it`,
+      ),
     );
   });
 
@@ -245,7 +250,9 @@ describe("an existing epic id parents the task under it", () => {
     expect(beadsComment).toHaveBeenCalledWith(
       ROOT,
       "sparkle-board.9",
-      `${EPIC_DECISION_MARKER}: existing epic sparkle-board — this is the drag half of the board column work`,
+      expect.stringContaining(
+        `${EPIC_DECISION_MARKER}: existing epic sparkle-board — this is the drag half of the board column work`,
+      ),
     );
   });
 
@@ -297,7 +304,9 @@ describe("`new:<title>` mints the epic and parents the task under it", () => {
     expect(beadsComment).toHaveBeenCalledWith(
       ROOT,
       "sparkle-fresh.1",
-      `${EPIC_DECISION_MARKER}: new epic sparkle-fresh ("Concierge epic hygiene") — opens the effort this task is the first piece of`,
+      expect.stringContaining(
+        `${EPIC_DECISION_MARKER}: new epic sparkle-fresh ("Concierge epic hygiene") — opens the effort this task is the first piece of`,
+      ),
     );
   });
 

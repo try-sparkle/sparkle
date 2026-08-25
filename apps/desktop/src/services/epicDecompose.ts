@@ -52,9 +52,36 @@ export const DECOMPOSE_FAILED_LABEL = "decompose-failed";
  */
 const PIPELINE_LABELS = [DECOMPOSING_LABEL, DECOMPOSED_LABEL, DECOMPOSE_FAILED_LABEL];
 
-/** Flatten the four board columns back into one bead list (childrenOf needs the full set). */
+/**
+ * Flatten EVERY board column back into one bead list (`childrenOf` needs the full set).
+ *
+ * ── IT USED TO READ FOUR OF THE SIX, AND BOTH OMISSIONS WERE LOAD-BEARING ────────────────────
+ * `blocked` and `archived` were missing, which is not a tidiness point — the list this returns is
+ * the ONLY thing `pickEpicsToDecompose` and `childrenOf` ever see, so a column left out is a set of
+ * beads that provably do not exist as far as this whole module is concerned. Two consequences, in
+ * opposite directions:
+ *
+ *   • AN EPIC IN `blocked` COULD NEVER BE PICKED. `columnFor` routes an open bead there for a bd
+ *     dependency OR for the epic sweep's `stalled` label — and "swept to Blocked and stuck there"
+ *     is the exact fate the founder measured for hollow epics. So the pipeline was unreachable for
+ *     precisely the population it exists to rescue, on top of the missing opt-in writer.
+ *   • AN EPIC WHOSE CHILDREN ARE ALL BLOCKED READ AS CHILDLESS, which is worse than inert: it is
+ *     the one shape that could spend money wrongly, decomposing an already-planned epic a second
+ *     time and filing a duplicate set of children under it.
+ *
+ * `archived` is included for the same reason and costs nothing — archived beads are closed, so the
+ * `status !== "closed"` clause in the picker still excludes them as epics, while they now count as
+ * children, which is what stops an epic whose plan was archived from reading as hollow.
+ */
 function boardBeads(board: Board): Bead[] {
-  return [...board.backlog, ...board.inProgress, ...board.done, ...board.delivered];
+  return [
+    ...board.backlog,
+    ...board.blocked,
+    ...board.inProgress,
+    ...board.done,
+    ...board.delivered,
+    ...board.archived,
+  ];
 }
 
 /**

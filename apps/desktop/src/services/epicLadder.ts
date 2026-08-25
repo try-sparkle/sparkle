@@ -42,19 +42,44 @@ export type LadderAgent = Pick<AgentTab, "id" | "epicId" | "beadId">;
  * would therefore ask `parentEpicOf` about an EPIC, which resolves to that epic's own parent when
  * it has one — silently attributing an orchestrator's work to the wrong epic in exactly the nested
  * case. `epicId` is the direct statement; it is read first for that reason, not by preference.
+ *
+ * ⚠️ BUT `epicId` IS NOT ALWAYS AN EPIC, so being read first is not the same as being returned
+ * verbatim (bead sparkle-o05vcs.5). `sendToBuild` in `mode: "task"` hands an orchestrator ONE TASK
+ * bead and stamps that task's id into `epicId` — the shape `docs/orchestrators-per-task.md` calls a
+ * TASK-LEVEL ORCHESTRATOR, and the only shape that produces one today. Returning it unresolved put
+ * that agent on a rung nobody queries: `agentsLadderingTo` is called with EPIC ids, so an
+ * orchestrator building `e1.t1` laddered to `e1.t1` and was absent from `e1`'s ladder entirely
+ * (recorded as a known defect in PRD/epic-linkage-at-spawn.md). BOTH fields are therefore resolved
+ * the same way — the bead is the answer when it IS an epic, its parent epic otherwise — which is
+ * what makes "how many orchestrators are on this task, and under which epic" answerable from the
+ * roster at all, and so what makes the one-per-task decision auditable rather than merely stated.
+ *
+ * WHAT THIS DOES **NOT** TOUCH: the raw `AgentTab.epicId` field stays the BINDING, and the binding
+ * is what `sendToBuild.prepareHandoff` and `planView.orchestratorNameForEpic` match on to keep the
+ * link 1:1. This module derives a LADDER VIEW over that binding. Resolving here cannot loosen the
+ * binding, and re-deriving the binding here would be the second definition this codebase's
+ * epic-membership guard exists to prevent.
  */
 export function epicIdForAgent(agent: LadderAgent, beads: readonly Bead[]): string | null {
-  if (agent.epicId) return agent.epicId;
-  const beadId = agent.beadId;
-  if (!beadId) return null;
+  // `epicId` first, `beadId` as the fallback — see the two warnings above for why the order is
+  // load-bearing in one direction and why neither answer may be returned unresolved.
+  const claimed = agent.epicId ? agent.epicId : agent.beadId;
+  if (!claimed) return null;
   const index = epicIndexOf(beads);
   // `index.byId`, NOT `beads.find`. This runs once per agent inside `agentsLadderingTo`, over a
   // snapshot the board re-polls every 5s, so a linear scan here is O(agents x beads) — the exact
   // per-item store scan `beads.ts` records at 3.4-4.0s on the 7,364-bead store. The index is
   // already in hand one line up and answers precisely this lookup.
-  const bead = index.byId.get(beadId);
-  if (!bead) return null;
-  // A worker whose OWN bead is an epic is already at the top of the ladder — attributing it to that
+  const bead = index.byId.get(claimed);
+  if (!bead) {
+    // AN UNKNOWN id is answered DIFFERENTLY on the two routes, and deliberately. The board polls, so
+    // an agent can name a bead a beat before the snapshot holds it; for an explicitly stamped
+    // `epicId` the field is a direct statement of intent and trusting it keeps the agent visible on
+    // its epic through a partial read. `beadId` has no such statement behind it — it may be any
+    // bead — so an unresolvable one stays null, exactly as before.
+    return agent.epicId ? claimed : null;
+  }
+  // An agent whose OWN bead is an epic is already at the top of the ladder — attributing it to that
   // epic's parent would be a rung too far.
   if (isEpicIndexed(index, bead)) return bead.id;
   return parentEpicOfIndexed(index, bead)?.id ?? null;

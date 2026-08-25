@@ -607,6 +607,25 @@ export interface SpawnBuildAgentInput {
   /** "plan" starts the agent researching and proposing before it edits anything (the state a human
    *  reaches with shift+tab). "build" is the ordinary mode. */
   mode?: "plan" | "build";
+  /**
+   * The epic this agent is being started AGAINST — bead sparkle-o05vcs.1.
+   *
+   * Epic membership in this app is the bead parent-child edge plus `AgentTab.epicId` and nothing
+   * else, and the shared spawn already writes BOTH halves when it is given one
+   * (`services/buildAgentSpawn.SpawnBuildAgentOpts.epicId`). What was missing was a way for the
+   * concierge to SAY the epic: with no field here, every agent the concierge started was structurally
+   * invisible to `epicLadder.agentsForEpicSlices` — which makes `engine/epicHealth` answer `gray` BY
+   * DEFINITION and the ladder rung `unstaffed`. The founder's audit found 6 of 67 epics staffed, so
+   * "Build: Active 1" was not a display bug; it was this argument not existing.
+   *
+   * Forwarded ONLY on the local arm. `spawnCloudBuildAgent` starts its row through a different path
+   * that mints no auto-bead, so there is nothing there to parent — same reasoning that keeps
+   * `model`/`mode` unforwarded for a cloud start (see the route in conciergeTools/registry.ts).
+   *
+   * Absent (the ordinary "start me an agent") the spawn is byte-for-byte what it was: a standalone
+   * agent with a top-level bead, which is a supported state, not a degraded one.
+   */
+  epicId?: string;
 }
 
 /**
@@ -740,6 +759,10 @@ export async function spawnBuildAgent(
     name: input.name,
     model: input.model,
     mode: input.mode,
+    // The epic binding, settled AT SPAWN rather than by a follow-up write — see
+    // `SpawnBuildAgentInput.epicId`. `undefined` is the no-epic case and the shared spawn treats it
+    // as the plain "+ New Build Agent" start, so this line changes nothing for a caller that omits it.
+    epicId: input.epicId,
     // THE ONE CALLER THAT OPTS INTO BEING DECLINED. A spawn from here is the machine acting on the
     // founder's behalf, not his own hand on a control — so if his caret is in a terminal when this
     // lands, the new agent appears and starts but does not take his screen (engine/attentionGuard).

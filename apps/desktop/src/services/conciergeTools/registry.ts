@@ -1022,6 +1022,11 @@ const spawnArgs = z
     name: z.string().min(1).optional(),
     model: z.string().min(1).optional(),
     mode: z.enum(["plan", "build"]).optional(),
+    /** The epic this agent is being started AGAINST (bead sparkle-o05vcs.1). Non-empty when
+     *  present: `""` would read as "an epic" everywhere downstream while binding the agent to
+     *  nothing, which is exactly the parentless-bead state this argument exists to end. Forwarded
+     *  on the LOCAL arm only — see the cloud route below. */
+    epicId: z.string().min(1, "an epic id cannot be empty — omit `epicId` for a standalone agent").optional(),
   })
   .strict();
 
@@ -1067,6 +1072,10 @@ const LIFECYCLE_ROUTES: Record<LifecycleOp, Handler> = {
         name: a.name,
         model: a.model,
         mode: a.mode,
+        // THE EPIC BINDING. Without this forward the field would exist on the schema and be dropped
+        // here, which is worse than not offering it: the reply would look like a linked spawn while
+        // `epicLadder.agentsForEpicSlices` still returned `[]` for the epic (gray / unstaffed).
+        epicId: a.epicId,
       }),
     ),
   ),
@@ -1081,6 +1090,14 @@ const LIFECYCLE_ROUTES: Record<LifecycleOp, Handler> = {
   // `model`/`mode` are deliberately NOT forwarded: `POST /sessions/start` takes neither, so passing
   // them would let a caller believe a choice was applied that nothing ever read. The schema still
   // ACCEPTS them (it is shared with the local spawn) — lifecycle ignores them for a cloud start.
+  //
+  // `epicId` IS NOT FORWARDED EITHER, for the same reason and deliberately (bead sparkle-o05vcs.1).
+  // Epic membership is the bead parent edge plus the row's `epicId`, and both halves are written by
+  // `services/buildAgentSpawn.spawnBuildAgentInProject` — which a cloud start never reaches. Its row
+  // comes up through `startCloudAgentSession`, which mints no auto-bead, so there is no parent to
+  // set and stamping the row alone would put an agent in the epic pill that the membership query
+  // still cannot see. Half a link reads as a bug in the epic column rather than as the missing
+  // feature it is, so the cloud arm stays honest and unlinked until it has a bead to parent.
   spawn_cloud_build_agent: route(spawnArgs, async (a, ctx) =>
     fromLifecycle(
       ctx,

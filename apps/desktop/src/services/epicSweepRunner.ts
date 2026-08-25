@@ -58,11 +58,19 @@ import { conciergeNotifierAvailable, notifyConcierge } from "./conciergeNotifier
 import { processAliveFor, ownsProjectInThisWindow } from "./goalContinuationRunner";
 import {
   decideEpicSweep,
+  EPIC_HOLLOW_SETTLE_MS,
   EPIC_MAX_STALL_AGE_MS,
   EPIC_STALL_MS,
   type EpicSweepCandidate,
   type EpicSweepDecision,
 } from "../engine/epicContinuation";
+import { DECOMPOSE_REQUESTED_LABEL } from "./epicDecompose";
+import {
+  isDecomposeRequested,
+  isInDecomposePipeline,
+  requestDecomposeMessage,
+  requestDecomposeNote,
+} from "./epicDecomposeRequest";
 import type { AgentTab } from "../types";
 import { log } from "../logger";
 
@@ -125,6 +133,23 @@ export const MAX_RESTARTS_PER_SWEEP = MAX_ACTIONS_PER_SWEEP;
  * does not burn the restart it never received.
  */
 export const RESTART_ENABLED = true;
+
+/**
+ * Is the sweep allowed to ASK for a hollow epic to be decomposed? Ships `true`.
+ *
+ * ── WHY IT HAS ITS OWN SWITCH AND NOT {@link RESTART_ENABLED}'s ───────────────────────────────
+ * They bound different spends and they fail differently. `RESTART_ENABLED` governs starting an
+ * AGENT — a slot out of a pool the founder spent a whole session reclaiming — and turning it off
+ * degrades to an escalation, because a stalled epic with no signal at all is worse than what he had
+ * before. This governs a PAID AI CALL fired by a later `epicDecompose` poll, and turning it off
+ * degrades to nothing at all, because the epic is not stalled: it has never been planned, so there
+ * is nothing to tell him that he cannot already see on the card.
+ *
+ * It is the kill switch for exactly one thing: "stop writing the opt-in label". Everything
+ * downstream keeps its own gates — `epicDecompose` still refuses without the label and still checks
+ * the master AI gate before and DURING its sweep.
+ */
+export const DECOMPOSE_REQUEST_ENABLED = true;
 
 /**
  * How many times to try the best-effort audit note, and how long to pause between tries.
@@ -243,7 +268,7 @@ export interface EpicSweepOutcome extends EpicSweepDecision {
   /** The action that was actually performed. Differs from `action` when the sweep was capped for
    *  this tick, or when a write failed — a decision is not a deed and the two must be legible
    *  apart. */
-  performed: "restarted" | "escalated" | "cleared" | "none";
+  performed: "restarted" | "escalated" | "cleared" | "decompose-requested" | "none";
   /**
    * Did the handoff actually RELAUNCH the orchestrator, or was it already running?
    *
@@ -255,7 +280,7 @@ export interface EpicSweepOutcome extends EpicSweepDecision {
    */
   relaunched?: boolean;
   /** Why nothing was performed despite a non-skip decision. */
-  note?: "capped" | "at-capacity" | "write-failed" | "spawn-failed" | "cannot-notify";
+  note?: "capped" | "at-capacity" | "write-failed" | "spawn-failed" | "cannot-notify" | "disabled";
   /**
    * Did the founder actually GET the notice? Absent when none was owed.
    *
@@ -283,6 +308,13 @@ export interface EpicSweepOptions {
   stallMs?: number;
   /** How far back the sweep reaches; defaults to {@link EPIC_MAX_STALL_AGE_MS}. */
   maxAgeMs?: number;
+  /** Grace period before a CHILDLESS epic is asked about; defaults to the engine's
+   *  {@link EPIC_HOLLOW_SETTLE_MS}. A separate window from `stallMs` — see that constant. */
+  hollowMs?: number;
+  /** May the sweep ask for a hollow epic to be decomposed? Defaults to
+   *  {@link DECOMPOSE_REQUEST_ENABLED}, which ships `true`. Injected by tests so the OFF
+   *  configuration — reachable in production if someone flips the constant — stays covered. */
+  requestDecomposeEnabled?: boolean;
   /**
    * Is the automatic restart live? Defaults to {@link RESTART_ENABLED}, which now ships `true`.
    *
@@ -422,6 +454,17 @@ export function candidateFor(
     // stand-in the moment the restart becomes available (see `standInToReset`).
     alreadyEscalated: epic.labels.includes(STALLED_LABEL),
     optedOut: isAutoRestartOptedOut(epic),
+    // ── THE HOLLOW-EPIC FACTS ────────────────────────────────────────────────────────────────
+    // `status` is the roll-up over CHILDREN, so it answers `unplanned` for a CLOSED childless epic
+    // exactly as it does for an open one. Read the epic's own status separately or the sweep asks
+    // for a paid decomposition of finished work.
+    epicClosed: epic.status === "closed",
+    decomposeRequested: isDecomposeRequested(epic),
+    inDecomposePipeline: isInDecomposePipeline(epic),
+    // THE EPIC'S OWN TIMESTAMP, deliberately the opposite rule to `lastChildProgressAt` above — a
+    // hollow epic has no children to read, and "somebody just promoted this" is exactly the freshness
+    // signal worth acting on. `createdAt` is the fallback for a bead bd has never updated.
+    hollowSinceAt: parseTs(epic.updatedAt) ?? parseTs(epic.createdAt),
   };
 }
 
@@ -565,7 +608,9 @@ export async function sweepEpics(opts: EpicSweepOptions = {}): Promise<EpicSweep
   const owns = opts.ownsProject ?? ownsProjectInThisWindow;
   const stallMs = opts.stallMs ?? EPIC_STALL_MS;
   const maxAgeMs = opts.maxAgeMs ?? EPIC_MAX_STALL_AGE_MS;
+  const hollowMs = opts.hollowMs ?? EPIC_HOLLOW_SETTLE_MS;
   const restartEnabled = opts.restartEnabled ?? RESTART_ENABLED;
+  const requestDecomposeEnabled = opts.requestDecomposeEnabled ?? DECOMPOSE_REQUEST_ENABLED;
   const notify = opts.notify ?? ((text: string) => notifyConcierge(text, "pusher"));
   const canNotify = opts.canNotify ?? conciergeNotifierAvailable;
   const restart =
@@ -672,12 +717,8 @@ export async function sweepEpics(opts: EpicSweepOptions = {}): Promise<EpicSweep
           });
         }
       }
-      const decision = decideEpicSweep(
-        candidateFor(beads, project.agents, epic, aliveFor),
-        now,
-        stallMs,
-        maxAgeMs,
-      );
+      const candidate = candidateFor(beads, project.agents, epic, aliveFor);
+      const decision = decideEpicSweep(candidate, now, stallMs, maxAgeMs, hollowMs);
       const out: EpicSweepOutcome = { ...decision, projectId: project.id, performed: "none" };
 
       // ── A STAND-IN IS RETRACTED THE MOMENT THE REAL THING IS AVAILABLE ──────────────────────
@@ -738,6 +779,16 @@ export async function sweepEpics(opts: EpicSweepOptions = {}): Promise<EpicSweep
         continue;
       }
 
+      // ── THE KILL SWITCH, CHECKED BEFORE THE CAP ────────────────────────────────────────────
+      // Above the cap on purpose: a suppressed request must not consume the tick's one action, or
+      // switching the flag off would silently starve the restart half in any project that also
+      // holds a hollow epic. Reported rather than folded into `skip`, so "we decided to ask and
+      // chose not to" stays legible apart from "there was nothing to ask about".
+      if (action === "request-decompose" && !requestDecomposeEnabled) {
+        outcomes.push({ ...out, note: "disabled" });
+        continue;
+      }
+
       // ── THE PER-SWEEP CAP BOUNDS WHAT THE TICK SPENDS, NOT WHAT IT RETRACTS ─────────────────
       // Hoisted above the restart/escalate split, and that is a fix rather than tidiness. It used to
       // sit INSIDE the restart branch — so with the restart gated off no epic entered that branch
@@ -762,6 +813,84 @@ export async function sweepEpics(opts: EpicSweepOptions = {}): Promise<EpicSweep
       const exemptFromCap = action === "clear" && !standInToReset;
       if (!exemptFromCap && acted >= MAX_ACTIONS_PER_SWEEP) {
         outcomes.push({ ...out, note: "capped" });
+        continue;
+      }
+
+      if (action === "request-decompose") {
+        // ── ASK FOR A PLAN FOR AN EPIC THAT HAS NONE ─────────────────────────────────────────
+        // The whole action is ONE label write. That write is not bookkeeping: `epicDecompose`'s
+        // watcher spends a PAID AI call on any epic carrying it, which is why this branch is
+        // guarded like the restart branch rather than like the `clear` one.
+        //
+        // DECLARED EPICS ONLY, AND THAT IS AN INVARIANT RATHER THAN A CHECK. `pickEpicsToDecompose`
+        // requires `isTypedEpic`, so a label on a merely-structural epic would be a request nothing
+        // could ever answer. The engine cannot assert it — it is handed a status, not a bead — but
+        // it does not have to: `isEpic` is `isTypedEpic(b) || hasChildren(b)`, and this branch is
+        // reached only for `status === "unplanned"`, which is `childrenOf(...).length === 0`. A
+        // structural epic therefore cannot be here, from the same bead list that answered both.
+        // Deliberately NOT re-checked with an `if`: a guard nothing can make fire is a branch no
+        // test can red, and the invariant is stronger stated than half-enforced. If the runner's own
+        // `isEpic` filter or `epicStatus`'s source list is ever changed to disagree, THAT is where
+        // the check belongs.
+        // The same refusal the restart branch makes, for the same reason: this spends the founder's
+        // money and its whole point is that he is TOLD. In a satellite window `sink` is null for the
+        // life of the window and `routeToOwningWindow` can hand a torn-out project's ownership to
+        // exactly that window — so the notice would not be transiently dropped, it would be
+        // permanently undeliverable, and no window that COULD tell him will ever sweep this project.
+        // Skipping leaves the epic fully eligible: nothing is written, so the next sweep in a window
+        // that can notify asks properly.
+        if (!canNotify()) {
+          log.warn("epics", "skipping a decompose request this window could not report", {
+            epic: epic.id,
+          });
+          outcomes.push({ ...out, note: "cannot-notify" });
+          continue;
+        }
+        try {
+          await setLabel(project.rootPath, "add", epic.id, DECOMPOSE_REQUESTED_LABEL);
+          // Keep the in-hand snapshot honest, exactly as the promoted-marker heal above does. A
+          // second pass over the same board within one tick must not read the pre-write state and
+          // ask twice.
+          //
+          // DEDUPED, because `bd` labels are a SET and this mirror must not be able to say otherwise.
+          // A caller whose own label write already updated this object (which is exactly what the
+          // suite's mutating `setLabel` does, and what a real re-read would do) would otherwise leave
+          // the bead carrying two copies — a shape no store can produce, so anything downstream
+          // counting labels reads a state that cannot exist.
+          epic.labels = [
+            ...epic.labels.filter((l) => l !== DECOMPOSE_REQUESTED_LABEL),
+            DECOMPOSE_REQUESTED_LABEL,
+          ];
+        } catch (e) {
+          // A FAILED WRITE MUST NOT NOTIFY: the sentence says "I have asked for it to be broken
+          // down", and nothing was asked. Nothing is spent either — the epic is untouched and fully
+          // eligible on the next tick.
+          log.warn("epics", "could not request decomposition", { epic: epic.id, error: String(e) });
+          outcomes.push({ ...out, note: "write-failed" });
+          continue;
+        }
+        acted += 1;
+        // The durable record, written AFTER the request actually landed so it can never describe
+        // one that did not. Best-effort and never throws — the label is what does the work, and a
+        // locked store must not turn a real request into a reported failure. Same bounded,
+        // lock-aware retry the restart path uses; the store is single-writer and shared by every
+        // worktree, so a transient lock is the ORDINARY failure here.
+        await writeAuditNoteResilient(
+          audit,
+          project.rootPath,
+          epic.id,
+          requestDecomposeNote(epic, candidate.hollowSinceAt ?? null, now),
+          auditAttempts,
+          auditBackoffMs,
+        );
+        // The notifier's own answer, not an assumption that sending equals delivering.
+        const noticed = notify(requestDecomposeMessage(epic, NO_AUTO_RESTART_LABEL));
+        if (!noticed) {
+          log.warn("epics", "requested a decomposition but the notice was dropped", {
+            epic: epic.id,
+          });
+        }
+        outcomes.push({ ...out, performed: "decompose-requested", noticed });
         continue;
       }
 

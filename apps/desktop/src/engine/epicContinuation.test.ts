@@ -4,12 +4,15 @@ import {
   decideEpicSweeps,
   EPIC_STALL_MS,
   EPIC_MAX_STALL_AGE_MS,
+  EPIC_HOLLOW_SETTLE_MS,
   type EpicSweepCandidate,
 } from "./epicContinuation";
 
 const NOW = 1_700_000_000_000;
 const STALE = NOW - EPIC_STALL_MS - 1; // just past the window
 const FRESH = NOW - 60_000;
+/** Hollow for longer than the grace period — the epic is a bare title and nothing is coming. */
+const HOLLOW = NOW - EPIC_HOLLOW_SETTLE_MS - 1;
 
 /** The canonical STALLED-AND-RESTARTABLE epic: promoted, then planned, then abandoned. Each test
  *  overrides exactly the field it is about, so a case reads as "this situation, minus that one
@@ -60,11 +63,13 @@ describe("decideEpicSweep — what it must never touch", () => {
     expect(d).toEqual({ epicId: "e1", action: "skip", reason: "not-watched" });
   });
 
-  it("skips an epic with no children — there is no plan to execute", () => {
+  it("never RESTARTS an epic with no children — there is no plan to execute", () => {
     // The `unplanned` / `planning` split is what makes this rule expressible. While both said
-    // `not_started`, a restart here would hand a build agent an empty brief.
-    expect(act({ status: "unplanned" })).toBe("skip");
-    expect(why({ status: "unplanned" })).toBe("nothing-planned");
+    // `not_started`, a restart here would hand a build agent an empty brief. The answer for a
+    // hollow epic is to ask for a plan (see the block below), never to spawn against one — so this
+    // asserts what must NEVER happen rather than one particular alternative.
+    expect(act({ status: "unplanned" })).not.toBe("restart");
+    expect(act({ status: "unplanned", hollowSinceAt: HOLLOW })).not.toBe("restart");
   });
 
   it("skips a finished epic", () => {
@@ -229,5 +234,73 @@ describe("decideEpicSweeps", () => {
   it("honours a caller-supplied window", () => {
     const out = decideEpicSweeps([stalled({ lastChildProgressAt: FRESH })], NOW, 30_000);
     expect(out[0]?.action).toBe("restart");
+  });
+});
+
+// ── THE HOLLOW EPIC: THE STATE 33 OF 67 EPICS WERE MEASURED SITTING IN ────────────────────────
+// A bead declared an epic and holding NOTHING. It cannot be worked — nothing can be started against
+// it — so it drifts to Blocked and stays there. `services/epicDecompose` has always been able to
+// break one down, and has always been gated on an opt-in label that nothing in the app ever wrote.
+// These are the rules that decide when the sweep asks for one, and every negative case below is a
+// PAID CALL not made.
+describe("decideEpicSweep — asking for a plan for an epic that has none", () => {
+  /** The canonical hollow-and-askable epic: promoted, childless, and settled. */
+  const hollow = (over: Partial<EpicSweepCandidate> = {}): EpicSweepCandidate =>
+    stalled({ status: "unplanned", lastChildProgressAt: null, hollowSinceAt: HOLLOW, ...over });
+
+  it("asks for a decomposition", () => {
+    expect(decideEpicSweep(hollow(), NOW)).toEqual({
+      epicId: "e1",
+      action: "request-decompose",
+    });
+  });
+
+  it("checks the watch gate first — an unpromoted hollow epic is never asked about", () => {
+    // Without this the change would fire a paid call against every hollow epic in the store on its
+    // first tick. Promotion to Build is the founder's own per-epic statement that he wants it.
+    expect(why(hollow({ promoted: false }))).toBe("not-watched");
+  });
+
+  it("does not ask about a CLOSED hollow epic, which the roll-up status cannot see", () => {
+    // `rollupEpicStatus` answers `unplanned` for a closed childless epic exactly as for an open one,
+    // so the `done` branch never sees this and only `epicClosed` can stop it.
+    expect(why(hollow({ epicClosed: true }))).toBe("already-done");
+  });
+
+  it("honours the founder's veto — asking spends his money too", () => {
+    expect(why(hollow({ optedOut: true }))).toBe("opted-out");
+  });
+
+  it("does not ask twice", () => {
+    expect(why(hollow({ decomposeRequested: true }))).toBe("decompose-pending");
+  });
+
+  it("does not ask about an epic already in the decompose pipeline", () => {
+    // `decomposing` / `decomposed` / `decompose-failed`. The retry affordance is clearing the failed
+    // badge, which `epicDecompose` owns; re-arming the opt-in here would re-spend behind its back.
+    expect(why(hollow({ inDecomposePipeline: true }))).toBe("decompose-pending");
+  });
+
+  it("skips an epic a build agent is on right now — it may be writing the plan this second", () => {
+    expect(why(hollow({ orchestratorAlive: true }))).toBe("orchestrator-alive");
+  });
+
+  it("gives a freshly filed epic a grace period", () => {
+    expect(why(hollow({ hollowSinceAt: FRESH }))).toBe("too-soon");
+    // …and the grace period is the HOLLOW one, not the two-hour stall window. An epic thirty
+    // minutes old is past the first and nowhere near the second, and it must be askable.
+    expect(act(hollow({ hollowSinceAt: NOW - 30 * 60_000 }))).toBe("request-decompose");
+  });
+
+  it("will not reach back past the sweep's window", () => {
+    // The blast-radius bound on the epics already in the store. It is a REACH limit, not an expiry:
+    // the window is measured from the epic's own `updatedAt`, so promoting one re-enters it.
+    expect(why(hollow({ hollowSinceAt: NOW - EPIC_MAX_STALL_AGE_MS - 1 }))).toBe("too-old");
+  });
+
+  it("fails CLOSED on a date it cannot read", () => {
+    // "We cannot tell how long this has been hollow" must never authorize a paid call.
+    expect(why(hollow({ hollowSinceAt: null }))).toBe("unknown-age");
+    expect(why(hollow({ hollowSinceAt: undefined }))).toBe("unknown-age");
   });
 });

@@ -65,6 +65,18 @@ import {
   type EpicDecision,
 } from "./epicDecision";
 import { candidateEpics, describeCandidates, type EpicCandidate } from "./epicCandidates";
+// THE CLASSIFY STEP (bead `sparkle-o05vcs.2`) — a DIFFERENT question from the gate above. The gate
+// asks "which EXISTING epic does this task go under"; this asks "is this ask a task or an epic AT
+// ALL". It is a written rule with stable ids, not a model call, and it takes NO new argument: the
+// only inputs are the `title` and `body` `create_item` already has, so the concierge cannot skip it
+// by omitting a field. What it produces is recorded on the bead beside the epic decision, because
+// "record WHICH rule fired, so a wrong call is arguable later instead of mysterious" is the whole
+// requirement — a verdict without the rule id satisfies none of it.
+import {
+  classifyAsk,
+  formatAskClassificationComment,
+  type AskClassification,
+} from "../../engine/askClassification";
 
 // ---------------------------------------------------------------------------------------------
 // The operation surface
@@ -368,8 +380,13 @@ export interface CreatedItemView {
   epicCreated: boolean;
   /** Whether the decision's reason actually landed on the bead as a comment. Reported rather than
    *  thrown: the bead exists either way, and a caller told "filed" while the record was lost would
-   *  never know to re-add it. */
+   *  never know to re-add it. The ask classification rides the SAME comment, so this covers both. */
   reasonRecorded: boolean;
+  /** What the CLASSIFY STEP called this ask, and which rule said so. Returned as well as recorded
+   *  so the concierge can CITE the rule in the same breath it reports the filing — a rule it can
+   *  read back is a rule it can be argued with. */
+  askVerdict: AskClassification["verdict"];
+  askRuleId: string;
 }
 
 /** How the refusals below open, so the three of them cannot drift into three explanations of one
@@ -517,6 +534,10 @@ export async function createItem(
     epicCreated = true;
   }
 
+  // THE CLASSIFY STEP. Pure and free — derived from the `title` and `body` already in hand, so it
+  // runs on EVERY create and there is no argument a hurried turn can leave off.
+  const classification = classifyAsk({ title, body });
+
   const created = await attempt("create_item", () =>
     beadsCreate(projectPath, {
       title,
@@ -539,12 +560,18 @@ export async function createItem(
   // THE DURABLE HALF. Attempted after the bead exists and never allowed to undo it — a failed
   // comment is reported through `reasonRecorded`, not raised as a create failure, because a caller
   // that retried on it would file the item twice.
+  //
+  // ONE COMMENT CARRIES BOTH RECORDS, and that is deliberate. A second `bd comment` is a second
+  // store write on a path with a human waiting for a bead to appear, and the two lines are read
+  // together anyway — each keeps its own marker (`EPIC DECISION`, `ASK CLASSIFICATION`), so one
+  // grep still finds either.
   let reasonRecorded = true;
   try {
     await beadsComment(
       projectPath,
       created.data.id,
-      formatEpicDecisionComment({ decision, epicId, epicCreated, reason }),
+      `${formatEpicDecisionComment({ decision, epicId, epicCreated, reason })}\n\n` +
+        formatAskClassificationComment(classification),
     );
   } catch {
     reasonRecorded = false;
@@ -556,6 +583,8 @@ export async function createItem(
     epicDecision: decision.kind,
     epicCreated,
     reasonRecorded,
+    askVerdict: classification.verdict,
+    askRuleId: classification.ruleId,
   });
 }
 

@@ -56,6 +56,23 @@ export const EPIC_STALL_MS = 2 * 60 * 60 * 1000;
  */
 export const EPIC_MAX_STALL_AGE_MS = 14 * 24 * 60 * 60 * 1000;
 
+/**
+ * How long a HOLLOW epic — one declared an epic and carrying no children at all — must have sat
+ * that way before the sweep asks for it to be decomposed.
+ *
+ * A SEPARATE, MUCH SHORTER WINDOW THAN {@link EPIC_STALL_MS}, and the difference is not a taste
+ * call. The two-hour stall window is measured from the newest CHILD `updatedAt`, because that is
+ * what "the work moved" means — and a hollow epic has no children, so that measurement does not
+ * exist for it. The thing being guarded here is different too: not "has the work stalled" but "has
+ * anything had a chance to write the plan yet". The race worth avoiding is an orchestrator that is
+ * mid-decomposition, and that is already a hard skip one rule earlier (`orchestratorAlive`), so
+ * this window only has to outlast the gap between an epic being filed and a build agent being
+ * pointed at it. Fifteen minutes is longer than the sweep's own ten-minute tick, so a freshly filed
+ * epic always gets at least one full tick of grace, and short enough that "the system asks for
+ * children" reads as a response rather than an afterthought.
+ */
+export const EPIC_HOLLOW_SETTLE_MS = 15 * 60 * 1000;
+
 /** What the sweep decided to do about one epic. */
 export type EpicSweepAction =
   /** Hand the epic to a build agent again — the plan exists and nobody is carrying it. */
@@ -64,6 +81,18 @@ export type EpicSweepAction =
   | "escalate"
   /** It is moving again (or finished). Take the escalation mark back off. */
   | "clear"
+  /**
+   * ASK FOR A PLAN. The epic was declared an epic and has NO children, so there is nothing to
+   * restart and nothing to escalate — it is a title. The sweep requests decomposition (the runner
+   * writes `services/epicDecompose`'s explicit opt-in label) rather than spending an agent slot.
+   *
+   * THIS IS THE ACTION THAT MAKES THE DECOMPOSE PIPELINE REACHABLE AT ALL. `epicDecompose` has been
+   * complete since it shipped — pickers, sweep, label state machine, crash recovery — and gated on
+   * an opt-in label that NOTHING in the app ever wrote. So no epic could ever be picked, and the
+   * measured result was 33 of 67 epics sitting hollow, each unable to be worked and each eventually
+   * swept to Blocked. The gate is not the bug; a gate with no door is.
+   */
+  | "request-decompose"
   /** Do nothing. `reason` says which rule answered. */
   | "skip";
 
@@ -76,6 +105,8 @@ export type EpicSkipReason =
   | "opted-out"
   /** No children at all: there is no plan for a build agent to execute. */
   | "nothing-planned"
+  /** Hollow, but decomposition is already requested or already ran — asking twice would spend twice. */
+  | "decompose-pending"
   /** Every child is closed. */
   | "already-done"
   /** A build agent is on it right now — recovering THAT is another sweep's job. */
@@ -172,6 +203,40 @@ export interface EpicSweepCandidate {
    * for the entire installed base, which is the failure this whole fix exists to end.
    */
   optedOut?: boolean;
+
+  /**
+   * Is the EPIC BEAD ITSELF closed?
+   *
+   * NOT derivable from {@link status}, and that gap was a live money bug in the first cut. `status`
+   * is the roll-up over CHILDREN, and a hollow epic has none — so `rollupEpicStatus` answers
+   * `unplanned` for a closed hollow epic exactly as it does for an open one, and the `done` branch
+   * below never sees it. Without this field the sweep would ask for a paid decomposition of work
+   * somebody had already closed. Absent ⇒ open, which is what every pre-existing candidate meant.
+   */
+  epicClosed?: boolean;
+  /** The epic already carries `epicDecompose`'s explicit opt-in label — decomposition is requested
+   *  and this sweep has nothing left to ask for. */
+  decomposeRequested?: boolean;
+  /** The epic is already somewhere in the decompose pipeline (`decomposing` / `decomposed` /
+   *  `decompose-failed`). Asking again would re-spend; the retry affordance is clearing the badge,
+   *  which `epicDecompose` owns. */
+  inDecomposePipeline?: boolean;
+  /**
+   * How long this epic has been hollow, expressed as the epoch-ms of the last thing that happened
+   * TO THE EPIC ITSELF (its own `updatedAt`, falling back to `createdAt`), or null when unreadable.
+   *
+   * THE EPIC'S OWN TIMESTAMP, which is the exact opposite of {@link lastChildProgressAt}'s rule —
+   * and both are right, because they answer different questions. Staleness is about the WORK, so it
+   * must exclude the epic (the sweep's own escalation label write bumps it, which would reset the
+   * clock it just measured). Hollowness is about the EPIC: there are no children to read, and a
+   * promotion or a label write is genuinely the most recent evidence anybody touched it. Reading a
+   * promotion as fresh is the behaviour we want — a hollow epic the founder promoted a minute ago
+   * is precisely the one to ask about, whatever its filing date.
+   *
+   * Null fails CLOSED ({@link EpicSkipReason} `unknown-age`): an unreadable date must never be able
+   * to authorize a paid call.
+   */
+  hollowSinceAt?: number | null;
 }
 
 /**
@@ -210,6 +275,7 @@ export function decideEpicSweep(
   now: number,
   stallMs: number = EPIC_STALL_MS,
   maxAgeMs: number = EPIC_MAX_STALL_AGE_MS,
+  hollowMs: number = EPIC_HOLLOW_SETTLE_MS,
 ): EpicSweepDecision {
   const skip = (reason: EpicSkipReason): EpicSweepDecision => ({
     epicId: c.epicId,
@@ -228,11 +294,44 @@ export function decideEpicSweep(
   if (c.status === "done") return c.alreadyEscalated ? clear() : skip("already-done");
   if (c.orchestratorAlive) return c.alreadyEscalated ? clear() : skip("orchestrator-alive");
 
-  // No children at all: there is no plan here to execute. Restarting would hand a build agent an
-  // empty brief, which is how you get an agent that invents work. This is the distinction the
-  // `unplanned` / `planning` split was made for — while both said `not_started`, this rule could
-  // not be written.
-  if (c.status === "unplanned") return skip("nothing-planned");
+  // ── A HOLLOW EPIC IS A TITLE, SO THE ANSWER IS "ASK FOR A PLAN", NOT "RESTART" ───────────────
+  // No children at all. Restarting would hand a build agent an empty brief, which is how you get an
+  // agent that invents work — so restart stays off the table here, exactly as it always has. What
+  // changed is that the sweep no longer just walks away: an epic nobody can work is the state the
+  // founder measured 33 of 67 epics sitting in, and every one of them was eventually swept to
+  // Blocked for want of a plan that nothing had asked for.
+  //
+  // This is the distinction the `unplanned` / `planning` split was made for — while both said
+  // `not_started`, neither this rule nor the restart rule could be written.
+  //
+  // Everything below is a REFUSAL to ask, and each one is a spend the request would have caused:
+  // the request writes `epicDecompose`'s opt-in label, and that label is what fires a PAID AI call
+  // on a later poll. So the order is "cheapest disqualification first", and every branch that
+  // cannot establish its fact fails closed.
+  if (c.status === "unplanned") {
+    // Closed work is finished work. `status` cannot see this — see `epicClosed`.
+    if (c.epicClosed) return skip("already-done");
+    // The founder's veto covers this the same way it covers a restart: it is a rule that ACTS, and
+    // asking for a decomposition spends his money.
+    if (c.optedOut) return skip("opted-out");
+    // Already asked, or already answered. `epicDecompose` consumes the opt-in on success and keeps
+    // it on failure (so clearing the `decompose-failed` badge retries) — either way, re-asking here
+    // would either duplicate the request or re-arm one the pipeline deliberately disarmed.
+    if (c.decomposeRequested || c.inDecomposePipeline) return skip("decompose-pending");
+    // FAIL CLOSED on an unreadable timestamp, the same rule the stall path follows: "we cannot tell
+    // how long this has been hollow" must never be able to authorize a paid call.
+    if (c.hollowSinceAt === null || c.hollowSinceAt === undefined) return skip("unknown-age");
+    // A GRACE PERIOD, not a stall window — see `EPIC_HOLLOW_SETTLE_MS`. An epic filed seconds ago
+    // may be about to receive its children from whatever filed it.
+    if (now - c.hollowSinceAt < hollowMs) return skip("too-soon");
+    // THE REACH LIMIT, for the same reason the stall path has one and with a sharper edge here: the
+    // 33 hollow epics already in the store would otherwise ALL become eligible on the first tick
+    // after this ships. Beyond the window a silent hollow epic is a decision, not a stall — and it
+    // re-enters the moment anyone touches it, because the window is measured from the epic's own
+    // `updatedAt` and a promotion bumps that.
+    if (now - c.hollowSinceAt > maxAgeMs) return skip("too-old");
+    return { epicId: c.epicId, action: "request-decompose" };
+  }
 
   // FAIL CLOSED on a missing timestamp. "We could not tell how old this is" must never be able to
   // authorize a spawn; an unreadable date is not evidence of a stall.
@@ -298,6 +397,7 @@ export function decideEpicSweeps(
   now: number,
   stallMs: number = EPIC_STALL_MS,
   maxAgeMs: number = EPIC_MAX_STALL_AGE_MS,
+  hollowMs: number = EPIC_HOLLOW_SETTLE_MS,
 ): EpicSweepDecision[] {
-  return candidates.map((c) => decideEpicSweep(c, now, stallMs, maxAgeMs));
+  return candidates.map((c) => decideEpicSweep(c, now, stallMs, maxAgeMs, hollowMs));
 }

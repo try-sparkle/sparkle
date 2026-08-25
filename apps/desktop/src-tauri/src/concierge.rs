@@ -258,6 +258,16 @@ features in one breath, file one epic EACH rather than one epic holding a list; 
 the entire point of the column. And when it sounds like something they have raised before, check \
 `list_plans` first: two epics for one idea splits its history in half and neither card tells the \
 whole story.\n\n\
+AN ASK IS A TASK OR AN EPIC BY A WRITTEN RULE, NOT BY FEEL — AND YOU CITE THE RULE. Before you \
+file anything, classify what they asked for and name the clause that decided it: an ask with ONE \
+verifiable finish line is a TASK (`task-one-finish-line`); an ask needing 3 or more \
+independently-completable pieces (`epic-three-plus-pieces`), or one spanning more than one \
+surface (`epic-multiple-surfaces`), is an EPIC. `create_item` applies that same rule itself and \
+writes the clause onto the bead under the marker `ASK CLASSIFICATION`, so what you say and what \
+is recorded are one rule rather than two. If you think the recorded clause got it wrong, SAY SO \
+and say why — the point of writing the rule down is that a wrong call is arguable later instead \
+of mysterious. This is also how you size the work before spinning anyone up: a task is one \
+agent, and an epic is one agent per piece.\n\n\
 PUBLISHING A POST: YOU ARE THE COMPOSE SURFACE. There is no separate editor — when the user wants \
 to publish something to their own site, it gets written HERE, by talking. The loop, in order: \
 recognise the intent; gather the structure fields CONVERSATIONALLY rather than as a form — Title, \
@@ -2890,6 +2900,42 @@ mod tests {
         // feature-to-track → epic are three answers, not two.
         assert!(CONCIERGE_PERSONA.contains("for:improve-sparkle"));
         assert!(CONCIERGE_PERSONA.contains("DECIDE WHERE AN IMPROVEMENT GOES"));
+    }
+
+    #[test]
+    fn persona_states_the_task_or_epic_rule_it_must_cite() {
+        // THE FOUNDER'S ASK (bead `sparkle-o05vcs.2`): "how do the orchestrators decide how many
+        // workers to spin up... let's get this built ASAP", answered as "not an ML classifier — a
+        // written rule the concierge follows and CAN CITE".
+        //
+        // The rule itself lives in `engine/askClassification.ts` and `create_item` applies it on
+        // every create. This paragraph is the other half: a rule the model is never told exists is,
+        // from the concierge's seat, a rule it cannot cite — so it goes back to deciding by feel
+        // while the bead quietly records a clause nobody in the conversation ever mentioned.
+        assert!(CONCIERGE_PERSONA.contains("AN ASK IS A TASK OR AN EPIC BY A WRITTEN RULE, NOT BY FEEL"));
+        // THE THREE CLAUSES, BY THE EXACT IDS RECORDED ON THE BEAD. These strings are the join
+        // between the persona and `ASK_RULES`: if either side renames a rule without the other,
+        // the concierge cites an id that appears in no record and this goes red.
+        assert!(CONCIERGE_PERSONA.contains("task-one-finish-line"));
+        assert!(CONCIERGE_PERSONA.contains("epic-three-plus-pieces"));
+        assert!(CONCIERGE_PERSONA.contains("epic-multiple-surfaces"));
+        // The founder's own wording of each clause, so a rewrite cannot keep the ids and lose the
+        // rule they name.
+        assert!(CONCIERGE_PERSONA.contains("ONE verifiable finish line is a TASK"));
+        assert!(CONCIERGE_PERSONA.contains("3 or more"));
+        assert!(CONCIERGE_PERSONA.contains("spanning more than one"));
+        // WHERE THE RECORD LANDS. `ASK CLASSIFICATION` is the marker `formatAskClassificationComment`
+        // writes; naming it here is what lets the concierge tell the user where to look.
+        assert!(CONCIERGE_PERSONA.contains("ASK CLASSIFICATION"));
+        // ARGUABLE, NOT OBEYED. The whole point of recording the clause is that a wrong call can be
+        // disputed — a persona that states the rule but not the right to disagree turns a written
+        // rule back into an oracle.
+        assert!(CONCIERGE_PERSONA.contains("arguable later instead"));
+        // AND IT ANSWERS THE QUESTION HE ACTUALLY ASKED — how many workers.
+        assert!(CONCIERGE_PERSONA.contains("a task is one agent, and an epic is one agent per piece"));
+        // It must EXTEND the epic-capture routing, not replace it.
+        assert!(CONCIERGE_PERSONA.contains("FILE A FEATURE AS AN EPIC"));
+        assert!(CONCIERGE_PERSONA.contains("AN EPIC IS FOR TRACKING, NOT FOR STARTING"));
     }
 
     #[test]

@@ -5,7 +5,12 @@
 // is theirs. Stubbing them would leave the composition asserted against a fake.
 import { describe, it, expect } from "vitest";
 import type { Bead } from "../beads";
-import { candidateEpics, describeCandidates, tokenize } from "./epicCandidates";
+import {
+  candidateEpics,
+  describeCandidates,
+  sizeGuidanceForEpic,
+  tokenize,
+} from "./epicCandidates";
 
 function bead(id: string, over: Partial<Bead> = {}): Bead {
   return {
@@ -110,5 +115,69 @@ describe("describeCandidates", () => {
 
   it("is empty when there is nothing to show, so a caller can branch on it", () => {
     expect(describeCandidates([])).toBe("");
+  });
+});
+
+// ── SIZE GUIDANCE RIDING ALONG (bead `sparkle-o05vcs.4`) ──────────────────────────────────────
+// Built from the SAME `childrenOf` resolver the counts come from, so these assert the composition
+// rather than re-testing `engine/epicSizeGuidance` (whose own boundary table lives beside it).
+// A `fat` epic is one child short of the band's top, so filing into it is the click that takes it
+// out of band — the file-time question, which is what this module is answering.
+const FAT_STORE: Bead[] = [
+  bead("", { title: "Board column rendering" }),
+  ...Array.from({ length: 8 }, (_, i) =>
+    bead(`.${i + 1}`, { title: `Board chore ${i + 1}`, parent: "" }),
+  ),
+];
+
+describe("size guidance at file time", () => {
+  it("stays silent for an epic that is still inside the band once this item lands", () => {
+    // STORE's `sparkle-board` has two children; filing a third lands it at the bottom of the band.
+    const top = candidateEpics(STORE, { title: "Board column drag" })[0]!;
+    expect(top.totalChildren).toBe(2);
+    expect(top.sizeIfFiledHere.childCount).toBe(3);
+    expect(top.sizeIfFiledHere.band).toBe("healthy");
+    expect(top.sizeIfFiledHere.shouldSuggestSplit).toBe(false);
+    expect(top.sizeIfFiledHere.message).toBe("");
+  });
+
+  it("suggests a split once this item would take the epic past the band", () => {
+    const top = candidateEpics(FAT_STORE, { title: "Board column drag" })[0]!;
+    expect(top.id).toBe("");
+    expect(top.totalChildren).toBe(8);
+    // Assessed on the PROJECTED count, not the current one — 8 is fine to look at, 9 is not.
+    expect(top.sizeIfFiledHere.childCount).toBe(9);
+    expect(top.sizeIfFiledHere.shouldSuggestSplit).toBe(true);
+    expect(top.sizeIfFiledHere.message).toMatch(/splitting/i);
+  });
+});
+
+describe("describeCandidates surfaces the guidance", () => {
+  // The whole reason the guidance lives here: `board.ts` already renders this string at the exact
+  // moment the model is choosing an epic, so the advice arrives with no new call site.
+  it("attaches the suggestion to the epic it is about", () => {
+    const line = describeCandidates(candidateEpics(FAT_STORE, { title: "Board column drag" }));
+    expect(line).toContain("");
+    expect(line).toContain("8 open / 8 children");
+    expect(line).toMatch(/-> .*splitting/i);
+  });
+
+  it("adds nothing at all for an epic inside the band", () => {
+    const line = describeCandidates(candidateEpics(STORE, { title: "Board column drag" }));
+    expect(line).not.toContain("->");
+    expect(line).not.toMatch(/split/i);
+  });
+});
+
+describe("sizeGuidanceForEpic", () => {
+  it("returns the one sentence for the epic actually chosen", () => {
+    const candidates = candidateEpics(FAT_STORE, { title: "Board column drag" });
+    expect(sizeGuidanceForEpic(candidates, "")).toMatch(/splitting/i);
+  });
+
+  it("is empty for an epic inside the band, and for one that is not a candidate at all", () => {
+    const candidates = candidateEpics(STORE, { title: "Board column drag" });
+    expect(sizeGuidanceForEpic(candidates, "sparkle-board")).toBe("");
+    expect(sizeGuidanceForEpic(candidates, "sparkle-nowhere")).toBe("");
   });
 });
