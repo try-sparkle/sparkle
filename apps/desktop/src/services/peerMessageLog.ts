@@ -73,21 +73,28 @@ export interface ConciergePeerMessage {
 }
 
 /**
- * Characters below which two clamped lines CANNOT have hidden anything.
+ * Characters a single RENDERED line can hold before it wraps.
  *
- * DELIBERATELY PESSIMISTIC, and that direction is the whole point (roborev 68628). Whether the clamp
- * actually hid text is a LAYOUT fact: it depends on the column's width, the reader's zoom and the
- * font, and nothing in JS can see it here — jsdom performs no layout at all, and a browser's own
- * answer only exists after paint. So the row cannot ask "did it overflow?"; it can only ask "is this
- * short enough that it could not have".
+ * PER LINE, NOT PER MESSAGE, and the difference is a shipped bug rather than a refinement (roborev
+ * 68649). Budgeting the whole string was optimistic for exactly the shape it was meant to catch: a
+ * two-line message of 64 + 7 characters totals 71, clears an 80-character aggregate, and draws no
+ * expand control — while the first line alone wraps to two visual lines in any column narrower than
+ * 64 characters and pushes the second line out of the clamp with no way to reach it. The clamp
+ * counts RENDERED lines, so the budget has to as well.
+ *
+ * DELIBERATELY PESSIMISTIC, which is the whole point. Whether the clamp actually hid text is a
+ * LAYOUT fact — it depends on the column's width, the reader's zoom and the font — and nothing in JS
+ * can see it here: jsdom performs no layout at all, and a browser's own answer exists only after
+ * paint. So the row cannot ask "did it overflow?"; it can only ask "is this short enough that it
+ * could not have".
  *
  * The two ways to be wrong are not symmetric. Guessing too HIGH hides text behind a clamp with no
  * control to reveal it — the exact failure this file's header calls worse than the invisibility the
  * feature replaces. Guessing too LOW shows a control that occasionally reveals nothing new. Forty
- * characters per line is well under what the narrowest usable column fits, so the second is the only
- * mistake this number can make.
+ * characters is well under what the narrowest usable column fits, so with the per-line accounting
+ * below the second is the only mistake this number can make.
  */
-export const PEER_CLAMP_SAFE_CHARS = 2 * 40;
+export const PEER_CLAMP_SAFE_CHARS_PER_LINE = 40;
 
 /** Lines of the message used as the clamp when the sender wrote no gist.
  *

@@ -16,7 +16,10 @@ import {
   PEER_APP_PARTY_TESTID,
 } from "./PeerMessageRow";
 import { ConciergeMessageRow } from "./ConciergeMessageRow";
-import { peerMessageEntry, PEER_CLAMP_SAFE_CHARS } from "../../services/peerMessageLog";
+import {
+  peerMessageEntry,
+  PEER_CLAMP_SAFE_CHARS_PER_LINE,
+} from "../../services/peerMessageLog";
 import type { MentionAgent } from "./mentions";
 import type { RevealOutcome } from "../../services/agentReveal";
 
@@ -134,7 +137,7 @@ describe("PeerMessageRow — a long single line is still reachable (roborev 6862
   // derives a gist equal to itself, so the compare said "nothing behind the clamp" and drew no
   // control while `-webkit-line-clamp: 2` ate everything past the second visual line. Every agent
   // that has not been updated to send a gist produces exactly this, up to 2000 characters.
-  const ONE_LONG_LINE = "x".repeat(PEER_CLAMP_SAFE_CHARS + 200);
+  const ONE_LONG_LINE = "x".repeat(PEER_CLAMP_SAFE_CHARS_PER_LINE * 4);
 
   it("offers the control for a long single line sent with NO gist", () => {
     mount(entry({ gist: "", message: ONE_LONG_LINE }));
@@ -152,9 +155,31 @@ describe("PeerMessageRow — a long single line is still reachable (roborev 6862
   });
 
   it("offers it for TWO long lines too — line count alone was never the question", () => {
-    const two = `${"a".repeat(PEER_CLAMP_SAFE_CHARS)}\n${"b".repeat(PEER_CLAMP_SAFE_CHARS)}`;
+    const two = `${"a".repeat(PEER_CLAMP_SAFE_CHARS_PER_LINE * 2)}\n${"b".repeat(
+      PEER_CLAMP_SAFE_CHARS_PER_LINE * 2,
+    )}`;
     mount(entry({ gist: "", message: two }));
     expect(screen.getByTestId(PEER_EXPAND_TESTID)).toBeTruthy();
+  });
+
+  it("offers it when ONE source line wraps and pushes a short second line out (roborev 68649)", () => {
+    // THE SECOND ROUND'S BUG, and the shape an AGGREGATE character budget got wrong: this message
+    // is short in TOTAL — comfortably under two lines' worth of characters — but its first line
+    // alone wraps to two rendered lines, so the clamp eats the second line entirely. Budgeting the
+    // whole string passed it; budgeting per rendered line catches it.
+    const wraps = `${"a".repeat(PEER_CLAMP_SAFE_CHARS_PER_LINE + 24)}\nthanks`;
+    expect([...wraps].length).toBeLessThan(PEER_CLAMP_SAFE_CHARS_PER_LINE * 2);
+    mount(entry({ gist: "", message: wraps }));
+    expect(screen.getByTestId(PEER_EXPAND_TESTID)).toBeTruthy();
+  });
+
+  it("does NOT offer it for a single line that wraps to exactly two — that still fits", () => {
+    // The accounting is `ceil(len / perLine)` rather than "any line over the width", so a single
+    // 1.5-line message correctly costs two rendered lines and needs no control. Without this, the
+    // repair would over-correct into a control on almost every row, which is how the affordance
+    // stops meaning anything.
+    mount(entry({ gist: "", message: "a".repeat(PEER_CLAMP_SAFE_CHARS_PER_LINE + 5) }));
+    expect(screen.queryByTestId(PEER_EXPAND_TESTID)).toBeNull();
   });
 
   it("still draws NO control for a genuinely short message", () => {

@@ -30,7 +30,7 @@ import { TYPE } from "../../theme/scale";
 import { AgentPill } from "./AgentPill";
 import { CopyAnswerButton } from "./CopyAnswerButton";
 import {
-  PEER_CLAMP_SAFE_CHARS,
+  PEER_CLAMP_SAFE_CHARS_PER_LINE,
   PEER_GIST_FALLBACK_LINES,
   type ConciergePeerMessage,
   type PeerParty,
@@ -99,12 +99,21 @@ export function peerRowExpandable(m: ConciergePeerMessage): boolean {
   return !fitsClamp(m.gist);
 }
 
-/** Could two clamped lines have hidden part of this? `false` means they certainly could. */
+/**
+ * Could two clamped lines have hidden part of this? `false` means they certainly could.
+ *
+ * COUNTS RENDERED LINES, NOT CHARACTERS (roborev 68649). An aggregate character budget was
+ * optimistic for the multi-line case and shipped the same unreachable-text bug one round later: a
+ * message of 64 + 7 characters clears an 80-character total, yet its first line alone wraps to two
+ * visual lines and pushes the second out of the clamp. Each source line costs
+ * `ceil(len / PER_LINE)` rendered lines — so a single 45-character line correctly costs 2 and still
+ * FITS, while 64 + 7 correctly costs 3 and does not.
+ */
 function fitsClamp(text: string): boolean {
-  return (
-    text.split("\n").length <= PEER_GIST_FALLBACK_LINES &&
-    [...text].length <= PEER_CLAMP_SAFE_CHARS
-  );
+  const rendered = text
+    .split("\n")
+    .reduce((n, line) => n + Math.max(1, Math.ceil([...line].length / PEER_CLAMP_SAFE_CHARS_PER_LINE)), 0);
+  return rendered <= PEER_GIST_FALLBACK_LINES;
 }
 
 export const PEER_APP_PARTY_TESTID = "concierge-peer-app-party";
