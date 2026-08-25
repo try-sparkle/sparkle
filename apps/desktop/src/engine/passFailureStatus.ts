@@ -62,6 +62,16 @@ const TRANSIENT_FAILURE_PATTERNS = [
   // PRs) before doing anything, so partial work from the dead attempt is deduped, not redone.
   "closed mid-response",
   "stalled mid-stream",
+  // SERVER OVERLOAD (HTTP 529 / `overloaded_error`). The connection was fine and the request was
+  // well-formed — the far side simply refused it for capacity, and its own message says "usually
+  // temporary — try again in a moment". Without this the whole hourly slot is spent on a failure
+  // the API told us to retry, and the row waits out the hour for nothing.
+  //
+  // NOT a quota shape, and it cannot be confused for one: a usage/spend wall is answered by arms 1
+  // and 2 of `classifyPassFailure` before this list is consulted at all, so a message carrying both
+  // still classifies `quota`. Matched on the word rather than on "529" so it also covers the
+  // structured `overloaded_error` type, and because a bare "529" would collide with any number.
+  "overloaded",
 ];
 
 /** True when a failed pass's message names a connectivity problem rather than a real failure. */

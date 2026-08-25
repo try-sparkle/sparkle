@@ -71,9 +71,24 @@ describe("classifyPassFailure", () => {
     ["API Error: Unable to connect to API (ENOTFOUND)", "unable to connect"],
     ["getaddrinfo EAI_AGAIN api.example", "getaddrinfo"],
     ["socket hang up", "socket hang up"],
+    [
+      "API Error: 529 Overloaded. This is a server-side issue, usually temporary — try again in a moment.",
+      "529 Overloaded",
+    ],
+    ['{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}', "overloaded_error"],
   ])("%s is transient, and transient is AMBER", (message) => {
     expect(classifyPassFailure(message, AT)).toBe("transient");
     expect(statusFor(message)).toBe("lapsed");
+  });
+
+  it("a QUOTA WALL that also says overloaded is still blocked, not re-attempted", () => {
+    // Same ordering guard as ECONNRESET above, for the shape this change adds: a 429 rate limit can
+    // legitimately mention overload, and re-attempting a wall within minutes clears nothing.
+    const msg =
+      "API Error: 429 Overloaded\nYou've hit your session limit · resets 8:40am (America/Bogota)";
+    expect(isTransientPassFailure(msg)).toBe(true); // the transient arm WOULD have matched
+    expect(classifyPassFailure(msg, AT)).toBe("quota");
+    expect(statusFor(msg)).toBe("blocked");
   });
 
   it("a TIMEOUT is 'other', and 'other' is AMBER too", () => {
