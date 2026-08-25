@@ -52,6 +52,11 @@
 // inbox) itself fails for an ALARM event, this module files that same deduped bead NOW rather than
 // waiting up to an hour — so a failed real-time delivery still leaves a durable record. Recovery
 // notices never file a bead (nothing is wrong to record).
+//
+// THE SAME DISTRUST APPLIES TO THE FLOOR. `create_bead_full` RESOLVES with bd's caught-error JSON on
+// a refused write, so awaiting it proves nothing; the fail-safe confirms a new bead id before it
+// claims one was filed (`assertBeadWasCreated`). Without that, a store that refuses every write
+// makes the last sink report success and the "this alarm is LOST" line unreachable.
 import { invoke } from "@tauri-apps/api/core";
 
 import { log } from "../logger";
@@ -485,7 +490,7 @@ export function liveEscalationDeps(projectPath: string): EscalationDeps {
         `${text}\n\n` +
         `Filed in real time when a ${ev.severity} transition's inbox doorbell could not be delivered. ` +
         `Deduped by label phc-${ev.componentId}; the hourly pipeline-health-scan.sh enriches this same bead.`;
-      await invoke<string>("create_bead_full", {
+      const raw = await invoke<string>("create_bead_full", {
         projectPath,
         title,
         body,
@@ -496,9 +501,43 @@ export function liveEscalationDeps(projectPath: string): EscalationDeps {
         // priority is seeded via the body/label; create_bead_full has no priority arg, and the
         // hourly scan owns priority after filing (never re-driven here).
       });
+      assertBeadWasCreated(raw);
       void priority;
     },
   };
+}
+
+/**
+ * A RESOLVED `create_bead_full` IS NOT A FILED BEAD — throw unless the payload names a new id.
+ *
+ * `notes.rs::select_bd_result` returns bd's caught-error JSON as `Ok("{\"error\":…}")` **on a
+ * non-zero exit**, by design and with its own test (`select_bd_result_prefers_json_stdout_even_on_
+ * nonzero_exit`), so the frontend can surface the structured message. A caller that awaits the
+ * invoke and discards the payload therefore reads EVERY refused write as a success.
+ *
+ * That mattered here more than anywhere else, because this is the FLOOR. The module header above
+ * distrusts `inbox_send` and `notifyConcierge` precisely because they were caught reporting
+ * unobserved success — and then the bead, the sink both of them fall back to, trusted a resolved
+ * promise. Measured on one machine: the improve inbox sat at its 50-message cap so `wakeImprove`
+ * returned false, and the beads store was schema-degraded (reads served, EVERY WRITE REFUSED), so
+ * bd exited non-zero with `{"error":…}`. The old code set `beadOk = true`, logged `durable bead
+ * filed as fail-safe`, and returned the event as `delivered`. The alarm reached no sink at all and
+ * the one line that says so — `escalation reached NO sink; this alarm is LOST` — could not fire.
+ *
+ * Same contract as `tasks.ts::createBeadFull`; kept local rather than imported so this watchdog
+ * does not take on that module's store graph for one parse.
+ */
+function assertBeadWasCreated(raw: string): void {
+  let obj: { id?: string; error?: string };
+  try {
+    obj = JSON.parse(raw) as { id?: string; error?: string };
+  } catch {
+    // Non-JSON stdout on a clean exit reaches us verbatim. We cannot confirm an id from it, and an
+    // unconfirmed write is not a floor — fail closed.
+    throw new Error(`bd returned unparseable output: ${raw.slice(0, 200)}`);
+  }
+  if (obj.error) throw new Error(obj.error);
+  if (!obj.id) throw new Error(`bd returned no id: ${raw.slice(0, 200)}`);
 }
 
 // ── The store's entry point + test seams ────────────────────────────────────────────────────────

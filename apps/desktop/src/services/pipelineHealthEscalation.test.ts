@@ -10,6 +10,7 @@ import {
   composeEscalationMessage,
   detectEscalations,
   escalatePipelineHealth,
+  liveEscalationDeps,
   remediationFor,
   type EscalationDeps,
   type EscalationEvent,
@@ -18,6 +19,20 @@ import {
 vi.mock("../logger", () => ({
   log: { info: vi.fn(), warn: vi.fn(), debug: vi.fn(), error: vi.fn() },
 }));
+
+/**
+ * The live Tauri bridge, swappable per test. Only `liveEscalationDeps` reaches it; every other case
+ * in this file injects its own deps and never calls `invoke`, so the default below is a tripwire
+ * rather than a stub — a test that reaches Tauri unintentionally fails loudly instead of silently
+ * resolving `undefined`.
+ */
+let invokeImpl: (cmd: unknown, args?: unknown) => Promise<string> = async (cmd) => {
+  throw new Error(`unexpected invoke("${String(cmd)}") — this test did not set invokeImpl`);
+};
+vi.mock("@tauri-apps/api/core", () => ({
+  invoke: (cmd: unknown, args?: unknown) => invokeImpl(cmd, args),
+}));
+vi.mock("./conciergeNotifier", () => ({ notifyConcierge: () => false }));
 
 /** Build a one-component snapshot with the given roborev state. */
 function snap(state: PipelineHealth["overall"], detail = "detail text"): PipelineHealth {
@@ -231,6 +246,96 @@ describe("escalatePipelineHealth — an alarm that reached NO sink is not `deliv
     const res = await escalatePipelineHealth(snap("healthy"), snap("blocking", "wedged"), r.deps);
     expect(res.undelivered).toEqual([]);
     expect(res.delivered).toHaveLength(1);
+  });
+});
+
+describe("liveEscalationDeps.fileDurableBead — a RESOLVED create_bead_full is not a filed bead", () => {
+  // These drive the PRODUCTION seam, not an injected stub: the defect lived entirely in
+  // `liveEscalationDeps`, so a test that injects its own `fileDurableBead` (as every case above
+  // does) cannot see it. Only the two real-time channels are stubbed off, because the shape being
+  // reproduced is the measured one — improve inbox at its 50-message cap, no concierge window — in
+  // which the bead is the LAST sink and its verdict alone decides delivered vs LOST.
+  function beadOnly(payload: string | Error): EscalationDeps {
+    invokeImpl = async () => {
+      if (payload instanceof Error) throw payload;
+      return payload;
+    };
+    return {
+      ...liveEscalationDeps("/tmp/project"),
+      now: () => 1_000_000,
+      notifyConcierge: () => false,
+      wakeImprove: async () => false,
+    };
+  }
+
+  it("bd REFUSING the write (resolved `{error}`) leaves the alarm UNDELIVERED, not delivered", async () => {
+    // The measured store state: schema behind the bd binary, so reads are served and every WRITE is
+    // refused. `notes.rs::select_bd_result` hands that back as Ok("{\"error\":…}") by design, so the
+    // old `await invoke(...)` resolved and the fail-safe claimed a bead it had not filed.
+    const res = await escalatePipelineHealth(
+      snap("healthy"),
+      snap("blocking", "wedged"),
+      beadOnly(`{"error":"database schema is out of date; writes are blocked"}`),
+    );
+
+    expect(res.delivered).toHaveLength(0);
+    expect(res.undelivered).toHaveLength(1);
+    expect(res.undelivered[0]!.componentId).toBe("roborev");
+  });
+
+  it("a clean exit with NO id is also a refusal — an unconfirmed write is not a floor", async () => {
+    const res = await escalatePipelineHealth(
+      snap("healthy"),
+      snap("blocking", "wedged"),
+      beadOnly(`{"warning":"nothing was created"}`),
+    );
+    expect(res.undelivered).toHaveLength(1);
+  });
+
+  it("non-JSON stdout is a refusal too, rather than being passed through as success", async () => {
+    const res = await escalatePipelineHealth(
+      snap("healthy"),
+      snap("blocking", "wedged"),
+      beadOnly("bd: unknown subcommand"),
+    );
+    expect(res.undelivered).toHaveLength(1);
+  });
+
+  it("PAIRED: bd returning a real id IS delivery — the guard is not refusing everything", async () => {
+    // Without this the three cases above pass for a `fileDurableBead` that always throws, which
+    // would silently retire the fail-safe rather than fix it.
+    const res = await escalatePipelineHealth(
+      snap("healthy"),
+      snap("blocking", "wedged"),
+      beadOnly(`{"id":"sparkle-abc12"}`),
+    );
+
+    expect(res.delivered).toHaveLength(1);
+    expect(res.undelivered).toHaveLength(0);
+  });
+
+  it("the refused write still reaches bd — the guard checks the RESULT, it does not skip the call", async () => {
+    // Pins that the fix is a verdict on the payload and not an early return: a fail-safe that stops
+    // calling bd would satisfy every assertion above while filing nothing when the store is healthy.
+    const calls: unknown[] = [];
+    invokeImpl = async (cmd: unknown, args: unknown) => {
+      calls.push([cmd, args]);
+      return `{"error":"writes are blocked"}`;
+    };
+    const deps: EscalationDeps = {
+      ...liveEscalationDeps("/tmp/project"),
+      now: () => 1_000_000,
+      notifyConcierge: () => false,
+      wakeImprove: async () => false,
+    };
+    await escalatePipelineHealth(snap("healthy"), snap("blocking", "wedged"), deps);
+
+    expect(calls).toHaveLength(1);
+    const [cmd, args] = calls[0] as [string, Record<string, string>];
+    expect(cmd).toBe("create_bead_full");
+    // …and with the dedupe labels the hourly scan folds onto, so the fix did not disturb them.
+    expect(args.labels).toContain("phc-roborev");
+    expect(args.labels).toContain("pipeline-health");
   });
 });
 
