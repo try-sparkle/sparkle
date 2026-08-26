@@ -1891,6 +1891,58 @@ pub fn install_agent_hooks_sync(
     Ok(log.to_string_lossy().into_owned())
 }
 
+/// Merge ONLY the event emitter (`sparkle-hook.mjs`) command into
+/// `<worktree>/.claude/settings.local.json`, preserving every other hook and key. Takes resolved
+/// values (no `AppHandle`) so it unit-tests with temp dirs, mirroring [`heal_worktree_hooks`].
+///
+/// This is the SURGICAL half of [`install_agent_hooks_sync`]: it writes the event hooks and NOTHING
+/// else. The full installer ALSO merges Sparkle's default plugins and the build-agent permission
+/// posture (`compose_agent_settings` → `merge_allowed_tools`), which would broaden the app-owned
+/// Improve-Sparkle worktree's deliberately narrow allow-list — a change unrelated to inbox delivery.
+/// So that worktree gets this instead. `merge_event_hooks` keeps the worktree-guard and scan-cadence
+/// hooks already present and only (idempotently) rewrites the emitter entry.
+pub fn install_event_hooks_at(worktree: &Path, emitter_cmd: &str) -> Result<(), String> {
+    let dir = worktree.join(".claude");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir .claude: {e}"))?;
+    let file = dir.join("settings.local.json");
+    // Held across read→merge→write so a concurrent installer or `heal_agent_hooks` cannot have its
+    // write silently reverted by ours. See `settings_write_lock`.
+    let write_lock = settings_write_lock(&file);
+    let _w = write_lock.lock().unwrap_or_else(|e| e.into_inner());
+    let existing = std::fs::read_to_string(&file).ok();
+    let merged = merge_event_hooks(existing.as_deref(), emitter_cmd);
+    // Atomic + JSON-validated: a concurrently-running Claude reads this file to drive its executable
+    // hooks and must never see a truncated write.
+    atomic_write_settings(&file, &merged)
+}
+
+/// Register the Level-2 inbox-drain hook (the `sparkle-hook.mjs` event emitter) into an app-owned
+/// worktree's `settings.local.json`, WITHOUT the plugin/posture changes [`install_agent_hooks`] also
+/// makes (see [`install_event_hooks_at`]). Confines the write to the managed worktrees dir — this
+/// file drives executable hooks, so an unconfined path is a write-anywhere primitive — and stages the
+/// emitter to a stable app-data path, exactly like the full installer. Returns the absolute
+/// event-log path.
+///
+/// This is what makes the app-owned Improve-Sparkle agent a real draining recipient. Its worktree
+/// basename IS its inbox id, and `sparkle_improve::build_improve_exec` already exports
+/// `SPARKLE_INBOX_AGENT` to match (bead sparkle-179b2s) — but the hook that CONSUMES that export was
+/// never installed for this worktree, so its inbox filled and was never drained. Build agents get the
+/// equivalent from `AgentPane.prepare`'s `installAgentHooks`. See `sparkle-hook.mjs::mayDrain`.
+pub fn install_event_hooks_for_worktree(app: &AppHandle, worktree: &Path) -> Result<String, String> {
+    let worktrees_base = crate::dev_identity::app_data_dir(app)?.join("worktrees");
+    let worktree_dir = confine_to_worktrees(&worktrees_base, &worktree.to_string_lossy())?;
+    // Stage the emitter to a stable app-data path (not the app bundle) so the command baked into
+    // settings.local.json survives the bundle being renamed/replaced/removed (see stage_resource_script).
+    let emitter = stage_resource_script(app, "sparkle-hook.mjs")?;
+    let log = event_log_path(app, &worktree_dir.to_string_lossy())?;
+    if let Some(parent) = log.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("mkdir hook-events: {e}"))?;
+    }
+    let emitter_cmd = hook_command(&emitter, &log);
+    install_event_hooks_at(&worktree_dir, &emitter_cmd)?;
+    Ok(log.to_string_lossy().into_owned())
+}
+
 /// Resolve the config layer whose `[plugins]` applies to a worktree. `project_root` must be an
 /// ABSOLUTE path to an existing directory to be used: `config::for_project` memoizes by the string
 /// it's handed, so a relative path, an empty string, or a stale/deleted root would both resolve
@@ -2789,6 +2841,123 @@ mod tests {
         // And the emitter itself landed, so both writers coexist.
         assert!(emitter_present(&v, "PreToolUse"));
     }
+
+    /// THE FIX for the app-owned Improve-Sparkle inbox black hole: registering the event hooks in its
+    /// worktree makes peer messages queued to `__sparkle_self__` DELIVERABLE at a turn boundary, and
+    /// the inbox's O_EXCL claim guarantees they are delivered exactly ONCE.
+    ///
+    /// NON-VACUOUS BY CONSTRUCTION. The agent id the delivery half drains is not hard-coded — it is
+    /// EXTRACTED from the Stop-hook command that `install_event_hooks_at` just wrote. Neuter that
+    /// registration (drop the Stop event, or make it a no-op) and the `Stop` array is absent, so the
+    /// extraction `.expect()`s fail before a single message is drained. The two halves therefore fail
+    /// together: registration is what makes delivery reachable. The env half was already present
+    /// (`build_improve_exec` exports `SPARKLE_INBOX_AGENT`); this proves the consuming hook is what was
+    /// missing.
+    #[test]
+    fn improve_worktree_registration_makes_a_peer_message_deliverable_exactly_once() {
+        // A temp app-data root laid out like the real one: the worktree whose basename is the inbox id,
+        // plus the sibling `inbox/` and `hook-events/` dirs the drain derives from the log path.
+        let app_data = std::env::temp_dir().join(format!(
+            "sparkle-improve-drain-{}-{}",
+            std::process::id(),
+            crate::inbox::uuid_v4()
+        ));
+        let worktree = app_data
+            .join("worktrees")
+            .join("sparkle-self")
+            .join(SPARKLE_CANONICAL_AGENT_ID_FOR_TEST);
+        std::fs::create_dir_all(worktree.join(".claude")).unwrap();
+        // Seed the settings the improve worktree really carries: a worktree-guard PreToolUse hook and
+        // a scan-cadence UserPromptSubmit hook, and NO event emitter. Both must survive the merge.
+        let preexisting = r#"{
+  "hooks": {
+    "PreToolUse": [ { "matcher": "Bash|Edit", "hooks": [ { "type": "command", "command": "node '/abs/worktree-guard.mjs' '/wt'" } ] } ],
+    "UserPromptSubmit": [ { "matcher": "", "hooks": [ { "type": "command", "command": "'/abs/.claude/hooks/scan-cadence.sh'" } ] } ]
+  },
+  "permissions": { "allow": [ "Read", "Grep" ], "defaultMode": "bypassPermissions" }
+}"#;
+        std::fs::write(worktree.join(".claude/settings.local.json"), preexisting).unwrap();
+
+        // Register the drain hook exactly as `install_event_hooks_for_worktree` does, with the log path
+        // the canonical worktree yields (`hook-events/<basename>.jsonl`).
+        let emitter = app_data.join("bin").join("sparkle-hook.mjs");
+        let log = app_data
+            .join("hook-events")
+            .join(format!("{SPARKLE_CANONICAL_AGENT_ID_FOR_TEST}.jsonl"));
+        install_event_hooks_at(&worktree, &hook_command(&emitter, &log)).unwrap();
+
+        // REGISTRATION: the Stop-hook drain landed, and the pre-existing guard + scan-cadence hooks
+        // were preserved (not clobbered by the emitter merge).
+        let written = std::fs::read_to_string(worktree.join(".claude/settings.local.json")).unwrap();
+        let v: Value = serde_json::from_str(&written).unwrap();
+        assert!(emitter_present(&v, "Stop"), "the Stop-hook inbox drain is registered");
+        assert!(written.contains("worktree-guard.mjs"), "the guard hook is preserved");
+        assert!(written.contains("scan-cadence.sh"), "the scan-cadence hook is preserved");
+
+        // Derive the drained agent id FROM the registered Stop command — this is what ties the delivery
+        // assertions below to the registration above (see the doc comment).
+        let stop_cmd = v["hooks"]["Stop"]
+            .as_array()
+            .expect("a Stop hook array exists once registered")
+            .iter()
+            .find_map(|e| {
+                e["hooks"][0]["command"]
+                    .as_str()
+                    .filter(|c| c.contains(EMITTER_MARKER))
+            })
+            .expect("the emitter is the registered Stop hook");
+        // `hook_command` renders `node '<script>' '<log>'`; the last single-quoted token is the log.
+        let log_arg = stop_cmd
+            .rsplit('\'')
+            .nth(1)
+            .expect("the emitter command quotes its event-log path");
+        let agent_id = Path::new(log_arg)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .expect("the event-log basename is the inbox id");
+        assert_eq!(
+            agent_id, SPARKLE_CANONICAL_AGENT_ID_FOR_TEST,
+            "the registered drain is keyed to the Improve-Sparkle inbox"
+        );
+
+        // DELIVERY, through the real inbox claim machinery keyed by that same id.
+        let now = 1_700_000_000_000i64;
+        let msg_id = crate::inbox::uuid_v4();
+        crate::inbox::enqueue(
+            &app_data,
+            agent_id,
+            "main has moved — rebase before you verify",
+            crate::inbox::Severity::Fyi,
+            "peer [wxyz]",
+            now,
+            msg_id.clone(),
+        )
+        .expect("a peer message enqueues to the Improve-Sparkle inbox");
+
+        // First turn-boundary drain: the message is deliverable, and the O_EXCL claim seals it.
+        let pending = crate::inbox::pending(&app_data, agent_id, now);
+        assert_eq!(pending.len(), 1, "the queued peer message is deliverable at the turn boundary");
+        let claims = crate::inbox::claims_dir(&app_data, agent_id);
+        assert!(crate::inbox::claim(&claims, &pending[0].id), "the drain claims it — delivered once");
+
+        // EXACTLY ONCE: the claim hides it from every later drain, and the same id can never be claimed
+        // twice — so the two racing delivery paths can never double-send.
+        assert!(
+            crate::inbox::pending(&app_data, agent_id, now).is_empty(),
+            "a claimed message is no longer pending — no second delivery"
+        );
+        assert!(
+            !crate::inbox::claim(&claims, &pending[0].id),
+            "O_EXCL refuses a second claim of the same message id"
+        );
+
+        let _ = std::fs::remove_dir_all(&app_data);
+    }
+
+    /// Mirrors `sparkle_improve::SPARKLE_CANONICAL_AGENT_ID` — the app-owned Improve-Sparkle worktree
+    /// basename, which is also its Level-2 inbox id. Duplicated as a test constant so a drift in either
+    /// module's constant surfaces here rather than silently decoupling the drain from the inbox.
+    const SPARKLE_CANONICAL_AGENT_ID_FOR_TEST: &str = "__sparkle_self__";
 
     // ── plugin pre-enable (sparkle-s3g2.1) ────────────────────────────────────────────────────
 

@@ -289,13 +289,18 @@ export function SparkleAgentPane({ visible, agentId }: { visible: boolean; agent
             // ours, matching AgentPane's generic branch.
             mcpConfig: controlMcpConfig,
             // Ownership proof for the Stop hook's inbox drain (bead sparkle-ei7keg): the same
-            // window id the hook-events log and the inbox would be keyed by.
+            // window id the hook-events log and the inbox are keyed by.
             //
-            // INERT TODAY, DELIBERATELY. This pane never calls `installAgentHooks`, so no Stop hook
-            // is registered in its worktree and nothing reads this yet. It is set anyway because
-            // the alternative is a silent hole the day hooks ARE installed here: the drain fails
-            // CLOSED, so a missing export presents as "the Improve-Sparkle agent stopped receiving
-            // messages" with nothing in the diff that installed hooks to explain it.
+            // LIVE FOR THE PRIMARY WINDOW. This pane does not call `installAgentHooks` itself, but the
+            // hourly improvement pass (`sparkle_improve_run` → `install_event_hooks_for_worktree`) now
+            // registers the Stop-hook drain in the SHARED canonical `__sparkle_self__` worktree, and
+            // this pane runs `claude` in that same worktree — so once a pass has registered the hook,
+            // the primary window's exported id IS consumed and its queued peer messages drain at a turn
+            // boundary. A SECONDARY window keys on `__sparkle_self__-<label>`, which the canonical log's
+            // basename never matches, so `mayDrain` refuses it (its own inbox, not the canonical one).
+            // The export is still unconditional because the drain fails CLOSED: a missing one would
+            // present as "the Improve-Sparkle agent stopped receiving messages" with nothing to explain
+            // it.
             inboxAgentId: agentId,
             // "Never" = chat-only: don't even grant the agent read access to the log dir, and open
             // with an introduction instead of a log-review mission.

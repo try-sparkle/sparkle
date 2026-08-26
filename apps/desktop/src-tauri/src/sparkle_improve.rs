@@ -358,9 +358,14 @@ fn build_improve_exec(
     // EXPORT THE INBOX-OWNER ID (bead sparkle-179b2s). `mayDrain` in sparkle-hook.mjs only drains an
     // inbox when `SPARKLE_INBOX_AGENT === <that agent's id>`; the hourly headless pass never sets it,
     // so Improve Sparkle's inbox was written but never drained by the pass that has no pane. Export
-    // the canonical id here — mirroring `claudeSpawn.ts`'s `inboxAgentExport` — so the headless pass
-    // is a first-class draining recipient, not a black hole. `shell_quote` keeps it fenced like every
-    // other value in this exec string.
+    // the canonical id here — mirroring `claudeSpawn.ts`'s `inboxAgentExport`.
+    //
+    // THIS EXPORT IS ONLY HALF THE MECHANISM. It satisfies `mayDrain`'s env check, but the hook that
+    // performs the drain still has to be REGISTERED in the worktree — which `sparkle_improve_run` now
+    // does via `crate::hooks::install_event_hooks_for_worktree` before this exec runs. Without that
+    // registration this export was inert and the inbox filled unread; the two together make the
+    // headless pass a real draining recipient, not a black hole. `shell_quote` keeps it fenced like
+    // every other value in this exec string.
     format!(
         "export PATH=\"$HOME/.local/bin:$PATH\"; export SPARKLE_INBOX_AGENT={}; {cmd}",
         shell_quote(SPARKLE_CANONICAL_AGENT_ID)
@@ -467,6 +472,30 @@ pub fn sparkle_improve_run(
         .map_err(|e| format!("sparkle_improve_run: {e}"))?
         .join("worktrees");
     let real_cwd = validate_run_inner(&worktrees, &claude_path, &cwd, &log_dir)?;
+
+    // LEVEL-2 INBOX DELIVERY (completes bead sparkle-179b2s). Register the `sparkle-hook.mjs` Stop
+    // hook in the canonical Improve-Sparkle worktree's settings.local.json BEFORE the pass spawns, so
+    // peer messages queued to `__sparkle_self__` are DELIVERED at this pass's turn boundary — the same
+    // drain a build agent gets from `AgentPane.prepare`'s `installAgentHooks`. `build_improve_exec`
+    // already exports `SPARKLE_INBOX_AGENT=__sparkle_self__` (sparkle-179b2s), which `mayDrain` gates
+    // on; this installs the hook that CONSUMES that export — the missing half that left this agent's
+    // inbox written but never drained.
+    //
+    // Gated on the CANONICAL worktree (basename `__sparkle_self__`, the inbox id `mayDrain` checks):
+    // a backlog-drain worker exports the same id but runs in a DISTINCT worktree whose basename
+    // differs, so `mayDrain` refuses it — registering there would only write a hook that never drains.
+    // Surgical (event hooks only, no plugin/posture change — see `install_event_hooks_for_worktree`)
+    // and best-effort: a registration failure must never block a pass. The message stays `pending` and
+    // UNCLAIMED, so the next pass retries — exactly the fail-closed posture `sparkle-hook.mjs`
+    // documents, never a double-send.
+    if real_cwd.file_name().and_then(|s| s.to_str()) == Some(SPARKLE_CANONICAL_AGENT_ID) {
+        if let Err(e) = crate::hooks::install_event_hooks_for_worktree(&app, &real_cwd) {
+            tracing::warn!(
+                error = %e,
+                "sparkle_improve_run: inbox-drain hook registration failed; peer messages wait for the next pass"
+            );
+        }
+    }
 
     let script = build_improve_exec(&claude_path, &prompt, &persona, &log_dir, mcp_config.as_deref());
     // Log paths only — the script embeds the persona/prompt (which reference the log dir and
