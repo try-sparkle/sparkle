@@ -122,7 +122,23 @@ function openClosePrompt() {
 function silentCloseProject(): Project {
   const project = buildAgentProject();
   useRuntimeStore.setState({
-    branchStatus: { a1: { ahead: 0, behind: 0, dirty: false, filesChanged: 0, insertions: 0, deletions: 0 } },
+    // `branch` IS LOAD-BEARING, not decoration (bead `sparkle-cn9z9l`). `closeDecision`'s silent arm
+    // rests on a CONFIDENT ZERO, and `ahead: 0` is meaningless until the reading can say WHICH branch
+    // it counted against — so a `BranchStatus` with no `branch` is refused and the choice pops
+    // instead. A fixture without it therefore does not represent what a current build produces (the
+    // guard's own note: "every BranchStatus it constructs carries a real branch"), and every silent
+    // -close assertion below would be testing the PROMPT path while claiming to test the silent one.
+    branchStatus: {
+      a1: {
+        ahead: 0,
+        behind: 0,
+        dirty: false,
+        filesChanged: 0,
+        insertions: 0,
+        deletions: 0,
+        branch: "sparkle/agent-a1",
+      },
+    },
     status: {},
     workflowStage: {},
     pollBranchStatus: vi.fn(() => Promise.resolve()),
@@ -480,8 +496,19 @@ describe("AgentSidebar — a LANDED agent needs the human's confirm (bead sparkl
   function landedProject(opts: { status?: Record<string, string> } = {}): Project {
     const project = buildAgentProject();
     useRuntimeStore.setState({
+      // Carries `branch` for the same reason `silentCloseProject` does — see its note. A landed row
+      // is one of the populations that reaches the silent arm, so an un-provenanced fixture here
+      // would send it down the prompt path instead.
       branchStatus: {
-        a1: { ahead: 0, behind: 0, dirty: false, filesChanged: 0, insertions: 0, deletions: 0 },
+        a1: {
+          ahead: 0,
+          behind: 0,
+          dirty: false,
+          filesChanged: 0,
+          insertions: 0,
+          deletions: 0,
+          branch: "sparkle/agent-a1",
+        },
       },
       // STOPPED by default, but NOT load-bearing for the override any more: probe 8 gated the
       // action on `!canAnswer` and roborev 59423 reversed that — `canAnswer` is not a liveness
