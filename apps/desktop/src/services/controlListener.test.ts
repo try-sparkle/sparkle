@@ -7,6 +7,9 @@ import { useProjectStore } from "../stores/projectStore";
 import { useConciergeThreadStore } from "../stores/conciergeThreadStore";
 import { buildConciergeFeed } from "./conciergeFeed";
 import { useRuntimeStore, RUNTIME_PERSIST_KEY } from "../stores/runtimeStore";
+// The RAM-budget walk itself, so the reconciliation test asserts against the REAL population
+// rather than a second hand-maintained list that could drift away from it.
+import { localAgentRowIds } from "./agentCapacity";
 import { continuationEvidenceFor, sweepGoalContinuations } from "./goalContinuationRunner";
 import { noteHooksLive, trackAgent } from "../engine/turnEndAuthority";
 import { useUiStore } from "../stores/uiStore";
@@ -7995,10 +7998,15 @@ describe("get_state scope: fleet — the cross-project address book (bead sparkl
       // was built to publish.
       expect(ids(r)).toEqual(expect.arrayContaining([SPARKLE_AGENT_ID, CONCIERGE_CALLER_AGENT_ID]));
 
-      // THE INVARIANT THE BEAD ASKS FOR: the two numbers in one body cannot silently disagree. The
-      // non-app-owned rows ARE the population `concurrency.live` counts, by construction.
+      // THE INVARIANT THE BEAD ASKS FOR, stated as CONTAINMENT rather than equality (roborev on
+      // sparkle-u1p68f). `concurrency.live` is a RAM-BUDGET reading: it excludes a running cloud
+      // agent, a shell agent and an agent mounted in another window, all of which are live and
+      // belong in a directory. So the guarantee is that the roster can never list FEWER agents than
+      // that headcount — under-reporting was the bug — while listing more is correct. Equality
+      // holds in THIS fixture only because every row here is a local, this-window build/worker;
+      // pinning it as a universal invariant is what hid the cloud/shell/other-window gap.
       const projectRows = r.agents.filter((a) => a.appOwned !== true);
-      expect(projectRows).toHaveLength(r.concurrency.live);
+      expect(projectRows.length).toBeGreaterThanOrEqual(r.concurrency.live);
       expect(r.totalAgents).toBe(r.agents.length);
     });
 
@@ -8010,7 +8018,10 @@ describe("get_state scope: fleet — the cross-project address book (bead sparkl
       // A row that exists and was NOT returned must be counted and named — this is the half that
       // `omitted: 0` was actively lying about.
       expect(ids(r)).not.toContain(dormantId);
-      expect(r.omitted).toBe(r.concurrency.used - r.concurrency.live);
+      // The dormant row is COUNTED and NAMED — the half `omitted: 0` was actively lying about.
+      // Asserted directly rather than as `used - live`: that arithmetic only coincides here because
+      // the fixture holds no cloud or shell rows, which hold no local slot and so are in neither
+      // figure (roborev on sparkle-u1p68f).
       expect(r.omitted).toBeGreaterThan(0);
       expect(r.omittedIds).toContain(dormantId);
     });
@@ -8059,6 +8070,145 @@ describe("get_state scope: fleet — the cross-project address book (bead sparkl
       for (const id of liveIds) expect(ids(r)).toContain(id);
       expect(ids(r)).not.toContain(dormantId);
       expect(r.omittedIds).toContain(dormantId);
+    });
+  });
+
+  // ── THE ROW PREDICATE IS A LIVENESS PREDICATE, NOT A RAM-BUDGET ONE (roborev on sparkle-u1p68f) ──
+  //
+  // `localAgentRowIds().live` answers "what counts against this machine's RAM budget". It therefore
+  // SKIPS `runtime === "cloud"` and every kind but build/worker ("they consume none of this
+  // machine's RAM"), and it reads the WINDOW-LOCAL `openAgentIds` rather than the cross-window
+  // merge every other scope in this handler uses (`readPersistedOpenAgentIds`, roborev #53406).
+  //
+  // Reusing it as the fleet directory's membership test silently redefined three live, addressable
+  // populations as DORMANT — which is what `omitted`/`omittedIds` is documented to mean in
+  // server.ts, types.ts and SKILL.md. A concierge asked to unstick a live cloud agent gets no row
+  // and an id labelled dormant: the exact name-resolution failure sparkle-u1p68f was filed about,
+  // reintroduced one level down. And because roster and headcount now come from ONE source, a
+  // caller can no longer catch it by cross-checking the two numbers the way the original bug was
+  // caught.
+  //
+  // EVERY CANDIDATE MOUNTED AT ONCE (bead sparkle-foqoe): a cloud agent, a shell agent, an agent
+  // open only in ANOTHER window, a freshly-spawned worker with no runtime entry at all, and a
+  // genuinely dormant row — all in one store, so each assertion is about a row that really exists
+  // and could have been returned.
+  describe("get_state scope: fleet — live-and-addressable, not just RAM-budget-resident", () => {
+    /** Seed the CROSS-WINDOW open set the way another window would have — the persisted zustand
+     *  blob `readPersistedOpenAgentIds` parses. Writing `useRuntimeStore.openAgentIds` instead would
+     *  seed THIS window's map and prove nothing about the merge. */
+    const seedOtherWindowOpenIds = (ids: string[]) => {
+      try {
+        localStorage.setItem(RUNTIME_PERSIST_KEY, JSON.stringify({ state: { openAgentIds: ids } }));
+      } catch {
+        /* jsdom without localStorage — the assertions below surface it as a missing row */
+      }
+    };
+    let cloudId: string;
+    let shellId: string;
+    let otherWindowId: string;
+    let freshWorkerId: string;
+    let dormantId: string;
+
+    // Piggybacks on the enclosing describe's project, caller and running listener — starting a
+    // second listener here is what made every case in this block die `firedHandler is not a
+    // function`. Only the extra rows are added.
+    beforeEach(() => {
+      const store = useProjectStore.getState();
+      cloudId = store.addAgent(projectId, { kind: "build", runtime: "cloud" })!;
+      shellId = store.addAgent(projectId, { kind: "shell" })!;
+      otherWindowId = store.addAgent(projectId, { kind: "build" })!;
+      // A worker the caller just spawned: no runtime entry, no open-pane entry. That is the state
+      // `spawn_worker` leaves behind, and why scope "active" carries its caller/child clause.
+      freshWorkerId = store.addAgent(projectId, { kind: "worker", parentId: callerId })!;
+      dormantId = store.addAgent(projectId, { kind: "build" })!;
+
+      // The cloud and shell agents are RUNNING — a live status reading in this window. Neither is
+      // in `localAgentRowIds().live`, because neither costs local RAM.
+      useRuntimeStore.getState().setStatus(cloudId, "working");
+      useRuntimeStore.getState().setStatus(shellId, "working");
+      // `otherWindowId` is mounted in a DIFFERENT window: it reaches this handler only through the
+      // persisted, cross-window open set, never through this window's runtime store.
+      seedOtherWindowOpenIds([otherWindowId]);
+    });
+    afterEach(() => {
+      seedOtherWindowOpenIds([]);
+    });
+
+    const fleetReply = async (reqId: string) => {
+      fire({ reqId, op: "get_state", callerAgentId: callerId, payload: { scope: "fleet" } });
+      await flush();
+      return lastReply() as {
+        agents: Array<{ id: string }>;
+        omitted: number;
+        omittedIds: string[];
+        concurrency: { live: number };
+      };
+    };
+
+    it("lists a RUNNING cloud agent and a RUNNING shell agent instead of calling them dormant", async () => {
+      const r = await fleetReply("rb1");
+      const rows = r.agents.map((a) => a.id);
+      // THE SIDE EFFECT: they come back as rows a caller can read a name off.
+      expect(rows).toContain(cloudId);
+      expect(rows).toContain(shellId);
+      // ...and specifically NOT relabelled as dormant, which is what `omittedIds` means.
+      expect(r.omittedIds).not.toContain(cloudId);
+      expect(r.omittedIds).not.toContain(shellId);
+    });
+
+    it("lists an agent mounted only in ANOTHER window, which the window-local walk cannot see", async () => {
+      const r = await fleetReply("rb2");
+      expect(r.agents.map((a) => a.id)).toContain(otherWindowId);
+      expect(r.omittedIds).not.toContain(otherWindowId);
+    });
+
+    it("lists the caller and a just-spawned worker that have no open-pane entry yet", async () => {
+      const r = await fleetReply("rb3");
+      const rows = r.agents.map((a) => a.id);
+      expect(rows).toContain(callerId);
+      expect(rows).toContain(freshWorkerId);
+    });
+
+    it("still omits a genuinely dormant row — widening must not make `omitted` meaningless", async () => {
+      // The paired control for all three above. If the predicate widened to "everything", these
+      // tests would pass while the scope stopped saying anything, so one row must still be dropped.
+      const r = await fleetReply("rb4");
+      expect(r.agents.map((a) => a.id)).not.toContain(dormantId);
+      expect(r.omittedIds).toContain(dormantId);
+      expect(r.omitted).toBeGreaterThan(0);
+    });
+
+    it("never drops a RAM-budget-live agent — the capacity denominator can only be under-stated by 0", async () => {
+      // The reconciliation the bead asked for, restated so it survives the widening. Listing MORE
+      // than `concurrency.live` is fine; listing FEWER is the original defect. So: every id the
+      // capacity walk counts as live must be a ROW, never an omitted id.
+      useRuntimeStore.setState({ openAgentIds: [callerId, otherWindowId] } as never);
+      const r = await fleetReply("rb5");
+      const rows = new Set(r.agents.map((a) => a.id));
+      expect(r.concurrency.live).toBeGreaterThan(0);
+      for (const id of localAgentRowIds().live) {
+        expect(rows.has(id)).toBe(true);
+        expect(r.omittedIds).not.toContain(id);
+      }
+    });
+
+    it("leaves scope self and scope project unwidened by any of this", async () => {
+      // Widening `fleet` must not widen its neighbours. Every candidate above is mounted, so these
+      // absences are real.
+      fire({ reqId: "rb6", op: "get_state", callerAgentId: callerId, payload: { scope: "self" } });
+      await flush();
+      expect((lastReply() as { agents: Array<{ id: string }> }).agents.map((a) => a.id)).toEqual([
+        callerId,
+      ]);
+
+      fire({ reqId: "rb7", op: "get_state", callerAgentId: callerId, payload: { scope: "project" } });
+      await flush();
+      const proj = (lastReply() as { agents: Array<{ id: string }> }).agents.map((a) => a.id);
+      // scope "project" is a BOUNDARY, not a liveness filter: it returns the project's rows,
+      // including the dormant one, and never the app-global ids.
+      expect(proj).toContain(dormantId);
+      expect(proj).not.toContain(CONCIERGE_CALLER_AGENT_ID);
+      expect(proj).not.toContain(SPARKLE_AGENT_ID);
     });
   });
 });

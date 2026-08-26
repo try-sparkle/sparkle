@@ -34,7 +34,6 @@ import {
 } from "@sparkle/core";
 import { safeUnlisten } from "./safeUnlisten";
 import { peakSummary, type PeakSummary } from "./peakConcurrency";
-import { localAgentRowIds } from "./agentCapacity";
 import { startControlBridge, controlRespond } from "./orchestrationLaunch";
 import { useProjectStore } from "../stores/projectStore";
 import { useAppOwnedAgentStore } from "../stores/appOwnedAgentStore";
@@ -1232,12 +1231,20 @@ function handleGetState(req: ControlRequest): {
   // which is the input every capacity decision needs: with each orchestrator blind to the shared
   // denominator, load reached 20.3x per core with swap 99% consumed (bead `sparkle-iyxxin`).
   //
-  // SO IT LISTS THEM. The live rows are exactly `localAgentRowIds().live` — the population
-  // `concurrency.live` counts — so the roster and that headcount remain the same statement by
-  // construction. They are ORDINARY ROSTER ROWS (`status`, `liveness`, `rollupDot`, `goal`, `stall`
-  // — the shapes every other scope returns), which is why the scope has to see the roster and can no
-  // longer return before it is built. `omitted`/`omittedIds` now count and name what is genuinely
-  // left over: the DORMANT rows, in project tabs Workspace would not mount right now.
+  // SO IT LISTS THEM. Membership is LIVE-OR-ADDRESSABLE — the same rule scope "active" applies (a
+  // live status here, or an open pane in ANY window, or the caller, or the caller's own child) —
+  // plus the app-global rows. They are ORDINARY ROSTER ROWS (`status`, `liveness`, `rollupDot`,
+  // `goal`, `stall` — the shapes every other scope returns), which is why the scope has to see the
+  // roster and can no longer return before it is built. `omitted`/`omittedIds` count and name what
+  // is genuinely left over: the DORMANT rows, in project tabs Workspace would not mount right now.
+  //
+  // THE GUARANTEE IT OWES A CALLER SIZING A SPAWN is containment, not equality: every agent
+  // `concurrency.live` counts is a ROW here, so the directory can never list FEWER agents than that
+  // headcount. It may list MORE, and that is correct rather than a discrepancy — `concurrency.live`
+  // is a RAM-BUDGET reading and deliberately excludes a running cloud agent, a shell agent and an
+  // agent mounted in another window, all of which are live and addressable and belong in a
+  // DIRECTORY. Equating the two is what made this scope report those three as dormant (roborev on
+  // `sparkle-u1p68f`), which is the same name-resolution failure the bead was filed about.
   //
   // WHAT IT STILL CANNOT SEE, stated so a caller does not over-read it: the agents THIS APP knows
   // about. A model process started outside Sparkle is invisible to it, and no field here claims
@@ -1500,10 +1507,6 @@ function handleGetState(req: ControlRequest): {
     appOwned: true as const,
   };
   const all = [...rosterAgents, sparkleRow];
-  // THE LIVE POPULATION, FROM THE SAME WALK `concurrency.live` COUNTS (services/agentCapacity). One
-  // reading, used for both the rows and the tally, so scope "fleet" and the `concurrency` block
-  // below can never be derived from two reads of the store taken at two different moments.
-  const liveAgentIds = new Set(localAgentRowIds().live);
   // The app-global rows scope "fleet" adds on top of the roster: the concierge (whose reserved id is
   // a row in no project) and any per-window Improve Sparkle beyond the one `sparkleRow` covers.
   // Built only for that scope — every other scope's contract is unchanged.
@@ -1552,31 +1555,55 @@ function handleGetState(req: ControlRequest): {
     if (scope === "project") {
       return callerProjectId !== undefined && projectOf.get(a.id) === callerProjectId;
     }
-    // "fleet" = every LIVE agent, plus the app-owned Improve Sparkle row (the other app-global rows
-    // are prepended below — they are not members of `all`). Liveness is `localAgentRowIds`'s, not a
-    // predicate of this filter's own, because this scope's contract is that its live-row count IS
-    // `concurrency.live`. A row that is not live is not dropped silently: it lands in `omittedIds`.
+    // "fleet" = every LIVE-OR-ADDRESSABLE agent, plus the app-owned Improve Sparkle row (the other
+    // app-global rows are prepended below — they are not members of `all`). A row that is not live
+    // is not dropped silently: it lands in `omittedIds`.
     //
     // THE CALLER AND ITS OWN CHILDREN ARE ALWAYS MEMBERS, for the SAME reason "active" carries the
     // clause below — and it matters MORE here, because this is the scope documented as the one to
-    // read before sizing a spawn. `liveAgentIds` requires a runtime entry plus a mounted project,
-    // and a just-spawned worker has neither yet. Without this an orchestrator calls spawn_worker
-    // twice, reads scope "fleet" to decide whether it has room, and gets back a roster containing
-    // NEITHER ITSELF NOR THE TWO WORKERS IT JUST CREATED — all three landing in `omittedIds`, which
-    // the tool description and SKILL.md both describe as "the dormant rows it did not list". It then
-    // sizes its next spawn against a live count that excludes the agents it just started: the exact
-    // under-counting shape as bead sparkle-iyxxin, reintroduced by the fix for it. Measured in that
-    // incident: one orchestrator saw 9 of its own workers while the machine ran 86 model processes.
-    // It also makes SKILL.md's unqualified "You are always in your own roster, and so are your
-    // workers" false for this scope alone. roborev on sparkle-u1p68f.
-    if (
-      scope === "fleet"
-    )
+    // read before sizing a spawn. A just-spawned worker has no runtime entry and no mounted pane,
+    // so without this an orchestrator calls spawn_worker twice, reads scope "fleet" to decide
+    // whether it has room, and gets back a roster containing NEITHER ITSELF NOR THE TWO WORKERS IT
+    // JUST CREATED — all three landing in `omittedIds`, which the tool description and SKILL.md
+    // both describe as "the dormant rows it did not list". It then sizes its next spawn against a
+    // live count that excludes the agents it just started: the exact under-counting shape as bead
+    // sparkle-iyxxin, reintroduced by the fix for it. Measured in that incident: one orchestrator
+    // saw 9 of its own workers while the machine ran 86 model processes. It also makes SKILL.md's
+    // unqualified "You are always in your own roster, and so are your workers" false for this scope
+    // alone. roborev on sparkle-u1p68f.
+    //
+    // MEMBERSHIP IS LIVENESS, NOT THE RAM BUDGET — and getting that backwards is what the clause
+    // below fixes (roborev on sparkle-u1p68f). `liveAgentIds` comes from `localAgentRowIds().live`,
+    // whose job is "what counts against this machine's RAM budget": it SKIPS `runtime === "cloud"`
+    // and every kind but build/worker, because those cost this machine nothing, and it reads the
+    // WINDOW-LOCAL `openAgentIds` rather than the cross-window merge (`openIds`) every other scope
+    // here uses. Using it as the directory's membership test therefore relabelled three live,
+    // addressable populations as DORMANT — which is precisely what `omitted`/`omittedIds` is
+    // documented to mean in server.ts, types.ts and SKILL.md:
+    //   · a running CLOUD agent (server sandbox — real, addressable, costs no local RAM),
+    //   · a running SHELL agent,
+    //   · any agent whose pane is mounted in ANOTHER WINDOW (roborev #53406 — control:request is
+    //     broadcast to every window and whichever answers first replies, so this window has no
+    //     status entry for them).
+    // The concierge asked to unstick a live cloud agent got no row and an id presented as dormant:
+    // the exact name-resolution failure `sparkle-u1p68f` was filed about, one level down. And
+    // because roster and headcount now come from one source, a caller could no longer catch it by
+    // cross-checking the two numbers, which is how the ORIGINAL bug was caught.
+    //
+    // So the test is scope "active"'s — live status, or open in any window, or the caller, or the
+    // caller's own child — plus the app-owned row. `liveAgentIds` needs no clause of its own here:
+    // `mergeOpenAgentIds` is a union, so it is a strict SUBSET of `openIds` and every RAM-budget-live
+    // agent is already carried by the `openIds` clause. That containment is the guarantee the scope
+    // owes a caller sizing a spawn — the directory can never list FEWER agents than
+    // `concurrency.live` counts — so it is asserted by test rather than restated as a redundant
+    // `||` that no mutation could show to matter.
+    if (scope === "fleet")
       return (
         a.id === sparkleRow.id ||
         a.id === req.callerAgentId ||
         a.parentId === req.callerAgentId ||
-        liveAgentIds.has(a.id)
+        openIds.has(a.id) ||
+        a.status !== "stopped"
       );
     // "active" = has a live status, OR is open in ANY window, OR is one of the caller's own
     // children. That last clause is not a nicety: "stopped" is also what an agent with NO runtime
