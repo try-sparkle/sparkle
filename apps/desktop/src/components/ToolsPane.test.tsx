@@ -401,6 +401,33 @@ describe("ToolsPane", () => {
     }
     // And it must never assert the unconditional present tense.
     expect(desc).not.toMatch(/always blocks|blocks every|holds every merge/i);
+
+    // THE THIRD LIE, and the one this row's own SWITCH tells (bead `sparkle-g4krv1`).
+    //
+    // Everything above judges what the copy says about the REVIEW. This judges what it lets a
+    // reader infer about the TOGGLE beside it, which is a different claim and was the false one:
+    // the copy described a review, sat under a switch, and so read as the switch that governs it.
+    // It does not. Measured, `tools.humanebench` has no consumer anywhere — and even once it has
+    // one, that consumer cannot reach this review, which is repo-side
+    // (.github/workflows/humane-gate.yml, triggered by the pull request) and deliberately out of
+    // reach of a machine-wide desktop setting, because a checkout that could disable its own
+    // humaneness gate is the thing the machine-wide scope exists to prevent. A user who flips
+    // this off believing they have opted out has not opted out: their PRs are still scored and
+    // still get a verdict comment. A switch that overstates its protection is the exact failure
+    // this test was written for, and this is the sharpest form of it.
+    //
+    // Note the shape of the pair below — an absent lie is NOT the same fact as a present truth.
+    // Merely deleting "Off skips the review entirely" leaves a reader with no statement at all
+    // about what the switch does, which is the inference that was wrong in the first place. So
+    // the negative and the positive are both required, and neither alone would go red on the
+    // copy this replaced.
+    // The negative is written with a lookbehind on purpose: the honest copy has to SAY "does not
+    // turn it off", so a naive /turns? it off/ would red the very sentence it exists to require.
+    // What is banned is the AFFIRMATIVE claim, in each form it has actually taken here.
+    expect(desc).not.toMatch(
+      /(?<!does not )(?<!doesn't )(?:turns?|switch(?:es)?|shuts?) (?:it|the review|the gate) off|off skips|skips the review|disables the review|opts? you out/i,
+    );
+    expect(desc).toMatch(/does not turn it off|runs on every pull request|regardless of this/i);
   });
 
   it("toggles HumaneBench through the [tools].humanebench flag (never AI-locked)", () => {

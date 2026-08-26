@@ -265,17 +265,38 @@ pub struct ToolsConfig {
     /// "done". On (default) appends the guardrails workflow to every coding agent's system prompt;
     /// off omits it. Adaptive — strict where a test setup exists, a nudge where one doesn't.
     pub guardrails: bool,
-    /// The HumaneBench reviewer. ON, a pull request changing what Sparkle says or does to a
-    /// person is scored against HumaneBench's 8 humane-technology principles by
-    /// `.github/workflows/humane-gate.yml`, the per-principle reasoning is posted onto the PR by
-    /// `scripts/humanebench-pr-comment.sh`, and a score below 0.5 publishes a FAILING
-    /// `HumaneBench` check run. Off skips the review entirely.
+    /// The user's PERSISTED PREFERENCE for the HumaneBench reviewer. The reviewer scores a pull
+    /// request changing what Sparkle says or does to a person against HumaneBench's 8
+    /// humane-technology principles, posts the per-principle reasoning onto the PR as a verdict
+    /// comment, and fails the HumaneBench check below 0.5. Read that as the DESIGNED behaviour of
+    /// the review; this bool is not the thing that turns it on, and the next paragraph is why.
     ///
-    /// WHAT THIS FLAG DOES NOT DO, stated precisely because the difference is the whole gate:
-    /// a failing check run does not by itself hold a merge. `HumaneBench` is deliberately NOT in
-    /// ruleset 18343818's required contexts yet — bead `sparkle-4eqjil` requires it to run green
-    /// on real pull requests twice before an admin adds it. Until then this scores and reports
-    /// but does not block, and no copy anywhere may say otherwise.
+    /// WHAT THIS FLAG DOES NOT DO, stated precisely because the difference is the whole gate.
+    /// Three things, and every one of them is a claim some earlier copy made and had to retract:
+    ///
+    /// 1. IT DOES NOT SWITCH THE REVIEW OFF — and it CANNOT, by construction. The review is
+    ///    repo-side: `.github/workflows/humane-gate.yml`, triggered by the pull request itself,
+    ///    running on a GitHub Actions runner that has no access to a machine-wide desktop config
+    ///    and is never going to have one. Turning this off does not stop a PR being scored and
+    ///    does not stop the verdict comment landing on it. That is deliberate, and it is the SAME
+    ///    argument as the machine-wide scope in the closing paragraph rather than a separate one:
+    ///    a checkout must not be able to switch off its own humaneness gate, and a local toggle
+    ///    the workflow honoured would be exactly that switch reached by another route. An earlier
+    ///    version of this comment ended "Off skips the review entirely." It never did.
+    /// 2. IT DOES NOT HOLD A MERGE. A failing check run does not by itself block. `HumaneBench` is
+    ///    deliberately NOT in ruleset 18343818's required contexts yet — bead `sparkle-4eqjil`
+    ///    requires it to run green on real pull requests twice before an admin adds it. Until then
+    ///    this scores and reports but does not block, and no copy anywhere may say otherwise.
+    /// 3. IT HAS NO CONSUMER AT ALL, today — bead `sparkle-9o0649.1`. Nothing reads it: measured,
+    ///    `grep -rn 'tools\.humanebench' apps/desktop/src-tauri/src/*.rs | grep -v config.rs`
+    ///    returns nothing, while every sibling flag in this table has a real call-site consumer
+    ///    (`tools.roborev` at roborev_probe.rs:443, `tools.builder_index` at builder_index.rs:1979,
+    ///    `tools.straude` at straude.rs:1603). So what IS it for? It is the persisted preference
+    ///    that consumer will read, and it is stated here rather than quietly left implied for the
+    ///    reason `scripts/dormant-modules.allow` gives in its own header: an honest "no consumer
+    ///    yet" note is the difference between a live entry and a stale one. When the consumer
+    ///    lands, delete this point — from here, from `DEFAULT_TEMPLATE`, from `ToolsPane.tsx`,
+    ///    from `services/config.ts` and from `settingsStore.ts`, all in the one change.
     ///
     /// Machine-wide like every key in this table, and here that scope is load-bearing rather than
     /// incidental: a cloned repo must not be able to switch off its own humaneness gate simply by
@@ -5750,7 +5771,11 @@ guardrails = true   # opinionated quality workflow (test-first, run tests+typech
 humanebench = true  # score pull requests that change what Sparkle says or does to a person against
                     # HumaneBench's 8 humane-technology principles, and post the reasoning on the PR.
                     # Below 0.5 fails the HumaneBench check; that check holds a merge once an admin
-                    # adds it to the branch ruleset. Off skips the review entirely.
+                    # adds it to the branch ruleset. NOTE what setting this false does NOT do: the
+                    # review is repo-side (.github/workflows/humane-gate.yml, triggered by the pull
+                    # request), so it cannot be switched off from here and your PRs are scored and
+                    # commented on either way. Today nothing reads this key at all — it is the
+                    # saved preference a future consumer will read (bead sparkle-9o0649.1).
 roborev    = true   # per-commit AI code review of your BUILD-agent commits (uses your claude login)
 # One of the two default-OFF tools, and the only one that publishes anything about you. On, Sparkle
 # posts your DAILY TOKEN TOTALS (per day, per model — never file paths, prompts, code, or keys) to the

@@ -140,13 +140,21 @@ export interface ToolsConfig {
   beads: boolean;
   github: boolean;
   guardrails: boolean;
-  /** Score a pull request that changes what Sparkle says or does to a person against
-   *  HumaneBench's 8 humane-technology principles, post the per-principle reasoning onto the PR,
-   *  and publish a failing `HumaneBench` check run below 0.5. That check holds a merge only once
-   *  an admin adds it to the branch ruleset's required contexts. Defaults ON. Optional so callers
-   *  guard: a Rust backend predating the key omits it, and the hydrate resolves an absent value
-   *  through `?? true` — the same back-compat rule the `builder_index`/`straude` pair uses, in
-   *  the opposite direction. */
+  /** The user's persisted PREFERENCE for the HumaneBench reviewer, which scores a pull request
+   *  that changes what Sparkle says or does to a person against HumaneBench's 8 humane-technology
+   *  principles, posts the per-principle reasoning onto the PR, and fails the HumaneBench check
+   *  below 0.5. That check holds a merge only once an admin adds it to the branch ruleset's
+   *  required contexts. Defaults ON.
+   *
+   *  It does NOT switch that review off, and cannot: the review is repo-side
+   *  (`.github/workflows/humane-gate.yml`, triggered by the pull request), so no machine-wide
+   *  desktop setting reaches it — deliberately, since a checkout must not be able to disable its
+   *  own humaneness gate. Today nothing reads this field at all; it is the preference a future
+   *  consumer will read (bead `sparkle-9o0649.1`). See `ToolsConfig::humanebench` in config.rs.
+   *
+   *  Optional so callers guard: a Rust backend predating the key omits it, and the hydrate
+   *  resolves an absent value through `?? true` — the same back-compat rule the
+   *  `builder_index`/`straude` pair uses, in the opposite direction. */
   humanebench?: boolean;
   roborev: boolean;
   /** Back your `.env*` files up to a 1Password vault. The one tool here that defaults OFF — it

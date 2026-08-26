@@ -807,13 +807,17 @@ interface SettingsState {
    *  "done") is appended to every coding agent's system prompt; off omits it. Mirrors
    *  [tools].guardrails. */
   guardrailsEnabled: boolean;
-  /** The HumaneBench reviewer. On, a pull request that changes what Sparkle says or does to a
-   *  person is scored against HumaneBench's 8 humane-technology principles, the per-principle
-   *  reasoning is posted onto the PR, and a score below 0.5 publishes a FAILING `HumaneBench`
-   *  check run; off skips the review. That failing check does not itself hold a merge until an
-   *  admin adds `HumaneBench` to the branch ruleset's required contexts — see the doc on
-   *  `ToolsConfig::humanebench` in config.rs for why that step is deliberately last. Mirrors
-   *  [tools].humanebench — machine-wide, so a cloned repo cannot switch its own gate off. */
+  /** The user's persisted PREFERENCE for the HumaneBench reviewer. The reviewer scores a pull
+   *  request that changes what Sparkle says or does to a person against HumaneBench's 8
+   *  humane-technology principles, posts the per-principle reasoning onto the PR, and fails the
+   *  HumaneBench check below 0.5. That failing check does not itself hold a merge until an admin
+   *  adds `HumaneBench` to the branch ruleset's required contexts — see the doc on
+   *  `ToolsConfig::humanebench` in config.rs for why that step is deliberately last.
+   *
+   *  Turning this OFF does not skip the review: it is repo-side
+   *  (`.github/workflows/humane-gate.yml`, triggered by the pull request), so it runs whatever
+   *  this says — which is the point of the machine-wide scope, not a gap in it. Nothing reads
+   *  this field yet (bead `sparkle-9o0649.1`). Mirrors [tools].humanebench. */
   humanebenchEnabled: boolean;
   /** roborev — the per-commit AI code-review daemon. On (default) → the Tools toggle is on and
    *  the daemon reviews each BUILD-agent commit; off → dormant. Mirrors [tools].roborev. Config-
