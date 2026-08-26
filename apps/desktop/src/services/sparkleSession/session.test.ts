@@ -9,32 +9,66 @@ import { describe, expect, it, vi } from "vitest";
 import { createSparkleSession, type SparkleSessionDeps } from "./session";
 import type { SparkleOverlayController } from "../../components/SparkleOverlay";
 import type { GenieResponse } from "../genie";
-import type { WakeWordDetector, WakeWordEvent } from "../../voice/wakeWord";
+import {
+  ON_DEVICE_ORIGIN,
+  type OnDeviceWakeWordDetector,
+  type TranscriptOrigin,
+  type WakeWordEvent,
+} from "../../voice/wakeWord";
 
-/** Records every controller call as a flat, ordered log of strings — the thing under test. */
-function recordingController() {
+/** Records every controller call as a flat, ordered log of strings — the thing under test.
+ *
+ *  `reply` is the interesting one. The real controller resolves it when the typing animation
+ *  ENDS, and that resolution is the only signal the response beat is over — so a test that wants
+ *  to observe `responding` at all has to be able to hold it open. `deferReply` does that;
+ *  `rejectReply` fails it instead. */
+function recordingController(
+  opts: { deferReply?: boolean; rejectReply?: boolean } = {},
+) {
   const calls: string[] = [];
+  const gates: (() => void)[] = [];
   const controller: SparkleOverlayController = {
     setState: (anchor, mode) => void calls.push(`setState:${anchor}/${mode}`),
     hear: async (text) => void calls.push(`hear:${text}`),
-    reply: async (text) => void calls.push(`reply:${text}`),
+    reply: async (text) => {
+      calls.push(`reply:${text}`);
+      if (opts.rejectReply) throw new Error("typing exploded");
+      if (opts.deferReply) await new Promise<void>((r) => gates.push(r));
+    },
     dismiss: () => void calls.push("dismiss"),
     getState: () => ({ anchor: "perch", mode: "still" }),
   };
-  return { controller, calls };
+  /** Let the oldest still-typing reply finish. Returns false if there was none. */
+  const finishReply = () => {
+    const g = gates.shift();
+    if (!g) return false;
+    g();
+    return true;
+  };
+  return { controller, calls, finishReply };
 }
 
 /** A detector stub whose `onDetect` we can fire by hand, and whose enabled flag we can read. */
 function stubDetector() {
   let fire: ((e: WakeWordEvent) => void) | null = null;
-  const state = { enabled: true, fed: [] as string[], resets: 0 };
-  const create = (onDetect: (e: WakeWordEvent) => void): WakeWordDetector => {
+  const state = {
+    enabled: true,
+    fed: [] as string[],
+    /** Every (chunk, origin) pair, so a test can prove the origin actually reaches the gate. */
+    fedWithOrigin: [] as [string, TranscriptOrigin][],
+    resets: 0,
+  };
+  const create = (onDetect: (e: WakeWordEvent) => void): OnDeviceWakeWordDetector => {
     fire = onDetect;
     return {
-      feed: (chunk: string) => void state.fed.push(chunk),
+      feed: (chunk: string, origin: TranscriptOrigin) => {
+        state.fed.push(chunk);
+        state.fedWithOrigin.push([chunk, origin]);
+      },
       setEnabled: (v: boolean) => void (state.enabled = v),
+      isEnabled: () => state.enabled,
       reset: () => void state.resets++,
-    } as unknown as WakeWordDetector;
+    } as unknown as OnDeviceWakeWordDetector;
   };
   return {
     create,
@@ -47,8 +81,11 @@ function reply(text: string): GenieResponse {
   return { intent: "chat", replyText: text, confidence: 0.9 };
 }
 
-function harness(over: Partial<SparkleSessionDeps> = {}) {
-  const { controller, calls } = recordingController();
+function harness(
+  over: Partial<SparkleSessionDeps> = {},
+  ctrlOpts: { deferReply?: boolean; rejectReply?: boolean } = {},
+) {
+  const { controller, calls, finishReply } = recordingController(ctrlOpts);
   const det = stubDetector();
   const route = vi.fn(async () => reply("here you go"));
   const onAction = vi.fn();
@@ -60,12 +97,15 @@ function harness(over: Partial<SparkleSessionDeps> = {}) {
     onAction,
     ...over,
   });
-  return { session, calls, det, route, onAction };
+  return { session, calls, det, route, onAction, finishReply };
 }
 
 describe("the full cycle", () => {
   it("paints idle -> listening -> processing -> speaking -> idle IN THAT ORDER", async () => {
-    const { session, calls, det } = harness();
+    // The reply is held open so every beat is observable; releasing it closes the ring. An
+    // earlier version of this test STOPPED at speaking while its title promised idle, which is
+    // exactly how the missing `responseDone` path stayed invisible.
+    const { session, calls, det, finishReply } = harness({}, { deferReply: true });
 
     det.wake("what is on my calendar");
     expect(session.getState().state).toBe("listening");
@@ -76,27 +116,44 @@ describe("the full cycle", () => {
     await vi.waitFor(() => expect(session.getState().state).toBe("responding"));
     session.endOfSpeech(); // a stray end-of-speech while responding must not disturb the cycle
 
+    // The typing animation ends. THIS is the beat that was unreachable before.
+    expect(finishReply()).toBe(true);
+    await vi.waitFor(() => expect(session.getState().state).toBe("idle"));
+
     // The ORDER is the assertion. Membership alone would pass for any permutation of these.
     expect(calls.filter((c) => c.startsWith("setState:"))).toEqual([
       "setState:perch/listening",
       "setState:center/processing",
       "setState:center/speaking",
+      "setState:perch/still",
     ]);
     expect(calls).toContain("hear:what is on my calendar");
     expect(calls).toContain("reply:here you go");
   });
 
-  it("returns the swarm home when the reply finishes painting", async () => {
-    const { session, calls, det } = harness();
+  it("returns the swarm home when the reply finishes painting — with no dismiss involved", async () => {
+    const { session, calls, det, finishReply } = harness({}, { deferReply: true });
     det.wake("hello");
     session.endOfSpeech("hello");
     await vi.waitFor(() => expect(session.getState().state).toBe("responding"));
 
-    // responseDone arrives through the machine via the public dismiss-free path: the controller
-    // finished typing. We drive it the way session.ts exposes it — the reply having landed, the
-    // caller signals completion by dismissing the response, which lands home.
-    session.dismiss();
-    expect(session.getState().state).toBe("idle");
+    // PAIRED NEGATIVE: while the reply is still typing the swarm must STAY out front. Without
+    // this, the assertion below passes for a session that went home early for any reason.
+    expect(session.getState().state).toBe("responding");
+    expect(calls).not.toContain("setState:perch/still");
+
+    expect(finishReply()).toBe(true);
+    await vi.waitFor(() => expect(session.getState().state).toBe("idle"));
+    expect(calls.slice(-2)).toEqual(["dismiss", "setState:perch/still"]);
+  });
+
+  it("a reply that FAILS to paint lands the swarm home rather than stranding it", async () => {
+    const { session, calls, det } = harness({}, { rejectReply: true });
+    det.wake("hello");
+    session.endOfSpeech("hello");
+    // Reaching idle is the whole assertion: a rejected reply used to be an unhandled rejection
+    // that left the machine parked in `responding` with nothing able to move it.
+    await vi.waitFor(() => expect(session.getState().state).toBe("idle"));
     expect(calls.slice(-2)).toEqual(["dismiss", "setState:perch/still"]);
   });
 });
@@ -127,10 +184,13 @@ describe("the losing interleaving", () => {
 
   it("PAIRED: the identical response DOES paint when no dismiss intervened", async () => {
     // Without this, the test above passes for a session whose route was never called at all.
+    // The reply is held open so `responding` is a state we can actually stand in — once the ring
+    // closes, an un-held reply resolves immediately and the session is correctly already home.
     let resolve!: (r: GenieResponse) => void;
-    const { session, calls, det } = harness({
-      route: () => new Promise<GenieResponse>((r) => (resolve = r)),
-    });
+    const { session, calls, det } = harness(
+      { route: () => new Promise<GenieResponse>((r) => (resolve = r)) },
+      { deferReply: true },
+    );
     det.wake("summarize the fleet");
     session.endOfSpeech("summarize the fleet");
     resolve(reply("too late"));
@@ -159,6 +219,39 @@ describe("the losing interleaving", () => {
     det.wake("open the build project");
     session.endOfSpeech("open the build project");
     await vi.waitFor(() => expect(onAction).toHaveBeenCalledTimes(1));
+  });
+
+  it("a reply finishing AFTER a supersede does not send the NEW conversation home", async () => {
+    // The sharpest case, and the one a state-only guard misses. After a dismiss the machine is
+    // idle, so a late `responseDone` is harmlessly ignored by the `state !== responding` check.
+    // But dismiss -> wake -> ask again puts it back IN `responding` under a NEW generation: the
+    // OLD reply then finishes typing and, ungenerationed, would send the new answer home
+    // mid-sentence. Only the generation check can tell those two apart.
+    const { session, calls, det, finishReply } = harness({}, { deferReply: true });
+
+    det.wake("first question");
+    session.endOfSpeech("first question");
+    await vi.waitFor(() => expect(calls).toContain("reply:here you go"));
+    expect(session.getState().state).toBe("responding");
+
+    session.dismiss();
+    det.wake("second question");
+    session.endOfSpeech("second question");
+    await vi.waitFor(() => expect(session.getState().state).toBe("responding"));
+    const generationNow = session.getState().generation;
+
+    // The FIRST reply's typing now finishes, long after its conversation ended.
+    expect(finishReply()).toBe(true);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(session.getState().state).toBe("responding");
+    expect(session.getState().generation).toBe(generationNow);
+
+    // PAIRED: the SECOND reply's own completion does still land it home, so the assertion above
+    // is a real rejection of a stale signal and not a session that stopped responding to any.
+    expect(finishReply()).toBe(true);
+    await vi.waitFor(() => expect(session.getState().state).toBe("idle"));
   });
 
   it("a second wake supersedes the first — the older answer never paints", async () => {
@@ -225,18 +318,33 @@ describe("failure never strands the swarm", () => {
 describe("plumbing that is easy to get silently wrong", () => {
   it("feeds EVERY chunk to the detector, awake or not — that is what 'continuous' means", () => {
     const { session, det } = harness();
-    session.feed("idle chatter");
+    session.feed("idle chatter", ON_DEVICE_ORIGIN);
     det.wake("");
-    session.feed("now i am talking");
+    session.feed("now i am talking", ON_DEVICE_ORIGIN);
     expect(det.state.fed).toEqual(["idle chatter", "now i am talking"]);
+  });
+
+  it("hands the detector the ORIGIN it was given, rather than a value of its own", () => {
+    // The gate can only be as good as what reaches it. If the session invented an origin — the
+    // easy mistake, and the one that would quietly re-open the hole the gate closes — every chunk
+    // would arrive tagged "on-device" no matter what the caller said.
+    const { session, det } = harness();
+    session.feed("heard locally", ON_DEVICE_ORIGIN);
+    session.feed("heard by deepgram", "cloud");
+    session.feed("nobody established", "unknown");
+    expect(det.state.fedWithOrigin).toEqual([
+      ["heard locally", "on-device"],
+      ["heard by deepgram", "cloud"],
+      ["nobody established", "unknown"],
+    ]);
   });
 
   it("shows transcript only once awake", () => {
     const { session, calls, det } = harness();
-    session.feed("nobody asked");
+    session.feed("nobody asked", ON_DEVICE_ORIGIN);
     expect(calls).toEqual([]);
     det.wake("");
-    session.feed("nobody asked");
+    session.feed("nobody asked", ON_DEVICE_ORIGIN);
     expect(calls).toContain("hear:nobody asked");
   });
 

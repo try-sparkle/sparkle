@@ -37,7 +37,14 @@ import {
   type Point,
   type Rect,
 } from "./engine";
-import { deriveFlags, modeMotion, type Anchor, type Mode, type OverlayState } from "./state";
+import {
+  deriveFlags,
+  modeMotion,
+  motionBurst,
+  type Anchor,
+  type Mode,
+  type OverlayState,
+} from "./state";
 import { orbTextMaxWidth, orbTextPosition, presize } from "./presize";
 import { sparkleOverlayEnabled } from "./flag";
 import { FONT_MONO, LABEL, TYPE } from "../../theme/scale";
@@ -246,7 +253,10 @@ function SparkleOverlayInner({
 
   const setSwarmState = (anchor: Anchor, mode: Mode) => {
     stateRef.current = { anchor, mode };
-    burstRef.current = 1; // zip flash on every transition
+    // Zip flash on every transition, decoded from the MOTION so a widened Mode union is a compile
+    // error here rather than a silently under-flashing new beat. The response beat bursts hardest
+    // — see motionBurst.
+    burstRef.current = motionBurst(modeMotion(mode));
     const spawn =
       anchor === "perch"
         ? rectCenter(perchRect())

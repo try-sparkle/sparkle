@@ -467,6 +467,7 @@ mod main_thread_guard {
         "nudger_send_escape",
         "orchestration_respond",
         "orchestrator_mcp_paths",
+        "overlay_tray_sync",
         "plugin_install_outcomes",
         "pr_claim_release",
         "pr_claim_set",

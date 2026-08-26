@@ -40,7 +40,13 @@ cc = "1"
 # rest of the list is verbatim Tauri defaults (`wry`, `common-controls-v6`, `dynamic-acl`, `x11`,
 # `dbus`); `x11`/`dbus` gate Linux-only optional deps and are inert on macOS/Windows, kept for parity.
 # `asset_serving.rs` guards this against a dependency bump silently restoring the default.
-tauri = { version = "2", default-features = false, features = ["wry", "common-controls-v6", "dynamic-acl", "x11", "dbus", "macos-private-api"] }
+# `tray-icon` is NOT a Tauri default; it is added here for the Living Sparkle Overlay's menu-bar
+# presence (overlay_tray.rs, bead sparkle-uz87.9). Enabling the FEATURE only makes `TrayIconBuilder`
+# available to compile — it creates nothing on its own. Tray creation is gated at runtime and fails
+# CLOSED (see `overlay_tray::tray_gate_open`), so with the gate shut the shipped app puts no icon in
+# anyone's menu bar. `tauri.conf.json` deliberately does NOT set `app.trayIcon`, because that key
+# would create one at startup unconditionally and defeat the gate.
+tauri = { version = "2", default-features = false, features = ["wry", "common-controls-v6", "dynamic-acl", "x11", "dbus", "macos-private-api", "tray-icon", "image-png"] }
 tauri-plugin-dialog = "2"
 tauri-plugin-opener = "2"
 tauri-plugin-deep-link = "2"
@@ -100,6 +106,12 @@ tungstenite = { version = "0.24", default-features = false, features = ["rustls-
 bzip2 = "0.4"
 tar = "0.4"
 tauri-plugin-global-shortcut = "2"
+# Launch-at-login registration (bead sparkle-uz87.9). This is the OS half of the opt-in auto-launch
+# preference: on macOS the plugin writes a LaunchAgent, on Windows a Run-key entry. The plugin is
+# registered with `MacosLauncher::LaunchAgent` and, critically, with NO argv-time auto-enable — the
+# ONLY thing that ever registers the app is an explicit user opt-in flowing through
+# `overlay_auto_launch_set`, so installing the app never enrols anyone.
+tauri-plugin-autostart = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"

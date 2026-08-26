@@ -11,8 +11,9 @@
 // (`sparkle-lgbwf`, seen 4x). `defaultSessionDeps()` below is the real wiring, and it has its own
 // test that does NOT inject.
 import {
-  createWakeWordDetector,
-  type WakeWordDetector,
+  createOnDeviceWakeWordDetector,
+  type OnDeviceWakeWordDetector,
+  type TranscriptOrigin,
   type WakeWordEvent,
 } from "../../voice/wakeWord";
 import { routeGenieIntent, type GenieResponse } from "../genie";
@@ -28,8 +29,9 @@ import {
 /** What the session needs from the outside world. All of it is replaceable in a test. */
 export interface SparkleSessionDeps {
   controller: SparkleOverlayController;
-  /** Built lazily so the session owns the detector's lifetime (and can dispose it). */
-  createDetector: (onDetect: (e: WakeWordEvent) => void) => WakeWordDetector;
+  /** Built lazily so the session owns the detector's lifetime (and can dispose it).
+   *  ORIGIN-GATED: only text a local ASR produced can wake it — see `feed` below. */
+  createDetector: (onDetect: (e: WakeWordEvent) => void) => OnDeviceWakeWordDetector;
   route: (transcript: string, at: number) => Promise<GenieResponse>;
   now: () => number;
   /** Surfaced so a caller can act on `response.action`; the overlay itself never does. */
@@ -37,8 +39,23 @@ export interface SparkleSessionDeps {
 }
 
 export interface SparkleSession {
-  /** Feed a transcript chunk from the existing dictation path. */
-  feed(chunk: string): void;
+  /**
+   * Feed a transcript chunk from the existing dictation path, TAGGED with the machine that
+   * produced it.
+   *
+   * `origin` is mandatory, and that is the point rather than an inconvenience. The bead requires
+   * the wake word to listen "without sending audio to the cloud", and this app produces transcript
+   * text two ways: sherpa-onnx in the Rust process (audio never leaves) and Deepgram over a
+   * websocket (raw audio already left before this is ever called). The detector performs no I/O,
+   * so it is structurally unable to tell those apart on its own — the answer has to travel WITH
+   * the text, from the only layer that knows it. A caller who cannot name the origin does not have
+   * the guarantee and must not be able to claim it, so there is no default.
+   *
+   * Note the gate gets the WAKE path, not the transcript: once the user has deliberately woken the
+   * overlay, what they dictate follows the app's ordinary engine choice like any other dictation.
+   * It is the always-on background listening that the privacy promise is about.
+   */
+  feed(chunk: string, origin: TranscriptOrigin): void;
   /** Close the current utterance and ask the genie. */
   endOfSpeech(transcript?: string): void;
   mute(): void;
@@ -55,7 +72,7 @@ export function defaultSessionDeps(
 ): SparkleSessionDeps {
   return {
     controller,
-    createDetector: (onDetect) => createWakeWordDetector({ onDetect }),
+    createDetector: (onDetect) => createOnDeviceWakeWordDetector({ onDetect }),
     route: (transcript, at) => routeGenieIntent({ transcript, at }),
     now: () => Date.now(),
     onAction,
@@ -75,9 +92,24 @@ export function createSparkleSession(deps: SparkleSessionDeps): SparkleSession {
         case "hear":
           void deps.controller.hear(intent.text);
           break;
-        case "reply":
-          void deps.controller.reply(intent.text);
+        case "reply": {
+          // The controller resolves `reply()` when the typing animation ENDS, and that is the
+          // only signal the response beat is over. Discarding it — which this line used to do —
+          // left `responseDone` with no caller anywhere in the app, so a real session parked in
+          // center/speaking forever and the "return to idle" leg of the cycle did not exist
+          // outside the reducer. The generation is captured HERE, at dispatch, because by the
+          // time the promise settles the conversation may be somebody else's.
+          const generation = snap.generation;
+          void deps.controller
+            .reply(intent.text)
+            .then(() => send({ kind: "responseDone", generation }))
+            .catch(() => {
+              // A reply that fails to paint must not strand the swarm either. Guarded so a
+              // stale failure cannot tear down a conversation that has already moved on.
+              if (snap.generation === generation) send({ kind: "error" });
+            });
           break;
+        }
         case "dismiss":
           deps.controller.dismiss();
           break;
@@ -101,11 +133,13 @@ export function createSparkleSession(deps: SparkleSessionDeps): SparkleSession {
   });
 
   return {
-    feed(chunk) {
+    feed(chunk, origin) {
       if (disposed) return;
       // The detector sees EVERY chunk — that is what makes the wake word continuous. Only once
-      // awake does the same chunk also become visible transcript.
-      detector.feed(chunk);
+      // awake does the same chunk also become visible transcript. Cloud-origin chunks are DROPPED
+      // by the gate before they reach the matcher, so they cannot wake the overlay and cannot form
+      // half of a later on-device match.
+      detector.feed(chunk, origin);
       if (snap.state === "listening") send({ kind: "transcript", text: chunk });
     },
 

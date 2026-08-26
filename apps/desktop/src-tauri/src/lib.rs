@@ -777,6 +777,17 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
+        // Launch-at-login registration for the overlay's opt-in auto-launch (bead sparkle-uz87.9).
+        //
+        // REGISTERING THE PLUGIN REGISTERS NOTHING WITH THE OS. It only makes `app.autolaunch()`
+        // available; the LaunchAgent is written exactly when `overlay_auto_launch_set` is called
+        // with `enable: true`, which happens only from an explicit user opt-in flowing through
+        // `overlayTray/autoLaunch.ts`. The second argument is the argv to relaunch with and is
+        // deliberately `None` — this is not a place to smuggle in a "--autostart" behaviour change.
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None,
+        ))
         .manage(PtyManager::default())
         .manage(claude_chat::ClaudeChatManager::default())
         .manage(sparkle_improve::SparkleImproveManager::default())
@@ -1822,6 +1833,13 @@ pub fn run() {
             // Pushes the island's persisted `enabled` back onto the native View menu's label. The
             // flag lives in localStorage, which Rust cannot read — the webview is the authority.
             app_menu::set_helper_menu_state,
+            // The Living Sparkle Overlay's tray presence and launch-at-login (bead sparkle-uz87.9).
+            // `overlay_tray_sync` is the ONLY path to a menu-bar icon in this app and it fails
+            // closed, so with the gate shut these are reachable and inert.
+            overlay_tray::overlay_tray_sync,
+            overlay_tray::overlay_tray_gate_open,
+            overlay_tray::overlay_auto_launch_set,
+            overlay_tray::overlay_auto_launch_is_enabled,
             frontmost::get_frontmost,
             capture_window::show_capture_window,
             capture_window::hide_capture_window,

@@ -26,8 +26,8 @@ export type SessionEvent =
   | { kind: "endOfSpeech"; transcript: string }
   /** An answer came back. `generation` is the one the request was issued under. */
   | { kind: "responseReady"; replyText: string; generation: number }
-  /** The reply finished painting. */
-  | { kind: "responseDone" }
+  /** The reply finished painting. `generation` is the one it was painted under. */
+  | { kind: "responseDone"; generation: number }
   /** The user dismissed the overlay, or clicked away. */
   | { kind: "dismiss" }
   /** Anything went wrong — the overlay must never be stranded mid-cycle. */
@@ -140,6 +140,12 @@ export function transition(snap: SessionSnapshot, ev: SessionEvent): TransitionR
     }
 
     case "responseDone": {
+      // THE SAME LOSING INTERLEAVING AS `responseReady`, and the state check alone does NOT
+      // cover it. After a dismiss the machine is idle, so a late completion is harmlessly
+      // ignored below. But dismiss -> wake -> ask again puts it back in `responding` under a
+      // NEW generation: the OLD reply's typing then finishes and, ungenerationed, would send
+      // somebody else's answer home mid-sentence.
+      if (ev.generation !== snap.generation) return { next: snap, intents: [] };
       if (snap.state !== "responding") return { next: snap, intents: [] };
       return goHome(snap);
     }

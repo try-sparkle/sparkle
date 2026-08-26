@@ -11,7 +11,7 @@
 // So every assertion below is comparative. `expect(swirl).not.toBe(rest)` is the real assertion;
 // `expect(rest).toBe(0.45)` is what stops the fix for (1) from being "make everything swirl".
 import { describe, expect, it } from "vitest";
-import { deriveFlags, modeMotion, type Mode } from "./state";
+import { deriveFlags, modeMotion, type Mode, motionBurst } from "./state";
 import { perchWave, shellPulse, twinkleRate } from "./engine";
 
 const MODES: Mode[] = ["still", "listening", "processing", "speaking"];
@@ -119,6 +119,31 @@ describe("deriveFlags with the widened union", () => {
       expect(deriveFlags("card", mode).cardInfused).toBe(true);
       expect(deriveFlags("row", mode).rowInfused).toBe(true);
       expect(deriveFlags("perch", mode).homeAway).toBe(false);
+    }
+  });
+});
+
+describe("the response burst is its own beat", () => {
+  it("bursts HARDEST on the response, and every other motion equally below it", () => {
+    // The bead lists "response burst" as a distinct beat. A single shared magnitude on every
+    // transition makes the answer arriving look identical to the overlay opening — so the
+    // property worth pinning is the ORDERING, not the number.
+    const response = motionBurst("pulse");
+    const others = (["rest", "ripple", "swirl"] as const).map(motionBurst);
+    for (const other of others) expect(response).toBeGreaterThan(other);
+    // PAIRED: the others are each other's equals, so the assertion above is about the response
+    // beat specifically and not merely about some arbitrary ranking of all four.
+    expect(new Set(others).size).toBe(1);
+  });
+
+  it("decodes every motion the union can express", () => {
+    // TypeScript cannot enumerate a union at runtime, so counting variants would be a tautology.
+    // What IS checkable: no motion returns a non-finite or non-positive flash, which is what a
+    // fall-through into an unhandled case would produce.
+    for (const motion of ["rest", "ripple", "swirl", "pulse"] as const) {
+      const v = motionBurst(motion);
+      expect(Number.isFinite(v)).toBe(true);
+      expect(v).toBeGreaterThan(0);
     }
   });
 });

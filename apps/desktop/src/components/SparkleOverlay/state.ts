@@ -71,6 +71,41 @@ export function modeMotion(mode: Mode): ModeMotion {
   }
 }
 
+/**
+ * How hard the swarm flashes when it ENTERS a motion — the "zip flash" magnitude.
+ *
+ * WHY THIS IS A FUNCTION AND NOT A CONSTANT. The bead names five beats, and one of them is a
+ * "response burst": idle drift -> listening pulse -> processing swirl -> RESPONSE BURST -> return
+ * to idle. With one shared magnitude on every transition, the answer landing flashes exactly as
+ * hard as the overlay opening, so the beat the bead singles out is not distinguishable from the
+ * four around it.
+ *
+ * It is keyed on the MOTION, not on the mode literal, for the same reason `modeMotion` exists: a
+ * `mode === "speaking"` test silently stops covering the moment the union grows, and this union
+ * has already grown once (`processing` was added for sparkle-uz87.7). Decoding it here keeps the
+ * `never` guard as the single tie between the union and everything downstream.
+ *
+ * A caveat worth stating rather than burying: the RATIO below is a judgement call that nobody has
+ * been able to LOOK at. The overlay is unmounted and flag-off, and jsdom has no canvas, so the
+ * flash itself is not observable in a test — what is pinned is the ordering property (the response
+ * beat bursts hardest), not that this particular number looks right on screen.
+ */
+export function motionBurst(motion: ModeMotion): number {
+  switch (motion) {
+    case "pulse":
+      // The reply landing — the beat the bead calls the "response burst".
+      return 1.6;
+    case "rest":
+    case "ripple":
+    case "swirl":
+      return 1;
+    default: {
+      const _exhaustive: never = motion;
+      return _exhaustive;
+    }
+  }
+}
+
 export function deriveFlags(anchor: Anchor, mode: Mode): DerivedFlags {
   return {
     dimmed: anchor === "center",

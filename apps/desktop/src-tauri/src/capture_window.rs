@@ -1,7 +1,7 @@
 //! The hidden `capture` window — a transparent, borderless, always-on-top takeover that
 //! renders the voice-narrated screenshot modal (React app at `?view=capture`).
 //!
-//! Created once at startup (mirroring the tray popover in tray.rs) and only ever
+//! Created once at startup and only ever
 //! shown/hidden. `show_capture_window` sizes + positions it to fill the monitor the
 //! cursor is on, shows + focuses it, then hands the shot to the webview over the
 //! `capture://shot` event. Transparency requires the `macos-private-api` tauri feature
@@ -62,7 +62,7 @@ pub struct CaptureShot {
     pub data_url: String,
 }
 
-/// Create the hidden capture window. Called once in setup, after `init_tray`.
+/// Create the hidden capture window. Called once from `lib.rs`'s `setup`.
 pub fn init_capture_window(app: &AppHandle) -> tauri::Result<()> {
     let win = WebviewWindowBuilder::new(
         app,
