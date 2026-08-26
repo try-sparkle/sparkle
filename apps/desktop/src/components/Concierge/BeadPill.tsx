@@ -701,6 +701,23 @@ export const DESC_MAX_H = 180;
 const noBoardSentence = (beadId: string) => `${beadId} is not on an open board.`;
 
 /**
+ * …and what it says when the EPICS COLUMN could not be opened.
+ *
+ * ══ A SECOND SENTENCE, BECAUSE THERE IS NOW A SECOND DESTINATION ═════════════════════════════
+ * `sparkle-huw924.12` sent the `Tasks:` pills to the Epics column instead of the board, and a miss
+ * on that path would otherwise have reported *"… is not on an open board"* — a sentence about a
+ * surface the click was no longer even trying to reach. AGENTS.md's rule, and it is the one that
+ * bit here: a fix that changes WHERE something happens must update every message that described
+ * the old destination, or the fix merely RELOCATES the bug into the copy.
+ *
+ * It is also a REMEDY the reader will act on, so it has to be true under the same conditions that
+ * produced it: both misses mean "that project is not open here", so both sentences say the same
+ * kind of thing about a different surface rather than sending the reader somewhere that would fail
+ * for the identical reason.
+ */
+const noColumnSentence = (beadId: string) => `${beadId} has no open project column.`;
+
+/**
  * One bead reference.
  *
  * `beadId` is what the linkifier found (or what an explicit `sparkle-bead:` reference carried). The
@@ -744,11 +761,21 @@ export function BeadPill({ beadId }: { beadId: string }) {
   // `true` on an already-`true` state is an identical-value update, React bails out, and the
   // reader's retry click paints and announces nothing.
   //
-  // THE ID IS NEW, and it is not decoration. The card can now open a DIFFERENT bead than its own —
-  // the `Tasks:` row's pills go through the same board handoff — so a sentence hard-coded to this
-  // card's id would name the wrong bead the moment a child failed to open. `noBoardSentence` is the
-  // one sentence either miss produces; only its subject changes.
-  const [miss, setMiss] = useState<{ id: string; n: number }>({ id: "", n: 0 });
+  // THE ID IS NEW, and it is not decoration. The card can open a DIFFERENT bead than its own — the
+  // `Tasks:` row's pills carry their own target — so a sentence hard-coded to this card's id would
+  // name the wrong bead the moment a child failed to open.
+  //
+  // AND SO IS `where`, FOR THE SAME CLASS OF REASON. There are now TWO destinations reachable from
+  // one card: the card's own `Board view` link still goes to the Plan board, while a `Tasks:` pill
+  // goes to the Epics column (`sparkle-huw924.12`). A single sentence can no longer describe both
+  // misses truthfully, so the miss records which surface was actually attempted and the sentence is
+  // chosen from it. Without this the column path would report "not on an open board" — a sentence
+  // about a surface that click never tried to reach.
+  const [miss, setMiss] = useState<{ id: string; n: number; where: "board" | "column" }>({
+    id: "",
+    n: 0,
+    where: "board",
+  });
   const cardId = useId();
   const anchorRef = useRef<HTMLButtonElement>(null);
 
@@ -896,7 +923,13 @@ export function BeadPill({ beadId }: { beadId: string }) {
           collapsed={!expanded}
           onToggleCollapsed={() => setExpanded((v) => !v)}
           onClose={() => setExpanded(false)}
-          notice={miss.n > 0 ? noBoardSentence(miss.id) : undefined}
+          notice={
+            miss.n > 0
+              ? miss.where === "board"
+                ? noBoardSentence(miss.id)
+                : noColumnSentence(miss.id)
+              : undefined
+          }
           noticeKey={miss.n}
           onOpenAgent={onOpenAgent}
           // THE NAVIGATION RUNS IN THE HANDLER, NEVER INSIDE THE UPDATER.
@@ -917,12 +950,76 @@ export function BeadPill({ beadId }: { beadId: string }) {
           // `Tasks:` row asks for a child's. Both are the same handoff to the same board, so they
           // share one function rather than growing a second copy that can drift about what a miss
           // means or which project answers for the id.
+          // ══ A `Tasks:` PILL GOES TO THE EPICS COLUMN, NOT TO THE BOARD ═════════════════════
+          // The founder, 2026-08-25 (`sparkle-huw924.12`): *"when I click on a task from the
+          // concierge window, I want it to by default open up in the epic column. I want it to
+          // open the epic that is its parent. And then I want it to open up the build agents that
+          // are assigned to that task. So I can basically get a filtered view of the build agents
+          // that are assigned to the tasks that live in the epic."*
+          //
+          // THIS IS A REWIRING, NOT A FEATURE. All three behaviours he asked for already existed
+          // and already worked; they simply hung off the wrong control. `viewInColumn` →
+          // `openBeadFocus` stamps a reveal request, `EpicsColumn` consumes it through
+          // `revealFor` → `focusEpicWithChild` (opens the PARENT epic without clearing the child,
+          // un-collapses its stage, scrolls to the task pill and flashes it), and `AgentSidebar`
+          // narrows the Build column via `agentIdsInEpic`. Parent epic, task revealed inside it,
+          // agents filtered to that task — his three asks, already built.
+          //
+          // WHAT IT USED TO DO, AND WHY IT WAS THE EXACT OPPOSITE OF THE ASK: this handler was
+          // `onViewOnBoard`, which opens the Plan board — and the board is an `inset: 0` sibling
+          // that COVERS the Epics column (`Workspace.tsx`, `covered={leftBoardActive}`). So the
+          // one gesture he wanted to REVEAL the column was the gesture that hid it.
+          //
+          // THE SIBLING SURFACE WAS CONVERTED LONG AGO AND THIS COPY WAS MISSED — that is the
+          // whole bug. `EpicInlineCard` wires the identical pill to `focusChildTaskInColumn`, with
+          // his ask quoted verbatim above it. Only the concierge kept the board handoff.
+          //
+          // ══ `isEpic: false`, AND IT IS NOT AN ASSUMPTION ABOUT THE TARGET ═══════════════════
+          // It selects the SETTER — `openBeadFocus` rather than `openEpicFocus` — and
+          // `openBeadFocus` is the one that stamps the reveal. The reveal is what this call site
+          // needs from a cold start: `focusChildTaskInColumn` can use the toggling `setBeadFocus`
+          // with no reveal because it fires on a row INSIDE an already-open epic, whereas from the
+          // concierge the epic is not open yet and nothing would open it.
+          //
+          // The RUNG of the target is then answered by `revealFor`, which is the shared resolver
+          // and handles all three shapes — a task under an epic, a bead that IS an epic (the
+          // parent chip's target), and a parentless task, which reveals as its own row. So this
+          // line is not claiming the target is a task; it is choosing the setter that lets the
+          // resolver decide. Re-deriving epic-ness here instead would be the extra definition
+          // `epic-membership-guard.sh` fails CI on.
           onOpenBead={
-            onViewOnBoard === undefined
+            onViewInColumn === undefined
               ? undefined
               : (targetId: string) => {
-                  const landed = onViewOnBoard({ beadId: targetId, projectId: resolved.projectId });
-                  setMiss((m) => (landed ? { id: "", n: 0 } : { id: targetId, n: m.n + 1 }));
+                  const landed = onViewInColumn({
+                    beadId: targetId,
+                    projectId: resolved.projectId,
+                    isEpic: false,
+                  });
+                  setMiss((m) =>
+                    landed
+                      ? { id: "", n: 0, where: "column" }
+                      : { id: targetId, n: m.n + 1, where: "column" },
+                  );
+                }
+          }
+          // ══ THE CARD'S OWN `Board view` LINK KEEPS THE BOARD — THAT IS THE WHOLE ESCAPE HATCH ═
+          // Split out of `onOpenBead` above, which used to serve BOTH (the file called it "ONE
+          // OPENER, TWO CALLERS"). Rewiring that shared handler wholesale would have taken the
+          // board away from this link too — and asked directly whether the concierge should keep a
+          // route to a task's board card, the founder chose to let the pill always open the Epics
+          // column *because* the card's own `Board view` link still goes to the board. That answer
+          // is only true if these two are separate handlers, so they are.
+          onViewOnBoardSelf={
+            onViewOnBoard === undefined
+              ? undefined
+              : () => {
+                  const landed = onViewOnBoard({ beadId: bead.id, projectId: resolved.projectId });
+                  setMiss((m) =>
+                    landed
+                      ? { id: "", n: 0, where: "board" }
+                      : { id: bead.id, n: m.n + 1, where: "board" },
+                  );
                 }
           }
           // THE SAME SHAPE, AND THE SAME WARNING APPLIES — the navigation runs in the handler, the
@@ -942,9 +1039,14 @@ export function BeadPill({ beadId }: { beadId: string }) {
                     projectId: resolved.projectId,
                     isEpic,
                   });
-                      // Miss state is keyed BY BEAD on this branch, not a bare counter, so the
-                      // sentence it drives can name the bead that missed.
-                      setMiss((m) => (landed ? { id: "", n: 0 } : { id: bead.id, n: m.n + 1 }));
+                  // Miss state is keyed BY BEAD on this branch, not a bare counter, so the
+                  // sentence it drives can name the bead that missed — and by DESTINATION, so it
+                  // says "no open project column" rather than borrowing the board's sentence.
+                  setMiss((m) =>
+                    landed
+                      ? { id: "", n: 0, where: "column" }
+                      : { id: bead.id, n: m.n + 1, where: "column" },
+                  );
                 }
           }
         />
@@ -983,6 +1085,7 @@ function ConciergeBeadCard({
   collapsed,
   onToggleCollapsed,
   onOpenBead,
+  onViewOnBoardSelf,
   onOpenAgent,
   onViewInColumn,
   onClose,
@@ -998,7 +1101,20 @@ function ConciergeBeadCard({
   /** Open a bead on the board — this card's own, from "View on board", or a child's, from a pill on
    *  the `Tasks:` row. Absent when the surface has no board to open, which makes both a missing
    *  SECOND step rather than a dead end: the card itself was already the result of the click. */
+  /**
+   * Open ANOTHER bead — a `Tasks:` pill's target, or the parent-epic chip's — in the EPICS COLUMN.
+   *
+   * ══ IT IS NOT THIS CARD'S OWN DESTINATION ═══════════════════════════════════════════════════
+   * This used to serve the card's own `Board view` link as well, and the two have been split
+   * ({@link onViewOnBoardSelf}). They point at different surfaces now, so one callback could not
+   * honestly do both: `sparkle-huw924.12` sends a task pill to the Epics column while the card's
+   * own link still goes to the Plan board.
+   */
   onOpenBead?: (beadId: string) => void;
+  /** THIS card's own `Board view` link. Separate from {@link onOpenBead} because the two
+   *  destinations diverged — see that field. Absence means this surface has no board to offer, the
+   *  same callback-is-the-switch rule every other affordance here follows. */
+  onViewOnBoardSelf?: () => void;
   /** Jump to a build agent on the `Build agents:` row. Absent on a surface with no reveal path. */
   onOpenAgent?: (target: { agentId: string; projectId: string }) => void;
   /** Absent when the surface has no build column to narrow. Passed through to the card ONLY for an
@@ -1136,7 +1252,14 @@ function ConciergeBeadCard({
             }
           : undefined
       }
-      onViewOnBoard={onOpenBead === undefined ? undefined : () => onOpenBead(bead.id)}
+      // ══ THIS CARD'S OWN BOARD LINK — ITS OWN CALLBACK, NOT THE LINEAGE ONE ═══════════════════
+      // It used to be `() => onOpenBead(bead.id)`, back when `onOpenBead` meant "open a bead on the
+      // board" for every target this card could name. `sparkle-huw924.12` pointed the lineage
+      // targets at the Epics column, and this link stayed on the board — so the two stopped being
+      // the same handoff and stopped sharing a callback. Reusing `onOpenBead` here now would send
+      // the card's own `Board view` link to the COLUMN, silently removing the board escape hatch
+      // the founder's answer explicitly relies on.
+      onViewOnBoard={onViewOnBoardSelf}
       // ══ NO CLOSE AFFORDANCE ON A COLLAPSED CARD (roborev job 68044) ══════════════════════════
       // `BeadCard` draws its `×` on the presence of this callback and nowhere else, so an ABSENT
       // `onClose` is how a surface says "this card has no dismiss" — the same callback-is-the-switch

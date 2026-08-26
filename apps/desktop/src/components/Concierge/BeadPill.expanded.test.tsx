@@ -144,6 +144,11 @@ function ctx(beads: Bead[], over: Partial<BeadPillContextValue> = {}): BeadPillC
   return {
     beads: new Map(beads.map((b) => [b.id, { bead: b, projectId: "p1", rootPath: "/repo" }])),
     onViewOnBoard: vi.fn(() => true),
+    // SUPPLIED BY DEFAULT, because it is now what makes a `Tasks:` pill a LINK at all
+    // (`sparkle-huw924.12` moved that path off the board and onto the Epics column). Callback-is-
+    // the-switch: without it the pills render as static text, and a row asserting "clicking a pill
+    // does not collapse the card" would be asserting it about something that is not clickable.
+    onViewInColumn: vi.fn(() => true),
     onOpenAgent: vi.fn(),
     ...over,
   };
@@ -476,14 +481,51 @@ describe("the two lineage rows, resolved from the live stores", () => {
     expect(taskPills.map((p) => p.textContent)).toEqual(["Kid A", "Kid B"]);
   });
 
+  // ══ A TASK PILL OPENS THE EPICS COLUMN, NOT THE BOARD (bead `sparkle-huw924.12`) ═════════════
+  // The founder: *"when I click on a task from the concierge window, I want it to by default open
+  // up in the epic column. I want it to open the epic that is its parent. And then I want it to
+  // open up the build agents that are assigned to that task."*
+  //
+  // THIS ROW USED TO ASSERT `onViewOnBoard`, and that was the bug rather than the contract: the
+  // Plan board is an `inset: 0` sibling that COVERS the Epics column, so the gesture meant to
+  // reveal the column was the one that hid it.
+  //
   // REAL LINKS, not decoration — and the id it carries is the CHILD's, which is the thing a
-  // hard-coded `bead.id` would get wrong while still looking like it worked.
-  it("jumps to the CHILD's bead when its pill is clicked", () => {
+  // hard-coded `bead.id` would get wrong while still looking like it worked. `KID_B` (index 1) on
+  // purpose, for exactly that reason.
+  it("opens the CHILD's bead in the epics column when its pill is clicked", () => {
+    const onViewInColumn = vi.fn(() => true);
     const onViewOnBoard = vi.fn(() => true);
     seedStores([EPIC, KID_A, KID_B]);
-    mountReply(ctx([EPIC, KID_A, KID_B], { onViewOnBoard }), "see sparkle-epic1");
+    mountReply(ctx([EPIC, KID_A, KID_B], { onViewInColumn, onViewOnBoard }), "see sparkle-epic1");
     fireEvent.click(screen.getAllByTestId("concierge-bead-card-tasks-pill")[1]!);
-    expect(onViewOnBoard).toHaveBeenCalledWith({ beadId: "sparkle-kidb2", projectId: "p1" });
+    expect(onViewInColumn).toHaveBeenCalledWith({
+      beadId: "sparkle-kidb2",
+      projectId: "p1",
+      // The SETTER, not a claim about the target's rung: `openBeadFocus` is the one that stamps a
+      // reveal, and `revealFor` then resolves the target to its parent epic. See the call site.
+      isEpic: false,
+    });
+    // BOTH HALVES, or this passes for a card that opens the column AND the board — which would put
+    // the board overlay straight back on top of the column it just revealed.
+    expect(onViewOnBoard).not.toHaveBeenCalled();
+  });
+
+  // ══ AND THE CARD'S OWN `Board view` LINK STILL GOES TO THE BOARD ══════════════════════════════
+  // The pair that makes the row above safe. Asked whether the concierge should keep any route from
+  // a task to its board card, the founder chose to let the pill always open the Epics column
+  // BECAUSE this link still exists — so "the pill went to the column" is only half the contract,
+  // and a rewiring that took both would have satisfied the row above while removing the escape
+  // hatch his answer depends on. They are separate handlers now precisely so this can be asserted.
+  it("keeps this card's own Board view link on the board", () => {
+    const onViewInColumn = vi.fn(() => true);
+    const onViewOnBoard = vi.fn(() => true);
+    seedStores([EPIC, KID_A, KID_B]);
+    mountReply(ctx([EPIC, KID_A, KID_B], { onViewInColumn, onViewOnBoard }), "see sparkle-epic1");
+    fireEvent.click(screen.getByTestId("concierge-bead-card-open-on-board"));
+    expect(onViewOnBoard).toHaveBeenCalledWith({ beadId: "sparkle-epic1", projectId: "p1" });
+    // It is THIS card's own bead, and it did NOT leak into the column path.
+    expect(onViewInColumn).not.toHaveBeenCalled();
   });
 
   it("draws the build agents on the children, and jumps to one on a click", () => {

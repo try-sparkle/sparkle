@@ -536,9 +536,20 @@ export function BeadCard({
   // card) at `TYPE.title`, untouched. The column's 1.3× `zoom` is a separate, founder-owned setting
   // and is NOT touched here — it scales title and row together, so matching the row size holds at
   // any zoom.
+  // ══ `semibold`, NOT `bold` — 600 IS THIS DESIGN SYSTEM'S BOLD ═══════════════════════════════
+  // `FONT_WEIGHT.bold` is the raw CSS 700 from `packages/ui/tokens.ts`, and the Blueprint scale
+  // does not have a 700: `theme/scale.ts` says it in as many words — *"The spec uses exactly two
+  // above regular, and `bold` is 600 — not 700"* — and `design-tokens.json` carries `--w-bold:
+  // 600`, extracted from the signed-off spec rather than chosen here. `FONT_WEIGHT.semibold` IS
+  // 600, so this is the token that spells the founder's *"should just be bold"* on-scale.
+  //
+  // It also keeps the title's weight IDENTICAL to `TITLE_STYLE`'s, which is what makes the change
+  // honest: the only thing this branch alters is the SIZE. The title stands apart from its row
+  // because the row inherits regular and states no weight at all, not because the title reaches
+  // for a heavier one — which is precisely *"the same size as the row… should just be bold"*.
   const titleStyle: CSSProperties =
     chrome === "epics"
-      ? { ...TITLE_STYLE, fontSize: TYPE.micro, fontWeight: FONT_WEIGHT.bold }
+      ? { ...TITLE_STYLE, fontSize: TYPE.micro, fontWeight: FONT_WEIGHT.semibold }
       : TITLE_STYLE;
 
   // ── THE PRIORITY WRITE ────────────────────────────────────────────────────────────────────────

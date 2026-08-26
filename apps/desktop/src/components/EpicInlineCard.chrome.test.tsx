@@ -16,7 +16,7 @@
 // mounts the wrapper the column mounts and counts what the founder would actually see.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { TYPE } from "../theme/scale";
+import { TYPE, WEIGHT } from "../theme/scale";
 import { FONT_WEIGHT } from "../theme/colors";
 
 // The Tauri boundary is the only thing stubbed — the same line `EpicInlineCard.goal.test.tsx` takes.
@@ -240,9 +240,21 @@ describe("the epics-column title is the row's size and bold only (sparkle-huw924
     // It WAS TYPE.title (17px). Spelling that out is what makes this about the CHANGE rather than
     // about whatever the current value happens to be.
     expect(title.style.fontSize).not.toBe(`${TYPE.title}px`);
-    // BOLD, not the semibold the section title used.
-    expect(title.style.fontWeight).toBe(String(FONT_WEIGHT.bold));
-    expect(title.style.fontWeight).not.toBe(String(FONT_WEIGHT.semibold));
+    // ══ BOLD IS 600 HERE, AND `FONT_WEIGHT.semibold` IS THE TOKEN THAT SPELLS IT ══════════════
+    // This row used to assert `FONT_WEIGHT.bold` — the raw CSS 700 out of `packages/ui/tokens.ts`
+    // — and the Blueprint scale has no 700 in it. `theme/scale.ts` states the rule outright: *"The
+    // spec uses exactly two above regular, and `bold` is 600 — not 700"*, and `design-tokens.json`
+    // carries `--w-bold: 600`, extracted from the signed-off spec rather than picked by hand. So
+    // 700 was off-scale on a founder-facing surface, and the fix is the TOKEN, not the number.
+    expect(title.style.fontWeight).toBe(String(FONT_WEIGHT.semibold));
+    // …and `semibold` really is the spec's bold, so this row is not quietly asserting "not bold".
+    // Pinned against the extracted token, so a retune of the spec reaches this test rather than
+    // leaving it asserting a stale constant.
+    expect(String(FONT_WEIGHT.semibold)).toBe(String(WEIGHT.bold));
+    // THE WEIGHT IS UNCHANGED FROM THE SECTION TITLE, WHICH IS THE POINT OF THE ASK. Only the SIZE
+    // moved: *"the same size as the row… should just be bold."* The title stands apart because the
+    // row inherits regular and states no weight, not because the title reaches for a heavier face.
+    expect(title.style.fontWeight).not.toBe(String(FONT_WEIGHT.bold));
   });
 
   // THE PAIR — the SAME title element on the SAME bead, but `chrome="board"`, is untouched: *"You

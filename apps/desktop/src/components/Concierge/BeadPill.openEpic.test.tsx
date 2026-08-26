@@ -36,6 +36,7 @@ import { useBeadsStore } from "../../stores/beadsStore";
 import { focusedBeadIdForSide, useUiStore } from "../../stores/uiStore";
 import { useProjectStore } from "../../stores/projectStore";
 import type { Bead } from "../../services/beads";
+import { revealFor } from "../../engine/epicReveal";
 
 afterEach(() => cleanup());
 
@@ -234,6 +235,67 @@ describe("viewInColumn — the two writes, and why one is not enough", () => {
     realHost(DECLARED.id);
     fireEvent.click(inColumn()!);
     expect(useUiStore.getState().epicFocusBySide.right).toBe(DECLARED.id);
+  });
+
+  // ══ CLICKING A `Tasks:` PILL FROM THE CONCIERGE — THE FOUNDER'S THREE ASKS, END TO END ═══════
+  // `sparkle-huw924.12`, his words: *"when I click on a task from the concierge window, I want it
+  // to by default open up in the epic column. I want it to open the epic that is its parent. And
+  // then I want it to open up the build agents that are assigned to that task."*
+  //
+  // THROUGH THE REAL HOST, for the reason `realHost` documents at length: the rewiring is one line
+  // in `BeadPillHost`'s provider value, and a test supplying its own `onViewInColumn` asserts its
+  // own copy while leaving that line covered by nothing. `BeadPill.expanded.test.tsx` pins the
+  // ARGUMENTS this card hands over; these rows pin what actually reaches the STORE.
+  //
+  // `STRUCTURAL` is the fixture on purpose — a structural epic with one child, so its card really
+  // draws a `Tasks:` row and the child really has a parent to be revealed inside.
+  it("writes the TASK's own focus when its pill is clicked, not the card's", () => {
+    realHost(STRUCTURAL.id);
+    fireEvent.click(screen.getAllByTestId("concierge-bead-card-tasks-pill")[0]!);
+
+    const ui = useUiStore.getState();
+    // THE CHILD, which is the thing a handler hard-coded to the card's own bead would get wrong
+    // while still looking like it worked.
+    expect(ui.beadFocusBySide.right).toBe(STRUCTURAL_CHILD.id);
+    // `focusedBeadIdForSide` is `child ?? epic`, and it is what `AgentSidebar` feeds to
+    // `agentIdsInEpic` — so THIS is the value that narrows the Build column to the agents on this
+    // task. His third ask, asserted at the seam that actually decides it rather than by counting
+    // pills in a column this suite does not mount.
+    expect(focusedBeadIdForSide(ui, "right")).toBe(STRUCTURAL_CHILD.id);
+  });
+
+  // ══ THE REVEAL STAMP — WITHOUT IT THE EPIC NEVER OPENS ═══════════════════════════════════════
+  // This is the half that separates `openBeadFocus` from the toggling `setBeadFocus` the epic
+  // card's own rows use, and it is the reason the call site cannot simply copy `EpicInlineCard`:
+  // that surface fires on a row INSIDE an already-open epic, whereas from the concierge the epic
+  // is closed and nothing else would open it. `EpicsColumn` consumes this event through
+  // `revealFor` → `focusEpicWithChild`, which is what opens the PARENT — his second ask.
+  it("stamps a reveal request for the task, so the column opens its parent epic", () => {
+    realHost(STRUCTURAL.id);
+    fireEvent.click(screen.getAllByTestId("concierge-bead-card-tasks-pill")[0]!);
+
+    const reveal = useUiStore.getState().columnRevealBySide.right;
+    expect(reveal?.beadId).toBe(STRUCTURAL_CHILD.id);
+    // …and the resolver really does route that id to the PARENT's card rather than to a row of its
+    // own. Asserted through `revealFor` — the shared resolver the column itself calls — so this
+    // row cannot pass while the column would do something different with the same event.
+    expect(revealFor(ALL, STRUCTURAL_CHILD.id)).toEqual({
+      kind: "child",
+      epicId: STRUCTURAL.id,
+      childId: STRUCTURAL_CHILD.id,
+    });
+  });
+
+  // THE MODE WRITE, on the task path too. The board is an `inset: 0` sibling that COVERS the Epics
+  // column, so a click that narrowed the column without leaving the board would reveal the epic
+  // UNDERNEATH the very overlay the founder was complaining about. Asserted by its EFFECT, like
+  // its sibling row below, not by spying on `showBuildStage`.
+  it("leaves the Plan board, so the Epics column is not still covered", () => {
+    useUiStore.setState({ workModeBySide: { left: "build", right: "plan" } } as never);
+    realHost(STRUCTURAL.id);
+    fireEvent.click(screen.getAllByTestId("concierge-bead-card-tasks-pill")[0]!);
+
+    expect(useUiStore.getState().workModeBySide.right).toBe("build");
   });
 
   // THE WRITE THAT IS EASY TO OMIT AND IMPOSSIBLE TO SEE. Asserted by its EFFECT on the mode, not
