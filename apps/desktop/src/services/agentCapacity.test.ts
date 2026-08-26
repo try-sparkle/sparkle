@@ -190,6 +190,67 @@ describe("localAgentCapacity — narrowed by the live CPU run queue", () => {
     expect(cap.basis).toBe(THROTTLE_BASIS); // and the run queue still explains the ceiling
   });
 
+  it("keeps the MEMORY ceiling while the run queue is throttling — `bound` is not a partition", async () => {
+    // ── THE REGRESSION THE THROTTLE PATH INTRODUCED (roborev, High) ───────────────────────────
+    //
+    // `bound === "load"` does NOT mean memory declined to narrow. Rust's `load_binds` is true
+    // whenever the run queue has an opinion and memory is not already holding at or below it, so
+    // this branch is reached with a REAL RAM-derived ceiling in hand — and `effective` is the min of
+    // the two, which cannot be decomposed back. A branch that computes its own ceiling from headroom
+    // alone has silently dropped the memory one, re-opening the jetsam path the sampler exists to
+    // close.
+    //
+    // The numbers are the reviewed failure: memory admits 6, the fleet holds 10 rows / 3 resident,
+    // and the queue is merely throttling. Without the memory clamp `limit` is `used + 1 = 11` and
+    // the gate admits; RAM said room for 6.
+    seedDormant(10, 3);
+    await sample({
+      effective: 4, // min(memory 6, load 3+1)
+      load_headroom: 1,
+      memory_admitted: 6, // ← what RAM alone allows
+      memory_basis: MEMORY_BASIS, // ← and the sentence that goes with it
+      bound: "load",
+      basis: THROTTLE_BASIS,
+      sample: null,
+      sampled: true,
+    });
+
+    const cap = localAgentCapacity();
+    expect(cap.limit).toBe(6); // the memory ceiling, not `used + headroom` (11) and not the static 12
+    expect(cap.atCapacity).toBe(true); // 10 rows against a RAM ceiling of 6
+    // …AND IT NAMES THE TERM THAT BOUND (roborev, High). The reading is attributed to the queue —
+    // Rust only sets `bound = load` when the queue's ceiling is below memory's — but the two arrive
+    // here in different denominations, so memory is what produced `limit`. Quoting the run queue
+    // would tell a human to wait for it to drain while RAM is the constraint: an instruction they
+    // can follow forever without effect.
+    expect(cap.basis).toBe(MEMORY_BASIS);
+    expect(cap.basis).not.toBe(THROTTLE_BASIS);
+  });
+
+  it("does NOT clamp to memory when memory is not narrowing — the throttle still admits", async () => {
+    // THE PAIRED CASE. Without it the test above passes for a gate that simply always refuses on a
+    // load reading, which is the latch this whole change removed. Identical in every respect except
+    // that `memory_admitted` is the static ceiling, i.e. RAM had no opinion.
+    seedDormant(5, 3);
+    await sample({
+      effective: 4,
+      load_headroom: 1,
+      memory_admitted: STATIC_LIMIT, // ← memory did not narrow
+      memory_basis: MEMORY_BASIS, // present but must NOT be quoted: memory is not what bound
+      bound: "load",
+      basis: THROTTLE_BASIS,
+      sample: null,
+      sampled: true,
+    });
+
+    const cap = localAgentCapacity();
+    expect(cap.limit).toBe(6); // used(5) + headroom(1); the memory clamp is a no-op here
+    expect(cap.atCapacity).toBe(false); // ← still admits, so the clamp did not become a latch
+    // THE PAIRED ATTRIBUTION. Memory did not bind, so the run queue keeps the sentence — without
+    // this, a gate that ALWAYS preferred the memory basis would pass the assertion above.
+    expect(cap.basis).toBe(THROTTLE_BASIS);
+  });
+
   it("REFUSES on the same fleet when the run queue is at its hard stop", async () => {
     // THE PAIRED CASE, and the reason the test above is not "the gate stopped gating". Identical
     // fleet, identical population split; the only difference is that the reading grants no headroom

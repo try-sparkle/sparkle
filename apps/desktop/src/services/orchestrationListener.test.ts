@@ -761,6 +761,44 @@ describe("orchestrationListener", () => {
     expect(spawnWorkerMock).toHaveBeenCalledTimes(4); // the held t2 released, plus t3
   });
 
+  it("keeps the MEMORY ceiling on the THROTTLE path — a load-attributed reading can still be RAM-bound", async () => {
+    // The same regression on the spawn gate (roborev, High). The throttle branch returned
+    // `globalUsedSlots() >= staticCap`, so with `bound === "load"` the fleet could grow to the
+    // static ceiling while available RAM allowed a handful. `bound` is not a partition: a reading
+    // attributed to the queue can carry a live RAM-derived `memory_admitted`.
+    //
+    // A roomy static cap of 20 with a memory ceiling of 1 — so the two numbers cannot be confused,
+    // and only the memory clamp can produce the refusal.
+    useSettingsStore.setState({ maxConcurrentWorkers: 20, effectiveMaxConcurrentWorkers: 20 });
+
+    admissionReading = null;
+    fire({ reqId: "m0", op: "spawn_worker", buildAgentId: buildId, projectId, payload: { task: "ok" } });
+    await flush();
+    expect(spawnWorkerMock).toHaveBeenCalledTimes(1); // one worker live, well under the static 20
+
+    admissionReading = {
+      effective: 1,
+      load_headroom: 1, // throttling, NOT the hard stop — the branch under test
+      memory_admitted: 1, // ← RAM allows one
+      static_max: 20,
+      static_bound: "cpu",
+      bound: "load",
+      basis: "throttled: the CPU run queue is 47.0 deep across 18 cores (2.6× per core…)",
+      sampled: true,
+      sample: null,
+    };
+    invokeMock.mockClear();
+    fire({ reqId: "m1", op: "spawn_worker", buildAgentId: buildId, projectId, payload: { task: "no" } });
+    await flush();
+    expect(spawnWorkerMock).toHaveBeenCalledTimes(1); // held by MEMORY, on a throttling reading
+
+    // PAIRED: the identical reading with memory not narrowing admits, so the clamp is not a latch.
+    admissionReading = { ...admissionReading, memory_admitted: 20 };
+    fire({ reqId: "m2", op: "spawn_worker", buildAgentId: buildId, projectId, payload: { task: "yes" } });
+    await flush();
+    expect(spawnWorkerMock).toHaveBeenCalledTimes(3); // m1 released by the drain, plus m2
+  });
+
   it("counts workers MACHINE-WIDE against the RAM cap, not per build agent (sparkle-hfhs)", async () => {
     // The dimensional error behind the 33 GiB coalition. `ram_derived_concurrency` (config.rs)
     // divides the MACHINE's RAM into a machine-wide budget, but this gate applied that budget

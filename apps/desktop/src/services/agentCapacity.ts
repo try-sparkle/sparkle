@@ -178,6 +178,10 @@ export function localAgentCapacity(): CapacityReading {
   // squeezed one, and the failure mode of getting that backwards is refusing every spawn on the
   // strength of an unrelated backend error.
   const admission = currentMemoryAdmission();
+  // Set inside the load branch below: true when the MEMORY term is the one that produced `limit`,
+  // even though Rust attributed the reading to the run queue. Drives which sentence the refusal
+  // quotes; see the note at the assignment.
+  let loadPathMemoryBinds = false;
   if (admission && admission.sampled) {
     const narrowed = Math.max(1, Math.min(staticLimit, Math.floor(admission.effective)));
     if (admission.bound === "load") {
@@ -208,7 +212,24 @@ export function localAgentCapacity(): CapacityReading {
       // only by a coupling across a process boundary that nothing checks, and the whole defect here
       // was a number meaning one population being spent against another.
       const headroom = Math.max(0, Math.floor(admission.load_headroom ?? 0));
-      limit = Math.max(1, Math.min(staticLimit, used + headroom));
+      // CLAMPED BY MEMORY TOO, because `bound` is not a partition (roborev, High). `bound === "load"`
+      // does NOT mean memory declined to narrow — `load_binds` is true whenever the queue has an
+      // opinion and memory is not already holding at or below it, so this branch is reached with a
+      // real RAM-derived ceiling in hand. Spending run-queue headroom without it re-opens exactly the
+      // jetsam path the memory sampler exists to close: measured on the failure this fix was reviewed
+      // against, RAM said room for 6 and this branch would have admitted 31.
+      const byMemory = Math.max(1, Math.floor(admission.memory_admitted ?? staticLimit));
+      const byLoad = used + headroom;
+      limit = Math.max(1, Math.min(staticLimit, byMemory, byLoad));
+      // WHICH TERM BOUND IS NOW A REAL QUESTION, and getting it wrong writes a dead instruction
+      // (roborev, High). Rust attributes this reading to the queue — `load_binds` is true only when
+      // the queue's ceiling is BELOW memory's — but the two arrive here in different denominations:
+      // `memory_admitted` is residents, `byLoad` is rows. With dormant rows present the memory term
+      // can be the smaller one HERE while `bound` still says `"load"`. Quoting the queue then tells
+      // a human to wait for it to drain, which will never help, while available RAM is the actual
+      // constraint. That is the same misattribution that once sent someone chasing memory 94% free,
+      // pointed the other way.
+      loadPathMemoryBinds = byMemory < byLoad && byMemory < staticLimit;
     } else if (narrowed < staticLimit) {
       limit = narrowed;
     }
@@ -226,7 +247,10 @@ export function localAgentCapacity(): CapacityReading {
     // `used >= live` always (see the load block above), which is why the load dimension may NOT be
     // enforced through `narrowed` — it is kept here only for the sentence a human reads.
     if (narrowed < staticLimit || admission.bound === "load") {
-      basis = admission.basis?.trim() || basis;
+      // Name the term that bound, not the dimension Rust attributed the reading to. `memory_basis`
+      // is absent on a payload predating it, which falls back to exactly what this line said before.
+      const preferred = loadPathMemoryBinds ? admission.memory_basis : undefined;
+      basis = preferred?.trim() || admission.basis?.trim() || basis;
     }
   }
 

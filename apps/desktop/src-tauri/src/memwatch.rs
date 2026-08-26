@@ -615,6 +615,30 @@ pub struct ConcurrencyAdmission {
     /// `0` IS THE SAFE DIRECTION for a payload that predates this field: it reads as the hard stop,
     /// which refuses. A missing field must never be able to admit more than was measured.
     pub load_headroom: u32,
+    /// What MEMORY alone would admit — `sampled_admission`'s `admitted`, before the run queue had
+    /// any say. Equal to `static_max` when memory did not narrow.
+    ///
+    /// IT IS ON THE WIRE BECAUSE `bound` IS NOT A PARTITION. `bound == Load` does NOT imply "memory
+    /// did not narrow": `load_binds` is true whenever the run queue has an opinion and memory did
+    /// not already hold at or below it, so a reading can simultaneously carry a real RAM-derived
+    /// ceiling and be attributed to the queue. `effective` is the `min` of the two and cannot be
+    /// decomposed back, so a consumer that branches on `bound == Load` and computes its own ceiling
+    /// from headroom has silently dropped the memory ceiling — which is the jetsam path
+    /// `sampled_admission` exists to close. Carrying the memory number separately is what lets the
+    /// throttle branches stay bounded by BOTH dimensions.
+    pub memory_admitted: u32,
+    /// The sentence that goes with [`Self::memory_admitted`] — what `sampled_admission` would have
+    /// said had the run queue not been attributed.
+    ///
+    /// IT TRAVELS WITH THE NUMBER BECAUSE THE NUMBER CAN NOW BIND ALONE. `load_binds` is only true
+    /// when the queue's ceiling is BELOW memory's, so `basis` on this struct is always the load
+    /// sentence in that arm — yet the two ceilings are denominated differently once they reach the
+    /// frontend (`memory_admitted` in residents, the queue's allowance in rows), so the memory term
+    /// can be the binding one there while `bound` still reads `load`. A refusal that quotes the
+    /// queue when RAM is the constraint tells a human to wait for a queue to drain that will never
+    /// help — the misattribution class this module has already been bitten by twice. Carrying both
+    /// sentences is what lets the consumer name whichever term actually bound.
+    pub memory_basis: String,
 }
 
 /// Compose the static derivation with a runtime sample. Pure — the caller supplies both.
@@ -673,6 +697,8 @@ pub fn sampled_concurrency(
     ConcurrencyAdmission {
         effective,
         load_headroom,
+        memory_admitted: a.admitted,
+        memory_basis: a.basis.clone(),
         static_max,
         static_bound,
         bound: match (narrowed, load_binds) {
@@ -2077,6 +2103,62 @@ mod tests {
     }
 
     #[test]
+    fn a_throttling_queue_alongside_a_memory_narrowing_still_reports_the_memory_ceiling() {
+        // `bound` IS NOT A PARTITION, and reading it as one dropped the memory ceiling on the
+        // throttle path. `load_binds` is true whenever the queue has an opinion and memory is not
+        // already holding at or below it — so `bound == Load` can sit on top of a REAL RAM-derived
+        // `admitted`, and `effective` (their `min`) cannot be decomposed back into the two.
+        //
+        // The fixture makes both dimensions bind at once with DIFFERENT numbers, which is the only
+        // shape that catches it: memory admits a few, the queue is merely throttling, and the queue
+        // is attributed. A consumer branching on `bound` alone sees only the trickle.
+        let tight = sample(128 * GIB, 9 * GIB, PressureLevel::Normal);
+        let cores = 18u32;
+        let throttling = LoadSample { load1: 3.0 * f64::from(cores), cores };
+
+        let memory_only = sampled_concurrency(81, Bound::Ram, "RAM-bound: …", 4, PER_AGENT, Some(&tight), None);
+        assert!(
+            memory_only.effective < 81,
+            "precondition: memory must actually be narrowing, or this proves nothing ({})",
+            memory_only.effective
+        );
+        let admitted = memory_only.effective;
+
+        let c = sampled_concurrency(81, Bound::Ram, "RAM-bound: …", 4, PER_AGENT, Some(&tight), Some(&throttling));
+        assert_eq!(c.bound, Bound::Load, "precondition: the queue is what gets attributed here");
+        assert!(c.load_headroom > 0, "precondition: throttling, not the hard stop");
+        assert_eq!(
+            c.memory_admitted, admitted,
+            "the memory ceiling survives on the wire even when the run queue is what bound"
+        );
+        assert!(
+            c.memory_admitted < c.static_max,
+            "and it is a real narrowing, not the static ceiling wearing its name"
+        );
+    }
+
+    #[test]
+    fn a_load_attributed_reading_still_carries_the_memory_sentence() {
+        // The frontend needs BOTH sentences on this path, because it — not Rust — is where the two
+        // ceilings become comparable. Rust attributes to the queue whenever the queue's number is
+        // lower; the frontend then re-denominates and can find memory binding after all, and a
+        // refusal that quotes the queue there is an instruction that can never help.
+        let tight = sample(128 * GIB, 9 * GIB, PressureLevel::Normal);
+        let cores = 18u32;
+        let throttling = LoadSample { load1: 3.0 * f64::from(cores), cores };
+
+        let c = sampled_concurrency(81, Bound::Ram, "RAM-bound: …", 4, PER_AGENT, Some(&tight), Some(&throttling));
+        assert_eq!(c.bound, Bound::Load, "precondition: attributed to the queue");
+        assert!(c.basis.starts_with("throttled:"), "precondition: `basis` is the queue's: {}", c.basis);
+        assert!(
+            !c.memory_basis.is_empty() && c.memory_basis != c.basis,
+            "the memory sentence travels alongside it and is a DIFFERENT sentence: {:?} vs {:?}",
+            c.memory_basis,
+            c.basis
+        );
+    }
+
+    #[test]
     fn an_unreadable_run_queue_narrows_nothing_rather_than_refusing_everything() {
         // FAILS OPEN, in every shape of "we could not read it". The opposite direction would turn a
         // broken `getloadavg` into a fleet-wide refusal.
@@ -2252,6 +2334,33 @@ mod tests {
              services/config.ts's ConcurrencyBound union spells it \"load\""
         );
         assert_eq!(wire.get("sampled").and_then(|v| v.as_bool()), Some(true));
+
+        // THE SAME SEAM, FOR THE TWO NUMBERS THE GATES READ. Both are consumed with `?? 0` /
+        // `?? static`, so an absent KEY is not an error on the frontend — it is a silent fallback.
+        // For `load_headroom` that fallback is the hard stop, i.e. a `rename_all` attribute or a
+        // rename to `loadHeadroom` would leave every Rust and TypeScript test green and put the
+        // latch this dimension was fixed to remove straight back: zero build agents and one worker,
+        // machine-wide, permanently, with nothing logged. Asserted with a THROTTLING sample so the
+        // expected value is non-zero — against the 21.5x fixture above, `Some(0)` and "the key is
+        // missing, defaulted to 0" are indistinguishable and the assertion would prove nothing.
+        let throttling = LoadSample { load1: 5.9 * 18.0, cores: 18 };
+        let t = sampled_concurrency(81, Bound::Ram, "RAM-bound: …", 69, PER_AGENT, None, Some(&throttling));
+        let twire = serde_json::to_value(&t).expect("ConcurrencyAdmission serializes");
+        assert_eq!(
+            twire.get("load_headroom").and_then(|v| v.as_u64()),
+            Some(1),
+            "services/agentCapacity.ts and services/orchestrationListener.ts read this key literally,              and an absent one silently reads as the hard stop"
+        );
+        assert_eq!(
+            twire.get("memory_admitted").and_then(|v| v.as_u64()),
+            Some(81),
+            "both throttle branches clamp to this key; an absent one would drop the memory ceiling"
+        );
+        assert!(
+            twire.get("memory_basis").and_then(|v| v.as_str()).is_some_and(|b| !b.is_empty()),
+            "services/agentCapacity.ts quotes this key when the memory term is what bound; an absent \
+             one silently falls back to the run-queue sentence, which is the misattribution"
+        );
     }
 
     #[test]

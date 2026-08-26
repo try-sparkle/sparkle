@@ -305,7 +305,8 @@ function globalGateBinds(): boolean {
   // Deliberately NOT re-derived here as `effective` minus some count of this module's own: every
   // count on this side is a different population than the `in_use` the ceiling was built on — this
   // gate's is workers only — and spending a whole-fleet allowance against a worker-only count is the
-  // dimensional error the paragraph above warns about. An absent field reads as 0, i.e. refuses.
+  // dimensional error the paragraph above warns about. An absent headroom field reads as 0, i.e.
+  // refuses; an absent `memory_admitted` falls back to the static cap, i.e. changes nothing.
   //
   // `globalUsedSlots() > 0` keeps the "you can always start the first one" floor that
   // `load_narrowed` establishes on the Rust side: a loaded-but-worker-less box still admits one, so
@@ -313,9 +314,14 @@ function globalGateBinds(): boolean {
   if (admission.bound === "load") {
     if ((admission.load_headroom ?? 0) <= 0) return globalUsedSlots() > 0;
     // Throttling, not stopping: the run queue has no worker-denominated ceiling to offer here, so
-    // the static cap governs and the queue's opinion is carried by the basis sentence a refusal
-    // quotes.
-    return globalUsedSlots() >= staticCap;
+    // the queue's own opinion is carried by the basis sentence a refusal quotes — but the MEMORY
+    // ceiling still governs, and dropping it here was a real regression (roborev, High). `bound` is
+    // not a partition: this branch is reached with a live RAM-derived `memory_admitted` whenever the
+    // queue merely sits below it, and returning `>= staticCap` would let the fleet grow to the
+    // static ceiling while available RAM said room for a handful. `?? staticCap` keeps a payload
+    // that predates the field exactly as strict as it was, never stricter.
+    const byMemory = Math.max(1, Math.floor(admission.memory_admitted ?? staticCap));
+    return globalUsedSlots() >= Math.max(1, Math.min(staticCap, byMemory));
   }
 
   const narrowed = Math.max(1, Math.min(staticCap, Math.floor(admission.effective)));

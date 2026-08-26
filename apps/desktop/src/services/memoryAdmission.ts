@@ -53,6 +53,23 @@ export interface ConcurrencyAdmission {
    *  OPTIONAL, DEFAULTING TO 0, for a payload that predates the field: 0 reads as the hard stop,
    *  which refuses. A missing field must never admit more than was measured. */
   load_headroom?: number;
+  /** What MEMORY alone would admit, before the run queue had any say — equal to `static_max` when
+   *  memory did not narrow.
+   *
+   *  READ IT IN EVERY BRANCH THAT DOES NOT ALREADY USE `effective`. `bound` is NOT a partition:
+   *  `bound === "load"` does not imply memory declined to narrow, so a load-attributed reading can
+   *  carry a real RAM-derived ceiling. `effective` is the min of the two and cannot be decomposed,
+   *  so a gate that branches on the bound and computes its own ceiling has dropped the memory one —
+   *  which is the jetsam path the memory sampler exists to close.
+   *
+   *  OPTIONAL, DEFAULTING TO `static_max` (never to 0, which would refuse everything on a payload
+   *  that predates the field). */
+  memory_admitted?: number;
+  /** The sentence that goes with `memory_admitted`. Quote it instead of `basis` whenever the memory
+   *  term is what actually bound — on the load path `bound` stays `"load"` even then, because the
+   *  two ceilings are denominated differently by the time they get here. Optional; absent falls back
+   *  to `basis`, which is what the payload said before this field existed. */
+  memory_basis?: string;
   /** False when nothing could be measured. A `false` here must narrow NOTHING — see the note on
    *  the null cache above; an unmeasured machine is not a squeezed one. */
   sampled: boolean;
