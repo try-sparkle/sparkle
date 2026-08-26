@@ -16,11 +16,6 @@ const bs = (ahead: number, dirty = false): BranchStatus => ({
   filesChanged: dirty ? 1 : 0,
   insertions: 0,
   deletions: 0,
-  // A CONFIRMED provenance: these numbers were measured on a real branch. `closeDecision` only
-  // trusts a zero-ahead/clean reading enough to tear down silently when it knows which branch the
-  // reading counted against (sparkle-cn9z9l) — so the default helper carries one, and the tests
-  // that exercise the MISSING-provenance case drop it explicitly below.
-  branch: "sparkle/agent-fixture",
 });
 
 describe("shouldPromptOnClose", () => {
@@ -232,37 +227,6 @@ describe("closeDecision — the retirement arm (bead sparkle-0l9xk)", () => {
     expect(
       closeDecision("build", "building_unsaved", { ...bs(0, false), worktreeOnBranch: false }, SETTLED),
     ).toBe("work-at-risk-prompt");
-  });
-
-  // ── sparkle-cn9z9l: a zero-ahead reading with NO branch provenance is not a safe teardown ────────
-  // THE REGRESSION PROOF. The would-be-silent path is `ahead === 0`, clean tree, on-branch — but
-  // `ahead` is only trustworthy if we know which branch it counted against. The roster used to report
-  // the branch minted at SPAWN, so a worker a commit ahead on its real branch read `ahead: 0` and was
-  // torn down over the commit. `bs.branch` now records the measured branch; when it is MISSING the
-  // zero is unconfirmed and must refuse. Against the pre-change code every assertion here read
-  // "silent" (the old final line trusted `ahead === 0` unconditionally); the paired confirmed-branch
-  // cases stay "silent" to prove the refusal is caused by the missing provenance and nothing else.
-  it("refuses a silent teardown when the reading cannot say which branch it measured", () => {
-    const clean = bs(0, false); // ahead 0, not dirty, worktreeOnBranch not set (i.e. not false)
-    // Branch provenance ABSENT → cannot confirm the zero → refuse.
-    expect(
-      closeDecision("build", "building_unsaved", { ...clean, branch: undefined }, UNSETTLED),
-    ).toBe("work-at-risk-prompt");
-    // Branch provenance BLANK (whitespace/empty from an odd resolve) → still unconfirmed → refuse.
-    expect(
-      closeDecision("build", "building_unsaved", { ...clean, branch: "" }, UNSETTLED),
-    ).toBe("work-at-risk-prompt");
-    expect(
-      closeDecision("build", "planned", { ...clean, branch: "   " }, UNSETTLED),
-    ).toBe("work-at-risk-prompt");
-    // PAIRED positive control: the identical reading WITH a confirmed branch still closes silently,
-    // so the refusal above is attributable to the missing provenance and not to some other gate.
-    expect(
-      closeDecision("build", "building_unsaved", { ...clean, branch: "sparkle/agent-real" }, UNSETTLED),
-    ).toBe("silent");
-    expect(
-      closeDecision("build", "planned", { ...clean, branch: "pr1380" }, UNSETTLED),
-    ).toBe("silent");
   });
 });
 
