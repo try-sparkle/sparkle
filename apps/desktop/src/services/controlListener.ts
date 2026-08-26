@@ -2493,6 +2493,22 @@ function handleSetEscalation(req: ControlRequest): Record<string, unknown> {
           "budget top-up — it only undoes an escalation.",
       };
     }
+    if (goal.metAt !== undefined) {
+      // ALREADY MET. `markGoalMet` does not clear `escalatedAt`, so a finished agent can still
+      // carry a latched escalation (see `escalationFieldsApply`, `sparkle-0qq4hx`). The store now
+      // refuses this at the source rather than spending a re-arm and handing `REARM_GRANT`
+      // continues back to work that is done — so classify it as its own refusal instead of the
+      // `escalation_rearm_exhausted` catch-all below, which would misreport a spent allowance and
+      // re-fire the "still needs you" banner for a goal the human already saw land.
+      return {
+        ok: false,
+        code: "goal_already_met",
+        error:
+          `${asked}'s goal is already met, so its escalation is moot — clearing it would spend a ` +
+          "re-arm on finished work. The latch is a leftover of the goal being marked met, not a " +
+          "live give-up. Nothing to do here.",
+      };
+    }
     // EXHAUSTED. The allowance is spent, the escalation is the human's again by construction, and
     // nothing the concierge calls may take it back.
     const spent = before.goal?.conciergeRearms ?? 0;

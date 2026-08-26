@@ -93,6 +93,33 @@ describe("conciergeRearmAgentGoal — the concierge clears a machine escalation"
     expect(agent().goal?.totalContinues).toBe(10);
     expect(agent().goal?.conciergeRearms).toBeUndefined();
   });
+
+  it("refuses a MET-but-latched goal, so a stale clear cannot spend a re-arm on finished work", () => {
+    // `markGoalMet` does not clear `escalatedAt`, so a resolved escalation keeps the latch after
+    // the work is done (sparkle-0qq4hx). Without the metAt guard this clear would fall through to
+    // the CHARGED branch: strip the latch, refund REARM_GRANT off totalContinues and burn one of
+    // the finite allowance. Assert the SIDE EFFECT that would happen without the guard is absent —
+    // the counter, not the state (a re-armed goal already reads `unmet`, so state alone is vacuous).
+    escalate(20);
+    store().setAgentGoalMet("p1", "a1", true);
+    expect(agent().goal?.metAt).toEqual(expect.any(Number));
+    expect(agent().goal?.escalatedAt).toEqual(expect.any(Number)); // the latch outlived being met
+
+    expect(store().conciergeRearmAgentGoal("p1", "a1", "sweeping a stale notification", Date.now())).toBe(
+      false,
+    );
+
+    expect(agent().goal?.conciergeRearms).toBeUndefined(); // no allowance spent
+    expect(agent().goal?.totalContinues).toBe(20); // no REARM_GRANT refund
+    expect(rearmsRemaining(agent().goal)).toBe(MAX_CONCIERGE_REARMS); // full allowance intact
+
+    // PAIRED: the SAME escalation setup, not marked met, IS re-armed — proving the refusal above is
+    // caused by `metAt` and not by some earlier gate short-circuiting the path.
+    seed();
+    escalate(20);
+    expect(store().conciergeRearmAgentGoal("p1", "a1", "genuinely unblocked", Date.now())).toBe(true);
+    expect(agent().goal?.conciergeRearms).toBe(1);
+  });
 });
 
 describe("undoing the concierge's OWN raise", () => {

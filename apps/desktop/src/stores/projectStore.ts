@@ -2060,6 +2060,17 @@ export const useProjectStore = create<ProjectState>()(
 
         if (goal.escalatedAt === undefined) return false;
 
+        // THE ESCALATION OUTLIVES THE GOAL BEING MET. `markGoalMet` does not clear `escalatedAt`
+        // and `baseGoalStateOf` answers `met` before `escalated`, so a RESOLVED escalation keeps
+        // the latch forever (see `escalationFieldsApply`, `sparkle-0qq4hx`). Without this guard a
+        // clear against a met-but-latched goal falls through to the charged branch below: it strips
+        // the latch, zeroes continues and burns one of the finite `MAX_CONCIERGE_REARMS` on
+        // finished work. There is nothing to resume, so refuse — the caller classifies this `false`
+        // as `goal_already_met`. Placed ABOVE the free-undo branch deliberately: a met goal's
+        // escalation is moot however it was raised. This is the symmetric guard `escalateGoal`
+        // already carries for the mirror-image race (`sparkle-i5v42`).
+        if (goal.metAt !== undefined) return false;
+
         // UNDOING ITS OWN RAISE IS FREE, and must not touch a single counter — see `unraiseGoal`.
         // Charging for it would be wrong (nothing was spent), and resetting counters would make
         // raise-then-clear an unlimited budget refill.

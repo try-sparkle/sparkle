@@ -115,7 +115,20 @@ export function closeDecision(
   // on the grounds that it "belongs to another branch" — the files are real and deleting the
   // worktree destroys them.
   if (bs.worktreeOnBranch === false) return "work-at-risk-prompt";
-  return bs.ahead > 0 || bs.dirty ? "work-at-risk-prompt" : "silent";
+  if (bs.ahead > 0 || bs.dirty) return "work-at-risk-prompt";
+  // The only path left to a silent teardown rests on a CONFIDENT ZERO — `ahead === 0` and a clean
+  // tree — but `ahead` is meaningless until we know WHICH branch it counted against. That is the
+  // whole of sparkle-cn9z9l: the roster reported the branch minted at spawn, so a worker whose real
+  // branch was a commit ahead read `ahead: 0`, and this line silently tore down a commit it never
+  // saw. `resolve_agent_branch` now records the measured branch on `bs.branch` (sparkle-pgkbn4) so
+  // the reading can state its own provenance. When it CANNOT — the field is absent or blank (an old
+  // Rust build, or a branch nothing resolved) — the zero is unconfirmed, and reporting it as "safe
+  // to discard" is exactly the confident zero the bead names. Refuse and pop the choice instead:
+  // fail-closed toward not deleting work, the same call the `!bs` and parked arms above already make.
+  // (Never permanent on a current build: every `BranchStatus` it constructs carries a real branch,
+  // so a clean finished worker still closes silently — this only catches the un-provenanced reading.)
+  if (bs.branch === undefined || bs.branch.trim() === "") return "work-at-risk-prompt";
+  return "silent";
 }
 
 /**
