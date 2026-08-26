@@ -48,6 +48,7 @@ import type {
   DetectorFinding,
   HumaneVerdict,
   Lane,
+  NoVerdictCause,
   OrdinalScore,
   PrincipleAssessment,
   PrincipleId,
@@ -150,12 +151,46 @@ export function notScoredVerdict(opts: JudgeOptions): HumaneVerdict {
     judgesAttempted: 0,
     degraded: false,
     lane: opts.lane,
+    // Nothing failed here — the gate looked and found no human-facing surface.
+    noVerdictCause: 'none',
   };
 }
 
 /** Round to two places, the precision every surface in this system reports. */
 function round2(n: number): number {
   return Math.round(n * 100) / 100;
+}
+
+/**
+ * Read WHY every judge failed out of the text they failed with.
+ *
+ * This is only possible because the gate quotes the API's response body rather than its
+ * status line alone — the body is where a provider says "your credit balance is too low".
+ * Classifying it is the second half of that change: quoting the cause put it on screen,
+ * and this decides which sentence the reader is handed.
+ *
+ * PRECEDENCE is deliberate, not alphabetical. A single judge naming a billing state is
+ * enough to return 'credit' even when its siblings merely timed out, because an exhausted
+ * balance explains the timeouts and paying is the action that clears all of them; the
+ * reverse — reporting an outage while an invoice is the true cause — is exactly the bug.
+ * 'auth' ranks below it for the same reason and above 'unreachable'.
+ *
+ * Matching is on the PROVIDER'S OWN vocabulary (its `error.type` values and the words its
+ * messages use), not on our wording, so a paraphrase on our side cannot silently unmatch it.
+ */
+export function classifyNoVerdictCause(
+  failures: readonly { readonly error: string }[],
+): NoVerdictCause {
+  if (failures.length === 0) return 'unreachable';
+  const text = failures.map((f) => f.error).join(' \n ');
+  // 402 is the status a provider reserves for this; the words are what the JSON body uses.
+  if (/\bHTTP 402\b|credit balance|insufficient[ _-]?(?:quota|credit|funds)|billing|payment required|quota exceeded|rate[ _-]?limit_error|\bHTTP 429\b/i.test(text)) {
+    return 'credit';
+  }
+  if (/\bHTTP 40[13]\b|authentication[ _-]?error|permission[ _-]?error|invalid[ _-]?(?:x-)?api[ _-]?key|unauthorized|not authenticated/i.test(text)) {
+    return 'auth';
+  }
+  return 'unreachable';
 }
 
 /**
@@ -252,6 +287,9 @@ export function summarizeJudgements(
     // number to caveat.
     degraded: hasQuorum && judgesAnswered < judgesAttempted,
     lane: opts.lane,
+    // Only a run with NO score has a cause to report. A scored verdict that also carried
+    // one would put a billing sentence on a pull request the judges evaluated perfectly.
+    noVerdictCause: hasQuorum ? 'none' : classifyNoVerdictCause(failures),
   };
 
   return { verdict, unmappedCodes: [...unmapped].sort(), failures };
@@ -268,7 +306,27 @@ export function headline(v: HumaneVerdict): string {
     return 'Not scored — this pull request changed no human-facing surface.';
   }
   if (v.humaneScore === null) {
-    return `Could not evaluate — ${v.judgesAnswered} of ${v.judgesAttempted} judges answered, and quorum is ${MIN_JUDGE_QUORUM}. This is not a pass.`;
+    // Every branch keeps the reserved "Could not evaluate" opening and the "not a pass"
+    // closing — check-run.sh keys on both, and neither depends on the cause. What the cause
+    // changes is the MIDDLE: the one sentence telling the reader what to actually go and do.
+    const counts = `${v.judgesAnswered} of ${v.judgesAttempted} judges answered, and quorum is ${MIN_JUDGE_QUORUM}`;
+    switch (v.noVerdictCause) {
+      case 'credit':
+        return (
+          `Could not evaluate — the judge account is out of credit, so ${counts}. ` +
+          `The model endpoint is healthy; this is an account balance to top up, and until ` +
+          `someone does, no pull request touching human-facing copy can be scored. ` +
+          `This is not a pass.`
+        );
+      case 'auth':
+        return (
+          `Could not evaluate — the judge API key was rejected as invalid or expired, so ` +
+          `${counts}. The key needs re-issuing; nothing about the model or this pull ` +
+          `request is at fault. This is not a pass.`
+        );
+      default:
+        return `Could not evaluate — ${counts}. This is not a pass.`;
+    }
   }
   const verb = v.humaneScore < AGGREGATE_THRESHOLD ? 'below' : 'at or above';
   return `HumaneScore ${v.humaneScore.toFixed(2)} — ${verb} the ${AGGREGATE_THRESHOLD} bar.`;

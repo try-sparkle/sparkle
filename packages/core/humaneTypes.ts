@@ -147,6 +147,22 @@ export interface ComplianceCitation {
 
 export type Lane = 'subscription' | 'openrouter';
 
+/**
+ * WHY there is no verdict — the distinction between a bill and an outage.
+ *
+ * A no-verdict run used to render identically whatever killed it, and the wording it chose
+ * was the endpoint's: "no model was reachable". When the real cause was an exhausted account
+ * balance, that sentence sent every reader to check an endpoint that was fine, while the
+ * actual remedy — a payment — was owed by someone who was never told (bead `sparkle-4xvu29`;
+ * four green pull requests sat on it). The causes are kept apart because their REMEDIES are
+ * different and are owed by different people: 'credit' is paid, 'auth' is re-issued,
+ * 'unreachable' is waited out or escalated.
+ *
+ * 'none' means a verdict exists, so no cause applies. It is a member rather than `null` so
+ * the field is always present on the wire and a reader never has to tell absent from unknown.
+ */
+export type NoVerdictCause = 'none' | 'credit' | 'auth' | 'unreachable';
+
 export interface HumaneVerdict {
   /** False when the change touched no human-affecting surface. Then nothing else applies. */
   scored: boolean;
@@ -165,6 +181,12 @@ export interface HumaneVerdict {
   /** True when scored on a quorum rather than the full ensemble. */
   degraded: boolean;
   lane: Lane;
+  /**
+   * Why no verdict exists, or 'none' when one does. NEVER a pass and never blocking on its
+   * own — it only decides which sentence the reader is given, and therefore which remedy
+   * they go and perform.
+   */
+  noVerdictCause: NoVerdictCause;
 }
 
 /** The rubric's own 'Acceptable' tier boundary — not a number we invented. */

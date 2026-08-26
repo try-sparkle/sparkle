@@ -291,3 +291,69 @@ describe('the verdict carries what the check run reads', () => {
     expect(verdict.lane).toBe('openrouter');
   });
 });
+
+describe('CANNOT-PAY is not CANNOT-REACH — an unpaid bill must not read as an outage', () => {
+  // Bead sparkle-4xvu29. Every judge call failing because the account has no credit left
+  // rendered word-for-word like a dead endpoint: "Could not evaluate — 0 of 3 judges
+  // answered". Four green pull requests sat on that wording while the actual remedy was a
+  // payment nobody knew was owed. The gate already quotes the API's response body, so the
+  // cause is present in the failure text — it was simply never classified.
+  const CREDIT = 'HTTP 400 Bad Request — {"type":"error","error":{"type":"invalid_request_error","message":"Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits."}}';
+  const RATE = 'HTTP 429 Too Many Requests — {"type":"error","error":{"type":"rate_limit_error","message":"quota exceeded for this organization"}}';
+  const AUTHFAIL = 'HTTP 401 Unauthorized — {"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}';
+  const DEAD = 'fetch failed: connect ECONNREFUSED 127.0.0.1:443';
+
+  function noVerdict(error: string) {
+    return summarizeJudgements([silent('j1', error), silent('j2', error), silent('j3', error)], OPTS)
+      .verdict;
+  }
+
+  it('names the account balance, and the remedy, when the key is out of credit', () => {
+    const line = headline(noVerdict(CREDIT));
+    expect(line).toMatch(/credit|billing/i);
+    // The remedy a reader will act on must be the one that works. Sending someone to check
+    // the model endpoint when the endpoint is fine is how this cost four PRs and two days.
+    expect(line).not.toMatch(/unreachable|could not be reached/i);
+  });
+
+  it('treats a quota/rate-limit refusal as the same account-state class', () => {
+    expect(headline(noVerdict(RATE))).toMatch(/credit|quota|billing/i);
+  });
+
+  it('keeps an expired or invalid key DISTINCT from an unpaid bill', () => {
+    // Different remedy, different person. Folding them together recreates the bug one level up.
+    const line = headline(noVerdict(AUTHFAIL));
+    expect(line).toMatch(/key|credential/i);
+    expect(line).not.toMatch(/credit balance|billing/i);
+  });
+
+  it('still says the generic thing when the cause really IS an unreachable model', () => {
+    // The paired negative: without it, a classifier that fires on everything passes the
+    // three tests above while telling every reader to go pay a bill they do not owe.
+    const line = headline(noVerdict(DEAD));
+    expect(line).toMatch(/Could not evaluate/);
+    expect(line).not.toMatch(/credit|billing|quota/i);
+  });
+
+  it('is still NOT A PASS, and still does not block, whatever the cause', () => {
+    // The fail-open contract is the reason this bug was survivable. Classifying the cause
+    // must not quietly convert a neutral no-verdict into a blocking one.
+    for (const err of [CREDIT, RATE, AUTHFAIL, DEAD]) {
+      const v = noVerdict(err);
+      expect(v.humaneScore).toBeNull();
+      expect(headline(v)).toContain('not a pass');
+      expect(verdictBlocks(v).blocked).toBe(false);
+    }
+  });
+
+  it('reports no cause at all once a real verdict exists', () => {
+    // A cause field left populated on a scored verdict would put a billing sentence on a
+    // pull request that was judged perfectly well.
+    const { verdict } = summarizeJudgements(
+      [answered('j1', allPrinciples(1)), answered('j2', allPrinciples(1))],
+      OPTS,
+    );
+    expect(verdict.noVerdictCause).toBe('none');
+    expect(headline(verdict)).not.toMatch(/credit|billing|quota|key/i);
+  });
+});

@@ -925,6 +925,7 @@ describe('the two axes never mix — a law cannot be averaged onto an ordinal', 
     const verdict: HumaneVerdict = {
       scored: true,
       humaneScore: aggregateScore(principles),
+      noVerdictCause: 'none' as const,
       principles,
       detectors: [],
       citations,
