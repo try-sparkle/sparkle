@@ -104,7 +104,7 @@ import {
 // column — and this file keeps no opinion of its own about what a stage MEANS.
 import { epicDropPlan, type EpicDropPlan } from "../services/epicDrop";
 import { applyEpicDrop } from "../services/applyEpicDrop";
-import { parsePrdRef } from "../services/tasks";
+import { resolveEpicPrdPath, useEpicPrdIndex } from "../services/epicPrd";
 
 /** How much room the ladder leaves for the pull tab on the seam side. The rail is 6px and the grip
  *  chiclet overhangs it slightly, so 10 clears both without eating a readable amount of a 280px
@@ -294,6 +294,10 @@ export function EpicsColumn({
   const readError = useBeadsStore((s) => (project ? s.error[project.id] : undefined));
   const projectId = project?.id;
   const projectPath = project?.rootPath;
+  // Structured PRD paths for this project's epics. Cached and deduped per project path, so this
+  // costs one bd read per TTL window however many columns and cards ask for it; an empty index
+  // (not yet loaded, or a failed read) simply sends `resolveEpicPrdPath` to the prose fallback.
+  const prdIndex = useEpicPrdIndex(projectPath);
   useEffect(() => {
     if (!beadsEnabled) return;
     if (!projectId || !projectPath) return;
@@ -464,15 +468,16 @@ export function EpicsColumn({
         projectId: project.id,
         rootPath,
         epicId: dragEpic.id,
-        // NOT re-derived — `parsePrdRef` on the description is the same rule the card's own Build It
-        // button uses to find an epic's PRD.
-        prdPath: parsePrdRef(dragEpic.description)?.relPath ?? null,
+        // NOT re-derived — `resolveEpicPrdPath` is the same rule the card's own Build It button,
+        // the stall sweep and `decomposeEpic` use to find an epic's PRD: the structured `prd`
+        // metadata first, the prose `PRD file:` line only when the epic has no metadata.
+        prdPath: resolveEpicPrdPath(dragEpic, prdIndex),
         plan,
       }).catch((e: unknown) => {
         setRefusal({ key, reason: e instanceof Error ? e.message : "That move didn’t stick." });
       });
     },
-    [planFor, project, dragEpic],
+    [planFor, project, dragEpic, prdIndex],
   );
 
   // ── SELECTION ────────────────────────────────────────────────────────────────────────────────

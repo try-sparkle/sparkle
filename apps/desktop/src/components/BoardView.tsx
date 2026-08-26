@@ -68,6 +68,8 @@ import { DefineStageModal } from "./DefineStageModal";
 import { StageColumnHeader, DefineStageCta, definableStageKey, type DeliveryChip } from "./StageColumnHeader";
 import { CardCriteria } from "./CardCriteria";
 import { BeadCard } from "./BeadCard/BeadCard";
+import { BeadSelectCheckbox, BeadSelectionBar } from "./BeadSelection";
+import { useBeadSelectionStore } from "../stores/beadSelectionStore";
 import { BeadPriorityChip } from "./BeadCard/BeadPriorityChip";
 import { TypePill } from "./BeadCard/TypePill";
 import { BeadSeverityBadge } from "./BeadCard/BeadSeverityBadge";
@@ -340,6 +342,22 @@ export function BoardView({
 
   const board = snapshot?.board;
   const allBeads = snapshot?.beads ?? NO_BEADS;
+  // A boolean selector, so the board re-renders on THIS project's select mode and nothing else.
+  const selectMode = useBeadSelectionStore((s) => s.selectMode[project.id] ?? false);
+
+  // ── A TICK MUST NOT OUTLIVE THE BEAD IT POINTS AT ────────────────────────────────────────────
+  // The snapshot is replaced by the poller, and beads leave it — an agent closes one, a sweep
+  // archives one. A tick left pointing at a bead that is no longer on screen is invisible AND live:
+  // the next "Move to epic" would carry it along silently, or fail the WHOLE batch with a message
+  // naming an id the user cannot see. `retain` writes nothing when every ticked bead still stands,
+  // so this costs one Set build per snapshot IDENTITY change — and `beadsStore` keeps that identity
+  // stable across a poll that found nothing new (`snapshotUnchanged`), so an idle board never runs
+  // it at all.
+  useEffect(() => {
+    useBeadSelectionStore
+      .getState()
+      .retain(project.id, new Set(allBeads.map((b) => b.id)));
+  }, [project.id, allBeads]);
 
   /**
    * The bead the open overlay is showing, read from the CURRENT poll rather than held.
@@ -754,6 +772,26 @@ export function BoardView({
         </div>
       )}
 
+      {/* THE CONSOLIDATE BAR — "N beads selected · [epic] Move to epic… · Unparent · Clear".
+          Renders NOTHING while nothing is ticked (the component returns null), so it costs the
+          board no height until the gesture is actually under way; see BeadSelection.tsx.
+
+          ── IT FORCES A REFRESH RATHER THAN WAITING FOR THE POLL ─────────────────────────────────
+          `onDone` re-reads the project immediately. The poller would carry the new parent edge
+          eventually, but its cadence is DERIVED from how long a read takes and is capped at
+          BEADS_POLL_MAX_INTERVAL_MS = 60s — so on a big store, which is exactly where consolidating
+          an epic matters, "eventually" is up to a minute of the board showing the OLD parent after
+          a click that already reported success. `refresh` never throws (failures land in `error`),
+          and it is the same call the poller makes, so an extra one is idempotent. */}
+      <BeadSelectionBar
+        projectId={project.id}
+        projectPath={project.rootPath}
+        allBeads={allBeads}
+        onDone={() => {
+          void useBeadsStore.getState().refresh(project.id, project.rootPath);
+        }}
+      />
+
       {/* Per-agent feedback filter banner: shown only while a FEEDBACK pill has narrowed the board.
           Clicking Clear drops the filter (boardAgentFilter → null) and the full board returns. */}
       {boardAgentFilter && (
@@ -918,6 +956,23 @@ export function BoardView({
           `aria-pressed` (not `aria-checked`) with `role="group"`: these are two toggle BUTTONS
           whose states are independent, not a radiogroup with one winner. That distinction is the
           whole change, and it is the part a screen reader has to get right too. */}
+      {/* The kind toggles now share their row with the SELECT toggle. The row is new; the group
+          inside it is byte-for-byte what it was, including its `role`/`aria-label` and its exactly
+          two buttons — `BoardView.test.tsx` reads `within(group).getAllByRole("button")` and
+          asserts `["Tasks", "Epics"]`, so a third control inside it would read as the "Both" button
+          the founder had removed. The row carries the padding and the hairline the group used to,
+          so nothing moves and the board gains no height. */}
+      <div
+        style={{
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "space-between",
+          gap: 8,
+          padding: "6px 16px",
+          borderBottom: `1px solid ${C.hairline}`,
+          flexShrink: 0,
+        }}
+      >
       <div
         data-testid="board-plan-kinds"
         role="group"
@@ -925,9 +980,6 @@ export function BoardView({
         style={{
           display: "flex",
           gap: 2,
-          padding: "6px 16px",
-          borderBottom: `1px solid ${C.hairline}`,
-          flexShrink: 0,
         }}
       >
         {PLAN_KINDS.map(({ kind, label }) => {
@@ -988,6 +1040,53 @@ export function BoardView({
             </button>
           );
         })}
+      </div>
+
+        {/* ══ SELECT — THE OPT-IN THAT MAKES THE PER-CARD TICKS EXIST ═══════════════════════════
+            The consolidate gesture (bead `sparkle-xelans.2`) needs a tick on each card, and the
+            collapsed board is a READ/NAVIGATE surface: `BoardView.test.tsx` asserts there is no
+            `input`, `select` or `textarea` anywhere on it, with the comment box on an OPENED card
+            as the one deliberate exception. That rule is right — a checkbox on every one of a few
+            hundred cards is a form, not a board — so the ticks are opt-in and this is the opt-in.
+            It is a BUTTON, which that rule explicitly allows ("buttons exist: cards open detail,
+            epics get Start").
+
+            Turning it OFF clears the selection: a tick nobody can see is invisible AND live. */}
+        <button
+          type="button"
+          data-testid="board-select-mode"
+          aria-pressed={selectMode}
+          title="Select several beads to move them under an epic"
+          onClick={() =>
+            useBeadSelectionStore.getState().setSelectMode(project.id, !selectMode)
+          }
+          style={{
+            display: "inline-flex",
+            alignItems: "center",
+            gap: 6,
+            padding: "3px 10px",
+            borderRadius: PILL,
+            // Same 1px-in-both-states rule as the kind pills beside it, for the same reason: the
+            // row must not reflow on a click.
+            border: `1px solid ${selectMode ? C.forest : C.hairline}`,
+            cursor: "pointer",
+            font: "inherit",
+            fontSize: 12,
+            fontWeight: selectMode ? FONT_WEIGHT.semibold : FONT_WEIGHT.regular,
+            background: selectMode ? C.forest : "transparent",
+            color: selectMode ? C.cream : C.muted,
+            flexShrink: 0,
+          }}
+        >
+          <span
+            aria-hidden="true"
+            data-mark={selectMode ? "on" : "off"}
+            style={{ display: "inline-flex", alignItems: "center", opacity: selectMode ? 1 : 0.55 }}
+          >
+            {selectMode ? <FiCheck size={11} /> : <FiCircle size={9} />}
+          </span>
+          Select
+        </button>
       </div>
 
       {/* No snapshot yet → loading. Otherwise the current mode's columns. */}
@@ -1426,6 +1525,25 @@ function ParentEpicLine({ epic, onOpen }: { epic: Bead; onOpen: (b: Bead) => voi
  * snapshot (stable per poll), or the stable `handleOpen`. Do not hand it a custom comparator to
  * paper over a prop that ought to be stable; fix the prop.
  */
+/** A flex row when `when`, and NOTHING (a bare fragment) otherwise.
+ *
+ *  Exists so the card can gain a wrapper in select mode without gaining one out of it. Written as a
+ *  component rather than a ternary around ~140 lines of card body, which would have to duplicate
+ *  the whole button — and a duplicated card body is how the two presentations of a bead diverged
+ *  field by field the last time (see `DetailOverlay`'s header). */
+function FlexRow({
+  when,
+  gap,
+  children,
+}: {
+  when: boolean;
+  gap: number;
+  children: React.ReactNode;
+}) {
+  if (!when) return <>{children}</>;
+  return <div style={{ display: "flex", alignItems: "flex-start", gap }}>{children}</div>;
+}
+
 const Card = memo(function Card({
   bead,
   allBeads,
@@ -1491,6 +1609,10 @@ const Card = memo(function Card({
   // counting UP, the same direction the epics column's ratio now counts. Deriving `done` as
   // `total - open` rather than counting closed children keeps `openChildCountIndexed` the single
   // definition of "still open" (`in_progress` counts as open; bd's only terminal state is closed).
+  // SUBSCRIBED HERE, not passed down: threading it through `Column` would put it in the memo's
+  // prop set and make every card re-render whenever any of `Column`'s own props moved. A boolean
+  // selector re-renders this card only when the mode itself flips.
+  const selectMode = useBeadSelectionStore((s) => s.selectMode[project.id] ?? false);
   const totalKids = beadIsEpic ? childrenOfIndexed(epicIndex, bead.id).length : 0;
   const doneKids = beadIsEpic ? totalKids - openChildCountIndexed(epicIndex, bead.id) : 0;
   const hasKids = beadIsEpic && totalKids > 0;
@@ -1520,6 +1642,26 @@ const Card = memo(function Card({
         // What actually keeps a title inside its column is `overflowWrap: anywhere`.
       }}
     >
+      {/* ── THE TICK IS A SIBLING OF THE BODY BUTTON, NEVER A CHILD OF IT ──────────────────────
+          A `<button>` may not contain another interactive control, and a checkbox inside the body
+          would open the detail overlay on every click. So in select mode the body button gets a
+          flex ROW around it and the checkbox sits beside it — the same shape `StartControls`
+          already uses to stay out of the button's click.
+
+          ── AND THE ROW ITSELF IS CONDITIONAL, WHICH IS THE LOAD-BEARING PART ──────────────────
+          Out of select mode this renders NOTHING — no wrapper, no checkbox — so the resting card's
+          DOM is exactly what it was. Three separate assertions in `BoardView.test.tsx` depend on
+          that and each caught a different consequence of an unconditional wrapper: the board holds
+          no `input` at all; `getAllByRole("checkbox")[0]` is the criteria popover's own tick, not a
+          card's; and the wrap test walks `title.closest("button").parentElement` expecting the CARD
+          SHELL, which a permanent wrapper silently became.
+
+          `minWidth: 0` likewise appears only in select mode. It is genuinely needed THERE — the
+          button is then a flex item on a ROW's main axis, where the content-based automatic minimum
+          really does apply — and it must stay absent otherwise, because the card's root comment and
+          that same wrap test pin its absence as dead style (roborev 57312). */}
+      <FlexRow when={selectMode} gap={8}>
+      {selectMode && <BeadSelectCheckbox projectId={project.id} beadId={bead.id} />}
       <button
         onClick={() => onOpen(bead)}
         style={{
@@ -1532,6 +1674,9 @@ const Card = memo(function Card({
           flexDirection: "column",
           gap: 6,
           width: "100%",
+          // `undefined` — NOT 0 — outside select mode, so React emits no declaration at all and
+          // `body.style.minWidth` reads `""`. See the block comment above.
+          minWidth: selectMode ? 0 : undefined,
           fontFamily: FONT_UI,
         }}
       >
@@ -1614,6 +1759,7 @@ const Card = memo(function Card({
           </span>
         </div>
       </button>
+      </FlexRow>
       {/* ── BELOW THE STATUS BAR ─────────────────────────────────────────────────────────────────
           Both of these are SIBLINGS of the body button, not children of it: they are interactive,
           and a <button> may not contain another one. That also keeps their clicks off the

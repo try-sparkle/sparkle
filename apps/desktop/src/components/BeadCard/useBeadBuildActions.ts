@@ -34,7 +34,11 @@ import {
 } from "../../services/beads";
 import { rollupEpicStatus } from "../../services/planView";
 import { useBeadsStore } from "../../stores/beadsStore";
-import { parsePrdRef } from "../../services/tasks";
+import {
+  resolveEpicPrdPath,
+  useEpicPrdIndex,
+  type EpicPrdIndex,
+} from "../../services/epicPrd";
 import {
   AtCapacityError,
   sendToBuild,
@@ -71,8 +75,10 @@ export interface BeadBuildActions {
    * epic, or is the only epic in its PRD.
    *
    * ══ THE EPIC GATE LIVES HERE, NOT AT THE CALL SITES ═════════════════════════════════════════
-   * `prdPath` is parsed out of THIS bead's description, and `parsePrdRef` matches a `PRD file:`
-   * line in any body regardless of type. So a task or bug carrying a PRD back-link resolves a
+   * `prdPath` is resolved from THIS bead by `resolveEpicPrdPath` — the bd `prd` metadata first, the
+   * prose `PRD file:` line only as fallback — and NEITHER half is type-aware: metadata can be set on
+   * any bead, and the prose matcher hits a `PRD file:` line in any body. So a task or bug carrying a
+   * PRD back-link resolves a
    * non-empty `prdEpics`, and a caller gating only on `prdEpics.length > 1` offers "Build all N
    * epics in this PRD" on a card for a bead that is not one of them — one press claiming and
    * handing off every epic in that PRD. Both surfaces made exactly that mistake independently
@@ -182,8 +188,8 @@ export interface BeadBuildActions {
  *
  * ══ CACHING THE INDEX WAS ONLY HALF THE FIX ══════════════════════════════════════════════════
  * Sharing {@link epicIndexOf} removed the per-card `isEpic` walk, but the `filter` that consumed
- * it was still O(backlog) PER CARD — and it ran `parsePrdRef`, a multiline regex, over every bead's
- * full description. On a Backlog column that renders all ~1,600 cards that is
+ * it was still O(backlog) PER CARD — and it ran the prose matcher (then `parsePrdRef` directly, now
+ * the fallback arm of `resolveEpicPrdPath`), a multiline regex, over every bead's full description. On a Backlog column that renders all ~1,600 cards that is
  * `cards_with_a_PRD_link × 2,100` regex executions on every `allBeads` identity change: the exact
  * per-card-whole-backlog shape the other two caches exist to remove (roborev 65609).
  *
@@ -194,21 +200,37 @@ export interface BeadBuildActions {
  * blocked lane as well as the bead list, and the group it filters is a handful of epics rather than
  * the whole store.
  */
-const PRD_EPICS = new WeakMap<EpicIndex, ReadonlyMap<string, Bead[]>>();
-function prdEpicsByPath(beads: readonly Bead[]): ReadonlyMap<string, Bead[]> {
+const PRD_EPICS = new WeakMap<EpicIndex, WeakMap<EpicPrdIndex, ReadonlyMap<string, Bead[]>>>();
+/**
+ * KEYED ON BOTH SNAPSHOTS, because the grouping now depends on two of them. The bead list decides
+ * which beads are epics; the PRD index decides which PATH each one is filed under. Grouping on the
+ * prose path while `prdPath` below resolves the STRUCTURED one would put a card's own epic in a
+ * bucket it can never look up — `buildAllPrd` collapsing to null on exactly the epics that have
+ * the new field. Both are stable objects that are REPLACED rather than mutated when they change, so
+ * a nested WeakMap hits while nothing moved and misses the moment either does.
+ */
+function prdEpicsByPath(
+  beads: readonly Bead[],
+  prdIndex: EpicPrdIndex,
+): ReadonlyMap<string, Bead[]> {
   const index = epicIndexOf(beads);
-  const hit = PRD_EPICS.get(index);
+  let byPrdIndex = PRD_EPICS.get(index);
+  if (!byPrdIndex) {
+    byPrdIndex = new WeakMap<EpicPrdIndex, ReadonlyMap<string, Bead[]>>();
+    PRD_EPICS.set(index, byPrdIndex);
+  }
+  const hit = byPrdIndex.get(prdIndex);
   if (hit) return hit;
   const out = new Map<string, Bead[]>();
   for (const b of beads) {
     if (!isEpicIndexed(index, b)) continue;
-    const path = parsePrdRef(b.description)?.relPath;
+    const path = resolveEpicPrdPath(b, prdIndex);
     if (!path) continue;
     const bucket = out.get(path);
     if (bucket) bucket.push(b);
     else out.set(path, [b]);
   }
-  PRD_EPICS.set(index, out);
+  byPrdIndex.set(prdIndex, out);
   return out;
 }
 
@@ -332,7 +354,18 @@ export function useBeadBuildActions({
     useBeadsStore((st) => st.byProject[projectId]?.board.blocked),
   );
 
-  const prdPath = useMemo(() => parsePrdRef(bead.description)?.relPath ?? null, [bead.description]);
+  // STRUCTURED FIRST, PROSE AS FALLBACK — `resolveEpicPrdPath` is the one rule, shared with the
+  // epic ladder's drag-to-stage, the stall sweep's restart and `decomposeEpic`. The index is
+  // cached and deduped per project path, so asking for it from a hook that runs on EVERY mounted
+  // card costs one bd read per TTL window rather than one per card.
+  const prdIndex = useEpicPrdIndex(rootPath);
+  const prdPath = useMemo(
+    () => resolveEpicPrdPath(bead, prdIndex),
+    // The rule reads only these two fields of the bead, whose own identity changes on every poll
+    // even when the row came back byte-identical.
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- see above
+    [bead.id, bead.description, prdIndex],
+  );
   // MEMOIZED, and it did not used to be — the two reads in the returned object below each called
   // `isEpic`, which runs `childrenOf`: a `filter` that both scans AND ALLOCATES over the project's
   // entire backlog. Two whole-backlog scans per render was affordable while at most one card was
@@ -376,7 +409,7 @@ export function useBeadBuildActions({
   // bead-is-an-epic (that short-circuit made `buildAllPrd`'s `epic &&` gate untestable — job
   // 65605). The startable filter runs here rather than in the cache because it also depends on the
   // blocked lane, and by this point it is filtering a handful of epics, not the store.
-  const byPath = prdEpicsByPath(allBeads);
+  const byPath = prdEpicsByPath(allBeads, prdIndex);
   const prdEpics = useMemo(() => {
     if (prdPath === null) return NO_EPICS;
     // FILTERED ON THE SAME PREDICATE THE CARD USES, so the count and the loop agree. Without it the

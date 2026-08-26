@@ -482,6 +482,17 @@ const staleSteals = new Map<string, number>();
  */
 const polledAt = new Map<string, number>();
 
+/** When the read behind the current snapshot STARTED — a lower bound on how old its contents are.
+ *
+ *  Deliberately separate from {@link polledAt}, which stamps COMPLETION. The two answer different
+ *  questions and only one of them is safe for "could this board already contain a write I made at
+ *  time T": a `bd list` that was already in flight when the write landed reads the store at its own
+ *  start yet commits afterwards, so a completion stamp can be NEWER than the write while the
+ *  contents are OLDER. Callers proving absence must compare against this. `polledAt` is left
+ *  untouched because its reader is a convoy guard ("when did we last read this"), and moving that
+ *  stamp earlier would make the guard more eager against exactly the contended store it protects. */
+const readStartedAt = new Map<string, number>();
+
 /**
  * When this project's beads were last successfully read, or `undefined` if never.
  *
@@ -493,6 +504,15 @@ const polledAt = new Map<string, number>();
  */
 export function beadsPolledAt(projectId: string): number | undefined {
   return polledAt.get(projectId);
+}
+
+/** When the read behind the current snapshot STARTED — see {@link readStartedAt}.
+ *
+ *  Use this, never `beadsPolledAt`, to decide whether the board could already reflect a write made
+ *  at a known time: `beadsReadStartedAt(p) >= writeTime` is the only form that proves the contents
+ *  postdate the write. */
+export function beadsReadStartedAt(projectId: string): number | undefined {
+  return readStartedAt.get(projectId);
 }
 
 /** TEST-ONLY. Drain the module-scope PER-PROJECT bookkeeping between cases — the in-flight claim,
@@ -511,6 +531,7 @@ export function __resetBeadsRefreshInFlightForTest(): void {
   // Freshness is module-scope too, so a case that polled project "p1" would otherwise leave the
   // next case's "p1" looking already-fresh.
   polledAt.clear();
+  readStartedAt.clear();
   // Likewise the blocked-id cache: a case that read a populated blocked set for "p1" would
   // otherwise hand it to the next case, whose `bd blocked` mock is then never consulted — turning
   // an assertion about the lane into an assertion about the previous test.
@@ -530,6 +551,16 @@ export function __resetBeadsRefreshInFlightForTest(): void {
 export function __setBeadsPolledAtForTest(projectId: string, at: number | undefined): void {
   if (at === undefined) polledAt.delete(projectId);
   else polledAt.set(projectId, at);
+}
+
+/** TEST-ONLY. Stamp (or clear) the READ-START clock independently of {@link polledAt}.
+ *
+ *  Separate from `__setBeadsPolledAtForTest` on purpose: the bug this clock exists for is a stamp
+ *  that is FRESHER than the contents it describes, and a fixture that could only set both together
+ *  cannot express that state at all. */
+export function __setBeadsReadStartedAtForTest(projectId: string, at: number | undefined): void {
+  if (at === undefined) readStartedAt.delete(projectId);
+  else readStartedAt.set(projectId, at);
 }
 
 /**
@@ -769,7 +800,12 @@ export const useBeadsStore = create<BeadsState>()((set) => ({
      * refresh` pins. Neither is what re-renders the rows.
      */
     const commitSnapshot = (beads: Bead[], board: Board) => {
-      if (ownsClaim()) polledAt.set(projectId, Date.now());
+      if (ownsClaim()) {
+        polledAt.set(projectId, Date.now());
+        // `now` is when THIS refresh took its claim, i.e. before `bd` was asked anything — so it is
+        // a lower bound on the age of the contents being committed here.
+        readStartedAt.set(projectId, now);
+      }
       commit((s) => {
         const prev = s.byProject[projectId];
         const next =

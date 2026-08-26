@@ -25,11 +25,13 @@ import {
   isBeadsUnavailable,
   AUTO_LABEL,
 } from "../services/beads";
+import { createBeadFull } from "../services/tasks";
 import { syncProjectMarkdown, ChiefLibraryClaimedError } from "../services/chiefSync";
 import { chiefProjectExists } from "../services/chief";
 import { useChiefSyncStore } from "./chiefSyncStore";
 import { useSettingsStore, effectiveChiefPat } from "./settingsStore";
 import { useProjectStore } from "./projectStore";
+import { useBeadsStore, beadsReadStartedAt } from "./beadsStore";
 import { useInteractionStore } from "./interactionStore";
 
 /** Trailing-debounce window per project. The branch-status poll fires often (mount + the ~30s
@@ -375,12 +377,24 @@ const beadLevelFor = new Map<string, number>();
 // (like beadCreateFailed); creating the DB mid-session takes effect on the next relaunch.
 const beadsUnavailableProjects = new Set<string>();
 
+// agentId -> the auto-bead id THIS poll minted and bound to the row. Kept so a later tick can tell
+// "the row still holds my bead" from "somebody rebound the row and mine is now referenced by
+// nothing" — see reconcileClobberedAutoBead. Dropped as soon as it is acted on, so it holds at most
+// one id per agent and never grows.
+const autoBeadWeWroteFor = new Map<string, string>();
+// agentId -> what we ASKED bd to create when the create came back write-AMBIGUOUS (bd may have
+// committed it and we lost the reply). Held instead of latching, so a later tick can look on the
+// board for the bead that may exist and ADOPT it rather than leaving it an orphaned epic child.
+const pendingAmbiguousCreate = new Map<string, { title: string; parent: string; at: number }>();
+
 /** Forget an agent's bead-lifecycle bookkeeping when it's closed/removed, so these module maps don't
  *  grow unbounded over a long session (and a recycled id can't inherit a stale watermark/latch). */
 function forgetBeadLifecycle(agentId: string): void {
   beadLevelFor.delete(agentId);
   beadCreateFailed.delete(agentId);
   creatingBeadFor.delete(agentId);
+  autoBeadWeWroteFor.delete(agentId);
+  pendingAmbiguousCreate.delete(agentId);
 }
 
 /** Test-only: reset the module-level lifecycle bookkeeping between cases. */
@@ -388,7 +402,236 @@ export function __resetBeadLifecycleForTest(): void {
   beadLevelFor.clear();
   beadCreateFailed.clear();
   creatingBeadFor.clear();
+  autoBeadWeWroteFor.clear();
+  pendingAmbiguousCreate.clear();
   beadsUnavailableProjects.clear();
+}
+
+/** Body of the bead this poll mints for a deliverable Build agent that has none. */
+const AUTO_BEAD_BODY = "Auto-created by Sparkle for a deliverable Build agent.";
+
+/** The epic the LIVE persisted row is bound to, or `""` for a row that is bound to none (or is
+ *  already gone). `""` is what `createBeadFull` takes to mean "no parent", so the two agree. */
+function liveEpicIdOf(projectId: string, agentId: string): string {
+  return (
+    useProjectStore
+      .getState()
+      .projects.find((p) => p.id === projectId)
+      ?.agents.find((a) => a.id === agentId)?.epicId ?? ""
+  );
+}
+
+/** The bead the LIVE persisted row is bound to, or `undefined`. Read separately from the caller's
+ *  `agent.beadId` projection on purpose — see the two re-reads around the create below. */
+function liveBeadIdOf(projectId: string, agentId: string): string | undefined {
+  return useProjectStore
+    .getState()
+    .projects.find((p) => p.id === projectId)
+    ?.agents.find((a) => a.id === agentId)?.beadId;
+}
+
+/**
+ * Mint the auto-bead AS A CHILD OF `parent` (bead `sparkle-f2tzxg`).
+ *
+ * Epic membership in this app is the bead parent-child edge and `AgentTab.epicId`, and nothing else.
+ * `beads.createBead` takes NO parent argument, so every bead this poll used to mint was top-level:
+ * the epic gained no slice for that agent's work, `epicLadder.agentsForEpicSlices` reported it as
+ * carrying no slice, and the work never appeared under the epic on the Plan board.
+ * `tasks.createBeadFull` is the parent-capable wrapper the spawn path already uses; this reuses it
+ * rather than growing `createBead` a fifth positional argument.
+ *
+ * ── WHAT `null` MEANS HERE: WRITE-AMBIGUOUS, NOT "FAILED" ─────────────────────────────────────
+ * `createBead` returns `null` where this wrapper THROWS, so the throw has to be classified. The
+ * split is {@link isProvablyNothingWritten}, and it is an allowlist of the RETRYABLE side: a throw
+ * whose own text says nothing ran is rethrown and retried next poll; EVERYTHING ELSE returns `null`
+ * and is treated as "bd may have committed this bead and we did not hear back".
+ *
+ * ⚠️ A NON-ZERO `bd` EXIT / `{"error":…}` IS ON THE LATCHED SIDE, AND THAT IS DELIBERATE — an
+ * earlier revision of this comment said the opposite. The genuine contention case is `StoreBusy`
+ * (bd never spawned), which IS retried; a non-zero exit and a `Timeout` are not, because
+ * `notes.rs` reads the drain path as *"the change most likely LANDED"* and the kill path as
+ * *"whether the change landed is UNKNOWN … bd create is not idempotent"*. Retrying either mints a
+ * SECOND bead, which `bead_dup.rs` cannot fold because it skips `AUTO_LABEL` by construction.
+ *
+ * ⚠️ `null` IS NOT THE END OF THE STORY, and reading it as a plain failure is what made this branch
+ * strand epics. The caller does NOT latch on it: it records the intent in `pendingAmbiguousCreate`
+ * and a later tick looks on the board for the bead that may have landed — see
+ * {@link resolvePendingAmbiguousCreate}. Latching blind would leave a committed, unreferenced OPEN
+ * CHILD of the epic, which is exactly the permanent `stranded` slice this whole change exists to
+ * remove. Only a lookup that finds nothing may latch.
+ */
+async function createParentedAutoBead(
+  projectPath: string,
+  title: string,
+  parent: string,
+  agentId: string,
+): Promise<string | null> {
+  try {
+    return await createBeadFull(projectPath, title, AUTO_BEAD_BODY, "task", parent, "", AUTO_LABEL);
+  } catch (e) {
+    if (isBeadsUnavailable(e)) throw e; // project-wide latch — must reach the outer catch
+    if (isProvablyNothingWritten(e)) throw e; // retried on the next poll, as before
+    console.debug("syncBeadLifecycle: auto-bead create is write-AMBIGUOUS for", agentId, e);
+    return null; // write-AMBIGUOUS: the caller records the intent and LOOKS before it latches
+  }
+}
+
+/**
+ * Is this failure one where `bd` PROVABLY WROTE NOTHING — the only kind safe to retry?
+ *
+ * ⚠️ THE ALLOWLIST IS THE RETRYABLE SIDE, NOT THE LATCHED SIDE, AND THAT DIRECTION IS THE WHOLE
+ * POINT. The obvious shape — "latch the two no-id messages, retry everything else" — is wrong
+ * because `bd`'s TIMEOUT is write-AMBIGUOUS, not a transport failure. `beads_cmd.rs` kills the child
+ * at its budget and returns `bd did not finish within Ns and was terminated`, and `notes.rs`
+ * spells out what that means for a mutation: on the kill path *"whether the change landed is
+ * UNKNOWN … do not retry blindly, because bd create is not idempotent"*, and on the drain path the
+ * write *"most likely LANDED"*. Retrying either mints a SECOND bead — the dedupe fold cannot absorb
+ * it, because `bead_dup.rs` skips every bead carrying `AUTO_LABEL` by construction. Under the
+ * sustained lock contention this whole change is motivated by, that is one extra epic-parented
+ * orphan per poll, each of them an unreferenced open child that strands the epic forever.
+ *
+ * So the asymmetry of harm decides the default, and it points at LATCHING: a wrong latch costs one
+ * agent one bead until relaunch, while a wrong retry writes junk into a shared store every 5s and
+ * makes `readyToClose` permanently false for the epic. An unrecognized message is therefore treated
+ * as AMBIGUOUS. Only the shapes whose own text states that nothing ran are retried:
+ *
+ *   - `StoreBusy` — the queue never freed a permit, so bd was never spawned. This is the genuine
+ *     contention shape (`beads_cmd.rs` is explicit that saturation is `StoreBusy`, never `Timeout`),
+ *     and it is exactly the case that must keep retrying rather than latch.
+ *   - `BinaryNotFound` / a spawn failure — no subprocess existed to write anything.
+ */
+function isProvablyNothingWritten(e: unknown): boolean {
+  const msg = e instanceof Error ? e.message : String(e);
+  return (
+    msg.includes("nothing was run and nothing was written") || // StoreBusy: queue saturated
+    msg.includes("bd not found — install beads") || // BinaryNotFound: never resolved
+    msg.includes("could not be executed") || // BinaryNotFound: exec failed
+    msg.startsWith("failed to run ") // spawn failure — the child never started
+  );
+}
+
+/**
+ * A write-AMBIGUOUS create may already have committed — go LOOK before latching.
+ *
+ * `bd` reports two failures where the write probably or possibly landed: the drain path, where
+ * *"bd itself finished successfully; what was lost is its reply, not the write, so the change most
+ * likely LANDED"*, and the kill path, where *"whether the change landed is UNKNOWN"*. Latching
+ * those blind — which is what this branch did — leaves a committed bead that is a CHILD OF THE EPIC
+ * and bound to no agent: `epicGoalRollup` calls that slice `stranded` forever and `readyToClose`
+ * can never be true again. The harm calculus that justified latching priced it at "one agent, one
+ * bead, until relaunch"; on the drain path it is a permanent false alarm on the epic instead.
+ *
+ * So this does what bd's own message instructs — *"Check the board before retrying"* — against the
+ * snapshot the board already polls every 5s. A candidate must match on ALL of: the epic we asked
+ * for as parent, the exact title we sent, `AUTO_LABEL`, still open, and referenced by NO agent row
+ * in the project. Then:
+ *
+ *   - exactly one candidate  → ADOPT it (binding it also puts it back under the lifecycle);
+ *   - none, snapshot loaded  → nothing landed, so latch exactly as before;
+ *   - more than one          → refuse to guess: latch and log. Adopting the wrong bead would bind
+ *                              an agent to another agent's work, which is worse than one orphan.
+ *
+ * Returns without deciding while the project has no snapshot yet — absence of data is not evidence
+ * that nothing landed, and this is the one branch where reading it that way re-creates the bug.
+ */
+function resolvePendingAmbiguousCreate(projectId: string, agentId: string): void {
+  const pending = pendingAmbiguousCreate.get(agentId);
+  if (!pending) return;
+  // Somebody bound a bead in the meantime (the spawn's own create): nothing left to resolve.
+  if (liveBeadIdOf(projectId, agentId)) {
+    pendingAmbiguousCreate.delete(agentId);
+    return;
+  }
+  const snapshot = useBeadsStore.getState().byProject[projectId];
+  if (!snapshot) return; // no reading yet — do NOT read that as "nothing landed"
+  // A STALE SNAPSHOT IS THE SAME AS NO SNAPSHOT, and this is the gate the first version missed.
+  // The docblock's principle — absence of data is not evidence that nothing landed — applies to a
+  // board read that PREDATES the write just as much as to a missing one, and stale is the COMMON
+  // case here rather than the exotic one: the beads poll runs on its own cadence clamped up to
+  // BEADS_POLL_MAX_INTERVAL_MS, and `refresh` leaves the previous snapshot in place on failure
+  // while stamping `polledAt` only on a successful commit. So under exactly the lock contention
+  // that made this create time out in the first place, the surviving snapshot can be minutes old
+  // while reads keep failing. Deciding from it would find 0 candidates, drop the pending entry and
+  // latch — leaving the committed bead an open child of the epic bound to no agent, which
+  // `rollUpEpicGoal` reports `stranded` forever. Undecided is the correct answer; the next tick
+  // asks again.
+  // READ-START, NOT READ-COMPLETION. `beadsPolledAt` stamps when the read FINISHED, so a `bd list`
+  // already in flight when our create landed commits a stamp NEWER than `pending.at` while its
+  // contents were read BEFORE the write — and both slownesses have the same cause (one Dolt lock),
+  // so that straddle is the common shape here, not an exotic one. Comparing against the read's
+  // START is the only form that proves the board could already contain our bead.
+  const readAt = beadsReadStartedAt(projectId);
+  if (readAt === undefined || readAt < pending.at) return;
+  const project = useProjectStore.getState().projects.find((p) => p.id === projectId);
+  const boundIds = new Set(
+    (project?.agents ?? []).map((a) => a.beadId).filter((id): id is string => !!id),
+  );
+  const candidates = snapshot.beads.filter(
+    (b) =>
+      b.parent === pending.parent &&
+      b.title === pending.title &&
+      b.status !== "closed" &&
+      b.labels.includes(AUTO_LABEL) &&
+      !boundIds.has(b.id),
+  );
+  pendingAmbiguousCreate.delete(agentId);
+  const only = candidates.length === 1 ? candidates[0] : undefined;
+  if (only) {
+    useProjectStore.getState().setAgentBeadId(projectId, agentId, only.id);
+    autoBeadWeWroteFor.set(agentId, only.id);
+    return;
+  }
+  if (candidates.length > 1) {
+    console.debug(
+      "syncBeadLifecycle: ambiguous create matched",
+      candidates.length,
+      "beads for",
+      agentId,
+      "— refusing to guess",
+    );
+  }
+  // Nothing landed (or we cannot tell which): latch, exactly as the blind path used to.
+  beadCreateFailed.add(agentId);
+}
+
+/**
+ * THE OTHER ORDERING: close an auto-bead this poll minted that something has since UNBOUND.
+ *
+ * RE-READ #2 in the create branch only arbitrates the interleaving where the competing write lands
+ * INSIDE our `await`. The mirror case is just as reachable and was previously unhandled: our create
+ * resolves FIRST, we bind our id, and `buildAgentSpawn`'s fire-and-forget `.then()` resolves a beat
+ * later and calls `setAgentBeadId` again — which clobbers unconditionally. Our bead is then
+ * referenced by nothing, and since `sparkle-f2tzxg` it is a CHILD OF THE EPIC, so the lifecycle
+ * never claims or closes it and `engine/epicGoalRollup` reports that slice `stranded` for good.
+ *
+ * The clobber cannot be prevented from here — the only place to arbitrate two writers is the spawn
+ * itself, and it is deliberately not touched by this change. What CAN be done is notice on the next
+ * tick and CLOSE the bead we lost, which is the same remedy RE-READ #2 applies: a closed child reads
+ * `done` in that rollup, so the epic is whole again. The stranding is therefore bounded by one poll
+ * interval instead of being permanent.
+ *
+ * ONE ATTEMPT, whatever happens. The entry is dropped before the close is tried, so a close that
+ * keeps failing cannot re-issue a `bd` write every 5s for the rest of the session — the same
+ * accrete-nothing bias as `beadCreateFailed`.
+ */
+async function reconcileClobberedAutoBead(
+  projectId: string,
+  projectPath: string,
+  agentId: string,
+): Promise<void> {
+  const ours = autoBeadWeWroteFor.get(agentId);
+  if (!ours) return;
+  const live = liveBeadIdOf(projectId, agentId);
+  if (live === ours) return; // still bound to what we wrote — nothing to reconcile
+  autoBeadWeWroteFor.delete(agentId);
+  // The row lost its bead altogether (agent reset/removed mid-tick). Ours is not provably orphaned
+  // by another writer, and closing on that guess could close a bead something is about to re-bind.
+  if (!live) return;
+  try {
+    await closeBead(projectPath, ours);
+  } catch (e) {
+    console.debug("syncBeadLifecycle: could not close the clobbered auto-bead", ours, e);
+  }
 }
 
 /** Advance a deliverable agent's bead from its current workflow STAGE, monotonically and best-effort
@@ -408,6 +651,14 @@ export async function syncBeadLifecycle(
   // Skip the shell-outs entirely (latched below on the first such failure) so we don't spawn a bd
   // subprocess per deliverable agent per poll for a project that doesn't use beads.
   if (beadsUnavailableProjects.has(projectId)) return;
+  // Before anything else: if a bead WE minted has since been unbound by another writer, close it so
+  // it cannot sit as a stranded open child of the epic. Runs every tick, independent of whether
+  // this agent has any lifecycle action left — the clobber makes `hasBead` true, so the create
+  // branch below would never look again.
+  await reconcileClobberedAutoBead(projectId, projectPath, agent.id);
+  // …and if a previous tick's create was write-AMBIGUOUS, look on the board for the bead that may
+  // have landed and adopt it, rather than latching over a committed orphan.
+  resolvePendingAmbiguousCreate(projectId, agent.id);
   // ATTRIBUTION side of sparkle-xk3x: `dirty` is the one BranchStatus field read from the
   // worktree rather than the branch ref, so when the worktree is parked on another branch its
   // dirt belongs to THAT branch. Counting it here would mark a landed agent as having real work
@@ -432,22 +683,84 @@ export async function syncBeadLifecycle(
     for (const action of actions) {
       if (action === "create") {
         if (beadId || beadCreateFailed.has(agent.id) || creatingBeadFor.has(agent.id)) return;
+        // A create we could not confirm is still outstanding — re-issuing it is the non-idempotent
+        // retry that mints a second epic child. Wait for the board lookup to settle it.
+        if (pendingAmbiguousCreate.has(agent.id)) return;
         creatingBeadFor.add(agent.id);
         try {
           const title = agent.name?.trim() || "Build agent";
-          const newId = await createBead(
-            projectPath,
-            title,
-            "Auto-created by Sparkle for a deliverable Build agent.",
-            AUTO_LABEL, // telemetry, not backlog — see AUTO_LABEL and the board's exclude filter
-          );
-          if (!newId) {
-            // bd ran but its output didn't yield an id — don't retry (would orphan a bead per poll).
-            beadCreateFailed.add(agent.id);
-            return;
+          // ── RE-READ #1, BEFORE THE CREATE ────────────────────────────────────────────────────
+          // `agent.beadId` is the caller's projection, captured at the top of the tick.
+          // `buildAgentSpawn` binds its own bead from a fire-and-forget `.then()`, so that
+          // projection goes stale the instant it lands and this branch would mint a SECOND bead for
+          // an agent that already has one. Adopt what the row actually says and skip the create.
+          const alreadyBound = liveBeadIdOf(projectId, agent.id);
+          if (alreadyBound) {
+            beadId = alreadyBound;
+            continue;
+          }
+          // EPIC LINKAGE (bead sparkle-f2tzxg). Read the epic off the LIVE row too, for the same
+          // reason: `buildAgentSpawn` writes `epicId` SYNCHRONOUSLY at spawn, so between that and
+          // its bead landing the row reads `epicId` SET / `beadId` UNSET — exactly the state this
+          // branch fires on, and exactly what a projection captured earlier in the tick would miss.
+          const epicParent = liveEpicIdOf(projectId, agent.id);
+          let newId: string | null;
+          if (epicParent) {
+            newId = await createParentedAutoBead(projectPath, title, epicParent, agent.id);
+            if (!newId) {
+              // WRITE-AMBIGUOUS, not "failed": bd may have committed this bead. Latching here is
+              // what leaves a stranded open child of the epic, so record what we asked for and let
+              // the next tick look for it on the board — resolvePendingAmbiguousCreate.
+              // `at` STAMPS THE WRITE. The board lookup must not decide from a snapshot read
+              // BEFORE this create, or absence of the bead proves nothing — see
+              // resolvePendingAmbiguousCreate.
+              pendingAmbiguousCreate.set(agent.id, { title, parent: epicParent, at: Date.now() });
+              return;
+            }
+          } else {
+            newId = await createBead(
+              projectPath,
+              title,
+              AUTO_BEAD_BODY,
+              AUTO_LABEL, // telemetry, not backlog — see AUTO_LABEL and the board's exclude filter
+            );
+            if (!newId) {
+              // bd ran but its output didn't yield an id — don't retry (would orphan one per poll).
+              // Unparented, so unlike the branch above it cannot strand an epic.
+              beadCreateFailed.add(agent.id);
+              return;
+            }
+          }
+          // ── RE-READ #2, AFTER THE CREATE: DO NOT CLOBBER, AND DO NOT STRAND ──────────────────
+          // The `await` above is a `bd` shell-out against a single-writer store under lock
+          // contention — seconds, not milliseconds — and the spawn's own `createBeadFull` can land
+          // inside that window. Overwriting the row's id here would leave the LOSING bead bound to
+          // nothing, and since `sparkle-f2tzxg` both beads are now CHILDREN OF THE EPIC. An
+          // unreferenced open child is not merely untidy: nothing ever claims or closes it (the
+          // lifecycle only writes to `row.beadId`), so `engine/epicGoalRollup` reports that slice
+          // `stranded` — "nothing is carrying this slice" — the moment any sibling moves off
+          // `open`, and `readyToClose = done === slices.length` can NEVER be true for that epic
+          // again. Parenting the bead is precisely what turned a harmless invisible orphan into a
+          // permanent false alarm, so the fix ships with the change that causes it.
+          //
+          // First writer wins, and the loser is CLOSED rather than abandoned: a closed child reads
+          // `done` in that same rollup, so it costs the epic nothing. Best-effort — a close that
+          // fails leaves exactly the orphan we would have had anyway, and must not break the poll.
+          const boundDuringCreate = liveBeadIdOf(projectId, agent.id);
+          if (boundDuringCreate && boundDuringCreate !== newId) {
+            beadId = boundDuringCreate;
+            try {
+              await closeBead(projectPath, newId);
+            } catch (e) {
+              console.debug("syncBeadLifecycle: could not close the raced-out auto-bead", newId, e);
+            }
+            continue;
           }
           beadId = newId;
           useProjectStore.getState().setAgentBeadId(projectId, agent.id, newId);
+          // Remember what we bound, so a LATER tick can tell that another writer has since rebound
+          // the row and close the bead we lost — see reconcileClobberedAutoBead.
+          autoBeadWeWroteFor.set(agent.id, newId);
         } finally {
           creatingBeadFor.delete(agent.id);
         }

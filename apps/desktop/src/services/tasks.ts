@@ -11,6 +11,13 @@
 import { invoke } from "@tauri-apps/api/core";
 import type { Metering } from "./anthropic";
 import { projectNameForPath } from "./creditProject";
+import { loadEpicPrdIndex, resolveEpicPrdRef, setEpicPrd } from "./epicPrd";
+
+/** Re-exported so every existing importer (and `tasks.test.ts`) keeps reading it from here. The
+ *  implementation moved to `epicPrd.ts` — the module that owns the structured-first resolve rule —
+ *  so that this file and that one need not import each other. It is the FALLBACK half of that rule
+ *  and is deliberately kept: thousands of epics carry their PRD only as this prose line. */
+export { parsePrdRef } from "./epicPrd";
 
 export interface PlannedTask {
   title: string;
@@ -271,6 +278,23 @@ async function createChildTasks(
 }
 
 /**
+ * Record an epic's PRD path as structured bd metadata, swallowing any failure.
+ *
+ * The ONE place this file writes the field, shared by `generateTasks` (recording it as the epic is
+ * created) and `decomposeEpic` (backfilling it for an epic that only ever had the prose line). Not
+ * a seam on an injected deps object: this is a single Tauri command with no alternative
+ * implementation, and a defaulted seam every test overrides would leave the line that supplies the
+ * real value covered by nothing.
+ */
+async function recordEpicPrd(projectPath: string, epicId: string, prdPath: string): Promise<void> {
+  try {
+    await setEpicPrd(projectPath, epicId, prdPath);
+  } catch {
+    // A structured PRD path is an improvement on the prose back-link, never a precondition of one.
+  }
+}
+
+/**
  * Generate the epic + child tasks from a PRD and write back the linkage. See module header for the
  * strict-vs-best-effort split.
  */
@@ -308,6 +332,17 @@ export async function generateTasks(
       "think-build-loop",
     );
     epicIds.push(epicId);
+    // ── THE STRUCTURED HALF OF THE SAME BACK-LINK ────────────────────────────────────────────
+    // Written HERE, one line after the prose `PRD file:` line above, deliberately: metadata and
+    // prose are recorded from the SAME `args.prdRelPath` at the SAME moment, so the two can never
+    // disagree about an epic this app created. Anywhere else and they would be two writes with a
+    // window between them.
+    //
+    // BEST-EFFORT, in the shape of step 6 below: a bd write that fails (a busy single-writer store
+    // is routine here) must not undo an epic whose beads and children already exist. The prose
+    // back-link is still in the body, and `resolveEpicPrdRef` falls back to it — which is exactly
+    // why the failure is survivable rather than merely tolerated.
+    await recordEpicPrd(args.projectPath, epicId, args.prdRelPath);
     const childIds = await createChildTasks(deps, args.projectPath, epicId, epic);
     taskIds.push(...childIds);
   }
@@ -344,18 +379,6 @@ export async function generateTasks(
 }
 
 // ── decomposeEpic — child tasks for an EXISTING epic (spec §7 auto-decompose) ──────────────────
-
-/** Pull the `PRD file: <relPath>` back-link out of an epic body (written by generateTasks).
- *  Returns the repo-relative path plus the bare filename (what the read_prd /
- *  write_prd commands take), or null when the epic carries no PRD reference. Pure. */
-export function parsePrdRef(body: string): { relPath: string; filename: string } | null {
-  // Capture to end of line, not \S+ — PRD paths may contain spaces (write_prd allows them).
-  const relPath = /PRD file:[ \t]*(.+)$/m.exec(body)?.[1]?.trim();
-  if (!relPath) return null;
-  const filename = relPath.split("/").pop();
-  if (!filename) return null;
-  return { relPath, filename };
-}
 
 export interface DecomposeDeps {
   structuredJson: GenerateDeps["structuredJson"];
@@ -422,9 +445,10 @@ export interface DecomposeResult {
 /**
  * Decompose an EXISTING epic into child task beads + dependency edges — the auto-decompose
  * counterpart of generateTasks (which creates the epic itself). Plans from the epic's PRD content
- * when the body carries a `PRD file:` back-link (falling back to title+body if the read fails or
- * no PRD exists), creates the children under the existing epic id, and writes the epic/task ids
- * back into the PRD frontmatter when a PRD was read. Errors propagate — the caller (the decompose
+ * when the epic HAS a PRD — structured `prd` metadata first, the prose `PRD file:` back-link as
+ * fallback (falling back to title+body if the read fails or no PRD exists) — creates the children
+ * under the existing epic id, and writes the epic/task ids back into the PRD frontmatter when a
+ * PRD was read. Errors propagate — the caller (the decompose
  * sweep) owns the guard-label bookkeeping.
  */
 export async function decomposeEpic(
@@ -437,7 +461,13 @@ export async function decomposeEpic(
   // throws — an epic whose PRD was moved/deleted/blanked still decomposes from the bead itself.
   // `prdContent !== null` is the single "a PRD was read" signal for both the plan input and the
   // write-back below.
-  const ref = parsePrdRef(epic.description);
+  //
+  // STRUCTURED FIRST, PROSE ONLY AS FALLBACK — `resolveEpicPrdRef` is the one rule, shared with
+  // the epic ladder, the Build It hook and the stall sweep. `loadEpicPrdIndex` never throws: a bd
+  // read that fails yields an empty index, which is the behaviour this function had before the
+  // field existed.
+  const prdIndex = await loadEpicPrdIndex(projectPath);
+  const ref = resolveEpicPrdRef(epic, prdIndex);
   let prdContent: string | null = null;
   if (ref) {
     try {
@@ -446,6 +476,28 @@ export async function decomposeEpic(
     } catch {
       prdContent = null;
     }
+  }
+  // THE BACKFILL, and the only write path that is reachable in the shipped app today (see the
+  // `generateTasks` note — its own caller chain has no importer). Recording the path as structured
+  // metadata makes it retrievable by a future agent's `bd show` without asking anyone to re-derive
+  // it. Only when the index did NOT already carry it, so this is one write per epic for the whole
+  // life of the epic rather than one per decompose.
+  //
+  // GATED ON `prdContent`, NOT ON `ref` — and the difference is not cosmetic. The `readPrd` above
+  // deliberately TOLERATES a PRD that was moved, deleted or blanked by setting `prdContent = null`
+  // and carrying on, so `ref` alone proves only that the prose carries a `PRD file:` line, never
+  // that the line still points at anything. Promoting an unread path would freeze a DEAD path into
+  // the shared Dolt store, where `resolveEpicPrdRef` is structured-first and this backfill is
+  // one-shot: every reader — Build It, the ladder drop, the sweep restart and `decomposeEpic`
+  // itself — would then be handed the stale path forever, outranking a prose line a human later
+  // corrected, and `set_epic_prd` deliberately offers no unset to undo it. So only a path that was
+  // just proved to resolve to real content earns the promotion.
+  // `ref &&` is redundant at RUNTIME — `prdContent` is only ever set inside the `if (ref)` above —
+  // but the compiler cannot carry that narrowing across the two statements, and `ref.relPath`
+  // below is a deref. Kept explicit rather than asserted with `!`, so a future edit that decouples
+  // the two is a type error here instead of a null deref at runtime.
+  if (prdContent !== null && ref && !prdIndex.get(epic.id)?.trim()) {
+    await recordEpicPrd(projectPath, epic.id, ref.relPath);
   }
   const planInput = prdContent ?? `# ${epic.title}\n\n${epic.description}`;
 

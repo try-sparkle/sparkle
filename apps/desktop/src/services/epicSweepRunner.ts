@@ -49,7 +49,11 @@ import {
   type Bead,
 } from "./beads";
 import { epicStatus } from "./planView";
-import { parsePrdRef } from "./tasks";
+import {
+  loadEpicPrdIndex,
+  resolveEpicPrdPath,
+  type EpicPrdIndex,
+} from "./epicPrd";
 import { useBeadsStore } from "../stores/beadsStore";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
@@ -350,6 +354,10 @@ export interface EpicSweepOptions {
   notify?: (text: string) => boolean;
   /** Can a notice reach the founder from THIS window at all? Defaults to the real probe. */
   canNotify?: () => boolean;
+  /** id → PRD path for the beads carrying structured `prd` metadata, so the restart hands the
+   *  resumed orchestrator the epic's PRD by path. Defaults to the real (cached, never-throwing)
+   *  `loadEpicPrdIndex`; injected by tests. */
+  prdIndexFor?: (projectPath: string) => Promise<EpicPrdIndex>;
 }
 
 /** Parse a bd ISO-8601 timestamp. Returns null on anything unreadable, which the engine then
@@ -613,22 +621,25 @@ export async function sweepEpics(opts: EpicSweepOptions = {}): Promise<EpicSweep
   const requestDecomposeEnabled = opts.requestDecomposeEnabled ?? DECOMPOSE_REQUEST_ENABLED;
   const notify = opts.notify ?? ((text: string) => notifyConcierge(text, "pusher"));
   const canNotify = opts.canNotify ?? conciergeNotifierAvailable;
+  const prdIndexFor = opts.prdIndexFor ?? loadEpicPrdIndex;
   const restart =
     opts.restart ??
-    ((projectId: string, epicId: string) =>
+    (async (projectId: string, epicId: string) =>
       sendToBuildAwaited({
         projectId,
         epicId,
         // The epic's own PRD, so the resumed orchestrator is pointed at the plan by path rather than
-        // told to go find it. `parsePrdRef` is the same parser the board's Start button uses, and it
-        // returns null for a PRD-less epic — which `resumeInstruction` handles by falling back to
-        // `bd show`. Read from the beads already in hand; no extra query.
-        // Resolved through `beadsFor`, the same seam the sweep reads everything else from, so a
-        // test that injects beads gets the PRD it declared rather than a store read. Declared below
-        // this closure but initialized long before it is ever called.
-        prdPath:
-          parsePrdRef(beadsFor(projectId)?.find((b) => b.id === epicId)?.description ?? "")?.relPath ??
-          null,
+        // told to go find it. `resolveEpicPrdPath` is the ONE rule the board's Start button, the
+        // epic ladder and `decomposeEpic` also use — structured `prd` metadata first, the prose
+        // `PRD file:` line only as fallback — and it returns null for a PRD-less epic, which
+        // `resumeInstruction` handles by falling back to `bd show`.
+        // The bead is read through `beadsFor`, the same seam the sweep reads everything else from,
+        // so a test that injects beads gets the PRD it declared rather than a store read. Both it
+        // and `projects` are declared below this closure but initialized long before it is called.
+        prdPath: resolveEpicPrdPath(
+          beadsFor(projectId)?.find((b) => b.id === epicId),
+          await prdIndexFor(projects.find((p) => p.id === projectId)?.rootPath ?? ""),
+        ),
         mode: "epic",
         // NOBODY CLICKED THIS. `landInAgent` would leave the board, select the agent, open its pane
         // and scroll its row into view — stealing the founder's screen on a ten-minute timer, which
