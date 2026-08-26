@@ -23,6 +23,10 @@ import {
   // `liveUsageRows` so the fleet switch, the helper rescue, the spawn gate, and `useLimitSync` all
   // read ONE source and cannot disagree — see `accountSelection.deadLoginIds`.
   deadLoginIds,
+  // The PROACTIVE cousin of the reactive turn-failure rotation, called here on the idle poll so the
+  // concierge's sticky account moves off an ineligible one BEFORE a turn — see the tick below.
+  rotateStickyConsumerOffSpentAccount,
+  CONCIERGE_ACCOUNT_KEY,
 } from "../services/accountSelection";
 import {
   listCeilings,
@@ -140,6 +144,25 @@ export function useAccountSwitch(pollMs: number = HEADROOM_POLL_MS): AccountSwit
             ceilings,
             identities: state.identities,
           };
+          // ══ PROACTIVELY ROTATE THE IDLE CONCIERGE OFF AN INELIGIBLE ACCOUNT ═════════════════════
+          // The concierge is a STICKY consumer (`CONCIERGE_ACCOUNT_KEY`), and its sticky pointer is
+          // moved off a spent/expired account only REACTIVELY: `ConciergeHost` rotates on an
+          // auth/quota TURN failure, and `concierge.ts` re-checks at the START of a turn. Neither
+          // fires while the concierge sits idle — so a sticky snapshot pinned to an account that has
+          // since walled or had its login expire stays there, the app shows the concierge "blocked",
+          // and nothing moves it until the founder's NEXT question fails or the caches happen to warm.
+          // This 120s headroom sweep is the one always-on idle loop that already loads account state
+          // and warms the health caches, so it is where the idle concierge gets rescued: fire the SAME
+          // proactive primitive the turn path uses, keyed on the concierge, on every believable tick.
+          // Fully self-guarded and a no-op unless the sticky account is spent/expired AND a healthy
+          // alternative exists — it never rotates off a human pin, never benches the fleet's last
+          // usable account, and returns `rotated: false` when the current account is still eligible
+          // (see `rotateStickyConsumerOffSpentAccount`). Fire-and-forget (it re-resolves the sticky
+          // pointer internally) and ABOVE the plan-suppression return below, so an idle concierge on a
+          // dead account is moved even while an unrelated fleet migration is advancing.
+          void rotateStickyConsumerOffSpentAccount(CONCIERGE_ACCOUNT_KEY, {
+            avoidClobberedDefault: true,
+          });
         }
         const current = busiestPaneAccount();
         // The shared DEFINITELY-expired-login set. `loadAccountState` above kicks the background

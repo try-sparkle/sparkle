@@ -5,11 +5,15 @@ import {
   NEVER_IDLE_NUDGE_TEXT,
   NEVER_IDLE_ESCALATED_NUDGE_TEXT,
   NEVER_IDLE_ESCALATE_AFTER,
+  CONCIERGE_NOTIFY_CADENCE_MS,
   neverIdleNudgeText,
   respinFleetNudgeText,
+  conciergeNotifyNudgeText,
   _resetImproveNudgeForTests,
   decideImproveNudge,
   improveLastNudgedAt,
+  improveLastConciergeNotifiedAt,
+  improveLastConciergeNotifyFingerprint,
   sweepImproveNudge,
   type ImproveNudgeDeps,
   type ImproveNudgeInput,
@@ -33,6 +37,7 @@ function makeDeps(
     fingerprint: string | null;
     ready: number;
     p1PipelineHealth: number;
+    p1PipelineHealthFingerprint: string | null;
     freeSlots: number;
     activeWorkers: number;
     sendResult: boolean;
@@ -48,6 +53,7 @@ function makeDeps(
     fingerprint: "idle" as string | null,
     ready: 3,
     p1PipelineHealth: 0,
+    p1PipelineHealthFingerprint: null as string | null,
     // DEFAULT: workers already draining, so the default idle-with-backlog case takes the GENERIC
     // reminder path (which the escalation/rate-limit/grace suites below exercise). The re-spin suite
     // overrides `activeWorkers: 0` to reach the specific push.
@@ -65,7 +71,11 @@ function makeDeps(
       consentIsNever: () => o.consentIsNever,
       paneStatus: () => o.paneStatus,
       advanceFingerprint: () => o.fingerprint,
-      readyBacklog: () => ({ ready: o.ready, p1PipelineHealth: o.p1PipelineHealth }),
+      readyBacklog: () => ({
+        ready: o.ready,
+        p1PipelineHealth: o.p1PipelineHealth,
+        p1PipelineHealthFingerprint: o.p1PipelineHealthFingerprint,
+      }),
       capacity: () => ({ freeSlots: o.freeSlots, activeWorkers: o.activeWorkers }),
       send: async (text: string) => {
         sent.push(text);
@@ -305,6 +315,99 @@ describe("sweepImproveNudge — rate limiting (guardrail c: respect the cadence)
   });
 });
 
+// ── THE CONCIERGE-NOTIFY PUSH — the SIDE EFFECT: given idle + flat signal + an OPEN P1 pipeline-health
+//    bead the concierge has not heard about, the SPECIFIC "message the concierge (send_peer_message to
+//    sparkle:concierge)" text is what actually lands in the inbox, ahead of the re-spin and generic
+//    pushes. Deduped per DISTINCT set of red beads (the fingerprint) per the concierge window. ───────
+describe("sweepImproveNudge — the concierge-notify push (surface a RED pipeline-health finding)", () => {
+  beforeEach(() => _resetImproveNudgeForTests());
+
+  const RED = { p1PipelineHealth: 1, p1PipelineHealthFingerprint: "ph-1" } as const;
+  const C = NEVER_IDLE_CADENCE_MS; // ordinary nudge cadence (== ADVANCE_IDLE_MS)
+  const CC = CONCIERGE_NOTIFY_CADENCE_MS; // the concierge re-remind window
+
+  it("idle + flat + a red finding the concierge has not heard about → sends the concierge-notify message", async () => {
+    const sent = await sweepStaleThen(ADVANCE_IDLE_MS, { ...RED });
+    expect(sent).toEqual([conciergeNotifyNudgeText(1)]);
+    // and it is DISTINCT from the generic reminder — the whole point of the push.
+    expect(sent[0]).not.toBe(NEVER_IDLE_NUDGE_TEXT);
+  });
+
+  it("the concierge-notify message names the send_peer_message channel, the red finding, and the no-factors rule", async () => {
+    const sent = await sweepStaleThen(ADVANCE_IDLE_MS, {
+      p1PipelineHealth: 2,
+      p1PipelineHealthFingerprint: "ph-a,ph-b",
+    });
+    expect(sent[0]).toContain("send_peer_message to sparkle:concierge");
+    expect(sent[0]).toContain("2 RED pipeline-health findings");
+    expect(sent[0]).toContain("NOT factors");
+  });
+
+  it("PAIRED ABSENCE: same idle-with-work setup but NO red finding → NEVER the concierge-notify (generic instead)", async () => {
+    // Remove only the red bead. Proves the concierge-notify is caused by the red finding, not by the
+    // idleness every nudge path shares — the mechanism, not a precondition.
+    const sent = await sweepStaleThen(ADVANCE_IDLE_MS, {
+      p1PipelineHealth: 0,
+      p1PipelineHealthFingerprint: null,
+    });
+    expect(sent).toEqual([NEVER_IDLE_NUDGE_TEXT]);
+    expect(sent[0]).not.toBe(conciergeNotifyNudgeText(1));
+  });
+
+  it("PRE-EMPTS the re-spin push: a red finding wins even when the fleet is idle-with-headroom (ready + slots + 0 workers)", async () => {
+    const sent = await sweepStaleThen(ADVANCE_IDLE_MS, {
+      ready: 7,
+      freeSlots: 5,
+      activeWorkers: 0,
+      ...RED,
+    });
+    expect(sent).toEqual([conciergeNotifyNudgeText(1)]);
+    expect(sent[0]).not.toBe(respinFleetNudgeText(7, 5));
+  });
+
+  it("records WHICH finding the concierge was told about on a confirmed send", async () => {
+    const t0 = 5_000_000;
+    await sweepImproveNudge(makeDeps({ now: t0, fingerprint: "idle", ...RED }).deps); // baseline
+    await sweepImproveNudge(makeDeps({ now: t0 + C, fingerprint: "idle", ...RED }).deps); // notify
+    expect(improveLastConciergeNotifyFingerprint()).toBe("ph-1");
+    expect(improveLastConciergeNotifiedAt()).toBe(t0 + C);
+  });
+
+  it("does NOT re-surface the SAME still-red finding within the window — a later nudge is generic, not a second concierge ping", async () => {
+    const t0 = 5_000_000;
+    await sweepImproveNudge(makeDeps({ now: t0, fingerprint: "idle", ...RED }).deps); // baseline
+    const first = makeDeps({ now: t0 + C, fingerprint: "idle", ...RED });
+    await sweepImproveNudge(first.deps);
+    expect(first.sent).toEqual([conciergeNotifyNudgeText(1)]);
+    // Past the ordinary nudge cadence but WITHIN the concierge window, same finding → generic reminder.
+    const second = makeDeps({ now: t0 + 2 * C, fingerprint: "idle", ...RED });
+    await sweepImproveNudge(second.deps);
+    expect(second.sent).toEqual([NEVER_IDLE_NUDGE_TEXT]);
+  });
+
+  it("re-surfaces a CHANGED red finding (a new bead the concierge has not heard about) immediately", async () => {
+    const t0 = 5_000_000;
+    await sweepImproveNudge(makeDeps({ now: t0, fingerprint: "idle", ...RED }).deps); // baseline
+    await sweepImproveNudge(makeDeps({ now: t0 + C, fingerprint: "idle", ...RED }).deps); // notify ph-1
+    // The red set changes to ph-2 — a finding the concierge has not been told about → notify again.
+    const changed = makeDeps({ now: t0 + 2 * C, fingerprint: "idle", p1PipelineHealth: 1, p1PipelineHealthFingerprint: "ph-2" });
+    await sweepImproveNudge(changed.deps);
+    expect(changed.sent).toEqual([conciergeNotifyNudgeText(1)]);
+  });
+
+  it("RE-surfaces the same still-red finding once the concierge window elapses (a persistently-unfixed red)", async () => {
+    const t0 = 5_000_000;
+    await sweepImproveNudge(makeDeps({ now: t0, fingerprint: "idle", ...RED }).deps); // baseline
+    const first = makeDeps({ now: t0 + C, fingerprint: "idle", ...RED });
+    await sweepImproveNudge(first.deps);
+    expect(first.sent).toEqual([conciergeNotifyNudgeText(1)]);
+    // A full concierge window later, still the SAME red finding → surfaced again.
+    const later = makeDeps({ now: t0 + C + CC, fingerprint: "idle", ...RED });
+    await sweepImproveNudge(later.deps);
+    expect(later.sent).toEqual([conciergeNotifyNudgeText(1)]);
+  });
+});
+
 // ── The pure decision, asserted directly so each guardrail is pinned as arithmetic and the whole
 //    rule is mutation-checkable without spies. `advancedRecently` is a plain boolean here — the
 //    fingerprint→clock derivation is exercised by the sweep tests above. ───────────────────────────
@@ -319,6 +422,10 @@ describe("decideImproveNudge — the idle-and-has-backlog rule", () => {
     advancedRecently: false,
     readyBacklogCount: 2,
     p1PipelineHealthCount: 0,
+    pipelineHealthFingerprint: null,
+    lastConciergeNotifyFingerprint: null,
+    lastConciergeNotifiedAt: null,
+    conciergeCadenceMs: CONCIERGE_NOTIFY_CADENCE_MS,
     freeSlots: 4,
     activeWorkers: 1,
     lastNudgedAt: null,
@@ -351,6 +458,56 @@ describe("decideImproveNudge — the idle-and-has-backlog rule", () => {
     [{ readyBacklogCount: 0, p1PipelineHealthCount: 1, freeSlots: 8, activeWorkers: 0 }, "P1-only, no ready backlog"],
   ])("stays GENERIC when the re-spin condition is not fully met (%o — %s)", (patch) => {
     expect(decideImproveNudge({ ...base, ...patch })).toEqual({ nudge: true, kind: "generic" });
+  });
+
+  // ── THE CONCIERGE-NOTIFY ARM, pinned as arithmetic on the pure decision ─────────────────────────
+  it("returns kind:concierge-notify with the fingerprint + count when a red pipeline-health finding is unheard-of", () => {
+    expect(
+      decideImproveNudge({ ...base, p1PipelineHealthCount: 2, pipelineHealthFingerprint: "ph-a,ph-b" }),
+    ).toEqual({ nudge: true, kind: "concierge-notify", fingerprint: "ph-a,ph-b", count: 2 });
+  });
+
+  it("concierge-notify PRE-EMPTS respin: a red finding wins over an idle-with-headroom fleet", () => {
+    expect(
+      decideImproveNudge({
+        ...base,
+        readyBacklogCount: 6,
+        freeSlots: 8,
+        activeWorkers: 0,
+        p1PipelineHealthCount: 1,
+        pipelineHealthFingerprint: "ph-1",
+      }),
+    ).toEqual({ nudge: true, kind: "concierge-notify", fingerprint: "ph-1", count: 1 });
+  });
+
+  it("does NOT re-notify the concierge about the SAME finding within the window (falls back to generic)", () => {
+    expect(
+      decideImproveNudge({
+        ...base,
+        p1PipelineHealthCount: 1,
+        pipelineHealthFingerprint: "ph-1",
+        lastConciergeNotifyFingerprint: "ph-1",
+        lastConciergeNotifiedAt: base.now - 1_000, // 1s ago, well within the window
+      }),
+    ).toEqual({ nudge: true, kind: "generic" });
+  });
+
+  it("re-notifies once the concierge window has elapsed for a still-red finding (>=, boundary allowed)", () => {
+    expect(
+      decideImproveNudge({
+        ...base,
+        p1PipelineHealthCount: 1,
+        pipelineHealthFingerprint: "ph-1",
+        lastConciergeNotifyFingerprint: "ph-1",
+        lastConciergeNotifiedAt: base.now - CONCIERGE_NOTIFY_CADENCE_MS, // exactly the window
+      }),
+    ).toEqual({ nudge: true, kind: "concierge-notify", fingerprint: "ph-1", count: 1 });
+  });
+
+  it("a null fingerprint never takes the concierge-notify shape, even with a positive count (fail-safe)", () => {
+    expect(
+      decideImproveNudge({ ...base, p1PipelineHealthCount: 1, pipelineHealthFingerprint: null }),
+    ).toEqual({ nudge: true, kind: "generic" });
   });
 
   it.each<[Partial<ImproveNudgeInput>, string]>([

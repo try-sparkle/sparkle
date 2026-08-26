@@ -256,15 +256,28 @@ function neverIdleArmed(): boolean {
 
 /** Live count of the Improve Sparkle project's ready work — the board's `backlog` column (open,
  *  unblocked, non-stalled, telemetry-filtered) and, counted separately, its open P1 pipeline-health
- *  beads (so a blocked-but-open P1 still says "there is work"). Both read from the 5s beads poll's
- *  cached snapshot — no `bd` shell call on this 60s tick, which is what keeps the watcher cheap. */
-function improveReadyBacklog(): { ready: number; p1PipelineHealth: number } {
+ *  beads (so a blocked-but-open P1 still says "there is work"). Also returns a FINGERPRINT of those
+ *  P1 pipeline-health beads (their sorted ids joined, or `null` when there are none) — the identity the
+ *  concierge-notify push dedups on, so a red finding is surfaced to the concierge once per distinct set
+ *  of red beads rather than every tick. All read from the 5s beads poll's cached snapshot — no `bd`
+ *  shell call on this 60s tick, which is what keeps the watcher cheap. */
+function improveReadyBacklog(): {
+  ready: number;
+  p1PipelineHealth: number;
+  p1PipelineHealthFingerprint: string | null;
+} {
   const snap = useBeadsStore.getState().byProject[SPARKLE_PROJECT_ID];
-  if (snap === undefined) return { ready: 0, p1PipelineHealth: 0 };
-  const p1PipelineHealth = snap.beads.filter(
+  if (snap === undefined) return { ready: 0, p1PipelineHealth: 0, p1PipelineHealthFingerprint: null };
+  const p1Beads = snap.beads.filter(
     (b) => b.status === "open" && b.priority === 1 && b.labels.includes(PIPELINE_HEALTH_LABEL),
-  ).length;
-  return { ready: snap.board.backlog.length, p1PipelineHealth };
+  );
+  const p1PipelineHealthFingerprint =
+    p1Beads.length === 0 ? null : p1Beads.map((b) => b.id).sort().join(",");
+  return {
+    ready: snap.board.backlog.length,
+    p1PipelineHealth: p1Beads.length,
+    p1PipelineHealthFingerprint,
+  };
 }
 
 /**

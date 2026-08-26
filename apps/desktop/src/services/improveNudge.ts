@@ -133,6 +133,45 @@ export function respinFleetNudgeText(readyCount: number, freeSlots: number): str
 }
 
 /**
+ * The SPECIFIC "notify the concierge about a RED pipeline-health finding" push. When the board carries
+ * an OPEN P1 pipeline-health bead — the fleet's highest-severity signal, the kind that needs a HUMAN to
+ * unblock it — the correct action is not to quietly work the bead but to SURFACE it to the concierge,
+ * which is the fleet hub and the only channel that routes the fix to the founder. The generic
+ * INTAKE→PULL reminder is too soft for this: the agent kept working the red bead in silence while the
+ * human stayed unaware. So this message names the finding and gives the one imperative — send the
+ * concierge a message NOW via `send_peer_message` to `sparkle:concierge` — with the founder's standing
+ * rule baked in so the machine restates it every window rather than trusting memory: caps, cost and
+ * permission are NEVER factors for surfacing a red fleet signal.
+ *
+ * Like `respinFleetNudgeText` this carries digits, which is safe for the same reason: `sweepImproveNudge`
+ * sends it directly via `send`, never through the Pusher's challenge path, so `checkCitations` never
+ * sees it. It must not be routed through the challenge path.
+ */
+export function conciergeNotifyNudgeText(p1PipelineHealthCount: number): string {
+  const finding =
+    p1PipelineHealthCount === 1
+      ? "a RED pipeline-health finding (1 open P1 pipeline-health bead)"
+      : `${p1PipelineHealthCount} RED pipeline-health findings (${p1PipelineHealthCount} open P1 pipeline-health beads)`;
+  return (
+    `You have ${finding} — message the concierge NOW (send_peer_message to sparkle:concierge) with ` +
+    `it; the concierge is the fleet hub and routes the human fix. Do NOT reply with a status report, ` +
+    `a plan, or a question, and do NOT just work the bead in silence — SEND the concierge the finding ` +
+    `so the human learns it is red. Caps, token cost, and permission are NOT factors; surfacing a red ` +
+    `fleet signal to the human is the whole point.`
+  );
+}
+
+/**
+ * How long the SAME still-open red pipeline-health finding waits before the concierge-notify push may
+ * repeat. A CHANGED set of red beads (a new finding the concierge has not heard about) fires
+ * immediately, subject only to the ordinary nudge cadence; the same unchanged set re-reminds the
+ * concierge at most once per this window, so a persistently-unfixed red is resurfaced without spamming
+ * it every tick. Thirty minutes — longer than the ordinary nudge cadence, because the concierge has
+ * already been told and only a stale, still-red finding warrants a repeat.
+ */
+export const CONCIERGE_NOTIFY_CADENCE_MS = 30 * 60 * 1000;
+
+/**
  * How long after a delivered nudge before another may be sent to the same agent.
  *
  * Ten minutes, chosen against the Pusher's 60s tick: without a floor the sweep would re-nudge every
@@ -188,6 +227,20 @@ export interface ImproveNudgeInput {
   /** How many open P1 pipeline-health beads exist — the highest-value ready work, counted separately
    *  so a blocked-but-open P1 still satisfies "there is work" even if the backlog column is empty. */
   p1PipelineHealthCount: number;
+  /** A stable fingerprint IDENTIFYING the current set of open P1 pipeline-health beads (their sorted
+   *  ids joined), or `null` when there are none or nothing readable. Identity, not a count, so the
+   *  concierge-notify push dedups per DISTINCT set of red beads — a changed fingerprint is a finding
+   *  the concierge has not heard about. `null` here can never produce a concierge-notify. */
+  pipelineHealthFingerprint: string | null;
+  /** The pipeline-health fingerprint the concierge was last notified about, or `null` if never. A
+   *  fingerprint that DIFFERS from this is a new/changed red finding → notify now; an unchanged one
+   *  re-notifies only once `conciergeCadenceMs` has elapsed. Window-local, like `lastNudgedAt`. */
+  lastConciergeNotifyFingerprint: string | null;
+  /** When the last concierge-notify was delivered, or `null` if never. Feeds the same "re-remind only
+   *  past the window" dedup as the fingerprint. */
+  lastConciergeNotifiedAt: number | null;
+  /** How long the SAME still-red fingerprint waits before the concierge-notify may repeat. */
+  conciergeCadenceMs: number;
   /** Machine headroom: free local agent slots (`localAgentCapacity` `limit − used`, clamped ≥ 0).
    *  When > 0 there is room to spawn a drain fleet; when 0 the machine is full and the re-spin push
    *  would be counterproductive, so the generic reminder is used instead. */
@@ -205,6 +258,7 @@ export interface ImproveNudgeInput {
 export type ImproveNudgeDecision =
   | { nudge: true; kind: "generic" }
   | { nudge: true; kind: "respin"; readyCount: number; freeSlots: number }
+  | { nudge: true; kind: "concierge-notify"; fingerprint: string; count: number }
   | { nudge: false; reason: ImproveNudgeRefusal };
 
 export type ImproveNudgeRefusal =
@@ -230,11 +284,20 @@ export type ImproveNudgeRefusal =
  *   6. `no-ready-backlog`  — nothing is ready, so resting is CORRECT; it may rest (guardrail a).
  *   7. `rate-limited`      — a nudge was delivered within `cadenceMs`; give the turn room to act.
  *
- * On a `nudge` verdict it chooses the SHAPE of the push (bead sparkle-4hwu2i): when there is ready
- * backlog AND the machine has free agent slots AND no drain worker is currently active, the fleet is
- * idle-with-work-and-headroom and the correct action is to re-spin the drain fleet — `kind: "respin"`,
- * carrying the numbers the message names. Otherwise (backlog exists but there is no headroom, or
- * workers are already draining) it keeps the existing generic INTAKE→PULL reminder — `kind: "generic"`.
+ * On a `nudge` verdict it chooses the SHAPE of the push, in priority order:
+ *
+ *   1. `concierge-notify` — an OPEN P1 pipeline-health bead exists (a RED fleet signal a human must
+ *      unblock) that the concierge has not been told about this window. This PRE-EMPTS re-spin and the
+ *      generic reminder: the founder wants a red signal SURFACED to the concierge (the fleet hub, which
+ *      routes the human fix), not quietly worked. Deduped per DISTINCT set of red beads — a new/changed
+ *      `pipelineHealthFingerprint` fires now, the same fingerprint re-fires only past `conciergeCadenceMs`
+ *      (a persistently-unfixed red is resurfaced, but not every tick). `pipelineHealthFingerprint === null`
+ *      (no red / unreadable) can never take this shape.
+ *   2. `respin` (bead sparkle-4hwu2i) — ready backlog AND free agent slots AND zero active workers: the
+ *      fleet is idle-with-work-and-headroom, so the correct action is to re-spin the drain fleet,
+ *      carrying the numbers the message names.
+ *   3. `generic` — otherwise (backlog exists but there is no headroom, or workers are already draining):
+ *      the existing generic INTAKE→PULL reminder.
  */
 export function decideImproveNudge(input: ImproveNudgeInput): ImproveNudgeDecision {
   if (!input.armed) return { nudge: false, reason: "not-armed" };
@@ -250,10 +313,32 @@ export function decideImproveNudge(input: ImproveNudgeInput): ImproveNudgeDecisi
   if (input.lastNudgedAt !== null && input.now - input.lastNudgedAt < input.cadenceMs) {
     return { nudge: false, reason: "rate-limited" };
   }
-  // Idle, with work, past the cadence. Push the SPECIFIC re-spin action when there are ready beads to
-  // drain, machine headroom to run them, and zero workers already draining; otherwise the generic
-  // reminder. `readyBacklogCount > 0` (not the P1 arm) gates re-spin because the message names "N
-  // ready beads" to dispatch — a lone blocked-but-open P1 has nothing to fan a drain fleet across.
+  // Idle, with work, past the cadence. Choose the shape.
+  //
+  // HIGHEST PRIORITY: a RED pipeline-health finding the concierge has not been told about. This is the
+  // fleet's most urgent signal — an open P1 pipeline-health bead needs a HUMAN to unblock it — so the
+  // founder wants it surfaced to the concierge hub, ahead of any drain-fleet re-spin or generic
+  // reminder. Deduped per distinct set of red beads: a changed fingerprint (a new finding) fires now,
+  // an unchanged one re-fires only once `conciergeCadenceMs` has elapsed. A `null` fingerprint (no red
+  // beads, or an unreadable board) can never reach here — the fail-toward-silence direction.
+  if (input.p1PipelineHealthCount > 0 && input.pipelineHealthFingerprint !== null) {
+    const isNewFinding = input.pipelineHealthFingerprint !== input.lastConciergeNotifyFingerprint;
+    const windowElapsed =
+      input.lastConciergeNotifiedAt === null ||
+      input.now - input.lastConciergeNotifiedAt >= input.conciergeCadenceMs;
+    if (isNewFinding || windowElapsed) {
+      return {
+        nudge: true,
+        kind: "concierge-notify",
+        fingerprint: input.pipelineHealthFingerprint,
+        count: input.p1PipelineHealthCount,
+      };
+    }
+  }
+  // Push the SPECIFIC re-spin action when there are ready beads to drain, machine headroom to run them,
+  // and zero workers already draining; otherwise the generic reminder. `readyBacklogCount > 0` (not the
+  // P1 arm) gates re-spin because the message names "N ready beads" to dispatch — a lone blocked-but-open
+  // P1 has nothing to fan a drain fleet across.
   if (input.readyBacklogCount > 0 && input.freeSlots > 0 && input.activeWorkers === 0) {
     return { nudge: true, kind: "respin", readyCount: input.readyBacklogCount, freeSlots: input.freeSlots };
   }
@@ -279,8 +364,10 @@ export interface ImproveNudgeDeps {
    * `pusherMount.improveAdvanceFingerprint` for what feeds it, and `sweepImproveNudge` for the clock.
    */
   advanceFingerprint(): string | null;
-  /** The ready-work counts, read from the beads board. */
-  readyBacklog(): { ready: number; p1PipelineHealth: number };
+  /** The ready-work counts, read from the beads board, plus a fingerprint IDENTIFYING the open P1
+   *  pipeline-health beads (their sorted ids joined, or `null` when there are none) — the identity the
+   *  concierge-notify push dedups on. */
+  readyBacklog(): { ready: number; p1PipelineHealth: number; p1PipelineHealthFingerprint: string | null };
   /** The machine-capacity reading behind the re-spin decision: `freeSlots` is the local agent
    *  headroom (`localAgentCapacity` `limit − used`, clamped ≥ 0) and `activeWorkers` is how many
    *  local drain workers are occupying slots right now. */
@@ -309,10 +396,23 @@ let lastAdvanceAt: number | null = null;
  *  the streak) and incremented on each confirmed delivery. Feeds `neverIdleNudgeText` so the message
  *  escalates when the agent keeps answering the nudge without shipping. Window-local, not persisted. */
 let consecutiveIdleNudges = 0;
+/** When the concierge was last notified about a red pipeline-health finding, and the fingerprint of the
+ *  finding it was told about. Window-local, not persisted, exactly like `lastNudgedAt`. Together they
+ *  dedup the concierge-notify push per DISTINCT set of red beads per `CONCIERGE_NOTIFY_CADENCE_MS`. */
+let lastConciergeNotifiedAt: number | null = null;
+let lastConciergeNotifyFingerprint: string | null = null;
 
 /** Test/introspection seam: the current flat-signal nudge streak. */
 export function improveConsecutiveIdleNudges(): number {
   return consecutiveIdleNudges;
+}
+
+/** Test/introspection seam: when did the concierge last get a pipeline-health notify, and about what. */
+export function improveLastConciergeNotifiedAt(): number | null {
+  return lastConciergeNotifiedAt;
+}
+export function improveLastConciergeNotifyFingerprint(): string | null {
+  return lastConciergeNotifyFingerprint;
 }
 
 /** Test seam: forget every clock so one suite cannot leak into the next. */
@@ -321,6 +421,8 @@ export function _resetImproveNudgeForTests(): void {
   consecutiveIdleNudges = 0;
   lastFingerprint = null;
   lastAdvanceAt = null;
+  lastConciergeNotifiedAt = null;
+  lastConciergeNotifyFingerprint = null;
 }
 
 /** Test/introspection seam: when did the last nudge land? */
@@ -385,6 +487,10 @@ export async function sweepImproveNudge(deps: ImproveNudgeDeps): Promise<Improve
       advancedRecently,
       readyBacklogCount: backlog.ready,
       p1PipelineHealthCount: backlog.p1PipelineHealth,
+      pipelineHealthFingerprint: backlog.p1PipelineHealthFingerprint,
+      lastConciergeNotifyFingerprint,
+      lastConciergeNotifiedAt,
+      conciergeCadenceMs: CONCIERGE_NOTIFY_CADENCE_MS,
       freeSlots: capacity.freeSlots,
       activeWorkers: capacity.activeWorkers,
       lastNudgedAt,
@@ -408,11 +514,20 @@ export async function sweepImproveNudge(deps: ImproveNudgeDeps): Promise<Improve
     const text =
       decision.kind === "respin"
         ? respinFleetNudgeText(decision.readyCount, decision.freeSlots)
-        : neverIdleNudgeText(consecutiveIdleNudges);
+        : decision.kind === "concierge-notify"
+          ? conciergeNotifyNudgeText(decision.count)
+          : neverIdleNudgeText(consecutiveIdleNudges);
     const delivered = await deps.send(text);
     if (delivered) {
       lastNudgedAt = now;
       consecutiveIdleNudges += 1;
+      // A confirmed concierge-notify records WHICH red finding the concierge now knows about, so the
+      // same still-open set is not re-surfaced until `CONCIERGE_NOTIFY_CADENCE_MS` has passed while a
+      // brand-new red finding fires on its next eligible tick.
+      if (decision.kind === "concierge-notify") {
+        lastConciergeNotifiedAt = now;
+        lastConciergeNotifyFingerprint = decision.fingerprint;
+      }
     }
     return { sent: delivered, detail: delivered ? "nudged" : "transport-failed" };
   } catch (e) {

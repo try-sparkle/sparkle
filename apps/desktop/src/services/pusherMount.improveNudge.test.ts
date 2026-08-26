@@ -56,7 +56,10 @@ describe("buildImproveNudgeDeps — the real readers reach the live stores", () 
     const beads: Bead[] = [
       bead({ id: "r1" }),
       bead({ id: "r2" }),
-      bead({ id: "phc", priority: 1, labels: [PIPELINE_HEALTH_LABEL] }),
+      // Two open P1 pipeline-health beads, deliberately given ids in DESCENDING order so the fingerprint
+      // assertion below proves the reader SORTS them (a stable identity), not merely concatenates.
+      bead({ id: "ph-z", priority: 1, labels: [PIPELINE_HEALTH_LABEL] }),
+      bead({ id: "ph-a", priority: 1, labels: [PIPELINE_HEALTH_LABEL] }),
     ];
     const board = emptyBoard();
     board.backlog = beads;
@@ -66,14 +69,20 @@ describe("buildImproveNudgeDeps — the real readers reach the live stores", () 
 
     const got = buildImproveNudgeDeps().readyBacklog();
     // Proves the reader reached `byProject[SPARKLE_PROJECT_ID].board.backlog` — a constant or a wrong
-    // project id could not produce 3, and the P1 filter reached the label + priority fields.
-    expect(got).toEqual({ ready: 3, p1PipelineHealth: 1 });
+    // project id could not produce 4, and the P1 filter reached the label + priority fields. The
+    // fingerprint proves it read the actual bead IDS and sorted them, so a changed set of red beads is a
+    // changed fingerprint (what the concierge-notify dedup keys on).
+    expect(got).toEqual({ ready: 4, p1PipelineHealth: 2, p1PipelineHealthFingerprint: "ph-a,ph-z" });
   });
 
-  it("readyBacklog() returns the fail-safe {0,0} when the sparkle board is unpolled", () => {
-    // The absent-snapshot case: the poll has not populated the store yet. Must read as no-work (rest),
-    // never as a spurious nudge.
-    expect(buildImproveNudgeDeps().readyBacklog()).toEqual({ ready: 0, p1PipelineHealth: 0 });
+  it("readyBacklog() returns the fail-safe empty reading when the sparkle board is unpolled", () => {
+    // The absent-snapshot case: the poll has not populated the store yet. Must read as no-work (rest)
+    // with a NULL fingerprint (no red finding to surface), never as a spurious nudge.
+    expect(buildImproveNudgeDeps().readyBacklog()).toEqual({
+      ready: 0,
+      p1PipelineHealth: 0,
+      p1PipelineHealthFingerprint: null,
+    });
   });
 
   it("paneStatus() and advanceFingerprint() read the improve agent's own runtime status", () => {
