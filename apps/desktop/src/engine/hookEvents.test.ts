@@ -57,6 +57,27 @@ describe("hookEventToStatus", () => {
     ).toBe("approval");
   });
 
+  it("maps an 'approval' Notification to approval (red), not idle (sparkle-gzu9yc)", () => {
+    // The production payload measured 77× says "approval", NOT "approve". The old matcher tested
+    // `\bapprove\b`, whose trailing word boundary cannot match "approval" (no boundary after the
+    // "e"), so a genuinely blocked-on-a-human agent fell through to idle (gray). Assert the SIDE
+    // EFFECT — the status written — for the literal production string. Against the old `\bapprove\b`
+    // this reds, which is what makes it non-vacuous.
+    expect(
+      hookEventToStatus({
+        event: "Notification",
+        message: "Claude needs your approval to continue",
+      }),
+    ).toBe("approval");
+    // The whole stem must be covered, not just this one inflection.
+    for (const message of [
+      "approved the plan? awaiting your approval",
+      "your sign-off approving this step is required",
+    ]) {
+      expect(hookEventToStatus({ event: "Notification", message })).toBe("approval");
+    }
+  });
+
   it("maps a non-permission idle Notification to idle (gray, NOT red)", () => {
     // Regression: Claude's idle-60s ping fires after a turn ends (often while a background shell
     // keeps running). It is NOT the agent asking you anything, so it must stay gray — red is

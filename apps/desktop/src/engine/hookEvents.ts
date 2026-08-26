@@ -50,7 +50,16 @@ export interface HookEvent {
 // a background shell keeps running) — so it must stay gray, never red. Red is reserved for real
 // approval prompts; treating the idle ping as red was the false-red bug (an agent that's done or
 // working in the background showing as if it were blocking on you).
-const PERMISSION_RE = /\b(permission|approve|allow)\b/i;
+//
+// The `approv` STEM (not the word `approve`) is load-bearing: production payloads say "approval"
+// far more than "approve", and `\bapprove\b` MISSES "approval" — the word boundary demands a
+// non-word char after the final "e", which "approval" does not have. That gap flipped 77 genuinely
+// blocked-on-a-human agents to gray/idle (sparkle-gzu9yc); two source comments elsewhere wrongly
+// claimed no Notification fires at all for this case, which is why it went unlooked-at. So this
+// alternative carries a leading `\b` (scoping it to word-initial "approv", so "disapprove" and the
+// like don't match) but NO trailing boundary — it must span approve/approval/approved/approving.
+// `permission` and `allow` keep both boundaries: those are the exact whole words Claude Code emits.
+const PERMISSION_RE = /\bpermission\b|\bapprov|\ballow\b/i;
 
 // A handful of tools BLOCK the turn on the user rather than doing work: their PreToolUse fires and
 // then Claude sits waiting for an answer, with NO Stop and — unlike a permission request — NO
