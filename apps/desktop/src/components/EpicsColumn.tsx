@@ -90,12 +90,21 @@ import { useEpicHealthOf } from "../hooks/useEpicHealthOf";
 import type { AgentTab } from "../types";
 import { EpicHealthSquare } from "./EpicHealthSquare";
 import {
+  STALLED_LABEL,
   childrenOfIndexed,
   epicDisplayTitle,
   epicIndexOf,
   openChildCountIndexed,
   type Bead,
 } from "../services/beads";
+// ── THE DROP RULE LIVES OUTSIDE THIS FILE, AND THAT IS THE POINT ──────────────────────────────
+// `epicDrop` decides what a drop writes and where the card will come to rest; `applyEpicDrop`
+// performs it through the bead primitives the board's own controls already use. Neither knows
+// anything about React, so the whole rule is asserted in `epicDrop.test.ts` with no rendered
+// column — and this file keeps no opinion of its own about what a stage MEANS.
+import { epicDropPlan, type EpicDropPlan } from "../services/epicDrop";
+import { applyEpicDrop } from "../services/applyEpicDrop";
+import { parsePrdRef } from "../services/tasks";
 
 /** How much room the ladder leaves for the pull tab on the seam side. The rail is 6px and the grip
  *  chiclet overhangs it slightly, so 10 clears both without eating a readable amount of a 280px
@@ -361,6 +370,110 @@ export function EpicsColumn({
     // has, and so the sort's own cache is keyed on the bucketed arrays' identity.
     return bucketed ? sortEpicBoard(bucketed, sortBy, dateField, allBeads) : null;
   }, [board, allBeads, healthOf, sortBy, dateField]);
+
+  // ── DRAGGING AN EPIC BETWEEN STAGES ──────────────────────────────────────────────────────────
+  //
+  // The founder: *"for any epics, I should be able to drag them in the epic column. Into different
+  // stages."* / *"Just like I can drag them in the board into different stages."*
+  //
+  // ══ THE BOARD DOES NOT ACTUALLY DO THIS, SO THERE IS NO MACHINERY TO SHARE ═══════════════════
+  // `BoardView` has no drag of any kind — its own doc says so verbatim: *"There are deliberately no
+  // drag handles, status dropdowns, or any edit controls — nothing here mutates a bead."* No card
+  // in this app is draggable and there is no dnd library. So "reuse rather than build a rival" is
+  // honoured the only way available: the DECISION is a pure module (`services/epicDrop`) and the
+  // WRITES are the primitives the board's existing controls already call, so a board drag added
+  // later reads the same rule instead of growing a second one.
+  //
+  // ══ THE ID LIVES IN REACT STATE, NOT IN `dataTransfer` ═══════════════════════════════════════
+  // The same shape `AgentSidebar` uses for agent-row reorder. Source and target are in one tree, so
+  // there is nothing to serialise; `dataTransfer` would only matter for a drag that leaves the
+  // window, which this one cannot.
+  //
+  // ⚠️ NOT `services/dndTargets`. That module hit-tests Tauri's window-global OS FILE drops, which
+  // arrive as a cursor position with no element. This is an in-app HTML5 card drag with a real
+  // event target, and reaching for `isOverDndTarget` here would be a misuse of the wrong layer.
+  const [dragEpicId, setDragEpicId] = useState<string | null>(null);
+  // The refusal to show, and WHICH rung refused it. Cleared on the next drag, so a reason never
+  // outlives the gesture that produced it.
+  const [refusal, setRefusal] = useState<{ key: EpicLadderKey; reason: string } | null>(null);
+
+  const dragEpic = useMemo(
+    () => (dragEpicId ? (allBeads.find((b) => b.id === dragEpicId) ?? null) : null),
+    [dragEpicId, allBeads],
+  );
+
+  // bd's dependency-blocked set, as far as this snapshot can tell.
+  //
+  // The store keeps the board ALREADY BUCKETED and does not carry the raw set, so it is read back
+  // off `board.blocked` — the same place `useBeadBuildActions` reads it. A bead is in that column
+  // for one of two reasons (a real dependency, or the sweep's `stalled` label), and only the label
+  // is visible from here, so a bead carrying it is assumed to be there BECAUSE of it.
+  //
+  // The one case that misreads is a bead that is BOTH dependency-blocked and stalled: taking the
+  // label off is then predicted to free it when it will not. That direction is the safe one — it
+  // accepts a drop that turns out to be a no-op, rather than refusing a legitimate one — and it
+  // cannot cause a wrong write, because the prediction only ever gates the refusal.
+  const blockedIds = useMemo(
+    () =>
+      new Set(
+        (board?.blocked ?? [])
+          .filter((b) => !b.labels.includes(STALLED_LABEL))
+          .map((b) => b.id),
+      ),
+    [board],
+  );
+
+  /** What a drop of the epic currently being dragged onto `key` would do — or why it is refused.
+   *  `null` when nothing is being dragged, which is what makes every rung inert at rest. */
+  const planFor = useCallback(
+    (key: EpicLadderKey): EpicDropPlan | null => {
+      if (!dragEpic) return null;
+      // THE SAME FLEET PREDICATE THE LADDER ITSELF USES, never a second staffing rule — that is the
+      // rival-rule drift `epicBoard.ts` warns about at length, and it would put the predicted
+      // landing and the rendered rung into disagreement about one epic.
+      return epicDropPlan(key, dragEpic, allBeads, blockedIds, (id) =>
+        rungForEpicHealth(healthOf(id)),
+      );
+    },
+    [dragEpic, allBeads, blockedIds, healthOf],
+  );
+
+  const onDropOnStage = useCallback(
+    (key: EpicLadderKey) => {
+      const plan = planFor(key);
+      setDragEpicId(null);
+      if (!plan || !project || !dragEpic) return;
+      // A BACKSTOP, not the path that shows a refusal: a refusing rung never cancels `dragover`,
+      // so the platform never delivers `drop` to it and this branch does not run in a browser. The
+      // reason is set in `onDragOver` instead. Kept because an ancestor that cancels the event
+      // would make the drop bubble here, and a refusal that silently wrote would be far worse than
+      // a duplicated sentence.
+      if (!plan.ok) {
+        setRefusal({ key, reason: plan.reason });
+        return;
+      }
+      setRefusal(null);
+      const rootPath = project.rootPath;
+      // A project with no checkout has nowhere to write. Refusing loudly beats a drop that appears
+      // to work and silently does nothing.
+      if (!rootPath) {
+        setRefusal({ key, reason: "This project has no local checkout to write to." });
+        return;
+      }
+      void applyEpicDrop({
+        projectId: project.id,
+        rootPath,
+        epicId: dragEpic.id,
+        // NOT re-derived — `parsePrdRef` on the description is the same rule the card's own Build It
+        // button uses to find an epic's PRD.
+        prdPath: parsePrdRef(dragEpic.description)?.relPath ?? null,
+        plan,
+      }).catch((e: unknown) => {
+        setRefusal({ key, reason: e instanceof Error ? e.message : "That move didn’t stick." });
+      });
+    },
+    [planFor, project, dragEpic],
+  );
 
   // ── SELECTION ────────────────────────────────────────────────────────────────────────────────
   const focusedEpicId = useUiStore((s) => s.epicFocusBySide[side]);
@@ -794,8 +907,69 @@ export function EpicsColumn({
           EPIC_LADDER_COLUMNS.map(({ key, label }) => {
             const rows = ladder[key];
             const isCollapsed = collapsed.has(key);
+            // ── THIS RUNG AS A DROP TARGET ──────────────────────────────────────────────────
+            // `null` at rest (nothing is being dragged), so the column behaves exactly as it did
+            // before this feature whenever no gesture is in flight.
+            //
+            // THE TARGET IS THE STAGE, NEVER A ROW. Two reasons, and both are load-bearing:
+            // `Workspace.epicsColumn.test.tsx` pins that a click ANYWHERE inside a row opens the
+            // card, so a row-level drop target would sit on top of the column's one gesture; and
+            // beads have no manual order to drop INTO — `boardSort` owns the order within a rung
+            // and its arrays are cache-shared and explicitly must not be mutated.
+            const plan = planFor(key);
+            const refused = plan !== null && !plan.ok;
+            const showRefusal = refusal?.key === key ? refusal.reason : null;
             return (
-              <div key={key} data-testid={`epics-stage-${key}`}>
+              <div
+                key={key}
+                data-testid={`epics-stage-${key}`}
+                /* WHAT THIS RUNG WOULD DO WITH THE DRAG IT CAN SEE — "accept", "refuse", or absent
+                   when nothing is being dragged. Read by the tests, and the honest thing to expose:
+                   it is the rung's own answer, not a guess about the pointer. */
+                data-drop={plan === null ? undefined : refused ? "refuse" : "accept"}
+                onDragOver={(e) => {
+                  if (plan === null) return;
+                  // `preventDefault` is what makes an element a drop target at all. Called ONLY on
+                  // the accepting path: leaving it off is precisely how the platform paints the
+                  // "no entry" cursor, so a refusal is visible DURING the drag rather than as
+                  // nothing happening after it.
+                  if (refused) {
+                    e.dataTransfer.dropEffect = "none";
+                    // ══ AND THE REASON IS SET HERE, NOT IN `onDrop` ═══════════════════════════
+                    // Not cosmetic placement — the drop handler is UNREACHABLE on this path. HTML5
+                    // dispatches `drop` to an element only if that element cancelled `dragover`,
+                    // and the line above deliberately does not cancel it. A reason produced on drop
+                    // would therefore never be seen in a browser, leaving a refused drag with the
+                    // "no entry" cursor and no sentence — the silent-gesture failure this note
+                    // exists to prevent. (jsdom dispatches `drop` unconditionally, so only a test
+                    // that asserts mid-gesture can tell the two apart; the drag suite does.)
+                    //
+                    // Guarded, because `dragover` fires continuously while the pointer is held
+                    // still: the reason is a pure function of this rung and the dragged epic, so
+                    // re-setting it once per tick would be a render per frame for no new fact.
+                    if (refusal?.key !== key) setRefusal({ key, reason: plan.reason });
+                    return;
+                  }
+                  e.preventDefault();
+                  e.dataTransfer.dropEffect = "move";
+                }}
+                onDrop={(e) => {
+                  if (plan === null) return;
+                  e.preventDefault();
+                  onDropOnStage(key);
+                }}
+                style={
+                  plan !== null && !refused
+                    ? {
+                        // A landing spot, painted only while a drag that this rung would ACCEPT is
+                        // in flight. Inset rather than an outline so it cannot shift the ladder's
+                        // layout mid-drag, which would move the target out from under the cursor.
+                        boxShadow: `inset 0 0 0 1px ${C.tealInk}`,
+                        borderRadius: 3,
+                      }
+                    : undefined
+                }
+              >
                 <button
                   data-testid={`epics-stage-toggle-${key}`}
                   aria-expanded={!isCollapsed}
@@ -834,12 +1008,35 @@ export function EpicsColumn({
                   <span style={{ flex: 1, minWidth: 0 }}>{label}</span>
                   <span data-testid={`epics-stage-count-${key}`}>{rows.length}</span>
                 </button>
+                {/* WHY THE DROP DID NOT TAKE, on the rung that refused it. A refusal has to say
+                    something: a gesture that completes and changes nothing is read as a broken
+                    control, and the user's next move is to drag it again. */}
+                {showRefusal !== null && (
+                  <div
+                    data-testid={`epics-stage-refusal-${key}`}
+                    role="status"
+                    style={{
+                      color: C.muted,
+                      fontFamily: FONT_UI,
+                      fontSize: TYPE.micro,
+                      padding: "2px 10px 6px",
+                    }}
+                  >
+                    {showRefusal}
+                  </div>
+                )}
                 {!isCollapsed &&
                   rows.map((epic) => (
                     <Fragment key={epic.id}>
                       <EpicRow
                         epic={epic}
                         allBeads={allBeads}
+                        onDragStartEpic={() => {
+                          setDragEpicId(epic.id);
+                          // A new gesture retires the previous one's explanation.
+                          setRefusal(null);
+                        }}
+                        onDragEndEpic={() => setDragEpicId(null)}
                         /* `null` on the three terminal rungs — a finished epic has no health to
                            report, and `epicHealthApplies` is where that is decided. */
                         health={epicHealthApplies(key) ? healthOf(epic.id) : null}
@@ -958,6 +1155,8 @@ function EpicRow({
   selected,
   reveal = false,
   onSelect,
+  onDragStartEpic,
+  onDragEndEpic,
 }: {
   epic: Bead;
   allBeads: readonly Bead[];
@@ -969,6 +1168,20 @@ function EpicRow({
    *  ever true for one row at a time (see `revealEpicId`). */
   reveal?: boolean;
   onSelect: () => void;
+  /** This row has been picked up. The column holds the dragged id — see its DRAGGING block for why
+   *  it is React state rather than `dataTransfer`.
+   *
+   *  ══ OPTIONAL, AND THE CALLBACK IS THE SWITCH ═════════════════════════════════════════════════
+   *  Omitted, the row is not draggable at all — the same rule `BeadCard`'s `onChat` uses to hide a
+   *  control the surrounding surface cannot honour. The standalone-task reveal above the ladder
+   *  passes neither: that row is drawn for a task belonging to NO epic and sitting in NO rung, so
+   *  there is no stage for it to move between, and offering the grab would promise a gesture that
+   *  cannot mean anything. A boolean prop would leave the two facts free to disagree. */
+  onDragStartEpic?: () => void;
+  /** The gesture ended, dropped or not. MUST clear the drag: without it a drag abandoned outside
+   *  any rung (the ESC key, a drop on the window chrome) leaves every stage painted as a live
+   *  landing spot forever. */
+  onDragEndEpic?: () => void;
 }) {
   // Still the RESOLVER's edge, never a local re-derivation — see this file's header and
   // scripts/lib/epic-membership-guard.sh. Only the lookup changed: these are the indexed reads of
@@ -1018,6 +1231,18 @@ function EpicRow({
       data-revealed={reveal ? "true" : undefined}
       data-selected={String(selected)}
       aria-pressed={selected}
+      /* ── THE DRAG SOURCE ────────────────────────────────────────────────────────────────────
+         The whole row, not a separate grip. A 280px row holding a square, an ellipsised title, a
+         count and a priority chiclet has no room for a handle that is still big enough to hit, and
+         the row's one click gesture (open the card) is unaffected — a press that MOVES becomes a
+         drag and a press that does not stays a click, which is the platform's own rule. */
+      draggable={onDragStartEpic !== undefined}
+      /* Announces the affordance to assistive tech WITHOUT overriding the row's accessible name,
+         which an `aria-label` here would. Same reason `AgentRow` uses this attribute — and it is
+         gated with the rest, so a row that cannot be dragged does not claim it can. */
+      aria-roledescription={onDragStartEpic ? "draggable epic card" : undefined}
+      onDragStart={onDragStartEpic}
+      onDragEnd={onDragEndEpic}
       onClick={onSelect}
       title={epic.title}
       style={{
