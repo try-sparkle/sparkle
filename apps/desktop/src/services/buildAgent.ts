@@ -181,8 +181,25 @@ export const DEFAULT_PREVIEW_EAGERNESS: PreviewEagerness = "visual";
  * So the rule is unchanged and its answer flipped — the fragment goes wherever the tool is
  * REACHABLE. It stays governed by `[preview] agent_eagerness`, which is the knob a project reaches
  * for when it does not want N workers each holding a dev server; the tier is not.
+ *
+ * ══ `planning` — WHY THE BRIEF HAS TO BE TOLD, AND WHY IT LOOKED LIKE IT ALREADY WAS ════════════
+ * Bead `sparkle-dlrqb8.3`, epic `sparkle-dlrqb8` (the founder asked for the localhost preview to be
+ * "part of the instructions in planning mode"). There is NO plan-mode persona in this repo: a
+ * plan-mode agent is an ordinary agent launched with `--permission-mode plan`, spawned `kind:
+ * "build"` (`buildAgentSpawn.ts`, the only writer of the field), so it already receives this whole
+ * fragment through `orchestrationPersona`. Grepping a plan-mode brief for "preview" therefore
+ * returns a hit, which is exactly why this piece read as shipped for weeks while being inert.
+ *
+ * It was inert because of the WHEN clause below: it is written for an agent that has BUILT
+ * something ("OPEN IT EARLY, as soon as there is something renderable"), and a plan-mode agent is
+ * forbidden to edit. Under its own rule the planner correctly opens nothing. `planning` is the
+ * clause that makes the ask actionable for it — show the app AS IT IS, so the plan arrives with a
+ * baseline to point at.
+ *
+ * `planning` does NOT bypass `agent_eagerness`: every call site still omits the entire fragment
+ * when the knob says `"never"`, so a project that has opted out stays opted out in plan mode too.
  */
-export function previewProtocol(opts: { eagerness: PreviewEagerness }): string {
+export function previewProtocol(opts: { eagerness: PreviewEagerness; planning?: boolean }): string {
   return [
     "SHOW YOUR WORK — OPEN A LIVE PREVIEW",
     "- People judge a change by LOOKING at it, not by reading a diff. A dev-server URL printed into",
@@ -198,6 +215,19 @@ export function previewProtocol(opts: { eagerness: PreviewEagerness }): string {
           "  component, a layout, styling, on-screen copy, a chart. Work with nothing to see (a pure",
           "  refactor, a config edit, a docs change, backend-only plumbing) does not need one.",
         ]),
+    ...(opts.planning
+      ? [
+          "- YOU ARE IN PLANNING MODE, so you cannot edit and there is nothing of YOURS to show — and",
+          "  that is exactly when a preview earns its place. Open one on the app AS IT IS and put the",
+          "  url in the plan itself, so whoever reads the plan can LOOK at the surface it is about",
+          "  instead of imagining it. A plan for visual work that arrives with nothing to look at is",
+          "  the failure this protocol exists to end, and planning is where it is cheapest to fix.",
+          "- SAY IN THE PLAN that the url shows the CURRENT state, not the proposed one. A reader who",
+          "  mistakes the baseline for the outcome concludes the work is already done.",
+          "- The preview is scoped to YOUR OWN worktree, so it does not carry over to whoever builds",
+          "  the plan — they open their own. What carries over is the url in the plan text.",
+        ]
+      : []),
     "- HOW: call the `preview` tool on the `sparkle-control` MCP server with `{ op: \"open\" }`.",
     "  It detects the project's dev server, starts it against YOUR OWN worktree on a loopback port,",
     "  and surfaces it as a CARD in the concierge column that opens the url in a real browser.",
@@ -239,11 +269,15 @@ export function previewProtocol(opts: { eagerness: PreviewEagerness }): string {
  * it is the pane a person is most likely to be typing into while looking at something, which is
  * exactly when a preview is worth having.
  */
-export function genericAgentProtocol(opts: { previewEagerness?: PreviewEagerness } = {}): string {
+export function genericAgentProtocol(
+  opts: { previewEagerness?: PreviewEagerness; planning?: boolean } = {},
+): string {
   const eagerness = opts.previewEagerness ?? DEFAULT_PREVIEW_EAGERNESS;
   return [
     sparkleControlProtocol(),
-    ...(eagerness === "never" ? [] : ["", previewProtocol({ eagerness })]),
+    // `planning` rides through unchanged: a generic pane CAN be in plan mode (`AgentPane` forwards
+    // `permissionMode` on this branch too), and the fragment is inert for a planner without it.
+    ...(eagerness === "never" ? [] : ["", previewProtocol({ eagerness, planning: opts.planning })]),
   ].join("\n");
 }
 
@@ -519,6 +553,9 @@ export function workerPersona(opts: {
     "",
     sparkleControlProtocol(),
     ...(opts.guardrails ? ["", guardrailsProtocol()] : []),
+    // NO `planning` HERE, and it is not an omission: `permissionMode` is written only by
+    // `buildAgentSpawn`, which always creates `kind: "build"`, so a worker can never be in plan
+    // mode. Passing it would be an option nothing could ever set — see `previewProtocol`'s header.
     // The worker is USUALLY the agent doing the visual work, and until `CONTROL_OP_TIERS.preview`
     // became `free` it was the one kind that could not show it. `?? DEFAULT_PREVIEW_EAGERNESS`, not
     // `?? "never"`, for the same reason as the orchestrator's call below: an omitted option is a
@@ -694,6 +731,11 @@ export function orchestrationPersona(opts: {
    *  as off — an absent config must not silently mean "stop asking for previews", which is the
    *  failure this whole fragment exists to end. */
   previewEagerness?: PreviewEagerness;
+  /** True when this agent was launched with `--permission-mode plan`. THE ONLY thing in prompt
+   *  assembly that reads plan mode — see `previewProtocol`'s header for why the preview ask is
+   *  inert for a planner without it. Absent reads as "not planning", which is the safe default:
+   *  it yields exactly today's brief. */
+  planning?: boolean;
 }): string {
   return [
     "You are a Sparkle BUILD agent — the master ORCHESTRATOR.",
@@ -867,6 +909,12 @@ export function orchestrationPersona(opts: {
     // the default silently the opposite of the shipped one.
     ...((opts.previewEagerness ?? DEFAULT_PREVIEW_EAGERNESS) === "never"
       ? []
-      : ["", previewProtocol({ eagerness: opts.previewEagerness ?? DEFAULT_PREVIEW_EAGERNESS })]),
+      : [
+          "",
+          previewProtocol({
+            eagerness: opts.previewEagerness ?? DEFAULT_PREVIEW_EAGERNESS,
+            planning: opts.planning,
+          }),
+        ]),
   ].join("\n");
 }

@@ -1006,6 +1006,23 @@ function AgentPaneInner({
           }
           const persona = orchestrationPersona({
             ownBranch: wt.branch,
+            // Plan mode reaches the BRIEF, not just the claude flag. `permissionMode` is only ever
+            // `"plan"` (types.ts), so the comparison is the honest read rather than a truthiness
+            // check on a field that could grow other values. Without this the preview ask is inert
+            // for a planner: its WHEN clause presumes the agent has built something and a planner
+            // cannot edit (bead `sparkle-dlrqb8.3`).
+            //
+            // `!resume` IS LOAD-BEARING, and it is the same fact the FLAG is gated on
+            // (`claudeSpawn.buildClaudeExec`: `if (!resume && opts.permissionMode)`). That gate
+            // exists because a human who leaves plan mode with shift+tab must not be dragged back
+            // into it on every relaunch — and `agent.permissionMode` is never cleared once stored
+            // (`projectStore` is its only writer and nothing unsets it). `--append-system-prompt`
+            // has NO such gate, so deriving this from `permissionMode` alone would relocate the
+            // exact failure the flag's gate prevents from the CLI flag into the BRIEF: a resumed,
+            // already-approved build agent, running WITHOUT plan mode, told in prose that it
+            // cannot edit and that its own post-change preview is "the current state". Found by
+            // review on the first commit of this bead, before it shipped.
+            planning: !resume && agent.permissionMode === "plan",
             // The ENFORCED cap, not the raw configured one — the persona is told how many
             // workers it may spawn, and the spawn gate silently queues anything past this. Telling
             // it a bigger number just makes it spawn into a queue and wait (sparkle-01xv).
@@ -1093,6 +1110,12 @@ function AgentPaneInner({
           appendSystemPrompt: controlMcpConfig
             ? genericAgentProtocol({
                 previewEagerness: useSettingsStore.getState().previewEagerness,
+                // Same reason as the build branch above: this branch forwards `permissionMode` to
+                // claude, so a generic pane can be in plan mode too and needs the same clause —
+                // INCLUDING the `!resume` half, because this branch forwards `permissionMode`
+                // under the identical resume gate. A fix wired into N call sites and checked at
+                // one reports the uncovered sibling as verified (`sparkle-50m03`).
+                planning: !resume && agent.permissionMode === "plan",
               })
             : undefined,
         });

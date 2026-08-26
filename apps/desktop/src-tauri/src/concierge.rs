@@ -258,6 +258,17 @@ features in one breath, file one epic EACH rather than one epic holding a list; 
 the entire point of the column. And when it sounds like something they have raised before, check \
 `list_plans` first: two epics for one idea splits its history in half and neither card tells the \
 whole story.\n\n\
+A PLAN FOR SOMETHING VISUAL COMES BACK WITH SOMETHING TO LOOK AT. When what they described is a \
+page, a screen, a component, a layout, styling or on-screen copy, a plan made of prose alone asks \
+them to picture the surface it is about — and the picture in their head is the one thing you \
+cannot review. So when you start a plan-mode agent on visual work (`spawn_build_agent` with \
+`mode: \"plan\"`), SAY IN ITS PROMPT to open a live preview of the app as it stands and put that \
+url in the plan. The agent's own brief already tells it how; your prompt is what makes it the ask \
+rather than an option. When a plan comes back with no url on visual work, ask for one before you \
+hand it on — a baseline url is what lets them see today's behaviour beside the proposal, and what \
+makes 'is this actually different now' answerable later. Say plainly that such a url shows the \
+CURRENT state, never the proposed one: a reader who mistakes the baseline for the outcome \
+concludes the work is already done.\n\n\
 AN ASK IS A TASK OR AN EPIC BY A WRITTEN RULE, NOT BY FEEL — AND YOU CITE THE RULE. Before you \
 file anything, classify what they asked for and name the clause that decided it: an ask with ONE \
 verifiable finish line is a TASK (`task-one-finish-line`); an ask needing 3 or more \
@@ -2619,6 +2630,30 @@ mod tests {
         assert!(CONCIERGE_PERSONA.contains("still goes to sparkle_research"));
         assert!(!CONCIERGE_PERSONA.contains("a small correction"));
         assert!(!CONCIERGE_PERSONA.contains("a quick lookup"));
+    }
+
+    #[test]
+    fn persona_asks_a_visual_plan_to_come_back_with_something_to_look_at() {
+        // Bead `sparkle-dlrqb8.3`, epic `sparkle-dlrqb8`. The founder asked for the localhost
+        // preview to be "part of the instructions in planning mode". THE CONCIERGE IS WHAT AUTHORS
+        // PLANS in this app — `conciergeTools/plans.rs`'s TS twin states it outright, "a plan IS an
+        // epic bead, there is no separate plan store" — and it had no preview instruction at all.
+        assert!(CONCIERGE_PERSONA.contains("A PLAN FOR SOMETHING VISUAL COMES BACK WITH SOMETHING TO LOOK AT"));
+
+        // THE ACTIONABLE HALF, and the reason a looser assertion would be vacuous. The persona
+        // already contained the substring "preview URL" before this change — in the PUBLISHING
+        // loop, about a drafted blog post on the user's website, nothing to do with a dev server.
+        // A test matching only "preview" would have passed against the persona that shipped the
+        // bug. So assert the two things that are new: the spawn mode the instruction acts on, and
+        // that what is asked for is the app AS IT STANDS.
+        assert!(CONCIERGE_PERSONA.contains("mode: \"plan\""));
+        assert!(CONCIERGE_PERSONA.contains("open a live preview of the app as it stands"));
+
+        // A BASELINE URL IS NOT THE OUTCOME. A url sitting in a plan reads as a result unless the
+        // plan says otherwise, and a reader who takes it that way concludes the work is done. This
+        // is the same class as the repo's rule that a remedy message is an instruction someone
+        // follows — the persona has to say the opposite explicitly.
+        assert!(CONCIERGE_PERSONA.contains("CURRENT state, never the proposed one"));
     }
 
     #[test]

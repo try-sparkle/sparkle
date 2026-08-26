@@ -27,9 +27,15 @@ import { create } from "zustand";
  *
  *  `serving` IS PART OF THE WIRE TYPE AND HAS NO WRITER (bead `sparkle-l7cihu`). This doc used to
  *  put it at the end of the happy path and to hang `crashed` off it; `supervise` reaches `ready`
- *  and stops, and `http_probe` is never retried, so a server that binds before it can answer HTTP
- *  latches at `listening` permanently. Keep parsing and handling `"serving"` anyway — see
- *  `SURFACING_STATES` below for why the set must not be narrowed. */
+ *  and stops there. Keep parsing and handling `"serving"` anyway — see `SURFACING_STATES` below for
+ *  why the set must not be narrowed.
+ *
+ *  `listening` → `ready` IS RETRIED, since bead `sparkle-dlrqb8.2`. This doc also used to say the
+ *  HTTP probe ran once, so a server that bound its port before it could answer HTTP latched at
+ *  `listening` permanently. It now re-probes every tick until the server answers or `READY_TIMEOUT`
+ *  is spent — so `listening` is a genuinely transient state for a slow-but-healthy dev server, and
+ *  a card that is stuck there means the server never answered at all rather than merely answering
+ *  late. Giving up is not terminal: the state stays `listening` and the process is left running. */
 export type PreviewState =
   | "installing"
   | "starting"

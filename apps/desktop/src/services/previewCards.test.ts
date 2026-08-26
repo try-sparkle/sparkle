@@ -242,10 +242,13 @@ describe("a running preview the card cannot render still says something", () => 
 //
 //   1. `supervise` never constructs `PreviewState::Serving`, and neither does anything else in
 //      preview.rs's production half. The variant is live in three predicates and dead as an output.
-//   2. The discovery/transition block is guarded by `if bound.is_none()`, so it runs AT MOST ONCE,
-//      and BOTH of the loop's `transition(` calls live inside it.
-//   3. `http_probe` is called exactly once, inside that same block — so it is never retried, and a
-//      server that binds before it can answer HTTP latches at `listening` forever.
+//   2. The DISCOVERY block is guarded by `if bound.is_none()`, so it runs AT MOST ONCE, and the
+//      only `transition(` inside it is the one to `listening`.
+//   3. The HTTP probe sits OUTSIDE that block and inside the loop, so it RETRIES (bead
+//      `sparkle-dlrqb8.2` — it used to be inside, which made one failing probe final and left a
+//      slow-to-answer server at `listening` forever). `ready` is emitted through `ReadyWatch::tick`,
+//      which returns a state AT MOST ONCE — so a healthy preview still emits nothing at all once it
+//      has reached `ready`, which is the property the corrected comments actually rest on.
 //
 // Precedent for reading Rust source from a vitest file, including the scoping discipline copied
 // here: `previewSeam.test.ts`, which pins the other Rust↔TS seam this feature has.
@@ -342,41 +345,88 @@ describe("preview.rs's supervise loop, as the corrected comments describe it", (
     ).toContain("PreviewState::Serving");
   });
 
-  it("runs discovery AT MOST ONCE, and both transitions live inside that one block", () => {
+  it("runs DISCOVERY at most once, and `listening` is the only transition inside that block", () => {
     const body = topLevelFn(productionHalf(whole), "fn supervise(");
     const { block, after } = onceOnlyBlock(body);
 
-    // Both of the loop's state ADVANCES are inside the once-only guard...
+    // Two state ADVANCES in the whole loop, and exactly one of them is inside the once-only guard.
     expect(count(body, ".transition(")).toBe(2);
-    expect(count(block, ".transition(")).toBe(2);
+    expect(count(block, ".transition(")).toBe(1);
     expect(block).toContain("PreviewState::Listening");
-    expect(block).toContain("PreviewState::Ready");
+    expect(count(after, ".transition(")).toBe(1);
 
-    // ...and after it the loop body only sleeps. This is the assertion the corrected comments rest
-    // on: once the port is bound there is NO further emission of any kind while the server is
-    // healthy, so there is nothing to debounce a re-capture off and nothing to stamp a clock from.
+    // The one outside is `ready`, and it is gated by `ReadyWatch::tick` rather than by the guard.
+    // That is what keeps "a healthy bound preview emits NOTHING once it is ready" true even though
+    // the probe now runs every tick: `tick` hands back a state at most once per server, so there is
+    // still nothing to debounce a re-capture off and nothing to stamp a clock from.
+    expect(after).toContain("ready.tick(|| http_probe(port), started.elapsed())");
     expect(after).toContain("std::thread::sleep(");
     expect(
       after,
-      "a state change appeared after the once-only discovery block. A healthy bound preview would " +
-        "now emit something, which is exactly what previewCardShot's header says it does not.",
-    ).not.toContain(".transition(");
-    expect(after).not.toContain("finish(");
+      "a TERMINAL state appeared after the once-only discovery block. The only thing that ends a " +
+        "bound server is still the `crashed`/`failed` exit check at the TOP of the loop — giving " +
+        "up on the readiness probe must not have become terminal.",
+    ).not.toContain("finish(");
   });
 
-  it("probes HTTP exactly once, so `listening` is a state a healthy server can be stuck in", () => {
+  it("probes HTTP outside the once-only block and inside the loop, so it RETRIES", () => {
     const body = topLevelFn(productionHalf(whole), "fn supervise(");
-    const { block } = onceOnlyBlock(body);
+    const { block, after } = onceOnlyBlock(body);
+
+    // ONE call site, and it is not in the discovery block. This is the whole of `sparkle-dlrqb8.2`:
+    // inside that block the probe ran exactly once and a single `false` was final, so a dev server
+    // that binds its socket before it can answer HTTP (a cold compile, a loaded machine) never
+    // reached `ready` and its card never became openable.
     expect(count(body, "http_probe(")).toBe(1);
-    expect(count(block, "http_probe(")).toBe(1);
+    expect(count(block, "http_probe(")).toBe(0);
+    expect(count(after, "http_probe(")).toBe(1);
+
+    // ...and still inside the loop body, i.e. before the per-tick sleep. Outside it there is no
+    // second tick and the "retry" would be a retry in name only.
+    expect(after.indexOf("http_probe(")).toBeLessThan(after.indexOf("std::thread::sleep("));
   });
 
   // ── THE NEGATIVE CONTROL ───────────────────────────────────────────────────────────────────
-  // Proof that the four assertions above are not vacuous, WITHOUT editing preview.rs: the same
-  // bytes are mutated IN MEMORY into the file the false comment described — a supervisor that
-  // re-emits while the server is healthy — and the checks are re-run against that. `preview.rs`
-  // belongs to another worker right now, so an on-disk mutation is not available to us; this is the
-  // honest substitute, and it fails for the same reason the real assertions would.
+  // Proof that the assertions above are not vacuous, WITHOUT editing preview.rs: the same bytes are
+  // mutated IN MEMORY back into the engine that shipped before `sparkle-dlrqb8.2` — probe once,
+  // inside the discovery block, never again — and the checks are re-run against that. This is a
+  // stronger control than a hypothetical mutation, because it is the exact regression the fix
+  // removes: if someone folds the probe back into the once-only block, these are the assertions
+  // that must go red.
+  it("would go red if the probe were folded back inside the once-only discovery block", () => {
+    const regressed = whole
+      .replace(
+        "        if let Some(port) = bound {\n" +
+          "            if let Some(state) = ready.tick(|| http_probe(port), started.elapsed()) {\n" +
+          "                app.state::<PreviewManager>().transition(&app, &id, state, Some(port), None);\n" +
+          "            }\n" +
+          "        }\n",
+        "",
+      )
+      .replace(
+        "                    mark_bound(&app_data, &id, port);",
+        "                    if http_probe(port) {\n" +
+          "                        app.state::<PreviewManager>().transition(&app, &id, PreviewState::Ready, Some(port), None);\n" +
+          "                    }\n" +
+          "                    mark_bound(&app_data, &id, port);",
+      );
+    expect(regressed, "the retry block this mutation removes must still exist verbatim").not.toBe(whole);
+    expect(regressed, "…and `mark_bound` must still be where the probe gets folded back in").toContain(
+      "if http_probe(port) {",
+    );
+
+    const body = topLevelFn(productionHalf(regressed), "fn supervise(");
+    const { block, after } = onceOnlyBlock(body);
+
+    // Each of the three claims, now false, and each detected by the assertion that guards it.
+    expect(count(block, "http_probe(")).not.toBe(0); // the probe is back inside the guard
+    expect(count(after, "http_probe(")).not.toBe(1); // ...and gone from the loop body
+    expect(count(block, ".transition(")).not.toBe(1); // both transitions are inside again
+  });
+
+  // And the OTHER direction: a supervisor that re-emits while the server is healthy — the engine
+  // the false comment described — is still caught, because `ReadyWatch::tick` is what bounds the
+  // emissions and a raw `transition(` after the block is not it.
   it("would go red if the engine were changed into the one the false comment described", () => {
     const mutated = whole.replace(
       "        std::thread::sleep(if bound.is_some() { LIVENESS_INTERVAL } else { DISCOVERY_INTERVAL });",
@@ -391,10 +441,10 @@ describe("preview.rs's supervise loop, as the corrected comments describe it", (
     const body = topLevelFn(prod, "fn supervise(");
     const { block, after } = onceOnlyBlock(body);
 
-    // Each of the three claims, now false, and each detected by the assertion that guards it.
     expect(count(prod, "PreviewState::Serving")).not.toBe(1);
-    expect(count(body, ".transition(")).not.toBe(count(block, ".transition("));
-    expect(after).toContain(".transition(");
+    expect(count(body, ".transition(")).not.toBe(2);
+    expect(count(after, ".transition(")).not.toBe(1);
+    expect(block).not.toBe("");
   });
 });
 

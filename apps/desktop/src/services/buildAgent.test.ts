@@ -571,6 +571,97 @@ describe("the preview protocol — an agent that is never TOLD about previews ne
     expect(always).toMatch(/on every task this project can preview at all/);
   });
 
+  // ══ PLAN MODE — bead `sparkle-dlrqb8.3`, epic `sparkle-dlrqb8` ═══════════════════════════════
+  //
+  // WHY THIS NEEDED A TEST AT ALL, given every assertion above already passes for a plan-mode
+  // agent: a plan-mode agent is spawned `kind: "build"` (`buildAgentSpawn` is the only writer of
+  // `permissionMode`), so it ALREADY received this whole fragment. Grepping a plan-mode brief for
+  // "preview" returned a hit, and the piece read as shipped while being inert — the WHEN clause is
+  // written for an agent that has BUILT something and a planner cannot edit, so under its own rule
+  // the planner correctly opened nothing.
+  //
+  // So the assertion that matters is NOT "the planner is told about previews" — that was true
+  // before this change and would be vacuous. It is that the brief says something DIFFERENT to a
+  // planner, and that the difference is the actionable half.
+  describe("plan mode — the ask has to be actionable for an agent that cannot edit", () => {
+    it("says something different to a planner than to a builder", () => {
+      const builder = previewProtocol({ eagerness: "visual" });
+      const planner = previewProtocol({ eagerness: "visual", planning: true });
+
+      expect(planner).not.toEqual(builder);
+      expect(planner).toMatch(/YOU ARE IN PLANNING MODE/);
+      expect(builder).not.toMatch(/YOU ARE IN PLANNING MODE/);
+    });
+
+    it("tells the planner to show the app AS IT IS and to put the url in the plan", () => {
+      // The two things a planner can actually do. "as it stands" rather than "your change", and
+      // the url landing in the PLAN TEXT rather than only in the card — the card belongs to this
+      // agent's worktree and does not survive to whoever builds the plan.
+      const planner = previewProtocol({ eagerness: "visual", planning: true });
+      expect(planner).toMatch(/app AS IT IS/);
+      expect(planner).toMatch(/put the\s+url in the plan itself/);
+    });
+
+    it("warns that the baseline url is NOT the proposed state", () => {
+      // A remedy message is an instruction someone will follow, and this one is read by whoever
+      // reviews the plan. A url in a plan that reads as "the outcome" says the work is already
+      // done — the opposite of what a baseline is for.
+      const planner = previewProtocol({ eagerness: "visual", planning: true });
+      expect(planner).toMatch(/CURRENT state, not the proposed one/);
+    });
+
+    it("carries into the COMPOSED orchestrator brief, which is what a plan-mode agent reads", () => {
+      // The composed brief is the only thing an agent sees. `orchestrationPersona` is the builder
+      // a plan-mode agent goes through, because plan mode implies `kind: "build"`.
+      const planning = orchestrationPersona({ ...base, planning: true });
+      const building = orchestrationPersona({ ...base, planning: false });
+
+      expect(planning).toMatch(/YOU ARE IN PLANNING MODE/);
+      expect(building).not.toMatch(/YOU ARE IN PLANNING MODE/);
+      // An ABSENT option must read as "not planning" — the same brief as today, not silence and
+      // not the planner text. An omitted flag defaulting to the planning clause would put the
+      // "you cannot edit" instruction in front of every build agent in the fleet.
+      expect(orchestrationPersona(base)).toEqual(building);
+    });
+
+    it("carries into the COMPOSED generic brief too", () => {
+      // `AgentPane` forwards `permissionMode` on the generic branch as well, so a generic pane can
+      // be in plan mode and needs the same clause. Covered because a fix wired into N call sites
+      // and checked at one reports the uncovered siblings as verified (`sparkle-50m03`).
+      const planning = genericAgentProtocol({ previewEagerness: "visual", planning: true });
+      const building = genericAgentProtocol({ previewEagerness: "visual" });
+
+      expect(planning).toMatch(/YOU ARE IN PLANNING MODE/);
+      expect(building).not.toMatch(/YOU ARE IN PLANNING MODE/);
+    });
+
+    it("still obeys the knob — `never` stays silent even in plan mode", () => {
+      // `planning` must not become a back door around `[preview].agent_eagerness`. A project that
+      // opted out is opted out in plan mode too; otherwise the knob's one job fails in the exact
+      // mode this change touches.
+      const never = orchestrationPersona({ ...base, previewEagerness: "never", planning: true });
+      expect(never).not.toMatch(/OPEN A LIVE PREVIEW/);
+      expect(never).not.toMatch(/YOU ARE IN PLANNING MODE/);
+
+      const neverGeneric = genericAgentProtocol({ previewEagerness: "never", planning: true });
+      expect(neverGeneric).not.toMatch(/YOU ARE IN PLANNING MODE/);
+    });
+
+    it("never reaches a WORKER, because a worker cannot be in plan mode", () => {
+      // Not an omission and not a gap to close later: `permissionMode` is written only by
+      // `buildAgentSpawn`, which always creates `kind: "build"`. A `planning` option on
+      // `workerPersona` would be one nothing could ever set — an unactionable instruction of the
+      // kind the fragment's own header forbids.
+      const worker = workerPersona({
+        parentBranch: "sparkle/agent-build1",
+        resultPath: "/wt/.sparkle/result.json",
+        previewEagerness: "visual",
+      });
+      expect(worker).toMatch(/OPEN A LIVE PREVIEW/);
+      expect(worker).not.toMatch(/YOU ARE IN PLANNING MODE/);
+    });
+  });
+
   it("reaches a GENERIC agent too", () => {
     // The title used to read "it is not a worker, so it may call the tool", drawing a distinction
     // that NO LONGER EXISTS: `CONTROL_OP_TIERS.preview` is `free`, so every agent kind may call it

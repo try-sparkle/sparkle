@@ -126,19 +126,26 @@ pub fn parse_listen_addr(addr: &str) -> Option<(String, u16)> {
 /// host, no other scheme. A test asserts the two functions disagree on `https://evil.example`, so a
 /// future "just reuse the existing one" refactor goes red rather than silently widening this gate.
 ///
-/// **SCOPE — this has no production call site on the Rust side, and that is deliberate rather than
-/// an oversight.** See `preview_url_for`: the Rust URL is CONSTRUCTED from a literal host and a
-/// `u16`, so a check on it cannot fail, and an earlier version of this docblock implied a guard
-/// that was not wired to anything. What this function is, honestly: the REFERENCE IMPLEMENTATION
-/// of the rule, kept beside the constructor and pinned by tests so the rule itself (including the
-/// userinfo and IPv6 traps below) has one authoritative statement — and so the anti-reuse test
-/// above keeps documenting the `is_safe_override` trap. The live enforcement is on the frontend,
-/// where a URL is RECEIVED rather than built: `services/preview.ts::isLoopbackPreviewUrl`, which
-/// `PreviewSlot` uses to refuse rendering a non-loopback src.
+/// **SCOPE — this DOES have a production call site on the Rust side now**, and where it does not is
+/// as important as where it does. The distinction is CONSTRUCTED versus RECEIVED:
 ///
-/// `#[allow(dead_code)]` rather than deleted: the rule outlives any one caller, and re-deriving
-/// these traps from scratch is how the userinfo case gets missed.
-#[allow(dead_code)]
+///   * A URL this crate just BUILT needs no check. `preview_url_for` takes a literal host and a
+///     `u16`, so there is no input that could name another origin, and a check on its output
+///     cannot fail. An earlier version of this docblock implied a guard over that path that was
+///     not wired to anything.
+///   * A URL this crate was HANDED does need one. `preview_capture.rs`'s `resolve_url_from_status`
+///     reads `PreviewStatus::url` — a string that crossed an await, and whose shape an older or
+///     newer build on the other side of the IPC boundary can also produce — to preserve the route
+///     an agent asked to look at (bead `sparkle-dlrqb8.1`). It calls this function and falls back
+///     to the port origin when the answer is false, so the loopback-only property of the headless
+///     capture surface is re-established rather than assumed.
+///
+/// It is also still the REFERENCE IMPLEMENTATION of the rule, kept beside the constructor and
+/// pinned by tests so the rule itself (including the userinfo and IPv6 traps below) has one
+/// authoritative statement — and so the anti-reuse test above keeps documenting the
+/// `is_safe_override` trap. The frontend keeps its own copy for its own received URLs:
+/// `services/preview.ts::isLoopbackPreviewUrl`, which `services/previewCards.ts` uses to refuse
+/// surfacing a card with a non-loopback url.
 pub fn preview_url_is_loopback(url: &str) -> bool {
     let Some(rest) = url.strip_prefix("http://") else {
         return false;
@@ -171,12 +178,14 @@ pub fn preview_url_is_loopback(url: &str) -> bool {
 /// there is no input that could name another origin. Together with `choose_listener` refusing a
 /// non-loopback (or v6-only) bind, nothing downstream ever has a foreign URL to reject.
 ///
-/// That is why `preview_url_is_loopback` below is documented as a gate for the FRONTEND rather than
-/// used here: a Rust-side check on a string this function just built cannot fail, and an earlier
-/// version of that function had no production call site at all while its test claimed to stop "a
-/// refactor silently letting a preview pane load a remote site". The place a URL is *received*
-/// rather than *constructed* is `services/preview.ts`, and that is where the live check lives
-/// (`isLoopbackPreviewUrl`, enforced by `PreviewSlot` refusing to render a non-loopback src).
+/// That is why `preview_url_is_loopback` above is not called HERE: a Rust-side check on a string
+/// this function just built cannot fail. It is a gate on *received* URLs, and it now has call sites
+/// on BOTH sides of the wire. In Rust: `preview_capture.rs`'s `resolve_url_from_status`, which
+/// reads a `PreviewStatus::url` that crossed the IPC boundary (bead `sparkle-dlrqb8.1`). On the
+/// frontend: `services/preview.ts::isLoopbackPreviewUrl`, used by `services/previewCards.ts` to
+/// refuse surfacing a card whose url is not loopback. (An earlier version of this sentence credited
+/// `PreviewSlot` with that gate; there is no such component in the repo, and the Rust half had no
+/// call site at all when it was written.)
 pub fn preview_url_for(port: u16) -> String {
     format!("http://127.0.0.1:{port}")
 }
@@ -2087,6 +2096,92 @@ fn http_probe(port: u16) -> bool {
     matches!(stream.read(&mut buf), Ok(n) if n > 0)
 }
 
+/// What the supervisor should do about readiness on this tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadyStep {
+    /// The server answered — emit `Ready`. Returned AT MOST ONCE per `ReadyWatch`.
+    Emit,
+    /// No answer yet and there is budget left: probe again on a later tick.
+    Retry,
+    /// Stop probing — either `Ready` already went out, or the budget is spent. Giving up is NOT a
+    /// terminal state: a bound-but-mute server is still alive and stays at `Listening`, because
+    /// killing a server for being slow is the regression bead `sparkle-dnvaq` records.
+    Done,
+}
+
+/// THE RETRY DECISION, alone and pure — `supervise` itself has no seam for `AppHandle`, `Child`,
+/// `discover_port` or `http_probe`, so this is the piece that CAN be driven with real inputs, and
+/// it is what the behavioural tests in §4c exercise. A second source-grep assertion would only
+/// re-state the precondition.
+///
+/// A late answer beats the deadline on purpose: `probe_succeeded` is checked FIRST, so a byte that
+/// arrives on the very tick the budget runs out still produces `Ready` rather than being thrown
+/// away on a timing technicality.
+fn next_ready_step(probe_succeeded: bool, elapsed: Duration, budget: Duration) -> ReadyStep {
+    if probe_succeeded {
+        ReadyStep::Emit
+    } else if elapsed < budget {
+        ReadyStep::Retry
+    } else {
+        ReadyStep::Done
+    }
+}
+
+/// The post-bind readiness progression: keep probing HTTP until the server answers or the budget
+/// runs out, and emit `Ready` exactly once.
+///
+/// WHY IT EXISTS (bead `sparkle-dlrqb8.2`). The probe used to live INSIDE `supervise`'s
+/// `if bound.is_none()` block, one line after `bound = Some(port)` — so it ran exactly once, and a
+/// single `false` was final. `Ready` never went out, no later tick re-probed, and a dev server that
+/// binds its socket before it can answer HTTP (a cold `vite optimize`, or any loaded machine)
+/// latched at `Listening` forever. `renderablePreviewCards` needs `ready`/`serving`, so the card
+/// never became openable. The once-only guard was providing "emit `Ready` at most once" by
+/// accident; this type provides it on purpose, which is what lets the probe move out of it.
+///
+/// BUDGET, AND WHICH CONSTANT IT COMES FROM. `READY_TIMEOUT` (120s) — this file's existing answer
+/// to "how long may a dev server take to become usable", already spent as the budget for a
+/// listening socket to appear. Answering HTTP is the SECOND HALF of that same wait (the compile
+/// runs after the listener is up), so it draws on the SAME budget from the SAME start rather than a
+/// new one: whatever discovery did not spend, probing may. A second independent 120s would double
+/// the worst case a person actually waits for a card, and nothing justifies that number twice.
+///
+/// The retry CADENCE needs no constant of its own: once bound, the loop already sleeps
+/// `LIVENESS_INTERVAL` (2s) per tick, so a re-probe is one extra `http_probe` on a tick that was
+/// going to happen anyway. `DISCOVERY_INTERVAL` (500ms) is deliberately NOT used — it paces `lsof`,
+/// which is cheap, whereas `http_probe` opens a socket with a 2s connect timeout of its own.
+struct ReadyWatch {
+    budget: Duration,
+    settled: bool,
+}
+
+impl ReadyWatch {
+    const fn new(budget: Duration) -> Self {
+        Self { budget, settled: false }
+    }
+
+    /// One tick of the post-bind half. Returns the state to emit, or `None` for "nothing to say".
+    ///
+    /// `probe` is a closure rather than a `bool` so that a settled watch spends NO probe at all —
+    /// after `Ready`, or after giving up, this must not keep opening sockets every 2s for the life
+    /// of the server. It is also the seam the tests drive.
+    fn tick(&mut self, probe: impl FnOnce() -> bool, elapsed: Duration) -> Option<PreviewState> {
+        if self.settled {
+            return None;
+        }
+        match next_ready_step(probe(), elapsed, self.budget) {
+            ReadyStep::Emit => {
+                self.settled = true;
+                Some(PreviewState::Ready)
+            }
+            ReadyStep::Retry => None,
+            ReadyStep::Done => {
+                self.settled = true;
+                None
+            }
+        }
+    }
+}
+
 /// Canonicalize a worktree path from the frontend and require it strictly inside the managed
 /// worktrees directory.
 ///
@@ -2557,8 +2652,11 @@ fn supervise(
     claim: PortClaim,
     app_data: PathBuf,
 ) {
-    let deadline = Instant::now() + READY_TIMEOUT;
+    let started = Instant::now();
+    let deadline = started + READY_TIMEOUT;
     let mut bound: Option<u16> = None;
+    // The HTTP half of "is this usable yet", sharing `deadline`'s one budget — see `ReadyWatch`.
+    let mut ready = ReadyWatch::new(READY_TIMEOUT);
 
     loop {
         if stop.load(Ordering::Acquire) {
@@ -2592,9 +2690,6 @@ fn supervise(
                 Ok(Some(port)) => {
                     bound = Some(port);
                     app.state::<PreviewManager>().transition(&app, &id, PreviewState::Listening, Some(port), None);
-                    if http_probe(port) {
-                        app.state::<PreviewManager>().transition(&app, &id, PreviewState::Ready, Some(port), None);
-                    }
                     mark_bound(&app_data, &id, port);
                 }
                 Ok(None) => {
@@ -2622,6 +2717,18 @@ fn supervise(
                     finish(&app, &id, PreviewState::Failed, None, Some(refusal), &app_data);
                     return;
                 }
+            }
+        }
+
+        // THE HTTP HALF, AND IT IS DELIBERATELY OUTSIDE THE ONCE-ONLY BLOCK ABOVE (bead
+        // `sparkle-dlrqb8.2`). On the tick that discovers the port this still runs immediately —
+        // `bound` is already `Some` by the time control reaches here — so a server that answers at
+        // once behaves exactly as it did before: `Listening` then `Ready`, same tick. What changed
+        // is the tick AFTER a failed probe: `ReadyWatch` keeps re-probing until the server answers
+        // or `READY_TIMEOUT` is spent, instead of the single `false` being final.
+        if let Some(port) = bound {
+            if let Some(state) = ready.tick(|| http_probe(port), started.elapsed()) {
+                app.state::<PreviewManager>().transition(&app, &id, state, Some(port), None);
             }
         }
 
@@ -4408,57 +4515,119 @@ mod tests {
         body
     }
 
+    /// The `if bound.is_none() { … }` block, bounded by INDENTATION one level in — the same
+    /// discipline `previewCards.test.ts` uses on this file from the TypeScript side. Brace counting
+    /// would have to reason about `format!("… {}s. {}", …)`, which is a parser these tests have no
+    /// business growing. Returns the block and everything after it, so a claim can be made about
+    /// WHICH SIDE of the once-only guard a call site sits on — which is the whole of this fix.
+    fn supervise_once_only_block(body: &str) -> (&str, &str) {
+        let guard = "        if bound.is_none() {\n";
+        let start = body.find(guard).expect(
+            "supervise no longer opens `if bound.is_none() {` at its expected indent — the claim \
+             that DISCOVERY runs at most once rests on that guard and cannot be assumed",
+        );
+        let rest = &body[start..];
+        let close = rest
+            .find("\n        }\n")
+            .expect("the `if bound.is_none()` block has no matching close at its own indent");
+        (&rest[..close], &rest[close..])
+    }
+
     /// *** A STRUCTURAL TEST, DELIBERATELY, AND HERE IS WHY. *** `supervise` takes a live
     /// `AppHandle` and a real `Child` and spawns no seam for either: `transition` and `finish` both
-    /// go straight to `app.emit`, and `discover_port`/`http_probe` read the actual process table
-    /// and the actual socket. There is no injection point to drive it through, so a behavioural
-    /// test of this loop is not reachable without a refactor larger than the finding — and the
-    /// function has therefore had NO test of any kind. This follows
+    /// go straight to `app.emit`, and `discover_port` reads the actual process table. There is no
+    /// injection point to drive the WHOLE loop through, so its shape is pinned against its own
+    /// source, following
     /// `open_reserved_calls_cancel_if_stopped_during_spawn_between_the_registry_write_and_set_pgid`
-    /// directly above, which is this file's precedent for pinning an untestable function's shape
-    /// against its own source.
+    /// above. What this test does NOT have to carry any more is the readiness decision itself: that
+    /// now lives in `ReadyWatch`/`next_ready_step`, which are pure and are tested BEHAVIOURALLY
+    /// below with real inputs. This asserts only that `supervise` is wired to them.
     ///
-    /// WHAT IT PINS — three verified facts about the loop's reachability graph, each of which is
-    /// currently true and none of which anything else asserts:
+    /// WHAT IT PINS — the contract as of bead `sparkle-dlrqb8.2`, which CHANGED the third clause:
     ///
-    ///   1. The discovery/transition block is guarded by `if bound.is_none()`, so it runs AT MOST
-    ///      ONCE for the life of the server. Every subsequent iteration only re-checks liveness.
-    ///   2. After binding, the ONLY reachable state change is the `Crashed` finish on exit. Both
-    ///      `transition` calls and both in-block `finish` calls live inside the once-only block.
-    ///   3. `http_probe` is called exactly once and is NEVER retried — so a dev server that binds
-    ///      its socket before it can answer HTTP LATCHES AT `Listening` FOREVER. That is a real
-    ///      behaviour of this loop (see the notes at the top of this file and on `http_probe`), not
-    ///      an oversight this test is smuggling in as correct; it is pinned so that a future edit
-    ///      which adds a retry is a deliberate, visible change rather than an accident.
+    ///   1. DISCOVERY still runs at most once: one `if bound.is_none()` guard, one `bound =
+    ///      Some(port)` inside it. Re-running discovery would be a second port, not a retry.
+    ///   2. Exactly two transitions. `Listening` is inside the once-only block; `Ready` is
+    ///      OUTSIDE it, driven by `ReadyWatch::tick`, which is what makes "emit `Ready` at most
+    ///      once" a property of that type rather than an accident of the guard.
+    ///   3. *** THE PROBE IS OUTSIDE THE ONCE-ONLY BLOCK AND INSIDE THE LOOP, SO IT RETRIES. ***
+    ///      It used to sit one line after `bound = Some(port)`, so a single `false` was final and a
+    ///      server that binds before it can answer HTTP latched at `Listening` forever. The one
+    ///      `http_probe(` call site must now be after the guard's close and before the tick sleep.
+    ///   4. The terminal side is UNCHANGED: three `finish(` sites, exactly one of them reachable
+    ///      after binding — the `Crashed`/`Failed` exit check at the top of the loop.
     ///
-    /// It goes RED if the loop is made to re-emit, if a second transition is added after bind, or
-    /// if `PreviewState::Serving` is written from here.
+    /// It goes RED if the probe is moved back inside the once-only block, if the retry is lifted
+    /// out of the loop, if a third transition appears, or if `PreviewState::Serving` is written.
     #[test]
-    fn supervise_binds_once_and_can_emit_nothing_further_except_the_crash() {
+    fn supervise_retries_the_http_probe_inside_the_loop_but_still_discovers_and_emits_ready_once() {
         let body = supervise_body();
+        let (block, after) = supervise_once_only_block(body);
 
-        let guard = body.find("if bound.is_none() {").expect("the once-only guard must still exist");
+        // 1. DISCOVERY is still once-only. This half of the old contract did not change.
         assert_eq!(
             body.matches("if bound.is_none() {").count(),
             1,
-            "one guard, or 'at most once' stops being a property of the loop"
+            "one guard, or 'discovery at most once' stops being a property of the loop"
         );
         assert_eq!(
-            body.matches("bound = Some(port);").count(),
+            block.matches("bound = Some(port);").count(),
             1,
-            "`bound` is latched in exactly one place — a second write is a second discovery"
+            "`bound` is latched in exactly one place, inside the guard — a second write is a second discovery"
         );
-        assert!(body.find("bound = Some(port);").unwrap() > guard, "…and it happens inside the guard");
+        assert_eq!(body.matches("bound = Some(port);").count(), 1, "…and nowhere else in the body");
 
-        // 2. EVERY state change, located by position relative to the guard.
-        let transitions: Vec<usize> = body.match_indices("transition(&app, &id,").map(|(i, _)| i).collect();
-        assert_eq!(transitions.len(), 2, "exactly two transitions — Listening, then Ready: {transitions:?}");
-        for at in &transitions {
-            assert!(*at > guard, "a transition outside the once-only block would re-emit every poll");
-        }
-        assert!(body.contains("PreviewState::Listening, Some(port), None)"), "the first is Listening");
-        assert!(body.contains("PreviewState::Ready, Some(port), None)"), "the second is Ready");
+        // 2. Two transitions: Listening inside the once-only block, Ready outside it.
+        assert_eq!(
+            body.matches("transition(&app, &id,").count(),
+            2,
+            "exactly two transitions — Listening, then Ready"
+        );
+        assert_eq!(
+            block.matches("transition(&app, &id,").count(),
+            1,
+            "exactly ONE of them is inside the once-only block, and it is Listening"
+        );
+        assert!(block.contains("PreviewState::Listening, Some(port), None)"), "…that one is Listening");
+        assert_eq!(
+            after.matches("transition(&app, &id,").count(),
+            1,
+            "and the OTHER is outside it — that is what lets a later tick reach Ready at all"
+        );
+        assert!(
+            after.contains("if let Some(state) = ready.tick(|| http_probe(port), started.elapsed())"),
+            "the post-bind transition must be gated by `ReadyWatch::tick`, which is the thing that \
+             keeps Ready to at most one emission now that the once-only guard no longer does"
+        );
 
+        // 3. ONE probe call site, OUTSIDE the once-only block and INSIDE the loop. This is the fix.
+        assert_eq!(
+            body.matches("http_probe(").count(),
+            1,
+            "one probe call site — a second would be a second, unbudgeted retry path"
+        );
+        assert_eq!(
+            block.matches("http_probe(").count(),
+            0,
+            "the probe must NOT be inside the once-only block. Inside it, one failing probe is \
+             final and a slow-to-answer dev server latches at Listening forever — bead \
+             `sparkle-dlrqb8.2`, the defect this loop was fixed for."
+        );
+        assert_eq!(after.matches("http_probe(").count(), 1, "…it is after the block closes");
+        // Positions taken WITHIN `after`, so this cannot be satisfied by some earlier 8-space close
+        // (the `if exited { … }` arm has one) standing in for the guard's own.
+        let probe_at = after.find("http_probe(").expect("the probe call site must still exist");
+        let sleep_at = after
+            .find("std::thread::sleep(if bound.is_some()")
+            .expect("the per-tick sleep must still exist");
+        assert!(
+            probe_at < sleep_at,
+            "…and BEFORE the per-tick sleep, i.e. still inside the loop body. Outside it there is \
+             no second tick and the retry is a retry in name only."
+        );
+
+        // 4. The terminal side, unchanged: the crash on exit is still the one post-bind finish.
+        let guard = body.find("if bound.is_none() {").expect("the guard must still exist");
         let finishes: Vec<usize> = body.match_indices("finish(").map(|(i, _)| i).collect();
         assert_eq!(finishes.len(), 3, "exactly three terminal finishes: {finishes:?}");
         assert_eq!(
@@ -4469,19 +4638,125 @@ mod tests {
         );
         assert!(
             body.contains("(PreviewState::Crashed, format!(\"the dev server exited. {tail}\"))"),
-            "and that one is the crash, which is the only post-bind state change there is"
+            "and that one is still the crash — giving up on the probe must not have become terminal"
         );
-
-        // 3. ONE probe, never retried. This is what makes `Listening` a latch.
-        assert_eq!(
-            body.matches("http_probe(").count(),
-            1,
-            "a second `http_probe` call would be a retry, which this loop deliberately does not do"
-        );
-        assert!(body.find("http_probe(").unwrap() > guard, "…and it is inside the once-only block");
 
         // Nothing here may write the dead variant. See the test below for the finding.
         assert!(!body.contains("PreviewState::Serving"), "supervise must not be the thing that revives Serving");
+    }
+
+    // ------------------------------------------- §4d the readiness retry, driven with real inputs
+
+    /// The seam `supervise` itself does not have. `ReadyWatch::tick` is the ENTIRE post-bind half of
+    /// the loop — production calls exactly this, with `|| http_probe(port)` and `started.elapsed()`
+    /// — so driving it with canned probe answers and a fake clock exercises the real decision, not
+    /// a re-implementation of it. `probes` counts how many times the closure actually ran, because
+    /// "spends no probe once settled" is a side effect worth asserting: a settled watch that kept
+    /// opening sockets every `LIVENESS_INTERVAL` for the life of the server would be a new cost.
+    fn drive(answers: &[bool], tick_at: &[Duration], budget: Duration) -> (Vec<PreviewState>, usize) {
+        assert_eq!(answers.len(), tick_at.len(), "one canned answer per tick");
+        let mut watch = ReadyWatch::new(budget);
+        let mut emitted = Vec::new();
+        let mut probes = 0usize;
+        for (answer, elapsed) in answers.iter().zip(tick_at.iter()) {
+            if let Some(state) = watch.tick(
+                || {
+                    probes += 1;
+                    *answer
+                },
+                *elapsed,
+            ) {
+                emitted.push(state);
+            }
+        }
+        (emitted, probes)
+    }
+
+    fn secs(n: u64) -> Duration {
+        Duration::from_secs(n)
+    }
+
+    /// THE HAPPY PATH IS UNCHANGED. A server that answers on the tick it binds reaches `Ready` on
+    /// that same tick, exactly as it did before the retry existed — and then costs nothing further.
+    #[test]
+    fn ready_watch_emits_ready_on_the_first_tick_when_the_server_already_answers() {
+        let (emitted, probes) = drive(
+            &[true, true, true],
+            &[secs(0), secs(2), secs(4)],
+            READY_TIMEOUT,
+        );
+        assert_eq!(emitted, vec![PreviewState::Ready], "Ready, once, on the first tick");
+        assert_eq!(probes, 1, "and no socket is opened again once it has answered");
+    }
+
+    /// *** THE DEFECT, AS A TEST. *** Three failed probes and then an answer — a cold compile
+    /// finishing after the socket is already bound. Before bead `sparkle-dlrqb8.2` the first
+    /// `false` was final and this emitted NOTHING, forever; the card never became openable.
+    #[test]
+    fn ready_watch_keeps_probing_after_a_failure_and_emits_ready_exactly_once_when_it_answers() {
+        let (emitted, probes) = drive(
+            &[false, false, false, true, true, true],
+            &[secs(0), secs(2), secs(4), secs(6), secs(8), secs(10)],
+            READY_TIMEOUT,
+        );
+        assert_eq!(
+            emitted,
+            vec![PreviewState::Ready],
+            "exactly ONE Ready — late, but emitted, and not repeated on the ticks after it"
+        );
+        assert_eq!(probes, 4, "four probes: three that failed, and the one that answered. Then it stops.");
+    }
+
+    /// THE GIVE-UP PATH. A server that binds and never answers stays at `Listening`: no spurious
+    /// `Ready`, and — just as important — no terminal state of its own. `tick` returns `None`, so
+    /// `supervise` emits nothing and the loop goes on watching liveness; the `Crashed` finish at
+    /// the top of the loop is still the only thing that ends this server, whenever it does exit.
+    /// Killing a bound server for being slow to answer is the regression `sparkle-dnvaq` records.
+    #[test]
+    fn ready_watch_gives_up_at_the_budget_without_emitting_ready_or_anything_else() {
+        let (emitted, probes) = drive(
+            &[false, false, false, false, false],
+            &[secs(0), secs(4), secs(8), secs(10), secs(12)],
+            secs(9),
+        );
+        assert!(emitted.is_empty(), "no state at all is emitted — least of all Ready: {emitted:?}");
+        assert_eq!(
+            probes, 4,
+            "four probes, not five: the tick at 10s is past the 9s budget, so it probes ONCE MORE \
+             (it has to look before it can give up) and then settles. The tick at 12s spends \
+             nothing — a settled watch must not keep opening sockets every LIVENESS_INTERVAL for \
+             the life of the server."
+        );
+    }
+
+    /// A budget spent by DISCOVERY leaves the probe with nothing, and that is the intended sharing:
+    /// `READY_TIMEOUT` is one budget for "time to become usable", measured from one start. This is
+    /// the only case where the new loop behaves like the old one — one probe, then done.
+    #[test]
+    fn ready_watch_gets_a_single_probe_when_discovery_already_spent_the_budget() {
+        let (emitted, probes) = drive(&[false, false], &[secs(120), secs(122)], READY_TIMEOUT);
+        assert!(emitted.is_empty());
+        assert_eq!(probes, 1, "past the deadline the first answer is also the last");
+    }
+
+    /// The decision itself, at its three boundaries. `elapsed == budget` is `Done`, not `Retry`:
+    /// the budget is a deadline, and `<` is what makes it one.
+    #[test]
+    fn next_ready_step_retries_below_the_budget_and_gives_up_at_it() {
+        assert_eq!(next_ready_step(false, secs(0), secs(10)), ReadyStep::Retry);
+        assert_eq!(next_ready_step(false, secs(9), secs(10)), ReadyStep::Retry);
+        assert_eq!(next_ready_step(false, secs(10), secs(10)), ReadyStep::Done);
+        assert_eq!(next_ready_step(false, secs(11), secs(10)), ReadyStep::Done);
+    }
+
+    /// A LATE ANSWER BEATS THE DEADLINE. The success check runs first, so a byte that arrives on
+    /// the very tick the budget expires still produces `Ready`. Throwing away a working server on a
+    /// timing technicality would be a new version of the bug this whole change removes.
+    #[test]
+    fn next_ready_step_emits_ready_even_on_a_tick_that_is_already_past_the_budget() {
+        assert_eq!(next_ready_step(true, secs(0), secs(10)), ReadyStep::Emit);
+        assert_eq!(next_ready_step(true, secs(10), secs(10)), ReadyStep::Emit);
+        assert_eq!(next_ready_step(true, secs(600), secs(10)), ReadyStep::Emit);
     }
 
     /// A RECORDED FINDING, NOT A FIX. `PreviewState::Serving` has NO production writer anywhere:

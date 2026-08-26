@@ -165,14 +165,19 @@ export function renderablePreviewCards(
  * verbatim by a task brief as a settled premise, where it would have shipped a timer with no
  * signal to time off (bead `sparkle-l7cihu`). What `preview.rs`'s `supervise` (§6) actually does:
  *
- *   • the discovery/transition block is guarded by `if bound.is_none()`, so it runs AT MOST ONCE;
- *   • inside that one block the server goes to `listening` unconditionally, then to `ready` only
- *     if `http_probe` succeeds ON THAT SAME TICK. The probe is never retried, so a server that
- *     binds its port before it can answer HTTP LATCHES AT `listening` FOREVER;
- *   • after that the loop body is only: check stop, check exited, sleep. The one reachable state
- *     change left is a terminal `finish(…)` — `crashed`, or `failed`.
+ *   • the DISCOVERY block is guarded by `if bound.is_none()`, so it runs AT MOST ONCE, and the one
+ *     transition inside it is to `listening`;
+ *   • the HTTP probe runs every tick until the server answers or `READY_TIMEOUT` is spent, and
+ *     `ready` goes out AT MOST ONCE, when it first answers (`ReadyWatch::tick`). The retry is bead
+ *     `sparkle-dlrqb8.2`; before it, the probe sat inside the discovery block, so one failing probe
+ *     was final and a server that bound its port before it could answer HTTP latched at `listening`
+ *     forever — which is what kept the card unopenable for exactly the slow starts it exists for;
+ *   • once `ready` has gone out (or the budget is spent) the loop body is only: check stop, check
+ *     exited, sleep. The one reachable state change left is a terminal `finish(…)` — `crashed`, or
+ *     `failed`. Giving up on the probe is NOT terminal: the server stays at `listening`, alive.
  *
- * So a healthy bound preview emits NOTHING AT ALL until it dies. A hot reload is invisible to Rust,
+ * So a healthy preview emits NOTHING AT ALL between reaching `ready` and dying. A hot reload is
+ * invisible to Rust,
  * which never watches the served page; it only watches the process. There is no repeat event to
  * debounce off and none to stamp from. (`serving` is a red herring in particular: it has NO
  * production writer on either side of the wire — see the `PreviewState` note in `previewStore` —

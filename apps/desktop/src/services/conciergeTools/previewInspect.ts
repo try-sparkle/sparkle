@@ -1,7 +1,9 @@
 // The PREVIEW INSPECT domain — "agent eyes" over an already-open live preview (Phase 3 of
 // docs/live-browser-preview.md). Two ops: `screenshot` and `query_dom`. Click-to-instruct is
 // explicitly NOT here — see bead sparkle-51pwp, deferred pending its own design pass and founder
-// sign-off, and because it would touch `PreviewSlot.tsx`, which this domain never does.
+// sign-off, and because it would touch the surface the human watches — the concierge preview card
+// (`components/Concierge/PreviewCards.tsx` over `services/previewCards.ts`) — which this domain
+// never does. (The `PreviewSlot.tsx` this line used to name no longer exists anywhere in the repo.)
 //
 // ---------------------------------------------------------------------------------------------
 // ADDITIVE, NOT A REBIND. This domain never opens, closes, or lists a preview (that is the
@@ -138,7 +140,10 @@ async function attempt<T>(
  * Screenshot the agent's currently-open preview.
  *
  * Requires a preview already opened for `agentId` (via the `preview` domain, not this one) and in
- * one of the "framable" states — see `PreviewSlot.tsx`'s `PREVIEW_PANE_FOR_STATE`. Refuses with
+ * one of the "framable" states (`listening`/`ready`/`serving`) — defined by `is_framable` in
+ * preview_capture.rs, whose docblock points at `stores/previewStore.ts`'s `SURFACING_STATES` for
+ * the whole family of peer state predicates and how they deliberately differ. (This line used to
+ * name `PreviewSlot.tsx`'s `PREVIEW_PANE_FOR_STATE`; that file no longer exists.) Refuses with
  * `no-preview` when none is open and `preview-not-ready` when one is open but has nothing rendered
  * yet, rather than returning a blank or stale image labelled as current.
  */

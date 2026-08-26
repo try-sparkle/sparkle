@@ -1,7 +1,9 @@
 //! Preview "agent eyes" — the Phase 3 slice of `docs/live-browser-preview.md`: an agent-readable
 //! screenshot of a running preview, and a bounded DOM query over it. Click-to-instruct is
-//! deliberately NOT here (see bead sparkle-51pwp — it needs its own design pass and touches
-//! `PreviewSlot.tsx`, which this module never does).
+//! deliberately NOT here (see bead sparkle-51pwp — it needs its own design pass and touches the
+//! surface the human watches, which this module never does. That surface is the concierge preview
+//! CARD, `components/Concierge/PreviewCards.tsx` over `services/previewCards.ts`; the
+//! `PreviewSlot.tsx` this line used to name no longer exists anywhere in the repo).
 //!
 //! WHY A FRESH HEADLESS BROWSER PER CALL, NOT A LONG-LIVED ONE: no lifecycle to leak, no
 //! orphan-sweep to write a second copy of (`preview.rs`'s supervisor already owns that problem for
@@ -643,8 +645,23 @@ fn query_dom_blocking(url: &str, selector: &str) -> Result<Vec<DomMatch>, String
 // Resolving an agent's preview to a URL — shared gate for both commands
 // ---------------------------------------------------------------------------------------------
 
-/// The states `PreviewSlot.tsx` calls "framable" (`listening`/`ready`/`serving`) — see that file's
-/// `PREVIEW_PANE_FOR_STATE` map. Anything else has nothing rendered yet (or ever) to look at.
+/// The "framable" states — `listening`/`ready`/`serving`. Anything else has nothing rendered yet
+/// (or ever) to look at.
+///
+/// This set is ONE MEMBER OF A FAMILY OF PEER PREDICATES, and the authoritative statement of the
+/// family lives on `stores/previewStore.ts`'s `SURFACING_STATES` doc comment — which names this
+/// function explicitly, along with `services/previewIdleGrace.ts`'s `LIVE_STATES`, `AgentRow`'s
+/// preview affordance, and `preview.rs`'s `live_for_reattach`. Read that comment before narrowing
+/// any of them; in particular `serving` stays in every one of them even though nothing writes it
+/// today (bead `sparkle-l7cihu`).
+///
+/// **The members are deliberately NOT the same set**, so this is a sibling to consult, not a
+/// definition to copy: `SURFACING_STATES` is `ready`/`serving` only (a bound port shows the
+/// framework's "compiling" page, which is not worth surfacing to a human), while this one admits
+/// `listening` because an agent asking to look is asking about whatever is there.
+///
+/// (The reference this used to carry — `PreviewSlot.tsx`'s `PREVIEW_PANE_FOR_STATE` — pointed at a
+/// file that no longer exists anywhere in the repo.)
 fn is_framable(state: PreviewState) -> bool {
     matches!(state, PreviewState::Listening | PreviewState::Ready | PreviewState::Serving)
 }
@@ -666,7 +683,33 @@ fn resolve_url_from_status(status: Option<PreviewStatus>, agent_id: &str) -> Res
     let port = status
         .port
         .ok_or_else(|| "preview eyes: this preview has no port yet — it may still be starting".to_string())?;
-    Ok(format!("http://127.0.0.1:{port}"))
+
+    // THE TWO GATES ABOVE RUN FIRST, AND THAT ORDER IS LOAD-BEARING — see this function's own
+    // docblock: `previewInspect.ts` string-matches "not yet serving anything" and "no port yet" to
+    // pick which refusal kind it reports. Reading `url` earlier would let a preview with a url but
+    // no port resolve, and the `preview-not-ready` refusal it is supposed to raise would silently
+    // stop firing.
+    //
+    // PREFER `status.url` OVER THE PORT ORIGIN: the url is where the ROUTE lives.
+    // `preview.rs`'s `preview_url_with_route(port, &server.route)` is the single place a port
+    // becomes a URL, so `{ op: "open", path: "/settings" }` is already carried here as
+    // `http://127.0.0.1:<port>/settings`. Deriving the origin from the port instead threw the
+    // route away and made this tool structurally incapable of looking at anything but the app
+    // ROOT — bead `sparkle-dlrqb8.1`.
+    //
+    // RE-VALIDATED, NOT TRUSTED. Unlike `preview_url_for`'s output this is a string this function
+    // RECEIVED (from a status that crossed an await, and whose shape an older or newer build on
+    // the other side of the IPC boundary can also produce), so the loopback-only property of this
+    // whole surface has to be re-established here rather than assumed. A non-loopback url falls
+    // back to the port origin — a bad url is a bad route, not a reason to withhold a working
+    // preview, which is the same call `preview_url_with_route` makes about a bad route.
+    let origin = crate::preview::preview_url_for(port);
+    match status.url {
+        Some(url) if crate::preview::preview_url_is_loopback(&url) => Ok(url),
+        // `None` is the ordinary reattach/legacy shape: a status assembled from a rediscovered
+        // listener knows the port before it knows a url.
+        _ => Ok(origin),
+    }
 }
 
 async fn resolve_preview_url(app: AppHandle, agent_id: String) -> Result<String, String> {
@@ -712,7 +755,13 @@ mod tests {
     // ----- is_framable -----
 
     #[test]
-    fn framable_states_match_preview_slot_tsx() {
+    fn framable_names_every_preview_state_exactly_once() {
+        // Named for what it asserts, not for a file: the old name was
+        // `framable_states_match_preview_slot_tsx`, and `PreviewSlot.tsx` no longer exists — a test
+        // name pointing at a deleted file is a claim nobody can check. It never compared against
+        // any TypeScript anyway; it exhausts the enum, which is the property worth pinning (a new
+        // `PreviewState` variant forces a decision here rather than defaulting to non-framable).
+        // See `is_framable`'s docblock for the peer predicates this set deliberately differs from.
         assert!(is_framable(PreviewState::Listening));
         assert!(is_framable(PreviewState::Ready));
         assert!(is_framable(PreviewState::Serving));
@@ -1090,16 +1139,29 @@ mod tests {
 
     // ----- resolve_url_from_status -----
 
-    fn preview_status(state: PreviewState, port: Option<u16>) -> PreviewStatus {
+    /// A status carrying BOTH a port and a url, which is the shape `preview.rs` actually emits —
+    /// `preview_url_with_route` sets `url` at the one place a port becomes a URL. The fixture used
+    /// to hardcode `url: None`, which made the whole suite structurally incapable of expressing
+    /// the defect in bead `sparkle-dlrqb8.1` (the route being thrown away): every assertion below
+    /// was about a field nothing ever populated. `preview_status_no_url` keeps the `None` shape
+    /// for the reattach/legacy case, which is real but is not the common one.
+    fn preview_status_with_url(state: PreviewState, port: Option<u16>, url: Option<&str>) -> PreviewStatus {
         PreviewStatus {
             id: "preview-1".to_string(),
             agent_id: "agent-1".to_string(),
             project_id: "project-1".to_string(),
-            url: None,
+            url: url.map(|u| u.to_string()),
             port,
             state,
             error: None,
         }
+    }
+
+    /// The default fixture: a port, and the origin-only url `preview.rs` builds when no route was
+    /// asked for.
+    fn preview_status(state: PreviewState, port: Option<u16>) -> PreviewStatus {
+        let url = port.map(|p| format!("http://127.0.0.1:{p}"));
+        preview_status_with_url(state, port, url.as_deref())
     }
 
     #[test]
@@ -1124,10 +1186,132 @@ mod tests {
     }
 
     #[test]
-    fn a_framable_state_with_a_port_resolves_the_loopback_url() {
-        let url =
-            resolve_url_from_status(Some(preview_status(PreviewState::Ready, Some(4321))), "agent-1")
-                .unwrap();
+    fn a_framable_state_resolves_the_url_the_status_carries_including_its_route() {
+        // THE POINT OF THE WHOLE BEAD (`sparkle-dlrqb8.1`). `{ op: "open", path: "/settings" }`
+        // reaches `status.url` as a full route-bearing URL, and a screenshot has to land THERE.
+        // Asserting the port-derived origin instead — which is what this test used to do — is
+        // exactly what held the defect in place: the assertion passed for a function that could
+        // only ever capture the app root.
+        let url = resolve_url_from_status(
+            Some(preview_status_with_url(
+                PreviewState::Ready,
+                Some(4321),
+                Some("http://127.0.0.1:4321/settings"),
+            )),
+            "agent-1",
+        )
+        .unwrap();
+        assert_eq!(url, "http://127.0.0.1:4321/settings");
+    }
+
+    #[test]
+    fn a_deep_route_with_a_query_survives_intact() {
+        // Nothing here re-parses or re-joins the URL, and nothing should: the query string is part
+        // of what the agent asked to look at.
+        let url = resolve_url_from_status(
+            Some(preview_status_with_url(
+                PreviewState::Serving,
+                Some(4321),
+                Some("http://127.0.0.1:4321/a/b?q=1#frag"),
+            )),
+            "agent-1",
+        )
+        .unwrap();
+        assert_eq!(url, "http://127.0.0.1:4321/a/b?q=1#frag");
+    }
+
+    #[test]
+    fn a_non_loopback_url_is_refused_and_falls_back_to_the_port_origin() {
+        // `status.url` is RECEIVED, not constructed here, so the loopback-only property of this
+        // surface is re-established rather than assumed. Falling back keeps a working preview
+        // usable; returning the string would point a headless browser at a remote site.
+        let url = resolve_url_from_status(
+            Some(preview_status_with_url(
+                PreviewState::Ready,
+                Some(4321),
+                Some("http://evil.example/settings"),
+            )),
+            "agent-1",
+        )
+        .unwrap();
         assert_eq!(url, "http://127.0.0.1:4321");
+    }
+
+    #[test]
+    fn a_userinfo_url_that_only_looks_loopback_falls_back_too() {
+        // `127.0.0.1@evil.example`'s host is `evil.example` — the trap `preview_url_is_loopback`'s
+        // own docblock records. Pinned here so a future "just check the prefix" shortcut on this
+        // side of the call goes red.
+        let url = resolve_url_from_status(
+            Some(preview_status_with_url(
+                PreviewState::Ready,
+                Some(4321),
+                Some("http://127.0.0.1@evil.example/settings"),
+            )),
+            "agent-1",
+        )
+        .unwrap();
+        assert_eq!(url, "http://127.0.0.1:4321");
+    }
+
+    #[test]
+    fn an_https_url_falls_back_too() {
+        // The anti-reuse case `preview_url_is_loopback` exists to hold: `is_safe_override` would
+        // accept any `https://` origin, and that is catastrophically wrong for this gate.
+        let url = resolve_url_from_status(
+            Some(preview_status_with_url(
+                PreviewState::Ready,
+                Some(4321),
+                Some("https://evil.example/settings"),
+            )),
+            "agent-1",
+        )
+        .unwrap();
+        assert_eq!(url, "http://127.0.0.1:4321");
+    }
+
+    #[test]
+    fn no_url_with_a_port_still_resolves_the_port_origin() {
+        // The reattach/legacy path: a status assembled from a rediscovered listener knows the port
+        // before it knows a url. That must keep working, not become a refusal.
+        let url = resolve_url_from_status(
+            Some(preview_status_with_url(PreviewState::Ready, Some(4321), None)),
+            "agent-1",
+        )
+        .unwrap();
+        assert_eq!(url, "http://127.0.0.1:4321");
+    }
+
+    #[test]
+    fn a_url_without_a_port_still_refuses_with_no_port_yet() {
+        // ORDER, ASSERTED. `previewInspect.ts` maps "no port yet" to its `preview-not-ready`
+        // refusal, so a url arriving before a port must NOT be allowed to short-circuit that gate
+        // — reading `url` first would turn this refusal into a successful resolve.
+        let err = resolve_url_from_status(
+            Some(preview_status_with_url(
+                PreviewState::Ready,
+                None,
+                Some("http://127.0.0.1:4321/settings"),
+            )),
+            "agent-1",
+        )
+        .unwrap_err();
+        assert!(err.contains("no port yet"), "got: {err}");
+    }
+
+    #[test]
+    fn a_non_framable_state_refuses_even_with_a_route_bearing_url() {
+        // The other half of the same ordering property: the `is_framable` gate stays ahead of the
+        // url, so `previewInspect.ts` still sees "not yet serving anything".
+        let err = resolve_url_from_status(
+            Some(preview_status_with_url(
+                PreviewState::Starting,
+                Some(4321),
+                Some("http://127.0.0.1:4321/settings"),
+            )),
+            "agent-1",
+        )
+        .unwrap_err();
+        assert!(err.contains("not yet serving"), "got: {err}");
     }
 }
