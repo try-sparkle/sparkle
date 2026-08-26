@@ -31,12 +31,13 @@ import {
   stepParticle,
   syntheticMicLevel,
   syntheticVoiceLevel,
+  twinkleRate,
   type LevelSource,
   type Particle,
   type Point,
   type Rect,
 } from "./engine";
-import { deriveFlags, type Anchor, type Mode, type OverlayState } from "./state";
+import { deriveFlags, modeMotion, type Anchor, type Mode, type OverlayState } from "./state";
 import { orbTextMaxWidth, orbTextPosition, presize } from "./presize";
 import { sparkleOverlayEnabled } from "./flag";
 import { FONT_MONO, LABEL, TYPE } from "../../theme/scale";
@@ -382,15 +383,18 @@ function SparkleOverlayInner({
       const t = tRef.current;
       burstRef.current = Math.max(0, burstRef.current - dt * 2.6);
       const { anchor, mode } = stateRef.current;
+      const motion = modeMotion(mode);
 
-      // Mic: sample the injected source only while listening; decay to 0 otherwise.
+      // Mic: sample the injected source only while listening; decay to 0 otherwise. Processing
+      // deliberately decays with the rest — the utterance is over, so there is no live level to
+      // sample and holding the last one would paint a mic that is still hearing you.
       micRef.current =
-        mode === "listening"
+        motion === "ripple"
           ? sourcesRef.current.micLevelSource(t)
           : Math.max(0, micRef.current - dt * 3);
       // Voice: track the source while speaking or while a reply is typing (typing
       // stands in for voice until the TTS unit lands); decay to silence otherwise.
-      if (mode === "speaking" || typingRef.current) {
+      if (motion === "pulse" || typingRef.current) {
         voiceRef.current +=
           (sourcesRef.current.voiceLevelSource(t) - voiceRef.current) * 0.35;
       } else {
@@ -420,7 +424,7 @@ function SparkleOverlayInner({
       // Additive compositing: overlapping sparkles brighten instead of occlude.
       ctx.globalCompositeOperation = "lighter";
 
-      const level = mode === "listening" ? mic : voice;
+      const level = motion === "ripple" ? mic : voice;
       for (const p of partsRef.current) {
         const sp2 = stepParticle(p, dt);
 
@@ -439,8 +443,9 @@ function SparkleOverlayInner({
           ctx.stroke();
         }
 
-        p.tw +=
-          p.twS * dt * (mode === "listening" ? 2.2 : mode === "speaking" ? 1.6 : 0.45);
+        // Twinkle rate is decoded ONCE, exhaustively, in engine.ts — the chained ternary this
+        // replaces would have handed `processing` the resting 0.45 with no type error.
+        p.tw += p.twS * dt * twinkleRate(motion);
         const gDim = anchor === "perch" ? galaxyDim(p.gBoost) : 1;
         const a =
           ((0.4 + 0.5 * (Math.sin(p.tw) * 0.5 + 0.5)) * (0.7 + level * 0.3) +
@@ -458,7 +463,7 @@ function SparkleOverlayInner({
       }
 
       // Listening halo hugs the shell while Sparkle is out front hearing you.
-      if (mode === "listening" && anchor !== "perch") {
+      if (motion === "ripple" && anchor !== "perch") {
         const cx = orbBox.left + orbBox.width / 2;
         const cy = orbBox.top + orbBox.height / 2;
         const r = Math.max(120, orbBox.width / 2 + 70) + mic * 26;

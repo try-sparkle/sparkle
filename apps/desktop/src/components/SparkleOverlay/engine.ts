@@ -10,7 +10,7 @@
 //  • The home is an edge-on galaxy: center-dense bulge, thin arms tapering to nothing,
 //    rippling like a waveform ONLY while listening (amplitude ∝ mic level × bulge).
 
-import type { Anchor, Mode } from "./state";
+import { modeMotion, type Anchor, type Mode, type ModeMotion } from "./state";
 import { divesOnTransition } from "./state";
 
 export interface Point {
@@ -198,17 +198,96 @@ function shellTarget(
 }
 
 /**
+ * How fast a particle twinkles in a given motion. Broken out of the render loop so the mode union
+ * is decoded in exactly one place: the chained ternary this replaces would have silently handed a
+ * newly-added variant the RESTING rate, which is the bug that makes a new state look like no state
+ * at all.
+ */
+export function twinkleRate(motion: ModeMotion): number {
+  switch (motion) {
+    case "ripple":
+      return 2.2;
+    case "pulse":
+      return 1.6;
+    case "swirl":
+      return 2.8;
+    case "rest":
+      return 0.45;
+    default: {
+      const _exhaustive: never = motion;
+      return _exhaustive;
+    }
+  }
+}
+
+/**
+ * The shell's breathing scale for a motion. `swirl` (the genie thinking) breathes on the CLOCK
+ * rather than on any input level — there is no mic signal during processing and no reply yet, so
+ * a level-driven pulse would sit dead flat and read as a frozen overlay.
+ */
+export function shellPulse(
+  motion: ModeMotion,
+  micLevel: number,
+  voiceLevel: number,
+  t: number,
+): number {
+  switch (motion) {
+    case "ripple":
+      return 1 + micLevel * 0.22;
+    case "pulse":
+      return 1 + voiceLevel * 0.16;
+    case "swirl":
+      return 1 + 0.07 + 0.05 * Math.sin(t * 4.2);
+    case "rest":
+      return 1;
+    default: {
+      const _exhaustive: never = motion;
+      return _exhaustive;
+    }
+  }
+}
+
+/**
+ * The vertical displacement of a particle along the edge-on galaxy at the perch.
+ *
+ * `ripple` is the prototype's waveform — the line ripples like speech while you talk. `swirl` is
+ * the processing beat: a slow travelling wave that runs along the galaxy independently of any
+ * input level, so the swarm visibly CHURNS while the genie thinks instead of going motionless the
+ * instant you stop speaking. `rest` and `pulse` hold the line flat, as they always did.
+ */
+export function perchWave(
+  motion: ModeMotion,
+  x: number,
+  t: number,
+  micLevel: number,
+  gBoost: number,
+): number {
+  switch (motion) {
+    case "ripple":
+      return Math.sin(x * 0.085 + t * 9) * 11 * micLevel * (0.25 + gBoost);
+    case "swirl":
+      return Math.sin(x * 0.05 - t * 3.4) * 6 * (0.35 + gBoost);
+    case "pulse":
+    case "rest":
+      return 0;
+    default: {
+      const _exhaustive: never = motion;
+      return _exhaustive;
+    }
+  }
+}
+
+/**
  * Compute every particle's frozen target for the current state. All positions are
  * static unless listening/speaking pulses them — "motion only happens in transit".
  */
 export function computeTargets(parts: Particle[], inp: TargetInputs): void {
   const { anchor, mode, t, micLevel, voiceLevel } = inp;
-  const pulse =
-    mode === "listening"
-      ? 1 + micLevel * 0.22
-      : mode === "speaking"
-        ? 1 + voiceLevel * 0.16
-        : 1;
+  const motion = modeMotion(mode);
+  // Branch on the MOTION, not the mode literal: a chained ternary over the literals silently
+  // stops covering the moment the union grows, and `processing` is exactly the variant that
+  // would have fallen through to the `still` arm and shown a motionless swarm mid-thought.
+  const pulse = shellPulse(motion, micLevel, voiceLevel, t);
 
   if (anchor === "perch") {
     // Edge-on galaxy: dense bright bulge, thin tapered arms. The line ripples like a
@@ -216,10 +295,7 @@ export function computeTargets(parts: Particle[], inp: TargetInputs): void {
     for (const p of parts) {
       const x = p.gu * GALAXY_HALF_WIDTH;
       const thick = 2.5 + 9.5 * p.gBoost;
-      const wave =
-        mode === "listening"
-          ? Math.sin(x * 0.085 + t * 9) * 11 * micLevel * (0.25 + p.gBoost)
-          : 0;
+      const wave = perchWave(motion, x, t, micLevel, p.gBoost);
       p.tx = inp.perch.x + x * pulse;
       p.ty = inp.perch.y + p.jy * thick + wave;
     }
