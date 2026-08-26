@@ -15,6 +15,19 @@ vi.mock("../logger", () => ({
   log: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
 }));
 
+// The steering prelude (bead .3) reaches Rust through `./steeringFiles` and finds its
+// project through the project store. Both are mocked at the SEAM AGENTBRIEF ACTUALLY USES, so the
+// wiring under test — "attachBrief asks for a block and prepends what comes back" — is the code
+// that runs, not a hand-built stand-in for it.
+const steeringBlockMock = vi.fn<(root: string) => Promise<string>>(async () => "");
+vi.mock("./steeringFiles", () => ({
+  fetchSteeringPreflightBlock: (root: string) => steeringBlockMock(root),
+}));
+const projectsMock: Array<{ rootPath: string; agents: Array<{ id: string }> }> = [];
+vi.mock("../stores/projectStore", () => ({
+  useProjectStore: { getState: () => ({ projects: projectsMock }) },
+}));
+
 import {
   __heldWaiterCount,
   attachBrief,
@@ -32,7 +45,17 @@ import { assembleBuildSpawn } from "./orchestrationLaunch";
 
 beforeEach(() => {
   resetAgentBriefs();
+  steeringBlockMock.mockReset();
+  steeringBlockMock.mockResolvedValue("");
+  projectsMock.length = 0;
 });
+
+const STEERING = [
+  "<<< SPARKLE STEERING — HARD CONSTRAINTS >>>",
+  "── standards.md (project) ──",
+  "The test command is `pnpm verify`. A red suite is not done.",
+  "<<< END SPARKLE STEERING >>>",
+].join("\n");
 
 const BRIEF = "Fix the flaky resize test.\nStart by reading Workspace.resize.test.tsx.";
 
@@ -393,5 +416,105 @@ describe("a timeout says WHICH silence it was", () => {
     expect(briefForLaunch("c4", false)).toBe(BRIEF);
     fire!();
     await expect(pending).resolves.toEqual({ state: "launching" });
+  });
+});
+
+// ── the steering prelude (bead .3) ────────────────────────────────────────────────
+//
+// A feature that is registered but never REACHED is inert, and that is the failure these guard:
+// the block only earns its place if the text an agent is actually launched with contains it.
+describe("the steering prelude is part of the brief the agent is LAUNCHED with", () => {
+  it("prepends this project's steering block, ahead of the mission", async () => {
+    projectsMock.push({ rootPath: "/repo", agents: [{ id: "s1" }] });
+    steeringBlockMock.mockResolvedValue(STEERING);
+
+    await attachBrief("s1", BRIEF);
+
+    const launched = briefForLaunch("s1", false);
+    // THE SIDE EFFECT: what goes into claude's argv, not merely that the fetch was called.
+    expect(launched).toContain("The test command is `pnpm verify`.");
+    expect(launched).toContain(BRIEF);
+    // Constraints must be in force while the agent reads the mission, so they come FIRST.
+    expect(launched!.indexOf("HARD CONSTRAINTS")).toBeLessThan(launched!.indexOf(BRIEF));
+    expect(steeringBlockMock).toHaveBeenCalledWith("/repo");
+  });
+
+  it("carries it all the way through a real launch assembly", async () => {
+    projectsMock.push({ rootPath: "/repo", agents: [{ id: "s2" }] });
+    steeringBlockMock.mockResolvedValue(STEERING);
+    await attachBrief("s2", BRIEF);
+
+    const spawn = assembleBuildSpawn({
+      claudePath: "/bin/claude",
+      resume: false,
+      cwd: "/wt",
+      persona: "persona",
+      bridge: { socketPath: "/s", token: "t" },
+      paths: { nodePath: "/node", serverPath: "/server.js" },
+      initialPrompt: briefForLaunch("s2", false),
+    });
+    expect(spawn.args.some((a) => a.includes("The test command is `pnpm verify`."))).toBe(true);
+  });
+
+  it("leaves the brief EXACTLY as written when steering is disabled", async () => {
+    projectsMock.push({ rootPath: "/repo", agents: [{ id: "s3" }] });
+    // Rust answers "" for every off / nothing-to-say case — steering off, inject_at_preflight off,
+    // or no files anywhere. There is no flag to read: the empty string IS the answer.
+    steeringBlockMock.mockResolvedValue("");
+
+    await attachBrief("s3", BRIEF);
+
+    expect(briefForLaunch("s3", false)).toBe(BRIEF);
+  });
+
+  it("does not guess a project for an agent no project claims", async () => {
+    projectsMock.push({ rootPath: "/other", agents: [{ id: "someone-else" }] });
+    steeringBlockMock.mockResolvedValue(STEERING);
+
+    await attachBrief("s4", BRIEF);
+
+    expect(briefForLaunch("s4", false)).toBe(BRIEF);
+    expect(steeringBlockMock).not.toHaveBeenCalled();
+  });
+
+  it("still delivers the mission when the steering lookup FAILS", async () => {
+    projectsMock.push({ rootPath: "/repo", agents: [{ id: "s5" }] });
+    steeringBlockMock.mockRejectedValue(new Error("steering_preflight_block: no such command"));
+
+    // Must not reject: a brief that failed to attach costs the agent its whole mission, while
+    // steering that could not be read costs it a hint.
+    await expect(attachBrief("s5", BRIEF)).resolves.toBeUndefined();
+    expect(briefForLaunch("s5", false)).toBe(BRIEF);
+  });
+
+  it("a re-spawn's brief is not overwritten by the superseded one's late steering", async () => {
+    projectsMock.push({ rootPath: "/repo", agents: [{ id: "s6" }] });
+    // Gate the FIRST lookup open so the interleaving under test is the one that runs, rather than
+    // whichever way two racing microtask chains happened to fall (an ordering test written from
+    // hope, not from the log, is the vacuous shape AGENTS.md names).
+    const calls: string[] = [];
+    let releaseFirst: (v: string) => void = () => {};
+    steeringBlockMock.mockImplementation((root: string) => {
+      calls.push(root);
+      return calls.length === 1
+        ? new Promise<string>((r) => {
+            releaseFirst = r;
+          })
+        : Promise.resolve(STEERING);
+    });
+
+    const first = attachBrief("s6", "FIRST MISSION");
+    await vi.waitFor(() => expect(calls.length).toBe(1));
+
+    // The re-spawn lands while the first lookup is still in flight.
+    await attachBrief("s6", "SECOND MISSION");
+    releaseFirst(STEERING);
+    await first;
+
+    const launched = briefForLaunch("s6", false);
+    expect(launched).toContain("SECOND MISSION");
+    expect(launched).not.toContain("FIRST MISSION");
+    // …and exactly one prelude, not the stale one stacked on top of the live one.
+    expect(launched!.split("HARD CONSTRAINTS").length - 1).toBe(1);
   });
 });

@@ -117,10 +117,19 @@ pub struct DevPortReport {
     pub port: u16,
     pub verdict: Verdict,
     pub holders: Vec<PortHolder>,
-    /// The sentence to show a human. Empty **only** when the port is free — there is nothing to say
-    /// about a port nobody is holding, and an empty string is what call sites test to decide
-    /// whether to say anything at all.
+    /// The sentence to show a human. Empty **only** when the port is free AND the port broker has
+    /// no record on it — there is nothing to say about a port nobody is holding, and an empty
+    /// string is what call sites test to decide whether to say anything at all.
     pub message: String,
+    /// What Sparkle's OWN port broker recorded about this port, if anything (bead `.5`).
+    ///
+    /// `null` for every port the registry has never heard of, which is the overwhelming majority
+    /// and includes every process a human started by hand. See [`RegistryClaim`] for why naming an
+    /// agent from a record does not breach this module's accuse-nobody rule.
+    ///
+    /// `Option`, so it crosses the wire as an explicit `null` rather than an absent key — the TS
+    /// side declares it `RegistryClaim | null`.
+    pub registry: Option<RegistryClaim>,
 }
 
 impl DevPortReport {
@@ -131,6 +140,108 @@ impl DevPortReport {
     pub fn worth_reporting(&self) -> bool {
         !self.message.is_empty()
     }
+}
+
+/// What Sparkle's own port broker knows about this port — a name that came from a RECORD SOMEBODY
+/// WROTE, not from an inference about a process (bead `.5`).
+///
+/// This is the one kind of attribution that does not strain this module's accuse-nobody rule, and
+/// the distinction is worth stating because it is the whole reason it is allowed here. Everything
+/// else in this file infers: `lsof` says a pid is on a port, `ps` says what its command line is,
+/// the cwd says which checkout it came from — every step a guess about somebody else's process,
+/// which is why none of them may justify a signal. A broker record is different in kind. An agent
+/// WROTE it, naming itself, before it started. Repeating what it said back is not an accusation.
+///
+/// The discipline is unchanged for everything else: a port with no record produces `None` and the
+/// report says exactly what it said before. Silence about a stranger is the default, and this
+/// speaks only where somebody volunteered their name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RegistryClaim {
+    /// The agent that recorded the claim.
+    pub agent_id: String,
+    pub pid: u32,
+    /// `lease` for an allocated port, `gate-lock` for a pinned one. Different remedies: a lease
+    /// moves, a pinned port cannot, so a reader has to be told which they are looking at.
+    pub kind: ClaimKind,
+    /// The gate lock's name, for a `gate-lock` claim. `null` for a lease.
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ClaimKind {
+    Lease,
+    GateLock,
+}
+
+/// Ask the port broker's registry who, if anyone, recorded a claim on `port`.
+///
+/// A LEASE WINS over a gate lock when both exist, which they should not: a lease is a claim on
+/// exactly this port, while a gate lock named `port-<n>` is a claim on the right to USE it. If the
+/// registry somehow holds both, the narrower fact is the more useful one to print.
+pub fn registry_claim(registry_root: &Path, port: u16) -> Option<RegistryClaim> {
+    if let Some(lease) = crate::port_broker::lease_on(registry_root, port) {
+        return Some(RegistryClaim {
+            agent_id: lease.agent_id,
+            pid: lease.pid,
+            kind: ClaimKind::Lease,
+            name: None,
+        });
+    }
+    let gate_name = crate::port_broker::pinned_gate_name(port);
+    let gate = crate::port_broker::gate_lock_on(registry_root, &gate_name)?;
+    Some(RegistryClaim {
+        agent_id: gate.agent_id,
+        pid: gate.pid,
+        kind: ClaimKind::GateLock,
+        name: Some(gate.name),
+    })
+}
+
+/// Fold a registry claim into a report. PURE, so the sentence it appends is testable without a
+/// registry on disk.
+///
+/// Appends to `message` for EVERY verdict, `Free` and `Undetermined` included, and the two
+/// non-`Held` cases are the interesting ones:
+///   * `Undetermined` — we could not see who is on the port, and the registry can still name the
+///     agent that reserved it. That is the case a reader is most stuck on, and the one where a
+///     volunteered name helps most.
+///   * `Free` — a record with nothing listening is a LEAK, not a collision: an agent took the port
+///     and died without releasing it. Saying so is how the lease gets cleaned up before it expires.
+pub fn with_registry_claim(mut report: DevPortReport, claim: Option<RegistryClaim>) -> DevPortReport {
+    let Some(claim) = claim else { return report };
+    let port = report.port;
+    let sentence = match (report.verdict, claim.kind) {
+        (Verdict::Free, _) => format!(
+            "Sparkle's port broker still has a record on port {port} for agent {} (pid {}), but \
+             nothing is listening there — that is a LEAK, not a collision: the agent went away \
+             without releasing it. It clears itself when its TTL runs out, or immediately with \
+             `port_broker_release`.",
+            claim.agent_id, claim.pid
+        ),
+        (_, ClaimKind::Lease) => format!(
+            "Sparkle's port broker records port {port} as LEASED by agent {} (pid {}). A lease can \
+             move: stop that agent's preview, or let it finish, and the port comes back on its own.",
+            claim.agent_id, claim.pid
+        ),
+        (_, ClaimKind::GateLock) => format!(
+            "Sparkle's port broker records port {port} as GATE-LOCKED by agent {} (pid {}) under \
+             `{}`. A gate lock is for a PINNED port, so there is no second port to move to — wait \
+             for that agent, or release the lock with `gate_lock_release`.",
+            claim.agent_id,
+            claim.pid,
+            claim.name.as_deref().unwrap_or("(unnamed)")
+        ),
+    };
+    if report.message.is_empty() {
+        report.message = sentence;
+    } else {
+        report.message.push(' ');
+        report.message.push_str(&sentence);
+    }
+    report.registry = Some(claim);
+    report
 }
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════
@@ -343,7 +454,13 @@ pub fn build_report(
         // "lsof printed something we could not read" (we do not know). Collapsing the second into
         // the first is exactly how a broken probe becomes a false all-clear.
         return if stdout.trim().is_empty() {
-            DevPortReport { port, verdict: Verdict::Free, holders: Vec::new(), message: String::new() }
+            DevPortReport {
+                port,
+                verdict: Verdict::Free,
+                holders: Vec::new(),
+                message: String::new(),
+                registry: None,
+            }
         } else {
             undetermined(port, COULD_NOT_PARSE)
         };
@@ -364,7 +481,7 @@ pub fn build_report(
     }
 
     let message = held_message(port, &holders);
-    DevPortReport { port, verdict: Verdict::Held, holders, message }
+    DevPortReport { port, verdict: Verdict::Held, holders, message, registry: None }
 }
 
 fn undetermined(port: u16, why: &str) -> DevPortReport {
@@ -372,6 +489,7 @@ fn undetermined(port: u16, why: &str) -> DevPortReport {
         port,
         verdict: Verdict::Undetermined,
         holders: Vec::new(),
+        registry: None,
         message: format!(
             "could not determine who is listening on port {port}: {why}. Nothing is being named as \
              the holder — a wrong name here would send you after an innocent process. Check by \
@@ -453,12 +571,21 @@ pub fn default_dev_port() -> u16 {
 pub async fn dev_port_preflight(
     app: tauri::AppHandle,
     port: Option<u16>,
+    project_root: Option<String>,
 ) -> Result<DevPortReport, String> {
     let port = port.unwrap_or_else(default_dev_port);
     let app_data = crate::worktree::app_data_dir_pub(&app)?;
     tauri::async_runtime::spawn_blocking(move || {
         let trash = crate::worktree::removal_trash_dir(&app_data);
-        Ok(build_report(port, &SystemProbe, &trash, &|p| p.is_dir()))
+        let report = build_report(port, &SystemProbe, &trash, &|p| p.is_dir());
+        // A `project_root` is optional because this command is reachable with no project in hand
+        // (the teardown path below has none either). Without one there is no registry to consult
+        // and the report is exactly what it always was — the accuse-nobody default, unchanged.
+        let claim = project_root
+            .as_deref()
+            .map(|r| crate::port_broker::registry_root(Path::new(r)))
+            .and_then(|root| registry_claim(&root, port));
+        Ok(with_registry_claim(report, claim))
     })
     .await
     .map_err(|e| format!("dev_port_preflight task failed: {e}"))?
@@ -816,5 +943,172 @@ mod tests {
         // contains nothing — the failure mode that would make this test permanently vacuous.
         assert!(report_path.contains("pub fn build_report"), "the slice must cover build_report");
         assert!(report_path.contains("pub fn held_message"), "the slice must cover held_message");
+    }
+
+    // ── REGISTRY ATTRIBUTION (bead `.5`) ─────────────────────────────────────────
+
+    fn free_report() -> DevPortReport {
+        DevPortReport {
+            port: 1420,
+            verdict: Verdict::Free,
+            holders: Vec::new(),
+            message: String::new(),
+            registry: None,
+        }
+    }
+
+    fn held_report() -> DevPortReport {
+        build_report(
+            1420,
+            &probe(Some(LSOF_ONE), Some(LSOF_CWD_LIVE), Some(PS_VITE)),
+            &trash(),
+            &|_| true,
+        )
+    }
+
+    /// A PORT THE REGISTRY HAS NEVER HEARD OF CHANGES NOTHING. The accuse-nobody discipline is the
+    /// default and stays the default: this is the case every process a human started falls into.
+    #[test]
+    fn a_port_with_no_record_reports_exactly_what_it_always_did() {
+        let before = held_report();
+        let after = with_registry_claim(before.clone(), None);
+        assert_eq!(after, before, "no record must mean no change, byte for byte");
+        assert!(after.registry.is_none());
+
+        let free = with_registry_claim(free_report(), None);
+        assert!(free.message.is_empty(), "and a free port must still say nothing at all");
+        assert!(!free.worth_reporting());
+    }
+
+    /// A LEASE NAMES ITS AGENT — the sentence the original complaint was missing. "The port is in
+    /// use" without a name tells a human with eight agents running precisely nothing.
+    #[test]
+    fn a_leased_port_names_the_agent_that_recorded_it() {
+        let claim = RegistryClaim {
+            agent_id: "agent-7".into(),
+            pid: 991,
+            kind: ClaimKind::Lease,
+            name: None,
+        };
+        let r = with_registry_claim(held_report(), Some(claim.clone()));
+        assert!(r.message.contains("agent-7"), "{}", r.message);
+        assert!(r.message.contains("991"), "{}", r.message);
+        assert!(r.message.contains("LEASED"), "{}", r.message);
+        assert!(r.message.contains("A lease can move"), "the remedy must match the kind: {}", r.message);
+        assert_eq!(r.registry, Some(claim));
+        // The original sentence survives — the claim is ADDITIVE, never a replacement.
+        assert!(r.message.contains("pid 48213"), "{}", r.message);
+    }
+
+    /// A GATE LOCK GETS A DIFFERENT REMEDY, because a pinned port has no second port to move to.
+    /// A remedy is an instruction somebody will follow, so offering "stop it and it will come back
+    /// on its own" for a resource that cannot move would be a dead instruction.
+    #[test]
+    fn a_gate_locked_port_is_told_apart_from_a_leased_one() {
+        let r = with_registry_claim(
+            held_report(),
+            Some(RegistryClaim {
+                agent_id: "agent-3".into(),
+                pid: 12,
+                kind: ClaimKind::GateLock,
+                name: Some("-1420".into()),
+            }),
+        );
+        assert!(r.message.contains("GATE-LOCKED by agent agent-3"), "{}", r.message);
+        assert!(r.message.contains("-1420"), "{}", r.message);
+        assert!(r.message.contains("no second port to move to"), "{}", r.message);
+        assert!(!r.message.contains("A lease can move"), "the lease remedy must NOT appear: {}", r.message);
+    }
+
+    /// A RECORD ON A PORT NOTHING IS LISTENING ON IS A LEAK, and saying so is what gets the lease
+    /// cleaned up before its TTL runs out. `Free` normally reports nothing at all, so this is the
+    /// one thing that can make a free port worth reporting.
+    #[test]
+    fn a_record_on_a_free_port_is_reported_as_a_leak() {
+        let r = with_registry_claim(
+            free_report(),
+            Some(RegistryClaim {
+                agent_id: "gone".into(),
+                pid: 4,
+                kind: ClaimKind::Lease,
+                name: None,
+            }),
+        );
+        assert_eq!(r.verdict, Verdict::Free);
+        assert!(r.worth_reporting(), "a leaked lease must break the free-port silence");
+        assert!(r.message.contains("that is a LEAK, not a collision"), "{}", r.message);
+        assert!(r.message.contains("port_broker_release"), "the remedy must be reachable: {}", r.message);
+    }
+
+    /// UNDETERMINED IS THE CASE A READER IS MOST STUCK ON: `lsof` could not say who is on the port,
+    /// and the registry still holds a name somebody volunteered. Both sentences must survive.
+    #[test]
+    fn an_undetermined_verdict_still_reports_what_the_registry_knows() {
+        let r = with_registry_claim(
+            undetermined(1420, COULD_NOT_LOOK),
+            Some(RegistryClaim {
+                agent_id: "agent-9".into(),
+                pid: 77,
+                kind: ClaimKind::Lease,
+                name: None,
+            }),
+        );
+        assert_eq!(r.verdict, Verdict::Undetermined);
+        assert!(r.message.contains("could not determine"), "{}", r.message);
+        assert!(r.message.contains("agent-9"), "{}", r.message);
+    }
+
+    /// THE READ SIDE, against a REAL registry: a lease written by the broker is the one this module
+    /// reads back. A pure test of the sentence cannot catch the two modules disagreeing about where
+    /// records live or what shape they are.
+    #[test]
+    fn the_claim_is_read_back_from_the_brokers_own_registry() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let settings = crate::port_broker::BrokerSettings {
+            enabled: true,
+            range_start: 45000,
+            range_end: 45000,
+            ..crate::port_broker::BrokerSettings::default()
+        };
+        let unbound = |_: u16| false;
+        let env =
+            crate::port_broker::Env { now_ms: 1_800_000_000_000, pid: 1234, is_bound: &unbound };
+        crate::port_broker::acquire_port(dir.path(), &settings, "agent-x", "preview", &env)
+            .expect("a lease");
+        let claim = registry_claim(dir.path(), 45000).expect("the registry must name the holder");
+        assert_eq!(claim.agent_id, "agent-x");
+        assert_eq!(claim.pid, 1234);
+        assert_eq!(claim.kind, ClaimKind::Lease);
+        assert!(registry_claim(dir.path(), 45001).is_none(), "and must stay silent about every other port");
+
+        crate::port_broker::acquire_gate_lock(
+            dir.path(),
+            &settings,
+            &crate::port_broker::pinned_gate_name(1420),
+            "agent-pin",
+            None,
+            &env,
+        )
+        .expect("a lock");
+        let gate = registry_claim(dir.path(), 1420).expect("a pinned port's lock must be readable");
+        assert_eq!(gate.kind, ClaimKind::GateLock);
+        assert_eq!(gate.agent_id, "agent-pin");
+        assert_eq!(gate.name.as_deref(), Some("port-1420"));
+    }
+
+    /// The attribution must not have smuggled a signal into this module. The header's whole rule is
+    /// that nothing here ever kills; a record naming an agent is a stronger temptation than an
+    /// inference about a pid, so the guard is re-run over the new code path explicitly.
+    #[test]
+    fn the_attribution_path_signals_nothing() {
+        let whole = include_str!("dev_port_preflight.rs");
+        let start = whole.find("pub fn registry_claim").expect("registry_claim must exist");
+        let end = whole.find("#[cfg(test)]").expect("test marker");
+        let path = &whole[start..end];
+        assert!(path.len() > 500, "the slice must not have been truncated to nothing");
+        for forbidden in ["kill_process_group", "libc::kill", "signal::kill", "SIGKILL", "SIGTERM"] {
+            assert!(!path.contains(forbidden), "the attribution path mentions `{forbidden}`");
+        }
+        assert!(path.contains("pub fn with_registry_claim"), "the slice must cover the fold");
     }
 }

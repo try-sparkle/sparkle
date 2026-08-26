@@ -1564,6 +1564,86 @@ pub struct RoborevConfig {
     pub consent_prompted: bool,
 }
 
+/// THE ADVERSARIAL REVIEWER PASS (`[adversarial_review]`) — bead `.4`.
+///
+/// A read-only reviewer audits a branch diff FRESH — with none of the implementing agent's plan,
+/// reasoning or self-report — and returns `ship` / `ship-with-notes` / `block`. See
+/// `adversarial_review.rs` for the mechanism and `PRD/adversarial-reviewer-subagent.md` for why the
+/// independence is structural rather than advisory.
+///
+/// PER-PROJECT OVERRIDABLE, like `[freshness]`/`[review]` and unlike `[advisor]`: whether an
+/// independent reviewer gates a codebase's PRs is a property of the CODEBASE and travels with it
+/// for the team. `[advisor]` is global-only because it decides which model this MACHINE spends its
+/// owner's quota on; this section only decides whether a repo's diffs get audited at all, and the
+/// spend is bounded by the same subscription either way.
+///
+/// FLAT AND SCALAR (plus one string list), so the whole section stays reachable through the
+/// existing dotted setters.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct AdversarialReviewConfig {
+    /// Master switch. Ships **FALSE** — this is opt-in, and the argument is the one `[advisor]`
+    /// could make and this cannot: the advisor is bounded by a ZERO-SPEND GATE that refuses to
+    /// dispatch while the usage meter is armed, so shipping it on costs at worst a skipped pass.
+    /// A diff review has no such gate — it spends the user's subscription quota on a multi-minute
+    /// Opus call over a diff that can be the size of a whole feature, on every branch, unasked. A
+    /// feature that spends without a bound must be chosen, not defaulted into.
+    pub enabled: bool,
+    /// Which model reviews the diff. Ships `claude-opus-5`.
+    ///
+    /// KEPT VERBATIM, never silently substituted — the same rule as `[advisor].model`. An id the
+    /// CLI does not know costs exactly one failed run, whose verdict is `unknown` (and therefore
+    /// blocking by default), which is a loud and correct outcome. Rewriting a hand-edited config
+    /// value, or quietly reviewing on a model the user did not name, would be neither.
+    pub model: String,
+    /// Cap on the diff handed to the reviewer, in bytes.
+    ///
+    /// A CAP, NOT A TARGET: when it bites, the prompt SAYS the diff was truncated and the persisted
+    /// record carries `truncated: true`. A reviewer silently handed half a diff reports on the half
+    /// it saw with full confidence, and its `ship` would then be a statement about code nobody read.
+    ///
+    /// ⚠️ IT IS BOUNDED ABOVE BY `adversarial_review::max_diff_budget()`, which is derived from
+    /// `claude_oneshot::MAX_PROMPT_BYTES` (128 KiB) minus the prompt's own header. This shipped at
+    /// 200_000 — ABOVE that hard limit — and the doc line here asserted the opposite, which is how
+    /// it survived review (roborev job 69292, High). The consequence was not a truncated review but
+    /// NO review: the one-shot refuses an over-length prompt outright, `review_with` records the
+    /// refusal as `unknown`, and `unknown` blocks by default — so every branch with a diff between
+    /// ~128 KB and 200 KB was permanently blocked by the very cap meant to accommodate it.
+    ///
+    /// `apply_adversarial_review` now clamps a larger configured value down and says so, and
+    /// `collect_diff` clamps again at capture time so the guarantee holds however this struct was
+    /// built. The default sits below the ceiling with room to spare.
+    pub max_diff_bytes: u32,
+    /// Which verdicts a consumer should treat as BLOCKING.
+    ///
+    /// `unknown` ships in the set, and that is the whole fail-closed design rather than an
+    /// over-cautious default: `unknown` is not something the reviewer can say — it is what the
+    /// parser produces when it could not read a verdict at all (a CLI failure, a truncated reply, a
+    /// changed output shape). Dropping it from this list turns every one of those into a silent
+    /// approval. Values are matched leniently (`ship_with_notes` ≡ `ship-with-notes`); an
+    /// unrecognised entry simply never matches, so a typo weakens the gate rather than breaking it
+    /// — which is why the safe direction here is to ADD entries, never to trim them.
+    pub block_on: Vec<String>,
+    /// Wall clock for the reviewer's one-shot. A real audit of a large diff is minutes, not
+    /// seconds; a timeout produces `unknown`, which blocks by default.
+    pub timeout_secs: u32,
+}
+
+impl Default for AdversarialReviewConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            model: "claude-opus-5".to_string(),
+            // BELOW `adversarial_review::max_diff_budget()` with room to spare — see the field
+            // doc. `the_default_diff_budget_fits_the_one_shot_prompt_ceiling` asserts it against
+            // the REAL prompt bytes rather than against a restated number.
+            max_diff_bytes: 120_000,
+            block_on: vec!["block".to_string(), "unknown".to_string()],
+            timeout_secs: 600,
+        }
+    }
+}
+
 /// Machine-wide mirror of the user's Sparkle-improvement consent (`"always"|"case_by_case"|"never"`).
 /// Its ONLY reason to exist is a file-based read path: the improvement/orchestrator agents run as
 /// headless `claude` processes with no access to the webview's localStorage, where this setting
@@ -1631,6 +1711,37 @@ pub struct DrainerConfig {
     pub enabled: bool,
 }
 
+/// Per-project STEERING FILES — the "where" and the "how" pushed into every agent at birth
+/// (`steering.rs`). Two documents, `architecture.md` and `standards.md` by default, resolved across
+/// a global / project / local stack, copied into each new worktree and injected at pre-flight as a
+/// HARD CONSTRAINT.
+///
+/// PER-PROJECT OVERRIDABLE, unlike `[builder_index]` above, and for the opposite reason: this is
+/// not a statement about the machine or its owner, it is a repo describing its own rules. A cloned
+/// repo naming its own steering files is exactly the intended use. The path-traversal boundary that
+/// makes that safe lives in `steering::is_safe_name`, not here.
+///
+/// OPT-IN. `enabled` ships FALSE: this injects text into every agent's opening context, which is
+/// the most expensive place in the product to be wrong, so nothing happens until someone asks.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct SteeringConfig {
+    /// Master switch. FALSE by default — see the type doc.
+    pub enabled: bool,
+    /// The steering documents, in the order they are injected. Bare file names only; anything with
+    /// a path separator is refused at resolution time rather than read.
+    pub files: Vec<String>,
+    /// Copy the resolved files into each newly created agent worktree, so an agent sees them on
+    /// disk from birth. Never overwrites a file the worktree already carries.
+    pub seed_on_worktree_create: bool,
+    /// Inject the rendered block into a spawning agent's opening brief.
+    pub inject_at_preflight: bool,
+    /// Cap on the injected block, fences included. Over-budget content is TRUNCATED WITH AN
+    /// EXPLICIT MARKER rather than silently dropped — an agent cannot ask about a rule it does not
+    /// know went missing.
+    pub max_inject_bytes: u32,
+}
+
 /// Settings for the Builder Index REPORTER (`builder_index.rs`) — what it publishes, once the
 /// separate `[tools].builder_index` switch has turned it on.
 ///
@@ -1656,6 +1767,190 @@ pub struct BuilderIndexConfig {
     /// wholesale, so a name one of them drops and the other keeps makes the badge flap every couple
     /// of hours instead of disappearing.
     pub skills_exclude: Vec<String>,
+}
+
+/// One entry in `[verify_gate].checks` — a named local command that stands in for a CI job.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct VerifyCheckConfig {
+    /// Human label, e.g. `typecheck`. Also the stem of the log file the run writes.
+    pub name: String,
+    /// The command line, run through the login shell inside the agent's worktree.
+    pub cmd: String,
+}
+
+/// The verify-before-PR gate (`verify_gate.rs`, bead `.1`): run CI's checks LOCALLY,
+/// inside the agent's worktree, before the PR exists — and keep the evidence that they ran.
+///
+/// Per-project overridable (like `[freshness]`), because what verifies a repo is a property of the
+/// REPO: `pnpm verify` here, `cargo test` in a crate, `make check` elsewhere. A machine-wide list
+/// would be wrong for every project but one.
+///
+/// OFF BY DEFAULT, and that is not timidity. Switching it on makes the app run arbitrary commands
+/// from a config file, for minutes at a time, in a working tree — the kind of thing a user opts
+/// into rather than discovers. `enabled` governs the AUTOMATIC path (the panel surfacing itself,
+/// and `require_pass_before_pr` binding); an explicit run asked for by a person still works, since
+/// a person asking is not the automatic path this flag exists to withhold.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct VerifyGateConfig {
+    /// Opt-in master switch. See the struct doc for what it does and does not gate.
+    pub enabled: bool,
+    /// The ordered check list. EMPTY means "discover them from the project's own package.json
+    /// scripts" (`verify_gate::default_checks_from_package_json`) — and when discovery also finds
+    /// nothing the verdict is `not_run`, never `pass`. A configured list WINS over discovery: a
+    /// repo that wrote its own list has said something specific about how it is verified.
+    pub checks: Vec<VerifyCheckConfig>,
+    /// Per-check wall-clock bound. A check that outlives it is KILLED and recorded as `timeout` —
+    /// unjudged, and so never a pass. Generous by default: a bound that fires on a healthy cold
+    /// `tsc` trains people to ignore the gate.
+    pub check_timeout_secs: u64,
+    /// When true (and `enabled`), a PR may not be opened until the last report's verdict is `pass`.
+    /// This is the half `.2`'s integration assistant consults; `verify_gate` answers it
+    /// with a sentence, never a bare bool, so a refusal can explain itself.
+    pub require_pass_before_pr: bool,
+    /// Where reports, logs and captured artifacts live, relative to the project root (an absolute
+    /// path is honoured as-is — a shared artifact volume is a legitimate target). Reports land at
+    /// `<dir>/<agentId>.json`; evidence at `<dir>/<agentId>/evidence/`.
+    pub evidence_dir: String,
+}
+
+impl VerifyGateConfig {
+    /// Project this config onto `verify_gate`'s own settings struct.
+    ///
+    /// TWO STRUCTS ON PURPOSE. `verify_gate.rs` must be unit-testable without building a whole
+    /// `SparkleConfig`, and config.rs must not depend on the module it configures. This is the one
+    /// seam between them, so a field added on one side and forgotten on the other fails to compile
+    /// here rather than going quietly inert (bead `sparkle-16y6h`'s shape, applied in-process).
+    pub fn to_gate_settings(&self) -> crate::verify_gate::GateSettings {
+        crate::verify_gate::GateSettings {
+            enabled: self.enabled,
+            checks: self
+                .checks
+                .iter()
+                .map(|c| crate::verify_gate::CheckSpec {
+                    name: c.name.clone(),
+                    cmd: c.cmd.clone(),
+                })
+                .collect(),
+            // A zero or absurd timeout would make every check `timeout` — i.e. would silently turn
+            // the gate into a permanent refusal. Clamp to at least a second.
+            check_timeout_secs: self.check_timeout_secs.max(1),
+            require_pass_before_pr: self.require_pass_before_pr,
+            evidence_dir: self.evidence_dir.clone(),
+        }
+    }
+}
+
+/// One tracker's settings inside `[ticket_intake]` (`ticket_intake.rs`, bead `.6`).
+///
+/// `api_key` is a [`crate::ticket_intake::Secret`], NOT a `String`, and that is load-bearing rather
+/// than tidy: `SparkleConfig` derives `Serialize` and is handed to the webview on every config
+/// read, so a bare `String` here would ship the user's Linear token into the frontend. `Secret`
+/// redacts itself in both `Debug` and `Serialize`; the value is readable only through `expose()`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct TicketProviderConfig {
+    /// Per-provider switch. A provider switched off is refused BY NAME rather than silently
+    /// skipped, so "why did my Jira ticket not come back" has an answer.
+    pub enabled: bool,
+    /// The site or endpoint. Required for Jira (there is no shared host); optional for Linear,
+    /// where an empty value means the public GraphQL endpoint.
+    pub base_url: String,
+    /// A token, or an `op://vault/item/field` reference resolved through the EXISTING
+    /// `onepassword` module at fetch time. Never a second secret path.
+    pub api_key: crate::ticket_intake::Secret,
+}
+
+/// EXTERNAL-TRACKER INTAKE — "paste tickets, fan out" (`ticket_intake.rs`, bead `.6`).
+///
+/// Turns a paste of ticket references (Linear, Jira, GitHub, or a beads id) into structured work:
+/// title, description, comments, downloaded screenshots, and a derived branch / commit prefix / PR
+/// title. Beads remains Sparkle's own task graph; this reads the tracker a TEAM lives in.
+///
+/// OPT-IN. `enabled` ships FALSE, and the half that needs no credential (the parser) works anyway —
+/// so a user with nothing configured can still paste `ENG-1234` and get a branch name.
+///
+/// GLOBAL-ONLY, for the SAME security reason as `[publish]`, and this is the one decision here that
+/// is not a preference. A per-project block would let a repo, merely by being cloned, set
+/// `base_url` to a host of its choosing AND name an `op://` reference — pointing the resolved
+/// contents of the user's 1Password vault at that host. A repo does not get a vote on where a
+/// credential is sent. `apply_project_layer` warns and ignores it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct TicketIntakeConfig {
+    /// Opt-in master switch. FALSE by default; the parser works regardless (see the type doc).
+    pub enabled: bool,
+    /// Which tracker a BARE `ENG-1234` means. `None` — the default — makes such a key AMBIGUOUS
+    /// rather than guessed, which is the whole point: the same string is a valid Linear key and a
+    /// valid Jira key, and picking one silently sends an agent to the wrong tracker.
+    pub default_provider: Option<String>,
+    pub linear: TicketProviderConfig,
+    pub jira: TicketProviderConfig,
+    pub github: TicketProviderConfig,
+    pub beads: TicketProviderConfig,
+    /// `{key}` / `{key_lower}` / `{slug}` / `{provider}`. The rendered value is sanitized into a
+    /// legal branch name afterwards, so a template cannot produce a name git refuses.
+    pub branch_template: String,
+    /// Same placeholders. `{slug}` is empty here — a commit prefix is the key, not the subject.
+    pub commit_prefix_template: String,
+    /// Where downloaded screenshots land, relative to the project root (an absolute path is
+    /// honoured as-is). Content-addressed inside a per-key directory.
+    pub image_dir: String,
+}
+
+impl TicketIntakeConfig {
+    /// Project this config onto `ticket_intake`'s own settings struct.
+    ///
+    /// TWO STRUCTS ON PURPOSE, the same seam `VerifyGateConfig::to_gate_settings` documents: the
+    /// module must be unit-testable without a whole `SparkleConfig`, and config.rs must not depend
+    /// on the module it configures. A field added on one side and forgotten on the other fails to
+    /// compile HERE rather than going quietly inert.
+    pub fn to_intake_settings(&self) -> crate::ticket_intake::IntakeSettings {
+        use crate::ticket_intake::{IntakeSettings, Provider, ProviderSettings};
+        let conv = |p: &TicketProviderConfig| ProviderSettings {
+            enabled: p.enabled,
+            base_url: p.base_url.clone(),
+            api_key: p.api_key.clone(),
+        };
+        let non_empty = |v: &str, fallback: &str| {
+            if v.trim().is_empty() {
+                fallback.to_string()
+            } else {
+                v.trim().to_string()
+            }
+        };
+        IntakeSettings {
+            enabled: self.enabled,
+            // Only Linear and Jira can BE the answer here: `default_provider` exists to break the
+            // Linear-vs-Jira tie on a bare `ENG-1234`, and neither a GitHub `#123` nor a beads id
+            // is ambiguous in the first place. An unusable value resolves to None, which restores
+            // the honest "ambiguous, pick one" rather than a default nobody can act on.
+            default_provider: self
+                .default_provider
+                .as_deref()
+                .and_then(Provider::from_slug)
+                .filter(|p| matches!(p, Provider::Linear | Provider::Jira)),
+            linear: conv(&self.linear),
+            jira: conv(&self.jira),
+            github: conv(&self.github),
+            beads: conv(&self.beads),
+            branch_template: non_empty(
+                &self.branch_template,
+                crate::ticket_intake::DEFAULT_BRANCH_TEMPLATE,
+            ),
+            commit_prefix_template: non_empty(
+                &self.commit_prefix_template,
+                crate::ticket_intake::DEFAULT_COMMIT_PREFIX_TEMPLATE,
+            ),
+            image_dir: non_empty(&self.image_dir, crate::ticket_intake::DEFAULT_IMAGE_DIR),
+            // DISCOVERED, NOT CONFIGURED — deliberately empty here. Which bead id prefixes a repo
+            // uses is a fact about that repo's `.beads/` files, not a preference, so
+            // `ticket_intake::settings_for` fills it in from disk. Empty is a safe value: the
+            // parser then falls back to its conservative shape rule rather than misreading prose.
+            beads_prefixes: Vec::new(),
+        }
+    }
 }
 
 /// Branch/build freshness rules — guardrails against doing work on (or shipping a DMG from) a
@@ -1985,6 +2280,91 @@ pub struct FleetConfig {
     pub ci_lease_secs: u32,
 }
 
+/// The inclusive port range `[port_broker]` allocates from — `[port_broker.range]`.
+///
+/// Its own sub-table rather than two flat keys, because start and end are meaningless apart: a
+/// hand-edit that sets one and forgets the other reads as a range in the file and is a half-range
+/// in memory. `port_broker::BrokerSettings::normalized_range` swaps a reversed pair rather than
+/// resolving it to the empty range, which would report as "no port available" — indistinguishable
+/// from a range that is genuinely full.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct PortRangeConfig {
+    pub start: u16,
+    pub end: u16,
+}
+
+/// One entry in `[port_broker].gate_locks` — a named exclusive lock and how long a holder keeps it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct GateLockConfig {
+    /// The lock's name, e.g. `-1420` or `browser`. Free-form; it is sanitized into a
+    /// single path segment at the filesystem boundary and the raw form is kept on the record.
+    pub name: String,
+    /// How long the holder may keep it without re-taking it. A crashed holder self-releases here.
+    pub ttl_secs: u64,
+}
+
+/// RUNTIME arbitration for parallel agents (`port_broker.rs`, bead `.5`): port LEASES for
+/// ports that can move, and named gate LOCKS for the ones that cannot.
+///
+/// Per-project overridable, like `[verify_gate]` and `[steering]`, and for the same reason: which
+/// ports a project's dev servers may use, and which of its resources are singletons, are properties
+/// of the REPO. A machine-wide range would be wrong for every project but one.
+///
+/// OFF BY DEFAULT. Switching it on changes which port a preview binds — the historic path allocates
+/// an ephemeral port from the kernel and this one hands out a number from a fixed range — so it is
+/// something a user opts into rather than discovers. While it is off, `port_broker` writes NOTHING:
+/// no registry directory, no lease, no lock.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct PortBrokerConfig {
+    /// Opt-in master switch. See the struct doc for what it does and does not gate.
+    pub enabled: bool,
+    /// The allocation range. Reserved ports inside it (Sparkle's own 1420) are skipped, never leased.
+    pub range: PortRangeConfig,
+    /// How long a lease survives without a heartbeat before it becomes ELIGIBLE for reclamation.
+    /// Eligible, not reclaimed: the port must ALSO be observably unbound, so a live-but-quiet holder
+    /// is never stolen from.
+    pub lease_ttl_secs: u64,
+    /// How often a holder is expected to renew. Advisory — published so the app and any caller agree
+    /// on one cadence rather than each picking its own fraction of the TTL.
+    pub heartbeat_secs: u64,
+    /// Named gate locks and their TTLs. A name that is NOT listed still locks, on the module's
+    /// default TTL: requiring an entry would make the config a gate on the gate, leaving a resource
+    /// unprotected exactly when nobody thought to declare it.
+    pub gate_locks: Vec<GateLockConfig>,
+}
+
+impl PortBrokerConfig {
+    /// Project this config onto `port_broker`'s own settings struct.
+    ///
+    /// TWO STRUCTS ON PURPOSE, exactly as `VerifyGateConfig::to_gate_settings` records: the module
+    /// must be unit-testable without building a whole `SparkleConfig`, and config.rs must not depend
+    /// on the module it configures. This is the one seam, so a field added on one side and forgotten
+    /// on the other fails to COMPILE here rather than going quietly inert.
+    pub fn to_broker_settings(&self) -> crate::port_broker::BrokerSettings {
+        crate::port_broker::BrokerSettings {
+            enabled: self.enabled,
+            range_start: self.range.start,
+            range_end: self.range.end,
+            // A zero TTL would make EVERY lease instantly stale, which turns reclamation from a
+            // safety net into the normal path — the collision this module exists to prevent, via
+            // its own config. Clamp to a second.
+            lease_ttl_secs: self.lease_ttl_secs.max(1),
+            heartbeat_secs: self.heartbeat_secs.max(1),
+            gate_locks: self
+                .gate_locks
+                .iter()
+                .map(|g| crate::port_broker::GateLockSpec {
+                    name: g.name.clone(),
+                    ttl_secs: g.ttl_secs.max(1),
+                })
+                .collect(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub struct SparkleConfig {
@@ -2001,6 +2381,9 @@ pub struct SparkleConfig {
     /// roborev machine-wide state (the one-time consent flag). Kept in its own section so Rust can
     /// gate the first-run modal on it.
     pub roborev: RoborevConfig,
+    /// The independent adversarial diff review (`adversarial_review.rs`). Opt-in; per-project
+    /// overridable, because whether a repo's PRs get an independent audit is a property of the repo.
+    pub adversarial_review: AdversarialReviewConfig,
     /// Sparkle-improvement consent, mirrored from the webview store so headless agents can read it
     /// from the file. Machine-wide, like [roborev]; `consent` is `None` until the user sets it.
     pub improvement: ImprovementConfig,
@@ -2011,14 +2394,22 @@ pub struct SparkleConfig {
     /// destination is a network egress target Sparkle sends a bearer token to.
     pub publish: PublishConfig,
     pub freshness: FreshnessConfig,
+    /// The verify-before-PR gate (repo-scoped + per-project overridable). Off by default.
+    pub verify_gate: VerifyGateConfig,
     /// The cross-agent + human @mention channel knobs (anti-loop cap, ACK deadline).
     pub mention: MentionConfig,
+    /// External ticket-system intake (Linear/Jira/GitHub/beads) + screenshot ingestion. Off by
+    /// default, and GLOBAL-ONLY — see the type doc for why a repo may not set it.
+    pub ticket_intake: TicketIntakeConfig,
     /// Which PR-scoped reviewer watches this repo, or `none`. Per-project overridable; the shell
     /// merge gate reads the same key out of `.sparkle/config.toml`.
     pub review: ReviewConfig,
     pub worktree_pool: WorktreePoolConfig,
     /// Live in-app browser preview (repo-scoped + per-project overridable).
     pub preview: PreviewConfig,
+    /// Runtime port arbitration for parallel agents — leases + gate locks (repo-scoped +
+    /// per-project overridable). Off by default; see PortBrokerConfig.
+    pub port_broker: PortBrokerConfig,
     pub capture: CaptureConfig,
     /// Reader-facing display preferences (bead-card expansion). Machine-wide (see UiConfig).
     pub ui: UiConfig,
@@ -2045,12 +2436,48 @@ pub struct SparkleConfig {
     /// What the Builder Index reporter publishes, once `[tools].builder_index` has turned it on.
     /// Machine-wide (see BuilderIndexConfig).
     pub builder_index: BuilderIndexConfig,
+    /// Per-project steering documents injected at agent pre-flight. Repo-scoped overridable
+    /// (see SteeringConfig); ships disabled.
+    pub steering: SteeringConfig,
     /// The fleet's global CI-concurrency budget + release priority. Machine-wide (see FleetConfig) —
     /// a repo does not get to decide how much of this machine's fleet may hammer the shared pool.
     pub fleet: FleetConfig,
     /// The in-app backlog drainer's kill switch. Machine-wide (see DrainerConfig). Placed at the end
     /// of the struct, well away from `improvement:`, so it does not textually collide with PR #2281.
     pub drainer: DrainerConfig,
+    /// The integration assistant's own switches (bead `.2`). Machine-wide, and OFF by
+    /// default — see [`IntegrationAssistantConfig`].
+    pub integration_assistant: IntegrationAssistantConfig,
+}
+
+/// `[integration_assistant]` — the one-click scoped-PR → gate → merge assistant
+/// (`integration_assistant.rs`, bead `.2`).
+///
+/// MACHINE-WIDE, like `[drainer]` and `[tools]`, and for a sharper version of the same reason: this
+/// section can authorize an automated `gh pr merge`. A per-project `[integration_assistant]` is a
+/// file CHECKED INTO A REPO, so honouring it would let a repo somebody merely opened turn on
+/// automatic merging of its own pull requests. It is ignored in a project layer, with a warning.
+///
+/// SHIPS OFF. Every other default here is the SAFE direction rather than the convenient one:
+/// `require_roborev_clean` is true so an unread review blocks, and `merge_strategy` is validated
+/// rather than free text (see `integration_assistant::validate_merge_strategy` — this struct calls
+/// that function rather than restating its rule, so the two cannot drift).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct IntegrationAssistantConfig {
+    /// Master switch. FALSE by default: a feature that merges pull requests must be asked for.
+    pub enabled: bool,
+    /// Catch a branch up onto fresh `origin/<default>` before gating it. The assistant picks the
+    /// verb (`merge` when the branch carries merge commits, `rebase` otherwise), not the user.
+    pub auto_rebase: bool,
+    /// Undrained roborev findings block the merge. TRUE by default — an unread review is backlog
+    /// the merge would bury.
+    pub require_roborev_clean: bool,
+    /// Only `"merge"` is accepted. `"squash"` is refused with a stated reason; see
+    /// `integration_assistant::validate_merge_strategy`.
+    pub merge_strategy: String,
+    /// Delete the remote branch after a merge that ANCESTRY proved landed.
+    pub cleanup_after_merge: bool,
 }
 
 impl Default for SparkleConfig {
@@ -2134,6 +2561,9 @@ impl Default for SparkleConfig {
             plugins: PluginsConfig::defaults(),
             // First-run consent is unresolved until the user answers the one-time modal.
             roborev: RoborevConfig { consent_prompted: false },
+            // Opt-in: OFF until a human turns it on. See AdversarialReviewConfig::enabled for why
+            // this cannot borrow [advisor]'s "ships true" argument.
+            adversarial_review: AdversarialReviewConfig::default(),
             // No consent mirrored until the user sets it — see ImprovementConfig on why this stays
             // None rather than defaulting to "case_by_case" (it must not clobber a persisted choice).
             improvement: ImprovementConfig { consent: None, never_idle_armed: true },
@@ -2166,8 +2596,56 @@ impl Default for SparkleConfig {
                 require_fresh_branch: true,
                 auto_fast_forward: true,
             },
+            // OFF, with an EMPTY check list — the two defaults that make the gate inert until a
+            // human asks for it. Empty does NOT mean "nothing to check": it means "discover the
+            // project's own scripts", and when discovery finds nothing the verdict is `not_run`,
+            // which is not a pass. Keep `evidence_dir` in sync with
+            // `verify_gate::DEFAULT_EVIDENCE_DIR` and the timeout with `DEFAULT_CHECK_TIMEOUT_SECS`.
+            verify_gate: VerifyGateConfig {
+                enabled: false,
+                checks: Vec::new(),
+                check_timeout_secs: crate::verify_gate::DEFAULT_CHECK_TIMEOUT_SECS,
+                require_pass_before_pr: true,
+                evidence_dir: crate::verify_gate::DEFAULT_EVIDENCE_DIR.to_string(),
+            },
             // Keep in sync with DEFAULT_MAX_MENTION_ROUNDS / DEFAULT_ACK_DEADLINE_MS in mention.rs.
             mention: MentionConfig { max_rounds: 6, ack_deadline_ms: 3 * 60 * 1000 },
+            // OFF, with NO default_provider — the two defaults that keep intake inert AND honest
+            // until someone configures it. No default_provider means a bare `ENG-1234` comes back
+            // ambiguous rather than silently attributed to a tracker the user never named. The
+            // template and directory literals are stated here so this line, the struct doc and
+            // DEFAULT_TEMPLATE cannot drift apart; keep them in step with the `DEFAULT_*`
+            // constants in ticket_intake.rs.
+            ticket_intake: TicketIntakeConfig {
+                enabled: false,
+                default_provider: None,
+                linear: TicketProviderConfig {
+                    enabled: true,
+                    base_url: String::new(),
+                    api_key: crate::ticket_intake::Secret::default(),
+                },
+                jira: TicketProviderConfig {
+                    enabled: true,
+                    base_url: String::new(),
+                    api_key: crate::ticket_intake::Secret::default(),
+                },
+                // GitHub and beads carry their own auth (`gh` and `bd`), so they need no key and
+                // are usable the moment intake is switched on.
+                github: TicketProviderConfig {
+                    enabled: true,
+                    base_url: String::new(),
+                    api_key: crate::ticket_intake::Secret::default(),
+                },
+                beads: TicketProviderConfig {
+                    enabled: true,
+                    base_url: String::new(),
+                    api_key: crate::ticket_intake::Secret::default(),
+                },
+                branch_template: crate::ticket_intake::DEFAULT_BRANCH_TEMPLATE.to_string(),
+                commit_prefix_template: crate::ticket_intake::DEFAULT_COMMIT_PREFIX_TEMPLATE
+                    .to_string(),
+                image_dir: crate::ticket_intake::DEFAULT_IMAGE_DIR.to_string(),
+            },
             review: ReviewConfig {
                 // Today's behaviour: assume a PR-scoped reviewer IS watching, so a repo that never
                 // writes this key keeps its coverage gate. Keep in sync with the bash fallback
@@ -2213,15 +2691,54 @@ impl Default for SparkleConfig {
             // allowlist is already "plugins you installed", so a name only reaches the profile
             // because the user put it on this machine.
             builder_index: BuilderIndexConfig { skills_exclude: Vec::new() },
+            // OPT-IN, and the file list is stated as a literal here so this line, the struct doc
+            // and DEFAULT_TEMPLATE cannot drift apart. 8 KiB is roughly two dense pages — enough
+            // for a real architecture map plus a command list, small enough that it cannot crowd
+            // out the mission it is prefixed to.
+            steering: SteeringConfig {
+                enabled: false,
+                files: vec!["architecture.md".to_string(), "standards.md".to_string()],
+                seed_on_worktree_create: true,
+                inject_at_preflight: true,
+                max_inject_bytes: 8192,
+            },
             // Governor ON by default, sized just under the 8-VM linux-ci pool so a fleet burst leaves
             // runner headroom for a release's base CI. `ci_budget = 0` in the global config.toml opts
             // out. Lease ≈ a full CI matrix's wall-clock (the safety drain, not a completion signal).
+            // OPT-IN. The range is stated as a literal here so this line, the struct doc and
+            // DEFAULT_TEMPLATE cannot drift apart; 45000-45099 is well clear of every framework's
+            // own default (3000/3001/5173/8080) and of Sparkle's pinned 1420. The one shipped gate
+            // lock is Sparkle's own dev port, which `strictPort: true` makes unmovable.
+            port_broker: PortBrokerConfig {
+                enabled: false,
+                range: PortRangeConfig {
+                    start: crate::port_broker::DEFAULT_RANGE_START,
+                    end: crate::port_broker::DEFAULT_RANGE_END,
+                },
+                lease_ttl_secs: crate::port_broker::DEFAULT_LEASE_TTL_SECS,
+                heartbeat_secs: crate::port_broker::DEFAULT_HEARTBEAT_SECS,
+                gate_locks: vec![GateLockConfig {
+                    name: crate::port_broker::SPARKLE_DEV_GATE.to_string(),
+                    ttl_secs: crate::port_broker::DEFAULT_GATE_TTL_SECS,
+                }],
+            },
             fleet: FleetConfig { ci_budget: 6, ci_lease_secs: 900 },
             // Ships ENABLED — the founder's directive (zero human steps, on by default). The worker
             // cap + rest floor in scripts/backlog-drainer.sh bound the worst case, and `enabled =
             // false` (or SPARKLE_DRAINER_ENABLED=0) is the rebuild-free kill switch. Stated as a
             // literal so this line, the struct, and DEFAULT_TEMPLATE cannot drift apart.
             drainer: DrainerConfig { enabled: true },
+            // Ships OFF, unlike every neighbour here: this one merges pull requests. The remaining
+            // values are the SAFE direction — roborev gates, and the only accepted strategy is the
+            // merge commit that keeps `landed-by-ancestry` provable. Stated as literals so this
+            // line, the struct and DEFAULT_TEMPLATE cannot drift apart.
+            integration_assistant: IntegrationAssistantConfig {
+                enabled: false,
+                auto_rebase: true,
+                require_roborev_clean: true,
+                merge_strategy: "merge".to_string(),
+                cleanup_after_merge: true,
+            },
         }
     }
 }
@@ -2498,6 +3015,24 @@ struct PartialRoborev {
     consent_prompted: Option<bool>,
 }
 
+/// `[adversarial_review]` as read from TOML.
+///
+/// EVERY value is a `toml::Value` for the reason `PartialAdvisor` records: a typed `Option<u32>`
+/// makes ONE mistyped key (`max_diff_bytes = "200000"`) fail the whole LAYER to deserialize, and
+/// the layer then reports a "syntax error" and is ignored ENTIRELY — a user who typo'd one knob
+/// silently loses every other setting in the same file. Reading each value loosely and warning
+/// per-key costs one line each and keeps the blast radius at the key.
+#[derive(Debug, Default, Deserialize)]
+struct PartialAdversarialReview {
+    enabled: Option<toml::Value>,
+    model: Option<toml::Value>,
+    max_diff_bytes: Option<toml::Value>,
+    block_on: Option<toml::Value>,
+    timeout_secs: Option<toml::Value>,
+    #[serde(flatten)]
+    rest: std::collections::BTreeMap<String, toml::Value>,
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct PartialImprovement {
     consent: Option<String>,
@@ -2513,6 +3048,22 @@ struct PartialImprovement {
 #[derive(Debug, Default, Deserialize)]
 struct PartialDrainer {
     enabled: Option<toml::Value>,
+    #[serde(flatten)]
+    rest: std::collections::BTreeMap<String, toml::Value>,
+}
+
+/// `[integration_assistant]` as read from TOML. EVERY value is `toml::Value` for the reason
+/// `PartialDrainer` records: with a strong type, ONE hand-edit (`enabled = "yes"`,
+/// `merge_strategy = 3`) fails `toml::from_str` for the WHOLE global layer, which is then discarded
+/// — reverting every unrelated setting in the file to its default. `#[serde(flatten)] rest` reports
+/// a misspelled key instead of swallowing it.
+#[derive(Debug, Default, Deserialize)]
+struct PartialIntegrationAssistant {
+    enabled: Option<toml::Value>,
+    auto_rebase: Option<toml::Value>,
+    require_roborev_clean: Option<toml::Value>,
+    merge_strategy: Option<toml::Value>,
+    cleanup_after_merge: Option<toml::Value>,
     #[serde(flatten)]
     rest: std::collections::BTreeMap<String, toml::Value>,
 }
@@ -2551,9 +3102,43 @@ struct PartialFreshness {
 }
 
 #[derive(Debug, Default, Deserialize)]
+struct PartialVerifyGate {
+    enabled: Option<bool>,
+    /// WHOLE-LIST REPLACEMENT, never a merge — see `apply_verify_gate`.
+    checks: Option<Vec<VerifyCheckConfig>>,
+    check_timeout_secs: Option<u64>,
+    require_pass_before_pr: Option<bool>,
+    evidence_dir: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
 struct PartialMention {
     max_rounds: Option<u32>,
     ack_deadline_ms: Option<u32>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PartialTicketProvider {
+    enabled: Option<bool>,
+    base_url: Option<String>,
+    /// Read as a plain `String` and wrapped into a `Secret` in `apply_ticket_provider`. Deriving
+    /// `Deserialize` on `Secret` directly would work too, but keeping the raw hop visible here is
+    /// what makes it greppable that a credential enters the process at exactly one place.
+    api_key: Option<String>,
+}
+
+/// `[ticket_intake]` as read from TOML.
+#[derive(Debug, Default, Deserialize)]
+struct PartialTicketIntake {
+    enabled: Option<bool>,
+    default_provider: Option<String>,
+    linear: Option<PartialTicketProvider>,
+    jira: Option<PartialTicketProvider>,
+    github: Option<PartialTicketProvider>,
+    beads: Option<PartialTicketProvider>,
+    branch_template: Option<String>,
+    commit_prefix_template: Option<String>,
+    image_dir: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -2621,6 +3206,41 @@ struct PartialDelivered {
     criteria: Option<Vec<PartialStageCriterion>>,
 }
 
+/// `[port_broker.range]` as read from TOML.
+#[derive(Debug, Default, Deserialize)]
+struct PartialPortRange {
+    start: Option<u16>,
+    end: Option<u16>,
+}
+
+/// `[port_broker]` as read from TOML.
+///
+/// `gate_locks` is a bare `toml::Value` for the reason recorded on [`PartialSteering::files`] and
+/// [`PartialBuilderIndex::skills_exclude`]: a typed `Vec<GateLockConfig>` turns one hand-edit of the
+/// wrong shape into a whole-layer parse failure, which discards every unrelated setting in the file.
+#[derive(Debug, Default, Deserialize)]
+struct PartialPortBroker {
+    enabled: Option<bool>,
+    range: Option<PartialPortRange>,
+    lease_ttl_secs: Option<u64>,
+    heartbeat_secs: Option<u64>,
+    gate_locks: Option<toml::Value>,
+}
+
+/// `[steering]` as read from TOML.
+///
+/// `files` is a bare `toml::Value` for the reason recorded on [`PartialBuilderIndex::skills_exclude`]:
+/// a typed `Vec<String>` turns one hand-edit of the wrong shape into a whole-layer parse failure,
+/// which discards every unrelated setting in the file.
+#[derive(Debug, Default, Deserialize)]
+struct PartialSteering {
+    enabled: Option<bool>,
+    files: Option<toml::Value>,
+    seed_on_worktree_create: Option<bool>,
+    inject_at_preflight: Option<bool>,
+    max_inject_bytes: Option<u32>,
+}
+
 /// `[builder_index]` as read from TOML.
 ///
 /// `skills_exclude` is a bare `toml::Value` for the reason recorded on [`PartialConcierge::tools`]
@@ -2667,12 +3287,15 @@ struct PartialConfig {
     tools: Option<PartialTools>,
     plugins: Option<PartialPlugins>,
     roborev: Option<PartialRoborev>,
+    adversarial_review: Option<PartialAdversarialReview>,
     improvement: Option<PartialImprovement>,
     babysit: Option<PartialBabysit>,
     onepassword: Option<PartialOnePassword>,
     publish: Option<PartialPublish>,
     freshness: Option<PartialFreshness>,
+    verify_gate: Option<PartialVerifyGate>,
     mention: Option<PartialMention>,
+    ticket_intake: Option<PartialTicketIntake>,
     review: Option<PartialReview>,
     worktree_pool: Option<PartialWorktreePool>,
     preview: Option<PartialPreview>,
@@ -2686,8 +3309,11 @@ struct PartialConfig {
     done: Option<PartialDone>,
     delivered: Option<PartialDelivered>,
     builder_index: Option<PartialBuilderIndex>,
+    port_broker: Option<PartialPortBroker>,
+    steering: Option<PartialSteering>,
     fleet: Option<PartialFleet>,
     drainer: Option<PartialDrainer>,
+    integration_assistant: Option<PartialIntegrationAssistant>,
     cleared: Option<PartialCleared>,
 }
 
@@ -2786,6 +3412,36 @@ fn apply_freshness(into: &mut FreshnessConfig, p: Option<PartialFreshness>) {
     }
 }
 
+/// Apply a `[verify_gate]` layer.
+///
+/// `checks` REPLACES the list wholesale rather than appending to it. A repo declaring its own check
+/// list is saying "this is how this project is verified" — silently running the global list as well
+/// would execute commands nobody in this repo asked for, in this repo's worktree. Whole-list
+/// replacement is also the only shape in which a project can REMOVE an inherited check, which
+/// merging cannot express at all.
+fn apply_verify_gate(into: &mut VerifyGateConfig, p: Option<PartialVerifyGate>) {
+    let Some(p) = p else { return };
+    if let Some(v) = p.enabled {
+        into.enabled = v;
+    }
+    if let Some(v) = p.checks {
+        into.checks = v;
+    }
+    if let Some(v) = p.check_timeout_secs {
+        into.check_timeout_secs = v;
+    }
+    if let Some(v) = p.require_pass_before_pr {
+        into.require_pass_before_pr = v;
+    }
+    if let Some(v) = p.evidence_dir {
+        // An empty string would resolve to the project root itself, which would scatter report
+        // JSON across the repo. Ignore it and keep the inherited value.
+        if !v.trim().is_empty() {
+            into.evidence_dir = v.trim().to_string();
+        }
+    }
+}
+
 fn apply_mention(into: &mut MentionConfig, p: Option<PartialMention>) {
     let Some(p) = p else { return };
     if let Some(v) = p.max_rounds {
@@ -2794,6 +3450,75 @@ fn apply_mention(into: &mut MentionConfig, p: Option<PartialMention>) {
     if let Some(v) = p.ack_deadline_ms {
         into.ack_deadline_ms = v;
     }
+}
+
+fn apply_ticket_provider(into: &mut TicketProviderConfig, p: Option<PartialTicketProvider>) {
+    let Some(p) = p else { return };
+    if let Some(v) = p.enabled {
+        into.enabled = v;
+    }
+    if let Some(v) = p.base_url {
+        into.base_url = v.trim().to_string();
+    }
+    if let Some(v) = p.api_key {
+        into.api_key = crate::ticket_intake::Secret::new(v);
+    }
+}
+
+/// Apply a `[ticket_intake]` layer.
+///
+/// An UNRECOGNIZED `default_provider` is warned about and DROPPED rather than kept. Keeping it
+/// would be worse than useless: `to_intake_settings` cannot make sense of it either, so the value
+/// would sit in the file looking like it had been honoured while every bare key still came back
+/// ambiguous, and nothing would ever say why.
+fn apply_ticket_intake(into: &mut TicketIntakeConfig, p: Option<PartialTicketIntake>) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let Some(p) = p else { return warnings };
+    if let Some(v) = p.enabled {
+        into.enabled = v;
+    }
+    if let Some(v) = p.default_provider {
+        let raw = v.trim().to_string();
+        match crate::ticket_intake::Provider::from_slug(&raw) {
+            Some(crate::ticket_intake::Provider::Linear) => {
+                into.default_provider = Some("linear".to_string())
+            }
+            Some(crate::ticket_intake::Provider::Jira) => {
+                into.default_provider = Some("jira".to_string())
+            }
+            _ if raw.is_empty() => into.default_provider = None,
+            _ => {
+                into.default_provider = None;
+                warnings.push(format!(
+                    "[ticket_intake].default_provider = \"{raw}\" is not a tracker a bare key can \
+                     be ambiguous between; use \"linear\" or \"jira\", or remove the key"
+                ));
+            }
+        }
+    }
+    apply_ticket_provider(&mut into.linear, p.linear);
+    apply_ticket_provider(&mut into.jira, p.jira);
+    apply_ticket_provider(&mut into.github, p.github);
+    apply_ticket_provider(&mut into.beads, p.beads);
+    if let Some(v) = p.branch_template {
+        if !v.trim().is_empty() {
+            into.branch_template = v.trim().to_string();
+        }
+    }
+    if let Some(v) = p.commit_prefix_template {
+        if !v.trim().is_empty() {
+            into.commit_prefix_template = v.trim().to_string();
+        }
+    }
+    if let Some(v) = p.image_dir {
+        // An empty string would resolve to the project root itself, scattering downloaded
+        // screenshots across the repo. Ignore it and keep the inherited value — the same rule
+        // `apply_verify_gate` applies to `evidence_dir`.
+        if !v.trim().is_empty() {
+            into.image_dir = v.trim().to_string();
+        }
+    }
+    warnings
 }
 
 fn apply_review(into: &mut ReviewConfig, p: Option<PartialReview>) {
@@ -3577,6 +4302,123 @@ fn apply_roborev(into: &mut RoborevConfig, p: Option<PartialRoborev>) {
     }
 }
 
+/// Apply `[adversarial_review]`, warning per key rather than failing the section.
+///
+/// THE OFF-SPELLING RULE OF `[advisor]`/`[pushers]` IS DELIBERATELY ABSENT, and the asymmetry is
+/// the point. There, `enabled` is the only brake on a feature that ships ON, so a dropped
+/// `enabled = "false"` leaves it RUNNING against its owner's stated intent — the unsafe direction.
+/// Here the feature ships OFF, so a value we cannot read as a boolean leaves it OFF: the safe
+/// direction, every time. Anything that is not a real boolean therefore warns and has no effect,
+/// which also keeps `enabled = "yes"` from quietly arming a pass that spends quota.
+fn apply_adversarial_review(
+    into: &mut AdversarialReviewConfig,
+    p: Option<PartialAdversarialReview>,
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let Some(p) = p else { return warnings };
+
+    if let Some(v) = p.enabled {
+        match v.as_bool() {
+            Some(b) => into.enabled = b,
+            None => warnings.push(format!(
+                "[adversarial_review].enabled is a {}, not true or false, so it has no effect —                  the review pass is still OFF. Use `enabled = true` to turn it on.",
+                v.type_str()
+            )),
+        }
+    }
+
+    // KEPT VERBATIM when it reads — see AdversarialReviewConfig::model. An unknown id costs one
+    // failed run whose verdict is `unknown` (blocking by default), never a silent substitution.
+    if let Some(v) = p.model {
+        match v.as_str() {
+            Some(m) => into.model = m.trim().to_string(),
+            None => warnings.push(format!(
+                "[adversarial_review].model is a {}, not a string, so it has no effect",
+                v.type_str()
+            )),
+        }
+    }
+
+    // CLAMPED, not merely type-checked. A `max_diff_bytes = 0` would send an EMPTY diff to a
+    // reviewer that would then dutifully audit nothing and could answer `ship` — an approval of a
+    // change nobody looked at, produced by a config typo. The floor makes that unreachable.
+    if let Some(v) = p.max_diff_bytes {
+        // CEILING AS WELL AS FLOOR. Above `max_diff_budget()` the one-shot refuses the whole
+        // request rather than reviewing a truncated diff, and the refusal is recorded as `unknown`
+        // — which blocks. Clamping DOWN (with a warning) is the only reading that leaves the
+        // feature working; honouring the number would let one config line block every large branch.
+        let ceiling = crate::adversarial_review::max_diff_budget() as i64;
+        match v.as_integer() {
+            Some(n) if n > ceiling => {
+                into.max_diff_bytes = ceiling as u32;
+                warnings.push(format!(
+                    "[adversarial_review].max_diff_bytes = {n} is above the {ceiling}-byte ceiling \
+                     the reviewer's prompt limit allows, so it was lowered to {ceiling}. A larger \
+                     value does not review more — the request would be refused outright and \
+                     recorded as an `unknown` verdict, which blocks."
+                ));
+            }
+            Some(n) if n >= 1_000 => into.max_diff_bytes = n as u32,
+            Some(n) => warnings.push(format!(
+                "[adversarial_review].max_diff_bytes = {n} is below the 1000-byte floor, so it has \
+                 no effect — a near-empty diff would be reviewed as if it were the whole change"
+            )),
+            None => warnings.push(format!(
+                "[adversarial_review].max_diff_bytes is a {}, not an integer, so it has no effect",
+                v.type_str()
+            )),
+        }
+    }
+
+    // A LIST OF STRINGS, and an EMPTY one is refused. `block_on = []` means "nothing blocks",
+    // including `unknown` — i.e. a reply nobody could read would clear the gate. That is the one
+    // configuration this feature must not be able to reach by accident; a user who genuinely wants
+    // no gate turns `enabled` off.
+    if let Some(v) = p.block_on {
+        match v.as_array() {
+            Some(items) if items.iter().all(|i| i.is_str()) && !items.is_empty() => {
+                into.block_on = items
+                    .iter()
+                    .filter_map(|i| i.as_str())
+                    .map(|s| s.trim().to_ascii_lowercase())
+                    .collect();
+            }
+            Some(items) if items.is_empty() => warnings.push(
+                "[adversarial_review].block_on is empty, so it has no effect — an empty set would \
+                 let an UNREADABLE verdict clear the gate. Turn `enabled` off instead."
+                    .to_string(),
+            ),
+            _ => warnings.push(format!(
+                "[adversarial_review].block_on is a {}, not a list of verdict strings, so it has \
+                 no effect",
+                v.type_str()
+            )),
+        }
+    }
+
+    if let Some(v) = p.timeout_secs {
+        match v.as_integer() {
+            Some(n) if n > 0 => into.timeout_secs = n.min(i64::from(u32::MAX)) as u32,
+            Some(n) => warnings.push(format!(
+                "[adversarial_review].timeout_secs = {n} is not a positive number of seconds, so \
+                 it has no effect"
+            )),
+            None => warnings.push(format!(
+                "[adversarial_review].timeout_secs is a {}, not an integer, so it has no effect",
+                v.type_str()
+            )),
+        }
+    }
+
+    for (field, _) in p.rest {
+        warnings.push(format!(
+            "[adversarial_review].{field} is not an adversarial-review setting (enabled, model, \
+             max_diff_bytes, block_on, timeout_secs), so it has no effect"
+        ));
+    }
+    warnings
+}
+
 fn apply_improvement(into: &mut ImprovementConfig, p: Option<PartialImprovement>) {
     let Some(p) = p else { return };
     if let Some(v) = p.consent {
@@ -3645,6 +4487,66 @@ fn apply_drainer(into: &mut DrainerConfig, p: Option<PartialDrainer>) -> Vec<Str
         warnings.push(format!(
             "[drainer].{field} is not a drainer setting (enabled, feedback_floor, max_workers, \
              max_concurrency, claim_max_age, inprogress_max_age, lock_ttl), so it has no effect"
+        ));
+    }
+    warnings
+}
+
+/// Overlay `[integration_assistant]`.
+///
+/// EVERY UNREADABLE VALUE KEEPS ITS DEFAULT AND WARNS, and the defaults are chosen so that failing
+/// that way is the safe direction: `enabled` stays FALSE (nothing merges), `require_roborev_clean`
+/// stays TRUE (an unread review still blocks). A warning that reads "so it has no effect" is only
+/// honest when the surviving value is the cautious one.
+///
+/// `merge_strategy` is validated by `integration_assistant::validate_merge_strategy` — the SAME
+/// function the merge path calls. One rule, one implementation: a second copy here would be free to
+/// drift, and the drift would be invisible because both halves would still be individually green.
+fn apply_integration_assistant(
+    into: &mut IntegrationAssistantConfig,
+    p: Option<PartialIntegrationAssistant>,
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let Some(p) = p else { return warnings };
+
+    let mut boolean = |field: &str, v: Option<toml::Value>, slot: &mut bool| {
+        let Some(v) = v else { return };
+        match v.as_bool() {
+            Some(b) => *slot = b,
+            None => warnings.push(format!(
+                "[integration_assistant].{field} is a {}, not true or false, so it has no effect \
+                 — the value stays {}.",
+                v.type_str(),
+                slot
+            )),
+        }
+    };
+    boolean("enabled", p.enabled, &mut into.enabled);
+    boolean("auto_rebase", p.auto_rebase, &mut into.auto_rebase);
+    boolean("require_roborev_clean", p.require_roborev_clean, &mut into.require_roborev_clean);
+    boolean("cleanup_after_merge", p.cleanup_after_merge, &mut into.cleanup_after_merge);
+
+    if let Some(v) = p.merge_strategy {
+        match v.as_str() {
+            Some(raw) => match crate::integration_assistant::validate_merge_strategy(raw) {
+                Ok(ok) => into.merge_strategy = ok,
+                // The validator's own sentence, verbatim: it says WHY a squash is refused, which a
+                // generic "not accepted" would drop — and that reason is the whole point.
+                Err(e) => warnings.push(format!("{e} The strategy stays \"merge\".")),
+            },
+            None => warnings.push(format!(
+                "[integration_assistant].merge_strategy is a {}, not a string, so it has no effect \
+                 — the strategy stays \"merge\".",
+                v.type_str()
+            )),
+        }
+    }
+
+    for (field, _) in p.rest {
+        warnings.push(format!(
+            "[integration_assistant].{field} is not an integration-assistant setting (enabled, \
+             auto_rebase, require_roborev_clean, merge_strategy, cleanup_after_merge), so it has \
+             no effect"
         ));
     }
     warnings
@@ -3892,6 +4794,169 @@ fn apply_builder_index(into: &mut BuilderIndexConfig, p: Option<PartialBuilderIn
     let Some(p) = p else { return warnings };
     if let Some(v) = p.skills_exclude {
         into.skills_exclude = resolve_skills_exclude(&v, &mut warnings);
+    }
+    warnings
+}
+
+/// Read `[steering].files` in either accepted spelling — a TOML array, or a comma-separated string
+/// — trimmed, with empties dropped and order preserved.
+///
+/// Total, like `resolve_skills_exclude`: anything unusable costs THAT ENTRY and a warning, never
+/// the layer. An EMPTY resolved list is honoured as written (a repo saying "inject nothing" must be
+/// able to say it) rather than silently reverting to the default pair.
+fn resolve_steering_files(v: &toml::Value, warnings: &mut Vec<String>) -> Option<Vec<String>> {
+    let raw: Vec<String> = match v {
+        toml::Value::String(s) => s.split(',').map(str::to_string).collect(),
+        toml::Value::Array(items) => {
+            let mut out = Vec::new();
+            for item in items {
+                match item.as_str() {
+                    Some(s) => out.push(s.to_string()),
+                    None => warnings.push(format!(
+                        "[steering].files has a {} entry, not a file name; ignoring that entry",
+                        item.type_str()
+                    )),
+                }
+            }
+            out
+        }
+        other => {
+            warnings.push(format!(
+                "[steering].files is a {}, not a list of file names like \
+                 [\"architecture.md\"]; keeping the default list",
+                other.type_str()
+            ));
+            // NONE, not an empty list: an unusable key must leave the existing list standing.
+            // Applying "" here would silently switch steering off for a user whose only mistake
+            // was a typo in one key — the loudest possible consequence for the quietest input.
+            return None;
+        }
+    };
+    let mut out: Vec<String> = Vec::new();
+    for name in raw.iter().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+        if !out.contains(&name) {
+            out.push(name);
+        }
+    }
+    // An EMPTY array is honoured as written — a repo saying "inject nothing" must be able to.
+    Some(out)
+}
+
+/// Read `[port_broker].gate_locks` in either accepted spelling.
+///
+/// The canonical form is an array of tables — `gate_locks = [{ name = "browser", ttl_secs = 600 }]`.
+/// The inline-table map — `gate_locks = { browser = 600 }` — is accepted too, because it is the
+/// shorter thing a person types and rejecting it would cost them the whole layer.
+///
+/// `None` means "this key said nothing usable, keep the lower layer's value". An EMPTY list is
+/// honoured as written: a repo saying "no named locks" must be able to.
+fn resolve_gate_locks(v: &toml::Value, warnings: &mut Vec<String>) -> Option<Vec<GateLockConfig>> {
+    let mut out: Vec<GateLockConfig> = Vec::new();
+    match v {
+        toml::Value::Array(items) => {
+            for item in items {
+                let Some(t) = item.as_table() else {
+                    warnings.push(format!(
+                        "[port_broker].gate_locks has a {} entry, not a table like \
+                         {{ name = \"browser\", ttl_secs = 600 }}; ignoring that entry",
+                        item.type_str()
+                    ));
+                    continue;
+                };
+                let name = t.get("name").and_then(|n| n.as_str()).unwrap_or("").trim().to_string();
+                if name.is_empty() {
+                    warnings
+                        .push("[port_broker].gate_locks has an entry with no `name`; ignoring it".into());
+                    continue;
+                }
+                let ttl = t
+                    .get("ttl_secs")
+                    .and_then(|n| n.as_integer())
+                    .filter(|n| *n > 0)
+                    .map(|n| n as u64)
+                    .unwrap_or(crate::port_broker::DEFAULT_GATE_TTL_SECS);
+                out.push(GateLockConfig { name, ttl_secs: ttl });
+            }
+        }
+        toml::Value::Table(map) => {
+            for (name, ttl) in map {
+                let name = name.trim().to_string();
+                if name.is_empty() {
+                    continue;
+                }
+                let Some(ttl) = ttl.as_integer().filter(|n| *n > 0) else {
+                    warnings.push(format!(
+                        "[port_broker].gate_locks.{name} is not a positive number of seconds; \
+                         ignoring that entry"
+                    ));
+                    continue;
+                };
+                out.push(GateLockConfig { name, ttl_secs: ttl as u64 });
+            }
+            out.sort_by(|a, b| a.name.cmp(&b.name));
+        }
+        other => {
+            warnings.push(format!(
+                "[port_broker].gate_locks is a {}, not a list of named locks like \
+                 [{{ name = \"browser\", ttl_secs = 600 }}]; keeping the previous value",
+                other.type_str()
+            ));
+            return None;
+        }
+    }
+    Some(out)
+}
+
+fn apply_port_broker(into: &mut PortBrokerConfig, p: Option<PartialPortBroker>) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let Some(p) = p else { return warnings };
+    if let Some(v) = p.enabled {
+        into.enabled = v;
+    }
+    if let Some(r) = p.range {
+        // Each end is applied INDEPENDENTLY, so `range = { start = 46000 }` widens from the default
+        // end rather than resetting it — the same one-key-costs-one-key rule the rest of this file
+        // follows.
+        if let Some(v) = r.start {
+            into.range.start = v;
+        }
+        if let Some(v) = r.end {
+            into.range.end = v;
+        }
+    }
+    if let Some(v) = p.lease_ttl_secs {
+        into.lease_ttl_secs = v;
+    }
+    if let Some(v) = p.heartbeat_secs {
+        into.heartbeat_secs = v;
+    }
+    if let Some(v) = p.gate_locks {
+        if let Some(resolved) = resolve_gate_locks(&v, &mut warnings) {
+            into.gate_locks = resolved;
+        }
+    }
+    warnings
+}
+
+fn apply_steering(into: &mut SteeringConfig, p: Option<PartialSteering>) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let Some(p) = p else { return warnings };
+    if let Some(v) = p.enabled {
+        into.enabled = v;
+    }
+    if let Some(v) = p.files {
+        if let Some(resolved) = resolve_steering_files(&v, &mut warnings) {
+            into.files = resolved;
+        }
+    }
+    if let Some(v) = p.seed_on_worktree_create {
+        into.seed_on_worktree_create = v;
+    }
+    if let Some(v) = p.inject_at_preflight {
+        into.inject_at_preflight = v;
+    }
+    if let Some(v) = p.max_inject_bytes {
+        into.max_inject_bytes = v;
     }
     warnings
 }
@@ -4683,6 +5748,18 @@ fn apply_project_layer(
                      gets to set; put it in the global config.toml"
                 ));
             }
+            if p.integration_assistant.is_some() {
+                // The strictest case of this rule. This section can authorize an automated
+                // `gh pr merge`, and a per-project file is CHECKED INTO THE REPO — so honouring it
+                // would let a repo the user merely opened turn on automatic merging of its own
+                // pull requests. Refused in both directions: a repo cannot turn it on, and cannot
+                // relax `require_roborev_clean` either.
+                warnings.push(format!(
+                    "[integration_assistant] in a per-project {file} is ignored — whether Sparkle \
+                     may merge pull requests here is a machine-wide decision, not one a repo gets \
+                     to make; set it in the global config.toml"
+                ));
+            }
             if p.fleet.is_some() {
                 // Same rule and reason as [workers]: the fleet's CI budget protects one SHARED
                 // runner pool, so a cloned repo must not be able to raise (or disable) the cap for
@@ -4725,6 +5802,17 @@ fn apply_project_layer(
             // would point the user's publishing at a host of its choosing merely by being
             // cloned with a block in its checked-in config. The token itself never leaves the
             // keychain, but the URL it is sent TO is exactly the thing worth stealing.
+            // The SAME security boundary [publish] draws, one step sharper: this block names both
+            // the host a request goes to AND (through an op:// reference) a 1Password item to
+            // resolve. A repo that could set it would, merely by being cloned, aim the contents of
+            // the user's vault at a host of its choosing.
+            if p.ticket_intake.is_some() {
+                warnings.push(format!(
+                    "[ticket_intake] in a per-project {file} is ignored — it names the host a \
+                     ticket request is sent to and the credential sent with it, which is not \
+                     something a repo gets to set; configure it in the global config.toml"
+                ));
+            }
             if p.publish.is_some() {
                 warnings.push(format!(
                     "[publish] in a per-project {file} is ignored — where \
@@ -4786,7 +5874,8 @@ fn apply_project_layer(
                      from .sparkle/local.toml; to drop a key from this file, delete the line"
                 ));
             }
-            // Per-project layer: [workflow], [freshness], [review], [approvals], [plugins], and the
+            // Per-project layer: [workflow], [freshness], [verify_gate], [review], [approvals],
+            // [plugins], and the
             // [done]/[delivered] stage definitions are repo-scoped and may override. [approvals]
             // is honored here so "this project" auto-approve rules actually take effect (per
             // category, project beats global). [plugins] is repo-scoped because which agent
@@ -4797,13 +5886,26 @@ fn apply_project_layer(
             apply_workflow(&mut cfg.workflow, p.workflow);
             rejected_plugins.extend(apply_plugins(&mut cfg.plugins, p.plugins));
             apply_freshness(&mut cfg.freshness, p.freshness);
+            apply_verify_gate(&mut cfg.verify_gate, p.verify_gate);
             apply_mention(&mut cfg.mention, p.mention);
             apply_review(&mut cfg.review, p.review);
+            // Per-project like [freshness]/[review]: whether a repo's diffs get an independent
+            // audit is a property of the repo, so it travels with the checkout for the team.
+            warnings.extend(apply_adversarial_review(
+                &mut cfg.adversarial_review,
+                p.adversarial_review,
+            ));
             apply_worktree_pool(&mut cfg.worktree_pool, p.worktree_pool);
             apply_preview(&mut cfg.preview, p.preview, layer, warnings);
             apply_approvals(&mut cfg.approvals, p.approvals);
             apply_done(&mut cfg.done, p.done);
             apply_delivered(&mut cfg.delivered, p.delivered);
+            // Repo-scoped: a project describing its own architecture and standards is the whole
+            // point of the feature, so this may override the global layer.
+            warnings.extend(apply_steering(&mut cfg.steering, p.steering));
+            // Repo-scoped for the same reason as [verify_gate]: which ports a project's dev servers
+            // may use, and which of its resources are singletons, are properties of the REPO.
+            warnings.extend(apply_port_broker(&mut cfg.port_broker, p.port_broker));
         }
         Err(e) => {
             warnings.push(format!(
@@ -4898,8 +6000,16 @@ fn build_effective_layered(
                 // no second layer whose warnings could interleave (same reasoning as [concierge]).
                 warnings.extend(apply_publish(&mut cfg.publish, p.publish));
                 apply_freshness(&mut cfg.freshness, p.freshness);
+                apply_verify_gate(&mut cfg.verify_gate, p.verify_gate);
                 apply_mention(&mut cfg.mention, p.mention);
+                // Global-only like [publish], and for the same reason: a repo may not name the
+                // host a credential is sent to. The project layer only ever reports it was ignored.
+                warnings.extend(apply_ticket_intake(&mut cfg.ticket_intake, p.ticket_intake));
                 apply_review(&mut cfg.review, p.review);
+                warnings.extend(apply_adversarial_review(
+                    &mut cfg.adversarial_review,
+                    p.adversarial_review,
+                ));
                 apply_worktree_pool(&mut cfg.worktree_pool, p.worktree_pool);
                 apply_preview(&mut cfg.preview, p.preview, Layer::Global, &mut warnings);
                 apply_capture(&mut cfg.capture, p.capture);
@@ -4924,8 +6034,15 @@ fn build_effective_layered(
                 // autonomous drain loop may spend is a property of the human at the machine, not a
                 // repo, so it is overlaid only here and a [drainer] in a project file is ignored.
                 warnings.extend(apply_drainer(&mut cfg.drainer, p.drainer));
+                // Global-only, and the strictest case of the rule: this section can authorize an
+                // automated `gh pr merge`, so a repo file must never be able to set it. An
+                // `[integration_assistant]` in a project layer is ignored (see below).
+                warnings
+                    .extend(apply_integration_assistant(&mut cfg.integration_assistant, p.integration_assistant));
                 apply_done(&mut cfg.done, p.done);
                 apply_delivered(&mut cfg.delivered, p.delivered);
+                warnings.extend(apply_steering(&mut cfg.steering, p.steering));
+                warnings.extend(apply_port_broker(&mut cfg.port_broker, p.port_broker));
             }
             Err(e) => {
                 warnings.push(format!("global config.toml has a syntax error and was ignored: {e}"));
@@ -5326,8 +6443,8 @@ pub const DEFAULT_TEMPLATE: &str = r#"# ========================================
 #   • Global  — this file, in Sparkle's app-data dir. Applies to every project. Holds your
 #               machine-wide preferences ([workers], [memory], [ai]) plus default rules.
 #   • Project — a `.sparkle/config.toml` CHECKED INTO a repo. Overrides ONLY the repo-scoped
-#               rules ([workflow], [freshness], [review], [approvals], [plugins],
-#               [worktree_pool], [preview], [done], [delivered]) for that one project, and
+#               rules ([workflow], [freshness], [verify_gate], [review], [approvals],
+#               [plugins], [worktree_pool], [preview], [done], [delivered]) for that one project, and
 #               travels with the repo so a team shares them. [workers]/[memory]/[ai]/[tools]
 #               there are ignored (they're per-machine).
 #   • Local   — a `.sparkle/local.toml` NEXT TO IT, gitignored. Same rules, same refusals; it
@@ -5758,6 +6875,21 @@ enabled = true              # master switch — false makes the in-app drain loo
 # max_workers cap, and the number of healthy pool accounts available to rotate across.
 # max_concurrency = 3
 
+# --- Integration assistant (per-machine; ignored in a project file) ---------------------
+# The one-click tail of the agent pipeline: a scoped PR body, a safe merge ORDER across several
+# ready branches, a gate over scripts/pr-checks.sh + roborev, and a merge that refuses rather than
+# guesses. It runs no checks of its own — bead .1 owns the local CI-parity runner.
+#
+# Ships OFF, unlike its neighbours here, because it MERGES PULL REQUESTS: that has to be asked for,
+# not discovered. merge_strategy accepts only "merge" — a squash rewrites the commits, so the branch
+# tip stops being an ancestor of main and "did my work land?" stops being answerable by ancestry.
+[integration_assistant]
+enabled               = false   # master switch — nothing plans, gates or merges while this is false
+auto_rebase           = true    # catch a branch up onto fresh origin/<default> before gating it
+require_roborev_clean = true    # undrained roborev findings block the merge
+merge_strategy        = "merge" # only "merge" is accepted; "squash" is refused with a reason
+cleanup_after_merge   = true    # delete the remote branch once ANCESTRY proves the merge landed
+
 # --- Opinionated tools (per-machine; ignored in a project file) -------------------------
 # The non-AI tools Sparkle leans on, surfaced in ⋯ Settings → "Tools". Each defaults on for a
 # new install; setting one false means that tool is used NOWHERE in Sparkle. (Deepgram voice is an
@@ -5821,6 +6953,50 @@ onepassword = false # back your .env* files up to a 1Password vault. Also ships 
 # leave tkmx-client's REPORT_MACHINE_CONFIG off or retire it — it is the only writer of those names.
 [builder_index]
 # skills_exclude = ["warp"]   # e.g. a plugin that's installed but that you don't want on show
+
+# --- Steering documents pushed into every agent (per-project overridable) ---------------
+# Two documents describing THIS repo — architecture.md (where the code lives) and standards.md
+# (how work is done, with the exact test/lint/format commands). Sparkle copies the resolved files
+# into every new agent worktree and injects them into a spawning agent's opening context as HARD
+# CONSTRAINTS, so an agent is born knowing the house rules instead of discovering them in review.
+#
+# Resolution, highest wins, every layer optional:
+#     <repo>/.sparkle/steering.local/   this machine only
+#     <repo>/.sparkle/steering/         the repo (the canonical place; create the files here)
+#     <app data>/steering/              a fallback for every project on this machine
+#
+# OFF BY DEFAULT. This prepends text to every agent's first prompt, so it waits to be asked for.
+[steering]
+# enabled = false                # turn it on for this project
+# files = ["architecture.md", "standards.md"]
+# seed_on_worktree_create = true # copy the resolved files into each new agent worktree
+# inject_at_preflight = true     # prepend the rendered block to a spawning agent's brief
+# max_inject_bytes = 8192        # over-budget content is truncated WITH AN EXPLICIT MARKER
+
+# --- Runtime port arbitration for parallel agents (per-project overridable) -------------
+# Filesystem isolation is solved (one worktree per agent). RUNTIME isolation is not: two agents
+# verifying at once both reach for the same dev-server port and the second dies with a bare
+# "port is already in use" that names nobody. This section is the answer, and it is TWO mechanisms
+# because there are two problems:
+#
+#   * A port that CAN move (an ordinary preview) gets a LEASE — each agent is handed a different
+#     number out of `range`, recorded machine-wide so no two agents pick the same one.
+#   * A port that CANNOT move (Sparkle's own dev server is port 1420 with strictPort, so vite
+#     exits rather than walking to 1421) gets a GATE LOCK — one holder at a time, and everybody
+#     else is told WHICH agent has it. Same for a browser gate or any other shared singleton.
+#
+# The registry lives in the shared gitdir, so every worktree on this machine sees one view of it.
+# A lease is reclaimed only when BOTH its TTL has run out AND its port is observably unbound — a
+# live-but-quiet dev server is never stolen from.
+#
+# OFF BY DEFAULT: switching it on changes which port a preview binds. While it is off, nothing is
+# written anywhere.
+[port_broker]
+# enabled = false                 # turn it on for this project
+# range = { start = 45000, end = 45099 }   # reserved ports inside it are skipped, never leased
+# lease_ttl_secs = 900            # a lease this stale becomes ELIGIBLE for reclamation
+# heartbeat_secs = 60             # how often a holder is expected to renew
+# gate_locks = [{ name = "-1420", ttl_secs = 1800 }]   # a name not listed still locks
 
 # --- 1Password env backup (per-machine; ignored in a project file) ----------------------
 # Where Sparkle backs your .env* files up to, and whether it restores them into fresh agent
@@ -6017,6 +7193,37 @@ require_fresh_branch      = true
 # (dirty, detached, a feature branch, or diverged) still waits for you. Set false to always ask.
 auto_fast_forward         = true
 
+# --- Verify before PR: run CI's checks LOCALLY, and keep the proof (repo-scoped) --------
+# Runs your project's own checks inside the agent's worktree BEFORE the PR exists, records each
+# one's exit code / duration / output tail, and renders a PR Testing section from that report
+# plus any captured artifacts (screenshots, recordings, log tails). Turns "the agent says it works"
+# into a transcript a reviewer can read.
+#
+# IT FAILS CLOSED: the verdict is `pass` only when EVERY check actually ran and exited 0. A check
+# that could not start, one that timed out, and a project with no checks all resolve to something
+# that is not a pass — "we could not look" is never green.
+# [verify_gate]
+# OPT-IN. Off means Sparkle never runs these commands on its own. On makes the panel appear and,
+# with require_pass_before_pr, makes the gate bind before a PR is opened.
+# enabled                 = false
+# Per-check wall-clock bound. A check that outlives it is KILLED and recorded as `timeout`, which
+# is unjudged — so it can never be a pass.
+# check_timeout_secs      = 900
+# Refuse to open a PR until the last report's verdict is `pass`. Only binds while `enabled`.
+# require_pass_before_pr  = true
+# Where reports, logs and evidence live, relative to the project root. Reports land at
+# <dir>/<agentId>.json; captured artifacts at <dir>/<agentId>/evidence/.
+# evidence_dir            = ".sparkle/verify-gate"
+# The ordered check list. LEAVE IT OUT to discover the project's own package.json scripts
+# (typecheck → lint → test → build, run with the runner your lockfile names). A list written here
+# REPLACES that wholesale — which is also the only way to remove an inherited check.
+# [[verify_gate.checks]]
+# name = "typecheck"
+# cmd  = "pnpm typecheck"
+# [[verify_gate.checks]]
+# name = "test"
+# cmd  = "pnpm test"
+
 # --- PR-scoped code review (repo-scoped; overridable in a project file) -----------------
 # Which PR-scoped reviewer watches this repo. Sparkle's merge gate refuses to land a PR that still
 # carries an UNANSWERED [blocking] probe, and separately refuses one whose current head no NEW
@@ -6130,6 +7337,47 @@ agent_eagerness = "visual"
 # [[delivered.criteria]]
 # text = "Deployed to prod verified"
 # kind = "manual"
+
+# ======================================================================================
+# [ticket_intake] — EXTERNAL TICKET SYSTEMS (Linear / Jira / GitHub / beads)
+# ======================================================================================
+# "Paste tickets, fan out." Reads a ticket's title, description, comments and SCREENSHOTS
+# and derives a branch name, a commit prefix and a PR title from its key.
+#
+# Beads is still Sparkle's own task graph. This is intake from the tracker your TEAM
+# lives in; what you do with an intaked ticket (open a bead, spawn a worker, both) is a
+# separate decision. See PRD/ticket-system-intake.md.
+#
+# OPT-IN: `enabled` is false, and the parser half works regardless — with nothing
+# configured you can still paste ENG-1234 and get eng-1234 / "ENG-1234:" back.
+#
+# GLOBAL ONLY. A per-project [ticket_intake] is IGNORED with a warning: this block names
+# the host a request goes to and the credential sent with it, and a cloned repo does not
+# get to point your 1Password vault at a host of its choosing.
+#
+# [ticket_intake]
+# enabled = false
+# # Which tracker a BARE key like ENG-1234 means. Leave it unset and such a key comes
+# # back AMBIGUOUS (the honest answer: it is valid in both) rather than guessed.
+# default_provider = "linear"        # "linear" | "jira"
+# branch_template        = "{key_lower}-{slug}"   # {key} {key_lower} {slug} {provider}
+# commit_prefix_template = "{key}:"
+# image_dir = ".sparkle/ticket-attachments"
+#
+# [ticket_intake.linear]
+# enabled = true
+# api_key = "op://Private/Linear/credential"   # a token, or an op:// reference
+#
+# [ticket_intake.jira]
+# enabled  = true
+# base_url = "https://acme.atlassian.net"
+# api_key  = "you@acme.com:your-api-token"     # colon => Basic; otherwise Bearer
+#
+# [ticket_intake.github]   # uses the `gh` CLI already signed in here; no key needed
+# enabled = true
+#
+# [ticket_intake.beads]    # `bd show <full-id>`; full ids only, never a prefix
+# enabled = true
 "#;
 
 /// Convert a JSON scalar from the frontend into a `toml_edit` value. Only bool / integer /
@@ -7954,6 +9202,107 @@ quit_app = 42
         assert!(warns.iter().any(|w| w.contains("[tools]")));
     }
 
+    // ── [steering] — the architecture map + standards pushed into every agent ────────────
+
+    #[test]
+    fn steering_ships_off_with_the_two_documents_named() {
+        let (cfg, warns, hard) = effective(None, None);
+        assert!(!hard);
+        assert!(warns.is_empty());
+        assert!(!cfg.steering.enabled, "steering injects text into every agent — it is OPT-IN");
+        assert_eq!(cfg.steering.files, vec!["architecture.md", "standards.md"]);
+        assert!(cfg.steering.seed_on_worktree_create);
+        assert!(cfg.steering.inject_at_preflight);
+        assert_eq!(cfg.steering.max_inject_bytes, 8192);
+    }
+
+    #[test]
+    fn a_project_may_set_its_own_steering_because_the_rules_are_the_repos() {
+        // The OPPOSITE rule to [builder_index] directly above, and deliberately so: what this
+        // machine publishes about its owner is machine-wide, but a repo describing its own
+        // architecture is precisely a repo-scoped statement.
+        let p = "[steering]\nenabled = true\nfiles = [\"house-rules.md\"]\nmax_inject_bytes = 4096\n";
+        let (cfg, warns, hard) = effective(None, Some(p));
+        assert!(!hard);
+        // THE SIDE EFFECT: the project's values took, rather than merely being warned about.
+        assert!(cfg.steering.enabled);
+        assert_eq!(cfg.steering.files, vec!["house-rules.md"]);
+        assert_eq!(cfg.steering.max_inject_bytes, 4096);
+        assert!(
+            !warns.iter().any(|w| w.contains("[steering]")),
+            "a repo-scoped section must not be refused: {warns:?}"
+        );
+    }
+
+    #[test]
+    fn steering_switches_are_independent_of_each_other() {
+        // Each of the three booleans has to be separately reachable, or "seed but do not inject"
+        // (and its mirror) is unsayable and one of them is dead config.
+        let g = "[steering]\nenabled = true\nseed_on_worktree_create = false\n";
+        let (cfg, _, _) = effective(Some(g), None);
+        assert!(cfg.steering.enabled);
+        assert!(!cfg.steering.seed_on_worktree_create);
+        assert!(cfg.steering.inject_at_preflight, "the other switch must be untouched");
+
+        let g = "[steering]\nenabled = true\ninject_at_preflight = false\n";
+        let (cfg, _, _) = effective(Some(g), None);
+        assert!(cfg.steering.seed_on_worktree_create, "the other switch must be untouched");
+        assert!(!cfg.steering.inject_at_preflight);
+    }
+
+    #[test]
+    fn steering_files_accepts_the_comma_separated_spelling_and_dedupes() {
+        let g = "[steering]\nfiles = \"architecture.md, standards.md , architecture.md\"\n";
+        let (cfg, warns, hard) = effective(Some(g), None);
+        assert!(!hard);
+        assert!(warns.is_empty(), "{warns:?}");
+        assert_eq!(cfg.steering.files, vec!["architecture.md", "standards.md"]);
+    }
+
+    #[test]
+    fn an_empty_files_list_is_honoured_but_an_unusable_one_leaves_the_default_standing() {
+        // Two inputs that both "resolve to nothing", with deliberately OPPOSITE outcomes. `[]` is a
+        // repo saying "inject nothing" and must be obeyed; `files = 7` is a typo, and emptying the
+        // list there would silently switch steering off — the loudest consequence for the quietest
+        // mistake — while reporting success.
+        let (cfg, warns, hard) = effective(Some("[steering]\nfiles = []\n"), None);
+        assert!(!hard);
+        assert!(warns.is_empty(), "{warns:?}");
+        assert!(cfg.steering.files.is_empty(), "an explicit empty list must be obeyed");
+
+        let (cfg, warns, hard) = effective(Some("[steering]\nfiles = 7\n"), None);
+        assert!(!hard, "one bad key must never cost the whole layer");
+        assert_eq!(
+            cfg.steering.files,
+            vec!["architecture.md", "standards.md"],
+            "an unusable value must leave the existing list standing"
+        );
+        assert!(warns.iter().any(|w| w.contains("[steering].files")), "{warns:?}");
+    }
+
+    #[test]
+    fn one_bad_entry_in_files_costs_that_entry_and_not_the_layer() {
+        let g = "[workflow]\nrequire_pr = false\n\n[steering]\nfiles = [\"standards.md\", 7]\n";
+        let (cfg, warns, hard) = effective(Some(g), None);
+        assert!(!hard);
+        assert_eq!(cfg.steering.files, vec!["standards.md"]);
+        // …and the unrelated setting in the same file survived, which is the point of not failing
+        // the layer parse.
+        assert!(!cfg.workflow.require_pr);
+        assert!(warns.iter().any(|w| w.contains("[steering].files")), "{warns:?}");
+    }
+
+    #[test]
+    fn the_steering_block_in_the_template_ships_inert() {
+        // Every key is commented out, so applying the shipped template must change nothing about
+        // steering — the table header alone is there for discoverability.
+        assert!(DEFAULT_TEMPLATE.contains("\n[steering]\n"));
+        let (cfg, _, hard) = build_effective(SparkleConfig::default(), Some(DEFAULT_TEMPLATE), None);
+        assert!(!hard);
+        assert_eq!(cfg.steering, SparkleConfig::default().steering);
+        assert!(!cfg.steering.enabled, "the shipped template must not switch steering on");
+    }
+
     // ── [builder_index] — what the reporter publishes ────────────────────────────────────
 
     #[test]
@@ -8151,6 +9500,89 @@ quit_app = 42
         // exactly the serde-Option-crosses-as-null trap AGENTS.md warns about, avoided by a plain bool.
         let json = serde_json::to_string(&DrainerConfig { enabled: true }).unwrap();
         assert_eq!(json, "{\"enabled\":true}", "wire shape must be a concrete bool: {json}");
+    }
+
+    #[test]
+    fn integration_assistant_ships_off_and_its_template_matches_the_default() {
+        // Same trap avoided the same way as `drainer_template_matches_the_default`: overlaying the
+        // template onto SparkleConfig::default() would pass with the block MISSING, because the base
+        // already holds the values. WIPE the section to something no default could be first.
+        let mut base = SparkleConfig::default();
+        base.integration_assistant = IntegrationAssistantConfig {
+            enabled: true,
+            auto_rebase: false,
+            require_roborev_clean: false,
+            merge_strategy: "wiped".to_string(),
+            cleanup_after_merge: false,
+        };
+        let (cfg, warns, hard) = build_effective(base, Some(DEFAULT_TEMPLATE), None);
+        assert!(!hard, "the shipped template must parse: {warns:?}");
+        assert_eq!(
+            cfg.integration_assistant,
+            SparkleConfig::default().integration_assistant,
+            "DEFAULT_TEMPLATE's [integration_assistant] disagrees with SparkleConfig::default()"
+        );
+        // The DEFAULT itself, stated: this section can merge pull requests, so it must ship OFF —
+        // and the rest of it must ship in the CAUTIOUS direction, not the convenient one.
+        let d = SparkleConfig::default().integration_assistant;
+        assert!(!d.enabled, "the integration assistant must ship OFF");
+        assert!(d.require_roborev_clean, "an unread review must block by default");
+        assert_eq!(d.merge_strategy, "merge");
+        assert!(DEFAULT_TEMPLATE.contains("\n[integration_assistant]\n"), "the block must ship uncommented");
+    }
+
+    #[test]
+    fn integration_assistant_refuses_squash_and_keeps_the_merge_commit() {
+        // The SIDE EFFECT: the config value does not change, and the warning carries the validator's
+        // own reason. A warning alone would be satisfied by an implementation that warned AND
+        // applied the value, which is the failure that matters here.
+        let toml = "[integration_assistant]\nenabled = true\nmerge_strategy = \"squash\"\n";
+        let (cfg, warns, hard) = build_effective(SparkleConfig::default(), Some(toml), None);
+        assert!(!hard, "a bad value must not discard the whole layer");
+        assert_eq!(cfg.integration_assistant.merge_strategy, "merge", "squash must not take effect");
+        assert!(
+            warns.iter().any(|w| w.contains("ancestor")),
+            "the warning must say WHY a squash is refused: {warns:?}"
+        );
+        // The PAIR: the same file's OTHER key did take effect, so this test cannot be passing merely
+        // because the whole section was ignored.
+        assert!(cfg.integration_assistant.enabled, "`enabled = true` in the same block must apply");
+    }
+
+    #[test]
+    fn integration_assistant_survives_a_wrong_typed_value_and_fails_in_the_safe_direction() {
+        // A hand-edit must never fail the WHOLE global layer (which would revert every unrelated
+        // setting in the file), and what survives must be the cautious value.
+        let toml = "[integration_assistant]\nenabled = \"yes\"\nrequire_roborev_clean = 3\nwibble = 1\n";
+        let (cfg, warns, hard) = build_effective(SparkleConfig::default(), Some(toml), None);
+        assert!(!hard);
+        assert!(!cfg.integration_assistant.enabled, "an unreadable switch must stay OFF");
+        assert!(cfg.integration_assistant.require_roborev_clean, "an unreadable gate must stay ON");
+        assert!(warns.iter().any(|w| w.contains("[integration_assistant].enabled")));
+        assert!(warns.iter().any(|w| w.contains("wibble")), "an unknown key must be reported: {warns:?}");
+    }
+
+    #[test]
+    fn a_repo_cannot_turn_on_automatic_merging_of_its_own_pull_requests() {
+        // The strictest case of the machine-wide rule: a per-project file is CHECKED IN, so a repo
+        // the user merely opened must not be able to authorize `gh pr merge`.
+        let project = "[integration_assistant]\nenabled = true\nrequire_roborev_clean = false\n";
+        let (cfg, warns, _hard) =
+            build_effective(SparkleConfig::default(), None, Some(project));
+        assert!(!cfg.integration_assistant.enabled, "a repo must not be able to turn it on");
+        assert!(
+            cfg.integration_assistant.require_roborev_clean,
+            "nor to relax the review gate"
+        );
+        assert!(
+            warns.iter().any(|w| w.contains("[integration_assistant]") && w.contains("ignored")),
+            "the refusal must be reported, not silent: {warns:?}"
+        );
+        // The PAIR: the GLOBAL layer CAN set it, so this test is about the layer and not about the
+        // section being inert everywhere.
+        let (global_cfg, _w, _h) =
+            build_effective(SparkleConfig::default(), Some(project), None);
+        assert!(global_cfg.integration_assistant.enabled, "the global layer must still apply");
     }
 
     #[test]
@@ -9479,6 +10911,51 @@ quit_app = 42
         // Untouched freshness field keeps its default; no "ignored" warning (unlike [workers]/[ai]).
         assert_eq!(cfg.freshness.stale_build_block_commits, 25);
         assert!(warns.is_empty());
+    }
+
+    /// `[verify_gate]` LAYERING — and the two things about it that are easy to get silently wrong.
+    ///
+    /// The plumbing is the whole risk here. A section that parses into a `Partial` nobody applies
+    /// is INERT and green: the defaults still come back, every assertion about them still passes,
+    /// and the only symptom is that a repo's checks never run. So this asserts the OVERRIDE took —
+    /// including the `[[verify_gate.checks]]` array-of-tables, which is the shape a user actually
+    /// writes and the one a hand-rolled `Option<Vec<_>>` most easily fails to deserialize.
+    #[test]
+    fn verify_gate_defaults_and_project_overrides() {
+        let (cfg, _, _) = effective(None, None);
+        // OPT-IN, and the empty list is not "nothing to check" — see the struct doc.
+        assert!(!cfg.verify_gate.enabled);
+        assert!(cfg.verify_gate.checks.is_empty());
+        assert!(cfg.verify_gate.require_pass_before_pr);
+        assert_eq!(cfg.verify_gate.evidence_dir, ".sparkle/verify-gate");
+
+        // Per-project overridable (like [freshness]); no "ignored" warning.
+        let p = "[verify_gate]\nenabled = true\ncheck_timeout_secs = 60\n\
+                 [[verify_gate.checks]]\nname = \"typecheck\"\ncmd = \"pnpm typecheck\"\n";
+        let (cfg, warns, _) = effective(None, Some(p));
+        assert!(cfg.verify_gate.enabled);
+        assert_eq!(cfg.verify_gate.check_timeout_secs, 60);
+        assert_eq!(cfg.verify_gate.checks.len(), 1);
+        assert_eq!(cfg.verify_gate.checks[0].name, "typecheck");
+        assert_eq!(cfg.verify_gate.checks[0].cmd, "pnpm typecheck");
+        // Untouched field keeps its default.
+        assert!(cfg.verify_gate.require_pass_before_pr);
+        assert!(warns.is_empty(), "{warns:?}");
+
+        // A project list REPLACES the global one rather than appending to it — otherwise a repo
+        // could never remove an inherited check, and would run commands nobody in it asked for.
+        let g = "[verify_gate]\n[[verify_gate.checks]]\nname = \"global\"\ncmd = \"echo g\"\n";
+        let p2 = "[verify_gate]\n[[verify_gate.checks]]\nname = \"local\"\ncmd = \"echo l\"\n";
+        let (cfg, _, _) = effective(Some(g), Some(p2));
+        assert_eq!(
+            cfg.verify_gate.checks.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+            vec!["local"]
+        );
+
+        // An empty evidence_dir would resolve to the project root itself; it is ignored.
+        let p3 = "[verify_gate]\nevidence_dir = \"   \"\n";
+        let (cfg, _, _) = effective(None, Some(p3));
+        assert_eq!(cfg.verify_gate.evidence_dir, ".sparkle/verify-gate");
     }
 
     /// `[review]` LAYERING, and the normalisation rule the shell twin mirrors.
@@ -12703,6 +14180,10 @@ merge_pr = "deny"
             ("[voice]", "[voice]\ninput_device_uid = \"x\"\n"),
             ("[concierge]", "[concierge.tools]\nquit_app = \"allow\"\n"),
             ("[pushers]", "[pushers]\nenabled = true\n"),
+            (
+                "[ticket_intake]",
+                "[ticket_intake.linear]\nbase_url = \"https://evil.example\"\napi_key = \"op://v/i/f\"\n",
+            ),
         ];
         for (section, toml) in cases {
             let (_, warns, hard) =
@@ -12713,6 +14194,46 @@ merge_pr = "deny"
                 "{section} in local.toml was not refused with a local-named warning: {warns:?}"
             );
         }
+    }
+
+    /// The `[ticket_intake]` boundary, asserted on the RESOLVED VALUE rather than on the warning.
+    ///
+    /// The warning sweep above proves a sentence is printed; this proves the setting did not take
+    /// effect — which is the fact that matters, because the block names the host a request is sent
+    /// to AND (through an `op://` reference) a 1Password item to resolve into it. A repo that could
+    /// set it would, merely by being cloned, aim the contents of the user's vault at a host of its
+    /// choosing. The PAIRED global case is what keeps this from being vacuous: without it, a
+    /// `[ticket_intake]` that never applied anywhere would pass.
+    #[test]
+    fn a_repo_cannot_name_the_host_a_ticket_credential_is_sent_to() {
+        let toml = "[ticket_intake]\nenabled = true\n[ticket_intake.jira]\nbase_url = \"https://evil.example\"\napi_key = \"op://Private/Linear/credential\"\n";
+
+        // From the TRACKED project layer: ignored.
+        let (cfg, warns, hard) =
+            build_effective_layered(SparkleConfig::default(), None, Some(toml), None);
+        assert!(!hard);
+        assert!(!cfg.ticket_intake.enabled, "a repo must not switch intake on");
+        assert_eq!(cfg.ticket_intake.jira.base_url, "", "a repo must not name the egress host");
+        assert!(cfg.ticket_intake.jira.api_key.is_empty(), "a repo must not name a vault item");
+        assert!(
+            warns.iter().any(|w| w.starts_with("[ticket_intake]")),
+            "the refusal must say so: {warns:?}"
+        );
+
+        // From the LOCAL layer: also ignored (same body, but the sweep above only checks the
+        // warning — this checks the value).
+        let (cfg, _, _) = build_effective_layered(SparkleConfig::default(), None, None, Some(toml));
+        assert_eq!(cfg.ticket_intake.jira.base_url, "");
+
+        // From the GLOBAL layer: it DOES apply. Without this half the test above passes for a
+        // section that was simply never wired up anywhere.
+        let (cfg, _, _) = build_effective_layered(SparkleConfig::default(), Some(toml), None, None);
+        assert!(cfg.ticket_intake.enabled);
+        assert_eq!(cfg.ticket_intake.jira.base_url, "https://evil.example");
+        assert!(!cfg.ticket_intake.jira.api_key.is_empty());
+        // …and even there the credential never reaches a Serialize or a Debug.
+        let json = serde_json::to_string(&cfg.ticket_intake).unwrap();
+        assert!(!json.contains("op://"), "{json}");
     }
 
     #[test]
@@ -13228,5 +14749,268 @@ merge_pr = "deny"
                 "vendored post-commit lost the '{needle}' guard/behavior — did the copy drift from the seed?"
             );
         }
+    }
+
+    // ── [port_broker] — runtime arbitration for parallel agents (bead .5) ───────
+
+    #[test]
+    fn the_port_broker_ships_off_with_the_documented_range() {
+        let (cfg, warns, hard) = effective(None, None);
+        assert!(!hard);
+        assert!(warns.is_empty(), "{warns:?}");
+        assert!(!cfg.port_broker.enabled, "this changes which port a preview binds — it is OPT-IN");
+        assert_eq!(cfg.port_broker.range.start, 45000);
+        assert_eq!(cfg.port_broker.range.end, 45099);
+        assert_eq!(cfg.port_broker.lease_ttl_secs, 900);
+        assert_eq!(cfg.port_broker.heartbeat_secs, 60);
+        // The one shipped lock is Sparkle's own dev port, which `strictPort: true` makes unmovable.
+        assert_eq!(cfg.port_broker.gate_locks.len(), 1);
+        assert_eq!(cfg.port_broker.gate_locks[0].name, "-1420");
+        assert_eq!(cfg.port_broker.gate_locks[0].ttl_secs, 1800);
+    }
+
+    #[test]
+    fn the_port_broker_block_in_the_template_ships_inert() {
+        assert!(DEFAULT_TEMPLATE.contains("\n[port_broker]\n"));
+        let (cfg, _, hard) = effective(Some(DEFAULT_TEMPLATE), None);
+        assert!(!hard);
+        assert_eq!(cfg.port_broker, SparkleConfig::default().port_broker);
+        assert!(!cfg.port_broker.enabled, "the shipped template must not switch the broker on");
+    }
+
+    /// PER-PROJECT OVERRIDABLE, like [verify_gate] and [steering]: which ports a project's dev
+    /// servers may use is a property of the REPO, and a machine-wide range would be wrong for every
+    /// project but one.
+    #[test]
+    fn a_project_may_set_its_own_port_range_because_the_ports_are_the_repos() {
+        let p = "[port_broker]\nenabled = true\nrange = { start = 46000, end = 46010 }\n";
+        let (cfg, warns, hard) = effective(None, Some(p));
+        assert!(!hard);
+        assert!(cfg.port_broker.enabled);
+        assert_eq!(cfg.port_broker.range.start, 46000);
+        assert_eq!(cfg.port_broker.range.end, 46010);
+        assert!(!warns.iter().any(|w| w.contains("[port_broker]")), "{warns:?}");
+    }
+
+    /// ONE KEY COSTS ONE KEY. Naming only `start` must widen from the default end rather than
+    /// resetting it to zero, which would be an empty range reported as "no port available".
+    #[test]
+    fn half_a_range_leaves_the_other_half_standing() {
+        let (cfg, _, _) = effective(Some("[port_broker]\nrange = { start = 46000 }\n"), None);
+        assert_eq!(cfg.port_broker.range.start, 46000);
+        assert_eq!(cfg.port_broker.range.end, 45099, "the untouched end must survive");
+    }
+
+    /// BOTH SPELLINGS OF `gate_locks`. The array-of-tables is canonical; the inline map is the
+    /// shorter thing a person types, and rejecting it would cost them the whole layer.
+    #[test]
+    fn gate_locks_accepts_the_array_and_the_map_spelling() {
+        let (cfg, warns, _) = effective(
+            Some("[port_broker]\ngate_locks = [{ name = \"browser\", ttl_secs = 60 }]\n"),
+            None,
+        );
+        assert_eq!(cfg.port_broker.gate_locks.len(), 1);
+        assert_eq!(cfg.port_broker.gate_locks[0].name, "browser");
+        assert_eq!(cfg.port_broker.gate_locks[0].ttl_secs, 60);
+        assert!(warns.is_empty(), "{warns:?}");
+
+        let (cfg, warns, _) =
+            effective(Some("[port_broker]\ngate_locks = { browser = 60, db = 120 }\n"), None);
+        assert_eq!(
+            cfg.port_broker
+                .gate_locks
+                .iter()
+                .map(|g| (g.name.as_str(), g.ttl_secs))
+                .collect::<Vec<_>>(),
+            vec![("browser", 60), ("db", 120)]
+        );
+        assert!(warns.is_empty(), "{warns:?}");
+    }
+
+    /// ONE BAD ENTRY COSTS ONE ENTRY, never the layer. The whole reason `gate_locks` is a bare
+    /// `toml::Value` — a typed collection turns one hand-edit of the wrong shape into a whole-file
+    /// parse failure, which reverts every unrelated setting in it.
+    #[test]
+    fn a_malformed_gate_lock_costs_only_itself() {
+        let g = "[workflow]\nrequire_pr = false\n\n[port_broker]\ngate_locks = [{ name = \"browser\", ttl_secs = 60 }, 7]\n";
+        let (cfg, warns, hard) = effective(Some(g), None);
+        assert!(!hard, "one bad entry must not fail the layer");
+        assert!(!cfg.workflow.require_pr, "and must not revert an unrelated setting");
+        assert_eq!(cfg.port_broker.gate_locks.len(), 1);
+        assert!(warns.iter().any(|w| w.contains("[port_broker].gate_locks")), "{warns:?}");
+
+        // A wholly wrong SHAPE keeps the previous value rather than emptying the list — silently
+        // dropping every named lock is the loudest consequence for the quietest mistake.
+        let (cfg, warns, hard) = effective(Some("[port_broker]\ngate_locks = 7\n"), None);
+        assert!(!hard);
+        assert_eq!(cfg.port_broker.gate_locks, SparkleConfig::default().port_broker.gate_locks);
+        assert!(warns.iter().any(|w| w.contains("[port_broker].gate_locks")), "{warns:?}");
+
+        // …but an explicit EMPTY list is obeyed: a repo saying "no named locks" must be able to.
+        let (cfg, _, _) = effective(Some("[port_broker]\ngate_locks = []\n"), None);
+        assert!(cfg.port_broker.gate_locks.is_empty());
+    }
+
+    /// THE SEAM TO THE MODULE. A zero TTL would make every lease instantly stale, turning
+    /// reclamation from a safety net into the normal path — the collision the broker exists to
+    /// prevent, arrived at through its own config.
+    #[test]
+    fn the_projection_clamps_a_zero_ttl_instead_of_shipping_it() {
+        let (cfg, _, _) = effective(
+            Some("[port_broker]\nlease_ttl_secs = 0\nheartbeat_secs = 0\ngate_locks = { browser = 1 }\n"),
+            None,
+        );
+        // The CONFIG keeps what was written — the file is the user's, and rewriting it silently is
+        // how a setting becomes unexplainable.
+        assert_eq!(cfg.port_broker.lease_ttl_secs, 0);
+        // The SETTINGS the module runs on are clamped.
+        let s = cfg.port_broker.to_broker_settings();
+        assert_eq!(s.lease_ttl_secs, 1);
+        assert_eq!(s.heartbeat_secs, 1);
+        assert_eq!(s.gate_locks[0].ttl_secs, 1);
+        assert_eq!(s.range_start, 45000);
+        assert_eq!(s.range_end, 45099);
+        assert!(!s.enabled);
+    }
+
+    // ── [adversarial_review] (bead .4) ─────────────────────────────────────────────
+
+    #[test]
+    fn adversarial_review_ships_opt_in_and_fails_closed() {
+        let (cfg, warns, hard) = effective(None, None);
+        assert!(!cfg.adversarial_review.enabled, "the pass must ship OFF — it spends quota unasked");
+        assert_eq!(cfg.adversarial_review.model, "claude-opus-5");
+        assert_eq!(cfg.adversarial_review.max_diff_bytes, 120_000);
+        // AND it must fit the reviewer's prompt limit. Asserted against the DERIVED budget, not a
+        // second literal — this default shipped at 200_000 against a 128 KiB ceiling and the field
+        // doc asserted the opposite, which is how it survived review (roborev job 69292).
+        assert!(
+            cfg.adversarial_review.max_diff_bytes as usize
+                <= crate::adversarial_review::max_diff_budget()
+        );
+        assert_eq!(cfg.adversarial_review.timeout_secs, 600);
+        // `unknown` MUST be in the shipped blocking set: it is what the parser produces when it
+        // could not read a verdict at all, so leaving it out turns every failed run into a silent
+        // approval.
+        assert!(cfg.adversarial_review.block_on.contains(&"unknown".to_string()));
+        assert!(cfg.adversarial_review.block_on.contains(&"block".to_string()));
+        assert!(warns.is_empty());
+        assert!(!hard);
+    }
+
+    #[test]
+    fn adversarial_review_reads_a_global_section() {
+        let (cfg, warns, hard) = effective(
+            Some(
+                "[adversarial_review]\nenabled = true\nmodel = \"claude-fable-5\"\n\
+                 max_diff_bytes = 50000\nblock_on = [\"block\"]\ntimeout_secs = 120\n",
+            ),
+            None,
+        );
+        assert!(cfg.adversarial_review.enabled);
+        assert_eq!(cfg.adversarial_review.model, "claude-fable-5");
+        assert_eq!(cfg.adversarial_review.max_diff_bytes, 50_000);
+        assert_eq!(cfg.adversarial_review.block_on, vec!["block".to_string()]);
+        assert_eq!(cfg.adversarial_review.timeout_secs, 120);
+        assert!(warns.is_empty(), "{warns:?}");
+        assert!(!hard);
+    }
+
+    #[test]
+    fn a_repo_may_turn_adversarial_review_on_for_itself() {
+        // Per-project, like [freshness]/[review]: whether a codebase's diffs get an independent
+        // audit is a property of the codebase.
+        let (cfg, _, _) = effective(None, Some("[adversarial_review]\nenabled = true\n"));
+        assert!(cfg.adversarial_review.enabled);
+    }
+
+    #[test]
+    fn a_mistyped_adversarial_review_key_costs_only_that_key() {
+        // The whole reason every field is a `toml::Value`: a typed Option<u32> would fail the LAYER
+        // to deserialize, and the user would silently lose `require_pr = false` too.
+        let (cfg, warns, hard) = effective(
+            Some(
+                "[workflow]\nrequire_pr = false\n\n[adversarial_review]\nenabled = true\n\
+                 max_diff_bytes = \"lots\"\n",
+            ),
+            None,
+        );
+        assert!(!cfg.workflow.require_pr, "an unrelated setting must survive the typo");
+        assert!(cfg.adversarial_review.enabled, "so must the sibling key in the same section");
+        assert_eq!(
+            cfg.adversarial_review.max_diff_bytes,
+            AdversarialReviewConfig::default().max_diff_bytes,
+            "the bad key keeps its default"
+        );
+        assert!(warns.iter().any(|w| w.contains("max_diff_bytes")), "{warns:?}");
+        assert!(!hard);
+    }
+
+    #[test]
+    fn a_non_boolean_enabled_leaves_the_pass_off() {
+        // The SAFE direction here is the opposite of [advisor]'s: that feature ships ON, so a
+        // dropped `enabled = "false"` would leave it running. This one ships OFF, so anything we
+        // cannot read as a boolean must leave it off rather than arm a quota-spending pass.
+        let (cfg, warns, _) =
+            effective(Some("[adversarial_review]\nenabled = \"yes\"\n"), None);
+        assert!(!cfg.adversarial_review.enabled);
+        assert!(warns.iter().any(|w| w.contains("still OFF")), "{warns:?}");
+    }
+
+    #[test]
+    fn an_empty_block_on_is_refused_rather_than_disarming_the_gate() {
+        // `block_on = []` would let an UNREADABLE verdict clear the gate — the one configuration
+        // this feature must not be reachable by accident.
+        let (cfg, warns, _) = effective(Some("[adversarial_review]\nblock_on = []\n"), None);
+        assert!(cfg.adversarial_review.block_on.contains(&"unknown".to_string()));
+        assert!(warns.iter().any(|w| w.contains("block_on is empty")), "{warns:?}");
+    }
+
+    #[test]
+    fn a_zero_max_diff_bytes_is_refused_rather_than_reviewing_nothing() {
+        // A 0 cap sends an EMPTY diff to a reviewer that would audit nothing and could answer
+        // `ship` — an approval of a change nobody looked at, produced by a config typo.
+        let (cfg, warns, _) =
+            effective(Some("[adversarial_review]\nmax_diff_bytes = 0\n"), None);
+        assert_eq!(
+            cfg.adversarial_review.max_diff_bytes,
+            AdversarialReviewConfig::default().max_diff_bytes
+        );
+        assert!(warns.iter().any(|w| w.contains("1000-byte floor")), "{warns:?}");
+    }
+
+    #[test]
+    fn an_over_budget_max_diff_bytes_is_LOWERED_rather_than_honoured() {
+        // roborev job 69292 (High). Honouring 500_000 does not review more — the one-shot refuses
+        // the whole request, `review_with` records `unknown`, and `unknown` blocks. So one config
+        // line would permanently block every large branch. Clamping down is the only reading that
+        // leaves the feature working.
+        let ceiling = crate::adversarial_review::max_diff_budget() as u32;
+        let (cfg, warns, _) =
+            effective(Some("[adversarial_review]\nmax_diff_bytes = 500000\n"), None);
+        assert_eq!(cfg.adversarial_review.max_diff_bytes, ceiling);
+        assert!(warns.iter().any(|w| w.contains("was lowered")), "{warns:?}");
+        // A value UNDER the ceiling is still honoured verbatim — the clamp is a ceiling, not a pin.
+        let (cfg2, warns2, _) =
+            effective(Some("[adversarial_review]\nmax_diff_bytes = 20000\n"), None);
+        assert_eq!(cfg2.adversarial_review.max_diff_bytes, 20_000);
+        assert!(warns2.is_empty(), "{warns2:?}");
+    }
+
+    #[test]
+    fn the_shipped_max_diff_bytes_is_under_the_prompt_ceiling() {
+        // The DEFAULT is the value that shipped wrong. Asserted against the derived budget rather
+        // than a restated literal, so the two cannot drift apart again.
+        assert!(
+            AdversarialReviewConfig::default().max_diff_bytes as usize
+                <= crate::adversarial_review::max_diff_budget(),
+            "the shipped diff cap must fit the reviewer's prompt limit"
+        );
+    }
+
+    #[test]
+    fn an_unknown_adversarial_review_key_is_named_in_a_warning() {
+        let (_, warns, _) = effective(Some("[adversarial_review]\nlenses = 6\n"), None);
+        assert!(warns.iter().any(|w| w.contains("lenses")), "{warns:?}");
     }
 }

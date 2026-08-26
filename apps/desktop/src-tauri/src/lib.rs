@@ -1,6 +1,7 @@
 mod account_ledger;
 mod account_usage;
 mod accounts;
+mod adversarial_review;
 mod agent_goal_record;
 mod agent_life;
 mod ai;
@@ -79,6 +80,7 @@ mod humanebench_vendor;
 /// The identity-epoch ledger backing `accounts.rs`' identity-keyed ceilings.
 mod identity_log;
 mod inbox;
+mod integration_assistant;
 mod judge;
 mod key_window;
 mod knightwatch;
@@ -93,6 +95,9 @@ mod model_catalog;
 mod naming;
 mod onepassword;
 mod peak_concurrency;
+/// Runtime arbitration for parallel agents: machine-wide port LEASES for ports that can move, and
+/// named gate LOCKS for the ones that cannot (bead `.5`).
+mod port_broker;
 mod pr_claims;
 mod pr_dismissal;
 mod pr_owner;
@@ -141,12 +146,15 @@ mod sparkle_agent;
 mod sparkle_improve;
 mod spend;
 mod stale_build;
+mod steering;
 mod teardown_guard;
+mod ticket_intake;
 mod support;
 mod transcript;
 mod roster;
 mod trial;
 mod trial_remote;
+mod verify_gate;
 mod watchdog;
 mod worktree;
 mod notes;
@@ -1361,11 +1369,21 @@ pub fn run() {
             fleet::fleet_digest,
             fleet::fleet_read_hook_stream,
             fleet::fleet_read_transcript,
+            // Per-worktree steering files (bead .3) — the project's architecture map
+            // and standards, seeded into every agent worktree and injected at pre-flight.
+            steering::steering_status,
+            steering::steering_read,
+            steering::steering_write,
+            steering::steering_seed_templates,
+            steering::steering_preflight_block,
             inbox::inbox_send,
             inbox::inbox_broadcast,
             inbox::inbox_status,
             inbox::inbox_peek,
             inbox::inbox_claim_for_idle,
+            adversarial_review::adversarial_review_run,
+            adversarial_review::adversarial_review_status,
+            adversarial_review::adversarial_review_verdict,
             // "Concierge Agents" (bead sparkle-s7rfc). `research_dispatch` RETURNS BEFORE THE CHILD
             // FINISHES — that non-blocking property is the feature, and research.rs has a test
             // pinning it. The names are the contract with `RESEARCH_COMMANDS` in
@@ -1415,6 +1433,16 @@ pub fn run() {
             preview::preview_stop,
             preview::preview_stop_for_agent,
             dev_port_preflight::dev_port_preflight,
+            // Runtime port arbitration (bead `.5`). Every one is `async fn` +
+            // spawn_blocking, for the same reason the preview commands above are: they all touch
+            // the filesystem and one of them attempts a bind per port in the range.
+            port_broker::port_broker_acquire,
+            port_broker::port_broker_renew,
+            port_broker::port_broker_release,
+            port_broker::port_broker_status,
+            port_broker::gate_lock_acquire,
+            port_broker::gate_lock_release,
+            port_broker::gate_lock_status,
             preview::preview_status,
             preview::preview_list,
             preview_capture::preview_screenshot,
@@ -1430,7 +1458,18 @@ pub fn run() {
             preflight::prereqs_preflight,
             preflight::roborev_preflight,
             preflight::lsp_preflight,
+            // The verify-before-PR gate (verify_gate.rs, bead .1): run CI's checks
+            // locally in the agent's worktree, keep the evidence, render the PR Testing section.
+            verify_gate::verify_gate_run,
+            verify_gate::verify_gate_status,
+            verify_gate::verify_gate_report,
+            verify_gate::verify_gate_attach_evidence,
+            verify_gate::verify_gate_testing_markdown,
             preflight::project_lsp_preflight,
+            ticket_intake::ticket_intake_parse,
+            ticket_intake::ticket_intake_fetch,
+            ticket_intake::ticket_intake_status,
+            ticket_intake::ticket_intake_image,
             // 1Password .env backup/restore — implements src/services/onepassword.ts.
             onepassword::op_preflight,
             onepassword::op_refresh,
@@ -1687,6 +1726,15 @@ pub fn run() {
             // every line here — an unregistered command still compiles clean and fails only
             // at runtime; `scripts/lib/tauri-handler-guard.sh` is the check.
             beads_cmd::beads_reparent,
+            // The integration assistant (bead .2): plan a safe merge order across
+            // several ready branches, gate each on scripts/pr-checks.sh + roborev, and merge only
+            // what the gate calls ready. Registered as ONE contiguous block; an unregistered
+            // command still compiles clean and fails only at runtime, which is what
+            // `scripts/lib/tauri-handler-guard.sh` exists to catch.
+            integration_assistant::integration_plan,
+            integration_assistant::integration_gate,
+            integration_assistant::integration_merge,
+            integration_assistant::integration_status,
             ai::anthropic_chat,
             // The planner's model id, so the second-model advisor pass can resolve a DIFFERENT one
             // rather than hardcoding a copy of it (bead `sparkle-revqiv`).

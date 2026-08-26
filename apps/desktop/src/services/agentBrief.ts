@@ -47,6 +47,7 @@
 // (the brief is only released once delivery is settled), and an app restart legitimately starts empty.
 
 import { log } from "../logger";
+import { fetchSteeringPreflightBlock } from "./steeringFiles";
 
 /** How a brief's delivery ended. */
 export type BriefDeliveryOutcome =
@@ -154,6 +155,10 @@ interface Held {
    * set would report `launching` for a pane that had already given up.
    */
   inFlight: boolean;
+  /** Has this entry's steering prelude already been prepended? Guards the async upgrade against
+   *  running twice for one held brief (a second attach replaces the entry outright, so identity is
+   *  what this is checked alongside). */
+  steered: boolean;
   waiters: Array<(o: BriefDeliveryOutcome) => void>;
 }
 
@@ -164,8 +169,67 @@ const held = new Map<string, Held>();
  *
  *  Pass `recorded` when you have ALREADY written this prompt to the store — see {@link BriefRecord}
  *  for the duplicate-record and goal-debt bugs that omitting it produced. */
-export function attachBrief(agentId: string, text: string, recorded?: BriefRecord): void {
-  held.set(agentId, { text, recorded, inFlight: false, waiters: [] });
+export function attachBrief(
+  agentId: string,
+  text: string,
+  recorded?: BriefRecord,
+): Promise<void> {
+  const entry: Held = { text, recorded, inFlight: false, steered: false, waiters: [] };
+  held.set(agentId, entry);
+  // Returned rather than fired-and-forgotten so a caller (and a test) can wait for the completed
+  // brief. Every existing caller invokes this as a statement and is unaffected.
+  return applySteeringPrelude(agentId, entry);
+}
+
+/**
+ * THE STEERING PRELUDE — this project's `architecture.md` + `standards.md`, prepended to the brief
+ * as HARD CONSTRAINTS so an agent is born knowing the house rules (bead .3).
+ *
+ * Prefixed rather than appended: the constraints have to be in force while the agent reads the
+ * mission, not discovered after it has already planned against its own habits.
+ *
+ * ── WHY THIS IS BEST-EFFORT AND NEVER BLOCKS ──────────────────────────────────────────────────
+ * `briefForLaunch` is synchronous — the pane calls it while assembling an argv — so this cannot
+ * make the brief wait. It upgrades the held text in place instead, and the ~7–40s that separates
+ * `attachBrief` from a pane's launch (measured; see the module header) is many orders of magnitude
+ * more than a local file read needs. If it loses that race anyway, or steering is off, or the
+ * project cannot be identified, the agent still gets its mission and still finds the same files ON
+ * DISK in its worktree (`steering::seed_into_worktree`). The seeding is the durable half; this is
+ * the half that makes the agent read them.
+ */
+async function applySteeringPrelude(agentId: string, entry: Held): Promise<void> {
+  try {
+    const root = await projectRootForAgent(agentId);
+    if (!root) return;
+    const block = await fetchSteeringPreflightBlock(root);
+    // Rust returns "" for every off/nothing-to-say case, so there is no flag to read here.
+    if (!block.trim()) return;
+    // Identity, not presence: a re-spawn between the await points replaced the entry, and that
+    // newer brief is running its own prelude.
+    if (held.get(agentId) !== entry || entry.steered) return;
+    entry.steered = true;
+    entry.text = `${block}\n${entry.text}`;
+  } catch (e) {
+    // Never fatal. Steering that could not be read costs the agent a hint; a brief that failed to
+    // attach costs it its whole mission.
+    log.debug("agent-brief", "no steering prelude for this brief", { agentId, error: String(e) });
+  }
+}
+
+/**
+ * The project root the agent belongs to, or undefined when we cannot tell.
+ *
+ * Imported LAZILY on purpose: `agentBrief` is otherwise dependency-light, and a static edge to the
+ * project store would pull the whole store into the module graph of every test that touches a
+ * brief. Undefined simply means no prelude — an agent whose project we cannot name is exactly the
+ * case where guessing one would be worst.
+ */
+async function projectRootForAgent(agentId: string): Promise<string | undefined> {
+  const { useProjectStore } = await import("../stores/projectStore");
+  const project = useProjectStore
+    .getState()
+    .projects.find((p) => p.agents.some((a) => a.id === agentId));
+  return project?.rootPath || undefined;
 }
 
 /**

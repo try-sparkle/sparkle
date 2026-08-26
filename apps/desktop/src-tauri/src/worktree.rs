@@ -1760,8 +1760,14 @@ pub async fn create_worker_worktree(
     tracing::info!(%root, %project_id, %worker_id, %parent_branch, "create_worker_worktree");
     let app_data = app_data_dir(&app)?;
     tauri::async_runtime::spawn_blocking(move || {
-        create_worktree_from_local(&root, &project_id, &worker_id, &parent_branch, &app_data)
-            .inspect_err(|e| tracing::error!(%worker_id, error = %e, "create_worker_worktree failed"))
+        let out = create_worktree_from_local(&root, &project_id, &worker_id, &parent_branch, &app_data)
+            .inspect_err(|e| tracing::error!(%worker_id, error = %e, "create_worker_worktree failed"));
+        if let Ok(info) = &out {
+            // Steering files (bead .3). NON-FATAL by construction — `seed_into_worktree`
+            // returns a report, never an error, so nothing here can stop a worker from opening.
+            crate::steering::seed_into_worktree(&root, &info.path, &app_data);
+        }
+        out
     })
     .await
     .map_err(|e| format!("create_worker_worktree task failed: {e}"))?
@@ -1785,8 +1791,14 @@ pub async fn create_agent_worktree(
     // git I/O) can't freeze the UI. The network fetch is now backgrounded inside `create_worktree_at`,
     // so this task is bounded by local git only.
     let outcome = tauri::async_runtime::spawn_blocking(move || {
-        create_worktree_at(&root, &project_id, &agent_id, &base_branch, &app_data)
-            .inspect_err(|e| tracing::error!(%agent_id, error = %e, "create_agent_worktree failed"))
+        let out = create_worktree_at(&root, &project_id, &agent_id, &base_branch, &app_data)
+            .inspect_err(|e| tracing::error!(%agent_id, error = %e, "create_agent_worktree failed"));
+        if let Ok(info) = &out {
+            // Steering files (bead .3). NON-FATAL by construction — `seed_into_worktree`
+            // returns a report, never an error, so nothing here can stop an agent from opening.
+            crate::steering::seed_into_worktree(&root, &info.path, &app_data);
+        }
+        out
     })
     .await
     .map_err(|e| format!("create_agent_worktree task failed: {e}"))?;

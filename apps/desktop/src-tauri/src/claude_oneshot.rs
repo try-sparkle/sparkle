@@ -67,7 +67,7 @@ pub(crate) const CHAT_TIMEOUT: Duration = Duration::from_secs(180);
 /// Over budget is an `Err`, NEVER a truncation. A clipped prompt yields a *confidently wrong*
 /// classification — a judge that never sees the question it was asked to rule on — which is
 /// strictly worse than a refusal the caller already knows how to degrade from.
-const MAX_PROMPT_BYTES: usize = 128 * 1024;
+pub(crate) const MAX_PROMPT_BYTES: usize = 128 * 1024;
 
 /// Floor for the post-hoc reply clamp, so a caller with a tiny `max_tokens` still gets a usable
 /// answer. `judge.rs` asks for 8 tokens and expects the word "FOLLOWUP"; a clamp derived purely
@@ -93,7 +93,7 @@ const MAX_CONCURRENT: usize = 4;
 /// Cap on concurrent BACKGROUND children, so a judge storm can never take the last slot from a call
 /// a human is actually waiting on. This one line is the anti-starvation guarantee, and it has a
 /// test named after it.
-const MAX_BACKGROUND: usize = 3;
+pub(crate) const MAX_BACKGROUND: usize = 3;
 
 /// How many callers may WAIT for a slot, on top of those holding one.
 ///

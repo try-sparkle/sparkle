@@ -1804,6 +1804,27 @@ struct Server {
     child: Arc<Mutex<Option<Child>>>,
     pgid: u32,
     stop: Arc<AtomicBool>,
+    /// What the port broker handed this preview, when `[port_broker]` is on — a LEASE on an
+    /// allocated port, or a GATE LOCK on a pinned one (bead `.5`). `None` for the
+    /// un-brokered path, which holds nothing.
+    ///
+    /// HELD ON THE ENTRY rather than recomputed at stop time, for the same reason `route` is: the
+    /// stop paths have neither the project root nor the broker settings in hand, and re-resolving
+    /// them on a teardown is how a release ends up silently skipped. A lease nobody releases wedges
+    /// its port for a whole TTL, and a gate lock nobody releases wedges a PINNED port — which by
+    /// construction has no alternative to move to.
+    hold: Option<crate::port_broker::PreviewPortHold>,
+}
+
+/// Give back whatever a removed entry was holding.
+///
+/// ONE function, called from EVERY path that drops an entry — `stop_one` and `finish` — because the
+/// two are reached by different routes (a user stop, and every terminal failure) and a release
+/// written into only one of them leaks on the other.
+fn release_hold_of(removed: Option<Server>) {
+    if let Some(hold) = removed.and_then(|s| s.hold) {
+        crate::port_broker::release_preview_hold(&hold);
+    }
 }
 
 /// Which states are worth re-attaching a second `preview_open` to.
@@ -2028,7 +2049,10 @@ impl PreviewManager {
         if let Some(dir) = self.app_data() {
             registry_remove(&dir, id);
         }
-        self.lock().remove(id);
+        // The entry is the ONLY thing that remembers what the port broker handed this preview, so
+        // the release has to happen off the removed value — after this line there is nothing left
+        // that knows a lease was ever taken.
+        release_hold_of(self.lock().remove(id));
         outcome
     }
 
@@ -2452,7 +2476,7 @@ fn open_reserved(
         };
         manager
             .lock()
-            .insert(id.clone(), Server { status: status.clone(), route: route.clone(), child: Arc::clone(&child), pgid: 0, stop: Arc::clone(&stop) });
+            .insert(id.clone(), Server { status: status.clone(), route: route.clone(), child: Arc::clone(&child), pgid: 0, stop: Arc::clone(&stop), hold: None });
         let _ = app.emit("preview:state", status);
     }
 
@@ -2500,17 +2524,54 @@ fn open_reserved(
         }};
     }
 
-    let port = match target.port {
-        Some(p) if !is_reserved_port(p) => p,
-        Some(p) => fail!(format!(
-            "this project pins port {p}, which is Sparkle's own dev port and would frame Sparkle \
-             inside Sparkle"
-        )),
-        None => match allocate_port() {
-            Ok(p) => p,
-            Err(e) => fail!(e),
-        },
+    // THE RESERVED-PORT REFUSAL STAYS FIRST AND UNCONDITIONAL. It is not an arbitration question:
+    // a preview framed on Sparkle's own dev port would be SAME-ORIGIN with the app document, so
+    // there is no holder to queue behind and no lock that could make it safe.
+    if let Some(p) = target.port {
+        if is_reserved_port(p) {
+            fail!(format!(
+                "this project pins port {p}, which is Sparkle's own dev port and would frame Sparkle \
+                 inside Sparkle"
+            ))
+        }
+    }
+    // RUNTIME ARBITRATION (bead `.5`). `choose_preview_port` answers BOTH configurations
+    // — disabled falls back to the historic ephemeral bind-and-drop and writes nothing anywhere — so the
+    // enabled/disabled behaviour is one function a test can drive, rather than a branch inside this
+    // function, which no test can call. It also picks the RIGHT primitive for each case: a lease for
+    // a port that can move, a gate lock for a pinned one that cannot.
+    let broker_settings = crate::port_broker::settings_for(&real.to_string_lossy());
+    let registry = crate::port_broker::registry_root(&real);
+    let hold = match crate::port_broker::choose_preview_port(
+        &registry,
+        &broker_settings,
+        &agent_id,
+        target.port,
+    ) {
+        Ok(h) => h,
+        Err(e) => fail!(e),
     };
+    let port = hold.port;
+    // RECORDED ON THE ENTRY IMMEDIATELY, so every stop path gives it back. If the entry has gone —
+    // a stop landed while we were allocating — the hold is released HERE rather than left for a
+    // teardown that will never run.
+    if hold.holds_anything() {
+        let placed = {
+            let manager = app.state::<PreviewManager>();
+            let mut servers = manager.lock();
+            match servers.get_mut(&id) {
+                Some(server) => {
+                    server.hold = Some(hold.clone());
+                    true
+                }
+                None => false,
+            }
+        };
+        if !placed {
+            crate::port_broker::release_preview_hold(&hold);
+            fail!(format!("a server for this agent is {ALREADY_STARTING}"));
+        }
+    }
     // BUILD ARGV AND THE PORT VERDICTS TOGETHER — see `build_spawn`. TWO verdicts, because they
     // answer two different questions and only one of them may become an address:
     //   * `forced`    — Sparkle put this port on the command line. The ONLY value publishable
@@ -2803,7 +2864,9 @@ fn finish(
 ) {
     app.state::<PreviewManager>().transition(app, id, state, port, error);
     registry_remove(app_data, id);
-    app.state::<PreviewManager>().lock().remove(id);
+    // Every terminal failure comes through here, so this is the other half of `stop_one`'s release:
+    // a preview that dies at spawn must not leave its lease standing for a whole TTL.
+    release_hold_of(app.state::<PreviewManager>().lock().remove(id));
 }
 
 fn mark_bound(app_data: &Path, id: &str, port: u16) {
@@ -4430,6 +4493,109 @@ mod tests {
         assert_eq!(forced.port, 5200);
     }
 
+    /// THE BROKER WIRING (bead `.5`). Source-level and scoped to `open_reserved`'s OWN
+    /// body, for exactly the reason the test below it is: the function cannot be called from a test.
+    ///
+    /// What each half holds, and why neither is enough alone:
+    ///   * The BEHAVIOUR of both configurations — a lease appears when the broker is enabled,
+    ///     nothing at all is written when it is disabled, a pinned port takes a gate lock and names
+    ///     the holder on refusal — is pinned by real tests over a real registry in
+    ///     `port_broker::tests`. Those prove the decision function is right.
+    ///   * This one proves the SPAWN PATH REACHES IT. A decision function nothing calls is a
+    ///     feature that is registered and never runs, which is the failure mode the epic's own
+    ///     brief names. It also pins that the reserved-port refusal stays AHEAD of the broker: 1420
+    ///     is not an arbitration question, and a gate lock on it would be a queue for something
+    ///     nobody may have.
+    #[test]
+    fn open_reserved_takes_its_port_from_the_broker_and_records_the_hold() {
+        let whole = include_str!("preview.rs");
+        let test_mod = whole
+            .find("#[cfg(test)]\nmod tests {")
+            .expect("preview.rs no longer carries its `#[cfg(test)] mod tests` marker");
+        let prod = &whole[..test_mod];
+        let fn_start = prod.find("fn open_reserved(").expect("open_reserved must still exist");
+        let after_sig = &prod[fn_start..];
+        let fn_end = after_sig.find("\n}\n").expect("open_reserved must still have a top-level close");
+        let body = &after_sig[..fn_end];
+
+        let broker_at = body
+            .find("crate::port_broker::choose_preview_port(")
+            .expect("the spawn path must take its port FROM THE BROKER, not from a bare allocate_port()");
+        let reserved_at = body
+            .find("if is_reserved_port(p) {")
+            .expect("the reserved-port refusal must still be in open_reserved");
+        assert!(
+            reserved_at < broker_at,
+            "the reserved-port refusal must come BEFORE the broker — 1420 has no alternative to \
+             queue for, so it is a refusal, never a lock"
+        );
+        assert!(
+            body.contains("server.hold = Some(hold.clone());"),
+            "the hold must be recorded on the entry, or no stop path can ever release it"
+        );
+        assert!(
+            body.contains("let port = hold.port;"),
+            "and the port that is spawned must be the one the broker handed out"
+        );
+        assert!(
+            !body.contains("allocate_port()"),
+            "open_reserved must no longer allocate directly — choose_preview_port owns both paths"
+        );
+    }
+
+    /// THE RELEASE, as a real side effect: a lease exists, the entry is dropped, the lease is gone.
+    ///
+    /// `release_hold_of` is the ONE function both teardown paths call, so this covers `stop_one`
+    /// and `finish` at once — and the source pin below it holds that both really do call it.
+    #[test]
+    fn dropping_an_entry_gives_its_broker_lease_back() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let settings = crate::port_broker::BrokerSettings {
+            enabled: true,
+            ..crate::port_broker::BrokerSettings::default()
+        };
+        let hold = crate::port_broker::choose_preview_port(dir.path(), &settings, "a1", None)
+            .expect("a lease");
+        assert_eq!(
+            crate::port_broker::list_leases(dir.path()).len(),
+            1,
+            "the preview must have taken a lease to begin with, or this test proves nothing"
+        );
+
+        let mut server = seeded("a1", "pv1", hold.port, PreviewState::Listening);
+        server.hold = Some(hold);
+        release_hold_of(Some(server));
+
+        assert!(
+            crate::port_broker::list_leases(dir.path()).is_empty(),
+            "dropping the entry must give the port back — a lease nobody releases wedges it for a \
+             whole TTL"
+        );
+    }
+
+    /// BOTH teardown paths, named. A release written into only one of them leaks on the other, and
+    /// the two are reached by different routes: a user stop, and every terminal failure.
+    #[test]
+    fn both_teardown_paths_release_the_hold() {
+        let whole = include_str!("preview.rs");
+        let test_mod = whole.find("#[cfg(test)]\nmod tests {").expect("test marker");
+        let prod = &whole[..test_mod];
+        assert!(
+            prod.contains("release_hold_of(self.lock().remove(id));"),
+            "stop_one must release off the REMOVED entry — after that line nothing remembers the lease"
+        );
+        assert!(
+            prod.contains("release_hold_of(app.state::<PreviewManager>().lock().remove(id));"),
+            "and so must `finish`, which is where every terminal failure lands"
+        );
+        assert_eq!(
+            prod.matches(".lock().remove(id)").count(),
+            2,
+            "every path that drops an entry must go through release_hold_of; a third bare removal \
+             is a leak"
+        );
+    }
+
     /// THE WIRING, because the three places the fiction escaped from are all inside a function no
     /// test can call: the `Starting` transition (which is what the pane and the card render), the
     /// `requested` argument handed to discovery (which decides `choose_listener`'s fast path), and
@@ -4972,6 +5138,7 @@ mod tests {
                 error: None,
             },
             route: String::new(),
+            hold: None,
             child: Arc::new(Mutex::new(None)),
             pgid: 0,
             stop: Arc::new(AtomicBool::new(false)),
