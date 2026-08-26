@@ -217,9 +217,12 @@ export function predictLanding(
  *    truth this file exists to avoid, and silently landing the card in Backlog instead makes the
  *    ladder lie about where the user put it.
  *
- * 2. A DROP THAT WOULD CHANGE NOTHING. If the card would come to rest on the rung it is already
- *    sitting on, the gesture is a no-op — the user drags, lets go, and watches the card return to
- *    where it started with no explanation. Refusing states the reason instead.
+ * 2. A DROP THAT WOULD CHANGE NOTHING — in either of two shapes. The card was let go on the rung
+ *    it is ALREADY SHOWN IN ("picked it up, changed my mind"), or the plan writes nothing at all
+ *    and the card would come to rest exactly where it started. Both are gestures the user watches
+ *    do nothing, so refusing states the reason instead. Note the first is refused whatever the plan
+ *    would write: on Build: Active an already-claimed epic plans `send-to-build`, and taking that
+ *    would re-prompt a running orchestrator from a gesture that meant "put it back".
  *
  * ══ WHY A LANDING THAT DIFFERS FROM THE TARGET IS STILL ACCEPTED ═══════════════════════════════
  * This was written as "refuse any mismatch" first, and that was wrong: it removes the ability to
@@ -256,20 +259,28 @@ export function epicDropPlan(
   const writes = writesFor(target, bead);
   const landsOn = predictLanding(beadAfterWrites(bead, writes), allBeads, blocked, fleetRung) ?? target;
 
-  // ══ THE NO-OP TEST IS ABOUT THE PLAN, NOT ABOUT THE CARD MOVING ══════════════════════════════
-  // This was first written as `landsOn === from`, and that swallowed the feature's headline
-  // gesture. An epic already `in_progress` with a gray fleet sits under Build: Unstaffed; dropping
-  // it on Build: Active is the STAFFING request this module exists to serve. Its plan is
-  // `[send-to-build]` alone — the bead is already claimed — and `send-to-build` is deliberately
-  // invisible to `beadAfterWrites`, so the predicted landing is the rung it started on. Keyed on
-  // the landing, the one drop that matters was refused with "this epic is already in Build:
-  // Unstaffed", and no orchestrator was ever bound.
+  // ══ TWO DIFFERENT NO-OPS, AND ONLY ONE OF THEM IS ABOUT THE PREDICTED LANDING ════════════════
   //
-  // So the question is whether the plan is INERT — whether it writes anything at all. A plan with
-  // no writes really does change nothing, and refusing it is honest. A plan whose only write is
-  // invisible to the ladder still DOES something; the card simply stays where it is until the
-  // agent goes green, which `epicBoard.ts` names as the designed slide.
-  if (writes.length === 0 && from !== null && landsOn === from) {
+  // 1. THE IN-PLACE DROP — `target === from`. The card was let go on the rung it is already shown
+  //    in, which is what "picked it up, changed my mind" looks like. Refused on its own terms,
+  //    whatever the plan would write, because on the build rungs the plan is NOT harmless: an epic
+  //    already claimed yields `[send-to-build]`, and taking that would re-hand a RUNNING
+  //    orchestrator a fresh mission and pull the user off the board into its pane. One rung left,
+  //    an epic filed under Blocked by a red fleet would be UN-CLAIMED by the same gesture.
+  //
+  // 2. THE PLAN THAT WRITES NOTHING, landing back where it started. That is a real no-op — the
+  //    user drags, lets go, and the card returns with no explanation — so refusing states why.
+  //
+  // WHAT IS DELIBERATELY *NOT* REFUSED is a plan that writes something the LADDER CANNOT SEE. This
+  // guard was first written as `landsOn === from` alone, and that swallowed the feature's headline
+  // gesture: an epic already `in_progress` with a gray fleet sits under Build: Unstaffed, and
+  // dropping it on Build: Active is the STAFFING request this module exists to serve. Its plan is
+  // `[send-to-build]` alone, `send-to-build` is invisible to `beadAfterWrites` by design, so the
+  // predicted landing equals the source rung — and the one drop that matters was refused with
+  // "this epic is already in Build: Unstaffed" while no orchestrator was ever bound. The card
+  // honestly stays put until that agent goes green, which `epicBoard.ts` names as the designed
+  // slide.
+  if (from !== null && (target === from || (writes.length === 0 && landsOn === from))) {
     return {
       ok: false,
       target,

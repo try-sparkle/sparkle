@@ -307,6 +307,34 @@ describe("epicDropPlan — staffing an epic that is ALREADY claimed", () => {
     expect(kinds(plan.writes)).toContain("send-to-build");
   });
 
+  // ══ AND THE IN-PLACE DROP IS STILL REFUSED, WHICH THE INERT TEST ALONE DOES NOT COVER ════════
+  // "Picked the card up, changed my mind, let go where it was" is the commonest drag gesture there
+  // is, and on Build: Active it is NOT harmless: `writesFor` emits `send-to-build` for an epic that
+  // is already claimed, so an inert-only guard would accept it and re-hand a RUNNING orchestrator a
+  // fresh mission — `prepareHandoff` appends the seed prompt to the live agent and the reveal drags
+  // the user off the board into its pane. So a drop onto the rung the card is ALREADY SHOWN IN is
+  // refused on its own terms, regardless of what the plan would write.
+  it("refuses an in-place drop on Build: Active rather than re-prompting the running agent", () => {
+    const { e, all } = loneEpic("in_progress");
+    const plan = epicDropPlan("inProgress", e, all, NOTHING_BLOCKED, () => "inProgress");
+
+    expect(plan.ok).toBe(false);
+    if (plan.ok) return;
+    expect(plan.reason).toMatch(/already/i);
+  });
+
+  // The same in-place rule one rung left, where the plan is NOT send-to-build: an epic filed under
+  // Blocked by a red fleet, dropped back on Blocked, would otherwise un-claim it — a real write
+  // nobody asked for from a gesture that means "put it back".
+  it("refuses an in-place drop on Blocked even though the plan would write", () => {
+    const { e, all } = loneEpic("in_progress");
+    const plan = epicDropPlan("blocked", e, all, NOTHING_BLOCKED, () => "blocked");
+
+    expect(plan.ok).toBe(false);
+    if (plan.ok) return;
+    expect(plan.reason).toMatch(/already/i);
+  });
+
   // THE OTHER HALF OF THE PAIR, and what keeps the refusal from being deleted outright: a plan that
   // writes NOTHING is still refused, because that gesture really does change nothing. Without this
   // the fix above would read as "accept every drop".
