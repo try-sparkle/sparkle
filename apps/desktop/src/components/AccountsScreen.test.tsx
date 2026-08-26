@@ -581,7 +581,16 @@ describe("AccountsScreen", () => {
 
     const note = await screen.findByTestId("account-usage-exhausted-note-a");
     expect(note.getAttribute("role")).toBe("status"); // calm, NOT the amber alert
+    // The `rate-limited` token still routes the 429 here (it is the classifier marker); the note
+    // names it honestly.
     expect(note.textContent).toContain("rate-limited");
+    // The reworded copy SEPARATES the two ideas the old string conflated: (a) the usage READ hit a
+    // transient rate limit, and (b) the account itself is signed in and still usable for work. Assert
+    // BOTH halves so a regression to the old "its limit will reset soon" wording — which read as the
+    // account being throttled for real work — fails here.
+    expect(note.textContent).toContain("Couldn't fetch live usage");
+    expect(note.textContent).toContain("signed in and still working");
+    expect(note.textContent).not.toContain("its limit will reset soon");
     expect(note.textContent).not.toContain("check your connection");
     expect(note.textContent).not.toContain("Check your connection");
     expect(note.textContent).not.toContain("sign in again");

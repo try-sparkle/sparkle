@@ -1298,7 +1298,7 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
               ...m,
               [a.id]: {
                 kind: "exhausted" as const,
-                text: "Account is rate-limited (usage temporarily unavailable). This account is signed in — its limit will reset soon.",
+                text: "Couldn't fetch live usage right now — Anthropic rate-limited the usage read. This account is signed in and still working; try again shortly.",
               },
             }));
           } else if (exReset) {
