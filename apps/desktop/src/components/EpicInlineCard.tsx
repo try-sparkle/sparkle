@@ -23,6 +23,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { useShallow } from "zustand/react/shallow";
 import { BeadCard } from "./BeadCard/BeadCard";
+import { EpicTaskCards } from "./EpicTaskCard";
 import { beadsComment, beadsDetail, type BeadComment } from "../services/beadsCommands";
 import { dispatchBeadChat } from "../services/beadChat";
 import { beadStage, workersInEpic } from "../services/planView";
@@ -109,6 +110,29 @@ export function EpicInlineCard({
   const lineage = useMemo(
     () => beadLineageOf({ beads: allBeads, bead, agents, projectId }),
     [allBeads, bead, agents, projectId],
+  );
+
+  // ── ON AN EPIC, BOTH LINEAGE ROWS COME OFF THE CARD ─────────────────────────────────────────
+  // Bead sparkle-huw924.10, the founder re-asking for the second time: *"I had already previously
+  // asked that the build agents not show outside of the tasks — that the epic will surface the
+  // tasks. And I want the tasks to look more like they do in the Plan board cards."*
+  //
+  //   • `Tasks:` went because it was a LOSSY copy of what the task cards below now draw in full —
+  //     one chip and a `+4 more` standing in for the whole plan. The board's own epic card dropped
+  //     it for the same reason and by the same means (`BoardView.DetailOverlay`, bead
+  //     sparkle-huw924.9); this is that decision reaching the column it was never applied to.
+  //   • `Build agents:` went because it was the WRONG SHAPE, not merely a duplicate: a flat list
+  //     beside a flat list, *"so nothing tells you WHICH agent is on WHICH task — which is the
+  //     entire question the card should answer."* Every one of those agents is still drawn, now
+  //     inside the task it is bound to (`planView.groupEpicAgentsByTask`), and the ones nothing can
+  //     attribute are drawn in the fallback group rather than dropped — see `EpicTaskCards`.
+  //
+  // A NON-EPIC CARD IS UNTOUCHED. It has no task cards under it, so its `Tasks:` row is the only
+  // place its children are ever named and removing it would delete information rather than a
+  // duplicate. Same asymmetry, same reason, as the board's overlay.
+  const cardLineage = useMemo(
+    () => (beadIsEpic ? { ...lineage, tasks: [], buildAgents: [] } : lineage),
+    [lineage, beadIsEpic],
   );
 
   // ── THE COMMENT THREAD, READ PER-OPEN ───────────────────────────────────────────────────────
@@ -225,7 +249,38 @@ export function EpicInlineCard({
         onBuildIt={canWrite ? (build.buildIt ?? undefined) : undefined}
         onBuildAllPrd={canWrite ? (build.buildAllPrd ?? undefined) : undefined}
         prdEpicCount={build.prdEpics.length}
-        lineage={lineage}
+        lineage={cardLineage}
+        // ── THE TASKS, AS PLAN-BOARD CARDS, INSIDE THIS CARD'S BORDER ─────────────────────────
+        // `EpicTaskCard` IS the Plan board's task card — mounting it here is what makes the two
+        // surfaces one treatment rather than a third drawing of an epic (bead sparkle-xelans
+        // records that this repo already shipped three). It goes through `footer` rather than
+        // beside the card because in THIS column the card carries the border, so a sibling would
+        // hang below the edge; the board's overlay is a bordered panel and can render it beside.
+        //
+        // `lineage.buildAgents` — the FULL resolved set, not the emptied `cardLineage` one — is
+        // what gets partitioned, so nothing the deleted row used to name can be lost.
+        footer={
+          beadIsEpic ? (
+            <EpicTaskCards
+              epicId={bead.id}
+              allBeads={allBeads as Bead[]}
+              agents={agents}
+              buildAgents={lineage.buildAgents}
+              // DOUBLE CLICK / Enter on a task NARROWS THE BUILD COLUMN to it — the founder's
+              // gesture, *"if I click on one of the children, I can see the exact build agent or
+              // agents that are working on that child"* — which is what the `Tasks:` pill used to
+              // do here and is preserved verbatim through the task card's own open seam. A SINGLE
+              // click expands the card in place instead, which is the other half of the same ask.
+              onOpenTask={(b) => focusChildTaskInColumn(b.id, projectId)}
+              // ── A BUILD-AGENT CHIP IS A REAL LINK ──────────────────────────────────────────
+              // Unchanged from the row it replaces: *"clicking one jumps to that agent, the same
+              // affordance the concierge uses in chat."* `openProjectTab` IS that affordance.
+              onOpenAgent={({ agentId, projectId: pillProjectId }) => {
+                openProjectTab(pillProjectId ?? projectId, agentId);
+              }}
+            />
+          ) : undefined
+        }
         // ── A TASK PILL NARROWS THE BUILD COLUMN TO THAT TASK ────────────────────────────────
         // THE FOUNDER ASKED FOR THIS GESTURE BY NAME: *"if I click on one of the children, I can
         // see the exact build agent or agents that are working on that child… that's one way for me

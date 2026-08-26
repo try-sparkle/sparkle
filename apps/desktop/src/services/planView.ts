@@ -343,3 +343,84 @@ export function beadLabel(beads: Pick<Bead, "id" | "title">[], beadId: string | 
     beadId,
   );
 }
+
+/**
+ * WHICH AGENT IS ON WHICH TASK — the partition the epic card exists to show.
+ *
+ * ══ THE FOUNDER'S RE-ASK, 2026-08-25 (bead sparkle-huw924.10) ═════════════════════════════════
+ * *"I had already previously asked that the build agents not show outside of the tasks — that the
+ * epic will surface the tasks."* And, on why the old shape failed: the card drew `Tasks:` and
+ * `Build agents:` as two unrelated rows, *"so nothing tells you WHICH agent is on WHICH task —
+ * which is the entire question the card should answer."*
+ *
+ * This is that answer, as data: every agent the epic's lineage already resolved, dropped into the
+ * bucket of the task it is bound to.
+ *
+ * ══ IT DOES NOT RE-DERIVE EPIC MEMBERSHIP, AND MUST NOT ═══════════════════════════════════════
+ * `buildAgents` is handed in ALREADY RESOLVED by `engine/beadLineage.beadLineageOf`, which composes
+ * the one sanctioned resolver (`agentIdsInEpic`). `scripts/lib/epic-membership-guard.sh` fails CI on
+ * a second definition of that edge, and this function deliberately asks a DIFFERENT question: the
+ * worker↔bead edge (`a.beadId === <task id>`), which is the same one `EpicTaskCard` and
+ * `workersForBead` already ask. Membership in, attribution out.
+ *
+ * ══ NOTHING MAY VANISH — THAT IS THE WHOLE CONTRACT ═══════════════════════════════════════════
+ * `spawn_build_agent` takes no epic parameter, so a great many agents are bound to no bead at all,
+ * and an orchestrator is normally bound to none by construction. Under the old flat row those
+ * agents were still NAMED; a partition that quietly dropped them would make the re-ask a net LOSS
+ * of information. So every pill that matches no task lands in {@link EpicAgentsByTask.unassigned},
+ * and the caller is required to draw it. The invariant is exact and is asserted in the suite:
+ *
+ *     sum(byTask.values().length) + unassigned.length === buildAgents.length
+ *
+ * ORDER IS THE INPUT'S, in both halves — `buildAgents` already carries the roster's order (see
+ * `beadLineageOf`), so a row cannot reshuffle between the store's 5s polls.
+ */
+export interface EpicAgentsByTask {
+  /** Task bead id → the agent pills bound to that task. Only non-empty buckets are present. */
+  byTask: Map<string, EpicAgentPill[]>;
+  /** Every pill whose task could not be determined — bound to nothing, bound to the epic's own
+   *  bead, or bound to something that is not one of the tasks this card draws. NEVER dropped. */
+  unassigned: EpicAgentPill[];
+}
+
+/** The shape `engine/beadLineage.LineagePill` already has. Restated structurally rather than
+ *  imported so this pure service keeps no dependency on the engine that feeds it. */
+export interface EpicAgentPill {
+  id: string;
+  label: string;
+  projectId?: string;
+}
+
+export function groupEpicAgentsByTask(params: {
+  /** The epic's resolved build agents, from `beadLineageOf(...).buildAgents`. */
+  buildAgents: readonly EpicAgentPill[];
+  /** The project's roster — read ONLY for `id` → `beadId`, the worker↔bead edge. */
+  agents: readonly Pick<AgentTab, "id" | "beadId">[];
+  /** The task beads this card draws, in the order it draws them. */
+  taskIds: readonly string[];
+}): EpicAgentsByTask {
+  const { buildAgents, agents, taskIds } = params;
+  // `null` as well as `undefined`: `AgentTab.beadId` is declared optional, but the roster is
+  // deserialised from a Rust `Option<String>`, which crosses the wire as an explicit `null` rather
+  // than an absent key (AGENTS.md, "A Rust Option crosses the wire as null"). Treating only
+  // `undefined` as "not bound" would file every wire-shaped agent under a task named "null".
+  const beadOfAgent = new Map<string, string | null | undefined>();
+  for (const a of agents) if (!beadOfAgent.has(a.id)) beadOfAgent.set(a.id, a.beadId);
+  const tasks = new Set(taskIds);
+
+  const byTask = new Map<string, EpicAgentPill[]>();
+  const unassigned: EpicAgentPill[] = [];
+  for (const pill of buildAgents) {
+    const beadId = beadOfAgent.get(pill.id);
+    // `beadId` may be null, undefined, the epic's own id, or a bead this card does not draw. All
+    // four are "cannot be attributed", and all four keep the pill rather than losing it.
+    if (beadId === null || beadId === undefined || !tasks.has(beadId)) {
+      unassigned.push(pill);
+      continue;
+    }
+    const bucket = byTask.get(beadId);
+    if (bucket) bucket.push(pill);
+    else byTask.set(beadId, [pill]);
+  }
+  return { byTask, unassigned };
+}

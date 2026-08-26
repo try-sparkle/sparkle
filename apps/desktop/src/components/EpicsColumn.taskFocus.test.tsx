@@ -88,7 +88,29 @@ afterEach(() => {
 });
 
 const card = () => screen.queryByTestId("epic-inline-card");
-const taskPills = () => screen.queryAllByTestId("epics-bead-card-tasks-pill");
+
+/**
+ * THE CHILD TASKS, AS THE CARD NOW DRAWS THEM.
+ *
+ * They were `Tasks:` PILLS until bead sparkle-huw924.10; they are now the Plan board's own
+ * `EpicTaskCard`, one per child, with that child's build agents inside it. The founder's gesture
+ * did not change — *"if I click on one of the children, I can see the exact build agent or agents
+ * that are working on that child"* — it moved onto the card's OPEN seam, which is a double click.
+ * A single click expands the card in place instead, which is the other half of the same ask.
+ */
+const taskCards = () => screen.queryAllByTestId("epic-task-card");
+const taskCardTitled = (title: string) =>
+  taskCards().find((c) => (c.textContent ?? "").includes(title))!;
+
+/** THE REAL BROWSER SEQUENCE: click(detail 1) → click(detail 2) → dblclick. Firing only
+ *  `doubleClick` would never arm the deferred single-click expand, so the cancellation the open
+ *  depends on would go untested — and a card left expanded behind the task it opened is exactly
+ *  the side effect `EpicTaskCard` defers for. */
+function openTask(el: HTMLElement) {
+  fireEvent.click(el, { detail: 1 });
+  fireEvent.click(el, { detail: 2 });
+  fireEvent.doubleClick(el);
+}
 
 /** Open the epic the way a user does — by clicking its ROW — rather than by writing the store.
  *  Seeding the focus directly would skip the very state transition the card's presence depends on. */
@@ -108,18 +130,28 @@ describe("clicking a child task in the epics column", () => {
     expect(useUiStore.getState().epicFocusBySide.right).toBe(EPIC_ID);
   });
 
-  it("renders a pill for each child task", async () => {
+  it("renders a TASK CARD for each child task", async () => {
     await openTheEpic();
-    const labels = (await waitFor(() => taskPills())).map((p) => p.textContent);
-    expect(labels).toContain("Wire the rows");
-    expect(labels).toContain("Ship the rows");
+    const cards = await waitFor(() => {
+      const found = taskCards();
+      expect(found.length).toBeGreaterThan(0);
+      return found;
+    });
+    expect(cards.map((c) => c.getAttribute("data-bead-id"))).toEqual([TASK_ID, OTHER_TASK_ID]);
+    const text = screen.getByTestId("epic-task-cards").textContent ?? "";
+    expect(text).toContain("Wire the rows");
+    expect(text).toContain("Ship the rows");
+    // …AND THE ROW THEY REPLACED IS GONE. A removal nothing pins comes back; this is the surface
+    // the founder was looking at when he re-asked for it (bead sparkle-huw924.10).
+    expect(screen.queryAllByTestId("epics-bead-card-tasks-pill")).toHaveLength(0);
+    expect(screen.queryByTestId("epics-bead-card-build-agents")).toBeNull();
   });
 
   // ══ THE FOUNDER'S SENTENCE, BOTH HALVES, ON THE RENDERED TREE ════════════════════════════════
   it("narrows the build column to that task AND leaves the card on screen", async () => {
     await openTheEpic();
-    const pill = (await waitFor(() => taskPills())).find((p) => p.textContent === "Wire the rows")!;
-    fireEvent.click(pill);
+    await waitFor(() => expect(taskCards().length).toBeGreaterThan(0));
+    openTask(taskCardTitled("Wire the rows"));
 
     // The narrowing, read through the composition rule — `child ?? epic` is what the build column
     // actually renders from, so asserting the raw key alone would not prove the column moved.
@@ -134,19 +166,19 @@ describe("clicking a child task in the epics column", () => {
   // TRANSITION rather than a restatement.
   it("puts the side into Build, so the narrowing is visible and clearable", async () => {
     await openTheEpic();
-    const pill = (await waitFor(() => taskPills())).find((p) => p.textContent === "Wire the rows")!;
-    fireEvent.click(pill);
+    await waitFor(() => expect(taskCards().length).toBeGreaterThan(0));
+    openTask(taskCardTitled("Wire the rows"));
     expect(useUiStore.getState().workModeBySide.right).toBe("build");
   });
 
-  // RULE 2 FROM THE READER'S SIDE: the pill is its own off-switch, so pressing the same task again
+  // RULE 2 FROM THE READER'S SIDE: the gesture is its own off-switch, so pressing the same task again
   // hands the column back to the EPIC — not to everything — and the card is still open throughout.
   // That is what makes it a drill-DOWN rather than a jump.
   it("pressing the same task again returns the column to the epic, card still open", async () => {
     await openTheEpic();
-    const pill = (await waitFor(() => taskPills())).find((p) => p.textContent === "Wire the rows")!;
-    fireEvent.click(pill);
-    fireEvent.click(pill);
+    await waitFor(() => expect(taskCards().length).toBeGreaterThan(0));
+    openTask(taskCardTitled("Wire the rows"));
+    openTask(taskCardTitled("Wire the rows"));
 
     expect(useUiStore.getState().beadFocusBySide.right).toBeNull();
     expect(focusedBeadIdForSide(useUiStore.getState(), "right")).toBe(EPIC_ID);
@@ -157,9 +189,9 @@ describe("clicking a child task in the epics column", () => {
   // off and leave the column on the epic — the shape a naive "click clears then sets" would produce.
   it("moves between two child tasks without falling back to the epic", async () => {
     await openTheEpic();
-    const pills = await waitFor(() => taskPills());
-    fireEvent.click(pills.find((p) => p.textContent === "Wire the rows")!);
-    fireEvent.click(pills.find((p) => p.textContent === "Ship the rows")!);
+    await waitFor(() => expect(taskCards().length).toBeGreaterThan(0));
+    openTask(taskCardTitled("Wire the rows"));
+    openTask(taskCardTitled("Ship the rows"));
 
     expect(focusedBeadIdForSide(useUiStore.getState(), "right")).toBe(OTHER_TASK_ID);
     expect(card()).not.toBeNull();

@@ -39,18 +39,25 @@
  * `scripts/lib/epic-membership-guard.sh` fails CI on a second one. The only roster question asked
  * here is "which agents are bound to THIS bead", which is the worker↔bead edge, not the epic edge.
  */
-import { useCallback, useEffect, useRef } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useShallow } from "zustand/react/shallow";
 
 import { C } from "../theme/colors";
-import { FONT_UI, TYPE } from "../theme/scale";
-import { beadStage, type EpicChildView } from "../services/planView";
+import { FONT_UI, RADIUS, TYPE } from "../theme/scale";
+import {
+  beadStage,
+  epicChildViews,
+  groupEpicAgentsByTask,
+  type EpicAgentPill,
+  type EpicChildView,
+} from "../services/planView";
 import { DELIVERED_LABEL } from "../services/beads";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { stageMeta, stageLineColor, type WorkflowStageId } from "../engine/workflowStage";
 import { WorkflowLine } from "./WorkflowLine";
 import { EpicHealthSquare } from "./EpicHealthSquare";
-import { beadHealthLabel } from "../engine/beadHealth";
+import { beadHealthApplies, beadHealthLabel } from "../engine/beadHealth";
+import { useBeadHealthOf } from "../hooks/useEpicHealthOf";
 import type { EpicHealth } from "../engine/epicHealth";
 import type { AgentTab } from "../types";
 import type { Bead } from "../services/beads";
@@ -82,6 +89,92 @@ export interface EpicTaskCardProps {
   /** Double click — open this task on its own. Absent on a read-only mount, which leaves the card
    *  expandable but not openable rather than offering a gesture that does nothing. */
   onOpen?: (b: Bead) => void;
+  /**
+   * THE AGENTS ON THIS TASK, AS PILLS THAT CAN BE CLICKED.
+   *
+   * Absent, the chips fall back to {@link EpicChildView.workers} — the same NAMES this card has
+   * always drawn, now through the same renderer, so there is exactly one agent-chip treatment on
+   * this card rather than one per caller. Supplied, each chip carries the agent's ID as well, which
+   * is what {@link onOpenAgent} needs to reveal it.
+   *
+   * WHY A CALLER MAY WANT TO SUPPLY IT: the names in `row.workers` come from
+   * `planView.workersForBead`, which sees WORKERS bound to this exact bead. The epic card's own
+   * lineage resolves a wider set (orchestrators included, transitively), and the epics column hands
+   * that set down partitioned by task — see `planView.groupEpicAgentsByTask` — so the card can say
+   * WHICH agent is on WHICH task without either surface re-deriving epic membership.
+   */
+  agentPills?: readonly EpicAgentPill[];
+  /** Reveal a build agent — *"clicking one jumps to that agent, the same affordance the concierge
+   *  uses in chat."* Absent renders the chips as static text, the callback-is-the-switch convention
+   *  every other affordance here takes. */
+  onOpenAgent?: (agent: { agentId: string; projectId?: string }) => void;
+}
+
+/**
+ * ONE BUILD-AGENT CHIP — the single agent treatment on this surface.
+ *
+ * ══ THE FOUNDER'S HARD RULE, 2026-08-25 (bead sparkle-huw924.10) ══════════════════════════════
+ * *"I do want it to work exactly like the build agents, so that's the hard rule. The colors work
+ * the same between the two, and don't let any instruction ever override that."*
+ *
+ * So the ink is `C.tealInk` and the box is a hairline chip — literally what `BeadCard`'s
+ * `Build agents:` row paints for the same agent (`BeadLineageRows.pillStyle`, `ink = C.tealInk`)
+ * and what the `Workers` field paints for it (`BeadCard`, `color: C.tealInk`). ONE renderer here
+ * rather than one per call site, so a chip inside a task card and a chip in the unassigned group
+ * below it cannot drift into two colours.
+ */
+function AgentChip({
+  pill,
+  onOpen,
+}: {
+  pill: EpicAgentPill;
+  onOpen?: (agent: { agentId: string; projectId?: string }) => void;
+}) {
+  const interactive = onOpen !== undefined;
+  return (
+    <span
+      data-testid="epic-task-card-agent"
+      data-agent-id={pill.id}
+      title={pill.label}
+      role={interactive ? "button" : undefined}
+      tabIndex={interactive ? 0 : undefined}
+      onClick={
+        interactive
+          ? (e) => {
+              // THE CARD BODY IS THE EXPAND/OPEN TARGET, so a chip click must not ALSO toggle or
+              // open the task it sits inside — the same rule every interactive child of a card
+              // body takes in `BeadCard`.
+              e.stopPropagation();
+              onOpen?.({ agentId: pill.id, projectId: pill.projectId });
+            }
+          : undefined
+      }
+      onKeyDown={
+        interactive
+          ? (e) => {
+              if (e.key !== "Enter" && e.key !== " ") return;
+              e.preventDefault();
+              e.stopPropagation();
+              onOpen?.({ agentId: pill.id, projectId: pill.projectId });
+            }
+          : undefined
+      }
+      style={{
+        color: C.tealInk,
+        fontSize: 12,
+        border: `1px solid ${C.hairline}`,
+        borderRadius: RADIUS.input,
+        padding: "1px 7px",
+        maxWidth: "100%",
+        overflow: "hidden",
+        textOverflow: "ellipsis",
+        whiteSpace: "nowrap",
+        cursor: interactive ? "pointer" : "default",
+      }}
+    >
+      {pill.label}
+    </span>
+  );
 }
 
 export function EpicTaskCard({
@@ -91,8 +184,16 @@ export function EpicTaskCard({
   expanded,
   onToggleExpand,
   onOpen,
+  agentPills,
+  onOpenAgent,
 }: EpicTaskCardProps) {
   const { bead, workers } = row;
+  // ONE list, one renderer. A caller that knows the agents' IDS supplies them and its chips
+  // navigate; a caller that only has names gets the same chips, inert. Branching on the SHAPE of
+  // the data here rather than on the caller keeps a single agent treatment on this card — the
+  // founder's colour rule is a statement about that single treatment.
+  const chips: readonly EpicAgentPill[] =
+    agentPills ?? workers.map((name) => ({ id: name, label: name }));
   const workerIds = agents
     .filter((a) => a.kind === "worker" && a.beadId === bead.id)
     .map((a) => a.id);
@@ -197,23 +298,11 @@ export function EpicTaskCard({
           <div style={{ color: C.muted, fontSize: TYPE.small }}>
             {`Stage: ${stageMeta(stage).label}`}
           </div>
-          {workers.length > 0 ? (
+          {chips.length > 0 ? (
             <div style={{ display: "flex", flexWrap: "wrap", gap: 4, alignItems: "center" }}>
               <span style={{ color: C.muted, fontSize: TYPE.small }}>Build agents:</span>
-              {workers.map((name) => (
-                <span
-                  key={name}
-                  data-testid="epic-task-card-agent"
-                  style={{
-                    color: C.tealInk,
-                    fontSize: 12,
-                    border: `1px solid ${C.hairline}`,
-                    borderRadius: 4,
-                    padding: "1px 7px",
-                  }}
-                >
-                  {name}
-                </span>
+              {chips.map((pill) => (
+                <AgentChip key={pill.id} pill={pill} onOpen={onOpenAgent} />
               ))}
             </div>
           ) : (
@@ -221,6 +310,155 @@ export function EpicTaskCard({
               {NO_BUILD_AGENTS}
             </div>
           )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * What the fallback group is called on screen. Exported so a test asserts the SHIPPED string rather
+ * than a copy of it.
+ *
+ * It is deliberately NOT `Build agents:` — that was the label on the top-level row bead
+ * sparkle-huw924.10 deletes, and reusing it would re-create, one row lower, the very thing the
+ * founder asked to go away. This row means something narrower and says so: these agents are inside
+ * the epic and we cannot tell you which task they are on.
+ */
+export const UNASSIGNED_AGENTS_LABEL = "Not on a task:";
+
+/**
+ * AN EPIC'S TASKS, AS CARDS — one {@link EpicTaskCard} per direct child, each owning the build
+ * agents bound to it, plus the fallback group for the ones nothing can attribute.
+ *
+ * ══ THE FOUNDER'S RE-ASK, 2026-08-25 (bead sparkle-huw924.10) ═════════════════════════════════
+ * *"I had already previously asked that the build agents not show outside of the tasks — that the
+ * epic will surface the tasks. And I want the tasks to look more like they do in the Plan board
+ * cards."* Both halves are the same component: the Plan board's task card IS `EpicTaskCard`, and
+ * mounting it here is what makes the two surfaces one treatment rather than a third.
+ *
+ * `services/beads` already records what happens when they are not: this repo shipped three
+ * incompatible drawings of an epic (bead sparkle-xelans). A fourth is the thing to avoid, so the
+ * only new code here is the LIST — expansion state, the health lookup, and the fallback group.
+ *
+ * ══ NOTHING VANISHES — READ `planView.groupEpicAgentsByTask` FOR THE CONTRACT ═════════════════
+ * `spawn_build_agent` takes no epic parameter, so an orchestrator is normally bound to no bead and
+ * many workers are bound to nothing either. Under the row this replaces they were still NAMED. Any
+ * pill that matches no task on this card therefore lands in the fallback group below the cards —
+ * visible, and clickable, in exactly the chip treatment the task cards use.
+ *
+ * ══ WHY THE EXPANDED SET IS LOCAL STATE ══════════════════════════════════════════════════════
+ * The same reasoning `BoardView.EpicLiveStatus` records: it resets when the epic card closes, which
+ * is the behaviour asked for — expanding a task in place is a reading gesture, not a saved
+ * preference. Putting it in `uiStore` is the change to make when someone wants it to survive a
+ * close, and not before.
+ */
+export interface EpicTaskCardsProps {
+  /** The epic whose direct children become the cards. */
+  epicId: string;
+  /** The project's FULL bead snapshot, straight from the store — `childrenOf` walks a WeakMap-cached
+   *  index keyed on this array's IDENTITY, so a copy, slice or re-sort defeats the cache silently. */
+  allBeads: Bead[];
+  /** The project's agent roster. */
+  agents: AgentTab[];
+  /**
+   * The epic's RESOLVED build agents, from `engine/beadLineage.beadLineageOf(...).buildAgents`.
+   *
+   * Passed in rather than resolved here for the reason `BeadCardProps.lineage` records: epic
+   * membership has ONE owner (`scripts/lib/epic-membership-guard.sh` fails CI on a second), and the
+   * caller has already paid for it. Absent, the cards fall back to the names in
+   * `planView.epicChildViews` and NO fallback group is drawn — there is no wider set to have lost
+   * anything from.
+   */
+  buildAgents?: readonly EpicAgentPill[];
+  /** Open a task on its own — the double-click / Enter gesture. */
+  onOpenTask?: (b: Bead) => void;
+  /** Reveal a build agent. Absent renders every chip as static text. */
+  onOpenAgent?: (agent: { agentId: string; projectId?: string }) => void;
+}
+
+export function EpicTaskCards({
+  epicId,
+  allBeads,
+  agents,
+  buildAgents,
+  onOpenTask,
+  onOpenAgent,
+}: EpicTaskCardsProps) {
+  const rows = epicChildViews(allBeads, agents, epicId);
+  // ONCE FOR THE WHOLE LIST, never per card. `hooks/useEpicHealthOf`'s header states the reason:
+  // `rollupViewFor` buckets every worker by `parentId` on construction, so asking inside
+  // `EpicTaskCard` would rebuild that map once per child on every 5s poll. Called BEFORE the early
+  // return below, because a hook cannot sit after a conditional exit.
+  const beadHealthOf = useBeadHealthOf(agents);
+  const [expandedIds, setExpandedIds] = useState<ReadonlySet<string>>(() => new Set());
+  const toggleExpanded = useCallback((beadId: string) => {
+    setExpandedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(beadId)) next.delete(beadId);
+      else next.add(beadId);
+      return next;
+    });
+  }, []);
+
+  const grouped =
+    buildAgents === undefined
+      ? null
+      : groupEpicAgentsByTask({
+          buildAgents,
+          agents,
+          taskIds: rows.map((r) => r.bead.id),
+        });
+
+  // An epic with no tasks AND no strays draws nothing at all — the same rule `BeadLineageRows`
+  // rule 3 takes, and what keeps a still-decomposing epic free of an empty block.
+  if (rows.length === 0 && (grouped === null || grouped.unassigned.length === 0)) return null;
+
+  return (
+    <div
+      data-testid="epic-task-cards"
+      style={{ display: "flex", flexDirection: "column", gap: 6 }}
+    >
+      {rows.map((row) => (
+        <EpicTaskCard
+          key={row.bead.id}
+          row={row}
+          agents={agents}
+          /* FINISHED WORK GETS NO MARK — `beadHealthApplies` is where that is decided, the same
+             shape `EpicsColumn` uses for a terminal rung. A closed child sitting under a gray
+             square would read "nobody is working on this", which is true and useless; nothing
+             rendered cannot be mistaken for calm. */
+          health={beadHealthApplies(row.bead.status) ? beadHealthOf(row.bead.id) : null}
+          expanded={expandedIds.has(row.bead.id)}
+          onToggleExpand={toggleExpanded}
+          onOpen={onOpenTask}
+          agentPills={grouped === null ? undefined : (grouped.byTask.get(row.bead.id) ?? [])}
+          onOpenAgent={onOpenAgent}
+        />
+      ))}
+
+      {/* ── THE FALLBACK GROUP ────────────────────────────────────────────────────────────────
+          NOT BEHIND AN EXPAND, unlike a task card's agents: there is no task here to expand INTO,
+          and an affordance that hides a thing behind a gesture that has no subject is how the
+          agents got lost in the first place. Drawn only when there is something to draw. */}
+      {grouped !== null && grouped.unassigned.length > 0 && (
+        <div
+          data-testid="epic-unassigned-agents"
+          style={{
+            display: "flex",
+            flexWrap: "wrap",
+            gap: 4,
+            alignItems: "center",
+            padding: "6px 8px",
+            background: C.forest,
+            borderRadius: 6,
+            fontFamily: FONT_UI,
+          }}
+        >
+          <span style={{ color: C.muted, fontSize: TYPE.small }}>{UNASSIGNED_AGENTS_LABEL}</span>
+          {grouped.unassigned.map((pill) => (
+            <AgentChip key={pill.id} pill={pill} onOpen={onOpenAgent} />
+          ))}
         </div>
       )}
     </div>

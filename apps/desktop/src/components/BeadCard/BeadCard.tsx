@@ -328,6 +328,35 @@ export interface BeadCardProps {
    * adds the rest of the card, NOT more lineage — so nothing here keys on {@link collapsed}.
    */
   lineage?: BeadLineage;
+  /**
+   * A BLOCK THE SURFACE DRAWS WHERE THE LINEAGE ROWS SIT — inside the card's own border, directly
+   * under `Tasks:`/`Build agents:` and above the comment thread.
+   *
+   * ══ WHY THIS EXISTS, AND WHY IT IS NOT THE `chrome` ESCAPE HATCH THIS FILE FORBIDS ═══════════
+   * Bead sparkle-huw924.10: on an EPIC card the founder wants the tasks drawn as CARDS with their
+   * build agents nested inside them, replacing the truncated `Tasks:` pill row — *"the epic will
+   * surface the tasks… I want the tasks to look more like they do in the Plan board cards."* That
+   * block is a view of OTHER beads (and of the live agent roster), which is exactly the kind of
+   * thing this card must not reach for itself; the board's overlay already renders the same block
+   * as a SIBLING, and the only reason the Epics column cannot is that its card, not its frame,
+   * carries the border (item 19 — one border in the whole chain).
+   *
+   * So it is a slot the CALLER fills, like `goal`, `showStageLine` and `collapsed` before it — the
+   * surface supplies the content, the card never decides from where it is mounted. `chrome` is not
+   * consulted anywhere near it.
+   *
+   * SHOWN COLLAPSED AND EXPANDED, for the same reason the lineage rows are: it IS the lineage, in
+   * a richer drawing. Expansion adds the rest of the card, never more lineage.
+   *
+   * ══ A CONCIERGE CALLER MUST PASS PHRASING CONTENT ═══════════════════════════════════════════
+   * Today only `chrome === "epics"` fills this, and that card mounts inside an ordinary `<div>`, so
+   * a block-level node is safe there. The CONCIERGE chrome is not: it mounts inside `<Markdown>`'s
+   * `<p>`, where a `<div>` is invalid nesting that the parser "resolves" by reparenting the node out
+   * of the sentence that referenced it — the rule `BeadLineageRows`' header states at length. If
+   * this slot ever gets a concierge caller, what it passes has to be `<span>`s with an explicit
+   * `display`, not `<div>`s.
+   */
+  footer?: React.ReactNode;
   /** Jump to a task on the `Tasks:` row. Absent renders those pills as static text. */
   onOpenBead?: (beadId: string) => void;
   /** Jump to a build agent — the same affordance the concierge uses in chat. */
@@ -515,6 +544,7 @@ export function BeadCard({
   collapsed = false,
   onToggleCollapsed,
   lineage,
+  footer,
   onOpenBead,
   onOpenAgent,
   notice,
@@ -1444,6 +1474,12 @@ export function BeadCard({
           onOpenAgent={onOpenAgent}
         />
       )}
+
+      {/* ── THE SURFACE'S OWN BLOCK, WHERE THE LINEAGE SITS ──────────────────────────────────────
+          The Epics column fills this with the epic's TASK CARDS (bead sparkle-huw924.10); every
+          other surface passes nothing and renders nothing. Inside the card's border on purpose —
+          see `BeadCardProps.footer`. */}
+      {footer}
 
       {/* ── COMMENT THREAD + COMPOSE ─────────────────────────────────────────────────────────────
           The point of the whole feature: humans (and agents) comment on a bead instead of filing a
