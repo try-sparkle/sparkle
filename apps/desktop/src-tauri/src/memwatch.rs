@@ -259,6 +259,47 @@ pub struct LoadSample {
 /// that feeds it (see [`memory_admission`]), because an unmeasured machine is not a squeezed one.
 pub const LOAD_REFUSE_PER_CORE: f64 = 2.0;
 
+/// Where the run queue stops NARROWING and becomes a hard stop.
+///
+/// The two constants exist because one number could not carry two meanings, and collapsing them is
+/// what broke this gate (bead `sparkle-e57k99.1`). [`LOAD_REFUSE_PER_CORE`] used to be both the line
+/// at which the queue got an opinion AND the point at which it admitted nobody, because
+/// [`load_narrowed`] returned `in_use` — a ceiling equal to the count it is compared against. Every
+/// consumer refuses on `>=`, so `count >= count` is a tautology: past 2.0x the app admitted ZERO
+/// agents, at whatever fleet size happened to be running when the line was crossed. That is why the
+/// reported ceiling was never a constant — eight different values in one day (42, 62, 60, 53, 53,
+/// 50, 49, 49, 37, 20) were not a mistuned threshold, they were the fleet size printed in the slot
+/// where a ceiling belongs. No value of a single constant can fix that; only headroom can.
+///
+/// CALIBRATION, and it is a judgement stated rather than a measurement. This machine's NORMAL
+/// operating band with a healthy 20-50 agent fleet is 2.6x-5.9x per core, because agents spend most
+/// of their life blocked on a model round-trip — the assumption [`LOAD_REFUSE_PER_CORE`]'s own note
+/// says it made and that this box violates. The measured failure was 21.5x. 12.0 sits above the
+/// healthy band with margin and below the measured failure with margin, so the emergency stop still
+/// covers the incident that motivated this dimension while the healthy band is merely throttled.
+pub const LOAD_HARD_STOP_PER_CORE: f64 = 12.0;
+
+/// How many MORE agents a run queue that is already over [`LOAD_REFUSE_PER_CORE`] will still admit.
+///
+/// This is the term [`sampled_admission`] has and [`load_narrowed`] did not: `by_available` is
+/// `in_use + headroom` and collapses to `in_use` only at [`PressureLevel::Critical`], which is what
+/// makes it a CAPACITY rather than a census. Without any headroom term the load dimension sat at
+/// `Critical` semantics unconditionally from the moment it got an opinion.
+///
+/// A TRICKLE, NOT A QUANTITY — the objection in [`load_narrowed`]'s note still stands: there is no
+/// honest way to say a load of 4.0/core "fits two more agents", so this does not pretend to compute
+/// one. It returns 1: while the queue is deep the fleet may still GROW, one agent per sample, so a
+/// deep queue slows the ramp instead of latching it shut. At [`LOAD_HARD_STOP_PER_CORE`] it returns
+/// 0 and the old hold-at-`in_use` behaviour is exactly recovered — deliberately, because that is the
+/// shape the 21.5x measurement justified.
+fn load_headroom(per_core: f64) -> u32 {
+    if per_core >= LOAD_HARD_STOP_PER_CORE {
+        0
+    } else {
+        1
+    }
+}
+
 /// The seam for the load reading, so the narrowing below is unit-tested without a real machine.
 pub trait LoadSampler: Send + Sync {
     fn sample(&self) -> Option<LoadSample>;
@@ -330,11 +371,19 @@ fn load_sampler() -> &'static dyn LoadSampler {
 /// narrow rather than refusing every spawn on a machine we simply could not read. Failing the other
 /// way would turn an unreadable load average into a fleet-wide outage.
 ///
-/// A RATE, NOT A QUANTITY — so this hard-stops rather than computing headroom. `sampled_admission`
-/// can say "available ÷ per-agent = room for N more" because bytes divide into agent-sized pieces.
-/// A run queue does not: there is no honest way to say a load of 4.0/core "fits two more agents".
-/// So the answer is binary and the number it returns is `in_use` — hold the line at what is already
-/// running, and let the queue drain.
+/// A RATE, NOT A QUANTITY — so this does not compute headroom the way `sampled_admission` does.
+/// That one can say "available ÷ per-agent = room for N more" because bytes divide into agent-sized
+/// pieces. A run queue does not: there is no honest way to say a load of 4.0/core "fits two more
+/// agents". What it returns instead is `in_use` plus a TRICKLE (see [`load_headroom`]) — the fleet
+/// may still grow, one agent per sample, so a deep queue slows the ramp rather than latching it.
+///
+/// IT MUST NEVER RETURN `in_use` ITSELF BELOW THE HARD STOP, and that is the whole bug this shape
+/// exists to prevent (bead `sparkle-e57k99.1`). Every consumer of `effective` refuses on `>=`
+/// against a count that is `in_use` or larger, so a ceiling equal to `in_use` is a tautology — not a
+/// narrowing that admits fewer, a stop that admits none, permanently, at whatever fleet size was
+/// running when the line was crossed. Retuning [`LOAD_REFUSE_PER_CORE`] cannot fix that; it only
+/// changes how often the tautology is reached. Above [`LOAD_HARD_STOP_PER_CORE`] the collapse to
+/// `in_use` is deliberate and is the emergency the 21.5x measurement justified.
 ///
 /// Floored at 1 for the identical reason [`sampled_admission`] floors: a ceiling of zero deadlocks
 /// the orchestrator instead of degrading it, and a user on a busy machine must still be able to
@@ -348,21 +397,33 @@ pub fn load_narrowed(in_use: u32, sample: Option<&LoadSample>) -> Option<u32> {
     if !per_core.is_finite() || per_core < LOAD_REFUSE_PER_CORE {
         return None;
     }
-    Some(in_use.max(1))
+    Some(in_use.max(1).saturating_add(load_headroom(per_core)))
 }
 
 /// The sentence a human reads when the run queue is what stood in their way. Composed next to the
 /// number it explains, for the same reason every other basis here is.
 fn load_basis(in_use: u32, s: &LoadSample) -> String {
-    format!(
-        "refused: the CPU run queue is {:.1} deep across {} cores ({:.1}× per core, refusing past \
-         {:.1}×) — the {in_use} agent(s) already running are contending for the cores, so another \
-         would finish everything later rather than sooner",
-        s.load1,
-        s.cores,
-        s.load1 / f64::from(s.cores.max(1)),
-        LOAD_REFUSE_PER_CORE,
-    )
+    let per_core = s.load1 / f64::from(s.cores.max(1));
+    // TWO SENTENCES, because there are now two behaviours and a message that describes the wrong one
+    // is an instruction the user will act on. Below the hard stop the fleet still grows one agent per
+    // sample, so telling a human "no more" there sends them to close something that did not need
+    // closing; at the hard stop it really is no more. `load_headroom` is the single source of which
+    // regime we are in, so the copy cannot drift from the arithmetic.
+    if load_headroom(per_core) == 0 {
+        format!(
+            "refused: the CPU run queue is {:.1} deep across {} cores ({per_core:.1}× per core, hard \
+             stop past {:.1}×) — the {in_use} agent(s) already running are contending for the cores, \
+             so another would finish everything later rather than sooner",
+            s.load1, s.cores, LOAD_HARD_STOP_PER_CORE,
+        )
+    } else {
+        format!(
+            "throttled: the CPU run queue is {:.1} deep across {} cores ({per_core:.1}× per core, \
+             throttling past {:.1}×) — the {in_use} agent(s) already running are contending for the \
+             cores, so the fleet is growing one at a time until the queue drains",
+            s.load1, s.cores, LOAD_REFUSE_PER_CORE,
+        )
+    }
 }
 
 // ============================== admission ==============================
@@ -539,6 +600,21 @@ pub struct ConcurrencyAdmission {
     pub basis: String,
     pub sampled: bool,
     pub sample: Option<MemorySample>,
+    /// How many MORE agents the run queue will admit on top of the `in_use` this was computed from
+    /// — 0 when it is not narrowing at all, 0 at the hard stop, and [`load_headroom`]'s trickle in
+    /// between.
+    ///
+    /// IT IS CARRIED RATHER THAN RE-DERIVED, and that is the point (bead `sparkle-e57k99.1`). The
+    /// consumers cannot recover it from `effective`: subtracting a count of their own means
+    /// subtracting a DIFFERENT population than the `in_use` this number was built on
+    /// (`orchestrationListener.globalUsedSlots` counts workers only; `localAgentCapacity` counts
+    /// rows, not residents), and mixing those populations is precisely how a rate's "hold at what is
+    /// running" became `count >= count` — a permanent refusal wearing a ceiling's clothes. A regime
+    /// the frontend must not get wrong is therefore stated on the wire, not inferred from it.
+    ///
+    /// `0` IS THE SAFE DIRECTION for a payload that predates this field: it reads as the hard stop,
+    /// which refuses. A missing field must never be able to admit more than was measured.
+    pub load_headroom: u32,
 }
 
 /// Compose the static derivation with a runtime sample. Pure — the caller supplies both.
@@ -560,8 +636,8 @@ pub fn sampled_concurrency(
     // `effective <= static_max` still holds by construction.
     //
     // A REFUSAL IS NOT THE SAME QUESTION AS "WHICH NUMBER IS SMALLEST" (bead `sparkle-iyxxin`).
-    // `by_load` is `Some` exactly when the run queue REFUSED — it is a rate, and its number is only
-    // ever "hold at what is already running". The first version of this asked `l < a.admitted`
+    // `by_load` is `Some` exactly when the run queue got an OPINION — it is a rate, and its number is
+    // only ever "what is already running, plus a trickle" (zero trickle at the hard stop). The first version of this asked `l < a.admitted`
     // instead, which is a question about two NUMBERS, and the two come apart the moment `in_use`
     // sits at or above the static ceiling — the normal state of a machine carrying a
     // `[workers].max_concurrent` pin. There the hold-at-`in_use` ceiling lands ABOVE the static cap,
@@ -572,6 +648,13 @@ pub fn sampled_concurrency(
     // this dimension was added to close, surviving inside it.
     let by_load = load_narrowed(in_use, load);
     let effective = by_load.map_or(a.admitted, |l| a.admitted.min(l));
+    // The regime, stated rather than left to be re-derived downstream — see the field's own note.
+    // `None` (the queue has no opinion) and the hard stop both report 0; only the trickle reports
+    // headroom, so a consumer that reads "> 0" is asking exactly "is this a throttle rather than a
+    // stop", which is the one question the wire could not previously answer.
+    let load_headroom = load
+        .filter(|_| by_load.is_some())
+        .map_or(0, |s| self::load_headroom(s.load1 / f64::from(s.cores.max(1))));
 
     // WHO GETS TO EXPLAIN IT, with the tie rule kept but stated in terms of what it actually meant:
     // memory wins a tie only when memory ITSELF narrowed. A tie was always "both dimensions
@@ -589,6 +672,7 @@ pub fn sampled_concurrency(
 
     ConcurrencyAdmission {
         effective,
+        load_headroom,
         static_max,
         static_bound,
         bound: match (narrowed, load_binds) {
@@ -1886,10 +1970,110 @@ mod tests {
         let just_under = LoadSample { load1: (LOAD_REFUSE_PER_CORE - 0.01) * f64::from(cores), cores };
         let just_over = LoadSample { load1: LOAD_REFUSE_PER_CORE * f64::from(cores), cores };
         assert_eq!(load_narrowed(69, Some(&just_under)), None, "below the line: no opinion");
-        assert_eq!(load_narrowed(69, Some(&just_over)), Some(69), "at the line: refuse");
+        assert_eq!(
+            load_narrowed(69, Some(&just_over)),
+            Some(70),
+            "at the line: THROTTLE — one more than what is running, not a hold at it"
+        );
         // …and it reaches the composed answer, not just the predicate.
         let c = sampled_concurrency(81, Bound::Ram, "RAM-bound: …", 69, PER_AGENT, Some(&mem), Some(&just_under));
         assert_eq!(c.effective, 81);
+    }
+
+    #[test]
+    fn a_throttling_run_queue_never_returns_a_ceiling_equal_to_the_count_it_is_compared_against() {
+        // THE REGRESSION (bead `sparkle-e57k99.1`). Every consumer of `effective` refuses on `>=`
+        // against a count that is `in_use` or larger, so a ceiling of exactly `in_use` admits ZERO
+        // — permanently, at whatever fleet size was running when the line was crossed. Asserting
+        // `> in_use` rather than a specific number is the point: it is the property the consumers
+        // depend on, and it cannot be satisfied by the code as it was.
+        //
+        // Swept across the whole throttling band and across fleet sizes, because the old code was
+        // wrong for EVERY value of both and a single-point test would leave that unpinned.
+        let cores = 18u32;
+        for tenths in 20..120 {
+            let per_core = f64::from(tenths) / 10.0;
+            let s = LoadSample { load1: per_core * f64::from(cores), cores };
+            for in_use in [0u32, 1, 20, 69, 200] {
+                let got = load_narrowed(in_use, Some(&s))
+                    .unwrap_or_else(|| panic!("{per_core}x is over the line and must have an opinion"));
+                assert!(
+                    got > in_use,
+                    "{per_core}x with {in_use} running returned {got} — a ceiling at or below the \
+                     count is a hard stop, not a narrowing"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_hard_stop_still_holds_the_line_at_what_is_already_running() {
+        // The PAIRED case, and the reason the throttle above is not simply "the gate stopped
+        // gating": past `LOAD_HARD_STOP_PER_CORE` the old hold-at-`in_use` behaviour is recovered
+        // exactly, which is what the 21.5x measurement justified.
+        let cores = 18u32;
+        let at = LoadSample { load1: LOAD_HARD_STOP_PER_CORE * f64::from(cores), cores };
+        let past = LoadSample { load1: 21.5 * f64::from(cores), cores };
+        let under = LoadSample { load1: (LOAD_HARD_STOP_PER_CORE - 0.1) * f64::from(cores), cores };
+        assert_eq!(load_narrowed(69, Some(&at)), Some(69), "at the hard stop: hold");
+        assert_eq!(load_narrowed(69, Some(&past)), Some(69), "past it: hold");
+        assert_eq!(load_narrowed(69, Some(&under)), Some(70), "just under it: still a trickle");
+        // The floor survives the change: a loaded box with nothing running still admits one.
+        assert_eq!(load_narrowed(0, Some(&past)), Some(1), "the first agent is always admissible");
+    }
+
+    #[test]
+    fn the_basis_sentence_says_which_of_the_two_regimes_the_reading_is_in() {
+        // User-facing copy is code: a message that describes the wrong regime is an instruction the
+        // user acts on. Below the hard stop "no more" would send someone to close an agent that did
+        // not need closing.
+        let cores = 18u32;
+        let mem = roomy();
+        let throttling = LoadSample { load1: 5.9 * f64::from(cores), cores };
+        let stopped = LoadSample { load1: 21.5 * f64::from(cores), cores };
+
+        let t = sampled_concurrency(81, Bound::Ram, "RAM-bound: …", 69, PER_AGENT, Some(&mem), Some(&throttling));
+        assert_eq!(t.effective, 70, "this box's NORMAL band throttles rather than stopping");
+        assert_eq!(t.bound, Bound::Load, "and load is still named as what bound it");
+        assert!(t.basis.starts_with("throttled:"), "throttling says so: {}", t.basis);
+        assert!(!t.basis.contains("finish everything later"), "not the hard-stop sentence: {}", t.basis);
+
+        let h = sampled_concurrency(81, Bound::Ram, "RAM-bound: …", 69, PER_AGENT, Some(&mem), Some(&stopped));
+        assert_eq!(h.effective, 69, "the emergency still holds the line");
+        assert!(h.basis.starts_with("refused:"), "the hard stop says so: {}", h.basis);
+        assert!(h.basis.contains("hard stop past"), "and names the line it crossed: {}", h.basis);
+    }
+
+    #[test]
+    fn the_regime_crosses_the_wire_as_headroom_because_the_frontend_cannot_re_derive_it() {
+        // `load_headroom` is the field the two frontend gates read to tell a throttle from a stop.
+        // They cannot recompute it: each counts a DIFFERENT population than the `in_use` this was
+        // built on, and mixing those populations is the whole defect (bead `sparkle-e57k99.1`). So
+        // the value has to be right on the wire, in all three regimes.
+        let mem = roomy();
+        let cores = 18u32;
+        let calm = LoadSample { load1: 0.5 * f64::from(cores), cores };
+        let throttling = LoadSample { load1: 5.9 * f64::from(cores), cores };
+        let stopped = LoadSample { load1: 21.5 * f64::from(cores), cores };
+
+        let no_opinion = sampled_concurrency(81, Bound::Ram, "…", 69, PER_AGENT, Some(&mem), Some(&calm));
+        assert_eq!(no_opinion.load_headroom, 0, "a healthy queue grants nothing because it took nothing");
+
+        let t = sampled_concurrency(81, Bound::Ram, "…", 69, PER_AGENT, Some(&mem), Some(&throttling));
+        assert_eq!(t.load_headroom, 1, "throttling: the fleet may still grow");
+
+        let h = sampled_concurrency(81, Bound::Ram, "…", 69, PER_AGENT, Some(&mem), Some(&stopped));
+        assert_eq!(h.load_headroom, 0, "hard stop: it may not");
+
+        let none = sampled_concurrency(81, Bound::Ram, "…", 69, PER_AGENT, Some(&mem), None);
+        assert_eq!(none.load_headroom, 0, "no reading at all is not a grant either");
+
+        // AND IT IS DISTINGUISHABLE FROM `bound`, which is the pair that matters: a consumer reading
+        // `bound == Load` alone cannot tell the two refusing regimes apart, and reading headroom
+        // alone cannot tell "throttling" from "no opinion". Both fields, or the frontend is guessing.
+        assert_eq!(t.bound, Bound::Load);
+        assert_eq!(h.bound, Bound::Load);
+        assert_ne!(no_opinion.bound, Bound::Load, "a calm queue does not claim to bind");
     }
 
     #[test]

@@ -286,18 +286,37 @@ function globalGateBinds(): boolean {
   // A SATURATED RUN QUEUE REFUSES OUTRIGHT rather than through the count, and the asymmetry with the
   // memory bounds is deliberate. The memory dimensions are QUANTITIES: `effective` is a genuine
   // "this many fit", so comparing a count against it is meaningful. `Bound::Load` is a RATE, and its
-  // `effective` is just `in_use` — the agents already running, counted over a DIFFERENT population
-  // than `globalUsedSlots()` (which counts `kind === "worker"` only; see the unresolved mismatch
+  // `effective` is `in_use` plus a trickle — counted over a DIFFERENT population than
+  // `globalUsedSlots()` (which counts `kind === "worker"` only; see the unresolved mismatch
   // documented above and in bead `sparkle-dv65b`). Comparing a worker-only count against a
   // whole-fleet `in_use` would silently under-bind — 40 workers against an `in_use` of 69 admits
   // more workers onto a machine at 21.5x per-core load, which is the exact spawn this bound exists
-  // to refuse. So when the run queue is what binds, the answer is "no more", read off the DIMENSION
-  // rather than off two counts that do not mean the same thing.
+  // to refuse. So the run queue's verdict is read off the DIMENSION rather than off two counts that
+  // do not mean the same thing.
+  //
+  // WHICH VERDICT, THOUGH — and reading it as an unconditional "no more" was half of bead
+  // `sparkle-e57k99.1`. `> 0` refuses every worker but the first from the moment per-core load
+  // crosses 2.0x, and this machine's NORMAL band with a healthy fleet is 2.6x-5.9x, so the gate was
+  // shut essentially always: one worker machine-wide, on a box whose static ceiling is 81. The
+  // dimension now distinguishes two regimes and this must not flatten them back. `load_headroom`
+  // is what separates them and it arrives ON THE WIRE, stated by the side that owns the threshold:
+  // above zero is a THROTTLE (the fleet may still grow, one per sample), zero is the HARD STOP.
+  //
+  // Deliberately NOT re-derived here as `effective` minus some count of this module's own: every
+  // count on this side is a different population than the `in_use` the ceiling was built on — this
+  // gate's is workers only — and spending a whole-fleet allowance against a worker-only count is the
+  // dimensional error the paragraph above warns about. An absent field reads as 0, i.e. refuses.
   //
   // `globalUsedSlots() > 0` keeps the "you can always start the first one" floor that
   // `load_narrowed` establishes on the Rust side: a loaded-but-worker-less box still admits one, so
   // a busy machine can never present as an app that refuses everything.
-  if (admission.bound === "load") return globalUsedSlots() > 0;
+  if (admission.bound === "load") {
+    if ((admission.load_headroom ?? 0) <= 0) return globalUsedSlots() > 0;
+    // Throttling, not stopping: the run queue has no worker-denominated ceiling to offer here, so
+    // the static cap governs and the queue's opinion is carried by the basis sentence a refusal
+    // quotes.
+    return globalUsedSlots() >= staticCap;
+  }
 
   const narrowed = Math.max(1, Math.min(staticCap, Math.floor(admission.effective)));
   return globalUsedSlots() >= narrowed;

@@ -50,6 +50,16 @@ function seedMachine(agentCount: number): void {
   } as never);
 }
 
+/** A machine where `live` is a STRICT subset of `used`: `rows` local build rows, only the first
+ *  `resident` of them open in this window. `seedMachine` opens every row, so it cannot express the
+ *  population split the run-queue bug lives in. */
+function seedDormant(rows: number, resident: number): void {
+  seedMachine(rows);
+  useRuntimeStore.setState({
+    openAgentIds: Array.from({ length: resident }, (_, i) => `a${i}`),
+  } as never);
+}
+
 function admission(over: Partial<ConcurrencyAdmission> = {}): ConcurrencyAdmission {
   return {
     effective: 3,
@@ -106,6 +116,8 @@ describe("localAgentCapacity — the static baseline (unchanged behavior)", () =
 describe("localAgentCapacity — narrowed by the live CPU run queue", () => {
   const LOAD_BASIS =
     "refused: the CPU run queue is 387.0 deep across 18 cores (21.5× per core, refusing past 2.0×)";
+  const THROTTLE_BASIS =
+    "throttled: the CPU run queue is 47.0 deep across 18 cores (2.6× per core, throttling past 2.0×)";
 
   it("applies a run-queue narrowing that carries NO memory sample at all", async () => {
     // THE REGRESSION THIS FILE EXISTS TO PIN (roborev 68367, High). The Rust `sample_now()` forks
@@ -139,6 +151,61 @@ describe("localAgentCapacity — narrowed by the live CPU run queue", () => {
     expect(cap.atCapacity).toBe(true);
     expect(cap.basis).toBe(LOAD_BASIS);
     expect(cap.limit).toBe(STATIC_LIMIT); // still never RAISED — the min holds
+  });
+
+  it("ADMITS while the run queue is only throttling, even with dormant rows in the count", async () => {
+    // ── THE HARD-STOP REGRESSION (bead `sparkle-e57k99.1`) ────────────────────────────────────
+    //
+    // The run-queue ceiling is computed FROM the live count this module sends, so it is denominated
+    // in RESIDENT agents, while the gate compares ROWS. `live` is a strict subset of `used`, so
+    // `used >= min(static, effective)` was a tautology: past 2.0x per core the machine admitted
+    // ZERO, permanently, at whatever fleet size was running when the line was crossed.
+    //
+    // The setup makes the two populations DIFFER, which is what the old arithmetic needed to be
+    // caught: 5 rows, 3 of them resident (2 sit in a project tab this window never opened). A
+    // throttling reading grants one on top of the residents — `effective = live + 1 = 4`. Under the
+    // old code `limit` became `min(12, 4) = 4` and `used(5) >= 4` refused; the fleet could never
+    // grow again. It must now admit, because the queue said "one more", not "no more".
+    seedDormant(5, 3);
+    expect(localAgentCapacity().atCapacity).toBe(false); // baseline: not already refusing
+
+    await sample({
+      effective: 4,
+      load_headroom: 1, // the trickle: one more on top of the 3 residents the reading was built on
+      bound: "load",
+      basis: THROTTLE_BASIS,
+      sample: null,
+      sampled: true,
+    });
+
+    const cap = localAgentCapacity();
+    expect(cap.used).toBe(5);
+    expect(cap.live).toBe(3);
+    expect(cap.atCapacity).toBe(false); // ← the tautology is gone
+    expect(cap.limit).toBe(6); // the headroom of 1 carried across to rows: used + 1
+    expect(cap.basis).toBe(THROTTLE_BASIS); // and the run queue still explains the ceiling
+  });
+
+  it("REFUSES on the same fleet when the run queue is at its hard stop", async () => {
+    // THE PAIRED CASE, and the reason the test above is not "the gate stopped gating". Identical
+    // fleet, identical population split; the only difference is that the reading grants no headroom
+    // (`effective === live`), which is what the Rust side returns past `LOAD_HARD_STOP_PER_CORE`.
+    // Without this pair, a gate that simply always admitted would pass the test above.
+    seedDormant(5, 3);
+
+    await sample({
+      effective: 3,
+      load_headroom: 0, // the hard stop: no room on top of what is already resident
+      bound: "load",
+      basis: LOAD_BASIS,
+      sample: null,
+      sampled: true,
+    });
+
+    const cap = localAgentCapacity();
+    expect(cap.atCapacity).toBe(true);
+    expect(cap.limit).toBe(5); // held at the rows already taken — no sixth
+    expect(cap.basis).toBe(LOAD_BASIS);
   });
 
   it("leaves the static basis alone when the same non-narrowing reading is a MEMORY one", async () => {

@@ -180,7 +180,36 @@ export function localAgentCapacity(): CapacityReading {
   const admission = currentMemoryAdmission();
   if (admission && admission.sampled) {
     const narrowed = Math.max(1, Math.min(staticLimit, Math.floor(admission.effective)));
-    if (narrowed < staticLimit) {
+    if (admission.bound === "load") {
+      // ── THE LOAD CEILING IS IN A DIFFERENT POPULATION THAN THE COMPARISON (bead
+      // `sparkle-e57k99.1`) ─────────────────────────────────────────────────────────────────────
+      //
+      // Every other number here is a machine CAPACITY — "this many agents fit" — so comparing rows
+      // against it is sound, and the deliberate asymmetry documented on `pollMemoryAdmission`
+      // (ask in residents, enforce in rows) is what makes a dormant row refuse before it becomes
+      // resident one click later. The run-queue number is not that. It is computed FROM the live
+      // count we sent (`in_use` + a trickle), so it is denominated in RESIDENT agents. Taking
+      // `min(staticLimit, effective)` and comparing `used` against it silently mixed the two, and
+      // because `live` is a strict subset of `used` — both come from the same walk in
+      // `localAgentRowIds`, where every id pushed to `live` was already pushed to `used` — the
+      // result was `used >= live`, which is a TAUTOLOGY. Past 2.0x per core this admitted ZERO
+      // agents, permanently, at whatever fleet size was running when the line was crossed. The
+      // eight different "limits" reported in one day (42, 62, 60, 53, 53, 50, 49, 49, 37, 20) were
+      // never a ceiling; they were the live count at refusal time.
+      //
+      // So carry the HEADROOM across rather than the number: whatever room the run queue grants on
+      // top of the residents, grant on top of the rows. `used >= limit` stays the single comparison
+      // every consumer and every message already reads, `live`-vs-`used` never enters it, and the
+      // two regimes fall out of the arithmetic — a trickle admits one more per sample, and the hard
+      // stop (zero headroom) still refuses outright.
+      //
+      // The headroom is READ OFF THE WIRE rather than recovered as `effective - live`. The two are
+      // equal in production, since `pollMemoryAdmission` sends exactly this `live` as `in_use` — but
+      // only by a coupling across a process boundary that nothing checks, and the whole defect here
+      // was a number meaning one population being spent against another.
+      const headroom = Math.max(0, Math.floor(admission.load_headroom ?? 0));
+      limit = Math.max(1, Math.min(staticLimit, used + headroom));
+    } else if (narrowed < staticLimit) {
       limit = narrowed;
     }
     // Take the sampled basis ONLY when something actually refused, so the refusal names memory
@@ -194,8 +223,8 @@ export function localAgentCapacity(): CapacityReading {
     // `staticLimit`, the number-based guard above discards it, and the refusal that DOES happen
     // (`used >= limit`) then cites the static ceiling. That tells a human at 21.5x per-core load to
     // think about hardware they cannot change, when the answer is to wait for the queue to drain.
-    // Note this can only ever fire while at capacity: `narrowed >= staticLimit` requires the
-    // resident count to be at least `staticLimit`, and `used >= live` always.
+    // `used >= live` always (see the load block above), which is why the load dimension may NOT be
+    // enforced through `narrowed` — it is kept here only for the sentence a human reads.
     if (narrowed < staticLimit || admission.bound === "load") {
       basis = admission.basis?.trim() || basis;
     }

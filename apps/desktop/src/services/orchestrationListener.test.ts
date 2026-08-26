@@ -711,6 +711,56 @@ describe("orchestrationListener", () => {
     expect(spawnWorkerMock).toHaveBeenCalledTimes(3);
   });
 
+  it("ADMITS a worker while the run queue is only THROTTLING, not at its hard stop (sparkle-e57k99.1)", async () => {
+    // THE OTHER HALF OF THE HARD STOP. The test above pins the 21.5x emergency; this pins the band
+    // the founder's machine actually lives in. `bound === "load"` used to mean an unconditional
+    // `globalUsedSlots() > 0` — every worker but the FIRST refused, machine-wide, from the moment
+    // per-core load crossed 2.0x. This box's normal band with a healthy fleet is 2.6x-5.9x, so the
+    // gate was shut essentially always: one worker against a static ceiling of 81.
+    //
+    // The discriminator is `load_headroom`, and it is the ONLY thing that differs from the fixture
+    // above — same bound, same `sampled`, same absent memory sample, a roomy static cap and a live
+    // worker already running. If this admits and that refuses, the branch is reading the regime and
+    // not the dimension.
+    useSettingsStore.setState({ maxConcurrentWorkers: 20, effectiveMaxConcurrentWorkers: 20 });
+
+    admissionReading = null;
+    fire({ reqId: "t0", op: "spawn_worker", buildAgentId: buildId, projectId, payload: { task: "ok" } });
+    await flush();
+    expect(spawnWorkerMock).toHaveBeenCalledTimes(1); // one worker is now live
+
+    admissionReading = {
+      effective: 9,
+      load_headroom: 1, // ← throttling: the queue is deep but the fleet may still grow
+      static_max: 20,
+      static_bound: "cpu",
+      bound: "load",
+      basis:
+        "throttled: the CPU run queue is 47.0 deep across 18 cores (2.6× per core, throttling past 2.0×)",
+      sampled: true,
+      sample: null,
+    };
+    fire({ reqId: "t1", op: "spawn_worker", buildAgentId: buildId, projectId, payload: { task: "more" } });
+    await flush();
+    expect(spawnWorkerMock).toHaveBeenCalledTimes(2); // ← admitted; under the old branch it was held
+
+    // …and the hard stop on the SAME fleet still refuses, so this is not "the gate stopped gating".
+    admissionReading = { ...admissionReading, load_headroom: 0, basis: "refused: … hard stop past 12.0×" };
+    invokeMock.mockClear();
+    fire({ reqId: "t2", op: "spawn_worker", buildAgentId: buildId, projectId, payload: { task: "no" } });
+    await flush();
+    expect(spawnWorkerMock).toHaveBeenCalledTimes(2); // held
+    expect(invokeMock).not.toHaveBeenCalled(); // reply deferred until the queue drains
+
+    // DRAIN BEFORE LEAVING, exactly as the test above does. A deferred reply is listener state that
+    // outlives the test that queued it, and leaving one behind makes the NEXT test's spawn look
+    // refused — which is a failure in a file nobody edited, blamed on the wrong change.
+    admissionReading = null;
+    fire({ reqId: "t3", op: "spawn_worker", buildAgentId: buildId, projectId, payload: { task: "again" } });
+    await flush();
+    expect(spawnWorkerMock).toHaveBeenCalledTimes(4); // the held t2 released, plus t3
+  });
+
   it("counts workers MACHINE-WIDE against the RAM cap, not per build agent (sparkle-hfhs)", async () => {
     // The dimensional error behind the 33 GiB coalition. `ram_derived_concurrency` (config.rs)
     // divides the MACHINE's RAM into a machine-wide budget, but this gate applied that budget

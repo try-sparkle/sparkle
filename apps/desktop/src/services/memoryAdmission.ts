@@ -43,6 +43,16 @@ export interface ConcurrencyAdmission {
   bound: ConcurrencyBound;
   /** One human sentence, composed in Rust next to the number it explains so the two can't drift. */
   basis: string;
+  /** How many MORE agents the run queue will admit on top of the `in_use` that was sent — 0 when it
+   *  is not narrowing, 0 at its hard stop, and a small trickle in between. Read it to tell a
+   *  THROTTLE from a STOP; do not try to recover it by subtracting a count of your own, because
+   *  every count on this side is a different population than the `in_use` it was built on, and
+   *  mixing those is what made a rate's ceiling equal the number it is compared against (bead
+   *  `sparkle-e57k99.1`).
+   *
+   *  OPTIONAL, DEFAULTING TO 0, for a payload that predates the field: 0 reads as the hard stop,
+   *  which refuses. A missing field must never admit more than was measured. */
+  load_headroom?: number;
   /** False when nothing could be measured. A `false` here must narrow NOTHING — see the note on
    *  the null cache above; an unmeasured machine is not a squeezed one. */
   sampled: boolean;
