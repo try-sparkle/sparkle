@@ -24,7 +24,7 @@ import {
   type EpicHealth,
 } from "./epicHealth";
 import { EPIC_LADDER } from "../services/epicBoard";
-import { bandOfRollup, type RollupDot } from "./workerRollup";
+import { bandOfRollup, rollupDot, type RollupDot } from "./workerRollup";
 import type { AgentTabStatus } from "../types";
 
 function agent(
@@ -110,6 +110,49 @@ describe("PARITY — the square is the build row's dot, drawn as a square", () =
     // Blue keeps its own colour rather than being recoloured to match its band's neighbours.
     expect(bandOfRollup("blue")).toBe("questions");
     expect(markOf(agent("a", "blue"))).toBe("blue");
+  });
+
+  // ── THE FORK GUARD — `epicHealth` MEASURED AGAINST `rollupDot` ITSELF ─────────────────────────
+  //
+  // `markOf` being the identity pins the PER-AGENT half of the hard rule. It says nothing about the
+  // FOLD, which is where a divergence would actually hide: someone reorders the mixed test, or adds
+  // an early return on red, or decides an epic full of questions should read amber, and every test
+  // above still passes because each one only ever inspects `epicHealth`'s own answers.
+  //
+  // So this one asserts the two derivations against EACH OTHER. `rollupDot` is what a BUILD ROW
+  // paints for a head with those workers under it; `epicHealth` is what an EPIC ROW paints for the
+  // same fleet bound to it. The founder, 2026-08-22, verbatim: *"The colors work the same between
+  // the two and don't let any instruction ever override that."* If those two functions ever
+  // disagree on any fleet, they have forked — and that is the sentence this reds on.
+  //
+  // The head is `idle` on purpose: it contributes nothing of its own, so the comparison is about
+  // the fold and not about a head status an epic has no analogue for. (`unmerged` is excluded for
+  // the same reason — `rollupDot` has an explicit own-status arm for it, and an epic has no "own
+  // status" to put there.)
+  it("agrees with `rollupDot` on EVERY fleet shape — the two derivations cannot fork", () => {
+    // One status per band, so the cross-product below covers every arm of the law.
+    const BY_BAND: readonly AgentTabStatus[] = ["working", "questions", "blocked", "idle"];
+    const fleets: AgentTabStatus[][] = [[]];
+    let frontier: AgentTabStatus[][] = [[]];
+    for (let depth = 0; depth < 3; depth += 1) {
+      // GROWN FROM THE PREVIOUS DEPTH ONLY, never from the whole accumulator — the latter re-emits
+      // shorter fleets it has already emitted, which inflates the count and covers nothing new.
+      frontier = frontier.flatMap((f) => BY_BAND.map((s) => [...f, s]));
+      fleets.push(...frontier);
+    }
+    // The loop is worthless if it enumerated nothing: every fleet of size 0..3 over the four bands.
+    expect(fleets.length).toBe(1 + 4 + 4 ** 2 + 4 ** 3);
+
+    for (const fleet of fleets) {
+      const buildRow = rollupDot("idle", fleet);
+      // Each agent enters the epic side carrying ITS OWN build-row dot — `rollupDotAccessor`'s
+      // value for a worker row, which is `rollupDot(status, [])`. That is the documented entry
+      // point, never a local re-derivation.
+      const epicSquare = epicHealth(
+        fleet.map((s, i) => ({ id: `a${i}`, dot: rollupDot(s, []) })),
+      );
+      expect(epicSquare, `fleet [${fleet.join(", ")}]`).toBe(buildRow);
+    }
   });
 });
 

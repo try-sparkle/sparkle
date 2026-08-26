@@ -176,9 +176,34 @@ function findFlashTarget(root: HTMLElement, selectors: readonly string[]): HTMLE
  *
  * `data-bead-flash` is the marker the tests read, and it carries WHICH treatment was applied so
  * that the reduced-motion path is observable rather than merely believed.
+ *
+ * ══ IT WRITES AND RESTORES THE `background` SHORTHAND, AND THAT IS LOAD-BEARING ═════════════════
+ * This used to snapshot `el.style.backgroundColor` — the LONGHAND — and put that back afterwards.
+ * It shipped the founder's *"when i click on 'column' view i get a gray bar all the way across"*
+ * (`sparkle-huw924.15`), and the mechanism is one line of CSSOM.
+ *
+ * `EpicRow` declares `background: var(--c-epic-card-fill)` — a SHORTHAND carrying a `var()`. Such a
+ * shorthand gives every one of its longhands a *pending-substitution* value, and a longhand read of
+ * a pending-substitution value returns the EMPTY STRING. So the snapshot was `""`; the flash then
+ * wrote a rival `background-color` longhand over the top; and the undo REMOVED that longhand, which
+ * takes the shorthand's colour with it. The `<button>` fell back to the UA `ButtonFace` default —
+ * `#c0c0c0` in WebKit, which is byte-for-byte the gray sampled from his screenshot — and React
+ * never repainted it, because the `background` PROP never changed. Permanently gray until unmount.
+ *
+ * Measured in real WebKit and real Chromium (playwright), not inferred; `EpicsColumn.revealFlash.
+ * test.tsx` carries the transcript and pins the declaration this function must leave behind.
+ *
+ * So: SAVE BOTH FORMS, write the SHORTHAND (which REPLACES whatever the node declared rather than
+ * shadowing it), and on undo clear both and re-declare exactly what was there. That round-trips
+ * every shape a flash target can take — shorthand-with-var, shorthand-with-plain-colour,
+ * longhand-only, a gradient, both at once, or nothing declared at all.
+ *
+ * DO NOT "SIMPLIFY" THIS BACK TO A LONGHAND. It is not a style preference; a longhand read cannot
+ * see a `var()` shorthand, and this is the bug that produced.
  */
 function applyFlash(el: HTMLElement, motion: "animate" | "static"): () => void {
-  const prevBackground = el.style.backgroundColor;
+  const prevBackground = el.style.getPropertyValue("background");
+  const prevBackgroundColor = el.style.getPropertyValue("background-color");
   const prevColor = el.style.color;
   const prevTransition = el.style.transition;
   el.setAttribute("data-bead-flash", motion);
@@ -190,11 +215,18 @@ function applyFlash(el: HTMLElement, motion: "animate" | "static"): () => void {
   // The epic pill's fill and its PAIRED ink, so the flashed row does not lose its text for 1.2s.
   // These two are themed together for exactly this reason; a hand-picked highlight here would be a
   // fourth un-themed colour in a column the repaint just finished cleaning up.
-  el.style.backgroundColor = C.epicPillFill;
+  el.style.setProperty("background", C.epicPillFill);
   el.style.color = C.onEpicPillFill;
   return () => {
     el.removeAttribute("data-bead-flash");
-    el.style.backgroundColor = prevBackground;
+    // BOTH ARE CLEARED BEFORE EITHER IS RESTORED, so a node that declared only one form does not
+    // end up carrying two. Then the shorthand goes back first and the longhand second, which is the
+    // order they were declared in — the later declaration wins, and that is how the node read
+    // before the flash.
+    el.style.removeProperty("background");
+    el.style.removeProperty("background-color");
+    if (prevBackground !== "") el.style.setProperty("background", prevBackground);
+    if (prevBackgroundColor !== "") el.style.setProperty("background-color", prevBackgroundColor);
     el.style.color = prevColor;
     el.style.transition = prevTransition;
   };
