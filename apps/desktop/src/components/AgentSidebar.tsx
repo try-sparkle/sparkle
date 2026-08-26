@@ -142,6 +142,7 @@ import {
 } from "../engine/workerRollup";
 import { StageSectionHeader } from "./StageSectionHeader";
 import { ChatSection } from "./ChatSection";
+import { ConnectionRequestRow } from "./ConnectionRequestRow";
 import { StatusFilterBar } from "./StatusFilterBar";
 import { attentionWorkersOf } from "../engine/workerExpansion";
 import { withDismissedAlerts, alertControlKind } from "../engine/alertDismissal";
@@ -4008,6 +4009,10 @@ export function AgentSidebar({
       {/* Support-ticket status banner: shows the user's OPEN tickets (Submitted / Responded).
           Renders nothing when there are none. Sits between Improve Sparkle and the footer. */}
       <SupportTicketRow />
+
+      {/* Inbound connection requests — the SupportTicketRow idiom, one line, everything else in
+          ConnectionRequestRow.tsx. Renders nothing when nobody has asked. */}
+      <ConnectionRequestRow />
 
       {/* (The old bottom-left StatusBar — version popover / changelog / support — is gone: that
           chrome now lives in the top-right kebab menu, see Concierge/KebabMenu.tsx.) */}

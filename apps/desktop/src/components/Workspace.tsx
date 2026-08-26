@@ -111,6 +111,8 @@ import {
   type PairAssignment,
 } from "../engine/pairs";
 import { planBoardUp } from "../engine/planBoard";
+// One id convention for a person, per `engine/social`'s header — never a hand-written prefix here.
+import { personAgentId } from "../engine/social";
 import { decidePromptTarget, resolvePinnedProjectId } from "../engine/shellResolve";
 import {
   markProjectVisited,
@@ -158,6 +160,9 @@ const SparkleAgentPane = lazy(() =>
 const ConciergeResearchPane = lazy(() =>
   import("./ConciergeResearchPane").then((m) => ({ default: m.ConciergeResearchPane })),
 );
+// The person-chat surface (Social Coding U5, bead `sparkle-xnjil.10`). Lazy for the same reason as
+// its neighbours: most sessions never open a chat, and its `Markdown` dependency is not small.
+const ChatPane = lazy(() => import("./ChatPane").then((m) => ({ default: m.ChatPane })));
 const BoardView = lazy(() => import("./BoardView").then((m) => ({ default: m.BoardView })));
 const ProjectModal = lazy(() => import("./ProjectModal").then((m) => ({ default: m.ProjectModal })));
 const NewCloudAgentDialog = lazy(() =>
@@ -1808,6 +1813,20 @@ export function Workspace() {
   // hints, and keeps a prompt from routing to an unseen terminal. WHICH task it shows lives in the
   // research store's `openTaskId`, not here — this flag is only "the research pane is the surface".
   const researchActive = activeSpecial === "research";
+  // ── THE PERSON CHAT (Social Coding U5, bead `sparkle-xnjil.10`) ────────────────────────────────
+  // The FOURTH covering surface over the primary pair's stage, and it carries the same gating as
+  // `sparkleActive` and `researchActive` everywhere below. It is NOT an `activeSpecial` value: a
+  // chat surface needs an argument (which person), which that persisted union cannot carry — see
+  // `uiStore.activeChatUserId` for the whole reasoning.
+  //
+  // `chatAgentId` is the `person:<social_id>` MOUNT id, minted through `engine/social.personAgentId`
+  // rather than by concatenating the prefix here. One id convention, one place that spells it.
+  const activeChatUserId = useUiStore((s) => s.activeChatUserId);
+  const chatActive = activeChatUserId !== null;
+  const chatAgentId = useMemo(
+    () => (activeChatUserId === null ? null : personAgentId(activeChatUserId)),
+    [activeChatUserId],
+  );
   // The read-only Tasks board (bead sparkle-hiju.10) is the Plan view. Only meaningful with a
   // project open, and only when the Beads tool ([tools].beads) is enabled — off means the board is
   // used nowhere (the Plan chevron hides and mode reconciles away from it).
@@ -1852,9 +1871,16 @@ export function Workspace() {
   // research pane COVERS the pair, so the selected agent's terminal is off screen. A research task
   // is a read-only view, not a chat target — a prompt typed while looking at it must route to the
   // brain (concierge), never into a terminal the founder cannot see.
+  //
+  // `!chatActive` for the same reason `!researchActive` is there: the chat pane covers the pair, so
+  // the selected agent's terminal is off screen and an imperative typed while looking at a
+  // conversation must route to the brain rather than into a terminal nobody can see. (U6 — the
+  // concierge mounted INTO a person — adds the other half of this: when a PERSON is the mounted
+  // target the prompt target IS shown, because the surface the words go to is the one on screen.
+  // That is a different branch from this one, not a relaxation of it.)
   const promptTargetShown = sparkleActive
     ? sparkleOpen
-    : !researchActive && !boardActive && activeIsOpen;
+    : !researchActive && !boardActive && !chatActive && activeIsOpen;
 
   // Calm terminal (PRD §3 / prototype `.terminal.calm`): when the agent you're looking at has
   // nothing for you, its terminal TEXT desaturates, so only a screen that wants something from you
@@ -1887,7 +1913,8 @@ export function Workspace() {
   // with. The desaturation now rides the terminal's own theme (AgentPane → Terminal → xtermTheme),
   // which also keeps it off the WebGL canvas's per-frame composite path.
   const terminalCalm = useMemo(() => {
-    if (sparkleActive || researchActive || boardActive || !activeAgentId || !activeIsOpen) return false;
+    if (sparkleActive || researchActive || boardActive || chatActive || !activeAgentId || !activeIsOpen)
+      return false;
     // Keyed off the RESOLVED project, not `currentProjectId`: the two differ for a commit after the
     // selected project moves pairs, and a miss here reads as CALM and desaturates a busy terminal.
     const p = feed.projects.find((x) => x.id === project?.id);
@@ -1905,7 +1932,7 @@ export function Workspace() {
     // hosts, so another window's reading is not evidence about the terminal in front of us.
     const a = p?.agents.find((x) => x.id === activeAgentId);
     return !!a?.statusObservedLocally && isCalmBand(a.status);
-  }, [feed, project, activeAgentId, activeIsOpen, sparkleActive, researchActive, boardActive]);
+  }, [feed, project, activeAgentId, activeIsOpen, sparkleActive, researchActive, boardActive, chatActive]);
 
   // THE PANE LIST'S PROPS, HOISTED OUT OF THE RENDER so `MemoAgentPaneList` can actually bail out.
   // Object literals inline at the call site are a fresh identity every render, which on a seam drag is
@@ -1924,8 +1951,13 @@ export function Workspace() {
       // epic-filter narrowing went ON it. A row hidden by an epic filter is hidden, NOT deselected,
       // so its PTY survives `Clear` — which is exactly why its id must stop counting as visible.
       left: leftBoardActive || leftHiddenByEpic ? null : leftActiveAgentId,
+      // `chatActive` joins the union for the identical reason every other term is in it: the chat
+      // pane COVERS this stage, so the selected agent's terminal is off screen. Leaving its id
+      // "visible" would paint two panes at once AND route a prompt into a terminal nobody can see.
       right:
-        sparkleActive || researchActive || boardActive || rightHiddenByEpic ? null : activeAgentId,
+        sparkleActive || researchActive || boardActive || chatActive || rightHiddenByEpic
+          ? null
+          : activeAgentId,
     }),
     [
       leftBoardActive,
@@ -1935,6 +1967,7 @@ export function Workspace() {
       sparkleActive,
       researchActive,
       boardActive,
+      chatActive,
       activeAgentId,
     ],
   );
@@ -2409,7 +2442,27 @@ export function Workspace() {
               </Suspense>
             )}
 
-            {!sparkleActive && !researchActive && !boardActive && !project && (
+            {/* ── THE PERSON CHAT PANE (Social Coding U5, bead `sparkle-xnjil.10`) ───────────
+                A DIRECT CHILD OF THIS STAGE, not a `PaneHost`. `PaneHost` exists solely to keep a
+                PTY alive across re-parenting when a project changes pairs; a chat pane has no PTY,
+                no xterm and no FitAddon measuring problem, so routing it through the portal would
+                buy nothing and bind it to a mechanism whose every invariant is about a terminal.
+
+                MOUNTED WHILE A CHAT IS OPEN and merely INVISIBLE otherwise — the pane's own
+                `paneVisibilityStyle(visible)` does the hiding, exactly as the Sparkle pane's does.
+                `paneVisibleAgentId.right` is already forced null while `chatActive`, so the agent
+                pane and this one can never paint together.
+
+                Keyed on `chatAgentId`? No — deliberately NOT. The pane instance is kept across a
+                person switch and it is the pane's INNER thread that carries the person key, so
+                switching people swaps the conversation without destroying pane state. */}
+            {chatAgentId !== null && (
+              <Suspense fallback={<PaneFallback />}>
+                <ChatPane visible={chatActive} agentId={chatAgentId} />
+              </Suspense>
+            )}
+
+            {!sparkleActive && !researchActive && !boardActive && !chatActive && !project && (
               <Hint title="Welcome to Sparkle">
                 Open a project with the <strong>+</strong> in the tab bar and choose a folder on your
                 Mac to start building.
@@ -2419,7 +2472,7 @@ export function Workspace() {
                 that window, or take it back — because otherwise a torn-out tab looks like a project
                 that lost its agents. "Bring it back here" is also the ONLY recovery path when the
                 satellite has ended up on a monitor that is no longer plugged in. */}
-            {!sparkleActive && !researchActive && !boardActive && selectedIsTornOut && project && (
+            {!sparkleActive && !researchActive && !boardActive && !chatActive && selectedIsTornOut && project && (
               <Hint title={project.name}>
                 <div style={{ marginBottom: 18 }}>
                   This project is open in its own window.

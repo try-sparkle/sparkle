@@ -150,6 +150,12 @@ const TRANSIENT_UI_KEYS = [
   // (engine/buildSections), not here, and it would leave the "a filter I never set is still on"
   // half of the defect standing for the bands it did not exempt. One of the two, not both halfway.
   "statusFilter",
+  // WHICH PERSON'S CHAT IS UP. Transient for the reason spelled out on the field itself: the pane
+  // is a live conversation with another human, and every fact it paints — their availability, the
+  // connection state, the messages — is re-read from the network at launch. Restoring one puts a
+  // stranger's thread over the stage for a gesture nobody made this session, and it would do it
+  // BEFORE any of those reads have come back, so the first frame is a chat with an unknown person.
+  "activeChatUserId",
 ] as const satisfies readonly (keyof UiState)[];
 
 export const COMPOSER_MIN = 64;
@@ -373,6 +379,33 @@ interface UiState {
   // board on screen. Read `workModeBySide[side] === "plan"` instead.
   activeSpecial: "sparkle" | "research" | null;
   setActiveSpecial: (v: "sparkle" | "research" | null) => void;
+  /**
+   * WHICH PERSON'S CHAT IS THE ACTIVE SURFACE over the primary pair's stage — a `social_id`, or
+   * null when no chat is up (Social Coding, bead `sparkle-xnjil.10`; design §10 "Key UI design
+   * calls").
+   *
+   * ── WHY IT IS ITS OWN FIELD AND NOT A THIRD `activeSpecial` VALUE ────────────────────────────
+   * `activeSpecial` is PERSISTED, carries a `repairActiveSpecial` migration and a shallow-merge
+   * rehydrate, and its union is a closed set of surfaces that need no argument. A chat surface
+   * needs one — WHICH person — so widening that union would either lose the person on every
+   * launch (a restored `"chat"` covering the stage with nobody in it, exactly the failure
+   * `"research"` is coerced to null for) or force a second field alongside it anyway. Two fields
+   * either way; this is the pair that does not touch the persisted union.
+   *
+   * ── MUTUAL EXCLUSION IS ENFORCED IN THE ACTIONS, NOT AT THE CALL SITES ───────────────────────
+   * The chat pane and every `activeSpecial` surface render into the SAME stage, so two of them at
+   * once means two panes painting on top of each other. `setActiveChatUserId` clears
+   * `activeSpecial`, `setActiveSpecial` clears this, and `openPlanBoard` / `showBuildStage` clear
+   * it for the pane-owning side — the one-place-applies-the-rule shape this file already uses for
+   * the `activeSpecial`/mode pairing, and for the reason stated there: a rule spread across call
+   * sites diverges the first time one of them is missed.
+   *
+   * TRANSIENT. It is in `TRANSIENT_UI_KEYS`: a restored chat is a conversation nobody opened this
+   * session, with a peer whose availability, connection state and message history are all re-read
+   * from the network at launch — so the honest launch state is "no chat up".
+   */
+  activeChatUserId: string | null;
+  setActiveChatUserId: (socialId: string | null) => void;
   // App theme preference. "auto" follows the OS appearance; "light"/"dark" force it.
   // Persisted in the same `sparkle-ui` blob; read synchronously at boot (see theme/theme.ts)
   // to set <html data-theme> before first paint and avoid a flash of the wrong theme.
@@ -902,7 +935,18 @@ export const useUiStore = create<UiState>()(
         }),
       resetAllZoom: () => set({ zoomByColumn: defaultZoomByColumn() }),
       activeSpecial: null,
-      setActiveSpecial: (v) => set({ activeSpecial: v }),
+      // Clears the chat surface: both render into the primary pair's stage, so "show me Improve
+      // Sparkle" is also "stop showing that chat". See `activeChatUserId` for why the rule lives
+      // here rather than at the call sites.
+      setActiveSpecial: (v) => set({ activeSpecial: v, activeChatUserId: null }),
+      activeChatUserId: null,
+      // The mirror — but only in the OPENING direction. Opening a chat yields the stage from
+      // whatever special held it; CLOSING one must leave `activeSpecial` exactly as it found it,
+      // or `setActiveChatUserId(null)` would silently close the Improve-Sparkle pane as well.
+      // (Mutual exclusion means it is already null in the ordinary case; this is about the case
+      // where it is not.)
+      setActiveChatUserId: (socialId) =>
+        set(socialId === null ? { activeChatUserId: null } : { activeChatUserId: socialId, activeSpecial: null }),
       themePref: "auto",
       setThemePref: (v) => set({ themePref: v }),
       conciergeComposeH: null,
@@ -942,7 +986,7 @@ export const useUiStore = create<UiState>()(
       // the primary pair's stage, so a left column entering Plan must not close it.
       openPlanBoard: (side) => {
         get().setWorkMode(side, "plan");
-        if (side === SPARKLE_PANE_SIDE) set({ activeSpecial: null });
+        if (side === SPARKLE_PANE_SIDE) set({ activeSpecial: null, activeChatUserId: null });
       },
       // THE MIRROR, and it needs to exist for the same reason. The Improve-Sparkle pane covers
       // WHICHEVER surface the column is showing, so "show me the Build stage" is the same two
@@ -952,7 +996,7 @@ export const useUiStore = create<UiState>()(
       // Improve Sparkle never touches the mode.
       showBuildStage: (side) => {
         get().setWorkMode(side, "build");
-        if (side === SPARKLE_PANE_SIDE) set({ activeSpecial: null });
+        if (side === SPARKLE_PANE_SIDE) set({ activeSpecial: null, activeChatUserId: null });
       },
       setWorkMode: (side, m) =>
         set((s) =>

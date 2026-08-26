@@ -24,20 +24,33 @@
 // the trap `build-column-header` already documents — so a hover-reveal here would make the feature
 // unreachable by keyboard and invisible to the one user who most needs it: the one with no people.
 //
-// ══ THE `[+]` DISPATCHES AN EVENT; IT IMPORTS NOTHING FROM SETTINGS ════════════════════════════
+// ══ THE `[+]` HAS TWO DESTINATIONS, AND WHICH ONE IS NOT A PREFERENCE ══════════════════════════
+// With a social identity it opens {@link AddPersonPopover}. WITHOUT one it opens Settings → Chat,
+// because there is nothing else it could usefully do: every `/social/*` path 404s for an account
+// with no row, so a directory panel would open onto a permanently empty list and the user would
+// have no way to learn that picking a username is the missing step. That is the deep-open seam
+// §10 names ("the `[+]` flow needs a deep-open seam — `openSettings("chat")` when you have no
+// username yet"), and it is why the event below still exists.
+//
+// `me.username`, NOT `profileLoaded`, is the test — deliberately, and the direction is the safe
+// one. Before the profile has been read we do not know whether there is a handle, and sending an
+// already-registered user to Settings costs them one click while opening an empty directory panel
+// on someone with no identity is a dead end with no signpost out of it.
+//
+// ══ THE SETTINGS HALF DISPATCHES AN EVENT; IT IMPORTS NOTHING FROM SETTINGS ════════════════════
 // `window.dispatchEvent(new CustomEvent(OPEN_SOCIAL_SETTINGS_EVENT))` is the agreed decoupling
-// seam. The Settings side is a separate stage landing in parallel, and a direct import (or a
-// `CATEGORIES` entry added from here) would couple two files that are being edited at once — the
-// collision this feature's file split exists to avoid. The event is a no-op until a listener
-// exists, which is the honest state of the world right now.
+// seam. A direct import (or a `CATEGORIES` entry added from here) would couple two files that are
+// edited on separate branches — the collision this feature's file split exists to avoid.
 
-import { memo } from "react";
+import { memo, useCallback, useRef, useState } from "react";
 import { FiPlus } from "react-icons/fi";
 
 import { C } from "../theme/colors";
 import { RADIUS } from "../theme/scale";
 import { COUNT, SECTION_LABEL } from "./labelTreatment";
 import { ROW_PAD_X } from "../engine/rowGeometry";
+import { AddPersonPopover } from "./AddPersonPopover";
+import { useSocialStore } from "../stores/socialStore";
 
 /** The one event name, exported so the Settings listener binds to a constant rather than to a
  *  re-typed string literal. A typo in either half is a button that silently does nothing. */
@@ -66,6 +79,15 @@ export const ChatSectionHeader = memo(function ChatSectionHeader({
   /** Total unread across everyone (`totalUnread` from socialStore). 0 → no badge. */
   unread?: number;
 }) {
+  // See the header: which destination the `[+]` has is decided by whether there is a handle.
+  const hasHandle = useSocialStore((s) => s.me.username != null);
+  // The popover is `position: fixed` at the button's rect AT CLICK TIME, so the rect is captured
+  // by the press rather than measured on every render — jsdom returns zeros for it and a real
+  // browser would pay a layout read per paint.
+  const [anchor, setAnchor] = useState<DOMRect | null>(null);
+  const addRef = useRef<HTMLButtonElement>(null);
+  const closePopover = useCallback(() => setAnchor(null), []);
+
   return (
     <div
       data-testid={CHAT_HEADER_TESTID}
@@ -103,11 +125,25 @@ export const ChatSectionHeader = memo(function ChatSectionHeader({
         {count}
       </span>
       <button
+        ref={addRef}
         type="button"
         data-testid={CHAT_ADD_PERSON_TESTID}
+        // Read by the popover's click-away guard: the press that TOGGLES the panel must not also
+        // be seen as a press outside it, or the panel would close and reopen in one gesture and
+        // never appear to respond.
+        data-add-person-anchor=""
         aria-label={ADD_PERSON_LABEL}
+        aria-expanded={anchor !== null}
         title={ADD_PERSON_LABEL}
-        onClick={requestOpenSocialSettings}
+        onClick={() => {
+          if (!hasHandle) {
+            requestOpenSocialSettings();
+            return;
+          }
+          setAnchor((open) =>
+            open !== null ? null : (addRef.current?.getBoundingClientRect() ?? null),
+          );
+        }}
         style={{
           flex: "0 0 auto",
           display: "inline-flex",
@@ -128,6 +164,9 @@ export const ChatSectionHeader = memo(function ChatSectionHeader({
         {/* react-icons/fi (Feather). No emoji — house rule. */}
         <FiPlus size={12} aria-hidden />
       </button>
+      {/* The panel itself — portalled to `document.body`, so it is a DOM sibling of the app and
+          carries its own `data-circuit` / `data-dismissible-open`. See AddPersonPopover.tsx. */}
+      {anchor !== null && <AddPersonPopover anchor={anchor} onClose={closePopover} />}
     </div>
   );
 });

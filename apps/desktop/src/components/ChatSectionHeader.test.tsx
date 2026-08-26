@@ -9,9 +9,20 @@
 // aria-hidden subtree is unreachable to assistive tech. This header owns a button, so it must never
 // acquire that wrapper — which is also why extending the stage header with an `action` prop was the
 // wrong shape rather than merely a busier one.
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+// The `[+]` mounts `AddPersonPopover`, which reads the directory on open. Mocked at the module
+// boundary so this file tests the WIRING and not the network.
+vi.mock("../services/socialApi", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../services/socialApi")>()),
+  getDirectory: vi.fn(async () => ({ users: [], nextCursor: null })),
+  getUser: vi.fn(),
+  postConnection: vi.fn(),
+}));
+
+import { ADD_PERSON_POPOVER_TESTID } from "./AddPersonPopover";
+import { useSocialStore } from "../stores/socialStore";
 import {
   ADD_PERSON_LABEL,
   CHAT_ADD_PERSON_TESTID,
@@ -21,7 +32,17 @@ import {
 } from "./ChatSectionHeader";
 import { FONT_MONO } from "../theme/scale";
 
-afterEach(cleanup);
+beforeEach(() => useSocialStore.getState().reset());
+
+afterEach(() => {
+  cleanup();
+  useSocialStore.getState().reset();
+});
+
+/** Give the signed-in user a social identity. Without one the `[+]` goes to Settings instead —
+ *  see the component header, and the pair of tests below that pins both destinations. */
+const withHandle = () =>
+  useSocialStore.setState({ me: { ...useSocialStore.getState().me, username: "me" } });
 
 const renderHeader = (count = 2, unread?: number) => {
   render(<ChatSectionHeader count={count} unread={unread} />);
@@ -81,7 +102,7 @@ describe("ChatSectionHeader — the [+]", () => {
     expect(add.getAttribute("title")).toBe(ADD_PERSON_LABEL);
   });
 
-  it("dispatches the decoupling event on click", () => {
+  it("with NO handle, dispatches the decoupling event and opens no panel", () => {
     const heard = vi.fn();
     window.addEventListener(OPEN_SOCIAL_SETTINGS_EVENT, heard);
     try {
@@ -89,9 +110,39 @@ describe("ChatSectionHeader — the [+]", () => {
       fireEvent.click(screen.getByTestId(CHAT_ADD_PERSON_TESTID));
       expect(heard).toHaveBeenCalledTimes(1);
       expect(heard.mock.calls[0]?.[0]).toBeInstanceOf(CustomEvent);
+      // A directory panel here would open onto a permanently empty list with no signpost out —
+      // every `/social/*` path 404s for an account with no row. Settings is the only useful door.
+      expect(screen.queryByTestId(ADD_PERSON_POPOVER_TESTID)).toBeNull();
     } finally {
       window.removeEventListener(OPEN_SOCIAL_SETTINGS_EVENT, heard);
     }
+  });
+
+  it("WITH a handle, opens the add-person panel instead — and does not open Settings", async () => {
+    const heard = vi.fn();
+    window.addEventListener(OPEN_SOCIAL_SETTINGS_EVENT, heard);
+    try {
+      withHandle();
+      renderHeader();
+      fireEvent.click(screen.getByTestId(CHAT_ADD_PERSON_TESTID));
+      expect(await screen.findByTestId(ADD_PERSON_POPOVER_TESTID)).toBeTruthy();
+      // The OTHER half: sending the user to Settings as well would be two surfaces for one press.
+      expect(heard).not.toHaveBeenCalled();
+      expect(screen.getByTestId(CHAT_ADD_PERSON_TESTID).getAttribute("aria-expanded")).toBe("true");
+    } finally {
+      window.removeEventListener(OPEN_SOCIAL_SETTINGS_EVENT, heard);
+    }
+  });
+
+  it("toggles: a second press on the [+] closes the panel it opened", async () => {
+    withHandle();
+    renderHeader();
+    const add = screen.getByTestId(CHAT_ADD_PERSON_TESTID);
+    fireEvent.click(add);
+    await screen.findByTestId(ADD_PERSON_POPOVER_TESTID);
+    fireEvent.click(add);
+    await waitFor(() => expect(screen.queryByTestId(ADD_PERSON_POPOVER_TESTID)).toBeNull());
+    expect(add.getAttribute("aria-expanded")).toBe("false");
   });
 
   it("renders no emoji anywhere — house rule, icons are react-icons/fi", () => {
