@@ -203,6 +203,10 @@ vi.mock("./conciergeReceiptClassifier", async (importOriginal) => {
 });
 
 import { configuredToolPolicy } from "./conciergeTools/policyBinding";
+// The publish op NAMES + RISK classification, driven from their one definition so the carve-out
+// suite below asserts over EVERY safe/live op rather than a hand-picked pair — a new op added to
+// PUBLISH_OPS is then automatically under test on the correct side of the boundary.
+import { PUBLISH_OPS, PUBLISH_RISK, type PublishOp } from "./conciergeTools/publish";
 import {
   clearConciergeApprovals,
   pendingApprovals,
@@ -5564,6 +5568,168 @@ describe("controlListener", () => {
       // The tier-gate wording — proof that concierge_tool is classified `privileged`, not `free`.
       expect(String(reply.error)).toContain("interactive (non-worker) agents");
       expect(dispatchConciergeToolMock).not.toHaveBeenCalled();
+    });
+
+    // ── THE IMPROVE-SPARKLE PUBLISHING-DRAFT CARVE-OUT ──────────────────────────────────────────
+    //
+    // The ONE exception to concierge-only: the app-owned Improve Sparkle agent may reach the publish
+    // domain's SAFE ops (the five reads + the three DRAFT writes) so it can draft/iterate DROdio.com
+    // posts itself — while the LIVE-SITE acts stay concierge-only, behind the human go-live card.
+    // Every case asserts the SIDE EFFECT — whether the registry was actually REACHED — not merely
+    // `ok`, because a gate that refused-but-dispatched, or admitted-but-was-blocked-later, would fool
+    // a reply-only assertion. The safe/live op lists are DRIVEN FROM PUBLISH_RISK, so a new publish op
+    // lands on the correct side of the boundary automatically.
+    describe("the Improve Sparkle publishing-draft carve-out", () => {
+      const SAFE_PUBLISH_OPS = (PUBLISH_OPS as readonly PublishOp[]).filter(
+        (op) => PUBLISH_RISK[op] === "read-only" || PUBLISH_RISK[op] === "routine",
+      );
+      const LIVE_PUBLISH_OPS = (PUBLISH_OPS as readonly PublishOp[]).filter(
+        (op) => PUBLISH_RISK[op] === "irreversible" || PUBLISH_RISK[op] === "disruptive",
+      );
+      // Guard the guards: if either list is empty the it.each below would assert nothing and pass
+      // vacuously, so the boundary must have members on both sides for these suites to mean anything.
+      it("the risk split actually partitions publish ops into a non-empty safe set and live set", () => {
+        expect(SAFE_PUBLISH_OPS.length).toBeGreaterThan(0);
+        expect(LIVE_PUBLISH_OPS.length).toBeGreaterThan(0);
+        // publish_go_live is the canonical live act — it MUST be on the refused side, never the safe.
+        expect(LIVE_PUBLISH_OPS).toContain("publish_go_live");
+        expect(SAFE_PUBLISH_OPS).not.toContain("publish_go_live");
+      });
+
+      it.each(SAFE_PUBLISH_OPS)(
+        "lets the app-owned Improve Sparkle agent REACH the registry for the SAFE op %s",
+        async (op) => {
+          fire({
+            reqId: `ispd-safe-${op}`,
+            op: "concierge_tool",
+            callerAgentId: SPARKLE_AGENT_ID,
+            payload: { domain: "publish", op, args: { a: 1 }, toolCallId: `tc-${op}` },
+          });
+          await flush();
+          // THE SIDE EFFECT: the call passed BOTH gates and reached the registry, with the frozen
+          // wire contract intact and the human's configured policy handed through (routine/read-only
+          // then auto-allow inside the registry, which is tested there).
+          expect(dispatchConciergeToolMock).toHaveBeenCalledTimes(1);
+          expect(dispatchConciergeToolMock.mock.calls[0]![0]).toEqual({
+            domain: "publish",
+            op,
+            args: { a: 1 },
+            toolCallId: `tc-${op}`,
+          });
+          expect(dispatchConciergeToolMock.mock.calls[0]![1]).toEqual({ policy: configuredToolPolicy });
+          expect(lastReply().ok).toBe(true);
+        },
+      );
+
+      // The carve-out is keyed on the app-owned NAMESPACE, not the one canonical id: a per-window
+      // Improve Sparkle instance (`__sparkle_self__-win-<uuid>`) must get the same reach, or a
+      // secondary window's agent silently loses it. isSparkleAgentId is what makes both match.
+      it("extends the carve-out to a PER-WINDOW Improve Sparkle id, not just the canonical one", async () => {
+        fire({
+          reqId: "ispd-win",
+          op: "concierge_tool",
+          callerAgentId: `${SPARKLE_AGENT_ID}-win-abc123`,
+          payload: { domain: "publish", op: "publish_create_draft", args: {}, toolCallId: "tc-win" },
+        });
+        await flush();
+        expect(dispatchConciergeToolMock).toHaveBeenCalledTimes(1);
+        expect(dispatchConciergeToolMock.mock.calls[0]![0]).toMatchObject({
+          domain: "publish",
+          op: "publish_create_draft",
+        });
+        expect(lastReply().ok).toBe(true);
+      });
+
+      it.each(LIVE_PUBLISH_OPS)(
+        "STILL REFUSES the app-owned Improve Sparkle agent the LIVE op %s, and never reaches the registry",
+        async (op) => {
+          fire({
+            reqId: `ispd-live-${op}`,
+            op: "concierge_tool",
+            callerAgentId: SPARKLE_AGENT_ID,
+            payload: { domain: "publish", op, args: {}, toolCallId: `tc-${op}` },
+          });
+          await flush();
+          // Refused, and — the load-bearing half — the live-site tool NEVER RAN. This is the
+          // assertion the mutation check flips: widen the carve-out to allow every publish op and
+          // publish_go_live reaches the registry, turning this red.
+          expect(lastReply().ok).toBe(false);
+          expect(dispatchConciergeToolMock).not.toHaveBeenCalled();
+        },
+      );
+
+      // THE CARVE-OUT DID NOT WIDEN ANYTHING ELSE. A non-publishing privileged concierge_tool op, and
+      // a direct privileged control op, are BOTH still refused for the Improve Sparkle agent — proving
+      // the exception is scoped to the publish domain's safe ops and nothing more.
+      it("STILL REFUSES Improve Sparkle a non-publishing privileged concierge_tool op (lifecycle)", async () => {
+        fire({
+          reqId: "ispd-lifecycle",
+          op: "concierge_tool",
+          callerAgentId: SPARKLE_AGENT_ID,
+          payload: { domain: "lifecycle", op: "retire_agent", args: {}, toolCallId: "tc-life" },
+        });
+        await flush();
+        expect(lastReply().ok).toBe(false);
+        expect(dispatchConciergeToolMock).not.toHaveBeenCalled();
+      });
+
+      it("STILL REFUSES Improve Sparkle a non-publishing concierge_tool op in a READ-shaped domain (workspace)", async () => {
+        // workspace/list_projects is itself a harmless read, but it is NOT the publish domain — the
+        // predicate keys on domain === "publish", so this must fall to the ordinary refusal. Proves
+        // the carve-out is not "any safe-looking op", it is "publish domain, safe op".
+        fire({
+          reqId: "ispd-workspace",
+          op: "concierge_tool",
+          callerAgentId: SPARKLE_AGENT_ID,
+          payload: { domain: "workspace", op: "list_projects", args: {}, toolCallId: "tc-ws" },
+        });
+        await flush();
+        expect(lastReply().ok).toBe(false);
+        expect(dispatchConciergeToolMock).not.toHaveBeenCalled();
+      });
+
+      it("STILL REFUSES Improve Sparkle a DIRECT privileged control op (set_config)", async () => {
+        // set_config is privileged and NOT a concierge_tool wrapper, so the predicate's `op ===
+        // "concierge_tool"` clause is false and the tier gate refuses it — proving the carve-out did
+        // not hand the app-owned agent the broad `callerMayAdminister` authority.
+        fire({
+          reqId: "ispd-setconfig",
+          op: "set_config",
+          callerAgentId: SPARKLE_AGENT_ID,
+          payload: { path: "concierge.own_orgs", value: ["evil"] },
+        });
+        await flush();
+        expect(lastReply().ok).toBe(false);
+        expect(setConfigCalls).toHaveLength(0);
+        expect(setConfigValuesCalls).toHaveLength(0);
+      });
+
+      it.each(SAFE_PUBLISH_OPS)(
+        "STILL REFUSES an ordinary BUILD agent the publish op %s (carve-out is Improve-Sparkle-only)",
+        async (op) => {
+          fire({
+            reqId: `ispd-build-${op}`,
+            op: "concierge_tool",
+            callerAgentId: callerId,
+            payload: { domain: "publish", op, args: {}, toolCallId: `tc-b-${op}` },
+          });
+          await flush();
+          expect(lastReply().ok).toBe(false);
+          expect(dispatchConciergeToolMock).not.toHaveBeenCalled();
+        },
+      );
+
+      it("STILL REFUSES an ordinary WORKER agent a safe publish op", async () => {
+        fire({
+          reqId: "ispd-worker",
+          op: "concierge_tool",
+          callerAgentId: otherId,
+          payload: { domain: "publish", op: "publish_create_draft", args: {}, toolCallId: "tc-wk" },
+        });
+        await flush();
+        expect(lastReply().ok).toBe(false);
+        expect(dispatchConciergeToolMock).not.toHaveBeenCalled();
+      });
     });
 
     // The near-miss is the one worth spelling out: the check is `===` on the reserved id, so no

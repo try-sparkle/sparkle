@@ -129,6 +129,11 @@ import { APP_TOOL_NAMES, type AppToolName } from "./conciergeTools/policy";
 // lifecycle op inherits the refusal remedy that tells the truth about it (see refusedCallerRemedy).
 import { LIFECYCLE_OPS } from "./conciergeTools/lifecycle";
 import { SCREENSHOT_OPS } from "./conciergeTools/screenshot";
+// The publish op NAMES and their RISK classification, read from their one definition in publish.ts
+// (imported, never redeclared), so the Improve-Sparkle draft carve-out (isImproveSparklePublishDraft)
+// stays bound to the same read-only/routine-vs-live split the policy layer enforces.
+import { PUBLISH_OPS, PUBLISH_RISK, type PublishOp } from "./conciergeTools/publish";
+import type { ConciergeToolDomain } from "./conciergeTools/registry";
 import { reportControlOp } from "./selfReportObservability";
 import { livenessOf } from "./agentLiveness";
 // The one assembly of goal + stall + thrash, shared with conciergeTools/terminal.getAgentStatus so
@@ -956,6 +961,71 @@ function callerMayAdminister(callerAgentId: string): boolean {
   if (callerAgentId === CONCIERGE_CALLER_AGENT_ID) return true;
   const kind = findAgent(callerAgentId)?.agent.kind;
   return kind != null && kind !== "worker";
+}
+
+/** The publishing domain, as `conciergeTools/registry.ts` registers it (`DOMAINS.publish`) and the
+ *  wire payload's `domain` names it. Typed as {@link ConciergeToolDomain} so renaming the domain in
+ *  the registry tuple fails `tsc` HERE rather than silently making the carve-out below match nothing
+ *  and fail closed. */
+const PUBLISH_DOMAIN: ConciergeToolDomain = "publish";
+
+/**
+ * The inner `{ domain, op }` of a `concierge_tool` payload, located the way {@link handleConciergeTool}
+ * locates them: `toolOp` first (the field the MCP server sets), then the legacy `op` fallback.
+ *
+ * ⚠️ `toolOp`, NOT `op`. bridgeClient FLATTENS this payload into the wire envelope and writes the
+ * envelope's own reserved fields (id/token/op/callerAgentId) AFTER the spread, so an inner field
+ * called `op` was overwritten by the envelope's `op` ("concierge_tool") and then stripped by the Rust
+ * bridge as reserved. The handler read an empty string and EVERY op-dispatched tool failed with
+ * `unknown-op` (shipped in v0.55.0). The `op` fallback is read-only compatibility for an older MCP
+ * server bundled beside a newer app; it can be dropped once no such pairing exists.
+ *
+ * Factored out so the draft carve-out ({@link isImproveSparklePublishDraft}) and the handler cannot
+ * DRIFT on how the inner op is located — a drift here would let one gate admit an op the other
+ * rejects, which for a SECURITY gate is a hole.
+ */
+function conciergeInnerDomainOp(payload: Record<string, unknown>): { domain: string; op: string } {
+  const domain = typeof payload.domain === "string" ? payload.domain : "";
+  const op =
+    typeof payload.toolOp === "string"
+      ? payload.toolOp
+      : typeof payload.op === "string"
+        ? payload.op
+        : "";
+  return { domain, op };
+}
+
+/**
+ * THE NARROW PUBLISHING-DRAFT CARVE-OUT — the ONE exception that lets the app-owned Improve Sparkle
+ * agent reach the publish domain's SAFE ops through `concierge_tool`, which is otherwise concierge-only.
+ *
+ * True IFF ALL of:
+ *   1. the caller is the app-owned Improve Sparkle agent — canonical `__sparkle_self__` or a
+ *      per-window variant. `isSparkleAgentId` is FALSE for the concierge (`sparkle:concierge` is not a
+ *      Sparkle-namespace id) and for every Build/Think/worker agent, so this admits nobody else; AND
+ *   2. the outer op is `concierge_tool` (the wrapper the publish domain rides on); AND
+ *   3. the inner domain is the publishing domain; AND
+ *   4. the inner op is a KNOWN publish op classified `read-only` or `routine` — the five reads and the
+ *      three DRAFT writes (create/update draft, attach media). `irreversible` (publish_update_live,
+ *      publish_go_live), `disruptive` (publish_take_down) — the LIVE-SITE acts — and any UNKNOWN op
+ *      all fall through to false, so live mutations stay concierge-only and behind the human card.
+ *
+ * WHY THIS IS SAFE, and why it is NOT `callerMayAdminister`. Making `callerMayAdminister` true for
+ * `__sparkle_self__` would grant EVERY privileged direct op (set_config, lifecycle, …) — far too
+ * broad, and a documented prompt-injection surface, since this agent mines untrusted session logs.
+ * The carve-out is therefore publishing-DRAFT-only: a draft is local to the founder and invisible to
+ * anyone until go-live, and the two acts that make anything public — or take it down — are excluded
+ * here and still require the concierge plus the human go-live approval card. So the injection risk of
+ * a draft created from untrusted content is bounded by that human-gated go-live step.
+ */
+function isImproveSparklePublishDraft(req: ControlRequest): boolean {
+  if (!isSparkleAgentId(req.callerAgentId)) return false;
+  if (req.op !== "concierge_tool") return false;
+  const { domain, op } = conciergeInnerDomainOp(req.payload);
+  if (domain !== PUBLISH_DOMAIN) return false;
+  if (!(PUBLISH_OPS as readonly string[]).includes(op)) return false;
+  const risk = PUBLISH_RISK[op as PublishOp];
+  return risk === "read-only" || risk === "routine";
 }
 
 /**
@@ -3301,22 +3371,20 @@ async function handleConciergeTool(req: ControlRequest): Promise<ConciergeToolRe
       : undefined,
   );
   // Read defensively: this payload was assembled by a model's MCP client, and the reply has to name
-  // the domain/op it was asked about even when they arrive as the wrong type.
-  const domain = typeof req.payload.domain === "string" ? req.payload.domain : "";
-  // `toolOp`, NOT `op`. bridgeClient FLATTENS this payload into the wire envelope and writes the
-  // envelope's own reserved fields (id/token/op/callerAgentId) AFTER the spread, so an inner field
-  // called `op` was overwritten by the envelope's `op` ("concierge_tool") and then stripped by the
-  // Rust bridge as reserved. The handler read an empty string and EVERY op-dispatched tool failed
-  // with `unknown-op`, while `get_state` — which carries no inner op — worked. That shipped in
-  // v0.55.0. The `op` fallback below is read-only compatibility for an older MCP server bundled
-  // beside a newer app; it can be dropped once no such pairing exists.
-  const op =
-    typeof req.payload.toolOp === "string"
-      ? req.payload.toolOp
-      : typeof req.payload.op === "string"
-        ? req.payload.op
-        : "";
-  if (req.callerAgentId !== CONCIERGE_CALLER_AGENT_ID) {
+  // the domain/op it was asked about even when they arrive as the wrong type. `toolOp`-vs-`op` and
+  // the reason it matters live on {@link conciergeInnerDomainOp}, which the draft carve-out below
+  // shares so the two cannot drift on how the inner op is located.
+  const { domain, op } = conciergeInnerDomainOp(req.payload);
+  // CONCIERGE-ONLY — with ONE narrow exception. The concierge is the ordinary caller here; the
+  // exception is the app-owned Improve Sparkle agent reaching the publish domain's SAFE ops (the five
+  // reads + the three DRAFT writes), so it can draft/iterate posts itself. Live-site acts
+  // (publish_update_live / publish_go_live / publish_take_down) are NOT in that safe set, so they
+  // still fall to this refusal for every caller but the concierge, and go-live stays behind the human
+  // approval card. See {@link isImproveSparklePublishDraft} for why draft-only is the safe boundary.
+  if (
+    req.callerAgentId !== CONCIERGE_CALLER_AGENT_ID &&
+    !isImproveSparklePublishDraft(req)
+  ) {
     return {
       ok: false,
       domain,
@@ -4251,7 +4319,20 @@ async function dispatch(req: ControlRequest): Promise<void> {
     // undefined → they fall through to the default "unknown op" reply) skip the check. This is the
     // single place the free/privileged decision is enforced — the per-handler `callerMayAdminister`
     // calls used to be scattered.
-    if (CONTROL_OP_TIERS[req.op as ControlOp] === "privileged" && !callerMayAdminister(req.callerAgentId)) {
+    // The narrow exception, mirrored at the concierge_tool handler's own caller check: the app-owned
+    // Improve Sparkle agent is let PAST this privileged-tier gate for the publish domain's SAFE ops
+    // ONLY (the five reads + the three DRAFT writes). `sparkle_publish` arrives as the outer op
+    // `concierge_tool`, which is `privileged`, and `callerMayAdminister("__sparkle_self__")` is false;
+    // without this the draft-compose loop could never reach the domain handler at all. Live-site acts
+    // (publish_update_live / publish_go_live / publish_take_down) are excluded by the predicate, so
+    // they stay concierge-only and behind the human go-live approval card — the drafts this admits are
+    // local to the founder and invisible until that human-gated go-live. See
+    // {@link isImproveSparklePublishDraft}.
+    if (
+      CONTROL_OP_TIERS[req.op as ControlOp] === "privileged" &&
+      !callerMayAdminister(req.callerAgentId) &&
+      !isImproveSparklePublishDraft(req)
+    ) {
       await respond(req.reqId, {
         ok: false,
         error: `${req.op} is only permitted for interactive (non-worker) agents`,
