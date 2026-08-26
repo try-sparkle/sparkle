@@ -1214,7 +1214,59 @@ fn fetch_usage_blocking(
         |cd, access| read_access_token(cd, access),
         |cd| invalidate_cache(cd),
         |token| http_get_usage(token),
+        |cd| claude_refresh_via_auth_status(cd),
     )
+}
+
+/// Terminal message when a usage 401 could not be recovered: the cached token was rejected, a fresh
+/// keychain re-read was rejected too, and (where attempted) the sanctioned `claude` refresh could not
+/// produce a working token. The substring `unauthorized` is a CROSS-LANGUAGE CONTRACT — `isUsageAuthError`
+/// in `components/AccountsScreen.tsx` keys on it to route the "sign in again" remedy instead of a
+/// generic "check your connection". Do NOT drop that word. Value unchanged from before this seam
+/// existed, so the un-refreshable path renders exactly as it always did.
+const UNAUTHORIZED_TERMINAL_MSG: &str = "usage fetch failed: unauthorized after keychain re-read";
+
+/// Terminal message when the sanctioned `claude` refresh reported the account is SIGNED OUT — its
+/// refresh token is itself dead, so no automatic refresh is possible and only a human sign-in fixes
+/// it (the separate relogin fork). Keeps the `unauthorized` marker so the frontend routes the sign-in
+/// remedy, and spells the remedy out in the string itself for the log/raw-display case.
+const SIGN_IN_AGAIN_MSG: &str = "usage fetch failed: unauthorized — this account is signed out and \
+     could not be refreshed; sign in again";
+
+/// Terminal message for the rare case where `claude` AFFIRMATIVELY refreshed (reported the account
+/// signed in for THIS config dir) yet the usage endpoint STILL refused the freshly-read token —
+/// endpoint-side revocation, or a seat/plan without usage-endpoint access. It deliberately OMITS the
+/// `unauthorized` marker: the account was just PROVEN signed in, so routing it to the frontend's
+/// "sign in again" remedy would be an affirmatively false claim (the same failure shape the 429 path
+/// is hardened against). Without the marker the frontend falls through to its transient "couldn't
+/// refresh usage — try again" card instead of the sign-in one.
+const REFRESHED_BUT_REFUSED_MSG: &str =
+    "usage fetch failed: the account is signed in but the usage endpoint refused the refreshed token";
+
+/// The result of one usage HTTP attempt, collapsed for the retry state machine: either a FINAL answer
+/// (success, or a non-401 failure we surface as-is) or a bare 401 that the caller may try to recover.
+enum StepResult {
+    /// A terminal answer — parsed usage on success, or a surfaced error (Other/RateLimited). No retry.
+    Done(Result<AccountUsageLive, String>),
+    /// HTTP 401. The bearer was rejected; the caller decides whether a re-read or refresh can recover.
+    Unauthorized,
+}
+
+/// The outcome of the ONE sanctioned keychain-token refresh — delegating to the user's own `claude`
+/// CLI, which refreshes its keychain OAuth access token as a side effect of running (when the refresh
+/// token is still valid). See [`claude_refresh_via_auth_status`].
+#[derive(Debug, PartialEq, Eq)]
+enum RefreshOutcome {
+    /// `claude` reports the account can authenticate now (`loggedIn: true`) — i.e. it refreshed the
+    /// keychain token. Re-read it and retry the usage fetch once.
+    Refreshed,
+    /// `claude` reports the account is signed out (`loggedIn: false`): the refresh token is dead, so
+    /// no automatic refresh is possible and only a human sign-in restores it.
+    RelogNeeded,
+    /// The refresh probe could not run or could not be read (no `claude` binary, timeout, or output
+    /// with no boolean `loggedIn`). We learned nothing — treat as terminal, and NEVER over-claim that
+    /// a relogin is needed.
+    Unknown,
 }
 
 /// The token-read → fetch → (on 401) invalidate-and-retry-once flow, with the token read, cache
@@ -1231,37 +1283,172 @@ fn fetch_usage_blocking(
 /// success). Crucially it does NOT delete the cache up front — a forced read that fails leaves the
 /// prior cached token in place — which is why it is a read mode rather than the `invalidate` the 401
 /// path (correctly) uses only after the server has PROVEN the token dead.
+///
+/// THE SANCTIONED REFRESH (`refresh`), added for the "Real usage unavailable after granting the
+/// keychain" report: a plain keychain re-read returns the SAME stored token, so if that token has
+/// gone stale a re-read cannot recover it — a second 401 is inevitable, and the old code stopped
+/// there. When the second 401 arrives AND the read is keychain-eligible (Interactive), we delegate to
+/// the user's own `claude` for THIS account, which refreshes the keychain OAuth token as a side
+/// effect (see [`claude_refresh_via_auth_status`]); on success we re-read the freshly-written token
+/// and retry the usage fetch EXACTLY once. This never loops: at most one refresh and one post-refresh
+/// retry. It is gated on [`TokenAccess::may_read_keychain`] so the Quiet poll chain (10s/60s/120s per
+/// account) can NEVER spawn a `claude` child — and could not read the refreshed token there anyway. A
+/// 429 is untouched by all of this (the token is fine; the account is capped).
 fn fetch_usage_with(
     config_dir: &str,
     access: TokenAccess,
     read_token: impl Fn(&str, TokenAccess) -> Result<String, String>,
     invalidate: impl Fn(&str),
     http_get: impl Fn(&str) -> Result<String, UsageFetchError>,
+    refresh: impl Fn(&str) -> RefreshOutcome,
 ) -> Result<AccountUsageLive, String> {
-    let token = read_token(config_dir, access)?;
-    match http_get(&token) {
-        Ok(text) => parse_usage_response(&text),
-        Err(UsageFetchError::Other(e)) => Err(e),
-        // A 429 is the account being rate-limited, not a stale token — surface it with its honest
-        // marker and DO NOT invalidate or retry (the token is valid; a retry just earns a second
-        // 429, and dropping the cache would cost a needless keychain read next time).
-        Err(UsageFetchError::RateLimited) => Err(RATE_LIMITED_MSG.to_string()),
-        Err(UsageFetchError::Unauthorized) => {
-            // Cached token rejected — drop the cache so the re-read resolves from source, then retry
-            // ONCE. Quiet stays quiet: with the cache gone and no creds file, that re-read returns
-            // "usage unknown" rather than reaching for the keychain.
-            invalidate(config_dir);
-            let token = read_token(config_dir, access)?;
-            match http_get(&token) {
-                Ok(text) => parse_usage_response(&text),
-                Err(UsageFetchError::Other(e)) => Err(e),
-                // The re-read token can itself hit a 429 — same honest marker, still no loop.
-                Err(UsageFetchError::RateLimited) => Err(RATE_LIMITED_MSG.to_string()),
-                Err(UsageFetchError::Unauthorized) => {
-                    Err("usage fetch failed: unauthorized after keychain re-read".to_string())
-                }
-            }
+    // One attempt, collapsed to Done(final) | Unauthorized. A 429 and a non-401 error are terminal
+    // here exactly as before — refresh is for 401/expiry ONLY.
+    let step = |token: &str| -> StepResult {
+        match http_get(token) {
+            Ok(text) => StepResult::Done(parse_usage_response(&text)),
+            Err(UsageFetchError::Other(e)) => StepResult::Done(Err(e)),
+            Err(UsageFetchError::RateLimited) => StepResult::Done(Err(RATE_LIMITED_MSG.to_string())),
+            Err(UsageFetchError::Unauthorized) => StepResult::Unauthorized,
         }
+    };
+
+    // Attempt 1: the token as stored (cache/creds/keychain per `access`).
+    let token = read_token(config_dir, access)?;
+    if let StepResult::Done(r) = step(&token) {
+        return r;
+    }
+
+    // First 401: drop the cache so the re-read resolves from source, then retry ONCE. Quiet stays
+    // quiet: with the cache gone and no creds file, this re-read returns "usage unknown" via `?`
+    // rather than reaching for the keychain.
+    invalidate(config_dir);
+    let token = read_token(config_dir, access)?;
+    if let StepResult::Done(r) = step(&token) {
+        return r;
+    }
+
+    // Second 401: the plain re-read handed back the SAME stale token, so re-reading again cannot help.
+    // A Quiet poll stops here (never spawns `claude`, and could not read a refreshed token anyway);
+    // only an explicit keychain-eligible read attempts the sanctioned refresh.
+    if !access.may_read_keychain() {
+        return Err(UNAUTHORIZED_TERMINAL_MSG.to_string());
+    }
+    match refresh(config_dir) {
+        // A dead refresh token: `claude` cannot restore this; a human must sign in again.
+        RefreshOutcome::RelogNeeded => return Err(SIGN_IN_AGAIN_MSG.to_string()),
+        // The probe told us nothing — fall back to the pre-existing terminal outcome, unchanged.
+        RefreshOutcome::Unknown => return Err(UNAUTHORIZED_TERMINAL_MSG.to_string()),
+        // `claude` refreshed the keychain token. Fall through to re-read + one final retry.
+        RefreshOutcome::Refreshed => {}
+    }
+    invalidate(config_dir);
+    let token = read_token(config_dir, access)?;
+    match step(&token) {
+        StepResult::Done(r) => r,
+        // Refreshed (proven signed in) yet still refused: no more attempts (never loop). Must NOT
+        // claim "sign in again" about an account we just proved is signed in — emit a marker-free
+        // message so the frontend shows its transient card instead.
+        StepResult::Unauthorized => Err(REFRESHED_BUT_REFUSED_MSG.to_string()),
+    }
+}
+
+/// Bound the sanctioned refresh probe. Roomier than accounts.rs's 8s `auth status` timeout because
+/// this fires only on the user-initiated "Check usage levels" path AND the refresh makes its own
+/// OAuth round trip, not just a local read — a cold node start under a busy fleet plus that round trip
+/// needs headroom. Still bounded, so a wedged CLI can never pin the blocking-pool thread.
+const REFRESH_PROBE_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Trigger the ONE sanctioned keychain-token refresh: run the user's own `claude auth status --json`
+/// for THIS account's config dir. Running `claude` refreshes the keychain OAuth access token as a
+/// side effect when the refresh token is still valid — and because `claude` OWNS that keychain item,
+/// this does NOT raise a "Sparkle wants to access key …" prompt. Sparkle deliberately never calls the
+/// OAuth token endpoint itself (that rotates the refresh token and logs `claude` out — see the module
+/// docstring); delegating to `claude` is the ToS-clean, non-rotating path.
+///
+/// `auth status --json` is chosen over a `claude -p` inference call on purpose: it spends ZERO
+/// subscription quota (no model call), it is the codebase's existing per-account auth probe (mirrors
+/// `accounts::run_claude_auth_status`, which we cannot reach because it is private and accounts.rs is
+/// out of scope), and its `loggedIn` field gives the exact Refreshed/RelogNeeded fork the caller
+/// needs. Fail-soft: any inability to run or read the probe is [`RefreshOutcome::Unknown`], which the
+/// caller treats as the pre-existing terminal outcome — never as a false "sign in again".
+///
+/// Never logs a token: `claude auth status --json` prints identity/subscription, never the bearer.
+///
+/// SECURITY: the ANTHROPIC_* scrub is load-bearing and REUSED (not re-typed) from `claude_oneshot`, so
+/// the probe refreshes the SUBSCRIPTION OAuth credential rather than an inherited API key — the same
+/// reasoning as accounts.rs's auth-status probe (roborev 57985).
+fn claude_refresh_via_auth_status(config_dir: &str) -> RefreshOutcome {
+    let Some(claude_path) = crate::preflight::cached_claude_path() else {
+        return RefreshOutcome::Unknown;
+    };
+    let cmd = claude_refresh_command(&claude_path, config_dir);
+    // Hardened capture: drains both streams on reader threads and kills the whole process group on
+    // expiry, so a chatty CLI cannot deadlock the pipe (roborev 57985).
+    let Ok(out) = crate::worktree::output_with_timeout(cmd, REFRESH_PROBE_TIMEOUT) else {
+        return RefreshOutcome::Unknown;
+    };
+    classify_refresh_stdout(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Build the `claude auth status --json` refresh command, fully configured, SEPARATE from the spawn.
+/// Split from [`claude_refresh_via_auth_status`] for the reason accounts.rs split
+/// `claude_auth_status_command` from its run (roborev 57985): the ANTHROPIC_* scrub and the
+/// per-account `CLAUDE_CONFIG_DIR` are invisible at runtime when they regress — every fetch test
+/// injects the `refresh` closure, so nothing here would otherwise be covered and deleting the body
+/// would keep the suite green. This builder is unit-tested against `get_envs()`/`get_args()` so both
+/// are pinned contracts. PURE (no spawn, no IO beyond reading the ambient PATH/HOME).
+///
+/// SECURITY: the scrub is REUSED (not re-typed) from `claude_oneshot`, so the probe refreshes the
+/// SUBSCRIPTION OAuth credential rather than an inherited API key.
+fn claude_refresh_command(claude_path: &str, config_dir: &str) -> std::process::Command {
+    let mut cmd = std::process::Command::new(claude_path);
+    cmd.args(["auth", "status", "--json"]);
+    // Strip every inherited var that could take `claude` off the user's subscription OAuth. Shared
+    // list, referenced not copied, so a name added there cannot go missing here.
+    crate::claude_oneshot::scrub_anthropic_env_for(&mut cmd);
+    // Target THIS account. An EMPTY dir is the default account: export no CLAUDE_CONFIG_DIR at all
+    // (matching claudeSpawn.ts and accounts.rs), so `claude` reads its default login.
+    if !config_dir.is_empty() {
+        cmd.env("CLAUDE_CONFIG_DIR", config_dir);
+    }
+    // A Finder-launched .app inherits no shell PATH, and the CLI's `#!/usr/bin/env node` shebang has
+    // to resolve; prepend ~/.local/bin the same way every other spawn path does. CWD to $HOME because
+    // a Dock-launched bundle's CWD is `/`, which some `claude` paths object to.
+    if let Some(home) = std::env::var_os("HOME") {
+        let path = std::env::var("PATH").unwrap_or_default();
+        let home_str = home.to_string_lossy().into_owned();
+        cmd.env("PATH", format!("{home_str}/.local/bin:{path}"));
+        cmd.current_dir(&home);
+    }
+    cmd
+}
+
+/// Decide the refresh outcome from `claude auth status --json` stdout. PURE, so the Refreshed /
+/// RelogNeeded / Unknown fork is unit-tested without spawning `claude`. Mirrors the tolerant parse in
+/// `accounts::parse_claude_auth_status` (which is private and cannot be reached from here): some
+/// installs print a banner line before the JSON, so scan for the first `{` and, if the whole tail is
+/// not valid JSON, fall back to its first line.
+///
+///  * `loggedIn: true`  → the CLI can authenticate now, i.e. it refreshed → [`RefreshOutcome::Refreshed`];
+///  * `loggedIn: false` → the session is dead and unrefreshable → [`RefreshOutcome::RelogNeeded`];
+///  * anything else (no JSON, no boolean `loggedIn`, empty capture) → [`RefreshOutcome::Unknown`],
+///    fail-soft: we learned nothing, so we do NOT claim a relogin is needed.
+fn classify_refresh_stdout(stdout: &str) -> RefreshOutcome {
+    let Some(start) = stdout.find('{') else {
+        return RefreshOutcome::Unknown;
+    };
+    let parsed: Option<serde_json::Value> = serde_json::from_str(stdout[start..].trim())
+        .ok()
+        .or_else(|| serde_json::from_str(stdout[start..].lines().next()?.trim()).ok());
+    match parsed
+        .as_ref()
+        .and_then(|v| v.get("loggedIn"))
+        .and_then(serde_json::Value::as_bool)
+    {
+        Some(true) => RefreshOutcome::Refreshed,
+        Some(false) => RefreshOutcome::RelogNeeded,
+        None => RefreshOutcome::Unknown,
     }
 }
 
@@ -2739,6 +2926,7 @@ mod tests {
                     Ok(r#"{"five_hour":{"utilization":7.0}}"#.to_string())
                 }
             },
+            |_cd: &str| -> RefreshOutcome { unreachable!("the plain re-read resolved the 401") },
         )
         .expect("retry with the re-read token must succeed");
         assert_eq!(out.five_hour_percent, Some(7.0));
@@ -2761,6 +2949,7 @@ mod tests {
             },
             |_cd| *invalidated.borrow_mut() = true,
             |_token| Err(UsageFetchError::Other("network down".to_string())),
+            |_cd: &str| -> RefreshOutcome { unreachable!("a non-401 must not reach the refresh") },
         )
         .unwrap_err();
         assert_eq!(err, "network down");
@@ -2788,6 +2977,7 @@ mod tests {
             },
             |_cd| *invalidated.borrow_mut() = true,
             |_token| Err(UsageFetchError::RateLimited),
+            |_cd: &str| -> RefreshOutcome { unreachable!("a 429 must not reach the refresh") },
         )
         .unwrap_err();
         assert_eq!(err, RATE_LIMITED_MSG);
@@ -2810,6 +3000,8 @@ mod tests {
             },
             |_cd| {},
             |_token| Err(UsageFetchError::Unauthorized),
+            // Quiet, so the keychain-eligibility gate returns terminal BEFORE any refresh spawn.
+            |_cd: &str| -> RefreshOutcome { unreachable!("a Quiet poll must never spawn the refresh") },
         )
         .unwrap_err();
         assert!(err.contains("unauthorized"));
@@ -2835,6 +3027,7 @@ mod tests {
             },
             |_cd| *invalidated.borrow_mut() = true,
             |_token| Ok(r#"{"five_hour":{"utilization":3.0}}"#.to_string()),
+            |_cd: &str| -> RefreshOutcome { unreachable!("the first attempt succeeds; no refresh") },
         )
         .expect("a forced fetch must succeed");
         assert_eq!(out.five_hour_percent, Some(3.0));
@@ -2865,6 +3058,7 @@ mod tests {
             },
             |_cd| {},
             |_token| Ok(r#"{"five_hour":{"utilization":9.0}}"#.to_string()),
+            |_cd: &str| -> RefreshOutcome { unreachable!("the first attempt succeeds; no refresh") },
         )
         .expect("a non-forced fetch must succeed");
         assert_eq!(out.five_hour_percent, Some(9.0));
@@ -2898,6 +3092,8 @@ mod tests {
             },
             |_cd| *invalidated.borrow_mut() = true,
             |_token| Err(UsageFetchError::Unauthorized),
+            // Quiet, so the re-read `?`-errors out before the keychain-eligibility gate is reached.
+            |_cd: &str| -> RefreshOutcome { unreachable!("a Quiet poll must never spawn the refresh") },
         )
         .unwrap_err();
         assert!(*invalidated.borrow(), "a 401 must still invalidate the cache");
@@ -2910,6 +3106,250 @@ mod tests {
             err.starts_with(USAGE_UNKNOWN_PREFIX),
             "the degraded re-read is what the user sees; got {err:?}"
         );
+    }
+
+    #[test]
+    fn fetch_refreshes_via_claude_when_a_re_read_cannot_clear_the_401_then_the_retry_succeeds() {
+        // THE SIDE EFFECT this whole change exists for. Interactive path: the stored token 401s, the
+        // plain keychain re-read hands back the SAME stale token and 401s AGAIN, so only the
+        // sanctioned `claude` refresh can recover it. After the refresh, the re-read yields a FRESH
+        // token and the usage fetch SUCCEEDS. Non-vacuous: delete the "re-read + retry after
+        // Refreshed" wiring and the fetch never gets the fresh token, so this success assertion reds.
+        let reads = RefCell::new(0);
+        let refreshed = RefCell::new(0);
+        let out = fetch_usage_with(
+            "/cfg/a",
+            TokenAccess::Interactive,
+            |_cd, _access| {
+                let mut n = reads.borrow_mut();
+                *n += 1;
+                // Reads 1 and 2 are the stale stored token (cache, then keychain re-read); read 3,
+                // taken ONLY after the refresh, is the freshly-written token.
+                Ok(if *n >= 3 { "fresh-token" } else { "stale-token" }.to_string())
+            },
+            |_cd| {},
+            |token| {
+                if token == "fresh-token" {
+                    Ok(r#"{"five_hour":{"utilization":11.0}}"#.to_string())
+                } else {
+                    Err(UsageFetchError::Unauthorized)
+                }
+            },
+            |_cd| {
+                *refreshed.borrow_mut() += 1;
+                RefreshOutcome::Refreshed
+            },
+        )
+        .expect("the fetch must succeed on the token claude refreshed");
+        assert_eq!(
+            out.five_hour_percent,
+            Some(11.0),
+            "the refreshed retry must return real usage"
+        );
+        assert_eq!(*refreshed.borrow(), 1, "exactly one refresh — never a loop");
+        assert_eq!(
+            *reads.borrow(),
+            3,
+            "stored token, keychain re-read, then the post-refresh read"
+        );
+    }
+
+    #[test]
+    fn fetch_falls_back_to_sign_in_again_when_the_refresh_token_is_dead() {
+        // The refresh token is itself dead: `claude` reports the account signed out, so no automatic
+        // refresh is possible. Surface the sign-in remedy AND stop — no post-refresh retry, no loop.
+        // Non-vacuous: a "retry anyway after RelogNeeded" implementation would take a third read.
+        let reads = RefCell::new(0);
+        let refreshed = RefCell::new(0);
+        let err = fetch_usage_with(
+            "/cfg/a",
+            TokenAccess::Interactive,
+            |_cd, _access| {
+                *reads.borrow_mut() += 1;
+                Ok("stale-token".to_string())
+            },
+            |_cd| {},
+            |_token| Err(UsageFetchError::Unauthorized),
+            |_cd| {
+                *refreshed.borrow_mut() += 1;
+                RefreshOutcome::RelogNeeded
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err, SIGN_IN_AGAIN_MSG);
+        assert!(
+            err.contains("unauthorized"),
+            "must keep the marker the frontend routes on: {err:?}"
+        );
+        assert!(err.contains("sign in again"), "must spell out the remedy: {err:?}");
+        assert_eq!(*refreshed.borrow(), 1, "exactly one refresh attempt");
+        assert_eq!(
+            *reads.borrow(),
+            2,
+            "no post-refresh retry when the refresh token is dead"
+        );
+    }
+
+    #[test]
+    fn a_refresh_that_still_401s_never_tells_a_signed_in_account_to_sign_in() {
+        // `claude` proved this account signed in (Refreshed), but the usage endpoint STILL 401s
+        // (endpoint-side revocation, or a seat without usage access). The terminal message must NOT
+        // carry the `unauthorized` marker the frontend routes to "sign in again" — the account was
+        // just proven signed in — and we still must not loop. Non-vacuous: reinstating the old
+        // `unauthorized` terminal string reddens the marker assertion.
+        let reads = RefCell::new(0);
+        let err = fetch_usage_with(
+            "/cfg/a",
+            TokenAccess::Interactive,
+            |_cd, _access| {
+                *reads.borrow_mut() += 1;
+                Ok("stale-token".to_string())
+            },
+            |_cd| {},
+            |_token| Err(UsageFetchError::Unauthorized),
+            |_cd| RefreshOutcome::Refreshed,
+        )
+        .unwrap_err();
+        assert_eq!(err, REFRESHED_BUT_REFUSED_MSG);
+        assert!(
+            !err.contains("unauthorized"),
+            "a proven-signed-in account must not be routed to the sign-in remedy: {err:?}"
+        );
+        assert_eq!(
+            *reads.borrow(),
+            3,
+            "stored, keychain re-read, post-refresh read — then terminal, no loop"
+        );
+    }
+
+    #[test]
+    fn claude_refresh_command_scrubs_anthropic_env_and_targets_the_account() {
+        // The scrub and the per-account CLAUDE_CONFIG_DIR are invisible at runtime when they regress,
+        // so pin them (mirrors accounts::claude_auth_status_command / roborev 57985). Deleting the
+        // scrub line or the config-dir line reddens this.
+        let named = claude_refresh_command("/usr/local/bin/claude", "/cfg/a");
+        let envs: Vec<(String, Option<String>)> = named
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        // Every ANTHROPIC_* override is REMOVED — `get_envs` reports a removed var with a `None` value.
+        for name in ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"] {
+            assert!(
+                envs.iter().any(|(k, v)| k == name && v.is_none()),
+                "{name} must be scrubbed (removed) from the refresh probe env; got {envs:?}"
+            );
+        }
+        // It probes THIS account's config dir.
+        assert!(
+            envs.iter()
+                .any(|(k, v)| k == "CLAUDE_CONFIG_DIR" && v.as_deref() == Some("/cfg/a")),
+            "the named account's CLAUDE_CONFIG_DIR must be exported; got {envs:?}"
+        );
+        // The args are the cheap no-op auth probe, never a `-p` inference call.
+        let args: Vec<String> = named
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args, vec!["auth", "status", "--json"]);
+
+        // The default account (empty dir) exports NO CLAUDE_CONFIG_DIR override — it inherits the
+        // default login, matching accounts.rs. Pinning the empty case is what the review asked for.
+        let default = claude_refresh_command("/usr/local/bin/claude", "");
+        assert!(
+            !default
+                .get_envs()
+                .any(|(k, v)| k == "CLAUDE_CONFIG_DIR" && v.is_some()),
+            "the default account must not pin a CLAUDE_CONFIG_DIR override"
+        );
+    }
+
+    #[test]
+    fn fetch_treats_an_unknown_refresh_as_terminal_without_retrying() {
+        // The refresh probe could not run (no claude, timeout, garbage). We learned nothing, so fall
+        // back to the pre-existing terminal outcome — NOT a false "sign in again", and NO retry.
+        let reads = RefCell::new(0);
+        let err = fetch_usage_with(
+            "/cfg/a",
+            TokenAccess::Interactive,
+            |_cd, _access| {
+                *reads.borrow_mut() += 1;
+                Ok("stale-token".to_string())
+            },
+            |_cd| {},
+            |_token| Err(UsageFetchError::Unauthorized),
+            |_cd| RefreshOutcome::Unknown,
+        )
+        .unwrap_err();
+        assert_eq!(err, UNAUTHORIZED_TERMINAL_MSG);
+        assert_eq!(
+            *reads.borrow(),
+            2,
+            "an unknown refresh must not trigger a post-refresh read"
+        );
+    }
+
+    #[test]
+    fn a_quiet_poll_never_spawns_the_refresh_even_with_a_creds_file_token() {
+        // The poll chain (10s/60s/120s per account) is Quiet. Even a machine with a
+        // `.credentials.json` token — where the Quiet re-read DOES return a token and can 401 twice —
+        // must never spawn a `claude` refresh child on that cadence. Non-vacuous: the refresh closure
+        // records, and removing the keychain-eligibility gate would let it fire here.
+        let reads = RefCell::new(0);
+        let refreshed = RefCell::new(0);
+        let err = fetch_usage_with(
+            "/cfg/a",
+            TokenAccess::Quiet,
+            |_cd, _access| {
+                *reads.borrow_mut() += 1;
+                Ok("creds-file-token".to_string())
+            },
+            |_cd| {},
+            |_token| Err(UsageFetchError::Unauthorized),
+            |_cd| {
+                *refreshed.borrow_mut() += 1;
+                RefreshOutcome::Refreshed
+            },
+        )
+        .unwrap_err();
+        assert_eq!(*refreshed.borrow(), 0, "a Quiet poll must NOT spawn the refresh");
+        assert_eq!(err, UNAUTHORIZED_TERMINAL_MSG);
+        assert_eq!(
+            *reads.borrow(),
+            2,
+            "two attempts, then terminal — no refresh, no loop"
+        );
+    }
+
+    #[test]
+    fn classify_refresh_stdout_reads_the_logged_in_bit() {
+        // loggedIn:true → we refreshed; false → relogin; missing/garbage/empty → unknown (fail-soft,
+        // never a false RelogNeeded).
+        assert_eq!(
+            classify_refresh_stdout(
+                r#"{"loggedIn":true,"authMethod":"claude.ai","subscriptionType":"max"}"#
+            ),
+            RefreshOutcome::Refreshed,
+        );
+        assert_eq!(
+            classify_refresh_stdout(r#"{"loggedIn":false}"#),
+            RefreshOutcome::RelogNeeded,
+        );
+        // A banner line before the JSON, exactly the shape accounts.rs's probe tolerates.
+        assert_eq!(
+            classify_refresh_stdout("Some update notice\n{\"loggedIn\":true}"),
+            RefreshOutcome::Refreshed,
+        );
+        assert_eq!(
+            classify_refresh_stdout(r#"{"other":1}"#),
+            RefreshOutcome::Unknown,
+        );
+        assert_eq!(classify_refresh_stdout("not json at all"), RefreshOutcome::Unknown);
+        assert_eq!(classify_refresh_stdout(""), RefreshOutcome::Unknown);
     }
 
     #[test]
