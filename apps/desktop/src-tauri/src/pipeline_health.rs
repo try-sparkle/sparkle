@@ -715,13 +715,14 @@ fn classify_not_answering(timed_out: bool, ev: DaemonEvidence) -> (HealthState, 
 /// Pull the `Jobs:` line out of `roborev status` for the panel detail, e.g.
 /// "14 queued, 4 running, 15488 completed". Best-effort — an empty string if the line is absent.
 ///
-/// The `N failed` term is QUALIFIED on the way through — see {@link qualify_failed_term}. Doing it
-/// here rather than at each call site is deliberate: this is the one function that turns that line
-/// into panel text, so there is no second path by which a bare count can reach a human.
+/// The `N failed` and `N completed` terms are QUALIFIED on the way through — see
+/// {@link qualify_cumulative_terms}. Doing it here rather than at each call site is deliberate: this
+/// is the one function that turns that line into panel text, so there is no second path by which a
+/// bare count can reach a human.
 fn jobs_summary(out: &str) -> String {
     out.lines()
         .find(|l| l.trim_start().starts_with("Jobs:"))
-        .map(|l| qualify_failed_term(l.trim_start().trim_start_matches("Jobs:").trim()))
+        .map(|l| qualify_cumulative_terms(l.trim_start().trim_start_matches("Jobs:").trim()))
         .unwrap_or_default()
 }
 
@@ -730,34 +731,55 @@ fn jobs_summary(out: &str) -> String {
 const FAILED_TERM_CAVEAT: &str =
     "cumulative; mostly jobs whose worktree vanished, not review verdicts";
 
-/// Qualify the `N failed` term of a `Jobs:` line, and ONLY that term.
+/// The marker stapled to the `completed` count. Kept as a constant because the test asserts on the
+/// word "lifetime": the point is that this is the frozen DENOMINATOR, not a live one.
+const COMPLETED_TERM_MARKER: &str = "lifetime total, not a current rate";
+
+/// Qualify the two CUMULATIVE terms of a `Jobs:` line — `N completed` and `N failed` — and only
+/// those two. `queued` / `running` / `skipped` are live gauges of the current queue and are left
+/// verbatim.
 ///
-/// WHY (bead `sparkle-xelans.11`): `roborev status` reports a CUMULATIVE `N failed`, and this panel
-/// published it verbatim. Measured against the real store on 2026-08-24, 3061 of 4509 failed rows
-/// (67.9%) died with `chdir <path>: no such file or directory` — jobs that never entered a repo, so
-/// they never opened a diff and never reached a verdict. They are infrastructure casualties,
-/// overwhelmingly deleted temp repos from this repo's own test suites. A human reading "4385 failed"
-/// in a health panel reads it as a review-failure RATE, which is how two months of deleted temp
-/// dirs became a standing alarm.
+/// WHY THE `failed` TERM (bead `sparkle-xelans.11`): `roborev status` reports a CUMULATIVE `N
+/// failed`, and this panel published it verbatim. Measured against the real store on 2026-08-24,
+/// 3061 of 4509 failed rows (67.9%) died with `chdir <path>: no such file or directory` — jobs that
+/// never entered a repo, so they never opened a diff and never reached a verdict. They are
+/// infrastructure casualties, overwhelmingly deleted temp repos from this repo's own test suites. A
+/// human reading "4385 failed" in a health panel reads it as a review-failure RATE.
 ///
-/// Two properties the tests pin, both of which are easy to get wrong in opposite directions:
-///   • The number is NOT suppressed. Hiding it would trade one wrong reading for no data at all.
-///   • The caveat is DERIVED from the value, never stapled on unconditionally. On a daemon with
-///     `0 failed` nothing was abandoned, so claiming otherwise would be its own lie.
-/// And it must not leak onto `queued` / `running` / `completed` / `skipped`, which were never
-/// ambiguous — so this rewrites one term rather than appending to the line.
-fn qualify_failed_term(summary: &str) -> String {
+/// WHY THE `completed` TERM (bead `sparkle-7d6tta`): a rate needs two numbers, and qualifying only
+/// `failed` left the DENOMINATOR bare — so `4385 failed` over `17591 completed` still reads as a
+/// live "~20% failure rate" when it is nothing of the kind. Measured on 2026-08-24 the `completed`
+/// count had not moved for over ten hours while commits landed (the enqueue path was severed), so it
+/// is a lifetime tally accumulated since the store began, NOT a current-window denominator. Marking
+/// it lifetime is what makes the pair un-readable as a current rate.
+///
+/// Properties the tests pin, each easy to get wrong in opposite directions:
+///   • Neither number is SUPPRESSED. Hiding a count would trade one wrong reading for no data.
+///   • The `failed` caveat is DERIVED from the value: on `0 failed` nothing was abandoned, so
+///     claiming otherwise would be its own lie — it is stapled only to a POSITIVE count.
+///   • The `completed` marker is UNCONDITIONAL on any parseable count including zero, because
+///     `completed` is a lifetime counter whatever its value; the "not a current rate" reading it
+///     defends against does not depend on the number being large.
+///   • Neither leaks onto `queued` / `running` / `skipped`, which are genuinely current — so this
+///     rewrites individual terms rather than appending to the whole line.
+fn qualify_cumulative_terms(summary: &str) -> String {
     summary
         .split(',')
         .map(|term| {
             let term = term.trim();
-            match term.strip_suffix(" failed") {
+            if let Some(count) = term.strip_suffix(" failed") {
                 // `0 failed` (and any unparseable count) is left exactly as it was.
-                Some(count) if count.trim().parse::<u64>().is_ok_and(|n| n > 0) => {
-                    format!("{term} ({FAILED_TERM_CAVEAT})")
+                if count.trim().parse::<u64>().is_ok_and(|n| n > 0) {
+                    return format!("{term} ({FAILED_TERM_CAVEAT})");
                 }
-                _ => term.to_string(),
             }
+            if let Some(count) = term.strip_suffix(" completed") {
+                // Any parseable count, INCLUDING zero: `completed` is a lifetime counter regardless.
+                if count.trim().parse::<u64>().is_ok() {
+                    return format!("{term} ({COMPLETED_TERM_MARKER})");
+                }
+            }
+            term.to_string()
         })
         .collect::<Vec<_>>()
         .join(", ")
@@ -3265,10 +3287,11 @@ mod tests {
         );
     }
 
-    /// The rewrite must touch ONLY the `failed` term. A caveat that leaked onto `completed` or
-    /// `queued` would corrupt the one part of this line that was never ambiguous.
+    /// The rewrite touches ONLY the two CUMULATIVE terms (`completed`, `failed`). A marker that
+    /// leaked onto `queued` / `running` / `skipped` would corrupt the live gauges of the current
+    /// queue, which were never ambiguous.
     #[test]
-    fn qualifying_the_failed_term_leaves_every_other_queue_term_intact() {
+    fn qualifying_cumulative_terms_leaves_the_live_queue_gauges_intact() {
         let out = "Daemon: running (uptime: 3m 54s) [v0.53.1]\n\
                    Workers: 4/4 active\n\
                    Jobs:    14 queued, 4 running, 15488 completed, 3437 failed, 0 skipped\n\
@@ -3277,17 +3300,69 @@ mod tests {
             .to_string();
         let (_, detail) =
             classify_roborev(&StatusProbe::Text(out), DaemonEvidence::loaded(Some(true)));
-        for term in ["14 queued", "4 running", "15488 completed", "0 skipped"] {
+        for term in ["14 queued", "4 running", "0 skipped"] {
             let i = detail
                 .find(term)
                 .unwrap_or_else(|| panic!("{term} should survive verbatim: {detail}"));
             let after = &detail[i + term.len()..];
             assert!(
                 !after.starts_with(" ("),
-                "the caveat leaked onto `{term}`, which was never ambiguous: {detail}"
+                "a marker leaked onto `{term}`, a live gauge that was never ambiguous: {detail}"
             );
         }
-        assert!(detail.contains("3437 failed ("), "the failed term is the one qualified: {detail}");
+        assert!(detail.contains("3437 failed ("), "the failed term is qualified: {detail}");
+        assert!(detail.contains("15488 completed ("), "the completed term is qualified: {detail}");
+    }
+
+    /// THE FROZEN DENOMINATOR (bead `sparkle-7d6tta`). Qualifying only `failed` still left a rate
+    /// readable: `4385 failed` over `17591 completed` (the founder's own numbers, from
+    /// `healthy_status`) reads as a live "~20% failure rate" when `completed` is bare. The fix marks
+    /// the denominator as a lifetime tally so the PAIR cannot be read as a current rate. This test
+    /// fails against the pre-change code, where `17591 completed` reached the panel unqualified.
+    #[test]
+    fn the_completed_denominator_is_marked_lifetime_so_no_current_rate_is_readable() {
+        let (state, detail) =
+            classify_roborev(&StatusProbe::Text(healthy_status()), DaemonEvidence::loaded(Some(true)));
+        assert_eq!(state, HealthState::Healthy, "{detail}");
+        // The denominator is not suppressed — the real number is still shown.
+        let idx = detail
+            .find("17591 completed")
+            .unwrap_or_else(|| panic!("the completed count should still be published: {detail}"));
+        let after = &detail["17591 completed".len() + idx..];
+        assert!(
+            after.starts_with(" ("),
+            "the completed denominator reached the panel BARE, where it reads as a live rate: {detail}"
+        );
+        assert!(
+            after.to_lowercase().contains("lifetime")
+                && after.to_lowercase().contains("not a current rate"),
+            "the denominator must say it is a lifetime tally, not a current rate, in words: {detail}"
+        );
+        // And the numerator is still marked cumulative — so BOTH halves of any ratio are lifetime.
+        assert!(
+            detail.contains("4385 failed ("),
+            "the failed numerator must also be qualified, or the pair still reads as a rate: {detail}"
+        );
+    }
+
+    /// THE UNCONDITIONAL MARKER. Unlike the `failed` caveat, the `completed` marker is stapled for
+    /// ANY parseable count including zero, because `completed` is a lifetime counter whatever its
+    /// value. Without this, a "derive it from the value like `failed`" refactor would strip the
+    /// marker on a fresh daemon and the suite would stay green — so pin the zero case.
+    #[test]
+    fn a_zero_completed_count_is_still_marked_lifetime() {
+        let out = "Daemon: running (uptime: 30s) [v0.53.1]\n\
+                   Health: OK\n\
+                   Jobs: 0 queued, 0 running, 0 completed, 0 failed, 0 skipped\n"
+            .to_string();
+        let (_, detail) =
+            classify_roborev(&StatusProbe::Text(out), DaemonEvidence::loaded(Some(true)));
+        let idx = detail.find("0 completed").unwrap_or_else(|| panic!("completed shown: {detail}"));
+        let after = &detail["0 completed".len() + idx..];
+        assert!(
+            after.starts_with(" (") && after.to_lowercase().contains("lifetime"),
+            "a zero completed count must still be marked lifetime: {detail}"
+        );
     }
 
     /// A running daemon that reports a non-OK health (a sick subsystem) is degraded → WARNING, not
