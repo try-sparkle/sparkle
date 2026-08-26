@@ -78,6 +78,40 @@ export const BABYSIT_LEASE_LIST_COMMAND = "babysit_leases";
 export const BABYSIT_LEASE_ACQUIRE_COMMAND = "babysit_lease_acquire";
 export const BABYSIT_LEASE_RELEASE_COMMAND = "babysit_lease_release";
 
+/** MUST match `REASON_HELD_LIVE` in `babysit_lease.rs` — the ONE refusal that is not a bug. */
+export const BABYSIT_LEASE_REASON_HELD_LIVE = "held-live";
+
+/**
+ * THE CEILING `babysit_lease.rs::is_agent_id` ENFORCES. An id one byte over is rejected, and the
+ * rejection is indistinguishable from "another driver holds it" to a caller reading `acquired`.
+ */
+export const BABYSIT_HOLDER_ID_MAX_LEN = 128;
+
+/**
+ * THE HOLDER ID THE ACQUIRE IS TAKEN UNDER — and the ONE place its alphabet is decided.
+ *
+ * `babysit_lease.rs::is_agent_id` accepts `[A-Za-z0-9_-]{1,128}` and nothing else, because the same
+ * shape is what `worktree::validate_id` requires before an id is joined onto a path. The previous
+ * mint here was `babysit-dispatch:${repo}#${pr}:${now}` — whose `:`, `/` and `#` that validator
+ * rejects — so EVERY acquire in the history of this module bailed before it touched the store and
+ * `dispatchOne` returned null silently. Zero drivers were ever dispatched (sparkle-2hsrlz).
+ *
+ * The repo half is folded to the accepted alphabet AND truncated, because GitHub's maximum slug
+ * (39-char owner + 100-char name) overruns 128 bytes on its own — a second, independent way to mint
+ * an id the store will not take. `pr` and `now` are kept whole and at the END: they are what make
+ * the id unique per attempt, and truncating those instead would let two sweeps collide.
+ *
+ * `apps/desktop/shared/babysit-holder-id.fixture.json` pins the output of this function, and the
+ * Rust suite feeds those same strings to the real validator — so the two halves fail TOGETHER.
+ */
+export function mintDispatchHolderId(repo: string, pr: number, nowMs: number): string {
+  const prefix = "babysit-dispatch_";
+  const suffix = `_${pr}_${nowMs}`;
+  const budget = BABYSIT_HOLDER_ID_MAX_LEN - prefix.length - suffix.length;
+  const slug = repo.replace(/[^A-Za-z0-9_-]/g, "-").slice(0, Math.max(0, budget));
+  return `${prefix}${slug}${suffix}`;
+}
+
 /** How often the sweep runs. See the header for why this is the PR-poll cadence and not faster. */
 export const BABYSIT_SWEEP_MS = OPEN_PR_POLL_MS;
 
@@ -656,20 +690,45 @@ async function dispatchOne(
   now: number,
   isCurrent: () => boolean = () => true,
 ): Promise<string | null> {
-  const holder = `babysit-dispatch:${repo}#${pr}:${now}`;
+  const holder = mintDispatchHolderId(repo, pr, now);
   let acquired = false;
+  // `reason` and `detail` are Rust `Option`s, so they cross the wire as `null` — NEVER as an absent
+  // key. Typing them `?: string` alone would describe a shape the wire cannot produce.
+  let refusal: { reason?: string | null; detail?: string | null } = {};
   try {
-    const res = await invoke<{ acquired?: boolean }>(BABYSIT_LEASE_ACQUIRE_COMMAND, {
-      repo,
-      pr,
-      agentId: holder,
-    });
+    const res = await invoke<{ acquired?: boolean; reason?: string | null; detail?: string | null }>(
+      BABYSIT_LEASE_ACQUIRE_COMMAND,
+      { repo, pr, agentId: holder },
+    );
     acquired = res?.acquired === true;
+    refusal = { reason: res?.reason ?? null, detail: res?.detail ?? null };
   } catch (e) {
     log.warn("babysit", "lease acquire failed; not dispatching", { repo, pr, error: String(e) });
     return null;
   }
-  if (!acquired) return null;
+  if (!acquired) {
+    // SAY WHY. A refusal for `held-live` is the ordinary one-driver-per-PR outcome and is debug.
+    // Any OTHER reason means this caller handed the lease store arguments it rejected — a bug here,
+    // not a decision — and a bare `return null` is what hid exactly that for the whole history of
+    // this module: 49,381 sweeps, `dispatched_total=0` in every one, and not a single log line
+    // anywhere that named the cause (sparkle-2hsrlz).
+    if (refusal.reason === BABYSIT_LEASE_REASON_HELD_LIVE) {
+      log.debug("babysit", "not dispatching: another driver already holds the lease", {
+        repo,
+        pr,
+        detail: refusal.detail ?? null,
+      });
+    } else {
+      log.warn("babysit", "lease acquire REFUSED for a non-held reason; not dispatching", {
+        repo,
+        pr,
+        holder,
+        reason: refusal.reason ?? "unreported",
+        detail: refusal.detail ?? null,
+      });
+    }
+    return null;
+  }
 
   /** Give the holder back. Every exit after the acquire that did NOT leave a driver running must
    *  call this, or the PR is silent until the lease goes stale 90 minutes later. */

@@ -6,6 +6,8 @@
 // SIDE EFFECT — whether a spawn happened, whether a lease was released — never against a
 // precondition, because a precondition assertion would have passed before this module existed.
 import { describe, it, expect, afterEach, beforeEach, vi } from "vitest";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 
 const invokeMock = vi.fn();
 const spawnMock = vi.fn();
@@ -13,6 +15,10 @@ const fetchOpenPrsMock = vi.fn();
 const capacityMock = vi.fn(() => ({ atCapacity: false, used: 0, limit: 8, basis: "test" }));
 const logInfoMock = vi.fn();
 const logDebugMock = vi.fn();
+// Capturable, not `vi.fn()` inline: a lease refused for a reason OTHER than `held-live` is a bug in
+// this module's own arguments, and "it was reported at warn, naming the reason" is the assertion —
+// the previous silent `return null` is what hid a total outage (sparkle-2hsrlz).
+const logWarnMock = vi.fn();
 
 // The logger is mocked so the sweep rollup's LEVEL is assertable. `logger.ts` does not forward
 // DEBUG to the persistent log in production, so "which hold fired" is only answerable if this line
@@ -21,7 +27,7 @@ vi.mock("../logger", () => ({
   log: {
     info: (...a: unknown[]) => logInfoMock(...a),
     debug: (...a: unknown[]) => logDebugMock(...a),
-    warn: vi.fn(),
+    warn: (...a: unknown[]) => logWarnMock(...a),
     error: vi.fn(),
   },
 }));
@@ -38,9 +44,12 @@ vi.mock("./openPrs", async (orig) => {
 });
 
 import {
+  BABYSIT_HOLDER_ID_MAX_LEN,
   BABYSIT_LEASE_ACQUIRE_COMMAND,
   BABYSIT_LEASE_LIST_COMMAND,
+  BABYSIT_LEASE_REASON_HELD_LIVE,
   BABYSIT_LEASE_RELEASE_COMMAND,
+  mintDispatchHolderId,
   _resetBabysitDispatcherForTests,
   babysitPrompt,
   sweepAllProjects,
@@ -120,6 +129,10 @@ function wireInvoke(opts: {
   leases?: unknown[];
   acquired?: boolean;
   acquireThrows?: boolean;
+  /** The Rust `AcquireOutcome.reason`. Crosses the wire as `null` when acquired, never absent. */
+  acquireReason?: string | null;
+  /** The Rust `AcquireOutcome.detail`. Same null-not-absent rule. */
+  acquireDetail?: string | null;
   /** The project's `[review]` table. Omitted = the shipped default: a reviewer, key NOT armed. */
   review?: { pr_reviewer?: string; require_review?: boolean };
   /** Make `get_config` throw, so the fail-closed path in `readReviewPolicy` is drivable. */
@@ -140,7 +153,12 @@ function wireInvoke(opts: {
     if (cmd === KNIGHTWATCH_PROBE_GATE_COMMAND) return opts.gate ?? gateWithUnansweredBlocking();
     if (cmd === BABYSIT_LEASE_ACQUIRE_COMMAND) {
       if (opts.acquireThrows) throw new Error("bridge down");
-      return { acquired: opts.acquired ?? true };
+      const acquired = opts.acquired ?? true;
+      return {
+        acquired,
+        reason: acquired ? null : (opts.acquireReason ?? BABYSIT_LEASE_REASON_HELD_LIVE),
+        detail: opts.acquireDetail ?? null,
+      };
     }
     if (cmd === BABYSIT_LEASE_RELEASE_COMMAND) return null;
     throw new Error(`unexpected command ${cmd}`);
@@ -159,6 +177,7 @@ beforeEach(() => {
   fetchOpenPrsMock.mockReset();
   logInfoMock.mockReset();
   logDebugMock.mockReset();
+  logWarnMock.mockReset();
   capacityMock.mockReturnValue({ atCapacity: false, used: 0, limit: 8, basis: "test" });
   spawnMock.mockReturnValue("agent-1");
   fetchOpenPrsMock.mockResolvedValue([prWithProbe()]);
@@ -501,21 +520,21 @@ describe("consecutive refusals — one is contention, a run of them is wedged", 
   }
 
   it("stays QUIET below the threshold — a lost acquire race is what the compare-and-set is for", async () => {
-    vi.mocked(log.warn).mockClear();
+    logWarnMock.mockClear();
     const out = await refuse(BABYSIT_REFUSAL_STREAK_WEDGED - 1);
 
     // The refusals really did happen — without this the test would pass on a sweep that never ran.
     expect(out.holds["lease-lost-or-spawn-refused"]).toBe(1);
     expect(out.wedged).toBe(0);
-    expect(vi.mocked(log.warn).mock.calls.filter((c) => c[1] === "a PR keeps being chosen for a driver and keeps not getting one")).toHaveLength(0);
+    expect(logWarnMock.mock.calls.filter((c) => c[1] === "a PR keeps being chosen for a driver and keeps not getting one")).toHaveLength(0);
   });
 
   it("reports WEDGED and warns once when the run reaches the threshold", async () => {
-    vi.mocked(log.warn).mockClear();
+    logWarnMock.mockClear();
     const out = await refuse(BABYSIT_REFUSAL_STREAK_WEDGED);
 
     expect(out.wedged).toBe(1);
-    const warns = vi.mocked(log.warn).mock.calls.filter((c) => c[1] === "a PR keeps being chosen for a driver and keeps not getting one");
+    const warns = logWarnMock.mock.calls.filter((c) => c[1] === "a PR keeps being chosen for a driver and keeps not getting one");
     expect(warns).toHaveLength(1);
     // It has to name WHICH PR, or the warn is no more actionable than the info line it replaces.
     expect(warns[0]?.[2]).toMatchObject({
@@ -526,7 +545,7 @@ describe("consecutive refusals — one is contention, a run of them is wedged", 
   });
 
   it("does NOT re-warn every sweep once wedged, but keeps COUNTING it", async () => {
-    vi.mocked(log.warn).mockClear();
+    logWarnMock.mockClear();
     // A few sweeps past the threshold, still well short of the re-warn interval.
     const out = await refuse(BABYSIT_REFUSAL_STREAK_WEDGED + 3);
 
@@ -534,7 +553,7 @@ describe("consecutive refusals — one is contention, a run of them is wedged", 
     expect(out.wedged).toBe(1);
     // ...but the warn fired once, not four times. A line that repeats forever reads as background
     // noise — that is the 143-warns-a-day failure this file's rollup describe records.
-    expect(vi.mocked(log.warn).mock.calls.filter((c) => c[1] === "a PR keeps being chosen for a driver and keeps not getting one")).toHaveLength(1);
+    expect(logWarnMock.mock.calls.filter((c) => c[1] === "a PR keeps being chosen for a driver and keeps not getting one")).toHaveLength(1);
   });
 
   // NOT "the dispatch branch resets the counter" — that reset was written, MUTATION-TESTED, and
@@ -582,7 +601,7 @@ describe("consecutive refusals — one is contention, a run of them is wedged", 
 // is exactly how the measured two-day stall stayed invisible.
 describe("sweepAllProjects — a WEDGED sweep is promoted out of info", () => {
   it("emits the rollup at warn, with the wedged count, once a PR is stuck", async () => {
-    vi.mocked(log.warn).mockClear();
+    logWarnMock.mockClear();
     wireInvoke({ leases: [], acquired: false });
 
     for (let i = 0; i <= BABYSIT_REFUSAL_STREAK_WEDGED; i += 1) {
@@ -595,7 +614,7 @@ describe("sweepAllProjects — a WEDGED sweep is promoted out of info", () => {
       });
     }
 
-    const warned = vi.mocked(log.warn).mock.calls.filter((c) => c[0] === "babysit" && c[1] === "sweep could not dispatch a PR it keeps choosing");
+    const warned = logWarnMock.mock.calls.filter((c) => c[0] === "babysit" && c[1] === "sweep could not dispatch a PR it keeps choosing");
     expect(warned).toHaveLength(1);
     expect((warned[0]?.[2] as { wedged: number }).wedged).toBe(1);
 
@@ -1489,5 +1508,131 @@ describe("`never-reviewed` — the sweep carries the repo's review policy into t
     // unreadable policy was correctly read as NOT ARMED.
     expect(out.holds["no-evidence"]).toBe(1);
     expect(out.failed).toBe(0);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+// THE HOLDER ID — the string the acquire is actually taken under.
+//
+// This module dispatched ZERO drivers for the entire history of the repo because the id it minted
+// contained `:`, `/` and `#`, which `babysit_lease.rs::is_agent_id` rejects — and `dispatchOne`
+// turned that rejection into a bare `return null` (sparkle-2hsrlz). Neither suite could see it: the
+// TS side stubbed `invoke` and returned `{acquired: true}` unconditionally, and the Rust side fed
+// hand-written ids ("driver-1", "old-driver") that all happened to be valid. NEITHER EVER SAW THE
+// STRING PRODUCTION MINTS — the defaulted-seam shape AGENTS.md names.
+//
+// So the pin is a SHARED FIXTURE: `apps/desktop/shared/babysit-holder-id.fixture.json` holds what
+// `mintDispatchHolderId` produces, this file asserts the mint still produces it, and
+// `babysit_lease.rs` feeds those exact strings to the REAL validator and the REAL `acquire_at`.
+// Change the mint and this half reds; update the fixture and the Rust half reds if the new shape is
+// one the store will not take. They fail together, which is the only arrangement that holds.
+describe("mintDispatchHolderId — the lease store has to ACCEPT it", () => {
+  const fixture = JSON.parse(
+    readFileSync(fileURLToPath(new URL("../../shared/babysit-holder-id.fixture.json", import.meta.url)), "utf8"),
+  ) as {
+    maxLen: number;
+    cases: { why: string; repo: string; pr: number; nowMs: number; holder: string }[];
+  };
+
+  it("the fixture is non-empty and carries the real production case", () => {
+    // Guards the guard: an empty `cases` array would make every `for` below vacuously pass.
+    expect(fixture.cases.length).toBeGreaterThanOrEqual(4);
+    expect(fixture.cases.map((c) => c.repo)).toContain("drodio/sparkle");
+    expect(fixture.maxLen).toBe(BABYSIT_HOLDER_ID_MAX_LEN);
+  });
+
+  it("produces EXACTLY the string the Rust suite validates, for every fixture case", () => {
+    for (const c of fixture.cases) {
+      expect(mintDispatchHolderId(c.repo, c.pr, c.nowMs), c.why).toBe(c.holder);
+    }
+  });
+
+  it("folds every character the validator rejects, and never overruns its length ceiling", () => {
+    // A LOCAL RESTATEMENT of `is_agent_id`, and worth only what a restatement is worth — it cannot
+    // notice the Rust rule changing. It earns its place as the fast signal; `babysit_lease.rs`'s
+    // fixture test is what actually ties this to the validator.
+    for (const c of fixture.cases) {
+      const id = mintDispatchHolderId(c.repo, c.pr, c.nowMs);
+      expect(id, c.why).toMatch(/^[A-Za-z0-9_-]+$/);
+      expect(id.length).toBeGreaterThan(0);
+      expect(id.length).toBeLessThanOrEqual(BABYSIT_HOLDER_ID_MAX_LEN);
+    }
+  });
+
+  it("keeps pr and now WHOLE, so two sweeps on one PR cannot collide on the id", () => {
+    // The truncation budget is spent on the repo half deliberately. If it ate the timestamp instead,
+    // a 140-char slug would mint the SAME id twice and the second acquire would look like a retake.
+    const long = `${"o".repeat(39)}/${"n".repeat(100)}`;
+    const a = mintDispatchHolderId(long, 2658, 1756180000000);
+    const b = mintDispatchHolderId(long, 2658, 1756180000001);
+    expect(a).not.toBe(b);
+    expect(a.endsWith("_2658_1756180000000")).toBe(true);
+    expect(b.endsWith("_2658_1756180000001")).toBe(true);
+  });
+
+  it("THE SIDE EFFECT: the id the sweep actually SENDS to the acquire is a valid one", async () => {
+    // The assertion the outage needed. Not "the mint is correct" — that is a precondition — but
+    // "the string that reached `babysit_lease_acquire` on the real dispatch path is one the store
+    // accepts". Before the fix this arg was `babysit-dispatch:drodio/sparkle#1251:...`.
+    wireInvoke({ leases: [] });
+    const out = await sweepTwice();
+    expect(out.dispatched).toHaveLength(1);
+
+    const acquireCalls = invokeMock.mock.calls.filter((c) => c[0] === BABYSIT_LEASE_ACQUIRE_COMMAND);
+    expect(acquireCalls).toHaveLength(1);
+    const sent = (acquireCalls[0]?.[1] as { agentId: string }).agentId;
+    expect(sent).toMatch(/^[A-Za-z0-9_-]{1,128}$/);
+    // And it is this module's own mint, not some other string that merely happens to be valid.
+    expect(sent).toBe(mintDispatchHolderId("drodio/sparkle", 1251, T0 + 60_000));
+  });
+
+  it("THE RELEASE uses the SAME id, or the lease is unreleasable for 90 minutes", async () => {
+    // A release keyed to a different string is refused, and the PR then sits held by a driver that
+    // never started. A spawn that yields no agent forces that path: acquired, then nothing to run.
+    spawnMock.mockReturnValue(null);
+    wireInvoke({ leases: [] });
+    await sweepTwice();
+
+    const acquired = invokeMock.mock.calls.filter((c) => c[0] === BABYSIT_LEASE_ACQUIRE_COMMAND);
+    const released = invokeMock.mock.calls.filter((c) => c[0] === BABYSIT_LEASE_RELEASE_COMMAND);
+    expect(acquired).toHaveLength(1);
+    expect(released).toHaveLength(1);
+    expect((released[0]?.[1] as { agentId: string }).agentId).toBe(
+      (acquired[0]?.[1] as { agentId: string }).agentId,
+    );
+  });
+});
+
+describe("a refused acquire SAYS WHY — the silence is what made the outage invisible", () => {
+  it("reports a NON-held refusal at warn, naming the reason and the id it was refused for", async () => {
+    // `unknown` is what an id the validator rejects comes back as. That is a bug in this caller's
+    // own arguments, so it must not be swallowed the way the ordinary one-driver-per-PR case is.
+    wireInvoke({
+      leases: [],
+      acquired: false,
+      acquireReason: "unknown",
+      acquireDetail: 'invalid pr 1251 or agent id "babysit-dispatch:drodio/sparkle#1251:1"',
+    });
+    const out = await sweepTwice();
+    expect(out.dispatched).toHaveLength(0);
+
+    const warned = logWarnMock.mock.calls.filter((c) => String(c[1]).includes("REFUSED"));
+    expect(warned).toHaveLength(1);
+    const fields = warned[0]?.[2] as { reason: string; holder: string; detail: string | null };
+    expect(fields.reason).toBe("unknown");
+    expect(fields.holder).toBe(mintDispatchHolderId("drodio/sparkle", 1251, T0 + 60_000));
+    expect(fields.detail).toContain("invalid pr");
+  });
+
+  it("does NOT warn when another driver simply holds it — that one is a decision, not a bug", async () => {
+    // The paired half. Without it, "warns on refusal" is satisfied by a module that warns on every
+    // refusal, which would make the normal exclusion path scream once per sweep per busy PR.
+    wireInvoke({ leases: [], acquired: false, acquireReason: BABYSIT_LEASE_REASON_HELD_LIVE });
+    const out = await sweepTwice();
+    expect(out.dispatched).toHaveLength(0);
+    expect(logWarnMock.mock.calls.filter((c) => String(c[1]).includes("REFUSED"))).toHaveLength(0);
+    expect(
+      logDebugMock.mock.calls.filter((c) => String(c[1]).includes("another driver already holds")),
+    ).toHaveLength(1);
   });
 });

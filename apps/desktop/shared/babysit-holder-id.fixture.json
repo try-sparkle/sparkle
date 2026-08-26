@@ -1,0 +1,34 @@
+{
+  "note": "THE ONE PAYLOAD BOTH SUITES PARSE. `holder` is what apps/desktop/src/services/babysitDispatcher.ts's mintDispatchHolderId ACTUALLY produces for (repo, pr, nowMs); apps/desktop/src-tauri/src/babysit_lease.rs feeds each of these strings to the REAL is_agent_id and the REAL acquire_at. Neither side may be edited alone: change the mint and the TS half reds until this file is updated, and the Rust half then reds if the new shape is one the validator rejects. That is the point — the two halves used to be tested against hand-written ids on the Rust side and a stubbed invoke on the TS side, so NEITHER ever saw the string production mints, and the dispatcher silently never fired once in the repo's history (sparkle-2hsrlz).",
+  "maxLen": 128,
+  "cases": [
+    {
+      "why": "The exact production shape. The pre-fix mint was `babysit-dispatch:drodio/sparkle#2658:...` — the ':', '/' and '#' are what is_agent_id rejects.",
+      "repo": "drodio/sparkle",
+      "pr": 2658,
+      "nowMs": 1756180000000,
+      "holder": "babysit-dispatch_drodio-sparkle_2658_1756180000000"
+    },
+    {
+      "why": "A dot is legal in a repo NAME but not in an agent id, so the mint must fold it too.",
+      "repo": "try-sparkle/sparkle.ai",
+      "pr": 7,
+      "nowMs": 1756180000001,
+      "holder": "babysit-dispatch_try-sparkle-sparkle-ai_7_1756180000001"
+    },
+    {
+      "why": "Shortest realistic slug, and nowMs 0 — the id must stay non-empty, which is_agent_id also requires.",
+      "repo": "a/b",
+      "pr": 1,
+      "nowMs": 0,
+      "holder": "babysit-dispatch_a-b_1_0"
+    },
+    {
+      "why": "GitHub's maximum slug (39-char owner + 100-char name) lands EXACTLY on the 128-byte ceiling once the repo half is truncated. Without the truncation this id is 154 bytes and is_agent_id rejects it on length alone — a second way to be silently un-dispatchable.",
+      "repo": "ooooooooooooooooooooooooooooooooooooooo/nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn",
+      "pr": 999999,
+      "nowMs": 1756180000000,
+      "holder": "babysit-dispatch_ooooooooooooooooooooooooooooooooooooooo-nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn_999999_1756180000000"
+    }
+  ]
+}

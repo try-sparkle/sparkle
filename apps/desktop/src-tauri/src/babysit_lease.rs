@@ -1007,6 +1007,103 @@ mod tests {
         acquire_at(d, "drodio/sparkle", 1176, agent, EPOCH_A, now, STALE_MS_DEFAULT)
     }
 
+    // ═══════════════════════════════════════════════════════════════════════════════════════════
+    // THE HOLDER ID THE TS SIDE ACTUALLY MINTS.
+    //
+    // Every other test in this module hands `acquire_at` a HAND-WRITTEN id — "driver-1",
+    // "old-driver", "impatient-driver" — and all of them happen to satisfy `is_agent_id`. So this
+    // suite was green for the entire time the one caller in production was minting
+    // `babysit-dispatch:drodio/sparkle#2658:1756180000000`, whose ':', '/' and '#' this validator
+    // rejects: 49,381 sweeps, zero drivers, and not one log line naming the cause
+    // (sparkle-2hsrlz). The TS suite could not see it either, because it stubs `invoke`.
+    //
+    // `apps/desktop/shared/babysit-holder-id.fixture.json` is the ONE payload both suites parse.
+    // The TS half pins the mint's OUTPUT to these strings; this half feeds those same strings to
+    // the real validator and the real `acquire_at`. Neither half can be edited alone into a state
+    // where production mints something the store refuses.
+    fn holder_fixture_cases() -> Vec<serde_json::Value> {
+        // Resolved from CARGO_MANIFEST_DIR, not the process CWD, so a different test runner cannot
+        // silently point this at a different file — or at nothing, and pass.
+        //
+        // Built with `.join()` rather than `concat!`, which is how all six sibling fixtures in
+        // `apps/desktop/shared/` are read (`observed_attention.rs`, `history.rs`, `config.rs`,
+        // `worktree.rs`, `nudge_gate.rs`). That is not cosmetic: `tools/lib/crate-cross-boundary-
+        // reads.mjs` recognises only the `concat!(env!("CARGO_MANIFEST_DIR"), …)` spelling, so the
+        // `concat!` form makes this ONE file of the seven a "cross-boundary read" that RUST_RE must
+        // then name — and `tools/fixtures/rust-re-negatives.txt` in turn demands a non-read sibling
+        // directly in that directory, which cannot exist, because every file in `shared/` is read by
+        // this crate by construction. Matching the neighbours keeps the whole directory under one
+        // rule instead of splitting it. The gap that leaves — a change to any `shared/` fixture does
+        // not trigger the Rust legs — is real, pre-existing, and the same for all seven.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("shared")
+            .join("babysit-holder-id.fixture.json");
+        let raw = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let json: serde_json::Value =
+            serde_json::from_str(&raw).expect("the shared holder-id fixture must be valid JSON");
+        json["cases"].as_array().expect("`cases` must be an array").clone()
+    }
+
+    #[test]
+    fn the_holder_ids_production_mints_all_pass_the_real_validator() {
+        let cases = holder_fixture_cases();
+        // GUARDS THE GUARD. An empty (or renamed-away) `cases` array would make the loop below
+        // vacuously pass, which is the exact shape of the failure this test exists to end.
+        assert!(cases.len() >= 4, "the fixture must carry the real cases, got {}", cases.len());
+        let mut saw_production_slug = false;
+
+        for case in &cases {
+            let holder = case["holder"].as_str().expect("each case needs a `holder` string");
+            let why = case["why"].as_str().unwrap_or("");
+            assert!(is_agent_id(holder), "the lease store would REFUSE this minted id: {holder:?} ({why})");
+            if case["repo"].as_str() == Some("drodio/sparkle") {
+                saw_production_slug = true;
+            }
+        }
+        assert!(saw_production_slug, "the fixture must include the real production repo slug");
+    }
+
+    #[test]
+    fn the_pre_fix_holder_id_is_still_refused_the_way_it_was() {
+        // THE PAIRED HALF. "Every fixture id is accepted" is satisfied by a validator that accepts
+        // everything — including the broken string, which would mean the fix was never needed and
+        // this test guards nothing. Pin the rejection too, on the exact id that shipped.
+        let broken = "babysit-dispatch:drodio/sparkle#2658:1756180000000";
+        assert!(!is_agent_id(broken), "the ':'/'/'/'#' id must still be refused: {broken}");
+
+        let d = tmp();
+        let out = acquire_at(d.path(), "drodio/sparkle", 2658, broken, EPOCH_A, T0, STALE_MS_DEFAULT);
+        assert!(!out.acquired);
+        assert_eq!(out.reason.as_deref(), Some(REASON_UNKNOWN));
+        // AND THE STORE IS UNTOUCHED — this is where the silence came from: it bails before writing.
+        assert!(stored(d.path(), "drodio/sparkle", 2658).is_none());
+    }
+
+    #[test]
+    fn a_minted_holder_id_actually_takes_the_lease_and_is_persisted_under_that_id() {
+        // THE SIDE EFFECT, not the predicate. `is_agent_id` returning true is a precondition;
+        // what the outage needed is that the real entry point WRITES a lease held by this id.
+        let d = tmp();
+        for (i, case) in holder_fixture_cases().iter().enumerate() {
+            let holder = case["holder"].as_str().unwrap();
+            let repo = case["repo"].as_str().unwrap();
+            let pr = case["pr"].as_u64().unwrap();
+            // Each case gets its own store: these are different repos and PRs, and reusing one
+            // directory would let an earlier case's live lease refuse a later one for the RIGHT
+            // reason, which reads exactly like the bug.
+            let dir = d.path().join(format!("case-{i}"));
+            std::fs::create_dir_all(&dir).unwrap();
+
+            let out = acquire_at(&dir, repo, pr, holder, EPOCH_A, T0, STALE_MS_DEFAULT);
+            assert!(out.acquired, "{repo}#{pr} must be acquirable under {holder:?}: {:?}", out.detail);
+            let normalized = normalize_repo(repo).expect("the fixture repos must be valid slugs");
+            let held = stored(&dir, &normalized, pr).expect("the lease must be PERSISTED, not just returned");
+            assert_eq!(held.agent_id, holder, "the store must record the id production minted");
+        }
+    }
+
     /// Who the STORE says holds it — read back off disk, never from a return value. Every assertion
     /// below goes through this so the test is proving the persisted side effect, not the API's
     /// opinion of what it did.
