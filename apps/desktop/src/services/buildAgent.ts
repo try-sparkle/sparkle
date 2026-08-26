@@ -542,6 +542,27 @@ export function workerMission(task: string, taskId: string): string {
  *  linked by `beadId`. Status transitions (in_progress / closed / delivered) are written
  *  PROGRAMMATICALLY by the app from real lifecycle events (see runtimeStore.syncBeadLifecycle), so
  *  the agent no longer runs them by hand. Tone/format mirror the orchestration persona. */
+/**
+ * The FALLBACK half of every "read the bead" instruction, in one place because five prompt sites
+ * emit it and a drifted copy would strand an agent in exactly the repo this exists to serve.
+ *
+ * ── WHY A FALLBACK IS MANDATORY HERE ──────────────────────────────────────────────────────────
+ * `bd` is a globally-installed CLI; `scripts/bead-brief.sh` is a file in THIS repo. But
+ * `beadsProtocol` and `buildSeedPrompt` are emitted for EVERY project the user adds to Sparkle,
+ * not just the sparkle checkout — so in any other beads-enabled project the script simply is not
+ * there, and an instruction naming only the script would make the orchestrator's PRIMARY read of
+ * its own spec fail with exit 127 and leave it nothing to do instead.
+ *
+ * The fallback is plain `bd show <id>` — the UN-FLAGGED form, which does print the comment
+ * thread. It is NOT `bd show <id> --json`: that is the form this whole change exists to get rid
+ * of, because it strips comments outright. Un-flagged `bd show` is merely unbounded (the raw
+ * recurrence thread repeats one recommendation verbatim per sighting), which is a cost, not
+ * blindness — the right thing to degrade to.
+ */
+export function beadReadFallback(id: string): string {
+  return `if this repo has no such script, plain \`bd show ${id}\` instead — never \`--json\`, which strips comments`;
+}
+
 export function beadsProtocol(opts: {
   epicId: string;
   /**
@@ -568,9 +589,30 @@ export function beadsProtocol(opts: {
     "BEADS PROTOCOL — THE WORK GRAPH IS THE SOURCE OF TRUTH",
     `- Your work is defined by beads epic ${opts.epicId} and its child tasks. Do not invent scope`,
     "  beyond what the epic and its children describe.",
-    `- Discover the children before doing anything else: \`bd show ${opts.epicId} --json\` for the`,
-    "  epic and its dependents, `bd list --json` to inspect the full graph, and `bd ready` to see",
-    "  which child tasks are unblocked and ready to start.",
+    // READ THE BEAD THROUGH THE BRIEF, NOT THROUGH `--json`. This line used to say
+    // `bd show <epicId> --json`, and that flag streams NO comments at all — `bd` emits them only
+    // under `--include-comments`. So every human comment on the epic was invisible to the agent
+    // working it, which is the entire failure `scripts/bead-brief.sh` exists to fix (bead
+    // sparkle-mzgqt.6). The brief is also BOUNDED, which the raw thread is not: the recurrence
+    // loop writes one comment per sighting, so a real bead repeats one recommendation verbatim six
+    // times.
+    `- READ THE EPIC FIRST, from the repo root: \`bash scripts/bead-brief.sh ${opts.epicId}\` —`,
+    `  ${beadReadFallback(opts.epicId)}. It prints the bead's description AND its comment thread:`,
+    "  every human comment verbatim, repeated machine sightings collapsed to one line, bookkeeping",
+    "  dropped, the whole thing capped so it cannot flood your context. Either form beats",
+    "  `bd show <id> --json`, which strips comments entirely — a human's note on the bead is",
+    "  invisible through that flag, and it is often the newest and most important thing on it.",
+    "  The brief fails loudly rather than printing an empty-looking one, so a non-zero exit NEVER",
+    "  means \"this bead has no comments\" — but only ONE code is worth retrying.",
+    "  EXIT 3 IS THE STORE BEING BUSY (it is single-writer): that one, and only that one, retry.",
+    "  Exit 127 — printed as",
+    "  `No such file or directory` for a path, or `command not found` for a bare name — means this",
+    "  repo simply has no such script: take the `bd show` fallback and move on.",
+    "  NEVER RETRY A 127 IN A LOOP — it is a permanent absence, not a transient fault. Every other",
+    "  non-zero code is permanent too (usage, `bd` missing, no such bead, unparseable payload):",
+    "  read stderr and act on it, do not loop.",
+    "- Then discover the graph: `bd list --json` to inspect it in full, and `bd ready` to see which",
+    "  child tasks are unblocked and ready to start.",
     "- For each READY child task, spawn exactly ONE worker for that one task, passing that `<taskId>`",
     "  as the `beadId` argument to `spawn_worker` so the worker is linked to its bead in the Plan and",
     "  Build views. ALWAYS pass `beadId` — it is what lets Sparkle recognize an existing claim.",

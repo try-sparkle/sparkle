@@ -7,7 +7,7 @@ import { useProjectStore } from "../stores/projectStore";
 import { useBeadsStore } from "../stores/beadsStore";
 import { hasEpicGoalText } from "../engine/epicGoal";
 import { parentEpicOf } from "./beads";
-import { beadsProtocol } from "./buildAgent";
+import { beadReadFallback, beadsProtocol } from "./buildAgent";
 import { landInAgent } from "./landInAgent";
 import { attentionHold } from "../engine/attentionGuard";
 import { localAgentCapacity, atCapacitySentence } from "./agentCapacity";
@@ -268,7 +268,14 @@ function buildSeedPrompt(
     return [
       `Build bead ${args.epicId} (a single task).`,
       "",
-      `Run \`bd show ${args.epicId}\` to read it, ${spec} implement it on ONE isolated worker`,
+      // `bash scripts/bead-brief.sh`, not `bd show`: the raw thread is unbounded (one machine
+      // comment per recurrence sighting, repeating one recommendation verbatim), and the `--json`
+      // form the orchestrator persona used to carry strips comments outright. The brief is the one
+      // read that gives an agent the bead AND the humans' notes on it without flooding the seed.
+      // Bead sparkle-mzgqt.6.
+      `Run \`bash scripts/bead-brief.sh ${args.epicId}\` from the repo root to read it — the bead`,
+      `and every human comment on it, bounded (${beadReadFallback(args.epicId)});`,
+      `${spec} implement it on ONE isolated worker`,
       "branch, verify it, and integrate that branch. Do not fan out into children — this is a single",
       "unit of work, not an epic.",
       // THE PARENT OBJECTIVE, stated here and NOT handed to `beadsProtocol`. In this mode the id
@@ -284,7 +291,9 @@ function buildSeedPrompt(
   }
   const spec = args.prdPath
     ? `First, read the PRD at ${args.prdPath} to understand the goal, constraints, and acceptance`
-    : `First, run \`bd show ${args.epicId}\` and read the epic's description for the goal and`;
+    : `First, run \`bash scripts/bead-brief.sh ${args.epicId}\` from the repo root`
+      + ` (${beadReadFallback(args.epicId)}) and read the epic's description AND`
+      + ` the human comments on it for the goal and`;
   return [
     `Build epic ${args.epicId}.`,
     "",
@@ -529,7 +538,9 @@ function prepareHandoff(args: SendToBuildArgs): PreparedHandoff {
       epicTitle: args.epicId,
       planText: args.prdPath
         ? `The plan for this epic is the PRD at ${args.prdPath} — read it.`
-        : `This epic has no PRD; run \`bd show ${args.epicId}\` and read its description as the plan.`,
+        : `This epic has no PRD; run \`bash scripts/bead-brief.sh ${args.epicId}\` from the repo`
+          + ` root (${beadReadFallback(args.epicId)}) and read its description and the human`
+          + ` comments on it as the plan.`,
       // IDS, not titles — this store holds `epicId` and nothing richer. See `AdvisorPassArgs`.
       siblingEpics: project.agents
         .filter((a) => a.kind === "build" && a.epicId && a.epicId !== args.epicId)
@@ -892,7 +903,7 @@ export async function sendToBuildAwaited(
 export function resumeInstruction(args: SendToBuildArgs): string {
   const where = args.prdPath
     ? `Its plan is at ${args.prdPath}.`
-    : `Run \`bd show ${args.epicId}\` for the plan.`;
+    : `Run \`bash scripts/bead-brief.sh ${args.epicId}\` for the plan (${beadReadFallback(args.epicId)}).`;
   // BUILT FROM THE MARKER, never a literal that happens to match it. `agentOriginated` recognises
   // Sparkle's own sends by this opening; if the two drifted apart the detector would go silently
   // blind and this prose would start counting as the agent's own activity.

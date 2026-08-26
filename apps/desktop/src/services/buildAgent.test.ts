@@ -966,8 +966,55 @@ describe("beadsProtocol", () => {
 
   it("binds the orchestrator to the epic and its child tasks", () => {
     expect(p).toContain("epic-42");
-    expect(p).toContain("bd show epic-42 --json");
+    expect(p).toContain("bash scripts/bead-brief.sh epic-42");
     expect(p).toContain("spawn_worker");
+  });
+
+  it("reads the epic through the BRIEF, never through the comment-stripping `--json` form", () => {
+    // BOTH DIRECTIONS, and the second half is the load-bearing one. This line used to read
+    // `bd show <epicId> --json`, and that flag streams NO comments — `bd` emits them only under
+    // `--include-comments` — so every human note on the epic was invisible to the agent working
+    // it. Asserting only that the brief is named would stay green if the old read were left in
+    // place beside it, which is the shape that reintroduces the bug: the agent would have a
+    // working command AND the one that silently hides the comments, and no reason to prefer
+    // either. Bead sparkle-mzgqt.6.
+    expect(p).toContain("bash scripts/bead-brief.sh epic-42");
+    expect(p).not.toContain(`bd show ${"epic-42"} --json`);
+    // The graph reads are untouched — the brief replaces the BEAD read, not the discovery ones.
+    expect(p).toContain("bd list --json");
+    expect(p).toContain("bd ready");
+  });
+
+  it("names a PORTABLE fallback, because the script only exists in THIS repo", () => {
+    // `bd` is a globally-installed CLI; `scripts/bead-brief.sh` is a file in the sparkle checkout.
+    // This persona is emitted for EVERY project the user adds to Sparkle, so in any other
+    // beads-enabled project the script is simply absent — and an instruction naming only the
+    // script would make the orchestrator's PRIMARY read of its own spec die with `command not
+    // found` and leave it nothing to do instead.
+    expect(p).toContain("if this repo has no such script, plain `bd show epic-42` instead");
+    // The fallback must be the UN-FLAGGED form. Degrading to `--json` would degrade straight back
+    // into the blindness this whole change removes; un-flagged `bd show` is merely unbounded.
+    expect(p).toContain("never `--json`, which strips comments");
+    // ...and it must be reachable from the repo root instruction, since a `cd` into a subdirectory
+    // is the other way the relative path dies.
+    expect(p).toContain("from the repo root");
+  });
+
+  it("does NOT tell the orchestrator to retry a `command not found`", () => {
+    // The prose says a non-zero exit means retry. Left unscoped, a PERMANENTLY absent script reads
+    // as an unbounded retry directive — the failure mode is a loop, not a missing brief.
+    // Pin the EXIT CODE, not just a prose literal. `bash <missing-path>` prints
+    // `No such file or directory`, never `command not found` — that string is only ever emitted
+    // for a bare name absent from PATH — so an exemption keyed solely on it cannot match the case
+    // it exists to cover, and a test asserting only that literal has a firm grip on the wrong
+    // answer. 127 is the observable signal both spellings share. roborev 69189 (High).
+    expect(p).toMatch(/127/);
+    expect(p).toContain("No such file or directory");
+    expect(p).toContain("NEVER RETRY A 127 IN A LOOP");
+    // And the retry rule must name the ONE transient code, not "any non-zero": scripts/bead-brief.sh
+    // documents 3 as the only retryable exit (2 usage, 4 no bd, 5 no such bead, 6 no jq are all
+    // permanent), so unscoped "non-zero means the store was busy" is a retry loop for four of them.
+    expect(p).toContain("EXIT 3 IS THE STORE BEING BUSY");
   });
 
   it("instructs exactly one worker per task, linked to its bead via the beadId argument", () => {

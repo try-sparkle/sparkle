@@ -159,7 +159,7 @@ import { briefForLaunch, briefRecord, hasUndeliveredBrief, resetAgentBriefs } fr
 // LEFT REAL, like `beadsProtocol` above it: the byte-identity cases below compose the expected seed
 // from the same function production uses, so they pin what THIS module contributes without
 // re-typing 30 lines of protocol prose that has its own byte-identity test in buildAgent.test.ts.
-import { beadsProtocol } from "./buildAgent";
+import { beadReadFallback, beadsProtocol } from "./buildAgent";
 import { useBeadsStore } from "../stores/beadsStore";
 
 describe("sendToBuild", () => {
@@ -572,7 +572,16 @@ describe("sendToBuild", () => {
     expect(seed).not.toMatch(/read the PRD/i);
     expect(seed).toContain("epic-1");
     expect(seed).toContain("BEADS PROTOCOL"); // protocol still embedded
-    expect(seed).toMatch(/bd show/i); // the epic bead itself is the spec now
+    // THE EPIC BEAD ITSELF IS THE SPEC NOW — read through the BRIEF, which carries the human
+    // comments on it. This assertion used to be `toMatch(/bd show/i)`, and that phrasing would
+    // now pass on the embedded protocol's own prose about `bd show --json` rather than on
+    // anything this seed says: a substring loose enough to be satisfied by a sentence WARNING
+    // against the old command is not an assertion about the new one. Bead sparkle-mzgqt.6.
+    expect(seed).toContain("bash scripts/bead-brief.sh epic-1");
+    expect(seed).not.toContain("run `bd show epic-1`");
+    // And the portable fallback rides with it — this seed goes to every project the user adds,
+    // and `scripts/bead-brief.sh` lives only in the sparkle checkout.
+    expect(seed).toContain("plain `bd show epic-1` instead");
   });
 
   it("seeds a prompt that instructs reading the PRD and following the beads protocol", () => {
@@ -907,10 +916,17 @@ describe("resumeInstruction", () => {
     expect(t).toContain("sparkle-e1");
   });
 
-  it("falls back to `bd show` for a PRD-less epic rather than naming a file that does not exist", () => {
+  it("falls back to the bead BRIEF for a PRD-less epic rather than naming a file that does not exist", () => {
     const t = resumeInstruction({ projectId: "p", epicId: "sparkle-e1", prdPath: null });
-    expect(t).toContain("bd show sparkle-e1");
+    expect(t).toContain("bash scripts/bead-brief.sh sparkle-e1");
     expect(t).not.toContain("PRD/");
+    // A resumed orchestrator re-reads the bead precisely because time passed — which is exactly
+    // when a human is most likely to have commented on it. Sending it back to `bd show --json`
+    // would hand it the one read that cannot see those comments. Bead sparkle-mzgqt.6.
+    expect(t).not.toContain("bd show sparkle-e1 --json");
+    // ...but the UN-FLAGGED form IS the fallback, and it has to survive here: this prompt is
+    // emitted for every project the user adds, and `scripts/bead-brief.sh` exists only in this one.
+    expect(t).toContain("plain `bd show sparkle-e1` instead");
   });
 
   it("stays TERSE — it must not re-send the whole build seed", () => {
@@ -1380,7 +1396,9 @@ describe("sendToBuild — epic goal laddering", () => {
       [
         "Build bead task-1 (a single task).",
         "",
-        "Run `bd show task-1` to read it, then implement it on ONE isolated worker",
+        "Run `bash scripts/bead-brief.sh task-1` from the repo root to read it — the bead",
+        `and every human comment on it, bounded (${beadReadFallback("task-1")});`,
+        "then implement it on ONE isolated worker",
         "branch, verify it, and integrate that branch. Do not fan out into children — this is a single",
         "unit of work, not an epic.",
         "",
