@@ -1057,6 +1057,15 @@ const spinDownArgs = z
      *  a permanently-stale cache entry deadlocked seven finished workers and the only workaround was
      *  `discard_agent`, which destroys branches outright (bead sparkle-plxhx). */
     allowUnknownStatus: confirmArg,
+    /** Proceed when the worker's COMMITTED work is held by nothing but its own local branch
+     *  (`unlanded-work`) — bead sparkle-3duunc. Deliberately its own field rather than a second
+     *  meaning for `discardUncommitted`: that one says something about UNCOMMITTED FILES, and
+     *  spending it here would let a caller who accepted losing a scratch edit also strand commits it
+     *  never heard about. IT MUST STAY WIRED THROUGH: the refusal's own sentence tells the caller to
+     *  retry with this flag, and a `.strict()` schema that does not declare it turns that sentence
+     *  into a dead instruction whose only remaining workaround is `discard_agent` — the branch-
+     *  deleting op this whole guard exists to keep people away from. */
+    allowUnlandedWork: confirmArg,
   })
   .strict();
 
@@ -1144,6 +1153,7 @@ const LIFECYCLE_ROUTES: Record<LifecycleOp, Handler> = {
       await spinDownWorkerAgent(a.agentId, {
         discardUncommitted: a.discardUncommitted,
         allowUnknownStatus: a.allowUnknownStatus,
+        allowUnlandedWork: a.allowUnlandedWork,
       }),
     ),
   ),

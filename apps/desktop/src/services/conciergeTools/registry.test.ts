@@ -2652,3 +2652,47 @@ describe("describeIssues — the remainder counts omissions, not duplicates", ()
     expect(describeIssues(r.success ? [] : r.error.issues)).toBe("`a`: Required");
   });
 });
+
+// ---------------------------------------------------------------------------------------------
+// The spin-down overrides have to SURVIVE THE WIRE (bead sparkle-3duunc)
+// ---------------------------------------------------------------------------------------------
+//
+// `spinDownArgs` is `.strict()`, so a field the schema does not declare is a `bad-args` refusal
+// BEFORE the domain ever runs. That matters more here than for an ordinary flag: the domain's
+// `unlanded-work` refusal ends by telling the caller to retry with `allowUnlandedWork`, and an
+// undeclared field turns that sentence into a dead instruction whose only remaining workaround is
+// `discard_agent` — the branch-deleting op the guard exists to keep people away from.
+//
+// The PAIRED CONTROL is what makes the first assertion mean anything: an invented neighbour must
+// still be rejected, or "not bad-args" would be satisfied by a schema that had stopped being strict.
+describe("spin_down_worker — the domain's own escape hatches reach it", () => {
+  const spinDownArgs = ["discardUncommitted", "allowUnknownStatus", "allowUnlandedWork"] as const;
+
+  it.each(spinDownArgs)("accepts %s rather than rejecting it as bad-args", async (field) => {
+    const r = await dispatchConciergeTool(
+      call({
+        domain: "lifecycle",
+        op: "spin_down_worker",
+        args: { agentId: "nobody", [field]: true },
+      }),
+    );
+    // The store is empty, so the DOMAIN refuses (`unknown-agent`) — which is the point: the call
+    // got past the schema and into the code that owns the decision.
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.code).not.toBe(REGISTRY_CODES.badArgs);
+  });
+
+  it("still rejects a field the schema never declared", async () => {
+    const r = await dispatchConciergeTool(
+      call({
+        domain: "lifecycle",
+        op: "spin_down_worker",
+        args: { agentId: "nobody", allowWhateverIWant: true },
+      }),
+    );
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.code).toBe(REGISTRY_CODES.badArgs);
+  });
+});

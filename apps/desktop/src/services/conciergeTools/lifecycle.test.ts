@@ -60,7 +60,7 @@ vi.mock("../workerSpawn", async (orig) => ({
 }));
 // THE LIVE GIT READ the spin-down guard now takes at the moment of the decision (bead
 // sparkle-plxhx). Mocked at the Tauri boundary rather than stubbing the guard itself, so these
-// tests drive the real `readWorkerWorktreeRisk` — including its gone-worktree and cache-fallback
+// tests drive the real `readRetirementFacts` — including its gone-worktree and cache-fallback
 // arms. `undefined` (the default) means "no live read was configured": the mock rejects, which is
 // the shape a git failure takes, so a test that forgets to set it lands on the honest unknown path
 // instead of silently getting a clean reading.
@@ -69,10 +69,28 @@ const agentBranchStatusMock = vi.fn(async () => {
   if (!liveBranchStatus) throw new Error("no live reading configured for this test");
   return liveBranchStatus();
 });
+// THE SECOND LIVE READ — the branch rung the spin-down guard grew for bead sparkle-3duunc. Mocked
+// at the same Tauri boundary and for the same reason: these tests drive the real
+// `readRetirementFacts` and the real `commitsHeldElsewhere`, not a stand-in for them. `null` means
+// "no reading configured", and the mock then REJECTS — the shape a git failure takes — so a test
+// that forgets to set one lands on the honest unknown path.
+let liveWorkflowState: (() => Promise<WorkflowState>) | null = null;
+const agentWorkflowStateMock = vi.fn(async () => {
+  if (!liveWorkflowState) throw new Error("no live workflow state configured for this test");
+  return liveWorkflowState();
+});
+/** Every `parentBranch` the spin-down path actually handed the workflow read. It is what makes
+ *  `inParent` answerable at all, so a call site that dropped it would leave that whole clearance
+ *  dead while every test here stayed green. */
+const workflowStateParentBranches: unknown[] = [];
 vi.mock("../branchStatus", async (orig) => ({
   ...(await orig<typeof import("../branchStatus")>()),
   projectAgentsStatus: vi.fn(() => Promise.resolve([])),
   agentBranchStatus: (...a: unknown[]) => agentBranchStatusMock(...(a as [])),
+  agentWorkflowState: (...a: unknown[]) => {
+    workflowStateParentBranches.push(a[2]);
+    return agentWorkflowStateMock(...(a as []));
+  },
 }));
 // The real spawn body runs by default (these tests assert the human path's exact sequence); a test
 // that needs the "project vanished mid-spawn" branch sets `spawnOverride`.
@@ -102,7 +120,7 @@ import { useProjectStore } from "../../stores/projectStore";
 import { useRuntimeStore } from "../../stores/runtimeStore";
 import { useSettingsStore } from "../../stores/settingsStore";
 import { shouldPromptOnClose } from "../../engine/closeAgent";
-import type { BranchStatus } from "../branchStatus";
+import type { BranchStatus, WorkflowState } from "../branchStatus";
 import type { SaveOutcome, ShipOutcome } from "../closeAgentActions";
 import { markProjectVisited, resetVisitedProjects } from "../sessionProjects";
 import type { WorkflowStageId } from "../../engine/workflowStage";
@@ -157,6 +175,37 @@ const CLEAN: BranchStatus = {
 const AHEAD: BranchStatus = { ...CLEAN, ahead: 3 };
 const DIRTY: BranchStatus = { ...CLEAN, dirty: true, filesChanged: 2 };
 
+/** The base workflow reading: nothing committed, nothing anywhere. Every case below names the ONE
+ *  field it is about, so a clearance can never be bought by a field the test never mentioned. */
+const WS_NOTHING: WorkflowState = {
+  inLocalMain: false,
+  inOriginMain: false,
+  inParent: false,
+  aheadOfBase: 0,
+  landed: false,
+  landedOnOrigin: false,
+  pushed: false,
+  shipped: false,
+  hasRemote: true,
+  prState: null,
+  prNumber: null,
+  prUrl: null,
+};
+/** THE DEFAULT for every pre-existing test in this file: a worker whose work is already on origin
+ *  main and on a remote ref. Those tests are about the TREE, and this keeps the branch rung silent
+ *  for them — the branch cases below each configure their own reading. */
+const WS_LANDED: WorkflowState = {
+  ...WS_NOTHING,
+  inLocalMain: true,
+  inOriginMain: true,
+  landed: true,
+  landedOnOrigin: true,
+  pushed: true,
+};
+/** THE BEAD (sparkle-3duunc): commits on neither origin/main nor any remote ref, no PR, and not
+ *  merged into the orchestrator either — held by this worker's own branch and nothing else. */
+const WS_STRANDED: WorkflowState = { ...WS_NOTHING, aheadOfBase: 8 };
+
 function seedProject(): string {
   return useProjectStore.getState().addProject("Demo", "/tmp/demo");
 }
@@ -203,7 +252,10 @@ function seedShell(projectId: string): string {
 
 beforeEach(() => {
   liveBranchStatus = null;
+  liveWorkflowState = () => Promise.resolve(WS_LANDED);
+  workflowStateParentBranches.length = 0;
   agentBranchStatusMock.mockClear();
+  agentWorkflowStateMock.mockClear();
   useProjectStore.setState({ projects: [], selectedProjectId: null });
   useRuntimeStore.setState({ branchStatus: {}, workflowStage: {}, openAgentIds: [] });
   useSettingsStore.setState({
@@ -1519,8 +1571,10 @@ describe("spinDownWorkerAgent", () => {
     expect(spinDownWorkerMock).not.toHaveBeenCalled();
   });
 
-  // Committed work survives on the branch the teardown keeps, so `ahead` must not gate the
-  // spin-down — an orchestrator that merged the branch would otherwise never reclaim the slot.
+  // `ahead` ITSELF must not gate the spin-down — it never returns to zero after a squash merge, so
+  // an orchestrator that merged the branch would otherwise never reclaim the slot. What gates it is
+  // the ancestry question (bead sparkle-3duunc, the describe below), and this worker's default
+  // workflow reading answers it: on origin main, and pushed.
   it("spins down a worker with commits ahead but a clean tree", async () => {
     const pid = seedProject();
     const build = seedBuild(pid, { bs: CLEAN });
@@ -1528,6 +1582,278 @@ describe("spinDownWorkerAgent", () => {
     const r = await spinDownWorkerAgent(worker);
     expect(r.ok).toBe(true);
     expect(spinDownWorkerMock).toHaveBeenCalledWith({ projectId: pid, workerId: worker });
+  });
+});
+
+// ══ THE BRANCH RUNG (bead sparkle-3duunc) ═══════════════════════════════════════════════════════
+// A finished worker's branch held EIGHT commits that were on neither origin/main nor any remote
+// ref, with no PR — and the spin-down took its row anyway, because this path only ever asked about
+// UNCOMMITTED FILES. "The branch is kept" is true and is not the same as "the work is safe": the
+// row is what a human and an orchestrator navigate by, and a branch nobody points at is work nobody
+// finishes. The roster reported only `status: done`.
+//
+// EVERY CASE HERE ASSERTS THE TEARDOWN, NOT THE VERDICT. The spin-down mock removes the agent row
+// exactly as production's does, so "it refused" is checked as app STATE — a guard that refused
+// AFTER destroying something would leave no row and fail these. The paired controls are what pin
+// the refusal to its cause: three shapes that are unlanded-but-safe tear down untouched.
+describe("spinDownWorkerAgent — commits held by this worker's branch and nothing else", () => {
+  /** A worker whose teardown really removes its row, the way `spinDownWorker` does.
+   *
+   *  `bs: null` seeds NO cached reading — which is what makes the unreadable-repo cases below
+   *  reachable at all. `readRetirementFacts` falls back to the cache when the live read throws (a
+   *  stale-but-real observation beats none), so a worker carrying a cached `CLEAN` answers the
+   *  branch question from that cache and never reaches the `unknown` arm. */
+  function seedTearableWorker(pid: string, build: string, bs: BranchStatus | null = CLEAN): string {
+    const worker = seedWorker(pid, build, undefined, bs ?? undefined);
+    spinDownWorkerMock.mockImplementation(async () => {
+      useProjectStore.getState().removeAgent(pid, worker);
+    });
+    return worker;
+  }
+  function rowExists(pid: string, id: string): boolean {
+    const p = useProjectStore.getState().projects.find((x) => x.id === pid);
+    return !!p?.agents.some((a) => a.id === id);
+  }
+  // The implementation is set per-test and `mockClear` does not remove it, so it would leak into
+  // every later test in this file and start deleting rows they never asked to lose.
+  afterEach(() => {
+    spinDownWorkerMock.mockImplementation(async () => {});
+  });
+
+  // ── THE HEADLINE ──────────────────────────────────────────────────────────────────────────────
+  it("refuses a clean worker whose commits are on no remote ref and on nobody else's branch", async () => {
+    const pid = seedProject();
+    const build = seedBuild(pid, { bs: CLEAN });
+    const worker = seedTearableWorker(pid, build);
+    // A spotless tree — the two guards that already existed both wave this through.
+    liveBranchStatus = async () => ({ ...CLEAN, ahead: 8 });
+    liveWorkflowState = async () => WS_STRANDED;
+    const r = await spinDownWorkerAgent(worker);
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.reason).toBe("unlanded-work");
+    // THE SIDE EFFECT: nothing was torn down.
+    expect(spinDownWorkerMock).not.toHaveBeenCalled();
+    expect(rowExists(pid, worker)).toBe(true);
+  });
+
+  // A REFUSAL IS AN INSTRUCTION THE USER WILL FOLLOW (the founder's sparkle-8bvh rule), so it has to
+  // name the count and ways out that are safe under the very condition that triggered it.
+  it("names the commit count, the branch, and only remedies that keep the commits", async () => {
+    const pid = seedProject();
+    const build = seedBuild(pid, { bs: CLEAN });
+    const worker = seedTearableWorker(pid, build);
+    liveBranchStatus = async () => ({ ...CLEAN, ahead: 8 });
+    liveWorkflowState = async () => WS_STRANDED;
+    const r = await spinDownWorkerAgent(worker);
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.message).toMatch(/8 commits/);
+    expect(r.message).toContain(`sparkle/agent-${worker}`);
+    // The three ways out, each of which either moves the commits somewhere else or is the caller
+    // deliberately spending the override.
+    expect(r.message).toContain(`sparkle/agent-${build}`);
+    expect(r.message).toMatch(/git push -u origin/);
+    expect(r.message).toMatch(/allowUnlandedWork/);
+    // …and NOT the one that would destroy them. `discard_agent` deletes the branch outright, which
+    // is strictly worse than the loss being guarded against.
+    expect(r.message).not.toMatch(/discard/i);
+  });
+
+  // ── PAIRED CONTROL 1: it landed. The same clean tree, the same non-zero `ahead` (which a squash
+  //    merge pins at N forever), and it tears down untouched. ────────────────────────────────────
+  it("spins down a worker whose commits ARE on origin main", async () => {
+    const pid = seedProject();
+    const build = seedBuild(pid, { bs: CLEAN });
+    const worker = seedTearableWorker(pid, build);
+    liveBranchStatus = async () => ({ ...CLEAN, ahead: 8 });
+    liveWorkflowState = async () => WS_LANDED;
+    const r = await spinDownWorkerAgent(worker);
+    expect(r.ok).toBe(true);
+    expect(spinDownWorkerMock).toHaveBeenCalledWith({ projectId: pid, workerId: worker });
+    expect(rowExists(pid, worker)).toBe(false);
+  });
+
+  // ── PAIRED CONTROL 2: unlanded, but PUSHED. This is the axis the bead names by hand — the loss
+  //    needs BOTH halves, and a remote ref is what makes the commits recoverable. ────────────────
+  it("spins down a worker whose unlanded commits are on a remote ref", async () => {
+    const pid = seedProject();
+    const build = seedBuild(pid, { bs: CLEAN });
+    const worker = seedTearableWorker(pid, build);
+    liveBranchStatus = async () => ({ ...CLEAN, ahead: 8 });
+    liveWorkflowState = async () => ({ ...WS_STRANDED, pushed: true });
+    const r = await spinDownWorkerAgent(worker);
+    expect(r.ok).toBe(true);
+    expect(spinDownWorkerMock).toHaveBeenCalledWith({ projectId: pid, workerId: worker });
+    expect(rowExists(pid, worker)).toBe(false);
+  });
+
+  // ── PAIRED CONTROL 3: merged UP into the orchestrator. The ordinary shape of a finished worker,
+  //    and the one that would have made this guard a fleet-wide deadlock (bead sparkle-plxhx) had
+  //    it been written on the origin/main axis alone. ───────────────────────────────────────────
+  it("spins down a worker whose commits are already in its orchestrator's branch", async () => {
+    const pid = seedProject();
+    const build = seedBuild(pid, { bs: CLEAN });
+    const worker = seedTearableWorker(pid, build);
+    liveBranchStatus = async () => ({ ...CLEAN, ahead: 8 });
+    liveWorkflowState = async () => ({ ...WS_STRANDED, inParent: true });
+    const r = await spinDownWorkerAgent(worker);
+    expect(r.ok).toBe(true);
+    expect(spinDownWorkerMock).toHaveBeenCalledWith({ projectId: pid, workerId: worker });
+    expect(rowExists(pid, worker)).toBe(false);
+  });
+
+  // …AND THE WIRING THAT MAKES CONTROL 3 REACHABLE AT ALL. Rust computes `inParent` against the
+  // branch name it is handed, so a call site passing "" (which every caller did before this bead)
+  // pins that clearance at a permanent false and turns every normal teardown into a refusal.
+  it("asks the workflow read about the ORCHESTRATOR's branch, not an empty one", async () => {
+    const pid = seedProject();
+    const build = seedBuild(pid, { bs: CLEAN });
+    const worker = seedTearableWorker(pid, build);
+    liveBranchStatus = async () => CLEAN;
+    liveWorkflowState = async () => WS_LANDED;
+    await spinDownWorkerAgent(worker);
+    expect(workflowStateParentBranches).toContain(`sparkle/agent-${build}`);
+  });
+
+  // …AND THE POPULATION THAT CARRIES NO `parentBranch` AT ALL. It is stamped at spawn time, and the
+  // disk-reconcile self-heal that re-creates worker rows after a restart (`adoptWorker`) passes
+  // none. Rust returns early on an empty branch name, so `inParent` would be a permanent false for
+  // exactly those rows and the ordinary merged-up worker would refuse forever. The minted
+  // `sparkle/agent-<parentId>` is the name this app guarantees, so it is a real answer.
+  it("falls back to the MINTED orchestrator branch for a worker re-adopted without one", async () => {
+    const pid = seedProject();
+    const build = seedBuild(pid, { bs: CLEAN });
+    // A re-adopted row: same parentId, no `parentBranch`.
+    const worker = useProjectStore.getState().addAgent(pid, {
+      kind: "worker",
+      parentId: build,
+      task: "do a thing",
+      select: false,
+    })!;
+    useProjectStore.getState().setAgentWorktree(pid, worker, `/wt/${worker}`, `sparkle/agent-${worker}`);
+    spinDownWorkerMock.mockImplementation(async () => {
+      useProjectStore.getState().removeAgent(pid, worker);
+    });
+    liveBranchStatus = async () => ({ ...CLEAN, ahead: 8 });
+    liveWorkflowState = async () => ({ ...WS_STRANDED, inParent: true });
+    const r = await spinDownWorkerAgent(worker);
+    // The reading was asked about the minted name — without it Rust could not answer `inParent`…
+    expect(workflowStateParentBranches).toContain(`sparkle/agent-${build}`);
+    // …and the ordinary merged-up worker tears down.
+    expect(r.ok).toBe(true);
+    expect(rowExists(pid, worker)).toBe(false);
+  });
+
+  // …and the refusal SENTENCE uses the same fallback, so it can never read "Have it merged into ,".
+  it("names the minted orchestrator branch in the refusal when the row carries none", async () => {
+    const pid = seedProject();
+    const build = seedBuild(pid, { bs: CLEAN });
+    const worker = useProjectStore.getState().addAgent(pid, {
+      kind: "worker",
+      parentId: build,
+      task: "do a thing",
+      select: false,
+    })!;
+    useProjectStore.getState().setAgentWorktree(pid, worker, `/wt/${worker}`, `sparkle/agent-${worker}`);
+    liveBranchStatus = async () => ({ ...CLEAN, ahead: 8 });
+    liveWorkflowState = async () => WS_STRANDED;
+    const r = await spinDownWorkerAgent(worker);
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.message).toContain(`merged into sparkle/agent-${build}`);
+    expect(r.message).not.toMatch(/merged into ,/);
+  });
+
+  // ── THE OVERRIDE. Deliberate, named, and the only thing that clears a POSITIVE reading. ───────
+  it("spins the worker down when the caller passes allowUnlandedWork", async () => {
+    const pid = seedProject();
+    const build = seedBuild(pid, { bs: CLEAN });
+    const worker = seedTearableWorker(pid, build);
+    liveBranchStatus = async () => ({ ...CLEAN, ahead: 8 });
+    liveWorkflowState = async () => WS_STRANDED;
+    const r = await spinDownWorkerAgent(worker, { allowUnlandedWork: true });
+    expect(r.ok).toBe(true);
+    expect(spinDownWorkerMock).toHaveBeenCalledWith({ projectId: pid, workerId: worker });
+    expect(rowExists(pid, worker)).toBe(false);
+  });
+
+  // …AND THE TWO FLAGS THAT MUST NOT CLEAR IT. Each says something about a DIFFERENT axis, and
+  // spending either one here would let a caller drop eight committed commits it never heard about.
+  it.each([
+    ["discardUncommitted", { discardUncommitted: true }],
+    ["allowUnknownStatus", { allowUnknownStatus: true }],
+  ])("%s does not override a positive unlanded reading", async (_label, opts) => {
+    const pid = seedProject();
+    const build = seedBuild(pid, { bs: CLEAN });
+    const worker = seedTearableWorker(pid, build);
+    liveBranchStatus = async () => ({ ...CLEAN, ahead: 8 });
+    liveWorkflowState = async () => WS_STRANDED;
+    const r = await spinDownWorkerAgent(worker, opts);
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.reason).toBe("unlanded-work");
+    expect(spinDownWorkerMock).not.toHaveBeenCalled();
+    expect(rowExists(pid, worker)).toBe(true);
+  });
+
+  // ── FAIL CLOSED. An unreadable repo cannot authorize a deletion. Same honesty split the tree
+  //    rung draws: the sentence must not assert that unlanded work exists. ──────────────────────
+  it("refuses as unlanded-unknown when the repo cannot be read at all", async () => {
+    const pid = seedProject();
+    const build = seedBuild(pid, { bs: CLEAN });
+    const worker = seedTearableWorker(pid, build, null);
+    // The worktree is GONE — which settles the FILE question ("clean": there is no checkout to
+    // lose) and leaves no `BranchStatus` at all…
+    liveBranchStatus = async () => {
+      throw new Error("fatal: cannot change to '/wt/gone': No such file or directory");
+    };
+    // …and the branch reading fails too, so nothing is known about where the commits are.
+    liveWorkflowState = async () => {
+      throw new Error("git: could not read refs");
+    };
+    const r = await spinDownWorkerAgent(worker);
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.reason).toBe("unlanded-unknown");
+    expect(r.message).toMatch(/couldn't establish/i);
+    expect(r.message).toMatch(/NOT a report/);
+    expect(spinDownWorkerMock).not.toHaveBeenCalled();
+    expect(rowExists(pid, worker)).toBe(true);
+  });
+
+  // …AND ITS ESCAPE HATCH, so "we could not tell" is a cautious gate rather than a locked door
+  // (bead sparkle-plxhx). `allowUnknownStatus` already means "I went and looked myself".
+  it("spins down an unreadable worker when the operator passes allowUnknownStatus", async () => {
+    const pid = seedProject();
+    const build = seedBuild(pid, { bs: CLEAN });
+    const worker = seedTearableWorker(pid, build, null);
+    liveBranchStatus = async () => {
+      throw new Error("fatal: cannot change to '/wt/gone': No such file or directory");
+    };
+    liveWorkflowState = async () => {
+      throw new Error("git: could not read refs");
+    };
+    const r = await spinDownWorkerAgent(worker, { allowUnknownStatus: true });
+    expect(r.ok).toBe(true);
+    expect(spinDownWorkerMock).toHaveBeenCalledWith({ projectId: pid, workerId: worker });
+    expect(rowExists(pid, worker)).toBe(false);
+  });
+
+  // ── AND THE VERB THAT ROUTES HERE. `close_agent` hands a worker straight to this path, so the
+  //    guard would be bypassable by name if the refusal did not travel back out of it. ──────────
+  it("close_agent relays the refusal rather than closing the worker itself", async () => {
+    const pid = seedProject();
+    const build = seedBuild(pid, { bs: CLEAN });
+    const worker = seedTearableWorker(pid, build);
+    liveBranchStatus = async () => ({ ...CLEAN, ahead: 8 });
+    liveWorkflowState = async () => WS_STRANDED;
+    const r = await closeAgent(worker);
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.reason).toBe("unlanded-work");
+    expect(spinDownWorkerMock).not.toHaveBeenCalled();
+    expect(rowExists(pid, worker)).toBe(true);
   });
 });
 

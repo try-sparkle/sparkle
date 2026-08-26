@@ -77,6 +77,7 @@ import { classifyStartError } from "../cloudAgents/startError";
 import type { CategoryId } from "../../stores/uiStore";
 import { localAgentCapacity, type CapacityReading } from "../agentCapacity";
 import { closeDecision, worktreeRiskOf, type WorktreeRisk } from "../../engine/closeAgent";
+import { agentBranchName } from "./workflow";
 import {
   agentBranchStatus,
   agentWorkflowState,
@@ -317,9 +318,16 @@ export type LifecycleRefusalReason =
   | "unlanded-work" //          committed work that never reached main. Retiring keeps the branch,
   //                            but nobody would be left finishing it. Established from
   //                            `unlandedWorkEvidence`, NEVER from the ahead count — see `mayRetire`.
+  //                            ALSO RAISED BY `spin_down_worker` (bead sparkle-3duunc): a worker's
+  //                            spin-down removes its ROW as well as its checkout, so committed work
+  //                            held by nothing but that worker's own local branch is left with
+  //                            nobody pointing at it. Same reason code because it is the same rule —
+  //                            two spellings of it is how the branch/main seam silently diverged.
   | "unlanded-unknown" //       we could not establish whether the work landed. Same split as
   //                            `uncommitted-work` / `status-unknown`, for the same reason: absence
   //                            of evidence must never be reported as evidence of unlanded work.
+  //                            ALSO RAISED BY `spin_down_worker`, for the same bead: an unreadable
+  //                            repo cannot authorize a teardown.
   | "activity-unknown" //       we could not read whether the agent is still working. COMMON, not
   //                            exotic: `runtimeStore.status` is window-local, so a whole project
   //                            reads `undefined` after a restart. Cleared by reading the terminal.
@@ -1699,15 +1707,53 @@ export function liveActivityOf(agentId: string): LiveActivity {
 /**
  * Take every safety reading LIVE, at the moment of the decision.
  *
+ * ONE READER FOR BOTH TEARDOWN VERBS. `retire_agent` and `spin_down_worker` ask the same two
+ * questions — what is in the tree, and did the work land — so they ask them through this. The
+ * spin-down path used to carry its own `readAgentWorktreeRisk`, identical in every arm; that copy
+ * is gone, because two spellings of one safety ladder is how the surfaces drift apart.
+ *
+ * ── WHY THIS RE-READS INSTEAD OF TRUSTING THE STORE (bead sparkle-plxhx) ─────────────────────────
+ * `runtimeStore.branchStatus` is a 30-second poll with two states that never recover on their own. A
+ * worker whose worktree was removed is LATCHED into `deadWorktrees` and never polled again, so its
+ * entry stays `undefined` for the app's lifetime; a worker whose pane was never mounted may have no
+ * entry at all. Deciding a teardown from a permanently-stale cache is how a fail-safe default became
+ * a fail-PERMANENT one. So we ask git, now. The live call deliberately BYPASSES the `deadWorktrees`
+ * latch (it invokes the Tauri command directly rather than going through `pollBranchStatus`),
+ * because the latched population is exactly the population that needs an answer here.
+ *
+ * ── FALLBACK ORDER, AND WHY A THROW IS NOT AUTOMATICALLY "UNKNOWN" ───────────────────────────────
  * A worktree that is GONE is not an ambiguity — there is no checkout left, so a teardown destroys
- * nothing, and `isWorktreeGoneError` already owns that signature. Any OTHER failure falls back to
- * the cached reading (a stale-but-real observation beats none) and only then to `unknown`, which
- * refuses. Same ladder `readAgentWorktreeRisk` uses, for the same reasons.
+ * no FILES, and `isWorktreeGoneError` already owns that signature; answering `"clean"` for it is a
+ * statement about a directory that demonstrably is not there. Any OTHER failure falls back to the
+ * cached reading (a stale-but-real observation beats none) and only then to `unknown`, which
+ * refuses.
+ *
+ * ⚠️ That `"clean"` is about the TREE ONLY, and the branch rung must not read it as an all-clear:
+ * a gone worktree leaves no `BranchStatus`, so `unlanded` comes back `undefined` and
+ * `spinDownWorkerAgent` needs `ws` — which is read from branch REFS and survives a missing
+ * checkout — to tell a landed-or-pushed branch from one nobody else is holding.
  */
 async function readRetirementFacts(
   project: { id: string; rootPath: string; defaultBranch?: string | null },
   agentId: string,
-): Promise<{ worktreeRisk: WorktreeRisk; unlanded: boolean | undefined; bs?: BranchStatus }> {
+  /**
+   * The ORCHESTRATOR's branch, for a worker. Empty for anything else.
+   *
+   * It is what makes `WorkflowState.inParent` answerable at all — Rust computes that containment
+   * against the branch name it is handed, so passing `""` (which every caller did before bead
+   * sparkle-3duunc) makes it a permanent `false`. The spin-down guard reads it as the ordinary,
+   * SAFE shape of a finished worker: the orchestrator merged the branch into its own and is now
+   * reclaiming the slot, so the commits are held by something other than the row about to vanish.
+   * Without it that guard would refuse every normal worker teardown, which is the fail-PERMANENT
+   * direction bead sparkle-plxhx was filed over.
+   */
+  parentBranch = "",
+): Promise<{
+  worktreeRisk: WorktreeRisk;
+  unlanded: boolean | undefined;
+  bs?: BranchStatus;
+  ws?: WorkflowState;
+}> {
   const rt = useRuntimeStore.getState();
   const cached = rt.branchStatus[agentId];
   const base = project.defaultBranch ?? "";
@@ -1726,7 +1772,7 @@ async function readRetirementFacts(
   try {
     // `probePrState: false` — the PR probe reaches GitHub, and `unlandedWorkEvidence` deliberately
     // does not consult `prState` anyway (it is the state of the branch's PR, not of the branch).
-    ws = await agentWorkflowState(project.rootPath, agentId, "", false, project.id);
+    ws = await agentWorkflowState(project.rootPath, agentId, parentBranch, false, project.id);
   } catch {
     ws = rt.workflowState[agentId];
   }
@@ -1736,7 +1782,43 @@ async function readRetirementFacts(
     // count, which is the only way a squash-landed branch (ahead: N forever) reads as landed.
     unlanded: unlandedWorkEvidence({ bs, ws, stageOverride: rt.workflowStage[agentId] }),
     bs,
+    ws,
   };
+}
+
+/**
+ * POSITIVE proof that this branch's commits exist somewhere OTHER than the worker's own local
+ * branch — i.e. that dropping the worker's row strands nothing (bead sparkle-3duunc).
+ *
+ * Every term is a `=== true`, and that is the whole design: `WorkflowState`'s booleans are all
+ * optional, so a Rust build predating any one of them deserializes it to `undefined`, and `false`
+ * on this type means "not known to be" rather than "known not to be". This function is only ever
+ * asked to CLEAR a refusal, so it must speak only from evidence that ran.
+ *
+ * The four terms, and why each one is a real answer to "would tearing this row down lose it":
+ *   • `pushed`         — `refs/remotes/origin/<branch>` exists (Rust `branch_pushed`). The commits
+ *                        are on a remote. This is the axis bead sparkle-3duunc names by hand.
+ *   • `inParent`       — the orchestrator's branch contains the worker's tip. The NORMAL shape of a
+ *                        finished worker: merged up, slot being reclaimed. See `parentBranch` above.
+ *   • `inOriginMain` /
+ *     `landedOnOrigin` — it reached origin main outright, by ancestry or by squash-equivalence.
+ *                        Redundant with `unlanded === false` in the ordinary case, and NOT redundant
+ *                        in the case that matters: a GONE worktree makes `agentBranchStatus` throw,
+ *                        and `unlandedWorkEvidence` answers `undefined` whenever it has no
+ *                        `BranchStatus` at all — even with a perfectly good workflow reading in hand.
+ *
+ * ⚠️ NO LOCAL TERM. `inLocalMain` and `landed` are deliberately absent, the same scoping
+ * `unlandedWorkEvidence` documents at length: a branch merged into LOCAL main only still needs
+ * somebody to carry it the rest of the way, and this function's job is to say who else is holding
+ * the work — not whether it exists on this laptop, which is exactly what is being torn down.
+ */
+function commitsHeldElsewhere(ws: WorkflowState | undefined): boolean {
+  return (
+    ws?.pushed === true ||
+    ws?.inParent === true ||
+    ws?.inOriginMain === true ||
+    ws?.landedOnOrigin === true
+  );
 }
 
 /** A one-line branch measurement for the audit record, in the same shape `branchEvidence` uses. */
@@ -2197,7 +2279,7 @@ export async function discardAgent(
  *  no salvage ref and no undo. The caller is an orchestrator that cannot see the worktree, so it
  *  spins a worker down believing "branch kept" covers the work; it does not.
  *
- *  THE READING IS TAKEN LIVE, AT THE MOMENT OF THE DECISION — see `readWorkerWorktreeRisk`. It used
+ *  THE READING IS TAKEN LIVE, AT THE MOMENT OF THE DECISION — see `readRetirementFacts`. It used
  *  to come from the cached `runtimeStore.branchStatus` with unknown collapsed into dirty, and that
  *  collapse is what bead sparkle-plxhx is about: a permanently-stale cache entry made the refusal
  *  permanent, and phrasing it as "there are uncommitted changes" made it a false one. Unknown is now
@@ -2214,10 +2296,37 @@ export async function discardAgent(
  *     because the unknown case used to be inescapable, which turned a fail-safe default into a
  *     permanent deadlock whose only workaround was `discard_agent` — an operation that deletes
  *     branches and worktrees outright and is far more dangerous than the loss being guarded against.
+ *
+ *  ── AND THE BRANCH, WHICH THIS USED TO NEVER ASK ABOUT (bead sparkle-3duunc) ────────────────────
+ *  The two guards above are both about the same axis — files in the tree — and a worker whose tree
+ *  is spotless sailed past both. That is the measured loss: a finished worker's branch held EIGHT
+ *  commits that were on neither origin/main nor any remote ref, with no PR, and the teardown took
+ *  its row with nothing anywhere flagging that the work was held by that row alone. "The branch is
+ *  kept" is TRUE and is not the same as "the work is safe": the ROW is what a human and an
+ *  orchestrator navigate by, and a branch nobody is pointing at is work nobody will finish.
+ *
+ *  So a third rung asks the ancestry question, and it REUSES the retirement assessment rather than
+ *  re-deriving it — `readRetirementFacts` → `engine/workflowStage.unlandedWorkEvidence`, the same
+ *  path `mayRetire` reads, raising the same `unlanded-work` / `unlanded-unknown` reasons. A rule
+ *  expressed twice is how two surfaces come to disagree about the same agent at the same moment.
+ *
+ *  It fires ONLY when nothing else is holding the commits — see `commitsHeldElsewhere`. A pushed
+ *  branch, or one already merged into the orchestrator's, tears down exactly as before.
+ *
+ *   • `allowUnlandedWork` — the third escape hatch, for the third axis: "I know these commits are
+ *     only on this branch, and I want the slot back anyway." Deliberately NOT `discardUncommitted`:
+ *     that flag says something about UNCOMMITTED FILES, and spending it here would let a caller who
+ *     accepted losing a scratch edit also drop a row over eight committed ones it never heard about.
+ *     `allowUnknownStatus` clears the UNKNOWN arm only, matching what it already means for the tree
+ *     ("I went and looked myself") — it cannot clear a positive unlanded reading.
  */
 export async function spinDownWorkerAgent(
   workerId: string,
-  opts: { discardUncommitted?: boolean; allowUnknownStatus?: boolean } = {},
+  opts: {
+    discardUncommitted?: boolean;
+    allowUnknownStatus?: boolean;
+    allowUnlandedWork?: boolean;
+  } = {},
 ): Promise<LifecycleResult<ClosedAgents>> {
   const found = locate(workerId);
   if (!found) return refuse("spin_down_worker", "unknown-agent", unknownAgent(workerId));
@@ -2228,7 +2337,21 @@ export async function spinDownWorkerAgent(
       `“${found.agent.name}” is a ${found.agent.kind} agent, not a worker — closing it is a different operation with different consequences.`,
     );
   }
-  const risk = await readAgentWorktreeRisk(found.project, workerId);
+  // ONE read for BOTH axes. `readRetirementFacts` takes the same live `agentBranchStatus` reading
+  // this path always took — same fallback ladder, same gone-worktree arm — and adds the workflow
+  // reading the branch rung needs, so the tree guards below are unchanged in behaviour.
+  // ── THE PARENT BRANCH, WITH THE MINTED FALLBACK EVERY OTHER CONSUMER ALREADY USES ────────────
+  // `parentBranch` is stamped at spawn time and is genuinely ABSENT for a real population: the
+  // disk-reconcile self-heal that re-creates worker rows after a restart (`adoptWorker`) passes
+  // none. Rust's `resolve_parent_branch` returns early on an empty string, so `inParent` would be a
+  // permanent `false` for exactly those rows — and the ordinary, safe shape (merged up into the
+  // orchestrator, not yet pushed) would then refuse forever. `sparkle/agent-<parentId>` is the
+  // branch name this app guarantees, so the fallback is a real answer rather than a guess.
+  const parentBranch = found.agent.parentId
+    ? found.agent.parentBranch || agentBranchName(found.agent.parentId)
+    : (found.agent.parentBranch ?? "");
+  const facts = await readRetirementFacts(found.project, workerId, parentBranch);
+  const risk = facts.worktreeRisk;
   if (risk === "dirty" && !opts.discardUncommitted) {
     return refuse(
       "spin_down_worker",
@@ -2251,6 +2374,49 @@ export async function spinDownWorkerAgent(
         `retire it — that still refuses if the tree turns out to hold real uncommitted files.`,
     );
   }
+  // ── THE BRANCH (bead sparkle-3duunc) ───────────────────────────────────────────────────────────
+  // Only reached once the tree is settled, mirroring `mayRetire`'s order: files first, because that
+  // is the rung where unrecoverable data is at stake, then the ancestry question.
+  if (!commitsHeldElsewhere(facts.ws)) {
+    const branch = found.agent.branch ?? `sparkle/agent-${workerId}`;
+    // The count comes from the SAME reading the verdict did. It may be absent (an unreadable tree
+    // leaves no `BranchStatus` while the stage watermark can still say work exists), and "commits"
+    // is the honest word for that — never a guessed number on a sentence about losing work.
+    const n = facts.bs?.ahead;
+    const commits = n !== undefined && n > 0 ? `${n} commit${n === 1 ? "" : "s"}` : "commits";
+    // EVERY REMEDY NAMED HERE IS SAFE UNDER THE CONDITION THAT TRIGGERED THE REFUSAL — the founder's
+    // sparkle-8bvh rule. Each of the three either moves the commits somewhere else first or is the
+    // caller deliberately spending the override; none of them is "spin it down another way", and
+    // `discard_agent` is not offered at all (it DELETES the branch, which is strictly worse than
+    // the loss being guarded against).
+    const waysOut =
+      `Have it merged into ${parentBranch || "your branch"}, or push the branch ` +
+      `(\`git push -u origin ${branch}\`) so the work exists somewhere other than this worktree — ` +
+      `either one clears this. If you already have the commits and just want the slot back, retry ` +
+      `with allowUnlandedWork.`;
+    if (facts.unlanded === true && !opts.allowUnlandedWork) {
+      return refuse(
+        "spin_down_worker",
+        "unlanded-work",
+        `“${found.agent.name}” has ${commits} on ${branch} that never reached main, and nothing ` +
+          `else is holding them — no remote ref, and not merged into its orchestrator. Spinning it ` +
+          `down keeps the branch but takes its row, so nobody would be left finishing that work. ` +
+          waysOut,
+      );
+    }
+    // FAIL CLOSED. An unreadable repo cannot authorize a teardown — and this is NOT a claim that
+    // unlanded work exists, the same honesty split `status-unknown` draws for the tree.
+    if (facts.unlanded === undefined && !opts.allowUnlandedWork && !opts.allowUnknownStatus) {
+      return refuse(
+        "spin_down_worker",
+        "unlanded-unknown",
+        `I couldn't establish whether “${found.agent.name}”'s committed work has landed, so I ` +
+          `can't rule out that spinning it down strands something — this is NOT a report that it ` +
+          `does. I've stopped rather than guess. ` +
+          waysOut,
+      );
+    }
+  }
   await spinDownWorker({ projectId: found.project.id, workerId });
   return ok("spin_down_worker", {
     agentIds: [workerId],
@@ -2268,53 +2434,6 @@ export async function spinDownWorkerAgent(
     agentName: found.agent.name,
   });
 }
-
-/**
- * What a spin-down of this worker's checkout would destroy, read LIVE.
- *
- * ── WHY THIS RE-READS INSTEAD OF TRUSTING THE STORE (bead sparkle-plxhx) ─────────────────────────
- * `runtimeStore.branchStatus` is a 30-second poll, and it has two states that never recover on their
- * own. A worker whose worktree was removed is LATCHED into `deadWorktrees` and never polled again, so
- * its entry stays `undefined` for the app's lifetime; and a worker whose pane was never mounted may
- * have no entry at all. Deciding an irreversible teardown from a cache that is permanently stale is
- * how a fail-safe default became a fail-permanent one. So we ask git, now, at the moment of the
- * decision — which is also the only reading that can honestly be called current.
- *
- * The live call deliberately BYPASSES the `deadWorktrees` latch (it invokes the Tauri command
- * directly rather than going through `pollBranchStatus`), because the latched population is exactly
- * the population that needs an answer here.
- *
- * ── FALLBACK ORDER, AND WHY A THROW IS NOT AUTOMATICALLY "UNKNOWN" ───────────────────────────────
- * A gone worktree is the case the latch exists for, and it is not an ambiguity: there is no checkout
- * left, so a teardown destroys nothing. `isWorktreeGoneError` already owns that signature, and
- * answering `"clean"` for it is a statement about a directory that demonstrably is not there.
- * Any OTHER failure is a genuine unknown, and rather than give up immediately we fall back to the
- * cached reading — a stale-but-real observation beats no observation — and only then to `"unknown"`.
- */
-async function readAgentWorktreeRisk(
-  project: { id: string; rootPath: string; defaultBranch?: string | null },
-  // Any agent that owns a worktree — a worker on the spin-down path, a worker or a build agent on
-  // the retirement path. Nothing in here was ever worker-specific; the name was.
-  workerId: string,
-): Promise<WorktreeRisk> {
-  const cached = useRuntimeStore.getState().branchStatus[workerId];
-  try {
-    const live = await agentBranchStatus(
-      project.rootPath,
-      project.id,
-      workerId,
-      project.defaultBranch ?? "",
-    );
-    // Keep the store honest too, so the sidebar stops rendering the stale reading the moment this
-    // op runs — the founder was looking at both surfaces while the fleet was wedged.
-    useRuntimeStore.getState().setBranchStatus(workerId, live);
-    return worktreeRiskOf(live);
-  } catch (e) {
-    if (isWorktreeGoneError(e)) return "clean";
-    return worktreeRiskOf(cached);
-  }
-}
-
 
 // ── Restart / Stop — the two ops that act on a PROCESS, not on records ───────────────────────────
 //

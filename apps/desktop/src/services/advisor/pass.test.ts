@@ -475,6 +475,12 @@ describe("the advisor's brief to the child", () => {
     });
     const q = h.dispatches[0]!.question;
     expect(q).toContain("pr-file-overlap.sh");
+    // The brief must describe the script it actually calls. pr-file-overlap.sh's in-flight verdict
+    // is 13 — another live worktree changing one of the plan's files, including work it has not
+    // committed — and a brief enumerating only 10/12/11 leaves the child reading the one verdict
+    // that fires at DISPATCH time as unexplained noise (sparkle-7h6q47).
+    expect(q).toMatch(/exit 13 =/);
+    expect(q).toContain("10 > 13 > 12 > 11");
     expect(q).toContain("sparkle-other");
     expect(q).toContain("worker-1: sparkle-bead9");
     // DEFERS to the gate rather than restating its rules — a second, drifting copy of the goal
