@@ -259,8 +259,32 @@ export function atCapacitySentence(capacity: CapacityReading, lead: string): str
       ? ` (${capacity.live} of them showing in this window; the rest are in project tabs that ` +
         `aren't open here — most are already running, they're just not on screen)`
       : "";
+  // "N of its M slots taken" IS ONLY TRUE WHILE N <= M, and a runtime narrowing routinely breaks
+  // that. `limit` is `min(staticLimit, effective)`, and `effective` lands BELOW the row count in
+  // both dimensions: the run queue answers `in_use` plus a trickle, where `in_use` is `live` — a
+  // strict subset of `used` from one walk in `localAgentRowIds` — and memory reaches the same shape
+  // whenever a freshly-narrowed ceiling lands under a row count admitted before the pressure. So a
+  // machine holding 40 rows with 20 panes mounted rendered "has 40 of its 21 agent slots taken", a
+  // sentence whose own two numbers contradict each other, shown at the exact moment a human is
+  // trying to work out what went wrong (bead `sparkle-e57k99.1`). It keys on the ARITHMETIC rather
+  // than on `bound`, because the dimension that narrowed is not what makes the claim false.
+  //
+  // The over-ceiling wording stops presenting the pair as a fraction — there is no honest way to
+  // call 21 a number of slots taken while 40 are occupied — but it deliberately KEEPS the phrase
+  // "agent slots". That is not stylistic: `components/Concierge/refusalAudience` classifies a
+  // refusal by matching `/\bagent slots?\b/i` to decide it is an internal gate the concierge can
+  // route around rather than red text for the founder. Rewording this clause out of that lexicon
+  // would silently reclassify every capacity refusal as founder-facing — a fix relocating a bug
+  // into the copy that describes it, and nothing would go red for it, because the classifier's own
+  // tests assert against strings hand-typed into its file. `agentCapacity.test.ts` pins the
+  // coupling on the sentence this function actually produces, so the next rewrite fails loudly.
+  const holding =
+    capacity.used > capacity.limit
+      ? `is holding ${capacity.used} agents against ${capacity.limit} agent slots — more than it ` +
+        `can take right now`
+      : `has ${capacity.used} of its ${capacity.limit} agent slots taken`;
   return (
-    `${lead} This machine has ${capacity.used} of its ${capacity.limit} agent slots taken${dormant}. ` +
+    `${lead} This machine ${holding}${dormant}. ` +
     `The ceiling is ${capacity.basis}. Close or finish one before starting another.`
   );
 }

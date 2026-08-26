@@ -16,6 +16,10 @@ import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useSettingsStore } from "../stores/settingsStore";
 import { markProjectVisited, resetVisitedProjects } from "./sessionProjects";
+// Pure — it imports nothing of its own — so pulling the refusal classifier in here costs
+// nothing and lets the wording coupling below be asserted on the sentence this module really
+// produces, rather than on a copy of it hand-typed into the classifier's own tests.
+import { refusalAudience } from "../components/Concierge/refusalAudience";
 
 // The STATIC ceiling for every test below. Deliberately not equal to any sampled number that
 // follows, so an assertion on the narrowed limit cannot pass by accident.
@@ -335,6 +339,62 @@ describe("localAgentCapacity — narrowed by the live memory reading", () => {
     const cap = localAgentCapacity();
     expect(cap.limit).toBe(3);
     expect(cap.basis).toBe(STATIC_BASIS);
+  });
+});
+
+describe("atCapacitySentence — the numbers it states must not contradict each other", () => {
+  it("does not claim more slots taken than the ceiling it names", async () => {
+    // THE DEFECT (bead `sparkle-e57k99.1`). `limit` is `min(staticLimit, effective)` and a runtime
+    // narrowing routinely lands it BELOW the row count — the run queue holds at `live` plus a
+    // trickle, and `live` is a strict subset of `used`. The sentence then read "has 9 of its 3
+    // agent slots taken": two numbers in one clause that cannot both be true, shown at the exact
+    // moment a human is trying to work out what is wrong with their machine.
+    seedMachine(9);
+    expect(localAgentCapacity().limit).toBe(STATIC_LIMIT); // baseline: provably not already 3
+    await sample({ effective: 3 });
+
+    const cap = localAgentCapacity();
+    expect(cap.used).toBe(9);
+    expect(cap.limit).toBe(3);
+
+    const sentence = atCapacitySentence(cap, "No.");
+    expect(sentence).not.toContain("9 of its 3");
+    // What it says instead is still both true numbers, just not as a slots-taken fraction.
+    expect(sentence).toContain("holding 9 agents against 3 agent slots");
+    expect(sentence).toContain(MEMORY_BASIS);
+  });
+
+  it("keeps the slots wording while the count actually fits under the ceiling", () => {
+    // THE PAIRED CASE. Without it, deleting the fraction branch outright would pass the test above,
+    // and the ordinary refusal — much the commoner one — would lose the framing users read daily.
+    seedMachine(2);
+    const cap = localAgentCapacity();
+    expect(cap.used).toBeLessThanOrEqual(cap.limit); // precondition, not an assumption
+    expect(atCapacitySentence(cap, "No.")).toContain(`has 2 of its ${STATIC_LIMIT} agent slots taken`);
+  });
+
+  it("stays classifiable as an internal gate in BOTH wordings", async () => {
+    // THE COUPLING, pinned on the produced sentence rather than a hand-typed copy of it.
+    // `refusalAudience` decides whether a refusal is machinery the concierge routes around or red
+    // text the founder has to read, and it decides by matching `/\bagent slots?\b/i`. Rewording
+    // either branch out of that lexicon reclassifies every capacity refusal as founder-facing, and
+    // nothing else in the tree would go red for it — the classifier's own tests assert against
+    // strings typed by hand into that file.
+    seedMachine(9);
+    await sample({ effective: 3 });
+    const over = localAgentCapacity();
+    expect(over.used).toBeGreaterThan(over.limit); // precondition: this IS the over-ceiling branch
+    expect(refusalAudience(atCapacitySentence(over, "I can't start another agent right now."))).toBe(
+      "internal",
+    );
+
+    resetMemoryAdmission();
+    seedMachine(2);
+    const under = localAgentCapacity();
+    expect(under.used).toBeLessThanOrEqual(under.limit);
+    expect(refusalAudience(atCapacitySentence(under, "I can't start another agent right now."))).toBe(
+      "internal",
+    );
   });
 });
 
