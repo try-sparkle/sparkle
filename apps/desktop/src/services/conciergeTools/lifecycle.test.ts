@@ -122,6 +122,7 @@ import {
   discardAgent,
   spinDownWorkerAgent,
   restartAgent,
+  resumeWorker,
   stopAgent,
   type LifecycleOp,
   type LifecycleRisk,
@@ -1629,6 +1630,134 @@ describe("restart_agent / stop_agent", () => {
     const restart = mountPane(agentId);
     expect((await restartAgent(agentId)).ok).toBe(true);
     expect(restart).toHaveBeenCalledTimes(1);
+  });
+
+  // ── `resume_worker` — THE ORCHESTRATOR'S NARROWED RESTART (bead `sparkle-abl8ug`) ─────────────
+  //
+  // Same act as `restart_agent`, with the populations that make a restart dangerous removed, which is
+  // what lets an unattended orchestrator call it. Each gate is asserted on the SIDE EFFECT — whether
+  // the pane lever was actually pulled — because a refusal object proves nothing about whether the
+  // process was left alone, and "left alone" is the whole property.
+  describe("resume_worker", () => {
+    /** A pane mounted but QUIET: the worker's process is gone, which is the population this op is
+     *  for. `mountPane` seeds `working`, so the status is overwritten after it. */
+    function mountDeadPane(agentId: string) {
+      const restart = mountPane(agentId);
+      useRuntimeStore.setState({ status: { [agentId]: "idle" } } as never);
+      return restart;
+    }
+
+    it("resumes a QUIET worker — the population it exists for", async () => {
+      const projectId = seedProject();
+      const parentId = seedBuild(projectId);
+      const workerId = seedWorker(projectId, parentId);
+      const restart = mountDeadPane(workerId);
+      const r = await resumeWorker(workerId);
+      expect(r.ok).toBe(true);
+      // THE SIDE EFFECT: the pane really was re-spawned.
+      expect(restart).toHaveBeenCalledTimes(1);
+      // And the reply names the op the CALLER asked for, not the one it delegates to — a receipt
+      // stamped `restart_agent` is a receipt for a call nobody made.
+      expect(r.op).toBe("resume_worker");
+      expect(r.ok === true && r.data).toMatchObject({ agentId: workerId, outcome: "restart" });
+    });
+
+    // ── GATE 1: WORKER ONLY ──────────────────────────────────────────────────────────────────────
+    it.each([
+      ["a build agent", "build"],
+      ["a shell", "shell"],
+    ])("REFUSES %s and never pulls the pane lever", async (_label, kind) => {
+      const projectId = seedProject();
+      const agentId = useProjectStore.getState().addAgent(projectId, { kind } as never)!;
+      const restart = mountDeadPane(agentId);
+      const r = await resumeWorker(agentId);
+      expect(r.ok).toBe(false);
+      expect(r.ok === false && r.reason).toBe("not-a-worker");
+      expect(restart).not.toHaveBeenCalled();
+    });
+
+    it("REFUSES the app-owned Improve Sparkle agent, which has no roster row to be a worker", async () => {
+      // `findKnownAgent` resolves it through its Sparkle arm, so it EXISTS — but it carries no `tab`,
+      // and an agent with no row saying what it is cannot be established as anybody's worker. This
+      // pins the `tab?.kind === undefined` branch: read `agent.kind` off the wrong object and this
+      // would not even compile, but read it off a defaulted one and the app's own agent becomes
+      // re-spawnable by any orchestrator.
+      const restart = mountDeadPane(SPARKLE_AGENT_ID);
+      const r = await resumeWorker(SPARKLE_AGENT_ID);
+      expect(r.ok).toBe(false);
+      expect(r.ok === false && r.reason).toBe("not-a-worker");
+      expect(restart).not.toHaveBeenCalled();
+    });
+
+    // ── GATE 2: NOT PRODUCING OUTPUT ─────────────────────────────────────────────────────────────
+    //
+    // This is the gate that makes the `routine` risk classification TRUE rather than asserted: with
+    // it, the op cannot stop work in flight, which is the exact property policy.ts's `disruptive`
+    // tier gates on. The RED tier is included deliberately — an agent holding a question or an
+    // approval open is mid-exchange with somebody, and re-spawning it discards that.
+    it.each(["working", "questions", "waiting", "approval"])(
+      "REFUSES a worker whose status is `%s`, leaving its turn alone",
+      async (status) => {
+        const projectId = seedProject();
+        const parentId = seedBuild(projectId);
+        const workerId = seedWorker(projectId, parentId);
+        const restart = mountPane(workerId);
+        useRuntimeStore.setState({ status: { [workerId]: status } } as never);
+        const r = await resumeWorker(workerId);
+        expect(r.ok).toBe(false);
+        expect(r.ok === false && r.reason).toBe("agent-busy");
+        expect(restart).not.toHaveBeenCalled();
+      },
+    );
+
+    // ── GATE 3: THE READING MUST EXIST ───────────────────────────────────────────────────────────
+    it("REFUSES when the activity reading is ABSENT — an unread status is not evidence of quiet", async () => {
+      // `runtimeStore.status` is written only by a mounted pane, so a whole project reads `undefined`
+      // after a relaunch. Treating that as quiet would make the entire fleet resumable on the
+      // strength of a map nobody had populated. The refusal names the remedy instead.
+      const projectId = seedProject();
+      const parentId = seedBuild(projectId);
+      const workerId = seedWorker(projectId, parentId);
+      const restart = mountPane(workerId);
+      useRuntimeStore.setState({ status: {} } as never);
+      const r = await resumeWorker(workerId);
+      expect(r.ok).toBe(false);
+      expect(r.ok === false && r.reason).toBe("activity-unknown");
+      expect(r.ok === false && r.message).toMatch(/pane/i);
+      expect(restart).not.toHaveBeenCalled();
+    });
+
+    it("REFUSES an id that names no agent at all", async () => {
+      const r = await resumeWorker("no-such-worker");
+      expect(r.ok).toBe(false);
+      expect(r.ok === false && r.reason).toBe("unknown-agent");
+    });
+
+    // THE FAILURE PATHS ARE THE DELEGATE'S, AND THEY MUST STILL SAY `resume_worker`. Sharing one
+    // implementation is the point — these five refusals each exist because of a measured false
+    // success — but a shared body that stamps the wrong op name reports a call the caller never made.
+    it("carries a delegate refusal through under its OWN op name", async () => {
+      const projectId = seedProject();
+      const parentId = seedBuild(projectId);
+      const workerId = seedWorker(projectId, parentId);
+      registerPaneRestart(workerId, async () => "no-claude");
+      useRuntimeStore.setState({ status: { [workerId]: "idle" } } as never);
+      const r = await resumeWorker(workerId);
+      expect(r.ok).toBe(false);
+      expect(r.op).toBe("resume_worker");
+      expect(r.ok === false && r.reason).toBe("action-failed");
+    });
+
+    it("refuses a worker with NO pane rather than claiming it came back", async () => {
+      const projectId = seedProject();
+      const parentId = seedBuild(projectId);
+      const workerId = seedWorker(projectId, parentId);
+      useRuntimeStore.setState({ status: { [workerId]: "idle" } } as never);
+      const r = await resumeWorker(workerId);
+      expect(r.ok).toBe(false);
+      expect(r.op).toBe("resume_worker");
+      expect(r.ok === false && r.reason).toBe("no-pane");
+    });
   });
 
   // ── THE FALSE-SUCCESS ACK ────────────────────────────────────────────────────────────────────

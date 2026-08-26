@@ -190,6 +190,13 @@ export const LIFECYCLE_OPS = [
   // clone the hourly scheduler works in.
   "restart_agent",
   "stop_agent",
+  // THE ORCHESTRATOR'S OWN RECOVERY VERB (bead `sparkle-abl8ug`). A build agent whose worker exits
+  // mid-task could not bring it back: `concierge_tool` is concierge-only, so three starved workers
+  // had to be salvaged by hand. This is `restart_agent` NARROWED until it is safe for a caller that
+  // is not the concierge — same SEPARATE-OP precedent `retire_agent` set against `close_agent`, and
+  // for the same reason: choosing this name is strictly MORE restrictive than choosing
+  // `restart_agent`, so it opens no laxer path into the op it delegates to. See `resumeWorker`.
+  "resume_worker",
 ] as const;
 
 export type LifecycleOp = (typeof LIFECYCLE_OPS)[number];
@@ -238,6 +245,13 @@ export const LIFECYCLE_RISK: Record<LifecycleOp, LifecycleRisk> = {
   // services/paneControl, which calls this "safe by construction". It is the remedy for a pane
   // wedged on a screen its CLI will not leave (a login prompt that ignores Escape).
   restart_agent: "routine",
+  // `routine`, AND — like `retire_agent`, and unlike the `restart_agent` it delegates to —
+  // deliberately NOT raised to `disruptive` by policy.ts's RISK_OVERRIDES. That table asks a human
+  // before work is stopped IN FLIGHT, and `resumeWorker` cannot stop work in flight: it refuses a
+  // target that is producing output and refuses one whose activity could not be read at all. What is
+  // left is a worker whose process is already gone — the population this verb exists for. See
+  // policy.ts for the paired reasoning.
+  resume_worker: "routine",
   // Kills the PTY and nothing else — no tab, no worktree, no branch, and for Improve Sparkle no
   // scheduler state. `routine` on the same grounds as restart: `restart_agent` brings it straight
   // back. The RISK_OVERRIDES table in policy.ts still raises both to the `disruptive` approval
@@ -2333,7 +2347,7 @@ export interface ProcessActed {
  *  force flag: a genuinely wedged pass already clears itself (a 30-minute client watchdog with a
  *  35-minute Rust reclaim behind it), so the escape hatch would only ever be used to do the damage. */
 function resolveForProcessOp(
-  op: "restart_agent" | "stop_agent",
+  op: "restart_agent" | "stop_agent" | "resume_worker",
   agentId: string,
 ): LifecycleRefused | null {
   if (findKnownAgent(agentId) === undefined) {
@@ -2367,19 +2381,39 @@ function resolveForProcessOp(
  * still down, so every non-`restarted` outcome is now a refusal the caller can read and relay.
  */
 export async function restartAgent(agentId: string): Promise<LifecycleResult<ProcessActed>> {
-  const refusal = resolveForProcessOp("restart_agent", agentId);
+  return restartTerminal("restart_agent", agentId);
+}
+
+/**
+ * The restart, with the OP NAME as a parameter — the one implementation both `restart_agent` and
+ * `resume_worker` run.
+ *
+ * PARAMETERISED RATHER THAN COPIED, deliberately. Every branch below is a refusal that tells the
+ * caller not to report the agent as recovered, and each was written after a measured false success
+ * (see `restartAgent`'s header for the v0.107.0 measurement). A second copy of five such branches is
+ * the drift class this repo keeps paying for: the copy would go stale silently, and the failure it
+ * produces is the exact one these sentences exist to prevent — an agent reported healthy while it is
+ * still down. The op name is threaded through so each refusal names the op the CALLER asked for; a
+ * reply stamped `restart_agent` to a caller that said `resume_worker` is a receipt for a call nobody
+ * made.
+ */
+async function restartTerminal(
+  op: "restart_agent" | "resume_worker",
+  agentId: string,
+): Promise<LifecycleResult<ProcessActed>> {
+  const refusal = resolveForProcessOp(op, agentId);
   if (refusal) return refusal;
   const result = await restartPaneAwaited(agentId);
   if (result === "no-pane") {
     return refuse(
-      "restart_agent",
+      op,
       "no-pane",
       `${agentId} has no terminal open right now, so there was nothing to restart. It will start fresh the next time it is opened.`,
     );
   }
   if (result === "no-claude") {
     return refuse(
-      "restart_agent",
+      op,
       "action-failed",
       `${agentId}'s terminal could not be restarted: the \`claude\` CLI was not found. The agent is still down — this needs a human to fix the install.`,
     );
@@ -2402,21 +2436,21 @@ export async function restartAgent(agentId: string): Promise<LifecycleResult<Pro
           ? "Restarting does not reach this kind of agent; closing and reopening it is what starts a fresh terminal."
           : "What would actually restart it depends on where it runs, and that could not be determined here.";
     return refuse(
-      "restart_agent",
+      op,
       "action-failed",
       `${agentId}'s terminal was not re-spawned — nothing was replaced, so it is in exactly the state it was in before. ${remedy} Do not report it as recovered.`,
     );
   }
   if (result === "timed-out") {
     return refuse(
-      "restart_agent",
+      op,
       "action-failed",
       `${agentId}'s terminal was told to restart but had not come up yet. It may still be starting — re-read its status before reporting it either way, and do not report it as recovered.`,
     );
   }
   if (result !== "restarted") {
     return refuse(
-      "restart_agent",
+      op,
       "action-failed",
       `${agentId}'s terminal did not come back up (${result}). It is still down — do not report it as recovered.`,
     );
@@ -2430,7 +2464,77 @@ export async function restartAgent(agentId: string): Promise<LifecycleResult<Pro
   // `spawn -> working` transition repaints the status off the real spawn. Letting the engine own it
   // means a restart that comes up and immediately re-errors still reads red.
   log.info("concierge", "restarted an agent's terminal", { agentId });
-  return ok("restart_agent", { agentId, outcome: "restart" });
+  return ok(op, { agentId, outcome: "restart" });
+}
+
+/**
+ * Bring an orchestrator's OWN worker back after its process is gone (bead `sparkle-abl8ug`).
+ *
+ * WHY THIS IS A SEPARATE OP AND NOT A LOOSENING OF `restart_agent`. `concierge_tool` is
+ * concierge-only, so a build agent whose worker exited mid-task had no way to resume it — the
+ * measured cost was three starved workers salvaged by hand, and the refusal an orchestrator got told
+ * it to "ask the human", which is exactly the unattended deadlock the fleet cannot afford overnight.
+ * The remedy is not to admit an agent to `restart_agent`: that op is `disruptive` because it can kill
+ * a `claude` mid-turn, and admitting an unattended caller to it would hand every orchestrator a way
+ * to cut off a worker's live turn. This op is the same act with the dangerous population REMOVED,
+ * which is the `retire_agent`-vs-`close_agent` precedent one more time: strictly more restrictive
+ * than the op it delegates to, so nothing is escapable by choosing it.
+ *
+ * THREE GATES, and each removes one thing the `disruptive` tier was protecting:
+ *
+ *   1. WORKER ONLY. A build agent is the human's own row and a shell is nobody's worker; neither is
+ *      an orchestrator's to re-spawn. `not-a-worker` says so.
+ *   2. NOT PRODUCING OUTPUT. `liveActivityOf` reads the live status map, and its RED tier
+ *      (`questions` / `waiting` / `approval`) counts as working — a worker holding a question open is
+ *      mid-exchange with somebody, and re-spawning it discards that. This is the gate that makes the
+ *      `routine` classification true rather than asserted: with it, the op cannot stop work in flight.
+ *   3. ACTIVITY MUST BE READABLE. `unknown` REFUSES rather than proceeding, for the reason
+ *      `liveActivityOf`'s own header gives: `runtimeStore.status` is written only by a mounted pane,
+ *      so an unread map is not evidence of quiet. Fail-closed here costs an orchestrator one refusal
+ *      it can act on; failing open costs a worker its turn. In practice the populations line up —
+ *      `restartPaneAwaited` needs a mounted pane too, and a mounted pane is what writes the status.
+ *
+ * OWNERSHIP IS NOT CHECKED HERE, and that is deliberate rather than missing: this module has no
+ * caller identity to check it against. The subtree test lives at the one layer that does have one —
+ * `mayWriteAgentFieldFor` in services/controlListener, the same walk `rename_agent` applies — and the
+ * concierge reaches this op with its own authority, as it does every other lifecycle op.
+ */
+export async function resumeWorker(agentId: string): Promise<LifecycleResult<ProcessActed>> {
+  const agent = findKnownAgent(agentId);
+  if (agent === undefined) {
+    return refuse("resume_worker", "unknown-agent", unknownAgent(agentId));
+  }
+  // READ THROUGH `tab`, and treat its ABSENCE as a refusal rather than as an unknown to work around.
+  // `findKnownAgent` resolves three arms and only the roster arm carries a row: the app-owned Improve
+  // Sparkle agent and an `observed`-only id both come back with no `tab` at all. Neither is anybody's
+  // worker — the first is the app's own, and the second is an id with no record saying what it is —
+  // so both belong on the refusing side of this gate, which is what reading `tab?.kind` gives.
+  const kind = agent.tab?.kind;
+  if (kind !== "worker") {
+    return refuse(
+      "resume_worker",
+      "not-a-worker",
+      kind === undefined
+        ? `${agentId} has no roster row saying what it is, so it cannot be established as your worker and was left alone. This op only brings back a worker in your own subtree.`
+        : `${agentId} is a ${kind} agent, not a worker, so it is not yours to resume. This op only brings back a worker in your own subtree; anything else is the human's or the concierge's call.`,
+    );
+  }
+  const activity = liveActivityOf(agentId);
+  if (activity === "working") {
+    return refuse(
+      "resume_worker",
+      "agent-busy",
+      `${agentId} is still mid-exchange — producing output, or holding a question or approval open. Resuming it would re-spawn its terminal and cut that turn off, so nothing was done. Read its terminal before deciding it is stuck.`,
+    );
+  }
+  if (activity === "unknown") {
+    return refuse(
+      "resume_worker",
+      "activity-unknown",
+      `Whether ${agentId} is still working could not be read, so it was left alone — an unread status is not evidence that it is quiet. Open its pane (that is what writes the reading) and try again.`,
+    );
+  }
+  return restartTerminal("resume_worker", agentId);
 }
 
 /**

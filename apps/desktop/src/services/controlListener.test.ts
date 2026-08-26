@@ -5732,6 +5732,181 @@ describe("controlListener", () => {
       });
     });
 
+    // ── THE ORCHESTRATOR WORKER-RESUME CARVE-OUT (bead `sparkle-abl8ug`) ────────────────────────
+    //
+    // The SECOND exception to concierge-only: a build agent may call `lifecycle.resume_worker` on a
+    // worker in its OWN subtree, so a worker that exits mid-task can be brought back without a human
+    // (three were salvaged by hand before this existed). Every case asserts the SIDE EFFECT — whether
+    // the registry was actually REACHED — because a gate that refused-but-dispatched, or
+    // admitted-but-was-blocked-later, fools a reply-only assertion.
+    //
+    // `otherId` is created as `{ kind: "worker", parentId: callerId }` in this suite's setup, so the
+    // ownership walk has a real edge to find rather than a stubbed predicate.
+    describe("the orchestrator worker-resume carve-out", () => {
+      it("lets an ORCHESTRATOR reach the registry for resume_worker on its OWN worker", async () => {
+        fire({
+          reqId: "owr-own",
+          op: "concierge_tool",
+          callerAgentId: callerId,
+          payload: {
+            domain: "lifecycle",
+            op: "resume_worker",
+            args: { agentId: otherId },
+            toolCallId: "tc-owr",
+          },
+        });
+        await flush();
+        // THE SIDE EFFECT: both gates passed and the wire contract arrived intact.
+        expect(dispatchConciergeToolMock).toHaveBeenCalledTimes(1);
+        expect(dispatchConciergeToolMock.mock.calls[0]![0]).toEqual({
+          domain: "lifecycle",
+          op: "resume_worker",
+          args: { agentId: otherId },
+          toolCallId: "tc-owr",
+        });
+        expect(lastReply().ok).toBe(true);
+      });
+
+      // THE PAIRED NEGATIVE THAT PINS THE OP NAME. Same caller, same owned target, same domain —
+      // only the op differs. Without this, widening the predicate to "any lifecycle op" would leave
+      // the positive above green while handing every orchestrator `discard_agent`.
+      it.each(["restart_agent", "stop_agent", "discard_agent", "spin_down_worker", "close_agent"])(
+        "STILL REFUSES the same orchestrator the lifecycle op %s on the SAME owned worker",
+        async (op) => {
+          fire({
+            reqId: `owr-op-${op}`,
+            op: "concierge_tool",
+            callerAgentId: callerId,
+            payload: { domain: "lifecycle", op, args: { agentId: otherId }, toolCallId: `tc-${op}` },
+          });
+          await flush();
+          expect(lastReply().ok).toBe(false);
+          expect(dispatchConciergeToolMock).not.toHaveBeenCalled();
+        },
+      );
+
+      it("REFUSES resume_worker aimed at an agent the caller does NOT own", async () => {
+        // A second orchestrator's worker. The ownership walk climbs `parentId` from the TARGET, so a
+        // peer's subtree never reaches this caller — and an agent that could resume a stranger's
+        // worker could cut off work it knows nothing about.
+        const stranger = useProjectStore.getState().addAgent(projectId, { kind: "build" })!;
+        const strangersWorker = useProjectStore
+          .getState()
+          .addAgent(projectId, { kind: "worker", parentId: stranger })!;
+        fire({
+          reqId: "owr-stranger",
+          op: "concierge_tool",
+          callerAgentId: callerId,
+          payload: {
+            domain: "lifecycle",
+            op: "resume_worker",
+            args: { agentId: strangersWorker },
+            toolCallId: "tc-str",
+          },
+        });
+        await flush();
+        expect(lastReply()).toMatchObject({ ok: false, code: "forbidden" });
+        expect(dispatchConciergeToolMock).not.toHaveBeenCalled();
+      });
+
+      it("REFUSES an orchestrator resuming ITSELF, which ownership alone would admit", async () => {
+        // `mayWriteAgentFieldFor` returns allowed for caller === target (renaming yourself is yours
+        // to do). Resuming yourself is a different act: it re-spawns the PTY of the agent making the
+        // call, killing it mid-tool-call. This pins the extra clause that excludes it — delete that
+        // clause and this goes red while every other case here stays green.
+        fire({
+          reqId: "owr-self",
+          op: "concierge_tool",
+          callerAgentId: callerId,
+          payload: {
+            domain: "lifecycle",
+            op: "resume_worker",
+            args: { agentId: callerId },
+            toolCallId: "tc-self",
+          },
+        });
+        await flush();
+        expect(lastReply()).toMatchObject({ ok: false, code: "forbidden" });
+        expect(dispatchConciergeToolMock).not.toHaveBeenCalled();
+      });
+
+      it.each([
+        ["a missing agentId", {}],
+        ["a non-string agentId", { agentId: 7 }],
+        ["a whitespace agentId", { agentId: "   " }],
+        ["an unknown agentId", { agentId: "ghost-worker" }],
+      ])("REFUSES resume_worker with %s and never reaches the registry", async (_label, args) => {
+        fire({
+          reqId: "owr-bad",
+          op: "concierge_tool",
+          callerAgentId: callerId,
+          payload: { domain: "lifecycle", op: "resume_worker", args, toolCallId: "tc-bad" },
+        });
+        await flush();
+        expect(lastReply().ok).toBe(false);
+        expect(dispatchConciergeToolMock).not.toHaveBeenCalled();
+      });
+
+      it("REFUSES resume_worker in a domain that is not `lifecycle`", async () => {
+        // The predicate keys on domain AND op. A caller that guesses the op name into another domain
+        // must not slip through on the strength of the name alone.
+        fire({
+          reqId: "owr-domain",
+          op: "concierge_tool",
+          callerAgentId: callerId,
+          payload: {
+            domain: "workspace",
+            op: "resume_worker",
+            args: { agentId: otherId },
+            toolCallId: "tc-dom",
+          },
+        });
+        await flush();
+        expect(lastReply().ok).toBe(false);
+        expect(dispatchConciergeToolMock).not.toHaveBeenCalled();
+      });
+
+      it("REFUSES a WORKER caller before the carve-out is even consulted", async () => {
+        // A worker is refused a `privileged` op at the TIER gate, which sits upstream of the
+        // concierge-only check — so this asserts the tier wording, not the carve-out's. Pinned so
+        // the grant cannot be read as reaching workers: only an interactive orchestrator gets it.
+        const grandchild = useProjectStore
+          .getState()
+          .addAgent(projectId, { kind: "worker", parentId: otherId })!;
+        fire({
+          reqId: "owr-worker-caller",
+          op: "concierge_tool",
+          callerAgentId: otherId,
+          payload: {
+            domain: "lifecycle",
+            op: "resume_worker",
+            args: { agentId: grandchild },
+            toolCallId: "tc-wk-caller",
+          },
+        });
+        await flush();
+        expect(lastReply().ok).toBe(false);
+        expect(String(lastReply().error)).toContain("interactive (non-worker) agents");
+        expect(dispatchConciergeToolMock).not.toHaveBeenCalled();
+      });
+
+      // THE REMEDY COPY. A refused orchestrator acts on this sentence, and before the grant it said
+      // there was nothing it could do — which is now false for exactly the caller the grant was made
+      // for. Asserted on the rendered refusal, not on a constant.
+      it("names resume_worker in the refusal a lifecycle-refused caller reads", async () => {
+        fire({
+          reqId: "owr-remedy",
+          op: "concierge_tool",
+          callerAgentId: callerId,
+          payload: { domain: "lifecycle", op: "close_agent", args: {}, toolCallId: "tc-rem" },
+        });
+        await flush();
+        const message = String((lastReply() as { message?: unknown }).message);
+        expect(message).toContain("resume_worker");
+        expect(message).toContain("own subtree");
+      });
+    });
+
     // The near-miss is the one worth spelling out: the check is `===` on the reserved id, so no
     // prefix, suffix or lookalike gets through. The others cover the fail-closed rule for a caller
     // that resolves to nothing at all.

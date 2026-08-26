@@ -1029,6 +1029,57 @@ function isImproveSparklePublishDraft(req: ControlRequest): boolean {
 }
 
 /**
+ * THE NARROW WORKER-RESUME CARVE-OUT — the ONE exception that lets an ORCHESTRATOR reach a lifecycle
+ * op through `concierge_tool`, which is otherwise concierge-only (bead `sparkle-abl8ug`).
+ *
+ * THE MEASURED COST OF NOT HAVING IT. A build agent whose worker exits mid-task could not bring it
+ * back: both `sparkle_terminal` and `sparkle_lifecycle` refused as concierge-only with no fallback,
+ * and three starved workers had to be salvaged by hand. The refusal an orchestrator got told it to
+ * ask the human — which for a fleet running overnight is a deadlock, not a safety property. The
+ * founder's own remedy (this bead, P1) is a SCOPED resume for workers in the caller's own subtree,
+ * using the ownership test `rename_agent` already applies; this is exactly that and nothing more.
+ *
+ * True IFF ALL of:
+ *   1. the outer op is `concierge_tool` (the wrapper the lifecycle domain rides on); AND
+ *   2. the inner domain is `lifecycle`; AND
+ *   3. the inner op is EXACTLY `resume_worker` — a single name, not a risk-class test. Every other
+ *      lifecycle op, known or unknown, falls through to the refusal, so widening this surface takes
+ *      an edit here rather than a new op somebody classified `routine`; AND
+ *   4. `args.agentId` names an agent the caller OWNS — `mayWriteAgentFieldFor`, the same walk up the
+ *      `parentId` chain `rename_agent`/`set_agent_activity`/`set_agent_goal` use, so there is one
+ *      ownership predicate on this file rather than two that can drift; AND
+ *   5. the target is NOT the caller itself. Ownership admits `caller === target` (writing your own
+ *      name is yours to do); resuming yourself is not the same act — it re-spawns the PTY of the
+ *      agent making the call, killing it mid-tool-call. That is a self-inflicted version of the
+ *      in-flight kill this whole gate exists to prevent, so it is excluded here rather than left to
+ *      the domain, which has no way to know who called.
+ *
+ * WHY THIS IS SAFE, and why it is NOT `callerMayAdminister`. Making that true for an orchestrator
+ * would grant EVERY privileged direct op. This grants one act, on agents the caller already owns, and
+ * `resumeWorker` in conciergeTools/lifecycle refuses on top of it: a non-worker target, a target that
+ * is producing output, and a target whose activity could not be read at all. So the worst a
+ * prompt-injected orchestrator gets is a re-spawn of its own already-dead worker, which resumes that
+ * worker's Claude session rather than starting it over — the same act the human would perform by
+ * hand, and the one they were performing by hand before this existed.
+ */
+function isOrchestratorWorkerResume(req: ControlRequest): boolean {
+  if (req.op !== "concierge_tool") return false;
+  const { domain, op } = conciergeInnerDomainOp(req.payload);
+  if (domain !== "lifecycle") return false;
+  if (op !== "resume_worker") return false;
+  // Read defensively: this payload was assembled by a model's MCP client, so the target may arrive
+  // as the wrong type or not at all. A missing id is not admitted and not refused here — it falls
+  // through to the ordinary concierge-only refusal, which is the truthful answer for a call that
+  // named nobody.
+  const args = req.payload.args as Record<string, unknown> | undefined;
+  const targetId = typeof args?.agentId === "string" ? args.agentId.trim() : "";
+  if (!targetId) return false;
+  const caller = (req.callerAgentId || "").trim();
+  if (!caller || caller === targetId) return false;
+  return mayWriteAgentFieldFor(req, targetId).allowed;
+}
+
+/**
  * The GOAL / STALLED / THRASHING fields on one `get_state` row — compact, and absent when there is
  * nothing to say.
  *
@@ -3309,9 +3360,17 @@ async function handlePreview(req: ControlRequest): Promise<Record<string, unknow
  * is a packaged build, so an agent that just landed a lifecycle fix cannot observe it from here even
  * with a working call. Saying so is the point — the finding that produced this was an agent burning
  * a pass hunting a verification path, and "there is no such path from here" is a fast, actionable
- * answer where a false one is not. There is deliberately no agent-callable substitute invented here:
- * a lifecycle call spawns or discards work, and widening who may make one is a policy decision for
- * the human, not a consolation prize attached to a refusal.
+ * answer where a false one is not. No agent-callable substitute is invented HERE, and that still
+ * holds: a lifecycle call spawns or discards work, and widening who may make one is a policy
+ * decision for the human, not a consolation prize attached to a refusal.
+ *
+ * ONE SUCH DECISION HAS SINCE BEEN MADE, and the sentence names it (bead `sparkle-abl8ug`). An
+ * orchestrator whose worker exits mid-task may call `resume_worker` on an agent in its own subtree —
+ * granted by the founder after three starved workers were salvaged by hand, gated by
+ * {@link isOrchestratorWorkerResume} plus the domain's own three refusals. It is named here because
+ * this is the sentence a refused orchestrator reads: leaving it out would have this function tell
+ * exactly the caller the grant was made for that there is nothing it can do, which is the same false
+ * remedy the paragraphs above were written to remove — just inverted.
  */
 function refusedCallerRemedy(domain: string, op: string): string {
   // Read from `SCREENSHOT_OPS`, not from two op names spelled out here. A hand-listed pair is
@@ -3338,7 +3397,11 @@ function refusedCallerRemedy(domain: string, op: string): string {
     return (
       "No ordinary control op spawns, closes, ships, saves, discards, retires or spins down an " +
       "agent — the whole lifecycle surface exists only behind `concierge_tool`, so there is " +
-      "nothing here to fall back to. Ask the human, or ask the concierge to make the call. And if " +
+      "nothing here to fall back to. Ask the human, or ask the concierge to make the call. THE ONE " +
+      "EXCEPTION, if what you wanted was your own stalled worker back: `concierge_tool` " +
+      "domain `lifecycle`, op `resume_worker`, with that worker's `agentId`. It is callable by YOU " +
+      "for an agent in your own subtree, and it refuses a target that is not a worker, one that is " +
+      "still producing output, and one whose activity cannot be read. And if " +
       "you were trying to VERIFY a lifecycle change you just landed: the running app is a packaged " +
       "build that does not pick up your edit, so there is no path from here to observing it — say " +
       "the change is unverified rather than looking for one."
@@ -3375,15 +3438,18 @@ async function handleConciergeTool(req: ControlRequest): Promise<ConciergeToolRe
   // the reason it matters live on {@link conciergeInnerDomainOp}, which the draft carve-out below
   // shares so the two cannot drift on how the inner op is located.
   const { domain, op } = conciergeInnerDomainOp(req.payload);
-  // CONCIERGE-ONLY — with ONE narrow exception. The concierge is the ordinary caller here; the
-  // exception is the app-owned Improve Sparkle agent reaching the publish domain's SAFE ops (the five
-  // reads + the three DRAFT writes), so it can draft/iterate posts itself. Live-site acts
+  // CONCIERGE-ONLY — with TWO narrow exceptions. The concierge is the ordinary caller here; the
+  // first exception is the app-owned Improve Sparkle agent reaching the publish domain's SAFE ops
+  // (the five reads + the three DRAFT writes), so it can draft/iterate posts itself. The second is an
+  // ORCHESTRATOR calling `lifecycle.resume_worker` on a worker in its OWN subtree — one op, one
+  // ownership walk, three further refusals in the domain; see {@link isOrchestratorWorkerResume}. Live-site acts
   // (publish_update_live / publish_go_live / publish_take_down) are NOT in that safe set, so they
   // still fall to this refusal for every caller but the concierge, and go-live stays behind the human
   // approval card. See {@link isImproveSparklePublishDraft} for why draft-only is the safe boundary.
   if (
     req.callerAgentId !== CONCIERGE_CALLER_AGENT_ID &&
-    !isImproveSparklePublishDraft(req)
+    !isImproveSparklePublishDraft(req) &&
+    !isOrchestratorWorkerResume(req)
   ) {
     return {
       ok: false,

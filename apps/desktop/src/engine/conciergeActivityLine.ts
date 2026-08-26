@@ -264,6 +264,10 @@ const LIFECYCLE_PHRASES: Record<LifecycleOp, OpPhrase> = {
   save_agent: phrase("Saving %s's work", "Saved %s's work", AGENT),
   discard_agent: phrase("Discarding %s", "Discarded %s", AGENT),
   spin_down_worker: phrase("Spinning down %s", "Spun down %s", AGENT),
+  // "Resuming", not "Restarting": the human reading this column should be able to tell the
+  // concierge unwedging a terminal apart from an orchestrator picking its own stalled worker back
+  // up, because only one of those is something they might have asked for.
+  resume_worker: phrase("Resuming %s", "Resumed %s", AGENT),
 };
 
 /** The roborev ops. `%s` is never used: a finding id is a bare number the human has no way to

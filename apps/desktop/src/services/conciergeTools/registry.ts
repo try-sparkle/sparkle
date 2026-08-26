@@ -91,6 +91,7 @@ import {
   type LifecycleOp,
   type LifecycleResult,
   restartAgent,
+  resumeWorker,
   stopAgent,
 } from "./lifecycle";
 import {
@@ -1150,6 +1151,10 @@ const LIFECYCLE_ROUTES: Record<LifecycleOp, Handler> = {
   // agent, no pane, and the app-owned agent being mid-pass — so this layer invents no sentence.
   restart_agent: route(agentOnly, async (a, ctx) => fromLifecycle(ctx, await restartAgent(a.agentId))),
   stop_agent: route(agentOnly, async (a, ctx) => fromLifecycle(ctx, await stopAgent(a.agentId))),
+  // `agentOnly` like restart, whose implementation it shares. The DOMAIN owns every refusal here
+  // too — not-a-worker, still-working, activity-unreadable — and the caller-ownership half is
+  // enforced a layer up, in services/controlListener, which is where a caller identity exists.
+  resume_worker: route(agentOnly, async (a, ctx) => fromLifecycle(ctx, await resumeWorker(a.agentId))),
 };
 
 /**
@@ -1174,6 +1179,8 @@ const LIFECYCLE_WRITE: Record<LifecycleOp, boolean> = {
   // Both change the world: one re-spawns a process, the other kills one.
   restart_agent: true,
   stop_agent: true,
+  // Re-spawns a process, same as the restart it delegates to.
+  resume_worker: true,
 };
 
 // ---------------------------------------------------------------------------------------------

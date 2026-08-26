@@ -154,6 +154,9 @@ const LIFECYCLE_RULES: Record<LifecycleOp, OpRule> = {
   // ship_agent, and the alternative is inventing an arm to describe two ops.
   restart_agent: null,
   stop_agent: null,
+  // `null` for the same reason restart is: nothing was created and nothing is gone. The worker is
+  // running again with the conversation it already had.
+  resume_worker: null,
 };
 
 /** Review. `close_finding` is deliberately NOT `closed`: that arm reads as an AGENT closing, and
