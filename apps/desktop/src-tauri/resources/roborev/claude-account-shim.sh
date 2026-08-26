@@ -44,6 +44,12 @@
 REAL_CLAUDE='@REAL_CLAUDE@'
 CANDIDATES='@CANDIDATES@'
 
+# Seconds any ONE auth probe may take before it is killed and treated as inconclusive (keep), and
+# the most probes a single review may pay for. Together they cap the pre-exec delay: a fleet of slow
+# accounts can otherwise serialize into a multi-minute stall before roborev's prompt is even sent.
+PROBE_TIMEOUT=${SPARKLE_SHIM_PROBE_TIMEOUT:-10}
+MAX_PROBES=${SPARKLE_SHIM_MAX_PROBES:-4}
+
 now=`date +%s 2>/dev/null` || now=0
 case "$now" in ''|*[!0-9]*) now=0 ;; esac
 
@@ -61,11 +67,45 @@ shim_auth_dead() {
   # Probe in the candidate's own config dir, with every ANTHROPIC_* / provider override scrubbed so an
   # inherited API key can't report a healthy API-key posture over a dead OAuth session (roborev 57985).
   # The unset+export run in the command-substitution subshell, so the parent environment is untouched.
-  _st=`
+  # BOUNDED. Before the `|| true` fix below, this probe could never return "dead", so the candidate
+  # loop always stopped at the first entry and cost exactly ONE probe. Now that it actually skips, a
+  # review can pay one probe PER ranked candidate — on roborev's critical path, with the prompt
+  # sitting unread on STDIN. A single wedged `auth status` would block the exec indefinitely.
+  #
+  # The watchdog is pure POSIX sh on purpose: no `timeout` binary (macOS ships none by default, and
+  # the daemon's plist PATH is deliberately narrow), no temp file, no mktemp dependency — the same
+  # stripped-env robustness the jq-free parsing below is written for. The watchdog subshell sends
+  # its own stdout to /dev/null so it does not hold the command substitution's pipe open; without
+  # that, EVERY probe would block for the full timeout even when claude answered instantly.
+  # Captured via a TEMP FILE, not a command substitution. A substitution does not return until
+  # EVERY holder of its stdout pipe exits, so killing the probe is not enough: `claude` forks, the
+  # grandchild inherits the pipe, and the substitution blocks for the full original duration anyway.
+  # Measured: a 30s hung probe with a 2s watchdog still took 31s. A file has no such coupling.
+  _tmp=`mktemp 2>/dev/null` || _tmp=''
+  if [ -z "$_tmp" ]; then
+    # No temp file available. An UNBOUNDED probe on roborev's critical path is the one thing we will
+    # not do, so decline to probe and KEEP the candidate — the same fail-open every other
+    # inconclusive reading takes.
+    return 1
+  fi
+  (
     unset ANTHROPIC_API_KEY ANTHROPIC_API ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL ANTHROPIC_CUSTOM_HEADERS CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX 2>/dev/null
     CLAUDE_CONFIG_DIR="$_dir" export CLAUDE_CONFIG_DIR
-    "$REAL_CLAUDE" auth status --json </dev/null 2>/dev/null
-  ` || _st=''
+    # `exec` so this subshell BECOMES claude: the pid we watchdog is the process we must kill.
+    exec "$REAL_CLAUDE" auth status --json </dev/null >"$_tmp" 2>/dev/null
+  ) &
+  _p=$!
+  { sleep "$PROBE_TIMEOUT"; kill -9 $_p 2>/dev/null; } >/dev/null 2>&1 &
+  _w=$!
+  wait $_p 2>/dev/null
+  kill $_w 2>/dev/null
+  _st=`cat "$_tmp" 2>/dev/null` || _st=''
+  rm -f "$_tmp" 2>/dev/null
+  # `|| true` INSIDE the substitution, never `|| _st=''` outside it. `claude auth status --json`
+  # EXITS 1 for a signed-out account while printing the definitive {"loggedIn": false} — so keying on
+  # its exit status discards the JSON in exactly the case this probe exists to catch, and every dead
+  # login reads as "inconclusive, keep". That made this whole probe inert in production while its
+  # suite passed, because the suite's fake claude exited 0 in probe mode (bead sparkle-lgm7p8).
   # Whitespace-normalize (a chatty CLI may print an update banner around the JSON), then match ONLY
   # the definite signed-out shape. jq-free by design, so the shim stays correct with a stripped env.
   # Anything else — {"loggedIn":true}, empty, an error, an older CLI with no `auth status` — is
@@ -88,6 +128,7 @@ selected=''
 have=0
 firstdir=''
 havefirst=0
+probes=0
 if [ -r "$CANDIDATES" ]; then
   while IFS='	' read -r until dir; do
     case "$until" in
@@ -104,6 +145,11 @@ if [ -r "$CANDIDATES" ]; then
     # EVERY candidate dead, we fall open to this one rather than stranding all reviews — the same
     # all-dead fail-open the Rust ranker applies (a possibly-wrong probe must not hard-stop review).
     if [ "$havefirst" -eq 0 ]; then firstdir=$dir; havefirst=1; fi
+    # Cap the probe count. Past the cap we stop asking and take this candidate: an unbounded serial
+    # chain of cold starts ahead of the exec is worse than possibly using a dead account, which the
+    # reactive bench still routes around on the next job.
+    if [ "$probes" -ge "$MAX_PROBES" ]; then selected=$dir; have=1; break; fi
+    probes=$((probes + 1))
     # Live-probe the OAuth session; a definite signed-out account is skipped for the next ranked one.
     if shim_auth_dead "$dir"; then continue; fi
     selected=$dir
