@@ -149,6 +149,10 @@ const CLEAN: BranchStatus = {
   insertions: 0,
   deletions: 0,
   worktreeOnBranch: true,
+  // `branch` IS LOAD-BEARING, not decoration (bead `sparkle-cn9z9l`). closeDecision's silent arm
+  // rests on a CONFIDENT ZERO: `ahead: 0` means nothing until the reading says WHICH branch it
+  // counted against, so an unbranched BranchStatus is refused and the close prompts instead.
+  branch: "sparkle/agent-a1",
 };
 const AHEAD: BranchStatus = { ...CLEAN, ahead: 3 };
 const DIRTY: BranchStatus = { ...CLEAN, dirty: true, filesChanged: 2 };

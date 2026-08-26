@@ -111,8 +111,8 @@ beforeEach(() => {
     // outright instead of raising the Ship/Save/Discard dialog. That dialog has its own file; what
     // this one needs is an OBSERVABLE outcome for the menu item.
     branchStatus: {
-      a1: { ahead: 0, behind: 0, dirty: false, filesChanged: 0, insertions: 0, deletions: 0 },
-      a2: { ahead: 0, behind: 0, dirty: false, filesChanged: 0, insertions: 0, deletions: 0 },
+      a1: { ahead: 0, behind: 0, dirty: false, filesChanged: 0, insertions: 0, deletions: 0, branch: "sparkle/agent-a1" },
+      a2: { ahead: 0, behind: 0, dirty: false, filesChanged: 0, insertions: 0, deletions: 0, branch: "sparkle/agent-a2" },
     },
     workflowStage: {},
     pollBranchStatus: vi.fn(() => Promise.resolve()),

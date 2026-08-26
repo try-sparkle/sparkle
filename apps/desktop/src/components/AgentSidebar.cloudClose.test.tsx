@@ -67,7 +67,7 @@ function seed(
   useRuntimeStore.setState({
     // ahead:1 → work at risk → × PROMPTS (Ship/Save/Discard); ahead:0 → × closes silently.
     branchStatus: {
-      a1: { ahead: opts.atRisk ? 1 : 0, behind: 0, dirty: false, filesChanged: 0, insertions: 0, deletions: 0 },
+      a1: { ahead: opts.atRisk ? 1 : 0, behind: 0, dirty: false, filesChanged: 0, insertions: 0, deletions: 0, branch: "sparkle/agent-a1" },
     },
     status: {},
     workflowStage: {},
@@ -115,7 +115,7 @@ describe("AgentSidebar — a × on a worker row is attributed to the human, not 
       ],
     } as never);
     useRuntimeStore.setState({
-      branchStatus: { w1: { ahead: 0, behind: 0, dirty: false, filesChanged: 0, insertions: 0, deletions: 0 } },
+      branchStatus: { w1: { ahead: 0, behind: 0, dirty: false, filesChanged: 0, insertions: 0, deletions: 0, branch: "sparkle/agent-w1" } },
       status: {}, workflowStage: {}, pollBranchStatus: vi.fn(() => Promise.resolve()),
     } as never);
     useUiStore.setState({ collapsedOrchestrators: {}, activeSpecial: null } as never);

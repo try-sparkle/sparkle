@@ -540,8 +540,8 @@ describe("closing the MOUNTED agent leaves the surviving agent's terminal on scr
     // and no teardown runs at all. That is what the first version of this case actually exercised.
     useRuntimeStore.setState({
       branchStatus: {
-        a1: { ahead: 0, behind: 0, dirty: false, filesChanged: 0, insertions: 0, deletions: 0 },
-        a2: { ahead: 0, behind: 0, dirty: false, filesChanged: 0, insertions: 0, deletions: 0 },
+        a1: { ahead: 0, behind: 0, dirty: false, filesChanged: 0, insertions: 0, deletions: 0, branch: "sparkle/agent-a1" },
+        a2: { ahead: 0, behind: 0, dirty: false, filesChanged: 0, insertions: 0, deletions: 0, branch: "sparkle/agent-a2" },
       },
       workflowStage: {},
     } as never);
