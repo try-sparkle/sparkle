@@ -195,6 +195,11 @@ export default defineConfig(({ mode, command }) => {
     // Bound the worker pool (sparkle-jl3y) — see vitest.pool.mjs. This is the largest suite in
     // the repo, so it is also the biggest single contributor to the process storm.
     poolOptions: testPoolOptions(),
+    // Hold ONE machine-wide build-slot for the whole run (../../vitest.build-slot.mjs). poolOptions
+    // caps workers PER run; this caps concurrent RUNS, so N agents each starting their own vitest
+    // cannot all compile+test at once — the ungated storm measured at 25 concurrent runs. Fail-open
+    // and skipped under CI; the biggest suite is where it matters most.
+    globalSetup: ["../../vitest.build-slot.mjs"],
     setupFiles: ["./src/test-setup.ts"],
     // Keep the per-test deadline strictly above Testing Library's async default so a slow
     // real-timer waitFor under coverage instrumentation surfaces its own RTL error/DOM dump
