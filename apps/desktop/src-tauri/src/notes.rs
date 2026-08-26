@@ -2305,27 +2305,50 @@ mod tests {
     /// of failing. Every timeout above this call is finite (30s MCP socket < 60s liveness stall <<
     /// 600s Rust rendezvous), so an unbounded call at the bottom hands the user a transport error
     /// while the real work stays wedged with nothing able to cancel it.
+    /// ANTI-VACUITY IS ASSERTED AS A PROPERTY, NOT AS A COUNT OF UNBOUNDED SHAPES — and the
+    /// difference is the whole reason this bead exists (sparkle-ozw542).
+    ///
+    /// The guard used to open with `assert!(probes >= 2)`, naming BOTH resolver probes. That floor
+    /// was a membership count of the very shape the module is trying to eliminate, so it inverted
+    /// the incentive: PR #2481 did the RIGHT thing — it bounded `login_shell_which_bd`, which was
+    /// the actual bug — and this guard went red at it, reporting "the scanner matched nothing" when
+    /// the scanner was working perfectly and one fewer unbounded call existed to find. The floor
+    /// was then lowered to `>= 1`, which merely defers the identical failure to the day
+    /// `windows_which_bd` is bounded too. A guard that reds on its own subject being FIXED is a
+    /// guard people switch off rather than repair.
+    ///
+    /// So the canary is now the property the floor was a proxy for: *can this scanner still catch
+    /// an unbounded bd call in THIS FILE'S REAL TEXT?* A regression is spliced onto the live scan
+    /// region and must be flagged. That cannot go stale — it holds whether the file contains two
+    /// unbounded probes, one, or none — and it is strictly stronger, because it exercises the real
+    /// `production_source()` plumbing (`include_str!` + the `#[cfg(test)]` split) rather than a
+    /// hand-written fixture that could drift from it.
     #[test]
     fn no_bd_invocation_in_this_module_is_unbounded() {
-        let (probes, offenders) = unbounded_output_calls_in(production_source());
-        // POSITIVE assertion first, so "the matcher found nothing" FAILS instead of passing
-        // silently — the vacuous shape this repo hits most. `windows_which_bd` still resolves bd
-        // with an unbounded `.output()` (present in the source text regardless of which target
-        // `cfg` compiles). `login_shell_which_bd` USED to be the second such probe, but it was
-        // bounded to route through `which_via_login_shell`'s `output_with_timeout` — so exactly ONE
-        // raw-`.output()` resolver probe remains in this file, and the floor tracks that. Red here
-        // means the scanner matched nothing, not that a probe should be re-added.
-        assert!(
-            probes >= 1,
-            "expected the bd RESOLVER probe (windows_which_bd) to still read as an allowed \
-             unbounded `.output()`, found {probes} — the scanner matched nothing, so this guard is \
-             not guarding anything"
-        );
+        let src = production_source();
+        let (_probes, offenders) = unbounded_output_calls_in(src);
         assert!(
             offenders.is_empty(),
             "these run bd with an UNBOUNDED `.output()`, so a wedged bd hangs the caller forever \
              and surfaces as `bridge request timeout: concierge_tool`. Route them through \
              `run_bd` / `run_cmd_bounded` (beads_cmd::run_cmd_timed): {offenders:#?}"
+        );
+
+        // THE CANARY. Splice the offending shape onto the REAL scan region and require it to be
+        // named. Green above therefore means "everything in this file is bounded"; it can no longer
+        // mean "the scanner was handed the wrong text, or nothing at all".
+        let seeded = format!(
+            "{src}\nfn seeded_unbounded_bd_call(project_path: &str) -> Result<Output, String> {{\n\
+             \x20   Command::new(&bd).args(args).current_dir(project_path).output()\n\
+             }}\n"
+        );
+        let (_, seeded_offenders) = unbounded_output_calls_in(&seeded);
+        assert!(
+            seeded_offenders.iter().any(|o| o.starts_with("seeded_unbounded_bd_call")),
+            "the scanner no longer detects an unbounded bd call in this file's OWN source, so the \
+             assertion above proves nothing about it. Fix the scanner (or `production_source`'s \
+             scan region) — do NOT re-add an unbounded probe to satisfy it. Found: \
+             {seeded_offenders:#?}"
         );
     }
 

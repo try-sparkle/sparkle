@@ -37,6 +37,8 @@ import {
   forgetOrphanedSubagents,
   orphanedSubagentsForAgent,
 } from "./orphanedSubagentRegistry";
+import { agentTranscriptPath } from "./agentTranscriptRegistry";
+import { subagentRecoverySentence } from "./subagentTranscripts";
 import {
   lastFailureForAgent,
   quotaBlockForAgent,
@@ -107,6 +109,21 @@ export interface DeathRecordDeps {
    * orphaned — but ONLY when there were some, so a death with no fan-out never overclaims.
    */
   orphanedSubagents: (agentId: string) => number | undefined;
+  /**
+   * This agent's OWN Claude Code session transcript file, or `undefined` when this window never
+   * recorded an exact one — `agentTranscriptRegistry.agentTranscriptPath`, writer (1), the
+   * session-gated EXACT file rather than the weaker worktree reading.
+   *
+   * Read on the death path for ONE reason: it is the address of the orphaned fan-out's surviving
+   * work. Claude Code writes each subagent's transcript to `<that path minus .jsonl>/subagents/
+   * agent-<id>.jsonl`, appended turn by turn, so a subagent killed mid-flight leaves everything it
+   * had done behind. See `services/subagentTranscripts` for the measured layout and for why the
+   * previous copy — which named the parent's own transcript — pointed at a file the work is not in.
+   *
+   * SYNCHRONOUS, deliberately, so it can be read alongside `resumeBanner` and `orphanedSubagents`
+   * before the first `await`; see the reads in {@link recordDeath}.
+   */
+  parentTranscriptPath: (agentId: string) => string | undefined;
   invoke: <T>(cmd: string, args: Record<string, unknown>) => Promise<T>;
   now: () => number;
 }
@@ -137,6 +154,7 @@ export function liveDeps(): DeathRecordDeps {
     resumeBanner: resumeBannerForAgent,
     escalate: (text) => notifyConcierge(text),
     orphanedSubagents: orphanedSubagentsForAgent,
+    parentTranscriptPath: agentTranscriptPath,
     invoke: (cmd, args) => tauriInvoke(cmd, args),
     now: () => Date.now(),
   };
@@ -264,14 +282,32 @@ export async function recordAgentRetirement(
  * is to say the one thing the old copy could not: a resumed parent keeps its OWN tool results, but the
  * background subagents it had dispatched die with the PTY and produce nothing on resume. The bead was
  * filed because the notice implied the work was merely "not lost"; when subagents were in flight it
- * was affirmatively lost, and the recoverable trace is the parent's own session transcript, where the
- * subagents' partial turns were interleaved (`isSidechain` records) before the exit.
+ * was affirmatively lost.
  *
- * OVERCLAIM IS THE FAILURE TO AVOID, per the same rule `agentNotices` states: on a death with no
- * fan-out (`count` undefined/0) the subagent sentence must be ABSENT, or every mid-task exit would
- * warn about subagents that never existed. So the extra clause is gated on a positive count.
+ * ── WHERE THE LOST WORK ACTUALLY IS (the sparkle-y5dk8x half this closes) ─────────────────────────
+ * PR #2613 said it was recoverable "from this agent's own session transcript, where the subagents'
+ * turns were interleaved (`isSidechain` records)". Measured on disk, that is FALSE — a parent
+ * transcript contains no `isSidechain:true` record at all; each subagent gets its OWN file under a
+ * `subagents/` directory beside it, appended turn by turn while it runs. So the old sentence sent a
+ * reader to an empty search, which is worse than saying nothing because it looks like an answer. The
+ * real directory comes from `subagentTranscripts.subagentRecoverySentence`, derived from this
+ * window's exact transcript path; see that module for the measurement.
+ *
+ * TWO INDEPENDENT GATES, and neither may be folded into the other:
+ *
+ *  • OVERCLAIM IS THE FAILURE TO AVOID, per the same rule `agentNotices` states: on a death with no
+ *    fan-out (`count` undefined/0) the subagent sentence must be ABSENT, or every mid-task exit would
+ *    warn about subagents that never existed. So the whole clause is gated on a positive count.
+ *  • A PATH THIS WINDOW CANNOT NAME IS OMITTED, not guessed. When no exact transcript file was ever
+ *    recorded the orphan sentence still fires — the fan-out really was lost and the parent must be
+ *    told — but it carries no address. Naming a directory we are not sure of would reintroduce
+ *    exactly the defect above.
  */
-export function midTaskExitNotice(agentId: string, orphanedSubagents: number | undefined): string {
+export function midTaskExitNotice(
+  agentId: string,
+  orphanedSubagents: number | undefined,
+  parentTranscriptPath?: string | undefined,
+): string {
   const base =
     "An agent session exited mid-task with its goal still unmet, leaving only a " +
     "`claude --resume` line. Recovery will resume the session — its own tool results survive the " +
@@ -280,11 +316,17 @@ export function midTaskExitNotice(agentId: string, orphanedSubagents: number | u
   if (orphanedSubagents !== undefined && orphanedSubagents > 0) {
     const n = orphanedSubagents;
     const tasks = n === 1 ? "1 background task/subagent" : `${n} background tasks/subagents`;
+    const lost =
+      `${base}, but ${tasks} it had dispatched did NOT survive the exit and reported nothing on ` +
+      "resume.";
+    const recovery = subagentRecoverySentence(parentTranscriptPath);
+    if (recovery) return `${lost} ${recovery} ${tail}`;
+    // No exact transcript file recorded for this agent in this window — say the fan-out was lost,
+    // but name no directory. See the second gate in this function's doc.
     return (
-      `${base}, but ${tasks} it had dispatched did NOT survive the exit and produced nothing on ` +
-      "resume. Their partial work is recoverable from this agent's own session transcript, where " +
-      "the subagents' turns were interleaved before it exited — re-dispatch or read that rather " +
-      `than assuming the work is merely "not lost". ${tail}`
+      `${lost} Each subagent's partial transcript is written to its own file under a \`subagents/\` ` +
+      "directory beside this agent's session transcript, but this window never recorded which " +
+      `session file that is — locate it before assuming the work is merely "not lost". ${tail}`
     );
   }
   return `${base}; its in-flight deliverable may not have been written. ${tail}`;
@@ -336,6 +378,12 @@ export async function recordDeath(
     // registry that a concurrent respawn clears via `openDeathRecord` during the `agent_life_close`
     // IPC await, so a read taken after the await could see it already gone.
     const orphanedSubagents = deps.orphanedSubagents(agentId);
+    // Read here for the SAME reason, and it is not merely symmetry: `agentTranscriptRegistry`'s exact
+    // path is cleared by `forgetAgentTranscriptPath` on teardown, and a respawn during the
+    // `agent_life_close` await rewrites it. A read taken after the await could therefore name a
+    // DIFFERENT session's `subagents/` directory than the one whose fan-out just died — the one
+    // failure mode this address must not have (bead sparkle-y5dk8x).
+    const parentTranscriptPath = deps.parentTranscriptPath(agentId);
     const verdict = classifyDeath(observation);
 
     // Refusal 1. `evidence: "none"` is the shape Gate 0 returns, and it means "this window has
@@ -423,7 +471,9 @@ export async function recordDeath(
       now,
     });
     if (midTaskExit) {
-      const accepted = deps.escalate(midTaskExitNotice(agentId, orphanedSubagents));
+      const accepted = deps.escalate(
+        midTaskExitNotice(agentId, orphanedSubagents, parentTranscriptPath),
+      );
       if (accepted) {
         log.info("resurrection", "surfaced a mid-task exit", { agentId });
       } else {

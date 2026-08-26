@@ -518,9 +518,23 @@ function handleSpawn(req: OrchestrationRequest): void {
  *  scan of one project never blocks the others. Returns the number of workers adopted. Exported as
  *  the callable repair path and run on listener start. */
 export async function reconcileWorkersFromDisk(projectId?: string): Promise<number> {
+  return (await reconcileFromDisk(projectId)).adopted;
+}
+
+/** The scan + adopt pass, returning BOTH the adopt count and the manifests it actually read.
+ *
+ *  Split out so `handleList` can derive each LIVE worker's real branch from the SAME scan it
+ *  already pays for (sparkle-ul7cnx). Scanning twice would be wasteful, but the load-bearing
+ *  reason is subtler: the scan is one backend round-trip per project, and two of them can observe
+ *  two different disks — a worker whose HEAD moved between them would be reported with a branch
+ *  that never matched the adoption it was reconciled against. One read, one truth. */
+async function reconcileFromDisk(
+  projectId?: string,
+): Promise<{ adopted: number; manifests: WorkerManifest[] }> {
   const initial = useProjectStore.getState().projects;
   const targets = projectId ? initial.filter((p) => p.id === projectId) : initial;
   let adopted = 0;
+  const seen: WorkerManifest[] = [];
   for (const target of targets) {
     let manifests: WorkerManifest[];
     try {
@@ -531,6 +545,7 @@ export async function reconcileWorkersFromDisk(projectId?: string): Promise<numb
       console.warn("[orchestration] scanWorkerManifests failed", target.id, e);
       continue;
     }
+    seen.push(...manifests.filter((m): m is WorkerManifest => !!m));
     for (const m of manifests) {
       if (!m || !m.workerId || !m.buildAgentId || !m.worktree) continue;
       // Re-read fresh each iteration — an earlier adopt in this loop already mutated the store.
@@ -555,7 +570,49 @@ export async function reconcileWorkersFromDisk(projectId?: string): Promise<numb
       adopted++;
     }
   }
-  return adopted;
+  return { adopted, manifests: seen };
+}
+
+/** What the roster should say a worker's branch is, and — when that CONTRADICTS the name minted at
+ *  spawn — the spawn name alongside it (sparkle-ul7cnx / sparkle-m15bfj).
+ *
+ *  THE DEFECT THIS CLOSES. `agent.branch` is written ONCE, at spawn, and never re-derived. But
+ *  AGENTS.md instructs every agent to name its branch for the WORK and never for an agent id, so a
+ *  worker doing exactly the right thing cuts `feature/<topic>`, commits there, and leaves the
+ *  minted `sparkle/agent-<uuid>` fast-forwarded to its base. The roster then reported the minted
+ *  name, `git merge sparkle/agent-<uuid>` answered "Already up to date" and exited 0, and the
+ *  orchestrator concluded the worker had produced nothing. Measured: 794 committed lines. Every
+ *  step reads exactly like success.
+ *
+ *  THE HEAD READ IS NOT REPEATED HERE. `head` comes from the manifest scan, whose `branch` the
+ *  backend already overwrites with `branch_from_worktree_head` (worktree.rs) — packed refs, a
+ *  linked worktree's per-worktree HEAD, and the DETACHED case all handled there. A detached HEAD
+ *  has no `ref: refs/heads/` line, so the backend returns the manifest's own value: the spawn name
+ *  stands and this function sees no disagreement, which is exactly right. Reporting a raw sha AS a
+ *  branch would be a different silent failure — `git merge <sha>` is not what the caller meant.
+ *
+ *  THE SPAWN NAME IS PRESERVED, NEVER ERASED, and that is load-bearing rather than informational:
+ *  `apps/mcp-orchestrator/src/tools.ts` assesses teardown safety on the UNION of both branches, so
+ *  a worker whose HEAD sits on an already-landed branch while its spawn branch still holds unlanded
+ *  commits must not assess as safe on HEAD alone — that trades a merge which does nothing for a
+ *  deletion which loses work. The field name matches `RosterEntry.spawnBranch` there deliberately;
+ *  the bridge reply is spread straight into that shape, so it needs no translation and the
+ *  `branchNote` sentence is derived from it on the far side.
+ *
+ *  FILLING IN AN EMPTY SPAWN NAME IS NOT A DISAGREEMENT. There was nothing to contradict, so no
+ *  `spawnBranch` is emitted — a warning that fires on ordinary rows stops being read, which is how
+ *  the measured incident survived every surface that could have reported it. */
+export function deriveReportedBranch(
+  spawnName: string | undefined,
+  head: string | undefined,
+): { branch: string; spawnBranch?: string } {
+  const spawn = (spawnName ?? "").trim();
+  const h = (head ?? "").trim();
+  // "We could not look" and "we looked and it is elsewhere" are different facts. An absent HEAD
+  // never overrides — manufacturing certainty from a failed read is the same mistake in the mirror.
+  if (!h) return { branch: spawn };
+  if (!spawn || h === spawn) return { branch: h };
+  return { branch: h, spawnBranch: spawn };
 }
 
 // ── reaper: reclaim orphaned workers (the machine-wide cap leak) ───────────────────────────────────
@@ -797,7 +854,21 @@ async function handleList(req: OrchestrationRequest): Promise<void> {
     // Self-heal first: re-adopt any of this build agent's workers whose store record was evicted
     // but whose worktree+manifest survive on disk, so the list reflects disk truth, not just the
     // (possibly-corrupted) in-memory store (sparkle-3xus).
-    await reconcileWorkersFromDisk(req.projectId);
+    //
+    // The manifests come back too, because THIS is the live-roster path and the branch each row
+    // reports has to be derived from the worktree's HEAD rather than from the name minted at spawn
+    // (sparkle-ul7cnx — see deriveReportedBranch). The reconcile itself SKIPS a worker already
+    // present in the store, so without this the fix that landed for evicted/disk-recovered workers
+    // reached every row EXCEPT the live ones actually doing the work.
+    const { manifests } = await reconcileFromDisk(req.projectId);
+    // The manifest scan's `branch` is already HEAD-derived by the backend, keyed by workerId. A
+    // worker with no manifest on disk (mid-spawn, worktree gone) simply has no entry, and
+    // deriveReportedBranch then leaves the store's name standing.
+    const headBranchByWorker = new Map(
+      manifests
+        .filter((m) => m?.workerId && m.branch)
+        .map((m) => [m.workerId, m.branch] as const),
+    );
     const project = useProjectStore.getState().projects.find((p) => p.id === req.projectId);
     const agents = (project?.agents ?? []).filter(
       (a) => a.kind === "worker" && a.parentId === req.buildAgentId,
@@ -817,9 +888,16 @@ async function handleList(req: OrchestrationRequest): Promise<void> {
         // Read once — the verdict and the still-running check must describe the SAME observation.
         const liveStatus = useRuntimeStore.getState().status[a.id];
         const status = workerStatus(resultRaw, liveStatus);
+        // The branch an orchestrator would actually merge — HEAD's, not the spawn-time name — with
+        // the minted name carried alongside it when the two disagree (sparkle-ul7cnx).
+        const derived = deriveReportedBranch(a.branch ?? "", headBranchByWorker.get(a.id));
         return {
           workerId: a.id,
-          branch: a.branch ?? "",
+          branch: derived.branch,
+          // Present ONLY on a real disagreement. `spin_down` / `list_workers` on the orchestrator
+          // side assess teardown safety on the union of both names, so erasing this one would let a
+          // landed HEAD vouch for a spawn branch that still holds unlanded commits.
+          ...(derived.spawnBranch !== undefined ? { spawnBranch: derived.spawnBranch } : {}),
           worktree: a.worktreePath ?? "",
           // Pair the result.json completion verdict with the worker's LIVE tab status so a
           // result-less worker reports its real state (working / idle / waiting / blocked / approval)

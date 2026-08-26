@@ -1299,6 +1299,107 @@ describe("orchestrationListener", () => {
     expect(workers[0]!.beadId).toBe("sparkle-visible");
   });
 
+  // ── the LIVE roster reports the branch the worker COMMITTED to (sparkle-ul7cnx) ────────────────
+  //
+  // Scoped deliberately to workers that are PRESENT IN THE STORE, i.e. neither evicted nor
+  // disk-recovered. The two commits that landed before this one (workerScan.ts,
+  // scan_worker_manifests_at) fixed only the recovery paths, and `reconcileWorkersFromDisk` SKIPS a
+  // worker whose record is already present — so a test that exercised recovery would be asserting
+  // against code that was already correct and would stay green with this whole change reverted.
+  // Every test below spawns through the real listener path first, so the row under assertion comes
+  // from the store, exactly as a live worker's does.
+  describe("list_workers branch derivation", () => {
+    /** Spawn one worker through the listener and hand back its id + minted spawn name. */
+    const spawnLive = async (reqId: string) => {
+      fire({ reqId, op: "spawn_worker", buildAgentId: buildId, projectId, payload: { task: "t" } });
+      await flush();
+      const worker = workersOf(projectId, buildId)[0]!;
+      return { workerId: worker.id, spawnBranch: worker.branch!, worktree: worker.worktreePath! };
+    };
+    /** The manifest the backend scan returns — its `branch` is already HEAD-derived there. */
+    const manifestOn = (w: { workerId: string; worktree: string }, branch: string) => ({
+      workerId: w.workerId,
+      buildAgentId: buildId,
+      projectId,
+      branch,
+      worktree: w.worktree,
+      task: "t",
+      createdAt: "2026-08-25T00:00:00.000Z",
+    });
+
+    it("reports the branch a LIVE worker's HEAD is on, not the name minted at spawn", async () => {
+      // THE MEASURED FAILURE. The worker followed AGENTS.md and named its branch for the work, so
+      // the minted `sparkle/agent-<uuid>` was left fast-forwarded to its base. Reporting that name
+      // made `git merge` answer "Already up to date" and exit 0 on a merge that moved nothing, and
+      // the orchestrator concluded the worker had produced nothing. 794 lines.
+      const live = await spawnLive("lulb1");
+      expect(live.spawnBranch).toMatch(/^sparkle\/agent-/); // the row really is a spawn-named one
+      // The store record is PRESENT, so the reconcile skips it — this is the live path, not recovery.
+      scanWorkerManifestsMock.mockResolvedValueOnce([manifestOn(live, "feature/some-work")]);
+      fire({ reqId: "lulb1r", op: "list_workers", buildAgentId: buildId, projectId, payload: {} });
+      await flush();
+      const { workers } = lastResult() as {
+        workers: Array<{ workerId: string; branch: string; spawnBranch?: string }>;
+      };
+      expect(workers).toHaveLength(1);
+      const row = workers[0]!;
+      expect(row.workerId).toBe(live.workerId);
+      // The row still has to name a worker the store never forgot.
+      expect(workersOf(projectId, buildId).map((w) => w.id)).toContain(live.workerId);
+      expect(row.branch).toBe("feature/some-work");
+      // …and the minted name survives ALONGSIDE it, because teardown safety on the orchestrator
+      // side assesses the union of both: a landed HEAD must not vouch for a spawn branch that still
+      // holds unlanded commits, or spin_down deletes the worktree those commits live in.
+      expect(row.spawnBranch).toBe(live.spawnBranch);
+    });
+
+    it("a DETACHED-HEAD worktree still reports the manifest/spawn name, never a bare sha", async () => {
+      // The paired negative. `branch_from_worktree_head` requires a literal `ref: refs/heads/` line
+      // and returns None otherwise, so the backend leaves the manifest's own value in place — the
+      // scan hands back the spawn name and there is nothing to disagree with. Reporting the raw sha
+      // AS a branch would be a different silent failure: `git merge <sha>` is not what the caller
+      // meant to run, and it would ALSO manufacture a bogus spawnBranch disagreement on every
+      // detached worker, which is how a warning stops being read.
+      const live = await spawnLive("lulb2");
+      scanWorkerManifestsMock.mockResolvedValueOnce([manifestOn(live, live.spawnBranch)]);
+      fire({ reqId: "lulb2r", op: "list_workers", buildAgentId: buildId, projectId, payload: {} });
+      await flush();
+      const { workers } = lastResult() as {
+        workers: Array<{ branch: string; spawnBranch?: string }>;
+      };
+      expect(workers).toHaveLength(1);
+      expect(workers[0]!.branch).toBe(live.spawnBranch);
+      // No disagreement → no spawnBranch. Emitting one here would put a contradiction warning on
+      // every ordinary row.
+      expect(workers[0]!).not.toHaveProperty("spawnBranch");
+    });
+
+    it("falls back to the store's branch when the worker has no manifest on disk", async () => {
+      // Mid-spawn, or a worktree that has gone away. "We could not look" is not "we looked and it
+      // is elsewhere" — an absent read must never override, and must never blank the row's branch.
+      const live = await spawnLive("lulb3");
+      scanWorkerManifestsMock.mockResolvedValueOnce([]);
+      fire({ reqId: "lulb3r", op: "list_workers", buildAgentId: buildId, projectId, payload: {} });
+      await flush();
+      const { workers } = lastResult() as {
+        workers: Array<{ branch: string; spawnBranch?: string }>;
+      };
+      expect(workers[0]!.branch).toBe(live.spawnBranch);
+      expect(workers[0]!).not.toHaveProperty("spawnBranch");
+    });
+
+    it("scans disk exactly ONCE per list_workers", async () => {
+      // The derivation reuses the reconcile's own scan. Two scans would be two backend round-trips
+      // observing two different disks, so a worker whose HEAD moved between them would be reported
+      // with a branch that never matched the adoption it was reconciled against.
+      await spawnLive("lulb4");
+      scanWorkerManifestsMock.mockClear();
+      fire({ reqId: "lulb4r", op: "list_workers", buildAgentId: buildId, projectId, payload: {} });
+      await flush();
+      expect(scanWorkerManifestsMock).toHaveBeenCalledTimes(1);
+    });
+  });
+
   it("a queued bead's claim is released when its build agent is purged (roborev 41945)", async () => {
     // A QUEUED request holds its claim but never reaches runSpawn, where the release lives. Without
     // an explicit release on the drop path the key leaks in a module-level Set — and since a build

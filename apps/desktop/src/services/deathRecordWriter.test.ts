@@ -40,6 +40,12 @@ import {
   orphanedSubagentsForAgent,
 } from "./orphanedSubagentRegistry";
 import {
+  agentTranscriptPath,
+  forgetAgentTranscriptPath,
+  noteAgentTranscriptPath,
+} from "./agentTranscriptRegistry";
+import { SUBAGENT_TRANSCRIPT_GLOB } from "./subagentTranscripts";
+import {
   _resetBackgroundTaskRegistryForTests,
   noteBackgroundTasks,
 } from "./backgroundTaskRegistry";
@@ -74,6 +80,9 @@ function deps(over: Partial<DeathRecordDeps> = {}): Calls {
     resumeBanner: () => false,
     escalate: () => true,
     orphanedSubagents: () => undefined,
+    // Defaults to "this window recorded no exact session file", matching production for an agent
+    // whose first turn never ended. Tests that care supply a path explicitly.
+    parentTranscriptPath: () => undefined,
     invoke: (cmd, args) => {
       invoked.push([cmd, args]);
       return Promise.resolve(undefined as never);
@@ -920,6 +929,15 @@ describe("a mid-task exit is surfaced as a hard signal, not left as a bare resum
   });
 });
 
+// THE MEASURED LAYOUT, verbatim in the shape Claude Code writes on this machine: a session file
+// `<project-slug>/<sessionId>.jsonl`, with each dispatched subagent's own transcript in a
+// `subagents/` directory named for that session. Written out longhand rather than built with the
+// helper under test, so the derivation is pinned against an OBSERVED path and not against itself.
+const PARENT_TRANSCRIPT =
+  "/Users/x/.claude/projects/-Users-x-wt/a9907495-45e0-426a-ba81-b0a29346a15a.jsonl";
+const SUBAGENT_DIR =
+  "/Users/x/.claude/projects/-Users-x-wt/a9907495-45e0-426a-ba81-b0a29346a15a/subagents";
+
 describe("the mid-task-exit notice names ORPHANED SUBAGENTS when the parent had fan-out in flight (sparkle-y5dk8x)", () => {
   function unmetGoal(over: Partial<AgentGoal> = {}): AgentGoal {
     return {
@@ -942,12 +960,17 @@ describe("the mid-task-exit notice names ORPHANED SUBAGENTS when the parent had 
   });
 
   // ── THE PURE COPY, both branches (non-vacuous: each assertion fails under the other branch) ──────
-  it("with orphaned subagents: says they did NOT survive and point at the recoverable transcript", () => {
-    const notice = midTaskExitNotice("a1", 3);
+  it("with orphaned subagents: says they did NOT survive and points at the recoverable transcripts", () => {
+    const notice = midTaskExitNotice("a1", 3, PARENT_TRANSCRIPT);
     expect(notice).toContain("3 background tasks/subagents");
     expect(notice).toMatch(/did NOT survive/);
-    expect(notice).toMatch(/recoverable from this agent's own session transcript/);
+    expect(notice).toContain(`${SUBAGENT_DIR}/${SUBAGENT_TRANSCRIPT_GLOB}`);
     expect(notice).toContain("a1");
+    // THE DEFECT THIS BRANCH FIXES: PR #2613 sent the reader to the parent's OWN transcript,
+    // "where the subagents' turns were interleaved". Measured on disk, a parent transcript holds no
+    // `isSidechain:true` record at all — that sentence must never come back.
+    expect(notice).not.toMatch(/own session transcript/);
+    expect(notice).not.toMatch(/interleaved/);
     // The overclaim the bead was filed about must be GONE on this branch — the work was not merely
     // "not lost", it was affirmatively orphaned.
     expect(notice).not.toContain("in-flight deliverable may not have been written");
@@ -974,6 +997,7 @@ describe("the mid-task-exit notice names ORPHANED SUBAGENTS when the parent had 
       goal: () => unmetGoal(),
       resumeBanner: () => true,
       orphanedSubagents: () => 2,
+      parentTranscriptPath: () => PARENT_TRANSCRIPT,
       escalate: (text) => {
         escalations.push(text);
         return true;
@@ -984,7 +1008,7 @@ describe("the mid-task-exit notice names ORPHANED SUBAGENTS when the parent had 
 
     expect(escalations).toHaveLength(1);
     expect(escalations[0]).toContain("2 background tasks/subagents");
-    expect(escalations[0]).toMatch(/recoverable/);
+    expect(escalations[0]).toContain(`${SUBAGENT_DIR}/${SUBAGENT_TRANSCRIPT_GLOB}`);
   });
 
   it("escalation stays the plain copy when the death path reports NO orphaned subagents", async () => {
@@ -1057,6 +1081,132 @@ describe("the mid-task-exit notice names ORPHANED SUBAGENTS when the parent had 
     new StatusEngine({ agentId: "seam-orphan", onStatus: () => {} }).exit();
     expect(liveDeps().orphanedSubagents("seam-orphan")).toBe(7);
     expect(liveDeps().orphanedSubagents("nobody-here")).toBeUndefined();
+  });
+
+  // ══ THE RECOVERABLE PARTIAL TRANSCRIPT (the sparkle-y5dk8x half PR #2613 left open) ═════════════
+  //
+  // Every assertion below is on the CONTENT of the surface a parent actually receives — the notice
+  // string — never on a helper having been called. The bead's own complaint is that the old copy
+  // "implied the work is fine when it is actually gone", so the only thing worth asserting is
+  // whether the words handed to the concierge carry an address the work is really at.
+
+  it("names no directory when this window recorded no exact session file — but still says the fan-out was lost", () => {
+    const notice = midTaskExitNotice("a1", 3, undefined);
+    // The orphan half is UNCONDITIONAL: the fan-out died whether or not we can address it.
+    expect(notice).toContain("3 background tasks/subagents");
+    expect(notice).toMatch(/did NOT survive/);
+    // …but no path is invented. Naming a directory we are not sure of is the exact defect being
+    // fixed, so the recovery glob must be absent rather than pointed somewhere plausible.
+    expect(notice).not.toContain(SUBAGENT_TRANSCRIPT_GLOB);
+    expect(notice).not.toContain(SUBAGENT_DIR);
+    expect(notice).toMatch(/never recorded which session file/);
+  });
+
+  it("a path that is not an exact `.jsonl` session file (a worktree) yields no address", () => {
+    // `agentTranscriptRegistry` writer (2) stores a WORKTREE, resolved to a file only at read time.
+    // Appending `/subagents` to that would name a directory inside the user's source tree.
+    const notice = midTaskExitNotice("a1", 2, "/Users/x/Projects/sparkle/.wt-feature");
+    expect(notice).not.toContain(SUBAGENT_TRANSCRIPT_GLOB);
+    expect(notice).not.toContain("/Users/x/Projects/sparkle/.wt-feature/subagents");
+    expect(notice).toMatch(/never recorded which session file/);
+  });
+
+  it("THE TWO GATES ARE INDEPENDENT: a known path with NO fan-out still names no directory", () => {
+    // The paired negative the bead's overclaim rule demands, in its hardest form: we HAVE an
+    // address, and must still stay silent because nothing was orphaned. A single fused condition
+    // ("mention the directory whenever we know it") passes every other test in this file and fails
+    // exactly here — which is why this one is worth its own case.
+    for (const count of [0, undefined] as const) {
+      const notice = midTaskExitNotice("a1", count, PARENT_TRANSCRIPT);
+      expect(notice).toContain("in-flight deliverable may not have been written");
+      expect(notice).not.toMatch(/subagent/i);
+      expect(notice).not.toContain(SUBAGENT_DIR);
+    }
+  });
+
+  // ── THROUGH THE REAL DEATH PATH, with EVERY earlier gate satisfied (AGENTS.md short-circuit trap) ─
+  //
+  // `recordDeath` reaches the escalation only past: Gate 0 liveness "local", Refusal 1
+  // (evidence !== "none"), Refusal 2 (terminator !== "quota-trip"), and `exitedMidTask`'s own three
+  // inputs — unknown cause, UNMET goal, resume banner on screen. Seed all of them, or the assertion
+  // is about a path the code never took.
+  it("recordDeath's escalation carries the REAL subagents directory derived from this agent's transcript", async () => {
+    const escalations: string[] = [];
+    const c = deps({
+      goal: () => unmetGoal(),
+      resumeBanner: () => true,
+      orphanedSubagents: () => 4,
+      parentTranscriptPath: () => PARENT_TRANSCRIPT,
+      escalate: (text) => {
+        escalations.push(text);
+        return true;
+      },
+    });
+
+    await recordDeath("a1", "pty-exit", c.deps);
+
+    expect(escalations).toHaveLength(1);
+    // THE OUTPUT, not the plumbing: the concierge is handed the directory the orphans' partial
+    // JSONL transcripts are really in, plus the glob that selects them.
+    expect(escalations[0]).toContain(`${SUBAGENT_DIR}/${SUBAGENT_TRANSCRIPT_GLOB}`);
+    expect(escalations[0]).toMatch(/meta\.json/);
+    expect(escalations[0]).toContain("4 background tasks/subagents");
+  });
+
+  it("THE PAIRED POSITIVE: the identical setup still escalates when the address is unknown", async () => {
+    // Proves the previous test's assertion is about the ADDRESS and not about whether the death
+    // path fires at all. Same seeded gates, only `parentTranscriptPath` differs; the notice still
+    // arrives, and only the directory is missing from it.
+    const escalations: string[] = [];
+    const c = deps({
+      goal: () => unmetGoal(),
+      resumeBanner: () => true,
+      orphanedSubagents: () => 4,
+      parentTranscriptPath: () => undefined,
+      escalate: (text) => {
+        escalations.push(text);
+        return true;
+      },
+    });
+
+    await recordDeath("a1", "pty-exit", c.deps);
+
+    expect(escalations).toHaveLength(1);
+    expect(escalations[0]).toContain("4 background tasks/subagents");
+    expect(escalations[0]).not.toContain(SUBAGENT_DIR);
+  });
+
+  it("an EARLIER gate short-circuits: no resume banner ⇒ no notice at all, address or not", async () => {
+    // The one shape that would make every assertion above vacuous — a surface that never fires.
+    const escalations: string[] = [];
+    const c = deps({
+      goal: () => unmetGoal(),
+      resumeBanner: () => false,
+      orphanedSubagents: () => 4,
+      parentTranscriptPath: () => PARENT_TRANSCRIPT,
+      escalate: (text) => {
+        escalations.push(text);
+        return true;
+      },
+    });
+
+    await recordDeath("a1", "pty-exit", c.deps);
+
+    expect(escalations).toHaveLength(0);
+  });
+
+  it("liveDeps().parentTranscriptPath reads the real registry, not a stub (the defaulted-seam trap)", () => {
+    // Without this, the line wiring production to `agentTranscriptRegistry` is covered by nothing:
+    // every test above injects its own path, so deleting that line leaves the suite green while the
+    // shipped notice silently loses its address forever.
+    noteAgentTranscriptPath("seam-transcript", PARENT_TRANSCRIPT);
+    try {
+      expect(agentTranscriptPath("seam-transcript")).toBe(PARENT_TRANSCRIPT);
+      expect(liveDeps().parentTranscriptPath("seam-transcript")).toBe(PARENT_TRANSCRIPT);
+      expect(liveDeps().parentTranscriptPath("nobody-here")).toBeUndefined();
+    } finally {
+      forgetAgentTranscriptPath("seam-transcript");
+    }
   });
 });
 
