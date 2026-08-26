@@ -218,10 +218,72 @@ export interface ConnectionsResponse {
 
 export interface ConversationRow {
   id: string;
+  /**
+   * `dm` for a person, `support` for the Sparkle Support Agent thread (design §7).
+   *
+   * THIS IS THE RECONCILIATION DISCRIMINATOR (open question 15) and the server has always emitted
+   * it; the client simply did not model it. See {@link ConversationPartition} for why modelling it
+   * is not enough on its own.
+   */
+  kind: "dm" | "support";
   socialId: string;
   state: "requested" | "active" | "left";
   unread: number;
   lastSeq: number;
+}
+
+/**
+ * The caller's conversations, SPLIT — never a flat list.
+ *
+ * ── WHY THIS IS A PARTITION AND NOT A `kind` FIELD PLUS A CONVENTION ────────────────────────────
+ * Sparkle already ships a support surface: `support_tickets` in apps/web, the docs-aware chat at
+ * `/api/support/chat`, `services/supportApi.ts`, and `SupportTicketRow` pinned in the builder
+ * column. Design §7 and open question 15 are explicit that the Sparkle Support Agent and that row
+ * "must be one thing, not two shipped side by side" — and the way two get shipped is not a
+ * decision anybody makes, it is a `.map()` over a list that happened to contain a support
+ * conversation.
+ *
+ * So the support thread is not FILTERED OUT of the chat list here; it is never IN a list a chat
+ * row can be built from. A future author of the chat row cannot forget the filter, because there
+ * is no filter to forget. That is the difference between a convention and a mechanism, and only
+ * the mechanism survives a fresh context.
+ *
+ * `SupportTicketRow` owns the one support slot. See PRD/social-coding-support-agent-seam.md for
+ * the full decision and for the migration path that lets that row later render `support` instead
+ * of `listMyTickets()` — in the same slot, without ever doubling.
+ */
+export interface ConversationPartition {
+  /** Person-to-person threads. A chat row is built from THIS and from nothing else. */
+  chats: ConversationRow[];
+  /**
+   * The caller's Sparkle Support Agent thread, or null before their first username claim (the
+   * server seeds it on that claim, not at signup). Consumed by the ONE support slot.
+   */
+  support: ConversationRow | null;
+}
+
+/**
+ * Split a raw `GET /social/conversations` payload. Exported for tests and for a future caller that
+ * already holds the rows; every network caller should use {@link getConversations}.
+ *
+ * MORE THAN ONE support row is not representable in the result — the server's `dm_key` unique index
+ * makes it impossible, and if that ever failed, silently rendering two support rows is precisely
+ * the outcome this whole seam exists to prevent. The FIRST is kept and the rest are dropped from
+ * both halves: putting an extra one in `chats` would ship the second surface by the back door.
+ */
+export function partitionConversations(
+  rows: readonly ConversationRow[],
+): ConversationPartition {
+  const chats: ConversationRow[] = [];
+  let support: ConversationRow | null = null;
+  for (const row of rows) {
+    if (row.kind === "support") {
+      support ??= row;
+      continue;
+    }
+    chats.push(row);
+  }
+  return { chats, support };
 }
 
 /** One block of a message. v1 accepts only `text` and the server rejects every other kind — the
@@ -340,8 +402,26 @@ export function postReport(report: {
 
 // ── Conversations and messages (§6.6) ───────────────────────────────────────────────────────────
 
-export function getConversations(): Promise<{ conversations: ConversationRow[] }> {
-  return request("GET", "/social/conversations");
+/**
+ * The caller's conversations, ALREADY SPLIT. There is deliberately no accessor that returns the
+ * flat list — see {@link ConversationPartition} for why that is the point rather than an
+ * inconvenience.
+ */
+export async function getConversations(): Promise<ConversationPartition> {
+  // NOT DESTRUCTURED. `readJson` returns `null` for any body that is not JSON — a 204, an
+  // empty-bodied 200, a captive portal or proxy serving HTML — and `request` casts that `null`
+  // straight to `T`. Destructuring it throws a raw `TypeError`, which is neither `SocialApiError`
+  // nor `SocialNetworkError`: the two types every caller of this module branches on. The old flat
+  // signature returned the value through untouched and could not throw here, so the destructure
+  // would have been a NEW crash path on the first thing the app asks for. (roborev 69154.)
+  const payload = await request<{ conversations?: ConversationRow[] } | null>(
+    "GET",
+    "/social/conversations",
+  );
+  // A payload from a server that predates `kind` yields `undefined`, which is not `"support"`, so
+  // every row lands in `chats` — the old behaviour exactly. Failing open here is correct: the
+  // support row cannot appear before the server that emits `kind` is deployed.
+  return partitionConversations(payload?.conversations ?? []);
 }
 
 /** Create-or-get the DM with `username`. **This is the only way to obtain a conversation id for

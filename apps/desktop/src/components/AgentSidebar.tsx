@@ -4007,7 +4007,12 @@ export function AgentSidebar({
       )}
 
       {/* Support-ticket status banner: shows the user's OPEN tickets (Submitted / Responded).
-          Renders nothing when there are none. Sits between Improve Sparkle and the footer. */}
+          Renders nothing when there are none. Sits between Improve Sparkle and the footer.
+
+          THE ONE SUPPORT SLOT. The Sparkle Support Agent's social-graph conversation (design §7)
+          does NOT get a row of its own — open question 15. socialApi.getConversations() returns a
+          partition precisely so a chat row cannot be built from it; see SupportTicketRow.tsx and
+          PRD/social-coding-support-agent-seam.md. */}
       <SupportTicketRow />
 
       {/* Inbound connection requests — the SupportTicketRow idiom, one line, everything else in

@@ -58,7 +58,20 @@ function openTicketThread(token: string) {
  *  minute for identical tickets (see supportTicketPoll). One open ticket → click opens its thread;
  *  many → click toggles an
  *  expanded per-ticket list directly beneath the banner. `memo`'d (no props) so unrelated sidebar
- *  re-renders don't churn it. */
+ *  re-renders don't churn it. *
+ *  ── THIS IS THE ONE SUPPORT SLOT IN THE BUILDER COLUMN ────────────────────────────────────────
+ *  Social Coding gives the Sparkle Support Agent a seat in the social graph (design §7): a
+ *  `kind: "support"` conversation, seeded on the user's first username claim. **That is not a
+ *  second row and must never become one** — open question 15 is explicit that this row and a
+ *  Support Agent chat row "must be one thing, not two shipped side by side".
+ *
+ *  The mechanism that holds it is in `services/socialApi.ts`: `getConversations()` returns a
+ *  PARTITION, so the support thread is never in a list a chat row can be built from. Do not
+ *  reach around it, and do not add a support row anywhere else in the sidebar.
+ *
+ *  The migration path, when the agent can actually answer: this component renders
+ *  `partition.support` instead of `listMyTickets()`, in this same slot, with the same click
+ *  target. See PRD/social-coding-support-agent-seam.md. */
 export const SupportTicketRow = memo(function SupportTicketRow() {
   const [tickets, setTickets] = useState<TicketStatus[]>([]);
   const [expanded, setExpanded] = useState(false);
