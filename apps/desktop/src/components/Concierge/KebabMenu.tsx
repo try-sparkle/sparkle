@@ -66,6 +66,18 @@ export function KebabMenu() {
   // A pending request shows the dialog directly (derived, not mirrored into state).
   const settingsVisible = settingsOpen || settingsRequest !== null;
 
+  // ONE-CLICK manage-accounts deep-open (e.g. the blocked-agents banner's "Manage fleet"): open the
+  // AccountsScreen straight away, rather than the Settings→Accounts pane that needs a second "Manage
+  // accounts…" click. This component owns AccountsScreen's mount, so it is the right place to honour
+  // the request; consume it and clear it so a later identical request re-fires.
+  const manageAccountsRequest = useUiStore((s) => s.manageAccountsRequest);
+  const clearManageAccountsRequest = useUiStore((s) => s.clearManageAccountsRequest);
+  useEffect(() => {
+    if (!manageAccountsRequest) return;
+    setAccountsOpen(true);
+    clearManageAccountsRequest();
+  }, [manageAccountsRequest, clearManageAccountsRequest]);
+
   // WHERE FOCUS WAS BEFORE THE DIALOG TOOK IT — captured in render, which is the only moment that
   // still knows.
   //

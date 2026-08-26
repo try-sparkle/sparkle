@@ -9,12 +9,15 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-libra
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   BlockedAgentsBanner,
+  blockedAccountName,
   BLOCKED_AGENTS_BAR_TESTID,
   BLOCKED_AGENTS_CTA_TESTID,
   type BlockedAgentsBannerDeps,
 } from "./BlockedAgentsBanner";
 import { useBlockedSubsystemsStore } from "../stores/blockedSubsystemsStore";
 import { useAccountLimitStore } from "../stores/accountLimitStore";
+import { useUiStore } from "../stores/uiStore";
+import type { Account, Identity } from "../services/accountStore";
 import { C } from "../theme/colors";
 
 const HOUR = 3_600_000;
@@ -22,7 +25,7 @@ const SPARKLE_ID = "__sparkle_self__";
 
 interface Wire {
   usage: { id: string; exhaustedUntil: number | null }[];
-  accounts: { id: string; isDefault: boolean }[];
+  accounts: { id: string; isDefault: boolean; nickname?: string }[];
   sticky: Record<string, string | undefined>;
   panes: Record<string, string | undefined>;
   agentNames: Record<string, string>;
@@ -32,7 +35,7 @@ interface Wire {
 function deps(wire: Partial<Wire>, openAccounts = vi.fn()): Partial<BlockedAgentsBannerDeps> {
   const w: Wire = {
     usage: wire.usage ?? [],
-    accounts: wire.accounts ?? [{ id: "acct-default", isDefault: true }],
+    accounts: wire.accounts ?? [{ id: "acct-default", isDefault: true, nickname: "work-laptop" }],
     sticky: wire.sticky ?? {},
     panes: wire.panes ?? {},
     agentNames: wire.agentNames ?? {},
@@ -166,18 +169,71 @@ describe("BlockedAgentsBanner", () => {
     expect(openAccounts).toHaveBeenCalledTimes(1);
   });
 
-  it("writes the shared blocked store, so the amber AiServiceBanner can step aside", async () => {
+  it("the DEFAULT 'Manage fleet' action opens the manage-accounts view directly (one click), not the settings landing", async () => {
+    // Issue #2: the CTA must deep-link to the AccountsScreen in one click. The default action is
+    // `useUiStore.openManageAccounts()` — the direct seam — NOT `openSettings("accounts")`, which
+    // lands on the Settings→Accounts pane behind a second "Manage accounts…" button. Non-vacuous:
+    // reverting the default to openSettings makes openManageAccounts go uncalled and this fail.
+    const openManageAccounts = vi.fn();
+    const openSettings = vi.fn();
+    const prev = useUiStore.getState();
+    useUiStore.setState({ openManageAccounts, openSettings });
+    try {
+      const d = deps({
+        usage: [{ id: "acct-default", exhaustedUntil: Date.now() + HOUR }],
+        accounts: [{ id: "acct-default", isDefault: true }],
+      });
+      delete (d as { openAccounts?: unknown }).openAccounts; // fall through to DEFAULT_DEPS.openAccounts
+      render(<BlockedAgentsBanner deps={d} />);
+      fireEvent.click(await screen.findByTestId(BLOCKED_AGENTS_CTA_TESTID));
+      expect(openManageAccounts).toHaveBeenCalledTimes(1);
+      expect(openSettings).not.toHaveBeenCalled();
+    } finally {
+      useUiStore.setState({
+        openManageAccounts: prev.openManageAccounts,
+        openSettings: prev.openSettings,
+      });
+    }
+  });
+
+  it("names WHICH account a blocked subsystem runs on, by nickname — and never the account email", async () => {
+    // End-to-end: the exhausted account carries an EMAIL in its identity (a token account's recorded
+    // login), yet the bar must name it by the user's nickname, never the email (founder privacy
+    // directive). Proves the "running on <account>" copy AND the no-email guarantee through the real
+    // component. Non-vacuous: resolving the name to `accountDisplay(...).primary` (the email) makes
+    // the email appear and the nickname assertion fail.
+    const load = (async () => ({
+      accounts: [
+        { id: "acct-default", nickname: "work-laptop", isDefault: true, configDir: "/x", createdAt: 0 },
+      ],
+      usage: [{ id: "acct-default", exhaustedUntil: Date.now() + HOUR }],
+      identities: [
+        { id: "acct-default", email: "secret@example.com", organization: null, accountUuid: "u1" },
+      ],
+      ceilings: [],
+    })) as unknown as BlockedAgentsBannerDeps["loadAccountState"];
+    render(<BlockedAgentsBanner deps={{ ...deps({}), loadAccountState: load }} />);
+    const bar = await screen.findByTestId(BLOCKED_AGENTS_BAR_TESTID);
+    const text = bar.textContent ?? "";
+    expect(text).toContain("AI Enhancement Features running on work-laptop");
+    expect(text).not.toContain("secret@example.com");
+    expect(text).not.toContain("@"); // no email address anywhere in the bar copy
+  });
+
+  it("writes the shared blocked store (with the account-named label), so the amber AiServiceBanner can step aside", async () => {
     render(
       <BlockedAgentsBanner
         deps={deps({
           usage: [{ id: "acct-default", exhaustedUntil: Date.now() + HOUR }],
-          accounts: [{ id: "acct-default", isDefault: true }],
+          accounts: [{ id: "acct-default", isDefault: true, nickname: "work-laptop" }],
         })}
       />,
     );
     await screen.findByTestId(BLOCKED_AGENTS_BAR_TESTID);
+    // The composed "running on <account>" label is what reaches the store, so AiServiceBanner and
+    // any other consumer read the same account-named copy the bar shows.
     expect(useBlockedSubsystemsStore.getState().blocked.map((b) => b.label)).toContain(
-      "AI Enhancement Features",
+      "AI Enhancement Features running on work-laptop",
     );
   });
 
@@ -292,6 +348,46 @@ describe("BlockedAgentsBanner", () => {
     });
     expect(load).not.toHaveBeenCalled();
     expect(screen.queryByTestId(BLOCKED_AGENTS_BAR_TESTID)).toBeNull();
+  });
+
+  describe("blockedAccountName (privacy-safe account label)", () => {
+    const acct = (over: Partial<Account> = {}): Account => ({
+      id: "acct-1",
+      nickname: "work-token",
+      configDir: "/cfg",
+      isDefault: false,
+      createdAt: 0,
+      ...over,
+    });
+    const withEmail = (over: Partial<Identity> = {}): Identity => ({
+      id: "acct-1",
+      email: "secret@example.com",
+      organization: null,
+      accountUuid: "uuid-1",
+      ...over,
+    });
+
+    it("shows the nickname and NEVER the account email, even when the identity carries one (token account)", () => {
+      const name = blockedAccountName(acct({ nickname: "work-token" }), withEmail());
+      expect(name).toBe("work-token");
+      expect(name).not.toContain("@");
+      expect(name).not.toContain("secret@example.com");
+    });
+
+    it("falls back to a non-PII id fingerprint, NOT the email, when there is no nickname", () => {
+      const name = blockedAccountName(
+        acct({ id: "acct-longtail9042", nickname: "   " }),
+        withEmail({ id: "acct-longtail9042" }),
+      );
+      expect(name).not.toContain("@");
+      expect(name).not.toContain("secret@example.com");
+      expect(name).toContain("9042"); // last-4 of the account id
+    });
+
+    it("uses the nickname without needing any identity at all (the production path: identities not loaded)", () => {
+      const name = blockedAccountName(acct({ nickname: "mforge" }));
+      expect(name).toBe("mforge");
+    });
   });
 
   it("clears the shared store on unmount, so a surface rendering the amber bar alone is not left suppressed", async () => {

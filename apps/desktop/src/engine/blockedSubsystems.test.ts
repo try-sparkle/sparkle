@@ -28,6 +28,7 @@ function baseInput(overrides: Partial<BlockedSubsystemsInput> = {}): BlockedSubs
     conciergeAccountId: "acct-default",
     panes: [],
     agentNames: {},
+    accountNames: {},
     isImproveSparkleAgentId: isSparkle,
     ...overrides,
   };
@@ -155,6 +156,69 @@ describe("computeBlockedSubsystems", () => {
       usage: [{ id: "acct-default", exhaustedUntil: NOW - 1 }],
     });
     expect(computeBlockedSubsystems(input)).toEqual([]);
+  });
+
+  it("names WHICH account each blocked subsystem runs on, from the accountNames map", () => {
+    // AI-Enhanced on the default account, Concierge on a different one — both exhausted. Each label
+    // must carry the account NAME the caller resolved, so the reader sees the blast radius per
+    // account, not just the subsystem. (Non-vacuous: dropping the "running on …" append makes this
+    // read the bare labels and fail.)
+    const input = baseInput({
+      usage: [
+        { id: "acct-default", exhaustedUntil: NOW + 5000 },
+        { id: "acct-pool", exhaustedUntil: NOW + 5000 },
+      ],
+      oneshotAccountId: "acct-default",
+      improveSparkleAccountId: "acct-improve-healthy",
+      conciergeAccountId: "acct-pool",
+      accountNames: { "acct-default": "work-laptop", "acct-pool": "mforge" },
+    });
+    expect(labels(input)).toEqual([
+      `${AI_ENHANCED_LABEL} running on work-laptop`,
+      `${CONCIERGE_LABEL} running on mforge`,
+    ]);
+  });
+
+  it("carries the exhausted accountId through on each blocked subsystem", () => {
+    const input = baseInput({
+      usage: [{ id: "acct-default", exhaustedUntil: NOW + 5000 }],
+      oneshotAccountId: "acct-default",
+      improveSparkleAccountId: "acct-other",
+      conciergeAccountId: "acct-other",
+      accountNames: { "acct-default": "work-laptop" },
+    });
+    const [ai] = computeBlockedSubsystems(input);
+    if (!ai) throw new Error("expected a blocked subsystem for the exhausted AI-Enhanced account");
+    expect(ai.accountId).toBe("acct-default");
+    expect(ai.label).toBe(`${AI_ENHANCED_LABEL} running on work-laptop`);
+  });
+
+  it("falls back to the bare subsystem name when the account name has not resolved yet", () => {
+    // A real block whose account is not in accountNames must still show — under the bare label, never
+    // dropped and never with a raw id appended.
+    const input = baseInput({
+      usage: [{ id: "acct-default", exhaustedUntil: NOW + 5000 }],
+      oneshotAccountId: "acct-default",
+      improveSparkleAccountId: "acct-other",
+      conciergeAccountId: "acct-other",
+      accountNames: {}, // nothing resolved
+    });
+    const out = labels(input);
+    expect(out).toEqual([AI_ENHANCED_LABEL]);
+    expect(out[0]).not.toContain("acct-default"); // the raw id must never leak into the label
+  });
+
+  it("names a build agent's account too (running on <account>), keeping name-sorted order", () => {
+    const input = baseInput({
+      usage: [{ id: "acct-pool", exhaustedUntil: NOW + 5000 }],
+      oneshotAccountId: "acct-default",
+      improveSparkleAccountId: "acct-default",
+      conciergeAccountId: "acct-default",
+      panes: [{ agentId: "a1", accountId: "acct-pool" }],
+      agentNames: { a1: "Zebra Flow" },
+      accountNames: { "acct-pool": "mforge" },
+    });
+    expect(labels(input)).toEqual(["Zebra Flow running on mforge"]);
   });
 });
 

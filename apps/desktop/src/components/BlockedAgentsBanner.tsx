@@ -32,6 +32,7 @@ import {
 import { useBlockedSubsystemsStore } from "../stores/blockedSubsystemsStore";
 import { useAccountLimitStore } from "../stores/accountLimitStore";
 import { loadAccountState, stickyAccountSnapshot, CONCIERGE_ACCOUNT_KEY } from "../services/accountSelection";
+import { accountDisplay, type Account, type Identity } from "../services/accountStore";
 import { SPARKLE_AGENT_ID, isSparkleAgentId } from "../services/sparkleAgent";
 import { oneshotAccountId } from "../engine/usageLimit";
 import { paneAccountMap } from "../services/paneControl";
@@ -65,6 +66,27 @@ export const BLOCKED_MAX_VISIBLE = 2;
 export const BLOCKED_RECHECK_MS = 20_000;
 
 
+/** The PRIVACY-SAFE name to show for one account in this red bar.
+ *
+ *  FOUNDER DIRECTIVE (never surface an email here). A token-based account records the email the
+ *  paste authenticated as (`recordOauthIdentity`), and `accountDisplay(...).primary` is exactly that
+ *  email — so naming an account by `primary` would print PII on a bar every user sees. This resolves
+ *  to the user's OWN label (the nickname) instead, and when there is no nickname falls back to a
+ *  non-PII fingerprint (the last 4 of the account id) — NEVER the email, for OAuth or token accounts
+ *  alike. `identity` is accepted so the guarantee is testable against an account that HAS an email to
+ *  leak; production passes none (the banner loads with `withIdentities: false`), so the nickname path
+ *  is the live one and the email is never even read. */
+export function blockedAccountName(account: Account, identity?: Identity): string {
+  // `?? ""` guards a nickname-less account (never the shape in production, where the field is
+  // required, but a partial fixture can omit it) so the trim below can't throw.
+  const nickname = (accountDisplay(account, identity).nickname ?? "").trim();
+  if (nickname) return nickname;
+  // No nickname to show. Do NOT fall back to the email — a non-PII short fingerprint instead, enough
+  // for the user to tell two unlabelled accounts apart without exposing the address.
+  const id = account.id;
+  return id.length > 4 ? `account …${id.slice(-4)}` : `account ${id}`;
+}
+
 /** Injectable seams. Real defaults in production; overridden in tests so no IPC or global registry is
  *  needed to drive a render. */
 export interface BlockedAgentsBannerDeps {
@@ -86,7 +108,11 @@ const DEFAULT_DEPS: BlockedAgentsBannerDeps = {
     }
     return out;
   },
-  openAccounts: () => useUiStore.getState().openSettings("accounts"),
+  // ONE CLICK to the manage-accounts view (the AccountsScreen where per-account usage / switch /
+  // re-auth live), not the Settings → Accounts landing pane, which only carried a second "Manage
+  // accounts…" button. `openSettings("accounts")` lands on that intermediate pane; `openManageAccounts`
+  // is the direct seam the concierge kebab honours by mounting AccountsScreen straight away.
+  openAccounts: () => useUiStore.getState().openManageAccounts(),
 };
 
 // See BANNER_BAR_TOP_ANCHOR in ProviderUnavailableBanner — the shell's bars share this shape, so a
@@ -157,6 +183,12 @@ export function BlockedAgentsBanner({ deps }: { deps?: Partial<BlockedAgentsBann
       load({ withIdentities: false }).then((state) => {
         if (!alive) return;
         const paneMap = panes();
+        // accountId → privacy-safe display name. `withIdentities: false` means `state.identities` is
+        // empty, so `blockedAccountName` resolves each account by its nickname (never its email) — the
+        // whole point of that helper. Any identities present are looked up defensively all the same.
+        const identityById = new Map(state.identities.map((i) => [i.id, i]));
+        const accountNames: Record<string, string> = {};
+        for (const a of state.accounts) accountNames[a.id] = blockedAccountName(a, identityById.get(a.id));
         const list = computeBlockedSubsystems({
           now: Date.now(),
           usage: state.usage,
@@ -165,6 +197,7 @@ export function BlockedAgentsBanner({ deps }: { deps?: Partial<BlockedAgentsBann
           conciergeAccountId: sticky(CONCIERGE_ACCOUNT_KEY) ?? null,
           panes: Object.entries(paneMap).map(([agentId, accountId]) => ({ agentId, accountId })),
           agentNames: agentNames(),
+          accountNames,
           isImproveSparkleAgentId: isSparkleAgentId,
         });
         setBlocked(list);

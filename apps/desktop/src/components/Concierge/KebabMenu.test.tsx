@@ -124,6 +124,7 @@ afterEach(() => {
   vi.clearAllMocks();
   capturedLogin = undefined;
   act(() => useUiStore.getState().clearSettingsRequest());
+  act(() => useUiStore.getState().clearManageAccountsRequest());
 });
 
 const trigger = () => screen.getByRole("button", { name: "Settings" });
@@ -403,6 +404,22 @@ describe("KebabMenu — reused surfaces", () => {
     // …and the promise handed to AccountsScreen settles, which is the signal that drives the
     // post-login re-read. An un-awaitable `void` return leaves this pending forever.
     await expect(loginPromise()).resolves.toBeUndefined();
+  });
+
+  it("a uiStore manageAccounts request opens the AccountsScreen in ONE step, bypassing the Settings dialog", () => {
+    // Issue #2: the blocked-agents banner's "Manage fleet" calls `openManageAccounts()`. The kebab —
+    // which owns AccountsScreen's mount — must open that screen directly, NOT the Settings→Accounts
+    // pane (which needs a second "Manage accounts…" click). The precondition on its own line keeps
+    // the "opens" assertion non-vacuous: the screen must be genuinely absent first.
+    render(<KebabMenu />);
+    expect(screen.queryByTestId("accounts-screen")).toBeNull();
+    act(() => useUiStore.getState().openManageAccounts());
+    expect(screen.getByTestId("accounts-screen")).toBeTruthy();
+    // No settings dialog was involved on the way there — this is the one-click deep link.
+    expect(screen.queryByTestId("settings-dialog")).toBeNull();
+    // The request is consumed, so it cannot re-fire the screen on a later unrelated render, and a
+    // second identical request can re-open it.
+    expect(useUiStore.getState().manageAccountsRequest).toBe(false);
   });
 
   it("Escape while a login is pending does NOT tear the accounts screen out from under it", async () => {

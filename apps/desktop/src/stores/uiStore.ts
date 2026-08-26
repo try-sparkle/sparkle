@@ -117,6 +117,10 @@ const TRANSIENT_UI_KEYS = [
   // `focusedNoticeBySide` above makes and one degree louder because this one MOVES the viewport.
   "columnRevealBySide",
   "settingsRequest",
+  // A one-shot "open the manage-accounts view" request, consumed by the kebab menu on the next
+  // render — restoring one at launch would pop the AccountsScreen for a click nobody made this
+  // session, the same argument `settingsRequest` above makes.
+  "manageAccountsRequest",
   "composeFocusSeq",
   "revealAgentId",
   // Travels with `revealAgentId` — a viewport coordinate from one click is meaningless on the next
@@ -693,6 +697,14 @@ interface UiState {
   settingsRequest: CategoryId | null;
   openSettings: (cat: CategoryId) => void;
   clearSettingsRequest: () => void;
+  // ONE-CLICK deep-open request for the MANAGE-ACCOUNTS view (the AccountsScreen where per-account
+  // usage / switch / re-auth live), distinct from `settingsRequest: "accounts"`, which only lands on
+  // the Settings→Accounts pane behind a second "Manage accounts…" button. The shell's kebab menu
+  // (which owns AccountsScreen's mount) honours this by opening that screen straight away and clears
+  // the request. Transient — NOT persisted (see partialize); a relaunch must never restore a dialog.
+  manageAccountsRequest: boolean;
+  openManageAccounts: () => void;
+  clearManageAccountsRequest: () => void;
   // Which agent has its "Move to cloud" confirm dialog open (local→cloud promotion, bead
   // sparkle-8zpvc). Held here rather than in the row that opened it because the row is memoized and
   // can unmount under the dialog — a section fold, a status-band filter, a project switch — and a
@@ -1190,6 +1202,9 @@ export const useUiStore = create<UiState>()(
       settingsRequest: null,
       openSettings: (cat) => set({ settingsRequest: cat }),
       clearSettingsRequest: () => set({ settingsRequest: null }),
+      manageAccountsRequest: false,
+      openManageAccounts: () => set({ manageAccountsRequest: true }),
+      clearManageAccountsRequest: () => set({ manageAccountsRequest: false }),
       promoteAgentId: null,
       openPromoteToCloud: (agentId) => set({ promoteAgentId: agentId }),
       closePromoteToCloud: () => set({ promoteAgentId: null }),

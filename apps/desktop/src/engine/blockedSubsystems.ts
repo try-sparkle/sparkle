@@ -37,9 +37,15 @@
 export interface BlockedSubsystem {
   /** Stable key for React lists and de-duplication. */
   key: string;
-  /** Human display name, e.g. "Improve Sparkle agent", "AI Enhancement Features", or a build
-   *  agent's sidebar name. */
+  /** Human display name the user reads. When the blocked subsystem's bound account resolves to a
+   *  name, this reads "<subsystem> running on <account>" — so the reader knows not just WHAT is
+   *  blocked but WHICH account exhausted it (the two facts the founder needed together). Falls back
+   *  to the bare subsystem name when no account name is known (e.g. `accountNames` not yet loaded). */
   label: string;
+  /** The id of the exhausted account this subsystem is bound to, when known — carried through so a
+   *  consumer can key an action (jump to that account) off the exact account, not re-derive it from
+   *  the label prose. Null/absent when the binding is unknown. */
+  accountId?: string | null;
 }
 
 /** One mounted build-agent pane and the account it is running under (from `paneAccountMap`). */
@@ -64,6 +70,12 @@ export interface BlockedSubsystemsInput {
   panes: readonly PaneBinding[];
   /** agentId → sidebar display name, for labelling build agents. */
   agentNames: Readonly<Record<string, string>>;
+  /** accountId → the PRIVACY-SAFE display name to show for that account (never an email — the caller
+   *  resolves this, see `BlockedAgentsBanner.blockedAccountName`). Used to append "running on <name>"
+   *  to each blocked subsystem's label so the banner names the exhausted account, not just the
+   *  subsystem. An account absent from this map (name not yet resolved) leaves the bare label — a
+   *  real block must never be dropped just because its account name has not hydrated. */
+  accountNames: Readonly<Record<string, string>>;
   /** True for any id in the Improve Sparkle namespace — the canonical `__sparkle_self__` AND its
    *  per-window `__sparkle_self__-win-<uuid>` variants (pass `services/sparkleAgent.isSparkleAgentId`).
    *  Its pane, in any window, is the same subsystem already covered by {@link improveSparkleAccountId},
@@ -116,22 +128,29 @@ export function computeBlockedSubsystems(input: BlockedSubsystemsInput): Blocked
 
   const out: BlockedSubsystem[] = [];
   const seen = new Set<string>();
-  const push = (key: string, label: string) => {
+  // Append "running on <account>" when — and only when — the bound account resolves to a name, so
+  // the banner names WHICH account exhausted a subsystem (the founder needed both facts). An
+  // unresolved account leaves the bare base name rather than inventing an id string.
+  const withAccount = (base: string, accountId: string | null | undefined): string => {
+    const name = accountId != null ? input.accountNames[accountId] : undefined;
+    return name ? `${base} running on ${name}` : base;
+  };
+  const push = (key: string, base: string, accountId: string | null | undefined) => {
     if (seen.has(key)) return;
     seen.add(key);
-    out.push({ key, label });
+    out.push({ key, label: withAccount(base, accountId), accountId: accountId ?? null });
   };
 
   // Fixed subsystems first, in blast-radius order: AI-Enhanced (every enhancement feature at once),
   // then the two named agents.
   if (input.oneshotAccountId != null && exhausted.has(input.oneshotAccountId)) {
-    push(AI_ENHANCED_KEY, AI_ENHANCED_LABEL);
+    push(AI_ENHANCED_KEY, AI_ENHANCED_LABEL, input.oneshotAccountId);
   }
   if (input.improveSparkleAccountId != null && exhausted.has(input.improveSparkleAccountId)) {
-    push(IMPROVE_SPARKLE_KEY, IMPROVE_SPARKLE_LABEL);
+    push(IMPROVE_SPARKLE_KEY, IMPROVE_SPARKLE_LABEL, input.improveSparkleAccountId);
   }
   if (input.conciergeAccountId != null && exhausted.has(input.conciergeAccountId)) {
-    push(CONCIERGE_KEY, CONCIERGE_LABEL);
+    push(CONCIERGE_KEY, CONCIERGE_LABEL, input.conciergeAccountId);
   }
 
   // Mounted build-agent panes, sorted by the name the user sees so the list is stable.
@@ -145,9 +164,15 @@ export function computeBlockedSubsystems(input: BlockedSubsystemsInput): Blocked
     // whose display name has not resolved yet — e.g. `projectStore` hydrating after the first poll
     // tick — is kept under a generic label rather than dropped; the next tick upgrades it to the
     // real name.
-    .map((p) => ({ key: `agent:${p.agentId}`, label: input.agentNames[p.agentId] || GENERIC_AGENT_LABEL }))
-    .sort((a, b) => a.label.localeCompare(b.label));
-  for (const a of agents) push(a.key, a.label);
+    .map((p) => ({
+      key: `agent:${p.agentId}`,
+      base: input.agentNames[p.agentId] || GENERIC_AGENT_LABEL,
+      accountId: p.accountId,
+    }))
+    // Sort on the BASE subsystem name (before "running on …" is appended) so the ordering the user
+    // sees is by agent name, not by whichever account happens to sort first.
+    .sort((a, b) => a.base.localeCompare(b.base));
+  for (const a of agents) push(a.key, a.base, a.accountId);
 
   return out;
 }
