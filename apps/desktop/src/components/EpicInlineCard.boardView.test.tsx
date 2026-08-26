@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 //
-// `Board view` ON THE EPICS COLUMN'S CARD — the PRODUCTION SEAM (bead sparkle-42onk2).
+// THE `Board` LINK ON THE EPICS COLUMN'S CARD — the PRODUCTION SEAM (bead sparkle-42onk2). It read
+// `Board view` until sparkle-huw924.14 dropped the trailing word.
 //
 // The founder, 2026-08-24: *"For epics on the epic column, I want a [link] to the right of the
 // yellow epic pill that says 'board view' and opens the epic on the planning board"*.
@@ -98,7 +99,7 @@ function assertTheCardIsReallyThere() {
 // ── THE LINK IS ON THE CARD THE COLUMN ACTUALLY MOUNTS ──────────────────────────────────────────
 
 describe("the epics column's epic card offers the board", () => {
-  it("draws 'Board view' beside the epic pill", () => {
+  it("draws 'Board' beside the epic pill", () => {
     mount();
     assertTheCardIsReallyThere();
 
@@ -112,7 +113,9 @@ describe("the epics column's epic card offers the board", () => {
     expect(pill, "no epic pill in the chrome row").toBeGreaterThan(-1);
     expect(board, "no board link in the chrome row").toBeGreaterThan(-1);
     expect(board).toBeGreaterThan(pill);
-    expect(screen.getByTestId(`${T}-destinations`).textContent).toBe("Board view");
+    // `Board`, not `Board view` — the founder took the trailing word out on 2026-08-26
+    // (sparkle-huw924.14), and this card is one of the two surfaces that renders it.
+    expect(screen.getByTestId(`${T}-destinations`).textContent).toBe("Board");
   });
 
   // THE FOUNDER'S EXPLICIT CHOICE, asked directly: the board link ALONE here. This column's whole

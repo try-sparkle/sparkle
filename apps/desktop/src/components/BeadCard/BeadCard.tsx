@@ -202,13 +202,14 @@ export interface BeadCardProps {
    * *"maybe instead of build it, because it's already building… it could say something like Open.
    * And then there's two options, and maybe they're just two clickable links. One is in column, and
    * the other is on board."* So this prop's real job is to add the SECOND destination beside the
-   * first: supplied, the chrome row reads `Column | Board view`; absent, it reads `Board view`
-   * alone. It is a pair or a single, never two separate controls in two places on one card.
+   * first: supplied, the chrome row reads `Column | Board`; absent, it reads `Board` alone. It is
+   * a pair or a single, never two separate controls in two places on one card.
    *
    * WHERE THEY LIVE IS THE FOUNDER'S LATER CALL. This pair used to be an `Open · in column · on
    * board` group sitting above Build It, halfway down the card. On 2026-08-24 he moved it to the
    * chrome row and renamed both halves — *"`[EPIC] Column | Board view` where 'Column' and 'Board'
-   * are hyperlinks"*. The group is deleted, not hidden; see the chrome row for the full quote.
+   * are hyperlinks"*. He dropped the trailing `view` on 2026-08-26, so the row now reads
+   * `Column | Board`. The group is deleted, not hidden; see the chrome row for the full quote.
    *
    * ══ WHY IT IS A SECOND CALLBACK AND NOT A FLAG ══════════════════════════════════════════════
    * Callback-is-the-switch, exactly like `onChat`, `onComment` and `goal` above. TWO different
@@ -985,12 +986,15 @@ export function BeadCard({
             card that drew either of them as well would offer the same destination twice, inches
             apart, which is the exact duplication the group was itself introduced to prevent.
 
-            ══ THE LINK IS THE NOUN; THE WORD AFTER IT IS NOT ═════════════════════════════════════
-            *"'Board view' where 'Board' is hyperlink"* — asked to choose between whole-phrase links
-            and noun-only links, he picked noun-only explicitly. So `Board` is the control and
-            `view` is plain muted text beside it, `aria-hidden` so a screen reader is not read the
-            word twice (the button's `aria-label` already carries the full phrase). `Column` takes
-            no trailing word, exactly as he wrote it.
+            ══ TWO NOUNS AND A BAR — THE WORD `view` IS GONE (bead sparkle-huw924.14) ═════════════
+            2026-08-26: *"also take out the word 'view' just have the column and board parts that
+            link."* So the row is exactly `Column | Board` — two links and a separator, nothing
+            else. This settles a question the earlier wording left half-open: asked to choose
+            between whole-phrase links and noun-only links he had already picked noun-only
+            (*"'Board view' where 'Board' is hyperlink"*), which left `view` as plain muted text
+            beside the link. Removing it makes the two halves symmetrical, which is what lets them
+            be structurally identical — and that symmetry IS the baseline fix, recorded on the
+            row's `alignItems` below.
 
             ══ `aria-label`, NOT `title` ══════════════════════════════════════════════════════════
             `disableNativeTooltips()` strips every `title` app-wide on the first `mouseover` and
@@ -1003,21 +1007,43 @@ export function BeadCard({
             ══ CALLBACK-IS-THE-SWITCH, LIKE EVERY OTHER AFFORDANCE ON THIS CARD ═══════════════════
             Nothing here reads `chrome` and nothing reads `bead.type`. A surface supplies the
             destinations that are real for it and gets exactly those: the concierge passes both and
-            sees `Column | Board view`; the epics column passes only the board and sees `Board view`;
-            a read-only fixture passes neither and sees no links at all. That is what keeps this
-            file out of the business of deciding what an epic is (`epic-membership-guard.sh`).
+            sees `Column | Board`; the epics column passes only the board and sees `Board`; a
+            read-only fixture passes neither and sees no links at all. That is what keeps this file
+            out of the business of deciding what an epic is (`epic-membership-guard.sh`).
 
             ══ IT MUST BE ABLE TO GIVE GROUND ═════════════════════════════════════════════════════
             `flex: "0 1 auto"` + `minWidth: 0`, for the reason the corner cluster below documents at
             length: the epics column is ~280px and the concierge column is user-resizable, so a run
             that cannot shrink pushes itself through the card's padding box. `nowrap` keeps the pair
-            on the pill's line rather than wrapping `view` onto its own. */}
+            on the pill's line rather than wrapping `Board` onto its own. */}
         {(onOpenInColumn !== undefined || onViewOnBoard !== undefined) && (
           <span
             data-testid={`${t}-destinations`}
             style={{
+              /* ══ WHY THE TWO WORDS SAT ON DIFFERENT BASELINES, AND WHY THIS SAYS `baseline` ═══
+                 The founder, 2026-08-26: *"this 'Column | Board view' text isn't aligned the same;
+                 board is lower."* It was, by 0.61px — measured in real Chrome on this exact markup,
+                 not eyeballed — and the cause was STRUCTURAL, not a margin.
+
+                 `Column` is a direct flex item of this row, so its box is exactly its own
+                 `line-height` (12px x 1.4 = 16.8px) and its text sits at that box's own baseline.
+                 `Board` was NOT a sibling: it lived inside the extra `display: "inline"` wrapper
+                 that held ` view`. As a flex item that wrapper is blockified, establishing its own
+                 inline formatting context whose STRUT takes the INHERITED type — and nothing
+                 between `body` and this row sets one, so the strut was the UA default 16px /
+                 `line-height: normal`, not the link's 12px / 1.4. The strut is taller than the
+                 button it contains, so the wrapper's box measured 19.8px against `Column`'s 16.8px,
+                 with the shared baseline pushed down inside it.
+
+                 `align-items: center` then aligned the BOXES, not the baselines: two boxes of
+                 different height whose baselines sit at different depths cannot land on one line.
+                 Deleting the wrapper (see the `Board` button below) removes the taller box, and
+                 `baseline` here removes the class of bug rather than this instance — with every
+                 item now on the same type it is pixel-identical to `center` (both measure 0.00px
+                 apart), but it keeps stating the invariant the founder asked for, so the next item
+                 added to this row with a different size cannot silently reintroduce the drift. */
               display: "flex",
-              alignItems: "center",
+              alignItems: "baseline",
               gap: 4,
               flex: "0 1 auto",
               minWidth: 0,
@@ -1055,45 +1081,35 @@ export function BeadCard({
                 |
               </span>
             )}
-            {/* ══ ONE FLEX ITEM, SO THE SPACE BETWEEN THE TWO WORDS IS A REAL SPACE ═══════════
-                The group's own `gap` separates `Column`, the bar and this PHRASE — but it must not
-                also separate `Board` from `view`, because those two are one thing the reader is
-                meant to read as one thing. A flex gap is not text: it renders a visual space and
-                leaves `textContent` reading "Boardview", so the card's plain-text rendering (and
-                any test or copy-paste that reads it) loses the word break the founder asked for.
-                A plain inline wrapper puts the two words back in normal inline flow, where the
-                literal space below is the space on screen — one mechanism, not two that can drift
-                to different widths. The wrapper is blockified as a flex item, which is why the
-                nested `display` is `inline` rather than `inline-flex`: inside an inline-flex,
-                whitespace between items is discarded and the fix would be undone. */}
+            {/* ══ A DIRECT SIBLING OF `Column`, AND THAT IS THE ALIGNMENT FIX ══════════════════
+                `Board` used to be wrapped in an extra `display: "inline"` span alongside a plain
+                ` view` suffix, so that the space between the two words survived into `textContent`
+                rather than being a flex `gap`. Dropping `view` removes that wrapper's only reason
+                to exist — and the wrapper WAS the misalignment the founder reported. See the
+                block comment above the row's `alignItems` for the measurement. */}
             {onViewOnBoard !== undefined && (
-              <span data-testid={`${t}-open-on-board-phrase`} style={{ display: "inline", minWidth: 0 }}>
-                <button
-                  type="button"
-                  data-testid={`${t}-open-on-board`}
-                  // Same reason as its sibling above — see that note.
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    onViewOnBoard();
-                  }}
-                  aria-label="Board view — open the Plan board focused on this card"
-                  style={openLinkStyle}
-                >
-                  Board
-                </button>
-                {/* `view` — VISIBLE TEXT, NOT PART OF THE LINK. The founder's wording, chosen
-                    explicitly over a whole-phrase link. Muted rather than `accentInk` so the eye
-                    reads exactly one clickable word, and `aria-hidden` so the phrase is announced
-                    ONCE — the button's `aria-label` already carries it in full, and without this a
-                    screen reader says "Board view … view". */}
-                <span
-                  aria-hidden
-                  data-testid={`${t}-open-on-board-suffix`}
-                  style={{ color: C.muted, fontSize: TYPE.small, lineHeight: 1.4 }}
-                >
-                  {" view"}
-                </span>
-              </span>
+              <button
+                type="button"
+                data-testid={`${t}-open-on-board`}
+                // Same reason as its sibling above — see that note.
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onViewOnBoard();
+                }}
+                // THE ACCESSIBLE NAME LOSES `view` TOO, AND KEEPS EVERYTHING ELSE. It read
+                // "Board view — open the Plan board focused on this card" while `view` was on
+                // screen. The visible label is now `Board`, so the leading phrase would name a word
+                // no sighted reader can see, and this card's own convention (see `Column` above) is
+                // `<visible label> — <what it does>`. The CONTEXT the label exists to carry is the
+                // clause after the dash — a one-word link named `Board` says nothing about which
+                // board or what will change — and that clause survives verbatim. Dropping the word
+                // also keeps WCAG 2.5.3 Label in Name exact rather than merely satisfied: the
+                // accessible name now STARTS with the visible text instead of embedding it.
+                aria-label="Board — open the Plan board focused on this card"
+                style={openLinkStyle}
+              >
+                Board
+              </button>
             )}
           </span>
         )}

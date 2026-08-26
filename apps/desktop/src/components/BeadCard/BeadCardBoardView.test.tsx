@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 //
-// `Board view` — THE DESTINATION LINKS, RIGHT OF THE YELLOW EPIC PILL (bead sparkle-42onk2).
+// `Column | Board` — THE DESTINATION LINKS, RIGHT OF THE YELLOW EPIC PILL (beads sparkle-42onk2,
+// sparkle-huw924.14).
 //
 // The founder, 2026-08-24, with a screenshot of the epics column open in front of him: *"For epics
 // on the epic column, I want a [link] to the right of the yellow epic pill that says 'board view'
@@ -8,6 +9,18 @@
 // and how far the hyperlink should extend, he settled both: *"for concierge card view do `[EPIC]
 // Column | Board view` where 'Column' and 'Board' are hyperlinks. then in the epic column just have
 // 'Board view' where 'Board' is hyperlink."*
+//
+// ══ AND THEN, 2026-08-26, HE DROPPED THE TRAILING WORD AND THE MISALIGNMENT WITH IT ════════════
+// *"this 'Column | Board view' text isn't aligned the same; board is lower. fix that. also take out
+// the word 'view' just have the column and board parts that link."* The two asks are ONE change:
+// `view` was the only reason `Board` lived inside an extra `display: "inline"` wrapper (so the
+// space in the phrase would survive into `textContent` rather than being a flex `gap`), and that
+// wrapper was the misalignment. Blockified as a flex item it established its own inline formatting
+// context whose strut takes the INHERITED type — the UA default 16px / `line-height: normal`, since
+// nothing between `body` and this row sets one — so its box measured 19.8px against `Column`'s
+// 16.8px and its baseline sat deeper inside it. `align-items: center` aligns BOXES, so `Board`
+// landed 0.61px low. Measured in real Chrome on this exact markup; jsdom cannot see any of it,
+// which is why the rows below pin the STRUCTURE and the STYLE EXPRESSION that produce the geometry.
 //
 // ══ WHAT THIS FILE HAS TO PIN, AND WHY EACH HALF IS NECESSARY ══════════════════════════════════
 // The ask is a POSITION and a WORDING. Both are invisible to a test that only checks a callback
@@ -116,63 +129,94 @@ describe("the board link sits immediately right of the epic pill", () => {
   });
 });
 
-// ── THE WORDING — 'Board' IS THE LINK, 'view' IS NOT ────────────────────────────────────────────
+// ── THE WORDING — TWO LINKED NOUNS, AND NOT A WORD MORE ─────────────────────────────────────────
 
 describe("the wording the founder chose", () => {
-  it("reads 'Board view', with only 'Board' clickable", () => {
+  it("says 'Board' and nothing else — no 'view' anywhere in the row", () => {
     const t = ID("epics");
     mount("epics", { onViewOnBoard: vi.fn() });
 
     const board = screen.getByTestId(`${t}-open-on-board`);
-    const suffix = screen.getByTestId(`${t}-open-on-board-suffix`);
-    // The LINK carries the noun alone — offered both readings, he picked noun-only explicitly.
+    const row = screen.getByTestId(`${t}-destinations`);
     expect(board.textContent).toBe("Board");
-    // A REAL TEXT SPACE, not a flex gap. The two words sit in one inline wrapper precisely so the
-    // break between them survives into `textContent` — a `gap` renders the same pixels and leaves
-    // the card's plain-text rendering reading "Boardview".
-    expect(suffix.textContent).toBe(" view");
-    // Read together they are the phrase he asked for.
-    expect(screen.getByTestId(`${t}-destinations`).textContent).toBe("Board view");
-    // …and the suffix is NOT a control. A second button reading "view" would satisfy the two text
-    // assertions above and be a different, worse thing.
-    expect(suffix.tagName).not.toBe("BUTTON");
-    expect(suffix.closest("button")).toBeNull();
+    // THE ASK, stated as the property rather than as one expected string: *"take out the word
+    // 'view'"*. Asserting the row equals "Board" would go green again the day a third destination
+    // is added; asserting the WORD is absent stays true whatever else the row grows.
+    expect(row.textContent).toBe("Board");
+    expect(row.textContent?.toLowerCase()).not.toContain("view");
+    // The wrapper and the plain word are DELETED, not hidden — a hidden suffix would still put its
+    // 16px strut in the row and the baseline would still be wrong.
+    expect(screen.queryByTestId(`${t}-open-on-board-suffix`)).toBeNull();
+    expect(screen.queryByTestId(`${t}-open-on-board-phrase`)).toBeNull();
   });
 
-  it("paints the link and only the link, so the eye reads one clickable word", () => {
-    const t = ID("epics");
-    mount("epics", { onViewOnBoard: vi.fn() });
+  // ══ THE ALIGNMENT FIX, PINNED ON ITS REAL CAUSE ══════════════════════════════════════════════
+  // jsdom has no layout engine — every `getBoundingClientRect` is zeroes and a class-derived
+  // `getComputedStyle` reads empty (docs/jsdom-test-caveats.md) — so a measured y-coordinate here
+  // would be theatre. What jsdom CAN see is the two things that produced the 0.61px drop in real
+  // Chrome: the extra wrapper around one of the two links, and the row's `align-items`. Both are
+  // pinned as structure and as the inline-style expression, which is exactly what the browser reads.
+  it("hangs both links off ONE baseline-aligned parent, as equal siblings", () => {
+    const t = ID("concierge");
+    mount("concierge", { onViewOnBoard: vi.fn(), onOpenInColumn: vi.fn(), onChat: vi.fn() });
+    assertTheCardIsReallyThere(t);
+
+    const row = screen.getByTestId(`${t}-destinations`);
+    const column = screen.getByTestId(`${t}-open-in-column`);
     const board = screen.getByTestId(`${t}-open-on-board`);
-    const suffix = screen.getByTestId(`${t}-open-on-board-suffix`);
+
+    // 1. NO NESTING ASYMMETRY. `Column` was always a direct flex item; `Board` was one level down,
+    //    inside a blockified wrapper with its own line box. Same parent is the whole repair.
+    expect(board.parentElement).toBe(row);
+    expect(column.parentElement).toBe(row);
+    // 2. SAME ELEMENT TYPE, so neither can pick up a different UA box.
+    expect(board.tagName).toBe(column.tagName);
+    // 3. SAME TYPE METRICS — a flex item's box height IS its line-height here, and a difference in
+    //    either of these is what put the two baselines at different depths.
+    expect(board.style.fontSize).toBe(column.style.fontSize);
+    expect(board.style.lineHeight).toBe(column.style.lineHeight);
+    // 4. AND THE ROW SAYS SO OUT LOUD. `center` aligns boxes; only `baseline` aligns baselines, and
+    //    it is the one of the two that survives a future item of a different size being added.
+    expect(row.style.alignItems).toBe("baseline");
+  });
+
+  it("paints both links identically, so the pair reads as one choice", () => {
+    const t = ID("concierge");
+    mount("concierge", { onViewOnBoard: vi.fn(), onOpenInColumn: vi.fn() });
+    const column = screen.getByTestId(`${t}-open-in-column`);
+    const board = screen.getByTestId(`${t}-open-on-board`);
 
     expect(board.style.color).toBe(C.accentInk);
     expect(board.style.textDecoration).toBe("underline");
-    // The plain word is muted and undecorated — the two together are what make "only 'Board' is
-    // hyperlink" visible rather than merely true of the DOM.
-    expect(suffix.textContent?.trim()).toBe("view");
-    expect(suffix.style.color).toBe(C.muted);
-    expect(suffix.style.color).not.toBe(board.style.color);
-    expect(suffix.style.textDecoration).toBe("");
+    expect(column.style.color).toBe(board.style.color);
+    expect(column.style.textDecoration).toBe(board.style.textDecoration);
   });
 
   // The visible text is one word, so the accessible name has to carry the rest — and a `title`
   // cannot: `disableNativeTooltips()` strips every one app-wide and rescues it into `aria-label`
-  // only for a control with no other accessible name. The suffix is `aria-hidden` so the phrase is
-  // announced ONCE rather than as "Board view … view".
-  it("announces the whole phrase and its destination, once", () => {
-    const t = ID("epics");
-    mount("epics", { onViewOnBoard: vi.fn() });
-    const label = screen.getByTestId(`${t}-open-on-board`).getAttribute("aria-label") ?? "";
-    expect(label.startsWith("Board view")).toBe(true);
+  // only for a control with no other accessible name.
+  it("keeps the destination in the accessible name, minus the word that left the screen", () => {
+    const t = ID("concierge");
+    mount("concierge", { onViewOnBoard: vi.fn(), onOpenInColumn: vi.fn() });
+    const board = screen.getByTestId(`${t}-open-on-board`);
+    const label = board.getAttribute("aria-label") ?? "";
+
+    // WCAG 2.5.3 Label in Name, exactly rather than merely satisfied: the name STARTS with the
+    // visible word. It used to start "Board view", naming a word no sighted reader can now see.
+    expect(label.startsWith(board.textContent ?? "")).toBe(true);
+    expect(label.toLowerCase()).not.toContain("view");
+    // …and the CONTEXT the label exists for survives the trim. A one-word link named `Board` says
+    // neither which board nor what changes, so dropping the clause would be the real regression.
     expect(label).toContain("Plan board");
-    expect(screen.getByTestId(`${t}-open-on-board-suffix`).getAttribute("aria-hidden")).toBe("true");
+    // Its sibling is named the same way, which is the convention the trim was made to match.
+    expect(screen.getByTestId(`${t}-open-in-column`).getAttribute("aria-label")).toContain("Column —");
   });
 });
 
 // ── THE PAIR, AND THE SINGLE — CALLBACK-IS-THE-SWITCH ───────────────────────────────────────────
 
 describe("a surface gets exactly the destinations it supplies", () => {
-  it("reads 'Column | Board view' when both are real", () => {
+  it("reads 'Column | Board' when both are real", () => {
     const t = ID("concierge");
     mount("concierge", { onViewOnBoard: vi.fn(), onOpenInColumn: vi.fn(), onChat: vi.fn() });
     assertTheCardIsReallyThere(t);
@@ -185,7 +229,7 @@ describe("a surface gets exactly the destinations it supplies", () => {
     expect(column.compareDocumentPosition(board) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     // The separator is visible but is NOT a third control, and never reaches the AX tree.
     const group = screen.getByTestId(`${t}-destinations`);
-    expect(group.textContent).toBe("Column|Board view");
+    expect(group.textContent).toBe("Column|Board");
     expect(group.querySelectorAll("button")).toHaveLength(2);
     // Both halves are painted identically, so the pair reads as one choice rather than two ranks.
     expect(column.style.color).toBe(board.style.color);
@@ -195,11 +239,11 @@ describe("a surface gets exactly the destinations it supplies", () => {
   // THE EPICS COLUMN'S CASE, and the reason it is its own row: the founder asked for the board link
   // ALONE there. A `Column` link would be a second, quieter way to do what clicking the epic row
   // already did to open this card.
-  it("reads 'Board view' alone when the surface has no column to narrow", () => {
+  it("reads 'Board' alone when the surface has no column to narrow", () => {
     const t = ID("epics");
     mount("epics", { onViewOnBoard: vi.fn(), onChat: vi.fn() });
     assertTheCardIsReallyThere(t);
-    expect(screen.getByTestId(`${t}-destinations`).textContent).toBe("Board view");
+    expect(screen.getByTestId(`${t}-destinations`).textContent).toBe("Board");
     expect(screen.queryByTestId(`${t}-open-in-column`)).toBeNull();
     expect(screen.getByTestId(`${t}-destinations`).querySelectorAll("button")).toHaveLength(1);
   });
@@ -210,8 +254,9 @@ describe("a surface gets exactly the destinations it supplies", () => {
     assertTheCardIsReallyThere(t);
     expect(screen.getByTestId(`${t}-destinations`).textContent).toBe("Column");
     expect(screen.queryByTestId(`${t}-open-on-board`)).toBeNull();
-    // No orphaned "view" with nothing in front of it.
-    expect(screen.queryByTestId(`${t}-open-on-board-suffix`)).toBeNull();
+    // …and no orphaned separator with nothing on its right. The bar is drawn only when BOTH
+    // destinations are real, so a single-destination row is one word and no punctuation.
+    expect(screen.getByTestId(`${t}-destinations`).textContent).not.toContain("|");
   });
 
   it("draws no destinations at all on a read-only card", () => {
@@ -268,14 +313,27 @@ describe("pressing a destination", () => {
     expect(onToggleCollapsed).not.toHaveBeenCalled();
   });
 
-  // The plain `view` must not be a dead zone the reader keeps missing — but it is not the control
-  // either. This pins the honest state: pressing the word does nothing, which is why the word is
-  // deliberately short and sits hard against the link.
-  it("does nothing when the plain word beside the link is pressed", () => {
-    const t = ID("epics");
+  // THE SEPARATOR IS THE ONLY NON-LINK LEFT IN THE ROW, and it must stay that way. It replaces
+  // the row that used to press the plain `view` — that word is gone, but the question it asked
+  // ("is there anything in this row that LOOKS pressable and is not, or vice versa?") is still
+  // live, and the bar is now the whole answer.
+  it("leaves the separator inert and out of the accessibility tree", () => {
+    const t = ID("concierge");
     const onViewOnBoard = vi.fn();
-    mount("epics", { onViewOnBoard });
-    fireEvent.click(screen.getByTestId(`${t}-open-on-board-suffix`));
+    const onOpenInColumn = vi.fn();
+    mount("concierge", { onViewOnBoard, onOpenInColumn });
+
+    const row = screen.getByTestId(`${t}-destinations`);
+    const kids = Array.from(row.children) as HTMLElement[];
+    // Three items and no more: link, bar, link. A fourth would mean something came back.
+    expect(kids.map((k) => k.textContent)).toEqual(["Column", "|", "Board"]);
+    const bar = kids[1]!;
+    expect(bar.tagName).not.toBe("BUTTON");
+    expect(bar.closest("button")).toBeNull();
+    expect(bar.getAttribute("aria-hidden")).toBe("true");
+
+    fireEvent.click(bar);
     expect(onViewOnBoard).not.toHaveBeenCalled();
+    expect(onOpenInColumn).not.toHaveBeenCalled();
   });
 });

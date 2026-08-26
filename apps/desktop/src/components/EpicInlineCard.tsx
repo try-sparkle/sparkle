@@ -211,11 +211,12 @@ export function EpicInlineCard({
             : undefined
         }
         onSetPriority={canWrite ? (p) => setBeadPriority(rootPath, bead.id, p) : undefined}
-        // ── `Board view` — RIGHT OF THE YELLOW EPIC PILL ─────────────────────────────────────
+        // ── `Board` — RIGHT OF THE YELLOW EPIC PILL ──────────────────────────────────────────
         // The founder, 2026-08-24, with a screenshot of this very card: *"For epics on the epic
         // column, I want a [link] to the right of the yellow epic pill that says 'board view' and
         // opens the epic on the planning board"* — and, on how it should read: *"in the epic column
-        // just have 'Board view' where 'Board' is hyperlink."*
+        // just have 'Board view' where 'Board' is hyperlink."* On 2026-08-26 he took the trailing
+        // word out too (*"take out the word 'view'"*, sparkle-huw924.14), so it reads `Board`.
         //
         // THIS COLUMN HAD NO WAY TO THE BOARD AT ALL. Not a rename and not a move: `EpicInlineCard`
         // passed neither destination callback, so the epic card here offered the board nowhere,
@@ -224,7 +225,7 @@ export function EpicInlineCard({
         //
         // ══ ONLY THE BOARD, NOT THE PAIR — AND THAT IS DELIBERATE ═══════════════════════════════
         // `onOpenInColumn` is NOT passed, so no `Column` link is drawn here and the row reads
-        // `Board view` alone. Asked directly, the founder chose just the board link: this column's
+        // `Board` alone. Asked directly, the founder chose just the board link: this column's
         // whole job is already to narrow the build column — clicking an epic ROW does exactly that
         // (`uiStore.epicFocusBySide` calls it *"the point of the epics column rather than a
         // refinement of it"*) — so a `Column` link on the card would be a second, quieter way to do

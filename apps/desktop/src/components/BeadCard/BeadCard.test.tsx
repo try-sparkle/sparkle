@@ -96,7 +96,7 @@ describe("BeadCard — only the description scrolls", () => {
 
   // bead sparkle-qogah: never hide a row that needs action. The priority control and the way out of
   // the card must be OUTSIDE the scrolling region, which is a containment fact, not a style fact.
-  it("keeps the priority control, the id and Board view outside the scroll region", () => {
+  it("keeps the priority control, the id and the Board link outside the scroll region", () => {
     mount({
       descMaxHeight: 180,
       onSetPriority: vi.fn(async () => {}),
@@ -176,10 +176,11 @@ describe("BeadCard — a surface with no project renders read-only", () => {
   });
 
   // A REAL `<button>`, PAINTED AS A LINK. The founder asked for a link — *"'Board view' where
-  // 'Board' is hyperlink"* — and the honest element is still a button: it moves the app rather than
-  // following an href, so an `<a>` here would lie to a screen reader about what pressing it does.
-  // The link READING comes from the style, which the row below pins.
-  it("renders Board view as a BUTTON, never an anchor", () => {
+  // 'Board' is hyperlink"*, and later took the trailing word out entirely (sparkle-huw924.14) — and
+  // the honest element is still a button: it moves the app rather than following an href, so an
+  // `<a>` here would lie to a screen reader about what pressing it does. The link READING comes
+  // from the style, which the row below pins.
+  it("renders the Board link as a BUTTON, never an anchor", () => {
     mount({ onViewOnBoard: vi.fn() });
     const board = screen.getByTestId(`${t}-open-on-board`);
     expect(board.tagName).toBe("BUTTON");
@@ -1110,8 +1111,8 @@ describe("BeadCard — the card body is the toggle", () => {
 
   // ══ EVERY NESTED CONTROL IS STILL A CONTROL ═════════════════════════════════════════════════
   // The concrete damage of a root `button` is not visible in a snapshot: assistive tech simply
-  // stops announcing Build It, the priority pill, Chat, Board view, Close, the parent chip, the
-  // goal editor and the comment box, because they are all INSIDE it. So the assertion is about
+  // stops announcing Build It, the priority pill, Chat, the Board link, Close, the parent chip,
+  // the goal editor and the comment box, because they are all INSIDE it. So the assertion is about
   // ANCESTRY — no control on this card may sit inside anything claiming button semantics.
   it("leaves every control on the card reachable — nothing sits inside a button", () => {
     mount({

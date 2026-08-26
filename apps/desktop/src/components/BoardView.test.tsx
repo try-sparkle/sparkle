@@ -4,7 +4,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Bead, Board } from "../services/beads";
 import { C } from "../theme/colors";
 import { TAG } from "./labelTreatment";
-import { DOUBLE_CLICK_GRACE_MS, NO_BUILD_AGENTS } from "./EpicTaskCard";
+import {
+  DOUBLE_CLICK_GRACE_MS,
+  NO_BUILD_AGENTS,
+  UNASSIGNED_AGENTS_LABEL,
+} from "./EpicTaskCard";
 import type { AgentTab, Project } from "../types";
 
 // Mock the beads store so no real `bd`/Tauri invoke happens. startPolling/stopPolling are spies;
@@ -3095,28 +3099,236 @@ describe("BoardView — the open epic card's TASK CARDS", () => {
     }
   });
 
-  it("drops ONLY the tasks row — the Build agents row still renders on the epic card", () => {
-    // WHAT THIS GUARDS, and why it is not the test it looks like. The obvious version — "a NON-epic
-    // card keeps its Tasks row" — CANNOT BE WRITTEN against this board: `beadIsEpic` here is
-    // STRUCTURAL (`isEpic` = typed epic OR has children), so any bead with children renders as an
-    // epic card, and a bead without children has an empty tasks list anyway. There is no third
-    // shape. The first draft of this test seeded a parent task with one child, then looked for
-    // `board-card-task`, and failed because that fixture IS an epic card.
+  it("drops BOTH top-level lineage rows on the epic card, and loses no agent doing it", () => {
+    // ══ THIS TEST WAS INVERTED BY bead sparkle-huw924.10, DELIBERATELY ═══════════════════════
+    // It used to read "drops ONLY the tasks row — the Build agents row still renders", which was
+    // the correct pin while `.9` had only retired `Tasks:`. The founder then re-asked, for the
+    // second time: *"I had already previously asked that the build agents not show outside of the
+    // tasks — that the epic will surface the tasks."* So the row goes too, and the claim flips.
     //
-    // So the real risk the epic-only removal carries is that someone drops the whole lineage block
-    // instead of just `tasks`, taking the `Build agents:` row with it. That row is a statement
-    // about the whole epic which no single task card makes, so losing it loses information the
-    // task cards do not restore. THAT is what this pins.
+    // WHAT IT STILL GUARDS IS THE SAME RISK, from the other side. A flat `Build agents:` row said
+    // something no single task card says, so deleting it without nesting the agents would DELETE
+    // INFORMATION rather than a duplicate — which is why the second half below is the load-bearing
+    // half, not a flourish. Both halves are needed: the absence alone would stay green with the
+    // agents thrown away, and the presence alone would stay green with the row still there.
     seedAgents();
     const dialog = openEpicCard();
 
     expect(within(dialog).queryByTestId("board-bead-card-tasks")).toBeNull();
+    expect(within(dialog).queryByTestId("board-bead-card-build-agents")).toBeNull();
+    expect(within(dialog).queryAllByTestId("board-bead-card-build-agents-pill")).toHaveLength(0);
+
+    // EVERY AGENT THE DELETED ROW USED TO NAME IS STILL DRAWN — inside the task it is bound to.
+    fireEvent.click(cardFor(dialog, KID_STAFFED));
+    settle();
+    expect(
+      within(cardFor(dialog, KID_STAFFED))
+        .getAllByTestId("epic-task-card-agent")
+        .map((n) => n.textContent),
+    ).toEqual(["task-worker-one", "task-worker-two"]);
+    // ...and in THIS fixture every agent is attributable, so the fallback group is not drawn at
+    // all. An empty `Not on a task:` heading would be the row this bead deleted, one rung lower.
+    expect(within(dialog).queryByTestId("epic-unassigned-agents")).toBeNull();
+  });
+});
+
+// ── THE BOARD'S EPIC CARD, AT PARITY WITH THE EPICS COLUMN — bead `sparkle-huw924.10` ───────────
+//
+// THE FOUNDER, 2026-08-25, RE-ASKING FOR THE SECOND TIME: *"I had already previously asked that the
+// build agents not show outside of the tasks — that the epic will surface the tasks."* The Epics
+// column's card landed that shape first (`EpicInlineCard` + `EpicTaskCards`); the board's own epic
+// card was scoped out of that branch and kept a top-level `Build agents:` row plus its own copy of
+// the task-card list. This suite is the parity pin.
+//
+// ══ WHAT MAKES THIS NOT A VACUOUS TEST ═══════════════════════════════════════════════════════
+// The dangerous version of this change is not "the row is still there" — it is "the row is gone AND
+// so are the agents it named". `spawn_build_agent` takes no epic parameter, so an ORCHESTRATOR is
+// normally bound to no bead at all: it reaches the epic only by the worker under it
+// (`epicFocus.agentIdsInEpic` lifts heads), and it matches no task card. Delete the flat row
+// without the fallback group and that agent is on screen nowhere. So the fixture below carries one
+// of each — an agent ON a task and an agent on NO task — and every assertion is about where a NAME
+// ended up, never about a prop having been passed.
+//
+// ══ AND THE PAIRED NEGATIVE IS MOUNTED IN THE SAME RENDER ════════════════════════════════════
+// The removal is EPIC-ONLY. A leaf task has no task cards under it, so its `Build agents:` row is
+// the only place its agents are ever named and removing it there would delete information rather
+// than a duplicate. Asserting that on a card that was never mounted proves nothing (AGENTS.md), so
+// the leaf is painted on the same board as the epic and its card is opened for real.
+describe("BoardView — the open epic card nests its build agents and strands none", () => {
+  const EPIC = "p1-nest";
+  const KID_ON = `${EPIC}.1`;
+  const KID_OFF = `${EPIC}.2`;
+  const LEAF = "p1-leaf";
+
+  function seedNestedBoard() {
+    const epic = bead({ id: EPIC, title: "Nesting epic", type: "epic" });
+    const kidOn = bead({ id: KID_ON, title: "Staffed task", parent: EPIC });
+    const kidOff = bead({ id: KID_OFF, title: "Unstaffed task", parent: EPIC });
+    // NO PARENT AND NO CHILDREN, so `isEpic` (structural: typed epic OR has children) calls it a
+    // task and its card takes the untouched branch.
+    const leaf = bead({ id: LEAF, title: "A lonely task" });
+    snapshot = {
+      beads: [epic, kidOn, kidOff, leaf],
+      board: {
+        backlog: [epic, kidOn, leaf],
+        blocked: [],
+        inProgress: [],
+        done: [],
+        delivered: [],
+        archived: [],
+      },
+      loadedAt: Date.now(),
+    };
+  }
+
+  function seedAgents() {
+    useProjectStore.setState({
+      projects: [
+        {
+          ...project,
+          agents: [
+            // BOUND TO NO BEAD — the normal orchestrator shape, and the one that vanishes if the
+            // flat row is deleted without a home for it.
+            { id: "ag-head", name: "orchestrator-alpha", kind: "build" },
+            {
+              id: "ag-hand",
+              name: "nested-worker",
+              kind: "worker",
+              beadId: KID_ON,
+              parentId: "ag-head",
+            },
+            // Belongs to the LEAF, which is not in the epic at all — so it is also the check that
+            // the epic card is not simply drawing the whole roster.
+            { id: "ag-leaf", name: "leaf-worker", kind: "worker", beadId: LEAF },
+          ] as unknown as AgentTab[],
+        },
+      ],
+      selectedProjectId: project.id,
+    });
+  }
+
+  /** Open the EPIC's full card through the child card's "Part of Epic" link — the walk this file
+   *  already pins elsewhere, so these tests are about the agents and not about card chrome. (The
+   *  epic's own board card renders its title through `epicDisplayTitle`, which rewrites it, so a
+   *  `getByText` on the raw title finds nothing.) */
+  function openEpicCard(): HTMLElement {
+    render(<BoardView project={project} side="right" />);
+    const child = screen
+      .getAllByTestId("board-card-task")
+      .find((c) => c.textContent?.includes("Staffed task"))!;
+    fireEvent.click(within(child).getByTestId("part-of-epic"));
+    return screen.getByRole("dialog");
+  }
+
+  /** Open a plain task's card by its title — task cards draw the title verbatim. */
+  function openCard(title: string): HTMLElement {
+    render(<BoardView project={project} side="right" />);
+    fireEvent.click(screen.getByText(title));
+    return screen.getByRole("dialog");
+  }
+
+  const cardFor = (dialog: HTMLElement, beadId: string) =>
+    within(dialog)
+      .getAllByTestId("epic-task-card")
+      .find((c) => c.getAttribute("data-bead-id") === beadId)!;
+
+  /** Let the deferred single click land — the expand waits `DOUBLE_CLICK_GRACE_MS`. */
+  function settle() {
+    act(() => {
+      vi.advanceTimersByTime(DOUBLE_CLICK_GRACE_MS + 50);
+    });
+  }
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    seedNestedBoard();
+    seedAgents();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("shows NO top-level Build agents row, nests the bound agent, and keeps the unbound one visible", () => {
+    const dialog = openEpicCard();
+
+    // 1. THE ROW IS GONE. Both forms: the row itself, and any pill it could have drawn — a card
+    //    that kept the row but happened to resolve nothing would satisfy only the first.
+    expect(within(dialog).queryByTestId("board-bead-card-build-agents")).toBeNull();
+    expect(within(dialog).queryAllByTestId("board-bead-card-build-agents-pill")).toHaveLength(0);
+    // ...and the `Tasks:` row stays gone with it, which `.9` already removed.
+    expect(within(dialog).queryByTestId("board-bead-card-tasks")).toBeNull();
+
+    // 2. THE BOUND AGENT RENDERS INSIDE ITS OWN TASK CARD. Collapsed first, so its appearance is
+    //    caused by the expand rather than by a card that always draws it.
+    expect(within(cardFor(dialog, KID_ON)).queryAllByTestId("epic-task-card-agent")).toHaveLength(
+      0,
+    );
+    fireEvent.click(cardFor(dialog, KID_ON));
+    settle();
+    const nested = within(cardFor(dialog, KID_ON))
+      .getAllByTestId("epic-task-card-agent")
+      .map((n) => n.textContent);
+    expect(nested).toEqual(["nested-worker"]);
+    // The ORCHESTRATOR is not filed under a task it was never bound to.
+    expect(nested).not.toContain("orchestrator-alpha");
+    // Nor is the agent that belongs to a bead outside this epic.
+    expect(dialog.textContent).not.toContain("leaf-worker");
+
+    // 3. THE UNBOUND AGENT IS STILL ON SCREEN — the regression this whole shape exists to avoid.
+    //    NOT behind an expand: there is no task here to expand into.
+    const stray = within(dialog).getByTestId("epic-unassigned-agents");
+    expect(stray.textContent).toContain(UNASSIGNED_AGENTS_LABEL);
+    expect(
+      within(stray)
+        .getAllByTestId("epic-task-card-agent")
+        .map((n) => n.textContent),
+    ).toEqual(["orchestrator-alpha"]);
+
+    // 4. THE EMPTY TASK SAYS SO, rather than silently expanding into nothing.
+    fireEvent.click(cardFor(dialog, KID_OFF));
+    settle();
+    expect(
+      within(cardFor(dialog, KID_OFF)).getByTestId("epic-task-card-no-agents").textContent,
+    ).toBe(NO_BUILD_AGENTS);
+  });
+
+  it("REALLY JUMPS to the unattributed agent when its chip is clicked, and drops the overlay", () => {
+    // PLAN ON BOTH SIDES FIRST — "build" is the store's default, so asserting it from an unseeded
+    // start would restate the default and stay green with the whole reveal deleted.
+    useUiStore.setState({ workModeBySide: { left: "plan", right: "plan" } });
+    const dialog = openEpicCard();
+
+    const chip = within(within(dialog).getByTestId("epic-unassigned-agents")).getByTestId(
+      "epic-task-card-agent",
+    );
+    act(() => {
+      fireEvent.click(chip);
+    });
+
+    // `selectAndOpen`'s OWN WRITES, the same landing `Concierge/AgentPill` gives — asserted where
+    // a chip wired to nothing cannot fake it.
+    expect(useRuntimeStore.getState().openAgentIds).toContain("ag-head");
+    expect(useProjectStore.getState().projects[0]?.selectedAgentId).toBe("ag-head");
+    expect(useUiStore.getState().workModeBySide.right).toBe("build");
+    // ...and the modal that was covering the agent came down.
+    expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
+  it("PAIRED NEGATIVE — a NON-epic card keeps its Build agents row untouched", () => {
+    // Mounted from the SAME board as the epic above. The removal is epic-only, so a change that
+    // dropped the row unconditionally would go red here and nowhere else.
+    const dialog = openCard("A lonely task");
+
     expect(within(dialog).getByTestId("board-bead-card-build-agents")).toBeTruthy();
     expect(
       within(dialog)
         .getAllByTestId("board-bead-card-build-agents-pill")
         .map((p) => p.textContent),
-    ).toContain("task-worker-one");
+    ).toEqual(["leaf-worker"]);
+    // And a leaf has no task cards under it at all — nothing moved INTO, so nothing may be moved
+    // OUT OF the row.
+    expect(within(dialog).queryByTestId("epic-task-cards")).toBeNull();
   });
 });
 
@@ -3886,21 +4098,40 @@ describe("BoardView — the open card's Tasks and Build agents rows", () => {
     expect(within(dialog).getByText(KID_B)).toBeTruthy();
   });
 
-  it("names the workers inside the epic on the Build agents row, and no one else's", () => {
+  it("names the workers inside the epic INSIDE their own task card, and no one else's", () => {
     seedLineageBoard();
     seedAgents();
     openEpicCard();
 
-    const labels = screen
-      .getAllByTestId("board-bead-card-build-agents-pill")
+    // THE SURFACE MOVED, THE RULE DID NOT — the same shape the `Tasks:` half of this suite already
+    // took under `.9`. Bead sparkle-huw924.10 retired the top-level `Build agents:` row on an epic
+    // card in favour of chips inside the task each agent is bound to, so the MEMBERSHIP filter
+    // this test has always guarded is asserted where it now renders. The row's absence is asserted
+    // too, so this cannot pass by finding the old row and the new chips at once.
+    expect(screen.queryByTestId("board-bead-card-build-agents")).toBeNull();
+
+    const cardOf = (id: string) =>
+      screen.getAllByTestId("epic-task-card").find((c) => c.getAttribute("data-bead-id") === id)!;
+    // SPACE, NOT A CLICK: the keyboard toggle is immediate, while a single click defers by
+    // `DOUBLE_CLICK_GRACE_MS` so a double click can overtake it — and this describe runs on real
+    // timers. Both gestures reach the same `onToggleExpand`; the deferral itself is pinned by the
+    // TASK CARDS suite, which owns the fake clock.
+    fireEvent.keyDown(cardOf(KID_A), { key: " " });
+
+    const labels = within(cardOf(KID_A))
+      .getAllByTestId("epic-task-card-agent")
       .map((p) => p.textContent);
     // Bound to a CHILD, not to the epic's own id — the normal dispatch shape, and the case that
     // used to render blank everywhere it was asked with `workersForBead(agents, bead.id)`.
     expect(labels).toContain("rows-worker");
     expect(labels).not.toContain("stranger-worker");
+    // AND NOWHERE ELSE ON THE CARD. The chips are now one of several places a name could leak in
+    // — the fallback group is the other — so the exclusion is asserted against the whole overlay
+    // rather than against the one list it used to be able to appear in.
+    expect(screen.getByRole("dialog").textContent).not.toContain("stranger-worker");
   });
 
-  it("REALLY JUMPS to the agent when a Build agents pill is clicked, and drops the overlay", () => {
+  it("REALLY JUMPS to the agent when a nested build-agent chip is clicked, and drops the overlay", () => {
     seedLineageBoard();
     seedAgents();
     // PLAN FIRST, ON BOTH SIDES. The reveal's job is to SHOW the agent, so it leaves the board and
@@ -3910,8 +4141,14 @@ describe("BoardView — the open card's Tasks and Build agents rows", () => {
     useUiStore.setState({ workModeBySide: { left: "plan", right: "plan" } });
     openEpicCard();
 
-    const pill = screen
-      .getAllByTestId("board-bead-card-build-agents-pill")
+    // The chip lives INSIDE the task card now (bead sparkle-huw924.10), so the card has to be open
+    // before there is anything to click. Space toggles it without the click deferral; see the
+    // sibling test above.
+    const cardOf = (id: string) =>
+      screen.getAllByTestId("epic-task-card").find((c) => c.getAttribute("data-bead-id") === id)!;
+    fireEvent.keyDown(cardOf(KID_A), { key: " " });
+    const pill = within(cardOf(KID_A))
+      .getAllByTestId("epic-task-card-agent")
       .find((p) => p.textContent === "rows-worker")!;
     act(() => {
       fireEvent.click(pill);

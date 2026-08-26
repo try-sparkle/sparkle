@@ -36,14 +36,13 @@ import { safeUnlisten } from "../services/safeUnlisten";
 import { useBeadsStore } from "../stores/beadsStore";
 import { useProjectStore } from "../stores/projectStore";
 import { rungForEpicHealth } from "../engine/epicHealth";
-import { beadHealthApplies } from "../engine/beadHealth";
-import { useEpicHealthOf, useBeadHealthOf } from "../hooks/useEpicHealthOf";
+import { useEpicHealthOf } from "../hooks/useEpicHealthOf";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import type { PairSide } from "../engine/cable";
 import { useUiStore } from "../stores/uiStore";
 import { useShallow } from "zustand/react/shallow";
-import { workersForBead, beadStage, epicChildViews } from "../services/planView";
-import { EpicTaskCard } from "./EpicTaskCard";
+import { workersForBead, beadStage } from "../services/planView";
+import { EpicTaskCards } from "./EpicTaskCard";
 import { WorkflowLine } from "./WorkflowLine";
 import { FiUsers, FiChevronRight, FiCheck, FiCircle } from "react-icons/fi";
 import { stageMeta, stageLineColor, type WorkflowStageId } from "../engine/workflowStage";
@@ -1776,8 +1775,36 @@ const Card = memo(function Card({
           // "An epic with zero children should say so plainly rather than expanding into nothing."
           <span style={{ color: C.muted, fontSize: 12 }}>Contains no tasks yet</span>
         ))}
+      {/* ── THE EPIC'S TASKS, AS THE SHARED TASK CARDS ────────────────────────────────────────
+          `EpicTaskCards` is the ONE list container for an epic's children, mounted here and on the
+          Epics column's own card. This used to be `BoardView.EpicLiveStatus`, a second copy of the
+          same loop — bead `sparkle-xelans` records that this repo already shipped three
+          incompatible drawings of an epic, so the copy became the shared component rather than a
+          fourth.
+
+          NO `buildAgents` HERE, unlike the detail overlay: this collapsed card resolves no lineage,
+          so there is no wider resolved set to partition and the cards fall back to the workers
+          bound to each task — exactly what this surface has always drawn.
+
+          WHAT THIS BLOCK USED TO BE, kept here because a test still pins its absence: it was headed
+          `Orchestrator  <name | not started>` above a list of the epic's CHILD TASKS. The founder,
+          2026-08-24: *"I think I don't understand what the difference is between tasks and
+          orchestrator. When I see orchestrator, it makes me think of build agents."* He was right
+          and the label was wrong — those rows were never orchestrators. The heading went under bead
+          `sparkle-huw924.9`; `planView.orchestratorNameForEpic` still exists and is still used by
+          the concierge's plan tools, so what was retired is the SUMMARY ROW, not the resolver.
+
+          ONE LEVEL, DELIBERATELY. Direct children only — a task's own sub-tasks are not nested a
+          second time, because an arbitrarily deep tree inside a card is the shape that stops being
+          legible first. Double-clicking a task opens it on its own, which is where its own children
+          belong. */}
       {beadIsEpic && childrenOpen && (
-        <EpicLiveStatus epicId={bead.id} allBeads={allBeads} agents={agents} onOpen={onOpen} />
+        <EpicTaskCards
+          epicId={bead.id}
+          allBeads={allBeads}
+          agents={agents}
+          onOpenTask={onOpen}
+        />
       )}
       {/* The mirror of the pill — from a child you can see the theme it serves, and click through to
           it. Absent for an orphan task: those are normal, not an error state, and must not be
@@ -2021,90 +2048,6 @@ function StartControls({
   );
 }
 
-/**
- * THE EPIC'S TASKS — one TASK CARD per direct child, each owning the build agents on it.
- *
- * ══ WHAT THIS USED TO BE, AND WHY THAT WAS A LIE ══════════════════════════════════════════════
- * It was headed `Orchestrator  <name | not started>` and then listed the epic's CHILD TASKS
- * underneath. The founder, 2026-08-24, reading his own screen: *"I think I don't understand what
- * the difference is between tasks and orchestrator. When I see orchestrator, it makes me think of
- * build agents."* He was right and the label was wrong — the rows under it were never
- * orchestrators, they were tasks, and the SAME six items were simultaneously rendered by the
- * card's truncated `Tasks: … +5 more` lineage row a few pixels above. One list, two headings, one
- * of them false.
- *
- * So the heading is gone (bead sparkle-huw924.9) and the rows became {@link EpicTaskCard}s that
- * carry their agents INSIDE them: EPIC → TASKS → BUILD AGENTS, which is the hierarchy he asked to
- * be the organising principle. `planView.orchestratorNameForEpic` still exists and is still used by
- * the concierge's plan tools — what was retired is this SUMMARY ROW, not the resolver.
- *
- * ══ ONE LEVEL, DELIBERATELY ══════════════════════════════════════════════════════════════════
- * Direct children only. A task's own sub-tasks are not nested a second time here: the point of the
- * card is that an epic's build is legible at a glance, and an arbitrarily deep tree inside a modal
- * is the shape that stops being legible first. Double-clicking a task opens it on its own, which is
- * where its own children belong.
- *
- * ══ WHY THE EXPANDED SET IS LOCAL STATE AND NOT `uiStore` ════════════════════════════════════
- * It resets when the epic card closes, which is the behaviour asked for — "expand it in place,
- * embedded inside the epic" is a reading gesture, not a saved preference. Session persistence is
- * deliberately deferred rather than forgotten; putting it in `uiStore` is the change to make when
- * someone actually wants it to survive a close.
- *
- * Renders nothing until the epic has children (a still-decomposing epic shows the decomposing
- * badge on its board card instead).
- */
-function EpicLiveStatus({
-  epicId,
-  allBeads,
-  agents,
-  onOpen,
-}: {
-  epicId: string;
-  allBeads: Bead[];
-  agents: AgentTab[];
-  /** Open a child's own card. Optional so a read-only mount stays possible. */
-  onOpen?: (b: Bead) => void;
-}) {
-  const rows = epicChildViews(allBeads, agents, epicId);
-  // ONCE FOR THE WHOLE LIST, never per card. `hooks/useEpicHealthOf`'s header states the reason:
-  // `rollupViewFor` buckets every worker by `parentId` on construction, so asking inside
-  // `EpicTaskCard` would rebuild that map once per child on every 5s poll. The hook is called
-  // BEFORE the early return below, because a hook cannot sit after a conditional exit.
-  const beadHealthOf = useBeadHealthOf(agents);
-  const [expandedIds, setExpandedIds] = useState<ReadonlySet<string>>(() => new Set());
-  const toggleExpanded = useCallback((beadId: string) => {
-    setExpandedIds((prev) => {
-      const next = new Set(prev);
-      if (next.has(beadId)) next.delete(beadId);
-      else next.add(beadId);
-      return next;
-    });
-  }, []);
-  if (rows.length === 0) return null;
-  return (
-    <div
-      data-testid="epic-task-cards"
-      style={{ display: "flex", flexDirection: "column", gap: 6 }}
-    >
-      {rows.map((row) => (
-        <EpicTaskCard
-          key={row.bead.id}
-          row={row}
-          agents={agents}
-          /* FINISHED WORK GETS NO MARK — `beadHealthApplies` is where that is decided, the same
-             shape `EpicsColumn` uses for a terminal rung. A closed child sitting under a gray
-             square would read "nobody is working on this", which is true and useless; nothing
-             rendered cannot be mistaken for calm. */
-          health={beadHealthApplies(row.bead.status) ? beadHealthOf(row.bead.id) : null}
-          expanded={expandedIds.has(row.bead.id)}
-          onToggleExpand={toggleExpanded}
-          onOpen={onOpen}
-        />
-      ))}
-    </div>
-  );
-}
-
 function DetailOverlay({
   bead,
   placedIn,
@@ -2147,23 +2090,42 @@ function DetailOverlay({
   // 5s poll. `allBeads` is passed STRAIGHT THROUGH — copying, slicing or re-sorting it first would
   // mint a new identity every render and defeat the cache silently.
   //
-  // ── THE `Tasks:` ROW IS DROPPED ON AN EPIC CARD, AND ONLY THERE ─────────────────────────────
-  // bead sparkle-huw924.9. On an epic card that row was a TRUNCATED SECOND COPY of the very list
-  // `EpicLiveStatus` renders in full below it — the founder saw the same six items twice, once as
-  // `Tasks: <one chip> +5 more` and once under the (mislabelled) Orchestrator heading. Truncating
-  // it is also the thing the card's own body forbids: sparkle-qogah, *"A row carrying an ACTION the
-  // founder owes IS NEVER TRUNCATED, collapsed, or hidden behind a click"*. The task cards below
-  // render every child, un-truncated, so the honest fix is to drop the lossy copy rather than the
-  // complete one.
+  // ── ON AN EPIC CARD, BOTH LINEAGE ROWS COME OFF ─────────────────────────────────────────────
+  // bead sparkle-huw924.9 dropped `Tasks:`; bead sparkle-huw924.10 finishes the pair by dropping
+  // `Build agents:` here too, which is the founder re-asking for the second time: *"I had already
+  // previously asked that the build agents not show outside of the tasks — that the epic will
+  // surface the tasks."*
   //
-  // NON-EPIC CARDS KEEP IT UNCHANGED. A task card has no `EpicLiveStatus` under it, so its `Tasks:`
-  // row is the only place its children are named — removing it there would delete information
-  // instead of a duplicate. The `Build agents:` row survives on both: it is a statement about the
-  // whole epic, which no single task card makes.
-  const lineage = useMemo(() => {
-    const full = beadLineageOf({ beads: allBeads, bead, agents, projectId });
-    return beadIsEpic ? { ...full, tasks: [] } : full;
-  }, [allBeads, bead, agents, projectId, beadIsEpic]);
+  //   • `Tasks:` went because on an epic card it was a TRUNCATED SECOND COPY of the very list
+  //     `EpicTaskCards` renders in full below it — the founder saw the same six items twice, once
+  //     as `Tasks: <one chip> +5 more` and once under the (mislabelled) Orchestrator heading.
+  //     Truncating it is also what the card's own body forbids: sparkle-qogah, *"A row carrying an
+  //     ACTION the founder owes IS NEVER TRUNCATED, collapsed, or hidden behind a click"*.
+  //   • `Build agents:` went because it was the WRONG SHAPE, not merely a duplicate: a flat list
+  //     beside a flat list, *"so nothing tells you WHICH agent is on WHICH task — which is the
+  //     entire question the card should answer."* Every one of those agents is still drawn, now
+  //     inside the task it is bound to, and the ones nothing can attribute land in the fallback
+  //     group — see the `EpicTaskCards` mount below and `planView.groupEpicAgentsByTask`, whose
+  //     contract is that `sum(byTask) + unassigned` IS the resolved set. Nothing vanishes.
+  //
+  // THE EPICS COLUMN'S CARD ALREADY DID EXACTLY THIS (`EpicInlineCard.cardLineage`). This is that
+  // decision reaching the surface it was scoped out of, so the two cards are one treatment.
+  //
+  // NON-EPIC CARDS KEEP BOTH ROWS UNCHANGED. A task card has no `EpicTaskCards` under it, so those
+  // rows are the only place its children and its agents are ever named — removing them there would
+  // delete information rather than a duplicate.
+  //
+  // TWO MEMOS, NOT ONE: the FULL set is what the task cards below partition, so the emptied copy
+  // the card renders can never be the thing that gets grouped. Passing `lineage` there instead
+  // would silently lose every agent, which is the regression this shape exists to make impossible.
+  const fullLineage = useMemo(
+    () => beadLineageOf({ beads: allBeads, bead, agents, projectId }),
+    [allBeads, bead, agents, projectId],
+  );
+  const lineage = useMemo(
+    () => (beadIsEpic ? { ...fullLineage, tasks: [], buildAgents: [] } : fullLineage),
+    [fullLineage, beadIsEpic],
+  );
   // The project's checkout root — every WRITE is addressed by PATH. Looked up here because the
   // overlay only receives a projectId.
   const rootPath = useProjectStore(
@@ -2366,9 +2328,30 @@ function DetailOverlay({
         {/* BOARD-ONLY, and the reason this overlay still exists as more than a frame: the per-child
             stage roll-up for an epic. It is a view of OTHER beads, not of this one, so it is not a
             field the concierge card is missing — it is a different surface that happens to live
-            here. */}
+            here.
+
+            `fullLineage.buildAgents` — the FULL resolved set, NOT the emptied `lineage` one — is
+            what gets partitioned, so nothing the deleted `Build agents:` row used to name can be
+            lost. Agents that match no task on this card render in the fallback group below the
+            cards rather than disappearing; `spawn_build_agent` takes no epic parameter, so an
+            orchestrator is normally bound to no bead at all and that group is where it lives. */}
         {beadIsEpic && (
-          <EpicLiveStatus epicId={bead.id} allBeads={allBeads} agents={agents} onOpen={onOpen} />
+          <EpicTaskCards
+            epicId={bead.id}
+            allBeads={allBeads}
+            agents={agents}
+            buildAgents={fullLineage.buildAgents}
+            onOpenTask={onOpen}
+            /* THE SAME REVEAL THE DELETED ROW CARRIED, chip for chip: *"clicking one jumps to that
+               agent, the same affordance the concierge uses in chat."* `openProjectTab` IS that
+               affordance, and the overlay comes down on a reveal that landed — leaving a modal
+               scrim over the agent the click just jumped to is the dead-click failure. Gated on the
+               return value: `false` means nothing moved, and closing the card would then be the
+               only thing the click did. */
+            onOpenAgent={({ agentId, projectId: pillProjectId }) => {
+              if (openProjectTab(pillProjectId ?? projectId, agentId)) onClose();
+            }}
+          />
         )}
       </div>
     </div>
