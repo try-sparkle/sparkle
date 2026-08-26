@@ -1262,9 +1262,14 @@ describe("AccountsScreen", () => {
     render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
 
     const notice = await screen.findByTestId("account-fork-notice-def");
-    // Both sides are named — a warning that does not say WHICH other account is not actionable.
-    expect(notice.textContent).toContain("someone-else@example.com");
-    expect(notice.textContent).toContain("super@example.com");
+    // PRIVACY (founder directive, 2026-08-25): the fork notice names the account by its NICKNAME and
+    // never spells out a raw email — not the account's own and above all not the base sign-in's,
+    // which may be a DIFFERENT person's login. It is actionable without leaking an address.
+    expect(notice.textContent).toContain("FC Superadmin");
+    expect(notice.textContent).toContain("forked login identity");
+    expect(notice.textContent).not.toContain("@");
+    expect(notice.textContent).not.toContain("someone-else@example.com");
+    expect(notice.textContent).not.toContain("super@example.com");
   });
 
   it("stays quiet when the terminal and the default account agree", async () => {

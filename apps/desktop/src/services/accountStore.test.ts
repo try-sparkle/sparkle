@@ -470,6 +470,45 @@ describe("accountDisplay — the verified email or nothing; the nickname is neve
 describe("accountDisplay — the shell fork (default account only)", () => {
   const DEFAULT = acct("d", { nickname: "DROdio Personal", isDefault: true });
 
+  it("PAIRED: a mixed-identity account produces the warning, a clean one does not (same nickname)", () => {
+    // The whole point of task #4: a forked/mixed-identity account is made VISIBLE. Same DEFAULT
+    // (same nickname) both ways, so the ONLY thing that flips the outcome is the fork itself — not
+    // some incidental difference in the fixture. Mutating `forkNotice` to always return null (or the
+    // old email-spelling copy) breaks exactly one half of this pair.
+    const forked = accountDisplay(
+      DEFAULT,
+      ident("d", { email: "sparkle@x.test", shellEmail: "base@x.test", shellAccountUuid: "u-base" }),
+    );
+    expect(forked.shellForked).toBe(true);
+    const warning = forkNotice(forked);
+    expect(warning).not.toBeNull();
+    expect(warning!).toContain('"DROdio Personal"'); // named by nickname, the user's own label
+    expect(warning!).toContain("forked login identity");
+    expect(warning!).not.toContain("@"); // no email, either side (privacy directive)
+
+    const clean = accountDisplay(
+      DEFAULT,
+      ident("d", { email: "sparkle@x.test", shellEmail: "sparkle@x.test", shellAccountUuid: "u-base" }),
+    );
+    expect(clean.shellForked).toBe(false);
+    expect(forkNotice(clean)).toBeNull(); // no fork → no warning at all
+  });
+
+  it("NEVER leaks an email even when the nickname IS one (the auto-populated production shape)", () => {
+    // roborev 69233/69232 (High): a nickname is ROUTINELY the login email — AccountLimitModal and the
+    // placeholder-completion path both set it to the identity's email, which in the mixed-identity case
+    // may be a DIFFERENT person's address. Naming by such a nickname would spell out the exact email the
+    // directive forbids. forkNotice must degrade an `@`-bearing nickname to the unnamed sentence.
+    const emailNick = acct("d", { nickname: "superadmin@storytell.ai", isDefault: true });
+    const d = accountDisplay(emailNick, ident("d", { shellEmail: "base@x.test", shellAccountUuid: "u-base" }));
+    expect(d.shellForked).toBe(true);
+    const notice = forkNotice(d) ?? "";
+    expect(notice).toContain("forked login identity"); // still warns
+    expect(notice).not.toContain("@"); // …but with NO email, even though the nickname was one
+    expect(notice).not.toContain("superadmin@storytell.ai");
+    expect(notice).not.toContain('("'); // fell back to the unnamed sentence, no quoted name at all
+  });
+
   it("flags the fork when the terminal is signed in as a DIFFERENT anthropic account", () => {
     const d = accountDisplay(
       DEFAULT,
@@ -481,9 +520,16 @@ describe("accountDisplay — the shell fork (default account only)", () => {
       }),
     );
     expect(d.shellForked).toBe(true);
-    expect(forkNotice(d)).toBe(
-      "Sparkle runs this account as drodio@storytell.ai, but Claude's shared base sign-in (~/.claude.json) is currently drodio@gmail.com. This account follows that base login — signing it in as a different account changes this one too.",
-    );
+    const notice = forkNotice(d) ?? "";
+    // PRIVACY (founder directive): the notice must NAME the account by its nickname and NEVER spell
+    // out an email — not Sparkle's own (`drodio@storytell.ai`) and above all not the base sign-in's
+    // (`drodio@gmail.com`), which may be a DIFFERENT person's login. `@` never appears.
+    expect(notice).toContain('"DROdio Personal"');
+    expect(notice).toContain("forked login identity");
+    expect(notice).toContain("Sign this account out and back in");
+    expect(notice).not.toContain("@");
+    expect(notice).not.toContain("drodio@storytell.ai");
+    expect(notice).not.toContain("drodio@gmail.com");
   });
 
   it("does NOT invent a fork when only ONE side records a uuid but the emails match", () => {
@@ -505,9 +551,12 @@ describe("accountDisplay — the shell fork (default account only)", () => {
     // a genuine fork — the failure this PR exists to fix, in the opposite direction.
     const d = accountDisplay(DEFAULT, ident("d", { email: "a@example.com", shellEmail: "b@example.com" }));
     expect(d.shellForked).toBe(true);
-    expect(forkNotice(d)).toBe(
-      "Sparkle runs this account as a@example.com, but Claude's shared base sign-in (~/.claude.json) is currently b@example.com. This account follows that base login — signing it in as a different account changes this one too.",
-    );
+    const notice = forkNotice(d) ?? "";
+    expect(notice).toContain("forked login identity");
+    // Neither the account's own email nor the base sign-in's email may leak.
+    expect(notice).not.toContain("@");
+    expect(notice).not.toContain("a@example.com");
+    expect(notice).not.toContain("b@example.com");
   });
 
   it("never calls a signed-in account 'not signed in' — a uuid with no email is still a login", () => {
@@ -525,11 +574,12 @@ describe("accountDisplay — the shell fork (default account only)", () => {
     expect(d.signedIn).toBe(false); // still no email to PRINT — the slot rule is unchanged
     expect(d.shellForked).toBe(true);
 
-    const notice = forkNotice(d);
+    const notice = forkNotice(d) ?? "";
     expect(notice).not.toContain("isn't signed in");
-    expect(notice).toBe(
-      "Sparkle runs this account as the account Sparkle is signed into, but Claude's shared base sign-in (~/.claude.json) is currently them@example.com. This account follows that base login — signing it in as a different account changes this one too.",
-    );
+    expect(notice).toContain("forked login identity");
+    // A uuid-only login has no email to leak, and the base side's email must not leak either.
+    expect(notice).not.toContain("@");
+    expect(notice).not.toContain("them@example.com");
   });
 
   it("groups two registrations of ONE pre-accountUuid login as duplicates (knightwatch probe 1)", () => {
@@ -745,12 +795,16 @@ describe("accountDisplay — the shell fork (default account only)", () => {
     expect(forkNotice(d)).toBeNull();
   });
 
-  it("names an unverified account by state, not by nickname, in prose", () => {
+  it("the fork notice names the account by nickname and leaks NO email, even when the base has one", () => {
     const d = accountDisplay(DEFAULT, ident("d", { shellEmail: "drodio@gmail.com", shellAccountUuid: "5fb3d67c" }));
     expect(d.shellForked).toBe(true);
     const notice = forkNotice(d) ?? "";
-    expect(notice).not.toContain("DROdio Personal");
-    expect(notice).toContain("drodio@gmail.com");
+    // The account is named by its user-chosen nickname (a label the user picked, not an identity)…
+    expect(notice).toContain('"DROdio Personal"');
+    // …and the base sign-in's real email is NEVER spelled out (founder privacy directive).
+    expect(notice).not.toContain("@");
+    expect(notice).not.toContain("drodio@gmail.com");
+    // `accountSentenceName` (dropdown prose, a DIFFERENT surface) is unchanged: still state, not nickname.
     expect(accountSentenceName(d)).toBe("an account that isn't signed in");
   });
 });
@@ -773,11 +827,11 @@ describe("hasLogin — availability is a WIDER question than 'can I name it'", (
     expect(d.signedIn).toBe(false); // still no email to PRINT — the slot rule is unchanged
     expect(d.shellForked).toBe(true);
 
-    const notice = forkNotice(d);
+    const notice = forkNotice(d) ?? "";
     expect(notice).not.toContain("isn't signed in");
-    expect(notice).toBe(
-      "Sparkle runs this account as the account Sparkle is signed into, but Claude's shared base sign-in (~/.claude.json) is currently them@example.com. This account follows that base login — signing it in as a different account changes this one too.",
-    );
+    expect(notice).toContain("forked login identity");
+    expect(notice).not.toContain("@");
+    expect(notice).not.toContain("them@example.com");
   });
 
   it("keeps calling a genuinely login-less account not signed in", () => {

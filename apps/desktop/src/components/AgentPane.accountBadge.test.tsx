@@ -140,13 +140,19 @@ describe("AccountBadge — the shell fork warning", () => {
     shellEmail: "drodio@gmail.com",
     shellAccountUuid: "5fb3d67c",
   });
+  // PRIVACY (founder directive, 2026-08-25): the fork notice names the account by its NICKNAME and
+  // never spells out a raw email — not the account's own (`drodio@storytell.ai`) and above all not
+  // the base sign-in's (`drodio@gmail.com`), which may be a DIFFERENT person's login.
   const NOTICE =
-    "Sparkle runs this account as drodio@storytell.ai, but Claude's shared base sign-in (~/.claude.json) is currently drodio@gmail.com. This account follows that base login — signing it in as a different account changes this one too.";
+    'This account ("DROdio Personal") has a forked login identity: its config directory currently follows Claude\'s shared base sign-in (~/.claude.json), which holds a different account — so Sparkle may be running it as the wrong identity. Sign this account out and back in to fix it.';
 
   it("says so, in the dropdown and the tooltip, when the terminal is a DIFFERENT login", () => {
     mount([DEFAULT], [FORKED]);
     expect(screen.getByTestId("account-row-fork").textContent).toBe(NOTICE);
     expect(screen.getByRole("button").getAttribute("title")).toContain(NOTICE);
+    // No email leaks in either surface.
+    expect(screen.getByTestId("account-row-fork").textContent).not.toContain("@");
+    expect(screen.getByRole("button").getAttribute("title")).not.toContain("drodio@gmail.com");
   });
 
   it("stays quiet when the terminal is the SAME anthropic account", () => {

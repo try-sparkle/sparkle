@@ -436,16 +436,29 @@ export function clobberedDefaultIds(
  *  default account exports `CLAUDE_CONFIG_DIR=~/.claude` and so reads `~/.claude/.claude.json`
  *  (storytell) — two valid logins in two different files, and nothing said so. We deliberately do
  *  NOT offer to migrate: the Rust guard that refuses to normalize a config dir holding a login is
- *  correct and stays (contract §5). Making the fork VISIBLE is the whole fix. */
+ *  correct and stays (contract §5). Making the fork VISIBLE is the whole fix.
+ *
+ *  PRIVACY (founder directive, 2026-08-25): this notice MUST NOT spell out a raw email. The whole
+ *  point of a forked identity is that the email the dir currently reports is WRONG — it may be a
+ *  DIFFERENT person's login (the founder saw a "storytell two" slot showing a super-admin address),
+ *  so rendering it would be the exact leak this warning exists to stop. Name the account by the
+ *  user's own NICKNAME instead — a label the user chose, never an Anthropic identity — and describe
+ *  the base side generically ("a different account"). No `shellEmail`, no `primary`. This is why it
+ *  no longer routes through `accountSentenceName`, which returns the verified email when there is one.
+ *
+ *  Naming the base file and the consequence is the point — signing the shared base in as someone
+ *  else silently becomes this account's identity too, which is exactly the drift this makes visible. */
 export function forkNotice(display: AccountDisplay): string | null {
   if (!display.shellForked) return null;
-  const sparkleAs = accountSentenceName(display);
-  const shellAs = display.shellEmail ?? "a different account";
-  // NO "terminal": this account follows Claude's SHARED BASE sign-in (~/.claude.json), and the fork
-  // is that Sparkle runs it as one account while that base file currently holds another. Naming the
-  // base file and the consequence is the whole point — signing the base in as someone else silently
-  // becomes this account's identity too, which is exactly the drift this notice exists to make visible.
-  return `Sparkle runs this account as ${sparkleAs}, but Claude's shared base sign-in (~/.claude.json) is currently ${shellAs}. This account follows that base login — signing it in as a different account changes this one too.`;
+  const nick = display.nickname?.trim();
+  // A nickname is ROUTINELY the login email, set automatically: `AccountLimitModal` writes
+  // `adoptionOutcome`'s `nickname: mine.email`, and the placeholder-completion path in AccountsScreen
+  // sets it to `newIdentity.email`. In the mixed-identity case this notice exists for, that stored
+  // address may be a DIFFERENT person's login (the "storytell two" slot showing a super-admin email) —
+  // so an email-shaped nickname is the exact leak we must not print. Enforce the invariant HERE, not
+  // by trusting the caller: an `@`-bearing nickname degrades to the unnamed sentence.
+  const named = nick && !nick.includes("@") ? ` ("${nick}")` : "";
+  return `This account${named} has a forked login identity: its config directory currently follows Claude's shared base sign-in (~/.claude.json), which holds a different account — so Sparkle may be running it as the wrong identity. Sign this account out and back in to fix it.`;
 }
 
 /** How to name an account inside PROSE. {@link NOT_SIGNED_IN} is a slot label, not a name — dropped
