@@ -36,8 +36,7 @@ import {
   snapshotUnchanged,
   COMPARED_BEAD_FIELDS,
   BEADS_BLOCKED_REFRESH_MS,
-  __resetBeadsRefreshInFlightForTest,
-} from "./beadsStore";
+  __resetBeadsRefreshInFlightForTest, beadsReadStartedAt} from "./beadsStore";
 import { useSettingsStore } from "./settingsStore";
 
 function bead(partial: Partial<Bead> & { id: string }): Bead {
@@ -323,6 +322,47 @@ describe("freshness is stamped separately from the snapshot", () => {
     vi.setSystemTime(1_060_000);
     await poll("p1", [bead({ id: "b" })]); // changed — must move
     expect(useBeadsStore.getState().byProject.p1?.loadedAt).toBe(1_060_000);
+  });
+
+  it("THE TWO CLOCKS ARE DIFFERENT INSTANTS: read-START vs read-COMPLETION", async () => {
+    // THE SEAM THIS PINS (bead sparkle-xelans.12, roborev High on 7796817fd). `readStartedAt` is
+    // written by ONE line inside `commitSnapshot`, and every consumer test injects the value through
+    // `__setBeadsReadStartedAtForTest` — so that line was covered by nothing. Two mutants both left
+    // the whole suite green: DELETING it (then `beadsReadStartedAt` is undefined forever, the
+    // ambiguous-create lookup returns early on every tick, and the agent never gets a bead — worse
+    // than the latch the whole chain exists to remove), and swapping `now` for `Date.now()` (which
+    // reinstates the completion stamp and with it the straddling-read defect).
+    //
+    // Driving the REAL `refresh` with the clock advancing MID-READ is what separates them: the
+    // stamp must be the instant the read was claimed, not the instant it committed.
+    vi.useFakeTimers();
+    const T0 = 2_000_000;
+    const T1 = 2_045_000; // a cold `bd list` is measured around this long under lock contention
+    vi.setSystemTime(T0);
+    listBeads.mockImplementationOnce(async () => {
+      vi.setSystemTime(T1); // the read takes 45s and lands in a LATER instant than it started
+      return [bead({ id: "a" })];
+    });
+    await useBeadsStore.getState().refresh("p1", "/proj");
+
+    expect(beadsReadStartedAt("p1")).toBe(T0); // lower bound on the age of the CONTENTS
+    expect(beadsPolledAt("p1")).toBe(T1); // when we last finished READING
+    // And they must not collapse onto each other, which is the whole point of two clocks.
+    expect(beadsReadStartedAt("p1")).not.toBe(beadsPolledAt("p1"));
+  });
+
+  it("a FAILED poll leaves the read-START clock unmoved, like the completion clock", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_000_000);
+    await poll("p1", [bead({ id: "a" })]);
+    expect(beadsReadStartedAt("p1")).toBe(1_000_000);
+
+    vi.setSystemTime(1_030_000);
+    listBeads.mockRejectedValueOnce(new Error("bd blew up"));
+    await useBeadsStore.getState().refresh("p1", "/proj");
+
+    // A read that failed describes no contents, so it may not claim to have seen anything newer.
+    expect(beadsReadStartedAt("p1")).toBe(1_000_000);
   });
 
   it("a FAILED poll does not stamp freshness, so the sweep retries that project", async () => {
