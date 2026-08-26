@@ -21,6 +21,20 @@ describe("paneVisibilityStyle", () => {
     expect(paneVisibilityStyle(true).visibility).toBe("visible");
   });
 
+  // ── AND SHEDS THE HIDDEN PANE'S SUBTREE LAYOUT COST (sparkle-gw36j) ───────────────────────────
+  // `visibility: hidden` keeps the box (good — measurable) but still LAYS OUT the subtree, so all
+  // ~50 backgrounded terminals (mostly on xterm's DOM renderer past MAX_WEBGL_CONTEXTS) take part
+  // in every forced layout — ~0.37 s per layout at 40 panes on the shipped renderer. A hidden pane
+  // must therefore also carry `content-visibility: hidden` so the engine skips its contents' layout
+  // while backgrounded; the active pane must NOT (it renders normally and its fillets/overhang must
+  // paint). The terminal refits on reveal via Terminal.tsx's become-active settle. Real layout perf
+  // is unmeasurable in jsdom (no layout, no content-visibility support) — this asserts the SKIP
+  // SIGNAL the fix applies, which is the property that goes to the DOM.
+  it("skips the hidden pane's subtree layout with content-visibility, and never the active one", () => {
+    expect(paneVisibilityStyle(false).contentVisibility).toBe("hidden");
+    expect(paneVisibilityStyle(true).contentVisibility).toBe("visible");
+  });
+
   it("makes only the active pane interactive so stacked hidden panes never steal clicks", () => {
     expect(paneVisibilityStyle(false).pointerEvents).toBe("none");
     expect(paneVisibilityStyle(true).pointerEvents).toBe("auto");
