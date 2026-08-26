@@ -9,6 +9,7 @@ import {
   neverIdleNudgeText,
   respinFleetNudgeText,
   conciergeNotifyNudgeText,
+  unstaffedEpicAlarmNudgeText,
   _resetImproveNudgeForTests,
   decideImproveNudge,
   improveLastNudgedAt,
@@ -40,6 +41,7 @@ function makeDeps(
     p1PipelineHealthFingerprint: string | null;
     freeSlots: number;
     activeWorkers: number;
+    unstaffedBuildableEpicCount: number;
     sendResult: boolean;
   }> = {},
 ): { deps: ImproveNudgeDeps; sent: string[] } {
@@ -59,6 +61,9 @@ function makeDeps(
     // overrides `activeWorkers: 0` to reach the specific push.
     freeSlots: 4,
     activeWorkers: 2,
+    // DEFAULT: no unstaffed epics, so the base idle-with-backlog case does not take the alarm shape.
+    // The alarm suite overrides `unstaffedBuildableEpicCount` (and keeps freeSlots > 0) to reach it.
+    unstaffedBuildableEpicCount: 0,
     sendResult: true,
     ...overrides,
   };
@@ -77,6 +82,9 @@ function makeDeps(
         p1PipelineHealthFingerprint: o.p1PipelineHealthFingerprint,
       }),
       capacity: () => ({ freeSlots: o.freeSlots, activeWorkers: o.activeWorkers }),
+      unstaffedBuildableEpics: () => ({
+        unstaffedBuildableEpicCount: o.unstaffedBuildableEpicCount,
+      }),
       send: async (text: string) => {
         sent.push(text);
         return o.sendResult;
@@ -408,6 +416,77 @@ describe("sweepImproveNudge — the concierge-notify push (surface a RED pipelin
   });
 });
 
+// ── THE UNSTAFFED-EPIC THREE-ALARM FIRE (bead sparkle-nu7gd9) — the SIDE EFFECT: given idle + flat +
+//    an in_progress buildable epic with no live orchestrator AND admission headroom, the SPECIFIC
+//    "THREE-ALARM FIRE … STAFF it / SURFACE it" push is what actually lands in the inbox, ahead of
+//    every other push. Gated on headroom so it NEVER fires into a saturated machine. ────────────────
+describe("sweepImproveNudge — the unstaffed-epic three-alarm fire", () => {
+  beforeEach(() => _resetImproveNudgeForTests());
+
+  it("idle + flat + an unstaffed buildable epic + admission headroom → sends the three-alarm-fire push", async () => {
+    const sent = await sweepStaleThen(ADVANCE_IDLE_MS, {
+      unstaffedBuildableEpicCount: 3,
+      freeSlots: 5,
+    });
+    expect(sent).toEqual([unstaffedEpicAlarmNudgeText(3, 5)]);
+    // and it is DISTINCT from the generic reminder — the whole point of the push.
+    expect(sent[0]).not.toBe(NEVER_IDLE_NUDGE_TEXT);
+  });
+
+  it("the alarm names the epic count, the free slots, and BOTH the staff and surface actions", async () => {
+    const sent = await sweepStaleThen(ADVANCE_IDLE_MS, {
+      unstaffedBuildableEpicCount: 2,
+      freeSlots: 6,
+    });
+    expect(sent[0]).toContain("2 in_progress epics with children");
+    expect(sent[0]).toContain("6 free agent slots");
+    expect(sent[0]).toContain("STAFF it");
+    expect(sent[0]).toContain("send_peer_message to sparkle:concierge");
+    expect(sent[0]).toContain("NEVER beyond machine headroom");
+  });
+
+  it("PAIRED ABSENCE: same idle-with-headroom setup but NO unstaffed epic → NEVER the alarm (generic instead)", async () => {
+    // Remove only the unstaffed epic. Proves the alarm is caused by the unstaffed epic, not by the
+    // idleness/headroom every path shares — the mechanism, not a precondition.
+    const sent = await sweepStaleThen(ADVANCE_IDLE_MS, {
+      unstaffedBuildableEpicCount: 0,
+      freeSlots: 5,
+      activeWorkers: 2,
+    });
+    expect(sent).toEqual([NEVER_IDLE_NUDGE_TEXT]);
+    expect(sent[0]).not.toBe(unstaffedEpicAlarmNudgeText(0, 5));
+  });
+
+  it("NO admission headroom (machine full) → does NOT fire the alarm even with unstaffed epics (never spawns into a saturated machine)", async () => {
+    // The founder's constraint: escalating into a saturated machine only produces admission refusals.
+    // With freeSlots 0 the alarm must NOT fire; here there is also a red finding, so the concierge-notify
+    // takes over — proving the alarm yielded, not that nudging stopped.
+    const sent = await sweepStaleThen(ADVANCE_IDLE_MS, {
+      unstaffedBuildableEpicCount: 3,
+      freeSlots: 0,
+      activeWorkers: 4,
+      p1PipelineHealth: 1,
+      p1PipelineHealthFingerprint: "ph-1",
+    });
+    expect(sent[0]).not.toBe(unstaffedEpicAlarmNudgeText(3, 0));
+    expect(sent).toEqual([conciergeNotifyNudgeText(1)]);
+  });
+
+  it("PRE-EMPTS the concierge-notify and re-spin pushes: the alarm wins when all three are eligible", async () => {
+    const sent = await sweepStaleThen(ADVANCE_IDLE_MS, {
+      unstaffedBuildableEpicCount: 1,
+      freeSlots: 5,
+      ready: 7,
+      activeWorkers: 0,
+      p1PipelineHealth: 1,
+      p1PipelineHealthFingerprint: "ph-1",
+    });
+    expect(sent).toEqual([unstaffedEpicAlarmNudgeText(1, 5)]);
+    expect(sent[0]).not.toBe(conciergeNotifyNudgeText(1));
+    expect(sent[0]).not.toBe(respinFleetNudgeText(7, 5));
+  });
+});
+
 // ── The pure decision, asserted directly so each guardrail is pinned as arithmetic and the whole
 //    rule is mutation-checkable without spies. `advancedRecently` is a plain boolean here — the
 //    fingerprint→clock derivation is exercised by the sweep tests above. ───────────────────────────
@@ -428,6 +507,7 @@ describe("decideImproveNudge — the idle-and-has-backlog rule", () => {
     conciergeCadenceMs: CONCIERGE_NOTIFY_CADENCE_MS,
     freeSlots: 4,
     activeWorkers: 1,
+    unstaffedBuildableEpicCount: 0,
     lastNudgedAt: null,
     now: 1_000_000,
     cadenceMs: NEVER_IDLE_CADENCE_MS,
@@ -507,6 +587,60 @@ describe("decideImproveNudge — the idle-and-has-backlog rule", () => {
   it("a null fingerprint never takes the concierge-notify shape, even with a positive count (fail-safe)", () => {
     expect(
       decideImproveNudge({ ...base, p1PipelineHealthCount: 1, pipelineHealthFingerprint: null }),
+    ).toEqual({ nudge: true, kind: "generic" });
+  });
+
+  // ── THE UNSTAFFED-EPIC ALARM ARM (bead sparkle-nu7gd9), pinned as arithmetic on the pure decision ──
+  it("returns kind:unstaffed-epic-alarm with the counts when a buildable epic is unstaffed AND there is headroom", () => {
+    expect(
+      decideImproveNudge({ ...base, unstaffedBuildableEpicCount: 3, freeSlots: 5 }),
+    ).toEqual({ nudge: true, kind: "unstaffed-epic-alarm", epicCount: 3, freeSlots: 5 });
+  });
+
+  it("the alarm PRE-EMPTS concierge-notify AND respin when all are eligible (loudest wins)", () => {
+    expect(
+      decideImproveNudge({
+        ...base,
+        unstaffedBuildableEpicCount: 1,
+        freeSlots: 8,
+        readyBacklogCount: 6,
+        activeWorkers: 0,
+        p1PipelineHealthCount: 1,
+        pipelineHealthFingerprint: "ph-1",
+      }),
+    ).toEqual({ nudge: true, kind: "unstaffed-epic-alarm", epicCount: 1, freeSlots: 8 });
+  });
+
+  it("NO headroom (freeSlots 0) → the alarm does NOT fire; it yields to the lower-priority shapes", () => {
+    // The safeguard: never escalate into a saturated machine. With a red finding also present, the
+    // concierge-notify takes over — proving the alarm yielded rather than nudging going silent.
+    expect(
+      decideImproveNudge({
+        ...base,
+        unstaffedBuildableEpicCount: 3,
+        freeSlots: 0,
+        p1PipelineHealthCount: 1,
+        pipelineHealthFingerprint: "ph-1",
+      }),
+    ).toEqual({ nudge: true, kind: "concierge-notify", fingerprint: "ph-1", count: 1 });
+  });
+
+  it("an unstaffed epic with headroom but NO other work still counts as 'there is work' (not no-ready-backlog)", () => {
+    // The alarm's population must not be suppressed by the empty-backlog guard.
+    expect(
+      decideImproveNudge({
+        ...base,
+        readyBacklogCount: 0,
+        p1PipelineHealthCount: 0,
+        unstaffedBuildableEpicCount: 2,
+        freeSlots: 4,
+      }),
+    ).toEqual({ nudge: true, kind: "unstaffed-epic-alarm", epicCount: 2, freeSlots: 4 });
+  });
+
+  it("zero unstaffed epics never takes the alarm shape, even with ample headroom (fail-safe)", () => {
+    expect(
+      decideImproveNudge({ ...base, unstaffedBuildableEpicCount: 0, freeSlots: 9 }),
     ).toEqual({ nudge: true, kind: "generic" });
   });
 

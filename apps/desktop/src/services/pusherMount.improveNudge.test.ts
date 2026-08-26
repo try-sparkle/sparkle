@@ -138,4 +138,82 @@ describe("buildImproveNudgeDeps — the real readers reach the live stores", () 
     expect(got.freeSlots).toBe(cap.limit);
     expect(got.freeSlots).toBeGreaterThan(0);
   });
+
+  // ── THE UNSTAFFED-EPIC READER (bead sparkle-nu7gd9) — proving the REAL reader reaches beads + roster +
+  //    runtime liveness, and reduces "in_progress + has children + no live orchestrator" to a count. A
+  //    constant, a wrong store field, or dropping the liveness check would leave this green while inert.
+  // A child bead `e1.t1` makes `childrenByParent.has("e1")` true, so `e1` reads BUILDABLE.
+  const seedEpicBoard = (beads: Bead[]): void => {
+    const board = emptyBoard();
+    useBeadsStore.setState({ byProject: { [SPARKLE_PROJECT_ID]: { beads, board, loadedAt: 0 } } });
+  };
+  const seedSparkleAgents = (agents: unknown[]): void => {
+    useProjectStore.setState({
+      selectedProjectId: SPARKLE_PROJECT_ID,
+      projects: [{ id: SPARKLE_PROJECT_ID, agents }],
+    } as never);
+  };
+
+  it("counts an in_progress epic that has children but NO bound orchestrator", () => {
+    seedEpicBoard([
+      bead({ id: "e1", type: "epic", status: "in_progress" }),
+      bead({ id: "e1.t1", status: "open" }), // a child → e1 is buildable
+    ]);
+    seedSparkleAgents([]); // nobody bound to e1
+    expect(buildImproveNudgeDeps().unstaffedBuildableEpics()).toEqual({
+      unstaffedBuildableEpicCount: 1,
+    });
+  });
+
+  it("does NOT count it once a LIVE build orchestrator is bound to it (staffed)", () => {
+    seedEpicBoard([
+      bead({ id: "e1", type: "epic", status: "in_progress" }),
+      bead({ id: "e1.t1", status: "open" }),
+    ]);
+    // A bound build agent with no observed status reads as alive (unknown liveness = conservative alive).
+    seedSparkleAgents([{ id: "orch-1", kind: "build", epicId: "e1", runtime: "local" }]);
+    useRuntimeStore.setState({ status: {} });
+    expect(buildImproveNudgeDeps().unstaffedBuildableEpics()).toEqual({
+      unstaffedBuildableEpicCount: 0,
+    });
+  });
+
+  it("DOES count it when the bound orchestrator is observed DEAD — the binding erased/finished-and-gone case", () => {
+    // The founder's actual failure: an epic whose orchestrator finished and went away. A bound agent
+    // observed `done` (a DEAD status) must read UNSTAFFED, not staffed by a stale binding.
+    seedEpicBoard([
+      bead({ id: "e1", type: "epic", status: "in_progress" }),
+      bead({ id: "e1.t1", status: "open" }),
+    ]);
+    seedSparkleAgents([{ id: "orch-1", kind: "build", epicId: "e1", runtime: "local" }]);
+    useRuntimeStore.setState({ status: { "orch-1": "done" } }); // observed dead
+    expect(buildImproveNudgeDeps().unstaffedBuildableEpics()).toEqual({
+      unstaffedBuildableEpicCount: 1,
+    });
+  });
+
+  it("does NOT count a childless (un-decomposed) in_progress epic — not buildable work", () => {
+    seedEpicBoard([bead({ id: "e2", type: "epic", status: "in_progress" })]); // no children
+    seedSparkleAgents([]);
+    expect(buildImproveNudgeDeps().unstaffedBuildableEpics()).toEqual({
+      unstaffedBuildableEpicCount: 0,
+    });
+  });
+
+  it("does NOT count a CLOSED epic with children — its own status is not in_progress", () => {
+    seedEpicBoard([
+      bead({ id: "e3", type: "epic", status: "closed" }),
+      bead({ id: "e3.t1", status: "closed" }),
+    ]);
+    seedSparkleAgents([]);
+    expect(buildImproveNudgeDeps().unstaffedBuildableEpics()).toEqual({
+      unstaffedBuildableEpicCount: 0,
+    });
+  });
+
+  it("returns the fail-safe zero when the sparkle board is unpolled", () => {
+    expect(buildImproveNudgeDeps().unstaffedBuildableEpics()).toEqual({
+      unstaffedBuildableEpicCount: 0,
+    });
+  });
 });

@@ -62,10 +62,16 @@ import {
 } from "./sparkleAgent";
 import { sweepImproveNudge, type ImproveNudgeDeps } from "./improveNudge";
 import { localAgentCapacity } from "./agentCapacity";
+import { epicIndexOf } from "./beads";
+import { boundAgentsFor } from "./epicSweepRunner";
 import { getConfig, onConfigChanged, type BabysitConfigPayload } from "./config";
 import { startConflictFlags } from "./conflictFlags";
 import { startBabysitDispatcher } from "./babysitDispatcher";
-import { currentWindowLabel, ownsProjectInThisWindow } from "./goalContinuationRunner";
+import {
+  currentWindowLabel,
+  ownsProjectInThisWindow,
+  processAliveFor,
+} from "./goalContinuationRunner";
 import { notifyConcierge } from "./conciergeNotifier";
 import { IMPROVEMENT_INTERVAL_MS } from "./improvementPass";
 import {
@@ -320,6 +326,49 @@ function improveLocalCapacity(): { freeSlots: number; activeWorkers: number } {
 }
 
 /**
+ * The THREE-ALARM-FIRE signal (bead sparkle-nu7gd9): how many `in_progress` epics have children (are
+ * buildable) but NO live orchestrator bound. The founder: *"It should be like a three alarm fire when
+ * there is unstaffed work. That is supposed to be actively built."*
+ *
+ * Computed from the SAME three cached stores the epic-sweep engine reads — no `bd` shell call on this
+ * 60s tick — and REUSING that engine's own primitives so the two can never drift about what "bound"
+ * or "alive" means:
+ *   • `epicIndexOf(beads).childrenByParent.has(id)` is the has-children (buildable) test.
+ *   • `boundAgentsFor(agents, id)` is the ONE definition of "which build agents are bound to this epic"
+ *     (`epicSweepRunner`), so an epic reads staffed iff a bound agent is LIVE.
+ *   • `processAliveFor(id, status, openIds)` is the ONE liveness reading (`goalContinuationRunner`);
+ *     `!== false` treats UNKNOWN liveness as alive (the conservative direction — a wrong "dead" would
+ *     manufacture an alarm against an epic somebody is building).
+ * A bound-but-DEAD orchestrator therefore reads UNSTAFFED — which is exactly the founder's measured
+ * failure, an epic whose orchestrator finished and went away leaving the binding erased. Reads 0 when
+ * the board snapshot is not hydrated — the fail-toward-silence direction, matching `improveReadyBacklog`.
+ */
+function improveUnstaffedEpics(): { unstaffedBuildableEpicCount: number } {
+  const snap = useBeadsStore.getState().byProject[SPARKLE_PROJECT_ID];
+  if (snap === undefined) return { unstaffedBuildableEpicCount: 0 };
+  const beads = snap.beads;
+  const agents =
+    useProjectStore.getState().projects.find((p) => p.id === SPARKLE_PROJECT_ID)?.agents ?? [];
+  const rt = useRuntimeStore.getState();
+  const openIds = new Set(rt.openAgentIds);
+  const index = epicIndexOf(beads);
+  let count = 0;
+  for (const b of beads) {
+    // "supposed to be ACTIVELY built" — the epic's own status, stamped once at promote-to-build.
+    if (b.status !== "in_progress") continue;
+    // Buildable = has children. A childless typed epic is an un-decomposed plan, not unstaffed WORK.
+    if (!index.childrenByParent.has(b.id)) continue;
+    // Staffed iff a bound build agent is LIVE. Empty bound, or all bound agents observed dead, ⇒ unstaffed.
+    const orchestratorAlive = boundAgentsFor(agents, b.id).some(
+      (a) => processAliveFor(a.id, rt.status, openIds) !== false,
+    );
+    if (orchestratorAlive) continue;
+    count += 1;
+  }
+  return { unstaffedBuildableEpicCount: count };
+}
+
+/**
  * The never-idle watcher's evidence, bound to the live stores. Resolves THIS window's own Improve
  * Sparkle id the same way the ownership election does (`sparkleAgentIdFor(currentWindowLabel())`) and
  * uses that ONE id for the pane read, the advance read AND the send — so the agent whose idleness is
@@ -337,6 +386,7 @@ export function buildImproveNudgeDeps(): ImproveNudgeDeps {
     advanceFingerprint: () => improveAdvanceFingerprint(improveAgentId()),
     readyBacklog: improveReadyBacklog,
     capacity: improveLocalCapacity,
+    unstaffedBuildableEpics: improveUnstaffedEpics,
     // Reuses `sendVerified`, so the nudge is confirmed to land exactly like a Pusher challenge, and it
     // does NOT append `BLOCKER_ASK` (that is the challenge path's job).
     send: (text) => sendVerified(improveAgentId(), text),

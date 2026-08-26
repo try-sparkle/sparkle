@@ -162,6 +162,48 @@ export function conciergeNotifyNudgeText(p1PipelineHealthCount: number): string 
 }
 
 /**
+ * The SPECIFIC "unstaffed buildable epic" THREE-ALARM FIRE — the fix for bead sparkle-nu7gd9. The
+ * founder: *"It should be like a three alarm fire when there is unstaffed work. That is supposed to be
+ * actively built."* An `in_progress` epic that HAS CHILDREN (is buildable) but has NO live orchestrator
+ * bound is unstaffed work that is supposed to be actively built, and the pusher used to say NOTHING
+ * about it — it nagged individual agents about unlanded branches while thirteen buildable epics sat
+ * with nobody on them. This is the loudest push the watcher emits, and it PRE-EMPTS every other shape.
+ *
+ * ── WHY IT NAMES BOTH STAFF AND SURFACE, AND WHY IT IS GATED ON HEADROOM ──────────────────────────
+ * The founder's own capacity note (in the bead) is that escalation WITHOUT reclamation only produces
+ * refusals: `promote_plan_to_build` was refused mid-sweep with *"29 of 19 agent slots taken … refusing
+ * past 2.0x"*. So the correct response is NOT "spawn harder" into a saturated machine — a louder nudge
+ * there manufactures admission refusals, not staffed epics. This shape therefore fires ONLY when there
+ * is admission headroom (`freeSlots > 0`), and the message it carries does TWO things: (1) STAFF the
+ * epics — bind/promote an orchestrator to each, bounded by the free slots, NEVER beyond machine
+ * headroom; and (2) SURFACE the fact to the concierge (the fleet hub that routes the human fix) so a
+ * human learns unstaffed buildable work is sitting idle. When the machine is full the shape does not
+ * fire and the ordinary cadence resurfaces it once slots free — a persistently-unstaffed epic is not
+ * silenced, it just is not shouted into a machine that cannot admit it.
+ *
+ * Like `respinFleetNudgeText` this carries digits, which is safe for the same reason: `sweepImproveNudge`
+ * sends it directly via `send`, never through the Pusher's challenge path, so `checkCitations` never
+ * sees it. It must not be routed through the challenge path.
+ */
+export function unstaffedEpicAlarmNudgeText(epicCount: number, freeSlots: number): string {
+  const epics =
+    epicCount === 1
+      ? "1 in_progress epic with children has"
+      : `${epicCount} in_progress epics with children have`;
+  const slots = freeSlots === 1 ? "1 free agent slot" : `${freeSlots} free agent slots`;
+  return (
+    `THREE-ALARM FIRE: ${epics} NO live build agent — unstaffed work that is supposed to be actively ` +
+    `built, and the machine has ${slots} to staff it. Do BOTH now, do not reply with a status report, ` +
+    `a plan, or a question: (1) STAFF it — promote/bind an orchestrator to each unstaffed epic, up to ` +
+    `the ${freeSlots} free slots and NEVER beyond machine headroom (spawning into a full machine only ` +
+    `produces admission refusals, which is the failure being corrected). (2) SURFACE it — message the ` +
+    `concierge NOW (send_peer_message to sparkle:concierge) that buildable epics are unstaffed, so the ` +
+    `human learns unstaffed work is sitting idle. Account caps and token cost are NEVER factors; ` +
+    `machine headroom is the only bound.`
+  );
+}
+
+/**
  * How long the SAME still-open red pipeline-health finding waits before the concierge-notify push may
  * repeat. A CHANGED set of red beads (a new finding the concierge has not heard about) fires
  * immediately, subject only to the ordinary nudge cadence; the same unchanged set re-reminds the
@@ -249,6 +291,12 @@ export interface ImproveNudgeInput {
    *  0 the fleet is idle and re-spinning is exactly the action to push; when > 0 workers are already
    *  draining, so no re-spin nudge fires. */
   activeWorkers: number;
+  /** How many `in_progress` epics have children (are buildable) but NO live orchestrator bound — the
+   *  founder's "unstaffed work that is supposed to be actively built" (bead sparkle-nu7gd9). > 0 makes
+   *  the three-alarm-fire push eligible, but ONLY together with `freeSlots > 0`: with no admission
+   *  headroom the alarm does not fire (escalating into a saturated machine only produces admission
+   *  refusals). 0 when unreadable — the fail-toward-silence direction. */
+  unstaffedBuildableEpicCount: number;
   /** When the last nudge was delivered, or `null` if never. */
   lastNudgedAt: number | null;
   now: number;
@@ -259,6 +307,7 @@ export type ImproveNudgeDecision =
   | { nudge: true; kind: "generic" }
   | { nudge: true; kind: "respin"; readyCount: number; freeSlots: number }
   | { nudge: true; kind: "concierge-notify"; fingerprint: string; count: number }
+  | { nudge: true; kind: "unstaffed-epic-alarm"; epicCount: number; freeSlots: number }
   | { nudge: false; reason: ImproveNudgeRefusal };
 
 export type ImproveNudgeRefusal =
@@ -286,6 +335,14 @@ export type ImproveNudgeRefusal =
  *
  * On a `nudge` verdict it chooses the SHAPE of the push, in priority order:
  *
+ *   0. `unstaffed-epic-alarm` (bead sparkle-nu7gd9) — an `in_progress` epic with children (buildable)
+ *      has NO live orchestrator AND the machine has admission headroom (`freeSlots > 0`). This is the
+ *      LOUDEST push — a three-alarm fire — and PRE-EMPTS every shape below: the founder wants unstaffed
+ *      buildable work surfaced and staffed, not silently ignored. It is gated on `freeSlots > 0` on
+ *      purpose: escalating into a saturated machine only produces admission refusals ("29 of 19 slots
+ *      taken"), so with no headroom the alarm does not fire and the ordinary cadence resurfaces it once
+ *      slots free. `unstaffedBuildableEpicCount === 0` (staffed, or no buildable epics, or unreadable)
+ *      can never take this shape.
  *   1. `concierge-notify` — an OPEN P1 pipeline-health bead exists (a RED fleet signal a human must
  *      unblock) that the concierge has not been told about this window. This PRE-EMPTS re-spin and the
  *      generic reminder: the founder wants a red signal SURFACED to the concierge (the fleet hub, which
@@ -307,7 +364,11 @@ export function decideImproveNudge(input: ImproveNudgeInput): ImproveNudgeDecisi
     return { nudge: false, reason: "not-idle" };
   }
   if (input.advancedRecently) return { nudge: false, reason: "advanced-recently" };
-  if (input.readyBacklogCount <= 0 && input.p1PipelineHealthCount <= 0) {
+  if (
+    input.readyBacklogCount <= 0 &&
+    input.p1PipelineHealthCount <= 0 &&
+    input.unstaffedBuildableEpicCount <= 0
+  ) {
     return { nudge: false, reason: "no-ready-backlog" };
   }
   if (input.lastNudgedAt !== null && input.now - input.lastNudgedAt < input.cadenceMs) {
@@ -315,8 +376,25 @@ export function decideImproveNudge(input: ImproveNudgeInput): ImproveNudgeDecisi
   }
   // Idle, with work, past the cadence. Choose the shape.
   //
-  // HIGHEST PRIORITY: a RED pipeline-health finding the concierge has not been told about. This is the
-  // fleet's most urgent signal — an open P1 pipeline-health bead needs a HUMAN to unblock it — so the
+  // HIGHEST PRIORITY — the three-alarm fire (bead sparkle-nu7gd9): an in_progress epic with children
+  // and no live orchestrator is unstaffed work that is supposed to be actively built. It PRE-EMPTS the
+  // concierge-notify, re-spin and generic pushes. But it fires ONLY with admission headroom
+  // (`freeSlots > 0`): the founder's measured failure was escalation INTO a saturated machine producing
+  // admission refusals ("29 of 19 slots taken"), so with no headroom this shape does not fire — a
+  // louder nudge could not admit a new orchestrator and would only manufacture refusals. The
+  // staffing/surface push then waits for the ordinary cadence to resurface it once slots free.
+  if (input.unstaffedBuildableEpicCount > 0 && input.freeSlots > 0) {
+    return {
+      nudge: true,
+      kind: "unstaffed-epic-alarm",
+      epicCount: input.unstaffedBuildableEpicCount,
+      freeSlots: input.freeSlots,
+    };
+  }
+  //
+  // SECOND PRIORITY (below the unstaffed-epic alarm above): a RED pipeline-health finding the concierge
+  // has not been told about. This is the fleet's most urgent HUMAN-unblock signal — an open P1
+  // pipeline-health bead needs a HUMAN to unblock it — so the
   // founder wants it surfaced to the concierge hub, ahead of any drain-fleet re-spin or generic
   // reminder. Deduped per distinct set of red beads: a changed fingerprint (a new finding) fires now,
   // an unchanged one re-fires only once `conciergeCadenceMs` has elapsed. A `null` fingerprint (no red
@@ -372,6 +450,10 @@ export interface ImproveNudgeDeps {
    *  headroom (`localAgentCapacity` `limit − used`, clamped ≥ 0) and `activeWorkers` is how many
    *  local drain workers are occupying slots right now. */
   capacity(): { freeSlots: number; activeWorkers: number };
+  /** How many `in_progress` epics have children (are buildable) but NO live orchestrator bound — the
+   *  three-alarm-fire signal (bead sparkle-nu7gd9). Read from the cached beads board + agent roster +
+   *  runtime liveness, no `bd` shell call. 0 when unreadable (the fail-toward-silence direction). */
+  unstaffedBuildableEpics(): { unstaffedBuildableEpicCount: number };
   /** Deliver the nudge to the improve agent's inbox; returns whether delivery was CONFIRMED. */
   send(text: string): Promise<boolean>;
 }
@@ -479,6 +561,7 @@ export async function sweepImproveNudge(deps: ImproveNudgeDeps): Promise<Improve
     if (advancedRecently) consecutiveIdleNudges = 0;
     const backlog = deps.readyBacklog();
     const capacity = deps.capacity();
+    const unstaffed = deps.unstaffedBuildableEpics();
     const decision = decideImproveNudge({
       armed: deps.armed(),
       ownsProject: deps.ownsProject(),
@@ -493,6 +576,7 @@ export async function sweepImproveNudge(deps: ImproveNudgeDeps): Promise<Improve
       conciergeCadenceMs: CONCIERGE_NOTIFY_CADENCE_MS,
       freeSlots: capacity.freeSlots,
       activeWorkers: capacity.activeWorkers,
+      unstaffedBuildableEpicCount: unstaffed.unstaffedBuildableEpicCount,
       lastNudgedAt,
       now,
       cadenceMs: NEVER_IDLE_CADENCE_MS,
@@ -505,18 +589,23 @@ export async function sweepImproveNudge(deps: ImproveNudgeDeps): Promise<Improve
     // send is in flight. A private `sending` flag here would be redundant with that and, worse, would
     // stay latched forever if a send never settled — permanently, silently disabling the watcher
     // (roborev 66023). The one serializer is the Pusher's.
-    // SELECT THE MESSAGE by the decided shape. A `respin` verdict (idle + ready backlog + free slots +
-    // zero active workers) sends the specific, digit-carrying "spin a drain fleet NOW" push naming the
-    // numbers (bead sparkle-4hwu2i). Otherwise the generic INTAKE→PULL reminder, which ESCALATES by the
+    // SELECT THE MESSAGE by the decided shape. An `unstaffed-epic-alarm` verdict (an in_progress epic
+    // with children and no live orchestrator, WITH admission headroom) sends the loudest push — the
+    // three-alarm fire naming the epic count and free slots (bead sparkle-nu7gd9). A `respin` verdict
+    // (idle + ready backlog + free slots + zero active workers) sends the specific, digit-carrying
+    // "spin a drain fleet NOW" push naming the numbers (bead sparkle-4hwu2i). Otherwise the generic
+    // INTAKE→PULL reminder, which ESCALATES by the
     // streak so far: `consecutiveIdleNudges` counts prior deliveries WITHOUT an advance, so the text
     // hardens the more the agent answers the nudge instead of shipping. Keyed on the advance
     // fingerprint (what the agent DID), so a reworded deferral cannot dodge it.
     const text =
-      decision.kind === "respin"
-        ? respinFleetNudgeText(decision.readyCount, decision.freeSlots)
-        : decision.kind === "concierge-notify"
-          ? conciergeNotifyNudgeText(decision.count)
-          : neverIdleNudgeText(consecutiveIdleNudges);
+      decision.kind === "unstaffed-epic-alarm"
+        ? unstaffedEpicAlarmNudgeText(decision.epicCount, decision.freeSlots)
+        : decision.kind === "respin"
+          ? respinFleetNudgeText(decision.readyCount, decision.freeSlots)
+          : decision.kind === "concierge-notify"
+            ? conciergeNotifyNudgeText(decision.count)
+            : neverIdleNudgeText(consecutiveIdleNudges);
     const delivered = await deps.send(text);
     if (delivered) {
       lastNudgedAt = now;
