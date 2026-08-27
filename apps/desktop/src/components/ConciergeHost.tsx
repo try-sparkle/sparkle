@@ -339,7 +339,7 @@ import { useMountedNotice } from "../hooks/useMountedNotice";
 import { useScreenHoldDrain } from "../hooks/useScreenHoldDrain";
 import { buildDigest, type DigestReadiness } from "../services/conciergeDigest";
 import { usePrReadinessStore } from "../stores/prReadinessStore";
-import { isSparkleAgentId, SPARKLE_AGENT_NAME } from "../services/sparkleAgent";
+import { isSparkleAgentId, SPARKLE_AGENT_DISPLAY_NAME } from "../services/sparkleAgent";
 import {
   agentTranscriptWorktree,
   subscribeAgentTranscriptWorktrees,
@@ -1457,7 +1457,8 @@ export function ConciergeHost({
   // not see it, which is the mount lying about where he is.
   //
   // TWO FACTS, FROM THE TWO PLACES THAT HOLD THEM, rather than a synthesized `AgentTab`: the NAME is
-  // a constant (`SPARKLE_AGENT_NAME`), and the WORKTREE is what `SparkleAgentPane.prepare()` writes
+  // a constant (`SPARKLE_AGENT_DISPLAY_NAME` — see the lookup below for which of the two, and why it
+  // is not a free choice), and the WORKTREE is what `SparkleAgentPane.prepare()` writes
   // to the transcript registry — the same worktree the concierge's own read chain resolves this
   // agent's transcript from (services/sparkleTranscript tier (d)). Faking a row would put a second,
   // partial answer to "what is this agent" in a file that already has one.
@@ -1477,7 +1478,27 @@ export function ConciergeHost({
         if (mountedRow) return { name: mountedRow.name, projectId: mountedProjectId ?? "" };
         // `projectId: ""` for the app-owned agent, exactly as `Workspace`'s `sparkleTarget` writes it
         // — it owns no project row, and the dispatcher keys a PTY by agent id.
-        if (isSparkleAgentId(id)) return { name: SPARKLE_AGENT_NAME, projectId: "" };
+        //
+        // ══ …AND `SPARKLE_AGENT_DISPLAY_NAME`, WHICH IS NOT INTERCHANGEABLE WITH THE OTHER ONE ═══
+        // This agent has two names and both are deliberate: `SPARKLE_AGENT_NAME` ("Sparkle") is the
+        // @-MENTION HANDLE, and `SPARKLE_AGENT_DISPLAY_NAME` ("Improve Sparkle") is what the sidebar
+        // row and `get_state`'s roster call it. This line returned the handle, and the handle is the
+        // wrong kind of name for it: the object built here is the only thing this window has to NAME
+        // that far end with, and it feeds two surfaces that a human reads —
+        //
+        //   • the chip, via `mountedName` → `mountedAgent` → ConciergeColumn's "Chatting with ● …"
+        //   • the send receipt, via `mountTarget` → `submitted` → `aim` → `setReceipt`'s `agentName`
+        //
+        // — so both said "Sparkle" while the row two inches away said "Improve Sparkle". DROdio, on
+        // the receipt: *"why does it say sparkle and not improve sparkle in the sent to slot?"* (bead
+        // sparkle-w3yxlo).
+        //
+        // THE RECEIPT CANNOT REPAIR THIS DOWNSTREAM, which is why the fix has to be here. `AgentPill`
+        // prefers the LIVE roster over the name a receipt was written with — but that roster is
+        // `projectStore`'s agents, and `services/knownAgents` is explicit that this agent is never
+        // admitted to it. The id misses, the pill falls back to the remembered name, and the name it
+        // remembers is whatever this line put in the target.
+        if (isSparkleAgentId(id)) return { name: SPARKLE_AGENT_DISPLAY_NAME, projectId: "" };
         return undefined;
       }),
     [cableWired, cablePin, mountedRow, mountedProjectId],
@@ -6180,14 +6201,20 @@ export function ConciergeHost({
       // receipt for a diversion he chose, and it is exactly as true unmounted, where the name is
       // simply absent.
       //
-      // …EXCEPT WHEN THE MOUNT IS THE APP-OWNED SPARKLE AGENT, WHOSE NAME IS "Sparkle" (roborev
-      // 59097). `mountedName` falls back to `SPARKLE_AGENT_NAME` for that row, so the named form
-      // rendered `Asked Sparkle — not Sparkle.` — and it rendered it in the LIKELIEST case, since a
-      // leading `@Sparkle` is now the only way to reach this line while mounted and it is exactly
-      // what someone mounted to an agent called "Sparkle" types. A line whose whole job is to
-      // separate "the brain got it" from "your agent did not" must not collapse into a
-      // contradiction when the two share a name; the unnamed form is the honest one there, and it
-      // is the fallback that already exists.
+      // …AND IT NAMES THE APP-OWNED SPARKLE AGENT TOO, WHICH IT COULD NOT DO UNTIL NOW. This used to
+      // carve that one mount out (roborev 59097) and fall back to the unnamed form. The carve-out was
+      // right at the time and is not any more, and the difference is upstream: `mountedName` resolved
+      // that row to `SPARKLE_AGENT_NAME`, so the named form rendered `Asked Sparkle — not Sparkle.` —
+      // a self-contradiction, in the LIKELIEST case, since a leading `@Sparkle` is the only way to
+      // reach this line while mounted and it is exactly what someone mounted to an agent called
+      // "Sparkle" types. A line whose whole job is to separate "the brain got it" from "your agent
+      // did not" must not collapse when the two share a name.
+      //
+      // They no longer share one: the mount resolves to `SPARKLE_AGENT_DISPLAY_NAME` (bead
+      // sparkle-w3yxlo), so the sentence reads `Asked Sparkle — not Improve Sparkle.` — two names for
+      // two different things, which is what it was always trying to say. DROdio chose the named form
+      // over keeping the carve-out. The unnamed fallback below is NOT dead: it still serves every
+      // mount this window cannot name.
       //
       // ══ AND IT NAMES BOTH KEYS, FOR THE REASON ConciergeColumn'S HINT DOES (bead sparkle-thm9o) ══
       // This is the other on-screen affordance telling the user how to get out of a mount, and it
@@ -6200,8 +6227,7 @@ export function ConciergeHost({
       // Drawn from the LIVE binding, not a hard-coded "⌘⇧U": `unmountCable` is rebindable in
       // ⋯ Settings → Shortcuts. Read through `getState()` — this runs inside a send callback.
       if (displayMountedRef.current && !notedThisSend) {
-        const mounted = displayMountedRef.current;
-        const held = isSparkleAgentId(mounted) ? undefined : displayMountedNameRef.current;
+        const held = displayMountedNameRef.current;
         const keys = `Esc or ${formatBinding(useKeybindingsStore.getState().bindings.unmountCable)}`;
         noteMounted(
           held

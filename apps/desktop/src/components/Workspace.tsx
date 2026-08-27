@@ -57,7 +57,7 @@ import {
   shouldWarmSparkleAtLaunch,
   sparkleAgentIdFor,
   sparkleOpenSetWhitelist,
-  SPARKLE_AGENT_NAME,
+  SPARKLE_AGENT_DISPLAY_NAME,
 } from "../services/sparkleAgent";
 import {
   useCurrentProjectId,
@@ -1577,10 +1577,22 @@ export function Workspace() {
   // case here; `decidePromptTarget` cannot resolve it through the roster lookup. `projectId` is ""
   // — the dispatcher keys a PTY by agent id ("PTY id === agent id", services/conciergeDispatch), and
   // this agent owns no project row.
+  //
+  // ══ AND THE NAME IS THE ROW'S, NOT THE @-MENTION HANDLE (bead sparkle-w3yxlo) ═══════════════════
+  // `ConciergeHost` writes its send receipt from this object's `name` (`aim.name` → `setReceipt`), so
+  // this string IS the "Sent to:" slot in the concierge thread. It used to be `SPARKLE_AGENT_NAME`
+  // ("Sparkle"), the @-mention handle, which made the receipt read `Sent to: @Sparkle` while the
+  // sidebar row beside it read "Improve Sparkle" — DROdio's report. `SPARKLE_AGENT_DISPLAY_NAME` is
+  // the name every surface that NAMES this agent to a human uses (the row, `get_state`'s roster, and
+  // `ConciergeHost`'s own mount lookup, fixed in the same change).
+  //
+  // TWO PRODUCERS, ONE LABEL, and this is the half a fix to the host alone would have missed: the
+  // MOUNTED path (cable patched at `__sparkle_self__`) is named by the host and ignores this object,
+  // while THIS path — the pane owning the shell with nothing mounted — is named entirely from here.
   const sparkleTarget = useMemo(
     () =>
       activeSpecial === "sparkle"
-        ? { projectId: "", agentId: sparkleAgentId, name: SPARKLE_AGENT_NAME }
+        ? { projectId: "", agentId: sparkleAgentId, name: SPARKLE_AGENT_DISPLAY_NAME }
         : null,
     [activeSpecial, sparkleAgentId],
   );

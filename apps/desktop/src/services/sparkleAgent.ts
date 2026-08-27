@@ -13,8 +13,14 @@ import { retroEmissionProtocol } from "./buildAgent";
  *  normal agents but is never part of any project's `agents` array — the double-underscore
  *  namespace keeps it from ever colliding with a real UUID. */
 export const SPARKLE_AGENT_ID = "__sparkle_self__";
-/** THE MENTION HANDLE — what a human types after `@` to address this agent, and what the mounted
- *  pane's chip falls back to. Deliberately the short form; see Concierge/mentions. */
+/** THE MENTION HANDLE — what a human types after `@` to address this agent. Deliberately the short
+ *  form; see Concierge/mentions.
+ *
+ *  NOT A DISPLAY NAME, and this doc comment used to say the mounted pane's chip fell back to it,
+ *  which was a true description of a bug: the chip and the concierge's send receipt both named this
+ *  agent "Sparkle" while the sidebar row named it "Improve Sparkle" (bead sparkle-w3yxlo). Anything
+ *  that NAMES this agent to a human takes `SPARKLE_AGENT_DISPLAY_NAME` below; this constant is for
+ *  ADDRESSING it. */
 export const SPARKLE_AGENT_NAME = "Sparkle";
 /** WHAT THE ROW ON SCREEN CALLS ITSELF, and therefore what any surface NAMING this agent to a human
  *  or to a model must use — the sidebar row, and `get_state`'s roster.

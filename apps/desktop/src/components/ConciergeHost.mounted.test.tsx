@@ -223,7 +223,12 @@ import { CONCIERGE_CHATTING_WITH_TESTID } from "./Concierge/ConciergeColumn";
 import { MOUNTED_THREAD_TESTID } from "./Concierge/MountedAgentThread";
 import { MOUNTED_NOTICE_TESTID } from "./Concierge/MountedNotice";
 import { CONCIERGE_THREAD_TESTID } from "../engine/composeBoxHeight";
-import { SPARKLE_AGENT_ID, SPARKLE_AGENT_NAME } from "../services/sparkleAgent";
+import { SENT_TO_AGENT_TESTID } from "./Concierge/SentToAgentRow";
+import {
+  SPARKLE_AGENT_DISPLAY_NAME,
+  SPARKLE_AGENT_ID,
+  SPARKLE_AGENT_NAME,
+} from "../services/sparkleAgent";
 import { SHORTCUT_DEFAULTS, useKeybindingsStore } from "../stores/keybindingsStore";
 import { formatBinding } from "../keyboardHints/keybindings";
 
@@ -416,7 +421,14 @@ function mount() {
 
 /** The APP-OWNED Improve-Sparkle agent as the SELECTED row. Real constants, imported rather than
  *  spelled out, because the bug is a consequence of those exact values: `isSparkleAgentId` matches
- *  the id, and the name is the literal "Sparkle". */
+ *  the id, and the name is the literal "Sparkle".
+ *
+ *  ══ THE NAME HERE IS DELIBERATELY THE *SHORT* ONE, AND MUST STAY THAT WAY ══════════════════════
+ *  `Workspace`'s `sparkleTarget` now hands down `SPARKLE_AGENT_DISPLAY_NAME` (bead sparkle-w3yxlo),
+ *  so as a model of production this fixture is one word behind on purpose. It is the ADVERSARIAL
+ *  value: every row below asserts that the column calls this agent "Improve Sparkle", and the host
+ *  must reach that name through its own mount lookup rather than by copying the prop. Spell the long
+ *  name here and those rows go green against a host that resolves nothing at all. */
 const SPARKLE_TARGET: ConciergePromptTarget = {
   projectId: "sparkle-self",
   agentId: SPARKLE_AGENT_ID,
@@ -1875,23 +1887,34 @@ describe("ConciergeHost — a plain mounted send goes to the mounted agent, alwa
     expect(notice().textContent).toContain("Blueprint UI/UX");
   });
 
-  // ══ …BUT NOT WHEN THE MOUNT IS THE AGENT *CALLED* "Sparkle" (roborev 59097) ════════════════════
-  // `mountedName` falls back to SPARKLE_AGENT_NAME for the app-owned Improve-Sparkle row, so the
-  // named form rendered `Asked Sparkle — not Sparkle.` — a self-contradiction, and in the LIKELIEST
-  // case: a leading `@Sparkle` is the only way to reach this line while mounted, and it is exactly
-  // what someone mounted to an agent named "Sparkle" types. This also covers the `held === undefined`
-  // fallback branch, which no other row exercises.
-  it("does not say 'not Sparkle' when the mount IS the Sparkle agent", async () => {
+  // ══ …AND IT NAMES THE APP-OWNED ONE TOO, NOW THAT THE TWO NAMES NO LONGER COLLIDE ═════════════
+  // This row used to assert the OPPOSITE — that the name was SUPPRESSED for this one mount (roborev
+  // 59097). That suppression was right for exactly as long as `mountedName` resolved this row to
+  // `SPARKLE_AGENT_NAME`: the named form rendered `Asked Sparkle — not Sparkle.`, a
+  // self-contradiction, and it rendered it in the LIKELIEST case, since a leading `@Sparkle` is the
+  // only way to reach this line while mounted and it is exactly what someone mounted to an agent
+  // called "Sparkle" types.
+  //
+  // The mount now resolves to `SPARKLE_AGENT_DISPLAY_NAME` (bead sparkle-w3yxlo), so the collision is
+  // gone and the informative form is the honest one — DROdio's call, asked before the change landed.
+  // The two halves of the sentence name two different things and now SAY two different things:
+  // "Sparkle" is the concierge that took the message, "Improve Sparkle" is the agent that did not.
+  it("says 'not Improve Sparkle' when the mount IS the app-owned Sparkle agent", async () => {
     wireCableTo(SPARKLE_TARGET);
     render(<ConciergeHost feed={FEED} promptTarget={SPARKLE_TARGET} promptTargetShown={false} />);
     await send("@Sparkle what is the status of the build?");
     await elapse();
     await waitFor(() => expect(notice().textContent).toContain("Asked Sparkle"));
-    expect(notice().textContent).not.toContain("not Sparkle");
-    // The unnamed fallback, whole — so a future edit cannot satisfy this row by dropping the
-    // sentence that tells him where the reply is.
+    expect(notice().textContent).toContain(`not ${SPARKLE_AGENT_DISPLAY_NAME}`);
+    // THE CONTRADICTION STAYS UNREACHABLE. `not Sparkle.` — with the full stop — is what the pre-fix
+    // build printed here, and it is a substring of neither the new sentence nor any correct one. So
+    // this row still reds for the ORIGINAL defect even though it no longer asserts suppression.
+    expect(notice().textContent).not.toContain("not Sparkle.");
+    // The way out, whole — so a future edit cannot satisfy the lines above by dropping the sentence
+    // that tells him where the reply is. Capitalised: this is the NAMED branch, which starts the
+    // sentence, where the unnamed fallback continues one.
     expect(notice().textContent).toContain(
-      `press Esc or ${formatBinding(SHORTCUT_DEFAULTS.unmountCable)} to unmount and read the reply`,
+      `Press Esc or ${formatBinding(SHORTCUT_DEFAULTS.unmountCable)} to unmount and read the reply`,
     );
   });
 
@@ -1927,5 +1950,72 @@ describe("ConciergeHost — a plain mounted send goes to the mounted agent, alwa
     await send("move the button 5px left");
     await elapse();
     expect(h.dispatchConciergeAnswer).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ══ THE APP-OWNED AGENT IS CALLED WHAT THE ROW CALLS IT — ON BOTH SURFACES (bead sparkle-w3yxlo) ══
+//
+// DROdio, verbatim: *"you can see it says the message was 'Sent to: @Sparkle' … So it looks like the
+// message was sent to '@Improve Sparkle' So then why does it say sparkle and not improve sparkle in
+// the sent to slot?"*
+//
+// NOTHING WAS MISROUTED — this was only ever a label. The host's mount lookup returned
+// `SPARKLE_AGENT_NAME`, the @-MENTION HANDLE, where the sidebar row and `get_state`'s roster both use
+// `SPARKLE_AGENT_DISPLAY_NAME`. One resolution feeds two surfaces, so both read wrong together: the
+// chip he was looking at said "Chatting with ● Sparkle" while the row two inches away said "Improve
+// Sparkle".
+//
+// ══ WHY THE PILL CANNOT SELF-CORRECT, AND THEREFORE WHY THIS IS A HOST TEST ═══════════════════════
+// `AgentPill` prefers the LIVE roster over the receipt's remembered name — but that roster is
+// `projectStore`'s agents, and `services/knownAgents` is explicit that the app-owned agent is
+// deliberately never admitted to it. So the id misses, the pill falls back to whatever name the
+// receipt was written with, and the only place that can be fixed is where the receipt is written.
+//
+// ══ THE RECEIPT IS ASSERTED AFTER UNMOUNTING, WHICH IS ALSO HOW HE SAW IT ═════════════════════════
+// A mounted column does not render `ConciergeThread`, so the receipt is not on screen while the
+// message is being sent; it becomes visible when the cable is unplugged and the concierge thread
+// comes back — exactly the screenshot he sent. Asserting it under the mount would be asserting a
+// surface that is not there.
+describe("ConciergeHost — the app-owned Sparkle agent is named 'Improve Sparkle'", () => {
+  it("draws the chip with the DISPLAY name, not the @-mention handle", () => {
+    wireCableTo(SPARKLE_TARGET);
+    render(<ConciergeHost feed={FEED} promptTarget={SPARKLE_TARGET} promptTargetShown={false} />);
+    const chip = screen.getByTestId(CONCIERGE_CHATTING_WITH_TESTID).textContent ?? "";
+    // THE CONTAINMENT RUNS THE SAFE WAY ROUND, which is why one assertion is enough here. The pre-fix
+    // chip rendered "Chatting withSparkle" — measured — and "Improve Sparkle" is NOT a substring of
+    // it, so this reds for the defect. (The vacuous direction is the mirror image: a row asserting
+    // `toContain("Sparkle")` would pass against BOTH builds, and there is deliberately no such line.)
+    expect(chip).toContain(SPARKLE_AGENT_DISPLAY_NAME);
+  });
+
+  it("writes the send receipt with the DISPLAY name — DROdio's 'Sent to:' slot", async () => {
+    wireCableTo(SPARKLE_TARGET);
+    const view = render(
+      <ConciergeHost feed={FEED} promptTarget={SPARKLE_TARGET} promptTargetShown={false} />,
+    );
+    await send("why do you have 50 queued messages?");
+    await elapse();
+    // It really went to that agent's terminal. Asserting the label alone would pass for a build that
+    // renamed the receipt and stopped delivering.
+    expect(h.dispatchConciergeAnswer).toHaveBeenCalledTimes(1);
+    expect(h.dispatchConciergeAnswer.mock.calls[0]![0]).toBe(SPARKLE_AGENT_ID);
+    // HE UNPLUGS, and both halves of "unplugged" have to move — they are two different facts in this
+    // file. `useCableStore` is the ROUTING mount; `useEffectiveWired` is the DRAWING projection the
+    // column reads (ConciergeHost's own comment: it "says 'off' for states the cable is very much
+    // patched in"). `ConciergeMessageRow` gates the "Sent to:" row on the DRAWING one — a mounted
+    // column hides its thread, so the receipt is not on screen while the message is being sent and
+    // becomes visible when the thread comes back. That is the screenshot DROdio sent.
+    h.wired.mockReturnValue("off");
+    act(() => {
+      useCableStore.getState().unbind();
+    });
+    view.rerender(
+      <ConciergeHost feed={FEED} promptTarget={SPARKLE_TARGET} promptTargetShown={false} />,
+    );
+    const sentTo = await screen.findByTestId(SENT_TO_AGENT_TESTID);
+    expect(sentTo.textContent).toContain(SPARKLE_AGENT_DISPLAY_NAME);
+    // The pre-fix rendering, whole: `AgentPill` prefixes "@" and the roster lookup misses, so the
+    // slot read exactly "@Sparkle". "@Improve Sparkle" does not contain it.
+    expect(sentTo.textContent).not.toContain("@Sparkle");
   });
 });
