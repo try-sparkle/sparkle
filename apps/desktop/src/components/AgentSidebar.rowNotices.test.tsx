@@ -76,6 +76,7 @@ import { useBeadsStore } from "../stores/beadsStore";
 import { useHelperPrefs } from "../helper/helperPrefs";
 import { allBandsVisible } from "../engine/buildSections";
 import { noteThrashEvent, resetThrashTracking } from "../engine/agentThrash";
+import { __setAuthRecoveryDeps, pollNudgeFlags } from "../services/authRecovery";
 import type { AgentTab, AgentTabStatus, Project } from "../types";
 import type { Bead, Board } from "../services/beads";
 import type { WorkflowStageId } from "../engine/workflowStage";
@@ -612,5 +613,62 @@ describe("stageChipShows — the narrow-column rule, as a pure predicate", () =>
     // 0 is "no ResizeObserver callback has landed", not "a zero-width column". Booting into the
     // hidden state and revealing the chip a frame later is a visible flicker down the whole column.
     expect(stageChipShows(0)).toBe(true);
+  });
+});
+
+// ── THE ROW HALF OF BEAD sparkle-qg71dl ───────────────────────────────────────────────────────────
+//
+// The composer's pill row carries the WORDS, and `Concierge/MountedAgentNotices.test.tsx` pins that.
+// But the founder is scanning THIS surface, and a fact that only exists once he has already mounted
+// the agent has not reached him — mounting is the thing he does AFTER something caught his eye.
+//
+// So this asserts the other end of the same seam: a `login-expired` flag polled from the real IPC
+// boundary produces a MARK on the real sidebar row, and its hover carries the login name. Both
+// surfaces are mounted against the same rule, which is what makes an absence assertion mean
+// anything — an absence proved against a component that is not in the tree proves nothing.
+describe("a login-expired stand-down marks the ROW, and its hover names the login", () => {
+  const loginFlag = (over: Record<string, unknown> = {}) => ({
+    agentId: "a1",
+    target: "founder",
+    raisedAtMs: Date.now(),
+    nudges: 4,
+    delivered: 4,
+    blockedBy: null,
+    silentSecs: 900,
+    reply: null,
+    standdown: "login-expired",
+    account: "work",
+    ...over,
+  });
+
+  afterEach(async () => {
+    __setAuthRecoveryDeps({ readNudgeFlags: async () => [] } as never);
+    await pollNudgeFlags();
+    __setAuthRecoveryDeps(null);
+  });
+
+  it("draws a mark whose hover says which login to sign back into", async () => {
+    // A row may render a GLYPH and never the words — this file's headline rule. So the login name
+    // has to ride the hover, which is the row's only channel for a fact this specific.
+    __setAuthRecoveryDeps({ readNudgeFlags: async () => [loginFlag()] } as never);
+    await pollNudgeFlags();
+    render(<AgentSidebar project={seed({ a1: "idle" }, { a1: CLEAN_BS }, { a1: BARE_WS })} />);
+    const mark = within(rowFor(AGENT_NAME)).getByTestId("row-notice-glyph");
+    expect(mark.getAttribute("title")).toContain("Login expired");
+    expect(mark.getAttribute("title")).toContain("work");
+    // The loudest tier, not the ordinary amber triangle: no nudge, no auto-continue and no pane
+    // restart can clear a dead session — only a person.
+    expect(mark.getAttribute("data-notice-glyph")).toBe("escalated");
+  });
+
+  it("…and draws NO mark for the same stand-down at concierge level — the paired negative", async () => {
+    // The row is otherwise identical and IS in the tree; without the pairing, "no mark" would be
+    // satisfied by a rule keyed on the wrong side entirely.
+    __setAuthRecoveryDeps({
+      readNudgeFlags: async () => [loginFlag({ target: "concierge" })],
+    } as never);
+    await pollNudgeFlags();
+    render(<AgentSidebar project={seed({ a1: "idle" }, { a1: CLEAN_BS }, { a1: BARE_WS })} />);
+    expect(within(rowFor(AGENT_NAME)).queryByTestId("row-notice-glyph")).toBeNull();
   });
 });

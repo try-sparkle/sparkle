@@ -48,6 +48,7 @@
 // from that bead's own engine work; this module only needs the class, the glyph and the ordering.
 import type { StallCause, StallReport } from "../engine/agentStall";
 import type { ThrashReport } from "../engine/agentThrash";
+import type { LoginStanddown } from "../engine/loginStanddown";
 import { STALL_CAUSE_LABEL, STALL_CAUSE_RANK, THRASH_VERDICT_LABEL } from "./rowAttention";
 import type { GoalBadge } from "./rowAttention";
 
@@ -74,6 +75,16 @@ export type NoticeClass = "warning" | "message" | "goal";
  * react-icons mapping. (Icons, never emoji — this repo's rule.)
  */
 export type NoticeGlyph = "alert" | "escalated" | "inbox" | "target" | "clock" | "check";
+
+/**
+ * The id of the login-expired notice — `nudge_ladder::Standdown::LoginExpired`, said once.
+ *
+ * ⚠️ NOT EXPORTED, DELIBERATELY. Every other notice id in this file is an inline template literal
+ * too, and an id exported for a test's convenience is the dormant-export shape
+ * `scripts/dormant-exports.mjs` blocks — this bead's own defect one size down. A test names the
+ * string, which is exactly what a surface's `data-notice-id` attribute carries.
+ */
+const LOGIN_EXPIRED_NOTICE_ID = "standdown:login-expired";
 
 /** One thing an agent is currently saying, in every register a surface might need. */
 export interface AgentNotice {
@@ -118,6 +129,28 @@ export interface AgentNotice {
  * `detail` — never a fabricated explanation.
  */
 export const NOTICE_EXPLAINER: Record<string, string> = {
+  // ── The one stand-down no machine can clear ──────────────────────────────────────────────────
+  // WRITTEN FOR SOMEONE WHO DOES NOT KNOW WHAT A NUDGE IS, per this table's own rule, and held to
+  // the promise-nothing rule the `thrash:quota-blocked` copy is held to: there is no auto-recovery
+  // path here AT ALL, so this says so outright rather than implying a retry might help.
+  //
+  // ⚠️ IT NAMES NO NUMBER AND POINTS AT NO NAME, and both omissions are deliberate. An earlier draft
+  // said "Sparkle asked it four times" — a count this surface does not have, since `nudges` is one
+  // of the climbing counters the snapshot deliberately excludes (`authRecovery.nudgeFlagsSnapshot`),
+  // so it would have been a fabricated number rendered as fact. The same draft ended "sign in to the
+  // login named on this pill", which is a dead instruction on exactly the rows that need it most:
+  // when `stamp_account` could not resolve the spawn the pill says "unknown login", and this
+  // paragraph is the generic one shown in BOTH cases. A remedy message is an instruction the reader
+  // will follow, so it has to be safe under every condition that produces it — the pill's own
+  // `detail`, which IS per-agent, carries the account-specific direction.
+  [LOGIN_EXPIRED_NOTICE_ID]:
+    "This agent's Claude login has expired, so it cannot make model calls at all — that is why it " +
+    "has gone quiet. Sparkle asked it and got nothing back, because answering would cost the very " +
+    "API call that is failing. Nothing here is broken and no work has been lost, but nothing will " +
+    "restart it either: nudging, auto-continue and a pane restart all need the same dead session. " +
+    "Signing that login back in is the only thing that clears it, and the agent then picks up " +
+    "where it stopped.",
+
   // ── Thrash: the agent is running, and getting nowhere ────────────────────────────────────────
   // NO PROMISE OF A SELF-RESTART (roborev 58721). The only auto-resume path is
   // `engine/goalContinuation.decideContinuation`, which returns `{action:"none"}` before it reaches
@@ -425,6 +458,17 @@ export interface NoticeInputs {
    * duplicate, so for it this is the only place the goal's words appear.
    */
   goal?: GoalBadge | null | undefined;
+  /**
+   * `services/humanBlockFor.loginStanddownIn(...)` — the agent's session has expired and only a
+   * person can sign it back in. `undefined`/`null` = no such stand-down, which is not a notice.
+   *
+   * ⚠️ THE ONE INPUT HERE THAT IS NOT AN ENGINE VERDICT ABOUT BEHAVIOUR. Every other field reports
+   * something Sparkle INFERRED from what an agent did; this one relays something Rust was TOLD by
+   * the ladder and then paid IO to enrich with an account name. It is an input rather than a lookup
+   * for the reason every other one is: this module is pure, and the surfaces subscribe to the flag
+   * table themselves (`useNudgeFlagSnapshot`) so the dependency is one React can see.
+   */
+  login?: LoginStanddown | null | undefined;
 }
 
 /**
@@ -448,7 +492,47 @@ export function agentNotices(input: NoticeInputs): AgentNotice[] {
   const out: AgentNotice[] = [];
 
   // ── WARNINGS ────────────────────────────────────────────────────────────────────────────────
-  // Thrash first: it describes an agent that is BURNING TIME right now, whereas a stall cause
+  // ⚠️ THE LOGIN STAND-DOWN LEADS EVERY OTHER WARNING, and the ordering is the point rather than a
+  // preference. `rowGlyphsFor` collapses the whole warning class to ONE mark and takes the loudest
+  // glyph, but the composer's pill row renders them IN THIS ORDER — and this is the only notice in
+  // the list that names a specific action a specific person must take before anything else on the
+  // row can move at all. An agent whose login has expired cannot make a model call, so every other
+  // warning it carries ("no progress", "PR unmerged") is a DOWNSTREAM SYMPTOM of this one; leading
+  // with a symptom would send the founder to investigate work that is simply waiting on a sign-in.
+  //
+  // It is `escalated` rather than `alert` for the same reason `stall:escalated-goal` is: this is the
+  // tier that means "nothing is coming on its own", which is literally true here — no nudge, no
+  // auto-continue and no restart can clear it, only a human at a keyboard.
+  const login = input.login;
+  if (login !== undefined && login !== null) {
+    out.push({
+      id: LOGIN_EXPIRED_NOTICE_ID,
+      cls: "warning",
+      glyph: "escalated",
+      // ── THE LOGIN IS IN THE LABEL, NOT ONLY IN THE DETAIL, and that placement is the fix ────
+      // A row renders no words at all and a pill's detail is behind a click, so anything that lives
+      // ONLY in `detail` is a fact the founder has to already suspect before he can read it. The
+      // label is the pill's visible text AND the row glyph's hover, i.e. the two places this reaches
+      // him without him going looking. `nudger::stamp_account` spends a PTY-table plus
+      // `accounts.json` read to resolve this name; putting it one click away wastes that.
+      //
+      // ⚠️ "unknown login" IS NOT A PLACEHOLDER FOR THE DEFAULT ACCOUNT. `LoginStanddown.account`
+      // is null when Rust could not identify the spawn at all, and this machine runs several Claude
+      // Max logins — naming the wrong one is worse than naming none. See `nudger.rs::account_label`,
+      // which refuses the same conflation at the other end of the wire.
+      label:
+        login.account !== null ? `Login expired · ${login.account}` : "Login expired · unknown login",
+      detail:
+        login.account !== null
+          ? `Sign in to the "${login.account}" login again. This agent's Claude session has expired, ` +
+            `so it cannot make model calls and no amount of nudging will restart it.`
+          : `Sign in to this agent's Claude login again. Sparkle could not work out WHICH of your ` +
+            `logins it was launched under, so check the agent's account before re-authenticating ` +
+            `rather than assuming the default.`,
+    });
+  }
+
+  // Thrash next: it describes an agent that is BURNING TIME right now, whereas a stall cause
   // describes work merely left owing. Both are amber; the ordering decides which glyph a
   // single-glyph row shows.
   const thrash = input.thrash;

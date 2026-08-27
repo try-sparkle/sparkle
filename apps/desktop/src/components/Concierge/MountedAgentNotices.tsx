@@ -82,7 +82,7 @@ import { quotaBlockForAgent } from "../../engine/engineRegistry";
 import { hasUnmetGoal } from "../../engine/agentGoal";
 import { goalBadgeFor, stallInputsFor } from "../rowAttention";
 import { awaitingCloseEvidenceFor } from "../../services/agentGoalReading";
-import { humanBlockIn } from "../../services/humanBlockFor";
+import { humanBlockIn, loginStanddownIn } from "../../services/humanBlockFor";
 import { useNudgeFlagSnapshot } from "../../useNudgeFlags";
 import { pendingCount, useAgentInbox } from "../../stores/inboxStore";
 import { useProjectStore } from "../../stores/projectStore";
@@ -232,6 +232,12 @@ export function MountedAgentNotices({ agentId, side }: { agentId: string; side: 
       // With the evidence, same reason as the stall input above: the composer's goal pill and its
       // stall pill sit in the same row and must not describe the agent differently.
       goal: goalBadgeFor(goal, now, awaitingCloseEvidenceFor(agentId, goal)),
+      // ── WHERE THE ACCOUNT NAME FINALLY GETS SAID (bead sparkle-qg71dl) ─────────────────────────
+      // `nudger::stamp_account` resolves WHICH of this machine's several Claude Max logins died and
+      // publishes it on the flag; until now nothing on this side read the field. This surface is the
+      // one with room for the words, so it is where "sign back into <login>" becomes reachable — the
+      // row can only ever draw a glyph, and its hover carries the label.
+      login: loginStanddownIn(nudgeFlags, agentId),
     });
   }, [agentId, now, goal, status, bs, ws, stageOverride, shipped, shippedAt, pending, entries, nudgeFlags]);
 

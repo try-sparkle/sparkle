@@ -1299,6 +1299,44 @@ export function eligibleAccounts(
 // outside React; every access is wrapped so a disabled/full/corrupt store degrades to auto-pick
 // rather than throwing on the spawn path.
 
+/** WHO WRITES A PIN — the complete list, and which of them is a PERSON.
+ *
+ *  A pin OUTRANKS every judgement `chooseAccountForAgent` makes, and the reason given throughout
+ *  this file is "a human chose it". That reason is only true of SOME writers, and for a long time
+ *  this surface stated it while listing NONE of them — so the claim read as covering all of them.
+ *  It cost a real defect (sparkle-smszd): a sweep written on the belief that only the switch
+ *  machinery pins ordinary agents deleted EVERY MANUAL OVERRIDE, in every project and every window,
+ *  on one click. The second writer — `AgentPane`'s own account picker — was one grep away and was
+ *  named nowhere the pin API is defined.
+ *
+ *  So before you widen, narrow or sweep pin behaviour, read this list and ask of each writer: is
+ *  this pin the machinery's to move, or did a person put it there on purpose?
+ *
+ *  HUMAN pins are a person's explicit choice for one agent and one account. They survive
+ *  `clearSwitchWrittenPins` and `hasHumanPin` reports them as human. MACHINERY pins are written by
+ *  a migration or cleared as bookkeeping; `clearSwitchWrittenPins` is allowed to discard them.
+ *  `setPin` writes a HUMAN pin (and drops the provenance mark to say so); `setPinFromSwitch` writes
+ *  a MACHINERY one.
+ *
+ *  THIS LIST IS CHECKED, NOT PROMISED. `scripts/account-pin-writer-check.sh` re-derives the writers
+ *  from the tree on every CI run and FAILS when one is missing here, when an entry no longer writes,
+ *  or when an entry does not say which kind it is. An invariant asserted only in a comment is
+ *  unbacked — that is this repo's contract and the subject of sibling bead sparkle-4r68r7. Add your
+ *  line in the SAME commit that adds the writer.
+ *
+ *  PIN WRITER REGISTRY — BEGIN (checked by scripts/account-pin-writer-check.sh)
+ *  HUMAN apps/desktop/src/components/AgentPane.tsx — the pane's own per-agent account picker calls `setPin` directly (`pickAccount`). Its own comment calls it a "manual override"; it takes effect on the NEXT spawn because a running agent is not restarted out from under the user. THIS is the writer the sweep in sparkle-smszd destroyed.
+ *  HUMAN apps/desktop/src/components/AccountsScreen.tsx — the accounts modal's STICKY-CONSUMER controls (`handleStickyChoice`) park the concierge / Sparkle-self keys on one account via `setPin`, or hand them back to automatic via `clearPin`. Reached through an injectable `DEPS` indirection, so the literal `setPin(` never appears in that file and a call-shape grep alone cannot see it.
+ *  MACHINERY apps/desktop/src/services/accountSwitch.ts — `moveAgent` writes the migration's pin with `setPinFromSwitch` (marked, so a LATER activation may sweep it), and `clearPin`s a sticky helper — plus its base key when the id is a satellite variant — before relocating it off a walled account.
+ *  MACHINERY apps/desktop/src/hooks/useAccountSwitch.ts — `recordActivation` calls `clearSwitchWrittenPins`, dropping the pins a PREVIOUS activation wrote. Deliberately only on the MANUAL lever ("Activate this account"); an automatic switch must not sweep, because it moves only the walled account's agents.
+ *  MACHINERY apps/desktop/src/stores/projectStore.ts — closing an agent `clearPin`s it and every worker it owns, so persisted pins do not accumulate for agents that no longer exist (a pane unmount is NOT a close).
+ *  PIN WRITER REGISTRY — END
+ *
+ *  NOT writers, and worth knowing so you do not go looking: `accountSelection.ts` only READS
+ *  (`getPin`, `stickyPin`), and `clearAllPins` has no production caller — it is test/teardown only.
+ *  Rust writes no pin at all; the map lives in this window's `localStorage`.
+ */
+
 /** localStorage key holding the agentId → accountId pin map. Exported for tests. */
 export const PINS_STORAGE_KEY = "sparkle.accountPins.v1";
 

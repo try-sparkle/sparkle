@@ -32,7 +32,7 @@ import type { NudgeFlagSnapshot } from "./services/humanBlockFor";
  * Pass it to `humanBlockIn`/`isHumanBlockedIn` and list it in the surrounding memo's deps — where it
  * now belongs by the linter's own rule, because the closure reads it.
  *
- * `Object.is` on a REPLACED map is what makes this correct: `bumpFlagVersion` builds a new `Map` per
+ * `Object.is` on a REPLACED map is what makes this correct: `publishFlagSnapshot` builds a new `Map` per
  * change, so the identity moves exactly when the contents do — no churn on an idle app, and no
  * missed change.
  */

@@ -69,7 +69,7 @@ import { getIdentities, listAccounts, type Account, type Identity } from "./acco
 import { isSafeToSwitch, moveAgent } from "./accountSwitch";
 import { paneAccountMap, restartPane } from "./paneControl";
 import { safeUnlisten } from "./safeUnlisten";
-import type { HumanBlockFlag } from "../engine/humanBlock";
+import type { NudgeFlagSnapshot } from "./humanBlockFor";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import {
   AUTH_RECOVERED_EVENT,
@@ -312,7 +312,7 @@ let deps: AuthRecoveryDeps = realDeps;
 export function __setAuthRecoveryDeps(next: Partial<AuthRecoveryDeps> | null): void {
   deps = next ? { ...realDeps, ...next } : realDeps;
   stuck.clear();
-  // ⚠️ THROUGH THE HELPER, NOT A BARE `flags.clear()` (roborev 65432). `bumpFlagVersion` is the only
+  // ⚠️ THROUGH THE HELPER, NOT A BARE `flags.clear()` (roborev 65432). `publishFlagSnapshot` is the only
   // writer of the snapshot, so a clear that skips it leaves `flagSnapshot` holding the PREVIOUS
   // test's flags — and this seam's own docstring promises the opposite. It bit end to end: a suite
   // that reset via `readNudgeFlags: () => []` then polled got `list.length === flags.size === 0`, so
@@ -674,8 +674,18 @@ export async function onAuthRecovered(payload: AuthRecoveredPayload): Promise<Re
 // ── NUDGER FLAGS — THE LISTENER THAT DID NOT EXIST ────────────────────────────────────────────
 
 /**
- * Bumped whenever the flag table CHANGES, so React can re-render on a signal that lives in a plain
- * module-level Map.
+ * Notified whenever the flag table CHANGES, so React can re-render on a signal that lives in a plain
+ * module-level Map. The `subscribe` half of `useSyncExternalStore`.
+ *
+ * ⚠️ THE VERSION COUNTER THAT USED TO SIT HERE IS GONE (bead sparkle-qg71dl). `nudgeFlagsVersion()`
+ * was the pre-snapshot spelling of this signal and, once the derivations took the snapshot instead,
+ * its only importer was this module's own test — so the exported accessor asserted a number nothing
+ * in a running app ever read, and `scripts/dormant-exports.mjs` says so. Deleting it is
+ * behaviour-preserving because {@link publishFlagSnapshot} — which was called `bumpFlagVersion` for
+ * the counter, and is renamed here so it stops naming a thing that no longer exists — already
+ * notifies through `flagListeners` and replaces `flagSnapshot`; the counter was a second, unread
+ * copy of the same fact. The tests now
+ * assert snapshot IDENTITY, which is what `useSyncExternalStore` actually compares.
  *
  * ⚠️ WITHOUT THIS THE FLAG IS INVISIBLE TO THE UI, AND SILENTLY SO (roborev 65339, a Medium). The
  * table is filled by a Tauri event listener and a 30s poll — neither of which is a store, so nothing
@@ -689,7 +699,6 @@ export async function onAuthRecovered(payload: AuthRecoveredPayload): Promise<Re
  * `quotaBlockForAgent` gets away with the same shape because its updates coincide with a StatusEngine
  * status write that re-renders anyway. This one has no such companion.
  */
-let flagVersion = 0;
 const flagListeners = new Set<() => void>();
 
 /**
@@ -706,7 +715,7 @@ const flagListeners = new Set<() => void>();
  * A fresh `Map` per change is what makes `Object.is` a correct `useSyncExternalStore` comparison —
  * the live `flags` map is a stable reference mutated in place, so it can never signal anything.
  */
-let flagSnapshot: ReadonlyMap<string, HumanBlockFlag> = new Map();
+let flagSnapshot: NudgeFlagSnapshot = new Map();
 
 /**
  * The current immutable flag table — the `getSnapshot` half of `useSyncExternalStore`.
@@ -724,7 +733,7 @@ let flagSnapshot: ReadonlyMap<string, HumanBlockFlag> = new Map();
  * Typing it as the fields that ARE change-detected makes a stale read impossible to write. Anything
  * needing the counters must read the live table and accept that it is not a React signal.
  */
-export function nudgeFlagsSnapshot(): ReadonlyMap<string, HumanBlockFlag> {
+export function nudgeFlagsSnapshot(): NudgeFlagSnapshot {
   return flagSnapshot;
 }
 
@@ -734,19 +743,27 @@ export function subscribeNudgeFlags(cb: () => void): () => void {
   return () => flagListeners.delete(cb);
 }
 
-/** The current flag-table version — the `getSnapshot` half of `useSyncExternalStore`. */
-export function nudgeFlagsVersion(): number {
-  return flagVersion;
-}
-
-function bumpFlagVersion(): void {
-  flagVersion++;
+function publishFlagSnapshot(): void {
   // Rebuilt here rather than at each mutation site, so no writer can forget it and every change
   // produces exactly one new identity.
   // Built from the judged fields only — see `nudgeFlagsSnapshot` for why exposing the counters here
   // would be a stale-read trap rather than a convenience.
   flagSnapshot = new Map(
-    [...flags].map(([id, f]) => [id, { target: f.target, reply: f.reply, raisedAtMs: f.raisedAtMs }]),
+    [...flags].map(([id, f]) => [
+      id,
+      {
+        target: f.target,
+        reply: f.reply,
+        raisedAtMs: f.raisedAtMs,
+        // ── THE TWO FIELDS THAT REACHED THE UI CORRECT AND UNREAD (bead sparkle-qg71dl) ────────
+        // `standdown` is the only "what is wrong" field that survives an agent being unable to
+        // SPEAK, and `account` is the whole reason `nudger::stamp_account` pays for a PTY-table plus
+        // `accounts.json` read: it names WHICH of this machine's several logins a person has to
+        // sign back into. Both crossed the IPC boundary intact and stopped at a module-level Map.
+        standdown: f.standdown,
+        account: f.account,
+      },
+    ]),
   );
   for (const cb of flagListeners) cb();
 }
@@ -764,7 +781,7 @@ function bumpFlagVersion(): void {
 export function clearNudgeFlagTable(): void {
   if (flags.size === 0 && flagSnapshot.size === 0) return;
   flags.clear();
-  bumpFlagVersion();
+  publishFlagSnapshot();
 }
 
 /**
@@ -784,19 +801,38 @@ export function clearNudgeFlagTable(): void {
 export function forgetNudgeFlagLocally(agentId: string): boolean {
   if (!flags.has(agentId)) return false;
   flags.delete(agentId);
-  bumpFlagVersion();
+  publishFlagSnapshot();
   return true;
 }
 
 function recordFlag(flag: NudgeFlag): void {
   flags.set(flag.agentId, flag);
-  bumpFlagVersion();
+  publishFlagSnapshot();
 }
 
 /** The fields a reader of this table branches on. Compared to decide whether a poll CHANGED
- *  anything — see {@link pollNudgeFlags}. */
+ *  anything — see {@link pollNudgeFlags}.
+ *
+ *  ⚠️ `standdown` AND `account` ARE HERE BECAUSE THE ACCOUNT ARRIVES ON A LATER LOOK THAN THE FLAG
+ *  (bead sparkle-qg71dl). `nudger.rs` builds the flag on every refresh but stamps the login name
+ *  only on the looks that need it — `stamp_account` costs a PTY-table plus `accounts.json` read, so
+ *  `build_flag` carries the PREVIOUS value forward and a fresh `login-expired` row can be published
+ *  with `account: null` and gain its name a look later. Nothing else about that row moves. Leave
+ *  these two out and the poll answers "unchanged", no bump happens, and the pill keeps saying the
+ *  login is unknown for as long as the row is up — the failure this whole bead is about, one layer
+ *  further in.
+ *
+ *  The `\u0000` join predates them and is why growing the key is safe: an unseparated key would let
+ *  one field's value end where the next begins and collide. */
 function flagIdentity(f: NudgeFlag): string {
-  return `${f.agentId}\u0000${f.target}\u0000${f.reply ?? ""}\u0000${f.raisedAtMs}`;
+  return [
+    f.agentId,
+    f.target,
+    f.reply ?? "",
+    f.standdown ?? "",
+    f.account ?? "",
+    String(f.raisedAtMs),
+  ].join("\u0000");
 }
 
 /** Did this poll actually change the table? */
@@ -827,7 +863,7 @@ export async function pollNudgeFlags(): Promise<NudgeFlag[]> {
     const changed = tableChanged(list);
     flags.clear();
     for (const f of list) flags.set(f.agentId, f);
-    if (changed) bumpFlagVersion();
+    if (changed) publishFlagSnapshot();
     return list;
   } catch (e) {
     deps.log("nudger_flags read failed", e);

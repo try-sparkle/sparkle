@@ -707,3 +707,201 @@ describe("a founder-level nudger flag reaches the mounted pill row", () => {
     expect(labels.some((t) => t.includes("blocked on you"))).toBe(false);
   });
 });
+
+// ── THE SEAM TEST FOR BEAD sparkle-qg71dl ─────────────────────────────────────────────────────────
+//
+// `nudge_ladder.rs` routes `Standdown::LoginExpired` to `Escalation::Founder`, and `nudger.rs`
+// spends a PTY-table plus `accounts.json` read in `stamp_account` to work out WHICH of this
+// machine's several Claude Max logins died. Both facts crossed the IPC boundary correctly, onto
+// `NudgeFlag.standdown` and `NudgeFlag.account` — and were read by NOTHING. The escalation the whole
+// ladder exists to raise terminated in a log line and a module-level `Map`.
+//
+// ⚠️ WHY THE UNIT TESTS CANNOT COVER THIS, and why this block is the one that matters. The producer
+// side (`nudge_ladder`'s Rust suite) and the consumer side (`engine/loginStanddown.test.ts`) BOTH
+// pass with the seam carrying nothing between them — that is the general shape the bead names.
+// `agentNotices.test.ts` is no better: it is handed an input that already contains the stand-down,
+// so it stays green no matter what the component forgets to pass. Only a test that starts at
+// `readNudgeFlags` — the real IPC boundary — and finishes at a rendered DOM node can fail when the
+// wiring is absent, and this one does: with `login:` removed from `MountedAgentNotices`' call to
+// `agentNotices`, or with `standdown`/`account` dropped from `authRecovery`'s snapshot, every
+// assertion below goes red.
+describe("a login-expired stand-down reaches the founder, naming the login", () => {
+  // ⚠️ `raisedAtMs` IS PINNED, and that is load-bearing rather than tidy. `flagIdentity` includes it,
+  // so a fixture calling `Date.now()` per invocation makes EVERY successive poll "changed" — and the
+  // account-arrives-a-look-later test below then passes with `account` absent from the poll's
+  // change-detection entirely, which is the exact seam it exists to pin. Measured: it did.
+  const RAISED_AT = 1_700_000_000_000;
+  const loginFlag = (over: Record<string, unknown> = {}) => ({
+    agentId: "a1",
+    target: "founder",
+    raisedAtMs: RAISED_AT,
+    nudges: 4,
+    delivered: 4,
+    blockedBy: null,
+    silentSecs: 900,
+    // NULL BY CONSTRUCTION, not an oversight in the fixture: answering a nudge costs the very API
+    // call that is failing, so this population never replies. A rule keyed on `reply` is
+    // permanently blind to it — which is the whole reason `standdown` exists.
+    reply: null,
+    standdown: "login-expired",
+    account: "work",
+    ...over,
+  });
+
+  afterEach(async () => {
+    __setAuthRecoveryDeps({ readNudgeFlags: async () => [] } as never);
+    await pollNudgeFlags();
+    __setAuthRecoveryDeps(null);
+  });
+
+  it("renders a pill that NAMES THE LOGIN, without the reader opening anything", async () => {
+    // The account is asserted on the pill's VISIBLE text on purpose. A fact that lives only in the
+    // expandable detail is one the founder has to already suspect before he can read it, and
+    // `stamp_account` does not spend two file reads so the answer can sit behind a click.
+    seed({ status: { a1: "idle" }, branchStatus: { a1: CLEAN_BS }, workflowState: { a1: BARE_WS } });
+    __setAuthRecoveryDeps({ readNudgeFlags: async () => [loginFlag()] } as never);
+    await pollNudgeFlags();
+    render(<MountedAgentNotices agentId="a1" side="left" />);
+    const pill = pills().find((p) => (p.dataset.noticeId ?? "") === "standdown:login-expired");
+    expect(pill).toBeTruthy();
+    expect(pill!.textContent ?? "").toContain("Login expired");
+    expect(pill!.textContent ?? "").toContain("work");
+  });
+
+  it("expands to an explanation that tells him what to actually do", async () => {
+    // The founder's own rule for this surface: *"there's no reason to tell me if you're not gonna
+    // execute, explain it to me in some place."* A label is not an explanation.
+    seed({ status: { a1: "idle" }, branchStatus: { a1: CLEAN_BS }, workflowState: { a1: BARE_WS } });
+    __setAuthRecoveryDeps({ readNudgeFlags: async () => [loginFlag()] } as never);
+    await pollNudgeFlags();
+    render(<MountedAgentNotices agentId="a1" side="left" />);
+    const pill = pills().find((p) => (p.dataset.noticeId ?? "") === "standdown:login-expired")!;
+    fireEvent.click(pill);
+    const detail = screen.getByTestId(NOTICE_DETAIL_TESTID);
+    expect(detail.textContent ?? "").toContain(NOTICE_EXPLAINER["standdown:login-expired"]);
+    // …and the agent's OWN instance of it — the login to sign back into.
+    expect(screen.getByTestId(NOTICE_OWN_WORDS_TESTID).textContent ?? "").toContain("work");
+  });
+
+  it("says UNKNOWN rather than naming a login, when Rust could not resolve one", async () => {
+    // ⚠️ THE ASSERTION THAT PROTECTS THE ESCALATION FROM ITSELF. This machine runs several Claude Max
+    // logins; `stamp_account` returns nothing when the PTY session is gone or `accounts.json` is
+    // unreadable, and printing "the default account" there would send a person to re-authenticate a
+    // login that is working fine. The row still raises — silence would be worse — but it must not
+    // invent the name.
+    seed({ status: { a1: "idle" }, branchStatus: { a1: CLEAN_BS }, workflowState: { a1: BARE_WS } });
+    __setAuthRecoveryDeps({ readNudgeFlags: async () => [loginFlag({ account: null })] } as never);
+    await pollNudgeFlags();
+    render(<MountedAgentNotices agentId="a1" side="left" />);
+    const pill = pills().find((p) => (p.dataset.noticeId ?? "") === "standdown:login-expired")!;
+    expect(pill.textContent ?? "").toContain("unknown login");
+  });
+
+  it("…and does NOT raise it for a CONCIERGE-level flag carrying the same stand-down", async () => {
+    // THE PAIRED NEGATIVE. Identical mount, identical status, identical flag SHAPE — only `target`
+    // differs. `Standdown::flag()` is the authority on who a stand-down is FOR, and reading the
+    // stand-down alone would re-open the false-founder-alarm class one layer up.
+    //
+    // ⚠️ SEEDED WITH AN OPEN PR SO THE TREE IS POPULATED. With `BARE_WS` and no goal this row has NO
+    // notices at all and the component takes its `notices.length === 0` early return, so `pills()`
+    // would query an EMPTY DOM and the assertion would pass with the whole rule deleted — the
+    // absence-against-an-unmounted-target trap this file already recorded once.
+    seed({
+      status: { a1: "idle" },
+      branchStatus: { a1: CLEAN_BS },
+      workflowState: { a1: OPEN_PR_WS },
+    });
+    __setAuthRecoveryDeps({
+      readNudgeFlags: async () => [loginFlag({ target: "concierge" })],
+    } as never);
+    await pollNudgeFlags();
+    render(<MountedAgentNotices agentId="a1" side="left" />);
+    // The row DID render pills — without this the assertion below is about an empty document.
+    expect(pills().length).toBeGreaterThan(0);
+    expect(pills().some((p) => (p.dataset.noticeId ?? "") === "standdown:login-expired")).toBe(
+      false,
+    );
+  });
+
+  it("a stand-down ARRIVING AFTER MOUNT repaints — and so does the account, one look later", async () => {
+    // ⚠️ THE ARM `flagIdentity` HAD TO GROW FOR (bead sparkle-qg71dl). `nudger.rs::build_flag` runs on
+    // every refresh but `stamp_account` runs only on the looks that need it, so a fresh
+    // `login-expired` row is routinely published with `account: null` and GAINS its name a look
+    // later. Nothing else about that row moves — it is silent by definition. Leave `account` out of
+    // the poll's change-detection and the second poll answers "unchanged", no bump happens, and the
+    // pill says "unknown login" for as long as the row is up.
+    //
+    // ⚠️ THE DEPS ARE INSTALLED ONCE AND THE FLAG MUTATES BEHIND A CLOSURE. Re-calling
+    // `__setAuthRecoveryDeps` per look is what the earlier cut of this test did, and it was VACUOUS:
+    // that call routes through `clearNudgeFlagTable`, so the table empties and the next poll is a
+    // size CHANGE no matter what `flagIdentity` watches. Measured — deleting `account` from
+    // `flagIdentity` left this test green. This is the same closure shape `authRecovery.test.ts`
+    // uses for its own change-detection assertions, and for the same reason.
+    seed({
+      status: { a1: "idle" },
+      branchStatus: { a1: CLEAN_BS },
+      workflowState: { a1: OPEN_PR_WS },
+    });
+    let raised = false;
+    let account: string | null = null;
+    __setAuthRecoveryDeps({
+      readNudgeFlags: async () => (raised ? [loginFlag({ account })] : []),
+    } as never);
+    await pollNudgeFlags();
+    render(<MountedAgentNotices agentId="a1" side="left" />);
+    // Mounted, with a populated pill row and no login stand-down on it.
+    expect(pills().length).toBeGreaterThan(0);
+    const named = () =>
+      pills().find((p) => (p.dataset.noticeId ?? "") === "standdown:login-expired")?.textContent ??
+      null;
+    expect(named()).toBeNull();
+
+    // Look one: raised, `stamp_account` has not run yet. Same mount, no re-render forced by the
+    // test — the pill can only be here via the subscription.
+    raised = true;
+    await act(async () => {
+      await pollNudgeFlags();
+    });
+    expect(named()).toContain("unknown login");
+
+    // Look two: the ONLY field that moves is the account. Nothing else about a silent agent does.
+    account = "work";
+    await act(async () => {
+      await pollNudgeFlags();
+    });
+    expect(named()).toContain("work");
+  });
+
+  it("a founder row already up, whose stand-down FLIPS to login-expired, repaints", async () => {
+    // ⚠️ THE OTHER HALF OF THE CHANGE-DETECTION CLAIM, and the ordinary way this arrives. A row does
+    // not usually appear already standing down: the ladder CLIMBS — nudge, nudge, nudge — and
+    // `nudge_gate` only later reads a dead session off the pane and sets `Standdown::LoginExpired`.
+    // `apply_flags` carries `raisedAtMs` across refreshes so the age is of the ASK, and this agent is
+    // silent, so on that look the ONLY field that moves is `standdown`. Leave it out of
+    // `flagIdentity` and the founder-level row that has been sitting there for an hour never gains
+    // the one pill that says what to do about it.
+    seed({
+      status: { a1: "idle" },
+      branchStatus: { a1: CLEAN_BS },
+      workflowState: { a1: OPEN_PR_WS },
+    });
+    let standdown: string | null = null;
+    __setAuthRecoveryDeps({
+      readNudgeFlags: async () => [loginFlag({ standdown })],
+    } as never);
+    await pollNudgeFlags();
+    render(<MountedAgentNotices agentId="a1" side="left" />);
+    const named = () =>
+      pills().find((p) => (p.dataset.noticeId ?? "") === "standdown:login-expired")?.textContent ??
+      null;
+    // The row is up and populated — a climbing ladder raises no stand-down pill of its own.
+    expect(pills().length).toBeGreaterThan(0);
+    expect(named()).toBeNull();
+
+    standdown = "login-expired";
+    await act(async () => {
+      await pollNudgeFlags();
+    });
+    expect(named()).toContain("work");
+  });
+});

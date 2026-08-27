@@ -56,7 +56,7 @@ import { isStalled, stallReport } from "../engine/agentStall";
 import { formatActivityAge, isActivityStale } from "../engine/activityFreshness";
 import { thrashReportFor } from "../engine/agentThrash";
 import { quotaBlockForAgent } from "../engine/engineRegistry";
-import { humanBlockIn } from "../services/humanBlockFor";
+import { humanBlockIn, loginStanddownIn } from "../services/humanBlockFor";
 import { useNudgeFlagSnapshot } from "../useNudgeFlags";
 import { hasUnmetGoal } from "../engine/agentGoal";
 import { stageFraction } from "../engine/workflowStage";
@@ -1101,7 +1101,21 @@ export const AgentRow = memo(function AgentRow({
   // itself clickable (roborev 59322). Without the removal the row drew `FiTarget` twice for one
   // fact, and a row whose only warning was the goal lost its amber "something is wrong" triangle.
   const noticeMarks = rowGlyphsFor(
-    withoutSeparatelyDrawn(agentNotices({ thrash, stall, goal: goalBadge }), goalBadge),
+    withoutSeparatelyDrawn(
+      agentNotices({
+        thrash,
+        stall,
+        goal: goalBadge,
+        // ── THE LOGIN STAND-DOWN, ON THE SURFACE HE IS ACTUALLY SCANNING (bead sparkle-qg71dl) ──
+        // From the SAME snapshot the stall input above takes, so this row cannot answer "is a
+        // person needed here" differently from the pill row the founder lands on when he clicks.
+        // It is not routed through `stall`: `stallReport` describes work left owing, and a dead
+        // login is not owed work — it is a precondition failure that makes every other verdict on
+        // this row a downstream symptom. See `agentNotices` for why it leads the warnings.
+        login: loginStanddownIn(nudgeFlags, a.id),
+      }),
+      goalBadge,
+    ),
   );
   /**
    * MOUNT THIS AGENT AND OPEN THE PILL THAT EXPLAINS `noticeId`. Bead sparkle-tyter, the founder's

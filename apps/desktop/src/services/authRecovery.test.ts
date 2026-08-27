@@ -20,7 +20,6 @@ import {
   __flushVerifications,
   __setAuthRecoveryDeps,
   subscribeNudgeFlags,
-  nudgeFlagsVersion,
   nudgeFlagFor,
   pollNudgeFlags,
   forgetNudgeFlagLocally,
@@ -516,11 +515,15 @@ describe("nudge flag table notifies subscribers", () => {
     });
     let calls = 0;
     const unsub = subscribeNudgeFlags(() => calls++);
-    const before = nudgeFlagsVersion();
+    // ⚠️ THE SNAPSHOT'S IDENTITY IS THE SIGNAL, and every assertion in this describe and the
+    // next reads it. It is what `useSyncExternalStore` actually compares, so `not.toBe` /
+    // `toBe` on it is a stronger claim than the counter these used to read: that counter had
+    // no production caller at all and was deleted with the bead sparkle-qg71dl wiring.
+    const before = nudgeFlagsSnapshot();
     await pollNudgeFlags();
-    expect(nudgeFlagsVersion()).toBeGreaterThan(before);
+    expect(nudgeFlagsSnapshot()).not.toBe(before);
     expect(calls).toBe(1);
-    // …and the flag is actually readable, so the version is not moving for nothing.
+    // …and the flag is actually readable, so the snapshot is not moving for nothing.
     expect(nudgeFlagFor("a")?.reply).toBe("blocked-on-human");
     unsub();
   });
@@ -552,16 +555,16 @@ describe("nudge flag table notifies subscribers", () => {
     expect(nudgeFlagFor("a")).toBeDefined();
     let calls = 0;
     const unsub = subscribeNudgeFlags(() => calls++);
-    const before = nudgeFlagsVersion();
+    const before = nudgeFlagsSnapshot();
     raised = false;
     await pollNudgeFlags();
     expect(nudgeFlagFor("a")).toBeUndefined();
-    expect(nudgeFlagsVersion()).toBeGreaterThan(before);
+    expect(nudgeFlagsSnapshot()).not.toBe(before);
     expect(calls).toBe(1);
     unsub();
   });
 
-  it("a poll that changes NOTHING does not bump — the version is a signal, not a heartbeat", async () => {
+  it("a poll that changes NOTHING does not bump — the snapshot is a signal, not a heartbeat", async () => {
     // ⚠️ THIS REPLACES AN ASSERTION THAT PINNED THE BUG (roborev 65367). The first cut bumped on
     // every successful read, so an idle app re-rendered every subscriber every 30s — recreating
     // `stallReportOf`, recomputing the whole escalate → present → effective chain for every agent,
@@ -572,10 +575,10 @@ describe("nudge flag table notifies subscribers", () => {
     await pollNudgeFlags();
     let calls = 0;
     const unsub = subscribeNudgeFlags(() => calls++);
-    const before = nudgeFlagsVersion();
+    const before = nudgeFlagsSnapshot();
     await pollNudgeFlags();
     await pollNudgeFlags();
-    expect(nudgeFlagsVersion()).toBe(before);
+    expect(nudgeFlagsSnapshot()).toBe(before);
     expect(calls).toBe(0);
     unsub();
   });
@@ -616,10 +619,10 @@ describe("nudge flag change-detection covers the field comparison, not just the 
     await pollNudgeFlags();
     let calls = 0;
     const unsub = subscribeNudgeFlags(() => calls++);
-    const before = nudgeFlagsVersion();
+    const before = nudgeFlagsSnapshot();
     reply = "blocked-on-human";
     await pollNudgeFlags();
-    expect(nudgeFlagsVersion()).toBeGreaterThan(before);
+    expect(nudgeFlagsSnapshot()).not.toBe(before);
     expect(calls).toBe(1);
     expect(nudgeFlagFor("a")?.reply).toBe("blocked-on-human");
     unsub();
@@ -646,10 +649,10 @@ describe("nudge flag change-detection covers the field comparison, not just the 
     await pollNudgeFlags();
     let calls = 0;
     const unsub = subscribeNudgeFlags(() => calls++);
-    const before = nudgeFlagsVersion();
+    const before = nudgeFlagsSnapshot();
     n = 7;
     await pollNudgeFlags();
-    expect(nudgeFlagsVersion()).toBe(before);
+    expect(nudgeFlagsSnapshot()).toBe(before);
     expect(calls).toBe(0);
     unsub();
   });
@@ -661,10 +664,10 @@ describe("nudge flag change-detection covers the field comparison, not just the 
     await pollNudgeFlags();
     let calls = 0;
     const unsub = subscribeNudgeFlags(() => calls++);
-    const before = nudgeFlagsVersion();
+    const before = nudgeFlagsSnapshot();
     forgetNudgeFlagLocally("a");
     expect(nudgeFlagFor("a")).toBeUndefined();
-    expect(nudgeFlagsVersion()).toBeGreaterThan(before);
+    expect(nudgeFlagsSnapshot()).not.toBe(before);
     expect(calls).toBe(1);
     unsub();
   });
@@ -674,7 +677,7 @@ describe("nudge flag change-detection covers the field comparison, not just the 
 describe("__setAuthRecoveryDeps leaves no flag state behind", () => {
   it("empties the SNAPSHOT too, so no test inherits another's flags", async () => {
     // ⚠️ THE BUG THIS PINS IS CROSS-TEST POLLUTION, which is invisible in the file that causes it.
-    // `bumpFlagVersion` is the only writer of the snapshot, so a bare `flags.clear()` in the seam
+    // `publishFlagSnapshot` is the only writer of the snapshot, so a bare `flags.clear()` in the seam
     // left it holding the previous test's flags — and the obvious reset (`readNudgeFlags: () => []`
     // then poll) could not fix it either, because `list.length === flags.size === 0` means
     // `tableChanged` answers false and no bump happens. A component reading the snapshot then

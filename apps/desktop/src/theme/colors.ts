@@ -242,6 +242,46 @@ export const THEME_HEX = {
   },
 } as const;
 
+// ── SCOPING A TOKEN TO A SUBTREE: THE TWO CLAUSES, AND WHY ONE LINE IS NEVER ENOUGH ───────────
+// (bead sparkle-cxekz, seen 8× — twice as a shipped, invisible defect one level apart)
+//
+// Redefining a `--c-*` token on an element is the sanctioned way to re-ink a subtree: no prop is
+// threaded, no component below knows the override exists, and there is exactly one definition.
+// SentToAgentRow.SENT_CARD_INK_VARS and NoticeAttribution.NOTICE_INK_VARS both do it. But a custom
+// property is resolved at the element that NAMES it, and that is a much smaller population than
+// "the subtree":
+//
+//   • a descendant writing `color: C.cream` resolves `var(--c-cream)` HERE, and re-inks. ✅
+//   • a descendant writing NO `color` inherits a COMPUTED rgb value from whatever ancestor last
+//     declared one — for this app, ConciergeColumn's `color: C.cream` on the section. That value
+//     was resolved against the THEME's token, far ABOVE the override. Redefining the token below
+//     cannot reach back and re-resolve it. ❌
+//
+// So the two halves of one subtree land on OPPOSITE sides of the same ground, silently. Measured:
+// a card pinned its inks, the labels and pills followed, and the founder's own message body stayed
+// near-black ON BLACK. Then again one level down, in the same shape.
+//
+// THE RULE. A scoped override of an ink token MUST carry both of these on the SAME element:
+//
+//   1. `color`, naming the token pinned in that very object — so inherited text re-resolves here
+//      instead of keeping the value it computed upstairs. Write the token, not the literal, so
+//      there is still one definition.
+//   2. a pin for every FILL a descendant paints FOR ITSELF. `color` cannot reach those: the
+//      descendant declares its own `background`, so it inherits nothing, and pinning only the ink
+//      puts a fixed-dark label on a themed pale chip (~1.07:1 — the second measured instance).
+//      CHAT_SENT_FILL below is that clause applied, and records which fills need no pin and why.
+//
+// Clause 1 is enforced by `scripts/scoped-ink-override-check.sh` (test:
+// scripts/tests/scoped-ink-override-check.test.sh), which fails a declaration block that redefines
+// a token some element declares as a `color` without declaring `color` beside it. Clause 2 is NOT
+// mechanically decidable — knowing which descendants paint their own ground means knowing what
+// renders inside the subtree — so it stays here, and it stays on you. A block that genuinely wants
+// an unpaired override says so with `scoped-ink-ok` in a comment inside it.
+//
+// ⚠ NOT EVERY INK TOKEN BELONGS IN A GIVEN OVERRIDE. `--c-pill-ink` exists precisely so a row that
+// re-inks its prose does not also grey a clickable pill's label: a GROUND change pins it, an
+// EMPHASIS change must not. See C.pillInk and NOTICE_INK_VARS' own note.
+
 // Themed token object for component inline styles. The four theme-dependent tokens become
 // var()-based, so a single `data-theme` flip on <html> re-themes the whole app through CSS
 // with no React re-render. Everything else (teal, amber, accent, status, …) is brand
