@@ -109,7 +109,7 @@ describe("persist → recall round trip", () => {
 });
 
 describe("shapeMemories", () => {
-  it("drops the schema_version bookkeeping key and sorts by key", () => {
+  it("drops the schema_version bookkeeping key; the key is only the LAST-RESORT tiebreak", () => {
     const shaped = shapeMemories({ schema_version: "1", zebra: "z", apple: "a" });
     expect(shaped.memories.map((m) => m.key)).toEqual(["apple", "zebra"]);
     expect(shaped.total).toBe(2);
@@ -121,6 +121,61 @@ describe("shapeMemories", () => {
     const shaped = shapeMemories(raw);
     expect(shaped.memories.length).toBe(MAX_RECALL_MEMORIES);
     expect(shaped.total).toBe(MAX_RECALL_MEMORIES + 5);
+  });
+});
+
+// ═══ WHICH memories survive the cap (bead sparkle-h2a492 / sparkle-b0ip2v) ══════════════════════
+//
+// The regression these pin: the cap used to be applied AFTER an alphabetical key sort, so a fact was
+// invisible-forever on the strength of its key's FIRST LETTER — measured at 17 of 42 memories never
+// reaching the prompt, one of them naming a P0 blocker. The assertions are on the SIDE EFFECT (which
+// keys actually come back in `memories`), never on the sort call.
+describe("shapeMemories ordering — the cap must never fall alphabetically", () => {
+  it("keeps an explicitly-important fact even when its key sorts DEAD LAST", () => {
+    const raw: Record<string, string> = {};
+    for (let i = 0; i < MAX_RECALL_MEMORIES; i++) {
+      raw[`a-filler-${String(i).padStart(2, "0")}`] = "a routine note nobody is waiting on";
+    }
+    raw["zz-release-blocker"] = "P0: the notarization cert expires Friday and no DMG can ship.";
+    const shaped = shapeMemories(raw);
+    expect(shaped.memories.map((m) => m.key)).toContain("zz-release-blocker");
+  });
+
+  it("ranks a STANDING (undated) rule ahead of a stale episodic note whose key sorts earlier", () => {
+    const shaped = shapeMemories({
+      "aaa-handoff-2026-01-02": "HANDOFF (2026-01-02): status of a branch that has long since landed.",
+      "zzz-founder-preference": "Never use emoji as icons — react-icons/fi only.",
+    });
+    expect(shaped.memories.map((m) => m.key)).toEqual([
+      "zzz-founder-preference",
+      "aaa-handoff-2026-01-02",
+    ]);
+  });
+
+  it("orders dated facts NEWEST-first, in defiance of their keys", () => {
+    const shaped = shapeMemories({
+      "aaa-old": "As of 2026-01-02 the release runner was hosted.",
+      "zzz-new": "As of 2026-08-20 the release runner is self-hosted.",
+    });
+    expect(shaped.memories.map((m) => m.key)).toEqual(["zzz-new", "aaa-old"]);
+  });
+
+  it("NAMES every fact the cap held back — nothing is silently unreachable", () => {
+    const raw: Record<string, string> = {};
+    for (let i = 0; i < MAX_RECALL_MEMORIES + 3; i++) {
+      raw[`k${String(i).padStart(2, "0")}`] = `body ${i}`;
+    }
+    const shaped = shapeMemories(raw);
+    expect(shaped.memories.length).toBe(MAX_RECALL_MEMORIES);
+    // The withheld facts are reported BY NAME, so `recall <key>` can still reach every one of them.
+    expect(shaped.hiddenKeys.length).toBe(3);
+    expect([...shaped.memories.map((m) => m.key), ...shaped.hiddenKeys].sort()).toEqual(
+      Object.keys(raw).sort(),
+    );
+  });
+
+  it("reports NO hidden keys when the whole store fits", () => {
+    expect(shapeMemories({ a: "alpha", b: "beta" }).hiddenKeys).toEqual([]);
   });
 });
 

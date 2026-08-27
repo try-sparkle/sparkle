@@ -23,8 +23,9 @@ import { listMemories, type MemoryEntry } from "../services/conciergeTools/memor
 import { log } from "../logger";
 
 export interface ConciergeMemoryState {
-  /** The last-known durable memories, sorted by key (already capped by `listMemories`). Empty until
-   *  the first `refresh()` lands. */
+  /** The last-known durable memories, ranked most-important/most-recent first and already capped by
+   *  `listMemories` (see `compareRanked` there — the order is deliberately NOT alphabetical).
+   *  Empty until the first `refresh()` lands. */
   memories: MemoryEntry[];
   /** How many facts exist in the store in total — may exceed `memories.length`, which is capped. The
    *  preamble discloses the difference so a capped list never reads as the whole store. */
@@ -80,13 +81,22 @@ export const MEMORY_PREAMBLE_HEADER =
  */
 export const MAX_MEMORY_VALUE_CHARS = 300;
 
-/** Clip one value to {@link MAX_MEMORY_VALUE_CHARS}, flattening newlines so one fact stays one line
- *  (a stray newline would split the `- key: value` entry across lines). */
+/**
+ * Clip one value to {@link MAX_MEMORY_VALUE_CHARS}, flattening newlines so one fact stays one line
+ * (a stray newline would split the `- key: value` entry across lines).
+ *
+ * The clip states HOW MUCH it dropped, not merely that it dropped something. Values in this store
+ * run ~0.7–1.7 KB against a 300-char budget, so a bare `…` leaves the concierge holding roughly the
+ * first sixth of a fact with no way to tell that from the whole of a short one — and it reads the
+ * fragment as complete (`sparkle-h2a492`). `…[+1382 chars]` is ~14 bytes that convert a silent clip
+ * into a measured one, and the key is already at the head of the same line, so `recall <key>` for
+ * the rest needs no per-line repetition of the remedy.
+ */
 function clipValue(value: string): string {
   const flat = value.replace(/\s+/g, " ").trim();
-  return flat.length <= MAX_MEMORY_VALUE_CHARS
-    ? flat
-    : `${flat.slice(0, MAX_MEMORY_VALUE_CHARS - 1).trimEnd()}…`;
+  if (flat.length <= MAX_MEMORY_VALUE_CHARS) return flat;
+  const shown = flat.slice(0, MAX_MEMORY_VALUE_CHARS - 1).trimEnd();
+  return `${shown}…[+${flat.length - shown.length} chars]`;
 }
 
 /**
@@ -102,9 +112,19 @@ export function buildMemoryPreamble(memories: readonly MemoryEntry[], total?: nu
   if (memories.length === 0) return "";
   const items = memories.map((m) => `- ${m.key}: ${clipValue(m.value)}`);
   const hidden = Math.max(0, (total ?? memories.length) - memories.length);
+  // THE REMEDY HAS TO WORK UNDER THE CONDITIONS THAT PRODUCED THE NOTICE (AGENTS.md, "a refusal or
+  // remedy message is an instruction the user will follow"). This line used to end "…or
+  // list_memories for all", which was a DEAD instruction: `list_memories` runs the very same
+  // MAX_RECALL_MEMORIES cap and hands back the identical 25 entries, so following it recovered
+  // nothing. What `list_memories` genuinely does now is NAME every withheld fact (`hiddenKeys`), so
+  // it is pointed at as the way to learn the KEYS, and `recall <key>` as the way to get a value.
   const note =
     hidden > 0
-      ? [`(${hidden} more fact(s) not shown — use recall to search them, or list_memories for all.)`]
+      ? [
+          `(${hidden} more fact(s) held back — ranked most important and most recent first, so ` +
+            `this is not the whole store. Use recall "<key or keyword>" for a full fact (a value ` +
+            `marked …[+N chars] is clipped), or list_memories to name every fact held back.)`,
+        ]
       : [];
   return [
     `${MEMORY_PREAMBLE_HEADER} ${memories.length} fact(s):`,

@@ -89,6 +89,24 @@ const CONCIERGE_ALLOWED_TOOLS: &str =
 /// every turn. Keep the split honest: what belongs HERE is the posture Sparkle guarantees and the
 /// mechanics only the app knows (link syntax, routing, honesty about tool outcomes); what belongs
 /// THERE is taste — anything the user is entitled to overrule.
+///
+/// ══ EVERY OP NAME IN HERE IS CHECKED AGAINST THE REAL CATALOG ═══════════════════════════════
+///
+/// `scripts/persona-op-drift.sh` extracts every backticked op name from this literal and asserts
+/// it is a member of the TypeScript tool catalog — under the very tool it is named with. It is
+/// exercised by `scripts/tests/persona-op-drift.test.sh`, which the shell suite (and so
+/// `pnpm verify`, and so CI) runs, so drift here fails the build rather than answering
+/// `unknown-op` in front of the user.
+///
+/// THE TESTS BELOW CANNOT DO THAT JOB, and the distinction is the whole reason the script exists.
+/// Every persona tripwire in this file is `assert!(CONCIERGE_PERSONA.contains("…"))` — a claim
+/// that a string is PRESENT. The defect that shipped (beads `sparkle-wbae6k`, `sparkle-dh7eu2`,
+/// `sparkle-ticjdo`) was that the present string was the WRONG one: this paragraph told the model
+/// to recall memories with a bare `list`, which is a real op the RESEARCH domain owns, so it read
+/// perfectly and every `contains` assertion stayed green while the instruction pointed at a call
+/// the memory domain could only refuse. A presence test cannot say "and this identifier must be a
+/// member of a set that lives in another language"; the follow-up `!contains(…)` pin below covers
+/// the one byte sequence that was wrong and says nothing about the next one.
 pub(crate) const CONCIERGE_PERSONA: &str = "You are the user's cross-project concierge and \
 minder — their eyes, ears, and best friend across everything happening in their projects, and \
 their single point of contact for the whole app. Each message you receive is a snapshot of live \
@@ -2838,6 +2856,21 @@ mod tests {
         assert!(
             !CONCIERGE_PERSONA.contains("with a keyword, or `list`)"),
             "op `list` does not exist in the memory domain; the persona must name `list_memories`"
+        );
+        // BOTH ASSERTIONS ABOVE PIN BYTES, NOT MEMBERSHIP — they are the shape that let this ship.
+        // The first says a string is present; the second forbids the ONE spelling that was wrong.
+        // Neither can see the next invented or renamed op, because the op catalog is TypeScript and
+        // nothing in Rust can read it. `scripts/persona-op-drift.sh` does that, checking every
+        // backticked op name in the persona against the real catalog under the tool it is named
+        // with; `scripts/tests/persona-op-drift.test.sh` runs it against this very file, so the
+        // membership half of this rule is enforced by the shell suite rather than restated here.
+        // The negative mention below is load-bearing for that guard's test — it is the sentence
+        // that proves the guard does not red on its own documentation.
+        assert!(
+            CONCIERGE_PERSONA.contains("there is no op called `list`"),
+            "the persona must keep saying the bare `list` op does not exist: it is what stops the \
+             model reaching for the research-domain name, and scripts/tests/persona-op-drift.test.sh \
+             uses this sentence as its negative-mention fixture"
         );
 
         // ══ DELEGATION MEMORY ════════════════════════════════════════════════════════════════════

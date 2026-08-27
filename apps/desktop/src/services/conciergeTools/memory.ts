@@ -105,6 +105,18 @@ export interface MemoryEntry {
 export interface MemoryListView {
   memories: MemoryEntry[];
   total: number;
+  /**
+   * The keys of the facts the cap held back — NAMES ONLY, no values.
+   *
+   * A count alone ("17 more") tells the concierge that something is missing but not what, so the
+   * only recovery is to guess search terms. The keys are slugs (tens of bytes each) while the values
+   * are the expensive part (~0.7–1.7 KB each), so listing every withheld key costs almost nothing and
+   * turns a silent, unreachable truncation into a disclosed, addressable one: every hidden fact is
+   * one `recall <key>` away. Deliberately UNCAPPED — a cap on this list would reintroduce the exact
+   * silent-cut defect it exists to close (bead `sparkle-h2a492`), and {@link MAX_RECALL_MEMORIES}
+   * already bounds the only part of the reply that is actually large.
+   */
+  hiddenKeys: string[];
 }
 
 /** What `remember` answers with — the key it landed under, so the concierge can `forget` it later
@@ -127,14 +139,116 @@ export const MAX_RECALL_MEMORIES = 25;
  *  raw map is turned into entries, in ONE place, so the two read paths cannot disagree. */
 export const SCHEMA_VERSION_KEY = "schema_version";
 
-/** Turn the raw `bd memories --json` map into sorted, capped entries. Pure, so the shaping is
- *  testable without invoking bd, and the `schema_version` filter has exactly one home. */
+// ---------------------------------------------------------------------------------------------
+// Ranking — WHICH facts survive the cap
+// ---------------------------------------------------------------------------------------------
+//
+// ══ WHAT THE STORE ACTUALLY CARRIES (measured, not assumed) ═════════════════════════════════════
+//
+// `bd memories --json` answers with a bare key→value JSON map and NOTHING else: no created/updated
+// timestamp, no priority column, no ordering guarantee worth reading (bd emits the map sorted by key,
+// so even the insertion order is gone by the time it reaches us). `bd memories --help` offers no flag
+// that would add one, and the Rust side (`memory_recall_argv` in src-tauri/src/notes.rs) is a
+// pass-through of that stdout. So there is NO true recency signal on this wire — if one is wanted,
+// it has to be added to `bd` or recorded app-side at `remember` time, and neither is this module's.
+//
+// ══ WHY THE OLD ORDER WAS A BUG, NOT A DEFAULT ═════════════════════════════════════════════════
+//
+// The cap used to be `sort by key` then `slice(0, 25)`, which made a fact's VISIBILITY a function of
+// its key's first letter — permanently, and with nothing reporting it. Measured against the live
+// store: 17 of 42 memories never reached the prompt, one of them naming a P0 release blocker
+// (`sparkle-h2a492`, `sparkle-b0ip2v`). Alphabetical is a fine TIEBREAK; as the primary rank it is a
+// silent lottery on an attribute that has no relationship to whether the fact matters.
+//
+// ══ THE BEST ORDER THE AVAILABLE DATA SUPPORTS ═════════════════════════════════════════════════
+//
+// Three bands, richest signal first, key ascending WITHIN a band so the result stays deterministic:
+//
+//   1. FLAGGED — the key or the value carries an explicit, shouted importance marker
+//      ({@link IMPORTANCE_MARKER}: `P0`, `BLOCKER`, `URGENT`, `IMPORTANT`, or a `pinned-` key). This
+//      is the escape hatch the bead's own example needed; it is the one signal a writer controls
+//      directly, so it outranks every inference.
+//   2. STANDING — the fact carries no date anywhere. Undated memories in this store are the timeless
+//      ones: founder preferences, "never do X", tool invariants. They do not go stale, and they are
+//      the last thing re-grounding should drop.
+//   3. EPISODIC — the fact carries an ISO date (in its key or its prose: `handoff-2026-06-24`,
+//      "OUTDATED as of 2026-07-28"), which is what a status-of-a-branch note looks like. These ARE
+//      recency-ordered, newest first, because a stale one is actively misleading. Measured: 55% of
+//      the live store's entries carry such a date, so this is a real signal, not a hypothetical.
+//
+// Bands 2 and 3 are inferences from the text, and inferences can be wrong — which is exactly why
+// `hiddenKeys` exists. Nothing this ranking demotes becomes unreachable; it only becomes un-preloaded.
+
+/** An explicit, writer-controlled "this one matters" marker. Deliberately UPPERCASE-only and
+ *  word-bounded so ordinary prose ("this is important to remember") does not promote itself — the
+ *  signal has to be a shout to count as one. */
+export const IMPORTANCE_MARKER = /\b(?:P0|BLOCKER|URGENT|IMPORTANT)\b/;
+
+/** A key namespaced as deliberately pinned, the other half of {@link IMPORTANCE_MARKER}. */
+export const PINNED_KEY_PREFIX = "pinned-";
+
+/** An ISO `YYYY-MM-DD`. Zero-padded and range-checked so a version string or an id (`2026-1-2`,
+ *  `1234-56-78`) is not mistaken for a date. Global — an entry can carry several, and the NEWEST is
+ *  the one that describes how current it is. */
+const ISO_DATE = /\b20\d{2}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])\b/g;
+
+/** True when the entry shouts that it matters. Exported so the rule is testable on its own. */
+export function isFlaggedMemory(entry: MemoryEntry): boolean {
+  return (
+    entry.key.startsWith(PINNED_KEY_PREFIX) ||
+    IMPORTANCE_MARKER.test(entry.key) ||
+    IMPORTANCE_MARKER.test(entry.value)
+  );
+}
+
+/** The newest ISO date the entry carries in its key or value, or `null` when it carries none (which
+ *  is what makes it a STANDING fact rather than an old one). Lexicographic max is chronological max
+ *  for zero-padded ISO dates. */
+export function memoryDateHint(entry: MemoryEntry): string | null {
+  const found = [...`${entry.key} ${entry.value}`.matchAll(ISO_DATE)].map((m) => m[0]);
+  return found.length === 0 ? null : found.reduce((a, b) => (a >= b ? a : b));
+}
+
+/** An entry with its band and date resolved ONCE. Both signals cost a regex sweep of the whole value
+ *  (~0.7–1.7 KB each), and a comparator is called O(n log n) times, so they are computed per ENTRY
+ *  rather than per comparison — decorate-sort-undecorate, so a store that keeps growing does not
+ *  quietly turn a re-ground into a few hundred kilobytes of rescanning. */
+interface RankedMemory {
+  entry: MemoryEntry;
+  /** 0 = flagged, 1 = standing (undated), 2 = episodic (dated). Lower sorts first. */
+  band: number;
+  date: string | null;
+}
+
+function rankMemory(entry: MemoryEntry): RankedMemory {
+  const date = memoryDateHint(entry);
+  const band = isFlaggedMemory(entry) ? 0 : date === null ? 1 : 2;
+  return { entry, band, date };
+}
+
+/** The total order the cap is applied to: band, then newest-date-first among dated entries, then key
+ *  ascending so two otherwise-equal facts never swap places between runs. */
+function compareRanked(a: RankedMemory, b: RankedMemory): number {
+  if (a.band !== b.band) return a.band - b.band;
+  if (a.date && b.date && a.date !== b.date) return b.date.localeCompare(a.date); // newest first
+  return a.entry.key.localeCompare(b.entry.key);
+}
+
+
+/** Turn the raw `bd memories --json` map into ranked, capped entries. Pure, so the shaping is
+ *  testable without invoking bd, and the `schema_version` filter has exactly one home.
+ *
+ *  The cut is by {@link compareRanked} — never by key alone — and everything it holds back is
+ *  named in {@link MemoryListView.hiddenKeys}, so a capped reply can be read as what it is. */
 export function shapeMemories(raw: Record<string, string>): MemoryListView {
   const entries = Object.entries(raw)
     .filter(([key]) => key !== SCHEMA_VERSION_KEY)
-    .map(([key, value]) => ({ key, value }))
-    .sort((a, b) => a.key.localeCompare(b.key));
-  return { memories: entries.slice(0, MAX_RECALL_MEMORIES), total: entries.length };
+    .map(([key, value]) => rankMemory({ key, value }))
+    .sort(compareRanked)
+    .map((r) => r.entry);
+  const memories = entries.slice(0, MAX_RECALL_MEMORIES);
+  const hiddenKeys = entries.slice(MAX_RECALL_MEMORIES).map((e) => e.key);
+  return { memories, total: entries.length, hiddenKeys };
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -231,7 +345,9 @@ export async function recallMemory(
   return ok("recall", shapeMemories(raw));
 }
 
-/** Every memory, newest-key-first-agnostic (sorted by key). The `recall` path with a null query. */
+/** Every memory, ranked by {@link compareRanked} and capped — with every withheld key named in
+ *  `hiddenKeys`, so "list" reports the whole store even when it can only carry part of it. The
+ *  `recall` path with a null query. */
 export async function listMemories(
   deps: MemoryDeps = LIVE_MEMORY_DEPS,
 ): Promise<MemoryResult<MemoryListView>> {

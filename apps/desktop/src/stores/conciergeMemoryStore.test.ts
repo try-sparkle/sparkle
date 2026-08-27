@@ -11,6 +11,10 @@ import {
   MEMORY_PREAMBLE_HEADER,
   withMemoryPreamble,
 } from "./conciergeMemoryStore";
+import {
+  MAX_RECALL_MEMORIES,
+  shapeMemories,
+} from "../services/conciergeTools/memory";
 
 describe("buildMemoryPreamble", () => {
   it("puts each recalled memory's key AND value into the section", () => {
@@ -49,13 +53,50 @@ describe("buildMemoryPreamble", () => {
       ],
       27,
     );
-    expect(preamble).toContain("25 more fact(s) not shown");
+    // The COUNT is the load-bearing half — 27 in the store, 2 rendered, so 25 are held back.
+    expect(preamble).toContain("25 more fact(s)");
     expect(preamble).toContain("recall");
   });
 
   it("adds NO disclosure note when everything is shown", () => {
     const preamble = buildMemoryPreamble([{ key: "a", value: "alpha" }], 1);
-    expect(preamble).not.toContain("more fact(s) not shown");
+    // Matched on the shape ANY version of the note takes, not on one wording — a phrase-exact
+    // negative assertion goes vacuously green the moment the copy is reworded.
+    expect(preamble).not.toMatch(/more fact\(s\)/);
+  });
+});
+
+// ═══ THE TRUNCATION MUST REACH THE PROMPT (bead sparkle-h2a492 / sparkle-b0ip2v) ════════════════
+//
+// A capped list that reads as a complete one is the whole defect. These drive the REAL capped path —
+// `shapeMemories` (the shipped shaper) feeding `buildMemoryPreamble` (the shipped fold-in) — rather
+// than hand-building a short array, so the disclosure is asserted where it actually has to fire.
+describe("truncation disclosure, end to end through the shipped cap", () => {
+  it("folds in the cap's worth of facts and discloses the exact number held back", () => {
+    const raw: Record<string, string> = {};
+    for (let i = 0; i < MAX_RECALL_MEMORIES + 7; i++) {
+      raw[`fact-${String(i).padStart(2, "0")}`] = `body of fact ${i}`;
+    }
+    const view = shapeMemories(raw);
+    const preamble = buildMemoryPreamble(view.memories, view.total);
+    expect(preamble).toContain(`${MAX_RECALL_MEMORIES} fact(s)`);
+    // The gap is the TRUE one — total minus what was rendered, not a guess.
+    expect(preamble).toContain("7 more fact(s)");
+  });
+
+  it("does NOT tell the concierge that list_memories will return all of them — it is capped too", () => {
+    // A remedy the reader will follow has to work under the conditions that produced the notice
+    // (AGENTS.md, "a refusal or remedy message is an instruction the user will follow").
+    // `list_memories` runs the SAME 25-entry cap, so pointing at it for "all" is a dead instruction.
+    const preamble = buildMemoryPreamble([{ key: "a", value: "alpha" }], 30);
+    expect(preamble).not.toContain("list_memories for all");
+    expect(preamble).toContain("recall");
+  });
+
+  it("says HOW MUCH of a clipped value is missing — a sixth of a fact must not read as the whole", () => {
+    const huge = "y".repeat(MAX_MEMORY_VALUE_CHARS * 6);
+    const preamble = buildMemoryPreamble([{ key: "big", value: huge }]);
+    expect(preamble).toMatch(/\+\d+ chars/);
   });
 });
 

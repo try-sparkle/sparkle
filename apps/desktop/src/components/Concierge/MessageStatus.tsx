@@ -254,16 +254,26 @@ export function MessageStatus({ status }: { status?: ConciergeMessageStatus | nu
  * Mounted ONLY when there is a status, which is why the hook can live here at all: `useConciergeLiveness`
  * keeps `now` in state and re-renders its caller at 1 Hz for the duration of every turn, and it
  * subscribes to the liveness store WITHOUT a selector — so it also re-renders on every
- * `noteConciergeProgress`, i.e. per token chunk. Exactly one status is `live` at a time — the message
- * whose turn is actually running — so exactly one of these exists, and both of those re-render paths
- * stop at this `div`.
+ * `noteConciergeProgress`, i.e. per token chunk. Both of those re-render paths stop at this `div`.
  *
- * THAT IS A PROPERTY OF THE FLAG, NOT OF THE THREAD, and the distinction is load-bearing now. It
- * used to rest on "exactly one bubble ever carries a status", which the turn queue retired: every
- * WAITING message carries one too, up to {@link MAX_QUEUED_TURNS}. Routing a waiter through here —
- * by setting `live: true` on it in the producer — re-creates precisely the per-bubble ticker cost
- * this placement exists to avoid, multiplied by the queue depth, and ages its ink off a clock that
- * belongs to a different message. See {@link ConciergeMessageStatusText.live}.
+ * ══ HOW MANY OF THESE EXIST — AND WHY THE NUMBER IS ASSERTED SOMEWHERE ═════════════════════════
+ * ONE PER MESSAGE OF THE RUNNING RUN, not one full stop. This header used to say "exactly one of
+ * these exists"; that was true when only one bubble could carry a status, and a later feature made
+ * it false without anyone re-reading the sentence that a cost was justified by — `RunningRun` lets
+ * one turn answer a run of messages, and the producer puts the SAME live line on every one of them.
+ * So the ticker count is the run's length.
+ *
+ * A comment cannot fail, which is the whole finding (bead sparkle-vfqhm). The bound now has a test:
+ * `services/conciergeMessageStatuses.tickerCount.test.ts` counts the `live` statuses the producer
+ * emits for a full 50-deep queue and for an absorbed run. Change what a run absorbs, or route a
+ * waiter through here, and a number moves rather than a docstring going quietly stale.
+ *
+ * THE STATIC/LIVE SPLIT IS A PROPERTY OF THE FLAG, NOT OF THE THREAD, and that distinction is what
+ * keeps the count small. Every WAITING message carries a status too, up to {@link MAX_QUEUED_TURNS}
+ * = 50 of them. Routing a waiter through here — by setting `live: true` on it in the producer —
+ * re-creates precisely the per-bubble ticker cost this placement exists to avoid, multiplied by the
+ * queue depth, and ages its ink off a clock that belongs to a different message. See
+ * {@link ConciergeMessageStatusText.live}.
  *
  * Calling the hook one level up — in `MessageStatus`, which every row renders — would mount a ticker
  * per bubble; calling it in the producer put it in the host.
