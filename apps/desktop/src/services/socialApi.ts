@@ -216,6 +216,30 @@ export interface ConnectionsResponse {
   outgoing: ConnectionRow[];
 }
 
+/**
+ * One row of `GET /social/conversations`, EXACTLY as the server emits it.
+ *
+ * ── THIS INTERFACE ONCE DESCRIBED A SHAPE THE WIRE CANNOT PRODUCE (bead sparkle-u94wvm) ──────────
+ * It named `socialId` and `lastSeq` — two fields the route has NEVER sent — and omitted `muted`,
+ * `last_read_seq` and `peers`, which it always has. Nothing surfaced it: no component consumes this
+ * type yet, so the drift was invisible until the first strict parser was written, at which point it
+ * would have rejected every real row and presented as a SERVER bug. Peer identity arrives inside
+ * {@link peers}, which is where `socialId` actually lives; there is no per-conversation `socialId`
+ * and no `lastSeq` anywhere on this endpoint.
+ *
+ * ── DO NOT EDIT THIS BY HAND WITHOUT THE FIXTURE ─────────────────────────────────────────────────
+ * `socialApiWireContract.test.ts` asserts this interface against a CAPTURED response body that the
+ * server's own suite asserts against `wireConversationRow()` — the function the route builds every
+ * row with. One artifact, two readers: move a field on either side and both suites go red, which is
+ * the only arrangement that stops this from happening again.
+ *
+ * ── NO OPTIONAL MEMBERS, DELIBERATELY ────────────────────────────────────────────────────────────
+ * Every column behind this row is `notNull` with a default, `unread` is a count that floors at 0,
+ * and `peers` is empty rather than absent — so every key is always present and never null. A
+ * `field?: T` here would mean `T | undefined`, which EXCLUDES `null`, and would therefore describe
+ * a case the wire cannot emit while failing to describe the one it can. Should a nullable column
+ * ever reach this row, write `field?: T | null` and put a real `null` in the fixture.
+ */
 export interface ConversationRow {
   id: string;
   /**
@@ -226,10 +250,21 @@ export interface ConversationRow {
    * is not enough on its own.
    */
   kind: "dm" | "support";
-  socialId: string;
+  /** The CALLER'S OWN participant state. `left` conversations are filtered out of this list
+   *  server-side, so it is not reachable here — it stays in the union because the same states are
+   *  what `POST /social/conversations` and `/accept` answer with. */
   state: "requested" | "active" | "left";
   unread: number;
-  lastSeq: number;
+  muted: boolean;
+  /**
+   * The caller's read high-water mark. SNAKE_CASE, and not a typo to tidy: this endpoint ships it
+   * as `last_read_seq` while the message wire is camelCase (`conversationId`, `createdAt`).
+   * Renaming it here would re-create the exact defect this interface was fixed for.
+   */
+  last_read_seq: number;
+  /** The other participants, sealed to the four public fields. Empty for a `support` thread, whose
+   *  other participant is an agent with no profile — never absent. */
+  peers: PublicProfile[];
 }
 
 /**

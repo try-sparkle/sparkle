@@ -29,15 +29,24 @@ function jsonRes(status: number, body: unknown): Response {
   } as unknown as Response;
 }
 
-/** A row as the server emits it. `kind` defaults to `dm` so a case can override just that. */
+/**
+ * A row as the server emits it. `kind` defaults to `dm` so a case can override just that.
+ *
+ * These keys are the WIRE's, checked against a captured response body by
+ * `socialApiWireContract.test.ts` — this builder used to carry `socialId` and `lastSeq`, which the
+ * route has never sent, and to omit `muted`/`last_read_seq`/`peers`, which it always does (bead
+ * sparkle-u94wvm). A hand-built row is fine for the partition rule under test here; it is not
+ * evidence about the wire, and that is what the contract test is for.
+ */
 function row(over: Partial<ConversationRow> = {}): ConversationRow {
   return {
     id: "conv-dm",
     kind: "dm",
-    socialId: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
     state: "active",
     unread: 0,
-    lastSeq: 0,
+    muted: false,
+    last_read_seq: 0,
+    peers: [],
     ...over,
   };
 }
@@ -97,8 +106,8 @@ describe("partitionConversations — the support thread never reaches a chat row
   it("carries the row's own fields through untouched", () => {
     // The partition re-homes rows; it must not rebuild them. An unread count lost here is a badge
     // that never appears.
-    const p = partitionConversations([support({ unread: 4, state: "active", lastSeq: 9 })]);
-    expect(p.support).toMatchObject({ unread: 4, state: "active", lastSeq: 9 });
+    const p = partitionConversations([support({ unread: 4, state: "active", last_read_seq: 9 })]);
+    expect(p.support).toMatchObject({ unread: 4, state: "active", last_read_seq: 9 });
   });
 });
 
@@ -121,8 +130,8 @@ describe("getConversations — the partition IS the API", () => {
     fetchMock.mockResolvedValueOnce(
       jsonRes(200, {
         conversations: [
-          { id: "s", kind: "support", socialId: "x", state: "active", unread: 1, lastSeq: 1 },
-          { id: "d", kind: "dm", socialId: "y", state: "active", unread: 0, lastSeq: 0 },
+          { id: "s", kind: "support", state: "active", unread: 1, muted: false, last_read_seq: 1, peers: [] },
+          { id: "d", kind: "dm", state: "active", unread: 0, muted: false, last_read_seq: 0, peers: [] },
         ],
       }),
     );
@@ -141,7 +150,9 @@ describe("getConversations — the partition IS the API", () => {
     // routing unknown rows to `support` would make a plain DM disappear from the chat list.
     fetchMock.mockResolvedValueOnce(
       jsonRes(200, {
-        conversations: [{ id: "old", socialId: "y", state: "active", unread: 0, lastSeq: 0 }],
+        conversations: [
+          { id: "old", state: "active", unread: 0, muted: false, last_read_seq: 0, peers: [] },
+        ],
       }),
     );
     const p = await getConversations();
