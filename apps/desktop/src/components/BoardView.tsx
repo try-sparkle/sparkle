@@ -1,3 +1,44 @@
+/**
+ * BoardView — the plan board. WHAT THIS SURFACE IS FOR; read this before adding a control.
+ *
+ * The board is a READ AND NAVIGATE surface: it shows the whole plan at a glance and it takes you
+ * somewhere (open a card, jump to an agent, hand an epic to Build). It is not an edit grid.
+ *
+ * ══ THE RULE — `board-read-navigate-only` ═══════════════════════════════════════════════════════
+ * The COLLAPSED board holds no free-form edit control: no `input`, no `select`, no `textarea`, and
+ * nothing exposing role `textbox` or `combobox`. Buttons are fine and are the point — a card opens
+ * its detail, an epic gets Start. The ONE deliberate exception is the comment compose box, and it
+ * lives on the OPENED card (`DetailOverlay` → `BeadCard`), never on the collapsed board.
+ *
+ * ══ THE REASON, because a rule with no because-clause is the one people route around ════════════
+ *   1. THE WHOLE CARD BODY IS THE CLICK TARGET, so the card root's `onClick` is an ANCESTOR of
+ *      everything you add. React bubbles through the component tree (portals included), so a new
+ *      control either calls `stopPropagation` or one gesture both edits the field and opens the
+ *      card. A text field makes that worse than a button does: click-to-place-cursor, drag-select
+ *      and Escape are all ordinary typing gestures, and each one also hits the card underneath.
+ *      See BeadCard's own header — this is why its root deliberately carries no `role="button"`.
+ *   2. THE BOARD IS A POLLED MIRROR of the beads store (`BEADS_POLL_INTERVAL_MS`, 5s). A control
+ *      here holds unsaved keystrokes in a subtree a poll can re-render or unmount underneath it.
+ *      The opened card is a stable single-bead context; a column of forty cards is not.
+ *   3. IT MULTIPLIES BY THE COLUMN. One control on a card is N controls on the board, and they
+ *      join the tab order and the role queries N times. Measured on the violation that filed
+ *      sparkle-a7xz30: the new control silently became the first element another test addressed by
+ *      index, and its wrapper displaced the parent a third test walked up to — two failures with
+ *      nothing to do with the feature, in tests nobody had opened.
+ *
+ * COST OF LEARNING IT THE OTHER WAY (bead sparkle-a7xz30): a per-card control was designed, built
+ * and finished before this rule surfaced — as five assertions going red at once, in a 4,000-line
+ * test file. The rework was the right outcome; the cost was that it came after the interaction was
+ * written rather than before it was designed.
+ *
+ * ══ WHERE IT IS PINNED, so the rule and its test cannot drift apart ═════════════════════════════
+ *   • the assertions: `apps/desktop/src/components/BoardView.test.tsx`, the test titled
+ *     "has no free-form edit controls on the COLLAPSED board".
+ *   • the guard: `scripts/board-readonly-rule-check.sh` (CI, `Node — static`), which fails if this
+ *     block stops saying it, if that test stops citing it, or if a form control is written straight
+ *     into this file. A line that genuinely needs one carries a `board-readonly-ok` comment.
+ *   • the general form of the rule: AGENTS.md, "A surface-level invariant".
+ */
 import { memo, useCallback, useEffect, useMemo, useRef, useState, type MouseEvent } from "react";
 import { C, FONT_WEIGHT, MODAL_SHADOW, SCRIM } from "../theme/colors";
 import { PILL, RADIUS } from "../theme/scale";

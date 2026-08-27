@@ -997,16 +997,45 @@ describe("BoardView", () => {
     expect(screen.queryByTestId("board-bead-card")).toBeNull();
   });
 
+  // THIS FAILURE MESSAGE IS THE DOCUMENTATION OF LAST RESORT (bead sparkle-a7xz30).
+  //
+  // The rule below used to live ONLY in the five bare assertions underneath, which meant the only
+  // way to learn it was to break it — and by then the interaction had been designed, built and
+  // finished, so the five reds arrived as a rework rather than as a design constraint. The rule now
+  // leads BoardView.tsx's header block, where a builder reads first, and is restated in AGENTS.md.
+  //
+  // A failure message is the one surface GUARANTEED to be read at the moment someone violates the
+  // rule, so it carries the rule, the reason and the pointer — not just the prohibition. Keep it
+  // that way: `expect(actual, message)` is vitest's second argument, and it costs one line each.
+  const BOARD_READ_NAVIGATE_ONLY = [
+    "VIOLATION of `board-read-navigate-only` — the collapsed board grew a free-form edit control.",
+    "",
+    "THE RULE: the COLLAPSED board is a READ/NAVIGATE surface. No input, no select, no textarea,",
+    "nothing with role textbox or combobox. Buttons are fine and are the point. The ONE deliberate",
+    "exception is the comment compose box, which lives on the OPENED card, not here.",
+    "",
+    "WHY (a rule with no because-clause is the one people route around):",
+    "  1. The whole card body is the click target, so the card root's onClick is an ANCESTOR of",
+    "     anything you add — click-to-place-cursor and drag-select also hit the card underneath.",
+    "  2. The board is a 5s-polled mirror of the beads store; keystrokes here sit in a subtree a",
+    "     poll can re-render or unmount underneath them.",
+    "  3. One control per card is N controls in the tab order and in every role query on the board.",
+    "",
+    "READ FIRST: the header block of apps/desktop/src/components/BoardView.tsx — it explains what",
+    "this surface is for and where to put the control you were about to add (the OPENED card).",
+    "ALSO: AGENTS.md, `A surface-level invariant`; guard scripts/board-readonly-rule-check.sh.",
+  ].join("\n");
+
   it("has no free-form edit controls on the COLLAPSED board — inputs/selects/textareas appear only on open", () => {
     const { container } = render(<BoardView project={project} side="right" />);
     // No edit controls anywhere on the collapsed board (buttons exist: cards open detail, epics get
     // Start). The board is a read/navigate surface — the one deliberate exception is the comment
     // compose box, which lives on the OPENED card, not here.
-    expect(container.querySelector("input")).toBeNull();
-    expect(container.querySelector("select")).toBeNull();
-    expect(container.querySelector("textarea")).toBeNull();
-    expect(screen.queryByRole("textbox")).toBeNull();
-    expect(screen.queryByRole("combobox")).toBeNull();
+    expect(container.querySelector("input"), BOARD_READ_NAVIGATE_ONLY).toBeNull();
+    expect(container.querySelector("select"), BOARD_READ_NAVIGATE_ONLY).toBeNull();
+    expect(container.querySelector("textarea"), BOARD_READ_NAVIGATE_ONLY).toBeNull();
+    expect(screen.queryByRole("textbox"), BOARD_READ_NAVIGATE_ONLY).toBeNull();
+    expect(screen.queryByRole("combobox"), BOARD_READ_NAVIGATE_ONLY).toBeNull();
     // Opening detail introduces exactly ONE edit control — the comment compose box (the founder's
     // ask). Still no `input`/`select`: this is a comment thread, not an edit grid.
     fireEvent.click(screen.getByText("Backlog one"));
