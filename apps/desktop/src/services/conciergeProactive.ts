@@ -249,7 +249,7 @@ export interface ProactiveScheduler {
    * silently refused the text, the finding was destroyed AND suppressed at source for four hours.
    * `false` here is the caller's instruction to keep it owed and offer it again next sweep.
    */
-  notify(text: string, kind?: NoticeKind): boolean;
+  notify(text: string, kind?: NoticeKind, revalidate?: NoticeRevalidator): boolean;
   /**
    * What is owed right now, for a turn THE USER IS ABOUT TO START. CLAIMS NOTHING.
    *
@@ -333,10 +333,34 @@ export const PUSHER_NOTICE_PREAMBLE =
  */
 export type NoticeKind = "pusher" | "report";
 
+/**
+ * A DELIVERY-TIME LIVENESS TEST for a notice whose subject can resolve while the notice waits its
+ * turn — bead sparkle-st06sq. Returns `true` if the condition the notice describes is STILL TRUE at
+ * the instant it would be spoken, `false` if it has already resolved and the notice must be dropped
+ * unsaid.
+ *
+ * WHY THIS EXISTS: a picker "needs you" notice is raised the moment a build agent stops at a menu,
+ * but the push does not reach the concierge for seconds-to-a-minute — and the multi-question wizards
+ * that raise these live for exactly that long. So by delivery the menu is usually gone and the agent
+ * is working again: the notice describes a state that no longer exists, costs the concierge a
+ * `read_picker_options` round-trip to discover there is nothing to answer, and inflates the founder's
+ * "needs you" count with agents that need nothing. The predicate re-reads the live screen at delivery
+ * (via `read_picker_options`, comparing the menu fingerprint captured when the notice was raised) so a
+ * resolved menu is filtered out instead of answered.
+ *
+ * OPTIONAL AND FAIL-OPEN: a notice with no predicate is ALWAYS delivered (reports, PR/goal/branch
+ * findings — nothing here re-validates those), and a predicate that THROWS is treated as still-valid,
+ * because losing a real escalation is worse than one stale bullet. It only ever suppresses; it never
+ * manufactures a delivery.
+ */
+export type NoticeRevalidator = () => boolean;
+
 /** One owed notice: what to say, and which of the two instructions it must be said under. */
 export interface PendingNotice {
   kind: NoticeKind;
   text: string;
+  /** See {@link NoticeRevalidator}. Absent for notices whose subject cannot go stale before delivery. */
+  revalidate?: NoticeRevalidator;
 }
 
 /**
@@ -847,6 +871,33 @@ export function createProactiveScheduler(deps: ProactiveDeps): ProactiveSchedule
     }
   };
 
+  /**
+   * DELIVERY-TIME STALENESS FILTER (bead sparkle-st06sq). Re-test every owed notice that carries a
+   * {@link NoticeRevalidator} against the LIVE screen and drop the ones whose subject has already
+   * resolved — the picker "needs you" notices whose menu is gone by the time they would be spoken.
+   *
+   * Called at the two delivery seams and NOWHERE ELSE: `fire` (a proactive turn about to speak) and
+   * `peekNotices` (a user turn about to carry the owed set). Notices with no predicate are untouched.
+   *
+   * REMOVED THROUGH `clearOwed`, the file's single remover, so the "something is owed" flag and the
+   * armed timer come down with them and the scheduler is never left owed-with-nothing-owed. A
+   * predicate that THROWS is treated as still-valid (the notice survives): suppressing a real
+   * escalation on a transient read error is the costlier failure, so this can only ever DROP a menu
+   * it positively re-confirmed as gone.
+   */
+  const dropStaleNotices = () => {
+    if (pendingNotices.length === 0) return;
+    const stale = pendingNotices.filter((n) => {
+      if (n.revalidate === undefined) return false;
+      try {
+        return !n.revalidate();
+      } catch {
+        return false; // fail open — keep the notice, never lose a real escalation to a read error
+      }
+    });
+    if (stale.length > 0) clearOwed(stale);
+  };
+
   const dropPending = () => {
     pendingFeed = null;
     pendingDigest = null;
@@ -944,6 +995,12 @@ export function createProactiveScheduler(deps: ProactiveDeps): ProactiveSchedule
     // This is deliberately the outermost gate: neither the feed track nor the research track may
     // smuggle a turn past a dead credential.
     if (deps.credentialExpired?.()) return;
+    // RE-VALIDATE OWED NOTICES AGAINST THE LIVE SCREEN before any of them can be snapshotted into
+    // this turn (bead sparkle-st06sq). A picker "needs you" notice whose menu has resolved is dropped
+    // here, so it neither rides this turn nor holds the "something is owed" flag that would keep the
+    // scheduler firing. Only on the main track's turn — that is the only turn that carries notices,
+    // and re-reading the terminal is not free.
+    if (mainReady) dropStaleNotices();
     // NOTHING FROM THE MAIN TRACK IS READ WHEN IT IS NOT ITS TURN. A research wake can come due
     // while a feed change is still held by the two-minute floor; taking the feed here anyway would
     // let research smuggle the fleet past its own limiter, which is §3.3's objection with the
@@ -1178,7 +1235,7 @@ export function createProactiveScheduler(deps: ProactiveDeps): ProactiveSchedule
      *
      * There is deliberately NO path that returns `true` for text this scheduler did not accept.
      */
-    notify(text, kind = "pusher") {
+    notify(text, kind = "pusher", revalidate) {
       // (1) DISPOSED — see above.
       if (disposed) return false;
       const finding = text.trim();
@@ -1199,7 +1256,11 @@ export function createProactiveScheduler(deps: ProactiveDeps): ProactiveSchedule
       // `shift()` that discarded the oldest owed finding with no residue of any kind. Counted over
       // BOTH kinds, because what it bounds is this scheduler's memory, and memory is not per-kind.
       if (pendingNotices.length >= PENDING_NOTICE_HARD_CAP) return false;
-      pendingNotices.push({ kind, text: finding });
+      // The `revalidate` predicate rides WITH the notice so its liveness can be re-tested at delivery
+      // rather than at this raise time (bead sparkle-st06sq). The already-owed check above matched on
+      // (kind, text) and kept the incumbent, which is correct: a re-raise of the same picker carries
+      // an equivalent predicate over the same agent + fingerprint, so the incumbent's is as good.
+      pendingNotices.push({ kind, text: finding, revalidate });
       // Opens the coalescing window if nothing else has. A finding that arrives while a feed change
       // is already pending rides the same turn, which is the cheaper outcome for both.
       if (pendingSince === null) {
@@ -1282,6 +1343,11 @@ export function createProactiveScheduler(deps: ProactiveDeps): ProactiveSchedule
      */
     peekNotices() {
       if (disposed) return [];
+      // The user-turn delivery seam — re-validate here too (bead sparkle-st06sq), or a picker notice
+      // whose menu resolved while it sat owed rides the next USER turn unfiltered. Drops go through
+      // `clearOwed`, so a dropped notice is gone from `pendingNotices` and is neither returned here
+      // nor claimable afterwards.
+      dropStaleNotices();
       return [...pendingNotices];
     },
 

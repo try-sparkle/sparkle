@@ -217,7 +217,8 @@ describe("the notifier registration", () => {
     // subject — WHICH sink survived the remount — while pinning that the default did not drift:
     // a report reaching the Pusher's "act on each one now" preamble would tell the concierge to
     // go and undo work that already finished.
-    expect(newSink).toHaveBeenCalledWith("hello", "pusher");
+    // The third slot is the delivery-time revalidator (bead sparkle-st06sq): absent for this notice.
+    expect(newSink).toHaveBeenCalledWith("hello", "pusher", undefined);
     expect(oldSink).not.toHaveBeenCalled();
   });
 

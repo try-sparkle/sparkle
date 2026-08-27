@@ -81,6 +81,7 @@
 // (config.rs says so where it defaults `resume` to "ask"), which puts it adjacent to the `spend`
 // class the founder reserved for himself. It keeps today's behaviour until he says otherwise.
 import { notifyConcierge } from "../conciergeNotifier";
+import { readPickerOptions } from "../pickerRead";
 import { notePromptAnswerOutcome } from "../../engine/blockedPromptGrace";
 import { useSettingsStore } from "../../stores/settingsStore";
 import { useProjectStore } from "../../stores/projectStore";
@@ -170,7 +171,33 @@ export function handOffToConcierge(agentId: string, scrollback: string): boolean
     notePromptAnswerOutcome(agentId, "escalated");
     return true;
   }
-  const accepted = notifyConcierge(escalationNoticeText(agentLabelFor(agentId), verdict), "pusher");
+  // DELIVERY-TIME RE-VALIDATION (bead sparkle-st06sq). This notice may not reach the concierge for
+  // seconds-to-a-minute — longer than the multi-question wizards that raise it stay on any one
+  // question — so by the time it is spoken the menu is usually gone and the agent is working again.
+  // Capture the menu's fingerprint NOW and hand the notice a predicate that re-reads the live screen
+  // at delivery: a menu that has resolved (present=false) or moved to a DIFFERENT question
+  // (fingerprint mismatch) is dropped instead of answered, and a batch of notices for successive
+  // wizard states collapses to at most the one whose fingerprint still matches the live screen.
+  //
+  // ONLY WHEN THE READER CAN SEE THE MENU NOW. An empty fingerprint means `read_picker_options` is
+  // blind to a menu that IS on screen (bead sparkle-99o9a — a DISTINCT bug, explicitly out of scope
+  // here); attaching a predicate that re-reads through the same blind reader would drop the notice on
+  // the spot and suppress a legitimate escalation. No predicate = today's always-deliver behaviour,
+  // so this can only ever remove notices whose resolution it positively re-confirmed.
+  const detected = readPickerOptions(agentId);
+  const capturedFingerprint = detected.present ? detected.fingerprint : "";
+  const revalidate =
+    capturedFingerprint !== ""
+      ? () => {
+          const live = readPickerOptions(agentId);
+          return live.present && live.fingerprint === capturedFingerprint;
+        }
+      : undefined;
+  const accepted = notifyConcierge(
+    escalationNoticeText(agentLabelFor(agentId), verdict),
+    "pusher",
+    revalidate,
+  );
   if (!accepted) {
     log.warn("approvals", "concierge hand-off refused; the prompt goes to the founder", { agentId });
     return false;

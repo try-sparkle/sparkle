@@ -23,19 +23,31 @@ beforeEach(() => {
 
 describe("notifyConcierge — the kind reaches the sink", () => {
   it("passes an explicit kind through", () => {
-    const sink = vi.fn((_text: string, _kind?: NoticeKind) => true);
+    const sink = vi.fn((_text: string, _kind?: NoticeKind, _revalidate?: () => boolean) => true);
     setConciergeNotifier(sink);
     expect(notifyConcierge("Retired “Kraken Auth”.", "report")).toBe(true);
     // THE SIDE EFFECT: what the sink actually received. Asserting only the `true` return would pass
     // against a version that dropped the kind on the floor, which is the whole defect this guards.
-    expect(sink).toHaveBeenCalledWith("Retired “Kraken Auth”.", "report");
+    // The third slot is the delivery-time revalidator (bead sparkle-st06sq): absent for a report.
+    expect(sink).toHaveBeenCalledWith("Retired “Kraken Auth”.", "report", undefined);
   });
 
   it("defaults to `pusher`, so every existing caller keeps its meaning", () => {
-    const sink = vi.fn((_text: string, _kind?: NoticeKind) => true);
+    const sink = vi.fn((_text: string, _kind?: NoticeKind, _revalidate?: () => boolean) => true);
     setConciergeNotifier(sink);
     notifyConcierge("Two agents are walled.");
-    expect(sink).toHaveBeenCalledWith("Two agents are walled.", "pusher");
+    expect(sink).toHaveBeenCalledWith("Two agents are walled.", "pusher", undefined);
+  });
+
+  it("forwards the delivery-time revalidator to the sink (bead sparkle-st06sq)", () => {
+    // A picker notice carries a predicate the scheduler re-tests at delivery. If `notifyConcierge`
+    // dropped it on the way through, the scheduler could never drop a stale menu — so the predicate
+    // reaching the sink verbatim is the load-bearing side effect, exactly as the kind is.
+    const sink = vi.fn((_text: string, _kind?: NoticeKind, _revalidate?: () => boolean) => true);
+    setConciergeNotifier(sink);
+    const revalidate = () => false;
+    notifyConcierge("Agent A is STOPPED at a menu", "pusher", revalidate);
+    expect(sink).toHaveBeenCalledWith("Agent A is STOPPED at a menu", "pusher", revalidate);
   });
 });
 

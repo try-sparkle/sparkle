@@ -41,7 +41,7 @@
 // listening" and "the message was accepted" are two facts and only the second one is reported.
 
 import { log } from "../logger";
-import type { NoticeKind } from "./conciergeProactive";
+import type { NoticeKind, NoticeRevalidator } from "./conciergeProactive";
 
 /**
  * What a registered sink looks like — `ProactiveScheduler.notify`, structurally.
@@ -53,7 +53,11 @@ import type { NoticeKind } from "./conciergeProactive";
  * contract is now the same one `notifyConcierge` publishes to its callers — true only if the text is
  * genuinely owed and will be acted on.
  */
-export type ConciergeNotifier = (text: string, kind?: NoticeKind) => boolean;
+export type ConciergeNotifier = (
+  text: string,
+  kind?: NoticeKind,
+  revalidate?: NoticeRevalidator,
+) => boolean;
 
 let sink: ConciergeNotifier | null = null;
 
@@ -103,14 +107,18 @@ export function conciergeNotifierAvailable(): boolean {
  * a rate-budget slot and stamp the condition as reported for four hours, so the finding was not just
  * lost but suppressed at source. A sink that says no is now propagated as no.
  */
-export function notifyConcierge(text: string, kind: NoticeKind = "pusher"): boolean {
+export function notifyConcierge(
+  text: string,
+  kind: NoticeKind = "pusher",
+  revalidate?: NoticeRevalidator,
+): boolean {
   const fn = sink;
   if (fn === null) {
     log.debug("pusher", "concierge push dropped — no notifier registered in this window");
     return false;
   }
   try {
-    const accepted = fn(text, kind);
+    const accepted = fn(text, kind, revalidate);
     if (!accepted) {
       // A REFUSAL IS NOT AN ERROR, and it is not silence either: the sink is alive and declining
       // this specific text, so it is worth a line the way a failed inbox write is. The finding

@@ -761,6 +761,89 @@ describe("notify — the Pusher's second input (sparkle-4cd0x)", () => {
   });
 });
 
+describe("a picker notice is re-validated at DELIVERY, not at raise (bead sparkle-st06sq)", () => {
+  // THE BUG: a "needs you" picker notice is raised the moment a build agent stops at a menu, but the
+  // push does not reach the concierge for seconds-to-a-minute — longer than the multi-question wizards
+  // that raise it stay on any one question. So by delivery the menu is GONE and the agent is working
+  // again: measured, 20 of 20 picker notices across three concierge turns described a state that no
+  // longer existed. The fix carries a liveness predicate ON the notice and re-tests it at the two
+  // delivery seams, dropping any whose menu has resolved.
+  //
+  // THE PAIRING IS THE PROOF. A notice whose predicate still holds is delivered; the one beside it
+  // whose predicate has gone false is dropped — same turn, same channel, differing only in the live
+  // state the predicate reads. Delete the `dropStaleNotices` calls in `fire`/`peekNotices` and the
+  // stale notice rides the turn, reding the "not delivered" assertions. Asserting only the drop would
+  // pass against a channel that delivered NOTHING, which is why the live half is tested in the same
+  // breath.
+
+  it("drops the resolved one and delivers the still-live one, in the same turn", () => {
+    const h = harness();
+    const s = createProactiveScheduler(h.deps);
+    // Raised together, as a wizard's successive questions are. By the time the coalescing window
+    // elapses, the first menu has resolved (predicate false) and the second is still on screen.
+    s.notify("Agent A is STOPPED at a menu — question one", "pusher", () => false);
+    s.notify("Agent B is STOPPED at a menu — still on screen", "pusher", () => true);
+    h.advance(PROACTIVE_COALESCE_MS);
+    expect(h.fired).toHaveLength(1);
+    expect(h.fired[0]!.prompt).toContain("Agent B is STOPPED at a menu — still on screen");
+    expect(h.fired[0]!.prompt).not.toContain("Agent A is STOPPED at a menu — question one");
+    s.dispose();
+  });
+
+  it("fires NO turn at all when the only owed picker notice has already resolved", () => {
+    // The common case the founder measured: every picker notice in the batch is stale. Nothing is
+    // spoken, so no read_picker_options round-trip is spent and the "needs you" count is not inflated.
+    const h = harness();
+    const s = createProactiveScheduler(h.deps);
+    s.notify("Agent A is STOPPED at a menu that is already gone", "pusher", () => false);
+    h.advance(PROACTIVE_COALESCE_MS);
+    expect(h.fired).toEqual([]);
+    // And the owed flag came down with it — no armed timer is left ticking on a resolved notice.
+    expect(h.pending()).toBe(0);
+    s.dispose();
+  });
+
+  it("drops a resolved picker notice from the USER-turn seam too, so it never rides a user turn", () => {
+    // peekNotices is the other delivery path — an owed notice riding a turn the user started. A menu
+    // that resolved while the notice sat owed must be filtered here as well, or it reaches the
+    // concierge unfiltered on the next user turn.
+    const h = harness();
+    const s = createProactiveScheduler(h.deps);
+    s.notify("Agent A — resolved before the user's next turn", "pusher", () => false);
+    s.notify("Agent B — still live", "pusher", () => true);
+    expect(s.peekNotices().map((n) => n.text)).toEqual(["Agent B — still live"]);
+    s.dispose();
+  });
+
+  it("a notice with NO predicate is always delivered — reports and feed findings never go stale", () => {
+    // The predicate is opt-in. Everything without one (a retirement report, a PR/goal finding) is
+    // delivered exactly as before, so this can only ever suppress a menu it positively re-confirmed
+    // as gone — never a notice whose subject cannot resolve underneath it.
+    const h = harness();
+    const s = createProactiveScheduler(h.deps);
+    s.notify("Retired Kraken Auth — its PR merged 4h ago", "report");
+    h.advance(PROACTIVE_COALESCE_MS);
+    expect(h.fired).toHaveLength(1);
+    expect(h.fired[0]!.prompt).toContain("Retired Kraken Auth — its PR merged 4h ago");
+    s.dispose();
+  });
+
+  it("FAILS OPEN — a predicate that throws keeps the notice rather than losing a real escalation", () => {
+    // A transient read error (pane mid-remount, scrollback momentarily unavailable) must not delete a
+    // notice that may describe a live menu. Losing a real "needs you" is the costlier failure, so a
+    // throwing predicate is treated as still-valid.
+    const h = harness();
+    const s = createProactiveScheduler(h.deps);
+    s.notify("Agent A is STOPPED at a menu — read threw", "pusher", () => {
+      throw new Error("scrollback unavailable");
+    });
+    h.advance(PROACTIVE_COALESCE_MS);
+    expect(h.fired).toHaveLength(1);
+    expect(h.fired[0]!.prompt).toContain("Agent A is STOPPED at a menu — read threw");
+    s.dispose();
+  });
+});
+
 describe("NOTHING OWED IS EVER SILENTLY LOST (bead sparkle-qogah)", () => {
   // FOUNDER'S RULE, VERBATIM, P0: "We should never hide a row that needs action from me."
   //

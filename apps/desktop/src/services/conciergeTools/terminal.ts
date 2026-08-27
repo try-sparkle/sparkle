@@ -74,7 +74,6 @@ import {
 import { isDispatchAuthority, type ConciergeToolAuthority } from "../dispatchAuthority";
 import { PtyGoneError, writePtyChainedStrict } from "../../pty";
 import { searchHistory } from "../history";
-import { pickerParseDiagnosis, type PickerBlindness } from "../suggestions/heuristics";
 import { SNAPSHOT_MAX_LINES, getAgentScrollback } from "../terminalScrollback";
 import {
   agentConfigDir,
@@ -1357,60 +1356,15 @@ export const CONCIERGE_TERMINAL_TOOLS = [
 //   • the press goes through the SAME authority-gated write as any other send, so a picked option is
 //     attributable to a toolCallId exactly like typed text.
 
-/** One option as the concierge sees it. `index` is what `select_picker_option` takes. */
-export interface PickerOptionView {
-  index: number;
-  label: string;
-}
-
-export interface PickerOptionsRead {
-  agentId: string;
-  /** Empty when there is no menu on screen — a normal state, not an error. */
-  options: PickerOptionView[];
-  /** True when the agent has a live prompt with options right now. */
-  present: boolean;
-  /** Echo this back to `select_picker_option`. It identifies the MENU, so a different question with
-   *  the same option labels (every numbered menu) cannot be answered by mistake.
-   *
-   *  EMPTY MEANS UNANSWERABLE, in either of two ways: there is no menu, or there is one but its
-   *  question could not be located — and without the question there is nothing that distinguishes
-   *  this ask from any other with the same option shape, which for both shapes that reach here is a
-   *  global constant. `select_picker_option` refuses on an empty fingerprint rather than comparing
-   *  it, so the two collapse to the same safe outcome and the caller never has to tell them apart. */
-  fingerprint: string;
-  /** WHY there is nothing to press, when `present` is false. Absent when a menu WAS read.
-   *
-   *  REPORTING, NOT A DECISION. Nothing branches on this and nothing may: the refusal is unchanged
-   *  and does not soften for any value. It exists because an empty read used to be indistinguishable
-   *  from an agent that is simply working, so the concierge could not tell the human WHICH agent
-   *  needed a click and why — and no occurrence left a trace anyone could count afterwards, which is
-   *  why bead sparkle-99o9a took four hand-observed incidents to characterise. */
-  blind?: "pane-not-mounted" | PickerBlindness;
-}
-
-/** Read the options an agent is offering, so the caller can decide (or relay them to the human). */
-export function readPickerOptions(agentId: string): PickerOptionsRead {
-  const live = liveOptionsFor(agentId);
-  if (live.length > 0) {
-    return {
-      agentId,
-      options: live.map((o, index) => ({ index, label: o.label })),
-      present: true,
-      fingerprint: pickerFingerprint(agentId, live),
-    };
-  }
-  // Empty. Say WHY — see `pickerParseDiagnosis`. The pane-not-mounted case is answered here rather
-  // than by the parser because the parser is handed `""` either way and cannot tell "the agent has
-  // no menu" from "this window cannot see that agent's terminal at all".
-  const scrollback = getAgentScrollback(agentId);
-  return {
-    agentId,
-    options: [],
-    present: false,
-    fingerprint: "",
-    blind: scrollback === null ? "pane-not-mounted" : pickerParseDiagnosis(scrollback),
-  };
-}
+// THE READ LIVES IN `services/pickerRead` — a leaf whose only imports are the three it genuinely
+// needs. Same reasoning as the transcript registry above: keeping the reader next to the writes it
+// guards reads well, but it forced every caller of the READ to import this whole domain module, and
+// with it `SNAPSHOT_MAX_LINES` at module scope. `suggestions/conciergeHandoff` needs the read to
+// re-validate a notice at delivery, and reaching for it here killed three `useSuggestions` suites at
+// COLLECTION and tripped the composer/improvement-pass latch in one move. The split falls on the
+// line that latch already draws: the READ is a pure query and may be reached from anywhere, the
+// WRITES below stay behind the boundary. Re-exported so this module's public surface is unchanged.
+export { readPickerOptions, type PickerOptionView, type PickerOptionsRead } from "../pickerRead";
 
 export interface SelectPickerResult {
   ok: boolean;
