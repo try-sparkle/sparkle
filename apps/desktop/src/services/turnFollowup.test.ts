@@ -2,6 +2,14 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 
 const invokeMock = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...args: unknown[]) => invokeMock(...args) }));
+// Isolate the judge orchestration from the account-failover subsystem: by default it resolves to
+// "no failover" (undefined) so it makes no extra `invoke` calls and the happy-path call shape is
+// unchanged. A dedicated wiring test below overrides it to prove the chosen configDir is forwarded.
+vi.mock("./accountSelection", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./accountSelection")>()),
+  oneshotFailoverConfigDir: vi.fn().mockResolvedValue(undefined),
+}));
+import { oneshotFailoverConfigDir } from "./accountSelection";
 
 import {
   mightNeedFollowup,
@@ -288,6 +296,22 @@ describe("judgeNeedsFollowup (orchestration)", () => {
     });
     // A real verdict of DONE — distinct from `unknown`, which is the absence of one.
     expect(result).toEqual({ verdict: "done" });
+  });
+
+  it("forwards the failover configDir into the judge invoke when the default account is walled", async () => {
+    // THE SPAWN HALF of the failover: the judge must run under the chosen account, or it stays pinned
+    // to the walled default. The default mock returns undefined, so no other test covers this seam.
+    invokeMock.mockResolvedValueOnce("DONE");
+    vi.mocked(oneshotFailoverConfigDir).mockResolvedValueOnce("/cfg/healthy-sibling");
+    await judgeNeedsFollowup({
+      task: "Ship the release",
+      response: "All secrets are in. Want me to land it now?", // ambiguous → the judge actually runs
+    });
+    const body = invokeMock.mock.calls.find((c) => c[0] === "judge_turn_followup")?.[1] as Record<
+      string,
+      unknown
+    >;
+    expect(body.configDir).toBe("/cfg/healthy-sibling");
   });
 
   it("reports UNKNOWN — never a red — when the judge cannot run on a STRONG ask", async () => {

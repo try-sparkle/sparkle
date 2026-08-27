@@ -75,6 +75,10 @@ pub async fn summarize_attention(
     // Display name of the project whose agent is asking. Diagnostic only now — it used to attribute
     // a credit debit, and there is no longer a debit to attribute.
     project: Option<String>,
+    // The account config dir this call should run under, or None to inherit the ambient default
+    // account. The JS failover selector supplies a healthy account here when the default is walled.
+    // See `claude_oneshot::OneShot::config_dir`.
+    config_dir: Option<String>,
 ) -> Result<String, String> {
     let screen = tail(&screen, SCREEN_TAIL_CHARS);
     // Nothing to summarize — an empty screen isn't an ask. (The caller pre-filters, but a
@@ -87,7 +91,9 @@ pub async fn summarize_attention(
     // runtime's worker threads, exactly as the proxy call it replaced did. The Sparkle bearer read
     // and its "not signed in" precondition are gone: this runs on the user's own Claude Code login.
     let outcome =
-        tauri::async_runtime::spawn_blocking(move || call_summarize(&screen, project.as_deref()))
+        tauri::async_runtime::spawn_blocking(move || {
+            call_summarize(&screen, project.as_deref(), config_dir.as_deref())
+        })
             .await
             .map_err(|e| format!("join error: {e}"))?;
     crate::claude_oneshot::finish_cacheable(&app, outcome)
@@ -110,6 +116,9 @@ fn summary_request<'a>(screen: &'a str, project: Option<&'a str>) -> OneShot<'a>
         cacheable: true,
         purpose: "attention-summary",
         project,
+        // Set per-call by `call_summarize` from the JS failover selector; the builder defaults to the
+        // ambient account. See `claude_oneshot::OneShot::config_dir`.
+        config_dir: None,
     }
 }
 
@@ -117,8 +126,15 @@ fn summary_request<'a>(screen: &'a str, project: Option<&'a str>) -> OneShot<'a>
 ///
 /// The pair is `(Result, bool)` rather than `Result<(..), ..>` ON PURPOSE: the spawn evidence must
 /// survive an EMPTY-summary rejection. See `claude_oneshot::finish_cacheable` and roborev 57507.
-fn call_summarize(screen: &str, project: Option<&str>) -> (Result<String, String>, bool) {
-    match run(summary_request(screen, project)) {
+fn call_summarize(
+    screen: &str,
+    project: Option<&str>,
+    config_dir: Option<&str>,
+) -> (Result<String, String>, bool) {
+    let mut req = summary_request(screen, project);
+    // Route to the failover account when one was chosen; None/"" leaves the ambient default.
+    req.config_dir = config_dir;
+    match run(req) {
         // The run itself failed — no health to report; the JS wrapper records the failure instead.
         Err(e) => (Err(e), false),
         Ok(reply) => interpret_summary_reply(reply),

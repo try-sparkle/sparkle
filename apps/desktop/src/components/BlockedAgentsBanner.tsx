@@ -32,9 +32,9 @@ import {
 import { useBlockedSubsystemsStore } from "../stores/blockedSubsystemsStore";
 import { useAccountLimitStore } from "../stores/accountLimitStore";
 import { loadAccountState, stickyAccountSnapshot, CONCIERGE_ACCOUNT_KEY } from "../services/accountSelection";
-import { accountDisplay, type Account, type Identity } from "../services/accountStore";
+import { accountDisplay, signedInAccountIds, type Account, type Identity } from "../services/accountStore";
 import { SPARKLE_AGENT_ID, isSparkleAgentId } from "../services/sparkleAgent";
-import { oneshotAccountId } from "../engine/usageLimit";
+import { effectiveOneshotAccount } from "../engine/usageLimit";
 import { paneAccountMap } from "../services/paneControl";
 import { useProjectStore } from "../stores/projectStore";
 import { useUiStore } from "../stores/uiStore";
@@ -180,19 +180,35 @@ export function BlockedAgentsBanner({ deps }: { deps?: Partial<BlockedAgentsBann
     if (!shouldPoll) return;
     let alive = true;
     const check = () => {
-      load({ withIdentities: false }).then((state) => {
+      // WITH IDENTITIES — needed here specifically for the AI-Enhanced failover. This poll runs only
+      // while a limit is indicated (see `shouldPoll`), and to decide whether AI-Enhanced is REALLY
+      // blocked we must know whether a healthy SIGNED-IN sibling exists to fail over to
+      // (`effectiveOneshotAccount`). Without identities every account reads as signed-out, no failover
+      // target is ever found, and the bar would keep naming AI-Enhanced blocked while the spawn
+      // (`oneshotFailoverConfigDir`) had quietly rotated — the exact banner/spawn disagreement the
+      // single-source selector exists to prevent. `blockedAccountName` still resolves by nickname,
+      // never email.
+      load({ withIdentities: true }).then((state) => {
         if (!alive) return;
         const paneMap = panes();
-        // accountId → privacy-safe display name. `withIdentities: false` means `state.identities` is
-        // empty, so `blockedAccountName` resolves each account by its nickname (never its email) — the
-        // whole point of that helper. Any identities present are looked up defensively all the same.
+        // accountId → privacy-safe display name (nickname, never email — the point of the helper).
         const identityById = new Map(state.identities.map((i) => [i.id, i]));
         const accountNames: Record<string, string> = {};
         for (const a of state.accounts) accountNames[a.id] = blockedAccountName(a, identityById.get(a.id));
         const list = computeBlockedSubsystems({
           now: Date.now(),
           usage: state.usage,
-          oneshotAccountId: oneshotAccountId(state.accounts),
+          // The account AI-Enhanced ACTUALLY runs under, accounting for failover: when the default is
+          // walled but a healthy signed-in sibling exists, this resolves to the sibling, so the bar
+          // stops naming AI-Enhanced blocked exactly when the spawn has rotated to it. Same single
+          // source the spawn reads (`oneshotFailoverConfigDir`), so the two cannot disagree.
+          oneshotAccountId:
+            effectiveOneshotAccount({
+              accounts: state.accounts,
+              usage: state.usage,
+              signedInIds: new Set(signedInAccountIds(state.identities)),
+              now: Date.now(),
+            })?.id ?? null,
           improveSparkleAccountId: sticky(SPARKLE_AGENT_ID) ?? null,
           conciergeAccountId: sticky(CONCIERGE_ACCOUNT_KEY) ?? null,
           panes: Object.entries(paneMap).map(([agentId, accountId]) => ({ agentId, accountId })),

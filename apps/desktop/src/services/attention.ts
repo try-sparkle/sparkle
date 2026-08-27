@@ -6,6 +6,7 @@ import type { RosterPayload } from "./relayClient";
 import type { Roster } from "./rosterTypes";
 import type { StatusBand } from "../engine/buildSections";
 import { noteAiProviderFailure, noteAiServiceFailure } from "./anthropic";
+import { oneshotFailoverConfigDir } from "./accountSelection";
 
 const hasTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
@@ -55,7 +56,11 @@ export async function summarizeAttention(
 ): Promise<string | null> {
   if (!hasTauri) return null;
   try {
-    const summary = await invoke<string>("summarize_attention", { screen, project });
+    // Route off a walled default account to a healthy signed-in one when possible; undefined leaves
+    // the ambient default and is dropped from the invoke. See
+    // `accountSelection.oneshotFailoverConfigDir`.
+    const configDir = await oneshotFailoverConfigDir();
+    const summary = await invoke<string>("summarize_attention", { screen, project, configDir });
     // NO healthy-report. summarize_attention is `cacheable: true`, and claude_oneshot serves a
     // cache hit before acquiring a permit or spawning anything — and its own doc says the point is
     // that a re-raised identical prompt must not re-summarize, so a persistent unanswered prompt

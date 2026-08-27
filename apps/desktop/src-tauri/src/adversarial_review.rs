@@ -667,6 +667,10 @@ pub(crate) fn review_request<'a>(
         cacheable: false,
         purpose: "Adversarial diff review",
         project,
+        // Adversarial review is not an AI-Enhanced surface and does not participate in the failover
+        // selector; it runs on the ambient default account, unchanged. See
+        // `claude_oneshot::OneShot::config_dir`.
+        config_dir: None,
     }
 }
 

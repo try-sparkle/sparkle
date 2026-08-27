@@ -39,6 +39,7 @@
 //
 // PURE. `now` is injected, so every rule is tested as arithmetic rather than by faking timers.
 import type { Usage } from "../services/accountStore";
+import { exhaustedAccountIds } from "./blockedSubsystems";
 
 /** A limit we can positively see, with the instant it lifts. `null` means NO POSITIVE EVIDENCE —
  *  never "no limit". */
@@ -94,6 +95,66 @@ export function oneshotAccountId(
   accounts: readonly { id: string; isDefault: boolean }[],
 ): string | null {
   return accounts.find((a) => a.isDefault)?.id ?? accounts[0]?.id ?? null;
+}
+
+/** One account as the failover selector needs to see it. `configDir` is the absolute
+ *  `CLAUDE_CONFIG_DIR` for this account (the default account records `""` — "inherit"). */
+export interface OneshotAccountCandidate {
+  id: string;
+  isDefault: boolean;
+  configDir: string;
+}
+
+/** Inputs to {@link effectiveOneshotAccount}. All already read from the observable seams. */
+export interface EffectiveOneshotInput {
+  accounts: readonly OneshotAccountCandidate[];
+  /** Per-account observed exhaustion (`exhaustedUntil` epoch ms, or null when not benched). */
+  usage: readonly { id: string; exhaustedUntil: number | null }[];
+  /** Ids that are signed in (a usable Claude login). A failover target must be here, or routing to
+   *  it would just fail into `claude_not_authenticated`. */
+  signedInIds: ReadonlySet<string>;
+  /** Injected clock (epoch ms). */
+  now: number;
+}
+
+/**
+ * The account AI-Enhanced one-shots should ACTUALLY run under, accounting for failover.
+ *
+ * WHY THIS EXISTS. {@link oneshotAccountId} names the DEFAULT account and is failover-blind, so when
+ * that account's Claude subscription hits its session limit, every AI-Enhanced feature is blocked at
+ * once and the red "Blocked due to session limits …" bar strands the user even when another healthy
+ * account is signed in (`sparkle-v3tz8j`; `sparkle-59a0w` defect #4). This picks a healthy sibling
+ * to hand off to, and is the SINGLE SOURCE both the banner (which account it reports as blocked) and
+ * the spawn (`services/accountSelection.oneshotFailoverConfigDir` → `CLAUDE_CONFIG_DIR`) read from,
+ * so the two cannot disagree — a banner that clears while the spawn still fails, or vice-versa, is
+ * exactly the split this avoids.
+ *
+ * THE RULE, in order:
+ *   • Default account NOT walled → the default account (unchanged, ambient — the happy path).
+ *   • Default walled AND a healthy (signed-in, not walled) sibling exists → that sibling (fail over).
+ *   • Default walled and NOTHING healthy to hand off to → the default account, so the block is
+ *     HONEST and the banner shows. Failover must never invent a target that is not actually usable.
+ *
+ * Returns null only when there are no accounts at all. PURE.
+ */
+export function effectiveOneshotAccount(
+  input: EffectiveOneshotInput,
+): OneshotAccountCandidate | null {
+  const { accounts, usage, signedInIds, now } = input;
+  const defaultAcct = accounts.find((a) => a.isDefault) ?? accounts[0];
+  if (!defaultAcct) return null;
+
+  const exhausted = exhaustedAccountIds(usage, now);
+  // Happy path: the default account is usable, so run there exactly as before this selector existed.
+  if (!exhausted.has(defaultAcct.id)) return defaultAcct;
+
+  // Default is walled — hand off to the first healthy signed-in sibling, if any. Array order is the
+  // stable tie-break; a walled or signed-out account is never a target.
+  const healthy = accounts.find(
+    (a) => a.id !== defaultAcct.id && signedInIds.has(a.id) && !exhausted.has(a.id),
+  );
+  // No healthy alternative → stay on the walled default so the banner tells the truth.
+  return healthy ?? defaultAcct;
 }
 
 /** How often to re-ask while a limit IS showing. Only runs then, so a healthy machine pays nothing. */

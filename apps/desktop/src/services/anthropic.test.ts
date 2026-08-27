@@ -4,6 +4,14 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
 const invokeMock = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...a: unknown[]) => invokeMock(...a) }));
+// Isolate chatOnce from the account-failover subsystem: default "no failover" (undefined) so it
+// makes no extra `invoke` calls and the legacy call shape is byte-identical. A wiring test below
+// overrides it to prove the chosen configDir is forwarded.
+vi.mock("./accountSelection", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./accountSelection")>()),
+  oneshotFailoverConfigDir: vi.fn().mockResolvedValue(undefined),
+}));
+import { oneshotFailoverConfigDir } from "./accountSelection";
 
 import {
   AiBusyError,
@@ -306,6 +314,21 @@ describe("chatOnce", () => {
       purpose: "Renamed agent to 'Fix OAuth loop'",
       project: "sparkle-desktop",
     });
+  });
+
+  it("forwards the failover configDir into the invoke body when the default account is walled", async () => {
+    // THE SPAWN HALF of the failover: chatOnce must hand the chosen account down to the Rust command
+    // as `configDir`, or suggestions/composer stay pinned to the walled default. Without this seam
+    // test the wiring is covered by nothing — the default mock returns undefined, so every other test
+    // exercises only the no-failover shape.
+    invokeMock.mockResolvedValue("ok");
+    vi.mocked(oneshotFailoverConfigDir).mockResolvedValueOnce("/cfg/healthy-sibling");
+    await chatOnce("sys", "usr", 256, { purpose: "Suggesting next actions" });
+    const body = invokeMock.mock.calls.find((c) => c[0] === "anthropic_chat")?.[1] as Record<
+      string,
+      unknown
+    >;
+    expect(body.configDir).toBe("/cfg/healthy-sibling");
   });
 
   it("omits project when only a purpose is known — no empty-string stand-in", async () => {

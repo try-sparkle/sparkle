@@ -34,6 +34,7 @@ import { invoke } from "@tauri-apps/api/core";
 // two detectors that could disagree later would be the same bug with extra steps.
 import { detectTerminalPrompts } from "./suggestions/heuristics";
 import { noteAiProviderFailure, noteAiServiceFailure } from "./anthropic";
+import { oneshotFailoverConfigDir } from "./accountSelection";
 import { log } from "../logger";
 
 // Only the TAIL of a turn carries the ask — agents put "Want me to…?" in the last line(s), after a
@@ -304,10 +305,15 @@ export async function judgeNeedsFollowup(args: {
   // (never a genuine verdict re-interpreted as an availability failure).
   let raw: string;
   try {
+    // Route off a walled default account to a healthy signed-in one when possible; undefined leaves
+    // the ambient default and is dropped from the invoke. See
+    // `accountSelection.oneshotFailoverConfigDir`.
+    const configDir = await oneshotFailoverConfigDir();
     raw = await invoke<string>("judge_turn_followup", {
       task: args.task,
       response: args.response,
       project: args.project,
+      configDir,
     });
     // NO healthy-report, unlike the same wrapper on main. This branch runs the call through
     // claude_oneshot with `cacheable: true`, and a cache hit is served BEFORE a permit is acquired

@@ -182,6 +182,23 @@ pub(crate) struct OneShot<'a> {
     pub purpose: &'a str,
     /// Diagnostic only now — was ledger attribution. Kept so the field is READ, not dead.
     pub project: Option<&'a str>,
+    /// The account config dir to run THIS call under (`CLAUDE_CONFIG_DIR`), or `None` to inherit
+    /// Sparkle's ambient env — i.e. the DEFAULT account (`isDefault`, `$HOME/.claude`).
+    ///
+    /// WHY THIS EXISTS. AI-Enhanced (naming, judge, attention, suggestions) used to be pinned to the
+    /// ambient default account with no way to move off it: `spawn_claude` set only `PATH` and never
+    /// `CLAUDE_CONFIG_DIR`. So when the default account's Claude subscription hit its session limit,
+    /// every enhancement feature was blocked at once and the red "Blocked due to session limits …"
+    /// bar stranded the user even when another healthy signed-in account existed
+    /// (`sparkle-v3tz8j`; `sparkle-59a0w` defect #4). The JS layer's failover selector
+    /// (`engine/usageLimit.ts` `effectiveOneshotAccount`) now hands down a healthy account's config
+    /// dir here so the call rotates instead of failing.
+    ///
+    /// EMPTY STRING MEANS "INHERIT", exactly as everywhere else: the default account records
+    /// `config_dir: ""` to mean "export no `CLAUDE_CONFIG_DIR`" (see `claude::spawn_env_config_dir`),
+    /// so `Some("")` is treated identically to `None`. That keeps the happy path — default account
+    /// healthy — byte-identical to before this field existed.
+    pub config_dir: Option<&'a str>,
 }
 
 /// What one run yielded, decided from the parsed JSON ALONE — never from the exit status.
@@ -834,9 +851,13 @@ pub(crate) fn run(req: OneShot<'_>) -> Result<OneShotReply, String> {
         // right for a machine with no `claude` on PATH.
         "ai_unconfigured".to_string()
     })?;
-    // Read off the request before it moves into `run_with`.
+    // Read off the request before it moves into `run_with`. `config_dir` is owned into the closure
+    // so the chosen account survives the move — see `OneShot::config_dir`.
     let timeout = req.timeout;
-    run_with(req, &|args| spawn_claude(&claude_path, args, timeout))
+    let config_dir = req.config_dir.map(str::to_owned);
+    run_with(req, &|args| {
+        spawn_claude(&claude_path, args, timeout, config_dir.as_deref())
+    })
 }
 
 /// The testable core. `spawn` is injected so the parse/permit/cache logic is exercised by the REAL
@@ -1059,10 +1080,24 @@ fn is_usable_result(stdout: &str) -> bool {
 ///
 /// Deliberately NOT concierge's spawn: concierge has no wall-clock bound at all, which is survivable
 /// for a user-visible turn they can cancel and is not survivable for a background judge.
-fn spawn_claude(claude_path: &str, args: &[String], timeout: Duration) -> Result<String, String> {
+/// Build (but do not run) the `claude` child command for a one-shot call.
+///
+/// Split out from [`spawn_claude`] so the env decisions — the Anthropic scrub, the failover
+/// `CLAUDE_CONFIG_DIR`, and the login `PATH` — are inspectable with `Command::get_envs` WITHOUT
+/// executing the CLI (the same testing seam `spawn_env_removes_…` already uses). Each of those is a
+/// silent decision that compiles fine when wrong: a dropped `apply_spawn_config_dir` would pin every
+/// AI-Enhanced call back to the walled default account with nothing red, which is exactly the
+/// regression this whole change removes.
+fn build_claude_command(claude_path: &str, args: &[String], config_dir: Option<&str>) -> Command {
     let mut cmd = Command::new(claude_path);
     cmd.args(args);
     scrub_anthropic_env(&mut cmd);
+    // Route this call to the chosen account when one was handed down (AI-Enhanced failover off a
+    // walled default), or leave the child inheriting our ambient `CLAUDE_CONFIG_DIR` when not. The
+    // SAME child-only helper the build-agent/concierge/improve spawns use, so the four AI-Enhanced
+    // features cannot drift from them — and an empty string is treated as "inherit" there, which is
+    // what the default account records. See `OneShot::config_dir`.
+    crate::claude::apply_spawn_config_dir(&mut cmd, config_dir);
     // Same PATH story as claude_chat/concierge: a Finder-launched .app inherits no shell PATH, so
     // hand the child the login PATH we captured once, with ~/.local/bin prepended (the CLI's
     // `#!/usr/bin/env node` shebang has to resolve).
@@ -1072,6 +1107,16 @@ fn spawn_claude(claude_path: &str, args: &[String], timeout: Duration) -> Result
     // into. The temp dir needs no AppHandle, which keeps `run()` callable from any of the five
     // migrated modules without plumbing one through.
     cmd.current_dir(std::env::temp_dir());
+    cmd
+}
+
+fn spawn_claude(
+    claude_path: &str,
+    args: &[String],
+    timeout: Duration,
+    config_dir: Option<&str>,
+) -> Result<String, String> {
+    let cmd = build_claude_command(claude_path, args, config_dir);
 
     let output = crate::worktree::output_with_timeout(cmd, timeout).map_err(|e| {
         if e.contains("timed out") {
@@ -1772,6 +1817,7 @@ mod tests {
             cacheable,
             purpose: "test",
             project: None,
+            config_dir: None,
         }
     }
 
@@ -3151,6 +3197,40 @@ mod tests {
         assert!(removed.contains(&"ANTHROPIC_BASE_URL".to_string()));
     }
 
+    /// The failover fix's load-bearing wire: a chosen account's config dir must reach the child as
+    /// `CLAUDE_CONFIG_DIR`, and NO override must leave the child inheriting our ambient default (an
+    /// empty string means the default account, so it too must force nothing). Inspects the built
+    /// command with `get_envs` — no CLI is executed, so it runs on every platform.
+    #[test]
+    fn a_chosen_config_dir_is_forced_on_the_child_and_none_leaves_the_ambient_default() {
+        let forced_config_dir = |config_dir: Option<&str>| -> Option<String> {
+            let cmd = build_claude_command("/bin/echo", &[], config_dir);
+            cmd.get_envs()
+                .find(|(k, _)| k.to_string_lossy() == "CLAUDE_CONFIG_DIR")
+                .and_then(|(_, v)| v.map(|val| val.to_string_lossy().into_owned()))
+        };
+        // A real failover account is exported verbatim — this is the routing that lets a walled
+        // default hand off to a healthy sibling instead of stranding the user.
+        assert_eq!(
+            forced_config_dir(Some("/acct/healthy-sibling")).as_deref(),
+            Some("/acct/healthy-sibling"),
+            "the chosen account's CLAUDE_CONFIG_DIR must be forced on the child",
+        );
+        // No override → nothing forced → the child inherits Sparkle's ambient env (the default
+        // account). If this ever forced a value, the happy path would stop being byte-identical.
+        assert_eq!(
+            forced_config_dir(None),
+            None,
+            "no override must leave CLAUDE_CONFIG_DIR unset on the child",
+        );
+        // Empty string is 'inherit', exactly as the default account records it.
+        assert_eq!(
+            forced_config_dir(Some("")),
+            None,
+            "an empty config_dir means inherit, not an empty CLAUDE_CONFIG_DIR",
+        );
+    }
+
     #[test]
     fn background_can_never_occupy_every_slot() {
         // The anti-starvation guarantee as an arithmetic property, not a comment. Setting these
@@ -3629,6 +3709,7 @@ mod tests {
             cacheable: false,
             purpose: "live-test",
             project: None,
+            config_dir: None,
         })
         .expect("live call should succeed");
         assert!(out.text.to_uppercase().contains("DONE"), "got {out:?}");

@@ -20,6 +20,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { useConnectionStore } from "../stores/connectionStore";
 import { useAiProviderStore, type AiProviderOutageReason } from "../stores/aiProviderStore";
 import { useAiServiceHealthStore } from "../stores/aiServiceHealthStore";
+import { oneshotFailoverConfigDir } from "./accountSelection";
 
 /**
  * The request never reached the proxy: no HTTP status came back because this machine has no working
@@ -260,6 +261,11 @@ export async function chatOnce(
     if (metering.purpose !== undefined) args.purpose = metering.purpose;
     if (metering.project !== undefined) args.project = metering.project;
     if (metering.background !== undefined) args.background = metering.background;
+    // Route off a walled default account to a healthy signed-in one when possible; only added when a
+    // failover target exists, so the call shape is unchanged on the happy path. See
+    // `accountSelection.oneshotFailoverConfigDir`.
+    const configDir = await oneshotFailoverConfigDir();
+    if (configDir) args.configDir = configDir;
     const raw = await invoke<string>("anthropic_chat", args);
     // A call that came back proves Sparkle's provider account is usable — clear any recorded outage
     // so the banner retires on its own the moment service is restored, with no restart or dismissal.

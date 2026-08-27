@@ -91,6 +91,10 @@ pub async fn anthropic_chat(
     // human is sitting behind. It selects the concurrency tier, and getting it wrong starves the
     // other kind — see the tier comment below. Back-compat: a missing key → None → interactive.
     background: Option<bool>,
+    // The account config dir this call should run under, or None to inherit the ambient default
+    // account. The JS failover selector supplies a healthy account here when the default is walled,
+    // so suggestions/composer rotate instead of failing. See `claude_oneshot::OneShot::config_dir`.
+    config_dir: Option<String>,
 ) -> Result<String, String> {
     let user = user.trim().to_string();
     if user.is_empty() {
@@ -108,15 +112,17 @@ pub async fn anthropic_chat(
     // JS on return. (Naming the surviving symbols on purpose — this is the one comment explaining
     // why this caller opts out of the health mechanism, so it has to stay greppable from it.)
     tauri::async_runtime::spawn_blocking(move || {
-        crate::claude_oneshot::run(chat_request(
+        let mut req = chat_request(
             &system,
             &user,
             max_tokens,
             purpose.as_deref(),
             project.as_deref(),
             background.unwrap_or(false),
-        ))
-        .map(|reply| reply.text)
+        );
+        // Route to the failover account when one was chosen; None/"" leaves the ambient default.
+        req.config_dir = config_dir.as_deref();
+        crate::claude_oneshot::run(req).map(|reply| reply.text)
     })
     .await
     .map_err(|e| format!("join error: {e}"))?
@@ -159,6 +165,9 @@ fn chat_request<'a>(
         // earlier cut threw it away by forcing a `&'static str` literal here.
         purpose: purpose.unwrap_or("chat"),
         project,
+        // Set per-call by the `anthropic_chat` command from the JS failover selector; the builder
+        // defaults to the ambient account. See `claude_oneshot::OneShot::config_dir`.
+        config_dir: None,
     }
 }
 

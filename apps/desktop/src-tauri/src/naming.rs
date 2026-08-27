@@ -321,6 +321,11 @@ pub async fn generate_agent_name(
     // Display name of the project this agent belongs to. Diagnostic only now — it used to attribute
     // a credit debit, and there is no longer a debit to attribute.
     project: Option<String>,
+    // The account config dir this call should run under, or None to inherit the ambient default
+    // account. The JS failover selector supplies a healthy account here when the default is walled,
+    // so naming rotates instead of failing. Back-compat: a missing key → None. See
+    // `claude_oneshot::OneShot::config_dir`.
+    config_dir: Option<String>,
 ) -> Result<AgentName, String> {
     let prompt = prompt.trim().to_string();
     if prompt.is_empty() {
@@ -332,7 +337,9 @@ pub async fn generate_agent_name(
     // and its "not signed in" precondition are gone: naming runs on the user's own Claude Code
     // login, so it works whether or not they have a Sparkle account.
     let outcome =
-        tauri::async_runtime::spawn_blocking(move || call_naming(&prompt, project.as_deref()))
+        tauri::async_runtime::spawn_blocking(move || {
+            call_naming(&prompt, project.as_deref(), config_dir.as_deref())
+        })
             .await
             .map_err(|e| format!("join error: {e}"))?;
     crate::claude_oneshot::finish_cacheable(&app, outcome)
@@ -360,6 +367,9 @@ fn naming_request<'a>(
         cacheable: true,
         purpose: "naming",
         project,
+        // Set per-call by `call_naming` from the JS failover selector; the builder defaults to the
+        // ambient account. See `claude_oneshot::OneShot::config_dir`.
+        config_dir: None,
     }
 }
 
@@ -368,8 +378,15 @@ fn naming_request<'a>(
 /// The pair is `(Result, bool)` rather than `Result<(..), ..>` ON PURPOSE: the spawn evidence must
 /// survive a PARSE failure. See `claude_oneshot::finish_cacheable`, which is where that evidence is
 /// acted on, and roborev 57507 for the latched-banner bug the old shape caused.
-fn call_naming(prompt: &str, project: Option<&str>) -> (Result<AgentName, String>, bool) {
-    match crate::claude_oneshot::run(naming_request(prompt, project)) {
+fn call_naming(
+    prompt: &str,
+    project: Option<&str>,
+    config_dir: Option<&str>,
+) -> (Result<AgentName, String>, bool) {
+    let mut req = naming_request(prompt, project);
+    // Route to the failover account when one was chosen; None/"" leaves the ambient default.
+    req.config_dir = config_dir;
+    match crate::claude_oneshot::run(req) {
         // The run itself failed — no health to report; the JS wrapper records the failure instead.
         Err(e) => (Err(e), false),
         Ok(reply) => interpret_naming_reply(reply),

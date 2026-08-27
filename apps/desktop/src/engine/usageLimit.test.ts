@@ -1,6 +1,12 @@
 import { describe, expect, it } from "vitest";
 
-import { currentUsageLimit, oneshotAccountId, USAGE_LIMIT_RECHECK_MS } from "./usageLimit";
+import {
+  currentUsageLimit,
+  effectiveOneshotAccount,
+  oneshotAccountId,
+  USAGE_LIMIT_RECHECK_MS,
+  type OneshotAccountCandidate,
+} from "./usageLimit";
 import type { Usage } from "../services/accountStore";
 
 const T0 = 1_700_000_000_000;
@@ -71,6 +77,66 @@ describe("oneshotAccountId", () => {
     ["returns null when there are none", [], null],
   ])("%s", (_label, accounts, expected) => {
     expect(oneshotAccountId(accounts as { id: string; isDefault: boolean }[])).toBe(expected);
+  });
+});
+
+describe("effectiveOneshotAccount — AI-Enhanced failover", () => {
+  const DEFAULT = "default";
+  const SIBLING = "sibling";
+  // The default account records configDir "" (inherit); a real second account has a path.
+  const cand = (
+    id: string,
+    isDefault: boolean,
+    configDir: string,
+  ): OneshotAccountCandidate => ({ id, isDefault, configDir });
+  const wall = (id: string): Usage => acct(id, T0 + 60_000);
+  const clear = (id: string): Usage => acct(id, null);
+
+  const base = {
+    accounts: [cand(DEFAULT, true, ""), cand(SIBLING, false, "/cfg/sibling")],
+    signedInIds: new Set([DEFAULT, SIBLING]),
+    now: T0,
+  };
+
+  it("runs on the default account when it is not walled (happy path, unchanged)", () => {
+    const eff = effectiveOneshotAccount({ ...base, usage: [clear(DEFAULT), clear(SIBLING)] });
+    expect(eff?.id).toBe(DEFAULT);
+    expect(eff?.configDir).toBe("");
+  });
+
+  it("FAILS OVER to a healthy signed-in sibling when the default is walled", () => {
+    // THE FIX. Before failover, AI-Enhanced was pinned to the walled default and the red bar
+    // stranded the user. This is exactly the case that must now route to the sibling — and it is
+    // RED against the old `oneshotAccountId`, which returns the walled default here.
+    const usage = [wall(DEFAULT), clear(SIBLING)];
+    const eff = effectiveOneshotAccount({ ...base, usage });
+    expect(eff?.id).toBe(SIBLING);
+    expect(eff?.configDir).toBe("/cfg/sibling");
+    // Pin the contrast with the failover-blind selector, so a regression back to it is caught here.
+    expect(oneshotAccountId(base.accounts)).toBe(DEFAULT);
+    expect(eff?.id).not.toBe(oneshotAccountId(base.accounts));
+  });
+
+  it("stays on the walled default (honest block) when no healthy sibling exists — sibling also walled", () => {
+    const usage = [wall(DEFAULT), wall(SIBLING)];
+    const eff = effectiveOneshotAccount({ ...base, usage });
+    expect(eff?.id).toBe(DEFAULT);
+  });
+
+  it("does NOT route to a signed-OUT sibling (routing there would just fail to auth)", () => {
+    const usage = [wall(DEFAULT), clear(SIBLING)];
+    const eff = effectiveOneshotAccount({
+      ...base,
+      usage,
+      signedInIds: new Set([DEFAULT]), // sibling is registered but never `claude login`ed
+    });
+    expect(eff?.id).toBe(DEFAULT);
+  });
+
+  it("returns null only when there are no accounts", () => {
+    expect(
+      effectiveOneshotAccount({ accounts: [], usage: [], signedInIds: new Set(), now: T0 }),
+    ).toBeNull();
   });
 });
 

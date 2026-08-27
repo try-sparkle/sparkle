@@ -21,6 +21,7 @@ import { reportNamingOutcome } from "./selfReportObservability";
 import type { NamingOutcome } from "../stores/selfReportMetrics";
 import type { AgentKind, AgentName, PromptHistoryEntry } from "../types";
 import { projectName } from "./creditProject";
+import { oneshotFailoverConfigDir } from "./accountSelection";
 
 // Common filler words ignored when comparing two prompts — so "please fix the test" and
 // "fix the test now" read as the same work.
@@ -288,10 +289,15 @@ export async function maybeAutoName(
   // Tally the paid fallback only once we actually commit to invoking (past the in-flight guard).
   reportNamingOutcome("paid_haiku_fallback", agent.kind);
   try {
+    // Route off a walled default account to a healthy signed-in one when possible; undefined leaves
+    // the ambient default and is dropped from the invoke, so the call shape is unchanged. See
+    // `accountSelection.oneshotFailoverConfigDir`.
+    const configDir = await oneshotFailoverConfigDir();
     const name = await invoke<AgentName>("generate_agent_name", {
       prompt,
       // Metering-only: attributes this paid naming call to its project in the Credits history.
       project: projectName(projectId),
+      configDir,
     });
     // NO healthy-report, unlike the same wrapper on main. This branch runs the call through
     // claude_oneshot with `cacheable: true`, and a cache hit is served BEFORE a permit is acquired
@@ -525,9 +531,11 @@ export async function maybeNameFromWork(projectId: string, agentId: string): Pro
   }
   inFlight.add(agentId);
   try {
+    const configDir = await oneshotFailoverConfigDir();
     const name = await invoke<AgentName>("generate_agent_name", {
       prompt: basis,
       project: projectName(projectId),
+      configDir,
     });
     // NO healthy-report, unlike the same wrapper on main. This branch runs the call through
     // claude_oneshot with `cacheable: true`, and a cache hit is served BEFORE a permit is acquired

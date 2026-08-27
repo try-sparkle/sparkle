@@ -44,6 +44,7 @@ import {
   type SelectionReason,
   type SpawnLogEntry,
 } from "./accountLedger";
+import { effectiveOneshotAccount } from "../engine/usageLimit";
 
 export interface AccountState {
   accounts: Account[];
@@ -425,6 +426,55 @@ export function invalidateAccountState(opts: { credentials?: boolean } = {}): vo
   // than migrating the fleet off the account the user just fixed. NOT on a plain agent move (see the
   // `credentials` note above), which changes no credentials and fires far too often.
   if (opts.credentials !== false) invalidateDeadLogins();
+}
+
+/**
+ * The `CLAUDE_CONFIG_DIR` an AI-Enhanced one-shot (naming / judge / attention / suggestions) should
+ * run under, or `undefined` to inherit the ambient DEFAULT account exactly as before.
+ *
+ * This is the SPAWN half of the failover the banner also reads: it defers the account decision to
+ * {@link effectiveOneshotAccount}, the single source of truth, so the two cannot disagree. Pass the
+ * result straight to the one-shot `invoke` as `configDir` (omit the key when `undefined`, so the
+ * Rust `Option<String>` sees `None` and the happy-path call shape stays byte-identical).
+ *
+ * BEST-EFFORT AND CHEAP ON THE HAPPY PATH. The first pass answers "is the default even walled?"
+ * WITHOUT identities, so the overwhelmingly-common healthy case pays no `getIdentities()` leg; only a
+ * genuinely walled default triggers the identity-loaded second pass that finds a healthy sibling. Any
+ * read failure falls back to the ambient default — failover must never make a call FAIL that would
+ * otherwise have run. See `sparkle-v3tz8j` / `sparkle-59a0w` defect #4.
+ */
+export async function oneshotFailoverConfigDir(
+  opts: { now?: number } = {},
+): Promise<string | undefined> {
+  try {
+    const now = opts.now ?? Date.now();
+    // CHEAP FIRST PASS — no identities. If the default account is not walled, there is nothing to
+    // fail over from and the call runs on the ambient default, unchanged.
+    const cheap = await loadAccountState({ withIdentities: false, now });
+    const defaultAcct = cheap.accounts.find((a) => a.isDefault) ?? cheap.accounts[0];
+    if (!defaultAcct) return undefined;
+    const defaultWalled = cheap.usage.some(
+      (u) => u.id === defaultAcct.id && u.exhaustedUntil != null && u.exhaustedUntil > now,
+    );
+    if (!defaultWalled) return undefined;
+
+    // Default IS walled — load identities so a healthy SIGNED-IN sibling can be found, then let the
+    // single-source selector decide (the same function the banner reads).
+    const state = await loadAccountState({ withIdentities: true, now });
+    const eff = effectiveOneshotAccount({
+      accounts: state.accounts,
+      usage: state.usage,
+      signedInIds: new Set(signedInAccountIds(state.identities)),
+      now,
+    });
+    // Override ONLY for a real, non-default failover target. Falling back to the default (its
+    // configDir is "" — inherit) means "no healthy alternative", so leave the ambient default and let
+    // the honest block stand.
+    if (!eff || eff.isDefault) return undefined;
+    return eff.configDir || undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /** Choose the account `agentId` should spawn under (honoring its manual pin) plus the loaded state

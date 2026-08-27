@@ -2,6 +2,14 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 
 const invoke = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...a: unknown[]) => invoke(...a) }));
+// Isolate naming from the account-failover subsystem: default "no failover" (undefined) so it makes
+// no extra `invoke` calls and the paid-call gating counts are unchanged. A wiring test below
+// overrides it to prove the chosen configDir is forwarded.
+vi.mock("./accountSelection", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./accountSelection")>()),
+  oneshotFailoverConfigDir: vi.fn().mockResolvedValue(undefined),
+}));
+import { oneshotFailoverConfigDir } from "./accountSelection";
 
 import {
   shouldRename,
@@ -320,6 +328,19 @@ describe("maybeAutoName — paid call gating for self-reporting agents", () => {
     await maybeAutoName("p1", "a1", "fix the login redirect bug");
     expect(invoke).toHaveBeenCalledTimes(1);
     expect(useSelfReportMetrics.getState().namingOutcomes.paid_haiku_fallback).toBe(1);
+  });
+
+  it("forwards the failover configDir into generate_agent_name when the default account is walled", async () => {
+    // THE SPAWN HALF of the failover: naming must run under the chosen account, or it stays pinned to
+    // the walled default. The default mock returns undefined, so no other test covers this seam.
+    vi.mocked(oneshotFailoverConfigDir).mockResolvedValueOnce("/cfg/healthy-sibling");
+    seed(agentTab({ kind: "worker", promptHistory: history(2) }));
+    await maybeAutoName("p1", "a1", "fix the login redirect bug");
+    const body = invoke.mock.calls.find((c) => c[0] === "generate_agent_name")?.[1] as Record<
+      string,
+      unknown
+    >;
+    expect(body.configDir).toBe("/cfg/healthy-sibling");
   });
 
   it("self-reporting worker WITH aiTitle → does NOT call generate_agent_name", async () => {
@@ -756,6 +777,10 @@ describe("maybeNameFromWork — Tier 2 paid backstop", () => {
     let resolveInvoke: (v: unknown) => void = () => {};
     invoke.mockImplementationOnce(() => new Promise((r) => (resolveInvoke = r)));
     const pending = maybeNameFromWork("p1", "a1");
+    // The naming call now resolves the failover account first (mocked to "no failover"), so the
+    // Haiku invoke fires one microtask later — wait for it to actually be in flight before pinning,
+    // which is exactly the moment this test means by "while the Haiku call is in flight".
+    await vi.waitFor(() => expect(invoke).toHaveBeenCalled());
     // User pins a name while the Haiku call is in flight.
     useProjectStore.setState((s) => ({
       projects: s.projects.map((p) => ({

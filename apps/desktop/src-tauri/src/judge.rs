@@ -104,6 +104,10 @@ pub async fn judge_turn_followup(
     // Display name of the project whose agent produced this turn. Diagnostic only now — it used to
     // attribute a credit debit, and there is no longer a debit to attribute.
     project: Option<String>,
+    // The account config dir this call should run under, or None to inherit the ambient default
+    // account. The JS failover selector supplies a healthy account here when the default is walled.
+    // See `claude_oneshot::OneShot::config_dir`.
+    config_dir: Option<String>,
 ) -> Result<String, String> {
     let response = response.trim().to_string();
     // Nothing to judge — an empty turn isn't an ask. (The frontend already pre-filters, but a
@@ -115,7 +119,7 @@ pub async fn judge_turn_followup(
     // Spawning the CLI and waiting out its wall clock is blocking work — keep it off the async
     // runtime's worker threads, exactly as the proxy call it replaced did.
     let outcome = tauri::async_runtime::spawn_blocking(move || {
-        call_judge(&task, &response, project.as_deref())
+        call_judge(&task, &response, project.as_deref(), config_dir.as_deref())
     })
     .await
     .map_err(|e| format!("join error: {e}"))?;
@@ -142,6 +146,9 @@ fn judge_request<'a>(user: &'a str, project: Option<&'a str>) -> OneShot<'a> {
         cacheable: true,
         purpose: "judge",
         project,
+        // Set per-call by `call_judge` from the JS failover selector; the builder defaults to the
+        // ambient account. See `claude_oneshot::OneShot::config_dir`.
+        config_dir: None,
     }
 }
 
@@ -151,9 +158,17 @@ fn judge_request<'a>(user: &'a str, project: Option<&'a str>) -> OneShot<'a> {
 /// `claude_oneshot::finish_cacheable`. The judge has no post-processing that can reject a reply, so
 /// the two shapes are equivalent HERE — it is written this way so the three call sites are
 /// identical and a reader cannot mistake this one for the exception.
-fn call_judge(task: &str, response: &str, project: Option<&str>) -> (Result<String, String>, bool) {
+fn call_judge(
+    task: &str,
+    response: &str,
+    project: Option<&str>,
+    config_dir: Option<&str>,
+) -> (Result<String, String>, bool) {
     let user = build_user_message(task, response);
-    match run(judge_request(&user, project)) {
+    let mut req = judge_request(&user, project);
+    // Route to the failover account when one was chosen; None/"" leaves the ambient default.
+    req.config_dir = config_dir;
+    match run(req) {
         Err(e) => (Err(e), false),
         Ok(reply) => (Ok(reply.text), reply.spawned),
     }
