@@ -20,7 +20,7 @@
 // render means Workspace handed the pane props the shipping predicate calls different, which is
 // exactly what makes the shipping pane re-render. A bare stub would count nothing and pass forever.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, act, render, screen } from "@testing-library/react";
+import { cleanup, act, render, screen, waitFor } from "@testing-library/react";
 
 vi.mock("@tauri-apps/api/window", () => ({
   getCurrentWindow: () => ({
@@ -143,7 +143,13 @@ afterEach(() => {
 
 async function mount() {
   render(<Workspace />);
-  await screen.findAllByTestId(/^pane-/);
+  // ALL of them, not just the first. Panes mount through a bounded queue now
+  // (services/paneMountScheduler, bead sparkle-pqss6) — two per frame, so `findAllByTestId` returns
+  // on a handful and the per-switch render counts below would be taken against a fleet still
+  // filling in, which is both the wrong measurement and a flaky one.
+  await waitFor(() => expect(screen.getAllByTestId(/^pane-/)).toHaveLength(PANES), {
+    timeout: 8000,
+  });
 }
 
 /** Drive a real selection through the store action the sidebar click calls — not a `setState` that

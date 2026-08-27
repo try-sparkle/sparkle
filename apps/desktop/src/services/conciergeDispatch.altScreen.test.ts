@@ -33,6 +33,9 @@ import { detectTerminalPrompts } from "./suggestions/heuristics";
 import { getAgentViewport } from "./terminalViewport";
 import { dispatchConciergeAnswer } from "./conciergeDispatch";
 import { conciergeToolAuthority } from "./dispatchAuthority";
+// For the evidence-logging case: the refusal's diagnostic record is the deliverable, so it is
+// asserted rather than assumed.
+import { log } from "../logger";
 
 const AGENT = "agent-1";
 /** A real gesture, so the authority gate (which runs first) is never what refuses here. */
@@ -673,5 +676,137 @@ describe("a mounted send is delivered, whatever the screen shows", () => {
       expect(r.path).toBe("alternate-screen");
       expectNothingWritten();
     });
+  });
+});
+
+// ══ …AND NEITHER IS A LIVE PERMISSION DIALOG (bead sparkle-d6a5r) ═══════════════════════════════
+//
+// THE REPORTED DEFECT, six occurrences: `send_to_agent_terminal` refused `alternate-screen` against
+// a pane a human had VISUALLY CONFIRMED was sitting on an ordinary Claude Code permission dialog —
+// no editor, no pager — leaving `restart_agent`, which destroys in-flight context, as the only
+// remaining way to reach that agent.
+//
+// THE MECHANISM. Claude Code holds the alternate buffer at all times on a modern fleet, so
+// `alternateBuffer` excludes nothing and the whole decision rests on `isClaudeCodeScreen`. That
+// predicate's family D (the composer box) is MANDATORY, and a permission dialog is exactly what
+// REPLACES the composer box. Its family E covers the dialog case, but earns its standing by
+// POSITION: the picker footer must TERMINATE the grid. A dialog whose `↑↓ to select` footer is not
+// drawn — a short column, a dialog taller than the pane — falls back through E, scores 1 on the
+// tool-call glyph alone, fails `>= 2`, and is reported as vim. The captured
+// `APPROVAL_2_1_220` fixtures all DO terminate the grid, which is why the suite never saw this.
+//
+// WHAT THESE CASES ASSERT IS THE CLASSIFICATION AND THE SIDE EFFECT TOGETHER. The reclassification
+// must not be a licence: the pair below pins that the dialog is no longer called a full-screen app
+// AND that free text still reaches no PTY. A version of this fix that merely relabelled the refusal
+// passes the first; a version that let prose through fails the second.
+describe("a live permission dialog is not a full-screen app either", () => {
+  /** A Claude Code Bash-permission dialog with its footer BELOW the visible grid — the shape the
+   *  bead reports and the one family E's below-footer walk cannot recognise. Nothing here is a
+   *  pager or an editor: the tool-call glyph above the box is Claude Code's own. */
+  const PERMISSION_DIALOG_NO_FOOTER = [
+    "⏺ Bash(git status --short)",
+    "  ⎿  M apps/desktop/src/services/conciergeDispatch.ts",
+    "",
+    "╭───────────────────────────────────────────────╮",
+    "│ Bash command                                  │",
+    "│                                               │",
+    "│   git push origin HEAD                        │",
+    "│   Push the branch                             │",
+    "│                                               │",
+    "│ Do you want to proceed?                       │",
+    "│ ❯ 1. Yes                                      │",
+    "│   2. Yes, and don't ask again                 │",
+    "│   3. No, and tell Claude what to do differently│",
+    "╰───────────────────────────────────────────────╯",
+  ].join("\n");
+
+  const DIALOG_OPTIONS = [
+    { id: "1", label: "Yes", value: "1\n", kind: "terminal", source: "heuristic" },
+    { id: "2", label: "No", value: "3\n", kind: "terminal", source: "heuristic" },
+  ] as unknown as SuggestionButton[];
+
+  function onPermissionDialog(): void {
+    vi.mocked(getAgentViewport).mockReturnValue({
+      text: PERMISSION_DIALOG_NO_FOOTER,
+      alternateBuffer: true,
+    });
+    vi.mocked(detectTerminalPrompts).mockReturnValue(DIALOG_OPTIONS);
+  }
+
+  // ── THE BEAD'S OWN CASE. Red before the fix: the path was `alternate-screen`. ─────────────────
+  it("classifies it as a blocked prompt, not a full-screen app", async () => {
+    onPermissionDialog();
+    const r = await dispatchConciergeAnswer(AGENT, "please push it when you can", OPTS);
+    expect(r.path).not.toBe("alternate-screen");
+    expect(r.path).toBe("blocked-prompt");
+  });
+
+  // ── AND THE OTHER HALF OF THE CONTRACT, which is what makes the change safe to make at all. ───
+  // The reclassification is interlocked on `screenBlocksWrite`, so the write is refused by the very
+  // next arm. If a later edit drops that conjunct, free text falls through to the picker block and
+  // a terse answer PRESSES an option on a dialog nobody read — and this case goes red.
+  it("still writes nothing to the PTY", async () => {
+    onPermissionDialog();
+    await dispatchConciergeAnswer(AGENT, "please push it when you can", OPTS);
+    expectNothingWritten();
+  });
+
+  // The auto-resume is the caller that burned its retry budget on this refusal every 15 seconds and
+  // escalated a human out of bed naming an editor that was not there.
+  it("gives the machine-authored auto-resume the same corrected classification", async () => {
+    onPermissionDialog();
+    const r = await dispatchConciergeAnswer(AGENT, "continue", {
+      authority: { kind: "goal-continue", agentId: AGENT },
+    });
+    expect(r.path).toBe("blocked-prompt");
+    expectNothingWritten();
+  });
+
+  // ── A PAGER SHOWING A MENU-SHAPED TRANSCRIPT IS STILL A PAGER ────────────────────────────────
+  // The widening needs a Claude Code marker family as well as a live menu. A pager or an editor has
+  // neither, so `onFullScreenApp` keeps its `alternate-screen` verdict even with options on screen
+  // — which the "stale option" case at the top of this file already pins, and this restates against
+  // the NEW conjunction so a future edit that drops the marker-family half goes red here.
+  it("does not reclassify a full-screen app that happens to show options", async () => {
+    onFullScreenApp();
+    vi.mocked(detectTerminalPrompts).mockReturnValue(DIALOG_OPTIONS);
+    const r = await dispatchConciergeAnswer(AGENT, "please push it when you can", OPTS);
+    expect(r.path).toBe("alternate-screen");
+    expectNothingWritten();
+  });
+
+  // ══ THE EVIDENCE THE REFUSAL WAS BASED ON — the second half of the bead's ask ═════════════════
+  // Every one of the six reported occurrences was undiagnosable after the fact, because the only
+  // thing this branch logged was the agent id. STRUCTURAL FACTS ONLY: a refused screen is by
+  // construction one sitting at a prompt, and some of those prompts are credential fields that echo
+  // nothing, so a log line carrying the viewport text would write a password into the app log.
+  it("logs the evidence a full-screen-app refusal was based on", async () => {
+    const warn = vi.spyOn(log, "warn").mockImplementation(() => {});
+    try {
+      onFullScreenApp();
+      await dispatchConciergeAnswer(AGENT, "please push it when you can", OPTS);
+      const entry = warn.mock.calls.find(
+        (c) => c[1] === "refused a write into a full-screen app",
+      );
+      expect(entry).toBeDefined();
+      const fields = entry?.[2] as Record<string, unknown>;
+      expect(fields).toMatchObject({
+        agentId: AGENT,
+        alternateBuffer: true,
+        markerFamilies: 0,
+        composerBox: false,
+        recognisedAsClaudeCode: false,
+        dialogOnScreen: false,
+      });
+      expect(fields).toHaveProperty("viewportOptions");
+      expect(fields).toHaveProperty("scrollbackOptions");
+      expect(fields).toHaveProperty("rows");
+      // NOT the screen text, under any key. This is the assertion that keeps a future "just log the
+      // viewport, it's easier to read" edit from leaking a credential field into the log.
+      for (const v of Object.values(fields)) expect(typeof v).not.toBe("undefined");
+      expect(JSON.stringify(fields)).not.toContain("~");
+    } finally {
+      warn.mockRestore();
+    }
   });
 });

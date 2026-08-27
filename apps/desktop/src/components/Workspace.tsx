@@ -126,6 +126,7 @@ import {
   onAdmittedAgentsChange,
 } from "../services/resurrectionAdmission";
 import { subscribeToCrossWindowSync } from "../services/crossWindowSync";
+import { useStaggeredPaneMounts } from "../hooks/useStaggeredPaneMounts";
 import { useTornOutProjects } from "../hooks/useTornOutProjects";
 import { focusSatellite, reclaimProject, reconcileSatellites } from "../services/satelliteWindows";
 import { startPresenceTracking } from "../stores/presenceStore";
@@ -1985,6 +1986,47 @@ export function Workspace() {
   );
   const paneCalm = useMemo(() => ({ left: false, right: terminalCalm }), [terminalCalm]);
 
+  // ── HOW MANY OF THOSE PANES MAY MOUNT IN *THIS* COMMIT (bead sparkle-pqss6) ─────────────────────
+  //
+  // `live` above answers WHICH agents have a pane in this window. It says nothing about WHEN, and
+  // until this gate every id it gained mounted in one synchronous burst: a fleet restore brings back
+  // every open agent across every visited project at once, and a batch spawn brings back every agent
+  // of the batch at once. Each mount is an xterm, a WebGL context and a pane's worth of effects, and
+  // every agent's terminal is laid out at all times — so N of them in one commit is N × renderer-wide
+  // layout with no frame in between. Measured: 20 of 28 hang detections landed within 70 seconds of
+  // an app start, with `AgentPane` rendered 93 times inside a single stall, and the one non-startup
+  // case studied was a 7-agent batch spawn that starved rAF for 10.2 seconds.
+  //
+  // THE GATE SITS HERE, ON THE LIST, RATHER THAN ON A STARTUP FLAG — deliberately. Boot and batch
+  // spawn reach the pane list through the same memo, so a boot-only fix would leave the second half
+  // of the bug exactly where it is. One gate covers both because there is only one path.
+  //
+  // IT IS A QUEUE, NOT A VIRTUALISER, AND `runtimeStore.status` IS WHY. That store is live-only with
+  // a MOUNTED `AgentPane` as its ONLY writer, so an unmounted pane means a frozen status, no
+  // attention notifications and no observed activity for that agent. `useStaggeredPaneMounts`
+  // therefore drops nothing: every id drains within ceil(N / PANES_PER_MOUNT_RELEASE) frames and the
+  // pump then stops rescheduling, so the settled state is the old one. The pane each stage is
+  // actually SHOWING skips the queue outright, so the terminal the user is looking at never waits.
+  const liveIds = useMemo(() => live.map(({ agent }) => agent.id), [live]);
+  // The right pair's visible pane first: it is the one a single-pair window (the common case) is
+  // showing, and the order decides nothing else — both bypass the queue.
+  const panePriorityIds = useMemo(
+    () => [paneVisibleAgentId.right, paneVisibleAgentId.left],
+    [paneVisibleAgentId],
+  );
+  const mountablePaneIds = useStaggeredPaneMounts(liveIds, panePriorityIds);
+  // RETURN `live` ITSELF once the queue has drained, rather than an equal copy. Agent ids are
+  // globally unique and this set is a subset of them, so equal sizes means equal contents — and
+  // handing back the same reference is what lets `MemoAgentPaneList` keep bailing out at pointer
+  // rate during a seam drag (roborev 55316), which a fresh array every render would silently undo.
+  const stagedLive = useMemo(
+    () =>
+      mountablePaneIds.size === live.length
+        ? live
+        : live.filter(({ agent }) => mountablePaneIds.has(agent.id)),
+    [live, mountablePaneIds],
+  );
+
   // NO PLAN/BUILD HANDLERS HERE ANY MORE. The board used to render its own duplicate of the
   // segmented toggle, because it covered the build column and took its header away with it. It
   // takes only the TERMINAL's slot now, so the sidebar's own toggle stays on screen and is the one
@@ -2616,7 +2658,9 @@ export function Workspace() {
           so the exposure doubles. It is also the "latency clicking around on the build agents" report,
           and the terminal-switch cost blocking the hover-to-preview work. */}
       <MemoAgentPaneList
-        panes={live}
+        // `stagedLive`, NOT `live` — the mount queue (bead sparkle-pqss6). It IS `live` once the
+        // queue has drained; before then it is the prefix the renderer has had a frame to absorb.
+        panes={stagedLive}
         pairAssignment={pairAssignment}
         stages={paneStages}
         // A column showing its board has no visible agent pane — EACH side answers that for itself.

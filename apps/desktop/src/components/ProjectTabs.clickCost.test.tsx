@@ -25,7 +25,7 @@
 // (`rendered: Workspace x98, AgentPane x68`) is from one. A bound measured at one pane would not
 // speak to the conditions the founder is actually in.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, act, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 
 // ── SHELL MOCKS ────────────────────────────────────────────────────────────────────────────────
 // Kept in sync with `Workspace.switchCost.test.tsx` — same shell, different interaction. Spread the
@@ -204,7 +204,21 @@ afterEach(() => {
 
 async function mount() {
   render(<Workspace />);
-  await screen.findAllByTestId(/^pane-/);
+  // WAIT FOR THE SELECTED PROJECT'S WHOLE SET. Panes mount through a bounded queue now
+  // (services/paneMountScheduler, bead sparkle-pqss6): the first commit holds only the pane the
+  // stage is showing, so `findAllByTestId` would hand back one pane and the click below would be
+  // measured against a cockpit that had not finished loading.
+  await paneCountAtLeast(PER_PROJECT);
+}
+
+/** Drain the mount queue until at least `n` panes are up. Two per frame, so a 20-pane project is
+ *  ~10 frames — comfortably inside the bound, and a stalled queue fails here as a count rather than
+ *  a hang. AT LEAST, not exactly: the visited-project set is module-level and only reset per `it`,
+ *  so the measurement loop below re-mounts with both projects already visited and forty panes live. */
+async function paneCountAtLeast(n: number) {
+  await waitFor(() => expect(screen.getAllByTestId(/^pane-/).length).toBeGreaterThanOrEqual(n), {
+    timeout: 8000,
+  });
 }
 
 function clickTab(id: string) {
@@ -315,6 +329,11 @@ describe("clicking a project tab", () => {
     expect(pane).toBeGreaterThanOrEqual(PER_PROJECT);
 
     clickTab("p2");
+    // p2's twenty now arrive through the mount queue (bead sparkle-pqss6) — its selected agent in
+    // the click's own commit, the other nineteen two per frame — so the count is taken once they
+    // are all up. WHAT is counted is unchanged: the pane renders one tab click costs, end to end.
+    // Taking it before the drain would report 2 and pass a bound the staggering had not yet met.
+    await paneCountAtLeast(PER_PROJECT * 2);
 
     // THE MEASUREMENT, pinned exactly — the sibling of `Workspace.switchCost.test.tsx`'s "exactly
     // two panes". It was `toBeLessThan(60)`, which let 59 of the 60 panes repaint and still pass:

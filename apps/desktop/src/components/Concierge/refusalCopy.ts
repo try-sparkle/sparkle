@@ -233,10 +233,16 @@ export function refusalCopy(path: RefusedPath | null, agent: ReferencableAgent, 
     // AND SUBMITTED into it. A different refusal from `alternate-screen` because the exit is
     // different: answer the thing on screen, rather than quit an app. Named without quoting the
     // prompt, since the whole hazard is that some of these echo nothing.
+    // ── AND A PERMISSION DIALOG REACHES THIS ARM NOW TOO (bead sparkle-d6a5r) ──────────────────
+    // A Claude Code permission dialog on the alternate buffer used to be reported as a full-screen
+    // app, because `isClaudeCodeScreen` false-negatives on the very screen where the dialog has
+    // replaced the composer box it requires. The dispatcher classifies that correctly now, so the
+    // most common screen arriving here is a permission dialog — and this sentence has to say so,
+    // or it describes everything except the usual case.
     case "blocked-prompt":
       return approving
-        ? line`${a} is waiting on something on screen — a prompt or a credential field — so I didn't send the approval. Answer that first, then approve again.`
-        : line`${a} is waiting on something on screen — a prompt or a credential field — so I didn't send that. Answer it in ${a}'s pane first, then send again.`;
+        ? line`${a} is waiting on something on screen — a permission dialog, a prompt, or a credential field — so I didn't send the approval. Answer that first, then approve again.`
+        : line`${a} is waiting on something on screen — a permission dialog, a prompt, or a credential field — so I didn't send that. Answer it in ${a}'s pane first, then send again.`;
     case "unauthorized":
       // Should be unreachable: `authority` is required and non-defaulted, so a call site that omits
       // it does not compile. Reachable only if a malformed authority is built dynamically — a bug,

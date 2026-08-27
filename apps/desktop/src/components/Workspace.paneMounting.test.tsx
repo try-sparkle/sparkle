@@ -25,7 +25,7 @@
 // Both fail loudly against the pre-portal shell (see PRD/sparkle/pane-mounting.md), which is what
 // makes them worth having.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { act, cleanup, render, screen } from "@testing-library/react";
+import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 
 vi.mock("@tauri-apps/api/window", () => ({
   getCurrentWindow: () => ({
@@ -176,7 +176,14 @@ afterEach(() => {
  *  the stage on `PaneFallback` with nothing mounted. */
 async function mount() {
   render(<Workspace />);
-  await screen.findAllByTestId(/^pane-/);
+  // WAIT FOR THE WHOLE SET, not merely the first pane. Panes mount through a bounded queue now
+  // (services/paneMountScheduler, bead sparkle-pqss6): the first commit holds only the pane the
+  // stage is showing and the rest arrive two per frame, so `findAllByTestId` resolves on a partial
+  // fleet and every "nothing was torn down" assertion below would be measuring agents that had not
+  // mounted yet.
+  await waitFor(() => expect(screen.getAllByTestId(/^pane-/)).toHaveLength(AGENTS.length), {
+    timeout: 8000,
+  });
 }
 
 const assign = (projectId: string, side: "left" | "right") =>

@@ -302,7 +302,7 @@ fn read_ledger(
 /// published list exactly as it was — the same fail-closed discipline `list_at` states for the
 /// reaper, in the other direction: a module that answers "nobody is due" when it cannot read its own
 /// store has quietly told the fleet that nothing needs recovering.
-fn tick(dir: &Path, app_data: &Path, state: &RevivalState, now_ms: i64) -> Option<Vec<DueAgent>> {
+fn tick(dir: &Path, app_data: &Path, state: &RevivalState, now_ms: i64) -> Option<Scan> {
     let readings = match read_ledger(dir, app_data, now_ms) {
         Ok(r) => r,
         Err(e) => {
@@ -346,8 +346,8 @@ fn tick(dir: &Path, app_data: &Path, state: &RevivalState, now_ms: i64) -> Optio
     }
 
     let due = due_at(&readings, now_ms, &live_epochs);
-    publish_due(state, &due);
-    Some(due)
+    let changed = publish_due(state, &due);
+    Some(Scan { due, changed })
 }
 
 /// WHICH DEATH THIS IS, as opposed to WHEN THE ANSWER WAS COMPUTED.
@@ -443,10 +443,15 @@ pub fn start<R: Runtime>(app: &AppHandle<R>) {
     let app = app.clone();
     std::thread::spawn(move || {
         let dir = agent_life::life_dir(&base);
+        // THE ONE PLACE THE REAL WALL CLOCK ENTERS THIS MODULE. Everything below reads time through
+        // `scanner`, so the same code runs in a test against a clock the test moves by hand.
+        let scanner = Scanner::live(&dir, &base);
         let mut next_scan_at = 0i64;
         loop {
             std::thread::sleep(TICK);
-            let now = now_ms();
+            // ONE read per wake, threaded through the scan gate, the reaper and the publish, so a
+            // single wake cannot straddle two instants.
+            let now = scanner.now();
             // The thread wakes on TICK; the LEDGER is read on its own, slower interval. Gated on the
             // wall clock rather than a tick counter so a machine suspend does not bank up a burst of
             // scans on wake — the same hazard `nudger.rs` handles explicitly for its deadlines.
@@ -499,7 +504,7 @@ pub fn start<R: Runtime>(app: &AppHandle<R>) {
                     }
                 }
             }
-            tick(&dir, &base, &state, now);
+            scanner.scan_at(&state, now);
         }
     });
 }
@@ -509,6 +514,72 @@ fn now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+/// THE DUE-SET CLOCK, AS A VALUE RATHER THAN AN AMBIENT CALL (bead sparkle-iknpzf).
+///
+/// `due_at` and `tick` have always taken their instant as an argument, so the RULE was already
+/// testable against an integer. What was not was the SCAN — the thread's own read of the wall
+/// clock, which `start` made inline and no test could reach. This closes that gap: `Scanner` owns
+/// the clock, `start` is the only caller that supplies the real one, and a test supplies its own.
+type Clock<'a> = &'a dyn Fn() -> i64;
+
+/// The real wall clock as a VALUE. A `static` because `Scanner::live` hands out a `&'static`
+/// reference to it, and a `fn` item is a zero-sized value that outlives everything.
+static WALL_CLOCK: fn() -> i64 = now_ms;
+
+/// WHAT ONE SCAN PRODUCED: the list that was published, and whether the due SET moved.
+///
+/// `changed` is not a convenience. It is the exact boolean `publish_due` gates its log on, handed
+/// back so a caller can assert the transition WITHOUT reading `tracing`'s output — which is the
+/// half of the old assertion that was not deterministic (see `capture_logs`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Scan {
+    due: Vec<DueAgent>,
+    changed: bool,
+}
+
+/// A revival scan bound to a clock and the two paths it reads.
+///
+/// `live` is the PRODUCTION WIRING and `start` is its only non-test caller. That single line is
+/// exactly the "defaulted seam" this repo keeps rediscovering — if every test injected its own
+/// clock, deleting the real one would leave the suite green — so `a_live_scanner_reads_the_real_
+/// wall_clock` drives `live` end to end over a real ledger and goes red if it supplies anything
+/// but a real clock.
+struct Scanner<'a> {
+    dir: &'a Path,
+    app_data: &'a Path,
+    clock: Clock<'a>,
+}
+
+impl<'a> Scanner<'a> {
+    /// THE PRODUCTION WIRING — the real wall clock, named once.
+    fn live(dir: &'a Path, app_data: &'a Path) -> Self {
+        Self { dir, app_data, clock: &WALL_CLOCK }
+    }
+
+    /// The same scanner over a clock the caller owns. Test-only by construction: production has one
+    /// clock and `live` is where it is named.
+    #[cfg(test)]
+    fn with_clock(dir: &'a Path, app_data: &'a Path, clock: Clock<'a>) -> Self {
+        Self { dir, app_data, clock }
+    }
+
+    /// Read the clock.
+    fn now(&self) -> i64 {
+        (self.clock)()
+    }
+
+    /// One scan at an instant the caller has already read.
+    fn scan_at(&self, state: &RevivalState, now_ms: i64) -> Option<Scan> {
+        tick(self.dir, self.app_data, state, now_ms)
+    }
+
+    /// One scan at whatever this scanner's clock says now.
+    #[cfg(test)]
+    fn scan(&self, state: &RevivalState) -> Option<Scan> {
+        self.scan_at(state, self.now())
+    }
 }
 
 /// The due list as of the last tick.
@@ -913,7 +984,7 @@ mod tests {
             .unwrap();
 
         let state = RevivalState::default();
-        let due = tick(&dir, &app_data, &state, NOW + 1).expect("ledger readable");
+        let due = tick(&dir, &app_data, &state, NOW + 1).expect("ledger readable").due;
         let ids: Vec<&str> = due.iter().map(|d| d.agent_id.as_str()).collect();
 
         assert_eq!(
@@ -987,7 +1058,7 @@ mod tests {
         .unwrap();
 
         let state = RevivalState::default();
-        let due = tick(&dir, &app_data, &state, NOW + 1).expect("ledger readable");
+        let due = tick(&dir, &app_data, &state, NOW + 1).expect("ledger readable").due;
         assert_eq!(due.len(), 1, "the dead agent must be published as due");
         assert_eq!(due[0].agent_id, "a1");
         assert_eq!(due[0].cause, DeathCause::TransportTransient);
@@ -1046,7 +1117,9 @@ mod tests {
         );
 
         let state = RevivalState::default();
-        let due = tick(&dir, &app_data, &state, NOW + 1).expect("a corrupt record is not a dead ledger");
+        let due = tick(&dir, &app_data, &state, NOW + 1)
+            .expect("a corrupt record is not a dead ledger")
+            .due;
         assert_eq!(
             due.iter().map(|d| d.agent_id.as_str()).collect::<Vec<_>>(),
             vec!["healthy"],
@@ -1061,9 +1134,101 @@ mod tests {
     // lines in one day. A test that only checked `publish_due`'s boolean would still pass against a
     // `tick` that logged unconditionally beside it.
 
+    /// PIN THE CALLSITE INTEREST FOR THE WHOLE TEST BINARY (bead sparkle-iknpzf).
+    ///
+    /// ── THE FLAKE THIS CLOSES ─────────────────────────────────────────────────────────────────
+    /// `capture_logs` used to claim that `with_default` being THREAD-LOCAL meant a parallel test
+    /// run could not cross-contaminate it. The dispatcher is thread-local; the thing it depends on
+    /// is not. `tracing` caches ONE `Interest` per callsite for the whole process, and in
+    /// `tracing-core` 0.1.36 the rebuild takes a shortcut whenever at most one dispatcher has ever
+    /// been registered: it asks the REGISTERING THREAD's default dispatcher
+    /// (`Dispatchers::rebuilder` -> `Rebuilder::JustOne` -> `dispatcher::get_default`). So the first
+    /// thread anywhere in the binary to reach `due-for-resurrection set changed` decides the answer
+    /// for every thread — and a sibling test that reaches it with NO subscriber installed (five
+    /// tests in this module drive `tick` or `publish_due` bare) hands back
+    /// `NoSubscriber::register_callsite` -> `Interest::never()`. Cached. Our own buffer is then
+    /// empty on a thread whose subscriber is installed and perfectly correct.
+    ///
+    /// Measured on the unfixed code, running just `tick_publishes_a_due_agent_from_a_real_ledger`
+    /// and `a_genuinely_changed_due_set_still_logs` on two threads: 8 failures in 60 runs, in both
+    /// shapes — `left: 0` when the poisoning landed before the first scan, `left: 1` when it landed
+    /// in the window BETWEEN the two. That window is why this test flaked and its unchanged-set
+    /// sibling did not: it is the one that does filesystem work mid-capture.
+    ///
+    /// ── THE FIX ───────────────────────────────────────────────────────────────────────────────
+    /// Register one extra dispatcher that lives for the whole binary and is interested in
+    /// EVERYTHING, BEFORE installing the capturing one. Two consequences, both needed:
+    ///
+    ///  * `Interest::and` yields `never` only when EVERY live dispatcher said `never`, so with this
+    ///    one registered the cached interest can only be `always` or `sometimes` — and `sometimes`
+    ///    re-asks the current thread's own subscriber per event, which is the correct answer. The
+    ///    poisoned state is unreachable.
+    ///  * Two registered dispatchers also take `rebuilder()` off the `JustOne` shortcut for good,
+    ///    so no later registration on any thread consults `get_default` again.
+    ///
+    /// It changes nothing about what is EMITTED. Events are delivered to the emitting thread's own
+    /// dispatcher, and this one is never anybody's default — it only votes on interest.
+    fn pin_callsite_interest() {
+        use tracing::level_filters::LevelFilter;
+        use tracing::subscriber::Interest;
+        use tracing::{span, Event, Metadata, Subscriber};
+
+        struct InterestedInEverything;
+        impl Subscriber for InterestedInEverything {
+            fn register_callsite(&self, _: &'static Metadata<'static>) -> Interest {
+                Interest::always()
+            }
+            /// Capped at INFO to match the capturing subscriber's own default, so pinning does not
+            /// raise the process-wide max level and start materialising every `debug!` in the crate.
+            /// The rebuild takes the MAX across dispatchers, so this can never SUPPRESS a more
+            /// verbose subscriber — only decline to raise the floor on its own.
+            fn max_level_hint(&self) -> Option<LevelFilter> {
+                Some(LevelFilter::INFO)
+            }
+            fn enabled(&self, _: &Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, _: &span::Attributes<'_>) -> span::Id {
+                span::Id::from_u64(1)
+            }
+            fn record(&self, _: &span::Id, _: &span::Record<'_>) {}
+            fn record_follows_from(&self, _: &span::Id, _: &span::Id) {}
+            fn event(&self, _: &Event<'_>) {}
+            fn enter(&self, _: &span::Id) {}
+            fn exit(&self, _: &span::Id) {}
+        }
+
+        // Holding it in a `static` is the load-bearing part: the callsite registry keeps only a
+        // `Weak`, so a dropped `Dispatch` silently stops voting and the shortcut comes back.
+        static PIN: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+        PIN.get_or_init(|| tracing::Dispatch::new(InterestedInEverything));
+    }
+
+    /// A clock the test moves by hand. `Cell` rather than an atomic because a `Scanner` and its
+    /// clock never leave the test's own thread.
+    struct TestClock(std::cell::Cell<i64>);
+
+    impl TestClock {
+        fn at(ms: i64) -> Self {
+            Self(std::cell::Cell::new(ms))
+        }
+        fn set(&self, ms: i64) {
+            self.0.set(ms);
+        }
+        fn read(&self) -> i64 {
+            self.0.get()
+        }
+    }
+
     /// Run `f` with `tracing` output captured into a string, so the number of emitted lines can be
-    /// counted. Thread-local (`with_default`), so a parallel test run cannot cross-contaminate.
+    /// counted. `with_default` is thread-local, so the OUTPUT cannot cross threads; the callsite
+    /// interest that decides whether there is any output at all is process-global, which is what
+    /// `pin_callsite_interest` above exists to hold steady.
     fn capture_logs<T>(f: impl FnOnce() -> T) -> (T, String) {
+        // BEFORE the capturing dispatcher, so its own registration rebuilds every callsite that a
+        // parallel thread may already have poisoned.
+        pin_callsite_interest();
+
         use std::io::Write;
         use std::sync::{Arc, Mutex};
 
@@ -1141,30 +1306,46 @@ mod tests {
     fn an_unchanged_due_set_logs_once_even_though_not_before_is_recomputed_each_scan() {
         let (_td, dir, app_data) = one_dead_agent_ledger("a1");
         let state = RevivalState::default();
+        // TIME MOVES ONLY WHEN THIS TEST SAYS SO. The 5s gap between the two scans is the one the
+        // production loop takes, expressed as two integers rather than as elapsed wall clock.
+        let clock = TestClock::at(NOW + 1);
+        let read = || clock.read();
+        let scanner = Scanner::with_clock(&dir, &app_data, &read);
 
         let ((first, second), logs) = capture_logs(|| {
-            let first = tick(&dir, &app_data, &state, NOW + 1).expect("ledger readable");
-            let second = tick(&dir, &app_data, &state, NOW + 5_000).expect("ledger readable");
+            let first = scanner.scan(&state).expect("ledger readable");
+            clock.set(NOW + 5_000);
+            let second = scanner.scan(&state).expect("ledger readable");
             (first, second)
         });
+
+        // THE DETERMINISTIC HALF: `changed` is the exact boolean the log is gated on, read back
+        // from the scan rather than out of a global the rest of the binary can write to.
+        assert!(first.changed, "the first publish is always a change");
+        assert!(
+            !second.changed,
+            "a recomputed instant alone must not read as a change"
+        );
 
         // POSITIVE CONTROL — without it a green test could mean the fixture never recomputed
         // anything, which is the vacuous version of this assertion.
         assert_ne!(
-            first, second,
+            first.due, second.due,
             "the fixture must actually produce two different structs, or this test proves nothing"
         );
-        assert_eq!(first.len(), 1);
-        assert_eq!(second.len(), 1);
+        assert_eq!(first.due.len(), 1);
+        assert_eq!(second.due.len(), 1);
         assert_ne!(
-            first[0].not_before_ms, second[0].not_before_ms,
+            first.due[0].not_before_ms, second.due[0].not_before_ms,
             "`not_before_ms` must be the recomputed field — that is the whole premise here"
         );
         assert_eq!(
-            first[0].agent_id, second[0].agent_id,
+            first.due[0].agent_id, second.due[0].agent_id,
             "the due SET is unchanged; only the recomputed instant moved"
         );
 
+        // AND THE WIRING HALF: the boolean above would still be right if `tick` logged
+        // unconditionally beside it, so the emitted line is counted too.
         assert_eq!(
             logs.matches(CHANGE_LINE).count(),
             1,
@@ -1174,25 +1355,121 @@ mod tests {
 
     /// THE PAIRED POSITIVE. Without it, a `publish_due` that never logged at all would satisfy the
     /// test above — and a change nobody is told about is the failure this module exists to end.
+    ///
+    /// ⚠️ THIS IS THE TEST THAT WAS FLAKY IN CI (bead sparkle-iknpzf) — one red in a 4,485-test run
+    /// on a branch that changed no line of this file, green in isolation and green in a full local
+    /// parallel run. It was NOT the ledger and it was NOT this module's arithmetic: the instants
+    /// were already literals. It was `tracing`'s process-global callsite-interest cache, which a
+    /// sibling test on another thread could switch off underneath the capture. `capture_logs` holds
+    /// that steady now; see `pin_callsite_interest`. What remains here is the clock, which this
+    /// test now owns outright — the second scan happens 5s later because `clock.set` says so, not
+    /// because any wall clock advanced.
     #[test]
     fn a_genuinely_changed_due_set_still_logs() {
         let (_td, dir, app_data) = one_dead_agent_ledger("a1");
         let state = RevivalState::default();
+        let clock = TestClock::at(NOW + 1);
+        let read = || clock.read();
+        let scanner = Scanner::with_clock(&dir, &app_data, &read);
 
-        let (sets, logs) = capture_logs(|| {
-            let first = tick(&dir, &app_data, &state, NOW + 1).expect("ledger readable");
+        let ((first, second), logs) = capture_logs(|| {
+            let first = scanner.scan(&state).expect("ledger readable");
             // A SECOND agent dies. Same cause, same epoch — so nothing but MEMBERSHIP changed.
             add_dead_agent(&dir, "a2");
-            let second = tick(&dir, &app_data, &state, NOW + 5_000).expect("ledger readable");
+            clock.set(NOW + 5_000);
+            let second = scanner.scan(&state).expect("ledger readable");
             (first, second)
         });
 
-        assert_eq!(sets.0.len(), 1);
-        assert_eq!(sets.1.len(), 2, "the second scan must genuinely see two agents");
+        assert_eq!(first.due.len(), 1);
+        assert_eq!(second.due.len(), 2, "the second scan must genuinely see two agents");
+        // THE DETERMINISTIC HALF — the boolean the log is gated on. Both scans moved the SET, so
+        // both must report a change.
+        assert!(
+            first.changed && second.changed,
+            "an agent joining the due set is a change; got first={} second={}",
+            first.changed,
+            second.changed
+        );
+        // AND THE WIRING HALF, which is what makes the boolean above worth anything: a `tick` that
+        // computed `changed` correctly and never emitted the line would still pass without this.
         assert_eq!(
             logs.matches(CHANGE_LINE).count(),
             2,
             "an agent joining the due set is news and must be logged — got:\n{logs}"
+        );
+    }
+
+    /// THE DEFAULTED SEAM, CLOSED (bead sparkle-iknpzf).
+    ///
+    /// Every other test in this module now hands the scanner a clock it controls, which is exactly
+    /// the shape this repo keeps paying for: the line that supplies the REAL clock ends up covered
+    /// by nothing, and could be deleted with the whole suite still green. This is the one test that
+    /// drives the PRODUCTION entry point — `Scanner::live`, the constructor `start` calls — over a
+    /// real ledger with the default clock wired in.
+    ///
+    /// It is built so it can only pass with a real clock, and without depending on wall-clock
+    /// PROGRESS: the record is a `wall-session` death, the one cause `arms_on_clock` gates on a
+    /// recorded instant, and that instant is a FIXED point already long past. Nothing here races
+    /// anything. Swap `WALL_CLOCK` for a stub, a zero or a frozen constant and the agent stops
+    /// being due; the paired negative below shows the gate is still there and doing the refusing.
+    #[test]
+    fn a_live_scanner_reads_the_real_wall_clock() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let dir = td.path().join("agent-life");
+        let app_data = td.path().join("app-data");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&app_data).unwrap();
+
+        let lifted_at = NOW + 60_000;
+        agent_life::open_at(&dir, "walled", "proj", "/wt", "dead-epoch", NOW).unwrap();
+        agent_life::close_at(
+            &dir,
+            "walled",
+            Death {
+                cause: DeathCause::WallSession,
+                evidence: DeathEvidence::QuotaBlock,
+                at: NOW,
+                message: Some("You've hit your session limit".into()),
+                goal_met_at: None,
+                stopped_by: None,
+            },
+            Some(Wall {
+                message: "You've hit your session limit · resets 10:30pm (America/Los_Angeles)"
+                    .into(),
+                reset_at: Some(lifted_at),
+                reset_parsed: true,
+                observed_at: NOW,
+            }),
+        )
+        .unwrap();
+
+        let state = RevivalState::default();
+        let scan = Scanner::live(&dir, &app_data)
+            .scan(&state)
+            .expect("ledger readable");
+        assert_eq!(
+            scan.due.iter().map(|d| d.agent_id.as_str()).collect::<Vec<_>>(),
+            vec!["walled"],
+            "a wall that lifted at a fixed instant in the past must be due when the scanner reads \
+             the REAL clock"
+        );
+        assert_eq!(
+            scan.due[0].not_before_ms, lifted_at,
+            "and it must be the wall's recorded instant that gated it"
+        );
+
+        // THE PAIRED NEGATIVE, one millisecond before the wall lifted. Without it the assertion
+        // above could pass because the clock gate is gone rather than because the clock is real.
+        let frozen = TestClock::at(lifted_at - 1);
+        let read = || frozen.read();
+        let before = Scanner::with_clock(&dir, &app_data, &read)
+            .scan(&RevivalState::default())
+            .expect("ledger readable");
+        assert!(
+            before.due.is_empty(),
+            "the clock gate must still refuse a wall that has not lifted — got {:?}",
+            before.due
         );
     }
 

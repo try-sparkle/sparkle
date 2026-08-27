@@ -35,6 +35,7 @@
 // Both are read from the VIEWPORT, never the scrollback — see `services/terminalViewport.ts` for why
 // history latches the second guard true forever.
 import { isClaudeCodeScreen } from "../engine/claudeCodeScreen";
+import { claudeCodeDialogOnScreen } from "../engine/claudeCodeDialogScreen";
 import {
   DISPLAY_AMBIGUOUS_SHELL_PROMPTS,
   screenAwaitsInput,
@@ -400,7 +401,28 @@ export function terminalWriteRefusal(
   //
   // THE REFUSAL FOR GENUINE FULL-SCREEN PROGRAMS IS UNTOUCHED. `vim`, `less`, `htop` and `lazygit`
   // draw none of those markers, so they still take this arm — which the bead requires explicitly.
-  if (viewport.alternateBuffer && !isClaudeCodeScreen(viewport.text)) return "alternate-screen";
+  //
+  // ══ …AND NEITHER IS A LIVE CLAUDE CODE DIALOG (bead sparkle-d6a5r) ═══════════════════════════
+  // `isClaudeCodeScreen` FALSE-NEGATIVES on a permission dialog whose footer does not terminate the
+  // grid — its family E earns its standing by position, and a dialog is what REPLACES the composer
+  // box family D demands. So the state a human most needs to reach was reported as `vim`, six times.
+  //
+  // THE PAIRING WITH `screenBlocksWrite` IS THE SAFETY ARGUMENT, not a belt-and-braces. Every screen
+  // this reclassifies is one the very next line refuses anyway, as `awaiting-input` — so nothing
+  // becomes writable that was not writable before, and the ONLY thing that changes is which sentence
+  // the human is shown. That matters on its own terms: "quit the full-screen app" is an instruction
+  // nobody can follow when there is no app to quit (AGENTS.md — a remedy string is an instruction),
+  // and it withholds the one thing they can act on, which is the dialog.
+  //
+  // THE DISPATCHER MAKES THE IDENTICAL WIDENING, on the identical conjunction. This function and
+  // `conciergeDispatch`'s chokepoint are documented above as having to agree about one screen; they
+  // share `claudeCodeDialogOnScreen` for the same reason they already share `isClaudeCodeScreen`.
+  if (
+    viewport.alternateBuffer &&
+    !isClaudeCodeScreen(viewport.text) &&
+    !(claudeCodeDialogOnScreen(viewport.text) && screenBlocksWrite(viewport.text))
+  )
+    return "alternate-screen";
   // AND THE PROMPT GUARD STILL RUNS ON IT. Recognising Claude Code says the buffer flag is not the
   // hazard; it says NOTHING about what is drawn on the screen. Claude Code shows permission
   // dialogs, pickers and `(y/n)` prompts of its own, and a message submitted into one of those

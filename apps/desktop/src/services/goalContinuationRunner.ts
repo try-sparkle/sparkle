@@ -780,7 +780,13 @@ function undeliverableReason(
           ? `${screen} has a dialog waiting for your answer${namedMenuOptions(altScreenMenuLabels)}. It is a menu the auto-resume cannot answer for you — open ${pane} and choose what is on screen, and the auto-resume will take over again`
           : `${screen} is in full-screen mode with no menu on it — a pager or editor is holding the screen, so nothing is waiting on an answer. Quitting it is safe and will not lose the turn (the goal resumes where it left off): open ${pane} and quit the pager or editor, and the auto-resume will take over again`
       : path === "blocked-prompt"
-        ? `${screen} is waiting at a prompt that must not receive free text — a password, a host-key confirmation, a yes/no. Answer that prompt in ${pane}`
+        ? // ── A PERMISSION DIALOG ARRIVES HERE NOW (bead sparkle-d6a5r) ─────────────────────────
+          // It used to take `alternate-screen` and be described as an editor or a pager, which the
+          // arm above already had to correct once. `conciergeDispatch` classifies it as what it is,
+          // which routes it to THIS sentence — so this list has to lead with it rather than
+          // enumerating only the credential shapes, or the escalation names every cause but the one
+          // the human is actually looking at.
+          `${screen} is waiting at a prompt that must not receive free text — a permission dialog, a password, a host-key confirmation, a yes/no. Answer that prompt in ${pane}`
         : path === "pty-gone"
           ? "its process is gone. Restart the agent to pick the goal back up"
           : // SPLIT FROM `pty-gone`, because the remedies differ and this one already has an

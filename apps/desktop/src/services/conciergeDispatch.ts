@@ -114,6 +114,10 @@ import { paneState } from "./paneReadiness";
 import { findKnownAgent } from "./knownAgents";
 import { getAgentViewport } from "./terminalViewport";
 import { isClaudeCodeScreen } from "../engine/claudeCodeScreen";
+// The terminal-delivery caller's own, narrower question about the SAME screen — see that
+// module's header for why the correction lives there and not in `isClaudeCodeScreen`, which is
+// shared with the row colour and the keystroke-authorization gate.
+import { altScreenEvidence } from "../engine/claudeCodeDialogScreen";
 // The blocked-prompt grace window's outcome channel. A VALUE import, and it does not close a cycle:
 // that module imports `ConciergeDispatchPath` from here `import type`, which erases at compile time.
 import { answerOutcomeForPath, notePromptAnswerOutcome } from "../engine/blockedPromptGrace";
@@ -200,6 +204,74 @@ export interface ConciergeDispatchResult {
    *  holding the screen — quitting it is safe". Populated from the SAME `liveOptionsFor` read the
    *  refusal decision uses, so the copy can never disagree with the guard about whether a menu is up. */
   altScreenMenuLabels?: string[];
+}
+
+/**
+ * DID THIS RESULT ACTUALLY SUBMIT THE MESSAGE TO THE AGENT? (bead sparkle-1cu3j)
+ *
+ * ══ THE DEFECT ═════════════════════════════════════════════════════════════════════════════════
+ * `ok` was being read as "delivered", and on one path it does not mean that: `queued` returns
+ * `ok: true` having written NOTHING to the PTY. The text is held in `services/pendingSends` until
+ * the pane reports ready, and the flush that eventually delivers it settles on a DIFFERENT channel
+ * (`onDeferredSendOutcome`) that a tool caller never subscribes to. So the caller is told the send
+ * succeeded, cannot tell otherwise without reading the pane, and — the reported consequence — a
+ * caller that retries on failure does not retry, because it was told it succeeded. Filed six times.
+ *
+ * `ok` KEEPS ITS MEANING and nothing about the queue changes: `ok: true` still says "I accepted
+ * this and nothing is wrong". This adds the second fact that was missing — whether the carriage
+ * return has been written yet — so a caller can distinguish "it is in front of the agent now" from
+ * "it is promised for later". A queued send is `ok: true, submitted: false`.
+ *
+ * ══ ONE FUNCTION, EXHAUSTIVE, RATHER THAN A FIELD ON THIRTY RETURN SITES ═══════════════════════
+ * Every producer of a `ConciergeDispatchResult` would otherwise have to remember to set it, and a
+ * field that can be forgotten answers this question by omission — the failure this repo names
+ * "a defaulted seam". Derived here from `(ok, path)`, with a `never` exhaustiveness check, so a new
+ * path CANNOT be added without deciding whether it delivers.
+ *
+ * ⚠️ IT IS A CLAIM ABOUT THE CARRIAGE RETURN, NOT ABOUT THE AGENT'S ATTENTION. `submitPrompt`
+ * resolves once the PTY has ACCEPTED the write, not once the CLI has processed it — this file's
+ * own `flushScreenHeldSends` header states that, and no synchronous read can improve on it. `true`
+ * means the paste AND its submitting `\r` were written; it does not mean the agent has read them.
+ */
+export function wasSubmitted(r: Pick<ConciergeDispatchResult, "ok" | "path">): boolean {
+  // A refusal never wrote anything. Asked first so the switch below is purely about the path.
+  if (!r.ok) return false;
+  switch (r.path) {
+    // THE TWO PATHS THAT WROTE A CARRIAGE RETURN.
+    //   `picker-option` — `frameSubmit` carries its own `\r` (relayGate), so the option was
+    //     pressed, not merely typed.
+    //   `free-text` — `submitPrompt` locally (bracketed paste, a beat, then `\r`), and
+    //     `frameCloudSubmit` over the relay (one string ending `\r`). Both submit; see
+    //     pty.deliverSubmit and frameCloudSubmit.
+    case "picker-option":
+    case "free-text":
+      return true;
+    // THE ONE THAT MADE THIS FUNCTION NECESSARY. Accepted, held, not written. See the doc above.
+    case "queued":
+      return false;
+    // Every remaining path is a refusal and cannot be `ok: true` — but they are enumerated rather
+    // than defaulted so the `never` below actually fires when a path is added.
+    case "queue-full":
+    case "ambiguous-picker":
+    case "addressed-at-picker":
+    case "empty":
+    case "trial-spent":
+    case "expired":
+    case "abandoned":
+    case "agent-failed":
+    case "cloud-agent":
+    case "cloud-offline":
+    case "alternate-screen":
+    case "blocked-prompt":
+    case "unauthorized":
+    case "pty-gone":
+      return false;
+    default: {
+      const exhaustive: never = r.path;
+      void exhaustive;
+      return false;
+    }
+  }
 }
 
 /** How a dispatch should be treated. `userPrompt` marks the text as something the USER authored
@@ -807,7 +879,41 @@ async function routeConciergeAnswer(
   // `picker-option` into `free-text`. The suite was right and the comment claiming re-reading was
   // harmless was wrong.)
   const pickerOptions = liveOptionsFor(agentId);
-  const claudeCodeHoldsTheBuffer = !!screen?.alternateBuffer && isClaudeCodeScreen(screen.text);
+  // ══ WHAT THIS SCREEN ACTUALLY IS, AND THE RECORD OF HOW WE DECIDED (bead sparkle-d6a5r) ═══════
+  // Gathered whether or not anything is refused, because it is also what the refusal LOGS: the six
+  // reported occurrences of "refused `alternate-screen` against an ordinary permission dialog" were
+  // undiagnosable after the fact, since the only log line this branch wrote was the agent id.
+  // Structural facts only — never the screen text; see `AltScreenEvidence`.
+  const evidence = screen
+    ? altScreenEvidence(screen.text, screen.alternateBuffer, pickerOptions.length)
+    : null;
+  // ══ A LIVE CLAUDE CODE DIALOG IS NOT A FULL-SCREEN APP ════════════════════════════════════════
+  // `isClaudeCodeScreen` false-negatives on a permission dialog whose footer does not TERMINATE the
+  // grid (its family E earns its standing by position), and a dialog is exactly what replaces the
+  // composer box family D requires. So the pane a human most needs to reach is the one reported as
+  // `vim`, with `restart_agent` — which destroys in-flight context — left as the only route to it.
+  //
+  // ⚠️ THE `screenBlocksWrite` CONJUNCT IS THE SAFETY ARGUMENT, NOT AN OPTIMISATION. It makes this
+  // widening provably incapable of DELIVERING anything that was previously refused: every screen it
+  // reclassifies is one `screenBlocksWrite` already says must not receive free text, so the
+  // `blocked-prompt` arm below refuses on exactly the same set. Drop it and free text falls through
+  // to the picker block, where a terse "1" would PRESS an option on a dialog nobody read — the
+  // least recoverable thing this path can do (roborev 54569/55400). Keep the two together.
+  const claudeCodeDialogHoldsTheBuffer =
+    screen !== null &&
+    screen.alternateBuffer === true &&
+    evidence?.dialogOnScreen === true &&
+    screenBlocksWrite(screen.text);
+  const claudeCodeHoldsTheBuffer =
+    (!!screen?.alternateBuffer && isClaudeCodeScreen(screen.text)) || claudeCodeDialogHoldsTheBuffer;
+  if (claudeCodeDialogHoldsTheBuffer && !evidence?.recognisedAsClaudeCode) {
+    // THE CORRECTION, LOGGED WHEN IT FIRES. This is the line that says a refusal which used to read
+    // "full-screen app" has been reclassified, and the evidence it was reclassified on.
+    log.info("concierge", "a live Claude Code dialog holds the buffer — not a full-screen app", {
+      agentId,
+      ...evidence,
+    });
+  }
   // ══ A FINGERPRINTED PICKER PRESS IS ITS OWN EVIDENCE (bead sparkle-jk8zt) ══════════════════════
   // THE BUG THIS FIXES: the concierge could not answer ANY approval prompt. Four agents in one day,
   // four for four, every `select_picker_option` refused `alternate-screen` — while
@@ -852,7 +958,11 @@ async function routeConciergeAnswer(
     !verifiedPickerPress &&
     !mountedHumanSend(opts)
   ) {
-    log.warn("concierge", "refused a write into a full-screen app", { agentId });
+    // NAME THE EVIDENCE (bead sparkle-d6a5r). `{ agentId }` alone made every one of the six
+    // reported misclassifications unreproducible: nothing recorded how many Claude Code marker
+    // families the screen showed, whether the composer box was there, or whether the viewport and
+    // the scrollback agreed about a live menu — which is the whole diagnosis. Structural only.
+    log.warn("concierge", "refused a write into a full-screen app", { agentId, ...evidence });
     // CARRY THE MENU VERDICT ON THE RESULT so the auto-resume escalation can name the right remedy.
     // `pickerOptions` is the same read this branch's `verifiedPickerPress` check already used, so the
     // copy downstream cannot disagree with the guard about whether a menu is live. A Claude Code

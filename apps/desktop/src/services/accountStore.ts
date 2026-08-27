@@ -79,6 +79,18 @@ export interface Identity {
    *  the wrong login keeps reporting drift until it is put back or re-attached. Absent (older backend)
    *  means "no drift known" — never assume it drifted. See Rust `AccountIdentity::identity_drifted`. */
   identityDrifted?: boolean;
+
+  /** HOW this account logs in — the login TYPE, not its health. `"token"` is a pasted long-lived
+   *  `claude setup-token` credential in `<configDir>/.credentials.json`; `"oauth"` is an interactive
+   *  `claude auth login` session. `null`/absent means NOTHING READABLE SAYS — a dir never signed
+   *  into, or a build whose Rust side predates the field — and the card renders "Login method
+   *  unknown" rather than picking the likelier answer.
+   *
+   *  Declared `| null`, not merely optional: the Rust field is an `Option`, and serde emits the key
+   *  with a `null` VALUE rather than omitting it (AGENTS.md). A bare `authKind?: "oauth" | "token"`
+   *  would describe a shape the wire cannot produce. Rust: `AccountIdentity.auth_kind`, pinned by
+   *  `account_identity_unknown_auth_kind_is_null_not_absent`. */
+  authKind?: "oauth" | "token" | null;
 }
 
 /** Raw shape the Rust side returns — mapped to {@link Usage} at the boundary. `AccountUsage` in

@@ -163,6 +163,23 @@ pub struct SpendSummary {
 /// "DROdio Storytell" and "DROdio Gmail" both resolved to `5fb3d67c-…`, so failing over between
 /// them switched to the SAME quota and re-hit the limit immediately, while the UI showed two
 /// independent headroom bars. Nothing could detect it because this field wasn't read.
+/// HOW an account's credential was established — the login TYPE, not its health.
+///
+/// Read from the account's own config dir, never from the keychain: see
+/// [`classify_credential_blob`] for the discriminator and [`auth_kind_for_account`] for the
+/// precedence. Serializes lowercase (`"oauth"` / `"token"`), which is the wire contract
+/// `services/accountStore.ts` (`Identity.authKind`) reads.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum AccountAuthKind {
+    /// An interactive `claude auth login` — a refreshable OAuth session, or a live `oauthAccount`
+    /// whose credential Claude Code keeps somewhere this never reads (the macOS keychain).
+    Oauth,
+    /// A pasted long-lived `claude setup-token` value, written to `<configDir>/.credentials.json`
+    /// by `account_usage::account_set_oauth_token`: an access token with NO refresh token.
+    Token,
+}
+
 #[derive(Serialize, Debug, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct AccountIdentity {
@@ -221,6 +238,15 @@ pub struct AccountIdentity {
     /// history (a legacy install predating the ledger) — so an older state never manufactures a drift
     /// claim. A wrong identity is worse than none: we only assert drift on positive evidence both ways.
     pub identity_drifted: bool,
+
+    /// Whether this account logs in by a pasted long-lived TOKEN or by an interactive OAUTH login.
+    /// `None` when nothing readable says so — a dir never signed into, or one whose credential lives
+    /// only somewhere this deliberately does not look. See [`auth_kind_for_account`].
+    ///
+    /// `Option` crosses the wire as an explicit `null`, never an absent key, so the TS side declares
+    /// it `authKind?: "oauth" | "token" | null` (AGENTS.md, "A Rust `Option` crosses the wire as
+    /// `null`"). A build whose frontend predates this field simply ignores it.
+    pub auth_kind: Option<AccountAuthKind>,
 }
 
 /// The `oauthAccount` fields we read out of an account's `.claude.json`. A present value means
@@ -3493,6 +3519,85 @@ fn identity_for_account(acct: &Account, home: Option<&Path>) -> Option<OauthIden
     read_oauth_identity_at(Some(Path::new(&acct.config_dir)), home_for)
 }
 
+// ---- login TYPE: OAuth session vs pasted long-lived token (pure) ---------------
+
+/// `<configDir>/.credentials.json` — the credential file an agent spawned with
+/// `CLAUDE_CONFIG_DIR=<configDir>` authenticates with.
+///
+/// It deliberately does NOT reuse [`identity_json_path`], because for the DEFAULT account the two
+/// files live in different directories. An empty `config_dir` means "set no `CLAUDE_CONFIG_DIR`",
+/// and Claude Code then records its identity at `$HOME/.claude.json` while keeping its credential
+/// under the state dir `$HOME/.claude/`. Resolving the empty case to `$HOME/.claude` matches
+/// `account_usage::resolve_config_dir_with`, which is the resolver the read path itself uses.
+fn credentials_json_path(config_dir: &str, home: Option<&Path>) -> Option<PathBuf> {
+    if !config_dir.is_empty() {
+        return Some(Path::new(config_dir).join(".credentials.json"));
+    }
+    home.map(|h| h.join(".claude").join(".credentials.json"))
+}
+
+/// Classify a `.credentials.json` blob. PURE — text in, verdict out — so the discriminator is
+/// unit-testable with no filesystem, no process, and emphatically no keychain.
+///
+/// The discriminator is the REFRESH TOKEN, and it is a shape contract rather than a guess. Sparkle's
+/// paste flow writes `{"claudeAiOauth":{"accessToken":…,"refreshToken":null,"expiresAt":0}}`
+/// (`account_usage::credentials_blob`) because a `claude setup-token` value is long-lived and has
+/// nothing to refresh; an interactive `claude auth login` mints a short-lived session and stores the
+/// refresh token it needs to renew it (`account_usage::extract_credentials` reads all three). So a
+/// usable access token with NO refresh token is a pasted TOKEN login, and one carrying a refresh
+/// token is an OAUTH session.
+///
+/// `None` for anything that is not a credential at all — absent object, empty access token,
+/// unparseable JSON. Never a guess and never an error: an unreadable file means the login type is
+/// unknown, and the UI says exactly that rather than picking the likelier answer.
+fn classify_credential_blob(blob: &str) -> Option<AccountAuthKind> {
+    let v: serde_json::Value = serde_json::from_str(blob).ok()?;
+    let oauth = v.get("claudeAiOauth")?;
+    oauth
+        .get("accessToken")
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.is_empty())?;
+    let refreshable = oauth
+        .get("refreshToken")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|s| !s.is_empty());
+    Some(if refreshable {
+        AccountAuthKind::Oauth
+    } else {
+        AccountAuthKind::Token
+    })
+}
+
+/// How this account logs in, or `None` when nothing readable says so.
+///
+/// PRECEDENCE — the credential FILE wins over the recorded identity, and that ordering is the point
+/// rather than an accident: `<configDir>/.credentials.json` is the file a spawn actually
+/// authenticates with (`account_usage::read_access_token_with` tries it FIRST and only then the
+/// keychain), so when it is there it describes the credential in use. The identity fallback is what
+/// covers an interactive macOS login, whose credential lives in the keychain — a place this never
+/// touches, deliberately: reading it would raise the very "wants to use your confidential
+/// information" dialog the app exists to keep off an unattended machine.
+///
+/// KNOWN LIMIT, and it is why the label this drives describes the CREDENTIAL rather than the person:
+/// a dir that was token-pasted and later re-logged-in interactively on macOS keeps its stale
+/// `.credentials.json` and still reads `Token`. That is the honest reading of the file a spawn reads
+/// first; it is not a claim about which browser window the user last used.
+fn auth_kind_for_account(
+    acct: &Account,
+    home: Option<&Path>,
+    signed_in: bool,
+) -> Option<AccountAuthKind> {
+    let home_for = if acct.is_default { home } else { None };
+    credentials_json_path(&acct.config_dir, home_for)
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|blob| classify_credential_blob(&blob))
+        .or(if signed_in {
+            Some(AccountAuthKind::Oauth)
+        } else {
+            None
+        })
+}
+
 
 /// The key an account's learned history is filed under: the Anthropic `accountUuid` when the login
 /// records one, otherwise the verified email.
@@ -3671,6 +3776,9 @@ fn identities_at(
         .zip(resolved)
         .map(|(a, id)| {
             let key = id.as_ref().map(identity_key);
+            // Captured BEFORE the match below consumes `id`: the identity fallback in
+            // `auth_kind_for_account` needs to know whether this dir holds a live `oauthAccount`.
+            let signed_in = id.is_some();
             let (email, organization, account_uuid) = match id {
                 Some(i) => (Some(i.email), i.organization, i.account_uuid),
                 None => (None, None, None),
@@ -3705,6 +3813,7 @@ fn identities_at(
                 shell_account_uuid,
                 identity_changed,
                 identity_drifted,
+                auth_kind: auth_kind_for_account(a, home, signed_in),
             }
         })
         .collect()
@@ -10238,17 +10347,150 @@ mod tests {
             shell_account_uuid: Some("5fb3d67c".into()),
             identity_changed: true,
             identity_drifted: true,
+            auth_kind: Some(AccountAuthKind::Token),
         })
         .unwrap();
         assert_eq!(v.get("shellEmail").unwrap(), "personal@example.com");
         assert_eq!(v.get("shellAccountUuid").unwrap(), "5fb3d67c");
         assert_eq!(v.get("identityChanged").unwrap(), true);
         assert_eq!(v.get("identityDrifted").unwrap(), true);
+        // The login-TYPE field the account card's "Token login" / "OAuth login" label reads. Both
+        // halves of the contract are pinned: the KEY is camelCase and the VALUE is the lowercase
+        // enum string the TS union (`authKind?: "oauth" | "token" | null`) declares.
+        assert_eq!(v.get("authKind").unwrap(), "token");
+        assert!(v.get("auth_kind").is_none());
         assert!(
             v.get("shell_email").is_none()
                 && v.get("identity_changed").is_none()
                 && v.get("identity_drifted").is_none()
         );
+    }
+
+    /// A `None` login type crosses the wire as an explicit `null`, NOT as an absent key — the exact
+    /// shape AGENTS.md warns a `field?: T` TypeScript declaration cannot express. The TS side must
+    /// declare `authKind?: "oauth" | "token" | null`, and this is what proves the `| null` is needed.
+    #[test]
+    fn account_identity_unknown_auth_kind_is_null_not_absent() {
+        let v = serde_json::to_value(AccountIdentity {
+            id: "133420d1".into(),
+            email: None,
+            organization: None,
+            account_uuid: None,
+            shell_email: None,
+            shell_account_uuid: None,
+            identity_changed: false,
+            identity_drifted: false,
+            auth_kind: None,
+        })
+        .unwrap();
+        assert!(v.get("authKind").is_some(), "the key must be PRESENT");
+        assert!(v.get("authKind").unwrap().is_null(), "and its value null");
+    }
+
+    /// The pasted-token blob Sparkle itself writes classifies as TOKEN, and a refreshable session
+    /// classifies as OAUTH. The discriminator is the refresh token, so mutating either arm flips the
+    /// verdict — this cannot pass against a classifier that always answers the same thing.
+    #[test]
+    fn classify_credential_blob_splits_token_from_oauth() {
+        // Byte-for-byte the shape `account_usage::credentials_blob` writes on a paste.
+        let pasted = r#"{"claudeAiOauth":{"accessToken":"neutral-access","refreshToken":null,"expiresAt":0}}"#;
+        assert_eq!(classify_credential_blob(pasted), Some(AccountAuthKind::Token));
+        // An absent refreshToken key reads the same as an explicit null — nothing to refresh.
+        let no_key = r#"{"claudeAiOauth":{"accessToken":"neutral-access"}}"#;
+        assert_eq!(classify_credential_blob(no_key), Some(AccountAuthKind::Token));
+        // An empty string is not a refresh token either.
+        let empty_refresh = r#"{"claudeAiOauth":{"accessToken":"neutral-access","refreshToken":""}}"#;
+        assert_eq!(
+            classify_credential_blob(empty_refresh),
+            Some(AccountAuthKind::Token)
+        );
+        // A real interactive session carries the token it renews itself with.
+        let session = r#"{"claudeAiOauth":{"accessToken":"neutral-access","refreshToken":"neutral-refresh","expiresAt":1710000000000}}"#;
+        assert_eq!(
+            classify_credential_blob(session),
+            Some(AccountAuthKind::Oauth)
+        );
+    }
+
+    /// Anything that is not a credential is UNKNOWN, never the likelier answer. Each of these once
+    /// tempted a "well, it's probably a token" default; a wrong login type on the card is a lie the
+    /// user has no way to check.
+    #[test]
+    fn classify_credential_blob_refuses_to_guess() {
+        assert_eq!(classify_credential_blob("{not json at all"), None);
+        assert_eq!(classify_credential_blob("{}"), None);
+        assert_eq!(classify_credential_blob(r#"{"other":1}"#), None);
+        assert_eq!(
+            classify_credential_blob(r#"{"claudeAiOauth":{"accessToken":""}}"#),
+            None,
+            "an empty access token is not a credential"
+        );
+        assert_eq!(
+            classify_credential_blob(r#"{"claudeAiOauth":{"refreshToken":"r"}}"#),
+            None,
+            "a refresh token with no access token is not a credential either"
+        );
+    }
+
+    /// The DEFAULT account's identity and its credential live in DIFFERENT directories when no
+    /// `CLAUDE_CONFIG_DIR` is set: `$HOME/.claude.json` vs `$HOME/.claude/.credentials.json`.
+    /// Reusing `identity_json_path` here would look beside the identity file and find nothing.
+    #[test]
+    fn credentials_json_path_resolves_the_empty_default_under_the_state_dir() {
+        let home = Path::new("/Users/example");
+        assert_eq!(
+            credentials_json_path("", Some(home)),
+            Some(PathBuf::from("/Users/example/.claude/.credentials.json"))
+        );
+        assert_ne!(
+            credentials_json_path("", Some(home)),
+            identity_json_path(None, Some(home)).map(|p| p.with_file_name(".credentials.json")),
+            "the credential is NOT beside $HOME/.claude.json"
+        );
+        // An explicit dir is joined verbatim.
+        assert_eq!(
+            credentials_json_path("/tmp/acct", None),
+            Some(PathBuf::from("/tmp/acct/.credentials.json"))
+        );
+        // No dir and no home: unknown, not a fabricated path.
+        assert_eq!(credentials_json_path("", None), None);
+    }
+
+    /// The end-to-end read, over a real directory: the file WINS over the identity fallback, and a
+    /// dir with neither is unknown. The three arms are asserted together because each is the
+    /// other's control — a classifier stuck on one answer reddens on the other two.
+    #[test]
+    fn auth_kind_for_account_prefers_the_credential_file() {
+        let base = unique_dir("auth-kind");
+        let acct = Account {
+            id: "a".into(),
+            nickname: "n".into(),
+            config_dir: base.to_string_lossy().to_string(),
+            is_default: false,
+            created_at: 0,
+            exhausted_until: None,
+            exhausted_identity: None,
+        };
+        // No credential file at all, and no live identity → unknown.
+        assert_eq!(auth_kind_for_account(&acct, None, false), None);
+        // No credential file, but the dir holds a live `oauthAccount` → the keychain-backed
+        // interactive login, i.e. OAuth.
+        assert_eq!(
+            auth_kind_for_account(&acct, None, true),
+            Some(AccountAuthKind::Oauth)
+        );
+        // A pasted token in the dir OUTRANKS the identity: `signed_in` is true (a token account
+        // records an email so it can be routed), yet the answer must be Token.
+        std::fs::write(
+            base.join(".credentials.json"),
+            r#"{"claudeAiOauth":{"accessToken":"neutral-access","refreshToken":null,"expiresAt":0}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            auth_kind_for_account(&acct, None, true),
+            Some(AccountAuthKind::Token)
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

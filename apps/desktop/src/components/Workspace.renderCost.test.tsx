@@ -33,7 +33,7 @@
 // pane props the real predicate calls different, which is exactly what makes the real pane re-render.
 // A bare stub (what every other Workspace suite mocks in) would count nothing and pass forever.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { BUILD_WIDTH_EVENT } from "../engine/columnResize";
 
 vi.mock("@tauri-apps/api/window", () => ({
@@ -185,7 +185,13 @@ const DRAG_STEPS = 30;
  *  which would make every bound below trivially satisfied by an empty stage. */
 async function mount() {
   render(<Workspace />);
-  await screen.findAllByTestId(/^pane-/);
+  // ALL of them, not just the first. Panes mount through a bounded queue now
+  // (services/paneMountScheduler, bead sparkle-pqss6) — two per frame, so `findAllByTestId` returns
+  // on a handful and the drag would then be measured against a fleet still filling in, which is
+  // both the wrong measurement and a flaky one.
+  await waitFor(() => expect(screen.getAllByTestId(/^pane-/)).toHaveLength(PANES), {
+    timeout: 8000,
+  });
 }
 
 describe("dragging the concierge seam does not re-render the terminal panes", () => {

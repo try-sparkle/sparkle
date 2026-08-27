@@ -69,6 +69,7 @@ import {
   agentCanAcceptInput,
   dispatchConciergeAnswer,
   liveOptionsFor,
+  wasSubmitted,
   type ConciergeDispatchPath,
 } from "../conciergeDispatch";
 import { isDispatchAuthority, type ConciergeToolAuthority } from "../dispatchAuthority";
@@ -300,6 +301,22 @@ export type ConciergeSendPath = ConciergeDispatchPath | "unknown-agent" | "spark
 export interface ConciergeSendResult {
   ok: boolean;
   agentId: string;
+  /**
+   * HAS THE MESSAGE ACTUALLY BEEN SUBMITTED TO THE AGENT? (bead sparkle-1cu3j)
+   *
+   * `ok: true` alone does NOT mean delivered, and that was the defect: a send aimed at an agent
+   * whose PTY is still coming up returns `ok: true, path: "queued"` having written nothing at all.
+   * The caller was told it succeeded, could not tell otherwise without reading the pane, and a
+   * caller that retries on failure therefore never retried. Filed six times.
+   *
+   * READ IT AS THE DELIVERY QUESTION and `ok` as the acceptance one. `ok: true, submitted: false`
+   * is the honest shape of a queued send: nothing is wrong, and nothing has arrived yet — `detail`
+   * says which. Derived by `conciergeDispatch.wasSubmitted`, exhaustively over the path, so it is
+   * never a field somebody forgot to set.
+   *
+   * ⚠️ A CLAIM ABOUT THE CARRIAGE RETURN, NOT ABOUT THE AGENT'S ATTENTION — see `wasSubmitted`.
+   */
+  submitted: boolean;
   path: ConciergeSendPath;
   /**
    * The text as the USER should see it. Deliberately NOT the dispatcher's `sent`: that is the wire
@@ -1064,8 +1081,16 @@ export function sendDetail(path: ConciergeSendPath, agentId: string): string {
     // Same shape as the line above and the same reason it offers no rephrasing: the screen is
     // waiting on a specific answer, and free text submitted into it would be answering the wrong
     // question — or, at a credential field, echoing nothing while it did so.
+    //
+    // ── AND IT NOW ALSO COVERS A PERMISSION DIALOG (bead sparkle-d6a5r) ──────────────────────────
+    // A Claude Code permission dialog on the alternate buffer used to take `alternate-screen`,
+    // because `isClaudeCodeScreen` false-negatives on the screen where the dialog has replaced the
+    // composer box. `conciergeDispatch` now classifies that correctly, which routes it HERE — so
+    // this sentence has to name it, or the most common screen reaching this refusal is the one it
+    // does not describe. AGENTS.md: a fix that changes what happens must update every string that
+    // narrated the old behaviour.
     case "blocked-prompt":
-      return "Not sent: the agent is waiting on something on screen (a prompt or a credential field), which this text would have been submitted into.";
+      return "Not sent: the agent is waiting on something on screen (a permission dialog, a prompt, or a credential field), which this text would have been submitted into. It's the human's to answer in that agent's own pane; I won't press anything on their behalf.";
     case "unknown-agent":
       return `Not sent: there is no open agent with id ${agentId}.`;
     // THE GENERIC FORM. The refusal site passes the LIVE sentence from services/sparkleBusy instead
@@ -1126,6 +1151,10 @@ export async function sendToAgentTerminal(
   const refuse = (path: ConciergeSendPath, detailOverride?: string): ConciergeSendResult => ({
     ok: false,
     agentId,
+    // A refusal never wrote a byte. Stated rather than derived here because these three paths
+    // (`unauthorized`, `unknown-agent`, `sparkle-busy`) are this layer's own and never reach the
+    // dispatcher, so `wasSubmitted` is not the thing that answers for them.
+    submitted: false,
     path,
     detail: detailOverride ?? sendDetail(path, agentId),
   });
@@ -1192,6 +1221,10 @@ export async function sendToAgentTerminal(
   return {
     ok: r.ok,
     agentId: r.agentId,
+    // THE HONEST HALF OF THE ACK (bead sparkle-1cu3j). From the dispatcher's own exhaustive
+    // derivation, not re-decided here — a second copy of "which paths deliver" is exactly how the
+    // two would come to disagree.
+    submitted: wasSubmitted(r),
     path: r.path,
     // `display`, never `sent` — see ConciergeSendResult.display.
     ...(r.display !== undefined ? { display: r.display } : {}),
@@ -1327,6 +1360,10 @@ export const CONCIERGE_TERMINAL_TOOLS = [
       "State `goal` — an objectively verifiable completion criterion anyone can check — or " +
       "`notWork: { reason }` when the send assigns no work; a send stating neither is refused. " +
       "Requires an authorized tool policy. Refuses rather than guessing when the agent has a prompt on screen the message doesn't answer. " +
+      "READ `submitted`, NOT `ok`, TO KNOW WHETHER THE MESSAGE ARRIVED: `ok` says the send was accepted and nothing is wrong, " +
+      "while `submitted: false` says it has NOT been typed and entered yet. The one case is an agent whose terminal is still " +
+      "coming up (`path: \"queued\"`) — the message is held and delivered when it is ready, so do NOT re-send it, and do not " +
+      "report it to the human as delivered. " +
       SPARKLE_AGENT_TOOL_NOTE,
     write: true,
   },

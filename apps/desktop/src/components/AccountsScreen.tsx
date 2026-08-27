@@ -875,6 +875,79 @@ export function deriveRowLogin(
   return "signedOut";
 }
 
+// ── THE LOGIN BADGE: how this account signs in, and whether that login is working ────────────────
+//
+// Two independent facts, rendered as one dot-and-label to the RIGHT of the "in rotation" status:
+// the METHOD in words ("OAuth login" / "Token login") and the HEALTH as the dot's colour. They are
+// separate functions because they answer separate questions and fail separately — a token login can
+// be perfectly healthy, and an OAuth login whose method we can read can still be dead.
+
+/** How this account authenticates. `"unknown"` is a real, rendered state, not a placeholder for a
+ *  missing case: it is what an account never signed into reports, and what a build whose Rust side
+ *  predates `AccountIdentity.auth_kind` reports for EVERY account.
+ *
+ *  The distinction cannot be made on this side of the wire and must not be guessed here. Both a
+ *  browser `claude auth login` and a pasted `claude setup-token` value are claude.ai OAuth
+ *  credentials, so `ClaudeAuthStatus.authMethod` reads `"claude.ai"` for both — deriving the label
+ *  from it would confidently mislabel every token account. Rust answers it by reading which
+ *  credential the account's own config dir actually holds (`accounts.rs::auth_kind_for_account`). */
+export type LoginMethod = "oauth" | "token" | "unknown";
+export function loginMethod(identity: Identity | undefined): LoginMethod {
+  const kind = identity?.authKind;
+  return kind === "oauth" || kind === "token" ? kind : "unknown";
+}
+
+/** The words each {@link LoginMethod} shows. "Login method unknown" is deliberately a full sentence
+ *  fragment rather than a blank: a missing label beside a coloured dot reads as a rendering bug, and
+ *  an empty string would let a reader assume the method is whatever the neighbouring card says. */
+export const LOGIN_METHOD_LABEL: Record<LoginMethod, string> = {
+  oauth: "OAuth login",
+  token: "Token login",
+  unknown: "Login method unknown",
+};
+
+/** The dot's colour, as a state. GREEN or RED only — no amber tier, by the bead's own instruction.
+ *
+ *  ⚠️ WHAT THIS CANNOT SEE, and why it is not painted red anyway. The bead this implements is
+ *  specified against an honest RateLimited / Unauthorized / Connection split of the usage-fetch
+ *  error, and THAT SPLIT DOES NOT EXIST YET on the quiet path every card gets automatically. The
+ *  automatic `getAccountUsageLive` failure handler (see the mount effect) folds a terminal 401, a
+ *  429, a network timeout, a 5xx and an unparseable body into ONE `"error"` cell. So a quietly
+ *  UNAUTHORIZED account — the login is genuinely dead but `.claude.json` still names an email and
+ *  the `claude auth status` probe could not run — is indistinguishable from a Wi-Fi blip, and this
+ *  reports it GREEN.
+ *
+ *  Painting that cell red would be the worse error in the other direction: it would announce a
+ *  broken login every time the machine's network hiccuped, on every card at once. A red dot is a
+ *  claim about the ACCOUNT, and a transient fetch failure is not evidence about the account. So the
+ *  rule is: red only on a signal that is decisive about the login or its limit, green otherwise.
+ *
+ *  FOLLOW-UP: once the usage fetch classifies its own failures — the Rust side already stamps both
+ *  `rate-limited` and `unauthorized after keychain re-read`, they are simply collapsed by the quiet
+ *  path's `isUsageUnknownError(e) ? "unknown" : "error"` — a proven-dead-token cell should join the
+ *  red set here, and only the connection arm should stay green.
+ *
+ *  The three signals it DOES read, all decisive:
+ *   • `rowLogin` — the identity read folded with the live `claude auth status` probe. Anything but
+ *     `"healthy"` is a dead or absent login (needs-reauth / disconnected).
+ *   • `rateLimited` — an OBSERVED limit: this account's `exhaustedUntil` wall has not passed, or a
+ *     user-initiated usage check came back classified `exhausted` (Anthropic's own 429).
+ *   • `usageErrorKind === "signedout"` — the user-initiated check proved the token dead (a terminal
+ *     401, `isUsageAuthError`). Only the FORCED path produces this; the quiet one cannot. */
+export type LoginHealth = "working" | "failing";
+export function loginHealth(
+  rowLogin: RowLogin,
+  rateLimited: boolean,
+  usageErrorKind: "error" | "unknown" | "exhausted" | "signedout" | undefined,
+): LoginHealth {
+  if (rowLogin !== "healthy") return "failing";
+  if (rateLimited || usageErrorKind === "exhausted") return "failing";
+  if (usageErrorKind === "signedout") return "failing";
+  // `"error"` and `"unknown"` fall through to working ON PURPOSE — see the note above. Neither
+  // carries a verdict about this account's login.
+  return "working";
+}
+
 /** What the identity slot says for a login that IS real (it has an `accountUuid`) but carries no
  *  readable email. It is neither the email (there isn't one) nor "Not signed in" (that would be a
  *  lie in the other direction) nor the nickname (never evidence of anything).
@@ -2241,6 +2314,18 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
         // signed-in but its session is actually dead.
         const rowLogin = deriveRowLogin(signedIn, authStatus[a.id]);
         const loginExpired = rowLogin === "expired";
+        // ── THE LOGIN BADGE beside "in rotation" (bead sparkle-p92mtz) ──────────────────────────
+        // Method in words, health as a colour. `isAccountExhausted` is the SAME observed-limit
+        // predicate the router gates spawns on, so a card cannot call a login healthy while
+        // selection is refusing to route to it. See `loginHealth` for the one thing this cannot
+        // read — a quietly-unauthorized account, which the un-split usage-fetch error folds into a
+        // plain network failure and which therefore stays GREEN rather than being guessed at.
+        const method = loginMethod(identity);
+        const health = loginHealth(
+          rowLogin,
+          isAccountExhausted(usage, a.id, now),
+          usageError[a.id]?.kind,
+        );
         // THE DOT'S ANSWER, and the header's, from one function — see `services/rotationState.ts`.
         // Deriving it here rather than inline is what makes "in rotation" a single claim: the count
         // in the header nets off the SAME `outOfRotation` set this reads, so a card cannot say it is
@@ -2351,6 +2436,43 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
                         {rotationReasonLabel(rotation)}
                       </span>
                     )}
+                  </span>
+                </span>
+                {/* THE LOGIN BADGE — a dot and two-or-three words, to the RIGHT of the rotation
+                    status, in the same register as it. The dot is a styled <span>, never an emoji
+                    (this repo renders NO emoji as icons), and both the dot's fill and the label's
+                    ink are set EXPLICITLY on the element that paints them rather than inherited
+                    through a scoped custom property — a var redefined on a descendant does not
+                    re-resolve a colour an ancestor already computed. `C.successInk`/`C.dangerInk`
+                    are themselves theme tokens with their own light and dark values, so the pair
+                    reads on both themes without a second rule here. */}
+                <span
+                  data-testid={`account-login-badge-${a.id}`}
+                  data-health={health}
+                  data-method={method}
+                  style={{ display: "flex", alignItems: "center", gap: 5, flexShrink: 0 }}
+                >
+                  <span
+                    aria-hidden
+                    data-testid={`account-login-health-${a.id}`}
+                    style={{
+                      width: 8,
+                      height: 8,
+                      borderRadius: "50%",
+                      flexShrink: 0,
+                      background: health === "working" ? C.successInk : C.dangerInk,
+                    }}
+                  />
+                  <span
+                    data-testid={`account-login-method-${a.id}`}
+                    style={{
+                      fontSize: TYPE.micro,
+                      fontWeight: 600,
+                      color: health === "working" ? C.successInk : C.dangerInk,
+                      whiteSpace: "nowrap",
+                    }}
+                  >
+                    {LOGIN_METHOD_LABEL[method]}
                   </span>
                 </span>
                 {a.isDefault && <span style={tagStyle}>default</span>}
