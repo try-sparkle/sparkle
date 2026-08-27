@@ -1,3 +1,25 @@
+/** THERE ARE NO jest-dom MATCHERS IN THIS PACKAGE, AND THAT IS THE ANSWER TO THE ERROR YOU HIT.
+ *
+ *  `expect(el).toHaveTextContent(...)` — and `toBeInTheDocument`, `toBeVisible`, `toBeDisabled`,
+ *  every other `@testing-library/jest-dom` matcher — dies here with `Invalid Chai property`.
+ *  That message names no file and no missing import, and vitest dumps the whole rendered DOM for
+ *  each failure, so it reads as a broken suite rather than an absent one-line setup. Measured:
+ *  FOURTEEN tests went red at once on that message, thousands of lines of noise ahead of the
+ *  cause, one debug cycle per person writing their first component test here (bead sparkle-tikxx9).
+ *  Five separate suites had already each rediscovered it and written their own note about it.
+ *
+ *  WHAT TO WRITE INSTEAD — read the DOM directly. These are the idioms the existing suites use:
+ *      expect(el.textContent).toContain("...")           // instead of toHaveTextContent
+ *      expect(el).not.toBeNull()                         // instead of toBeInTheDocument
+ *      expect((el as HTMLButtonElement).disabled).toBe(true)   // instead of toBeDisabled
+ *
+ *  WHY IT IS NOT SIMPLY ADDED. `@testing-library/jest-dom` resolves from the ROOT node_modules
+ *  today as a transitive dep, so a bare import would appear to work while no package.json declares
+ *  it — a phantom dependency that breaks on any hoisting change. Registering it properly means an
+ *  explicit devDependency plus a lockfile change, and it alters matcher resolution across ~380
+ *  component suites at once. That is a single-purpose PR with a full-suite run behind it, not a
+ *  passenger on an unrelated branch. Until someone does that, the idioms above are the contract.
+ */
 import { afterEach, beforeEach } from "vitest";
 import { cleanup } from "@testing-library/react";
 import { argsCarryTauriUnavailableSignature } from "./services/tauriUnavailableSignature";
