@@ -88,6 +88,65 @@ describe("parseResetInstant — real messages Claude Code emits", () => {
   });
 });
 
+describe("parseResetInstant — DATED weekly forms bench to the true weekly reset, not 5h", () => {
+  // A weekly cap whose reset is more than a day out is emitted WITH a calendar date
+  // ("resets Aug 4 at 11pm") — the exact string used verbatim across the pusherRunner/pusherSnapshots
+  // suites. The bare-time RE captures no date, so before this fix these forms returned the 5h
+  // SESSION_WINDOW_MS fallback: limitSync benched the weekly-walled account for only 5h, and once that
+  // observed wall expired — while the weekly window still had days to run — the fleet routed straight
+  // back onto it. These assert the reset lands on the NAMED future date (days out), which is exactly
+  // what a 5h-only or 24h-horizon parser cannot produce, so removing the dated branches reds them.
+
+  it("parses a MONTH+DAY weekly reset ('resets Aug 4 at 11pm') days out — not the 5h fallback", () => {
+    const at = Date.parse("2026-08-01T15:00:00.000Z"); // ~3.5 days before the reset
+    const got = parseResetInstant(
+      "You've hit your weekly limit · resets Aug 4 at 11pm (America/Bogota)",
+      at,
+    );
+    expect(got).toBe(instantAt("America/Bogota", 2026, 8, 4, 23, 0));
+    // The load-bearing property: NOT the 5h session fallback, and BEYOND the 24h bare-time horizon —
+    // a weekly wall must bench for days, not hours.
+    expect(got).not.toBe(at + SESSION_WINDOW_MS);
+    expect(got - at).toBeGreaterThan(24 * 60 * 60 * 1000);
+    expect(got - at).toBeLessThan(8 * 24 * 60 * 60 * 1000);
+  });
+
+  it("parses a WEEKDAY weekly reset ('resets Wednesday 8pm') to the next matching day", () => {
+    const at = Date.parse("2026-08-03T18:00:00.000Z"); // Mon 11am LA → next Wed is Aug 5
+    const got = parseResetInstant(
+      "You've hit your weekly limit · resets Wednesday 8pm (America/Los_Angeles)",
+      at,
+    );
+    expect(got).toBe(instantAt("America/Los_Angeles", 2026, 8, 5, 20, 0));
+    expect(got).not.toBe(at + SESSION_WINDOW_MS);
+    expect(got - at).toBeGreaterThan(24 * 60 * 60 * 1000);
+  });
+
+  it("resetInstantFor benches a dated weekly LimitEvent for days, the value limitSync uses", () => {
+    const at = Date.parse("2026-08-01T15:00:00.000Z");
+    const ev: LimitEvent = {
+      accountId: "acct-weekly",
+      at,
+      text: "You've hit your weekly limit · resets Aug 4 at 11pm (America/Bogota)",
+    };
+    expect(resetInstantFor(ev)).toBe(instantAt("America/Bogota", 2026, 8, 4, 23, 0));
+    expect(resetInstantFor(ev)).not.toBe(at + SESSION_WINDOW_MS);
+  });
+
+  it("a dated form with NO zone still falls back — a date without a zone can't be placed", () => {
+    const at = Date.parse("2026-08-01T15:00:00.000Z");
+    expect(parseResetInstant("resets Aug 4 at 11pm", at)).toBe(at + SESSION_WINDOW_MS);
+    expect(parseResetInstant("resets Wednesday 8pm", at)).toBe(at + SESSION_WINDOW_MS);
+  });
+
+  it("a dated form with an ambiguous bare hour falls back rather than guessing AM", () => {
+    const at = Date.parse("2026-08-01T15:00:00.000Z");
+    expect(parseResetInstant("resets Aug 4 at 3 (America/Bogota)", at)).toBe(
+      at + SESSION_WINDOW_MS,
+    );
+  });
+});
+
 describe("parseResetInstant — falls back rather than guessing wrong", () => {
   const at = Date.parse("2026-07-26T15:55:24.145Z");
   const FALLBACK = at + SESSION_WINDOW_MS;

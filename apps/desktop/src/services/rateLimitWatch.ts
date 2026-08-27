@@ -46,10 +46,30 @@ export interface LimitEvent {
  *  better-founded than Phase 1's blind 4h guess, which was neither. */
 export const SESSION_WINDOW_MS = 5 * 60 * 60 * 1000;
 
-/** Upper bound on any parsed reset. A weekly-cap message can legitimately name a time up to a day
- *  out; anything beyond that means we misparsed, and benching an account for longer than this on a
- *  bad parse is worse than re-hitting the limit once. */
+/** Upper bound on a BARE-TIME parsed reset (a clock time with no calendar date). Such a message can
+ *  only legitimately name a time up to a day out; anything beyond that means we misparsed, and
+ *  benching an account for longer than this on a bad parse is worse than re-hitting the limit once. */
 const MAX_RESET_HORIZON_MS = 24 * 60 * 60 * 1000;
+
+/** Upper bound on a DATED reset — a message that carries an explicit calendar date or weekday
+ *  ("resets Aug 4 at 11pm", "resets Wednesday 8pm"), which is the form Claude Code emits for a WEEKLY
+ *  cap whose reset is more than a day out. The 7-day window plus one day of slack: a weekly reset can
+ *  legitimately sit almost a full week ahead, so the 24h bare-time horizon would wrongly reject it and
+ *  collapse the bench back to the {@link SESSION_WINDOW_MS} fallback (5h). Only reached when an
+ *  explicit date/weekday was actually parsed — a bare time with no date still uses the tighter 24h
+ *  bound, so an ambiguous misparse is still benched no longer than a day. */
+const WEEKLY_RESET_HORIZON_MS = 8 * 24 * 60 * 60 * 1000;
+
+/** 3-letter month prefix → 1-based month number, for the dated weekly form. */
+const MONTHS: Readonly<Record<string, number>> = {
+  jan: 1, feb: 2, mar: 3, apr: 4, may: 5, jun: 6,
+  jul: 7, aug: 8, sep: 9, oct: 10, nov: 11, dec: 12,
+};
+
+/** 3-letter weekday prefix → JS `getUTCDay()` index (Sun=0), for the weekday weekly form. */
+const WEEKDAYS: Readonly<Record<string, number>> = {
+  sun: 0, mon: 1, tue: 2, wed: 3, thu: 4, fri: 5, sat: 6,
+};
 
 /** Milliseconds to ADD to a UTC instant to get wall-clock time in `tz`. Returns null for a zone
  *  `Intl` doesn't recognize (invalid name, or a runtime without full ICU data). */
@@ -123,19 +143,117 @@ function zonedDate(ms: number, tz: string): { y: number; mo: number; d: number }
 const RESET_RE =
   /\breset(?:s|ting)?\b(?:\s+at)?\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s*(?:\(\s*([A-Za-z][A-Za-z0-9_+-]*(?:\/[A-Za-z0-9_+-]+)+)\s*\))?/i;
 
+// A WEEKLY cap whose reset is more than a day out is emitted WITH a calendar date — the bare-time
+// `RESET_RE` above captures no date at all, so on those forms it returns no match and the whole parse
+// collapses to the 5h `SESSION_WINDOW_MS` fallback: the account is un-benched hours before its weekly
+// window actually resets, and the fleet routes straight back onto a still-walled account. These two
+// forms recover the date. Group order deliberately mirrors `RESET_RE`'s tail (hour, min, am/pm, tz) so
+// the shared `resolveClock` helper reads them the same way.
+//
+//   "You've hit your weekly limit · resets Aug 4 at 11pm (America/Bogota)"     → month + day
+const RESET_MONTHDAY_RE =
+  /\breset(?:s|ting)?\b\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+(\d{1,2})(?:\s+at)?\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s*(?:\(\s*([A-Za-z][A-Za-z0-9_+-]*(?:\/[A-Za-z0-9_+-]+)+)\s*\))?/i;
+//   "You've hit your weekly limit · resets Wednesday 8pm (America/Los_Angeles)" → weekday
+const RESET_WEEKDAY_RE =
+  /\breset(?:s|ting)?\b\s+(sun|mon|tue|wed|thu|fri|sat)[a-z]*\.?\s+(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s*(?:\(\s*([A-Za-z][A-Za-z0-9_+-]*(?:\/[A-Za-z0-9_+-]+)+)\s*\))?/i;
+
+/** Validate a `(hour, minute, am/pm, tz)` quartet into a placeable wall time, or null when it is
+ *  ambiguous or unplaceable — the SAME rules the bare-time path applies, lifted out so all three
+ *  forms agree: a bare hour with no meridiem is ambiguous below 13, and a wall time needs an IANA zone
+ *  to sit on the timeline. */
+function resolveClock(
+  hourStr: string | undefined,
+  minStr: string | undefined,
+  ap: string | undefined,
+  tz: string | undefined,
+): { hour: number; min: number; tz: string } | null {
+  if (!hourStr) return null;
+  let hour = Number(hourStr);
+  const min = minStr ? Number(minStr) : 0;
+  const a = ap?.toLowerCase();
+  if (!Number.isFinite(hour) || !Number.isFinite(min) || min > 59) return null;
+  if (a === "pm" && hour < 12) hour += 12;
+  if (a === "am" && hour === 12) hour = 0;
+  // No meridiem: only an unambiguous 24h hour (13–23) is usable; 0–12 could be either half.
+  if (!a && hour <= 12) return null;
+  if (hour > 23) return null;
+  if (!tz) return null; // a wall time with no zone can't be placed on the timeline
+  return { hour, min, tz };
+}
+
+/** The reset instant for an explicit MONTH + DAY, or null. The message carries no year, so try the
+ *  current zoned year first and roll to the next only for a December→January wrap; a result must sit
+ *  strictly after `at` and within the weekly horizon or it is a misparse. DST-correct via
+ *  {@link zonedWallTimeToUtc}. */
+function monthDayReset(mo: number, day: number, c: { hour: number; min: number; tz: string }, at: number): number | null {
+  const nowZ = zonedDate(at, c.tz);
+  if (!nowZ) return null;
+  for (const y of [nowZ.y, nowZ.y + 1]) {
+    const reset = zonedWallTimeToUtc(y, mo, day, c.hour, c.min, c.tz);
+    if (reset != null && reset > at && reset - at <= WEEKLY_RESET_HORIZON_MS) return reset;
+  }
+  return null;
+}
+
+/** The reset instant for a WEEKDAY name, or null. Walks forward from today (in the zone) to the first
+ *  calendar day whose weekday matches, at the given wall time, strictly after `at` and within the
+ *  weekly horizon. Iterating calendar dates rather than adding 7×24h keeps the wall time exact across
+ *  a DST transition, the same discipline the bare-time next-day recompute uses. */
+function weekdayReset(dow: number, c: { hour: number; min: number; tz: string }, at: number): number | null {
+  const DAY_MS = 24 * 60 * 60 * 1000;
+  for (let off = 0; off <= 7; off++) {
+    const cand = zonedDate(at + off * DAY_MS, c.tz);
+    if (!cand) continue;
+    if (new Date(Date.UTC(cand.y, cand.mo - 1, cand.d)).getUTCDay() !== dow) continue;
+    const reset = zonedWallTimeToUtc(cand.y, cand.mo, cand.d, c.hour, c.min, c.tz);
+    if (reset != null && reset > at && reset - at <= WEEKLY_RESET_HORIZON_MS) return reset;
+  }
+  return null;
+}
+
 /** Compute the epoch-MS instant a limit is expected to reset, given the message `text` and the
  *  instant `at` the event occurred. PURE.
  *
  *  Resolution order:
- *    1. A parseable clock time WITH an IANA zone → the next occurrence of that wall time in that
- *       zone strictly after `at`. Exact, DST-correct.
- *    2. Anything unparseable (no time, unknown zone, ambiguous bare hour, absurd result) →
+ *    1. An explicit calendar DATE (month+day or weekday) with a clock time and IANA zone → that
+ *       future wall time, up to a WEEK out. This is the WEEKLY-cap form; without it a weekly reset
+ *       named by date fell through to the 5h fallback and un-benched the account far too early.
+ *    2. A parseable clock time WITH an IANA zone but no date → the next occurrence of that wall time
+ *       in that zone strictly after `at`, up to a day out. Exact, DST-correct.
+ *    3. Anything unparseable (no time, unknown zone, ambiguous bare hour, absurd result) →
  *       `at + SESSION_WINDOW_MS`.
  *
  *  A bare hour with NO meridiem and NO zone stays ambiguous and falls back — guessing AM for
  *  "resets at 3" can bench an account ~15h instead of a few. */
 export function parseResetInstant(text: string, at: number): number {
   const fallback = at + SESSION_WINDOW_MS;
+
+  // 1a. Month + day ("resets Aug 4 at 11pm (America/Bogota)").
+  const md = RESET_MONTHDAY_RE.exec(text);
+  if (md?.[1]) {
+    const mo = MONTHS[md[1].toLowerCase()];
+    const day = Number(md[2]);
+    const c = resolveClock(md[3], md[4], md[5], md[6]);
+    if (mo && day >= 1 && day <= 31 && c) {
+      const reset = monthDayReset(mo, day, c, at);
+      if (reset != null) return reset;
+    }
+    return fallback;
+  }
+
+  // 1b. Weekday ("resets Wednesday 8pm (America/Los_Angeles)").
+  const wd = RESET_WEEKDAY_RE.exec(text);
+  if (wd?.[1]) {
+    const dow = WEEKDAYS[wd[1].toLowerCase()];
+    const c = resolveClock(wd[2], wd[3], wd[4], wd[5]);
+    if (dow != null && c) {
+      const reset = weekdayReset(dow, c, at);
+      if (reset != null) return reset;
+    }
+    return fallback;
+  }
+
+  // 2. Bare clock time, no date.
   const m = RESET_RE.exec(text);
   if (!m?.[1]) return fallback;
 
