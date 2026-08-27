@@ -1,9 +1,23 @@
 import { afterEach, beforeEach, describe, it, expect } from "vitest";
-import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync, realpathSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync, realpathSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
+import { fileURLToPath } from "node:url";
+import { execFileSync, spawnSync } from "node:child_process";
 // Import the pure predicate straight from the shipped guard script.
-import { isInside, blocksKeychainCommand, isAllowlistedNoteDir, isAllowlistedScratchpad, callerWorktreeRoot, outsideWorktreeMessage } from "../../src-tauri/resources/worktree-guard.mjs";
+import {
+  isInside,
+  blocksKeychainCommand,
+  isAllowlistedNoteDir,
+  isAllowlistedScratchpad,
+  callerWorktreeRoot,
+  outsideWorktreeMessage,
+  isSessionOwnedWorktree,
+  sessionIdForLedger,
+  sessionPlanFile,
+  isUnderPlansRoot,
+  otherSessionPlanMessage,
+} from "../../src-tauri/resources/worktree-guard.mjs";
 
 describe("isInside (lexical, no filesystem)", () => {
   const root = "/wt/proj/agent";
@@ -447,5 +461,379 @@ describe("outsideWorktreeMessage (the refusal names a sanctioned hand-off)", () 
     expect(msg()).toContain(recommended);
     // The same shape with the placeholders filled in is allow-listed.
     expect(isAllowlistedScratchpad("/tmp/claude-501/some-session/some-uuid/scratchpad/deliverable.md")).toBe(true);
+  });
+});
+
+// ── Worktree ownership: the worktree THIS SESSION created (sparkle-q39ja0, sparkle-6mpx2a) ──────
+//
+// `scripts/new-feature.sh <name>` — the repo's documented way to start from fresh origin/main — puts
+// the new worktree BESIDE the repo root, so `isInside(callerRoot, …)` refused every edit inside the
+// worktree the agent had just been told to make. These cases run against REAL git worktrees rather
+// than an injected resolver on purpose: the whole judgement is "what does git say about this path",
+// and a defaulted seam every test stubs out would leave that judgement covered by nothing.
+//
+// The allowance and its PAIRED NEGATIVES are asserted together. An allowance test alone passes for a
+// guard that allows everything, and the negatives are the guard's actual job: a rival agent's
+// worktree — same repo, registered with git, same name shape — must still be refused.
+describe("isSessionOwnedWorktree (real git worktrees on disk)", () => {
+  const SESSION = "fa25cafd-4561-44b2-9748-d934ae26d235";
+  let tmp: string;
+  let repo: string;
+  let owned: string; // a worktree this session created and recorded
+  let rival: string; // a worktree of the SAME repo that this session did NOT create
+  let ledgerDir: string;
+
+  const git = (cwd: string, ...args: string[]) =>
+    execFileSync("git", ["-C", cwd, ...args], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+      env: {
+        ...process.env,
+        GIT_AUTHOR_NAME: "t",
+        GIT_AUTHOR_EMAIL: "t@example.invalid",
+        GIT_COMMITTER_NAME: "t",
+        GIT_COMMITTER_EMAIL: "t@example.invalid",
+      },
+    });
+
+  const initRepo = (dir: string) => {
+    mkdirSync(dir, { recursive: true });
+    git(dir, "init");
+    git(dir, "commit", "--allow-empty", "-m", "init");
+    return dir;
+  };
+
+  beforeEach(() => {
+    tmp = realpathSync(mkdtempSync(join(tmpdir(), "wtguard-own-")));
+    repo = initRepo(join(tmp, "repo"));
+    owned = join(tmp, "sparkle-feature");
+    rival = join(tmp, "sparkle-rival");
+    git(repo, "worktree", "add", owned, "-b", "feature/mine");
+    git(repo, "worktree", "add", rival, "-b", "feature/theirs");
+    const common = git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir").trim();
+    ledgerDir = join(common, "sparkle-session-worktrees");
+    mkdirSync(ledgerDir, { recursive: true });
+    writeFileSync(join(ledgerDir, SESSION), `${owned}\n`);
+  });
+  afterEach(() => rmSync(tmp, { recursive: true, force: true }));
+
+  it("allows a write into the worktree this session created and recorded", () => {
+    expect(isSessionOwnedWorktree(repo, SESSION, join(owned, "apps", "desktop", "src", "App.tsx"))).toBe(true);
+    // A file that does not exist yet (the Write that creates it) is the normal case.
+    expect(isSessionOwnedWorktree(repo, SESSION, join(owned, "brand", "new", "file.ts"))).toBe(true);
+    // …and the caller may itself be standing in a worktree, not the main checkout.
+    expect(isSessionOwnedWorktree(rival, SESSION, join(owned, "apps", "x.ts"))).toBe(true);
+  });
+
+  // THE paired negative, and the reason a path allow-list would have been the wrong fix: `rival` is a
+  // real registered worktree of the SAME repository carrying the SAME `sparkle-*` name shape. Only the
+  // ledger separates it from `owned`. If ownership were inferred from the path, this flips to true.
+  it("still refuses a write into ANOTHER agent's worktree of the same repository", () => {
+    expect(isSessionOwnedWorktree(repo, SESSION, join(rival, "apps", "x.ts"))).toBe(false);
+  });
+
+  it("still refuses paths outside the repository entirely", () => {
+    expect(isSessionOwnedWorktree(repo, SESSION, join(tmp, "not-a-worktree", "x.ts"))).toBe(false);
+    expect(isSessionOwnedWorktree(repo, SESSION, "/Users/dev/Projects/elsewhere/apps/x.ts")).toBe(false);
+    expect(isSessionOwnedWorktree(repo, SESSION, join(tmp, "..", "escape.ts"))).toBe(false);
+  });
+
+  // ── THE ENV VAR IS NOT A PER-SESSION KEY, so it must never open this door ────────────────────
+  // (bead sparkle-q39ja0) The ledger's writer, scripts/new-feature.sh, keys on
+  // `$CLAUDE_CODE_SESSION_ID`; this reader keys on the hook payload's `session_id`. They are not
+  // reliably equal, so the ledger is filed under a key never looked up and the feature admits
+  // nothing. The tempting repair — try the env id too — is UNSOUND: an environment variable is
+  // INHERITED, so every sibling agent dispatched from one parent carries the same value. Agent A
+  // records its worktree under the shared id and agent B is then admitted into A's worktree.
+  //
+  // These assert the SELECTION step, which is the only place a fallback can live. Asserting
+  // `isSessionOwnedWorktree` with hand-chosen ids cannot catch it: that function does exactly what
+  // it is told, and it is WHICH id it is told that is the security property.
+  it("keys the ledger on the payload id alone, never on the inherited env id", () => {
+    expect(sessionIdForLedger({ session_id: "payload-id" }, { CLAUDE_CODE_SESSION_ID: "env-id" })).toBe("payload-id");
+    // No payload id: null, so the caller admits NOTHING. Returning the env id here is the hole.
+    expect(sessionIdForLedger({}, { CLAUDE_CODE_SESSION_ID: "env-id" })).toBeNull();
+    expect(sessionIdForLedger({ session_id: "" }, { CLAUDE_CODE_SESSION_ID: "env-id" })).toBeNull();
+    expect(sessionIdForLedger(undefined, { CLAUDE_CODE_SESSION_ID: "env-id" })).toBeNull();
+    expect(sessionIdForLedger({ session_id: 42 }, { CLAUDE_CODE_SESSION_ID: "env-id" })).toBeNull();
+  });
+
+  // The same fact, composed the way the call site composes it, on real worktrees. `rival` is
+  // recorded ONLY under the inherited id — the shape a sibling agent produces — and this session's
+  // payload id names a different ledger. Any fallback that consults the env id turns this true.
+  it("refuses a worktree a SIBLING recorded under the shared inherited id", () => {
+    const inherited = "inherited-parent-session-id";
+    writeFileSync(join(ledgerDir, inherited), `${rival}\n`);
+    const env = { CLAUDE_CODE_SESSION_ID: inherited };
+    const key = sessionIdForLedger({ session_id: SESSION }, env);
+    expect(isSessionOwnedWorktree(repo, key, join(rival, "x.ts"))).toBe(false);
+    // PAIRED POSITIVE: the same composition still admits what this session really did record, so
+    // the refusal above is the env id being ignored, not the whole path being broken.
+    expect(isSessionOwnedWorktree(repo, key, join(owned, "x.ts"))).toBe(true);
+    // …and the ledger under the inherited id is genuinely populated — otherwise the refusal above
+    // would pass for a ledger that was never written and this test would prove nothing.
+    expect(isSessionOwnedWorktree(repo, inherited, join(rival, "x.ts"))).toBe(true);
+  });
+
+  // Cheap secondary net only — the behavioural tests above are the real guard. This catches the
+  // sloppiest reintroduction (a bare env read) but not a renamed or destructured one.
+  it("performs no executable read of CLAUDE_CODE_SESSION_ID", () => {
+    const src = readFileSync(
+      fileURLToPath(new URL("../../src-tauri/resources/worktree-guard.mjs", import.meta.url)),
+      "utf8",
+    );
+    const executableReads = src
+      .split("\n")
+      .filter((l) => !l.trimStart().startsWith("//") && !l.trimStart().startsWith("*"))
+      .filter((l) => /CLAUDE_CODE_SESSION_ID/.test(l));
+    expect(executableReads).toEqual([]);
+  });
+
+  it("refuses when a DIFFERENT session recorded the worktree", () => {
+    // The ledger is per session, so another session's recording grants this one nothing.
+    expect(isSessionOwnedWorktree(repo, "11111111-2222-3333-4444-555555555555", join(owned, "x.ts"))).toBe(false);
+  });
+
+  it("refuses an absent, empty, or traversal-shaped session id rather than sanitizing it", () => {
+    expect(isSessionOwnedWorktree(repo, undefined, join(owned, "x.ts"))).toBe(false);
+    expect(isSessionOwnedWorktree(repo, "", join(owned, "x.ts"))).toBe(false);
+    expect(isSessionOwnedWorktree(repo, `../${SESSION}`, join(owned, "x.ts"))).toBe(false);
+    expect(isSessionOwnedWorktree(repo, `sub/${SESSION}`, join(owned, "x.ts"))).toBe(false);
+  });
+
+  // The ledger is a CLAIM, not a capability: git is re-consulted at write time, so a line naming a
+  // worktree of a DIFFERENT repository grants nothing even though this session wrote the line itself.
+  it("refuses a recorded path that belongs to a different repository", () => {
+    const other = initRepo(join(tmp, "otherrepo"));
+    const otherWt = join(tmp, "sparkle-other-repo-wt");
+    git(other, "worktree", "add", otherWt, "-b", "feature/other");
+    writeFileSync(join(ledgerDir, SESSION), `${owned}\n${otherWt}\n`);
+    expect(isSessionOwnedWorktree(repo, SESSION, join(otherWt, "x.ts"))).toBe(false);
+    // The genuinely-owned entry on the line above still works — the reject was targeted, not blanket.
+    expect(isSessionOwnedWorktree(repo, SESSION, join(owned, "x.ts"))).toBe(true);
+  });
+
+  // …and a line naming a path that is no longer a worktree at all (removed, then the name reused by
+  // an ordinary directory) resolves to no toplevel, so it grants nothing either.
+  it("refuses a stale recorded path whose name is now an ordinary directory", () => {
+    const stale = join(tmp, "sparkle-removed");
+    mkdirSync(join(stale, "src"), { recursive: true });
+    writeFileSync(join(ledgerDir, SESSION), `${stale}\n`);
+    expect(isSessionOwnedWorktree(repo, SESSION, join(stale, "src", "x.ts"))).toBe(false);
+  });
+
+  it("refuses when this session recorded nothing at all", () => {
+    rmSync(join(ledgerDir, SESSION));
+    expect(isSessionOwnedWorktree(repo, SESSION, join(owned, "x.ts"))).toBe(false);
+  });
+});
+
+// ── Plan mode: exactly THIS session's plan file (sparkle-hshjw, seen 3x) ─────────────────────────
+//
+// One `plans/` dir is shared by every concurrent agent, so the directory-level allowance that
+// unblocked plan mode also admitted writes into a rival's plan — the file it is about to present.
+// `sessionPlanFile` reads the harness's own record of which file is ours out of the session
+// transcript, so the allowance can be narrowed to exactly that path.
+describe("sessionPlanFile (reads the assigned plan path out of the session transcript)", () => {
+  let tmp: string;
+  const line = (planFilePath: string) =>
+    JSON.stringify({ type: "attachment", attachment: { type: "plan_mode", reminderType: "full", planFilePath, planExists: false } });
+
+  beforeEach(() => {
+    tmp = realpathSync(mkdtempSync(join(tmpdir(), "wtguard-plan-")));
+  });
+  afterEach(() => rmSync(tmp, { recursive: true, force: true }));
+
+  it("returns the planFilePath a plan_mode attachment names", () => {
+    const t = join(tmp, "session.jsonl");
+    writeFileSync(t, `${JSON.stringify({ type: "user", message: "hi" })}\n${line("/cfg/plans/mine.md")}\n`);
+    expect(sessionPlanFile(t)).toBe("/cfg/plans/mine.md");
+  });
+
+  it("takes the LAST assignment — re-entering plan mode reassigns the file", () => {
+    const t = join(tmp, "session.jsonl");
+    writeFileSync(t, `${line("/cfg/plans/first.md")}\n${line("/cfg/plans/second.md")}\n`);
+    expect(sessionPlanFile(t)).toBe("/cfg/plans/second.md");
+  });
+
+  it("returns null when the transcript names no plan, is absent, or is unparseable", () => {
+    const empty = join(tmp, "empty.jsonl");
+    writeFileSync(empty, `${JSON.stringify({ type: "user", message: "hi" })}\n`);
+    expect(sessionPlanFile(empty)).toBe(null);
+    expect(sessionPlanFile(join(tmp, "does-not-exist.jsonl"))).toBe(null);
+    const broken = join(tmp, "broken.jsonl");
+    writeFileSync(broken, '{"planFilePath": "/cfg/plans/x.md"\n'); // truncated JSON
+    expect(sessionPlanFile(broken)).toBe(null);
+    expect(sessionPlanFile(undefined)).toBe(null);
+    expect(sessionPlanFile("")).toBe(null);
+    // A relative planFilePath is not a path the guard can compare, so it is ignored.
+    const rel = join(tmp, "rel.jsonl");
+    writeFileSync(rel, `${line("plans/mine.md")}\n`);
+    expect(sessionPlanFile(rel)).toBe(null);
+  });
+});
+
+describe("isUnderPlansRoot (which config roots' plans/ dir a target sits in)", () => {
+  it("matches plans/ under $HOME/.claude and under the account config dir", () => {
+    expect(isUnderPlansRoot("/home/dev", "/home/dev/.claude/plans/a.md", undefined)).toBe(true);
+    expect(isUnderPlansRoot("/home/dev", "/accounts/abc/plans/a.md", "/accounts/abc")).toBe(true);
+  });
+  it("does not match the memory dir, the config root itself, or a relative configDir", () => {
+    expect(isUnderPlansRoot("/home/dev", "/home/dev/.claude/projects/p/memory/m.md", undefined)).toBe(false);
+    expect(isUnderPlansRoot("/home/dev", "/home/dev/.claude/settings.json", undefined)).toBe(false);
+    expect(isUnderPlansRoot("/home/dev", "/accounts/abc/plans/a.md", "accounts/abc")).toBe(false);
+    expect(isUnderPlansRoot("/home/dev", "", "/accounts/abc")).toBe(false);
+  });
+});
+
+// The refusal for a rival's plan file. A refusal message is an instruction the reader will follow, so
+// it has to name a path that is SAFE under the conditions that triggered it — here, the session's own
+// plan file, which the same guard admits and which ExitPlanMode actually reads.
+describe("otherSessionPlanMessage (the refusal names the caller's OWN plan file)", () => {
+  const msg = () => otherSessionPlanMessage("/cfg/plans/theirs.md", "/cfg/plans/mine.md");
+  it("says what was blocked and names the caller's own plan file as the destination", () => {
+    expect(msg().startsWith("Blocked:")).toBe(true);
+    expect(msg()).toContain("/cfg/plans/theirs.md");
+    expect(msg()).toContain("/cfg/plans/mine.md");
+    expect(msg()).toMatch(/ExitPlanMode/);
+  });
+  it("names the improvisation it exists to prevent — leaving the owner a note in their plan", () => {
+    expect(msg()).toMatch(/do NOT edit the file above/i);
+  });
+  // Cross-check: the path the message tells the reader to use must be one this guard admits, or the
+  // refusal accomplishes nothing. The plan file it names is by construction the session's own.
+  it("recommends a path the plans allow-list accepts", () => {
+    expect(isUnderPlansRoot("/home/dev", "/cfg/plans/mine.md", "/cfg")).toBe(true);
+  });
+});
+
+// ── The guard's ACTUAL decision, end to end ─────────────────────────────────────────────────────
+//
+// The predicates above are pure; these run the shipped hook the way Claude Code runs it — a JSON
+// payload on stdin, argv[2] the install root — and assert the only thing the harness reads: the exit
+// code (2 blocks the tool call, 0 lets it through). This is what keeps the wiring covered: a correct
+// predicate that main() never calls still fails these.
+describe("worktree-guard process decisions (exit codes, real git)", () => {
+  const GUARD = fileURLToPath(new URL("../../src-tauri/resources/worktree-guard.mjs", import.meta.url));
+  const SESSION = "fa25cafd-4561-44b2-9748-d934ae26d235";
+  let tmp: string;
+  let repo: string;
+  let owned: string;
+  let rival: string;
+  let config: string;
+  let transcript: string;
+
+  const git = (cwd: string, ...args: string[]) =>
+    execFileSync("git", ["-C", cwd, ...args], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+      env: {
+        ...process.env,
+        GIT_AUTHOR_NAME: "t",
+        GIT_AUTHOR_EMAIL: "t@example.invalid",
+        GIT_COMMITTER_NAME: "t",
+        GIT_COMMITTER_EMAIL: "t@example.invalid",
+      },
+    });
+
+  /** Run the hook exactly as the harness does. Returns the exit code and stderr. */
+  const runGuard = (payload: Record<string, unknown>, env: Record<string, string> = {}) => {
+    const r = spawnSync(process.execPath, [GUARD, repo], {
+      input: JSON.stringify(payload),
+      encoding: "utf8",
+      env: { ...process.env, CLAUDE_CONFIG_DIR: config, ...env },
+    });
+    return { code: r.status, stderr: r.stderr ?? "" };
+  };
+
+  beforeEach(() => {
+    tmp = realpathSync(mkdtempSync(join(tmpdir(), "wtguard-e2e-")));
+    repo = join(tmp, "repo");
+    mkdirSync(repo, { recursive: true });
+    git(repo, "init");
+    git(repo, "commit", "--allow-empty", "-m", "init");
+    owned = join(tmp, "sparkle-feature");
+    rival = join(tmp, "sparkle-rival");
+    git(repo, "worktree", "add", owned, "-b", "feature/mine");
+    git(repo, "worktree", "add", rival, "-b", "feature/theirs");
+    const common = git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir").trim();
+    mkdirSync(join(common, "sparkle-session-worktrees"), { recursive: true });
+    writeFileSync(join(common, "sparkle-session-worktrees", SESSION), `${owned}\n`);
+    config = join(tmp, "account");
+    mkdirSync(join(config, "plans"), { recursive: true });
+    transcript = join(tmp, "session.jsonl");
+    writeFileSync(
+      transcript,
+      `${JSON.stringify({
+        type: "attachment",
+        attachment: { type: "plan_mode", planFilePath: join(config, "plans", "mine.md"), planExists: false },
+      })}\n`,
+    );
+  });
+  afterEach(() => rmSync(tmp, { recursive: true, force: true }));
+
+  const edit = (file: string, extra: Record<string, unknown> = {}) => ({
+    session_id: SESSION,
+    transcript_path: transcript,
+    cwd: repo,
+    tool_name: "Write",
+    tool_input: { file_path: file },
+    ...extra,
+  });
+
+  it("allows an edit in the caller's own worktree (unchanged behaviour)", () => {
+    expect(runGuard(edit(join(repo, "apps", "x.ts"))).code).toBe(0);
+  });
+
+  // DEFECT A. Red before the fix: this exits 2 with "outside this agent's worktree", which is what
+  // sent a measured session back to its stale launch worktree.
+  it("allows an edit in the worktree THIS session created via new-feature.sh", () => {
+    expect(runGuard(edit(join(owned, "apps", "desktop", "src", "App.tsx"))).code).toBe(0);
+  });
+
+  it("still blocks an edit in a RIVAL agent's worktree of the same repo", () => {
+    const r = runGuard(edit(join(rival, "apps", "x.ts")));
+    expect(r.code).toBe(2);
+    expect(r.stderr).toMatch(/outside this agent's worktree/);
+  });
+
+  it("still blocks an edit outside the repository entirely", () => {
+    const r = runGuard(edit(join(tmp, "elsewhere", "x.ts")));
+    expect(r.code).toBe(2);
+    expect(r.stderr).toMatch(/outside this agent's worktree/);
+  });
+
+  it("still blocks the owned worktree for a session that did not create it", () => {
+    const r = runGuard(edit(join(owned, "x.ts"), { session_id: "99999999-2222-3333-4444-555555555555" }));
+    expect(r.code).toBe(2);
+  });
+
+  // DEFECT B, the allowance half: plan mode's one editable file. (Already allowed at directory
+  // granularity before this change; asserted so the narrowing cannot break it.)
+  it("allows the plan file THIS session was assigned", () => {
+    expect(runGuard(edit(join(config, "plans", "mine.md"))).code).toBe(0);
+  });
+
+  // DEFECT B, the paired negative. Red before the fix: the directory-level allowance exits 0 here,
+  // letting one agent overwrite the plan another is about to present.
+  it("blocks ANOTHER session's plan file in the same shared plans dir", () => {
+    const r = runGuard(edit(join(config, "plans", "theirs.md")));
+    expect(r.code).toBe(2);
+    expect(r.stderr).toContain(join(config, "plans", "mine.md"));
+  });
+
+  // The fallback, stated as a test because it is the difference between a narrowing and a
+  // regression: with no transcript to name a plan file, the directory-level allowance stands rather
+  // than leaving the human with no plan at all.
+  it("keeps the directory-level plans allowance when the transcript names no plan file", () => {
+    expect(runGuard(edit(join(config, "plans", "anything.md"), { transcript_path: undefined })).code).toBe(0);
+    expect(runGuard(edit(join(config, "plans", "anything.md"), { transcript_path: join(tmp, "gone.jsonl") })).code).toBe(0);
+  });
+
+  // The memory half of the note-dir allow-list is untouched by the plans narrowing.
+  it("still allows the per-agent memory dir", () => {
+    const mem = join(config, "projects", "some-project", "memory", "note.md");
+    mkdirSync(join(config, "projects", "some-project", "memory"), { recursive: true });
+    expect(runGuard(edit(mem)).code).toBe(0);
   });
 });

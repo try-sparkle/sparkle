@@ -2708,7 +2708,10 @@ export function outsideWorktreeMessage(target, callerRoot, sameRepo = null) {
       "through your own branch and PR like any other change.\n" +
       "Do NOT reach across into the sibling checkout even though the file is 'the same file': that\n" +
       "worktree belongs to another agent, your write would land outside your branch, and nothing in\n" +
-      "your PR would carry it.\n"
+      "your PR would carry it.\n" +
+      "If what you actually need is a FRESH branch off origin/main, run `scripts/new-feature.sh <name>`\n" +
+      "from your own worktree and work in the worktree it creates: it records that worktree as owned by\n" +
+      "this session, and this guard admits writes into a worktree this session itself made.\n"
     );
   }
   return (
@@ -2921,6 +2924,212 @@ export function callerWorktreeRoot(installRoot, cwd, resolveToplevel = gitToplev
     if (typeof top === "string" && top.length > 0) return top;
   }
   return installRoot;
+}
+
+// ── Worktree ownership: a worktree THIS SESSION created is not another agent's ──────────────────
+//
+// WHY (beads sparkle-q39ja0, sparkle-6mpx2a). `scripts/new-feature.sh <name>` is this repo's own
+// documented way to start from fresh `origin/main`, and it creates the worktree as a SIBLING of the
+// repo root (`<parent>/sparkle-<slug>`) — outside `callerWorktreeRoot` by construction. So every Edit
+// into the worktree the agent had just been told to make was refused as "outside this agent's
+// worktree", pushing the agent back onto the stale launch worktree that new-feature.sh exists to get
+// it off. One measured session abandoned the fresh worktree, re-cut the branch in the old one, and
+// paid for a cold `pnpm install`.
+//
+// A PATH ALLOW-LIST WOULD BE THE WRONG FIX, and is deliberately not what this is: `sparkle-*` and
+// `.wt-*` are the shapes EVERY agent's worktree carries, so admitting them by name admits a RIVAL's
+// worktree too — the one thing this guard exists to stop. Ownership is established from two facts
+// instead, and BOTH are required:
+//
+//   (a) THE CREATING SESSION RECORDED IT. `new-feature.sh` appends the path it just created to
+//       `<git-common-dir>/sparkle-session-worktrees/<session-id>`. Creation is the only moment that
+//       fact exists — a PreToolUse hook is stateless and sees only the write, long afterwards — so
+//       the record has to be written there and read here. The ledger lives under the git COMMON dir,
+//       never inside a working tree, because an untracked file in a working tree wedges the hourly
+//       worktree park (AGENTS.md, shared state).
+//   (b) IT IS STILL A WORKTREE OF THIS REPOSITORY, re-checked at write time against git itself: the
+//       recorded path must be a worktree ROOT (`rev-parse --show-toplevel` resolves back to it) and
+//       its `--git-common-dir` must equal the caller's.
+//
+// The ledger is a CLAIM, not a capability, and (b) is what keeps a stale or hand-forged line from
+// admitting an arbitrary directory: a recorded path that was removed and its name reused by an
+// ordinary directory resolves to no toplevel, and one pointing into a different repository resolves
+// to a different common dir. Neither half alone is sufficient, which is why neither is checked alone.
+
+/** Directory under the git COMMON dir in which a session records the worktrees it created. */
+const SESSION_WORKTREE_LEDGER_DIR = "sparkle-session-worktrees";
+
+/** Ledger lines are read at write time on a hot-ish path; cap the file so a corrupt or runaway
+ *  ledger cannot turn one Edit into an unbounded scan. Far above any real session's worktree count. */
+const SESSION_WORKTREE_LEDGER_MAX_LINES = 256;
+
+/** True iff `id` is safe to use as a ledger FILENAME. Anything else — empty, absent, or carrying a
+ *  path separator or a `..` — is rejected outright rather than sanitized: a sanitized id could
+ *  collide with a DIFFERENT session's ledger, which would hand one session another's worktrees. */
+function isLedgerSessionId(id) {
+  return typeof id === "string" && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(id) && !id.includes("..");
+}
+
+/** True iff `target` sits inside a worktree that THIS session created from THIS repository — see the
+ *  block comment above for why ownership is two facts rather than a path shape. Fails closed (false)
+ *  on every unknown: no session id, no ledger, no git, an unresolvable path. `sessionId` comes from
+ *  the hook payload's `session_id`; `callerRoot` is the worktree the caller is operating in. */
+export function isSessionOwnedWorktree(callerRoot, sessionId, target) {
+  if (typeof callerRoot !== "string" || callerRoot.length === 0) return false;
+  if (typeof target !== "string" || target.length === 0) return false;
+  if (!isLedgerSessionId(sessionId)) return false;
+  const commonRaw = gitCommonDir(callerRoot);
+  if (!commonRaw) return false; // no git / not a repo → cannot establish ownership → block
+  const mine = realResolve(commonRaw);
+  if (mine === null) return false;
+  let ledger;
+  try {
+    ledger = readFileSync(`${mine}${sep}${SESSION_WORKTREE_LEDGER_DIR}${sep}${sessionId}`, "utf8");
+  } catch {
+    return false; // this session recorded no worktrees
+  }
+  const lines = ledger.split("\n").slice(0, SESSION_WORKTREE_LEDGER_MAX_LINES);
+  for (const line of lines) {
+    const wt = line.trim();
+    if (wt.length === 0 || !isAbsolute(wt)) continue;
+    // Containment first: it is the cheap check, and it is symlink-safe (a symlink inside the recorded
+    // worktree that points out of it resolves OUT and is rejected here, exactly as elsewhere).
+    if (!isInside(wt, target)) continue;
+    // (b) The recorded path must still BE a worktree root of the caller's own repository. Both halves
+    // matter: `--show-toplevel` from inside a subdirectory answers with the enclosing worktree, so
+    // without the root comparison a ledger line naming any subdirectory of any worktree would pass.
+    const top = gitToplevel(wt);
+    if (!top) continue;
+    const rTop = realResolve(top);
+    const rWt = realResolve(wt);
+    if (rTop === null || rWt === null || rTop !== rWt) continue;
+    const theirsRaw = gitCommonDir(wt);
+    if (!theirsRaw) continue;
+    const theirs = realResolve(theirsRaw);
+    if (theirs === null || theirs !== mine) continue; // a different repository
+    return true;
+  }
+  return false;
+}
+
+/** The session id this guard may use as a ledger key — the hook payload's `session_id` and NOTHING
+ *  else. Returns null when the payload cannot supply one, so the caller admits nothing.
+ *
+ *  This is one line of logic and it exists as a function so it can be TESTED (bead sparkle-q39ja0).
+ *  The choice of key is the whole security property, and a `payload?.session_id` inlined at the call
+ *  site is guarded only by whoever reads that line next.
+ *
+ *  WHY IT MUST NOT FALL BACK TO `$CLAUDE_CODE_SESSION_ID`. The ledger's writer,
+ *  `scripts/new-feature.sh`, keys on that env var, and it is NOT reliably the same string as the
+ *  payload id — measured, the env var held an id naming no transcript on the machine while the
+ *  payload id named the live one, so the ledger is filed under a key never looked up and the feature
+ *  admits nothing. That is a real bug, and it is filed. It must not be fixed here, because an
+ *  environment variable is INHERITED by every descendant process: sibling agents dispatched from one
+ *  parent all carry the same value (a child session here carries `CLAUDE_CODE_CHILD_SESSION=1`
+ *  beside an inherited id). Agent A records its worktree under the shared id; agent B looks the same
+ *  id up, finds A's line, and is admitted into A's worktree — the rival write this guard exists to
+ *  refuse. `isSessionOwnedWorktree` does not save it: it proves only that the recorded path is a
+ *  worktree root of the SAME REPOSITORY, which every rival worktree also is.
+ *
+ *  The repair belongs to the WRITER — record under the id the reader receives, not one inherited.
+ *  Until then this reader stays strict and the feature stays inert, which is the safe way to fail. */
+export function sessionIdForLedger(payload, env) {
+  void env; // deliberately unused: see above. Taking it as a parameter is what makes that testable.
+  const id = payload?.session_id;
+  return typeof id === "string" && id.length > 0 ? id : null;
+}
+
+// ── Plan mode: THIS session's plan file, not the whole plans directory ──────────────────────────
+//
+// WHY (bead sparkle-hshjw, seen 3×). Plan mode hands the agent exactly one file it may edit and it
+// lives outside every worktree, so the containment check refused it and ExitPlanMode then read a file
+// the agent had been structurally prevented from creating — the human saw NO PLAN AT ALL. The
+// `<config>/plans/` allow-list (sparkle-3moh0) unblocked that, but at DIRECTORY granularity: every
+// concurrent agent shares one `plans/` dir, so it also admitted writes to every OTHER session's plan
+// file. That is the same hole the scratchpad carve-out was tightened to close, and it matters more
+// here, because the file a rival is about to present is the file it would land in.
+//
+// The narrowing needs a verifiable answer to "which plan file is MINE", and the harness already
+// records one: the session transcript carries a `plan_mode` attachment whose `planFilePath` names it,
+// and the hook payload carries `transcript_path`. So the write is admitted for exactly that path.
+//
+// FALLBACK, stated plainly because it is the difference between a narrowing and a regression: when
+// the transcript cannot name a plan file — absent, unreadable, oversized, or plan mode never entered
+// — the directory-level allowance stands. A guard that cannot establish ownership must not re-create
+// the bug in which the one file plan mode permits is unwritable; refusing there would leave the human
+// with no plan again, which is the exact failure this whole path exists to prevent.
+
+/** A transcript larger than this is not scanned (→ null → the directory-level allowance stands).
+ *  A guard must not read an unbounded file synchronously on a tool call. */
+const TRANSCRIPT_READ_CAP = 64 * 1024 * 1024;
+
+/** The plan file THIS session was assigned, read from its own transcript, or null when the
+ *  transcript cannot name one. The harness writes one JSONL record per turn; a `plan_mode` attachment
+ *  record carries `planFilePath`. The LAST such record wins — re-entering plan mode reassigns the
+ *  file, and an agent must be able to write the plan it was most recently given. */
+export function sessionPlanFile(transcriptPath) {
+  if (typeof transcriptPath !== "string" || transcriptPath.length === 0) return null;
+  let raw;
+  try {
+    const st = statSync(transcriptPath);
+    if (!st.isFile() || st.size > TRANSCRIPT_READ_CAP) return null;
+    raw = readFileSync(transcriptPath, "utf8");
+  } catch {
+    return null;
+  }
+  let found = null;
+  for (const line of raw.split("\n")) {
+    // Cheap literal filter first: JSON.parse on every line of a multi-megabyte transcript is the
+    // expensive way to ask a question almost every line answers "no".
+    if (!line.includes('"planFilePath"')) continue;
+    let rec;
+    try {
+      rec = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    const p = rec?.attachment?.planFilePath ?? rec?.planFilePath;
+    if (typeof p === "string" && p.length > 0 && isAbsolute(p)) found = p;
+  }
+  return found;
+}
+
+/** True iff `target` resolves into a `plans/` dir under EITHER Claude config root — the same two
+ *  roots `isAllowlistedNoteDir` consults, and for the same reason (Sparkle always sets
+ *  `$CLAUDE_CONFIG_DIR`, the harness falls back to `$HOME/.claude`). This asks only WHERE the target
+ *  is, never whose it is; ownership is `sessionPlanFile`'s question. */
+export function isUnderPlansRoot(homeDir, target, configDir) {
+  if (typeof target !== "string" || target.length === 0) return false;
+  if (typeof homeDir === "string" && homeDir.length > 0) {
+    if (isInside(`${homeDir}${sep}.claude${sep}plans`, target)) return true;
+  }
+  if (typeof configDir !== "string" || configDir.length === 0) return false;
+  if (!isAbsolute(configDir)) return false;
+  return isInside(`${configDir}${sep}plans`, target);
+}
+
+/** True iff two paths name the same file once canonicalized. Fails closed on an unresolvable side. */
+function samePath(a, b) {
+  const ra = realResolve(a);
+  const rb = realResolve(b);
+  return ra !== null && rb !== null && ra === rb;
+}
+
+/** The stderr text for refusing a write to ANOTHER session's plan file. The remedy has to be safe
+ *  under the conditions that triggered the refusal, so it names the one path that is: this session's
+ *  own plan file, which the guard admits and which ExitPlanMode actually reads. It also names the
+ *  improvisation the refusal invites — editing the neighbour's file to leave them a note — because
+ *  that lands in a plan another agent is about to present as its own. */
+export function otherSessionPlanMessage(target, planFile) {
+  return (
+    `Blocked: ${target} is another session's plan file.\n` +
+    "Plan mode assigns THIS session exactly one file it may edit, and that is not it. Yours is:\n" +
+    `  ${planFile}\n` +
+    "Write the plan there. That is the path ExitPlanMode reads, so a plan written anywhere else is a\n" +
+    "plan the human never sees.\n" +
+    "Do NOT edit the file above to leave its owner a note: another agent is writing that plan right\n" +
+    "now and is about to present it, so your text would be read as theirs.\n"
+  );
 }
 
 
@@ -3556,6 +3765,39 @@ async function main() {
   // `$CLAUDE_CONFIG_DIR` is passed because the harness honours it over `$HOME/.claude`, and Sparkle
   // always sets it to the account dir — without it the app's own agents cannot write their assigned
   // plan file at all (sparkle-3moh0). The hook inherits the variable from the `claude` process.
+  //
+  // The `plans/` half of that allow-list is narrowed FIRST to the one plan file THIS session was
+  // assigned (sparkle-hshjw): one `plans/` dir is shared by every concurrent agent, so a
+  // directory-level allowance also admitted writes into a rival's plan — the file it is about to
+  // present. `transcript_path` is the harness's own record of which file is ours. When it cannot name
+  // one the directory-level allowance stands, deliberately: see the block comment on sessionPlanFile.
+  let plansTarget = false;
+  try {
+    plansTarget = isUnderPlansRoot(homedir(), target, process.env.CLAUDE_CONFIG_DIR);
+  } catch {
+    plansTarget = false;
+  }
+  if (plansTarget) {
+    let planFile = null;
+    try {
+      planFile = sessionPlanFile(payload?.transcript_path);
+    } catch {
+      planFile = null;
+    }
+    // No answer → keep the pre-existing directory-level allowance. Refusing here would restore the
+    // very bug this path exists to fix: the one file plan mode permits becomes unwritable and the
+    // human sees no plan at all.
+    if (planFile === null) process.exit(0);
+    let mine = false;
+    try {
+      mine = samePath(planFile, target);
+    } catch {
+      mine = false;
+    }
+    if (mine) process.exit(0);
+    process.stderr.write(otherSessionPlanMessage(target, planFile));
+    process.exit(2); // exit code 2 → Claude Code blocks the tool call
+  }
   let allowedNoteDir = false;
   try {
     allowedNoteDir = isAllowlistedNoteDir(homedir(), target, process.env.CLAUDE_CONFIG_DIR);
@@ -3578,6 +3820,18 @@ async function main() {
     allowedScratchpad = false;
   }
   if (allowedScratchpad) process.exit(0);
+  // Worktrees THIS SESSION created (sparkle-q39ja0, sparkle-6mpx2a): `scripts/new-feature.sh` puts a
+  // fresh worktree BESIDE the repo root, so the containment check above refuses the worktree the agent
+  // was just told to make. Ownership is two verifiable facts — the creating session recorded the path
+  // under the git common dir, and git still resolves that path to a worktree root of THIS repository —
+  // never a path shape, which would admit a rival's worktree too. Fails closed on every unknown.
+  let ownWorktree = false;
+  try {
+    ownWorktree = isSessionOwnedWorktree(callerRoot, sessionIdForLedger(payload, process.env), target);
+  } catch {
+    ownWorktree = false;
+  }
+  if (ownWorktree) process.exit(0);
   // Three-valued on purpose: only a proven same-repo answer changes the remedy (see
   // outsideWorktreeMessage). Any failure here leaves it null and the conservative text stands.
   let sameRepo = null;

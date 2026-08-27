@@ -80,10 +80,36 @@ declare module "*/worktree-guard.mjs" {
   // which keeps sibling agent worktrees (also created under /private/tmp/claude-*) blocked. uid-scoped,
   // not session-scoped (see the .mjs docstring).
   export function isAllowlistedScratchpad(target: unknown): boolean;
+  // True iff `target` sits inside a worktree THIS session created from THIS repository. Ownership is
+  // TWO facts, never a path shape: the creating session recorded the path under
+  // `<git-common-dir>/sparkle-session-worktrees/<session-id>` (scripts/new-feature.sh writes it), and
+  // git still resolves that path to a worktree ROOT whose common dir equals the caller's. A path
+  // allow-list would admit a rival agent's worktree, which is what the guard exists to stop. Fails
+  // closed on every unknown (sparkle-q39ja0, sparkle-6mpx2a).
+  export function isSessionOwnedWorktree(callerRoot: unknown, sessionId: unknown, target: unknown): boolean;
+  // The session id this guard may use as a ledger key: the hook payload's `session_id` and nothing
+  // else, or null when the payload cannot supply one. `env` is accepted and deliberately IGNORED —
+  // the ledger's writer keys on the inherited `$CLAUDE_CODE_SESSION_ID`, which sibling agents
+  // dispatched from one parent all share, so honouring it would admit agent B into agent A's
+  // worktree. Taking the parameter is what makes that guarantee testable (sparkle-q39ja0).
+  export function sessionIdForLedger(payload: unknown, env: unknown): string | null;
+  // The plan file THIS session was assigned, read from the `plan_mode` attachment in its own
+  // transcript (`transcript_path` in the hook payload), or null when the transcript cannot name one —
+  // absent, unreadable, oversized, or plan mode never entered. The LAST such record wins.
+  export function sessionPlanFile(transcriptPath: unknown): string | null;
+  // True iff `target` resolves into a `plans/` dir under either Claude config root ($HOME/.claude or
+  // `configDir`). Asks only WHERE the target is; whose it is, is sessionPlanFile's question.
+  export function isUnderPlansRoot(homeDir: unknown, target: unknown, configDir?: unknown): boolean;
+  // The stderr text for refusing a write to ANOTHER session's plan file: names this session's own
+  // plan file, the one path that is safe under the conditions that triggered the refusal.
+  export function otherSessionPlanMessage(target: string, planFile: string): string;
   // The stderr text for a containment refusal. Names the sanctioned hand-off (session scratchpad, or
   // a worktree in the target repo) instead of stating the rule and stopping — an agent whose work was
   // redirected into another repo mid-task otherwise improvises something worse (sparkle-itohi).
-  export function outsideWorktreeMessage(target: string, callerRoot: string): string;
+  // `sameRepo === true` (a target in a SIBLING worktree of the caller's own repo) selects a remedy
+  // that points back at the caller's worktree and at scripts/new-feature.sh; `false`/`null` keep the
+  // conservative cross-repo text, because an unproven same-repo claim must not pick the narrow one.
+  export function outsideWorktreeMessage(target: string, callerRoot: string, sameRepo?: boolean | null): string;
   // Worktree-relative containment helper: the worktree the CALLER is actually operating in.
   // Derives the caller's worktree root from the tool call's `cwd` (via `resolveToplevel`, default
   // `git rev-parse --show-toplevel`), falling back to `installRoot` when cwd isn't in a git work tree.
