@@ -1076,6 +1076,38 @@ describe("beadsProtocol", () => {
     expect(p).toContain("bd ready");
   });
 
+  it("scopes EVERY readiness read to the epic, because bare `bd ready` is a silent wrong answer", () => {
+    // `bd ready` with no `--parent` is GLOBAL, priority-sorted and capped at 100. An epic's
+    // P2-P4 children are therefore pushed off the end by unrelated P0/P1 work from the whole
+    // store, and the orchestrator is handed ~100 rows belonging to other epics. Measured on the
+    // 32-child epic sparkle-qtvp6c: bare `bd ready` returned 107 rows containing exactly ONE of
+    // its children, while `bd ready --parent <epicId> --limit 0` returned all 32. That is a
+    // WRONG ANSWER, not an empty backlog, so an orchestrator that trusts it dispatches nothing
+    // and reports the epic as having no ready work. Beads sparkle-o3x8cb, sparkle-22xzbl,
+    // sparkle-ww8omr, sparkle-pzi2c3.
+    //
+    // The assertion is on the PROPERTY, not on membership: `toContain("bd ready --parent")`
+    // alone stays green if a bare `bd ready` is left standing somewhere else in the brief — and
+    // a brief that names BOTH forms is exactly the shape that reintroduces the bug, because the
+    // agent has a working command and a broken one side by side with no reason to prefer either.
+    // So: every single occurrence of `bd ready` must be immediately followed by ` --parent`.
+    // The brief DOES name the bare form once, to explain why it is wrong — so the exemption is
+    // narrow and explicit: an occurrence introduced by the word "bare" is the counter-example
+    // being warned about, and every OTHER occurrence is an instruction and must carry --parent.
+    // Keeping the counter-example inside the assertion's reach is deliberate: if someone later
+    // rewrites the warning into an instruction by dropping the word "bare", this goes red.
+    const occurrences = [...p.matchAll(/(?<lead>\S*\s?)`?bd ready(?<rest>.{0,9})/g)];
+    expect(occurrences.length).toBeGreaterThan(0);
+    const instructions = occurrences.filter((m) => !/\bbare\s$/.test(m.groups?.lead ?? ""));
+    expect(instructions.length).toBeGreaterThan(0);
+    for (const m of instructions) {
+      expect(m.groups?.rest ?? "").toMatch(/^ --parent/);
+    }
+    // …and the epic-scoped form must actually name the limit, or the 100-row cap silently
+    // truncates any epic with more than 100 children back into the same wrong answer.
+    expect(p).toContain("bd ready --parent <epicId> --limit 0");
+  });
+
   it("names a PORTABLE fallback, because the script only exists in THIS repo", () => {
     // `bd` is a globally-installed CLI; `scripts/bead-brief.sh` is a file in the sparkle checkout.
     // This persona is emitted for EVERY project the user adds to Sparkle, so in any other

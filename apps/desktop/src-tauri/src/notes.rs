@@ -861,14 +861,25 @@ pub async fn bead_show(project_path: String, id: String) -> Result<String, Strin
 
 /// Assemble the `bd create …` argv (the tokens AFTER `bd`). Every value (title, body, type,
 /// parent, deps, labels) is a distinct argv token — NEVER interpolated into a shell string — so it
-/// is injection-safe, matching `create_bead`. Optional flags (`--parent`/`--deps`/`-l`) and their
-/// values are appended ONLY when non-empty. Empty `issue_type` defaults to "task". Pure (no I/O) so
-/// the assembly is unit-testable without invoking bd. The cwd is set by `run_bd` (`.current_dir`),
-/// so — unlike the old shell form — the project path is not part of the argv.
+/// is injection-safe, matching `create_bead`. Optional flags (`-p`/`--parent`/`--deps`/`-l`) and
+/// their values are appended ONLY when non-empty. Empty `issue_type` defaults to "task". Pure (no
+/// I/O) so the assembly is unit-testable without invoking bd. The cwd is set by `run_bd`
+/// (`.current_dir`), so — unlike the old shell form — the project path is not part of the argv.
+///
+/// `priority` EXISTS BECAUSE ITS ABSENCE WAS A SILENT DEFECT (`sparkle-1abg72`). This assembly
+/// carried no priority parameter at all, so every bead minted through `create_bead_full` — the
+/// path `tasks.ts::generate*` and `buildAgentSpawn.ts` reach — took bd's own default of `-p 2`,
+/// whatever the caller intended. Nothing failed and nothing was logged: a caller asking for P1 got
+/// P2 and no signal that its request had been dropped on the floor, because the request had
+/// nowhere to be expressed in the first place. Contrast `beads_cmd::build_create_args`, the
+/// verified sibling, which has always pushed `-p`. An EMPTY string means "say nothing and let bd
+/// default", which is what every pre-existing caller wants — so adding this cannot move any bead
+/// that did not ask to be moved.
 fn build_create_bead_args(
     title: &str,
     body: &str,
     issue_type: &str,
+    priority: &str,
     parent: &str,
     deps: &str,
     labels: &str,
@@ -884,6 +895,10 @@ fn build_create_bead_args(
         "-t".to_string(),
         issue_type.to_string(),
     ];
+    if !priority.trim().is_empty() {
+        args.push("-p".to_string());
+        args.push(priority.trim().to_string());
+    }
     if !parent.trim().is_empty() {
         args.push("--parent".to_string());
         args.push(parent.to_string());
@@ -911,6 +926,7 @@ pub async fn create_bead_full(
     title: String,
     body: String,
     issue_type: String,
+    priority: String,
     parent: String,
     deps: String,
     labels: String,
@@ -921,6 +937,7 @@ pub async fn create_bead_full(
             &title,
             &body,
             &issue_type,
+            &priority,
             &parent,
             &deps,
             &labels,
@@ -942,6 +959,7 @@ fn create_bead_full_inner(
     title: &str,
     body: &str,
     issue_type: &str,
+    priority: &str,
     parent: &str,
     deps: &str,
     labels: &str,
@@ -952,7 +970,7 @@ fn create_bead_full_inner(
     {
         return Ok(row.to_string());
     }
-    let args = build_create_bead_args(title, body, issue_type, parent, deps, labels);
+    let args = build_create_bead_args(title, body, issue_type, priority, parent, deps, labels);
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let output = run_bd_env(project_path, &arg_refs, env)?;
     select_bd_result(output.success, output.stdout.trim(), output.stderr.trim())
@@ -1594,7 +1612,7 @@ mod tests {
     fn build_create_bead_args_minimal_uses_defaults() {
         // Empty type defaults to "task"; no optional flags appended. The project path is NOT in
         // the argv (run_bd sets cwd via .current_dir), and every value is a distinct argv token.
-        let args = build_create_bead_args("My Title", "body text", "", "", "", "");
+        let args = build_create_bead_args("My Title", "body text", "", "", "", "", "");
         assert_eq!(
             args,
             vec!["create", "--title=My Title", "-d", "body text", "-t", "task", "--json"]
@@ -1607,6 +1625,7 @@ mod tests {
             "Title",
             "Body",
             "bug",
+            "",
             "sparkle-parent",
             "blocks:sparkle-x,sparkle-y",
             "ui,backend",
@@ -1635,7 +1654,7 @@ mod tests {
     #[test]
     fn build_create_bead_args_skips_omitted_optionals() {
         // Only labels provided: parent/deps flags are absent, `-l docs` still appended.
-        let args = build_create_bead_args("T", "B", "task", "", "", "docs");
+        let args = build_create_bead_args("T", "B", "task", "", "", "", "docs");
         assert_eq!(
             args,
             vec!["create", "--title=T", "-d", "B", "-t", "task", "-l", "docs", "--json"]
@@ -1646,7 +1665,7 @@ mod tests {
     fn build_create_bead_args_never_inlines_hostile_values() {
         // A shell-injection payload as the title stays a single argv token (no shell parses it),
         // so it can never break out — the direct-exec equivalent of the old positional-arg scheme.
-        let args = build_create_bead_args("'; rm -rf / #", "b", "", "", "", "");
+        let args = build_create_bead_args("'; rm -rf / #", "b", "", "", "", "", "");
         assert_eq!(args[0], "create");
         assert_eq!(args[1], "--title='; rm -rf / #");
         assert!(args.contains(&"--json".to_string()));
@@ -1660,12 +1679,62 @@ mod tests {
     /// separate-token `--title <t>` would still let a `-`-leading value be re-read as an option.
     #[test]
     fn both_notes_create_paths_bind_the_title_inside_one_argv_token() {
-        let args = build_create_bead_args("- fix the thing", "b", "", "", "", "");
+        let args = build_create_bead_args("- fix the thing", "b", "", "", "", "", "");
         assert_eq!(args[1], "--title=- fix the thing");
         assert!(
             !args.iter().any(|a| a == "--title"),
             "a separate-token --title still exposes a dash-leading value: {args:?}"
         );
+    }
+
+    /// THE PRIORITY SEAM, and why asserting on the DEFAULT case is not enough (`sparkle-1abg72`).
+    ///
+    /// `build_create_bead_args` carried no priority parameter at all, so every bead minted through
+    /// `create_bead_full` silently took bd's own `-p 2` however the caller had specified it. The
+    /// failure was invisible from inside: nothing errored, nothing logged, and a caller asking for
+    /// P1 simply received P2 — because there was nowhere for the request to be written down.
+    ///
+    /// The two directions are asserted TOGETHER on purpose. "no `-p` when none is asked for" alone
+    /// stays green against the defect — it was the defect's exact behaviour, for every input. Only
+    /// the paired case, where a supplied priority MUST appear in the argv, can distinguish a seam
+    /// that exists from one that never did.
+    #[test]
+    fn build_create_bead_args_carries_a_supplied_priority_and_omits_an_empty_one() {
+        // (a) supplied → `-p` is present, as its own argv token, with the value beside it.
+        let args = build_create_bead_args("T", "B", "epic", "1", "", "", "");
+        let pos = args
+            .iter()
+            .position(|a| a == "-p")
+            .expect("a supplied priority must reach bd's argv; without -p bd silently defaults to 2");
+        assert_eq!(args.get(pos + 1).map(String::as_str), Some("1"));
+
+        // (b) not supplied → say nothing and let bd default. An empty string must NOT become
+        // `-p ""`, which bd would reject outright and turn a quiet default into a hard failure.
+        let bare = build_create_bead_args("T", "B", "epic", "", "", "", "");
+        assert!(!bare.iter().any(|a| a == "-p"), "empty priority must add no flag: {bare:?}");
+
+        // (c) whitespace is not a priority. Same reasoning as (b), and it is the shape a UI text
+        // field actually produces when a human tabs through it without typing.
+        let blank = build_create_bead_args("T", "B", "epic", "   ", "", "", "");
+        assert!(!blank.iter().any(|a| a == "-p"), "blank priority must add no flag: {blank:?}");
+
+        // (d) the value is trimmed, never inlined — `-p` and its value stay two argv tokens, so a
+        // hostile value cannot be re-read as a flag.
+        let padded = build_create_bead_args("T", "B", "epic", " 0 ", "", "", "");
+        let pos = padded.iter().position(|a| a == "-p").expect("-p present");
+        assert_eq!(padded.get(pos + 1).map(String::as_str), Some("0"));
+    }
+
+    /// The type half of `sparkle-1abg72` does NOT reproduce, and this pins that it stays fixed.
+    /// The bead reports a bead created as `epic` persisting as `task`; both argv builders in this
+    /// crate do pass `-t`, so on today's code the type reaches bd intact. Left as a regression pin
+    /// rather than deleted: it is cheap, and the bead's report is specific enough that whatever
+    /// dropped the type once is worth being able to detect again.
+    #[test]
+    fn build_create_bead_args_passes_an_epic_type_through_unchanged() {
+        let args = build_create_bead_args("T", "B", "epic", "", "", "", "");
+        let pos = args.iter().position(|a| a == "-t").expect("-t present");
+        assert_eq!(args.get(pos + 1).map(String::as_str), Some("epic"));
     }
 
     #[test]
@@ -2739,6 +2808,7 @@ mod tests {
             "",
             "",
             "",
+            "",
             beads_cmd::NO_EXTRA_ENV,
         )
         .expect("epic create ran");
@@ -2756,7 +2826,7 @@ mod tests {
 
         let mut ids = Vec::new();
         for child in ["Wire the scanner resolution and its bounds", "Wire the priority seam through the board"] {
-            let row = create_bead_full_inner(&path, child, "", "task", &epic_id, "", "", &env)
+            let row = create_bead_full_inner(&path, child, "", "task", "", &epic_id, "", "", &env)
                 .expect("child create ran");
             ids.push(crate::bead_dup::tests::id_of(&row));
         }

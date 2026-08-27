@@ -147,6 +147,7 @@ export interface GenerateDeps {
     parent: string,
     deps: string,
     labels: string,
+    priority?: string,
   ) => Promise<string>;
   beadDepAdd: (projectPath: string, blockedId: string, blockerId: string) => Promise<void>;
   writePrd: (projectPath: string, filename: string, content: string) => Promise<string>;
@@ -566,7 +567,16 @@ export async function readPrd(projectPath: string, filename: string): Promise<st
   return invoke<string>("read_prd", { projectPath, filename });
 }
 
-/** Create a bead with full options; returns the new id. Wraps the Rust `create_bead_full`. */
+/** Create a bead with full options; returns the new id. Wraps the Rust `create_bead_full`.
+ *
+ *  `priority` is LAST and optional so every existing call site keeps its meaning unchanged. It is
+ *  a plain string, and an EMPTY one means "say nothing, let bd default" — the Rust side appends
+ *  `-p` only for a non-blank value. It is deliberately NOT `number | undefined`: the Rust command
+ *  takes a `String`, and a `serde` `Option` would cross the wire as `null` rather than an absent
+ *  key, which is the shape that silently fails to parse (see AGENTS.md). One string, always sent.
+ *
+ *  Before this existed the priority could not be expressed at all, so a caller asking for P1 got
+ *  bd's default P2 with nothing logged (`sparkle-1abg72`). */
 export async function createBeadFull(
   projectPath: string,
   title: string,
@@ -575,12 +585,14 @@ export async function createBeadFull(
   parent: string,
   depsCsv: string,
   labels: string,
+  priority = "",
 ): Promise<string> {
   const raw = await invoke<string>("create_bead_full", {
     projectPath,
     title,
     body,
     issueType,
+    priority,
     parent,
     deps: depsCsv,
     labels,
