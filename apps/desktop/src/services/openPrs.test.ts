@@ -201,8 +201,19 @@ describe("prMergeReadiness — the dot answers ONE question: safe to merge right
     const r = prMergeReadiness(PR_944_CONFLICTING);
     expect(r.tone).toBe("blocked");
     expect(r.canMerge).toBe(false);
-    expect(r.label).toBe("Conflicts");
     expect(r.override).toBeNull();
+    // THIS ASSERTION USED TO READ `toBe("Conflicts")`, AND THAT WAS THE DEFECT PINNED IN PLACE.
+    // #944's rollup is PENDING, and a conflicting PR's pending run does not exist and never will —
+    // GitHub creates no CI run for one. The row said only why the merge was refused, never that
+    // waiting for the checks was pointless (beads sparkle-o36b7u, sparkle-emvwqh).
+    expect(r.label).toMatch(/never tested/i);
+    expect(r.title).toMatch(/no CI run/i);
+    expect(r.title).toMatch(/never resolve/i);
+    // The remedy has to stay safe under the condition that produced it: a branch carrying merge
+    // commits must be MERGED, not rebased, so the sentence names both verbs and the test that
+    // picks between them.
+    expect(r.title).toMatch(/merge commits/i);
+    expect(r.title).toMatch(/rebase/i);
   });
 
   it("NAMES the failing checks and offers a deliberate override for UNSTABLE (#934)", () => {
@@ -407,7 +418,9 @@ describe("the invariant that keeps the dot and the button honest", () => {
     // The reordering claim, swept rather than spot-checked: wherever a probe block is the most
     // durable outstanding fact, it is the one the row names. Conflicts and merge rights still
     // outrank it, and those are the ONLY two that may.
-    const outranking = new Set(["Conflicts", "No merge rights"]);
+    // BY BLOCKER, NOT BY LABEL. The blocker is the rank's identity; the label is copy, and pinning
+    // the ranking to a sentence made an unrelated wording change look like a ranking regression.
+    const outranking = new Set(["conflicts", "merge-rights"]);
     let named = 0;
     for (const pr of EVERY_COMBINATION) {
       if (!isProbeBlocked(pr)) continue;
@@ -417,7 +430,7 @@ describe("the invariant that keeps the dot and the button honest", () => {
       expect(r.canMerge, `probe-blocked but mergeable: ${shape}`).toBe(false);
       expect(r.tone, `probe-blocked but not red: ${shape}`).toBe("blocked");
       if (r.label?.startsWith("Blocked: ")) named += 1;
-      else expect(outranking, `probe block lost to '${r.label}': ${shape}`).toContain(r.label);
+      else expect(outranking, `probe block lost to '${r.label}': ${shape}`).toContain(r.blocker);
     }
     // And it is not satisfied by never naming the probe.
     expect(named).toBeGreaterThan(0);
@@ -515,8 +528,8 @@ describe("prMergeReadiness — unanswered knightwatch probes block the row", () 
         checks: "passing",
         mergeable: "conflicting",
         probes: probed(1),
-      }).label,
-    ).toBe("Conflicts");
+      }).blocker,
+    ).toBe("conflicts");
     expect(
       prMergeReadiness({
         checks: "passing",
@@ -949,7 +962,10 @@ describe("prProbeBlockedCount — the header's blocked number asks the RULE", ()
       mergeStateStatus: "dirty",
       probes: probed(2),
     };
-    expect(prMergeReadiness(conflicting).label).toBe("Conflicts");
+    expect(prMergeReadiness(conflicting).blocker).toBe("conflicts");
+    // …and this row is the STALE-GREEN shape (`checks: "passing"` on a conflicting PR), which is
+    // the one that used to read as healthy. It must not carry a check verdict at all.
+    expect(prMergeReadiness(conflicting).label).toMatch(/never tested/i);
     expect(prProbeBlockedCount([conflicting])).toBe(0);
   });
 

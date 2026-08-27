@@ -684,6 +684,111 @@ describe("OpenPrMenu (the dot reflects MERGEABILITY, not just checks)", () => {
   });
 });
 
+// ── A CONFLICTING PR IS NEVER JUDGED — NOT RED, AND NOT GREEN ──────────────────────────────────
+//
+// Beads sparkle-o36b7u, sparkle-lyy3q3, sparkle-1e1pe5 and sparkle-emvwqh are four wordings of ONE
+// finding, and they point in OPPOSITE directions — which is exactly why they have to be pinned
+// together rather than one at a time.
+//
+// GitHub never fires a `pull_request` event for a conflicting PR, so no CI run is ever created for
+// its head. Whatever its rollup says is therefore a statement about a tree that no longer exists,
+// and every rollup shape mis-reads in its own way:
+//
+//   • rollup ABSENT   → the row reads like an ordinary red, so the reader starts debugging a diff
+//                       that has never once been tested (sparkle-o36b7u, sparkle-lyy3q3).
+//   • rollup PENDING  → the row promises checks that will never arrive, so a poller waits for an
+//                       event GitHub will not emit (sparkle-emvwqh — one such PR sat 22 hours).
+//   • rollup PASSING  → the row reads HEALTHY off stale green and sweeps skip it (sparkle-1e1pe5).
+//                       THE OPPOSITE FAILURE from the other three, from the same cause.
+//   • rollup FAILING  → the row blames this diff for a check that ran before the conflict existed.
+//
+// ALL FOUR ARE MOUNTED AT ONCE, beside a genuinely-red PR and a genuinely-green one. Asserting the
+// never-tested wording on one conflicting shape proves nothing about a shape the rule did not pick,
+// and asserting its ABSENCE on a row that was never mounted proves nothing at all — so the two
+// non-conflicting rows are here to show the rendering is CHOSEN rather than painted on everything.
+const conflictingRow = (number: number, extra: Partial<PrRow>): PrRow => ({
+  number,
+  title: `fix: something #${number}`,
+  headRefName: `sparkle/agent-conf-${number}`,
+  url: `https://github.com/o/r/pull/${number}`,
+  checks: "none",
+  mergeable: "conflicting",
+  failingChecks: [],
+  pendingChecks: [],
+  ...extra,
+});
+/** No rollup at all — the shape `pr-checks.sh` calls exit 4, REBASE REQUIRED / NEVER TESTED. */
+const CONF_ABSENT = conflictingRow(801, { checks: "none" });
+/** A rollup that will never conclude, because the run it is waiting on was never created. */
+const CONF_PENDING = conflictingRow(802, {
+  checks: "pending",
+  pendingChecks: ["Node — typecheck · test · build"],
+});
+/** STALE GREEN: checks that passed against a tree the conflict has since invalidated. */
+const CONF_STALE_GREEN = conflictingRow(803, { checks: "passing" });
+/** Stale RED, which is the same lie pointed the other way — the red predates the conflict too. */
+const CONF_RED = conflictingRow(804, {
+  checks: "failing",
+  failingChecks: ["Node — coverage (shard 3/4)"],
+});
+
+describe("OpenPrMenu — a CONFLICTING PR reads as NEVER TESTED, whatever its rollup says", () => {
+  const CONFLICTERS = [CONF_ABSENT, CONF_PENDING, CONF_STALE_GREEN, CONF_RED];
+
+  it("paints the never-tested state on EVERY conflicting rollup shape — and on no other row", async () => {
+    stubList([...CONFLICTERS, PR_934, PASS]);
+    render(
+      <OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />,
+    );
+    await openMenu();
+    await screen.findByTestId("merge-1");
+
+    for (const row of CONFLICTERS) {
+      const where = `#${row.number} (rollup: ${row.checks})`;
+      const text = screen.getByTestId(`pr-state-${row.number}`).textContent ?? "";
+
+      // THE CHOSEN RENDERING. The row says the PR was never judged, whatever its rollup said.
+      expect(text, `${where} did not say it was never tested`).toMatch(/never tested/i);
+      // …AND NOT THE RENDERINGS IT HAS TO BE DISTINGUISHABLE FROM. A conflicting row may not
+      // report a check verdict as though the checks described this diff.
+      expect(text, `${where} reported a check verdict`).not.toMatch(
+        /checks? (failing|running)|not clean/i,
+      );
+      // GREEN IS THE ABSENCE OF A LABEL, so the checks above cannot see it — assert it directly.
+      const dot = screen.getByTestId(`pr-dot-${row.number}`);
+      expect(dot.getAttribute("data-tone"), `${where} painted ready`).not.toBe("ready");
+      expect(
+        (screen.getByTestId(`merge-${row.number}`) as HTMLButtonElement).disabled,
+        `${where} offered a live Merge`,
+      ).toBe(true);
+
+      // THE TOOLTIP CARRIES THE REMEDY, and the fact that waiting is not one. A row that only says
+      // "conflicts" leaves a poller waiting for a run that will never be created.
+      const title = dot.getAttribute("title") ?? "";
+      expect(title, `${where}: tooltip never says CI does not run`).toMatch(/no CI run/i);
+      expect(title, `${where}: tooltip does not say the checks are terminal`).toMatch(
+        /never resolve/i,
+      );
+      // AND THE REMEDY MUST BE SAFE UNDER THE CONDITION THAT PRODUCED IT. A bare "rebase" is wrong
+      // advice for a branch carrying merge commits — `git rebase` drops them and replays every
+      // underlying commit against a base none of them was written for (AGENTS.md, sparkle-pxhaq).
+      // So the sentence has to name BOTH verbs and the condition that picks between them, the way
+      // `integration_assistant.rs`'s own refusal remedy already does.
+      expect(title, `${where}: remedy omits the merge-commit case`).toMatch(/merge commits/i);
+      expect(title, `${where}: remedy never names a catch-up verb`).toMatch(/rebase/i);
+    }
+
+    // ── THE ROWS THE RULE MUST NOT HAVE PICKED ────────────────────────────────────────────────
+    // A genuinely red PR still blames its checks: its run really did happen and really did fail.
+    const red = screen.getByTestId("pr-state-934").textContent ?? "";
+    expect(red).toBe("2 checks failing");
+    expect(red).not.toMatch(/never tested/i);
+    // …and the green one still has no word at all, because its enabled button is the label.
+    expect(screen.queryByTestId("pr-state-1")).toBeNull();
+    expect(screen.getByTestId("pr-dot-1").getAttribute("data-tone")).toBe("ready");
+  });
+});
+
 describe("OpenPrMenu (merge error surfacing)", () => {
   it("surfaces the gh error text when a merge is declined", async () => {
     h.invoke.mockImplementation((cmd: string) => {
@@ -825,7 +930,11 @@ describe("OpenPrMenu — no Merge affordance when the answer is not yes", () => 
     await openMenu();
     await screen.findByTestId("merge-1");
 
-    expect(screen.getByTestId("pr-state-944").textContent).toBe("Conflicts");
+    // #944 CONFLICTS AND ITS ROLLUP IS PENDING — a run that does not exist and never will, since
+    // GitHub creates none for a conflicting PR. This assertion read `toBe("Conflicts")`, which
+    // pinned a row that let a reader wait for checks that cannot arrive (sparkle-emvwqh).
+    expect(screen.getByTestId("pr-state-944").textContent).toMatch(/never tested/i);
+    expect(screen.getByTestId("pr-state-944").textContent).not.toMatch(/checks running/i);
     expect(screen.getByTestId("pr-state-934").textContent).toBe(
       "2 checks failing",
     );
@@ -4142,7 +4251,7 @@ describe("OpenPrMenu — the drawer follows the same ranking as the row and the 
 
     expect(
       screen.getByTestId(`pr-state-${PR_CONFLICTING_AND_PROBED.number}`).textContent,
-    ).toBe("Conflicts");
+    ).toMatch(/^Conflicts\b.*never tested/i);
     expect(
       screen.queryByTestId(`probe-disclosure-${PR_CONFLICTING_AND_PROBED.number}`),
     ).toBeNull();

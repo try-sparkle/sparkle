@@ -341,10 +341,10 @@ export interface PrReadiness {
    *  yes/no question. */
   tone: "ready" | "waiting" | "blocked";
   /**
-   * The WORD shown NEXT TO the dot — "Conflicts", "1 check failing", "Checks running (3)". Never
-   * null for a non-green PR, so the state never depends on colour perception alone (the founder's
-   * screenshot had five dots and no words). Null exactly when green, where the enabled Merge
-   * button is itself the label.
+   * The WORD shown NEXT TO the dot — "Conflicts — never tested", "1 check failing", "Checks
+   * running (3)". Never null for a non-green PR, so the state never depends on colour perception
+   * alone (the founder's screenshot had five dots and no words). Null exactly when green, where the
+   * enabled Merge button is itself the label.
    */
   label: string | null;
   /** Full tooltip: the label plus the offending check NAMES where there are any. */
@@ -378,6 +378,25 @@ function nameList(names: string[], cap = 3): string {
 }
 
 const plural = (n: number, one: string, many: string) => (n === 1 ? one : many);
+
+/**
+ * The WORD a conflicting PR's row shows, and the sentence behind it.
+ *
+ * Exported so the CLI vocabulary has one home on this side of the wire, not so tests can assert
+ * `label === PR_CONFLICT_LABEL` — an assertion against the constant it is checking cannot fail.
+ * The suites pin the LITERAL phrases a reader depends on ("never tested", "no CI run",
+ * "never resolve", the merge-commit caveat) against the RENDERED row.
+ *
+ * Both facts, in that order: the conflict is the cause, "never tested" is what it means for the
+ * checks. Short enough for the row's never-elided state slot — it sits between
+ * "Checking mergeability" and "Blocked: 3 probes" in width.
+ */
+export const PR_CONFLICT_LABEL = "Conflicts — never tested";
+export const PR_CONFLICT_TITLE =
+  "Conflicts with the base branch — REBASE REQUIRED, NEVER TESTED. GitHub creates no CI run for a " +
+  "conflicting pull request, so its checks will never resolve on their own and anything shown here " +
+  "was recorded before the conflict. Catch the branch up onto its base — merge the base in if the " +
+  "branch carries merge commits, rebase otherwise — push, and GitHub gives it its first run.";
 
 export function prMergeReadiness(pr: PrJudgeable): PrReadiness {
   // Trust the NAME ARRAYS when present, but never let an empty array override the rollup word: an
@@ -441,12 +460,46 @@ export function prMergeReadiness(pr: PrJudgeable): PrReadiness {
       override: null,
     };
 
+  // ── A CONFLICT IS ALSO A VERDICT ABOUT THE CHECKS: THERE ARE NONE, AND THERE WILL BE NONE ─────
+  //
+  // Beads sparkle-o36b7u, sparkle-lyy3q3, sparkle-1e1pe5 and sparkle-emvwqh — four wordings of one
+  // finding. GitHub never fires a `pull_request` event for a conflicting PR, so no CI run is ever
+  // CREATED for its head. Its rollup is therefore not a statement about this diff at all, and every
+  // shape of it mis-reads in its own direction:
+  //
+  //   • ABSENT  → the row reads like an ordinary red, so the reader starts debugging a diff that
+  //               has never once been tested. One such PR was described as failing; merging main
+  //               in produced its FIRST run, which went green.
+  //   • PENDING → the row promises checks that will never arrive, so a poller waits for an event
+  //               GitHub will not emit. One sat three days, 105 commits behind, never tested once.
+  //   • PASSING → STALE GREEN, the opposite failure from the same cause: the checks describe a tree
+  //               that has not existed for most of a day, so sweeps read the PR as healthy and skip
+  //               it. One sat 22 hours unowned that way.
+  //
+  // So the label names the state rather than only its cause, and the tooltip says the thing a
+  // "Conflicts" row could not: **waiting is not a remedy here**. This is deliberately the SAME
+  // vocabulary `scripts/pr-checks.sh` exit 4 and `integration_assistant.rs`'s
+  // `CheckState::RebaseRequired` already use — REBASE REQUIRED, NEVER TESTED — so the CLI, the
+  // gate and the row cannot describe one pull request three different ways.
+  //
+  // THE REMEDY SENTENCE NAMES BOTH VERBS, AND THAT IS NOT PADDING. A refusal message is an
+  // instruction the reader will follow, so it has to be safe under the very condition that produced
+  // it — and a bare "rebase" is wrong advice for a branch carrying merge commits: `git rebase`
+  // DROPS them and replays every underlying commit against a base none of them was written for
+  // (AGENTS.md; `sparkle-pxhaq`, where the rebase conflicted on the first of eight replays while
+  // the merge produced three trivial additive conflicts). `integration_assistant.rs` already
+  // resolved this the same way in its own refusal remedy; this is that sentence, for the row.
+  //
+  // Still `tone: "blocked"` and still no override. The tone answers exactly one question — is this
+  // safe to merge right now — and the answer is no; a fourth tone would be a third answer to a
+  // yes/no question, which is the bug the `"none"` tone was deleted for. What was missing was never
+  // a colour, it was the WORDS.
   if (pr.mergeable === "conflicting" || state === "dirty")
     return {
       tone: "blocked",
-      label: "Conflicts",
+      label: PR_CONFLICT_LABEL,
       blocker: "conflicts",
-      title: "Conflicts with the base branch — this cannot be merged until they are resolved",
+      title: PR_CONFLICT_TITLE,
       canMerge: false,
       override: null,
     };
