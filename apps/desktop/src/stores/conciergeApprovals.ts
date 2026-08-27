@@ -128,6 +128,31 @@ export interface ConciergeApprovalRequest {
   /** The MCP-minted `toolCallId` (or, for the legacy sparkle-control ops, the Rust-minted `reqId`).
    *  NEVER a model-supplied string — see the header. */
   id: string;
+  /**
+   * WHO RAISED THIS QUESTION — the caller identity the APP stamped, never anything the model said.
+   *
+   * THE BUG THIS FIELD EXISTS FOR (bead `sparkle-tavx1`). This ledger is one app-wide array, and
+   * until now an entry recorded nothing about whose call it was. The human's column is right to
+   * render all of them — there is one human — but the AGENT-FACING read is not: `sparkle_approvals`
+   * promises every caller "See YOUR OWN pending approval requests" and `conciergeTools/approvals`
+   * answered it from the whole ledger. So a question raised for agent A was delivered into agent
+   * B's transcript, framed as awaiting B's decision, carrying A's arguments — the peer-message text
+   * of a `sparkle_fleet` send among them. An agent acting on that would send a message it never
+   * composed, to a peer it was not talking to.
+   *
+   * STAMPED AT RAISE, from `req.callerAgentId` — the id Rust mints from WHICH SOCKET the request
+   * arrived on (`controlListener`'s header). It is an `AgentTab.id`, or the reserved
+   * `sparkle:concierge` for the concierge brain. It cannot be re-derived later: the ledger outlives
+   * the turn that filled it, which is the same reason `relayedFounderWords` and `subject` are
+   * stamped here rather than read back at click time.
+   *
+   * EMPTY MEANS UNATTRIBUTED, AND UNATTRIBUTED IS INVISIBLE TO EVERY AGENT READ. A raiser that
+   * cannot name its caller gets an entry the human can still answer and no agent can see — see
+   * {@link approvalBelongsTo}, which fails closed on a blank on either side. That direction is the
+   * safe one: the cost is an agent unable to poll a card the human can still press, and the
+   * alternative is the delivery this field exists to stop.
+   */
+  requestedBy?: string;
   /** `lifecycle` | `terminal` | `workflow` | `workspace` | `app`. */
   domain: string;
   op: string;
@@ -238,6 +263,10 @@ export interface ConciergeApprovalRequest {
 }
 
 export interface ConciergeApproval extends ConciergeApprovalRequest {
+  /** Narrowed to REQUIRED on a stored entry: {@link requestApproval} normalises a missing or
+   *  non-string requester to `""`, so every reader has one field to test rather than three states
+   *  (absent / blank / present) to remember. See the request field for what `""` means. */
+  requestedBy: string;
   requestedAt: number;
   /** When this entry stops counting — the request window while pending, the grant window once
    *  approved. */
@@ -458,6 +487,19 @@ function blank(id: unknown): boolean {
  * independently by id, approving both would run the op twice. Two clicks, two sends, one intention
  * (roborev 54729, finding 2). One live question per identity: the same call asked again while it is
  * still unanswered returns the card already waiting.
+ *
+ * …BUT "THE SAME QUESTION" IS PER REQUESTER, NOT PER FINGERPRINT (bead `sparkle-tavx1`). The
+ * fingerprint is `domain + op + args`, and it says nothing about WHO asked. Two DIFFERENT agents
+ * that happen to make byte-identical calls are two intentions, not one retry, and collapsing them
+ * was the delivery this bead is about in its sharpest form: the second agent was handed the FIRST
+ * agent's entry object outright. Two consequences, both live before this line changed —
+ *   - the second agent is gated on a card stamped with somebody else's name, so it cannot see its
+ *     own pending question through `list_pending_approvals` and waits on it forever; and
+ *   - `claimApproval` authorises by id, so ONE human click would spend a single grant against two
+ *     agents' calls — the exact "one intention, two sends" inversion the paragraph above guards.
+ * So the live-question match is keyed on the requester as well. A blank requester still collapses
+ * with another blank one: two callers that could not be identified cannot be told apart, and that
+ * is the pre-existing behaviour rather than a new hole.
  */
 export function requestApproval(
   request: ConciergeApprovalRequest,
@@ -465,15 +507,23 @@ export function requestApproval(
 ): ConciergeApproval | null {
   if (blank(request.id)) return null;
   const id = request.id.trim();
+  // NORMALISED BEFORE THE LIVE-QUESTION MATCH, not just before the write, because the match now
+  // consults it: comparing a raw `undefined` against a stored `""` would miss and mint a duplicate.
+  const requestedBy = typeof request.requestedBy === "string" ? request.requestedBy.trim() : "";
   const swept = sweepAndAnnounce(useConciergeApprovals.getState().entries, now);
   const existing = swept.find((e) => e.id === id);
   if (existing) {
     commit(swept);
     return existing;
   }
-  // Same call, already on screen and still unanswered → that card IS this question.
+  // Same call BY THE SAME CALLER, already on screen and still unanswered → that card IS this
+  // question. The requester is half the key; see the docstring for what collapsing without it did.
   const onScreen = swept.find(
-    (e) => e.fingerprint === request.fingerprint && e.outcome === "pending" && isLive(e, now),
+    (e) =>
+      e.fingerprint === request.fingerprint &&
+      e.requestedBy === requestedBy &&
+      e.outcome === "pending" &&
+      isLive(e, now),
   );
   if (onScreen) {
     commit(swept);
@@ -482,6 +532,11 @@ export function requestApproval(
   const entry: ConciergeApproval = {
     ...request,
     id,
+    // Normalised once, above, so no reader has to and so the live-question match above compares
+    // like with like. `request` comes off a policy binding whose own caller may be a wire payload,
+    // so a non-string is as possible as an absent one and both mean the same thing: nobody could be
+    // named. See the field's doc for why blank fails closed.
+    requestedBy,
     requestedAt: now,
     expiresAt: now + APPROVAL_REQUEST_TTL_MS,
     outcome: "pending",
@@ -568,15 +623,39 @@ function resolve(id: string, outcome: "approved" | "denied", now: number): boole
  *     the answer is `false` and we stop there: an explicit "no" for this exact call must not be
  *     routed around by the identity path below.
  *  2. BY IDENTITY. No entry for this id, so this is a fresh call from a later turn. The oldest
- *     approved-live-unspent entry with the SAME fingerprint is spent. Same domain, same op, same
- *     arguments — the human approved this exact thing, just under a previous id.
+ *     approved-live-unspent entry with the SAME fingerprint AND THE SAME REQUESTER is spent. Same
+ *     domain, same op, same arguments, same caller — the human approved this exact thing, just
+ *     under a previous id.
  *
  * Everything else is `false`. There is no third way.
+ *
+ * WHY THE REQUESTER IS HALF OF BRANCH 2 (bead `sparkle-tavx1`, the spending half). A fingerprint is
+ * `domain + op + args` and says nothing about WHO asked, while branch 2 is not a corner — it is the
+ * ONLY way a retry can ever spend a grant, because `toolCallId` is minted fresh per call. So a
+ * fingerprint-only branch 2 let agent B's byte-identical call redeem the grant a human gave agent
+ * A: measured on the control-op path (`appOpPolicy` / `chiefOpPolicy`), which
+ * `conciergeApprovalResume` deliberately does NOT replay, so an approved entry sits unspent for the
+ * whole {@link APPROVAL_GRANT_TTL_MS} window with nothing but the fingerprint guarding it. B ran on
+ * A's click and A's own retry was then refused as already-spent — the human's answer delivered to
+ * the agent they were not answering. Scoping the READ (`approvalBelongsTo`) without scoping this
+ * left the sharper half open.
+ *
+ * BRANCH 1 IS DELIBERATELY NOT SCOPED. The id is the app's own binding between a card and one call,
+ * and the approve-button replay (`services/conciergeApprovalResume`) re-dispatches under that id
+ * with no caller of its own; requiring a requester match there would refuse the human's own click.
+ *
+ * TWO BLANKS STILL MATCH, exactly as in {@link requestApproval}'s live-question match: two callers
+ * that cannot be identified cannot be told apart, and that is the pre-existing behaviour rather
+ * than a new hole. It is also what keeps a legacy raiser that never stamped a requester spendable
+ * by the same legacy retry.
  */
 export function claimApproval(
   id: string,
   fingerprint: string,
   now: number = Date.now(),
+  /** The caller trying to spend, as {@link ConciergeToolCall.callerAgentId} stamped it. Defaults to
+   *  the unattributed reader, which can redeem only an unattributed grant. */
+  callerAgentId: string = "",
 ): boolean {
   const swept = sweepAndAnnounce(useConciergeApprovals.getState().entries, now);
   const spendable = (e: ConciergeApproval) =>
@@ -592,7 +671,12 @@ export function claimApproval(
     }
     target = byId;
   } else {
-    target = swept.find((e) => spendable(e) && e.fingerprint === fingerprint);
+    // Normalised the same way the entry's own `requestedBy` was at raise, so this compares like
+    // with like rather than missing on whitespace and silently falling through to no match.
+    const reader = typeof callerAgentId === "string" ? callerAgentId.trim() : "";
+    target = swept.find(
+      (e) => spendable(e) && e.fingerprint === fingerprint && e.requestedBy === reader,
+    );
   }
 
   if (!target) {
@@ -644,6 +728,26 @@ export function pendingApprovals(
   now: number = Date.now(),
 ): readonly ConciergeApproval[] {
   return entries.filter((e) => e.outcome === "pending" && isLive(e, now) && !e.spent);
+}
+
+/**
+ * Is this entry the caller's OWN question? The one test every agent-facing read must apply.
+ *
+ * FAILS CLOSED ON A BLANK EITHER SIDE, and that is the whole guard rather than a defensive extra.
+ * An unattributed entry (`requestedBy === ""` — a raiser that could not name its caller) and an
+ * unidentified reader (a dispatch that arrived without a stamped caller id) are the two ways the
+ * check could be skipped, and skipping it is exactly the delivery this exists to stop. Neither is a
+ * match, so neither can see anything.
+ *
+ * Deliberately an EXACT string comparison and nothing cleverer. There is no hierarchy here: an
+ * orchestrator is not entitled to its worker's approvals, and the concierge is not entitled to an
+ * agent's, because the argument block on a card is the payload of a call somebody else composed.
+ */
+export function approvalBelongsTo(a: ConciergeApproval, callerAgentId: string): boolean {
+  const asked = typeof a.requestedBy === "string" ? a.requestedBy.trim() : "";
+  const reader = typeof callerAgentId === "string" ? callerAgentId.trim() : "";
+  if (asked === "" || reader === "") return false;
+  return asked === reader;
 }
 
 /** Read one entry without changing anything — for tests and for asserting a state transition. */

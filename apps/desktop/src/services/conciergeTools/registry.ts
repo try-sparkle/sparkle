@@ -415,6 +415,20 @@ export interface ConciergeToolCall {
   /** Minted by the MCP server (crypto.randomUUID) — NEVER supplied by the model. It is what a PTY
    *  write is attributed to, so a blank one costs the write. */
   toolCallId: string;
+  /**
+   * WHO IS CALLING — the identity the APP stamped, never a value the model sent (bead
+   * `sparkle-tavx1`). Rust mints it from WHICH SOCKET the request arrived on; `controlListener`
+   * forwards it verbatim. An `AgentTab.id`, or the reserved `sparkle:concierge`.
+   *
+   * Carried so a domain can scope a per-caller surface to its own caller. Today exactly one does —
+   * `approvals`, whose two ops promise "your own" and used to answer from one app-wide ledger, so a
+   * question raised for agent A was delivered into agent B's transcript.
+   *
+   * OPTIONAL BECAUSE IT ARRIVES OFF A WIRE, not because it is optional to check: an absent one is
+   * normalised to `""` and every read that consults it treats `""` as "nobody", which matches
+   * nothing. A caller that cannot be identified is served no per-caller data at all.
+   */
+  callerAgentId?: string;
 }
 
 export interface ConciergeToolOk {
@@ -506,6 +520,16 @@ export interface ToolPolicyQuery {
    * A policy with no side effects may ignore this entirely; `permissiveToolPolicy` does.
    */
   raiseApproval?: boolean;
+  /**
+   * The stamped caller identity, forwarded from {@link ConciergeToolCall.callerAgentId}.
+   *
+   * The policy is where an ask-tier call becomes a CARD (`policyBinding`'s `resolveAskTier` →
+   * `requestApproval`), so this is the only moment at which the question can be told whose it is.
+   * Recording it there is what lets the agent-facing read refuse to hand one caller's pending
+   * question to another (bead `sparkle-tavx1`). A policy with no ask tier may ignore it;
+   * `permissiveToolPolicy` does.
+   */
+  callerAgentId?: string;
 }
 
 /** The seam. Pure: a query in, a decision out. `services/conciergeTools/policy.ts`'s
@@ -535,6 +559,9 @@ interface OpContext {
   domain: string;
   op: string;
   toolCallId: string;
+  /** The stamped caller, normalised to `""` when the call carried none. See
+   *  {@link ConciergeToolCall.callerAgentId}. */
+  callerAgentId: string;
   decision: ToolPolicyDecision;
 }
 
@@ -2166,9 +2193,16 @@ const BOARD_ROUTES: Record<BoardOp, Handler> = {
 
 const approvalIdArgs = z.object({ id: z.string().min(1, "an approval id is required") }).strict();
 
+// BOTH OPS TAKE `ctx.callerAgentId`, and that is the whole of bead `sparkle-tavx1`'s fix at this
+// layer. The domain answers "your own" from the identity the app stamped rather than from the whole
+// ledger; see approvals.ts's header for what was being delivered before.
 const APPROVALS_ROUTES: Record<ApprovalsOp, Handler> = {
-  list_pending_approvals: route(noArgs, (_a, ctx) => fromApprovals(ctx, listPendingApprovals())),
-  get_approval: route(approvalIdArgs, (a, ctx) => fromApprovals(ctx, getApproval(a.id))),
+  list_pending_approvals: route(noArgs, (_a, ctx) =>
+    fromApprovals(ctx, listPendingApprovals(ctx.callerAgentId)),
+  ),
+  get_approval: route(approvalIdArgs, (a, ctx) =>
+    fromApprovals(ctx, getApproval(a.id, ctx.callerAgentId)),
+  ),
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -2916,6 +2950,10 @@ export async function dispatchConciergeTool(
   const domain = typeof call?.domain === "string" ? call.domain : "";
   const op = typeof call?.op === "string" ? call.op : "";
   const toolCallId = typeof call?.toolCallId === "string" ? call.toolCallId : "";
+  // Normalised ONCE, here, for the same reason everything else on this line is: the call arrives as
+  // JSON a model's client assembled, and a non-string caller id is as possible as an absent one.
+  // Both mean "nobody could be identified", which every per-caller read treats as matching nothing.
+  const callerAgentId = typeof call?.callerAgentId === "string" ? call.callerAgentId : "";
   try {
     if (!isDomain(domain)) {
       return bareErr(
@@ -2947,7 +2985,7 @@ export async function dispatchConciergeTool(
     // parse. Both refusals below leave the approval ledger untouched, which is the whole point of
     // the change: see this function's gate-order docstring for the incident.
     const preflight = parseArgs(
-      { domain, op, toolCallId, decision: { tier: "allow" } },
+      { domain, op, toolCallId, callerAgentId, decision: { tier: "allow" } },
       handler.schema,
       call.args,
     );
@@ -2960,6 +2998,7 @@ export async function dispatchConciergeTool(
         op,
         write,
         toolCallId,
+        callerAgentId,
         args: call.args,
         raiseApproval: false,
       });
@@ -3013,12 +3052,16 @@ export async function dispatchConciergeTool(
       op,
       write,
       toolCallId,
+      // WHOSE QUESTION THIS WILL BE, if the policy raises one. The card is minted inside this call
+      // (`policyBinding`'s `resolveAskTier`), so passing it here is what stamps the entry — bead
+      // `sparkle-tavx1`.
+      callerAgentId,
       args: call.args,
       // THE SUPPRESSION. Spread rather than passed as `undefined` so that an ordinary call's query
       // is byte-for-byte what it always was, and only a refused relay carries the flag.
       ...(relayRefusal ? { raiseApproval: false as const } : {}),
     });
-    const ctx: OpContext = { domain, op, toolCallId, decision };
+    const ctx: OpContext = { domain, op, toolCallId, callerAgentId, decision };
     if (relayRefusal) {
       log.warn("concierge-tools", "send refused — unaddressed relay of the founder's words", {
         domain,

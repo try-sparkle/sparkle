@@ -31,7 +31,9 @@ import {
   type ConciergeApproval,
 } from "../../stores/conciergeApprovals";
 import { setConciergeChat } from "../../stores/conciergeThreadStore";
+import { useProjectStore } from "../../stores/projectStore";
 import { ApprovalPrompt } from "./ApprovalPrompt";
+import { resolveRequesterLabels } from "./approvalRequesterLabels";
 
 /**
  * How often the list re-checks its own deadlines.
@@ -59,11 +61,22 @@ export function ConciergeApprovals() {
     return () => clearInterval(h);
   }, [anyPending]);
 
+  // WHO ASKED, in names rather than ids (bead `sparkle-tavx1`). Resolved HERE because the card is
+  // purely presentational and reads no stores, and over the PENDING SET rather than per agent —
+  // agent names are not unique across projects, so a name is only a discriminator once it has been
+  // checked against the other cards on screen. See `approvalRequesterLabels.ts`.
+  const projects = useProjectStore((s) => s.projects);
+
   const pending = useMemo(
     () => pendingApprovals(entries),
     // `tick` is a deliberate dependency: it is the only thing that changes when a deadline passes.
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [entries, tick],
+  );
+
+  const requesterLabels = useMemo(
+    () => resolveRequesterLabels(pending, projects),
+    [pending, projects],
   );
 
   /**
@@ -124,6 +137,7 @@ export function ConciergeApprovals() {
   return (
     <ApprovalPrompt
       approvals={pending}
+      requesterLabels={requesterLabels}
       onApprove={onApprove}
       onDecline={denyApproval}
       onAlwaysAllow={onAlwaysAllow}

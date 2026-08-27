@@ -422,6 +422,7 @@ function seedApproval(id: string, guard: ReturnType<typeof publishApprovalGuard>
   useConciergeApprovals.getState().replace([
     {
       id,
+      requestedBy: "sparkle:concierge",
       domain: "publish",
       op: "publish_go_live",
       summary: "",

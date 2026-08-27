@@ -15,6 +15,7 @@ afterEach(() => cleanup());
 function approval(over: Partial<ConciergeApproval> = {}): ConciergeApproval {
   return {
     id: "call-1",
+    requestedBy: "sparkle:concierge",
     domain: "lifecycle",
     op: "discard_agent",
     summary: "Throw the agent's work away.",
@@ -34,6 +35,70 @@ function approval(over: Partial<ConciergeApproval> = {}): ConciergeApproval {
 }
 
 describe("ApprovalPrompt", () => {
+  // TWO IDENTICAL CARDS ARE NOW REPRESENTABLE (bead `sparkle-tavx1`). The ledger collapses a repeat
+  // per REQUESTER, so two agents asking the same thing put two cards here with the same domain, op,
+  // summary and arguments. If the card cannot say who asked, the human is answering a coin flip.
+  describe("names the caller that raised it", () => {
+    it("tells two byte-identical cards apart by their asker", () => {
+      render(
+        <ApprovalPrompt
+          approvals={[
+            approval({ id: "call-a", requestedBy: "agent-a" }),
+            approval({ id: "call-b", requestedBy: "agent-b" }),
+          ]}
+          // Keyed by APPROVAL id — see the prop's doc for why a requester-keyed map cannot
+          // disambiguate two unattributed cards at all.
+          requesterLabels={{ "call-a": "Kraken Auth", "call-b": "Stripe Checkout" }}
+          onApprove={vi.fn()}
+          onDecline={vi.fn()}
+          onAlwaysAllow={vi.fn()}
+        />,
+      );
+      // Both cards are up — an assertion that only found one name would pass just as well if the
+      // second card had never rendered.
+      const cards = screen.getAllByTestId("approval-card");
+      expect(cards).toHaveLength(2);
+      // …and each names ITS OWN asker, which is stronger than "a name appears somewhere".
+      expect(within(cards[0]!).getByTestId("approval-requester").textContent).toContain(
+        "Kraken Auth",
+      );
+      expect(within(cards[1]!).getByTestId("approval-requester").textContent).toContain(
+        "Stripe Checkout",
+      );
+    });
+
+    it("falls back to the raw id for an agent it cannot name, rather than to nothing", () => {
+      // An agent can be torn down while its question is still on screen. The id is ugly and still
+      // discriminates one card from another, which is the whole job of this line.
+      render(
+        <ApprovalPrompt
+          approvals={[approval({ requestedBy: "agent-gone" })]}
+          requesterLabels={{}}
+          onApprove={vi.fn()}
+          onDecline={vi.fn()}
+          onAlwaysAllow={vi.fn()}
+        />,
+      );
+      expect(screen.getByTestId("approval-requester").textContent).toContain("agent-gone");
+    });
+
+    it("says an unattributed card is unattributed instead of blaming the app", () => {
+      render(
+        <ApprovalPrompt
+          approvals={[approval({ requestedBy: "" })]}
+          onApprove={vi.fn()}
+          onDecline={vi.fn()}
+          onAlwaysAllow={vi.fn()}
+        />,
+      );
+      // The ledger treats a blank requester as belonging to nobody — no agent may read it, only the
+      // human may answer it. The card must state that, not invent an owner.
+      expect(screen.getByTestId("approval-requester").textContent).toContain(
+        "an unidentified caller",
+      );
+    });
+  });
+
   it("renders nothing when nothing is pending", () => {
     const { container } = render(
       <ApprovalPrompt approvals={[]} onApprove={vi.fn()} onDecline={vi.fn()} onAlwaysAllow={vi.fn()} />,

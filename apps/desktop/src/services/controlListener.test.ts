@@ -5605,12 +5605,16 @@ describe("controlListener", () => {
       });
       await flush();
       expect(dispatchConciergeToolMock).toHaveBeenCalledTimes(1);
-      // The frozen wire contract, unchanged in both directions.
+      // The frozen wire contract, unchanged in both directions — plus the caller identity, which
+      // joined it for bead `sparkle-tavx1`. Asserted by exact shape rather than `toMatchObject` so
+      // that dropping the forward would go red here: it is what stamps whose question an ask-tier
+      // call becomes, and an approval nobody is named on is readable by no agent at all.
       expect(dispatchConciergeToolMock.mock.calls[0]![0]).toEqual({
         domain: "workspace",
         op: "list_projects",
         args: { some: "args" },
         toolCallId: "tc-42",
+        callerAgentId: CONCIERGE_CALLER_AGENT_ID,
       });
       // The seam is CONNECTED — the human's configured policy is handed to the registry, not the
       // permissive default. Without this assertion the wiring can be deleted silently.
@@ -5811,6 +5815,9 @@ describe("controlListener", () => {
             op,
             args: { a: 1 },
             toolCallId: `tc-${op}`,
+            // The carve-out reaches the registry as ITSELF, not as the concierge — so a card it
+            // raises is addressed to it (bead `sparkle-tavx1`).
+            callerAgentId: SPARKLE_AGENT_ID,
           });
           expect(dispatchConciergeToolMock.mock.calls[0]![1]).toEqual({ policy: configuredToolPolicy });
           expect(lastReply().ok).toBe(true);
@@ -5959,6 +5966,8 @@ describe("controlListener", () => {
           op: "resume_worker",
           args: { agentId: otherId },
           toolCallId: "tc-owr",
+          // The ORCHESTRATOR's own id, not the worker's: the question belongs to whoever asked it.
+          callerAgentId: callerId,
         });
         expect(lastReply().ok).toBe(true);
       });

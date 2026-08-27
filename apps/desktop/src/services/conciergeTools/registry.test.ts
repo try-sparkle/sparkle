@@ -858,6 +858,9 @@ describe("dispatchConciergeTool — the policy seam", () => {
       write: false,
       toolCallId: TOOL_CALL_ID,
       args: {},
+      // Normalised to "" because this fixture's call carries no caller. That is the fail-closed
+      // value, not a placeholder: an unidentified caller matches no approval (bead `sparkle-tavx1`).
+      callerAgentId: "",
     });
     expect(seen[1]).toMatchObject({ op: "quit_app", write: true });
     // The RAW args, forwarded verbatim and unparsed — an ask-tier policy needs them to scope one

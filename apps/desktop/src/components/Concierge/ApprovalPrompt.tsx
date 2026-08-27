@@ -18,15 +18,37 @@
 // it would run with. All of that prose comes from `policy.ts`'s tables by way of the ledger entry —
 // nothing is written here, so the card cannot drift from the classification it is quoting.
 import type { CSSProperties } from "react";
-import { FiAlertTriangle, FiCheck, FiRepeat, FiSettings, FiX } from "react-icons/fi";
+import { FiAlertTriangle, FiCheck, FiRepeat, FiSettings, FiUser, FiX } from "react-icons/fi";
 
 import { C, CHAT_USER_BUBBLE, FONT_WEIGHT } from "../../theme/colors";
 import type { ConciergeApproval } from "../../stores/conciergeApprovals";
+import { UNIDENTIFIED_CALLER } from "./approvalRequesterLabels";
 
 import { FONT_MONO, RADIUS, TYPE } from "../../theme/scale";
 export interface ApprovalPromptProps {
   /** Every unanswered request, oldest first (stores/conciergeApprovals.pendingApprovals). */
   approvals: readonly ConciergeApproval[];
+  /**
+   * `approval.id` → the name of the caller that raised it. Supplied by the container, because this
+   * component reads no stores (see the header) and an agent's display name lives in `projectStore`.
+   *
+   * KEYED BY APPROVAL, NOT BY REQUESTER. Two unattributed entries share the empty requester string,
+   * so a requester-keyed map could not give them different labels at all — and agent NAMES are not
+   * unique either (`defaultAgentName` numbers within one project, while this column is app-global),
+   * so the disambiguation has to happen over the cards on screen. `approvalRequesterLabels.ts` does
+   * it; this component only renders the answer.
+   *
+   * WHY THE CARD MUST NAME THE ASKER (bead `sparkle-tavx1`). The ledger collapses a repeated
+   * question onto one card PER REQUESTER, so two agents making byte-identical calls now put TWO
+   * cards on this column — same domain, same op, same summary, same argument lines. `subject` does
+   * not separate them either: it names what the call ACTS ON, not who asked. Without this line the
+   * human is shown two identical prompts, cannot tell which agent they are answering, and the whole
+   * gate here is that they read what they are agreeing to.
+   *
+   * A MISSING ENTRY IS NOT AN ERROR — an id with no name resolves to the id itself, which is still
+   * a discriminator, and an agent can be torn down while its question is still on screen.
+   */
+  requesterLabels?: Readonly<Record<string, string>>;
   /** Takes the whole entry, not just its id, because approving now RUNS the call and the runner
    *  replays it from the entry's own stored arguments (services/conciergeApprovalResume). */
   onApprove: (approval: ConciergeApproval) => void;
@@ -46,6 +68,7 @@ const ACCENT = C.sienna;
 
 export function ApprovalPrompt({
   approvals,
+  requesterLabels,
   onApprove,
   onDecline,
   onAlwaysAllow,
@@ -59,6 +82,7 @@ export function ApprovalPrompt({
         <ApprovalCard
           key={a.id}
           approval={a}
+          requesterLabels={requesterLabels}
           onApprove={onApprove}
           onDecline={onDecline}
           onAlwaysAllow={onAlwaysAllow}
@@ -70,6 +94,7 @@ export function ApprovalPrompt({
 
 function ApprovalCard({
   approval,
+  requesterLabels,
   onApprove,
   onDecline,
   onAlwaysAllow,
@@ -89,6 +114,14 @@ function ApprovalCard({
         </span>
         {approval.riskClass && <span style={riskPill}>{approval.riskClass}</span>}
         <span style={opName}>{`${approval.domain}.${approval.op}`}</span>
+      </div>
+
+      {/* WHO IS ASKING. Read the prop's own doc for why this is not decoration: the ledger now
+          mints one card per REQUESTER, so two agents asking the same thing put two identical cards
+          here, and this is the only line that tells them apart. */}
+      <div data-testid="approval-requester" style={requesterNote}>
+        <FiUser size={11} aria-hidden />
+        <span>Asked by {requesterLabels?.[approval.id] ?? unresolvedLabel(approval.requestedBy)}</span>
       </div>
 
       {/* ALREADY RAN? Say it before anything else on the card. The commonest way to arrive here is
@@ -220,6 +253,30 @@ const opName: CSSProperties = {
 
 // Deliberately louder than the risk note and quieter than the buttons: it is a correction to the
 // reader's assumption, not a new risk. Same sienna the card already uses.
+/**
+ * The asker when the container resolved no label for this card — a caller-side fallback only, so
+ * the component stays renderable on its own.
+ *
+ * BLANK IS ITS OWN ANSWER, not a missing name. An entry with no `requestedBy` is one the raiser
+ * could not attribute, and the ledger treats it as belonging to nobody — no agent can read it, only
+ * the human can answer it. Saying so states that; falling back to the app's own name would assert
+ * something the ledger does not know. An unknown id falls back to the id itself, which still
+ * discriminates one card from another.
+ */
+function unresolvedLabel(requestedBy: string): string {
+  const id = (requestedBy ?? "").trim();
+  return id === "" ? UNIDENTIFIED_CALLER : id;
+}
+
+const requesterNote: CSSProperties = {
+  display: "flex",
+  alignItems: "center",
+  gap: 5,
+  marginTop: 4,
+  fontSize: TYPE.small,
+  color: C.conciergeMuted,
+};
+
 const ranNote: CSSProperties = {
   display: "flex",
   alignItems: "center",

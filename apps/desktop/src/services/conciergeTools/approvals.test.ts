@@ -17,6 +17,13 @@ import { APPROVALS_OPS, APPROVALS_RISK, listPendingApprovals, getApproval } from
 
 const NOW = 1_000_000;
 
+/** The caller every fixture below belongs to. Named rather than inlined because these two ops now
+ *  take a caller identity, and a bare string at each call site reads as noise rather than as the
+ *  thing being matched. The CROSS-caller cases — one agent's prompt must not reach another's
+ *  transcript — live in `approvalRouting.test.ts`, which drives the real dispatch with both
+ *  agents mounted rather than seeding the store directly (bead `sparkle-tavx1`). */
+const CALLER = "agent-a";
+
 // ---------------------------------------------------------------------------------------------
 // Import-shape helpers for the self-approval guard at the bottom of this file
 // ---------------------------------------------------------------------------------------------
@@ -26,6 +33,9 @@ const NOW = 1_000_000;
 const ALLOWED_STORE_IMPORTS = [
   "pendingApprovals",
   "findApproval",
+  // The one test every agent-facing read applies — a pure predicate over an entry, with no way to
+  // change one. Allowed for the same reason `pendingApprovals` is: it reads, it cannot approve.
+  "approvalBelongsTo",
   "ConciergeApproval",
   "ApprovalOutcome",
   "ApprovalArgLine",
@@ -60,6 +70,7 @@ function importedNames(clause: string): string[] {
 function approval(id: string, over: Partial<ConciergeApproval> = {}): ConciergeApproval {
   return {
     id,
+    requestedBy: CALLER,
     domain: "workflow",
     op: "merge_pr",
     summary: "Merge a pull request",
@@ -97,7 +108,7 @@ describe("list_pending_approvals", () => {
   it("returns what is waiting on the human, with the prose the card shows them", () => {
     seed(approval("a"));
 
-    const r = listPendingApprovals(NOW);
+    const r = listPendingApprovals(CALLER, NOW);
     expect(r.ok).toBe(true);
     if (!r.ok) return;
     expect(r.data).toHaveLength(1);
@@ -117,16 +128,16 @@ describe("list_pending_approvals", () => {
   it("omits requests whose window closed, rather than reporting them as still pending", () => {
     seed(approval("stale"));
 
-    const before = listPendingApprovals(NOW);
+    const before = listPendingApprovals(CALLER, NOW);
     expect(before.ok && before.data).toHaveLength(1);
-    const after = listPendingApprovals(NOW + APPROVAL_REQUEST_TTL_MS + 1);
+    const after = listPendingApprovals(CALLER, NOW + APPROVAL_REQUEST_TTL_MS + 1);
     expect(after.ok && after.data).toEqual([]);
   });
 
   it("omits an approval that has already been spent", () => {
     seed(approval("used", { outcome: "approved", spent: true, resolvedAt: NOW }));
 
-    const r = listPendingApprovals(NOW);
+    const r = listPendingApprovals(CALLER, NOW);
     expect(r.ok && r.data).toEqual([]);
   });
 });
@@ -137,7 +148,7 @@ describe("get_approval", () => {
   it("reads a RESOLVED approval, so the outcome is observable without asking the human", () => {
     seed(approval("done", { outcome: "approved", resolvedAt: NOW + 5 }));
 
-    const r = getApproval("done", NOW + 10);
+    const r = getApproval("done", CALLER, NOW + 10);
     expect(r.ok).toBe(true);
     if (!r.ok) return;
     expect(r.data.outcome).toBe("approved");
@@ -148,13 +159,13 @@ describe("get_approval", () => {
   it("distinguishes an approved-but-spent grant from a fresh one", () => {
     seed(approval("spent", { outcome: "approved", spent: true, resolvedAt: NOW }));
 
-    const r = getApproval("spent", NOW);
+    const r = getApproval("spent", CALLER, NOW);
     // approved AND spent — single-use, so this is not permission to run it again.
     expect(r.ok && [r.data.outcome, r.data.spent]).toEqual(["approved", true]);
   });
 
   it("refuses an id it does not hold rather than returning an empty success", () => {
-    const r = getApproval("ghost", NOW);
+    const r = getApproval("ghost", CALLER, NOW);
     expect(r.ok).toBe(false);
     // "I can't find it" and "they said no" must not read the same to a model deciding to retry.
     if (!r.ok) expect(r.reason).toBe("unknown-approval");
@@ -162,7 +173,7 @@ describe("get_approval", () => {
 
   it("reports a denial as a denial", () => {
     seed(approval("no", { outcome: "denied", resolvedAt: NOW + 1 }));
-    const r = getApproval("no", NOW + 2);
+    const r = getApproval("no", CALLER, NOW + 2);
     expect(r.ok && r.data.outcome).toBe("denied");
   });
 });

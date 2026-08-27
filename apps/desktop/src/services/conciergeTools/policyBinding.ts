@@ -22,8 +22,9 @@
  *
  *   1. TRY TO SPEND an approval a human already gave for this exact call
  *      (`claimApproval`). Single-use, time-boxed, and matched by tool-call id OR by the call's
- *      identity — the domain, the op, and the exact arguments the human was shown. It returns
- *      `true` only where somebody pressed a button; every ambiguous path is `false`.
+ *      identity — the domain, the op, the exact arguments the human was shown, AND the caller that
+ *      raised it. It returns `true` only where somebody pressed a button; every ambiguous path is
+ *      `false`.
  *   2. Otherwise RAISE THE QUESTION (`requestApproval`) so the concierge column can show it, and
  *      report `approvedByUser: false` — which is the truthful outcome: the human asked to be
  *      consulted and has not answered yet.
@@ -183,6 +184,16 @@ interface AskContext {
   /** The MCP-minted `toolCallId`, or the Rust-minted `reqId` for a legacy control op. Never a
    *  model-supplied string. A blank one can spend nothing and raise nothing — fail closed. */
   id: string;
+  /**
+   * WHOSE CALL THIS IS — stamped onto the card so the agent-facing read can tell one caller's
+   * pending question from another's (bead `sparkle-tavx1`).
+   *
+   * Like `id`, it is the APP's answer and never the model's: Rust mints it from which socket the
+   * request arrived on. Both entry points into {@link resolveAskTier} supply it — `configuredToolPolicy`
+   * off the dispatch's `callerAgentId`, `controlOpPolicy` off the control request's — and a blank
+   * one is recorded verbatim, producing an entry the human can still answer and no agent can read.
+   */
+  requestedBy?: string;
   domain: string;
   op: string;
   /** The model's raw arguments. Used ONLY to compute the call's identity and to render the prompt;
@@ -227,7 +238,10 @@ function resolveAskTier(c: AskContext): ToolPolicyDecision {
   // The approval is BOUND to this call's id, so `conciergeToolAuthority` refuses if it is ever
   // presented for a different call. Belt and braces with the ledger's own single-use claim: the
   // ledger stops it being spent twice, this stops it being spent on something else.
-  if (claimApproval(c.id, fingerprint)) {
+  // THE REQUESTER IS PASSED EXPLICITLY, not left to the parameter's default. `claimApproval`'s
+  // identity branch is the only way a retry can spend a grant, and without the caller it would spend
+  // ANY agent's — see the ledger's own docstring for the delivery that closes (bead `sparkle-tavx1`).
+  if (claimApproval(c.id, fingerprint, Date.now(), c.requestedBy ?? "")) {
     return { tier: "ask", approvedByUser: true, approvedForToolCallId: c.id };
   }
 
@@ -261,6 +275,10 @@ function resolveAskTier(c: AskContext): ToolPolicyDecision {
 
   requestApproval({
     id: c.id,
+    // WHO ASKED. Carried onto the entry because it cannot be recovered afterwards — the ledger
+    // outlives the turn, exactly as with `relayedFounderWords` and `subject` below. See the
+    // store's own field doc for the delivery this closes (bead `sparkle-tavx1`).
+    requestedBy: c.requestedBy ?? "",
     domain: c.domain,
     op: c.op,
     // Both strings come from `policy.ts`'s own tables. Nothing new is written here: a second
@@ -477,6 +495,7 @@ export const configuredToolPolicy: ConciergeToolPolicy = (q: ToolPolicyQuery) =>
   }
   return resolveAskTier({
     id: q.toolCallId,
+    requestedBy: q.callerAgentId,
     domain: q.domain,
     op: q.op,
     args: q.args,
@@ -503,7 +522,7 @@ export const configuredToolPolicy: ConciergeToolPolicy = (q: ToolPolicyQuery) =>
  */
 export function appOpPolicy(
   op: string,
-  ctx?: { requestId?: string; args?: unknown },
+  ctx?: { requestId?: string; args?: unknown; callerAgentId?: string },
 ): ToolPolicyDecision {
   return controlOpPolicy("app", op, ctx);
 }
@@ -526,7 +545,7 @@ export function appOpPolicy(
  */
 export function chiefOpPolicy(
   op: ChiefOp,
-  ctx?: { requestId?: string; args?: unknown },
+  ctx?: { requestId?: string; args?: unknown; callerAgentId?: string },
 ): ToolPolicyDecision {
   return controlOpPolicy("chief", op, ctx);
 }
@@ -536,7 +555,7 @@ export function chiefOpPolicy(
 function controlOpPolicy(
   domain: string,
   op: string,
-  ctx?: { requestId?: string; args?: unknown },
+  ctx?: { requestId?: string; args?: unknown; callerAgentId?: string },
 ): ToolPolicyDecision {
   const { evaluation, held } = evaluateWithHydrationHold(op, ctx?.args);
   if (held) return HYDRATION_HOLD;
@@ -545,6 +564,11 @@ function controlOpPolicy(
   }
   return resolveAskTier({
     id: ctx?.requestId ?? "",
+    // THE CONTROL-OP HALF of bead `sparkle-tavx1`. This is the entry point EVERY agent can reach
+    // (`concierge_tool` is concierge-only; the app and chief ops are not), so it is the one that can
+    // put another caller's question into the shared ledger — and therefore the one that most needs
+    // the question to remember whose it was.
+    requestedBy: ctx?.callerAgentId ?? "",
     domain,
     op,
     args: ctx?.args,

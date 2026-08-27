@@ -3564,7 +3564,19 @@ async function handleConciergeTool(req: ControlRequest): Promise<ConciergeToolRe
     // why the default is a NAMED export rather than an inline `() => ({ tier: "allow" })`: a missing
     // policy is visible in review instead of looking like the intended behaviour.
     const reply = await dispatchConciergeTool(
-      { domain, op, args: req.payload.args, toolCallId },
+      {
+        domain,
+        op,
+        args: req.payload.args,
+        toolCallId,
+        // WHO IS ASKING, stamped by Rust from the socket the request arrived on — never a value the
+        // model sent. Forwarded so an ask-tier call's approval card records whose question it is,
+        // and so the `approvals` domain can answer "your own" instead of reading the whole app-wide
+        // ledger (bead `sparkle-tavx1`). The concierge is the ordinary caller here, but not the
+        // only one: the two carve-outs above (Improve Sparkle's publish drafts, an orchestrator's
+        // `resume_worker`) reach this line with their own ids.
+        callerAgentId: req.callerAgentId,
+      },
       { policy: configuredToolPolicy },
     );
     ok = reply.ok === true;
@@ -4510,6 +4522,10 @@ async function dispatch(req: ControlRequest): Promise<void> {
         const decision = chief
           ? chiefOpPolicy(policyOp as ChiefOp, {
               requestId: req.reqId,
+              // Whose question the card will be, if this raises one — bead `sparkle-tavx1`. Every
+              // agent can reach a control op, so without this the ledger cannot tell two callers'
+              // pending requests apart and the agent-facing read hands one to the other.
+              callerAgentId: req.callerAgentId,
               args: {
                 [CHIEF_CALL_TOOL_ARG]: chief.tool,
                 arguments: chief.args,
@@ -4521,7 +4537,11 @@ async function dispatch(req: ControlRequest): Promise<void> {
                 project: chief.requested,
               },
             })
-          : appOpPolicy(req.op, { requestId: req.reqId, args: req.payload });
+          : appOpPolicy(req.op, {
+              requestId: req.reqId,
+              callerAgentId: req.callerAgentId,
+              args: req.payload,
+            });
         if (decision.tier === "deny") {
           // Distinguish "the human switched this off" from "nobody classified this op" — the second
           // is a BUG, and blaming a Settings toggle the human never touched sends them hunting for a

@@ -140,6 +140,41 @@ describe("conciergeApprovals — the ledger that makes `ask` mean something", ()
       expect(findApproval("call-2")?.spent).toBe(true);
       expect(claimApproval("retry-c", req.fingerprint, T0 + 6)).toBe(false);
     });
+
+    // THE SPENDING HALF of bead `sparkle-tavx1`. The identity branch is the only way a retry ever
+    // spends a grant, and a fingerprint says nothing about who asked — so without the requester in
+    // the key, the human's click on agent A's card is redeemable by agent B.
+    it("refuses a retry from a DIFFERENT caller, and still honours one from the caller that asked", () => {
+      const req = ask("call-a", { requestedBy: "agent-a" });
+      approveApproval("call-a", T0 + 1);
+
+      // Byte-identical call, different agent, fresh id — the exact shape the fingerprint branch
+      // exists to serve, and the exact shape it must not serve across callers.
+      expect(claimApproval("retry-b", req.fingerprint, T0 + 2, "agent-b")).toBe(false);
+      // NOT merely absent: the grant is untouched, so the agent the human actually answered can
+      // still spend it. An assertion that only proved B was refused would also pass if approving
+      // had granted nothing at all.
+      expect(findApproval("call-a")?.spent).toBe(false);
+      expect(claimApproval("retry-a", req.fingerprint, T0 + 3, "agent-a")).toBe(true);
+      expect(findApproval("call-a")?.spent).toBe(true);
+    });
+
+    it("refuses an UNIDENTIFIED retry of an attributed grant, and vice versa", () => {
+      const req = ask("call-a", { requestedBy: "agent-a" });
+      approveApproval("call-a", T0 + 1);
+      // A dispatch that arrived with no stamped caller is nobody, and nobody owns this grant.
+      expect(claimApproval("retry-anon", req.fingerprint, T0 + 2)).toBe(false);
+      expect(findApproval("call-a")?.spent).toBe(false);
+    });
+
+    it("still lets an unattributed retry spend an unattributed grant — the pre-existing shape", () => {
+      // Two blanks match, exactly as in `requestApproval`'s live-question match: a raiser that could
+      // not name its caller must stay spendable by the retry of that same call, or scoping the key
+      // would silently kill every legacy grant instead of scoping it.
+      const req = ask("call-1");
+      approveApproval("call-1", T0 + 1);
+      expect(claimApproval("retry-fresh-uuid", req.fingerprint, T0 + 2)).toBe(true);
+    });
   });
 
   describe("fails CLOSED on every ambiguous path", () => {

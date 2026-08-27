@@ -116,6 +116,7 @@ function renderBlockedCard() {
 function pendingApproval(): ConciergeApproval {
   return {
     id: "call-1",
+    requestedBy: "sparkle:concierge",
     domain: "lifecycle",
     op: "discard_agent",
     summary: "Throw the agent's work away.",

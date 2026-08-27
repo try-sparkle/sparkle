@@ -20,9 +20,33 @@
 // `deny` is not offered either, for a smaller reason: it has no use the concierge can't get by
 // simply not retrying, and offering only the negative half of a decision invites a model to "tidy
 // up" requests the human hasn't looked at yet.
+//
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+// "YOUR OWN" IS ENFORCED, NOT DESCRIBED (bead `sparkle-tavx1`).
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+//
+// The tool's own description has always promised "See YOUR OWN pending approval requests", and for
+// a long time this module answered it out of `stores/conciergeApprovals`' ONE app-wide array with
+// no test of who was asking. Every caller therefore saw every caller's questions. The reported
+// failure is the sharp end of it: a permission prompt raised for one agent's `sparkle_fleet` send
+// arrived in a DIFFERENT agent's transcript, framed as awaiting that agent's decision and carrying
+// the peer-message text of a call it had never composed.
+//
+// Both ops now take the caller identity the app stamped (`req.callerAgentId`, minted by Rust from
+// which socket the request arrived on — never anything the model supplied) and compare it against
+// the `requestedBy` the ledger recorded at raise. The check lives in the store
+// (`approvalBelongsTo`) so the two ops cannot drift apart, and it fails closed on a blank on either
+// side: an unattributed entry and an unidentified reader are both "no match", which is the only
+// direction in which being wrong is cheap.
+//
+// FILTERED, NOT REFUSED, FOR THE LIST — a caller with nothing pending gets an honest empty list, the
+// same answer it would get if the other agent's card did not exist. `get_approval` is the opposite
+// and REFUSES by id, with its own reason: "that is not yours" and "I have never heard of it" are
+// different facts, and a model that cannot tell them apart will retry the one that can never work.
 import {
   pendingApprovals,
   findApproval,
+  approvalBelongsTo,
   type ConciergeApproval,
   type ApprovalOutcome,
   type ApprovalArgLine,
@@ -140,10 +164,17 @@ function viewOf(a: ConciergeApproval, now: number): ApprovalView {
  * `pendingApprovals` takes the LEDGER first and the clock second; it is left to default to the live
  * store so this stays a read of what the human is actually looking at.
  */
-export function listPendingApprovals(now: number = Date.now()): ApprovalsResult<ApprovalView[]> {
+export function listPendingApprovals(
+  callerAgentId: string,
+  now: number = Date.now(),
+): ApprovalsResult<ApprovalView[]> {
   return ok(
     "list_pending_approvals",
-    pendingApprovals(undefined, now).map((a) => viewOf(a, now)),
+    pendingApprovals(undefined, now)
+      // THE SCOPE. Applied to what is RETURNED, not to what the human is shown — the column reads
+      // the same ledger unfiltered, because there is one human and every card is theirs to answer.
+      .filter((a) => approvalBelongsTo(a, callerAgentId))
+      .map((a) => viewOf(a, now)),
   );
 }
 
@@ -154,7 +185,11 @@ export function listPendingApprovals(now: number = Date.now()): ApprovalsResult<
  * store. That is reported as its own refusal rather than an empty success, because "I can't find it"
  * and "it wasn't approved" must not read the same to a model deciding whether to retry.
  */
-export function getApproval(id: string, now: number = Date.now()): ApprovalsResult<ApprovalView> {
+export function getApproval(
+  id: string,
+  callerAgentId: string,
+  now: number = Date.now(),
+): ApprovalsResult<ApprovalView> {
   const found = findApproval(id);
   if (!found) {
     return refuse(
@@ -162,6 +197,20 @@ export function getApproval(id: string, now: number = Date.now()): ApprovalsResu
       "unknown-approval",
       `I don't have an approval with id ${id} — it may have been answered long enough ago to age ` +
         `out of the retained set.`,
+    );
+  }
+  // NOT YOURS IS ITS OWN REFUSAL, and the entry is not described in it. Reporting the domain, the
+  // op or the arguments of somebody else's call would perform the very delivery this gate exists to
+  // stop — the refusal would become the leak. It is also deliberately NOT folded into
+  // `unknown-approval`: a model told "no such id" retries with a different id, while a model told
+  // "that one is not yours" stops, and only one of those is true.
+  if (!approvalBelongsTo(found, callerAgentId)) {
+    return refuse(
+      "get_approval",
+      "not-your-approval",
+      `Approval ${id} was raised for a different caller, so it isn't mine to read. Only the ` +
+        `caller whose tool call raised a request can see it — list_pending_approvals shows the ` +
+        `ones that are mine.`,
     );
   }
   return ok("get_approval", viewOf(found, now));
