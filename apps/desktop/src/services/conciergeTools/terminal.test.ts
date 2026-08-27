@@ -96,6 +96,11 @@ const REAL_SCREEN =
 // the read the same way (suggestions/conciergeHandoff imports it from ../pickerRead), so importing
 // it through terminal.ts made this test the only importer of that name on that module — which is
 // precisely what the dormant-export guard reports, and it reported it on main.
+//
+// THE RE-EXPORT ITSELF IS GONE TOO (this branch): `terminal.ts` now re-exports only
+// `readPickerOptions`, the one name that has an importer there (`registry.ts`). Repointing the test
+// alone silences the guard while leaving two type names promised to no module, which is exactly
+// what the transcript-registry re-export note twenty lines above it warns against.
 import type { PickerOptionsRead } from "../pickerRead";
 import {
   CONTROL_KEYS,

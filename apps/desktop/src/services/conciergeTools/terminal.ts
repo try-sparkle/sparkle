@@ -1364,7 +1364,13 @@ export const CONCIERGE_TERMINAL_TOOLS = [
 // COLLECTION and tripped the composer/improvement-pass latch in one move. The split falls on the
 // line that latch already draws: the READ is a pure query and may be reached from anywhere, the
 // WRITES below stay behind the boundary. Re-exported so this module's public surface is unchanged.
-export { readPickerOptions, type PickerOptionView, type PickerOptionsRead } from "../pickerRead";
+//
+// ONLY THE NAME THAT HAS AN IMPORTER HERE, exactly as the transcript-registry re-export above says.
+// `PickerOptionView` and `PickerOptionsRead` came along in the first pass and `dormant-exports`
+// reds on them: a type re-export with no in-file use has no production importer, so re-exporting
+// it is a promise to a module that does not exist. `registry.ts` imports `readPickerOptions` from
+// here; every consumer of the TYPES reaches the leaf directly.
+export { readPickerOptions } from "../pickerRead";
 
 export interface SelectPickerResult {
   ok: boolean;

@@ -173,24 +173,52 @@ export function handOffToConcierge(agentId: string, scrollback: string): boolean
   }
   // DELIVERY-TIME RE-VALIDATION (bead sparkle-st06sq). This notice may not reach the concierge for
   // seconds-to-a-minute — longer than the multi-question wizards that raise it stay on any one
-  // question — so by the time it is spoken the menu is usually gone and the agent is working again.
-  // Capture the menu's fingerprint NOW and hand the notice a predicate that re-reads the live screen
-  // at delivery: a menu that has resolved (present=false) or moved to a DIFFERENT question
-  // (fingerprint mismatch) is dropped instead of answered, and a batch of notices for successive
-  // wizard states collapses to at most the one whose fingerprint still matches the live screen.
+  // question — so by the time it is spoken the menu is often gone and the agent is working again.
+  // Hand the notice a predicate that re-reads the live screen at delivery and drops it if so.
   //
-  // ONLY WHEN THE READER CAN SEE THE MENU NOW. An empty fingerprint means `read_picker_options` is
-  // blind to a menu that IS on screen (bead sparkle-99o9a — a DISTINCT bug, explicitly out of scope
-  // here); attaching a predicate that re-reads through the same blind reader would drop the notice on
-  // the spot and suppress a legitimate escalation. No predicate = today's always-deliver behaviour,
-  // so this can only ever remove notices whose resolution it positively re-confirmed.
+  // IT DROPS ON ONE THING ONLY: the reader looked at the screen and POSITIVELY SAW NO MENU
+  // (`blind === "no-menu"`). Everything else keeps the notice. Two separate High reviews
+  // (roborev 69361, 69362) landed on the same two ways the earlier `live.present &&
+  // live.fingerprint === captured` form suppressed a real escalation, and both losses are
+  // PERMANENT rather than deferred, because `seen.add(sig)` below makes the `seen.has(sig)` early
+  // return the only thing a later watcher pass reaches:
+  //
+  //   • BLINDNESS IS NOT RESOLUTION. `present:false` has three causes, and only one of them is "no
+  //     menu". `readPickerOptions` -> `liveOptionsFor` reads the LIVE XTERM BUFFER, which is null
+  //     whenever the pane is unmounted — and per conciergeTools/terminal's own header, "on a real
+  //     fleet most agents are unmounted most of the time". Clicking to another agent between raise
+  //     and delivery therefore read as "the menu resolved". `footer-without-options` is the
+  //     sparkle-99o9a blind-reader shape the raise-time guard below already refuses to trust, and
+  //     trusting it here contradicted that. The `blind` discriminator exists to tell these apart
+  //     and was not being consulted.
+  //   • A DIFFERENT LIVE MENU IS STILL A "NEEDS YOU". `pickerFingerprint` hashes options + the
+  //     question block; `pickerSignature` (the de-dupe above) hashes option labels + keystrokes
+  //     only. A wizard's next question commonly shares the SIGNATURE and changes the FINGERPRINT —
+  //     `1. Yes / 2. Yes, don't ask again / 3. No` is the ubiquitous shape — so question 1's notice
+  //     was dropped for mismatch and question 2 could never raise one. The agent sat at a live
+  //     menu with nothing owed. A repaint or wrap that shifts the parsed question block does the
+  //     same to an UNCHANGED menu (`pickerFingerprint`'s QUESTION_CONTEXT_LINES fallback is
+  //     documented as producing different hashes for one menu). The notice text tells the concierge
+  //     to `read_picker_options` first and answer whatever is actually on screen, so delivering it
+  //     against a moved-on question is correct, not a mis-answer.
+  //
+  // What is left is a strictly weaker filter than the original design intended, and deliberately:
+  // the P0 rule is "never hide a row that needs action from me", and re-speaking a notice about a
+  // menu that is still up costs a sentence, while dropping one costs the founder a stuck agent.
+  //
+  // THE RAISE-TIME GATE IS UNCHANGED. An empty fingerprint means the reader is blind to a menu that
+  // IS on screen right now; attaching any predicate that re-reads through the same blind reader
+  // would risk dropping on the spot. No predicate = always-deliver.
   const detected = readPickerOptions(agentId);
   const capturedFingerprint = detected.present ? detected.fingerprint : "";
   const revalidate =
     capturedFingerprint !== ""
       ? () => {
           const live = readPickerOptions(agentId);
-          return live.present && live.fingerprint === capturedFingerprint;
+          // A menu is up — still owed, whichever question it is now.
+          if (live.present) return true;
+          // Not present. Drop ONLY on a positively-read empty screen; every blind read keeps it.
+          return live.blind !== "no-menu";
         }
       : undefined;
   const accepted = notifyConcierge(

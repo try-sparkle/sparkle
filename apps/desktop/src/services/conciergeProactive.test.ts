@@ -1392,6 +1392,60 @@ describe("research coming back wakes the concierge", () => {
     expect(s.stats().fired).toBe(1);
     expect(s.stats().researchFired).toBe(1);
   });
+
+  it("SURVIVES a picker-notice drop that empties the main track — the research wake is re-armed", () => {
+    // roborev 69362 (High). `clearOwed` tears the ONE timer down when the main track empties, and
+    // the file's invariant is that every `clearOwed` is followed by `arm()` — `settle` does exactly
+    // that. `dropStaleNotices` did not, and it is reached from `fire` and `peekNotices`, neither of
+    // which re-arms either. So a stale picker notice dropped at the fire seam destroyed the timer,
+    // `fire` then fell through `if (!hasMain && !researchReady) return;`, and `researchSince` — which
+    // a notice drop never touches — was left non-null with NOTHING RUNNING. The answer sat unspoken
+    // until some unrelated notify/observeFeed/observeResearch happened along, which on a quiet fleet
+    // is the failure `observeResearch` was written to remove.
+    //
+    // THE ORDERING IS THE TEST. The research wake is armed one tick AFTER the notice, so its due
+    // moment is strictly later: the main track comes due first, drops its only notice, and the
+    // research wake is the only thing left for the timer to be holding.
+    const tasks = [task({ id: "r1" })];
+    const h = harness(drainOver(() => tasks));
+    const s = createProactiveScheduler(h.deps);
+    s.observe(quiet());
+    s.notify("Agent A is STOPPED at a menu that is already gone", "pusher", () => false);
+    h.advance(1);
+    s.observeResearch(tasks);
+
+    // The main track's moment: the notice is re-validated, found stale, and dropped. Nothing is
+    // spoken — and before the fix the timer died here.
+    h.advance(PROACTIVE_COALESCE_MS - 1);
+    expect(h.fired).toEqual([]);
+
+    // The research wake's own moment, one tick later. It must still fire.
+    h.advance(1);
+    expect(h.fired).toHaveLength(1);
+    expect(h.fired[0]!.prompt).toContain("Epics are containers");
+    expect(h.fired[0]!.researchTaskIds).toEqual(["r1"]);
+    s.dispose();
+  });
+
+  it("…and the pair: with the notice still LIVE, the main track speaks at that same moment", () => {
+    // The assertion above cannot stand alone. Byte-identical setup, ONE bit different — the
+    // predicate holds — so the notice is not dropped, the main track is still owed when its moment
+    // arrives, and it buys a turn there. That contrast is what pins the cause: at
+    // `PROACTIVE_COALESCE_MS` the drop case is silent and this one speaks, so the earlier test's
+    // "nothing fired yet" is the DROP, not a scheduler that simply never fires.
+    const tasks = [task({ id: "r1" })];
+    const h = harness(drainOver(() => tasks));
+    const s = createProactiveScheduler(h.deps);
+    s.observe(quiet());
+    s.notify("Agent A is STOPPED at a menu that is still on screen", "pusher", () => true);
+    h.advance(1);
+    s.observeResearch(tasks);
+
+    h.advance(PROACTIVE_COALESCE_MS - 1);
+    expect(h.fired).toHaveLength(1);
+    expect(h.fired[0]!.prompt).toContain("Agent A is STOPPED at a menu that is still on screen");
+    s.dispose();
+  });
 });
 
 // ══ THE OWED CHANNEL'S SECOND KIND — A REPORT, NOT A PUSH ═══════════════════════════════════════

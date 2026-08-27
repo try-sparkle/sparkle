@@ -895,7 +895,21 @@ export function createProactiveScheduler(deps: ProactiveDeps): ProactiveSchedule
         return false; // fail open — keep the notice, never lose a real escalation to a read error
       }
     });
-    if (stale.length > 0) clearOwed(stale);
+    if (stale.length > 0) {
+      clearOwed(stale);
+      // RE-ARM, because `clearOwed` tears the timer down when the main track empties and this is
+      // not `settle` (roborev 69362, High). `settle` is the only other caller and it re-arms on the
+      // line after; neither of THIS function's two call sites does. From `peekNotices` there is no
+      // `arm()` at all, and from `fire` a drop that empties the main track falls through to
+      // `if (!hasMain && !researchReady) return;` with the timer already destroyed. `researchSince`
+      // is untouched by a notice drop, so a finished research answer whose wake was armed alongside
+      // the picker notice was left with `researchDueAt()` non-null and NOTHING RUNNING — silently
+      // cancelled until some unrelated notify/observeFeed/observeResearch happened along. That is
+      // exactly the "answer sits unspoken until the founder thinks to ask for it" failure
+      // `observeResearch` exists to remove. `arm` is a no-op when nothing is due, so this is safe
+      // on the ordinary path where the main track still has notices.
+      arm();
+    }
   };
 
   const dropPending = () => {
