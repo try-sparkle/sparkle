@@ -1132,7 +1132,7 @@ pub fn run() {
                     }
                 });
             }
-            // Sweep the concierge's screenshot directory (`<temp>/sparkle-captures`). THE
+            // Sweep the concierge's screenshot directory (`<temp>/sparkle-captures.noindex`). THE
             // DETERMINISTIC HALF of that module's retention bound: pruning only inside a capture
             // made retention a side effect of taking ANOTHER capture, so a session that
             // photographed the screen once and then went quiet left the PNG in temp forever — the

@@ -230,6 +230,18 @@ fn next_drop_seq() -> u64 {
 /// primary cleanup story — there isn't one yet, which is exactly why this exists.
 const DROP_FILE_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
 
+/// The dedicated directory materialised drops are written to and swept from.
+///
+/// SEPARATE from `window_screenshot::capture_dir()` ON PURPOSE. Both dirs end in `.noindex` so
+/// macOS Spotlight / `mediaanalysisd` never analyses their contents, but their RETENTION differs:
+/// captures are swept at 1h, drops need [`DROP_FILE_MAX_AGE`] (24h) so a slow agent turn does not
+/// race the sweep for a file it still has to read. Co-mingling drops into the 1h-swept captures dir
+/// would silently shorten that window to an hour. Giving drops their OWN `.noindex` dir keeps the
+/// index-exclusion win without touching the 24h backstop this module owns.
+fn drop_dir() -> std::path::PathBuf {
+    std::env::temp_dir().join("sparkle-drops.noindex")
+}
+
 /// Delete our own stale `sparkle-drop-*` files from `dir`. PURE data-in/data-out over a file list
 /// so the age rule is testable without touching a real temp directory's unrelated contents.
 ///
@@ -338,7 +350,7 @@ fn maybe_sweep_stale_drop_files() {
         return;
     }
     std::thread::spawn(|| {
-        let dir = std::env::temp_dir();
+        let dir = drop_dir();
         let Ok(read) = std::fs::read_dir(&dir) else { return };
         let entries = read.filter_map(|e| {
             let e = e.ok()?;
@@ -396,7 +408,11 @@ fn materialize_pasteboard_data(
 fn read_drag_pasteboard_image_bytes() -> Vec<String> {
     use objc2_app_kit::{NSPasteboard, NSPasteboardNameDrag};
 
-    let dir = std::env::temp_dir();
+    // Write into the dedicated `.noindex` drops dir (see `drop_dir`) so macOS never indexes/analyses
+    // these files, created best-effort — a failed create just means the write below returns None,
+    // which is the same "no file recovered" path a byte-less drag already takes.
+    let dir = drop_dir();
+    let _ = std::fs::create_dir_all(&dir);
     let stamp = now_millis();
 
     // SAFETY: reading a named pasteboard; every call is a plain AppKit read of memory AppKit owns.
@@ -537,9 +553,24 @@ pub async fn recover_drag_paths(window: tauri::WebviewWindow) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        file_url_to_path, materialize_image_bytes, materialize_sized_data, recover_for,
+        drop_dir, file_url_to_path, materialize_image_bytes, materialize_sized_data, recover_for,
         sweep_stale_entries, write_dropped_bytes, DROP_FILE_MAX_AGE, MAX_DROP_IMAGE_BYTES,
     };
+
+    /// Drops get their OWN `.noindex` directory, NOT the 1h-swept captures dir, so their 24h
+    /// retention survives. RED if `drop_dir` is reverted to a plain temp path (index exclusion lost)
+    /// or pointed at the captures dir (`sparkle-captures.noindex`, whose retention is 1h). Both
+    /// halves are asserted because either regression is a real, separately-shipped bug.
+    #[test]
+    fn drops_live_in_their_own_noindex_dir_with_24h_retention() {
+        let dir = drop_dir();
+        let name = dir.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_string();
+        assert_eq!(name, "sparkle-drops.noindex", "got {}", dir.display());
+        assert!(name.ends_with(".noindex"), "drop dir must be index-excluded, got {name}");
+        // Distinct from the captures dir, whose sweep is 1h — co-mingling would shorten this window.
+        assert_ne!(name, "sparkle-captures.noindex");
+        assert_eq!(DROP_FILE_MAX_AGE, std::time::Duration::from_secs(24 * 60 * 60));
+    }
 
     #[test]
     fn plain_path_round_trips() {

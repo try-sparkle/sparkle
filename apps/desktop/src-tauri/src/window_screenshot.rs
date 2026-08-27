@@ -60,7 +60,7 @@
 //!     surprise is a refusal naming the size, not a silent multi-megabyte artifact the caller is
 //!     told about only by a number it may not read.
 //!
-//! Captures land in ONE dedicated directory (`<temp>/sparkle-captures`) rather than loose in the
+//! Captures land in ONE dedicated directory (`<temp>/sparkle-captures.noindex`) rather than loose in the
 //! temp dir, so the litter is inspectable and prunable as a group. Anything older than
 //! [`CAPTURE_RETENTION`] is best-effort pruned; without that a chatty concierge would grow an
 //! unbounded pile of screenshots of the user's screen, which is a privacy cost as much as a disk
@@ -184,8 +184,15 @@ pub fn region_arg(rect: CaptureRect) -> String {
 }
 
 /// The directory every capture is written to. One place, so the litter is prunable as a group.
+///
+/// The `.noindex` suffix is load-bearing, NOT decoration: macOS Spotlight (and with it
+/// `mediaanalysisd`, which runs vision/OCR analysis on every image it indexes) excludes any
+/// directory whose name ends in `.noindex`. Without it, every concierge/preview screenshot Sparkle
+/// writes gets analysed by the OS, pinning a background daemon on churn that is pure waste — the
+/// files are ephemeral and never user-searched. Renaming this dir is the whole fix; the suffix must
+/// stay on the name.
 pub fn capture_dir() -> PathBuf {
-    std::env::temp_dir().join("sparkle-captures")
+    std::env::temp_dir().join("sparkle-captures.noindex")
 }
 
 /// The file one capture writes. `kind` distinguishes a window shot from a pane shot in a directory
@@ -675,7 +682,15 @@ mod tests {
     #[test]
     fn captures_land_in_one_dedicated_directory() {
         let dir = capture_dir();
-        assert!(dir.ends_with("sparkle-captures"), "got {}", dir.display());
+        assert!(dir.ends_with("sparkle-captures.noindex"), "got {}", dir.display());
+        // The `.noindex` suffix is the whole mechanism that keeps macOS `mediaanalysisd` from
+        // analysing every screenshot: Spotlight excludes any directory whose name ends in it. Assert
+        // the suffix explicitly so reverting the rename to a plain `sparkle-captures` turns this RED.
+        assert!(
+            dir.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.ends_with(".noindex")),
+            "capture dir name must end in .noindex, got {}",
+            dir.display()
+        );
         // Both kinds share the directory, so pruning covers them together.
         assert_eq!(capture_path("window", 7).parent(), Some(dir.as_path()));
         assert_eq!(capture_path("pane", 7).parent(), Some(dir.as_path()));

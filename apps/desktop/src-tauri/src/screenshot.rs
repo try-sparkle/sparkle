@@ -66,7 +66,13 @@ fn capture_blocking() -> Result<Option<Screenshot>, String> {
         .duration_since(UNIX_EPOCH)
         .map_err(|e| e.to_string())?
         .as_millis();
-    let path = std::env::temp_dir().join(format!("sparkle-shot-{stamp}.png"));
+    // Land in the shared captures directory whose name ends in `.noindex` so macOS Spotlight /
+    // `mediaanalysisd` never analyses these screenshots (see `window_screenshot::capture_dir`). The
+    // full-res `path` is still what the CLI/agent reads; it just lives in a dir the OS skips. Both
+    // this and the transient preview below go in the same dir, created best-effort.
+    let dir = crate::window_screenshot::capture_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| format!("could not create {}: {e}", dir.display()))?;
+    let path = dir.join(format!("sparkle-shot-{stamp}.png"));
 
     // -i: interactive crosshair selection.  -x: silence the shutter sound.
     let status = Command::new("/usr/sbin/screencapture")
@@ -96,7 +102,7 @@ fn capture_blocking() -> Result<Option<Screenshot>, String> {
     // Only downscale when the capture actually exceeds the preview box; `sips -Z` would otherwise
     // UPSCALE a small selection (it sets the max dimension to exactly N), bloating the preview.
     let needs_downscale = png_dimensions(&path).is_some_and(|(w, h)| w.max(h) > PREVIEW_MAX_DIM);
-    let preview_path = std::env::temp_dir().join(format!("sparkle-shot-{stamp}-preview.png"));
+    let preview_path = dir.join(format!("sparkle-shot-{stamp}-preview.png"));
     let downscaled = needs_downscale
         && Command::new("/usr/bin/sips")
             .args(["-Z", &PREVIEW_MAX_DIM.to_string(), "--out"])

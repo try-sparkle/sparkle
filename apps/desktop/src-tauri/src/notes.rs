@@ -740,6 +740,13 @@ pub fn copy_capture_asset(
     let assets_dir = root.join("PRD").join("assets");
     std::fs::create_dir_all(&assets_dir)
         .map_err(|e| format!("create {}: {e}", assets_dir.display()))?;
+    // Tell macOS Spotlight / `mediaanalysisd` never to index this directory's images. Unlike the
+    // temp capture/drop dirs, `PRD/assets` is a real, named directory inside the user's project, so
+    // the `.noindex` suffix trick is not available; the empty `.metadata_never_index` marker file is
+    // the documented equivalent for a directory whose name we do not control. Best-effort and
+    // idempotent: it must NEVER fail the copy, so its error is deliberately swallowed. The marker is
+    // already covered by the `PRD/assets/` gitignore rule below, so it is not committed.
+    let _ = std::fs::write(assets_dir.join(".metadata_never_index"), b"");
     let dest = assets_dir.join(&filename);
     std::fs::copy(&src, &dest).map_err(|e| format!("copy {src} -> {}: {e}", dest.display()))?;
 
