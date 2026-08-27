@@ -456,29 +456,55 @@ describe("control op: preview", () => {
     },
   );
 
-  // A POST-DISCOVERY state passes straight through, and must NOT be made to wait. `listening` is
+  // A POST-DISCOVERY state passes straight through, and must NOT be made to wait. Each of these is
   // only reached from `supervise`'s `discover_port` (preview.rs), so its address is already the
   // BOUND one — polling again would add a round trip to every re-attach for an answer we hold.
   //
-  // `starting` deliberately does NOT appear in this row any more; see the settle tests below for
-  // why its address is the one thing that must never pass through. That split is also what still
+  // `starting` deliberately does NOT appear in these rows; see the settle tests below for why its
+  // address is the one thing that must never pass through. That split is also what still
   // discriminates roborev 64017's state-keyed strip: a guard keyed on the STATE alone would strip
-  // this reply's real address too, and this row goes red if anyone reintroduces one.
-  it.each(["listening"] as const)(
-    "open with an already-DISCOVERED port (state %s) → the real url/port pass through, unpolled",
-    async (state) => {
-      openPreviewServerMock.mockResolvedValueOnce({
-        id: "pv1",
-        url: "http://127.0.0.1:5199",
-        port: 5199,
-        state,
-      });
+  // these replies' real addresses too, and these rows go red if anyone reintroduces one.
+  //
+  // ── WHY THIS IS A MATRIX AND NOT ONE ROW (bead `sparkle-ym3bh5`) ──────────────────────────────
+  //
+  // Both axes are here because a single row could be satisfied without the handler reading
+  // anything:
+  //
+  //   * THE ADDRESS AXIS. The previous version asserted `port: 5199` against a mock that returned
+  //     5199 — the value that happened to come back, which is exactly the shape that let this
+  //     suite pin the PREDICTED port as correct for a `starting` reply and protect the bug with
+  //     its own green test. Two distinct addresses leave no constant that passes both rows, so the
+  //     only implementation that satisfies them is one that actually forwards what it was given.
+  //   * THE STATE AXIS. `PREVIEW_DISCOVERED_STATES` in controlListener.ts has THREE members and
+  //     this row covered one. That set is deliberately not exported (an export whose only importer
+  //     is a test is its own defect), so the list below is a hand-kept mirror: adding a member
+  //     there without adding a row here leaves the new state's fast path unexercised.
+  const DISCOVERED_ADDRESSES = [
+    [5199, "http://127.0.0.1:5199"],
+    [4173, "http://127.0.0.1:4173"],
+  ] as const;
+  const DISCOVERED_STATES = ["listening", "ready", "serving"] as const;
+  it.each(
+    DISCOVERED_STATES.flatMap((state) =>
+      DISCOVERED_ADDRESSES.map(([port, url]) => [state, port, url] as const),
+    ),
+  )(
+    "open with an already-DISCOVERED port (state %s, port %i) → that exact url/port pass through, unpolled",
+    async (state, port, url) => {
+      openPreviewServerMock.mockResolvedValueOnce({ id: "pv1", url, port, state });
       fire({ reqId: "p15", op: "preview", callerAgentId: buildId, payload: { previewOp: "open" } });
       await flush();
-      expect(lastReply()).toMatchObject({
-        ok: true,
-        preview: { id: "pv1", url: "http://127.0.0.1:5199", port: 5199, state },
-      });
+      const preview = lastReply().preview as { url: string; port: number; state: string; id: string };
+      expect(preview).toEqual({ id: "pv1", url, port, state });
+      // THE CAPABILITY, not the value: the link the caller is handed must name the port the caller
+      // is told about. A reply that paired one row's url with the other's port would satisfy the
+      // equality above only by accident of the fixture, and would still be an address nothing
+      // serves — which is the whole class of defect this file exists to keep out.
+      expect(preview.url).toContain(String(preview.port));
+      // …and it is not the OTHER row's address, so a constant is unsatisfiable in both directions.
+      const other = DISCOVERED_ADDRESSES.find(([p]) => p !== port)!;
+      expect(preview.port).not.toBe(other[0]);
+      expect(preview.url).not.toContain(String(other[0]));
       expect(fetchPreviewStatusMock).not.toHaveBeenCalled();
     },
   );
@@ -494,21 +520,28 @@ describe("control op: preview", () => {
   // pane, over the `preview:state` event. The agent that called this op got the guess, reported it
   // to the human, and the link opened a port nothing was serving.
   //
-  // THIS IS THE ROW THAT FAILS IF A CONSTANT PORT IS USED, and it is parameterised for exactly that
-  // reason. The requested port and the bound port are different numbers, so an implementation that
-  // echoes `opened.port` cannot satisfy it — but a single row asserting `port: 3000` would also be
-  // satisfied by a hardcoded 3000, which is the same defect wearing the answer as a costume. TWO
-  // different bound ports against the SAME requested port leave no constant that passes both.
+  // THIS IS THE ROW THAT FAILS IF A CONSTANT PORT IS USED, and BOTH of its numbers vary for exactly
+  // that reason (bead `sparkle-ym3bh5`). The requested port and the bound port are different in
+  // every row, so an implementation that echoes `opened.port` cannot satisfy any of them — but a
+  // single row asserting `port: 3000` would also be satisfied by a hardcoded 3000, which is the
+  // same defect wearing the answer as a costume. TWO different bound ports leave no constant that
+  // passes both.
+  //
+  // THE REQUESTED PORT VARIES TOO, which the earlier version held fixed at 5199. A fixed prediction
+  // cannot discriminate "forwards the observed port" from "special-cases the one number this
+  // fixture always predicts" — the second is not a real implementation, but it is exactly the
+  // reasoning a fixture teaches the next reader, and the whole bead is about a suite teaching the
+  // wrong thing with a green tick.
   it.each([
-    [3000, "http://127.0.0.1:3000"],
-    [4321, "http://127.0.0.1:4321"],
+    [5199, 3000, "http://127.0.0.1:3000"],
+    [5200, 4321, "http://127.0.0.1:4321"],
   ])(
-    "open → the reply carries the port the dev server actually BOUND (%i), not the one Sparkle asked for",
-    async (boundPort, boundUrl) => {
+    "open → the reply carries the port the dev server actually BOUND (%i predicted → %i bound), not the one Sparkle asked for",
+    async (requestedPort, boundPort, boundUrl) => {
       openPreviewServerMock.mockResolvedValueOnce({
         id: "pv1",
-        url: "http://127.0.0.1:5199",
-        port: 5199,
+        url: `http://127.0.0.1:${requestedPort}`,
+        port: requestedPort,
         state: "starting",
       });
       fetchPreviewStatusMock.mockResolvedValueOnce({
@@ -525,8 +558,12 @@ describe("control op: preview", () => {
       expect(fetchPreviewStatusMock).toHaveBeenCalledWith(buildId);
       const preview = lastReply().preview as { url: string; port: number; state: string; id: string };
       expect(preview).toEqual({ id: "pv1", url: boundUrl, port: boundPort, state: "ready" });
-      expect(preview.port).not.toBe(5199);
-      expect(preview.url).not.toContain("5199");
+      expect(preview.port).not.toBe(requestedPort);
+      expect(preview.url).not.toContain(String(requestedPort));
+      // THE CAPABILITY THE CALLER ACTUALLY HAS: the link it is handed points at the port the dev
+      // server is on. Asserting the url and the port agree is what makes "the link opens the
+      // running server" a property of the reply rather than a coincidence of the fixture.
+      expect(preview.url).toContain(String(preview.port));
     },
   );
 

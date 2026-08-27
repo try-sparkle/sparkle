@@ -377,6 +377,34 @@ impl ListenTable for LsofListenTable {
 /// silently does nothing. `command`/`args` are the keys that do exist and are how a user actually
 /// forces the bind. A remedy is an instruction someone will follow, so it gets the same scrutiny as
 /// the code path it replaces.
+/// Why a preview may not be framed at a port the tree really did bind.
+///
+/// THE SAME REFUSAL `open_reserved` MAKES BEFORE THE SPAWN, ASKED AGAIN AFTER DISCOVERY. That
+/// pre-spawn gate reads `target.port` — a `[preview].port` the project PINNED — and nothing else,
+/// so it is silent about the case it cannot see: a dev server that binds a reserved port ON ITS
+/// OWN. `Framework::Unknown` is injected no port flag at all, and any framework free to hop off a
+/// taken port does so silently, so "the config never mentioned 1420" is not evidence about where
+/// the child actually listened (bead `sparkle-r5v0fs`, observed reaching `ready` on exactly the
+/// port this module documents as same-origin-unsafe).
+///
+/// A REFUSAL RATHER THAN A DEPREFERENCE, for the reason the pre-spawn gate already states: framing
+/// Sparkle's own dev port would put the preview SAME-ORIGIN with the Sparkle document, and there is
+/// no holder to queue behind and no lock that could make that safe. `supervise` answers an `Err`
+/// by killing the child, which is also the right outcome here — that child is squatting on the port
+/// Sparkle's own dev server needs, so leaving it running helps nobody.
+///
+/// It fires ONLY when nothing else in the tree is framable: a reserved socket beside a real one is
+/// simply skipped, never refused. See [`choose_listener`].
+fn reserved_port_refusal(port: u16) -> String {
+    format!(
+        "refusing to preview a dev server listening on port {port}: that is Sparkle's own dev \
+         port, so the preview would be same-origin with the Sparkle window itself. Nothing can \
+         make that safe, so move the dev server off it — give its dev script an explicit port \
+         (`command`/`args` under [preview] in this project's .sparkle/config.toml), or change the \
+         port the project defaults to."
+    )
+}
+
 fn v6_refusal(addr: &str) -> String {
     format!(
         "the dev server is listening only on the IPv6 loopback ({addr}), which the preview frame \
@@ -418,9 +446,17 @@ fn v6_refusal(addr: &str) -> String {
 ///     tree. See the caveat below — this bullet claimed the forced case was "deterministic" for one
 ///     commit after the fall-through stopped being conditional, which is the overclaim the caveat
 ///     exists to correct.
-///   * `Err(msg)` — the tree IS listening, but not on loopback. **Refused, not depreferred**, and
-///     the message NAMES the offending address so the pane can say what it refused rather than
-///     showing a generic failure.
+///   * `Err(msg)` — the tree IS listening, but at an address we may not frame: not on loopback, or
+///     (bead `sparkle-r5v0fs`) on a RESERVED port. **Refused, not depreferred**, and the message
+///     NAMES the offending address so the pane can say what it refused rather than showing a
+///     generic failure.
+///
+/// **A RESERVED PORT IS NEVER A CANDIDATE, WHATEVER THE CLAIM SAYS.** Both lists are filtered
+/// before any rule below reads them, so a reserved socket beside a real one is silently skipped
+/// (the real one is framed, and nothing is refused), and a reserved socket that is the ONLY thing
+/// the tree bound reaches the tail refusal above. `open_reserved`'s pre-spawn gate cannot see this
+/// case at all: it reads the PINNED port, and a server that binds Sparkle's own dev port on its own
+/// initiative pinned nothing. See [`reserved_port_refusal`].
 ///
 /// **A PORT THAT MATCHES NEITHER LIST FALLS THROUGH TO THE FIRST v4 LOOPBACK SOCKET, WHATEVER IT
 /// IS — and passing a `preferred` port does not change that.** The rule is uniform: `preferred` wins
@@ -485,6 +521,42 @@ pub fn choose_listener(listeners: &[Listener], claim: PortClaim) -> Result<Optio
         v6_only.remove(port);
     }
 
+    // ── THE RESERVED-PORT CHECK, RE-ASKED AGAINST WHAT WAS ACTUALLY BOUND (bead `sparkle-r5v0fs`)
+    //
+    // `open_reserved` refuses a reserved port BEFORE the spawn, but it can only read the one the
+    // project PINNED. Discovery is where the other half is knowable, and until now nothing asked:
+    // a tree listening on Sparkle's own dev port fell straight through to `loopback.first()` and
+    // was framed, reaching `ready` with no warning at all.
+    //
+    // DONE HERE, AFTER the dual-stack dedup and BEFORE any preference rule reads either list, so
+    // there is exactly one place a reserved port can leave the candidate set. Doing it in the
+    // claim branch alone would miss the fall-through, and doing it at the tail alone would let a
+    // `preferred`/`forced` match return a reserved port ahead of the tail.
+    let mut reserved: Vec<u16> = Vec::new();
+    loopback.retain(|p| {
+        if is_reserved_port(*p) {
+            reserved.push(*p);
+            false
+        } else {
+            true
+        }
+    });
+    // v6-only sockets are pulled out too, so the refusal a caller reads NAMES THE REAL PROBLEM.
+    // Left in, a reserved v6-only bind would produce the v6 refusal instead — whose remedy ("make
+    // the server bind IPv4") is an instruction that, followed, lands the user on the same reserved
+    // port over v4 and refuses again. A remedy must be safe under the conditions that produced the
+    // refusal (bead `sparkle-8bvh`); that one is not.
+    v6_only.retain(|p, _| {
+        if is_reserved_port(*p) {
+            reserved.push(*p);
+            false
+        } else {
+            true
+        }
+    });
+    reserved.sort_unstable();
+    reserved.dedup();
+
     // THE NAMED PORT DECIDES when it is actually listening, whatever the strength of the claim:
     // somebody asked for this number, so among sockets that ARE up it is the best candidate for
     // being the app's. This branch only ever picks BETWEEN OBSERVED SOCKETS — it never invents an
@@ -532,6 +604,13 @@ pub fn choose_listener(listeners: &[Listener], claim: PortClaim) -> Result<Optio
     loopback.sort_unstable();
     if let Some(&port) = loopback.first() {
         return Ok(Some(port));
+    }
+    // NOTHING FRAMABLE, AND THE ONLY THING THIS TREE BOUND IS A PORT WE MAY NEVER FRAME. Ahead of
+    // both refusals below because it is the most SPECIFIC diagnosis available: we saw the socket,
+    // we know exactly why it is unusable, and we can say so by number. The v6 and foreign refusals
+    // below are about a DIFFERENT socket being wrong in a different way.
+    if let Some(&port) = reserved.first() {
+        return Err(reserved_port_refusal(port));
     }
     // Nothing on v4 loopback, but something IS on v6: that is the app, and it is unreachable.
     if let Some((_, addr)) = v6_only.iter().next() {
@@ -4432,6 +4511,129 @@ mod tests {
             choose_listener(&no_v4, PortClaim::Unknown).is_err(),
             "and so does no claim at all — the tail refusal is not claim-driven"
         );
+    }
+
+    /// THE RESERVED PORT, DISCOVERED RATHER THAN CONFIGURED — bead `sparkle-r5v0fs`.
+    ///
+    /// `open_reserved` refuses a reserved `[preview].port` before it spawns anything, and that gate
+    /// was the ONLY consultation of the reserved list on the whole open path. It reads what the
+    /// project PINNED, so it is structurally blind to a dev server that binds Sparkle's own dev
+    /// port on its own initiative — `Framework::Unknown` is handed no port flag at all, and a
+    /// framework free to hop off a taken port does so silently. The reported symptom was a preview
+    /// reaching `ready` on exactly the port this module documents as same-origin-unsafe, with no
+    /// warning anywhere.
+    ///
+    /// THE INPUT IS DERIVED FROM `RESERVED_PORTS`, NOT TYPED AS `1420`, for the reason
+    /// `preview_csp`'s `sparkles_own_dev_port_is_reserved` records: hard-coding the number makes
+    /// the test describe one entry of a list rather than the list, and reserving a second port
+    /// would leave it green while saying nothing about the new entry. The ASSERTION is still about
+    /// what `choose_listener` returns, so deriving the input is not self-reference.
+    #[test]
+    fn a_reserved_port_is_never_framed_however_it_was_discovered() {
+        let reserved = RESERVED_PORTS[0];
+        let v4 = |port: u16| listener(7, &format!("127.0.0.1:{port}"));
+
+        // ── 1. A REAL SOCKET BESIDE THE RESERVED ONE IS FRAMED, AND NOTHING IS REFUSED. ──────────
+        //
+        // TWO DISTINCT EXPECTED PORTS, ON PURPOSE (bead `sparkle-ym3bh5`). A single row asserting
+        // `Ok(Some(5173))` is satisfied by any implementation that happens to return 5173 —
+        // including one that ignores the socket list entirely. Two different answers from two
+        // different trees leave no constant that passes both, so this can only be satisfied by
+        // actually reading what is listening.
+        for real in [5173u16, 4321u16] {
+            assert_eq!(
+                choose_listener(&[v4(reserved), v4(real)], PortClaim::Unknown),
+                Ok(Some(real)),
+                "the reserved socket must be skipped in favour of the real one, not refused"
+            );
+            // ORDER MUST NOT DECIDE IT. `loopback.first()` reads a SORTED list, and the reserved
+            // dev port is numerically below both of these — so a filter that ran after the sort,
+            // or not at all, would return `reserved` here and pass the row above only by accident.
+            assert_eq!(
+                choose_listener(&[v4(real), v4(reserved)], PortClaim::Unknown),
+                Ok(Some(real)),
+                "…whichever order lsof happened to report them in"
+            );
+            // AND A CLAIM MUST NOT RESURRECT IT. `claim.port()` is the one rule that can return a
+            // port ahead of the sorted fall-through, so a filter placed only at the tail would let
+            // a pin or a forced flag hand back the reserved port from inside this branch.
+            assert_eq!(
+                choose_listener(&[v4(reserved), v4(real)], PortClaim::Preferred(reserved)),
+                Ok(Some(real)),
+                "an unverified pin on the reserved port may not select it"
+            );
+            assert_eq!(
+                choose_listener(&[v4(reserved), v4(real)], PortClaim::Forced(reserved)),
+                Ok(Some(real)),
+                "and neither may a forced one — no claim outranks the reservation"
+            );
+        }
+
+        // ── 2. THE RESERVED SOCKET ALONE IS REFUSED BY NAME, NEVER FRAMED. ──────────────────────
+        for claim in [PortClaim::Unknown, PortClaim::Preferred(reserved), PortClaim::Forced(reserved)] {
+            let err = choose_listener(&[v4(reserved)], claim)
+                .expect_err("the reserved port is the only candidate, so this must refuse");
+            assert!(
+                err.contains(&reserved.to_string()),
+                "the refusal must NAME the port so the pane can say what it refused; got: {err}"
+            );
+            assert!(
+                err.contains("same-origin"),
+                "…and say why, since 'refused' with no cause is undebuggable; got: {err}"
+            );
+        }
+
+        // ── 3. A RESERVED v6-ONLY BIND GETS THE RESERVED REFUSAL, NOT THE 'BIND IPv4' ONE. ──────
+        //
+        // A remedy must be safe under the conditions that produced the refusal (bead
+        // `sparkle-8bvh`). "Make the server bind IPv4" is a live instruction the reader will
+        // follow, and following it here lands them on the SAME reserved port over v4 — refused
+        // again, for a reason the first message never mentioned.
+        let err = choose_listener(&[listener(7, &format!("[::1]:{reserved}"))], PortClaim::Unknown)
+            .expect_err("a reserved v6-only bind is still unframable");
+        assert!(err.contains("same-origin"), "the reserved reason must win; got: {err}");
+        assert!(
+            !err.contains("Make the server bind IPv4"),
+            "…and must NOT hand back the v6 remedy, which cannot help here; got: {err}"
+        );
+
+        // ── 4. UNRESERVED BEHAVIOUR IS UNTOUCHED — the filter must not swallow ordinary sockets. ─
+        assert_eq!(choose_listener(&[v4(5173)], PortClaim::Unknown), Ok(Some(5173)));
+        assert_eq!(choose_listener(&[], PortClaim::Unknown), Ok(None), "an empty tree still waits");
+    }
+
+    /// THE SAME PROPERTY THROUGH THE WHOLE DISCOVERY STEP, not just the pure chooser.
+    ///
+    /// `supervise` calls `discover_port`, which walks the process tree and then delegates. A test
+    /// that only drove `choose_listener` would stay green through a `discover_port` that grew its
+    /// own pre-check and returned the reserved port before delegating — and `discover_port` is the
+    /// function the bead names ("re-check … after process-tree discovery").
+    #[test]
+    fn discovery_refuses_a_reserved_port_found_in_the_process_tree() {
+        let reserved = RESERVED_PORTS[0];
+        let procs = FixedProcessTable(Some(vec![
+            ProcRow { pid: 100, ppid: 1, rss_bytes: 0 },
+            ProcRow { pid: 101, ppid: 100, rss_bytes: 0 },
+        ]));
+
+        let only_reserved =
+            FixedListenTable(Some(vec![listener(101, &format!("127.0.0.1:{reserved}"))]));
+        let err = discover_port(&procs, &only_reserved, 100, PortClaim::Unknown)
+            .expect_err("a tree listening only on the reserved port must be refused");
+        assert!(err.contains(&reserved.to_string()), "named by port; got: {err}");
+
+        // Two distinct real ports again, for the reason case 1 above states.
+        for real in [5200u16, 3000u16] {
+            let mixed = FixedListenTable(Some(vec![
+                listener(101, &format!("127.0.0.1:{reserved}")),
+                listener(101, &format!("127.0.0.1:{real}")),
+            ]));
+            assert_eq!(
+                discover_port(&procs, &mixed, 100, PortClaim::Unknown),
+                Ok(Some(real)),
+                "and a real socket in the same tree is still discovered normally"
+            );
+        }
     }
 
     /// THE DOCS AND THE TYPE MUST NOT DRIFT. `Spawn` carried two parallel `Option<u16>` fields
