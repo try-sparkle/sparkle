@@ -35,11 +35,20 @@
 //!
 //! # Policy (the founder's call, 2026-08-13)
 //!
-//! roborev shares the account pool with the interactive fleet but ranks **lowest priority**: it
-//! picks the account with the most headroom, and if only ONE healthy account is left it **stands
-//! down** rather than competing for it. Reviews degrade before the founder's own work does. A
-//! stood-down job fails fast and honestly instead of burning the last account; re-running it is a
-//! separate concern (see the reaper).
+//! roborev shares the NON-default account pool with the interactive fleet but ranks **lowest
+//! priority**: it picks the account with the most headroom, and if fewer than two healthy fleet
+//! accounts are left it **stands down** rather than competing. Reviews degrade before the founder's
+//! own work does. A stood-down job fails fast and honestly instead of burning the last account;
+//! re-running it is a separate concern (see the reaper).
+//!
+//! The one login it NEVER touches is the interactive session's own — the DEFAULT account
+//! (`$HOME/.claude`, the empty-`config_dir` sentinel). That account is what a plain interactive
+//! `claude`, the founder's terminal, and this shim's fail-open path all run as, so routing a review
+//! onto it is the exact shared-quota collision that starves reviews when the fleet is busy
+//! (sparkle-yqr5hb / sparkle-ksftv0 / sparkle-l218hb: 11-of-11 re-enqueued reviews died on a session
+//! limit within minutes). [`is_interactive_reserved`] drops it from the candidate list before
+//! ranking — the enforcement of the founder's deference rule, not a reversal of the shared-pool
+//! decision.
 //!
 //! # Split of responsibility
 //!
@@ -70,6 +79,24 @@ pub struct Candidate {
     pub dir: String,
     /// Epoch seconds this account is exhausted until; `0` = healthy.
     pub exhausted_until: i64,
+}
+
+/// Is this account the interactive session's own login, which roborev must NEVER route a review
+/// onto? The DEFAULT account — `is_default`, or the empty-`config_dir` sentinel that means
+/// "export no `CLAUDE_CONFIG_DIR` at all" (`$HOME/.claude`) — is the exact account a plain
+/// interactive `claude` runs as, that the founder's own terminal session uses, and that the shim's
+/// fail-open path falls back to. Ranking it as a review candidate is the shared-quota collision the
+/// review daemon exists to avoid: a busy fleet walls that login, every review routes onto it, and
+/// 11-of-11 re-enqueued reviews die on a session limit within minutes (sparkle-yqr5hb /
+/// sparkle-ksftv0 / sparkle-l218hb).
+///
+/// Reserving it is the ENFORCEMENT of the founder's 2026-08-13 rule ("reviews degrade before the
+/// founder's own work does"), not a reversal of it: roborev still shares the NON-default fleet pool
+/// and still ranks lowest within it — it just never competes for the one login the interactive
+/// session cannot do without. The empty-dir sentinel and a literal `$HOME/.claude` are both caught,
+/// because both resolve to the same interactive login (see [`crate::accounts::Account::config_dir`]).
+fn is_interactive_reserved(a: &Account) -> bool {
+    a.is_default || a.config_dir.is_empty()
 }
 
 /// Is this account usable right now? `exhausted_until` in the future means walled.
@@ -232,7 +259,15 @@ pub fn rank_candidates_excluding_auth_dead(
     auth_dead: &HashSet<String>,
     now: i64,
 ) -> Vec<Candidate> {
-    let mut healthy: Vec<&Account> = accounts.iter().filter(|a| is_healthy(a, now)).collect();
+    // Reserve the interactive/default login BEFORE anything else looks at the pool: a review must
+    // never be routed onto the account the interactive session runs as, and this composes with —
+    // rather than bypasses — the last-account stand-down below, which now applies to the NON-default
+    // fleet pool. See [`is_interactive_reserved`].
+    let mut healthy: Vec<&Account> = accounts
+        .iter()
+        .filter(|a| !is_interactive_reserved(a))
+        .filter(|a| is_healthy(a, now))
+        .collect();
     if healthy.len() < MIN_HEALTHY_TO_RUN {
         return Vec::new();
     }
@@ -485,6 +520,97 @@ mod tests {
             .map(|c| c.dir)
             .collect();
         assert!(dirs.contains(&"/dir/a".to_string()), "healthy A must be offered: {dirs:?}");
+    }
+
+    /// A default account with a non-empty, literal `$HOME/.claude`-style config dir.
+    fn acct_default(id: &str, dir: &str) -> Account {
+        let mut a = acct(id, dir, None);
+        a.is_default = true;
+        a
+    }
+
+    /// THE ISOLATION ASSERTION: the interactive/default login is NEVER offered as a review
+    /// candidate, and its non-default fleet siblings ARE. This is the shared-quota collision the
+    /// review daemon exists to avoid (sparkle-yqr5hb / sparkle-ksftv0 / sparkle-l218hb) — a review
+    /// must not run on the account the interactive session runs as.
+    ///
+    /// Mutation-provable: delete the `!is_interactive_reserved` filter in the ranker and the default
+    /// dir reappears in the list — i.e. the daemon FALLS BACK TO SHARING the interactive session, and
+    /// this goes red. Paired with the SAME account as non-default being offered, so the exclusion is
+    /// proven to be caused by the default flag, not by a ranker that would have dropped it anyway.
+    #[test]
+    fn the_interactive_default_account_is_never_a_review_candidate() {
+        // Default account carries a literal, non-empty `$HOME/.claude` (the pre-migration shape) so
+        // this cannot pass merely because the dir is empty — it must be the `is_default` flag.
+        let accounts = vec![
+            acct_default("home", "/home/.claude"),
+            acct("a", "/dir/a", None),
+            acct("b", "/dir/b", None),
+        ];
+        let dirs: Vec<String> = rank_candidates(&accounts, &HashMap::new(), NOW)
+            .into_iter()
+            .map(|c| c.dir)
+            .collect();
+        assert!(!dirs.contains(&"/home/.claude".to_string()), "interactive default offered: {dirs:?}");
+        assert!(dirs.contains(&"/dir/a".to_string()), "fleet sibling A missing: {dirs:?}");
+        assert!(dirs.contains(&"/dir/b".to_string()), "fleet sibling B missing: {dirs:?}");
+
+        // The empty-`config_dir` sentinel is the SAME interactive login by another spelling, and is
+        // likewise reserved even when it is not flagged `is_default`.
+        let sentinel = vec![
+            acct("home", "", None),
+            acct("a", "/dir/a", None),
+            acct("b", "/dir/b", None),
+        ];
+        let dirs: Vec<String> = rank_candidates(&sentinel, &HashMap::new(), NOW)
+            .into_iter()
+            .map(|c| c.dir)
+            .collect();
+        assert!(!dirs.iter().any(|d| d.is_empty()), "default sentinel offered: {dirs:?}");
+        assert_eq!(dirs, vec!["/dir/a".to_string(), "/dir/b".to_string()], "only fleet accounts: {dirs:?}");
+
+        // PAIRED: the SAME `/home/.claude` dir, but NON-default, IS offered — proving the drop above
+        // is caused by the interactive-reservation, not by the ranker excluding that dir regardless.
+        let non_default = vec![
+            acct("home", "/home/.claude", None),
+            acct("a", "/dir/a", None),
+            acct("b", "/dir/b", None),
+        ];
+        let dirs: Vec<String> = rank_candidates(&non_default, &HashMap::new(), NOW)
+            .into_iter()
+            .map(|c| c.dir)
+            .collect();
+        assert!(dirs.contains(&"/home/.claude".to_string()), "non-default /home/.claude must be offered: {dirs:?}");
+    }
+
+    /// The reservation COMPOSES with the founder's last-account stand-down, applied to the NON-default
+    /// fleet pool: a default account plus ONE healthy fleet account leaves only one usable review
+    /// login, so roborev stands down rather than publishing it. Paired with default + TWO fleet
+    /// accounts, which DOES run — so the test cannot pass by always standing down.
+    #[test]
+    fn reserving_the_default_composes_with_the_last_account_standdown() {
+        // default + 1 fleet -> 1 usable review account -> STAND DOWN. The default is NOT counted as
+        // review headroom, so this is one usable login, not two.
+        let one_fleet = vec![
+            acct_default("home", "/home/.claude"),
+            acct("a", "/dir/a", None),
+        ];
+        assert!(
+            rank_candidates(&one_fleet, &HashMap::new(), NOW).is_empty(),
+            "default + one fleet account must stand down (the default is reserved, not a candidate)"
+        );
+
+        // default + 2 fleet -> 2 usable review accounts -> runs, on the fleet accounts only.
+        let two_fleet = vec![
+            acct_default("home", "/home/.claude"),
+            acct("a", "/dir/a", None),
+            acct("b", "/dir/b", None),
+        ];
+        let dirs: Vec<String> = rank_candidates(&two_fleet, &HashMap::new(), NOW)
+            .into_iter()
+            .map(|c| c.dir)
+            .collect();
+        assert_eq!(dirs, vec!["/dir/a".to_string(), "/dir/b".to_string()], "must run on the fleet pool only: {dirs:?}");
     }
 
     /// An exhaustion in the PAST is expired and must not bench the account — mirrors
