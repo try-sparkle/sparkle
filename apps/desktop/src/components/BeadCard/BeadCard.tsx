@@ -30,22 +30,38 @@
 // A COLLAPSED CARD SCROLLS NOTHING AT ALL — it renders no description, so there is no inner
 // scroller for `descMaxHeight` to create. See `collapsed`.
 //
-// ══ THE WHOLE BODY IS THE EXPAND TARGET, SO EVERY CONTROL MUST STOP THE BUBBLE ═════════════════
+// ══ THE WHOLE BODY IS THE EXPAND TARGET, SO THE ROOT MUST IGNORE PRESSES THAT HAVE AN OWNER ════
 // The founder asked for click-the-card rather than a chevron. That makes the card root's `onClick`
-// an ancestor of every button on it, and React bubbles through the COMPONENT tree — including the
-// priority menu, which is portaled to `document.body`. So each control (and each wrapper around a
-// child component that owns its own controls) calls `stopPropagation`, or pressing Build It fires
-// the build AND collapses the card in the same gesture.
+// an ancestor of every control on it, and pressing Build It would fire the build AND collapse the
+// card in the same gesture. TWO guards cover that, and they cover different halves:
+//
+//   1. THE DEFAULT, on the root: `isInteractiveClickTarget` (`../interactiveClickTarget.ts`). If
+//      the press landed on an interactive DOM descendant — a link, a button, a field — the root
+//      stays out of it. This needs nothing from the descendant, which is the point: bead
+//      `sparkle-92md3i` shipped because one branch made the body a click target and ANOTHER added
+//      links inside it, so the defect existed only in their merge and neither suite could see it.
+//      A link `<Markdown>` renders, or anything a caller passes as `footer`, is not ours to edit.
+//   2. `stopPropagation`, on the controls: React bubbles through the COMPONENT tree, not the DOM
+//      tree, so the priority menu — portaled to `document.body` — is not a DOM descendant of the
+//      card at all and guard 1 cannot see it. Each wrapper around a child component that owns its
+//      own controls still swallows the bubble; see `swallow`.
 //
 // THAT CLICK IS A MOUSE CONVENIENCE AND NOTHING ELSE. The root carries NO `role="button"` and no
 // `tabIndex`: ARIA gives the `button` role presentational children, so one on the root deletes the
 // announced semantics of every control inside the card and displaces the chrome's `role="status"`.
 // The disclosure semantics live on the TITLE BUTTON instead — see the root element and the title.
-import { useEffect, useState, type CSSProperties, type ReactNode } from "react";
+import {
+  useEffect,
+  useState,
+  type CSSProperties,
+  type MouseEvent as ReactMouseEvent,
+  type ReactNode,
+} from "react";
 import { FiMessageSquare, FiUsers, FiX } from "react-icons/fi";
 import { C, FONT_WEIGHT, ON_BRAND_FILL } from "../../theme/colors";
 import { FONT_MONO, FONT_UI, RADIUS, TYPE } from "../../theme/scale";
 import { severityOf, type Bead } from "../../services/beads";
+import { isInteractiveClickTarget } from "../interactiveClickTarget";
 import type { BeadComment } from "../../services/beadsCommands";
 import type { WorkflowStageId } from "../../engine/workflowStage";
 import type { EpicGoal, EpicGoalSource } from "../../engine/epicGoal";
@@ -405,11 +421,16 @@ const rowStyle: CSSProperties = { display: "flex", alignItems: "center", gap: 8,
 /**
  * KEEP A CLICK OFF THE CARD BODY.
  *
- * The card root is the expand/collapse target, so every control on the card — and every child
- * component that owns controls of its own (the priority pill and its portaled menu, the goal
- * editor, the comment composer) — has to swallow the bubble. Written once, because "I added a
- * button and forgot the `stopPropagation`" is the exact defect the founder asked to have solved
- * rather than discovered later.
+ * The card root is the expand/collapse target, so every child component that owns controls of its
+ * own (the priority pill and its PORTALED menu, the goal editor, the comment composer) has to
+ * swallow the bubble. Written once, because "I added a button and forgot the `stopPropagation`" is
+ * the exact defect the founder asked to have solved rather than discovered later.
+ *
+ * THE ROOT NO LONGER DEPENDS ON THIS FOR THE ORDINARY CASE. `isInteractiveClickTarget` on the root
+ * already ignores a press that landed on an interactive DOM descendant, so a plain control added
+ * below needs nothing from its author (bead `sparkle-92md3i`). What is left here is the half that
+ * check STRUCTURALLY cannot do: a portaled menu is outside the card in the DOM while still inside
+ * it in the React tree, so only the component-tree guard reaches it.
  *
  * `display: contents` on the wrappers below, NOT `block`: the wrapper must not become a flex item
  * of its own or it would change the spacing of a component it is only listening on.
@@ -912,7 +933,21 @@ export function BeadCard({
       role={spec.role}
       onClick={
         toggles
-          ? (e: { detail: number }) => {
+          ? (e: ReactMouseEvent<HTMLElement>) => {
+              // ══ A PRESS THAT ALREADY HAS AN OWNER IS NOT A PRESS ON THE BODY ═══════════════
+              // Bead `sparkle-92md3i`. The `SWALLOW_BOX` wrappers below are a rule the NEXT
+              // contributor has to remember, and the descendant is often not theirs to edit:
+              // a link `<Markdown>` renders, or whatever a caller put in `footer`. That is how
+              // this shipped — one branch made the body a click target, another added links
+              // inside it, and only their MERGE contained the bug: a press both navigated and
+              // collapsed the card. This check is on the CONTAINER, so it is right by default
+              // for every interactive descendant that has not been written yet.
+              //
+              // It does NOT retire the wrappers. `PriorityPill` portals its menu to
+              // `document.body`, and React bubbles through the COMPONENT tree rather than the
+              // DOM tree, so that option is not a DOM descendant of the card at all and this
+              // cannot see it. The two guards cover different halves.
+              if (isInteractiveClickTarget(e.target, e.currentTarget)) return;
               if (gestureSelectedText(e)) return;
               onToggleCollapsed();
             }
