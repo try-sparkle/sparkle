@@ -411,6 +411,44 @@ describe("orchestrationListener", () => {
     expect(workers[0]!.status).toBe("running");
   });
 
+  it("list_workers reports a not-yet-materialized worker as 'provisioning', not 'running' (sparkle-q8fgp7)", async () => {
+    // THE SPAWN WINDOW. spawnWorker registers the roster row (addAgent) BEFORE it cuts the git
+    // worktree and stamps worktreePath (setAgentWorktree), so for the seconds-to-minutes of that cut
+    // — far longer under load — the row exists with no worktree on disk. Flattening that to "running"
+    // is the bug: an orchestrator following the documented round-trip-timeout recovery (list_workers,
+    // re-spawn only if nothing is there) saw a row AND an absent worktree and could not tell "still
+    // being created" from "half-spawned failure", while the beadId dedupe guard handed the same
+    // phantom back on every retry.
+    const ps = useProjectStore.getState();
+    // PROVISIONING: registered, worktree NOT yet cut (no setAgentWorktree → worktreePath null).
+    const provisioning = ps.addAgent(projectId, { kind: "worker", parentId: buildId })!;
+    // PAIRED CONTROL (mutation-check cause 1: an earlier gate must not be what decides the outcome).
+    // Same setup, but its worktree HAS been cut — so the ONLY thing differing between the two rows is
+    // worktreePath. It proves the "provisioning" verdict is caused by the absent worktree, and that a
+    // MATERIALIZED worker with no result.json and no live status still reads plain "running".
+    const running = ps.addAgent(projectId, { kind: "worker", parentId: buildId })!;
+    ps.setAgentWorktree(projectId, running, "/wt/materialized", "sparkle/agent-materialized");
+    // read_worker_result → null for both (no result.json anywhere), and neither carries a live tab
+    // status, so nothing but worktreePath separates the two rows.
+    invokeMock.mockImplementation((cmd: string) =>
+      Promise.resolve(cmd === "read_worker_result" ? null : undefined),
+    );
+
+    fire({ reqId: "lprov", op: "list_workers", buildAgentId: buildId, projectId, payload: {} });
+    await flush();
+
+    const reply = invokeMock.mock.calls.filter(([c]) => c === "orchestration_respond").at(-1)!;
+    const workers = (
+      reply[1] as {
+        result: { workers: Array<{ workerId: string; status: string; worktree: string }> };
+      }
+    ).result.workers;
+    const row = (id: string) => workers.find((w) => w.workerId === id)!;
+    expect(row(provisioning).status).toBe("provisioning"); // absent worktree → transient, NOT running
+    expect(row(provisioning).worktree).toBe(""); // and the worktree really is absent on this row
+    expect(row(running).status).toBe("running"); // worktree present, no result/live status → running
+  });
+
   it("list_workers gates 'done' on result.json, not the coarse tab status (sparkle-7kra)", async () => {
     // Root cause: workerStatus read the live UI tab status, where "done" means only that a Claude
     // TURN ended (statusRouter) — NOT process exit, commits, or result.json. A worker whose turn

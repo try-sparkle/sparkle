@@ -329,9 +329,10 @@ function globalGateBinds(): boolean {
 }
 
 /** Status token surfaced by list_workers: the terminal completion VERDICT when the worker has
- *  finished, otherwise its live TAB state. A superset of the two terminal verdicts plus every
- *  `AgentTabStatus` the orchestrator might need to tell a busy worker from a stuck one. */
-export type WorkerStatus = "running" | "done" | "failed" | AgentTabStatus;
+ *  finished, otherwise its live TAB state. A superset of the two terminal verdicts, the transient
+ *  `provisioning` pre-materialization state, plus every `AgentTabStatus` the orchestrator might need
+ *  to tell a busy worker from a stuck one. */
+export type WorkerStatus = "running" | "provisioning" | "done" | "failed" | AgentTabStatus;
 
 /** Status for list_workers, layering TWO independent facts so an orchestrator can act on both:
  *
@@ -364,6 +365,7 @@ export type WorkerStatus = "running" | "done" | "failed" | AgentTabStatus;
 function workerStatus(
   resultRaw: string | null | undefined,
   liveStatus: AgentTabStatus | undefined,
+  materialized: boolean,
 ): WorkerStatus {
   if (resultRaw != null) {
     try {
@@ -374,6 +376,20 @@ function workerStatus(
       // than declare a false terminal that could license a premature spin_down.
     }
   }
+  // NOT YET MATERIALIZED → "provisioning" (sparkle-q8fgp7). spawnWorker registers the roster row
+  // (store.addAgent) BEFORE it cuts the git worktree and stamps `worktreePath` (setAgentWorktree),
+  // so for the seconds-to-minutes of that cut — far worse under load — the row exists with no
+  // worktree on disk. The old code flattened that window to "running", and an orchestrator following
+  // the documented recovery (bare round-trip timeout → UNKNOWN → list_workers → re-spawn only if
+  // NOTHING is there) then saw a row AND an absent worktree with no way to tell "still being created"
+  // from "half-spawned failure" — while the beadId dedupe guard handed the same phantom back on every
+  // retry, so the bead could never be dispatched again. A distinct transient token makes the absent
+  // worktree explicitly evidence of an in-progress spawn, not of a failed one. `resultRaw` is null
+  // here whenever this fires (it is only read when worktreePath is set), so this never shadows a real
+  // completion verdict, preserving the sparkle-7kra invariant. Covers a mid-relocation record too
+  // (worktreePath transiently reset to null), which is likewise not a worktree an orchestrator can
+  // act on and must not read as a plain "running".
+  if (!materialized) return "provisioning";
   // No valid result.json → the worker has NOT completed. Surface its live state so a stalled worker
   // is distinguishable from a busy one, but never emit a terminal verdict from here (sparkle-7kra).
   if (liveStatus === undefined) return "running";
@@ -912,7 +928,10 @@ async function handleList(req: OrchestrationRequest): Promise<void> {
           : null;
         // Read once — the verdict and the still-running check must describe the SAME observation.
         const liveStatus = useRuntimeStore.getState().status[a.id];
-        const status = workerStatus(resultRaw, liveStatus);
+        // `worktreePath` is set (setAgentWorktree) only AFTER the git worktree is cut on disk, so its
+        // absence is exactly the pre-materialization window — report it as "provisioning", not a flat
+        // "running" that an absent-worktree probe would misread as a failed spawn (sparkle-q8fgp7).
+        const status = workerStatus(resultRaw, liveStatus, Boolean(a.worktreePath));
         // The branch an orchestrator would actually merge — HEAD's, not the spawn-time name — with
         // the minted name carried alongside it when the two disagree (sparkle-ul7cnx).
         const derived = deriveReportedBranch(a.branch ?? "", headBranchByWorker.get(a.id));
