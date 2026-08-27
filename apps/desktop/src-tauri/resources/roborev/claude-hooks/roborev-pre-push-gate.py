@@ -200,7 +200,7 @@ def _format_block(jobs: list[dict], cmd: str = "") -> str:
         "stays open until you close it).",
         "  3. INVALID / YAGNI finding (a guard, edge-case branch, fallback, or "
         "abstraction not warranted at the current operating point): decline it — "
-        "`roborev comment <id> -m \"<why declined>\"` to record the reason, then "
+        "`roborev comment --job <id> -m \"<why declined>\"` to record the reason, then "
         "`roborev close <id>`.",
         "",
         "Do NOT clear these with `roborev refine` or `roborev fix`: they "

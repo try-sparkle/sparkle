@@ -713,9 +713,13 @@ def open_fail_backlog(db_path: Path = ROBOREV_DB) -> list[dict] | None:
 
     Returns a list of `{repo, root_path, branch, id}` dicts (one per open-FAIL job),
     where `id` is the JOB id (`review_jobs.id`) — the namespace every CLI verb
-    (`roborev show --job <id>`, `roborev close/comment <id>`) resolves. Note the
-    `--job`: `show` resolves its argument as a git ref FIRST, so a bare numeric
-    job id is read as a commit SHA prefix. Surfacing `reviews.id` here
+    (`roborev show --job <id>`, `roborev comment --job <id>`, `roborev close
+    <id>`) resolves. Note the `--job`, and note WHICH verbs need it: `show` AND
+    `comment` both resolve their argument as a git ref FIRST, so a bare numeric
+    job id is read as a commit SHA prefix. `close` takes the bare id (it has no
+    SHA form and no `--job`), and it takes NO message flag at all — the reason
+    goes on the `comment`, which is why the pair is chained in that order.
+    Surfacing `reviews.id` here
     instead handed agents ids the CLI answers "no review found" for, killing
     the backlog sweep. SELECT DISTINCT because the emitted id is no longer the
     row's primary key: should a job ever carry two open FAIL reviews, one
@@ -807,7 +811,7 @@ def format_round_notice(rounds: int, *, threshold: int | None = None) -> str:
         "is a property of the loop, not a sign you are close.\n"
         "So on this and every later round, prefer LANDING over another lap: fix everything "
         "Medium and above (that is what the pre-push gate enforces), and for anything below it "
-        "record a decision instead of chasing it — `EDITOR=true roborev comment <id> -m \"<why>\"` "
+        "record a decision instead of chasing it — `EDITOR=true roborev comment --job <id> -m \"<why>\"` "
         "then `roborev close <id>`. A declined finding with a reason attached is finished work; "
         "an unread one is backlog. Do not take another round for findings the gate does not "
         "block on.\n"
@@ -894,7 +898,7 @@ def format_backlog_summary(
         "Sweep the STALE ones while you're here: open them with "
         "`roborev show --job <id>`, and for any that are days-old, caused by code you "
         "authored, or invalid / valid-but-YAGNI, resolve + `roborev close <id>` "
-        "(fix-then-close, or `roborev comment <id> -m \"<why declined>\"` "
+        "(fix-then-close, or `roborev comment --job <id> -m \"<why declined>\"` "
         "then close). But NEVER close a finding a parallel session is actively "
         "working — recently-created, on a branch checked out in another clone, or "
         "under a PR being iterated. When unsure whether a finding is active, "

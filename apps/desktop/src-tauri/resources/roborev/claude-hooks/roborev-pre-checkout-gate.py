@@ -109,7 +109,7 @@ def _format_block(branch: str, jobs: list[dict]) -> str:
         "  1. `roborev show --job <id>` — read the findings.",
         "  2. VALID finding: fix it in a new commit on THIS branch, then "
         "`roborev close <id>`.",
-        "  3. INVALID / YAGNI finding: `roborev comment <id> -m \"<why declined>\"` "
+        "  3. INVALID / YAGNI finding: `roborev comment --job <id> -m \"<why declined>\"` "
         "then `roborev close <id>`.",
         "",
         "Re-run the switch once no open fail-verdict reviews remain on this branch.",
