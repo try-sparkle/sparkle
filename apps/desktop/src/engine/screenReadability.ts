@@ -57,7 +57,16 @@ export function screenReadability(viewport: TerminalViewport | null): ScreenRead
   // `claudeCodeScreen` exists at all. Claude Code holds that buffer for its ordinary busy state, so
   // treating the flag as the answer would call the single most common state in the app unreadable.
   if (!viewport.alternateBuffer) return { kind: "readable" };
-  if (isClaudeCodeScreen(viewport.text)) return { kind: "readable" };
+  // ⚠️ THE AUTHORIZING READING, NAMED, EVEN THOUGH THIS IS A DISPLAY CALLER (bead sparkle-gihgml).
+  // `claudeCodeScreen`'s strictness parameter exists because colour and authorization are not the
+  // same question — and this row is the ONE display caller that must nevertheless ask the
+  // authorizing one. The header above says why: the row may not claim "Needs you" on a screen
+  // `terminalWriteRefusal` is simultaneously refusing as `alternate-screen`, and the two answer
+  // differently the moment they read different thresholds. So the leniency the roster's colour path
+  // takes (`liveBackgroundSubagentCount`, "colour-only") is deliberately NOT taken here. Passing
+  // this explicitly rather than by default is the point: an audit reading this call site sees the
+  // choice instead of having to prove it from an absence.
+  if (isClaudeCodeScreen(viewport.text, "authorize-keystrokes")) return { kind: "readable" };
   return { kind: "blind", reason: "unrecognized-fullscreen" };
 }
 

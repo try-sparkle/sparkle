@@ -52,11 +52,23 @@ export interface IdentifiableProject {
  * This USED to be a hand copy of that expression, justified here on the grounds that "the engine
  * may not depend on a service (every other `engine/*` module holds that line)". THAT RULE DOES NOT
  * EXIST. No lint rule, eslint config, or dependency check anywhere in the repo enforces an
- * engine→services boundary, and twelve non-test `engine/*` modules import VALUES from
- * `../services` today (`statusEngine`, `agentCta`, `workerAttention`, `screenClassifier`,
- * `quotaBlock`, `epicFocus`, …) — the comment was the only place the rule was ever stated.
+ * engine→services boundary, and MOST non-test `engine/*` modules import from `../services` today —
+ * `statusEngine`, `agentCta`, `workerAttention`, `screenClassifier`, `quotaBlock`, `epicFocus` and
+ * many more take VALUES, not just types.
+ *
  * `openTarget` is in any case a zero-import pure leaf (no store, no React, no Tauri, by its own
  * header), so importing it costs this module none of the properties it actually holds.
+ *
+ * DON'T TRUST THE NUMBER, RE-MEASURE IT. This paragraph used to hard-code a count of twelve. That
+ * was accurate the day it was written and had grown by the time anyone re-read it — an unbacked
+ * integer in prose is the same defect one layer down (bead sparkle-4r68r7, AGENTS.md meta-rule 1).
+ * One line settles it:
+ * `grep -l 'from "\.\./services' apps/desktop/src/engine/*.ts | grep -vc '\.test\.'`
+ *
+ * NOR WAS THIS THE ONLY PLACE THE RULE WAS STATED, as this comment once claimed it was.
+ * `engine/humanBlock.ts` and `engine/loginStanddown.ts` each restated it to justify hand-restating
+ * `services/authRecovery.NudgeFlag` instead of importing it; all three sites now record it as
+ * false, and `engine/nudgeFlagWireDrift.test.ts` pins the drift those two were carrying unguarded.
  *
  * The copy was also less safe than it read. Its drift pin fed only ASCII, lowercase,
  * trailing-slash inputs, so it pinned the separator strip and NOTHING ELSE: deleting

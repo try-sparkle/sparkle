@@ -996,19 +996,25 @@ mod tests {
     /// `__mh_execute_header`, which is not just useless but misleading about which subsystem failed.
     /// Nothing else in the build fails when that happens, so pin it here: this test is the only
     /// thing standing between a working crash pipeline and a silently dark one.
-    #[test]
-    fn release_profile_keeps_symbols_for_backtraces() {
-        let manifest = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"))
-            .expect("read src-tauri/Cargo.toml");
-        let profile = manifest
-            .split("[profile.release]")
-            .nth(1)
+    /// The `strip` value in the manifest's release profile, normalized, or `"false"` when the key
+    /// is absent (Cargo's default, which keeps symbols).
+    ///
+    /// FINDING THE SECTION IS THE DELICATE PART, and it is why this is a function taking a `&str`
+    /// rather than four lines inlined in the test. This used to be `manifest.split("[profile.release]")`,
+    /// which matches that text ANYWHERE — including inside a `#` comment. A comment added to the
+    /// manifest above the real section mentioning the header in prose handed the splitter the
+    /// COMMENT: the slice it returned held no `strip` line at all, the `unwrap_or("false")` below
+    /// took over, and the assertion passed unconditionally. The guard stayed green while guarding
+    /// nothing, which is the one failure mode it cannot afford. So the header is matched as a whole
+    /// LINE, and the section ends at the next line that starts one.
+    fn release_profile_strip(manifest: &str) -> String {
+        let mut lines = manifest.lines().map(str::trim);
+        lines
+            .find(|l| *l == "[profile.release]")
             .expect("[profile.release] section missing from Cargo.toml");
-        // Stop at the next section header so we only read this profile's keys.
-        let profile = profile.split("\n[").next().unwrap_or(profile);
-        let raw = profile
-            .lines()
-            .map(str::trim)
+        let raw = lines
+            // Stop at the next section header so we only read this profile's keys.
+            .take_while(|l| !l.starts_with('['))
             .find_map(|l| {
                 // Match the key exactly — `strip` followed by `=`, so a hypothetical `stripe = ...`
                 // can't be mistaken for it.
@@ -1020,17 +1026,63 @@ mod tests {
         // Normalize before comparing. TOML accepts either quote style and allows a trailing
         // comment, so `'symbols'` and `"symbols" # smaller binary` must not slip past a guard whose
         // entire job is to catch exactly that.
-        let strip = raw
-            .split('#')
+        raw.split('#')
             .next()
             .unwrap_or(raw)
             .trim()
-            .trim_matches(['"', '\'']);
+            .trim_matches(['"', '\''])
+            .to_string()
+    }
+
+    #[test]
+    fn release_profile_keeps_symbols_for_backtraces() {
+        let manifest = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"))
+            .expect("read src-tauri/Cargo.toml");
+        let strip = release_profile_strip(&manifest);
         assert!(
-            !matches!(strip, "true" | "symbols"),
-            "release profile sets strip = {raw}, which discards the symbol table and blinds the \
+            !matches!(strip.as_str(), "true" | "symbols"),
+            "release profile sets strip = {strip}, which discards the symbol table and blinds the \
              crash reporter. Use strip = \"debuginfo\" — it still drops DWARF (the part that \
              actually costs binary size) while keeping function names resolvable."
+        );
+    }
+
+    /// The regression for the break described on `release_profile_strip`. Prose mentioning the
+    /// header ahead of the real section must not shadow it — the value read has to come from the
+    /// SECTION, and a `strip = true` behind such a comment must still be caught.
+    ///
+    /// Both halves matter. Asserting only that a clean manifest reads `"debuginfo"` would pass on
+    /// the old splitter too, because the bug's signature is a MISSING key reported as the safe
+    /// default — so the case that pins it is the one where the answer should be alarming.
+    #[test]
+    fn a_comment_naming_the_release_header_cannot_shadow_the_real_section() {
+        let decoyed = concat!(
+            "[package]\n",
+            "name = \"x\"\n",
+            "\n",
+            "# Prose that spells [profile.release] inline, the way a hand-written note does.\n",
+            "# It is a comment, so it holds no keys and must not be mistaken for the section.\n",
+            "[profile.release]\n",
+            "strip = true\n",
+        );
+        assert_eq!(
+            release_profile_strip(decoyed),
+            "true",
+            "a comment naming the release header shadowed the real section, so the guard read no \
+             strip key and would have reported the safe default for a manifest that strips symbols"
+        );
+
+        // And the ordinary shape still resolves, including the quoting/trailing-comment forms.
+        let ok = concat!(
+            "[profile.release]\n",
+            "strip = 'debuginfo' # keeps function names\n",
+            "[profile.dev]\n",
+            "strip = true\n",
+        );
+        assert_eq!(
+            release_profile_strip(ok),
+            "debuginfo",
+            "the section must end at the next header — a later profile's key leaked in"
         );
     }
 

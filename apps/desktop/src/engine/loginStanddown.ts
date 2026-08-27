@@ -22,8 +22,13 @@
 // agent said so" to cover an agent that said nothing, or silently drop the account name, which is
 // the only part of this a person can act on.
 //
-// PURE. Data in, data out; no clock, no registry read, no I/O — same contract as `humanBlock`, and
-// the same reason: `engine/` may not import `services/`, so the caller supplies the flag.
+// PURE. Data in, data out; no clock, no registry read, no I/O — same contract as `humanBlock`. The
+// caller supplies the flag because `services/authRecovery` OWNS the poll and the module-level flag
+// map, and reaching into it would put a live registry read inside a rule that is worth having
+// precisely because a test can call it with a literal.
+//
+// It is NOT because `engine/` may not import `services/`. THAT RULE DOES NOT EXIST — see
+// `LoginStanddownFlag` below, and bead sparkle-4r68r7 for what believing it cost.
 
 /**
  * The wire token `nudge_ladder::Standdown::as_str` writes for `Standdown::LoginExpired`.
@@ -47,9 +52,25 @@ const FOUNDER_TARGET = "founder";
 /**
  * The shape this module needs from a raised nudger flag.
  *
- * STRUCTURAL ON PURPOSE — `services/authRecovery.NudgeFlag` satisfies it without being imported, so
- * `engine/` keeps its no-dependency-on-`services/` direction and this stays unit-testable with a
- * literal.
+ * STRUCTURAL ON PURPOSE, and the reason is NARROWNESS, not layering. `NudgeFlag` carries nine
+ * fields and this module reads four, so a test builds a literal without inventing `nudges`,
+ * `delivered`, `blockedBy` or `silentSecs`, and widening the wire type cannot change what is read
+ * here.
+ *
+ * ⚠️ NOT because `engine/` may not import `services/`. THAT RULE DOES NOT EXIST: no lint rule,
+ * eslint config or dependency check anywhere in this repo enforces an engine→services boundary,
+ * and most non-test `engine/*` modules import from `../services` today — re-measure with
+ * `grep -l 'from "\.\./services' apps/desktop/src/engine/*.ts | grep -vc '\.test\.'` rather than
+ * trusting a number in a comment. The claim stood in three files in this directory and had already
+ * justified one hand-copied helper before anyone checked it (bead sparkle-4r68r7). It is recorded
+ * here as false so it cannot justify a fourth.
+ *
+ * ⚠️ NARROWNESS HAS A COST, AND IT IS NOT WHAT IT LOOKS LIKE. A hand-restated wire shape drifts
+ * silently, and the obvious pin cannot see it: every field this module turns on is OPTIONAL, so
+ * `{} as NudgeFlag` satisfies this interface. Rename `standdown` on the wire type and
+ * `loginStanddownOf` returns `undefined` forever with the whole suite green.
+ * `nudgeFlagWireDrift.test.ts` pins the field NAMES against `NudgeFlag` at typecheck time — that
+ * pin is what makes the narrowing safe, and deleting it re-opens the failure.
  */
 export interface LoginStanddownFlag {
   /** `"founder"` | `"concierge"` — `nudge_ladder::Escalation::as_str`. */

@@ -283,6 +283,51 @@ muda = "0.19"
 # Unification still adds the production feature list from the entry above, so `mock_app` works.
 tauri = { version = "2", default-features = false, features = ["test"] }
 
+# ── DEV / TEST BUILD TIME (bead sparkle-i5a4a) ──────────────────────────────────────────────────
+# A cold `cargo test` for this crate is the single largest wall-clock tax any agent that touches
+# Rust here pays, and EVERY fresh agent worktree pays it once. The crate is ~248k lines of Rust
+# across 143 modules over 657 locked packages, and with cargo's stock dev profile the debug
+# `target/` reached 6.5 GB — DWARF, nearly all of it, most of it for dependencies nobody steps into.
+#
+# WHAT THESE THREE TABLES REACH. `cargo test` compiles the TEST TARGETS with `[profile.test]` and
+# every DEPENDENCY with `[profile.dev]`, and `test` inherits from `dev` — so tuning `dev` here
+# governs both halves without needing a `[profile.test]` of its own.
+#
+# WHAT THEY DO NOT CHANGE. Only the VOLUME of debug information. `opt-level`, `debug-assertions`,
+# `overflow-checks`, `panic` and `incremental` are all left at their defaults, so the same code is
+# compiled and the SAME tests run — locally and in ci.yml's `cargo check` + `cargo test` leg.
+# The release profile below reads none of this, so the shipped DMG is unaffected. (That
+# sentence deliberately does not spell the release section's header: `crash.rs`'s
+# `release_profile_keeps_symbols_for_backtraces` guard finds that section by scanning this
+# file, and an earlier mention in prose used to hand it the comment instead of the section.)
+#
+# WHY NOT `split-debuginfo`, which the usual advice reaches for first: macOS already defaults
+# dev/test to "unpacked", so it would be a no-op on the platform CI tests; and "unpacked" is
+# REJECTED by the MSVC target, which would break ci.yml's Windows `cargo check` gate. A per-target
+# override belongs in `.cargo/config.toml` — and that path is `.gitignore`d in this repo
+# (scripts/worktree-cargo-cache.sh owns it and writes a machine-local absolute path there), so
+# there is nowhere to put one that CI would ever read.
+[profile.dev]
+# Full DWARF for a crate this size is minutes of rustc and linker work on every build. Line tables
+# keep `file:line` in backtraces and in `RUST_BACKTRACE=1` test output; what is dropped is the
+# variable and type information only an interactive debugger consumes. Test failure locations are
+# untouched either way — `#[track_caller]` and `panic!`'s `Location` are compile-time constants
+# baked into the binary, not DWARF, so `assert_eq!` still names its own file and line.
+debug = "line-tables-only"
+
+# Dependencies carry NO debug information. `"*"` matches dependencies only and never this package,
+# so the line tables above survive for our own code. Symbol NAMES live in the symbol table rather
+# than in DWARF, so a backtrace crossing a dependency still names the function; it loses only the
+# file and line for that frame.
+[profile.dev.package."*"]
+debug = false
+
+# Build scripts and proc macros are compiled and then RUN at build time. Nothing ever reads their
+# debug information, and 657 packages' worth of `build.rs` and derive macros is not free to emit.
+[profile.dev.build-override]
+debug = false
+
+
 # Release tuning for a perf-sensitive native app. LTO + single codegen unit trade build time
 # for faster runtime on the git/audio/transcribe hot paths. Deliberately NOT panic="abort": the app
 # runs work on spawned threads (pty readers, audio, transcribe, bridge) and relies on unwind

@@ -59,9 +59,18 @@ const FOUNDER_TARGET = "founder";
 /**
  * The shape this module needs from a raised nudger flag.
  *
- * STRUCTURAL ON PURPOSE — `services/authRecovery.NudgeFlag` satisfies it without being imported, so
- * `engine/` keeps its no-dependency-on-`services/` direction and this stays unit-testable with a
- * literal. Widening `NudgeFlag` cannot silently change what is read here.
+ * STRUCTURAL ON PURPOSE, and the reason is NARROWNESS, not layering. `NudgeFlag` carries nine
+ * fields and this module reads three, so a test builds a literal without inventing the rest, and
+ * widening the wire type cannot silently change what is read here.
+ *
+ * ⚠️ NOT because `engine/` may not import `services/`. THAT RULE DOES NOT EXIST — nothing in this
+ * repo enforces an engine→services boundary and most non-test `engine/*` modules cross it; the
+ * claim stood in three files here and had already justified a hand-copied helper (bead
+ * sparkle-4r68r7). `loginStanddown.LoginStanddownFlag` carries the full account.
+ *
+ * ⚠️ The drift this narrowing DOES risk is pinned in `nudgeFlagWireDrift.test.ts`, not by
+ * assignability — `reply` is optional, so an object missing it still satisfies this interface, and
+ * a rename on the wire type would leave `humanBlockOf` permanently silent with the suite green.
  */
 export interface HumanBlockFlag {
   /** `"founder"` | `"concierge"` — `nudge_ladder::Escalation::as_str`. */

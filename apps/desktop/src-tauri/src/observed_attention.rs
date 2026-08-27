@@ -1124,7 +1124,18 @@ mod tests {
             // THE SPLIT THAT KEEPS FAMILY F STRICT. `hasBackgroundTaskList` gates a WRITE, so its
             // default must stay the line-anchored walk; only the attention reader passes the looser
             // test. Deleting the parameter would leave every literal above intact.
-            "terminates: (lines: readonly string[], i: number) => boolean = nothingUnrecognizedBelowFooter,",
+            //
+            // Re-pointed for bead sparkle-gihgml: the split used to be an opaque `terminates`
+            // callback and is now a NAMED strictness parameter, so what is pinned is the name, the
+            // SAFE DEFAULT, and the one call that opts out of it. All three are needed — pinning
+            // only the declaration would let the default be flipped to the lenient value in place,
+            // which is the widening this port exists to notice.
+            r#"type ScreenEvidenceUse ="#,
+            r#"use: ScreenEvidenceUse = "authorize-keystrokes","#,
+            r#"use === "colour-only""#,
+            // …and that the LOOSER reading stays confined to the attention reader. A second caller
+            // passing "colour-only" is the exact regression: colour is cheap, the write gate is not.
+            r#"return backgroundTaskRowCount(snapshot.split("\n"), "colour-only");"#,
         ] {
             assert!(
                 ts.contains(needle),

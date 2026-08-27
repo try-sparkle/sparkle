@@ -331,6 +331,36 @@ const BOX_PROMPT = /^\s*[│|]\s*[❯›>]\s*[│|]?\s*$|^\s*[│|]\s*[❯›>]\
  *  status row (`less`'s `:` prompt, a filename, a percentage), which is not ambient Claude chrome,
  *  so the walk rejects it. `vim` and `htop` never satisfy the footer grammar at all — htop's
  *  "F1Help F2Setup" carries no `<key> to <verb>` hint. */
+/** WHOSE QUESTION IS THIS? — THE RISK LEVEL IS IN THE SIGNATURE, NOT IN A COMMENT (bead
+ *  sparkle-gihgml).
+ *
+ *  ══ WHY A NAMED PARAMETER RATHER THAN A NOTE ON THE FUNCTION ═══════════════════════════════════
+ *  The predicates in this file are read by TWO KINDS OF CALLER whose false-positive costs are
+ *  orders of magnitude apart, and the difference used to live only in prose. That is the exact
+ *  shape of the incident this type exists to prevent: the family-F walk was widened for the CHEAP
+ *  caller — a roster on a narrow pane was taking its row GRAY while its subagents ran — and,
+ *  because both callers shared one threshold, the same widening silently reached the DEAR one, a
+ *  gate that authorizes keystrokes into what may be a full-screen app (roborev 68294, High). One
+ *  edit, made for colour, bought a keystroke into `less`.
+ *
+ *  A comment cannot stop that, because the person widening the threshold is reading the CALL SITE
+ *  they care about, not the other one. A parameter can: every call site now has to say which
+ *  question it is asking, and the answer is visible in the diff that widens it.
+ *
+ *  ⚠️ THE DEFAULT IS THE SAFE VALUE AND MUST STAY THAT WAY. A caller that names nothing inherits
+ *  the strict reading, so a NEW reader added later is safe until someone deliberately writes
+ *  `"colour-only"` — which is a word a reviewer can see. Defaulting the other way would make the
+ *  dangerous case the silent one, which is the bug again with a parameter attached. */
+type ScreenEvidenceUse =
+  /** A gate that AUTHORIZES KEYSTROKES into the pane — `dictationTerminalRoute`'s alternate-screen
+   *  refusal, `conciergeDispatch`, `conciergeTools/terminal`. This file's header prices a false
+   *  positive here as a line pasted AND SUBMITTED into `vim` normal mode. THE SAFE VALUE. */
+  | "authorize-keystrokes"
+  /** Row colour, a label, a count — nothing is typed anywhere. A false positive costs a wrongly
+   *  green dot, which is recoverable by looking at the pane; a false NEGATIVE takes a working
+   *  agent's row gray, which is the bug this leniency exists to fix (bead sparkle-262p7). */
+  | "colour-only";
+
 /** ══ FAMILY F — THE BACKGROUND-TASK LIST, WHICH ALSO REPLACES THE COMPOSER (bead sparkle-tbsvf) ═══
  *  THE DEFECT THIS CLOSES. Claude Code draws a live roster of its own background subagents as a
  *  block of `◯ <kind>  <label>  <elapsed>` rows under a `⏺ <branch>` header — see the founder's own
@@ -364,8 +394,11 @@ const BOX_PROMPT = /^\s*[│|]\s*[❯›>]\s*[│|]?\s*$|^\s*[│|]\s*[❯›>]\
  *  below the list) keeps a pager's trailing prose or `:` prompt out, exactly as it does for E. */
 const BACKGROUND_TASK_ROW = /^\s*◯\s+\S.*\d+m\s*\d+s\s*$/;
 
-function hasBackgroundTaskList(lines: readonly string[]): boolean {
-  return backgroundTaskRowCount(lines) !== null;
+function hasBackgroundTaskList(
+  lines: readonly string[],
+  use: ScreenEvidenceUse = "authorize-keystrokes",
+): boolean {
+  return backgroundTaskRowCount(lines, use) !== null;
 }
 
 /** How many subagents Claude Code is listing as live, or `null` when this is not a live list.
@@ -388,8 +421,9 @@ function hasBackgroundTaskList(lines: readonly string[]): boolean {
  *  agent green forever. Position is the discriminator, exactly as it is for the dialog family. */
 function backgroundTaskRowCount(
   lines: readonly string[],
-  /** How strictly the list must TERMINATE the grid — and the two callers genuinely differ, because
-   *  they are asking different questions with different costs (roborev 68294, High).
+  /** WHICH QUESTION IS BEING ASKED, and therefore how strictly the list must TERMINATE the grid.
+   *  The two callers genuinely differ (roborev 68294, High), so the difference is NAMED here rather
+   *  than left to a comment on the threshold — see {@link ScreenEvidenceUse}.
    *
    *  ⚠️ THE DEFAULT IS THE STRICT WALK, AND IT MUST STAY THAT WAY. `hasBackgroundTaskList` is
    *  FAMILY F, and `isClaudeCodeScreen` returns true on family F STANDING ALONE — no corroborating
@@ -399,8 +433,13 @@ function backgroundTaskRowCount(
    *  strictly weaker than the walk — it constrains the tail's OPENING, not all of it — so routing
    *  it into family F traded a gray row for a keystroke into `less`. Colour and authorization are
    *  not the same question and must not share one threshold. */
-  terminates: (lines: readonly string[], i: number) => boolean = nothingUnrecognizedBelowFooter,
+  use: ScreenEvidenceUse = "authorize-keystrokes",
 ): number | null {
+  const terminates =
+    use === "colour-only"
+      ? (lines: readonly string[], i: number): boolean =>
+          nothingUnrecognizedBelowFooter(lines, i) || chromeBarTailBelow(lines, i)
+      : nothingUnrecognizedBelowFooter;
   for (let i = lines.length - 1; i >= 0; i--) {
     if (!BACKGROUND_TASK_ROW.test(lines[i] ?? "")) continue;
     if (!terminates(lines, i)) return null;
@@ -527,10 +566,7 @@ export function liveBackgroundSubagentCount(snapshot: string): number | null {
   // Ink-wrapped status bar — so on a narrow pane the walk alone took a row GRAY with its subagents
   // visibly listed. That is a colour bug; it never authorizes a write, which is why this and family
   // F ask the question differently. See `backgroundTaskRowCount`'s parameter.
-  return backgroundTaskRowCount(
-    snapshot.split("\n"),
-    (lines, i) => nothingUnrecognizedBelowFooter(lines, i) || chromeBarTailBelow(lines, i),
-  );
+  return backgroundTaskRowCount(snapshot.split("\n"), "colour-only");
 }
 
 function hasLiveDialog(lines: readonly string[]): boolean {
@@ -722,10 +758,23 @@ const MAX_NARROW_CHROME_ROWS = 12;
  *  bar-plus-prose document this bound exists to reject. The tail is therefore SEGMENTED per logical
  *  bar and this bounds each segment.
  *
- *  ⚠️ DO NOT RE-DERIVE THIS FROM A BAR YOU HAPPEN TO BE LOOKING AT. `theLongestCapturedBar` in
- *  `claudeCodeScreen.test.ts` recomputes the maximum FROM the fixture and fails if it exceeds this,
- *  so a longer sample added later reds the suite instead of silently taking a row gray. That test is
- *  the reason this number is allowed to be a literal at all. */
+ *  ⚠️ DO NOT RE-DERIVE THIS FROM A BAR YOU HAPPEN TO BE LOOKING AT, AND DO NOT RE-STATE THE MEASURED
+ *  MAXIMUM IN PROSE HERE. A number hand-copied out of data drifts the moment the data changes, which
+ *  is the defect this replaced (bead sparkle-lmpbuj): the previous constant's comment claimed "the
+ *  longest bar is 48 characters" while the fixture it cited as its authority OPENED with a
+ *  74-character one. The comment pointed at the evidence that refuted it and nobody followed it.
+ *
+ *  The maximum is therefore written down NOWHERE. `every captured bar clears the bound — the maximum
+ *  COMPUTED from the fixture, never quoted` in `claudeCodeScreen.test.ts` measures the bound IN
+ *  FORCE by probing `chromeBarTailBelow`, then requires every bar-shaped line in
+ *  `capturedScreens.fixture.ts` to clear it — so a longer sample added later reds the suite instead
+ *  of silently taking a row gray. That test is the only reason this may be a literal at all.
+ *
+ *  ⚠️ IT IS A CEILING, NOT A MEASUREMENT — `>=` the longest bar Claude draws, never `==` it: a bar
+ *  carries a PR number and a branch name, and both grow. Note also that the longest LINE in that
+ *  fixture list is 99 characters and is NOT a bar; a re-derivation that measures lines rather than
+ *  bars produces a number no bound could satisfy, which is why the test separates shape from
+ *  length before taking a maximum. */
 const MAX_BAR_CHARS = 96;
 
 /** HOW a narrow box terminated the grid, because the two ways are not equal evidence (roborev
@@ -943,7 +992,10 @@ function matchesAny(patterns: readonly RegExp[], text: string): boolean {
  * silently collapsed two families into one would still satisfy `>= 2` from a single marker, and that
  * is exactly the weakening this module must not accept quietly.
  */
-export function claudeCodeMarkerFamilies(snapshot: string): number {
+export function claudeCodeMarkerFamilies(
+  snapshot: string,
+  use: ScreenEvidenceUse = "authorize-keystrokes",
+): number {
   const lines = snapshot.split("\n");
   let n = 0;
   if (matchesAny(BUSY_STATUS, snapshot)) n += 1;
@@ -968,7 +1020,7 @@ export function claudeCodeMarkerFamilies(snapshot: string): number {
   if (hasLiveDialog(lines)) n += 1;
   // Family F, same reasoning: a screen showing only the background-task list scores 1 on the
   // `⏺ <branch>` header (family B) alone without this, which is the exact gap sparkle-tbsvf found.
-  if (hasBackgroundTaskList(lines)) n += 1;
+  if (hasBackgroundTaskList(lines, use)) n += 1;
   return n;
 }
 
@@ -996,7 +1048,14 @@ export function hasClaudeCodeComposerBox(snapshot: string): boolean {
  * that is a different guard's question — `screenBlocksWrite` still has to run, and in
  * `terminalWriteRefusal` it does. Do not let a true from this function stand in for that check.
  */
-export function isClaudeCodeScreen(snapshot: string): boolean {
+export function isClaudeCodeScreen(
+  snapshot: string,
+  /** WHOSE QUESTION IS THIS — see {@link ScreenEvidenceUse}. Defaulted to the AUTHORIZING reading,
+   *  which is the safe one, so a caller added later inherits safety rather than the leniency the
+   *  colour path asked for (bead sparkle-gihgml). Every caller in this repo is listed on that
+   *  type; if you are adding one, say which kind you are. */
+  use: ScreenEvidenceUse = "authorize-keystrokes",
+): boolean {
   const lines = snapshot.split("\n");
 
   // ── A LIVE DIALOG STANDS ALONE; IT DOES NOT NEED A SECOND FAMILY ─────────────────────────────
@@ -1019,7 +1078,7 @@ export function isClaudeCodeScreen(snapshot: string): boolean {
   // ── THE BACKGROUND-TASK LIST STANDS ALONE TOO, FOR THE SAME REASON (bead sparkle-tbsvf) ────────
   // It replaces the composer exactly as a live dialog does, so requiring family D below would fail
   // on precisely the screen this family exists for.
-  if (hasBackgroundTaskList(lines)) return true;
+  if (hasBackgroundTaskList(lines, use)) return true;
 
   // ── A NARROW COMPOSER BOX STANDS ALONE, LIKE E AND F (roborev 64482, High) ────────────────────
   // NOT a relaxation — it is what stops one piece of evidence being counted twice. The narrow arm
@@ -1060,12 +1119,15 @@ export function isClaudeCodeScreen(snapshot: string): boolean {
   // Unchanged, and still the rule for every screen without a live dialog: a pasted transcript in a
   // pager carries Claude's glyphs and its status bar — two families — without being Claude Code.
   if (box === "no") return false;
-  return claudeCodeMarkerFamilies(snapshot) >= 2;
+  return claudeCodeMarkerFamilies(snapshot, use) >= 2;
 }
 
 /** Is there evidence of a LIVE Claude Code TUI — either form? The precondition `isClaudeCodeScreen`
  *  applies, split out so callers and tests can ask for it directly. */
-export function hasClaudeCodeLiveTui(snapshot: string): boolean {
+export function hasClaudeCodeLiveTui(
+  snapshot: string,
+  use: ScreenEvidenceUse = "authorize-keystrokes",
+): boolean {
   const lines = snapshot.split("\n");
-  return hasComposerBox(lines) || hasLiveDialog(lines) || hasBackgroundTaskList(lines);
+  return hasComposerBox(lines) || hasLiveDialog(lines) || hasBackgroundTaskList(lines, use);
 }

@@ -312,13 +312,66 @@ describe("chromeBarTailBelow — a tail is one or more logical status bars", () 
   const SHORT_BAR = "⏸ manual mode on · ? for shortcuts";
   const LONG_BAR = NON_PICKER_HINT_LINES_2_1_220[0]!;
 
-  it("the fixture's longest bar is the one the bound must clear — measured, not quoted", () => {
-    // THE GUARD ON THE GUARD. The replaced constant's comment asserted "the longest bar is 48
-    // characters" while this very list opened with a 74-character one. Recomputing it here means a
-    // longer sample added later reds this test instead of silently taking a row gray.
-    const longest = Math.max(...NON_PICKER_HINT_LINES_2_1_220.map((l) => l.trim().length));
-    expect(longest).toBeGreaterThan(64);
-    expect(LONG_BAR.trim().length).toBe(74);
+  // ══ THE GUARD ON THE GUARD (bead sparkle-lmpbuj) ═══════════════════════════════════════════
+  //
+  // The replaced constant's comment asserted "the longest bar Claude draws is 48 characters" and
+  // cited THIS list as its authority. The list's own first entry is 74. A number sized from a
+  // measured maximum and then QUOTED in prose cannot notice when the measurement stops being true,
+  // which is how a bound shipped that rejected a real, captured, unwrapped bar.
+  //
+  // The first repair recomputed the maximum here and then asserted only `> 64` against it — the
+  // computation was decoration, because the assertion it fed could never fail for the reason the
+  // comment claimed it would. Adding a 200-character sample left this green. What follows compares
+  // the fixture against the BOUND ITSELF, so a longer sample reds the suite.
+
+  /** The longest single-row tail `chromeBarTailBelow` accepts — MEASURED from the code, not read
+   *  off the constant.
+   *
+   *  ⚠️ DELIBERATELY NOT AN IMPORT. `MAX_BAR_CHARS` is module-private, and exporting it so a test
+   *  could compare it against itself would prove nothing (and would strand an export whose only
+   *  importer is a test). Probing the real function instead means this measures the bound that is
+   *  actually IN FORCE, including anything else in the path that shortens it.
+   *
+   *  The stem is a real captured bar, so `BAR_OPENS_STRICT` matches the join by construction and
+   *  LENGTH is the only thing left that can decide acceptance. Padding is `x` — one segment, so no
+   *  continuation row exists for `looksLikeProse` to judge. */
+  const MEASURED_BAR_BOUND = ((): number => {
+    const base = [...SHORT_BAR].length;
+    for (let n = base; n <= 2000; n += 1) {
+      if (!tail(SHORT_BAR + "x".repeat(n - base))) return n - 1;
+    }
+    throw new Error("chromeBarTailBelow accepted a 2000-character bar: the per-bar bound is gone");
+  })();
+
+  it("every captured bar clears the bound — the maximum COMPUTED from the fixture, never quoted", () => {
+    // A rejected line is not automatically a violation: most entries in this list are hint lines
+    // rather than status bars, and the bound never applies to them. Truncating a rejected line to
+    // the bound is what separates the two causes. Every `BAR_OPENS_STRICT` pattern is anchored and
+    // decides inside the first few words, so truncation cannot destroy a match that was there —
+    // which means a truncated line that IS accepted proves the full line is a real bar the LENGTH
+    // turned away. That is the failure this test exists to catch.
+    const rejectedBars: string[] = [];
+    const acceptedBars: string[] = [];
+    for (const raw of NON_PICKER_HINT_LINES_2_1_220) {
+      const line = raw.trim();
+      if (tail(line)) acceptedBars.push(line);
+      else if (tail([...line].slice(0, MEASURED_BAR_BOUND).join(""))) rejectedBars.push(line);
+    }
+    expect(rejectedBars).toEqual([]);
+    expect(acceptedBars.length).toBeGreaterThan(0);
+
+    const longestBar = Math.max(...acceptedBars.map((l) => [...l].length));
+    expect(longestBar).toBeLessThanOrEqual(MEASURED_BAR_BOUND);
+    // …and the number the REPLACED bound used could never have held it. Kept as a computed fact
+    // about the past rather than a sentence claiming one.
+    expect(longestBar).toBeGreaterThan(64);
+  });
+
+  it("no captured hint line ends in a full stop — the OTHER claim this file makes in prose", () => {
+    // `looksLikeProse` is justified by "no entry in `capturedScreens.fixture.ts` ends in a full
+    // stop". Same class of claim as the one above, same failure mode if a later capture breaks it:
+    // the prose-vs-wrapped-fragment split silently stops separating anything.
+    expect(NON_PICKER_HINT_LINES_2_1_220.filter((l) => /\.\s*$/.test(l))).toEqual([]);
   });
 
   it("accepts a short bar — the only shape the previous tests covered", () => {
