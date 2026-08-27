@@ -106,6 +106,22 @@ fn ensure_never_index_marker(dir: &Path) {
 fn mark_worktree_never_indexed(app_data: &Path, worktree_root: &Path) {
     ensure_never_index_marker(&app_data.join("worktrees"));
     ensure_never_index_marker(worktree_root);
+    // WHOEVER WRITES THE MARKER MUST ALSO MAKE GIT IGNORE IT, in the same breath. Listing it in
+    // `AGENT_WORKTREE_IGNORES` is necessary but NOT sufficient on its own: that list only reaches a
+    // repo once something calls `ensure_worktree_excludes`, which used to happen exclusively on
+    // project prep and on the park's decision point. A worktree created by any other route — the
+    // agent-creation path here — therefore got the marker WITHOUT the exclude, leaving it as
+    // untracked dirt that aborts `git checkout`/`git merge` and pollutes the close prompt's SAFETY
+    // reading. That is the same "wired into the wrong place" gap the park call site was moved to
+    // close, arriving by a different door, so the fix is the same shape: seed at the moment the
+    // condition is created rather than trusting an earlier caller to have done it.
+    //
+    // Cheap, idempotent (one small read; a write only when a pattern is genuinely absent) and
+    // best-effort — `ensure_worktree_excludes` returns Ok on an unwritable gitdir, so this can never
+    // turn a successful worktree creation into an error. The marker itself is likewise best-effort,
+    // and these two must keep that property together: a marker with no exclude is worse than no
+    // marker at all.
+    let _ = ensure_worktree_excludes(&worktree_root.to_string_lossy());
 }
 
 /// Resolve Sparkle's per-user app-data dir (e.g. ~/Library/Application Support/ai.sparkle.desktop).
@@ -1523,13 +1539,28 @@ pub async fn remove_repo_hooks_cmd(path: String) -> Result<(), String> {
 // `.beads/.gitignore` is (a wedged worktree is pinned to an old branch that predates any fix). The
 // store is runtime data that is never committed, so excluding it in the untracked `info/exclude`
 // only ever suppresses dirt that had no business blocking the park.
-const AGENT_WORKTREE_IGNORES: [&str; 6] = [
+//
+// `.metadata_never_index` is the macOS Spotlight marker `mark_worktree_never_indexed` drops into
+// EVERY worktree root it creates. Writing a file git has never heard of turned it into untracked
+// dirt that git actively refuses to clobber, so it did not merely add noise — it BROKE the two
+// operations this module exists to perform:
+//
+//     git checkout <branch> failed: The following untracked working tree files would be
+//       overwritten by checkout:  .metadata_never_index
+//     git merge --no-ff -m integrate <branch> failed: ... would be overwritten by merge
+//
+// and it leaked into the SAFETY reading behind the close prompt, which asks whether files are at
+// risk: the marker showed up beside the user's real work as `[..., ".metadata_never_index", ...]`.
+// Nineteen `worktree::tests` caught exactly that. NO trailing slash — the marker is a FILE, and the
+// directory form would not match it (the same distinction the beads entries above are written for).
+const AGENT_WORKTREE_IGNORES: [&str; 7] = [
     ".claude/worktrees/",
     ".wt-*/",
     ".sparkle-*/",
     ".beads/embeddeddolt",
     ".beads/dolt",
     ".beads/proxieddb",
+    ".metadata_never_index",
 ];
 
 /// Append any of `patterns` missing from the newline-delimited `existing`, or `None` when all are
