@@ -77,6 +77,37 @@ pub fn worktree_path(app_data: &Path, project_id: &str, agent_id: &str) -> Resul
     Ok(app_data.join("worktrees").join(project_id).join(agent_id))
 }
 
+/// Drop an empty `.metadata_never_index` marker in `dir`. macOS Spotlight honors this file for the
+/// entire subtree that contains it, so its presence tells `mdworker`/`mediaanalysisd`/
+/// `knowledgeconstructiond` to stop crawling — which matters because Sparkle's out-of-tree worktrees
+/// hold millions of files the OS indexers would otherwise churn through on every machine.
+///
+/// Idempotent (returns early if the marker already exists) and BEST-EFFORT: a write failure is
+/// logged and swallowed. A marker is a performance nicety, never a correctness requirement, so it
+/// must never fail the worktree creation that calls it.
+fn ensure_never_index_marker(dir: &Path) {
+    let marker = dir.join(".metadata_never_index");
+    if marker.exists() {
+        return;
+    }
+    if let Err(e) = std::fs::write(&marker, b"") {
+        tracing::warn!(
+            path = %marker.display(),
+            error = %e,
+            "failed to write .metadata_never_index marker; macOS may index this subtree"
+        );
+    }
+}
+
+/// Ensure the never-index marker exists both at a just-created worktree ROOT and at the shared
+/// `<app_data>/worktrees` BASE that contains every worktree. Marking the base covers pool slots and
+/// any future sibling before its own marker lands; marking the leaf covers the worktree itself even
+/// if the base marker was ever removed. Best-effort throughout (see `ensure_never_index_marker`).
+fn mark_worktree_never_indexed(app_data: &Path, worktree_root: &Path) {
+    ensure_never_index_marker(&app_data.join("worktrees"));
+    ensure_never_index_marker(worktree_root);
+}
+
 /// Resolve Sparkle's per-user app-data dir (e.g. ~/Library/Application Support/ai.sparkle.desktop).
 /// Routes through `dev_identity` so DEBUG builds get the isolated `-dev` sibling and never mutate
 /// production workspace state.
@@ -1629,6 +1660,8 @@ pub fn create_worktree_at(
 
     // Idempotent: if the path already exists and is a valid worktree, return it.
     if wt.exists() && git(&wt_str, &["rev-parse", "--is-inside-work-tree"]).is_ok() {
+        // Retro-fit the marker onto worktrees that predate it (they already exist on every Mac).
+        mark_worktree_never_indexed(app_data, &wt);
         return Ok(WorktreeInfo { path: wt_str, branch });
     }
 
@@ -1663,6 +1696,7 @@ pub fn create_worktree_at(
             // the slot we just consumed. Both off the critical path.
             spawn_background_origin_refresh(root, base_branch);
             spawn_pool_topup(root, project_id, base_branch, app_data);
+            mark_worktree_never_indexed(app_data, Path::new(&info.path));
             return Ok(info);
         }
         // SLOW PATH (pool disabled / empty / stale): cut IMMEDIATELY from the last-known integration
@@ -1695,6 +1729,8 @@ pub fn create_worktree_at(
         spawn_pool_topup(root, project_id, base_branch, app_data);
     }
 
+    // Keep macOS indexers off the freshly-cut worktree (and the base that holds them all).
+    mark_worktree_never_indexed(app_data, &wt);
     Ok(WorktreeInfo { path: wt_str, branch })
 }
 
@@ -1727,6 +1763,7 @@ pub fn create_worktree_from_local(
     // is always THIS worker's own (already on `sparkle/agent-<worker_id>`) — not a stale cut from
     // a different base. We therefore don't re-verify its branch/ancestry.
     if wt.exists() && git(&wt_str, &["rev-parse", "--is-inside-work-tree"]).is_ok() {
+        mark_worktree_never_indexed(app_data, &wt);
         return Ok(WorktreeInfo { path: wt_str, branch });
     }
     if let Some(parent) = wt.parent() {
@@ -1745,6 +1782,8 @@ pub fn create_worktree_from_local(
     } else {
         git(root, &["worktree", "add", "-b", &branch, &wt_str, base])?;
     }
+    // Keep macOS indexers off the freshly-cut worker worktree (and the base that holds them all).
+    mark_worktree_never_indexed(app_data, &wt);
     Ok(WorktreeInfo { path: wt_str, branch })
 }
 
@@ -12575,6 +12614,69 @@ mod tests {
         let app_data = unique_root(&format!("{tag}-appdata"));
         let info = create_worktree_at(&r, "p1", "a1", "main", &app_data).unwrap();
         (r, info.path, app_data)
+    }
+
+    // ── .metadata_never_index markers (macOS indexing exclusion) ────────────────────────────────
+
+    /// The helper is the unit under test: it CREATES the marker, is idempotent on a second call, and
+    /// TOLERATES a pre-existing marker (even one with content) without clobbering it or erroring.
+    #[test]
+    fn ensure_never_index_marker_creates_is_idempotent_and_tolerant() {
+        let dir = unique_root("never-index-helper");
+        let marker = dir.join(".metadata_never_index");
+        assert!(!marker.exists(), "precondition: no marker yet");
+
+        ensure_never_index_marker(&dir);
+        assert!(marker.exists(), "the marker must be created");
+
+        // Idempotent: a second call is a no-op and must not error.
+        ensure_never_index_marker(&dir);
+        assert!(marker.exists(), "still present after a second call");
+
+        // Tolerates a pre-existing marker that already has content — must NOT overwrite it.
+        std::fs::write(&marker, b"preexisting").unwrap();
+        ensure_never_index_marker(&dir);
+        assert_eq!(
+            std::fs::read(&marker).unwrap(),
+            b"preexisting",
+            "an existing marker is left untouched, never clobbered"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The create PATH must drop the marker at the worktree ROOT and at the shared `worktrees` BASE.
+    /// This is the assertion that goes RED if the `mark_worktree_never_indexed` call is removed from
+    /// `create_worktree_at` — driving the real production entry point, not the helper directly.
+    #[test]
+    fn create_worktree_at_marks_root_and_base() {
+        let (_root, wt, app_data) = repo_with_worktree("never-index-agent");
+        assert!(
+            Path::new(&wt).join(".metadata_never_index").exists(),
+            "the agent worktree root must carry the never-index marker"
+        );
+        assert!(
+            app_data.join("worktrees").join(".metadata_never_index").exists(),
+            "the shared worktrees base must carry the never-index marker"
+        );
+    }
+
+    /// The worker path (`create_worktree_from_local`) must mark its worktree too. Workers cut from a
+    /// sibling agent's LOCAL branch, so `main` (which `init_repo` leaves checked out) serves as the
+    /// local base here.
+    #[test]
+    fn create_worktree_from_local_marks_the_worker_worktree() {
+        let r = init_repo("never-index-worker");
+        let app_data = unique_root("never-index-worker-appdata");
+        let info = create_worktree_from_local(&r, "p1", "w1", "main", &app_data).unwrap();
+        assert!(
+            Path::new(&info.path).join(".metadata_never_index").exists(),
+            "the worker worktree root must carry the never-index marker"
+        );
+        assert!(
+            app_data.join("worktrees").join(".metadata_never_index").exists(),
+            "the shared worktrees base must carry the never-index marker"
+        );
+        let _ = std::fs::remove_dir_all(&app_data);
     }
 
     #[test]
