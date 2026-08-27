@@ -108,7 +108,10 @@ const JOIN_FAILED: &str = "the keychain task didn't finish";
 
 /// The keychain half of the read path. Validated on READ as well as write — see the command's doc.
 fn keychain_pat() -> Option<String> {
-    let stored = entry().ok()?.get_password().ok()?;
+    // Guarded: in a DEBUG build this must never raise the macOS confidential-information
+    // dialog for the dev-suffixed item this binary no longer owns the ACL of (sparkle-vvwbl).
+    let e = entry().ok()?;
+    let stored = crate::dev_identity::no_prompt(|| e.get_password().ok())?;
     normalize_pat(&stored)
 }
 
@@ -118,12 +121,18 @@ fn store_pat(pat: &str) -> Result<(), String> {
     let Some(pat) = normalize_pat(pat) else {
         return Err("that PAT is empty or contains spaces/line breaks; check the paste".to_string());
     };
-    entry()?.set_password(&pat).map_err(|e| e.to_string())
+    let e = entry()?;
+    // Guarded: in a DEBUG build this must never raise the macOS confidential-information
+    // dialog for the dev-suffixed item this binary no longer owns the ACL of (sparkle-vvwbl).
+    crate::dev_identity::no_prompt(|| e.set_password(&pat)).map_err(|e| e.to_string())
 }
 
 /// The keychain half of the disconnect path. `NoEntry` is the state the caller wanted.
 fn erase_pat() -> Result<(), String> {
-    match entry()?.delete_credential() {
+    let entry = entry()?;
+    // Guarded: in a DEBUG build this must never raise the macOS confidential-information
+    // dialog for the dev-suffixed item this binary no longer owns the ACL of (sparkle-vvwbl).
+    match crate::dev_identity::no_prompt(|| entry.delete_credential()) {
         Ok(()) => Ok(()),
         Err(keyring::Error::NoEntry) => Ok(()),
         Err(e) => Err(e.to_string()),

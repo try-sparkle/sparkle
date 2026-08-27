@@ -13,6 +13,13 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
+/// The shared delivered-list watch below is macOS-only in production (it is the macOS Notification
+/// Center list), but its policy is plain Rust and is unit-tested on every platform.
+#[cfg(any(target_os = "macos", test))]
+use std::collections::HashSet;
+#[cfg(any(target_os = "macos", test))]
+use std::sync::LazyLock;
+
 use tauri::{AppHandle, Emitter, Manager};
 
 /// How many notification banners may be parked at once. Each `notify_attention` blocks a thread
@@ -26,9 +33,12 @@ static IN_FLIGHT_NOTIFICATIONS: AtomicUsize = AtomicUsize::new(0);
 /// How long an untouched banner may sit in Notification Center before we take it back.
 ///
 /// ── WHAT THIS FIXES, AND WHAT IT NO LONGER FIXES ──────────────────────────────────────────────
-/// `wait_for_click(true)` makes `mac-notification-sys` poll `deliveredNotifications` every 0.5s per
-/// banner — a synchronous XPC round-trip — and the poll stops only when the notification leaves the
-/// center. Nothing did that for a banner the user ignored, so it ran forever.
+/// `wait_for_click(true)` makes `mac-notification-sys` watch for auto-dismiss every 0.5s per banner,
+/// and the watch stops only when the notification leaves the center. Nothing did that for a banner
+/// the user ignored, so it ran forever. (That watch WAS a synchronous whole-list
+/// `deliveredNotifications` XPC round-trip, per banner; it is now a lookup against the single
+/// shared snapshot — see the ONE READER note below. What still runs forever is the entry sitting in
+/// Notification Center, which is what this TTL bounds.)
 ///
 /// Upstream ran that poll on the MAIN RUN LOOP, which made it the app's largest source of
 /// multi-second UI stalls (~22% of main-thread wall clock in a live `sample`). **That part is no
@@ -38,10 +48,12 @@ static IN_FLIGHT_NOTIFICATIONS: AtomicUsize = AtomicUsize::new(0);
 /// main-thread jank; that would be claiming credit for someone else's fix.
 ///
 /// Two things the off-thread move did NOT address, which are what this TTL is actually for:
-///  1. **The delivered list still grows for the process lifetime.** Every poll marshals the whole
-///     list, so the cost per poll climbs — measured across three samples of one session, blocked
+///  1. **The delivered list still grows for the process lifetime.** Every read marshals the whole
+///     list, so the cost per read climbs — measured across three samples of one session, blocked
 ///     time rose 22% → 38% while the parked-thread count stayed pinned at the cap, and the process
-///     footprint went 919MB → 1.1GB. That work is merely relocated off main, not eliminated.
+///     footprint went 919MB → 1.1GB. The shared snapshot took the per-banner MULTIPLIER out of
+///     that (one read per sweep instead of one per banner per tick), but a longer list still costs
+///     more per read, so bounding the list is still this TTL's job.
 ///  2. **Slots are never released** — see the slot-lifetime note below, which is the sharper one.
 ///
 /// ── THE TRADE THIS CONSTANT MAKES, STATED PLAINLY ─────────────────────────────────────────────
@@ -64,9 +76,11 @@ static IN_FLIGHT_NOTIFICATIONS: AtomicUsize = AtomicUsize::new(0);
 /// ── THE THIRD AXIS: THIS CONSTANT IS ALSO THE SLOT LIFETIME ───────────────────────────────────
 /// Not obvious, and worth stating because getting it wrong loses banners outright. `send()` parks
 /// its thread until the banner is clicked, dismissed, or AUTO-dismissed — and `notify.m`'s
-/// `wasAutoDismissed()` means precisely "no longer in `deliveredNotifications`". So when the sweep
-/// removes an entry, that is what releases the parked thread and with it one of the
-/// `MAX_IN_FLIGHT_NOTIFICATIONS` slots. Slot lifetime IS the TTL.
+/// `wasAutoDismissed()` means precisely "no longer in the delivered list". So when the sweep removes
+/// an entry, that is what releases the parked thread and with it one of the
+/// `MAX_IN_FLIGHT_NOTIFICATIONS` slots. Slot lifetime IS the TTL. (Since the shared snapshot, the
+/// banner learns this from the NEXT sweep rather than within 0.5s, so a slot comes back up to one
+/// sweep interval later — small against a 30-300s TTL, and it is the whole cost of the merge.)
 ///
 /// Left alone, that couples reachability to THROUGHPUT: at a flat 300s the sustained ceiling is 16
 /// banners per five minutes, and past the cap `notify_attention` drops the banner entirely — no
@@ -287,6 +301,307 @@ pub unsafe extern "C" fn sparkle_select_notifications_to_evict(
     n
 }
 
+// ── ONE READER FOR THE DELIVERED LIST ─────────────────────────────────────────────────────────
+//
+// ── THE DEFECT THIS REPLACES ──────────────────────────────────────────────────────────────────
+// `send()` parks a thread per banner, and that thread watched for auto-dismiss by asking the OS
+// directly: `wasAutoDismissed()` iterated `notificationCenter.deliveredNotifications` — a
+// SYNCHRONOUS XPC round-trip that marshals and unarchives the WHOLE list — every 0.5s, forever, for
+// every parked banner. The cost was therefore N × 2 whole-list reads per second: at the
+// `MAX_IN_FLIGHT_NOTIFICATIONS` ceiling, ~32 per second for the life of the process. A live sample
+// caught 46 concurrent `NSUserNotificationCenter.SyncQueue` objects mid-`NSKeyedUnarchiver` decode,
+// with queue serial numbers spanning ~47,800 dispatch queues created in 83 minutes, contending
+// `_os_unfair_lock_lock_slow` inside `objc look_up_class`. PR #816 moved that work OFF the main
+// thread, which fixed the UI stalls; it never made it CHEAP, and this is the half it left.
+//
+// ── THE SHAPE OF THE FIX ──────────────────────────────────────────────────────────────────────
+// Exactly one reader. The 15s expiry sweep was already reading the same list for its own purpose,
+// so the two readers are merged: the sweep publishes the identifiers it just read as a SNAPSHOT,
+// and every parked banner answers "am I still delivered?" from that snapshot — an in-process
+// `HashSet` lookup, zero XPC. Reads per interval are now ONE, independent of how many banners are
+// parked. That independence is the property the tests pin; see
+// `the_delivered_list_is_read_once_per_sweep_however_many_banners_are_parked`.
+//
+// ── WHAT THIS COSTS, STATED PLAINLY ───────────────────────────────────────────────────────────
+// Auto-dismiss is now noticed within one SWEEP interval (15s) instead of within one banner poll
+// (0.5s), so the in-flight slot a silently-vanished banner holds is released up to ~15s later. That
+// is small against the 30–300s slot lifetime the TTL already imposes (see `NOTIFICATION_TTL_SECS`)
+// and it does not touch real interactions at all: a click or a dismiss arrives on AppKit's delegate
+// and marks the notification done immediately, with no polling involved on either design.
+
+/// How many committed snapshots a banner may go UNSEEN before we conclude it is gone.
+///
+/// The ordinary verdict is "some snapshot saw it, the newest does not" — unambiguous. This constant
+/// covers the case that verdict cannot reach: a banner delivered and cleared entirely BETWEEN two
+/// snapshots is never observed present, so "seen then unseen" never fires and its thread would park
+/// forever, permanently leaking one of the `MAX_IN_FLIGHT_NOTIFICATIONS` slots. That is a worse
+/// failure than the poll cost this whole change exists to remove, so it needs an escape.
+///
+/// Four snapshots at the 15s sweep is a ~60s grace — long enough that a banner in a genuinely
+/// healthy center is observed many times over first, short enough that a leaked slot comes back
+/// inside a minute. Erring LONG is the safe direction: concluding "absent" early only unparks the
+/// thread (the Notification Center entry is untouched and the dock badge is unaffected), but it does
+/// retire the pending entry, so a click landing afterwards has nowhere to go.
+#[cfg(any(target_os = "macos", test))]
+const DELIVERED_WATCH_GRACE_SNAPSHOTS: u64 = 4;
+
+/// THE verdict a parked banner acts on: is it gone from Notification Center?
+///
+/// Pure, so the thing that decides whether a banner's thread unparks is unit-testable — the same
+/// doctrine as `should_expire` and `select_evictions`, and for the same reason: the alternative is a
+/// comparison living in Objective-C where nothing in CI can see it inverted.
+///
+/// Ordered so the cheap certainties come first, and `ever_seen` is what separates "it left" from "we
+/// have not looked at it yet" — a distinction the raw `!present` test cannot make and which, gotten
+/// wrong, auto-dismisses every banner the instant it is posted.
+#[cfg(any(target_os = "macos", test))]
+fn watch_says_absent(
+    present_in_latest: bool,
+    ever_seen: bool,
+    snapshots_since_watch: u64,
+    grace_snapshots: u64,
+) -> bool {
+    // In the newest snapshot: still delivered, whatever else is true.
+    if present_in_latest {
+        return false;
+    }
+    // Seen before, gone now — that IS the auto-dismiss signal, and it is the only unambiguous one.
+    if ever_seen {
+        return true;
+    }
+    // Never seen at all. Either no snapshot has been taken yet (say so: keep waiting), or enough
+    // have been taken that "it was never there" is the only reading left. See the grace constant.
+    snapshots_since_watch >= grace_snapshots
+}
+
+/// What we know about one banner whose thread is parked waiting on it.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Clone, Copy)]
+struct Watcher {
+    /// The snapshot generation in force when this banner started being watched, so
+    /// `watch_says_absent` can tell "we have not looked yet" from "we looked and it was gone".
+    began_at_generation: u64,
+    /// Has ANY committed snapshot contained this identifier? Sticky once true.
+    ever_seen: bool,
+}
+
+/// The shared snapshot, plus the set of banners consulting it.
+///
+/// One `Mutex` rather than a lock per field: every operation here is a handful of hash lookups
+/// against a set bounded by the delivered list, it is touched once per banner per 0.5s tick and once
+/// per 15s sweep, and the whole point of the change is that none of it is a system call.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Default)]
+struct DeliveredWatchState {
+    /// How many snapshots have been COMMITTED. 0 means the list has never been read.
+    generation: u64,
+    /// Identifiers in the newest committed snapshot.
+    present: HashSet<String>,
+    /// Banner identifier -> what we know about it.
+    watchers: HashMap<String, Watcher>,
+    /// The snapshot being assembled between `snapshot_begin` and `snapshot_commit`. A partially
+    /// built snapshot is NEVER consulted — publishing one would read as "everything after this
+    /// point is gone" and auto-dismiss the tail of the list.
+    building: Option<HashSet<String>>,
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl DeliveredWatchState {
+    fn begin_watch(&mut self, identifier: &str) {
+        let ever_seen = self.present.contains(identifier);
+        self.watchers.insert(
+            identifier.to_string(),
+            Watcher { began_at_generation: self.generation, ever_seen },
+        );
+    }
+
+    fn end_watch(&mut self, identifier: &str) {
+        self.watchers.remove(identifier);
+    }
+
+    fn absent(&self, identifier: &str) -> bool {
+        match self.watchers.get(identifier) {
+            Some(w) => watch_says_absent(
+                self.present.contains(identifier),
+                w.ever_seen,
+                self.generation.saturating_sub(w.began_at_generation),
+                DELIVERED_WATCH_GRACE_SNAPSHOTS,
+            ),
+            // Nobody registered this identifier. Never claim absence for a banner we were never
+            // told to watch — fail towards "keep waiting", which costs a tick, not a lost banner.
+            None => false,
+        }
+    }
+
+    fn snapshot_begin(&mut self, capacity: usize) {
+        self.building = Some(HashSet::with_capacity(capacity));
+    }
+
+    fn snapshot_add(&mut self, identifier: &str) {
+        if let Some(building) = self.building.as_mut() {
+            building.insert(identifier.to_string());
+        }
+    }
+
+    fn snapshot_commit(&mut self) {
+        // No `begin` means no read happened; committing here would publish an empty list as fact.
+        let Some(next) = self.building.take() else {
+            return;
+        };
+        for (identifier, watcher) in self.watchers.iter_mut() {
+            if next.contains(identifier) {
+                watcher.ever_seen = true;
+            }
+        }
+        self.present = next;
+        self.generation = self.generation.saturating_add(1);
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+static DELIVERED_WATCH: LazyLock<Mutex<DeliveredWatchState>> =
+    LazyLock::new(|| Mutex::new(DeliveredWatchState::default()));
+
+/// Poison-tolerant, like `BadgeCounts`: a panic in a prior holder must not wedge every parked
+/// banner thread for the life of the process.
+#[cfg(any(target_os = "macos", test))]
+fn delivered_watch() -> std::sync::MutexGuard<'static, DeliveredWatchState> {
+    DELIVERED_WATCH.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// # Safety
+/// `identifier` must be a NUL-terminated C string valid for the duration of the call, or null.
+#[cfg(target_os = "macos")]
+unsafe fn identifier_str(identifier: *const std::ffi::c_char) -> Option<String> {
+    if identifier.is_null() {
+        return None;
+    }
+    std::ffi::CStr::from_ptr(identifier).to_str().ok().map(str::to_string)
+}
+
+/// A parked banner thread announces itself. Called from the vendored `notify.m` once its
+/// notification has been posted, before it starts waiting.
+///
+/// # Safety
+/// See `identifier_str`.
+#[cfg(target_os = "macos")]
+#[no_mangle]
+pub unsafe extern "C" fn sparkle_delivered_watch_begin(identifier: *const std::ffi::c_char) {
+    if let Some(id) = identifier_str(identifier) {
+        delivered_watch().begin_watch(&id);
+    }
+}
+
+/// THE call that replaced a synchronous whole-list XPC round-trip with a hash lookup. Returns true
+/// when the shared snapshot says this banner has left Notification Center.
+///
+/// # Safety
+/// See `identifier_str`.
+#[cfg(target_os = "macos")]
+#[no_mangle]
+pub unsafe extern "C" fn sparkle_delivered_watch_absent(identifier: *const std::ffi::c_char) -> bool {
+    match identifier_str(identifier) {
+        Some(id) => delivered_watch().absent(&id),
+        // An unreadable identifier is not evidence of absence.
+        None => false,
+    }
+}
+
+/// A parked banner thread is done (clicked, dismissed, or auto-dismissed) and stops consulting the
+/// snapshot. Not merely hygiene: without it `watchers` grows for the life of the process, which is
+/// the unbounded-accumulation shape this module already exists to stop.
+///
+/// # Safety
+/// See `identifier_str`.
+#[cfg(target_os = "macos")]
+#[no_mangle]
+pub unsafe extern "C" fn sparkle_delivered_watch_end(identifier: *const std::ffi::c_char) {
+    if let Some(id) = identifier_str(identifier) {
+        delivered_watch().end_watch(&id);
+    }
+}
+
+/// The sweep is about to report the list it just read. Called once per read, from
+/// `objc/expire_notifications.m`.
+#[cfg(target_os = "macos")]
+#[no_mangle]
+pub extern "C" fn sparkle_delivered_snapshot_begin(capacity: usize) {
+    delivered_watch().snapshot_begin(capacity);
+}
+
+/// One identifier from the list the sweep just read.
+///
+/// # Safety
+/// See `identifier_str`.
+#[cfg(target_os = "macos")]
+#[no_mangle]
+pub unsafe extern "C" fn sparkle_delivered_snapshot_add(identifier: *const std::ffi::c_char) {
+    if let Some(id) = identifier_str(identifier) {
+        delivered_watch().snapshot_add(&id);
+    }
+}
+
+/// Publish. Only a COMMITTED snapshot is ever consulted — see `DeliveredWatchState::building`.
+#[cfg(target_os = "macos")]
+#[no_mangle]
+pub extern "C" fn sparkle_delivered_snapshot_commit() {
+    delivered_watch().snapshot_commit();
+}
+
+/// The single reader of the delivered list, behind a seam so a test can COUNT the reads.
+///
+/// The seam is the point of it. The property this change has to hold is not "the sweep works" but
+/// "the number of whole-list reads does not scale with the number of parked banners", and that is
+/// a statement about a CALL COUNT — unassertable against a bare `unsafe extern` call.
+#[cfg(any(target_os = "macos", test))]
+trait DeliveredSweeper {
+    /// Read the delivered list ONCE: publish it as the shared snapshot, then expire what the
+    /// policy picks from that same read. Returns how many were removed.
+    fn sweep(&self, ttl_secs: f64, budget: u32) -> u32;
+}
+
+/// Production: the Objective-C half, which owns only what must be Objective-C.
+#[cfg(target_os = "macos")]
+struct ObjcSweeper;
+
+#[cfg(target_os = "macos")]
+impl DeliveredSweeper for ObjcSweeper {
+    fn sweep(&self, ttl_secs: f64, budget: u32) -> u32 {
+        // SAFETY: no pointers cross the boundary, it returns a plain count, and we are on a
+        // background thread, which is what it requires.
+        unsafe { sparkle_sweep_delivered_notifications(ttl_secs, budget) }
+    }
+}
+
+/// What one sweep did, so the caller can log which regime ran without recomputing the dials.
+#[cfg(any(target_os = "macos", test))]
+struct SweepTick {
+    removed: u32,
+    ttl_secs: f64,
+    budget: u32,
+    under_pressure: bool,
+}
+
+/// ONE tick of the ONE reader: pick the dials for the current pressure, then read the list exactly
+/// once. Every parked banner is served from that read.
+#[cfg(any(target_os = "macos", test))]
+fn sweep_tick(sweeper: &dyn DeliveredSweeper, in_flight: usize) -> SweepTick {
+    let ttl_secs = effective_ttl_secs(
+        in_flight,
+        NOTIFICATION_PRESSURE_AT,
+        NOTIFICATION_TTL_SECS,
+        NOTIFICATION_PRESSURE_TTL_SECS,
+    );
+    let budget = removal_budget(in_flight, NOTIFICATION_PRESSURE_AT);
+    let removed = sweeper.sweep(ttl_secs, budget);
+    SweepTick {
+        removed,
+        ttl_secs,
+        budget,
+        under_pressure: under_pressure(in_flight, NOTIFICATION_PRESSURE_AT),
+    }
+}
+
 /// RAII release for an in-flight notification slot. Decrements on drop — including on unwind —
 /// so a panic inside `n.send()` (which calls into Objective-C and can unwrap internally) can't
 /// permanently leak a slot and eventually wedge the cap.
@@ -412,7 +727,12 @@ fn deliver_attention_banner(_app: &AppHandle, _project_id: &str, _agent_id: &str
 #[cfg(target_os = "macos")]
 extern "C" {
     fn sparkle_force_present_anchor();
-    /// Remove delivered notifications older than `ttl_seconds`; returns how many went.
+    /// THE ONE READ of the delivered list. Publishes what it read as the shared snapshot every
+    /// parked banner consults (`sparkle_delivered_snapshot_*`), then removes the entries older than
+    /// `ttl_seconds` that the Rust selector picks from that SAME read. Returns how many went.
+    ///
+    /// It is one function rather than two precisely so there is one read: a separate "read for the
+    /// watchers" and "read for the expiry" is the two-reader shape this change removed.
     ///
     /// Call from a BACKGROUND thread, not main — the opposite of what this said before the vendored
     /// mac-notification-sys patch moved the crate's own `deliveredNotifications` poll off the main
@@ -420,8 +740,9 @@ extern "C" {
     ///
     /// `max_removals` is a budget, oldest-first. It is clamped to `MAX_EVICTIONS_PER_SWEEP` on the
     /// Rust side regardless of what is passed, so no caller can request an unbounded batch — see
-    /// `select_evictions`. `removal_budget` supplies the pressure-side value.
-    fn sparkle_expire_delivered_notifications(
+    /// `select_evictions`. `removal_budget` supplies the pressure-side value. A budget of 0 still
+    /// publishes the snapshot: the watchers' correctness must not depend on the expiry dials.
+    fn sparkle_sweep_delivered_notifications(
         ttl_seconds: f64,
         max_removals: std::ffi::c_uint,
     ) -> std::ffi::c_uint;
@@ -461,23 +782,17 @@ fn start_notification_expiry_sweep() {
     std::thread::spawn(|| loop {
         std::thread::sleep(std::time::Duration::from_secs_f64(NOTIFICATION_SWEEP_SECS));
         let in_flight = IN_FLIGHT_NOTIFICATIONS.load(Ordering::SeqCst);
-        let ttl = effective_ttl_secs(
-            in_flight,
-            NOTIFICATION_PRESSURE_AT,
-            NOTIFICATION_TTL_SECS,
-            NOTIFICATION_PRESSURE_TTL_SECS,
-        );
-        let budget = removal_budget(in_flight, NOTIFICATION_PRESSURE_AT);
-        // SAFETY: no pointers cross the boundary, it returns a plain count, and we are on a
-        // background thread, which is what it requires.
-        let removed = unsafe { sparkle_expire_delivered_notifications(ttl, budget) };
+        // ONE read, serving both jobs: it publishes the snapshot every parked banner consults AND
+        // expires what the policy picks. See `sweep_tick` and the ONE READER note above.
+        let SweepTick { removed, ttl_secs: ttl, budget, under_pressure: pressured } =
+            sweep_tick(&ObjcSweeper, in_flight);
         if removed > 0 {
             // Both regimes end up on this line, and they mean very different things, so the line
             // must say which one ran. A routine 300s cleanup and a pressure eviction that just
             // ended the click-through route for the longest-waiting agent are otherwise
             // indistinguishable in a shipped log — the same "a count with the discriminator
             // stripped out" defect this branch already fixed twice on the jank instrument.
-            if under_pressure(in_flight, NOTIFICATION_PRESSURE_AT) {
+            if pressured {
                 tracing::info!(
                     target: "attention",
                     removed,
@@ -530,9 +845,11 @@ pub fn init_application() {
         unsafe {
             sparkle_force_present_anchor();
         }
-        // Bound how long an ignored banner keeps polling the main thread. Started here rather than
-        // lazily on first notification so the sweep also collects banners left over from a previous
-        // run of the app — those are delivered notifications too, and they poll just the same.
+        // Bound how long an ignored banner sits in Notification Center, AND start the single reader
+        // every parked banner's auto-dismiss check depends on (see the ONE READER note) — without
+        // this loop running, no snapshot is ever published and no banner ever unparks. Started here
+        // rather than lazily on first notification so the sweep also collects banners left over
+        // from a previous run of the app — those are delivered notifications too.
         start_notification_expiry_sweep();
     }
 }
@@ -541,11 +858,14 @@ pub fn init_application() {
 mod tests {
     use super::{
         badge_total, effective_ttl_secs, removal_budget, select_evictions, should_expire,
-        sweep_is_finer_than_ttl, under_pressure, MAX_EVICTIONS_PER_SWEEP,
-        MAX_IN_FLIGHT_NOTIFICATIONS, NOTIFICATION_PRESSURE_AT, NOTIFICATION_PRESSURE_TTL_SECS,
-        NOTIFICATION_SWEEP_SECS, NOTIFICATION_TTL_SECS,
+        sweep_is_finer_than_ttl, sweep_tick, under_pressure, watch_says_absent,
+        DeliveredSweeper, DeliveredWatchState, DELIVERED_WATCH_GRACE_SNAPSHOTS,
+        MAX_EVICTIONS_PER_SWEEP, MAX_IN_FLIGHT_NOTIFICATIONS, NOTIFICATION_PRESSURE_AT,
+        NOTIFICATION_PRESSURE_TTL_SECS, NOTIFICATION_SWEEP_SECS, NOTIFICATION_TTL_SECS,
     };
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
 
     // ── THE EXPIRY DECISION ────────────────────────────────────────────────────────────────────
     // This is the comparison that actually removes a user's notification, so it is the one that has
@@ -921,6 +1241,273 @@ mod tests {
         assert_eq!(badge_total(&counts(&[("main", 4), ("win-1", -10)])), Some(4));
     }
 
+    // ── ONE READER: THE READ COUNT MUST NOT SCALE WITH PARKED BANNERS ─────────────────────────
+    //
+    // THE DEFECT. Every parked banner used to answer "am I still delivered?" by asking the OS
+    // itself — `wasAutoDismissed()` iterating `deliveredNotifications`, a synchronous whole-list
+    // XPC round-trip, once per banner every 0.5s, forever. At the 16-banner cap that is ~32
+    // whole-list reads per second for the life of the process.
+    //
+    // WHAT THESE TESTS PIN, AND WHERE THE PRE-IMAGE DISCRIMINATOR LIVES. The count assertion below
+    // pins the Rust seam: however many banners are watching, one sweep reads once, and a banner-side
+    // check reads never. The Rust half alone cannot fail against the OLD code, because the old
+    // per-banner read was not in Rust at all — it was six lines of Objective-C. So the assertion
+    // that genuinely goes red on the pre-change bytes is the SOURCE SCAN,
+    // `a_parked_banner_thread_never_reads_the_delivered_list_itself`, which is where the deleted
+    // read actually was. The pair is deliberate: the scan proves the old seam is gone, the count
+    // proves the new one does not grow a replacement.
+
+    /// A `DeliveredSweeper` that counts reads and publishes what it "read" into a watch state —
+    /// i.e. it stands in for `objc/expire_notifications.m`, minus the XPC.
+    struct CountingSweeper<'a> {
+        reads: AtomicUsize,
+        delivered: Vec<String>,
+        state: &'a Mutex<DeliveredWatchState>,
+    }
+
+    impl CountingSweeper<'_> {
+        fn reads(&self) -> usize {
+            self.reads.load(Ordering::SeqCst)
+        }
+    }
+
+    impl DeliveredSweeper for CountingSweeper<'_> {
+        fn sweep(&self, _ttl_secs: f64, _budget: u32) -> u32 {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            let mut state = self.state.lock().unwrap();
+            state.snapshot_begin(self.delivered.len());
+            for identifier in &self.delivered {
+                state.snapshot_add(identifier);
+            }
+            state.snapshot_commit();
+            0
+        }
+    }
+
+    /// How many times a parked banner checks for auto-dismiss between two sweeps, at the tick the
+    /// vendored `notify.m` polls on. This is the multiplier the old design paid an XPC round-trip
+    /// for and the new one pays a hash lookup for.
+    fn banner_checks_per_sweep() -> usize {
+        (NOTIFICATION_SWEEP_SECS / 0.5) as usize
+    }
+
+    #[test]
+    fn the_delivered_list_is_read_once_per_sweep_however_many_banners_are_parked() {
+        const SWEEPS: usize = 3;
+        for banners in [1usize, 4, MAX_IN_FLIGHT_NOTIFICATIONS] {
+            let state = Mutex::new(DeliveredWatchState::default());
+            let delivered: Vec<String> = (0..banners).map(|i| format!("banner-{i}")).collect();
+            {
+                let mut s = state.lock().unwrap();
+                for identifier in &delivered {
+                    s.begin_watch(identifier);
+                }
+            }
+            let sweeper =
+                CountingSweeper { reads: AtomicUsize::new(0), delivered: delivered.clone(), state: &state };
+
+            for _ in 0..SWEEPS {
+                // Every parked banner checks, at its own tick, for the whole interval. This is the
+                // work that used to be `banners * banner_checks_per_sweep()` whole-list XPC reads.
+                for _ in 0..banner_checks_per_sweep() {
+                    let s = state.lock().unwrap();
+                    for identifier in &delivered {
+                        assert!(!s.absent(identifier), "still in the snapshot: {identifier}");
+                    }
+                }
+                sweep_tick(&sweeper, banners);
+            }
+
+            let checks = banner_checks_per_sweep();
+            assert_eq!(
+                sweeper.reads(),
+                SWEEPS,
+                "{banners} banners x {checks} checks x {SWEEPS} intervals must cost {SWEEPS} \
+                 whole-list reads, not {}",
+                banners * checks * SWEEPS
+            );
+        }
+    }
+
+    #[test]
+    fn a_banner_side_dismissal_check_reads_the_list_zero_times() {
+        // The sharper half of the count above: the sweep's read is the ONLY read. If a future edit
+        // gives the watcher its own refresh — the obvious "but the snapshot might be stale" fix —
+        // this goes red immediately rather than at the 16-banner ceiling in production.
+        let state = Mutex::new(DeliveredWatchState::default());
+        let delivered: Vec<String> =
+            (0..MAX_IN_FLIGHT_NOTIFICATIONS).map(|i| format!("banner-{i}")).collect();
+        {
+            let mut s = state.lock().unwrap();
+            for identifier in &delivered {
+                s.begin_watch(identifier);
+            }
+        }
+        let sweeper =
+            CountingSweeper { reads: AtomicUsize::new(0), delivered: delivered.clone(), state: &state };
+
+        for _ in 0..banner_checks_per_sweep() {
+            let s = state.lock().unwrap();
+            for identifier in &delivered {
+                let _ = s.absent(identifier);
+            }
+        }
+        assert_eq!(sweeper.reads(), 0, "a parked banner must never read the delivered list itself");
+    }
+
+    // ── watch_says_absent: THE VERDICT A PARKED BANNER ACTS ON ────────────────────────────────
+    // Getting this wrong is not a performance bug: `true` unparks the thread and retires the
+    // pending entry, so a banner the user is still looking at stops being clickable.
+
+    #[test]
+    fn a_banner_in_the_newest_snapshot_is_never_declared_gone() {
+        assert!(!watch_says_absent(true, true, 100, 4), "present wins over every other signal");
+        assert!(!watch_says_absent(true, false, 100, 4));
+    }
+
+    #[test]
+    fn seen_then_unseen_is_the_auto_dismiss_signal() {
+        assert!(watch_says_absent(false, true, 1, 4), "a snapshot saw it and the newest does not");
+    }
+
+    // The failure this ordering exists to prevent: on the very first check a freshly posted banner
+    // is not in ANY snapshot yet, and calling that "absent" auto-dismisses every banner the instant
+    // it is delivered — turning a poll-cost fix into a feature that never works.
+    #[test]
+    fn a_banner_watched_before_the_first_snapshot_is_not_declared_gone() {
+        assert!(!watch_says_absent(false, false, 0, 4), "no snapshot has been taken yet");
+        assert!(!watch_says_absent(false, false, 3, 4), "still inside the grace");
+    }
+
+    // The escape hatch, and why it must exist: a banner delivered and cleared entirely BETWEEN two
+    // snapshots is never observed present, so "seen then unseen" can never fire for it and its
+    // thread would park forever — permanently leaking one of the in-flight slots.
+    #[test]
+    fn a_banner_no_snapshot_ever_saw_is_given_up_on_after_the_grace() {
+        assert!(watch_says_absent(false, false, 4, 4), "the grace boundary is inclusive");
+        assert!(watch_says_absent(false, false, 99, 4));
+    }
+
+    #[test]
+    fn the_shipped_grace_is_long_enough_to_observe_a_healthy_banner_first() {
+        // The grace only has to be longer than the window in which a genuinely delivered banner
+        // would first be observed, which is one sweep. Assert the RULE, not the number.
+        assert!(
+            DELIVERED_WATCH_GRACE_SNAPSHOTS >= 2,
+            "a grace of one snapshot gives up before a banner posted mid-interval is ever read"
+        );
+    }
+
+    // ── DeliveredWatchState: the snapshot protocol ────────────────────────────────────────────
+
+    fn publish(state: &mut DeliveredWatchState, ids: &[&str]) {
+        state.snapshot_begin(ids.len());
+        for id in ids {
+            state.snapshot_add(id);
+        }
+        state.snapshot_commit();
+    }
+
+    #[test]
+    fn a_watched_banner_is_declared_gone_once_a_snapshot_stops_containing_it() {
+        let mut state = DeliveredWatchState::default();
+        state.begin_watch("a");
+        publish(&mut state, &["a", "b"]);
+        assert!(!state.absent("a"));
+        publish(&mut state, &["b"]);
+        assert!(state.absent("a"), "seen, then gone");
+    }
+
+    // A partial publish must never be consulted: read as fact it says "everything not yet added is
+    // gone", which would auto-dismiss the tail of the delivered list on every single sweep.
+    #[test]
+    fn a_partially_built_snapshot_is_never_consulted() {
+        let mut state = DeliveredWatchState::default();
+        state.begin_watch("a");
+        publish(&mut state, &["a"]);
+        state.snapshot_begin(1);
+        // "a" has not been added back yet — mid-publish it is missing from `building`.
+        assert!(!state.absent("a"), "the in-progress snapshot must not be visible");
+        state.snapshot_add("a");
+        state.snapshot_commit();
+        assert!(!state.absent("a"));
+    }
+
+    // A commit with no begin means no read happened. Publishing an empty list there would tell
+    // every parked banner it had been dismissed — the exact shape of a mass false auto-dismiss.
+    #[test]
+    fn a_commit_without_a_read_publishes_nothing() {
+        let mut state = DeliveredWatchState::default();
+        state.begin_watch("a");
+        publish(&mut state, &["a"]);
+        state.snapshot_commit(); // stray commit, no begin
+        assert!(!state.absent("a"), "the previous snapshot must still stand");
+    }
+
+    #[test]
+    fn an_identifier_nobody_registered_is_never_declared_gone() {
+        let mut state = DeliveredWatchState::default();
+        publish(&mut state, &[]);
+        publish(&mut state, &[]);
+        publish(&mut state, &[]);
+        publish(&mut state, &[]);
+        publish(&mut state, &[]);
+        assert!(!state.absent("never-registered"), "absence is only ever claimed for a watcher");
+    }
+
+    // Without this the watcher map grows for the life of the process — the same unbounded
+    // accumulation the delivered list itself was already bounded to stop.
+    #[test]
+    fn ending_a_watch_drops_the_watcher() {
+        let mut state = DeliveredWatchState::default();
+        state.begin_watch("a");
+        publish(&mut state, &["a"]);
+        publish(&mut state, &[]);
+        assert!(state.absent("a"));
+        state.end_watch("a");
+        assert!(!state.absent("a"), "an ended watch answers like an unknown identifier");
+    }
+
+    // A banner already in the list when its watch starts must count as seen immediately, or the
+    // grace clock starts against a banner we have in fact already observed.
+    #[test]
+    fn a_watch_started_on_an_already_delivered_banner_counts_as_seen() {
+        let mut state = DeliveredWatchState::default();
+        publish(&mut state, &["a"]);
+        state.begin_watch("a");
+        publish(&mut state, &[]);
+        assert!(state.absent("a"), "one snapshot after it left is enough — no grace needed");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_watch_ffi_round_trips_a_c_identifier() {
+        use std::ffi::CString;
+        // The global state is shared with every other test in this binary, so use an identifier
+        // nothing else touches rather than asserting on counts.
+        let id = CString::new("ffi-round-trip-banner").unwrap();
+        unsafe {
+            super::sparkle_delivered_watch_begin(id.as_ptr());
+            super::sparkle_delivered_snapshot_begin(1);
+            super::sparkle_delivered_snapshot_add(id.as_ptr());
+            super::sparkle_delivered_snapshot_commit();
+            assert!(!super::sparkle_delivered_watch_absent(id.as_ptr()), "just published as present");
+
+            super::sparkle_delivered_snapshot_begin(0);
+            super::sparkle_delivered_snapshot_commit();
+            assert!(super::sparkle_delivered_watch_absent(id.as_ptr()), "gone from the newest snapshot");
+
+            super::sparkle_delivered_watch_end(id.as_ptr());
+            assert!(!super::sparkle_delivered_watch_absent(id.as_ptr()), "no longer watched");
+
+            // A null identifier is not evidence of absence, and must not dereference.
+            assert!(!super::sparkle_delivered_watch_absent(std::ptr::null()));
+            super::sparkle_delivered_watch_begin(std::ptr::null());
+            super::sparkle_delivered_watch_end(std::ptr::null());
+            super::sparkle_delivered_snapshot_add(std::ptr::null());
+        }
+    }
+
     // ── THE AUTO-DISMISS POLL MUST STAY OFF THE MAIN RUN LOOP ──────────────────────────────────
     //
     // `notify_attention` delivers each banner through `mac-notification-sys`, which watches for
@@ -1065,6 +1652,67 @@ mod tests {
                 !called_on_the_main_queue(&code, xpc).unwrap(),
                 "`{xpc}` is called inside a dispatch_get_main_queue block — that is a synchronous \
                  XPC round-trip to usernoted executing on the UI thread."
+            );
+        }
+    }
+
+    // THE PRE-IMAGE DISCRIMINATOR for this change: on the bytes before it, `wasAutoDismissed()` was
+    //
+    //     for (NSUserNotification* n in notificationCenter.deliveredNotifications) { ... }
+    //
+    // — a synchronous whole-list XPC round-trip, executed by EVERY parked banner thread every 0.5s,
+    // forever. That is the ~32 reads/second at the 16-banner cap this change removed, and this
+    // assertion fails against it. The Rust count tests above cannot: the deleted read was never in
+    // Rust, so nothing in Rust changed shape when it went.
+    //
+    // The scan is over CODE only (`objc_code_only`), which is load-bearing here: notify.m documents
+    // the hazard at length, so its prose still contains `deliveredNotifications` verbatim.
+    #[test]
+    fn a_parked_banner_thread_never_reads_the_delivered_list_itself() {
+        let code = objc_code_only(NOTIFY_M);
+        assert!(
+            !code.contains("deliveredNotifications"),
+            "notify.m reads the delivered list again. Every parked banner runs that code, so one \
+             read becomes N whole-list XPC round-trips per tick — the defect the shared snapshot \
+             (sparkle_delivered_watch_*) replaced. There is exactly ONE reader, in \
+             objc/expire_notifications.m."
+        );
+        // And it must be consulting the shared snapshot rather than having simply dropped the
+        // check — losing auto-dismiss detection would leak an in-flight slot per ignored banner.
+        assert!(
+            code.contains("sparkle_delivered_watch_absent"),
+            "the auto-dismiss check is gone entirely rather than served from the shared snapshot"
+        );
+        // Both ends of the registration bracket, or the snapshot cannot tell "this banner left" from
+        // "we have not read the list yet" (begin), and the watcher map grows forever (end).
+        for required in ["sparkle_delivered_watch_begin", "sparkle_delivered_watch_end"] {
+            assert!(code.contains(required), "notify.m no longer calls `{required}`");
+        }
+    }
+
+    // The one reader must still BE one reader, and must still publish. A sweep that reads the list
+    // and forgets to publish leaves every parked banner on a snapshot that never advances: no
+    // auto-dismiss is ever detected, every in-flight slot leaks, and attention banners stop being
+    // posted at all — with every other test in this module green.
+    #[test]
+    fn the_single_reader_publishes_exactly_one_snapshot_per_read() {
+        const SWEEP_M: &str = include_str!("../objc/expire_notifications.m");
+        let code = objc_code_only(SWEEP_M);
+        assert_eq!(
+            code.matches("deliveredNotifications").count(),
+            1,
+            "objc/expire_notifications.m must read the delivered list exactly once per sweep"
+        );
+        for required in [
+            "sparkle_delivered_snapshot_begin",
+            "sparkle_delivered_snapshot_add",
+            "sparkle_delivered_snapshot_commit",
+        ] {
+            // Twice each: the extern declaration and the call site.
+            assert!(
+                code.matches(required).count() >= 2,
+                "objc/expire_notifications.m never calls `{required}`, so the read it just did is \
+                 published to nobody and every parked banner waits on a frozen snapshot"
             );
         }
     }

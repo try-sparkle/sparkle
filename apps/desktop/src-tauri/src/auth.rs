@@ -115,13 +115,6 @@ pub(crate) fn bearer_token() -> Option<String> {
     read_token()
 }
 
-fn entry() -> Result<keyring::Entry, String> {
-    // Service name is dev-suffixed in debug builds (see dev_identity) so a dev build never touches
-    // the production app's keychain ACL — avoids the macOS confidential-info prompt.
-    keyring::Entry::new(&crate::dev_identity::keychain_service(), KEYCHAIN_USER)
-        .map_err(|e| e.to_string())
-}
-
 // ── Token cache ───────────────────────────────────────────────────────────────────────────────
 //
 // EVERY authenticated path used to call the keychain. `read_token` has 20+ call sites (the /me
@@ -147,13 +140,12 @@ static TOKEN_CACHE: RwLock<Option<Option<String>>> = RwLock::new(None);
 static TOKEN_LOAD_LOCK: Mutex<()> = Mutex::new(());
 
 /// The uncached keychain read. Only `cached_token` should call this.
+///
+/// Routed through `dev_identity` for BOTH halves of the item's identity: the dev-suffixed service
+/// name, and — in debug builds — the guarantee that an ACL mismatch reads as SIGNED OUT rather than
+/// putting a login-password modal on the user's screen (sparkle-vvwbl).
 fn keychain_read_token() -> Option<String> {
-    let t = entry().ok()?.get_password().ok()?;
-    if t.is_empty() {
-        None
-    } else {
-        Some(t)
-    }
+    crate::dev_identity::read_keychain_secret(KEYCHAIN_USER)
 }
 
 /// Read the token through the cache, loading via `load` on a miss. Split from `read_token` so a
@@ -278,17 +270,15 @@ const JOIN_FAILED: &str = "the keychain task didn't finish";
 /// The blocking half of sign-out. Split from the command so the command is a wrapper with no
 /// keychain call of its own, and so this stays unit-testable as a plain function.
 fn sign_out_blocking() -> Result<(), String> {
-    let deleted = entry()?.delete_credential();
+    let deleted = crate::dev_identity::delete_keychain_secret(KEYCHAIN_USER);
     // Invalidate UNCONDITIONALLY, before inspecting the outcome. A cached bearer that outlives the
     // keychain item is a security bug, not merely a stale read: every `read_token` caller would go
     // on authenticating as the user who just signed out. On a failed delete the extra keychain read
     // this costs is the cheap side of the trade.
     invalidate_token_cache();
-    match deleted {
-        Ok(_) => Ok(()),
-        Err(keyring::Error::NoEntry) => Ok(()),
-        Err(e) => Err(e.to_string()),
-    }
+    // `delete_keychain_secret` already reports "nothing was stored" as success — the outcome a
+    // sign-out wanted — so there is no NoEntry case left to fold here.
+    deleted
 }
 
 /// True if a (non-empty) desktop bearer token is stored.
@@ -364,7 +354,7 @@ pub async fn desktop_exchange_code(
         .get("token")
         .and_then(|t| t.as_str())
         .ok_or_else(|| "exchange response missing token".to_string())?;
-    entry()?.set_password(token).map_err(|e| e.to_string())?;
+    crate::dev_identity::write_keychain_secret(KEYCHAIN_USER, token)?;
     // The cache holds the PRE-SIGN-IN answer — almost always a cached `None` (signed out), which
     // without this would be served to every caller until restart, leaving the app authenticated
     // nowhere immediately after a successful sign-in.

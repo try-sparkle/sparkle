@@ -842,7 +842,10 @@ pub fn validate_token(token: &str) -> Result<(), String> {
 pub fn read_token() -> Result<String, SkipReason> {
     #[cfg(test)]
     KEYCHAIN_READS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    let Some(t) = entry().ok().and_then(|e| e.get_password().ok()) else {
+    // Guarded: in a DEBUG build this must never raise the macOS confidential-information
+    // dialog for the dev-suffixed item this binary no longer owns the ACL of (sparkle-vvwbl).
+    let Some(t) = entry().ok().and_then(|e| crate::dev_identity::no_prompt(|| e.get_password().ok()))
+    else {
         return Err(SkipReason::NoToken);
     };
     let t = t.trim().to_string();
@@ -855,11 +858,17 @@ pub fn read_token() -> Result<String, SkipReason> {
 
 pub fn write_token(token: &str) -> Result<(), String> {
     validate_token(token)?;
-    entry()?.set_password(token).map_err(|e| e.to_string())
+    let e = entry()?;
+    // Guarded: in a DEBUG build this must never raise the macOS confidential-information
+    // dialog for the dev-suffixed item this binary no longer owns the ACL of (sparkle-vvwbl).
+    crate::dev_identity::no_prompt(|| e.set_password(token)).map_err(|e| e.to_string())
 }
 
 pub fn delete_token() -> Result<(), String> {
-    match entry()?.delete_credential() {
+    let entry = entry()?;
+    // Guarded: in a DEBUG build this must never raise the macOS confidential-information
+    // dialog for the dev-suffixed item this binary no longer owns the ACL of (sparkle-vvwbl).
+    match crate::dev_identity::no_prompt(|| entry.delete_credential()) {
         Ok(()) => Ok(()),
         // Already absent is the state the caller wanted.
         Err(keyring::Error::NoEntry) => Ok(()),

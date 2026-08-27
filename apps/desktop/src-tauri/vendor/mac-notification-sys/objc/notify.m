@@ -54,9 +54,31 @@ static void uuidBytesFromNotification(NSUserNotification* n, unsigned char out[1
     }
 }
 
+// SPARKLE PATCH (notification-shared-delivered-watch): the shared delivered-list snapshot.
+//
+// These three are implemented in the HOST crate (apps/desktop/src-tauri/src/attention.rs) and fed
+// by its 15s sweep, which reads `deliveredNotifications` once and publishes what it read. They
+// exist because the auto-dismiss watch below used to ask the OS directly, once per banner every
+// 0.5s: `wasAutoDismissed()` iterated `notificationCenter.deliveredNotifications`, a SYNCHRONOUS
+// XPC round-trip that marshals and unarchives the WHOLE list. With N banners parked that is 2N
+// whole-list reads per second, forever — ~32/s at Sparkle's 16-banner cap, and a live sample caught
+// ~47,800 SyncQueue dispatch queues created in 83 minutes decoding those replies. `_absent` is now
+// a hash lookup against the snapshot and performs no system call at all, so the read count is one
+// per sweep regardless of how many banners are waiting.
+//
+// `_begin`/`_end` bracket the wait so the snapshot can tell "this banner left the center" from "we
+// have not read the list since this banner was posted" — without that distinction the very first
+// check would auto-dismiss every banner the instant it was delivered.
+#import <stdbool.h>
+
+extern void sparkle_delivered_watch_begin(const char* identifier);
+extern bool sparkle_delivered_watch_absent(const char* identifier);
+extern void sparkle_delivered_watch_end(const char* identifier);
+
 // resolveAutoDismiss — called on the main thread when wasAutoDismissed() fires.
-// NSUserNotification has no auto-dismiss delegate callback; polling deliveredNotifications is the
-// only signal. We drain any already-queued delegate messages (didActivate / didDismissAlert) before
+// NSUserNotification has no auto-dismiss delegate callback; the notification's disappearance from
+// the delivered list is the only signal (read once per sweep by the host — see the shared-watch
+// externs above, not by this thread). We drain any already-queued delegate messages (didActivate / didDismissAlert) before
 // falling back to treating the disappearance as a silent auto-dismiss. This removes all timing
 // heuristics: if a real callback was queued, it fires during the runUntilDate: drain and wins.
 static void resolveAutoDismiss(const unsigned char* uuid) {
@@ -180,13 +202,16 @@ void sendNotification(NSString* title, NSString* subtitle, NSString* message, NS
             return;
         }
 
-        // auto-dismiss: notification disappeared from deliveredNotifications without a callback
+        // auto-dismiss: notification disappeared from the delivered list without a callback.
+        //
+        // SPARKLE PATCH (notification-shared-delivered-watch): answered from the HOST's shared
+        // snapshot, never by asking the OS. The body of this block used to be
+        // `for (NSUserNotification* n in notificationCenter.deliveredNotifications)` — one
+        // synchronous whole-list XPC round-trip per banner per tick. See the extern declarations
+        // near the top of this file for the measurement and the shape of the replacement.
+        sparkle_delivered_watch_begin([identifierString UTF8String]);
         BOOL (^wasAutoDismissed)(void) = ^BOOL {
-          for (NSUserNotification* n in notificationCenter.deliveredNotifications) {
-              if ([n.identifier isEqualToString:identifierString])
-                  return NO;
-          }
-          return YES;
+          return sparkle_delivered_watch_absent([identifierString UTF8String]) ? YES : NO;
         };
 
         if ([NSThread isMainThread]) {
@@ -209,17 +234,23 @@ void sendNotification(NSString* title, NSString* subtitle, NSString* message, NS
             }
         } else {
             // SPARKLE PATCH (notification-xpc-offthread): the auto-dismiss watch runs on THIS
-            // background thread — NEVER the main run loop. `wasAutoDismissed()` iterates
-            // `notificationCenter.deliveredNotifications`, which is a SYNCHRONOUS XPC round-trip to
-            // the usernoted daemon (deliveredNotifications -> _sendSyncMessage ->
-            // semaphore_timedwait_trap). Upstream added this poll as a 0.5s NSTimer on
-            // `[NSRunLoop mainRunLoop]` (#86), so every parked banner pinned the UI thread on that
-            // XPC every 0.5s — and because an un-interacted banner lingers in Notification Center
-            // indefinitely, the poll never stopped. With many agents parking banners at once this
-            // was the single largest source of multi-second main-thread jank (~22% of main-thread
-            // wall-clock in a live sample). This `else` branch already runs on a caller-owned
-            // background thread (mac_notification_sys is invoked from a detached std::thread in
-            // attention.rs), so we simply poll here instead of hoisting the work onto main.
+            // background thread — NEVER the main run loop. Upstream added this poll as a 0.5s
+            // NSTimer on `[NSRunLoop mainRunLoop]` (#86), so every parked banner pinned the UI
+            // thread on a synchronous XPC round-trip every 0.5s — and because an un-interacted
+            // banner lingers in Notification Center indefinitely, the poll never stopped. With many
+            // agents parking banners at once this was the single largest source of multi-second
+            // main-thread jank (~22% of main-thread wall-clock in a live sample). This `else` branch
+            // already runs on a caller-owned background thread (mac_notification_sys is invoked from
+            // a detached std::thread in attention.rs), so we poll here instead of hoisting the work
+            // onto main.
+            //
+            // SPARKLE PATCH (notification-shared-delivered-watch): and the poll itself is no longer
+            // a system call. `wasAutoDismissed()` used to iterate the OS's delivered list here — a
+            // whole-list XPC round-trip, per banner, twice a second, which merely RELOCATED the cost
+            // rather than removing it (~32/s at the 16-banner cap, forever). It now reads the host's
+            // shared snapshot, which one 15s sweep publishes for every banner at once. The tick
+            // below therefore costs a hash lookup; what it buys is noticing an auto-dismiss within
+            // one sweep instead of within one tick, which only delays releasing an in-flight slot.
             //
             // Click / dismiss are still delivered by AppKit's delegate on the MAIN thread and set
             // `done` via the Rust Condvar; this loop observes `done` within one tick and exits, so
@@ -241,7 +272,7 @@ void sendNotification(NSString* title, NSString* subtitle, NSString* message, NS
                             });
                             break;
                         }
-                    } else if (wasAutoDismissed()) { // SYNC XPC — now on the background thread, not main
+                    } else if (wasAutoDismissed()) { // shared-snapshot lookup; no XPC, no syscall
                         dispatch_sync(dispatch_get_main_queue(), ^{
                             resolveAutoDismiss(notificationId);
                         });
@@ -254,6 +285,12 @@ void sendNotification(NSString* title, NSString* subtitle, NSString* message, NS
             // return (and let the pending entry be reaped) before that result is recorded.
             rust_wait_for_notification(notificationId);
         }
+
+        // SPARKLE PATCH (notification-shared-delivered-watch): both branches above fall through to
+        // here, so this is the single un-registration point. Not hygiene — the host keeps one map
+        // entry per watched banner, and leaking them would grow a structure for the life of the
+        // process, which is the exact accumulation shape the notification path already fought once.
+        sparkle_delivered_watch_end([identifierString UTF8String]);
     }
 }
 

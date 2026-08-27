@@ -174,7 +174,10 @@ fn token_from_env_with(
 /// The keychain half of the read path, split out so [`resolve_token`] can be driven over both
 /// answers without a test ever writing to the developer's real keychain.
 fn keychain_token(destination_id: &str) -> Option<String> {
-    let stored = entry(destination_id).ok()?.get_password().ok()?;
+    // Guarded: in a DEBUG build this must never raise the macOS confidential-information
+    // dialog for the dev-suffixed item this binary no longer owns the ACL of (sparkle-vvwbl).
+    let e = entry(destination_id).ok()?;
+    let stored = crate::dev_identity::no_prompt(|| e.get_password().ok())?;
     normalize_token(&stored)
 }
 
@@ -213,13 +216,17 @@ fn write_token(destination_id: &str, token: &str) -> Result<(), String> {
             "that token is empty or contains spaces/line breaks; check the paste".to_string()
         );
     };
-    entry(destination_id)?
-        .set_password(&token)
-        .map_err(|e| e.to_string())
+    let e = entry(destination_id)?;
+    // Guarded: in a DEBUG build this must never raise the macOS confidential-information
+    // dialog for the dev-suffixed item this binary no longer owns the ACL of (sparkle-vvwbl).
+    crate::dev_identity::no_prompt(|| e.set_password(&token)).map_err(|e| e.to_string())
 }
 
 fn erase_token(destination_id: &str) -> Result<(), String> {
-    match entry(destination_id)?.delete_credential() {
+    let entry = entry(destination_id)?;
+    // Guarded: in a DEBUG build this must never raise the macOS confidential-information
+    // dialog for the dev-suffixed item this binary no longer owns the ACL of (sparkle-vvwbl).
+    match crate::dev_identity::no_prompt(|| entry.delete_credential()) {
         Ok(()) => Ok(()),
         Err(keyring::Error::NoEntry) => Ok(()),
         Err(e) => Err(e.to_string()),

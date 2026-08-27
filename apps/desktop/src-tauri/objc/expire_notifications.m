@@ -1,5 +1,15 @@
-// Expire attention banners the user never touched, so the delivered list stops growing without
-// bound and the in-flight slots their parked threads hold are released.
+// THE ONE READER of the macOS delivered-notification list, and the two jobs it serves:
+//
+//  1. Expire attention banners the user never touched, so the delivered list stops growing without
+//     bound and the in-flight slots their parked threads hold are released.
+//  2. Publish what it just read as the SHARED SNAPSHOT every parked banner consults to learn
+//     whether it has been auto-dismissed (`sparkle_delivered_snapshot_*` -> attention.rs).
+//
+// Job 2 used to be done per banner, by each parked thread, against the OS itself: the vendored
+// notify.m's `wasAutoDismissed()` iterated `deliveredNotifications` every 0.5s per banner — a
+// synchronous whole-list XPC round-trip each time, ~32/second at the 16-banner cap, forever. This
+// file was already reading exactly that list on its own cadence, so the two readers were merged
+// into this one. Adding a second read anywhere in the notification path reinstates the defect.
 //
 // ── THE DEFECT THIS EXISTS TO BOUND ───────────────────────────────────────────────────────────
 // attention.rs asks mac-notification-sys for a CLICKABLE banner (`wait_for_click(true)`), because a
@@ -78,6 +88,22 @@ extern size_t sparkle_select_notifications_to_evict(const double *ages, size_t c
                                                     double ttlSeconds, unsigned int maxRemovals,
                                                     unsigned int *out, size_t outCap);
 
+// THE OTHER CONSUMER OF THE ONE READ BELOW (attention.rs, the "ONE READER" note).
+//
+// Every parked banner used to answer "am I still delivered?" by asking the OS itself — the vendored
+// notify.m called `wasAutoDismissed()`, which iterated `deliveredNotifications` once per banner
+// every 0.5s. At the 16-banner cap that is ~32 whole-list XPC round trips per second, forever,
+// each one marshalling and unarchiving the entire list. This file was ALREADY reading exactly that
+// list on its own 15s cadence, so the two readers are now one: we publish the identifiers we just
+// read as a snapshot, and notify.m answers from it with a hash lookup and no XPC at all.
+//
+// Publish protocol, in this order and from a single read: begin, add each identifier, commit.
+// Only a COMMITTED snapshot is consulted, so a partial publish can never read as "the rest are
+// gone" and auto-dismiss the tail of the list.
+extern void sparkle_delivered_snapshot_begin(size_t capacity);
+extern void sparkle_delivered_snapshot_add(const char *identifier);
+extern void sparkle_delivered_snapshot_commit(void);
+
 // Remove delivered notifications the Rust selector picks: stale ones, oldest first, at most
 // `maxRemovals`. Returns how many were removed.
 //
@@ -110,7 +136,7 @@ extern size_t sparkle_select_notifications_to_evict(const double *ages, size_t c
 // over from a previous run, so the first tick could meet an arbitrarily large backlog with zero
 // pressure and block main for the whole of it. Deferring the remainder to the next tick costs
 // nothing, because the TTL is absolute rather than a countdown.
-unsigned int sparkle_expire_delivered_notifications(double ttlSeconds, unsigned int maxRemovals) {
+unsigned int sparkle_sweep_delivered_notifications(double ttlSeconds, unsigned int maxRemovals) {
   // @autoreleasepool IS LOAD-BEARING, not hygiene. This runs on a raw pthread from
   // std::thread::spawn, which — unlike the main run loop, and unlike a GCD queue — has NO ambient
   // autorelease pool. It used to run via run_on_main_thread and inherited the run loop's pool; it
@@ -121,16 +147,34 @@ unsigned int sparkle_expire_delivered_notifications(double ttlSeconds, unsigned 
   // bound. ARC does not save this; Foundation's convenience constructors are precisely the case
   // its fast path cannot elide. The vendored notify.m wraps its own off-main poll the same way.
   @autoreleasepool {
-  if (maxRemovals == 0) {
-    return 0;
-  }
   NSUserNotificationCenter *center = [NSUserNotificationCenter defaultUserNotificationCenter];
   if (center == nil) {
+    // Deliberately publish NOTHING. We did not read the list, and an empty snapshot is not the
+    // same statement as "no notifications" — committing one here would tell every parked banner
+    // it had been dismissed.
     return 0;
   }
+
+  // ── THE ONE READ ────────────────────────────────────────────────────────────────────────────
+  // Everything below — the snapshot the parked banners consult AND the expiry decision — comes
+  // out of this single `deliveredNotifications` call. Adding a second read anywhere reinstates
+  // the defect this merge removed.
   NSArray<NSUserNotification *> *delivered = center.deliveredNotifications;
   NSUInteger total = delivered.count;
-  if (total == 0) {
+
+  // Publish first, and unconditionally: an empty delivered list is a real and important reading
+  // (it is what tells every parked banner it is gone), and the watchers must not depend on the
+  // expiry budget or on there being anything stale to remove.
+  sparkle_delivered_snapshot_begin((size_t)total);
+  for (NSUInteger i = 0; i < total; i++) {
+    NSString *identifier = delivered[i].identifier;
+    if (identifier != nil) {
+      sparkle_delivered_snapshot_add([identifier UTF8String]);
+    }
+  }
+  sparkle_delivered_snapshot_commit();
+
+  if (total == 0 || maxRemovals == 0) {
     return 0;
   }
 

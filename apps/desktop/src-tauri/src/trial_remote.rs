@@ -34,19 +34,11 @@ fn base_url() -> String {
     std::env::var("ORCHESTRATION_URL").unwrap_or_else(|_| DEFAULT_ORCHESTRATION_URL.to_string())
 }
 
-fn entry() -> Result<keyring::Entry, String> {
-    // Dev-suffixed keychain service in debug builds (mirrors auth.rs; see dev_identity).
-    keyring::Entry::new(&crate::dev_identity::keychain_service(), KEYCHAIN_USER)
-        .map_err(|e| e.to_string())
-}
-
+/// Read the device token. Routed through `dev_identity` so a debug build gets the dev-suffixed
+/// item AND never raises a keychain dialog for it — an ACL mismatch reads as absent, which here
+/// means "mint a fresh device token", not "ask the user for their login password" (sparkle-vvwbl).
 fn read_device_token() -> Option<String> {
-    let t = entry().ok()?.get_password().ok()?;
-    if t.is_empty() {
-        None
-    } else {
-        Some(t)
-    }
+    crate::dev_identity::read_keychain_secret(KEYCHAIN_USER)
 }
 
 /// Mint a fresh device token from the server and persist it in the keychain. Returns the token.
@@ -63,7 +55,7 @@ fn init_device_token() -> Result<String, String> {
         .get("deviceToken")
         .and_then(|t| t.as_str())
         .ok_or_else(|| "trial init response missing deviceToken".to_string())?;
-    entry()?.set_password(token).map_err(|e| e.to_string())?;
+    crate::dev_identity::write_keychain_secret(KEYCHAIN_USER, token)?;
     Ok(token.to_string())
 }
 

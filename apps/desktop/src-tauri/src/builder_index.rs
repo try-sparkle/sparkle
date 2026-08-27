@@ -1454,7 +1454,10 @@ static KEYCHAIN_READS: AtomicUsize = AtomicUsize::new(0);
 fn read_api_key() -> Result<String, SkipReason> {
     #[cfg(test)]
     KEYCHAIN_READS.fetch_add(1, Ordering::SeqCst);
-    let Some(k) = entry().ok().and_then(|e| e.get_password().ok()) else {
+    // Guarded: in a DEBUG build this must never raise the macOS confidential-information
+    // dialog for the dev-suffixed item this binary no longer owns the ACL of (sparkle-vvwbl).
+    let Some(k) = entry().ok().and_then(|e| crate::dev_identity::no_prompt(|| e.get_password().ok()))
+    else {
         return Err(SkipReason::NoApiKey);
     };
     let k = k.trim().to_string();
@@ -1484,11 +1487,17 @@ fn validate_api_key(key: &str) -> Result<(), String> {
 
 fn write_api_key(key: &str) -> Result<(), String> {
     validate_api_key(key)?;
-    entry()?.set_password(key).map_err(|e| e.to_string())
+    let e = entry()?;
+    // Guarded: in a DEBUG build this must never raise the macOS confidential-information
+    // dialog for the dev-suffixed item this binary no longer owns the ACL of (sparkle-vvwbl).
+    crate::dev_identity::no_prompt(|| e.set_password(key)).map_err(|e| e.to_string())
 }
 
 fn delete_api_key() -> Result<(), String> {
-    match entry()?.delete_credential() {
+    let entry = entry()?;
+    // Guarded: in a DEBUG build this must never raise the macOS confidential-information
+    // dialog for the dev-suffixed item this binary no longer owns the ACL of (sparkle-vvwbl).
+    match crate::dev_identity::no_prompt(|| entry.delete_credential()) {
         Ok(()) => Ok(()),
         // Already absent is the state the caller wanted.
         Err(keyring::Error::NoEntry) => Ok(()),

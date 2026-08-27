@@ -6,7 +6,9 @@
 //! dumps in `~/Library/Logs/ai.sparkle.desktop/hangs/`, whose main-thread stacks carry
 //! `tauri::ipc::protocol::get → Webview::on_message`). So for a sync command:
 //!
-//!     main-thread block per call  ==  wall time of the body
+//! ```text
+//! main-thread block per call  ==  wall time of the body
+//! ```
 //!
 //! That identity is what makes this harness a measurement of UI freeze rather than a microbenchmark
 //! of some unrelated function. After a command is moved to `async` + `spawn_blocking`, the main
@@ -19,7 +21,9 @@
 //! are machine- and moment-specific — an assertion on them would be a flake generator. It is a
 //! reporting instrument, run deliberately:
 //!
-//!     cargo test --lib main_thread_bench -- --ignored --nocapture
+//! ```text
+//! cargo test --lib main_thread_bench -- --ignored --nocapture
+//! ```
 //!
 //! The regression guard that DOES run in CI is `cmd_timing::main_thread_guard`, which asserts the
 //! conversions are still in place. This file proves they were worth making; that one keeps them.
