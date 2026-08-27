@@ -34,7 +34,13 @@ export default [
       "react-hooks/rules-of-hooks": "error",
       // warn, not error: a drifted dependency list is worth surfacing but is often an intentional
       // run-once effect. A single warning does not error, but the desktop lint script caps the
-      // total (`eslint src --max-warnings 12`), so NEW drift beyond today's 12 fails the gate.
+      // total (`eslint src --max-warnings 6`), so NEW drift beyond the cap fails the gate.
+      //
+      // THE CAP IS A RATCHET WITH SLACK, AND BOTH HALVES MATTER (bead sparkle-rrfs6p). It sat at 12
+      // against exactly 12 real warnings — passing, but with zero headroom, so the next branch to
+      // add any warning anywhere in the package went red and wore a failure it did not cause. The
+      // backlog was burned 12 → 4 and the cap re-cut at 6. When you burn more down, LOWER the cap
+      // to keep ~2 of slack; never RAISE it to absorb new drift, which is what makes it meaningless.
       "react-hooks/exhaustive-deps": "warn",
     },
   },

@@ -81,10 +81,13 @@ export function MobileDevicesPane() {
   }, [refresh]);
 
   const codeRemainingMs = code ? Math.max(0, codeMintedAt + CODE_TTL_MS - now) : 0;
+  // Named, so the dependency below is a plain boolean the linter can check statically — and so the
+  // tick only restarts when the code crosses live/expired, not on every `now` re-render.
+  const codeCountingDown = Boolean(code) && codeRemainingMs > 0;
   useEffect(() => {
-    const id = setInterval(() => setNow(Date.now()), code && codeRemainingMs > 0 ? 1000 : 60_000);
+    const id = setInterval(() => setNow(Date.now()), codeCountingDown ? 1000 : 60_000);
     return () => clearInterval(id);
-  }, [code, codeRemainingMs > 0]);
+  }, [codeCountingDown]);
 
   const mint = async () => {
     setMinting(true);

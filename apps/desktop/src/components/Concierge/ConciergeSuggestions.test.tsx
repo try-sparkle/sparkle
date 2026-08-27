@@ -5,7 +5,7 @@
 // the failure reporting, and "clear only on a real action" are pinned here directly.
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 
 const h = vi.hoisted(() => ({
   buttons: [] as unknown[],
@@ -105,12 +105,17 @@ beforeEach(() => {
   h.status = "working";
   h.mounts.length = 0;
   h.useSuggestions.mockReset();
-  // The mock stands in for a real hook, so it may use hooks itself: an empty-dep effect fires once
-  // per INSTANCE, which is what "the component did not remount" actually means.
+  // The mock stands in for a real hook, so it may use hooks itself: an effect whose dependency is
+  // frozen at first render fires once per INSTANCE, which is what "the component did not remount"
+  // actually means.
   h.useSuggestions.mockImplementation((agentId: string) => {
+    // `useRef(x).current` freezes the agentId this INSTANCE first rendered with, so the effect below
+    // has a dependency that never changes — one push per instance, which is the thing being
+    // measured — while still declaring everything it reads.
+    const mountedWith = useRef(agentId).current;
     useEffect(() => {
-      h.mounts.push(agentId);
-    }, []);
+      h.mounts.push(mountedWith);
+    }, [mountedWith]);
     return { buttons: h.buttons, dismiss: h.dismiss, clear: h.clear };
   });
   h.clear.mockReset();

@@ -61,6 +61,12 @@ export function PinnedPrompt({
   const interactive = history.length > 0;
   // The store keeps history oldest-first; the dropdown shows newest-first.
   const items = useMemo(() => history.slice().reverse(), [history]);
+  // Mirrored into a ref so the open-transition effect below can read the CURRENT list without
+  // taking `items` as a dependency — depending on it would re-fire that effect (resetting the
+  // user's selection) every time history changes while the menu is open, which is exactly what
+  // that effect documents it must not do.
+  const itemsRef = useRef(items);
+  itemsRef.current = items;
   // The bar shows up to the last 4 prompts as a breadcrumb, oldest→newest (newest on the right).
   // history's last entry is the current prompt (=== lastPrompt), so this ends with it. These four
   // map to the top four rows of the newest-first dropdown, so a crumb click never has to scroll.
@@ -110,15 +116,15 @@ export function PinnedPrompt({
     if (!open) return;
     const wantId = pendingSelectId.current;
     pendingSelectId.current = null;
-    const wantIdx = wantId ? items.findIndex((it) => it.id === wantId) : -1;
+    const wantIdx = wantId ? itemsRef.current.findIndex((it) => it.id === wantId) : -1;
     setSelectedIndex(wantIdx);
     setExpanded(wantIdx >= 0);
     setScrolledOutId(null);
     const raf = requestAnimationFrame(() => listRef.current?.focus());
     return () => cancelAnimationFrame(raf);
-    // Runs only on the open transition; `items` is read fresh at that moment, and we deliberately
-    // don't re-fire when history changes mid-open. (The exhaustive-deps suppression this rationale
-    // was attached to is gone — the rule no longer fires here — but the intent still holds.)
+    // Runs only on the open transition; the list is read fresh at that moment (through itemsRef),
+    // and we deliberately don't re-fire when history changes mid-open. The ref is what lets that
+    // intent hold with an EXHAUSTIVE dependency array rather than a suppression comment.
   }, [open]);
 
   // Click a row: a fresh row selects it (collapsed); clicking the already-selected row toggles its

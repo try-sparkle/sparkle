@@ -141,7 +141,6 @@ export function StraudeConsentModal() {
       // between a flow they finish and a URL they never click.
       window.open(c.verifyUrl, "_blank", "noopener,noreferrer");
       const deadline = Date.now() + LOGIN_TIMEOUT_MS;
-      // eslint-disable-next-line no-constant-condition
       while (true) {
         if (generation.current !== mine) return;
         if (Date.now() > deadline) {

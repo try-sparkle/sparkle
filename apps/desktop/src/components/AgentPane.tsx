@@ -1161,6 +1161,7 @@ function AgentPaneInner({
       // Increment the generation counter to invalidate any in-flight prepare() run. If
       // startOrchestrationBridge resolves AFTER this cleanup runs, the build branch's token
       // comparison (myRun !== prepareRunRef.current) will detect the staleness and stop the bridge.
+      // eslint-disable-next-line react-hooks/exhaustive-deps -- rule wants the ref copied to a local; this is a generation COUNTER that must be bumped on the LIVE ref at cleanup, so a copy would invalidate nothing.
       prepareRunRef.current++;
       // THIS RUN HAD READ THE OPENING BRIEF INTO ITS ARGV AND IS NOW OVER WITHOUT REACHING THE PTY.
       //

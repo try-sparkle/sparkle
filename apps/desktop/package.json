@@ -30,7 +30,7 @@
     "visual:prose-row-wrap": "node scripts/visual/prose-row-wrap-probe.mjs",
     "visual:reply-quote": "node scripts/visual/reply-quote-shot.mjs",
     "visual": "pnpm visual:capture && pnpm visual:compare",
-    "lint": "eslint src --max-warnings 12",
+    "lint": "eslint src --max-warnings 6",
     "typecheck": "tsc --noEmit",
     "test": "bash ../../scripts/vitest-run.sh",
     "test:coverage": "vitest run --coverage",

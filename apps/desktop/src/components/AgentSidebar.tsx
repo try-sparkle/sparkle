@@ -585,9 +585,13 @@ export function AgentSidebar({
   // you, <kind>") hasn't changed. That limit now bites `blocked` hardest, since the stall escalation
   // makes it the most-recurring red. advanceAlerts writes only on a real red-tier transition, so this
   // is not a per-tick persist. No-ops before a project.
+  // Read the id out of `project` here rather than inside the effect: the effect keys on the ID, not
+  // on the project OBJECT's identity — a re-created project record with the same id must not
+  // re-advance the episodes — and naming it keeps that dependency array exhaustive.
+  const alertProjectId = project?.id;
   useEffect(() => {
-    if (project) advanceAlerts(project.id, escalatedStatus);
-  }, [project?.id, escalatedStatus, advanceAlerts]);
+    if (alertProjectId) advanceAlerts(alertProjectId, escalatedStatus);
+  }, [alertProjectId, escalatedStatus, advanceAlerts]);
   // CONCIERGE BANDING NOTE (roborev 46341-M3): `effectiveStatus` above IS the published map.
   // `status` already carries both worker overlays (withUnstartedWorkerAttention +
   // withRedWorkerAttention, see its memo), and effectiveStatus adds withUnmergedWork +

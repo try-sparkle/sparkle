@@ -718,6 +718,11 @@ export function Terminal({
     disposedRef.current = false;
     let disposed = false;
     const unlistens: Array<() => void> = [];
+    // Bound once here so the cleanup below clears the SAME Map this run populated, rather than
+    // re-reading `markersRef.current` after teardown has begun. The ref is created once
+    // (`useRef(new Map())`) and never reassigned, so this is the identical object either way — but
+    // holding it makes that guarantee local instead of a whole-file invariant.
+    const markers = markersRef.current;
 
     // Select the transport by runtime. Local → a PTY on the Mac (pty.ts, unchanged behavior); cloud
     // → the relay stream for the already-running server session (never spawns a local PTY). Every
@@ -1762,7 +1767,7 @@ export function Terminal({
       transportRef.current = null;
       unregisterStatusEngine(agentId, engine);
       engine.dispose();
-      markersRef.current.clear(); // term.dispose() drops the markers; clear our handles too
+      markers.clear(); // term.dispose() drops the markers; clear our handles too
       // Dispose the WebGL renderer BEFORE the terminal. Its render loop runs on
       // requestAnimationFrame; if we let term.dispose() tear down the core render service first, an
       // already-scheduled frame can still fire and read `this._renderer.value.dimensions` after it's
