@@ -491,10 +491,16 @@ describe("a credential prompt refuses on the normal buffer too", () => {
 // is the SEAM the runner test cannot cover: it mocks `dispatchConciergeAnswer` whole, so the line
 // that PRODUCES this field is exercised by nothing but these rows.
 describe("an alternate-screen refusal carries its menu verdict", () => {
-  it("carries the live menu's labels when a dialog is on the alternate screen", async () => {
-    // A Claude Code permission dialog reached by a free-text send: the composer box is replaced, so
-    // it is NOT recognised as Claude Code and takes the alternate-screen path — but `read_picker`
-    // finds its options. The escalation must be able to name them, so they ride on the result.
+  it("carries the live menu's labels when an unrecognised screen shows a menu", async () => {
+    // AN UNRECOGNISED SCREEN THAT IS SHOWING SOMETHING MENU-SHAPED — a pager displaying a transcript
+    // is the realistic one. `onFullScreenApp` scores zero Claude Code marker families, so the
+    // `claudeCodeDialogOnScreen` carve-out cannot fire and this stays `alternate-screen`.
+    //
+    // (This case used to be described here as "a Claude Code permission dialog reached by a
+    // free-text send". That WAS true, and it is the misclassification bead sparkle-d6a5r reports: a
+    // real dialog now takes `blocked-prompt` instead, and its labels are pinned in the
+    // permission-dialog describe below. The assertion is unchanged; only the screen it is claiming
+    // to be has been corrected.)
     onFullScreenApp();
     vi.mocked(detectTerminalPrompts).mockReturnValue([
       { label: "Yes", value: "y" } as unknown as SuggestionButton,
@@ -505,7 +511,7 @@ describe("an alternate-screen refusal carries its menu verdict", () => {
     });
     expect(r.path).toBe("alternate-screen");
     // THE SIDE EFFECT: the labels, in order, so the escalation names the actual question.
-    expect(r.altScreenMenuLabels).toEqual(["Yes", "No, and tell Claude what to do differently"]);
+    expect(r.liveMenuLabels).toEqual(["Yes", "No, and tell Claude what to do differently"]);
     expectNothingWritten();
   });
 
@@ -518,7 +524,7 @@ describe("an alternate-screen refusal carries its menu verdict", () => {
       authority: { kind: "goal-continue", agentId: AGENT },
     });
     expect(r.path).toBe("alternate-screen");
-    expect(r.altScreenMenuLabels).toBeUndefined();
+    expect(r.liveMenuLabels).toBeUndefined();
     expectNothingWritten();
   });
 });
@@ -762,15 +768,147 @@ describe("a live permission dialog is not a full-screen app either", () => {
     expectNothingWritten();
   });
 
+  // ══ THE ESCALATION HAS TO NAME THE QUESTION, NOT A LIST OF CANDIDATES (bead sparkle-d6a5r) ═══
+  // The reclassification above moved this screen off `alternate-screen`, which is where the menu
+  // labels were carried — so the escalation for the app's MOST COMMON refused screen went from
+  // naming the actual choice to enumerating four things it might be. RED before the labels were
+  // carried on this arm: `liveMenuLabels` was undefined on every `blocked-prompt`.
+  it("carries the live dialog's option labels on the blocked-prompt refusal", async () => {
+    onPermissionDialog();
+    const r = await dispatchConciergeAnswer(AGENT, "please push it when you can", OPTS);
+    expect(r.path).toBe("blocked-prompt");
+    // THE SIDE EFFECT, in order, so the escalation can quote the actual question.
+    expect(r.liveMenuLabels).toEqual(["Yes", "No"]);
+    expectNothingWritten();
+  });
+
+  it("carries them for the machine-authored auto-resume too, which is the caller that escalates", async () => {
+    onPermissionDialog();
+    const r = await dispatchConciergeAnswer(AGENT, "continue", {
+      authority: { kind: "goal-continue", agentId: AGENT },
+    });
+    expect(r.path).toBe("blocked-prompt");
+    expect(r.liveMenuLabels).toEqual(["Yes", "No"]);
+  });
+
+  // ══ AND THE HALF THAT KEEPS THE REMEDY SAFE (the `sparkle-8bvh` shape) ═══════════════════════
+  // A CREDENTIAL FIELD MUST NEVER CARRY LABELS. It reaches `blocked-prompt` through the arm ABOVE
+  // the one that sets them, so a password line sitting under a menu that is still in scrollback
+  // cannot be escalated as "a dialog waiting for your answer" with options to choose between —
+  // which would instruct the human to do the exact thing the refusal exists to prevent, at a field
+  // that echoes nothing.
+  //
+  // ⚠️ WHAT THIS ROW COVERS IS THE ARM ORDERING, AND ONLY THAT (roborev 70330). An earlier comment
+  // here claimed it also pinned the viewport-vs-scrollback source choice. It cannot: this fixture
+  // returns at the CREDENTIAL arm, above the arm that sets the labels, so `liveMenuLabels` is
+  // undefined whichever source that arm reads — and `toBeUndefined()` was equally true before the
+  // field existed on this path at all, which makes it a precondition rather than the side effect.
+  // The source choice is pinned by the disagreeing-sources row below instead.
+  it("carries NO labels at a credential field, even with a menu still in scrollback", async () => {
+    // The recognised-Claude-Code sudo screen from the describe above, so the credential arm is the
+    // one that refuses. `detectTerminalPrompts` is made ARGUMENT-AWARE here: the SCROLLBACK still
+    // parses as a live menu while the VIEWPORT does not — the exact cross-source disagreement
+    // roborev 58562/58575 took four rounds to close, restated against the labels.
+    const CREDENTIAL_SCREEN = [
+      "⏺ Installing the dependency.",
+      "  ⎿  $ sudo make install",
+      "     (ctrl+b to run in background)",
+      "[sudo] password for drodio:",
+      "──────────────────────────────────────────────────────────────────────────────",
+      "❯ ",
+      "──────────────────────────────────────────────────────────────────────────────",
+      "  ⏸ manual mode on · ? for shortcuts",
+    ].join("\n");
+    vi.mocked(getAgentViewport).mockReturnValue({
+      text: CREDENTIAL_SCREEN,
+      alternateBuffer: true,
+    });
+    // "SCREEN" is what the mocked `getAgentScrollback` returns, i.e. the scrollback read only.
+    vi.mocked(detectTerminalPrompts).mockImplementation((text: string) =>
+      text === "SCREEN" ? DIALOG_OPTIONS : [],
+    );
+    const r = await dispatchConciergeAnswer(AGENT, "continue", {
+      authority: { kind: "goal-continue", agentId: AGENT },
+    });
+    expect(r.path).toBe("blocked-prompt");
+    expect(r.liveMenuLabels).toBeUndefined();
+    expectNothingWritten();
+  });
+
   // ── A PAGER SHOWING A MENU-SHAPED TRANSCRIPT IS STILL A PAGER ────────────────────────────────
-  // The widening needs a Claude Code marker family as well as a live menu. A pager or an editor has
-  // neither, so `onFullScreenApp` keeps its `alternate-screen` verdict even with options on screen
-  // — which the "stale option" case at the top of this file already pins, and this restates against
-  // the NEW conjunction so a future edit that drops the marker-family half goes red here.
+  // The widening needs a Claude Code marker family as well as a live menu. A `vim` screen has
+  // neither, so it keeps its `alternate-screen` verdict even with options on screen.
+  //
+  // ⚠️ THIS ROW DOES NOT GUARD THE MARKER-FAMILY HALF, though it used to claim it did. Measured with
+  // `mutation-check` on `claudeCodeDialogScreen.ts:62`: relaxing `claudeCodeMarkerFamilies(text) >= 1`
+  // to `< 1` — which reclassifies EVERY screen with no Claude Code markers at all, the exact edit
+  // the comment said would go red here — left this row GREEN. `onFullScreenApp` is `~\n~\n~`, which
+  // is not awaiting input, so `screenBlocksWrite` is false and the OTHER conjunct is what holds the
+  // line. The claim was true of the conjunction and false of this fixture, which is the shape
+  // AGENTS.md calls a guard that pins a precondition rather than the side effect.
+  // The row below carries that half properly; this one stays for the case it really does cover.
   it("does not reclassify a full-screen app that happens to show options", async () => {
     onFullScreenApp();
     vi.mocked(detectTerminalPrompts).mockReturnValue(DIALOG_OPTIONS);
     const r = await dispatchConciergeAnswer(AGENT, "please push it when you can", OPTS);
+    expect(r.path).toBe("alternate-screen");
+    expectNothingWritten();
+  });
+
+  // ══ THE SOURCE CHOICE ITSELF, ON THE ONLY FIXTURE THAT CAN SEE IT (roborev 70330) ════════════
+  // The rows above cannot: `onPermissionDialog` mocks `detectTerminalPrompts` with a blanket
+  // `mockReturnValue`, so the SCROLLBACK read and the VIEWPORT read return the identical list and
+  // both stay green whichever one the labelling arm uses. That leaves the commit's central safety
+  // property — labels come from the viewport — pinned by nothing, which is the same misattributed
+  // guard this file corrects two rows down.
+  //
+  // So make the two sources DISAGREE. The viewport holds the live dialog; the scrollback still
+  // holds a different, older menu. Swap `viewportOptions` for `pickerOptions` at the labelling arm
+  // and the human is told to choose between options that scrolled off the screen — the roborev
+  // 58562/58575 hazard, restated against the labels — and this row goes red naming both lists.
+  it("labels the LIVE dialog, not an older menu still sitting in the scrollback", async () => {
+    const STALE_SCROLLBACK_OPTIONS = [
+      { id: "1", label: "Discard everything and start over", value: "1\n" },
+      { id: "2", label: "Keep the current worktree", value: "2\n" },
+    ] as unknown as SuggestionButton[];
+    vi.mocked(getAgentViewport).mockReturnValue({
+      text: PERMISSION_DIALOG_NO_FOOTER,
+      alternateBuffer: true,
+    });
+    // "SCREEN" is what the mocked `getAgentScrollback` returns; anything else is the viewport.
+    vi.mocked(detectTerminalPrompts).mockImplementation((text: string) =>
+      text === "SCREEN" ? STALE_SCROLLBACK_OPTIONS : DIALOG_OPTIONS,
+    );
+    const r = await dispatchConciergeAnswer(AGENT, "continue", {
+      authority: { kind: "goal-continue", agentId: AGENT },
+    });
+    expect(r.path).toBe("blocked-prompt");
+    // THE VIEWPORT'S menu, which is what is actually on screen for the human to answer.
+    expect(r.liveMenuLabels).toEqual(["Yes", "No"]);
+    // AND EXPLICITLY NOT the scrollback's, so the failure names which source leaked in.
+    expect(r.liveMenuLabels).not.toContain("Discard everything and start over");
+    expectNothingWritten();
+  });
+
+  // ══ AND THE MARKER-FAMILY HALF, ON A FIXTURE THAT CAN ACTUALLY FAIL ══════════════════════════
+  // The negative case above is decided by `screenBlocksWrite`, so it cannot see the marker-family
+  // requirement being dropped. This one can: a full-screen app that IS awaiting input — `ssh` or
+  // `sudo` run from inside a pager-held screen — satisfies `screenBlocksWrite`, carries ZERO Claude
+  // Code marker families, and shows a menu (mocked, as the "stale options in scrollback" case
+  // does). The marker-family conjunct is then the ONLY thing keeping it on `alternate-screen`.
+  //
+  // Relax `claudeCodeMarkerFamilies(text) >= 1` and this screen is reclassified as a live Claude
+  // Code dialog, takes `blocked-prompt`, and this row goes red. Verified with `mutation-check`
+  // against that exact line: SURVIVED before this row existed, CAUGHT after.
+  it("does not reclassify a blocking screen that carries no Claude Code markers at all", async () => {
+    vi.mocked(getAgentViewport).mockReturnValue({
+      text: ["~", "~", "~", "[sudo] password for drodio:"].join("\n"),
+      alternateBuffer: true,
+    });
+    vi.mocked(detectTerminalPrompts).mockReturnValue(DIALOG_OPTIONS);
+    const r = await dispatchConciergeAnswer(AGENT, "continue", {
+      authority: { kind: "goal-continue", agentId: AGENT },
+    });
     expect(r.path).toBe("alternate-screen");
     expectNothingWritten();
   });

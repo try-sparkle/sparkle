@@ -578,7 +578,7 @@ describe("an auto-continue that never REACHES the terminal", () => {
   });
 
   it("NO-MENU alternate screen: says a pager/editor is holding it and quitting is safe, never that a dialog is waiting", async () => {
-    // `alwaysRefuse` sets no `altScreenMenuLabels`, which is the `blind:'no-menu'` case — a pager or
+    // `alwaysRefuse` sets no `liveMenuLabels`, which is the `blind:'no-menu'` case — a pager or
     // editor holds the alternate buffer and there is NO question on the screen. Measured: four agents
     // in one morning, every one a no-menu pager, all told "usually a permission dialog or menu
     // waiting on an answer" — sending the founder to open a pane and hunt for a menu that was not
@@ -615,15 +615,20 @@ describe("an auto-continue that never REACHES the terminal", () => {
   });
 
   it("MENU-present alternate screen: names the waiting dialog and its options, never the pager remedy", async () => {
-    // The OTHER state on the SAME path: a Claude Code permission dialog reached by a free-text send.
-    // `read_picker_options` succeeds on it, so the dispatcher carries the labels on the result. Here
-    // there IS a question — telling the human to "quit the pager" would be the wrong remedy, and the
-    // no-menu copy's "quitting is safe" would be actively unsafe advice against a live decision.
+    // The OTHER state on the SAME path: an unrecognised alternate-screen app that IS showing
+    // something menu-shaped — a pager displaying a transcript, most often. Here there IS something
+    // on screen to name, so telling the human to "quit the pager" would be the wrong remedy and the
+    // no-menu copy's "quitting is safe" would be advice against a decision that may be live.
+    //
+    // (This used to read "a Claude Code permission dialog reached by a free-text send", which was
+    // true when it was written. That screen is now classified as `blocked-prompt` — bead
+    // sparkle-d6a5r — and its own menu-present row is below. Keeping the stale premise here would
+    // leave the file claiming the dialog case is covered by a row that can no longer see it.)
     sendMock.mockImplementation(async (agentId: string) => ({
       ok: false as const,
       path: "alternate-screen" as const,
       agentId,
-      altScreenMenuLabels: ["Yes", "No, and tell Claude what to do differently"],
+      liveMenuLabels: ["Yes", "No, and tell Claude what to do differently"],
     }));
     const { projectId, agentId } = seed({ goal: "land the PR" });
 
@@ -669,6 +674,60 @@ describe("an auto-continue that never REACHES the terminal", () => {
     // The wrong diagnosis, and the one this arm used to give.
     expect(reason).not.toContain("its process is gone");
     expect(reason).not.toContain("Restart the agent");
+  });
+
+  // ══ THE DIALOG CASE ESCALATES FROM HERE NOW (bead sparkle-d6a5r) ═════════════════════════════
+  // `sparkle-1cu3j` stopped calling a Claude Code permission dialog a full-screen app, which routed
+  // it off `alternate-screen` and onto this path — and the labels did not travel with it. So the
+  // single most common screen to reach a refusal went from naming its own question to being handed
+  // to the human as "a permission dialog, a password, a host-key confirmation, a yes/no": four
+  // candidates, one of them true, at 3am. RED before the labels were carried on the blocked-prompt
+  // arm, because `liveMenuLabels` was undefined on every result reaching this branch.
+  it("MENU-present blocked prompt: names the permission dialog and its options", async () => {
+    sendMock.mockImplementation(async (agentId: string) => ({
+      ok: false as const,
+      path: "blocked-prompt" as const,
+      agentId,
+      liveMenuLabels: ["Yes", "No, and tell Claude what to do differently"],
+    }));
+    const { projectId, agentId } = seed({ goal: "land the PR" });
+
+    await sweepUntilEligible(MAX_UNDELIVERED_CONTINUES);
+
+    const reason = goalOf(projectId, agentId)!.escalationReason!;
+    // Names the dialog AND the specific options, so the human knows what is being asked without
+    // opening the pane to find out.
+    expect(reason).toMatch(/permission dialog waiting for your answer/i);
+    expect(reason).toContain('"Yes"');
+    expect(reason).toContain('"No, and tell Claude what to do differently"');
+    // ── AND IT MUST NOT OFFER A REMEDY THAT IS UNSAFE IN THIS STATE (the `sparkle-8bvh` rule) ───
+    // "Quitting it is safe" belongs to the no-menu pager arm and is FALSE against a live decision;
+    // and this bead exists because `restart_agent` — which destroys in-flight context to deliver
+    // one message — was left as the only route to the pane, so the escalation may never send the
+    // human there either.
+    expect(reason).not.toMatch(/quitting it is safe/i);
+    expect(reason).not.toMatch(/pager or editor/i);
+    expect(reason).not.toMatch(/restart/i);
+    // The banner the human actually reads carries the same sentence, not a second one that drifts.
+    expect(notifyMock.mock.calls[0]![0].body).toBe(reason);
+  });
+
+  it("NO-MENU blocked prompt: keeps the honest enumeration and claims no dialog it cannot see", async () => {
+    // A credential field reaches this path with NO labels, by construction — the credential arm
+    // returns above the arm that sets them. The copy must not invent a menu here: "choose what is
+    // on screen" at a concealed password field is a dead instruction.
+    alwaysRefuse("blocked-prompt");
+    const { projectId, agentId } = seed({ goal: "land the PR" });
+
+    await sweepUntilEligible(MAX_UNDELIVERED_CONTINUES);
+
+    const reason = goalOf(projectId, agentId)!.escalationReason!;
+    expect(reason).toMatch(/must not receive free text/i);
+    expect(reason).toMatch(/host-key/i);
+    expect(reason).not.toMatch(/waiting for your answer/i);
+    expect(reason).not.toMatch(/choose what is on screen/i);
+    expect(reason).not.toMatch(/quitting it is safe/i);
+    expect(reason).not.toMatch(/restart/i);
   });
 
   it("still gives a LOCAL agent the terminal wording on the same path", async () => {

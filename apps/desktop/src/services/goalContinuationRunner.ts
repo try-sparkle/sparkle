@@ -738,10 +738,11 @@ function undeliverableReason(
   goalText: string,
   path: UndeliveredPath,
   isCloud: boolean,
-  /** For the `alternate-screen` path only: the live menu labels the dispatcher's screen probe
-   *  found, or `undefined` when it found none (`blind:'no-menu'`). Undefined for every other path.
-   *  See {@link ConciergeDispatchResult.altScreenMenuLabels} and bead sparkle-j2gase. */
-  altScreenMenuLabels?: string[],
+  /** For the SCREEN paths (`alternate-screen`, `blocked-prompt`): the live menu labels the
+   *  dispatcher's screen probe found, or `undefined` when it found none (`blind:'no-menu'`, and a
+   *  credential field, which never carries labels by construction). Undefined for every other path.
+   *  See {@link ConciergeDispatchResult.liveMenuLabels} and beads sparkle-j2gase, sparkle-d6a5r. */
+  liveMenuLabels?: string[],
 ): string {
   // THE SCREEN ARMS ARE RUNTIME-AWARE TOO, not just the closing sentence. Both of these fire for a
   // cloud agent — the guards that produce them run BEFORE the cloud branch and read the RELAYED
@@ -770,14 +771,14 @@ function undeliverableReason(
         // ── AND IT BRANCHES ON THE MENU PROBE, because one string for two states cost the human a
         // trip (bead sparkle-j2gase). BOTH states reach this same `alternate-screen` path, but the
         // dispatcher already KNOWS which one it is: the SAME `liveOptionsFor` read that made the
-        // refusal decision is carried on `altScreenMenuLabels`. A live menu (a Claude Code permission
+        // refusal decision is carried on `liveMenuLabels`. A live menu (a Claude Code permission
         // dialog, reached by a free-text send) has options — there IS a question, name it and say
         // "answer it". No menu (`blind:'no-menu'` — a pager or editor holds the buffer) has none —
         // "answer what is on screen" is a dead instruction there, so say the true remedy: quitting it
         // is safe and will not lose the turn. Measured: four agents in one morning, every one a
         // no-menu pager, all told to go find a dialog that was not there.
-        altScreenMenuLabels && altScreenMenuLabels.length > 0
-          ? `${screen} has a dialog waiting for your answer${namedMenuOptions(altScreenMenuLabels)}. It is a menu the auto-resume cannot answer for you — open ${pane} and choose what is on screen, and the auto-resume will take over again`
+        liveMenuLabels && liveMenuLabels.length > 0
+          ? `${screen} has a dialog waiting for your answer${namedMenuOptions(liveMenuLabels)}. It is a menu the auto-resume cannot answer for you — open ${pane} and choose what is on screen, and the auto-resume will take over again`
           : `${screen} is in full-screen mode with no menu on it — a pager or editor is holding the screen, so nothing is waiting on an answer. Quitting it is safe and will not lose the turn (the goal resumes where it left off): open ${pane} and quit the pager or editor, and the auto-resume will take over again`
       : path === "blocked-prompt"
         ? // ── A PERMISSION DIALOG ARRIVES HERE NOW (bead sparkle-d6a5r) ─────────────────────────
@@ -786,7 +787,25 @@ function undeliverableReason(
           // which routes it to THIS sentence — so this list has to lead with it rather than
           // enumerating only the credential shapes, or the escalation names every cause but the one
           // the human is actually looking at.
-          `${screen} is waiting at a prompt that must not receive free text — a permission dialog, a password, a host-key confirmation, a yes/no. Answer that prompt in ${pane}`
+          //
+          // ── AND IT BRANCHES ON THE MENU PROBE, FOR THE REASON THE ARM ABOVE DOES ──────────────
+          // Reclassifying the dialog fixed the diagnosis and broke the SPECIFICS: the arm above
+          // names the actual question and its options, and this one enumerated four candidate
+          // causes — a permission dialog, a password, a host-key confirmation, a yes/no — exactly
+          // one of which is true, for the screen that is now the most common one to reach a
+          // refusal. The dispatcher already knows which: `liveMenuLabels` carries the VIEWPORT menu
+          // its own `screenBlocksWrite` interlock read. So say what is being asked when there is a
+          // menu, and keep the honest enumeration for when there is not.
+          //
+          // ⚠️ THE NO-MENU BRANCH MUST NOT INHERIT THE PAGER REMEDY. "Quitting it is safe" belongs
+          // to the arm above and is TRUE only there; a no-menu `blocked-prompt` is a credential
+          // field or a confirmation, where quitting loses the turn and answering is the point.
+          // Neither branch may suggest restarting the agent: this bead exists because
+          // `restart_agent` — which destroys in-flight context to deliver one message — was left as
+          // the only route to the pane.
+          liveMenuLabels && liveMenuLabels.length > 0
+          ? `${screen} has a permission dialog waiting for your answer${namedMenuOptions(liveMenuLabels)}. It is a decision the auto-resume cannot make for you — open ${pane} and choose what is on screen, and the auto-resume will take over again`
+          : `${screen} is waiting at a prompt that must not receive free text — a password, a host-key confirmation, or a yes/no. Answer that prompt in ${pane}`
         : path === "pty-gone"
           ? "its process is gone. Restart the agent to pick the goal back up"
           : // SPLIT FROM `pty-gone`, because the remedies differ and this one already has an
@@ -1185,9 +1204,12 @@ async function continueAgent(
       useProjectStore.getState().noteAgentGoalContinue(projectId, agent.id, mark);
       log.info("goals", "auto-continued a stalled agent", { agentId: agent.id, path: result.path });
     } else {
-      // `altScreenMenuLabels` is set only on an `alternate-screen` refusal; undefined everywhere
-      // else, which is exactly what `undeliverableReason` wants for every other arm.
-      noteUndelivered(projectId, agent, result.path, now, result.altScreenMenuLabels);
+      // `liveMenuLabels` is set on the two SCREEN refusals — `alternate-screen` and
+      // `blocked-prompt` — and only when the refusing arm's own screen read found a live menu.
+      // Undefined everywhere else, which is exactly what `undeliverableReason` wants for every
+      // other arm. (It was `alternate-screen`-only until the permission dialog was reclassified
+      // onto `blocked-prompt`; bead sparkle-d6a5r.)
+      noteUndelivered(projectId, agent, result.path, now, result.liveMenuLabels);
     }
   } catch (e) {
     outcome.detail = "threw";
@@ -1221,12 +1243,13 @@ function noteUndelivered(
   agent: AgentTab,
   path: UndeliveredPath,
   now: number,
-  /** For the `alternate-screen` path only: the live menu labels the dispatcher found this sweep, or
-   *  undefined for the `blind:'no-menu'` case (and every non-alternate-screen path). Passed straight
-   *  to {@link undeliverableReason} so the escalation names the right remedy — see bead
-   *  sparkle-j2gase. It is the CURRENT sweep's verdict that escalates, so this needs no persisting
-   *  in the streak map: the sweep that trips the bound carries its own menu state. */
-  altScreenMenuLabels?: string[],
+  /** For the SCREEN paths (`alternate-screen`, `blocked-prompt`): the live menu labels the
+   *  dispatcher found this sweep, or undefined for the `blind:'no-menu'` case (and every non-screen
+   *  path). Passed straight to {@link undeliverableReason} so the escalation names the right remedy
+   *  — see beads sparkle-j2gase and sparkle-d6a5r. It is the CURRENT sweep's verdict that escalates,
+   *  so this needs no persisting in the streak map: the sweep that trips the bound carries its own
+   *  menu state. */
+  liveMenuLabels?: string[],
 ): void {
   const count = (undelivered.get(agent.id)?.count ?? 0) + 1;
   undelivered.set(agent.id, { count, path });
@@ -1244,7 +1267,7 @@ function noteUndelivered(
       agent.goal?.text ?? "",
       path,
       agent.runtime === "cloud",
-      altScreenMenuLabels,
+      liveMenuLabels,
     ),
     "escalate",
     now,

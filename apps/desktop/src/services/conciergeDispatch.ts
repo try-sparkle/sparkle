@@ -192,18 +192,45 @@ export interface ConciergeDispatchResult {
    *  new producer: a hold whose release depends on the same predicate that caused it is how the
    *  founder's message came to be dropped fifteen minutes after he was promised it would arrive. */
   heldReason?: "screen";
-  /** On an `"alternate-screen"` refusal ONLY: the labels of the live menu the screen probe found at
-   *  the instant of the refusal, or `undefined` when it found NONE (the `blind:'no-menu'` case — a
-   *  pager or editor is holding the alternate buffer).
+  /** On a SCREEN refusal — `"alternate-screen"` or `"blocked-prompt"` — the labels of the live menu
+   *  the screen probe found at the instant of the refusal, or `undefined` when it found NONE (the
+   *  `blind:'no-menu'` case — a pager or editor holding the alternate buffer, or a credential field
+   *  that is not a menu at all).
    *
-   *  The two states reach the SAME `"alternate-screen"` path but need OPPOSITE remedies, and the
-   *  auto-resume escalation had no way to tell them apart: it told the human "usually a permission
-   *  dialog or menu waiting on an answer" for a stuck pager where there is no question to answer,
-   *  sending them to open a pane and hunt for a menu that is not there (bead sparkle-j2gase, four
-   *  agents in one morning). A live menu means "answer the dialog"; no menu means "a pager/editor is
-   *  holding the screen — quitting it is safe". Populated from the SAME `liveOptionsFor` read the
-   *  refusal decision uses, so the copy can never disagree with the guard about whether a menu is up. */
-  altScreenMenuLabels?: string[];
+   *  Two states reach each of those paths and they need OPPOSITE remedies, and the auto-resume
+   *  escalation had no way to tell them apart: it told the human "usually a permission dialog or menu
+   *  waiting on an answer" for a stuck pager where there is no question to answer, sending them to
+   *  open a pane and hunt for a menu that is not there (bead sparkle-j2gase, four agents in one
+   *  morning). A live menu means "answer the dialog, and here is what it asks"; no menu means "a
+   *  pager/editor is holding the screen — quitting it is safe".
+   *
+   *  ══ IT COVERS `blocked-prompt` TOO, BECAUSE THE DIALOG CASE MOVED THERE (bead sparkle-d6a5r) ══
+   *  It was `alternate-screen`-only when it was written, and that was correct then: a Claude Code
+   *  permission dialog on the alternate buffer took the `alternate-screen` path, so naming the menu
+   *  there was naming the dialog. `sparkle-1cu3j` then fixed the misclassification this bead
+   *  reports — a dialog is not a full-screen app — which routed that exact screen to
+   *  `blocked-prompt` instead. The classification got better and the ESCALATION got worse: the most
+   *  common screen reaching a refusal became the one arm that could not name what it was asking, so
+   *  the human was handed a list of four things it MIGHT be. A fix that changes WHEN something
+   *  happens has to bring along every string that described the old timing (AGENTS.md), and this
+   *  field is one of them.
+   *
+   *  ══ WHICH SOURCE, AND WHY IT DIFFERS PER PATH ═════════════════════════════════════════════════
+   *  Always the SAME read the refusing arm's own guard used, so the copy can never disagree with the
+   *  guard about whether a menu is up. That is `liveOptionsFor` (the scrollback) on the
+   *  `alternate-screen` arm, and `detectTerminalPrompts(screen.text)` (the VIEWPORT) on the
+   *  `blocked-prompt` arm — whose `screenBlocksWrite`/`claudeCodeDialogOnScreen` interlock is
+   *  viewport-derived. Mixing them is the exact failure roborev 58562/58575 took four rounds to
+   *  close: a scrollback-derived claim about a viewport-derived decision describes a menu that has
+   *  already scrolled away.
+   *
+   *  ⚠️ NEVER POPULATED FOR A CREDENTIAL FIELD, and that is load-bearing rather than incidental. A
+   *  `blocked-prompt` from the credential arm returns BEFORE the arm that sets this, so a password
+   *  line sitting under a stale `1) … 2) …` run can never be described to the human as "a dialog
+   *  waiting for your answer" with options to pick. That mis-description is the `sparkle-8bvh` shape
+   *  — a remedy string is an instruction, and "go choose an option" at a concealed field is an
+   *  instruction that cannot be followed. */
+  liveMenuLabels?: string[];
 }
 
 /**
@@ -966,15 +993,19 @@ async function routeConciergeAnswer(
     // CARRY THE MENU VERDICT ON THE RESULT so the auto-resume escalation can name the right remedy.
     // `pickerOptions` is the same read this branch's `verifiedPickerPress` check already used, so the
     // copy downstream cannot disagree with the guard about whether a menu is live. A Claude Code
-    // permission dialog reached by a free-text send lands here WITH options (answer it); a pager or
-    // editor holds the alternate buffer with NONE (`blind:'no-menu'` — quitting it is safe). See
-    // bead sparkle-j2gase.
+    // permission dialog reached by a free-text send USED to land here WITH options (answer it) — it
+    // now takes `blocked-prompt` instead (bead sparkle-d6a5r), which carries the same field from its
+    // own arm below. What still reaches HERE with a menu is a screen that is genuinely unrecognised
+    // AND showing something menu-shaped: a pager displaying a transcript, most often. Naming what is
+    // on it is still the better escalation than a guess about which app it is. A pager or editor
+    // holds the alternate buffer with NO menu (`blind:'no-menu'` — quitting it is safe). See beads
+    // sparkle-j2gase and sparkle-d6a5r.
     const menuIsLive = pickerOptions.length > 0;
     return {
       ok: false,
       path: "alternate-screen",
       agentId,
-      altScreenMenuLabels: menuIsLive ? pickerOptions.map((o) => o.label) : undefined,
+      liveMenuLabels: menuIsLive ? pickerOptions.map((o) => o.label) : undefined,
     };
   }
   // ══ RECOGNISING CLAUDE CODE IS NOT A SAFETY VERDICT (roborev 57718) ═════════════════════════════
@@ -1107,10 +1138,43 @@ async function routeConciergeAnswer(
     !mountedHumanSend(opts) &&
     screenBlocksWrite(screen.text)
   ) {
+    // ══ NAME THE QUESTION, NOT A LIST OF WHAT IT MIGHT BE (bead sparkle-d6a5r) ═══════════════════
+    // THIS ARM IS WHERE THE PERMISSION DIALOG LANDS — that is the whole point of the
+    // reclassification one guard up, and it is also what made the escalation worse. The
+    // `alternate-screen` arm carries the live menu's labels so the human is told what is being asked
+    // ("Yes" / "No, and tell Claude what to do differently"); this arm carried nothing, so the same
+    // screen that used to name its own question started producing "a permission dialog, a password,
+    // a host-key confirmation, a yes/no" — four candidates, one of which is right. AGENTS.md: a fix
+    // that changes WHEN something happens must update every string that described the old timing.
+    //
+    // ⚠️ FROM THE VIEWPORT, NOT THE SCROLLBACK, AND THAT IS NOT INTERCHANGEABLE. This arm's own
+    // premise is viewport-derived — `screenBlocksWrite(screen.text)`, and `claudeCodeDialogOnScreen`
+    // inside `evidence` — so the labels have to come from the same rows, which is what
+    // `viewportOptions` is. Reaching for `pickerOptions` (50 lines of SCROLLBACK for the Claude
+    // picker) would let a menu that has already scrolled away describe a prompt that is live now,
+    // and the human would be told to choose between two options that are not on screen. That exact
+    // cross-source shape took roborev 58562/58575 four rounds to close on the credential waiver; it
+    // is not worth re-opening here for a string.
+    //
+    // ⚠️ A CREDENTIAL FIELD CANNOT REACH THIS LINE, which is what makes naming a menu safe at all.
+    // The credential arm above returns first and unconditionally, so `screenIsCredentialField` is
+    // false by the time we are here. Were it not, `Enter your vault password:` under a stale
+    // `1) … 2) …` run would be escalated as "a dialog waiting for your answer" with options to pick
+    // — a remedy string that instructs the human to do the one thing the refusal exists to prevent
+    // (the `sparkle-8bvh` shape). If a future edit reorders these two arms, this field must move
+    // with them.
+    const menuIsLive = viewportOptions.length > 0;
     log.warn("concierge", "refused a write into a blocked prompt on a Claude Code screen", {
       agentId,
+      menuIsLive,
+      viewportOptions: viewportOptions.length,
     });
-    return { ok: false, path: "blocked-prompt", agentId };
+    return {
+      ok: false,
+      path: "blocked-prompt",
+      agentId,
+      liveMenuLabels: menuIsLive ? viewportOptions.map((o) => o.label) : undefined,
+    };
   }
   // ══ ANSWER FROM THE TEXT THE WAIVER READ (roborev 58575) ═══════════════════════════════════════
   // The previous round made the WAIVER read the viewport but left the ANSWER parsed from the
