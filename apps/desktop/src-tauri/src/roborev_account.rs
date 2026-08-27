@@ -36,10 +36,17 @@
 //! # Policy (the founder's call, 2026-08-13)
 //!
 //! roborev shares the NON-default account pool with the interactive fleet but ranks **lowest
-//! priority**: it picks the account with the most headroom, and if fewer than two healthy fleet
-//! accounts are left it **stands down** rather than competing. Reviews degrade before the founder's
-//! own work does. A stood-down job fails fast and honestly instead of burning the last account;
-//! re-running it is a separate concern (see the reaper).
+//! priority**: it picks the account with the most headroom, and if NO healthy fleet account is left
+//! it **stands down** rather than falling back to the reserved interactive login. Reviews degrade
+//! before the founder's own work does. A stood-down job fails fast and honestly; re-running it is a
+//! separate concern (see the reaper).
+//!
+//! It may run on a SINGLE healthy fleet account. The founder's own login is the DEFAULT account,
+//! which is always reserved out of this pool (below), so the last fleet account is never the
+//! founder's last one — it is a worker account roborev already defers to by ranking lowest. Standing
+//! down at one fleet account (the pre-reservation rule) only re-darkened review for no protection
+//! once the default became unconditionally reserved (sparkle-qfr436 / -yjtp0g / -s666fn / -v8dkzo /
+//! -5dc1jv).
 //!
 //! The one login it NEVER touches is the interactive session's own — the DEFAULT account
 //! (`$HOME/.claude`, the empty-`config_dir` sentinel). That account is what a plain interactive
@@ -60,17 +67,23 @@ use crate::accounts::Account;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-/// Marker line meaning "do not run a review at all" — written when fewer than two accounts are
-/// healthy, so roborev never competes for the founder's last one. The shim exits non-zero on it.
+/// Marker line meaning "do not run a review at all" — written when NO non-default account is
+/// healthy, so roborev never falls back to the reserved interactive login. The shim exits non-zero
+/// on it.
 pub const STANDDOWN: &str = "STANDDOWN";
 
 /// Header written at the top of the candidate file. Purely informational; the shim skips `#` lines.
 const CANDIDATES_HEADER: &str =
     "# sparkle roborev claude-account candidates v1 — <exhaustedUntilEpochSecs>\\t<configDir>";
 
-/// Below this many healthy accounts, roborev stands down (see the policy note above). Two, not one:
-/// at exactly one healthy account, using it IS taking the founder's last one.
-const MIN_HEALTHY_TO_RUN: usize = 2;
+/// Below this many healthy NON-DEFAULT accounts, roborev stands down (see the policy note above).
+/// ONE, not two, now that the interactive/default login is ALWAYS reserved out of the pool
+/// ([`is_interactive_reserved`]): with the founder's own login never a review candidate, running on
+/// the last remaining FLEET account no longer takes the founder's last one — it competes only with a
+/// worker account roborev already defers to by ranking lowest. Standing down at one fleet account
+/// instead just re-darkens review for no protection (sparkle-qfr436 / -yjtp0g / -s666fn / -v8dkzo /
+/// -5dc1jv). Zero healthy fleet accounts still stands down: roborev must never fall back to default.
+const MIN_HEALTHY_TO_RUN: usize = 1;
 
 /// A ranked account the shim may select. `dir` empty means the default account — "export no
 /// `CLAUDE_CONFIG_DIR` at all", the same sentinel [`crate::accounts::Account::config_dir`] uses.
@@ -229,8 +242,8 @@ pub const OVERLOAD_PHRASES: &[&str] = &[
 /// from the map is treated as `0.5` — neutral, so an unknown never sorts as either the best or the
 /// worst choice on no evidence.
 ///
-/// Returns EMPTY when fewer than [`MIN_HEALTHY_TO_RUN`] accounts are healthy: that is the
-/// stand-down case, and the caller writes [`STANDDOWN`] rather than a list.
+/// Returns EMPTY when fewer than [`MIN_HEALTHY_TO_RUN`] healthy NON-DEFAULT accounts remain: that is
+/// the stand-down case, and the caller writes [`STANDDOWN`] rather than a list.
 ///
 /// Pure — `now` is injected, so this is unit-testable without a clock.
 pub fn rank_candidates(accounts: &[Account], headroom: &HashMap<String, f64>, now: i64) -> Vec<Candidate> {
@@ -240,13 +253,13 @@ pub fn rank_candidates(accounts: &[Account], headroom: &HashMap<String, f64>, no
 /// [`rank_candidates`], additionally dropping accounts whose config dir is in `auth_dead` — the
 /// OAuth-expired accounts observed by [`is_auth_expired`] on a prior job's output.
 ///
-/// SAFETY — the founder's last-account rule, mirrored for auth. An auth-dead account is NOT a usable
-/// reserve, so excluding it composes with the [`MIN_HEALTHY_TO_RUN`] stand-down rather than
-/// bypassing it: if dropping the auth-dead accounts leaves fewer than [`MIN_HEALTHY_TO_RUN`] USABLE
-/// accounts, roborev stands down exactly as it would on quota — running on the one remaining login IS
-/// taking the founder's last usable one. The ONE exception is fail-open: if EVERY healthy account is
-/// auth-dead the detector might be wrong (a false positive would otherwise strand ALL reviews), so
-/// the un-pruned ranking is kept and the shim is left to try. The exclusion EXPIRES rather than being
+/// SAFETY — fail-open. An auth-dead account is NOT a usable review login, so it is pruned from the
+/// pool. Because the interactive/default login is reserved out BEFORE this filter runs, one surviving
+/// fleet login is safe to run on (`MIN_HEALTHY_TO_RUN == 1`) — it is never the founder's own account,
+/// so there is no last-account stand-down for the auth filter to compose with. The ONE exception is
+/// fail-open: if EVERY healthy account is auth-dead the detector might be wrong (a false positive
+/// would otherwise strand ALL reviews), so the un-pruned ranking is kept and the shim is left to try.
+/// The exclusion EXPIRES rather than being
 /// permanent: the scan only reads auth errors within `AUTH_EXPIRY_LOOKBACK`, so once the error ages
 /// past that window the account is retried (and re-benched if it fails again). A shared account also
 /// clears immediately if the interactive fleet completes a run under it (a newer usage-bearing turn).
@@ -277,14 +290,13 @@ pub fn rank_candidates_excluding_auth_dead(
             .copied()
             .filter(|a| !auth_dead.contains(&a.config_dir))
             .collect();
-        if alive.is_empty() {
-            // Every healthy account is auth-dead: fail open, keep the un-pruned list (the detector
-            // could be wrong, and a hard stop of all reviews is the worse error).
-        } else if alive.len() < MIN_HEALTHY_TO_RUN {
-            // Exclusion drops us below the run threshold: stand down, same as the quota case — one
-            // usable login left means using it takes the founder's last usable account.
-            return Vec::new();
-        } else {
+        // Keep the pruned list — UNLESS excluding the auth-dead accounts would empty the pool, in
+        // which case FAIL OPEN and keep the un-pruned list (the detector could be wrong, and a hard
+        // stop of all reviews is the worse error; the exclusion self-heals on the next
+        // re-login/republish). There is no last-fleet-account stand-down to compose here: the
+        // interactive/default login is already reserved above, so one surviving fleet login is safe
+        // to run on (`MIN_HEALTHY_TO_RUN == 1`) — it is never the founder's own account.
+        if !alive.is_empty() {
             healthy = alive;
         }
     }
@@ -583,24 +595,43 @@ mod tests {
         assert!(dirs.contains(&"/home/.claude".to_string()), "non-default /home/.claude must be offered: {dirs:?}");
     }
 
-    /// The reservation COMPOSES with the founder's last-account stand-down, applied to the NON-default
-    /// fleet pool: a default account plus ONE healthy fleet account leaves only one usable review
-    /// login, so roborev stands down rather than publishing it. Paired with default + TWO fleet
-    /// accounts, which DOES run — so the test cannot pass by always standing down.
+    /// THE #2819 REGRESSION FIX: with the interactive/default login reserved out of the pool, roborev
+    /// may run on a SINGLE healthy fleet account — a default account plus ONE healthy fleet account is
+    /// enough to publish a candidate, because the reserved default is never the founder's-last-account
+    /// this pool must protect. Standing down here (the pre-`MIN_HEALTHY_TO_RUN == 1` behaviour) only
+    /// re-darkened review, which is the exact P1 cluster this fixes (sparkle-qfr436 / -yjtp0g /
+    /// -s666fn / -v8dkzo / -5dc1jv).
+    ///
+    /// Mutation-provable: restore `MIN_HEALTHY_TO_RUN = 2` and the default + one-fleet case stands
+    /// down, so the first assertion goes RED. Paired with default-only (ZERO fleet accounts), which
+    /// MUST still stand down — roborev never falls back to the interactive login — so the test cannot
+    /// pass by always publishing.
     #[test]
-    fn reserving_the_default_composes_with_the_last_account_standdown() {
-        // default + 1 fleet -> 1 usable review account -> STAND DOWN. The default is NOT counted as
-        // review headroom, so this is one usable login, not two.
+    fn reserving_the_default_still_lets_a_single_fleet_account_run() {
+        // default + 1 fleet -> RUNS on that one fleet account (the reserved default is not a
+        // candidate, but the one fleet login is safe to run on: it is not the founder's own).
         let one_fleet = vec![
             acct_default("home", "/home/.claude"),
             acct("a", "/dir/a", None),
         ];
-        assert!(
-            rank_candidates(&one_fleet, &HashMap::new(), NOW).is_empty(),
-            "default + one fleet account must stand down (the default is reserved, not a candidate)"
+        let dirs: Vec<String> = rank_candidates(&one_fleet, &HashMap::new(), NOW)
+            .into_iter()
+            .map(|c| c.dir)
+            .collect();
+        assert_eq!(
+            dirs, vec!["/dir/a".to_string()],
+            "default + one fleet account must RUN on the fleet account, not stand down: {dirs:?}"
         );
 
-        // default + 2 fleet -> 2 usable review accounts -> runs, on the fleet accounts only.
+        // default ONLY (zero fleet accounts) -> STAND DOWN: roborev must never fall back to the
+        // reserved interactive login.
+        let default_only = vec![acct_default("home", "/home/.claude")];
+        assert!(
+            rank_candidates(&default_only, &HashMap::new(), NOW).is_empty(),
+            "default-only machine must stand down, never run on the interactive login"
+        );
+
+        // default + 2 fleet -> runs on the fleet accounts only (the default is still excluded).
         let two_fleet = vec![
             acct_default("home", "/home/.claude"),
             acct("a", "/dir/a", None),
@@ -628,25 +659,46 @@ mod tests {
         assert!(dirs.contains(&"/dir/a".to_string()), "expired exhaustion still benched: {dirs:?}");
     }
 
-    /// The founder's deference rule: at exactly one healthy account, roborev stands down.
+    /// The founder's deference rule, post-reservation: roborev runs on ONE healthy fleet account and
+    /// stands down only at ZERO. With the interactive default reserved out of the pool, the last
+    /// healthy fleet account is a worker login, not the founder's, so running on it is safe.
+    ///
+    /// Mutation-provable: restore `MIN_HEALTHY_TO_RUN = 2` and the one-healthy case stands down, so
+    /// the first assertion goes RED. Paired with the zero-healthy case, which MUST stand down.
     #[test]
-    fn roborev_stands_down_rather_than_taking_the_last_healthy_account() {
-        let accounts = vec![
+    fn roborev_runs_on_one_healthy_fleet_account_and_stands_down_at_zero() {
+        // Exactly ONE healthy (two walled) -> RUNS on the healthy one.
+        let one_healthy = vec![
             acct("a", "/dir/a", Some(NOW + 5_000)),
             acct("b", "/dir/b", Some(NOW + 5_000)),
             acct("c", "/dir/c", None),
         ];
-        assert!(
-            rank_candidates(&accounts, &HashMap::new(), NOW).is_empty(),
-            "must stand down at one healthy account"
+        let dirs: Vec<String> = rank_candidates(&one_healthy, &HashMap::new(), NOW)
+            .into_iter()
+            .map(|c| c.dir)
+            .collect();
+        assert_eq!(
+            dirs, vec!["/dir/c".to_string()],
+            "one healthy fleet account must run, not stand down: {dirs:?}"
         );
-        // Two healthy → allowed to run. Pairs the rule so the test can't pass by always standing down.
-        let accounts = vec![
+
+        // ZERO healthy (all walled) -> STAND DOWN. Pairs the rule so it can't pass by always running.
+        let none_healthy = vec![
+            acct("a", "/dir/a", Some(NOW + 5_000)),
+            acct("b", "/dir/b", Some(NOW + 5_000)),
+        ];
+        assert!(
+            rank_candidates(&none_healthy, &HashMap::new(), NOW).is_empty(),
+            "zero healthy accounts must stand down"
+        );
+
+        // Two healthy → both offered.
+        let two_healthy = vec![
             acct("a", "/dir/a", Some(NOW + 5_000)),
             acct("b", "/dir/b", None),
             acct("c", "/dir/c", None),
         ];
-        assert_eq!(rank_candidates(&accounts, &HashMap::new(), NOW).len(), 2);
+        assert_eq!(rank_candidates(&two_healthy, &HashMap::new(), NOW).len(), 2);
     }
 
     #[test]
@@ -831,21 +883,28 @@ mod tests {
         assert_eq!(dirs.len(), 3, "must not strand roborev when all are auth-dead: {dirs:?}");
     }
 
-    /// THE STAND-DOWN COMPOSITION (reviewer's case): with TWO quota-healthy accounts, one auth-dead,
-    /// only ONE login is usable — so roborev must STAND DOWN, not publish a one-candidate list that
-    /// takes the founder's last usable account. Paired with a 3-account case where a real alternative
-    /// remains, which DOES publish the survivors — so the test can't pass by always standing down.
+    /// AUTH-EXCLUSION COMPOSITION, post-reservation: pruning the auth-dead login leaves the surviving
+    /// fleet account(s), and roborev runs on them down to the last one. With the interactive default
+    /// reserved out of the pool, one surviving fleet login is safe to run on — there is no
+    /// last-account stand-down for the auth filter to compose with (that only applied while the
+    /// default was still a pool member). Paired with a 3-account case so the test can't pass by always
+    /// publishing one candidate.
     #[test]
-    fn auth_exclusion_stands_down_when_it_leaves_only_one_usable_login() {
-        // 2 quota-healthy, 1 auth-dead -> 1 usable -> STAND DOWN.
+    fn auth_exclusion_prunes_the_dead_login_and_runs_on_the_survivor() {
+        // 2 quota-healthy, 1 auth-dead -> 1 usable -> RUNS on the survivor (not stand down).
         let two = vec![acct("a", "/dir/a", None), acct("b", "/dir/b", None)];
         let a_dead: HashSet<String> = ["/dir/a".to_string()].into_iter().collect();
-        assert!(
-            rank_candidates_excluding_auth_dead(&two, &HashMap::new(), &a_dead, NOW).is_empty(),
-            "one usable login left must stand down, not publish a single candidate"
+        let dirs: Vec<String> =
+            rank_candidates_excluding_auth_dead(&two, &HashMap::new(), &a_dead, NOW)
+                .into_iter()
+                .map(|c| c.dir)
+                .collect();
+        assert_eq!(
+            dirs, vec!["/dir/b".to_string()],
+            "the one surviving login must run once the auth-dead one is pruned: {dirs:?}"
         );
 
-        // 3 quota-healthy, 1 auth-dead -> 2 usable -> publish the two survivors.
+        // 3 quota-healthy, 1 auth-dead -> 2 usable -> publish the two survivors (dead one absent).
         let three = vec![
             acct("a", "/dir/a", None),
             acct("b", "/dir/b", None),
@@ -859,18 +918,19 @@ mod tests {
         assert_eq!(dirs, vec!["/dir/b".to_string(), "/dir/c".to_string()], "survivors must publish: {dirs:?}");
     }
 
-    /// The stand-down rule is unchanged by auth exclusion: at one quota-healthy account roborev still
-    /// stands down BEFORE the auth filter can even run.
+    /// The ZERO-healthy stand-down fires BEFORE the auth filter can even run: with no quota-healthy
+    /// account, roborev stands down regardless of the auth-dead set. (Post-reservation the threshold
+    /// is ONE, so this guards the floor — zero healthy — not the old one-account case.)
     #[test]
-    fn auth_exclusion_does_not_bypass_the_standdown_guard() {
+    fn the_zero_healthy_standdown_fires_before_the_auth_filter() {
         let accounts = vec![
             acct("a", "/dir/a", Some(NOW + 5_000)),
-            acct("b", "/dir/b", None),
+            acct("b", "/dir/b", Some(NOW + 5_000)),
         ];
         let dead: HashSet<String> = ["/dir/c".to_string()].into_iter().collect();
         assert!(
             rank_candidates_excluding_auth_dead(&accounts, &HashMap::new(), &dead, NOW).is_empty(),
-            "must still stand down at one healthy account"
+            "must stand down with zero healthy accounts, before the auth filter runs"
         );
     }
 
