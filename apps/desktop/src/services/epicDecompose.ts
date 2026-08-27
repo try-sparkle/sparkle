@@ -19,7 +19,7 @@
 // `pickEpicsToDecompose`. Decomposition looks for a bead DECLARED an epic that has no children yet;
 // asking the membership resolver would be self-contradictory, since a structural epic has children
 // by definition and so can never be a candidate.
-import { childrenOf, isTypedEpic, labelBead, type Bead, type Board } from "./beads";
+import { allBoardBeads, childrenOf, isTypedEpic, labelBead, type Bead, type Board } from "./beads";
 import {
   beadDepAdd,
   createBeadFull,
@@ -55,33 +55,31 @@ const PIPELINE_LABELS = [DECOMPOSING_LABEL, DECOMPOSED_LABEL, DECOMPOSE_FAILED_L
 /**
  * Flatten EVERY board column back into one bead list (`childrenOf` needs the full set).
  *
- * ── IT USED TO READ FOUR OF THE SIX, AND BOTH OMISSIONS WERE LOAD-BEARING ────────────────────
- * `blocked` and `archived` were missing, which is not a tidiness point — the list this returns is
- * the ONLY thing `pickEpicsToDecompose` and `childrenOf` ever see, so a column left out is a set of
- * beads that provably do not exist as far as this whole module is concerned. Two consequences, in
- * opposite directions:
+ * ── IT USED TO KEEP ITS OWN LIST, AND THAT LIST READ FOUR OF THE SIX ─────────────────────────
+ * `blocked` and `archived` were missing (bead sparkle-m3340n), which is not a tidiness point — the
+ * list this returns is the ONLY thing `pickEpicsToDecompose`, `pickStuckDecomposing` and
+ * `childrenOf` ever see, so a column left out is a set of beads that provably do not exist as far
+ * as this whole module is concerned. Two consequences, in opposite directions:
  *
  *   • AN EPIC IN `blocked` COULD NEVER BE PICKED. `columnFor` routes an open bead there for a bd
  *     dependency OR for the epic sweep's `stalled` label — and "swept to Blocked and stuck there"
  *     is the exact fate the founder measured for hollow epics. So the pipeline was unreachable for
  *     precisely the population it exists to rescue, on top of the missing opt-in writer.
- *   • AN EPIC WHOSE CHILDREN ARE ALL BLOCKED READ AS CHILDLESS, which is worse than inert: it is
- *     the one shape that could spend money wrongly, decomposing an already-planned epic a second
- *     time and filing a duplicate set of children under it.
+ *   • AN EPIC WHOSE CHILDREN ARE ALL BLOCKED OR ARCHIVED READ AS CHILDLESS, which is worse than
+ *     inert: it is the one shape that could spend money wrongly, decomposing an already-planned
+ *     epic a second time and filing a duplicate set of children under it.
  *
- * `archived` is included for the same reason and costs nothing — archived beads are closed, so the
+ * `archived` costs nothing as a candidate source — archived beads are closed, so the
  * `status !== "closed"` clause in the picker still excludes them as epics, while they now count as
  * children, which is what stops an epic whose plan was archived from reading as hollow.
+ *
+ * THE LIST ITSELF NOW LIVES BESIDE THE `Board` TYPE and is derived from it ({@link allBoardBeads}
+ * over `BOARD_COLUMNS`), because a hand-written spread here went stale exactly once and would go
+ * stale again the moment a seventh column is added. This function is kept as a one-line alias so
+ * the module still reads in its own vocabulary.
  */
 function boardBeads(board: Board): Bead[] {
-  return [
-    ...board.backlog,
-    ...board.blocked,
-    ...board.inProgress,
-    ...board.done,
-    ...board.delivered,
-    ...board.archived,
-  ];
+  return allBoardBeads(board);
 }
 
 /**

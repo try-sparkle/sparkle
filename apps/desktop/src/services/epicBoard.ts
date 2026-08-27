@@ -104,8 +104,9 @@ export const STAGE_LABELS: Record<EpicLadderKey, string> = {
  *  the ladder never renders that column, {@link ladderKeyOf} returns `null` for every bead sitting
  *  in it, and `BeadPill`'s placement index never indexes them — so those cards' chips fall back to
  *  `columnFor` and print a stage that has no header on screen. The `satisfies` clause makes adding
- *  a key to {@link EpicLadderKey} a compile error HERE too. Same idiom as `beadsStore`'s
- *  `BOARD_COLUMNS`, for the same reason.
+ *  a key to {@link EpicLadderKey} a compile error HERE too. Same idiom as `beads.ts`'s
+ *  `BOARD_COLUMNS` — the board's own six-column list, which `allBoardBeads` walks — for the same
+ *  reason.
  *
  *  `Object.keys` preserves the literal's insertion order for string keys, so the sequence written
  *  below IS the rendered order — the exhaustiveness check costs nothing in expressiveness. */

@@ -157,7 +157,7 @@ describe("setPluginEnabled — the [plugins] flags", () => {
     // skills and commands to be AVAILABLE at all. PLUGIN_DEFAULTS is what the toggle paints before
     // the config hydrate answers, so a `false` here shows the user an off switch for a plugin that
     // is in fact installed and running. Rust's
-    // `the_frontend_plugin_defaults_mirror_matches_this_tables_default_on_column` pins the other
+    // `the_generated_frontend_plugin_catalog_matches_this_table` pins the other
     // direction (this file against KNOWN_PLUGINS); this pins the intended VALUE, so flipping both
     // mirrors to false in lockstep still fails here.
     for (const key of [

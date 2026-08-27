@@ -42,6 +42,7 @@ import { FONT_UI, TYPE } from "../theme/scale";
 import { ZOOM_COLUMN_ATTR, zoomColumnFor } from "../engine/columnZoom";
 import { PAIR_COLUMN_ATTR } from "../engine/pairColumns";
 import { ColumnPullTab, HEADER_H, TAB_TOP } from "./ColumnPullTab";
+import { borrowInlineStyle } from "./borrowInlineStyle";
 import { HeaderLink } from "./HeaderLink";
 import { EpicInlineCard } from "./EpicInlineCard";
 // REUSED, never re-derived. This is the same read-only chip the board cards wear
@@ -177,7 +178,7 @@ function findFlashTarget(root: HTMLElement, selectors: readonly string[]): HTMLE
  * `data-bead-flash` is the marker the tests read, and it carries WHICH treatment was applied so
  * that the reduced-motion path is observable rather than merely believed.
  *
- * ══ IT WRITES AND RESTORES THE `background` SHORTHAND, AND THAT IS LOAD-BEARING ═════════════════
+ * ══ IT BORROWS THE WHOLE DECLARATION, AND WRITES THE `background` SHORTHAND — BOTH LOAD-BEARING ═
  * This used to snapshot `el.style.backgroundColor` — the LONGHAND — and put that back afterwards.
  * It shipped the founder's *"when i click on 'column' view i get a gray bar all the way across"*
  * (`sparkle-huw924.15`), and the mechanism is one line of CSSOM.
@@ -193,42 +194,45 @@ function findFlashTarget(root: HTMLElement, selectors: readonly string[]): HTMLE
  * Measured in real WebKit and real Chromium (playwright), not inferred; `EpicsColumn.revealFlash.
  * test.tsx` carries the transcript and pins the declaration this function must leave behind.
  *
- * So: SAVE BOTH FORMS, write the SHORTHAND (which REPLACES whatever the node declared rather than
- * shadowing it), and on undo clear both and re-declare exactly what was there. That round-trips
- * every shape a flash target can take — shorthand-with-var, shorthand-with-plain-colour,
- * longhand-only, a gradient, both at once, or nothing declared at all.
+ * The undo is therefore `borrowInlineStyle` — which captures `cssText`, the declaration AS
+ * AUTHORED, and re-declares it wholesale. Note what that replaced: naming `background` beside
+ * `background-color` fixed the one pair this function happens to write, and left the next borrow to
+ * rediscover the same trap with `border`, `font` or `transition` (bead `sparkle-8qd0ey`). Capturing
+ * the declaration names no property at all, so there is nothing to forget — it round-trips every
+ * shape a flash target can take: shorthand-with-var, shorthand-with-plain-colour, longhand-only, a
+ * gradient, both at once, or nothing declared at all.
  *
- * DO NOT "SIMPLIFY" THIS BACK TO A LONGHAND. It is not a style preference; a longhand read cannot
- * see a `var()` shorthand, and this is the bug that produced.
+ * The WRITE still uses the SHORTHAND deliberately: a shorthand write REPLACES whatever the node
+ * declared instead of shadowing it with a rival longhand, so the row reads coherently *during* the
+ * 1.2s flash and not merely after it. DO NOT "SIMPLIFY" EITHER HALF BACK TO A LONGHAND. It is not a
+ * style preference; a longhand read cannot see a `var()` shorthand, and this is the bug that
+ * produced.
  */
 function applyFlash(el: HTMLElement, motion: "animate" | "static"): () => void {
-  const prevBackground = el.style.getPropertyValue("background");
-  const prevBackgroundColor = el.style.getPropertyValue("background-color");
-  const prevColor = el.style.color;
-  const prevTransition = el.style.transition;
+  // THE PAINT GOES INSIDE THE BORROW, and that is not a style preference. `borrowInlineStyle` has
+  // to record the declaration it LEAVES BEHIND so its restore can tell "nobody touched this" from
+  // "React re-rendered this row mid-flash" — and it cannot know when the painting is finished
+  // unless the painting is handed to it. See that file's header for what each case does.
+  const restoreStyle = borrowInlineStyle(el, (style) => {
+    // UNDER `reduce` THE HIGHLIGHT IS STILL PAINTED, AND HELD FOR THE SAME 1.2s — only the fade is
+    // dropped. Skipping the reveal for a reduced-motion reader would take away the ONLY
+    // confirmation the click did anything, which is strictly worse than the movement it avoids.
+    style.transition =
+      motion === "animate" ? "background-color 220ms ease-out, color 220ms ease-out" : "";
+    // The epic pill's fill and its PAIRED ink, so the flashed row does not lose its text for 1.2s.
+    // These two are themed together for exactly this reason; a hand-picked highlight here would be
+    // a fourth un-themed colour in a column the repaint just finished cleaning up.
+    style.setProperty("background", C.epicPillFill);
+    style.color = C.onEpicPillFill;
+  });
   el.setAttribute("data-bead-flash", motion);
-  // UNDER `reduce` THE HIGHLIGHT IS STILL PAINTED, AND HELD FOR THE SAME 1.2s — only the fade is
-  // dropped. Skipping the reveal for a reduced-motion reader would take away the ONLY confirmation
-  // the click did anything, which is a strictly worse outcome than the movement it avoids.
-  el.style.transition =
-    motion === "animate" ? "background-color 220ms ease-out, color 220ms ease-out" : "";
-  // The epic pill's fill and its PAIRED ink, so the flashed row does not lose its text for 1.2s.
-  // These two are themed together for exactly this reason; a hand-picked highlight here would be a
-  // fourth un-themed colour in a column the repaint just finished cleaning up.
-  el.style.setProperty("background", C.epicPillFill);
-  el.style.color = C.onEpicPillFill;
   return () => {
     el.removeAttribute("data-bead-flash");
-    // BOTH ARE CLEARED BEFORE EITHER IS RESTORED, so a node that declared only one form does not
-    // end up carrying two. Then the shorthand goes back first and the longhand second, which is the
-    // order they were declared in — the later declaration wins, and that is how the node read
-    // before the flash.
-    el.style.removeProperty("background");
-    el.style.removeProperty("background-color");
-    if (prevBackground !== "") el.style.setProperty("background", prevBackground);
-    if (prevBackgroundColor !== "") el.style.setProperty("background-color", prevBackgroundColor);
-    el.style.color = prevColor;
-    el.style.transition = prevTransition;
+    // ONE CALL WITHDRAWS THE FLASH — the whole declaration when the row was left alone, and only
+    // this function's own writes when React repainted the row mid-flash. A restore that undid
+    // property by property could only undo the properties it thought to list; one that re-declared
+    // unconditionally would revert React's write and leave the row stale forever.
+    restoreStyle();
   };
 }
 

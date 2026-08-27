@@ -12,6 +12,11 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { PushersConfigPayload } from "@sparkle/core";
 export type { PushersConfigPayload };
 
+// Type-only, and the store side of the dependency is type-only too, so this cannot make a runtime
+// import cycle. `pluginCatalog.generated.ts` is emitted from Rust's `KNOWN_PLUGINS`, which is what
+// makes the `[plugins]` wire shape below a derivation instead of a mirror.
+import type { PluginTomlKey } from "../stores/pluginCatalog";
+
 export interface DriftConfig {
   behind_nudge: number;
   ahead_nudge: number;
@@ -169,30 +174,20 @@ export interface ToolsConfig {
   straude?: boolean;
 }
 /** Claude Code marketplace plugins Sparkle pre-enables for every agent it spawns. Repo-scoped and
- *  per-project overridable (like [workflow]), so a repo can pick the plugins its codebase wants. */
-export /** The `[plugins]` table as Rust serializes it.
+ *  per-project overridable (like [workflow]), so a repo can pick the plugins its codebase wants.
  *
- *  Every key OPTIONAL on purpose: the hydrate already resolves each one through `?? <default>`,
- *  and a Sparkle frontend can run against an older backend whose `KNOWN_PLUGINS` predates a key.
- *  Requiring them would make that a type error while the runtime handled it fine. */
-interface PluginsConfig {
-  superpowers?: boolean;
-  frontend_design?: boolean;
-  hookify?: boolean;
-  code_simplifier?: boolean;
-  sparkle_guardrails?: boolean;
-  sparkle_freshness?: boolean;
-  sparkle_mutation_check?: boolean;
-  sparkle_conflict_watch?: boolean;
-  sparkle_secrets?: boolean;
-  sparkle_review_probes?: boolean;
-  sparkle_pusher?: boolean;
-  elements_of_style?: boolean;
-  double_shot_latte?: boolean;
-  compound_engineering?: boolean;
-  differential_review?: boolean;
-  review_squad?: boolean;
-}
+ *  The `[plugins]` table as Rust serializes it — DERIVED from the plugin catalog, not restated.
+ *
+ *  This used to be a hand-written interface listing all sixteen snake_case keys, which made it the
+ *  seventh place a new plugin had to be added by hand and the one nobody had counted: a Rust row
+ *  with no key here typechecks as `undefined` at every read site, so the hydrate silently resolved
+ *  it to its default forever. `PluginTomlKey` comes from `stores/pluginCatalog.generated.ts`,
+ *  which `scripts/gen-plugin-catalog.mjs` emits from Rust's own `KNOWN_PLUGINS`.
+ *
+ *  Every key stays OPTIONAL on purpose: the hydrate already resolves each one through
+ *  `?? <default>`, and a Sparkle frontend can run against an older backend whose `KNOWN_PLUGINS`
+ *  predates a key. Requiring them would make that a type error while the runtime handled it fine. */
+export type PluginsConfig = Partial<Record<PluginTomlKey, boolean>>;
 /** roborev machine-wide state (the one-time consent flag), its own section so Rust can gate the
  *  first-run modal on it. Machine-wide (like [tools]); ignored in a per-project file. */
 export interface RoborevConfig {

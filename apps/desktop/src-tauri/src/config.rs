@@ -8609,49 +8609,50 @@ quit_app = 42
         }
     }
 
-    /// The frontend's `PLUGIN_DEFAULTS` must agree with this table's `default_on` column, row for
-    /// row — and NOTHING enforced that until this test, which is exactly how it drifted.
+    /// The frontend's GENERATED plugin catalog must agree with this table, row for row — same
+    /// keys, same `default_on` column, same order.
     ///
-    /// The four newer rows were flipped to `default_on: false` here while `settingsStore.ts` kept
-    /// them `true`, and every suite stayed green: the Rust tests cannot see the TS file, the TS
-    /// tests had no assertion on `PLUGIN_DEFAULTS` at all, and the mirror's own doc comment
-    /// ("Rust is the authority") reads as a licence to let them diverge. The consequence is small
-    /// but real and user-visible — four toggles paint ON for the first frame, then flip OFF when
-    /// the config hydrate answers — and the comment sitting above the values kept asserting the
-    /// retracted "these ship ON" reasoning, which is what the next reader would have believed.
+    /// WHAT THIS GUARDS NOW. `apps/desktop/src/stores/pluginCatalog.generated.ts` is emitted from
+    /// THIS TABLE by `scripts/gen-plugin-catalog.mjs`, and every TypeScript key list — the
+    /// `PluginKey` union, the defaults record, the config hydrate, the dotted-path map, the
+    /// `[plugins]` wire type and the Tools pane's rows — is derived from it. So this one assertion
+    /// now covers all six, where its predecessor covered only the defaults record: it is the check
+    /// that the generator was actually RE-RUN after a row moved here.
+    ///
+    /// The predecessor read `settingsStore.ts` and compared a hand-written `PLUGIN_DEFAULTS`
+    /// literal, which is exactly how four rows drifted — the Rust table moved them to
+    /// `default_on: false` while the mirror kept them `true`, and every suite stayed green.
+    /// Deriving the TS side removes those mirrors rather than adding a fifth guard over them.
     ///
     /// Read from disk rather than duplicated, because a hand-copied expectation is one more mirror
     /// to drift. Same technique as `vendored_roborev_post_commit_keeps_its_skip_guards`.
     ///
     /// Both directions are asserted. A missing key catches a Rust row the frontend never learned
     /// about; the count check catches a TS key with no Rust row behind it. A value mismatch is the
-    /// drift this exists for.
+    /// drift this exists for. The ORDER check is new and is not cosmetic: the Tools pane renders
+    /// its plugin rows by mapping the catalog, so the array's order IS the pane's row order.
     #[test]
-    fn the_frontend_plugin_defaults_mirror_matches_this_tables_default_on_column() {
+    fn the_generated_frontend_plugin_catalog_matches_this_table() {
         let src = std::fs::read_to_string(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../src/stores/settingsStore.ts"
+            "/../src/stores/pluginCatalog.generated.ts"
         ))
-        .expect("settingsStore.ts must be readable — it is the frontend mirror of KNOWN_PLUGINS");
+        .expect(
+            "pluginCatalog.generated.ts must be readable — it is the generated frontend mirror of \
+             KNOWN_PLUGINS. Re-run: node scripts/gen-plugin-catalog.mjs",
+        );
 
         let start = src
-            .find("export const PLUGIN_DEFAULTS")
-            .expect("settingsStore.ts must still export PLUGIN_DEFAULTS");
+            .find("export const PLUGIN_CATALOG")
+            .expect("pluginCatalog.generated.ts must still export PLUGIN_CATALOG");
         let body = &src[start..];
-        let end = body.find("\n};").expect("PLUGIN_DEFAULTS must be a closed object literal");
+        let end = body.find("\n]").expect("PLUGIN_CATALOG must be a closed array literal");
         let body = &body[..end];
 
-        // `key: true,` / `key: false,` — comment lines and the declaration head are skipped, so the
-        // prose above each group cannot be mistaken for an entry.
-        //
-        // AN UNREADABLE LINE IS FATAL, NOT SKIPPED, and that is what gives the count assertion below
-        // its teeth. A parser that drops what it cannot read makes the "extra TS key" direction
-        // unable to fail in exactly the case it guards: `sparkleFoo: true, // flips once content
-        // ships` parses to a value of `true, // flips once content ships`, matches neither literal,
-        // and would vanish silently — leaving the counts equal and an orphan frontend toggle
-        // shipping green. The sibling helper `template_toggle_value` strips its trailing `#` comment
-        // for the same reason; this one has to strip `//`.
-        let mut ts: std::collections::BTreeMap<String, bool> = std::collections::BTreeMap::new();
+        // `{ key: "x", tomlKey: "y", plugin: "z", defaultOn: true },` — one row per line, and an
+        // UNREADABLE LINE IS FATAL rather than skipped. A parser that drops what it cannot read
+        // makes the "extra TS row" direction unable to fail in exactly the case it guards.
+        let mut ts: Vec<(String, String, bool)> = Vec::new();
         for line in body.lines() {
             let line = line.trim();
             if line.is_empty()
@@ -8662,64 +8663,59 @@ quit_app = 42
             {
                 continue;
             }
-            let unparsed = || panic!("unparsed PLUGIN_DEFAULTS line: {line:?}");
+            let unparsed = || panic!("unparsed PLUGIN_CATALOG line: {line:?}");
 
-            let Some((key, val)) = line.split_once(':') else { unparsed() };
-            let key = key.trim().trim_matches('"');
-            // Strip a trailing `// comment` before reading the value.
-            let val = val.split("//").next().unwrap_or("").trim().trim_end_matches(',').trim();
-            if key.is_empty() {
+            let field = |name: &str| -> Option<String> {
+                let at = line.find(&format!("{name}: "))? + name.len() + 2;
+                let rest = &line[at..];
+                let rest = rest.strip_prefix('"')?;
+                let close = rest.find('"')?;
+                Some(rest[..close].to_string())
+            };
+            let (Some(key), Some(toml_key)) = (field("key"), field("tomlKey")) else { unparsed() };
+            let default_on = if line.contains("defaultOn: true") {
+                true
+            } else if line.contains("defaultOn: false") {
+                false
+            } else {
                 unparsed()
-            }
-            match val {
-                "true" => drop(ts.insert(key.to_string(), true)),
-                "false" => drop(ts.insert(key.to_string(), false)),
-                // A value that is neither literal (a constant, an expression) is not something this
-                // guard can compare, so it must be loud rather than ignored.
-                _ => unparsed(),
-            }
+            };
+            ts.push((key, toml_key, default_on));
         }
 
-        assert!(!ts.is_empty(), "parsed no entries out of PLUGIN_DEFAULTS — has its shape changed?");
+        assert!(!ts.is_empty(), "parsed no rows out of PLUGIN_CATALOG — has its shape changed?");
 
-        for row in KNOWN_PLUGINS {
-            // `sparkle_conflict_watch` -> `sparkleConflictWatch`, the frontend's key spelling.
-            let mut camel = String::new();
-            let mut upper = false;
-            for c in row.toggle.chars() {
-                if c == '_' {
-                    upper = true;
-                } else if upper {
-                    camel.push(c.to_ascii_uppercase());
-                    upper = false;
-                } else {
-                    camel.push(c);
-                }
-            }
-
-            let got = ts.get(&camel).unwrap_or_else(|| {
-                panic!(
-                    "PLUGIN_DEFAULTS has no `{camel}` — every KNOWN_PLUGINS row needs a frontend \
-                     mirror, or the toggle renders with no default at first paint"
-                )
-            });
-            assert_eq!(
-                *got, row.default_on,
-                "`{}` ships default_on={} in KNOWN_PLUGINS but `{camel}` is {got} in \
-                 settingsStore.ts — the toggle would paint wrong until the config hydrate lands, \
-                 and the two must flip in the SAME commit",
-                row.toggle, row.default_on
-            );
-        }
+        let want: Vec<(String, String, bool)> = KNOWN_PLUGINS
+            .iter()
+            .map(|row| (camel_case(row.toggle), row.toggle.to_string(), row.default_on))
+            .collect();
 
         assert_eq!(
-            ts.len(),
-            KNOWN_PLUGINS.len(),
-            "PLUGIN_DEFAULTS has {} entries but KNOWN_PLUGINS has {} — a frontend key with no Rust \
-             row behind it is a toggle the backend will never honor",
-            ts.len(),
-            KNOWN_PLUGINS.len()
+            ts, want,
+            "pluginCatalog.generated.ts has drifted from KNOWN_PLUGINS — the frontend's plugin \
+             key union, defaults, hydrate, dotted paths, wire type and Tools rows are ALL derived \
+             from that file, so a stale copy silently strands a plugin.\n\
+             \n\
+             Re-run: node scripts/gen-plugin-catalog.mjs"
         );
+    }
+
+    /// `sparkle_conflict_watch` -> `sparkleConflictWatch`, the frontend's key spelling. Mirrors
+    /// `camelize` in `scripts/gen-plugin-catalog.mjs`.
+    fn camel_case(snake: &str) -> String {
+        let mut camel = String::new();
+        let mut upper = false;
+        for c in snake.chars() {
+            if c == '_' {
+                upper = true;
+            } else if upper {
+                camel.push(c.to_ascii_uppercase());
+                upper = false;
+            } else {
+                camel.push(c);
+            }
+        }
+        camel
     }
 
     /// The `<toggle> = <bool>` assignment for `toggle` in a TOML source, or None if there is no

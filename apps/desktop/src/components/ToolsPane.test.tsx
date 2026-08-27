@@ -45,7 +45,8 @@ import {
 } from "../services/configActions";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { builderIndexStatus, type BuilderIndexStatus } from "../services/builderIndex";
-import { useSettingsStore, type PluginKey } from "../stores/settingsStore";
+import { useSettingsStore, PLUGIN_KEYS, type PluginKey } from "../stores/settingsStore";
+import { PLUGIN_CATALOG } from "../stores/pluginCatalog";
 import { ToolsPane, TOOLS_CATEGORY_KEYWORDS, TOOL_META } from "./ToolsPane";
 
 /** Seed the store to a known baseline: every AI flag + every tool ON (aiFeatureMode = "all") —
@@ -332,6 +333,62 @@ describe("ToolsPane", () => {
     expect(screen.getAllByText("Sparkle couldn't install")).toHaveLength(keys.length - 1);
     // The scope note is displaced while there's something more urgent to say, and only then.
     expect(screen.queryByText("Applies to agents created from now on.")).toBeNull();
+  });
+
+  // THE PANE'S PLUGIN ROWS ARE DERIVED FROM THE CATALOG, and this is what says so.
+  //
+  // The vacuous shape here would be "the pane renders 16 plugin rows" — true before the rows were
+  // derived, so it proves nothing. What can only pass on a derived implementation is set equality
+  // against `PLUGIN_KEYS`, which is itself a function of the generated catalog: a future refactor
+  // that re-hardcodes the row array renders whatever it hardcoded, and a catalog row it forgot
+  // goes red here instead of silently never appearing in Settings → Tools. That silent
+  // never-appearing is the defect this bead was filed about.
+  it("renders one row per CATALOG key, in catalog order, wired to that key", () => {
+    render(<ToolsPane />);
+
+    // Every catalog key renders a row bearing its TOOL_META name — the derivation reaching the DOM.
+    const rendered = screen
+      .getAllByTestId("tool-row")
+      .map((row) => row.querySelector("span")?.textContent ?? "");
+    const pluginNames = PLUGIN_KEYS.map((k) => TOOL_META[k].name);
+    for (const name of pluginNames) {
+      expect(rendered, `no Tools row for catalog key "${name}"`).toContain(name);
+    }
+
+    // …and in the catalog's own order, which is the Rust table's order. The pane has no second
+    // ordering to keep in sync: the row order IS the catalog's, by construction.
+    const pluginPositions = pluginNames.map((n) => rendered.indexOf(n));
+    expect(pluginPositions).toEqual([...pluginPositions].sort((a, b) => a - b));
+
+    // Each row's switch calls setPluginEnabled with ITS OWN key. A derived row array that indexed
+    // the catalog wrongly — every row toggling the first plugin — renders identically and would
+    // pass a count or a name check; only driving each switch can tell them apart.
+    for (const key of PLUGIN_KEYS) {
+      vi.mocked(setPluginEnabled).mockClear();
+      fireEvent.click(screen.getByRole("switch", { name: TOOL_META[key].name }));
+      expect(setPluginEnabled, `the "${TOOL_META[key].name}" switch does not toggle "${key}"`)
+        .toHaveBeenCalledWith(key, expect.any(Boolean));
+    }
+  });
+
+  it("gives every catalog row a Learn more link built from its own plugin name", () => {
+    // The sparkle* urls are derived from each row's plugin name, so a new catalog row cannot get a
+    // link pointing at a folder that does not exist. Asserted as a SIDE EFFECT — click the link and
+    // read what was opened — rather than by re-deriving the string this test would then agree with.
+    render(<ToolsPane />);
+    for (const row of PLUGIN_CATALOG) {
+      vi.mocked(openUrl).mockClear();
+      fireEvent.click(
+        screen.getByRole("button", { name: `Learn more about ${TOOL_META[row.key].name}` }),
+      );
+      const [opened] = vi.mocked(openUrl).mock.calls[0] ?? [];
+      expect(opened, `no Learn more target for catalog row "${row.key}"`).toMatch(/^https:\/\//);
+      if (row.plugin.startsWith("sparkle-")) {
+        expect(opened).toBe(
+          `https://github.com/try-sparkle/marketplace/tree/main/plugins/${row.plugin}`,
+        );
+      }
+    }
   });
 
   it("links Frontend design at the repo we actually install from", () => {

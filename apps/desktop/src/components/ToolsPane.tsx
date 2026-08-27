@@ -31,7 +31,12 @@ import {
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { C, ON_BRAND_FILL } from "../theme/colors";
 import { FONT_WEIGHT } from "@sparkle/ui";
-import { useSettingsStore, aiFeatureMode } from "../stores/settingsStore";
+import {
+  useSettingsStore,
+  aiFeatureMode,
+  PLUGIN_KEYS,
+  type PluginKey,
+} from "../stores/settingsStore";
 import {
   setAiFeature,
   setToolEnabled,
@@ -262,6 +267,17 @@ export const TOOLS_SEARCH_ENTRIES = Object.values(TOOL_META).map(
  *  vocabulary (tests asserting nothing is unadvertised); MATCHING goes through TOOLS_SEARCH_ENTRIES,
  *  because this form cannot tell "one row has both terms" from "two rows have one each". */
 export const TOOLS_CATEGORY_KEYWORDS = TOOLS_SEARCH_ENTRIES.join(" ");
+
+/** TOOL_META, narrowed to the plugin rows — and, in the same line, the ASSERTION that it has one
+ *  for every plugin key.
+ *
+ *  This assignment is the guard: `PluginKey` is derived from the generated catalog, so a
+ *  `KNOWN_PLUGINS` row with no `TOOL_META` entry makes this fail to typecheck. A name and a
+ *  description are the one part of a plugin row that genuinely cannot be derived from the Rust
+ *  table — they are human copy — so the goal here is not to remove the edit but to make omitting
+ *  it impossible to ship. Before this, an unlisted row simply never appeared in the pane. */
+const PLUGIN_TOOL_META: Record<PluginKey, { name: string; desc: string; keywords: string }> =
+  TOOL_META;
 
 const AI_HINT = "Turn on AI features to use this tool.";
 
@@ -497,6 +513,39 @@ const DOUBLE_SHOT_LATTE_URL = `${SUPERPOWERS_MARKETPLACE_URL}/tree/main/plugins/
 const COMPOUND_ENGINEERING_URL = "https://github.com/EveryInc/compound-engineering-plugin";
 const DIFFERENTIAL_REVIEW_URL = "https://github.com/trailofbits/skills/tree/main/plugins/differential-review";
 const REVIEW_SQUAD_URL = "https://github.com/2389-research/claude-plugins";
+
+/** The two things a plugin row needs that Rust's `KNOWN_PLUGINS` cannot supply: an icon and a
+ *  "Learn more" target.
+ *
+ *  TYPED `Record<PluginKey, …>` ON PURPOSE. `PluginKey` is derived from the generated catalog, so
+ *  a new `KNOWN_PLUGINS` row makes this object fail to typecheck until it is filled in — which is
+ *  the whole point. The hand-written row array this replaced had no such property: a catalog row
+ *  with no UI row simply never rendered, silently, and no test could see it.
+ *
+ *  The sparkle* urls are DERIVED from each row's own plugin name, so they cannot point at a folder
+ *  that does not exist in try-sparkle/marketplace; the rest name their marketplace explicitly
+ *  because those repos lay their plugins out differently. */
+const sparkleMarketplaceUrl = (plugin: string): string =>
+  `${SPARKLE_MARKETPLACE_URL}/tree/main/plugins/${plugin}`;
+
+const PLUGIN_ROW_UI: Record<PluginKey, { Icon: ComponentType<{ size?: number }>; url: string }> = {
+  superpowers: { Icon: FiBookOpen, url: "https://github.com/obra/superpowers" },
+  frontendDesign: { Icon: FiLayout, url: FRONTEND_DESIGN_URL },
+  hookify: { Icon: FiAnchor, url: HOOKIFY_URL },
+  codeSimplifier: { Icon: FiScissors, url: CODE_SIMPLIFIER_URL },
+  sparkleGuardrails: { Icon: FiShield, url: sparkleMarketplaceUrl("sparkle-guardrails") },
+  sparkleFreshness: { Icon: FiGitBranch, url: sparkleMarketplaceUrl("sparkle-freshness") },
+  sparkleMutationCheck: { Icon: FiCheckSquare, url: sparkleMarketplaceUrl("sparkle-mutation-check") },
+  sparkleConflictWatch: { Icon: FiGitMerge, url: sparkleMarketplaceUrl("sparkle-conflict-watch") },
+  sparkleSecrets: { Icon: FiKey, url: sparkleMarketplaceUrl("sparkle-secrets") },
+  sparkleReviewProbes: { Icon: FiMessageSquare, url: sparkleMarketplaceUrl("sparkle-review-probes") },
+  sparklePusher: { Icon: FiBell, url: sparkleMarketplaceUrl("sparkle-pusher") },
+  elementsOfStyle: { Icon: FiEdit3, url: ELEMENTS_OF_STYLE_URL },
+  doubleShotLatte: { Icon: FiCoffee, url: DOUBLE_SHOT_LATTE_URL },
+  compoundEngineering: { Icon: FiLayers, url: COMPOUND_ENGINEERING_URL },
+  differentialReview: { Icon: FiSearch, url: DIFFERENTIAL_REVIEW_URL },
+  reviewSquad: { Icon: FiUsers, url: REVIEW_SQUAD_URL },
+};
 
 /** Both plugin rows carry this. Sparkle writes `enabledPlugins` into an agent worktree's
  *  settings.local.json at prepare time and never removes an entry (insert-if-absent, so a plugin
@@ -748,156 +797,21 @@ export function ToolsPane({ query = "" }: { query?: string }) {
       checked: straudeEnabled,
       onToggle: () => void setStraudeEnabled(!straudeEnabled),
     },
-    {
-      ...TOOL_META.superpowers,
-      key: "superpowers",
-      Icon: FiBookOpen,
-      url: "https://github.com/obra/superpowers",
-      hint: pluginHint(pluginInstallState.superpowers),
-      checked: pluginsEnabled.superpowers,
-      onToggle: () => void setPluginEnabled("superpowers", !pluginsEnabled.superpowers),
-    },
-    {
-      ...TOOL_META.frontendDesign,
-      key: "frontendDesign",
-      Icon: FiLayout,
-      url: FRONTEND_DESIGN_URL,
-      hint: pluginHint(pluginInstallState.frontendDesign),
-      checked: pluginsEnabled.frontendDesign,
-      onToggle: () => void setPluginEnabled("frontendDesign", !pluginsEnabled.frontendDesign),
-    },
-    {
-      ...TOOL_META.hookify,
-      key: "hookify",
-      Icon: FiAnchor,
-      url: HOOKIFY_URL,
-      hint: pluginHint(pluginInstallState.hookify),
-      checked: pluginsEnabled.hookify,
-      onToggle: () => void setPluginEnabled("hookify", !pluginsEnabled.hookify),
-    },
-    {
-      ...TOOL_META.codeSimplifier,
-      key: "codeSimplifier",
-      Icon: FiScissors,
-      url: CODE_SIMPLIFIER_URL,
-      hint: pluginHint(pluginInstallState.codeSimplifier),
-      checked: pluginsEnabled.codeSimplifier,
-      onToggle: () => void setPluginEnabled("codeSimplifier", !pluginsEnabled.codeSimplifier),
-    },
-    {
-      ...TOOL_META.sparkleGuardrails,
-      key: "sparkleGuardrails",
-      Icon: FiShield,
-      url: `${SPARKLE_MARKETPLACE_URL}/tree/main/plugins/sparkle-guardrails`,
-      hint: pluginHint(pluginInstallState.sparkleGuardrails),
-      checked: pluginsEnabled.sparkleGuardrails,
-      onToggle: () =>
-        void setPluginEnabled("sparkleGuardrails", !pluginsEnabled.sparkleGuardrails),
-    },
-    {
-      ...TOOL_META.sparkleFreshness,
-      key: "sparkleFreshness",
-      Icon: FiGitBranch,
-      url: `${SPARKLE_MARKETPLACE_URL}/tree/main/plugins/sparkle-freshness`,
-      hint: pluginHint(pluginInstallState.sparkleFreshness),
-      checked: pluginsEnabled.sparkleFreshness,
-      onToggle: () => void setPluginEnabled("sparkleFreshness", !pluginsEnabled.sparkleFreshness),
-    },
-    {
-      ...TOOL_META.sparkleMutationCheck,
-      key: "sparkleMutationCheck",
-      Icon: FiCheckSquare,
-      url: `${SPARKLE_MARKETPLACE_URL}/tree/main/plugins/sparkle-mutation-check`,
-      hint: pluginHint(pluginInstallState.sparkleMutationCheck),
-      checked: pluginsEnabled.sparkleMutationCheck,
-      onToggle: () =>
-        void setPluginEnabled("sparkleMutationCheck", !pluginsEnabled.sparkleMutationCheck),
-    },
-    {
-      ...TOOL_META.sparkleConflictWatch,
-      key: "sparkleConflictWatch",
-      Icon: FiGitMerge,
-      url: `${SPARKLE_MARKETPLACE_URL}/tree/main/plugins/sparkle-conflict-watch`,
-      hint: pluginHint(pluginInstallState.sparkleConflictWatch),
-      checked: pluginsEnabled.sparkleConflictWatch,
-      onToggle: () =>
-        void setPluginEnabled("sparkleConflictWatch", !pluginsEnabled.sparkleConflictWatch),
-    },
-    {
-      ...TOOL_META.sparkleSecrets,
-      key: "sparkleSecrets",
-      Icon: FiKey,
-      url: `${SPARKLE_MARKETPLACE_URL}/tree/main/plugins/sparkle-secrets`,
-      hint: pluginHint(pluginInstallState.sparkleSecrets),
-      checked: pluginsEnabled.sparkleSecrets,
-      onToggle: () => void setPluginEnabled("sparkleSecrets", !pluginsEnabled.sparkleSecrets),
-    },
-    {
-      ...TOOL_META.sparkleReviewProbes,
-      key: "sparkleReviewProbes",
-      Icon: FiMessageSquare,
-      url: `${SPARKLE_MARKETPLACE_URL}/tree/main/plugins/sparkle-review-probes`,
-      hint: pluginHint(pluginInstallState.sparkleReviewProbes),
-      checked: pluginsEnabled.sparkleReviewProbes,
-      onToggle: () =>
-        void setPluginEnabled("sparkleReviewProbes", !pluginsEnabled.sparkleReviewProbes),
-    },
-    {
-      ...TOOL_META.sparklePusher,
-      key: "sparklePusher",
-      Icon: FiBell,
-      url: `${SPARKLE_MARKETPLACE_URL}/tree/main/plugins/sparkle-pusher`,
-      hint: pluginHint(pluginInstallState.sparklePusher),
-      checked: pluginsEnabled.sparklePusher,
-      onToggle: () => void setPluginEnabled("sparklePusher", !pluginsEnabled.sparklePusher),
-    },
-    {
-      ...TOOL_META.elementsOfStyle,
-      key: "elementsOfStyle",
-      Icon: FiEdit3,
-      url: ELEMENTS_OF_STYLE_URL,
-      hint: pluginHint(pluginInstallState.elementsOfStyle),
-      checked: pluginsEnabled.elementsOfStyle,
-      onToggle: () => void setPluginEnabled("elementsOfStyle", !pluginsEnabled.elementsOfStyle),
-    },
-    {
-      ...TOOL_META.doubleShotLatte,
-      key: "doubleShotLatte",
-      Icon: FiCoffee,
-      url: DOUBLE_SHOT_LATTE_URL,
-      hint: pluginHint(pluginInstallState.doubleShotLatte),
-      checked: pluginsEnabled.doubleShotLatte,
-      onToggle: () => void setPluginEnabled("doubleShotLatte", !pluginsEnabled.doubleShotLatte),
-    },
-    {
-      ...TOOL_META.compoundEngineering,
-      key: "compoundEngineering",
-      Icon: FiLayers,
-      url: COMPOUND_ENGINEERING_URL,
-      hint: pluginHint(pluginInstallState.compoundEngineering),
-      checked: pluginsEnabled.compoundEngineering,
-      onToggle: () =>
-        void setPluginEnabled("compoundEngineering", !pluginsEnabled.compoundEngineering),
-    },
-    {
-      ...TOOL_META.differentialReview,
-      key: "differentialReview",
-      Icon: FiSearch,
-      url: DIFFERENTIAL_REVIEW_URL,
-      hint: pluginHint(pluginInstallState.differentialReview),
-      checked: pluginsEnabled.differentialReview,
-      onToggle: () =>
-        void setPluginEnabled("differentialReview", !pluginsEnabled.differentialReview),
-    },
-    {
-      ...TOOL_META.reviewSquad,
-      key: "reviewSquad",
-      Icon: FiUsers,
-      url: REVIEW_SQUAD_URL,
-      hint: pluginHint(pluginInstallState.reviewSquad),
-      checked: pluginsEnabled.reviewSquad,
-      onToggle: () => void setPluginEnabled("reviewSquad", !pluginsEnabled.reviewSquad),
-    },
+    // EVERY PLUGIN ROW, DERIVED FROM THE CATALOG — sixteen near-identical eight-line literals used
+    // to sit here, and they were the sixth of seven places a new plugin had to be added by hand.
+    // Mapping `PLUGIN_KEYS` means a new `KNOWN_PLUGINS` row renders a row the moment the generator
+    // runs, in the Rust table's own order, and `PLUGIN_ROW_UI` is what makes the two things a row
+    // still needs that cannot be derived from Rust — an icon and a "Learn more" target — a COMPILE
+    // ERROR to forget rather than a row that silently never appears.
+    ...PLUGIN_KEYS.map((key) => ({
+      ...PLUGIN_TOOL_META[key],
+      key,
+      Icon: PLUGIN_ROW_UI[key].Icon,
+      url: PLUGIN_ROW_UI[key].url,
+      hint: pluginHint(pluginInstallState[key]),
+      checked: pluginsEnabled[key],
+      onToggle: () => void setPluginEnabled(key, !pluginsEnabled[key]),
+    })),
     {
       ...TOOL_META.onepassword,
       key: "onepassword",

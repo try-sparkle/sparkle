@@ -629,6 +629,92 @@ describe("BeadCard — the Chat button", () => {
  *  TITLE rather than its id. */
 const PARENT = bead({ id: "sparkle-epic1", title: "Bead cards collapse to half height", type: "epic" });
 
+// ══ THE ACCESSIBILITY-TREE HELPERS (bead sparkle-2mwl2m) ═══════════════════════════════════════
+// Used by "announces every control by its own role and name" far below. They live up here with the
+// other fixtures rather than beside that case, because the CLASS they describe is not specific to
+// this card: any card-like component can copy these fifteen lines and get the same guard.
+
+/** WAI-ARIA 1.2 roles with "Presentational Children: True" — assistive tech flattens the entire
+ *  subtree to the element's own accessible name, so every control beneath one is REMOVED from the
+ *  accessibility tree no matter how correct its own markup is. This list is the same one the
+ *  `sparkle-a11y/no-presentational-children-role` lint rule polices; the rule catches the shape
+ *  where it is written, this catches it where it is RENDERED (through a child component, a
+ *  `{cond && …}`, or anything else static analysis cannot see). */
+const PRESENTATIONAL_CHILDREN_ROLES = new Set([
+  "button",
+  "checkbox",
+  "img",
+  "math",
+  "menuitemcheckbox",
+  "menuitemradio",
+  "meter",
+  "option",
+  "progressbar",
+  "radio",
+  "scrollbar",
+  "slider",
+  "switch",
+  "tab",
+]);
+
+/** Native elements that carry one of those roles implicitly, with no `role` attribute to grep for.
+ *  `<button>` is the one that actually shipped as a bug elsewhere in this app; the rest are here so
+ *  the helper does not quietly pass a card that grows a `<progress>` or an `<input type="radio">`
+ *  wrapper later. */
+function implicitPresentationalRole(el: Element): string | null {
+  const tag = el.tagName.toLowerCase();
+  if (tag === "button") return "button";
+  if (tag === "progress") return "progressbar";
+  if (tag === "meter") return "meter";
+  if (tag === "img") return "img";
+  if (tag === "input") {
+    const type = (el.getAttribute("type") ?? "").toLowerCase();
+    if (type === "checkbox") return "checkbox";
+    if (type === "radio") return "radio";
+    if (type === "range") return "slider";
+    if (type === "image") return "button";
+    if (type === "button" || type === "submit" || type === "reset") return "button";
+  }
+  return null;
+}
+
+/** The STRICT ANCESTOR (up to and including `root`) that flattens `el` out of the accessibility
+ *  tree, described for the failure message — or null when `el` really is announced.
+ *
+ *  Strict on purpose: an element's own presentational-children role says nothing about whether IT is
+ *  announced, only about its descendants. The parent chip is itself a `role="button"` leaf, and must
+ *  keep passing. */
+function flattenedBy(el: Element, root: Element): string | null {
+  for (let node = el.parentElement; node !== null; node = node.parentElement) {
+    const explicit = node.getAttribute("role");
+    const role =
+      explicit !== null && explicit.trim() !== ""
+        ? explicit.trim()
+        : implicitPresentationalRole(node);
+    if (role !== null && PRESENTATIONAL_CHILDREN_ROLES.has(role)) {
+      const id = node.getAttribute("data-testid") ?? node.tagName.toLowerCase();
+      return `${id} claims role="${role}", whose children are presentational`;
+    }
+    if (node === root) break;
+  }
+  return null;
+}
+
+/** Every control the open concierge card offers, with the role and NAME a reader is given for it.
+ *  Names are the real ones the component computes — an `aria-label` where it has one, its text
+ *  otherwise — so a change that guts a label fails here too, not only a change that re-flattens. */
+const ANNOUNCED_CONTROLS: ReadonlyArray<{ id: string; role: string; name: string | RegExp }> = [
+  { id: "title", role: "button", name: B.title },
+  { id: "build-it", role: "button", name: /Build It/ },
+  { id: "priority-trigger", role: "button", name: /.+/ },
+  { id: "chat", role: "button", name: /Chat/ },
+  { id: "open-on-board", role: "button", name: /Board/ },
+  { id: "close", role: "button", name: "Close" },
+  { id: "parent", role: "button", name: `Epic: ${PARENT.title}` },
+  { id: "goal", role: "textbox", name: "Epic goal" },
+  { id: "comments-input", role: "textbox", name: "Add a comment" },
+];
+
 /** Everything on screen in document order. jsdom has no layout, so document order inside a row flex
  *  container IS its left-to-right order — the same fact `BeadCardChrome.test.tsx` measures. */
 function indexOnMetaLine(id: string): number {
@@ -1149,6 +1235,64 @@ describe("BeadCard — the card body is the toggle", () => {
         above?.closest('[role="button"]') ?? null,
         `${id} is inside a role="button"`,
       ).toBeNull();
+    }
+  });
+
+  // ══ …AND EVERY ONE OF THEM IS STILL *ANNOUNCED* ═════════════════════════════════════════════
+  // The case above asserts ANCESTRY — no control sits inside a button. This one asserts the EFFECT
+  // that ancestry exists to protect: each control still reaches the accessibility tree carrying its
+  // own ROLE and its own NAME, which is the only thing a screen-reader user ever gets. The two are
+  // not the same assertion, and the difference is the whole reason the defect shipped: the DOM was
+  // never wrong, only the tree computed from it.
+  //
+  // ── WHY `getByRole` ALONE CANNOT FAIL HERE, AND WHAT CARRIES THE WEIGHT ──────────────────────
+  // testing-library resolves a role from the element's OWN tag or `role` attribute and never prunes
+  // a presentational subtree, because jsdom exposes no accessibility tree to prune. So
+  // `getByRole("button", { name: "Close" })` finds [x] just as happily with `role="button"` back on
+  // the card root — the exact defect. A test built only on it would be VACUOUS: green before the
+  // fix, green after, green when it regresses. Two assertions below can actually go red:
+  //
+  //   1. `getByRole("status")` — the card's own live region. A role attribute holds ONE value, so
+  //      the root cannot be both a button and a status; re-applying the role deletes the live region
+  //      and this query finds nothing. Stock testing-library, no modelling, and it pins the SECOND
+  //      regression the one line caused (a card posted into the concierge thread stopped announcing
+  //      itself).
+  //   2. `flattenedBy` — WAI-ARIA's "Presentational Children: True" applied by hand, because jsdom
+  //      will not apply it for us. It is what turns "the markup is right" into "the reader hears it".
+  it("announces every control by its own role and name, and none is flattened away", () => {
+    mount({
+      collapsed: false,
+      onToggleCollapsed: vi.fn(),
+      onBuildIt: vi.fn(async () => {}),
+      onSetPriority: vi.fn(async () => {}),
+      onChat: vi.fn(),
+      onViewOnBoard: vi.fn(),
+      onClose: vi.fn(),
+      onOpenBead: vi.fn(),
+      onSetGoal: vi.fn(),
+      comments: [],
+      onComment: vi.fn(async () => {}),
+      lineage: { parent: PARENT, tasks: [], buildAgents: [] },
+    });
+
+    // THE LIVE REGION SURVIVES — assertion (1). The card is the app's `role="status"` node; the
+    // root `role="button"` displaced it, silently, because an element has only one role slot.
+    const card = screen.getByTestId(t);
+    expect(
+      screen.queryAllByRole("status"),
+      "the card root is no longer announced as a live region",
+    ).toContain(card);
+
+    for (const c of ANNOUNCED_CONTROLS) {
+      const el = screen.getByTestId(`${t}-${c.id}`);
+      // It is announced, with the role and the name a reader is actually given. Necessary, and on
+      // its own not sufficient — see the header.
+      expect(
+        screen.queryAllByRole(c.role, { name: c.name }),
+        `${c.id} is not announced as ${c.role} named ${String(c.name)}`,
+      ).toContain(el);
+      // …and it genuinely REACHES the tree — assertion (2).
+      expect(flattenedBy(el, card), `${c.id} is flattened out of the accessibility tree`).toBeNull();
     }
   });
 

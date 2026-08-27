@@ -4,6 +4,7 @@
 // and a re-render never touches the interval.
 import { create } from "zustand";
 import {
+  BOARD_COLUMNS,
   listBeads,
   blockedBeadIdsOrNull,
   bucketBeads,
@@ -11,7 +12,6 @@ import {
   isBeadsUnavailable,
   type Bead,
   type Board,
-  type BoardColumn,
 } from "../services/beads";
 import { runDecomposeWatcherForPoll } from "../services/epicDecompose";
 import { useSettingsStore } from "./settingsStore";
@@ -249,17 +249,6 @@ export const COMPARED_BEAD_FIELDS = [
   // per bead, so the duty-cycle argument this list exists for is unaffected.
   "commentCount",
 ] as const;
-
-/** Every board column, exhaustively. The `Record<BoardColumn, true>` literal is the tie: adding a
- *  column to `BoardColumn` fails to compile here rather than silently dropping out of the compare. */
-const BOARD_COLUMNS = Object.keys({
-  backlog: true,
-  blocked: true,
-  inProgress: true,
-  done: true,
-  delivered: true,
-  archived: true,
-} satisfies Record<BoardColumn, true>) as BoardColumn[];
 
 function sameLabels(a: readonly string[], b: readonly string[]): boolean {
   if (a === b) return true;

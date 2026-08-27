@@ -23,6 +23,11 @@ import {
   type ToolKey,
   type SparkleImprovementConsent,
 } from "../stores/settingsStore";
+import {
+  PLUGINS_CONFIG_PATH,
+  pluginKeyForTomlKey,
+  pluginTomlKey,
+} from "../stores/pluginCatalog";
 import { useProjectStore } from "../stores/projectStore";
 import {
   installRoborev,
@@ -520,42 +525,10 @@ export async function setStraudeEnabled(on: boolean): Promise<void> {
   await setToolEnabled("straude", false);
 }
 
-/** Plugin key → its dotted config path under [plugins]. Note the snake_case leaf: the TOML key is
- *  `frontend_design`, not the camelCase store key. */
-const PLUGINS_CONFIG_PATH: Record<PluginKey, string> = {
-  superpowers: "plugins.superpowers",
-  frontendDesign: "plugins.frontend_design",
-  hookify: "plugins.hookify",
-  codeSimplifier: "plugins.code_simplifier",
-  sparkleGuardrails: "plugins.sparkle_guardrails",
-  sparkleFreshness: "plugins.sparkle_freshness",
-  sparkleMutationCheck: "plugins.sparkle_mutation_check",
-  sparkleConflictWatch: "plugins.sparkle_conflict_watch",
-  sparkleSecrets: "plugins.sparkle_secrets",
-  sparkleReviewProbes: "plugins.sparkle_review_probes",
-  sparklePusher: "plugins.sparkle_pusher",
-  elementsOfStyle: "plugins.elements_of_style",
-  doubleShotLatte: "plugins.double_shot_latte",
-  compoundEngineering: "plugins.compound_engineering",
-  differentialReview: "plugins.differential_review",
-  reviewSquad: "plugins.review_squad",
-};
-
-/** Store key → the `[plugins]` TOML key Rust reports back in a `PluginInstallOutcome`.
- *
- *  DERIVED, not a third hand-written copy of the plugin set: a new plugin missing from a fourth map
- *  would yield `undefined`, `find` would miss, and the row would show the false "couldn't confirm"
- *  hint instead of the truth. */
-const pluginTomlKey = (key: PluginKey): string =>
-  PLUGINS_CONFIG_PATH[key].slice("plugins.".length);
-
-/** The reverse: an outcome's TOML key → the store key whose row it belongs to, or undefined for a
- *  plugin this build's UI doesn't know about. */
-function pluginKeyForTomlKey(tomlKey: string): PluginKey | undefined {
-  return (Object.keys(PLUGINS_CONFIG_PATH) as PluginKey[]).find(
-    (k) => pluginTomlKey(k) === tomlKey,
-  );
-}
+/** The dotted config paths, the TOML-key projection and its inverse all come from the ONE derived
+ *  catalog in `stores/pluginCatalog` — see its header. This file used to carry a hand-written
+ *  `Record<PluginKey, string>` restating all sixteen rows, which was the third of seven places a
+ *  new plugin had to be added by hand and the second that could be silently forgotten. */
 
 /** The row hint for a plugin that is switched ON but not actually on the machine. `null` when the
  *  plugin is present (installed just now, or already there).

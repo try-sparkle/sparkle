@@ -621,13 +621,55 @@ export function columnFor(bead: Bead, blocked?: ReadonlySet<string>): BoardColum
   return "done";
 }
 
-export interface Board {
-  backlog: Bead[];
-  blocked: Bead[];
-  inProgress: Bead[];
-  done: Bead[];
-  delivered: Bead[];
-  archived: Bead[];
+/** The board, one bead list per column.
+ *
+ *  DERIVED FROM {@link BoardColumn} rather than re-listing the columns, so `keyof Board` and
+ *  `BoardColumn` cannot drift apart. That mattered: everything that walks the board indexes this
+ *  struct, so a column declared HERE and not there (or the reverse) is a lane the walkers cannot
+ *  see. There is now exactly ONE place a column is declared — {@link BoardColumn} — and this type,
+ *  {@link BOARD_COLUMNS} and {@link allBoardBeads} all follow it. */
+export type Board = Record<BoardColumn, Bead[]>;
+
+/**
+ * EVERY board column, exhaustively — DERIVED FROM THE TYPE, never hand-listed.
+ *
+ * The `satisfies Record<keyof Board, true>` literal is the tie: adding a column to
+ * {@link BoardColumn} — which is what grows {@link Board} — fails to COMPILE here rather than
+ * silently dropping out of everything that walks the board. Keyed off `keyof Board` on purpose,
+ * because this list exists to be INDEXED INTO a board; checking it against the union alone would
+ * still pass for a struct that had drifted from the union. Order is the order written below, and
+ * callers may rely on it.
+ */
+export const BOARD_COLUMNS = Object.keys({
+  backlog: true,
+  blocked: true,
+  inProgress: true,
+  done: true,
+  delivered: true,
+  archived: true,
+} satisfies Record<keyof Board, true>) as readonly BoardColumn[];
+
+/**
+ * THE ONE FLATTEN: every column of a {@link Board} back into a single bead list.
+ *
+ * ══ WHY THIS LIVES BESIDE THE TYPE INSTEAD OF IN EACH CONSUMER ═════════════════════════════════
+ * `epicDecompose` kept its own copy and it spread FOUR of the six columns — `blocked` and
+ * `archived` were missing (bead sparkle-m3340n). The result type is `Bead[]` either way, so the
+ * type system could not see the omission, and that list was the SOLE input to that module's
+ * membership and candidate queries: the beads in the two forgotten columns provably did not exist
+ * as far as the whole module was concerned. The two directions are asymmetric, and only one is
+ * inert — an unreachable candidate merely does nothing, while a parent whose children all sit in a
+ * forgotten column reads as CHILDLESS and becomes eligible for a duplicate PAID rebuild.
+ *
+ * A hand-written spread over a struct with N fields goes stale the moment an N+1th field is added,
+ * silently and with nothing to catch it. Walking {@link BOARD_COLUMNS} makes that impossible: a new
+ * column has to be declared there (or the `satisfies` fails), and every caller of this function
+ * picks it up with no edit.
+ */
+export function allBoardBeads(board: Board): Bead[] {
+  const out: Bead[] = [];
+  for (const column of BOARD_COLUMNS) out.push(...board[column]);
+  return out;
 }
 
 /** Group beads into board columns, preserving input order within each column.

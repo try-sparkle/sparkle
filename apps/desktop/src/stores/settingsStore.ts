@@ -172,72 +172,31 @@ export const TOOL_FIELD: Record<
 // section ([plugins], repo-overridable) than [tools] (machine-wide), so a single key type would
 // make the wrong dotted path reachable. Same shape and same hydrate/optimistic-write pattern.
 
-/** Stable identifiers for the config-backed [plugins] flags, across six marketplaces.
+/** The plugin key space and its shipped defaults now come from ONE derived catalog —
+ *  `pluginCatalog.ts`, which is a function of `pluginCatalog.generated.ts`, which is emitted from
+ *  Rust's `KNOWN_PLUGINS` table by `scripts/gen-plugin-catalog.mjs`.
  *
- *  The `sparkle*` ones come from Sparkle's OWN public marketplace
- *  (github.com/try-sparkle/marketplace, Apache-2.0) rather than Anthropic's official one — the
- *  same opinions Sparkle applies internally, published so they can be read, forked, or used
- *  without Sparkle. `superpowers`/`frontendDesign`/`hookify`/`codeSimplifier` come from
- *  Anthropic's official marketplace. The last five come from THIRD-PARTY marketplaces Sparkle
- *  neither owns nor pins — obra/superpowers-marketplace, EveryInc/compound-engineering-plugin,
- *  trailofbits/skills and 2389-research/claude-plugins; the `[plugins]` TRUST block in
- *  config.rs's DEFAULT_TEMPLATE is where that is spelled out for the user. */
-export type PluginKey =
-  | "superpowers"
-  | "frontendDesign"
-  | "hookify"
-  | "codeSimplifier"
-  | "sparkleGuardrails"
-  | "sparkleFreshness"
-  | "sparkleMutationCheck"
-  | "sparkleConflictWatch"
-  | "sparkleSecrets"
-  | "sparkleReviewProbes"
-  | "sparklePusher"
-  | "elementsOfStyle"
-  | "doubleShotLatte"
-  | "compoundEngineering"
-  | "differentialReview"
-  | "reviewSquad";
+ *  Re-exported here rather than moved-and-forgotten: `PluginKey` and `PLUGIN_DEFAULTS` are the
+ *  names the rest of the app already imports from the store, and this is the module that owns the
+ *  `pluginsEnabled` slice they describe.
+ *
+ *  WHAT CHANGED AND WHY. Both used to be hand-written literals: a 16-member union and a 16-entry
+ *  record restating the Rust table, kept honest only by a `cargo test` that read THIS FILE from
+ *  disk and compared it row for row. That guard covered the defaults and nothing else — the union,
+ *  the hydrate block below, the dotted-path map in configActions and the wire-shape interface in
+ *  services/config were all unguarded, and a row missing from the hydrate block would have read as
+ *  its default forever with every suite green. Deriving them removes the four mirrors instead of
+ *  adding a fifth guard. */
+import {
+  PLUGIN_CATALOG,
+  PLUGIN_DEFAULTS,
+  PLUGIN_KEYS,
+  resolvePluginsEnabled,
+  type PluginKey,
+} from "./pluginCatalog";
 
-/** Defaults, mirroring the `default_on` column of Rust's `KNOWN_PLUGINS`. Used until the first
- *  config hydrate answers for real.
- *
- *  THE TWO MUST FLIP IN THE SAME COMMIT. This comment used to say a disagreement here was "a
- *  first-paint flicker, not a correctness bug, because Rust is the authority" — which read as
- *  licence to defer the mirror update, and is how all four sparkle* rows below sat at `true` for a
- *  commit after the Rust table moved them to `false`. Two things make it wrong: the flicker is
- *  user-visible (the toggle paints the wrong state until hydrate lands, which on a slow start is
- *  long enough to read and click), and it is now a hard `cargo test` failure —
- *  `the_frontend_plugin_defaults_mirror_matches_this_tables_default_on_column` in `config.rs` reads
- *  THIS FILE from disk and compares it to `KNOWN_PLUGINS` row for row, in both directions. */
-export const PLUGIN_DEFAULTS: Record<PluginKey, boolean> = {
-  superpowers: true,
-  frontendDesign: true,
-  hookify: true,
-  codeSimplifier: true,
-  // OFF: [tools].guardrails already injects this same prose (see the Rust table).
-  sparkleGuardrails: false,
-  sparkleFreshness: true,
-  // A deliberate, targeted act ("prove THIS test can fail"), not a background discipline.
-  sparkleMutationCheck: false,
-  // The four below ship OFF, and — unlike the two above — not on their own merits: each earns an
-  // eventual ON, but try-sparkle/marketplace does not carry the content yet, so an enabled row
-  // makes the install pass retry a failing `claude plugin install` on every launch and renders a
-  // "couldn't install" hint. They flip to true once each name appears in that listing, in the same
-  // commit that flips Rust's `default_on`. See the KNOWN_PLUGINS block in config.rs.
-  sparkleConflictWatch: false,
-  sparkleSecrets: false,
-  sparkleReviewProbes: false,
-  sparklePusher: false,
-  // Tier 2, third-party marketplaces (see the PluginKey note above). ON: their content is
-  // published and confirmed present in each listing, so the install resolves on the first try.
-  elementsOfStyle: true,
-  doubleShotLatte: true,
-  compoundEngineering: true,
-  differentialReview: true,
-  reviewSquad: true,
-};
+export { PLUGIN_DEFAULTS, PLUGIN_KEYS };
+export type { PluginKey };
 
 // --- Chief sync state (replacing the legacy markdown-sync watermark) -----------------------
 
@@ -1431,30 +1390,10 @@ export const useSettingsStore = create<SettingsState>()(
           // (older backend) means the on-by-default state, matching SparkleConfig::default().
           // An absent [plugins] block (older backend) reads as the on-by-default state, matching
           // SparkleConfig::default(). Each key maps to its snake_case TOML name.
-          pluginsEnabled: {
-            superpowers: config.plugins?.superpowers ?? PLUGIN_DEFAULTS.superpowers,
-            frontendDesign: config.plugins?.frontend_design ?? PLUGIN_DEFAULTS.frontendDesign,
-            hookify: config.plugins?.hookify ?? PLUGIN_DEFAULTS.hookify,
-            codeSimplifier: config.plugins?.code_simplifier ?? PLUGIN_DEFAULTS.codeSimplifier,
-            sparkleGuardrails:
-              config.plugins?.sparkle_guardrails ?? PLUGIN_DEFAULTS.sparkleGuardrails,
-            sparkleFreshness: config.plugins?.sparkle_freshness ?? PLUGIN_DEFAULTS.sparkleFreshness,
-            sparkleMutationCheck:
-              config.plugins?.sparkle_mutation_check ?? PLUGIN_DEFAULTS.sparkleMutationCheck,
-            sparkleConflictWatch:
-              config.plugins?.sparkle_conflict_watch ?? PLUGIN_DEFAULTS.sparkleConflictWatch,
-            sparkleSecrets: config.plugins?.sparkle_secrets ?? PLUGIN_DEFAULTS.sparkleSecrets,
-            sparkleReviewProbes:
-              config.plugins?.sparkle_review_probes ?? PLUGIN_DEFAULTS.sparkleReviewProbes,
-            sparklePusher: config.plugins?.sparkle_pusher ?? PLUGIN_DEFAULTS.sparklePusher,
-            elementsOfStyle: config.plugins?.elements_of_style ?? PLUGIN_DEFAULTS.elementsOfStyle,
-            doubleShotLatte: config.plugins?.double_shot_latte ?? PLUGIN_DEFAULTS.doubleShotLatte,
-            compoundEngineering:
-              config.plugins?.compound_engineering ?? PLUGIN_DEFAULTS.compoundEngineering,
-            differentialReview:
-              config.plugins?.differential_review ?? PLUGIN_DEFAULTS.differentialReview,
-            reviewSquad: config.plugins?.review_squad ?? PLUGIN_DEFAULTS.reviewSquad,
-          },
+          pluginsEnabled: resolvePluginsEnabled(config.plugins, PLUGIN_CATALOG) as Record<
+            PluginKey,
+            boolean
+          >,
           // NOTE THE ASYMMETRY: every tool above falls back to `?? true`, this one to `?? false`.
           // 1Password backup needs an external account, the `op` CLI, and a chosen vault before it
           // can do anything, so an absent [tools] block must read as OFF — defaulting it on would
