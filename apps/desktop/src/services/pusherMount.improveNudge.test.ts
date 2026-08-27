@@ -54,8 +54,10 @@ afterEach(() => vi.restoreAllMocks());
 describe("buildImproveNudgeDeps — the real readers reach the live stores", () => {
   it("readyBacklog() reads the sparkle-self board backlog and its open P1 pipeline-health beads", () => {
     const beads: Bead[] = [
-      bead({ id: "r1" }),
-      bead({ id: "r2" }),
+      // r1 is an explicit P0 so the self-feeding `nextReadyBead` pick below is unambiguous — the
+      // highest-priority ready bead the code hands the agent, ahead of the P1s.
+      bead({ id: "r1", priority: 0, title: "the P0" }),
+      bead({ id: "r2", priority: 2 }),
       // Two open P1 pipeline-health beads, deliberately given ids in DESCENDING order so the fingerprint
       // assertion below proves the reader SORTS them (a stable identity), not merely concatenates.
       bead({ id: "ph-z", priority: 1, labels: [PIPELINE_HEALTH_LABEL] }),
@@ -71,8 +73,15 @@ describe("buildImproveNudgeDeps — the real readers reach the live stores", () 
     // Proves the reader reached `byProject[SPARKLE_PROJECT_ID].board.backlog` — a constant or a wrong
     // project id could not produce 4, and the P1 filter reached the label + priority fields. The
     // fingerprint proves it read the actual bead IDS and sorted them, so a changed set of red beads is a
-    // changed fingerprint (what the concierge-notify dedup keys on).
-    expect(got).toEqual({ ready: 4, p1PipelineHealth: 2, p1PipelineHealthFingerprint: "ph-a,ph-z" });
+    // changed fingerprint (what the concierge-notify dedup keys on). And `nextReadyBead` proves the
+    // reader chose the highest-priority ready bead IN CODE (the P0 r1, ahead of the P1s) — the
+    // self-feeding pick the never-idle nudge hands over by name (bead sparkle-n2feho.1).
+    expect(got).toEqual({
+      ready: 4,
+      p1PipelineHealth: 2,
+      p1PipelineHealthFingerprint: "ph-a,ph-z",
+      nextReadyBead: { id: "r1", priority: 0, title: "the P0" },
+    });
   });
 
   it("readyBacklog() returns the fail-safe empty reading when the sparkle board is unpolled", () => {
@@ -82,6 +91,8 @@ describe("buildImproveNudgeDeps — the real readers reach the live stores", () 
       ready: 0,
       p1PipelineHealth: 0,
       p1PipelineHealthFingerprint: null,
+      // No snapshot → no ready column → no code-chosen next item (fail-toward-silence: never invent one).
+      nextReadyBead: null,
     });
   });
 

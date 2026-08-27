@@ -53,7 +53,54 @@
 // wrong nudge is spending the agent's attention on a turn it did not need.
 
 import type { AgentTabStatus } from "../types";
+import type { Bead } from "./beads";
 import { log } from "../logger";
+
+/**
+ * The concrete next item the self-feeding pull-loop hands the agent — the identity of the highest-
+ * priority ready bead, resolved in CODE so the resume no longer punts "pick one yourself" to the
+ * model. `priority` is bd's numeric band (0 = P0, the most urgent); `title` is for a human-legible
+ * nudge line. See `selectNextReadyBead`.
+ */
+export interface NextReadyBead {
+  id: string;
+  priority: number;
+  title: string;
+}
+
+/** Sentinel priority for a ready bead bd left ungraded — sorts LAST (see `selectNextReadyBead`) and
+ *  renders as "unprioritized" rather than a bogus "P<big number>" (see `namedPullNudgeText`). */
+const UNGRADED_PRIORITY = Number.POSITIVE_INFINITY;
+
+/**
+ * SELECT THE NEXT READY ITEM — the code-level half of the founder's "run `bd ready` sorted by
+ * priority, take the top item" (bead sparkle-n2feho.1, cause 4: a goal is a finish line, so make the
+ * loop self-feeding, not supervised). Given the board's already-filtered READY column (open,
+ * unblocked, non-stalled — the same `board.backlog` the idle COUNT reads), return the single
+ * highest-priority bead so the never-idle nudge can NAME it instead of telling the agent to choose.
+ * That is the supervision→self-feeding shift: the choice is made HERE, deterministically, not deferred
+ * to a model turn that kept answering with a status line (the exact failure of bead sparkle-iiz0eu).
+ *
+ * ORDERING mirrors bd's own: priority ASCENDING (0 = P0 outranks P1 outranks …), so P0s are exhausted
+ * before P1s — exactly what the founder asked for. A missing priority sorts LAST: it is the least
+ * urgent thing to hand someone, and treating "unknown" as "urgent" would jump an un-graded bead ahead
+ * of a real P0. Ties break by id ascending so the pick is STABLE across polls — a selector that
+ * reordered equal-priority beads on every 5s snapshot would name a different "next item" each tick and
+ * never let the agent converge on one. Returns `null` for an empty ready column (nothing to pull).
+ *
+ * PURE and non-mutating: it copies before sorting, so the caller's snapshot array is untouched.
+ */
+export function selectNextReadyBead(readyColumn: readonly Bead[]): NextReadyBead | null {
+  const ranked = [...readyColumn].sort((a, b) => {
+    const pa = a.priority ?? UNGRADED_PRIORITY;
+    const pb = b.priority ?? UNGRADED_PRIORITY;
+    if (pa !== pb) return pa - pb;
+    return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+  });
+  const top = ranked[0];
+  if (top === undefined) return null;
+  return { id: top.id, priority: top.priority ?? UNGRADED_PRIORITY, title: top.title };
+}
 
 /**
  * The nudge text delivered into the Improve Sparkle agent's inbox. Carries NO digits, so it can never
@@ -105,6 +152,48 @@ export function neverIdleNudgeText(priorNudgesWithoutAdvance: number): string {
   return priorNudgesWithoutAdvance >= NEVER_IDLE_ESCALATE_AFTER
     ? NEVER_IDLE_ESCALATED_NUDGE_TEXT
     : NEVER_IDLE_NUDGE_TEXT;
+}
+
+/** Render a ready bead's priority band for the nudge line: `P0`/`P1`/… for a graded bead, or
+ *  `unprioritized` for one bd left ungraded (its sentinel is not a real band — see `UNGRADED_PRIORITY`). */
+function priorityLabel(priority: number): string {
+  return Number.isFinite(priority) ? `P${priority}` : "unprioritized";
+}
+
+/**
+ * THE SELF-FEEDING PULL NUDGE — the fix for bead sparkle-n2feho.1, cause 4. Where the generic reminder
+ * tells the agent to "work the highest-value ready item — pick it YOURSELF", this NAMES the item the
+ * code already chose (`selectNextReadyBead`) so the resume hands over a concrete unit of work instead
+ * of deferring the choice to a model turn. That deferral is the measured failure the founder called
+ * out (bead sparkle-iiz0eu — "answered the nudge with a status line or a question instead of
+ * shipping"): a prompt telling an agent to decide cannot fix an agent that keeps not deciding, so the
+ * decision moves into code and the message merely relays it.
+ *
+ * It still ESCALATES by the flat-signal streak, exactly like the generic reminder, because naming the
+ * item does not by itself stop an agent that answers with a status line: at/above the threshold the
+ * text additionally names the streak and declares a non-artifact reply unacceptable. The item is named
+ * in BOTH variants — that is the whole point — so escalation hardens the demand without ever dropping
+ * the concrete target.
+ *
+ * Like `respinFleetNudgeText` this carries digits (the bead id and its priority band), which is safe
+ * for the same reason: `sweepImproveNudge` sends it directly via `send`, never through the Pusher's
+ * challenge path, so `checkCitations` never sees it. It must not be routed through the challenge path.
+ */
+export function namedPullNudgeText(bead: NextReadyBead, priorNudgesWithoutAdvance: number): string {
+  const target = `${bead.id} (${priorityLabel(bead.priority)}) — "${bead.title}"`;
+  const escalated = priorNudgesWithoutAdvance >= NEVER_IDLE_ESCALATE_AFTER;
+  const lead = escalated
+    ? `You have now been nudged MULTIPLE times without producing a single concrete artifact. A status ` +
+      `line, a plan, a list of options, or a question back to the founder is NOT an acceptable ` +
+      `response. `
+    : ``;
+  return (
+    lead +
+    `Your next item is ALREADY CHOSEN — ${target}. It is the highest-priority ready bead, so do NOT ` +
+    `re-decide which to work and do NOT reply asking which one: CLAIM it (comment "taking <path>" on ` +
+    `the bead / mark it in_progress), WORK it, CLOSE it, then pull the next one. End this turn having ` +
+    `left an artifact ON THIS ITEM: a commit, a pushed PR, a filed or closed bead, or a real file edit.`
+  );
 }
 
 /**
@@ -297,6 +386,12 @@ export interface ImproveNudgeInput {
    *  headroom the alarm does not fire (escalating into a saturated machine only produces admission
    *  refusals). 0 when unreadable — the fail-toward-silence direction. */
   unstaffedBuildableEpicCount: number;
+  /** The highest-priority ready bead the code has ALREADY chosen for the agent to pull next
+   *  (`selectNextReadyBead` over the same ready column `readyBacklogCount` counts), or `null` when the
+   *  ready column is empty/unreadable. When present it upgrades the terminal generic reminder into a
+   *  `named-pull` that hands over the concrete item instead of telling the agent to pick one — the
+   *  supervision→self-feeding shift (bead sparkle-n2feho.1). `null` keeps the plain generic reminder. */
+  nextReadyBead: NextReadyBead | null;
   /** When the last nudge was delivered, or `null` if never. */
   lastNudgedAt: number | null;
   now: number;
@@ -305,6 +400,7 @@ export interface ImproveNudgeInput {
 
 export type ImproveNudgeDecision =
   | { nudge: true; kind: "generic" }
+  | { nudge: true; kind: "named-pull"; bead: NextReadyBead }
   | { nudge: true; kind: "respin"; readyCount: number; freeSlots: number }
   | { nudge: true; kind: "concierge-notify"; fingerprint: string; count: number }
   | { nudge: true; kind: "unstaffed-epic-alarm"; epicCount: number; freeSlots: number }
@@ -420,6 +516,16 @@ export function decideImproveNudge(input: ImproveNudgeInput): ImproveNudgeDecisi
   if (input.readyBacklogCount > 0 && input.freeSlots > 0 && input.activeWorkers === 0) {
     return { nudge: true, kind: "respin", readyCount: input.readyBacklogCount, freeSlots: input.freeSlots };
   }
+  // SELF-FEEDING PULL (bead sparkle-n2feho.1, cause 4): the terminal case is "there is ready work but
+  // no drain fleet to spin" (no headroom, or workers already draining and the orchestrator itself must
+  // work a reserved unit). Rather than tell the agent to "pick the highest-value ready item YOURSELF",
+  // NAME the item the code already chose so the resume hands over a concrete unit — that is the
+  // supervision→self-feeding shift. Falls back to the plain generic reminder only when no ready bead
+  // is readable (e.g. a lone blocked-but-open P1, or an unhydrated board), the fail-toward-silence
+  // direction: never invent a target.
+  if (input.nextReadyBead !== null) {
+    return { nudge: true, kind: "named-pull", bead: input.nextReadyBead };
+  }
   return { nudge: true, kind: "generic" };
 }
 
@@ -444,8 +550,15 @@ export interface ImproveNudgeDeps {
   advanceFingerprint(): string | null;
   /** The ready-work counts, read from the beads board, plus a fingerprint IDENTIFYING the open P1
    *  pipeline-health beads (their sorted ids joined, or `null` when there are none) — the identity the
-   *  concierge-notify push dedups on. */
-  readyBacklog(): { ready: number; p1PipelineHealth: number; p1PipelineHealthFingerprint: string | null };
+   *  concierge-notify push dedups on — and `nextReadyBead`, the highest-priority ready bead the code
+   *  has chosen for the self-feeding pull nudge (`selectNextReadyBead`; `null` when the ready column is
+   *  empty/unreadable). */
+  readyBacklog(): {
+    ready: number;
+    p1PipelineHealth: number;
+    p1PipelineHealthFingerprint: string | null;
+    nextReadyBead: NextReadyBead | null;
+  };
   /** The machine-capacity reading behind the re-spin decision: `freeSlots` is the local agent
    *  headroom (`localAgentCapacity` `limit − used`, clamped ≥ 0) and `activeWorkers` is how many
    *  local drain workers are occupying slots right now. */
@@ -577,6 +690,7 @@ export async function sweepImproveNudge(deps: ImproveNudgeDeps): Promise<Improve
       freeSlots: capacity.freeSlots,
       activeWorkers: capacity.activeWorkers,
       unstaffedBuildableEpicCount: unstaffed.unstaffedBuildableEpicCount,
+      nextReadyBead: backlog.nextReadyBead,
       lastNudgedAt,
       now,
       cadenceMs: NEVER_IDLE_CADENCE_MS,
@@ -605,7 +719,12 @@ export async function sweepImproveNudge(deps: ImproveNudgeDeps): Promise<Improve
           ? respinFleetNudgeText(decision.readyCount, decision.freeSlots)
           : decision.kind === "concierge-notify"
             ? conciergeNotifyNudgeText(decision.count)
-            : neverIdleNudgeText(consecutiveIdleNudges);
+            : // SELF-FEEDING PULL (bead sparkle-n2feho.1): when the code has chosen a concrete next item,
+              // hand it over by NAME; escalation by streak applies exactly as it does to the generic
+              // reminder, so an agent answering the nudge without shipping still gets the harder demand.
+              decision.kind === "named-pull"
+              ? namedPullNudgeText(decision.bead, consecutiveIdleNudges)
+              : neverIdleNudgeText(consecutiveIdleNudges);
     const delivered = await deps.send(text);
     if (delivered) {
       lastNudgedAt = now;

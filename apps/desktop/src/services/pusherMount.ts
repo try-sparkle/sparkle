@@ -60,7 +60,12 @@ import {
   sparkleAgentIdFor,
   SPARKLE_PROJECT_ID,
 } from "./sparkleAgent";
-import { sweepImproveNudge, type ImproveNudgeDeps } from "./improveNudge";
+import {
+  sweepImproveNudge,
+  selectNextReadyBead,
+  type ImproveNudgeDeps,
+  type NextReadyBead,
+} from "./improveNudge";
 import { localAgentCapacity } from "./agentCapacity";
 import { epicIndexOf } from "./beads";
 import { boundAgentsFor } from "./epicSweepRunner";
@@ -271,9 +276,11 @@ function improveReadyBacklog(): {
   ready: number;
   p1PipelineHealth: number;
   p1PipelineHealthFingerprint: string | null;
+  nextReadyBead: NextReadyBead | null;
 } {
   const snap = useBeadsStore.getState().byProject[SPARKLE_PROJECT_ID];
-  if (snap === undefined) return { ready: 0, p1PipelineHealth: 0, p1PipelineHealthFingerprint: null };
+  if (snap === undefined)
+    return { ready: 0, p1PipelineHealth: 0, p1PipelineHealthFingerprint: null, nextReadyBead: null };
   const p1Beads = snap.beads.filter(
     (b) => b.status === "open" && b.priority === 1 && b.labels.includes(PIPELINE_HEALTH_LABEL),
   );
@@ -283,6 +290,11 @@ function improveReadyBacklog(): {
     ready: snap.board.backlog.length,
     p1PipelineHealth: p1Beads.length,
     p1PipelineHealthFingerprint,
+    // SELF-FEEDING PULL (bead sparkle-n2feho.1): choose the highest-priority ready bead IN CODE from
+    // the SAME ready column the count above reads, so the never-idle nudge hands over a concrete next
+    // item by name instead of telling the agent to pick one. Cheap — reuses the cached 5s snapshot,
+    // no `bd` shell call on this 60s tick.
+    nextReadyBead: selectNextReadyBead(snap.board.backlog),
   };
 }
 

@@ -10,6 +10,8 @@ import {
   respinFleetNudgeText,
   conciergeNotifyNudgeText,
   unstaffedEpicAlarmNudgeText,
+  namedPullNudgeText,
+  selectNextReadyBead,
   _resetImproveNudgeForTests,
   decideImproveNudge,
   improveLastNudgedAt,
@@ -18,8 +20,10 @@ import {
   sweepImproveNudge,
   type ImproveNudgeDeps,
   type ImproveNudgeInput,
+  type NextReadyBead,
 } from "./improveNudge";
 import type { AgentTabStatus } from "../types";
+import type { Bead } from "./beads";
 
 // ── A deps builder that RECORDS the side effect (the nudge send) into an array ────────────────────
 // The contract this feature exists for is "a nudge was DELIVERED to the Improve Sparkle agent", so
@@ -42,6 +46,7 @@ function makeDeps(
     freeSlots: number;
     activeWorkers: number;
     unstaffedBuildableEpicCount: number;
+    nextReadyBead: NextReadyBead | null;
     sendResult: boolean;
   }> = {},
 ): { deps: ImproveNudgeDeps; sent: string[] } {
@@ -64,6 +69,9 @@ function makeDeps(
     // DEFAULT: no unstaffed epics, so the base idle-with-backlog case does not take the alarm shape.
     // The alarm suite overrides `unstaffedBuildableEpicCount` (and keeps freeSlots > 0) to reach it.
     unstaffedBuildableEpicCount: 0,
+    // DEFAULT: no code-chosen ready bead, so the base idle-with-backlog case keeps the GENERIC
+    // reminder. The self-feeding-pull suite overrides `nextReadyBead` to reach the named-pull path.
+    nextReadyBead: null as NextReadyBead | null,
     sendResult: true,
     ...overrides,
   };
@@ -80,6 +88,7 @@ function makeDeps(
         ready: o.ready,
         p1PipelineHealth: o.p1PipelineHealth,
         p1PipelineHealthFingerprint: o.p1PipelineHealthFingerprint,
+        nextReadyBead: o.nextReadyBead,
       }),
       capacity: () => ({ freeSlots: o.freeSlots, activeWorkers: o.activeWorkers }),
       unstaffedBuildableEpics: () => ({
@@ -508,6 +517,9 @@ describe("decideImproveNudge — the idle-and-has-backlog rule", () => {
     freeSlots: 4,
     activeWorkers: 1,
     unstaffedBuildableEpicCount: 0,
+    // DEFAULT: no code-chosen ready bead → the terminal case stays GENERIC. The self-feeding-pull
+    // tests below set `nextReadyBead` to reach the named-pull shape.
+    nextReadyBead: null,
     lastNudgedAt: null,
     now: 1_000_000,
     cadenceMs: NEVER_IDLE_CADENCE_MS,
@@ -668,5 +680,182 @@ describe("decideImproveNudge — the idle-and-has-backlog rule", () => {
     expect(
       decideImproveNudge({ ...base, lastNudgedAt: 0, now: NEVER_IDLE_CADENCE_MS }),
     ).toEqual({ nudge: true, kind: "generic" });
+  });
+});
+
+// ── THE SELF-FEEDING PULL SELECTOR (bead sparkle-n2feho.1, cause 4) ────────────────────────────────
+// The code-level "run `bd ready` sorted by priority, take the top item". Pinned as pure arithmetic:
+// P0 before P1, ungraded last, id tiebreak, empty → null. These assertions are what make the nudge's
+// named target trustworthy — a wrong sort here names the wrong bead.
+function bead(overrides: Partial<Bead> & { id: string }): Bead {
+  return {
+    title: `title ${overrides.id}`,
+    description: "",
+    status: "open",
+    labels: [],
+    ...overrides,
+  };
+}
+
+describe("selectNextReadyBead — the priority-sorted next item", () => {
+  it("returns null for an empty ready column (nothing to pull)", () => {
+    expect(selectNextReadyBead([])).toBeNull();
+  });
+
+  it("picks P0 ahead of P1 even when the P1 is listed first — P0s exhaust before P1s", () => {
+    const picked = selectNextReadyBead([
+      bead({ id: "sparkle-p1", priority: 1, title: "a P1" }),
+      bead({ id: "sparkle-p0", priority: 0, title: "a P0" }),
+    ]);
+    expect(picked).toEqual({ id: "sparkle-p0", priority: 0, title: "a P0" });
+  });
+
+  it("orders across several bands, lowest number wins (0 < 1 < 2 < 3)", () => {
+    const picked = selectNextReadyBead([
+      bead({ id: "c", priority: 3 }),
+      bead({ id: "a", priority: 2 }),
+      bead({ id: "b", priority: 1 }),
+    ]);
+    expect(picked?.id).toBe("b");
+    expect(picked?.priority).toBe(1);
+  });
+
+  it("sorts an UNGRADED bead LAST — 'unknown' must not jump ahead of a real P0", () => {
+    const picked = selectNextReadyBead([
+      bead({ id: "ungraded", priority: undefined }),
+      bead({ id: "graded", priority: 0 }),
+    ]);
+    expect(picked?.id).toBe("graded");
+  });
+
+  it("returns the ungraded bead only when it is the ONLY ready item", () => {
+    const picked = selectNextReadyBead([bead({ id: "lonely", priority: undefined, title: "solo" })]);
+    expect(picked).toEqual({ id: "lonely", priority: Number.POSITIVE_INFINITY, title: "solo" });
+  });
+
+  it("breaks a same-priority tie by id ascending, STABLY (same input → same pick every poll)", () => {
+    const col = [
+      bead({ id: "", priority: 1 }),
+      bead({ id: "", priority: 1 }),
+      bead({ id: "", priority: 1 }),
+    ];
+    expect(selectNextReadyBead(col)?.id).toBe("");
+    // reordered input, identical pick — the tiebreak is on id, not position.
+    expect(selectNextReadyBead([...col].reverse())?.id).toBe("");
+  });
+
+  it("does not mutate the caller's snapshot array", () => {
+    const col = [bead({ id: "b", priority: 2 }), bead({ id: "a", priority: 1 })];
+    const before = col.map((b) => b.id);
+    selectNextReadyBead(col);
+    expect(col.map((b) => b.id)).toEqual(before);
+  });
+});
+
+// ── THE NAMED-PULL DECISION ARM (bead sparkle-n2feho.1) — supervision → self-feeding ───────────────
+describe("decideImproveNudge — the self-feeding named-pull arm", () => {
+  const base: ImproveNudgeInput = {
+    armed: true,
+    ownsProject: true,
+    consentIsNever: false,
+    paneStatus: "idle",
+    advancedRecently: false,
+    readyBacklogCount: 2,
+    p1PipelineHealthCount: 0,
+    pipelineHealthFingerprint: null,
+    lastConciergeNotifyFingerprint: null,
+    lastConciergeNotifiedAt: null,
+    conciergeCadenceMs: CONCIERGE_NOTIFY_CADENCE_MS,
+    // Workers already draining → not the re-spin arm, so the terminal case decides between generic
+    // and named-pull purely on whether a next ready bead was chosen.
+    freeSlots: 4,
+    activeWorkers: 1,
+    unstaffedBuildableEpicCount: 0,
+    nextReadyBead: null,
+    lastNudgedAt: null,
+    now: 1_000_000,
+    cadenceMs: NEVER_IDLE_CADENCE_MS,
+  };
+
+  it("hands over the code-chosen item by NAME instead of the generic 'pick one yourself' reminder", () => {
+    const pick: NextReadyBead = { id: "sparkle-n2feho.1", priority: 0, title: "self-feeding" };
+    expect(decideImproveNudge({ ...base, nextReadyBead: pick })).toEqual({
+      nudge: true,
+      kind: "named-pull",
+      bead: pick,
+    });
+  });
+
+  it("falls back to the plain generic reminder when NO ready bead is readable (fail-toward-silence)", () => {
+    expect(decideImproveNudge({ ...base, nextReadyBead: null })).toEqual({
+      nudge: true,
+      kind: "generic",
+    });
+  });
+
+  it("the re-spin arm still PRE-EMPTS named-pull — a chosen bead does not suppress spinning the fleet", () => {
+    const pick: NextReadyBead = { id: "sparkle-x", priority: 1, title: "x" };
+    expect(
+      decideImproveNudge({
+        ...base,
+        nextReadyBead: pick,
+        readyBacklogCount: 6,
+        freeSlots: 8,
+        activeWorkers: 0,
+      }),
+    ).toEqual({ nudge: true, kind: "respin", readyCount: 6, freeSlots: 8 });
+  });
+});
+
+// ── THE NAMED-PULL SIDE EFFECT — the message that actually LANDS names the bead ────────────────────
+describe("sweepImproveNudge — the self-feeding named-pull message", () => {
+  beforeEach(() => _resetImproveNudgeForTests());
+
+  it("idle + workers draining + a code-chosen bead → sends the NAMED-PULL text, not the generic one", async () => {
+    const pick: NextReadyBead = { id: "sparkle-abc12", priority: 0, title: "fix the thing" };
+    const sent = await sweepStaleThen(ADVANCE_IDLE_MS, {
+      ready: 3,
+      freeSlots: 4,
+      activeWorkers: 2, // draining → generic/named-pull terminal case, not re-spin
+      nextReadyBead: pick,
+    });
+    expect(sent).toEqual([namedPullNudgeText(pick, 1)]);
+    // and it is DISTINCT from the generic reminder — the whole point of the slice.
+    expect(sent[0]).not.toBe(NEVER_IDLE_NUDGE_TEXT);
+    // it NAMES the concrete item so the resume hands over work rather than asking the agent to choose.
+    expect(sent[0]).toContain("sparkle-abc12");
+    expect(sent[0]).toContain("P0");
+    expect(sent[0]).toContain("fix the thing");
+    expect(sent[0]).toContain("ALREADY CHOSEN");
+  });
+});
+
+// ── THE NAMED-PULL TEXT (bead sparkle-n2feho.1) — names the item; escalates by streak ──────────────
+describe("namedPullNudgeText", () => {
+  const pick: NextReadyBead = { id: "sparkle-q9", priority: 2, title: "tidy the log" };
+
+  it("names the id, priority band and title, and tells the agent NOT to re-decide", () => {
+    const t = namedPullNudgeText(pick, 0);
+    expect(t).toContain("sparkle-q9");
+    expect(t).toContain("P2");
+    expect(t).toContain("tidy the log");
+    expect(t).toContain("do NOT");
+  });
+
+  it("renders an ungraded pick as 'unprioritized', never 'PInfinity'", () => {
+    const t = namedPullNudgeText({ id: "sparkle-u", priority: Number.POSITIVE_INFINITY, title: "u" }, 0);
+    expect(t).toContain("unprioritized");
+    expect(t).not.toContain("PInfinity");
+    expect(t).not.toContain("Infinity");
+  });
+
+  it("escalates at/above the streak threshold — still names the item, adds the 'not acceptable' demand", () => {
+    const soft = namedPullNudgeText(pick, NEVER_IDLE_ESCALATE_AFTER - 1);
+    const hard = namedPullNudgeText(pick, NEVER_IDLE_ESCALATE_AFTER);
+    expect(soft).not.toContain("not an acceptable");
+    expect(soft).not.toContain("NOT an acceptable");
+    expect(hard).toContain("NOT an acceptable");
+    // the concrete target survives escalation — never dropped for the harder demand.
+    expect(hard).toContain("sparkle-q9");
   });
 });
