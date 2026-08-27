@@ -185,7 +185,74 @@ function words(transcript: string): string[] {
 }
 
 /**
- * Does this text stop MID-CLAUSE — a dangling function word, or a comma?
+ * The coordinating conjunctions (FANBOYS + "so"), as WHOLE WORDS. A subset of
+ * {@link TRAILING_CONJUNCTIONS} — the ones that also open a fresh independent clause — reused by the
+ * interior-splice check below. Kept separate on purpose: a dangling `to`/`the`/`because` is a
+ * mid-clause TAIL and belongs only to `TRAILING_CONJUNCTIONS`; a capitalised `But`/`So`/`And`
+ * appearing INSIDE the text is the seam between two spliced utterances, which is a different signal.
+ */
+const COORDINATING_CONJUNCTIONS = new Set(["and", "but", "or", "nor", "for", "yet", "so"]);
+
+/**
+ * Does this text SPLICE two separately-finalised utterances into one?
+ *
+ * ══ THE FOUNDER NAMED THIS ONE TOO (bead `sparkle-r3wl6f`, splice comment) ══════════════════════
+ * *"As a part of that work, feel free to also compress it so it has less information, not more But
+ * looking for something within 10/01/2026 move in dates…"* — TWO UNRELATED dictation sessions run
+ * into one message: Sparkle work, then a rental-property enquiry, with no sentence boundary between
+ * them. This is worse than a truncation because the tail (`…is not available then.`) LOOKS COMPLETE,
+ * so every finished-ness check upstream reads it as `high` and both the countdown and the research
+ * dispatcher act on garbage.
+ *
+ * The seam is the one mark speech-to-text cannot hide: a capitalised coordinating conjunction with
+ * NO terminal punctuation before it. `smart_format` capitalises a word only when it has decided a
+ * new sentence began — and when it decides that, it also PUNCTUATES the end of the previous one. So
+ * a capital `But`/`So`/`And` that is NOT preceded by a `.`/`!`/`?` did not come from one continuous
+ * transcription: it is the boundary where a second finalised utterance was concatenated onto the
+ * first. `"…not more. But looking…"` (a real full stop) is a legitimate sentence start and is left
+ * alone; `"…not more But looking…"` (no stop) is the splice.
+ *
+ * The FIRST word is exempt — a message that merely opens with "But…" is informal, not a splice —
+ * so the scan starts at index 1. NOT a claim about the speaker, only about the text: every caller is
+ * asking whether this is ONE whole finished thought, and a splice is two.
+ *
+ * The seam must be SENTENCE CASE, not merely a leading capital: `smart_format` capitalises exactly
+ * the first letter of a sentence, so `But`/`So`/`And` are seams but `AND`/`OR`/`SO` are not — an
+ * all-caps coordinating word is emphasis or a boolean/query operator ("the PRs that are green AND
+ * unmerged", "open OR ready"), which is one continuous utterance and must stay dispatchable.
+ */
+export function hasInteriorSplice(text: string): boolean {
+  const tokens = text.trim().split(/\s+/).filter((t) => t.length > 0);
+  for (let i = 1; i < tokens.length; i++) {
+    const token = tokens[i] ?? "";
+    // A SENTENCE-CASED coordinating conjunction — the start of a fresh independent clause. Sentence
+    // case (first letter upper, the rest lower) and not ALL-CAPS is the discriminator: it is what
+    // `smart_format` emits at a real sentence boundary, and what an emphasis/operator does not.
+    if (!isSentenceCase(token)) continue;
+    if (!COORDINATING_CONJUNCTIONS.has(bareWord(token))) continue;
+    // …with no real sentence boundary before it. A terminal mark on the previous token means this
+    // capital is a legitimate new sentence, not a splice seam.
+    const prev = tokens[i - 1] ?? "";
+    if (TERMINAL_PUNCTUATION.test(prev)) continue;
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Is this token SENTENCE CASE — first letter uppercase, every other letter lowercase? Surrounding
+ * punctuation is ignored; only the letter run is judged. `"But"` and `"So"` are; `"AND"`, `"OR"`,
+ * `"iOS"` and `"button"` are not. Used by {@link hasInteriorSplice} to tell a sentence seam apart
+ * from an all-caps emphasis/operator word.
+ */
+function isSentenceCase(token: string): boolean {
+  const letters = token.replace(/[^\p{L}]/gu, "");
+  if (letters.length === 0) return false;
+  return /^\p{Lu}\p{Ll}*$/u.test(letters);
+}
+
+/**
+ * Does this text stop MID-CLAUSE — a dangling function word, a comma, OR splice two utterances?
  *
  * The strongest "do not send" signal available without a model, and the exact check
  * {@link confidence} makes below for its `verylow` tier. Exported so the rule lives in ONE place,
@@ -205,6 +272,14 @@ function words(transcript: string): string[] {
  * NOT a claim about the SPEAKER, only about the TEXT — same posture as `endsMidThought`. A tail
  * like `and` reads as unfinished whether a transcriber cut it, a countdown fired early, or the
  * writer changed their mind. Every caller is asking whether MORE was coming.
+ *
+ * It also folds in {@link hasInteriorSplice} — two utterances concatenated into one. That is not a
+ * dangling TAIL, but it is the same underlying question every caller here asks ("is this one whole
+ * finished thought?"), and routing it through THIS predicate is deliberate: the dispatch guard in
+ * `engine/conciergeAutoDispatch` calls `endsMidClause` to refuse research on a fragment, and a
+ * splice must be refused too — a research child dispatched on two spliced enquiries reads NOTES.md
+ * and the backlog hunting for an antecedent to a question the other half of the message answered.
+ * One predicate, so `confidence`'s `verylow` and the dispatch guard's `fragment` stay in lockstep.
  */
 export function endsMidClause(text: string): boolean {
   const trimmed = text.trim();
@@ -212,6 +287,9 @@ export function endsMidClause(text: string): boolean {
   // RAW TEXT FIRST — see MID_CLAUSE_PUNCTUATION on why tokenising before this check is what made
   // the trailing comma unreachable for as long as it was.
   if (MID_CLAUSE_PUNCTUATION.test(trimmed)) return true;
+  // An interior splice seam is also read from the raw text — the capitalisation and the ABSENCE of
+  // punctuation before it are exactly what `bareWord` would throw away.
+  if (hasInteriorSplice(trimmed)) return true;
   const w = words(trimmed);
   const last = w[w.length - 1] ?? "";
   return TRAILING_CONJUNCTIONS.has(last);
@@ -260,14 +338,17 @@ export function confidence(transcript: string): Confidence {
   const hasTerminal = TERMINAL_PUNCTUATION.test(trimmed);
   const endsWithQuestionMark = /[?？]$/.test(trimmed);
 
-  // ── verylow — the speaker is demonstrably mid-clause ────────────────────────────────────────
+  // ── verylow — the speaker is demonstrably mid-clause, or two utterances are spliced ──────────
   // A dangling conjunction/preposition/auxiliary — or a trailing comma — beats everything,
   // INCLUDING a terminal mark:
   // "let's deploy it, and." is punctuation landing on an unfinished clause, which is a transcription
   // artefact rather than a finished thought.
   // Delegated to `endsMidClause` above — same condition, one definition, so the dispatch guard's
   // copy of this question cannot drift. It also folds in the TRAILING COMMA, which the tokenised
-  // `last` could never see: `bareWord` had already stripped it.
+  // `last` could never see (`bareWord` had already stripped it), AND an INTERIOR SPLICE — two
+  // separately-finalised utterances concatenated — whose tail looks complete but which is not one
+  // whole thought (see `hasInteriorSplice`). This beats the `hasTerminal → high` rule below, which
+  // is the whole point: a splice ends on a clean full stop and would otherwise score `high`.
   if (endsMidClause(trimmed)) return "verylow";
 
   // An UNCLOSED QUESTION — it opened like a question and never got its mark. Only when nothing else

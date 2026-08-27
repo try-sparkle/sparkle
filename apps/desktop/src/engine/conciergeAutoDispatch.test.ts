@@ -611,6 +611,22 @@ describe("fail-closed guards", () => {
     }
   });
 
+  it("refuses an INTERIOR SPLICE — two utterances concatenated, whose tail looks complete", () => {
+    // Bead sparkle-r3wl6f's splice comment: two separate dictation sessions run into one message
+    // (Sparkle work, then a rental-property enquiry). The tail is a clean full stop, so without the
+    // interior-splice check this scores `high` and a research child is spent hunting the backlog for
+    // an antecedent that lives in the OTHER utterance. Founder's verbatim example + a reproduction.
+    for (const text of [
+      "As a part of that work, feel free to also compress it so it has less information, not more But looking for something within 10/01/2026 move in dates, period, just wanna confirm that this property is not available then.",
+      "compress the file to less information not more But looking for a rental.",
+    ]) {
+      expect(decideAutoDispatch(obs({ waiting: [{ ...waiter("w1", OLD), text }] }))).toEqual({
+        action: "none",
+        reason: "fragment",
+      });
+    }
+  });
+
   it("reports `fragment` rather than `too-short` for a fragment that clears the length floor", () => {
     // THE TWO GUARDS ARE ON DIFFERENT AXES, and this pins that they are not collapsible. The first
     // string is 24 characters — it clears MIN_DISPATCHABLE_CHARS EXACTLY, so the length guard lets
@@ -636,6 +652,11 @@ describe("fail-closed guards", () => {
       "why is the DMG build red and what changed",
       "Look into the flaky test in worktree.rs",
       "Find out which PRs are blocked on checks right now.",
+      // A real full stop before "But" is a legitimate new sentence, NOT a splice seam — this must
+      // stay dispatchable, or the interior-splice check would refuse ordinary punctuated dictation.
+      "Check whether the build is green. But first confirm the runners are online.",
+      // ALL-CAPS boolean/query operator, not a sentence seam — must NOT be refused as a splice.
+      "Show me the PRs that are green AND unmerged.",
     ]) {
       expect(
         decideAutoDispatch(obs({ waiting: [{ ...waiter("w1", OLD), text }] })).action,

@@ -7,6 +7,7 @@ import {
   type Confidence,
   endsMidThought,
   endsMidClause,
+  hasInteriorSplice,
 } from "./confidence";
 
 /**
@@ -42,6 +43,12 @@ const CASES: Array<{ signal: string; transcript: string; tier: Confidence }> = [
   { signal: "trailing auxiliary", transcript: "the build is", tier: "verylow" },
   { signal: "unclosed question (opener, no mark)", transcript: "how do I roll this back", tier: "verylow" },
   { signal: "unclosed question, short", transcript: "what happened", tier: "verylow" },
+  // Interior splice — two utterances concatenated. The TAIL looks complete (ends on a full stop),
+  // so without the interior-splice check these would score `high`; they must not. Founder's verbatim
+  // example from bead sparkle-r3wl6f's splice comment, plus a minimal reproduction.
+  { signal: "interior splice — founder's verbatim two-utterance concat", transcript: "As a part of that work, feel free to also compress it so it has less information, not more But looking for something within 10/01/2026 move in dates, period, just wanna confirm that this property is not available then.", tier: "verylow" },
+  { signal: "interior splice — capitalised 'But', no stop before it", transcript: "compress the file to less information not more But looking for a rental.", tier: "verylow" },
+  { signal: "interior splice — capitalised 'So' seam", transcript: "the build is finally green So can you confirm the property is available.", tier: "verylow" },
   { signal: "nothing said yet", transcript: "", tier: "verylow" },
   { signal: "whitespace only", transcript: "   \n  ", tier: "verylow" },
 ];
@@ -241,6 +248,11 @@ describe("endsMidClause — the shared 'is this cut off' predicate", () => {
     "here's the problem:",
     "two things —",
     "and I was thinking...",
+    // Interior splices — the tail is a clean full stop, but a capitalised coordinating conjunction
+    // sits mid-text with no sentence boundary before it. Verbatim founder example + reproductions.
+    "As a part of that work, feel free to also compress it so it has less information, not more But looking for something within 10/01/2026 move in dates, period, just wanna confirm that this property is not available then.",
+    "compress the file to less information not more But looking for a rental.",
+    "the build is finally green So can you confirm the property is available.",
   ];
   for (const text of CUT_OFF) {
     it(`reads as cut off: ${JSON.stringify(text)}`, () => {
@@ -263,6 +275,13 @@ describe("endsMidClause — the shared 'is this cut off' predicate", () => {
     "Add a login button.",
     "ship it",
     "Look into the flaky test in worktree.rs",
+    // The false positive the interior-splice check MUST avoid: a real full stop before the capital
+    // makes "But" a legitimate new sentence, not a splice seam. One continuous, punctuated dictation.
+    "Compress the file to less information not more. But keep the examples.",
+    "The build is finally green. So can you confirm the property is available?",
+    // A message that merely OPENS with a coordinating conjunction is informal, not a splice — the
+    // scan starts at index 1, so the leading "But" is exempt.
+    "But we still need to fix the header.",
   ];
   for (const text of WHOLE) {
     it(`does NOT read as cut off: ${JSON.stringify(text)}`, () => {
@@ -274,5 +293,50 @@ describe("endsMidClause — the shared 'is this cut off' predicate", () => {
     expect(endsMidClause("")).toBe(false);
     expect(endsMidClause("   ")).toBe(false);
     expect(endsMidClause("  fix the header and \t")).toBe(true);
+  });
+});
+
+describe("hasInteriorSplice — two utterances concatenated into one", () => {
+  // The seam is a capitalised coordinating conjunction with NO terminal punctuation before it —
+  // `smart_format` capitalises a new sentence only when it also punctuated the previous one, so a
+  // lone capital `But`/`So`/`And` mid-text is where a second finalised utterance was appended.
+  const SPLICES = [
+    "compress it so it has less information, not more But looking for a rental.",
+    "the build is finally green So can you confirm the property is available.",
+    "run the tests And also check the migration files apply.",
+    // Founder's verbatim two-utterance concatenation (bead sparkle-r3wl6f splice comment).
+    "As a part of that work, feel free to also compress it so it has less information, not more But looking for something within 10/01/2026 move in dates, period, just wanna confirm that this property is not available then.",
+  ];
+  for (const text of SPLICES) {
+    it(`detects the splice: ${JSON.stringify(text)}`, () => {
+      expect(hasInteriorSplice(text)).toBe(true);
+    });
+  }
+
+  // The load-bearing NON-splices: a real sentence boundary before the capital, a leading
+  // conjunction, and a lowercase conjunction mid-sentence (ordinary connective, not a seam).
+  const NOT_SPLICES = [
+    "compress it to less information not more. But keep the examples.", // full stop → new sentence
+    "ship it! But first run the tests.", // exclamation is terminal too
+    "is it done? Or should I wait?", // question mark is terminal too
+    "But we still need to fix the header.", // opens with a conjunction — index-0 exempt
+    "run the tests and also push the branch to origin.", // lowercase 'and' — not a seam
+    "add a login button.", // no interior conjunction at all
+    "So we should ship it.", // opens with 'So' — index-0 exempt
+    // ALL-CAPS coordinating words are emphasis or boolean/query operators, NOT sentence seams —
+    // `smart_format` capitalises only the first letter at a real boundary. These must stay whole.
+    "show me the PRs that are green AND unmerged.",
+    "filter the board by open OR ready.",
+    "make it faster AND cheaper.",
+  ];
+  for (const text of NOT_SPLICES) {
+    it(`is NOT a splice: ${JSON.stringify(text)}`, () => {
+      expect(hasInteriorSplice(text)).toBe(false);
+    });
+  }
+
+  it("is empty-safe", () => {
+    expect(hasInteriorSplice("")).toBe(false);
+    expect(hasInteriorSplice("   ")).toBe(false);
   });
 });

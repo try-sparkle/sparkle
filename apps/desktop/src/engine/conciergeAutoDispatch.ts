@@ -480,6 +480,11 @@ function excludeReason(
   // The message still REACHES the concierge; only the research child is refused. A fragment the
   // founder wants answered is answered by the concierge asking him to finish it, which is a turn he
   // was going to spend anyway — not by a subprocess searching the repo for words he never said.
+  //
+  // `endsMidClause` also refuses an INTERIOR SPLICE — two separate dictation sessions concatenated,
+  // e.g. Sparkle work run into a rental-property enquiry (the bead's splice comment). That case is
+  // WORSE than a cut-off tail here: the tail looks complete, so without this the dispatcher would
+  // spend a research child hunting the backlog for an antecedent that lives in the OTHER utterance.
   if (endsMidClause(entry.text)) return "fragment";
   return null;
 }
