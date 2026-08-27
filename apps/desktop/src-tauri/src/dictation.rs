@@ -238,18 +238,45 @@ pub(crate) enum CaptureFate {
     /// The session generation rotated (a stop+start swapped in fresh Arcs), so this capture is stale
     /// against state nobody holds.
     Stale,
+    /// THE WINDOW LOST FOCUS WHILE THIS CAPTURE WAS STILL STARTING, and the mic is still ARMED.
+    ///
+    /// Nothing was held and nothing was lost: the user tabbed away, so `focused` went false while
+    /// `armed` stayed true, and the microphone is meant to be released until they tab back. The
+    /// capture is discarded exactly like the three above — but SILENTLY, because there is no
+    /// utterance to account for.
+    ///
+    /// ── WHY THIS IS A SEPARATE FATE AND NOT `MissedTheHold` ─────────────────────────────────
+    /// Both arrive here with `wants_capture == false` and an empty slot, so the three-term
+    /// classifier collapsed them — and that did not matter while the focus-GAIN build ran
+    /// synchronously on the AppKit main thread, because no blur could interleave with it at all.
+    /// Moving that build OFF the main thread is precisely what makes the interleaving reachable:
+    /// focus in, tab straight back out, and the ~216 ms build lands into a blurred session. Under
+    /// the three-term classifier that fires `MissedTheHold` — a WARN plus a
+    /// `dictation://capture-missed` banner reading "the microphone finished starting AFTER the hold
+    /// ended, so this utterance captured no audio at all" — over a user who never spoke and never
+    /// held anything. That is the same false-claim defect this classifier was written to delete,
+    /// pointing the other way, so the change that introduced the interleaving owes the distinction.
+    ///
+    /// The two are separable because `wants_capture` is `capture_should_be_live(armed, focused, …)`:
+    /// a hold that genuinely ended went through the stop path, which clears `armed`. So `armed`
+    /// still true with `wants_capture` false means the ONLY false term is `focused` — a blur, by
+    /// construction.
+    PausedByBlur,
 }
 
 /// Decide a freshly-built capture's fate. Pure, so the distinction that decides whether the user is
 /// TOLD they lost their words is unit-testable without CoreAudio, an `AppHandle` or a real device.
 ///
-/// Argument order mirrors the `still_current` expression it replaces, so the three terms stay
-/// readable against the original: does the session still want a capture, is the slot free, and is
-/// this capture's transcriber still the live generation.
+/// Argument order mirrors the `still_current` expression it replaces, so the first three terms
+/// stay readable against the original: does the session still want a capture, is the slot free, and
+/// is this capture's transcriber still the live generation. `still_armed` is the fourth, and it
+/// splits the one fate that SPEAKS TO THE USER — see [`CaptureFate::PausedByBlur`] for why that
+/// split is owed by the change that took the capture build off the main thread.
 pub(crate) fn classify_capture_fate(
     wants_capture: bool,
     slot_empty: bool,
     same_generation: bool,
+    still_armed: bool,
 ) -> CaptureFate {
     if wants_capture && slot_empty && same_generation {
         return CaptureFate::Install;
@@ -263,6 +290,12 @@ pub(crate) fn classify_capture_fate(
     }
     if !slot_empty {
         return CaptureFate::LostToASibling;
+    }
+    // STILL ARMED means the hold never ended, so the only false term is `focused` — a blur. The
+    // user is owed nothing, and telling them they lost an utterance they never spoke is the exact
+    // false claim the fates above exist to prevent. See `CaptureFate::PausedByBlur`.
+    if still_armed {
+        return CaptureFate::PausedByBlur;
     }
     CaptureFate::MissedTheHold
 }
@@ -2240,6 +2273,7 @@ impl DictationState {
                 capture_should_be_live(sess.armed, sess.focused, sess.capture_warm_now()),
                 sess.capture.is_none(),
                 sess.transcriber.as_ref().map(|t| Arc::ptr_eq(t, built_for)).unwrap_or(false),
+                sess.armed,
             );
             if fate == CaptureFate::Install {
                 sess.capture = Some(capture);
@@ -2311,6 +2345,16 @@ impl DictationState {
                     target: "dictation",
                     build_ms,
                     "discarding a capture whose session generation has already rotated"
+                ),
+                // SILENT BY DESIGN — info, no `dictation://capture-missed`. The window lost focus
+                // while this capture was still starting and the mic is still armed, so there is no
+                // utterance to account for and nothing the user needs told. Emitting the missed-hold
+                // banner here would claim they lost words they never spoke.
+                CaptureFate::PausedByBlur => tracing::info!(
+                    target: "dictation",
+                    build_ms,
+                    "discarding a capture that finished starting after the window lost focus; the \
+                     hold is still active, so nothing was captured and nothing was lost"
                 ),
                 // Unreachable: `Install` never produces a discard. Stated rather than omitted so a
                 // future relaxation cannot silently fall into the missed-hold report.

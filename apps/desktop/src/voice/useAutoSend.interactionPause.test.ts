@@ -61,6 +61,10 @@ function setup(overrides: Partial<Props> = {}) {
     composeInteraction: NO_COMPOSE_INTERACTION,
     interim: "",
     targetName: "Concierge",
+    // The window-focus guard added with the dictation-misroute fix reads this at
+    // the fire deadline; jsdom's document.hasFocus() is false, so without an
+    // explicit injection every auto-send in this file is held rather than fired.
+    isWindowActive: () => true,
     onFire,
     onAnnounce: vi.fn(),
   };

@@ -283,6 +283,29 @@ export interface UseAutoSendArgs {
    * mis-route safety net — is never announced at all.
    */
   onAnnounce?: (message: string) => void;
+  /**
+   * Is Sparkle the active OS window RIGHT NOW — re-checked live at the fire moment (bead
+   * sparkle-byvvn6).
+   *
+   * ── WHY A FIRE-TIME RE-CHECK, WHEN THE CAPTURE PATH ALREADY GATES ON FOCUS ────────────────────
+   * The countdown ARMS only while Sparkle is the focused window: `useDictation` gates both the
+   * committed-text insert and the `dictation://speech-end` that starts the clock on its own
+   * `isWindowActive()`. But `phase` is deliberately RETAINED "active" across a window blur (the
+   * cloud relay tears down, the phase does not), so a countdown already running keeps ticking after
+   * the user tabs to another app — and `micLive` stays true with it. Without this term the rail
+   * fires a dictated message into the concierge thread while the user has moved on and is now
+   * typing or dictating into a DIFFERENT app: words meant for somewhere else, auto-sent here. This
+   * is the mis-route in bead sparkle-byvvn6, seen live four times in a row.
+   *
+   * Checked LIVE rather than off `dictationStore.windowFocused` for the same reason the routing
+   * gate is: the store mirror exists to make the paused COPY reactive and can lag, whereas the
+   * fire decision must act on the authoritative, race-free signal. Same idiom and default as
+   * `useDictation`'s own `isWindowActive` (`document.hasFocus()`), so the two gates cannot drift.
+   *
+   * Optional with a REAL default — omitting it does not make the guard inert, it makes it use live
+   * focus, which is the production behaviour. The one caller relies on the default; tests inject.
+   */
+  isWindowActive?: () => boolean;
 }
 
 /** Builds the rail's model and drives the timer. */
@@ -299,6 +322,7 @@ export function useAutoSend({
   targetName,
   onFire,
   onAnnounce,
+  isWindowActive = () => typeof document === "undefined" || document.hasFocus(),
 }: UseAutoSendArgs): SendTrayModel {
   const [state, setState] = useState<AutoSendState>(initialState);
   // Repaint clock. Bumped by the tick so `remainingFraction` is recomputed as time passes — the
@@ -337,6 +361,10 @@ export function useAutoSend({
   onFireRef.current = onFire;
   const announceRef = useRef(onAnnounce);
   announceRef.current = onAnnounce;
+  // The fire moment re-reads focus through this, live — see `isWindowActive`'s doc. A ref for the
+  // same reason `onFire` is one: the tick runs on a plain setInterval outside React's render cycle.
+  const isWindowActiveRef = useRef(isWindowActive);
+  isWindowActiveRef.current = isWindowActive;
   const targetRef = useRef(targetName);
   targetRef.current = targetName;
   /**
@@ -678,6 +706,25 @@ export function useAutoSend({
       const decision = evaluate(s, now);
 
       if (decision.action === "fire") {
+        // ── FOCUS LEFT SPARKLE MID-COUNTDOWN: HOLD, NEVER SEND (bead sparkle-byvvn6) ─────────────
+        // The clock only ever ARMS while Sparkle is the focused window (useDictation gates the
+        // speech-end that starts it on `isWindowActive`), but `phase` is retained "active" across a
+        // blur, so a countdown already running keeps ticking after the user tabs away to another
+        // app. Firing then dispatches a dictated message into the concierge thread while the user is
+        // now talking or dictating INTO A DIFFERENT APP — the mis-route this bead exists to stop.
+        //
+        // So re-check focus at the deadline. If Sparkle is no longer the intended (focused) target,
+        // hold the words in the composer exactly as the auto-send-off branch below does: no
+        // `onFire`, no fired-seq flash, no tuning sample. The words are NOT lost — they wait in the
+        // box for the user to come back and send deliberately. No announcement, because the user is
+        // in another window; the column's `role="status"` region is speaking to nobody, and a
+        // "held" line there would be narrating to a surface that has no listener. `noteCountdownHeld`
+        // stops the clock while keeping the transcript, unlike the fire branch which clears it.
+        if (!isWindowActiveRef.current()) {
+          apply(noteCountdownHeld(s));
+          resetSample();
+          return;
+        }
         // ── AUTO-SEND OFF: THE COUNTDOWN RAN, THE UTTERANCE ENDED, NOTHING IS SENT ───────────────
         // Everything up to this line is identical to the auto-sending path — the clock started on
         // the speech-end, accumulated silence against a moving threshold, honoured the type-during-

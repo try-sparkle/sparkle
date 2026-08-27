@@ -3254,7 +3254,7 @@
         // investigations hunting a focus race". Only one of the three costs the user their words,
         // and only that one may raise a banner.
         assert_eq!(
-            classify_capture_fate(true, true, true),
+            classify_capture_fate(true, true, true, true),
             CaptureFate::Install,
             "wanted, slot free, same generation: install it"
         );
@@ -3262,32 +3262,72 @@
         // capture caught the words. Measured 12+ times on 2026-08-09 with capture_ms up to 2083ms
         // against ~345ms holds.
         assert_eq!(
-            classify_capture_fate(false, true, true),
+            classify_capture_fate(false, true, true, false),
             CaptureFate::MissedTheHold,
-            "nobody wants it and nothing else is live: this hold recorded NOTHING"
+            "not wanted, slot free, same generation, and DISARMED: this hold recorded NOTHING"
+        );
+        // THE SAME THREE TERMS, STILL ARMED — a blur, not a lost hold. This row is the whole point
+        // of the fourth term: before it, this input was indistinguishable from the row above and
+        // fired a "captured no audio at all" banner at a user who never spoke. It became reachable
+        // when the capture build moved OFF the AppKit main thread, so a blur can now interleave
+        // with a build that is still running.
+        assert_eq!(
+            classify_capture_fate(false, true, true, true),
+            CaptureFate::PausedByBlur,
+            "still armed means the hold never ended, so the only false term is focus: a blur"
         );
         // NOT user-visible: a sibling is already installed and routing, so the audio was captured.
         // Reporting this one would fire a "nothing was recorded" banner over a working dictation.
         assert_eq!(
-            classify_capture_fate(false, false, true),
+            classify_capture_fate(false, false, true, false),
             CaptureFate::LostToASibling,
             "a sibling holds the slot — the words were captured by it, nothing is owed"
         );
         assert_eq!(
-            classify_capture_fate(true, false, true),
+            classify_capture_fate(true, false, true, true),
             CaptureFate::LostToASibling,
             "still a sibling even when the session wants a capture"
         );
         // NOT user-visible either: these words belong to a session the user already left.
         assert_eq!(
-            classify_capture_fate(false, true, false),
+            classify_capture_fate(false, true, false, false),
             CaptureFate::Stale,
             "a rotated generation outranks everything — not this session's loss to report"
         );
         assert_eq!(
-            classify_capture_fate(true, true, false),
+            classify_capture_fate(true, true, false, true),
             CaptureFate::Stale,
             "wanting a capture does not make a stale one this session's"
+        );
+    }
+
+    #[test]
+    fn a_blur_during_an_off_main_thread_build_never_claims_the_user_lost_words() {
+        // THE REGRESSION THIS EXISTS TO PREVENT, stated as the sequence that produces it rather
+        // than as a truth table row, because the sequence is what became possible and the row is
+        // only how it shows up.
+        //
+        // Taking the CoreAudio capture build off the AppKit main thread removed a ~216 ms stall on
+        // every focus-regain — and in doing so made a blur able to interleave with a build that is
+        // still running. Focus in, tab straight back out, and the build lands into a session whose
+        // `focused` is false while `armed` is still true.
+        //
+        // `wants_capture` is `capture_should_be_live(armed, focused, ..)`, so it goes false on the
+        // blur alone. The slot is empty and the generation has not rotated, so the three-term
+        // classifier reached `MissedTheHold` and told a user who never spoke that this utterance
+        // "captured no audio at all".
+        assert_eq!(
+            classify_capture_fate(/* wants */ false, /* slot_empty */ true, /* same_gen */ true, /* armed */ true),
+            CaptureFate::PausedByBlur,
+            "a blur mid-build owes the user nothing — it must not report a lost hold"
+        );
+        // THE PAIRED DIRECTION, without which the assertion above is satisfied by a classifier that
+        // simply never reports anything. Same three terms, mic DISARMED: a hold genuinely ended
+        // before the mic came up, and that one IS the user's loss to hear about.
+        assert_eq!(
+            classify_capture_fate(false, true, true, false),
+            CaptureFate::MissedTheHold,
+            "a disarmed session with an empty slot is a hold that really did record nothing"
         );
     }
 
@@ -3302,18 +3342,25 @@
         for wants in [true, false] {
             for slot_empty in [true, false] {
                 for same_gen in [true, false] {
-                    if classify_capture_fate(wants, slot_empty, same_gen)
-                        == CaptureFate::MissedTheHold
-                    {
-                        reported.push((wants, slot_empty, same_gen));
+                    for armed in [true, false] {
+                        if classify_capture_fate(wants, slot_empty, same_gen, armed)
+                            == CaptureFate::MissedTheHold
+                        {
+                            reported.push((wants, slot_empty, same_gen, armed));
+                        }
                     }
                 }
             }
         }
+        // STILL EXACTLY ONE, and the fourth term is what narrowed it. Before `still_armed` this
+        // read `(false, true, true)` and matched BOTH a genuinely lost hold and a blur; the blur
+        // half is now `PausedByBlur` and says nothing to the user. If this ever grows a second row
+        // again, a banner claiming lost words is firing over a case that lost none.
         assert_eq!(
             reported,
-            vec![(false, true, true)],
-            "exactly one input may report a lost hold: not wanted, slot empty, same generation"
+            vec![(false, true, true, false)],
+            "exactly one input may report a lost hold: not wanted, slot empty, same generation, \
+             and DISARMED — an armed one is a blur"
         );
     }
 

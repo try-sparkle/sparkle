@@ -66,6 +66,10 @@ function setup(overrides: Partial<Props> = {}) {
     targetName: "Concierge",
     onFire,
     onAnnounce,
+    // Sparkle IS the focused OS window — the ordinary case every pre-existing row below assumes, and
+    // pinned here rather than left to the live `document.hasFocus()` default so the suite does not
+    // ride on jsdom's focus behaviour. The focus-loss rows override this explicitly.
+    isWindowActive: () => true,
   };
   const props = { ...base, ...overrides };
   const view = renderHook((p: Props) => useAutoSend(p), { initialProps: props });
@@ -828,6 +832,77 @@ describe("auto-send OFF holds the message instead of sending it", () => {
     await tick(HIGH + AUTO_SEND_TICK_MS);
     expect(onFire).toHaveBeenCalledTimes(1);
     expect(onAnnounce.mock.calls.map(([l]) => String(l)).some((l) => /\bSent\b/.test(l))).toBe(true);
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// FOCUS LEFT SPARKLE MID-COUNTDOWN — bead sparkle-byvvn6.
+//
+// The mis-route: dictation the user aimed at ANOTHER app (a Maps command, half a phone call) landed
+// auto-sent in the concierge thread. The clock ARMS only while Sparkle is the focused window
+// (useDictation gates the speech-end on `isWindowActive`), but `phase` is retained "active" across a
+// blur, so a countdown already running keeps ticking after the user tabs away — and there was no
+// second focus check at the deadline. This block pins that a countdown which reaches its deadline
+// while Sparkle is NOT the focused window holds the words instead of dispatching them.
+//
+// Every row asserts the same PAIR the auto-send-OFF block does, and for the same reason: the
+// countdown BEHAVED (it armed and ran, `phase === "counting"`), AND nothing was sent. Asserting only
+// the second half would pass just as happily against `micLive: false` or `armed: false` — the wrong
+// fix wearing the right result. The discriminator is that the clock demonstrably ran first, and
+// (in the KEEPS-THE-WORDS row) that the very same draft fires once focus returns.
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+describe("focus leaving Sparkle mid-countdown HOLDS the message instead of misrouting it (sparkle-byvvn6)", () => {
+  it("does NOT send when the window lost focus before the deadline — the countdown ran, the send did not", async () => {
+    const { onFire, update, result } = setup();
+    speechEnds();
+    // THE CLOCK ARMED AND IS RUNNING — this is the half that `micLive: false` / `armed: false` would
+    // fail, and it is asserted first so the withheld send below is attributable to the focus check
+    // and nothing else.
+    expect(result.current.phase).toBe("counting");
+
+    // The user tabs to another app while the fill is draining — exactly the driving-and-talking
+    // scenario in the bead. `isWindowActive` is read LIVE at the deadline, so this takes effect.
+    update({ isWindowActive: () => false });
+    await tick(HIGH + AUTO_SEND_TICK_MS);
+
+    // NOTHING WENT OUT, and the clock ended cleanly (held, ready for the next utterance).
+    expect(onFire).not.toHaveBeenCalled();
+    expect(result.current.phase).toBe("listening");
+  });
+
+  it("never announces a send while blurred — no phantom 'Sent' into a window nobody is looking at", async () => {
+    const { onAnnounce, update } = setup();
+    speechEnds();
+    update({ isWindowActive: () => false });
+    await tick(HIGH + AUTO_SEND_TICK_MS);
+    const said = onAnnounce.mock.calls.map(([line]) => String(line));
+    expect(said.some((l) => /\bSent\b/.test(l))).toBe(false);
+  });
+
+  it("KEEPS THE WORDS — refocus, speak again, and the SAME draft fires (not an emptied box)", async () => {
+    // The held branch must preserve the transcript, exactly as auto-send-off does: the words were
+    // never sent, so clearing them would strand the reducer out of sync with the textarea. Proven
+    // end-to-end — refocus, a fresh speech-end over the still-present draft, and it fires.
+    const { onFire, update, result } = setup();
+    speechEnds();
+    update({ isWindowActive: () => false });
+    await tick(HIGH + AUTO_SEND_TICK_MS);
+    expect(onFire).not.toHaveBeenCalled();
+
+    update({ isWindowActive: () => true }); // the user comes back to Sparkle
+    speechEnds(); // and speaks again over the still-present draft
+    expect(result.current.phase).toBe("counting");
+    await tick(HIGH + AUTO_SEND_TICK_MS);
+    expect(onFire).toHaveBeenCalledTimes(1);
+  });
+
+  it("focused throughout STILL fires — the hands-free flow is untouched (control)", async () => {
+    // The control row: the guard must cost the ordinary on-Sparkle case nothing. Everything above
+    // must be attributable to focus loss and not to the guard being present at all.
+    const { onFire } = setup({ isWindowActive: () => true });
+    speechEnds();
+    await tick(HIGH + AUTO_SEND_TICK_MS);
+    expect(onFire).toHaveBeenCalledTimes(1);
   });
 });
 
