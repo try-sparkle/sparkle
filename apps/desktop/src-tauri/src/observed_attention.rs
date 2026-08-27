@@ -1216,16 +1216,118 @@ mod tests {
     /// `Claude is using your computer · press Esc to stop` (49 chars) and pronounced the bound safe,
     /// while `capturedScreens.fixture.ts` opened its catalogue with a 74-character bar that the
     /// bound REJECTED. A test that picks its own witness cannot falsify the claim it is guarding.
+    /// Every entry of `NON_PICKER_HINT_LINES_2_1_220`, READ OUT OF `capturedScreens.fixture.ts`.
+    ///
+    /// ⚠️ READ, NEVER TRANSCRIBED (bead sparkle-lmpbuj). The previous version of the test below
+    /// pasted the longest bar into this file and asserted its length was 74 — a SECOND hand-copy of
+    /// the very number whose first hand-copy shipped the defect. A literal here cannot notice that
+    /// the fixture moved, which is the whole failure being closed. Same `CARGO_MANIFEST_DIR`
+    /// technique `the_chrome_bar_catalogue_has_not_drifted_from_typescript` already uses.
+    ///
+    /// Strict by construction: it PANICS on any entry it cannot read verbatim rather than skipping
+    /// it, because a reader that silently dropped an entry would drop exactly the over-long sample
+    /// this guard exists to catch and then report a clean bill of health.
+    fn captured_hint_lines() -> Vec<String> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("src")
+            .join("engine")
+            .join("capturedScreens.fixture.ts");
+        let ts = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        const MARKER: &str = "export const NON_PICKER_HINT_LINES_2_1_220 = [";
+        let start = ts
+            .find(MARKER)
+            .unwrap_or_else(|| panic!("{MARKER} not found in {}", path.display()));
+        let body = &ts[start + MARKER.len()..];
+        let end = body
+            .find("\n];")
+            .unwrap_or_else(|| panic!("unterminated NON_PICKER_HINT_LINES_2_1_220 in {}", path.display()));
+        let mut out = Vec::new();
+        for raw in body[..end].lines() {
+            let t = raw.trim();
+            if t.is_empty() || t.starts_with("//") || t.starts_with('*') {
+                continue;
+            }
+            let inner = t
+                .strip_prefix('"')
+                .and_then(|rest| rest.strip_suffix("\","))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "cannot read this fixture entry verbatim: {t}\n\
+                         captured_hint_lines() reads plain double-quoted entries. Teach it the new \
+                         shape — do NOT let it skip an entry, which is how the long sample hides."
+                    )
+                });
+            assert!(
+                !inner.contains('\\'),
+                "fixture entry carries an escape this reader does not decode: {inner}"
+            );
+            out.push(inner.to_string());
+        }
+        assert!(
+            out.len() >= 5,
+            "read only {} entries from NON_PICKER_HINT_LINES_2_1_220 — the reader has drifted",
+            out.len()
+        );
+        out
+    }
+
+    /// Keeps the bar filter honest, so the maximum above cannot quietly become a maximum over
+    /// everything. If `chrome_bar_opens` ever degraded into an all-pass, this list's prose would
+    /// enter that maximum and demand a bound no real bar has ever needed.
+    #[test]
+    fn captured_prose_outruns_the_bound_and_is_not_matched_as_a_bar() {
+        let captured = captured_hint_lines();
+        let prose: Vec<&str> = captured
+            .iter()
+            .map(|l| l.trim())
+            .filter(|l| !chrome_bar_opens().is_match(l))
+            .collect();
+        assert!(!prose.is_empty(), "the bar filter matched EVERY captured line — it is an all-pass");
+        let longest_prose = prose.iter().map(|l| l.chars().count()).max().expect("non-empty");
+        assert!(
+            longest_prose > MAX_BAR_CHARS,
+            "no captured non-bar exceeds MAX_BAR_CHARS, so nothing here still demonstrates why the \
+             maximum must be taken over BARS rather than over lines (longest prose: {longest_prose})"
+        );
+    }
+
     #[test]
     fn the_bound_admits_the_longest_captured_bar_and_is_not_unbounded() {
-        // The real maximum, verbatim from NON_PICKER_HINT_LINES_2_1_220[0].
-        let longest = "▶▶ bypass permissions on (shift+tab to cycle) · PR #730 · esc to interrupt";
-        assert_eq!(longest.chars().count(), 74, "the captured maximum moved; re-measure the bound");
+        // ⚠️ MAX OVER *BARS*, NOT OVER LINES. Most of this list is ambient hint prose the bound
+        // never applies to, and the longest LINE in it is longer than every bar in it — so a
+        // maximum taken over lines yields a number no real bar needs. The filter is
+        // `chrome_bar_opens` alone, which is LENGTH-FREE on purpose: a classifier that consulted
+        // the bound would file an over-long bar as "not a bar", drop it out of the maximum, and go
+        // green on the one input that must red it.
+        let captured = captured_hint_lines();
+        let bars: Vec<&str> = captured
+            .iter()
+            .map(|l| l.trim())
+            .filter(|l| chrome_bar_opens().is_match(l))
+            .collect();
         assert!(
-            longest.chars().count() <= MAX_BAR_CHARS,
-            "the longest captured bar ({} chars) no longer fits MAX_BAR_CHARS ({})",
-            longest.chars().count(),
-            MAX_BAR_CHARS
+            bars.len() >= 3,
+            "only {} captured bars left to measure — this guard is going vacuous",
+            bars.len()
+        );
+        let longest = bars
+            .iter()
+            .copied()
+            .max_by_key(|l| l.chars().count())
+            .expect("bars is non-empty");
+        let measured = longest.chars().count();
+        assert!(
+            measured <= MAX_BAR_CHARS,
+            "the longest captured bar ({measured} chars) no longer fits MAX_BAR_CHARS \
+             ({MAX_BAR_CHARS}): {longest}"
+        );
+        // A CEILING, NEVER AN EQUALITY. A live bar carries a PR number and a branch name, both of
+        // which grow; being UNDER the bound is a false negative that takes a live row gray.
+        assert!(
+            MAX_BAR_CHARS > measured,
+            "MAX_BAR_CHARS ({MAX_BAR_CHARS}) has no headroom over the captured maximum ({measured})"
         );
         assert!(chrome_bar_tail_below(&["x", longest], 0));
         // TWO of them, which MAX_NARROW_CHROME_ROWS's own comment says is the real shape.
