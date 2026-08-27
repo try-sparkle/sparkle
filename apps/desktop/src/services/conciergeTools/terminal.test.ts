@@ -92,7 +92,11 @@ const REAL_SCREEN =
   await vi.importActual<typeof import("../../engine/claudeCodeScreen")>(
     "../../engine/claudeCodeScreen",
   );
-import type { PickerOptionsRead } from "./terminal";
+// The TYPE comes from where it is DECLARED, not from terminal.ts's re-export. Production reaches
+// the read the same way (suggestions/conciergeHandoff imports it from ../pickerRead), so importing
+// it through terminal.ts made this test the only importer of that name on that module — which is
+// precisely what the dormant-export guard reports, and it reported it on main.
+import type { PickerOptionsRead } from "../pickerRead";
 import {
   CONTROL_KEYS,
   CONTROL_KEY_NAMES,
