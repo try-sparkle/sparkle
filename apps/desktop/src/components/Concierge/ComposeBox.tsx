@@ -1484,6 +1484,21 @@ export function ComposeBox({
   // The thread node currently under observation. Tracked so `measure` re-observes only when the
   // node IDENTITY changes (ConciergeThread remounting), never on every callback.
   const observedThread = useRef<HTMLElement | null>(null);
+  // FAST-PATH CACHE for the height layout effect below. That effect forces a synchronous layout
+  // reflow — collapse the textarea to `height:auto`, read `scrollHeight`, restore — on EVERY
+  // keystroke, and its cost scales with the draft and the depth of the concierge flex tree: a
+  // measured renderer wedge (bead sparkle-vkdca, the keystroke/offsetWidth path). We cache the last
+  // full measurement's content height alongside every NON-TEXT input to the height math, so the
+  // effect can prove the height cannot have moved and skip the reflow. Mirrors the proven composer
+  // guard (Composer.tsx, commit 4861b77b9). Written and read only while NOT dictating — a
+  // provisional phrase re-measures the mirror and re-pins the scroll, neither keyed on the
+  // textarea's own scrollHeight, so those frames always take the full path.
+  const measureCacheRef = useRef<{
+    contentH: number;
+    textLen: number;
+    newlines: number;
+    deps: readonly unknown[];
+  } | null>(null);
   const [availableH, setAvailableH] = useState(() =>
     typeof window === "undefined" ? 800 : window.innerHeight,
   );
@@ -1548,6 +1563,46 @@ export function ComposeBox({
   useLayoutEffect(() => {
     const ta = textareaRef.current;
     if (!ta) return;
+
+    // Every NON-TEXT input the measurement below depends on, compared by identity. When only the
+    // typed `text` changed, all of these are Object.is-equal to the last full measurement.
+    const nonTextDeps = [
+      columnWidth,
+      interimH,
+      showRichPlaceholder,
+      micPresentation,
+      errorNotice,
+      modelProgress,
+      captionKind,
+    ] as const;
+    const textLen = ta.value.length;
+    // Newline count is the shrink guard's second axis: a naked `scrollHeight` cannot see the box
+    // getting SHORTER (it clamps up to the set height), so we only skip the reflow when the text
+    // can't have gotten shorter — neither its length nor its line count dropped since the last full
+    // measurement. Deleting text falls through to the full un-collapse measurement, which shrinks
+    // the box correctly (covered by "shrinks back when content is deleted").
+    let newlines = 0;
+    for (let i = 0; i < textLen; i++) if (ta.value.charCodeAt(i) === 10) newlines++;
+    const cached = measureCacheRef.current;
+    // FAST PATH: nothing that could move the height changed. `!interim` keeps every dictation frame
+    // on the full path (the mirror re-measure and the scroll pin below are not keyed on the
+    // textarea's own scrollHeight and must still run). A single naked `scrollHeight` read — no
+    // collapse, so no reflow forced — equal to the cached content height proves the box is still
+    // hugging the same content, so `setContentH`/`setPlaceholderH` would only re-set their current
+    // values (they already bail on identity). When the box is dragged taller than its content the
+    // naked read is clamped up and won't match, so it correctly falls through to a full measurement.
+    if (
+      !interim &&
+      cached &&
+      cached.deps.length === nonTextDeps.length &&
+      cached.deps.every((v, i) => Object.is(v, nonTextDeps[i])) &&
+      textLen >= cached.textLen &&
+      newlines >= cached.newlines &&
+      ta.scrollHeight === cached.contentH
+    ) {
+      return;
+    }
+
     const prev = ta.style.height;
     const prevPad = ta.style.paddingBottom;
     ta.style.height = "auto";
@@ -1689,6 +1744,14 @@ export function ComposeBox({
       }
     }
     setPlaceholderH((cur) => (cur === overlayH ? cur : overlayH));
+
+    // Record this full measurement so the next keystroke can prove the height is unchanged and skip
+    // the reflow above. Only while NOT dictating — a provisional-phrase frame measures the mirror
+    // and pins the scroll, work the naked-scrollHeight guard cannot stand in for, so it must never
+    // short-circuit near a dictation transition. `next` is the collapsed content height read above.
+    measureCacheRef.current = interim
+      ? null
+      : { contentH: next, textLen, newlines, deps: nonTextDeps };
     // `interim` IS a dependency — of the MIRROR measurement above, never of this floor: the mirror
     // is skipped by the walk and always will be. Every Deepgram partial re-runs this effect, which
     // is the price of the box fitting the words as they arrive, exactly as typing them would.
