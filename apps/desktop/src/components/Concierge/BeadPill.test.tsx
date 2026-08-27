@@ -682,7 +682,7 @@ describe("BeadPill — a bead in a project the founder is not looking at", () =>
 
 // ── 5. BOARD VIEW ───────────────────────────────────────────────────────────────────────────────
 
-describe("BeadPill — Board view", () => {
+describe("BeadPill — Board", () => {
   it("is absent when the surface has no board to open, and the card still opens", () => {
     mountMarkdown(ctx([T6], { onViewOnBoard: undefined }), "see sparkle-t6wje");
     fireEvent.click(pills()[0]!);
@@ -747,7 +747,7 @@ describe("BeadPill — Board view", () => {
     fireEvent.click(pills()[0]!);
     // THE PILL-SIDE `Board` LINK — the card's ONE board control since the founder moved both
     // destinations up beside the epic pill (bead sparkle-42onk2). This row mounts the REAL
-    // `BeadPillHost`, which supplies both, so the row reads `Column | Board view`; the rows above
+    // `BeadPillHost`, which supplies both, so the row reads `Column | Board`; the rows above
     // mount a context with no column destination and reach the same testid, because the fallback is
     // now the same control with one fewer sibling rather than a different control in the corner.
     fireEvent.click(screen.getByTestId("concierge-bead-card-open-on-board"));

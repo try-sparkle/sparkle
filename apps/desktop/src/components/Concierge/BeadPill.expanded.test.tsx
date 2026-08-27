@@ -511,13 +511,13 @@ describe("the two lineage rows, resolved from the live stores", () => {
     expect(onViewOnBoard).not.toHaveBeenCalled();
   });
 
-  // ══ AND THE CARD'S OWN `Board view` LINK STILL GOES TO THE BOARD ══════════════════════════════
+  // ══ AND THE CARD'S OWN `Board` LINK STILL GOES TO THE BOARD ══════════════════════════════
   // The pair that makes the row above safe. Asked whether the concierge should keep any route from
   // a task to its board card, the founder chose to let the pill always open the Epics column
   // BECAUSE this link still exists — so "the pill went to the column" is only half the contract,
   // and a rewiring that took both would have satisfied the row above while removing the escape
   // hatch his answer depends on. They are separate handlers now precisely so this can be asserted.
-  it("keeps this card's own Board view link on the board", () => {
+  it("keeps this card's own Board link on the board", () => {
     const onViewInColumn = vi.fn(() => true);
     const onViewOnBoard = vi.fn(() => true);
     seedStores([EPIC, KID_A, KID_B]);

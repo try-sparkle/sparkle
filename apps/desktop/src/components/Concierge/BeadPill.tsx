@@ -766,7 +766,7 @@ export function BeadPill({ beadId }: { beadId: string }) {
   // name the wrong bead the moment a child failed to open.
   //
   // AND SO IS `where`, FOR THE SAME CLASS OF REASON. There are now TWO destinations reachable from
-  // one card: the card's own `Board view` link still goes to the Plan board, while a `Tasks:` pill
+  // one card: the card's own `Board` link still goes to the Plan board, while a `Tasks:` pill
   // goes to the Epics column (`sparkle-huw924.12`). A single sentence can no longer describe both
   // misses truthfully, so the miss records which surface was actually attempted and the sentence is
   // chosen from it. Without this the column path would report "not on an open board" — a sentence
@@ -1003,12 +1003,12 @@ export function BeadPill({ beadId }: { beadId: string }) {
                   );
                 }
           }
-          // ══ THE CARD'S OWN `Board view` LINK KEEPS THE BOARD — THAT IS THE WHOLE ESCAPE HATCH ═
+          // ══ THE CARD'S OWN `Board` LINK KEEPS THE BOARD — THAT IS THE WHOLE ESCAPE HATCH ═
           // Split out of `onOpenBead` above, which used to serve BOTH (the file called it "ONE
           // OPENER, TWO CALLERS"). Rewiring that shared handler wholesale would have taken the
           // board away from this link too — and asked directly whether the concierge should keep a
           // route to a task's board card, the founder chose to let the pill always open the Epics
-          // column *because* the card's own `Board view` link still goes to the board. That answer
+          // column *because* the card's own `Board` link still goes to the board. That answer
           // is only true if these two are separate handlers, so they are.
           onViewOnBoardSelf={
             onViewOnBoard === undefined
@@ -1105,13 +1105,13 @@ function ConciergeBeadCard({
    * Open ANOTHER bead — a `Tasks:` pill's target, or the parent-epic chip's — in the EPICS COLUMN.
    *
    * ══ IT IS NOT THIS CARD'S OWN DESTINATION ═══════════════════════════════════════════════════
-   * This used to serve the card's own `Board view` link as well, and the two have been split
+   * This used to serve the card's own `Board` link as well, and the two have been split
    * ({@link onViewOnBoardSelf}). They point at different surfaces now, so one callback could not
    * honestly do both: `sparkle-huw924.12` sends a task pill to the Epics column while the card's
    * own link still goes to the Plan board.
    */
   onOpenBead?: (beadId: string) => void;
-  /** THIS card's own `Board view` link. Separate from {@link onOpenBead} because the two
+  /** THIS card's own `Board` link. Separate from {@link onOpenBead} because the two
    *  destinations diverged — see that field. Absence means this surface has no board to offer, the
    *  same callback-is-the-switch rule every other affordance here follows. */
   onViewOnBoardSelf?: () => void;
@@ -1257,7 +1257,7 @@ function ConciergeBeadCard({
       // board" for every target this card could name. `sparkle-huw924.12` pointed the lineage
       // targets at the Epics column, and this link stayed on the board — so the two stopped being
       // the same handoff and stopped sharing a callback. Reusing `onOpenBead` here now would send
-      // the card's own `Board view` link to the COLUMN, silently removing the board escape hatch
+      // the card's own `Board` link to the COLUMN, silently removing the board escape hatch
       // the founder's answer explicitly relies on.
       onViewOnBoard={onViewOnBoardSelf}
       // ══ NO CLOSE AFFORDANCE ON A COLLAPSED CARD (roborev job 68044) ══════════════════════════
