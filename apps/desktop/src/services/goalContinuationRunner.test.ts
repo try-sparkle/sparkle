@@ -388,7 +388,14 @@ describe("escalation", () => {
     expect(notice).toMatchObject({ projectId, agentId });
     expect(notice.title).toContain(agentName);
     expect(notice.body).toContain("land the PR");
-    expect(notice.body).toContain("no sign of progress");
+    // WHICH WORDING, AND WHY IT IS THE BLIND ONE (bead `sparkle-gazo4a`). This seed supplies no
+    // fleet digest, no branch status and no PR reading, so the mark's three WORK-EVIDENCE columns
+    // are all empty and `goalContinuation.workEvidenceReadable` reports the streak as unobserved.
+    // The escalation still FIRES — which is this test's actual claim, asserted on either side of
+    // this line — but it may not say "no sign of progress", because that is a finding about the
+    // agent and nothing was read. A seed that supplied any one reading gets the ordinary sentence;
+    // `engine/goalContinuation.falseAbsence.test.ts` pins both directions.
+    expect(notice.body).toContain("whether it advanced is unknown, not settled");
 
     // And it is recorded on the goal, which is what stops the retrying.
     const goal = goalOf(projectId, agentId)!;
@@ -937,7 +944,14 @@ describe("evidence the sweep must actually gather", () => {
     await settleThenSweep();
 
     expect(notifyMock).toHaveBeenCalledTimes(1);
-    expect(notifyMock.mock.calls[0]![0].body).toContain("no sign of progress");
+    // WHICH WORDING, AND WHY IT IS THE BLIND ONE (bead `sparkle-gazo4a`). This seed supplies no
+    // fleet digest, no branch status and no PR reading, so the mark's three WORK-EVIDENCE columns
+    // are all empty and `goalContinuation.workEvidenceReadable` reports the streak as unobserved.
+    // The escalation still FIRES — which is this test's actual claim, asserted on either side of
+    // this line — but it may not say "no sign of progress", because that is a finding about the
+    // agent and nothing was read. A seed that supplied any one reading gets the ordinary sentence;
+    // `engine/goalContinuation.falseAbsence.test.ts` pins both directions.
+    expect(notifyMock.mock.calls[0]![0].body).toContain("whether it advanced is unknown, not settled");
     expect(goalOf(projectId, agentId)!.escalatedAt).toBeDefined();
   });
 

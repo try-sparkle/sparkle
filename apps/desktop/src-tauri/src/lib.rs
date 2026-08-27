@@ -134,6 +134,9 @@ mod research;
 mod retention;
 mod revival;
 mod pipeline_health;
+// The false-absence contract (bead `sparkle-gazo4a`): a probe that could not look must never be
+// worded as an absence. `pipeline_health` is its first consumer.
+mod probe_outcome;
 mod review_cmd;
 mod roborev_account;
 mod roborev_probe;

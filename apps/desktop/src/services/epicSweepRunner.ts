@@ -430,13 +430,25 @@ export function candidateFor(
   agents: readonly AgentTab[],
   epic: Bead,
   alive: (agentId: string) => boolean | undefined,
+  /**
+   * Was `agents` an ACTUAL ROSTER READING, or is it a placeholder because the read failed?
+   *
+   * Defaults to `true` so every existing caller is unchanged. A caller that could not read the
+   * roster passes `false`, and the candidate then carries `orchestratorAlive: null` — see
+   * `epicContinuation.EpicSkipReason`'s `staffing-unknown` arm for why an unread roster must not
+   * render as an unstaffed epic (bead `sparkle-gazo4a`).
+   */
+  rosterRead = true,
 ): EpicSweepCandidate {
   const bound = boundAgentsFor(agents, epic.id);
   // UNKNOWN LIVENESS COUNTS AS ALIVE. `processAliveFor` returns undefined for an agent this window
   // never observed, and the conservative reading of "I cannot tell whether anyone is on this" is
   // to leave it alone: a wrong "alive" costs one skipped tick, a wrong "dead" spawns a rival
   // orchestrator against an epic somebody is already building.
-  const orchestratorAlive = bound.some((a) => alive(a.id) !== false);
+  // AN UNREAD ROSTER IS NOT AN EMPTY ONE. `boundAgentsFor` over a placeholder list returns nothing,
+  // which is indistinguishable from a genuinely unstaffed epic — so the distinction has to come
+  // from the caller, and it is carried as `null` rather than folded into `false`.
+  const orchestratorAlive = rosterRead ? bound.some((a) => alive(a.id) !== false) : null;
   return {
     epicId: epic.id,
     status: epicStatus(beads as Bead[], epic.id),

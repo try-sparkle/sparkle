@@ -698,8 +698,23 @@ fn classify_not_answering(timed_out: bool, ev: DaemonEvidence) -> (HealthState, 
         }
         _ => format!("neither the daemon process nor {ROBOREV_DB_LABEL} could be read"),
     };
+    // ── TOTALLY BLIND ⇒ Unknown, NOT Warning (bead `sparkle-gazo4a`, instance `roborev-timeout`) ──
+    // The doc above says "all four are Warning: a down or unreadable daemon must never read as
+    // 'nothing to do'". That stays true for every arm where SOMETHING was read. It is wrong for the
+    // one arm where NOTHING was: no process reading, no store reading, and a probe that timed out.
+    //
+    // A timeout is a property of the OBSERVATION, not of the thing observed — the measured truth
+    // behind this instance was a daemon answering in 0.5-0.9ms while the alert called it dead. With
+    // no corroborating evidence at all, "the daemon is in trouble" is a finding we did not make, and
+    // `Warning` is the state that PAGES A HUMAN (`services/pipelineHealthEscalation.isAlarmState`
+    // counts warning as an alarm; it deliberately excludes unknown). Paging someone about a meter we
+    // could not read is precisely the confident wrong statement this bead exists to stop.
+    //
+    // `Unknown` does NOT read as green: it ranks above Healthy in `severity_rank`, paints the chip
+    // amber, and carries the sentence below verbatim. It simply stops short of asserting a fault.
+    let blind = ev.is_alive().is_none() && db_mb.is_none();
     (
-        HealthState::Warning,
+        if blind { HealthState::Unknown } else { HealthState::Warning },
         format!(
             "{why}, and the cause is UNDETERMINED: {evidence}. A daemon that is merely slow behind \
              a bloated store and one that is genuinely wedged look identical from here and need \
@@ -1684,13 +1699,44 @@ fn classify_release_publication(
     // 1. A STRANDED TAG above the mark. Nothing is staged and nothing is scheduled to act, so this
     //    is the worst fact available and it outranks every draft state.
     if let Some(newest) = above_orphans.iter().copied().max() {
+        // ── "NOT EVEN A DRAFT" NEEDS A CONTROL (bead `sparkle-gazo4a`, instance
+        //    `release-draft-invisible`) ────────────────────────────────────────────────────────────
+        // The measured failure: this line asserted "There is no release object at all for v0.140.0
+        // — not even a draft" while a draft existed. Drafts are visible on `gh api .../releases`
+        // ONLY to a token with the right scope, so an under-scoped or truncated read returns a
+        // published-only view — in which every draft in the world looks like an orphan tag.
+        //
+        // THE CONTROL IS ALREADY IN OUR HANDS, and this is the whole technique: if we saw ANY draft
+        // in this read, the query demonstrably returns drafts, and an absent one is then a real
+        // finding. If we saw none, "no drafts exist" and "this token cannot see drafts" are the same
+        // bytes, and only one of them justifies the remedy below — re-dispatching release.yml
+        // against a tag that already has a draft staged is the wrong action.
+        //
+        // NOTE WHAT IS **NOT** SOFTENED. The tag exists and nothing is published above the
+        // high-water mark: that is read from data we hold, it is a genuine Blocking fact, and users
+        // are not getting this build either way. Only the CLAIM ABOUT DRAFTS and the ACTION it
+        // implies are qualified. Muting the alarm would trade a wrong sentence for a missed outage.
+        let drafts_visible = !drafts.is_empty();
+        let draft_clause = if drafts_visible {
+            format!(
+                "There is no release object at all for {newest} — not even a draft — so nothing is \
+                 scheduled to publish it. Re-dispatch release.yml with existing_tag={newest}."
+            )
+        } else {
+            format!(
+                "This read returned no draft releases whatsoever, which is also what an \
+                 insufficiently-scoped token returns — so whether {newest} already has a draft \
+                 staged is unread. Check with `gh release view {newest} --repo {PUBLIC_RELEASE_REPO} \
+                 --json isDraft` FIRST: if a draft is staged, re-dispatching release.yml would build \
+                 it a second time."
+            )
+        };
         return (
             HealthState::Blocking,
             format!(
                 "{} built but NOT published — {shipped}. The auto-updater serves \
                  {PUBLIC_RELEASE_REPO}'s newest release, so this work has shipped to nobody. \
-                 There is no release object at all for {newest} — not even a draft — so nothing is \
-                 scheduled to publish it. Re-dispatch release.yml with existing_tag={newest}.{held}{note}",
+                 {draft_clause}{held}{note}",
                 name_versions(&above_orphans)
             ),
         );
@@ -1838,6 +1884,11 @@ const REVIEWER_COMMENT_MARKER: &str = "sparkle-reviewer:auto-post";
 /// on an idle afternoon gets muted, and then misses the real outage.
 const KNIGHTWATCH_FRESH_SECS: u64 = 48 * 3600;
 
+/// How many comments the liveness read asks for. Named because the READER compares the page it got
+/// back against this number to decide whether it was truncated — a page that came back full is a
+/// window onto a larger set, and absence is unprovable through it (bead `sparkle-gazo4a`).
+const KNIGHTWATCH_COMMENT_PAGE: usize = 100;
+
 /// The liveness reading for the PR reviewer, assembled from GitHub by [`read_knightwatch_liveness`].
 /// A `None` from that reader means the signal was UNREADABLE (-> Unknown); this struct is built only
 /// once a reading succeeded.
@@ -1845,10 +1896,27 @@ const KNIGHTWATCH_FRESH_SECS: u64 = 48 * 3600;
 struct KnightwatchLiveness {
     /// Age in seconds of the newest sparkle-reviewer review comment found, or `None` when none was
     /// seen in the scanned window (never posted, or older than the window).
+    ///
+    /// ⚠️ `None` IS AMBIGUOUS ON ITS OWN and must be read together with [`Self::horizon`] — see the
+    /// note there. That ambiguity is corpus instance `knightwatch-label-window`.
     last_review_age_secs: Option<u64>,
+    /// How far back the comment read actually SAW, and whether its page was full.
+    ///
+    /// WHY IT IS NOT ENOUGH TO KNOW THAT THE READ SUCCEEDED (bead `sparkle-gazo4a`). The read is one
+    /// repo-wide page of 100 comments sorted by recency. Measured on 2026-08-26 against the live
+    /// repo, that page came back FULL — 100 of 100 — and its oldest entry was about FIFTEEN HOURS
+    /// old, while [`KNIGHTWATCH_FRESH_SECS`] makes the claim over FORTY-EIGHT. So "no reviewer
+    /// comment in the page" covered under a third of the question being asked, and treating it as
+    /// "no recent review" is an absence claim the read cannot support.
+    horizon: crate::probe_outcome::ReadHorizon,
     /// Whether the repo has at least one OPEN PR — work the reviewer would be expected to cover.
     /// Distinguishes a genuinely-idle reviewer (no PRs) from a silent-but-should-be-working one.
-    has_open_prs: bool,
+    ///
+    /// ⚠️ `None` MEANS THE PR LIST COULD NOT BE READ, and it is `Option` for exactly that reason.
+    /// It used to be a bare `bool` defaulted to `false` on a failed read (corpus instance
+    /// `reviewer-unavailable`), which LAUNDERED A FAILED READ INTO A NEGATIVE FACT — and that fact
+    /// is load-bearing, because it is what flips the stale/never arms between Warning and Healthy.
+    has_open_prs: Option<bool>,
 }
 
 /// Current wall-clock as a Unix epoch in seconds. `0` if the clock is before the epoch (never on a
@@ -1901,8 +1969,40 @@ fn github_ts_age_secs(ts: &str, now_epoch: i64) -> Option<u64> {
 /// if no comment in the page carries the marker. Takes the MAX `updated_at` (RFC3339 sorts
 /// chronologically as text) rather than trusting the request's sort order.
 fn newest_reviewer_comment_ts(json: &str) -> Option<String> {
+    newest_reviewer_comment_scan(json).and_then(|(ts, _)| ts)
+}
+
+/// The scan behind [`newest_reviewer_comment_ts`], returning BOTH halves: the newest reviewer
+/// timestamp (if any) AND the OLDEST timestamp in the page plus how many entries it held.
+///
+/// The second half is what makes an empty answer interpretable (bead `sparkle-gazo4a`). Without it
+/// the caller cannot tell "the reviewer has posted nothing for two days" from "the newest hundred
+/// comments in a busy repo happen to be about something else", and those need opposite responses.
+///
+/// `None` means the payload was not the comments shape at all — an error body, truncated JSON — and
+/// is the caller's UNREADABLE case, distinct from a well-formed page holding nothing of interest.
+fn newest_reviewer_comment_scan(json: &str) -> Option<(Option<String>, (usize, Option<String>))> {
     let value: serde_json::Value = serde_json::from_str(json.trim()).ok()?;
     let items = value.as_array()?;
+    let mut oldest_any: Option<String> = None;
+    for c in items {
+        // The page's own extent, over EVERY comment rather than only the reviewer's — it is the
+        // window we looked through, not the thing we looked for.
+        if let Some(ts) = c
+            .get("updated_at")
+            .and_then(|t| t.as_str())
+            .or_else(|| c.get("created_at").and_then(|t| t.as_str()))
+        {
+            if oldest_any.as_deref().is_none_or(|o| ts < o) {
+                oldest_any = Some(ts.to_string());
+            }
+        }
+    }
+    let newest = newest_reviewer_ts_in(items);
+    Some((newest, (items.len(), oldest_any)))
+}
+
+fn newest_reviewer_ts_in(items: &[serde_json::Value]) -> Option<String> {
     let mut newest: Option<String> = None;
     for c in items {
         let body = c.get("body").and_then(|b| b.as_str()).unwrap_or("");
@@ -1981,13 +2081,26 @@ fn classify_knightwatch(
             HealthState::Healthy,
             format!("'{reviewer_name}' posted a review {} ago — the reviewer is live.", humanize_age(age)),
         ),
-        Some(age) if l.has_open_prs => (
+        Some(age) if l.has_open_prs == Some(true) => (
             HealthState::Warning,
             format!(
                 "'{reviewer_name}' last posted a review {} ago and open PR(s) are waiting — the \
                  reviewer may not be running. {}",
                 humanize_age(age),
                 RESTART
+            ),
+        ),
+        // A STALE REVIEW WITH AN UNREADABLE PR LIST (bead `sparkle-gazo4a`). We know when the
+        // reviewer last posted; we do not know whether anything is waiting, and that is precisely
+        // what decides between "it has stopped" and "it is idle because there is nothing to do".
+        // Defaulting it used to pick Healthy, which is the quiet wrong answer.
+        Some(age) if l.has_open_prs.is_none() => (
+            HealthState::Unknown,
+            format!(
+                "'{reviewer_name}' last posted a review {} ago, but the open-PR list could not be \
+                 read — so whether anything is waiting on it is unread, not settled. Check its host \
+                 directly.",
+                humanize_age(age)
             ),
         ),
         Some(age) => (
@@ -1997,7 +2110,33 @@ fn classify_knightwatch(
                 humanize_age(age)
             ),
         ),
-        None if l.has_open_prs => (
+        // ── NOTHING FOUND: THE WINDOW DECIDES WHETHER THAT MEANS ANYTHING ────────────────────────
+        // Ranked FIRST among the `None` arms, and that ordering is the fix. Finding no reviewer
+        // comment is only evidence that none exists if the read looked back at least as far as the
+        // claim reaches. Measured live: the page came back FULL and spanned ~15h against a 48h
+        // claim, so this arm is reached on a busy repo whose reviewer posted perfectly normally.
+        None if !l.horizon.covers(KNIGHTWATCH_FRESH_SECS) => (
+            HealthState::Unknown,
+            format!(
+                "the '{reviewer_name}' review window could not be read back far enough to judge: \
+                 the most recent {KNIGHTWATCH_COMMENT_PAGE} comments in this repo{} do not reach \
+                 the {}h this check covers, so an empty result here says nothing either way. Check \
+                 a specific PR, or its host, directly.",
+                match l.horizon.oldest_seen_secs {
+                    Some(o) => format!(" span only {}", humanize_age(o)),
+                    None => String::new(),
+                },
+                KNIGHTWATCH_FRESH_SECS / 3600
+            ),
+        ),
+        None if l.has_open_prs.is_none() => (
+            HealthState::Unknown,
+            format!(
+                "no recent '{reviewer_name}' review is in a window that covers this check, and the \
+                 open-PR list could not be read either — there is not enough here to judge it."
+            ),
+        ),
+        None if l.has_open_prs == Some(true) => (
             HealthState::Warning,
             format!(
                 "no recent '{reviewer_name}' review was found and open PR(s) are waiting — the \
@@ -2021,16 +2160,28 @@ fn read_knightwatch_liveness(gh_program: Option<&str>, root: &str) -> Option<Kni
     let comments = gh_api_text(
         program,
         root,
-        &format!("repos/{RELEASE_REPO}/issues/comments?sort=updated&direction=desc&per_page=100"),
+        &format!("repos/{RELEASE_REPO}/issues/comments?sort=updated&direction=desc&per_page={KNIGHTWATCH_COMMENT_PAGE}"),
     )?;
-    let last_review_age_secs =
-        newest_reviewer_comment_ts(&comments).and_then(|ts| github_ts_age_secs(&ts, now_epoch_secs()));
-    // Open-PR presence refines stale/never into warn-vs-idle. A failed read defaults to `false` —
-    // the fail-safe direction, so an unreadable PR list never manufactures a stale-warning.
+    let now = now_epoch_secs();
+    // ONE SCAN, TWO FACTS (bead `sparkle-gazo4a`): what we found, and how far we could see. The
+    // second is what makes "we found nothing" interpretable at all.
+    let (newest, (page_len, oldest_any)) = newest_reviewer_comment_scan(&comments)?;
+    let last_review_age_secs = newest.and_then(|ts| github_ts_age_secs(&ts, now));
+    let horizon = crate::probe_outcome::ReadHorizon {
+        // A FULL page is a truncated view by definition: the read asked for `per_page` and got
+        // exactly that many, so there is no evidence the set ends there. Measured live at 100/100.
+        truncated: page_len >= KNIGHTWATCH_COMMENT_PAGE,
+        oldest_seen_secs: oldest_any.as_deref().and_then(|ts| github_ts_age_secs(ts, now)),
+    };
+    // Open-PR presence refines stale/never into warn-vs-idle.
+    //
+    // IT USED TO DEFAULT TO `false` ON A FAILED READ, described as "the fail-safe direction". It is
+    // not one: it is a NEGATIVE FACT MANUFACTURED FROM A FAILED READ, and it is load-bearing —
+    // `has_open_prs` is exactly what flips the stale and never arms between Warning and Healthy. So
+    // an unreadable PR list silently decided the verdict. `None` now means what it says.
     let has_open_prs = gh_api_text(program, root, &format!("repos/{RELEASE_REPO}/pulls?state=open&per_page=1"))
-        .map(|j| has_open_prs_from_json(&j))
-        .unwrap_or(false);
-    Some(KnightwatchLiveness { last_review_age_secs, has_open_prs })
+        .map(|j| has_open_prs_from_json(&j));
+    Some(KnightwatchLiveness { last_review_age_secs, horizon, has_open_prs })
 }
 
 // ── The command ─────────────────────────────────────────────────────────────────────────────────
@@ -3189,13 +3340,27 @@ mod tests {
     }
 
     /// THE UNREADABLE CASE — no evidence at all. SLOW and WEDGED need opposite remedies, so the only
-    /// honest verdict is "diagnose first", and it must still be a WARNING: an unreadable or down
-    /// review daemon must never render as "nothing to do".
+    /// honest verdict is "diagnose first".
+    ///
+    /// ⚠️ IT IS `Unknown`, NOT `Warning`, SINCE bead `sparkle-gazo4a` (corpus instance
+    /// `roborev-timeout`). This test used to assert Warning on the reasoning that "an unreadable or
+    /// down review daemon must never render as 'nothing to do'". The second half of that sentence is
+    /// still enforced — and by stronger assertions than a state check, since the detail below must
+    /// still say UNDETERMINED and still name the diagnostic. What changed is the first half: with NO
+    /// evidence whatsoever, "the daemon is in trouble" is a finding we did not make, and `Warning` is
+    /// the state that PAGES A HUMAN (`services/pipelineHealthEscalation.isAlarmState` counts warning
+    /// and deliberately excludes unknown). `Unknown` ranks above Healthy, paints the chip amber, and
+    /// carries this same sentence — it is not silence, it is an honest refusal to diagnose.
+    ///
+    /// The measured instance: an 8s probe timeout read as a dead daemon, while the daemon was alive
+    /// and answering in 0.5-0.9ms. See `false_absence_roborev_timeout_without_evidence_is_unknown`
+    /// for the paired case proving an OBSERVED-dead daemon still warns.
     #[test]
     fn no_evidence_is_undetermined_and_never_restarts_blind() {
         for probe in [StatusProbe::TimedOut, StatusProbe::Text("Daemon: not running\n".into())] {
             let (state, detail) = classify_roborev(&probe, DaemonEvidence::default());
-            assert_eq!(state, HealthState::Warning, "never silent: {detail}");
+            assert_eq!(state, HealthState::Unknown, "no evidence is not a diagnosis: {detail}");
+            assert_ne!(state, HealthState::Healthy, "never silent: {detail}");
             assert!(detail.contains("UNDETERMINED"), "say what we do not know: {detail}");
             assert!(
                 detail.contains("scripts/roborev-maintenance.sh --status"),
@@ -5068,8 +5233,24 @@ mod tests {
 
     // ── knightwatch ───────────────────────────────────────────────────────────────────────────────
 
+    /// The pre-`sparkle-gazo4a` shape, kept so the existing ladder tests read unchanged: a reading
+    /// whose window COVERED the question (untruncated) and whose PR list WAS read.
     fn liveness(age: Option<u64>, open: bool) -> KnightwatchLiveness {
-        KnightwatchLiveness { last_review_age_secs: age, has_open_prs: open }
+        KnightwatchLiveness {
+            last_review_age_secs: age,
+            horizon: crate::probe_outcome::ReadHorizon { truncated: false, oldest_seen_secs: None },
+            has_open_prs: Some(open),
+        }
+    }
+
+    /// A reading assembled by hand, for the false-absence cases that vary the two facts the ladder
+    /// tests hold fixed.
+    fn liveness_with(
+        age: Option<u64>,
+        open: Option<bool>,
+        horizon: crate::probe_outcome::ReadHorizon,
+    ) -> KnightwatchLiveness {
+        KnightwatchLiveness { last_review_age_secs: age, horizon, has_open_prs: open }
     }
 
     /// `pr_reviewer = none` → NotApplicable (excluded from the fold), and an UNREADABLE signal is
@@ -5236,7 +5417,28 @@ mod tests {
         let (state, detail) =
             classify_pub(Some(&bare), Some(&strings(&["v0.121.0", "v0.118.0"])));
         assert_eq!(state, HealthState::Blocking, "a tag with no release object is stranded: {detail}");
-        assert!(detail.contains("existing_tag=v0.121.0"), "detail must name the remedy: {detail}");
+        // ⚠️ THE REMEDY IS QUALIFIED WHEN NO DRAFT WAS VISIBLE ANYWHERE IN THE READ (bead
+        // `sparkle-gazo4a`, corpus instance `release-draft-invisible`). This fixture's `drafts` is
+        // empty, and in production those exact bytes are ALSO what an under-scoped token returns —
+        // the measured failure was "not even a draft" asserted about a tag that had one. The
+        // BLOCKING verdict is untouched (the tag is real and users are not getting it); only the
+        // claim about drafts, and the action it implies, are qualified.
+        assert!(
+            detail.contains("--json isDraft"),
+            "with no draft visible, the remedy must say CHECK before re-dispatching: {detail}"
+        );
+
+        // PAIRED — the control. A draft visible for ANOTHER version PROVES this read returns drafts,
+        // so an absent one for v0.121.0 is a real absence and the direct remedy is earned again.
+        let sees_drafts =
+            ReleasesReading { published: strings(&["v0.118.0"]), drafts: strings(&["v0.117.0"]) };
+        let (state, detail) =
+            classify_pub(Some(&sees_drafts), Some(&strings(&["v0.121.0", "v0.118.0"])));
+        assert_eq!(state, HealthState::Blocking);
+        assert!(
+            detail.contains("existing_tag=v0.121.0"),
+            "with drafts demonstrably visible the direct remedy must survive: {detail}"
+        );
     }
 
     /// A stranded tag must still win over a staged draft when BOTH are above the mark — the worse
@@ -5352,6 +5554,186 @@ mod tests {
             "with no gh there is no reading, and no reading must never be Healthy: {}",
             c.detail
         );
+    }
+
+
+    // ══ FALSE ABSENCE (bead `sparkle-gazo4a`) ═══════════════════════════════════════════════════
+    //
+    // The four instances of this bug class that live in THIS file. The contract is
+    // `apps/desktop/shared/false-absence-corpus.json`, read from disk below; the lexicon that
+    // decides what counts as an absence claim is `crate::probe_outcome`.
+    //
+    // Every case drives the REAL classifier, and every case is PAIRED: the blind reading must be
+    // honest AND the observed reading must still produce its ordinary verdict. A suite that only
+    // proves silence passes just as well against a classifier that has been emptied out — which
+    // would mute real outages, the opposite and equally expensive error.
+
+    use crate::probe_outcome::{ReadHorizon, absence_claim_in};
+
+    /// Assert a detail string makes no absence claim, naming the pattern when it does.
+    fn no_absence_claim(detail: &str, case: &str) {
+        if let Some(pattern) = absence_claim_in(detail) {
+            panic!("instance {case}: a COULD-NOT-LOOK reading rendered an ABSENCE CLAIM (pattern {pattern:?}).\nText was: {detail}");
+        }
+    }
+
+    /// INSTANCE 1 — `knightwatch-label-window`.
+    ///
+    /// Measured live on 2026-08-26: the repo-wide comments page came back FULL (100 of 100) with its
+    /// oldest entry ~15h old, while the freshness claim spans 48h. Finding no reviewer comment in a
+    /// window a third the size of the question settles nothing.
+    #[test]
+    fn false_absence_knightwatch_truncated_window_is_unknown() {
+        let short_window =
+            ReadHorizon { truncated: true, oldest_seen_secs: Some(15 * 3600) };
+        let (state, detail) =
+            classify_knightwatch(false, "sparkle-reviewer", Some(&liveness_with(None, Some(true), short_window)));
+        assert_eq!(
+            state,
+            HealthState::Unknown,
+            "a window shorter than the claim cannot support an absence verdict: {detail}"
+        );
+        no_absence_claim(&detail, "knightwatch-label-window");
+
+        // PAIRED 1 — the SAME empty result through a window that DID reach past the claim is a real
+        // answer, and must still warn. Without this the assertion above is satisfied by a classifier
+        // that has stopped judging the reviewer at all.
+        let long_window = ReadHorizon { truncated: true, oldest_seen_secs: Some(72 * 3600) };
+        let (state, _) =
+            classify_knightwatch(false, "sparkle-reviewer", Some(&liveness_with(None, Some(true), long_window)));
+        assert_eq!(state, HealthState::Warning, "a window that outreaches the claim still judges");
+
+        // PAIRED 2 — an UNTRUNCATED page settles it however short it is: we saw the whole set.
+        let complete = ReadHorizon { truncated: false, oldest_seen_secs: Some(60) };
+        let (state, _) =
+            classify_knightwatch(false, "sparkle-reviewer", Some(&liveness_with(None, Some(true), complete)));
+        assert_eq!(state, HealthState::Warning, "an untruncated read is a real answer");
+    }
+
+    /// INSTANCE 2 — `reviewer-unavailable`.
+    ///
+    /// `has_open_prs` used to be `.unwrap_or(false)` on a FAILED read, and that manufactured
+    /// negative is what decides between "the reviewer has stopped" and "it is idle because nothing
+    /// is waiting". The monitor said "unavailable — reprovision the VM" while the reviewer was
+    /// posting a real review.
+    #[test]
+    fn false_absence_reviewer_unreadable_prs_is_unknown() {
+        let complete = ReadHorizon { truncated: false, oldest_seen_secs: Some(60) };
+        let stale = KNIGHTWATCH_FRESH_SECS + 1;
+
+        // A stale review + an UNREADABLE PR list: we cannot say which situation this is.
+        let (state, detail) =
+            classify_knightwatch(false, "sparkle-reviewer", Some(&liveness_with(Some(stale), None, complete)));
+        assert_eq!(state, HealthState::Unknown, "an unread PR list may not decide the verdict: {detail}");
+        no_absence_claim(&detail, "reviewer-unavailable");
+
+        // Nothing found AND no PR list: even less to go on.
+        let (state, detail) =
+            classify_knightwatch(false, "sparkle-reviewer", Some(&liveness_with(None, None, complete)));
+        assert_eq!(state, HealthState::Unknown);
+        no_absence_claim(&detail, "reviewer-unavailable");
+
+        // PAIRED — the same staleness with the PR list actually READ still reaches its real verdicts,
+        // in BOTH directions, so the tri-state has not simply swallowed the component.
+        let (state, _) =
+            classify_knightwatch(false, "sparkle-reviewer", Some(&liveness_with(Some(stale), Some(true), complete)));
+        assert_eq!(state, HealthState::Warning, "stale + PRs waiting is a genuine warning");
+        let (state, _) =
+            classify_knightwatch(false, "sparkle-reviewer", Some(&liveness_with(Some(stale), Some(false), complete)));
+        assert_eq!(state, HealthState::Healthy, "stale + nothing waiting is a genuinely idle reviewer");
+    }
+
+    /// INSTANCE 3 — `roborev-timeout`.
+    ///
+    /// An 8s probe timeout with NO corroborating evidence read as a dead daemon. The daemon was
+    /// alive and answering in 0.5-0.9ms. `Warning` is the state that PAGES someone, so a fully blind
+    /// probe must not reach it.
+    #[test]
+    fn false_absence_roborev_timeout_without_evidence_is_unknown() {
+        let blind = DaemonEvidence::default();
+        let (state, detail) = classify_not_answering(true, blind);
+        assert_eq!(state, HealthState::Unknown, "a timeout with no evidence is not a diagnosis: {detail}");
+        no_absence_claim(&detail, "roborev-timeout");
+
+        // PAIRED — the SAME timeout with a real process reading still reaches a real verdict. This
+        // is what proves the arm above is about the missing evidence and not about the timeout.
+        let mut alive = DaemonEvidence::default();
+        alive.alive = Some(false);
+        let (state, _) = classify_not_answering(true, alive);
+        assert_eq!(
+            state,
+            HealthState::Warning,
+            "an observed-dead daemon is a genuine finding and must still warn"
+        );
+    }
+
+    /// INSTANCE 4 — `release-draft-invisible`.
+    ///
+    /// The alert asserted "There is no release object at all for v0.140.0 — not even a draft" while a
+    /// draft existed. Drafts are visible only to a token with the right scope, so a published-only
+    /// view makes every draft look like an orphan tag. Seeing ANY draft is the control that proves
+    /// the query returns them.
+    #[test]
+    fn false_absence_release_draft_blindness_is_unknown() {
+        let tags = vec!["v0.140.0".to_string(), "v0.139.0".to_string()];
+        let gates = std::collections::BTreeMap::new();
+
+        // NO draft anywhere in the read — indistinguishable from a token that cannot see drafts.
+        let blind = ReleasesReading { published: vec!["v0.139.0".to_string()], drafts: vec![] };
+        let (state, detail) = classify_release_publication(Some(&blind), Some(&tags), None, &gates);
+        assert_eq!(
+            state,
+            HealthState::Blocking,
+            "the unshipped tag is still a real finding and the alarm must not be muted"
+        );
+        no_absence_claim(&detail, "release-draft-invisible");
+        assert!(
+            detail.contains("--json isDraft"),
+            "the remedy must send the reader to CHECK before re-dispatching: {detail}"
+        );
+
+        // PAIRED — with a draft visible somewhere in the read, the query is PROVEN to return drafts,
+        // so an absent one for this tag is a real absence and the direct remedy is correct again.
+        let seeing = ReleasesReading {
+            published: vec!["v0.139.0".to_string()],
+            drafts: vec!["v0.138.0".to_string()],
+        };
+        let (state, detail) = classify_release_publication(Some(&seeing), Some(&tags), None, &gates);
+        assert_eq!(state, HealthState::Blocking);
+        assert!(
+            detail.contains("not even a draft"),
+            "with drafts demonstrably visible, the absence claim is EARNED and must survive: {detail}"
+        );
+        assert!(detail.contains("Re-dispatch release.yml"), "and so must the direct remedy");
+    }
+
+    /// THE COVERAGE GUARD. Every corpus case whose `lang` is `rust` must be named by a live test in
+    /// this file. An instance list nobody runs is exactly the false-green this bead is about, so the
+    /// corpus gets a guard of its own — a case cannot be dropped by deleting its assertions.
+    #[test]
+    fn every_rust_corpus_instance_has_a_live_test() {
+        let corpus: serde_json::Value =
+            serde_json::from_str(include_str!("../../shared/false-absence-corpus.json")).unwrap();
+        let this_file = include_str!("pipeline_health.rs");
+        let mut seen = 0;
+        for case in corpus["instances"]["cases"].as_array().unwrap() {
+            if case["lang"].as_str() != Some("rust") {
+                continue;
+            }
+            seen += 1;
+            let id = case["id"].as_str().unwrap();
+            let covered_by = case["coveredBy"].as_str().unwrap();
+            let fn_name = covered_by.rsplit("::").next().unwrap();
+            assert!(
+                this_file.contains(&format!("fn {fn_name}(")),
+                "corpus instance {id} names {covered_by}, which does not exist in this file"
+            );
+            assert!(
+                this_file.contains(id),
+                "corpus instance {id} has a test but the test never names the instance"
+            );
+        }
+        assert_eq!(seen, 4, "the corpus's Rust instance count changed; update this file with it");
     }
 
 }

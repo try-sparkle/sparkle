@@ -115,6 +115,19 @@ export type EpicSkipReason =
   | "already-escalated"
   /** We cannot tell how old the last progress is, so we refuse to act. */
   | "unknown-age"
+  /**
+   * WE COULD NOT READ WHO IS STAFFED ON THIS EPIC (bead `sparkle-gazo4a`, corpus instance
+   * `epic-sweeper-no-change`).
+   *
+   * DISTINCT FROM `orchestrator-alive` AND FROM ACTING, and it has to be all three states rather
+   * than two. `orchestratorAlive: false` used to be produced BY AN UNREAD ROSTER as readily as by a
+   * genuinely unstaffed epic — `boundAgentsFor` over an empty agent list returns nothing either
+   * way — so "nobody is building this" was a sentence the sweep manufactured out of its own missing
+   * reading, and then acted on by spawning a rival orchestrator against an epic somebody was
+   * already building. The runner's `alive()` already refuses to turn an unknown LIVENESS into a
+   * dead agent for exactly this reason; this is the same rule one level up, about the roster itself.
+   */
+  | "staffing-unknown"
   /** Stalled for less than the window. */
   | "too-soon"
   /** Stalled for LONGER than {@link EPIC_MAX_STALL_AGE_MS} — out of the sweep's reach on purpose. */
@@ -180,8 +193,15 @@ export interface EpicSweepCandidate {
    * work: an agent tab can be closed, and closing one must not silently re-grant a restart.
    */
   lastSweepRestartAt: number | null;
-  /** A build agent bound to this epic is alive right now. */
-  orchestratorAlive: boolean;
+  /**
+   * A build agent bound to this epic is alive right now — or `null` when THE STAFFING READING
+   * ITSELF WAS UNAVAILABLE, which is not the same fact and must not collapse onto `false`.
+   *
+   * See {@link EpicSkipReason}'s `staffing-unknown` arm for the measured failure. `null` is the
+   * honest reading whenever the roster this is derived from was not successfully read; a caller
+   * that HAS a roster and finds nothing bound still passes `false`, which is a real observation.
+   */
+  orchestratorAlive: boolean | null;
   /**
    * The newest `updatedAt` across the epic's CHILDREN, or null when none is readable.
    *
@@ -292,6 +312,11 @@ export function decideEpicSweep(
   // stalled, that mark is now wrong and comes off. A stale escalation is worse than none: it is a
   // false alarm sitting in the lane the human scans for real ones.
   if (c.status === "done") return c.alreadyEscalated ? clear() : skip("already-done");
+  // STAFFING UNREADABLE ⇒ REFUSE, and refuse BEFORE the alive test rather than after. `null` is
+  // falsy, so an `if (c.orchestratorAlive)` placed first would fall straight through to the restart
+  // ladder — the exact collapse this state exists to prevent. Note it does NOT clear an existing
+  // escalation either: clearing is a claim that the epic is fine, and we have not established that.
+  if (c.orchestratorAlive === null) return skip("staffing-unknown");
   if (c.orchestratorAlive) return c.alreadyEscalated ? clear() : skip("orchestrator-alive");
 
   // ── A HOLLOW EPIC IS A TITLE, SO THE ANSWER IS "ASK FOR A PLAN", NOT "RESTART" ───────────────

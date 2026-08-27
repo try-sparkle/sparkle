@@ -25,6 +25,7 @@
 // parameters — so every rule is tested as arithmetic. The mount that spends real money on the
 // decision lives in services/goalContinuationRunner.
 import type { AgentTabStatus } from "@sparkle/ui";
+import { safeRenderProbeClaim } from "./probeOutcome";
 import {
   AWAITING_CLOSE_STATE,
   type AgentGoal,
@@ -562,6 +563,13 @@ export function decideContinuation(input: ContinuationInput): ContinuationDecisi
   // fresh one (mirroring agentGoal.noteContinue, which applies the same rule when recording).
   const progressed = live.mark !== undefined && live.mark !== mark;
   const consecutive = progressed ? 0 : live.continues;
+  // ── ARE WE ACTUALLY OBSERVING THIS AGENT? (bead `sparkle-gazo4a`) ────────────────────────────
+  // `progressed === false` has two completely different causes and every sentence below used to
+  // assume the first: the agent did nothing, OR we read nothing. BOTH marks must be blind for this
+  // to hold — a streak in which either end carried a real work reading is a genuine comparison, and
+  // calling it unreadable would mute a true stall. Only consulted for the WORDING; see
+  // {@link workEvidenceReadable} for why the ladder itself is deliberately unchanged.
+  const markBlind = !progressed && !workEvidenceReadable(mark) && !workEvidenceReadable(live.mark);
   // ── HOW OLD IS THE GATE, AND IS IT STILL AN EXPLANATION? ────────────────────────────────────
   // Three states, and they are NOT two — collapsing the middle one is how this fails unsafely.
   //   LIVE    — a gate we have watched for less than the grace. Waiting explains the quiet.
@@ -590,8 +598,18 @@ export function decideContinuation(input: ContinuationInput): ContinuationDecisi
       return {
         action: "escalate",
         reason:
-          `Auto-continued ${consecutive} times with no sign of progress. The goal is still unmet: ` +
-          `"${live.text}". Something is blocking it that restarting cannot fix.` +
+          (markBlind
+            ? // BLIND (bead `sparkle-gazo4a`). Every work-evidence column was unreadable across this
+              // streak, so "no sign of progress" would be a claim about the agent built out of our
+              // own missing readings. A human still has to look — the streak is real and the ladder
+              // is bounded — but they must be told WHICH of the two situations they are looking at,
+              // because the first thing to check differs: a stalled agent, or a broken signal.
+              `Auto-continued ${consecutive} times, and Sparkle could not read any of its progress ` +
+              `signals for this agent across that streak — so whether it advanced is unknown, not ` +
+              `settled. The goal is still unmet: "${live.text}". Check the agent itself, and check ` +
+              `whether the fleet digest and branch status are being read at all.`
+            : `Auto-continued ${consecutive} times with no sign of progress. The goal is still unmet: ` +
+              `"${live.text}". Something is blocking it that restarting cannot fix.`) +
           whereItRuns(input.runtime),
       };
     }
@@ -642,7 +660,7 @@ export function decideContinuation(input: ContinuationInput): ContinuationDecisi
   // attempt number so the agent is told the ceiling it is ACTUALLY heading for.
   return {
     action: "continue",
-    prompt: continuePrompt(live, attempt, input.externalWait),
+    prompt: continuePrompt(live, attempt, input.externalWait, markBlind),
     attempt,
   };
 }
@@ -786,12 +804,16 @@ export function continuePrompt(
   goal: AgentGoal,
   attempt = 1,
   externalWait?: ExternalWait,
+  /** Were the mark's WORK-EVIDENCE columns unreadable this sweep — see
+   *  {@link workEvidenceReadable}? Defaults false so every existing caller keeps today's wording;
+   *  `decideContinuation` is the caller that knows and passes it. */
+  markBlind = false,
 ): string {
   return (
     `${RESUME_PROMPT_MARKER} automatically. ` +
     `Do not stop to acknowledge this — pick up exactly where you left off and keep working.\n\n` +
     `GOAL: ${goal.text}\n\n` +
-    repeatedResumeLine(attempt, externalWait) +
+    repeatedResumeLine(attempt, externalWait, markBlind) +
     // NAME THE OP THAT EXISTS. This said `set_agent_goal with met: true`, which cannot work:
     // `set_agent_goal`'s schema is `{ targetAgentId?, goal, ttlMs? }` — there is no `met`, and
     // `goal` is required. An agent that obeyed either failed zod validation or, if it invented a
@@ -826,8 +848,37 @@ export function continuePrompt(
  * not a guess. It is scoped to what Sparkle can SEE — an agent may well have been thinking — which
  * is why the line says so instead of accusing the agent of idling.
  */
-function repeatedResumeLine(attempt: number, externalWait?: ExternalWait): string {
+function repeatedResumeLine(attempt: number, externalWait?: ExternalWait, markBlind = false): string {
   if (attempt < 2) return "";
+  // ── THE BLIND VARIANT (bead `sparkle-gazo4a`) ────────────────────────────────────────────────
+  // Ranked ABOVE the gated arm on purpose. Both are true at once for an agent holding an open PR
+  // whose digest we also could not read, and of the two claims the blind one is the weaker: the
+  // gated sentence tells the agent what Sparkle thinks it is waiting for, which is a statement we
+  // cannot make when the reading that would support it is missing. Say less, not more.
+  //
+  // What this arm must NOT say is the ordinary sentence below. `workEvidenceReadable` established
+  // that none of the three columns an ordinary working agent moves was readable this sweep, so
+  // "nothing Sparkle can observe has changed" describes our own blindness and asserts it as a fact
+  // about the agent. That is the corpus instance verbatim, and it is what re-arms an agent that is
+  // twenty minutes into a verify.
+  if (markBlind) {
+    // ── THE ENFORCEMENT IS LIVE, NOT TEST-ONLY ───────────────────────────────────────────────────
+    // This is the highest-traffic could-not-look render in the app: it is typed into a working
+    // agent's terminal, unprompted, and the sentence it replaced ("Nothing Sparkle can observe has
+    // changed") IS corpus instance `resume-ticker-no-progress`. Routing it through `probeOutcome`
+    // runs the absence-claim lexicon in PRODUCTION every time this fires, so an edit that
+    // reintroduces an absence claim here is caught by the mechanism rather than by whoever happens
+    // to read the diff.
+    //
+    // `safeRenderProbeClaim`, never `renderProbeClaim`: this is a live path and a throw would take
+    // the sweep down with it. It degrades to a bland honest sentence instead — worse copy, never a
+    // wrong claim. No `onViolation` sink because this module is PURE by contract (see its header)
+    // and owns no logger; `goalContinuation.falseAbsence.test.ts` asserts the text directly.
+    return safeRenderProbeClaim<never>(
+      { kind: "could-not-look", why: `auto-resume ${attempt}`, control: null },
+      { found: () => "", notFound: () => "", couldNotLook: () => blindResumeBanner(attempt) },
+    );
+  }
   // ── THE GATED VARIANT ────────────────────────────────────────────────────────────────────────
   // Past the suppressed streak bound the ordinary sentence below is false twice over: the count has
   // gone past the ceiling it quotes, and the escalation it promises at that ceiling is exactly what
@@ -863,6 +914,22 @@ function repeatedResumeLine(attempt: number, externalWait?: ExternalWait): strin
     `your status will not clear it and does not count as progress. Take the next concrete step, ` +
     `mark the goal met, or name what is blocking you. At ${MAX_CONTINUES_WITHOUT_PROGRESS} this ` +
     `stops and escalates to a human.\n\n`
+  );
+}
+
+/** The blind variant's words, split out so {@link repeatedResumeLine} reads as the DECISION and this
+ *  reads as the COPY — and so the lexicon has one whole expression to police rather than a template
+ *  spliced into a control-flow arm.
+ *
+ *  ⚠️ IT MUST NOT ASSERT ABSENCE. That is not a style note: `repeatedResumeLine` renders this through
+ *  `probeOutcome.safeRenderProbeClaim`, which replaces it with a bland fallback if it does. */
+function blindResumeBanner(attempt: number): string {
+  return (
+    `THIS IS AUTO-RESUME ${attempt} on this goal. Sparkle could not read its own progress ` +
+    `signals for you this time — a long verification run and a queued CI run both move none of ` +
+    `them — so this resume is NOT a judgement that you have stalled, and an identical message ` +
+    `arriving twice is this timer rather than the human repeating themselves. If you are part-way ` +
+    `through something, carry straight on. If you are genuinely blocked, name what on and stop.\n\n`
   );
 }
 
@@ -941,6 +1008,51 @@ function repeatedResumeLine(attempt: number, externalWait?: ExternalWait): strin
 /** Where {@link progressMark} writes each field. Named so the two functions cannot drift — a reader
  *  that hard-coded an index would silently read the wrong column the day a field is inserted. */
 const MARK_FIELDS = ["promptHistoryLength", "activity", "aiTitle", "toolBursts", "commitsAhead", "prMark"] as const;
+
+/**
+ * DID THIS SWEEP ACTUALLY OBSERVE THE AGENT WORKING, or did it merely fail to see anything?
+ * (bead `sparkle-gazo4a`, corpus instance `resume-ticker-no-progress`.)
+ *
+ * ══ THE DEFECT ═════════════════════════════════════════════════════════════════════════════════
+ * Two successive marks being EQUAL is read everywhere below as "the agent did nothing". That is
+ * only true when the mark's inputs were READ. The three WORK-EVIDENCE columns — `toolBursts`,
+ * `commitsAhead`, `prMark` — are the only ones an ordinary working agent moves (see the WORK
+ * EVIDENCE note above: `promptHistoryLength` moves only when a HUMAN types, `aiTitle` only when
+ * Claude Code re-derives a title, and agents are instructed to emit `activity` sparingly). Each is
+ * rendered as an EMPTY TOKEN when this window has no reading for it — a failed `fleet_digest` poll,
+ * a branch status that could not be taken, a PR state never read.
+ *
+ * So a mark whose three work columns are ALL empty is not a measurement of an idle agent. It is a
+ * measurement of NOTHING, and two of them in a row are identical for exactly that reason. Concluding
+ * "nothing has changed" from that pair is a COULD-NOT-LOOK rendered as an absence claim, and it is
+ * what pages a human about — and re-arms — an agent that is running a twenty-minute verify or
+ * waiting on a queued CI run with no PR open yet to gate on.
+ *
+ * ══ WHAT THIS DOES AND DELIBERATELY DOES NOT DO ════════════════════════════════════════════════
+ * It changes what the ladder SAYS, never whether the ladder RUNS. The streak still counts and
+ * {@link MAX_CONTINUES_TOTAL} still bounds it, because this module's older and larger rule is that a
+ * missed stall strands work — an agent parked forever behind a signal nobody can read is strictly
+ * worse than a wrongly-worded resume. What changes is that neither the resume banner nor the
+ * escalation asserts an absence the evidence cannot support; both say the signal was unreadable.
+ *
+ * ══ IT JUDGES ONLY A WELL-FORMED MARK, AND THAT NARROWNESS IS THE POINT ════════════════════════
+ * A mark that does not carry exactly {@link MARK_FIELDS}'s columns is not a failed reading — it is
+ * an older build's mark, or a hand-built fixture string. A FAILED READING always produces a
+ * perfectly well-formed mark whose work columns are empty, because `progressMark` renders every
+ * missing input as an empty token. So an unparseable mark reads as OBSERVED, leaving every legacy
+ * and synthetic case behaving exactly as it did before this function existed.
+ *
+ * Treating those as blind instead would have been the wider and lazier rule, and it would have
+ * softened the escalation wording for a whole class of agents about whom nothing had actually gone
+ * wrong with our reading — muting on the strength of a guess, which is the same error this bead is
+ * about, pointed the other way.
+ */
+export function workEvidenceReadable(mark: string | undefined): boolean {
+  if (mark === undefined) return true;
+  const cols = mark.split("\u0000");
+  if (cols.length !== MARK_FIELDS.length) return true;
+  return (["toolBursts", "commitsAhead", "prMark"] as const).some((f) => cols[MARK_FIELDS.indexOf(f)] !== "");
+}
 
 /**
  * The `toolBursts` count a RECORDED mark carries, or `null` when there is none to read.

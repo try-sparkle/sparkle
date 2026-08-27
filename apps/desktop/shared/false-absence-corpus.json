@@ -1,0 +1,199 @@
+{
+  "$comment": [
+    "CANONICAL CONTRACT for bead sparkle-gazo4a — 'a monitor reports I COULD NOT SEE IT as IT IS NOT",
+    "THERE'. ONE file, read by the TypeScript suite AND by the Rust suite, so the two hand-written",
+    "halves cannot drift apart silently (AGENTS.md's `sparkle-16y6h` rule: share ONE fixture both",
+    "suites parse, so they fail TOGETHER).",
+    "",
+    "══ THE BUG THIS FILE EXISTS TO KILL ═══════════════════════════════════════════════════════════",
+    "A probe looks for something. The look FAILS — it errors, times out, lacks credentials, or comes",
+    "back empty from a query nobody proved was working — and the empty result is published as PROOF OF",
+    "ABSENCE rather than as a FAILED OBSERVATION. Every instance produces a confident wrong statement",
+    "that a human or another agent then acts on. Six are recorded below, all measured, all real.",
+    "",
+    "══ THE RULE ═══════════════════════════════════════════════════════════════════════════════════",
+    "EVERY PROBE REPORTS THREE OUTCOMES, NOT TWO:",
+    "",
+    "  FOUND          — we looked and it is there.",
+    "  NOT-FOUND      — we looked, THE LOOK IS PROVEN TO WORK AND TO COVER THE GROUND THE CLAIM",
+    "                   COVERS, and it is not there. This outcome requires a CONTROL.",
+    "  COULD-NOT-LOOK — anything else. The probe errored, timed out, lacked credentials, or returned",
+    "                   empty from a query whose reach was never established.",
+    "",
+    "COULD-NOT-LOOK MUST NEVER RENDER AS ABSENCE, anywhere in the UI, in an alert, or in a prompt.",
+    "That is what `absenceClaims` below enforces: a phrase from that lexicon appearing in text",
+    "generated for a could-not-look outcome is the defect, and it is a test failure.",
+    "",
+    "══ WHAT A CONTROL IS, CONCRETELY ══════════════════════════════════════════════════════════════",
+    "An empty result is only evidence of absence once you have shown the query can return a non-empty",
+    "one. The concierge established that `sparkle-reviewer` genuinely posts nothing by running",
+    "`gh repo view` ALONGSIDE the empty result — proving `gh` was authenticated and the repo",
+    "reachable. That one finding is reliable BECAUSE of the control; the five below are wrong because",
+    "nobody ran one.",
+    "",
+    "A control has TWO halves and BOTH are required:",
+    "  1. REACHABLE — the query mechanism works at all (authenticated, the host answered, the parse",
+    "     succeeded). Without this, empty means 'the door was shut'.",
+    "  2. COMPLETE  — the read covered the whole population the claim is about. A paginated, windowed,",
+    "     or capped read PROVES PRESENCE BUT CAN NEVER PROVE ABSENCE: not seeing it settles nothing,",
+    "     because it may live on a page nobody fetched. `ph_read_pool`'s third field in",
+    "     scripts/lib/pipeline-health.sh is this same bit, and its comment records the measured victim.",
+    "",
+    "══ WHY A LEXICON AND NOT JUST A TYPE ══════════════════════════════════════════════════════════",
+    "A tri-state TYPE is necessary and is not sufficient: `HealthState::Unknown` has existed in",
+    "pipeline_health.rs the whole time, and four of the six instances below happened anyway — because",
+    "the DETAIL STRING attached to a correctly-typed reading still asserted absence in prose. The type",
+    "governs the fold; the lexicon governs the SENTENCE, which is the thing a human actually reads and",
+    "acts on. Both are needed."
+  ],
+
+  "absenceClaims": {
+    "$comment": [
+      "The vocabulary of an ABSENCE CLAIM — case-insensitive regular expressions, in a syntax both",
+      "JavaScript's RegExp and Rust's `regex` crate accept unchanged (no lookaround, no backrefs).",
+      "",
+      "APPLIED ONLY TO TEXT GENERATED FOR A could-not-look OUTCOME. A genuine NOT-FOUND is SUPPOSED to",
+      "say 'it is not there' — that is the whole point of the third outcome existing separately. So",
+      "these patterns are not banned words; they are words a could-not-look may not use.",
+      "",
+      "Each entry names the measured instance whose real text it catches, so a future edit can tell a",
+      "pattern that is load-bearing from one that is decoration. `id` is referenced by `instances`."
+    ],
+    "patterns": [
+      {
+        "id": "does-not-exist",
+        "re": "\\b(does not|doesn't|do not|don't) exist\\b",
+        "caught": "the ready-for-review label doesn't exist in the repo at all"
+      },
+      {
+        "id": "there-is-no",
+        "re": "\\bthere (is|are|was|were) no\\b",
+        "caught": "there is no roborev daemon process"
+      },
+      {
+        "id": "not-even",
+        "re": "\\bnot even a\\b",
+        "caught": "— not even a draft — so nothing is published"
+      },
+      {
+        "id": "none-at-all",
+        "re": "\\b(no|none|nothing)\\b[^.!?]{0,60}\\bat all\\b",
+        "caught": "There is no release object at all for v0.140.0"
+      },
+      {
+        "id": "was-not-found",
+        "re": "\\bno\\b[^.!?]{0,60}\\b(was|were) found\\b",
+        "caught": "no recent 'sparkle-reviewer' review was found and open PR(s) are waiting"
+      },
+      {
+        "id": "not-found-bare",
+        "re": "\\b(not found|no jobs found|no results found|nothing found)\\b",
+        "caught": "roborev list --open --branch <b> answering 'No jobs found'"
+      },
+      {
+        "id": "is-not-running",
+        "re": "\\bis (not|never) running\\b",
+        "caught": "there is no roborev daemon process — the review daemon is not running"
+      },
+      {
+        "id": "is-unavailable",
+        "re": "\\b(is|are) (unavailable|unreachable|down|dead|offline)\\b",
+        "caught": "The PR reviewer (knightwatch) is unavailable — reprovision it"
+      },
+      {
+        "id": "nothing-changed",
+        "re": "\\bnothing\\b[^.!?]{0,60}\\b(has )?changed\\b",
+        "caught": "Nothing Sparkle can observe has changed since resume 2"
+      },
+      {
+        "id": "no-progress",
+        "re": "\\bno (progress|observable change|activity|movement)\\b",
+        "caught": "the epic sweeper reading 'no observable change' as 'no progress'"
+      },
+      {
+        "id": "nobody-is",
+        "re": "\\b(nobody|no one|no agent|no worker) (is|has)\\b",
+        "caught": "Nobody is working on this epic right now"
+      }
+    ]
+  },
+
+  "instances": {
+    "$comment": [
+      "THE SIX MEASURED INSTANCES, converted into cases. Every one is driven through its REAL",
+      "production classifier or renderer by the suite named in `coveredBy` — never through a copy of",
+      "the mechanism, which is the vacuity shape AGENTS.md names (`guard-vacuity-relocates-upstream`).",
+      "",
+      "`observation` is what the probe actually got back. `wrongClaim` is the sentence the shipped",
+      "code produced from it. `truth` is what was actually the case, established afterwards. A case",
+      "passes when the real code, fed `observation`, produces a could-not-look outcome AND text",
+      "carrying no pattern from `absenceClaims`.",
+      "",
+      "`lang` picks which suite owns the case; `coveredBy` names the test. The COVERAGE GUARD in each",
+      "suite asserts every instance of its own language is claimed by a live test, so a case cannot be",
+      "quietly dropped — an instance list nobody runs is exactly the false-green this bead is about."
+    ],
+    "cases": [
+      {
+        "id": "knightwatch-label-window",
+        "lang": "rust",
+        "surface": "pipeline_health.rs::read_knightwatch_liveness",
+        "observation": "A repo-wide `issues/comments?per_page=100` read returned a FULL page (100 of 100) whose oldest comment is 15h old, and no comment in it carried the reviewer marker. The claim being made spans 48h.",
+        "wrongClaim": "the ready-for-review label doesn't exist in the repo at all",
+        "truth": "The label exists (colour #0E8A16, bead sparkle-x8fxcw). No OPEN PR carried it — a different fact with a different fix. Acting on the false version meant re-creating an existing label.",
+        "mechanism": "A capped page proves presence, never absence. The window (15h) is SHORTER than the claim (48h), so an empty read cannot settle the question and must report could-not-look.",
+        "coveredBy": "pipeline_health.rs::tests::false_absence_knightwatch_truncated_window_is_unknown"
+      },
+      {
+        "id": "reviewer-unavailable",
+        "lang": "rust",
+        "surface": "pipeline_health.rs::classify_knightwatch",
+        "observation": "The reviewer-liveness read came back with no reviewer comment in its window, while the open-PR read FAILED outright and was defaulted to false.",
+        "wrongClaim": "The PR reviewer (knightwatch) is unavailable — reprovision the VM.",
+        "truth": "Knightwatch was posting a real, substantive review on PR #2718 at that exact moment.",
+        "mechanism": "Two failed reads were each laundered into a negative fact — an unreadable comment window into 'no review', an unreadable PR list into 'no open PRs'. Neither is an observation.",
+        "coveredBy": "pipeline_health.rs::tests::false_absence_reviewer_unreadable_prs_is_unknown"
+      },
+      {
+        "id": "roborev-timeout",
+        "lang": "rust",
+        "surface": "pipeline_health.rs::classify_not_answering",
+        "observation": "An 8-second `roborev status` probe timed out, and no daemon evidence (process liveness, launchd state, store size, lock activity) could be read either.",
+        "wrongClaim": "there is no roborev daemon process — the review daemon is not running",
+        "truth": "The daemon was alive and answering in 0.5-0.9ms.",
+        "mechanism": "A timeout is a property of the OBSERVATION, not of the thing observed. With no corroborating evidence the only honest verdict is could-not-look.",
+        "coveredBy": "pipeline_health.rs::tests::false_absence_roborev_timeout_without_evidence_is_unknown"
+      },
+      {
+        "id": "release-draft-invisible",
+        "lang": "rust",
+        "surface": "pipeline_health.rs::classify_release_publication",
+        "observation": "A `gh api repos/<repo>/releases` read that could not be proven to include drafts returned no object for the newest tag.",
+        "wrongClaim": "There is no release object at all for v0.140.0 — not even a draft.",
+        "truth": "A draft existed. Drafts are visible only to a token with the right scope, so an under-scoped or truncated read sees a published-only view.",
+        "mechanism": "'Not even a draft' is a claim about a population the read was never shown to cover. Without that proof it is could-not-look.",
+        "coveredBy": "pipeline_health.rs::tests::false_absence_release_draft_blindness_is_unknown"
+      },
+      {
+        "id": "epic-sweeper-no-change",
+        "lang": "ts",
+        "surface": "engine/epicContinuation.ts",
+        "observation": "The sweeper compared two board readings and saw no difference in the fields it can see, while workers were actively committing to the epic's branches.",
+        "wrongClaim": "no observable change — no progress",
+        "truth": "Workers were committing throughout. The sweeper's mark simply does not observe commits.",
+        "mechanism": "'I cannot see this kind of progress' is not 'there is no progress'. An unchanged mark whose inputs do not cover the work in question is could-not-look.",
+        "coveredBy": "engine/epicContinuation.falseAbsence.test.ts"
+      },
+      {
+        "id": "resume-ticker-no-progress",
+        "lang": "ts",
+        "surface": "engine/goalContinuation.ts::repeatedResumeLine",
+        "observation": "An agent's progress mark did not move across two sweeps while it was running a long verify, or waiting on a queued CI run with no open PR yet to gate on.",
+        "wrongClaim": "Nothing Sparkle can observe has changed since resume 1.",
+        "truth": "The agent was working fine. A long verification run and a queued CI run both move nothing the mark reads.",
+        "mechanism": "The mark reads prompt history and tool activity; it does not read a running verify or a queued run. An unmoved mark under a known-unobservable wait is could-not-look, and re-arming on it interrupts working agents.",
+        "coveredBy": "engine/goalContinuation.falseAbsence.test.ts"
+      }
+    ]
+  }
+}

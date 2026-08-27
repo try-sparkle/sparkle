@@ -143,7 +143,23 @@ export function remediationFor(componentId: string): string | null {
     case "release_runner":
       return "The release runner (DMG build) is offline — wake the founder's Mac, and repair the runner with `sudo scripts/runner/setup-self-hosted-runner.sh` if it does not re-register.";
     case "knightwatch":
-      return "The PR reviewer (knightwatch) is unavailable — reprovision it with `scripts/knightwatch/provision-vm.sh`.";
+      // TWO THINGS WERE WRONG WITH THE PREVIOUS STRING, and both are the kind AGENTS.md warns about
+      // (a remedy is an instruction someone will follow).
+      //
+      //   1. IT NAMED A DEAD PATH. It said "reprovision it with `scripts/knightwatch/provision-vm.sh`",
+      //      but the configured reviewer is `sparkle-reviewer` — a local `claude` call dispatched per
+      //      push by the app's babysit sweep, not a VM. `pipeline_health.rs`'s own RESTART constant,
+      //      attached to the very detail this remedy is appended to, says `scripts/pr-review.sh
+      //      <PR#> --post`. The alert contradicted its own evidence.
+      //   2. IT OVERCLAIMED. "is unavailable" is an ABSENCE CLAIM (bead `sparkle-gazo4a`), and the
+      //      reading behind this component is a freshness heuristic over a comment window — it can
+      //      say the reviewer has not posted lately, never that it is down. It said "unavailable" at
+      //      the exact moment the reviewer was posting a substantive review on a live PR.
+      //
+      // Note the component now reports `unknown` rather than `warning` whenever that window could
+      // not be read back far enough to judge, so this string is only reached on a reading that DID
+      // cover the question — and it still only claims what such a reading supports.
+      return "The PR reviewer (sparkle-reviewer) has not posted a review recently while PRs are waiting — it is dispatched by the app's babysit sweep, so review one manually with `scripts/pr-review.sh <PR#> --post` and check why the sweep is not dispatching.";
     case "release_publication":
       // NEVER SAY "RE-DISPATCH" HERE. This string used to end "…and the tagged commit's CI gate
       // before re-dispatching", and re-dispatching a HELD tag is the one action release.yml
