@@ -200,6 +200,22 @@ pub struct ConflictFlag {
     pub raised_at_ms: u64,
     pub rung: usize,
     pub unresolved_secs: u64,
+    /// HOW OLD THE READING BEHIND THIS ROW IS, in seconds — `0` when it was taken on this look.
+    ///
+    /// ── WHY A HEDGE WAS NOT ENOUGH (bead sparkle-iw02bk) ──────────────────────────────────────
+    /// `blocked_by` and `evidence` already say a row is not current, and they were both set
+    /// correctly throughout a SIX-HOUR outage. It did not help: every row said "NOT current" in the
+    /// same words on minute one and on hour six, so the qualifier read as boilerplate and the
+    /// numbers beside it got acted on anyway. An unquantified hedge is one a reader learns to skip.
+    ///
+    /// This is the number that cannot be skipped, because it is a number: `21600` is not an opinion
+    /// about freshness, and "last read 6h 0m ago" is a sentence nobody mistakes for a live verdict.
+    ///
+    /// NOTE WHICH AGE THIS IS. `unresolved_secs` is how long the CONFLICT has stood; this is how
+    /// long ago we last MANAGED TO LOOK. During the measured outage the first kept climbing while
+    /// the second was frozen — and the surface showed only the first, so the rows looked
+    /// actively-monitored precisely because nothing was monitoring them.
+    pub reading_age_secs: u64,
     /// Why we could not read this PR, if we could not. Distinguishes "it is conflicting" from
     /// "we cannot tell". Mirrors nudge_ladder's last_blocked.
     ///
@@ -381,6 +397,19 @@ pub struct PrFacts {
     /// first-hand reading. Bounded by [`MAX_CARRIED_LOOKS`]; disclosed on the flag as
     /// `evidence: "last-known"`. Deliberately not part of [`identity_hash`].
     pub carried_looks: u32,
+    /// EPOCH MS OF THE LAST LOOK THAT ACTUALLY REACHED GITHUB FOR THIS PR — the anchor for
+    /// [`ConflictFlag::reading_age_secs`]. Deliberately not part of [`identity_hash`]: a clock
+    /// moving must never restart an episode.
+    ///
+    /// `evidence` already says a reading is not first-hand. What it cannot say is HOW STALE — and
+    /// that is the difference between a verdict GitHub was still recomputing forty seconds ago and
+    /// one nobody has been able to re-read since last night. Both wear the same words, so the
+    /// consumer had no way to weigh them and a six-hour-old verdict read exactly like a fresh one
+    /// (bead sparkle-iw02bk).
+    ///
+    /// Carried verbatim through [`blind_facts`], because a blind look does not move it: that is the
+    /// whole point — the number has to keep CLIMBING while the reader is down.
+    pub last_read_ms: u64,
 }
 
 /// One repo's open-PR read: the facts, PLUS whether the read filled its window.
@@ -470,6 +499,9 @@ fn decode_pr_facts(r: &Value) -> Option<PrFacts> {
         url: s("url"),
         // A freshly decoded row is always first-hand; the carry is the driver's doing.
         carried_looks: 0,
+        // Decoded from a read that just happened. `tick` re-stamps it through `advance_last_read`;
+        // this keeps the value honest for any path that builds facts outside that driver.
+        last_read_ms: now_ms(),
     })
 }
 
@@ -650,6 +682,43 @@ fn carry_unknown_forward(fresh: &mut PrFacts, previous: Option<&PrFacts>) -> Opt
     None
 }
 
+/// How old a reading is, in whole seconds — the value that reaches the consumer as
+/// [`ConflictFlag::reading_age_secs`].
+///
+/// SATURATING, and never negative. `last_read_ms` is an epoch stamp taken by this process, so a
+/// clock that steps BACKWARD (an NTP correction, a laptop waking) can put it ahead of `now`. A
+/// signed subtraction would then render a negative age; on this surface that is not a cosmetic
+/// glitch but a citation failure, because the Pusher's own gate refuses a whole report whose
+/// numbers do not match the ones it quoted. An impossible reading fails to `0` — "as fresh as we
+/// can claim" — which is the conservative direction here: it never invents staleness that would
+/// discredit a verdict that is in fact live.
+///
+/// A never-read row (`0`) is deliberately NOT special-cased into a huge age: no PR is ever tracked
+/// without a successful read first, so `0` cannot occur in production, and manufacturing a
+/// 57-year age out of a default would be a fabricated number on a surface built not to have any.
+fn reading_age_secs(last_read_ms: u64, now: u64) -> u64 {
+    now.saturating_sub(last_read_ms) / 1000
+}
+
+/// The `last_read_ms` one look leaves on the row.
+///
+/// A named function ONLY so the wiring is assertable. `tick` takes an `AppHandle` and has no test,
+/// and this module has already recorded (see [`blind_facts`]) a case where a fix that lived inside
+/// `tick` left every test green while doing nothing. The rule it encodes is one line and the whole
+/// feature depends on it: a look that REACHED the repo stamps now; a blind one must leave the old
+/// stamp exactly where it is, because a blind look that refreshed this would reset the very counter
+/// that is supposed to expose it.
+///
+/// `stored` is `None` only for a PR seen for the first time, which by construction arrives on a
+/// look that read it — so `now` is the honest answer there rather than a 1970 epoch.
+fn advance_last_read(reached_repo: bool, stored: Option<u64>, now: u64) -> u64 {
+    if reached_repo {
+        now
+    } else {
+        stored.unwrap_or(now)
+    }
+}
+
 /// Identity of one conflict: FNV-1a over `(head_oid, merge_state)`.
 ///
 /// A change to either ends the episode, and those are the only two things that can end one: the
@@ -771,6 +840,7 @@ fn build_flag(
         raised_at_ms: raised_at_ms.unwrap_or_else(now_ms),
         rung: decision.rung,
         unresolved_secs: state.unresolved_secs(),
+        reading_age_secs: reading_age_secs(facts.last_read_ms, now_ms()),
         blocked_by: state.last_blocked().map(str::to_string),
     }
 }
@@ -811,6 +881,81 @@ struct Repo {
     dirs: Vec<PathBuf>,
 }
 
+/// Is `dir` a worktree `gh` and `git` can still ANSWER from — as opposed to a husk that merely
+/// looks like one?
+///
+/// ── WHY `.git.exists()` WAS NOT THIS CHECK (bead sparkle-iw02bk) ──────────────────────────────
+/// `git worktree prune` removes the ADMIN directory at `<repo>/.git/worktrees/<id>`. It does NOT
+/// touch the worktree's own `.git`, which is a one-line `gitdir:` POINTER FILE living in the
+/// worktree directory itself. So a pruned worktree keeps its `.git` and passes an `.exists()` test
+/// — the test that was written precisely to exclude "a leftover husk `git worktree prune` has
+/// already disowned", and excluded none of them.
+///
+/// What that cost: every `git`/`gh` call in such a directory answers `fatal: not a git repository:
+/// <the pruned gitdir>`. [`repo_slug`] therefore returns `None`, so `gh pr list` falls back to
+/// resolving the repo from its cwd and fails, and `gh api` cannot expand `{owner}/{repo}` and fails
+/// too. Two failures, one cause, neither of them an API fault — reported as [`BOTH_APIS_FAILED`],
+/// which reads as a GitHub outage. And because `dirs` is sorted and [`probe_repo`] always takes the
+/// same leading [`MAX_PROBE_FALLBACKS`], it recurs identically on every sweep: not a transient, a
+/// PERMANENT blind spot that ends only when a human deletes the directory. Measured on the
+/// founder's machine as a ~6-hour outage during which the `gh` CLI was entirely healthy.
+///
+/// Both shapes of `.git` are accepted, because both are real:
+///   * a FILE — a linked worktree. Live only if the `gitdir:` it names still exists.
+///   * a DIRECTORY — an ordinary main checkout, which owns its git dir outright.
+///
+/// Deliberately filesystem-only: no subprocess. This runs once per worktree per discovery walk, and
+/// `discovery_stamp` exists to keep that walk cheap — spawning `git` here would put ~90 processes on
+/// a path built to cost syscalls.
+fn is_live_worktree(dir: &Path) -> bool {
+    let dot_git = dir.join(".git");
+    let Ok(meta) = std::fs::metadata(&dot_git) else {
+        return false;
+    };
+    if meta.is_dir() {
+        return true;
+    }
+    let Ok(contents) = std::fs::read_to_string(&dot_git) else {
+        // A `.git` we cannot read is not a directory we can answer from either, but it is also not
+        // the husk this function is named for — say so, since silence here is what hid the original.
+        tracing::warn!(
+            target: "conflict_watch",
+            dir = %dir.display(),
+            "a worktree's `.git` file is unreadable; treating the worktree as gone"
+        );
+        return false;
+    };
+    let Some(gitdir) = gitdir_pointer(&contents) else {
+        return false;
+    };
+    // A RELATIVE pointer resolves against the worktree directory, which is how git writes one for a
+    // worktree created with a relative path.
+    let target = if gitdir.is_absolute() { gitdir } else { dir.join(gitdir) };
+    if target.exists() {
+        return true;
+    }
+    tracing::debug!(
+        target: "conflict_watch",
+        dir = %dir.display(),
+        gitdir = %target.display(),
+        "skipping a PRUNED worktree: its `.git` file survives but the gitdir it names is gone, so \
+         every `gh` call here fails with `not a git repository` and reads as an API outage"
+    );
+    false
+}
+
+/// The path out of a linked worktree's `.git` pointer file (`gitdir: <path>`), PURE so the parse is
+/// asserted without a filesystem. `None` for anything that is not that one line — a `.git` we
+/// cannot parse is not a worktree we can vouch for.
+fn gitdir_pointer(contents: &str) -> Option<PathBuf> {
+    contents
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("gitdir:"))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+}
+
 /// Every live worktree per project, in a stable (sorted) order.
 ///
 /// Sorted so that the duplicate-PR-number tie-break in [`tick`] and the fallback order in
@@ -831,10 +976,7 @@ fn discover_repos(app_data: &Path) -> Vec<Repo> {
             let mut dirs: Vec<PathBuf> = std::fs::read_dir(base.join(project_id))
                 .ok()?
                 .flatten()
-                // `.git` is a FILE in a linked worktree, so its presence is the cheap proof this
-                // directory is still a live worktree and not a leftover husk `git worktree prune`
-                // has already disowned.
-                .filter(|e| e.path().join(".git").exists())
+                .filter(|e| is_live_worktree(&e.path()))
                 .map(|e| e.path())
                 .collect();
             dirs.sort();
@@ -1553,6 +1695,7 @@ where
                 commits_behind: 0,
                 url: p.url.clone(),
                 carried_looks: 0,
+                last_read_ms: now_ms(),
             }
         })
         .collect();
@@ -2584,6 +2727,16 @@ fn tick<R: Runtime>(app: &AppHandle<R>, watch: &mut Watch, now: u64) {
                 (pr, t.project_id.clone(), None, blind_facts(&t.facts), Some(reason))
             }
         };
+        // WHEN THIS PR WAS LAST ACTUALLY READ. Stamped here, before the verdict logic below, so it
+        // records whether we REACHED the repo — not whether we liked what it said. A carried
+        // `unknown` did reach GitHub (the verdict was merely still being recomputed) and so counts
+        // as a reading; a blind look reached nothing and must leave the old stamp alone, which is
+        // what lets the age keep climbing through an outage. See `advance_last_read`.
+        facts.last_read_ms = advance_last_read(
+            dir.is_some(),
+            watch.tracked.get(&pr).map(|t| t.facts.last_read_ms),
+            now,
+        );
         // GitHub is still recomputing this PR's mergeability — no new information, so inherit the
         // last real verdict rather than letting the churn reset the episode. See
         // `carry_unknown_forward`; this is the second door into the reset bug.
@@ -2773,6 +2926,8 @@ mod tests {
             commits_behind: 220,
             url: "https://github.com/o/r/pull/1091".into(),
             carried_looks: 0,
+            // Read just now unless a test says otherwise, so a fixture never claims a 1970 reading.
+            last_read_ms: now_ms(),
         }
     }
 
@@ -3565,7 +3720,130 @@ mod tests {
         assert_eq!(remaining, vec![10], "the closed PR's row goes; the open one stays");
     }
 
+    // ══ HOW OLD IS THIS READING? ════════════════════════════════════════════════════════════════
+
+    /// THE DEFECT, STATED AS A TEST: a reader that cannot read must not present its last verdict as
+    /// a current one — and the row has to say HOW OLD the reading is (bead sparkle-iw02bk).
+    ///
+    /// The measured outage had `blocked_by` and `evidence` set correctly for six hours and it did
+    /// not help: the hedge was word-for-word identical on minute one and on hour six, so it read as
+    /// boilerplate while the numbers next to it got acted on. An age is the part a reader cannot
+    /// skim past.
+    ///
+    /// Asserts the SIDE EFFECT — what the CONSUMER is told on the row it renders — not that a
+    /// helper was called or that something was logged.
+    #[test]
+    fn a_row_we_could_not_re_read_reports_how_old_its_reading_is() {
+        let read_at = now_ms() - 6 * 3600 * 1000;
+        let stale = PrFacts { last_read_ms: read_at, ..conflicting_facts() };
+        let (state, decision) = climb(&observation(&stale, Some(BOTH_APIS_FAILED)), 3);
+        let flag = build_flag(&stale, None, &decision, &state, None);
+
+        assert!(
+            (21_595..=21_605).contains(&flag.reading_age_secs),
+            "the row must carry the AGE of its reading (~6h), got {}s",
+            flag.reading_age_secs
+        );
+        // AND THE HEDGE IS STILL THERE. The age ADDS to the disclosure; it does not replace it, and
+        // a row that quietly dropped `blocked_by` in favour of a number would be a fresh way to
+        // read as current.
+        assert_eq!(flag.blocked_by.as_deref(), Some(BOTH_APIS_FAILED));
+        // AND THE VERDICT IS STILL REPORTED. "Unknown" licenses "we cannot vouch for this", never
+        // "there is no verdict" — dropping the row would suppress a real standing conflict for the
+        // whole outage, which is the failure the evidence split exists to prevent.
+        assert_eq!(flag.kind, "conflicting", "the standing conflict still reaches somebody");
+        assert!(flag.untested);
+    }
+
+    /// THE PAIRED CASE — REQUIRED, and the half that stops the fix from being "always claim stale".
+    ///
+    /// A reader that reported a large age unconditionally would satisfy the test above while being
+    /// strictly worse than the bug: every live verdict would read as unreliable and the surface
+    /// would stop being believed at all. So a first-hand reading must report a real verdict AND an
+    /// age of zero.
+    #[test]
+    fn a_reading_taken_on_this_look_reports_a_real_verdict_and_no_age() {
+        let fresh = PrFacts { last_read_ms: now_ms(), ..conflicting_facts() };
+        let (state, decision) = climb(&observation(&fresh, None), 3);
+        let flag = build_flag(&fresh, None, &decision, &state, None);
+
+        assert!(flag.reading_age_secs <= 1, "a fresh read is not stale: {}s", flag.reading_age_secs);
+        assert_eq!(flag.blocked_by, None, "and nothing is holding it");
+        assert_eq!(flag.evidence, "no-checks-ran", "a first-hand verdict, stated as one");
+        assert_eq!(flag.kind, "conflicting");
+    }
+
+    /// RECOVERY — the half that was missing for six hours.
+    ///
+    /// Fail, keep failing, then succeed. The age must CLIMB while the reader is down and drop back
+    /// to zero the moment a look reaches the repo again, so a recovered reader is visibly recovered
+    /// rather than merely stopping its complaints.
+    ///
+    /// Drives `advance_last_read`, which is the rule `tick` applies — extracted precisely because
+    /// `tick` takes an `AppHandle` and a fix living inside it is a fix no assertion can reach.
+    #[test]
+    fn the_age_climbs_through_an_outage_and_resets_when_the_reader_recovers() {
+        let t0 = 1_000_000_000_000u64;
+        let minute = 60_000u64;
+
+        // A first look that READ the repo anchors the stamp.
+        let read = advance_last_read(true, None, t0);
+        assert_eq!(read, t0, "a look that reached the repo stamps itself");
+        assert_eq!(reading_age_secs(read, t0), 0, "and is not stale");
+
+        // Now the reader goes blind. Every blind look must LEAVE THE STAMP ALONE — a blind look
+        // that refreshed it would reset the very counter that exposes the outage, which is exactly
+        // how six hours of blindness stayed invisible.
+        let mut stamp = read;
+        let mut ages = Vec::new();
+        for i in 1..=6 {
+            let now = t0 + i * 60 * minute;
+            stamp = advance_last_read(false, Some(stamp), now);
+            assert_eq!(stamp, t0, "a blind look must not refresh the reading stamp");
+            ages.push(reading_age_secs(stamp, now));
+        }
+        assert_eq!(ages, vec![3600, 7200, 10800, 14400, 18000, 21600], "the age must CLIMB: {ages:?}");
+
+        // AND IT RECOVERS. One successful look re-anchors the stamp and the age falls to zero.
+        let back = t0 + 7 * 60 * minute;
+        let recovered = advance_last_read(true, Some(stamp), back);
+        assert_eq!(recovered, back, "a look that reaches the repo re-anchors the stamp");
+        assert_eq!(
+            reading_age_secs(recovered, back),
+            0,
+            "a recovered reader must serve LIVE verdicts again, not a permanently-hedged row"
+        );
+    }
+
+    /// A CLOCK THAT STEPS BACKWARD MUST NOT PRODUCE A NEGATIVE AGE.
+    ///
+    /// `last_read_ms` is a stamp this process took, and an NTP correction or a laptop waking can
+    /// put it ahead of `now`. On this surface a negative number is not cosmetic: the Pusher's
+    /// citation gate refuses a whole report whose quoted numbers do not match its measured ones, so
+    /// one impossible age would present as SILENCE across the entire detector.
+    #[test]
+    fn an_impossible_age_fails_to_zero_rather_than_going_negative() {
+        assert_eq!(reading_age_secs(2_000, 1_000), 0, "a backward clock reads as fresh, not as -1");
+        assert_eq!(reading_age_secs(1_500, 1_000), 0);
+        assert_eq!(reading_age_secs(0, 1_999), 1, "and whole seconds truncate, never round up");
+    }
+
     // ══ DISCOVERY ═══════════════════════════════════════════════════════════════════════════════
+
+    /// Create `dir` as a LIVE linked worktree — a `.git` POINTER FILE whose gitdir really exists.
+    ///
+    /// The pointer has to RESOLVE. Every fixture here used to write a literal pointer naming a path
+    /// that has never existed — so each of them was building the exact husk [`is_live_worktree`]
+    /// now drops, while asserting it was a live worktree. That is what made the old `.exists()`
+    /// filter look tested: the fixtures agreed with the bug (bead sparkle-iw02bk).
+    ///
+    /// The admin directory is kept under the worktree because the filter only asks whether the
+    /// pointer resolves; WHERE a real git puts it is not something these tests are about.
+    fn make_live_worktree(dir: &Path) {
+        let admin = dir.join(".git-admin");
+        std::fs::create_dir_all(&admin).unwrap();
+        std::fs::write(dir.join(".git"), format!("gitdir: {}\n", admin.display())).unwrap();
+    }
 
     /// Repos are found through the worktrees Sparkle itself created, so this thread depends on
     /// nothing the (possibly wedged) WebView publishes.
@@ -3573,9 +3851,17 @@ mod tests {
     fn repos_are_discovered_from_the_worktree_layout_and_husks_are_skipped() {
         let d = tempfile::tempdir().unwrap();
         let base = d.path().join("worktrees");
-        // A live worktree: `.git` is a FILE in a linked worktree.
+        // A live worktree: `.git` is a FILE in a linked worktree, pointing at a gitdir that is
+        // really there. The pointer must RESOLVE — a dangling one is the husk this filter drops,
+        // and a pointer naming a path that never existed made this fixture a husk claiming to be live.
+        let admin = d.path().join("repo/.git/worktrees/agent-1");
+        std::fs::create_dir_all(&admin).unwrap();
         std::fs::create_dir_all(base.join("proj-a").join("agent-1")).unwrap();
-        std::fs::write(base.join("proj-a").join("agent-1").join(".git"), "gitdir: ...").unwrap();
+        std::fs::write(
+            base.join("proj-a").join("agent-1").join(".git"),
+            format!("gitdir: {}\n", admin.display()),
+        )
+        .unwrap();
         // A husk `git worktree prune` has already disowned — no `.git` left.
         std::fs::create_dir_all(base.join("proj-b").join("agent-2")).unwrap();
 
@@ -3583,6 +3869,89 @@ mod tests {
         assert_eq!(repos.len(), 1, "the husk must not be probed: {repos:?}");
         assert_eq!(repos[0].project_id, "proj-a");
         assert_eq!(repos[0].dirs, vec![base.join("proj-a").join("agent-1")]);
+    }
+
+    /// THE HUSK THAT ACTUALLY OCCURS KEEPS ITS `.git` FILE — measured 2026-08-24/25, and this is
+    /// the whole mechanism behind a reader that stayed dead for six hours while `gh` on the same
+    /// machine was healthy (bead sparkle-iw02bk).
+    ///
+    /// `git worktree prune` removes the ADMIN directory under `<repo>/.git/worktrees/<id>`. It does
+    /// NOT remove the worktree's own `.git` FILE, which is a one-line `gitdir:` pointer sitting in
+    /// the worktree directory. So the `.exists()` liveness filter — written specifically to exclude
+    /// "a leftover husk `git worktree prune` has already disowned" — excludes nothing: the husk
+    /// passes it, gets probed, and answers `fatal: not a git repository` to every `gh` call.
+    ///
+    /// That failure is DETERMINISTIC and PERMANENT, which is what turns a transient into an outage:
+    /// `dirs` is sorted, `probe_repo` always takes the same first [`MAX_PROBE_FALLBACKS`], and a
+    /// project whose candidates are husks fails identically on every sweep forever. Measured on the
+    /// founder's machine: one project's ONLY two candidate directories were both husks, so both the
+    /// GraphQL and the REST probe failed for the same non-API reason and the repo reported
+    /// [`BOTH_APIS_FAILED`] — an "API outage" that was never an API problem at all.
+    ///
+    /// Asserts the SIDE EFFECT — the husk is not offered to the prober — not that some helper was
+    /// called. Revert `is_live_worktree` to a bare `.exists()` and this goes red.
+    #[test]
+    fn a_pruned_worktree_that_kept_its_git_file_is_not_a_live_candidate() {
+        let d = tempfile::tempdir().unwrap();
+        let base = d.path().join("worktrees");
+        let admin = d.path().join("repo/.git/worktrees");
+
+        // LIVE: `.git` points at an admin gitdir that is really there.
+        let live = base.join("proj-a").join("agent-live");
+        std::fs::create_dir_all(&live).unwrap();
+        std::fs::create_dir_all(admin.join("agent-live")).unwrap();
+        std::fs::write(
+            live.join(".git"),
+            format!("gitdir: {}\n", admin.join("agent-live").display()),
+        )
+        .unwrap();
+
+        // HUSK: `.git` is still on disk, but the gitdir it names has been pruned away. Sorts FIRST,
+        // which is how it consumed the fallback budget ahead of the live sibling.
+        let husk = base.join("proj-a").join("agent-DEAD");
+        std::fs::create_dir_all(&husk).unwrap();
+        std::fs::write(
+            husk.join(".git"),
+            format!("gitdir: {}\n", admin.join("agent-DEAD").display()),
+        )
+        .unwrap();
+        assert!(husk.join(".git").exists(), "precondition: the husk passes the OLD filter");
+
+        let repos = discover_repos(d.path());
+        assert_eq!(repos.len(), 1, "the project is still discovered: {repos:?}");
+        assert_eq!(
+            repos[0].dirs,
+            vec![live],
+            "the husk must be dropped, so the live worktree is what gets probed"
+        );
+    }
+
+    /// THE PAIRED CASE — the half that stops the fix from being "call everything dead".
+    ///
+    /// A filter that returned `false` for everything would satisfy the test above and blind the
+    /// reader completely, which is strictly worse than the bug. So: a live linked worktree is
+    /// still live, and a MAIN checkout — where `.git` is a DIRECTORY, not a pointer file — is too.
+    #[test]
+    fn a_live_worktree_and_a_main_checkout_both_stay_live() {
+        let d = tempfile::tempdir().unwrap();
+        let admin = d.path().join("repo/.git/worktrees/agent-1");
+        std::fs::create_dir_all(&admin).unwrap();
+
+        let linked = d.path().join("linked");
+        std::fs::create_dir_all(&linked).unwrap();
+        std::fs::write(linked.join(".git"), format!("gitdir: {}\n", admin.display())).unwrap();
+        assert!(is_live_worktree(&linked), "a linked worktree with a real gitdir is live");
+
+        let main_checkout = d.path().join("main-checkout");
+        std::fs::create_dir_all(main_checkout.join(".git")).unwrap();
+        assert!(
+            is_live_worktree(&main_checkout),
+            "a main checkout keeps its whole `.git` DIRECTORY and must never read as a husk"
+        );
+
+        let nothing = d.path().join("no-git");
+        std::fs::create_dir_all(&nothing).unwrap();
+        assert!(!is_live_worktree(&nothing), "and a directory with no `.git` at all is not a worktree");
     }
 
     /// ONE BROKEN WORKTREE MUST NOT BLIND A PROJECT (roborev 57873).
@@ -4149,8 +4518,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let base = d.path().join("worktrees");
         let wt = base.join("proj-a").join("agent-1");
-        std::fs::create_dir_all(&wt).unwrap();
-        std::fs::write(wt.join(".git"), "gitdir: ...").unwrap();
+        make_live_worktree(&wt);
 
         let mut cache = DiscoveryCache::default();
         // A `Cell`, not a captured `&mut`, so reading the count between calls does not fight the
@@ -4173,16 +4541,14 @@ mod tests {
         // A NEW WORKTREE MUST STILL BE FOUND — a cache that never invalidates is just a bug with
         // better latency.
         let wt2 = base.join("proj-a").join("agent-2");
-        std::fs::create_dir_all(&wt2).unwrap();
-        std::fs::write(wt2.join(".git"), "gitdir: ...").unwrap();
+        make_live_worktree(&wt2);
         let third = walk(&mut cache);
         assert_eq!(walks.get(), 2, "adding a worktree bumps its project dir's mtime, so we re-walk");
         assert_eq!(third[0].dirs.len(), 2, "and the new worktree is in the answer");
 
         // A NEW PROJECT bumps the BASE directory instead — the other half of the stamp.
         let wt3 = base.join("proj-b").join("agent-3");
-        std::fs::create_dir_all(&wt3).unwrap();
-        std::fs::write(wt3.join(".git"), "gitdir: ...").unwrap();
+        make_live_worktree(&wt3);
         let fourth = walk(&mut cache);
         assert_eq!(walks.get(), 3, "a new PROJECT is caught by the base dir's mtime");
         assert_eq!(fourth.len(), 2);
@@ -4207,8 +4573,7 @@ mod tests {
         let base = d.path().join("worktrees");
         let proj = base.join("proj-a");
         let wt1 = proj.join("agent-1");
-        std::fs::create_dir_all(&wt1).unwrap();
-        std::fs::write(wt1.join(".git"), "gitdir: ...").unwrap();
+        make_live_worktree(&wt1);
 
         let mut cache = DiscoveryCache::default();
         let walks = std::cell::Cell::new(0usize);
@@ -4230,8 +4595,7 @@ mod tests {
 
         // A new agent starts up in that same project. Only the project dir's mtime moves.
         let wt2 = proj.join("agent-2");
-        std::fs::create_dir_all(&wt2).unwrap();
-        std::fs::write(wt2.join(".git"), "gitdir: ...").unwrap();
+        make_live_worktree(&wt2);
 
         let back = walk(&mut cache);
         assert_eq!(
@@ -4255,8 +4619,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let base = d.path().join("worktrees");
         let proj = base.join("proj-a");
-        std::fs::create_dir_all(proj.join("agent-1")).unwrap();
-        std::fs::write(proj.join("agent-1").join(".git"), "gitdir: ...").unwrap();
+        make_live_worktree(&proj.join("agent-1"));
 
         let mut cache = DiscoveryCache::default();
         let walks = std::cell::Cell::new(0usize);
@@ -4267,8 +4630,7 @@ mod tests {
             walks.set(walks.get() + 1);
             let seen = discover_repos(p);
             let late = proj.join("agent-2");
-            std::fs::create_dir_all(&late).unwrap();
-            std::fs::write(late.join(".git"), "gitdir: ...").unwrap();
+            make_live_worktree(&late);
             seen
         });
         assert_eq!(first[0].dirs.len(), 1, "the walk legitimately missed the late arrival");
@@ -4658,6 +5020,11 @@ mod tests {
             "raisedAtMs",
             "rung",
             "unresolvedSecs",
+            // The wire NAME is pinned here, not just the Rust field: the TS side reads
+            // `readingAgeSecs` off an `invoke` boundary TypeScript cannot check, so a rename that
+            // compiles on both sides would silently stop the age reaching the surface — leaving
+            // exactly the unquantified hedge that let a six-hour-old verdict read as current.
+            "readingAgeSecs",
             "blockedBy",
         ] {
             assert!(json.get(key).is_some(), "the contract field {key} is missing from {json}");

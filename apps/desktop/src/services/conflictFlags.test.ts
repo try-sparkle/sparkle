@@ -37,6 +37,9 @@ const raw = {
   unresolvedSecs: 14400,
   evidence: "no-checks-ran",
   blockedBy: null,
+  // Rust sends this as a plain `u64`, so it is always present and never `null` — unlike the
+  // Option-typed fields above. It is `0` on a reading taken this look, which is the common case.
+  readingAgeSecs: 0,
 };
 
 beforeEach(() => {
@@ -45,6 +48,40 @@ beforeEach(() => {
 });
 
 describe("parseConflictFlags", () => {
+  // ── THE READING'S AGE MUST SURVIVE THE PARSE ─────────────────────────────────────────────────
+  //
+  // `parseOne` builds an EXPLICIT object rather than spreading the input, which is the right call
+  // (it is what stops an unvalidated field riding along) and is also why a new field reaches the
+  // consumer only if it is copied here by hand. A producer that states the age and a parser that
+  // drops it renders exactly the surface this change exists to remove: a six-hour-old verdict
+  // narrated with an unquantified hedge (bead sparkle-iw02bk).
+  it("keeps the age of the reading, which is what makes a stale row legible as stale", () => {
+    const [one] = parseConflictFlags([{ ...raw, evidence: "unknown", readingAgeSecs: 21600 }])!;
+    expect(one!.readingAgeSecs).toBe(21600);
+  });
+
+  // VERSION SKEW MUST NOT MUTE THE DETECTOR. This parser is ALL-OR-NOTHING: one unreadable entry
+  // turns the whole sweep into "we did not look". An older Rust half sends no `readingAgeSecs`, so
+  // requiring it would silence the detector for the entire fleet on any mismatched build — trading
+  // a disclosure gap for a total outage. Absent is accepted and simply carries no age.
+  it("still parses a payload from a producer that does not send an age", () => {
+    const { readingAgeSecs: _readingAgeSecs, ...withoutAge } = raw;
+    const parsed = parseConflictFlags([withoutAge]);
+    expect(parsed).toHaveLength(1);
+    expect(parsed![0]!.readingAgeSecs).toBeUndefined();
+    expect(parsed![0]!.pr).toBe(1091);
+  });
+
+  // A NONSENSE AGE IS REAL DRIFT, and it is rejected at the boundary for the same reason
+  // `commitsBehind` is: a negative renders as `-5`, from which the report's citation gate reads `5`
+  // while `measured` holds `-5`. The two never match, so the WHOLE report is refused as
+  // `fabricated-citation` — which presents as silence. Better to refuse the payload loudly here.
+  it("refuses a negative or fractional age rather than letting it reach the report", () => {
+    expect(parseConflictFlags([{ ...raw, readingAgeSecs: -5 }])).toBeUndefined();
+    expect(parseConflictFlags([{ ...raw, readingAgeSecs: 1.5 }])).toBeUndefined();
+    expect(parseConflictFlags([{ ...raw, readingAgeSecs: "6h" }])).toBeUndefined();
+  });
+
   it("accepts the frozen wire shape and keeps every field", () => {
     expect(parseConflictFlags([raw])).toEqual([
       {
@@ -56,6 +93,7 @@ describe("parseConflictFlags", () => {
         commitsBehind: 220,
         unresolvedSecs: 14400,
         evidence: "no-checks-ran",
+        readingAgeSecs: 0,
       },
     ]);
   });

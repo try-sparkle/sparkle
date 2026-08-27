@@ -99,6 +99,22 @@ function parseOne(v: unknown): ConflictingPr | undefined {
   // never fire. Unlike `ownerAgentId`, where `null` is a distinct FACT (unresolved) that must
   // survive, `null` here carries no information the absent key does not, so it normalises to absent.
   if (blockedBy !== undefined && blockedBy !== null && typeof blockedBy !== "string") return undefined;
+  // HOW OLD THE READING IS — OPTIONAL KEY, CONSTRAINED VALUE, and both halves are deliberate.
+  //
+  // OPTIONAL, because an older Rust half sends no such key and this parser is all-or-nothing:
+  // requiring it would turn every sweep on a mismatched build into "we did not look" for the whole
+  // fleet at once — muting the detector to fix a disclosure problem. This is the one field whose
+  // absence is a version fact rather than drift. (`null` is not accepted: Rust sends a plain `u64`,
+  // so `null` is not a shape the producer can emit and treating it as absent would hide real drift.)
+  //
+  // CONSTRAINED, because of what a bad value does downstream. The report renders this number into
+  // its text, and the citation gate refuses a WHOLE report whose quoted numbers do not match its
+  // measured ones — so a negative would render `-5`, be read back as `5`, and present as SILENCE
+  // across every condition, not just this one. Same rule, same reason, as `commitsBehind` above.
+  const readingAge = o["readingAgeSecs"];
+  if (readingAge !== undefined && (!Number.isSafeInteger(readingAge) || (readingAge as number) < 0)) {
+    return undefined;
+  }
   return {
     pr: o["pr"] as number,
     projectId: o["projectId"],
@@ -109,6 +125,10 @@ function parseOne(v: unknown): ConflictingPr | undefined {
     unresolvedSecs: o["unresolvedSecs"] as number,
     evidence,
     ...(typeof blockedBy === "string" ? { blockedBy } : {}),
+    // Copied EXPLICITLY, like every field here. The object is built key by key rather than spread
+    // precisely so an unvalidated field cannot ride along — which also means a producer that states
+    // the age and a parser that forgets to copy it renders the exact surface this change removes.
+    ...(readingAge === undefined ? {} : { readingAgeSecs: readingAge as number }),
   };
 }
 

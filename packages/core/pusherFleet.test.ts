@@ -1280,6 +1280,82 @@ describe("pr-conflicting evidence", () => {
     expect(citable(c!.text, c!.measured)).toBe(true);
   });
 
+  // ── HOW OLD IS THE READING? ──────────────────────────────────────────────────────────────────
+  //
+  // "NOT current" is a QUALIFIER, and through a measured six-hour outage it was set correctly on
+  // every row and did not help: it said the same words on minute one and on hour six, so it read as
+  // boilerplate while the numbers next to it got acted on. The producer now states
+  // `readingAgeSecs`; these cases are about the reader being TOLD it.
+  //
+  // Note which age this is: `unresolvedSecs` is how long the CONFLICT has stood, and it kept
+  // climbing right through the outage — which is why the rows looked actively monitored when in
+  // fact nothing had been read since the night before.
+  it("says HOW OLD a not-current reading is, rather than only that it is not current", () => {
+    const [c] = evaluateFleetConditions(
+      [],
+      T0,
+      [],
+      [pr({ evidence: "unknown", blockedBy: "gh-graphql-and-rest-failed", readingAgeSecs: 6 * 3600 })],
+    );
+    const line = lineFor(c!.text, 1091);
+    expect(line).toContain("NOT current");
+    // THE POINT: a number the reader cannot skim past.
+    expect(line).toContain("last read 6h 0m ago");
+    // The whole report must still survive the citation gate — a number in the text that is not in
+    // `measured` refuses the WHOLE report as `fabricated-citation`, which presents as SILENCE and
+    // would take the detector down in a new way while fixing the old one.
+    expect(citable(c!.text, c!.measured)).toBe(true);
+  });
+
+  // THE PAIRED CASE — REQUIRED. A surface that stamped an age on every row would satisfy the case
+  // above while telling the reader that live verdicts are unreliable too, which is worse than the
+  // bug: the value of the disclosure is that it is NOT always there.
+  it("does not age-stamp a reading that was taken on this look", () => {
+    const [c] = evaluateFleetConditions([], T0, [], [pr({ evidence: "no-checks-ran", readingAgeSecs: 0 })]);
+    const line = lineFor(c!.text, 1091);
+    expect(line).toContain("no CI has ever run on it");
+    expect(line).not.toContain("last read");
+    expect(line).not.toContain("NOT current");
+    expect(citable(c!.text, c!.measured)).toBe(true);
+  });
+
+  // A STALE ROW GETS THE SAME TREATMENT. This is the exact sentence the founder was shown 17 times:
+  // "last known to be mergeable — that reading is NOT current". It is the one that most reads as a
+  // present-tense verdict, because "mergeable" is the word a reader acts on.
+  it("age-stamps a stale row's not-current mergeability too", () => {
+    const [c] = evaluateFleetConditions(
+      [],
+      T0,
+      [],
+      [pr({ kind: "stale", evidence: "unknown", readingAgeSecs: 5 * 3600 + 52 * 60 })],
+    );
+    const line = lineFor(c!.text, 1091);
+    expect(line).toContain("last known to be mergeable");
+    expect(line).toContain("last read 5h 52m ago");
+    expect(citable(c!.text, c!.measured)).toBe(true);
+  });
+
+  // VERSION SKEW MUST NOT MUTE THE DETECTOR. An older Rust half sends no `readingAgeSecs` at all,
+  // and the field is optional precisely so that build keeps reporting: the row loses the age and
+  // keeps everything else. Making it mandatory would turn every sweep on a mismatched build into
+  // "we did not look" for the whole fleet at once.
+  it("still reports a row from a producer that does not send an age", () => {
+    const [c] = evaluateFleetConditions([], T0, [], [pr({ evidence: "unknown" })]);
+    const line = lineFor(c!.text, 1091);
+    expect(line).toContain("NOT current");
+    expect(line).not.toContain("last read");
+    expect(line).toContain("#1091");
+    expect(citable(c!.text, c!.measured)).toBe(true);
+  });
+
+  // A SUB-MINUTE AGE IS NOT STALENESS. "last read 0h 0m ago" is noise that would train the reader to
+  // ignore the phrase — the exact fate of the qualifier this replaces.
+  it("does not stamp an age under a minute", () => {
+    const [c] = evaluateFleetConditions([], T0, [], [pr({ evidence: "unknown", readingAgeSecs: 42 })]);
+    expect(lineFor(c!.text, 1091)).not.toContain("last read");
+    expect(citable(c!.text, c!.measured)).toBe(true);
+  });
+
   // ── THE AGGREGATE IS A CLAIM TOO, AND IT COVERS EVERY ROW ────────────────────────────────────
   // The headline used to say "they have never been tested" unconditionally, one line above a row
   // that says its checks DID run, or that nobody re-read the verdict. Same defect as the row-level

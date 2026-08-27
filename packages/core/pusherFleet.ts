@@ -225,6 +225,27 @@ export interface ConflictingPr {
   evidence: ConflictEvidence | (string & {});
   /** Whatever the producer knows is holding it, quoted verbatim. Absent when nothing is recorded. */
   blockedBy?: string;
+  /**
+   * HOW OLD the reading behind this row is, in seconds — `0` when it was taken on the last look.
+   *
+   * ── WHY `evidence` WAS NOT ENOUGH ──────────────────────────────────────────────────────────────
+   * `evidence` says a reading is not current; it cannot say HOW not-current. Through a measured
+   * six-hour outage it was set correctly on all 17 rows and did not help, because the qualifier was
+   * word-for-word identical on minute one and on hour six. A hedge that never changes is one the
+   * reader learns to skip, and the numbers beside it got acted on anyway. This is the part that
+   * cannot be skimmed, because it is itself a number.
+   *
+   * NOTE WHICH AGE THIS IS. {@link ConflictingPr.unresolvedSecs} is how long the CONFLICT has stood
+   * — it kept climbing right through the outage, which is precisely why the rows looked actively
+   * monitored while nothing had been re-read since the night before. This one is how long ago
+   * anybody managed to LOOK.
+   *
+   * OPTIONAL ON PURPOSE, and this is a safety property rather than laxity. An older Rust half sends
+   * no such key; the desktop parser is ALL-OR-NOTHING, so requiring it would turn every sweep on a
+   * mismatched build into "we did not look" for the whole fleet at once — muting the detector to
+   * fix a disclosure problem. Absent simply means the producer does not state it.
+   */
+  readingAgeSecs?: number;
 }
 
 /**
@@ -1196,6 +1217,40 @@ const FIRST_HAND_EVIDENCE = new Set<string>([
 const notCurrent = (c: ConflictingPr): boolean => !FIRST_HAND_EVIDENCE.has(c.evidence);
 
 /**
+ * A reading old enough to be worth saying out loud — one minute.
+ *
+ * Below it the phrase would render "last read 0h 0m ago", which is noise, and noise on a qualifier
+ * is exactly how the qualifier this supplements stopped being read. A sub-minute gap is also not
+ * staleness by any reading: the producer's own sweep cadence is longer than that.
+ */
+const READING_AGE_FLOOR_SECS = 60;
+
+/**
+ * The hours and minutes of this row's reading age, or `undefined` when there is nothing honest to
+ * say — the producer stated no age (an older build), the value is not a usable number, or the
+ * reading is fresh enough that stamping it would be noise.
+ *
+ * ONE SOURCE FOR BOTH SIDES, and that is a safety property. Whatever numbers reach the TEXT must
+ * also reach the condition's `measured` list: a number in the text that is not measured refuses the
+ * WHOLE report as `fabricated-citation`, and that refusal presents as SILENCE. So a disclosure
+ * added carelessly here would mute the detector rather than improve it. Both the phrase and the
+ * `measured` entries are computed from this function, so they cannot drift apart.
+ */
+function readingAgeParts(c: ConflictingPr): { h: number; m: number } | undefined {
+  const secs = c.readingAgeSecs;
+  if (typeof secs !== "number" || !Number.isFinite(secs) || secs < READING_AGE_FLOOR_SECS) {
+    return undefined;
+  }
+  return splitHoursMinutes(Math.trunc(secs) * 1000);
+}
+
+/** ` (last read 6h 0m ago)`, or `""` when {@link readingAgeParts} has nothing to state. */
+function agePhrase(c: ConflictingPr): string {
+  const parts = readingAgeParts(c);
+  return parts === undefined ? "" : ` (last read ${parts.h}h ${parts.m}m ago)`;
+}
+
+/**
  * The compound "conflicting — and therefore untested" clause for one PR, qualified by HOW the
  * producer knows it.
  *
@@ -1213,7 +1268,7 @@ function testingPhrase(c: ConflictingPr): string {
       c.evidence === "unknown"
         ? "nothing about this commit could be confirmed on the last look"
         : "the verdict is real and recent, but was not re-read on the last look";
-    return `conflicting, and therefore untested — but this reading is NOT current: ${why}`;
+    return `conflicting, and therefore untested — but this reading is NOT current: ${why}${agePhrase(c)}`;
   }
   // Checks that EXIST but ran before the conflict arose are not "no CI has ever run": they ran, and
   // they ran against a merge that no longer applies. Same conclusion — nothing current has tested
@@ -1294,7 +1349,7 @@ export function conflictCondition(
     // rather than re-establishing it, so a `stale` row whose evidence is not current may not claim
     // it in the present tense — the same rule the conflicting lines above already follow.
     const merges = notCurrent(c)
-      ? "last known to be mergeable — that reading is NOT current — but"
+      ? `last known to be mergeable — that reading is NOT current${agePhrase(c)} — but`
       : "mergeable, but";
     return `  - #${c.pr} ${c.branch} — ${merges} ${behind} and drifting further with every merge. Unresolved for ${h}h ${m}m. ${who}.${held}`;
   });
@@ -1357,6 +1412,15 @@ export function conflictCondition(
       String(nS),
       ...ordered.flatMap((c) => [String(c.pr), String(behindOf(c))]),
       ...ages.flatMap(({ h, m }) => [String(h), String(m)]),
+      // The READING age, which is a DIFFERENT number from the conflict age above it. Emitted for
+      // every row whose producer stated one, whether or not that row's line ends up carrying the
+      // phrase: `measured` is a whitelist, so a spare entry is harmless while a MISSING one refuses
+      // the whole report as `fabricated-citation` — silently. Both this and the text read
+      // `readingAgeParts`, so they cannot disagree about what was computed.
+      ...ordered.flatMap((c) => {
+        const parts = readingAgeParts(c);
+        return parts === undefined ? [] : [String(parts.h), String(parts.m)];
+      }),
       // Branch names, labels and hold reasons are reproduced character-for-character, so whatever
       // digits they carry are quoted rather than computed — the widening this module's header names.
       ...quotedNumbers(
