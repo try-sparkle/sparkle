@@ -141,7 +141,11 @@ const REMEDY: Record<string, string> = {
     "It's optional — Sparkle works without it. Turn it on in Settings to install it.",
   [REVIEW_REFUSALS.daemonDown]:
     "roborev is installed but its daemon isn't running, so I can't reach any findings. This is " +
-    "NOT the same as there being none — I genuinely can't see. `roborev daemon start` fixes it.",
+    "NOT the same as there being none — I genuinely can't see. Restart it through launchd so it " +
+    "comes up with the right PATH: `launchctl kickstart -k gui/$(id -u)/co.plow.roborev-daemon`. " +
+    "Do NOT run `roborev daemon start` — it's broken on this machine (it needs setsid) and each " +
+    "failed attempt leaves an orphan daemon on a bare PATH that answers healthy while it can reach " +
+    "no review agent, so review goes dark silently.",
   [REVIEW_REFUSALS.unregistered]:
     "roborev has never reviewed anything in this project, so it has no findings to show. An empty " +
     "answer here would mean \"nothing has looked\", not \"nothing was found\" — `roborev init` in " +

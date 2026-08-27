@@ -106,6 +106,26 @@ describe("an unreachable roborev is never reported as a clean repo", () => {
     expect(!r.ok && r.message).toMatch(/can't see|daemon/i);
   });
 
+  // The remedy is an instruction the reader will run, so it must not prescribe the very command that
+  // CAUSES the fault. `roborev daemon start` is broken on this macOS (needs setsid) and each failed
+  // attempt leaves an orphan daemon on launchd's bare PATH that answers "healthy" while reaching no
+  // review agent — review goes dark silently (bead sparkle-wtiu7m). The safe restart hands the port
+  // back to launchd, whose plist carries the full PATH. This assertion FAILS the moment the remedy
+  // reverts to the bare `roborev daemon start` prescription.
+  it("prescribes the launchd restart, never the bare `roborev daemon start` that orphans the daemon", async () => {
+    invokeMock.mockRejectedValue(new Error("roborev-daemon-down: failed to connect to daemon"));
+
+    const r = await listFindings(REPO);
+    expect(r.ok).toBe(false);
+    const msg = !r.ok ? r.message : "";
+    // Must route the restart through launchd (correct PATH), matching pipeline_health's remedy.
+    expect(msg).toContain("launchctl kickstart -k gui/$(id -u)/co.plow.roborev-daemon");
+    // Must NOT tell the reader to run the broken command that manufactures the bare-PATH orphan.
+    // (A bare `roborev daemon start`; the string is allowed only inside an explicit "Do NOT" warning.)
+    expect(msg).not.toMatch(/`roborev daemon start` fixes it/);
+    expect(msg).toMatch(/Do NOT run `roborev daemon start`/);
+  });
+
   // A repo roborev has never tracked returns an EMPTY ARRAY from `roborev list`, which is
   // indistinguishable from "registered, nothing open" — Rust probes registration to tell them
   // apart. The two answers mean opposite things: "you're clear" vs "nothing has ever looked".
