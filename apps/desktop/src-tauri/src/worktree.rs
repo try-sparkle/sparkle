@@ -6432,6 +6432,228 @@ fn base_branch_gate(app_data: &Path, project_id: &str, root: &str, number: u64) 
     }
 }
 
+// ── STALE-HEAD AND UNDRAINED-REVIEW GATES ─────────────────────────────────────────────────────
+// Beads sparkle-sx0glm / sparkle-vthvdx (one defect, filed twice) and sparkle-c9is0f. Both are this
+// epic's shape: the merge path reports the SYMPTOM it produced rather than the CAUSE a reader can
+// act on. It merged whichever head it happened to see and said nothing about the newer work it was
+// leaving behind; and it merged a commit whose roborev findings were still open while the pre-push
+// gate — asking the SAME question about the SAME commit — held them back. Two mechanisms
+// disagreeing about one commit is not a policy, it is a gap, and the lenient side is the one that
+// lands.
+//
+// Both gates live HERE, in `merge_pr`, for the reason [`merge_policy_gate`] and [`base_branch_gate`]
+// do: this function is the single sink for all six in-app merge paths, so one call covers them all
+// and no surface routes around it.
+//
+// Both follow [`base_branch_gate`]'s doctrine that ONLY POSITIVE EVIDENCE REFUSES — with one
+// deliberate exception, called out on [`roborev_drain_gate`], where a read that could not be
+// completed refuses, because that is what the pre-push gate does and matching it is the entire
+// point of the bead.
+
+/// How PR #n's head relates to its branch's LOCAL tip.
+///
+/// Refs live in the common git dir and are shared by every worktree of a repository, so
+/// `refs/heads/<head>` read from `root` **is** the agent's branch tip. No worktree lookup, no
+/// subprocess in another directory, and it works for an agent whose worktree has already been torn
+/// down — which is exactly the case where the abandoned commits are hardest to find.
+#[derive(Debug, PartialEq, Eq)]
+enum HeadDrift {
+    /// The PR head IS the branch tip. Merge it.
+    InSync,
+    /// The branch carries `ahead` commits the PR head does not, AND the PR head is an ancestor of
+    /// the tip — so those commits are strictly newer work this merge would leave behind.
+    WorktreeAhead { ahead: usize },
+    /// Nothing positive was established: an unknown head oid, no local ref, a DIVERGED pair, or a
+    /// git that could not answer. Diverged is deliberately here and not in `WorktreeAhead`: the
+    /// remedy below ("push, then merge") is not safe for a branch that has been rewritten, and a
+    /// refusal whose remedy is unsafe under the conditions that triggered it is worse than no
+    /// refusal at all (AGENTS.md, *User-facing copy is code*).
+    CannotTell,
+}
+
+/// The pure classifier, so the decision is testable without a repo. `ahead` counts commits reachable
+/// from the local tip but not from the PR head; `behind` the reverse, so `behind == 0` is "the PR
+/// head is an ancestor of the tip".
+fn head_drift_verdict(pr_head: &str, local_tip: &str, ahead: usize, behind: usize) -> HeadDrift {
+    let (pr_head, local_tip) = (pr_head.trim(), local_tip.trim());
+    if pr_head.is_empty() || local_tip.is_empty() {
+        return HeadDrift::CannotTell;
+    }
+    if pr_head == local_tip {
+        return HeadDrift::InSync;
+    }
+    if behind == 0 && ahead > 0 {
+        HeadDrift::WorktreeAhead { ahead }
+    } else {
+        HeadDrift::CannotTell
+    }
+}
+
+/// The refusal for a merge that would land a stale head. A refusal is an instruction the reader will
+/// follow, so it names the ONE remedy that is safe under the conditions that produced it: the local
+/// commits are strictly newer than the PR head, so pushing them fast-forwards the branch and the PR
+/// picks them up. It never suggests merging anyway, because that is the loss.
+fn stale_head_refusal(number: u64, head_ref: &str, pr_head: &str, ahead: usize) -> String {
+    let short: String = pr_head.chars().take(12).collect();
+    let plural = if ahead == 1 { "commit" } else { "commits" };
+    format!(
+        "Refusing merge_pr #{number}: the branch `{head_ref}` carries {ahead} local {plural} that \
+         this PR's head ({short}) does not. Merging now lands the OLDER head and leaves that newer \
+         work — including any review-finding drains — on no pull request, with nothing pointing at \
+         it (beads sparkle-sx0glm / sparkle-vthvdx). Those commits are strictly newer than the PR \
+         head, so pushing them fast-forwards the branch: `git push origin {head_ref}`. The PR picks \
+         the new head up, its checks re-run, and the merge then lands all of it."
+    )
+}
+
+/// Refuse a `merge_pr` that would land a head the agent's branch is already AHEAD of
+/// (beads sparkle-sx0glm / sparkle-vthvdx).
+///
+/// `pr_head` is the head oid the caller's merge decision was made against — the same value
+/// [`merge_argv`] hands to `--match-head-commit`. That flag is NOT this gate: it asks whether the
+/// REMOTE branch moved under the merge, and answers "no" for precisely the measured case, where the
+/// newer commits were still LOCAL and had never been pushed.
+fn worktree_ahead_gate(root: &str, number: u64, head_ref: &str, pr_head: Option<&str>) -> Result<(), String> {
+    let head_ref = head_ref.trim();
+    let Some(pr_head) = pr_head.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(());
+    };
+    if head_ref.is_empty() {
+        return Ok(());
+    }
+    // `--verify --quiet` exits non-zero for an absent ref AND for a repo that cannot be read; both
+    // are "cannot tell", which is what an Err becomes here.
+    let full_ref = format!("refs/heads/{head_ref}");
+    let Ok(local_tip) = git(root, &["rev-parse", "--verify", "--quiet", &full_ref]) else {
+        return Ok(());
+    };
+    // Two counts rather than `merge-base --is-ancestor`: that command reports FALSE and an ERROR
+    // with the same non-zero exit, and this gate must not read "git could not answer" as "the
+    // branch has not moved". A `rev-list --count` of an object we do not have fails loudly instead.
+    let count = |range: String| -> Option<usize> {
+        git(root, &["rev-list", "--count", &range]).ok()?.trim().parse().ok()
+    };
+    let (Some(ahead), Some(behind)) = (
+        count(format!("{pr_head}..{}", local_tip.trim())),
+        count(format!("{}..{pr_head}", local_tip.trim())),
+    ) else {
+        return Ok(());
+    };
+    match head_drift_verdict(pr_head, local_tip.trim(), ahead, behind) {
+        HeadDrift::InSync | HeadDrift::CannotTell => Ok(()),
+        HeadDrift::WorktreeAhead { ahead } => Err(stale_head_refusal(number, head_ref, pr_head, ahead)),
+    }
+}
+
+/// Wall-clock ceiling for the roborev query. Local IPC to a daemon, so shorter than a network read;
+/// long enough that a busy daemon is not mistaken for a dead one.
+const ROBOREV_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// THE SHARED DEFINITION of an outstanding finding, copied from the pre-push gate's `_is_open_fail`
+/// so the two surfaces cannot answer differently about one commit — which is the whole of bead
+/// `sparkle-c9is0f`: six HIGH findings, the pre-push gate held the worst one back, the app merged
+/// anyway, and the fixes needed a third PR.
+///
+/// `verdict == "F"` is load-bearing: `roborev list --open` means "unresolved, ANY verdict" and
+/// includes PASS rows. `closed` drops reviews already acknowledged with `roborev close`.
+///
+/// Returns `(open_fail_count, ids)` — the count comes from the ROWS, not from the ids, so a drifted
+/// row with no `id` still blocks the merge instead of silently vanishing from the tally.
+/// `None` means the output could not be read as the contract's shape, which is DISTINCT from a
+/// cleanly-parsed empty result. A bare JSON `null` is roborev's way of saying "no jobs for this
+/// repo+branch" (a fresh repo, a brand-new branch) and is EMPTY, not a fault.
+fn roborev_open_fail(stdout: &str) -> Option<(usize, Vec<i64>)> {
+    let v: Value = serde_json::from_str(stdout.trim()).ok()?;
+    if v.is_null() {
+        return Some((0, Vec::new()));
+    }
+    let rows = v.as_array()?;
+    let open: Vec<&Value> = rows
+        .iter()
+        .filter(|j| {
+            j.get("verdict").and_then(Value::as_str) == Some("F")
+                && !j.get("closed").and_then(Value::as_bool).unwrap_or(false)
+        })
+        .collect();
+    let ids = open.iter().filter_map(|j| j.get("id").and_then(Value::as_i64)).collect();
+    Some((open.len(), ids))
+}
+
+/// The refusal for a merge whose branch still has open fail-verdict reviews. The remedy is the one
+/// the pre-push gate already prints and that an agent can actually perform — read it, fix it or
+/// record why it was declined, then close it. There is deliberately no override: the pre-push gate
+/// offers none either, and an override here would re-open exactly the disagreement this closes.
+fn roborev_drain_refusal(number: u64, head_ref: &str, count: usize, ids: &[i64]) -> String {
+    let plural = if count == 1 { "review" } else { "reviews" };
+    let which = if ids.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", ids.iter().map(i64::to_string).collect::<Vec<_>>().join(", "))
+    };
+    format!(
+        "Refusing merge_pr #{number}: `{head_ref}` has {count} open roborev fail-verdict {plural}\
+         {which}. The pre-push gate already blocks on these, so merging here would land defects it \
+         held back and leave the fixes to a third PR (bead sparkle-c9is0f). Drain them first: \
+         `roborev show <id>` to read the findings, then either fix and `roborev close <id>`, or \
+         `EDITOR=true roborev comment --job <id> -m \"<why declined>\" && roborev close <id>`."
+    )
+}
+
+/// Refuse a `merge_pr` whose branch still carries open roborev fail-verdict reviews
+/// (bead `sparkle-c9is0f`).
+///
+/// Scoped by BRANCH, not by the head sha alone, because that is what the pre-push gate does
+/// (`roborev list --json --repo <root> --branch <b>`) and matching it exactly is the point: a
+/// finding raised on an earlier commit of the branch is still unlanded when the branch lands.
+///
+/// FAIL-CLOSED, unlike its two sibling gates, and the asymmetry is deliberate. "roborev is not
+/// installed here" and "roborev is switched off for this project" are ABSENCE OF A MECHANISM and
+/// allow the merge — otherwise this would block every merge in every repo that does not use it.
+/// But once roborev IS the mechanism, a read that fails is not evidence of no findings: certifying
+/// "nothing open" from a wedged daemon is the precise shape the pre-push gate refuses, and it is
+/// the shape that let the measured merge through.
+fn roborev_drain_gate(root: &str, number: u64, head_ref: &str, enabled: bool) -> Result<(), String> {
+    let head_ref = head_ref.trim();
+    if !enabled || head_ref.is_empty() {
+        return Ok(());
+    }
+    // No roborev on this machine = no mechanism, not a silent failure. Allow.
+    let Some(bin) = crate::preflight::cached_roborev_path() else {
+        return Ok(());
+    };
+    let mut cmd = Command::new(bin);
+    cmd.args(["list", "--json", "--repo", root, "--branch", head_ref]).current_dir(root);
+    apply_noninteractive(&mut cmd);
+    let parsed = match output_with_timeout(cmd, ROBOREV_TIMEOUT) {
+        Ok(out) if out.status.success() => roborev_open_fail(&String::from_utf8_lossy(&out.stdout)),
+        // A non-zero exit, a timeout, or a capped/incomplete drain are all "could not read", never
+        // "nothing found" — `roborev list` exits 0 while printing a usage dump when the daemon is
+        // unreachable, so the parse is what actually settles it (AGENTS.md, *roborev cadence*).
+        _ => None,
+    };
+    roborev_drain_decision(number, head_ref, parsed)
+}
+
+/// The gate's DECISION, split out from the subprocess so all three arms are reachable from a test —
+/// including the UNREADABLE one, which is the arm that actually matters and the one a
+/// live-daemon-dependent test can never reach on demand.
+fn roborev_drain_decision(
+    number: u64,
+    head_ref: &str,
+    parsed: Option<(usize, Vec<i64>)>,
+) -> Result<(), String> {
+    match parsed {
+        Some((0, _)) => Ok(()),
+        Some((count, ids)) => Err(roborev_drain_refusal(number, head_ref, count, &ids)),
+        None => Err(format!(
+            "Refusing merge_pr #{number}: could not read roborev's review state for `{head_ref}`, \
+             so whether this head has open fail-verdict findings is UNKNOWN — and an unknown is not \
+             an all-clear (bead sparkle-c9is0f). Check `roborev status`, then merge again. To merge \
+             without roborev at all, turn `[tools].roborev` off for this project."
+        )),
+    }
+}
+
 /// Wall-clock ceiling for a user-initiated `gh pr merge`. Longer than `NETWORK_TIMEOUT`: a merge does
 /// more server-side work than a read, and this path is one deliberate click (not a background poll),
 /// so a slightly longer wait is acceptable where a stalled poll would not be.
@@ -6520,6 +6742,15 @@ pub async fn merge_pr(
         merge_policy_gate(&root, "merge_pr")?;
         // Then WHERE the merge would land: never onto a peer agent's in-flight branch (sparkle-hvenv2).
         base_branch_gate(&app_data, &project_id, &root, number)?;
+        // Then WHAT would land, and whether it is ready to. The branch can be AHEAD of the head this
+        // merge was decided against, so merging strands the newer work on no PR (sparkle-sx0glm /
+        // sparkle-vthvdx); and that branch can still carry open roborev fail-verdict findings that
+        // the pre-push gate is already blocking on, so merging lands defects it held back
+        // (sparkle-c9is0f). One `gh` read serves both.
+        let head_ref = probe_pr_merge_facts(&root, number).map(|(_, h, _)| h).unwrap_or_default();
+        worktree_ahead_gate(&root, number, &head_ref, expected_head_oid.as_deref())?;
+        let roborev_on = crate::config::for_project(&root).config.tools.roborev;
+        roborev_drain_gate(&root, number, &head_ref, roborev_on)?;
         crate::knightwatch::enforce(&root, number, knightwatch_override.as_deref())?;
         let mut cmd = Command::new(crate::preflight::gh_program());
         cmd.args(merge_argv(number, expected_head_oid.as_deref()))
@@ -6740,6 +6971,21 @@ fn warm_one_slot(
     {
         let gl = repo_git_lock(root);
         let _lock = gl.lock().unwrap_or_else(|e| e.into_inner());
+        // ── THIS DIRECTORY'S BIRTH TIME IS POOL-WARM TIME (bead sparkle-21f4l9) ───────────────
+        // It is NOT the claim time and it is NOT the agent's session-start time. A slot is warmed
+        // HERE, on project open or a top-up, and only claimed later — by `try_claim_pooled_worktree`,
+        // which RENAMES this directory rather than creating a new one, so the birth time survives
+        // the claim unchanged and follows the agent's worktree around for the rest of its life.
+        //
+        // The two clocks diverge by MINUTES, and reading one as the other inverts an ordering:
+        // measured across three agents, settings written at 08:17:34 / 08:21:31 / 08:24:31 against
+        // SessionStart events at 08:17:43 / 08:21:38 / 08:24:41 — i.e. the writes land 7-10 SECONDS
+        // BEFORE session start, while directory birth time made them read as minutes AFTER it. Most
+        // of a session went to chasing an ordering bug that did not exist.
+        //
+        // When timing evidence decides a fix, key it to the EVENT: the per-agent hook-event log's
+        // `SessionStart` entry is the authoritative session-start clock and is already written for
+        // every agent. Do not derive session start from this directory.
         git(root, &["worktree", "add", "--detach", &slot_str, &base_commit])?;
     }
     pools()
@@ -6834,6 +7080,11 @@ fn try_claim_pooled_worktree(
     let target = worktree_path(app_data, project_id, agent_id).ok()?;
     let target_str = target.to_string_lossy().to_string();
 
+    // ── THE CLAIM IS WHERE THE TWO CLOCKS SEPARATE (bead sparkle-21f4l9) ─────────────────────
+    // What follows moves an ALREADY-EXISTING directory into place. Nothing here creates it, so the
+    // agent's worktree carries the birth time it was WARMED with (see the note at the `worktree add
+    // --detach` in the warm path), not the time this agent claimed it or started its session. The
+    // authoritative session-start clock is the per-agent hook-event log's `SessionStart` entry.
     // Pop the most-recently-warmed slot (LIFO — most likely to still match the current base).
     let slot = {
         let mut map = pools().lock().unwrap_or_else(|e| e.into_inner());
@@ -12035,6 +12286,222 @@ mod tests {
         git(&r, &["commit", "--allow-empty", "-m", "init"]).unwrap();
         git(&r, &["branch", "-M", "main"]).unwrap();
         r
+    }
+
+
+    // ── STALE-HEAD AND UNDRAINED-REVIEW GATES ────────────────────────────────────────────────
+    // Beads sparkle-sx0glm / sparkle-vthvdx and sparkle-c9is0f.
+
+    /// Same body-scoped whole-line pin as the two gates above: a substring test would pass for
+    /// `let _ = worktree_ahead_gate(…);`, which swallows the refusal, or for a commented-out call.
+    #[test]
+    fn merge_pr_actually_runs_the_worktree_ahead_gate() {
+        const CALL: &str = "worktree_ahead_gate(&root, number, &head_ref, expected_head_oid.as_deref())?;";
+        let src = include_str!("worktree.rs");
+        let start = src.find("pub async fn merge_pr(").expect("merge_pr's signature");
+        let body = &src[start..];
+        let merge = body.find("merge_argv(number,").expect("the merge argv");
+        assert!(
+            body[..merge].lines().any(|l| l.trim() == CALL),
+            "merge_pr must call worktree_ahead_gate as a STATEMENT, with `?`, BEFORE `gh pr merge`"
+        );
+    }
+
+    #[test]
+    fn merge_pr_actually_runs_the_roborev_drain_gate() {
+        const CALL: &str = "roborev_drain_gate(&root, number, &head_ref, roborev_on)?;";
+        let src = include_str!("worktree.rs");
+        let start = src.find("pub async fn merge_pr(").expect("merge_pr's signature");
+        let body = &src[start..];
+        let merge = body.find("merge_argv(number,").expect("the merge argv");
+        assert!(
+            body[..merge].lines().any(|l| l.trim() == CALL),
+            "merge_pr must call roborev_drain_gate as a STATEMENT, with `?`, BEFORE `gh pr merge`"
+        );
+    }
+
+    #[test]
+    fn head_drift_reads_an_identical_head_as_in_sync() {
+        assert_eq!(head_drift_verdict("abc123", "abc123", 0, 0), HeadDrift::InSync);
+        // Whitespace is not a difference — a `rev-parse` result arrives with a trailing newline.
+        assert_eq!(head_drift_verdict(" abc123 ", "abc123\n", 0, 0), HeadDrift::InSync);
+    }
+
+    /// THE BEAD: the branch is strictly newer than the head the merge was decided against.
+    #[test]
+    fn head_drift_reads_a_branch_ahead_of_the_pr_head_as_worktree_ahead() {
+        assert_eq!(
+            head_drift_verdict("old", "new", 3, 0),
+            HeadDrift::WorktreeAhead { ahead: 3 }
+        );
+    }
+
+    /// The PAIRED case that pins the cause rather than merely proving an absence: the same shapes
+    /// that are NOT "the branch has newer work" must all pass, or the gate blocks ordinary merges.
+    #[test]
+    fn head_drift_refuses_to_guess_when_the_evidence_is_not_positive() {
+        // DIVERGED — commits on both sides. "Push, then merge" is not safe for a rewritten branch,
+        // so this must not reach the refusal that recommends it.
+        assert_eq!(head_drift_verdict("old", "new", 2, 1), HeadDrift::CannotTell);
+        // The local ref is BEHIND the PR head (a worktree that never fetched). Nothing is stranded.
+        assert_eq!(head_drift_verdict("newer", "older", 0, 4), HeadDrift::CannotTell);
+        // Unknown head oid, and an unresolvable local ref.
+        assert_eq!(head_drift_verdict("", "new", 3, 0), HeadDrift::CannotTell);
+        assert_eq!(head_drift_verdict("old", "", 3, 0), HeadDrift::CannotTell);
+    }
+
+    /// The refusal is an instruction the reader will follow, so it must name the remedy that is
+    /// safe under the very conditions that triggered it — and must not offer the loss as an option.
+    #[test]
+    fn the_stale_head_refusal_names_the_push_remedy_and_never_advises_merging_anyway() {
+        let msg = stale_head_refusal(2580, "sparkle/agent-x", "0123456789abcdef0123", 2);
+        assert!(msg.contains("git push origin sparkle/agent-x"), "{msg}");
+        assert!(msg.contains("2 local commits"), "{msg}");
+        // The short sha, not the full one — and never truncated mid-way through a shorter oid.
+        assert!(msg.contains("0123456789ab"), "{msg}");
+        for unsafe_advice in ["--force", "merge anyway", "--admin", "--squash"] {
+            assert!(!msg.contains(unsafe_advice), "refusal must not suggest `{unsafe_advice}`: {msg}");
+        }
+        // Singular/plural is copy a human reads.
+        assert!(stale_head_refusal(1, "b", "abc", 1).contains("1 local commit that"), "singular");
+    }
+
+    /// A REAL repo, driving the gate itself rather than only its classifier — the classifier cannot
+    /// prove that `rev-list --count` was pointed at the right ends, and reversing the two ranges is
+    /// the mistake this test exists to catch.
+    #[test]
+    fn worktree_ahead_gate_refuses_a_branch_that_has_moved_past_the_pr_head() {
+        let root = init_repo("worktree-ahead-gate");
+        git(&root, &["checkout", "-q", "-b", "agent/work"]).unwrap();
+        let pr_head = git(&root, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
+        // The PR head is what it is now; the gate must PASS while the branch sits on it.
+        assert!(worktree_ahead_gate(&root, 7, "agent/work", Some(&pr_head)).is_ok());
+        // Two more local commits — never pushed, so `--match-head-commit` would still be satisfied.
+        git(&root, &["commit", "--allow-empty", "-m", "later work"]).unwrap();
+        git(&root, &["commit", "--allow-empty", "-m", "a review-finding drain"]).unwrap();
+        let err = worktree_ahead_gate(&root, 7, "agent/work", Some(&pr_head))
+            .expect_err("the branch is 2 commits past the PR head; merging strands them");
+        assert!(err.contains("2 local commits"), "{err}");
+        assert!(err.contains("git push origin agent/work"), "{err}");
+        // An unknown head oid, and a branch this repo does not have, are both "cannot tell".
+        assert!(worktree_ahead_gate(&root, 7, "agent/work", None).is_ok());
+        assert!(worktree_ahead_gate(&root, 7, "no/such/branch", Some(&pr_head)).is_ok());
+        // A head oid this repo has never seen makes `rev-list` fail — not a refusal.
+        assert!(worktree_ahead_gate(&root, 7, "agent/work", Some("deadbeef")).is_ok());
+    }
+
+    #[test]
+    fn roborev_open_fail_counts_only_unacknowledged_fail_verdicts() {
+        let raw = r#"[
+          {"id": 1, "verdict": "F", "closed": false},
+          {"id": 2, "verdict": "F", "closed": true},
+          {"id": 3, "verdict": "P", "closed": false},
+          {"id": 4, "verdict": "F"}
+        ]"#;
+        // 1 and 4 are open fails; 2 was acknowledged with `roborev close`, 3 passed.
+        assert_eq!(roborev_open_fail(raw), Some((2, vec![1, 4])));
+    }
+
+    /// The count comes from the ROWS, not the ids — a drifted row with no `id` must still block the
+    /// merge. Counting the ids instead makes such a row vanish from the tally and the gate certify
+    /// clear, which is the exact failure the gate exists to prevent.
+    #[test]
+    fn roborev_open_fail_still_counts_a_row_whose_id_is_missing() {
+        let raw = r#"[{"verdict": "F", "closed": false}]"#;
+        assert_eq!(roborev_open_fail(raw), Some((1, vec![])));
+    }
+
+    /// `null` is roborev's "no jobs for this repo+branch" — a fresh repo or a brand-new branch. It
+    /// is EMPTY, not a fault; reading it as a fault would refuse every merge in an unreviewed repo.
+    #[test]
+    fn roborev_open_fail_reads_a_bare_null_as_cleanly_empty() {
+        assert_eq!(roborev_open_fail("null"), Some((0, vec![])));
+        assert_eq!(roborev_open_fail("[]"), Some((0, vec![])));
+    }
+
+    /// UNREADABLE is not EMPTY. `roborev list` exits 0 while printing a usage dump when the daemon
+    /// is unreachable, so the parse is the thing that separates "no findings" from "nobody looked".
+    #[test]
+    fn roborev_open_fail_reports_an_unreadable_answer_as_none_not_as_empty() {
+        assert_eq!(roborev_open_fail("failed to connect to daemon\nUsage: roborev list"), None);
+        assert_eq!(roborev_open_fail(""), None);
+        assert_eq!(roborev_open_fail("{}"), None);
+    }
+
+    /// The two ABSENCE-OF-MECHANISM cases allow, so the gate cannot block every merge in every repo
+    /// that does not use roborev. Driven through the gate, not the parser.
+    #[test]
+    fn roborev_drain_gate_allows_when_the_mechanism_is_switched_off_or_unnamed() {
+        let root = init_repo("roborev-drain-gate-off");
+        assert!(roborev_drain_gate(&root, 9, "agent/work", false).is_ok(), "[tools].roborev off");
+        assert!(roborev_drain_gate(&root, 9, "", true).is_ok(), "no head ref to ask about");
+    }
+
+    #[test]
+    fn the_roborev_refusal_names_the_drain_the_agent_can_actually_perform() {
+        let msg = roborev_drain_refusal(2580, "agent/work", 6, &[11, 12]);
+        assert!(msg.contains("6 open roborev fail-verdict reviews"), "{msg}");
+        assert!(msg.contains("11, 12"), "{msg}");
+        assert!(msg.contains("roborev close <id>"), "{msg}");
+        // AGENTS.md pins this exact idiom: the flag on the comment, the reason on the comment,
+        // nothing on the close. A remedy that dies in $EDITOR is a remedy nobody can follow.
+        assert!(msg.contains("roborev comment --job <id> -m"), "{msg}");
+        assert!(msg.contains("EDITOR=true"), "{msg}");
+        assert!(roborev_drain_refusal(1, "b", 1, &[]).contains("1 open roborev fail-verdict review"), "singular");
+    }
+
+
+    /// Bead `sparkle-21f4l9` is a DOCUMENTATION fix, and prose is exactly what does not survive a
+    /// refactor — so pin it. Both the warm site and the claim site must keep saying that a pooled
+    /// worktree's directory birth time is POOL-WARM time, because that inference cost most of a
+    /// session chasing an ordering bug that did not exist.
+    #[test]
+    fn the_worktree_pool_says_directory_birth_time_is_not_session_start() {
+        let src = include_str!("worktree.rs");
+        // The WARM site: sliced from the `worktree add --detach` that creates a slot.
+        let warm = src
+            .find(r#"git(root, &["worktree", "add", "--detach", &slot_str, &base_commit])?;"#)
+            .expect("the pool warm's `worktree add --detach`");
+        let warm_note = &src[warm.saturating_sub(1600)..warm];
+        assert!(warm_note.contains("sparkle-21f4l9"), "the warm site must cite the bead");
+        assert!(
+            warm_note.contains("POOL-WARM TIME"),
+            "the warm site must say what the directory's birth time actually is"
+        );
+        assert!(
+            warm_note.contains("SessionStart"),
+            "naming the wrong clock is only half the fix; the note must name the RIGHT one"
+        );
+        // The CLAIM site, where the two clocks separate.
+        let claim = src
+            .find("fn try_claim_pooled_worktree(")
+            .expect("try_claim_pooled_worktree");
+        let claim_body = &src[claim..];
+        let pop = claim_body.find("Pop the most-recently-warmed slot").expect("the LIFO pop");
+        assert!(
+            claim_body[..pop].contains("sparkle-21f4l9"),
+            "the claim site must carry the note too — it is where a reader looks for 'when did this \
+             agent get its worktree', and the answer is not here"
+        );
+    }
+
+
+    /// THE ASYMMETRY, driven directly. A read that could not be completed is not evidence of no
+    /// findings — certifying "nothing open" from a wedged daemon is precisely how the measured merge
+    /// got through. This is the one arm that must NOT follow `base_branch_gate`'s allow-on-doubt
+    /// doctrine, so it gets its own test rather than riding on the parser's.
+    #[test]
+    fn roborev_drain_decision_refuses_an_unreadable_answer_as_well_as_open_findings() {
+        assert!(roborev_drain_decision(5, "b", Some((0, vec![]))).is_ok(), "clean = merge");
+        let open = roborev_drain_decision(5, "b", Some((2, vec![7, 8])))
+            .expect_err("two open fail-verdict reviews must hold the merge");
+        assert!(open.contains("2 open roborev fail-verdict reviews"), "{open}");
+        let unknown = roborev_drain_decision(5, "b", None)
+            .expect_err("an unreadable answer is not an all-clear");
+        assert!(unknown.contains("UNKNOWN"), "{unknown}");
+        assert!(unknown.contains("roborev status"), "the remedy must be one a reader can run: {unknown}");
+        // The two refusals must not be confusable — they need different remedies.
+        assert!(!unknown.contains("roborev close"), "an unreadable state has nothing to close: {unknown}");
     }
 
     fn branch_exists(root: &str, branch: &str) -> bool {
