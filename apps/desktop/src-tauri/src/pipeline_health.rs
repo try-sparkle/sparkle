@@ -4658,7 +4658,11 @@ mod tests {
         assert!(c.detail.contains("are accepted in"), "{}", c.detail);
 
         // The paired direction, through the SAME entry point: a root with no acceptance file accepts
-        // nothing, so the identical payloads warn.
+        // nothing, so the identical payloads degrade. It is BLOCKING rather than Warning because the
+        // baseline now carries v0.142.0 — a plain tag ABOVE the published high-water mark (v0.132.0)
+        // with no release object at all, which is branch 1's stranded-tag shape. That is the whole
+        // point of the pair: the SAME payloads read Healthy when the acceptance file is present and
+        // Blocking when it is not, so the file is provably what the classifier is honouring.
         let c = release_publication_from_json(
             Some(releases_json),
             Some(&tags_json),
@@ -4666,7 +4670,7 @@ mod tests {
             concat!(env!("CARGO_MANIFEST_DIR"), "/src"),
             &no_gh,
         );
-        assert_eq!(c.state, HealthState::Warning, "no file means nothing accepted: {}", c.detail);
+        assert_eq!(c.state, HealthState::Blocking, "no file means nothing accepted: {}", c.detail);
         assert!(c.detail.contains("could not be read"), "{}", c.detail);
     }
 
