@@ -9,12 +9,24 @@
 // of this boundary — Rust reporting `prState: "closed"` for an unprobed branch, or the stage window
 // shifting — would have turned confident verdicts into `unknown`, or `unknown` into "genuinely done",
 // with both suites green.
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+// THE TAURI BOUNDARY, mocked at the module edge rather than injected as a `deps` argument.
+//
+// ⚠️ THE DEFAULTED-SEAM TRAP (bead sparkle-lgbwf) is what dictates this shape. Had
+// `probeLandedFromGit` taken an injectable git runner, every test here would pass its own — and the
+// line supplying the REAL one would be covered by nothing, so deleting it would leave this suite
+// green while the feature was inert in production. There is no seam to default: the function calls
+// `invoke` directly, and what is replaced here is the Tauri module itself, which is the same
+// boundary the app crosses in production.
+const invokeMock = vi.hoisted(() => vi.fn(async (_cmd: string, _args?: unknown): Promise<unknown> => undefined));
+vi.mock("@tauri-apps/api/core", () => ({ invoke: (...a: unknown[]) => invokeMock(...(a as [string, unknown])) }));
 import {
   correctedStatusFor,
   expiryProofFor,
   goalReading,
   landedEvidenceFor,
+  probeLandedFromGit,
   stallEvidenceFor,
   stallReadingFor,
 } from "./agentGoalReading";
@@ -91,6 +103,11 @@ function seedRoster(over: Partial<AgentTab> = {}) {
 beforeEach(() => {
   seed({});
   seedRoster();
+  invokeMock.mockReset();
+  // ⚠️ NOT `beforeEach(() => invokeMock.mockReset())` as a one-liner: a vitest hook's RETURN VALUE
+  // is registered as the test's teardown, and `mockReset` returns the chainable mock — so vitest
+  // would CALL it after every test (bead: vitest-hook-return-is-a-teardown).
+  invokeMock.mockResolvedValue(undefined);
 });
 
 describe("readOpenPr — the open-PR arm nothing exercised", () => {
@@ -397,6 +414,75 @@ describe("goalReading — a frozen escalation beside a goal that has moved on", 
     const reading = goalReading(newGoal("cut the DMG", T), T + 2)!;
     expect(reading.escalationReason).toBeUndefined();
     expect(reading.escalationStale).toBeUndefined();
+  });
+});
+
+// ── probeLandedFromGit — THE ON-DEMAND READER FOR AN UNMOUNTED PANE ─────────────────────────────
+//
+// `landedEvidenceFor` is window-local by contract and bails on `branchStatus === undefined`, whose
+// only writer is a MOUNTED AgentPane. For an agent whose pane never mounted in this window it can
+// therefore never answer anything but `undefined`, `canSelfMarkMet` fails closed, and the agent is
+// auto-resumed until it escalates a false alarm over already-merged work (sparkle-h3wqm and ten
+// siblings). This is the second reader that closes that hole at the `set_agent_goal_met` seam.
+//
+// EVERY CASE BELOW SEEDS NO `branchStatus`, so the window-local reader genuinely declines.
+describe("probeLandedFromGit — the live git ancestry probe", () => {
+  const WT = "/wt/a";
+
+  it("returns TRUE when the probe reports the head is an ancestor", async () => {
+    seedRoster({ worktreePath: WT });
+    // The precondition this reader exists for: the cheap one has nothing to say.
+    expect(landedEvidenceFor(A)).toBeUndefined();
+    invokeMock.mockResolvedValue({ landed: true, reason: "abc is an ancestor of refs/remotes/origin/main" });
+    await expect(probeLandedFromGit(A)).resolves.toBe(true);
+  });
+
+  it("asks about the agent's OWN worktree and the project's root", async () => {
+    seedRoster({ worktreePath: WT });
+    invokeMock.mockResolvedValue({ landed: true, reason: "ok" });
+    await probeLandedFromGit(A);
+    // Both halves matter: HEAD is read in the AGENT's tree, and the default-branch name is resolved
+    // in the PROJECT's checkout — where it cannot degrade into the agent's own branch.
+    expect(invokeMock).toHaveBeenCalledWith("agent_landed_probe", { worktree: WT, root: "/tmp/p" });
+  });
+
+  it("returns FALSE when the probe reports it is not an ancestor", async () => {
+    seedRoster({ worktreePath: WT });
+    invokeMock.mockResolvedValue({ landed: false, reason: "abc is not an ancestor" });
+    await expect(probeLandedFromGit(A)).resolves.toBe(false);
+  });
+
+  // ── THE THREE FAIL-CLOSED SHAPES, all `undefined` and never `false` ────────────────────────────
+  // `false` makes `selfMarkRefusal` say "git says it is not on origin/main yet". Saying that about a
+  // git that never ran is the exact lie this cluster of beads reports.
+  it("treats serde's null `landed` as 'could not tell', NOT as a no", async () => {
+    seedRoster({ worktreePath: WT });
+    // A Rust `Option<bool>` crosses the wire as `null` for `None` — serde emits the key, it does not
+    // omit it (bead sparkle-16y6h). A parser spelling this `boolean | undefined` describes a shape
+    // the wire cannot produce.
+    invokeMock.mockResolvedValue({ landed: null, reason: "no origin/main to compare against" });
+    await expect(probeLandedFromGit(A)).resolves.toBeUndefined();
+  });
+
+  it("answers undefined when the invoke REJECTS", async () => {
+    seedRoster({ worktreePath: WT });
+    invokeMock.mockRejectedValue(new Error("worktree is gone"));
+    await expect(probeLandedFromGit(A)).resolves.toBeUndefined();
+  });
+
+  it("answers undefined, and never shells anything, when no worktree is recorded", async () => {
+    seedRoster({ worktreePath: null });
+    await expect(probeLandedFromGit(A)).resolves.toBeUndefined();
+    // THE SIDE EFFECT, not just the verdict: with no path to probe there is nothing to ask, and a
+    // call with `worktree: null` would reach Rust and be declined there instead — one subprocess
+    // spawn per refusal, on the seam that is meant to stay cheap.
+    expect(invokeMock).not.toHaveBeenCalled();
+  });
+
+  it("answers undefined for an id no project holds", async () => {
+    seedRoster({ worktreePath: WT });
+    await expect(probeLandedFromGit("not-a-roster-agent")).resolves.toBeUndefined();
+    expect(invokeMock).not.toHaveBeenCalled();
   });
 });
 

@@ -36,7 +36,9 @@ import {
   unlandedWorkEvidence,
   type WorkflowStageId,
 } from "../engine/workflowStage";
+import { invoke } from "@tauri-apps/api/core";
 import { useRuntimeStore } from "../stores/runtimeStore";
+import { useProjectStore } from "../stores/projectStore";
 import { useInteractionStore } from "../stores/interactionStore";
 import { calmNewAgent } from "../engine/newAgentAttention";
 import { findRosterAgent } from "./knownAgents";
@@ -312,6 +314,90 @@ export function landedEvidenceFor(agentId: string): boolean | undefined {
     });
   if (shipped !== true && !liveLandedOnOrigin) return false;
   return unlandedWorkEvidence({ bs, ws, stageOverride: stage }) === true ? false : true;
+}
+
+/** The Rust probe's reply (`goal_landed_probe.rs::LandedProbe`).
+ *
+ *  ⚠️ `landed` IS `boolean | null`, NOT `boolean | undefined`. It is a Rust `Option<bool>`, and
+ *  serde emits the key with a **null** value for `None` — it omits the key only under
+ *  `skip_serializing_if`. TypeScript's `field?: T` means `T | undefined`, which EXCLUDES null, so
+ *  the optimistic spelling would describe a shape the wire cannot produce (bead sparkle-16y6h).
+ *  Both `null` and absent are treated as "could not tell" below, which is the same answer. */
+interface LandedProbeReply {
+  landed?: boolean | null;
+  reason?: string | null;
+}
+
+/** Hard ceiling on the whole probe, JS side. Rust already bounds each subprocess (5s local, 10s for
+ *  the one fetch), so this is the backstop for the IPC itself hanging — the seam it guards is an
+ *  agent waiting on a reply, and an unbounded wait there is indistinguishable from the refusal loop
+ *  this whole change exists to end. Comfortably above the Rust budget so a slow-but-working fetch
+ *  still gets to answer. */
+const LANDED_PROBE_TIMEOUT_MS = 30_000;
+
+/**
+ * THE ON-DEMAND SECOND READER — git asked LIVE, for ONE agent, at the `set_agent_goal_met` seam.
+ *
+ * ── WHY {@link landedEvidenceFor} CANNOT BE THE ONLY ANSWER ──────────────────────────────────────
+ * That reader is window-local by contract: it reads already-polled store state and shells nothing,
+ * because `handleGetState` calls it for EVERY agent on a call orchestrators make routinely. Nothing
+ * here weakens that — the roster hot path still never reaches this function.
+ *
+ * But its first hard bail is `if (bs === undefined) return undefined`, and `runtimeStore.branchStatus`
+ * has exactly ONE writer: a MOUNTED AgentPane. Panes mount lazily per project, so for an agent whose
+ * pane is not mounted in this window — or right after a relaunch, or in a second window — that bail
+ * fires forever. `canSelfMarkMet` fails closed on `landed !== true`, and the refusal's own remedy
+ * ("mark it met again once a branch poll lands") never arrives, because nothing is polling that
+ * agent. Measured outcome: an agent whose work is PROVABLY merged is refused, auto-resumed, and
+ * eventually escalates a false alarm to a human — beads sparkle-h3wqm, sparkle-ayj8oe,
+ * sparkle-k2ocyl, sparkle-e0f34k, sparkle-4s07tm, sparkle-3d4ouj, sparkle-ch57hz, sparkle-28ifhw,
+ * sparkle-aqd0xp, sparkle-v22kuv, sparkle-fiyfrn.
+ *
+ * ── WHAT MAKES THE COST ACCEPTABLE HERE AND NOWHERE ELSE ─────────────────────────────────────────
+ * One call, one agent, made by an agent that believes it has finished, at most once per attempt.
+ * That is affordable; N agents × every roster tick is not. Do NOT call this from `awaitingCloseEvidenceFor`,
+ * `expiryProofFor`, or `handleGetState` — each of those is per-agent-per-tick and their own doc
+ * comments say why.
+ *
+ * ── `undefined` IS THE ONLY FAILURE VALUE ────────────────────────────────────────────────────────
+ * Every error path — no worktree recorded, no project row, a rejected invoke, a null `landed`, the
+ * timeout above — answers `undefined`, never `false`. `false` makes `selfMarkRefusal` emit "git says
+ * it is not on origin/main yet", which is exactly the sentence these beads report as a lie; only a
+ * real git ancestry verdict may produce it.
+ */
+export async function probeLandedFromGit(agentId: string): Promise<boolean | undefined> {
+  // Resolve BOTH halves from the roster row: the agent's own worktree (where HEAD is read) and the
+  // project's main checkout (where the default branch NAME is resolved). The Rust side declines
+  // outright without a root — see `landed_probe_in` for why guessing it can silently turn "have I
+  // landed?" into "have I pushed?".
+  let worktree: string | null = null;
+  let root: string | null = null;
+  for (const p of useProjectStore.getState().projects) {
+    const a = p.agents.find((x) => x.id === agentId);
+    if (a) {
+      worktree = a.worktreePath;
+      root = p.rootPath;
+      break;
+    }
+  }
+  if (!worktree || !root) return undefined;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const reply = await Promise.race([
+      invoke<LandedProbeReply>("agent_landed_probe", { worktree, root }),
+      new Promise<undefined>((resolve) => {
+        timer = setTimeout(() => resolve(undefined), LANDED_PROBE_TIMEOUT_MS);
+      }),
+    ]);
+    const landed = reply?.landed;
+    return typeof landed === "boolean" ? landed : undefined;
+  } catch {
+    // An unregistered command, a dead worktree, a panicking probe — all "we could not tell". The
+    // caller's copy for that is "your branch's git state has not been read yet", which is true.
+    return undefined;
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
 }
 
 /**

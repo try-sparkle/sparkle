@@ -142,6 +142,7 @@ import {
   goalReading,
   awaitingCloseEvidenceFor,
   landedEvidenceFor,
+  probeLandedFromGit,
   shippedAfterGoalSet,
   stallEvidenceFor,
   stallReadingFor,
@@ -2112,7 +2113,7 @@ function sameGoalVerify(stated: GoalVerify, stored: GoalVerify | undefined): boo
  * legitimately done — a turn ending does not set it — so without a way to say so an agent that
  * genuinely finished keeps being auto-continued, and the concierge keeps reading it as outstanding.
  */
-function handleSetGoalMet(req: ControlRequest): Record<string, unknown> {
+async function handleSetGoalMet(req: ControlRequest): Promise<Record<string, unknown>> {
   // CALLER-STAMPED FOR AGENTS, TARGETABLE ONLY BY THE CONCIERGE.
   //
   // Agent-to-agent spoofing is the threat: marking a DIFFERENT live agent met latches its `metAt`,
@@ -2231,6 +2232,42 @@ function handleSetGoalMet(req: ControlRequest): Record<string, unknown> {
   // some bearing there — it does not.
   const unlandedWork =
     goal.verify?.kind === "landed" ? stallEvidenceFor(targetId).hasUnlandedWork : undefined;
+  // ── THE WINDOW-LOCAL READING, THEN A LIVE GIT PROBE IF IT CAME BACK BLANK ────────────────────────
+  // `landedEvidenceFor` is the roster's reader and it stays exactly as it is: window-local, no git
+  // call, because `handleGetState` runs it for EVERY agent. Its first hard bail is
+  // `branchStatus === undefined`, and that map has ONE writer — a MOUNTED AgentPane. Panes mount
+  // lazily per project, so an agent whose pane is not mounted in THIS window (or one running right
+  // after a relaunch, or in a second window) can never get any answer but `undefined` — and
+  // `canSelfMarkMet` fails closed on that. The refusal then promises a retry "once a branch poll
+  // lands", which never happens because nothing is polling that agent, so the agent is auto-resumed
+  // until it escalates a false alarm to a human over work that is already merged. Eleven beads,
+  // all one cluster (sparkle-h3wqm, sparkle-ayj8oe, sparkle-k2ocyl, sparkle-e0f34k, sparkle-4s07tm,
+  // sparkle-3d4ouj, sparkle-ch57hz, sparkle-28ifhw, sparkle-aqd0xp, sparkle-v22kuv, sparkle-fiyfrn).
+  //
+  // THIS SEAM CAN AFFORD WHAT THE ROSTER CANNOT: one call, one agent, made by an agent that believes
+  // it has finished. So when — and only when — the cheap reader declines AND the answer would change
+  // the outcome, ask git directly (`services/agentGoalReading.probeLandedFromGit` →
+  // `goal_landed_probe.rs`). It resolves the branch from the worktree's own HEAD, refreshes and
+  // compares against `refs/remotes/origin/<default>`, and decides by ancestry.
+  //
+  // GATED ON EVERY CONDITION THAT MAKES IT MATTER. `met` false is a reopen (never refused); the
+  // concierge is exempt above; a non-`landed` kind ignores this evidence entirely; and a reader that
+  // already answered `true`/`false` needs no second opinion. Any of those and the probe never runs,
+  // so no ordinary call pays for a subprocess.
+  //
+  // ITS FAILURES ARE `undefined`, NEVER `false` — see `probeLandedFromGit`. A `false` here would emit
+  // "git says it is not on origin/main yet", which is the exact sentence the beads above report as a
+  // lie; an unreadable git must keep producing the "nothing has read your branch yet" copy.
+  //
+  // THE NEW-WORK VETO IS ALREADY SATISFIED, so do not "restore" one. `landedEvidenceFor` needs an
+  // explicit ahead-count veto because its positive half is a MONOTONIC watermark that survives into
+  // a new cycle of work. The probe has no watermark: it answers "is this worktree's CURRENT HEAD
+  // reachable from origin/<default>", and if it is, there are by definition ZERO commits on this
+  // branch that origin/<default> lacks — the first new commit flips it to `false` by itself.
+  let landedReading = goal.verify?.kind === "landed" ? landedEvidenceFor(targetId) : undefined;
+  if (goal.verify?.kind === "landed" && landedReading === undefined && met && !isConcierge) {
+    landedReading = await probeLandedFromGit(targetId);
+  }
   // `stated` always rides along: `selfMarkRefusal` uses it to decide WHAT TO TELL the agent (whether
   // to mention the concierge take-back), never whether the goal may close — `canSelfMarkMet` reads
   // only `landed`. Passing it is what stops the refusal asking the agent a question it cannot answer
@@ -2243,7 +2280,7 @@ function handleSetGoalMet(req: ControlRequest): Record<string, unknown> {
     // the stall surface uses, so there is no second answer to "is this branch holding work back".
     ...(goal.verify?.kind === "landed"
       ? {
-          landed: landedEvidenceFor(targetId),
+          landed: landedReading,
           // SPREAD-WHEN-KNOWN, the shape the rest of this evidence uses: a key present with the
           // value `undefined` reads as a supplied answer, and here that would be a claim the branch
           // holds nothing back when nobody looked.
@@ -4534,7 +4571,7 @@ async function dispatch(req: ControlRequest): Promise<void> {
         result = handleSetGoal(req);
         break;
       case "set_agent_goal_met":
-        result = handleSetGoalMet(req);
+        result = await handleSetGoalMet(req);
         break;
       case "set_agent_escalation":
         result = handleSetEscalation(req);

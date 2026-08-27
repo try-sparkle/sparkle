@@ -63,6 +63,17 @@ const inboxSends: InboxSendArgs[] = [];
 let inboxSendError: string | null = null;
 /** What `agent_concurrency_peak` answers. `null` = a backend that has recorded nothing. */
 let peakRecordReply: unknown = null;
+// ── THE ON-DEMAND LANDING PROBE (`goal_landed_probe.rs::agent_landed_probe`) ─────────────────────
+// Driven through the invoke switch rather than by re-mocking `@tauri-apps/api/core` per test: the
+// default implementation is what captures `control_respond`, so a per-test `mockImplementation`
+// would silently swallow every reply this suite asserts on.
+/** What the probe answers. `undefined` stands in for a probe that could not tell — which is also
+ *  what an unregistered command would produce, so the default is the fail-closed value. */
+let landedProbeReply: unknown = undefined;
+/** Set to make the probe REJECT, standing in for a dead worktree / a git that would not run. */
+let landedProbeError: string | null = null;
+/** Every call's arguments, so a test can pin WHICH worktree and root were probed. */
+const landedProbeCalls: Array<{ worktree?: string; root?: string }> = [];
 const invokeMock = vi.fn(async (cmd: string, args?: unknown) => {
   switch (cmd) {
     case "start_control_bridge":
@@ -89,6 +100,13 @@ const invokeMock = vi.fn(async (cmd: string, args?: unknown) => {
     // shaped like a record, so the default leaves `get_state`'s block reporting `observed: false`.
     case "agent_concurrency_peak":
       return peakRecordReply;
+    // The `set_agent_goal_met` fallback. Recorded as well as answered: the whole point of the probe
+    // is that it asks about the AGENT'S OWN worktree, so a test that only read the verdict would
+    // pass against a handler probing the wrong tree entirely.
+    case "agent_landed_probe":
+      landedProbeCalls.push((args ?? {}) as { worktree?: string; root?: string });
+      if (landedProbeError) throw new Error(landedProbeError);
+      return landedProbeReply;
     default:
       return undefined;
   }
@@ -361,6 +379,11 @@ describe("controlListener", () => {
     useUiStore.getState().setThemePref("auto");
     inboxSends.length = 0;
     inboxSendError = null;
+    // Reset with the rest of the invoke-switch state: a leaked `{ landed: true }` would hand a
+    // later refusal test the ancestry proof that unlocks a `landed` goal.
+    landedProbeReply = undefined;
+    landedProbeError = null;
+    landedProbeCalls.length = 0;
     _resetPeerRateLimitsForTests();
     const store = useProjectStore.getState();
     projectId = store.addProject("Demo", "/tmp/demo");
@@ -2075,6 +2098,179 @@ describe("controlListener", () => {
       expect(lastReply()).toMatchObject({ ok: false, code: "goal_not_self_markable" });
       expect(String((lastReply() as { error?: string }).error)).toMatch(/has not been read/i);
       expect(goalOf(callerId)!.metAt).toBeUndefined();
+    });
+
+    // ── THE UNMOUNTED-PANE CLUSTER: sparkle-h3wqm, sparkle-ayj8oe, sparkle-k2ocyl, sparkle-e0f34k,
+    //    sparkle-4s07tm, sparkle-3d4ouj, sparkle-ch57hz, sparkle-28ifhw, sparkle-aqd0xp,
+    //    sparkle-v22kuv, sparkle-fiyfrn ─────────────────────────────────────────────────────────
+    //
+    // `landedEvidenceFor` bails on `branchStatus === undefined`, and that map has exactly ONE
+    // writer: a MOUNTED AgentPane. Panes mount lazily per project, so for an agent whose pane is not
+    // mounted in this window the reader can NEVER answer anything but `undefined` — and the refusal
+    // it produces promises a retry "once a branch poll lands", which never happens because nothing
+    // is polling. The agent is auto-resumed until it escalates a false alarm to a human, over work
+    // that is already merged.
+    //
+    // EVERY CASE HERE SEEDS NO `branchStatus` AT ALL. That is not incidental setup — it IS the
+    // population, and a fixture that seeded one would test the path that already worked.
+    describe("landed goal with NO branchStatus — the live git ancestry probe", () => {
+      /** State the population exactly: a `landed` goal, a real worktree row, and NOTHING polled. */
+      const seedUnmountedLandedGoal = () => {
+        useProjectStore
+          .getState()
+          .setAgentGoal(projectId, callerId, "the fix is merged to origin/main", undefined, "agent", {
+            kind: "landed",
+          });
+        // The precondition, asserted rather than assumed: if a future beforeEach started seeding
+        // branchStatus, every test below would quietly stop covering the unmounted case.
+        expect(useRuntimeStore.getState().branchStatus[callerId]).toBeUndefined();
+        // A cut worktree. `addAgent` leaves `worktreePath` null (no worktree exists yet), and the
+        // probe declines without one — which is correct, but would make every case below pass for
+        // the wrong reason.
+        useProjectStore.setState({
+          projects: useProjectStore.getState().projects.map((p) =>
+            p.id === projectId
+              ? {
+                  ...p,
+                  agents: p.agents.map((a) =>
+                    a.id === callerId ? { ...a, worktreePath: "/wt/caller" } : a,
+                  ),
+                }
+              : p,
+          ),
+        } as never);
+      };
+
+      // ⚠️ THE CRITICAL CASE. Delete the fallback in `handleSetGoalMet` and this goes red: the old
+      // code has no reading, fails closed, and refuses an agent whose work git can see on main.
+      it("MARKS MET when git says the worktree's HEAD is an ancestor of origin/main", async () => {
+        seedUnmountedLandedGoal();
+        landedProbeReply = { landed: true, reason: "abc123 is an ancestor of refs/remotes/origin/main" };
+        fire({ reqId: "lp1", op: "set_agent_goal_met", callerAgentId: callerId, payload: { met: true } });
+        await flush();
+        expect(lastReply()).toMatchObject({ ok: true, met: true });
+        // THE STORE FACT, not the reply. `metAt` is the only thing that makes an idle agent count as
+        // done and stops the auto-continue sweep; a handler that replied ok and never latched would
+        // leave the agent being resumed and escalated exactly as before.
+        expect(goalOf(callerId)!.metAt).toEqual(expect.any(Number));
+        expect(goalStateOf(goalOf(callerId), Date.now())).toBe("met");
+      });
+
+      // The probe must ask about THIS AGENT'S OWN worktree, and about the project's main checkout
+      // for the default-branch name. A probe pointed at the wrong tree answers a different question
+      // and would still satisfy the verdict assertion above.
+      it("probes the agent's OWN worktree and the project root", async () => {
+        seedUnmountedLandedGoal();
+        landedProbeReply = { landed: true, reason: "ok" };
+        fire({ reqId: "lp2", op: "set_agent_goal_met", callerAgentId: callerId, payload: { met: true } });
+        await flush();
+        expect(landedProbeCalls).toEqual([{ worktree: "/wt/caller", root: "/tmp/demo" }]);
+      });
+
+      // THE PAIRED NEGATIVE. Same unmounted agent, opposite git answer: still refused, and refused
+      // with the sentence that tells it to LAND the work — not the one that says nobody looked.
+      // Without this pair, the positive case above is satisfied by a handler that simply stopped
+      // refusing `landed` goals altogether.
+      it("still REFUSES when git says HEAD is NOT an ancestor, with the 'not on origin/main' copy", async () => {
+        seedUnmountedLandedGoal();
+        landedProbeReply = { landed: false, reason: "abc123 is not an ancestor of refs/remotes/origin/main" };
+        fire({ reqId: "lp3", op: "set_agent_goal_met", callerAgentId: callerId, payload: { met: true } });
+        await flush();
+        expect(lastReply()).toMatchObject({ ok: false, code: "goal_not_self_markable" });
+        const err = String((lastReply() as { error?: string }).error);
+        expect(err).toMatch(/not on origin\/main/i);
+        // …and NOT the "nobody looked" copy: the two send the agent to do opposite things.
+        expect(err).not.toMatch(/has not been read/i);
+        expect(goalOf(callerId)!.metAt).toBeUndefined();
+      });
+
+      // FAIL CLOSED, AND FAIL TO THE RIGHT SENTENCE. A probe that errors is not a no. Answering
+      // `false` here would emit "git says it is not on origin/main yet" about a git that never ran —
+      // which is exactly the lie the beads above report.
+      it("refuses with the 'not been read' copy when the probe ERRORS, never with git's no", async () => {
+        seedUnmountedLandedGoal();
+        landedProbeError = "worktree is gone";
+        fire({ reqId: "lp4", op: "set_agent_goal_met", callerAgentId: callerId, payload: { met: true } });
+        await flush();
+        expect(lastReply()).toMatchObject({ ok: false, code: "goal_not_self_markable" });
+        const err = String((lastReply() as { error?: string }).error);
+        expect(err).toMatch(/has not been read/i);
+        expect(err).not.toMatch(/git says it is not on origin\/main/i);
+        expect(goalOf(callerId)!.metAt).toBeUndefined();
+      });
+
+      // THE WIRE SHAPE. `landed` is a Rust `Option<bool>`, and serde emits the key with a **null**
+      // value for `None` — it does not omit it. A frontend that read `null` as anything but "could
+      // not tell" would either latch a goal on nothing or emit git's no on nobody's behalf.
+      it("treats a null `landed` (serde's None) as 'could not tell', not as a no", async () => {
+        seedUnmountedLandedGoal();
+        landedProbeReply = { landed: null, reason: "no origin/main to compare against" };
+        fire({ reqId: "lp5", op: "set_agent_goal_met", callerAgentId: callerId, payload: { met: true } });
+        await flush();
+        const err = String((lastReply() as { error?: string }).error);
+        expect(err).toMatch(/has not been read/i);
+        expect(err).not.toMatch(/git says it is not on origin\/main/i);
+      });
+
+      // ── THE ROSTER HOT PATH IS NOT WEAKENED ────────────────────────────────────────────────────
+      // `landedEvidenceFor`'s "no git call, window-local only" contract is load-bearing:
+      // `handleGetState` runs it for EVERY agent on a call orchestrators make routinely. These two
+      // cases pin that the subprocess is reachable ONLY from the one-agent seam.
+      it("does NOT probe when the window-local reader already answered", async () => {
+        seedUnmountedLandedGoal();
+        useRuntimeStore.getState().setWorkflowShipped(callerId, true);
+        useRuntimeStore.getState().setBranchStatus(callerId, {
+          ahead: 0,
+          behind: 0,
+          dirty: false,
+          filesChanged: 0,
+          insertions: 0,
+          deletions: 0,
+          worktreeOnBranch: true,
+        });
+        landedProbeReply = { landed: false, reason: "would contradict the store reading" };
+        fire({ reqId: "lp6", op: "set_agent_goal_met", callerAgentId: callerId, payload: { met: true } });
+        await flush();
+        expect(lastReply()).toMatchObject({ ok: true, met: true });
+        expect(landedProbeCalls).toEqual([]);
+      });
+
+      it("get_state never shells the probe, however many landed goals the roster holds", async () => {
+        seedUnmountedLandedGoal();
+        useProjectStore
+          .getState()
+          .setAgentGoal(projectId, otherId, "the worker's fix is merged to origin/main", undefined, "agent", {
+            kind: "landed",
+          });
+        landedProbeReply = { landed: true, reason: "ok" };
+        fire({ reqId: "lp7", op: "get_state", callerAgentId: callerId, payload: { scope: "all" } });
+        await flush();
+        expect(landedProbeCalls).toEqual([]);
+      });
+
+      // A REOPEN IS NOT A CLOSE. `met: false` re-arms auto-continue and is never refused, so there
+      // is nothing for a subprocess to decide.
+      it("does NOT probe when the call is a reopen (met: false)", async () => {
+        seedUnmountedLandedGoal();
+        fire({ reqId: "lp8", op: "set_agent_goal_met", callerAgentId: callerId, payload: { met: false } });
+        await flush();
+        expect(lastReply()).toMatchObject({ ok: true, met: false });
+        expect(landedProbeCalls).toEqual([]);
+      });
+
+      // A `human` goal must never be unlocked by ancestry, so the evidence is not even gathered.
+      it("does NOT probe for a human-kind goal", async () => {
+        useProjectStore
+          .getState()
+          .setAgentGoal(projectId, callerId, "the founder likes the new layout", undefined, "agent", {
+            kind: "human",
+          });
+        landedProbeReply = { landed: true, reason: "irrelevant here" };
+        fire({ reqId: "lp9", op: "set_agent_goal_met", callerAgentId: callerId, payload: { met: true } });
+        await flush();
+        expect(lastReply()).toMatchObject({ ok: false, code: "goal_not_self_markable" });
+        expect(landedProbeCalls).toEqual([]);
+      });
     });
 
     // ── sparkle-vfkqz: THE GATE MUST NOT FIRE ON WORK GIT SAYS IS LANDED ─────────────────────────

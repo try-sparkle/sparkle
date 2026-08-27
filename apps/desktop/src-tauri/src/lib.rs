@@ -70,6 +70,7 @@ mod display_span;
 mod drainer;
 mod fleet;
 mod gh_rest;
+mod goal_landed_probe;
 mod folder_picker;
 mod frontmost;
 mod github;
@@ -1578,6 +1579,13 @@ pub fn run() {
             worktree::diff_file_text,
             worktree::diff_commits,
             worktree::agent_workflow_state,
+            // THE ON-DEMAND LANDING PROBE, used ONLY by `set_agent_goal_met` — never by the roster
+            // hot path above, whose window-local reader is deliberately git-free. Registered in the
+            // SAME line-edit as the module, because an unregistered command still compiles clean and
+            // fails only at invoke time (see the note further down about `generate_handler!`), and a
+            // silent rejection here reads as "we could not tell", which is precisely the state that
+            // leaves a finished agent unable to close its goal.
+            goal_landed_probe::agent_landed_probe,
             worktree::project_agents_status,
             worktree::project_open_pr_count,
             worktree::project_pr_list_url,
