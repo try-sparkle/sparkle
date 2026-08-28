@@ -831,6 +831,18 @@ struct RunnerPoolReading {
     /// An ABSENT `total_count` counts as complete: a stub or a hand-written fixture that omits it
     /// is a complete answer about the world it describes, not a truncated one.
     complete: bool,
+    /// Did this read enumerate ANY runner registration (any status, any label)?
+    ///
+    /// The false-absence CONTROL (bead `sparkle-fsokcu`). `complete` proves the label slice was not
+    /// truncated; it does NOT prove the read returned a fleet. A degraded body that parses to
+    /// `{"total_count":0,"runners":[]}` — which `pr_query_runners`' `.[0].total_count // 0` coercion
+    /// can emit on an empty/partial page — is complete-and-empty. Seeing zero release runners in a
+    /// read that saw NO runners at all is not proof the Mac is offline; it is a read that proved
+    /// nothing. `classify_release_runner` keeps the "wake the Mac" BLOCKING verdict for the case this
+    /// bit is `true`: the read DID list a fleet and the release runner simply was not an online
+    /// member of it (an offline-but-registered runner still appears in the list, so this stays true
+    /// and the verdict stays Blocking — a genuinely-offline runner is never greened).
+    saw_runners: bool,
 }
 
 impl RunnerPoolReading {
@@ -867,7 +879,17 @@ fn read_runner_pool(json: &str, label: &str) -> Option<RunnerPoolReading> {
         let runners = page.get("runners").and_then(|r| r.as_array())?;
         merged.extend(runners.iter());
     }
-    let complete = total_count.map(|t| t as usize <= merged.len()).unwrap_or(true);
+    // A present total_count that DISAGREES with the runners returned is an untrustworthy view: GREATER
+    // means the list is truncated (more registrations on unfetched pages); LESS — the self-
+    // contradictory `total_count:0` with a non-empty list that `pr_query_runners`' `.[0].total_count
+    // // 0` coercion can emit on a degraded first page — means the count itself is garbage (GitHub
+    // never reports a total below the page it returns). Both must read INCOMPLETE, or the coercion
+    // slips a confident "wake the release Mac" through with complete=true (bead sparkle-fsokcu,
+    // roborev 70861). An ABSENT count is a complete answer about the small world a stub describes.
+    let complete = total_count.map(|t| t as usize == merged.len()).unwrap_or(true);
+    // The false-absence control: captured BEFORE the loop consumes `merged`. An empty list is a read
+    // that enumerated nothing — not proof any runner is offline (bead `sparkle-fsokcu`).
+    let saw_runners = !merged.is_empty();
     let mut online_idle = 0;
     let mut online_busy = 0;
     for r in merged {
@@ -890,7 +912,7 @@ fn read_runner_pool(json: &str, label: &str) -> Option<RunnerPoolReading> {
             online_idle += 1;
         }
     }
-    Some(RunnerPoolReading { online_idle, online_busy, complete })
+    Some(RunnerPoolReading { online_idle, online_busy, complete, saw_runners })
 }
 
 /// Read `.total_count` from `gh api "repos/<repo>/actions/runs?status=queued&per_page=1"`.
@@ -953,6 +975,20 @@ fn classify_ci_pool(
                 "the runner list was TRUNCATED and no CI runner ({CI_RUNNER_LABEL}) appeared on the \
                  page read — this is a limit of the probe, not proof the pool is down. Re-read with \
                  pagination."
+            ),
+        );
+    }
+    // The false-absence CONTROL, mirrored from the release runner (bead sparkle-fsokcu, roborev
+    // 70860). Both pools are read from the SAME runners JSON, so an EMPTY read (`!saw_runners`) that
+    // reads the release runner as UNKNOWN would file an identical false "no CI runners online" P1 the
+    // same pass. A read that enumerated nothing is not proof the pool is down → Unknown.
+    if r.online_total() == 0 && !r.saw_runners {
+        return (
+            HealthState::Unknown,
+            format!(
+                "the runners read returned NO runners at all, so it could not see any CI runner \
+                 ({CI_RUNNER_LABEL}) — this is a degraded read, not proof the pool is down. Re-read \
+                 before concluding anything."
             ),
         );
     }
@@ -1037,6 +1073,18 @@ fn classify_release_runner(reading: Option<RunnerPoolReading>) -> (HealthState, 
                 "the runner list was TRUNCATED and the release runner ({RELEASE_RUNNER_LABEL}) did \
                  not appear on the page read — this is a limit of the probe, not proof the Mac is \
                  offline. Re-read with pagination."
+            ),
+        ),
+        // The false-absence CONTROL (bead sparkle-fsokcu). A COMPLETE-looking but EMPTY read enumerated
+        // no runner at all, so it cannot see the release runner either — a degraded read, not an
+        // offline Mac. Kept ahead of the Blocking arm; Blocking then only fires when the read DID list
+        // a fleet (`saw_runners`) without an online release runner in it.
+        Some(r) if r.online_total() == 0 && !r.saw_runners => (
+            HealthState::Unknown,
+            format!(
+                "the runners read returned NO runners at all, so it could not see the release runner \
+                 ({RELEASE_RUNNER_LABEL}) — this is a degraded read, not proof the Mac is offline. \
+                 Re-read before concluding anything."
             ),
         ),
         Some(r) if r.online_total() == 0 => (
@@ -3918,8 +3966,73 @@ mod tests {
         let no_count = r#"{"runners":[{"name":"r","status":"offline","busy":false,"labels":[{"name":"sparkle-release"}]}]}"#;
         let reading = read_runner_pool(no_count, RELEASE_RUNNER_LABEL).expect("readable");
         assert!(reading.complete, "an absent total_count is a complete answer, not a truncated one");
+        assert!(reading.saw_runners, "the offline-but-registered runner was still enumerated — saw a fleet");
         let (state, _) = classify_release_runner(Some(reading));
         assert_eq!(state, HealthState::Blocking, "so existing fixtures keep their verdicts");
+    }
+
+    /// THE FALSE-ABSENCE CONTROL (bead sparkle-fsokcu). A degraded read that parses to a COMPLETE-but-
+    /// EMPTY body — zero runners, total_count 0 (which `pr_query_runners`' `.[0].total_count // 0`
+    /// coercion emits on an empty/partial page) — is not proof the Mac is offline. `complete` is true
+    /// here, so the truncation arm does NOT fire; only the `saw_runners` control keeps it from reading
+    /// as the confident "wake the release Mac". This filed a P1 bead hourly for four days while the
+    /// release Mac was online and shipping DMGs. Paired with the still-blocks test above, so "empty →
+    /// Unknown" cannot be satisfied by a classifier that never blocks.
+    #[test]
+    fn a_complete_but_empty_read_is_unknown_not_an_offline_verdict() {
+        let reading =
+            read_runner_pool(r#"{"total_count":0,"runners":[]}"#, RELEASE_RUNNER_LABEL).expect("readable");
+        assert!(reading.complete, "a total_count-0 empty body is complete, not truncated");
+        assert!(!reading.saw_runners, "an empty runners list enumerated no registration — saw nothing");
+        let (state, detail) = classify_release_runner(Some(reading));
+        assert_eq!(state, HealthState::Unknown, "an empty read proves nothing about the Mac: {detail}");
+        assert_ne!(state, HealthState::Blocking, "and must never publish an outage on it: {detail}");
+        assert!(
+            !detail.contains(&format!("({RELEASE_RUNNER_LABEL}) is offline")),
+            "it must not assert the runner is offline: {detail}"
+        );
+        assert!(
+            !detail.contains("Wake the release Mac"),
+            "and must not dispatch anyone to a Mac that is probably fine: {detail}"
+        );
+    }
+
+    /// THE COERCION HOLE (roborev 70861). `pr_query_runners` computes `total_count: (.[0].total_count
+    /// // 0)`, so a degraded first page yields `total_count:0` while LATER pages still contribute
+    /// runners — a NON-EMPTY list with a self-contradictory count (GitHub never reports a total below
+    /// the page it returns). `saw_runners` is true here (the list is non-empty), so ONLY the tightened
+    /// `complete` (a present count that disagrees with the runners held is untrustworthy) keeps this
+    /// from falling through to the confident "wake the release Mac".
+    #[test]
+    fn a_coerced_zero_count_with_runners_is_incomplete_not_offline() {
+        let json = r#"{"total_count":0,"runners":[
+            {"name":"ci-1","status":"online","busy":false,"labels":[{"name":"linux-ci"}]},
+            {"name":"ci-2","status":"online","busy":true,"labels":[{"name":"linux-ci"}]}]}"#;
+        let reading = read_runner_pool(json, RELEASE_RUNNER_LABEL).expect("readable");
+        assert!(!reading.complete, "total_count 0 below a 2-runner list is a broken count → incomplete");
+        assert!(reading.saw_runners, "the list is non-empty — saw a fleet, so the empty-read arm cannot fire");
+        let (state, detail) = classify_release_runner(Some(reading));
+        assert_eq!(state, HealthState::Unknown, "a broken-count read proves nothing about the Mac: {detail}");
+        assert!(!detail.contains("Wake the release Mac"), "must not dispatch anyone: {detail}");
+    }
+
+    /// THE CI TWIN of the false-absence control (roborev 70860). The CI pool reads the SAME JSON, so
+    /// the same complete-but-empty degraded body must be Unknown, not the confident "no CI runners
+    /// online" — paired with the still-blocks negative so it cannot be met by a classifier that never
+    /// blocks.
+    #[test]
+    fn a_complete_but_empty_ci_read_is_unknown_not_a_dead_pool() {
+        let reading = read_runner_pool(r#"{"total_count":0,"runners":[]}"#, CI_RUNNER_LABEL).expect("readable");
+        assert!(reading.complete, "a total_count-0 empty body is complete, not truncated");
+        assert!(!reading.saw_runners, "an empty list enumerated no registration");
+        let (state, detail) = classify_ci_pool(Some(reading), Some(0));
+        assert_eq!(state, HealthState::Unknown, "an empty CI read proves nothing about the pool: {detail}");
+        assert!(!detail.contains("are online"), "must not assert no runners are online: {detail}");
+
+        // Paired: zero CI runners from a read that DID list a fleet (complete, non-empty) still blocks.
+        let entries: Vec<(&str, &str, bool)> = (0..5).map(|_| ("sparkle-release", "online", false)).collect();
+        let (state, _) = classify_ci_pool(read_runner_pool(&runners_page(5, &entries), CI_RUNNER_LABEL), Some(0));
+        assert_eq!(state, HealthState::Blocking, "a complete, non-empty read with no CI runner is the real outage");
     }
 
     /// FIX 1(a)'s wire shape. `gh api --paginate … --slurp` returns an ARRAY of
@@ -5378,12 +5491,12 @@ mod tests {
     #[test]
     fn release_in_progress_is_busy_true_idle_false_unknown_none() {
         assert_eq!(
-            release_in_progress(Some(RunnerPoolReading { online_idle: 0, online_busy: 1, complete: true })),
+            release_in_progress(Some(RunnerPoolReading { online_idle: 0, online_busy: 1, complete: true, saw_runners: true })),
             Some(true),
             "a busy release VM means a DMG is building — the fleet must pause"
         );
         assert_eq!(
-            release_in_progress(Some(RunnerPoolReading { online_idle: 1, online_busy: 0, complete: true })),
+            release_in_progress(Some(RunnerPoolReading { online_idle: 1, online_busy: 0, complete: true, saw_runners: true })),
             Some(false),
             "online but idle is NOT a release in progress"
         );
