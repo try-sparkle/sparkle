@@ -46,7 +46,6 @@
     "governs the fold; the lexicon governs the SENTENCE, which is the thing a human actually reads and",
     "acts on. Both are needed."
   ],
-
   "absenceClaims": {
     "$comment": [
       "The vocabulary of an ABSENCE CLAIM — case-insensitive regular expressions, in a syntax both",
@@ -117,7 +116,6 @@
       }
     ]
   },
-
   "instances": {
     "$comment": [
       "THE SIX MEASURED INSTANCES, converted into cases. Every one is driven through its REAL",
@@ -193,6 +191,26 @@
         "truth": "The agent was working fine. A long verification run and a queued CI run both move nothing the mark reads.",
         "mechanism": "The mark reads prompt history and tool activity; it does not read a running verify or a queued run. An unmoved mark under a known-unobservable wait is could-not-look, and re-arming on it interrupts working agents.",
         "coveredBy": "engine/goalContinuation.falseAbsence.test.ts"
+      },
+      {
+        "id": "epic-sweep-frozen-snapshot",
+        "lang": "ts",
+        "surface": "engine/epicContinuation.ts::decideEpicSweep",
+        "observation": "The epic sweep read its board from a beads snapshot that had not been refreshed for 2h20m. `beadsStore.refresh` KEEPS the previous snapshot when `bd` fails, writing only `error[projectId]`, and its poller is reference-counted on VIEWERS while this sweep exists to run on projects nobody is viewing. The read succeeded, parsed, and was complete — and described an earlier state of the store.",
+        "wrongClaim": "There is no sweep-restarted marker on this epic and no founder veto, so its one automatic restart is still owed.",
+        "truth": "The bead carried the founder's `no-auto-restart` veto and, by the end, FOURTEEN `sweep-restarted:` markers the sweep had written itself. Every one of them was in the store and none was in the snapshot.",
+        "mechanism": "Every brake on this sweep is a LABEL — the veto, the `sweep-restarted:` budget marker, the `stalled` escalation mark — so a snapshot predating those writes reports all three absent, which is exactly the state that authorizes a restart. It restarted one epic 14 times at a 601s cadence, wiping its agent's context each time, while its own notice promised it would stop. Its audit note carries the fingerprint: 'no child bead has moved in 16h', then 17h, 18h, 19h on successive ticks, because `now` advanced while `lastChildProgressAt` could not. A stale read is `complete: false` — the population read is not the population the claim is about — so `beadsObserved` is false and the sweep skips `beads-unknown` before reading any other field.",
+        "coveredBy": "engine/epicContinuation.falseAbsence.test.ts"
+      },
+      {
+        "id": "babysit-lease-blind-to-roster",
+        "lang": "ts",
+        "surface": "services/babysitDispatcher.ts::standingFor",
+        "observation": "`babysit_leases` returned a readable list with NO row for this PR. The agent roster, which was never consulted, held a live babysit driver for it.",
+        "wrongClaim": "No agent is driving drodio/sparkle#74, so the lease is free and a driver may be dispatched.",
+        "truth": "A driver had owned that PR for two hours and was alive and visible on the roster the whole time. Four PRs ended up with two agents each; the duplicates could not even be retired, because by then they held uncommitted work on the branch their twin owned.",
+        "mechanism": "The lease store is not the population the claim is about. A driver started through the babysit SKILL, by a human, or by an orchestrator writes no lease at all — SKILL.md assumes the dispatcher took one on its behalf — so it is structurally invisible and the read comes back empty for a PR that is owned. Separately `babysit_lease_heartbeat` has NO frontend caller, so `heartbeat_at_ms` is stamped once at acquire and never refreshed and every live driver is reclassified `dead-stale` at 90 minutes. The roster answer is a tri-state (`processAliveFor`): observed-live holds, observed-exit releases, and NOT-OBSERVED holds rather than reading as absent.",
+        "coveredBy": "services/babysitDispatcher.test.ts"
       }
     ]
   }

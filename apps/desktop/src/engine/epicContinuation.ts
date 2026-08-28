@@ -128,6 +128,32 @@ export type EpicSkipReason =
    * dead agent for exactly this reason; this is the same rule one level up, about the roster itself.
    */
   | "staffing-unknown"
+  /**
+   * WE COULD NOT PROVE THE BEAD READING BEHIND THIS CANDIDATE IS CURRENT (bead `sparkle-rk0k8o`,
+   * corpus instance `epic-sweep-frozen-snapshot`).
+   *
+   * THE SIBLING OF `staffing-unknown`, ONE LEVEL FURTHER OUT. That arm exists because an unread
+   * ROSTER rendered as an unstaffed epic. This exists because a STALE BOARD renders as an epic with
+   * no labels — and every gate that stops this sweep running away is a label: the founder's
+   * `no-auto-restart` veto, the `sweep-restarted:` budget marker, and the `stalled` escalation mark.
+   * A snapshot that predates all three answers "not vetoed, never restarted, never escalated", which
+   * is precisely the state that authorizes a restart.
+   *
+   * MEASURED, and it is the reason this arm exists rather than a hypothetical. `beadsStore.refresh`
+   * KEEPS the previous snapshot when `bd` fails, writing only `error[projectId]` — correct for a
+   * board that must not blank out mid-poll, catastrophic for a sweep that spends agent slots. With
+   * the store failing to list, the runner held ONE FROZEN SNAPSHOT for 2h20m and restarted the same
+   * epic FOURTEEN times at a 601-second cadence, wiping its agent's context every ten minutes while
+   * its own notice told the founder it would stop. He then added the documented opt-out label and
+   * watched three more restarts fire, because the veto was written to a store the sweep was no
+   * longer reading.
+   *
+   * DISTINCT FROM `unknown-age`, which is a bead we DID read whose timestamp would not parse. This
+   * one is about the reading itself, and it disqualifies every other field too — which is why it is
+   * checked FIRST, above even the watch gate: `promoted` is a label as well, and a stale `false`
+   * there is a lucky skip rather than a decision.
+   */
+  | "beads-unknown"
   /** Stalled for less than the window. */
   | "too-soon"
   /** Stalled for LONGER than {@link EPIC_MAX_STALL_AGE_MS} — out of the sweep's reach on purpose. */
@@ -146,6 +172,20 @@ export interface EpicSweepDecision {
  */
 export interface EpicSweepCandidate {
   epicId: string;
+  /**
+   * Was the BEAD READING every other field here was derived from proven CURRENT?
+   *
+   * See {@link EpicSkipReason}'s `beads-unknown` arm for the measured failure. `false` is the honest
+   * reading whenever the caller could not establish that its board snapshot postdates the writes the
+   * decision turns on; the runner asks `probeOutcome.freshnessControl` and passes the answer.
+   *
+   * OPTIONAL, AND ABSENCE MEANS "OBSERVED" — the same rule {@link optedOut} follows, for the same
+   * reason. Every candidate written before this field existed states its facts directly, which is
+   * what a test does: it IS the observation. Reading `undefined` as unobserved would switch the
+   * whole sweep off for every existing caller, which is the failure this field exists to end rather
+   * than to cause. The RUNNER always passes it explicitly, so production never takes the default.
+   */
+  beadsObserved?: boolean;
   /** Rolled up by `planView.rollupEpicStatus`. `planning` — a written plan nobody started — is the
    *  state this whole sweep was built for, and it did not exist as a distinct word until now. */
   status: EpicStatus;
@@ -303,6 +343,19 @@ export function decideEpicSweep(
     reason,
   });
   const clear = (): EpicSweepDecision => ({ epicId: c.epicId, action: "clear" });
+
+  // ── A STALE BOARD DISQUALIFIES EVERY OTHER FACT, SO IT IS CHECKED BEFORE ALL OF THEM ─────────
+  // Above even the watch gate, and that ordering is the fix rather than fussiness. `promoted` is
+  // itself a label read (`promoted-to-build`), so on a frozen snapshot it answers from the same
+  // obsolete bytes as the veto and the restart marker do — a stale `false` there merely skips by
+  // luck, and a stale `true` walks the epic straight down a ladder whose every remaining gate is
+  // also a label. There is no field in this candidate that a bad reading does not poison, so the
+  // reading is judged first and nothing else runs.
+  //
+  // NO `clear` EITHER, exactly as `staffing-unknown` refuses to clear: retracting the founder's
+  // `stalled` mark is a claim that the epic is FINE, and a reading we could not trust is not
+  // grounds for that claim any more than it is grounds for a restart. See `beads-unknown`.
+  if (c.beadsObserved === false) return skip("beads-unknown");
 
   // Never handed to a build agent ⇒ not something the founder asked to be driven. Checked FIRST so
   // that no later rule can reach an epic outside the watch set, whatever else is true of it.

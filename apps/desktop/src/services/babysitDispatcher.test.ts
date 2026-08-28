@@ -37,7 +37,14 @@ vi.mock("./buildAgentSpawn", () => ({ spawnBuildAgentInProject: (...a: unknown[]
 vi.mock("./agentCapacity", () => ({ localAgentCapacity: () => capacityMock() }));
 // The production tick reads the real store and the real window-ownership election; both are
 // stubbed so the deadline test can drive `startBabysitDispatcher` itself.
-vi.mock("./goalContinuationRunner", () => ({ ownsProjectInThisWindow: () => true }));
+// `processAliveFor` is passed through REAL, not stubbed. It is the shared tri-state liveness
+// answer the duplicate-spawn fix turns on, and a stub here would let the guard pass against a
+// predicate this file invented — the vacuity shape AGENTS.md names. Only the window-ownership
+// election is replaced, because the production tick reads a real store.
+vi.mock("./goalContinuationRunner", async (orig) => {
+  const real = (await orig()) as Record<string, unknown>;
+  return { ...real, ownsProjectInThisWindow: () => true };
+});
 vi.mock("./openPrs", async (orig) => {
   const real = (await orig()) as Record<string, unknown>;
   return { ...real, fetchOpenPrs: (...a: unknown[]) => fetchOpenPrsMock(...a) };
@@ -46,6 +53,7 @@ vi.mock("./openPrs", async (orig) => {
 import {
   BABYSIT_HOLDER_ID_MAX_LEN,
   BABYSIT_LEASE_ACQUIRE_COMMAND,
+  BABYSIT_LEASE_HEARTBEAT_COMMAND,
   BABYSIT_LEASE_LIST_COMMAND,
   BABYSIT_LEASE_REASON_HELD_LIVE,
   BABYSIT_LEASE_RELEASE_COMMAND,
@@ -61,16 +69,26 @@ import {
   checkRollupOf,
   repoSlugFromPrUrl,
   standingFor,
+  driverSightingFor,
+  isBabysitDriverFor,
+  BABYSIT_UNOBSERVED_HOLD_MS,
+  NO_DRIVER_SIGHTED,
 } from "./babysitDispatcher";
 // The ONE command constant lives with the ONE adapter that uses it.
 import { KNIGHTWATCH_PROBE_GATE_COMMAND, readProbeGate } from "./probeGate";
 import { log } from "../logger";
 import { resolveBabysitConfig } from "@sparkle/core";
 import { useProjectStore } from "../stores/projectStore";
-import type { Project } from "../types";
+import { useRuntimeStore } from "../stores/runtimeStore";
+import type { AgentTab, Project } from "../types";
 
-const PROJECT = { id: "p1", name: "sparkle", rootPath: "/repo" } as unknown as Project;
+// `agents: []` is REQUIRED on the fixture, not defaulted away in the source. Project.agents is a
+// required field and every production path supplies it, so a `?? []` in the sweep would exist
+// only to serve this fixture — and would silently resolve "nobody supplied a roster" to the
+// PERMISSIVE verdict, which is backwards for this module: conservative here means HOLD.
+const PROJECT = { id: "p1", name: "sparkle", rootPath: "/repo", agents: [] } as unknown as Project;
 const T0 = 1_700_000_000_000;
+const REPO = "drodio/sparkle";
 const CONFIG = resolveBabysitConfig({});
 
 /** A PR carrying one UNANSWERED [blocking] probe — the evidence the whole feature exists for. */
@@ -467,7 +485,7 @@ describe("the per-PR cooldown", () => {
 // The ownership gate is the more dangerous of the two, because a wrong election SUBTRACTS sweeps
 // and reads as "the feature quietly does nothing", which no assertion would otherwise notice.
 describe("sweepAllProjects — the single-owner election", () => {
-  const projectB = { id: "p2", name: "other", rootPath: "/repo2" } as unknown as Project;
+  const projectB = { id: "p2", name: "other", rootPath: "/repo2", agents: [] } as unknown as Project;
 
   it("SKIPS a project this window does not own, and sweeps the one it does", async () => {
     wireInvoke({ leases: [], gate: { applicable: false, probes: [], error: null, overridden: false } });
@@ -1634,5 +1652,481 @@ describe("a refused acquire SAYS WHY — the silence is what made the outage inv
     expect(
       logDebugMock.mock.calls.filter((c) => String(c[1]).includes("another driver already holds")),
     ).toHaveLength(1);
+  });
+});
+
+// ── THE ROSTER AXIS (bead `sparkle-rk0k8o`) ────────────────────────────────────────────────────
+//
+// FALSE-ABSENCE CASE: corpus instance `babysit-lease-blind-to-roster`, contract
+// `apps/desktop/shared/false-absence-corpus.json`. The lease store is not the population the claim
+// is about, so an empty read is a could-not-look, never "this PR is unowned".
+//
+// The spawner consulted `babysit-leases.json` and NOTHING ELSE, so a PR whose driver was alive and
+// plainly on the roster still read as free. Measured over one night: #69, #70, #72 and #74 each
+// ended up with two agents, #74 twice — and the duplicates could not be retired, because by the
+// time anyone looked they ALREADY HELD uncommitted work on the branch their twin owned.
+//
+// Every assertion below is on the SIDE EFFECT (did a spawn happen, what standing came out), never
+// on a precondition — the sweep's own header rule, and the reason these can fail.
+
+/** A roster row for a babysit driver on `pr`, as `dispatchOne` actually creates it. */
+function driverRow(id: string, pr: number, over: Partial<AgentTab> = {}): AgentTab {
+  return {
+    id,
+    name: `Babysit #${pr}`,
+    kind: "build",
+    parentId: null,
+    runtime: "local",
+    worktreePath: null,
+    branch: null,
+    baseBranch: null,
+    lastPrompt: babysitPrompt(pr),
+    promptHistory: [{ id: "p0", text: babysitPrompt(pr), at: T0 }],
+    ...over,
+  } as unknown as AgentTab;
+}
+
+/** PROJECT, but carrying a roster — the input the dispatcher never used to read. */
+function projectWith(agents: AgentTab[]): Project {
+  return { ...PROJECT, agents } as unknown as Project;
+}
+
+/** Seed this window's liveness maps. `status` present ⇒ `livenessOf` says "local" (authoritative);
+ *  absent but in `openAgentIds` ⇒ "other-window"; neither ⇒ "unknown". The last two are both
+ *  NOT-OBSERVED, which is the state the old code read as "no driver". */
+function seedLiveness(status: Record<string, string>, openAgentIds: string[] = []): void {
+  useRuntimeStore.setState({ status, openAgentIds } as never);
+}
+
+describe("isBabysitDriverFor — a driver is identified by more than its name", () => {
+  it("matches the name dispatchOne spawns with", () => {
+    expect(isBabysitDriverFor(driverRow("a", 74), REPO, 74)).toBe(true);
+  });
+
+  it("STILL matches after the agent renames itself", () => {
+    // `rename_agent` is a control op any agent may call, so a name is a label that drifts. The
+    // latched `/babysit-pr <n>` in promptHistory is what survives it — and survives a relaunch.
+    const renamed = driverRow("a", 74, { name: "PR 74 cleanup", lastPrompt: "carry on" });
+    expect(isBabysitDriverFor(renamed, REPO, 74)).toBe(true);
+  });
+
+  it("matches a driver started by the SKILL, which writes no lease at all", () => {
+    // SKILL.md never acquires a lease — it assumes the dispatcher took one on its behalf. So a
+    // `/babysit-pr 74` typed by a human is a real driver with no lease row, and the prompt is the
+    // only trace of it. This is the case that produced the duplicates.
+    const handRolled = driverRow("a", 74, { name: "Some agent", promptHistory: [] });
+    expect(isBabysitDriverFor(handRolled, REPO, 74)).toBe(true);
+  });
+
+  it("does NOT confuse #7 with #70 — a prefix is not a match", () => {
+    // `startsWith`/`includes` here would either suppress a legitimate dispatch on #70 forever or
+    // let one through onto #7. Exact match on the trimmed string is the only safe test.
+    expect(isBabysitDriverFor(driverRow("a", 7), REPO, 70)).toBe(false);
+    expect(isBabysitDriverFor(driverRow("a", 70), REPO, 7)).toBe(false);
+  });
+});
+
+describe("driverSightingFor — 'I cannot see it' is not 'it is not there'", () => {
+  const alive = (map: Record<string, boolean | undefined>) => (id: string) => map[id];
+
+  it("an OBSERVED-RUNNING driver is live, and is named", () => {
+    expect(driverSightingFor([driverRow("owner", 74)], REPO, 74, alive({ owner: true }), T0)).toEqual({
+      verdict: "live",
+      agentId: "owner",
+    });
+  });
+
+  it("a driver this window CANNOT OBSERVE is unobservable, NOT absent", () => {
+    // `processAliveFor` returns undefined for an agent with no open pane in this window. That is
+    // the absence of an observation, never a death — and reading it as "no driver" is the whole
+    // bug: agent 7d023a66 had owned #74 for two hours when a second was spawned onto it.
+    expect(driverSightingFor([driverRow("owner", 74)], REPO, 74, alive({}), T0)).toEqual({
+      verdict: "unobservable",
+      agentId: "owner",
+    });
+  });
+
+  it("a driver this window WATCHED EXIT is passed over", () => {
+    // The other direction has to work too, or one finished driver suppresses every future dispatch
+    // on that PR forever. `false` is a real observation; `undefined` is not.
+    expect(driverSightingFor([driverRow("gone", 74)], REPO, 74, alive({ gone: false }), T0)).toBe(
+      NO_DRIVER_SIGHTED,
+    );
+  });
+
+  it("an observed-live driver outranks an unobservable one, whatever the roster order", () => {
+    const rows = [driverRow("cannot-see", 74), driverRow("running", 74)];
+    expect(driverSightingFor(rows, REPO, 74, alive({ running: true }), T0)).toEqual({
+      verdict: "live",
+      agentId: "running",
+    });
+  });
+
+  it("no driver row for this PR is 'none' — the lease still decides", () => {
+    expect(driverSightingFor([driverRow("other", 99)], REPO, 74, alive({ other: true }), T0)).toBe(
+      NO_DRIVER_SIGHTED,
+    );
+  });
+});
+
+describe("standingFor — the roster outranks the lease, in BOTH directions", () => {
+  it("a live driver makes a LEASELESS PR held, not free", () => {
+    // THE MEASURED BUG. `[]` is a perfectly readable lease store with no row for this PR, and it
+    // used to answer `free` — which is a dispatch. A driver started by the skill, a human or an
+    // orchestrator lands here every single time.
+    expect(standingFor([], "a/b", 74, { verdict: "live", agentId: "owner" })).toBe("held-live");
+  });
+
+  it("a live driver overrides a dead-stale lease", () => {
+    // `babysit_lease_heartbeat` has NO FRONTEND CALLER — it is in
+    // scripts/tauri-command-callers.allow as a known-dead command — so `heartbeat_at_ms` is stamped
+    // once at acquire and never refreshed. Every driver is therefore reclassified dead at 90
+    // minutes WHILE STILL RUNNING, and the recovery cooldown dispatches its replacement 5 minutes
+    // later. The skill self-paces at ~28 minutes a pass, so this is the normal case, not the edge.
+    const stale = [{ lease: { repo: "a/b", pr: 74 }, standing: "dead-stale" }];
+    expect(standingFor(stale, "a/b", 74)).toBe("held-dead");
+    expect(standingFor(stale, "a/b", 74, { verdict: "live", agentId: "owner" })).toBe("held-live");
+  });
+
+  it("an UNOBSERVABLE driver holds — it does not fall through to the lease", () => {
+    expect(standingFor([], "a/b", 74, { verdict: "unobservable", agentId: "owner" })).toBe("unknown");
+  });
+
+  it("a sighting of NONE leaves the original lease logic exactly as it was", () => {
+    // The recovery path a genuinely dead driver depends on must be untouched, or a crashed driver
+    // is never replaced.
+    expect(standingFor([], "a/b", 74, NO_DRIVER_SIGHTED)).toBe("free");
+    expect(standingFor(undefined, "a/b", 74, NO_DRIVER_SIGHTED)).toBe("unknown");
+    const dead = [{ lease: { repo: "a/b", pr: 74 }, standing: "dead-epoch" }];
+    expect(standingFor(dead, "a/b", 74, NO_DRIVER_SIGHTED)).toBe("held-dead");
+  });
+});
+
+describe("the sweep does not put a SECOND driver on a PR that already has one", () => {
+  afterEach(() => {
+    seedLiveness({}, []);
+  });
+
+  it("REFUSES to spawn when a live driver is on the roster and no lease row exists", async () => {
+    // End to end through the real sweep, driving the exact production shape: readable lease store,
+    // no row for this PR, and an owner this window can see running. Before the roster axis existed
+    // this spawned a duplicate; `spawnMock` is the side effect that proves it no longer does.
+    seedLiveness({ owner: "working" });
+    wireInvoke({ leases: [] });
+    const project = projectWith([driverRow("owner", 1251)]);
+
+    await babysitSweepProject(project, T0, CONFIG);
+    const out = await babysitSweepProject(project, T0 + 60_000, CONFIG);
+
+    expect(spawnMock).not.toHaveBeenCalled();
+    expect(out.dispatched).toEqual([]);
+  });
+
+  it("NAMES the agent that already owns it, at a level a shipped build keeps", async () => {
+    // The only pre-existing message naming an owner was a `log.debug` on the acquire path, and
+    // `logger` drops debug in shipped builds — so when four PRs had two agents each, nothing in any
+    // log said which agent held which, and they were untangled by hand. A refusal that cannot name
+    // what it deferred to reads as the dispatcher being broken.
+    seedLiveness({ owner: "working" });
+    wireInvoke({ leases: [] });
+    const project = projectWith([driverRow("owner", 1251)]);
+
+    await babysitSweepProject(project, T0, CONFIG);
+    await babysitSweepProject(project, T0 + 60_000, CONFIG);
+
+    const named = logInfoMock.mock.calls.find(
+      (c) => typeof c[1] === "string" && c[1].includes("already has a driver"),
+    );
+    expect(named).toBeDefined();
+    expect(named?.[2]).toMatchObject({ pr: 1251, owner: "owner", sighting: "live" });
+  });
+
+  it("REFUSES when the owner is on the roster but this window cannot observe it", async () => {
+    // No status entry and no open pane: `processAliveFor` answers undefined. That is precisely the
+    // reading the old code folded onto "no driver", and it is the state of every agent whose pane
+    // is closed — which is most of them, most of the time.
+    seedLiveness({}, []);
+    wireInvoke({ leases: [] });
+    const project = projectWith([driverRow("owner", 1251)]);
+
+    await babysitSweepProject(project, T0, CONFIG);
+    await babysitSweepProject(project, T0 + 60_000, CONFIG);
+
+    expect(spawnMock).not.toHaveBeenCalled();
+  });
+
+  it("STILL dispatches when the roster shows a driver this window watched EXIT", async () => {
+    // The guard must not become a permanent mute. A `done` row is an OBSERVED death, so the PR is
+    // genuinely unowned and the ordinary lease logic takes over.
+    seedLiveness({ owner: "done" });
+    wireInvoke({ leases: [] });
+    const project = projectWith([driverRow("owner", 1251)]);
+
+    await babysitSweepProject(project, T0, CONFIG);
+    const out = await babysitSweepProject(project, T0 + 60_000, CONFIG);
+
+    expect(spawnMock).toHaveBeenCalledTimes(1);
+    expect(out.dispatched).toEqual([{ repo: "drodio/sparkle", pr: 1251, agentId: "agent-1" }]);
+  });
+});
+
+// ── THE HOLD IS BOUNDED, OR IT IS A SILENT MUTE ────────────────────────────────────────────────
+//
+// The first cut of the roster guard held a PR for any never-observed driver row, forever. Review
+// caught that this is the same defect pointed the other way, and STRICTLY WORSE than the duplicates
+// it replaces, because nothing recovers from it. The mechanism is exact and it fires on every
+// relaunch: `runtimeStore`'s `partialize` EXCLUDES `status` while PERSISTING `openAgentIds`, and a
+// roster row is destroyed only by an explicit `removeAgent`. So a `Babysit #<pr>` row left by a
+// driver that finished days ago reads `other-window` → `processAliveFor: undefined` → hold, on
+// every sweep, for that PR, permanently.
+//
+// These cases pin the CAPABILITY the guard protects — "a PR that is genuinely unowned still gets a
+// driver" — rather than the raw verdict, so the bound cannot be removed without one going red.
+describe("an unobservable driver holds, but not forever", () => {
+  const alive = (map: Record<string, boolean | undefined>) => (id: string) => map[id];
+  const OLD = T0 - BABYSIT_UNOBSERVED_HOLD_MS - 60_000;
+
+  it("THE LATCH SHAPE: a row from before a relaunch stops holding once it ages out", async () => {
+    // The exact production shape the review named, and the one no earlier test reached: `status`
+    // empty (it is never persisted) while the id is still in the persisted `openAgentIds`, which is
+    // `livenessOf → "other-window"`. Stale row ⇒ the PR is dispatchable again.
+    const stale = driverRow("owner", 74, { promptHistory: [{ id: "p0", text: babysitPrompt(74), at: OLD }] });
+    expect(driverSightingFor([stale], REPO, 74, alive({}), T0)).toBe(NO_DRIVER_SIGHTED);
+  });
+
+  it("PAIRED — a RECENT never-observed row still holds", () => {
+    // Without this the bound could be widened to zero and the guard would be gone, which is the
+    // duplicate-spawn bug back again.
+    const fresh = driverRow("owner", 74, { promptHistory: [{ id: "p0", text: babysitPrompt(74), at: T0 - 60_000 }] });
+    expect(driverSightingFor([fresh], REPO, 74, alive({}), T0)).toEqual({
+      verdict: "unobservable",
+      agentId: "owner",
+    });
+  });
+
+  it("`activityAt` refreshes the bound — a driver narrating an hour ago is recent", () => {
+    // A long-lived driver re-prompted or narrating recently is not stale however long ago it was
+    // spawned, so the newest stamp wins. Otherwise the bound would age out exactly the drivers that
+    // have been working hardest.
+    const chatty = driverRow("owner", 74, {
+      promptHistory: [{ id: "p0", text: babysitPrompt(74), at: OLD }],
+      activityAt: T0 - 60 * 60 * 1000,
+    });
+    expect(driverSightingFor([chatty], REPO, 74, alive({}), T0)).toEqual({
+      verdict: "unobservable",
+      agentId: "owner",
+    });
+  });
+
+  it("an OBSERVED-LIVE row is never aged out — an observation beats a bound", () => {
+    // The bound stands in for an observation we could not make. Where we DID make one it has no
+    // business overriding it, or a long-running driver we can plainly see gets a twin.
+    const old = driverRow("owner", 74, { promptHistory: [{ id: "p0", text: babysitPrompt(74), at: OLD }] });
+    expect(driverSightingFor([old], REPO, 74, alive({ owner: true }), T0)).toEqual({
+      verdict: "live",
+      agentId: "owner",
+    });
+  });
+
+  it("a row carrying NO stamp at all still holds — an unmeasurable age is not a stale one", () => {
+    // Deliberately asymmetric. Nothing to age out means nothing to age out; the harm of an
+    // unbounded hold here is one PR unwatched, and the harm of dispatching is two agents on one
+    // branch. The latch the review found always carries a prompt stamp, so the bound still bites
+    // exactly where the defect is.
+    const stampless = driverRow("owner", 74, { promptHistory: [], lastPrompt: babysitPrompt(74) });
+    expect(driverSightingFor([stampless], REPO, 74, alive({}), T0)).toEqual({
+      verdict: "unobservable",
+      agentId: "owner",
+    });
+  });
+
+  it("END TO END: an aged-out row does not mute the PR — a driver is dispatched", async () => {
+    // The capability, through the real sweep. This is the assertion that fails if anyone removes
+    // the bound, and it is on the SIDE EFFECT.
+    seedLiveness({}, ["owner"]);
+    wireInvoke({ leases: [] });
+    const project = projectWith([
+      driverRow("owner", 1251, { promptHistory: [{ id: "p0", text: babysitPrompt(1251), at: OLD }] }),
+    ]);
+
+    await babysitSweepProject(project, T0, CONFIG);
+    const out = await babysitSweepProject(project, T0 + 60_000, CONFIG);
+
+    expect(spawnMock).toHaveBeenCalledTimes(1);
+    expect(out.dispatched).toEqual([{ repo: "drodio/sparkle", pr: 1251, agentId: "agent-1" }]);
+  });
+
+  it("END TO END: a RECENT unobservable row on the persisted set still refuses", async () => {
+    seedLiveness({}, ["owner"]);
+    wireInvoke({ leases: [] });
+    const project = projectWith([
+      driverRow("owner", 1251, { promptHistory: [{ id: "p0", text: babysitPrompt(1251), at: T0 - 60_000 }] }),
+    ]);
+
+    await babysitSweepProject(project, T0, CONFIG);
+    await babysitSweepProject(project, T0 + 60_000, CONFIG);
+
+    expect(spawnMock).not.toHaveBeenCalled();
+  });
+});
+
+// ── THE HEARTBEAT NOW HAS A CALLER ─────────────────────────────────────────────────────────────
+//
+// `babysit_lease.rs` calls a lease dead once its heartbeat is 90 minutes old, and NOTHING in the
+// app had ever invoked `babysit_lease_heartbeat` — it sat in `scripts/tauri-command-callers.allow`
+// as a known-dead command. So `heartbeat_at_ms` was stamped once at acquire and never moved, every
+// driver was reclassified `dead-stale` at 90 minutes WHILE STILL RUNNING, and the recovery cooldown
+// dispatched its replacement. A pass self-paces at ~28 minutes, so crossing 90 is ordinary.
+describe("the lease heartbeat is refreshed from an observation", () => {
+  it("stamps the HOLDER's id when the roster shows the driver running", async () => {
+    seedLiveness({ owner: "working" });
+    wireInvoke({ leases: [{ lease: { repo: "drodio/sparkle", pr: 1251, agent_id: "holder-9" }, standing: "live" }] });
+
+    await babysitSweepProject(projectWith([driverRow("owner", 1251)]), T0, CONFIG);
+
+    // The HOLDER id, not the agent's own: the lease is held under the minted dispatch id, and
+    // `heartbeat_at` matches on it. Stamping the wrong id is a silent no-op in Rust.
+    expect(invokeMock).toHaveBeenCalledWith(BABYSIT_LEASE_HEARTBEAT_COMMAND, {
+      repo: "drodio/sparkle",
+      pr: 1251,
+      agentId: "holder-9",
+    });
+  });
+
+  it("does NOT stamp one for a driver this window cannot observe", async () => {
+    // The heartbeat must carry an OBSERVATION. Stamping it for a row we merely cannot see would
+    // keep a dead driver's lease alive forever and re-break the recovery path from the other end.
+    seedLiveness({}, ["owner"]);
+    wireInvoke({ leases: [{ lease: { repo: "drodio/sparkle", pr: 1251, agent_id: "holder-9" }, standing: "live" }] });
+
+    await babysitSweepProject(projectWith([driverRow("owner", 1251)]), T0, CONFIG);
+
+    expect(invokeMock).not.toHaveBeenCalledWith(BABYSIT_LEASE_HEARTBEAT_COMMAND, expect.anything());
+  });
+
+  it("a failing heartbeat does not take the sweep down", async () => {
+    // Best-effort bookkeeping: the roster guard already holds the PR without it, so a throw here
+    // must not turn a working sweep into a failed one.
+    seedLiveness({ owner: "working" });
+    const base = invokeMock.getMockImplementation();
+    wireInvoke({ leases: [{ lease: { repo: "drodio/sparkle", pr: 1251, agent_id: "holder-9" }, standing: "live" }] });
+    const wired = invokeMock.getMockImplementation();
+    invokeMock.mockImplementation(async (cmd: string, ...rest: unknown[]) => {
+      if (cmd === BABYSIT_LEASE_HEARTBEAT_COMMAND) throw new Error("bridge down");
+      return (wired ?? base)?.(cmd, ...rest);
+    });
+
+    const out = await babysitSweepProject(projectWith([driverRow("owner", 1251)]), T0, CONFIG);
+
+    expect(out.failed).toBe(0);
+    expect(spawnMock).not.toHaveBeenCalled();
+  });
+});
+
+// ── THE (repo, pr) GAP IS KNOWN AND DELIBERATELY LEFT OPEN ─────────────────────────────────────
+//
+// Neither `Babysit #<pr>` nor `/babysit-pr <pr>` carries a repo, so a driver on another repo's PR
+// of the same number cannot be told apart here. An earlier cut narrowed on `assignmentRepos` and
+// review measured it worse than the gap in BOTH directions: inert where aimed (dispatcher-spawned
+// drivers latch `[]`, because the babysit prompt names no repo) and harmful where not (the latch
+// fires on any GitHub URL in an agent's FIRST prompt, so a hand-typed `/babysit-pr 74` in such an
+// agent would be un-identified — and a hand-rolled driver writes no lease, so nothing else catches
+// it). The asymmetry decides it: a missed hold costs a duplicate driver on a human's PR, a spurious
+// hold costs one deferred dispatch. Closing it properly means carrying the slug in the babysit
+// assignment itself, which is a change to the skill's argument contract.
+describe("driver identity ignores the repo, and that is a stated gap not an oversight", () => {
+  const alive = (map: Record<string, boolean | undefined>) => (id: string) => map[id];
+
+  it("a foreign-repo latch does NOT un-identify a driver — the narrowing is gone and stays gone", () => {
+    const elsewhere = driverRow("owner", 74, { assignmentRepos: ["otherowner/otherrepo"] });
+    expect(isBabysitDriverFor(elsewhere, REPO, 74)).toBe(true);
+    expect(driverSightingFor([elsewhere], REPO, 74, alive({ owner: true }), T0)).toEqual({
+      verdict: "live",
+      agentId: "owner",
+    });
+  });
+
+  it("the PR NUMBER still discriminates — #7 is not #70", () => {
+    // The one half of identity this function CAN honour, and the load-bearing one: a prefix match
+    // would either suppress #70 forever or let a driver through onto #7.
+    expect(isBabysitDriverFor(driverRow("a", 7), REPO, 70)).toBe(false);
+    expect(isBabysitDriverFor(driverRow("a", 70), REPO, 7)).toBe(false);
+  });
+});
+
+
+// ── THE HOLD MUST BE ABLE TO END, WHATEVER WROTE THE LEASE ─────────────────────────────────────
+//
+// An earlier cut let a same-launch lease bypass the bound. Review caught that the epoch is per APP
+// LAUNCH, not per driver, and that NOTHING releases a lease when a driver ends normally — the only
+// release is the spawn-refused path, and the skill never releases. So an orphan lease from a driver
+// that finished an hour ago reads `dead-stale` for the rest of the app's life, and the bypass
+// turned that into a mute lasting days. One bound now, no bypass.
+describe("an orphan lease cannot mute a PR for the life of the app", () => {
+  const alive = (map: Record<string, boolean | undefined>) => (id: string) => map[id];
+  const OLD = T0 - BABYSIT_UNOBSERVED_HOLD_MS - 60_000;
+  const ancient = (pr: number) =>
+    driverRow("owner", pr, { promptHistory: [{ id: "p0", text: babysitPrompt(pr), at: OLD }] });
+
+  it("THE MUTE: an aged row with an equally-aged dead-stale lease is RELEASED", () => {
+    // The driver ended; nobody released its lease and nobody can observe its roster row. Both
+    // stamps are past the bound, so the row stops counting and the ordinary lease logic resumes.
+    expect(
+      driverSightingFor([ancient(74)], REPO, 74, alive({}), T0, {
+        acquired_at_ms: OLD,
+        heartbeat_at_ms: OLD,
+      }),
+    ).toBe(NO_DRIVER_SIGHTED);
+  });
+
+  it("PAIRED — a RECENTLY-stamped lease still holds the same aged row", () => {
+    // The lease's stamps feed the SAME bound rather than bypassing it, so recent evidence from
+    // either source holds and stale evidence from both releases. This is the case that proves the
+    // lease is still consulted at all.
+    expect(
+      driverSightingFor([ancient(74)], REPO, 74, alive({}), T0, { heartbeat_at_ms: T0 - 60_000 }),
+    ).toEqual({ verdict: "unobservable", agentId: "owner" });
+  });
+
+  it("END TO END: an orphaned dead-stale lease eventually hands the PR to a replacement", async () => {
+    // The recovery this module exists to provide. Before the bound was made unconditional, this PR
+    // stayed at `lease-unknown` until the app restarted.
+    seedLiveness({}, ["owner"]);
+    wireInvoke({
+      leases: [
+        {
+          lease: { repo: "drodio/sparkle", pr: 1251, agent_id: "holder-9", acquired_at_ms: OLD, heartbeat_at_ms: OLD },
+          standing: "dead-stale",
+        },
+      ],
+    });
+    const project = projectWith([ancient(1251)]);
+
+    await babysitSweepProject(project, T0, CONFIG);
+    const out = await babysitSweepProject(project, T0 + 60_000, CONFIG);
+
+    expect(out.dispatched).toEqual([{ repo: "drodio/sparkle", pr: 1251, agentId: "agent-1" }]);
+  });
+
+  it("a hand-typed driver in an agent whose FIRST prompt linked another repo is still recognised", async () => {
+    // `assignmentRepos` records the OPENING assignment, not the babysit target, and the latch fires
+    // on any GitHub URL in an ordinary prompt. Narrowing on it un-identified exactly the driver that
+    // writes no lease — so nothing else would have caught it, and a twin would be spawned onto a
+    // branch holding uncommitted work. The narrowing is gone; this pins that it stays gone.
+    seedLiveness({ owner: "working" });
+    wireInvoke({ leases: [] });
+    const project = projectWith([
+      driverRow("owner", 1251, {
+        name: "Some other agent",
+        assignmentRepos: ["try-sparkle/sparkle"],
+        lastPrompt: babysitPrompt(1251),
+        promptHistory: [{ id: "p0", text: "look at github.com/try-sparkle/sparkle/pull/9", at: T0 - 60_000 }],
+      }),
+    ]);
+
+    await babysitSweepProject(project, T0, CONFIG);
+    await babysitSweepProject(project, T0 + 60_000, CONFIG);
+
+    expect(spawnMock).not.toHaveBeenCalled();
   });
 });

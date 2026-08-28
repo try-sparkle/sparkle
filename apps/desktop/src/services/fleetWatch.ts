@@ -233,12 +233,61 @@ const PROMPTING: ReadonlySet<AgentTabStatus> = new Set<AgentTabStatus>(["waiting
  * prompt nobody read, which is the exact sparkle-8bvh failure the `observed-prompting` arm exists to
  * prevent. A second, narrower copy of a safety check is how that happens, so there is no second copy.
  */
-function observedStatusRefusal(st: AgentTabStatus | undefined): NoDeliveryReason | undefined {
+export function observedStatusRefusal(st: AgentTabStatus | undefined): NoDeliveryReason | undefined {
   // A live status entry is this window's proof that a pane is mounted, i.e. that a PTY exists to
   // write to. Its ABSENCE is the same event that killed the process — see `decideIdleDelivery`.
   if (st === undefined) return "no-live-pty";
   if (SAFE_TO_DELIVER.has(st)) return undefined;
   return PROMPTING.has(st) ? "observed-prompting" : "observed-not-resting";
+}
+
+/**
+ * WHAT WILL EVER HAND A QUEUED MESSAGE OVER — the question a send receipt has to answer.
+ *
+ * `inbox_send` writes a line to an append-only queue and wakes nothing. Exactly two paths ever drain
+ * it, and which one applies is decided by the SAME observation {@link observedStatusRefusal} makes:
+ *
+ *   • `turn-boundary` — this window observes the agent mid-turn or at a live prompt. It will reach
+ *     another turn boundary on its own, and its `Stop` hook (resources/sparkle-hook.mjs) drains the
+ *     queue there. Nothing in this window needs to act.
+ *   • `idle-sweep`    — this window observes a live pane in a resting band. The agent has already
+ *     emitted its last `Stop`, so the hook can never reach it; {@link pollFleetOnce}'s 30s sweep is
+ *     what claims and writes it, once the settle gate has passed.
+ *   • `nothing-observable` — this window has NO live status entry for the agent, which is the
+ *     `no-live-pty` refusal. The sweep will not claim it and the hook will not fire, so the message
+ *     sits `pending` with nobody told. That was the whole defect (bead sparkle-rk0k8o): the receipt
+ *     said `queued` and pointed at `inbox_status`, and gave the caller no way to learn that nothing
+ *     would ever move it.
+ *
+ * WHAT THIS MAY NOT SAY, and it is a hard rule here, not a nicety. A missing status entry is a fact
+ * about THIS WINDOW's observation, never about the agent — see `engine/probeOutcome` and its
+ * `ABSENCE_CLAIM_PATTERNS`. The agent may be running perfectly in another window, or headless. So
+ * the member is named for what is (not) OBSERVABLE, and every sentence rendered from it is scoped to
+ * this window. `fleet.test.ts` asserts `absenceClaimIn(note) === null` for all three.
+ *
+ * The two special ids that drain through their own channels (the concierge, and the headless Sparkle
+ * pass) come back `nothing-observable` when no pane is open, and that is deliberate rather than an
+ * oversight: this is a statement about what this window can see, and the asymmetry is the usual one
+ * — a false alarm costs a look, a false all-clear loses the message.
+ *
+ * NOT A SECOND COPY. Every arm is derived from `observedStatusRefusal`, so a change to the liveness
+ * rule moves both readers at once. A second copy of it is exactly how the receipt would come to
+ * disagree with the sweep that fills it.
+ */
+export type QueueDrainer = "turn-boundary" | "idle-sweep" | "nothing-observable";
+
+/** {@link QueueDrainer} for one observed status. Pure — see the type's docblock for each arm. */
+export function observedDrainer(st: AgentTabStatus | undefined): QueueDrainer {
+  const refusal = observedStatusRefusal(st);
+  if (refusal === undefined) return "idle-sweep";
+  return refusal === "no-live-pty" ? "nothing-observable" : "turn-boundary";
+}
+
+/** {@link observedDrainer} against this window's live status map — the same read
+ *  `defaultFleetWatchDeps().observedStatus` performs, so the receipt and the sweep cannot disagree
+ *  about which pane is live. */
+export function observedDrainerFor(agentId: string): QueueDrainer {
+  return observedDrainer(useRuntimeStore.getState().status[agentId]);
 }
 
 /**

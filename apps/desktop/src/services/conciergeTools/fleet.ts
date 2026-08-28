@@ -30,6 +30,8 @@ import type {
 } from "../../engine/fleetVerdict";
 import { verdictsFor } from "../../engine/fleetVerdict";
 import { openAgentIdSet } from "../knownAgents";
+import { useSettingsStore } from "../../stores/settingsStore";
+import { observedDrainerFor, type QueueDrainer } from "../fleetWatch";
 import { SPARKLE_AGENT_ID } from "../sparkleAgent";
 
 /** The concierge's reserved caller id. Mirrors `CONCIERGE_CALLER_AGENT_ID` in `../controlListener`,
@@ -251,6 +253,7 @@ export type EnqueueState = "queued" | "not-queued";
  *  - `delivered: false` — the direct answer to the question the caller is actually about to answer.
  *  - `verifyWith` / `verifyArgs` — the follow-up call, ready to paste. A receipt that says "this is
  *    unconfirmed" without saying how to confirm it just relocates the problem to the caller.
+ *  - `drainableBy` / `drainNote` — WHETHER ANYTHING WILL EVER DRAIN THE QUEUE. See below.
  */
 export interface EnqueueReceipt {
   messageId: string;
@@ -259,7 +262,112 @@ export interface EnqueueReceipt {
   delivered: false;
   verifyWith: "fleet.inbox_status";
   verifyArgs: { agentIds: string[]; messageIds: string[] };
+  /**
+   * WHAT WILL HAND THIS MESSAGE OVER — the half of the honesty the first version was missing
+   * (bead sparkle-rk0k8o).
+   *
+   * `state: "queued"` + `delivered: false` + "go ask `inbox_status`" is a receipt that is accurate
+   * and still leaves the caller stuck: it says the message is not delivered YET, and gives no way to
+   * learn that in this case it never will be. Measured — the concierge queued messages to idle
+   * agents this window held no pane for, they were never handed over, `inbox_status` said `pending`
+   * every time it was asked, and the sender lost time before giving up and using terminal sends.
+   *
+   * This is decided by the SAME predicate `fleetWatch` applies when the sweep tries to deliver
+   * ({@link observedDrainerFor}), so the receipt cannot promise a drain the sweep will then refuse.
+   * `"nothing-observable"` is the one that changes what a caller should do: escalate to a terminal
+   * send, or open the pane, rather than wait.
+   */
+  drainableBy: ReceiptDrainer;
+  /** One sentence a language model can repeat to a human verbatim. Scoped to THIS WINDOW's
+   *  observation and never a claim about the agent — {@link DRAIN_NOTES}. */
+  drainNote: string;
 }
+
+/**
+ * The drain path for a recipient. The two ids {@link inboxAddressableIds} admits WITHOUT a pane come
+ * FIRST, exactly as they do there, because their queue is drained by something other than a PTY;
+ * everything else is the observed-liveness question, unchanged.
+ *
+ * `observedDrainerFor` would answer `nothing-observable` for both — they have no `runtimeStore`
+ * status entry in the ordinary case — and that answer is not conservative, it is WRONG, and wrong in
+ * the way that does damage. The concierge has no PTY and no `Stop` hook at all: it drains its inbox
+ * while assembling its own turn (`services/conciergeInbox`). Improve Sparkle drains through its
+ * scheduled headless pass. So this is not an unknowable case where a false alarm merely costs a look
+ * — it is a channel KNOWN to work, reported as dead, on every single send, contradicting
+ * {@link undeliverableRecipient}'s own text three lines up. Worse, the remedy prose attached to
+ * `nothing-observable` tells the caller to open a pane or use a terminal send, and the concierge has
+ * neither: an instruction that cannot be followed, inviting a duplicate delivery on a channel that
+ * was already working (the `sparkle-8bvh` shape — a remedy is an instruction the reader will act on,
+ * so it must be safe under the very conditions that produced it).
+ *
+ * AND THE SPARKLE ARM IS CONDITIONAL, which is the whole reason this is a function rather than a set
+ * (roborev 71174, High). "Improve Sparkle has its own channel" is true only while that channel is
+ * SWITCHED ON: `improvementPass.passHoldReason` returns `consent-off` and the hourly headless pass
+ * never runs when `sparkleImprovementConsent === "never"`, a persisted user setting. With consent off
+ * and no pane open, NOTHING drains that inbox — and an unconditional `own-channel` would tell the
+ * caller not to escalate, in exactly the state where escalating is the only thing that works. That is
+ * the same defect as the `idle-sweep` promise this arm was written alongside: an affirmative claim
+ * made from a predicate that cannot see one of the real drain path's gates. Here the gate IS
+ * synchronously readable, so it is read rather than hedged in prose.
+ *
+ * The concierge has no such switch — it drains while assembling its own turn, unconditionally — so
+ * that arm stays flat.
+ */
+function receiptDrainerFor(agentId: string): ReceiptDrainer {
+  if (agentId === CONCIERGE_INBOX_ID) return "own-channel";
+  if (agentId === SPARKLE_AGENT_ID && sparkleHeadlessPassEnabled()) return "own-channel";
+  return observedDrainerFor(agentId);
+}
+
+/** Is Improve Sparkle's headless pass — its ONLY pane-less drain path — switched on? Mirrors
+ *  `improvementPass.passHoldReason`'s first arm, which is the gate that actually holds the pass. */
+function sparkleHeadlessPassEnabled(): boolean {
+  return useSettingsStore.getState().sparkleImprovementConsent !== "never";
+}
+
+/**
+ * What the receipt may name as the drain path. {@link QueueDrainer} plus the one arm that is NOT a
+ * function of an observed status: a recipient whose queue is drained structurally rather than by a
+ * pane. That arm is decided here rather than in `fleetWatch` on purpose — `fleetWatch` owns the
+ * liveness rule and must not learn which ids are app-owned singletons.
+ */
+export type ReceiptDrainer = QueueDrainer | "own-channel";
+
+/**
+ * The sentence for each {@link ReceiptDrainer}.
+ *
+ * THE CONSTRAINT ON THE `nothing-observable` ONE, and it is load-bearing. A missing status entry
+ * means this window cannot see a pane; it does NOT mean the agent is gone. The agent may be running
+ * in another window, or headless. `engine/probeOutcome.ABSENCE_CLAIM_PATTERNS` is this repo's
+ * lexicon for exactly that lie, and `fleet.test.ts` asserts `absenceClaimIn(note) === null` for
+ * every note here. So: "this window cannot see a live pane" (an observation), never "that agent is
+ * not running" (a claim about the world).
+ *
+ * THE CONSTRAINT ON THE `idle-sweep` ONE IS THE MIRROR, and it is the same defect pointing the other
+ * way. A live resting pane is NECESSARY for the sweep to deliver and it is not SUFFICIENT: the
+ * status axis is one of five gates in `fleetWatch.decideIdleDelivery`, which also refuses
+ * `no-worktree`, `unobserved`, `never-reached-a-boundary`, `mid-turn` and `boundary-not-settled` —
+ * two of them BEFORE it ever looks at the status. Those gates read the fleet digest, which this
+ * synchronous receipt does not have and will not pay for. So the note says the sweep is the path and
+ * that its other gates still apply; promising the hand-over outright would re-create the exact
+ * silent loss this field exists to end, with an affirmative claim attached.
+ */
+export const DRAIN_NOTES: Readonly<Record<ReceiptDrainer, string>> = {
+  "turn-boundary":
+    "This window sees that agent mid-turn, so its own Stop hook should drain the queue when it " +
+    "reaches its next turn boundary.",
+  "idle-sweep":
+    "This window sees a live resting pane, so the fleet watch's 30s idle sweep is the path — " +
+    "subject to its other gates (a present worktree, an observed verdict, a settled boundary), " +
+    "which this receipt does not check. Confirm with inbox_status rather than assuming.",
+  "nothing-observable":
+    "This window cannot see a live pane for that agent, so nothing here will hand the message " +
+    "over; it will sit queued. Open the agent's pane, or use a terminal send, if it has to arrive.",
+  "own-channel":
+    "That recipient drains its own inbox through its own channel rather than through a pane — the " +
+    "concierge while assembling its next turn, Improve Sparkle on its scheduled pass, which was " +
+    "checked as switched on — so this one needs no open pane and no terminal send.",
+};
 
 /** A broadcast's per-recipient receipt: the raw outcome plus the same honest vocabulary. */
 export interface BroadcastReceipt extends BroadcastOutcome {
@@ -441,6 +549,10 @@ export async function inboxSend(
   }
   try {
     const messageId = await invoke<string>("inbox_send", { agentId, text, severity });
+    // WILL ANYTHING EVER DRAIN THIS? Asked AFTER the write, of the same seam `fleetWatch` reads (plus
+    // the pane-less arm above), so the receipt reports what the sweep would decide rather than a
+    // second opinion about liveness.
+    const drainableBy = receiptDrainerFor(agentId);
     return ok("inbox_send", {
       messageId,
       agentId,
@@ -448,6 +560,8 @@ export async function inboxSend(
       delivered: false,
       verifyWith: "fleet.inbox_status",
       verifyArgs: { agentIds: [agentId], messageIds: [messageId] },
+      drainableBy,
+      drainNote: DRAIN_NOTES[drainableBy],
     });
   } catch (e) {
     return refuse("inbox_send", "queue-failed", detail(e));

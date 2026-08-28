@@ -54,7 +54,8 @@ import {
   resolveEpicPrdPath,
   type EpicPrdIndex,
 } from "./epicPrd";
-import { useBeadsStore } from "../stores/beadsStore";
+import { freshnessControl, resolveProbe } from "../engine/probeOutcome";
+import { useBeadsStore, beadsReadStartedAt } from "../stores/beadsStore";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { sendToBuildAwaited, didRelaunch, AtCapacityError, type BuildHandoff } from "./sendToBuild";
@@ -79,9 +80,37 @@ import type { AgentTab } from "../types";
 import { log } from "../logger";
 
 /** How often the sweep runs. Slow on purpose: the thing it detects is measured in hours, so a tick
- *  every ten minutes is already far finer than the two-hour window it judges against, and each tick
- *  reads the store rather than shelling out. */
+ *  every ten minutes is already far finer than the two-hour window it judges against.
+ *
+ *  A tick DOES shell out now — one `bd list` per owned project, to prove the board it is about to
+ *  judge is current (see {@link EPIC_BEADS_FRESHNESS_MS}). This comment used to say it did not, and
+ *  that was the whole bug: reading a cached snapshot is cheap precisely because it can be arbitrarily
+ *  old, and the sweep spent an agent slot on every one of those reads. One list per project per ten
+ *  minutes is a rounding error against a board poll that runs every five seconds while anyone is
+ *  looking. */
 export const EPIC_SWEEP_INTERVAL_MS = 10 * 60 * 1000;
+
+/**
+ * How recently this project's beads must have been READ for the sweep to act on them.
+ *
+ * ══ WHY THE SWEEP NEEDS ITS OWN FRESHNESS BOUND ════════════════════════════════════════════════
+ * Every gate that stops this module running away is a LABEL on the epic — the founder's
+ * `no-auto-restart` veto, the `sweep-restarted:` budget marker it writes itself, and the `stalled`
+ * escalation mark. A snapshot that predates those writes reports all three as absent, which is
+ * exactly the state that authorizes a restart. So the sweep is not merely reading data that might
+ * be a bit old; it is reading its own brakes, and a stale read means it has none.
+ *
+ * ══ TWO MINUTES, AND THE TWO NUMBERS IT SITS BETWEEN ═══════════════════════════════════════════
+ * The FLOOR is the ordinary board poll: `beadsStore.BEADS_POLL_INTERVAL_MS` is 5s and the derived
+ * cadence is capped at 60s, so any project a human is looking at is comfortably inside this and the
+ * sweep's own refresh is a no-op that costs one coalesced call. The CEILING is the sweep's own
+ * spacing: it acts at most once per ten-minute tick, so a two-minute-old read cannot predate a
+ * marker THIS sweep wrote — that write happened at least eight minutes before the read.
+ *
+ * Against the measured failure it is a factor of seventy: the runner held one frozen snapshot for
+ * 2h20m and restarted the same epic fourteen times from it (bead `sparkle-rk0k8o`).
+ */
+export const EPIC_BEADS_FRESHNESS_MS = 2 * 60 * 1000;
 
 /**
  * At most one epic is restarted per sweep, per project.
@@ -331,6 +360,49 @@ export interface EpicSweepOptions {
   /** Everything below is injected only by tests. Production takes the real stores. */
   projects?: { id: string; rootPath: string; agents: AgentTab[] }[];
   beadsFor?: (projectId: string) => Bead[] | null;
+  /**
+   * ASK FOR A CURRENT BOARD before judging one. Defaults to a passive `beadsStore.refresh`.
+   *
+   * NOT A NICETY — the sweep runs on projects NOBODY IS LOOKING AT, which is its whole purpose, and
+   * `beadsStore`'s poller is REFERENCE-COUNTED on viewers. An unwatched project is therefore polled
+   * by nothing, and its `byProject` entry is whatever was last written, however long ago. Worse,
+   * `refresh` deliberately KEEPS the previous snapshot when `bd` fails, so a project that IS being
+   * polled can still be frozen for as long as the store stays unreadable.
+   *
+   * `runWatchers: false` because the post-poll decompose watcher spends a PAID AI call and must
+   * stay bound to a real board poll; `allowAutoInit: false` because this reads a project, it does
+   * not create one. NEVER THROWS — a failed refresh leaves the freshness clock untouched, which the
+   * probe below then reads as `could-not-look`, which is the correct outcome and needs no exception.
+   */
+  refreshBeads?: (projectId: string, projectPath: string) => Promise<void>;
+  /** When this project's beads were last READ (the read's START, never its completion — see
+   *  `beadsStore.beadsReadStartedAt` for why a completion stamp can postdate contents it does not
+   *  contain). Defaults to the real clock; injected by tests. */
+  beadsReadAt?: (projectId: string) => number | undefined;
+  /** How fresh that read must be; defaults to {@link EPIC_BEADS_FRESHNESS_MS}. */
+  beadsFreshnessMs?: number;
+  /**
+   * A LIVE clock, for the freshness comparison only — NOT `now`.
+   *
+   * ══ WHY THE DECISION CLOCK CANNOT ANSWER THIS QUESTION ═════════════════════════════════════════
+   * `now` is captured ONCE at the top of the sweep and that is correct for every DECISION here:
+   * they must all judge the same instant, or two epics in one tick are measured against different
+   * stall lines. It is WRONG for freshness, which is the age of a reading at the moment it is read.
+   *
+   * The gap between the two is an unbounded chain of awaits: one `bd list --all` per project (~45s
+   * cold, documented), plus every earlier project's restarts (`sendToBuildAwaited`), label writes
+   * and audit writes with retry backoff. For the Nth project, `now - readAt` therefore UNDERSTATES
+   * the board's age by the whole elapsed tick — so a sweep that has been running six minutes would
+   * judge a board last read eight minutes ago as inside the two-minute bound and act on it. That is
+   * precisely the failure this gate exists to prevent, reintroduced for every project after the
+   * first, and worst for the projects most likely to be unviewed and therefore stale.
+   *
+   * DEFAULTS TO `Date.now` IN PRODUCTION, and to the injected `now` when a caller supplied one —
+   * so a test that fixes the clock keeps a single coherent instant and does not have to reconcile
+   * `Date.now()` (today) against a `now` of 1_700_000_000_000 (years apart, and only ever an
+   * accident of the fixture).
+   */
+  clock?: () => number;
   aliveFor?: (agentId: string) => boolean | undefined;
   restart?: (projectId: string, epicId: string) => Promise<BuildHandoff>;
   /** The durable audit note. Defaults to a `bd comment` on the epic. Injected by tests, and
@@ -439,6 +511,17 @@ export function candidateFor(
    * render as an unstaffed epic (bead `sparkle-gazo4a`).
    */
   rosterRead = true,
+  /**
+   * Was the `beads` list a CURRENT reading, or one that could not be proven fresh?
+   *
+   * Defaults to `true` so every existing caller is unchanged — a caller handing over a bead list it
+   * built itself IS the observation. The runner passes the answer its freshness probe gave, and a
+   * `false` makes `decideEpicSweep` skip `beads-unknown` before it reads any other field. Separate
+   * from `rosterRead` because they are separate readings that fail independently: the roster lives
+   * in memory and the board comes from `bd`, and the measured failure had a perfect roster beside a
+   * board frozen for 2h20m (bead `sparkle-rk0k8o`).
+   */
+  beadsObserved = true,
 ): EpicSweepCandidate {
   const bound = boundAgentsFor(agents, epic.id);
   // UNKNOWN LIVENESS COUNTS AS ALIVE. `processAliveFor` returns undefined for an agent this window
@@ -451,6 +534,7 @@ export function candidateFor(
   const orchestratorAlive = rosterRead ? bound.some((a) => alive(a.id) !== false) : null;
   return {
     epicId: epic.id,
+    beadsObserved,
     status: epicStatus(beads as Bead[], epic.id),
     // THE WATCH GATE, AND IT MUST NOT DEPEND ON A LIVE TAB. A bound agent row still counts — it is
     // the freshest possible evidence — but the DURABLE marker is what makes the gate survive the
@@ -695,6 +779,31 @@ export async function sweepEpics(opts: EpicSweepOptions = {}): Promise<EpicSweep
   }
   const beadsFor =
     opts.beadsFor ?? ((projectId: string) => useBeadsStore.getState().byProject[projectId]?.beads ?? null);
+  // ── THE FRESHNESS CLOCK BELONGS TO THE STORE, SO IT ONLY SPEAKS FOR THE STORE ─────────────────
+  // A caller that injects `beadsFor` has supplied the reading ITSELF and therefore IS the
+  // observation — the same rule `EpicSweepCandidate.beadsObserved` follows one level further in,
+  // and the same rule `candidateFor`'s `rosterRead` follows for the roster. Judging an injected
+  // board against `beadsStore`'s clock would ask how recently we read a store that board did not
+  // come from, and answer `beads-unknown` for every such caller: not a fact about anything, and it
+  // would make the gate impossible to test around rather than merely strict.
+  //
+  // So both seams default TOGETHER, off the same condition. Production injects neither and gets the
+  // real refresh and the real clock; a caller that hands over a board gets a no-op refresh and a
+  // clock that says "this reading is the one you just gave me". Splitting the two defaults is what
+  // would let a future edit refresh the real store on behalf of a synthetic board.
+  const boardIsInjected = opts.beadsFor !== undefined;
+  const refreshBeads =
+    opts.refreshBeads ??
+    (boardIsInjected
+      ? async () => {}
+      : (projectId: string, projectPath: string) =>
+          useBeadsStore.getState().refresh(projectId, projectPath, false, false));
+  const beadsReadAt = opts.beadsReadAt ?? (boardIsInjected ? () => now : beadsReadStartedAt);
+  const beadsFreshnessMs = opts.beadsFreshnessMs ?? EPIC_BEADS_FRESHNESS_MS;
+  // See `EpicSweepOptions.clock`: freshness is the age of a reading AT THE MOMENT IT IS READ, and
+  // `now` is minutes stale by the Nth project. A caller that fixed `now` gets that same instant, so
+  // no fixture has to reconcile two clocks years apart.
+  const clock = opts.clock ?? (opts.now !== undefined ? () => opts.now as number : Date.now);
   const aliveFor =
     opts.aliveFor ??
     ((agentId: string) => {
@@ -709,11 +818,54 @@ export async function sweepEpics(opts: EpicSweepOptions = {}): Promise<EpicSweep
     // SINGLE-OWNER ELECTION, the same one the other three sweeps use. Without it every open window
     // reaches the same conclusion about the same epic and each starts its own agent.
     if (!owns(project.id)) continue;
+
+    // ── ASK FOR A CURRENT BOARD BEFORE JUDGING ONE ──────────────────────────────────────────────
+    // Best-effort and deliberately un-awaited-for-success: if it throws or the store stays
+    // unreadable, the freshness clock simply does not advance and the probe below answers
+    // `could-not-look`, which is the outcome we want. There is nothing to do with the exception
+    // that the clock does not already say.
+    try {
+      await refreshBeads(project.id, project.rootPath);
+    } catch (e) {
+      log.warn("epics", "could not refresh the board before sweeping it", {
+        project: project.id,
+        error: String(e),
+      });
+    }
+
     const beads = beadsFor(project.id);
     // A project whose board has never loaded is NOT a project with no epics. Skipping is the only
     // honest answer — acting on an empty list would read every epic as having no children and
     // therefore nothing planned, which is silence rather than a decision.
     if (!beads || beads.length === 0) continue;
+
+    // ── IS THIS BOARD A CURRENT OBSERVATION, OR AN OLD ONE THAT STILL PARSES? ────────────────────
+    // THE QUESTION THE SWEEP ASKS OF A BEAD IS AN ABSENCE QUESTION — "does this epic carry the
+    // founder's veto?", "has this sweep already stamped its restart marker?", "is it already
+    // escalated?" — and every one of those is answered "no" by a snapshot old enough to predate the
+    // write. So it is resolved on the ABSENCE side deliberately: `value: null` asks `resolveProbe`
+    // whether a "no, it is not there" drawn from THIS reading would be warranted, and only
+    // `not-found` means yes. Routing it through `resolveProbe` rather than reading the control's two
+    // booleans here is what keeps this rule from drifting away from the one place that decides
+    // empty-vs-unreadable for the whole app.
+    const control = freshnessControl(
+      beadsReadAt(project.id),
+      // THE LIVE CLOCK, deliberately not `now` — read AFTER the refresh above has awaited, which is
+      // the instant this reading's age is actually being asked about.
+      clock(),
+      beadsFreshnessMs,
+      `${project.id}'s beads`,
+    );
+    const beadsObserved = resolveProbe<true>({ value: null, control }).kind === "not-found";
+    if (!beadsObserved) {
+      // ONE LINE PER PROJECT, not per epic: a wedged store makes this true of every epic at once and
+      // a per-epic log would bury the fact in its own repetition. The per-epic OUTCOMES below still
+      // name each one, because a caller that asked about N epics must get N answers.
+      log.warn("epics", "board is not a current reading; judging nothing in this project", {
+        project: project.id,
+        why: control.evidence,
+      });
+    }
 
     let acted = 0;
     for (const epic of beads.filter((b) => isEpic(beads, b))) {
@@ -729,7 +881,14 @@ export async function sweepEpics(opts: EpicSweepOptions = {}): Promise<EpicSweep
       //
       // Not counted against MAX_ACTIONS_PER_SWEEP: it starts no agent and notifies nobody. It is
       // bookkeeping that makes an existing fact durable, not a decision about the work.
-      if (!isPromotedToBuild(epic) && boundAgentsFor(project.agents, epic.id).length > 0) {
+      //
+      // GATED ON THE BOARD BEING A CURRENT READING, like every other rule below. `isPromotedToBuild`
+      // is a label read, so on a frozen snapshot this heals a marker that may already be there — an
+      // idempotent write, but one that spends a `bd` call per epic per tick against the very store
+      // that is failing to answer, which is the last thing a wedged store needs. More to the point
+      // it is a WRITE justified by a reading we have just declined to trust, and this module does
+      // not get to trust it for its own bookkeeping and distrust it for the founder's veto.
+      if (beadsObserved && !isPromotedToBuild(epic) && boundAgentsFor(project.agents, epic.id).length > 0) {
         try {
           await setLabel(project.rootPath, "add", epic.id, PROMOTED_LABEL);
           epic.labels = [...epic.labels, PROMOTED_LABEL];
@@ -740,7 +899,9 @@ export async function sweepEpics(opts: EpicSweepOptions = {}): Promise<EpicSweep
           });
         }
       }
-      const candidate = candidateFor(beads, project.agents, epic, aliveFor);
+      // `rosterRead` stays true — the roster is an in-memory read that cannot fail here; the fifth
+      // argument is the board reading, which can and did.
+      const candidate = candidateFor(beads, project.agents, epic, aliveFor, true, beadsObserved);
       const decision = decideEpicSweep(candidate, now, stallMs, maxAgeMs, hollowMs);
       const out: EpicSweepOutcome = { ...decision, projectId: project.id, performed: "none" };
 

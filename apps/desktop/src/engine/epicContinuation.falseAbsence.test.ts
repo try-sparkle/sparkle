@@ -86,3 +86,75 @@ describe("instance epic-sweeper-no-change: an unread roster is not an unstaffed 
     }
   });
 });
+
+// FALSE-ABSENCE CASE: corpus instance `epic-sweep-frozen-snapshot` (bead sparkle-rk0k8o).
+//
+// MEASURED: the sweep read its board from a beads snapshot that had not refreshed for 2h20m and
+// restarted ONE epic FOURTEEN times at a 601-second cadence, wiping its agent's session context
+// every ten minutes while its own concierge notice promised it would not restart again until the
+// epic moved. The founder added the documented `no-auto-restart` opt-out mid-run and watched three
+// more restarts fire.
+//
+// The read SUCCEEDED. It was authenticated, it parsed, and it was complete — over a population that
+// no longer existed. Every brake on this sweep is a LABEL, so a snapshot predating those writes
+// reports all of them absent, which is precisely the state that authorizes a restart.
+describe("instance epic-sweep-frozen-snapshot: a stale board is not an epic with no labels", () => {
+  it("THE CASE — an unproven board refuses to act, and says which refusal it is", () => {
+    const d = decideEpicSweep(stalled({ beadsObserved: false }), NOW);
+    expect(d.action).toBe("skip");
+    expect(d.reason).toBe("beads-unknown");
+  });
+
+  it("PAIRED — the SAME epic on a board proven current still restarts", () => {
+    // Without this, the assertion above is satisfied by a sweep switched off altogether, which
+    // re-opens the founder's original complaint rather than fixing this one.
+    expect(decideEpicSweep(stalled({ beadsObserved: true }), NOW).action).toBe("restart");
+  });
+
+  it("ABSENT means observed — an omitted field must not switch the sweep off for every caller", () => {
+    // The safe default here is the opposite of most guards in this repo, and deliberately: a
+    // candidate that states its facts directly IS the observation. Reading `undefined` as unproven
+    // would make the whole sweep inert, which is the failure it exists to end, not to cause.
+    expect(decideEpicSweep(stalled(), NOW).action).toBe("restart");
+  });
+
+  it("is checked BEFORE the watch gate, because `promoted` is a label read too", () => {
+    // The ordering is the mechanism. `promoted` comes from `promoted-to-build`, so on a frozen
+    // board it answers from the same obsolete bytes as the veto does. Checked second, an epic whose
+    // stale snapshot happens to carry the label walks straight down a ladder whose every remaining
+    // gate is also a label — and one whose stale snapshot lacks it skips by luck, reporting
+    // `not-watched` about an epic that IS watched. Pinned by asserting the unproven board wins over
+    // BOTH values of `promoted`.
+    expect(decideEpicSweep(stalled({ beadsObserved: false, promoted: true }), NOW).reason).toBe(
+      "beads-unknown",
+    );
+    expect(decideEpicSweep(stalled({ beadsObserved: false, promoted: false }), NOW).reason).toBe(
+      "beads-unknown",
+    );
+    expect(decideEpicSweep(stalled({ beadsObserved: true, promoted: false }), NOW).reason).toBe(
+      "not-watched",
+    );
+  });
+
+  it("THE FOUNDER'S VETO IS THE FACT THAT WENT MISSING — on a proven board it is honoured", () => {
+    // The bead's own hypothesis was that the veto ran too late in the ladder. It does not: it sits
+    // above every branch that ACTS. What it never got was a board carrying the label. Both halves
+    // are pinned here so neither can regress into the other.
+    expect(decideEpicSweep(stalled({ optedOut: true }), NOW).reason).toBe("opted-out");
+    expect(decideEpicSweep(stalled({ optedOut: true, alreadyEscalated: false }), NOW).action).toBe(
+      "skip",
+    );
+  });
+
+  it("an unproven board does NOT clear a standing escalation either", () => {
+    // Same rule as `staffing-unknown`, for the same reason: clearing asserts the epic is fine, and
+    // a reading we declined to trust cannot support that claim any more than it supports a restart.
+    const d = decideEpicSweep(stalled({ beadsObserved: false, alreadyEscalated: true }), NOW);
+    expect(d.action).toBe("skip");
+    expect(d.reason).toBe("beads-unknown");
+  });
+
+  it("the new skip reason does not read as an absence claim", () => {
+    expect(absenceClaimIn("beads-unknown")).toBeNull();
+  });
+});

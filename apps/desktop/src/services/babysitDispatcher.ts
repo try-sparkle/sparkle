@@ -69,14 +69,28 @@ import { readProbeGate } from "./probeGate";
 import { spawnBuildAgentInProject } from "./buildAgentSpawn";
 import { localAgentCapacity } from "./agentCapacity";
 import { useProjectStore } from "../stores/projectStore";
-import { ownsProjectInThisWindow } from "./goalContinuationRunner";
+import { useRuntimeStore } from "../stores/runtimeStore";
+import { ownsProjectInThisWindow, processAliveFor } from "./goalContinuationRunner";
 import { log } from "../logger";
-import type { Project } from "../types";
+import type { AgentTab, Project } from "../types";
 
 /** MUST match the Rust command names in `babysit_lease.rs`. */
 export const BABYSIT_LEASE_LIST_COMMAND = "babysit_leases";
 export const BABYSIT_LEASE_ACQUIRE_COMMAND = "babysit_lease_acquire";
 export const BABYSIT_LEASE_RELEASE_COMMAND = "babysit_lease_release";
+/**
+ * Refresh a lease's heartbeat, so `dead-stale` means something.
+ *
+ * ══ IT HAD NO CALLER AT ALL, AND THAT IS WHY DRIVERS WERE DUPLICATED ═══════════════════════════
+ * `babysit_lease.rs` calls a lease dead once its heartbeat is `STALE_MS_DEFAULT` (90 minutes) old,
+ * and nothing in the app had ever invoked this command — it sat in
+ * `scripts/tauri-command-callers.allow` as a known-dead command. `heartbeat_at_ms` was therefore
+ * stamped once at acquire and never moved, so EVERY driver was reclassified `dead-stale` at 90
+ * minutes WHILE STILL RUNNING, and the recovery cooldown dispatched its replacement five minutes
+ * later. A babysit pass self-paces at ~28 minutes, so crossing 90 is the ordinary case, and the
+ * measured duplicates were a ~2h-old owner beside a fresh agent on four PRs in one night.
+ */
+export const BABYSIT_LEASE_HEARTBEAT_COMMAND = "babysit_lease_heartbeat";
 
 /** MUST match `REASON_HELD_LIVE` in `babysit_lease.rs` — the ONE refusal that is not a bug. */
 export const BABYSIT_LEASE_REASON_HELD_LIVE = "held-live";
@@ -154,8 +168,223 @@ export function checkRollupOf(pr: PrRow): BabysitCheckRollup {
 
 /** One lease as `babysit_leases` reports it, narrowed to what this module reads. */
 interface LeaseView {
-  lease?: { repo?: string; pr?: number };
+  lease?: { repo?: string; pr?: number; agent_id?: string; acquired_at_ms?: number; heartbeat_at_ms?: number };
   standing?: string;
+}
+
+/**
+ * Is this roster row a babysit driver for `pr`?
+ *
+ * TWO SIGNALS, BOTH DELIBERATE. `dispatchOne` spawns with `name: \`Babysit #<pr>\``, which is the
+ * obvious one and is NOT sufficient on its own: an agent may rename itself at any time through the
+ * `rename_agent` control op, so a name is a label that drifts. `promptHistory` is latched — every
+ * prompt ever submitted, oldest-first, persisted — so the `/babysit-pr <n>` that started the skill
+ * survives a rename, a relaunch, and the agent going on to talk about something else.
+ *
+ * IT ALSO CATCHES THE DRIVER THE LEASE STORE CANNOT SEE, which is the whole point. `.claude/skills/
+ * babysit-pr/SKILL.md` never acquires a lease — it ASSUMES the dispatcher already took one on its
+ * behalf. So a `/babysit-pr 70` typed by a human, invoked through the Skill tool, or handed out by
+ * an orchestrator produces a real, working driver with NO lease row at all, and the lease read
+ * below reports that PR free. Matching on the prompt is what makes such a driver visible.
+ *
+ * EXACT MATCH ON A TRIMMED STRING, not `startsWith` or `includes`: `/babysit-pr 7` is a prefix of
+ * `/babysit-pr 70`, and a driver on #7 must not be mistaken for one on #70 (or the reverse, which
+ * would suppress a legitimate dispatch forever).
+ */
+export function isBabysitDriverFor(
+  agent: Pick<AgentTab, "name" | "lastPrompt" | "promptHistory" | "assignmentRepos">,
+  repo: string,
+  pr: number,
+): boolean {
+  const numberMatches =
+    agent.name === `Babysit #${pr}` ||
+    agent.lastPrompt?.trim() === babysitPrompt(pr) ||
+    (agent.promptHistory ?? []).some((e) => e.text?.trim() === babysitPrompt(pr));
+  // ── IDENTITY IS (repo, pr), AND THIS FUNCTION CANNOT SEE THE REPO ─────────────────────────────
+  // Neither `Babysit #<pr>` nor `/babysit-pr <pr>` carries one, so a driver on another repo's PR of
+  // the same number is indistinguishable from this one's here. `repo` is taken and deliberately
+  // UNUSED, so the signature states the identity this decision is about even though the evidence
+  // available cannot yet honour it.
+  //
+  // AN EARLIER CUT NARROWED ON `assignmentRepos` AND THAT WAS WORSE THAN THE GAP. Review measured
+  // both directions. It is INERT where it was aimed: `dispatchOne` spawns with `/babysit-pr <n>`,
+  // which names no repository, so every dispatcher-spawned driver latches `[]` and matches across
+  // repos regardless. And it is HARMFUL where it is not aimed: `assignmentRepos` records the
+  // agent's OPENING assignment, latched once and never rewritten, and the latch fires on any GitHub
+  // URL or `owner/repo#N` shorthand — shapes that saturate ordinary prompts here. So a human typing
+  // `/babysit-pr 74` into an agent whose first prompt happened to link another repo would have its
+  // driver un-identified, and a hand-rolled driver writes NO LEASE, so nothing else would catch it:
+  // a second driver onto a branch the first holds uncommitted work on. That is this bead, unchanged.
+  //
+  // The asymmetry decides it: a missed hold costs a duplicate driver on a human's PR; a spurious
+  // hold costs one deferred dispatch. So the number collision stays a known gap rather than being
+  // "fixed" by a field that answers a different question. Closing it properly means carrying the
+  // slug in the babysit assignment itself — `/babysit-pr <owner/repo#n>` — which is a change to the
+  // skill's argument contract and is deliberately not smuggled in here.
+  void repo;
+  return numberMatches;
+}
+
+/**
+ * What the AGENT ROSTER says about a driver for this PR — the reading the lease store cannot make.
+ *
+ *   live         — a driver for this PR exists and THIS WINDOW OBSERVED IT RUNNING.
+ *   unobservable — a driver row exists and this window cannot tell whether it is running.
+ *   none         — no row for this PR at all.
+ *
+ * `alive` is `goalContinuationRunner.processAliveFor`, the app's shared tri-state liveness answer,
+ * and the tri-state is the entire fix. `undefined` there means "this window never observed this
+ * agent" — an agent with no open pane, or one just spawned whose pane has not mounted — and it is
+ * NOT a claim that the agent is gone. Folding that onto "no driver" is the same mistake the epic
+ * sweep made with a stale board, and it has the worse blast radius of the two: two agents pushing
+ * one branch is precisely the collision worktree isolation exists to prevent.
+ *
+ * A row `alive` reports as literally `false` is a driver this window WATCHED EXIT, so it is passed
+ * over — otherwise a finished driver would suppress every future dispatch on that PR forever.
+ */
+export type BabysitDriverSighting =
+  | { verdict: "live"; agentId: string }
+  | { verdict: "unobservable"; agentId: string }
+  | { verdict: "none" };
+
+export const NO_DRIVER_SIGHTED: BabysitDriverSighting = { verdict: "none" };
+
+/**
+ * How long a driver row this window has NEVER OBSERVED may hold its PR.
+ *
+ * ══ AN UNBOUNDED HOLD IS THE SAME BUG POINTED THE OTHER WAY ════════════════════════════════════
+ * The first cut of this guard had no bound, and review caught that it manufactures a permanent,
+ * silent mute — the `sparkle-2hsrlz` class, and strictly worse than the duplicates it replaces
+ * because nothing ever recovers from it. The mechanism is exact: `runtimeStore`'s `partialize`
+ * EXCLUDES `status` while PERSISTING `openAgentIds`, and a roster row is destroyed only by an
+ * explicit `removeAgent`. So after any relaunch, a `Babysit #<pr>` row left by a driver that
+ * finished days ago reads `livenessOf → "other-window"` → `processAliveFor → undefined` →
+ * `unobservable` → hold, on every sweep, forever, for that PR.
+ *
+ * ══ WHAT THE BOUND IS MEASURED AGAINST, AND WHY NOT A CLOCK OF OUR OWN ═════════════════════════
+ * The row's own evidence: the `at` on the latched `/babysit-pr <n>` prompt entry (when the driver
+ * was started) and `activityAt` (when it last narrated). Both are stamps the row already carries
+ * for other reasons, both survive a relaunch, and neither can be forged by the absence of an
+ * observation — which is the whole failure class here. A module-scope "first seen" map would be
+ * wiped by the relaunch that CREATES the latch, so it would bound nothing in the one case that
+ * matters.
+ *
+ * FOUR HOURS. A babysit pass self-paces at ~28 minutes and the skill self-terminates on merge,
+ * close or convergence, so four hours is several passes — comfortably past the measured duplicate
+ * pairs (a 2h-old owner beside a fresh one) while still bounding the mute at a fraction of a day.
+ *
+ * AN UNMEASURABLE AGE STILL HOLDS, and that asymmetry is deliberate: a row carrying neither stamp
+ * gives us nothing to age out, and the harm of a hold we cannot bound is bounded itself (one PR
+ * unwatched) while the harm of dispatching is two agents pushing one branch.
+ *
+ * ══ IT IS THE FALLBACK, NOT THE PRIMARY SIGNAL — AND REVIEW WAS RIGHT ABOUT WHY ════════════════
+ * NEITHER STAMP ADVANCES WHILE A BABYSIT DRIVER RUNS. `promptHistory` grows only when a prompt is
+ * DELIVERED, and `dispatchOne` sends exactly one, ever — the skill re-arms itself through its own
+ * Monitor, which writes nothing to the store. `activityAt` has one writer, the `set_agent_activity`
+ * MCP op, and the skill never emits it. So this stamp is SPAWN TIME, frozen for the agent's whole
+ * life, and a bound resting on it alone would age out a driver that has been working for five hours
+ * — re-opening the exact duplicate dispatch this guard exists to stop, for every PR that takes more
+ * than four hours to land, which is most of the interesting ones.
+ *
+ * ══ THERE IS NO SIGNAL THAT ADVANCES, SO THE BOUND IS A CHOICE, NOT A MEASUREMENT ═════════════
+ * Two review rounds established this from opposite directions, and both were right. An earlier cut
+ * let a SAME-LAUNCH LEASE bypass the bound entirely. That is not the fix: the epoch is per APP
+ * LAUNCH, not per driver, and nothing releases a lease when a driver ends normally — the only
+ * release is the spawn-refused path, and the skill never releases. So an orphan lease from a driver
+ * that finished an hour ago reads `dead-stale` for the rest of the app's life, and bypassing the
+ * bound on it mutes that PR for days. That is the same permanent mute, reached through the hatch
+ * added to close its opposite.
+ *
+ * So: ONE bound, NO bypass, measured against the NEWEST of everything available — the latched
+ * babysit prompt, `activityAt`, and the lease's own `acquired_at_ms` / `heartbeat_at_ms`. None of
+ * them advances while an unobservable driver works, so past the bound we are guessing either way.
+ * The bound decides WHICH guess and FOR HOW LONG, and that is all it can honestly claim to do.
+ *
+ * TWELVE HOURS, with the residual risk stated rather than hidden: a driver still working after
+ * twelve hours that no window can observe WILL get a twin. That is accepted. It is far rarer than
+ * either failure it replaces — a four-hour bound aged out ordinary long-running drivers, and an
+ * unbounded hold silenced a PR until the app restarted — and unlike a mute it ANNOUNCES ITSELF,
+ * because a second driver is visible on the roster while a silently-unwatched PR is not.
+ *
+ * When the bound does release, nothing is lost: the ordinary lease logic resumes, `dead-stale`
+ * becomes `held-dead`, and the recovery cooldown paces the takeover. A recovery, not a storm.
+ */
+export const BABYSIT_UNOBSERVED_HOLD_MS = 12 * 60 * 60 * 1000;
+
+/**
+ * The newest moment this row gave evidence it exists, or null when it carries none.
+ *
+ * Prompt stamps AND `activityAt`, whichever is newer: a driver re-prompted or narrating an hour ago
+ * is recent however long ago it was spawned.
+ */
+export function driverEvidenceAt(
+  agent: Pick<AgentTab, "name" | "lastPrompt" | "promptHistory" | "activityAt">,
+  pr: number,
+  /** The lease's own stamps for this PR, when one exists. Neither advances for an unobservable
+   *  driver either — see {@link BABYSIT_UNOBSERVED_HOLD_MS} — but `acquired_at_ms` is a better lower
+   *  bound than a spawn prompt for a driver whose lease was taken later, and folding them into the
+   *  SAME bound is precisely what stops a lease from becoming a bypass. */
+  lease?: { acquired_at_ms?: number; heartbeat_at_ms?: number },
+): number | null {
+  const want = babysitPrompt(pr);
+  let newest: number | null = null;
+  for (const e of agent.promptHistory ?? []) {
+    if (e.text?.trim() !== want) continue;
+    if (typeof e.at === "number" && (newest === null || e.at > newest)) newest = e.at;
+  }
+  for (const t of [agent.activityAt, lease?.acquired_at_ms, lease?.heartbeat_at_ms]) {
+    if (typeof t === "number" && (newest === null || t > newest)) newest = t;
+  }
+  return newest;
+}
+
+export function driverSightingFor(
+  agents: readonly Pick<
+    AgentTab,
+    "id" | "name" | "lastPrompt" | "promptHistory" | "activityAt" | "assignmentRepos"
+  >[],
+  repo: string,
+  pr: number,
+  alive: (agentId: string) => boolean | undefined,
+  now: number,
+  /**
+   * Does a lease for this PR carry the CURRENT app launch's epoch?
+   *
+   * THE SIGNAL THAT ACTUALLY ADVANCES, and the one the time bound cannot replace. `babysit_lease.rs`
+   * stamps every lease with `process_epoch()`, and its `standing` reports `dead-epoch` for a lease
+   * from a launch that is over — so a `live` or `dead-stale` standing means "the holder's process
+   * belongs to THIS launch", which is positive evidence a driver we merely cannot observe is still
+   * running. `dead-epoch`, or no lease at all, gives us none.
+   *
+   * This is what separates the two failure shapes the reviews found, which pull in opposite
+   * directions: a row persisted from a PREVIOUS launch by a driver that finished days ago (the
+   * permanent latch) has a `dead-epoch` lease and is released; a driver spawned five hours ago in
+   * THIS launch whose pane is simply closed has a same-epoch lease and is held. Neither is a
+   * question about elapsed time, which is why elapsed time could not answer both.
+   */
+  leaseStamps?: { acquired_at_ms?: number; heartbeat_at_ms?: number },
+  holdMs: number = BABYSIT_UNOBSERVED_HOLD_MS,
+): BabysitDriverSighting {
+  let unobservable: BabysitDriverSighting | null = null;
+  for (const a of agents) {
+    if (!isBabysitDriverFor(a, repo, pr)) continue;
+    const v = alive(a.id);
+    // AN OBSERVED-LIVE ROW ENDS IT — the strongest evidence available, and no later row can weaken
+    // it, so there is nothing to gain by reading on. Note it is NOT aged out: an observation beats
+    // a bound, because the bound exists only to stand in for one we could not make.
+    if (v === true) return { verdict: "live", agentId: a.id };
+    if (v !== undefined) continue; // observed EXIT — the PR is genuinely unowned by this row
+    // NEVER OBSERVED. Hold while the newest evidence this row OR its lease carries is inside the
+    // bound; past it the row stops counting and the ordinary lease logic — including the recovery
+    // cooldown — takes over. ONE rule, no bypass: see BABYSIT_UNOBSERVED_HOLD_MS for why a
+    // same-launch lease is not the exemption it looks like.
+    const at = driverEvidenceAt(a, pr, leaseStamps);
+    if (at !== null && now - at > holdMs) continue;
+    // FIRST such row is kept, not the last: the oldest matching driver is the one whose ownership a
+    // refusal should name, and the roster is in creation order.
+    if (unobservable === null) unobservable = { verdict: "unobservable", agentId: a.id };
+  }
+  return unobservable ?? NO_DRIVER_SIGHTED;
 }
 
 /**
@@ -164,12 +393,40 @@ interface LeaseView {
  * FAIL CLOSED. An unreadable lease store must never read as `free`: the harm is two drivers
  * double-posting on a human's PR, so "I could not tell whether a driver exists" is not "no driver
  * exists". The decision core holds `lease-unknown` on it and nothing is dispatched.
+ *
+ * ══ THE ROSTER OUTRANKS THE LEASE, IN BOTH DIRECTIONS (bead `sparkle-rk0k8o`) ═══════════════════
+ * The lease was the ONLY input here, and it is blind in two measured ways that between them put a
+ * second driver on PRs #69, #70, #72 and #74 — each pair a ~2h-old agent beside a fresh one, and
+ * the concierge could not retire the duplicates because they ALREADY HELD uncommitted work on the
+ * branch their twin owned.
+ *
+ *   1. NO LEASE ROW READ AS `free`. A driver started through the skill, by a human, or by an
+ *      orchestrator writes no lease at all — `SKILL.md` assumes the dispatcher took one — so it is
+ *      structurally invisible and the PR reports free.
+ *   2. `dead-stale` IS NOT A DEATH SIGNAL IN THIS BUILD. `standing()` calls a lease dead once its
+ *      heartbeat is 90 minutes old, and `babysit_lease_heartbeat` HAS NO FRONTEND CALLER — it sits
+ *      in `scripts/tauri-command-callers.allow` as a known-dead command. `heartbeat_at_ms` is
+ *      stamped once at acquire and never refreshed, so EVERY driver is reclassified dead at 90
+ *      minutes while still running, and the 5-minute recovery cooldown then dispatches its
+ *      replacement. The skill self-paces at ~28 minutes a pass, so crossing 90 minutes is the
+ *      normal case, not the edge. That is the exact "2h old + 25m old" shape on the roster.
+ *
+ * So a roster sighting is consulted FIRST and wins: an observed-live driver makes the PR held
+ * whatever the lease says, and a driver we merely cannot observe makes it `unknown` rather than
+ * free. Fixing the heartbeat instead would close (2) alone and leave (1) wide open; this closes
+ * both, and keeps working if the heartbeat is ever wired up.
+ *
+ * A sighting of `none` leaves the original lease logic untouched, so the recovery path a genuinely
+ * dead driver depends on is unchanged.
  */
 export function standingFor(
   rows: readonly LeaseView[] | undefined,
   repo: string,
   pr: number,
+  sighting: BabysitDriverSighting = NO_DRIVER_SIGHTED,
 ): BabysitLeaseStanding {
+  if (sighting.verdict === "live") return "held-live";
+  if (sighting.verdict === "unobservable") return "unknown";
   if (rows === undefined) return "unknown";
   const row = rows.find((r) => r.lease?.repo === repo && r.lease?.pr === pr);
   if (!row) return "free";
@@ -476,6 +733,14 @@ export async function babysitSweepProject(
   const hold = (reason: string): void => {
     out.holds[reason] = (out.holds[reason] ?? 0) + 1;
   };
+  /** The app's shared tri-state liveness answer, read off this window's runtime store. `undefined`
+   *  means "never observed here" and is NOT a death — see `driverSightingFor`. Read through the
+   *  store rather than injected because every caller and every test already seeds these two maps
+   *  directly, and a second copy of the liveness rule is the drift this whole bead is about. */
+  const aliveFor = (agentId: string): boolean | undefined => {
+    const rt = useRuntimeStore.getState();
+    return processAliveFor(agentId, rt.status, new Set(rt.openAgentIds));
+  };
 
   const prs = await fetchOpenPrs(project.rootPath, project.id);
   // `null` is "we could not look" and is NOT an empty list. Nothing to do either way, but the two
@@ -571,7 +836,54 @@ export async function babysitSweepProject(
         prReviewer: reviewPolicy.prReviewer,
       };
       const k = key(repo, pr.number);
-      const lease = standingFor(leases, repo, pr.number);
+      // ── ASK THE ROSTER BEFORE THE LEASE ────────────────────────────────────────────────────────
+      // `project.agents` is this window's roster; `processAliveFor` is the app's shared tri-state
+      // liveness answer, whose `undefined` means "not observed", never "gone". See `standingFor`
+      // for the two ways the lease alone is blind and the four PRs that cost.
+      // `?? []` because a caller may hand over a project record without a roster (every direct
+      // caller in the suite does). An ABSENT roster is not an empty one, but the two are
+      // indistinguishable from here and the honest reading is the conservative one: `[]` yields
+      // `none`, which leaves the lease logic exactly as it was rather than manufacturing a hold.
+      // The lease's own stamps feed the SAME bound the roster row does — there is no bypass. See
+      // BABYSIT_UNOBSERVED_HOLD_MS for why "written by this app launch" is not evidence about a
+      // driver: the epoch is per launch, not per driver, and no lease is released on a normal exit.
+      const leaseRow = leases?.find((r) => r.lease?.repo === repo && r.lease?.pr === pr.number);
+      // NO `?? []` HERE, DELIBERATELY. `Project.agents` is a REQUIRED field and every production
+      // path supplies it, so a default would exist only to serve a test fixture — and it would
+      // resolve "nobody supplied a roster" to the PERMISSIVE `none` verdict, which inverts this
+      // module's own convention: `standingFor` maps an unreadable lease store to `unknown` precisely
+      // because "I could not tell whether a driver exists" must not read as "no driver exists".
+      // Conservative here means HOLD, not dispatch. The fixtures carry `agents: []` instead, so a
+      // future roster-less caller fails loudly rather than silently disabling the whole guard.
+      const sighting = driverSightingFor(
+        project.agents,
+        repo,
+        pr.number,
+        aliveFor,
+        now,
+        leaseRow?.lease,
+      );
+      const lease = standingFor(leases, repo, pr.number, sighting);
+      // ── AN OBSERVATION IS WHAT A HEARTBEAT IS FOR ──────────────────────────────────────────────
+      // The sweep has just established, from the roster, that a driver for this PR is RUNNING. That
+      // is exactly the fact `heartbeat_at_ms` is supposed to carry, and until now nothing carried
+      // it: see BABYSIT_LEASE_HEARTBEAT_COMMAND for the 90-minute reclassification that produced
+      // the duplicates. Stamping it here — from an observation rather than from the driver's own
+      // say-so — makes `dead-stale` mean "no window has seen this driver in 90 minutes" instead of
+      // "this lease is 90 minutes old", which is the question the standing was always asking.
+      //
+      // BEST EFFORT AND NEVER FATAL. It is bookkeeping that makes an existing fact durable; a
+      // failed stamp costs one refresh, and the roster guard above already holds the PR without it.
+      if (sighting.verdict === "live") {
+        const holder = leaseRow?.lease?.agent_id;
+        if (holder) {
+          try {
+            await invoke(BABYSIT_LEASE_HEARTBEAT_COMMAND, { repo, pr: pr.number, agentId: holder });
+          } catch (e) {
+            log.debug("babysit", "could not refresh a lease heartbeat", { repo, pr: pr.number, error: String(e) });
+          }
+        }
+      }
       // Before the decision, so a driver that exited during THIS interval is already cooling down by
       // the time the cooldown is evaluated rather than one sweep later.
       observeLease(k, lease, now);
@@ -593,6 +905,27 @@ export async function babysitSweepProject(
 
       if (!decision.dispatch) {
         hold(decision.hold);
+        // ── SAY WHO ALREADY OWNS IT, AT A LEVEL A SHIPPED BUILD KEEPS ─────────────────────────────
+        // The only existing message naming an owner is a `log.debug` on the ACQUIRE path, and
+        // `logger` drops debug in shipped builds — so when the founder found four PRs with two
+        // agents each, nothing in any log could tell him which agent held which PR, and the
+        // duplicates had to be untangled by hand. A refusal that cannot name what it deferred to is
+        // indistinguishable from the dispatcher being broken, which is the reading he actually made.
+        //
+        // ONLY FOR THE OWNERSHIP HOLDS. The other reasons (cooldown, budget, no evidence yet) are
+        // ordinary and frequent, and logging every one of them at info would bury this line.
+        if (sighting.verdict !== "none") {
+          log.info("babysit", "not dispatching: this PR already has a driver", {
+            repo,
+            pr: pr.number,
+            owner: sighting.agentId,
+            // "observed running here" vs "on the roster but not observable from this window" — the
+            // second is a HOLD, not a claim that the agent is running. Saying which is what lets a
+            // reader decide whether to go and look.
+            sighting: sighting.verdict,
+            hold: decision.hold,
+          });
+        }
         // A sweep that declined to dispatch is not a refusal, so it BREAKS the run — see the field's
         // own note for why the count is consecutive rather than cumulative.
         clocks.refusalStreak = 0;

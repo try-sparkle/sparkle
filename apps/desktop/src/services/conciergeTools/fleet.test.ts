@@ -9,6 +9,7 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke: (...a: unknown[]) => invoke(...
 
 import type { InboxEntry, InboxView } from "./fleet";
 import {
+  DRAIN_NOTES,
   FLEET_OPS,
   FLEET_RISK,
   fleetDigest,
@@ -17,8 +18,10 @@ import {
   inboxStatus,
   readAgentTranscript,
 } from "./fleet";
+import { absenceClaimIn } from "../../engine/probeOutcome";
 import { defaultDecisionFor } from "./policy";
 import { useRuntimeStore } from "../../stores/runtimeStore";
+import { useSettingsStore, DEFAULT_SPARKLE_CONSENT } from "../../stores/settingsStore";
 import { SPARKLE_AGENT_ID } from "../sparkleAgent";
 
 // The concierge's reserved caller id. Mirrors `CONCIERGE_CALLER_AGENT_ID` in `../controlListener`
@@ -32,13 +35,28 @@ beforeEach(() => {
   // The deliver-or-fail directory (bead sparkle-179b2s) reads liveness from `openAgentIdSet`, i.e.
   // the runtime store's `openAgentIds`. Reset it so no live agent leaks between tests; each test
   // that expects a send to SUCCEED seeds the recipient here (driving the REAL seam, not a mock).
-  useRuntimeStore.setState({ openAgentIds: [] } as never);
+  // `status` too: it is the SECOND, independent seam the receipt reads (`drainableBy`), and a live
+  // entry leaking between tests would silently turn a `nothing-observable` case into a drainable one.
+  useRuntimeStore.setState({ openAgentIds: [], status: {} } as never);
+  // The THIRD seam the receipt reads: Improve Sparkle's `own-channel` arm is only true while its
+  // headless pass is switched on, so a leaked `never` from another test would silently change the
+  // verdict for that id.
+  useSettingsStore.setState({ sparkleImprovementConsent: DEFAULT_SPARKLE_CONSENT } as never);
 });
 
 /** Mark ids as live so `inboxSend`/`inboxBroadcast` will deliver to them — the same seam production
  *  reads. Kept as a helper so a test states the addressable set in one line. */
 function markLive(...ids: string[]): void {
   useRuntimeStore.setState({ openAgentIds: ids } as never);
+}
+
+/** Give this window a live STATUS entry for `id` — the seam `fleetWatch.observedStatusRefusal` reads
+ *  and therefore the one the receipt's `drainableBy` is decided from. Distinct from `markLive`:
+ *  `openAgentIds` answers "may I address this id?", `status` answers "can I see a live pane?". */
+function markObserved(id: string, status: string): void {
+  useRuntimeStore.setState(
+    { status: { ...useRuntimeStore.getState().status, [id]: status } } as never,
+  );
 }
 
 /**
@@ -267,6 +285,189 @@ describe("inboxSend — a receipt for an ENQUEUE, not for a delivery", () => {
     expect(check.data.rows[0]!.entries!.map((e) => [e.id, e.state])).toEqual([["m1", "pending"]]);
   });
 
+  /**
+   * (b) THE SECOND HALF OF THE HONESTY (bead sparkle-rk0k8o). Everything above is accurate and still
+   * leaves the caller stuck: `queued` + `delivered: false` + "ask `inbox_status`" says the message
+   * has not landed YET, and says nothing about whether anything will EVER pick it up.
+   *
+   * Measured: the concierge queued messages to idle agents this window held no pane for. Nothing
+   * drains that queue except the recipient's own `Stop` hook — which an already-idle agent has
+   * emitted for the last time — and `fleetWatch`'s 30s sweep, which refuses `no-live-pty` for
+   * exactly these agents. The messages sat `pending` and the receipt looked like ordinary success.
+   *
+   * FAILS WITHOUT THE CHANGE by construction: the old receipt has no `drainableBy` key at all, so it
+   * reads `undefined` and `toBe("nothing-observable")` rejects it.
+   */
+  it("says NOTHING OBSERVABLE will drain the queue when this window has no live pane", async () => {
+    // Addressable (so the send proceeds) but UNOBSERVED — no `status` entry. This is precisely the
+    // shape `fleetWatch.observedStatusRefusal` answers `no-live-pty` for, and therefore the shape
+    // whose message the sweep will never claim.
+    markLive("a1");
+    invoke.mockResolvedValue("m1");
+    const r = await inboxSend("a1", "rebase before you verify");
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+
+    expect(r.data.drainableBy).toBe("nothing-observable");
+    expect(r.data.drainNote).toBe(DRAIN_NOTES["nothing-observable"]);
+    // The rule the whole receipt rests on is UNCHANGED: this is still an enqueue, never a delivery.
+    expect(r.data.state).toBe("queued");
+    expect(r.data.delivered).toBe(false);
+  });
+
+  /**
+   * THE PAIRED POSITIVE. A verdict that said `nothing-observable` unconditionally would also satisfy
+   * the test above; these two pin that the receipt is reading the observation rather than a constant,
+   * and that each of the two real drain paths is named by the state that actually reaches it.
+   */
+  it("names the IDLE SWEEP for a live resting pane and the TURN BOUNDARY for one mid-turn", async () => {
+    markLive("resting", "busy");
+    markObserved("resting", "idle"); // a resting band: the hook is done, the 30s sweep is what runs
+    markObserved("busy", "working"); // mid-turn: its own Stop hook will drain at the next boundary
+
+    invoke.mockResolvedValue("m-resting");
+    const resting = await inboxSend("resting", "main has moved");
+    expect(resting.ok).toBe(true);
+    if (!resting.ok) return;
+    expect(resting.data.drainableBy).toBe("idle-sweep");
+    expect(resting.data.drainNote).toBe(DRAIN_NOTES["idle-sweep"]);
+
+    invoke.mockResolvedValue("m-busy");
+    const busy = await inboxSend("busy", "main has moved");
+    expect(busy.ok).toBe(true);
+    if (!busy.ok) return;
+    expect(busy.data.drainableBy).toBe("turn-boundary");
+    expect(busy.data.drainNote).toBe(DRAIN_NOTES["turn-boundary"]);
+  });
+
+  /**
+   * THE NOTE MAY NOT CLAIM THE AGENT IS GONE. A missing status entry is a fact about what THIS
+   * WINDOW can observe — the agent may be running perfectly in another window, or headless. This
+   * repo has a lexicon for that exact lie (`engine/probeOutcome.ABSENCE_CLAIM_PATTERNS`), and the
+   * sentence a language model repeats to a human is the surface it does the most damage on.
+   *
+   * Asserted over EVERY note, not just the `nothing-observable` one, so a later edit to any of them
+   * is caught. `absenceClaimIn` returns the pattern ID rather than a boolean, so the failure names
+   * which claim was made instead of reading as "some string is wrong".
+   */
+  it("phrases every drain note as an observation, never as an absence claim", () => {
+    /**
+     * THE CLAIM EACH NOTE MUST ACTUALLY CARRY. Passing the absence lexicon is only the PROHIBITION,
+     * and a note gutted to a single harmless clause passes it trivially — measured: blanking half
+     * the `nothing-observable` sentence left the suite green, because the receipt test compared
+     * `drainNote` against `DRAIN_NOTES[...]`, which is tautological on the text. So each note is
+     * also pinned to the load-bearing clause it exists for, and the map is asserted EXHAUSTIVE so a
+     * new drainer cannot be added with no claim at all.
+     */
+    const REQUIRED_CLAIMS: Record<string, RegExp[]> = {
+      // Scoped to the observer, AND names the mechanism that will run, so the caller knows to wait.
+      "turn-boundary": [/\bthis window\b/i, /\bStop hook\b/i],
+      // NECESSARY IS NOT SUFFICIENT: the sweep has four more gates this receipt cannot check, so the
+      // note must name the sweep AND say the observation is a path rather than a promise. Without
+      // the second clause the note re-creates the silent loss the field exists to end, with an
+      // affirmative claim attached.
+      "idle-sweep": [/\b30s idle sweep\b/i, /\bsubject to its other gates\b/i],
+      // Scoped to the OBSERVER. This is the clause that stops the same fact being repeated to a
+      // human as "that agent is gone", and dropping it trips no absence pattern.
+      "nothing-observable": [/\bthis window cannot see\b/i],
+      // The opposite failure: these ids have no pane BY DESIGN. The note must say the queue is
+      // drained anyway, name BOTH channels so the caller can tell which it is holding, and must NOT
+      // send anyone after a pane or a terminal that do not exist.
+      "own-channel": [
+        /\bits own channel\b/i,
+        /\bconcierge\b/i,
+        /\bImprove Sparkle\b/i,
+        /\bneeds no open pane and no terminal send\b/i,
+      ],
+    };
+    expect(Object.keys(REQUIRED_CLAIMS).sort()).toEqual(Object.keys(DRAIN_NOTES).sort());
+
+    for (const [drainer, note] of Object.entries(DRAIN_NOTES)) {
+      expect(absenceClaimIn(note), `${drainer}: "${note}"`).toBe(null);
+      for (const claim of REQUIRED_CLAIMS[drainer]!) {
+        expect(note, `${drainer} must carry ${claim}: "${note}"`).toMatch(claim);
+      }
+    }
+  });
+
+  /**
+   * THE PANE-LESS RECIPIENTS THE INBOX EXPLICITLY SUPPORTS (roborev 71170, High).
+   *
+   * `inboxAddressableIds` admits the concierge and Improve Sparkle with no pane open, because their
+   * queues are drained by something that is not a PTY: the concierge drains while assembling its own
+   * turn (it has no `Stop` hook at all), Improve Sparkle on its scheduled headless pass. Reading the
+   * status map alone answers `nothing-observable` for both — which is not a cautious answer, it is a
+   * false one, on every send, contradicting `undeliverableRecipient`'s own text.
+   *
+   * And the damage is in the REMEDY, not the label: the `nothing-observable` prose tells the caller
+   * to open a pane or use a terminal send, and the concierge has neither. That is the `sparkle-8bvh`
+   * shape — a remedy is an instruction the reader will act on, so it must be safe under the very
+   * conditions that produced it — and here it invites a duplicate delivery on a working channel.
+   */
+  it("does NOT report the pane-less concierge / Improve Sparkle inboxes as undrainable", async () => {
+    for (const id of [CONCIERGE_ID, SPARKLE_AGENT_ID]) {
+      invoke.mockResolvedValue(`m-${id}`);
+      const r = await inboxSend(id, "the founder asked for a status line");
+      expect(r.ok, id).toBe(true);
+      if (!r.ok) return;
+      expect(r.data.drainableBy, id).toBe("own-channel");
+      expect(r.data.drainNote, id).toBe(DRAIN_NOTES["own-channel"]);
+      // The note must not send the caller after the two things these ids do not have.
+      expect(r.data.drainNote, id).toMatch(/\bneeds no open pane and no terminal send\b/i);
+    }
+  });
+
+  /**
+   * ...BUT "Improve Sparkle has its own channel" IS CONDITIONAL (roborev 71174, High).
+   *
+   * That channel is the hourly headless pass, and `improvementPass.passHoldReason` holds it at
+   * `consent-off` whenever `sparkleImprovementConsent === "never"` — a persisted user setting. With
+   * consent off and no pane open, NOTHING drains that inbox, and an unconditional `own-channel`
+   * would tell the caller not to escalate in exactly the state where escalating is the only thing
+   * that works. That is the `idle-sweep`-promise defect wearing the other arm's clothes: an
+   * affirmative claim from a predicate blind to one of the real drain path's gates. This gate is
+   * synchronously readable, so it is READ rather than hedged in prose.
+   *
+   * The concierge is the control: it has no such switch, so it must stay `own-channel` in the same
+   * state — otherwise a test that simply refused everything under `never` would also pass.
+   */
+  it("stops calling Improve Sparkle's channel a drain path once its pass is switched off", async () => {
+    useSettingsStore.setState({ sparkleImprovementConsent: "never" } as never);
+
+    invoke.mockResolvedValue("m-sparkle");
+    const sparkle = await inboxSend(SPARKLE_AGENT_ID, "unstick yourself");
+    expect(sparkle.ok).toBe(true);
+    if (!sparkle.ok) return;
+    // No pane either, so the honest answer is the one that sends the caller to escalate.
+    expect(sparkle.data.drainableBy).toBe("nothing-observable");
+
+    // ...and a live pane for that same id, with consent still off, is a real drain path again.
+    markObserved(SPARKLE_AGENT_ID, "idle");
+    invoke.mockResolvedValue("m-sparkle-2");
+    const withPane = await inboxSend(SPARKLE_AGENT_ID, "unstick yourself");
+    expect(withPane.ok).toBe(true);
+    if (!withPane.ok) return;
+    expect(withPane.data.drainableBy).toBe("idle-sweep");
+
+    // THE CONTROL: the concierge has no consent switch and is unaffected.
+    invoke.mockResolvedValue("m-concierge");
+    const concierge = await inboxSend(CONCIERGE_ID, "the founder asked for a status line");
+    expect(concierge.ok).toBe(true);
+    if (!concierge.ok) return;
+    expect(concierge.data.drainableBy).toBe("own-channel");
+  });
+
+  /** And the live receipt carries one of exactly those notes — the check above guards the table, this
+   *  guards that the table is what the caller actually receives. */
+  it("returns a drain note that trips no absence-claim pattern", async () => {
+    markLive("a1");
+    invoke.mockResolvedValue("m1");
+    const r = await inboxSend("a1", "rebase before you verify");
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(absenceClaimIn(r.data.drainNote), r.data.drainNote).toBe(null);
+    expect(Object.values(DRAIN_NOTES)).toContain(r.data.drainNote);
+  });
 });
 
 describe("deliver-or-fail: the recipient directory (C1, bead sparkle-179b2s)", () => {

@@ -133,6 +133,68 @@ export function truncatedControl(evidence: string): ProbeControl {
   return { reachable: true, complete: false, evidence };
 }
 
+/**
+ * The control for a CACHED reading — a snapshot taken at some past moment and being used to answer
+ * a question about NOW.
+ *
+ * ══ THE THIRD WAY A CONTROL FAILS, AND IT LOOKS EXACTLY LIKE SUCCESS ════════════════════════════
+ * {@link unreachableControl} covers "the door was shut" and {@link truncatedControl} covers "the
+ * door was open onto part of the room". This covers the case where the door was wide open, the
+ * whole room was read, and the read happened SO LONG AGO that the room has since been rearranged.
+ * There is no error, no empty array and no truncation flag — the caller holds a complete, correctly
+ * parsed, entirely obsolete answer, and every existing freshness-blind guard reads it as current.
+ *
+ * ══ THE MEASURED INSTANCE (bead `sparkle-rk0k8o`) ═══════════════════════════════════════════════
+ * `services/epicSweepRunner` read the beads snapshot straight off `useBeadsStore` with no freshness
+ * question asked. `beadsStore.refresh` KEEPS the previous snapshot when `bd` fails — it writes
+ * `error[projectId]` and leaves `byProject[projectId]` alone, which is right for a board that must
+ * not blank out mid-poll and catastrophic for a sweep that spends agent slots. With the store
+ * failing to list, the sweep held one frozen snapshot for 2h20m and restarted the same epic FOURTEEN
+ * times at a 601-second cadence, because every label-derived fact it read was absent from that
+ * snapshot: the founder's `no-auto-restart` veto (added mid-run and never seen), the
+ * `sweep-restarted:` budget marker the sweep had itself written fourteen times, and the `stalled`
+ * mark that would have ended the loop. Its own audit note carries the fingerprint — "no child bead
+ * has moved in 16h", then 17h, 18h, 19h on successive ticks, because `now` advanced while
+ * `lastChildProgressAt` could not.
+ *
+ * Absence of evidence rendered as evidence of absence, one more time, from a read that succeeded.
+ *
+ * ══ WHY `complete: false` AND NOT `reachable: false` ════════════════════════════════════════════
+ * Both would refuse, so the distinction is about the SENTENCE a reader gets, which is the half this
+ * module exists to govern. `reachable: false` says the mechanism is broken and sends someone to fix
+ * `bd`; the mechanism may be perfect and simply not have been asked recently. `complete: false` is
+ * the honest shape — the read covered a population (the store as it stood at `readAt`) that is not
+ * the population the claim is about (the store as it stands now), which is the same "scope-limited
+ * read proves presence and never absence" the truncated arm already names.
+ *
+ * `readAt` is `undefined` when nothing has ever been read, and that is `reachable: false`: there is
+ * no stale answer, there is no answer. Callers pass a COMPLETION-independent clock —
+ * `beadsStore.beadsReadStartedAt`, never `beadsPolledAt` — because a read already in flight when a
+ * write landed commits AFTER that write while its contents predate it.
+ */
+export function freshnessControl(
+  readAt: number | undefined | null,
+  now: number,
+  maxAgeMs: number,
+  what: string,
+): ProbeControl {
+  if (readAt === undefined || readAt === null) {
+    return unreachableControl(`${what} has never been read in this window`);
+  }
+  const ageMs = now - readAt;
+  if (ageMs > maxAgeMs) {
+    return truncatedControl(
+      `${what} was last read ${Math.round(ageMs / 1000)}s ago, past the ${Math.round(
+        maxAgeMs / 1000,
+      )}s freshness bound — it describes an earlier state, so an empty result cannot settle a ` +
+        `question about the current one`,
+    );
+  }
+  return provenControl(`${what} was read ${Math.round(ageMs / 1000)}s ago, inside the ${Math.round(
+    maxAgeMs / 1000,
+  )}s freshness bound`);
+}
+
 // ── The absence-claim lexicon ─────────────────────────────────────────────────────────────────────
 
 /**

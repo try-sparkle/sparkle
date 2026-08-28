@@ -177,8 +177,16 @@ describe("COVERAGE GUARD — every TypeScript corpus instance is claimed by a li
   // case id, which is what stops a case from being dropped by deleting its assertions.
   const tsCases = CORPUS.instances.cases.filter((c) => c.lang === "ts");
 
-  it("has at least the two TypeScript instances the bead names", () => {
-    expect(tsCases.map((c) => c.id).sort()).toEqual(["epic-sweeper-no-change", "resume-ticker-no-progress"]);
+  it("has at least the TypeScript instances the beads name", () => {
+    // Grows as instances are measured. `sparkle-rk0k8o` added the last two: one watcher judging a
+    // FROZEN board and one asking a lease store a question only the roster can answer — the same
+    // family as the first two, found again in two more places.
+    expect(tsCases.map((c) => c.id).sort()).toEqual([
+      "babysit-lease-blind-to-roster",
+      "epic-sweep-frozen-snapshot",
+      "epic-sweeper-no-change",
+      "resume-ticker-no-progress",
+    ]);
   });
 
   for (const c of tsCases) {

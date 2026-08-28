@@ -56,6 +56,8 @@ import {
   type Bead,
 } from "./beads";
 import { EPIC_STALL_MS } from "../engine/epicContinuation";
+import { EPIC_BEADS_FRESHNESS_MS } from "./epicSweepRunner";
+import { useBeadsStore, __setBeadsReadStartedAtForTest } from "../stores/beadsStore";
 import { MountRefusedError } from "./sendToBuild";
 import type { AgentTab } from "../types";
 
@@ -99,6 +101,21 @@ function scenario(over: {
    *  subject explicitly. A case about the ON path must pass `true`; do not read the default as
    *  production. */
   restartEnabled?: boolean;
+  /**
+   * When this project's beads were last READ. Defaults to `now`, i.e. a CURRENT reading.
+   *
+   * Every case in this file states its beads directly, which IS the observation — so the default
+   * has to be "fresh", or the freshness gate would answer `beads-unknown` for the whole suite and
+   * no other rule could be tested at all. The cases that are ABOUT the gate pass a stale value.
+   *
+   * The PRODUCTION defaults (`beadsStore.beadsReadStartedAt` and the real `refresh`) are NOT
+   * reachable through this helper — it always injects `beadsFor`, which is what makes an injected
+   * board its own observation. They are covered by the "against the real beads store" describe at
+   * the bottom of this file, which injects no board seam at all. An earlier version of this comment
+   * claimed a case here did it; none did, and review caught the claim before the gap.
+   */
+  beadsReadAt?: number | undefined;
+  refreshBeads?: (projectId: string, projectPath: string) => Promise<void>;
 } = {}) {
   const beads = over.beads ?? [
     bead({ id: "e1", title: "Ship the thing", type: "epic" }),
@@ -140,6 +157,11 @@ function scenario(over: {
       beadsFor: () => beads,
       aliveFor: over.alive ?? (() => false),
       restartEnabled: over.restartEnabled ?? false,
+      // Only when the case is ABOUT the freshness gate. Left alone otherwise, so the ordinary case
+      // exercises the runner's real "an injected board IS the observation" default rather than a
+      // value this fixture supplied.
+      ...("beadsReadAt" in over ? { beadsReadAt: () => over.beadsReadAt } : {}),
+      ...(over.refreshBeads ? { refreshBeads: over.refreshBeads } : {}),
       restart,
       mark,
       setLabel,
@@ -1604,5 +1626,296 @@ describe("the mount", () => {
     expect(isEpicSweepRunnerRunning()).toBe(false);
     stopEpicSweepRunner(); // idempotent
     expect(isEpicSweepRunnerRunning()).toBe(false);
+  });
+});
+
+// ── THE FROZEN BOARD (bead `sparkle-rk0k8o`, corpus `epic-sweep-frozen-snapshot`) ───────────────
+//
+// PRODUCTION, EXACTLY. The sweep restarted ONE epic FOURTEEN times at a 601-second cadence over
+// 2h20m, wiping its agent's session context every ten minutes while its own notice promised it
+// would stop. `beadsStore.refresh` KEEPS the previous snapshot when `bd` fails — it writes only
+// `error[projectId]` — and its poller is reference-counted on VIEWERS, while this sweep exists to
+// run on projects nobody is viewing. So the board it judged was frozen, and every brake on this
+// module is a LABEL: the founder's veto, the `sweep-restarted:` budget marker, the `stalled` mark.
+//
+// The cases below are driven through the REAL `sweepEpics`, and every assertion is on the SIDE
+// EFFECT — did a restart dispatch — because the decision alone was never the thing that hurt.
+describe("sweepEpics on a board it cannot prove is current", () => {
+  /** The store and the SNAPSHOT disagree, which is the whole production shape: the veto is in `bd`
+   *  and the sweep is reading bytes written before it landed. `refreshBeads` is what closes that
+   *  gap, so a test can make it succeed or fail and watch the outcome change. */
+  const frozen = (opts: { readAt?: number; refreshRestoresLabels?: boolean } = {}) => {
+    const snapshot: Bead[] = [
+      bead({ id: "e1", title: "Ship the thing", type: "epic", labels: [PROMOTED_LABEL] }),
+      bead({ id: "e1.1", parent: "e1", updatedAt: iso(STALE) }),
+    ];
+    let readAt = opts.readAt ?? NOW - 2 * 60 * 60 * 1000 - 20 * 60 * 1000; // 2h20m, as measured
+    const restart = vi.fn(async (_p: string, _e: string) => ({
+      agentId: "new-agent",
+      verdict: "restarted" as const,
+    }));
+    const setLabel = vi.fn(
+      async (_path: string, action: "add" | "remove", id: string, label: string) => {
+        const b = snapshot.find((x) => x.id === id);
+        if (!b) return;
+        b.labels =
+          action === "add" ? [...b.labels.filter((l) => l !== label), label] : b.labels.filter((l) => l !== label);
+      },
+    );
+    const refreshBeads = vi.fn(async () => {
+      if (!opts.refreshRestoresLabels) return; // the store is unreadable; the snapshot stays frozen
+      // A SUCCESSFUL refresh: the clock advances AND the veto the founder wrote appears, which is
+      // the pair of facts a real `bd list` delivers together.
+      readAt = NOW;
+      const e = snapshot.find((x) => x.id === "e1");
+      if (e && !e.labels.includes(NO_AUTO_RESTART_LABEL)) e.labels = [...e.labels, NO_AUTO_RESTART_LABEL];
+    });
+    const run = (now = NOW) =>
+      sweepEpics({
+        now,
+        ownsProject: () => true,
+        projects: [{ id: "p1", rootPath: "/proj", agents: [] }],
+        beadsFor: () => snapshot,
+        beadsReadAt: () => readAt,
+        refreshBeads,
+        aliveFor: () => false,
+        restartEnabled: true,
+        restart,
+        mark: vi.fn(async () => {}),
+        setLabel,
+        notify: vi.fn(() => true),
+      });
+    return { run, restart, setLabel, refreshBeads, snapshot };
+  };
+
+  it("RESTARTS NOTHING when the board is 2h20m old and the store will not answer", async () => {
+    const s = frozen();
+    const out = await s.run();
+
+    expect(out.find((x) => x.epicId === "e1")?.reason).toBe("beads-unknown");
+    // THE SIDE EFFECT. This is the assertion that would have caught the fourteen restarts.
+    expect(s.restart).not.toHaveBeenCalled();
+  });
+
+  it("STILL restarts nothing on the tenth consecutive tick — the loop cannot start at all", async () => {
+    // The measured failure was not one bad restart, it was a bare 601-second cadence that never
+    // terminated because nothing it wrote could ever be read back. Ten ticks, zero restarts.
+    const s = frozen();
+    for (let i = 0; i < 10; i++) await s.run(NOW + i * 600_000);
+    expect(s.restart).not.toHaveBeenCalled();
+    // And it wrote NO marker either — a stamp against an unproven board is the same mistake, and it
+    // is what left fourteen `sweep-restarted:` labels on one bead.
+    const stamps = s.snapshot
+      .find((b) => b.id === "e1")
+      ?.labels.filter((l) => l.startsWith(SWEEP_RESTART_PREFIX));
+    expect(stamps).toEqual([]);
+  });
+
+  it("ASKS for a fresh board before judging one — and honours the veto it then finds", async () => {
+    // The fix is not merely "refuse when stale": a sweep that only refused would go permanently
+    // silent on every unwatched project, which is the population it exists for. It refreshes FIRST.
+    // Here the refresh succeeds and brings back the `no-auto-restart` label the founder actually
+    // wrote — so the sweep sees the veto for the first time and stands down.
+    const s = frozen({ refreshRestoresLabels: true });
+    const out = await s.run();
+
+    expect(s.refreshBeads).toHaveBeenCalledTimes(1);
+    expect(out.find((x) => x.epicId === "e1")?.reason).toBe("opted-out");
+    expect(s.restart).not.toHaveBeenCalled();
+  });
+
+  it("PAIRED — a current board with NO veto still restarts, so the gate is not a mute button", async () => {
+    // Without this the three assertions above are satisfied by a sweep that does nothing ever,
+    // which would re-open the founder's original complaint instead of closing this one.
+    const s = frozen({ readAt: NOW });
+    const out = await s.run();
+
+    expect(out.find((x) => x.epicId === "e1")?.action).toBe("restart");
+    expect(out.find((x) => x.epicId === "e1")?.performed).toBe("restarted");
+    expect(s.restart).toHaveBeenCalledTimes(1);
+  });
+
+  // ── THE SELF-HEAL, WITH THE PRECONDITION IT ACTUALLY NEEDS ────────────────────────────────────
+  // The first version of this case asserted `setLabel` was never called against `frozen()`, whose
+  // epic already carries PROMOTED_LABEL and whose project has no agents — so BOTH halves of
+  // `!isPromotedToBuild(epic) && boundAgentsFor(...).length > 0` were false regardless of
+  // freshness, the branch was dead on the fresh board too, and deleting the guard left it green.
+  // Review caught it. These seed the shape the heal genuinely requires.
+  const healable = (readAt: number) => {
+    const snapshot: Bead[] = [
+      // NO promoted label — the heal exists to put it back when the handoff-time stamp was lost.
+      bead({ id: "e1", title: "Ship the thing", type: "epic", labels: [] }),
+      bead({ id: "e1.1", parent: "e1", updatedAt: iso(STALE) }),
+    ];
+    const setLabel = vi.fn(async (_p: string, action: "add" | "remove", id: string, label: string) => {
+      const b = snapshot.find((x) => x.id === id);
+      if (!b) return;
+      b.labels =
+        action === "add" ? [...b.labels.filter((l) => l !== label), label] : b.labels.filter((l) => l !== label);
+    });
+    const run = () =>
+      sweepEpics({
+        now: NOW,
+        ownsProject: () => true,
+        // A BOUND BUILD AGENT is the other half of the precondition: it is the proof the epic was
+        // handed over, which is what makes a missing marker a lost write rather than a fact.
+        projects: [
+          { id: "p1", rootPath: "/proj", agents: [buildAgent({ id: "a1", epicId: "e1", createdAt: STALE - 60_000 })] },
+        ],
+        beadsFor: () => snapshot,
+        beadsReadAt: () => readAt,
+        refreshBeads: vi.fn(async () => {}),
+        // The bound agent must read as DEAD, or the epic skips `orchestrator-alive` before any of
+        // this matters — the heal would still run, but the case would prove less than it claims.
+        aliveFor: () => false,
+        restartEnabled: true,
+        restart: vi.fn(async () => ({ agentId: "new-agent", verdict: "restarted" as const })),
+        mark: vi.fn(async () => {}),
+        setLabel,
+        notify: vi.fn(() => true),
+      });
+    return { run, setLabel, snapshot };
+  };
+
+  it("does not heal the promoted marker off a board it declined to trust", async () => {
+    // The self-heal is a WRITE justified by a label read. This module does not get to trust the
+    // board for its own bookkeeping and distrust it for the founder's veto — and on a wedged store
+    // it would spend a bd call per epic per tick against the very store that is failing to answer.
+    const s = healable(NOW - 2 * 60 * 60 * 1000 - 20 * 60 * 1000);
+    await s.run();
+    expect(s.setLabel).not.toHaveBeenCalledWith("/proj", "add", "e1", PROMOTED_LABEL);
+    expect(s.snapshot.find((b) => b.id === "e1")?.labels).toEqual([]);
+  });
+
+  it("PAIRED — the SAME fixture on a current board DOES heal it", async () => {
+    // Without this the assertion above passes against a heal that never fires for any reason, which
+    // is precisely the hole review found in the first version of this pair.
+    const s = healable(NOW);
+    await s.run();
+    expect(s.setLabel).toHaveBeenCalledWith("/proj", "add", "e1", PROMOTED_LABEL);
+    expect(s.snapshot.find((b) => b.id === "e1")?.labels).toContain(PROMOTED_LABEL);
+  });
+});
+
+// ── THE PRODUCTION DEFAULTS, EXECUTED BY SOMETHING ────────────────────────────────────────────
+// Every other case in this file injects `beadsFor`, which is what makes an injected board its own
+// observation — so the REAL `beadsStore.beadsReadStartedAt` and the REAL `refresh` were reached by
+// nothing. Review caught a docstring claiming otherwise. This is the case that makes it true: no
+// board seam injected at all, the store seeded directly, so the production clock decides.
+describe("sweepEpics against the real beads store — the un-injected seam", () => {
+  it("refuses on a store whose last read is older than the freshness bound", async () => {
+    useBeadsStore.setState({
+      byProject: {
+        p1: {
+          beads: [
+            bead({ id: "e1", title: "Ship the thing", type: "epic", labels: [PROMOTED_LABEL] }),
+            bead({ id: "e1.1", parent: "e1", updatedAt: iso(STALE) }),
+          ],
+          board: { backlog: [], inProgress: [], blocked: [], done: [], delivered: [], archived: [] },
+          loadedAt: NOW,
+        },
+      },
+    } as never);
+    __setBeadsReadStartedAtForTest("p1", NOW - EPIC_BEADS_FRESHNESS_MS - 60_000);
+    const restart = vi.fn(async () => ({ agentId: "new-agent", verdict: "restarted" as const }));
+
+    const out = await sweepEpics({
+      now: NOW,
+      ownsProject: () => true,
+      projects: [{ id: "p1", rootPath: "/proj", agents: [] }],
+      // `beadsFor`, `beadsReadAt` and `refreshBeads` are ALL omitted on purpose — that is the point
+      // of this case. `refreshBeads` therefore calls the real store `refresh`, which no-ops here
+      // because beads are disabled in the test environment, leaving the clock where we set it.
+      aliveFor: () => false,
+      restartEnabled: true,
+      restart,
+      mark: vi.fn(async () => {}),
+      setLabel: vi.fn(async () => {}),
+      notify: vi.fn(() => true),
+    });
+
+    expect(out.find((x) => x.epicId === "e1")?.reason).toBe("beads-unknown");
+    expect(restart).not.toHaveBeenCalled();
+  });
+
+  it("PAIRED — the same store read a moment ago is acted on", async () => {
+    __setBeadsReadStartedAtForTest("p1", NOW - 1_000);
+    const restart = vi.fn(async () => ({ agentId: "new-agent", verdict: "restarted" as const }));
+
+    const out = await sweepEpics({
+      now: NOW,
+      ownsProject: () => true,
+      projects: [{ id: "p1", rootPath: "/proj", agents: [] }],
+      aliveFor: () => false,
+      restartEnabled: true,
+      restart,
+      mark: vi.fn(async () => {}),
+      setLabel: vi.fn(async () => {}),
+      notify: vi.fn(() => true),
+    });
+
+    expect(out.find((x) => x.epicId === "e1")?.action).toBe("restart");
+    expect(restart).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ── FRESHNESS IS MEASURED WHEN THE READING IS READ, NOT WHEN THE TICK STARTED ──────────────────
+//
+// `now` is captured once at the top of the sweep, which is right for every DECISION (two epics in
+// one tick must judge the same stall line) and WRONG for freshness. The gap between them is an
+// unbounded chain of awaits — one `bd list --all` per project (~45s cold), plus every earlier
+// project's restarts, label writes and audit retries. Measured against `now`, `ageMs` systematically
+// UNDERSTATES the board's age for the Nth project, so a sweep six minutes into its tick would judge
+// an eight-minute-old board as inside the two-minute bound and act on it. That is the exact failure
+// the gate exists to prevent, reintroduced for every project after the first — and worst for the
+// projects most likely to be unviewed and therefore stale.
+describe("sweepEpics measures board age against a LIVE clock", () => {
+  const run = (clock: () => number) => {
+    const beads: Bead[] = [
+      bead({ id: "e1", title: "Ship the thing", type: "epic", labels: [PROMOTED_LABEL] }),
+      bead({ id: "e1.1", parent: "e1", updatedAt: iso(STALE) }),
+    ];
+    const restart = vi.fn(async () => ({ agentId: "new-agent", verdict: "restarted" as const }));
+    return {
+      restart,
+      out: sweepEpics({
+        now: NOW,
+        clock,
+        ownsProject: () => true,
+        projects: [{ id: "p1", rootPath: "/proj", agents: [] }],
+        beadsFor: () => beads,
+        // Read ONE MINUTE before the tick began — comfortably inside the two-minute bound as `now`
+        // would measure it.
+        beadsReadAt: () => NOW - 60_000,
+        refreshBeads: async () => {},
+        aliveFor: () => false,
+        restartEnabled: true,
+        restart,
+        mark: vi.fn(async () => {}),
+        setLabel: vi.fn(async () => {}),
+        notify: vi.fn(() => true),
+      }),
+    };
+  };
+
+  it("REFUSES when the tick has been running long enough to age the board out", async () => {
+    // Ten minutes of awaits since `now` was captured. The board was read a minute before the tick
+    // started, so it is ELEVEN minutes old at the moment it is being judged — outside the bound.
+    // Measured against `now` it would read as one minute old and be acted on.
+    const s = run(() => NOW + 10 * 60_000);
+    const out = await s.out;
+
+    expect(out.find((x) => x.epicId === "e1")?.reason).toBe("beads-unknown");
+    expect(s.restart).not.toHaveBeenCalled();
+  });
+
+  it("PAIRED — the same board on a tick that has barely started is acted on", async () => {
+    // Same `beadsReadAt`, same `now`; only the elapsed time differs. So this pins the CLOCK, not
+    // the bound: nothing else about the two cases is different.
+    const s = run(() => NOW + 1_000);
+    const out = await s.out;
+
+    expect(out.find((x) => x.epicId === "e1")?.action).toBe("restart");
+    expect(s.restart).toHaveBeenCalledTimes(1);
   });
 });

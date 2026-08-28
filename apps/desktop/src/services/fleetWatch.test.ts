@@ -29,6 +29,8 @@ import {
   isFleetWatchRunning,
   latestFleetTick,
   onFleetTick,
+  observedDrainer,
+  observedDrainerFor,
   pollFleetOnce,
   startFleetWatch,
   stopFleetWatch,
@@ -200,6 +202,90 @@ afterEach(() => {
 // ─────────────────────────────────────────────────────────────────────────────────────────────
 // The deliverability gate
 // ─────────────────────────────────────────────────────────────────────────────────────────────
+
+describe("observedDrainer — what will ever hand a queued message over (bead sparkle-rk0k8o)", () => {
+  /*
+   * `inbox_send` writes a line and wakes nothing. Exactly two paths drain that queue, and the send
+   * receipt now names which one applies so the caller is not left waiting on a queue nobody will
+   * touch. This is the SAME observation `decideIdleDelivery` gates on, deliberately — a second copy
+   * of the liveness rule is how a receipt comes to promise a drain the sweep then refuses.
+   */
+
+  it("maps a missing status entry to nothing-observable — the refusal the sweep makes", () => {
+    // `observedStatusRefusal(undefined)` is `no-live-pty`, i.e. this window sees no mounted pane, so
+    // neither drain path can run. Pinned against the real decision below, not just asserted here.
+    expect(observedDrainer(undefined)).toBe("nothing-observable");
+    expect(
+      decideIdleDelivery({
+        facts: facts("a1"),
+        verdict: verdict("a1"),
+        observedStatus: undefined,
+        nowMs: NOW,
+      }),
+    ).toEqual({ deliver: false, reason: "no-live-pty" });
+  });
+
+  it("maps the resting bands to the idle sweep and everything else to the turn boundary", () => {
+    // Resting: the agent has emitted its last `Stop`, so the hook can never reach it and the 30s
+    // sweep is the only thing that will.
+    for (const st of ["idle", "unmerged", "blocked"] as AgentTabStatus[]) {
+      expect(observedDrainer(st), st).toBe("idle-sweep");
+    }
+    // Not resting: mid-turn or at a live prompt. The sweep refuses (correctly — a queued FYI written
+    // into a live prompt would be read as the answer), but the agent WILL reach another boundary and
+    // its own hook drains the queue there.
+    for (const st of ["working", "waiting", "approval", "new"] as AgentTabStatus[]) {
+      expect(observedDrainer(st), st).toBe("turn-boundary");
+    }
+  });
+
+  /**
+   * WHAT THIS PREDICATE DOES NOT COVER — pinned so nobody reads `idle-sweep` as a promise
+   * (roborev 71170, High).
+   *
+   * `observedDrainer` answers the STATUS axis and only that axis. `decideIdleDelivery` has four more
+   * gates, and TWO of them run BEFORE it ever consults the status: a missing worktree and an
+   * `unobserved` verdict. Both read the fleet digest, which the synchronous send receipt does not
+   * have. So a live resting pane whose worktree is gone reads `idle-sweep` here while the sweep
+   * refuses it on every tick — which is why the note attached to `idle-sweep` names the sweep as the
+   * PATH and says its other gates still apply, instead of promising the hand-over.
+   *
+   * These assertions are the honest form of that gap: they pin the divergence rather than pretending
+   * it is absent, so anyone who later widens the note to a promise has to delete a test that says
+   * exactly why it is not one.
+   */
+  it("answers the STATUS axis only — the sweep's worktree and verdict gates are outside it", () => {
+    // A resting pane says `idle-sweep` here...
+    expect(observedDrainer("idle")).toBe("idle-sweep");
+
+    // ...while the real decision refuses it on a gate evaluated BEFORE the status is read.
+    expect(
+      decideIdleDelivery({
+        facts: facts("a1", { worktreeExists: false }),
+        verdict: verdict("a1"),
+        observedStatus: "idle",
+        nowMs: NOW,
+      }),
+    ).toEqual({ deliver: false, reason: "no-worktree" });
+
+    expect(
+      decideIdleDelivery({
+        facts: facts("a1"),
+        verdict: verdict("a1", "unobserved"),
+        observedStatus: "idle",
+        nowMs: NOW,
+      }),
+    ).toEqual({ deliver: false, reason: "unobserved" });
+  });
+
+  it("reads this window's live status map, so the receipt and the sweep cannot disagree", () => {
+    useRuntimeStore.setState({ status: {} } as never);
+    expect(observedDrainerFor("ghost")).toBe("nothing-observable");
+    useRuntimeStore.setState({ status: { ghost: "idle" } } as never);
+    expect(observedDrainerFor("ghost")).toBe("idle-sweep");
+    useRuntimeStore.setState({ status: {} } as never);
+  });
+});
 
 describe("decideIdleDelivery", () => {
   // `observedStatus: "idle"` is part of the BASELINE, not an extra: a live status entry is the only
