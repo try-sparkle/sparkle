@@ -355,7 +355,14 @@ export function LogoWaveform({ pttHeld = false }: LogoWaveformProps = {}) {
     // pauseReason term — its only pause path is `status === "listening" ? intent : "paused"` — so on
     // raw `status` it painted a green "Microphone: actively listening" above a caption reading
     // "Listening paused", in the NON-terminal case, which is the common one (roborev 57117).
-    status: capturing ? status : "idle",
+    // …and demoted again on a standing NOTICE, for the same reason and by the same one-way rule
+    // (roborev 71078). A delivery drop deliberately does not write `status` — that is a routing
+    // input (roborev 71065) — so `indicatorState`, whose only health term is
+    // `status === "listening" ? intent : "paused"`, would otherwise paint the green
+    // "Microphone: actively listening" glyph directly above the error block this same component
+    // renders at :593, while every recognised word is being discarded. That contradiction is the
+    // exact lie this file's header (roborev 55289/57117) exists to delete.
+    status: capturing && errorNotice === null ? status : "idle",
     phase,
     modelProgress,
     focusOwner,

@@ -29,6 +29,7 @@ import {
   SPEAK_CAPTION_HEADLINE,
 } from "../voice/dictationCopy";
 import { C } from "../theme/colors";
+import { deliveryErrorFor } from "../voice/deliveryWatchdog";
 import { VOICE_STATUS_LINE_MIN_HEIGHT } from "./VoiceStatusLine";
 
 // THE push-to-talk status line — ONE line since sparkle-bbfsx, where it used to be a grey headline
@@ -556,6 +557,31 @@ describe("LogoWaveform — the mic indicator is a read-out of the send tray", ()
     expect(ring().getAttribute("aria-label")).toBe("Microphone: actively listening");
     // The old action labels must not survive anywhere on this surface.
     expect(screen.queryByRole("button", { name: /microphone|listening|Activate Sparkle voice/i })).toBeNull();
+  });
+
+  // ── THE RING MUST NOT CLAIM LIVE ROUTING OVER A DELIVERY NOTICE (roborev 71078 / 71168) ───────
+  // Every other error case in this file sets `status: "error"` alongside `error`, so every one of
+  // them would still pass with the `&& errorNotice === null` term at LogoWaveform:358 deleted —
+  // the `sparkle-50m03` shape, where the CHANGE is covered and the SITE is not. A delivery drop is
+  // the one fault that deliberately leaves `status` on "listening", because `status` is a routing
+  // input (roborev 71065). This is that shape, and it is the founder's exact scenario: recognised
+  // words being discarded while the ring paints the green live-mic glyph directly above the error
+  // block this same component renders.
+  it("does not paint a live mic over a delivery notice, whose status stays listening", () => {
+    useUiStore.setState({ conciergeSendMode: "speak" });
+    useDictationStore.setState({
+      enabled: true,
+      status: "listening",
+      phase: "active",
+      error: deliveryErrorFor("no-target"),
+    });
+    render(<LogoWaveform />);
+
+    expect(ring().getAttribute("aria-label")).not.toBe("Microphone: actively listening");
+    expect(ring().getAttribute("aria-label")).not.toMatch(/actively listening/i);
+    // …and the notice it is contradicting really is on screen, so this cannot pass vacuously by
+    // the surface having rendered nothing at all.
+    expect(document.body.textContent).toMatch(/nowhere to put the text/i);
   });
 
   it("nothing else on this surface toggles the mic either — the strip and caption are read-outs", () => {

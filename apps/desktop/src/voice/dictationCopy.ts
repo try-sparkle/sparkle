@@ -22,6 +22,11 @@
 import { ALLOW_VIRTUAL_LABEL, INPUT_PICKER_LOCATION } from "../services/audioInputs";
 import { TALK_KEY_GLYPH } from "./sendMode";
 import type { PauseReason } from "./dictationFocus";
+import {
+  DELIVERY_ERROR_PREFIX,
+  deliveryReasonOf,
+  type DeliveryDropReason,
+} from "./deliveryWatchdog";
 
 // ══ ONE STATUS LINE PER MODE, AND IT IS NOW LIVE (bead sparkle-bbfsx) ═══════════════════════════
 //
@@ -232,6 +237,11 @@ export type VoiceErrorKind =
   | "download"
   | "disk-space"
   | "permission"
+  // The microphone is FINE and the words were heard — they just never reached the box. Its own
+  // bucket because every other kind here says capture failed, and their remedies all point at the
+  // mic, the device or the Privacy pane: all dead ends when the mic is working perfectly and the
+  // delivery leg is what broke. Raised by `voice/deliveryWatchdog`, never by the backend.
+  | "transcript-undelivered"
   | "unknown";
 
 /** The kinds the frame-liveness WATCHDOG emits — the family that its `dictation://audio-recovered`
@@ -265,6 +275,14 @@ export interface VoiceErrorNotice {
 // pinning exact sentences, and anything we don't recognize falls through to `unknown` (which shows
 // the raw string) rather than being forced into a bucket that would misattribute the cause.
 const PATTERNS: [VoiceErrorKind, RegExp][] = [
+  // AHEAD OF EVERY BACKEND PATTERN, and for a reason none of them share: this is the only entry
+  // matching a string SPARKLE ITSELF wrote (`deliveryErrorFor`), not one from ureq/std::io/cpal.
+  // Its shape is therefore ours to guarantee rather than to guess at, so it is anchored (`^`) and
+  // keyed to the exported constant — the one pattern here that cannot drift when the Rust side
+  // rewords. Ordering is belt-and-braces: "voice-delivery:" shares no noun phrase with any bucket
+  // below, so it could sit anywhere; it leads because a first-party sentinel outranking third-party
+  // heuristics is the rule that stays true as those heuristics get looser.
+  ["transcript-undelivered", new RegExp(`^${DELIVERY_ERROR_PREFIX}`)],
   // FIRST — but, unlike the entry below it, NOT because correctness depends on winning the race.
   //
   // The backend sentence this matches is LEXICALLY DISJOINT from the stale-grant one: it does not
@@ -535,6 +553,52 @@ export function voiceErrorNotice(raw: string | null | undefined): VoiceErrorNoti
         headline: "Sparkle can't use the microphone.",
         detail: "Allow it in System Settings → Privacy & Security → Microphone, then turn the mic back on.",
       };
+    // ── THE MIC WORKED AND THE WORDS STILL DID NOT ARRIVE ──────────────────────────────────────
+    // The one family here that must NOT reach for a microphone remedy. Every sibling above ends by
+    // sending the user to the mic, the device list or the Privacy pane; on this path the mic is
+    // provably healthy — the level meter is moving, and on three of the four reasons the words were
+    // successfully recognised — so each of those remedies is an instruction that changes nothing.
+    //
+    // THE `heldSegments` SPLIT IS LOAD-BEARING, and it is why this is four sentences rather than
+    // one. `onSegment` calls `appendHeldSegment` BEFORE `insert`, deliberately, so a dropped
+    // segment is still on the clipboard hatch — the founder's recovery path. That makes "your words
+    // are safe" TRUE for the three drop reasons and FALSE for `no-transcript`, where nothing was
+    // ever produced to hold. Shipping the reassuring half over `no-transcript` would repeat the
+    // exact defect AGENTS.md records against the `too-slow` banner: promising a user words that
+    // were never recorded.
+    case "transcript-undelivered": {
+      const reason: DeliveryDropReason = deliveryReasonOf(text) ?? "no-transcript";
+      if (reason === "no-transcript")
+        return {
+          kind,
+          headline: "Sparkle is hearing you, but no words are coming back.",
+          detail:
+            "Transcription isn't responding, so nothing you say is being written down. The mic is still on and will keep trying — speak again in a moment to see if it has recovered.",
+        };
+      if (reason === "mic-paused")
+        return {
+          kind,
+          headline: "Sparkle heard you, but the mic is paused.",
+          detail: `Those words weren't sent anywhere. Hold ${TALK_KEY_GLYPH} while you speak, or switch the mic to always-on, and say it again.`,
+        };
+      if (reason === "not-routable")
+        return {
+          kind,
+          headline: "Sparkle heard you, but this window wasn't ready for the text.",
+          detail:
+            "Those words weren't sent anywhere, because the cursor wasn't somewhere they could go. Click into the message box, then say it again.",
+        };
+      // The ONE reason that may promise the words survived, and only because the code path proves
+      // it: `no-target` is raised inside `insert()`, which `onSegment` reaches only AFTER calling
+      // `appendHeldSegment`. The other two return before that line ever runs — an earlier draft
+      // claimed "kept" on all three and was wrong twice (roborev 71065).
+      return {
+        kind,
+        headline: "Sparkle heard you, but had nowhere to put the text.",
+        detail:
+          "Your words were recognised and kept, but no message box was open to receive them. Open or click into a message box, then say it again.",
+      };
+    }
     default:
       return {
         kind: "unknown",

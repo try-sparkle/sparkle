@@ -18,6 +18,7 @@ import { selectedProjectName } from "./services/creditProject";
 import { classifyVoiceError, isWatchdogFault } from "./voice/dictationCopy";
 import { peekHoldOriginAge, takeHoldOriginAge } from "./voice/holdOrigin";
 import { shouldPreconnectCloud } from "./voice/cloudPreconnect";
+import { DELIVERY_DEADLINE_MS, shouldReportNoTranscript } from "./voice/deliveryWatchdog";
 import { useUiStore } from "./stores/uiStore";
 import { copyToClipboard } from "./clipboard";
 import type { Phase } from "./voice/dictationPhase";
@@ -252,6 +253,43 @@ export async function createDictationController(
   // `true` once this window has torn its relay down and is waiting to resume on refocus. Guards resume
   // so it only fires after a real teardown (never spuriously re-opens an already-running stream).
   let streamTornDown = false;
+
+  // ── "I AM HEARING YOU" WITH NOTHING TO SHOW FOR IT ──────────────────────────────────────────
+  // The backend watchdog stops asking questions the moment voiced frames arrive
+  // (`watchdog.rs`: `AudioHealth::Live => FaultAction::Idle`), so a transcription leg that is
+  // simply DEAD — relay unreachable and the on-device engine producing nothing — renders as a
+  // healthy live meter forever. This is the only thing in the app that notices.
+  //
+  // Armed by the VAD, never by arming the mic: see the header in `voice/deliveryWatchdog`.
+  let noTranscriptTimer: ReturnType<typeof setTimeout> | null = null;
+  const clearNoTranscriptWatch = () => {
+    if (noTranscriptTimer === null) return;
+    clearTimeout(noTranscriptTimer);
+    noTranscriptTimer = null;
+  };
+  const armNoTranscriptWatch = () => {
+    // Already counting for this episode — a second `speaking` edge must not restart the clock, or
+    // a user speaking in bursts resets the deadline forever and it never fires.
+    if (noTranscriptTimer !== null) return;
+    // `committedSeq` counts segments the BACKEND produced. Comparing it across the deadline asks
+    // exactly the right question — "did the transcription leg emit anything at all while the user
+    // was audibly talking" — and is unaffected by whether a later gate then dropped the words,
+    // which is the separate defect the drop reasons report.
+    const seqAtSpeech = useDictationStore.getState().committedSeq;
+    noTranscriptTimer = setTimeout(() => {
+      noTranscriptTimer = null;
+      const s = useDictationStore.getState();
+      const fire = shouldReportNoTranscript({
+        msSinceFirstSpeech: DELIVERY_DEADLINE_MS,
+        delivered: s.committedSeq !== seqAtSpeech,
+        // The UI is claiming to hear the user exactly when it is enabled and "listening" — which is
+        // what `micIsHearing` paints for BOTH activeListening and passiveWaiting. Anything else
+        // (error already up, idle, off) is not a claim this would be contradicting.
+        hearing: s.enabled && s.status === "listening" && isCapturable(),
+      });
+      if (fire) s.noteDeliveryDrop("no-transcript");
+    }, DELIVERY_DEADLINE_MS);
+  };
 
   // Close THIS window's relay when it stops being the focused dictation target. Only the OWNER (its own
   // phase is ACTIVE) has a billable stream to close; a passive/background window is a no-op. Phase is
@@ -536,7 +574,13 @@ export async function createDictationController(
       });
       return true;
     }
-    if (!isRoutable()) return false;
+    // A committed segment with nowhere to route: the window is unfocused, or the caret is somewhere
+    // that refuses dictated text. Recognised words, discarded — so it is reported, for the same
+    // reason as the phase gate above.
+    if (!isRoutable()) {
+      useDictationStore.getState().noteDeliveryDrop("not-routable");
+      return false;
+    }
     // Capture started — clear any lingering model-download progress.
     useDictationStore.getState().setModelProgress(null);
     // A committed (final) segment supersedes the live preview — clear it so the interim text
@@ -801,6 +845,9 @@ export async function createDictationController(
       // `isCapturable`: speech routed into a TERMINAL is still being consumed by this window, and a
       // flat meter over a live capture is the same half-state in the other direction.
       if (!isCapturable()) return;
+      // The user is audibly talking. From here, "and still nothing has come back" is a statement
+      // about the pipeline rather than about them — start the only clock allowed to say so.
+      if (e.payload) armNoTranscriptWatch();
       setSpeaking(e.payload);
     }),
 
@@ -1152,6 +1199,9 @@ export async function createDictationController(
     // The park timer outlives nothing: a controller torn down mid-wait would otherwise fire against
     // a store the next controller owns, parking a relay it never opened.
     clearIdlePark();
+    // Same reasoning as the park timer above: a deadline that outlives its controller would accuse
+    // a store the NEXT controller owns of losing words this one was waiting on.
+    clearNoTranscriptWatch();
     // safeUnlisten (not a bare `u()`): a window-close during teardown can tear down Tauri's
     // listeners map first, and a raw unlisten then throws the benign "handlerId" race. Routing
     // each call through it also means a throw can't abort the loop and leak the remaining
@@ -1408,9 +1458,18 @@ export function useAmbientVoice(): void {
     const store = useDictationStore.getState();
     // The mic is armed but not routing — Push to talk between holds. The words are not addressed to
     // anything, so they are dropped rather than inserted somewhere the user is not looking.
-    if (store.phase !== "active") return ctx.terminal ? null : undefined;
+    //
+    // DROPPING IS STILL RIGHT; DROPPING IN SILENCE WAS NOT. `micIsHearing()` answers TRUE for
+    // `passiveWaiting`, so the ring tells the user it is hearing them in exactly this state — the
+    // discard is invisible and the indicator contradicts it. Say so instead (sparkle-klkcwu).
+    // THE EMPTY GUARD MOVED ABOVE THE PHASE GATE (roborev 71065). Reporting first meant a blank or
+    // noise-only segment raised a user-facing notice about words that did not exist.
     const text = seg.trim();
     if (!text) return ctx.terminal ? null : undefined;
+    if (store.phase !== "active") {
+      store.noteDeliveryDrop("mic-paused");
+      return ctx.terminal ? null : undefined;
+    }
     // RECORD IT BEFORE ROUTING IT ANYWHERE. The clipboard copy is the founder's recovery hatch for
     // the holds that deliver nothing, so it must not depend on the delivery succeeding — capturing
     // after `insert()` would lose exactly the cases it exists for. It also spans BOTH destinations

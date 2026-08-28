@@ -3,6 +3,7 @@ import { persist, createJSONStorage } from "zustand/middleware";
 import { log } from "../logger";
 import type { Phase } from "../voice/dictationPhase";
 import type { FocusOwner } from "../voice/dictationFocus";
+import { deliveryErrorFor, deliveryReasonOf, type DeliveryDropReason } from "../voice/deliveryWatchdog";
 
 /** localStorage key for the persisted slice (only `enabled`). Exported so the cross-window
  *  sync service can rehydrate on the browser `storage` event. */
@@ -235,6 +236,12 @@ interface DictationState {
    *  null only returns to "idle" if we were in the "error" state — an active
    *  "listening" session is left untouched. */
   setError: (e: string | null) => void;
+  /** Report that recognised speech did NOT reach a destination, naming which gate refused it.
+   *  Surfaces through the ordinary voice-error path (see `voice/deliveryWatchdog`). */
+  noteDeliveryDrop: (reason: DeliveryDropReason) => void;
+  /** Report that a segment DID land. Retracts a standing delivery notice and puts the mic back in
+   *  "listening" — the pipeline has just proven itself, so the notice has stopped being true. */
+  noteDelivered: () => void;
   /** Record (or clear) the dead-mic fault — see {@link deadMicSilent}. */
   setDeadMicSilent: (v: boolean) => void;
   setModelProgress: (p: ModelProgress | null) => void;
@@ -309,6 +316,34 @@ export const useDictationStore = create<DictationState>()(
           error,
           status: error ? "error" : s.status === "error" ? "idle" : s.status,
         })),
+      // ── THESE WRITE `error` AND DELIBERATELY NEVER WRITE `status` (roborev 71065) ────────────
+      // `status` is NOT presentation — it is a ROUTING INPUT. `terminalRoutingArmed()` goes false
+      // on `status === "error"`, which makes `isTerminalRoutable()` false, which makes
+      // `focusPauseReason()` answer "terminal", which makes `isRoutable()` false. An earlier draft
+      // set both, and the result was a notice that could never be retracted: once it was up,
+      // delivery was structurally impossible, so `noteDelivered` could never run and terminal
+      // dictation stayed dead for the session. `maybeResumeOwnedStream` refuses on the same term,
+      // so the relay never reopened either.
+      //
+      // Writing `error` alone is sufficient AND safe: the mic surfaces derive `hasError` from
+      // `voiceErrorNotice(error) !== null`, never from `status` (see `useVoicePlaceholder` and
+      // `useMicIsHearing`), so the notice paints while every routing gate keeps working. That is
+      // also exactly the founder's "show the error, keep listening, keep retrying".
+      //
+      // RE-REPORTING THE SAME REASON IS A NO-OP, which is the rate limit. The on-device engine
+      // keeps emitting committed segments in ordinary passive push-to-talk, so reporting per
+      // segment would raise a notice on every ambient phrase — the flapping
+      // `OPEN_REFUSALS_BEFORE_WARNING` was deliberately left alone to avoid.
+      noteDeliveryDrop: (reason) => {
+        if (deliveryReasonOf(get().error) === reason) return;
+        log.info("dictation", `delivery drop: ${reason}`);
+        set({ error: deliveryErrorFor(reason) });
+      },
+      // Retracts ONLY our own notice. A dead-mic or permission error is about a different fault
+      // that a delivered segment does not disprove, so it is left standing — and since we never
+      // wrote `status`, there is nothing to restore.
+      noteDelivered: () =>
+        set((s) => (deliveryReasonOf(s.error) === null ? s : { error: null })),
       setDeadMicSilent: (deadMicSilent) => set({ deadMicSilent }),
       setModelProgress: (modelProgress) => set({ modelProgress }),
 
@@ -354,9 +389,22 @@ export const useDictationStore = create<DictationState>()(
       setFocusOwner: (focusOwner) => set((s) => (s.focusOwner === focusOwner ? s : { focusOwner })),
       setWindowFocused: (windowFocused) =>
         set((s) => (s.windowFocused === windowFocused ? s : { windowFocused })),
+      // THE SILENT DROP THIS `else` EXISTS TO END (bead sparkle-klkcwu). This was
+      // `if (fn) fn(text)` with nothing on the other side, so a committed segment arriving while no
+      // composer held the app-wide target vanished with no log, no event and no pixel. Measured on
+      // the founder's machine: twelve recognised segments discarded here over three and a half
+      // minutes while the level meter kept moving and the ring kept reading "actively listening".
+      //
+      // The words are NOT lost at this point — `onSegment` calls `appendHeldSegment` first — so the
+      // honest report is "we heard you and had nowhere to put it", which is what the notice says.
       insert: (text) => {
         const fn = get().insertTarget;
-        if (fn) fn(text);
+        if (!fn) {
+          get().noteDeliveryDrop("no-target");
+          return;
+        }
+        fn(text);
+        get().noteDelivered();
       },
     }),
     {

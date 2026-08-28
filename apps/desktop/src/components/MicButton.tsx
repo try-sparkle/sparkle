@@ -7,6 +7,7 @@ import { useAuthStore } from "../stores/authStore";
 import { hasAiCredits } from "../services/aiGate";
 import type { Me } from "../services/entitlement";
 import type { Phase } from "../voice/dictationPhase";
+import { voiceErrorNotice } from "../voice/dictationCopy";
 import { RADIUS } from "../theme/scale";
 
 /** Should an attempt to ARM the mic be refused because the user is out of credits? Voice spends
@@ -93,7 +94,10 @@ export type MicVariant = "open" | "slash" | "pause" | "loading";
 /** Reads the dictation store and exposes the mic's current state plus the tri-state click cycle.
  *  Both mics call this, so the click actions and semantics are guaranteed the same. */
 export function useMicToggle(): {
+  /** Drives the CLICK CYCLE and the labels. Never demoted by a notice — see the split below. */
   state: MicState;
+  /** Drives only what is PAINTED. Equals `state` except while a notice stands. */
+  glyphState: MicState;
   onClick: () => void;
   ariaLabel: string;
   title: string;
@@ -107,8 +111,33 @@ export function useMicToggle(): {
   const showOutOfCreditsNotice = useDictationStore((s) => s.showOutOfCreditsNotice);
   const clearOutOfCreditsNotice = useDictationStore((s) => s.clearOutOfCreditsNotice);
 
+  const error = useDictationStore((s) => s.error);
+
   // Single source of truth (deriveMicState) so this control and every other mic surface agree.
+  //
+  // ── TWO STATES, AND THE SPLIT IS THE WHOLE POINT (roborev 71168) ────────────────────────────
+  // `state` drives the CLICK CYCLE and the labels; `glyphState` drives only what is PAINTED. They
+  // differ solely while a notice stands.
+  //
+  // An earlier draft demoted the single shared value, which silently rewrote what the control DOES:
+  // `onClick` sends "active" to `setPhase("passive")` and everything else to `setEnabled(false)`, so
+  // over a genuinely live mic (`enabled`, `listening`, `active` — exactly the `no-target` and
+  // `no-transcript` shapes) the button read "Turn off" and a click DISARMED capture instead of
+  // pausing it. Re-arming is not free: it goes back through `shouldBlockMicArm` and restarts the
+  // capture path. `deriveMicState`'s own docblock predicted this in as many words — an error term
+  // "would also change what a click does in that state" — which is why the demotion belongs here
+  // rather than inside it.
   const state: MicState = deriveMicState(enabled, status, phase, modelProgress);
+
+  // DEMOTED ON A STANDING NOTICE, the same one-way rule LogoWaveform applies for `capturing`
+  // (roborev 71078/57117): a notice may dim the glyph, never brighten it. `deriveMicState` has no
+  // error term by design — every OTHER fault demotes through `status === "error"` — but a delivery
+  // drop deliberately never writes `status`, because that is a routing input (roborev 71065). So
+  // without this the glyph stays GREEN while every recognised word is discarded.
+  const glyphState: MicState =
+    voiceErrorNotice(error) === null
+      ? state
+      : deriveMicState(enabled, "idle", phase, modelProgress);
 
   const onClick = () => {
     if (state === "off") {
@@ -156,7 +185,7 @@ export function useMicToggle(): {
       ? "Setting up voice…"
       : "Turn off";
 
-  return { state, onClick, ariaLabel, title };
+  return { state, glyphState, onClick, ariaLabel, title };
 }
 
 /** The hover-pill's model: the user's chosen INTENT plus the three direct "jump straight to this
@@ -506,7 +535,7 @@ export function ComposerMic({
    *  global dictation slot. See the claim comments in Composer / Concierge ComposeBox. */
   onArm,
 }: { onArm?: () => void } = {}) {
-  const { state, onClick, ariaLabel, title } = useMicToggle();
+  const { state, glyphState, onClick, ariaLabel, title } = useMicToggle();
   const [hover, setHover] = useState(false);
   // Hovering the mic reveals the three-option pill (see MicMenu). The pill opens UP because the
   // composer sits at the window bottom — there's room above (the message list), none below.
@@ -516,7 +545,8 @@ export function ComposerMic({
   // re-enabled from the always-present top ring, whose pill also offers "listening".
   if (state === "off") return null;
 
-  const { color, variant } = micVisual(state, hover);
+  // PAINT reads `glyphState`; the click and labels above keep the undemoted `state` (roborev 71168).
+  const { color, variant } = micVisual(glyphState, hover);
   return (
     <span
       {...menu.hoverProps}

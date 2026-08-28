@@ -10,6 +10,8 @@ import { ComposerMic, MicMenu, useMicToggle } from "./MicButton";
 import { useDictationStore } from "../stores/dictationStore";
 import { useAuthStore } from "../stores/authStore";
 import type { Me } from "../services/entitlement";
+import { deliveryErrorFor } from "../voice/deliveryWatchdog";
+import { C } from "../theme/colors";
 
 const meWith = (balanceCents: number): Me => ({
   clerkUserId: "u1",
@@ -21,7 +23,9 @@ const meWith = (balanceCents: number): Me => ({
 beforeEach(() => {
   // modelProgress must be reset too: it now drives the "preparing" state, so a case that leaves a
   // download in flight would otherwise bleed that state into the next test.
-  useDictationStore.setState({ enabled: true, status: "idle", phase: "passive", modelProgress: null });
+  // `error` resets here for the same reason `modelProgress` does: the delivery-notice rows below
+  // set it, and a leaked notice would demote the glyph in every later case (roborev 71218).
+  useDictationStore.setState({ enabled: true, status: "idle", phase: "passive", modelProgress: null, error: null });
 });
 afterEach(() => cleanup());
 
@@ -42,6 +46,54 @@ describe("ComposerMic — visibility", () => {
     useDictationStore.setState({ enabled: true, status: "listening", phase: "active" });
     render(<ComposerMic />);
     expect(screen.getByRole("button", { name: "Pause listening" })).toBeTruthy();
+  });
+});
+
+// ── THE PAINT SITE ITSELF, NOT THE HOOK THAT FEEDS IT (roborev 71218) ─────────────────────────
+// `useMicToggle` returns an undemoted `state` (click cycle + labels) and a notice-demoted
+// `glyphState` (paint). The hook half is asserted in useDictation.delivery.test.tsx; this is the
+// CONSUMPTION half — that `ComposerMic` actually paints from `glyphState`. Reverting
+// `micVisual(glyphState, hover)` to `micVisual(state, hover)` restores the green live-mic glyph in
+// the composer while every recognised word is being discarded, and without this row the entire
+// suite stays green — the `sparkle-50m03` shape, twice over in this branch.
+//
+// A delivery drop is the ONLY fault class that leaves `status` on "listening" (status is a routing
+// input — roborev 71065), which is why no pre-existing ComposerMic test reaches this shape: they
+// all leave `error` null.
+describe("ComposerMic — a delivery notice dims the glyph without changing the control", () => {
+  const notice = {
+    enabled: true,
+    status: "listening" as const,
+    phase: "active" as const,
+    modelProgress: null,
+    error: deliveryErrorFor("no-target"),
+  };
+
+  it("does not paint the green live-mic glyph while words are being discarded", () => {
+    useDictationStore.setState(notice);
+    render(<ComposerMic />);
+    const button = screen.getByRole("button", { name: "Pause listening" });
+
+    // `micVisual("active", false)` is `{ color: C.successInk, variant: "open" }` — the live mic.
+    // Compared through the browser's own normalisation, since React writes the raw token.
+    const probe = document.createElement("span");
+    probe.style.color = C.successInk;
+    expect(button.style.color).not.toBe(probe.style.color);
+  });
+
+  // The other half of the split, in the same shape: the notice may dim the glyph and must NOT
+  // touch what a click does. Demoting the shared value made this button read "Turn off" and
+  // disarm capture instead of pausing it.
+  it("still offers Pause, and a click pauses rather than disarms", () => {
+    useDictationStore.setState(notice);
+    render(<ComposerMic />);
+    const button = screen.getByRole("button", { name: "Pause listening" });
+    expect(button.getAttribute("title")).toBe("Pause");
+
+    fireEvent.click(button);
+
+    expect(useDictationStore.getState().phase).toBe("passive");
+    expect(useDictationStore.getState().enabled).toBe(true);
   });
 });
 
