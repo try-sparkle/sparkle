@@ -19,7 +19,6 @@ import {
   improveLastConciergeNotifyFingerprint,
   sweepImproveNudge,
   armImproveResumeKick,
-  improveResumeKickArmed,
   type ImproveNudgeDeps,
   type ImproveNudgeInput,
   type NextReadyBead,
@@ -978,15 +977,24 @@ describe("sweepImproveNudge — the one-shot resume kick (auto-start on app rest
     expect(out.sent).toBe(false);
     expect(out.detail).toBe("no-ready-backlog");
     expect(sent).toHaveLength(0);
+    // …AND THE KICK SURVIVES IT. This is the assertion the whole feature turns on, and it is the one
+    // that separates "spent on the look" from "spent on the action": the backlog feed is started
+    // asynchronously at the same mount, so the earliest real tick genuinely reads a readable agent and
+    // an empty backlog. If the kick were spent above, the fleet would sit out the full grace — exactly
+    // the ten-minute idle this PR exists to remove. Asserted as a SEND on the next tick, where the
+    // baseline grace is still in force (same fingerprint, 60s later), so only a surviving kick can
+    // deliver it.
+    const { deps: d2, sent: s2 } = makeDeps({ now: t0 + 60_000 }); // backlog has arrived
+    const out2 = await sweepImproveNudge(d2);
+    expect(out2.sent).toBe(true);
+    expect(s2).toHaveLength(1);
   });
 
-  it("is ONE-SHOT: the first readable sweep CONSUMES the kick, and a follow-up tick does not double-fire", async () => {
+  it("is ONE-SHOT: the first DELIVERED nudge spends the kick, and a follow-up tick does not double-fire", async () => {
     armImproveResumeKick();
-    expect(improveResumeKickArmed()).toBe(true);
-    // First readable sweep fires AND consumes the kick — direct proof it is spent.
+    // First eligible sweep fires AND spends the kick — the follow-up's refusal below is the proof.
     const first = makeDeps({ now: t0 });
     await sweepImproveNudge(first.deps);
-    expect(improveResumeKickArmed()).toBe(false);
     expect(first.sent).toHaveLength(1);
     // A follow-up sweep within the same interval is back under the ordinary baseline grace (the kick is
     // spent), NOT re-firing — steady-state is governed by the normal grace/cadence once the kick is gone.
@@ -1005,8 +1013,8 @@ describe("sweepImproveNudge — the one-shot resume kick (auto-start on app rest
     expect(out.sent).toBe(false);
     expect(out.detail).toBe("not-idle");
     expect(sent).toHaveLength(0);
-    // Kick survives the blind sweep, so it still fires on the next readable tick.
-    expect(improveResumeKickArmed()).toBe(true);
+    // Kick survives the blind sweep, so it still fires on the next readable tick — the SEND is the
+    // proof it survived, not a flag read.
     const { deps: d2, sent: s2 } = makeDeps({ now: t0 + 60_000 }); // readable pane now
     await sweepImproveNudge(d2);
     expect(s2).toHaveLength(1);

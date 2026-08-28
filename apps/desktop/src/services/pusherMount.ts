@@ -594,12 +594,15 @@ export function startPusher(): () => void {
   // ARM THE ONE-SHOT RESUME KICK for this window (bead sparkle-n2feho.1, cause 4). `startPusher` runs
   // once per window mount, which is exactly the app-restart / session-resume moment the founder means
   // by "after restarting the app, the fleet does NOT automatically start draining." Arming here makes
-  // the first pusher sweep skip the baseline idle-grace and immediately emit the pull (`named-pull`) /
-  // spawn (`respin`) action when the improve agent is idle with ready P0/P1 backlog — instead of
-  // resting through a full `ADVANCE_IDLE_MS` interval. It lifts ONLY that grace; every other nudge
-  // guard (armed / owner / consent / not-idle / no-ready-backlog / rate-limit) still applies, so an
-  // un-armed feature, a non-owning window, or an empty backlog produces no action. Consumed by the
-  // first readable sweep, so it never changes steady-state behaviour.
+  // the first ELIGIBLE pusher sweep skip the baseline idle-grace and immediately emit the pull
+  // (`named-pull`) / spawn (`respin`) action when the improve agent is idle with ready P0/P1 backlog —
+  // instead of resting through a full `ADVANCE_IDLE_MS` interval. It lifts ONLY that grace; every other
+  // nudge guard (armed / owner / consent / not-idle / no-ready-backlog / rate-limit) still applies, so
+  // an un-armed feature, a non-owning window, or an empty backlog produces no action. Spent on the
+  // first CONFIRMED DELIVERY — not on the first look — because the backlog feed started just below is
+  // asynchronous (`ensureSparkleRepo` may clone, then a first `bd` snapshot) while the pane is readable
+  // almost at once, so the earliest ticks of exactly this cold start see a readable agent and an empty
+  // backlog. Once spent it never changes steady-state behaviour.
   armImproveResumeKick();
 
   const stopRunner = startPusherRunner(buildPusherDeps(), MIN_TICK_MS);

@@ -354,18 +354,19 @@ export interface ImproveNudgeInput {
    */
   advancedRecently: boolean;
   /**
-   * THE ONE-SHOT RESUME KICK (bead sparkle-n2feho.1, cause 4). `true` for the first readable sweep
-   * after a window mounts / the app restarts (armed by `armImproveResumeKick`, consumed by the sweep).
+   * THE ONE-SHOT RESUME KICK (bead sparkle-n2feho.1, cause 4). `true` on every sweep after a window
+   * mounts / the app restarts until the kick is SPENT ON A CONFIRMED DELIVERY (armed by
+   * `armImproveResumeKick`, consumed by `sweepImproveNudge`).
    * It lifts EXACTLY ONE suppression — the baseline `advancedRecently` GRACE — so a resume that finds
-   * the agent idle-with-ready-work pulls/spawns on the FIRST tick instead of sitting through a full
-   * `ADVANCE_IDLE_MS` idle interval before the watcher is even allowed to speak. That grace is stamped
-   * on the first readable fingerprint of a fresh window and exists to protect an agent we have OBSERVED
-   * working; a window that has just resumed has observed nothing, so on resume the grace is exactly the
-   * mechanism that makes the fleet "sit there idle after a restart" (the founder's complaint). It lifts
-   * ONLY the grace: every other guard (armed / owner / consent / not-idle / no-ready-backlog /
-   * rate-limit) still refuses, so a resume can never nudge a working agent (not-idle wins) nor
-   * manufacture a spurious action when there is no ready work (no-ready-backlog wins). `false` on every
-   * later sweep, so the normal grace/cadence governs steady-state — this only ever fires once.
+   * the agent idle-with-ready-work pulls/spawns on the FIRST eligible tick instead of sitting through a
+   * full `ADVANCE_IDLE_MS` idle interval before the watcher is even allowed to speak. That grace is
+   * stamped on the first readable fingerprint of a fresh window and exists to protect an agent we have
+   * OBSERVED working; a window that has just resumed has observed nothing, so on resume the grace is
+   * exactly the mechanism that makes the fleet "sit there idle after a restart" (the founder's
+   * complaint). It lifts ONLY the grace: every other guard (armed / owner / consent / not-idle /
+   * no-ready-backlog / rate-limit) still refuses, so a resume can never nudge a working agent (not-idle
+   * wins) nor manufacture a spurious action when there is no ready work (no-ready-backlog wins).
+   * `false` once spent, so the normal grace/cadence governs steady-state — this only ever fires once.
    */
   justResumed: boolean;
   /** How many open, unblocked improvement beads are ready (the board's `backlog` column). */
@@ -623,13 +624,19 @@ let lastConciergeNotifiedAt: number | null = null;
 let lastConciergeNotifyFingerprint: string | null = null;
 /**
  * THE ONE-SHOT RESUME KICK, window-local and NOT persisted (bead sparkle-n2feho.1, cause 4). Armed by
- * `armImproveResumeKick` when this window mounts / the app restarts, and consumed by the FIRST sweep
- * that gets a readable look at the improve agent. While armed it makes `sweepImproveNudge` pass
- * `justResumed: true` into the decision, which lifts the baseline-grace `advanced-recently` suppression
- * for that one sweep — so a resume that finds the agent idle-with-ready-work pulls/spawns on the first
- * tick instead of after a full `ADVANCE_IDLE_MS` grace. Defaults FALSE (an un-armed window behaves
- * exactly as before), and a blind sweep — no readable fingerprint — does NOT consume it (fail-closed:
- * the kick is spent only on a real look, never on a sweep that saw nothing).
+ * `armImproveResumeKick` when this window mounts / the app restarts, and SPENT ON THE FIRST CONFIRMED
+ * DELIVERY. While armed it makes `sweepImproveNudge` pass `justResumed: true` into the decision, which
+ * lifts the baseline-grace `advanced-recently` suppression — so a resume that finds the agent
+ * idle-with-ready-work pulls/spawns on the first eligible tick instead of after a full
+ * `ADVANCE_IDLE_MS` grace. Defaults FALSE (an un-armed window behaves exactly as before).
+ *
+ * SPENT ON THE ACTION, NOT ON THE LOOK, and that is the load-bearing half. The backlog this kick needs
+ * is fed asynchronously from the SAME mount (`ensureSparkleRepo` may `git clone`, then a first `bd`
+ * snapshot), while the pane fingerprint is readable almost immediately — so on the cold start this
+ * feature exists to fix, the earliest ticks routinely see a READABLE agent and an EMPTY backlog.
+ * Spending the kick there would burn it on a sweep that could not act and hand the fleet back the very
+ * grace this exists to skip. It therefore survives any number of refusing ticks — "this window has not
+ * yet self-fed" — which is also why it needs no separate blind-sweep case.
  */
 let resumeKickArmed = false;
 
@@ -642,18 +649,14 @@ export function improveConsecutiveIdleNudges(): number {
  * ARM THE ONE-SHOT RESUME KICK (bead sparkle-n2feho.1, cause 4). The wiring (`startPusher`) calls this
  * exactly once when a window mounts / the app restarts, to declare "this window has just resumed and
  * has not yet taken a real look at the improve agent." It lifts ONLY the baseline-grace suppression on
- * the first readable sweep, so a resumed fleet that finds a ready P0/P1 backlog begins draining on the
- * first pusher tick rather than sitting idle for a full idle interval — the founder's exact complaint
- * that "after restarting the app, the fleet does NOT automatically start draining." Idempotent: calling
- * it again while already armed is a no-op, and every non-grace guard still governs the resulting sweep.
+ * every sweep until it is spent, so a resumed fleet that finds a ready P0/P1 backlog begins draining on
+ * the first eligible pusher tick rather than sitting idle for a full idle interval — the founder's exact
+ * complaint that "after restarting the app, the fleet does NOT automatically start draining."
+ * Idempotent: calling it again while already armed is a no-op, and every non-grace guard still governs
+ * the resulting sweep.
  */
 export function armImproveResumeKick(): void {
   resumeKickArmed = true;
-}
-
-/** Test/introspection seam: is the one-shot resume kick still armed (not yet consumed by a sweep)? */
-export function improveResumeKickArmed(): boolean {
-  return resumeKickArmed;
 }
 
 /** Test/introspection seam: when did the concierge last get a pipeline-health notify, and about what. */
@@ -724,16 +727,13 @@ export async function sweepImproveNudge(deps: ImproveNudgeDeps): Promise<Improve
     // The advance clock is folded EVERY sweep, before the decision and regardless of every other
     // gate, so a window that is not the owner (or is disarmed) still tracks advance and does not
     // manufacture a false "idle for ages" the moment it becomes eligible.
-    const fingerprint = deps.advanceFingerprint();
-    const advancedRecently = advancedWithin(fingerprint, now, ADVANCE_IDLE_MS);
-    // THE ONE-SHOT RESUME KICK (bead sparkle-n2feho.1, cause 4). Read the armed flag BEFORE consuming
-    // it, then hand it to the decision as `justResumed`. Consume it the moment we get a READABLE look at
-    // the agent (a non-null fingerprint) — a blind sweep (fingerprint null, the pane not yet reporting)
-    // is not a real look, so the kick stays armed for the next tick rather than being spent on nothing.
-    // After it is consumed the normal baseline grace and 10-minute cadence govern steady-state, so the
+    const advancedRecently = advancedWithin(deps.advanceFingerprint(), now, ADVANCE_IDLE_MS);
+    // THE ONE-SHOT RESUME KICK (bead sparkle-n2feho.1, cause 4). Hand the armed flag to the decision as
+    // `justResumed`; it is SPENT BELOW, on a confirmed delivery, never here on a mere look — see the
+    // `resumeKickArmed` declaration for why the cold-start backlog race makes that the load-bearing
+    // half. Once spent, the normal baseline grace and 10-minute cadence govern steady-state, so the
     // kick fires at most once per window: it only ever SKIPS the first-interval grace on resume.
     const justResumed = resumeKickArmed;
-    if (resumeKickArmed && fingerprint !== null) resumeKickArmed = false;
     // A real advance ENDS the streak: the agent worked, so the next nudge (if any) starts soft again.
     // Done every sweep, before the decision, so an advance resets escalation even on a tick that then
     // refuses to nudge for some other reason.
@@ -796,6 +796,11 @@ export async function sweepImproveNudge(deps: ImproveNudgeDeps): Promise<Improve
     if (delivered) {
       lastNudgedAt = now;
       consecutiveIdleNudges += 1;
+      // THE RESUME KICK IS SPENT HERE AND ONLY HERE — one delivered action per window mount. Beside
+      // `lastNudgedAt` on purpose: both follow this function's stated "spend the budget against a
+      // CONFIRMED delivery" discipline, so a send the transport could not confirm leaves the kick armed
+      // and the next tick retries instead of falling back under the grace.
+      resumeKickArmed = false;
       // A confirmed concierge-notify records WHICH red finding the concierge now knows about, so the
       // same still-open set is not re-surfaced until `CONCIERGE_NOTIFY_CADENCE_MS` has passed while a
       // brand-new red finding fires on its next eligible tick.
