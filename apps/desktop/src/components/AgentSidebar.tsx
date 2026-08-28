@@ -166,6 +166,7 @@ import { humanBlockIn, isHumanBlockedIn } from "../services/humanBlockFor";
 import { useNudgeFlagSnapshot } from "../useNudgeFlags";
 import { useFinishedHeads } from "../hooks/useFinishedHeads";
 import { useOverlaidStatus } from "../hooks/useOverlaidStatus";
+import { useResurrectableDeadStore } from "../stores/resurrectableDeadStore";
 import {
   stallInputsFor,
 } from "./rowAttention";
@@ -376,6 +377,13 @@ export function AgentSidebar({
   // stop that; one derivation can. Nothing about this file's behaviour changes: same functions, same
   // order, same inputs.
   const { status, calmStatus, graceTick } = useOverlaidStatus(project?.agents ?? NO_AGENTS);
+  // THE DURABLE DEAD-SESSION ANCHOR for the rollup memo below (roborev 70464, bead sparkle-nu7gd9).
+  // That memo shares `rollupViewFor` with `useEpicHealthOf` and `composeRollup`, which now de-red
+  // against the durable `revival_due` list through `deathCauseForAgent`. That list arrives on the 15s
+  // resurrection sweep with NO status write behind it, so — exactly like `graceTick` and `nudgeFlags`
+  // one signal over — without this subscription the Build column's band and head disc would hold their
+  // red through the very fleet-wide wave this fix targets while `status` above has already gone amber.
+  const durableDead = useResurrectableDeadStore((s) => s.causes);
   // Advance each agent's alert-episode record on every change to the overlaid (pre-dismissal) status
   // — the input the "Dismiss Alert" feature reads. Runs AFTER the worker-attention overlays so a
   // worker's bubbled red counts as the orchestrator's episode too: a dismissed orchestrator re-alerts
@@ -2653,8 +2661,10 @@ export function AgentSidebar({
     // and a flagged agent's other deps are static, so without it this memo could never learn that
     // the agent said a person was blocking it (roborev 65408). The eslint-disable below means
     // nothing will flag a missing dep here for you — it has to be kept by hand.
+    // `durableDead` is a third such anchor: the durable dead-session list `rollupViewFor` de-reds
+    // against arrives on the 15s sweep with no status write behind it (roborev 70464).
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [project?.agents, liveStatus, openAgentIds, lastObserved, branchStatus, workflowStage, graceTick, isFinishedOf, nudgeFlags],
+    [project?.agents, liveStatus, openAgentIds, lastObserved, branchStatus, workflowStage, graceTick, isFinishedOf, nudgeFlags, durableDead],
   );
   const rowBandOf = useCallback((id: string) => bandOfRollup(rollupOf(id)), [rollupOf]);
 

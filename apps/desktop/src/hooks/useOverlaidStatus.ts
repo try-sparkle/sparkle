@@ -30,6 +30,7 @@ import { withLandedRedVeto } from "../engine/landedRedVeto";
 import { withBackgroundTaskGreen } from "../engine/workerRollup";
 import { hasLiveBackgroundTasksForAgent } from "../services/backgroundTaskRegistry";
 import { deathCauseForAgent } from "../services/deadSessionRegistry";
+import { useResurrectableDeadStore } from "../stores/resurrectableDeadStore";
 import type { DeathCause } from "../engine/deathTypes";
 import { resolveStage } from "../engine/workflowStage";
 import { useNewAgentCalm, useNewAgentGraceTick } from "./useNewAgentCalm";
@@ -145,6 +146,12 @@ export function useOverlaidStatus(
   const branchStatus = useRuntimeStore((s) => s.branchStatus);
   const workflowStage = useRuntimeStore((s) => s.workflowStage);
   const interactionAt = useInteractionStore((s) => s.lastAt);
+  // THE DURABLE DEAD-SESSION SIGNAL, SUBSCRIBED so step (0b) re-runs when the resurrection sweep
+  // publishes a death this window never observed (bead sparkle-nu7gd9). `deathCauseOf` reads this list
+  // through `deadSessionRegistry.deathCauseForAgent`, but that is a plain function call the memo cannot
+  // see move; the subscription is what turns a durable-ledger update into a render. In the fleet-wide
+  // wave this fix exists for, no other input moves — see `stores/resurrectableDeadStore`'s header.
+  const durableDead = useResurrectableDeadStore((s) => s.causes);
   const openIds = useMemo(() => new Set(openAgentIds), [openAgentIds]);
 
   const observedCorrected = useMemo(
@@ -236,9 +243,11 @@ export function useOverlaidStatus(
   const s0b = useMemo(
     () => withDeadSessionCalm(agents, s0, deathCauseOf),
     // `deadSessionWake` is deliberate — see the note above; it is the only input that changes when
-    // a death is recorded with no store write behind it.
+    // a death is recorded with no store write behind it. `durableDead` is the OTHER such input: a
+    // durable-ledger death that arrives on the 15s sweep with no status write behind it (bead
+    // sparkle-nu7gd9), which `deathCauseOf` reads but the memo cannot otherwise see move.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [agents, s0, deathCauseOf, deadSessionWake],
+    [agents, s0, deathCauseOf, deadSessionWake, durableDead],
   );
 
   // (0b-ii) A ROW WHOSE WORK IS PROVEN LANDED IS FINISHED, NOT BLOCKED.

@@ -33,6 +33,7 @@ import { useFinishedHeads } from "./useFinishedHeads";
 import { useOverlaidStatus } from "./useOverlaidStatus";
 import { useNudgeFlagSnapshot } from "../useNudgeFlags";
 import { useRuntimeStore } from "../stores/runtimeStore";
+import { useResurrectableDeadStore } from "../stores/resurrectableDeadStore";
 import { agentsForEpicSlices } from "../services/epicLadder";
 import { epicHealth, type EpicHealth } from "../engine/epicHealth";
 import { beadHealth } from "../engine/beadHealth";
@@ -71,6 +72,13 @@ function useRollupView(roster: readonly AgentTab[]) {
   // raw `idle` here (verdict `finished`). The two columns then disagreed about the same head in
   // exactly the case the shared verdict was extracted to fix.
   const { calmStatus, graceTick } = useOverlaidStatus(roster);
+  // SUBSCRIBED for the same reason `graceTick` is a reactivity anchor below: `rollupViewFor` applies
+  // `withDeadSessionCalm` internally through `deathCauseForAgent`, which now also reads the durable
+  // `revival_due` list (bead sparkle-nu7gd9). That list arrives on the 15s resurrection sweep with no
+  // status write behind it, so without this subscription the square would hold a red epic whose only
+  // dead worker the app is already restarting — the "epic squares and build dots share one colour
+  // source" case the bead names, on the surface the founder actually reported.
+  const durableDead = useResurrectableDeadStore((s) => s.causes);
   const agentsById = useMemo(() => {
     const index = new Map<string, AgentTab>();
     for (const a of roster) index.set(a.id, a);
@@ -108,9 +116,10 @@ function useRollupView(roster: readonly AgentTab[]) {
     // samples its own clock in step (0), and for a held `errored` or briefless agent NONE of this
     // memo's other deps ever move again: `rt` is shallow-compared, `roster` is stable, and
     // `nudgeFlags` only moves when a flag arrives. Without it the square holds the pre-deadline
-    // reading indefinitely while the build column reddens.
+    // reading indefinitely while the build column reddens. `durableDead` is a second such anchor:
+    // the durable dead-session list `composeRollup` de-reds against arrives with no status write.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [roster, rt, isFinishedOf, nudgeFlags, graceTick]);
+  }, [roster, rt, isFinishedOf, nudgeFlags, graceTick, durableDead]);
 }
 
 /**

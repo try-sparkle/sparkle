@@ -66,6 +66,7 @@ import { notifyConcierge } from "./conciergeNotifier";
 import { mountAgent, type MountResult } from "./agentMount";
 import { ownsProjectInThisWindow, suppressContinuation } from "./goalContinuationRunner";
 import { isTornOut } from "./satelliteWindows";
+import { useResurrectableDeadStore } from "../stores/resurrectableDeadStore";
 
 /** How often the sweep runs. Matches `GOAL_SWEEP_INTERVAL_MS`, and for the same reason: the ENGINE
  *  decides when a rung is due by comparing wall-clock instants, so this only bounds how late a due
@@ -718,6 +719,32 @@ export async function sweepResurrections(
     log.warn("resurrection", "could not read the due list", { error: String(e) });
     return outcomes;
   }
+
+  // ── PUBLISH THE DURABLE DEAD-AND-RESURRECTABLE LIST FOR THE ROW-COLOUR PIPELINE (bead sparkle-
+  // nu7gd9, Defect #1) ─────────────────────────────────────────────────────────────────────────
+  // Every entry in `due` is dead AND resurrectable — `revival::due_at` skips a non-resurrectable
+  // cause — so this IS the set `engine/deadSessionAttention` should render amber rather than red.
+  // Published before any ownership/torn-out/ceiling gate below: those decide who THIS window
+  // RESTARTS, but the colour rule is about what any window PAINTS, and a resurrectable death owned by
+  // another window is still not the founder's to unblock. Wholesale, so a respawned agent that has
+  // left the due list stops rendering amber; a no-op guard keeps an unchanged list from churning the
+  // sidebar every 15s. See `stores/resurrectableDeadStore` for the reactivity argument.
+  //
+  // ── BUT LIVE SESSIONS ARE FILTERED OUT, AND THAT IS LOAD-BEARING (roborev 70465) ──────────────
+  // The due list can name an agent whose PTY is ALREADY LIVE — a stale ledger record, another
+  // window's respawn, a straggler from the dying app — which is the whole reason `liveIds` exists and
+  // is applied at election below (`unelectable`). `withDeadSessionCalm` repaints anything that is not
+  // exactly `working` or `lapsed` to `lapsed`, so publishing a live agent sitting on `waiting` /
+  // `approval` (an on-screen prompt the founder MUST answer) would hide that ask — the exact inverse
+  // of the failure `deadSessionAttention`'s header forbids. The live-session snapshot read on the
+  // line above is the same one election trusts, so filter with it here too.
+  useResurrectableDeadStore
+    .getState()
+    .syncDurable(
+      due
+        .filter((d) => !liveIds.has(d.agentId))
+        .map((d) => ({ agentId: d.agentId, cause: d.cause })),
+    );
 
   // ── THE MOUNT CEILING (bead sparkle-5j6re3), READ ONCE FOR THE WHOLE SWEEP ───────────────────
   // The fleet the per-mount layout cost scales with. Every new `AgentPane` mount forces a
