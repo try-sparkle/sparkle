@@ -301,6 +301,30 @@ describe("borrowInlineStyle", () => {
       expect(el.hasAttribute("style")).toBe(false);
     });
 
+    // ── THE OTHER WAY A PAINT WRITES ──────────────────────────────────────────────────────────
+    // `applyFlash` writes `style.transition = …` and `style.color = …` as CAMELCASE ASSIGNMENTS,
+    // not through `setProperty`. Those have to be recorded too, and recorded under their CSS names
+    // (`backgroundColor` is `background-color`) or the withdrawal asks the CSSOM about a property
+    // that does not exist and leaves the paint standing. RED if the assignment trap stops
+    // recording: the flash's `transition` and fill are still on the node after the restore.
+    it("records a camelCased assignment under its CSS name, not only setProperty", () => {
+      const el = node(THEMED_SHORTHAND);
+
+      const restore = borrowInlineStyle(el, (style) => {
+        style.transition = "background-color 220ms ease-out";
+        style.backgroundColor = FLASH_FILL;
+      });
+      expect(el.style.getPropertyValue("background-color")).toBe(FLASH_FILL_SERIALIZED);
+
+      el.style.setProperty("color", "var(--c-muted)");
+
+      restore();
+
+      expect(el.style.getPropertyValue("transition")).toBe(""); // ours, added — withdrawn
+      expect(el.style.getPropertyValue("background-color")).toBe(""); // ours, added — withdrawn
+      expect(el.style.getPropertyValue("color")).toBe("var(--c-muted)"); // theirs — kept
+    });
+
     // ── THE CONCRETE ROW, END TO END ───────────────────────────────────────────────────────────
     // `EpicRow` renders `background`, `border-left` and `color` off one `selected` flag, and the
     // reveal flash borrows the row while it is selected. Click a sibling inside the 1.2s window and
@@ -331,6 +355,368 @@ describe("borrowInlineStyle", () => {
       expect(el.style.cssText).not.toContain("var(--c-epic-card-fill)");
       expect(el.style.cssText).not.toContain("var(--c-teal-ink)");
       expect(el.style.cssText).not.toContain("var(--c-cream)");
+    });
+
+    // ── A REMOVAL IS A WRITE, AND A DIFF CANNOT SEE ONE ───────────────────────────────────────
+    // A property the paint REMOVED is simply absent from the painted declaration, so a withdrawal
+    // that recovers "what was mine" by walking that declaration can never find it — it is the one
+    // write that leaves no trace to enumerate. Recording the NAMES as they are written finds it
+    // like any other. RED against the enumerate-the-declaration implementation: `opacity` comes
+    // back as `""`.
+    it("puts back a property the paint REMOVED, which no diff of the declaration can see", () => {
+      const el = node(`${THEMED_SHORTHAND}; opacity: 0.5`);
+
+      const restore = borrowInlineStyle(el, (style) => {
+        style.removeProperty("opacity");
+        style.setProperty("background", FLASH_FILL);
+      });
+
+      // Somebody else writes an unrelated property — the interference path, where the withdrawal
+      // is per-property and the wholesale re-declaration is off the table.
+      el.style.setProperty("color", "var(--c-muted)");
+
+      restore();
+
+      expect(el.style.getPropertyValue("opacity")).toBe("0.5"); // ours, removed — and put back
+      expect(el.style.getPropertyValue("background")).toBe("var(--c-epic-card-fill)"); // ours
+      expect(el.style.getPropertyValue("color")).toBe("var(--c-muted)"); // theirs — kept
+    });
+
+    // The `!important` an authored declaration can carry has to survive the round trip too: a
+    // withdrawal that re-declares the value without its priority silently downgrades it, and the
+    // node then loses to a stylesheet rule it used to beat.
+    it("withdraws to the authored value WITH its priority, not just its text", () => {
+      const el = node("background: var(--c-epic-card-fill) !important");
+
+      const restore = borrowInlineStyle(el, (style) => {
+        style.setProperty("background", FLASH_FILL);
+        style.setProperty("opacity", "0.4");
+      });
+
+      el.style.setProperty("color", "var(--c-muted)");
+
+      restore();
+
+      expect(el.style.getPropertyValue("background")).toBe("var(--c-epic-card-fill)");
+      expect(el.style.getPropertyPriority("background")).toBe("important");
+    });
+  });
+
+  // ══ THE HALF jsdom CANNOT EXPRESS, MODELLED EXPLICITLY ═══════════════════════════════════════
+  // Everything above runs against jsdom's CSSOM, which keeps an unparsed `var()` shorthand verbatim
+  // under the SHORTHAND name — so `style.item(0)` reads `"background"` there. Real engines do the
+  // opposite, and it is the difference that makes or breaks the withdrawal: a shorthand carrying a
+  // `var()` gives each of its LONGHANDS a pending-substitution value, the declaration enumerates
+  // those longhands, and reading one back serializes as `""` (measured in WebKit and Chromium —
+  // `EpicsColumn.revealFlash.test.tsx` carries the transcript).
+  //
+  // So the engine behaviour is MODELLED here rather than borrowed from the environment. This is a
+  // model and is labelled as one: it encodes exactly the two facts above for `background` and
+  // refuses anything it has not been taught, so it cannot quietly answer a question it does not
+  // know. What it buys is that the two shapes below — the ones that make the real app wrong and
+  // that no jsdom test can reach — are executable.
+  describe("against a CSSOM that models a real engine's pending-substitution longhands", () => {
+    const BACKGROUND_LONGHANDS = [
+      "background-image",
+      "background-position",
+      "background-size",
+      "background-repeat",
+      "background-attachment",
+      "background-origin",
+      "background-clip",
+      "background-color",
+    ] as const;
+    /** What each of those reads back when `background` was set to a PLAIN value — the shorthand's
+     *  own colour lands on `background-color` and the rest sit at their initial values. */
+    const PLAIN_LONGHAND_VALUES: Record<string, string> = {
+      "background-image": "none",
+      "background-position": "0% 0%",
+      "background-size": "auto",
+      "background-repeat": "repeat",
+      "background-attachment": "scroll",
+      "background-origin": "padding-box",
+      "background-clip": "border-box",
+    };
+
+    /** A declaration with a real engine's shorthand bookkeeping for `background`, and nothing else
+     *  modelled. Longhand ENUMERATION plus EMPTY longhand reads under a `var()` are the whole of
+     *  what it exists to express; every other property behaves like an ordinary longhand. */
+    const isBackgroundLonghand = (name: string): boolean =>
+      BACKGROUND_LONGHANDS.includes(name as (typeof BACKGROUND_LONGHANDS)[number]);
+
+    class EngineDeclaration {
+      private order: string[] = [];
+      private values = new Map<string, { value: string; priority: string }>();
+      /** A longhand written or removed OVER a declared `background` shorthand. `null` is a
+       *  removal — and a removed longhand does NOT fall back to the shorthand's pending value: the
+       *  colour is gone, which is the whole of `sparkle-huw924.15`. */
+      private overrides = new Map<string, { value: string; priority: string } | null>();
+
+      private isPending(): boolean {
+        const bg = this.values.get("background");
+        return bg !== undefined && bg.value.includes("var(");
+      }
+
+      private shadowed(name: string): boolean {
+        return isBackgroundLonghand(name) && this.values.has("background");
+      }
+
+      setProperty(name: string, value: string, priority = ""): void {
+        if (this.shadowed(name)) {
+          this.overrides.set(name, { value, priority });
+          return;
+        }
+        if (name === "background") {
+          // A SHORTHAND WRITE REPLACES STANDING LONGHANDS of its family — the authored
+          // `background-color` a React `style={{ backgroundColor }}` emits is gone the moment the
+          // paint writes `background`, which is what makes its withdrawal destructive.
+          this.overrides.clear();
+          this.order = this.order.filter((n) => !isBackgroundLonghand(n));
+          for (const longhand of BACKGROUND_LONGHANDS) this.values.delete(longhand);
+        }
+        if (!this.values.has(name)) this.order.push(name);
+        this.values.set(name, { value, priority });
+      }
+
+      removeProperty(name: string): string {
+        const previous = this.getPropertyValue(name);
+        if (this.shadowed(name)) {
+          this.overrides.set(name, null);
+          return previous;
+        }
+        if (name === "background") this.overrides.clear();
+        this.values.delete(name);
+        this.order = this.order.filter((n) => n !== name);
+        return previous;
+      }
+
+      getPropertyValue(name: string): string {
+        if (name === "background") {
+          const bg = this.values.get("background");
+          if (bg === undefined) return "";
+          // A RIVAL LONGHAND MAKES THE SHORTHAND UNSERIALIZABLE — measured, and the reason the
+          // original defect could not be seen from the shorthand side once the flash had painted.
+          return this.overrides.size === 0 ? bg.value : "";
+        }
+        const override = this.overrides.get(name);
+        if (override !== undefined) return override === null ? "" : override.value;
+        const own = this.values.get(name);
+        if (own !== undefined) return own.value;
+        if (!isBackgroundLonghand(name)) return "";
+        const bg = this.values.get("background");
+        if (bg === undefined) return "";
+        // THE ONE LINE THE WHOLE MODEL EXISTS FOR: a pending-substitution longhand reads EMPTY.
+        if (this.isPending()) return "";
+        return name === "background-color" ? bg.value : (PLAIN_LONGHAND_VALUES[name] ?? "");
+      }
+
+      getPropertyPriority(name: string): string {
+        const override = this.overrides.get(name);
+        if (override !== undefined && override !== null) return override.priority;
+        return this.values.get(name)?.priority ?? "";
+      }
+
+      /** Longhands, never the shorthand — the enumeration that makes the naive withdrawal wrong.
+       *  A longhand REMOVED over the shorthand drops out of it, exactly as it does in the engine. */
+      private get enumerated(): string[] {
+        return this.order.flatMap((n) =>
+          n === "background"
+            ? BACKGROUND_LONGHANDS.filter((l) => this.overrides.get(l) !== null)
+            : [n],
+        );
+      }
+
+      get length(): number {
+        return this.enumerated.length;
+      }
+
+      item(i: number): string {
+        return this.enumerated[i] ?? "";
+      }
+
+      get cssText(): string {
+        const parts: string[] = [];
+        for (const n of this.order) {
+          if (n === "background" && this.overrides.size > 0) {
+            // Once a rival longhand exists the engine can no longer print the shorthand, so the
+            // family serializes property by property.
+            for (const longhand of BACKGROUND_LONGHANDS) {
+              const value = this.getPropertyValue(longhand);
+              if (value !== "") parts.push(`${longhand}: ${value};`);
+            }
+            continue;
+          }
+          const { value, priority } = this.values.get(n) ?? { value: "", priority: "" };
+          parts.push(`${n}: ${value}${priority === "" ? "" : ` !${priority}`};`);
+        }
+        return parts.join(" ");
+      }
+
+      set cssText(text: string) {
+        this.order = [];
+        this.values = new Map();
+        this.overrides = new Map();
+        for (const part of text.split(";")) {
+          const at = part.indexOf(":");
+          if (at === -1) continue;
+          this.setProperty(part.slice(0, at).trim(), part.slice(at + 1).trim());
+        }
+      }
+    }
+
+    /** The same shape `borrowInlineStyle` uses of a real element, over the modelled declaration. */
+    function engineNode(cssText: string): { el: HTMLElement; style: EngineDeclaration } {
+      const style = new EngineDeclaration();
+      style.cssText = cssText;
+      let hasStyleAttribute = cssText !== "";
+      const el = {
+        style,
+        hasAttribute: (name: string) => name === "style" && hasStyleAttribute,
+        removeAttribute: (name: string) => {
+          if (name === "style") hasStyleAttribute = false;
+        },
+        ownerDocument: { createElement: () => ({ style: new EngineDeclaration() }) },
+      };
+      return { el: el as unknown as HTMLElement, style };
+    }
+
+    // The model itself is asserted before anything is built on it — a double that does not
+    // reproduce the defect would make every test under it vacuous.
+    it("models the engine: a var() shorthand enumerates longhands that read EMPTY", () => {
+      const { style } = engineNode(THEMED_SHORTHAND);
+
+      expect(style.getPropertyValue("background")).toBe("var(--c-epic-card-fill)");
+      expect(style.getPropertyValue("background-color")).toBe("");
+      expect(style.length).toBe(BACKGROUND_LONGHANDS.length);
+      expect(style.item(0)).toBe("background-image");
+    });
+
+    // ── SHAPE 1: var() OVER var() — THE SHIPPED CALLER ────────────────────────────────────────
+    // `EpicRow` is authored `background: var(--c-epic-card-fill)` and the flash paints
+    // `var(--c-epic-pill-fill)`. Both sides are pending-substitution, so a diff of the declaration
+    // sees NOTHING change and has nothing to withdraw — the row keeps the flash fill permanently,
+    // and React never repaints it because its `background` prop never changed.
+    it("withdraws a var() shorthand painted over a var() shorthand", () => {
+      const { el, style } = engineNode(THEMED_SHORTHAND);
+
+      const restore = borrowInlineStyle(el, (s) =>
+        s.setProperty("background", "var(--c-epic-pill-fill)"),
+      );
+      expect(style.getPropertyValue("background")).toBe("var(--c-epic-pill-fill)");
+
+      // Somebody else writes — the interference path, where only the borrow's own writes go back.
+      style.setProperty("color", "var(--c-muted)");
+
+      restore();
+
+      expect(style.getPropertyValue("background")).toBe("var(--c-epic-card-fill)");
+      expect(style.getPropertyValue("color")).toBe("var(--c-muted)");
+    });
+
+    // ── SHAPE 2: A PLAIN VALUE OVER var() — THE GRAY BAR, REBUILT INSIDE ITS OWN FIX ──────────
+    // Here the painted longhands ARE visible to a diff and their authored counterparts read `""`,
+    // so the naive withdrawal REMOVES them and leaves `background` undeclared — which is
+    // `sparkle-huw924.15` exactly: the `<button>` falls back to the UA default, permanently.
+    it("withdraws a plain value painted over a var() shorthand, without destroying it", () => {
+      const { el, style } = engineNode(THEMED_SHORTHAND);
+
+      const restore = borrowInlineStyle(el, (s) => s.setProperty("background", FLASH_FILL));
+      expect(style.getPropertyValue("background-color")).toBe(FLASH_FILL);
+
+      style.setProperty("color", "var(--c-muted)");
+
+      restore();
+
+      expect(style.getPropertyValue("background")).toBe("var(--c-epic-card-fill)");
+      expect(style.cssText).toContain("var(--c-epic-card-fill)");
+    });
+
+    // ── SHAPE 3: A LONGHAND OVER var() — RECORDING THE NAME IS ONLY HALF OF IT ────────────────
+    // Recording fixes WHICH property was the borrower's. It does not fix WHAT to put back: the
+    // withdrawal reads that with `priorStyle.getPropertyValue("background-color")`, which under an
+    // authored `background: var(…)` is `""` — pending substitution, from the value side. Treat that
+    // `""` as "never authored" and the withdrawal REMOVES the rival longhand, which takes the
+    // shorthand's colour with it. `sparkle-huw924.15`, reached by a caller doing what the header
+    // used to say was fine.
+    it("withdraws a LONGHAND painted over a var() shorthand without taking the fill with it", () => {
+      const { el, style } = engineNode(THEMED_SHORTHAND);
+
+      const restore = borrowInlineStyle(el, (s) => s.setProperty("background-color", FLASH_FILL));
+      expect(style.getPropertyValue("background-color")).toBe(FLASH_FILL);
+      // ...and the shorthand can no longer be read back at all while the rival longhand stands.
+      expect(style.getPropertyValue("background")).toBe("");
+
+      style.setProperty("color", "var(--c-muted)");
+
+      restore();
+
+      expect(style.getPropertyValue("background")).toBe("var(--c-epic-card-fill)");
+      expect(style.getPropertyValue("color")).toBe("var(--c-muted)");
+    });
+
+    // ── SHAPE 4: AN UNNAMEABLE PAINT MUST NOT BE GUESSED AT ───────────────────────────────────
+    // `style.cssText = …` names no property. Enumerating the declaration afterwards to find out
+    // what was written hands the withdrawal eight longhands whose authored values all read `""`,
+    // so it removes all eight and the authored shorthand is destroyed — a worse outcome than
+    // recording nothing at all. Rule 3 says don't write `cssText`; this says what happens if you
+    // do: the paint stands, and the declaration survives.
+    it("withdraws NOTHING rather than shredding the declaration when the paint set cssText", () => {
+      const { el, style } = engineNode(THEMED_SHORTHAND);
+
+      const restore = borrowInlineStyle(el, (s) => {
+        s.cssText = "background: var(--c-epic-pill-fill)";
+      });
+
+      style.setProperty("color", "var(--c-muted)");
+
+      restore();
+
+      expect(style.getPropertyValue("background")).toBe("var(--c-epic-pill-fill)");
+      expect(style.getPropertyValue("color")).toBe("var(--c-muted)");
+    });
+
+    // ── SHAPE 5: THE INVERSE — A SHORTHAND OVER AN AUTHORED LONGHAND ──────────────────────────
+    // The other direction of the same fact, and the one an ordinary React `style={{ backgroundColor }}`
+    // produces: the node is authored with a LONGHAND, the paint writes the shorthand exactly as
+    // rule 1 recommends, and `priorStyle.getPropertyValue("background")` is `""` because a lone
+    // longhand does not serialize as a shorthand. A withdrawal that reads that as "never authored"
+    // calls `removeProperty("background")`, which clears the WHOLE family — the authored fill
+    // included. React never rewrites it: its bookkeeping says `backgroundColor` is already applied.
+    it("withdraws a SHORTHAND painted over an authored LONGHAND without clearing the family", () => {
+      const { el, style } = engineNode("background-color: #c0392b");
+      expect(style.getPropertyValue("background")).toBe("");
+
+      const restore = borrowInlineStyle(el, (s) =>
+        s.setProperty("background", "var(--c-epic-pill-fill)"),
+      );
+      expect(style.getPropertyValue("background")).toBe("var(--c-epic-pill-fill)");
+
+      style.setProperty("color", "var(--c-muted)");
+
+      restore();
+
+      expect(style.getPropertyValue("background-color")).toBe("#c0392b");
+      expect(style.getPropertyValue("color")).toBe("var(--c-muted)");
+    });
+
+    // ── SHAPE 6: RE-DECLARING INTO A FAMILY IS A WIDE WRITE ───────────────────────────────────
+    // Putting a shorthand back lands on every longhand in its family, including one the OTHER
+    // writer set during the window — which is bug two rebuilt inside bug three's fix, and bug two
+    // is the worse of the two because React cannot recover from being reverted. So when a sibling
+    // has moved since the paint, this borrow's property is left standing instead. The leak is
+    // deliberate and is asserted, so nobody "fixes" it back into a revert.
+    it("leaves the family alone when the other writer holds a sibling longhand", () => {
+      const { el, style } = engineNode(THEMED_SHORTHAND);
+
+      const restore = borrowInlineStyle(el, (s) => s.setProperty("background-color", FLASH_FILL));
+
+      // React writes a SIBLING longhand of the same family during the window.
+      style.setProperty("background-image", "url(a.png)");
+
+      restore();
+
+      expect(style.getPropertyValue("background-image")).toBe("url(a.png)"); // theirs — never reverted
+      expect(style.getPropertyValue("background-color")).toBe(FLASH_FILL); // ours — leaked, on purpose
     });
   });
 });
