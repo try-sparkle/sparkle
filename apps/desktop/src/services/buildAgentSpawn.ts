@@ -15,7 +15,7 @@ import { useUiStore } from "../stores/uiStore";
 import { landInAgent } from "./landInAgent";
 import { attentionHold } from "../engine/attentionGuard";
 import { createBeadFull } from "./tasks";
-import { isBeadsUnavailable, AUTO_LABEL } from "./beads";
+import { isBeadsUnavailable, AUTO_LABEL, closeBead } from "./beads";
 import { localAgentCapacity } from "./agentCapacity";
 import { attachBrief, clearBrief } from "./agentBrief";
 import { markProjectVisited, wasProjectVisited } from "./sessionProjects";
@@ -527,7 +527,47 @@ export function spawnBuildAgentInProject(
     // Labeled `sparkle-auto` so the board can tell app-generated telemetry from beads a human filed —
     // see AUTO_LABEL. Without it these are indistinguishable from real backlog once the agent is gone.
     void createBeadFull(project.rootPath, title, "", "task", opts.epicId ?? "", "", AUTO_LABEL)
-      .then((beadId) => useProjectStore.getState().setAgentBeadId(project.id, id, beadId))
+      .then((beadId) => {
+        // ── FIRST WRITER WINS. THIS `.then` IS LATE BY CONSTRUCTION ─────────────────────────────
+        // `createBeadFull` is a `bd` shell-out against a single-writer Dolt store under lock
+        // contention — seconds, not milliseconds — and this tail resolves whenever it resolves.
+        // Two other writers can bind `row.beadId` inside that window: `sendToBuild` (which binds
+        // the epic's own HUMAN-FILED bead) and `runtimeStore.syncBeadLifecycle`'s create branch
+        // (which mints and binds its own). Writing unconditionally here is not merely redundant —
+        // it OVERWRITES a real, correctly-parented id with this path's auto-minted one, and the
+        // row then points at a bead nobody else knows about.
+        //
+        // The race was previously made benign only DOWNSTREAM: `syncBeadLifecycle` remembers what
+        // it bound (`autoBeadWeWroteFor`) and `reconcileClobberedAutoBead` closes the bead it lost
+        // on the next poll. That narrows the window to one poll interval; it does not close it, and
+        // it cannot help `sendToBuild` at all, whose bead is not an auto-bead and is never
+        // reconciled. `runtimeStore.ts`'s own header on that reconciler says so: *"The clobber
+        // cannot be prevented from here — the only place to arbitrate two writers is the spawn
+        // itself."* This is that arbitration.
+        //
+        // AND WE CLOSE OUR LOSER RATHER THAN ABANDON IT — the same remedy, in the same shape, that
+        // `syncBeadLifecycle` applies when IT loses. Since sparkle-f2tzxg the bead we just minted
+        // is a CHILD OF THE EPIC, so an open child bound to nothing is not an invisible orphan:
+        // `engine/epicGoalRollup` reports that slice `stranded` forever and `readyToClose` can
+        // never be true for the epic again. A closed child reads `done` there and costs the epic
+        // nothing. Best-effort — a close that fails leaves exactly the orphan an unconditional
+        // write would have created anyway, and must never surface as a spawn failure.
+        const store = useProjectStore.getState();
+        const bound = store.projects
+          .find((p) => p.id === project.id)
+          ?.agents.find((a) => a.id === id)?.beadId;
+        if (bound && bound !== beadId) {
+          log.debug("build-agent", "auto-bead lost the race; closing it", { id, bound, beadId });
+          void closeBead(project.rootPath, beadId).catch((e) => {
+            log.debug("build-agent", "could not close the raced-out auto-bead", {
+              beadId,
+              error: String(e),
+            });
+          });
+          return;
+        }
+        store.setAgentBeadId(project.id, id, beadId);
+      })
       .catch((e) => {
         // A project with no beads DB is a normal, supported state (bd is optional) — don't cry WARN on
         // every build-agent spawn for it; keep only genuine failures loud.

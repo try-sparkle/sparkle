@@ -36,7 +36,9 @@ import {
   snapshotUnchanged,
   COMPARED_BEAD_FIELDS,
   BEADS_BLOCKED_REFRESH_MS,
-  __resetBeadsRefreshInFlightForTest, beadsReadStartedAt} from "./beadsStore";
+  __resetBeadsRefreshInFlightForTest,
+  beadsReadStartedAt,
+} from "./beadsStore";
 import { useSettingsStore } from "./settingsStore";
 
 function bead(partial: Partial<Bead> & { id: string }): Bead {
@@ -378,15 +380,23 @@ describe("freshness is stamped separately from the snapshot", () => {
     expect(beadsPolledAt("p1")).toBe(1_000_000); // NOT 1_030_000
   });
 
-  it("turning beads off drops the freshness stamp with the snapshot", async () => {
+  it("turning beads off drops BOTH freshness stamps with the snapshot", async () => {
     await poll("p1", [bead({ id: "a" })]);
+    // Both preconditions, so neither assertion below can pass against a clock that was never set:
+    // `readStartedAt` is written by the same success commit as `polledAt`, and an assertion that a
+    // never-written clock is undefined proves nothing about this branch.
     expect(beadsPolledAt("p1")).toBeDefined();
+    expect(beadsReadStartedAt("p1")).toBeDefined();
 
     useSettingsStore.setState({ beadsEnabled: false });
     await useBeadsStore.getState().refresh("p1", "/proj");
 
     expect(useBeadsStore.getState().byProject.p1).toBeUndefined();
     expect(beadsPolledAt("p1")).toBeUndefined();
+    // The read-START clock goes too. Leaving it makes the two clocks disagree about a snapshot
+    // that no longer exists — inert only because today's consumers short-circuit on the missing
+    // snapshot first, which is a guard in THEM, not an invariant of this branch.
+    expect(beadsReadStartedAt("p1")).toBeUndefined();
   });
 });
 

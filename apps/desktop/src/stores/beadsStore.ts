@@ -727,12 +727,19 @@ export const useBeadsStore = create<BeadsState>()((set) => ({
     // route through here), and it also gates the post-poll decompose watcher below. Drop any prior
     // snapshot so a board reached in some edge case shows empty, not stale.
     if (!beadsEnabled()) {
-      // Drop the freshness stamp with the snapshot. Leaving it would make the cross-project sweep
-      // treat a project whose snapshot we just discarded as recently read, so re-enabling beads
-      // would show dead ids for up to a full sweep interval. The cached blocked set goes with it
-      // for the same reason: it would otherwise outlive the snapshot it belongs to and bucket the
+      // Drop the freshness stamps with the snapshot. Leaving them would make the cross-project
+      // sweep treat a project whose snapshot we just discarded as recently read, so re-enabling
+      // beads would show dead ids for up to a full sweep interval. BOTH clocks go, not just the
+      // completion one: `readStartedAt` is the stamp callers use to PROVE a board already reflects
+      // a write, so one left behind claims that contents we have just thrown away postdate that
+      // write — the two clocks disagreeing about a snapshot that no longer exists. Today every
+      // such caller happens to short-circuit on the missing snapshot before it consults the clock,
+      // which makes the leak inert but not correct: that guard belongs to them, and deleting the
+      // stamp here is what keeps this branch's own invariant true. The cached blocked set goes for
+      // the same reason: it would otherwise outlive the snapshot it belongs to and bucket the
       // first post-re-enable read against a set up to BEADS_BLOCKED_REFRESH_MS old.
       polledAt.delete(projectId);
+      readStartedAt.delete(projectId);
       blockedCache.delete(projectId);
       set((s) => ({
         byProject: { ...s.byProject, [projectId]: undefined },
