@@ -18,6 +18,8 @@ import {
   improveLastConciergeNotifiedAt,
   improveLastConciergeNotifyFingerprint,
   sweepImproveNudge,
+  armImproveResumeKick,
+  improveResumeKickArmed,
   type ImproveNudgeDeps,
   type ImproveNudgeInput,
   type NextReadyBead,
@@ -508,6 +510,8 @@ describe("decideImproveNudge — the idle-and-has-backlog rule", () => {
     consentIsNever: false,
     paneStatus: "idle",
     advancedRecently: false,
+    // DEFAULT: not a resume tick — the resume-kick arm is exercised by its own suite below.
+    justResumed: false,
     readyBacklogCount: 2,
     p1PipelineHealthCount: 0,
     pipelineHealthFingerprint: null,
@@ -681,6 +685,60 @@ describe("decideImproveNudge — the idle-and-has-backlog rule", () => {
       decideImproveNudge({ ...base, lastNudgedAt: 0, now: NEVER_IDLE_CADENCE_MS }),
     ).toEqual({ nudge: true, kind: "generic" });
   });
+
+  // ── THE ONE-SHOT RESUME KICK (bead sparkle-n2feho.1, cause 4) — lift the baseline grace on resume ──
+  // On a fresh window/app-restart the FIRST readable sweep reads `advancedRecently: true` (the baseline
+  // grace), which normally refuses for a full interval — the exact reason the fleet "sits there idle
+  // after a restart." `justResumed` lifts ONLY that suppression, so a resume with ready work pulls/spawns
+  // at once. These pin the arithmetic: grace preserved when NOT a resume, lifted when it IS, and every
+  // other guard (not-idle, no-ready-backlog) still wins so a resume never nudges a working agent or
+  // manufactures a spurious action.
+  it("WITHOUT the resume kick, a baseline-grace sweep still refuses (advanced-recently) — grace preserved", () => {
+    expect(decideImproveNudge({ ...base, advancedRecently: true, justResumed: false })).toEqual({
+      nudge: false,
+      reason: "advanced-recently",
+    });
+  });
+
+  it("a resume + idle + ready backlog + free slots + zero workers SPAWNS immediately (respin), skipping the grace", () => {
+    expect(
+      decideImproveNudge({
+        ...base,
+        advancedRecently: true, // baseline grace on the first sweep after restart
+        justResumed: true,
+        readyBacklogCount: 5,
+        freeSlots: 8,
+        activeWorkers: 0,
+      }),
+    ).toEqual({ nudge: true, kind: "respin", readyCount: 5, freeSlots: 8 });
+  });
+
+  it("a resume + idle + a code-chosen ready P0 (workers busy) hands over the concrete item (named-pull), skipping the grace", () => {
+    const pick: NextReadyBead = { id: "sparkle-n2feho.1", priority: 0, title: "self-feeding" };
+    expect(
+      decideImproveNudge({ ...base, advancedRecently: true, justResumed: true, nextReadyBead: pick }),
+    ).toEqual({ nudge: true, kind: "named-pull", bead: pick });
+  });
+
+  it("a resume with NO ready work still refuses (no-ready-backlog) — the kick never manufactures a spurious action", () => {
+    expect(
+      decideImproveNudge({
+        ...base,
+        advancedRecently: true,
+        justResumed: true,
+        readyBacklogCount: 0,
+        p1PipelineHealthCount: 0,
+        unstaffedBuildableEpicCount: 0,
+        nextReadyBead: null,
+      }),
+    ).toEqual({ nudge: false, reason: "no-ready-backlog" });
+  });
+
+  it("a resume that finds the agent WORKING still refuses (not-idle) — the kick never nudges a live turn", () => {
+    expect(
+      decideImproveNudge({ ...base, paneStatus: "working", advancedRecently: true, justResumed: true }),
+    ).toEqual({ nudge: false, reason: "not-idle" });
+  });
 });
 
 // ── THE SELF-FEEDING PULL SELECTOR (bead sparkle-n2feho.1, cause 4) ────────────────────────────────
@@ -760,6 +818,7 @@ describe("decideImproveNudge — the self-feeding named-pull arm", () => {
     consentIsNever: false,
     paneStatus: "idle",
     advancedRecently: false,
+    justResumed: false,
     readyBacklogCount: 2,
     p1PipelineHealthCount: 0,
     pipelineHealthFingerprint: null,
@@ -857,5 +916,99 @@ describe("namedPullNudgeText", () => {
     expect(hard).toContain("NOT an acceptable");
     // the concrete target survives escalation — never dropped for the harder demand.
     expect(hard).toContain("sparkle-q9");
+  });
+});
+
+// ── THE RESUME-KICK SIDE EFFECT (bead sparkle-n2feho.1, cause 4) — auto-start on restart ────────────
+// The founder's TOP complaint: "after restarting the app, the fleet does NOT automatically start
+// draining the P0/P1 backlog." The structural cause is the baseline grace — the FIRST readable sweep of
+// a fresh window reads `advancedRecently: true` and the watcher refuses for a full ADVANCE_IDLE_MS
+// interval, so a resumed-idle agent with a ready P0 sits for up to ten minutes before the first
+// nudge/pull/spawn. `armImproveResumeKick()` (called once by `startPusher` at window mount) makes that
+// first sweep skip the grace and act immediately. These sweep tests drive the REAL entry point and
+// assert on the delivered message — the side effect the feature exists for.
+describe("sweepImproveNudge — the one-shot resume kick (auto-start on app restart)", () => {
+  beforeEach(() => _resetImproveNudgeForTests());
+
+  const t0 = 5_000_000;
+
+  it("ARMED: the FIRST sweep of a fresh window SENDS immediately, skipping the 10-minute baseline grace", async () => {
+    armImproveResumeKick();
+    const { deps, sent } = makeDeps({ now: t0 }); // idle + ready backlog + free slots (defaults)
+    const out = await sweepImproveNudge(deps);
+    // RED IF PASSIVE: without the kick this first sweep only baselines the clock and stays silent.
+    expect(out.sent).toBe(true);
+    expect(sent).toHaveLength(1);
+  });
+
+  it("UNARMED (default): the first sweep is silent (baseline grace) — the kick is what lifts it", async () => {
+    // No armImproveResumeKick() — this is the pre-existing behaviour, kept for a normal steady-state tick.
+    const { deps, sent } = makeDeps({ now: t0 });
+    const out = await sweepImproveNudge(deps);
+    expect(out.sent).toBe(false);
+    expect(out.detail).toBe("advanced-recently");
+    expect(sent).toHaveLength(0);
+  });
+
+  it("ARMED resume with free slots + zero active workers SPAWNS a drain fleet on the first sweep (respin text)", async () => {
+    armImproveResumeKick();
+    const { deps, sent } = makeDeps({ now: t0, ready: 5, freeSlots: 8, activeWorkers: 0 });
+    await sweepImproveNudge(deps);
+    expect(sent).toEqual([respinFleetNudgeText(5, 8)]);
+  });
+
+  it("ARMED resume with a code-chosen ready P0 (workers busy) hands over the concrete item (named-pull text)", async () => {
+    armImproveResumeKick();
+    const pick: NextReadyBead = { id: "sparkle-n2feho.1", priority: 0, title: "self-feeding" };
+    const { deps, sent } = makeDeps({ now: t0, activeWorkers: 2, nextReadyBead: pick });
+    await sweepImproveNudge(deps);
+    expect(sent).toEqual([namedPullNudgeText(pick, 0)]);
+  });
+
+  it("ARMED but NO ready work → the kick sends nothing (never manufactures a spurious action)", async () => {
+    armImproveResumeKick();
+    const { deps, sent } = makeDeps({
+      now: t0,
+      ready: 0,
+      p1PipelineHealth: 0,
+      unstaffedBuildableEpicCount: 0,
+      nextReadyBead: null,
+    });
+    const out = await sweepImproveNudge(deps);
+    expect(out.sent).toBe(false);
+    expect(out.detail).toBe("no-ready-backlog");
+    expect(sent).toHaveLength(0);
+  });
+
+  it("is ONE-SHOT: the first readable sweep CONSUMES the kick, and a follow-up tick does not double-fire", async () => {
+    armImproveResumeKick();
+    expect(improveResumeKickArmed()).toBe(true);
+    // First readable sweep fires AND consumes the kick — direct proof it is spent.
+    const first = makeDeps({ now: t0 });
+    await sweepImproveNudge(first.deps);
+    expect(improveResumeKickArmed()).toBe(false);
+    expect(first.sent).toHaveLength(1);
+    // A follow-up sweep within the same interval is back under the ordinary baseline grace (the kick is
+    // spent), NOT re-firing — steady-state is governed by the normal grace/cadence once the kick is gone.
+    const soon = makeDeps({ now: t0 + 60_000, fingerprint: "idle" });
+    const out = await sweepImproveNudge(soon.deps);
+    expect(out.sent).toBe(false);
+    expect(out.detail).toBe("advanced-recently");
+    expect(soon.sent).toHaveLength(0);
+  });
+
+  it("a BLIND first sweep (pane not yet reporting) does NOT consume the kick and does NOT send (fail-closed)", async () => {
+    armImproveResumeKick();
+    // Unreadable pane: fingerprint AND status both absent, exactly as production reads one source.
+    const { deps, sent } = makeDeps({ now: t0, fingerprint: null, paneStatus: undefined });
+    const out = await sweepImproveNudge(deps);
+    expect(out.sent).toBe(false);
+    expect(out.detail).toBe("not-idle");
+    expect(sent).toHaveLength(0);
+    // Kick survives the blind sweep, so it still fires on the next readable tick.
+    expect(improveResumeKickArmed()).toBe(true);
+    const { deps: d2, sent: s2 } = makeDeps({ now: t0 + 60_000 }); // readable pane now
+    await sweepImproveNudge(d2);
+    expect(s2).toHaveLength(1);
   });
 });

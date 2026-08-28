@@ -62,6 +62,7 @@ import {
 } from "./sparkleAgent";
 import {
   sweepImproveNudge,
+  armImproveResumeKick,
   selectNextReadyBead,
   type ImproveNudgeDeps,
   type NextReadyBead,
@@ -590,6 +591,17 @@ export function startPusher(): () => void {
   // inside the sweep by the per-trigger cooldowns and the hourly budget rather than by the timer.
   // Ticking at the floor is what lets a config change take effect without a restart — a timer built
   // from a policy that had not loaded yet would be stuck at the default for the life of the window.
+  // ARM THE ONE-SHOT RESUME KICK for this window (bead sparkle-n2feho.1, cause 4). `startPusher` runs
+  // once per window mount, which is exactly the app-restart / session-resume moment the founder means
+  // by "after restarting the app, the fleet does NOT automatically start draining." Arming here makes
+  // the first pusher sweep skip the baseline idle-grace and immediately emit the pull (`named-pull`) /
+  // spawn (`respin`) action when the improve agent is idle with ready P0/P1 backlog — instead of
+  // resting through a full `ADVANCE_IDLE_MS` interval. It lifts ONLY that grace; every other nudge
+  // guard (armed / owner / consent / not-idle / no-ready-backlog / rate-limit) still applies, so an
+  // un-armed feature, a non-owning window, or an empty backlog produces no action. Consumed by the
+  // first readable sweep, so it never changes steady-state behaviour.
+  armImproveResumeKick();
+
   const stopRunner = startPusherRunner(buildPusherDeps(), MIN_TICK_MS);
 
   // THE BACKLOG FEED FOR THE NEVER-IDLE WATCHER. Nothing else polls the sparkle-self beads into

@@ -353,6 +353,21 @@ export interface ImproveNudgeInput {
    * interval, which is exactly what to nudge.
    */
   advancedRecently: boolean;
+  /**
+   * THE ONE-SHOT RESUME KICK (bead sparkle-n2feho.1, cause 4). `true` for the first readable sweep
+   * after a window mounts / the app restarts (armed by `armImproveResumeKick`, consumed by the sweep).
+   * It lifts EXACTLY ONE suppression — the baseline `advancedRecently` GRACE — so a resume that finds
+   * the agent idle-with-ready-work pulls/spawns on the FIRST tick instead of sitting through a full
+   * `ADVANCE_IDLE_MS` idle interval before the watcher is even allowed to speak. That grace is stamped
+   * on the first readable fingerprint of a fresh window and exists to protect an agent we have OBSERVED
+   * working; a window that has just resumed has observed nothing, so on resume the grace is exactly the
+   * mechanism that makes the fleet "sit there idle after a restart" (the founder's complaint). It lifts
+   * ONLY the grace: every other guard (armed / owner / consent / not-idle / no-ready-backlog /
+   * rate-limit) still refuses, so a resume can never nudge a working agent (not-idle wins) nor
+   * manufacture a spurious action when there is no ready work (no-ready-backlog wins). `false` on every
+   * later sweep, so the normal grace/cadence governs steady-state — this only ever fires once.
+   */
+  justResumed: boolean;
   /** How many open, unblocked improvement beads are ready (the board's `backlog` column). */
   readyBacklogCount: number;
   /** How many open P1 pipeline-health beads exist — the highest-value ready work, counted separately
@@ -426,6 +441,8 @@ export type ImproveNudgeRefusal =
  *   3. `consent-never`     — chat-only mode may not be told to mine backlog.
  *   4. `not-idle`          — the agent's own pane is not at rest (working / waiting / approval / unknown).
  *   5. `advanced-recently` — it advanced a concrete item within the interval (or we could not tell); it IS working.
+ *                            BYPASSED by `justResumed`: on the first sweep after an app restart this
+ *                            signal is the baseline grace, not real work, so a resume pulls immediately.
  *   6. `no-ready-backlog`  — nothing is ready, so resting is CORRECT; it may rest (guardrail a).
  *   7. `rate-limited`      — a nudge was delivered within `cadenceMs`; give the turn room to act.
  *
@@ -459,7 +476,15 @@ export function decideImproveNudge(input: ImproveNudgeInput): ImproveNudgeDecisi
   if (input.paneStatus === undefined || !RESTING.has(input.paneStatus)) {
     return { nudge: false, reason: "not-idle" };
   }
-  if (input.advancedRecently) return { nudge: false, reason: "advanced-recently" };
+  // A concrete advance within the interval means the agent IS working, so refuse — UNLESS this is the
+  // one-shot resume kick (bead sparkle-n2feho.1, cause 4). On a fresh window/app-restart the
+  // `advancedRecently` signal is the BASELINE GRACE (the first readable fingerprint stamps the clock
+  // and reads as "just advanced"), not evidence of real work — and that grace is precisely what leaves
+  // the fleet idle for a full interval after a restart. `justResumed` lifts ONLY this suppression; the
+  // not-idle gate above already refused a genuinely-working agent, so bypassing here cannot nudge one.
+  if (input.advancedRecently && !input.justResumed) {
+    return { nudge: false, reason: "advanced-recently" };
+  }
   if (
     input.readyBacklogCount <= 0 &&
     input.p1PipelineHealthCount <= 0 &&
@@ -596,10 +621,39 @@ let consecutiveIdleNudges = 0;
  *  dedup the concierge-notify push per DISTINCT set of red beads per `CONCIERGE_NOTIFY_CADENCE_MS`. */
 let lastConciergeNotifiedAt: number | null = null;
 let lastConciergeNotifyFingerprint: string | null = null;
+/**
+ * THE ONE-SHOT RESUME KICK, window-local and NOT persisted (bead sparkle-n2feho.1, cause 4). Armed by
+ * `armImproveResumeKick` when this window mounts / the app restarts, and consumed by the FIRST sweep
+ * that gets a readable look at the improve agent. While armed it makes `sweepImproveNudge` pass
+ * `justResumed: true` into the decision, which lifts the baseline-grace `advanced-recently` suppression
+ * for that one sweep — so a resume that finds the agent idle-with-ready-work pulls/spawns on the first
+ * tick instead of after a full `ADVANCE_IDLE_MS` grace. Defaults FALSE (an un-armed window behaves
+ * exactly as before), and a blind sweep — no readable fingerprint — does NOT consume it (fail-closed:
+ * the kick is spent only on a real look, never on a sweep that saw nothing).
+ */
+let resumeKickArmed = false;
 
 /** Test/introspection seam: the current flat-signal nudge streak. */
 export function improveConsecutiveIdleNudges(): number {
   return consecutiveIdleNudges;
+}
+
+/**
+ * ARM THE ONE-SHOT RESUME KICK (bead sparkle-n2feho.1, cause 4). The wiring (`startPusher`) calls this
+ * exactly once when a window mounts / the app restarts, to declare "this window has just resumed and
+ * has not yet taken a real look at the improve agent." It lifts ONLY the baseline-grace suppression on
+ * the first readable sweep, so a resumed fleet that finds a ready P0/P1 backlog begins draining on the
+ * first pusher tick rather than sitting idle for a full idle interval — the founder's exact complaint
+ * that "after restarting the app, the fleet does NOT automatically start draining." Idempotent: calling
+ * it again while already armed is a no-op, and every non-grace guard still governs the resulting sweep.
+ */
+export function armImproveResumeKick(): void {
+  resumeKickArmed = true;
+}
+
+/** Test/introspection seam: is the one-shot resume kick still armed (not yet consumed by a sweep)? */
+export function improveResumeKickArmed(): boolean {
+  return resumeKickArmed;
 }
 
 /** Test/introspection seam: when did the concierge last get a pipeline-health notify, and about what. */
@@ -618,6 +672,9 @@ export function _resetImproveNudgeForTests(): void {
   lastAdvanceAt = null;
   lastConciergeNotifiedAt = null;
   lastConciergeNotifyFingerprint = null;
+  // DISARMED by reset, so the existing sweep suites keep the baseline-silent contract they assert; the
+  // resume-kick suite opts in by calling `armImproveResumeKick()` after the reset.
+  resumeKickArmed = false;
 }
 
 /** Test/introspection seam: when did the last nudge land? */
@@ -667,7 +724,16 @@ export async function sweepImproveNudge(deps: ImproveNudgeDeps): Promise<Improve
     // The advance clock is folded EVERY sweep, before the decision and regardless of every other
     // gate, so a window that is not the owner (or is disarmed) still tracks advance and does not
     // manufacture a false "idle for ages" the moment it becomes eligible.
-    const advancedRecently = advancedWithin(deps.advanceFingerprint(), now, ADVANCE_IDLE_MS);
+    const fingerprint = deps.advanceFingerprint();
+    const advancedRecently = advancedWithin(fingerprint, now, ADVANCE_IDLE_MS);
+    // THE ONE-SHOT RESUME KICK (bead sparkle-n2feho.1, cause 4). Read the armed flag BEFORE consuming
+    // it, then hand it to the decision as `justResumed`. Consume it the moment we get a READABLE look at
+    // the agent (a non-null fingerprint) — a blind sweep (fingerprint null, the pane not yet reporting)
+    // is not a real look, so the kick stays armed for the next tick rather than being spent on nothing.
+    // After it is consumed the normal baseline grace and 10-minute cadence govern steady-state, so the
+    // kick fires at most once per window: it only ever SKIPS the first-interval grace on resume.
+    const justResumed = resumeKickArmed;
+    if (resumeKickArmed && fingerprint !== null) resumeKickArmed = false;
     // A real advance ENDS the streak: the agent worked, so the next nudge (if any) starts soft again.
     // Done every sweep, before the decision, so an advance resets escalation even on a tick that then
     // refuses to nudge for some other reason.
@@ -681,6 +747,7 @@ export async function sweepImproveNudge(deps: ImproveNudgeDeps): Promise<Improve
       consentIsNever: deps.consentIsNever(),
       paneStatus: deps.paneStatus(),
       advancedRecently,
+      justResumed,
       readyBacklogCount: backlog.ready,
       p1PipelineHealthCount: backlog.p1PipelineHealth,
       pipelineHealthFingerprint: backlog.p1PipelineHealthFingerprint,
