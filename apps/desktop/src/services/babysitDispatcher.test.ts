@@ -1980,7 +1980,7 @@ describe("an unobservable driver holds, but not forever", () => {
 describe("the lease heartbeat is refreshed from an observation", () => {
   it("stamps the HOLDER's id when the roster shows the driver running", async () => {
     seedLiveness({ owner: "working" });
-    wireInvoke({ leases: [{ lease: { repo: "drodio/sparkle", pr: 1251, agent_id: "holder-9" }, standing: "live" }] });
+    wireInvoke({ leases: [{ lease: { repo: "drodio/sparkle", pr: 1251, agentId: "holder-9" }, standing: "live" }] });
 
     await babysitSweepProject(projectWith([driverRow("owner", 1251)]), T0, CONFIG);
 
@@ -1997,7 +1997,7 @@ describe("the lease heartbeat is refreshed from an observation", () => {
     // The heartbeat must carry an OBSERVATION. Stamping it for a row we merely cannot see would
     // keep a dead driver's lease alive forever and re-break the recovery path from the other end.
     seedLiveness({}, ["owner"]);
-    wireInvoke({ leases: [{ lease: { repo: "drodio/sparkle", pr: 1251, agent_id: "holder-9" }, standing: "live" }] });
+    wireInvoke({ leases: [{ lease: { repo: "drodio/sparkle", pr: 1251, agentId: "holder-9" }, standing: "live" }] });
 
     await babysitSweepProject(projectWith([driverRow("owner", 1251)]), T0, CONFIG);
 
@@ -2009,7 +2009,7 @@ describe("the lease heartbeat is refreshed from an observation", () => {
     // must not turn a working sweep into a failed one.
     seedLiveness({ owner: "working" });
     const base = invokeMock.getMockImplementation();
-    wireInvoke({ leases: [{ lease: { repo: "drodio/sparkle", pr: 1251, agent_id: "holder-9" }, standing: "live" }] });
+    wireInvoke({ leases: [{ lease: { repo: "drodio/sparkle", pr: 1251, agentId: "holder-9" }, standing: "live" }] });
     const wired = invokeMock.getMockImplementation();
     invokeMock.mockImplementation(async (cmd: string, ...rest: unknown[]) => {
       if (cmd === BABYSIT_LEASE_HEARTBEAT_COMMAND) throw new Error("bridge down");
@@ -2073,8 +2073,8 @@ describe("an orphan lease cannot mute a PR for the life of the app", () => {
     // stamps are past the bound, so the row stops counting and the ordinary lease logic resumes.
     expect(
       driverSightingFor([ancient(74)], REPO, 74, alive({}), T0, {
-        acquired_at_ms: OLD,
-        heartbeat_at_ms: OLD,
+        acquiredAtMs: OLD,
+        heartbeatAtMs: OLD,
       }),
     ).toBe(NO_DRIVER_SIGHTED);
   });
@@ -2084,7 +2084,7 @@ describe("an orphan lease cannot mute a PR for the life of the app", () => {
     // either source holds and stale evidence from both releases. This is the case that proves the
     // lease is still consulted at all.
     expect(
-      driverSightingFor([ancient(74)], REPO, 74, alive({}), T0, { heartbeat_at_ms: T0 - 60_000 }),
+      driverSightingFor([ancient(74)], REPO, 74, alive({}), T0, { heartbeatAtMs: T0 - 60_000 }),
     ).toEqual({ verdict: "unobservable", agentId: "owner" });
   });
 
@@ -2095,7 +2095,7 @@ describe("an orphan lease cannot mute a PR for the life of the app", () => {
     wireInvoke({
       leases: [
         {
-          lease: { repo: "drodio/sparkle", pr: 1251, agent_id: "holder-9", acquired_at_ms: OLD, heartbeat_at_ms: OLD },
+          lease: { repo: "drodio/sparkle", pr: 1251, agentId: "holder-9", acquiredAtMs: OLD, heartbeatAtMs: OLD },
           standing: "dead-stale",
         },
       ],
@@ -2123,6 +2123,73 @@ describe("an orphan lease cannot mute a PR for the life of the app", () => {
         promptHistory: [{ id: "p0", text: "look at github.com/try-sparkle/sparkle/pull/9", at: T0 - 60_000 }],
       }),
     ]);
+
+    await babysitSweepProject(project, T0, CONFIG);
+    await babysitSweepProject(project, T0 + 60_000, CONFIG);
+
+    expect(spawnMock).not.toHaveBeenCalled();
+  });
+});
+
+// ── A DEAD-EPOCH LEASE IS NOT EVIDENCE THAT ANY PROCESS EXISTS ─────────────────────────────────
+//
+// `dead-epoch` is positive proof the holder's app launch is over, so its stamps — however recent —
+// must not feed the bound. Folding them in let a lease left by a previous launch keep a dead roster
+// row "fresh" for the whole 12-hour window, preempting the recovery `standingFor` still implements
+// (dead-epoch → held-dead → cooldown → replacement). The heartbeat wiring makes this concrete: it
+// stamps `heartbeatAtMs` on every sweep that observes a driver, so a lease surviving a restart
+// carries a stamp only minutes old.
+describe("a lease from a previous app launch cannot keep a dead row alive", () => {
+  const OLD = T0 - BABYSIT_UNOBSERVED_HOLD_MS - 60_000;
+  const ancient = (pr: number) =>
+    driverRow("owner", pr, { promptHistory: [{ id: "p0", text: babysitPrompt(pr), at: OLD }] });
+
+  it("END TO END: a dead-epoch lease with a RECENT heartbeat still hands the PR over", async () => {
+    // The exact post-restart shape: openAgentIds persisted so the row survives with no observable
+    // status, the lease file survived with a stamp from minutes before the quit, and `list_at`
+    // reports it dead-epoch under the new process_epoch(). Before the guard this held for 12h.
+    seedLiveness({}, ["owner"]);
+    wireInvoke({
+      leases: [
+        {
+          lease: {
+            repo: "drodio/sparkle",
+            pr: 1251,
+            agentId: "holder-9",
+            acquiredAtMs: T0 - 120_000,
+            heartbeatAtMs: T0 - 60_000,
+          },
+          standing: "dead-epoch",
+        },
+      ],
+    });
+    const project = projectWith([ancient(1251)]);
+
+    await babysitSweepProject(project, T0, CONFIG);
+    const out = await babysitSweepProject(project, T0 + 60_000, CONFIG);
+
+    expect(out.dispatched).toEqual([{ repo: "drodio/sparkle", pr: 1251, agentId: "agent-1" }]);
+  });
+
+  it("PAIRED — the SAME recent stamps under a dead-stale (this-launch) lease still hold", async () => {
+    // Only the standing differs, so this pins that the guard keys on `dead-epoch` and not on the
+    // stamps themselves — otherwise it would be a blanket refusal to consult the lease at all.
+    seedLiveness({}, ["owner"]);
+    wireInvoke({
+      leases: [
+        {
+          lease: {
+            repo: "drodio/sparkle",
+            pr: 1251,
+            agentId: "holder-9",
+            acquiredAtMs: T0 - 120_000,
+            heartbeatAtMs: T0 - 60_000,
+          },
+          standing: "dead-stale",
+        },
+      ],
+    });
+    const project = projectWith([ancient(1251)]);
 
     await babysitSweepProject(project, T0, CONFIG);
     await babysitSweepProject(project, T0 + 60_000, CONFIG);

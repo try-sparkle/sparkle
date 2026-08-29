@@ -81,10 +81,11 @@ export const BABYSIT_LEASE_RELEASE_COMMAND = "babysit_lease_release";
 /**
  * Refresh a lease's heartbeat, so `dead-stale` means something.
  *
- * ══ IT HAD NO CALLER AT ALL, AND THAT IS WHY DRIVERS WERE DUPLICATED ═══════════════════════════
+ * ══ IT HAD NO CALLER UNTIL THIS BEAD, AND THAT IS WHY DRIVERS WERE DUPLICATED ══════════════════
  * `babysit_lease.rs` calls a lease dead once its heartbeat is `STALE_MS_DEFAULT` (90 minutes) old,
  * and nothing in the app had ever invoked this command — it sat in
- * `scripts/tauri-command-callers.allow` as a known-dead command. `heartbeat_at_ms` was therefore
+ * `scripts/tauri-command-callers.allow` as a known-dead command until `sparkle-rk0k8o` wired the
+ * sweep's stamp below and dropped that entry. `heartbeat_at_ms` was therefore
  * stamped once at acquire and never moved, so EVERY driver was reclassified `dead-stale` at 90
  * minutes WHILE STILL RUNNING, and the recovery cooldown dispatched its replacement five minutes
  * later. A babysit pass self-paces at ~28 minutes, so crossing 90 is the ordinary case, and the
@@ -168,7 +169,17 @@ export function checkRollupOf(pr: PrRow): BabysitCheckRollup {
 
 /** One lease as `babysit_leases` reports it, narrowed to what this module reads. */
 interface LeaseView {
-  lease?: { repo?: string; pr?: number; agent_id?: string; acquired_at_ms?: number; heartbeat_at_ms?: number };
+  /**
+   * CAMEL CASE, BECAUSE THAT IS WHAT THE WIRE SENDS. `babysit_lease.rs`'s `BabysitLease` carries
+   * `#[serde(rename_all = "camelCase")]`, so `agent_id` / `acquired_at_ms` / `heartbeat_at_ms`
+   * arrive as `agentId` / `acquiredAtMs` / `heartbeatAtMs`. `repo` and `pr` are unaffected by the
+   * rename, which is exactly why the snake_case version of this interface LOOKED fine: the two
+   * fields anything already depended on survived, and every field this adds is optional, so three
+   * mechanisms went inert in production with a green suite. See `babysitLeaseWire.test.ts`, which
+   * reads the Rust source and pins these names so the two halves fail together (AGENTS.md's
+   * `sparkle-16y6h` rule: a fixture matching a shape the wire cannot produce tests nothing).
+   */
+  lease?: { repo?: string; pr?: number; agentId?: string; acquiredAtMs?: number; heartbeatAtMs?: number };
   standing?: string;
 }
 
@@ -324,7 +335,7 @@ export function driverEvidenceAt(
    *  driver either — see {@link BABYSIT_UNOBSERVED_HOLD_MS} — but `acquired_at_ms` is a better lower
    *  bound than a spawn prompt for a driver whose lease was taken later, and folding them into the
    *  SAME bound is precisely what stops a lease from becoming a bypass. */
-  lease?: { acquired_at_ms?: number; heartbeat_at_ms?: number },
+  lease?: { acquiredAtMs?: number; heartbeatAtMs?: number },
 ): number | null {
   const want = babysitPrompt(pr);
   let newest: number | null = null;
@@ -332,7 +343,7 @@ export function driverEvidenceAt(
     if (e.text?.trim() !== want) continue;
     if (typeof e.at === "number" && (newest === null || e.at > newest)) newest = e.at;
   }
-  for (const t of [agent.activityAt, lease?.acquired_at_ms, lease?.heartbeat_at_ms]) {
+  for (const t of [agent.activityAt, lease?.acquiredAtMs, lease?.heartbeatAtMs]) {
     if (typeof t === "number" && (newest === null || t > newest)) newest = t;
   }
   return newest;
@@ -362,7 +373,7 @@ export function driverSightingFor(
    * THIS launch whose pane is simply closed has a same-epoch lease and is held. Neither is a
    * question about elapsed time, which is why elapsed time could not answer both.
    */
-  leaseStamps?: { acquired_at_ms?: number; heartbeat_at_ms?: number },
+  leaseStamps?: { acquiredAtMs?: number; heartbeatAtMs?: number },
   holdMs: number = BABYSIT_UNOBSERVED_HOLD_MS,
 ): BabysitDriverSighting {
   let unobservable: BabysitDriverSighting | null = null;
@@ -861,7 +872,13 @@ export async function babysitSweepProject(
         pr.number,
         aliveFor,
         now,
-        leaseRow?.lease,
+        // NOT FROM A `dead-epoch` LEASE. That standing is positive proof the holder's process is
+        // over, so its stamps — however recent — cannot be evidence that any process exists. Passing
+        // them would let a lease left by a previous app launch keep a dead roster row "fresh" for
+        // the whole 12-hour bound, preempting the recovery `standingFor` still implements
+        // (`dead-epoch` → `held-dead` → cooldown → replacement). That is the silent mute again,
+        // reached through the axis added to close it.
+        leaseRow?.standing === "dead-epoch" ? undefined : leaseRow?.lease,
       );
       const lease = standingFor(leases, repo, pr.number, sighting);
       // ── AN OBSERVATION IS WHAT A HEARTBEAT IS FOR ──────────────────────────────────────────────
@@ -875,13 +892,26 @@ export async function babysitSweepProject(
       // BEST EFFORT AND NEVER FATAL. It is bookkeeping that makes an existing fact durable; a
       // failed stamp costs one refresh, and the roster guard above already holds the PR without it.
       if (sighting.verdict === "live") {
-        const holder = leaseRow?.lease?.agent_id;
+        const holder = leaseRow?.lease?.agentId;
         if (holder) {
           try {
             await invoke(BABYSIT_LEASE_HEARTBEAT_COMMAND, { repo, pr: pr.number, agentId: holder });
           } catch (e) {
             log.debug("babysit", "could not refresh a lease heartbeat", { repo, pr: pr.number, error: String(e) });
           }
+        }
+        // ── FENCE AGAIN, BECAUSE THIS AWAIT SITS ABOVE `observeLease` ─────────────────────────────
+        // `babysit_lease_heartbeat` takes `lock_store` on the shared lease file and then saves it, so
+        // it blocks behind any other window's acquire/release/list — a real chance of outliving the
+        // sweep deadline, not a cheap local read. Without this check a superseded sweep resumes and
+        // runs `observeLease` holding a pre-deadline `now` and a pre-deadline `leases` snapshot,
+        // stamping `lastDriverExitAt` — THE SOLE PER-PR LIMITER — far in the past and clearing the
+        // replacement sweep's `sawLive`. The cooldown then reads as long expired and the PR becomes
+        // re-dispatchable a full cooldown early: the duplicate driver this bead is about, reached
+        // through the one write the post-probe fence was added to protect.
+        if (!isCurrent()) {
+          out.abandoned = true;
+          return out;
         }
       }
       // Before the decision, so a driver that exited during THIS interval is already cooling down by
