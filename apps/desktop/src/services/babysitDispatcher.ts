@@ -903,12 +903,20 @@ export async function babysitSweepProject(
         // ── FENCE AGAIN, BECAUSE THIS AWAIT SITS ABOVE `observeLease` ─────────────────────────────
         // `babysit_lease_heartbeat` takes `lock_store` on the shared lease file and then saves it, so
         // it blocks behind any other window's acquire/release/list — a real chance of outliving the
-        // sweep deadline, not a cheap local read. Without this check a superseded sweep resumes and
-        // runs `observeLease` holding a pre-deadline `now` and a pre-deadline `leases` snapshot,
-        // stamping `lastDriverExitAt` — THE SOLE PER-PR LIMITER — far in the past and clearing the
-        // replacement sweep's `sawLive`. The cooldown then reads as long expired and the PR becomes
-        // re-dispatchable a full cooldown early: the duplicate driver this bead is about, reached
-        // through the one write the post-probe fence was added to protect.
+        // sweep deadline, not a cheap local read.
+        //
+        // WHAT IS ACTUALLY AT RISK HERE IS NARROWER THAN AT THE OTHER TWO FENCES, and the first
+        // version of this comment overstated it — review caught that. It claimed a superseded sweep
+        // would stamp `lastDriverExitAt`, the sole per-PR limiter, with a pre-deadline `now`. That
+        // cannot happen ON THIS BRANCH: we are inside `sighting.verdict === "live"`, `standingFor`
+        // answers `held-live` unconditionally for a live sighting, and `observeLease` short-circuits
+        // on `held-live` (`c.sawLive = true; return;`) without ever reaching the exit stamp. A guard
+        // justified by an unreachable harm is how the next reader concludes the guard is pointless.
+        //
+        // The REACHABLE harm is still worth fencing: a superseded sweep resumes and writes
+        // `sawLive = true` over a replacement sweep's newer state, then walks on through PRs 2..N
+        // judging every one of them against a `now` and a `leases` snapshot from before the
+        // deadline. That is the same class the two sibling fences exist for, one degree less severe.
         if (!isCurrent()) {
           out.abandoned = true;
           return out;

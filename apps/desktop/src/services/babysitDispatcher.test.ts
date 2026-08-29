@@ -2197,3 +2197,50 @@ describe("a lease from a previous app launch cannot keep a dead row alive", () =
     expect(spawnMock).not.toHaveBeenCalled();
   });
 });
+
+// ── THE HEARTBEAT AWAIT IS FENCED, AND BOTH DIRECTIONS ARE PINNED ──────────────────────────────
+//
+// The two sibling fences each carry a paired test, including an explicit "a fence that always
+// reported superseded would pass above" direction — this one shipped with neither, so if it were
+// misplaced or inert nothing would have said so. That is the shape the rest of this work is about.
+//
+// The reachable harm here is narrower than at the other two: we are inside a `live` sighting, so
+// `observeLease` short-circuits on `held-live` and never reaches the exit stamp. What a superseded
+// sweep would still do is write `sawLive = true` over a replacement's newer state and walk on
+// through PRs 2..N against a pre-deadline clock and lease snapshot.
+describe("the fence after the heartbeat await", () => {
+  it("ABANDONS the sweep when it is superseded during the heartbeat invoke", async () => {
+    // A live sighting is what reaches the heartbeat at all, so seed one; the lease supplies the
+    // holder id the stamp needs. `isCurrent` stays true for the two earlier fences and flips on the
+    // third call — the one after the invoke.
+    seedLiveness({ owner: "working" });
+    wireInvoke({
+      leases: [{ lease: { repo: "drodio/sparkle", pr: 1251, agentId: "holder-9" }, standing: "live" }],
+    });
+    const project = projectWith([driverRow("owner", 1251)]);
+
+    let calls = 0;
+    const out = await babysitSweepProject(project, T0, CONFIG, () => ++calls <= 2);
+
+    expect(out.abandoned).toBe(true);
+    // It stopped BEFORE judging this PR, so nothing downstream ran on the stale snapshot.
+    expect(out.holds).toEqual({});
+  });
+
+  it("PAIRED — a sweep that stays current is NOT abandoned", async () => {
+    // Without this, a fence hard-wired to report superseded would satisfy the case above. The same
+    // fixture, the same heartbeat, the only difference being that nothing supersedes it.
+    seedLiveness({ owner: "working" });
+    wireInvoke({
+      leases: [{ lease: { repo: "drodio/sparkle", pr: 1251, agentId: "holder-9" }, standing: "live" }],
+    });
+    const project = projectWith([driverRow("owner", 1251)]);
+
+    const out = await babysitSweepProject(project, T0, CONFIG);
+
+    expect(out.abandoned).toBeUndefined();
+    // …and it went on to judge the PR, holding it because a live driver already owns it.
+    expect(out.holds).toEqual({ "driver-alive": 1 });
+    expect(spawnMock).not.toHaveBeenCalled();
+  });
+});
