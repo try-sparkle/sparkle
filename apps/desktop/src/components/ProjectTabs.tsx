@@ -214,6 +214,50 @@ export function tabBadgeCount(counts: ProjectTabCounts | undefined, active: bool
 }
 
 /**
+ * The per-tab key for the floor MEASUREMENT effect (`measureChrome` + label `scrollWidth`): the
+ * inputs that can move a tab's rendered widths, and NOTHING that cannot.
+ *
+ * WHY THIS IS ITS OWN FUNCTION (bead sparkle-vkdca — the timer-driven half of the layout wedge).
+ * `measureChrome` reads `offsetWidth` per unshrinkable child; reading it forces a SYNCHRONOUS
+ * relayout of a deeply nested flex strip. That is correct to pay when a rendered width actually
+ * changes — but the old key paid it on inputs that change NO width:
+ *
+ *   • THE ACTIVE TAB'S COUNT. `tabBadgeCount` returns `null` on the active tab, so its count badge
+ *     is not rendered at all — yet the old key embedded `${band}${count}` for every tab regardless
+ *     of `active`. The active tab is the one you are working in, so its counts tick the FASTEST, and
+ *     every tick forced a full-strip relayout to re-measure a badge that is not on screen. That is
+ *     the timer-driven forced-synchronous-layout the bead reports: a microtask that relaid out the
+ *     whole strip and changed nothing. Keying on `tabBadgeCount(...)` instead makes an active tab's
+ *     count churn a no-op.
+ *   • THE BAND LETTER. The band drives the badge's COLOUR, not its width (the dot is a fixed
+ *     `dotSize`, the gap is fixed) — so a `needs_you`↔`questions` flip at the same count is a
+ *     width-invariant repaint, and embedding the band forced a re-measure for it. The count VALUE
+ *     stays in the key because `BandBadge` renders `{count}` in a PROPORTIONAL font (no
+ *     `tabular-nums`), so "11" and "18" really are different widths and must still re-measure.
+ *
+ * Pure and exported so the invariant is pinned by a unit test independently of the strip's markup.
+ */
+export function tabMetricsSig(
+  project: { id: string; name: string },
+  counts: ProjectTabCounts | undefined,
+  staleness: ProjectTabStaleness | undefined,
+  active: boolean,
+  tornOut: boolean,
+  hasClose: boolean,
+): string {
+  const badge = tabBadgeCount(counts, active);
+  return [
+    project.id,
+    project.name,
+    active ? "a" : "-",
+    badge === null ? "-" : String(badge),
+    staleness?.behind ?? "-",
+    tornOut ? "t" : "-",
+    hasClose ? "x" : "-",
+  ].join(":");
+}
+
+/**
  * ● N — the inactive tab's alarm badge: the band's own dot, then the bare number.
  *
  * NO "Needs you" IS RENDERED. The badge is read at a glance across a strip of tabs, where two words
@@ -972,19 +1016,16 @@ export function ProjectTabs({
    * `offsetWidth - offsetWidth` taken across that boundary is not a chrome measurement at all.
    */
   const metricsKey = projects
-    .map((p) => {
-      const c = countsByProject[p.id];
-      const b = tabBand(c);
-      return [
-        p.id,
-        p.name,
-        p.id === selectedProjectId ? "a" : "-",
-        b ? `${b}${c?.[b] ?? 0}` : "-",
-        stalenessByProject?.[p.id]?.behind ?? "-",
-        tornOutProjectIds?.has(p.id) ? "t" : "-",
-        onClose ? "x" : "-",
-      ].join(":");
-    })
+    .map((p) =>
+      tabMetricsSig(
+        p,
+        countsByProject[p.id],
+        stalenessByProject?.[p.id],
+        p.id === selectedProjectId,
+        tornOutProjectIds?.has(p.id) ?? false,
+        Boolean(onClose),
+      ),
+    )
     .join("|");
   useLayoutEffect(() => {
     const next: Record<string, { natural: number; chrome: number }> = {};
