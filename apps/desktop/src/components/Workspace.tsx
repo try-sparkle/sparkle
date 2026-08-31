@@ -1220,9 +1220,35 @@ export function Workspace() {
   // because the concierge is the row's MIDDLE column and has an outboard neighbour on each side;
   // `engine/columnResize` carries the reasoning and owns the toggle rule so the two seams cannot
   // implement it differently.
-  const [conciergeOverlay, setConciergeOverlay] = useState<ConciergeOverlaySide>(() =>
+  const [storedConciergeOverlay, setConciergeOverlay] = useState<ConciergeOverlaySide>(() =>
     readStoredConciergeOverlay(),
   );
+  // A LEFT OVERLAY NEEDS A LEFT NEIGHBOUR, and in the single-pair shell there is none: the
+  // concierge is the row's FIRST child, pinned to its left edge, and the left seam is not even
+  // rendered (`pairCount === 2` gates it). Floating leftward there anchors the panel by its right
+  // edge and pushes `docked + BOOST` px off the window — clipped, unreadable, and with no chevron
+  // in existence to bring it back. The state is persisted, so it would survive every relaunch.
+  //
+  // Reached two ways, which is why this is a CLAMP at render and not a one-off reset: overlay left
+  // in the two-pair cockpit and then drop to one pair, or simply relaunch with "left" in the store.
+  const conciergeOverlay: ConciergeOverlaySide =
+    storedConciergeOverlay === "left" && pairCount !== 2 ? null : storedConciergeOverlay;
+  // …and the STORED value is cleared, so a preference that cannot be honoured here does not come
+  // back on a relaunch that also has one pair. The clamp above is what decides the RENDER — this
+  // effect deliberately does not also reset the state, because then the clamp would be dead code
+  // that no test could distinguish from a working one (measured: removing the clamp changed
+  // nothing, because the reset had already docked the column by the time anything asserted).
+  // Leaving the live state alone also means assigning a second pair again in the same session
+  // restores what the user last chose in the layout where they chose it.
+  useEffect(() => {
+    if (storedConciergeOverlay === "left" && pairCount !== 2) {
+      try {
+        localStorage.removeItem(CONCIERGE_OVERLAY_KEY);
+      } catch {
+        /* no store, nothing to clear */
+      }
+    }
+  }, [storedConciergeOverlay, pairCount]);
   // A SEAM ASKS, THE ENGINE DECIDES. Each tab passes only which seam was clicked; whether that
   // docks the column or moves the overlay across is `nextConciergeOverlay`'s call, in one place.
   const toggleConciergeOverlay = (seam: "left" | "right") => {
@@ -2424,6 +2450,16 @@ export function Workspace() {
             // anchored to THIS box — the slot they came out of — rather than to whatever positioned
             // ancestor happened to be next up the tree.
             position: "relative",
+            // THE STACKING LEVEL BELONGS ON THE ZOOMED ELEMENT, and this is it. A computed `zoom`
+            // other than 1 makes this box establish a STACKING CONTEXT, which confines any
+            // `z-index` set on a descendant to the inside of the box — so putting the overlay's
+            // level on the floated child alone left the box itself at `z-index: auto` and paint
+            // order fell back to tree order among the row's positioned siblings. The neighbour the
+            // panel is supposed to cover painted OVER it, and only at 1.1x and above, which is
+            // exactly the kind of defect a jsdom suite and a default-zoom screenshot both miss.
+            // `AgentSidebar` carries `zoom` and `SIDEBAR_OVERLAY_Z` on the SAME element for this
+            // reason.
+            ...(conciergeOverlay ? { zIndex: SIDEBAR_OVERLAY_Z } : null),
           }}
         >
         {/* THE COLUMN'S CONTENTS, which are what actually float. Docked, this is an ordinary

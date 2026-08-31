@@ -107,6 +107,7 @@ import {
   OVERLAY_WIDTH_BOOST,
   windowAwareMax,
 } from "../engine/columnResize";
+import { SIDEBAR_OVERLAY_Z } from "./layers";
 import { applyVisualFixtures } from "../dev/visualFixtures";
 import { DEV_BYPASS_AUTH_FLAG } from "../dev/devBypassAuth";
 import { useProjectStore } from "../stores/projectStore";
@@ -1304,5 +1305,79 @@ describe("the concierge overlays OUTBOARD from whichever seam was pulled", () =>
     expect(rule).toContain("[data-concierge-inner] > section");
     // …and the element that selector names is the one that exists, rather than a stale spelling.
     expect(document.querySelector("[data-concierge-inner]")).toBe(inner());
+  });
+});
+
+// ── THE OVERLAY MUST NOT TRAP THE USER ────────────────────────────────────────────────────────
+//
+// Three ways a floated column can strand itself, all three found by review on the first cut and none
+// of them visible to a style assertion alone. They are grouped because they share one failure mode:
+// the panel is on screen, looks right, and the control that undoes it cannot be reached.
+describe("the concierge overlay always leaves a way back", () => {
+  beforeEach(() => localStorage.clear());
+
+  const inner = () => screen.getByTestId("concierge-inner");
+  const twoPairs = () =>
+    useUiStore.setState({ pairAssignment: { p1: "left" }, leftProjectId: "p1" } as never);
+
+  it("lifts the seam the column floated OVER, so its own chevron stays reachable", () => {
+    // A column growing outboard grows over the seam it was pulled from, overhanging it by hundreds
+    // of pixels against the rail's 6. Hover is detected ON THE RAIL, so a buried rail never fires
+    // it and the chevron never appears — the dock control is unreachable by mouse while remaining
+    // reachable by keyboard, which is what makes it a trap rather than an obviously dead control.
+    twoPairs();
+    render(<Workspace />);
+    // The rail IS the tab's root element — `testId` names it directly.
+    const rail = () => screen.getByTestId("concierge-pull-tab");
+    const docked = Number(rail().style.zIndex);
+    expect(docked).toBeLessThan(SIDEBAR_OVERLAY_Z);
+    fireEvent.click(screen.getByTestId("concierge-pull-tab-chevron"));
+    expect(Number(rail().style.zIndex)).toBeGreaterThan(SIDEBAR_OVERLAY_Z);
+  });
+
+  it("carries the stacking level on the element that carries the ZOOM", () => {
+    // A computed `zoom` other than 1 makes the box a stacking context, which CONFINES a z-index set
+    // on its child. With the level only on the floated child, the box stayed at `auto` and the
+    // neighbour the panel is meant to cover painted over it — at 1.1x and above only.
+    twoPairs();
+    render(<Workspace />);
+    const box = () => screen.getByTestId("concierge-box");
+    expect(box().style.zoom).toBeTruthy();
+    expect(box().style.zIndex).toBe("");
+    fireEvent.click(screen.getByTestId("concierge-pull-tab-chevron"));
+    expect(box().style.zIndex).toBe(String(SIDEBAR_OVERLAY_Z));
+  });
+
+  it("refuses a LEFT overlay when there is no left neighbour to cover", () => {
+    // Single pair: the concierge is the row's first child and the left seam is not rendered at all.
+    // Floating leftward anchors by the right edge and pushes the column off the window, clipped and
+    // unreadable, with no chevron in existence to bring it back — and the state is persisted, so it
+    // would survive every relaunch.
+    localStorage.setItem(CONCIERGE_OVERLAY_KEY, "left");
+    render(<Workspace />);
+    expect(screen.queryByTestId("left-pair-pull-tab-chevron")).toBeNull();
+    expect(inner().style.position).toBe("");
+    // …and the stored preference is cleared, so it does not silently reappear on the next launch
+    // that happens to have two pairs.
+    expect(localStorage.getItem(CONCIERGE_OVERLAY_KEY)).toBeNull();
+  });
+
+  it("still allows a RIGHT overlay with one pair — the neighbour on that side exists", () => {
+    // The paired case. Without it, "left is refused" would also pass for a build that had simply
+    // stopped overlaying at all in the single-pair shell.
+    localStorage.setItem(CONCIERGE_OVERLAY_KEY, "right");
+    render(<Workspace />);
+    expect(inner().style.position).toBe("absolute");
+    expect(inner().style.left).toBe("0px");
+  });
+
+  it("drops a live LEFT overlay when the second pair goes away", () => {
+    twoPairs();
+    render(<Workspace />);
+    fireEvent.click(screen.getByTestId("left-pair-pull-tab-chevron"));
+    expect(inner().style.right).toBe("0px");
+    // The pair count is not a launch-time constant: assignments change while the app is running.
+    act(() => useUiStore.setState({ pairAssignment: {}, leftProjectId: null } as never));
+    expect(inner().style.position).toBe("");
   });
 });

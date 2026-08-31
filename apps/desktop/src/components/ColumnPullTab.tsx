@@ -90,6 +90,7 @@ import { C } from "../theme/colors";
 import { RADIUS } from "../theme/scale";
 import { log } from "../logger";
 import { clampWidth, type ClampedBy } from "../engine/columnResize";
+import { SIDEBAR_OVERLAY_Z } from "./layers";
 
 /** Keyboard step, and the larger step when Shift is held. */
 const STEP = 8;
@@ -821,7 +822,7 @@ export function ColumnPullTab({
       // The tab keeps its own handler: it is a DESCENDANT, so a press there fires this too as it
       // bubbles, which `startResize` absorbs (see its `drag.current` guard).
       onPointerDown={overlaid ? undefined : startResize}
-      style={overlaid ? rail : railDraggable}
+      style={overlaid ? railOverlaid : railDraggable}
     >
       {/* THE SEAM FILL — the gap, painted. See `seamFill` on the props for why this is what the
           reported vertical line actually is, and why neither a border change nor a bleed on the row
@@ -1120,6 +1121,28 @@ const rail: CSSProperties = {
  *  boundary to drag. Only the cursor differs: the hit area is the rail's own 6px column, full height,
  *  so the affordance has to be visible for the whole of it or the reach is undiscoverable. */
 const railDraggable: CSSProperties = { ...rail, cursor: "col-resize", touchAction: "none" };
+
+/**
+ * THE RAIL WHILE ITS OWN COLUMN IS FLOATING OVER IT — the overlay must never hide its own way out.
+ *
+ * `overlaid` means this seam's column has left the flow and is painting at `SIDEBAR_OVERLAY_Z`. A
+ * column that grows OUTBOARD grows over the very seam it was pulled from, and it overhangs it by
+ * `OVERLAY_WIDTH_BOOST` — hundreds of pixels against this rail's 6. At `PULL_TAB_RAIL_Z` the rail
+ * is therefore buried: hover is detected ON THE RAIL, so a covered rail never fires it, the
+ * chevron and dot zone never appear, and the only control that docks the column again is
+ * unreachable by mouse. Keyboard focus still gets there, which is what makes it a trap rather than
+ * an obviously broken control — it is dead for exactly the users who cannot see why.
+ *
+ * `AgentSidebar` avoids this by mounting its tab INSIDE the floated element. The concierge cannot:
+ * `Workspace.resize.test.tsx`'s `assertRowStructure` pins the rails as siblings of the box, so the
+ * seams stay in the row while the column floats out of it. Lifting the rail above the overlay is
+ * the same guarantee reached from the other side, and it costs nothing while docked because this
+ * style is only used when `overlaid` is true.
+ *
+ * ABOVE `SIDEBAR_OVERLAY_Z` (25) BY CONSTRUCTION, not by a hand-picked number that could drift
+ * under it the next time either constant moves.
+ */
+const railOverlaid: CSSProperties = { ...rail, zIndex: SIDEBAR_OVERLAY_Z + 1 };
 
 /**
  * The seam fill's box — the rail's full height, PLUS one pixel into each neighbour.
