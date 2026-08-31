@@ -13,6 +13,9 @@ import {
   callerWorktreeRoot,
   outsideWorktreeMessage,
   isSessionOwnedWorktree,
+  sessionOwnedWorktrees,
+  misroutedRootEdit,
+  misroutedRootEditMessage,
   sessionIdForLedger,
   sessionPlanFile,
   isUnderPlansRoot,
@@ -628,6 +631,111 @@ describe("isSessionOwnedWorktree (real git worktrees on disk)", () => {
   });
 });
 
+// ── Misroute: editing the app-owned ROOT while a fresh named worktree exists (sparkle-tade76) ────
+//
+// The ownership check above admits writes INTO the worktree a session created. It cannot catch the
+// OPPOSITE mistake — the one that happened — where the session's cwd stayed on the app-owned root
+// after `git worktree add`, so an absolute-path Edit landed on the SHARED root instead of the
+// isolated worktree. `misroutedRootEdit` catches exactly that, keyed on the same verified ledger as
+// ownership (not a path shape), and the allowance and its PAIRED NEGATIVES are asserted together: an
+// allowance-only test passes for a predicate that fires on everything, and a block-only test passes
+// for one that never fires, so neither alone shows the rule guards what it claims.
+describe("misroutedRootEdit + sessionOwnedWorktrees (real git worktrees on disk)", () => {
+  const SESSION = "fa25cafd-4561-44b2-9748-d934ae26d235";
+  let tmp: string;
+  let repo: string; // the app-owned root checkout
+  let owned: string; // a worktree this session created and recorded, BESIDE the root
+  let nested: string; // …and one UNDER the root, the real `.claude/worktrees/<name>` layout
+  let ledgerDir: string;
+
+  const git = (cwd: string, ...args: string[]) =>
+    execFileSync("git", ["-C", cwd, ...args], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+      env: {
+        ...process.env,
+        GIT_AUTHOR_NAME: "t",
+        GIT_AUTHOR_EMAIL: "t@example.invalid",
+        GIT_COMMITTER_NAME: "t",
+        GIT_COMMITTER_EMAIL: "t@example.invalid",
+      },
+    });
+
+  beforeEach(() => {
+    tmp = realpathSync(mkdtempSync(join(tmpdir(), "wtguard-misroute-")));
+    repo = join(tmp, "repo");
+    mkdirSync(repo, { recursive: true });
+    git(repo, "init");
+    git(repo, "commit", "--allow-empty", "-m", "init");
+    owned = join(tmp, "sparkle-feature");
+    nested = join(repo, ".claude", "worktrees", "mine");
+    git(repo, "worktree", "add", owned, "-b", "feature/mine");
+    git(repo, "worktree", "add", nested, "-b", "feature/nested");
+    const common = git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir").trim();
+    ledgerDir = join(common, "sparkle-session-worktrees");
+    mkdirSync(ledgerDir, { recursive: true });
+    writeFileSync(join(ledgerDir, SESSION), `${owned}\n`);
+  });
+  afterEach(() => rmSync(tmp, { recursive: true, force: true }));
+
+  it("returns this session's verified owned worktree roots, and [] when it owns none", () => {
+    expect(sessionOwnedWorktrees(repo, SESSION)).toEqual([realpathSync(owned)]);
+    // No session id / no ledger → empty, so a caller reading the length fails closed.
+    expect(sessionOwnedWorktrees(repo, undefined)).toEqual([]);
+    rmSync(join(ledgerDir, SESSION));
+    expect(sessionOwnedWorktrees(repo, SESSION)).toEqual([]);
+  });
+
+  // THE POSITIVE: caller is on the app-owned root, the edit lands on a root file, and this session
+  // owns a fresh named worktree — a misroute. The descriptor names the worktree to redirect into.
+  it("flags an edit on the root when this session owns a fresh named worktree", () => {
+    const m = misroutedRootEdit(repo, SESSION, join(repo, "apps", "x.ts"));
+    expect(m).not.toBeNull();
+    expect(m!.worktree).toBe(realpathSync(owned));
+    // …and the message names that exact prefix (the bead's first recommendation).
+    expect(misroutedRootEditMessage(m)).toContain(`${realpathSync(owned)}/`);
+  });
+
+  // PAIRED NEGATIVE 1 — the edit is aimed INTO the owned worktree (an absolute path from a root cwd).
+  // That is precisely what the agent should do, so it must NOT be flagged.
+  it("does NOT flag an edit aimed into the owned worktree", () => {
+    expect(misroutedRootEdit(repo, SESSION, join(owned, "apps", "x.ts"))).toBeNull();
+  });
+
+  // PAIRED NEGATIVE 2 — the whole reason this is not "block every root edit": with NO recorded
+  // worktree, editing the root is ordinary work. If this returned a descriptor, the guard would
+  // refuse every agent that never created a worktree.
+  it("does NOT flag a root edit when this session owns no named worktree", () => {
+    rmSync(join(ledgerDir, SESSION));
+    expect(misroutedRootEdit(repo, SESSION, join(repo, "apps", "x.ts"))).toBeNull();
+  });
+
+  // PAIRED NEGATIVE 3 — the caller is correctly STANDING IN its own worktree (cwd there). A write to
+  // that worktree's own root file is correctly placed, not a misroute.
+  it("does NOT flag when the caller is operating inside its own worktree", () => {
+    expect(misroutedRootEdit(owned, SESSION, join(owned, "x.ts"))).toBeNull();
+  });
+
+  // The real layout: the worktree lives UNDER the root at `.claude/worktrees/<name>`. An edit to a
+  // root file OUTSIDE that subtree is still a misroute; an edit INTO the nested worktree is not.
+  it("handles a worktree nested under the root (the real .claude/worktrees layout)", () => {
+    writeFileSync(join(ledgerDir, SESSION), `${nested}\n`);
+    const m = misroutedRootEdit(repo, SESSION, join(repo, "scripts", "x.sh"));
+    expect(m).not.toBeNull();
+    expect(m!.worktree).toBe(realpathSync(nested));
+    expect(misroutedRootEdit(repo, SESSION, join(nested, "scripts", "x.sh"))).toBeNull();
+  });
+
+  // Ownership is a CLAIM re-verified against git: a rival's worktree recorded under ANOTHER session's
+  // id grants this session nothing, so a root edit by a session that recorded nothing stays allowed
+  // even while a sibling's ledger is populated.
+  it("does NOT flag on a worktree recorded by a DIFFERENT session", () => {
+    writeFileSync(join(ledgerDir, "99999999-2222-3333-4444-555555555555"), `${owned}\n`);
+    rmSync(join(ledgerDir, SESSION));
+    expect(misroutedRootEdit(repo, SESSION, join(repo, "apps", "x.ts"))).toBeNull();
+  });
+});
+
 // ── Plan mode: exactly THIS session's plan file (sparkle-hshjw, seen 3x) ─────────────────────────
 //
 // One `plans/` dir is shared by every concurrent agent, so the directory-level allowance that
@@ -781,7 +889,23 @@ describe("worktree-guard process decisions (exit codes, real git)", () => {
     ...extra,
   });
 
-  it("allows an edit in the caller's own worktree (unchanged behaviour)", () => {
+  // DEFECT C (bead sparkle-tade76). cwd is the app-owned ROOT checkout while THIS session created a
+  // fresh named worktree (recorded in the ledger by beforeEach). Editing the root here is the
+  // misroute the bead names: the edit lands on the shared checkout instead of the isolated worktree.
+  // Red before the fix — the containment allow exits 0, silently corrupting the app-owned tree.
+  it("blocks an edit on the app-owned ROOT when this session owns a fresh named worktree", () => {
+    const r = runGuard(edit(join(repo, "apps", "x.ts")));
+    expect(r.code).toBe(2);
+    // The remedy names the exact worktree path prefix to redirect under (the bead's first rec).
+    expect(r.stderr).toContain(realpathSync(owned));
+  });
+
+  // THE PAIRED NEGATIVE, and the reason this is not just "block every root edit": with NO recorded
+  // worktree, editing the root is ordinary work an agent launched in the checkout is entitled to do.
+  // If this flipped to 2, the guard would refuse every agent that never made a worktree.
+  it("allows an edit on the ROOT when this session owns NO named worktree", () => {
+    const common = git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir").trim();
+    rmSync(join(common, "sparkle-session-worktrees", SESSION));
     expect(runGuard(edit(join(repo, "apps", "x.ts"))).code).toBe(0);
   });
 

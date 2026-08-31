@@ -2970,31 +2970,31 @@ function isLedgerSessionId(id) {
   return typeof id === "string" && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(id) && !id.includes("..");
 }
 
-/** True iff `target` sits inside a worktree that THIS session created from THIS repository — see the
- *  block comment above for why ownership is two facts rather than a path shape. Fails closed (false)
- *  on every unknown: no session id, no ledger, no git, an unresolvable path. `sessionId` comes from
- *  the hook payload's `session_id`; `callerRoot` is the worktree the caller is operating in. */
-export function isSessionOwnedWorktree(callerRoot, sessionId, target) {
-  if (typeof callerRoot !== "string" || callerRoot.length === 0) return false;
-  if (typeof target !== "string" || target.length === 0) return false;
-  if (!isLedgerSessionId(sessionId)) return false;
+/** The REAL (symlink-resolved) roots of the worktrees THIS session created from THIS repository, in
+ *  ledger order. Empty on every unknown — no session id, no ledger, no git — so a caller reading the
+ *  length as "does this session own a fresh worktree" fails closed. This is the two-fact ownership
+ *  check of the block comment above, lifted out so both `isSessionOwnedWorktree` (does a target sit
+ *  inside one?) and `misroutedRootEdit` (is the caller editing the ROOT while owning one?) read the
+ *  SAME verified list rather than two copies that could drift. `callerRoot` supplies the git common
+ *  dir the ledger is keyed under and the repository every recorded path must still belong to. */
+export function sessionOwnedWorktrees(callerRoot, sessionId) {
+  if (typeof callerRoot !== "string" || callerRoot.length === 0) return [];
+  if (!isLedgerSessionId(sessionId)) return [];
   const commonRaw = gitCommonDir(callerRoot);
-  if (!commonRaw) return false; // no git / not a repo → cannot establish ownership → block
+  if (!commonRaw) return []; // no git / not a repo → cannot establish ownership
   const mine = realResolve(commonRaw);
-  if (mine === null) return false;
+  if (mine === null) return [];
   let ledger;
   try {
     ledger = readFileSync(`${mine}${sep}${SESSION_WORKTREE_LEDGER_DIR}${sep}${sessionId}`, "utf8");
   } catch {
-    return false; // this session recorded no worktrees
+    return []; // this session recorded no worktrees
   }
   const lines = ledger.split("\n").slice(0, SESSION_WORKTREE_LEDGER_MAX_LINES);
+  const roots = [];
   for (const line of lines) {
     const wt = line.trim();
     if (wt.length === 0 || !isAbsolute(wt)) continue;
-    // Containment first: it is the cheap check, and it is symlink-safe (a symlink inside the recorded
-    // worktree that points out of it resolves OUT and is rejected here, exactly as elsewhere).
-    if (!isInside(wt, target)) continue;
     // (b) The recorded path must still BE a worktree root of the caller's own repository. Both halves
     // matter: `--show-toplevel` from inside a subdirectory answers with the enclosing worktree, so
     // without the root comparison a ledger line naming any subdirectory of any worktree would pass.
@@ -3007,9 +3007,89 @@ export function isSessionOwnedWorktree(callerRoot, sessionId, target) {
     if (!theirsRaw) continue;
     const theirs = realResolve(theirsRaw);
     if (theirs === null || theirs !== mine) continue; // a different repository
-    return true;
+    roots.push(rWt);
   }
-  return false;
+  return roots;
+}
+
+/** True iff `target` sits inside a worktree that THIS session created from THIS repository — see the
+ *  block comment above for why ownership is two facts rather than a path shape. Fails closed (false)
+ *  on every unknown: no session id, no ledger, no git, an unresolvable path. `sessionId` comes from
+ *  the hook payload's `session_id`; `callerRoot` is the worktree the caller is operating in.
+ *  Containment is symlink-safe: a symlink inside a recorded worktree that points OUT of it resolves
+ *  out and is rejected by `isInside`, exactly as elsewhere. */
+export function isSessionOwnedWorktree(callerRoot, sessionId, target) {
+  if (typeof target !== "string" || target.length === 0) return false;
+  return sessionOwnedWorktrees(callerRoot, sessionId).some((wt) => isInside(wt, target));
+}
+
+// ── Misroute: editing the APP-OWNED ROOT while a fresh named worktree exists for this session ────
+//
+// WHY (bead sparkle-tade76). The ownership check above admits writes INTO the worktree an agent
+// created. It cannot catch the opposite mistake, which is the one that actually happened: after
+// `git worktree add … .claude/worktrees/<name>`, the session cwd and every default absolute path
+// still point at the app-owned ROOT checkout, so an Edit/Write by absolute path silently modified
+// the SHARED root worktree instead of the isolated one — corrupting a tree the app owns and losing
+// the isolation the worktree was created for. It was caught only when a later grep showed the
+// intended worktree still held the original bytes; recovery was a hand-rolled patch-and-revert.
+//
+// The containment check cannot see this, because from a root cwd the root IS `callerRoot` and a
+// write to a root file is genuinely "inside the caller's worktree" — so `main` allows it. The signal
+// that makes it a MISROUTE rather than legitimate root work is exactly the bead's condition: this
+// session created a fresh named worktree (it is in the ledger) and yet the edit is landing on the
+// root instead. Absent a recorded worktree there is no misroute — an agent that never made one is
+// entitled to edit the checkout it was launched in, so this must never fire on ordinary root work.
+//
+// This is a REDIRECT, not a security boundary (the ownership check above is that). So it fails OPEN:
+// any error establishing the misroute leaves the write to proceed exactly as it did before this
+// guard existed. But when it IS established it blocks (exit 2), because a silent nudge a PreToolUse
+// hook cannot make loud enough is what let the bug ship — and the message names the exact worktree
+// path prefix to redirect under, which is the bead's other recommendation.
+
+/** A misroute descriptor when `target` is being edited on the app-owned ROOT worktree while this
+ *  session owns a fresh named worktree it should be editing instead — else null. `callerRoot` is the
+ *  worktree the caller is operating in (the root, in the misroute case); `target` has already been
+ *  established as inside it. Null on every non-misroute AND on every uncertainty (fail open):
+ *   • the session owns no recorded worktree                       → not a misroute (ordinary root work)
+ *   • the caller IS standing in one of its own worktrees          → not a misroute (correctly placed)
+ *   • the target already sits inside one of its own worktrees     → not a misroute (correctly aimed) */
+export function misroutedRootEdit(callerRoot, sessionId, target) {
+  if (typeof callerRoot !== "string" || callerRoot.length === 0) return null;
+  if (typeof target !== "string" || target.length === 0) return null;
+  const owned = sessionOwnedWorktrees(callerRoot, sessionId);
+  if (owned.length === 0) return null; // no fresh named worktree → nothing to redirect to
+  const rCaller = realResolve(callerRoot);
+  for (const wt of owned) {
+    // The caller is operating INSIDE one of its own worktrees — the edit is correctly placed, and any
+    // target inside it is handled by the ordinary containment allow. Not a misroute.
+    if (rCaller !== null && rCaller === wt) return null;
+    // The edit is aimed INTO one of its own worktrees (e.g. an absolute path from a root cwd). That is
+    // exactly what the agent should be doing — not a misroute.
+    if (isInside(wt, target)) return null;
+  }
+  // The caller is editing the app-owned root while owning a fresh named worktree elsewhere. Redirect
+  // to the most recently recorded one (the last ledger line), which is the worktree just created.
+  return { callerRoot, target, worktree: owned[owned.length - 1] };
+}
+
+/** The refusal shown for a misrouted root edit. It NAMES the worktree path prefix to use for all
+ *  subsequent edits (bead sparkle-tade76's first recommendation) so the redirect is mechanical. */
+export function misroutedRootEditMessage(m) {
+  const wt = m?.worktree ?? "<your worktree>";
+  const target = m?.target ?? "<file>";
+  return (
+    `Blocked: this Edit/Write targets the app-owned ROOT checkout, but this session created its own ` +
+    `named worktree and should be editing THAT.\n\n` +
+    `  edit aimed at : ${target}\n` +
+    `  your worktree : ${wt}\n\n` +
+    `The root checkout is shared and app-owned; writing to it corrupts a tree you do not own and ` +
+    `loses the isolation your worktree exists for. Redirect this edit under your worktree — every ` +
+    `subsequent path should start with:\n\n` +
+    `  ${wt}/\n\n` +
+    `Run \`cd ${wt}\` and work from there, or rewrite the absolute path to sit under it. (This guard ` +
+    `keys on the worktree you recorded when you created it, not on a path shape; it fires only ` +
+    `because a fresh named worktree exists for this session.)\n`
+  );
 }
 
 /** The session id this guard may use as a ledger key — the hook payload's `session_id` and NOTHING
@@ -3757,7 +3837,24 @@ async function main() {
   } catch {
     inside = false;
   }
-  if (inside) process.exit(0);
+  if (inside) {
+    // Misroute guard (bead sparkle-tade76): the target IS inside the caller's worktree — but when
+    // that worktree is the app-owned ROOT and this session created its own named worktree, the write
+    // is landing on the shared checkout instead of the isolated one. Block with the path to redirect
+    // under. Fails OPEN: this is a redirect, not a security boundary, so any error here restores the
+    // pre-existing allow rather than blocking a legitimate root edit on a guard bug.
+    let misroute = null;
+    try {
+      misroute = misroutedRootEdit(callerRoot, sessionIdForLedger(payload, process.env), target);
+    } catch {
+      misroute = null;
+    }
+    if (misroute !== null) {
+      process.stderr.write(misroutedRootEditMessage(misroute));
+      process.exit(2); // exit code 2 → Claude Code blocks the tool call
+    }
+    process.exit(0);
+  }
   // Narrow allow-list (item 1j): permit writes to the two append-only per-agent note dirs that
   // live OUTSIDE every worktree by design (plan files and cross-session memory) so an agent can
   // record what it learned for the next agent. Safe because these are notes, not code, and

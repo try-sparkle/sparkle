@@ -87,6 +87,28 @@ declare module "*/worktree-guard.mjs" {
   // allow-list would admit a rival agent's worktree, which is what the guard exists to stop. Fails
   // closed on every unknown (sparkle-q39ja0, sparkle-6mpx2a).
   export function isSessionOwnedWorktree(callerRoot: unknown, sessionId: unknown, target: unknown): boolean;
+  // The REAL (symlink-resolved) roots of the worktrees THIS session created from THIS repository, in
+  // ledger order — the two-fact ownership check above, lifted out so it can also answer the misroute
+  // question. Empty on every unknown (no session id, no ledger, no git), so a caller reading the
+  // length fails closed.
+  export function sessionOwnedWorktrees(callerRoot: unknown, sessionId: unknown): string[];
+  // Non-null iff `target` is being edited on the app-owned ROOT worktree while THIS session owns a
+  // fresh named worktree it should be editing instead (bead sparkle-tade76) — a misroute. `worktree`
+  // names the recorded worktree to redirect under. Null on every non-misroute AND every uncertainty
+  // (fails OPEN): this is a redirect nudge, not a security boundary. `callerRoot` is the worktree the
+  // caller is operating in; `target` has already been established as inside it.
+  export function misroutedRootEdit(
+    callerRoot: unknown,
+    sessionId: unknown,
+    target: unknown,
+  ): { callerRoot: string; target: string; worktree: string } | null;
+  // The stderr text for a misrouted root edit. Names the exact worktree path prefix to redirect all
+  // subsequent edits under (bead sparkle-tade76's first recommendation).
+  export function misroutedRootEditMessage(m: {
+    callerRoot?: string;
+    target?: string;
+    worktree?: string;
+  } | null): string;
   // The session id this guard may use as a ledger key: the hook payload's `session_id` and nothing
   // else, or null when the payload cannot supply one. `env` is accepted and deliberately IGNORED —
   // the ledger's writer keys on the inherited `$CLAUDE_CODE_SESSION_ID`, which sibling agents
