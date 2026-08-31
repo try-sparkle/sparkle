@@ -470,12 +470,27 @@ describe("sweepEpics — the bounds that keep it from running away", () => {
     expect(s.restart).not.toHaveBeenCalled();
   });
 
-  it("treats UNKNOWN liveness as alive rather than as dead", async () => {
-    // A wrong "alive" costs one skipped tick. A wrong "dead" starts a rival orchestrator against an
-    // epic somebody is already building.
+  it("NAMES an unknown liveness rather than reading it as alive", async () => {
+    // ── THIS TEST USED TO ASSERT `orchestrator-alive`, AND THAT WAS THE BUG ───────────────────
+    // Its old rationale was "a wrong 'alive' costs one skipped tick. A wrong 'dead' starts a rival
+    // orchestrator against an epic somebody is already building." The second half is still true and
+    // is still honoured — the sweep does NOT restart here. The first half was false: the reading
+    // never improves for an orchestrator whose pane is never mounted again, so it was not one tick.
+    // It was 121 hours across 25 `in_progress` epics with zero work happening on any of them, until
+    // the founder came back from two days offline and asked why (bead `sparkle-kwl5r2.2`).
+    //
+    // The refusal to act is unchanged. What changed is the SENTENCE: `staffing-unknown` says "we
+    // could not establish who is on this", where `orchestrator-alive` claimed "somebody is on this"
+    // out of nobody having looked. Both skip; only one of them can be debugged from its own output,
+    // and only one of them refuses to CLEAR a `stalled` escalation (which `orchestrator-alive`
+    // does clear — a false all-clear retracting a real alarm).
+    //
+    // `alive: () => undefined` with no artifact evidence — `runtimeStore.agentMovement` is empty in
+    // this suite — is exactly the two-witness `null`. See `engine/orchestratorLiveness`.
     const s = scenario({ alive: () => undefined });
     const out = await s.run();
-    expect(out.find((o) => o.epicId === "e1")?.reason).toBe("orchestrator-alive");
+    expect(out.find((o) => o.epicId === "e1")?.reason).toBe("staffing-unknown");
+    expect(s.restart).not.toHaveBeenCalled();
   });
 
   it("skips a project whose board has not loaded, rather than reading it as empty", async () => {

@@ -55,6 +55,14 @@ import {
   type EpicPrdIndex,
 } from "./epicPrd";
 import { freshnessControl, resolveProbe } from "../engine/probeOutcome";
+import {
+  epicOrchestratorLiveness,
+  epicRestartRemedy,
+  orchestratorLivenessOf,
+  ORCHESTRATOR_SILENT_MS,
+} from "../engine/orchestratorLiveness";
+import { deathCauseForAgent } from "./deadSessionRegistry";
+import type { DeathCause } from "../engine/deathTypes";
 import { useBeadsStore, beadsReadStartedAt } from "../stores/beadsStore";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
@@ -313,7 +321,29 @@ export interface EpicSweepOutcome extends EpicSweepDecision {
    */
   relaunched?: boolean;
   /** Why nothing was performed despite a non-skip decision. */
-  note?: "capped" | "at-capacity" | "write-failed" | "spawn-failed" | "cannot-notify" | "disabled";
+  note?:
+    | "capped"
+    | "at-capacity"
+    | "write-failed"
+    | "spawn-failed"
+    | "cannot-notify"
+    | "disabled"
+    /**
+     * THE ORCHESTRATOR IS BEHIND AN ACCOUNT WALL, so a restart cannot help — the door opens on the
+     * account's own clock (`wall-session`) or when a human raises a cap (`wall-spend`), and neither
+     * is moved by spawning. Nothing is stamped and nothing is escalated: the epic stays fully
+     * eligible and the next tick re-asks, exactly as `cannot-notify` does. Escalating instead would
+     * put a false alarm in the Blocked lane for an epic with nothing wrong with it, and stamping
+     * would spend its one-shot budget on an attempt that was never made.
+     */
+    | "wall"
+    /**
+     * A PERSON is what the orchestrator is waiting on — it stopped on a real question
+     * (`blocked-on-human`) or a human deliberately stopped it (`human-stopped`). Restarting re-asks
+     * nothing and overrides a stated decision, so the sweep declines, exactly as
+     * `deathTypes.isResurrectable` refuses both.
+     */
+    | "human-blocked";
   /**
    * Did the founder actually GET the notice? Absent when none was owed.
    *
@@ -404,6 +434,34 @@ export interface EpicSweepOptions {
    */
   clock?: () => number;
   aliveFor?: (agentId: string) => boolean | undefined;
+  /**
+   * THE SECOND WITNESS. When an agent's hook log last recorded anything, per `fleet_digest`.
+   *
+   * Defaults to `runtimeStore.agentMovement[agentId]?.lastEventMs`, which `services/fleetWatch`
+   * refreshes every `FLEET_POLL_INTERVAL_MS` over `knownAgents.openAgentIdSet()` — the APP-WIDE
+   * open set, which deliberately does NOT narrow to what this window can see. That population is
+   * precisely the orchestrators `aliveFor` cannot answer for, which is why this closes the gap
+   * rather than restating it.
+   *
+   * `undefined` for an agent the last digest tick did not cover — a cloud agent, one with no
+   * worktree, or any agent at all before the first poll lands. That reads as NO ARTIFACT, and with
+   * no observation either the staffing verdict is `null` (`skip: staffing-unknown`), which is
+   * fail-closed and names the missing reading instead of manufacturing an all-clear.
+   */
+  lastHookEventFor?: (agentId: string) => number | null | undefined;
+  /** How long an orchestrator may be silent before it stops counting as staffing its epic.
+   *  Defaults to {@link ORCHESTRATOR_SILENT_MS}; injected by tests so a fixture can state a window
+   *  instead of moving a clock an hour. */
+  orchestratorSilentMs?: number;
+  /**
+   * WHY the bound orchestrator died, per `engine/deathRecord.classifyDeath`.
+   *
+   * Defaults to `deadSessionRegistry.deathCauseForAgent`, which reads this window's observations
+   * and falls back to the DURABLE `agent-life` ledger republished by `revival_due` — so a
+   * fleet-wide death that no surviving pane witnessed still has a cause. The sweep uses it for one
+   * decision only: whether a restart is the remedy at all. It classifies nothing itself.
+   */
+  deathCauseFor?: (agentId: string) => DeathCause | undefined;
   restart?: (projectId: string, epicId: string) => Promise<BuildHandoff>;
   /** The durable audit note. Defaults to a `bd comment` on the epic. Injected by tests, and
    *  best-effort in production — see the call site for why a failed note must not undo a restart. */
@@ -522,6 +580,24 @@ export function candidateFor(
    * board frozen for 2h20m (bead `sparkle-rk0k8o`).
    */
   beadsObserved = true,
+  /**
+   * THE SECOND WITNESS: artifact evidence that this epic's orchestrator has actually acted.
+   *
+   * OPTIONAL, AND ABSENCE KEEPS THE OLD ONE-WITNESS READING — but production ALWAYS passes it (see
+   * `sweepEpics`), so the default is reachable only from a direct unit call that states its facts
+   * about the status map alone. It is not a feature flag and must never be used as one: the whole
+   * measured failure (bead `sparkle-kwl5r2.2`) is what the one-witness reading answers.
+   *
+   * `lastHookEventFor` returns `MovementEvidence.lastEventMs` — when that agent's hook log last
+   * recorded anything, read off disk by `fleet_digest` with no pane mounted — or null/undefined for
+   * no reading. See `engine/orchestratorLiveness` for the join and for why a measurement outranks a
+   * latched status.
+   */
+  staffing?: {
+    lastHookEventFor: (agentId: string) => number | null | undefined;
+    now: number;
+    silentMs?: number;
+  },
 ): EpicSweepCandidate {
   const bound = boundAgentsFor(agents, epic.id);
   // UNKNOWN LIVENESS COUNTS AS ALIVE. `processAliveFor` returns undefined for an agent this window
@@ -531,7 +607,32 @@ export function candidateFor(
   // AN UNREAD ROSTER IS NOT AN EMPTY ONE. `boundAgentsFor` over a placeholder list returns nothing,
   // which is indistinguishable from a genuinely unstaffed epic — so the distinction has to come
   // from the caller, and it is carried as `null` rather than folded into `false`.
-  const orchestratorAlive = rosterRead ? bound.some((a) => alive(a.id) !== false) : null;
+  // ── TWO WITNESSES, AND THE MEASUREMENT OUTRANKS THE LATCH ─────────────────────────────────
+  // AN UNREAD ROSTER IS NOT AN EMPTY ONE. `boundAgentsFor` over a placeholder list returns nothing,
+  // which is indistinguishable from a genuinely unstaffed epic — so the distinction has to come
+  // from the caller, and it is carried as `null` rather than folded into `false`.
+  //
+  // WITH THE SECOND WITNESS (production always supplies it) the answer joins the window-local
+  // status map with the hook log `fleet_digest` reads off disk. The old expression is kept below
+  // for a direct unit call that supplies no artifacts, and it is the bug: `alive()` returns
+  // `undefined` for an orchestrator whose pane this window is not hosting, `undefined !== false` is
+  // `true`, so an epic read STAFFED on the strength of nobody having looked — for 121 hours across
+  // 25 epics, until a human noticed (bead `sparkle-kwl5r2.2`). A fleet-wide death is exactly the
+  // case that produces it: with every pane gone there is no observer left, so the one moment the
+  // sweep is most needed is the one moment it was guaranteed to say nothing.
+  const orchestratorAlive = !rosterRead
+    ? null
+    : staffing === undefined
+      ? bound.some((a) => alive(a.id) !== false)
+      : epicOrchestratorLiveness(
+          bound.map((a) =>
+            orchestratorLivenessOf(
+              { observedAlive: alive(a.id), lastHookEventMs: staffing.lastHookEventFor(a.id) },
+              staffing.now,
+              staffing.silentMs,
+            ),
+          ),
+        );
   return {
     epicId: epic.id,
     beadsObserved,
@@ -810,6 +911,16 @@ export async function sweepEpics(opts: EpicSweepOptions = {}): Promise<EpicSweep
       const rt = useRuntimeStore.getState();
       return processAliveFor(agentId, rt.status, new Set(rt.openAgentIds));
     });
+  // THE ARTIFACT WITNESS, read from the map `services/fleetWatch` publishes off `fleet_digest`. It
+  // needs no pane and costs no agent turn, which is the entire reason it can answer for the
+  // orchestrators `aliveFor` cannot. `setAgentMovement` is WHOLE-MAP by contract — an agent missing
+  // from a tick has no evidence THIS tick and must not keep a previous one's — so `undefined` here
+  // is honestly "no reading", never a stale claim of life.
+  const lastHookEventFor =
+    opts.lastHookEventFor ??
+    ((agentId: string) => useRuntimeStore.getState().agentMovement[agentId]?.lastEventMs);
+  const orchestratorSilentMs = opts.orchestratorSilentMs ?? ORCHESTRATOR_SILENT_MS;
+  const deathCauseFor = opts.deathCauseFor ?? deathCauseForAgent;
 
   const projects = opts.projects ?? useProjectStore.getState().projects;
   const outcomes: EpicSweepOutcome[] = [];
@@ -901,7 +1012,11 @@ export async function sweepEpics(opts: EpicSweepOptions = {}): Promise<EpicSweep
       }
       // `rosterRead` stays true — the roster is an in-memory read that cannot fail here; the fifth
       // argument is the board reading, which can and did.
-      const candidate = candidateFor(beads, project.agents, epic, aliveFor, true, beadsObserved);
+      const candidate = candidateFor(beads, project.agents, epic, aliveFor, true, beadsObserved, {
+        lastHookEventFor,
+        now,
+        silentMs: orchestratorSilentMs,
+      });
       const decision = decideEpicSweep(candidate, now, stallMs, maxAgeMs, hollowMs);
       const out: EpicSweepOutcome = { ...decision, projectId: project.id, performed: "none" };
 
@@ -1079,6 +1194,41 @@ export async function sweepEpics(opts: EpicSweepOptions = {}): Promise<EpicSweep
       }
 
       if (action === "restart") {
+        // ── A RESTART IS ONE REMEDY, NOT THE DEFAULT ONE ───────────────────────────────────────
+        // CHECKED FIRST IN THIS BRANCH, ABOVE THE NOTIFIER GATE AND ABOVE `stamp`, because both of
+        // those are things you do once you have decided to spend — and this is the decision.
+        //
+        // The staffing verdict above established that NOBODY IS DRIVING THIS EPIC. It says nothing
+        // about WHY, and the why decides whether a restart can possibly help. Conflating the death
+        // modes is the trap: this app has already measured 2,273 account-wall records across 1,102
+        // sessions, one session retrying into a closed door 45 times (`engine/deathTypes`). A
+        // fleet-wide wall gates EVERY LLM in the app behind the same account limit, so it is
+        // precisely when the fleet is most tempted to hammer — and a spawn moves neither the
+        // account's reset clock nor the human who raises a spend cap.
+        //
+        // The classification is not made here. `engine/deathRecord.classifyDeath` made it, the
+        // durable `agent-life` ledger holds it, and `deadSessionRegistry.deathCauseForAgent`
+        // republishes it — including for a death no surviving pane witnessed, which is the
+        // fleet-wide case. This reads that verdict and maps it onto the one question the epic sweep
+        // has to answer. A second classifier over the same strings would be a second opinion, which
+        // this repo ranks as worse than none.
+        //
+        // NEITHER REFUSAL STAMPS AND NEITHER ESCALATES, and both halves of that are deliberate.
+        // Stamping would spend the epic's one-shot `sweep-restarted` budget on an attempt that was
+        // never made. Escalating would put a `stalled` mark in the founder's Blocked lane for an
+        // epic that is merely waiting out an account limit — a false alarm in the one lane that
+        // must only ever hold real ones. The epic stays fully eligible and the next tick re-asks,
+        // exactly as the `cannot-notify` refusal below does.
+        const remedy = epicRestartRemedy(
+          boundAgentsFor(project.agents, epic.id).map((a) => deathCauseFor(a.id)),
+        );
+        if (remedy !== "restart") {
+          const note = remedy === "wall" ? "wall" : "human-blocked";
+          log.info("epics", "a restart is not the remedy for this epic", { epic: epic.id, note });
+          outcomes.push({ ...out, note });
+          continue;
+        }
+
         // ── DECIDE BEFORE SPENDING, NOT AFTER ──────────────────────────────────────────────────
         // A restart spends two irreversible things — an agent slot and this epic's one-shot
         // `sweep-restarted` budget — and its whole point is that the founder is TOLD. In a
