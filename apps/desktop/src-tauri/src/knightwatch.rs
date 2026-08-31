@@ -418,8 +418,10 @@ fn backticked_after(s: &str, marker: &str) -> Option<String> {
 /// spends a full Claude session on that PR every cooldown window forever. Depth-1-only makes the
 /// quote state NO coverage, so `evaluate` skips past it to the real review underneath.
 ///
-/// `is_knightwatch` is deliberately NOT touched: it is the frozen shared contract that the fixture
-/// corpus and a second shell implementation both assert against.
+/// `is_knightwatch` has SINCE been anchored (the frozen contract moved, corpus and shell twin
+/// together), so a pure quote-reply no longer reaches this function as a review at all. The nesting
+/// rule is not thereby retired: the shape it still guards is a GENUINE review — leading marker, so a
+/// review whatever the anchor says — that quotes an older round underneath its own status.
 fn first_level_quote(line: &str) -> Option<&str> {
     let rest = line.trim_start().strip_prefix('>')?;
     let rest = rest.strip_prefix(' ').unwrap_or(rest);
@@ -500,6 +502,55 @@ fn dequote(line: &str) -> &str {
 #[cfg(test)]
 fn has_unquoted_marker(body: &str, marker: &str) -> bool {
     body.lines().any(|l| !is_blockquoted(l) && l.contains(marker))
+}
+
+/// Does some NON-blockquoted line START WITH `marker`?
+///
+/// CAN THIS COMMENT ANSWER A PROBE? A DIFFERENT QUESTION FROM "IS IT A REVIEW", and conflating the
+/// two fails OPEN. [`is_knightwatch`] is anchored, which is right for review IDENTITY — a quotation
+/// is not a review. The replier set used to be screened by that same test, and that was safe only
+/// while it was `contains`: every marker-carrying comment was then a review, so `review_positions`
+/// provably excluded them all and no further filter was needed. Anchoring retired that guarantee
+/// silently. A review with anything above its marker (a model preamble — the shape
+/// `scripts/pr-review.sh` now hoists away) is no longer a review, so it falls INSIDE the previous
+/// review window, and its own re-review prose ("Probe 1 from the prior round is addressed", a
+/// phrasing [`SPARKLE_REVIEW_MARKER`]'s own doc says the reviewer is actively steered toward) then
+/// ANSWERS the probe it was reviewing. The bot clears its own gate — the one thing rule 3 exists to
+/// prevent — and it fails toward MERGE.
+///
+/// So the replier screen is structural, SEPARATE, and LINE-ANCHORED. That one test dominates the
+/// two weaker forms this went through, and arriving at it took three rounds because each weaker
+/// form left a residual class:
+///
+///   * the BODY anchor ([`is_knightwatch`]) misses a marker with a PREAMBLE above it;
+///   * marker-ALONE-on-a-line misses a marker with TRAILING CONTENT after it on that line;
+///   * their UNION still misses a post with BOTH at once — which is neither a review (so it opens
+///     no window and falls INSIDE the previous one) nor screened, breaking the windowed and the
+///     durable arm together.
+///
+/// Line-anchored closes all three: a body-leading marker starts line 1, and a marker alone on a
+/// line starts that line, so it implies both.
+///
+/// DELIBERATELY NOT [`has_unquoted_marker`] AND NOT A FLAT `contains` — both are the obvious fix and
+/// both are wrong here: they re-drop a human reply that merely MENTIONS the marker mid-sentence
+/// while explaining what was checked, which is the defect anchoring was introduced to fix. A
+/// mid-sentence mention is BY CONSTRUCTION not at line start, and a quote-reply is blockquoted, so
+/// both keep answering — line-anchoring was never what broke that reply, `contains` was.
+///
+/// Residual, stated: someone who begins a line with the marker while genuinely answering is dropped
+/// and told to cite the probe again — recoverable in one edit, unlike a silent merge past a
+/// `[blocking]` probe. The same trade [`is_foreign_gate_record`] already makes. Pinned on both
+/// implementations by `preamble-review-cannot-answer-the-previous-round.json`,
+/// `trailing-content-on-the-marker-line-cannot-answer.json` and
+/// `preamble-and-trailing-content-cannot-answer.json` — one per residual class.
+fn has_marker_led_line(body: &str, marker: &str) -> bool {
+    body.lines().any(|l| !is_blockquoted(l) && l.trim_start().starts_with(marker))
+}
+
+/// Is this comment a reviewer's own post — a review, or one that failed the anchored review test
+/// only because something sits above its marker? Such a comment may never ANSWER a probe.
+fn is_reviewer_post(body: &str) -> bool {
+    has_marker_led_line(body, REVIEW_MARKER) || has_marker_led_line(body, SPARKLE_REVIEW_MARKER)
 }
 
 /// Is EVERY occurrence of `marker` inside a blockquote run that CONTINUES PAST IT with non-empty
@@ -791,11 +842,14 @@ fn evaluate(comments: &[Comment]) -> ProbeGate {
         //   * "after THIS review, before the NEXT one" — a reply that lands after the next review
         //     answers that one, not this one (probe numbering restarts, so "Probe 1" in round 3 is
         //     a different probe from "Probe 1" in round 1).
-        //   * "NON-knightwatch" — `review_positions` holds EVERY marker-carrying index, so this
-        //     half-open range provably contains none of them. A later `.filter(|c|
-        //     !is_knightwatch(…))` here would be dead code, and dead code that looks like a guard is
-        //     worse than none: a mutation test proved the filter and the window each masked the
-        //     other's failure, so removing it is what makes the window's own tests able to fail.
+        //   * "NON-knightwatch" — this USED to be free. `review_positions` held EVERY
+        //     marker-carrying index while `is_knightwatch` was `contains`, so the half-open range
+        //     provably contained none of them and a filter here would have been dead code. ANCHORING
+        //     `is_knightwatch` RETIRED THAT GUARANTEE: a reviewer post with anything above its
+        //     marker is no longer a review, so it is no longer in `review_positions` and it DOES
+        //     land in this range — where its own re-review prose would answer the probe it was
+        //     reviewing. The filter below is therefore live, not decorative, and
+        //     `preamble-review-cannot-answer-the-previous-round.json` is what fails without it.
         let window_end = review_positions.get(nth + 1).copied().unwrap_or(comments.len());
         // THE ONE EXCLUSION the window cannot make for us: this module's OWN override records.
         // They carry [`OVERRIDE_MARKER`], not [`REVIEW_MARKER`], so they are ordinary replies as far
@@ -822,7 +876,9 @@ fn evaluate(comments: &[Comment]) -> ProbeGate {
         let repliers: Vec<&Comment> = comments[pos + 1..window_end]
             .iter()
             .filter(|c| {
-                !c.body.trim_start().starts_with(OVERRIDE_MARKER) && !is_foreign_gate_record(&c.body)
+                !c.body.trim_start().starts_with(OVERRIDE_MARKER)
+                    && !is_foreign_gate_record(&c.body)
+                    && !is_reviewer_post(&c.body)
             })
             .collect();
 
@@ -838,7 +894,14 @@ fn evaluate(comments: &[Comment]) -> ProbeGate {
                     .iter()
                     .skip(pos + 1)
                     .filter(|c| {
-                        !is_knightwatch(&c.body)
+                        // BOTH SCREENS, OR-ed. [`is_reviewer_post`] is now LINE-anchored and so
+                        // DOMINATES [`is_knightwatch`] — a body-leading marker necessarily starts
+                        // line 1 — which makes this OR redundant TODAY. It is kept anyway and
+                        // deliberately: this is the arm that reaches ACROSS windows, so it is the
+                        // one whose fail-open clears an EARLIER round's `[blocking]` probe, and it
+                        // has already been broken twice by a screen weakened underneath it.
+                        // Redundancy here costs one boolean.
+                        !(is_knightwatch(&c.body) || is_reviewer_post(&c.body))
                             && !c.body.trim_start().starts_with(OVERRIDE_MARKER)
                             && !is_foreign_gate_record(&c.body)
                     })
