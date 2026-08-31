@@ -751,7 +751,7 @@ export function describeIssues(issues: readonly z.ZodIssue[]): string {
 /** One op: its argument schema and what to do with the parsed value. */
 type Handler = ((raw: unknown, ctx: OpContext) => Promise<ConciergeToolReply>) & {
   /**
-   * The op's own argument schema, hung on the handler so DISPATCH can reach it.
+   * THE PREFLIGHT SCHEMA — what DISPATCH may reject early, hung on the handler so it can reach it.
    *
    * It used to be reachable only from inside the closure below, which meant validation could not
    * happen until the handler ran — i.e. after the policy layer had already minted an approval card
@@ -759,6 +759,10 @@ type Handler = ((raw: unknown, ctx: OpContext) => Promise<ConciergeToolReply>) &
    * `.strict()` was always going to reject, and approving it would spend the single-use grant on
    * something that could not run. Exposing the schema is what lets the gate order be fixed without
    * every one of the 96 routes having to declare its schema twice.
+   *
+   * For an ordinary {@link route} this IS the op's whole contract, byte for byte. It differs only
+   * for a route built with {@link routeOwningRefusal}, where the fields that route names as its own
+   * are relaxed to optional HERE so the call gets past dispatch and reaches the op that teaches.
    */
   schema: z.ZodType<unknown>;
 };
@@ -767,17 +771,95 @@ function route<T>(
   schema: z.ZodType<T>,
   run: (value: T, ctx: OpContext) => ConciergeToolReply | Promise<ConciergeToolReply>,
 ): Handler {
+  return buildHandler(schema, run);
+}
+
+/** `T` as the handler actually receives it: the owned fields may be absent, because letting them be
+ *  absent is the whole point — the op is about to say something useful about that. */
+type RelaxOwned<T, F extends keyof T> = Omit<T, F> & { [K in F]?: T[K] };
+
+/**
+ * A route that declares fields REQUIRED and still owns their refusal (bead `sparkle-vphgrl`).
+ *
+ * ══ THE PROBLEM ════════════════════════════════════════════════════════════════════════════════
+ * `dispatchConciergeTool`'s GATE 2 preflights every call against the route's schema before any
+ * domain code runs — deliberately, so a malformed call cannot mint an approval card (bead
+ * `sparkle-jjm27e`). The cost is that a `z.string()` field answers its own absence with
+ * `` bad-args: `epicDecision`: Required `` and nothing else. An op whose refusal has to compute
+ * something — candidate epics from a store read, the live options, the alternative that actually
+ * works — can never reach the code that computes it. So the author picks: a machine-checkable
+ * contract, or an error the caller can act on. AGENTS.md's "a refusal is an instruction the caller
+ * will follow" says which one loses, and it is the wrong one to lose.
+ *
+ * ══ THE SEAM ═══════════════════════════════════════════════════════════════════════════════════
+ * Two schemas out of one declaration. The CONTRACT is what you write, in one place, where anyone
+ * reading or grepping the op finds it — required means required. The PREFLIGHT is that contract with
+ * exactly `ownRefusal`'s fields relaxed to optional, and it is what dispatch gets. A call missing one
+ * of them therefore passes the gate, reaches `run`, and is refused by the op — which can read
+ * whatever it likes first. The preflight is derived, never written, so the two cannot be edited apart.
+ *
+ * ══ THE INVARIANT, ENFORCED AT IMPORT ══════════════════════════════════════════════════════════
+ * Every named field must be REQUIRED in the contract, or this throws while the route table is being
+ * built — i.e. the moment anything imports this module, including every test. That is the guard the
+ * workaround it replaces did not have: `.optional()` plus a domain refusal is one "tightening"
+ * commit away from silently deleting the informative refusal, and nothing fails.
+ *
+ * ONE runtime check, deliberately. The two others this used to carry are things the TYPES already
+ * say and say EARLIER: a name that is not in the contract is a compile error (`F extends keyof T`),
+ * and a `.refine`/`.transform` wrapper cannot be passed at all now the parameter is a `ZodObject`
+ * rather than a `ZodType` — which is what makes reaching inside such a wrapper, and silently
+ * dropping its check, unexpressible instead of merely refused. What is left is `isOptional()`, the
+ * one thing the type system cannot state, and it is the invariant this seam is actually about.
+ *
+ * The relaxation itself is `partial(mask)` and nothing else, so `.strict()`, `.min()` and every
+ * other constraint survive — relaxing more than was asked for is how a validation hole gets opened
+ * by a helper nobody re-reads.
+ */
+function routeOwningRefusal<T extends object, F extends keyof T & string>(
+  contract: z.ZodObject<z.ZodRawShape, z.UnknownKeysParam, z.ZodTypeAny, T>,
+  ownRefusal: readonly F[],
+  run: (
+    value: RelaxOwned<T, F>,
+    ctx: OpContext,
+  ) => ConciergeToolReply | Promise<ConciergeToolReply>,
+): Handler {
+  for (const f of ownRefusal) {
+    // `isOptional()` is zod's own "would this accept undefined" — so this is the requirement itself
+    // being checked, not a restatement of it.
+    if (contract.shape[f]?.isOptional() !== false) {
+      throw new Error(
+        `routeOwningRefusal names \`${f}\`, which the contract does not declare as a REQUIRED ` +
+          "field. Owning a refusal means declaring the field required and answering its absence " +
+          "yourself; an optional field has nothing to own.",
+      );
+    }
+  }
+  const mask = Object.fromEntries(ownRefusal.map((f) => [f, true as const]));
+  return buildHandler(
+    contract.partial(mask as never) as unknown as z.ZodType<unknown>,
+    run as (v: T, c: OpContext) => ConciergeToolReply | Promise<ConciergeToolReply>,
+  );
+}
+
+function buildHandler<T>(
+  preflight: z.ZodType<unknown>,
+  run: (value: T, ctx: OpContext) => ConciergeToolReply | Promise<ConciergeToolReply>,
+): Handler {
   const handler = (async (raw, ctx) => {
     // STILL PARSED HERE, and deliberately not skipped when dispatch has already parsed. This is
     // belt-and-braces of the cheap kind: `parseArgs` is pure and the schemas are small, so paying
     // for it twice costs nothing measurable, while a handler that trusted a caller to have
     // validated would be one refactor away from running on unvalidated input. The handler stays
     // safe to call directly — which every one of this file's own route tests does.
-    const parsed = parseArgs(ctx, schema, raw);
+    //
+    // AND IT PARSES THE PREFLIGHT, NOT THE CONTRACT. Re-parsing the contract here would put the
+    // generic `bad-args` back on the path one line before the op that was going to teach — the
+    // exact defect this seam removes, re-introduced in the name of strictness.
+    const parsed = parseArgs(ctx, preflight, raw);
     if (!parsed.ok) return parsed.reply;
-    return run(parsed.value, ctx);
+    return run(parsed.value as T, ctx);
   }) as Handler;
-  handler.schema = schema as z.ZodType<unknown>;
+  handler.schema = preflight;
   return handler;
 }
 
@@ -2054,23 +2136,32 @@ const beadPriority = z.number().int().min(0, "priority is 0-4 (0 = highest)").ma
  * `create_item`'s arguments — AND THE EPIC GATE (bead `sparkle-xelans.3`).
  *
  * `epicDecision` / `epicReason` are the required-argument half of the founder's ruling: the
- * concierge cannot file a task without stating whether it belongs under an epic, and why. The
- * enforcement is REAL — `board.createItem` refuses and files nothing without them — but it lives in
- * the DOMAIN rather than in this schema, and the `.optional()` below is that decision, not laxity.
+ * concierge cannot file a task without stating whether it belongs under an epic, and why. They are
+ * REQUIRED HERE, and the enforcement is STILL the domain's — `board.createItem` refuses and files
+ * nothing without them. Both at once is the point.
  *
- * WHY. Dispatch preflights every call against this schema (see `dispatchConciergeTool`'s GATE 2), so
- * a `z.string()` here would answer a missing decision with `bad-args: \`epicDecision\`: Required`
- * and nothing else. The bead's whole point is that the refusal COMPUTES AND RETURNS CANDIDATE
- * EPICS — "a refusal that just says required teaches nothing" — and candidates need a store read,
- * which a zod message cannot do. So the parse is lenient by exactly two fields and the domain owns
- * the verdict. `.strict()` still applies: a misspelled `epic_decision` is refused, not ignored.
+ * WHY IT TAKES A SEAM (bead `sparkle-vphgrl`). Dispatch preflights every call against the route's
+ * schema (see `dispatchConciergeTool`'s GATE 2), so for as long as one schema did both jobs, a
+ * `z.string()` here answered a missing decision with `bad-args: \`epicDecision\`: Required` and
+ * nothing else — and the bead's whole point is that the refusal COMPUTES AND RETURNS CANDIDATE
+ * EPICS ("a refusal that just says required teaches nothing"), which needs a store read a zod
+ * message cannot do. The fields were therefore `.optional()` with a comment explaining that they
+ * were not: true, unenforceable, and one "tightening" commit away from deleting the refusal.
+ * `routeOwningRefusal` below states the requirement here and relaxes it for the PREFLIGHT ONLY, so
+ * the call still reaches the domain that teaches. `.strict()` still applies to both schemas: a
+ * misspelled `epic_decision` is refused, not ignored.
+ *
+ * NO `.min(1)` ON EITHER, deliberately. Relaxation lifts required-ness and nothing else, so a
+ * length floor here would answer `epicDecision: ""` with a generic `bad-args` — putting back the
+ * untaught refusal for the caller who tried hardest to comply. The domain reads an empty decision
+ * and an empty reason and has a separate sentence for each.
  */
 const createItemArgs = boardWriteScope.extend({
   title: z.string().min(1, "a title is required"),
   body: z.string().optional(),
   priority: beadPriority.optional(),
-  epicDecision: z.string().optional(),
-  epicReason: z.string().optional(),
+  epicDecision: z.string(),
+  epicReason: z.string(),
 });
 
 /** At least one field must actually change — `.refine` rather than all-optional, so an empty update
@@ -2151,7 +2242,11 @@ const BOARD_ROUTES: Record<BoardOp, Handler> = {
     ),
   ),
   // The writes resolve through `withProject` — no store fallback. See boardWriteScope.
-  create_item: route(createItemArgs, (a, ctx) =>
+  //
+  // `routeOwningRefusal`, not `route`: the two epic fields are REQUIRED by `createItemArgs` and
+  // their absence is answered by `board.createItem`, which lists the candidate epics a zod
+  // `Required` cannot. See `createItemArgs` and bead `sparkle-vphgrl`.
+  create_item: routeOwningRefusal(createItemArgs, ["epicDecision", "epicReason"], (a, ctx) =>
     withProject(ctx, a.projectId, async (p) =>
       fromBoard(
         ctx,
@@ -2984,6 +3079,11 @@ export async function dispatchConciergeTool(
     // Pure — `parseArgs` reads nothing and writes nothing — so running it this early costs only the
     // parse. Both refusals below leave the approval ledger untouched, which is the whole point of
     // the change: see this function's gate-order docstring for the incident.
+    //
+    // `handler.schema` IS THE PREFLIGHT SCHEMA, which for most ops is the whole contract and for a
+    // `routeOwningRefusal` op is the contract minus the fields that op refuses itself (bead
+    // `sparkle-vphgrl`). Preflighting the unrelaxed contract here instead would be the one-line
+    // change that silently takes those refusals away again — this gate is what they are escaping.
     const preflight = parseArgs(
       { domain, op, toolCallId, callerAgentId, decision: { tier: "allow" } },
       handler.schema,

@@ -64,10 +64,10 @@ describe("board.create_item carries the epic decision across the registry", () =
     });
   });
 
-  // THE ONE THAT BREAKS IF SOMEONE "TIGHTENS" THE ZOD SCHEMA. Dispatch preflights every call
-  // against the route's schema, so a required `epicDecision` there would refuse HERE, and the
-  // candidate epics the bead asks for — which need a store read a zod message cannot do — would
-  // never be computed. The domain must be the one that says no.
+  // THE ONE THAT BREAKS IF THE PREFLIGHT EVER GETS THE CONTRACT (bead `sparkle-vphgrl`).
+  // `createItemArgs` DOES require `epicDecision`; `routeOwningRefusal` relaxes it for the PREFLIGHT
+  // alone, so the call still reaches the domain — the only layer that can read the store for the
+  // candidate epics a zod message cannot compute. Preflight the unrelaxed contract and this reds.
   it("still reaches the domain when the decision is missing, so the refusal can carry candidates", async () => {
     createItem.mockResolvedValue({
       ok: false,
