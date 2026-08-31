@@ -125,6 +125,17 @@ pub struct PtyObserver {
     /// which is exactly what latches these gates — so the failure this module exists to survive is
     /// also the failure that would blind it.
     reader_parked: AtomicBool,
+    /// Epoch ms of the FIRST byte of output this session ever produced — its startup heartbeat.
+    /// `0` until the reader feeds a first non-empty `ingest`; set once and never moved after.
+    ///
+    /// A healthy `claude` paints its TUI within a second or two of spawn (a `--resume` redraws its
+    /// transcript in seconds too), so this timestamp is a reliable "the agent came alive" signal.
+    /// `agent_life::reap_dead_sessions_at` reads it via `Observers::startup_heartbeats` to tell a
+    /// worker that hung or died on startup — a live PTY session that never spoke — apart from one that
+    /// has only just spawned. Kept HERE, on the nudger's observer, because this is already the one
+    /// per-session thing the reader thread feeds; adding a field to `PtySession` would touch the hot
+    /// spawn path for a value this side already sees.
+    first_output_ms: AtomicU64,
 }
 
 impl PtyObserver {
@@ -134,6 +145,7 @@ impl PtyObserver {
             screen: Mutex::new(vt100::Parser::new(rows, cols, 0)),
             last_foreign_write_ms: AtomicU64::new(0),
             reader_parked: AtomicBool::new(false),
+            first_output_ms: AtomicU64::new(0),
         }
     }
 
@@ -143,6 +155,19 @@ impl PtyObserver {
     /// a reader, and an observation is not worth propagating a failure for.
     pub fn ingest(&self, text: &str) {
         let bytes = text.as_bytes();
+        if bytes.is_empty() {
+            return;
+        }
+        // Stamp the startup heartbeat on the FIRST non-empty output and never move it — a
+        // compare-exchange from 0 so a later read cannot overwrite the first-byte instant. `ingest`
+        // is only ever called with a session's real decoded output, so this is exactly "the agent
+        // spoke for the first time".
+        let _ = self.first_output_ms.compare_exchange(
+            0,
+            now_ms(),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
         {
             let mut tail = self.tail.lock().unwrap_or_else(|e| e.into_inner());
             if bytes.len() >= TAIL_BYTES {
@@ -168,6 +193,15 @@ impl PtyObserver {
 
     fn reader_is_parked(&self) -> bool {
         self.reader_parked.load(Ordering::Relaxed)
+    }
+
+    /// Epoch ms of this session's startup heartbeat — its FIRST byte of output — or `None` if it has
+    /// not spoken yet. See `first_output_ms` for why this is the "the agent came alive" signal.
+    pub fn first_output_ms(&self) -> Option<i64> {
+        match self.first_output_ms.load(Ordering::Relaxed) {
+            0 => None,
+            ms => Some(ms as i64),
+        }
     }
 
     /// Record that something other than the nudger wrote to this PTY.
@@ -255,6 +289,27 @@ impl Observers {
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect()
+    }
+
+    /// Per-agent startup heartbeat, for `agent_life::reap_dead_sessions_at`: agent id → the epoch ms
+    /// at which we last had positive evidence the worker is alive.
+    ///
+    /// An entry is present iff the session has shown a sign of life — it emitted a first byte
+    /// (`first_output_ms`), OR its reader is PARKED so its silence cannot be observed. The parked case
+    /// carries the SAME fail-safe direction the rest of this module takes (a wedged WebView latches
+    /// the backpressure gates and starves the observer): an unobservable session is presumed alive,
+    /// mapped to `now_ms`, so it can never be mistaken for a startup no-show. Absence therefore means
+    /// "observably silent", which past the deadline is exactly the hung-on-startup worker.
+    pub fn startup_heartbeats(&self, now_ms: i64) -> HashMap<String, i64> {
+        let mut out = HashMap::new();
+        for (id, obs) in self.all() {
+            if let Some(ms) = obs.first_output_ms() {
+                out.insert(id, ms);
+            } else if obs.reader_is_parked() {
+                out.insert(id, now_ms);
+            }
+        }
+        out
     }
 }
 
@@ -1534,6 +1589,57 @@ mod tests {
 
     fn observer() -> PtyObserver {
         PtyObserver::new(DEFAULT_COLS, DEFAULT_ROWS)
+    }
+
+    /// The startup heartbeat: a fresh observer has NOT spoken, the first real output stamps it once,
+    /// and later output never moves it. This is the signal `agent_life`'s reaper reads to tell a
+    /// worker that came alive from one that hung on startup.
+    #[test]
+    fn first_output_ms_is_set_once_on_the_first_byte_and_never_moved() {
+        let o = observer();
+        assert_eq!(o.first_output_ms(), None, "a session that has not spoken has no heartbeat");
+
+        // Empty output is not a sign of life — it must not stamp the heartbeat.
+        o.ingest("");
+        assert_eq!(o.first_output_ms(), None, "empty output is not a startup heartbeat");
+
+        o.ingest("claude booting");
+        let first = o.first_output_ms().expect("the first real byte stamps the heartbeat");
+
+        // A later read must not overwrite the FIRST-byte instant.
+        o.ingest("more output later");
+        assert_eq!(
+            o.first_output_ms(),
+            Some(first),
+            "the heartbeat is the FIRST byte's time, never a later one",
+        );
+    }
+
+    /// `Observers::startup_heartbeats` reports a session as alive on TWO grounds and stays silent on
+    /// the third — which is exactly the input the reaper needs to seal only a genuine no-show.
+    #[test]
+    fn startup_heartbeats_reports_spoke_and_parked_but_not_observably_silent() {
+        let obs = Observers::default();
+        let spoke = obs.attach("spoke", DEFAULT_COLS, DEFAULT_ROWS);
+        let parked = obs.attach("parked", DEFAULT_COLS, DEFAULT_ROWS);
+        let _silent = obs.attach("silent", DEFAULT_COLS, DEFAULT_ROWS);
+
+        spoke.ingest("hello"); // has a first-output heartbeat
+        parked.set_reader_parked(true); // unobservable ⇒ presumed alive
+
+        let now = 5_000_000i64;
+        let hb = obs.startup_heartbeats(now);
+
+        assert!(hb.contains_key("spoke"), "a session that spoke has a heartbeat");
+        assert_eq!(
+            hb.get("parked").copied(),
+            Some(now),
+            "a parked (unobservable) session is presumed alive at `now`",
+        );
+        assert!(
+            !hb.contains_key("silent"),
+            "an observably-silent session must have NO heartbeat — that is the no-show the reaper reclaims",
+        );
     }
 
     /// A SLOW ITERATION IS NOT A SUSPEND, and this is the pair that pins the difference.

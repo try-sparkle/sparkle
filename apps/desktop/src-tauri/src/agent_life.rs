@@ -133,6 +133,19 @@ pub enum DeathCause {
     /// safe policy over that union was to recover neither. Splitting them lets each get the answer
     /// it deserves: this one is never resurrectable, and the crashes are.
     HumanStopped,
+    /// THE PTY CAME UP BUT THE AGENT NEVER SPOKE — no output at all by the startup-heartbeat deadline.
+    ///
+    /// Distinct from `ProcessGone`, whose evidence is a session that VANISHED from the map: here the
+    /// session is still PRESENT (the shell is alive) yet the agent inside it produced not one byte by
+    /// {@link STARTUP_HEARTBEAT_DEADLINE_MS} after open. A healthy `claude` paints its TUI within
+    /// seconds — even a `--resume` redraws in seconds — so total silence under a live PTY past that
+    /// deadline is a worker that hung or died on startup while its wrapper lingered, which the reaper
+    /// could not previously tell apart from one still starting up (it read the live session as proof
+    /// of life and left the slot held indefinitely — the 12-minute ambiguity this closes).
+    ///
+    /// RESURRECTABLE, but paced on the SLOWEST rung (`resurrection.armsOnSlowestRung`): a startup
+    /// fault is the crash-loop shape the fast rungs would burn a day's budget against.
+    StartupNoShow,
     Unknown,
 }
 
@@ -166,6 +179,15 @@ pub enum DeathEvidence {
     /// therefore compatible with every cause there is. Nothing infers this one, so nothing can
     /// mistake a crash for it — which is exactly what `PtyExit` could not promise.
     UserStop,
+    /// A live PTY session under a still-live epoch that had emitted ZERO output by
+    /// {@link STARTUP_HEARTBEAT_DEADLINE_MS} after its record opened — read by
+    /// `reap_dead_sessions_at` on the revival tick. The only evidence that supports `StartupNoShow`.
+    ///
+    /// Distinct from `SessionVanished` (the session was ABSENT) and from `PtyExit` (a window watched
+    /// a close): here the session is PRESENT and simply never came alive. Sharing either would make
+    /// `validate` reject every record this path writes, the same drift `SessionVanished` was split
+    /// out to fix (roborev 61705).
+    StartupSilent,
     PtyExit,
     SessionEndHook,
     None,
@@ -183,6 +205,7 @@ pub fn cause_of(evidence: DeathEvidence) -> Option<DeathCause> {
         }
         DeathEvidence::EpochDead => Some(DeathCause::AppRestart),
         DeathEvidence::SessionVanished => Some(DeathCause::ProcessGone),
+        DeathEvidence::StartupSilent => Some(DeathCause::StartupNoShow),
         DeathEvidence::UserStop => Some(DeathCause::HumanStopped),
         DeathEvidence::PtyExit | DeathEvidence::SessionEndHook | DeathEvidence::None => {
             Some(DeathCause::Unknown)
@@ -216,6 +239,9 @@ pub fn is_resurrectable(cause: DeathCause) -> bool {
         | DeathCause::WallSpend
         | DeathCause::AppRestart
         | DeathCause::ProcessGone
+        // A startup no-show recovers by respawning — on the slowest rung, since it is the crash-loop
+        // shape the fast rungs would burn a day's budget against (`resurrection.armsOnSlowestRung`).
+        | DeathCause::StartupNoShow
         | DeathCause::Unknown => true,
         // `HumanStopped` joins the two terminal ones for a third reason: the human already decided,
         // and restarting is a wrong ACTION against a stated decision rather than a missed recovery.
@@ -237,6 +263,7 @@ pub fn arms_on_clock(cause: DeathCause) -> bool {
         | DeathCause::AppRestart
         | DeathCause::ProcessGone
         | DeathCause::HumanStopped
+        | DeathCause::StartupNoShow
         | DeathCause::Unknown => false,
     }
 }
@@ -259,6 +286,7 @@ fn serde_name_cause(cause: DeathCause) -> &'static str {
         DeathCause::AppRestart => "app-restart",
         DeathCause::ProcessGone => "process-gone",
         DeathCause::HumanStopped => "human-stopped",
+        DeathCause::StartupNoShow => "startup-no-show",
         DeathCause::Unknown => "unknown",
     }
 }
@@ -276,6 +304,7 @@ fn serde_name_evidence(evidence: DeathEvidence) -> &'static str {
         DeathEvidence::GoalDischargedOnGitProof => "goal-discharged-on-git-proof",
         DeathEvidence::EpochDead => "epoch-dead",
         DeathEvidence::SessionVanished => "session-vanished",
+        DeathEvidence::StartupSilent => "startup-silent",
         DeathEvidence::UserStop => "user-stop",
         DeathEvidence::PtyExit => "pty-exit",
         DeathEvidence::SessionEndHook => "session-end-hook",
@@ -965,6 +994,77 @@ pub fn seal_stale_at(
 /// being far below the 15s×N it takes the TS sweep to act on anything.
 pub const REAP_GRACE_MS: i64 = 60_000;
 
+/// How long after open a worker may stay SILENT before a still-live PTY session stops being read as
+/// proof it is alive.
+///
+/// ── THE HOLE THIS CLOSES ──────────────────────────────────────────────────────────────────────
+/// `REAP_GRACE_MS` covers a record whose session is ABSENT. It says nothing about a record whose
+/// session is PRESENT but whose agent never came alive — a `claude` that hung or died on startup
+/// while its `zsh -c '<script>'` wrapper kept the PTY open. The reaper read the live session as
+/// proof of life (`still_live`) and left the slot held indefinitely, which is byte-for-byte
+/// indistinguishable from a worker that had only just spawned. That was the 12-minute ambiguity: a
+/// dead-on-startup worker and a just-spawned one looked identical for as long as the shell lingered.
+///
+/// ── WHY A DEADLINE ON FIRST OUTPUT IS THE RIGHT DISCRIMINATOR ──────────────────────────────────
+/// A healthy `claude` paints its TUI within a second or two of spawn, and even a `--resume` redraws
+/// its transcript in seconds — so the FIRST byte of output is a reliable startup heartbeat. Total
+/// silence under a live PTY past this deadline means the agent never started. The signal a
+/// slept-then-quiet or backpressured session would trip is excluded at the wiring, not here: the
+/// caller reports a heartbeat for any session whose reader is PARKED (unobservable ⇒ presumed alive,
+/// the same fail-safe direction the rest of this module takes), so this classifier only ever sees a
+/// genuine no-show.
+///
+/// 180s is generous headroom over cold model-init latency while still an order of magnitude below the
+/// ambiguity window it replaces. It is deliberately far ABOVE `REAP_GRACE_MS`: a session that is
+/// present but silent is a weaker signal than one that has vanished, so it earns a longer benefit of
+/// the doubt.
+pub const STARTUP_HEARTBEAT_DEADLINE_MS: i64 = 180_000;
+
+/// Where a `Live` worker is in the just-spawned → alive → died-on-startup progression, derived from
+/// its open time and whether it has shown a startup heartbeat (first output).
+///
+/// The whole point of this type is that `Starting` and `DiedOnStartup` are DIFFERENT — the roster
+/// signal that conflated them held a dead worker's slot for 12 minutes. `Running` means the worker
+/// has shown a sign of life and this classifier has nothing more to say about it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum StartupLiveness {
+    /// No heartbeat yet, but still within {@link STARTUP_HEARTBEAT_DEADLINE_MS} of open — silence is
+    /// the normal shape of a worker that is still coming up. Do NOT reclaim.
+    Starting,
+    /// Has produced a startup heartbeat (first output, or unobservable-so-presumed-alive). Alive.
+    Running,
+    /// Past the deadline with no heartbeat. A worker that never came alive; reclaim its slot.
+    DiedOnStartup,
+}
+
+/// Classify a `Live` worker's startup liveness. PURE — the caller supplies the heartbeat.
+///
+/// `heartbeat_at` is `Some` iff the worker has shown a sign of life: its PTY emitted a first byte, OR
+/// its reader is parked so its silence cannot be observed (the caller passes `Some(now)` for that,
+/// keeping the fail-safe out of this pure core). `session_present` distinguishes the present-but-
+/// silent case (this classifier's reason to exist) from the absent case (which `REAP_GRACE_MS`
+/// already handles); it is carried so an external reader — a roster, an orchestrator — gets the same
+/// verdict the reaper does.
+pub fn startup_liveness_at(
+    opened_at: i64,
+    session_present: bool,
+    heartbeat_at: Option<i64>,
+    now_ms: i64,
+) -> StartupLiveness {
+    if heartbeat_at.is_some() {
+        return StartupLiveness::Running;
+    }
+    if now_ms.saturating_sub(opened_at) < STARTUP_HEARTBEAT_DEADLINE_MS {
+        return StartupLiveness::Starting;
+    }
+    // Past the deadline, never spoke. Present-but-silent is the case the reaper acts on; the absent
+    // case reaches the same verdict here (it is the `process-gone` shape, honestly named for readers)
+    // but is sealed by the `REAP_GRACE_MS` path in the reaper, not by this deadline.
+    let _ = session_present;
+    StartupLiveness::DiedOnStartup
+}
+
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct ReapStats {
     pub scanned: u32,
@@ -975,6 +1075,10 @@ pub struct ReapStats {
     pub too_young: u32,
     /// Left alone because they belong to a DIFFERENT epoch — not ours to judge.
     pub not_ours: u32,
+    /// Reaped as `StartupNoShow`: a live PTY session that never emitted a startup heartbeat by
+    /// {@link STARTUP_HEARTBEAT_DEADLINE_MS}. A subset of `reaped`, counted apart so a caller can log
+    /// the distinct "hung on startup" reclamation.
+    pub startup_no_show: u32,
 }
 
 /// SEAL EVERY RECORD WHOSE AGENT PROCESS IS GONE, ON THE RUNNING APP'S OWN CLOCK.
@@ -999,14 +1103,21 @@ pub struct ReapStats {
 /// lazily per project, so most of the fleet has no observer at any given moment. A death nobody is
 /// watching has to be inferred from an artifact, and the PTY session map is that artifact.
 ///
-/// ── THE THREE GATES, AND WHY EACH ONE IS LOAD-BEARING ─────────────────────────────────────────
+/// ── THE GATES, AND WHY EACH ONE IS LOAD-BEARING ───────────────────────────────────────────────
 ///  1. `rec.epoch == current_epoch`. `live_sessions` is THIS process's PTY map, so it is evidence
 ///     about OUR agents only. Judging another live instance's records against it would report its
 ///     entire healthy fleet as dead — the same catastrophic direction `epoch_still_running`'s
 ///     short-circuit exists to prevent. A record under a DEAD epoch is `seal_stale_at`'s job and is
 ///     deliberately left alone here.
-///  2. The session is absent. Present ⇒ the agent is running; nothing to do.
-///  3. Older than {@link REAP_GRACE_MS} — see that constant for the open-before-spawn race.
+///  2. Session PRESENT: the agent is running — UNLESS it has never shown a startup heartbeat by
+///     {@link STARTUP_HEARTBEAT_DEADLINE_MS}, in which case it hung or died on startup while its
+///     shell lingered and is sealed `StartupNoShow`. This is the case a live session used to hide.
+///  3. Session ABSENT and older than {@link REAP_GRACE_MS} — the vanished-process case, sealed
+///     `ProcessGone`. See that constant for the open-before-spawn race.
+///
+/// `heartbeats` maps an agent id to the epoch-ms of its startup heartbeat, present iff the worker has
+/// shown a sign of life — a first byte of PTY output, or an unobservable (reader-parked) session the
+/// caller presumes alive. Absence means "no heartbeat seen", which past the deadline is the no-show.
 ///
 /// Idempotent: a record already `Dead`, `Claimed` or `Retired` is skipped, so re-running never
 /// rewrites a verdict a window recorded with real evidence.
@@ -1014,6 +1125,7 @@ pub fn reap_dead_sessions_at(
     dir: &Path,
     current_epoch: &str,
     live_sessions: &std::collections::HashSet<String>,
+    heartbeats: &std::collections::HashMap<String, i64>,
     now_ms: i64,
 ) -> Result<ReapStats, LifeError> {
     let mut stats = ReapStats::default();
@@ -1040,22 +1152,49 @@ pub fn reap_dead_sessions_at(
             stats.not_ours += 1;
             continue;
         }
-        if live_sessions.contains(agent_id) {
+        let session_present = live_sessions.contains(agent_id);
+        let heartbeat = heartbeats.get(agent_id).copied();
+        let startup_no_show = session_present
+            && matches!(
+                startup_liveness_at(rec.opened_at, session_present, heartbeat, now_ms),
+                StartupLiveness::DiedOnStartup
+            );
+        if session_present && !startup_no_show {
+            // Present and either alive (heartbeat seen / unobservable) or still within the startup
+            // deadline. Left alone — a live session that HAS come alive is the ordinary running agent.
             stats.still_live += 1;
             continue;
         }
-        if now_ms.saturating_sub(rec.opened_at) < REAP_GRACE_MS {
+        if !session_present && now_ms.saturating_sub(rec.opened_at) < REAP_GRACE_MS {
             stats.too_young += 1;
             continue;
         }
-        let death = Death {
-            cause: DeathCause::ProcessGone,
-            evidence: DeathEvidence::SessionVanished,
-            at: now_ms,
-            message: None,
-            goal_met_at: None,
-            // Inferred from the session's absence — nobody asked for this either.
-            stopped_by: None,
+        // Two shapes reach here. A PRESENT-but-silent session that blew the startup deadline never
+        // came alive (`StartupNoShow`); an ABSENT session past the grace window is a vanished process
+        // (`ProcessGone`). Each carries its OWN honest evidence — the two must not be collapsed, or
+        // `validate` rejects the record (roborev 61705, the same drift `SessionVanished` was split
+        // out to fix).
+        let death = if startup_no_show {
+            stats.startup_no_show += 1;
+            Death {
+                cause: DeathCause::StartupNoShow,
+                evidence: DeathEvidence::StartupSilent,
+                at: now_ms,
+                message: None,
+                // Inferred from the silence of a live session — nobody asked for this.
+                goal_met_at: None,
+                stopped_by: None,
+            }
+        } else {
+            Death {
+                cause: DeathCause::ProcessGone,
+                evidence: DeathEvidence::SessionVanished,
+                at: now_ms,
+                message: None,
+                goal_met_at: None,
+                // Inferred from the session's absence — nobody asked for this either.
+                stopped_by: None,
+            }
         };
         // THROUGH `validate`, not around it (roborev 61705). Writing straight to
         // `write_record_at` is what let the first version persist a `{ProcessGone, PtyExit}` pair
@@ -1547,6 +1686,18 @@ mod tests {
         ids.iter().map(|s| s.to_string()).collect()
     }
 
+    /// No startup heartbeats — the default for a reap test that is not about the startup path. A
+    /// present session with no heartbeat is only reclaimed once it blows `STARTUP_HEARTBEAT_DEADLINE_MS`,
+    /// so these tests, which reap on session ABSENCE, are unaffected by an empty map.
+    fn no_hb() -> std::collections::HashMap<String, i64> {
+        std::collections::HashMap::new()
+    }
+
+    /// A startup-heartbeat map: each id → the epoch ms it first spoke.
+    fn hb(pairs: &[(&str, i64)]) -> std::collections::HashMap<String, i64> {
+        pairs.iter().map(|(k, v)| (k.to_string(), *v)).collect()
+    }
+
     /// THE ONE THAT MATTERS, asserted on the END-TO-END side effect rather than on the write.
     ///
     /// `reaped == 1` would be satisfied by a reaper that wrote any death at all. What the founder
@@ -1572,7 +1723,7 @@ mod tests {
         assert!(before.alive, "precondition: an unreaped record reads ALIVE — the bug");
         assert!(!before.resurrectable, "and is therefore invisible to recovery");
 
-        let stats = reap_dead_sessions_at(&dir, "epoch-mine", &sessions(&[]), at).unwrap();
+        let stats = reap_dead_sessions_at(&dir, "epoch-mine", &sessions(&[]), &no_hb(), at).unwrap();
         assert_eq!(stats.reaped, 1, "a dead session under our own epoch must be sealed");
 
         let r = read_at(&dir, &app_data, "a1", at).unwrap().unwrap();
@@ -1593,7 +1744,7 @@ mod tests {
         let at = NOW + REAP_GRACE_MS;
 
         // IDENTICAL to the test above in every input except the session set.
-        let stats = reap_dead_sessions_at(&dir, "epoch-mine", &sessions(&["a1"]), at).unwrap();
+        let stats = reap_dead_sessions_at(&dir, "epoch-mine", &sessions(&["a1"]), &no_hb(), at).unwrap();
         assert_eq!(stats.reaped, 0);
         assert_eq!(stats.still_live, 1);
         assert_eq!(read_record_at(&dir, "a1").unwrap().unwrap().state, LifeState::Live);
@@ -1615,13 +1766,154 @@ mod tests {
         let (_td, dir, _app_data) = dirs();
         open(&dir, "a1", "epoch-mine");
 
-        let early = reap_dead_sessions_at(&dir, "epoch-mine", &sessions(&[]), NOW + REAP_GRACE_MS - 1).unwrap();
+        let early = reap_dead_sessions_at(&dir, "epoch-mine", &sessions(&[]), &no_hb(), NOW + REAP_GRACE_MS - 1).unwrap();
         assert_eq!(early.reaped, 0, "the open→spawn gap must never be read as death");
         assert_eq!(early.too_young, 1);
         assert_eq!(read_record_at(&dir, "a1").unwrap().unwrap().state, LifeState::Live);
 
-        let late = reap_dead_sessions_at(&dir, "epoch-mine", &sessions(&[]), NOW + REAP_GRACE_MS).unwrap();
+        let late = reap_dead_sessions_at(&dir, "epoch-mine", &sessions(&[]), &no_hb(), NOW + REAP_GRACE_MS).unwrap();
         assert_eq!(late.reaped, 1, "and once it is past, the reaper must still fire");
+    }
+
+    // ── the startup-heartbeat classifier and its reaper branch ──────────────────────────────────
+    //
+    // The bug these guard: a live PTY session used to be read as proof of life, so a worker that hung
+    // or died on startup while its shell lingered was indistinguishable from one still spawning — for
+    // as long as the shell stayed up. Each reaper test is an INVERTED PAIR that changes exactly one
+    // input (heartbeat present/absent, or the clock either side of the deadline), so a green cannot
+    // come from the record being dropped or kept for some unrelated reason.
+
+    #[test]
+    fn startup_liveness_is_running_the_moment_a_heartbeat_exists() {
+        // A heartbeat at any time — even long past the deadline — means the worker spoke: Running.
+        assert_eq!(
+            startup_liveness_at(NOW, true, Some(NOW + 10), NOW + STARTUP_HEARTBEAT_DEADLINE_MS * 10),
+            StartupLiveness::Running,
+        );
+        // And it stays Running whether or not a session is currently present.
+        assert_eq!(
+            startup_liveness_at(NOW, false, Some(NOW + 10), NOW + STARTUP_HEARTBEAT_DEADLINE_MS * 10),
+            StartupLiveness::Running,
+        );
+    }
+
+    #[test]
+    fn startup_liveness_is_starting_while_silent_within_the_deadline() {
+        // No heartbeat yet, but inside the window — silence is the normal shape of a spawning worker.
+        assert_eq!(
+            startup_liveness_at(NOW, true, None, NOW + STARTUP_HEARTBEAT_DEADLINE_MS - 1),
+            StartupLiveness::Starting,
+        );
+    }
+
+    #[test]
+    fn startup_liveness_is_died_on_startup_when_silent_past_the_deadline() {
+        // No heartbeat, past the window: the worker never came alive.
+        assert_eq!(
+            startup_liveness_at(NOW, true, None, NOW + STARTUP_HEARTBEAT_DEADLINE_MS),
+            StartupLiveness::DiedOnStartup,
+        );
+    }
+
+    /// THE ONE THAT MATTERS, asserted on the end-to-end reading rather than the write. A live PTY
+    /// session that never emitted a byte by the startup deadline is sealed `StartupNoShow`, stops
+    /// reading ALIVE and becomes resurrectable — so its held slot is reclaimed. Against today's code
+    /// (a present session is `still_live` forever) it would sit Live and `alive` indefinitely, which
+    /// is the 12-minute ambiguity this closes.
+    #[test]
+    #[cfg(unix)]
+    fn a_live_session_silent_past_the_startup_deadline_is_reaped_as_startup_no_show() {
+        let (_td, dir, app_data) = dirs();
+        open(&dir, "a1", "epoch-mine");
+        // A GENUINELY ALIVE epoch, or the `!alive` assertion proves nothing (see the sibling
+        // session-vanished test): `derive` computes `alive = Live && epoch_alive`.
+        let _lock = hold_test_lock(&app_data, "epoch-mine");
+        // STRICTLY past the deadline, not exactly at it: at the boundary `age == DEADLINE`, flipping
+        // the classifier's `<` to `>` leaves the outcome unchanged (both false), so an at-boundary
+        // clock cannot grip that comparison. The exact edge is pinned separately by
+        // `a_silent_live_session_is_immune_until_the_startup_deadline`.
+        let at = NOW + STARTUP_HEARTBEAT_DEADLINE_MS + 5_000;
+
+        // Session PRESENT under our epoch, and NO heartbeat recorded for it.
+        let stats =
+            reap_dead_sessions_at(&dir, "epoch-mine", &sessions(&["a1"]), &no_hb(), at).unwrap();
+        assert_eq!(stats.reaped, 1);
+        assert_eq!(
+            stats.startup_no_show, 1,
+            "reaped for never coming alive, not for a vanished session"
+        );
+        assert_eq!(stats.still_live, 0);
+
+        let rec = read_record_at(&dir, "a1").unwrap().unwrap();
+        assert_eq!(rec.state, LifeState::Dead);
+        let death = rec.death.as_ref().unwrap();
+        assert_eq!(death.cause, DeathCause::StartupNoShow);
+        assert_eq!(death.evidence, DeathEvidence::StartupSilent);
+
+        let r = read_at(&dir, &app_data, "a1", at).unwrap().unwrap();
+        assert!(!r.alive, "a worker that never came alive must stop reading ALIVE");
+        assert!(r.resurrectable, "a startup no-show is recovered by respawning");
+    }
+
+    /// THE PAIRED POSITIVE. Same record, same present session, the clock PAST the deadline — the ONLY
+    /// difference is that this worker DID emit a startup heartbeat. It must be left completely alone,
+    /// so the test above cannot be passing because the deadline reaps every present session.
+    #[test]
+    #[cfg(unix)]
+    fn a_live_session_that_spoke_stays_alive_past_the_startup_deadline() {
+        let (_td, dir, app_data) = dirs();
+        open(&dir, "a1", "epoch-mine");
+        let _lock = hold_test_lock(&app_data, "epoch-mine");
+        let at = NOW + STARTUP_HEARTBEAT_DEADLINE_MS + 5_000;
+
+        // IDENTICAL to the test above except a1 has a heartbeat — it spoke at NOW+10.
+        let stats = reap_dead_sessions_at(
+            &dir,
+            "epoch-mine",
+            &sessions(&["a1"]),
+            &hb(&[("a1", NOW + 10)]),
+            at,
+        )
+        .unwrap();
+        assert_eq!(stats.reaped, 0);
+        assert_eq!(stats.startup_no_show, 0);
+        assert_eq!(stats.still_live, 1);
+        assert!(
+            read_at(&dir, &app_data, "a1", at).unwrap().unwrap().alive,
+            "a worker that came alive must keep reading ALIVE — reaping one would be catastrophic",
+        );
+    }
+
+    /// INVERTED PAIR ON THE CLOCK. A silent present session is immune one millisecond under the
+    /// startup deadline and reapable at it — the boundary itself, not merely "eventually".
+    #[test]
+    #[cfg(unix)]
+    fn a_silent_live_session_is_immune_until_the_startup_deadline() {
+        let (_td, dir, app_data) = dirs();
+        open(&dir, "a1", "epoch-mine");
+        let _lock = hold_test_lock(&app_data, "epoch-mine");
+
+        let early = reap_dead_sessions_at(
+            &dir,
+            "epoch-mine",
+            &sessions(&["a1"]),
+            &no_hb(),
+            NOW + STARTUP_HEARTBEAT_DEADLINE_MS - 1,
+        )
+        .unwrap();
+        assert_eq!(early.startup_no_show, 0, "a still-starting worker must never be reaped");
+        assert_eq!(early.still_live, 1);
+        assert_eq!(read_record_at(&dir, "a1").unwrap().unwrap().state, LifeState::Live);
+
+        let late = reap_dead_sessions_at(
+            &dir,
+            "epoch-mine",
+            &sessions(&["a1"]),
+            &no_hb(),
+            NOW + STARTUP_HEARTBEAT_DEADLINE_MS,
+        )
+        .unwrap();
+        assert_eq!(late.startup_no_show, 1, "and at the deadline the no-show must be sealed");
     }
 
     /// THE CATASTROPHIC DIRECTION. `live_sessions` is THIS process's PTY map, so it is evidence
@@ -1633,7 +1925,7 @@ mod tests {
         let (_td, dir, _app_data) = dirs();
         open(&dir, "theirs", "some-other-epoch");
         let stats =
-            reap_dead_sessions_at(&dir, "epoch-mine", &sessions(&[]), NOW + 86_400_000).unwrap();
+            reap_dead_sessions_at(&dir, "epoch-mine", &sessions(&[]), &no_hb(), NOW + 86_400_000).unwrap();
         assert_eq!(stats.reaped, 0, "another instance's agents are not ours to judge");
         assert_eq!(stats.not_ours, 1);
         assert_eq!(read_record_at(&dir, "theirs").unwrap().unwrap().state, LifeState::Live);
@@ -1655,7 +1947,7 @@ mod tests {
         .unwrap();
 
         let stats =
-            reap_dead_sessions_at(&dir, "epoch-mine", &sessions(&[]), NOW + 86_400_000).unwrap();
+            reap_dead_sessions_at(&dir, "epoch-mine", &sessions(&[]), &no_hb(), NOW + 86_400_000).unwrap();
         assert_eq!(stats.reaped, 0);
         let rec = read_record_at(&dir, "a1").unwrap().unwrap();
         assert_eq!(
@@ -1726,7 +2018,7 @@ mod tests {
         );
 
         let at = NOW + REAP_GRACE_MS;
-        let stats = reap_dead_sessions_at(&dir, "epoch-mine", &sessions(&[]), at).unwrap();
+        let stats = reap_dead_sessions_at(&dir, "epoch-mine", &sessions(&[]), &no_hb(), at).unwrap();
         assert_eq!(stats.reaped, 0, "a stop the user asked for is not a death to recover from");
 
         let r = read_at(&dir, &app_data, "a1", at).unwrap().unwrap();
@@ -1861,7 +2153,7 @@ mod tests {
         .unwrap();
 
         let at = NOW + REAP_GRACE_MS;
-        assert_eq!(reap_dead_sessions_at(&dir, "epoch-mine", &sessions(&[]), at).unwrap().reaped, 1);
+        assert_eq!(reap_dead_sessions_at(&dir, "epoch-mine", &sessions(&[]), &no_hb(), at).unwrap().reaped, 1);
 
         let r = read_at(&dir, &app_data, "a1", at).unwrap().unwrap();
         assert_eq!(r.effective_cause, Some(DeathCause::ProcessGone));
@@ -1982,7 +2274,7 @@ mod tests {
     /// the causes (`is_resurrectable_matches_deathtypes_ts`) that local list would have become the
     /// duplicated pair whose drift `EVERY_EVIDENCE`'s own doc argues against. Hand-written for the
     /// same residual reason: Rust cannot enumerate an enum's variants without `strum`.
-    const EVERY_CAUSE: [DeathCause; 9] = [
+    const EVERY_CAUSE: [DeathCause; 10] = [
         DeathCause::TransportTransient,
         DeathCause::WallSession,
         DeathCause::WallSpend,
@@ -1991,6 +2283,7 @@ mod tests {
         DeathCause::AppRestart,
         DeathCause::ProcessGone,
         DeathCause::HumanStopped,
+        DeathCause::StartupNoShow,
         DeathCause::Unknown,
     ];
 
@@ -2007,7 +2300,7 @@ mod tests {
     /// a STALE EXTRA entry here is caught by the sibling serde guard, which round-trips every element
     /// through serde. The `len` equality inside the mapping test compares the TS switch against the
     /// TS union — both TypeScript-side — and says nothing about this array.
-    const EVERY_EVIDENCE: [DeathEvidence; 12] = [
+    const EVERY_EVIDENCE: [DeathEvidence; 13] = [
         DeathEvidence::QuotaBlock,
         DeathEvidence::Transcript429,
         DeathEvidence::ApiBanner,
@@ -2023,6 +2316,7 @@ mod tests {
         // and compares the result against `deathTypes.ts`'s union as a SET, so a member present in
         // TS and missing here fails loudly instead of silently narrowing the guard's coverage.
         DeathEvidence::UserStop,
+        DeathEvidence::StartupSilent,
         DeathEvidence::PtyExit,
         DeathEvidence::SessionEndHook,
         DeathEvidence::None,

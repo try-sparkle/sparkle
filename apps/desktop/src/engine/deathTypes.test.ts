@@ -25,6 +25,7 @@ const ALL_EVIDENCE = [
   "user-stop",
   "pty-exit",
   "session-end-hook",
+  "startup-silent",
   "none",
 ] as const satisfies readonly DeathEvidence[];
 
@@ -36,6 +37,7 @@ const ALL_CAUSES = [
   "blocked-on-human",
   "app-restart",
   "process-gone",
+  "startup-no-show",
   "human-stopped",
   "unknown",
 ] as const satisfies readonly DeathCause[];

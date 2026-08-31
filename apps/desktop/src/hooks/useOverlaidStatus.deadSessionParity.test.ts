@@ -141,6 +141,7 @@ const ALL_CAUSES: Record<DeathCause, true> = {
   "blocked-on-human": true,
   "app-restart": true,
   "process-gone": true,
+  "startup-no-show": true,
   "human-stopped": true,
   unknown: true,
 };

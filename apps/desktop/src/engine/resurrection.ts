@@ -217,7 +217,10 @@ export interface ResurrectionInput {
  * to the former. The founder's P0 — a stopped row sitting dead 45+ minutes — is exactly this case.
  */
 export function armsOnSlowestRung(cause: DeathCause): boolean {
-  return cause === "unknown";
+  // `startup-no-show` joins `unknown` on the slowest rung: a worker that produced no output at all by
+  // the startup deadline is the crash-loop shape (the fault likely re-fails instantly on respawn), so
+  // the fast rungs would spend a day's retry budget in the first ten minutes for nothing.
+  return cause === "unknown" || cause === "startup-no-show";
 }
 
 /** When the next rung is due. ALWAYS defined: past the last rung the gap holds at the ceiling, so an

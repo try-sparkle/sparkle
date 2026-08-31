@@ -114,6 +114,20 @@ export type DeathCause =
    * `unknown` no longer has to be — see {@link isResurrectable}.
    */
   | "human-stopped"
+  /**
+   * The PTY came up but the agent NEVER SPOKE — zero output by the startup-heartbeat deadline.
+   *
+   * Written only by `agent_life::reap_dead_sessions_at`, for a record whose PTY session is still
+   * PRESENT under a live epoch yet produced not one byte by `STARTUP_HEARTBEAT_DEADLINE_MS` after
+   * open. Distinct from `process-gone` (the session VANISHED) and `unknown` (a window watched a
+   * close): a healthy `claude` paints its TUI within seconds, so total silence under a live PTY is a
+   * worker that hung or died on startup while its wrapper lingered — the case the reaper used to read
+   * as still-alive, holding the slot for the whole 12-minute ambiguity this closes.
+   *
+   * Resurrectable, but paced on the SLOWEST rung (`resurrection.armsOnSlowestRung`): a startup fault
+   * is the crash-loop shape the fast rungs would burn a day's budget against.
+   */
+  | "startup-no-show"
   /** Nothing was observed. A first-class, honest value — NOT a synonym for "healthy" or "fine". */
   | "unknown";
 
@@ -158,6 +172,17 @@ export type DeathEvidence =
    * record the reaper writes — the invariant stated but untrue (roborev 61705).
    */
   | "session-vanished"
+  /**
+   * A live PTY session under a still-live epoch that had emitted ZERO output by
+   * `STARTUP_HEARTBEAT_DEADLINE_MS` after its record opened — read by `agent_life::reap_dead_sessions_at`
+   * on the revival tick. The only evidence that supports `"startup-no-show"`.
+   *
+   * Distinct from `"session-vanished"` (the session was ABSENT) and `"pty-exit"` (a window watched a
+   * close): here the session is PRESENT and simply never came alive. Sharing either would make
+   * `verdictIsSupported` false for every record this path writes (the drift `"session-vanished"` was
+   * split out to fix, roborev 61705).
+   */
+  | "startup-silent"
   /**
    * THE APP ITSELF KILLED THE PTY, on a human's instruction — `pty_kill` → `mark_stopped_at`.
    *
@@ -230,6 +255,8 @@ export function causeOf(evidence: DeathEvidence): DeathCause | null {
       return "app-restart";
     case "session-vanished":
       return "process-gone";
+    case "startup-silent":
+      return "startup-no-show";
     case "user-stop":
       return "human-stopped";
     case "pty-exit":
@@ -298,7 +325,11 @@ export function isResurrectable(cause: DeathCause): boolean {
     case "wall-spend":
     case "app-restart":
     case "process-gone":
+    case "startup-no-show":
     case "unknown":
+      // `startup-no-show` recovers by respawning, on the slowest rung — see its definition above and
+      // `resurrection.armsOnSlowestRung`. (Note in the body, not between labels, per the `false`
+      // arm's `no-fallthrough` reason.)
       return true;
     case "clean-goal-met":
     case "blocked-on-human":

@@ -478,10 +478,20 @@ pub fn start<R: Runtime>(app: &AppHandle<R>) {
             // with this module's header.
             if let Some(pty) = app.try_state::<crate::pty::PtyManager>() {
                 let live: HashSet<String> = pty.session_ids().into_iter().collect();
+                // Per-agent startup heartbeat: a session that has emitted a first byte, or one whose
+                // reader is parked (unobservable ⇒ presumed alive). Absence past the startup deadline
+                // is a live PTY that never came alive — the hung-on-startup worker the reaper reclaims
+                // as `StartupNoShow`. Same cost profile as `session_ids` above: mutex locks and a
+                // small clone, no model call, no I/O.
+                let heartbeats = app
+                    .try_state::<crate::nudger::Observers>()
+                    .map(|o| o.startup_heartbeats(now))
+                    .unwrap_or_default();
                 match agent_life::reap_dead_sessions_at(
                     &dir,
                     crate::babysit_lease::process_epoch(),
                     &live,
+                    &heartbeats,
                     now,
                 ) {
                     Ok(stats) if stats.reaped > 0 => {
@@ -490,9 +500,10 @@ pub fn start<R: Runtime>(app: &AppHandle<R>) {
                         tracing::info!(
                             target: "revival",
                             reaped = stats.reaped,
+                            startup_no_show = stats.startup_no_show,
                             still_live = stats.still_live,
                             too_young = stats.too_young,
-                            "sealed agents whose PTY session is gone"
+                            "sealed agents whose PTY session is gone or never came alive"
                         );
                     }
                     Ok(_) => {}
