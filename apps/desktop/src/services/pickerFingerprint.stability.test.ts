@@ -178,6 +178,116 @@ describe("pickerFingerprint is stable while the question is static", () => {
   });
 });
 
+// ══ THE OPTION LABEL IS SEMANTIC TOO — A MOVING SPAN INSIDE IT MUST NOT MOVE THE FINGERPRINT ════
+// (bead sparkle-jniddo.)
+//
+// THE GAP THE TESTS ABOVE LEAVE. `fingerprintsAcrossTicks` reads the options ONCE, from the first
+// frame, then re-fingerprints the SAME options array against each later screen. That pins the
+// QUESTION half — which reads the live scrollback — but never the SHAPE half, because the shape is
+// derived from the fixed options and cannot move when they don't. The REAL press path does not hold
+// the options still: `selectPickerOption` calls `liveOptionsFor` at press time, RE-DETECTING them
+// from whatever the screen shows then. So an option label that carries a moving span — Claude Code's
+// per-option elapsed readout, an AskUserQuestion option quoting a size — re-detects to a different
+// string at press time, the shape half churns, and the press is refused as `changed` though the menu
+// is the same one. That is the deadlock the bead records, and it lives on the axis these ticks-tests
+// do not drive.
+//
+// So this block re-detects the options from each repainted frame, the way the press path does, and
+// asserts the CAPABILITY the fingerprint gates: an unchanged menu still MATCHES across the repaint
+// (the press would proceed), and a genuinely different menu still does NOT (the press is still
+// refused). The `changed` guard fires on `now !== expectFingerprint`, so fingerprint equality across
+// the read→press window is exactly the boolean that decides whether the press is answered.
+describe("the fingerprint survives a repaint that moves a span INSIDE an option label", () => {
+  beforeEach(() => {
+    screen = "";
+  });
+
+  /** A numbered picker whose FIRST option carries a live elapsed readout. The question and the set
+   *  of options are static; only the clock inside option 1 ticks between repaints. Bordered, so the
+   *  question half is already pinned by `bounds.top` — isolating the option-label axis. */
+  const rebuildDialog = (elapsed: string) =>
+    [
+      "────────────────────────────────────────────────────────────────────────────",
+      " Rebuild preview?",
+      "",
+      " Do you want to proceed?",
+      ` ❯ 1. Yes, rebuild now (last build ${elapsed})`,
+      "   2. No, keep the current preview",
+      "",
+      " Esc to cancel · Tab to amend",
+    ].join("\n");
+
+  /** Read the options from ONE frame and fingerprint them, exactly as `read_picker_options` does. */
+  function readFingerprint(dialog: string, spinner: string, elapsed: string, tokens: string): string {
+    screen = screenWith(dialog, spinner, elapsed, tokens);
+    return pickerFingerprint("agent-1", detectTerminalPrompts(screen));
+  }
+
+  it("an UNCHANGED menu re-detected at press time still matches the read (press would PROCEED)", () => {
+    // READ: the caller reads the menu and holds this fingerprint.
+    const read = readFingerprint(rebuildDialog("1m 20s"), "✻", "12s", "1.2k");
+    expect(read).not.toBe("");
+
+    // PRESS: the screen repainted — the spinner and clock above the dialog moved AND the elapsed
+    // readout inside option 1 ticked — and the press re-derives the fingerprint from the live screen,
+    // just as `selectPickerOption` does before comparing it to what the caller echoed back.
+    const atPress = readFingerprint(rebuildDialog("2m 40s"), "✽", "13s", "1.4k");
+
+    // The `changed` refusal fires on inequality; equality here is the press proceeding. Against the
+    // pre-fix code (raw, un-steadied option label) these differ and the menu is unanswerable.
+    expect(atPress).toBe(read);
+  });
+
+  it("a GENUINELY CHANGED menu still does NOT match — the protection is not weakened (press REFUSED)", () => {
+    // Same option shape, DIFFERENT question — a distinct ask that must never be answered with a
+    // fingerprint read from the first. This is the paired half: steadying the volatile span must not
+    // collapse two different asks onto one hash.
+    const read = readFingerprint(rebuildDialog("1m 20s"), "✻", "12s", "1.2k");
+
+    const differentAsk = [
+      "────────────────────────────────────────────────────────────────────────────",
+      " Delete build cache?",
+      "",
+      " Do you want to proceed?",
+      " ❯ 1. Yes, rebuild now (last build 1m 20s)",
+      "   2. No, keep the current preview",
+      "",
+      " Esc to cancel · Tab to amend",
+    ].join("\n");
+    screen = screenWith(differentAsk, "✻", "12s", "1.2k");
+    const atPress = pickerFingerprint("agent-1", detectTerminalPrompts(screen));
+
+    expect(read).not.toBe("");
+    expect(atPress).not.toBe("");
+    expect(atPress).not.toBe(read);
+  });
+
+  it("two options differing ONLY in real (non-volatile) label text still hash differently", () => {
+    // The narrow correctness claim under the fix: `steady` removes moving SPANS, not real words. Two
+    // menus whose option 2 names a different target must stay distinguishable, or a press could land
+    // on a button nobody read.
+    const menu = (target: string) =>
+      [
+        "────────────────────────────────────────────────────────────────────────────",
+        " Choose a target",
+        "",
+        " Do you want to proceed?",
+        " ❯ 1. Yes",
+        `   2. Deploy to ${target}`,
+        "",
+        " Esc to cancel · Tab to amend",
+      ].join("\n");
+
+    screen = screenWith(menu("staging"), "✻", "12s", "1.2k");
+    const staging = pickerFingerprint("agent-1", detectTerminalPrompts(screen));
+    screen = screenWith(menu("production"), "✻", "12s", "1.2k");
+    const production = pickerFingerprint("agent-1", detectTerminalPrompts(screen));
+
+    expect(staging).not.toBe("");
+    expect(production).not.toBe(staging);
+  });
+});
+
 // ══ THE UPPER SIDE OF THE TOP-BORDER BOUND — THE SIDE THE DEFECT LIVES ON (roborev 63294) ═══════
 // Every fixture above is a BORDERED dialog whose rule sits within `DIALOG_TOP_SPAN` of its first
 // option, so all of them stay green if the bound is widened back to `PICKER_SPAN` (30). That leaves

@@ -216,7 +216,18 @@ export function pickerFingerprint(agentId: string, options: readonly SuggestionB
   // (numbered menus, and the constant Approve/Deny pair), so producing one would be worse than
   // producing none. "" is the sentinel: `select_picker_option` refuses on it.
   if (prompt === "") return "";
-  const shape = options.map((o) => `${o.label}\u0000${o.value}`).join("\u0001");
+  // STEADY THE LABEL, exactly as `questionBlock` already steadies the option ROWS it hashes (bead
+  // sparkle-jniddo). The label is DISPLAY text and can carry a moving span — Claude Code renders a
+  // per-option elapsed readout ("… (last build 1m 20s)"), and an AskUserQuestion option can quote a
+  // byte size or a percentage. `read_picker_options` hands that raw label to the human to read, but
+  // the fingerprint is the menu's IDENTITY, and a clock ticking inside one option must not make the
+  // same menu hash differently between the read and the press — that mismatch is refused as
+  // `changed` and DEADLOCKS the flow, the exact field failure this bead records (a menu the
+  // concierge could read but never answer). The value is the KEYSTROKE ("2\n", "y\n") and is left
+  // verbatim: it is what gets injected, never display chrome. `steady` neutralises only the moving
+  // span, so two options differing in real text still differ — the collision protection the
+  // fingerprint exists for is untouched.
+  const shape = options.map((o) => `${steady(o.label)}\u0000${o.value}`).join("\u0001");
   let h = 5381;
   const material = `${shape}\u0002${prompt}`;
   for (let i = 0; i < material.length; i++) h = ((h * 33) ^ material.charCodeAt(i)) >>> 0;
