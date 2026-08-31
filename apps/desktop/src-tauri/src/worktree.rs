@@ -6570,6 +6570,160 @@ fn worktree_ahead_gate(root: &str, number: u64, head_ref: &str, pr_head: Option<
     }
 }
 
+/// What a POST-merge landing check found: did the merge commit actually take the branch tip?
+#[derive(Debug, PartialEq, Eq)]
+enum MergeLanding {
+    /// The merge commit's second parent IS the branch tip — everything the branch held landed.
+    Landed,
+    /// The merge took an OLDER head. `stranded` commits are reachable from the local branch tip and
+    /// NOT from the merge commit's second parent, so they are on the default branch nowhere.
+    Stranded { stranded: usize },
+    /// Nothing positive was established: an unreadable sha, no local ref, a DIVERGED pair, or a git
+    /// that could not answer. Diverged is deliberately here — a locally rewritten branch and a merge
+    /// that dropped work are indistinguishable from outside, and this must not accuse the first.
+    CannotTell,
+}
+
+/// The pure classifier, so the decision is testable without a repo. `ahead` counts commits reachable
+/// from the local branch tip but NOT from the merge commit's second parent; `behind` the reverse.
+fn merge_landing_verdict(second_parent: &str, local_tip: &str, ahead: usize, behind: usize) -> MergeLanding {
+    let (second_parent, local_tip) = (second_parent.trim(), local_tip.trim());
+    if second_parent.is_empty() || local_tip.is_empty() {
+        return MergeLanding::CannotTell;
+    }
+    if second_parent == local_tip {
+        return MergeLanding::Landed;
+    }
+    if behind == 0 && ahead > 0 {
+        MergeLanding::Stranded { stranded: ahead }
+    } else {
+        MergeLanding::CannotTell
+    }
+}
+
+/// THE ONE `Err` FROM `merge_pr` THAT MEANS THE REPOSITORY *DID* MOVE. Every other error this
+/// function can return is a refusal — nothing merged, nothing changed — and both consumers of the
+/// `Err` channel are written on that invariant: `conciergeTools/workflow.ts` classifies unmatched
+/// prose as `unknown-error` ("a message a model retries verbatim") and `OpenPrMenu.tsx` skips its
+/// merged-ledger push. So this text leads with `MERGED-BUT-STRANDED` and says in its first clause
+/// that the merge SUCCEEDED and must not be retried — the token is there to be matched on, and
+/// wiring those two call sites to an explicit non-failure branch is bead `sparkle-a08oi0`'s
+/// follow-up (roborev 72228; both files are outside this change's scope).
+///
+/// It names BOTH shas, because the whole failure this exists to end is a success-looking exit whose
+/// two halves — what the merge took, and what the branch held — were never put side by side.
+///
+/// It does NOT tell the reader to re-merge or to push over anything: the PR is merged and its branch
+/// may be deleted, so "push, then merge" is unsafe here in a way it is not in `stale_head_refusal`.
+/// The only remedy that is safe under the conditions that produced this is to open a NEW PR for the
+/// commits that did not land, which is what it says.
+fn stranded_after_merge_report(
+    number: u64,
+    head_ref: &str,
+    second_parent: &str,
+    remote_tip: &str,
+    stranded: usize,
+) -> String {
+    let plural = if stranded == 1 { "commit" } else { "commits" };
+    let was = if stranded == 1 { "was" } else { "were" };
+    format!(
+        "MERGED-BUT-STRANDED: merge_pr #{number} SUCCEEDED — the pull request IS merged and the \
+         repository DID move, so do not call merge_pr again — but it did not land all of \
+         `{head_ref}`. The merge commit's second parent is {second_parent}, while the pushed branch \
+         head is {remote_tip}: {stranded} {plural} {was} not merged. `gh` exited 0, so nothing else \
+         will tell you this (bead sparkle-a08oi0); the usual cause is a push that raced the merge. \
+         Its branch may already be deleted, so read the gap with `git log --oneline \
+         {second_parent}..{remote_tip}` and open a NEW pull request for those commits."
+    )
+}
+
+/// Ask GitHub for the merge commit a just-succeeded `gh pr merge` produced, and resolve its SECOND
+/// parent — the head the merge actually took. Two `gh api` reads rather than a local `rev-parse
+/// <merge>^2`, because the merge commit is seconds old and exists only on the remote; making this
+/// work locally would need a `git fetch` whose failure modes are far wider than a read.
+///
+/// `None` at every step: this runs AFTER the irreversible half, so a network hiccup must not turn a
+/// merge that landed into an error. Only a POSITIVE, fully-read mismatch is allowed to speak.
+fn merged_second_parent(root: &str, number: u64) -> Option<String> {
+    let gh_json = |path: &str, jq: &str| -> Option<String> {
+        let mut cmd = Command::new(crate::preflight::gh_program());
+        cmd.args(["api", path, "--jq", jq])
+            .current_dir(root)
+            .env("GH_PROMPT_DISABLED", "1")
+            .env("GH_NO_UPDATE_NOTIFIER", "1");
+        apply_noninteractive(&mut cmd);
+        let output = output_with_timeout(cmd, NETWORK_TIMEOUT).ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        // `--jq` on an absent field prints `null`, not nothing — which would otherwise become a
+        // sha-shaped string and be compared against the branch tip as if it were one.
+        if s.is_empty() || s == "null" { None } else { Some(s) }
+    };
+    let merge = gh_json(&format!("repos/{{owner}}/{{repo}}/pulls/{number}"), ".merge_commit_sha")?;
+    gh_json(&format!("repos/{{owner}}/{{repo}}/commits/{merge}"), ".parents[1].sha // \"\"")
+}
+
+/// Verify, AFTER `gh pr merge` reports success, that the merge commit actually contains the branch
+/// tip it was asked to merge (bead sparkle-a08oi0: a merge answered "already merged" at exit 0 while
+/// a commit pushed seconds earlier was not in the merge commit at all).
+///
+/// `second_parent` is the head the merge took, read from the merge commit itself. It is a parameter
+/// rather than read in here so the comparison is testable against a REAL repo with a REAL merge
+/// commit, which is the only way to prove the two `rev-list` ranges are not reversed.
+///
+/// IT MEASURES THE REMOTE-TRACKING REF, NOT `refs/heads/`. The question is "did the merge take
+/// everything the PR's branch held", and the PR's branch is the REMOTE one. A local `refs/heads/`
+/// tip is wrong in both directions, and the direction that matters is the false accusation: a
+/// worktree merely holding UNPUSHED commits merges perfectly correctly and would be reported as a
+/// dropped merge — with prose blaming "a push that raced the merge" when nothing was pushed at all
+/// (roborev 72228). Unpushed work is the SEPARATE hazard [`worktree_ahead_gate`] refuses BEFORE the
+/// merge. No remote-tracking ref means we cannot establish what was pushed, so it is `CannotTell`:
+/// fail-closed against the false positive, exactly where the rest of this gate fails open.
+fn merge_landing_gate(
+    root: &str,
+    number: u64,
+    head_ref: &str,
+    second_parent: Option<&str>,
+) -> Result<(), String> {
+    let head_ref = head_ref.trim();
+    let Some(second_parent) = second_parent.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(());
+    };
+    if head_ref.is_empty() {
+        return Ok(());
+    }
+    let full_ref = format!("refs/remotes/origin/{head_ref}");
+    let Ok(local_tip) = git(root, &["rev-parse", "--verify", "--quiet", &full_ref]) else {
+        return Ok(());
+    };
+    let local_tip = local_tip.trim().to_string();
+    // Two counts rather than `git merge-base --is-ancestor`: that command reports FALSE and an ERROR
+    // with the SAME non-zero exit, and conflating "not contained" with "git could not answer" is the
+    // exact class of bug this whole gate exists to end. A `rev-list --count` over an object we do not
+    // have fails loudly instead, and lands in `CannotTell`.
+    let count = |range: String| -> Option<usize> {
+        git(root, &["rev-list", "--count", &range]).ok()?.trim().parse().ok()
+    };
+    let (Some(ahead), Some(behind)) = (
+        count(format!("{second_parent}..{local_tip}")),
+        count(format!("{local_tip}..{second_parent}")),
+    ) else {
+        return Ok(());
+    };
+    match merge_landing_verdict(second_parent, &local_tip, ahead, behind) {
+        MergeLanding::Landed | MergeLanding::CannotTell => Ok(()),
+        MergeLanding::Stranded { stranded } => Err(stranded_after_merge_report(
+            number,
+            head_ref,
+            second_parent,
+            &local_tip,
+            stranded,
+        )),
+    }
+}
+
 /// Wall-clock ceiling for the roborev query. Local IPC to a daemon, so shorter than a network read;
 /// long enough that a busy daemon is not mistaken for a dead one.
 const ROBOREV_TIMEOUT: Duration = Duration::from_secs(30);
@@ -6788,7 +6942,12 @@ pub async fn merge_pr(
         // merged as failed — the exit status is the truth here, not the output tail.
         let captured = output_with_timeout_lenient(cmd, MERGE_TIMEOUT)?;
         if captured.output.status.success() {
-            return Ok(());
+            // AFTER the merge, because a success exit is not evidence the merge took the branch: a
+            // push that races the merge leaves `gh` reporting success over a head that predates it,
+            // and the pushed commit is then on the default branch nowhere (bead sparkle-a08oi0).
+            // Fail-OPEN on anything unread — the merge already happened, so only a positive,
+            // fully-read mismatch may speak.
+            return merge_landing_gate(&root, number, &head_ref, merged_second_parent(&root, number).as_deref());
         }
         let output = &captured.output;
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -12509,6 +12668,141 @@ mod tests {
         assert!(worktree_ahead_gate(&root, 7, "no/such/branch", Some(&pr_head)).is_ok());
         // A head oid this repo has never seen makes `rev-list` fail — not a refusal.
         assert!(worktree_ahead_gate(&root, 7, "agent/work", Some("deadbeef")).is_ok());
+    }
+
+    // ── POST-MERGE LANDING VERIFICATION ──────────────────────────────────────────────────────
+    // Bead sparkle-a08oi0: a merge answered "already merged" at EXIT 0 while a commit pushed
+    // seconds earlier was not in the merge commit at all. Every signal read green.
+
+    /// The pin that the check is actually WIRED: a substring test would pass for a
+    /// `let _ = merge_landing_gate(...);` that swallows the report, and the whole bead is a report
+    /// that never reached anyone. It must also sit AFTER the merge — before it, there is no merge
+    /// commit to read, so the check could only ever be vacuous.
+    #[test]
+    fn merge_pr_returns_the_merge_landing_gate_rather_than_a_bare_ok() {
+        const CALL: &str =
+            "return merge_landing_gate(&root, number, &head_ref, merged_second_parent(&root, number).as_deref());";
+        let src = include_str!("worktree.rs");
+        let start = src.find("pub async fn merge_pr(").expect("merge_pr's signature");
+        let body = &src[start..];
+        let merge = body.find("merge_argv(number,").expect("the merge argv");
+        let after = &body[merge..];
+        let end = after.find("\n}\n").unwrap_or(after.len());
+        assert!(
+            after[..end].lines().any(|l| l.trim() == CALL),
+            "merge_pr's success arm must RETURN merge_landing_gate, after `gh pr merge`, not `Ok(())`"
+        );
+    }
+
+    #[test]
+    fn merge_landing_reads_a_second_parent_equal_to_the_tip_as_landed() {
+        assert_eq!(merge_landing_verdict("abc123", "abc123", 0, 0), MergeLanding::Landed);
+        // A `rev-parse` result arrives with a trailing newline; that is not a difference.
+        assert_eq!(merge_landing_verdict(" abc123 ", "abc123\n", 0, 0), MergeLanding::Landed);
+    }
+
+    /// THE BEAD: the merge took a head the branch is strictly past, so those commits landed nowhere.
+    #[test]
+    fn merge_landing_reads_a_tip_past_the_second_parent_as_stranded() {
+        assert_eq!(
+            merge_landing_verdict("merged-head", "tip", 2, 0),
+            MergeLanding::Stranded { stranded: 2 }
+        );
+    }
+
+    /// The PAIRED case that pins the cause rather than merely proving an absence: every shape that
+    /// is NOT "the branch holds commits the merge did not take" must stay silent, or a successful
+    /// merge starts reporting a failure.
+    #[test]
+    fn merge_landing_refuses_to_guess_when_the_evidence_is_not_positive() {
+        // DIVERGED — a locally rewritten branch is indistinguishable from a dropped merge here.
+        assert_eq!(merge_landing_verdict("merged-head", "tip", 2, 1), MergeLanding::CannotTell);
+        // The local ref is BEHIND the merged head (a worktree that never fetched). Nothing stranded.
+        assert_eq!(merge_landing_verdict("merged-head", "tip", 0, 4), MergeLanding::CannotTell);
+        // An unreadable second parent, and an unresolvable local ref.
+        assert_eq!(merge_landing_verdict("", "tip", 2, 0), MergeLanding::CannotTell);
+        assert_eq!(merge_landing_verdict("merged-head", "", 2, 0), MergeLanding::CannotTell);
+    }
+
+    /// The report is the ONLY thing that carries the fact, so it must put both halves side by side —
+    /// which is precisely what a bare exit 0 could not do.
+    #[test]
+    fn the_stranded_after_merge_report_names_both_shas_and_never_advises_re_merging() {
+        let msg = stranded_after_merge_report(2580, "sparkle/agent-x", "aaaa1111", "bbbb2222", 2);
+        assert!(msg.contains("aaaa1111"), "must name the merged head: {msg}");
+        assert!(msg.contains("bbbb2222"), "must name the pushed branch head: {msg}");
+        assert!(msg.contains("2 commits"), "{msg}");
+        assert!(msg.contains("aaaa1111..bbbb2222"), "the gap must be readable as a range: {msg}");
+        // The PR is merged and its branch may be deleted, so every "just do it again" is unsafe.
+        for bad in ["--force", "re-merge", "--admin", "git push origin sparkle/agent-x"] {
+            assert!(!msg.contains(bad), "report must not suggest `{bad}`: {msg}");
+        }
+        assert!(stranded_after_merge_report(1, "b", "a1", "b2", 1).contains("1 commit was"), "singular");
+    }
+
+    /// EVERY OTHER `Err` FROM `merge_pr` MEANS NOTHING MERGED, and both consumers of that channel are
+    /// written on it — `workflow.ts` buckets unmatched prose as `unknown-error`, which its own comment
+    /// calls "a message a model retries verbatim". This one is the exception, so the text has to say
+    /// so in its own first clause and carry a token a consumer can match (roborev 72228). Asserting
+    /// the token alone would be vacuous — a prefix proves nothing about what the sentence claims — so
+    /// this pins the CLAIM: the merge succeeded, and calling merge_pr again is not the remedy.
+    #[test]
+    fn the_stranded_report_declares_the_merge_LANDED_rather_than_reading_as_a_failed_merge() {
+        let msg = stranded_after_merge_report(2580, "sparkle/agent-x", "aaaa1111", "bbbb2222", 2);
+        assert!(msg.starts_with("MERGED-BUT-STRANDED:"), "needs a matchable leading token: {msg}");
+        // The claim, not the label. A reader must not be able to come away thinking nothing merged.
+        assert!(msg.contains("SUCCEEDED"), "{msg}");
+        assert!(msg.contains("IS merged"), "{msg}");
+        assert!(msg.contains("do not call merge_pr again"), "{msg}");
+        // ...and the words that would send a model to retry the merge must not appear.
+        for retry in ["merge it again", "retry the merge", "run merge_pr again"] {
+            assert!(!msg.contains(retry), "report must not invite a retry (`{retry}`): {msg}");
+        }
+    }
+
+    /// A REAL repo with a REAL merge commit, driving the gate rather than only its classifier. The
+    /// classifier cannot prove the two `rev-list` ranges were pointed at the right ends, and swapping
+    /// them turns the bead's own case into a silent pass — which is the mistake this test catches.
+    #[test]
+    fn merge_landing_gate_reports_a_merge_that_did_not_take_the_branch_tip() {
+        let root = init_repo("merge-landing-gate");
+        git(&root, &["checkout", "-q", "-b", "agent/work"]).unwrap();
+        git(&root, &["commit", "--allow-empty", "-m", "the head the merge was decided against"]).unwrap();
+        let merged_head = git(&root, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
+        // The merge itself, so the second parent under test is a genuine `<merge>^2`.
+        git(&root, &["checkout", "-q", "main"]).unwrap();
+        git(&root, &["commit", "--allow-empty", "-m", "someone else's work on main"]).unwrap();
+        git(&root, &["merge", "-q", "--no-ff", "--no-edit", "agent/work"]).unwrap();
+        let second_parent = git(&root, &["rev-parse", "HEAD^2"]).unwrap().trim().to_string();
+        assert_eq!(second_parent, merged_head, "precondition: the merge took the branch as it stood");
+
+        // MATCHING: the pushed branch head is what the merge took, so the gate must stay silent.
+        git(&root, &["checkout", "-q", "agent/work"]).unwrap();
+        git(&root, &["update-ref", "refs/remotes/origin/agent/work", &second_parent]).unwrap();
+        assert!(merge_landing_gate(&root, 7, "agent/work", Some(&second_parent)).is_ok());
+
+        // THE BEAD: a commit PUSHED while the merge settled. `gh` exited 0; it is not in the merge.
+        git(&root, &["commit", "--allow-empty", "-m", "pushed seconds before the merge settled"]).unwrap();
+        let tip = git(&root, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
+        // UNPUSHED it proves nothing — that is `worktree_ahead_gate`'s hazard, not this one, and
+        // reporting it here accuses a correct merge of dropping work nobody ever sent (roborev 72228).
+        assert!(
+            merge_landing_gate(&root, 7, "agent/work", Some(&second_parent)).is_ok(),
+            "a merely-unpushed local commit must NOT be reported as a merge that dropped work"
+        );
+        // Now it is pushed, and the remote branch head is genuinely not in the merge commit.
+        git(&root, &["update-ref", "refs/remotes/origin/agent/work", &tip]).unwrap();
+        let err = merge_landing_gate(&root, 7, "agent/work", Some(&second_parent))
+            .expect_err("the merge commit's second parent is not the pushed head; that commit landed nowhere");
+        assert!(err.contains(&second_parent), "must name the merged head {second_parent}: {err}");
+        assert!(err.contains(&tip), "must name the pushed branch head {tip}: {err}");
+        assert!(err.contains("1 commit was"), "{err}");
+
+        // Nothing positive to read is never a report: no second parent, no such branch, and a sha
+        // this repo has never seen (which makes `rev-list` fail rather than answer "not contained").
+        assert!(merge_landing_gate(&root, 7, "agent/work", None).is_ok());
+        assert!(merge_landing_gate(&root, 7, "no/such/branch", Some(&second_parent)).is_ok());
+        assert!(merge_landing_gate(&root, 7, "agent/work", Some("deadbeef")).is_ok());
     }
 
     #[test]
