@@ -17,9 +17,11 @@
 //!
 //! The four rules, each validated against real data:
 //!
-//!   1. A comment is a knightwatch REVIEW iff its body contains [`REVIEW_MARKER`]. The bot posts
-//!      under a REAL HUMAN's account, so author equality is not a bot test in either direction —
-//!      the marker is the ONLY discriminator (`impostor-no-marker.json` is that case).
+//!   1. A comment is a knightwatch REVIEW iff its body STARTS with [`REVIEW_MARKER`] (leading
+//!      whitespace allowed) — ANCHORED, never `contains`, because a reply that merely QUOTES the
+//!      marker is an answer and not a review (`preamble-above-the-marker-is-not-a-review.json`).
+//!      The bot posts under a REAL HUMAN's account, so author equality is not a bot test in either
+//!      direction — the marker is the ONLY discriminator (`impostor-no-marker.json` is that case).
 //!   2. A probe is a line matching `^(\d+)\.\s+\[(blocking|open)\]`, optionally followed by
 //!      `[from: <specialist>]`. Numbering RESTARTS in every review, so probe identity is
 //!      `(comment_id, index)` and never the index alone.
@@ -455,9 +457,23 @@ fn parse_review_coverage(body: &str) -> (Option<String>, bool) {
     (head, stale)
 }
 
-/// Is this comment a knightwatch review? The marker, and nothing else.
+/// Is this comment a knightwatch review? The marker, and nothing else — ANCHORED to the START of
+/// the body, leading whitespace allowed.
+///
+/// NOT `contains`, and the anchor is the whole rule. A real review always LEADS with its marker
+/// (every fixture in the shared corpus does, and so does every real body it was built from); a
+/// QUOTATION, a code span and a blockquote never do. Unanchored, a probe REPLY that quoted the
+/// reviewer's marker while explaining what it had verified was reclassified as a review — and a
+/// review can never answer a probe, by design, so the citation was DROPPED, the probe stayed
+/// unanswered and the review count inflated by one. Silent in both directions.
+///
+/// The same anchoring [`OVERRIDE_MARKER`]'s test already uses (`trim_start().starts_with`), for the
+/// same reason, and the same one `scripts/probe-gate.sh` uses — the two implementations of this
+/// frozen contract must agree, and `preamble-above-the-marker-is-not-a-review.json` in the shared
+/// corpus is what now makes a disagreement fail rather than pass on both sides.
 fn is_knightwatch(body: &str) -> bool {
-    body.contains(REVIEW_MARKER) || body.contains(SPARKLE_REVIEW_MARKER)
+    let b = body.trim_start();
+    b.starts_with(REVIEW_MARKER) || b.starts_with(SPARKLE_REVIEW_MARKER)
 }
 
 /// Is this line blockquoted? One `>` after optional leading whitespace, the same shape
@@ -4087,8 +4103,16 @@ mod tests {
             round_one.lines().map(|l| format!("> {l}\n")).collect::<String>()
                 + "\nStill relevant — see above.\n";
 
-        // The premises this rests on. Without them it could pass for lack of anything to find.
-        assert!(is_knightwatch(&quoted_round_one), "a quote-reply really does read as a review");
+        // THE PREMISE MOVED, AND SAYING SO IS THE POINT. This assert used to read "a quote-reply
+        // really does read as a review" — it was pinning the DEFECT as its own precondition. Since
+        // `is_knightwatch` was anchored, a pure quote-reply is no longer a review at all, so that
+        // is now the FIRST line of defence and the nesting rule is the second. Asserting the old
+        // premise would fail; deleting the assert would leave the test passing for lack of anything
+        // to find, which is what a premise assert exists to prevent.
+        assert!(
+            !is_knightwatch(&quoted_round_one),
+            "an anchored is-a-review test must not classify a pure quote-reply as a review"
+        );
         assert!(quoted_round_one.contains("aaa1111"), "and it really does carry the STALE sha");
 
         let gate = evaluate(&[
@@ -4100,6 +4124,31 @@ mod tests {
             gate.reviewed_head.as_deref(),
             Some("bbb2222"),
             "round 2's head survives; the quote of round 1 must not drag coverage backwards"
+        );
+
+        // AND THE NESTING GUARD IS STILL LIVE — anchoring did not retire it, it only removed the
+        // easiest way to reach it. The dangerous shape now is a GENUINE review (leading marker, so
+        // it IS a review whatever the anchor says) that QUOTES an older round's status underneath
+        // its own. Without the depth rule that quoted `aaa1111` is read as this review's coverage
+        // and drags the head backwards — the same damage, one indirection out. Keeping this half in
+        // the same test is deliberate: the two defences protect one property, and a later edit that
+        // relaxes either should redden here.
+        let round_three_quoting_round_one =
+            format!("{REVIEW_MARKER}\n> 📋 Re-review at `ccc3333`.\n\nFor context, round 1 said:\n\n")
+                + &round_one.lines().map(|l| format!("> > {l}\n")).collect::<String>();
+        assert!(
+            is_knightwatch(&round_three_quoting_round_one),
+            "a body that LEADS with the marker is still a review, quoting or not"
+        );
+        let gate = evaluate(&[
+            comment(1, &round_one),
+            comment(2, &round_two),
+            comment(3, &round_three_quoting_round_one),
+        ]);
+        assert_eq!(
+            gate.reviewed_head.as_deref(),
+            Some("ccc3333"),
+            "a real review that quotes an older round reports its OWN head, not the quoted one"
         );
     }
 
