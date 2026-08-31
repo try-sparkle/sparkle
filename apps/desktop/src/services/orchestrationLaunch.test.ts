@@ -6,6 +6,7 @@ import { describe, it, expect, vi } from "vitest";
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 
 import { assembleBuildSpawn } from "./orchestrationLaunch";
+import { RESUME_PROMPT_SUPPRESS_MINUTES, RESUME_PROMPT_SUPPRESS_TOKENS } from "./claudeSpawn";
 
 describe("assembleBuildSpawn", () => {
   const base = {
@@ -59,6 +60,36 @@ describe("assembleBuildSpawn", () => {
   it("adds --continue on a resumed session", () => {
     const exec = assembleBuildSpawn({ ...base, resume: true }).args[2];
     expect(exec).toContain("--continue");
+  });
+
+  // bead sparkle-bucbkp: an UNATTENDED orchestrator/epic that --resumes an old, large session must
+  // never stop on Claude Code's "resume from summary?" picker — nobody is watching its pane, so the
+  // prompt escalates to the founder. The belt the worker path already sets (AgentPane.tsx) pushes
+  // the gate's age/token thresholds out of reach so the picker never draws. This asserts the SIDE
+  // EFFECT — the exec actually carries both env exports at their unreachable ceilings — not merely
+  // that a flag was passed. Removing `suppressResumePrompt: true` from assembleBuildSpawn turns it
+  // red (mutation-checked), which is the escalation the founder reported.
+  it("suppresses the resume-from-summary picker for the unattended orchestrator (bead sparkle-bucbkp)", () => {
+    const exec = assembleBuildSpawn({ ...base, resume: true }).args[2] ?? "";
+    expect(exec).toContain(
+      `export CLAUDE_CODE_RESUME_THRESHOLD_MINUTES=${RESUME_PROMPT_SUPPRESS_MINUTES}; `,
+    );
+    expect(exec).toContain(
+      `export CLAUDE_CODE_RESUME_TOKEN_THRESHOLD=${RESUME_PROMPT_SUPPRESS_TOKENS}; `,
+    );
+    // The exports must precede the `exec claude …` they are meant to scope, or the child never sees
+    // them — the same ordering the claudeSpawn suite pins for the worker path.
+    expect(exec.indexOf("CLAUDE_CODE_RESUME_TOKEN_THRESHOLD")).toBeLessThan(exec.indexOf("exec "));
+  });
+
+  // PAIRED with the above: the belt is unconditional (harmless on a fresh spawn — the gate needs a
+  // prior session to fire at all), so a NON-resumed orchestrator still carries it. This pins that
+  // the suppression rides EVERY orchestrator launch and is not silently gated on `resume`, which
+  // would reopen the wedge for the --resume path the bug is actually about.
+  it("carries the resume-suppress belt even on a fresh (non-resumed) orchestrator spawn", () => {
+    const exec = assembleBuildSpawn(base).args[2];
+    expect(exec).toContain("export CLAUDE_CODE_RESUME_THRESHOLD_MINUTES=");
+    expect(exec).toContain("export CLAUDE_CODE_RESUME_TOKEN_THRESHOLD=");
   });
 
   it("propagates a chosen account's configDir into the exec (multi Claude Max support)", () => {

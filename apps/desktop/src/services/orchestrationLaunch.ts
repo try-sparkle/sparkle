@@ -154,6 +154,16 @@ export function assembleBuildSpawn(opts: {
     permissionMode: opts.permissionMode,
     initialPrompt: opts.initialPrompt,
     inboxAgentId: opts.agentId,
+    // …and, on a resume of an old/large session, don't stop on Claude Code's "resume from
+    // summary?" picker either — the SAME belt the worker path already sets (AgentPane.tsx), for the
+    // SAME reason. A Build/orchestrator agent (an epic like "Retro Pipeline Epic") runs UNATTENDED,
+    // fanning out workers for hours with nobody watching its pane; when it `--resume`s a large
+    // session it lands on that picker and, because the auto-answer (services/suggestions
+    // `maybeAutoResume`) is inherently racy against restart-bursts and the 30s blocked-prompt grace
+    // ceiling, the prompt escalates to the founder — the exact recurring tax bead sparkle-bucbkp
+    // records. Only the worker call site set this; the orchestrator path was the gap. Child-scoped
+    // env thresholds; see suppressResumePrompt's JSDoc. Harmless on a fresh (non-resumed) spawn.
+    suppressResumePrompt: true,
   });
   return { command: SHELL, args: ["-l", "-c", exec], cwd: opts.cwd };
 }
