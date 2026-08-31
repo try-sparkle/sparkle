@@ -351,6 +351,9 @@ pub struct TranscriptPage {
     /// establishes both the history and the live cursor. `None`/`0` when the agent has no sessions.
     pub tail_file: Option<String>,
     pub tail_byte: u64,
+    /// Where this page ACTUALLY looked, and whether the environment narrowed it. See [`ScanRoots`]:
+    /// `sessionsScanned` is a count, and a count without its roots is believed rather than checked.
+    pub scan: ScanRoots,
 }
 
 /// New records appended to the newest session file since `from_byte`.
@@ -364,27 +367,137 @@ pub struct TranscriptTail {
     /// Where to resume. Never advances past a trailing partial line, so the next poll re-reads
     /// that line once it is complete.
     pub next_byte: u64,
+    /// Where this poll ACTUALLY looked. Same reasoning as [`TranscriptPage::scan`], and it matters
+    /// on every poll: the store is re-resolved each time, so a mid-session account change shows up
+    /// here rather than as a tail that quietly stops advancing.
+    pub scan: ScanRoots,
+}
+
+/// WHERE A TRANSCRIPT READ ACTUALLY LOOKED — emitted on every page and every tail poll.
+///
+/// A read resolves ONE store out of several on this machine, and that resolution used to be
+/// invisible in its result: an empty page with `sessionsScanned: 0` renders identically whether the
+/// agent has no history or the reader was pointed at a different account's store entirely.
+///
+/// `CLAUDE_CONFIG_DIR` is what makes that misfire routine rather than exotic. It is exported inside
+/// every Sparkle agent shell, so a process that inherits it narrows every read whose account is
+/// UNKNOWN (`config_dir: None`) to that one store. The same narrowing was measured as a 32x
+/// undercount in this app's builder-index dry run: 3,697 project directories under
+/// `~/.claude/projects` never scanned, 1.99B reported where the truth was 56.4B, with nothing in
+/// the output to say so (`sparkle-j3887`, 6 sightings).
+///
+/// So the roots travel WITH the number. A zero that names the directory it counted in is a question
+/// a reader can answer; a bare zero is one they believe.
+///
+/// TypeScript reads this off the wire, and a Rust `Option` crosses as `null`, NEVER as an absent
+/// key — so every field below is `field?: string | null` on the TS side, not `field?: string`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScanRoots {
+    /// The single directory whose `*.jsonl` files this read enumerated. `None` only when no root
+    /// resolved at all — neither an account config dir, nor `CLAUDE_CONFIG_DIR`, nor `HOME`.
+    pub session_dir: Option<String>,
+    /// The `projects` root `session_dir` was derived from, i.e. the store as a whole. That is the
+    /// level at which one account's history is compared against another's.
+    pub projects_root: Option<String>,
+    /// The config dir that WON the precedence, or `None` for the `$HOME/.claude` default.
+    pub config_dir: Option<String>,
+    /// The PROCESS `CLAUDE_CONFIG_DIR` verbatim, empty treated as unset. Emitted whether or not it
+    /// won, because "it was set and did NOT win" is exactly what rules the env out as an
+    /// explanation for a surprising count.
+    pub claude_config_dir_env: Option<String>,
+    /// Non-null exactly when the process env NARROWED this scan. Names the value AND the command
+    /// that clears it: a caveat a reader cannot act on is decoration.
+    pub caveat: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
 // Session directory resolution
 // ---------------------------------------------------------------------------
 
-/// The directory Claude Code stores this worktree's transcripts in.
+/// The directory Claude Code stores this worktree's transcripts in, AND the account resolution that
+/// picked it — returned together because they are one decision and separating them is how the
+/// second half stopped being reported (see [`ScanRoots`]).
 ///
 /// Composed from `claude.rs`'s own pieces on purpose — the slug rule (every non-ASCII-alphanumeric
 /// char becomes `-`, which is what makes the SPACE in `Library/Application Support` work) and the
 /// config-dir precedence (explicit account wins, empty counts as unset, else `$HOME/.claude`) both
 /// live there. Re-deriving either here is how a reader ends up pointed at a different account's
 /// history than the spawn used.
-fn session_dir(worktree_path: &str, config_dir: Option<&str>) -> Option<PathBuf> {
-    let env = std::env::var_os("CLAUDE_CONFIG_DIR")
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from);
-    let config_dir = crate::claude::resolve_session_config_dir(config_dir, env);
+///
+/// PURE — every input is a parameter, `env` kept as an `OsStr` so a non-UTF8 `CLAUDE_CONFIG_DIR`
+/// still resolves byte-exactly (only the emitted *display* copy is lossy). That is what lets the
+/// caveat rule be unit-tested without mutating process env in a test binary whose cases run in
+/// parallel.
+///
+/// The caveat fires on ONE condition, and deliberately not on the others: an explicit `config_dir`
+/// beats the env, so a read that named its account is already looking in the right store and needs
+/// no warning even with the env set. It is the UNKNOWN account — `config_dir` absent or empty —
+/// that hands the choice to whatever shell launched this process.
+fn scan_roots_from(
+    worktree_path: &str,
+    config_dir: Option<&str>,
+    env: Option<&std::ffi::OsStr>,
+    home: Option<&Path>,
+) -> (Option<PathBuf>, ScanRoots) {
+    let env = env.filter(|s| !s.is_empty());
+    let resolved =
+        crate::claude::resolve_session_config_dir(config_dir, env.map(PathBuf::from));
+    let projects_root = crate::claude::claude_projects_root(resolved.as_deref(), home);
+    let session_dir = projects_root
+        .as_ref()
+        .map(|root| crate::claude::claude_session_dir_for(root, worktree_path));
+
+    let narrowed_by_env = config_dir.filter(|s| !s.is_empty()).is_none() && env.is_some();
+    let caveat = narrowed_by_env.then(|| {
+        format!(
+            "CLAUDE_CONFIG_DIR={} narrowed this scan to ONE account store: no account was named, \
+             so the surrounding shell chose it. Sessions in every other store (including the \
+             $HOME/.claude default) were NOT scanned, so a low or zero count here can be an \
+             artifact of the environment rather than of the history. Clear it with \
+             `unset CLAUDE_CONFIG_DIR` and re-run, or name the account explicitly.",
+            env.unwrap_or_default().to_string_lossy()
+        )
+    });
+
+    let wire = ScanRoots {
+        session_dir: session_dir.as_ref().map(|p| p.to_string_lossy().into_owned()),
+        projects_root: projects_root.map(|p| p.to_string_lossy().into_owned()),
+        config_dir: resolved.map(|p| p.to_string_lossy().into_owned()),
+        claude_config_dir_env: env.map(|s| s.to_string_lossy().into_owned()),
+        caveat,
+    };
+    (session_dir, wire)
+}
+
+/// [`scan_roots_from`] against the live process environment.
+///
+/// The `PathBuf` half comes out of the SAME resolution that produced the emitted strings, never a
+/// second one — the strings are `to_string_lossy` display copies, so re-parsing one would mangle a
+/// non-UTF8 store on the way to `read_dir`, and a second resolution could drift from the reported
+/// one, which is the exact class of bug this whole change exists to make impossible.
+fn process_scan_roots(
+    worktree_path: &str,
+    config_dir: Option<&str>,
+) -> (Option<PathBuf>, ScanRoots) {
+    let env = std::env::var_os("CLAUDE_CONFIG_DIR");
     let home = std::env::var_os("HOME").map(PathBuf::from);
-    let root = crate::claude::claude_projects_root(config_dir.as_deref(), home.as_deref())?;
-    Some(crate::claude::claude_session_dir_for(&root, worktree_path))
+    scan_roots_from(worktree_path, config_dir, env.as_deref(), home.as_deref())
+}
+
+/// The message for a read that could not resolve any store at all.
+///
+/// Carries the roots for the same reason every other result does: "no root" is itself a count of
+/// zero, and the reader needs to see which inputs were absent to know whether to set an account or
+/// a `HOME`.
+fn no_root_error(roots: &ScanRoots) -> String {
+    let mut msg =
+        "no Claude projects root: neither CLAUDE_CONFIG_DIR nor HOME is set".to_string();
+    if let Some(caveat) = &roots.caveat {
+        msg.push_str(" — ");
+        msg.push_str(caveat);
+    }
+    msg
 }
 
 /// Every `*.jsonl` regular file in `dir`, newest mtime first.
@@ -1296,8 +1409,8 @@ fn transcript_page_sync(
     limit: usize,
     session_ids: Option<&[String]>,
 ) -> Result<TranscriptPage, String> {
-    let dir = session_dir(worktree_path, config_dir)
-        .ok_or_else(|| "no Claude projects root: neither CLAUDE_CONFIG_DIR nor HOME is set".to_string())?;
+    let (dir, scan) = process_scan_roots(worktree_path, config_dir);
+    let dir = dir.ok_or_else(|| no_root_error(&scan))?;
     // UNKNOWN binding → an empty page, never the newest stranger in the directory. Reported as a
     // page with nothing in it and no tail anchor, so the caller renders its ordinary empty state and
     // the live tail has nowhere to start.
@@ -1310,6 +1423,7 @@ fn transcript_page_sync(
             files_opened: 0,
             tail_file: None,
             tail_byte: 0,
+            scan,
         });
     };
     let sessions_scanned = files.len();
@@ -1330,6 +1444,7 @@ fn transcript_page_sync(
                     files_opened: 0,
                     tail_file: None,
                     tail_byte: 0,
+                    scan,
                 })
             }
         },
@@ -1400,6 +1515,7 @@ fn transcript_page_sync(
         files_opened,
         tail_file,
         tail_byte,
+        scan,
     })
 }
 
@@ -1445,8 +1561,8 @@ fn transcript_tail_sync(
     from_file: Option<&str>,
     session_ids: Option<&[String]>,
 ) -> Result<TranscriptTail, String> {
-    let dir = session_dir(worktree_path, config_dir)
-        .ok_or_else(|| "no Claude projects root: neither CLAUDE_CONFIG_DIR nor HOME is set".to_string())?;
+    let (dir, scan) = process_scan_roots(worktree_path, config_dir);
+    let dir = dir.ok_or_else(|| no_root_error(&scan))?;
     // UNKNOWN binding → follow nothing. Identical shape to "the agent has no sessions yet", which is
     // the honest answer in both cases: we have no file we can attribute to this agent.
     let files = own_session_files(&dir, session_ids).unwrap_or_default();
@@ -1455,6 +1571,7 @@ fn transcript_tail_sync(
             entries: Vec::new(),
             file: String::new(),
             next_byte: 0,
+            scan,
         });
     };
     let file_str = path.to_string_lossy().into_owned();
@@ -1543,6 +1660,7 @@ fn transcript_tail_sync(
         entries,
         file: file_str,
         next_byte,
+        scan,
     })
 }
 
@@ -1590,7 +1708,7 @@ fn own_session_path_sync(
     session_ids: Option<&[String]>,
     config_dir: Option<&str>,
 ) -> Option<String> {
-    let dir = session_dir(worktree_path, config_dir)?;
+    let dir = process_scan_roots(worktree_path, config_dir).0?;
     let files = own_session_files(&dir, session_ids)?;
     Some(files.first()?.to_string_lossy().into_owned())
 }
@@ -3381,5 +3499,193 @@ mod tests {
             .is_some_and(|p| p.ends_with("s-1111.jsonl")),
             "and the bound call through the same command does resolve",
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Scan roots — a count must name where it counted (sparkle-j3887)
+    // -----------------------------------------------------------------------
+    //
+    // THE DEFECT THESE GUARD. A transcript read resolves ONE store out of several, and the
+    // resolution used to be invisible in its result. `CLAUDE_CONFIG_DIR` is exported inside every
+    // Sparkle agent shell, so for any read whose account is UNKNOWN the surrounding shell picks
+    // the store — and the reader reports whatever it found there, in silence. The same narrowing
+    // measured a 32x undercount elsewhere in this app (3,697 project directories never scanned,
+    // 1.99B reported where the truth was 56.4B). The assertions below are all on the EMITTED
+    // OUTPUT: that it NAMES the directory actually read, and that a narrowed scan carries a caveat
+    // naming the value and the command that clears it. None of them can pass on output that does
+    // not carry the roots at all.
+
+    /// The wire half of the resolver. The `PathBuf` half is exercised end-to-end by the page and
+    /// tail tests below, which read real files out of the directory it resolves.
+    fn roots_of(
+        worktree_path: &str,
+        config_dir: Option<&str>,
+        env: Option<&std::ffi::OsStr>,
+        home: Option<&Path>,
+    ) -> super::ScanRoots {
+        super::scan_roots_from(worktree_path, config_dir, env, home).1
+    }
+
+    #[test]
+    fn an_unnamed_account_reports_the_env_that_narrowed_its_scan() {
+        let roots = roots_of(
+            "/w/tree",
+            None,
+            Some(std::ffi::OsStr::new("/accounts/one")),
+            Some(Path::new("/home/me")),
+        );
+
+        let caveat = roots
+            .caveat
+            .expect("an env-narrowed scan must say so alongside its number");
+        assert!(
+            caveat.contains("/accounts/one"),
+            "the caveat must NAME the value that narrowed the scan: {caveat}"
+        );
+        assert!(
+            caveat.contains("unset CLAUDE_CONFIG_DIR"),
+            "a caveat a reader cannot act on is decoration; it must name the command that clears \
+             the narrowing: {caveat}"
+        );
+        assert_eq!(
+            roots.claude_config_dir_env.as_deref(),
+            Some("/accounts/one"),
+            "the raw env value travels with the result so a reader can rule it in or out",
+        );
+
+        let dir = roots.session_dir.expect("a resolvable read names its directory");
+        assert!(
+            dir.starts_with("/accounts/one/projects/"),
+            "the emitted root must be the one the env actually chose: {dir}"
+        );
+        assert!(
+            !dir.contains("/home/me"),
+            "the $HOME default was NOT scanned, and the output must not imply it was: {dir}"
+        );
+    }
+
+    /// The paired half: proving the caveat fires is worthless without proving it can stay silent,
+    /// or "always warn" would pass the test above. An explicitly named account beats the env
+    /// (`claude::resolve_session_config_dir`), so that read is looking in the right store — but the
+    /// env value is STILL emitted, because "it was set and did not win" is what rules it out.
+    #[test]
+    fn a_named_account_beats_the_env_and_needs_no_caveat() {
+        let roots = roots_of(
+            "/w/tree",
+            Some("/accounts/two"),
+            Some(std::ffi::OsStr::new("/accounts/one")),
+            Some(Path::new("/home/me")),
+        );
+
+        assert_eq!(
+            roots.caveat, None,
+            "an explicitly named account is not narrowed by the env and must not be warned about",
+        );
+        assert_eq!(
+            roots.claude_config_dir_env.as_deref(),
+            Some("/accounts/one"),
+            "the env is reported whether or not it won",
+        );
+        let dir = roots.session_dir.expect("a resolvable read names its directory");
+        assert!(
+            dir.starts_with("/accounts/two/projects/"),
+            "the named account chose the store: {dir}"
+        );
+    }
+
+    #[test]
+    fn a_page_names_the_session_directory_it_actually_read() {
+        let f = fixture();
+        f.session(
+            "s-roots.jsonl",
+            &[agent_rec("a1", "2026-07-01T00:00:01Z", "hello")],
+            1_000,
+        );
+
+        let page = f.page(None, 40);
+        assert_eq!(page.entries.len(), 1, "the fixture session was read");
+        assert_eq!(
+            page.scan.session_dir.as_deref(),
+            Some(f.sessions.to_string_lossy().as_ref()),
+            "the emitted root must be the directory the page ACTUALLY enumerated, not a constant",
+        );
+        assert_eq!(
+            page.scan.config_dir.as_deref(),
+            Some(f.config.to_string_lossy().as_ref()),
+            "and the store it was resolved under",
+        );
+    }
+
+    /// THE HEADLINE CASE. `sessions_scanned: 0` with no roots renders identically whether the agent
+    /// has no history or the reader was pointed at another account's store entirely. A zero that
+    /// names the directory it counted in is a question a reader can answer; a bare zero is one they
+    /// believe.
+    #[test]
+    fn an_empty_page_still_names_the_directory_it_found_nothing_in() {
+        let f = fixture();
+        f.session(
+            "s-roots.jsonl",
+            &[agent_rec("a1", "2026-07-01T00:00:01Z", "hello")],
+            1_000,
+        );
+
+        let page = f.page_unknown(40);
+        assert_eq!(page.sessions_scanned, 0, "the unknown binding yields the silent zero");
+        assert!(page.entries.is_empty());
+        assert_eq!(
+            page.scan.session_dir.as_deref(),
+            Some(f.sessions.to_string_lossy().as_ref()),
+            "a zero must still name where it looked, or it cannot be told from a wrong-store read",
+        );
+    }
+
+    #[test]
+    fn a_tail_carries_the_same_roots_as_the_page() {
+        let f = fixture();
+        f.session(
+            "s-roots.jsonl",
+            &[agent_rec("a1", "2026-07-01T00:00:01Z", "hello")],
+            1_000,
+        );
+
+        let tail = f.tail(0);
+        assert_eq!(
+            tail.scan.session_dir.as_deref(),
+            Some(f.sessions.to_string_lossy().as_ref()),
+            "the live poll resolves the store on every call and must report it too",
+        );
+
+        let empty = f.tail_unknown(0);
+        assert_eq!(
+            empty.scan.session_dir, tail.scan.session_dir,
+            "an empty tail names the same directory a populated one does",
+        );
+    }
+
+    #[test]
+    fn scan_roots_serialize_camel_case_for_the_frontend() {
+        let roots = roots_of(
+            "/w/tree",
+            None,
+            Some(std::ffi::OsStr::new("/accounts/one")),
+            Some(Path::new("/home/me")),
+        );
+        let v: serde_json::Value = serde_json::to_value(&roots).unwrap();
+        for key in [
+            "sessionDir",
+            "projectsRoot",
+            "configDir",
+            "claudeConfigDirEnv",
+            "caveat",
+        ] {
+            assert!(v.get(key).is_some(), "missing {key} in {v}");
+        }
+        // A Rust `Option` crosses the wire as `null`, never as an absent key — so the TS side is
+        // `field?: string | null`. Pin that, since a fixture written as `field?: string` would test
+        // a shape the wire cannot produce.
+        let none = roots_of("/w/tree", Some("/a"), None, None);
+        let v: serde_json::Value = serde_json::to_value(&none).unwrap();
+        assert!(v["caveat"].is_null(), "an absent caveat must be null, not missing: {v}");
+        assert!(v["claudeConfigDirEnv"].is_null(), "{v}");
     }
 }
