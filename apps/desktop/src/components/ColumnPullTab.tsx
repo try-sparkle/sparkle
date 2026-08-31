@@ -90,7 +90,7 @@ import { C } from "../theme/colors";
 import { RADIUS } from "../theme/scale";
 import { log } from "../logger";
 import { clampWidth, type ClampedBy } from "../engine/columnResize";
-import { SIDEBAR_OVERLAY_Z } from "./layers";
+import { OVERLAID_RAIL_Z } from "./layers";
 
 /** Keyboard step, and the larger step when Shift is held. */
 const STEP = 8;
@@ -182,6 +182,22 @@ export interface ColumnPullTabProps {
    */
   overlaid?: boolean;
   onOverlayToggle?: () => void;
+  /**
+   * THE COLUMN THIS SEAM OWNS IS FLOATING — in EITHER direction, not necessarily over this seam.
+   *
+   * `overlaid` is per-SEAM: it means "the column is floated over ME", which is what the chevron and
+   * the dot zone read. `lifted` is per-COLUMN. They differ for a middle column with two seams, and
+   * the difference is a real defect: while the concierge floats one way its BOX carries
+   * `SIDEBAR_OVERLAY_Z`, which outranks the FAR rail sitting at `PULL_TAB_RAIL_Z`. The tab is
+   * `translateX(-50%)` on a 6px rail and is ~24px wide, so ~9px of the chevron and dot zone overhang
+   * INTO that box — and the box wins hit-testing there while painting nothing, so the control still
+   * looks whole and roughly a third of its click target is dead. That is exactly the defect
+   * `CONCIERGE_LIFT_Z` was introduced to prevent (roborev 54712), reintroduced from an ancestor
+   * where that guard cannot see it.
+   *
+   * Defaults to `overlaid`, so a single-seam column needs no second prop.
+   */
+  lifted?: boolean;
   /** Which side the owned column sits on. `left` means dragging right grows it. */
   grows?: "left" | "right";
   /**
@@ -363,6 +379,7 @@ export function ColumnPullTab({
   label,
   overlaid = false,
   onOverlayToggle,
+  lifted,
   grows = "left",
   widthPerPx = 1,
   cssVar,
@@ -822,7 +839,7 @@ export function ColumnPullTab({
       // The tab keeps its own handler: it is a DESCENDANT, so a press there fires this too as it
       // bubbles, which `startResize` absorbs (see its `drag.current` guard).
       onPointerDown={overlaid ? undefined : startResize}
-      style={overlaid ? railOverlaid : railDraggable}
+      style={overlaid ? railOverlaid : (lifted ? railDraggableLifted : railDraggable)}
     >
       {/* THE SEAM FILL — the gap, painted. See `seamFill` on the props for why this is what the
           reported vertical line actually is, and why neither a border change nor a bleed on the row
@@ -1139,10 +1156,18 @@ const railDraggable: CSSProperties = { ...rail, cursor: "col-resize", touchActio
  * the same guarantee reached from the other side, and it costs nothing while docked because this
  * style is only used when `overlaid` is true.
  *
- * ABOVE `SIDEBAR_OVERLAY_Z` (25) BY CONSTRUCTION, not by a hand-picked number that could drift
- * under it the next time either constant moves.
+ * THE LEVEL COMES FROM `layers.ts`, not from arithmetic on one neighbour. `SIDEBAR_OVERLAY_Z + 1`
+ * spelled here was 26 — exactly `PLAN_COLUMN_Z` — so the lifted rail TIED with the pair's Plan
+ * board and the tie broke in opposite directions on the two sides. `OVERLAID_RAIL_Z` is derived
+ * from both constants and pinned against them there.
  */
-const railOverlaid: CSSProperties = { ...rail, zIndex: SIDEBAR_OVERLAY_Z + 1 };
+const railOverlaid: CSSProperties = { ...rail, zIndex: OVERLAID_RAIL_Z };
+
+/** The FAR seam of a floated column: lifted for the reason above, but still a live resize boundary,
+ *  so it keeps the drag affordance. `overlaid` is what removes the cursor — there is no boundary to
+ *  drag when the column has floated over THIS seam — and that is a different question from whether
+ *  the column is floating at all. */
+const railDraggableLifted: CSSProperties = { ...railDraggable, zIndex: OVERLAID_RAIL_Z };
 
 /**
  * The seam fill's box — the rail's full height, PLUS one pixel into each neighbour.

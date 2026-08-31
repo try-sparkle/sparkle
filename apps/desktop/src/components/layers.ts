@@ -90,6 +90,31 @@ export const SIDEBAR_OVERLAY_Z = 25;
 // and the first time it drifted nothing could say which of the two was right.
 export const PLAN_COLUMN_Z = 26;
 
+/**
+ * THE SEAM OF A FLOATED COLUMN — the one thing that must outrank everything the column floats over,
+ * including the board that covers the column itself.
+ *
+ * A column that grows OUTBOARD grows over the very seam it was pulled from, overhanging a 6px rail
+ * by hundreds of pixels. Hover is detected on the rail, so a buried rail never fires it and the
+ * chevron that docks the column never appears: the panel is on screen and its only mouse-reachable
+ * way out is gone. `AgentSidebar` avoids this by mounting its tab INSIDE the floated element; the
+ * concierge cannot, because its rails are pinned as SIBLINGS of the box
+ * (`Workspace.resize.test.tsx`'s `assertRowStructure`), so the rail is lifted instead.
+ *
+ * DERIVED FROM THE LADDER, NOT FROM ONE NEIGHBOUR. The first cut spelled this
+ * `SIDEBAR_OVERLAY_Z + 1`, which is 26 — exactly `PLAN_COLUMN_Z`. That is not "above the board", it
+ * is a TIE, and this file already says a tie is resolved by DOM order and must never be relied on.
+ * It broke in opposite directions on the two sides: the right pair renders after
+ * `data-concierge-root`, so a concierge overlaid onto a pair in Plan mode was buried by the board
+ * and the trap was fully restored; on the left the tie went the other way and the tab's overhang
+ * paints and hit-tests OVER a board whose whole contract is that nothing beneath it is reachable.
+ *
+ * So it is one above the highest thing it can be occluded by, stated as an expression of both so a
+ * later change to either cannot silently re-create the tie. Still well under the 38–45 modal band —
+ * a seam is chrome, not a modal.
+ */
+export const OVERLAID_RAIL_Z = Math.max(SIDEBAR_OVERLAY_Z, PLAN_COLUMN_Z) + 1;
+
 // ── THE TWO COLUMNS OF A PAIR, AT REST ─────────────────────────────────────────────────────────
 // Separate from the two constants above, which are about a column that has been FLOATED. These are
 // the ordinary docked case, and they exist because of one visible defect: the selected agent row

@@ -2389,6 +2389,13 @@ export function Workspace() {
             // one-click move rather than a dead control (`nextConciergeOverlay`).
             overlaid={conciergeOverlay === "left"}
             onOverlayToggle={() => toggleConciergeOverlay("left")}
+            // LIFTED WHENEVER THE COLUMN IS FLOATING, in either direction — a different question
+            // from `overlaid`, which is per-seam. While the column floats, its BOX carries
+            // `SIDEBAR_OVERLAY_Z`, and the tab overhangs ~9px INTO that box; without the lift the
+            // box wins hit-testing there while painting nothing, so this control looks whole and a
+            // third of its click target is dead. That is the `CONCIERGE_LIFT_Z` defect
+            // (roborev 54712) reintroduced from an ancestor the original guard cannot see.
+            lifted={conciergeOverlay !== null}
             // DOWN PAST THE LEFT PAIR'S TAB STRIP, so this grip lines up with the build grip in the
             // pair beside it. See `rowGripTop`.
             topOffset={rowGripTop("left")}
@@ -2544,6 +2551,7 @@ export function Workspace() {
           // where their own column is.
           overlaid={conciergeOverlay === "right"}
           onOverlayToggle={() => toggleConciergeOverlay("right")}
+          lifted={conciergeOverlay !== null}
           // DOWN PAST THE RIGHT PAIR'S TAB STRIP — the mirror of the left rail above.
           topOffset={rowGripTop("right")}
           // THE SEAM THE FOUNDER HAS REPORTED FIVE TIMES, in the single-pair cockpit: this rail is

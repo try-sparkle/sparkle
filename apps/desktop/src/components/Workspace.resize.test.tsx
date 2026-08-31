@@ -107,7 +107,7 @@ import {
   OVERLAY_WIDTH_BOOST,
   windowAwareMax,
 } from "../engine/columnResize";
-import { SIDEBAR_OVERLAY_Z } from "./layers";
+import { PLAN_COLUMN_Z, SIDEBAR_OVERLAY_Z } from "./layers";
 import { applyVisualFixtures } from "../dev/visualFixtures";
 import { DEV_BYPASS_AUTH_FLAG } from "../dev/devBypassAuth";
 import { useProjectStore } from "../stores/projectStore";
@@ -1379,5 +1379,53 @@ describe("the concierge overlay always leaves a way back", () => {
     // The pair count is not a launch-time constant: assignments change while the app is running.
     act(() => useUiStore.setState({ pairAssignment: {}, leftProjectId: null } as never));
     expect(inner().style.position).toBe("");
+  });
+});
+
+// ── ...AND THE WAY BACK MUST OUTRANK EVERYTHING THE COLUMN FLOATS OVER ────────────────────────
+//
+// The first fix lifted the seam to `SIDEBAR_OVERLAY_Z + 1` — which is 26, exactly `PLAN_COLUMN_Z`.
+// Not "above the board": a TIE, resolved by DOM order, which broke in opposite directions on the two
+// sides of the row. And lifting only the seam the column floated OVER left the FAR seam at
+// `PULL_TAB_RAIL_Z` under a box that now carries `SIDEBAR_OVERLAY_Z`, so ~9px of its tab overhang
+// was hit-tested by an element that paints nothing — the control looked whole with a third of its
+// click target dead. Both are the same lesson: a level derived from one neighbour is not a level.
+describe("a floated concierge lifts BOTH seams, clear of the board", () => {
+  beforeEach(() => localStorage.clear());
+
+  const twoPairs = () =>
+    useUiStore.setState({ pairAssignment: { p1: "left" }, leftProjectId: "p1" } as never);
+  const railZ = (t: string) => Number(screen.getByTestId(t).style.zIndex);
+
+  it("clears the Plan board's layer outright, rather than tying with it", () => {
+    twoPairs();
+    render(<Workspace />);
+    fireEvent.click(screen.getByTestId("concierge-pull-tab-chevron"));
+    expect(railZ("concierge-pull-tab")).toBeGreaterThan(PLAN_COLUMN_Z);
+    expect(railZ("concierge-pull-tab")).toBeGreaterThan(SIDEBAR_OVERLAY_Z);
+  });
+
+  it("lifts the FAR seam too, so the box cannot swallow its tab overhang", () => {
+    // The far seam is not `overlaid` — the column floated the other way — but the BOX it overhangs
+    // into is at SIDEBAR_OVERLAY_Z the whole time. This is the CONCIERGE_LIFT_Z defect
+    // (roborev 54712) arriving from an ancestor, where that guard cannot see it.
+    twoPairs();
+    render(<Workspace />);
+    const docked = railZ("left-pair-pull-tab");
+    expect(docked).toBeLessThan(SIDEBAR_OVERLAY_Z);
+    fireEvent.click(screen.getByTestId("concierge-pull-tab-chevron"));
+    expect(railZ("left-pair-pull-tab")).toBeGreaterThan(SIDEBAR_OVERLAY_Z);
+    // …and it is still a resize boundary: only the seam the column floated OVER loses its drag.
+    expect(screen.getByTestId("left-pair-pull-tab").style.cursor).toBe("col-resize");
+    expect(screen.getByTestId("concierge-pull-tab").style.cursor).toBe("");
+  });
+
+  it("puts both rails back when the column docks", () => {
+    twoPairs();
+    render(<Workspace />);
+    const before = [railZ("left-pair-pull-tab"), railZ("concierge-pull-tab")];
+    fireEvent.click(screen.getByTestId("concierge-pull-tab-chevron"));
+    fireEvent.click(screen.getByTestId("concierge-pull-tab-chevron"));
+    expect([railZ("left-pair-pull-tab"), railZ("concierge-pull-tab")]).toEqual(before);
   });
 });

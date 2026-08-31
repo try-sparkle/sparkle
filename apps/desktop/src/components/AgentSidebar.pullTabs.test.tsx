@@ -42,7 +42,7 @@ import {
   buildWidthVar,
 } from "../engine/columnResize";
 import { AgentSidebar } from "./AgentSidebar";
-import { PLAN_COLUMN_Z, SIDEBAR_OVERLAY_Z } from "./layers";
+import { OVERLAID_RAIL_Z, PLAN_COLUMN_Z, SIDEBAR_OVERLAY_Z } from "./layers";
 import { ZoomColumnOverride } from "../hooks/useZoomColumn";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
@@ -859,10 +859,18 @@ describe("AgentSidebar — overlay mode", () => {
     // SettingsDialog's backdrop (40/41) and OpenPrMenu's click-away backdrop (40/41/42) live as
     // root-level `position: fixed` elements. PLAN_COLUMN_Z sat at exactly 40 for one commit and
     // won the tie on DOM order, so a Plan-mode click stopped dismissing the open PR menu.
-    for (const z of [SIDEBAR_OVERLAY_Z, PLAN_COLUMN_Z]) {
+    for (const z of [SIDEBAR_OVERLAY_Z, PLAN_COLUMN_Z, OVERLAID_RAIL_Z]) {
       expect(z).toBeGreaterThan(21);
       expect(z).toBeLessThan(38);
     }
+    // THE LIFTED SEAM CLEARS BOTH, and by a strict margin rather than a tie. A floated column's
+    // rail is the only mouse-reachable way to dock it again, so it must outrank the column itself
+    // AND the board that covers that column. The first spelling was `SIDEBAR_OVERLAY_Z + 1` = 26,
+    // which is exactly PLAN_COLUMN_Z: a tie, resolved by DOM order, which broke in OPPOSITE
+    // directions on the two sides of the row — the board buried the seam on one side and the seam
+    // painted over the board on the other. Ties are what this block exists to forbid.
+    expect(OVERLAID_RAIL_Z).toBeGreaterThan(SIDEBAR_OVERLAY_Z);
+    expect(OVERLAID_RAIL_Z).toBeGreaterThan(PLAN_COLUMN_Z);
     // ...and the column must actually render at that shared layer, not a number of its own.
     render(<AgentSidebar project={mkProject()} />);
     fireEvent.click(overlayTab());
