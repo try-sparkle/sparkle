@@ -28,6 +28,9 @@ import {
   buildWidthKey,
   LEGACY_BUILD_OVERLAY_KEY,
   readStoredOverlay,
+  readStoredConciergeOverlay,
+  nextConciergeOverlay,
+  CONCIERGE_OVERLAY_KEY,
   RAIL_WIDTH,
   TERMINAL_MIN_WIDTH,
   centreOf,
@@ -1097,5 +1100,58 @@ describe("buildOverlayKey — per side AND per window", () => {
     localStorage.setItem(buildOverlayKey("left"), "1");
     expect(readStoredOverlay("left")).toBe(true);
     expect(readStoredOverlay("right")).toBe(false);
+  });
+});
+
+describe("the concierge overlay is a DIRECTION — the OUTBOARD rule for a middle column", () => {
+  beforeEach(() => localStorage.clear());
+
+  it("reads back the side that was stored", () => {
+    localStorage.setItem(CONCIERGE_OVERLAY_KEY, "left");
+    expect(readStoredConciergeOverlay()).toBe("left");
+    localStorage.setItem(CONCIERGE_OVERLAY_KEY, "right");
+    expect(readStoredConciergeOverlay()).toBe("right");
+  });
+
+  it("reads anything unrecognised as DOCKED, not as overlaid", () => {
+    // The value is a free string in a store the user can edit and an older build can have written.
+    // A truthiness test would read "1" — what the BUILD column writes — as a direction, so a shared
+    // origin would dock-flip this column on the first launch after an upgrade. Absent, empty,
+    // legacy and garbage must all mean the same thing: docked.
+    for (const bad of ["1", "0", "", "true", "up", "LEFT"]) {
+      localStorage.setItem(CONCIERGE_OVERLAY_KEY, bad);
+      expect(readStoredConciergeOverlay()).toBeNull();
+    }
+    localStorage.removeItem(CONCIERGE_OVERLAY_KEY);
+    expect(readStoredConciergeOverlay()).toBeNull();
+  });
+
+  it("toggles OFF when you click the seam it is already overlaid toward", () => {
+    expect(nextConciergeOverlay("left", "left")).toBeNull();
+    expect(nextConciergeOverlay("right", "right")).toBeNull();
+  });
+
+  it("MOVES to the other side in one click, rather than docking first", () => {
+    // "I want it over there" is one intention. Docking first would make the far seam a two-click
+    // control while the near one stays single-click — the inconsistency this bead exists to remove.
+    expect(nextConciergeOverlay("left", "right")).toBe("right");
+    expect(nextConciergeOverlay("right", "left")).toBe("left");
+  });
+
+  it("overlays outward from the docked state on either seam", () => {
+    expect(nextConciergeOverlay(null, "left")).toBe("left");
+    expect(nextConciergeOverlay(null, "right")).toBe("right");
+  });
+
+  it("can never be overlaid BOTH ways at once", () => {
+    // The reason the state is one nullable direction and not two booleans: "left and right at the
+    // same time" is not a wider column, it is two conflicting positions for one element. The type
+    // makes it unrepresentable; this pins that no input produces it.
+    const reachable = new Set(
+      (["left", "right", null] as const).flatMap((cur) =>
+        (["left", "right"] as const).map((seam) => String(nextConciergeOverlay(cur, seam))),
+      ),
+    );
+    expect([...reachable].sort()).toEqual(["left", "null", "right"]);
   });
 });

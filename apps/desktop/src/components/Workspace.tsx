@@ -33,7 +33,7 @@ import { reattachProjectOnOpen } from "../services/cloudAgents/startup";
 import { NewAgentButtons } from "./NewAgentButtons";
 import { useNewBuildAgentDrop } from "../hooks/useNewBuildAgentDrop";
 import { AgentSidebar } from "./AgentSidebar";
-import { PLAN_COLUMN_Z } from "./layers";
+import { PLAN_COLUMN_Z, SIDEBAR_OVERLAY_Z } from "./layers";
 import { HeaderLink } from "./HeaderLink";
 import { PLAN_BOARD_HEADER_COLUMN_GAP, PLAN_BOARD_HEADER_ROW_GAP } from "./planBoardHeader";
 import { agentIdsInEpic } from "../engine/epicFocus";
@@ -82,10 +82,17 @@ import {
   // CONCIERGE_PAIRED_HARD_MAX is no longer read here — `acceptsStoredConciergeWidth` owns the
   // choice between the two ceilings now, which is the point of it being a predicate.
   CONCIERGE_WIDTH_VAR,
+  CONCIERGE_OVERLAY_KEY,
+  OVERLAY_EDGE_RESERVE,
+  OVERLAY_MIN_WIDTH,
+  OVERLAY_WIDTH_BOOST,
   acceptsStoredConciergeWidth,
   conciergePairedMax,
+  nextConciergeOverlay,
+  readStoredConciergeOverlay,
   windowAwareMax,
 } from "../engine/columnResize";
+import type { ConciergeOverlaySide } from "../engine/columnResize";
 import {
   clearsSelectionOnKey,
   pinnedFarEndIsGone,
@@ -1208,6 +1215,52 @@ export function Workspace() {
     publishColumnWidthVar(CONCIERGE_WIDTH_VAR, renderedConciergeWidth);
   }, [renderedConciergeWidth]);
 
+  // ── THE OUTBOARD OVERLAY (bead sparkle-7ymve1.3) ─────────────────────────────────────────────
+  // Which way this column is floated, or `null` for docked. A DIRECTION rather than a boolean
+  // because the concierge is the row's MIDDLE column and has an outboard neighbour on each side;
+  // `engine/columnResize` carries the reasoning and owns the toggle rule so the two seams cannot
+  // implement it differently.
+  const [conciergeOverlay, setConciergeOverlay] = useState<ConciergeOverlaySide>(() =>
+    readStoredConciergeOverlay(),
+  );
+  // A SEAM ASKS, THE ENGINE DECIDES. Each tab passes only which seam was clicked; whether that
+  // docks the column or moves the overlay across is `nextConciergeOverlay`'s call, in one place.
+  const toggleConciergeOverlay = (seam: "left" | "right") => {
+    setConciergeOverlay((current) => {
+      const next = nextConciergeOverlay(current, seam);
+      try {
+        // A preference we cannot persist is still a preference for this session: the column floats
+        // now and docks on relaunch, which is the same fail-closed reading `readStoredConciergeOverlay`
+        // gives an unreadable store.
+        if (next) localStorage.setItem(CONCIERGE_OVERLAY_KEY, next);
+        else localStorage.removeItem(CONCIERGE_OVERLAY_KEY);
+      } catch {
+        /* no store, no persistence — the live state below is unaffected */
+      }
+      return next;
+    });
+  };
+
+  // THE BOX IS ITS OWN SPACER, which is the whole reason this column's overlay is not a copy of
+  // `AgentSidebar`'s. That one leaves the flow and drops a SPACER SIBLING behind to hold its slot.
+  // The concierge cannot: `Workspace.resize.test.tsx`'s `assertRowStructure` pins
+  // `box.parentElement === root` AND a rail immediately either side of the box, so neither a
+  // wrapper around the box nor an extra sibling beside it survives. So the box keeps its docked
+  // width and stays in flow — nothing beside it reflows, and no PTY re-measures — and its CONTENTS
+  // float outward from the box's outboard edge instead.
+  //
+  // The width is the same expression the build column uses, for the same reason and from the same
+  // constants: a BOOST on the docked width rather than an absolute cap, floored so a narrow window
+  // yields a usable panel, and with the docked width inside the `max()` so the edge reserve can
+  // never pull the overlay NARROWER than the dock it came out of. `overlaidColumnWidth` is the
+  // arithmetic form; the constants come from there so the two cannot drift.
+  //
+  // DIVIDED BY THE COLUMN'S ZOOM for the reason the docked width is: this lands on an element
+  // inside `zoom: conciergeZoom`, so an undivided length would be scaled by Z on the way to the
+  // screen and the boost would silently become `280 · Z`.
+  const CONCIERGE_DOCKED_W = `var(${CONCIERGE_WIDTH_VAR}, ${renderedConciergeWidth}px)`;
+  const CONCIERGE_OVERLAY_W = `calc(max(${OVERLAY_MIN_WIDTH}px, ${CONCIERGE_DOCKED_W}, min(calc(${CONCIERGE_DOCKED_W} + ${OVERLAY_WIDTH_BOOST}px), calc(100vw - ${OVERLAY_EDGE_RESERVE}px))) / ${conciergeZoom})`;
+
   // Each side's selection, validated against what that side actually holds. The RIGHT pair keeps
   // using `selectedProjectId` — that value means "the current project" to the concierge feed,
   // notifications, capture and satellite ownership, and re-pointing it at a two-sided concept would
@@ -2267,7 +2320,13 @@ export function Workspace() {
             flex ITEM, but it is still a CHILD, and the row's structure is read by position — the box
             must have a rail immediately either side of it. Keeping this out of that group means
             nothing has to special-case it. */}
-        <style>{`[data-concierge-box] > section{width:100% !important}`}</style>
+        {/* THE SELECTOR FOLLOWS THE CONTENTS. This used to be `[data-concierge-box] > section`,
+            which was correct while the section was the box's direct child. The overlay puts a
+            positioned wrapper between them (`data-concierge-inner`), so the child combinator would
+            silently match NOTHING — and this rule is what makes the column fill its own box, so
+            losing it is a width bug, not a cosmetic one. Anchored to the wrapper instead, which is
+            the section's parent in BOTH states. */}
+        <style>{`[data-concierge-inner] > section{width:100% !important}`}</style>
         <div
           data-concierge-root
           // THIS COLUMN ANSWERS ITS OWN SELECTIONS — `useCopyOnSelection` copies a finished
@@ -2297,6 +2356,13 @@ export function Workspace() {
             cssVar={CONCIERGE_WIDTH_VAR}
             label="Sparkle column"
             testId="left-pair-pull-tab"
+            // THE LEFT SEAM OVERLAYS LEFTWARD — outboard, away from the row's centre, over the
+            // epics/build column on this side. `overlaid` is this seam's OWN direction, not the
+            // column's: floated the other way, this tab is docked as far as it is concerned, so its
+            // chevron still offers to bring the column over here. That is what makes the far seam a
+            // one-click move rather than a dead control (`nextConciergeOverlay`).
+            overlaid={conciergeOverlay === "left"}
+            onOverlayToggle={() => toggleConciergeOverlay("left")}
             // DOWN PAST THE LEFT PAIR'S TAB STRIP, so this grip lines up with the build grip in the
             // pair beside it. See `rowGripTop`.
             topOffset={rowGripTop("left")}
@@ -2353,6 +2419,45 @@ export function Workspace() {
             // new size but lays out at the old one, so the column would overlap its neighbours and
             // every hit-test inside would be offset from what the user sees.
             zoom: conciergeZoom,
+            // THE CONTAINING BLOCK for the overlay below. Adding `relative` to an element that is
+            // already a flex item changes no layout on its own, and it keeps the floated contents
+            // anchored to THIS box — the slot they came out of — rather than to whatever positioned
+            // ancestor happened to be next up the tree.
+            position: "relative",
+          }}
+        >
+        {/* THE COLUMN'S CONTENTS, which are what actually float. Docked, this is an ordinary
+            full-size flex child and the box is unchanged from before the overlay existed.
+            Overlaid, it leaves the flow and grows OUTBOARD — away from the row's centre, over the
+            neighbour on that side — while the box behind it holds the docked width so nothing in
+            the row moves and no terminal re-measures its PTY.
+
+            THE ANCHOR IS THE OPPOSITE EDGE FROM THE DIRECTION OF TRAVEL, which is the part that is
+            easy to get backwards: to grow RIGHTWARD the panel must be pinned by its LEFT edge, or
+            it would grow away from its own slot and appear to teleport (the bug roborev 55337
+            found on the build column's mirror). */}
+        <div
+          data-concierge-inner
+          data-testid="concierge-inner"
+          style={{
+            display: "flex",
+            minWidth: 0,
+            minHeight: 0,
+            flex: "1 1 auto",
+            ...(conciergeOverlay
+              ? {
+                  position: "absolute" as const,
+                  [conciergeOverlay === "right" ? "left" : "right"]: 0,
+                  top: 0,
+                  bottom: 0,
+                  height: "auto",
+                  width: CONCIERGE_OVERLAY_W,
+                  // See components/layers.ts — the same layer the build column's overlay uses,
+                  // because they are the same affordance and must not fight for the top.
+                  zIndex: SIDEBAR_OVERLAY_Z,
+                  boxShadow: "0 8px 24px rgba(0,0,0,0.45)",
+                }
+              : null),
           }}
         >
         <ConciergeHost
@@ -2367,6 +2472,7 @@ export function Workspace() {
           // closed agent's pill has to open it — seeding the query alone would paint nothing.
           onOpenHistory={palette.openPalette}
         />
+        </div>
         </div>
         {/* THE CONCIERGE BOUNDARY IS DRAGGABLE NOW. This column shipped at a hardcoded 360 with no
             way to move it, while the agent column beside it had a full resize strip — so of the
@@ -2397,6 +2503,11 @@ export function Workspace() {
           cssVar={CONCIERGE_WIDTH_VAR}
           label="Sparkle column"
           testId="concierge-pull-tab"
+          // …and the right seam overlays RIGHTWARD, the mirror of the left rail above. The two tabs
+          // read the same state and write through the same rule, so they cannot disagree about
+          // where their own column is.
+          overlaid={conciergeOverlay === "right"}
+          onOverlayToggle={() => toggleConciergeOverlay("right")}
           // DOWN PAST THE RIGHT PAIR'S TAB STRIP — the mirror of the left rail above.
           topOffset={rowGripTop("right")}
           // THE SEAM THE FOUNDER HAS REPORTED FIVE TIMES, in the single-pair cockpit: this rail is

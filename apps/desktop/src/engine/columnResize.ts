@@ -340,6 +340,64 @@ export function readStoredOverlay(side: "left" | "right", satellite = false): bo
   return (own ?? legacy) === "1";
 }
 
+/**
+ * THE CONCIERGE'S OVERLAY IS A DIRECTION, NOT A BOOLEAN — and that is the whole difference from the
+ * build column's (bead sparkle-7ymve1.3).
+ *
+ * A build column has ONE outboard neighbour, so "overlaid" is a yes/no. The concierge sits in the
+ * MIDDLE of the row and has two seams, so the founder's own examples require two different
+ * answers from one column: "the concierge would overlay EPICS" (leftward) and "makes the Build
+ * column overlay the terminal" (rightward). The consistent rule behind all of them is OUTBOARD —
+ * each column grows AWAY from the centre, over its next neighbour outward — which for a
+ * middle column means the seam you pulled decides which way it goes.
+ *
+ * Encoding that as two booleans would admit a state the layout cannot paint: overlaid left AND
+ * right at once, which is not "wider", it is two conflicting positions for one element. One
+ * nullable direction makes that unrepresentable rather than merely untested.
+ *
+ * ONE KEY, because the concierge is ONE column — the opposite of `buildOverlayKey`, which must
+ * split because there are two build columns and a satellite sharing a `localStorage` origin
+ * (sparkle-7ymve1.5). Splitting a single column's preference per seam would let the two tabs
+ * disagree about where their own column is.
+ */
+export type ConciergeOverlaySide = "left" | "right" | null;
+
+/** Storage for the concierge's overlay DIRECTION — spelled beside the width's key for the same
+ *  reason `buildOverlayKey` is: so a second caller cannot respell it. */
+export const CONCIERGE_OVERLAY_KEY = "sparkle-concierge-overlay";
+
+/** The stored overlay direction — the SEED for the concierge's overlay state, and the only reader
+ *  of that key.
+ *
+ *  ANYTHING UNRECOGNISED IS `null`, not a throw and not a coerced `true`. The value is a free
+ *  string in a store the user can edit and an older build can have written, and the honest reading
+ *  of "I do not understand this" is the docked state — the same fail-closed choice
+ *  `readStoredOverlay` makes for an unreadable store. */
+export function readStoredConciergeOverlay(): ConciergeOverlaySide {
+  let raw: string | null = null;
+  try {
+    raw = localStorage.getItem(CONCIERGE_OVERLAY_KEY);
+  } catch {
+    // A preference we cannot read is a preference we do not have; the column docks.
+    return null;
+  }
+  return raw === "left" || raw === "right" ? raw : null;
+}
+
+/**
+ * WHICH DIRECTION A CLICK ON ONE SEAM SHOULD PRODUCE — the OUTBOARD rule, in one place.
+ *
+ * Clicking the seam you are already overlaid toward docks the column again (a toggle). Clicking
+ * the OTHER seam moves the overlay to that side rather than docking first, because "I want it over
+ * there" is one intention and should not cost two clicks.
+ */
+export function nextConciergeOverlay(
+  current: ConciergeOverlaySide,
+  seam: "left" | "right",
+): ConciergeOverlaySide {
+  return current === seam ? null : seam;
+}
+
 /** The pre-split key every build before the per-side keys wrote. Read as the SEED for both sides so
  *  an existing width survives rather than silently resetting to the default. */
 const LEGACY_BUILD_WIDTH_KEY = "sparkle-sidebar-width";

@@ -103,6 +103,8 @@ import {
   CONCIERGE_MAX_WIDTH,
   CONCIERGE_MIN_WIDTH,
   CONCIERGE_WIDTH_VAR,
+  CONCIERGE_OVERLAY_KEY,
+  OVERLAY_WIDTH_BOOST,
   windowAwareMax,
 } from "../engine/columnResize";
 import { applyVisualFixtures } from "../dev/visualFixtures";
@@ -1192,5 +1194,115 @@ describe("the concierge grip clears the pair's tab strip", () => {
     for (const t of ["left-pair-pull-tab", "concierge-pull-tab"]) {
       expect(zoneTop(t)).toMatch(/^calc\(var\(--pairtabs-h-(left|right), 0px\) \+ 34px\)$/);
     }
+  });
+});
+
+// ── THE CONCIERGE HAS AN OVERLAY ARROW NOW, AND IT GOES OUTBOARD ──────────────────────────────
+//
+// The founder's report is that the arrow "does nothing different from the six dots", and that the
+// concierge has no arrow at all. The second half is this bead (sparkle-7ymve1.3): the chevron zone
+// renders only when `onOverlayToggle` is passed, and only the build mount passed it — which was
+// correct as written, because an affordance that does nothing is worse than an absent one. So the
+// work is to give this column a REAL overlay mode, and these assert the mode, not the arrow.
+//
+// The rule is OUTBOARD: a column grows away from the row's centre, over its next neighbour outward.
+// For the row's MIDDLE column that means the seam you pulled decides the direction, which is why
+// the state is a direction and not a boolean (`engine/columnResize`).
+describe("the concierge overlays OUTBOARD from whichever seam was pulled", () => {
+  beforeEach(() => localStorage.clear());
+
+  const inner = () => screen.getByTestId("concierge-inner");
+  const twoPairs = () =>
+    useUiStore.setState({ pairAssignment: { p1: "left" }, leftProjectId: "p1" } as never);
+
+  it("gives BOTH concierge seams a chevron — the affordance the column did not have", () => {
+    twoPairs();
+    render(<Workspace />);
+    expect(screen.getByTestId("left-pair-pull-tab-chevron")).toBeTruthy();
+    expect(screen.getByTestId("concierge-pull-tab-chevron")).toBeTruthy();
+  });
+
+  it("floats the contents LEFT off the left seam, and RIGHT off the right one", () => {
+    twoPairs();
+    render(<Workspace />);
+    // Docked: in flow. Not "some other position" — in flow, which is what leaves the row alone.
+    expect(inner().style.position).toBe("");
+
+    fireEvent.click(screen.getByTestId("left-pair-pull-tab-chevron"));
+    // PINNED BY THE OPPOSITE EDGE FROM ITS TRAVEL. To grow leftward the panel is held by its RIGHT
+    // edge; anchoring it by the edge it is moving toward is how the build column's mirror once made
+    // the panel teleport away from its own slot (roborev 55337).
+    expect(inner().style.position).toBe("absolute");
+    expect(inner().style.right).toBe("0px");
+    expect(inner().style.left).toBe("");
+
+    fireEvent.click(screen.getByTestId("concierge-pull-tab-chevron"));
+    expect(inner().style.left).toBe("0px");
+    expect(inner().style.right).toBe("");
+  });
+
+  it("comes out WIDER than the dock, which is the whole complaint", () => {
+    // THE EFFICACY ASSERTION, and the reason the parent bead was filed: the old build-column overlay
+    // was capped at a fixed 480, so for any column already that wide it produced the same width in
+    // the same place — "exactly nothing happening". A boost on the docked width cannot do that.
+    twoPairs();
+    render(<Workspace />);
+    fireEvent.click(screen.getByTestId("concierge-pull-tab-chevron"));
+    const w = inner().style.width;
+    expect(w).toContain(`+ ${OVERLAY_WIDTH_BOOST}px`);
+    // …and the docked width is inside the max(), so the edge reserve can never pull it under.
+    expect(w).toContain(`var(${CONCIERGE_WIDTH_VAR}`);
+  });
+
+  it("leaves the BOX in flow at its docked width — the box is its own spacer", () => {
+    // No spacer sibling and no wrapper: `assertRowStructure` pins that the box is a direct child of
+    // the group with a rail either side, so this column cannot float the way the build column does.
+    // The box holding its own slot is what keeps the row from reflowing and a PTY from re-measuring.
+    twoPairs();
+    render(<Workspace />);
+    const before = screen.getByTestId("concierge-box").style.width;
+    fireEvent.click(screen.getByTestId("concierge-pull-tab-chevron"));
+    expect(screen.getByTestId("concierge-box").style.width).toBe(before);
+    expect(screen.getByTestId("concierge-box").style.position).toBe("relative");
+  });
+
+  it("MOVES across in one click, and docks when you re-click the seam it is on", () => {
+    twoPairs();
+    render(<Workspace />);
+    fireEvent.click(screen.getByTestId("concierge-pull-tab-chevron"));
+    expect(inner().style.left).toBe("0px");
+    // The FAR seam moves it rather than docking it — one intention, one click.
+    fireEvent.click(screen.getByTestId("left-pair-pull-tab-chevron"));
+    expect(inner().style.right).toBe("0px");
+    // The seam it is already on docks it.
+    fireEvent.click(screen.getByTestId("left-pair-pull-tab-chevron"));
+    expect(inner().style.position).toBe("");
+  });
+
+  it("survives a relaunch, and an unrecognised stored value docks", () => {
+    localStorage.setItem(CONCIERGE_OVERLAY_KEY, "right");
+    twoPairs();
+    render(<Workspace />);
+    expect(inner().style.left).toBe("0px");
+    cleanup();
+    // "1" is what the BUILD column writes to a key one character away. A truthiness read here would
+    // float this column on the first launch after an upgrade.
+    localStorage.setItem(CONCIERGE_OVERLAY_KEY, "1");
+    twoPairs();
+    render(<Workspace />);
+    expect(inner().style.position).toBe("");
+  });
+
+  it("keeps the section rule pointed at the element that actually holds it", () => {
+    // The overlay puts a wrapper between the box and the section, so `[data-concierge-box] > section`
+    // would match nothing — and that rule is what makes the column fill its own box. A silently dead
+    // selector is a width bug with no error.
+    render(<Workspace />);
+    const rule = Array.from(document.querySelectorAll("style"))
+      .map((el) => el.textContent ?? "")
+      .find((t) => t.includes("width:100% !important"));
+    expect(rule).toContain("[data-concierge-inner] > section");
+    // …and the element that selector names is the one that exists, rather than a stale spelling.
+    expect(document.querySelector("[data-concierge-inner]")).toBe(inner());
   });
 });
