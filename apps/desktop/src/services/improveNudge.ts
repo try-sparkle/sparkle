@@ -222,6 +222,74 @@ export function respinFleetNudgeText(readyCount: number, freeSlots: number): str
 }
 
 /**
+ * THE LOUDEST PUSH THERE IS — the fleet is 100% idle against a live backlog while FINISHED agents sit
+ * on every slot (bead `sparkle-nu7gd9`).
+ *
+ * ── WHAT WAS MEASURED, AND WHY NOTHING FIRED ─────────────────────────────────────────────────────
+ * The concierge measured ~30 build agents with ZERO working: almost all had goal state `met` and
+ * stall `finished`, holding 79 of 81 slots, while `bd ready` reported 2148 ready issues. The
+ * watcher raised NOTHING about it. It was, meanwhile, loud about stale PR-drift — several of those
+ * alerts provably wrong. Loud about noise, silent about the thing that matters.
+ *
+ * That silence was STRUCTURAL, not a missing threshold, and both of the loud shapes were disabled by
+ * the very condition they exist to detect:
+ *
+ *   • `unstaffed-epic-alarm` asks whether a bound orchestrator is LIVE, and a finished agent is very
+ *     much alive — its process is up and its pane reads `idle`. So all 30 finished orchestrators read
+ *     as STAFFED and the epic count was 0.
+ *   • `respin` asks for `activeWorkers === 0`, and that number counts ROWS, not work. 79 finished rows
+ *     are 79 "active workers", so the arm could not fire while a single finished row survived.
+ *
+ * Both readings are individually defensible and together they guarantee silence in exactly the state
+ * the founder wants shouted about. The fix is one idea applied in both places: **a finished agent is
+ * not a working agent**, so the judgment runs off `workingAgents` (alive AND not finished) rather than
+ * off liveness or row count.
+ *
+ * ── WHY THIS SHAPE IS NOT GATED ON `freeSlots > 0`, WHEN EVERY OTHER LOUD SHAPE IS ────────────────
+ * The headroom gate is correct for a push that says SPAWN — escalating into a saturated machine only
+ * manufactures admission refusals ("29 of 19 agent slots taken"), which is the founder's own capacity
+ * note. It is exactly WRONG for a push that says RECLAIM. When the slots are held by agents that have
+ * finished, headroom is zero *because* of the defect, so gating on headroom makes the alarm silence
+ * itself precisely when it is right. That is the inversion this shape exists to end: the remedy here
+ * creates the headroom rather than needing it.
+ *
+ * So the message orders the two steps in the only order that can work — RETIRE the finished agents
+ * first, THEN dispatch into the slots that frees — and surfaces the fact to the concierge, because a
+ * fleet that has been idle against thousands of ready items is something the human should learn about
+ * even though no human action is required to fix it. (That last clause is deliberate: an unretired
+ * slot is machine-clearable, so under the founder's rule it must never render RED. It is a
+ * three-alarm fire aimed at the MACHINE, not a summons for a human.)
+ *
+ * Like `respinFleetNudgeText` this carries digits, which is safe for the same reason: `sweepImproveNudge`
+ * sends it directly via `send`, never through the Pusher's challenge path, so `checkCitations` never
+ * sees it. It must not be routed through the challenge path.
+ */
+export function fleetIdleAlarmNudgeText(
+  readyCount: number,
+  reclaimable: number,
+  totalRows: number,
+  freeSlots: number,
+): string {
+  const finished =
+    reclaimable === 1
+      ? "1 agent has FINISHED (goal met / stall finished) and still holds its slot"
+      : `${reclaimable} agents have FINISHED (goal met / stall finished) and still hold their slots`;
+  const slots = freeSlots === 1 ? "1 slot is free" : `${freeSlots} slots are free`;
+  return (
+    `THREE-ALARM FIRE: the fleet is 100% IDLE — ZERO agents are working — against ${readyCount} ready ` +
+    `beads. ${finished}, out of ${totalRows} local rows; only ${slots}. Nothing is being built. Do ` +
+    `these three things NOW, in this order, and do not reply with a status report, a plan, or a ` +
+    `question: (1) RECLAIM — retire/spin down every finished agent so its slot returns to the pool; ` +
+    `this is what creates the headroom, and skipping it makes step 2 fail with admission refusals. ` +
+    `(2) DISPATCH — fan out drain workers into the reclaimed slots, highest-value ready work first ` +
+    `(open P1/blocking pipeline-health beads, then \`bd ready\`, then the agent-feedback inbox). ` +
+    `(3) SURFACE — message the concierge (send_peer_message to sparkle:concierge) that the fleet was ` +
+    `fully idle against ${readyCount} ready beads, so the human learns the backlog stalled. Account ` +
+    `caps and token cost are NEVER factors; machine headroom is the only bound.`
+  );
+}
+
+/**
  * The SPECIFIC "notify the concierge about a RED pipeline-health finding" push. When the board carries
  * an OPEN P1 pipeline-health bead — the fleet's highest-severity signal, the kind that needs a HUMAN to
  * unblock it — the correct action is not to quietly work the bead but to SURFACE it to the concierge,
@@ -392,10 +460,37 @@ export interface ImproveNudgeInput {
    *  When > 0 there is room to spawn a drain fleet; when 0 the machine is full and the re-spin push
    *  would be counterproductive, so the generic reminder is used instead. */
   freeSlots: number;
-  /** How many local drain workers are currently active (the capacity reading's occupied slots). When
-   *  0 the fleet is idle and re-spinning is exactly the action to push; when > 0 workers are already
-   *  draining, so no re-spin nudge fires. */
+  /** How many local build/worker ROWS exist (the capacity reading's occupied slots).
+   *
+   *  ⚠️ THIS IS NOT AN IDLENESS TEST, AND USING IT AS ONE WAS THE BUG (bead `sparkle-nu7gd9`). It
+   *  counts rows, not work: a row whose agent finished hours ago still occupies a slot and still
+   *  increments this number, so `activeWorkers === 0` is false while a single finished row survives.
+   *  Measured, 79 finished rows made the re-spin arm unreachable at the exact moment the fleet was
+   *  100% idle against 2148 ready beads. Judge idleness with {@link workingAgents}; this number is
+   *  kept because the alarm message quotes it ("M of K rows are finished") to make the remedy legible. */
   activeWorkers: number;
+  /** How many local build/worker rows are ACTUALLY WORKING right now — process alive AND goal not
+   *  quiet (not `met`/`discharged`/`awaiting_close`). This is the honest "is anything being built?"
+   *  reading, and it is what every idleness judgment below runs off. 0 means the fleet is doing
+   *  nothing, however many rows exist. Reads conservatively: an agent whose liveness or goal cannot
+   *  be read counts as WORKING, so an unreadable roster can never manufacture a false alarm. */
+  workingAgents: number;
+  /** How many local build/worker rows are FINISHED but still holding a slot — process alive, goal
+   *  quiet. These are the slots a machine can reclaim with no human involved, which is why a fleet
+   *  stuck behind them must be loud at the MACHINE and must never render RED (the founder's rule:
+   *  red means a human is the only one who can unblock it). > 0 together with `workingAgents === 0`
+   *  and a ready backlog is the `fleet-idle-alarm`. 0 when unreadable — fail toward silence. */
+  reclaimableAgents: number;
+  /** How many local build/worker rows this window has NOT observed at all — no runtime status entry,
+   *  so their liveness is unknown (an unvisited project tab, a row owned by another window, or every
+   *  row on the first sweep after an app restart).
+   *
+   *  ⚠️ IT GATES THE FLEET-IDLE ALARM, because "nothing is working" is a claim about the WHOLE fleet
+   *  and one unobserved row means the evidence is incomplete (roborev 72764). Project A's tab open
+   *  with one finished agent while project B is unvisited and flat out reads `workingAgents === 0`,
+   *  and firing there would order a drain fan-out into a machine that is already busy. 0 means every
+   *  row was actually looked at. */
+  unobservedAgents: number;
   /** How many `in_progress` epics have children (are buildable) but NO live orchestrator bound — the
    *  founder's "unstaffed work that is supposed to be actively built" (bead sparkle-nu7gd9). > 0 makes
    *  the three-alarm-fire push eligible, but ONLY together with `freeSlots > 0`: with no admission
@@ -420,6 +515,14 @@ export type ImproveNudgeDecision =
   | { nudge: true; kind: "respin"; readyCount: number; freeSlots: number }
   | { nudge: true; kind: "concierge-notify"; fingerprint: string; count: number }
   | { nudge: true; kind: "unstaffed-epic-alarm"; epicCount: number; freeSlots: number }
+  | {
+      nudge: true;
+      kind: "fleet-idle-alarm";
+      readyCount: number;
+      reclaimable: number;
+      totalRows: number;
+      freeSlots: number;
+    }
   | { nudge: false; reason: ImproveNudgeRefusal };
 
 export type ImproveNudgeRefusal =
@@ -449,7 +552,12 @@ export type ImproveNudgeRefusal =
  *
  * On a `nudge` verdict it chooses the SHAPE of the push, in priority order:
  *
- *   0. `unstaffed-epic-alarm` (bead sparkle-nu7gd9) — an `in_progress` epic with children (buildable)
+ *   0. `fleet-idle-alarm` (bead sparkle-nu7gd9) — ZERO agents are working, there IS ready backlog, and
+ *      FINISHED agents are still holding slots. The loudest shape there is, and the ONLY one not gated
+ *      on `freeSlots > 0`: its remedy is RECLAMATION, which creates the headroom the other shapes wait
+ *      for, so gating it on headroom would silence it exactly when it is right. See
+ *      `fleetIdleAlarmNudgeText` for the measured failure it exists to end.
+ *   0b. `unstaffed-epic-alarm` (bead sparkle-nu7gd9) — an `in_progress` epic with children (buildable)
  *      has NO live orchestrator AND the machine has admission headroom (`freeSlots > 0`). This is the
  *      LOUDEST push — a three-alarm fire — and PRE-EMPTS every shape below: the founder wants unstaffed
  *      buildable work surfaced and staffed, not silently ignored. It is gated on `freeSlots > 0` on
@@ -505,6 +613,42 @@ export function decideImproveNudge(input: ImproveNudgeInput): ImproveNudgeDecisi
   // admission refusals ("29 of 19 slots taken"), so with no headroom this shape does not fire — a
   // louder nudge could not admit a new orchestrator and would only manufacture refusals. The
   // staffing/surface push then waits for the ordinary cadence to resurface it once slots free.
+  // HIGHEST PRIORITY OF ALL — THE FLEET IS 100% IDLE AND FINISHED AGENTS ARE HOLDING THE SLOTS
+  // (bead `sparkle-nu7gd9`). Nothing is being built, there IS ready work, and the reason nothing can
+  // start is that agents which already finished never gave their slots back.
+  //
+  // It pre-empts the unstaffed-epic alarm below because it is strictly worse: an unstaffed epic is
+  // work nobody picked up, this is the WHOLE FLEET stopped. And it is deliberately NOT gated on
+  // `freeSlots > 0` — the one shape here that is not. Every other loud push says SPAWN, and spawning
+  // into a saturated machine only manufactures admission refusals, so those correctly wait for
+  // headroom. This one says RECLAIM FIRST, and the headroom it would have waited for is precisely
+  // what the defect consumed: gating it on free slots makes the alarm silence itself exactly when it
+  // is right. That inversion — loud about noise, silent about the fleet being stopped — is the whole
+  // bug (measured: ~30 finished agents, zero working, 79/81 slots held, 2148 ready, watcher silent).
+  //
+  // `reclaimableAgents > 0` is what separates this from the `respin` arm below rather than a
+  // magnitude threshold: with nothing to reclaim, an idle fleet with headroom is an ordinary re-spin
+  // and gets the ordinary push. Both arms are therefore reachable and neither shadows the other.
+  // `unobservedAgents === 0` is the COMPLETENESS term, and it is not optional (roborev 72764):
+  // `workingAgents === 0` is an absence of contrary evidence, not evidence of absence. A row this
+  // window never observed is in neither count, so an unvisited project full of busy workers reads as
+  // zero working — and this push would then order a drain fan-out into a machine that is already
+  // flat out. The alarm speaks only when every row was actually looked at.
+  if (
+    input.workingAgents === 0 &&
+    input.readyBacklogCount > 0 &&
+    input.reclaimableAgents > 0 &&
+    input.unobservedAgents === 0
+  ) {
+    return {
+      nudge: true,
+      kind: "fleet-idle-alarm",
+      readyCount: input.readyBacklogCount,
+      reclaimable: input.reclaimableAgents,
+      totalRows: input.activeWorkers,
+      freeSlots: input.freeSlots,
+    };
+  }
   if (input.unstaffedBuildableEpicCount > 0 && input.freeSlots > 0) {
     return {
       nudge: true,
@@ -539,6 +683,16 @@ export function decideImproveNudge(input: ImproveNudgeInput): ImproveNudgeDecisi
   // and zero workers already draining; otherwise the generic reminder. `readyBacklogCount > 0` (not the
   // P1 arm) gates re-spin because the message names "N ready beads" to dispatch — a lone blocked-but-open
   // P1 has nothing to fan a drain fleet across.
+  // ⚠️ THIS ARM DELIBERATELY STILL JUDGES ROWS (`activeWorkers`), NOT WORK. It was changed to
+  // `workingAgents` and changed back, because the two arms need OPPOSITE failure directions and only
+  // this one can fire without positive evidence. `workingAgents` counts only rows observed alive, so
+  // on the first sweep after an app restart — when `useRuntimeStore.status` is empty and every row
+  // reads unobserved — it is 0 for a fleet that may be busily building, and this arm would push
+  // "spin a drain fleet NOW" straight into it. The `fleet-idle-alarm` above cannot make that mistake
+  // because it additionally requires `reclaimableAgents > 0`, which needs an agent POSITIVELY
+  // observed alive with a quiet goal. `activeWorkers === 0` means "there is not a single local
+  // build/worker row", which is narrow but is real evidence rather than an absence of it — so the
+  // finished-fleet case belongs to the alarm above, and this arm keeps the reading it can trust.
   if (input.readyBacklogCount > 0 && input.freeSlots > 0 && input.activeWorkers === 0) {
     return { nudge: true, kind: "respin", readyCount: input.readyBacklogCount, freeSlots: input.freeSlots };
   }
@@ -585,10 +739,20 @@ export interface ImproveNudgeDeps {
     p1PipelineHealthFingerprint: string | null;
     nextReadyBead: NextReadyBead | null;
   };
-  /** The machine-capacity reading behind the re-spin decision: `freeSlots` is the local agent
-   *  headroom (`localAgentCapacity` `limit − used`, clamped ≥ 0) and `activeWorkers` is how many
-   *  local drain workers are occupying slots right now. */
-  capacity(): { freeSlots: number; activeWorkers: number };
+  /** The machine-capacity reading behind the re-spin and fleet-idle decisions. `freeSlots` is the
+   *  local agent headroom (`localAgentCapacity` `limit − used`, clamped ≥ 0); `activeWorkers` is how
+   *  many local build/worker ROWS occupy slots (rows, not work — see the field doc); `workingAgents`
+   *  is how many of those rows are actually working (alive AND goal not quiet); and
+   *  `reclaimableAgents` is how many are finished-but-still-holding-a-slot. The last two are what
+   *  every idleness judgment runs off — see `ImproveNudgeInput.activeWorkers` for why the row count
+   *  cannot serve (bead `sparkle-nu7gd9`). */
+  capacity(): {
+    freeSlots: number;
+    activeWorkers: number;
+    workingAgents: number;
+    reclaimableAgents: number;
+    unobservedAgents: number;
+  };
   /** How many `in_progress` epics have children (are buildable) but NO live orchestrator bound — the
    *  three-alarm-fire signal (bead sparkle-nu7gd9). Read from the cached beads board + agent roster +
    *  runtime liveness, no `bd` shell call. 0 when unreadable (the fail-toward-silence direction). */
@@ -756,6 +920,9 @@ export async function sweepImproveNudge(deps: ImproveNudgeDeps): Promise<Improve
       conciergeCadenceMs: CONCIERGE_NOTIFY_CADENCE_MS,
       freeSlots: capacity.freeSlots,
       activeWorkers: capacity.activeWorkers,
+      workingAgents: capacity.workingAgents,
+      reclaimableAgents: capacity.reclaimableAgents,
+      unobservedAgents: capacity.unobservedAgents,
       unstaffedBuildableEpicCount: unstaffed.unstaffedBuildableEpicCount,
       nextReadyBead: backlog.nextReadyBead,
       lastNudgedAt,
@@ -782,6 +949,13 @@ export async function sweepImproveNudge(deps: ImproveNudgeDeps): Promise<Improve
     const text =
       decision.kind === "unstaffed-epic-alarm"
         ? unstaffedEpicAlarmNudgeText(decision.epicCount, decision.freeSlots)
+        : decision.kind === "fleet-idle-alarm"
+          ? fleetIdleAlarmNudgeText(
+              decision.readyCount,
+              decision.reclaimable,
+              decision.totalRows,
+              decision.freeSlots,
+            )
         : decision.kind === "respin"
           ? respinFleetNudgeText(decision.readyCount, decision.freeSlots)
           : decision.kind === "concierge-notify"

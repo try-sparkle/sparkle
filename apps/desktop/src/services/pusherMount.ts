@@ -68,6 +68,8 @@ import {
   type NextReadyBead,
 } from "./improveNudge";
 import { localAgentCapacity } from "./agentCapacity";
+import { goalStateOf, type AgentGoal } from "../engine/agentGoal";
+import type { AgentTabStatus } from "../types";
 import { epicIndexOf } from "./beads";
 import { boundAgentsFor } from "./epicSweepRunner";
 import { getConfig, onConfigChanged, type BabysitConfigPayload } from "./config";
@@ -325,17 +327,141 @@ function improveAdvanceFingerprint(agentId: string): string | null {
   return useRuntimeStore.getState().status[agentId] ?? null;
 }
 
+/** The goal states that mean "this agent is DONE and is not going to do more work".
+ *
+ *  Deliberately the SAME three tokens Rust's nudge ladder stands down on (`nudger.rs`
+ *  `QUIET_GOAL_STATES`), so the pusher's idea of finished cannot drift from the nudger's. `expired`
+ *  and `escalated` are NOT here on purpose: those are goals that ended BADLY, they may still need
+ *  someone, and calling them finished would let a stalled fleet read as a reclaimable one. */
+const QUIET_GOAL_STATES: ReadonlySet<string> = new Set(["met", "discharged", "awaiting_close"]);
+
 /**
- * The machine-capacity reading behind the re-spin push (bead sparkle-4hwu2i), projected from the ONE
- * `localAgentCapacity` gate every spawn path shares. `freeSlots` is `limit − used` clamped ≥ 0 — the
- * headroom to fan out a drain fleet; `activeWorkers` is `used`, every local build/worker ROW the
- * budget counts (an unmounted row is still a spawned worker occupying a slot), so `activeWorkers === 0`
- * means the fleet is genuinely empty and re-spinning is the right push — the conservative reading for
- * an aggressive "spin maximally" nudge.
+ * Is this agent FINISHED — observed alive, but with nothing left to do?
+ *
+ * ⚠️ `processAliveFor` IS TRI-STATE, AND ONLY `true` COUNTS HERE (roborev 72653, High). It answers
+ * `undefined` for any agent THIS WINDOW never observed — `useRuntimeStore.status` is live-only and
+ * never persisted, so a row in an unvisited project tab, a row owned by another window, and every
+ * row on the first sweep after an app restart all read `undefined`. Testing `!== false` therefore
+ * made "we have never looked at this agent" mean FINISHED, which is the opposite of a fail-safe:
+ * after a restart every row carrying a persisted `metAt` would count as reclaimable at once,
+ * `workingAgents` would collapse to 0, and the fleet-idle alarm could fire with no evidence anyone
+ * had stopped. Worse, `improveUnstaffedEpics` would read an epic being built in ANOTHER WINDOW as
+ * unstaffed and push to staff a second orchestrator onto it.
+ *
+ * So: POSITIVELY observed alive, AND a quiet goal. Anything it cannot see is not finished. That
+ * keeps the alarm reachable for the case it exists for — the measured fleet WAS observed, which is
+ * how its `goal.state: met` was read in the first place — while an unobserved roster can never
+ * manufacture one.
  */
-function improveLocalCapacity(): { freeSlots: number; activeWorkers: number } {
+function agentIsFinished(
+  agent: { id: string; goal?: AgentGoal },
+  status: Record<string, AgentTabStatus>,
+  openIds: ReadonlySet<string>,
+  now: number,
+): boolean {
+  if (processAliveFor(agent.id, status, openIds) !== true) return false;
+  if (agent.goal === undefined) return false;
+  return QUIET_GOAL_STATES.has(goalStateOf(agent.goal, now));
+}
+
+/**
+ * Is this agent WORKING — actually building something right now?
+ *
+ * ⚠️ IT IS COUNTED DIRECTLY, NOT AS "EVERY ROW THAT IS NOT RECLAIMABLE" (roborev 72653, High).
+ * Deriving it by subtraction — `used − reclaimable` — folds three populations that are plainly NOT
+ * working into "working": an observed-DEAD row, a row with no goal record, and a row whose goal
+ * `expired` or `escalated` (both deliberately outside {@link QUIET_GOAL_STATES}, because those ended
+ * BADLY and must not be retired as if they were done). One unreaped dead row, one goal-less agent or
+ * one expired goal would then hold the count at ≥ 1 forever and silence the alarm — which is the
+ * identical "the arm exists but cannot fire" defect this whole change was written to remove.
+ * `WORKING` and `RECLAIMABLE` are NOT complements; there is a third bucket and it belongs to
+ * neither.
+ *
+ * A row is working when it is observed alive AND either:
+ *   • its pane says `working` — positively seen mid-turn, the most direct evidence there is; or
+ *   • its goal is `unmet` — it holds a live mandate it is still pursuing, which covers the ordinary
+ *     case of an agent resting between turns of work it has not finished.
+ * Everything else — dead, unobserved, finished, escalated, expired, or resting with no live mandate
+ * — is not building anything, and none of those may vote to silence the alarm.
+ */
+function agentIsWorking(
+  agent: { id: string; goal?: AgentGoal },
+  status: Record<string, AgentTabStatus>,
+  openIds: ReadonlySet<string>,
+  now: number,
+): boolean {
+  if (processAliveFor(agent.id, status, openIds) !== true) return false;
+  if (status[agent.id] === "working") return true;
+  return agent.goal !== undefined && goalStateOf(agent.goal, now) === "unmet";
+}
+
+/**
+ * The machine-capacity reading behind the re-spin push (bead sparkle-4hwu2i) and the fleet-idle
+ * three-alarm fire (bead `sparkle-nu7gd9`), projected from the ONE `localAgentCapacity` gate every
+ * spawn path shares.
+ *
+ * `freeSlots` is `limit − used` clamped ≥ 0 — the headroom to fan out a drain fleet. `activeWorkers`
+ * is `used`, every local build/worker ROW the budget counts (an unmounted row is still a spawned
+ * worker occupying a slot).
+ *
+ * ⚠️ `activeWorkers === 0` DOES NOT MEAN THE FLEET IS IDLE, and the comment here used to say it did.
+ * It counts ROWS, and a row whose agent finished hours ago is still a row. Measured on the night this
+ * was fixed: ~30 build agents, ZERO working, almost all `goal.state: met` / stall `finished`, holding
+ * 79 of 81 slots against 2148 ready beads — and because 79 ≠ 0 the re-spin arm could not fire, while
+ * the unstaffed-epic alarm read every one of those finished orchestrators as LIVE and therefore
+ * STAFFED. Both loud shapes were disabled by the very condition they exist to detect.
+ *
+ * So this also reports what the row count cannot: `workingAgents` (rows actually doing work),
+ * `reclaimableAgents` (rows that finished and still hold a slot — the headroom a machine can take
+ * back with no human involved), and `unobservedAgents`.
+ *
+ * ⚠️ `unobservedAgents` IS WHAT MAKES "100% IDLE" AN HONEST CLAIM (roborev 72764, High). Positive
+ * observation of ONE row is not observation of ALL rows: `useRuntimeStore.status` only holds entries
+ * for panes mounted in THIS window this session, so a MIXED roster is the common case — project A's
+ * tab is open and holds one finished agent (`reclaimable = 1`) while project B is unvisited, or
+ * owned by another window, and its workers are busily building. Those rows read `undefined`, so they
+ * are in neither the working nor the reclaimable count, and `workingAgents === 0` would be satisfied
+ * by a fleet that is flat out. The loudest push in the system would then fire against a busy machine
+ * and order a drain fan-out into it — manufacturing exactly the admission-refusal storm the whole
+ * bead warns about. Counting the unobserved rows lets the alarm demand COMPLETE evidence
+ * (`unobservedAgents === 0`) rather than merely an absence of contrary evidence. Those two, not `activeWorkers`, are what the idleness judgments run
+ * off. The split is intentionally reported rather than folded into `used`: `localAgentCapacity` is
+ * the ADMISSION gate, and a finished row really does still occupy the slot until something retires
+ * it, so narrowing `used` here would let spawns in against slots that are not actually free.
+ */
+function improveLocalCapacity(): {
+  freeSlots: number;
+  activeWorkers: number;
+  workingAgents: number;
+  reclaimableAgents: number;
+  unobservedAgents: number;
+} {
   const cap = localAgentCapacity();
-  return { freeSlots: Math.max(0, cap.limit - cap.used), activeWorkers: cap.used };
+  const rt = useRuntimeStore.getState();
+  const openIds = new Set(rt.openAgentIds);
+  const now = Date.now();
+  let reclaimable = 0;
+  let working = 0;
+  let unobserved = 0;
+  for (const p of useProjectStore.getState().projects) {
+    for (const a of p.agents) {
+      if (a.runtime === "cloud" || (a.kind !== "build" && a.kind !== "worker")) continue;
+      // ALL THREE COUNTED DIRECTLY over the same walk, never one derived from another — see
+      // `agentIsWorking` for why subtraction silences the alarm. They are not complements, and
+      // `working + reclaimable + unobserved <= activeWorkers` is the expected relation, not
+      // equality: an observed-DEAD row is in none of them.
+      if (processAliveFor(a.id, rt.status, openIds) === undefined) unobserved += 1;
+      else if (agentIsFinished(a, rt.status, openIds, now)) reclaimable += 1;
+      else if (agentIsWorking(a, rt.status, openIds, now)) working += 1;
+    }
+  }
+  return {
+    freeSlots: Math.max(0, cap.limit - cap.used),
+    activeWorkers: cap.used,
+    workingAgents: working,
+    reclaimableAgents: reclaimable,
+    unobservedAgents: unobserved,
+  };
 }
 
 /**
@@ -355,6 +481,15 @@ function improveLocalCapacity(): { freeSlots: number; activeWorkers: number } {
  * A bound-but-DEAD orchestrator therefore reads UNSTAFFED — which is exactly the founder's measured
  * failure, an epic whose orchestrator finished and went away leaving the binding erased. Reads 0 when
  * the board snapshot is not hydrated — the fail-toward-silence direction, matching `improveReadyBacklog`.
+ *
+ * ⚠️ STAFFED MEANS SOMEBODY IS BUILDING IT, NOT THAT A PROCESS IS UP (bead `sparkle-nu7gd9`). Liveness
+ * alone was not enough, and the gap was not theoretical: an agent that has MET its goal is still very
+ * much alive — its process is up and its pane reads `idle` — so `processAliveFor` answered `true` for
+ * every one of the ~30 finished orchestrators measured on the night this was fixed, every epic read
+ * STAFFED, and the three-alarm fire this function feeds counted ZERO while nothing at all was being
+ * built. So the predicate is liveness AND `!agentIsFinished`: an orchestrator that finished has left
+ * the epic exactly as unstaffed as one that died, and the founder's erased-binding case and the
+ * finished-agent case are the same fact wearing two faces.
  */
 function improveUnstaffedEpics(): { unstaffedBuildableEpicCount: number } {
   const snap = useBeadsStore.getState().byProject[SPARKLE_PROJECT_ID];
@@ -365,17 +500,42 @@ function improveUnstaffedEpics(): { unstaffedBuildableEpicCount: number } {
   const rt = useRuntimeStore.getState();
   const openIds = new Set(rt.openAgentIds);
   const index = epicIndexOf(beads);
+  const now = Date.now();
   let count = 0;
   for (const b of beads) {
     // "supposed to be ACTIVELY built" — the epic's own status, stamped once at promote-to-build.
     if (b.status !== "in_progress") continue;
     // Buildable = has children. A childless typed epic is an un-decomposed plan, not unstaffed WORK.
     if (!index.childrenByParent.has(b.id)) continue;
-    // Staffed iff a bound build agent is LIVE. Empty bound, or all bound agents observed dead, ⇒ unstaffed.
-    const orchestratorAlive = boundAgentsFor(agents, b.id).some(
-      (a) => processAliveFor(a.id, rt.status, openIds) !== false,
+    // Staffed iff a bound build agent is LIVE **and still working**. Empty bound, all bound agents
+    // observed dead, or all of them FINISHED ⇒ unstaffed. See the ⚠️ note above for why liveness on
+    // its own reported a fully-idle fleet as fully staffed.
+    //
+    // ⚠️ A SECOND, STILL-WANTED NARROWING OF THIS EXPRESSION COMPOSES WITH THIS ONE — write it as a
+    // conjunct, never as a replacement. PR #2907 (bead `sparkle-kwl5r2.2`) implemented it and was
+    // CLOSED UNMERGED, so the defect it addressed is still live and someone will come back to this
+    // line. The two narrow "staffed" from opposite directions and neither subsumes the other:
+    //   • #2907 replaces the `processAliveFor(...) !== false` conjunct with
+    //     `presumeAliveFromHeartbeat(processAliveFor(...), a.activityAt, now, ORCHESTRATOR_HEARTBEAT_STALE_MS)`,
+    //     so an UNOBSERVED agent (app restarted, nothing re-observed) falls back to its durable
+    //     activity stamp instead of counting as alive.
+    //   • this change adds the `!agentIsFinished(...)` conjunct, so an OBSERVED-ALIVE agent whose
+    //     goal is met stops counting as staffed.
+    // They are independent facts: a finished agent has a FRESH heartbeat (it just finished), so the
+    // heartbeat check reads it alive; an unobserved stale agent may have an unmet goal, so this
+    // check reads it working. THE CORRECT SHAPE IS BOTH CONJUNCTS, in this order:
+    //     presumeAliveFromHeartbeat(processAliveFor(a.id, rt.status, openIds), a.activityAt, now,
+    //       ORCHESTRATOR_HEARTBEAT_STALE_MS) && !agentIsFinished(a, rt.status, openIds, now)
+    // Taking either side alone re-opens the other's bug silently — and note that `unobservedAgents`
+    // in `improveLocalCapacity` handles the never-observed case for the CAPACITY counts only; this
+    // staffing predicate still needs the heartbeat term to tell a long-dead orchestrator from a
+    // merely-unobserved one.
+    const orchestratorWorking = boundAgentsFor(agents, b.id).some(
+      (a) =>
+        processAliveFor(a.id, rt.status, openIds) !== false &&
+        !agentIsFinished(a, rt.status, openIds, now),
     );
-    if (orchestratorAlive) continue;
+    if (orchestratorWorking) continue;
     count += 1;
   }
   return { unstaffedBuildableEpicCount: count };

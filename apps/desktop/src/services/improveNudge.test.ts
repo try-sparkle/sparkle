@@ -10,6 +10,7 @@ import {
   respinFleetNudgeText,
   conciergeNotifyNudgeText,
   unstaffedEpicAlarmNudgeText,
+  fleetIdleAlarmNudgeText,
   namedPullNudgeText,
   selectNextReadyBead,
   _resetImproveNudgeForTests,
@@ -46,6 +47,9 @@ function makeDeps(
     p1PipelineHealthFingerprint: string | null;
     freeSlots: number;
     activeWorkers: number;
+    workingAgents: number | undefined;
+    reclaimableAgents: number;
+    unobservedAgents: number;
     unstaffedBuildableEpicCount: number;
     nextReadyBead: NextReadyBead | null;
     sendResult: boolean;
@@ -67,6 +71,14 @@ function makeDeps(
     // overrides `activeWorkers: 0` to reach the specific push.
     freeSlots: 4,
     activeWorkers: 2,
+    // DEFAULT: both rows are WORKING and nothing is reclaimable, so the base case cannot take the
+    // fleet-idle alarm. The fleet-idle suite overrides `workingAgents: 0` + `reclaimableAgents > 0`.
+    workingAgents: undefined as number | undefined,
+    reclaimableAgents: 0,
+    // DEFAULT: every row was observed. The alarm demands COMPLETE evidence, so an unobserved row
+    // must never be the silent default — a suite that forgot this field would otherwise assert the
+    // alarm fires while the gate that stops it going off against a busy fleet went untested.
+    unobservedAgents: 0,
     // DEFAULT: no unstaffed epics, so the base idle-with-backlog case does not take the alarm shape.
     // The alarm suite overrides `unstaffedBuildableEpicCount` (and keeps freeSlots > 0) to reach it.
     unstaffedBuildableEpicCount: 0,
@@ -91,7 +103,16 @@ function makeDeps(
         p1PipelineHealthFingerprint: o.p1PipelineHealthFingerprint,
         nextReadyBead: o.nextReadyBead,
       }),
-      capacity: () => ({ freeSlots: o.freeSlots, activeWorkers: o.activeWorkers }),
+      capacity: () => ({
+        freeSlots: o.freeSlots,
+        activeWorkers: o.activeWorkers,
+        // With nothing reclaimable a ROW is a WORKING row, so an unset `workingAgents` mirrors
+        // `activeWorkers` — which keeps every pre-existing re-spin test meaning exactly what it did
+        // before the split. The fleet-idle suite sets the two apart explicitly.
+        workingAgents: o.workingAgents ?? o.activeWorkers,
+        unobservedAgents: o.unobservedAgents,
+        reclaimableAgents: o.reclaimableAgents,
+      }),
       unstaffedBuildableEpics: () => ({
         unstaffedBuildableEpicCount: o.unstaffedBuildableEpicCount,
       }),
@@ -131,14 +152,14 @@ describe("sweepImproveNudge — the side effect, keyed off concrete advance not 
   //    slots + zero active workers, the SPECIFIC "spin a drain fleet NOW" message naming the numbers
   //    is what actually lands in the inbox, not the generic reminder. ───────────────────────────────
   it("idle + ready backlog + free slots + ZERO active workers → sends the SPECIFIC re-spin message with the numbers", async () => {
-    const sent = await sweepStaleThen(ADVANCE_IDLE_MS, { ready: 7, freeSlots: 5, activeWorkers: 0 });
+    const sent = await sweepStaleThen(ADVANCE_IDLE_MS, { ready: 7, freeSlots: 5, activeWorkers: 0, workingAgents: 0 });
     expect(sent).toEqual([respinFleetNudgeText(7, 5)]);
     // and it is DISTINCT from the generic reminder — the whole point of the bead.
     expect(sent[0]).not.toBe(NEVER_IDLE_NUDGE_TEXT);
   });
 
   it("the re-spin message names the exact ready-bead and free-slot counts, and 0 workers", async () => {
-    const sent = await sweepStaleThen(ADVANCE_IDLE_MS, { ready: 4, freeSlots: 9, activeWorkers: 0 });
+    const sent = await sweepStaleThen(ADVANCE_IDLE_MS, { ready: 4, freeSlots: 9, activeWorkers: 0, workingAgents: 0 });
     expect(sent[0]).toContain("4 ready beads");
     expect(sent[0]).toContain("9 free agent slots");
     expect(sent[0]).toContain("0 active workers");
@@ -146,12 +167,12 @@ describe("sweepImproveNudge — the side effect, keyed off concrete advance not 
   });
 
   it("idle + ready backlog + free slots but workers ALREADY draining → keeps the GENERIC reminder", async () => {
-    const sent = await sweepStaleThen(ADVANCE_IDLE_MS, { ready: 7, freeSlots: 5, activeWorkers: 3 });
+    const sent = await sweepStaleThen(ADVANCE_IDLE_MS, { ready: 7, freeSlots: 5, activeWorkers: 3, workingAgents: 3 });
     expect(sent).toEqual([NEVER_IDLE_NUDGE_TEXT]);
   });
 
   it("idle + ready backlog + zero workers but NO free slots (machine full) → keeps the GENERIC reminder", async () => {
-    const sent = await sweepStaleThen(ADVANCE_IDLE_MS, { ready: 7, freeSlots: 0, activeWorkers: 0 });
+    const sent = await sweepStaleThen(ADVANCE_IDLE_MS, { ready: 7, freeSlots: 0, activeWorkers: 0, workingAgents: 0 });
     expect(sent).toEqual([NEVER_IDLE_NUDGE_TEXT]);
   });
 
@@ -377,6 +398,7 @@ describe("sweepImproveNudge — the concierge-notify push (surface a RED pipelin
       ready: 7,
       freeSlots: 5,
       activeWorkers: 0,
+      workingAgents: 0,
       ...RED,
     });
     expect(sent).toEqual([conciergeNotifyNudgeText(1)]);
@@ -430,6 +452,172 @@ describe("sweepImproveNudge — the concierge-notify push (surface a RED pipelin
 //    an in_progress buildable epic with no live orchestrator AND admission headroom, the SPECIFIC
 //    "THREE-ALARM FIRE … STAFF it / SURFACE it" push is what actually lands in the inbox, ahead of
 //    every other push. Gated on headroom so it NEVER fires into a saturated machine. ────────────────
+// ── THE FLEET-IDLE THREE-ALARM FIRE (bead `sparkle-nu7gd9`) ───────────────────────────────────────
+//    The measured failure: ~30 build agents, ZERO working, almost all goal `met` / stall `finished`,
+//    holding 79 of 81 slots, against 2148 ready beads — and the watcher said NOTHING, while being
+//    loud about stale PR drift. These tests pin the two structural causes of that silence, so a
+//    regression in either one goes red rather than going quiet.
+describe("sweepImproveNudge — the fleet-idle three-alarm fire", () => {
+  beforeEach(() => _resetImproveNudgeForTests());
+
+  it("zero WORKING agents + ready backlog + finished agents holding slots → sends the fleet-idle alarm", async () => {
+    const sent = await sweepStaleThen(ADVANCE_IDLE_MS, {
+      ready: 2148,
+      activeWorkers: 30,
+      workingAgents: 0,
+      reclaimableAgents: 30,
+      freeSlots: 2,
+    });
+    expect(sent).toEqual([fleetIdleAlarmNudgeText(2148, 30, 30, 2)]);
+    expect(sent[0]).not.toBe(NEVER_IDLE_NUDGE_TEXT);
+  });
+
+  it("THE REGRESSION THAT CAUSED THE SILENCE: 30 rows are NOT 30 workers — a row-count reading stays quiet, this one fires", async () => {
+    // `activeWorkers: 30` is exactly the reading that made the old `activeWorkers === 0` re-spin arm
+    // unreachable. If any arm here ever goes back to judging idleness by ROWS, this goes red.
+    const sent = await sweepStaleThen(ADVANCE_IDLE_MS, {
+      ready: 2148,
+      activeWorkers: 30,
+      workingAgents: 0,
+      reclaimableAgents: 30,
+      freeSlots: 2,
+    });
+    expect(sent[0]).toContain("the fleet is 100% IDLE");
+    expect(sent[0]).toContain("2148 ready");
+  });
+
+  it("FIRES WITH ZERO HEADROOM — the gate every other loud shape has is deliberately absent here", async () => {
+    // The whole inversion: slots held by FINISHED agents mean freeSlots is 0 *because of* the defect,
+    // so a headroom gate would silence the alarm exactly when it is right. Reclamation makes the room.
+    const sent = await sweepStaleThen(ADVANCE_IDLE_MS, {
+      ready: 900,
+      activeWorkers: 81,
+      workingAgents: 0,
+      reclaimableAgents: 81,
+      freeSlots: 0,
+    });
+    expect(sent).toEqual([fleetIdleAlarmNudgeText(900, 81, 81, 0)]);
+  });
+
+  it("orders the remedy RECLAIM → DISPATCH → SURFACE, and names all three", async () => {
+    const sent = await sweepStaleThen(ADVANCE_IDLE_MS, {
+      ready: 40,
+      activeWorkers: 12,
+      workingAgents: 0,
+      reclaimableAgents: 12,
+      freeSlots: 0,
+    });
+    const text = sent[0]!;
+    expect(text).toContain("RECLAIM");
+    expect(text).toContain("DISPATCH");
+    expect(text).toContain("SURFACE");
+    expect(text).toContain("send_peer_message to sparkle:concierge");
+    // The ORDER is the load-bearing part: dispatching before reclaiming is what produces admission
+    // refusals, which is the failure the founder's capacity note names.
+    expect(text.indexOf("RECLAIM")).toBeLessThan(text.indexOf("DISPATCH"));
+    expect(text.indexOf("DISPATCH")).toBeLessThan(text.indexOf("SURFACE"));
+  });
+
+  it("PAIRED ABSENCE: same setup but ONE agent is still working → NEVER the fleet-idle alarm", async () => {
+    // Changes exactly one term, so the alarm is proven to be caused by the fleet being idle rather
+    // than by the ready backlog or the finished rows on their own.
+    const sent = await sweepStaleThen(ADVANCE_IDLE_MS, {
+      ready: 2148,
+      activeWorkers: 30,
+      workingAgents: 1,
+      reclaimableAgents: 29,
+      freeSlots: 2,
+    });
+    expect(sent[0]).not.toBe(fleetIdleAlarmNudgeText(2148, 29, 30, 2));
+  });
+
+  it("AN UNOBSERVED ROW SILENCES THE ALARM — 'nothing is working' is a claim about the WHOLE fleet", async () => {
+    // roborev 72764 (High). `workingAgents === 0` is an ABSENCE OF CONTRARY EVIDENCE, not evidence of
+    // absence. The runtime status store only holds entries for panes mounted in THIS window, so the
+    // common shape is project A open with one finished agent while project B is unvisited and its
+    // workers are flat out — those rows are in neither count. Firing here would tell the agent the
+    // fleet is 100% idle and order a drain fan-out into a machine that is already full, which is the
+    // admission-refusal storm this whole bead warns about.
+    const sent = await sweepStaleThen(ADVANCE_IDLE_MS, {
+      ready: 2148,
+      activeWorkers: 30,
+      workingAgents: 0,
+      reclaimableAgents: 1,
+      unobservedAgents: 29,
+      freeSlots: 2,
+    });
+    expect(sent[0]).not.toBe(fleetIdleAlarmNudgeText(2148, 1, 30, 2));
+  });
+
+  it("PAIRED: the SAME fleet with every row observed DOES fire — the gate is completeness, not a mute", async () => {
+    // One term apart from the test above: the 29 unobserved rows become 29 observed-finished ones.
+    // Without this pair the gate could be satisfied by an alarm that never fires at all.
+    const sent = await sweepStaleThen(ADVANCE_IDLE_MS, {
+      ready: 2148,
+      activeWorkers: 30,
+      workingAgents: 0,
+      reclaimableAgents: 30,
+      unobservedAgents: 0,
+      freeSlots: 2,
+    });
+    expect(sent).toEqual([fleetIdleAlarmNudgeText(2148, 30, 30, 2)]);
+  });
+
+  it("PAIRED ABSENCE: idle fleet with NOTHING reclaimable falls to the ordinary re-spin, not the alarm", async () => {
+    const sent = await sweepStaleThen(ADVANCE_IDLE_MS, {
+      ready: 7,
+      activeWorkers: 0,
+      workingAgents: 0,
+      reclaimableAgents: 0,
+      freeSlots: 5,
+    });
+    expect(sent).toEqual([respinFleetNudgeText(7, 5)]);
+  });
+
+  it("PRE-EMPTS the unstaffed-epic alarm — the whole fleet stopped outranks one unstaffed epic", async () => {
+    const sent = await sweepStaleThen(ADVANCE_IDLE_MS, {
+      ready: 50,
+      activeWorkers: 20,
+      workingAgents: 0,
+      reclaimableAgents: 20,
+      freeSlots: 3,
+      unstaffedBuildableEpicCount: 4,
+    });
+    expect(sent).toEqual([fleetIdleAlarmNudgeText(50, 20, 20, 3)]);
+    expect(sent[0]).not.toBe(unstaffedEpicAlarmNudgeText(4, 3));
+  });
+
+  it("PRE-EMPTS the concierge-notify push", async () => {
+    const sent = await sweepStaleThen(ADVANCE_IDLE_MS, {
+      ready: 50,
+      activeWorkers: 20,
+      workingAgents: 0,
+      reclaimableAgents: 20,
+      freeSlots: 3,
+      p1PipelineHealth: 2,
+      p1PipelineHealthFingerprint: "red-a,red-b",
+    });
+    expect(sent).toEqual([fleetIdleAlarmNudgeText(50, 20, 20, 3)]);
+  });
+
+  it("no ready backlog → an idle fleet is CORRECTLY resting, so no alarm", async () => {
+    const sent = await sweepStaleThen(ADVANCE_IDLE_MS, {
+      ready: 0,
+      activeWorkers: 20,
+      workingAgents: 0,
+      reclaimableAgents: 20,
+      freeSlots: 3,
+    });
+    expect(sent).toEqual([]);
+  });
+
+  it("singularises one finished agent and one free slot", () => {
+    const text = fleetIdleAlarmNudgeText(5, 1, 1, 1);
+    expect(text).toContain("1 agent has FINISHED");
+    expect(text).toContain("1 slot is free");
+  });
+});
+
 describe("sweepImproveNudge — the unstaffed-epic three-alarm fire", () => {
   beforeEach(() => _resetImproveNudgeForTests());
 
@@ -462,6 +650,7 @@ describe("sweepImproveNudge — the unstaffed-epic three-alarm fire", () => {
       unstaffedBuildableEpicCount: 0,
       freeSlots: 5,
       activeWorkers: 2,
+      workingAgents: 2,
     });
     expect(sent).toEqual([NEVER_IDLE_NUDGE_TEXT]);
     expect(sent[0]).not.toBe(unstaffedEpicAlarmNudgeText(0, 5));
@@ -475,6 +664,7 @@ describe("sweepImproveNudge — the unstaffed-epic three-alarm fire", () => {
       unstaffedBuildableEpicCount: 3,
       freeSlots: 0,
       activeWorkers: 4,
+      workingAgents: 4,
       p1PipelineHealth: 1,
       p1PipelineHealthFingerprint: "ph-1",
     });
@@ -488,6 +678,7 @@ describe("sweepImproveNudge — the unstaffed-epic three-alarm fire", () => {
       freeSlots: 5,
       ready: 7,
       activeWorkers: 0,
+      workingAgents: 0,
       p1PipelineHealth: 1,
       p1PipelineHealthFingerprint: "ph-1",
     });
@@ -519,6 +710,11 @@ describe("decideImproveNudge — the idle-and-has-backlog rule", () => {
     conciergeCadenceMs: CONCIERGE_NOTIFY_CADENCE_MS,
     freeSlots: 4,
     activeWorkers: 1,
+    // DEFAULT: the one row is WORKING and nothing is reclaimable — the fleet-idle alarm needs BOTH
+    // `workingAgents === 0` and `reclaimableAgents > 0`, so `base` can never take that shape.
+    workingAgents: 1,
+    reclaimableAgents: 0,
+    unobservedAgents: 0,
     unstaffedBuildableEpicCount: 0,
     // DEFAULT: no code-chosen ready bead → the terminal case stays GENERIC. The self-feeding-pull
     // tests below set `nextReadyBead` to reach the named-pull shape.
@@ -542,15 +738,15 @@ describe("decideImproveNudge — the idle-and-has-backlog rule", () => {
   // ── THE RE-SPIN ARM (bead sparkle-4hwu2i), pinned as arithmetic on the pure decision ────────────
   it("returns kind:respin with the numbers when idle + ready backlog + free slots + zero active workers", () => {
     expect(
-      decideImproveNudge({ ...base, readyBacklogCount: 6, freeSlots: 8, activeWorkers: 0 }),
+      decideImproveNudge({ ...base, readyBacklogCount: 6, freeSlots: 8, activeWorkers: 0, workingAgents: 0 }),
     ).toEqual({ nudge: true, kind: "respin", readyCount: 6, freeSlots: 8 });
   });
 
   it.each<[Partial<ImproveNudgeInput>, string]>([
-    [{ readyBacklogCount: 6, freeSlots: 8, activeWorkers: 1 }, "active workers present"],
-    [{ readyBacklogCount: 6, freeSlots: 0, activeWorkers: 0 }, "no free slots"],
+    [{ readyBacklogCount: 6, freeSlots: 8, activeWorkers: 1, workingAgents: 1 }, "active workers present"],
+    [{ readyBacklogCount: 6, freeSlots: 0, activeWorkers: 0, workingAgents: 0 }, "no free slots"],
     // P1-only work (no ready backlog to dispatch a fleet across) is generic even with slots + 0 workers.
-    [{ readyBacklogCount: 0, p1PipelineHealthCount: 1, freeSlots: 8, activeWorkers: 0 }, "P1-only, no ready backlog"],
+    [{ readyBacklogCount: 0, p1PipelineHealthCount: 1, freeSlots: 8, activeWorkers: 0, workingAgents: 0 }, "P1-only, no ready backlog"],
   ])("stays GENERIC when the re-spin condition is not fully met (%o — %s)", (patch) => {
     expect(decideImproveNudge({ ...base, ...patch })).toEqual({ nudge: true, kind: "generic" });
   });
@@ -569,6 +765,7 @@ describe("decideImproveNudge — the idle-and-has-backlog rule", () => {
         readyBacklogCount: 6,
         freeSlots: 8,
         activeWorkers: 0,
+        workingAgents: 0,
         p1PipelineHealthCount: 1,
         pipelineHealthFingerprint: "ph-1",
       }),
@@ -620,6 +817,7 @@ describe("decideImproveNudge — the idle-and-has-backlog rule", () => {
         freeSlots: 8,
         readyBacklogCount: 6,
         activeWorkers: 0,
+        workingAgents: 0,
         p1PipelineHealthCount: 1,
         pipelineHealthFingerprint: "ph-1",
       }),
@@ -708,6 +906,7 @@ describe("decideImproveNudge — the idle-and-has-backlog rule", () => {
         readyBacklogCount: 5,
         freeSlots: 8,
         activeWorkers: 0,
+        workingAgents: 0,
       }),
     ).toEqual({ nudge: true, kind: "respin", readyCount: 5, freeSlots: 8 });
   });
@@ -828,6 +1027,9 @@ describe("decideImproveNudge — the self-feeding named-pull arm", () => {
     // and named-pull purely on whether a next ready bead was chosen.
     freeSlots: 4,
     activeWorkers: 1,
+    workingAgents: 1,
+    reclaimableAgents: 0,
+    unobservedAgents: 0,
     unstaffedBuildableEpicCount: 0,
     nextReadyBead: null,
     lastNudgedAt: null,
@@ -860,6 +1062,7 @@ describe("decideImproveNudge — the self-feeding named-pull arm", () => {
         readyBacklogCount: 6,
         freeSlots: 8,
         activeWorkers: 0,
+        workingAgents: 0,
       }),
     ).toEqual({ nudge: true, kind: "respin", readyCount: 6, freeSlots: 8 });
   });
@@ -875,6 +1078,7 @@ describe("sweepImproveNudge — the self-feeding named-pull message", () => {
       ready: 3,
       freeSlots: 4,
       activeWorkers: 2, // draining → generic/named-pull terminal case, not re-spin
+      workingAgents: 2,
       nextReadyBead: pick,
     });
     expect(sent).toEqual([namedPullNudgeText(pick, 1)]);
@@ -951,7 +1155,7 @@ describe("sweepImproveNudge — the one-shot resume kick (auto-start on app rest
 
   it("ARMED resume with free slots + zero active workers SPAWNS a drain fleet on the first sweep (respin text)", async () => {
     armImproveResumeKick();
-    const { deps, sent } = makeDeps({ now: t0, ready: 5, freeSlots: 8, activeWorkers: 0 });
+    const { deps, sent } = makeDeps({ now: t0, ready: 5, freeSlots: 8, activeWorkers: 0, workingAgents: 0 });
     await sweepImproveNudge(deps);
     expect(sent).toEqual([respinFleetNudgeText(5, 8)]);
   });
