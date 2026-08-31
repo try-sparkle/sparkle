@@ -264,7 +264,17 @@ pub(crate) fn git(cwd: &str, args: &[&str]) -> Result<String, String> {
 /// `project_agents_status` runs these per changed agent on a ~30s poll, stuck children pile up on
 /// Tauri's blocking pool. Only the network touches go through this deadline — local ref reads
 /// (rev-parse, status of local worktrees, merge-base) are unaffected and stay on the plain `git()`.
-const NETWORK_TIMEOUT: Duration = Duration::from_secs(15);
+pub(crate) const NETWORK_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Wall-clock ceiling for a `git push`. An agent-branch push is a small pack, but a slow upload
+/// must still be allowed to finish — so this is generous where [`NETWORK_TIMEOUT`] (a `fetch` whose
+/// failure just degrades to the local ref) is tight. It is BOUNDED all the same: a wedged push
+/// transport (`git-remote-https` blocked on a dead connection, the child idle for hours) is what
+/// accumulates machine-wide until no agent can push at all — measured at 120+ live, many idle two
+/// hours, on a link that still answered small REST reads in seconds (`sparkle-cw6yo6`,
+/// `sparkle-q2xtel`). Killing the child at this deadline is the reaping the bug asks for: it can no
+/// longer outlive its caller and hold a connection slot indefinitely.
+pub(crate) const PUSH_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// How long we'll wait for the drain threads to finish AFTER the child has exited or been killed.
 ///
@@ -695,10 +705,25 @@ pub(crate) fn output_with_timeout(
 /// non-interactive env and stdout/stderr-on-failure semantics as `git`; a timeout reads as an Err
 /// (which every caller already treats as "offline/degrade — fall back to the local ref").
 fn git_networked(cwd: &str, args: &[&str]) -> Result<String, String> {
+    git_networked_within(cwd, args, NETWORK_TIMEOUT)
+}
+
+/// [`git_networked`] with a caller-chosen deadline. The reaping half of `sparkle-cw6yo6` /
+/// `sparkle-q2xtel`: a `push` or `fetch` run through here is spawned in its OWN process group and
+/// KILLED at `timeout` by [`output_with_timeout`] (see [`output_with_timeout_lenient`]'s
+/// group-kill), so a wedged transport child cannot outlive its caller and pile up machine-wide.
+/// Every network-touching git call MUST route through this rather than the unbounded [`git`], which
+/// blocks on the OS default (~75s+) and, on a saturated link, forever. `fetch` callers pass
+/// [`NETWORK_TIMEOUT`]; `push` callers pass the more generous [`PUSH_TIMEOUT`].
+pub(crate) fn git_networked_within(
+    cwd: &str,
+    args: &[&str],
+    timeout: Duration,
+) -> Result<String, String> {
     let mut cmd = Command::new(crate::preflight::git_program());
     cmd.arg("-C").arg(cwd).args(args);
     apply_noninteractive(&mut cmd);
-    let output = output_with_timeout(cmd, NETWORK_TIMEOUT)
+    let output = output_with_timeout(cmd, timeout)
         .map_err(|e| format!("git {} failed: {e}", args.join(" ")))?;
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
@@ -8525,6 +8550,18 @@ pub async fn land_agent_branch(
 /// when the project has no `origin` (the caller then falls back to a local land or keeps the branch
 /// locally). A git failure (auth/network) surfaces as Err so the UI can report it.
 pub fn push_agent_branch_at(root: &str, agent_id: &str) -> Result<String, String> {
+    push_agent_branch_within(root, agent_id, PUSH_TIMEOUT)
+}
+
+/// [`push_agent_branch_at`] with a caller-chosen push deadline, so a test can drive the real push
+/// path against a wedged remote without waiting the full [`PUSH_TIMEOUT`]. The push goes through
+/// [`git_networked_within`] — NOT the unbounded [`git`] — so a hung transport is killed at the
+/// deadline rather than left to accumulate (`sparkle-cw6yo6`, `sparkle-q2xtel`).
+pub(crate) fn push_agent_branch_within(
+    root: &str,
+    agent_id: &str,
+    timeout: Duration,
+) -> Result<String, String> {
     if git(root, &["remote", "get-url", "origin"]).is_err() {
         return Ok("no-remote".to_string());
     }
@@ -8532,7 +8569,7 @@ pub fn push_agent_branch_at(root: &str, agent_id: &str) -> Result<String, String
     if git(root, &["rev-parse", "--verify", "--quiet", &format!("{branch}^{{commit}}")]).is_err() {
         return Err("no-branch".to_string());
     }
-    git(root, &["push", "-u", "origin", &branch]).map(|_| "pushed".to_string())
+    git_networked_within(root, &["push", "-u", "origin", &branch], timeout).map(|_| "pushed".to_string())
 }
 
 /// Push an agent's branch to `origin` for the close-agent Ship/Save paths. "pushed" | "no-remote".
@@ -11569,6 +11606,90 @@ mod tests {
         assert!(
             !alive,
             "the grandchild (pid {pid}) outlived the expiry — the kill did not reach the process group"
+        );
+    }
+
+    /// The WIRING `sparkle-cw6yo6` / `sparkle-q2xtel` ask for: the REAL agent-branch push path must
+    /// bound AND REAP a wedged transport, not block on the unbounded [`git`]. Drives
+    /// [`push_agent_branch_within`] against an `ext::` remote whose helper hangs far past the
+    /// deadline, and proves the kill reached the transport child by polling `kill(pid, 0)` on the
+    /// pid the helper recorded — the same direct-observation proof as the grandchild test above, so
+    /// a green run means "the transport was actually killed", never "it never spawned". Mutating the
+    /// push back to the unbounded `git` makes this HANG; dropping the group-kill leaves the helper
+    /// ALIVE and the final assertion red.
+    #[cfg(unix)]
+    #[test]
+    fn a_wedged_agent_push_is_reaped_at_the_deadline() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = unique_root("wedged-push-reap");
+        let repo = root.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let repo_str = repo.to_string_lossy().to_string();
+
+        // An `ext::` transport lets us stand in a DETERMINISTIC hang for the remote: git runs the
+        // helper and blocks reading the ref advertisement it never sends. `GIT_SSH_COMMAND` (which
+        // `apply_noninteractive` pins) would override a fake ssh, so `ext::` is the one transport
+        // we can actually control here. The helper records its own pid, then sleeps far past the
+        // deadline; `temp_dir()` has no spaces, so the single-token command needs no quoting.
+        let pidfile = root.join("helper.pid");
+        let helper = root.join("hang-remote");
+        std::fs::write(
+            &helper,
+            format!("#!/bin/sh\necho $$ > \"{}\"\nexec sleep 30\n", pidfile.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let agent_id = "reap-test";
+        let branch = format!("sparkle/agent-{agent_id}");
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "sparkle-test"],
+            vec!["config", "user.name", "sparkle-test"],
+            // `ext::` is disabled by default; a repo-local allow is enough for this fixture.
+            vec!["config", "protocol.ext.allow", "always"],
+            vec!["remote", "add", "origin", &format!("ext::{}", helper.to_string_lossy())],
+            vec!["commit", "-q", "--allow-empty", "-m", "seed"],
+            vec!["branch", &branch],
+        ] {
+            git(&repo_str, &args).unwrap();
+        }
+
+        let timeout = Duration::from_millis(1500);
+        let started = Instant::now();
+        let err = push_agent_branch_within(&repo_str, agent_id, timeout)
+            .expect_err("a push to a hung remote must expire, not block");
+        assert!(err.contains("timed out"), "expiry should say so: {err}");
+        // Bounded: it returned near the deadline, NOT after the helper's own 30s sleep. Generous
+        // slack for git startup + the `ext` helper spawn under CI load, still an order of magnitude
+        // below 30s so the distinction being pinned is unambiguous.
+        assert!(
+            started.elapsed() < timeout + DRAIN_GRACE + Duration::from_secs(8),
+            "push must return at its deadline, not after the remote helper's sleep: took {:?}",
+            started.elapsed()
+        );
+
+        // THE SIDE EFFECT: the transport child was actually KILLED, observed directly rather than
+        // inferred from a marker. `.expect` on the pidfile keeps a green run honest — it means
+        // "killed", never "the helper never ran".
+        let pid: i32 = std::fs::read_to_string(&pidfile)
+            .expect("the remote helper should have written its pid before the kill")
+            .trim()
+            .parse()
+            .expect("pid");
+        let mut alive = true;
+        for _ in 0..40 {
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                alive = false;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(
+            !alive,
+            "the wedged remote helper (pid {pid}) outlived the deadline — the push was not reaped"
         );
     }
 

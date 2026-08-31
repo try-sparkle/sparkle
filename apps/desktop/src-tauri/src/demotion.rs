@@ -169,7 +169,14 @@ pub fn land_branch_at(
     // refspec, and every comparison below reads that ref by name.
     let remote_ref = format!("refs/remotes/origin/{branch}");
     let refspec = format!("+refs/heads/{branch}:{remote_ref}");
-    git(root, &["fetch", "origin", refspec.as_str()]).map_err(|e| format!("fetch-failed:{e}"))?;
+    // Bounded + process-group-killed on expiry (`sparkle-cw6yo6`, `sparkle-q2xtel`): a wedged fetch
+    // transport must not accumulate machine-wide. NOT the unbounded `git`, which blocks forever.
+    crate::worktree::git_networked_within(
+        root,
+        &["fetch", "origin", refspec.as_str()],
+        crate::worktree::NETWORK_TIMEOUT,
+    )
+    .map_err(|e| format!("fetch-failed:{e}"))?;
     git(root, &["rev-parse", remote_ref.as_str()]).map_err(|e| format!("fetch-failed:{e}"))?;
 
     // ── resolve (or cut) the worktree ───────────────────────────────────────────────────────────

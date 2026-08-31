@@ -309,7 +309,13 @@ pub fn push_branch_at(root: &str, branch: &str) -> Result<String, String> {
     {
         return Err("no-branch".to_string());
     }
-    git(root, &["push", "-u", "origin", branch])?;
+    // Bounded + process-group-killed on expiry (`sparkle-cw6yo6`, `sparkle-q2xtel`): a wedged push
+    // transport must not accumulate machine-wide. NOT the unbounded `git`, which blocks forever.
+    crate::worktree::git_networked_within(
+        root,
+        &["push", "-u", "origin", branch],
+        crate::worktree::PUSH_TIMEOUT,
+    )?;
     // Read the REMOTE-TRACKING ref, which `push` has just updated — not the local branch. They are
     // the same commit on a successful push, but only one of them is a statement about the remote,
     // and this value's whole job is to be that statement.
