@@ -43,7 +43,50 @@
 //
 // PURE. Data in, data out — no store, no clock of its own, no React — so every rule below is
 // testable as arithmetic, which is the same reason `engine/epicContinuation` is pure.
+import type { AgentTabStatus } from "@sparkle/ui";
 import type { DeathCause } from "./deathTypes";
+
+/**
+ * Statuses that mean A PERSON IS THE THING THIS AGENT IS WAITING ON — so its hook log going quiet is
+ * the WAIT, not a death, and must never be read as one.
+ *
+ * ── WHY THIS EXEMPTION EXISTS (roborev 72648, High) ───────────────────────────────────────────
+ * `processAliveFor`'s DEAD set is only `done|errored|stopped`, so `waiting`, `approval`, `blocked`
+ * and `questions` all report ALIVE. And a hook log freezes at exactly those statuses:
+ * `movementRetraction`'s header says it outright — a `PreToolUse` for a blocking tool with nothing
+ * after it "is the picker being unanswered, not progress past it". Without this exemption the
+ * silence rule below fires on a live agent sitting at an open prompt, and the sweep then hands the
+ * epic back through `sendToBuild`, which for an already-live orchestrator writes the handoff text
+ * into that PTY — a bracketed paste plus Enter, which ANSWERS the pending question with the handoff
+ * text. A permission decision the human never made, taken while they are away, which is the exact
+ * scenario the fix was written for.
+ *
+ * The remedy gate does not cover it either, and the reason is worth stating: `blocked-on-human` is a
+ * DEATH cause, and a live blocked agent has no death record at all — so `deathCauseFor` returns
+ * `undefined` and `restartRemedyFor` correctly answers `restart`. Liveness is the layer that has to
+ * know this, not the remedy layer.
+ *
+ * ── IT IS NOT `windowStatus.isRedStatus`, AND THAT IS DELIBERATE ──────────────────────────────
+ * That predicate asks a COLOUR question and is wrong at both edges here. It INCLUDES `errored`,
+ * which is a death this module has already answered one rule earlier and which must stay
+ * answerable. It EXCLUDES `questions`, which is blue by an explicit founder decision ("why are they
+ * red when they don't require my assistance?") but is still, literally, an agent that asked a person
+ * something and is waiting — so its log freezes identically.
+ *
+ * ── THE PRECEDENT ─────────────────────────────────────────────────────────────────────────────
+ * `engine/busyLiveness` applies the same stale-movement rule and restricts it to `working` alone,
+ * saying why in the same words: the red tiers "are someone waiting on the human, not a claim the
+ * process is producing output". This module reintroduced what that one refuses; this set is the
+ * repair. It is stated as an EXEMPTION rather than as an allowlist of working tiers because `idle`
+ * must remain subject to the rule — the founder's 17 measured orchestrators read `idle`, and a
+ * working-tiers-only reading would exempt exactly the population this module exists to catch.
+ */
+export const WAITING_ON_HUMAN: ReadonlySet<AgentTabStatus> = new Set<AgentTabStatus>([
+  "questions",
+  "waiting",
+  "approval",
+  "blocked",
+]);
 
 /**
  * How long an orchestrator may produce NO hook event before the sweep stops counting it as staffing
@@ -84,6 +127,17 @@ export interface OrchestratorEvidence {
    * that can be trusted as current).
    */
   observedAlive: boolean | undefined;
+  /**
+   * The RAW observed status behind {@link observedAlive}, when this window has one.
+   *
+   * Read for exactly one thing: {@link WAITING_ON_HUMAN}. `undefined` means this window observed no
+   * status, in which case the silence rule applies unmodified — which is the measured case (an
+   * orchestrator whose pane nobody is hosting) and must keep working.
+   *
+   * RAW, not composited: the composite carries an `unmerged` overlay written over other statuses,
+   * which is the same reason `processAliveFor` insists on the raw map.
+   */
+  observedStatus?: AgentTabStatus | undefined;
   /**
    * `MovementEvidence.lastEventMs` for this agent — when its hook log last recorded ANY event —
    * or `null`/`undefined` when there is no reading at all (`fleet_digest` has not polled yet, the
@@ -129,6 +183,14 @@ export function orchestratorLivenessOf(
   silentMs: number = ORCHESTRATOR_SILENT_MS,
 ): boolean | null {
   if (e.observedAlive === false) return false;
+
+  // A PERSON IS THE BLOCKER, SO THE SILENCE IS THE WAIT. Checked before the artifact is read at all:
+  // an agent sitting at an open prompt is STAFFING its epic — restarting it would type into that
+  // prompt — and no hook-log age can make that untrue. See WAITING_ON_HUMAN. This returns the same
+  // answer the one-witness code gave for these rows, so it is a preserved behaviour, not a new one.
+  if (e.observedAlive === true && e.observedStatus !== undefined && WAITING_ON_HUMAN.has(e.observedStatus)) {
+    return true;
+  }
 
   const ts = e.lastHookEventMs;
   const readable = ts !== null && ts !== undefined && Number.isFinite(ts) && ts > 0 && ts <= now;

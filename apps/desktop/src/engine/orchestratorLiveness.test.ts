@@ -65,6 +65,53 @@ describe("orchestratorLivenessOf", () => {
     ).toBe(false);
   });
 
+  // ══ A PERSON IS THE BLOCKER, SO THE SILENCE IS THE WAIT (roborev 72648, High) ══════════════
+  // `processAliveFor`'s DEAD set is only done|errored|stopped, so every one of these reports ALIVE —
+  // and a hook log freezes at exactly these statuses, because a `PreToolUse` for a blocking tool
+  // with nothing after it IS the unanswered prompt. Reading that as a death makes the sweep hand the
+  // epic back, and `sendToBuild` on an already-live orchestrator writes the handoff text into the
+  // open prompt: a bracketed paste plus Enter, ANSWERING a permission question the human never saw.
+  it.each(["questions", "waiting", "approval", "blocked"] as const)(
+    "an agent sitting at a prompt (%s) is STAFFING, however old its hook log",
+    (status) => {
+      expect(
+        orchestratorLivenessOf(
+          { observedAlive: true, observedStatus: status, lastHookEventMs: NOW - 121 * HOUR },
+          NOW,
+        ),
+      ).toBe(true);
+    },
+  );
+
+  // THE PAIRED CASE, and without it the exemption above could be a blanket "observed means alive".
+  // `idle` is NOT a human wait — it is the status 17 of the founder's 17 measured orchestrators
+  // carried — so the silence rule must still fire on it with a status supplied.
+  it("…but an IDLE agent with the same stale log is still not staffing", () => {
+    expect(
+      orchestratorLivenessOf(
+        { observedAlive: true, observedStatus: "idle", lastHookEventMs: NOW - 121 * HOUR },
+        NOW,
+      ),
+    ).toBe(false);
+    expect(
+      orchestratorLivenessOf(
+        { observedAlive: true, observedStatus: "working", lastHookEventMs: NOW - 121 * HOUR },
+        NOW,
+      ),
+    ).toBe(false);
+  });
+
+  // The exemption is keyed on an OBSERVED status. With none — the measured case, an orchestrator
+  // whose pane nobody is hosting — the silence rule applies unmodified and must keep working.
+  it("with no observed status the silence rule is unchanged", () => {
+    expect(
+      orchestratorLivenessOf(
+        { observedAlive: undefined, observedStatus: undefined, lastHookEventMs: NOW - 121 * HOUR },
+        NOW,
+      ),
+    ).toBe(false);
+  });
+
   it("an observed death is false even when the hook log is fresh", () => {
     expect(
       orchestratorLivenessOf({ observedAlive: false, lastHookEventMs: NOW - 1000 }, NOW),

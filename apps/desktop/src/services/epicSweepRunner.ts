@@ -63,6 +63,7 @@ import {
 } from "../engine/orchestratorLiveness";
 import { deathCauseForAgent } from "./deadSessionRegistry";
 import type { DeathCause } from "../engine/deathTypes";
+import type { AgentTabStatus } from "@sparkle/ui";
 import { useBeadsStore, beadsReadStartedAt } from "../stores/beadsStore";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
@@ -449,6 +450,11 @@ export interface EpicSweepOptions {
    * fail-closed and names the missing reading instead of manufacturing an all-clear.
    */
   lastHookEventFor?: (agentId: string) => number | null | undefined;
+  /** The RAW observed status for an agent. Defaults to `runtimeStore.status[agentId]` — raw, not
+   *  composited, for the same reason `processAliveFor` insists on it: the composite's `unmerged`
+   *  overlay is written over other statuses. Used only to exempt an agent waiting on a human from
+   *  the silence rule; see `engine/orchestratorLiveness.WAITING_ON_HUMAN`. */
+  statusFor?: (agentId: string) => AgentTabStatus | undefined;
   /** How long an orchestrator may be silent before it stops counting as staffing its epic.
    *  Defaults to {@link ORCHESTRATOR_SILENT_MS}; injected by tests so a fixture can state a window
    *  instead of moving a clock an hour. */
@@ -595,6 +601,15 @@ export function candidateFor(
    */
   staffing?: {
     lastHookEventFor: (agentId: string) => number | null | undefined;
+    /**
+     * The RAW observed status for an agent, or `undefined` when this window observed none.
+     *
+     * Load-bearing, not decorative: it is what lets the liveness join exempt an agent WAITING ON A
+     * HUMAN from the silence rule. A blocked agent's hook log freezes at the unanswered prompt, so
+     * without this the sweep reads it as dead and hands the epic back — and `sendToBuild` on an
+     * already-live orchestrator writes the handoff text into that open prompt (roborev 72648).
+     */
+    statusFor: (agentId: string) => AgentTabStatus | undefined;
     now: number;
     silentMs?: number;
   },
@@ -627,7 +642,11 @@ export function candidateFor(
       : epicOrchestratorLiveness(
           bound.map((a) =>
             orchestratorLivenessOf(
-              { observedAlive: alive(a.id), lastHookEventMs: staffing.lastHookEventFor(a.id) },
+              {
+                observedAlive: alive(a.id),
+                observedStatus: staffing.statusFor(a.id),
+                lastHookEventMs: staffing.lastHookEventFor(a.id),
+              },
               staffing.now,
               staffing.silentMs,
             ),
@@ -919,6 +938,8 @@ export async function sweepEpics(opts: EpicSweepOptions = {}): Promise<EpicSweep
   const lastHookEventFor =
     opts.lastHookEventFor ??
     ((agentId: string) => useRuntimeStore.getState().agentMovement[agentId]?.lastEventMs);
+  const statusFor =
+    opts.statusFor ?? ((agentId: string) => useRuntimeStore.getState().status[agentId]);
   const orchestratorSilentMs = opts.orchestratorSilentMs ?? ORCHESTRATOR_SILENT_MS;
   const deathCauseFor = opts.deathCauseFor ?? deathCauseForAgent;
 
@@ -1014,6 +1035,7 @@ export async function sweepEpics(opts: EpicSweepOptions = {}): Promise<EpicSweep
       // argument is the board reading, which can and did.
       const candidate = candidateFor(beads, project.agents, epic, aliveFor, true, beadsObserved, {
         lastHookEventFor,
+        statusFor,
         now,
         silentMs: orchestratorSilentMs,
       });

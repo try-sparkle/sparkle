@@ -23,6 +23,7 @@ import { useRuntimeStore } from "../stores/runtimeStore";
 import { _resetDeadSessionRegistryForTests, noteAgentDeath } from "./deadSessionRegistry";
 import type { DeathCause } from "../engine/deathTypes";
 import type { AgentTab } from "../types";
+import type { AgentTabStatus } from "@sparkle/ui";
 
 const NOW = 1_700_000_000_000;
 const HOUR = 60 * 60 * 1000;
@@ -50,6 +51,8 @@ function scenario(
     /** `undefined` = this window never observed the agent, which is what a fleet-wide death leaves
      *  behind: no surviving pane, so `runtimeStore.status` holds nothing for anyone. */
     alive?: boolean | undefined;
+    /** The RAW observed status, when the case is about one. */
+    status?: AgentTabStatus;
     lastHookEventMs?: number | null;
     deathCause?: DeathCause;
     /** Omit BOTH artifact seams so the production defaults run. */
@@ -87,6 +90,7 @@ function scenario(
       projects: [{ id: "p1", rootPath: "/proj", agents }],
       beadsFor: () => beads,
       aliveFor: () => over.alive,
+      ...(over.status === undefined ? {} : { statusFor: () => over.status }),
       restartEnabled: true,
       restart,
       mark,
@@ -168,6 +172,39 @@ describe("an orchestrator is judged by evidence of work, not by a latched status
     const o = forEpic(await s.run());
     expect(o?.reason).toBe("staffing-unknown");
     expect(s.restart).not.toHaveBeenCalled();
+  });
+});
+
+// ── THE ONE THING THE SWEEP MUST NEVER DO ───────────────────────────────────────────────────────
+// roborev 72648 (High). An orchestrator sitting at a permission prompt reports ALIVE
+// (`processAliveFor`'s DEAD set is only done|errored|stopped) and its hook log FREEZES at the
+// unanswered `PreToolUse`. Read as a death, the sweep hands the epic back — and `sendToBuild` on an
+// already-live orchestrator writes the handoff text into that PTY as a bracketed paste plus Enter,
+// which ANSWERS the pending question with the handoff text. A permission decision the human never
+// made, taken while they are away. The remedy gate cannot catch it: `blocked-on-human` is a DEATH
+// cause and a LIVE blocked agent has no death record, so `deathCauseFor` returns undefined and
+// `restartRemedyFor` answers "restart".
+describe("an orchestrator waiting on a human is staffing, not dead", () => {
+  it.each(["questions", "waiting", "approval", "blocked"] as const)(
+    "never restarts an epic whose orchestrator sits at a prompt (%s)",
+    async (status) => {
+      const s = scenario({ alive: true, status, lastHookEventMs: NOW - 121 * HOUR });
+      const o = forEpic(await s.run());
+      expect(o?.action).toBe("skip");
+      expect(o?.reason).toBe("orchestrator-alive");
+      // THE SIDE EFFECT that matters: nothing was handed back, so nothing was typed into the open
+      // prompt. Asserting only the reason would pass for a sweep that skipped for another cause.
+      expect(s.restart).not.toHaveBeenCalled();
+      expect(s.notify).not.toHaveBeenCalled();
+    },
+  );
+
+  // PAIRED, or the case above is satisfiable by a sweep that stopped restarting anything. `idle` is
+  // the status 17 of the founder's 17 measured orchestrators carried, and it is not a human wait.
+  it("…but an IDLE orchestrator with the same stale log is still restarted", async () => {
+    const s = scenario({ alive: true, status: "idle", lastHookEventMs: NOW - 121 * HOUR });
+    expect(forEpic(await s.run())?.performed).toBe("restarted");
+    expect(s.restart).toHaveBeenCalledTimes(1);
   });
 });
 
