@@ -472,8 +472,18 @@ pub fn diagnose_at(root: &str, default_branch: &str, threshold: u32) -> StaleDia
         head_branch,
         default_branch: default_branch.to_string(),
         detached,
-        // A linked worktree's `.git` is a FILE pointing at the main checkout's admin dir.
-        linked_worktree: std::path::Path::new(root).join(".git").is_file(),
+        // CLASSIFICATION, NOT LIVENESS — deliberately the other helper (bead sparkle-tm4blm).
+        //
+        // This field means "linked worktree rather than main checkout", and a pruned HUSK is still
+        // linked-shaped even though `git` can no longer answer in it. Routing this through
+        // `is_live_worktree` would answer a question nobody asked here and misreport a dead linked
+        // worktree as a MAIN CHECKOUT, which is a second wrong answer rather than a fix.
+        //
+        // A husk cannot reach this line at all: `root_staleness_at` above runs `git` in `root`,
+        // which fails in a husk, so arm 1 has already returned `unknown` with `linked_worktree:
+        // false`. That ordering is what makes the distinction safe, and it is asserted by
+        // `a_pruned_husk_is_unknown_and_never_reaches_the_linked_worktree_classification`.
+        linked_worktree: crate::worktree_liveness::is_linked_worktree(std::path::Path::new(root)),
         held_by: held_by_at(root, default_branch),
         dirty_count,
         dirty_sample,
@@ -1084,6 +1094,46 @@ mod tests {
         assert!(d.dirty_sample.contains(&"f.txt".to_string()), "got {:?}", d.dirty_sample);
         assert!(d.dirty_sample.contains(&"scratch.txt".to_string()), "got {:?}", d.dirty_sample);
         assert!(d.cause.contains('2'), "the cause names the count: {}", d.cause);
+    }
+
+    // 2b. THE HUSK, AND WHY THIS SITE IS CLASSIFICATION RATHER THAN LIVENESS (bead sparkle-tm4blm).
+    //
+    // `linked_worktree` is set from `is_linked_worktree`, not `is_live_worktree`, and this pins the
+    // ordering that makes that safe: a pruned husk never reaches the classification at all, because
+    // every `git` probe in it fails and arm 1 returns `unknown` first. The SIDE EFFECT asserted is
+    // the panel's: a husk is reported as UNMEASURABLE, so no remedy button is offered for a
+    // directory in which no remedy could run — rather than being classified and given one.
+    //
+    // Move the classification above the `unknown` gate, or swap the helper for `is_live_worktree`,
+    // and one of these assertions goes red.
+    #[test]
+    fn a_pruned_husk_is_unknown_and_never_reaches_the_linked_worktree_classification() {
+        let holder = unique_root("diag-husk");
+        let husk = holder.path().join("husk");
+        std::fs::create_dir_all(&husk).unwrap();
+        // `git worktree prune` leaves the pointer FILE and removes the gitdir it names.
+        std::fs::write(husk.join(".git"), "gitdir: /nowhere/that/exists/.git/worktrees/x\n")
+            .unwrap();
+        assert!(husk.join(".git").exists(), "precondition: the husk passes the OLD `.exists()`");
+
+        let d = diagnose_at(husk.to_str().unwrap(), "main", 25);
+        assert!(d.unknown, "no git probe can answer in a husk, so nothing may be claimed about it");
+        assert_eq!(d.remedy, StaleRemedy::Unknown, "and no button is offered");
+        assert!(
+            !d.linked_worktree,
+            "the unknown arm reports false — the classification below it is never reached"
+        );
+
+        // The classifier itself, on the same husk, still says LINKED — which is the correct answer
+        // to the question it asks, and is why this site must not use the liveness helper.
+        assert!(
+            crate::worktree_liveness::is_linked_worktree(&husk),
+            "a husk is a DEAD worktree, but it was never a main checkout"
+        );
+        assert!(
+            !crate::worktree_liveness::is_live_worktree(&husk),
+            "…and it is not live, which is the other question"
+        );
     }
 
     // 3. THE CASE THIS FEATURE EXISTS FOR — a REAL linked worktree with a detached HEAD while the

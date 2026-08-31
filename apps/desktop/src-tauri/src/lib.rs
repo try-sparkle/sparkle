@@ -161,6 +161,7 @@ mod trial_remote;
 mod verify_gate;
 mod watchdog;
 mod worktree;
+mod worktree_liveness;
 mod notes;
 mod nudge_gate;
 mod nudge_ladder;

@@ -169,9 +169,17 @@ pub fn budget() -> Duration {
 
 /// Every live agent worktree under `<app_data>/worktrees/<project_id>/<agent_id>`.
 ///
-/// `.git` is a FILE in a linked worktree, so its presence is the cheap proof this directory is a
-/// live worktree rather than a husk `git worktree prune` has already disowned — the same test
-/// `conflict_watch::discover_repos` uses, for the same reason.
+/// Liveness comes from [`crate::worktree_liveness::is_live_worktree`], NOT from the presence of a
+/// `.git` entry. The sentence that stood here claimed the opposite — that a `.git` FILE "is the
+/// cheap proof this directory is a live worktree rather than a husk `git worktree prune` has
+/// already disowned" — and it was exactly backwards (bead sparkle-tm4blm): prune removes the ADMIN
+/// directory and LEAVES the pointer file, so a husk is precisely what that test admitted.
+///
+/// The cost here is the QUIT BUDGET. Every husk claimed as a target takes a worker slot and spends
+/// it on a `git status` that can only answer `fatal: not a git repository` — and the budget is the
+/// thing that decides WHICH live worktree goes unprotected when time runs out. Stale husks
+/// accumulate in the app's worktree tree until a human deletes them, so this is a standing tax on
+/// the one path whose whole job is to not run out of time.
 ///
 /// ORDERED NEWEST-TOUCHED FIRST, and that ordering is load-bearing rather than cosmetic: when the
 /// budget runs out it decides WHICH trees go unprotected, and the agent that was typing when the
@@ -195,7 +203,7 @@ pub fn sweep_targets(app_data: &Path) -> Vec<Target> {
         };
         for entry in entries.flatten() {
             let path = entry.path();
-            if !path.join(".git").exists() {
+            if !crate::worktree_liveness::is_live_worktree(&path) {
                 continue;
             }
             let Some(agent_id) = path.file_name().and_then(|n| n.to_str()).map(str::to_string)
@@ -370,6 +378,18 @@ mod tests {
         dir
     }
 
+    /// A LIVE linked worktree — a `.git` POINTER FILE whose gitdir REALLY EXISTS.
+    ///
+    /// Every fixture in this module used to write `gitdir: /somewhere`, a path that has never
+    /// existed, so each of them built the exact husk `sweep_targets` now drops while asserting it
+    /// was a live target. The fixtures agreed with the bug, which is what made the vacuous filter
+    /// look tested (bead sparkle-tm4blm).
+    fn make_live_worktree(dir: &Path) {
+        let admin = dir.join(".git-admin");
+        std::fs::create_dir_all(&admin).unwrap();
+        std::fs::write(dir.join(".git"), format!("gitdir: {}\n", admin.display())).unwrap();
+    }
+
     fn target(id: &str) -> Target {
         Target { agent_id: id.to_string(), path: PathBuf::from(format!("/nope/{id}")) }
     }
@@ -387,7 +407,7 @@ mod tests {
         for (project, agent) in [("p1", "a1"), ("p1", "a2"), ("p2", "b1")] {
             let wt = base.join(project).join(agent);
             std::fs::create_dir_all(&wt).unwrap();
-            std::fs::write(wt.join(".git"), "gitdir: /somewhere").unwrap();
+            make_live_worktree(&wt);
         }
         // A husk `git worktree prune` already disowned: a directory with no `.git`.
         std::fs::create_dir_all(base.join("p1").join("husk")).unwrap();
@@ -403,8 +423,55 @@ mod tests {
             "every live worktree is a target; the husk and the stray file are not"
         );
         for t in &found {
-            assert!(t.path.join(".git").exists(), "a target always names a real worktree");
+            assert!(
+                crate::worktree_liveness::is_live_worktree(&t.path),
+                "a target always names a LIVE worktree, not merely one with a `.git` entry"
+            );
         }
+    }
+
+    /// A PRUNED HUSK MUST NOT BE SWEPT (bead sparkle-tm4blm).
+    ///
+    /// `git worktree prune` removes the admin directory and leaves the worktree's own `.git`
+    /// POINTER FILE behind, so a husk passes the bare `.exists()` this discovery used to run — the
+    /// test written precisely to exclude "a husk prune has already disowned" excluded none of them.
+    ///
+    /// The SIDE EFFECT asserted here is the one that costs something: a husk claimed as a target
+    /// spends a slot of the QUIT BUDGET on a `git status` that can only answer `fatal: not a git
+    /// repository`, and the budget is what decides which live worktree goes unprotected. So the
+    /// husk must be absent from `sweep_targets`, and the live worktrees must still be present.
+    #[test]
+    fn a_pruned_husk_that_kept_its_git_file_is_not_a_sweep_target() {
+        let app_data = unique_root("husk");
+        let base = app_data.join("worktrees").join("p1");
+        let admin = app_data.join("repo/.git/worktrees");
+
+        // LIVE: the pointer resolves to an admin dir that is really there.
+        let live = base.join("a-live");
+        std::fs::create_dir_all(&live).unwrap();
+        std::fs::create_dir_all(admin.join("a-live")).unwrap();
+        std::fs::write(live.join(".git"), format!("gitdir: {}\n", admin.join("a-live").display()))
+            .unwrap();
+
+        // LIVE main checkout: `.git` is a DIRECTORY.
+        let main = base.join("a-main");
+        std::fs::create_dir_all(main.join(".git")).unwrap();
+
+        // HUSK: pointer file survives, gitdir is gone.
+        let husk = base.join("a-DEAD");
+        std::fs::create_dir_all(&husk).unwrap();
+        std::fs::write(husk.join(".git"), format!("gitdir: {}\n", admin.join("a-DEAD").display()))
+            .unwrap();
+        assert!(husk.join(".git").exists(), "precondition: the husk passes the OLD filter");
+
+        let found = sweep_targets(&app_data);
+        let mut ids: Vec<&str> = found.iter().map(|t| t.agent_id.as_str()).collect();
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec!["a-live", "a-main"],
+            "the husk must not consume a slot of the quit budget; both live shapes must remain"
+        );
     }
 
     #[test]
@@ -423,7 +490,7 @@ mod tests {
         for agent in ["oldest", "middle", "newest"] {
             let wt = base.join(agent);
             std::fs::create_dir_all(&wt).unwrap();
-            std::fs::write(wt.join(".git"), "gitdir: /somewhere").unwrap();
+            make_live_worktree(&wt);
             // Touch the DIRECTORY (adding an entry bumps its mtime) with a gap big enough that a
             // coarse filesystem timestamp still separates them.
             std::thread::sleep(Duration::from_millis(1_100));

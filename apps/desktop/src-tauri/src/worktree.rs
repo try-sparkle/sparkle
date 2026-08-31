@@ -6440,9 +6440,19 @@ fn base_branch_verdict(
 /// that no agent is known to own (a project's own `develop`/`release/x`, or a descriptive branch), and
 /// a PR whose facts `gh` could not read all PASS — so neither a `gh` hiccup nor an ordinary non-agent
 /// PR is blocked. Only a base POSITIVELY owned by an agent that is not the head's own is refused.
-fn base_branch_gate(app_data: &Path, project_id: &str, root: &str, number: u64) -> Result<(), String> {
+///
+/// `facts` is READ BY THE CALLER and passed in, so `merge_pr`'s three gates share ONE `gh pr view`
+/// instead of issuing an identical network read each. It also puts the probe's `Option` — "we could
+/// not read this PR" — in the caller's hands, where the gates that must NOT allow on it can see it.
+fn base_branch_gate(
+    app_data: &Path,
+    project_id: &str,
+    root: &str,
+    number: u64,
+    facts: Option<&(String, String, String)>,
+) -> Result<(), String> {
     let default_branch = resolve_default_branch(root);
-    let facts = probe_pr_merge_facts(root, number);
+    let facts = facts.cloned();
     let store = crate::pr_owner::load_store(app_data);
     let facts_ref = facts.as_ref().map(|(b, h, y)| (b.as_str(), h.as_str(), y.as_str()));
     match base_branch_verdict(&store, project_id, &default_branch, facts_ref) {
@@ -6538,14 +6548,22 @@ fn stale_head_refusal(number: u64, head_ref: &str, pr_head: &str, ahead: usize) 
 /// [`merge_argv`] hands to `--match-head-commit`. That flag is NOT this gate: it asks whether the
 /// REMOTE branch moved under the merge, and answers "no" for precisely the measured case, where the
 /// newer commits were still LOCAL and had never been pushed.
-fn worktree_ahead_gate(root: &str, number: u64, head_ref: &str, pr_head: Option<&str>) -> Result<(), String> {
-    let head_ref = head_ref.trim();
-    let Some(pr_head) = pr_head.map(str::trim).filter(|s| !s.is_empty()) else {
+fn worktree_ahead_gate(
+    root: &str,
+    number: u64,
+    head_ref: Option<&str>,
+    pr_head: Option<&str>,
+) -> Result<(), String> {
+    // An unreadable head ref allows here, deliberately, matching `base_branch_gate`'s
+    // positive-evidence doctrine: with no branch name there is no local ref to compare, so there is
+    // no evidence of stranded work — only an absence of evidence. Its sibling below reaches the
+    // OPPOSITE conclusion from the same input, and the asymmetry is the point.
+    let (Some(head_ref), Some(pr_head)) = (
+        head_ref.map(str::trim).filter(|s| !s.is_empty()),
+        pr_head.map(str::trim).filter(|s| !s.is_empty()),
+    ) else {
         return Ok(());
     };
-    if head_ref.is_empty() {
-        return Ok(());
-    }
     // `--verify --quiet` exits non-zero for an absent ref AND for a repo that cannot be read; both
     // are "cannot tell", which is what an Err becomes here.
     let full_ref = format!("refs/heads/{head_ref}");
@@ -6754,8 +6772,11 @@ fn roborev_open_fail(stdout: &str) -> Option<(usize, Vec<i64>)> {
                 && !j.get("closed").and_then(Value::as_bool).unwrap_or(false)
         })
         .collect();
-    let ids = open.iter().filter_map(|j| j.get("id").and_then(Value::as_i64)).collect();
-    Some((open.len(), ids))
+    let ids: Vec<i64> = open.iter().filter_map(|j| j.get("id").and_then(Value::as_i64)).collect();
+    // From the ROWS, deliberately — `ids` is shorter whenever a row carries no `id`, and taking the
+    // count from it is how an open finding silently leaves the tally.
+    let count = open.len();
+    Some((count, ids))
 }
 
 /// The refusal for a merge whose branch still has open fail-verdict reviews. The remedy is the one
@@ -6791,15 +6812,31 @@ fn roborev_drain_refusal(number: u64, head_ref: &str, count: usize, ids: &[i64])
 /// But once roborev IS the mechanism, a read that fails is not evidence of no findings: certifying
 /// "nothing open" from a wedged daemon is the precise shape the pre-push gate refuses, and it is
 /// the shape that let the measured merge through.
-fn roborev_drain_gate(root: &str, number: u64, head_ref: &str, enabled: bool) -> Result<(), String> {
-    let head_ref = head_ref.trim();
-    if !enabled || head_ref.is_empty() {
+fn roborev_drain_gate(
+    root: &str,
+    number: u64,
+    head_ref: Option<&str>,
+    enabled: bool,
+) -> Result<(), String> {
+    // BOTH ABSENCE-OF-MECHANISM CHECKS COME FIRST, and the order is load-bearing (roborev 70001).
+    // `[tools].roborev` defaults to TRUE while the binary is resolved separately and can simply not
+    // be there — setup never ran, the install failed, the user removed it. Refusing above this point
+    // would block merges on a machine where the gate has nothing whatever to guard: with no roborev
+    // there are no findings that can exist, so the refusal would certify a risk that is structurally
+    // impossible. It would also contradict this function's own doc contract three lines up.
+    if !enabled {
         return Ok(());
     }
-    // No roborev on this machine = no mechanism, not a silent failure. Allow.
     let Some(bin) = crate::preflight::cached_roborev_path() else {
         return Ok(());
     };
+    // ONLY NOW, with the mechanism established: AN UNREADABLE HEAD REF IS NOT "NO HEAD REF"
+    // (roborev 69915). Every open PR has a `headRefName`, so an empty one never means "there is no
+    // branch to ask about" — it means the `gh pr view` behind it failed: a spawn error, a timeout, a
+    // rate limit, an expired token, unparseable JSON. Flattening that into a skip is how a
+    // fail-CLOSED gate silently becomes fail-OPEN, and a network blip would then re-admit exactly
+    // the merge this gate exists to refuse.
+    let head_ref = roborev_head_ref_or_refuse(number, head_ref)?;
     let mut cmd = Command::new(bin);
     cmd.args(["list", "--json", "--repo", root, "--branch", head_ref]).current_dir(root);
     apply_noninteractive(&mut cmd);
@@ -6824,13 +6861,49 @@ fn roborev_drain_decision(
     match parsed {
         Some((0, _)) => Ok(()),
         Some((count, ids)) => Err(roborev_drain_refusal(number, head_ref, count, &ids)),
-        None => Err(format!(
-            "Refusing merge_pr #{number}: could not read roborev's review state for `{head_ref}`, \
-             so whether this head has open fail-verdict findings is UNKNOWN — and an unknown is not \
-             an all-clear (bead sparkle-c9is0f). Check `roborev status`, then merge again. To merge \
-             without roborev at all, turn `[tools].roborev` off for this project."
-        )),
+        None => Err(roborev_unreadable_refusal(number, head_ref)),
     }
+}
+
+/// The head-ref half of [`roborev_drain_gate`], as a PURE function (roborev 72642).
+///
+/// It is split out for the same reason [`roborev_drain_decision`] is: driving it through the gate
+/// means first resolving the roborev BINARY, which has no test seam — so on a machine without
+/// roborev (hosted CI, where the Rust leg runs, and where roborev is deliberately not installed) the
+/// gate short-circuits on absence-of-mechanism and the assertion tests nothing. That made the
+/// behaviour green only on the one machine where roborev happens to exist.
+fn roborev_head_ref_or_refuse<'a>(number: u64, head_ref: Option<&'a str>) -> Result<&'a str, String> {
+    head_ref
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| roborev_unreadable_head_refusal(number))
+}
+
+/// The refusal for a PR whose head branch could not be read at all. Distinct from the
+/// review-state-unreadable message below because the fault and the remedy are different: nothing
+/// here is wrong with roborev, and telling the reader to check `roborev status` would send them to
+/// investigate a subsystem that is fine.
+fn roborev_unreadable_head_refusal(number: u64) -> String {
+    format!(
+        "Refusing merge_pr #{number}: could not read the PR's head branch from `gh`, so whether it \
+         has open roborev fail-verdict findings cannot be asked at all — and an unasked question is \
+         not an all-clear (roborev 69915). This is usually transient: check `gh auth status` and \
+         your connection, then merge again. If the probe is persistently slow rather than broken, \
+         \"merge again\" is not a remedy — turn `[tools].roborev` off for this project, which \
+         clears this refusal too."
+    )
+}
+
+/// The refusal for a review state that could not be READ, kept separate from the one for findings
+/// that were read and are open. They need different remedies — there is nothing to `roborev close`
+/// here — and a reader handed the wrong one follows an instruction that cannot work.
+fn roborev_unreadable_refusal(number: u64, head_ref: &str) -> String {
+    format!(
+        "Refusing merge_pr #{number}: could not read roborev's review state for `{head_ref}`, \
+         so whether this head has open fail-verdict findings is UNKNOWN — and an unknown is not \
+         an all-clear (bead sparkle-c9is0f). Check `roborev status`, then merge again. To merge \
+         without roborev at all, turn `[tools].roborev` off for this project."
+    )
 }
 
 /// Wall-clock ceiling for a user-initiated `gh pr merge`. Longer than `NETWORK_TIMEOUT`: a merge does
@@ -6920,16 +6993,20 @@ pub async fn merge_pr(
         // definitive refusal than a review-coverage question about a PR in it.
         merge_policy_gate(&root, "merge_pr")?;
         // Then WHERE the merge would land: never onto a peer agent's in-flight branch (sparkle-hvenv2).
-        base_branch_gate(&app_data, &project_id, &root, number)?;
+        // ONE `gh pr view`, shared by all three gates below. Its `Option` is kept, NOT flattened
+        // to a default: "we could not read this PR" and "this PR has no head branch" are different
+        // facts, and the gates disagree about what to do with the first one (roborev 69915).
+        let facts = probe_pr_merge_facts(&root, number);
+        let head_ref = facts.as_ref().map(|(_, h, _)| h.trim()).filter(|h| !h.is_empty());
+        base_branch_gate(&app_data, &project_id, &root, number, facts.as_ref())?;
         // Then WHAT would land, and whether it is ready to. The branch can be AHEAD of the head this
         // merge was decided against, so merging strands the newer work on no PR (sparkle-sx0glm /
         // sparkle-vthvdx); and that branch can still carry open roborev fail-verdict findings that
         // the pre-push gate is already blocking on, so merging lands defects it held back
-        // (sparkle-c9is0f). One `gh` read serves both.
-        let head_ref = probe_pr_merge_facts(&root, number).map(|(_, h, _)| h).unwrap_or_default();
-        worktree_ahead_gate(&root, number, &head_ref, expected_head_oid.as_deref())?;
+        // (sparkle-c9is0f).
+        worktree_ahead_gate(&root, number, head_ref, expected_head_oid.as_deref())?;
         let roborev_on = crate::config::for_project(&root).config.tools.roborev;
-        roborev_drain_gate(&root, number, &head_ref, roborev_on)?;
+        roborev_drain_gate(&root, number, head_ref, roborev_on)?;
         crate::knightwatch::enforce(&root, number, knightwatch_override.as_deref())?;
         let mut cmd = Command::new(crate::preflight::gh_program());
         cmd.args(merge_argv(number, expected_head_oid.as_deref()))
@@ -6947,7 +7024,11 @@ pub async fn merge_pr(
             // and the pushed commit is then on the default branch nowhere (bead sparkle-a08oi0).
             // Fail-OPEN on anything unread — the merge already happened, so only a positive,
             // fully-read mismatch may speak.
-            return merge_landing_gate(&root, number, &head_ref, merged_second_parent(&root, number).as_deref());
+            // `head_ref` is now an Option because the PRE-merge gates disagree about an
+            // unreadable one (roborev 69915). This POST-merge gate is fail-OPEN by design and
+            // already returns Ok on an empty ref, so flattening it here preserves its contract
+            // exactly: it cannot check what it could not read, and the merge already happened.
+            return merge_landing_gate(&root, number, head_ref.unwrap_or_default(), merged_second_parent(&root, number).as_deref());
         }
         let output = &captured.output;
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -8979,7 +9060,13 @@ pub fn commit_worktree_wip_within(
     // kinds, so unlike an `Err` it does not even leave a warning. A probe that times out on
     // `index.lock` (the bootstrap-install contention this whole timeout exists for) must say so.
     if let Err(e) = git_wip(worktree, &["rev-parse", "--git-dir"], deadline) {
-        return if Path::new(worktree).join(".git").exists() {
+        // ASK THE SHARED HELPER, not `.join(".git").exists()` (bead sparkle-tm4blm). `git worktree
+        // prune` removes the admin directory and LEAVES the `gitdir:` pointer file, so a husk passes
+        // an `.exists()` test — and then BOTH halves of this condition are true at once: the probe
+        // fails because the gitdir is gone, and the pointer is still sitting there. The old test
+        // therefore raised a hard "could not read the worktree" error for a directory that is simply
+        // dead, which is the one answer that is neither true nor actionable.
+        return if crate::worktree_liveness::is_live_worktree(Path::new(worktree)) {
             Err(format!("WIP snapshot could not read the worktree: {e}"))
         } else {
             Ok(nothing(WipCommitKind::NoWorktree))
@@ -9483,7 +9570,9 @@ pub fn autosave_worktree_wip_within(
         return Ok(none(AutosaveKind::NoWorktree));
     }
     if let Err(e) = git_autosave(worktree, &["rev-parse", "--git-dir"], deadline, None) {
-        return if Path::new(worktree).join(".git").exists() {
+        // The same husk-reads-as-a-broken-probe defect as the WIP snapshot above, on the other half
+        // of the quit path (bead sparkle-tm4blm). Same shared helper, same reason.
+        return if crate::worktree_liveness::is_live_worktree(Path::new(worktree)) {
             Err(format!("autosave could not read the worktree: {e}"))
         } else {
             Ok(none(AutosaveKind::NoWorktree))
@@ -12229,7 +12318,8 @@ mod tests {
         git(&main_str, &["worktree", "add", "-q", &wt_str, "-b", "side"]).unwrap();
 
         // Precondition: this is the layout that used to break — .git is a file, not a directory.
-        assert!(wt.join(".git").is_file(), "a linked worktree's .git must be a gitlink file");
+        // The SHAPE git wrote, not liveness — a gitlink file is what a linked worktree gets.
+        assert!(wt.join(".git").is_file(), "a linked worktree's .git must be a gitlink file"); // guard-ok
 
         // The worktree resolves to the SHARED hooks dir, and creating it succeeds (the ENOTDIR fix).
         let resolved = hooks_dir_for(&wt_str);
@@ -12576,7 +12666,7 @@ mod tests {
     /// `let _ = worktree_ahead_gate(…);`, which swallows the refusal, or for a commented-out call.
     #[test]
     fn merge_pr_actually_runs_the_worktree_ahead_gate() {
-        const CALL: &str = "worktree_ahead_gate(&root, number, &head_ref, expected_head_oid.as_deref())?;";
+        const CALL: &str = "worktree_ahead_gate(&root, number, head_ref, expected_head_oid.as_deref())?;";
         let src = include_str!("worktree.rs");
         let start = src.find("pub async fn merge_pr(").expect("merge_pr's signature");
         let body = &src[start..];
@@ -12589,7 +12679,7 @@ mod tests {
 
     #[test]
     fn merge_pr_actually_runs_the_roborev_drain_gate() {
-        const CALL: &str = "roborev_drain_gate(&root, number, &head_ref, roborev_on)?;";
+        const CALL: &str = "roborev_drain_gate(&root, number, head_ref, roborev_on)?;";
         let src = include_str!("worktree.rs");
         let start = src.find("pub async fn merge_pr(").expect("merge_pr's signature");
         let body = &src[start..];
@@ -12655,19 +12745,19 @@ mod tests {
         git(&root, &["checkout", "-q", "-b", "agent/work"]).unwrap();
         let pr_head = git(&root, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
         // The PR head is what it is now; the gate must PASS while the branch sits on it.
-        assert!(worktree_ahead_gate(&root, 7, "agent/work", Some(&pr_head)).is_ok());
+        assert!(worktree_ahead_gate(&root, 7, Some("agent/work"), Some(&pr_head)).is_ok());
         // Two more local commits — never pushed, so `--match-head-commit` would still be satisfied.
         git(&root, &["commit", "--allow-empty", "-m", "later work"]).unwrap();
         git(&root, &["commit", "--allow-empty", "-m", "a review-finding drain"]).unwrap();
-        let err = worktree_ahead_gate(&root, 7, "agent/work", Some(&pr_head))
+        let err = worktree_ahead_gate(&root, 7, Some("agent/work"), Some(&pr_head))
             .expect_err("the branch is 2 commits past the PR head; merging strands them");
         assert!(err.contains("2 local commits"), "{err}");
         assert!(err.contains("git push origin agent/work"), "{err}");
         // An unknown head oid, and a branch this repo does not have, are both "cannot tell".
-        assert!(worktree_ahead_gate(&root, 7, "agent/work", None).is_ok());
-        assert!(worktree_ahead_gate(&root, 7, "no/such/branch", Some(&pr_head)).is_ok());
+        assert!(worktree_ahead_gate(&root, 7, Some("agent/work"), None).is_ok());
+        assert!(worktree_ahead_gate(&root, 7, Some("no/such/branch"), Some(&pr_head)).is_ok());
         // A head oid this repo has never seen makes `rev-list` fail — not a refusal.
-        assert!(worktree_ahead_gate(&root, 7, "agent/work", Some("deadbeef")).is_ok());
+        assert!(worktree_ahead_gate(&root, 7, Some("agent/work"), Some("deadbeef")).is_ok());
     }
 
     // ── POST-MERGE LANDING VERIFICATION ──────────────────────────────────────────────────────
@@ -12680,8 +12770,12 @@ mod tests {
     /// commit to read, so the check could only ever be vacuous.
     #[test]
     fn merge_pr_returns_the_merge_landing_gate_rather_than_a_bare_ok() {
+        // `head_ref` became an `Option` when the PRE-merge gates started disagreeing about an
+        // unreadable one (roborev 69915); this POST-merge gate is fail-OPEN and already returns Ok
+        // on an empty ref, so it takes the flattened value. The pin tracks the call, not the spelling
+        // it had before.
         const CALL: &str =
-            "return merge_landing_gate(&root, number, &head_ref, merged_second_parent(&root, number).as_deref());";
+            "return merge_landing_gate(&root, number, head_ref.unwrap_or_default(), merged_second_parent(&root, number).as_deref());";
         let src = include_str!("worktree.rs");
         let start = src.find("pub async fn merge_pr(").expect("merge_pr's signature");
         let body = &src[start..];
@@ -12845,11 +12939,56 @@ mod tests {
 
     /// The two ABSENCE-OF-MECHANISM cases allow, so the gate cannot block every merge in every repo
     /// that does not use roborev. Driven through the gate, not the parser.
+    /// ABSENCE OF A MECHANISM allows; an unreadable ANSWER does not. Only the first of these is a
+    /// reason to merge, and conflating them is what roborev 69915 caught: `gh pr view` failing gave
+    /// an empty head ref, the gate skipped, and one network blip turned the fail-closed gate
+    /// fail-open — re-admitting the very merge it exists to refuse.
     #[test]
-    fn roborev_drain_gate_allows_when_the_mechanism_is_switched_off_or_unnamed() {
+    fn roborev_drain_gate_allows_only_when_the_mechanism_is_absent_never_when_a_read_failed() {
         let root = init_repo("roborev-drain-gate-off");
-        assert!(roborev_drain_gate(&root, 9, "agent/work", false).is_ok(), "[tools].roborev off");
-        assert!(roborev_drain_gate(&root, 9, "", true).is_ok(), "no head ref to ask about");
+        assert!(
+            roborev_drain_gate(&root, 9, Some("agent/work"), false).is_ok(),
+            "[tools].roborev off is a repo that does not use the mechanism at all"
+        );
+        // THE SECOND ABSENCE (roborev 70001). `[tools].roborev` defaults to true while the binary
+        // is resolved separately, so "enabled but not installed" is a real machine state — and the
+        // gate must allow there, because with no roborev no finding can exist to be undrained.
+        // Asserted structurally: the path lookup has to precede the head-ref refusal, or an
+        // unreadable head ref would block a merge on a machine the gate cannot guard at all.
+        let src = include_str!("worktree.rs");
+        let start = src.find("fn roborev_drain_gate(").expect("roborev_drain_gate");
+        let body = &src[start..];
+        let installed = body.find("cached_roborev_path()").expect("the path lookup");
+        let refusal = body.find("roborev_head_ref_or_refuse(number, head_ref)?").expect("the refusal");
+        // A readable ref passes straight through, so the refusal is about unreadability alone.
+        assert_eq!(roborev_head_ref_or_refuse(9, Some(" agent/work ")), Ok("agent/work"));
+        assert!(
+            installed < refusal,
+            "the roborev-installed check must come BEFORE the unreadable-head refusal, or a machine \
+             with no roborev cannot merge"
+        );
+        // Driven through the PURE decision, not the gate (roborev 72642): the gate resolves the
+        // roborev BINARY first, and on a machine without it — hosted CI, where the Rust leg runs —
+        // absence-of-mechanism short-circuits and this loop would assert nothing at all. The
+        // structural check above is what pins the ORDERING; this pins the DECISION.
+        for unreadable in [None, Some(""), Some("   ")] {
+            let err = roborev_head_ref_or_refuse(9, unreadable)
+                .expect_err("an unreadable head ref must NOT skip the gate");
+            assert!(err.contains("could not read the PR's head branch"), "{err}");
+            // The remedy must point at the thing that is actually broken. roborev is fine here.
+            assert!(!err.contains("roborev status"), "wrong subsystem in the remedy: {err}");
+        }
+    }
+
+    /// Its SIBLING reaches the opposite conclusion from the same input, on purpose: with no branch
+    /// name there is no local ref to compare, so there is no evidence of stranded work — and this
+    /// gate, like `base_branch_gate`, only refuses on positive evidence.
+    #[test]
+    fn worktree_ahead_gate_allows_an_unreadable_head_ref_where_its_sibling_refuses() {
+        let root = init_repo("worktree-ahead-unreadable");
+        let head = git(&root, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
+        assert!(worktree_ahead_gate(&root, 9, None, Some(&head)).is_ok());
+        assert!(worktree_ahead_gate(&root, 9, Some(""), Some(&head)).is_ok());
     }
 
     #[test]
@@ -12917,6 +13056,93 @@ mod tests {
         assert!(unknown.contains("roborev status"), "the remedy must be one a reader can run: {unknown}");
         // The two refusals must not be confusable — they need different remedies.
         assert!(!unknown.contains("roborev close"), "an unreadable state has nothing to close: {unknown}");
+    }
+
+
+    // ── THE QUIT PATH'S HUSK TEST (bead sparkle-tm4blm) ──────────────────────────────────────
+    // `git worktree prune` removes the admin directory and LEAVES the `gitdir:` pointer file, so a
+    // pruned husk passed the old `.join(".git").exists()` test. In a husk BOTH halves of that
+    // condition are true at once — the `rev-parse` probe fails because the gitdir is gone, and the
+    // pointer is still on disk — so each of these two paths raised a hard "could not read the
+    // worktree" error about a directory that is simply dead.
+
+    /// A husk on disk: a directory whose `.git` FILE points at a gitdir that does not exist. Exactly
+    /// what `git worktree prune` leaves behind, built by hand so no live git state can mask it.
+    fn husk(tag: &str) -> String {
+        let dir = unique_root(tag);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dangling = dir.join("no-such-admin-dir");
+        std::fs::write(dir.join(".git"), format!("gitdir: {}\n", dangling.display())).unwrap();
+        assert!(dir.join(".git").exists(), "precondition: the husk passes the OLD `.exists()` test");
+        assert!(!dangling.exists(), "precondition: the gitdir it names is gone");
+        dir.to_string_lossy().to_string()
+    }
+
+    #[test]
+    fn the_wip_snapshot_reads_a_pruned_husk_as_no_worktree_not_as_a_broken_probe() {
+        let h = husk("wip-husk");
+        let out = commit_worktree_wip_within(&h, "wip", Instant::now() + WIP_SNAPSHOT_TIMEOUT)
+            .expect("a dead worktree is nothing to save, not a hard error");
+        assert_eq!(out.kind, WipCommitKind::NoWorktree);
+        assert_eq!(out.files, 0);
+    }
+
+    #[test]
+    fn autosave_reads_a_pruned_husk_as_no_worktree_not_as_a_broken_probe() {
+        let h = husk("autosave-husk");
+        let out = autosave_worktree_wip_within(&h, "agent-x", Instant::now() + AUTOSAVE_TIMEOUT)
+            .expect("a dead worktree is nothing to save, not a hard error");
+        assert_eq!(out.kind, AutosaveKind::NoWorktree);
+    }
+
+    /// A worktree that is LIVE by the helper's measure — a real `.git` DIRECTORY — but whose `git`
+    /// invocations all fail. An unsupported `repositoryformatversion` is git's own refusal, so this
+    /// needs no corrupted bytes and no race: every later `git` call in this tree errors out.
+    fn live_but_unreadable(tag: &str) -> String {
+        let root = init_repo(tag);
+        git(&root, &["config", "core.repositoryformatversion", "999"]).unwrap();
+        assert!(
+            crate::worktree_liveness::is_live_worktree(Path::new(&root)),
+            "precondition: still LIVE — `.git` is a real directory, so this is not the husk case"
+        );
+        assert!(
+            git(&root, &["rev-parse", "--git-dir"]).is_err(),
+            "precondition: the probe this gate branches on must actually fail"
+        );
+        root
+    }
+
+    /// THE PAIRED CASE, without which the two husk tests above are ambiguous: a LIVE worktree whose
+    /// probe genuinely fails must still say so. The reroute can only turn `Err` into
+    /// `Ok(NoWorktree)`, and `NoWorktree` is SILENT on the TS side — so getting this wrong reports
+    /// "there was nothing to save" about a directory about to be deleted with work in it, which is
+    /// exactly what roborev 64474 ruled out.
+    ///
+    /// An earlier version of this test passed `Instant::now()` as the deadline and was VACUOUS
+    /// (roborev 69988): the spent-budget guard at the top of the function returned first, so the
+    /// rerouted branch was never reached and `assert!(!err.is_empty())` passed on the deadline
+    /// string. Hence a live deadline, and an assertion on the MESSAGE rather than on non-emptiness.
+    #[test]
+    fn a_live_worktree_whose_probe_fails_is_still_a_hard_error() {
+        let root = live_but_unreadable("wip-live-but-broken");
+        let err = commit_worktree_wip_within(&root, "wip", Instant::now() + WIP_SNAPSHOT_TIMEOUT)
+            .expect_err("a live worktree we could not read is a fault worth reporting");
+        assert!(
+            err.contains("could not read the worktree"),
+            "must be the probe-failed error, not the deadline one: {err}"
+        );
+    }
+
+    /// The mirror on the autosave half, which had no paired test at all.
+    #[test]
+    fn autosave_of_a_live_worktree_whose_probe_fails_is_still_a_hard_error() {
+        let root = live_but_unreadable("autosave-live-but-broken");
+        let err = autosave_worktree_wip_within(&root, "agent-x", Instant::now() + AUTOSAVE_TIMEOUT)
+            .expect_err("a live worktree we could not read is a fault worth reporting");
+        assert!(
+            err.contains("could not read the worktree"),
+            "must be the probe-failed error, not the deadline one: {err}"
+        );
     }
 
     fn branch_exists(root: &str, branch: &str) -> bool {
@@ -13494,7 +13720,8 @@ mod tests {
         // The fix recovers it into a real standalone repo with a born HEAD.
         ensure_project_repo_inner(r.clone()).expect("orphaned worktree should be recovered");
         assert!(git(&r, &["rev-parse", "HEAD"]).is_ok(), "recovered repo has a born HEAD");
-        assert!(Path::new(&r).join(".git").is_dir(), ".git is now a real repo directory");
+        // The SHAPE, not liveness — the point of the assertion is that it is a DIRECTORY now.
+        assert!(Path::new(&r).join(".git").is_dir(), ".git is now a real repo directory"); // guard-ok
         assert!(Path::new(&r).join(".git.orphaned").exists(), "dead pointer preserved, not destroyed");
         assert!(Path::new(&r).join("keep.txt").exists(), "user files are untouched");
     }
@@ -13510,7 +13737,8 @@ mod tests {
         std::fs::write(format!("{r}/.git"), format!("gitdir: {live_gitdir}\n")).unwrap();
 
         clear_dangling_gitfile(&r);
-        assert!(Path::new(&r).join(".git").is_file(), "live gitfile must remain in place");
+        // That the gitfile was LEFT ALONE, not that anything is live.
+        assert!(Path::new(&r).join(".git").is_file(), "live gitfile must remain in place"); // guard-ok
         assert!(!Path::new(&r).join(".git.orphaned").exists(), "nothing should be moved aside");
     }
 
@@ -20820,8 +21048,9 @@ detached
         let linked_str = linked.to_string_lossy().to_string();
         git(&origin_str, &["worktree", "add", "-b", "desktop-checkout", &linked_str, "main"])
             .unwrap();
+        // That the FIXTURE really is a linked worktree (a gitlink file), not that it is live.
         assert!(
-            Path::new(&linked_str).join(".git").is_file(),
+            Path::new(&linked_str).join(".git").is_file(), // guard-ok
             "fixture: a linked worktree's `.git` is a FILE pointing elsewhere — the whole hazard"
         );
 
@@ -23816,7 +24045,7 @@ mod merge_policy_tests {
     /// a commented-out call.
     #[test]
     fn merge_pr_actually_runs_the_base_branch_gate() {
-        const CALL: &str = "base_branch_gate(&app_data, &project_id, &root, number)?;";
+        const CALL: &str = "base_branch_gate(&app_data, &project_id, &root, number, facts.as_ref())?;";
         let src = include_str!("worktree.rs");
         let start = src.find("pub async fn merge_pr(").expect("merge_pr's signature");
         let body = &src[start..];

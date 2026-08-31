@@ -450,10 +450,20 @@ fn describe_bd_failure(e: &BeadsError, mutates: bool) -> String {
 /// `project_path` let the webview write `NOTES.md` / `PRD/<name>.md` into — or read
 /// `PRD/<name>.md` out of — ANY directory the user can access (`~/.ssh`, `~/Library`, `/etc`, …).
 /// Every real Sparkle project root is a git repository (the whole app is git-worktree based;
-/// `bd`/PRD/NOTES all live in a repo), so we require an absolute, existing directory that contains
-/// a `.git` entry — a DIR in a normal clone, a FILE in a linked worktree — which those sensitive
-/// non-repo targets never do. We canonicalize FIRST so a symlink or `..` can't smuggle the check
-/// across a repo boundary. Returns the canonical root to use for the join.
+/// `bd`/PRD/NOTES all live in a repo), so we require an absolute, existing directory that is a LIVE
+/// working tree — which those sensitive non-repo targets never are. We canonicalize FIRST so a
+/// symlink or `..` can't smuggle the check across a repo boundary. Returns the canonical root.
+///
+/// THE QUESTION HERE IS "CAN GIT ANSWER IN THIS DIRECTORY", NOT MERELY "IS THERE A `.git`" (bead
+/// sparkle-tm4blm). This gate used to test `.join(".git").exists()`, which a PRUNED HUSK passes:
+/// `git worktree prune` deletes the admin directory the pointer names and leaves the one-line
+/// `gitdir:` pointer FILE on disk. Admitting a husk is not a security hole — the directory is still
+/// under the app's own worktree tree, so nothing sensitive is reachable — but it is a wrong answer
+/// with a cost: `append_note` and `write_prd` would happily create `NOTES.md` / `PRD/<name>.md`
+/// inside a directory that no `git`, `gh`, `bd` or PRD tooling can read, so the note is written,
+/// reported as saved, and belongs to no repository. [`crate::worktree_liveness::is_live_worktree`]
+/// accepts both live shapes (a `.git` DIRECTORY in a clone, a RESOLVING pointer file in a linked
+/// worktree) and refuses only the husk.
 fn validate_project_root(project_path: &str) -> Result<PathBuf, String> {
     if project_path.is_empty() {
         return Err("project_path must not be empty".into());
@@ -467,7 +477,7 @@ fn validate_project_root(project_path: &str) -> Result<PathBuf, String> {
     if !real.is_dir() {
         return Err(format!("project_path is not a directory: {}", real.display()));
     }
-    if !real.join(".git").exists() {
+    if !crate::worktree_liveness::is_live_worktree(&real) {
         return Err(format!(
             "project_path is not a registered project root (no git repository): {}",
             real.display()
@@ -1838,11 +1848,17 @@ mod tests {
         let real = validate_project_root(&dir.to_string_lossy()).unwrap();
         // Returns the CANONICAL root (symlinks/.. resolved) so callers join a real path.
         assert_eq!(real, std::fs::canonicalize(&dir).unwrap());
-        // A `.git` FILE (linked worktree) counts too, not just a dir.
+        // A `.git` FILE (linked worktree) counts too, not just a dir — but the pointer has to
+        // RESOLVE. This fixture used to name `/somewhere/else`, a path that has never existed, so
+        // it was building the exact HUSK the gate is meant to refuse while asserting it was live
+        // (bead sparkle-tm4blm). That agreement between fixture and bug is what made the old
+        // `.exists()` gate look tested.
         let wt = std::env::temp_dir().join(format!("sparkle_root_wt_{}", std::process::id()));
         std::fs::remove_dir_all(&wt).ok();
         std::fs::create_dir_all(&wt).unwrap();
-        std::fs::write(wt.join(".git"), "gitdir: /somewhere/else\n").unwrap();
+        let admin = wt.join("admin-gitdir");
+        std::fs::create_dir_all(&admin).unwrap();
+        std::fs::write(wt.join(".git"), format!("gitdir: {}\n", admin.display())).unwrap();
         assert!(validate_project_root(&wt.to_string_lossy()).is_ok());
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_dir_all(&wt).ok();
@@ -2887,4 +2903,40 @@ mod tests {
         let got = v.get("title").or_else(|| v.get(0).and_then(|r| r.get("title")));
         assert_eq!(got.and_then(|t| t.as_str()), Some(title));
     }
+
+    /// A PRUNED HUSK MUST NOT PASS THE PROJECT-ROOT GATE (bead sparkle-tm4blm).
+    ///
+    /// `git worktree prune` removes the admin directory the pointer names and leaves the pointer
+    /// FILE itself on disk, so a husk satisfies a bare `.git.exists()` — the very shape this gate
+    /// was written with. Asserts the SIDE EFFECT at this call site: `validate_project_root` errors,
+    /// so `append_note` / `write_prd` refuse to create files under a directory no `git`, `bd` or
+    /// PRD tooling can answer from. Paired with the live cases so "reject everything" cannot pass.
+    #[test]
+    fn validate_project_root_rejects_a_pruned_husk_but_keeps_live_roots() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // HUSK: the `.git` pointer file survives, the gitdir it names does not.
+        let husk = tmp.path().join("husk");
+        std::fs::create_dir_all(&husk).unwrap();
+        std::fs::write(husk.join(".git"), "gitdir: /nowhere/that/exists/.git/worktrees/x\n")
+            .unwrap();
+        assert!(husk.join(".git").exists(), "precondition: the husk passes the OLD gate");
+        let err = validate_project_root(&husk.to_string_lossy())
+            .expect_err("a pruned husk is not a project root anything can be written into");
+        assert!(err.contains("git repository"), "the message names the reason: {err}");
+
+        // LIVE linked worktree: the pointer resolves.
+        let live = tmp.path().join("live");
+        let admin = tmp.path().join("repo/.git/worktrees/live");
+        std::fs::create_dir_all(&admin).unwrap();
+        std::fs::create_dir_all(&live).unwrap();
+        std::fs::write(live.join(".git"), format!("gitdir: {}\n", admin.display())).unwrap();
+        assert!(validate_project_root(&live.to_string_lossy()).is_ok());
+
+        // LIVE main checkout: `.git` is a DIRECTORY and owns its git dir outright.
+        let main = tmp.path().join("main");
+        std::fs::create_dir_all(main.join(".git")).unwrap();
+        assert!(validate_project_root(&main.to_string_lossy()).is_ok());
+    }
+
 }

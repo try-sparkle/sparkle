@@ -4454,7 +4454,10 @@ fi
         assert!(body.contains("/sub/dir/.env.local"), "rule must be repo-anchored, got: {body:?}");
         // …and NO fabricated gitdir inside the user's project. That was the visible symptom: an
         // untracked `.git/info/` git never reads, left behind while the seed was refused.
-        assert!(!sub.join(".git").exists(), "must not fabricate a .git inside the repo");
+        // Not a liveness test: this asserts a `.git` was NOT FABRICATED here, which is the
+        // OPPOSITE question, and no liveness helper can express it (bead sparkle-tm4blm).
+        let fabricated = sub.join(".git").exists(); // guard-ok (worktree-liveness): see above
+        assert!(!fabricated, "must not fabricate a .git inside the repo");
     }
 
     #[test]

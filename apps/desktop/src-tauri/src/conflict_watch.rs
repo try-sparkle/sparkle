@@ -48,6 +48,7 @@ use serde_json::Value;
 use tauri::{AppHandle, Emitter, Manager, Runtime, State};
 
 use crate::conflict_ladder::{self, Action, Escalation, Observation, PrState};
+use crate::worktree_liveness::is_live_worktree;
 
 /// How often the thread wakes. Also the resolution of every deadline below.
 ///
@@ -881,80 +882,9 @@ struct Repo {
     dirs: Vec<PathBuf>,
 }
 
-/// Is `dir` a worktree `gh` and `git` can still ANSWER from — as opposed to a husk that merely
-/// looks like one?
-///
-/// ── WHY `.git.exists()` WAS NOT THIS CHECK (bead sparkle-iw02bk) ──────────────────────────────
-/// `git worktree prune` removes the ADMIN directory at `<repo>/.git/worktrees/<id>`. It does NOT
-/// touch the worktree's own `.git`, which is a one-line `gitdir:` POINTER FILE living in the
-/// worktree directory itself. So a pruned worktree keeps its `.git` and passes an `.exists()` test
-/// — the test that was written precisely to exclude "a leftover husk `git worktree prune` has
-/// already disowned", and excluded none of them.
-///
-/// What that cost: every `git`/`gh` call in such a directory answers `fatal: not a git repository:
-/// <the pruned gitdir>`. [`repo_slug`] therefore returns `None`, so `gh pr list` falls back to
-/// resolving the repo from its cwd and fails, and `gh api` cannot expand `{owner}/{repo}` and fails
-/// too. Two failures, one cause, neither of them an API fault — reported as [`BOTH_APIS_FAILED`],
-/// which reads as a GitHub outage. And because `dirs` is sorted and [`probe_repo`] always takes the
-/// same leading [`MAX_PROBE_FALLBACKS`], it recurs identically on every sweep: not a transient, a
-/// PERMANENT blind spot that ends only when a human deletes the directory. Measured on the
-/// founder's machine as a ~6-hour outage during which the `gh` CLI was entirely healthy.
-///
-/// Both shapes of `.git` are accepted, because both are real:
-///   * a FILE — a linked worktree. Live only if the `gitdir:` it names still exists.
-///   * a DIRECTORY — an ordinary main checkout, which owns its git dir outright.
-///
-/// Deliberately filesystem-only: no subprocess. This runs once per worktree per discovery walk, and
-/// `discovery_stamp` exists to keep that walk cheap — spawning `git` here would put ~90 processes on
-/// a path built to cost syscalls.
-fn is_live_worktree(dir: &Path) -> bool {
-    let dot_git = dir.join(".git");
-    let Ok(meta) = std::fs::metadata(&dot_git) else {
-        return false;
-    };
-    if meta.is_dir() {
-        return true;
-    }
-    let Ok(contents) = std::fs::read_to_string(&dot_git) else {
-        // A `.git` we cannot read is not a directory we can answer from either, but it is also not
-        // the husk this function is named for — say so, since silence here is what hid the original.
-        tracing::warn!(
-            target: "conflict_watch",
-            dir = %dir.display(),
-            "a worktree's `.git` file is unreadable; treating the worktree as gone"
-        );
-        return false;
-    };
-    let Some(gitdir) = gitdir_pointer(&contents) else {
-        return false;
-    };
-    // A RELATIVE pointer resolves against the worktree directory, which is how git writes one for a
-    // worktree created with a relative path.
-    let target = if gitdir.is_absolute() { gitdir } else { dir.join(gitdir) };
-    if target.exists() {
-        return true;
-    }
-    tracing::debug!(
-        target: "conflict_watch",
-        dir = %dir.display(),
-        gitdir = %target.display(),
-        "skipping a PRUNED worktree: its `.git` file survives but the gitdir it names is gone, so \
-         every `gh` call here fails with `not a git repository` and reads as an API outage"
-    );
-    false
-}
-
-/// The path out of a linked worktree's `.git` pointer file (`gitdir: <path>`), PURE so the parse is
-/// asserted without a filesystem. `None` for anything that is not that one line — a `.git` we
-/// cannot parse is not a worktree we can vouch for.
-fn gitdir_pointer(contents: &str) -> Option<PathBuf> {
-    contents
-        .lines()
-        .find_map(|l| l.trim().strip_prefix("gitdir:"))
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-}
+/// Worktree liveness lives in [`crate::worktree_liveness`] — the corrected helper was written
+/// here first (bead sparkle-iw02bk) and then found in three more modules, each with its own
+/// vacuous copy (bead sparkle-tm4blm). One definition, so the versions cannot drift apart.
 
 /// Every live worktree per project, in a stable (sorted) order.
 ///
