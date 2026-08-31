@@ -88,7 +88,32 @@ export const SIDEBAR_OVERLAY_Z = 25;
 // so they are mutually exclusive by construction and there is no ordering between them to express.
 // A second constant with the same value would be pure drift surface — kept equal by hand forever,
 // and the first time it drifted nothing could say which of the two was right.
-export const PLAN_COLUMN_Z = 26;
+export const PLAN_COLUMN_Z = 27;
+
+/**
+ * THE FAR SEAM OF A FLOATED COLUMN — above the floated column, and DELIBERATELY BELOW the board.
+ *
+ * This is not the same question as `OVERLAID_RAIL_Z` below, and conflating the two is a defect that
+ * has now been made twice in a row from opposite directions.
+ *
+ * The FAR seam is the one the column floated AWAY from. It is never covered by the panel, so it does
+ * not need to clear the board; what it needs to clear is the floated column's BOX, which carries
+ * `SIDEBAR_OVERLAY_Z` across the whole slot while the column is out. The tab is `translateX(-50%)`
+ * on a 6px rail and ~24px wide, so ~9px of it overhangs into that box — and a box that paints
+ * nothing still WINS hit-testing there, killing a third of the control's click target while it
+ * still looks whole (`CONCIERGE_LIFT_Z`'s defect, roborev 54712, arriving from an ancestor).
+ *
+ * Lifting it to `OVERLAID_RAIL_Z` instead over-corrects: that level is above `PLAN_COLUMN_Z`, so the
+ * far pair's own Plan board would be out-ranked by a seam it is supposed to cover — and `layers.ts`
+ * states that contract directly ("its pull tab is under the board in Plan mode, so it cannot be
+ * started there"). One step too high is the same class of bug as one step too low; only the victim
+ * changes.
+ *
+ * So the ladder now reads 25 → 26 → 27 → 28: the floated column, the far seam that must clear it,
+ * the board that must cover both, and the seam the column floated OVER, which is the only mouse-way
+ * back and must therefore clear everything.
+ */
+export const LIFTED_RAIL_Z = SIDEBAR_OVERLAY_Z + 1;
 
 /**
  * THE SEAM OF A FLOATED COLUMN — the one thing that must outrank everything the column floats over,
@@ -113,7 +138,7 @@ export const PLAN_COLUMN_Z = 26;
  * later change to either cannot silently re-create the tie. Still well under the 38–45 modal band —
  * a seam is chrome, not a modal.
  */
-export const OVERLAID_RAIL_Z = Math.max(SIDEBAR_OVERLAY_Z, PLAN_COLUMN_Z) + 1;
+export const OVERLAID_RAIL_Z = Math.max(SIDEBAR_OVERLAY_Z, PLAN_COLUMN_Z, LIFTED_RAIL_Z) + 1;
 
 // ── THE TWO COLUMNS OF A PAIR, AT REST ─────────────────────────────────────────────────────────
 // Separate from the two constants above, which are about a column that has been FLOATED. These are

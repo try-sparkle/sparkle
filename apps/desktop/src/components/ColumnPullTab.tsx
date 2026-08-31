@@ -90,7 +90,7 @@ import { C } from "../theme/colors";
 import { RADIUS } from "../theme/scale";
 import { log } from "../logger";
 import { clampWidth, type ClampedBy } from "../engine/columnResize";
-import { OVERLAID_RAIL_Z } from "./layers";
+import { LIFTED_RAIL_Z, OVERLAID_RAIL_Z } from "./layers";
 
 /** Keyboard step, and the larger step when Shift is held. */
 const STEP = 8;
@@ -1166,8 +1166,13 @@ const railOverlaid: CSSProperties = { ...rail, zIndex: OVERLAID_RAIL_Z };
 /** The FAR seam of a floated column: lifted for the reason above, but still a live resize boundary,
  *  so it keeps the drag affordance. `overlaid` is what removes the cursor — there is no boundary to
  *  drag when the column has floated over THIS seam — and that is a different question from whether
- *  the column is floating at all. */
-const railDraggableLifted: CSSProperties = { ...railDraggable, zIndex: OVERLAID_RAIL_Z };
+ *  the column is floating at all.
+ *
+ *  AT `LIFTED_RAIL_Z`, NOT `OVERLAID_RAIL_Z`. This seam is never covered by the panel, so it needs
+ *  to clear the floated BOX and nothing more; borrowing the overlaid level would put it above the
+ *  far pair's own Plan board, which is the exact contract inversion the previous round fixed on the
+ *  other side. One step too high and one step too low are the same class of bug. */
+const railDraggableLifted: CSSProperties = { ...railDraggable, zIndex: LIFTED_RAIL_Z };
 
 /**
  * The seam fill's box — the rail's full height, PLUS one pixel into each neighbour.

@@ -107,7 +107,7 @@ import {
   OVERLAY_WIDTH_BOOST,
   windowAwareMax,
 } from "../engine/columnResize";
-import { PLAN_COLUMN_Z, SIDEBAR_OVERLAY_Z } from "./layers";
+import { LIFTED_RAIL_Z, PLAN_COLUMN_Z, SIDEBAR_OVERLAY_Z } from "./layers";
 import { applyVisualFixtures } from "../dev/visualFixtures";
 import { DEV_BYPASS_AUTH_FLAG } from "../dev/devBypassAuth";
 import { useProjectStore } from "../stores/projectStore";
@@ -1415,6 +1415,11 @@ describe("a floated concierge lifts BOTH seams, clear of the board", () => {
     expect(docked).toBeLessThan(SIDEBAR_OVERLAY_Z);
     fireEvent.click(screen.getByTestId("concierge-pull-tab-chevron"));
     expect(railZ("left-pair-pull-tab")).toBeGreaterThan(SIDEBAR_OVERLAY_Z);
+    // …but NOT over that pair's own Plan board. The far seam is never covered by the panel, so
+    // clearing the box is the whole requirement; going higher would let a ~9px tab overhang paint
+    // and hit-test over a board whose contract is that nothing beneath it is reachable.
+    expect(railZ("left-pair-pull-tab")).toBeLessThan(PLAN_COLUMN_Z);
+    expect(railZ("left-pair-pull-tab")).toBe(LIFTED_RAIL_Z);
     // …and it is still a resize boundary: only the seam the column floated OVER loses its drag.
     expect(screen.getByTestId("left-pair-pull-tab").style.cursor).toBe("col-resize");
     expect(screen.getByTestId("concierge-pull-tab").style.cursor).toBe("");
