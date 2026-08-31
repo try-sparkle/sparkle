@@ -2333,6 +2333,51 @@ describe("controlListener", () => {
         expect(goalOf(callerId)!.metAt).toEqual(expect.any(Number));
       });
 
+      // ⚠️ THE NO-OP GUARD (roborev 72103). Ancestry ALONE is not enough to close a landed goal,
+      // because the branch that satisfies it most easily is one that has done NOTHING: cut from
+      // origin/main, nothing committed, so its HEAD *is* the ancestor and the probe answers a
+      // truthful `true`. `landedEvidenceFor` gates its own positive behind `committedWorkSeen`
+      // for exactly this reason, and widening the escalation to `!== true` handed that guarded
+      // `false` to an unguarded `true` — letting an agent with zero committed work self-latch
+      // `metAt`, the false "done" this gate exists to prevent.
+      //
+      // `dirty: true, ahead: 0` is the sharpest shape: the agent HAS edits, so it feels like work,
+      // and none of it is committed, so none of it can possibly have landed.
+      it("REFUSES a probe `true` for a branch that has committed nothing (ahead: 0, dirty)", async () => {
+        seedWindowLocalFalse();
+        useRuntimeStore.getState().setBranchStatus(callerId, {
+          ahead: 0,
+          behind: 0,
+          dirty: true,
+          filesChanged: 3,
+          insertions: 40,
+          deletions: 2,
+          worktreeOnBranch: true,
+        });
+        // The precondition, asserted rather than assumed — otherwise this passes for a fixture that
+        // never reached the probe at all.
+        expect(landedEvidenceFor(callerId)).toBe(false);
+        landedProbeReply = { landed: true, reason: "abc123 is an ancestor of refs/remotes/origin/main" };
+        fire({ reqId: "wl-noop", op: "set_agent_goal_met", callerAgentId: callerId, payload: { met: true } });
+        await flush();
+        // The goal must NOT close on ancestry alone…
+        expect(lastReply()).toMatchObject({ ok: false, code: "goal_not_self_markable" });
+        // …and the STORE fact is the one that matters: an unset `metAt` is what keeps the
+        // auto-continue sweep alive for an agent that has not finished.
+        expect(goalOf(callerId)!.metAt).toBeUndefined();
+
+        // ⚠️ AND THE TEXT, because blocking the latch is only half the job (roborev 72328).
+        // Discarding the probe's verdict left the provenance at "window-local", so the refusal
+        // denied git had spoken — while git had — and then told the agent to run
+        // `merge-base --is-ancestor`, which for THIS branch answers ANCESTOR, and to take that to
+        // the concierge, who is exempt from this gate. The blocked self-latch became a
+        // human-mediated false close. Asserting only the code and `metAt` passes over all of it.
+        const refusal = String((lastReply() as { error?: string }).error ?? "");
+        expect(refusal).toMatch(/ancestry check DOES say|reachable from origin\/main/i);
+        expect(refusal).not.toMatch(/merge-base --is-ancestor/);
+        expect(refusal).toMatch(/Do NOT take the ancestry result to the concierge/i);
+      });
+
       // THE PAIRED NEGATIVE — git ran and said no. This arm KEEPS "git says", because here it is
       // true; a fix that deleted the sentence outright would pass every assertion about the new copy
       // while stripping the one accurate message.

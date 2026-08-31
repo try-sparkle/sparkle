@@ -316,6 +316,39 @@ export function landedEvidenceFor(agentId: string): boolean | undefined {
   return unlandedWorkEvidence({ bs, ws, stageOverride: stage }) === true ? false : true;
 }
 
+/** Has this branch AUTHORED anything at all? — the no-op guard a raw ancestry check cannot carry.
+ *
+ *  `probeLandedFromGit` asks one question: is this worktree's CURRENT HEAD reachable from
+ *  origin/<default>. For a branch cut from origin/main whose agent has committed nothing — or that
+ *  holds only uncommitted edits — the honest answer to that question is YES, trivially, because its
+ *  HEAD *is* origin/main's HEAD. Ancestry is therefore not sufficient to close a `landed` goal: it
+ *  is satisfied most easily by a branch that has done no work at all, which is the false "done"
+ *  the goal gate exists to prevent (roborev 72103).
+ *
+ *  `landedEvidenceFor` already guards this — its positive half is gated behind `committedWorkSeen`
+ *  for exactly this reason — but that guard lives on the WINDOW-LOCAL path, so a probe result
+ *  allowed to overturn a window-local reading needs its own copy of it. This is that copy, sharing
+ *  the one `committedWorkSeen` implementation rather than re-deriving the rule: two spellings of
+ *  "has this branch done anything" that can disagree would be a worse bug than the one it fixes.
+ *
+ *  It establishes only that WORK EXISTS. It says nothing about whether that work landed — the
+ *  ancestry verdict still has to answer that, and still has the last word on the positive.
+ */
+export function authoredWorkSeen(agentId: string): boolean {
+  const rt = useRuntimeStore.getState();
+  const bs = rt.branchStatus?.[agentId];
+  const ws = rt.workflowState?.[agentId];
+  const stage = rt.workflowStage?.[agentId];
+  return committedWorkSeen({
+    gitStage: gitDerivedStage(bs),
+    prev: stage,
+    aheadOfBase: ws?.aheadOfBase,
+    pushed: ws?.pushed,
+    prState: ws?.prState,
+    crossRepoStamp: findRosterAgent(agentId)?.landedElsewhere != null,
+  });
+}
+
 /** The Rust probe's reply (`goal_landed_probe.rs::LandedProbe`).
  *
  *  ⚠️ `landed` IS `boolean | null`, NOT `boolean | undefined`. It is a Rust `Option<bool>`, and

@@ -189,6 +189,79 @@ describe("canSelfMarkMet — the self-report gate", () => {
     expect(nothingHeld).not.toEqual(holding);
   });
 
+  it("a GIT negative on a branch holding nothing back is the SQUASH shape, not a second PR (roborev 72103)", () => {
+    // THE BUG THIS PINS: arm ORDER. The `landedSource === "git-probe"` arm was placed first and
+    // matched on provenance alone, so it SHADOWED the "holding nothing back" arm for
+    // `{ landed: false, unlandedWork: false, landedSource: "git-probe" }` — a population that is
+    // reachable in production the moment the probe is allowed to run on a `false` reading, and that
+    // is exactly the SQUASH/REBASE-MERGE shape: the work IS in main, the tip is not an ancestor of
+    // it, so nothing is outstanding. Those agents were handed "Land it (open a PR and merge it)",
+    // the duplicate-PR instruction the shadowed arm was written to prevent.
+    //
+    // Not vacuous: before the fix this input returned the git-probe arm's string, so every
+    // assertion below fails on the pre-fix code.
+    const gitNegativeNothingHeld = selfMarkRefusal(
+      { kind: "landed" },
+      { landed: false, unlandedWork: false, landedSource: "git-probe" },
+    );
+
+    // THE ACTION is the thing: a branch holding nothing must never be sent, unconditionally, to
+    // open a PR — however git answered.
+    expect(gitNegativeNothingHeld).not.toMatch(/Land it \(open a PR and merge it\)/i);
+    // It still names the check that settles it and the door this agent cannot open itself.
+    expect(gitNegativeNothingHeld).toMatch(/concierge/i);
+    // …and it is HONEST about provenance in BOTH directions. Git did answer here, so it must not
+    // recite the watermark-miss line; and it must say why an ancestry negative is not proof.
+    expect(gitNegativeNothingHeld).not.toMatch(/NOT git saying your work is unlanded/i);
+    expect(gitNegativeNothingHeld).toMatch(/squash|rebase/i);
+
+    // ⚠️ THE REMEDY MUST BE ABLE TO SUCCEED (roborev 72328). A refusal is an instruction the agent
+    // will follow, so offering a check that CANNOT resolve this population is the same defect as
+    // saying nothing. `merge-base --is-ancestor` is exactly that check: the probe just ran it
+    // against a fresh fetch and got NOT an ancestor, and under a squash landing no commit of the
+    // agent's can ever BE an ancestor — so its "if it IS an ancestor" branch is unreachable here
+    // and the only live instruction left was "commit it and land it", i.e. the duplicate PR.
+    // Lineage cannot answer a squash; content can. Assert BOTH directions or the fix is untested.
+    expect(gitNegativeNothingHeld).not.toMatch(/merge-base --is-ancestor/);
+    expect(gitNegativeNothingHeld).toMatch(/gh pr list|git diff origin\/main/);
+    expect(gitNegativeNothingHeld).toMatch(/concierge/i);
+
+    // The PAIR: same evidence but window-local provenance keeps the watermark-miss copy, so a fix
+    // that simply collapsed the two would fail here.
+    const watermarkNothingHeld = selfMarkRefusal(
+      { kind: "landed" },
+      { landed: false, unlandedWork: false, landedSource: "window-local" },
+    );
+    expect(watermarkNothingHeld).toMatch(/NOT git saying your work is unlanded/i);
+    expect(watermarkNothingHeld).not.toEqual(gitNegativeNothingHeld);
+  });
+
+  it("a REFUSED git `true` says so, and does not hand the agent an ancestry argument (roborev 72328)", () => {
+    // THE BUG THIS PINS. When the probe answers ANCESTOR but no authored work is provable, the
+    // verdict used to be discarded and the provenance left at "window-local". The refusal then
+    // (a) denied git had spoken, while git had, and (b) told the agent to run
+    // `merge-base --is-ancestor` — which for this branch WILL say ancestor — and to take that to
+    // the concierge, who is exempt from this gate. A blocked self-latch became a human-mediated
+    // false close plus a false escalation: strictly worse than the hole the guard closed.
+    const refusedTrue = selfMarkRefusal(
+      { kind: "landed" },
+      { landed: false, landedSource: "git-probe-unproven" },
+    );
+
+    // It states git's ACTUAL finding rather than denying git ran…
+    expect(refusedTrue).toMatch(/ancestry check DOES say|reachable from origin\/main/i);
+    expect(refusedTrue).not.toMatch(/NOT git saying your work is unlanded/i);
+    // …explains why ancestry is not evidence for THIS branch…
+    expect(refusedTrue).toMatch(/has done\s+NOTHING|no commits of its own/i);
+    // …and must NOT hand over the argument that closes the goal through a human.
+    expect(refusedTrue).not.toMatch(/merge-base --is-ancestor/);
+    expect(refusedTrue).toMatch(/Do NOT take the ancestry result to the concierge/i);
+    // The gate itself is untouched: provenance changes what is SAID, never what may close.
+    expect(canSelfMarkMet({ kind: "landed" }, { landed: false, landedSource: "git-probe-unproven" })).toBe(
+      false,
+    );
+  });
+
   it("attributes the negative to GIT only when git actually answered — the PAIR (sparkle-2668a7)", () => {
     // THE BUG THIS PINS, and it is a PAIR on purpose. Asserting only that the new sentence appears
     // would be vacuous: before this change BOTH inputs below returned the "git says" string, so a
@@ -473,6 +546,19 @@ describe("the DOCS that quote these refusals — pinned to the strings actually 
       fragment: "it is holding no unlanded commits either",
       evidence: { landed: false, unlandedWork: false },
     },
+    {
+      // THE SQUASH/REBASE ARM — a real git negative on a branch holding nothing back. Its remedy is
+      // deliberately a CONTENT check, not an ancestry one: ancestry is the check that just answered
+      // (roborev 72328).
+      fragment: "settle it by content instead",
+      evidence: { landed: false, unlandedWork: false, landedSource: "git-probe" },
+    },
+    {
+      // THE REFUSED-`true` ARM — git said ancestor, the no-op guard declined it, and the copy must
+      // admit git spoke while withholding the ancestry argument (roborev 72328).
+      fragment: "do not take the ancestry result to the concierge",
+      evidence: { landed: false, landedSource: "git-probe-unproven" },
+    },
     { fragment: "your branch's git state has not been read yet", evidence: {} },
   ];
 
@@ -494,6 +580,14 @@ describe("the DOCS that quote these refusals — pinned to the strings actually 
     // and the coverage check below would report one arm short.
     { landed: false, unlandedWork: true, landedSource: "git-probe" },
     { landed: false, unlandedWork: true, landedSource: "window-local" },
+    // THE SQUASH/REBASE SHAPE — a real git negative on a branch holding nothing back. It is the
+    // only shape that reaches the content-check arm, and it is reachable in production the moment
+    // the probe is allowed to run on a `false` reading (roborev 72103).
+    { landed: false, unlandedWork: false, landedSource: "git-probe" },
+    // THE REFUSED-`true` SHAPE — git answered ANCESTOR and the no-op guard declined it. The third
+    // provenance is not a shade of the other two: it is the only shape whose honest copy must both
+    // admit git spoke and withhold the ancestry argument (roborev 72328).
+    { landed: false, landedSource: "git-probe-unproven" },
     { landed: undefined, unlandedWork: false },
     // `landed: true` never reaches a refusal arm in production (the goal simply closes), but it is
     // the OTHER SIDE of a field the arms branch on, and the varies-each-field check below counts

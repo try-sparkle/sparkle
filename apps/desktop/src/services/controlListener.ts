@@ -141,6 +141,7 @@ import { livenessOf } from "./agentLiveness";
 import {
   goalReading,
   awaitingCloseEvidenceFor,
+  authoredWorkSeen,
   landedEvidenceFor,
   probeLandedFromGit,
   shippedAfterGoalSet,
@@ -2286,9 +2287,34 @@ async function handleSetGoalMet(req: ControlRequest): Promise<Record<string, unk
     // answers `undefined`, and clobbering a window-local `false` with it would downgrade a real
     // (if weak) negative into "nobody looked" — a different refusal, sending the agent to wait for
     // a poll instead of to check ancestry.
-    if (probed !== undefined) {
-      landedReading = probed;
+    // ⚠️ A PROBE `true` NEEDS A NO-OP GUARD; A PROBE `false` DOES NOT (roborev 72103).
+    // The probe answers pure ancestry on the worktree's CURRENT HEAD, and a branch cut from
+    // origin/main that has committed NOTHING satisfies that trivially — its HEAD *is* the
+    // ancestor. So an unguarded `true` closes a `landed` goal for an agent that authored nothing,
+    // which is the false "done" this gate exists to prevent; `landedEvidenceFor` gates its own
+    // positive behind `committedWorkSeen` for precisely this reason, and widening the escalation
+    // to `!== true` handed that guarded `false` to an UNGUARDED `true`. The asymmetry is the
+    // point: a `false` can only ever refuse, so it needs no proof that work exists, and gating it
+    // would re-open the watermark-miss lie this whole change removes.
+    if (probed === false) {
+      landedReading = false;
       landedSource = "git-probe";
+      // …and the guard applies ONLY where the regression is: OVERTURNING a window-local `false`.
+      // A BLANK reading (`undefined`) is the pre-existing path — nothing has polled this pane, so
+      // there is no `committedWorkSeen` input to consult and no window verdict being overruled;
+      // requiring authored work there would refuse the very agent the probe exists to serve, and
+      // its own test ("MARKS MET when git says the worktree's HEAD is an ancestor") pins that.
+    } else if (probed === true && (landedReading === undefined || authoredWorkSeen(targetId))) {
+      landedReading = true;
+      landedSource = "git-probe";
+    } else if (probed === true) {
+      // GIT ANSWERED, AND WE REFUSED ITS ANSWER — RECORD THAT, do not drop it (roborev 72328).
+      // Leaving `landedSource` at "window-local" here made the refusal deny git had spoken while
+      // git had, and then send the agent to run the ancestry check that WILL say ancestor and take
+      // it to the concierge — who is exempt from this gate. The blocked self-latch became a
+      // human-mediated false close plus a false escalation. The READING stays `false`, so the gate
+      // is untouched; only the provenance changes, which is what lets the copy tell the truth.
+      landedSource = "git-probe-unproven";
     }
   }
   // `stated` always rides along: `selfMarkRefusal` uses it to decide WHAT TO TELL the agent (whether

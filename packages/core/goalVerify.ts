@@ -424,7 +424,13 @@ export interface GoalVerifyEvidence {
    * {@link selfMarkRefusal}, never by {@link canSelfMarkMet} — this changes the MESSAGE, not the
    * decision, and a caller that supplies it can never make a goal closable that was not already.
    */
-  landedSource?: "git-probe" | "window-local" | undefined;
+  /** WHERE the `landed` reading came from — `selfMarkRefusal` may quote git only for a verdict git
+   *  actually produced. `"git-probe-unproven"` is the third state and not a shade of the other two:
+   *  git ran and answered ANCESTOR, and that answer was REFUSED because no authored work is
+   *  provable on this branch. Dropping it back to `"window-local"` would make the copy deny git had
+   *  spoken while git had, and would then hand the agent an ancestry argument to take to the
+   *  concierge — converting a blocked self-latch into a human-mediated false close (roborev 72328). */
+  landedSource?: "git-probe" | "window-local" | "git-probe-unproven" | undefined;
   /**
    * Did a caller EVER choose this check — for this goal or an earlier one it was carried from?
    *
@@ -537,7 +543,20 @@ export function selfMarkRefusal(verify: GoalVerify, evidence?: GoalVerifyEvidenc
       //
       // `=== "git-probe"` and nothing looser. `undefined` is "nobody recorded where this came from",
       // which is not evidence that git was asked, so it falls through to the honest copy below.
-      if (evidence?.landed === false && evidence?.landedSource === "git-probe") {
+      //
+      // ⚠️ `unlandedWork !== false` IS PART OF THE CONDITION, not decoration (roborev 72103). This
+      // arm tells the agent to open a PR, and that is right only for a branch actually HOLDING
+      // work. `{ landed: false, unlandedWork: false }` is the SQUASH/REBASE-MERGE shape — the work
+      // is in main, the tip is not an ancestor of it — and it is reachable from a real git verdict
+      // now that the probe runs on a `false` reading. Without this clause the git-probe arm shadows
+      // the carefully hedged arm below and hands "open a PR and merge it" to a branch whose work has
+      // ALREADY merged: the duplicate PR `scripts/pr-for-branch.sh` exists to prevent, reached by
+      // obeying the refusal.
+      if (
+        evidence?.landed === false &&
+        evidence?.landedSource === "git-probe" &&
+        evidence?.unlandedWork !== false
+      ) {
         return (
           "This goal is verified by the work being on origin/main, and git says it is not on " +
           "origin/main yet — so there is nothing to mark met. Land it (open a PR and merge it), and " +
@@ -563,12 +582,68 @@ export function selfMarkRefusal(verify: GoalVerify, evidence?: GoalVerifyEvidenc
       // failure (an agent left escalating because the copy named no door it could open itself). `=== false` on both bits, never truthiness:
       // `unlandedWork: undefined` means nobody looked, and must keep the original copy rather than
       // manufacture advice out of a missing reading.
+      //
+      // IT IS PROVENANCE-AWARE (roborev 72103). Both populations reach here now that a real git
+      // verdict can accompany `unlandedWork: false`, and they need different OPENINGS: quoting git
+      // for a reading git never produced is the lie this whole change removes, and denying git said
+      // anything when it did is that same lie mirrored. What must NOT differ is the ADVICE — in both
+      // the tip is not an ancestor and nothing is outstanding, so opening a second PR is the wrong
+      // move until the agent has checked whether the work is already in main by content.
+      // ⚠️ GIT SAID ANCESTOR AND WE REFUSED IT — SAY SO, AND DO NOT HAND OVER THE ARGUMENT
+      // (roborev 72328). This is the branch whose HEAD *is* reachable from origin/main purely
+      // because it has committed nothing. Dropping that verdict back to "window-local" made the
+      // copy deny git had spoken, then send the agent to run the very ancestry check that WILL say
+      // ancestor, then invite it to take that to the concierge — who is exempt from this gate. A
+      // blocked self-latch became a human-mediated false close plus a false escalation. So this
+      // arm states git's actual finding, explains why ancestry is not evidence here, and asks for
+      // the one thing that would be: authored commits.
+      if (evidence?.landed === false && evidence?.landedSource === "git-probe-unproven") {
+        return (
+          "This goal is verified by the work being on origin/main. A git ancestry check DOES say " +
+          "this worktree's HEAD is reachable from origin/main — but that is not evidence of a " +
+          "landing, because the branch that satisfies ancestry most easily is one that has done " +
+          "NOTHING: cut from origin/main with no commits of its own, its HEAD simply IS the " +
+          "ancestor. Nothing here can see any commits you authored on this branch, so this goal " +
+          "cannot close on that `true`. Do NOT take the ancestry result to the concierge as proof " +
+          "— it would close this goal over work that may not exist. If you HAVE landed work, show " +
+          "what it was: `gh pr list --state merged --head <this branch>`, or the shas you " +
+          "authored. If you have not, the work still has to be committed and landed."
+        );
+      }
+      // ⚠️ THE SQUASH POPULATION GETS ITS OWN REMEDY, BECAUSE ANCESTRY CANNOT SETTLE IT
+      // (roborev 72328). A remedy is an instruction the agent will follow, so it must be able to
+      // SUCCEED under the conditions that produced the refusal. Here the probe has just run
+      // `merge-base --is-ancestor` against a fresh fetch and answered NOT an ancestor — and for a
+      // squash or rebase landing NO commit of the agent's will ever be an ancestor, so telling it
+      // to re-run that check offers a test whose answer is already known and whose "if it IS an
+      // ancestor" branch is unreachable. That left "commit it and land it" as the only live
+      // instruction, which opens the duplicate PR this arm exists to prevent. Lineage cannot
+      // answer a squash; CONTENT can.
+      if (
+        evidence?.landed === false &&
+        evidence?.unlandedWork === false &&
+        evidence?.landedSource === "git-probe"
+      ) {
+        return (
+          "This goal is verified by the work being on origin/main. A git ancestry check says this " +
+          "branch's tip is NOT reachable from origin/main — but the branch is holding no unlanded " +
+          "commits either, and a SQUASH or REBASE merge produces exactly that pair: the work is in " +
+          "main, the tip is not an ancestor of it. Do NOT re-run the ancestry check; it is the " +
+          "check that just answered, and under a squash landing no commit of yours can ever be an " +
+          "ancestor. Settle it by CONTENT instead: `gh pr list --state merged --head <this " +
+          "branch>` for a merged PR, or `git diff origin/main -- <the files you changed>` for an " +
+          "empty diff. If either shows your work is already on origin/main, say so and ask the " +
+          "concierge to close this goal — never open a second PR for work already merged. If " +
+          "neither does, then nothing on this branch has landed and there is nothing to mark met."
+        );
+      }
       if (evidence?.landed === false && evidence?.unlandedWork === false) {
         return (
           "This goal is verified by the work being on origin/main. Nothing has been observed " +
           "reaching origin/main for this branch, and it is holding no unlanded commits either — so " +
           "this is NOT git saying your work is unlanded, and which of the two it is depends on facts " +
-          "only you can check. If you have not committed the work yet, commit it and land it, then " +
+          "only you can check. " +
+          "If you have not committed the work yet, commit it and land it, then " +
           "mark this met again; no human is needed once the branch is reachable from origin/main. " +
           "If you believe it is ALREADY on origin/main — it merged and this worktree was then " +
           "parked or moved onto another branch, which reads exactly like this — run `git merge-base " +
