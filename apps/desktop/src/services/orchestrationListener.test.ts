@@ -986,6 +986,54 @@ describe("orchestrationListener", () => {
     }
   });
 
+  it("NAMES the ceiling in the timeout diagnostic — machine-wide used/limit and basis (bead sparkle-7v492u)", async () => {
+    // The bead: a fleet fired a batch and got back N identical multi-minute "stayed at its
+    // concurrency cap" errors it could not tell from a WEDGED bridge, nor from "the box is full of
+    // OTHER orchestrators' workers" — silent starvation. The fix makes the expiry reply carry the
+    // numbers the gate actually reasoned about, so the reader learns it was capacity, how full, and
+    // why. Asserting the diagnostic CONTENT (used/limit + basis), not merely that a reply was sent —
+    // a test that only matched "timed out" would stay green if the enrichment were reverted, which
+    // is exactly the vacuity this pins.
+    let clock = 5_000_000;
+    __setReaperNow(() => clock);
+    try {
+      // A distinctive basis string so the assertion cannot pass on incidental text, and a cap of 1
+      // so one live worker fills the machine-wide count.
+      useSettingsStore.setState({
+        maxConcurrentWorkers: 1,
+        effectiveMaxConcurrentWorkers: 1,
+        concurrencyBasis: "CPU-bound: 12 cores × 2 agents per core",
+      });
+      fire({ reqId: "c1", op: "spawn_worker", buildAgentId: buildId, projectId, payload: { task: "holds the slot" } });
+      await flush();
+      expect(spawnWorkerMock).toHaveBeenCalledTimes(1);
+
+      // Over the cap → queued, no reply.
+      invokeMock.mockClear();
+      fire({ reqId: "c2", op: "spawn_worker", buildAgentId: buildId, projectId, payload: { task: "abandoned" } });
+      await flush();
+      expect(spawnWorkerMock).toHaveBeenCalledTimes(1);
+
+      // Its caller gives up; the reap sweep expires it.
+      clock += SPAWN_QUEUE_MAX_WAIT_MS + 1;
+      await reapOrphanedWorkers();
+
+      const c2 = invokeMock.mock.calls.find(([, a]) => (a as { reqId: string }).reqId === "c2");
+      const err = (c2![1] as { result: { error?: string } }).result.error ?? "";
+      // The machine-wide occupancy and the ceiling the gate compared it against: 1 worker live, cap 1.
+      expect(err).toMatch(/1 of 1 machine-wide worker slots in use/);
+      // ...and WHY that ceiling — carried verbatim from the settings basis so a reverted enrichment
+      // (bare "stayed at its concurrency cap.") fails this line.
+      expect(err).toContain("CPU-bound: 12 cores × 2 agents per core");
+      // The distinguishing lead-in and the "not started" advice both survive the enrichment.
+      expect(err).toMatch(/stayed at its concurrency cap/);
+      expect(err).toMatch(/NOT started/);
+    } finally {
+      __setReaperNow();
+      useSettingsStore.setState({ concurrencyBasis: "" });
+    }
+  });
+
   it("expires on the REAP TICK too, so a quiet store cannot miss the deadline (roborev 56200)", async () => {
     // The expiry originally ran ONLY at the top of drainQueue, which is driven by projectStore
     // changes / runSpawn's finally / handleSpawn. The 60s reap tick did not call it, and a reap pass

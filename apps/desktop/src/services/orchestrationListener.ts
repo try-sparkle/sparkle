@@ -21,7 +21,7 @@ import { parseWorkerResult } from "./buildAgent";
 import { useProjectStore, isLocallyRemoved } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import type { AgentTabStatus } from "../types";
-import { useSettingsStore, enforcedWorkerCap } from "../stores/settingsStore";
+import { useSettingsStore, enforcedWorkerCap, concurrencyBasis } from "../stores/settingsStore";
 import { currentMemoryAdmission } from "./memoryAdmission";
 import { workersNeedingOpen, isNotYetLiveWorker } from "../engine/workerAttention";
 
@@ -1069,9 +1069,20 @@ function expireStaleQueuedSpawns(): void {
     // without this the key leaks and a legitimate retry of that bead is refused as "already being
     // spawned" with nothing in flight (roborev 41945).
     releaseBeadClaim(req);
+    // NAME THE CEILING, don't just assert it (bead sparkle-7v492u). "the machine stayed at its
+    // concurrency cap" alone is the silent-starvation error the bead is filed against: an
+    // orchestrator that fired a batch got back N identical multi-minute timeouts it could not tell
+    // from a WEDGED bridge ("frontend round-trip timeout"), and could not tell "the box is full of
+    // OTHER orchestrators' workers" from "my spawn is merely slow". So carry the numbers the gate
+    // actually reasoned about — `globalUsedSlots()` is MACHINE-WIDE (every project's workers, which
+    // is why a peer orchestrator can starve this one) and `enforcedWorkerCap` is the ceiling it was
+    // compared against — plus the human-readable basis (`concurrencyBasis`), so the reader learns it
+    // was capacity, how full, and why, and can spin one down or back off instead of re-firing blind.
+    const st = useSettingsStore.getState();
     void respond(req.reqId, {
       error:
-        "spawn timed out waiting for a free slot — the machine stayed at its concurrency cap. " +
+        "spawn timed out waiting for a free slot — the machine stayed at its concurrency cap " +
+        `(${globalUsedSlots()} of ${Math.max(1, enforcedWorkerCap(st))} machine-wide worker slots in use; ${concurrencyBasis(st)}). ` +
         "This unit was NOT started; retry it once a worker has been spun down.",
     });
   }
