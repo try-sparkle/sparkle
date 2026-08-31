@@ -2252,8 +2252,8 @@ async function handleSetGoalMet(req: ControlRequest): Promise<Record<string, unk
   //
   // GATED ON EVERY CONDITION THAT MAKES IT MATTER. `met` false is a reopen (never refused); the
   // concierge is exempt above; a non-`landed` kind ignores this evidence entirely; and a reader that
-  // already answered `true`/`false` needs no second opinion. Any of those and the probe never runs,
-  // so no ordinary call pays for a subprocess.
+  // already answered `true` needs no second opinion, because that answer CLOSES the goal. Any of
+  // those and the probe never runs, so no ordinary call pays for a subprocess.
   //
   // ITS FAILURES ARE `undefined`, NEVER `false` — see `probeLandedFromGit`. A `false` here would emit
   // "git says it is not on origin/main yet", which is the exact sentence the beads above report as a
@@ -2264,9 +2264,32 @@ async function handleSetGoalMet(req: ControlRequest): Promise<Record<string, unk
   // a new cycle of work. The probe has no watermark: it answers "is this worktree's CURRENT HEAD
   // reachable from origin/<default>", and if it is, there are by definition ZERO commits on this
   // branch that origin/<default> lacks — the first new commit flips it to `false` by itself.
+  //
+  // ⚠️ THE GATE IS `!== true`, NOT `=== undefined` (sparkle-2668a7). It used to escalate ONLY a
+  // blank reading, which left the window-local `false` — the reading `landedEvidenceFor` manufactures
+  // when its POSITIVE test fails (no `workflowShipped` watermark AND no live origin reading) —
+  // permanently uncorrected by git. That `false` is byte-identical for a branch that has landed
+  // nothing and for one whose PR merged before this window latched anything, so the agent it
+  // refuses is exactly the one git could have cleared. Measured live: a branch whose HEAD WAS an
+  // ancestor of origin/main, with a MERGED PR, could not self-mark and was told to open another.
+  // A `true` still short-circuits — the goal simply closes, and the roster hot path is untouched
+  // either way because this seam is one agent, once, on a call it makes when it believes it is done.
   let landedReading = goal.verify?.kind === "landed" ? landedEvidenceFor(targetId) : undefined;
-  if (goal.verify?.kind === "landed" && landedReading === undefined && met && !isConcierge) {
-    landedReading = await probeLandedFromGit(targetId);
+  // WHERE THE ANSWER CAME FROM, carried alongside it: `selfMarkRefusal` may quote git only for a
+  // reading git actually produced. A window-local reading that the probe then declined to overturn
+  // stays `"window-local"` — "the probe could not tell" is not "git said no".
+  let landedSource: GoalVerifyEvidence["landedSource"] =
+    landedReading === undefined ? undefined : "window-local";
+  if (goal.verify?.kind === "landed" && landedReading !== true && met && !isConcierge) {
+    const probed = await probeLandedFromGit(targetId);
+    // `undefined` MUST NOT OVERWRITE a reading we already have. The probe's every failure path
+    // answers `undefined`, and clobbering a window-local `false` with it would downgrade a real
+    // (if weak) negative into "nobody looked" — a different refusal, sending the agent to wait for
+    // a poll instead of to check ancestry.
+    if (probed !== undefined) {
+      landedReading = probed;
+      landedSource = "git-probe";
+    }
   }
   // `stated` always rides along: `selfMarkRefusal` uses it to decide WHAT TO TELL the agent (whether
   // to mention the concierge take-back), never whether the goal may close — `canSelfMarkMet` reads
@@ -2285,6 +2308,10 @@ async function handleSetGoalMet(req: ControlRequest): Promise<Record<string, unk
           // value `undefined` reads as a supplied answer, and here that would be a claim the branch
           // holds nothing back when nobody looked.
           ...(unlandedWork === undefined ? {} : { unlandedWork }),
+          // Same discipline for provenance: omitted when there is no reading to have a source.
+          // `selfMarkRefusal` treats an absent source exactly like `"window-local"` — an unrecorded
+          // origin cannot license a sentence that speaks for git.
+          ...(landedSource === undefined ? {} : { landedSource }),
         }
       : {}),
     // TWO BITS, because there are three populations and the refusal says something different to

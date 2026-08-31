@@ -153,7 +153,12 @@ describe("canSelfMarkMet — the self-report gate", () => {
     // "your work is not on main yet" (go land it) and "nothing has read your branch" (wait for a
     // poll) are different instructions. Collapsing them into one sentence sends half the agents that
     // read it to do the wrong thing.
-    const notLanded = selfMarkRefusal({ kind: "landed" }, { landed: false });
+    // `landedSource: "git-probe"` is what makes this the "git answered no" population rather than
+    // the watermark-miss one below — a `landed: false` alone no longer speaks for git.
+    const notLanded = selfMarkRefusal(
+      { kind: "landed" },
+      { landed: false, landedSource: "git-probe" },
+    );
     const unread = selfMarkRefusal({ kind: "landed" }, {});
     expect(notLanded).toMatch(/not (yet )?on origin\/main|is not on origin\/main/i);
     expect(unread).toMatch(/has not been read|not been polled|no reading/i);
@@ -182,6 +187,74 @@ describe("canSelfMarkMet — the self-report gate", () => {
     expect(nothingHeld).toMatch(/merge-base --is-ancestor/);
     expect(nothingHeld).toMatch(/concierge/i);
     expect(nothingHeld).not.toEqual(holding);
+  });
+
+  it("attributes the negative to GIT only when git actually answered — the PAIR (sparkle-2668a7)", () => {
+    // THE BUG THIS PINS, and it is a PAIR on purpose. Asserting only that the new sentence appears
+    // would be vacuous: before this change BOTH inputs below returned the "git says" string, so a
+    // one-sided assertion is satisfied by code that simply deleted the true message along with the
+    // false one. The property is that the two DIVERGE, and that each says the honest thing about
+    // its own provenance.
+    //
+    // Identical in every other respect — a branch holding commits, `landed: false` — so the ONLY
+    // difference between these two calls is WHERE the `false` came from.
+    const fromGit = selfMarkRefusal(
+      { kind: "landed" },
+      { landed: false, unlandedWork: true, landedSource: "git-probe" },
+    );
+    const fromWatermark = selfMarkRefusal(
+      { kind: "landed" },
+      { landed: false, unlandedWork: true, landedSource: "window-local" },
+    );
+    expect(fromGit).not.toEqual(fromWatermark);
+
+    // HALF ONE: a real ancestry verdict may STILL be quoted as one. This is the half a naive fix
+    // breaks — strip "git says" everywhere and every assertion about the new copy still passes
+    // while the one message that was true is gone.
+    expect(fromGit).toMatch(/git says it is not on origin\/main yet/i);
+
+    // HALF TWO: a watermark miss may not borrow git's authority. `landed: false` on that path is a
+    // POSITIVE TEST FAILING — no merge watermark this window latched — and no ancestry question was
+    // asked at all, which is why a provably-merged branch read git's no and was sent to open a
+    // second PR.
+    expect(fromWatermark).not.toMatch(/git says/i);
+    expect(fromWatermark).toMatch(/merge watermark this window has not latched/i);
+    // It must name the mechanism AND hand over the command that settles it…
+    expect(fromWatermark).toMatch(/merge-base --is-ancestor/);
+    // …and answer the ancestor case, the branch whose absence produced the duplicate PR.
+    expect(fromWatermark).toMatch(/if it IS an ancestor/i);
+    expect(fromWatermark).toMatch(/concierge/i);
+    // …while still telling the genuinely-unlanded reader what to do, since this arm serves both.
+    expect(fromWatermark).toMatch(/open a PR and merge it/i);
+
+    // AN UNRECORDED SOURCE IS NOT A GIT SOURCE. A caller that never computed provenance gets the
+    // honest copy, not one that speaks for a check it never ran.
+    expect(selfMarkRefusal({ kind: "landed" }, { landed: false, unlandedWork: true })).toEqual(
+      fromWatermark,
+    );
+
+    // No claim that the work is on main may stand unconditionally here either — same single owner
+    // (`@sparkle/core/testing/landedClaim`) as the arm above, so the two cannot drift.
+    const audit = auditLandedClaims(fromWatermark);
+    expect(
+      audit.candidates.length,
+      `no landed-claim sentence found in: ${fromWatermark}`,
+    ).toBeGreaterThan(0);
+    expect(audit.violations, "an unconditional landed claim").toEqual([]);
+  });
+
+  it("PROVENANCE never unlocks the latch — it only picks the sentence", () => {
+    // The gate is the half that must not move. `canSelfMarkMet` must not read `landedSource` at
+    // all, asserted in BOTH directions: a `git-probe` stamp cannot add to a `false`, and a
+    // `window-local` stamp cannot subtract from a genuine ancestry YES.
+    expect(canSelfMarkMet({ kind: "landed" }, { landed: false, landedSource: "git-probe" })).toBe(
+      false,
+    );
+    expect(canSelfMarkMet({ kind: "landed" }, { landed: true, landedSource: "window-local" })).toBe(
+      true,
+    );
+    // …and a source with no reading behind it is still "nobody looked".
+    expect(canSelfMarkMet({ kind: "landed" }, { landedSource: "git-probe" })).toBe(false);
   });
 
   it("speaks CONDITIONALLY, because `unlandedWork: false` is three populations and only git separates them", () => {
@@ -383,7 +456,15 @@ describe("the DOCS that quote these refusals — pinned to the strings actually 
   // CHECKED against the code below: every distinct string the `landed` case can return must be
   // claimed by some fragment here, which reds the moment a fourth branch is added and left unlisted.
   const ARMS: Array<{ fragment: string; evidence: GoalVerifyEvidence }> = [
-    { fragment: "git says it is not on origin/main yet", evidence: { landed: false, unlandedWork: true } },
+    {
+      fragment: "git says it is not on origin/main yet",
+      // ONLY reachable with a real ancestry verdict behind it now (sparkle-2668a7).
+      evidence: { landed: false, unlandedWork: true, landedSource: "git-probe" },
+    },
+    {
+      fragment: "a merge watermark this window has not latched",
+      evidence: { landed: false, unlandedWork: true, landedSource: "window-local" },
+    },
     {
       fragment: "nothing has been observed reaching origin/main",
       evidence: { landed: false, unlandedWork: false },
@@ -408,6 +489,11 @@ describe("the DOCS that quote these refusals — pinned to the strings actually 
     { landed: false, unlandedWork: true },
     { landed: false, unlandedWork: false },
     { landed: false },
+    // BOTH SIDES OF `landedSource`, which is the field the newest arm keys on. The `git-probe` shape
+    // is the ONLY one that can reach the "git says" arm, so without it that string is unreachable
+    // and the coverage check below would report one arm short.
+    { landed: false, unlandedWork: true, landedSource: "git-probe" },
+    { landed: false, unlandedWork: true, landedSource: "window-local" },
     { landed: undefined, unlandedWork: false },
     // `landed: true` never reaches a refusal arm in production (the goal simply closes), but it is
     // the OTHER SIDE of a field the arms branch on, and the varies-each-field check below counts

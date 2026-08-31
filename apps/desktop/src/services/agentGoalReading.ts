@@ -361,9 +361,11 @@ const LANDED_PROBE_TIMEOUT_MS = 30_000;
  *
  * ── `undefined` IS THE ONLY FAILURE VALUE ────────────────────────────────────────────────────────
  * Every error path — no worktree recorded, no project row, a rejected invoke, a null `landed`, the
- * timeout above — answers `undefined`, never `false`. `false` makes `selfMarkRefusal` emit "git says
- * it is not on origin/main yet", which is exactly the sentence these beads report as a lie; only a
- * real git ancestry verdict may produce it.
+ * timeout above — answers `undefined`, never `false`. A `false` from HERE is the one reading the
+ * caller stamps `landedSource: "git-probe"`, which is the only provenance `selfMarkRefusal` accepts
+ * for "git says it is not on origin/main yet" — the sentence these beads report as a lie when it is
+ * said on behalf of a git that never ran (sparkle-2668a7). So an error path answering `false` would
+ * not merely be wrong, it would launder itself into git's verdict.
  */
 export async function probeLandedFromGit(agentId: string): Promise<boolean | undefined> {
   // Resolve BOTH halves from the roster row: the agent's own worktree (where HEAD is read) and the

@@ -274,7 +274,7 @@ import { noteThrashEvent, resetThrashTracking } from "../engine/agentThrash";
 // `MAX_CONCIERGE_REARMS` is the bound `set_agent_escalation` spends against — spelled as the
 // constant so a change to the allowance moves the test with it rather than leaving a stale `2`.
 import { MAX_CONCIERGE_REARMS, goalStateOf } from "../engine/agentGoal";
-import { awaitingCloseEvidenceFor } from "./agentGoalReading";
+import { awaitingCloseEvidenceFor, landedEvidenceFor } from "./agentGoalReading";
 // The thinking indicator's source of truth — asserted here because this file owns the one call site
 // that records it.
 import {
@@ -2273,6 +2273,103 @@ describe("controlListener", () => {
       });
     });
 
+    // ── sparkle-2668a7: A WINDOW-LOCAL `false` IS NOT GIT'S NO, AND WAS NEVER CORRECTED BY GIT ──
+    //
+    // The probe gate above used to read `landedReading === undefined` ONLY, so it escalated a BLANK
+    // reading and never a NEGATIVE one. But `landedEvidenceFor` manufactures `false` from a POSITIVE
+    // TEST FAILING — no `workflowShipped` watermark AND no live origin reading — having asked git
+    // nothing. That `false` is byte-identical for a branch holding unlanded commits and for one
+    // whose PR merged before this window latched anything, and it short-circuited the one reader
+    // that could tell them apart. Measured live: a branch whose HEAD WAS an ancestor of origin/main,
+    // with a MERGED PR, could not self-mark and was told git said its work was unlanded.
+    //
+    // EVERY CASE HERE SEEDS A branchStatus THAT YIELDS `false`. That is the population — a fixture
+    // with no branchStatus tests the blank-reading path that already worked.
+    describe("landed goal whose WINDOW-LOCAL reading is `false` — escalated to git", () => {
+      /** A branch two commits ahead, no merge watermark: `landedEvidenceFor` answers `false`. */
+      const seedWindowLocalFalse = () => {
+        useProjectStore
+          .getState()
+          .setAgentGoal(projectId, callerId, "the provenance fix is merged to origin/main", undefined, "agent", {
+            kind: "landed",
+          });
+        useRuntimeStore.getState().setBranchStatus(callerId, {
+          ahead: 2,
+          behind: 0,
+          dirty: false,
+          filesChanged: 1,
+          insertions: 5,
+          deletions: 0,
+          worktreeOnBranch: true,
+        });
+        // The precondition, asserted rather than assumed: a blank reading here would make every
+        // case below pass through the OLD gate and prove nothing about the widened one.
+        expect(landedEvidenceFor(callerId)).toBe(false);
+        // Without a worktree the probe declines before invoking, so the side effect under test
+        // could never be observed.
+        useProjectStore.setState({
+          projects: useProjectStore.getState().projects.map((p) =>
+            p.id === projectId
+              ? { ...p, agents: p.agents.map((a) => (a.id === callerId ? { ...a, worktreePath: "/wt/caller" } : a)) }
+              : p,
+          ),
+        } as never);
+      };
+
+      // ⚠️ THE SIDE EFFECT, AND THE BEHAVIOUR THAT DID NOT EXIST. Narrow the gate back to
+      // `=== undefined` and this goes red twice over: the probe is never called, and the agent whose
+      // work git can see on main is refused.
+      it("CALLS the git probe on a window-local `false`, and git's YES closes the goal", async () => {
+        seedWindowLocalFalse();
+        landedProbeReply = { landed: true, reason: "abc123 is an ancestor of refs/remotes/origin/main" };
+        fire({ reqId: "wl1", op: "set_agent_goal_met", callerAgentId: callerId, payload: { met: true } });
+        await flush();
+        // The call itself — asserted on the ARGUMENTS, so a probe pointed at some other tree cannot
+        // satisfy it.
+        expect(landedProbeCalls).toEqual([{ worktree: "/wt/caller", root: "/tmp/demo" }]);
+        // …and the outcome the bead reports as impossible today: a provably-merged branch self-marks.
+        expect(lastReply()).toMatchObject({ ok: true, met: true });
+        // THE STORE FACT, not the reply: `metAt` is what stops the auto-continue sweep.
+        expect(goalOf(callerId)!.metAt).toEqual(expect.any(Number));
+      });
+
+      // THE PAIRED NEGATIVE — git ran and said no. This arm KEEPS "git says", because here it is
+      // true; a fix that deleted the sentence outright would pass every assertion about the new copy
+      // while stripping the one accurate message.
+      it("keeps the 'git says' copy when the PROBE is what answered no", async () => {
+        seedWindowLocalFalse();
+        landedProbeReply = { landed: false, reason: "abc123 is not an ancestor of refs/remotes/origin/main" };
+        fire({ reqId: "wl2", op: "set_agent_goal_met", callerAgentId: callerId, payload: { met: true } });
+        await flush();
+        expect(landedProbeCalls).toHaveLength(1);
+        expect(lastReply()).toMatchObject({ ok: false, code: "goal_not_self_markable" });
+        const err = String((lastReply() as { error?: string }).error);
+        expect(err).toMatch(/git says it is not on origin\/main yet/i);
+        expect(goalOf(callerId)!.metAt).toBeUndefined();
+      });
+
+      // THE OTHER HALF OF THE PAIR, and the sentence the bead is actually about. The probe declined,
+      // so the ONLY reading left is the window-local one — and the refusal must not put that in
+      // git's mouth. It must also not collapse to "nobody looked": that copy says wait for a poll,
+      // which is the wrong instruction for a branch that may already be an ancestor.
+      it("says WATERMARK, not 'git says', when the probe could not tell", async () => {
+        seedWindowLocalFalse();
+        landedProbeError = "worktree is gone";
+        fire({ reqId: "wl3", op: "set_agent_goal_met", callerAgentId: callerId, payload: { met: true } });
+        await flush();
+        expect(landedProbeCalls).toHaveLength(1);
+        const err = String((lastReply() as { error?: string }).error);
+        expect(err).toMatch(/merge watermark this window has not latched/i);
+        expect(err).not.toMatch(/git says/i);
+        // The window-local `false` SURVIVES an undecided probe — it is not downgraded to blank.
+        expect(err).not.toMatch(/has not been read/i);
+        // Both exits still named: the check that settles it, and what to do if it IS an ancestor.
+        expect(err).toMatch(/merge-base --is-ancestor/);
+        expect(err).toMatch(/concierge/i);
+        expect(goalOf(callerId)!.metAt).toBeUndefined();
+      });
+    });
+
     // ── sparkle-vfkqz: THE GATE MUST NOT FIRE ON WORK GIT SAYS IS LANDED ─────────────────────────
     // Twice on 2026-08-04 a FINISHED agent burned three auto-continues and escalated to the founder
     // over a merged PR, because `landed` was refused unconditionally while the app already knew the
@@ -2328,7 +2425,13 @@ describe("controlListener", () => {
       fire({ reqId: "sgV4", op: "set_agent_goal_met", callerAgentId: callerId, payload: { met: true } });
       await flush();
       expect(lastReply()).toMatchObject({ ok: false, code: "goal_not_self_markable" });
-      expect(String((lastReply() as { error?: string }).error)).toMatch(/not on origin\/main/i);
+      const err = String((lastReply() as { error?: string }).error);
+      // It must send this agent to LAND the commits it is holding…
+      expect(err).toMatch(/open a PR and merge it/i);
+      // …without putting the refusal in git's mouth (sparkle-2668a7). No worktree is recorded here,
+      // so the probe declines and the ONLY reading is the window-local one — a positive test
+      // failing, not an ancestry verdict.
+      expect(err).not.toMatch(/git says/i);
       expect(goalOf(callerId)!.metAt).toBeUndefined();
     });
 

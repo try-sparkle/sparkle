@@ -284,7 +284,14 @@ function sampleOfKind(kind: GoalVerifyKind): GoalVerify {
 // `unlandedWork: false` is this bit's most-favourable value, not a typo: the question it answers is
 // "is the branch holding work back", so NO is the reading that could never stand in the way of a
 // close. Answering it keeps the counterfactual honest even though `canSelfMarkMet` ignores it.
-const OMNISCIENT_EVIDENCE: GoalVerifyEvidence = { landed: true, unlandedWork: false };
+// `landedSource: "git-probe"` is likewise the most-authoritative provenance a caller could hold —
+// git itself, asked live. It changes nothing here (`canSelfMarkMet` never reads it), and is answered
+// only to keep this constant's own contract: every question a caller could answer, answered.
+const OMNISCIENT_EVIDENCE: GoalVerifyEvidence = {
+  landed: true,
+  unlandedWork: false,
+  landedSource: "git-probe",
+};
 
 /**
  * Could the AGENT ITSELF ever close a goal carrying this kind of check, given the best evidence?
@@ -400,6 +407,25 @@ export interface GoalVerifyEvidence {
    */
   unlandedWork?: boolean | undefined;
   /**
+   * WHERE `landed` CAME FROM — the provenance that decides whether the copy may say "git says".
+   *
+   * ── WHY A `false` IS NOT AUTOMATICALLY GIT'S NO (sparkle-2668a7) ─────────────────────────────
+   * Two completely different computations both hand this field `false`:
+   *   • `"git-probe"` — a live ancestry check RAN and answered no (`agent_landed_probe` →
+   *     `git merge-base --is-ancestor`). That is git's verdict, and the copy may quote it.
+   *   • `"window-local"` — `landedEvidenceFor` read already-polled store state and its POSITIVE
+   *     TEST FAILED: no merge watermark this window latched, and no live origin reading. It asked
+   *     git NOTHING. Saying "git says it is not on origin/main yet" here is a statement of fact
+   *     about a check that never ran, and it was measured live: a branch whose HEAD WAS an
+   *     ancestor of origin/main, with a MERGED PR, was told git said otherwise and instructed to
+   *     open a second PR for work already merged.
+   * `undefined` means the caller did not record provenance, which is treated exactly like
+   * `"window-local"`: an unrecorded source cannot license a claim about git. Read ONLY by
+   * {@link selfMarkRefusal}, never by {@link canSelfMarkMet} — this changes the MESSAGE, not the
+   * decision, and a caller that supplies it can never make a goal closable that was not already.
+   */
+  landedSource?: "git-probe" | "window-local" | undefined;
+  /**
    * Did a caller EVER choose this check — for this goal or an earlier one it was carried from?
    *
    * `false`/`undefined` mean the app manufactured it, or nobody recorded (a check persisted before
@@ -500,6 +526,24 @@ export function selfMarkRefusal(verify: GoalVerify, evidence?: GoalVerifyEvidenc
     // worse than no refusal: the agent stops looking for the door that exists. So each arm below
     // names the ACTION that will close the goal by itself.
     case "landed":
+      // ── ONLY A REAL ANCESTRY CHECK MAY BE QUOTED AS ONE (sparkle-2668a7) ───────────────────────
+      // This arm is FIRST because it is the only one entitled to speak for git. `landed: false` is
+      // handed to this function by two unrelated computations — a live `git merge-base
+      // --is-ancestor` verdict, and a window-local positive test that failed having asked git
+      // nothing — and until `landedSource` existed the copy could not tell them apart, so every
+      // watermark miss was reported as git's no. Measured live: a branch whose HEAD WAS an ancestor
+      // of origin/main, carrying a MERGED PR, read "git says it is not on origin/main yet" and was
+      // told to open a PR for work already on main.
+      //
+      // `=== "git-probe"` and nothing looser. `undefined` is "nobody recorded where this came from",
+      // which is not evidence that git was asked, so it falls through to the honest copy below.
+      if (evidence?.landed === false && evidence?.landedSource === "git-probe") {
+        return (
+          "This goal is verified by the work being on origin/main, and git says it is not on " +
+          "origin/main yet — so there is nothing to mark met. Land it (open a PR and merge it), and " +
+          "you can mark this goal met yourself once the branch is reachable from origin/main."
+        );
+      }
       // ── A BRANCH HOLDING NOTHING BACK MUST NOT BE TOLD WHAT GIT SAID ───────────────────────────
       // `landed: false` is a POSITIVE test failing, not git's no. With `unlandedWork: false` the
       // honest reading is "nothing has been observed reaching origin/main, and nothing is
@@ -532,11 +576,25 @@ export function selfMarkRefusal(verify: GoalVerify, evidence?: GoalVerifyEvidenc
           "close this goal rather than opening a second PR for work already merged."
         );
       }
+      // ── THE SAME LIE, ONE POPULATION OVER: A WATERMARK MISS IS NOT GIT'S NO (sparkle-2668a7) ───
+      // Reached when the reading is `false` and NOTHING asked git — either the caller recorded
+      // `"window-local"`, or it recorded no provenance at all. The branch may well be holding
+      // commits (`unlandedWork: true`), and "land it" is then the right action; what this copy may
+      // NOT do is attribute the negative to git, because the identical `false` is what a
+      // landed-then-parked worktree reads. So it names the mechanism that actually produced the
+      // refusal, hands over the one command that settles it, and — crucially — says what to do when
+      // that command says ANCESTOR, which is the branch the old sentence had no room for and which
+      // ends in a duplicate PR for merged work.
       if (evidence?.landed === false) {
         return (
-          "This goal is verified by the work being on origin/main, and git says it is not on " +
-          "origin/main yet — so there is nothing to mark met. Land it (open a PR and merge it), and " +
-          "you can mark this goal met yourself once the branch is reachable from origin/main."
+          "This goal is verified by the work being on origin/main. Nothing has been observed " +
+          "reaching origin/main for this branch, and no git ancestry check was run — that is a " +
+          "merge watermark this window has not latched, NOT git saying your work is unlanded. " +
+          "Settle it yourself with `git merge-base --is-ancestor <sha> origin/main`. If it is not " +
+          "an ancestor, land it (open a PR and merge it) and mark this goal met again — no human is " +
+          "needed once the branch is reachable from origin/main. If it IS an ancestor, say so and " +
+          "ask the concierge to close this goal rather than opening a second PR for work that has " +
+          "already merged."
         );
       }
       return (
