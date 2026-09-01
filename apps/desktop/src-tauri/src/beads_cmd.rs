@@ -2938,38 +2938,174 @@ pub(crate) mod tests {
     pub(crate) const TEST_GIT_ENV: ChildEnv<'static> =
         &[("GIT_CONFIG_GLOBAL", "/dev/null"), ("GIT_CONFIG_NOSYSTEM", "1"), ("BEADS_ACTOR", "sparkle-test")];
 
+    /// How many real-bd integration tests may hold a workspace AT ONCE, across this whole test
+    /// binary.
+    ///
+    /// THE FLAKE THIS BOUNDS. Eleven tests in this crate stand up a real bd workspace, and libtest
+    /// runs them in PARALLEL — so all eleven used to be spawning bd children into the same 18 cores
+    /// at the same moment, on a machine that is also running the app, other agents' worktrees and
+    /// their builds. Every bd call in the bodies under test is bounded by `BD_TIMEOUT` (30s), and a
+    /// call measured at ~1s on a quiet box is not 30x from the edge when eleven of its siblings are
+    /// competing for the same cores. That is exactly how it presented: six of these tests failing
+    /// together with `bd did not finish within 30s and was terminated`, on `origin/main`'s own
+    /// bytes, and passing on the re-run — a coin flip, not a defect in the code under test.
+    ///
+    /// The cap is small but not 1. These workspaces are ISOLATED FROM EACH OTHER (see
+    /// [`TempWorkspace`]) so there is no lock to serialize for; the only shared resource is the
+    /// machine, and running four at a time keeps the suite's own footprint modest without turning
+    /// eleven ~10s tests into a 110s serial tail.
+    const REAL_BD_TEST_CONCURRENCY: usize = 4;
+
+    /// The permits behind [`REAL_BD_TEST_CONCURRENCY`]. Deliberately the module's own
+    /// `BdConcurrencyLimiter` rather than a second implementation: it is already proven to
+    /// acquire/hold/release correctly under a bounded wait, and reusing it keeps one primitive.
+    static WORKSPACE_SLOTS: BdConcurrencyLimiter =
+        BdConcurrencyLimiter::new(REAL_BD_TEST_CONCURRENCY);
+
+    /// How long a test waits for a workspace slot before running anyway.
+    ///
+    /// FAIL OPEN, on purpose. This cap exists to keep the suite from stampeding itself; it is not a
+    /// correctness boundary, and a test that FAILED because a permit never came free would be a
+    /// worse outcome than the load it was avoiding. Long enough that the fallback is not reached in
+    /// practice (four slots x ~10s per workspace drains eleven tests in well under a minute).
+    const WORKSPACE_SLOT_WAIT: Duration = Duration::from_secs(300);
+
+    /// The ONE initialised workspace every test's store is cloned from.
+    ///
+    /// `bd init` is the expensive half — measured at ~10s on this machine against ~1s for an
+    /// ordinary `bd create` — because it stands up an embedded Dolt database, a git repo and a
+    /// commit. Paying it once per test binary instead of once per test removes ~110 CPU-seconds of
+    /// concurrent Dolt initialisation from the suite, which is the single largest contributor to
+    /// the contention above.
+    ///
+    /// `None` means bd is absent, or could not initialise a workspace here (sandbox, no git
+    /// identity, Dolt refusing). Every caller then SKIPS, exactly as before.
+    static TEMPLATE_WORKSPACE: std::sync::OnceLock<Option<std::path::PathBuf>> =
+        std::sync::OnceLock::new();
+
+    /// Run bd in `dir` with the module's test env. Shared by the template init and
+    /// [`TempWorkspace::bd`] so guard 2 (see [`TEST_GIT_ENV`]) cannot be applied to one and not the
+    /// other.
+    fn bd_in(bd: &str, dir: &std::path::Path, args: &[&str]) -> Option<std::process::Output> {
+        Command::new(bd)
+            .args(args)
+            .current_dir(dir)
+            .env("PATH", bd_exec_path())
+            // Guard 2 — see the TEST_GIT_ENV doc.
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("BEADS_ACTOR", "sparkle-test")
+            .output()
+            .ok()
+    }
+
+    /// Copy a directory tree. Small and explicit rather than shelling out to `cp -R`: one of the
+    /// tests that needs a workspace (`create_then_close_round_trips_against_a_real_bd_workspace`)
+    /// is NOT `cfg(unix)`, and `cp` is not a thing to rely on off it.
+    ///
+    /// Symlinks are not followed and not recreated — a freshly `bd init`ed workspace has none, and
+    /// silently materialising one would be a surprise rather than a copy.
+    fn copy_tree(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+        std::fs::create_dir_all(to)?;
+        for entry in std::fs::read_dir(from)? {
+            let entry = entry?;
+            let kind = entry.file_type()?;
+            let dst = to.join(entry.file_name());
+            if kind.is_dir() {
+                copy_tree(&entry.path(), &dst)?;
+            } else if kind.is_file() {
+                std::fs::copy(entry.path(), &dst)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Remove template directories left by test binaries that are no longer running.
+    ///
+    /// The template outlives every `TempWorkspace` by construction — it is reached through a
+    /// `static`, and statics are never dropped — so nothing can clean it up at exit. Age is the
+    /// discriminator that is safe against a CONCURRENT test binary (another worktree's suite may be
+    /// mid-run with a template minutes old); an hour is far longer than any run of this suite.
+    fn sweep_stale_templates() {
+        let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else { return };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if !name.starts_with("sparkle-test-beads-template-") {
+                continue;
+            }
+            let old = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| std::time::SystemTime::now().duration_since(t).ok())
+                .is_some_and(|age| age >= Duration::from_secs(60 * 60));
+            if old {
+                std::fs::remove_dir_all(entry.path()).ok();
+            }
+        }
+    }
+
+    /// The template workspace's path, initialising it on first use.
+    fn template_workspace() -> Option<&'static std::path::Path> {
+        TEMPLATE_WORKSPACE
+            .get_or_init(|| {
+                let bd = bd_for_integration()?;
+                sweep_stale_templates();
+                // `sparkle-test-` component: guard 1 — see the TEST_GIT_ENV doc. `bd init` makes a
+                // git commit, and this is the only place in the suite that still does.
+                let dir = std::env::temp_dir()
+                    .join(format!("sparkle-test-beads-template-{}", std::process::id()));
+                std::fs::remove_dir_all(&dir).ok();
+                std::fs::create_dir_all(&dir).ok()?;
+                match bd_in(&bd, &dir, &["init", "--non-interactive", "--quiet"]) {
+                    Some(o) if o.status.success() => Some(dir),
+                    _ => {
+                        std::fs::remove_dir_all(&dir).ok();
+                        None
+                    }
+                }
+            })
+            .as_deref()
+    }
+
+    /// A throwaway beads workspace, CLONED from [`template_workspace`].
+    ///
+    /// **IT IS ITS OWN STORE, AND THAT IS THE POINT.** The machine-wide work graph is one embedded
+    /// Dolt database, single-writer, shared by every worktree and polled by the app every 5s — a
+    /// test that drove it would race every other agent on the box for the one write lock, and would
+    /// also be writing real rows into the real backlog. Every test here gets its own copy of an
+    /// empty initialised workspace instead, so "no second bead was filed" is a statement about a
+    /// store nobody else can touch.
     pub(crate) struct TempWorkspace {
         pub(crate) dir: std::path::PathBuf,
+        /// Released on drop; see [`REAL_BD_TEST_CONCURRENCY`]. `Option` because the wait fails open.
+        _slot: Option<BdPermit<'static>>,
     }
 
     impl TempWorkspace {
         pub(crate) fn new(tag: &str) -> Option<Self> {
-            let bd = bd_for_integration()?;
+            let template = template_workspace()?;
+            // Taken BEFORE the clone and held for the whole test body, so the cap covers the bd
+            // calls the test makes, not merely the copy.
+            let slot = WORKSPACE_SLOTS.acquire_by(Instant::now() + WORKSPACE_SLOT_WAIT);
             let dir = std::env::temp_dir()
                 .join(format!("sparkle-test-beads-{tag}-{}", std::process::id()));
             std::fs::remove_dir_all(&dir).ok();
-            std::fs::create_dir_all(&dir).ok()?;
-            let ws = TempWorkspace { dir };
-            let out = ws.bd(&bd, &["init", "--non-interactive", "--quiet"]);
-            match out {
-                Some(o) if o.status.success() => Some(ws),
-                // bd is present but could not init here (sandbox, no git identity, Dolt refusing):
-                // skip rather than fail the suite for an environment problem.
-                _ => None,
+            match copy_tree(template, &dir) {
+                Ok(()) => Some(TempWorkspace { dir, _slot: slot }),
+                // The template is fine but this copy is not (no space, a permissions oddity): skip
+                // rather than fail the suite for an environment problem, exactly as the `bd init`
+                // this replaced did.
+                Err(_) => {
+                    std::fs::remove_dir_all(&dir).ok();
+                    None
+                }
             }
         }
 
         pub(crate) fn bd(&self, bd: &str, args: &[&str]) -> Option<std::process::Output> {
-            Command::new(bd)
-                .args(args)
-                .current_dir(&self.dir)
-                .env("PATH", bd_exec_path())
-                // Guard 2 — see the struct doc.
-                .env("GIT_CONFIG_GLOBAL", "/dev/null")
-                .env("GIT_CONFIG_NOSYSTEM", "1")
-                .env("BEADS_ACTOR", "sparkle-test")
-                .output()
-                .ok()
+            bd_in(bd, &self.dir, args)
         }
     }
 
@@ -2983,6 +3119,49 @@ pub(crate) mod tests {
             }
             std::fs::remove_dir_all(&self.dir).ok();
         }
+    }
+
+    /// TWO WORKSPACES ARE TWO STORES — the property every fold test's "no second bead was filed"
+    /// rests on, and the one the template CLONE had to preserve.
+    ///
+    /// Before the clone, each workspace was its own `bd init`; now they are copies of one
+    /// initialised template, which is exactly the change that could have quietly made them share a
+    /// store — and nothing else in the suite would have said so. A fold test would simply have
+    /// counted a sibling test's rows and failed somewhere far from the cause, intermittently,
+    /// depending on which tests happened to overlap.
+    ///
+    /// It asserts the SIDE EFFECT in both directions: what A wrote is IN A and NOT IN B. Asserting
+    /// only "B does not have it" would pass against a workspace that never received the write at
+    /// all.
+    #[test]
+    fn two_temp_workspaces_do_not_share_a_store() {
+        let (Some(a), Some(b)) = (TempWorkspace::new("iso-a"), TempWorkspace::new("iso-b")) else {
+            eprintln!("SKIP: bd not installed or could not init a workspace");
+            return;
+        };
+        let (pa, pb) = (a.dir.to_string_lossy().to_string(), b.dir.to_string_lossy().to_string());
+        let title = "A row that must exist in exactly one of two throwaway stores";
+
+        let made = create_bead(
+            &pa,
+            &NewBead { title: title.into(), ..Default::default() },
+            TEST_GIT_ENV,
+        )
+        .expect("create ran in A");
+
+        let in_a = query_beads(&pa, &BeadQuery::default(), TEST_GIT_ENV).expect("bd list ran in A");
+        assert!(
+            in_a.beads.iter().any(|r| r.id == made.id),
+            "the write did not land in its own store, so the other half proves nothing: {:?}",
+            in_a.beads
+        );
+
+        let in_b = query_beads(&pb, &BeadQuery::default(), TEST_GIT_ENV).expect("bd list ran in B");
+        assert!(
+            in_b.beads.is_empty(),
+            "a second workspace can see the first one's rows — the stores are shared: {:?}",
+            in_b.beads
+        );
     }
 
     #[test]

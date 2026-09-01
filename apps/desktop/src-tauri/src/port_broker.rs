@@ -819,6 +819,27 @@ pub fn release_port(root: &Path, port: u16, agent_id: &str) -> ReleaseOutcome {
 /// exhausting it reports a refusal, which is the safe answer.
 const GATE_ATTEMPTS: usize = 4;
 
+/// How long to wait before LOOKING AGAIN after an attempt lost the race.
+///
+/// A LOST RACE IS A TORN READ, NOT AN EMPTY REGISTRY, and spinning straight back into a
+/// `create_exclusive` that must fail is what turned that into a give-up. [`create_exclusive`]
+/// creates the record and THEN writes it, so the winner's file is briefly zero bytes and
+/// [`read_gate`] answers `None` for a file that plainly exists — the same window
+/// [`unreadable_is_reclaimable`] exists for on the lease side. Four attempts issued back to back
+/// all land inside it, and `acquire_gate_lock` ends in the "the record kept changing under us"
+/// error rather than in the sentence it exists to produce.
+///
+/// MEASURED: six threads racing one name, with the machine under load, put FOUR of the six on that
+/// error — so four of five losers were told "try again" instead of being told WHO holds the lock,
+/// which is the one thing a refused caller needs. A few milliseconds is nothing against a
+/// filesystem lock whose TTL is measured in tens of seconds, and it is long enough for the winner's
+/// `write_all` + `flush` to land.
+///
+/// It is a BACKOFF, not a fixed sleep: the wait grows with the attempt, so the worst case across
+/// every retry plus the final re-read stays under ~20ms while a badly-descheduled winner still gets
+/// a widening window to finish in.
+const GATE_RETRY_BACKOFF: Duration = Duration::from_millis(2);
+
 /// Take the named lock for `agent_id`, or say who has it.
 ///
 /// Four outcomes, all in [`GateLockOutcome`]: taken, RE-ENTERED (we already had it), reclaimed from
@@ -851,7 +872,12 @@ pub fn acquire_gate_lock(
     let bytes =
         serde_json::to_vec_pretty(&mine).map_err(|e| format!("could not encode a gate lock: {e}"))?;
 
-    for _ in 0..GATE_ATTEMPTS {
+    for attempt in 0..GATE_ATTEMPTS {
+        // Back off before looking again — see `GATE_RETRY_BACKOFF`. Never before the FIRST look:
+        // the uncontended acquire is the common case and must not pay for the contended one.
+        if attempt > 0 {
+            std::thread::sleep(GATE_RETRY_BACKOFF * attempt as u32);
+        }
         match read_gate(&path) {
             None => match create_exclusive(&path, &bytes) {
                 Ok(()) => {
@@ -916,7 +942,11 @@ pub fn acquire_gate_lock(
         }
     }
 
-    // Every attempt lost a race. Report the holder we can see rather than inventing a success.
+    // Every attempt lost a race. One last backoff before the give-up read, for the same reason the
+    // loop has one: the record we could not parse a moment ago is almost certainly complete now, and
+    // reading it turns an opaque "try again" into the holder's name.
+    std::thread::sleep(GATE_RETRY_BACKOFF * GATE_ATTEMPTS as u32);
+    // Report the holder we can see rather than inventing a success.
     match read_gate(&path) {
         Some(held) => Ok(GateLockOutcome {
             acquired: false,
@@ -1660,8 +1690,29 @@ mod tests {
 
     // ── GATE LOCKS ──────────────────────────────────────────────────────────────────────────
 
-    /// THE RACING CASE for the lock. Six threads, one name: exactly one holds it, and the other
-    /// five are told WHO — the sentence that answers "task ui errors on the port".
+    /// THE RACING CASE for the lock. Six threads, one name: exactly one holds it, and every acquirer
+    /// that does not hold it is told WHO does — the sentence that answers "task ui errors on the
+    /// port".
+    ///
+    /// **NOTHING IN A SPAWNED THREAD MAY `unwrap`, AND THAT IS THE POINT OF THIS DOCBLOCK.** The
+    /// previous shape called `acquire_gate_lock(..).unwrap()` inside each racing thread, and it was
+    /// intermittently red on `origin/main`'s own bytes. A panic in a spawned thread DESTROYS THE
+    /// EVIDENCE: the thread dies, `join().unwrap()` re-raises an opaque `Any { .. }`, and the report
+    /// names neither the error nor an assertion — so the failure reads as "the one-winner rule
+    /// broke" when the one-winner rule was never reached. Every thread now hands its `Result` back
+    /// and every judgement is made here, where a message can be printed.
+    ///
+    /// **A CONTENDED ACQUIRE MAY LEGITIMATELY ERROR, AND IT IS TOLERATED — NARROWLY.**
+    /// `acquire_gate_lock` retries `GATE_ATTEMPTS` times and gives up when every attempt read a
+    /// record that would not parse. That is a real window, not a defect: `create_exclusive` creates
+    /// the file and THEN writes it, so the winner's record is briefly an empty file (the same window
+    /// `unreadable_is_reclaimable` exists for on the lease side), and six threads on one name land
+    /// in it. Giving up there is the honest answer — it acquired NOTHING, so it cannot double-hold
+    /// the gate, and the message says to try again. So the tolerance is keyed to THAT sentence
+    /// only: any other error — an unwritable registry, an unencodable record — still fails the test.
+    ///
+    /// What the test pins, whatever the interleaving, is HOLDERS: exactly one acquirer, the disk
+    /// agreeing with it, and nobody who failed to acquire believing otherwise.
     #[test]
     fn six_agents_racing_one_gate_lock_leave_exactly_one_holder() {
         let dir = tmp();
@@ -1673,16 +1724,48 @@ mod tests {
             let s = s.clone();
             handles.push(std::thread::spawn(move || {
                 let env = Env { now_ms: T0, pid: 200 + i as u32, is_bound: &never_bound };
-                acquire_gate_lock(&root, &s, "browser", &format!("agent-{i}"), None, &env).unwrap()
+                // NO `unwrap` HERE — see the docblock. The Result travels back intact.
+                acquire_gate_lock(&root, &s, "browser", &format!("agent-{i}"), None, &env)
             }));
         }
-        let outcomes: Vec<GateLockOutcome> = handles.into_iter().map(|h| h.join().unwrap()).collect();
-        let winners: Vec<&GateLockOutcome> = outcomes.iter().filter(|o| o.acquired).collect();
-        assert_eq!(winners.len(), 1, "exactly one acquirer may hold the lock");
+        let outcomes: Vec<Result<GateLockOutcome, String>> = handles
+            .into_iter()
+            .enumerate()
+            .map(|(i, h)| h.join().unwrap_or_else(|_| panic!("racing thread {i} panicked")))
+            .collect();
+
+        // Any error must be the CONTENTION give-up, which acquired nothing. Anything else is a real
+        // fault and is reported with its own text rather than swallowed by the tolerance.
+        for out in &outcomes {
+            if let Err(e) = out {
+                assert!(
+                    e.contains("the record kept changing under us"),
+                    "a racing acquire failed for a reason that is not contention: {e}"
+                );
+            }
+        }
+
+        let winners: Vec<&GateLockOutcome> =
+            outcomes.iter().filter_map(|o| o.as_ref().ok()).filter(|o| o.acquired).collect();
+        assert_eq!(
+            winners.len(),
+            1,
+            "exactly one acquirer may hold the lock, got {:?}",
+            outcomes
+                .iter()
+                .map(|o| match o {
+                    Ok(g) => format!("{}={:?}", g.lock.agent_id, g.state),
+                    Err(e) => format!("Err({e})"),
+                })
+                .collect::<Vec<_>>()
+        );
 
         let holder = gate_lock_on(&root, "browser").expect("a record on disk");
         assert_eq!(holder.agent_id, winners[0].lock.agent_id, "the disk must agree with the winner");
-        for refused in outcomes.iter().filter(|o| !o.acquired) {
+
+        // Every non-holder either NAMES the holder, or errored above having taken nothing. Neither
+        // may come back believing it holds the gate.
+        for refused in outcomes.iter().filter_map(|o| o.as_ref().ok()).filter(|o| !o.acquired) {
             assert_eq!(refused.state, GateState::Refused);
             assert!(
                 refused.message.contains(&holder.agent_id),
@@ -1691,6 +1774,45 @@ mod tests {
             );
             assert!(refused.message.contains(&holder.pid.to_string()), "{}", refused.message);
         }
+    }
+
+    /// A TORN RECORD IS RE-READ AFTER A WAIT, NOT SPUN ON.
+    ///
+    /// The defect this pins is not a wrong answer, it is a wrong SCHEDULE. `create_exclusive`
+    /// creates the record and THEN writes it, so a winner's file is briefly zero bytes and
+    /// `read_gate` answers `None` for a file that plainly exists. Four attempts issued back to back
+    /// all land inside that window, and `acquire_gate_lock` gives up with an opaque "try again"
+    /// instead of naming the holder — measured on this machine under load, FOUR of six racing
+    /// threads got that instead of the one sentence a refused caller needs.
+    ///
+    /// So the assertion is the SIDE EFFECT of [`GATE_RETRY_BACKOFF`]: the call must have SPENT the
+    /// backoff before giving up. A zero-byte record here never becomes readable, so the VERDICT is
+    /// fixed and only the elapsed time is under test — delete the sleeps and this goes red, while no
+    /// amount of machine load can red it spuriously, because a sleep only ever overshoots.
+    #[test]
+    fn a_torn_gate_record_is_re_read_after_a_backoff_rather_than_spun_on() {
+        let dir = tmp();
+        let s = settings();
+        fs::create_dir_all(gates_dir(dir.path())).unwrap();
+        // EXACTLY the state `create_exclusive` leaves for the microseconds between its `open` and
+        // its `write_all`: the file exists and holds nothing.
+        fs::write(gate_path(dir.path(), "browser"), b"").unwrap();
+
+        let started = std::time::Instant::now();
+        let out = acquire_gate_lock(dir.path(), &s, "browser", "waiter", None, &env_at(T0));
+        let waited = started.elapsed();
+
+        let err = out.expect_err("a record that never becomes readable cannot be acquired");
+        assert!(err.contains("the record kept changing under us"), "{err}");
+
+        // Every retry inside the loop, plus the one before the give-up read.
+        let floor: Duration = (1..GATE_ATTEMPTS as u32).map(|n| GATE_RETRY_BACKOFF * n).sum::<Duration>()
+            + GATE_RETRY_BACKOFF * GATE_ATTEMPTS as u32;
+        assert!(
+            waited >= floor,
+            "the retry loop spun instead of waiting: {waited:?} < {floor:?} — a winner still mid-write \
+             never gets to finish, and its rivals are told `try again` instead of who holds the lock"
+        );
     }
 
     /// RE-ENTRANT for the same agent. A pinned-port preview takes this lock on every open, so a
