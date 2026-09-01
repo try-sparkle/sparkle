@@ -42,6 +42,7 @@ import {
 } from "./OpenPrMenu";
 import { OPEN_PR_POLL_MS, type PrRow } from "../services/openPrs";
 import { __resetProbeGateCacheForTests } from "../services/probeGate";
+import { STRANDED_REPORT } from "../services/mergeGuard/mergedButStranded.fixture";
 import type { FleetTotals, PrScope } from "../services/fleetPrs";
 import type { AgentTab, Project } from "../types";
 
@@ -2943,6 +2944,80 @@ describe("OpenPrMenu — unanswered knightwatch probes", () => {
   // was to write a sentence justifying a merge with the probe unanswered for a probe they had just
   // answered. Rust discards that sentence (it returns Allow before reading it once nothing blocks),
   // so the waiver was fabricated and then thrown away.
+  // ── A MERGE THAT LANDED IS A MERGE, EVEN WHEN IT STRANDED WORK (roborev 72228) ───────────────
+  //
+  // Rust's post-merge landing gate throws AFTER `gh pr merge` succeeded, to report that the merge
+  // took an older head than the branch held (bead sparkle-a08oi0). It arrives on the same channel
+  // as every refusal, and this loop's `catch` was written on the invariant that a throw means the
+  // repository did not move — so the row never reached `merged.push(prKey)` and its probe-refusal
+  // ledger survived a merge that had actually gone through.
+  //
+  // THE OBSERVABLE SIDE EFFECT of "recorded as merged" is that ledger clearing: the row's action
+  // slot is `probeRefusal ? <probe-override> : <merge>`, so a row still holding a refusal offers
+  // "Override probes…" and NO Merge button. Asserting the map itself would be asserting a
+  // precondition; these assert the affordance, which is what a person actually meets.
+  describe("a merge that SUCCEEDED but stranded work", () => {
+    /** Refuse the un-overridden merge for probes, then answer the OVERRIDDEN one with `outcome`. */
+    function stubProbeThen(outcome: Error) {
+      h.invoke.mockImplementation(
+        (cmd: string, args?: Record<string, unknown>) => {
+          if (cmd === "project_open_prs") return Promise.resolve([GREEN_A]);
+          if (cmd === "merge_pr")
+            return typeof args?.knightwatchOverride === "string"
+              ? Promise.reject(outcome)
+              : Promise.reject(new Error(REFUSAL));
+          return Promise.resolve(null);
+        },
+      );
+    }
+
+    /** Refuse for probes, then write the override sentence and submit it. */
+    async function refuseThenOverride() {
+      render(
+        <OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />,
+      );
+      await openMenu();
+      fireEvent.click(await screen.findByTestId("merge-1176"));
+      fireEvent.click(await screen.findByTestId("probe-override-1176"));
+      fireEvent.change(await screen.findByTestId("probe-override-reason-1176"), {
+        target: { value: REASON },
+      });
+      fireEvent.click(screen.getByTestId("probe-override-1176"));
+    }
+
+    it("clears the row's probe ledger — the PR IS merged", async () => {
+      stubProbeThen(new Error(STRANDED_REPORT));
+      await refuseThenOverride();
+
+      // THE SIDE EFFECT: the ordinary Merge affordance is back and the override is gone, which is
+      // only reachable through `merged.push(prKey)`. Before this fix the row stayed on the override
+      // arm, inviting a second merge of a pull request that had already landed.
+      expect(await screen.findByTestId("merge-1176")).toBeTruthy();
+      expect(screen.queryByTestId("probe-override-1176")).toBeNull();
+
+      // …AND THE REPORT IS STILL ON SCREEN. Recording the merge while swallowing the finding would
+      // reproduce the bead exactly: `gh` exited 0 and nothing else ever mentions the lost commits.
+      const err = await screen.findByTestId("merge-error");
+      expect(err.textContent).toContain("MERGED-BUT-STRANDED");
+      expect(err.textContent).toContain("aaaa1111..bbbb2222");
+    });
+
+    // THE PAIR. Treating a genuine failure as a landed merge would be worse than the bug: the row
+    // would drop its refusal and offer Merge again for a PR that never merged at all. Identical
+    // flow, identical assertions inverted — only the thrown message differs.
+    it("does NOT clear the ledger for a merge that genuinely FAILED", async () => {
+      stubProbeThen(new Error("Pull request is not mergeable"));
+      await refuseThenOverride();
+
+      await waitFor(() =>
+        expect(screen.getByTestId("merge-error").textContent).toMatch(/not mergeable/i),
+      );
+      // Still on the override arm: nothing merged, so nothing about this row is history.
+      expect(screen.getByTestId("probe-override-1176")).toBeTruthy();
+      expect(screen.queryByTestId("merge-1176")).toBeNull();
+    });
+  });
+
   it("gives the row its Merge button back after a deliberate re-read", async () => {
     stubProbeGate([GREEN_A]);
     render(

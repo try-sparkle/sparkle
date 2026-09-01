@@ -6620,13 +6620,35 @@ fn merge_landing_verdict(second_parent: &str, local_tip: &str, ahead: usize, beh
 }
 
 /// THE ONE `Err` FROM `merge_pr` THAT MEANS THE REPOSITORY *DID* MOVE. Every other error this
-/// function can return is a refusal — nothing merged, nothing changed — and both consumers of the
-/// `Err` channel are written on that invariant: `conciergeTools/workflow.ts` classifies unmatched
-/// prose as `unknown-error` ("a message a model retries verbatim") and `OpenPrMenu.tsx` skips its
-/// merged-ledger push. So this text leads with `MERGED-BUT-STRANDED` and says in its first clause
-/// that the merge SUCCEEDED and must not be retried — the token is there to be matched on, and
-/// wiring those two call sites to an explicit non-failure branch is bead `sparkle-a08oi0`'s
-/// follow-up (roborev 72228; both files are outside this change's scope).
+/// function can return is a refusal — nothing merged, nothing changed — and every consumer of the
+/// `Err` channel is written on that invariant. So this text leads with `MERGED-BUT-STRANDED` and
+/// says in its first clause that the merge SUCCEEDED and must not be retried — the token is there
+/// to be matched on (bead `sparkle-a08oi0`, roborev 72228 and 72459).
+///
+/// THERE ARE **THREE** CONSUMERS OF THAT CHANNEL, AND ALL THREE ARE WIRED. The count is written out
+/// because the previous version of this header named two and called that "both consumers": the
+/// third was reading the report as an ordinary failure the whole time, and a closed list that is
+/// wrong is worse than no list — an auditor checking the contract never opens the file it omits
+/// (roborev 72459). Add a fourth call site and this list is what has to grow with it.
+///
+///   • `conciergeTools/workflow.ts` — classifies unmatched prose as `unknown-error`, the bucket its
+///     own comment calls "a message a model retries verbatim"; it now returns `ok(...)` with a
+///     `strandedWarning` instead.
+///   • `components/OpenPrMenu.tsx` — reaches `merged.push(prKey)` only on the success path, so an
+///     unclassified report left the row's probe-refusal ledger uncleared; it now records the row as
+///     MERGED and still shows the report.
+///   • `integration_assistant.rs::integration_merge` — the RUST consumer, and the one the two-item
+///     list hid. A bare `?` there meant no `MergeOutcome` was ever built, so a merge that landed was
+///     recorded with `landed: false`, the ancestry proof and cleanup never ran, and the entry stayed
+///     in `nextActionable`'s queue offering a second Merge click against an already-merged PR. It
+///     matches through [`is_merged_but_stranded_report`] below rather than spelling the token again.
+///
+/// THE TOKEN IS A WIRE CONTRACT ACROSS TWO LANGUAGES. `services/mergeGuard/mergedButStranded.ts`
+/// matches it as a LEADING token — anchored, not a substring, because a false positive there
+/// reports a merge that never happened as one that did — and [`is_merged_but_stranded_report`] is
+/// the Rust half of exactly the same rule, so the three call sites share ONE spelling. Renaming it
+/// here alone leaves every consumer silently classifying this as an ordinary failure again, which
+/// is the whole defect; the test below pins it from the writing side.
 ///
 /// It names BOTH shas, because the whole failure this exists to end is a success-looking exit whose
 /// two halves — what the merge took, and what the branch held — were never put side by side.
@@ -6635,7 +6657,10 @@ fn merge_landing_verdict(second_parent: &str, local_tip: &str, ahead: usize, beh
 /// may be deleted, so "push, then merge" is unsafe here in a way it is not in `stale_head_refusal`.
 /// The only remedy that is safe under the conditions that produced this is to open a NEW PR for the
 /// commits that did not land, which is what it says.
-fn stranded_after_merge_report(
+/// `pub(crate)` so `integration_assistant.rs`'s tests can drive its own arm with the REAL report
+/// rather than a hand-typed copy — two halves of one wire spelled separately is exactly how a
+/// pair of suites goes green over a feature that never runs.
+pub(crate) fn stranded_after_merge_report(
     number: u64,
     head_ref: &str,
     second_parent: &str,
@@ -6645,7 +6670,7 @@ fn stranded_after_merge_report(
     let plural = if stranded == 1 { "commit" } else { "commits" };
     let was = if stranded == 1 { "was" } else { "were" };
     format!(
-        "MERGED-BUT-STRANDED: merge_pr #{number} SUCCEEDED — the pull request IS merged and the \
+        "{MERGED_BUT_STRANDED_TOKEN} merge_pr #{number} SUCCEEDED — the pull request IS merged and the \
          repository DID move, so do not call merge_pr again — but it did not land all of \
          `{head_ref}`. The merge commit's second parent is {second_parent}, while the pushed branch \
          head is {remote_tip}: {stranded} {plural} {was} not merged. `gh` exited 0, so nothing else \
@@ -6653,6 +6678,29 @@ fn stranded_after_merge_report(
          Its branch may already be deleted, so read the gap with `git log --oneline \
          {second_parent}..{remote_tip}` and open a NEW pull request for those commits."
     )
+}
+
+/// THE ONE SPELLING OF THE TOKEN, and the Rust half of the same rule
+/// `mergeGuard/mergedButStranded.ts` applies in TypeScript.
+///
+/// It is a `const` rather than a literal in the `format!` above because the token now has FOUR
+/// readers — the writer, this matcher, `mergedButStranded.ts`, and each of their tests — and a
+/// token hand-written at each one is a rename that goes green while un-wiring every consumer.
+/// [`stranded_after_merge_report`] interpolates this, so the writer and the reader cannot disagree.
+pub const MERGED_BUT_STRANDED_TOKEN: &str = "MERGED-BUT-STRANDED:";
+
+/// Is `message` [`stranded_after_merge_report`]'s output — i.e. did the merge SUCCEED?
+///
+/// ANCHORED AT THE START, never a substring, and the asymmetry is the reason. A false positive
+/// reports a merge that never happened as one that did: the caller stops retrying, the queue entry
+/// leaves `nextActionable`, and a PR genuinely stuck on a conflict is recorded as landed. A false
+/// negative merely returns the behaviour that existed before this was wired. So an error that
+/// merely quotes or forwards the report somewhere inside itself is NOT this — the token has to be
+/// the thing the message leads with, the way [`stranded_after_merge_report`] emits it. This is
+/// deliberately the same rule, character for character, as `isMergedButStrandedReport` in
+/// `services/mergeGuard/mergedButStranded.ts`.
+pub fn is_merged_but_stranded_report(message: &str) -> bool {
+    message.trim_start().starts_with(MERGED_BUT_STRANDED_TOKEN)
 }
 
 /// Ask GitHub for the merge commit a just-succeeded `gh pr merge` produced, and resolve its SECOND
@@ -12834,15 +12882,21 @@ mod tests {
         assert!(stranded_after_merge_report(1, "b", "a1", "b2", 1).contains("1 commit was"), "singular");
     }
 
-    /// EVERY OTHER `Err` FROM `merge_pr` MEANS NOTHING MERGED, and both consumers of that channel are
-    /// written on it — `workflow.ts` buckets unmatched prose as `unknown-error`, which its own comment
-    /// calls "a message a model retries verbatim". This one is the exception, so the text has to say
-    /// so in its own first clause and carry a token a consumer can match (roborev 72228). Asserting
+    /// EVERY OTHER `Err` FROM `merge_pr` MEANS NOTHING MERGED, and all THREE consumers of that
+    /// channel are written on it — `workflow.ts` buckets unmatched prose as `unknown-error`, which
+    /// its own comment calls "a message a model retries verbatim"; `OpenPrMenu.tsx` skips its
+    /// merged-ledger push; and `integration_assistant.rs::integration_merge` builds no `MergeOutcome`
+    /// at all. This one is the exception, so the text has to say so in its own first clause and
+    /// carry a token a consumer can match (roborev 72228, and 72459 for the third). Asserting
     /// the token alone would be vacuous — a prefix proves nothing about what the sentence claims — so
     /// this pins the CLAIM: the merge succeeded, and calling merge_pr again is not the remedy.
     #[test]
     fn the_stranded_report_declares_the_merge_LANDED_rather_than_reading_as_a_failed_merge() {
         let msg = stranded_after_merge_report(2580, "sparkle/agent-x", "aaaa1111", "bbbb2222", 2);
+        // PINNED LITERALLY, ON PURPOSE, and NOT through `MERGED_BUT_STRANDED_TOKEN`: the writer
+        // interpolates that const, so asserting against it would be tautological. This literal and
+        // `mergedButStranded.ts`'s own are the two ends of the wire; changing the const alone
+        // un-wires all three consumers with nothing going red but this.
         assert!(msg.starts_with("MERGED-BUT-STRANDED:"), "needs a matchable leading token: {msg}");
         // The claim, not the label. A reader must not be able to come away thinking nothing merged.
         assert!(msg.contains("SUCCEEDED"), "{msg}");
@@ -12851,6 +12905,29 @@ mod tests {
         // ...and the words that would send a model to retry the merge must not appear.
         for retry in ["merge it again", "retry the merge", "run merge_pr again"] {
             assert!(!msg.contains(retry), "report must not invite a retry (`{retry}`): {msg}");
+        }
+    }
+
+    /// THE MATCHER, ASSERTED AGAINST THE WRITER — not against a hand-typed token, which would only
+    /// prove that two literals in this file agree. The property that matters is ANCHORING: an error
+    /// that forwards or quotes the report somewhere inside itself is an ordinary failure, and
+    /// reading it as a landed merge is the one direction that loses a stuck PR (roborev 72459).
+    #[test]
+    fn the_stranded_matcher_is_anchored_so_a_quoted_report_is_not_a_landed_merge() {
+        let real = stranded_after_merge_report(2580, "sparkle/agent-x", "aaaa1111", "bbbb2222", 2);
+        assert!(is_merged_but_stranded_report(&real), "the writer's own output must match");
+        // Leading whitespace is a transport artefact, not a different message.
+        assert!(is_merged_but_stranded_report(&format!("\n  {real}")));
+        // ...and everything that is not the report leading the message is a REFUSAL.
+        for other in [
+            format!("gh pr merge #2580 failed; the last run said: {real}"),
+            "Pull request is not mergeable: the merge commit cannot be cleanly created".to_string(),
+            "knightwatch: 3 open fail-verdict findings".to_string(),
+            String::new(),
+            // The claim without the token: prose alone must never be enough.
+            "merge_pr #2580 SUCCEEDED — the pull request IS merged".to_string(),
+        ] {
+            assert!(!is_merged_but_stranded_report(&other), "must stay a refusal: {other:?}");
         }
     }
 

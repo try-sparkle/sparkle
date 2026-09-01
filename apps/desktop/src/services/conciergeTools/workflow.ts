@@ -81,6 +81,7 @@ import {
 } from "../mergeGuard/roborev";
 import { fetchPrClaims, findClaim, viewClaim } from "../mergeGuard/prClaims";
 import { isBaseBranchRefusal, isKnightwatchRefusal, knightwatchReasonIssue } from "../mergeGuard/knightwatch";
+import { isMergedButStrandedReport } from "../mergeGuard/mergedButStranded";
 import type {
   KnightwatchOverride,
   PrClaimView,
@@ -976,6 +977,24 @@ export interface MergePrRequest {
   knightwatchOverride?: KnightwatchOverride;
 }
 
+/** What a completed `merge_pr` reports. The PR IS merged whenever this shape is returned at all. */
+export interface MergePrReport {
+  number: number;
+  method: "merge";
+  url: string;
+  /**
+   * Rust's post-merge landing report, present ONLY when the merge succeeded and left commits
+   * behind (bead sparkle-a08oi0, roborev 72228). It is a warning ON a completed merge, never a
+   * failure: the pull request is merged, `merge_pr` must not be called again, and the remedy the
+   * text spells out is a NEW pull request for the commits the merge did not take.
+   *
+   * IT IS A FIELD RATHER THAN AN ERROR ON PURPOSE. Carried in the `Err` channel it lands in
+   * `unknown-error`, whose comment calls it "a message a model retries verbatim" — and the retry is
+   * a re-merge of an already-merged PR. Absent on every ordinary merge.
+   */
+  strandedWarning?: string;
+}
+
 /**
  * Merge an open PR into the default branch with a MERGE COMMIT.
  *
@@ -1002,7 +1021,7 @@ export interface MergePrRequest {
  */
 export async function mergePrTool(
   req: MergePrRequest,
-): Promise<WorkflowResult<{ number: number; method: "merge"; url: string }>> {
+): Promise<WorkflowResult<MergePrReport>> {
   const op = "merge_pr";
   // Runtime backstop for the type above. Read defensively: this object came off the wire.
   const raw = req as unknown as Record<string, unknown>;
@@ -1109,7 +1128,23 @@ export async function mergePrTool(
     return ok(op, { number: req.number, method: "merge", url: pr.url });
   } catch (e) {
     const msg = errText(e);
-    // FIRST, because a probe refusal is a REFUSAL — nothing was merged and the repo did not move —
+    // BEFORE EVERY REFUSAL BRANCH, BECAUSE THIS IS THE ONE THAT IS NOT ONE (roborev 72228).
+    //
+    // Rust's post-merge landing gate runs AFTER `gh pr merge` has already succeeded, and reports a
+    // merge that took an older head than the branch held (bead sparkle-a08oi0). It reaches us
+    // through `Err` because the fact has to reach somebody — but every branch below it, and the
+    // `unknown-error` fall-through in particular, tells the model an operation did NOT happen. The
+    // fall-through's own comment calls it "a message a model retries verbatim", and the retry here
+    // is `merge_pr` against a pull request that is already merged and whose branch may be deleted.
+    //
+    // So it resolves `ok`: the merge is the operation this tool was asked to perform and it
+    // happened. The report is not discarded — it rides on `strandedWarning`, which exists for
+    // exactly this and is absent on every ordinary merge, so a reader that ignores the field is no
+    // worse off than before and one that reads it gets the whole finding verbatim.
+    if (isMergedButStrandedReport(msg))
+      return ok(op, { number: req.number, method: "merge", url: pr.url, strandedWarning: msg });
+    // FIRST among the refusals, because a probe refusal is a REFUSAL — nothing was merged and the
+    // repo did not move —
     // and because its remedy is nothing the patterns below would suggest. Left to them it lands on
     // `unknown-error` with Rust's prose and no code, which is a message a model retries verbatim.
     if (isKnightwatchRefusal(msg))

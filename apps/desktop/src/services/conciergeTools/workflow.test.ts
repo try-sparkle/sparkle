@@ -71,6 +71,8 @@ vi.mock("../../stores/projectStore", () => ({
 }));
 
 import { PR_CLAIM_GRACE_SECONDS } from "../mergeGuard/types";
+// Rust's post-merge report, shared with the classifier's own suite so the two cannot drift.
+import { STRANDED_REPORT } from "../mergeGuard/mergedButStranded.fixture";
 import {
   WORKFLOW_OPERATIONS,
   WORKFLOW_RISK,
@@ -711,6 +713,63 @@ describe("merge_pr", () => {
       ok: false,
       kind: "refused",
       code: "knightwatch-unanswered",
+    });
+  });
+
+  // ── A MERGE THAT HAPPENED MUST NEVER BE REPORTED AS ONE THAT DID NOT (roborev 72228) ─────────
+  //
+  // Rust's post-merge landing gate throws AFTER `gh pr merge` succeeded, to say the merge took an
+  // older head than the branch held (bead sparkle-a08oi0). Every other throw out of `mergePr` means
+  // nothing merged, and the fall-through bucket `unknown-error` is — by its own comment — "a
+  // message a model retries verbatim". Retrying THIS one re-merges a pull request that is already
+  // merged and whose branch may be deleted.
+  //
+  // These assert what the CONSUMER produces, not that Rust threw. "The gate errors on a mismatch"
+  // is true of the bug too.
+  describe("a merge that SUCCEEDED but stranded work", () => {
+    it("does NOT reach the retry-me `unknown-error` bucket — it resolves ok", async () => {
+      m.fetchOpenPrs.mockResolvedValue([openPr]);
+      m.mergePr.mockRejectedValue(new Error(STRANDED_REPORT));
+      const r = await mergePrTool({ root: "/repo", projectId: "p1", number: 7 });
+
+      // THE DEFECT, stated as an assertion: this used to be `{ kind: "failed", code:
+      // "unknown-error" }`, which tells the model the merge failed.
+      expect(r).not.toMatchObject({ ok: false });
+      expect(r).not.toMatchObject({ code: "unknown-error" });
+      expect(r).toMatchObject({ ok: true, op: "merge_pr" });
+
+      // …AND THE DETECTION SURVIVES. Resolving `ok` while dropping the report would trade one
+      // silent loss of work for another — the whole bead is that `gh` exited 0 and nothing else
+      // was ever going to mention the stranded commits.
+      const data = (r as { data: { strandedWarning?: string; number: number } }).data;
+      expect(data.strandedWarning).toBe(STRANDED_REPORT);
+      expect(data.number).toBe(7);
+    });
+
+    it("carries NO warning field on an ordinary merge, so its presence means something", async () => {
+      m.fetchOpenPrs.mockResolvedValue([openPr]);
+      m.mergePr.mockResolvedValue(undefined);
+      const r = await mergePrTool({ root: "/repo", projectId: "p1", number: 7 });
+      expect((r as { data: { strandedWarning?: string } }).data.strandedWarning).toBeUndefined();
+    });
+
+    // THE PAIR. Conflating a genuine failure with a landed merge would be worse than the bug being
+    // fixed: the model would stop retrying a merge that never happened, and go on to delete the
+    // branch. Same tool, same call shape — only the message differs.
+    it("still reports a GENUINE merge failure as a failure", async () => {
+      for (const [msg, code] of [
+        ["Pull request is not mergeable", "conflict"],
+        ["GraphQL: Required status checks have not passed", "checks-blocked"],
+        ["gh: something nobody has a pattern for", "unknown-error"],
+      ] as const) {
+        m.fetchOpenPrs.mockResolvedValue([openPr]);
+        m.mergePr.mockRejectedValue(new Error(msg));
+        expect(await mergePrTool({ root: "/repo", projectId: "p1", number: 7 }), msg).toMatchObject({
+          ok: false,
+          kind: "failed",
+          code,
+        });
+      }
     });
   });
 });

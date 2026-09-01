@@ -1400,6 +1400,16 @@ pub struct MergeOutcome {
     pub head_sha: Option<String>,
     /// What cleanup did, or why it did not run.
     pub cleanup: String,
+    /// `merge_pr`'s post-merge stranded-work report, when it produced one — the mirror of
+    /// `strandedWarning` on the TypeScript side.
+    ///
+    /// SOME HERE MEANS THE MERGE LANDED, not that it failed. It is the one `Err` `merge_pr` can
+    /// return that means the repository DID move: the PR is merged, and commits that were on the
+    /// pushed branch head are not in the merge commit. `landed` is true alongside it and the
+    /// remote branch is deliberately NOT deleted, because that branch is the only thing still
+    /// holding the stranded commits (roborev 72459, bead `sparkle-a08oi0`).
+    #[serde(default)]
+    pub stranded: Option<String>,
 }
 
 /// Gate, refuse or merge, then PROVE it landed before cleaning anything up.
@@ -1449,12 +1459,20 @@ pub async fn integration_merge(
             refusal: Some(refusal),
             head_sha,
             cleanup: "not run — nothing was merged".to_string(),
+            stranded: None,
         });
     }
 
     // The single sink for every in-app merge: it carries the merge-protected policy gate, the
     // knightwatch review gate and the base-branch gate, and it uses `--merge`.
-    crate::worktree::merge_pr(
+    //
+    // NOT `.await?`. That bare `?` was the defect roborev 72459 found: `merge_pr` has ONE `Err`
+    // that means the merge SUCCEEDED, and propagating it as an ordinary failure here built no
+    // `MergeOutcome` at all, so a merge that landed was recorded with `landed: false`, the ancestry
+    // proof and cleanup never ran, and the entry stayed in the queue for a second Merge click
+    // against an already-merged PR. [`outcome_after_merge`] owns that branch, and keeps `?` for
+    // every other `Err`.
+    let merged = crate::worktree::merge_pr(
         app,
         root.clone(),
         project_id,
@@ -1462,65 +1480,112 @@ pub async fn integration_merge(
         None,
         head_sha.clone(),
     )
-    .await?;
+    .await;
 
     let root_for_proof = root.clone();
     let sha_for_proof = head_sha.clone();
-    let branch_for_cleanup = branch.clone();
     let cleanup_wanted = c.cleanup_after_merge;
-    let (landed, cleanup) = tauri::async_runtime::spawn_blocking(move || {
-        let default = crate::worktree::resolve_default_branch(&root_for_proof);
-        let base_ref = format!("origin/{default}");
-        let mut fetch = Command::new(crate::preflight::git_program());
-        fetch.arg("-C").arg(&root_for_proof).args([
-            "fetch", "--quiet", "--no-tags", "origin", &default,
-        ]);
-        apply_noninteractive(&mut fetch);
-        let _ = crate::worktree::output_with_timeout(fetch, SCRIPT_TIMEOUT);
-
-        let landed = match sha_for_proof.as_deref() {
-            Some(sha) => confirm_landed_by_ancestry(&root_for_proof, sha, &base_ref).unwrap_or(false),
-            None => false,
-        };
-        if !landed {
-            return (
-                false,
-                "not run — ancestry could not prove the merge landed, so nothing was deleted"
-                    .to_string(),
-            );
-        }
-        if !cleanup_wanted {
-            return (true, "skipped — cleanup_after_merge is false".to_string());
-        }
-        let mut push = Command::new(crate::preflight::git_program());
-        push.arg("-C").arg(&root_for_proof).args([
-            "push",
-            "origin",
-            "--delete",
-            &branch_for_cleanup,
-        ]);
-        apply_noninteractive(&mut push);
-        match crate::worktree::output_with_timeout(push, SCRIPT_TIMEOUT) {
-            Ok(o) if o.status.success() => {
-                (true, format!("deleted the remote branch {branch_for_cleanup}"))
-            }
-            Ok(o) => (
-                true,
-                format!(
-                    "the merge landed, but deleting {branch_for_cleanup} failed: {}",
-                    String::from_utf8_lossy(&o.stderr).trim()
-                ),
-            ),
-            Err(e) => (
-                true,
-                format!("the merge landed, but deleting {branch_for_cleanup} failed: {e}"),
-            ),
-        }
+    tauri::async_runtime::spawn_blocking(move || {
+        let root_for_delete = root_for_proof.clone();
+        outcome_after_merge(
+            merged,
+            branch,
+            pr,
+            head_sha,
+            cleanup_wanted,
+            move || {
+                let default = crate::worktree::resolve_default_branch(&root_for_proof);
+                let base_ref = format!("origin/{default}");
+                let mut fetch = Command::new(crate::preflight::git_program());
+                fetch.arg("-C").arg(&root_for_proof).args([
+                    "fetch", "--quiet", "--no-tags", "origin", &default,
+                ]);
+                apply_noninteractive(&mut fetch);
+                let _ = crate::worktree::output_with_timeout(fetch, SCRIPT_TIMEOUT);
+                match sha_for_proof.as_deref() {
+                    Some(sha) => {
+                        confirm_landed_by_ancestry(&root_for_proof, sha, &base_ref).unwrap_or(false)
+                    }
+                    None => false,
+                }
+            },
+            move |branch| {
+                let mut push = Command::new(crate::preflight::git_program());
+                push.arg("-C").arg(&root_for_delete).args([
+                    "push",
+                    "origin",
+                    "--delete",
+                    branch,
+                ]);
+                apply_noninteractive(&mut push);
+                match crate::worktree::output_with_timeout(push, SCRIPT_TIMEOUT) {
+                    Ok(o) if o.status.success() => Ok(()),
+                    Ok(o) => Err(String::from_utf8_lossy(&o.stderr).trim().to_string()),
+                    Err(e) => Err(e),
+                }
+            },
+        )
     })
     .await
-    .map_err(|e| format!("integration_merge cleanup task failed: {e}"))?;
+    .map_err(|e| format!("integration_merge cleanup task failed: {e}"))?
+}
 
-    Ok(MergeOutcome { branch, pr, landed, refusal: None, head_sha, cleanup })
+/// THE POST-MERGE HALF OF [`integration_merge`], with its two effects injected so the decision it
+/// makes can be driven without a Tauri host, a network, or a `gh` anywhere near the machine.
+///
+/// THE BRANCH THIS EXISTS FOR. `merge_pr` returns `Err` for a refusal — nothing merged, the
+/// repository is exactly where it was — with ONE exception: [`crate::worktree`]'s post-merge
+/// landing report, which means the merge SUCCEEDED and left commits behind. `integration_merge`
+/// used to reach this code through a bare `?`, so that one report took the failure path with
+/// `workflow.ts` and `OpenPrMenu.tsx` already wired to treat it as a completed merge — the third
+/// consumer of a channel two doc headers described as having two (roborev 72459).
+///
+/// SO A STRANDED REPORT IS LANDED, AND ITS BRANCH IS NEVER DELETED. `landed` is what takes the
+/// entry out of `nextActionable`'s queue, and leaving it false is what offered a second Merge click
+/// against an already-merged PR. But the report's own remedy is to open a NEW pull request for the
+/// commits that did not land, and the remote branch is the only thing still holding them — so this
+/// arm proves landing and then declines the delete, which is the opposite of what `landed: true`
+/// means everywhere else here. `prove_landed` is still called on it: the fetch and the ancestry read
+/// are what the cleanup line is written from, and skipping them would make the stranded arm the one
+/// path through this function that never looks at the repository.
+///
+/// A GENUINE FAILURE STILL ERRORS, and errors BEFORE either effect runs. Conflating the two
+/// directions would be worse than the bug: reporting a merge that never happened as landed clears
+/// the row, empties the queue, and deletes the branch of a PR stuck on a conflict.
+fn outcome_after_merge(
+    merged: Result<(), String>,
+    branch: String,
+    pr: u64,
+    head_sha: Option<String>,
+    cleanup_wanted: bool,
+    prove_landed: impl FnOnce() -> bool,
+    delete_remote_branch: impl FnOnce(&str) -> Result<(), String>,
+) -> Result<MergeOutcome, String> {
+    // ONE spelling of the token, shared with `mergedButStranded.ts` and `OpenPrMenu.tsx`.
+    let stranded = match merged {
+        Ok(()) => None,
+        Err(msg) if crate::worktree::is_merged_but_stranded_report(&msg) => Some(msg),
+        Err(msg) => return Err(msg),
+    };
+    let proven = prove_landed();
+    let (landed, cleanup) = match (stranded.is_some(), proven, cleanup_wanted) {
+        (true, _, _) => (
+            true,
+            format!(
+                "not run — the merge landed but left commits on {branch} that it did not take, and                  that branch is the only thing still holding them"
+            ),
+        ),
+        (false, false, _) => (
+            false,
+            "not run — ancestry could not prove the merge landed, so nothing was deleted".to_string(),
+        ),
+        (false, true, false) => (true, "skipped — cleanup_after_merge is false".to_string()),
+        (false, true, true) => match delete_remote_branch(&branch) {
+            Ok(()) => (true, format!("deleted the remote branch {branch}")),
+            Err(e) => (true, format!("the merge landed, but deleting {branch} failed: {e}")),
+        },
+    };
+    Ok(MergeOutcome { branch, pr, landed, refusal: None, head_sha, cleanup, stranded })
 }
 
 /// What this assistant is configured to do, and whether the tooling it needs is here.
@@ -1563,6 +1628,54 @@ pub async fn integration_status(root: String) -> Result<IntegrationStatus, Strin
 
 #[cfg(test)]
 mod tests {
+    // ── THE SEAM MUST BE ON THE PATH, NOT MERELY CORRECT (roborev 72492) ─────────────────────
+    // `outcome_after_merge` is unit-tested directly, and those tests prove it DECIDES correctly.
+    // They do not prove `integration_merge` ROUTES THROUGH IT. Restore the bare `.await?` on the
+    // `merge_pr` call — the exact two-character defect this whole change exists to remove — and
+    // `outcome_after_merge` becomes an orphan that the test module still calls directly: every
+    // behavioural test here stays green, `worktree.rs`'s matcher tests stay green, and the panel
+    // test stays green because it mocks `mergeBranch` at the TS boundary and never crosses into
+    // Rust. The crate has no `deny(dead_code)`, so the orphan does not even warn. That is the
+    // vacuous-coverage shape AGENTS.md calls the #1 fleet-wide finding, sitting on the one line
+    // that actually carried the bug.
+    //
+    // So this is a STRUCTURAL pin, the same `include_str!` idiom `worktree.rs` and `knightwatch.rs`
+    // already use for exactly this problem. It is the only assertion here that reddens when the
+    // seam is bypassed.
+    #[test]
+    fn integration_merge_routes_its_merge_result_through_outcome_after_merge() {
+        let src = include_str!("integration_assistant.rs");
+        let start = src
+            .find("pub async fn integration_merge(")
+            .expect("integration_merge's signature");
+        // Bound the slice at the NEXT top-level item, so a later function's text can never satisfy
+        // — or falsify — an assertion about this one.
+        let rest = &src[start..];
+        let end = rest.find("\nfn outcome_after_merge(").expect("outcome_after_merge follows it");
+        let body = &rest[..end];
+
+        // 1. The result is BOUND, not `?`-propagated. This is the line the bug lived on.
+        assert!(
+            body.contains("let merged = crate::worktree::merge_pr("),
+            "integration_merge must BIND merge_pr's result so the stranded arm can be inspected, \
+             not propagate it with `?` — a MERGED-BUT-STRANDED report means the merge LANDED"
+        );
+
+        // 2. …and it is handed to the seam. Binding it and then ignoring it would pass (1) alone.
+        assert!(
+            body.contains("outcome_after_merge("),
+            "integration_merge must pass merge_pr's result to outcome_after_merge"
+        );
+
+        // 3. …and nothing in this function `?`-propagates a merge_pr result after all. Asserted on
+        //    the WHOLE-LINE form, because a substring test passes for a commented-out call.
+        assert!(
+            !body.lines().any(|l| l.trim() == ".await?;"),
+            "integration_merge must not `?`-propagate merge_pr's Err — that is the third-consumer \
+             gap roborev 72492 reports, and it is reintroducible with a two-character edit"
+        );
+    }
+
     use super::*;
 
     // ── the check-code contract ────────────────────────────────────────────────────────────
@@ -2141,5 +2254,113 @@ mod tests {
         assert!(confirm_landed_by_ancestry(&root, "  ", "main").is_err());
         // A commit this repo has never heard of cannot be proven landed either.
         assert!(confirm_landed_by_ancestry(&root, "0".repeat(40).as_str(), "main").is_err());
+    }
+
+    // ── the THIRD consumer of `merge_pr`'s `Err` channel (roborev 72459) ───────────────────
+
+    /// Drive [`outcome_after_merge`] with both effects recorded, so what is asserted is the
+    /// OUTCOME — what `MergeOutcome` was built and what ran — and not that a matcher matched.
+    fn drive(
+        merged: Result<(), String>,
+        cleanup_wanted: bool,
+        proven: bool,
+    ) -> (Result<MergeOutcome, String>, bool, bool) {
+        let proved = std::cell::Cell::new(false);
+        let deleted = std::cell::Cell::new(false);
+        let out = outcome_after_merge(
+            merged,
+            "sparkle/agent-x".to_string(),
+            2580,
+            Some("cafe1234".to_string()),
+            cleanup_wanted,
+            || {
+                proved.set(true);
+                proven
+            },
+            |_| {
+                deleted.set(true);
+                Ok(())
+            },
+        );
+        (out, proved.get(), deleted.get())
+    }
+
+    /// The REAL report, from the writer, rather than a hand-typed token — a fixture spelled here
+    /// would be exactly the two-halves-wrong-the-same-way shape AGENTS.md warns about.
+    fn real_stranded_report() -> String {
+        crate::worktree::stranded_after_merge_report(
+            2580,
+            "sparkle/agent-x",
+            "aaaa1111",
+            "bbbb2222",
+            2,
+        )
+    }
+
+    /// THE BUG, ASSERTED AS AN OUTCOME. The bare `?` this replaced returned `Err` here, so no
+    /// `MergeOutcome` existed at all: `landed` was never true, `nextActionable` kept offering the
+    /// entry, and a second Merge click re-issued `gh pr merge` against an already-merged PR.
+    #[test]
+    fn a_stranded_report_is_a_LANDED_merge_that_carries_the_report_and_keeps_its_branch() {
+        let report = real_stranded_report();
+        // Ancestry `false` on purpose: the stranded case is precisely the one where the head the
+        // merge was decided against may not be on the default branch, so a fix that merely let
+        // the existing block run would still record `landed: false` and still offer the Merge.
+        let (out, proved, deleted) = drive(Err(report.clone()), true, false);
+        let o = out.expect("a merge that LANDED must not reach the Err channel");
+        assert!(o.landed, "the PR IS merged — `landed: false` is what keeps it in the queue");
+        assert_eq!(o.stranded.as_deref(), Some(report.as_str()), "the report must be carried");
+        assert!(o.refusal.is_none(), "nothing refused — the merge happened");
+        // The ancestry proof and the cleanup block are REACHED, which the bare `?` skipped.
+        assert!(proved, "the post-merge proof must still run on this arm");
+        // ...but the branch is the only thing still holding the stranded commits.
+        assert!(!deleted, "deleting the branch destroys the commits the report says to re-open");
+        assert!(o.cleanup.contains("sparkle/agent-x"), "the cleanup line must say why: {}", o.cleanup);
+        // Even with ancestry AGREEING, the branch still survives — `landed` is not the delete rule
+        // here, and a stranded merge that happened to prove ancestry must not be swept up by it.
+        let (out, _, deleted) = drive(Err(real_stranded_report()), true, true);
+        assert!(!deleted, "still stranded, still not deleted");
+        assert!(out.expect("landed").landed);
+    }
+
+    /// THE PAIR. Conflating these two directions would be worse than the bug it fixes: a merge
+    /// that never happened, recorded as landed, clears the row, empties the queue and deletes the
+    /// branch of a PR that is stuck on a conflict.
+    #[test]
+    fn a_genuine_merge_failure_still_errors_and_touches_nothing() {
+        for msg in [
+            "gh pr merge #2580 failed: Pull request is not mergeable: the merge commit cannot be cleanly created",
+            "knightwatch: 3 open fail-verdict findings on this branch",
+            "",
+        ] {
+            let (out, proved, deleted) = drive(Err(msg.to_string()), true, true);
+            assert_eq!(out.as_ref().err().map(String::as_str), Some(msg), "must stay an Err: {msg:?}");
+            // Nothing merged, so nothing may be proven and nothing may be deleted.
+            assert!(!proved && !deleted, "a refusal must not reach the post-merge half: {msg:?}");
+        }
+        // A message that merely QUOTES the report is not the report — the token has to lead.
+        let quoted = format!("gh pr merge #2580 failed; the previous run said: {}", real_stranded_report());
+        assert!(drive(Err(quoted), true, true).0.is_err(), "an embedded token is not a landed merge");
+    }
+
+    /// The `Ok(())` path is unchanged, and it is what pins that the stranded arm is a genuinely
+    /// separate state rather than "landed" being handed out to everything that is not an error.
+    #[test]
+    fn an_ordinary_merge_still_needs_ancestry_and_still_deletes_the_branch() {
+        let (out, _, deleted) = drive(Ok(()), true, true);
+        let o = out.expect("ok");
+        assert!(o.landed && o.stranded.is_none());
+        assert!(deleted, "an ordinary landed merge still cleans up");
+        assert!(o.cleanup.contains("deleted"), "{}", o.cleanup);
+
+        // Ancestry could not prove it: NOT landed, nothing deleted — the pre-existing rule.
+        let (out, _, deleted) = drive(Ok(()), true, false);
+        let o = out.expect("ok");
+        assert!(!o.landed, "an unproven merge is not landed");
+        assert!(!deleted && o.cleanup.contains("ancestry"), "{}", o.cleanup);
+
+        // Cleanup turned off: landed, nothing deleted.
+        let (out, _, deleted) = drive(Ok(()), false, true);
+        assert!(out.expect("ok").landed && !deleted);
     }
 }

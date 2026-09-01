@@ -2,15 +2,17 @@
 //
 // What the panel is allowed to OFFER, which is the only thing about it that can cause harm. The
 // rest of the render is prose; the Merge button is a merge.
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   INTEGRATION_HOLD_TESTID,
   INTEGRATION_ROW_TESTID,
+  INTEGRATION_STRANDED_TESTID,
   IntegrationAssistantPanel,
 } from "./IntegrationAssistantPanel";
 import { useIntegrationQueueStore } from "../stores/integrationQueueStore";
-import { readIntegrationStatus } from "../services/integrationAssistant";
+import { mergeBranch, readIntegrationStatus } from "../services/integrationAssistant";
+import { STRANDED_REPORT } from "../services/mergeGuard/mergedButStranded.fixture";
 import type {
   GateReport,
   IntegrationStatus,
@@ -26,6 +28,7 @@ vi.mock("../services/integrationAssistant", async (orig) => ({
   mergeBranch: vi.fn(),
 }));
 const statusMock = vi.mocked(readIntegrationStatus);
+const mergeMock = vi.mocked(mergeBranch);
 
 const STATUS: IntegrationStatus = {
   enabled: true,
@@ -76,6 +79,7 @@ function panel() {
 beforeEach(() => {
   statusMock.mockReset();
   statusMock.mockResolvedValue(STATUS);
+  mergeMock.mockReset();
   useIntegrationQueueStore.getState().reset();
 });
 afterEach(cleanup);
@@ -181,5 +185,57 @@ describe("IntegrationAssistantPanel", () => {
     statusMock.mockResolvedValue({ ...STATUS, prChecksAvailable: false });
     render(panel());
     await waitFor(() => expect(screen.getByText(/is not in this repo/)).toBeTruthy());
+  });
+
+  // ── the merge that LANDED but left work behind (roborev 72459) ────────────────────────────
+
+  /** Seed one ready head and render, so the Merge button is on screen. */
+  async function readyHead() {
+    seed({ base: "origin/main", order: [planned("first", 1)], warnings: [], unplannable: [] });
+    useIntegrationQueueStore.getState().setGate(gate("first", "ready", null));
+    render(panel());
+    return await waitFor(() => screen.getByRole("button", { name: /Merge #1/ }));
+  }
+
+  it("paints a MERGED-BUT-STRANDED merge as landed-with-a-warning, and takes it out of the queue", async () => {
+    // Rust returns this as a RESOLVED outcome now, not a rejection — the whole of roborev 72459.
+    mergeMock.mockResolvedValue({
+      branch: "first",
+      pr: 1,
+      landed: true,
+      refusal: null,
+      headSha: "cafe1234",
+      cleanup: "not run — the merge landed but left commits on first that it did not take",
+      stranded: STRANDED_REPORT,
+    });
+    fireEvent.click(await readyHead());
+
+    // THE OUTCOME THAT MATTERS: the entry has left the queue, so no second Merge is offered
+    // against a PR that is already merged. That is what `landed: false` used to prevent.
+    await waitFor(() => expect(screen.queryByRole("button", { name: /Merge #1/ })).toBeNull());
+    // ...and the queue is DONE rather than HELD: `nextActionable` finds no unlanded entry at all,
+    // so there is no "x is holding the line" note either. A landed:false fix would render one.
+    expect(screen.queryByTestId(INTEGRATION_HOLD_TESTID)).toBeNull();
+    // The row reads LANDED, and the report is beside it rather than lost.
+    expect(screen.getByText("landed")).toBeTruthy();
+    expect(screen.getByTestId(INTEGRATION_STRANDED_TESTID).textContent).toContain(
+      "MERGED-BUT-STRANDED",
+    );
+    // ...and NOT through the panel's error line, which is what a `setError` fix would look like
+    // while leaving the entry in the queue. `role=alert` is the panel's error slot.
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("...and the PAIR: a merge that genuinely FAILED still errors and stays in the queue", async () => {
+    // Conflating these would be worse than the bug — a PR stuck on a conflict would read as
+    // landed, clear its row and empty the queue.
+    mergeMock.mockRejectedValue("gh pr merge #1 failed: the merge commit cannot be cleanly created");
+    fireEvent.click(await readyHead());
+
+    await waitFor(() => expect(screen.getByRole("alert").textContent).toContain("cannot be cleanly created"));
+    // Still the head, still offered — nothing merged, so nothing left the queue.
+    expect(screen.getByRole("button", { name: /Merge #1/ })).toBeTruthy();
+    expect(screen.queryByTestId(INTEGRATION_STRANDED_TESTID)).toBeNull();
+    expect(screen.queryByText("landed")).toBeNull();
   });
 });

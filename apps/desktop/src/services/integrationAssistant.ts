@@ -109,6 +109,14 @@ export interface MergeOutcome {
   refusal?: MergeRefusal | null;
   headSha?: string | null;
   cleanup: string;
+  /** Rust's post-merge stranded-work report, when the merge produced one.
+   *
+   *  NON-NULL MEANS THE MERGE LANDED — it is not a failure. The PR is merged and the repository
+   *  moved, but commits that were on the pushed branch head are not in the merge commit, so
+   *  `landed` is true beside it and the remote branch is deliberately kept: it is the only thing
+   *  still holding them. Render it as a warning ON a landed row, never through an error channel
+   *  (roborev 72459) — the shape it takes is `mergeGuard/mergedButStranded.ts`'s report. */
+  stranded?: string | null;
 }
 
 export interface IntegrationStatus {

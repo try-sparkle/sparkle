@@ -8,6 +8,14 @@
 // the merge the ORDER existed to prevent, so the decision lives in `nextActionable` (pure, tested)
 // and this component only paints it.
 //
+// A MERGE THAT LANDED NEVER REACHES THE ERROR LINE. `integration_merge` has one outcome that is a
+// success carrying bad news: the PR merged, but commits on the pushed branch head were not in the
+// merge commit (`outcome.stranded`, Rust's `MERGED-BUT-STRANDED` report). It arrives as a RESOLVED
+// promise with `landed: true`, so the row paints as landed with the report beside it and the entry
+// leaves `nextActionable`'s queue. Routing it to `setError` — which is what happened while the Rust
+// side propagated it as a plain `Err` — left the entry offered for a second Merge click against an
+// already-merged PR (roborev 72459). The `.catch` below is for merges that did NOT happen.
+//
 // No emoji icons anywhere — react-icons/fi (Feather), per the founder's standing rule.
 import { useCallback, useEffect, useState, type CSSProperties } from "react";
 import {
@@ -37,6 +45,8 @@ import { useIntegrationQueueStore, warningsFor } from "../stores/integrationQueu
 export const INTEGRATION_PANEL_TESTID = "integration-assistant-panel";
 export const INTEGRATION_ROW_TESTID = "integration-queue-row";
 export const INTEGRATION_HOLD_TESTID = "integration-queue-hold";
+/** The landed-with-a-warning report. On a LANDED row — never in the panel's error line. */
+export const INTEGRATION_STRANDED_TESTID = "integration-queue-stranded";
 
 interface Props {
   root: string;
@@ -194,6 +204,11 @@ export function IntegrationAssistantPanel({ root, projectId, candidates, base = 
               <div>
                 <div style={{ color: C.dangerInk }}>{entry.outcome.refusal.reason}</div>
                 <div style={meta}>{entry.outcome.refusal.remedy}</div>
+              </div>
+            )}
+            {entry.outcome?.stranded != null && (
+              <div style={{ color: C.amberInk }} data-testid={INTEGRATION_STRANDED_TESTID}>
+                <FiAlertTriangle aria-hidden /> {entry.outcome.stranded}
               </div>
             )}
             {entry.outcome?.landed === true && <div style={meta}>{entry.outcome.cleanup}</div>}

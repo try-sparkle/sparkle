@@ -107,6 +107,7 @@ import {
   refusalLines,
   type KnightwatchOverrideFor,
 } from "../services/mergeGuard/knightwatch";
+import { isMergedButStrandedReport } from "../services/mergeGuard/mergedButStranded";
 import {
   dismissPr,
   dismissedNumbers,
@@ -1443,6 +1444,27 @@ export function OpenPrMenu({
         merged.push(prKey);
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
+        // THE ONE THROW THAT IS NOT A FAILED MERGE (roborev 72228, bead sparkle-a08oi0). Rust's
+        // post-merge landing gate runs after `gh pr merge` has already succeeded and reports a merge
+        // that took an older head than the branch held. The PR IS merged — so this row belongs in
+        // `merged` exactly as the success path does, and everything keyed on that has to happen:
+        // the probe refusal recorded for it is now history, and leaving it in the ledger keeps a
+        // merged row offering "Override probes…" for a merge that already went through.
+        //
+        // THE REPORT IS STILL SHOWN, because it is the whole point — `gh` exited 0 and nothing else
+        // will ever say that commits were left behind. It goes through the same `firstError` slot
+        // (its own first clause says the merge SUCCEEDED and must not be retried, so it reads
+        // correctly there) rather than being swallowed by the success path.
+        if (isMergedButStrandedReport(msg)) {
+          log.warn(
+            "open-pr-menu",
+            `merge LANDED but stranded work for ${scope.projectName} PR #${n}`,
+            msg,
+          );
+          merged.push(prKey);
+          if (!firstError) firstError = `${scope.projectName} PR #${n}: ${msg}`;
+          continue;
+        }
         log.warn(
           "open-pr-menu",
           `merge failed for ${scope.projectName} PR #${n}`,
