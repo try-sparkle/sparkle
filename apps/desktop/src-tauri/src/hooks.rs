@@ -1016,6 +1016,551 @@ fn plugins_needing_install<'a>(
         .collect()
 }
 
+// ── Repairing third-party plugin hook commands (bead sparkle-iuzz5y) ──────────────────────────
+//
+// THE BUG. Claude Code runs every hook `command` string through `/bin/sh -c`. A Sparkle agent's
+// `CLAUDE_CONFIG_DIR` — and therefore `CLAUDE_PLUGIN_ROOT`, which Claude Code derives from it —
+// resolves under `~/Library/Application Support/ai.sparkle.desktop/accounts/<id>/plugins/cache/…`,
+// which CONTAINS A SPACE. `double-shot-latte@superpowers-marketplace` v1.2.0 — which Sparkle
+// itself ships `default_on: true` (`config::KNOWN_PLUGINS`, toggle `double_shot_latte`) —
+// registers its Stop hook as:
+//
+//     ${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.cmd claude-judge-continuation
+//
+// Unquoted, `sh` word-splits at that space and execs the DIRECTORY `…/Library/Application`,
+// producing `/bin/sh: …/Library/Application: is a directory`. Stop hooks are non-blocking, so this
+// fires on EVERY turn of EVERY Sparkle agent and fails SILENTLY: the plugin's turn-boundary work
+// has never once run under Sparkle. Its sibling `superpowers` quotes the identical variable
+// correctly (`"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.cmd" session-start`), so this is upstream
+// inconsistency, not a missing convention — which is exactly why a local repair is the right
+// remedy: we cannot wait on a third party to be consistent, and the file is on our disk.
+//
+// INVARIANTS OF THIS PASS, and WHY each one is non-negotiable (these files are NOT ours):
+//
+//   * IT MAY ONLY ADD QUOTES. Every rewrite is expressible as "wrap this one word in double
+//     quotes" — same program, same argument order, same argument count. A word whose repair would
+//     need anything more (it already carries quotes, a backslash, a backtick, a glob, a `$(…)`, a
+//     leading `~`) is SKIPPED and warn-logged rather than guessed at, because changing which
+//     program a third-party plugin runs is a strictly worse failure than the one we are fixing.
+//   * IT IS IDEMPOTENT. A repaired word begins with `"`, so its expansion is inside a quoted span
+//     on the next pass and classifies Safe. That matters because this runs on EVERY launch: a
+//     plugin UPDATE that reintroduces the defect gets repaired again, and a launch that changes
+//     nothing writes nothing.
+//   * IT IS FAIL-SOFT, NEVER FATAL. Unreadable, unparseable, or read-only `hooks.json` is
+//     `tracing::warn!`ed and skipped. A best-effort repair that sometimes declines is better than
+//     a hook that silently never runs — and blocking agent startup over a third party's JSON would
+//     trade a degraded feature for a dead app.
+//   * IT WRITES ONLY WHEN SOMETHING CHANGED, round-tripping the parsed document (`serde_json` is
+//     built here with `preserve_order`, so key order survives) so an unrelated file is never
+//     reformatted and no plugin but the offending one is touched at all.
+//   * IT DOES DIRTY A GIT CHECKOUT WHEN THE INSTALL HAPPENS TO BE ONE, and that is a real cost,
+//     not a thing this comment gets to wish away. Measured on this machine: 17 of 104 installed
+//     plugin directories under `plugins/cache/` contain a `.git`, and in those the repaired
+//     `hooks/hooks.json` is a TRACKED file — so a repair leaves a modified tracked file in a
+//     checkout Sparkle does not own. It varies per account, so neither "installs are git
+//     checkouts" nor "installs are inert payload" is a safe assumption to code against.
+//
+//     ACCEPTED, on these terms. The pass is idempotent and re-runs every launch, so a
+//     `claude plugin update` that DISCARDS the repair simply gets it re-applied next launch. The
+//     residual risk is the other branch — an update that REFUSES over local changes — which would
+//     need the user to reset that checkout. That is judged the better trade against the
+//     alternative, which is a Stop hook that silently never runs for the life of the install. If
+//     that trade ever stops being worth it, the lever is `KNOWN_PLUGINS`, not this pass.
+//   * IT JOURNALS EVERY WRITE at `info` with the file and the before/after command, because this
+//     modifies files Sparkle does not own and a human must be able to see exactly what was touched.
+
+/// One whitespace/operator-delimited word of a `/bin/sh -c` command line, as byte offsets into the
+/// original string, plus whether it sits in COMMAND POSITION (first word of the line or of a new
+/// command after `;`, `&&`, `||`, `|`, `&`, `(`, `)` or a newline).
+///
+/// Offsets rather than owned strings so [`repair_hook_command`] can splice quotes back into the
+/// original text — the whole point is that everything we do not touch survives byte-for-byte.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ShellWord {
+    start: usize,
+    end: usize,
+    command_position: bool,
+}
+
+/// Split a command line into [`ShellWord`]s, honouring quoting well enough that a quoted space is
+/// not a word boundary.
+///
+/// This is deliberately NOT a shell parser. It only has to answer two questions — where does each
+/// word begin and end, and is this word a command name — and it has to be WRONG IN THE SAFE
+/// DIRECTION when it is wrong, because everything downstream refuses to rewrite anything it does
+/// not fully understand. Redirections (`<`, `>`) end a word but do NOT start a command, so a
+/// redirection target is judged by the path rule alone.
+fn split_shell_words(cmd: &str) -> Vec<ShellWord> {
+    let b = cmd.as_bytes();
+    let mut out: Vec<ShellWord> = Vec::new();
+    let mut i = 0usize;
+    let mut start: Option<usize> = None;
+    let mut command_position = true;
+    while i < b.len() {
+        match b[i] {
+            q @ (b'\'' | b'"') => {
+                start.get_or_insert(i);
+                i += 1;
+                while i < b.len() && b[i] != q {
+                    // Inside double quotes a backslash escapes the next byte; inside single quotes
+                    // nothing does. An UNTERMINATED quote simply runs to end-of-string, which makes
+                    // the word span the rest of the line — safe, because a word containing a quote
+                    // is never rewritten anyway.
+                    if q == b'"' && b[i] == b'\\' && i + 1 < b.len() {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                if i < b.len() {
+                    i += 1;
+                }
+            }
+            b'\\' => {
+                start.get_or_insert(i);
+                i += if i + 1 < b.len() { 2 } else { 1 };
+            }
+            b' ' | b'\t' | b'\r' => {
+                if let Some(s) = start.take() {
+                    out.push(ShellWord { start: s, end: i, command_position });
+                    command_position = false;
+                }
+                i += 1;
+            }
+            b';' | b'&' | b'|' | b'(' | b')' | b'\n' => {
+                if let Some(s) = start.take() {
+                    out.push(ShellWord { start: s, end: i, command_position });
+                }
+                command_position = true;
+                i += 1;
+            }
+            b'<' | b'>' => {
+                if let Some(s) = start.take() {
+                    out.push(ShellWord { start: s, end: i, command_position });
+                    command_position = false;
+                }
+                i += 1;
+            }
+            _ => {
+                start.get_or_insert(i);
+                i += 1;
+            }
+        }
+    }
+    if let Some(s) = start {
+        out.push(ShellWord { start: s, end: b.len(), command_position });
+    }
+    out
+}
+
+/// What [`classify_shell_word`] concluded about one word.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HookWordVerdict {
+    /// No unquoted expansion used as a path or as the command itself. Leave it alone.
+    Safe,
+    /// Offends, and wrapping the WHOLE word in double quotes is an exact, quotes-only repair.
+    NeedsQuotes,
+    /// Offends, but a whole-word wrap would change more than quoting. Skipped and logged — see the
+    /// "may only add quotes" invariant above.
+    Unrepairable,
+}
+
+/// Does this word open with a `NAME=` assignment prefix?
+///
+/// It matters because such a word sits in command position while not BEING a command: wrapping
+/// `FOO=$BAR` in double quotes would turn an assignment into an attempt to execute a program
+/// literally named `FOO=…`. It is also already safe — POSIX does not word-split the right-hand
+/// side of an assignment — so the correct handling is to leave it entirely alone.
+fn is_assignment_prefix(word: &str) -> bool {
+    let b = word.as_bytes();
+    if b.is_empty() || !(b[0].is_ascii_alphabetic() || b[0] == b'_') {
+        return false;
+    }
+    for (i, c) in b.iter().enumerate().skip(1) {
+        if *c == b'=' {
+            return true;
+        }
+        if !(c.is_ascii_alphanumeric() || *c == b'_') {
+            return false;
+        }
+        let _ = i;
+    }
+    false
+}
+
+/// Parse a `$NAME` / `${NAME…}` expansion starting at `b[i] == b'$'`.
+///
+/// Returns `(name_len, end)` where `end` is the offset just past the expansion. `name_len == 0`
+/// means this `$` did not introduce a NAME expansion at all (`$1`, `$@`, `$?`, `$$`, `$(`, a bare
+/// trailing `$`) — the detection contract is about VARIABLES used as paths, so those are not our
+/// business. `${VAR:?}` / `${VAR:-x}` are handled by taking the LEADING identifier as the name and
+/// the matching `}` as the end.
+///
+/// `None` means the expansion is malformed (`${` with no closing brace), which the caller treats as
+/// "do not touch this word".
+fn parse_expansion(b: &[u8], i: usize) -> Option<(usize, usize)> {
+    debug_assert_eq!(b[i], b'$');
+    if b.get(i + 1) == Some(&b'{') {
+        let mut j = i + 2;
+        while j < b.len() && b[j] != b'}' {
+            j += 1;
+        }
+        if j >= b.len() {
+            return None; // unterminated `${` — malformed, hands off
+        }
+        let mut n = i + 2;
+        while n < j && (b[n].is_ascii_alphanumeric() || b[n] == b'_') {
+            n += 1;
+        }
+        // The first character of a NAME may not be a digit; `${1}` and `${#a}` are positional or
+        // special, not the variable-as-path shape this pass repairs.
+        let name_len = if b[i + 2].is_ascii_digit() { 0 } else { n - (i + 2) };
+        Some((name_len, j + 1))
+    } else {
+        let mut n = i + 1;
+        if n < b.len() && (b[n].is_ascii_alphabetic() || b[n] == b'_') {
+            n += 1;
+            while n < b.len() && (b[n].is_ascii_alphanumeric() || b[n] == b'_') {
+                n += 1;
+            }
+            Some((n - (i + 1), n))
+        } else {
+            Some((0, i + 1))
+        }
+    }
+}
+
+/// THE DETECTION CONTRACT, applied to one word.
+///
+/// A hook command is UNSAFE when a variable expansion used as a PATH is neither double- nor
+/// single-quoted. Concretely: with every quoted span removed, the remainder still holds a `$NAME`
+/// or `${NAME}` expansion that is either (a) in command position, or (b) immediately followed by
+/// `/` (used as a path prefix). `echo $HOME` is neither, and stays untouched — a bare expansion in
+/// argument position is the caller's business, not a path we broke.
+///
+/// The `Unrepairable` verdict carries the "only add quotes" invariant. Anything in the word whose
+/// meaning a surrounding pair of double quotes would ALTER — an existing quote, a backslash, a
+/// backtick, a glob metacharacter, a `$(…)` substitution, a leading `~` — disqualifies the
+/// whole-word wrap, because the alternative is inventing a rewrite for a third party's command
+/// line.
+fn classify_shell_word(word: &str, command_position: bool) -> HookWordVerdict {
+    let b = word.as_bytes();
+    if b.is_empty() || is_assignment_prefix(word) {
+        return HookWordVerdict::Safe;
+    }
+    let mut offends = false;
+    // `blocked` is only consulted when the word offends: `bash '${X}/y.sh'` is full of quotes and
+    // perfectly safe, and must be reported Safe rather than as something we declined to fix.
+    let mut blocked = b[0] == b'~'; // quoting would kill tilde expansion
+    let mut i = 0usize;
+    while i < b.len() {
+        match b[i] {
+            b'\'' => {
+                blocked = true;
+                i += 1;
+                while i < b.len() && b[i] != b'\'' {
+                    i += 1;
+                }
+                i = (i + 1).min(b.len());
+            }
+            b'"' => {
+                blocked = true;
+                i += 1;
+                while i < b.len() && b[i] != b'"' {
+                    if b[i] == b'\\' && i + 1 < b.len() {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                i = (i + 1).min(b.len());
+            }
+            // A backslash or backtick means the word already carries its own escaping/substitution;
+            // a glob means quoting would change WHICH files it names.
+            b'\\' | b'`' | b'*' | b'?' | b'[' | b']' => {
+                blocked = true;
+                i += 1;
+            }
+            b'$' => match parse_expansion(b, i) {
+                None => {
+                    blocked = true;
+                    i += 1;
+                }
+                Some((0, end)) => {
+                    if b.get(i + 1) == Some(&b'(') {
+                        // `$(…)` — a command substitution, whose output a whole-word wrap would
+                        // stop word-splitting. Different program, potentially.
+                        blocked = true;
+                    }
+                    i = end.max(i + 1);
+                }
+                Some((_, end)) => {
+                    if command_position || b.get(end) == Some(&b'/') {
+                        offends = true;
+                    }
+                    // A `${…}` body carrying a nested substitution is beyond what a wrap preserves.
+                    if word[i..end].contains("$(") || word[i..end].contains('`') {
+                        blocked = true;
+                    }
+                    i = end;
+                }
+            },
+            _ => i += 1,
+        }
+    }
+    match (offends, blocked) {
+        (false, _) => HookWordVerdict::Safe,
+        (true, true) => HookWordVerdict::Unrepairable,
+        (true, false) => HookWordVerdict::NeedsQuotes,
+    }
+}
+
+/// Quote every unquoted path expansion in one hook `command` string, or `None` when there was
+/// nothing to fix (which is the case for every well-formed command on this machine today — the
+/// sweep that motivated this found exactly ONE distinct offending command across all ten account
+/// config dirs and every hook event, so the repair must be a no-op on everything else).
+///
+/// `Some` is returned ONLY when the output differs from the input, so the caller can use it
+/// directly as "does this file need a write".
+fn repair_hook_command(cmd: &str) -> Option<String> {
+    // THIS RULE IS DELIBERATELY NARROWER THAN `scripts/hook-command-quoting-check.sh`, AND THE GAP
+    // IS NOT A BUG TO CLOSE. That script REPORTS; this function WRITES, into files Sparkle does not
+    // own. So the guard flags every expansion that survives quote-stripping (over-reporting costs a
+    // reader one glance), while this pass repairs only what it can express as wrapping ONE WHOLE
+    // WORD in double quotes and refuses everything else (over-writing costs a stranger a corrupted
+    // hook). A future reader who notices the two disagreeing should leave them disagreeing.
+    //
+    // A COMMAND SUBSTITUTION IS REFUSED WHOLE, and it has to be refused HERE rather than per-word.
+    // `split_shell_words` treats `(` and `)` as word terminators, so a `$(` can never survive
+    // inside a single word and the `$(`-guard in `classify_shell_word` is unreachable from this
+    // path. Left to the per-word rule, `${CLAUDE_PLUGIN_ROOT}/hooks/$(uname).sh` splits into the
+    // word `${CLAUDE_PLUGIN_ROOT}/hooks/$` — command position, expansion followed by `/`, nothing
+    // marking it blocked — which classifies `NeedsQuotes` and is rewritten to
+    // `"${CLAUDE_PLUGIN_ROOT}/hooks/$"(uname).sh`: a shell SYNTAX ERROR.
+    //
+    // That is strictly worse than the bug being fixed. Word splitting still ran the wrong program;
+    // a parse error runs nothing at all, and it is NOT self-healing — the corrupted form contains
+    // no unquoted expansion, so it classifies `Safe` and every later pass leaves it broken. A
+    // backtick is the same hazard in the older spelling. Refusing keeps the invariant this pass
+    // rests on: it may only ever ADD quotes, and may never change what the command means.
+    if cmd.contains("$(") || cmd.contains('`') {
+        tracing::warn!(
+            command = %cmd,
+            "plugin hook repair: command substitution cannot be repaired by quoting; refused"
+        );
+        return None;
+    }
+    let mut edits: Vec<(usize, usize)> = Vec::new();
+    for w in split_shell_words(cmd) {
+        let word = &cmd[w.start..w.end];
+        match classify_shell_word(word, w.command_position) {
+            HookWordVerdict::NeedsQuotes => edits.push((w.start, w.end)),
+            HookWordVerdict::Unrepairable => tracing::warn!(
+                word = %word,
+                command = %cmd,
+                "plugin hook repair: unquoted path expansion needs more than quoting; skipped"
+            ),
+            HookWordVerdict::Safe => {}
+        }
+    }
+    if edits.is_empty() {
+        return None;
+    }
+    let mut out = cmd.to_string();
+    // Back to front, so an earlier edit's offsets stay valid.
+    for (s, e) in edits.into_iter().rev() {
+        out.insert(e, '"');
+        out.insert(s, '"');
+    }
+    Some(out)
+}
+
+/// Walk a parsed `hooks.json` and repair every command it holds, collecting `(before, after)` for
+/// the journal. Returns nothing; the collected pairs ARE the record of what changed.
+///
+/// Shape-agnostic BY DESIGN. Plugins in the wild ship both `{"hooks": {<event>: […]}}` and a bare
+/// top-level object keyed by event, and Claude Code accepts either — so keying on the shape would
+/// mean silently skipping half the population the first time a plugin picks the other one. Instead
+/// this recurses and repairs any object that is EXACTLY a hook entry: `"type": "command"` with a
+/// string `"command"`. A `"type": "prompt"` entry has no `command` and cannot match, so it is left
+/// byte-for-byte alone, and so is every other key in the document.
+fn repair_hooks_document(node: &mut Value, out: &mut Vec<(String, String)>) {
+    match node {
+        Value::Object(map) => {
+            if map.get("type").and_then(Value::as_str) == Some("command") {
+                let repaired = match map.get("command") {
+                    Some(Value::String(cmd)) => {
+                        repair_hook_command(cmd).map(|fixed| (cmd.clone(), fixed))
+                    }
+                    _ => None,
+                };
+                if let Some((before, after)) = repaired {
+                    map.insert("command".into(), Value::String(after.clone()));
+                    out.push((before, after));
+                }
+            }
+            for (_k, v) in map.iter_mut() {
+                repair_hooks_document(v, out);
+            }
+        }
+        Value::Array(items) => {
+            for v in items {
+                repair_hooks_document(v, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Repair one plugin `hooks.json` in place. `true` means the file was rewritten.
+///
+/// Every failure path here is a warn-and-skip, not an error return: see the fail-soft invariant.
+/// Note the file is only OPENED FOR WRITING once a change is already computed, so an unparseable
+/// document can never be truncated by this pass.
+fn repair_plugin_hooks_file(path: &Path) -> bool {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(
+                file = %path.display(), error = %e,
+                "plugin hook repair: unreadable; skipped"
+            );
+            return false;
+        }
+    };
+    let mut doc: Value = match serde_json::from_str(&text) {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::warn!(
+                file = %path.display(), error = %e,
+                "plugin hook repair: unparseable; skipped"
+            );
+            return false;
+        }
+    };
+    let mut changes: Vec<(String, String)> = Vec::new();
+    repair_hooks_document(&mut doc, &mut changes);
+    if changes.is_empty() {
+        return false;
+    }
+    let mut rendered = match serde_json::to_string_pretty(&doc) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(
+                file = %path.display(), error = %e,
+                "plugin hook repair: re-serialize failed; skipped"
+            );
+            return false;
+        }
+    };
+    // Match the file's own trailing-newline convention rather than imposing one.
+    if text.ends_with('\n') {
+        rendered.push('\n');
+    }
+    // ATOMIC, via a temp file in the SAME directory then a rename. `std::fs::write` truncates
+    // before it writes, and this pass runs at launch and at every agent prepare — i.e. immediately
+    // around the moment a `claude` child is starting up and reading exactly this file. A reader
+    // that lands inside that window gets a truncated document, which parses as invalid JSON and
+    // costs the plugin ALL of its hooks, not just the one being repaired. `rename` within a
+    // directory is atomic on both unix and Windows-with-replace, so a concurrent reader sees
+    // either the old file or the new one and never a half-written one.
+    let tmp = path.with_extension(format!("json.sparkle-repair-{}", std::process::id()));
+    if let Err(e) = std::fs::write(&tmp, &rendered) {
+        tracing::warn!(
+            file = %path.display(), temp = %tmp.display(), error = %e,
+            "plugin hook repair: could not stage the repaired file; skipped"
+        );
+        let _ = std::fs::remove_file(&tmp);
+        return false;
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        tracing::warn!(
+            file = %path.display(), error = %e,
+            "plugin hook repair: not writable; skipped"
+        );
+        let _ = std::fs::remove_file(&tmp);
+        return false;
+    }
+    for (before, after) in changes {
+        tracing::info!(
+            file = %path.display(),
+            before = %before,
+            after = %after,
+            "plugin hook repair: quoted an unquoted path expansion"
+        );
+    }
+    true
+}
+
+/// How deep under `<plugins root>/cache` to look for a `hooks.json`. The installed layout —
+/// `cache/<marketplace>/<plugin>/<version>/hooks/hooks.json` — sits at depth 5, so 8 is slack
+/// without turning a launch-time pass into an unbounded filesystem walk.
+const PLUGIN_HOOKS_SCAN_DEPTH: usize = 8;
+
+/// The ONLY subtree this pass will write to: Claude Code's installed-plugin payload.
+///
+/// THE WALK IS DELIBERATELY NOT THE WHOLE PLUGINS ROOT, and the reason is REACH, not git.
+/// `CLAUDE_PLUGIN_ROOT` points at the installed copy under `cache/`, so that is the copy whose
+/// hooks actually execute — including the `double-shot-latte` Stop hook this pass exists for. The
+/// sibling `marketplaces/<marketplace>/` holds the SOURCE clones, whose `hooks.json` is never the
+/// file Claude Code runs, so repairing one fixes nothing.
+///
+/// That distinction is worth having on its own, because writing where it cannot help is pure cost:
+/// every `marketplaces/` tree on this machine (129 of them across the account dirs) IS a git
+/// checkout, so a write there leaves a modified tracked file in somebody else's clone and buys
+/// nothing at all.
+///
+/// BUT DO NOT READ THIS AS "`cache/` IS GIT-FREE" — it is not, and an earlier version of this
+/// comment claimed otherwise. 17 of 104 installed plugin directories here contain a `.git` with
+/// `hooks/hooks.json` tracked, and which ones do varies BY ACCOUNT (the same plugin is a plain
+/// payload in one account tree and a checkout in another). Repairing the executing copy therefore
+/// does sometimes dirty a git checkout; see the module comment above for why that cost is accepted
+/// rather than avoided. The narrowing removes the writes that could never help, not the exposure.
+const PLUGIN_INSTALL_SUBDIR: &str = "cache";
+
+/// Every `hooks.json` under a plugins root, bounded by [`PLUGIN_HOOKS_SCAN_DEPTH`].
+fn collect_plugin_hooks_files(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+    if depth == 0 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let path = entry.path();
+        if path.is_dir() {
+            // `temp_git_<n>` is `claude plugin install`'s staging clone — rewriting a tree that is
+            // about to be moved into place (or deleted) is pure risk for no benefit, and the moved
+            // copy is repaired on the next pass anyway. `.git` and `node_modules` hold no hooks.
+            if name.starts_with("temp_git_") || name == ".git" || name == "node_modules" {
+                continue;
+            }
+            collect_plugin_hooks_files(&path, depth - 1, out);
+        } else if name == "hooks.json" {
+            out.push(path);
+        }
+    }
+}
+
+/// Repair every installed plugin's hook commands under one Claude Code config tree. Returns how
+/// many files were rewritten.
+///
+/// Resolves the root through [`claude_plugins_dir`] rather than hardcoding `~/.claude/plugins`,
+/// because Sparkle sets `CLAUDE_CONFIG_DIR` per account and the offending path is precisely a
+/// per-account one — a hardcoded home tree would repair the one tree that never had the bug.
+fn repair_installed_plugin_hooks(config_dir: Option<&Path>, home: &Path) -> usize {
+    // Scoped to the installed payload only — see `PLUGIN_INSTALL_SUBDIR` for why the sibling
+    // `marketplaces/` source checkouts are deliberately out of reach.
+    let root = claude_plugins_dir(config_dir, home).join(PLUGIN_INSTALL_SUBDIR);
+    if !root.is_dir() {
+        return 0;
+    }
+    let mut files: Vec<PathBuf> = Vec::new();
+    collect_plugin_hooks_files(&root, PLUGIN_HOOKS_SCAN_DEPTH, &mut files);
+    files.sort();
+    files.iter().filter(|f| repair_plugin_hooks_file(f)).count()
+}
+
 /// Wall-clock ceiling for one `claude plugin …` shell-out. These touch the NETWORK (a marketplace
 /// fetch, a git clone of the plugin repo), and they run on a Tauri blocking-pool thread inside a
 /// sequential loop — so without a deadline a single hung child pins that thread and stalls every
@@ -1426,6 +1971,18 @@ fn ensure_plugins_installed(
             &mut |args| run_claude(&claude, tree.as_deref(), args),
         );
         merge_outcomes(&mut merged, outcomes);
+        // AFTER the install pass for this tree, so a plugin that just landed is repaired on the
+        // same launch rather than running broken until the next one. Best-effort and never fatal:
+        // see the repair pass's invariants above.
+        if let Some(home_dir_for_tree) = home.as_deref() {
+            let fixed = repair_installed_plugin_hooks(tree.as_deref(), home_dir_for_tree);
+            if fixed > 0 {
+                tracing::info!(
+                    files = fixed,
+                    "plugin hook repair: rewrote unquoted path expansions"
+                );
+            }
+        }
     }
     remember_outcomes(&merged);
     merged
@@ -2271,6 +2828,462 @@ pub fn read_events_since_impl(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Plugin hook command quoting repair (bead sparkle-iuzz5y) ──────────────────────────────
+    //
+    // The defect these guard is a SILENT one: a Stop hook that dies `is a directory` on every turn
+    // and is never surfaced, so a green build proves nothing here. `runs_the_repaired_command_but_
+    // not_the_broken_one_through_real_sh` is the load-bearing one — it executes both strings
+    // through `/bin/sh -c` against a real path containing a space, so the repair is proved to be
+    // functional rather than cosmetic.
+
+    /// The exact Stop hook `double-shot-latte@superpowers-marketplace` v1.2.0 ships.
+    const LATTE_BROKEN: &str = "${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.cmd claude-judge-continuation";
+    const LATTE_FIXED: &str =
+        "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.cmd\" claude-judge-continuation";
+
+    #[test]
+    fn quotes_the_command_word_of_the_shipped_double_shot_latte_stop_hook() {
+        assert_eq!(repair_hook_command(LATTE_BROKEN).as_deref(), Some(LATTE_FIXED));
+    }
+
+    #[test]
+    fn quotes_an_unquoted_path_expansion_in_argument_position() {
+        assert_eq!(
+            repair_hook_command("bash $CLAUDE_PLUGIN_ROOT/hooks/x.sh").as_deref(),
+            Some("bash \"$CLAUDE_PLUGIN_ROOT/hooks/x.sh\"")
+        );
+    }
+
+    #[test]
+    fn leaves_every_well_formed_command_untouched() {
+        // The sweep that motivated this pass found exactly ONE offending command across all ten
+        // account config dirs; a repair that is not a no-op on the rest would be a regression in
+        // files Sparkle does not own.
+        for safe in [
+            "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.cmd\" session-start",
+            "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/stop.py\"",
+            "bash '${CLAUDE_PLUGIN_ROOT}/x.sh'",
+            "cd \"${CLAUDE_PROJECT_DIR:?}\" && exec bash scripts/foo.sh",
+            "echo $HOME",
+            "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/staleness-check.sh\"",
+        ] {
+            assert_eq!(repair_hook_command(safe), None, "must not rewrite: {safe}");
+        }
+    }
+
+    #[test]
+    fn handles_the_colon_forms_of_a_brace_expansion() {
+        // `${VAR:?}` / `${VAR:-x}`: the NAME is the leading identifier, and the `?` inside the
+        // braces must not read as a glob metacharacter that blocks the repair.
+        assert_eq!(
+            repair_hook_command("${CLAUDE_PLUGIN_ROOT:?}/hooks/x.sh").as_deref(),
+            Some("\"${CLAUDE_PLUGIN_ROOT:?}/hooks/x.sh\"")
+        );
+        assert_eq!(
+            repair_hook_command("bash ${CLAUDE_PLUGIN_ROOT:-/tmp}/hooks/x.sh").as_deref(),
+            Some("bash \"${CLAUDE_PLUGIN_ROOT:-/tmp}/hooks/x.sh\"")
+        );
+    }
+
+    #[test]
+    fn repairing_an_already_repaired_command_changes_nothing() {
+        // This pass re-runs on EVERY launch, so a second pass that kept adding quotes would
+        // corrode a third party's file a little more each time the app started.
+        assert_eq!(repair_hook_command(LATTE_FIXED), None);
+        let once = repair_hook_command(LATTE_BROKEN).unwrap();
+        assert_eq!(repair_hook_command(&once), None, "second pass must be a no-op");
+    }
+
+    #[test]
+    fn skips_a_word_whose_repair_would_be_more_than_quoting() {
+        // Each of these offends the detection contract, and for each of them wrapping the whole
+        // word in double quotes would change what runs — so the pass declines rather than guesses.
+        for unfixable in [
+            "$CLAUDE_PLUGIN_ROOT/hooks/*.sh",             // quoting would kill the glob
+            "$CLAUDE_PLUGIN_ROOT/hooks/`uname`.sh",       // already substituting
+            "$CLAUDE_PLUGIN_ROOT/my\\ dir/x.sh",          // already escaping
+            "$CLAUDE_PLUGIN_ROOT/\"hooks\"/x.sh",         // already partly quoted
+            "~$CLAUDE_PLUGIN_ROOT/x.sh",                  // quoting would kill tilde expansion
+            "$(dirname $0)/x.sh",                         // command substitution
+        ] {
+            assert_eq!(repair_hook_command(unfixable), None, "must skip, not guess: {unfixable}");
+        }
+    }
+
+    /// A COMMAND SUBSTITUTION IS REFUSED WHOLE, and this covers the shape the per-word guard
+    /// structurally CANNOT see. `split_shell_words` terminates a word at `(`, so in
+    /// `${CLAUDE_PLUGIN_ROOT}/hooks/$(uname).sh` the first word is `${CLAUDE_PLUGIN_ROOT}/hooks/$`
+    /// — a trailing bare `$` with nothing after it to mark the word blocked — which the per-word
+    /// rule classifies `NeedsQuotes`. The sibling test above passes for `$(dirname $0)/x.sh` only
+    /// INCIDENTALLY (splitting at `(` leaves no offending word at all), so it would stay green
+    /// with the guard deleted. This one would not.
+    #[test]
+    fn a_command_substitution_is_refused_rather_than_corrupted() {
+        for unfixable in [
+            "${CLAUDE_PLUGIN_ROOT}/hooks/$(uname).sh",
+            "${CLAUDE_PLUGIN_ROOT}/hooks/run.sh $(id -u)",
+            "${CLAUDE_PLUGIN_ROOT}/hooks/`uname`.sh",
+        ] {
+            assert_eq!(
+                repair_hook_command(unfixable),
+                None,
+                "a command substitution must be refused, not rewritten: {unfixable}"
+            );
+        }
+    }
+
+    /// WHY REFUSING BEATS REPAIRING HERE, proved against a real `/bin/sh` rather than asserted.
+    /// The rewrite the per-word rule would have produced is not merely imperfect: it is a SYNTAX
+    /// ERROR, which runs nothing at all, where the unrepaired command at least ran something. And
+    /// it is not self-healing — the corrupted form holds no unquoted expansion, so a later pass
+    /// classifies it `Safe` and leaves it broken forever.
+    #[cfg(unix)]
+    #[test]
+    fn the_rewrite_this_refusal_avoids_would_be_a_shell_syntax_error() {
+        let naive = "\"${CLAUDE_PLUGIN_ROOT}/hooks/$\"(uname).sh";
+        let out = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(naive)
+            .env("CLAUDE_PLUGIN_ROOT", "/tmp")
+            .output()
+            .expect("/bin/sh runs");
+        assert!(!out.status.success(), "the naive rewrite must not run: {naive}");
+        let err = String::from_utf8_lossy(&out.stderr).to_lowercase();
+        assert!(
+            err.contains("syntax error"),
+            "the naive rewrite is a PARSE failure, not a run failure: {err}"
+        );
+        // And the corrupted form would then be treated as safe forever — the reason this must be
+        // prevented up front rather than repaired on a later pass.
+        assert_eq!(repair_hook_command(naive), None, "the corrupted form looks 'safe' afterwards");
+    }
+
+    #[test]
+    fn an_assignment_prefix_is_never_turned_into_a_command() {
+        // `FOO=$BAR cmd` sits in command position without BEING a command; wrapping it would try to
+        // exec a program literally named `FOO=…`. It is also already safe — POSIX does not
+        // word-split an assignment's right-hand side.
+        assert_eq!(repair_hook_command("ROOT=$CLAUDE_PLUGIN_ROOT/hooks bash x.sh"), None);
+    }
+
+    /// Every `command` and every `prompt` string anywhere in a parsed hooks document, so the
+    /// assertions read the VALUES rather than the JSON-escaped text around them.
+    fn collect_entry_fields(node: &Value, commands: &mut Vec<String>, prompts: &mut Vec<String>) {
+        match node {
+            Value::Object(map) => {
+                if let Some(Value::String(c)) = map.get("command") {
+                    commands.push(c.clone());
+                }
+                if let Some(Value::String(p)) = map.get("prompt") {
+                    prompts.push(p.clone());
+                }
+                for (_k, v) in map {
+                    collect_entry_fields(v, commands, prompts);
+                }
+            }
+            Value::Array(items) => {
+                for v in items {
+                    collect_entry_fields(v, commands, prompts);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// A plugin `hooks.json` in the `{"hooks": {<event>: …}}` shape, with a sibling key and a
+    /// `prompt` entry that must both survive verbatim.
+    fn wrapped_hooks_doc() -> String {
+        serde_json::to_string_pretty(&json!({
+            "hooks": {
+                "Stop": [{
+                    "matcher": "*",
+                    "hooks": [
+                        { "type": "command", "command": LATTE_BROKEN, "async": false },
+                        { "type": "prompt", "prompt": "${CLAUDE_PLUGIN_ROOT}/nope keep me" }
+                    ]
+                }]
+            },
+            "description": "left alone"
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn repairs_both_document_shapes_and_leaves_prompt_entries_alone() {
+        for text in [
+            wrapped_hooks_doc(),
+            // The BARE shape: top level keyed directly by event.
+            serde_json::to_string_pretty(&json!({
+                "SessionStart": [{
+                    "hooks": [
+                        { "type": "command", "command": LATTE_BROKEN },
+                        { "type": "prompt", "prompt": "${CLAUDE_PLUGIN_ROOT}/nope keep me" }
+                    ]
+                }]
+            }))
+            .unwrap(),
+        ] {
+            let mut doc: Value = serde_json::from_str(&text).unwrap();
+            let mut changes = Vec::new();
+            repair_hooks_document(&mut doc, &mut changes);
+            assert_eq!(changes.len(), 1, "exactly the one command entry: {changes:?}");
+            assert_eq!(changes[0], (LATTE_BROKEN.to_string(), LATTE_FIXED.to_string()));
+            // Assert on the PARSED document: `LATTE_FIXED` contains double quotes, so a
+            // substring test against the serialized text compares against the JSON-escaped form
+            // and would pass for the wrong reasons (or, as here, fail for none).
+            let mut commands = Vec::new();
+            let mut prompts = Vec::new();
+            collect_entry_fields(&doc, &mut commands, &mut prompts);
+            assert_eq!(commands, vec![LATTE_FIXED.to_string()], "command rewritten: {doc}");
+            assert_eq!(
+                prompts,
+                vec!["${CLAUDE_PLUGIN_ROOT}/nope keep me".to_string()],
+                "a `type: prompt` entry carries no command and must be untouched: {doc}"
+            );
+        }
+    }
+
+    /// A plugin tree whose ROOT PATH CONTAINS A SPACE — the condition that makes the unquoted
+    /// command fail at all. `<tmp>/Application Support/plugins/cache/<mkt>/<plugin>/<ver>/hooks/`.
+    fn fixture_plugin_tree(tmp: &Path) -> PathBuf {
+        let config = tmp.join("Application Support").join("acct");
+        let hooks = config
+            .join("plugins")
+            .join("cache")
+            .join("superpowers-marketplace")
+            .join("double-shot-latte")
+            .join("1.2.0")
+            .join("hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        std::fs::write(hooks.join("hooks.json"), wrapped_hooks_doc()).unwrap();
+        config
+    }
+
+    #[test]
+    fn rewrites_the_file_on_disk_under_a_path_containing_a_space() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = fixture_plugin_tree(tmp.path());
+        assert!(
+            config.to_string_lossy().contains(' '),
+            "the fixture must reproduce the space that causes the bug"
+        );
+
+        let fixed = repair_installed_plugin_hooks(Some(&config), Path::new("/nonexistent-home"));
+        assert_eq!(fixed, 1, "one file rewritten");
+
+        let path = config
+            .join("plugins/cache/superpowers-marketplace/double-shot-latte/1.2.0/hooks/hooks.json");
+        let after = std::fs::read_to_string(&path).unwrap();
+        let doc: Value = serde_json::from_str(&after).expect("still valid JSON");
+        let (mut commands, mut prompts) = (Vec::new(), Vec::new());
+        collect_entry_fields(&doc, &mut commands, &mut prompts);
+        assert_eq!(commands, vec![LATTE_FIXED.to_string()], "command quoted on disk: {after}");
+        // Everything the pass does not own survives.
+        assert_eq!(prompts, vec!["${CLAUDE_PLUGIN_ROOT}/nope keep me".to_string()]);
+        assert_eq!(doc["description"], json!("left alone"), "sibling key survives: {after}");
+        assert_eq!(doc["hooks"]["Stop"][0]["matcher"], json!("*"), "matcher survives: {after}");
+        assert_eq!(
+            doc["hooks"]["Stop"][0]["hooks"][0]["async"],
+            json!(false),
+            "sibling key inside the repaired entry survives: {after}"
+        );
+
+        // Idempotent at the FILE level: a second pass reports no write.
+        assert_eq!(
+            repair_installed_plugin_hooks(Some(&config), Path::new("/nonexistent-home")),
+            0,
+            "second pass must write nothing"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), after, "and change nothing");
+    }
+
+    #[test]
+    fn honours_claude_config_dir_and_falls_back_to_home() {
+        // The offending path is a PER-ACCOUNT one, so a hardcoded `~/.claude/plugins` would repair
+        // the single tree that never had the bug.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = fixture_plugin_tree(tmp.path());
+        // Home fallback: `<home>/.claude/plugins`.
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        std::os::unix::fs::symlink(config.join("plugins"), home.join(".claude").join("plugins"))
+            .unwrap();
+        assert_eq!(repair_installed_plugin_hooks(None, &home), 1, "resolved via $HOME/.claude");
+        assert_eq!(repair_installed_plugin_hooks(Some(&config), &home), 0, "already repaired");
+    }
+
+    /// THE `marketplaces/` SOURCE CHECKOUTS ARE OUT OF REACH. They are real git clones (129 of
+    /// them across this machine's account trees), so repairing one leaves a modified tracked file
+    /// in a checkout Sparkle does not own — which a later git-based `claude plugin update` either
+    /// refuses ("local changes would be overwritten") or silently discards, taking the repair with
+    /// it. Nothing is lost: `CLAUDE_PLUGIN_ROOT` points at the `cache/` copy, so the hooks that
+    /// actually execute all live there.
+    ///
+    /// Asserted as a PAIR — the cache copy IS repaired in the same pass — because "the
+    /// marketplaces file was untouched" alone would also pass if the walk had found nothing at all.
+    #[test]
+    fn repairs_the_installed_copy_and_never_the_marketplace_checkout() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = tmp.path().join("Application Support").join("acct");
+
+        let install = config
+            .join("plugins")
+            .join("cache")
+            .join("superpowers-marketplace")
+            .join("double-shot-latte")
+            .join("1.2.0");
+        let cached = install.join("hooks");
+        std::fs::create_dir_all(&cached).unwrap();
+        std::fs::write(cached.join("hooks.json"), wrapped_hooks_doc()).unwrap();
+        // THE INSTALL IS A GIT CHECKOUT TOO — 17 of 104 on this machine are, and which ones varies
+        // by account. The fixture carries the `.git` so this test represents the real condition
+        // rather than only the excluded one: the pass must STILL repair the executing copy here,
+        // because the alternative is a hook that never runs. Dirtying this checkout is the
+        // accepted cost documented on `PLUGIN_INSTALL_SUBDIR`, not an oversight.
+        std::fs::create_dir_all(install.join(".git")).unwrap();
+
+        // The source clone, complete with the `.git` that makes writing into it harmful.
+        let source = config
+            .join("plugins")
+            .join("marketplaces")
+            .join("superpowers-marketplace")
+            .join("plugins")
+            .join("double-shot-latte")
+            .join("hooks");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(
+            config.join("plugins").join("marketplaces").join("superpowers-marketplace").join(".git"),
+        )
+        .unwrap();
+        let source_file = source.join("hooks.json");
+        let source_before = wrapped_hooks_doc();
+        std::fs::write(&source_file, &source_before).unwrap();
+
+        let fixed = repair_installed_plugin_hooks(Some(&config), Path::new("/nonexistent-home"));
+        assert_eq!(fixed, 1, "exactly the installed copy is repaired");
+
+        // Compare the PARSED command, not the raw bytes: the repaired command contains double
+        // quotes, which JSON escapes as `\"`, so a substring check against the file text can never
+        // match however correct the repair is.
+        let cached_doc: Value =
+            serde_json::from_str(&std::fs::read_to_string(cached.join("hooks.json")).unwrap())
+                .unwrap();
+        let mut cached_commands = Vec::new();
+        let mut cached_prompts = Vec::new();
+        collect_entry_fields(&cached_doc, &mut cached_commands, &mut cached_prompts);
+        assert_eq!(
+            cached_commands,
+            vec![LATTE_FIXED.to_string()],
+            "the installed copy IS repaired: {cached_doc}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&source_file).unwrap(),
+            source_before,
+            "the marketplace git checkout must be left byte-for-byte alone"
+        );
+    }
+
+    /// The write is staged and renamed, so a `claude` child reading this file mid-pass sees the old
+    /// document or the new one, never a truncated one. The observable trace of getting that wrong
+    /// is a leftover staging file, so assert the directory holds exactly `hooks.json` afterwards.
+    #[test]
+    fn the_repair_leaves_no_staging_file_behind() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = fixture_plugin_tree(tmp.path());
+        assert_eq!(repair_installed_plugin_hooks(Some(&config), Path::new("/nonexistent-home")), 1);
+
+        let hooks_dir = config
+            .join("plugins")
+            .join("cache")
+            .join("superpowers-marketplace")
+            .join("double-shot-latte")
+            .join("1.2.0")
+            .join("hooks");
+        let names: Vec<String> = std::fs::read_dir(&hooks_dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["hooks.json".to_string()], "no staging file survives: {names:?}");
+    }
+
+    #[test]
+    fn an_unparseable_hooks_json_is_skipped_without_truncating_it() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = tmp.path().join("Application Support").join("acct");
+        let hooks =
+            config.join("plugins").join("cache").join("m").join("p").join("v").join("hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        let path = hooks.join("hooks.json");
+        let garbage = "{ this is not json, and it mentions ${X}/y unquoted";
+        std::fs::write(&path, garbage).unwrap();
+
+        let fixed = repair_installed_plugin_hooks(Some(&config), Path::new("/nonexistent-home"));
+        assert_eq!(fixed, 0, "nothing claimed as repaired");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            garbage,
+            "the file is never opened for writing unless a change was already computed"
+        );
+    }
+
+    /// THE HAZARD TEST. Everything above is string manipulation; this one proves the repair is the
+    /// difference between the plugin's hook running and `/bin/sh` refusing to exec a directory.
+    #[cfg(unix)]
+    #[test]
+    fn runs_the_repaired_command_but_not_the_broken_one_through_real_sh() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        // The exact shape of a Sparkle account plugin root: a directory whose path has a space.
+        let root = tmp.path().join("Application Support").join("plugin-root");
+        let hooks = root.join("hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        // sh truncates the unquoted word at the space and execs `<tmp>/Application`. Make that a
+        // real directory so the failure reproduces the shipped message VERBATIM
+        // (`…/Application: is a directory`) rather than a bare ENOENT.
+        std::fs::create_dir_all(tmp.path().join("Application")).unwrap();
+        let sentinel = tmp.path().join("sentinel");
+        let script = hooks.join("run-hook.cmd");
+        std::fs::write(&script, "#!/bin/sh\nprintf '%s' \"$1\" > \"$SPARKLE_TEST_SENTINEL\"\n")
+            .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let run = |cmd: &str| {
+            std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(cmd)
+                .env("CLAUDE_PLUGIN_ROOT", &root)
+                .env("SPARKLE_TEST_SENTINEL", &sentinel)
+                .output()
+                .expect("/bin/sh runs")
+        };
+
+        // 1. The command as shipped: sh splits at the space and execs `<tmp>/Application`.
+        let broken = run(LATTE_BROKEN);
+        assert!(!broken.status.success(), "the unquoted form must fail: {broken:?}");
+        let stderr = String::from_utf8_lossy(&broken.stderr);
+        assert!(
+            stderr.contains("is a directory") || stderr.contains("Is a directory"),
+            "the shipped failure mode, verbatim: {stderr}"
+        );
+        assert!(!sentinel.exists(), "the plugin's hook never ran");
+
+        // 2. The repaired command, from the repair pass itself — not a hand-written string.
+        let repaired = repair_hook_command(LATTE_BROKEN).expect("the shipped command is repaired");
+        let ok = run(&repaired);
+        assert!(
+            ok.status.success(),
+            "the repaired form must run: {}",
+            String::from_utf8_lossy(&ok.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&sentinel).unwrap(),
+            "claude-judge-continuation",
+            "the hook ran AND kept its argument — quoting must not swallow or reorder arguments"
+        );
+    }
 
     // ── Staged bundle resources (bead sparkle-1ueh3) ──────────────────────────────────────────
     //
