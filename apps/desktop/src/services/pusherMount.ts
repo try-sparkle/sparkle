@@ -72,6 +72,10 @@ import { goalStateOf, type AgentGoal } from "../engine/agentGoal";
 import type { AgentTabStatus } from "../types";
 import { epicIndexOf } from "./beads";
 import { boundAgentsFor } from "./epicSweepRunner";
+import {
+  epicOrchestratorLiveness,
+  orchestratorLivenessOf,
+} from "../engine/orchestratorLiveness";
 import { getConfig, onConfigChanged, type BabysitConfigPayload } from "./config";
 import { startConflictFlags } from "./conflictFlags";
 import { startBabysitDispatcher } from "./babysitDispatcher";
@@ -475,9 +479,11 @@ function improveLocalCapacity(): {
  *   • `epicIndexOf(beads).childrenByParent.has(id)` is the has-children (buildable) test.
  *   • `boundAgentsFor(agents, id)` is the ONE definition of "which build agents are bound to this epic"
  *     (`epicSweepRunner`), so an epic reads staffed iff a bound agent is LIVE.
- *   • `processAliveFor(id, status, openIds)` is the ONE liveness reading (`goalContinuationRunner`);
- *     `!== false` treats UNKNOWN liveness as alive (the conservative direction — a wrong "dead" would
- *     manufacture an alarm against an epic somebody is building).
+ *   • `orchestratorLivenessOf` + `epicOrchestratorLiveness` (`engine/orchestratorLiveness`) is the ONE
+ *     staffing reading, joining the window-local `processAliveFor` status with the durable
+ *     `fleet_digest` hook-log witness — the SAME join `epicSweepRunner.candidateFor` uses. An
+ *     UNOBSERVED orchestrator whose hook log is stale reads UNSTAFFED; only a genuine "no reading at
+ *     all" stays conservative (counts as staffed), so a wrong "dead" cannot manufacture an alarm.
  * A bound-but-DEAD orchestrator therefore reads UNSTAFFED — which is exactly the founder's measured
  * failure, an epic whose orchestrator finished and went away leaving the binding erased. Reads 0 when
  * the board snapshot is not hydrated — the fail-toward-silence direction, matching `improveReadyBacklog`.
@@ -507,35 +513,41 @@ function improveUnstaffedEpics(): { unstaffedBuildableEpicCount: number } {
     if (b.status !== "in_progress") continue;
     // Buildable = has children. A childless typed epic is an un-decomposed plan, not unstaffed WORK.
     if (!index.childrenByParent.has(b.id)) continue;
-    // Staffed iff a bound build agent is LIVE **and still working**. Empty bound, all bound agents
-    // observed dead, or all of them FINISHED ⇒ unstaffed. See the ⚠️ note above for why liveness on
-    // its own reported a fully-idle fleet as fully staffed.
-    //
-    // ⚠️ A SECOND, STILL-WANTED NARROWING OF THIS EXPRESSION COMPOSES WITH THIS ONE — write it as a
-    // conjunct, never as a replacement. PR #2907 (bead `sparkle-kwl5r2.2`) implemented it and was
-    // CLOSED UNMERGED, so the defect it addressed is still live and someone will come back to this
-    // line. The two narrow "staffed" from opposite directions and neither subsumes the other:
-    //   • #2907 replaces the `processAliveFor(...) !== false` conjunct with
-    //     `presumeAliveFromHeartbeat(processAliveFor(...), a.activityAt, now, ORCHESTRATOR_HEARTBEAT_STALE_MS)`,
-    //     so an UNOBSERVED agent (app restarted, nothing re-observed) falls back to its durable
-    //     activity stamp instead of counting as alive.
-    //   • this change adds the `!agentIsFinished(...)` conjunct, so an OBSERVED-ALIVE agent whose
-    //     goal is met stops counting as staffed.
-    // They are independent facts: a finished agent has a FRESH heartbeat (it just finished), so the
-    // heartbeat check reads it alive; an unobserved stale agent may have an unmet goal, so this
-    // check reads it working. THE CORRECT SHAPE IS BOTH CONJUNCTS, in this order:
-    //     presumeAliveFromHeartbeat(processAliveFor(a.id, rt.status, openIds), a.activityAt, now,
-    //       ORCHESTRATOR_HEARTBEAT_STALE_MS) && !agentIsFinished(a, rt.status, openIds, now)
-    // Taking either side alone re-opens the other's bug silently — and note that `unobservedAgents`
-    // in `improveLocalCapacity` handles the never-observed case for the CAPACITY counts only; this
-    // staffing predicate still needs the heartbeat term to tell a long-dead orchestrator from a
-    // merely-unobserved one.
-    const orchestratorWorking = boundAgentsFor(agents, b.id).some(
-      (a) =>
-        processAliveFor(a.id, rt.status, openIds) !== false &&
-        !agentIsFinished(a, rt.status, openIds, now),
+    // Staffed iff a bound orchestrator is LIVE **and still working** — the two narrowings of this
+    // expression COMPOSED (bead `sparkle-nu7gd9`). Empty bound, all bound agents observed dead, all
+    // FINISHED, or all UNOBSERVED-and-stale ⇒ unstaffed. Two independent facts, both required, neither
+    // subsuming the other:
+    //   • LIVENESS via `orchestratorLivenessOf` + `epicOrchestratorLiveness`
+    //     (`engine/orchestratorLiveness`, the join #2908 gave the epic sweep): the window-local
+    //     `processAliveFor` status joined with the durable `fleet_digest` hook-log witness. Reading
+    //     `processAliveFor(...) !== false` alone folded an UNOBSERVED orchestrator (`undefined`) to
+    //     "alive", so after a fleet-wide/restart death — no pane left to observe — every unstaffed epic
+    //     read STAFFED and this three-alarm count stayed 0. The join reads an unobserved-but-stale
+    //     orchestrator as DEAD; "no reading at all" stays `null` (conservative, counts as staffed).
+    //   • NOT-FINISHED via `!agentIsFinished` (#2909): an OBSERVED-ALIVE agent whose goal is `met` is
+    //     idle, not working — process up, pane `idle` — so liveness alone read a finished fleet as staffed.
+    // A finished agent is observed-alive with a FRESH hook log, so the liveness join reads it `true`;
+    // only `!agentIsFinished` excludes it. An unobserved-stale agent may hold an unmet goal, so
+    // `!agentIsFinished` reads it working; only the liveness join excludes it. So the per-agent verdict
+    // FORCES a finished agent to a definite not-staffing `false` (it is observed, so this is KNOWN, not
+    // unknown-`null`) and otherwise takes the tri-state liveness verdict. Dropping either half silently
+    // re-opens the other's bug — proven by the paired mutation tests in `pusherMount.improveNudge.test.ts`.
+    const liveness = epicOrchestratorLiveness(
+      boundAgentsFor(agents, b.id).map((a) =>
+        agentIsFinished(a, rt.status, openIds, now)
+          ? false
+          : orchestratorLivenessOf(
+              {
+                observedAlive: processAliveFor(a.id, rt.status, openIds),
+                lastHookEventMs: rt.agentMovement[a.id]?.lastEventMs,
+              },
+              now,
+            ),
+      ),
     );
-    if (orchestratorWorking) continue;
+    // `true` staffed, `null` cannot-tell (conservative — treat as staffed, matching
+    // `improveReadyBacklog`'s fail-toward-silence). Only a confident `false` is the three-alarm fire.
+    if (liveness !== false) continue;
     count += 1;
   }
   return { unstaffedBuildableEpicCount: count };

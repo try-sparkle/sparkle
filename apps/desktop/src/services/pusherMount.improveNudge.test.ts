@@ -21,6 +21,7 @@ import { useSettingsStore } from "../stores/settingsStore";
 import { useProjectStore } from "../stores/projectStore";
 import { localAgentCapacity } from "./agentCapacity";
 import type { Bead, Board } from "./beads";
+import { ORCHESTRATOR_SILENT_MS } from "../engine/orchestratorLiveness";
 
 const bead = (over: Partial<Bead>): Bead => ({
   id: "b",
@@ -46,7 +47,7 @@ const IMPROVE_ID = SPARKLE_AGENT_ID;
 
 beforeEach(() => {
   useBeadsStore.setState({ byProject: {} });
-  useRuntimeStore.setState({ status: {} });
+  useRuntimeStore.setState({ status: {}, agentMovement: {} } as never);
   useProjectStore.setState({ selectedProjectId: null, projects: [] } as never);
 });
 afterEach(() => vi.restoreAllMocks());
@@ -420,6 +421,73 @@ describe("buildImproveNudgeDeps — the real readers reach the live stores", () 
     });
   });
 
+  // ── DEFECT #2 IS TWO INDEPENDENT AXES, COMPOSED (bead sparkle-nu7gd9). An epic reads STAFFED only if
+  //    a bound orchestrator is BOTH alive-on-the-liveness-join AND not-finished. Each axis is pinned by
+  //    its own case below AND mutation-proven independent: revert the liveness join and the
+  //    unobserved-stale case reds; revert `!agentIsFinished` and the alive-but-finished case reds.
+
+  // ── AXIS A: THE UNOBSERVED-AFTER-RESTART CASE (the orchestratorLiveness join, #2908's join reused).
+  //    `runtimeStore.status` is live-only and never persisted, so after a fleet-wide / app-restart
+  //    death — no pane left to observe — every bound orchestrator reads `undefined` there.
+  //    `undefined !== false` folds to "alive"; the durable `fleet_digest` hook-log witness
+  //    (`agentMovement[id].lastEventMs`) is what tells a long-dead orchestrator from a merely-unobserved one.
+  const movement = (lastEventMs: number | null) => ({
+    lastEvent: "PostToolUse",
+    lastEventMs,
+    sessionId: "s",
+    toolsRecent: 1,
+  });
+
+  it("DOES count it when the bound orchestrator is UNOBSERVED and its hook-log witness is STALE (fleet-wide/restart death)", () => {
+    seedEpicBoard([
+      bead({ id: "e1", type: "epic", status: "in_progress" }),
+      bead({ id: "e1.t1", status: "open" }),
+    ]);
+    seedSparkleAgents([{ id: "orch-1", kind: "build", epicId: "e1", runtime: "local" }]);
+    // UNOBSERVED: this window never mounted the pane, so `status` has no entry (undefined liveness). The
+    // durable witness's last hook event is 2h ago — older than the 1h silence window ⇒ observed silent.
+    useRuntimeStore.setState({
+      status: {},
+      agentMovement: { "orch-1": movement(Date.now() - 2 * ORCHESTRATOR_SILENT_MS) },
+    } as never);
+    expect(buildImproveNudgeDeps().unstaffedBuildableEpics()).toEqual({
+      unstaffedBuildableEpicCount: 1,
+    });
+  });
+
+  it("does NOT count it when the bound orchestrator is UNOBSERVED but its hook-log witness is FRESH — pins the witness as the cause", () => {
+    // SAME unobserved setup; only the witness's freshness differs. Proves the count flips on the durable
+    // hook log, not on "unobserved always counts" — the paired test the guard-trap rule asks for.
+    seedEpicBoard([
+      bead({ id: "e1", type: "epic", status: "in_progress" }),
+      bead({ id: "e1.t1", status: "open" }),
+    ]);
+    seedSparkleAgents([{ id: "orch-1", kind: "build", epicId: "e1", runtime: "local" }]);
+    useRuntimeStore.setState({
+      status: {},
+      agentMovement: { "orch-1": movement(Date.now()) }, // moved just now ⇒ working
+    } as never);
+    expect(buildImproveNudgeDeps().unstaffedBuildableEpics()).toEqual({
+      unstaffedBuildableEpicCount: 0,
+    });
+  });
+
+  it("stays conservative (does NOT count) when the orchestrator is UNOBSERVED and there is NO hook-log reading at all", () => {
+    // Neither witness has anything to say: no pane observed it, and `fleet_digest` holds no event for it.
+    // That is `null` (cannot tell), and an unproven death must not manufacture an alarm — the existing
+    // fail-toward-silence contract, preserved. (Distinguishes the fix from "unobserved ⇒ unstaffed".)
+    seedEpicBoard([
+      bead({ id: "e1", type: "epic", status: "in_progress" }),
+      bead({ id: "e1.t1", status: "open" }),
+    ]);
+    seedSparkleAgents([{ id: "orch-1", kind: "build", epicId: "e1", runtime: "local" }]);
+    useRuntimeStore.setState({ status: {}, agentMovement: {} } as never);
+    expect(buildImproveNudgeDeps().unstaffedBuildableEpics()).toEqual({
+      unstaffedBuildableEpicCount: 0,
+    });
+  });
+
+  // ── AXIS B: THE ALIVE-BUT-FINISHED CASE (#2909's `!agentIsFinished`).
   it("DOES count it when the bound orchestrator is ALIVE but FINISHED — the silence bug (bead sparkle-nu7gd9)", () => {
     // ⚠️ THE CASE THAT MADE THE THREE-ALARM FIRE SILENT. This orchestrator is not dead: its process is
     // up and its pane reads `idle`. Under a pure liveness predicate it read STAFFED, so on the night
@@ -464,6 +532,34 @@ describe("buildImproveNudgeDeps — the real readers reach the live stores", () 
     useRuntimeStore.setState({ status: { "orch-1": "idle" } });
     expect(buildImproveNudgeDeps().unstaffedBuildableEpics()).toEqual({
       unstaffedBuildableEpicCount: 0,
+    });
+  });
+
+  // ── THE COMPOSITION ITSELF: an axis-A death cannot be masked by an unmet goal (which is all
+  //    `!agentIsFinished` alone would see). UNOBSERVED + stale witness + an explicitly UNMET goal ⇒
+  //    UNSTAFFED. Under #2909-alone (`processAliveFor(...) !== false && !agentIsFinished`) this reads
+  //    STAFFED — `undefined !== false` is true and an unmet goal is not finished — so the assertion
+  //    REDS if the liveness-join half is dropped, the mutation proof that axis A is load-bearing here.
+  it("COMPOSITION: UNOBSERVED + stale witness ⇒ unstaffed even though the goal is UNMET (not finished)", () => {
+    seedEpicBoard([
+      bead({ id: "e1", type: "epic", status: "in_progress" }),
+      bead({ id: "e1.t1", status: "open" }),
+    ]);
+    seedSparkleAgents([
+      {
+        id: "orch-1",
+        kind: "build",
+        epicId: "e1",
+        runtime: "local",
+        goal: { text: "build e1", setAt: 1 }, // UNMET ⇒ !agentIsFinished is TRUE (would read staffed)
+      },
+    ]);
+    useRuntimeStore.setState({
+      status: {}, // UNOBSERVED
+      agentMovement: { "orch-1": movement(Date.now() - 2 * ORCHESTRATOR_SILENT_MS) }, // stale ⇒ dead
+    } as never);
+    expect(buildImproveNudgeDeps().unstaffedBuildableEpics()).toEqual({
+      unstaffedBuildableEpicCount: 1,
     });
   });
 
