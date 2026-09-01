@@ -72,11 +72,88 @@ describe("orchestratorLivenessOf", () => {
   // epic back, and `sendToBuild` on an already-live orchestrator writes the handoff text into the
   // open prompt: a bracketed paste plus Enter, ANSWERING a permission question the human never saw.
   it.each(["questions", "waiting", "approval", "blocked"] as const)(
-    "an agent sitting at a prompt (%s) is STAFFING, however old its hook log",
+    "an agent sitting at a prompt (%s), CORROBORATED by the grid, is STAFFING however old its hook log",
     (status) => {
       expect(
         orchestratorLivenessOf(
-          { observedAlive: true, observedStatus: status, lastHookEventMs: NOW - 121 * HOUR },
+          {
+            observedAlive: true,
+            observedStatus: status,
+            observedAttention: "awaiting",
+            lastHookEventMs: NOW - 121 * HOUR,
+          },
+          NOW,
+        ),
+      ).toBe(true);
+    },
+  );
+
+  // ══ THE EXEMPTION MUST EXPIRE (roborev 73028, High) ═══════════════════════════════════════
+  // `runtimeStore.status` is the SAME non-retractable latch this module distrusts: only a mounted
+  // pane writes it and only `close()` clears it, so an orchestrator that hit a prompt and then died
+  // in the ENOTFOUND batch kill reads `waiting` for the window's life. Membership alone would make
+  // the silence rule unreachable for these four statuses — re-opening the original incident for
+  // exactly the rows the bead named, which were "idle/errored/WAITING".
+  it.each(["questions", "waiting", "approval", "blocked"] as const)(
+    "a latched %s with NO grid reading is not immortal — it is staffing-UNKNOWN, not staffed",
+    (status) => {
+      expect(
+        orchestratorLivenessOf(
+          {
+            observedAlive: true,
+            observedStatus: status,
+            observedAttention: undefined,
+            lastHookEventMs: NOW - 121 * HOUR,
+          },
+          NOW,
+        ),
+      ).toBe(null);
+    },
+  );
+
+  // `unreadable` holds NO OPINION by its own contract — "it never lowers and never raises" — so it
+  // must read exactly like an absent entry, never as corroboration.
+  it("an unreadable grid does not corroborate a latched wait", () => {
+    expect(
+      orchestratorLivenessOf(
+        {
+          observedAlive: true,
+          observedStatus: "waiting",
+          observedAttention: "unreadable",
+          lastHookEventMs: NOW - 121 * HOUR,
+        },
+        NOW,
+      ),
+    ).toBe(null);
+  });
+
+  // THE ARM THAT RECOVERS A DIED-WHILE-WAITING ORCHESTRATOR. The grid positively saw NO prompt, so
+  // the latch is stale and the silence rule applies — and there is no open prompt for a handoff to
+  // be pasted into, which is what makes reaching `false` safe here.
+  it.each(["calm", "delegating"] as const)(
+    "a grid reading of %s contradicts the latch, and the silence rule applies",
+    (verdict) => {
+      expect(
+        orchestratorLivenessOf(
+          {
+            observedAlive: true,
+            observedStatus: "waiting",
+            observedAttention: verdict,
+            lastHookEventMs: NOW - 121 * HOUR,
+          },
+          NOW,
+        ),
+      ).toBe(false);
+      // …and it is the SILENCE rule that answered, not a blanket "contradicted means dead": a fresh
+      // hook log under the same contradiction is still staffing.
+      expect(
+        orchestratorLivenessOf(
+          {
+            observedAlive: true,
+            observedStatus: "waiting",
+            observedAttention: verdict,
+            lastHookEventMs: NOW - 60_000,
+          },
           NOW,
         ),
       ).toBe(true);
@@ -84,8 +161,10 @@ describe("orchestratorLivenessOf", () => {
   );
 
   // THE PAIRED CASE, and without it the exemption above could be a blanket "observed means alive".
-  // `idle` is NOT a human wait — it is the status 17 of the founder's 17 measured orchestrators
-  // carried — so the silence rule must still fire on it with a status supplied.
+  // `idle` is NOT a human wait, and it is one of the three statuses the bead actually recorded
+  // ("idle/errored/waiting"), so the silence rule must still fire on it with a status supplied.
+  // An earlier version of this comment said all 17 measured orchestrators read `idle`; they did
+  // not, and that overstatement is what made the uncorroborated exemption above look harmless.
   it("…but an IDLE agent with the same stale log is still not staffing", () => {
     expect(
       orchestratorLivenessOf(

@@ -24,6 +24,7 @@ import { _resetDeadSessionRegistryForTests, noteAgentDeath } from "./deadSession
 import type { DeathCause } from "../engine/deathTypes";
 import type { AgentTab } from "../types";
 import type { AgentTabStatus } from "@sparkle/ui";
+import type { ObservedVerdict } from "../engine/observedAttention";
 
 const NOW = 1_700_000_000_000;
 const HOUR = 60 * 60 * 1000;
@@ -53,6 +54,8 @@ function scenario(
     alive?: boolean | undefined;
     /** The RAW observed status, when the case is about one. */
     status?: AgentTabStatus;
+    /** The Rust nudger's grid verdict — the witness that retracts. */
+    attention?: ObservedVerdict;
     lastHookEventMs?: number | null;
     deathCause?: DeathCause;
     /** Omit BOTH artifact seams so the production defaults run. */
@@ -91,6 +94,7 @@ function scenario(
       beadsFor: () => beads,
       aliveFor: () => over.alive,
       ...(over.status === undefined ? {} : { statusFor: () => over.status }),
+      ...(over.attention === undefined ? {} : { attentionFor: () => over.attention }),
       restartEnabled: true,
       restart,
       mark,
@@ -188,7 +192,12 @@ describe("an orchestrator waiting on a human is staffing, not dead", () => {
   it.each(["questions", "waiting", "approval", "blocked"] as const)(
     "never restarts an epic whose orchestrator sits at a prompt (%s)",
     async (status) => {
-      const s = scenario({ alive: true, status, lastHookEventMs: NOW - 121 * HOUR });
+      const s = scenario({
+        alive: true,
+        status,
+        attention: "awaiting",
+        lastHookEventMs: NOW - 121 * HOUR,
+      });
       const o = forEpic(await s.run());
       expect(o?.action).toBe("skip");
       expect(o?.reason).toBe("orchestrator-alive");
@@ -199,8 +208,34 @@ describe("an orchestrator waiting on a human is staffing, not dead", () => {
     },
   );
 
-  // PAIRED, or the case above is satisfiable by a sweep that stopped restarting anything. `idle` is
-  // the status 17 of the founder's 17 measured orchestrators carried, and it is not a human wait.
+  // ── AND THE EXEMPTION EXPIRES (roborev 73028) ─────────────────────────────────────────────
+  // The same latched `waiting`, but the grid has RETRACTED (its `gone` verdict clears the entry when
+  // the PTY is swept) — i.e. the orchestrator died at the prompt. Without corroboration the epic
+  // would read staffed forever, which is the original incident for the exact rows the bead named.
+  // It does NOT restart either: `null` is `staffing-unknown`, which spends nothing and — unlike the
+  // `true` it replaces — cannot clear a real escalation.
+  it("a latched wait with no grid reading is staffing-UNKNOWN, not staffed", async () => {
+    const s = scenario({ alive: true, status: "waiting", lastHookEventMs: NOW - 121 * HOUR });
+    const o = forEpic(await s.run());
+    expect(o?.reason).toBe("staffing-unknown");
+    expect(s.restart).not.toHaveBeenCalled();
+  });
+
+  // THE RECOVERY ARM: the grid positively saw no prompt, so the latch is stale and the epic is
+  // handed back — and there is no open prompt for the handoff to be pasted into.
+  it("restarts when the grid CONTRADICTS a latched wait", async () => {
+    const s = scenario({
+      alive: true,
+      status: "waiting",
+      attention: "calm",
+      lastHookEventMs: NOW - 121 * HOUR,
+    });
+    expect(forEpic(await s.run())?.performed).toBe("restarted");
+    expect(s.restart).toHaveBeenCalledTimes(1);
+  });
+
+  // PAIRED, or the cases above are satisfiable by a sweep that stopped restarting anything. `idle`
+  // is not a human wait, and it is one of the three statuses the bead actually recorded.
   it("…but an IDLE orchestrator with the same stale log is still restarted", async () => {
     const s = scenario({ alive: true, status: "idle", lastHookEventMs: NOW - 121 * HOUR });
     expect(forEpic(await s.run())?.performed).toBe("restarted");

@@ -44,6 +44,7 @@
 // PURE. Data in, data out — no store, no clock of its own, no React — so every rule below is
 // testable as arithmetic, which is the same reason `engine/epicContinuation` is pure.
 import type { AgentTabStatus } from "@sparkle/ui";
+import type { ObservedVerdict } from "./observedAttention";
 import type { DeathCause } from "./deathTypes";
 
 /**
@@ -72,6 +73,24 @@ import type { DeathCause } from "./deathTypes";
  * answerable. It EXCLUDES `questions`, which is blue by an explicit founder decision ("why are they
  * red when they don't require my assistance?") but is still, literally, an agent that asked a person
  * something and is waiting — so its log freezes identically.
+ *
+ * ── MEMBERSHIP IS NOT ENOUGH: THE LATCH CANNOT RETRACT (roborev 73028, High) ──────────────────
+ * The status this set is tested against is `runtimeStore.status`, which is THE SAME
+ * non-retractable latch this module was written to distrust. `AgentPane` is its only writer, the
+ * entry is cleared by `close()` and by nothing else — not by unmount, not by PTY death — and
+ * `livenessOf` calls an agent `local` merely because an entry EXISTS. So an orchestrator that hit
+ * an `AskUserQuestion`, wrote `waiting`, and then died in the ENOTFOUND batch kill keeps `waiting`
+ * for the window's life. Membership alone would therefore make the silence rule UNREACHABLE for
+ * these four statuses and re-open the original incident for exactly the rows it named: the bead
+ * records them as "idle/errored/**waiting**", so `waiting` was in the measured population.
+ *
+ * The asymmetry decides it. The hazard the exemption prevents — a paste into an open prompt —
+ * requires the agent to be genuinely live NOW; the latch cannot tell "live and waiting" from "died
+ * while waiting", and getting it wrong that way is PERMANENT. So the exemption requires a witness
+ * that CAN retract: {@link OrchestratorEvidence.observedAttention}, read off the agent's own grid
+ * every second in the Rust process and swept to `gone` when its PTY dies — which is precisely the
+ * property `runtimeStore.status` lacks, and precisely why that channel exists ("a held verdict that
+ * outlives its terminal is a latched reading with no writer that can move it").
  *
  * ── THE PRECEDENT ─────────────────────────────────────────────────────────────────────────────
  * `engine/busyLiveness` applies the same stale-movement rule and restricts it to `working` alone,
@@ -139,6 +158,18 @@ export interface OrchestratorEvidence {
    */
   observedStatus?: AgentTabStatus | undefined;
   /**
+   * What the Rust nudger last read off this agent's GRID, or `undefined` for no reading.
+   *
+   * THE RETRACTING WITNESS. `services/observedAttentionListener` clears the entry on a `gone`
+   * verdict — emitted when the PTY is swept — so unlike {@link observedStatus} an absence here is a
+   * real signal rather than a frozen claim. That is the whole reason it is consulted.
+   *
+   * `undefined` covers BOTH "never had a reading" and "retracted", and they are deliberately not
+   * distinguished: neither corroborates a live wait, and the answer for both is the same honest
+   * `null`.
+   */
+  observedAttention?: ObservedVerdict | undefined;
+  /**
    * `MovementEvidence.lastEventMs` for this agent — when its hook log last recorded ANY event —
    * or `null`/`undefined` when there is no reading at all (`fleet_digest` has not polled yet, the
    * agent is cloud or has no worktree so the digest skips it, or its hook log is empty).
@@ -189,7 +220,21 @@ export function orchestratorLivenessOf(
   // prompt — and no hook-log age can make that untrue. See WAITING_ON_HUMAN. This returns the same
   // answer the one-witness code gave for these rows, so it is a preserved behaviour, not a new one.
   if (e.observedAlive === true && e.observedStatus !== undefined && WAITING_ON_HUMAN.has(e.observedStatus)) {
-    return true;
+    // A LATCHED `waiting` IS A CLAIM, NOT A READING — so it is corroborated against the one witness
+    // that can retract. Three answers, and the middle one is what recovers a died-while-waiting
+    // orchestrator that membership alone would have held forever:
+    //
+    //   awaiting            the grid SAW a prompt on screen. Staffing. Never touch it.
+    //   calm | delegating   the grid saw NO prompt, so the latch is stale. Fall through to the
+    //                       silence rule, which may legitimately reach `false` — and there is no
+    //                       open prompt for a handoff to be pasted into.
+    //   unreadable | none   no opinion. `unreadable` holds none BY CONTRACT ("it never lowers and
+    //                       never raises"), and an absent entry is either a retraction or a channel
+    //                       that never spoke. Answer `null`, which is `staffing-unknown`: not a
+    //                       claim of health (so it cannot clear a real escalation, which returning
+    //                       `true` would), and not a spend (so nothing is typed anywhere).
+    if (e.observedAttention === "awaiting") return true;
+    if (e.observedAttention !== "calm" && e.observedAttention !== "delegating") return null;
   }
 
   const ts = e.lastHookEventMs;

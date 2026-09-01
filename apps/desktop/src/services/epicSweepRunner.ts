@@ -64,6 +64,7 @@ import {
 import { deathCauseForAgent } from "./deadSessionRegistry";
 import type { DeathCause } from "../engine/deathTypes";
 import type { AgentTabStatus } from "@sparkle/ui";
+import type { ObservedVerdict } from "../engine/observedAttention";
 import { useBeadsStore, beadsReadStartedAt } from "../stores/beadsStore";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
@@ -455,6 +456,11 @@ export interface EpicSweepOptions {
    *  overlay is written over other statuses. Used only to exempt an agent waiting on a human from
    *  the silence rule; see `engine/orchestratorLiveness.WAITING_ON_HUMAN`. */
   statusFor?: (agentId: string) => AgentTabStatus | undefined;
+  /** The Rust nudger's last grid reading. Defaults to `runtimeStore.observedAttention[agentId]`,
+   *  which `services/observedAttentionListener` CLEARS on a `gone` verdict when the PTY is swept —
+   *  so an absence here is a real signal, not a frozen claim. See
+   *  `engine/orchestratorLiveness.WAITING_ON_HUMAN`. */
+  attentionFor?: (agentId: string) => ObservedVerdict | undefined;
   /** How long an orchestrator may be silent before it stops counting as staffing its epic.
    *  Defaults to {@link ORCHESTRATOR_SILENT_MS}; injected by tests so a fixture can state a window
    *  instead of moving a clock an hour. */
@@ -610,6 +616,9 @@ export function candidateFor(
      * already-live orchestrator writes the handoff text into that open prompt (roborev 72648).
      */
     statusFor: (agentId: string) => AgentTabStatus | undefined;
+    /** The Rust nudger's last GRID reading for an agent — the witness that RETRACTS, which is what
+     *  keeps a latched `waiting` from holding an epic forever (roborev 73028). */
+    attentionFor: (agentId: string) => ObservedVerdict | undefined;
     now: number;
     silentMs?: number;
   },
@@ -645,6 +654,7 @@ export function candidateFor(
               {
                 observedAlive: alive(a.id),
                 observedStatus: staffing.statusFor(a.id),
+                observedAttention: staffing.attentionFor(a.id),
                 lastHookEventMs: staffing.lastHookEventFor(a.id),
               },
               staffing.now,
@@ -940,6 +950,9 @@ export async function sweepEpics(opts: EpicSweepOptions = {}): Promise<EpicSweep
     ((agentId: string) => useRuntimeStore.getState().agentMovement[agentId]?.lastEventMs);
   const statusFor =
     opts.statusFor ?? ((agentId: string) => useRuntimeStore.getState().status[agentId]);
+  const attentionFor =
+    opts.attentionFor ??
+    ((agentId: string) => useRuntimeStore.getState().observedAttention[agentId]?.verdict);
   const orchestratorSilentMs = opts.orchestratorSilentMs ?? ORCHESTRATOR_SILENT_MS;
   const deathCauseFor = opts.deathCauseFor ?? deathCauseForAgent;
 
@@ -1036,6 +1049,7 @@ export async function sweepEpics(opts: EpicSweepOptions = {}): Promise<EpicSweep
       const candidate = candidateFor(beads, project.agents, epic, aliveFor, true, beadsObserved, {
         lastHookEventFor,
         statusFor,
+        attentionFor,
         now,
         silentMs: orchestratorSilentMs,
       });
