@@ -13034,7 +13034,14 @@ mod tests {
         // unreadable head ref would block a merge on a machine the gate cannot guard at all.
         let src = include_str!("worktree.rs");
         let start = src.find("fn roborev_drain_gate(").expect("roborev_drain_gate");
-        let body = &src[start..];
+        // BOUND TO THE FUNCTION, not to end of file (roborev 72720). Slicing to EOF pulls in this
+        // very `mod tests` block, so both `find`s would match the STRING LITERALS on the lines just
+        // below — and then deleting the real call from the gate leaves this assertion green, because
+        // it is satisfied by its own source text. That is the exact class of defect this test exists
+        // to catch, reintroduced inside the catcher. `\n}\n` is the function's closing brace at
+        // column 0, which no line inside the body can produce.
+        let end = start + src[start..].find("\n}\n").expect("the end of roborev_drain_gate") + 3;
+        let body = &src[start..end];
         let installed = body.find("cached_roborev_path()").expect("the path lookup");
         let refusal = body.find("roborev_head_ref_or_refuse(number, head_ref)?").expect("the refusal");
         // A readable ref passes straight through, so the refusal is about unreadability alone.
