@@ -178,7 +178,21 @@ export type NoContinueReason =
    * "auto-continue gave up and a human owns this now" and "it is waiting on CI and will pick itself
    * up when the run concludes" are opposite claims about whether anyone needs to act.
    */
-  | "external-wait";
+  | "external-wait"
+  /**
+   * A CHILD IS STILL RUNNING — this agent's own turn closed, but a background task or a worker it
+   * spawned is actively working, so the quiet is a delegation, not a stall. See
+   * {@link ContinuationInput.inMotion}.
+   *
+   * NEITHER continued nor escalated, and both halves matter. Resuming would type "continue" into a
+   * terminal whose foreground is a running child (a `pnpm verify`, a background Bash), interrupting
+   * the very work the resume is meant to protect. Escalating would page a human about an agent that
+   * is progressing fine. Like `external-wait`, the ladder PARKS and un-parks itself: the moment the
+   * child settles the motion signal drops, and the ordinary resume path resumes if the goal is
+   * still unmet — while {@link MAX_CONTINUES_TOTAL} still bounds a genuinely wedged agent once it
+   * stops delegating.
+   */
+  | "in-motion";
 
 export type ContinuationDecision =
   | { action: "continue"; prompt: string; attempt: number }
@@ -290,6 +304,25 @@ export type ExternalWait = {
  * This one is a WALL-CLOCK claim about the gate, and what it must outlast is a CI queue.
  */
 export const EXTERNAL_WAIT_GRACE_MS = 3 * 60 * 60 * 1_000;
+
+/**
+ * How long a `inMotion` signal that has not dropped may go on suppressing the ladder — the same
+ * safety valve {@link EXTERNAL_WAIT_GRACE_MS} is for the CI park, and the reason the motion gate is a
+ * bounded park and not a hole. Both signals that feed motion have observed STUCK-TRUE states: a
+ * killed worker keeps reporting `working` on the roster for hours (`sparkle-8uio`), and the
+ * background-task count is scraped off a fragile TUI footer and only cleared on a later settle — so a
+ * missed settle leaves a permanent count. Without a bound, either would strand the parent in the
+ * "never continued AND never escalated" state this module exists to abolish.
+ *
+ * TWO HOURS, pinned from both sides. The FLOOR is the longest plausible CONTINUOUS child run: a
+ * worker doing a full build-and-verify can occupy the better part of an hour, and the count resets
+ * the moment motion drops, so two unbroken hours of it is already well past any real child. The
+ * CEILING is `agentGoal.DEFAULT_GOAL_TTL_MS` (four hours): a grace at or above it is unreachable,
+ * because `goalStateOf` answers `expired` and `decideContinuation` returns `goal-expired` first — so
+ * the hand-over this grace promises would never fire. Two hours sits above the worst real child and
+ * below the TTL, so a genuinely wedged delegate is handed to a human while its goal is still live.
+ */
+export const IN_MOTION_GRACE_MS = 2 * 60 * 60 * 1_000;
 
 /**
  * What this window knows about a CLOUD agent's sandbox. Required whenever `runtime` is `"cloud"`.
@@ -448,6 +481,24 @@ export interface ContinuationInput {
    * resumed, which is what it does today.
    */
   awaitingClose?: AwaitingCloseEvidence;
+  /**
+   * A CHILD still running under this agent even though its own turn closed — a background task it
+   * launched (engine/backgroundTaskFooter, parked in services/backgroundTaskRegistry) or a worker it
+   * spawned that is still `working` (engine/inMotion) — with the epoch ms this window first saw that
+   * motion CONTINUOUSLY. Absent means no child is running. See the `in-motion` gate in
+   * {@link decideContinuation} for what it suppresses and the {@link IN_MOTION_GRACE_MS} bound.
+   *
+   * ⚠️ CARRIES AN AGE for the same reason {@link ExternalWait} does, and `since: null` is a real
+   * state, not an oversight: it is a live child whose age this window cannot state (it has not folded
+   * the motion ledger since the child appeared). Like an UNTIMED external gate, an untimed motion
+   * is NOT parked on — parking without an age is unbounded — so it falls through to the bounds and
+   * behaves exactly as before. Only a TIMED, still-fresh child parks.
+   *
+   * OPTIONAL and fail-open, same direction as `externalWait?`/`quotaBlock?` above and the opposite of
+   * {@link cloud}: a caller that forgot to wire it gets today's resume behaviour, never a fleet that
+   * never escalates.
+   */
+  inMotion?: { since: number | null };
 }
 
 /**
@@ -557,6 +608,31 @@ export function decideContinuation(input: ContinuationInput): ContinuationDecisi
     return { action: "none", reason: "idle-not-settled" };
   }
   if (!canAcceptInput) return { action: "none", reason: "cannot-accept-input" };
+
+  // ── A CHILD IS STILL RUNNING: PARK WHILE FRESH, HAND OVER IF THE SIGNAL IS STUCK ──────────────
+  // (bead sparkle-n2feho.1.) This agent's own turn closed, but a background task or a worker it
+  // spawned is actively working — the quiet is a DELEGATION, not a stall. Resuming would type
+  // "continue" into a terminal whose foreground is that running child (a long `pnpm verify`, a
+  // background Bash), interrupting the very work the resume exists to protect; escalating would page
+  // a human about an agent that is progressing. So a FRESH motion PARKS, exactly as an open PR does:
+  // no send, no page. It un-parks itself the moment the child settles.
+  //
+  // BUT A PARK NEEDS A BOUND, mirroring `externalWait` three lines down: both signals feeding motion
+  // have stuck-true states (a killed worker still reading `working`; a background-task footer whose
+  // count never re-read down), and an unbounded park would strand the agent in the "never continued
+  // AND never escalated" state this module abolishes. So once the motion has out-lasted
+  // {@link IN_MOTION_GRACE_MS}, or its age cannot be stated at all (`since: null`, the UNTIMED case
+  // externalWait also refuses to park on), the gate FALLS THROUGH to the bounds — where the streak
+  // and {@link MAX_CONTINUES_TOTAL} resume the diagnosis and a genuinely wedged delegate reaches a
+  // human. Placed before the bounds so a fresh delegating agent is never even resumed into.
+  const motion = input.inMotion;
+  if (motion !== undefined) {
+    const motionAgeMs = typeof motion.since === "number" ? now - motion.since : null;
+    if (motionAgeMs !== null && motionAgeMs < IN_MOTION_GRACE_MS) {
+      return { action: "none", reason: "in-motion" };
+    }
+    // STALE or UNTIMED: fall through to the bounds below.
+  }
 
   // BOUNDS. `continues` counts attempts since the mark last moved; a mark that has moved since the
   // last attempt means the agent DID something, so that streak is over and this attempt starts a

@@ -65,7 +65,11 @@ vi.mock("./attention", async (importOriginal) => {
 import { notifyAttention } from "./attention";
 import { resetWindowRegistry, setWindowProject } from "./windowRegistry";
 import { dispatchConciergeAnswer } from "./conciergeDispatch";
-import { EXTERNAL_WAIT_GRACE_MS } from "../engine/goalContinuation";
+import { EXTERNAL_WAIT_GRACE_MS, IN_MOTION_GRACE_MS } from "../engine/goalContinuation";
+import {
+  _resetBackgroundTaskRegistryForTests,
+  noteBackgroundTasks,
+} from "./backgroundTaskRegistry";
 import {
   _resetGoalContinuationRunnerForTests,
   idleSinceFor,
@@ -154,6 +158,7 @@ beforeEach(() => {
   } as never);
   resetTurnEndAuthority();
   _resetGoalContinuationRunnerForTests();
+  _resetBackgroundTaskRegistryForTests();
   sendMock.mockClear();
   notifyMock.mockClear();
 });
@@ -1048,6 +1053,50 @@ describe("evidence the sweep must actually gather", () => {
       action: "none",
       detail: "external-wait",
     });
+  });
+
+  it("an agent with a RUNNING CHILD is PARKED as in-motion — no send, no page", async () => {
+    // THE RUNNING-CHILD HALF of sparkle-n2feho.1, end to end through the real sweep. Identical to the
+    // no-PR streak that pages the human (the PAIR above), except the background-task registry holds
+    // the one fact the predicate never consulted: this agent's own turn closed while a child it
+    // spawned is still working. Resuming would type into the child; escalating would page about a
+    // progressing agent. So it parks — named, not silent.
+    const { projectId, agentId } = seed({ goal: "improve the app" });
+    noteBackgroundTasks(agentId, 1);
+    burn(projectId, agentId, 3);
+
+    await sweepGoalContinuations({ now: T0, ownsProject: ownsEverything });
+    const outcomes = await sweepGoalContinuations({ now: SETTLED, ownsProject: ownsEverything });
+
+    expect(notifyMock).not.toHaveBeenCalled();
+    expect(sendMock).not.toHaveBeenCalled();
+    expect(goalOf(projectId, agentId)!.escalatedAt).toBeUndefined();
+    expect(outcomes.find((o) => o.agentId === agentId)).toEqual({
+      agentId,
+      action: "none",
+      detail: "in-motion",
+    });
+  });
+
+  it("PAIR — a child that never settles reaches the human after IN_MOTION_GRACE_MS", async () => {
+    // The hole the bounded park closes: a stuck-true motion signal (a killed worker still reading
+    // `working`, a footer count that never clears) must not park forever. Run the real ledger past
+    // the grace with the task still live — this reds if the sweep stops folding the age, or if the
+    // pure gate drops its staleness check.
+    const { projectId, agentId } = seed({ goal: "improve the app" });
+    noteBackgroundTasks(agentId, 1);
+    burn(projectId, agentId, 3);
+
+    await sweepGoalContinuations({ now: T0, ownsProject: ownsEverything });
+    await sweepGoalContinuations({ now: SETTLED, ownsProject: ownsEverything });
+    expect(notifyMock).not.toHaveBeenCalled();
+
+    await sweepGoalContinuations({
+      now: T0 + IN_MOTION_GRACE_MS + 60_000,
+      ownsProject: ownsEverything,
+    });
+    expect(notifyMock).toHaveBeenCalledTimes(1);
+    expect(goalOf(projectId, agentId)!.escalatedAt).toBeDefined();
   });
 
   it("PAIR — the park is BOUNDED: a gate that never moves reaches the human after the grace", async () => {

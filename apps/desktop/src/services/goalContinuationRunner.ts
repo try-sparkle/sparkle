@@ -45,6 +45,8 @@ import type { WorkflowState } from "./branchStatus";
 import { hasUnmetGoal } from "../engine/agentGoal";
 import { quotaBlockForAgent } from "../engine/engineRegistry";
 import { hasTurnEndAuthority } from "../engine/turnEndAuthority";
+import { isInMotion } from "../engine/inMotion";
+import { hasLiveBackgroundTasksForAgent } from "./backgroundTaskRegistry";
 import { withUnmergedWork } from "../engine/unmergedAttention";
 import { resolveStage } from "../engine/workflowStage";
 import { useProjectStore } from "../stores/projectStore";
@@ -399,6 +401,7 @@ export function _resetGoalContinuationRunnerForTests(): void {
   undelivered.clear();
   suppressedUntil.clear();
   externalWaitSeen.clear();
+  inMotionSeen.clear();
   toolActivity.clear();
 }
 
@@ -455,6 +458,43 @@ const toolActivity = new Map<string, { lastSeen: number; bursts: number }>();
  */
 const externalWaitSeen = new Map<string, { signature: string; since: number }>();
 
+/** agentId → epoch ms this window first saw the agent CONTINUOUSLY in motion (a running child).
+ *  Mirrors {@link externalWaitSeen}: the sweep folds it via {@link noteInMotion}, and the shared
+ *  {@link continuationEvidenceFor} reads it, so the decision and the `resumeReading` prediction take
+ *  the same age and cannot drift. Presence is recomputed LIVE in the builder; this holds only the age. */
+const inMotionSeen = new Map<string, number>();
+
+/**
+ * Fold the first-seen-in-motion ledger for one agent. `inMotionNow` is the sweep's live reading; a
+ * `false` CLEARS the entry, so a child that settles and a later one that starts are two separate
+ * motions with two separate ages rather than one that looks stuck. Called once per agent per sweep,
+ * BEFORE {@link continuationEvidenceFor} reads it — the same fold-then-read order as the burst ledger.
+ */
+export function noteInMotion(agentId: string, inMotionNow: boolean, now: number): void {
+  if (!inMotionNow) {
+    inMotionSeen.delete(agentId);
+    return;
+  }
+  if (!inMotionSeen.has(agentId)) inMotionSeen.set(agentId, now);
+}
+
+/**
+ * The motion gate for one agent — LIVE presence plus its ledger age — or `undefined` when no child is
+ * running. Mirrors {@link externalWaitOf}: presence is recomputed every call from already-polled
+ * window state (worker statuses + the background-task footer count), so the predictor never lags on
+ * whether a child exists; only the AGE comes from the ledger the sweep folds. `since: null` when the
+ * ledger has not been folded for this agent yet — the UNTIMED case the pure gate refuses to park on.
+ */
+function inMotionOf(agent: AgentTab): { since: number | null } | undefined {
+  const siblings =
+    useProjectStore.getState().projects.find((p) => p.agents.some((a) => a.id === agent.id))?.agents ?? [agent];
+  const running =
+    isInMotion(agent.id, siblings, useRuntimeStore.getState().status) ||
+    hasLiveBackgroundTasksForAgent(agent.id);
+  if (!running) return undefined;
+  return { since: inMotionSeen.get(agent.id) ?? null };
+}
+
 /**
  * Fold ONE tick's windowed tool count into {@link toolActivity} and return the burst counter.
  *
@@ -505,6 +545,10 @@ export function noteToolActivity(
 export interface ContinuationEvidence {
   mark: string;
   externalWait: ExternalWait | undefined;
+  /** A running child gate, or undefined — see engine/goalContinuation ContinuationInput.inMotion.
+   *  Built here so the sweep and `resumeReading` apply the identical park; presence live, age from
+   *  the ledger the sweep folds. */
+  inMotion: { since: number | null } | undefined;
 }
 
 /**
@@ -545,6 +589,7 @@ export function continuationEvidenceFor(agent: AgentTab): ContinuationEvidence {
       prMark: prMarkOf(ws),
     }),
     externalWait: externalWaitOf(ws, agent.id),
+    inMotion: inMotionOf(agent),
   };
 }
 
@@ -978,6 +1023,7 @@ export async function sweepGoalContinuations(opts: SweepOptions = {}): Promise<S
   // gate that had been open for minutes — or, if the grace had not yet elapsed, be parked on
   // somebody else's evidence.
   for (const id of externalWaitSeen.keys()) if (!composite.has(id)) externalWaitSeen.delete(id);
+  for (const id of inMotionSeen.keys()) if (!composite.has(id)) inMotionSeen.delete(id);
 
   const outcomes: SweepOutcome[] = [];
   const pending: Promise<void>[] = [];
@@ -1029,10 +1075,18 @@ export async function sweepGoalContinuations(opts: SweepOptions = {}): Promise<S
       // written, every gate reports `since: null`, and the whole park is dead code that still
       // typechecks — the shape `ContinuationInput.quotaBlock` warns about two dozen lines below.
       noteExternalWait(agent.id, rt.workflowState?.[agent.id], now);
+      // …and the SAME fold-then-read for the running-child gate, whose age decides whether a
+      // delegating agent is parked or handed to a human once the child looks stuck. Presence is
+      // recomputed in `inMotionOf`; this only stamps the first-seen age.
+      noteInMotion(
+        agent.id,
+        isInMotion(agent.id, project.agents, raw) || hasLiveBackgroundTasksForAgent(agent.id),
+        now,
+      );
       // ONE builder, shared with the prediction surface, so the two cannot drift. Computed ONCE
       // here and passed below rather than re-derived: two reads of the same store can disagree,
       // and the mark that is DECIDED on must be the mark that is RECORDED.
-      const { mark, externalWait } = continuationEvidenceFor(agent);
+      const { mark, externalWait, inMotion } = continuationEvidenceFor(agent);
 
       // STATED, not inferred — see ContinuationInput.runtime. `AgentTab.runtime` is the store's own
       // record of where the agent runs, and the same field `getTransport` selects a transport by.
@@ -1111,6 +1165,10 @@ export async function sweepGoalContinuations(opts: SweepOptions = {}): Promise<S
         // which escalates exactly as before, so a window that has not polled this agent keeps
         // today's behaviour rather than silently going quiet.
         ...(externalWait === undefined ? {} : { externalWait }),
+        // A CHILD STILL RUNNING under an agent whose own turn closed — see engine/goalContinuation
+        // ContinuationInput.inMotion. From the SAME shared builder `resumeReading` uses, so the
+        // prediction cannot drift from the decision (roborev 65440's rule, applied to this gate).
+        ...(inMotion === undefined ? {} : { inMotion }),
         // The wall the agent itself reported. Without this line the whole backoff is dead code: the
         // gate lives in the pure decision, and the pure decision only knows what this sweep hands it.
         quotaBlock: quotaBlockForAgent(agent.id, now),
