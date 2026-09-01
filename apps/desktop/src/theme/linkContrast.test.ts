@@ -29,6 +29,12 @@ import { dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { LINK_MIN_CONTRAST, THEME_HEX } from "./colors";
+import {
+  attributedGuardReport,
+  blameInvocationCount,
+  resetBlameInvocationCount,
+  type GuardSite,
+} from "./scaleGuardTestUtils";
 
 /** WCAG relative luminance of a #rrggbb string. */
 function luminance(hex: string): number {
@@ -404,7 +410,11 @@ function styleExpr(tag: ts.JsxOpeningLikeElement): ts.Expression | undefined {
 
 describe("no link paints its text with a brand FILL token", () => {
   it("every underlined element's colour resolves to a verifiable ink tier", () => {
-    const offenders: string[] = [];
+    // SITES, not formatted strings. Who introduced each one is resolved lazily, only while the
+    // failure message is being built — this walks every .tsx in the tree, so blaming inline would
+    // put a `git` process behind every element on a GREEN run.
+    resetBlameInvocationCount();
+    const offenders: GuardSite[] = [];
 
     for (const file of sourceFiles(SRC)) {
       const src = readFileSync(file, "utf8");
@@ -425,17 +435,19 @@ describe("no link paints its text with a brand FILL token", () => {
         const tokens = [...text.matchAll(/\bC\.([A-Za-z_$][\w$]*)/g)].map((m) => m[1]!);
         const bad = tokens.find((t) => FILL_ONLY.includes(t));
         if (bad) {
-          offenders.push(`${rel}:${line} — color: ${shown} (C.${bad} is a fill; use C.${FILL_TO_INK[bad]})`);
+          offenders.push({ file: rel, line, text: `color: ${shown} (C.${bad} is a fill; use C.${FILL_TO_INK[bad]})` });
           return;
         }
         if (tokens.length > 0) {
           const unknown = tokens.find((t) => !INK_OK.test(t));
-          if (unknown) offenders.push(`${rel}:${line} — color: ${shown} (C.${unknown} is not a known text tier)`);
+          if (unknown) {
+            offenders.push({ file: rel, line, text: `color: ${shown} (C.${unknown} is not a known text tier)` });
+          }
           return;
         }
         if (INERT.test(text) || INK_HELPERS.test(text)) return;
         // FAIL CLOSED — an expression that cannot be traced to an ink is not evidence of safety.
-        offenders.push(`${rel}:${line} — color: ${shown} (unverifiable; point it at an ink token or route it through statusInk)`);
+        offenders.push({ file: rel, line, text: `color: ${shown} (unverifiable; point it at an ink token or route it through statusInk)` });
       };
 
       // Every `textDecoration: …underline` the AST actually reached. Cross-checked against a plain
@@ -463,7 +475,7 @@ describe("no link paints its text with a brand FILL token", () => {
             const imported = importedNames(sf);
             const roots = [...rootIdents(sx)];
             if (roots.length === 0 || !roots.every((r) => imported.has(r))) {
-              offenders.push(`${rel}:${lineOf(node)} — \`style={…}\` shape the AST cannot resolve to an object (teach styleCandidates about it rather than letting the element be skipped)`);
+              offenders.push({ file: rel, line: lineOf(node), text: "`style={…}` shape the AST cannot resolve to an object (teach styleCandidates about it rather than letting the element be skipped)" });
             }
           }
           for (const obj of candidates) {
@@ -498,7 +510,7 @@ describe("no link paints its text with a brand FILL token", () => {
             }
 
             if (sites.length === 0) {
-              offenders.push(`${rel}:${lineOf(node)} — underlined element has no resolvable colour in itself or its children (point it at an ink tier)`);
+              offenders.push({ file: rel, line: lineOf(node), text: "underlined element has no resolvable colour in itself or its children (point it at an ink tier)" });
             }
             for (const s of sites) check(s.colour, s.at);
           }
@@ -521,12 +533,32 @@ describe("no link paints its text with a brand FILL token", () => {
       src.split("\n").forEach((line, i) => {
         if (!/textDecoration:\s*[^,\n]*["']underline/.test(line)) return;
         if (accounted.has(i + 1)) return;
-        offenders.push(`${rel}:${i + 1} — an underlined style the AST walk never reached (unsupported \`style={…}\` shape; teach styleCandidates about it rather than letting it be skipped)`);
+        offenders.push({ file: rel, line: i + 1, text: "an underlined style the AST walk never reached (unsupported `style={…}` shape; teach styleCandidates about it rather than letting it be skipped)" });
       });
     }
 
-    expect(offenders, `underlined link text not provably on an ink tier:\n${offenders.join("\n")}`)
-      .toEqual([]);
+    expect(
+      offenders,
+      // Newest commit first, so the link this branch just wrote is the TOP entry rather than one
+      // alphabetical row among many. Built only when there is something to report.
+      offenders.length === 0
+        ? ""
+        : attributedGuardReport({
+            root: SRC,
+            headline: `${offenders.length} underlined link site(s) not provably on an ink tier.`,
+            remedy:
+              "Point the newest site above at an ink tier (C.ink / C.muted / C.faint) or route " +
+              "it through statusInk; a brand FILL token is not a text colour. If the site is an " +
+              "unresolvable `style={…}` shape, teach styleCandidates about it rather than " +
+              "letting the element be skipped.",
+            sites: offenders,
+          }),
+    ).toEqual([]);
+    // A GREEN scan must not have shelled out even once — see the note where offenders is declared.
+    expect(
+      blameInvocationCount(),
+      "a GREEN link scan spawned git processes — attribution must stay on the failing path only",
+    ).toBe(0);
   });
 
   it("no style module outside the scanned .tsx files defines an underlined style", () => {
@@ -536,7 +568,7 @@ describe("no link paints its text with a brand FILL token", () => {
     // while nothing outside the scanned `.tsx` set is a LINK — so this asserts exactly that, and
     // turns "we cannot see across modules" from a silent hole into a failure the moment a link
     // moves there. The remedy then is to follow the import, not to widen the exemption.
-    const offenders: string[] = [];
+    const offenders: GuardSite[] = [];
     const walk = (dir: string): void => {
       for (const e of readdirSync(dir, { withFileTypes: true })) {
         const p = join(dir, e.name);
@@ -544,12 +576,29 @@ describe("no link paints its text with a brand FILL token", () => {
         if (!e.isFile() || !p.endsWith(".ts") || p.endsWith(".d.ts") || p.includes(".test.")) continue;
         readFileSync(p, "utf8").split("\n").forEach((line, i) => {
           if (/textDecoration:\s*[^,\n]*["']underline/.test(line)) {
-            offenders.push(`${relative(SRC, p)}:${i + 1} — an underlined style outside the .tsx scan`);
+            offenders.push({
+              file: relative(SRC, p),
+              line: i + 1,
+              text: `an underlined style outside the .tsx scan: ${line.trim()}`,
+            });
           }
         });
       }
     };
     walk(SRC);
-    expect(offenders, `link styles the .tsx scan cannot reach:\n${offenders.join("\n")}`).toEqual([]);
+    expect(
+      offenders,
+      offenders.length === 0
+        ? ""
+        : attributedGuardReport({
+            root: SRC,
+            headline: `${offenders.length} link style(s) the .tsx scan cannot reach.`,
+            remedy:
+              "A link has moved into a non-.tsx module, which the single-file AST walk above " +
+              "exempts and therefore cannot check. Follow the import from the newest site above " +
+              "and bring the style back into the scanned set — do NOT widen the exemption.",
+            sites: offenders,
+          }),
+    ).toEqual([]);
   });
 });

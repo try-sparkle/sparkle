@@ -81,13 +81,23 @@ export const SIDEBAR_OVERLAY_Z = 25;
 // Above the floated Build column (see above) — the board covers that column, so it must also cover
 // it when floated — and clear of the stage's own overlays at 19-21. Well under the 38–45 band.
 //
-// `PreviewSlot` SHARES THIS NUMBER RATHER THAN DECLARING AN EQUAL ONE. It is the same geometry —
-// an inset-0 overlay over a pair's `paircols`, covering the Build column and carrying its own way
-// back out — so every word above applies to it unchanged. And the two can never be on screen
-// together: a pair has ONE `workMode`, and the board and the preview are two of its three values,
-// so they are mutually exclusive by construction and there is no ordering between them to express.
-// A second constant with the same value would be pure drift surface — kept equal by hand forever,
-// and the first time it drifted nothing could say which of the two was right.
+// WHO SHARES THIS NUMBER, AND WHY IT IS SHARED RATHER THAN COPIED.
+//
+// This paragraph used to name a `PreviewSlot` overlay and justify the sharing with "a pair has ONE
+// `workMode`, and the board and the preview are two of its three values". Both halves of that are
+// gone: d48af48e5 deleted the Preview segment, its mode and its pane, and `workModeBySide` now
+// carries two values per column (`build`/`plan`), not three. Nothing replaced the preview at this
+// depth — the surviving preview surface is the concierge preview CARD, which lives in the concierge
+// column and is not on this ladder at all.
+//
+// What DOES share the number is the SATELLITE WINDOW. `satellite/SatelliteApp.tsx` paints the same
+// `data-testid="plan-column"` overlay at this exact constant, because it is the same surface in a
+// second host, not a second surface at a coincidentally equal depth: both are `position: absolute`
+// + `inset: 0` over their host's column box, covering the Build content and carrying their own way
+// back out, so every word above applies to both unchanged. A new host imports this; it never
+// declares an equal one. A second constant with the same value would be pure drift surface — kept
+// equal by hand forever, and the first time it drifted nothing could say which of the two was
+// right.
 export const PLAN_COLUMN_Z = 27;
 
 /**

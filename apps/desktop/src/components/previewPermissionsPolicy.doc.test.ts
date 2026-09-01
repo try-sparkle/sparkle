@@ -9,10 +9,15 @@ import { describe, expect, it } from "vitest";
 // of the source list, because the only thing tying them together was a sentence asking people to
 // keep them in step. Prose documents drift; it does not detect it.
 //
-// The source list itself is well pinned (`Workspace.previewSlot.test.tsx` compares the parsed
-// `allow` attribute against a literal set, so an edit has to be mirrored deliberately). This closes
-// the other half: the `*` row must be exactly the source's `*` block, so a feature added to that
-// block reds this test until the doc names it too.
+// The source list used to be pinned from the other side too: `Workspace.previewSlot.test.tsx`
+// rendered the real iframe and compared its parsed `allow` attribute against a literal set. That
+// file does not exist anywhere in the repo — d48af48e5 deleted the Preview segment, its mode and
+// its pane, and with them the only element that ever carried the attribute. So THIS FILE IS NOW
+// THE ONLY THING HOLDING THE LIST, and `PREVIEW_PERMISSIONS_POLICY` has no production consumer at
+// all; both halves are dormant together, waiting on a renderer. The assertion below is unchanged
+// and still worth its keep: the `*` row must be exactly the source's `*` block, so a feature added
+// to that block reds this test until the doc names it too.
+//                                    # guard-ok — tombstone: names the deleted file on purpose
 //
 // SCOPED TO THE `*` ROW ON PURPOSE. That row is exhaustive because it is the class an empty
 // `allow` would leave open — the whole reason the file exists. The `self` row is illustrative (7 of

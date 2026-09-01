@@ -157,8 +157,15 @@ describe("previewStore", () => {
 
   // THE RELOAD BUTTON'S ONLY MECHANISM. The nonce is the iframe's `key`; React leaves an element
   // with an unchanged key alone even if you re-render it, so a reload that does not change this
-  // number is a control that looks fine and does nothing. (The DOM half of this claim is asserted
-  // in PreviewSlot.test.tsx against a real element.)
+  // number is a control that looks fine and does nothing.
+  //
+  // (The DOM half of this claim used to be credited to `PreviewSlot.test.tsx`, beside the
+  // `PreviewSlot.tsx` it covered. Neither file exists anywhere in the repo — d48af48e5 deleted the
+  // Preview segment, its mode and its pane. NOTHING ASSERTS THE DOM HALF TODAY, and nothing in the
+  // app reads `reloadNonce` either: every remaining reference is a test fixture. So this suite
+  // pins the reducer of a control that currently has no renderer. Read it as the contract a future
+  // renderer has to honour, not as a claim that one exists.)
+  //                                    # guard-ok — tombstone: names the deleted files on purpose
   it("bumpReload changes the nonce and leaves everything else alone", () => {
     usePreviewStore.getState().setPreview("a1", RUNNING);
     const before = usePreviewStore.getState().byAgent.a1!;

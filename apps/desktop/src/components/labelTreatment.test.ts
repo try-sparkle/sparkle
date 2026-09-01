@@ -7,6 +7,15 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { FONT_MONO, RADIUS, TYPE } from "../theme/scale";
+import {
+  UNATTRIBUTED_LABEL,
+  attributeSites,
+  attributedGuardReport,
+  blameInvocationCount,
+  blameSite,
+  resetBlameInvocationCount,
+  type GuardSite,
+} from "../theme/scaleGuardTestUtils";
 import { CHIP, COUNT, SECTION_LABEL, TAG, chip, tag } from "./labelTreatment";
 
 const SRC = fileURLToPath(new URL("..", import.meta.url));
@@ -26,16 +35,36 @@ const SRC = fileURLToPath(new URL("..", import.meta.url));
  * exempted the property written LAST in an object literal, and `line.match` stopped at the first
  * hit on a line.
  */
-function handTypedTracking(src: string, rel: string): string[] {
-  const out: string[] = [];
+function handTypedTracking(src: string, rel: string): GuardSite[] {
+  const out: GuardSite[] = [];
   src.split("\n").forEach((line, i) => {
     if (/^\s*(\/\/|\/\*|\*)/.test(line)) return;
     for (const m of line.matchAll(/letterSpacing:\s*([\d.]+)\s*(?=[,\n}]|$)/g)) {
       const px = Number(m[1]);
-      if (px > 0 && px < 2) out.push(`${rel}:${i + 1}: ${line.trim()}`);
+      // A SITE, not a formatted string: attribution costs a `git` process each, so who wrote this
+      // line is resolved LAZILY, only while a failure message is being built. The detection above
+      // is unchanged — this carries the same three facts the old string interpolated.
+      if (px > 0 && px < 2) out.push({ file: rel, line: i + 1, text: line.trim() });
     }
   });
   return out;
+}
+
+/** Every `.ts`/`.tsx` source file under `dir`, excluding tests. */
+function sourceFiles(dir: string, out: string[] = []): string[] {
+  for (const name of readdirSync(dir)) {
+    const p = join(dir, name);
+    if (statSync(p).isDirectory()) sourceFiles(p, out);
+    else if (/\.tsx?$/.test(name) && !name.includes(".test.")) out.push(p);
+  }
+  return out;
+}
+
+/** Every hand-typed tracking site in the whole tree — the ratchet's real scan, in one place. */
+function trackingSitesTreeWide(): GuardSite[] {
+  return sourceFiles(SRC).flatMap((f) =>
+    handTypedTracking(readFileSync(f, "utf8"), f.slice(SRC.length)),
+  );
 }
 
 describe("the section label matches the spec's .grp / .rail b", () => {
@@ -126,20 +155,25 @@ describe("the call sites actually use the treatment", () => {
   });
 
   it.each(MIGRATED)("%s does not re-type label tracking by hand", (rel) => {
-    expect(handTypedTracking(readFileSync(join(SRC, rel), "utf8"), rel)).toEqual([]);
+    const sites = handTypedTracking(readFileSync(join(SRC, rel), "utf8"), rel);
+    expect(
+      sites,
+      // Built only when there IS something to report — `expect(actual, message)` evaluates its
+      // message eagerly, so an unguarded call would blame on every green run.
+      sites.length === 0
+        ? ""
+        : attributedGuardReport({
+            root: SRC,
+            headline: `${rel} re-types label tracking by hand at ${sites.length} site(s).`,
+            remedy: `Spread SECTION_LABEL (or TAG) instead of writing the tracking out; the ` +
+              `treatment owns 0.1em so a call site cannot drift from it.`,
+            sites,
+          }),
+    ).toEqual([]);
   });
 });
 
 describe("nothing in the tree reaches for a capsule where the spec draws a box", () => {
-  function sourceFiles(dir: string, out: string[] = []): string[] {
-    for (const name of readdirSync(dir)) {
-      const p = join(dir, name);
-      if (statSync(p).isDirectory()) sourceFiles(p, out);
-      else if (/\.tsx?$/.test(name) && !name.includes(".test.")) out.push(p);
-    }
-    return out;
-  }
-
   // A RATCHET, like theme/scale.test.ts and fontTokens.test.ts, and for the same reason: the
   // remaining `999`s live in files other branches own, so a hard zero here would red the fleet for
   // work that is in flight. `PILL` stays legal in scale.ts for the shapes that genuinely need it —
@@ -179,28 +213,135 @@ describe("nothing in the tree reaches for a capsule where the spec draws a box",
   const MAX_HAND_TYPED_TRACKING = 8;
 
   it("the count of hand-typed label tracking never rises, tree-wide", () => {
-    const hits = sourceFiles(SRC).flatMap((f) =>
-      handTypedTracking(readFileSync(f, "utf8"), f.slice(SRC.length)),
-    );
+    resetBlameInvocationCount();
+    const sites = trackingSitesTreeWide();
     expect(
-      hits.length,
-      `${hits.length} hand-typed label tracking sites vs ceiling ${MAX_HAND_TYPED_TRACKING}. ` +
-        `Spread SECTION_LABEL / TAG (0.1em) instead:\n${hits.join("\n")}`,
+      sites.length,
+      // ONE feature commit reddens this, and CI then reports it against whichever unrelated branch
+      // runs next — so the list names the introducing commit for every site and puts the NEWEST at
+      // the top, which is where the entry this branch added will be. Built only on the failing
+      // path: `expect(actual, message)` evaluates its message eagerly, and this scans the tree.
+      sites.length <= MAX_HAND_TYPED_TRACKING
+        ? ""
+        : attributedGuardReport({
+            root: SRC,
+            headline:
+              `${sites.length} hand-typed label tracking sites vs ceiling ` +
+              `${MAX_HAND_TYPED_TRACKING} — ${sites.length - MAX_HAND_TYPED_TRACKING} too many.`,
+            remedy:
+              `Spread SECTION_LABEL / TAG (0.1em) at the newest site above instead of hand-typing ` +
+              `the tracking. If you MIGRATED sites rather than adding one, lower ` +
+              `MAX_HAND_TYPED_TRACKING to ${sites.length} in this PR — a ceiling left above the ` +
+              `real count is a free slot for the next drift.`,
+            sites,
+          }),
     ).toBeLessThanOrEqual(MAX_HAND_TYPED_TRACKING);
+    // HERMETICITY, pinned rather than promised: attribution shells out to `git`, and this scan
+    // walks the whole tree. A green run must spawn ZERO processes — move the blame into the
+    // scanner and this line goes red.
+    expect(
+      blameInvocationCount(),
+      "a GREEN ratchet run spawned git processes — attribution must stay on the failing path only",
+    ).toBe(0);
   });
 
   it("the count of literal `borderRadius: 999` never rises", () => {
-    const hits: string[] = [];
+    resetBlameInvocationCount();
+    const sites: GuardSite[] = [];
     for (const file of sourceFiles(SRC)) {
       readFileSync(file, "utf8").split("\n").forEach((line, i) => {
         if (/^\s*(\/\/|\/\*|\*)/.test(line)) return;
-        if (/borderRadius:\s*999\b/.test(line)) hits.push(`${file.slice(SRC.length)}:${i + 1}`);
+        if (/borderRadius:\s*999\b/.test(line)) {
+          sites.push({ file: file.slice(SRC.length), line: i + 1, text: line.trim() });
+        }
       });
     }
     expect(
-      hits.length,
-      `${hits.length} literal 999 radii vs ceiling ${MAX_LITERAL_999}. Use RADIUS.sm for a chip, ` +
-        `or PILL from theme/scale if the shape really is a circle or a capsule:\n${hits.join("\n")}`,
+      sites.length,
+      sites.length <= MAX_LITERAL_999
+        ? ""
+        : attributedGuardReport({
+            root: SRC,
+            headline:
+              `${sites.length} literal 999 radii vs ceiling ${MAX_LITERAL_999} — ` +
+              `${sites.length - MAX_LITERAL_999} too many.`,
+            remedy:
+              `Use RADIUS.sm for a chip at the newest site above, or PILL from theme/scale if the ` +
+              `shape really is a circle or a capsule. If you MIGRATED sites, lower ` +
+              `MAX_LITERAL_999 to ${sites.length} in this PR.`,
+            sites,
+          }),
     ).toBeLessThanOrEqual(MAX_LITERAL_999);
+    expect(
+      blameInvocationCount(),
+      "a GREEN ratchet run spawned git processes — attribution must stay on the failing path only",
+    ).toBe(0);
+  });
+});
+
+describe("a tripped ratchet names the commit behind every site it lists", () => {
+  // THE READING PROBLEM THIS GUARDS. One feature commit pushes the count over the ceiling, and CI
+  // reports it against whichever unrelated branch runs next. The old message listed every CURRENT
+  // hit and marked none as new, so the agent had to diff the list by hand against this constant's
+  // comment history to find the one line its own branch added.
+  //
+  // Deliberately fed by the REAL scan over the REAL tree, not a hand-built array: a test that
+  // formats a hand-made list proves the formatter works and says nothing about whether the ratchet
+  // feeds it. If the scan and the report ever stop agreeing on a shape, this is what goes red.
+  const sites = trackingSitesTreeWide();
+
+  it("has real sites to attribute — otherwise everything below is vacuous", () => {
+    expect(
+      sites.length,
+      "the tree-wide scan found nothing, so the attribution assertions below prove nothing",
+    ).toBeGreaterThan(0);
+  });
+
+  it("orders them NEWEST COMMIT FIRST, so the entry this branch added is on top", () => {
+    const times = attributeSites(SRC, sites).map((s) => s.blame.time);
+    expect(times, "the offender list is not sorted newest-commit-first").toEqual(
+      [...times].sort((a, b) => b - a),
+    );
+  });
+
+  it("spends the failure message on sha, date, author, file:line and the offending text", () => {
+    const attributed = attributeSites(SRC, sites);
+    const message = attributedGuardReport({
+      root: SRC,
+      headline: `${sites.length} hand-typed label tracking sites vs ceiling 0.`,
+      remedy: "Spread SECTION_LABEL / TAG (0.1em) instead.",
+      sites,
+    });
+
+    expect(message).toContain("NEWEST COMMIT FIRST");
+    expect(message).toContain("Spread SECTION_LABEL / TAG (0.1em) instead.");
+    for (const s of attributed) {
+      expect(message, `${s.file}:${s.line} is missing from the report`).toContain(
+        `${s.file}:${s.line}`,
+      );
+      expect(message, `${s.file}:${s.line} carries no attribution column`).toContain(
+        s.blame.label || UNATTRIBUTED_LABEL,
+      );
+      expect(message, `${s.file}:${s.line} lost its offending text`).toContain(s.text);
+    }
+
+    // The rendered ORDER matches the sorted order — a sorted array printed in scan order would
+    // still bury the new entry, which is the defect this exists to fix.
+    const first = attributed[0]!;
+    const last = attributed[attributed.length - 1]!;
+    if (first !== last) {
+      expect(message.indexOf(`${first.file}:${first.line}`)).toBeLessThan(
+        message.indexOf(`${last.file}:${last.line}`),
+      );
+    }
+
+    // We ARE in a git checkout, so at least one site must really carry a sha. Guarded by a control
+    // blame rather than assumed: outside a repo the contract is to degrade, not to fail.
+    if (blameSite(join(SRC, "theme/scale.ts"), 1).known) {
+      expect(
+        attributed.some((s) => s.blame.sha !== "" || s.blame.uncommitted),
+        "not one site was attributed inside a real git checkout",
+      ).toBe(true);
+    }
   });
 });

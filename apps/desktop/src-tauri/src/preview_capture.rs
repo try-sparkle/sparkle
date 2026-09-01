@@ -4,6 +4,7 @@
 //! surface the human watches, which this module never does. That surface is the concierge preview
 //! CARD, `components/Concierge/PreviewCards.tsx` over `services/previewCards.ts`; the
 //! `PreviewSlot.tsx` this line used to name no longer exists anywhere in the repo).
+//! # guard-ok — tombstone: names the deleted file on purpose, which is what a tombstone is for.
 //!
 //! WHY A FRESH HEADLESS BROWSER PER CALL, NOT A LONG-LIVED ONE: no lifecycle to leak, no
 //! orphan-sweep to write a second copy of (`preview.rs`'s supervisor already owns that problem for
@@ -662,6 +663,7 @@ fn query_dom_blocking(url: &str, selector: &str) -> Result<Vec<DomMatch>, String
 ///
 /// (The reference this used to carry — `PreviewSlot.tsx`'s `PREVIEW_PANE_FOR_STATE` — pointed at a
 /// file that no longer exists anywhere in the repo.)
+/// # guard-ok — tombstone: names the deleted file on purpose, which is what a tombstone is for.
 fn is_framable(state: PreviewState) -> bool {
     matches!(state, PreviewState::Listening | PreviewState::Ready | PreviewState::Serving)
 }
@@ -762,6 +764,7 @@ mod tests {
         // any TypeScript anyway; it exhausts the enum, which is the property worth pinning (a new
         // `PreviewState` variant forces a decision here rather than defaulting to non-framable).
         // See `is_framable`'s docblock for the peer predicates this set deliberately differs from.
+        // # guard-ok — tombstone: names the deleted file, and the retired test name, on purpose.
         assert!(is_framable(PreviewState::Listening));
         assert!(is_framable(PreviewState::Ready));
         assert!(is_framable(PreviewState::Serving));

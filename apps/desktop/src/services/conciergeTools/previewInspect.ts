@@ -4,6 +4,7 @@
 // sign-off, and because it would touch the surface the human watches — the concierge preview card
 // (`components/Concierge/PreviewCards.tsx` over `services/previewCards.ts`) — which this domain
 // never does. (The `PreviewSlot.tsx` this line used to name no longer exists anywhere in the repo.)
+// # guard-ok — tombstone: names the deleted file on purpose, which is what a tombstone is for.
 //
 // ---------------------------------------------------------------------------------------------
 // ADDITIVE, NOT A REBIND. This domain never opens, closes, or lists a preview (that is the
@@ -146,6 +147,8 @@ async function attempt<T>(
  * name `PreviewSlot.tsx`'s `PREVIEW_PANE_FOR_STATE`; that file no longer exists.) Refuses with
  * `no-preview` when none is open and `preview-not-ready` when one is open but has nothing rendered
  * yet, rather than returning a blank or stale image labelled as current.
+ *
+ * # guard-ok — tombstone: names the deleted file on purpose, which is what a tombstone is for.
  */
 export async function previewScreenshot(agentId: string): Promise<PreviewInspectResult<PreviewCapture>> {
   if (!agentId?.trim()) {

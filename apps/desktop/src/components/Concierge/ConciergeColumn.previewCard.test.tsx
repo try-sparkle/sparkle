@@ -7,7 +7,10 @@
 // neighbours:
 //
 //   1. THAT IT IS RENDERED AT ALL. A component nothing mounts is the whole feature, inert, with a
-//      green suite (`PreviewSlot` shipped mounted; several sibling surfaces did not).
+//      green suite. The worked example was the preview PANE: `PreviewSlot.tsx` shipped mounted
+//      while several sibling surfaces did not. d48af48e5 deleted that file and it exists nowhere
+//      in the repo; the example is kept because it is the reason this test exists, not because
+//      you can go and read it.       # guard-ok — tombstone: names the deleted file on purpose
 //   2. THAT IT SITS INSIDE THE `AgentPillProvider`. Outside it, the pill resolves nothing and
 //      renders the `concierge-agent-pill-closed` dead-end variant — a card that names an agent the
 //      reader cannot open, which LOOKS like a working pill. That is the exact failure

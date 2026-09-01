@@ -256,7 +256,17 @@ export const AGENT_FEEDBACK_DRAIN_STEP =
 
 /** The beads label the deployment-pipeline health scan writes into (one bead per non-green
  *  component, deduped, enriched on recurrence). Exported so the persona and its test name the SAME
- *  string as `scripts/pipeline-health-scan.sh`. */
+ *  string as `scripts/pipeline-health-scan.sh`.
+ *
+ *  gate-writer-ok — THE PRODUCER IS A SHELL SCRIPT, NOT TYPESCRIPT, and that is deliberate.
+ *  `scripts/unwritten-gate-constant-check.mjs` flags a gating constant that production READS but
+ *  only tests WRITE, because that shape shipped a whole feature nobody could reach (sparkle-srypl7).
+ *  This one is the legitimate exception the guard's own opt-out exists for: the writer is
+ *  `scripts/pipeline-health-scan.sh:660`, which files and enriches the bead through `bd` — outside
+ *  the TypeScript the scanner can see. The three production reads that are not the picker are
+ *  PROMPT TEXT telling the agent to run exactly that script, so the reader and the writer are
+ *  bound by this constant on purpose. If that script ever stops writing the label, this exemption
+ *  becomes a lie: the honest fix then is to delete it and let the guard fire. */
 export const PIPELINE_HEALTH_LABEL = "pipeline-health";
 
 /** Header of the deployment-pipeline health section. Exported so the test asserts its
