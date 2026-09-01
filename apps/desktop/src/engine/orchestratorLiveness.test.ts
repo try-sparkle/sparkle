@@ -151,6 +151,76 @@ describe("orchestratorLivenessOf", () => {
     },
   );
 
+  // ══ A GRID PROMPT OUTRANKS THE LATCH, INCLUDING ITS ABSENCE ════════════════════════════════
+  // The `awaiting` witness used to be read only INSIDE the WAITING_ON_HUMAN branch, so the module
+  // asked the UNTRUSTED latch for permission to consult the TRUSTED one. Any status outside that set
+  // — `idle`, `working`, or NO entry at all, which is the common case after a fleet-wide death —
+  // skipped it, fell through to the silence rule, and restarted an agent the grid was reporting at a
+  // prompt right then.
+  it.each([
+    ["idle", true as boolean | undefined],
+    ["working", true as boolean | undefined],
+    [undefined, undefined as boolean | undefined],
+  ] as const)(
+    "a grid reporting a prompt is staffing even when the latch says %s",
+    (status, alive) => {
+      expect(
+        orchestratorLivenessOf(
+          {
+            observedAlive: alive,
+            ...(status === undefined ? {} : { observedStatus: status }),
+            observedAttention: "awaiting",
+            lastHookEventMs: NOW - 121 * HOUR,
+          },
+          NOW,
+        ),
+      ).toBe(true);
+    },
+  );
+
+  // PAIRED — without this the hoist could be "any grid reading means staffing". Only `awaiting`
+  // outranks the silence rule; a `calm` reading over an `idle` latch still restarts, which is the
+  // measured incident and must keep working.
+  it("…but a non-prompt grid reading over an idle latch still reaches the silence rule", () => {
+    expect(
+      orchestratorLivenessOf(
+        {
+          observedAlive: true,
+          observedStatus: "idle",
+          observedAttention: "calm",
+          lastHookEventMs: NOW - 121 * HOUR,
+        },
+        NOW,
+      ),
+    ).toBe(false);
+  });
+
+  // ══ A LIVE GRID READING OUTRANKS A DEATH RECORD ════════════════════════════════════════════
+  // The nudger emits a verdict only for a PTY in its live set and sweeps everything else to `gone`,
+  // which clears the entry — so ANY non-`gone` reading is evidence the process was alive at that
+  // reading. A death record beside one is stale, and stale in a KNOWN direction:
+  // `deathRecordWriter.openDeathRecord` deliberately does not clear the record when its ledger write
+  // fails, a fail-toward-dead default chosen for a row colour. Without this, a respawned orchestrator
+  // whose `agent_life_open` was rejected would be restarted — and pasted into — on a `calm` misread
+  // of its own open prompt.
+  it.each(["calm", "delegating", "unreadable"] as const)(
+    "a live grid reading of %s makes a death record untrustworthy",
+    (verdict) => {
+      expect(
+        orchestratorLivenessOf(
+          {
+            observedAlive: true,
+            observedStatus: "waiting",
+            observedAttention: verdict,
+            deathRecorded: true,
+            lastHookEventMs: NOW - 121 * HOUR,
+          },
+          NOW,
+        ),
+      ).toBe(null);
+    },
+  );
+
   // ══ THE ARM THAT ACTUALLY RECOVERS THE BATCH-KILL POPULATION ═══════════════════════════════
   // The durable ledger is the one POSITIVE statement that the session ended — and a dead PTY has no
   // prompt to type into, which is what makes acting safe. Note this is the ONLY way a latched wait
@@ -188,9 +258,27 @@ describe("orchestratorLivenessOf", () => {
   });
 
   // `gone` is a value the type admits through the seam even though the listener consumes it by
-  // clearing the entry. It is not corroboration, so it must read exactly like an absence — pinned
-  // rather than left to work by accident, on the same reasoning the listener handles it explicitly.
-  it("a `gone` verdict is not corroboration", () => {
+  // clearing the entry. It must read exactly like an ABSENCE — which now means something the
+  // parent's version of this rule did not: absence is the ONLY state in which a death record is
+  // honoured, so `gone` must fall through to the death arm rather than be treated as a live reading.
+  // (The earlier form of this case asserted `null` for a bare `gone`, which was already true before
+  // the two-witness rule existed and so proved nothing.)
+  it("a `gone` verdict reads as ABSENCE, so the death record is still honoured", () => {
+    expect(
+      orchestratorLivenessOf(
+        {
+          observedAlive: true,
+          observedStatus: "waiting",
+          observedAttention: "gone",
+          deathRecorded: true,
+          lastHookEventMs: NOW - 121 * HOUR,
+        },
+        NOW,
+      ),
+    ).toBe(false);
+  });
+
+  it("…and a bare `gone` with no death record is still not corroboration", () => {
     expect(
       orchestratorLivenessOf(
         {

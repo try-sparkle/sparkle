@@ -228,6 +228,24 @@ export function orchestratorLivenessOf(
   // an agent sitting at an open prompt is STAFFING its epic — restarting it would type into that
   // prompt — and no hook-log age can make that untrue. See WAITING_ON_HUMAN. This returns the same
   // answer the one-witness code gave for these rows, so it is a preserved behaviour, not a new one.
+  // ── A GRID THAT SEES A PROMPT OUTRANKS EVERYTHING, INCLUDING THE ABSENCE OF A LATCH ─────────
+  // HOISTED ABOVE THE LATCH TEST, and that ordering is the fix (adversarial review of fb7519a57,
+  // finding 1). It used to be read INSIDE the `WAITING_ON_HUMAN` branch, which meant the module
+  // asked the UNTRUSTED latch for permission to consult the TRUSTED witness — leaving the witness
+  // unreachable in precisely the population it was added for.
+  //
+  // Measured against this module's own tests: an orchestrator whose `runtimeStore.status` says
+  // `idle` (or `working`, or has NO entry because no pane in this window ever mounted it — the
+  // common case after a fleet-wide death) skipped the branch entirely, fell through to the silence
+  // rule, and was restarted. `sendToBuild` then finds it `already-live` and delivers the handoff as
+  // a bracketed paste plus CR — into the prompt the grid was reporting AT THAT MOMENT.
+  //
+  // The grid is mount-independent and retracting: it is read off the agent's own screen in the Rust
+  // process for every live PTY, and swept to `gone` when the PTY dies. `awaiting` therefore means "a
+  // prompt is on screen NOW", which no status enum and no hook-log age can override. There is
+  // nothing a stale latch can add to that and nothing it should be able to subtract.
+  if (e.observedAttention === "awaiting") return true;
+
   if (e.observedAlive === true && e.observedStatus !== undefined && WAITING_ON_HUMAN.has(e.observedStatus)) {
     // A LATCHED `waiting` IS A CLAIM, NOT A READING, so it is corroborated. Two POSITIVE witnesses
     // are accepted and nothing else; anything short of one answers `null` (`staffing-unknown`),
@@ -266,7 +284,27 @@ export function orchestratorLivenessOf(
     // was chosen over the status latch in the first place. The residual is a wedged nudger leaving
     // a stale `awaiting`; that fails to `true` ⇒ skip, i.e. an epic not recovered, which is the
     // safe direction.
-    if (e.observedAttention === "awaiting") return true;
+    // `awaiting` is already answered above, so what remains is a latch with no corroborating grid.
+    //
+    // A LIVE GRID READING OUTRANKS A DEATH RECORD (review of fb7519a57, finding 3). The nudger emits
+    // a verdict only for a PTY in its `live_ids` set and sweeps everything else to `gone`, which
+    // CLEARS the entry — so ANY non-`gone` reading present here is evidence the process was alive at
+    // that reading. A death record alongside one is therefore stale, and stale in a known direction:
+    // `deathRecordWriter.openDeathRecord` deliberately does NOT clear the record when its ledger
+    // write fails ("a failed open leaves the row amber rather than silently repainting an agent that
+    // did not come back") — a fail-toward-DEAD default chosen for a ROW COLOUR, which is the safe
+    // direction there and the dangerous one for a PTY write. So a respawned orchestrator whose
+    // `agent_life_open` was rejected carries a death record while running, and without this line a
+    // `calm` misread of its open prompt would restart it and paste into that prompt.
+    // `gone` is EXCLUDED, and a test caught the code disagreeing with the comment above it: `gone` is
+    // the retraction itself — the nudger's statement that the PTY is dead — so it corroborates a
+    // death record rather than contradicting it. The listener normally consumes it by clearing the
+    // entry, so it should never be read here; the seam's type admits it, and "should never" is not a
+    // guarantee, which is the same reason the listener handles it explicitly.
+    if (e.observedAttention !== undefined && e.observedAttention !== "gone") return null;
+
+    // No grid reading at all — retracted, or a channel that never spoke — so the durable ledger is
+    // the only witness left, and it is the one that recovers the batch-kill population.
     if (e.deathRecorded === true) return false;
     return null;
   }

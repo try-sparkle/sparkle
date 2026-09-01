@@ -399,6 +399,53 @@ describe("against the real stores", () => {
     expect(s.restart).not.toHaveBeenCalled();
   });
 
+  // ── THE DEATH SEAM'S DEFAULT, DRIVEN, AND COUPLED TO THE REMEDY GATE ────────────────────────
+  // `deathRecordedFor` defaults to `deathCauseFor(id) !== undefined` and every other case INJECTS
+  // it, so the production line was executed by nothing: mutate it to `() => false` and no test reds,
+  // while the batch-kill recovery arm — the whole point of the death witness — goes permanently
+  // inert. Same defaulted-seam shape as the attention seam above (`sparkle-lgbwf`).
+  //
+  // It also pins the COUPLING the two-layer design turns on, which no test covered: in production
+  // `deathRecordedFor` and `deathCauseFor` are the SAME reading, so a latched wait released by the
+  // liveness layer arrives at the remedy gate carrying a real cause — and for a wall or a human
+  // stop that gate must still refuse. Injecting the two independently (as the other cases do) can
+  // hold a pair production cannot.
+  it("releases a latched wait via the REAL registry, then the remedy gate refuses a wall", async () => {
+    useRuntimeStore.getState().setAgentMovement({
+      a1: {
+        lastEvent: "PreToolUse",
+        lastEventMs: NOW - 121 * HOUR,
+        sessionId: "s1",
+        toolsRecent: 0,
+      },
+    });
+    // No grid entry at all, so the death record is the only witness — and it is read from the real
+    // registry, by the real default, for BOTH layers.
+    noteAgentDeath("a1", "wall-spend");
+    const s = scenario({ alive: true, status: "waiting", useRealSeams: true });
+    const o = forEpic(await s.run());
+    // Liveness released the latch (otherwise this would be `staffing-unknown`, never a `restart`
+    // decision) and the remedy gate then refused it, because a spawn cannot open a spend cap.
+    expect(o?.action).toBe("restart");
+    expect(o?.note).toBe("wall");
+    expect(s.restart).not.toHaveBeenCalled();
+  });
+
+  it("…and the same path RESTARTS when the real cause is a transport death", async () => {
+    useRuntimeStore.getState().setAgentMovement({
+      a1: {
+        lastEvent: "PreToolUse",
+        lastEventMs: NOW - 121 * HOUR,
+        sessionId: "s1",
+        toolsRecent: 0,
+      },
+    });
+    noteAgentDeath("a1", "transport-transient");
+    const s = scenario({ alive: true, status: "waiting", useRealSeams: true });
+    expect(forEpic(await s.run())?.performed).toBe("restarted");
+    expect(s.restart).toHaveBeenCalledTimes(1);
+  });
+
   it("reads the death cause out of the real registry, with no seam injected", async () => {
     useRuntimeStore.getState().setAgentMovement({
       a1: {
