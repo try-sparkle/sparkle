@@ -121,17 +121,6 @@ describe("mayRetire — the branch", () => {
     expect(m).not.toContain("0 commit");
   });
 
-  it("prints the CHECKABLE command when it knows the base it counted against", () => {
-    const v = mayRetire(
-      retirable({ unlanded: true, measuredOn: { branch: "sparkle/agent-x", ahead: 2, base: "main" } }),
-    );
-    const m = v.ok === false ? v.message : "";
-    // A count is an assertion; a command is checkable. `git log main..sparkle/agent-x` must
-    // reproduce the number the sentence quotes.
-    expect(m, "the refusal must print the range it counted").toContain("main..sparkle/agent-x");
-    expect(m).toContain("2 commits");
-  });
-
   // ── ONE READING, ONE BRANCH (roborev 73884) ───────────────────────────────────────────────────
   // `WorkflowState.aheadOfBase` is folded across nested adopted worktrees (Rust takes the subtree
   // MAX), and that same fold is what clears `inOriginMain` and makes `unlanded` fire. Pairing it
@@ -140,12 +129,23 @@ describe("mayRetire — the branch", () => {
   // with a named branch backing the wrong conclusion. The pin is at the call site
   // (`lifecycle.retire.test.ts`); this one pins the arm it depends on.
   it("never quotes a count that did not come with the branch it names", () => {
-    const v = mayRetire(
-      retirable({ unlanded: true, measuredOn: { branch: "sparkle/agent-x", ahead: 0, base: "main" } }),
-    );
+    const v = mayRetire(retirable({ unlanded: true, measuredOn: { branch: "sparkle/agent-x", ahead: 0 } }));
     const m = v.ok === false ? v.message : "";
     expect(m).toContain("sparkle/agent-x");
     expect(m, "a branch that read 0 ahead must not carry a commit count").not.toMatch(/\d+ commit/);
+  });
+
+  // ── NO RANGE UNTIL THE BASE IS ON THE WIRE (roborev 73959 / 73962) ────────────────────────────
+  // A command beats a count — but only a command that was actually run. The sole base reachable
+  // here is the caller's `project.defaultBranch`, and Rust counts against `effective_base`'s
+  // resolution of it (`origin/<default>` when that ref exists). The shared local checkout routinely
+  // lags its remote by hundreds of commits, so a printed `main..<branch>` would list the whole gap
+  // and disagree with the quoted number by two orders of magnitude.
+  it("prints NO range, because no base it could name is the one the count was measured against", () => {
+    const v = mayRetire(retirable({ unlanded: true, measuredOn: { branch: "feat/y", ahead: 2 } }));
+    const m = v.ok === false ? v.message : "";
+    expect(m).toContain("2 commits on");
+    expect(m, "a range whose base was never counted against must not be handed to an operator").not.toContain("..feat/y");
   });
 
   it("says NOTHING about a branch when the reading carries no name", () => {

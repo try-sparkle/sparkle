@@ -242,8 +242,6 @@ describe("retire_agent judges landing by reachability, never by the ahead count"
 describe("retire_agent's unlanded-work refusal says what it measured", () => {
   it("names the resolved branch and the range it counted", async () => {
     const p = seedProject();
-    // The base is what makes the sentence CHECKABLE — without it there is no range to re-run.
-    useProjectStore.getState().setDefaultBranch(p, "main");
     const id = seedBuild(p);
     useRuntimeStore.setState((s) => ({
       workflowStage: { ...s.workflowStage, [id]: "building_saved" },
@@ -256,10 +254,12 @@ describe("retire_agent's unlanded-work refusal says what it measured", () => {
     const msg = r.ok === false ? r.message : "";
     // The resolved branch, NOT the minted `sparkle/agent-<id>` name the worktree was created with.
     expect(msg, "the refusal must name the branch it counted").toContain("feat/renamed-away");
-    expect(msg, "and the range, so `git log` reproduces the number").toContain(
-      "main..feat/renamed-away",
-    );
     expect(msg).toContain("2 commits");
+    // NO RANGE: the only base this layer can name is the one it HANDED Rust, not the one
+    // `effective_base` counted against. See `unlandedEvidenceClause` (roborev 73959 / 73962).
+    expect(msg, "a range whose base was never counted against is worse than none").not.toContain(
+      "..feat/renamed-away",
+    );
   });
 
   // ONE READING, ONE BRANCH. `WorkflowState.aheadOfBase` is folded across nested adopted worktrees

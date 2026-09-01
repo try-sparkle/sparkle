@@ -126,7 +126,7 @@ export interface RetirementInputs {
    * predating the field deserializes to `undefined`, which means "this build cannot tell you" and
    * must render as NOTHING — never as a blank or guessed branch name.
    */
-  measuredOn?: { branch?: string; ahead?: number; base?: string } | null;
+  measuredOn?: { branch?: string; ahead?: number } | null;
   /** LIVE read of whether the agent is producing output. See {@link LiveActivity}. */
   liveActivity: LiveActivity;
   /** The concierge's own stated reason. Recorded verbatim in the audit trail. */
@@ -169,38 +169,44 @@ function retirableKind(kind: AgentKind): boolean {
  *
  * A REFUSAL A HUMAN CANNOT RE-RUN IS A REFUSAL THEY WILL CALL A BUG. This is the same remedy
  * `BranchStatus.branch` was put on the wire for (sparkle-pgkbn4 — "the row had no way to say what it
- * counted"), spent on the one surface that actively asks somebody to go and check with git. So where
- * it can, it prints the COMMAND rather than a number: `git log <base>..<branch>` is checkable, and a
- * bare count is only an assertion.
+ * counted"), spent on the one surface that actively asks somebody to go and check with git.
  *
- * Four arms, and the empty one is deliberate:
- *   • name + positive count + base → the command and its expected answer;
- *   • name + positive count       → the count on that branch, with no base to reproduce it against;
+ * Three arms, and the empty one is deliberate:
+ *   • name + positive count → the count, on the branch it was counted on;
  *   • name alone → the name. A non-positive `ahead` is not "nothing outstanding" here — a squash or
  *     rebase land leaves that counter at a number this rung must not quote (see `unlanded`) — so an
  *     unread count is simply not shown rather than rendered as `0 commits`;
  *   • no name → NOTHING. An absent `BranchStatus.branch` means "this build cannot tell you", and a
  *     blank or guessed branch name is worse than the sentence that never claimed one.
  *
- * ⚠️ WHEN THE BASE IS NAMED IT IS THE PROJECT'S DEFAULT BRANCH, while Rust counted against
- * `origin/<default>` whenever that ref exists. The two differ only while the local base LAGS its
- * remote, and then the local count is the LARGER one — so a human re-running the printed command
- * sees at least as many commits as the message claimed. That is the safe direction for this
- * sentence: it can under-claim, never over-claim, so the reading can never look manufactured.
+ * ⚠️ IT NAMES NO BASE, AND MUST NOT UNTIL ONE IS ON THE WIRE (roborev 73959 / 73962). Printing
+ * `git log <base>..<branch>` would be strictly better than a bare count — a command is checkable and
+ * a number is only an assertion — but the only base reachable from here is the CALLER'S
+ * `project.defaultBranch`, and Rust does not count against that. `effective_base` re-resolves it to
+ * `origin/<default>` whenever that ref exists, and falls back to a drifted default (`master`), to
+ * `HEAD`, or to a no-base path where `ahead` is the branch's ENTIRE history. Two of those name a ref
+ * the count never ran against and one does not resolve at all.
+ *
+ * An earlier revision printed the local name anyway, arguing the two differ only while the local
+ * base LAGS its remote, so the sentence could under-claim but never over-claim. That argument was
+ * wrong in both directions and worst in the common one: the shared `main` checkout here routinely
+ * sits far behind `origin/main` (`scripts/main-checkout-fresh.sh` exists to report exactly that), so
+ * a branch cut from a recent `origin/main` makes `main..<branch>` list every commit in the gap —
+ * measured shape, 2 claimed against ~302 listed. Handing an operator a command that disagrees with
+ * the sentence by two orders of magnitude is the "this reading looks manufactured" outcome this
+ * whole change exists to remove. The fix is to return `effective_base`'s resolved ref from
+ * `agent_branch_status_at` beside `branch`, so all three fields come from ONE reading; until then,
+ * a bare count on a named branch is the most this can honestly say.
  */
 function unlandedEvidenceClause(m: RetirementInputs["measuredOn"]): string {
   const branch = m?.branch?.trim();
   if (!branch) return "";
   const ahead = m?.ahead;
-  const base = m?.base?.trim();
   const counted = typeof ahead === "number" && Number.isFinite(ahead) && ahead > 0;
   // The trailing clause is the load-bearing half for the case this was built from: without it a
   // human checks the branch their worktree happens to have checked out, gets the opposite answer,
   // and concludes the refusal is false.
   const measured = `That is the branch this reading was measured on, which is not always the one checked out in the agent's worktree`;
-  if (counted && base) {
-    return `: “${base}..${branch}” holds ${ahead} commit${ahead === 1 ? "" : "s"}. ${measured}`;
-  }
   if (counted) {
     return `: ${ahead} commit${ahead === 1 ? "" : "s"} on “${branch}”. ${measured}`;
   }

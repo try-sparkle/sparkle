@@ -1858,7 +1858,12 @@ export async function retireAgent(
     // nested adopted worktrees — Rust takes the subtree MAX — so pairing it with this branch's name
     // would print a count that was measured somewhere else, which is the false-positive reading this
     // whole change exists to remove. `measuredOn`'s own doc carries the measured shape.
-    measuredOn: { branch: facts.bs?.branch, ahead: facts.bs?.ahead, base: project.defaultBranch ?? undefined },
+    //
+    // ⚠️ NO BASE IS PASSED, deliberately (roborev 73959 / 73962). `project.defaultBranch` is what
+    // this caller HANDS Rust, not what Rust counted against: `effective_base` re-resolves it to
+    // `origin/<default>` when that ref exists, and the shared local checkout routinely lags it far
+    // enough that the two ranges differ by hundreds of commits. See `unlandedEvidenceClause`.
+    measuredOn: { branch: facts.bs?.branch, ahead: facts.bs?.ahead },
     liveActivity: deps.readActivity(agentId),
     reason: args.reason,
     deadClaim: args.deadClaim ?? null,
