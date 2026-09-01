@@ -34,6 +34,32 @@ function sourceFiles(dir: string, out: string[] = []): string[] {
   return out;
 }
 
+// A scan that silently matched NOTHING would make every ceiling in this file vacuous. The ratchets
+// below all gate on `hits.length <= CEILING`, and zero satisfies that — forever, silently, over a
+// tree nobody opened. That is not hypothetical here: every agent worktree on this machine lives
+// under a path containing a space ("Application Support"), so a walk rooted on a
+// `new URL(..).pathname` reads a percent-encoded directory that does not exist. The
+// `fileURLToPath` above is what keeps SRC honest; this floor is what notices if anything ever
+// stops being honest.
+//
+// It THROWS rather than returning an empty list, so the vacuity is impossible rather than merely
+// detectable: one broken walk reds every ratchet that depends on it, not just whichever single
+// test happens to carry the assertion. Compare `modalChrome.test.ts`, which anchors its own
+// narrower scope the same way.
+const MIN_SCANNED_FILES = 200;
+
+function scannedSourceFiles(): string[] {
+  const files = sourceFiles(SRC);
+  if (files.length < MIN_SCANNED_FILES) {
+    throw new Error(
+      `the source scan under ${SRC} found ${files.length} file(s), below the floor of ` +
+        `${MIN_SCANNED_FILES}. The ratchets in this file gate on a COUNT, so a truncated or empty ` +
+        `scan reports GREEN while guarding nothing. Fix the walk — do not lower this floor.`,
+    );
+  }
+  return files;
+}
+
 /**
  * Every numeric value assigned to `<prop>`, however it is written.
  *
@@ -64,7 +90,7 @@ function sourceFiles(dir: string, out: string[] = []): string[] {
  */
 function offScale(prop: string, allowed: readonly number[]): { file: string; value: number }[] {
   const hits: { file: string; value: number }[] = [];
-  for (const file of sourceFiles(SRC)) {
+  for (const file of scannedSourceFiles()) {
     const src = readFileSync(file, "utf8");
     // module-level numeric constants in THIS file, so `fontSize: BASE` resolves to its value
     const consts = new Map<string, number>();

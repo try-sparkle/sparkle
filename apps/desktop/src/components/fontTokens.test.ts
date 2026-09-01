@@ -40,6 +40,32 @@ function sourceFiles(dir: string, out: string[] = []): string[] {
   return out;
 }
 
+// A scan that silently matched NOTHING would make every ceiling in this file vacuous. The ratchets
+// below all gate on `hits.length <= CEILING`, and zero satisfies that — forever, silently, over a
+// tree nobody opened. That is not hypothetical here: every agent worktree on this machine lives
+// under a path containing a space ("Application Support"), so a walk rooted on a
+// `new URL(..).pathname` reads a percent-encoded directory that does not exist. The
+// `fileURLToPath` above is what keeps SRC honest; this floor is what notices if anything ever
+// stops being honest.
+//
+// It THROWS rather than returning an empty list, so the vacuity is impossible rather than merely
+// detectable: one broken walk reds every ratchet that depends on it, not just whichever single
+// test happens to carry the assertion. Compare `modalChrome.test.ts`, which anchors its own
+// narrower scope the same way.
+const MIN_SCANNED_FILES = 200;
+
+function scannedSourceFiles(): string[] {
+  const files = sourceFiles(SRC);
+  if (files.length < MIN_SCANNED_FILES) {
+    throw new Error(
+      `the source scan under ${SRC} found ${files.length} file(s), below the floor of ` +
+        `${MIN_SCANNED_FILES}. The ratchets in this file gate on a COUNT, so a truncated or empty ` +
+        `scan reports GREEN while guarding nothing. Fix the walk — do not lower this floor.`,
+    );
+  }
+  return files;
+}
+
 /** The webfont families the app used to render in, and which the spec replaced with the system face. */
 const BANNED = ["IBM Plex Sans", "IBM Plex Mono", "Source Code Pro", "Verdana"];
 
@@ -380,7 +406,7 @@ export function applyExemptions(
 
 function scan(): { banned: string[]; quoted: string[] } {
   return applyExemptions(
-    sourceFiles(SRC).map((f) => [f.slice(SRC.length), readFileSync(f, "utf8")] as const),
+    scannedSourceFiles().map((f) => [f.slice(SRC.length), readFileSync(f, "utf8")] as const),
   );
 }
 
