@@ -597,6 +597,17 @@ export function selfMarkRefusal(verify: GoalVerify, evidence?: GoalVerifyEvidenc
       // blocked self-latch became a human-mediated false close plus a false escalation. So this
       // arm states git's actual finding, explains why ancestry is not evidence here, and asks for
       // the one thing that would be: authored commits.
+      //
+      // ⚠️ AND IT NAMES A DOOR (roborev 72416). This arm's population is EXACTLY the agent that can
+      // never self-close: `canSelfMarkMet` requires `landed === true`, and the reading is pinned
+      // `false` here because `authoredWorkSeen` is false — which is precisely what a squash-merged
+      // PR followed by a worktree parked back on origin/main produces, and it will stay false. So
+      // the concierge is the ONLY door. Asking for better evidence and then not saying where to
+      // take it leaves a genuinely-landed agent gathering a merged PR, having nowhere to go,
+      // re-marking met, being refused identically, and auto-continuing to escalation. That is the
+      // sparkle-vfkqz shape the `unlandedWork === false` arm's own comment names — "an agent left
+      // escalating because the copy named no door it could open itself" — and the first cut of
+      // THIS arm reintroduced it. The ancestry prohibition stays; only the destination is added.
       if (evidence?.landed === false && evidence?.landedSource === "git-probe-unproven") {
         return (
           "This goal is verified by the work being on origin/main. A git ancestry check DOES say " +
@@ -607,7 +618,9 @@ export function selfMarkRefusal(verify: GoalVerify, evidence?: GoalVerifyEvidenc
           "cannot close on that `true`. Do NOT take the ancestry result to the concierge as proof " +
           "— it would close this goal over work that may not exist. If you HAVE landed work, show " +
           "what it was: `gh pr list --state merged --head <this branch>`, or the shas you " +
-          "authored. If you have not, the work still has to be committed and landed."
+          "authored, and ask the concierge to close this goal on THAT evidence — never open a " +
+          "second PR for work already merged. If you have not, the work still has to be committed " +
+          "and landed."
         );
       }
       // ⚠️ THE SQUASH POPULATION GETS ITS OWN REMEDY, BECAUSE ANCESTRY CANNOT SETTLE IT

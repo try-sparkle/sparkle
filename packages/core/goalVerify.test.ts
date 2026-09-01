@@ -256,6 +256,11 @@ describe("canSelfMarkMet — the self-report gate", () => {
     // …and must NOT hand over the argument that closes the goal through a human.
     expect(refusedTrue).not.toMatch(/merge-base --is-ancestor/);
     expect(refusedTrue).toMatch(/Do NOT take the ancestry result to the concierge/i);
+    // …but it must still NAME A DOOR (roborev 72416). This arm's population can never self-close —
+    // the gate needs `landed === true` and the reading is pinned false — so the concierge is the
+    // only exit. Forbidding the ancestry argument and then not saying where to take better
+    // evidence leaves a genuinely-landed agent escalating with nothing to open.
+    expect(refusedTrue).toMatch(/ask the concierge to close/i);
     // The gate itself is untouched: provenance changes what is SAID, never what may close.
     expect(canSelfMarkMet({ kind: "landed" }, { landed: false, landedSource: "git-probe-unproven" })).toBe(
       false,
@@ -597,6 +602,36 @@ describe("the DOCS that quote these refusals — pinned to the strings actually 
     {},
     undefined,
   ];
+
+  it("EVERY distinct landed refusal names an action that closes the goal (roborev 72416)", () => {
+    // THE RULE THIS ENFORCES, and it has now been broken twice by two different arms: a refusal is
+    // an instruction the agent will follow, so it has to terminate in something that CLOSES the
+    // goal. Some populations can self-close (land it, then mark met again); some structurally
+    // cannot, because `canSelfMarkMet` needs `landed === true` and their reading is pinned false —
+    // for those the concierge is the only door, and an arm that omits it leaves the agent
+    // re-marking, being refused identically, and auto-continuing to escalation (sparkle-vfkqz).
+    //
+    // Asserted over LANDED_EVIDENCE rather than a hand-listed set, so an arm added later is swept
+    // in automatically — the same reason the arm-count and field-coverage checks below derive
+    // from the source instead of trusting this file's opinion.
+    for (const ev of LANDED_EVIDENCE) {
+      const out = selfMarkRefusal({ kind: "landed" }, ev);
+      if (!out) continue;
+      // TWO DOORS EXIST, and an arm must name at least one. SELF-CLOSE — some phrasing of
+      // marking the goal met once the work lands — or the CONCIERGE, for the populations whose
+      // reading is pinned `false` and which therefore can never satisfy `canSelfMarkMet`. The
+      // self-close pattern is deliberately loose about the surrounding words ("mark this met
+      // again", "mark this goal met yourself") and strict about the verb: an arm that never says
+      // "mark … met" and never names the concierge has told the agent nothing it can act on.
+      const namesADoor =
+        /ask the concierge to close/i.test(out) || /mark (this|it)( goal)? met/i.test(out);
+      expect(
+        namesADoor,
+        `this refusal names no action that closes the goal — the agent has nowhere to go:\n${out}`,
+      ).toBe(true);
+    }
+  });
+
 
   it("the evidence matrix exercises every field the landed case actually branches on", () => {
     // Read from the SOURCE, not from this file's memory of it. `evidence?.<name>` inside the

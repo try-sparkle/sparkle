@@ -6674,7 +6674,8 @@ pub(crate) fn stranded_after_merge_report(
          repository DID move, so do not call merge_pr again — but it did not land all of \
          `{head_ref}`. The merge commit's second parent is {second_parent}, while the pushed branch \
          head is {remote_tip}: {stranded} {plural} {was} not merged. `gh` exited 0, so nothing else \
-         will tell you this (bead sparkle-a08oi0); the usual cause is a push that raced the merge. \
+         will tell you this (bead sparkle-a08oi0); the usual cause is a push that raced the merge, \
+         or one that landed just after it. \
          Its branch may already be deleted, so read the gap with `git log --oneline \
          {second_parent}..{remote_tip}` and open a NEW pull request for those commits."
     )
@@ -6711,83 +6712,311 @@ pub fn is_merged_but_stranded_report(message: &str) -> bool {
 /// `None` at every step: this runs AFTER the irreversible half, so a network hiccup must not turn a
 /// merge that landed into an error. Only a POSITIVE, fully-read mismatch is allowed to speak.
 fn merged_second_parent(root: &str, number: u64) -> Option<String> {
-    let gh_json = |path: &str, jq: &str| -> Option<String> {
-        let mut cmd = Command::new(crate::preflight::gh_program());
-        cmd.args(["api", path, "--jq", jq])
-            .current_dir(root)
-            .env("GH_PROMPT_DISABLED", "1")
-            .env("GH_NO_UPDATE_NOTIFIER", "1");
-        apply_noninteractive(&mut cmd);
-        let output = output_with_timeout(cmd, NETWORK_TIMEOUT).ok()?;
-        if !output.status.success() {
-            return None;
+    let merge = gh_json(root, &format!("repos/{{owner}}/{{repo}}/pulls/{number}"), ".merge_commit_sha")?;
+    gh_json(root, &format!("repos/{{owner}}/{{repo}}/commits/{merge}"), ".parents[1].sha // \"\"")
+}
+
+/// ONE `gh api … --jq` read, `None` on every non-answer — a transport failure, a non-zero exit, an
+/// empty body, or the literal `null` `--jq` prints for an absent field, which would otherwise become
+/// a sha-shaped string and be compared against a real sha as if it were one.
+///
+/// Shared by [`merged_second_parent`] and [`remote_branch_head`] rather than written twice, because
+/// the two reads are the two halves of ONE comparison: if they resolved a non-answer differently,
+/// the gate could compare an authoritative sha against a placeholder and call the difference a
+/// dropped merge.
+fn gh_json(root: &str, path: &str, jq: &str) -> Option<String> {
+    let mut cmd = Command::new(crate::preflight::gh_program());
+    cmd.args(["api", path, "--jq", jq])
+        .current_dir(root)
+        .env("GH_PROMPT_DISABLED", "1")
+        .env("GH_NO_UPDATE_NOTIFIER", "1");
+    apply_noninteractive(&mut cmd);
+    let output = output_with_timeout(cmd, NETWORK_TIMEOUT).ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if s.is_empty() || s == "null" { None } else { Some(s) }
+}
+
+/// The branch's CURRENT head, read from GitHub — the authoritative answer to "what did the PR's
+/// branch hold", and the same source [`merged_second_parent`] already trusts for the same reason.
+///
+/// IT IS NOT `refs/remotes/origin/<head_ref>`. That ref is a LOCAL MIRROR, and nothing on the
+/// `merge_pr` path refreshes it: there is no fetch anywhere between the gates and the merge. So it
+/// answers "what did THIS clone last observe", which equals the branch head only when this clone
+/// happened to witness the racing push. The race this gate exists to catch is precisely the one
+/// where it did not — a push from another machine or clone, from the GitHub UI, or a PR merged INTO
+/// the branch on the remote (`sparkle-80ek3u`). In every one of those the mirror still points at the
+/// OLD head, `ahead` is 0, and the verdict reads `Landed` over a merge that dropped work: the exact
+/// silent success bead `sparkle-a08oi0` exists to end, under a comment claiming the remote was read
+/// (roborev 72414).
+///
+/// THE LIVE BRANCH REF IS READ FIRST, AND THE PR RECORD IS ONLY THE FALLBACK — and that ordering
+/// is the whole substance of this function, because the obvious-looking reverse makes the gate
+/// STRUCTURALLY INCAPABLE of ever reporting anything (roborev 72547).
+///
+/// `.head.sha` on `pulls/{number}` is the SAME RECORD [`merged_second_parent`] reads
+/// `.merge_commit_sha` from, and for a `--merge` the merge commit's `parents[1]` **is** the head
+/// GitHub merged — so the two are two projections of one instant, and a merge freezes `.head.sha`
+/// when it closes the PR. Reading it first therefore hands [`merge_landing_check`] two values that
+/// are equal by construction, it takes the `second_parent == remote_tip` short circuit, and the
+/// verdict is `Landed` before the containment is ever asked. Bead sparkle-a08oi0's own shape is
+/// exactly the losing case: the merge lands, a commit is pushed afterwards, a re-run answers
+/// "already merged" at exit 0, and the frozen `.head.sha` still equals the merged head. A gate that
+/// cannot emit `Stranded` is not a gate.
+///
+/// So the ref answers first, and the PR record covers the two shapes where it CANNOT answer:
+///
+///   • `git/ref/heads/<head_ref>` **404s whenever the head branch no longer exists at read time**,
+///     and this read runs immediately after `gh pr merge` succeeded — on a repo with "Automatically
+///     delete head branches" the merge itself deletes that ref, so a ref-only source left the gate
+///     inert for EVERY merge on that repo, with nothing logged (roborev 72508).
+///     `stranded_after_merge_report` says "Its branch may already be deleted" in its own prose.
+///   • A FORK PR, where `{owner}/{repo}` resolves to the BASE repo. `.head.sha` is the fork's sha
+///     and is right there.
+///
+/// BUT THE REF IS RESOLVED BY BARE NAME, AND A NAME IS NOT AN IDENTITY (roborev 72641). `head_ref`
+/// is `probe_pr_merge_facts`'s `headRefName` with no repository attached, and the read is against
+/// the BASE repo — so "a fork 404s" only holds while the base repo has no branch of that name. When
+/// it does, the read SUCCEEDS and hands back a sha belonging to something else entirely:
+///
+///   • a fork PR from `main`, `patch-1`, or any name the base repo also carries;
+///   • BRANCH-NAME REUSE, which this repo does by construction — the app can hand two agents the
+///     same branch name — reached on exactly the path the bead describes, a `merge_pr` re-invoked
+///     on an already-merged PR long after that name was recreated by somebody else.
+///
+/// That is not a `CannotTell`. A genuine fork sha is fail-safe only because
+/// [`remote_containment`]'s `compare` 404s on an object the base repo lacks; a SAME-NAMED
+/// base-repo head is an object the base repo resolves perfectly, so `compare` answers, the shape is
+/// very likely `behind == 0 && ahead > 0`, and the gate emits a POSITIVELY ASSERTED
+/// `MERGED-BUT-STRANDED` naming an unrelated sha and telling the user to open a new pull request
+/// for commits that are already on the default branch. A false accusation costs more than silence.
+///
+/// So the ref is only believed once it has been RECONCILED WITH THIS PR, twice over: the PR's head
+/// must live in the base repo at all (`.head.repo.full_name == .base.repo.full_name`, and a reading
+/// that cannot be obtained counts as NO), and the ref's sha must CONTAIN `.head.sha` — a branch that
+/// moved forward does, a recreated one wearing the same name does not. Anything else falls back to
+/// `.head.sha`, which is the only one of the two sources tied to this pull request.
+///
+/// A PUSH LANDING AFTER THE MERGE IS REPORTED, and that is deliberate rather than a false
+/// accusation. The ref has moved past what the merge took, so those commits really are on the
+/// default branch nowhere and on no pull request — which is the situation
+/// [`stranded_after_merge_report`] describes and the remedy it gives (open a NEW pull request) is
+/// the right one. Suppressing it is what costs the gate its own bead.
+///
+/// Two reads of `pulls/{number}` (this fallback and [`merged_second_parent`]'s) rather than one
+/// that returns both shas: [`gh_json`]'s single-value contract is what turns every non-answer into
+/// `None`, and a combined read would have to re-derive that per field, which is where a placeholder
+/// gets compared against a real sha as though it were one.
+///
+/// `None` on any non-answer, which the gate reads as `CannotTell` — a head we could not obtain must
+/// never render as "landed cleanly".
+fn remote_branch_head(root: &str, number: u64, head_ref: &str) -> Option<String> {
+    remote_branch_head_with(root, number, head_ref, gh_json, remote_containment)
+}
+
+/// [`remote_branch_head`] with both remote reads injected, so the shapes that decide this function
+/// are expressible in a test at all: a `git/ref/heads/` read cannot be made to 404 on demand, and a
+/// base-repo branch that merely SHARES A NAME with a fork's head cannot be conjured live either.
+///
+/// `read` and `containment` are taken as `(root, …)` functions and passed BY NAME from
+/// [`remote_branch_head`] — never wrapped in a closure. Same reason as [`merge_landing_gate`]: a
+/// closure at a wiring site has an argument order that a source-text pin cannot check, and swapping
+/// this containment's two shas inverts exactly the reconciliation below (roborev 72547).
+fn remote_branch_head_with(
+    root: &str,
+    number: u64,
+    head_ref: &str,
+    read: impl Fn(&str, &str, &str) -> Option<String>,
+    containment: impl Fn(&str, &str, &str) -> Option<(usize, usize)>,
+) -> Option<String> {
+    let pr = format!("repos/{{owner}}/{{repo}}/pulls/{number}");
+    let pr_head = read(root, &pr, ".head.sha");
+    // FAIL-CLOSED: only an explicit `true` licenses a bare-name read against the base repo. An
+    // unreadable answer, a deleted head repo (`.head.repo` is null on the wire), or a fork all
+    // leave the name meaning something this pull request has no claim on.
+    let head_is_in_the_base_repo = read(root, &pr, ".head.repo.full_name == .base.repo.full_name")
+        .is_some_and(|same| same == "true");
+
+    let head_ref = head_ref.trim();
+    if head_is_in_the_base_repo && !head_ref.is_empty() {
+        if let Some(ref_sha) =
+            read(root, &format!("repos/{{owner}}/{{repo}}/git/ref/heads/{head_ref}"), ".object.sha")
+        {
+            match pr_head.as_deref() {
+                // The ref must CONTAIN the head this PR is about. A branch that moved forward does
+                // (`behind == 0`); a branch of the same name recreated by another agent does not,
+                // and believing it is a positively asserted report naming an unrelated sha.
+                Some(head) if matches!(containment(root, head, &ref_sha), Some((_, 0))) => {
+                    return Some(ref_sha);
+                }
+                // Nothing to reconcile against, so there is nothing the ref can contradict.
+                None => return Some(ref_sha),
+                // Unrelated, rewound, or unresolvable: this name is not this PR's branch any more.
+                Some(_) => {}
+            }
         }
-        let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        // `--jq` on an absent field prints `null`, not nothing — which would otherwise become a
-        // sha-shaped string and be compared against the branch tip as if it were one.
-        if s.is_empty() || s == "null" { None } else { Some(s) }
+    }
+    pr_head
+}
+
+/// How the two heads contain one another, ASKED OF THE SAME AUTHORITY THAT SUPPLIED THEM.
+/// `Some((ahead, behind))` where `ahead` counts commits reachable from `head` and not from `base`,
+/// and `behind` the reverse — the exact pair [`merge_landing_verdict`] classifies.
+///
+/// IT IS NOT A LOCAL `git rev-list`, and that is the whole point (roborev 72508). The race this gate
+/// exists to catch is a commit pushed from another machine or clone, from the GitHub UI, or a PR
+/// merged INTO the branch on the remote (`sparkle-80ek3u`) — and in every one of those **the object
+/// is not in this clone's store at all**, because nothing on the `merge_pr` path fetches. Both
+/// `rev-list`s then fail with `bad revision`, the verdict is `CannotTell`, and the gate returns
+/// `Ok(())`: byte for byte the silent success of bead `sparkle-a08oi0`, with only the internal label
+/// changed. Reading the branch head from GitHub while still counting locally moved the failure, it
+/// did not remove it.
+///
+/// `compare/{base}...{head}` was chosen over fetching the object first because it needs NO write to
+/// the git dir — which is shared by every worktree on this machine — and because it resolves against
+/// the same source both shas already come from, so the three facts cannot disagree with each other.
+///
+/// `None` on every non-answer, including the fork-PR 404 (`{owner}/{repo}` is the BASE repo, which
+/// does not have the fork's objects) and a `null` count. The gate reads that as `CannotTell`, which
+/// fails in the safe direction: this runs after the irreversible half.
+fn remote_containment(root: &str, base: &str, head: &str) -> Option<(usize, usize)> {
+    let raw = gh_json(
+        root,
+        &format!("repos/{{owner}}/{{repo}}/compare/{base}...{head}"),
+        r#""\(.ahead_by) \(.behind_by)""#,
+    )?;
+    let mut parts = raw.split_whitespace();
+    let ahead = parts.next()?.parse().ok()?;
+    let behind = parts.next()?.parse().ok()?;
+    Some((ahead, behind))
+}
+
+/// WHAT IS ACTUALLY MEASURED: the merge commit's second parent against the branch head GitHub
+/// reports right now. BOTH shas are parameters, BOTH come from the remote, AND SO DOES THE
+/// CONTAINMENT BETWEEN THEM — `containment` is [`remote_containment`] in production. Nothing in
+/// here touches the local object store, in either spelling: not for the shas, and not for the
+/// counts. When the authority cannot answer, the verdict is `CannotTell`.
+///
+/// THE COUNTS USED TO BE A LOCAL `git rev-list` AND THAT MADE THE GATE INERT IN ITS OWN SCENARIO
+/// (roborev 72508). A commit pushed from another clone is not in this one's store, so both counts
+/// failed and every targeted race landed in `CannotTell` → `Ok(())`. The cases that reached
+/// `Stranded` were the ones where the racing object happened to be local, which a normal `push` or
+/// `fetch` from this clone does not produce. See [`remote_containment`].
+///
+/// It is a check rather than a claim about the remote: `remote_head` is whatever the caller could
+/// obtain, so a comment saying "the remote was read" would be a promise this function cannot keep.
+/// It reads what it is handed, and says `CannotTell` when it is handed nothing.
+///
+/// Both shas are parameters rather than read in here so the comparison is testable against a REAL
+/// repo with a REAL merge commit — the only way to prove the two `rev-list` ranges are not reversed
+/// — and so the STALE-MIRROR case is expressible at all. It is not expressible while the branch head
+/// is read from `refs/remotes/origin/<head_ref>` inside this function, because a test can only make
+/// that ref agree with its own expectations (roborev 72414).
+///
+/// THE BRANCH HEAD IS NOT A LOCAL REF, in either spelling. `refs/heads/` is wrong in the direction
+/// that produces a FALSE ACCUSATION: a worktree merely holding UNPUSHED commits merges perfectly
+/// correctly and would be reported as a dropped merge, with prose blaming "a push that raced the
+/// merge" when nothing was pushed at all (roborev 72228) — unpushed work is the SEPARATE hazard
+/// [`worktree_ahead_gate`] refuses BEFORE the merge. `refs/remotes/origin/` is wrong in the
+/// direction that produces a SILENT FALSE NEGATIVE, which is worse: it is an unrefreshed mirror of
+/// what this clone last observed, so in the very race this gate targets it still points at the old
+/// head and the verdict reads `Landed` (roborev 72414). See [`remote_branch_head`].
+fn merge_landing_check(
+    second_parent: Option<&str>,
+    remote_head: Option<&str>,
+    containment: impl FnOnce(&str, &str) -> Option<(usize, usize)>,
+) -> MergeLanding {
+    let (Some(second_parent), Some(remote_tip)) = (
+        second_parent.map(str::trim).filter(|s| !s.is_empty()),
+        remote_head.map(str::trim).filter(|s| !s.is_empty()),
+    ) else {
+        // Either side unread is NOT "landed cleanly". This is the fail-closed half of a gate that
+        // otherwise fails open: `CannotTell` still returns `Ok(())` from the gate, but it must not
+        // be spelled `Landed`, or a future reader gets a positive answer nobody established.
+        return MergeLanding::CannotTell;
     };
-    let merge = gh_json(&format!("repos/{{owner}}/{{repo}}/pulls/{number}"), ".merge_commit_sha")?;
-    gh_json(&format!("repos/{{owner}}/{{repo}}/commits/{merge}"), ".parents[1].sha // \"\"")
+    // Settled before the containment read on purpose: when the merge took exactly what the branch
+    // holds, the shas alone say so, and the round trip buys nothing.
+    if second_parent == remote_tip {
+        return MergeLanding::Landed;
+    }
+    // A PAIR of counts rather than a single "is contained" answer: an ancestry probe reports FALSE
+    // and an ERROR with the same shape, and conflating "not contained" with "could not answer" is
+    // the exact class of bug this whole gate exists to end. An unresolvable pair is `None` here and
+    // becomes `CannotTell` — never a clean landing, and never an accusation.
+    let Some((ahead, behind)) = containment(second_parent, remote_tip) else {
+        return MergeLanding::CannotTell;
+    };
+    merge_landing_verdict(second_parent, remote_tip, ahead, behind)
 }
 
 /// Verify, AFTER `gh pr merge` reports success, that the merge commit actually contains the branch
-/// tip it was asked to merge (bead sparkle-a08oi0: a merge answered "already merged" at exit 0 while
-/// a commit pushed seconds earlier was not in the merge commit at all).
+/// head it was asked to merge (bead sparkle-a08oi0: a merge answered "already merged" at exit 0
+/// while a commit pushed seconds earlier was not in the merge commit at all).
 ///
-/// `second_parent` is the head the merge took, read from the merge commit itself. It is a parameter
-/// rather than read in here so the comparison is testable against a REAL repo with a REAL merge
-/// commit, which is the only way to prove the two `rev-list` ranges are not reversed.
-///
-/// IT MEASURES THE REMOTE-TRACKING REF, NOT `refs/heads/`. The question is "did the merge take
-/// everything the PR's branch held", and the PR's branch is the REMOTE one. A local `refs/heads/`
-/// tip is wrong in both directions, and the direction that matters is the false accusation: a
-/// worktree merely holding UNPUSHED commits merges perfectly correctly and would be reported as a
-/// dropped merge — with prose blaming "a push that raced the merge" when nothing was pushed at all
-/// (roborev 72228). Unpushed work is the SEPARATE hazard [`worktree_ahead_gate`] refuses BEFORE the
-/// merge. No remote-tracking ref means we cannot establish what was pushed, so it is `CannotTell`:
-/// fail-closed against the false positive, exactly where the rest of this gate fails open.
+/// ONE DELEGATING CALL, and it passes [`remote_containment`] as a FUNCTION ITEM rather than
+/// wrapping it in a closure. That is not a style choice (roborev 72547): a closure here —
+/// `|base, head| remote_containment(root, base, head)` — has a swappable parameter list, and
+/// `|head, base| remote_containment(root, base, head)` inverts `ahead` and `behind` so every
+/// genuinely stranded merge becomes `CannotTell` (a silent `Ok(())`) and a merge that took MORE
+/// than the branch head becomes a false accusation. A source-text pin cannot see that swap; it
+/// contains the same substring. With the function passed by name there is no argument order here
+/// to get wrong, and the one place the order IS written is inside [`merge_landing_gate_with`],
+/// which the real-repo arms drive end to end.
 fn merge_landing_gate(
     root: &str,
     number: u64,
     head_ref: &str,
     second_parent: Option<&str>,
+    remote_head: Option<&str>,
 ) -> Result<(), String> {
-    let head_ref = head_ref.trim();
-    let Some(second_parent) = second_parent.map(str::trim).filter(|s| !s.is_empty()) else {
+    merge_landing_gate_with(root, number, head_ref, second_parent, remote_head, remote_containment)
+}
+
+/// [`merge_landing_gate`] with the containment source injected: [`merge_landing_check`] plus
+/// [`merge_landing_report`], composed exactly as production composes them.
+///
+/// THE COMPOSITION IS THE POINT. The classifier alone cannot prove the two containment directions
+/// were pointed at the right ends, and swapping them turns bead sparkle-a08oi0's own case into a
+/// silent pass — so a test that re-implements this composition locally proves nothing about the
+/// code that runs. `containment` takes `(root, base, head)` so a repo-backed fake has the same
+/// shape as [`remote_containment`] and the real arms can pass it by name too.
+fn merge_landing_gate_with(
+    root: &str,
+    number: u64,
+    head_ref: &str,
+    second_parent: Option<&str>,
+    remote_head: Option<&str>,
+    containment: impl Fn(&str, &str, &str) -> Option<(usize, usize)>,
+) -> Result<(), String> {
+    let landing =
+        merge_landing_check(second_parent, remote_head, |base, head| containment(root, base, head));
+    merge_landing_report(number, head_ref, second_parent, remote_head, landing)
+}
+
+/// The pure mapping of a [`MergeLanding`] onto `merge_pr`'s `Result` channel. `Landed` and
+/// `CannotTell` both return `Ok(())`, because this runs after the irreversible half — only a
+/// POSITIVE, fully-read mismatch may speak.
+fn merge_landing_report(
+    number: u64,
+    head_ref: &str,
+    second_parent: Option<&str>,
+    remote_head: Option<&str>,
+    landing: MergeLanding,
+) -> Result<(), String> {
+    let MergeLanding::Stranded { stranded } = landing else {
         return Ok(());
     };
-    if head_ref.is_empty() {
-        return Ok(());
-    }
-    let full_ref = format!("refs/remotes/origin/{head_ref}");
-    let Ok(local_tip) = git(root, &["rev-parse", "--verify", "--quiet", &full_ref]) else {
-        return Ok(());
-    };
-    let local_tip = local_tip.trim().to_string();
-    // Two counts rather than `git merge-base --is-ancestor`: that command reports FALSE and an ERROR
-    // with the SAME non-zero exit, and conflating "not contained" with "git could not answer" is the
-    // exact class of bug this whole gate exists to end. A `rev-list --count` over an object we do not
-    // have fails loudly instead, and lands in `CannotTell`.
-    let count = |range: String| -> Option<usize> {
-        git(root, &["rev-list", "--count", &range]).ok()?.trim().parse().ok()
-    };
-    let (Some(ahead), Some(behind)) = (
-        count(format!("{second_parent}..{local_tip}")),
-        count(format!("{local_tip}..{second_parent}")),
-    ) else {
-        return Ok(());
-    };
-    match merge_landing_verdict(second_parent, &local_tip, ahead, behind) {
-        MergeLanding::Landed | MergeLanding::CannotTell => Ok(()),
-        MergeLanding::Stranded { stranded } => Err(stranded_after_merge_report(
-            number,
-            head_ref,
-            second_parent,
-            &local_tip,
-            stranded,
-        )),
-    }
+    // Only reachable when both shas were non-empty — every other shape is `CannotTell` above.
+    Err(stranded_after_merge_report(
+        number,
+        head_ref.trim(),
+        second_parent.unwrap_or_default().trim(),
+        remote_head.unwrap_or_default().trim(),
+        stranded,
+    ))
 }
 
 /// Wall-clock ceiling for the roborev query. Local IPC to a daemon, so shorter than a network read;
@@ -7076,7 +7305,16 @@ pub async fn merge_pr(
             // unreadable one (roborev 69915). This POST-merge gate is fail-OPEN by design and
             // already returns Ok on an empty ref, so flattening it here preserves its contract
             // exactly: it cannot check what it could not read, and the merge already happened.
-            return merge_landing_gate(&root, number, head_ref.unwrap_or_default(), merged_second_parent(&root, number).as_deref());
+            // It is BOUND rather than flattened inline because both the second parent and the
+            // authoritative branch head are read from it (roborev 72508 / 72641).
+            let head_ref = head_ref.unwrap_or_default();
+            return merge_landing_gate(
+                &root,
+                number,
+                &head_ref,
+                merged_second_parent(&root, number).as_deref(),
+                remote_branch_head(&root, number, &head_ref).as_deref(),
+            );
         }
         let output = &captured.output;
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -12816,23 +13054,43 @@ mod tests {
     /// `let _ = merge_landing_gate(...);` that swallows the report, and the whole bead is a report
     /// that never reached anyone. It must also sit AFTER the merge — before it, there is no merge
     /// commit to read, so the check could only ever be vacuous.
+    ///
+    /// IT ALSO PINS WHICH SOURCE SUPPLIES THE BRANCH HEAD, and that is the half every other test
+    /// here is structurally blind to. Both shas are injected parameters, so every unit test below
+    /// passes its own — which means the line choosing the PRODUCTION value is covered by nothing,
+    /// and swapping [`remote_branch_head`] back for a `rev-parse refs/remotes/origin/<ref>` would
+    /// keep the whole suite green while restoring the stale-mirror false negative of roborev 72414.
     #[test]
     fn merge_pr_returns_the_merge_landing_gate_rather_than_a_bare_ok() {
+        // Whole lines, so a commented-out call or a `let _ = …` swallow cannot satisfy them.
         // `head_ref` became an `Option` when the PRE-merge gates started disagreeing about an
         // unreadable one (roborev 69915); this POST-merge gate is fail-OPEN and already returns Ok
-        // on an empty ref, so it takes the flattened value. The pin tracks the call, not the spelling
-        // it had before.
-        const CALL: &str =
-            "return merge_landing_gate(&root, number, head_ref.unwrap_or_default(), merged_second_parent(&root, number).as_deref());";
+        // on an empty ref, so it takes the flattened value. The pin tracks the call, not the
+        // spelling it had before — but it still pins WHICH SOURCES the call reads.
+        const CALL: &[&str] = &[
+            "let head_ref = head_ref.unwrap_or_default();",
+            "return merge_landing_gate(",
+            "merged_second_parent(&root, number).as_deref(),",
+            // THE AUTHORITATIVE READ. Not `refs/remotes/origin/` — see `remote_branch_head`.
+            "remote_branch_head(&root, number, &head_ref).as_deref(),",
+        ];
         let src = include_str!("worktree.rs");
         let start = src.find("pub async fn merge_pr(").expect("merge_pr's signature");
         let body = &src[start..];
         let merge = body.find("merge_argv(number,").expect("the merge argv");
         let after = &body[merge..];
         let end = after.find("\n}\n").unwrap_or(after.len());
+        let arm = &after[..end];
+        for line in CALL {
+            assert!(
+                arm.lines().any(|l| l.trim() == *line),
+                "merge_pr's success arm must RETURN merge_landing_gate after `gh pr merge`, reading \
+                 the branch head from GitHub; missing line: {line}"
+            );
+        }
         assert!(
-            after[..end].lines().any(|l| l.trim() == CALL),
-            "merge_pr's success arm must RETURN merge_landing_gate, after `gh pr merge`, not `Ok(())`"
+            !arm.contains("refs/remotes/origin/"),
+            "the branch head must not come from an unrefreshed local mirror (roborev 72414)"
         );
     }
 
@@ -12931,9 +13189,25 @@ mod tests {
         }
     }
 
-    /// A REAL repo with a REAL merge commit, driving the gate rather than only its classifier. The
-    /// classifier cannot prove the two `rev-list` ranges were pointed at the right ends, and swapping
-    /// them turns the bead's own case into a silent pass — which is the mistake this test catches.
+    /// Containment resolved from `repo` — the test's stand-in for [`remote_containment`], which in
+    /// production asks GitHub. `ahead` counts commits reachable from `head` and not `base`, matching
+    /// `compare/{base}...{head}`'s `.ahead_by`, and `behind` the reverse: pointed at the wrong ends
+    /// this returns the mirror image and every `Stranded` arm below flips, which is what makes the
+    /// real-repo arms worth their cost.
+    ///
+    /// IT IS DELIBERATELY POINTED AT A REPO THE CALLER NAMES, because "which store answered the
+    /// containment question" is the whole subject of roborev 72508. An arm that passes `root` is
+    /// asserting the OLD behaviour; the arms that matter pass a store `root` has never fetched from.
+    fn containment_in(repo: &str, base: &str, head: &str) -> Option<(usize, usize)> {
+        let count = |range: String| -> Option<usize> {
+            git(repo, &["rev-list", "--count", &range]).ok()?.trim().parse().ok()
+        };
+        Some((count(format!("{base}..{head}"))?, count(format!("{head}..{base}"))?))
+    }
+
+    /// A REAL repo with a REAL merge commit, driving the classifier and the report together. The
+    /// pure verdict cannot prove the two containment ranges were pointed at the right ends, and
+    /// swapping them turns the bead's own case into a silent pass — the mistake this test catches.
     #[test]
     fn merge_landing_gate_reports_a_merge_that_did_not_take_the_branch_tip() {
         let root = init_repo("merge-landing-gate");
@@ -12947,33 +13221,469 @@ mod tests {
         let second_parent = git(&root, &["rev-parse", "HEAD^2"]).unwrap().trim().to_string();
         assert_eq!(second_parent, merged_head, "precondition: the merge took the branch as it stood");
 
-        // MATCHING: the pushed branch head is what the merge took, so the gate must stay silent.
+        // THE REAL COMPOSITION, not a local re-implementation of it: `merge_landing_gate_with` is
+        // `merge_landing_gate`'s own body with only the containment SOURCE injected, and
+        // `containment_in` is passed by name so it has the same `(root, base, head)` shape
+        // `remote_containment` has. A test that re-composed `merge_landing_check` and
+        // `merge_landing_report` itself would prove nothing about the code that runs, and the two
+        // containment directions — the thing this real-repo fixture exists to pin — would be
+        // unguarded (roborev 72547).
+        let gate = |sp: Option<&str>, head: Option<&str>| -> Result<(), String> {
+            merge_landing_gate_with(&root, 7, "agent/work", sp, head, containment_in)
+        };
+
+        // MATCHING: GitHub says the branch head is what the merge took, so the gate stays silent.
         git(&root, &["checkout", "-q", "agent/work"]).unwrap();
-        git(&root, &["update-ref", "refs/remotes/origin/agent/work", &second_parent]).unwrap();
-        assert!(merge_landing_gate(&root, 7, "agent/work", Some(&second_parent)).is_ok());
+        assert!(gate(Some(&second_parent), Some(&second_parent)).is_ok());
 
         // THE BEAD: a commit PUSHED while the merge settled. `gh` exited 0; it is not in the merge.
         git(&root, &["commit", "--allow-empty", "-m", "pushed seconds before the merge settled"]).unwrap();
         let tip = git(&root, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
         // UNPUSHED it proves nothing — that is `worktree_ahead_gate`'s hazard, not this one, and
         // reporting it here accuses a correct merge of dropping work nobody ever sent (roborev 72228).
+        // The commit exists locally; GitHub still reports the branch head as the head that merged.
         assert!(
-            merge_landing_gate(&root, 7, "agent/work", Some(&second_parent)).is_ok(),
+            gate(Some(&second_parent), Some(&second_parent)).is_ok(),
             "a merely-unpushed local commit must NOT be reported as a merge that dropped work"
         );
-        // Now it is pushed, and the remote branch head is genuinely not in the merge commit.
-        git(&root, &["update-ref", "refs/remotes/origin/agent/work", &tip]).unwrap();
-        let err = merge_landing_gate(&root, 7, "agent/work", Some(&second_parent))
+        // Now GitHub reports it as the branch head, and it is genuinely not in the merge commit.
+        let err = gate(Some(&second_parent), Some(&tip))
             .expect_err("the merge commit's second parent is not the pushed head; that commit landed nowhere");
         assert!(err.contains(&second_parent), "must name the merged head {second_parent}: {err}");
         assert!(err.contains(&tip), "must name the pushed branch head {tip}: {err}");
         assert!(err.contains("1 commit was"), "{err}");
 
-        // Nothing positive to read is never a report: no second parent, no such branch, and a sha
-        // this repo has never seen (which makes `rev-list` fail rather than answer "not contained").
-        assert!(merge_landing_gate(&root, 7, "agent/work", None).is_ok());
-        assert!(merge_landing_gate(&root, 7, "no/such/branch", Some(&second_parent)).is_ok());
-        assert!(merge_landing_gate(&root, 7, "agent/work", Some("deadbeef")).is_ok());
+        // Nothing positive to read is never a report: no second parent, no branch head (the shape a
+        // 404 or a network failure produces), and a pair the authority could not resolve.
+        assert!(gate(None, Some(&tip)).is_ok());
+        assert!(gate(Some(&second_parent), None).is_ok());
+        assert!(gate(Some(&second_parent), Some("deadbeef")).is_ok());
+        // ...and none of those unread shapes may be spelled `Landed`: `CannotTell` and `Landed` both
+        // return `Ok(())`, so the Result alone cannot tell them apart and asserting on it would be
+        // vacuous for the one that matters.
+        for unread in [
+            merge_landing_check(None, Some(&tip), |b, h| containment_in(&root, b, h)),
+            merge_landing_check(Some(&second_parent), None, |b, h| containment_in(&root, b, h)),
+            merge_landing_check(Some(&second_parent), Some("deadbeef"), |b, h| containment_in(&root, b, h)),
+            // The authority itself declining to answer — a 404, a network failure, a `null` count.
+            merge_landing_check(Some(&second_parent), Some(&tip), |_, _| None),
+        ] {
+            assert_eq!(unread, MergeLanding::CannotTell, "an unread side is never a clean landing");
+        }
+    }
+
+    /// THE STALE-MIRROR ARM — the case the whole gate exists for, and the one every arm above is
+    /// blind to (roborev 72414). `refs/remotes/origin/<branch>` is a local mirror and NOTHING on the
+    /// `merge_pr` path refreshes it, so when the racing commit is pushed from somewhere this clone
+    /// never observed — another machine, the GitHub UI, a PR merged INTO the branch on the remote
+    /// (`sparkle-80ek3u`) — the mirror still points at the head the merge took. Measuring it there
+    /// gives `ahead == 0` and a verdict of `Landed` over a merge that dropped a commit: the silent
+    /// success of bead sparkle-a08oi0, restored.
+    ///
+    /// THE MIRROR IS BYTE-IDENTICAL IN BOTH ARMS, deliberately. The only thing that differs is the
+    /// authoritative head, so a pass here pins the CAUSE — "the gate reads the authoritative head"
+    /// — rather than mere absence, which a gate that had simply stopped reporting anything would
+    /// also satisfy.
+    #[test]
+    fn a_stale_remote_tracking_mirror_does_not_make_a_dropped_merge_look_landed() {
+        let root = init_repo("merge-landing-stale-mirror");
+        git(&root, &["checkout", "-q", "-b", "agent/work"]).unwrap();
+        git(&root, &["commit", "--allow-empty", "-m", "the head the merge was decided against"]).unwrap();
+        let merged_head = git(&root, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
+        git(&root, &["checkout", "-q", "main"]).unwrap();
+        git(&root, &["merge", "-q", "--no-ff", "--no-edit", "agent/work"]).unwrap();
+        let second_parent = git(&root, &["rev-parse", "HEAD^2"]).unwrap().trim().to_string();
+        assert_eq!(second_parent, merged_head, "precondition: the merge took the branch as it stood");
+
+        // The commit that raced the merge in. It is on the real branch; the mirror never saw it.
+        git(&root, &["checkout", "-q", "agent/work"]).unwrap();
+        git(&root, &["commit", "--allow-empty", "-m", "pushed from a clone this one never fetched"]).unwrap();
+        let real_head = git(&root, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
+
+        // THE STALE MIRROR: exactly the head the merge took, which is what makes it look clean.
+        git(&root, &["update-ref", "refs/remotes/origin/agent/work", &second_parent]).unwrap();
+        assert_eq!(
+            git(&root, &["rev-parse", "refs/remotes/origin/agent/work"]).unwrap().trim(),
+            second_parent,
+            "precondition: the mirror is stale at the merged head, so measuring IT reads `Landed`"
+        );
+
+        // DROPPED: the authoritative head is ahead of what the merge took. Not `Landed` — and the
+        // report has to reach the caller, because `Ok(())` here is the silent success of the bead.
+        let landing =
+            merge_landing_check(Some(&second_parent), Some(&real_head), |b, h| containment_in(&root, b, h));
+        assert_eq!(
+            landing,
+            MergeLanding::Stranded { stranded: 1 },
+            "the branch head GitHub reports is ahead of the merge; the stale mirror must not hide it"
+        );
+        let err =
+            merge_landing_gate_with(&root, 7, "agent/work", Some(&second_parent), Some(&real_head), containment_in)
+                .expect_err("a stale mirror must not turn a dropped merge into a silent success");
+        assert!(err.contains(&real_head), "must name the real branch head {real_head}: {err}");
+
+        // PAIRED, over the SAME stale mirror: when the authoritative head IS what the merge took,
+        // the gate still reports `Landed`. Without this the arm above is satisfied by a gate that
+        // reports `Stranded` unconditionally, which is a different bug.
+        let clean = merge_landing_check(Some(&second_parent), Some(&second_parent), |b, h| {
+            containment_in(&root, b, h)
+        });
+        assert_eq!(clean, MergeLanding::Landed, "a genuinely-clean landing must still read as landed");
+        assert!(
+            merge_landing_gate_with(
+                &root,
+                7,
+                "agent/work",
+                Some(&second_parent),
+                Some(&second_parent),
+                containment_in
+            )
+            .is_ok()
+        );
+    }
+
+    /// THE ARM THE STALE-MIRROR TEST ABOVE STRUCTURALLY CANNOT REACH, and the one roborev 72508 was
+    /// filed about. That test builds `real_head` with `git commit` in the SAME repo it then queries,
+    /// so the racing object is always present locally — and while the containment counts were a
+    /// `git rev-list` in `root`, "the object is present" was the fixture's own hidden premise. In
+    /// PRODUCTION it is false by construction: the race this gate targets is a push from ANOTHER
+    /// machine or clone, from the GitHub UI, or a PR merged INTO the branch on the remote
+    /// (`sparkle-80ek3u`), and nothing on the `merge_pr` path fetches. Both counts then failed with
+    /// `bad revision`, the verdict was `CannotTell`, and the gate returned `Ok(())` — byte for byte
+    /// the silent success of bead sparkle-a08oi0, with only the internal label changed from
+    /// `Landed`. The head sha had become authoritative; the containment had not.
+    ///
+    /// So `root` here is a clone made BEFORE the racing commit exists, and it never fetches again.
+    /// The precondition below asserts `root` genuinely cannot resolve that object, and the arm after
+    /// it asserts the verdict is `Stranded` anyway — which is only possible because the containment
+    /// is asked of the store that has it, the way `merge_landing_gate` asks `remote_containment`.
+    #[test]
+    fn a_racing_commit_this_clone_has_never_fetched_is_still_reported_as_stranded() {
+        // THE AUTHORITY — the remote. `root` is a clone of it, and GitHub is its stand-in.
+        let authority = init_repo("merge-landing-authority");
+        git(&authority, &["checkout", "-q", "-b", "agent/work"]).unwrap();
+        git(&authority, &["commit", "--allow-empty", "-m", "the head the merge was decided against"])
+            .unwrap();
+        let merged_head = git(&authority, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
+        git(&authority, &["checkout", "-q", "main"]).unwrap();
+        git(&authority, &["merge", "-q", "--no-ff", "--no-edit", "agent/work"]).unwrap();
+        let second_parent = git(&authority, &["rev-parse", "HEAD^2"]).unwrap().trim().to_string();
+        assert_eq!(second_parent, merged_head, "precondition: the merge took the branch as it stood");
+
+        // THIS CLONE, taken while the branch still stood at the head the merge was decided against.
+        let root = unique_root("merge-landing-absent-object").to_string_lossy().to_string();
+        git(&authority, &["clone", "-q", &authority, &root]).unwrap();
+        git(&root, &["config", "user.email", "t@t"]).unwrap();
+        git(&root, &["config", "user.name", "t"]).unwrap();
+
+        // ...and only NOW does the racing commit get pushed, from somewhere this clone is not.
+        git(&authority, &["checkout", "-q", "agent/work"]).unwrap();
+        git(&authority, &["commit", "--allow-empty", "-m", "pushed from a clone this one never fetched"])
+            .unwrap();
+        let real_head = git(&authority, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
+
+        // THE PREMISE, asserted rather than assumed — this is exactly what the same-repo fixture
+        // could not express, and asserting it is what keeps the arm below from drifting back into it.
+        assert!(
+            git(&root, &["cat-file", "-e", &format!("{real_head}^{{commit}}")]).is_err(),
+            "precondition: {real_head} must be absent from this clone's object store"
+        );
+        assert_eq!(
+            containment_in(&root, &second_parent, &real_head),
+            None,
+            "precondition: a containment read against THIS clone cannot answer — which is how the \
+             race reached `CannotTell` and returned a silent `Ok(())` (roborev 72508)"
+        );
+        assert_eq!(
+            merge_landing_check(Some(&second_parent), Some(&real_head), |b, h| containment_in(&root, b, h)),
+            MergeLanding::CannotTell,
+            "measuring containment in this clone is the silent success the gate exists to end"
+        );
+        assert!(
+            merge_landing_gate_with(&root, 7, "agent/work", Some(&second_parent), Some(&real_head), containment_in)
+                .is_ok(),
+            "...and through the real composition that `CannotTell` is an `Ok(())` nobody ever sees — \
+             which is why the label alone was never the fix"
+        );
+
+        // THE FIX: asked of the authority — where both shas already come from — the same pair of
+        // shas is a positively-established dropped merge, and the report reaches the caller.
+        let landing = merge_landing_check(Some(&second_parent), Some(&real_head), |b, h| {
+            containment_in(&authority, b, h)
+        });
+        assert_eq!(
+            landing,
+            MergeLanding::Stranded { stranded: 1 },
+            "an object absent from this clone must still be judged, against the authority that has it"
+        );
+        let err = merge_landing_gate_with(
+            &authority,
+            7,
+            "agent/work",
+            Some(&second_parent),
+            Some(&real_head),
+            containment_in,
+        )
+        .expect_err("a merge that dropped a commit must not return Ok(()) merely because we lack the object");
+        assert!(err.contains(&second_parent), "must name the merged head {second_parent}: {err}");
+        assert!(err.contains(&real_head), "must name the pushed branch head {real_head}: {err}");
+        assert!(err.contains("1 commit was"), "{err}");
+
+        // PAIRED, over the SAME absent-object shape and the SAME authority: two DIFFERENT shas the
+        // merge fully contains — the merge took MORE than the branch head, which happens after a
+        // force-push — must NOT be reported. Without this the arm above is equally satisfied by a
+        // check that answers `Stranded` for every unequal pair, which is a false-accusation bug and
+        // the one `worktree_ahead_gate` already had to be corrected for (roborev 72228). It runs
+        // through the containment closure rather than the sha-equality short circuit, so it also
+        // proves the closure's ANSWER drives the verdict rather than merely being called.
+        assert_eq!(
+            merge_landing_check(Some(&real_head), Some(&second_parent), |b, h| {
+                containment_in(&authority, b, h)
+            }),
+            MergeLanding::CannotTell,
+            "nothing is stranded when the merge contains the branch head; that is not a report"
+        );
+        // ...and the genuinely-clean landing still reads `Landed` with the object still absent.
+        assert_eq!(
+            merge_landing_check(Some(&real_head), Some(&real_head), |b, h| containment_in(&authority, b, h)),
+            MergeLanding::Landed,
+            "a clean landing must stay clean even though this clone has neither object"
+        );
+    }
+
+    /// THE PRODUCTION CONTAINMENT SOURCE, which no behavioural arm above can reach: every one of
+    /// them injects its own `containment`, exactly as every one injects its own shas, so the single
+    /// line choosing the real value is covered by nothing. Restoring a `git rev-list` in `root`
+    /// there re-opens roborev 72508 in full — the racing object is absent, both counts fail, and the
+    /// verdict is `CannotTell` → `Ok(())` — while leaving every test in this module green.
+    #[test]
+    fn the_landing_gate_resolves_containment_against_the_remote_not_this_clone() {
+        let src = include_str!("worktree.rs");
+        let slice = |sig: &str| -> String {
+            let start = src.find(sig).unwrap_or_else(|| panic!("{sig} must exist"));
+            let body = &src[start..];
+            let end = body.find("\n}\n").unwrap_or(body.len());
+            body[..end].to_string()
+        };
+
+        // THE WHOLE CALL, not a substring, and it must name `remote_containment` WITHOUT wrapping it
+        // in a closure. `|head, base| remote_containment(root, base, head)` contains that substring
+        // too, inverts `ahead`/`behind`, and turns every stranded merge into a silent `Ok(())` —
+        // which is why the old substring pin was not a pin at all (roborev 72547).
+        let gate = slice("fn merge_landing_gate(");
+        assert!(
+            gate.lines().any(|l| {
+                l.trim()
+                    == "merge_landing_gate_with(root, number, head_ref, second_parent, remote_head, remote_containment)"
+            }),
+            "merge_landing_gate must forward to merge_landing_gate_with with `remote_containment` \
+             passed BY NAME — a closure here has a parameter order this pin cannot check: {gate}"
+        );
+        assert!(
+            !gate.contains('|'),
+            "no closure in merge_landing_gate: its argument order would be unguarded (roborev 72547): {gate}"
+        );
+        for local in ["rev-list", "refs/remotes/origin/"] {
+            assert!(
+                !gate.contains(local),
+                "the containment must not be measured in this clone's object store (roborev 72508): {gate}"
+            );
+        }
+
+        let check = slice("fn merge_landing_check(");
+        for local in ["rev-list", "git(", "refs/remotes/origin/"] {
+            assert!(
+                !check.contains(local),
+                "merge_landing_check must read NOTHING local — found {local:?}: {check}"
+            );
+        }
+
+        // And the read itself is GitHub's compare, whose `.ahead_by`/`.behind_by` are the same pair
+        // of directions `merge_landing_verdict` classifies.
+        let containment = slice("fn remote_containment(");
+        assert!(
+            containment.contains("compare/{base}...{head}"),
+            "remote_containment must ask GitHub's compare endpoint: {containment}"
+        );
+        assert!(
+            containment.contains(".ahead_by") && containment.contains(".behind_by"),
+            "remote_containment must read both directions: {containment}"
+        );
+
+        // The head source has the SAME two seams and the same rule: passed by name, no closure, so
+        // the sha order in its reconciliation cannot be swapped where nothing would notice.
+        let head = slice("fn remote_branch_head(");
+        assert!(
+            head.lines()
+                .any(|l| l.trim() == "remote_branch_head_with(root, number, head_ref, gh_json, remote_containment)"),
+            "remote_branch_head must forward both reads BY NAME: {head}"
+        );
+        assert!(!head.contains('|'), "no closure in remote_branch_head (roborev 72547): {head}");
+    }
+
+    /// FINDING 2 OF ROBOREV 72508: `git/ref/heads/<head_ref>` 404s the moment the head branch is
+    /// gone, and this read runs immediately after `gh pr merge` succeeded — so on a repo with
+    /// "Automatically delete head branches" enabled the ONLY head source disappeared and the gate
+    /// was inert for EVERY merge, in every scenario, with nothing logged. The same 404 is what a
+    /// fork PR produces, where `{owner}/{repo}` resolves to the base repo.
+    ///
+    /// Every unit arm injects `remote_head` directly and the wiring pin only matches the call line's
+    /// text, so nothing in the suite could see it. The read is injected here for exactly that
+    /// reason: a test cannot make a live `git/ref/heads/` read 404 on demand.
+    ///
+    /// IT ALSO PINS THE ORDERING, WHICH IS THE HALF THAT NEARLY WENT THE OTHER WAY (roborev 72547).
+    /// The obvious repair for the 404 — read `.head.sha` first, since it survives deletion — makes
+    /// the gate STRUCTURALLY INCAPABLE of reporting anything: `.head.sha` lives on the same PR
+    /// record `merged_second_parent` reads `.merge_commit_sha` from, and a merge freezes it, so the
+    /// two shas the check compares become equal by construction and it short-circuits to `Landed`
+    /// before the containment is ever asked. So the arms below assert not merely which endpoint is
+    /// used but that the answer CAN DIFFER from the second parent, and that the difference reaches
+    /// a report through the real composition.
+    #[test]
+    fn the_branch_head_survives_a_head_branch_deleted_by_the_merge() {
+        use std::cell::RefCell;
+        let asked: RefCell<Vec<String>> = RefCell::new(Vec::new());
+        const MERGED_HEAD: &str = "aaaa1111";
+        const BRANCH_AHEAD: &str = "bbbb2222";
+        const SOMEONE_ELSES: &str = "cccc3333";
+        // A `read` fake: `same_repo` answers the identity question, `refs` the bare-name ref read,
+        // `pr_head` the PR record's own head. Recorded so "which endpoints were asked" is assertable.
+        // Captured by REFERENCE, so the builder stays `Copy` and can be called for every arm.
+        let log = &asked;
+        let read = |same_repo: bool, refs: Option<&'static str>, pr_head: Option<&'static str>| {
+            move |_root: &str, path: &str, jq: &str| -> Option<String> {
+                log.borrow_mut().push(format!("{path} {jq}"));
+                if jq.contains("full_name") {
+                    return Some(if same_repo { "true".to_string() } else { "false".to_string() });
+                }
+                if path.contains("/git/ref/") {
+                    return refs.map(str::to_string);
+                }
+                pr_head.map(str::to_string)
+            }
+        };
+        // Containment as GitHub's compare would answer it: `ahead` of `base`, `behind` it.
+        let contains = |_r: &str, _b: &str, _h: &str| Some((1usize, 0usize));
+        let unrelated = |_r: &str, _b: &str, _h: &str| Some((3usize, 4usize));
+        let never = |_r: &str, _b: &str, _h: &str| None;
+
+        // THE DELETED BRANCH (roborev 72508): the ref 404s, the PR record still knows the head.
+        assert_eq!(
+            remote_branch_head_with(
+                "unused", 7, "agent/work", read(true, None, Some(MERGED_HEAD)), contains
+            ),
+            Some(MERGED_HEAD.to_string()),
+            "a merge that deleted the head branch must still yield a branch head, or the gate is \
+             inert for every merge on that repo"
+        );
+
+        // THE LIVE REF WINS WHEN IT RECONCILES (roborev 72547). `.head.sha` lives on the same PR
+        // record `merged_second_parent` reads `.merge_commit_sha` from and a merge freezes it, so
+        // preferring it hands `merge_landing_check` two shas equal by construction — it
+        // short-circuits to `Landed` and the gate can never report anything at all.
+        asked.borrow_mut().clear();
+        assert_eq!(
+            remote_branch_head_with(
+                "unused", 7, "agent/work", read(true, Some(BRANCH_AHEAD), Some(MERGED_HEAD)), contains
+            ),
+            Some(BRANCH_AHEAD.to_string()),
+            "the live branch ref must win over the frozen PR record when it contains that head, or \
+             the head can never differ from the second parent"
+        );
+        assert!(
+            asked.borrow().iter().any(|a| a.contains("git/ref/heads/agent/work")),
+            "the ref must actually be read: {:?}",
+            asked.borrow()
+        );
+
+        // A FORK PR (roborev 72641). `{owner}/{repo}` is the BASE repo and `head_ref` is a bare
+        // name, so a base-repo branch that merely SHARES that name answers with a sha this pull
+        // request has no claim on. That is not a `CannotTell`: `compare` resolves it perfectly, the
+        // shape is ahead-and-not-behind, and the gate emits a positively asserted
+        // MERGED-BUT-STRANDED naming an unrelated sha. The identity check is what stops it.
+        asked.borrow_mut().clear();
+        assert_eq!(
+            remote_branch_head_with(
+                "unused", 7, "patch-1", read(false, Some(SOMEONE_ELSES), Some(MERGED_HEAD)), contains
+            ),
+            Some(MERGED_HEAD.to_string()),
+            "a fork PR must not take a base-repo branch that happens to share its head ref name"
+        );
+        assert!(
+            asked.borrow().iter().all(|a| !a.contains("/git/ref/")),
+            "a head outside the base repo must not be looked up by bare name at all: {:?}",
+            asked.borrow()
+        );
+
+        // BRANCH-NAME REUSE, same repo — the shape this project produces by construction, reached
+        // on the bead's own path: merge_pr re-invoked on an already-merged PR long after the name
+        // was recreated by another agent. The ref answers, and its sha does NOT contain this PR's
+        // head, so it is a different branch wearing the name.
+        assert_eq!(
+            remote_branch_head_with(
+                "unused", 7, "agent/work", read(true, Some(SOMEONE_ELSES), Some(MERGED_HEAD)), unrelated
+            ),
+            Some(MERGED_HEAD.to_string()),
+            "a recreated branch of the same name must not be reported as this PR's head"
+        );
+        // ...and an unresolvable reconciliation is the same answer: never believe what we could not
+        // check. This is the fail-closed direction, and it is the one that must not drift.
+        assert_eq!(
+            remote_branch_head_with(
+                "unused", 7, "agent/work", read(true, Some(SOMEONE_ELSES), Some(MERGED_HEAD)), never
+            ),
+            Some(MERGED_HEAD.to_string()),
+            "a containment that could not answer must not license the ref"
+        );
+        // With no PR head there is nothing for the ref to contradict, so it stands.
+        assert_eq!(
+            remote_branch_head_with(
+                "unused", 7, "agent/work", read(true, Some(BRANCH_AHEAD), None), never
+            ),
+            Some(BRANCH_AHEAD.to_string()),
+        );
+
+        // AND THE DIFFERENCE REACHES A VERDICT, through the real composition.
+        let err = merge_landing_gate_with(
+            "unused",
+            7,
+            "agent/work",
+            Some(MERGED_HEAD),
+            Some(BRANCH_AHEAD),
+            |_, _, _| Some((1, 0)),
+        )
+        .expect_err("a branch head past the merge must reach the caller as a report");
+        assert!(err.contains(BRANCH_AHEAD), "{err}");
+        // PAIRED: had the frozen PR record won, these are one sha and nothing can be said.
+        assert!(
+            merge_landing_gate_with("unused", 7, "agent/work", Some(MERGED_HEAD), Some(MERGED_HEAD), |
+                _,
+                _,
+                _
+            | panic!("equal shas must short-circuit before any containment read"))
+            .is_ok(),
+            "the ordering these arms pin is all that stands between the gate and that shape"
+        );
+
+        // NEITHER SOURCE ANSWERED is `None` — which the gate reads as `CannotTell`, never `Landed`.
+        assert_eq!(
+            remote_branch_head_with("unused", 7, "agent/work", read(true, None, None), contains),
+            None
+        );
+        // An empty head ref cannot build a ref path, so the PR record is the only source left.
+        asked.borrow_mut().clear();
+        assert_eq!(
+            remote_branch_head_with(
+                "unused", 7, "  ", read(true, Some("wrong"), Some(SOMEONE_ELSES)), contains
+            ),
+            Some(SOMEONE_ELSES.to_string()),
+            "the PR record answers without a head ref at all"
+        );
+        assert!(
+            asked.borrow().iter().all(|a| !a.contains("/git/ref/")),
+            "an empty head ref must not build a ref path: {:?}",
+            asked.borrow()
+        );
     }
 
     #[test]
