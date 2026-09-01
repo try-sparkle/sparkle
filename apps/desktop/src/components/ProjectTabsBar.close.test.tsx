@@ -11,6 +11,10 @@
 //   3. closing the selected tab lands on a sensible neighbour;
 //   4. closing the LAST tab leaves the welcome state, not a blank shell;
 //   5. the closed project is one click from having its tab back.
+// THE TAB ROLE LIVES ON THE LABEL (`tab-label-<id>`), NOT ON THE SLOT (`tab-<id>`) — bead
+// sparkle-2mwl2m.1. A `role="tab"` flattens its whole subtree, which was silencing the close
+// button, the pin and the stale badge inside it, so the role moved inward to the name and
+// those controls became its siblings. `aria-selected` and the accessible name moved with it.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 
@@ -107,8 +111,10 @@ describe("only OPEN projects get a tab", () => {
   it("keeps the tab order the project list gives, not the open set's", () => {
     useUiStore.setState({ openProjectIds: ["p3", "p1"] } as never);
     render(bar());
+    // The tab ROLE is on the label (see the note at the top of this file), so the ids read
+    // `tab-label-…`; the order is what this case is about and it is unchanged.
     const ids = screen.getAllByRole("tab").map((el) => el.getAttribute("data-testid"));
-    expect(ids).toEqual(["tab-p1", "tab-p3"]);
+    expect(ids).toEqual(["tab-label-p1", "tab-label-p3"]);
   });
 });
 
@@ -139,7 +145,7 @@ describe("× closes a tab", () => {
     render(bar());
     fireEvent.click(screen.getByTestId("close-p2"));
     expect(selected()).toBe("p3");
-    expect(screen.getByTestId("tab-p3").getAttribute("aria-selected")).toBe("true");
+    expect(screen.getByTestId("tab-label-p3").getAttribute("aria-selected")).toBe("true");
   });
 
   it("closing the selected LAST tab falls back to its left-hand neighbour", () => {
@@ -153,7 +159,7 @@ describe("× closes a tab", () => {
     render(bar());
     fireEvent.click(screen.getByTestId("close-p3"));
     expect(selected()).toBe("p1");
-    expect(screen.getByTestId("tab-p1").getAttribute("aria-selected")).toBe("true");
+    expect(screen.getByTestId("tab-label-p1").getAttribute("aria-selected")).toBe("true");
   });
 
   it("does NOT also select the tab it is closing", () => {

@@ -579,9 +579,15 @@ export function groupAgentsByStage<T extends { id: string }>(
   /** Does this row's worktree hold anything? `undefined` = not looked up (or parked). Only consulted
    *  for rows that would land in `local_uncommitted` — see {@link sectionOfRow}.
    *
-   *  OPTIONAL, and omitting it reproduces the pre-sparkle-biezi behaviour exactly: every such row
-   *  stays in `local_uncommitted`. That is deliberate rather than lazy — a caller with no worktree
-   *  reading must not be forced to invent one, and the default is the conservative arm.
+   *  ⚠️ REQUIRED, THOUGH `undefined` IS STILL A LEGAL VALUE — and the difference between those two
+   *  facts is the whole point (bead `sparkle-l5fi7`). Passing `undefined` reproduces the
+   *  pre-sparkle-biezi behaviour exactly (every such row stays in `local_uncommitted`), so a caller
+   *  with no worktree reading is still not forced to invent one. What it can no longer do is OMIT
+   *  the argument by accident: this used to be `holdsWorkOf?`, which made deleting the wiring from
+   *  a production call site neither a type error nor a test failure, and the rung was reachable
+   *  only through it. A comment asserting that drift is impossible is not a mechanism; an arity
+   *  error is. The tests are the second mechanism — one per call site, each mutation-checked by
+   *  actually deleting the argument (AgentSidebar.ladderAccessorWiring.test.tsx).
    *
    *  ⚠️ BUT PASS IT CONSISTENTLY. This changes which SECTION a row lands in, and therefore the
    *  flattened row ORDER (`local_none` sorts above `local_uncommitted`). Two callers that disagree
@@ -589,14 +595,17 @@ export function groupAgentsByStage<T extends { id: string }>(
    *  `firstLadderRowId` hand selection to a row the column was not rendering (roborev 53858). The
    *  three production callers (AgentSidebar, ladderSelection, conciergeTools/sidebarView) all derive
    *  it from `runtimeStore.branchStatus` through the same `uncommittedWorkEvidence`. */
-  holdsWorkOf?: (id: string) => boolean | undefined,
+  holdsWorkOf: ((id: string) => boolean | undefined) | undefined,
   /** Does this row's work live outside the bound project? See {@link sectionOfRow}.
    *
    *  ⚠️ SAME CONSISTENCY RULE AS `holdsWorkOf`, for the same reason: it changes which section a row
    *  lands in and therefore the flattened row ORDER, so two callers that disagree hand selection to a
    *  row the column is not rendering. Every production caller derives it from the same
-   *  `engine/crossRepo.crossRepoReading` over the same agent record. */
-  crossRepoOf?: (id: string) => CrossRepoReading | undefined,
+   *  `engine/crossRepo.crossRepoReading` over the same agent record.
+   *
+   *  ⚠️ REQUIRED for the same reason as `holdsWorkOf` above — pass `undefined` to mean "no reading",
+   *  never nothing at all. */
+  crossRepoOf: ((id: string) => CrossRepoReading | undefined) | undefined,
 ): BuildSectionGroup<T>[] {
   const buckets = new Map<BuildSectionId, T[]>();
   for (const agent of agents) {

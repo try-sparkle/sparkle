@@ -109,6 +109,9 @@ describe("the stage ladder", () => {
       (id) => (id === "pr" ? "pull_request" : "merged_local"),
       () => "idle",
       allBandsVisible(),
+      undefined,
+      undefined,
+      undefined,
     );
     expect(groups.map((g) => g.id)).toEqual(["local_merged", "remote_pr"]);
   });
@@ -220,7 +223,7 @@ describe("grouping rows into sections", () => {
   it("returns ONLY non-empty sections, in ladder order", () => {
     const agents = [row("a"), row("b")];
     const { stageOf, statusOf } = lookups({ a: "pull_request", b: "building_unsaved" });
-    const groups = groupAgentsByStage(agents, stageOf, statusOf, all);
+    const groups = groupAgentsByStage(agents, stageOf, statusOf, all, undefined, undefined, undefined);
     // Nothing is committed/pushed/merged, so those rungs don't render at all.
     expect(groups.map((g) => g.id)).toEqual(["local_uncommitted", "remote_pr"]);
     expect(groups[0]!.rows.map((r) => r.id)).toEqual(["b"]);
@@ -230,7 +233,7 @@ describe("grouping rows into sections", () => {
   it("preserves input order within a section — that order IS the user's drag arrangement", () => {
     const agents = [row("c"), row("a"), row("b")];
     const { stageOf, statusOf } = lookups({ a: "building_saved", b: "building_saved", c: "building_saved" });
-    const groups = groupAgentsByStage(agents, stageOf, statusOf, all);
+    const groups = groupAgentsByStage(agents, stageOf, statusOf, all, undefined, undefined, undefined);
     expect(groups).toHaveLength(1);
     expect(groups[0]!.rows.map((r) => r.id)).toEqual(["c", "a", "b"]);
   });
@@ -248,12 +251,18 @@ describe("grouping rows into sections", () => {
       lookups(stages, { a: "idle", b: "idle", c: "idle" }).stageOf,
       lookups(stages, { a: "idle", b: "idle", c: "idle" }).statusOf,
       all,
+      undefined,
+      undefined,
+      undefined,
     );
     const noisy = groupAgentsByStage(
       agents,
       lookups(stages, { a: "idle", b: "waiting", c: "working" }).stageOf,
       lookups(stages, { a: "idle", b: "waiting", c: "working" }).statusOf,
       all,
+      undefined,
+      undefined,
+      undefined,
     );
     // Under the OLD attention sort, `b` (waiting, rank 0) would have jumped to the top and `c`
     // (working, rank 2) to the bottom. Position must now be immune to status entirely.
@@ -263,8 +272,8 @@ describe("grouping rows into sections", () => {
 
   it("moves a row between sections ONLY when its stage advances", () => {
     const agents = [row("a")];
-    const before = groupAgentsByStage(agents, () => "building_saved", () => "idle", all);
-    const after = groupAgentsByStage(agents, () => "pull_request", () => "idle", all);
+    const before = groupAgentsByStage(agents, () => "building_saved", () => "idle", all, undefined, undefined, undefined);
+    const after = groupAgentsByStage(agents, () => "pull_request", () => "idle", all, undefined, undefined, undefined);
     expect(before.map((g) => g.id)).toEqual(["local_committed"]);
     expect(after.map((g) => g.id)).toEqual(["remote_pr"]);
   });
@@ -280,7 +289,10 @@ describe("grouping rows into sections", () => {
       questions: false,
       running: false,
       done: false,
-    });
+    },
+      undefined,
+      undefined,
+      undefined,);
     expect(flattenSections(onlyRed).map((r) => r.id)).toEqual(["red"]);
 
     const noRed = groupAgentsByStage(agents, stageOf, statusOf, {
@@ -288,7 +300,10 @@ describe("grouping rows into sections", () => {
       questions: true,
       running: true,
       done: true,
-    });
+    },
+      undefined,
+      undefined,
+      undefined,);
     expect(flattenSections(noRed).map((r) => r.id)).toEqual(["green", "gray"]);
   });
 
@@ -304,7 +319,10 @@ describe("grouping rows into sections", () => {
       questions: true,
       running: false,
       done: true,
-    });
+    },
+      undefined,
+      undefined,
+      undefined,);
     expect(groups.map((g) => g.id)).toEqual(["remote_pr"]);
   });
 
@@ -318,7 +336,10 @@ describe("grouping rows into sections", () => {
       questions: false,
       running: false,
       done: false,
-    });
+    },
+      undefined,
+      undefined,
+      undefined,);
     expect(groups).toEqual([]);
   });
 
@@ -326,7 +347,7 @@ describe("grouping rows into sections", () => {
     const a = row("a");
     const b = row("b");
     const { stageOf, statusOf } = lookups({ a: "building_saved", b: "pull_request" });
-    const flat = flattenSections(groupAgentsByStage([a, b], stageOf, statusOf, all));
+    const flat = flattenSections(groupAgentsByStage([a, b], stageOf, statusOf, all, undefined, undefined, undefined));
     // Identity, not just equality: selection is tracked by id and re-renders key off object identity.
     expect(flat[0]).toBe(a);
     expect(flat[1]).toBe(b);
@@ -376,15 +397,21 @@ describe("sectionOfRow — a row that holds NOTHING is not 'Uncommitted' (sparkl
     }
   });
 
-  it("groupAgentsByStage without the accessor behaves exactly as before", () => {
-    // Back-compat is the reason the parameter is optional: a caller with no worktree reading must
-    // not be forced to invent one, and omitting it must not quietly move rows.
+  it("groupAgentsByStage with an `undefined` accessor behaves exactly as before", () => {
+    // Back-compat is the reason `undefined` is a legal VALUE: a caller with no worktree reading must
+    // not be forced to invent one, and saying so must not quietly move rows. It is no longer a legal
+    // OMISSION — the parameter is required (bead `sparkle-l5fi7`) — which is exactly the distinction
+    // this test now pins: passing "I did not look" is supported; forgetting to pass anything is a
+    // compile error.
     const agents = [{ id: "a" }, { id: "b" }];
     const groups = groupAgentsByStage(
       agents,
       () => "building_unsaved",
       () => "idle",
       allBandsVisible(),
+      undefined,
+      undefined,
+      undefined,
     );
     expect(groups.map((g) => g.id)).toEqual(["local_uncommitted"]);
   });
@@ -398,6 +425,7 @@ describe("sectionOfRow — a row that holds NOTHING is not 'Uncommitted' (sparkl
       allBandsVisible(),
       undefined,
       (id) => (id === "empty" ? false : id === "dirty" ? true : undefined),
+      undefined,
     );
     expect(groups.map((g) => g.id)).toEqual(["local_none", "local_uncommitted"]);
     expect(groups[0]?.rows.map((r) => r.id)).toEqual(["empty"]);

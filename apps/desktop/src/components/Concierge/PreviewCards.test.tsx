@@ -33,6 +33,7 @@ import {
   PREVIEW_CARD_REFRESH_FAILED_TESTID,
   PREVIEW_CARD_REFUSED_TESTID,
   PREVIEW_CARD_OPEN_TESTID,
+  PREVIEW_CARD_TOGGLE_TESTID,
   PREVIEW_CARD_COLLAPSED_WIDTH,
   PREVIEW_CARD_EXPANDED_WIDTH,
   PREVIEW_OPEN_REFUSAL_COPY,
@@ -45,6 +46,7 @@ import {
   PREVIEW_ZONE_TESTID,
 } from "./PreviewCards";
 import { AgentPillProvider, type AgentPillContextValue } from "./AgentPill";
+import { expectAnnounced, flattenedBy } from "../../testing/announcedControls";
 import { applyPreviewStatus } from "../../services/preview";
 import { usePreviewStore, type PreviewState, type PreviewStatus } from "../../stores/previewStore";
 import { useProjectStore } from "../../stores/projectStore";
@@ -253,6 +255,68 @@ describe("a live preview becomes a card", () => {
 
     expect(cardsOnScreen()).toEqual([[KRAKEN, "http://127.0.0.1:5173"]]);
     expect(screen.queryByTestId("concierge-agent-pill-closed")).toBeNull();
+  });
+});
+
+// ══ EVERY CONTROL ON THE CARD IS ANNOUNCED, AND NONE IS FLATTENED ════════════════════════════════
+//
+// THE DEFECT (bead sparkle-2mwl2m.1). The card root carried `role="button"` + `tabIndex` so the
+// whole card was the expand toggle, and WAI-ARIA gives that role PRESENTATIONAL CHILDREN — assistive
+// tech flattens the entire subtree to the root's own accessible name. The agent pill, ⟳ and, worst,
+// "Open in browser" — whose accessible name is where the URL lives, the actionable half of the whole
+// card — were announced as nothing at all. It renders identically and every behavioural row in this
+// file stayed green, because `fireEvent.click` does not consult the accessibility tree.
+//
+// THE REMEDY IS BeadCard's, and for a DISCLOSURE BeadCard puts the real `<button>` on the title:
+// here that is the lead line, which now carries `aria-expanded` and the name the root used to hold.
+// So the two halves are asserted together — the controls are announced, AND the gesture that made
+// the root a "button" still works from a real control.
+describe("PreviewCards — the card's nested controls reach the accessibility tree", () => {
+  it("announces the pill, the disclosure, Open in browser and ⟳ by their own role and name", () => {
+    mount();
+    fire(KRAKEN, "ready", "http://127.0.0.1:5173", 5173);
+    const card = screen.getByTestId(PREVIEW_CARD_TESTID);
+    expectAnnounced(card, [
+      { testId: "concierge-agent-pill", role: "button", name: /@Kraken Auth/ },
+      { testId: PREVIEW_CARD_TOGGLE_TESTID, role: "button", name: "Expand Kraken Auth's preview" },
+      {
+        testId: PREVIEW_CARD_OPEN_TESTID,
+        role: "button",
+        name: "Open Kraken Auth's preview at http://127.0.0.1:5173 in the browser",
+      },
+      {
+        testId: PREVIEW_CARD_REFRESH_TESTID,
+        role: "button",
+        name: "Refresh the preview snapshot for Kraken Auth",
+      },
+    ]);
+    // The card root is what decided all four. It is a plain generic now.
+    expect(card.getAttribute("role")).toBeNull();
+    expect(card.hasAttribute("tabindex")).toBe(false);
+    expect(card.hasAttribute("aria-expanded")).toBe(false);
+    expect(flattenedBy(screen.getByTestId(PREVIEW_CARD_OPEN_TESTID), card)).toBeNull();
+  });
+
+  it("the disclosure BUTTON toggles the card, and reports its own expanded state", () => {
+    // PAIRED with the case above, and this is the half that proves nothing was merely deleted: the
+    // root stopped being a toggle, so a real control had to become one. Both directions, because
+    // "it expanded" alone is satisfied by a switch that can never collapse again.
+    mount();
+    fire(KRAKEN, "ready", "http://127.0.0.1:5173", 5173);
+    const toggle = () => screen.getByTestId(PREVIEW_CARD_TOGGLE_TESTID);
+    expect(toggle().tagName).toBe("BUTTON");
+    expect(toggle().getAttribute("aria-expanded")).toBe("false");
+
+    fireEvent.click(toggle());
+    expect(screen.getByTestId(PREVIEW_CARD_TESTID).getAttribute("data-expanded")).toBe("true");
+    expect(toggle().getAttribute("aria-expanded")).toBe("true");
+    expect(toggle().getAttribute("aria-label")).toBe("Collapse Kraken Auth's preview");
+
+    fireEvent.click(toggle());
+    expect(screen.getByTestId(PREVIEW_CARD_TESTID).getAttribute("data-expanded")).toBeNull();
+    expect(toggle().getAttribute("aria-expanded")).toBe("false");
+    // …and it never navigated. The disclosure and the browser are different gestures on this card.
+    expect(openUrlMock).not.toHaveBeenCalled();
   });
 });
 

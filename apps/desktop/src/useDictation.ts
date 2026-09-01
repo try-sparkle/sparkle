@@ -1196,6 +1196,28 @@ export async function createDictationController(
   });
 
   const cleanup = () => {
+    // ── TEARDOWN IS ITSELF A CLOSER, AND IT WAS THE ONE THAT WASN'T (bead sparkle-xr5ak) ─────────
+    //
+    // Everything else in this function REMOVES a closer: it clears the idle-park timer, unlistens
+    // `dictation://cloud-ended`, drops the phase-edge subscriber, and removes the window blur/focus
+    // handlers. Those are the FIVE things that can close the billable relay. Run them with a live
+    // stream still open and the socket has no closer left anywhere in the process — the backend
+    // parks only on blur, and the blur handler is one of the things just removed — so it meters per
+    // elapsed minute until the process dies. That is the exact shape of the wake-word regression
+    // this file's idle-park block was written to close: not a deletion of the socket's owner, but a
+    // deletion of everything that triggers its closer.
+    //
+    // GUARDED EXACTLY LIKE THE IDLE PARK, and for the same reason. `tearDownOwnedStream`'s only
+    // test is `phase !== "active"`, and `phase` is persisted and CROSS-WINDOW SYNCED — so it cannot
+    // tell "this window owns the relay" from "some window does". Unguarded, a background window
+    // unmounting would close the FOCUSED window's stream on the single global backend resource,
+    // which is roborev 56061 reached by a teardown instead of by a store event. `isWindowActive()`
+    // is the per-window ownership signal the park already trusts for this.
+    //
+    // `!streamTornDown` is not defensive padding: after a park, a blur or a `cloud-ended` this
+    // window has already relinquished the stream, and closing again would be a redundant
+    // `stop_cloud_stream` against a relay some other window may since have opened.
+    if (!streamTornDown && isWindowActive()) tearDownOwnedStream();
     // The park timer outlives nothing: a controller torn down mid-wait would otherwise fire against
     // a store the next controller owns, parking a relay it never opened.
     clearIdlePark();

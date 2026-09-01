@@ -25,6 +25,7 @@ import {
   resolvedAccent,
 } from "./NudgeCard";
 import { AgentPillProvider } from "./AgentPill";
+import { expectAnnounced, flattenedBy } from "../../testing/announcedControls";
 import type { ConciergeNudge } from "./types";
 import type { RevealOutcome } from "../../services/agentReveal";
 
@@ -87,6 +88,42 @@ const renderCard = (
 };
 
 const card = () => screen.getByTestId(NUDGE_CARD_TESTID);
+
+// ══ EVERY CONTROL ON THE CARD IS ANNOUNCED, AND NONE IS FLATTENED ════════════════════════════════
+//
+// THE DEFECT (bead sparkle-2mwl2m.1). The card root carried `role="button"`, and WAI-ARIA gives that
+// role PRESENTATIONAL CHILDREN — assistive tech flattens the whole subtree to the root's own
+// accessible name. Approve (a one-tap relay with no other entry point), Mute (the do-not-interrupt
+// feature's only call site) and [x] were all announced as nothing at all. It renders identically and
+// every behavioural case in this file stayed green, because `fireEvent.click` does not consult the
+// accessibility tree.
+//
+// TWO ASSERTIONS PER CONTROL, both needed — see `testing/announcedControls`: the role+name query
+// proves the markup is right, `flattenedBy` proves no ancestor between it and the card root erases
+// it. EVERY CANDIDATE IS MOUNTED: the fixture is the approval nudge, so Approve is on screen. A case
+// that asserted the absence of flattening on controls that were never rendered would pass on an
+// empty card.
+describe("NudgeCard — the nested controls reach the accessibility tree", () => {
+  it("announces the pill, Approve, Mute and [x] by their own role and name", () => {
+    renderCard(approvalNudge);
+    expectAnnounced(card(), [
+      { testId: "concierge-agent-pill", role: "button", name: /@Live Remote Mirror/ },
+      { testId: "concierge-nudge-action-approve", role: "button", name: "Approve" },
+      {
+        testId: "concierge-nudge-mute",
+        role: "button",
+        name: "Mute alerts about Live Remote Mirror",
+      },
+      {
+        testId: "concierge-nudge-dismiss",
+        role: "button",
+        name: "Dismiss this alert about Live Remote Mirror",
+      },
+    ]);
+    // The card root itself is a plain generic now — the thing that makes all four reachable.
+    expect(flattenedBy(screen.getByTestId("concierge-nudge-mute"), card())).toBeNull();
+  });
+});
 
 describe("nudgeAccent — one red, no gold", () => {
   it("is brand sienna, and never amber", () => {
@@ -260,10 +297,22 @@ describe("NudgeCard — the two alarm controls", () => {
     expect(onNudgeClick).not.toHaveBeenCalled();
   });
 
-  it("still takes Enter on the CARD itself — the guard did not disable the card's own gesture", () => {
-    const { onNudgeClick } = renderCard(nudge);
-    fireEvent.keyDown(card(), { key: "Enter" });
-    expect(onNudgeClick).toHaveBeenCalledTimes(1);
+  it("no longer swallows Enter ANYWHERE, because the card has no keyboard gesture left to guard", () => {
+    // The guard above was the mitigation for a hazard the card no longer creates: the root's
+    // `role="button"` + `tabIndex` + hand-rolled Enter/Space handler are gone (bead
+    // sparkle-2mwl2m.1), so there is nothing left that can `preventDefault()` a nested control's
+    // activation. Asserted on the CARD ROOT as well as the controls — the strongest form of "the
+    // handler is gone", and the one that fails if it is ever re-added.
+    const { onNudgeClick } = renderCard(approvalNudge);
+    for (const id of [
+      NUDGE_CARD_TESTID,
+      "concierge-nudge-mute",
+      "concierge-nudge-dismiss",
+      "concierge-nudge-action-approve",
+    ]) {
+      expect(fireEvent.keyDown(screen.getByTestId(id), { key: "Enter" })).toBe(true);
+    }
+    expect(onNudgeClick).not.toHaveBeenCalled();
   });
 });
 
@@ -292,15 +341,32 @@ describe("NudgeCard — the card is still one big click target", () => {
     expect(onNudgeAction).not.toHaveBeenCalled();
   });
 
-  it("Enter on the focused card acts like a card click (it's a div, not a <button>)", () => {
-    const { onNudgeClick } = renderCard(approvalNudge);
-    fireEvent.keyDown(card(), { key: "Enter" });
-    expect(onNudgeClick).toHaveBeenCalledTimes(1);
+  // ══ THE CLICK TARGET IS A MOUSE CONVENIENCE, AND THE KEYBOARD PATH IS THE PILL ═══════════════
+  // The card root used to be `role="button" tabIndex={0}` so the whole line was operable. That role
+  // gives its children PRESENTATIONAL treatment, so it silenced Approve, Mute and [x] at once
+  // (bead sparkle-2mwl2m.1). The remedy is BeadCard's: keep the wrapper's `onClick` as a mouse
+  // convenience with NO role and NO tabIndex, and let the control that owns the gesture be a real
+  // `<button>` — here the AgentPill, which was ALREADY a button running the same `onNudgeClick`.
+  it("is not itself a control any more — no role, no tab stop, no name on the wrapper", () => {
+    renderCard(approvalNudge);
+    expect(card().getAttribute("role")).toBeNull();
+    expect(card().hasAttribute("tabindex")).toBe(false);
+    expect(card().getAttribute("aria-label")).toBeNull();
   });
 
-  it("labels itself for assistive tech in the same words it shows", () => {
-    renderCard(nudge);
-    expect(card().getAttribute("aria-label")).toBe("BLOCKED: OG Image Pipeline in drodio-website");
+  it("keeps the SAME destination on the keyboard: the pill is a <button> firing onNudgeClick", () => {
+    // PAIRED with the case above, and that pairing is the point: "the card is not a button" alone
+    // would also be true of a card whose gesture had simply been deleted. This is the half that
+    // proves nothing became unreachable.
+    const { onNudgeClick, contextOpen } = renderCard(approvalNudge);
+    const pill = screen.getByTestId("concierge-agent-pill");
+    expect(pill.tagName).toBe("BUTTON");
+    fireEvent.click(pill);
+    expect(onNudgeClick).toHaveBeenCalledTimes(1);
+    expect(onNudgeClick).toHaveBeenCalledWith(approvalNudge);
+    // …and exactly once: the card's own onClick must not ALSO fire, and the pill's reveal routes
+    // through the card rather than the context's plain open.
+    expect(contextOpen).not.toHaveBeenCalled();
   });
 });
 
@@ -426,10 +492,18 @@ describe("NudgeCard — a resolved episode is history, not an alarm", () => {
 
   it("tells assistive tech it is resolved, in the same words it shows", () => {
     // A screen-reader user gets the stale-fact bug in its purest form otherwise: the visual card
-    // greys out and the label still says BLOCKED.
+    // greys out and the announced text still says BLOCKED.
+    //
+    // READ OFF THE RENDERED TEXT, NOT OFF AN `aria-label` (bead sparkle-2mwl2m.1). The card's name
+    // used to be a duplicate sentence in an attribute — which is exactly how the two could drift —
+    // and it went with the `role="button"` that was flattening every control inside it. There is now
+    // ONE source: what the card actually says. So this can no longer go stale by construction, and
+    // the case asserts the property that remains — the words on screen, and no second copy anywhere.
     renderCard(resolvedNudge);
-    expect(card().getAttribute("aria-label")).toBe(
-      "RESOLVED after 40s: OG Image Pipeline in drodio-website",
-    );
+    expect(card().getAttribute("aria-label")).toBeNull();
+    expect(card().textContent).toContain("RESOLVED after 40s:");
+    expect(card().textContent).toContain("OG Image Pipeline");
+    expect(card().textContent).toContain("in drodio-website");
+    expect(card().textContent).not.toContain("BLOCKED");
   });
 });

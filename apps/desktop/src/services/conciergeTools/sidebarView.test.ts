@@ -895,8 +895,8 @@ describe("every entry point returns a value", () => {
 // ── The concierge's view must agree with the column about `tracked_elsewhere` ────────────────────
 //
 // This whole module exists so the concierge describes the SCREEN rather than its own recomputation
-// of it, and `crossRepoOf` is an optional trailing argument to `groupAgentsByStage` — so dropping it
-// here is neither a type error nor, without this block, a test failure. It would silently restore the
+// of it, and `crossRepoOf` was an optional trailing argument to `groupAgentsByStage` — so dropping it
+// here was neither a type error nor, without this block, a test failure. It would silently restore the
 // state roborev 67500 found: the column showing a row on ladder slot 0 while this view reported it in
 // `local_none`, at a different index (roborev 67613).
 describe("cross-repo rows (bead `sparkle-pgh1ue`)", () => {

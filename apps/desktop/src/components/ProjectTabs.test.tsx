@@ -7,11 +7,15 @@ import { C, INK_MIN_CONTRAST, CONTROL_MIN_CONTRAST, THEME_HEX } from "../theme/c
 import { asRgb } from "./statusDotTestUtils";
 import {
   ProjectTabs,
+  closeTitle,
   pinTitle,
+  staleTitle,
   tabBadgeCount,
   tabBand,
   TAB_LABEL_MAX_WIDTH,
+  type ProjectTabStaleness,
 } from "./ProjectTabs";
+import { expectAnnounced, flattenedBy } from "../testing/announcedControls";
 
 /** WCAG relative luminance / contrast for a #rrggbb pair — the same arithmetic
  *  theme/chromeContrast.test.ts uses, kept local so this file's colour floors are self-contained. */
@@ -63,6 +67,84 @@ function renderTabs(overrides: Partial<Parameters<typeof ProjectTabs>[0]> = {}) 
   return { onSelect, onTogglePin, onAddProject };
 }
 
+// ══ EVERY CONTROL IN A TAB IS ANNOUNCED, AND NONE IS FLATTENED ═══════════════════════════════════
+//
+// THE DEFECT (bead sparkle-2mwl2m.1). The tab SLOT carried `role="tab"`, and WAI-ARIA gives that role
+// PRESENTATIONAL CHILDREN — assistive tech flattens the entire subtree to the tab's own accessible
+// name. The pin toggle, the ⚠ stale badge and the × CLOSE button all lived inside it, so a
+// screen-reader user was told the strip held N tabs and nothing else: no way to close a project, no
+// way to pin one, and no way to hear that a checkout was 1,696 commits behind. It rendered
+// identically and no test failed.
+//
+// THE ROLE MOVED INWARD RATHER THAN AWAY. A tab strip really is the ARIA tabs pattern, so deleting
+// `role="tab"` would cost the strip its semantics; instead the role now sits on the LABEL and the
+// three controls are its SIBLINGS inside two `role="presentation"` wrappers (the slot and the tab
+// body), which is what preserves the tablist → tab ownership across intermediate markup.
+//
+// EVERY CANDIDATE IS MOUNTED AT ONCE — pinned, closable, and stale — because absence asserted on a
+// control that was never rendered proves nothing (AGENTS.md's `sparkle-foqoe` shape).
+describe("ProjectTabs — a tab's controls reach the accessibility tree", () => {
+  const stale: ProjectTabStaleness = { behind: 1696, base: "origin/main" };
+
+  it("announces the tab, the pin, the ⚠ badge and × by their own role and name", () => {
+    renderTabs({
+      projects: [{ id: "sparkle", name: "sparkle", rootPath: "/repos/sparkle" }],
+      pinnedProjectId: "sparkle",
+      onClose: vi.fn(),
+      onOpenSettings: vi.fn(),
+      onTearOff: vi.fn(),
+      stalenessByProject: { sparkle: stale },
+    });
+    const slot = screen.getByTestId("tab-sparkle");
+    expectAnnounced(slot, [
+      // The tab itself is a LEAF now: it is announced, and it flattens nothing, because nothing
+      // interactive is inside it any more.
+      {
+        testId: "tab-label-sparkle",
+        role: "tab",
+        name: /^sparkle — double-click for project settings/,
+      },
+      { testId: "pin-sparkle", role: "button", name: pinTitle(true) },
+      { testId: "stale-sparkle", role: "button", name: staleTitle("sparkle", stale) },
+      { testId: "close-sparkle", role: "button", name: closeTitle("sparkle") },
+    ]);
+    // The slot and the body are what used to erase all four. Both are presentational now, which is
+    // ALSO what keeps `role="tablist"` owning the tab across them — a bare generic would not.
+    expect(slot.getAttribute("role")).toBe("presentation");
+    expect(screen.getByTestId("tab-body-sparkle").getAttribute("role")).toBe("presentation");
+    expect(flattenedBy(screen.getByTestId("close-sparkle"), slot)).toBeNull();
+  });
+
+  it("keeps the tab strip a real tablist, with the tab as the tab stop", () => {
+    // PAIRED with the case above: "nothing is flattened" would also be true of a strip that had
+    // simply stopped being a tablist. This is the half that says the ARIA pattern survived.
+    renderTabs({ onClose: vi.fn() });
+    expect(screen.getAllByRole("tablist")).toHaveLength(1);
+    const tabs = screen.getAllByRole("tab");
+    expect(tabs.map((el) => el.getAttribute("data-testid"))).toEqual([
+      "tab-label-sparkle",
+      "tab-label-website",
+    ]);
+    for (const t of tabs) expect(t.getAttribute("tabindex")).toBe("0");
+    // …and the × is NOT one of them, which is the whole point of the restructure.
+    expect(tabs).not.toContain(screen.getByTestId("close-sparkle"));
+  });
+
+  it("selects from the tab element by keyboard AND by clicking anywhere on the slot", () => {
+    // The slot's `onClick`/`onKeyDown` are one code path reached two ways: a click on the tab
+    // bubbles to it, and so does Enter. Losing either would make the restructure a regression
+    // rather than a fix, and "the role moved" alone cannot see that.
+    const { onSelect } = renderTabs({ onClose: vi.fn() });
+    fireEvent.keyDown(screen.getByTestId("tab-label-website"), { key: "Enter" });
+    expect(onSelect).toHaveBeenCalledWith("website");
+    fireEvent.click(screen.getByTestId("tab-website"));
+    expect(onSelect).toHaveBeenCalledTimes(2);
+    // …while × still stops the bubble, so closing never also selects.
+    fireEvent.click(screen.getByTestId("close-sparkle"));
+    expect(onSelect).toHaveBeenCalledTimes(2);
+  });
+});
+
 describe("pure helpers", () => {
   it("pinTitle describes the action (pin vs unpin)", () => {
     expect(pinTitle(false)).toMatch(/disregard all other project alerts/i);
@@ -81,8 +163,8 @@ describe("pure helpers", () => {
 describe("ProjectTabs", () => {
   it("renders a tab per project and marks the selected one", () => {
     renderTabs();
-    expect(screen.getByTestId("tab-sparkle").getAttribute("aria-selected")).toBe("true");
-    expect(screen.getByTestId("tab-website").getAttribute("aria-selected")).toBe("false");
+    expect(screen.getByTestId("tab-label-sparkle").getAttribute("aria-selected")).toBe("true");
+    expect(screen.getByTestId("tab-label-website").getAttribute("aria-selected")).toBe("false");
   });
 
   it("clicking a tab selects that project", () => {
@@ -311,7 +393,7 @@ describe("ProjectTabs — long names truncate rather than wrap", () => {
     // ProjectTabs.hoverExpand.test.tsx is the visible half.
     renderTabs({ projects: [{ id: "long", name: longName }] });
     expect(screen.getByTestId("tab-label-long").textContent).toBe(longName);
-    expect(screen.getByTestId("tab-long").getAttribute("aria-label")).toContain(longName);
+    expect(screen.getByTestId("tab-label-long").getAttribute("aria-label")).toContain(longName);
   });
 
   it("applies the same clamp to short names, so every tab is exactly one row tall", () => {

@@ -14,11 +14,14 @@ import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   PINNED_BLOCKERS_TESTID,
+  PINNED_BLOCKER_ACTION_TESTID,
   PINNED_BLOCKER_CHIP_TESTID,
+  PINNED_BLOCKER_REDRAW_TESTID,
   PINNED_BLOCKER_TESTID,
   PINNED_CLEAR_ACTION,
   PinnedBlockers,
 } from "./PinnedBlockers";
+import { expectAnnounced, flattenedBy } from "../../testing/announcedControls";
 import { NUDGE_DISMISS_ACTION } from "./NudgeCard";
 import { AgentPillProvider } from "./AgentPill";
 import type { ConciergeNudge } from "./types";
@@ -68,6 +71,53 @@ const openIds = () =>
   screen.queryAllByTestId(PINNED_BLOCKER_TESTID).map((el) => el.getAttribute("data-agent-id"));
 const chipIds = () =>
   screen.queryAllByTestId(PINNED_BLOCKER_CHIP_TESTID).map((el) => el.getAttribute("data-agent-id"));
+
+// ══ EVERY CONTROL ON THE ROW IS ANNOUNCED, AND NONE IS FLATTENED ═════════════════════════════════
+//
+// THE DEFECT (bead sparkle-2mwl2m.1). The row carried `role="button"` so the whole strip was one
+// click target, and WAI-ARIA gives that role PRESENTATIONAL CHILDREN — assistive tech flattens the
+// entire subtree to the row's own accessible name. Approve/Open (a one-tap relay with no other entry
+// point), Force redraw (the recovery action for a pane the app cannot read), Mute (the
+// do-not-interrupt feature's only call site) and [x] were all announced as nothing at all, on a
+// surface whose entire purpose is that nothing needing the founder may be hidden.
+//
+// THE FIX IS `role="group"`, NOT NO ROLE: a container role with no presentational children keeps
+// the four buttons announced while the row keeps the name that says BLOCKED at a width where the
+// visible word has been dropped (see `PinnedBlockers.narrow.test.tsx`, tier 2). A name on a bare
+// generic is not exposed at all, so dropping the role outright would have lost it.
+//
+// EVERY CANDIDATE IS MOUNTED — the fixture carries an action, so Approve is on screen, and the
+// unmeasured column width reads as roomy so nothing is tiered away. Asserting the absence of
+// flattening on a control that was never rendered would pass on an empty row.
+describe("PinnedBlockers — the row's nested controls reach the accessibility tree", () => {
+  it("announces the pill, Approve, Force redraw, Mute and [x] by their own role and name", () => {
+    const approvable: ConciergeNudge = {
+      ...blocker("a"),
+      actions: [{ id: "approve", label: "Approve", kind: "primary" }],
+    };
+    renderPinned([approvable]);
+    const row = screen.getByTestId(PINNED_BLOCKER_TESTID);
+    expectAnnounced(row, [
+      { testId: "concierge-agent-pill", role: "button", name: /@Agent a/ },
+      { testId: PINNED_BLOCKER_ACTION_TESTID, role: "button", name: "Approve" },
+      {
+        testId: PINNED_BLOCKER_REDRAW_TESTID,
+        role: "button",
+        name: "Force Agent a's terminal to redraw",
+      },
+      { testId: "concierge-nudge-mute", role: "button", name: "Mute alerts about Agent a" },
+      {
+        testId: "concierge-nudge-dismiss",
+        role: "button",
+        name: "Dismiss this alert about Agent a",
+      },
+    ]);
+    // The row's own role is what decides all five, so pin it directly too: `group` announces the
+    // name AND leaves its children alone, which is the whole distinction from `button`.
+    expect(row.getAttribute("role")).toBe("group");
+    expect(flattenedBy(screen.getByTestId(PINNED_BLOCKER_ACTION_TESTID), row)).toBeNull();
+  });
+});
 
 describe("PinnedBlockers — a live blocker is pinned, not threaded", () => {
   it("names its agent and project, and says BLOCKED in the same words the thread used", () => {

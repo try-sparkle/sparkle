@@ -46,15 +46,22 @@ export function firstLadderRowId<
    *  be the same accessor the column passes. `local_none` sorts above `local_uncommitted`, so a
    *  caller that omits it here while the sidebar supplies it computes a different first row — the
    *  exact "selection points at a row the column is not rendering" failure this module was extracted
-   *  to end (roborev 53858), just reached through the section axis instead of the band axis. */
-  holdsWorkOf?: (id: string) => boolean | undefined,
+   *  to end (roborev 53858), just reached through the section axis instead of the band axis.
+   *
+   *  ⚠️ REQUIRED, though `undefined` is still a legal VALUE — see the matching note on
+   *  `groupAgentsByStage`. It was `holdsWorkOf?` until bead `sparkle-l5fi7`, which made deleting
+   *  the argument at a call site neither a type error nor a test failure. */
+  holdsWorkOf: ((id: string) => boolean | undefined) | undefined,
   /** Does this row's work live in ANOTHER REPOSITORY? Forwarded straight to `groupAgentsByStage`,
    *  and it MUST be the same accessor the column passes — for the identical reason as `holdsWorkOf`
    *  above, only more sharply: `tracked_elsewhere` is section SLOT 0, so a cross-repo row sorts to
    *  the very TOP of the rendered column. A caller that omits it here while the sidebar supplies it
    *  computes it in `local_none`/`local_uncommitted` instead and returns a first row that is not the
-   *  first row on screen (roborev 67500). */
-  crossRepoOf?: (id: string) => CrossRepoReading | undefined,
+   *  first row on screen (roborev 67500).
+   *
+   *  ⚠️ REQUIRED for the same reason as `holdsWorkOf` above — pass `undefined` to mean "no
+   *  reading", never nothing at all. */
+  crossRepoOf: ((id: string) => CrossRepoReading | undefined) | undefined,
 ): string | null {
   // NO rollup accessor here, deliberately — `statusOf` already carries it.
   //

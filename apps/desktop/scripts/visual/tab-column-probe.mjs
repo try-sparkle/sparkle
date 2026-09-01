@@ -74,7 +74,9 @@ const READ = `(() => {
       bg: getComputedStyle(el).backgroundColor,
     };
   });
-  const tabs = [...document.querySelectorAll('[role="tab"]')].map((tab) => {
+  // THE SLOT, by class — the tab ROLE moved onto the label (bead sparkle-2mwl2m.1), so a role
+  // query would measure the name box rather than the tab's footprint in the strip.
+  const tabs = [...document.querySelectorAll('.concierge-tab')].map((tab) => {
     const id = (tab.getAttribute('data-testid') || '').replace(/^tab-/, '');
     const r = tab.getBoundingClientRect();
     const mid = (r.left + r.right) / 2;
@@ -82,7 +84,10 @@ const READ = `(() => {
     const face = document.querySelector('[data-testid="tab-body-' + id + '"]');
     return {
       id,
-      active: tab.getAttribute('aria-selected') === 'true',
+      active:
+        (tab.querySelector('[data-testid="tab-label-' + id + '"]') || tab).getAttribute(
+          'aria-selected',
+        ) === 'true',
       mid,
       under: under ? under.kind : null,
       wantBg: under ? under.bg : null,

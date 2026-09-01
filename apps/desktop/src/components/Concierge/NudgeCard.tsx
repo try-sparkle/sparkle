@@ -37,8 +37,19 @@
 // default for a control the reader will reach for reflexively: the cost of a mis-click is one
 // alarm, not a permanently silenced agent. Mute, one glyph to its left, is the durable one.
 //
-// A div with role="button" (not <button>) because buttons can't nest.
-import type { CSSProperties, KeyboardEvent } from "react";
+// ══ THE CARD ROOT IS A PLAIN DIV — NO ROLE, NO tabIndex (bead sparkle-2mwl2m.1) ═══════════════
+// It used to be `role="button"` + `tabIndex={0}` + a hand-rolled Enter/Space handler, so that a
+// click anywhere on the line would open the agent. WAI-ARIA gives the `button` role PRESENTATIONAL
+// CHILDREN: assistive tech flattens the whole subtree to one accessible name and drops the
+// semantics of everything inside it. That one attribute therefore silenced Approve, Mute and [x]
+// simultaneously — three controls, two of which (Mute, and Approve's one-tap relay) have no other
+// call site in the app. It renders identically, so nothing failed.
+//
+// The whole-surface `onClick` STAYS, as what it always really was: a MOUSE CONVENIENCE. The
+// keyboard and screen-reader path to the same destination is the AgentPill below, which is already
+// a real `<button>` running the same `onNudgeClick` — so this is subtraction, not a relocation, and
+// nothing that could be reached before is unreachable now. Same remedy `BeadCard` shipped.
+import type { CSSProperties } from "react";
 import { FiBellOff, FiX } from "react-icons/fi";
 import { C, CHAT_USER_BUBBLE, FONT_WEIGHT } from "../../theme/colors";
 import { AgentPill } from "./AgentPill";
@@ -184,25 +195,6 @@ export function NudgeCard({
   const lead = resolved
     ? `${RESOLVED_LEAD} after ${formatElapsed(Math.max(0, resolved.resolvedAt - resolved.raisedAt))}:`
     : LEAD;
-  const label = `${lead} ${nudge.agentName} in ${nudge.projectName}`;
-  const onKeyDown = (e: KeyboardEvent<HTMLDivElement>) => {
-    // ONLY THE CARD ITSELF. Without this guard a keydown on a nested control bubbles up here, and
-    // `preventDefault()` below cancels the very thing it was: for a <button>, Enter/Space activation
-    // IS the keydown default action. So a keyboard user who tabbed to Mute, [x] or Approve and
-    // pressed Enter got NAVIGATED to the agent instead — the card's own gesture, silently replacing
-    // theirs. Worst on the two icon controls, which the `:focus-within` reveal lights up for
-    // precisely that user, and on Approve, whose one-tap relay has no other entry point.
-    //
-    // `stopPropagation` on each control would work too, and is what the CLICK handlers do; the guard
-    // is here instead because it is one rule for every control the card will ever grow, and because
-    // the failure it prevents is silent in both directions — nothing throws, the wrong thing simply
-    // happens.
-    if (e.target !== e.currentTarget) return;
-    if (e.key === "Enter" || e.key === " ") {
-      e.preventDefault();
-      onNudgeClick(nudge);
-    }
-  };
   /** Fire an action without ALSO counting as a card click. */
   const act = (actionId: string) => (e: { stopPropagation: () => void }) => {
     e.stopPropagation();
@@ -210,8 +202,6 @@ export function NudgeCard({
   };
   return (
     <div
-      role="button"
-      tabIndex={0}
       data-testid={NUDGE_CARD_TESTID}
       data-agent-id={nudge.id}
       data-band={nudge.band}
@@ -219,9 +209,11 @@ export function NudgeCard({
       // finished" without reading colours out of a style attribute — and, more importantly, so the
       // opposite case can assert a LIVE card is still absent from this attribute.
       data-resolved={resolved ? "true" : undefined}
-      aria-label={label}
+      // NO `aria-label`. A name on a role-less generic is not announced anyway, and the line the
+      // card renders — "BLOCKED:", the pill, "in {project}" — is the same sentence it used to
+      // duplicate into the attribute. Naming the wrapper is also what made the flattened subtree
+      // look intentional.
       onClick={() => onNudgeClick(nudge)}
-      onKeyDown={onKeyDown}
       style={{
         alignSelf: "stretch",
         maxWidth: "100%",
@@ -308,6 +300,10 @@ export function NudgeCard({
         <button
           key={a.id}
           type="button"
+          // A HANDLE OF ITS OWN, so a case can name this control rather than fishing for its label
+          // — the label is producer-chosen (`services/nudgeActions` emits Approve or Open) and a
+          // suite that finds the button by its words stops testing it the day the words change.
+          data-testid={`concierge-nudge-action-${a.id}`}
           onClick={act(a.id)}
           style={{
             fontSize: 12,

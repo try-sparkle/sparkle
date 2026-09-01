@@ -433,13 +433,18 @@ describe("AgentSidebar — selection never lands on a filtered-out row", () => {
 });
 
 describe("the `local_none` rung is actually WIRED to the column (roborev 57842)", () => {
-  // WHY THIS BLOCK EXISTS. `holdsWorkOf` is OPTIONAL on both `groupAgentsByStage` and
-  // `firstLadderRowId`, so deleting the argument from any production call site is not a type error.
+  // WHY THIS BLOCK EXISTS. `holdsWorkOf` used to be OPTIONAL on both `groupAgentsByStage` and
+  // `firstLadderRowId`, so deleting the argument from any production call site was not a type error.
   // Before these tests, `local_none` appeared only in pure-function unit tests — every component
   // test here seeds `branchStatus: {}`, so every row read `undefined` and the whole rung was
   // invisible to the suite. It could have been silently removed from the UI with everything green,
-  // which is precisely the drift the comments on `groupAgentsByStage` and `ladderSelection` claim is
-  // impossible.
+  // which is precisely the drift the comments on `groupAgentsByStage` and `ladderSelection` claimed
+  // was impossible.
+  //
+  // THIS TEST IS THE COVERAGE FOR ONE ARGUMENT AT ONE CALL SITE — `headHoldsWorkOf` on
+  // AgentSidebar's `sections` memo — and is mutation-checked by deleting exactly that line (bead
+  // `sparkle-l5fi7`). The parameter is now REQUIRED as well, so the omission is also an arity
+  // error; the sibling positions are covered by AgentSidebar.ladderAccessorWiring.test.tsx.
 
   /** A worktree reading as Rust sends it. `worktreeOnBranch: true` is required — a parked tree reads
    *  `undefined` and would put the row straight back in `local_uncommitted`. */

@@ -477,7 +477,9 @@ describe("PinnedBlockers attaches its width observer on the idle → blocked tra
   // THE SHIPPED RULE: the fence ONLY `stopPropagation()`s. Every form the pill can render keeps
   // just its own honest behavior (open, toggle, navigate, or nothing) and NEVER ALSO approves.
   // "The entire row remains clickable" is satisfied by the ROW's own area (its padding, the dot,
-  // the "in {project}" text) and by Enter/Space on the row — never by clicking the pill itself.
+  // the "in {project}" text) — never by clicking the pill itself. The KEYBOARD reaches the same
+  // destination through the pill's own `<button>`; the row stopped being a tab stop with the
+  // `role="button"` that was flattening every control inside it (bead sparkle-2mwl2m.1).
   it("the LIVE pill button always opens the agent — even at tier 4, so its tooltip stays true", () => {
     (globalThis as { ResizeObserver: unknown }).ResizeObserver = RecordingResizeObserver;
     const { onNudgeClick, onNudgeAction } = renderPinned([blocker("a")]);
@@ -637,12 +639,17 @@ describe("PinnedBlockers attaches its width observer on the idle → blocked tra
     expect(onNudgeClick).not.toHaveBeenCalled();
   });
 
-  // ── THE ACCESSIBLE NAME MUST SAY WHAT Enter/Space NOW DOES (roborev 64058) ─────────────────────
+  // ── THE ACCESSIBLE NAME MUST SAY WHAT ACTIVATION NOW DOES (roborev 64058) ─────────────────────
   // "User-facing copy is code" — a fix that relocates a behavior owes every string describing the
-  // OLD behavior an update. The row is `role="button"` with the same aria-label at every width
-  // before this fix, so a screen-reader user got no cue that activating it now fires an
-  // irreversible relay instead of merely opening the agent.
-  it("the accessible name stays the plain form once the button is gone, and Enter OPENS rather than approving", () => {
+  // OLD behavior an update. The row carried the same aria-label at every width before that fix, so
+  // a screen-reader user got no cue that activating it fired an irreversible relay instead of
+  // merely opening the agent.
+  //
+  // THE ROW IS NO LONGER A CONTROL AT ALL (bead sparkle-2mwl2m.1). It is a labelled `role="group"`
+  // with a mouse-convenience `onClick`; the KEYBOARD path to the same destination is the pill,
+  // which is a real `<button>`. So the case asserts both halves: the name still says BLOCKED at a
+  // width where the visible word is gone, and the keyboard reaches OPEN — never the approval.
+  it("the accessible name stays the plain form once the button is gone, and the KEYBOARD path OPENS rather than approving", () => {
     (globalThis as { ResizeObserver: unknown }).ResizeObserver = RecordingResizeObserver;
     const { onNudgeClick, onNudgeAction } = renderPinned([blocker("a")]);
     deliver(live()[0]!, PINNED_BLOCKER_HIDE_BUTTON_MAX_COLUMN_PX - 1);
@@ -652,10 +659,20 @@ describe("PinnedBlockers attaches its width observer on the idle → blocked tra
     // approves at any width, so the warning is retired with the behaviour it warned about; leaving
     // it would narrate a relay that cannot happen.
     expect(row.getAttribute("aria-label")).toBe("BLOCKED: Agent a in sparkle");
+    // …on a role that does NOT flatten its children. `button` did, which is what silenced every
+    // control in the row; a bare generic would drop the name above entirely.
+    expect(row.getAttribute("role")).toBe("group");
+    expect(row.hasAttribute("tabindex")).toBe(false);
 
     // KEYBOARD, NOT CLICK — the sibling case above covers the pointer. A screen-reader user
-    // activating this row must be no more able to fire a blind approval than a sighted one.
-    fireEvent.keyDown(row, { key: "Enter" });
+    // activating this row must be no more able to fire a blind approval than a sighted one. The
+    // pill is a `<button>`, so the browser turns Enter into its click; jsdom does not synthesize
+    // that, which is why this drives the click the activation produces.
+    const pill = rowByAgentId("a").querySelector<HTMLElement>(
+      '[data-testid="concierge-agent-pill"]',
+    )!;
+    expect(pill.tagName).toBe("BUTTON");
+    fireEvent.click(pill);
     expect(onNudgeClick).toHaveBeenCalledWith(expect.objectContaining({ id: "a" }));
     expect(onNudgeAction).not.toHaveBeenCalled();
   });

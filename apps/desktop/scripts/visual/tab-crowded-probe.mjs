@@ -110,14 +110,17 @@ export function floorsMatch(src) {
 
 /** Measure every tab: its box in the strip, and its label's rendered vs natural width. */
 const MEASURE = `(() => {
-  const tabs = [...document.querySelectorAll('[role="tab"]')].map((t) => {
+  // THE SLOT, by class — not by \'[role="tab"]\'. Since bead sparkle-2mwl2m.1 the tab ROLE sits on
+  // the label inside the slot (a tab flattens its children, which was silencing the close button),
+  // so a role query would return the label and every rect below would measure the wrong box.
+  const tabs = [...document.querySelectorAll(".concierge-tab")].map((t) => {
     const id = (t.getAttribute("data-testid") || "").replace(/^tab-/, "");
     const label = t.querySelector('[data-testid="tab-label-' + id + '"]');
     const r = t.getBoundingClientRect();
     const lr = label.getBoundingClientRect();
     return {
       id,
-      active: t.getAttribute("aria-selected") === "true",
+      active: label.getAttribute("aria-selected") === "true",
       expanded: t.getAttribute("data-expanded") === "true",
       // The SLOT's box — what must not move when a sibling expands. BOTH AXES: this recorded
       // left/width only, and the tab-click bug (bead sparkle-73imb) lived precisely in the axis it

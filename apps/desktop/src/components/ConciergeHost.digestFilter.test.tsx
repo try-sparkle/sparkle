@@ -179,7 +179,11 @@ const feedFrom = (projects: Project[], status: Record<string, AgentTabStatus>) =
  * green on exactly the drift it exists to catch.
  *
  * The stage function is constant because stage decides which SECTION a row lands in, never whether
- * it is visible at all.
+ * it is visible at all — and the three trailing `undefined`s say the same thing explicitly. This
+ * helper's subject is the BAND filter, so it has no band-rollup, worktree or cross-repo reading to
+ * supply; those parameters are REQUIRED rather than optional (bead `sparkle-l5fi7`), so a caller
+ * with nothing to pass must say so rather than say nothing. Do NOT read the `undefined`s as the
+ * sidebar's real inputs: the column passes all three, and a row's SECTION would differ here.
  */
 function sidebarRowsUnder(
   project: Project,
@@ -195,6 +199,9 @@ function sidebarRowsUnder(
       () => resolveStage(undefined, undefined),
       (id) => eff[id] ?? "stopped",
       bands,
+      undefined,
+      undefined,
+      undefined,
     ),
   );
 }

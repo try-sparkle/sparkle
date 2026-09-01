@@ -82,7 +82,7 @@ const LEAD = "BLOCKED:";
 //                  actually unblocks the agent, so it is the last thing to give.
 //   4. narrowest — only here does the button itself disappear, and ONLY because the ROW's own
 //                  area is wired to fire the exact same action in that state (see the row's own
-//                  `onClick`/`onKeyDown` below) — a block you can see but cannot act on would be
+//                  `onClick` below) — a block you can see but cannot act on would be
 //                  worse than a cramped row. THE PILL IS A PURE CARVE-OUT, not a second approval
 //                  path: every form it can render — the live button, a closed pill's disclosure
 //                  toggle, the notice prose that toggle can reveal, its own "See what it did"
@@ -91,8 +91,10 @@ const LEAD = "BLOCKED:";
 //                  all) and NEVER also triggers the approval; the fence around it exists solely to
 //                  `stopPropagation()` so none of that bubbles up and double-fires the row's own
 //                  handler. "The entire row remains clickable" is satisfied by the ROW's own area
-//                  — its padding, the dot, the "in {project}" text — and by Enter/Space on the row
-//                  itself, never by the pill sub-region. The name keeps its tooltip regardless
+//                  — its padding, the dot, the "in {project}" text — never by the pill sub-region.
+//                  THE KEYBOARD REACHES THE SAME DESTINATION THROUGH THE PILL, which is a real
+//                  `<button>` running the same `onNudgeClick`; the row itself is no longer a tab
+//                  stop (bead sparkle-2mwl2m.1). The name keeps its tooltip regardless
 //                  (AgentPill already carries one — see `AgentPill`'s `title`), so a truncated
 //                  name is always recoverable on hover.
 //
@@ -350,8 +352,25 @@ export function PinnedBlockers({
           key={b.id}
           data-testid={PINNED_BLOCKER_TESTID}
           data-agent-id={b.id}
-          role="button"
-          tabIndex={0}
+          // ══ A LABELLED `group`, NOT `role="button"` (bead sparkle-2mwl2m.1) ═══════════════════
+          // The row was `role="button"` + `tabIndex={0}` so the whole strip was one big target.
+          // WAI-ARIA gives the `button` role PRESENTATIONAL CHILDREN: the entire subtree collapses
+          // to the row's own accessible name, so Approve/Open, Force redraw, Mute and [x] — four
+          // controls, two of which have no other call site in the app — were announced as nothing
+          // at all. It renders identically, which is why it shipped.
+          //
+          // `group` is a container role with NO presentational children, so the four buttons and
+          // the pill are announced again while the row keeps the ONE thing the name below is for:
+          // saying BLOCKED at a width where the visible word has been dropped (tier 2). Dropping
+          // the name outright was the other option and it loses that; putting it on a role-less
+          // generic loses it too, since a name on a `generic` is not exposed.
+          //
+          // NO `tabIndex` AND NO `onKeyDown`. The keyboard path to the row's own gesture is the
+          // `AgentPill` below, which is already a real `<button>` running the same `onNudgeClick`
+          // the row's click does (see `pinnedBlockerRowActivation`: the row OPENS, always, at every
+          // width). So the whole-surface `onClick` is what it always really was — a MOUSE
+          // CONVENIENCE — and nothing that could be reached before is unreachable now.
+          role="group"
           // ONE ACCESSIBLE NAME AT EVERY WIDTH, because the row now does ONE thing at every width:
           // it opens the agent. This used to branch — below the button threshold the row fired an
           // irreversible Approve relay, and the name had to warn a screen-reader user about a
@@ -366,14 +385,6 @@ export function PinnedBlockers({
           // read it twice.
           aria-label={`${LEAD} ${b.agentName} in ${b.projectName}`}
           onClick={rowActivate}
-          onKeyDown={(e) => {
-            // ONLY THE ROW ITSELF, matching NudgeCard: a keydown on the nested fold button bubbles
-            // here, and preventDefault would cancel the button's own Enter/Space activation.
-            if (e.target !== e.currentTarget) return;
-            if (e.key !== "Enter" && e.key !== " ") return;
-            e.preventDefault();
-            rowActivate();
-          }}
           style={row()}
         >
           <span

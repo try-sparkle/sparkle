@@ -35,6 +35,10 @@
 // are asserted, plus the siblings' own inline styles are captured before and after and compared, so
 // a change that starts restyling the neighbours reds this file.
 
+// THE TAB ROLE LIVES ON THE LABEL (`tab-label-<id>`), NOT ON THE SLOT (`tab-<id>`) — bead
+// sparkle-2mwl2m.1. A `role="tab"` flattens its whole subtree, which was silencing the close
+// button, the pin and the stale badge inside it, so the role moved inward to the name and
+// those controls became its siblings. `aria-selected` and the accessible name moved with it.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Profiler } from "react";
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
@@ -565,7 +569,10 @@ describe("the full name reaches keyboard and screen-reader users too", () => {
     // element has no accessible name yet. A tab has visible text, so the attribute was removed with
     // no replacement — every hover, forever. The name has to be an explicit `aria-label`.
     renderTabs();
-    const tab = screen.getByTestId("tab-foundry");
+    // …and it lives on the TAB, which since bead sparkle-2mwl2m.1 is the label rather than the
+    // slot — see the note at the top of this file.
+    const tab = screen.getByTestId("tab-label-foundry");
+    expect(tab.getAttribute("role")).toBe("tab");
     expect(tab.getAttribute("aria-label")).toContain("foundry-web");
   });
 
@@ -576,7 +583,7 @@ describe("the full name reaches keyboard and screen-reader users too", () => {
       selectedProjectId: "sparkle",
       countsByProject: { sparkle: counts({ needs_you: 155 }) },
     });
-    expect(screen.getByTestId("tab-sparkle").getAttribute("aria-label")).toContain(
+    expect(screen.getByTestId("tab-label-sparkle").getAttribute("aria-label")).toContain(
       "sparkle-desktop",
     );
   });

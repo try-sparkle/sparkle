@@ -284,6 +284,47 @@ describe("the stale badge opens the remedy panel", () => {
     expect(document.activeElement).toBe(badge);
   });
 
+  // THE FALLBACK BRANCH — the one that regressed silently (roborev 72737, bead sparkle-2mwl2m.1).
+  //
+  // The test above covers the badge-PRESENT branch, where focus goes back to the badge. This is the
+  // other half: after a successful fast-forward the project leaves `stalenessByProject` and its
+  // badge UNMOUNTS, so `closeStalePanel` falls back to the tab. That fallback used to read the slot
+  // `<div>` from `tabEls` — and when the a11y restructure moved the tab stop off the slot and onto
+  // the label, `.focus()` on the slot became a SILENT no-op: no error, no exception, focus just
+  // lands on `document.body` and a keyboard user closing the panel is dumped to the top of the
+  // document. Asserting "the panel closed" cannot see that; only asserting WHERE FOCUS WENT can.
+  //
+  // So this asserts the side effect (`document.activeElement` is the label) and explicitly rejects
+  // `document.body`, which is precisely the value the defect produced.
+  it("returns focus to the tab LABEL when the badge has gone (the successful-remedy case)", async () => {
+    const { rerender } = renderTabs({ sparkle: STALE });
+    fireEvent.click(screen.getByTestId("stale-sparkle"));
+    await screen.findByTestId("stale-panel");
+
+    // The remedy landed: the project drops out of `stalenessByProject`, so the badge unmounts and
+    // the fallback is the ONLY way out for a keyboard user.
+    rerender(
+      <ProjectTabs
+        projects={projects}
+        selectedProjectId="sparkle"
+        pinnedProjectId={null}
+        countsByProject={{ sparkle: counts(), website: counts() }}
+        onSelect={() => {}}
+        onTogglePin={() => {}}
+        stalenessByProject={{}}
+      />,
+    );
+    await waitFor(() => expect(screen.queryByTestId("stale-sparkle")).toBeNull());
+
+    fireEvent.keyDown(window, { key: "Escape" });
+    await waitFor(() => expect(screen.queryByTestId("stale-panel")).toBeNull());
+
+    const label = screen.getByTestId("tab-label-sparkle");
+    // The tab stop is the label, and it is what must hold focus.
+    expect(document.activeElement, "focus must land on the tab label, not be dropped to <body>").toBe(label);
+    expect(document.activeElement).not.toBe(document.body);
+  });
+
   // THE ROW LIST IS FROZEN AT OPEN, and this is the case that decides it.
   //
   // `stalenessByProject` omits THREE different things — unknown, not-stale, and a read that FAILED

@@ -186,7 +186,11 @@ describe("Workspace — window title", () => {
     act(() => {
       fireEvent.click(screen.getByTestId("tab-p2"));
     });
-    await waitFor(() => expect(screen.getByTestId("tab-p2").getAttribute("aria-selected")).toBe("true"));
+    await waitFor(() =>
+      // The tab ROLE, and so `aria-selected`, sits on the label rather than the slot since bead
+      // sparkle-2mwl2m.1 — a `role="tab"` was flattening the close button inside it.
+      expect(screen.getByTestId("tab-label-p2").getAttribute("aria-selected")).toBe("true"),
+    );
     // Beta is now selected. A projectName-keyed effect would have fired again here.
     expect(setTitleSpy.mock.calls.length).toBe(callsAfterBoot);
     expect(setTitleSpy).not.toHaveBeenCalledWith("Beta");
@@ -253,8 +257,8 @@ describe("Workspace — project tabs drive the shell", () => {
 
   it("renders a tab per project, marking the selected one", () => {
     render(<Workspace />);
-    expect(screen.getByTestId("tab-p1").getAttribute("aria-selected")).toBe("true");
-    expect(screen.getByTestId("tab-p2").getAttribute("aria-selected")).toBe("false");
+    expect(screen.getByTestId("tab-label-p1").getAttribute("aria-selected")).toBe("true");
+    expect(screen.getByTestId("tab-label-p2").getAttribute("aria-selected")).toBe("false");
   });
 
   it("the tab pin toggles the concierge's scope (one pin at a time)", () => {

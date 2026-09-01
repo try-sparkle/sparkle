@@ -143,6 +143,11 @@ export const PREVIEW_CARD_REFUSED_TESTID = "concierge-preview-refused";
  *  and no keyboard can make. */
 export const PREVIEW_CARD_OPEN_TESTID = "concierge-preview-open";
 
+/** How a test finds the card's DISCLOSURE — the real `<button>` that owns the expand/collapse
+ *  gesture. See the card root's own comment: the whole-surface click is a mouse convenience, and
+ *  this is the control a keyboard or a screen reader reaches (bead sparkle-2mwl2m.1). */
+export const PREVIEW_CARD_TOGGLE_TESTID = "concierge-preview-toggle";
+
 /**
  * THE TWO WIDTHS A CARD OCCUPIES, exported so a test can assert the SIZE rather than eyeballing it.
  *
@@ -524,29 +529,22 @@ function PreviewCard({
       // than eyeballing a width. Absent rather than `"false"` when collapsed, so the attribute's
       // presence is itself the signal.
       data-expanded={expanded ? "true" : undefined}
-      role="button"
-      tabIndex={0}
-      // THE CARD IS A TOGGLE NOW, so it announces its expanded state and what activating it does.
-      // The url is NOT in this name any more — a single click no longer navigates there; the
-      // "Open in browser" button below carries the url in its own accessible name instead.
-      aria-expanded={expanded}
-      aria-label={`${expanded ? "Collapse" : "Expand"} ${name}'s preview`}
+      // ══ NO ROLE, NO tabIndex, NO NAME ON THE CARD ROOT (bead sparkle-2mwl2m.1) ═════════════════
+      // This was `role="button"` + `tabIndex={0}` + `aria-expanded` + a hand-rolled Enter/Space
+      // handler, so the whole card was the toggle. WAI-ARIA gives the `button` role PRESENTATIONAL
+      // CHILDREN: assistive tech flattens the entire subtree to the card's own accessible name, so
+      // the agent pill, "Open in browser" (which carries the url — the actionable half of the whole
+      // card) and ⟳ were announced as nothing at all. It renders identically.
+      //
+      // The remedy is BeadCard's, and for a disclosure BeadCard puts the real `<button>` on the
+      // TITLE: here that is the lead line below, which now carries `aria-expanded` and the name this
+      // attribute used to hold. The whole-surface `onClick` stays as a MOUSE CONVENIENCE.
+      //
       // SINGLE CLICK EXPANDS, DOUBLE CLICK OPENS (sparkle-7kn6bk). React fires `onDoubleClick` from
       // the browser's own `dblclick`, which arrives AFTER the two clicks — so a double-click toggles
       // twice (a no-op, back to where it started) and then opens, which is the intended net effect.
       onClick={toggleExpanded}
       onDoubleClick={open}
-      onKeyDown={(e) => {
-        // ONLY THE CARD ITSELF — a keydown on the nested pill, the ⟳ or the open button bubbles
-        // here, and preventDefault would cancel their own Enter/Space activation. Same rule as
-        // `PinnedBlockers`/`NudgeCard`. Enter/Space EXPANDS (the primary gesture); the keyboard path
-        // to the browser is the focusable "Open in browser" button, since a double-click has no
-        // keyboard equivalent.
-        if (e.target !== e.currentTarget) return;
-        if (e.key !== "Enter" && e.key !== " ") return;
-        e.preventDefault();
-        toggleExpanded();
-      }}
       style={card(expanded)}
     >
       <div style={{ display: "flex", alignItems: "center", gap: 6, minWidth: 0, flexWrap: "wrap" }}>
@@ -562,9 +560,43 @@ function PreviewCard({
         >
           <AgentPill agentId={agentId} fallbackName={name} />
         </span>
-        <span style={{ color: C.conciergeMuted, fontSize: TYPE.small, minWidth: 0 }}>
+        {/* THE DISCLOSURE — the one control that owns the expand/collapse gesture, and a real
+            `<button>` so Enter, Space and a focus ring come from the platform rather than from a
+            hand-rolled keydown handler on a div (bead sparkle-2mwl2m.1). It looks exactly like the
+            muted lead it replaces: the card's whole surface is still clickable, so the affordance a
+            sighted mouse user sees is unchanged — what changed is that a keyboard and a screen
+            reader can now reach it, and that the four controls inside the card are no longer
+            flattened by a role on the root.
+
+            `stopPropagation` for the same reason every other control on this card has it: without
+            it the card's own `onClick` also fires and the two toggles cancel out to nothing. */}
+        <button
+          type="button"
+          data-testid={PREVIEW_CARD_TOGGLE_TESTID}
+          aria-expanded={expanded}
+          // The name the card root used to carry, unchanged. The url is deliberately NOT in it — a
+          // single click does not navigate there; the "Open in browser" button below owns the url in
+          // its own accessible name.
+          aria-label={`${expanded ? "Collapse" : "Expand"} ${name}'s preview`}
+          onClick={(e) => {
+            e.stopPropagation();
+            toggleExpanded();
+          }}
+          style={{
+            appearance: "none",
+            border: "none",
+            background: "transparent",
+            padding: 0,
+            textAlign: "left",
+            font: "inherit",
+            color: C.conciergeMuted,
+            fontSize: TYPE.small,
+            minWidth: 0,
+            cursor: "pointer",
+          }}
+        >
           {PREVIEW_CARD_LEAD}
-        </span>
+        </button>
       </div>
       {shotState ? (
         <img

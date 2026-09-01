@@ -664,9 +664,14 @@ function ensureTabStyles(): void {
  * overflowing the window does not. Keeping "+" outside that scroller is the reason for the split:
  * inside it, the one control that opens a project scrolls off the end exactly when the bar is full.
  *
- * `role="tablist"` stays on the box that directly contains the `role="tab"` children — that
- * parent/child relationship is required by ARIA, and moving the role outward to the wrapper would
- * quietly break it. `index.css` mirrors both boxes for the left-hand pair (`.concierge-tabbar`).
+ * `role="tablist"` stays on the box that CONTAINS the `role="tab"` elements — that ownership is
+ * required by ARIA, and moving the role outward to the wrapper would quietly break it. It reaches
+ * them through two `role="presentation"` boxes (the slot and the tab body), which is the sanctioned
+ * way to keep the relationship across intermediate markup: since bead sparkle-2mwl2m.1 the tab is
+ * the LABEL rather than the whole slot, so that the close/pin/stale controls beside it are ANNOUNCED
+ * instead of being flattened away by the tab role's presentational children. A GENERIC wrapper would
+ * not preserve it, which is why those two roles are load-bearing rather than decoration.
+ * `index.css` mirrors both boxes for the left-hand pair (`.concierge-tabbar`).
  */
 /**
  * The strip's rule — the line separating the bar from the content beneath it.
@@ -1157,10 +1162,19 @@ export function ProjectTabs({
 
   /** Close the panel and put focus back on the badge that opened it — the keyboard user's way out
    *  lands nowhere otherwise, since the panel is portaled away from the strip. Falls back to the
-   *  TAB when the badge is gone, which is exactly the successful-remedy case below. */
+   *  TAB when the badge is gone, which is exactly the successful-remedy case below.
+   *
+   *  THE FALLBACK READS `labelEls`, NOT `tabEls`, AND THAT IS LOAD-BEARING (bead sparkle-2mwl2m.1).
+   *  The tab stop moved off the slot and onto the label when the slot became `role="presentation"`:
+   *  the slot has no `tabIndex` any more, so `.focus()` on it is a SILENT no-op — no error, no
+   *  thrown exception, focus simply falls to `document.body` and the keyboard user is dumped at the
+   *  top of the document. That is exactly the successful-remedy case this fallback exists to serve,
+   *  so the regression would have landed on the one path nobody exercises by hand. `tabEls` stays
+   *  the measurement map (`readActiveFill`, `measure`, `scrollIntoView`); `labelEls` is the map of
+   *  things that can hold FOCUS. Anything restoring focus must read the latter. */
   function closeStalePanel(): void {
     const el = stalePanelFor ? staleBadgeEls.current.get(stalePanelFor) : null;
-    const tab = stalePanelFor ? tabEls.current.get(stalePanelFor) : null;
+    const tab = stalePanelFor ? labelEls.current.get(stalePanelFor) : null;
     setStalePanelFor(null);
     if (el?.isConnected) el.focus();
     else tab?.focus();
@@ -1351,9 +1365,26 @@ export function ProjectTabs({
               else tabEls.current.delete(p.id);
             }}
             className="concierge-tab"
-            role="tab"
-            aria-selected={active}
-            tabIndex={0}
+            // ══ THE SLOT IS PRESENTATIONAL; THE TAB IS THE LABEL INSIDE IT (bead sparkle-2mwl2m.1)
+            // This element used to be the `role="tab"` itself, with `aria-selected`, `tabIndex={0}`
+            // and the tab's accessible name. WAI-ARIA gives the `tab` role PRESENTATIONAL CHILDREN:
+            // assistive tech flattens the whole subtree to the tab's own name and drops the
+            // semantics of everything inside — so the pin toggle, the ⚠ stale badge and, worst, the
+            // × CLOSE button were announced as nothing at all. A screen-reader user could not close
+            // a project, and nothing rendered differently.
+            //
+            // The role moved INWARD rather than away, because a tab strip really is the ARIA tabs
+            // pattern and deleting the role would cost the strip its semantics. It now sits on the
+            // label (see `tab-label-…` below), and the close/pin/badge controls are its SIBLINGS
+            // inside the tab's presentational wrapper — announced separately, exactly as bead
+            // sparkle-2mwl2m.1 asks. `role="presentation"` on this box and on the body below is
+            // what preserves the tablist → tab ownership across the two wrappers.
+            //
+            // THE SLOT KEEPS EVERYTHING ELSE: the pointer/drag gestures, the hover expansion, the
+            // measurement refs, and the whole-footprint `onClick` — which is now what it always
+            // really was, a MOUSE CONVENIENCE. Keyboard selection comes from the tab element's own
+            // Enter/Space, whose keydown bubbles to `onKeyDown` here.
+            role="presentation"
             data-testid={`tab-${p.id}`}
             data-torn-out={tornOut || undefined}
             onPointerDown={(e) => onTabPointerDown(p.id, e)}
@@ -1372,15 +1403,6 @@ export function ProjectTabs({
             data-hint={PROJECT_TAB_HINT}
             data-expanded={exp ? true : undefined}
             title={label}
-            // THE NAME IS AN `aria-label`, NOT JUST A `title` — and the title alone was never
-            // enough. `disableNativeTooltips()` (wired at main.tsx) strips `title` app-wide on a
-            // capture-phase `mouseover`, rehoming it to `aria-label` ONLY for an element with no
-            // accessible name yet; a tab has visible text, so the attribute was removed with no
-            // replacement on every hover. That left the full project name reachable NOWHERE once
-            // the label was squeezed — not by tooltip, not by screen reader. Naming the tab
-            // explicitly is what gives keyboard and screen-reader users the same information the
-            // hover expansion gives the mouse, and it does not depend on the (clipped) text.
-            aria-label={label}
             onMouseEnter={() => beginExpand(p.id, false)}
             onMouseLeave={() => endExpand(p.id)}
             // Focus expands with NO delay: reaching a tab by keyboard is already deliberate.
@@ -1440,6 +1462,10 @@ export function ProjectTabs({
           >
             <div
               data-testid={`tab-body-${p.id}`}
+              // Presentational for the same reason the slot is: it sits BETWEEN the `role="tablist"`
+              // and the `role="tab"`, and ARIA preserves that ownership through `presentation`
+              // wrappers but not through generic ones.
+              role="presentation"
               ref={(el) => {
                 // Same delete-on-unmount discipline as `tabEls`; the chrome measurement walks this
                 // element's children, so a dead node here would be measured as a live tab.
@@ -1519,8 +1545,33 @@ export function ProjectTabs({
             >
               <MdOutlinePushPin size={14} />
             </button>
+            {/* ══ THIS IS THE TAB (bead sparkle-2mwl2m.1) ═══════════════════════════════════════
+                The role sits on the NAME rather than on the whole slot, because a `tab` flattens
+                everything inside it and the slot contains the pin, the stale badge and the close
+                control. Those are now siblings of the tab rather than descendants, so each is
+                announced on its own. (Spelled out in words, not glyphs: `glyphIcons.test.ts` scans
+                the continuation lines of a JSX comment as if they were code.)
+
+                IT CARRIES THE THREE THINGS THAT MAKE A TAB A TAB: the role, `aria-selected`, and a
+                tab stop. Enter/Space reach `onKeyDown` on the slot by bubbling, and a click here
+                reaches the slot's `onClick` the same way, so selection is ONE code path however it
+                is triggered — the pin and the close button already `stopPropagation` to stay out
+                of it.
+
+                THE NAME IS AN `aria-label`, NOT JUST A `title` — and the title alone was never
+                enough. `disableNativeTooltips()` (wired at main.tsx) strips `title` app-wide on a
+                capture-phase `mouseover`, rehoming it to `aria-label` ONLY for an element with no
+                accessible name yet; a tab has visible text, so the attribute was removed with no
+                replacement on every hover. That left the full project name reachable NOWHERE once
+                the label was squeezed — not by tooltip, not by screen reader. Naming the tab
+                explicitly is what gives keyboard and screen-reader users the same information the
+                hover expansion gives the mouse, and it does not depend on the (clipped) text. */}
             <span
               data-testid={`tab-label-${p.id}`}
+              role="tab"
+              aria-selected={active}
+              tabIndex={0}
+              aria-label={label}
               ref={(el) => {
                 // Same discipline as `tabEls`: delete on unmount, so a closed project cannot leave
                 // a dead node behind for the natural-width measurement to read.
@@ -1540,6 +1591,11 @@ export function ProjectTabs({
                 // `tabMinWidth` for the measurement that proved it.
                 minWidth: 0,
                 overflow: exp ? "visible" : "hidden",
+                // INSET, because the box it draws on CLIPS. The collapsed label is
+                // `overflow: hidden` (that is what produces the ellipsis), so a focus ring drawn
+                // outside the border box is cut off — and this element is the strip's only tab stop,
+                // so that ring is the sole indication of where keyboard focus is.
+                outlineOffset: -2,
                 textOverflow: "ellipsis",
                 whiteSpace: "nowrap",
               }}

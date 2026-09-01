@@ -249,7 +249,7 @@ describe("clicking a project tab", () => {
     expect(screen.getByTestId("tab-p1")).toBeTruthy();
     expect(screen.getByTestId("tab-p2")).toBeTruthy();
     expect(screen.getByTestId("tab-p3")).toBeTruthy();
-    expect(screen.getByTestId("tab-p1").getAttribute("aria-selected")).toBe("true");
+    expect(screen.getByTestId("tab-label-p1").getAttribute("aria-selected")).toBe("true");
   });
 
   it("MEASUREMENT: prices a tab click in each configuration, and every one must LAND", async () => {
@@ -288,7 +288,7 @@ describe("clicking a project tab", () => {
         `[measure] ${c.label}: strip commits=${counts.strip - strip} ` +
           `paneRenders=${counts.pane - pane} selections=${JSON.stringify(selections)}`,
       );
-      expect(screen.getByTestId("tab-p2").getAttribute("aria-selected")).toBe("true");
+      expect(screen.getByTestId("tab-label-p2").getAttribute("aria-selected")).toBe("true");
       expect(selections).toEqual(["p2"]);
       cleanup();
     }
@@ -319,7 +319,7 @@ describe("clicking a project tab", () => {
     });
 
     expect(useProjectStore.getState().selectedProjectId).toBe("p2");
-    expect(screen.getByTestId("tab-p2").getAttribute("aria-selected")).toBe("true");
+    expect(screen.getByTestId("tab-label-p2").getAttribute("aria-selected")).toBe("true");
     expect(selections).toEqual(["p2"]);
   });
 
