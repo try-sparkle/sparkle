@@ -27,7 +27,32 @@ declare module "*/worktree-guard.mjs" {
     command: unknown,
     home?: string,
     depth?: number,
-  ): { rule: string; bin: string; root: string; reached: string[] } | null;
+  ): { rule: string; bin: string; root: string; reached: string[]; home: string } | null;
+  // The directory-walker table the TCC rule is keyed on. Exported so the remedy test can be driven
+  // off the table itself rather than a hardcoded list — a binary added here is then covered by the
+  // "every walker gets a non-empty, guard-accepted remedy" sweep automatically (sparkle-x1bg6t).
+  export const WALKERS: Record<
+    string,
+    { depthFlags: string[]; depthLimitsTraversal: boolean; patternFirst: boolean }
+  >;
+  // The remedy for a TCC home-walk refusal: `commands` is every runnable example the text names,
+  // and it is NEVER empty — a binary with no table entry falls back to a generic narrowing
+  // instruction rather than the empty string this replaced. Each command is itself accepted by
+  // `blocksProtectedAppDataWalk`, because a remedy the guard would refuse is a dead instruction.
+  export function protectedAppDataWalkRemedy(v: {
+    bin: string;
+    root: string;
+    home: string;
+  }): { commands: string[]; text: string };
+  // The binaries carrying an EXPLICIT remedy entry (as opposed to the generic narrowing fallback).
+  export function walkRemedyBinaries(): string[];
+  // The stderr text for a TCC home-walk refusal: what it reached, why it matters, and the remedy.
+  export function protectedAppDataWalkMessage(v: {
+    bin: string;
+    root: string;
+    home: string;
+    reached: string[];
+  }): string;
   // Merge-policy guard predicate (contract §7): non-null iff a Bash command invokes `gh pr merge`
   // in a worktree whose `<worktree>/.sparkle/merge-policy.json` refuses it. Deliberately NOT a
   // global rule — in the owner's own repo merging is the sanctioned path — so the verdict is

@@ -3270,7 +3270,7 @@ const PROTECTED_APP_DATA = [
  *
  *  `patternFirst` marks the tools whose FIRST operand is a search pattern rather than a path
  *  (`rg foo ~/`), so the root extractor must not treat `foo` as a directory to walk. */
-const WALKERS = {
+export const WALKERS = {
   find: { depthFlags: ["-maxdepth"], depthLimitsTraversal: true, patternFirst: false },
   fd: { depthFlags: ["-d", "--max-depth", "--maxdepth"], depthLimitsTraversal: true, patternFirst: true },
   fdfind: { depthFlags: ["-d", "--max-depth", "--maxdepth"], depthLimitsTraversal: true, patternFirst: true },
@@ -3682,33 +3682,193 @@ export function blocksProtectedAppDataWalk(command, home = homedir(), depth = 0)
       const root = expandHomePrefix(rawRoot, home);
       if (!isAbsolute(root)) continue; // relative root — cwd is a worktree, not the home tree
       const reached = protectedReachedFrom(root, maxDepth, excludes, home);
-      if (reached.length > 0) return { rule: "protected-app-data-walk", bin, root, reached };
+      // `home` travels with the violation because the REMEDY needs it: a narrowed root has to be
+      // proven outside every protected container, and `root` may itself be inside one.
+      if (reached.length > 0) return { rule: "protected-app-data-walk", bin, root, reached, home };
     }
   }
   return null;
 }
 
-/** The refusal text. It names the containers actually reached and hands back a runnable prune,
+/** The protected set expressed as PRUNE GLOBS — the exclusions a remedy hands back.
+ *
+ *  Pinned to `PROTECTED_APP_DATA` by a test that feeds every generated remedy straight back through
+ *  this guard: if a container is added that these globs do not cover, the guard refuses its own
+ *  suggestion and the test goes red. That round trip is the whole point. The remedy this replaced
+ *  was a hand-written five-glob `find` line that pruned only FIVE of the twelve containers, so the
+ *  guard already refused it — a dead instruction, shipped, with no test that could see it
+ *  (sparkle-x1bg6t).
+ *
+ *  `prefix` exists because the two glob dialects disagree about `/`. `find`'s `-path` is fnmatch
+ *  WITHOUT FNM_PATHNAME, so `*` crosses `/` and a ONE-star prefix is right. ripgrep and fd both
+ *  use the gitignore/globset flavour where `*` STOPS at `/`, so there a one-star prefix matches
+ *  nothing at all and a TWO-star prefix is required. A remedy that borrows the wrong dialect
+ *  reads as authoritative and excludes nothing.
+ *
+ *  (Written as a `prefix` parameter rather than two literal lists so the two dialects cannot
+ *  drift apart, and so a container added to `PROTECTED_APP_DATA` is covered in both at once.) */
+const WALK_PRUNE_SUFFIXES = [
+  "Library/Application Support/*",
+  "Library/Containers",
+  "Library/Group Containers",
+  "Library/CloudStorage",
+  "Library/Mobile Documents",
+  ".walletwasabi",
+];
+
+function walkPruneGlobs(prefix) {
+  return WALK_PRUNE_SUFFIXES.map((s) => `${prefix}/${s}`);
+}
+
+/** An illustrative root guaranteed to sit OUTSIDE every protected container, so "narrow the root"
+ *  hands back a command this guard accepts rather than the same refusal one directory down. */
+function walkNarrowRoot(home) {
+  return `${home}/Projects`;
+}
+
+/** The lead every remedy opens with. Narrowing the root is the PRIMARY advice for all nine
+ *  binaries — the exclusion flag is the fallback for "I genuinely must start at home" — so it is
+ *  written once here rather than nine times. */
+function walkNarrowLead(cmd) {
+  return (
+    `Narrow the ROOT to the subtree you actually need — that is almost always what you meant:` +
+    `\n\n  ${cmd}\n\n`
+  );
+}
+
+/** The shape for a binary with NO exclusion flag this guard can honour: the narrowed-root command,
+ *  plus the reason there is no flag to offer. Never empty, and never names an invented flag — an
+ *  invented flag is worse than the empty string, because it reads as authoritative. */
+function walkNarrowOnly(cmd, why) {
+  return { commands: [cmd], text: `${walkNarrowLead(cmd)}${why}\n` };
+}
+
+/** The shape for a binary that DOES have an exclusion flag this guard reads as a prune: narrow
+ *  first, exclude second. Both commands are runnable and both are re-checked by the test. */
+function walkNarrowOrExclude(v, narrowCmd, excludeCmd, how, note) {
+  return {
+    commands: [narrowCmd, excludeCmd],
+    text:
+      walkNarrowLead(narrowCmd) +
+      `If you genuinely must start at ${v.root}, ${how}:\n\n  ${excludeCmd}\n\n${note}\n`,
+  };
+}
+
+function walkFdRemedy(v, bin) {
+  return walkNarrowOrExclude(
+    v,
+    `${bin} yourpattern ${walkNarrowRoot(v.home)}`,
+    `${bin} ${walkPruneGlobs("**").map((g) => `--exclude '${g}'`).join(" ")} yourpattern ${v.root}`,
+    "exclude the protected set with `--exclude`",
+    `Note: ${bin}'s globs are gitignore-flavoured, so \`*\` does NOT cross \`/\` — the two-star ` +
+      "`**/` prefix is required. A bare `*/Library/…` excludes nothing and the dialogs still fire.",
+  );
+}
+
+/** Per-binary remedies. Each returns `{ commands, text }`, where `commands` is EVERY runnable
+ *  example the text names — non-empty by construction, and every one re-checked against this guard
+ *  by the test, because a remedy the guard would itself refuse is a dead instruction (AGENTS.md:
+ *  "the alternative it suggests must be safe under the SAME conditions that triggered the refusal").
+ *
+ *  Only FOUR of the nine refusable binaries have an exclusion flag this guard reads as a prune. For
+ *  the other five the honest remedy is to narrow the root, and each says so in those words together
+ *  with WHY its own tool cannot express the protected set. */
+const WALK_REMEDIES = {
+  find: (v) => {
+    const prune = walkPruneGlobs("*").map((g) => `-path '${g}'`).join(" -o ");
+    return walkNarrowOrExclude(
+      v,
+      `find ${walkNarrowRoot(v.home)} -type f -print`,
+      `find ${v.root} \\( ${prune} \\) -prune -o -type f -print`,
+      "`-prune` the protected set",
+      "Note: `-not -path` does NOT help. It filters find's OUTPUT but still descends, so the " +
+        "dialog fires anyway. Only `-prune` (or a narrower root, or a `-maxdepth` that cannot " +
+        "reach them) works.",
+    );
+  },
+  rg: (v) =>
+    walkNarrowOrExclude(
+      v,
+      `rg yourpattern ${walkNarrowRoot(v.home)}`,
+      `rg ${walkPruneGlobs("**").map((g) => `--glob '!${g}'`).join(" ")} yourpattern ${v.root}`,
+      "exclude the protected set with `--glob`",
+      "Note: ripgrep's globs are gitignore-flavoured, so `*` does NOT cross `/` — the two-star " +
+        "`**/` prefix is required. A bare `*/Library/…` excludes nothing and the dialogs still " +
+        "fire.",
+    ),
+  fd: (v) => walkFdRemedy(v, "fd"),
+  fdfind: (v) => walkFdRemedy(v, "fdfind"),
+  du: (v) =>
+    walkNarrowOnly(
+      `du -sh ${walkNarrowRoot(v.home)}`,
+      "macOS ships BSD `du`, which has no path-glob exclusion — `-I` matches a basename, and " +
+        "GNU's `--exclude` is not there. `-d` is not a substitute either: it only SUMMARISES at " +
+        "that depth, it still stats everything below. The root is the only lever `du` gives you.",
+    ),
+  ncdu: (v) =>
+    walkNarrowOnly(
+      `ncdu ${walkNarrowRoot(v.home)}`,
+      "`ncdu --exclude` matches a NAME, not a path, so it cannot name the protected set — and " +
+        "this guard does not read it as a prune. The root is the only lever.",
+    ),
+  tree: (v) =>
+    walkNarrowOnly(
+      `tree ${walkNarrowRoot(v.home)}`,
+      "`tree -I` matches a basename pattern, not a path, so it cannot express the protected set. " +
+        "The root — or an `-L` too shallow to reach them — is the only lever.",
+    ),
+  ls: (v) =>
+    walkNarrowOnly(
+      `ls -R ${walkNarrowRoot(v.home)}`,
+      "`ls -R` has no exclusion flag at all. The root is the only lever.",
+    ),
+  grep: (v) => {
+    const narrow = `grep -r yourpattern ${walkNarrowRoot(v.home)}`;
+    const rgCmd =
+      `rg ${walkPruneGlobs("**").map((g) => `--glob '!${g}'`).join(" ")} yourpattern ${v.root}`;
+    return {
+      commands: [narrow, rgCmd],
+      text:
+        walkNarrowLead(narrow) +
+        "`grep --exclude-dir` cannot stand in for that: it matches a directory's BASENAME, not a " +
+        `path, so it cannot name the protected set. If you must search from ${v.root}, use ` +
+        `ripgrep, whose \`--glob\` can:\n\n  ${rgCmd}\n`,
+    };
+  },
+};
+
+/** The binaries carrying an EXPLICIT remedy. The fallback below keeps production safe when a
+ *  walker is added without one; this list is what lets the test insist the author wrote a real
+ *  remedy anyway, rather than silently inheriting a generic line. */
+export function walkRemedyBinaries() {
+  return Object.keys(WALK_REMEDIES);
+}
+
+/** The remedy for a violation. TOTAL over every binary, present and future: a binary with no entry
+ *  gets a generic-but-runnable narrowing instruction, never the empty string the ternary this
+ *  replaced produced for seven of its eight callers (sparkle-x1bg6t). */
+export function protectedAppDataWalkRemedy(v) {
+  const build = WALK_REMEDIES[v.bin];
+  if (build) return build(v);
+  return walkNarrowOnly(
+    `${v.bin} ${walkNarrowRoot(v.home)}`,
+    `\`${v.bin}\` has no exclusion flag this guard reads as a prune, so the root is the only lever.`,
+  );
+}
+
+/** The refusal text. It names the containers actually reached and hands back a RUNNABLE remedy,
  *  because a refusal with no compliable alternative is a wall — and under bypassPermissions there
  *  is no approval path around it. */
-function protectedAppDataWalkMessage(v) {
+export function protectedAppDataWalkMessage(v) {
   const names = v.reached.map((p) => `  - ${p}`).join("\n");
-  const prune = v.bin === "find"
-    ? `  find ${v.root} \\( -path '*/Library/Application Support/Google/*' -o ` +
-      `-path '*/Library/Containers' -o -path '*/Library/CloudStorage' -o ` +
-      `-path '*/Library/Mobile Documents' -o -path '*/Library/Group Containers' \\) ` +
-      `-prune -o <your predicates> -print\n`
-    : "";
+  const remedy = protectedAppDataWalkRemedy(v);
   return (
     `Blocked: this ${v.bin} would walk into macOS TCC-protected app data.\n\n` +
     `Root: ${v.root}\nReaches:\n${names}\n\n` +
     `Each container it touches raises its OWN "would like to access data from other apps" dialog, ` +
     `attributed to Sparkle — macOS makes the spawning app the responsible process for every agent, ` +
     `so your walk wears Sparkle's name. A single sweep can raise half a dozen.\n\n` +
-    `Fix it by narrowing the ROOT to the subtree you actually need — that is almost always what you ` +
-    `meant. If you genuinely must start at home, prune the protected set:\n${prune}\n` +
-    `Note: \`-not -path\` does NOT help. It filters find's OUTPUT but still descends, so the dialog ` +
-    `fires anyway. Only \`-prune\` (or a narrower root, or a -maxdepth that cannot reach them) works.\n`
+    remedy.text
   );
 }
 
