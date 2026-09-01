@@ -83,6 +83,81 @@ describe("mayRetire — the branch", () => {
   it("PAIRED: the same agent retires once the work is known landed", () => {
     expect(mayRetire(retirable({ unlanded: false }))).toEqual({ ok: true });
   });
+
+  // ── THE REFUSAL MUST BE CHECKABLE (bead `sparkle-c68xl5`) ──────────────────────────────────────
+  // Measured 2026-08-31: `retire_agent` refused with `unlanded-work` while the operator, standing in
+  // the agent's worktree, read `git merge-base --is-ancestor <tip> origin/main` → YES and
+  // `git log origin/main..<tip>` → EMPTY, and reported the refusal as a false positive. It was not
+  // false. The worktree HEAD was a no-op branch parked on main; the reading had been taken on the
+  // agent's OWN resolved branch, which held two unlanded commits — and still does. Both readings
+  // were right about different branches, and the sentence named neither, so the disagreement was
+  // unfalsifiable and cost the agent's slot until a human retired it by hand.
+  //
+  // So the refusal names the branch it counted. That is the same remedy `BranchStatus.branch`
+  // exists for (sparkle-pgkbn4: "the row had no way to say what it counted"), applied to the one
+  // surface that asks a human to go and check.
+  it("NAMES the branch and the outstanding count it measured", () => {
+    const v = mayRetire(
+      retirable({ unlanded: true, measuredOn: { branch: "sparkle/agent-14ed66c0", ahead: 2 } }),
+    );
+    expect(v.ok).toBe(false);
+    expect(v.ok === false && v.refusal).toBe("unlanded-work");
+    const m = v.ok === false ? v.message : "";
+    expect(m, "the refusal must name the branch it counted").toContain("sparkle/agent-14ed66c0");
+    expect(m, "the refusal must say how many commits are outstanding").toContain("2 commit");
+    // The whole point of naming it: a human re-running the check must be told the branch measured
+    // is not necessarily the one checked out in the worktree, or they check HEAD and disagree.
+    expect(m, "the refusal must warn the measured branch may not be the checked-out one").toContain(
+      "worktree",
+    );
+  });
+
+  it("names the branch WITHOUT a count when the count is not a positive reading", () => {
+    const v = mayRetire(retirable({ unlanded: true, measuredOn: { branch: "feat/x", ahead: 0 } }));
+    const m = v.ok === false ? v.message : "";
+    expect(m).toContain("feat/x");
+    // Never "0 commits": the branch is outstanding by reachability (a squash land leaves `ahead` at
+    // a number that means nothing here), so a count that did not positively read must not be shown.
+    expect(m).not.toContain("0 commit");
+  });
+
+  it("prints the CHECKABLE command when it knows the base it counted against", () => {
+    const v = mayRetire(
+      retirable({ unlanded: true, measuredOn: { branch: "sparkle/agent-x", ahead: 2, base: "main" } }),
+    );
+    const m = v.ok === false ? v.message : "";
+    // A count is an assertion; a command is checkable. `git log main..sparkle/agent-x` must
+    // reproduce the number the sentence quotes.
+    expect(m, "the refusal must print the range it counted").toContain("main..sparkle/agent-x");
+    expect(m).toContain("2 commits");
+  });
+
+  // ── ONE READING, ONE BRANCH (roborev 73884) ───────────────────────────────────────────────────
+  // `WorkflowState.aheadOfBase` is folded across nested adopted worktrees (Rust takes the subtree
+  // MAX), and that same fold is what clears `inOriginMain` and makes `unlanded` fire. Pairing it
+  // with the agent's OWN branch name prints "1 commit on <branch>" for a branch that is 0 ahead —
+  // the operator re-runs the check, gets an empty list, and concludes false positive again, now
+  // with a named branch backing the wrong conclusion. The pin is at the call site
+  // (`lifecycle.retire.test.ts`); this one pins the arm it depends on.
+  it("never quotes a count that did not come with the branch it names", () => {
+    const v = mayRetire(
+      retirable({ unlanded: true, measuredOn: { branch: "sparkle/agent-x", ahead: 0, base: "main" } }),
+    );
+    const m = v.ok === false ? v.message : "";
+    expect(m).toContain("sparkle/agent-x");
+    expect(m, "a branch that read 0 ahead must not carry a commit count").not.toMatch(/\d+ commit/);
+  });
+
+  it("says NOTHING about a branch when the reading carries no name", () => {
+    // `BranchStatus.branch` is optional so a Rust build predating it deserializes to `undefined`,
+    // and that field's own doc requires rendering it as NOTHING — never a blank or guessed name.
+    const bare = mayRetire(retirable({ unlanded: true }));
+    const named = mayRetire(retirable({ unlanded: true, measuredOn: { branch: "", ahead: 3 } }));
+    const bareMsg = bare.ok === false ? bare.message : "";
+    const namedMsg = named.ok === false ? named.message : "";
+    expect(namedMsg, "an empty branch name must not produce a clause").toBe(bareMsg);
+    expect(bareMsg).not.toContain("“”");
+  });
 });
 
 describe("mayRetire — the process", () => {

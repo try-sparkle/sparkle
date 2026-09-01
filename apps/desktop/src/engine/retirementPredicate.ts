@@ -98,6 +98,35 @@ export interface RetirementInputs {
    * (`landed` / `inOriginMain` / `inLocalMain`) for this reason.
    */
   unlanded: boolean | undefined;
+  /**
+   * WHICH branch the `unlanded` reading above was taken on, and how far ahead it read — the
+   * evidence a human needs to re-run the check and get the SAME answer.
+   *
+   * ⚠️ THE MEASURED BRANCH IS NOT ALWAYS THE ONE CHECKED OUT. `unlanded` is derived from the agent's
+   * resolved branch (Rust `resolve_agent_branch`, surfaced as `BranchStatus.branch`), and a worktree
+   * can be parked on, or renamed onto, something else entirely. Measured 2026-08-31 (bead
+   * `sparkle-c68xl5`): a refusal fired over two real unlanded commits on the agent's own branch
+   * while the operator, standing in its worktree, read HEAD as an ancestor of `origin/main` and
+   * reported the refusal as a false positive. Both readings were right about different branches and
+   * the sentence named neither, so nobody could tell which — and the row cost a fleet slot until a
+   * human retired it by hand.
+   *
+   * ⚠️ ALL THREE FIELDS MUST COME FROM ONE READING OF ONE BRANCH, and this is not a tidiness rule —
+   * mixing them re-creates the exact false positive the clause exists to close (roborev 73884).
+   * `WorkflowState.aheadOfBase` is FOLDED ACROSS NESTED ADOPTED WORKTREES — Rust takes the MAX over
+   * the subtree (`worktree.rs`, "the most outstanding work anywhere in the subtree") — and that fold
+   * is also what clears `inOriginMain` and makes `unlanded` fire. Pair that count with the agent's
+   * OWN branch name and the sentence reads "1 commit on “sparkle/agent-<id>”" for a branch that is
+   * 0 ahead and IS an ancestor of `origin/main`: the operator re-runs the check, gets an empty list,
+   * and concludes false positive again — now with a named branch backing the wrong conclusion, which
+   * is worse than the sentence that named nothing. So the count travels with `BranchStatus`, beside
+   * the branch `BranchStatus` measured it on.
+   *
+   * Optional, and every arm of it is: `BranchStatus.branch` is itself optional so a Rust build
+   * predating the field deserializes to `undefined`, which means "this build cannot tell you" and
+   * must render as NOTHING — never as a blank or guessed branch name.
+   */
+  measuredOn?: { branch?: string; ahead?: number; base?: string } | null;
   /** LIVE read of whether the agent is producing output. See {@link LiveActivity}. */
   liveActivity: LiveActivity;
   /** The concierge's own stated reason. Recorded verbatim in the audit trail. */
@@ -133,6 +162,49 @@ export type RetirementVerdict =
 /** Kinds that own a worktree, and so can be retired at all. A `shell` has no branch of its own. */
 function retirableKind(kind: AgentKind): boolean {
   return kind === "build" || kind === "worker";
+}
+
+/**
+ * The "…and here is where I read that" half of the `unlanded-work` sentence.
+ *
+ * A REFUSAL A HUMAN CANNOT RE-RUN IS A REFUSAL THEY WILL CALL A BUG. This is the same remedy
+ * `BranchStatus.branch` was put on the wire for (sparkle-pgkbn4 — "the row had no way to say what it
+ * counted"), spent on the one surface that actively asks somebody to go and check with git. So where
+ * it can, it prints the COMMAND rather than a number: `git log <base>..<branch>` is checkable, and a
+ * bare count is only an assertion.
+ *
+ * Four arms, and the empty one is deliberate:
+ *   • name + positive count + base → the command and its expected answer;
+ *   • name + positive count       → the count on that branch, with no base to reproduce it against;
+ *   • name alone → the name. A non-positive `ahead` is not "nothing outstanding" here — a squash or
+ *     rebase land leaves that counter at a number this rung must not quote (see `unlanded`) — so an
+ *     unread count is simply not shown rather than rendered as `0 commits`;
+ *   • no name → NOTHING. An absent `BranchStatus.branch` means "this build cannot tell you", and a
+ *     blank or guessed branch name is worse than the sentence that never claimed one.
+ *
+ * ⚠️ WHEN THE BASE IS NAMED IT IS THE PROJECT'S DEFAULT BRANCH, while Rust counted against
+ * `origin/<default>` whenever that ref exists. The two differ only while the local base LAGS its
+ * remote, and then the local count is the LARGER one — so a human re-running the printed command
+ * sees at least as many commits as the message claimed. That is the safe direction for this
+ * sentence: it can under-claim, never over-claim, so the reading can never look manufactured.
+ */
+function unlandedEvidenceClause(m: RetirementInputs["measuredOn"]): string {
+  const branch = m?.branch?.trim();
+  if (!branch) return "";
+  const ahead = m?.ahead;
+  const base = m?.base?.trim();
+  const counted = typeof ahead === "number" && Number.isFinite(ahead) && ahead > 0;
+  // The trailing clause is the load-bearing half for the case this was built from: without it a
+  // human checks the branch their worktree happens to have checked out, gets the opposite answer,
+  // and concludes the refusal is false.
+  const measured = `That is the branch this reading was measured on, which is not always the one checked out in the agent's worktree`;
+  if (counted && base) {
+    return `: “${base}..${branch}” holds ${ahead} commit${ahead === 1 ? "" : "s"}. ${measured}`;
+  }
+  if (counted) {
+    return `: ${ahead} commit${ahead === 1 ? "" : "s"} on “${branch}”. ${measured}`;
+  }
+  return `: measured on “${branch}”. ${measured}`;
 }
 
 /**
@@ -189,7 +261,7 @@ export function mayRetire(i: RetirementInputs): RetirementVerdict {
   if (i.unlanded === true) {
     return refuse(
       "unlanded-work",
-      "This agent has committed work that never reached main. Retiring it keeps the branch, but nobody would be left finishing it — it should be shipped or saved first.",
+      `This agent has committed work that never reached main${unlandedEvidenceClause(i.measuredOn)}. Retiring it keeps the branch, but nobody would be left finishing it — it should be shipped or saved first.`,
     );
   }
   if (i.unlanded === undefined) {

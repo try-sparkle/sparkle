@@ -1848,6 +1848,17 @@ export async function retireAgent(
     kind: agent.kind,
     worktreeRisk: facts.worktreeRisk,
     unlanded: facts.unlanded,
+    // THE EVIDENCE BEHIND THAT BOOLEAN, so an `unlanded-work` refusal can be re-run with git and
+    // agreed with. `facts.bs.branch` is the RESOLVED branch the count was taken on — not the
+    // worktree's HEAD, and not the minted `sparkle/agent-<id>` name (bead `sparkle-c68xl5`; see
+    // `measuredOn` for the measured disagreement this closes). Every field is optional on the wire,
+    // and `mayRetire` renders an absent one as nothing rather than guessing.
+    //
+    // ⚠️ ALL THREE FROM `bs`, NEVER `ws.aheadOfBase` (roborev 73884). That count is folded across
+    // nested adopted worktrees — Rust takes the subtree MAX — so pairing it with this branch's name
+    // would print a count that was measured somewhere else, which is the false-positive reading this
+    // whole change exists to remove. `measuredOn`'s own doc carries the measured shape.
+    measuredOn: { branch: facts.bs?.branch, ahead: facts.bs?.ahead, base: project.defaultBranch ?? undefined },
     liveActivity: deps.readActivity(agentId),
     reason: args.reason,
     deadClaim: args.deadClaim ?? null,

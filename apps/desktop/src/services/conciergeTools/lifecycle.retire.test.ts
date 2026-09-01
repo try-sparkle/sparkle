@@ -233,6 +233,62 @@ describe("retire_agent judges landing by reachability, never by the ahead count"
   });
 });
 
+// ── THE REFUSAL MUST BE RE-RUNNABLE (bead `sparkle-c68xl5`, roborev 73884) ───────────────────────
+// The refusal is a sentence that asks a human to go and check with git, so it has to say WHICH ref
+// it counted. Measured 2026-08-31: it named nothing, the operator checked the branch their worktree
+// happened to have checked out — a no-op branch parked on main — got the opposite answer, and
+// reported a correct refusal as a false positive. The row then cost a fleet slot until a human
+// retired it by hand.
+describe("retire_agent's unlanded-work refusal says what it measured", () => {
+  it("names the resolved branch and the range it counted", async () => {
+    const p = seedProject();
+    // The base is what makes the sentence CHECKABLE — without it there is no range to re-run.
+    useProjectStore.getState().setDefaultBranch(p, "main");
+    const id = seedBuild(p);
+    useRuntimeStore.setState((s) => ({
+      workflowStage: { ...s.workflowStage, [id]: "building_saved" },
+    }));
+    liveBranchStatus = () =>
+      Promise.resolve({ ...CLEAN, ahead: 2, branch: "feat/renamed-away" } as BranchStatus);
+    liveWorkflowState = () => Promise.resolve(WS_UNLANDED);
+    const r = await retireAgent(id, { reason: REASON });
+    expect(r.ok === false && r.reason).toBe("unlanded-work");
+    const msg = r.ok === false ? r.message : "";
+    // The resolved branch, NOT the minted `sparkle/agent-<id>` name the worktree was created with.
+    expect(msg, "the refusal must name the branch it counted").toContain("feat/renamed-away");
+    expect(msg, "and the range, so `git log` reproduces the number").toContain(
+      "main..feat/renamed-away",
+    );
+    expect(msg).toContain("2 commits");
+  });
+
+  // ONE READING, ONE BRANCH. `WorkflowState.aheadOfBase` is folded across nested adopted worktrees
+  // (Rust takes the subtree MAX) and that fold is also what clears `inOriginMain` and fires the
+  // refusal — so quoting it beside the agent's OWN branch name prints a count measured somewhere
+  // else, and a human re-running the range gets an empty list. That is the original false-positive
+  // report, re-created with a named branch to back it, which is worse than naming nothing.
+  it("does NOT quote a subtree-folded count beside this branch's name", async () => {
+    const p = seedProject();
+    const id = seedBuild(p);
+    useRuntimeStore.setState((s) => ({
+      workflowStage: { ...s.workflowStage, [id]: "building_saved" },
+    }));
+    // The agent's OWN branch is 0 ahead and an ancestor of origin/main. The subtree is not: an
+    // adopted nested worktree carries the one outstanding commit, which is what `unlanded` fires on.
+    liveBranchStatus = () =>
+      Promise.resolve({ ...CLEAN, ahead: 0, branch: "sparkle/agent-own" } as BranchStatus);
+    liveWorkflowState = () =>
+      Promise.resolve({ ...WS_UNLANDED, aheadOfBase: 1 } as WorkflowState);
+    const r = await retireAgent(id, { reason: REASON });
+    expect(r.ok === false && r.reason).toBe("unlanded-work");
+    const msg = r.ok === false ? r.message : "";
+    expect(msg).toContain("sparkle/agent-own");
+    expect(msg, "a count from another branch must never be attributed to this one").not.toMatch(
+      /\d+ commit/,
+    );
+  });
+});
+
 // ── THE GAP MARK ─────────────────────────────────────────────────────────────────────────────────
 // A receipt has no delete path anywhere in this app, so the permanent "no retro on file" mark may be
 // written from evidence of absence and NEVER from absence of evidence.
