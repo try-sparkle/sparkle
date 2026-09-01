@@ -173,6 +173,16 @@
         "coveredBy": "pipeline_health.rs::tests::false_absence_release_draft_blindness_is_unknown"
       },
       {
+        "id": "baseline-read-from-working-tree",
+        "lang": "rust",
+        "surface": "pipeline_health.rs::read_baseline_at",
+        "observation": "The acceptance file `.github/release-orphan-baseline.txt` was read out of the project root's WORKING TREE, which was parked on a feature branch that deletes the v0.142.0 line. The parser saw 22 accepted tags; origin/main carries 23.",
+        "wrongClaim": "there is no recorded decision accepting the orphan tag v0.142.0",
+        "truth": "origin/main records that decision, with a reason, and has since PR #2451. The founder's checkout is a scratch surface holding half-finished work, and it moves.",
+        "mechanism": "A control has two halves, and this read failed the COMPLETE one: a working tree is a different population from what shipped. Shipped state is read with `git show origin/<default>:<path>` after a best-effort fetch, never off disk — and a failed fetch degrades to the stale ref, never to the tree.",
+        "coveredBy": "pipeline_health.rs::tests::false_absence_baseline_read_from_working_tree_is_not_shipped_state"
+      },
+      {
         "id": "epic-sweeper-no-change",
         "lang": "ts",
         "surface": "engine/epicContinuation.ts",

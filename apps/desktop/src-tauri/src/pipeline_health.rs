@@ -37,7 +37,7 @@
 //! reproduce on a healthy machine.
 
 use std::process::Command;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// The CI/release repository whose runners gate deployments. NOT `SPARKLE_REPO_URL`
 /// (`try-sparkle/sparkle`, the open-source mirror) — that repo has no runners. Mirrors the default in
@@ -2481,18 +2481,49 @@ fn roborev_enqueue_evidence(root: &str) -> EnqueueEvidence {
     if iso.is_empty() {
         return EnqueueEvidence::Unknown;
     }
-    let mut g = Command::new("git");
-    g.arg("-C").arg(root).args(["rev-list", "--count"]).arg(format!("--since={iso}")).arg("HEAD");
-    match crate::worktree::output_with_timeout(g, Duration::from_secs(10)) {
-        Ok(o) if o.status.success() => {
-            match String::from_utf8_lossy(&o.stdout).trim().parse::<u32>() {
-                Ok(unfed_commits) => EnqueueEvidence::Seen { unfed_commits, gap_secs },
-                Err(_) => EnqueueEvidence::Unknown,
-            }
-        }
+    match commits_since_anywhere(root, iso) {
+        Some(unfed_commits) => EnqueueEvidence::Seen { unfed_commits, gap_secs },
         // No NotTaken arm here on purpose: by this point the store HAS been read, so a git failure
         // is a half-answer, never "nobody asked".
-        _ => EnqueueEvidence::Unknown,
+        None => EnqueueEvidence::Unknown,
+    }
+}
+
+/// How many commits arrived ANYWHERE in this repository since `iso`. `None` when git could not
+/// answer, which the caller turns into `Unknown` rather than a zero.
+///
+/// `--branches` (plus `HEAD`, for a detached checkout no ref points at) rather than `HEAD` alone,
+/// and that is the whole correctness content of this function (bead `sparkle-yl1lj0`). The fence
+/// asks "IS WORK ARRIVING?" — a question about the repository the daemon serves, not about
+/// whichever branch a scratch checkout happens to be parked on. Counted from `HEAD`, a project root
+/// sitting on an idle branch reports ZERO unfed commits while the fleet lands work on every other
+/// branch, which is a false GREEN in exactly the situation the fence exists to catch. It is the
+/// same trap this module already documents one function up, where `roborev list` was rejected for
+/// defaulting to the current repo AND BRANCH.
+///
+/// TWO NARROWINGS, AND BOTH EXIST TO STOP A FALSE ALARM (roborev 72643). "Unfed" means *a commit a
+/// local `post-commit` hook should have enqueued and did not*, so:
+///   * `--branches`, NOT `--all`. `--all` includes `refs/remotes/*`, so every commit that was never
+///     created on this machine counts — and a PR merged with `gh pr merge` produces a SERVER-SIDE
+///     merge commit that no local hook ever saw and roborev can therefore never enqueue. With
+///     [`SHIPPED_FETCH_MIN_INTERVAL`] pulling `origin/<default>` every five minutes, two such merges
+///     plus a quiet half-hour would be enough to declare a perfectly healthy daemon DISCONNECTED —
+///     a false warning, in the function whose whole purpose is removing one.
+///   * `--no-merges`. The same server-side merge commits arrive on a LOCAL branch the moment anyone
+///     fast-forwards `main`, which puts them back inside `--branches`. Dropping merges costs the
+///     fence almost nothing (agent work is overwhelmingly non-merge commits, and the threshold is
+///     two in thirty minutes) and closes the class outright.
+fn commits_since_anywhere(root: &str, iso: &str) -> Option<u32> {
+    let mut g = Command::new(crate::preflight::git_program());
+    g.arg("-C")
+        .arg(root)
+        .args(["rev-list", "--count"])
+        .arg(format!("--since={iso}"))
+        .args(["--branches", "HEAD", "--no-merges"]);
+    apply_noninteractive(&mut g);
+    match crate::worktree::output_with_timeout(g, Duration::from_secs(10)) {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().parse::<u32>().ok(),
+        _ => None,
     }
 }
 
@@ -2708,15 +2739,88 @@ fn gh_api_paginated_text(program: &str, root: &str, path: &str) -> Option<String
     }
 }
 
-/// Load the acceptance file from a project root.
+/// How long a fetched `origin/<default>` stays good enough to judge shipped state from.
 ///
-/// A MISSING OR UNREADABLE BASELINE IS `None`, WHICH ACCEPTS NOTHING. Reading it as blanket
-/// acceptance would make the one channel that reports a genuine publication failure go quiet the
-/// moment the file was deleted or renamed — the opposite of what an acceptance file is for.
+/// The probe ticks every 60s (`PIPELINE_HEALTH_POLL_INTERVAL_MS`), and every worktree on this
+/// machine SHARES one object store and one set of remote-tracking refs — so a fetch per tick would
+/// take the common-dir lock ~60 times an hour for a ref the agent fleet already refreshes ~12 times
+/// an hour on its own (measured, `repo_freshness`'s header). Five minutes keeps the read current
+/// without adding that contention to a shared resource.
+const SHIPPED_FETCH_MIN_INTERVAL: Duration = Duration::from_secs(300);
+
+/// Wall-clock bound on the shipped-state fetch. Deliberately shorter than [`RELEASE_QUERY_TIMEOUT`]:
+/// a fetch that has not answered in ten seconds is a partitioned network, and the read it feeds
+/// works without it.
+const SHIPPED_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// When this process last ATTEMPTED a shipped-state fetch, per project root.
+static LAST_SHIPPED_FETCH: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, Instant>>,
+> = std::sync::OnceLock::new();
+
+/// PURE half of the throttle: may a fetch run now, given when one last ran? Never fetched is always
+/// due — a first read must not be served from a ref this process has no reason to believe in.
+fn fetch_is_due(last: Option<Instant>, now: Instant, min_interval: Duration) -> bool {
+    match last {
+        None => true,
+        Some(t) => now.saturating_duration_since(t) >= min_interval,
+    }
+}
+
+/// Refresh `refs/remotes/origin/<default_branch>` so the shipped-state reads below are current.
+///
+/// BEST EFFORT, AND THE FAILURE IS DELIBERATELY NOT FATAL. A stale `origin/<default>` is still
+/// shipped state — it is what main looked like at some point — whereas a working tree is not
+/// shipped state at any age, so degrading to the stale ref is strictly better than degrading to the
+/// tree. Same posture as `goal_landed_probe`'s RULE 3.
+fn refresh_shipped_ref(root: &str, default_branch: &str) {
+    // A ref name is about to become a bare `git fetch` argument. `resolve_default_branch` already
+    // validates a CONFIGURED value, but its auto-detect arms do not — and a name beginning with `-`
+    // would be read as a flag.
+    if crate::worktree::validate_ref(default_branch).is_err() {
+        return;
+    }
+    let cell = LAST_SHIPPED_FETCH.get_or_init(Default::default);
+    {
+        let Ok(seen) = cell.lock() else { return };
+        if !fetch_is_due(seen.get(root).copied(), Instant::now(), SHIPPED_FETCH_MIN_INTERVAL) {
+            return;
+        }
+    }
+    let mut cmd = Command::new(crate::preflight::git_program());
+    cmd.arg("-C").arg(root).args(["fetch", "--quiet", "--no-tags", "origin", default_branch]);
+    apply_noninteractive(&mut cmd);
+    let _ = crate::worktree::output_with_timeout(cmd, SHIPPED_FETCH_TIMEOUT);
+    // Stamped on the ATTEMPT rather than on success: a root with no reachable `origin` would
+    // otherwise re-try — and re-pay the ten-second bound — on every 60s tick, forever.
+    if let Ok(mut seen) = cell.lock() {
+        seen.insert(root.to_string(), Instant::now());
+    }
+}
+
+/// Load the acceptance file AS IT EXISTS ON `origin/<default>` — never from the working tree.
+///
+/// WHY THE SOURCE IS THE WHOLE POINT (bead `sparkle-yl1lj0`). This file records what the project has
+/// DECIDED about shipped versions, so every question it answers is a question about what shipped.
+/// The project root it is read from is the founder's own checkout: a scratch surface that sits on
+/// whatever branch he happens to have open and holds half-finished work. Measured — that checkout
+/// was parked on a branch deleting the `v0.142.0` line, so this read saw 22 accepted tags where
+/// `origin/main` carries 23, and the component raised an hourly WARNING about a tag main has
+/// explicitly recorded as abandoned. The parse was never wrong; the source was.
+///
+/// A MISSING OR UNREADABLE BASELINE IS `None`, WHICH ACCEPTS NOTHING — and that now covers a
+/// missing `origin/<default>` too. Reading either as blanket acceptance would make the one channel
+/// that reports a genuine publication failure go quiet the moment the file was deleted, renamed, or
+/// unreachable — the opposite of what an acceptance file is for. It must NEVER fall back to the
+/// tree: a fallback is exactly the reading this function exists to stop, and it would fire on
+/// precisely the machine where the tree is least trustworthy.
+///
 /// Separated from [`release_publication_component`] so the wiring itself is covered: with the read
 /// inlined there, deleting it would pass `None` and every classifier test would stay green.
 fn read_baseline_at(root: &str) -> Option<ReleaseBaseline> {
-    let text = std::fs::read_to_string(std::path::Path::new(root).join(ORPHAN_BASELINE_PATH)).ok()?;
+    let default_branch = crate::worktree::resolve_default_branch(root);
+    refresh_shipped_ref(root, &default_branch);
+    let text = crate::repo_freshness::fresh_read_at(root, &default_branch, ORPHAN_BASELINE_PATH).ok()?;
     Some(read_orphan_baseline(&text))
 }
 
@@ -4727,13 +4831,17 @@ mod tests {
     /// is its own function and this drives it against the REAL repo root.
     #[test]
     fn the_component_reads_the_acceptance_file_from_the_project_root() {
-        let repo_root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../..");
-        let baseline = read_baseline_at(repo_root).expect("the real repo carries the baseline file");
+        let f = real_baseline_fixture("wiring");
+        let baseline = read_baseline_at(f.root()).expect("origin/main carries the baseline file");
         assert!(baseline.tags.len() >= 20, "and it is the real one: {}", baseline.tags.len());
-        assert_eq!(baseline, read_orphan_baseline(REAL_BASELINE), "the same bytes, parsed the same");
+        assert_eq!(
+            baseline,
+            read_orphan_baseline(REAL_BASELINE),
+            "the shipped bytes are the acceptance file's bytes, parsed the same"
+        );
 
         // A root without the file accepts NOTHING — never blanket acceptance.
-        assert_eq!(read_baseline_at(concat!(env!("CARGO_MANIFEST_DIR"), "/src")), None);
+        assert_eq!(read_baseline_at(&no_repo_root("wiring-empty")), None);
     }
 
     /// …and the CALL SITE, driven end-to-end. The payloads are fixtures; `root` is the real repo, so
@@ -4741,7 +4849,8 @@ mod tests {
     /// goes from Healthy to Warning — which is precisely the hourly false alarm being removed.
     #[test]
     fn the_component_honours_the_acceptance_file_end_to_end() {
-        let repo_root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../..");
+        let f = real_baseline_fixture("honours");
+        let repo_root = f.root();
         let baseline = read_baseline_at(repo_root).expect("the real baseline");
 
         // Published: v0.132.0 (today's high-water mark) and an old floor so every orphan is
@@ -4776,11 +4885,16 @@ mod tests {
         // with no release object at all, which is branch 1's stranded-tag shape. That is the whole
         // point of the pair: the SAME payloads read Healthy when the acceptance file is present and
         // Blocking when it is not, so the file is provably what the classifier is honouring.
+        //
+        // The "no file" root is a directory OUTSIDE any repository, and it has to be: since the read
+        // resolves `origin/<default>:<path>` rather than a path on disk, a SUBDIRECTORY of this repo
+        // (what this used to pass) still finds the file through the enclosing checkout, and the pair
+        // silently collapses into two copies of the same case.
         let c = release_publication_from_json(
             Some(releases_json),
             Some(&tags_json),
             true,
-            concat!(env!("CARGO_MANIFEST_DIR"), "/src"),
+            &no_repo_root("honours-empty"),
             &no_gh,
         );
         assert_eq!(c.state, HealthState::Blocking, "no file means nothing accepted: {}", c.detail);
@@ -5242,7 +5356,8 @@ mod tests {
     /// what moves a draft out of the report.
     #[test]
     fn todays_real_state_is_healthy_end_to_end() {
-        let repo_root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../..");
+        let f = real_baseline_fixture("today");
+        let repo_root = f.root();
         let baseline = read_baseline_at(repo_root).expect("the real baseline");
         assert!(baseline.tags.len() >= 20, "not a vacuous fixture: {}", baseline.tags.len());
         assert!(
@@ -5320,7 +5435,8 @@ mod tests {
     /// mere passage of a release.
     #[test]
     fn an_unrecorded_draft_below_the_mark_is_still_reported() {
-        let repo_root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../..");
+        let f = real_baseline_fixture("unrecorded");
+        let repo_root = f.root();
         let releases =
             ReleasesReading { published: strings(&["v0.134.0"]), drafts: strings(&["v0.131.0"]) };
         let tags = strings(&["v0.134.0", "v0.131.0"]);
@@ -5637,7 +5753,12 @@ mod tests {
         let no_gh = |_: &str| None;
 
         // COMPLETE read (paginated, production): a >page-size clean set is Healthy, NOT Unknown.
-        let c = release_publication_from_json(Some(&releases_json), Some(&tags_json), true, ".", &no_gh);
+        // NOT `"."`. That is the crate dir, which HAD no `.github/release-orphan-baseline.txt` on
+        // disk — but the read now resolves `origin/<default>:<path>` through the enclosing checkout,
+        // so `"."` silently became "the real acceptance file" AND made a unit test fetch over the
+        // network into the common-dir refs every worktree on this machine shares (roborev 72643).
+        let empty_root = no_repo_root("truncation");
+        let c = release_publication_from_json(Some(&releases_json), Some(&tags_json), true, &empty_root, &no_gh);
         assert_eq!(
             c.state,
             HealthState::Healthy,
@@ -5652,7 +5773,7 @@ mod tests {
 
         // The MUTATION that proves the pagination is load-bearing: mark the SAME read incomplete and
         // the verdict collapses to Unknown — the exact bug this fix removes.
-        let c = release_publication_from_json(Some(&releases_json), Some(&tags_json), false, ".", &no_gh);
+        let c = release_publication_from_json(Some(&releases_json), Some(&tags_json), false, &empty_root, &no_gh);
         assert_eq!(c.state, HealthState::Unknown, "an incomplete read of the same tags is Unknown: {}", c.detail);
     }
 
@@ -5662,7 +5783,7 @@ mod tests {
     /// on its no-gh path, which needs no network.
     #[test]
     fn the_real_constructor_produces_the_component_the_panel_looks_up() {
-        let c = release_publication_component(None, ".");
+        let c = release_publication_component(None, &no_repo_root("constructor"));
         assert_eq!(c.id, "release_publication", "the panel keys on this id");
         assert_eq!(c.name, "Release publication");
         assert_eq!(
@@ -5824,6 +5945,282 @@ mod tests {
         assert!(detail.contains("Re-dispatch release.yml"), "and so must the direct remedy");
     }
 
+    // ── shipped state is read from origin/<default>, never from a working tree ───────────────────
+    //
+    // Bead `sparkle-yl1lj0`, corpus instance `baseline-read-from-working-tree`. The acceptance file
+    // records what the project has DECIDED about shipped versions, so the question it answers is
+    // "what shipped" — and the founder's checkout sits on whatever branch he happens to have open.
+    // Measured: that checkout was on a branch deleting the `v0.142.0` line, so the monitor read 22
+    // accepted tags where `origin/main` carries 23, and raised an hourly warning about a tag main
+    // has explicitly recorded as abandoned.
+
+    /// Run git in a FIXTURE repo with this machine's global/system config removed.
+    ///
+    /// `GIT_CONFIG_GLOBAL=/dev/null` is not tidiness: this repo's workflow installs a global
+    /// `core.hooksPath` (the roborev review loop), so without it every fixture commit below enqueues
+    /// a review against a temp directory that is deleted seconds later.
+    fn fx(cwd: &std::path::Path, args: &[&str]) -> std::process::Output {
+        let out = Command::new(crate::preflight::git_program())
+            .arg("-C")
+            .arg(cwd)
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@example.com")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@example.com")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .expect("git runs");
+        assert!(out.status.success(), "git {args:?} failed: {}", String::from_utf8_lossy(&out.stderr));
+        out
+    }
+
+    struct ShippedFixture {
+        dir: std::path::PathBuf,
+        upstream: std::path::PathBuf,
+        clone: std::path::PathBuf,
+    }
+
+    impl ShippedFixture {
+        fn root(&self) -> &str {
+            self.clone.to_str().expect("utf-8 fixture path")
+        }
+        /// Write the acceptance file in the WORKING TREE only — no commit, no push. This is the
+        /// founder's scratch surface, and nothing the monitor reports may come from it.
+        fn write_working_tree(&self, body: &str) {
+            let p = self.clone.join(ORPHAN_BASELINE_PATH);
+            std::fs::create_dir_all(p.parent().unwrap()).expect("mkdir .github");
+            std::fs::write(p, body).expect("write baseline");
+        }
+    }
+
+    impl Drop for ShippedFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// A directory that is NOT a git repository, so `origin/<default>` cannot resolve and the read
+    /// fails closed. Leaked deliberately into the temp dir rather than cleaned: it is empty, and a
+    /// `Drop` guard here would be more machinery than the fact it represents.
+    ///
+    /// This replaces every `concat!(env!("CARGO_MANIFEST_DIR"), "/src")` and `"."` that used to
+    /// stand for "a root with no acceptance file". Both are INSIDE this repository, and the read is
+    /// no longer a path on disk — so both stopped meaning what their assertions said.
+    fn no_repo_root(tag: &str) -> String {
+        let d = std::env::temp_dir()
+            .join(format!("-a-repo-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&d).expect("mkdir");
+        d.to_str().expect("utf-8 temp path").to_string()
+    }
+
+    /// A fixture repo whose `origin/main` carries the REAL acceptance file, byte for byte.
+    ///
+    /// WHY NOT THE REAL REPO ROOT, WHICH THESE TESTS USED TO PASS (roborev 72643). Two reasons, and
+    /// each on its own is disqualifying:
+    ///   * CI HAS NO `origin/main`. The Rust leg's `actions/checkout@v4` carries no `with:` block,
+    ///     so it takes the default `fetch-depth: 1` and leaves a detached HEAD with no local `main`
+    ///     and no remote-tracking ref. `resolve_default_branch` falls all the way through to
+    ///     `rev-parse --abbrev-ref HEAD` — the literal string `"HEAD"` — and the read returns `None`.
+    ///     Every one of these tests would be green locally and red in CI: the exact shape AGENTS.md
+    ///     names under "Inherited red vs your own red".
+    ///   * A UNIT TEST WOULD FETCH INTO SHARED STATE. Every worktree on this machine shares one
+    ///     object store and one set of remote-tracking refs, so a test-driven fetch takes the
+    ///     common-dir lock and moves `origin/main` under every concurrent session.
+    /// The fixture's remote is a local bare repo: the SAME code path, offline, writing only to refs
+    /// it owns and tearing them down on `Drop`.
+    fn real_baseline_fixture(tag: &str) -> ShippedFixture {
+        shipped_fixture(tag, REAL_BASELINE)
+    }
+
+    /// A BARE upstream whose HEAD is `main` and which carries `baseline` at the acceptance path,
+    /// plus a clone of it sitting on `main`.
+    ///
+    /// ⚠️ THE UPSTREAM MUST BE BARE. A non-bare upstream moves its own HEAD, and modern git copies
+    /// the remote's HEAD into `refs/remotes/origin/HEAD` on fetch — which `resolve_default_branch`
+    /// reads FIRST, so every read below would silently resolve against the wrong branch while the
+    /// assertions still went the colour they expected.
+    fn shipped_fixture(tag: &str, baseline: &str) -> ShippedFixture {
+        let dir = std::env::temp_dir()
+            .join(format!("sparkle-shipped-read-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let upstream = dir.join("upstream");
+        let clone = dir.join("clone");
+        std::fs::create_dir_all(&upstream).expect("mkdir");
+        fx(&upstream, &["init", "--bare", "--initial-branch=main", "."]);
+
+        std::fs::create_dir_all(&clone).expect("mkdir");
+        fx(&clone, &["init", "--initial-branch=main", "."]);
+        fx(&clone, &["remote", "add", "origin", upstream.to_str().unwrap()]);
+        let f = ShippedFixture { dir, upstream, clone };
+        f.write_working_tree(baseline);
+        fx(&f.clone, &["add", "."]);
+        fx(&f.clone, &["commit", "-m", "baseline"]);
+        fx(&f.clone, &["push", "-q", "-u", "origin", "main"]);
+        f
+    }
+
+    /// THE BEAD, reproduced: a working checkout parked on a branch that edits the acceptance file
+    /// must not change one word of what the monitor reports.
+    ///
+    /// Both directions are asserted, because either alone is satisfiable by the wrong code. A read
+    /// that only checked "the shipped decision survives" would pass for code that unions the two
+    /// sources; one that only checked "the branch's own addition is invisible" would pass for code
+    /// that read nothing at all.
+    #[test]
+    fn false_absence_baseline_read_from_working_tree_is_not_shipped_state() {
+        let f = shipped_fixture(
+            "diverged",
+            "# decisions\nv0.142.0  # abandoned, never re-cut\nv0.129.0\ndraft:v0.111.0\n",
+        );
+
+        // The founder's checkout: a feature branch that DELETES the v0.142.0 decision (committed),
+        // plus an uncommitted edit adding a decision that was never made. Neither is shipped state.
+        fx(&f.clone, &["checkout", "-q", "-b", "fix/close-fixtures-branch-provenance"]);
+        f.write_working_tree("# decisions\nv0.129.0\ndraft:v0.111.0\n");
+        fx(&f.clone, &["commit", "-qam", "drop the v0.142.0 line"]);
+        f.write_working_tree("# decisions\nv0.129.0\nv0.999.0\ndraft:v0.111.0\n");
+
+        let baseline = read_baseline_at(f.root()).expect("origin/main carries the acceptance file");
+        assert!(
+            baseline.tags.contains(&parse_version("v0.142.0").unwrap()),
+            "the decision recorded on origin/main must survive a branch that deletes it: {:?}",
+            baseline.tags
+        );
+        assert!(
+            !baseline.tags.contains(&parse_version("v0.999.0").unwrap()),
+            "and a decision that exists ONLY in the working tree was never made: {:?}",
+            baseline.tags
+        );
+        assert!(
+            baseline.drafts.contains(&parse_version("v0.111.0").unwrap()),
+            "the drafts namespace comes from the same shipped bytes: {:?}",
+            baseline.drafts
+        );
+    }
+
+    /// A fetch is BEST EFFORT. A stale `origin/<default>` is still shipped state; a working tree is
+    /// not shipped state at any age — so an unreachable remote must degrade to the stale ref rather
+    /// than fall back to the tree. Same posture as `goal_landed_probe`'s RULE 3.
+    #[test]
+    fn a_fetch_that_fails_falls_back_to_the_stale_ref_and_never_to_the_tree() {
+        let f = shipped_fixture("offline", "v0.142.0\n");
+        // Destroy the remote. `origin/main` still resolves locally; every fetch from here on fails.
+        std::fs::remove_dir_all(&f.upstream).expect("remove upstream");
+        f.write_working_tree("v0.999.0\n");
+
+        let baseline = read_baseline_at(f.root()).expect("a stale origin/main is still readable");
+        assert!(
+            baseline.tags.contains(&parse_version("v0.142.0").unwrap()),
+            "the last-known shipped bytes: {:?}",
+            baseline.tags
+        );
+        assert!(
+            !baseline.tags.contains(&parse_version("v0.999.0").unwrap()),
+            "a failed fetch must never promote the working tree to shipped state: {:?}",
+            baseline.tags
+        );
+    }
+
+    /// FAIL CLOSED, and specifically NOT by reading the tree. With no `origin/<default>` there is no
+    /// shipped state to read, so nothing is accepted and every orphan is still counted — which is
+    /// the same posture the module already took for a missing file.
+    #[test]
+    fn the_baseline_read_fails_closed_when_origin_default_does_not_resolve() {
+        let f = shipped_fixture("no-remote", "v0.142.0\n");
+        // A repo whose remote-tracking refs are gone, with the file sitting right there on disk.
+        fx(&f.clone, &["remote", "remove", "origin"]);
+        fx(&f.clone, &["update-ref", "-d", "refs/remotes/origin/main"]);
+        assert_eq!(
+            read_baseline_at(f.root()),
+            None,
+            "a readable working-tree file is NOT an answer to what shipped"
+        );
+
+        // And a path that is not a repository at all.
+        let outside = std::env::temp_dir().join(format!("-a-repo-{}", std::process::id()));
+        std::fs::create_dir_all(&outside).expect("mkdir");
+        assert_eq!(read_baseline_at(outside.to_str().unwrap()), None);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    /// THE FALSE-ALARM DIRECTION, which the widening above cannot be trusted without (roborev
+    /// 72643). "Unfed" means a commit a LOCAL hook should have enqueued. A commit reachable only
+    /// from `refs/remotes/*` was never created on this machine — a `gh pr merge` merge commit is the
+    /// everyday case — so counting it would report a healthy daemon as DISCONNECTED, and this
+    /// module now fetches `origin/<default>` every five minutes, which is what makes those commits
+    /// arrive reliably enough to trip the threshold.
+    #[test]
+    fn a_commit_that_only_exists_on_a_remote_tracking_ref_is_not_unfed_work() {
+        let f = shipped_fixture("remote-only", "v0.142.0\n");
+        let since = "1970-01-01T00:00:00Z";
+        let before = commits_since_anywhere(f.root(), since).expect("git counts");
+
+        // Work that arrived from somewhere else: a commit written into the object store and pointed
+        // at by a REMOTE-TRACKING ref alone, exactly as a fetch of a server-side merge leaves it.
+        fx(&f.clone, &["checkout", "-q", "-b", "scratch"]);
+        f.write_working_tree("v0.142.0\nv0.143.0\n");
+        fx(&f.clone, &["commit", "-qam", "a commit nobody here authored"]);
+        let sha = String::from_utf8_lossy(&fx(&f.clone, &["rev-parse", "HEAD"]).stdout).trim().to_string();
+        fx(&f.clone, &["checkout", "-q", "main"]);
+        fx(&f.clone, &["branch", "-qD", "scratch"]);
+        fx(&f.clone, &["update-ref", "refs/remotes/origin/somebody-else", &sha]);
+
+        assert_eq!(
+            commits_since_anywhere(f.root(), since).expect("git counts"),
+            before,
+            "a commit reachable only from refs/remotes/* is not work this machine failed to review"
+        );
+    }
+
+    /// The throttle, as a pure decision. The probe ticks every 60s and every worktree on this
+    /// machine shares one set of remote-tracking refs, so "fetch on every tick" is contention on a
+    /// ref the fleet already refreshes for us.
+    #[test]
+    fn the_shipped_fetch_is_throttled_but_always_runs_the_first_time() {
+        let now = Instant::now();
+        assert!(fetch_is_due(None, now, SHIPPED_FETCH_MIN_INTERVAL), "never fetched → due");
+        let just_now = now.checked_sub(Duration::from_secs(1)).expect("clock has room");
+        assert!(
+            !fetch_is_due(Some(just_now), now, SHIPPED_FETCH_MIN_INTERVAL),
+            "a fetch one second ago is still good"
+        );
+        let old = now.checked_sub(SHIPPED_FETCH_MIN_INTERVAL).expect("clock has room");
+        assert!(fetch_is_due(Some(old), now, SHIPPED_FETCH_MIN_INTERVAL), "exactly at the interval → due");
+    }
+
+    /// The enqueue fence asks "IS WORK ARRIVING?" — a question about the repository, not about
+    /// whichever branch a scratch checkout is parked on. Counting from `HEAD` let an idle branch
+    /// report zero unfed commits while the fleet was landing work, which is the false GREEN the
+    /// fence exists to prevent.
+    #[test]
+    fn work_arriving_is_counted_across_local_branches_not_just_the_checked_out_one() {
+        let f = shipped_fixture("all-refs", "v0.142.0\n");
+        // The checkout is parked on an idle branch cut BEFORE the new work.
+        fx(&f.clone, &["checkout", "-q", "-b", "idle"]);
+        // Work lands somewhere else in the same repo — another agent's branch.
+        fx(&f.clone, &["checkout", "-q", "-b", "someone-elses-work"]);
+        f.write_working_tree("v0.142.0\nv0.143.0\n");
+        fx(&f.clone, &["commit", "-qam", "work that roborev should have seen"]);
+        fx(&f.clone, &["checkout", "-q", "idle"]);
+
+        let since = "1970-01-01T00:00:00Z";
+        let all = commits_since_anywhere(f.root(), since).expect("git counts");
+        let head_only = String::from_utf8_lossy(
+            &fx(&f.clone, &["rev-list", "--count", &format!("--since={since}"), "HEAD"]).stdout,
+        )
+        .trim()
+        .parse::<u32>()
+        .expect("a count");
+        assert_eq!(head_only, 1, "the parked branch sees only the commit it was cut from");
+        assert!(
+            all > head_only,
+            "work on another ref must still count as work arriving: {all} vs {head_only}"
+        );
+    }
+
     /// THE COVERAGE GUARD. Every corpus case whose `lang` is `rust` must be named by a live test in
     /// this file. An instance list nobody runs is exactly the false-green this bead is about, so the
     /// corpus gets a guard of its own — a case cannot be dropped by deleting its assertions.
@@ -5850,7 +6247,7 @@ mod tests {
                 "corpus instance {id} has a test but the test never names the instance"
             );
         }
-        assert_eq!(seen, 4, "the corpus's Rust instance count changed; update this file with it");
+        assert_eq!(seen, 5, "the corpus's Rust instance count changed; update this file with it");
     }
 
 }
