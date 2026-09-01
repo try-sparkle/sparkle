@@ -71,6 +71,27 @@ function useRollupView(roster: readonly AgentTab[]) {
   // carrying a red worker reads `blocked` in the build column (verdict `active`, NOT finished) and
   // raw `idle` here (verdict `finished`). The two columns then disagreed about the same head in
   // exactly the case the shared verdict was extracted to fix.
+  //
+  // ⚠️ THIS CALL IS ALSO THIS CHAIN'S ONLY SUBSCRIPTION TO `runtimeStore.observedAttention`, and
+  // that is load-bearing rather than incidental (bead sparkle-obvtfx, filed against this file as a
+  // missing subscription — it is not one, and the reason is worth stating before someone "fixes" it).
+  //
+  // `engine/observedAttention.applyVerdict`'s `delegating` arm is the ONE mount-independent GREEN
+  // input in the app: it exists for rows where `runtimeStore.status` has no entry because no pane
+  // ever mounted. On exactly that population `status` never moves, so NONE of this memo's own deps
+  // can change when a verdict lands — `rt` is the five-field shallow slice above and does not carry
+  // `observedAttention`, and `rollupViewFor` reads the live map through a `getState()` default a
+  // memo cannot see move. What makes the square repaint is that `useOverlaidStatus` subscribes to
+  // the field itself and feeds `calmStatus` into `useFinishedHeads` below, so `isFinishedOf` — a
+  // real dep — moves and the memo re-runs, at which point `rollupViewFor`'s default reads the fresh
+  // map. The reactivity is TRANSITIVE, and dropping this call (or making it read `getState()`) puts
+  // the square back to holding its gray until some unrelated render happens along.
+  //
+  // Guarded by `useEpicHealthOf.attentionSub.test.tsx`, which asserts the TRANSITION across a store
+  // write rather than the value after a fresh render — the only shape a lost subscription can fail.
+  // Adding `observedAttention` to the `useShallow` slice above would be a second, redundant path to
+  // the same render, and this hook's callers re-render on a 5s poll with ~19 epics; measure before
+  // paying for it.
   const { calmStatus, graceTick } = useOverlaidStatus(roster);
   // SUBSCRIBED for the same reason `graceTick` is a reactivity anchor below: `rollupViewFor` applies
   // `withDeadSessionCalm` internally through `deathCauseForAgent`, which now also reads the durable
