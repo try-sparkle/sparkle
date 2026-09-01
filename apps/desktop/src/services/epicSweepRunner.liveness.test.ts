@@ -56,6 +56,8 @@ function scenario(
     status?: AgentTabStatus;
     /** The Rust nudger's grid verdict — the witness that retracts. */
     attention?: ObservedVerdict;
+    /** Does the durable ledger record the orchestrator as dead? */
+    deathRecorded?: boolean;
     lastHookEventMs?: number | null;
     deathCause?: DeathCause;
     /** Omit BOTH artifact seams so the production defaults run. */
@@ -95,6 +97,9 @@ function scenario(
       aliveFor: () => over.alive,
       ...(over.status === undefined ? {} : { statusFor: () => over.status }),
       ...(over.attention === undefined ? {} : { attentionFor: () => over.attention }),
+      ...(over.deathRecorded === undefined
+        ? {}
+        : { deathRecordedFor: () => over.deathRecorded as boolean }),
       restartEnabled: true,
       restart,
       mark,
@@ -221,13 +226,29 @@ describe("an orchestrator waiting on a human is staffing, not dead", () => {
     expect(s.restart).not.toHaveBeenCalled();
   });
 
-  // THE RECOVERY ARM: the grid positively saw no prompt, so the latch is stale and the epic is
-  // handed back — and there is no open prompt for the handoff to be pasted into.
-  it("restarts when the grid CONTRADICTS a latched wait", async () => {
+  // `calm` IS NOT PERMISSION TO ACT. `observed_attention.rs` maps a prompt found only by
+  // `nudge_gate`'s live-region arm to `Verdict::Calm` BY CONSTRUCTION, so treating it as "no prompt"
+  // re-opens the paste hazard through the witness added to close it.
+  it("does not restart on a `calm` grid reading over a latched wait", async () => {
     const s = scenario({
       alive: true,
       status: "waiting",
       attention: "calm",
+      lastHookEventMs: NOW - 121 * HOUR,
+    });
+    const o = forEpic(await s.run());
+    expect(o?.reason).toBe("staffing-unknown");
+    expect(s.restart).not.toHaveBeenCalled();
+  });
+
+  // THE ARM THAT RECOVERS THE BATCH-KILL POPULATION, and the only way a latched wait reaches a
+  // restart: the DURABLE ledger positively records the session as ended, so there is no prompt left
+  // to type into.
+  it("restarts a latched wait once the durable ledger records the death", async () => {
+    const s = scenario({
+      alive: true,
+      status: "waiting",
+      deathRecorded: true,
       lastHookEventMs: NOW - 121 * HOUR,
     });
     expect(forEpic(await s.run())?.performed).toBe("restarted");
@@ -320,10 +341,12 @@ describe("against the real stores", () => {
   beforeEach(() => {
     _resetDeadSessionRegistryForTests();
     useRuntimeStore.getState().setAgentMovement({});
+    useRuntimeStore.getState().seedObservedAttention({});
   });
   afterEach(() => {
     _resetDeadSessionRegistryForTests();
     useRuntimeStore.getState().setAgentMovement({});
+    useRuntimeStore.getState().seedObservedAttention({});
   });
 
   it("reads the hook log out of runtimeStore.agentMovement, with no seam injected", async () => {
@@ -345,6 +368,34 @@ describe("against the real stores", () => {
     });
     const s = scenario({ alive: undefined, useRealSeams: true });
     expect(forEpic(await s.run())?.reason).toBe("orchestrator-alive");
+    expect(s.restart).not.toHaveBeenCalled();
+  });
+
+  // ── THE ATTENTION SEAM'S DEFAULT, DRIVEN ─────────────────────────────────────────────────────
+  // Without this, the line that reads `runtimeStore.observedAttention` is executed by nothing: every
+  // other case injects `attentionFor`, and the one case that omits it asserts the EMPTY-store answer
+  // (`null`), which is already true before the lookup runs. A typo there — the wrong map, the wrong
+  // field — would make the `awaiting` exemption dead code, leave every waiting orchestrator
+  // permanently `staffing-unknown`, and red no test. That is the defaulted-seam shape AGENTS.md
+  // records as `sparkle-lgbwf`.
+  it("reads the grid verdict out of runtimeStore.observedAttention, with no seam injected", async () => {
+    useRuntimeStore.getState().setObservedAttention("a1", {
+      verdict: "awaiting",
+      alternate: false,
+      atMs: NOW - 30 * 60_000,
+    });
+    useRuntimeStore.getState().setAgentMovement({
+      a1: {
+        lastEvent: "PreToolUse",
+        lastEventMs: NOW - 121 * HOUR,
+        sessionId: "s1",
+        toolsRecent: 0,
+      },
+    });
+    const s = scenario({ alive: true, status: "waiting", useRealSeams: true });
+    const o = forEpic(await s.run());
+    // The real store answered `awaiting`, so the epic is STAFFED and nothing is typed anywhere.
+    expect(o?.reason).toBe("orchestrator-alive");
     expect(s.restart).not.toHaveBeenCalled();
   });
 

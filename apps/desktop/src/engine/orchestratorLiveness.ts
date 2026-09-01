@@ -170,6 +170,15 @@ export interface OrchestratorEvidence {
    */
   observedAttention?: ObservedVerdict | undefined;
   /**
+   * Does the DURABLE ledger record that this agent's session ended?
+   *
+   * `deadSessionRegistry.deathCauseForAgent !== undefined` — this window's observations with a
+   * fallback to the `agent-life` ledger republished by `revival_due`, so a death no surviving pane
+   * witnessed still counts. It is the one POSITIVE statement available that the process is gone,
+   * which is what makes it safe to act on a latched wait: a dead PTY has no prompt to type into.
+   */
+  deathRecorded?: boolean;
+  /**
    * `MovementEvidence.lastEventMs` for this agent — when its hook log last recorded ANY event —
    * or `null`/`undefined` when there is no reading at all (`fleet_digest` has not polled yet, the
    * agent is cloud or has no worktree so the digest skips it, or its hook log is empty).
@@ -220,21 +229,46 @@ export function orchestratorLivenessOf(
   // prompt — and no hook-log age can make that untrue. See WAITING_ON_HUMAN. This returns the same
   // answer the one-witness code gave for these rows, so it is a preserved behaviour, not a new one.
   if (e.observedAlive === true && e.observedStatus !== undefined && WAITING_ON_HUMAN.has(e.observedStatus)) {
-    // A LATCHED `waiting` IS A CLAIM, NOT A READING — so it is corroborated against the one witness
-    // that can retract. Three answers, and the middle one is what recovers a died-while-waiting
-    // orchestrator that membership alone would have held forever:
+    // A LATCHED `waiting` IS A CLAIM, NOT A READING, so it is corroborated. Two POSITIVE witnesses
+    // are accepted and nothing else; anything short of one answers `null` (`staffing-unknown`),
+    // which spends nothing and — unlike `true` — makes no claim of health.
     //
-    //   awaiting            the grid SAW a prompt on screen. Staffing. Never touch it.
-    //   calm | delegating   the grid saw NO prompt, so the latch is stale. Fall through to the
-    //                       silence rule, which may legitimately reach `false` — and there is no
-    //                       open prompt for a handoff to be pasted into.
-    //   unreadable | none   no opinion. `unreadable` holds none BY CONTRACT ("it never lowers and
-    //                       never raises"), and an absent entry is either a retraction or a channel
-    //                       that never spoke. Answer `null`, which is `staffing-unknown`: not a
-    //                       claim of health (so it cannot clear a real escalation, which returning
-    //                       `true` would), and not a spend (so nothing is typed anywhere).
+    //   awaiting          the grid SAW a prompt on screen. Staffing. Never touch it.
+    //   a death record    the DURABLE ledger says the session ended, so there is no prompt to type
+    //                     into and acting is safe. This is the arm that actually recovers the
+    //                     ENOTFOUND-batch-kill population.
+    //
+    // ── WHY `calm`/`delegating` ARE NOT A THIRD ARM (adversarial review of d9de06a04) ──────────
+    // An earlier cut let those two fall through to the silence rule, on the reasoning that "the
+    // grid saw NO prompt, so there is nothing to paste into". BOTH HALVES OF THAT WERE WRONG.
+    //
+    // `Calm` does not mean "no prompt". `observed_attention.rs` maps `Refusal::AwaitingInput` to
+    // `Verdict::Calm` whenever `screen_awaits_input` fails to re-confirm — and `nudge_gate`'s
+    // `write_refusal` has ALREADY failed that same predicate before it can return `AwaitingInput`,
+    // so every prompt detected only by its live-region arm (`menu_line` / `question_opener`)
+    // becomes `Calm` BY CONSTRUCTION. The Rust comment says so and defends the trade in the open —
+    // "a prompt missed here is still caught by the pane's own classifier the moment anyone opens
+    // it" — a trade made when the consumer was a ROW COLOUR. Letting it authorize a PTY write makes
+    // this module overrule the classifier that was supposed to be the backstop.
+    //
+    // And the arm could never have helped the population it was written for. A dead PTY is swept by
+    // `nudger.rs`, which emits `gone`, which CLEARS the entry — so a died-while-waiting orchestrator
+    // reads `undefined` here, never `calm`. The only population in which that arm was reachable at
+    // all was an agent whose PTY IS STILL LIVE: precisely where a paste is dangerous, and precisely
+    // nowhere it was useful. Deleting it costs nothing and closes the hazard.
+    //
+    // ── AND WHY THERE IS NO FRESHNESS BOUND ON `awaiting` ─────────────────────────────────────
+    // Deliberate, and the opposite of the rule one branch down. The producer emits ON CHANGE, not
+    // every tick (`runtimeStore.setObservedAttention`: "a missing agent this tick means unchanged,
+    // never no evidence"), so an agent legitimately parked at a prompt for three hours carries an
+    // `atMs` three hours old. An age bound would expire exactly the long waits this exemption
+    // exists to protect. The guarantee here is RETRACTION, not recency — which is why this witness
+    // was chosen over the status latch in the first place. The residual is a wedged nudger leaving
+    // a stale `awaiting`; that fails to `true` ⇒ skip, i.e. an epic not recovered, which is the
+    // safe direction.
     if (e.observedAttention === "awaiting") return true;
-    if (e.observedAttention !== "calm" && e.observedAttention !== "delegating") return null;
+    if (e.deathRecorded === true) return false;
+    return null;
   }
 
   const ts = e.lastHookEventMs;

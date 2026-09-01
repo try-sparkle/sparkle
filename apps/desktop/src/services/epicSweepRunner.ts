@@ -461,6 +461,10 @@ export interface EpicSweepOptions {
    *  so an absence here is a real signal, not a frozen claim. See
    *  `engine/orchestratorLiveness.WAITING_ON_HUMAN`. */
   attentionFor?: (agentId: string) => ObservedVerdict | undefined;
+  /** Does the durable ledger record this agent as dead? Defaults to `deathCauseFor(id) !== undefined`
+   *  — the SAME reading the remedy gate uses, deliberately, so liveness and remedy cannot disagree
+   *  about whether an orchestrator died. */
+  deathRecordedFor?: (agentId: string) => boolean;
   /** How long an orchestrator may be silent before it stops counting as staffing its epic.
    *  Defaults to {@link ORCHESTRATOR_SILENT_MS}; injected by tests so a fixture can state a window
    *  instead of moving a clock an hour. */
@@ -619,6 +623,9 @@ export function candidateFor(
     /** The Rust nudger's last GRID reading for an agent — the witness that RETRACTS, which is what
      *  keeps a latched `waiting` from holding an epic forever (roborev 73028). */
     attentionFor: (agentId: string) => ObservedVerdict | undefined;
+    /** Does the durable ledger record this agent's session as ended? The one POSITIVE proof that a
+     *  latched wait is over, and what makes acting on it safe — a dead PTY has no open prompt. */
+    deathRecordedFor: (agentId: string) => boolean;
     now: number;
     silentMs?: number;
   },
@@ -655,6 +662,7 @@ export function candidateFor(
                 observedAlive: alive(a.id),
                 observedStatus: staffing.statusFor(a.id),
                 observedAttention: staffing.attentionFor(a.id),
+                deathRecorded: staffing.deathRecordedFor(a.id),
                 lastHookEventMs: staffing.lastHookEventFor(a.id),
               },
               staffing.now,
@@ -955,6 +963,11 @@ export async function sweepEpics(opts: EpicSweepOptions = {}): Promise<EpicSweep
     ((agentId: string) => useRuntimeStore.getState().observedAttention[agentId]?.verdict);
   const orchestratorSilentMs = opts.orchestratorSilentMs ?? ORCHESTRATOR_SILENT_MS;
   const deathCauseFor = opts.deathCauseFor ?? deathCauseForAgent;
+  // ONE reading, shared with the remedy gate below, so liveness and remedy cannot disagree about
+  // whether an orchestrator died — two lookups of the same durable record can land either side of a
+  // write, and a "it died / no it didn't" split between the two layers would be unreadable.
+  const deathRecordedFor =
+    opts.deathRecordedFor ?? ((agentId: string) => deathCauseFor(agentId) !== undefined);
 
   const projects = opts.projects ?? useProjectStore.getState().projects;
   const outcomes: EpicSweepOutcome[] = [];
@@ -1050,6 +1063,7 @@ export async function sweepEpics(opts: EpicSweepOptions = {}): Promise<EpicSweep
         lastHookEventFor,
         statusFor,
         attentionFor,
+        deathRecordedFor,
         now,
         silentMs: orchestratorSilentMs,
       });

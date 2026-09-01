@@ -127,11 +127,15 @@ describe("orchestratorLivenessOf", () => {
     ).toBe(null);
   });
 
-  // THE ARM THAT RECOVERS A DIED-WHILE-WAITING ORCHESTRATOR. The grid positively saw NO prompt, so
-  // the latch is stale and the silence rule applies — and there is no open prompt for a handoff to
-  // be pasted into, which is what makes reaching `false` safe here.
+  // ══ `calm` MUST NOT AUTHORIZE A RESTART (adversarial review of d9de06a04) ══════════════════
+  // An earlier cut let `calm`/`delegating` fall through to the silence rule, reasoning that the grid
+  // had seen no prompt. `observed_attention.rs` maps `Refusal::AwaitingInput` to `Verdict::Calm`
+  // whenever `screen_awaits_input` fails to re-confirm — and `nudge_gate::write_refusal` has ALREADY
+  // failed that predicate before it can return `AwaitingInput`, so every prompt found only by its
+  // live-region arm is `Calm` BY CONSTRUCTION. Treating it as "no prompt" re-opened the paste
+  // hazard through the very witness added to close it.
   it.each(["calm", "delegating"] as const)(
-    "a grid reading of %s contradicts the latch, and the silence rule applies",
+    "a grid reading of %s is NOT permission to act on a latched wait",
     (verdict) => {
       expect(
         orchestratorLivenessOf(
@@ -143,22 +147,62 @@ describe("orchestratorLivenessOf", () => {
           },
           NOW,
         ),
-      ).toBe(false);
-      // …and it is the SILENCE rule that answered, not a blanket "contradicted means dead": a fresh
-      // hook log under the same contradiction is still staffing.
-      expect(
-        orchestratorLivenessOf(
-          {
-            observedAlive: true,
-            observedStatus: "waiting",
-            observedAttention: verdict,
-            lastHookEventMs: NOW - 60_000,
-          },
-          NOW,
-        ),
-      ).toBe(true);
+      ).toBe(null);
     },
   );
+
+  // ══ THE ARM THAT ACTUALLY RECOVERS THE BATCH-KILL POPULATION ═══════════════════════════════
+  // The durable ledger is the one POSITIVE statement that the session ended — and a dead PTY has no
+  // prompt to type into, which is what makes acting safe. Note this is the ONLY way a latched wait
+  // reaches `false`: the deleted `calm` arm could never have done it, because a dead PTY is swept by
+  // the nudger, which emits `gone`, which clears the entry to `undefined`.
+  it("a durable death record releases a latched wait", () => {
+    expect(
+      orchestratorLivenessOf(
+        {
+          observedAlive: true,
+          observedStatus: "waiting",
+          observedAttention: undefined,
+          deathRecorded: true,
+          lastHookEventMs: NOW - 121 * HOUR,
+        },
+        NOW,
+      ),
+    ).toBe(false);
+  });
+
+  // PAIRED: a live prompt outranks a death record, so a stale record cannot re-open the hazard.
+  it("…but a grid that still SEES the prompt outranks a death record", () => {
+    expect(
+      orchestratorLivenessOf(
+        {
+          observedAlive: true,
+          observedStatus: "waiting",
+          observedAttention: "awaiting",
+          deathRecorded: true,
+          lastHookEventMs: NOW - 121 * HOUR,
+        },
+        NOW,
+      ),
+    ).toBe(true);
+  });
+
+  // `gone` is a value the type admits through the seam even though the listener consumes it by
+  // clearing the entry. It is not corroboration, so it must read exactly like an absence — pinned
+  // rather than left to work by accident, on the same reasoning the listener handles it explicitly.
+  it("a `gone` verdict is not corroboration", () => {
+    expect(
+      orchestratorLivenessOf(
+        {
+          observedAlive: true,
+          observedStatus: "waiting",
+          observedAttention: "gone",
+          lastHookEventMs: NOW - 121 * HOUR,
+        },
+        NOW,
+      ),
+    ).toBe(null);
+  });
 
   // THE PAIRED CASE, and without it the exemption above could be a blanket "observed means alive".
   // `idle` is NOT a human wait, and it is one of the three statuses the bead actually recorded
