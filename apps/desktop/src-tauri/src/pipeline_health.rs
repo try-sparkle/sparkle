@@ -134,6 +134,18 @@ enum EnqueueVerdict {
     Severed { unfed_commits: u32, gap_secs: u64 },
 }
 
+/// The enqueue fence's verdict as the token [`sub_verdict_rank`] grades. Derived from the SAME
+/// [`classify_enqueue`] the fold uses, so it can never disagree with the ladder about thresholds —
+/// only about whether the fold carried the result.
+fn enqueue_sub_verdict(ev: EnqueueEvidence) -> &'static str {
+    match classify_enqueue(ev) {
+        EnqueueVerdict::NotTaken => "not_taken",
+        EnqueueVerdict::Unknown => "unknown",
+        EnqueueVerdict::Ok => "ok",
+        EnqueueVerdict::Severed { .. } => "severed",
+    }
+}
+
 fn classify_enqueue(ev: EnqueueEvidence) -> EnqueueVerdict {
     match ev {
         EnqueueEvidence::NotTaken => EnqueueVerdict::NotTaken,
@@ -222,6 +234,39 @@ pub struct ComponentHealth {
     pub state: HealthState,
     /// One human-readable line: what is wrong (or right) and, when actionable, what to do about it.
     pub detail: String,
+    /// THE NUMBERS THE VERDICT WAS DERIVED FROM, as `key=value` strings (bead `sparkle-7m0f2x`).
+    ///
+    /// A health surface reported a component GREEN while a probe one layer down held the
+    /// CONTRADICTING number, and there was no cheap way to see the disagreement: every surface
+    /// published the VERDICT and threw the evidence away, so confirming a suspect green meant
+    /// re-deriving each probe by hand. Nobody does that, which is why the false-P1 flap of
+    /// `sparkle-imfgv5` stood unchallenged for 159 consecutive passes.
+    ///
+    /// An UNREAD value renders as `<unread>`, never as a bare `key=`: "the queue depth is 0" and
+    /// "the queue depth could not be read" are the pair whose collapse produced the measured false
+    /// RECOVERED (`sparkle-1xg2f6`), and a trailing `=` reads as the former at a glance. Same
+    /// spelling as `ph_readings` in `scripts/lib/pipeline-health.sh`.
+    pub readings: Vec<String>,
+}
+
+impl ComponentHealth {
+    /// Render one reading. `None` — a probe that could not look — is spelled `<unread>`.
+    fn reading<T: std::fmt::Display>(key: &str, value: Option<T>) -> String {
+        match value {
+            Some(v) => format!("{key}={v}"),
+            None => format!("{key}=<unread>"),
+        }
+    }
+
+    /// Attach the evidence to a finished component, and — the half with teeth — LOUDLY append the
+    /// disagreement when a sub-probe's own verdict outranks the state being published above it.
+    fn with_evidence(mut self, readings: Vec<String>, subs: &[(&str, &str)]) -> Self {
+        if let Some(line) = contradiction(self.state, subs) {
+            self.detail = format!("{} {line}", self.detail);
+        }
+        self.readings = readings;
+        self
+    }
 }
 
 /// The whole reading, as one IPC payload.
@@ -280,6 +325,74 @@ pub fn overall_state(components: &[ComponentHealth]) -> HealthState {
         .max_by_key(|(r, _)| *r)
         .map(|(_, s)| s)
         .unwrap_or(HealthState::NotApplicable)
+}
+
+/// The wire/prose token for a state — the same words `scripts/lib/pipeline-health.sh` prints, and
+/// the same words the shared contract's `stateRanks` keys use.
+fn state_token(state: HealthState) -> &'static str {
+    match state {
+        HealthState::Healthy => "healthy",
+        HealthState::Warning => "warning",
+        HealthState::Blocking => "blocking",
+        HealthState::Unknown => "unknown",
+        HealthState::NotApplicable => "not_applicable",
+    }
+}
+
+// ── THE CONTRADICTION CHECK (bead `sparkle-7m0f2x`) ─────────────────────────────────────────────
+//
+// A component's state is a FOLD over several sub-probes, and a fold can lose the worst thing it was
+// handed. When that happens the surface publishes a verdict its own evidence contradicts, and — with
+// the readings thrown away — nobody can see it. Measured live: an unreadable enqueue reading folds
+// roborev to `Unknown` (an amber "could not tell") while the completion probe one layer down holds a
+// majority-failure rate; and, historically, "1 of 21 idle and ready" published over 43 queued runs.
+//
+// THE RULE IS A RANK COMPARISON, NOT A SECOND LADDER, and that distinction is what keeps it usable:
+// every sub-verdict below is computed with the SAME thresholds the fold uses, so a state the ladder
+// deliberately TOLERATES (a fully-busy CI pool with a drained queue, `sparkle-ot4dxb`; a stale
+// reviewer with no open PRs) yields `ok` and cannot fire this. A check that second-guessed those
+// would shout on every ordinary pass, and a line that always fires is a line nobody reads.
+//
+// Pinned, with `ph_subverdict_rank` / `ph_contradiction` in the shell mirror, to
+// `apps/desktop/src-tauri/contracts/pipeline-confirmation-contract.json`.
+
+/// How bad a sub-probe's own verdict is, on the same scale as [`severity_rank`]. `None` for a token
+/// that is not a reading at all.
+///
+/// `not_taken` ranks 0 ALONGSIDE `ok`, deliberately: a probe nobody asked cannot disagree with
+/// anything, and ranking it above `ok` would report every caller that skips an optional probe as a
+/// contradiction.
+pub fn sub_verdict_rank(token: &str) -> Option<u8> {
+    match token {
+        "ok" | "not_taken" => Some(0),
+        "unknown" => Some(1),
+        "backlog" | "severed" | "failing" | "stale" => Some(2),
+        "dead" => Some(3),
+        _ => None,
+    }
+}
+
+/// One loud line naming every sub-probe whose verdict outranks `state`, or `None` when the fold
+/// carried the worst reading it had.
+///
+/// `NotApplicable` is excluded exactly as it is from [`overall_state`]: a component that is
+/// deliberately off has no verdict for a sub-probe to contradict.
+pub fn contradiction(state: HealthState, subs: &[(&str, &str)]) -> Option<String> {
+    let state_rank = severity_rank(state)?;
+    let worse: String = subs
+        .iter()
+        .filter(|(_, v)| sub_verdict_rank(v).is_some_and(|r| r > state_rank))
+        .map(|(n, v)| format!(" {n}={v}"))
+        .collect();
+    if worse.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "CONTRADICTS ITS OWN PROBE — this component is published as {}, but a probe one layer down \
+         disagrees:{worse}. The verdict above did not carry the worst reading it had, so do NOT read \
+         the state as an all-clear; the readings on the row above are the evidence.",
+        state_token(state)
+    ))
 }
 
 // ── roborev ─────────────────────────────────────────────────────────────────────────────────────
@@ -2570,6 +2683,11 @@ fn users_uid() -> Option<String> {
 fn roborev_component(root: &str) -> ComponentHealth {
     let enabled = crate::preflight::cached_roborev_path().is_some()
         && crate::config::for_project(root).config.tools.roborev;
+    // Hoisted out of the branch so the READINGS can be reported beside the verdict (bead
+    // sparkle-7m0f2x). `None` means the probe was never run — the disabled arm — which is a
+    // different fact from a reading that was attempted and failed, and only the second is a
+    // visibility gap.
+    let mut enqueue_evidence: Option<EnqueueEvidence> = None;
     let (state, detail) = if !enabled {
         (
             HealthState::NotApplicable,
@@ -2595,6 +2713,7 @@ fn roborev_component(root: &str) -> ComponentHealth {
         // precisely what hid the measured outage, so skipping this on the healthy path would leave
         // the fence blind to the only case it exists for.
         let enqueue = roborev_enqueue_evidence(root);
+        enqueue_evidence = Some(enqueue);
         let evidence = if not_answering {
             DaemonEvidence {
                 loaded: roborev_daemon_loaded(),
@@ -2608,12 +2727,36 @@ fn roborev_component(root: &str) -> ComponentHealth {
         };
         classify_roborev(&status, evidence)
     };
+    // THE EVIDENCE, carried out with the verdict. `enqueue_evidence` is re-derived here rather than
+    // threaded out of the block above because the disabled arm never took a reading at all, and
+    // "not asked" must render as `not_taken`, not as a zero.
+    //
+    // ONE ASYMMETRY, STATED RATHER THAN HIDDEN: the shell mirror also carries a COMPLETION fence
+    // (`ph_classify_roborev_completion`, bead sparkle-0ggmfi) that reads job outcomes straight out
+    // of the roborev store, and this half has no equivalent — it predates this change and adding a
+    // sqlite reader here is its own piece of work. So the shell reports two sub-probes for roborev
+    // and this reports one. The MECHANISM is mirrored and pinned; the input set is not yet, and
+    // pretending otherwise by inventing a placeholder verdict would be worse than saying so.
+    let seen = match enqueue_evidence {
+        Some(EnqueueEvidence::Seen { unfed_commits, gap_secs }) => Some((unfed_commits, gap_secs)),
+        _ => None,
+    };
+    let readings = vec![
+        ComponentHealth::reading("unfed_commits", seen.map(|(u, _)| u)),
+        ComponentHealth::reading("enqueue_gap_secs", seen.map(|(_, g)| g)),
+    ];
+    let subs: Vec<(&str, &str)> = match enqueue_evidence {
+        None => vec![("enqueue", "not_taken")],
+        Some(ev) => vec![("enqueue", enqueue_sub_verdict(ev))],
+    };
     ComponentHealth {
         id: "roborev".to_string(),
         name: "Code review (roborev)".to_string(),
         state,
         detail,
+        readings: Vec::new(),
     }
+    .with_evidence(readings, &subs)
 }
 
 /// Is a release being built right now? `Some(true)` when the release runner has a busy VM,
@@ -2674,21 +2817,101 @@ fn runner_components(
     let (ci_state, ci_detail) = classify_ci_pool(ci, queued);
     let (rel_state, rel_detail) = classify_release_runner(release);
 
+    let pool_readings = |r: Option<RunnerPoolReading>| {
+        vec![
+            ComponentHealth::reading("idle", r.map(|p| p.online_idle)),
+            ComponentHealth::reading("busy", r.map(|p| p.online_busy)),
+            ComponentHealth::reading("total", r.map(|p| p.online_total())),
+            ComponentHealth::reading("complete", r.map(|p| p.complete)),
+            ComponentHealth::reading("saw_runners", r.map(|p| p.saw_runners)),
+        ]
+    };
+    let mut ci_readings = pool_readings(ci);
+    ci_readings.push(ComponentHealth::reading("queued", queued));
+
     let components = vec![
         ComponentHealth {
             id: "ci_runners".to_string(),
             name: "CI test runners".to_string(),
             state: ci_state,
             detail: ci_detail,
-        },
+            readings: Vec::new(),
+        }
+        .with_evidence(ci_readings, &[("queue", ci_queue_sub_verdict(ci, queued))]),
         ComponentHealth {
             id: "release_runner".to_string(),
             name: "Release runner (DMG build)".to_string(),
             state: rel_state,
             detail: rel_detail,
-        },
+            readings: Vec::new(),
+        }
+        // No sub-probe: the release pool's verdict IS its reading — online-or-not, with the
+        // truncation and empty-read controls already folded into `classify_release_runner`. An
+        // invented sub-verdict here would restate the fold and could only ever agree with it.
+        .with_evidence(pool_readings(release), &[]),
     ];
     (components, release_in_progress(release))
+}
+
+/// The CI pool's one-layer-down probe: is free capacity draining the work waiting for it?
+///
+/// SAME TWO THRESHOLDS `classify_ci_pool` folds on, deliberately — a backlog the ladder tolerates
+/// (below [`CI_QUEUE_BACKLOG_MIN`], or one the idle count covers) is `ok` here, so this can never
+/// second-guess the healthy-saturation decision of bead `sparkle-ot4dxb`. Mirrors
+/// `ph_subverdict_ci_queue`.
+/// THE IDLE COUNT ONLY REACHES THIS PROBE WHEN THE LADDER WOULD ITSELF CONCLUDE FROM IT.
+///
+/// `read_runner_pool` returns `Some(..)` for two DEGRADED reads that [`classify_ci_pool`]
+/// deliberately folds to `Unknown`: a truncated page carrying no CI runner (`online_total() == 0
+/// && !complete`) and an enumeration that returned no runners at all (`online_total() == 0 &&
+/// !saw_runners`). In both, `online_idle` is a fabricated `0` — the very number the ladder refused
+/// to conclude from. Guarding only on `reading.is_some()` passes that zero straight through, so
+/// whenever the runners read is truncated or empty while the SEPARATE queued-runs read succeeds
+/// with `queued >= CI_QUEUE_BACKLOG_MIN`, this answers `backlog` (rank 2) against a published
+/// `Unknown` (rank 1) and `with_evidence` appends `CONTRADICTS ITS OWN PROBE` — firing, on every
+/// such pass, the one line this module says must never fire on a state the ladder tolerates. A
+/// loud line that cries on ordinary degraded reads is a loud line nobody reads.
+///
+/// THIS IS THE SHELL MIRROR, and it is the whole point of the pairing. `scripts/pipeline-health-
+/// scan.sh` computes `ci_q_idle` and passes it on only when `ci_read=1 && (idle+busy > 0 ||
+/// (complete && saw))`. Both halves are the same rule pinned to `pipeline-confirmation-
+/// contract.json`, so a guard present on one side and absent on the other is exactly the silent
+/// cross-language drift beads sparkle-negds0 and sparkle-vlnf7c were filed for — and it is worse
+/// than an ordinary bug, because the two halves provably disagree for the same inputs while both
+/// claim to be replaying one contract. A REAL empty pool (complete, non-empty enumeration) still
+/// passes its true `0` through, so the blocking arm keeps its evidence.
+fn ci_queue_sub_verdict(reading: Option<RunnerPoolReading>, queued: Option<usize>) -> &'static str {
+    let (Some(r), Some(q)) = (reading, queued) else { return "unknown" };
+    if r.online_total() == 0 && !(r.complete && r.saw_runners) {
+        return "unknown";
+    }
+    if q > r.online_idle && q >= CI_QUEUE_BACKLOG_MIN { "backlog" } else { "ok" }
+}
+
+/// The reviewer's one-layer-down probe. Every arm mirrors the corresponding arm of
+/// [`classify_knightwatch`], INCLUDING the horizon arm — an empty read that could not reach back as
+/// far as the claim is `unknown`, not `stale`. Getting that wrong would fire a contradiction on
+/// every busy repo, which is the fastest way to make a loud line ignored.
+fn knightwatch_sub_verdict(
+    has_no_reviewer: bool,
+    liveness: Option<&KnightwatchLiveness>,
+) -> &'static str {
+    if has_no_reviewer {
+        return "not_taken";
+    }
+    let Some(l) = liveness else { return "unknown" };
+    match l.last_review_age_secs {
+        Some(age) if age <= KNIGHTWATCH_FRESH_SECS => "ok",
+        Some(_) | None if l.has_open_prs.is_none() => "unknown",
+        None if !l.horizon.covers(KNIGHTWATCH_FRESH_SECS) => "unknown",
+        _ => {
+            if l.has_open_prs == Some(true) {
+                "stale"
+            } else {
+                "ok"
+            }
+        }
+    }
 }
 
 /// Build the knightwatch (PR reviewer) component from config.
@@ -2703,12 +2926,26 @@ fn knightwatch_component(gh_program: Option<&str>, root: &str) -> ComponentHealt
     };
     let (state, detail) =
         classify_knightwatch(review.has_no_pr_reviewer(), review.pr_reviewer.trim(), liveness.as_ref());
+    let readings = vec![
+        ComponentHealth::reading("reviewer", Some(review.pr_reviewer.trim())),
+        ComponentHealth::reading(
+            "last_review_age_secs",
+            liveness.as_ref().and_then(|l| l.last_review_age_secs),
+        ),
+        ComponentHealth::reading("has_open_prs", liveness.as_ref().and_then(|l| l.has_open_prs)),
+        ComponentHealth::reading("window_covers_claim", liveness.as_ref().map(|l| l.horizon.covers(KNIGHTWATCH_FRESH_SECS))),
+    ];
     ComponentHealth {
         id: "knightwatch".to_string(),
         name: "PR reviewer (knightwatch)".to_string(),
         state,
         detail,
+        readings: Vec::new(),
     }
+    .with_evidence(
+        readings,
+        &[("liveness", knightwatch_sub_verdict(review.has_no_pr_reviewer(), liveness.as_ref()))],
+    )
 }
 
 /// Run one bounded `gh api <path>` in `root`, returning stdout on success. `None` on ANY failure —
@@ -2885,11 +3122,21 @@ where
     // paginated read above (`release_publication_component`) `tags_complete` is `true`, so a real
     // Healthy verdict survives; only an incomplete read is downgraded.
     let (state, detail) = apply_tag_page_truncation(state, detail, tags_complete);
+    // The readings this verdict is a fold over. No sub-probe: the draft gates are already resolved
+    // INTO `classify_release_publication`, so there is no lower layer holding a number the fold did
+    // not see — the disagreement this check exists for cannot arise here.
+    let readings = vec![
+        ComponentHealth::reading("published_releases", releases.as_ref().map(|r| r.published.len())),
+        ComponentHealth::reading("draft_releases", releases.as_ref().map(|r| r.drafts.len())),
+        ComponentHealth::reading("version_tags", tags.as_ref().map(|t| t.len())),
+        ComponentHealth::reading("tag_list_complete", Some(tags_complete)),
+    ];
     ComponentHealth {
         id: "release_publication".to_string(),
         name: "Release publication".to_string(),
         state,
         detail,
+        readings,
     }
 }
 
@@ -2928,7 +3175,226 @@ mod tests {
             name: "X".into(),
             state,
             detail: String::new(),
+            readings: Vec::new(),
         }
+    }
+
+    // ── THE CONTRADICTION CHECK, pinned to the SHARED contract (bead `sparkle-7m0f2x`) ──────────
+    //
+    // `scripts/tests/pipeline-health-hysteresis.test.sh` replays these exact cases through
+    // `ph_contradiction`, so the two halves fail TOGETHER. That is the remedy AGENTS.md prescribes
+    // for the drift that has already burned this mirror twice (`sparkle-vlnf7c`, `sparkle-negds0`).
+
+    const CONFIRMATION_CONTRACT: &str =
+        include_str!("../contracts/pipeline-confirmation-contract.json");
+
+    fn confirmation_contract() -> serde_json::Value {
+        serde_json::from_str(CONFIRMATION_CONTRACT)
+            .expect("the pipeline-confirmation contract must be valid JSON")
+    }
+
+    fn state_from_token(token: &str) -> HealthState {
+        match token {
+            "healthy" => HealthState::Healthy,
+            "warning" => HealthState::Warning,
+            "blocking" => HealthState::Blocking,
+            "unknown" => HealthState::Unknown,
+            "not_applicable" => HealthState::NotApplicable,
+            other => panic!("the contract names a state this half does not know: {other}"),
+        }
+    }
+
+    #[test]
+    fn every_contradiction_case_in_the_shared_contract_agrees() {
+        let c = confirmation_contract();
+        let cases = c["contradiction"]["cases"].as_array().expect("contradiction cases array");
+        assert!(!cases.is_empty(), "the contract must carry at least one contradiction case");
+        for case in cases {
+            let id = case["id"].as_str().expect("every case names itself");
+            let state = state_from_token(case["state"].as_str().unwrap());
+            let pairs: Vec<(String, String)> = case["subs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|p| {
+                    (p[0].as_str().unwrap().to_string(), p[1].as_str().unwrap().to_string())
+                })
+                .collect();
+            let subs: Vec<(&str, &str)> =
+                pairs.iter().map(|(n, v)| (n.as_str(), v.as_str())).collect();
+            let got = contradiction(state, &subs);
+            let want = case["contradicts"].as_bool().unwrap();
+            assert_eq!(got.is_some(), want, "case {id}: got {got:?}");
+            // A loud line that does not NAME the disagreeing probe leaves the reader exactly where
+            // they were — re-deriving every probe by hand, which is the defect.
+            if let Some(line) = got {
+                for m in case["mentions"].as_array().unwrap() {
+                    let m = m.as_str().unwrap();
+                    assert!(line.contains(m), "case {id}: the line must name `{m}`: {line}");
+                }
+            }
+        }
+    }
+
+    /// The RANK TABLES are the contract too, and the case list above cannot see a drift in them: a
+    /// token moved from rank 2 to rank 3 changes no case's verdict while changing which side of a
+    /// fold wins the next time one is added.
+    #[test]
+    fn the_contradiction_rank_tables_are_pinned_to_the_shared_contract() {
+        let c = confirmation_contract();
+        for (token, want) in c["contradiction"]["subVerdictRanks"].as_object().unwrap() {
+            assert_eq!(
+                sub_verdict_rank(token).map(u64::from),
+                want.as_u64(),
+                "sub-verdict `{token}` has drifted from the shared contract"
+            );
+        }
+        for (token, want) in c["contradiction"]["stateRanks"].as_object().unwrap() {
+            assert_eq!(
+                severity_rank(state_from_token(token)).map(u64::from),
+                want.as_u64(),
+                "state `{token}` has drifted from the shared contract"
+            );
+        }
+    }
+
+    /// THE SUB-VERDICTS MUST NOT RE-LITIGATE A DELIBERATE THRESHOLD. Each of these is a state the
+    /// ladder above deliberately calls Healthy; if the sub-verdict disagreed, the loud line would
+    /// fire on an ordinary pass and be ignored within a day.
+    #[test]
+    fn a_deliberately_tolerated_state_is_ok_at_the_sub_probe_too() {
+        // Healthy saturation (bead `sparkle-ot4dxb`): every runner busy, nothing queued.
+        let saturated = RunnerPoolReading {
+            online_idle: 0,
+            online_busy: 21,
+            complete: true,
+            saw_runners: true,
+        };
+        assert_eq!(ci_queue_sub_verdict(Some(saturated), Some(0)), "ok");
+        assert_eq!(
+            contradiction(classify_ci_pool(Some(saturated), Some(0)).0, &[("queue", "ok")]),
+            None,
+            "healthy saturation must not read as a contradiction"
+        );
+        // A backlog UNDER the floor is tolerated by the ladder, so it is `ok` here as well.
+        let one_idle =
+            RunnerPoolReading { online_idle: 1, online_busy: 3, complete: true, saw_runners: true };
+        assert_eq!(ci_queue_sub_verdict(Some(one_idle), Some(2)), "ok");
+        // …and a real backlog IS `backlog`, so the negative above is not vacuous.
+        assert_eq!(ci_queue_sub_verdict(Some(one_idle), Some(43)), "backlog");
+        // An unreadable queue is a visibility gap, never a proven-drained one.
+        assert_eq!(ci_queue_sub_verdict(Some(one_idle), None), "unknown");
+
+        // THE TWO DEGRADED READS, which every case above is blind to because all of them set
+        // `complete: true, saw_runners: true`. `read_runner_pool` returns `Some(..)` for both, with
+        // a FABRICATED `online_idle: 0` that `classify_ci_pool` itself refuses to conclude from —
+        // so before the guard these answered `backlog` against a published `Unknown` and fired
+        // `CONTRADICTS ITS OWN PROBE` on every truncated or empty runners read.
+        //
+        // A real queue depth is used deliberately: with `queued: 43` the unguarded code CANNOT
+        // reach any other answer, so these assertions go red the moment the guard is removed.
+        let truncated_page =
+            RunnerPoolReading { online_idle: 0, online_busy: 0, complete: false, saw_runners: true };
+        let saw_nothing =
+            RunnerPoolReading { online_idle: 0, online_busy: 0, complete: true, saw_runners: false };
+        for (name, degraded) in [("truncated page", truncated_page), ("no runners seen", saw_nothing)]
+        {
+            assert_eq!(
+                ci_queue_sub_verdict(Some(degraded), Some(43)),
+                "unknown",
+                "{name}: a fabricated idle=0 must not be read as a measurement"
+            );
+            assert_eq!(
+                contradiction(
+                    classify_ci_pool(Some(degraded), Some(43)).0,
+                    &[("queue", ci_queue_sub_verdict(Some(degraded), Some(43)))]
+                ),
+                None,
+                "{name}: the ladder tolerates this state, so the sub-probe must not contradict it"
+            );
+        }
+
+        // THE PAIRED POSITIVE, so the two assertions above cannot be satisfied by a probe that
+        // simply answers `unknown` for every zero-total pool. A REAL empty pool — complete, and the
+        // enumeration did return runners — is a measurement, and its true `0` still reaches the
+        // blocking arm with its evidence intact.
+        let really_empty =
+            RunnerPoolReading { online_idle: 0, online_busy: 0, complete: true, saw_runners: true };
+        assert_eq!(
+            ci_queue_sub_verdict(Some(really_empty), Some(43)),
+            "backlog",
+            "a genuinely empty pool under a real backlog is evidence, not a degraded read"
+        );
+    }
+
+    /// EVERY arm of the reviewer's sub-verdict must agree with the arm of `classify_knightwatch`
+    /// that produced the state — including the horizon arm, which is the one that would otherwise
+    /// shout on every busy repo (an empty read that could not reach back as far as the claim).
+    #[test]
+    fn the_reviewer_sub_verdict_never_contradicts_its_own_fold() {
+        let horizon_full_short =
+            crate::probe_outcome::ReadHorizon { truncated: true, oldest_seen_secs: Some(15 * 3600) };
+        let horizon_complete =
+            crate::probe_outcome::ReadHorizon { truncated: false, oldest_seen_secs: Some(60) };
+        let cases = [
+            // fresh review, PRs waiting → Healthy / ok
+            KnightwatchLiveness {
+                last_review_age_secs: Some(3600),
+                horizon: horizon_complete,
+                has_open_prs: Some(true),
+            },
+            // stale review, PRs waiting → Warning / stale
+            KnightwatchLiveness {
+                last_review_age_secs: Some(200_000),
+                horizon: horizon_complete,
+                has_open_prs: Some(true),
+            },
+            // stale review, no PRs → Healthy / ok (idle, not down)
+            KnightwatchLiveness {
+                last_review_age_secs: Some(200_000),
+                horizon: horizon_complete,
+                has_open_prs: Some(false),
+            },
+            // stale review, PR list unreadable → Unknown / unknown
+            KnightwatchLiveness {
+                last_review_age_secs: Some(200_000),
+                horizon: horizon_complete,
+                has_open_prs: None,
+            },
+            // nothing found, and the window did not cover the claim → Unknown / unknown
+            KnightwatchLiveness {
+                last_review_age_secs: None,
+                horizon: horizon_full_short,
+                has_open_prs: Some(true),
+            },
+            // nothing found, window exhaustive, PRs waiting → Warning / stale
+            KnightwatchLiveness {
+                last_review_age_secs: None,
+                horizon: horizon_complete,
+                has_open_prs: Some(true),
+            },
+            // nothing found, window exhaustive, no PRs → Healthy / ok
+            KnightwatchLiveness {
+                last_review_age_secs: None,
+                horizon: horizon_complete,
+                has_open_prs: Some(false),
+            },
+        ];
+        for (i, l) in cases.iter().enumerate() {
+            let (state, detail) = classify_knightwatch(false, "sparkle-reviewer", Some(l));
+            let sub = knightwatch_sub_verdict(false, Some(l));
+            assert_eq!(
+                contradiction(state, &[("liveness", sub)]),
+                None,
+                "reviewer case {i} disagrees with its own fold: state={state:?} sub={sub} — {detail}"
+            );
+        }
+        // The negative control: a `stale` sub-verdict under a Healthy fold IS a contradiction, so
+        // the loop above is not passing because the check is inert.
+        assert!(
+            contradiction(HealthState::Healthy, &[("liveness", "stale")]).is_some(),
+            "the check must still fire when a fold really does lose a disagreement"
+        );
     }
 
     // ── aggregation ─────────────────────────────────────────────────────────────────────────────
@@ -4618,10 +5084,14 @@ mod tests {
             name: "Release publication".into(),
             state: HealthState::Blocking,
             detail: "v0.120.0 built but NOT published".into(),
+            readings: vec!["published_releases=2".into(), "tag_list_complete=true".into()],
         };
         let json = serde_json::to_string(&comp).unwrap();
         assert!(json.contains(r#""id":"release_publication""#), "{json}");
         assert!(json.contains(r#""state":"blocking""#), "{json}");
+        // The readings ride on the wire beside the verdict (bead `sparkle-7m0f2x`) — a panel that
+        // shows a state without the numbers behind it is the surface this change exists to end.
+        assert!(json.contains(r#""readings":["published_releases=2""#), "{json}");
     }
 
     // ── the orphan baseline ───────────────────────────────────────────────────────────────────────

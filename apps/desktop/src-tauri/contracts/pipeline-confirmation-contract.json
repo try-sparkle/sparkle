@@ -1,0 +1,257 @@
+{
+  "$comment": [
+    "THE ONE CONTRACT for the two rules added by beads sparkle-imfgv5 and sparkle-7m0f2x, parsed by",
+    "BOTH language halves' test suites so they fail TOGETHER or not at all.",
+    "",
+    "WHY A SHARED FILE RATHER THAN TWO TABLES. scripts/lib/pipeline-health.sh and",
+    "apps/desktop/src-tauri/src/pipeline_health.rs are documented mirrors, and this repo has been",
+    "burned twice by them drifting: sparkle-vlnf7c (a shell `grep -q 'ok'` substring test greened",
+    "`BROKEN` while the Rust twin was already correct) and sparkle-negds0 (a pinning test covered the",
+    "classifier THRESHOLDS but not the READ that feeds them). AGENTS.md's remedy for exactly this",
+    "shape is 'share ONE fixture both suites parse, so they fail together' — the pattern",
+    "false-absence-corpus.json already uses. This is that fixture.",
+    "",
+    "The cases below are driven through the REAL entry points on both sides: the Rust tests call",
+    "`probe_outcome::hysteresis_step` / `pipeline_health::contradiction`, and the shell test calls",
+    "`ph_hysteresis_step` / `ph_contradiction` from scripts/lib/pipeline-health.sh. Neither side may",
+    "re-encode a case inline; a case added here must be picked up by both."
+  ],
+
+  "hysteresis": {
+    "$comment": [
+      "sparkle-imfgv5 — a TRANSIENT, SELF-HEALING dip must not become a standing P1.",
+      "",
+      "MEASURED: one pipeline-health bead accumulated 159 recurrence comments and was dispatched to a",
+      "top-priority agent as a fleet-blocking emergency while CI had been reaching green conclusions",
+      "throughout. The scan filed on the FIRST non-green reading and consulted no prior-pass state at",
+      "all, so a runner pool mid-replacement (MIG isStable=False, size 4/6) — a condition that heals",
+      "itself in minutes — was indistinguishable from a dead pool.",
+      "",
+      "The policy has four knobs and each one closes a different half of that:",
+      "  passes         CONFIRM-TWICE. A single non-green reading is a blip until a SECOND consecutive",
+      "                 pass agrees. This is the knob the bead is about.",
+      "  minSecs        the sustained-window alternative, for a caller whose passes are irregular. 0",
+      "                 DISABLES it (never 'always true' — a 0 threshold that compared >= would file",
+      "                 on the first reading, which is the defect).",
+      "  cooldownSecs   the RECURRENCE cap the bead's second sentence asks for. Once filed, a still-red",
+      "                 component is re-enriched at most this often, so an hourly scan cannot write 24",
+      "                 comments a day onto one card.",
+      "  maxRecurrences a hard ceiling per unhealthy streak, so even a cooldown cannot accumulate",
+      "                 unboundedly. 0 disables it.",
+      "",
+      "RECURRENCE NEVER WRITES PRIORITY. AGENTS.md records that explicitly (the ladder was retired by",
+      "sparkle-mzgqt); this policy governs WHETHER the store is touched, never at what priority."
+    ],
+    "policy": {
+      "passes": 2,
+      "minSecs": 0,
+      "cooldownSecs": 21600,
+      "maxRecurrences": 12
+    },
+    "actions": {
+      "none": "green, and no streak was running — nothing to say and nothing to write",
+      "clear": "green after a streak — the streak, the filing count and the cooldown all RESET, so a later dip must re-confirm from scratch",
+      "hold": "non-green but UNCONFIRMED — the reading is still reported, the store is not touched",
+      "file": "non-green and confirmed — create or enrich exactly one bead now",
+      "suppress": "non-green and confirmed, but inside the cooldown or at the recurrence ceiling — the store is not touched"
+    },
+    "cases": [
+      {
+        "id": "blip-then-green-files-nothing",
+        "why": "THE case sparkle-imfgv5 is about: one unhealthy pass, then green. Nothing may be filed and nothing may escalate.",
+        "observations": [
+          { "green": false, "atSecs": 0 },
+          { "green": true, "atSecs": 3600 }
+        ],
+        "expect": ["hold", "clear"]
+      },
+      {
+        "id": "two-consecutive-file-exactly-once",
+        "why": "N consecutive unhealthy passes file ONCE, not N times — the third pass is inside the cooldown.",
+        "observations": [
+          { "green": false, "atSecs": 0 },
+          { "green": false, "atSecs": 3600 },
+          { "green": false, "atSecs": 7200 }
+        ],
+        "expect": ["hold", "file", "suppress"]
+      },
+      {
+        "id": "sustained-then-recovery-clears",
+        "why": "A sustained outage files, then recovery CLEARS — and the next single dip is a blip again, not an instant re-file.",
+        "observations": [
+          { "green": false, "atSecs": 0 },
+          { "green": false, "atSecs": 3600 },
+          { "green": true, "atSecs": 7200 },
+          { "green": false, "atSecs": 10800 }
+        ],
+        "expect": ["hold", "file", "clear", "hold"]
+      },
+      {
+        "id": "cooldown-expiry-re-enriches",
+        "why": "A component that stays red past the cooldown IS enriched again — the cap must not mute a real standing outage forever.",
+        "observations": [
+          { "green": false, "atSecs": 0 },
+          { "green": false, "atSecs": 3600 },
+          { "green": false, "atSecs": 7200 },
+          { "green": false, "atSecs": 25200 }
+        ],
+        "expect": ["hold", "file", "suppress", "file"]
+      },
+      {
+        "id": "flap-never-confirms",
+        "why": "The measured shape: red/green/red/green. Alternating passes never reach two in a row, so the store is never touched at all.",
+        "observations": [
+          { "green": false, "atSecs": 0 },
+          { "green": true, "atSecs": 3600 },
+          { "green": false, "atSecs": 7200 },
+          { "green": true, "atSecs": 10800 },
+          { "green": false, "atSecs": 14400 }
+        ],
+        "expect": ["hold", "clear", "hold", "clear", "hold"]
+      },
+      {
+        "id": "green-from-rest-says-nothing",
+        "why": "A healthy component with no history writes nothing and says nothing — the scan must not narrate every green pass.",
+        "observations": [{ "green": true, "atSecs": 0 }],
+        "expect": ["none"]
+      },
+      {
+        "id": "sustained-window-confirms-without-a-second-pass",
+        "why": "minSecs is the alternative trigger for an irregular cadence: one long-running observation confirms on TIME rather than on pass count. Only reachable when minSecs > 0.",
+        "policy": { "passes": 5, "minSecs": 1800, "cooldownSecs": 21600, "maxRecurrences": 12 },
+        "observations": [
+          { "green": false, "atSecs": 0 },
+          { "green": false, "atSecs": 3600 }
+        ],
+        "expect": ["hold", "file"]
+      },
+      {
+        "id": "recurrence-ceiling-stops-the-comment-pile",
+        "why": "159 comments on one bead is the measured harm. With maxRecurrences=2 and no cooldown, the third confirmed pass stops writing.",
+        "policy": { "passes": 1, "minSecs": 0, "cooldownSecs": 0, "maxRecurrences": 2 },
+        "observations": [
+          { "green": false, "atSecs": 0 },
+          { "green": false, "atSecs": 60 },
+          { "green": false, "atSecs": 120 }
+        ],
+        "expect": ["file", "file", "suppress"]
+      },
+      {
+        "id": "passes-1-is-the-legacy-file-on-first-sight",
+        "why": "passes=1 reproduces the pre-hysteresis behaviour exactly, which is what the scan's pre-existing filing-mechanics tests pin.",
+        "policy": { "passes": 1, "minSecs": 0, "cooldownSecs": 0, "maxRecurrences": 0 },
+        "observations": [
+          { "green": false, "atSecs": 0 },
+          { "green": false, "atSecs": 60 }
+        ],
+        "expect": ["file", "file"]
+      }
+    ]
+  },
+
+  "contradiction": {
+    "$comment": [
+      "sparkle-7m0f2x — a component read GREEN while a probe ONE LAYER DOWN held the contradicting",
+      "number, and there was no cheap way to see the disagreement: the scan printed a verdict per",
+      "component and never the READINGS behind it, so confirming a suspect green meant re-deriving",
+      "every probe by hand. That is why sparkle-imfgv5 went unchallenged for 159 passes.",
+      "",
+      "The rule is a RANK COMPARISON, not a second ladder: every sub-probe already returns a verdict",
+      "token, and the component's fold picks one state. When the WORST sub-verdict outranks the state",
+      "published above it, the fold LOST a disagreement and the scan must say so loudly.",
+      "",
+      "IT MUST NOT RE-LITIGATE A DELIBERATE THRESHOLD. Each sub-verdict is computed with the SAME",
+      "thresholds the fold uses, so a state the ladder deliberately tolerates (a fully-busy CI pool",
+      "with a drained queue, sparkle-ot4dxb; a stale reviewer with no open PRs) yields `ok` and cannot",
+      "fire this. What fires it is a rank the fold could not carry — measured today in exactly one",
+      "arm: roborev's enqueue reading is UNREADABLE (component -> unknown, rank 1) while the",
+      "completion probe one layer down reads FAILING (rank 2), so the panel shows amber 'could not",
+      "tell' over a measured majority-failure rate."
+    ],
+    "stateRanks": { "healthy": 0, "unknown": 1, "warning": 2, "blocking": 3 },
+    "subVerdictRanks": {
+      "not_taken": 0,
+      "ok": 0,
+      "unknown": 1,
+      "backlog": 2,
+      "severed": 2,
+      "failing": 2,
+      "stale": 2,
+      "dead": 3
+    },
+    "cases": [
+      {
+        "id": "unknown-over-failing-completion",
+        "why": "The live one: an unreadable enqueue reading folds to `unknown` while the completion probe holds a majority-failure rate.",
+        "state": "unknown",
+        "subs": [["enqueue", "unknown"], ["completion", "failing"]],
+        "contradicts": true,
+        "mentions": ["completion", "failing"]
+      },
+      {
+        "id": "healthy-over-a-severed-intake",
+        "why": "The tripwire this exists to be: any future ladder edit that greens a component whose intake probe says severed.",
+        "state": "healthy",
+        "subs": [["enqueue", "severed"]],
+        "contradicts": true,
+        "mentions": ["enqueue", "severed"]
+      },
+      {
+        "id": "healthy-over-a-queue-backlog",
+        "why": "The measured CI false-RECOVERED shape (sparkle-1xg2f6), as a rank: green published over a backlog the queue probe saw.",
+        "state": "healthy",
+        "subs": [["queue", "backlog"]],
+        "contradicts": true,
+        "mentions": ["queue", "backlog"]
+      },
+      {
+        "id": "healthy-over-an-unreadable-subprobe",
+        "why": "`unknown` outranks `healthy`: a green published over a probe that could not look is still a lost disagreement.",
+        "state": "healthy",
+        "subs": [["completion", "unknown"]],
+        "contradicts": true,
+        "mentions": ["completion", "unknown"]
+      },
+      {
+        "id": "warning-carries-its-own-severed-intake",
+        "why": "The fold DID carry the disagreement — same rank, no contradiction. Without this the check would fire on every honest warning.",
+        "state": "warning",
+        "subs": [["enqueue", "severed"], ["completion", "ok"]],
+        "contradicts": false,
+        "mentions": []
+      },
+      {
+        "id": "blocking-outranks-everything-below-it",
+        "why": "A blocking component already says the worst thing there is to say.",
+        "state": "blocking",
+        "subs": [["queue", "backlog"], ["enqueue", "unknown"]],
+        "contradicts": false,
+        "mentions": []
+      },
+      {
+        "id": "healthy-with-every-subprobe-ok",
+        "why": "The ordinary green pass. This is the case that must stay silent, or the loud line becomes noise and gets ignored.",
+        "state": "healthy",
+        "subs": [["enqueue", "ok"], ["completion", "ok"]],
+        "contradicts": false,
+        "mentions": []
+      },
+      {
+        "id": "healthy-with-no-subprobe-taken",
+        "why": "`not_taken` is NOT a reading — a caller that never asked must not be reported as a disagreement.",
+        "state": "healthy",
+        "subs": [["enqueue", "not_taken"], ["completion", "not_taken"]],
+        "contradicts": false,
+        "mentions": []
+      },
+      {
+        "id": "not-applicable-is-excluded",
+        "why": "A component that is deliberately off has no verdict to contradict; the fold excludes it, and so does this.",
+        "state": "not_applicable",
+        "subs": [["enqueue", "severed"]],
+        "contradicts": false,
+        "mentions": []
+      }
+    ]
+  }
+}

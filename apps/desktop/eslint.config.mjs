@@ -41,6 +41,19 @@ export default [
       // add any warning anywhere in the package went red and wore a failure it did not cause. The
       // backlog was burned 12 → 4 and the cap re-cut at 6. When you burn more down, LOWER the cap
       // to keep ~2 of slack; never RAISE it to absorb new drift, which is what makes it meaningless.
+      //
+      // AND THE CAP IS ONE SHARED GLOBAL BUDGET, SO OVER-CAP SAYS NOTHING ABOUT WHOSE DRIFT IT IS
+      // (bead sparkle-r3jtp). ESLint over the cap reports the COUNT, never which warning is new, so
+      // a branch that adds one warning reds on a rule unrelated to its change — and both obvious
+      // ways out are wrong: raising the cap retires the ratchet, and "fixing" a pre-existing warning
+      // to buy headroom buries an unrelated repair inside a feature branch. Do neither. Ask instead:
+      //
+      //     pnpm --filter @sparkle/desktop lint:mine      (scripts/lint-warning-attribution.sh)
+      //
+      // It lints the working tree and the merge base the same way and names, with file:line and
+      // rule, only the findings THIS branch introduced — 11 means the red is inherited and is not
+      // yours to fix here. The desktop lint script prints that pointer whenever it fails, so the
+      // answer reaches CI logs too.
       "react-hooks/exhaustive-deps": "warn",
     },
   },

@@ -158,10 +158,19 @@ export type Lane = 'subscription' | 'openrouter';
  * different and are owed by different people: 'credit' is paid, 'auth' is re-issued,
  * 'unreachable' is waited out or escalated.
  *
+ * 'request-rejected' is the fourth, and it is the one this gate died of (beads
+ * `sparkle-dy8mu0`, `sparkle-fegwof`): the API answered, immediately, to say OUR REQUEST is
+ * invalid — a sampling parameter the current model generation rejects with a flat 400. That
+ * is neither infrastructure nor a finding about the diff; it is the gate itself being wrong,
+ * and its remedy is owed by whoever maintains the gate. Keeping it inside 'unreachable' is
+ * what told three separate investigations to go inspect a healthy endpoint, and what made
+ * "re-run once judging is reachable" — a dead instruction, since every re-run reproduces it
+ * exactly — the advice on every surface.
+ *
  * 'none' means a verdict exists, so no cause applies. It is a member rather than `null` so
  * the field is always present on the wire and a reader never has to tell absent from unknown.
  */
-export type NoVerdictCause = 'none' | 'credit' | 'auth' | 'unreachable';
+export type NoVerdictCause = 'none' | 'credit' | 'auth' | 'request-rejected' | 'unreachable';
 
 export interface HumaneVerdict {
   /** False when the change touched no human-affecting surface. Then nothing else applies. */
@@ -187,6 +196,18 @@ export interface HumaneVerdict {
    * they go and perform.
    */
   noVerdictCause: NoVerdictCause;
+  /**
+   * The PROVIDER'S OWN sentence about the first failure — one line, redacted and bounded —
+   * or null when a verdict exists.
+   *
+   * NEVER DISCARD THE ERROR BODY (bead `sparkle-dy8mu0`). The body was already quoted into
+   * the CI log, and that was still not enough: the log is not what a reviewer reads. A
+   * check-run summary saying "no model was reachable" while the API had been saying
+   * "temperature: Extra inputs are not permitted" on every call is how a one-line diagnosis
+   * became three investigations. This field is that sentence, carried to the surfaces a human
+   * actually looks at, so the NEXT parameter incompatibility is readable rather than bisected.
+   */
+  noVerdictDetail: string | null;
 }
 
 /** The rubric's own 'Acceptable' tier boundary — not a number we invented. */

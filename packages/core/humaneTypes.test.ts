@@ -43,6 +43,7 @@ function verdict(over: Partial<HumaneVerdict> = {}): HumaneVerdict {
     scored: true,
     humaneScore: aggregateScore(principles),
     noVerdictCause: 'none' as const,
+    noVerdictDetail: null,
     principles,
     detectors: [],
     citations: [],

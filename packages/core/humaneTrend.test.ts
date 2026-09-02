@@ -66,6 +66,7 @@ function verdict(principles: PrincipleAssessment[], over: Partial<HumaneVerdict>
     scored: true,
     humaneScore: aggregateScore(principles),
     noVerdictCause: 'none' as const,
+    noVerdictDetail: null,
     principles,
     detectors: [],
     citations: [],

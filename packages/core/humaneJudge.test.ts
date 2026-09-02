@@ -357,3 +357,103 @@ describe('CANNOT-PAY is not CANNOT-REACH — an unpaid bill must not read as an 
     expect(headline(verdict)).not.toMatch(/credit|billing|quota|key/i);
   });
 });
+
+describe('A REJECTED REQUEST is not an unreachable model — the gate\'s own bug must not read as an outage', () => {
+  // Beads sparkle-dy8mu0 (cause) and sparkle-fegwof (consequence). The gate sent a sampling
+  // parameter the current model generation rejects with a flat 400. Every judge call failed,
+  // every failure was folded into 'unreachable', and every surface therefore told the reader
+  // "no model was reachable" and "re-run the gate once judging is reachable". Both sentences
+  // are FALSE for a 400: the endpoint answered, it answered instantly, and it will answer
+  // exactly the same way on every re-run forever. Three separate investigations chased the
+  // model id because the one sentence that named the offending field — the API's own — was
+  // classified away and never reached a human-readable surface.
+  const REJECTED =
+    'HTTP 400 Bad Request — {"type":"error","error":{"type":"invalid_request_error","message":"temperature: Extra inputs are not permitted"}}';
+  const UNKNOWN_MODEL =
+    'HTTP 404 Not Found — {"type":"error","error":{"type":"not_found_error","message":"model: claude-sonnet-4-5-20250929"}}';
+  const CREDIT_400 =
+    'HTTP 400 Bad Request — {"type":"error","error":{"type":"invalid_request_error","message":"Your credit balance is too low to access the Anthropic API."}}';
+  const DEAD = 'fetch failed: connect ECONNREFUSED 127.0.0.1:443';
+
+  function noVerdict(error: string) {
+    return summarizeJudgements([silent('j1', error), silent('j2', error), silent('j3', error)], OPTS)
+      .verdict;
+  }
+
+  it('classifies a 400 rejecting a request field as the gate being wrong, not the model being gone', () => {
+    expect(noVerdict(REJECTED).noVerdictCause).toBe('request-rejected');
+  });
+
+  it('carries the API\'s own sentence — including the field it named — onto the verdict', () => {
+    // THE WHOLE POINT of sparkle-dy8mu0. The body was already quoted to the CI log; what no
+    // human-readable surface ever received was the field name. A verdict that drops it makes
+    // the next parameter incompatibility cost another three investigations.
+    const detail = noVerdict(REJECTED).noVerdictDetail;
+    expect(detail).toContain('temperature');
+    expect(detail).toContain('Extra inputs are not permitted');
+  });
+
+  it('never tells the reader the model was unreachable, and never tells them to re-run', () => {
+    // A remedy message is an instruction the reader will follow (AGENTS.md). "Re-run once
+    // judging is reachable" is a dead instruction here: every re-run reproduces this exactly.
+    const line = headline(noVerdict(REJECTED));
+    expect(line).not.toMatch(/unreachable|could not reach|not reachable/i);
+    expect(line).toMatch(/rejected/i);
+    expect(line).toMatch(/temperature/);
+  });
+
+  it('classifies an unknown model id the same way — it is still our request that is wrong', () => {
+    expect(noVerdict(UNKNOWN_MODEL).noVerdictCause).toBe('request-rejected');
+    expect(headline(noVerdict(UNKNOWN_MODEL))).toMatch(/rejected/i);
+  });
+
+  it('still calls a credit-worded 400 a BILLING state — status alone must not decide', () => {
+    // The paired negative that keeps the new class narrow. A provider reports an exhausted
+    // balance with a 400 `invalid_request_error` too, and paying is the remedy there, not
+    // editing the request. Classifying on the status code alone would misroute it.
+    expect(noVerdict(CREDIT_400).noVerdictCause).toBe('credit');
+    expect(headline(noVerdict(CREDIT_400))).toMatch(/credit|billing/i);
+  });
+
+  it('still calls a real transport failure UNREACHABLE — infra is a different story again', () => {
+    const v = noVerdict(DEAD);
+    expect(v.noVerdictCause).toBe('unreachable');
+    expect(headline(v)).not.toMatch(/rejected/i);
+  });
+
+  it('is still NOT A PASS and still does not block — a broken gate never red-lights a diff', () => {
+    // sparkle-fegwof: the infra/gate half must never render as "your copy failed the bar".
+    for (const err of [REJECTED, UNKNOWN_MODEL]) {
+      const v = noVerdict(err);
+      expect(v.scored).toBe(true);
+      expect(v.humaneScore).toBeNull();
+      expect(headline(v)).toContain('not a pass');
+      expect(verdictBlocks(v).blocked).toBe(false);
+    }
+  });
+
+  it('reports no detail at all once a real verdict exists', () => {
+    const { verdict } = summarizeJudgements(
+      [answered('j1', allPrinciples(1)), answered('j2', allPrinciples(1))],
+      OPTS,
+    );
+    expect(verdict.noVerdictDetail).toBeNull();
+  });
+
+  it('redacts anything shaped like an API key before it travels', () => {
+    // The detail is quoted onto a PUBLIC pull request comment. A provider that echoes part of
+    // the offending request would otherwise publish it.
+    const v = noVerdict('HTTP 400 — {"message":"invalid x-api-key sk-ant-api03-AAAAAAAAAAAAAAAAAAAA"}');
+    expect(v.noVerdictDetail).not.toContain('sk-ant-api03-AAAAAAAAAAAAAAAAAAAA');
+    expect(v.noVerdictDetail).toContain('[redacted]');
+  });
+
+  it('collapses the detail to ONE readable line and bounds its length', () => {
+    // It lands in a check-run title's neighbourhood and in a CI log line; a 60KB HTML error
+    // page from a proxy must not become the summary.
+    const v = noVerdict(`HTTP 502 Bad Gateway — ${'x'.repeat(5000)}\n\n${'y'.repeat(5000)}`);
+    expect(v.noVerdictDetail).not.toBeNull();
+    expect((v.noVerdictDetail ?? '').length).toBeLessThanOrEqual(320);
+    expect(v.noVerdictDetail).not.toContain('\n');
+  });
+});

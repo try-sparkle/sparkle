@@ -153,6 +153,7 @@ export function notScoredVerdict(opts: JudgeOptions): HumaneVerdict {
     lane: opts.lane,
     // Nothing failed here — the gate looked and found no human-facing surface.
     noVerdictCause: 'none',
+    noVerdictDetail: null,
   };
 }
 
@@ -190,7 +191,45 @@ export function classifyNoVerdictCause(
   if (/\bHTTP 40[13]\b|authentication[ _-]?error|permission[ _-]?error|invalid[ _-]?(?:x-)?api[ _-]?key|unauthorized|not authenticated/i.test(text)) {
     return 'auth';
   }
+  // THE REQUEST ITSELF WAS REFUSED — the gate is wrong, not the infrastructure. Beads
+  // `sparkle-dy8mu0` / `sparkle-fegwof`: a 400 `invalid_request_error` naming a rejected field
+  // is an answer, delivered instantly by a healthy endpoint, and it will be delivered again on
+  // every re-run until somebody edits the request. It ranks BELOW credit and auth on purpose:
+  // a provider reports an exhausted balance with a 400 `invalid_request_error` as well, and
+  // there the remedy is a payment, so the status code alone must never decide.
+  if (/\bHTTP 4(?:00|04|22)\b|invalid[ _-]?request[ _-]?error|not[ _-]?found[ _-]?error|are not permitted|unexpected keyword argument|unrecognized[ _-]request[ _-]argument/i.test(text)) {
+    return 'request-rejected';
+  }
   return 'unreachable';
+}
+
+/** How much of the provider's sentence travels. Long enough to carry a rejected field name
+ * and the clause around it; short enough that it stays one readable line beside a verdict. */
+const NO_VERDICT_DETAIL_CHARS = 300;
+
+/**
+ * The provider's own sentence about the first failure, made safe to publish.
+ *
+ * Three things happen here and each has a reason. It is COLLAPSED to one line, because it is
+ * rendered inside a check-run summary and a CI log line and a proxy's HTML error page must not
+ * become the summary. It is REDACTED, because it is quoted onto a public pull request comment
+ * and a provider that echoes part of the offending request would otherwise publish a key. It
+ * is TRUNCATED, for the same reason as the collapse.
+ */
+export function noVerdictDetailFrom(
+  failures: readonly { readonly error: string }[],
+): string | null {
+  const first = failures.find((f) => (f.error ?? '').trim().length > 0);
+  if (!first) return null;
+  const oneLine = first.error
+    .replace(/\s+/g, ' ')
+    // Anthropic-shaped keys and bearer tokens. Deliberately broad: a false redaction costs a
+    // reader nothing, and a missed one is published forever on a pull request.
+    .replace(/\b(?:sk-ant|sk|Bearer)[-_A-Za-z0-9]{8,}/g, '[redacted]')
+    .trim();
+  return oneLine.length > NO_VERDICT_DETAIL_CHARS
+    ? `${oneLine.slice(0, NO_VERDICT_DETAIL_CHARS - 1)}…`
+    : oneLine;
 }
 
 /**
@@ -290,6 +329,9 @@ export function summarizeJudgements(
     // Only a run with NO score has a cause to report. A scored verdict that also carried
     // one would put a billing sentence on a pull request the judges evaluated perfectly.
     noVerdictCause: hasQuorum ? 'none' : classifyNoVerdictCause(failures),
+    // The API's own explanation, carried to the surfaces a human reads. Null once a verdict
+    // exists — a scored pull request has no failure to quote.
+    noVerdictDetail: hasQuorum ? null : noVerdictDetailFrom(failures),
   };
 
   return { verdict, unmappedCodes: [...unmapped].sort(), failures };
@@ -323,6 +365,18 @@ export function headline(v: HumaneVerdict): string {
           `Could not evaluate — the judge API key was rejected as invalid or expired, so ` +
           `${counts}. The key needs re-issuing; nothing about the model or this pull ` +
           `request is at fault. This is not a pass.`
+        );
+      case 'request-rejected':
+        // The one cause where the API's OWN SENTENCE is the actionable content, so it is in
+        // the headline rather than a footnote — that sentence names the offending field, and
+        // burying it is precisely what cost this gate its entire working life
+        // (`sparkle-dy8mu0`). Note what this branch must NOT say: not "unreachable", because
+        // the endpoint answered; and not "re-run", because a re-run reproduces it exactly.
+        return (
+          `Could not evaluate — the API REJECTED this gate's own request, so ${counts}. ` +
+          `The endpoint is healthy and re-running will not change this; the request itself ` +
+          `has to be fixed. The API said: ${v.noVerdictDetail ?? 'no detail was captured'}. ` +
+          `This is not a pass, and it is not a finding about this pull request.`
         );
       default:
         return `Could not evaluate — ${counts}. This is not a pass.`;

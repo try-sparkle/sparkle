@@ -548,6 +548,7 @@ describe('principle ids', () => {
       scored: true,
       humaneScore: 1,
       noVerdictCause: 'none' as const,
+      noVerdictDetail: null,
       principles: PRINCIPLE_IDS.map((principle) => ({
         principle,
         applicability: 'not-applicable' as const,
