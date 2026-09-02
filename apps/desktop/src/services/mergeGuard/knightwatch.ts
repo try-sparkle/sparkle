@@ -11,9 +11,11 @@
 //
 // ── WHY THE GATE EXISTS ────────────────────────────────────────────────────────────────────────
 // Over the last 40 merged PRs, 39 carried a knightwatch review and 24 carried at least one
-// `[blocking]` probe (40 probes in total). ALL 24 merged with zero probe-citing reply. GitHub branch
-// protection is unavailable on this plan (403 "Upgrade to GitHub Pro"), so a required status check
-// was never an option — Sparkle owns the merge action, so the gate lives there.
+// `[blocking]` probe (40 probes in total). ALL 24 merged with zero probe-citing reply. The default
+// branch IS protected — by an active ruleset requiring the CI status contexts (the legacy
+// `branches/main/protection` endpoint still 404s) — but no status check can express "the `[blocking]`
+// probe was answered", so that gate is never available server-side. Sparkle owns the merge action,
+// so the gate lives there.
 //
 // ── THE ONE RULE THIS FILE IS WRITTEN AROUND ───────────────────────────────────────────────────
 // A refusal the founder cannot act on is just an obstacle. The Rust message names each probe, its

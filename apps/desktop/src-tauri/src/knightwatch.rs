@@ -3,9 +3,10 @@
 //!
 //! WHY THIS EXISTS: measured over the last 40 merged PRs in this repo, 39 carried a knightwatch
 //! review, 24 carried at least one `[blocking]` probe (40 probes in total), and ALL 24 merged with
-//! zero probe-citing reply. Nothing stopped them. GitHub branch protection is not available on this
-//! plan (`repos/…/branches/main/protection` → 403 "Upgrade to GitHub Pro"), so a required status
-//! check is not an option — but Sparkle owns the merge action, and [`crate::worktree::merge_pr`] is
+//! zero probe-citing reply. Nothing stopped them. The default branch IS protected — by an active
+//! ruleset requiring the CI status contexts (the legacy `repos/…/branches/main/protection` endpoint
+//! still 404s) — but no status check can express "the `[blocking]` probe was answered", so that gate
+//! is not available server-side. Sparkle owns the merge action, and [`crate::worktree::merge_pr`] is
 //! the single sink for all six in-app merge paths (three UI buttons, the concierge tool, the
 //! approval-resume path, and MCP). Gating there covers every one of them at once.
 //!
