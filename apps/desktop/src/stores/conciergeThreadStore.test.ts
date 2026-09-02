@@ -60,8 +60,20 @@ describe("conciergeThreadStore", () => {
 
   it("rehydrates the conversation after a simulated reload", () => {
     setChat([you("1", "how are the agents"), sparkle("2", "all calm")]);
+    const back = persisted();
     // The whole point of the subsystem: a fresh webview reads this back instead of an empty column.
-    expect(persisted()).toEqual([you("1", "how are the agents"), sparkle("2", "all calm")]);
+    // `arrivedAt` is stripped for the comparison because its value is the CLOCK's, not the fixture's
+    // — it is asserted on its own terms immediately below.
+    expect(back.map(({ arrivedAt: _arrivedAt, ...rest }) => rest)).toEqual([
+      you("1", "how are the agents"),
+      sparkle("2", "all calm"),
+    ]);
+    // …AND EVERY TURN COMES BACK WITH THE INSTANT IT ARRIVED (bead sparkle-75fbot). This is the one
+    // test that reads the real localStorage payload rather than calling `persistableThread`
+    // directly, so it is where "the stamp reaches disk" is actually pinned: a thread artifact
+    // derives its position in the transcript from these, and without them a restored thread cannot
+    // say when anything happened.
+    expect(back.map((m) => typeof m.arrivedAt)).toEqual(["number", "number"]);
   });
 
   it("keeps the thread OLDEST FIRST, the order the view model renders", () => {

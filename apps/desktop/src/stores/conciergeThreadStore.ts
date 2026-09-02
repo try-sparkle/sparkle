@@ -374,6 +374,14 @@ export function boundCollapsedPayloads(chat: ConciergeMessage[]): ConciergeMessa
  * ordering guarantee is pinned in one place: the result stays OLDEST-FIRST, matching
  * `ConciergeViewModel.messages`. (promptHistoryStore is newest-first because it is a lookup table;
  * this is a transcript, and reversing it would render the conversation backwards.)
+ *
+ * `arrivedAt` SURVIVES, and that is the whole reason it exists rather than an incidental property of
+ * the spreads above (bead sparkle-75fbot). A thread artifact's position is derived from it, so a
+ * stamp dropped here would leave the restored transcript unable to say when anything happened and
+ * the artifact back to guessing — the exact gap the field closes. It costs ~13 bytes a message
+ * against caps measured in thousands, so no budget here has to account for it. Asserted in
+ * `conciergeThreadStore.arrivals.test.ts`, because "it survives" is the kind of guarantee a future
+ * field-by-field rebuild breaks silently.
  */
 export function persistableThread(chat: ConciergeMessage[]): ConciergeMessage[] {
   const conversation = chat.filter(isConversation).map(clip).map(stripDataUrls).map(boundLintMarks);
@@ -495,6 +503,11 @@ export function endStreamsThrough(
  * {@link persistableThread}) keep their quote and lose only the jump; see `remapAnchors`.
  */
 export function rehydrateThread(chat: ConciergeMessage[]): ConciergeMessage[] {
+  // `arrivedAt` IS DELIBERATELY NOT REWRITTEN, unlike every id here. Ids are reindexed because they
+  // collide with the ones a fresh session mints; an arrival instant collides with nothing and is the
+  // one fact about a restored message that is still true — restamping it would date last week's
+  // conversation from this launch. A message restored WITHOUT one (persisted by a build that
+  // predates the field) stays without one, and readers fall back; see `ConciergeMessageArrival`.
   // Built over the SAME positional rule the map below applies, in a first pass, because an anchor may
   // point backwards or forwards and a single pass would only ever have half the map.
   const idMap = new Map(chat.map((m, i) => [m.id, `${RESTORED_ID_PREFIX}${i}`]));
@@ -541,6 +554,63 @@ export function rehydrateThread(chat: ConciergeMessage[]): ConciergeMessage[] {
   });
 }
 
+/**
+ * Stamp `arrivedAt` on every message the thread has not seen before (bead sparkle-75fbot).
+ *
+ * ══ WHY HERE AND NOT AT THE DOZEN CONSTRUCTION SITES ════════════════════════════════════════════
+ * `ConciergeHost` builds these objects in about a dozen places — a send, a streamed brain reply, a
+ * receipt, five distinct failure paths, a recap, a peer row — and every one of them ends up here,
+ * for the same reason {@link boundLiveThumbnails} is applied here: this store is the one place all
+ * the writes converge. A field stamped at the call sites is a field the NEXT call site forgets, and
+ * a message with no stamp is invisible rather than loud — precisely the write-only/half-written
+ * field shape this epic keeps finding. Stamped at the seam, a kind added tomorrow gets it for free.
+ *
+ * ══ FOUR CASES, AND EACH ONE MATTERS ════════════════════════════════════════════════════════════
+ *  1. Already stamped → untouched. A message keeps the instant it ARRIVED, not the instant of the
+ *     last write that happened to include it; the array is rewritten on every keystroke-driven
+ *     append and on every streamed delta.
+ *  2. Unstamped, but an earlier copy under this id had a stamp → the old stamp is CARRIED FORWARD.
+ *     Call sites rebuild messages by spread and so preserve it, but a site that rebuilds one field
+ *     by field would silently drop it, and re-stamping it `now` would be a lie rather than a gap.
+ *  3. Unstamped, and this id is already in the thread with no stamp → LEFT UNSTAMPED. This is the
+ *     restored-from-an-older-build population (`merge` bypasses this function entirely, so those
+ *     messages reach the store unstamped and stay that way). Stamping them on the next send would
+ *     date a conversation from last week as having arrived this second, which is worse than the gap
+ *     — readers treat an absent stamp as "older than everything stamped", which is true of exactly
+ *     this population. See `ConciergeMessageArrival`.
+ *  4. Unstamped and new → stamped `now`. The ordinary path.
+ *
+ * Returns the INPUT ARRAY UNCHANGED when nothing needed stamping, for the reason
+ * {@link boundLiveThumbnails} states: bubbles are memoized on identity, so rebuilding an untouched
+ * message would re-render it.
+ */
+export function stampArrivals(
+  prev: ConciergeMessage[],
+  next: ConciergeMessage[],
+  now: number = Date.now(),
+): ConciergeMessage[] {
+  // Built over `prev`, so "has this thread seen this id before" and "what did it say the arrival
+  // was" are one lookup. A message present with no stamp records `undefined` deliberately: the map
+  // distinguishes case 3 from case 4, which `Map.get` alone cannot.
+  const seen = new Map<string, number | undefined>();
+  for (const m of prev) seen.set(m.id, m.arrivedAt);
+  let out: ConciergeMessage[] | null = null;
+  for (let i = 0; i < next.length; i++) {
+    const m = next[i]!;
+    if (m.arrivedAt !== undefined) continue;
+    if (seen.has(m.id)) {
+      const carried = seen.get(m.id);
+      if (carried === undefined) continue;
+      out ??= next.slice();
+      out[i] = { ...m, arrivedAt: carried };
+      continue;
+    }
+    out ??= next.slice();
+    out[i] = { ...m, arrivedAt: now };
+  }
+  return out ?? next;
+}
+
 interface ConciergeThreadState {
   /** The thread, OLDEST FIRST — the same order `ConciergeViewModel.messages` wants. */
   chat: ConciergeMessage[];
@@ -559,9 +629,13 @@ export const useConciergeThreadStore = create<ConciergeThreadState>()(
       // one place all of them converge — the host's append, the receipt rewrite, a seeded test —
       // so bounding here is what makes the guarantee hold rather than depending on each call site.
       setChat: (next) =>
-        set((s) => ({
-          chat: boundLiveThumbnails(typeof next === "function" ? next(s.chat) : next),
-        })),
+        set((s) => {
+          const resolved = typeof next === "function" ? next(s.chat) : next;
+          // ARRIVAL IS STAMPED AGAINST THE PREVIOUS THREAD, so "new to this thread" is decided by
+          // what the store held rather than by anything the call site remembered to pass. See
+          // {@link stampArrivals}.
+          return { chat: boundLiveThumbnails(stampArrivals(s.chat, resolved)) };
+        }),
       clearChat: () => set({ chat: [] }),
     }),
     {

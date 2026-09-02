@@ -612,7 +612,54 @@ export interface ConciergeFailureMessage {
   canReauth?: boolean;
 }
 
-export type ConciergeMessage =
+/**
+ * WHEN THIS MESSAGE ARRIVED, in epoch ms — carried on EVERY member of {@link ConciergeMessage}
+ * (bead sparkle-75fbot).
+ *
+ * ══ WHY THE TRANSCRIPT NEEDS A CLOCK AT ALL ═════════════════════════════════════════════════════
+ * The list is ordered by arrival and always was, but the order was the ONLY record of it: a
+ * position in an array, and nothing a non-message could compare itself against. So a THREAD
+ * ARTIFACT — something drawn between two bubbles that is not itself a bubble, today the live
+ * preview card (`PreviewThreadArtifacts`) — could not be interleaved by time. It had to reconstruct
+ * its place by remembering which message was newest the first time it rendered, in a ref, which is
+ * gone the moment the component unmounts: mount a build agent (the concierge transcript is swapped
+ * out entirely, see `PreviewCards`' docstring) and come back, or restore the thread from disk, and
+ * the card silently re-anchors to the bottom of the conversation — the pinned-above-the-composer
+ * position the founder asked twice to be rid of, wearing a different hat.
+ *
+ * With a stamp the anchor is DERIVED — "the newest anchorable message that arrived at or before the
+ * preview surfaced" — so any render, in any session, computes the same answer from the same data.
+ *
+ * ══ AN INTERSECTION ON THE UNION, NOT A BASE INTERFACE ══════════════════════════════════════════
+ * Two of the eight members are declared in `services/` — `ConciergeRecapMessage` and
+ * `ConciergePeerMessage` — and those modules are deliberately pure and React-free and do not import
+ * this one (this module imports THEM). A base interface here could only reach the six declared in
+ * this file, so the field would be present on some members and absent on others, which is exactly
+ * the drift a shared stamp exists to prevent. Applied once at the union it reaches all eight, and
+ * any member added later inherits it without anyone remembering this paragraph.
+ *
+ * ══ OPTIONAL, AND ABSENT IS A REAL STATE WITH A DEFINED MEANING ═════════════════════════════════
+ * A thread persisted by a build that predates this field restores with no stamps at all, and a
+ * hand-built fixture need not carry one. An unstamped message reads as "arrived at an unknown time,
+ * therefore older than anything stamped" — which is true of the only population that has it, the
+ * restored ones, since `persistableThread` keeps the OLDEST at the front. See
+ * `Concierge/threadArtifactAnchor.anchorableIdAt`, where that reading collapses to the pre-existing
+ * behaviour when nothing is stamped.
+ *
+ * ══ WHO WRITES IT ═══════════════════════════════════════════════════════════════════════════════
+ * `conciergeThreadStore.stampArrivals`, on the way into the store — the ONE seam every message
+ * converges on, rather than each of the dozen construction sites in `ConciergeHost` that would each
+ * have to remember. `digest` and `nudge` are the exception and carry no stamp: they never enter the
+ * store's `chat` at all (they are concatenated in at the view model) and they are precisely the
+ * kinds an anchor must never point at, because they are projections that retire.
+ */
+export interface ConciergeMessageArrival {
+  /** Epoch ms when this message first entered the thread. Absent on a message restored from a
+   *  build that predates the field, and on a hand-built fixture. */
+  arrivedAt?: number;
+}
+
+export type ConciergeMessage = (
   | ConciergeUserMessage
   | ConciergeSparkleMessage
   | ConciergeFailureMessage
@@ -620,7 +667,9 @@ export type ConciergeMessage =
   | ConciergeDigestMessage
   | ConciergeRecapMessage
   | ConciergePeerMessage
-  | ConciergeNudge;
+  | ConciergeNudge
+) &
+  ConciergeMessageArrival;
 
 export type ConciergeAttachKind = "screenshot" | "image" | "files";
 

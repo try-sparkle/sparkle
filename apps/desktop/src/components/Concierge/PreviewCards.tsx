@@ -84,6 +84,7 @@ import { AgentPill } from "./AgentPill";
 // knows nothing about previews — it draws whatever artifacts its caller hands it.
 import type { ThreadArtifact } from "./ConciergeThread";
 import type { ConciergeMessage } from "./types";
+import { anchorableIdAt } from "./threadArtifactAnchor";
 // The SAME "time ago" the prompt-history dropdown uses. It takes `nowMs` as an argument rather than
 // reading the clock, which is what lets this card own WHEN the age is recomputed — see
 // `PREVIEW_CARD_AGE_TICK_MS`, because nothing else re-renders a card while a server sits quiet.
@@ -990,31 +991,11 @@ function PreviewCardStrip({ named }: { named: ReturnType<typeof renderablePrevie
 // THE THREAD SURFACE — the primary one since bead sparkle-0xbron. See this file's header.
 // ════════════════════════════════════════════════════════════════════════════════════════════════
 
-/**
- * MESSAGE KINDS THAT ARE PROJECTIONS RATHER THAN CONVERSATION, and therefore cannot hold an anchor.
- *
- * `ConciergeHost` builds `messages` in ARRIVAL order out of chat, digests and resolved cards, so
- * the newest entry is genuinely the newest thing that happened — which is what an anchor wants. But
- * a digest or a nudge is a projection of live fleet state: it RETIRES when the agents behind it
- * stand down, and an anchor pointing at a retired card resolves to nothing, which would send the
- * preview card jumping to the top of the transcript for a reason the reader cannot see.
- *
- * A chat bubble is only ever appended and trimmed from the FRONT, so anchoring to the newest one is
- * stable — and when it does eventually age out of the 200-entry window, "above everything on
- * screen" is the honest position rather than a glitch.
- */
-const VOLATILE_ANCHOR_KINDS = new Set<ConciergeMessage["kind"]>(["nudge", "digest"]);
-
-/** The newest message an artifact may anchor to, or `null` when the thread holds none yet — see
- *  {@link VOLATILE_ANCHOR_KINDS}. A card that arrives into an empty conversation anchors to
- *  nothing, which draws it at the top: correct, because there is nothing for it to be under. */
-function newestAnchorableId(messages: ConciergeMessage[]): string | null {
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const m = messages[i]!;
-    if (!VOLATILE_ANCHOR_KINDS.has(m.kind)) return m.id;
-  }
-  return null;
-}
+// THE ANCHOR RULE ITSELF LIVES IN ./threadArtifactAnchor — a pure module, so it can be exercised
+// without mounting a column (bead sparkle-75fbot). Its header carries both halves of the rule: which
+// kinds may never hold an anchor (`nudge`/`digest` are projections that RETIRE), and how an
+// artifact's own arrival instant is compared against `ConciergeMessage.arrivedAt`. Read it before
+// changing anything here — the invariants below depend on both.
 
 /** One notice, with its own age clock.
  *
@@ -1044,11 +1025,20 @@ function ThreadPreviewNotice({ notice }: { notice: NamedPreviewNoticeModel }) {
  * stores here and hands the column a ready-made array satisfies both: the preview knowledge stays
  * in this file, the thread stays dumb, and the column stays a renderer.
  *
- * ══ THE ANCHOR IS CAPTURED ONCE, ON FIRST SIGHT ════════════════════════════════════════════════
+ * ══ THE ANCHOR IS CAPTURED ONCE, ON FIRST SIGHT — AND IS DERIVED, NOT GUESSED ══════════════════
  * `anchors` records where the conversation was the first time each agent's preview became
  * renderable, and never moves it afterwards — that recorded position IS "its own place in scroll
  * history". Recomputing it per render would glue the card to the bottom of the transcript, which is
  * the fixture the founder asked us to get rid of, wearing a different hat.
+ *
+ * WHAT IS RECORDED IS COMPUTED FROM TIMESTAMPS (bead sparkle-75fbot): {@link anchorableIdAt} asks
+ * which message had already arrived when the preview surfaced, rather than which message happened
+ * to be last when this component first rendered. Those differ whenever anything arrives between the
+ * two — and, more importantly, the first is REPRODUCIBLE and the second is not. The ref is lost on
+ * every unmount, and this component unmounts routinely: mounting a build agent swaps the concierge
+ * transcript out entirely (see this file's header), so coming back used to re-capture the anchor at
+ * the bottom of the conversation and the card visibly moved. Now the same answer is recomputed from
+ * data the messages carry, and the card lands where it happened.
  *
  * A REF MUTATED DURING RENDER, deliberately: the anchor must be known on the SAME render that first
  * draws the card, and an effect runs after paint — so a card would flash at the wrong position for
@@ -1078,18 +1068,29 @@ export function PreviewThreadArtifacts({
   const notices = renderablePreviewNotices(byAgent, projects);
 
   const anchors = useRef(new Map<string, string | null>());
-  const live = new Set<string>();
-  for (const c of named) live.add(c.agentId);
-  for (const n of notices) live.add(n.agentId);
+  // WHEN each live artifact arrived, which is what {@link anchorableIdAt} compares messages against.
+  // A card's is `surfacedAt` — the TRANSITION into a surfacing state, never a last-seen-at (see
+  // `previewStore.PreviewEntry`) — and a notice's is `startedAt`, when its entry first appeared. The
+  // two projections are disjoint by construction (see the docstring below), so the card write below
+  // cannot actually be contending with a notice for an agent; it is ordered second so that if that
+  // ever stops being true the openable surface wins, matching which one the reader would be looking at.
+  const arrivedAt = new Map<string, number>();
+  for (const n of notices) arrivedAt.set(n.agentId, n.startedAt);
+  for (const c of named) arrivedAt.set(c.agentId, c.surfacedAt);
   // FORGOTTEN WITH THE CARD. Retirement is derived (see the file header), so an agent that drops out
   // of both projections drops its anchor too — and a preview that comes back is news again and
   // anchors to wherever the conversation is then.
   for (const agentId of Array.from(anchors.current.keys())) {
-    if (!live.has(agentId)) anchors.current.delete(agentId);
+    if (!arrivedAt.has(agentId)) anchors.current.delete(agentId);
   }
-  const newest = newestAnchorableId(messages);
-  for (const agentId of live) {
-    if (!anchors.current.has(agentId)) anchors.current.set(agentId, newest);
+  // STILL CAPTURED ONCE, ON FIRST SIGHT. The derivation is stable under a growing conversation on its
+  // own — a message that arrives later cannot have arrived before `at` — but only while the messages
+  // carry stamps, and an older restored thread carries none. There the walk degenerates to "the
+  // newest anchorable message", which recomputed every render is precisely the glued-to-the-bottom
+  // behaviour this whole surface exists to avoid. So the ref stays: it is what makes the fallback
+  // safe, and it keeps the write on the SAME render that first draws the card (see the docstring).
+  for (const [agentId, at] of arrivedAt) {
+    if (!anchors.current.has(agentId)) anchors.current.set(agentId, anchorableIdAt(messages, at));
   }
   const anchorFor = (agentId: string) => anchors.current.get(agentId) ?? null;
 
