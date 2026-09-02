@@ -1079,8 +1079,26 @@ export function sendDetail(path: ConciergeSendPath, agentId: string): string {
     // NO EM-DASH IN THIS SENTENCE, deliberately: ` — ` is the receipt line's own separator between
     // verb, reason and agent pills, and a reason containing it leaves the reader unable to see where
     // the reason ends and the agent list begins (same finding). Keep any future wording clear of it.
+    // ── AND IT STOPPED MEANING A PERMISSION DIALOG (bead sparkle-t9ujin) ─────────────────────────
+    // This sentence used to end "Usually that means a permission dialog is waiting. It's the human's
+    // to answer in that agent's own pane" — the correction that landed here first, on measured field
+    // evidence: five agents frozen with this reason, every one a normal Claude Code pane stopped at
+    // `Do you want to proceed?`, not one in an editor or a pager.
+    //
+    // `sparkle-d6a5r` then MOVED that population. `conciergeDispatch` classifies a permission dialog
+    // as `blocked-prompt` now, and its own comment on this branch says what is left: "A pager or
+    // editor holds the alternate buffer with NO menu". So the correction outlived the routing it
+    // described, and this file ended up telling the model that BOTH paths usually mean a permission
+    // dialog — while the `blocked-prompt` arm eight lines down says it correctly. A remedy of
+    // "answer it in that agent's pane" is a dead instruction when nothing is asking.
+    //
+    // THE REMEDY NAMED HERE IS SAFE UNDER THE CONDITION THAT TRIGGERED THE REFUSAL, which is the
+    // `sparkle-8bvh` test AGENTS.md sets for a remedy string. `quit_alternate_screen` is not a way
+    // around this guard: it presses `q` only behind POSITIVE pager evidence, so on the screen this
+    // refusal is actually about it either clears it or refuses `not-a-pager`. It cannot put a
+    // keystroke into a dialog, which is the outcome this whole path exists to prevent.
     case "alternate-screen":
-      return "Not sent: that terminal is in full-screen mode and I couldn't recognise it as Claude Code's own prompt, so typing there could have run as commands. Usually that means a permission dialog is waiting. It's the human's to answer in that agent's own pane; I won't press anything on their behalf.";
+      return "Not sent: that terminal is in full-screen mode and I couldn't recognise it as Claude Code's own prompt, so typing there could have run as commands. What holds the screen there is a pager or an editor, not something waiting on an answer. quit_alternate_screen can clear it and presses q only where it can prove a pager is on screen; otherwise it is the human's to quit in that agent's own pane.";
     // Same shape as the line above and the same reason it offers no rephrasing: the screen is
     // waiting on a specific answer, and free text submitted into it would be answering the wrong
     // question — or, at a credential field, echoing nothing while it did so.

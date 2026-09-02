@@ -3421,6 +3421,19 @@ export function ConciergeHost({
       //
       // The partial-text drop stays UNCONDITIONAL: a push's failed turn leaks the same way a user
       // turn's does, so it is done on both sides of the return.
+      //
+      // ══ AND THIS RETURN IS ALSO WHAT KEEPS A PUSH OFF THE QUEUE SLOT (bead sparkle-huv14) ══════
+      // The drain below is NOT written `if (!isProactiveTurn(e.id))` the way its `done` twin is —
+      // its only guard is that it sits UNDERNEATH this return. `turnFinished` is id-agnostic: it
+      // releases whatever is in `running` and dispatches the next waiter without checking that the
+      // ending turn is the one holding the slot, so a push reaching it dispatches the user's queued
+      // message while their turn is still streaming and `concierge.rs` kills that turn's child.
+      // Hoisting the drain above this line — the exact relocation that produced the `done` defect
+      // (roborev 58503), where moving a call to fix an ordering bug lifted it out of an enclosing
+      // guard — reintroduces it, and leaves every liveness row here green while doing so, because
+      // those pin the typing/bubble/outage effects and all three sit above the drain.
+      // Pinned by "a proactive push failing does not dispatch the queued message" in
+      // ConciergeHost.test.tsx, which is the only row that goes red for that move.
       if (isProactiveTurn(e.id)) {
         delete brainTextRef.current[e.id];
         return;

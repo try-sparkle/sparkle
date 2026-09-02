@@ -2056,6 +2056,64 @@ describe("ConciergeHost", () => {
 
   });
 
+  /**
+   * AND THE SAME FOR A PUSH'S `error` — THE OTHER TERMINAL PATH (bead sparkle-huv14).
+   *
+   * The error handler releases the slot too (`drainQueueRef.current()` below its teardown), and it
+   * is protected by an ENCLOSING early return — `if (isProactiveTurn(e.id)) { …; return; }` — rather
+   * than by a condition on the drain itself. That is the shape the original defect had before it was
+   * fixed: a statement whose guard is its POSITION, not its text, is one relocation away from being
+   * unguarded, and nothing about the moved line says what it was nested inside.
+   *
+   * That return is already pinned by ConciergeHost.liveness.test.tsx — but only for its typing,
+   * failure-bubble and outage effects, every one of which sits ABOVE the drain. Measured: hoisting
+   * the drain above the return leaves all four of those rows green. So this is the assertion that
+   * covers the queue slot, which is the one the bead is about.
+   *
+   * Asserted on `startConciergeTurn` NOT being called again, exactly as its `done` twin above is:
+   * that is the call that dispatches M2 into a slot M1 still holds, and `concierge.rs` then kills
+   * M1's child — the loss the queue exists to prevent, arriving from a turn the user never sent.
+   */
+  it("a proactive push failing does not dispatch the queued message", async () => {
+    _resetConciergeActivityForTests();
+    h.feed = feedWith("approval");
+    render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "M1" } });
+    fireEvent.click(screen.getByText("Send"));
+    await settle();
+    turnStartedWorking();
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "M2" } });
+    fireEvent.click(screen.getByText("Send"));
+    await settle();
+    const before = h.startConciergeTurn.mock.calls.length;
+
+    // A background push FAILS. It owns no slot, so it must release nothing. Its id is LOWER than the
+    // user turns' for the reason its `done` twin gives at length: `proactive_may_start` refuses to
+    // start a push while any turn holds the slot, so a push still in flight when the user sends
+    // necessarily took its token first — and a higher id would advance the retirement floor and get
+    // the mirror assertion below rejected by the supersede gate instead of answered by the guard.
+    //
+    // `boom` is deliberately NOT a supersede sentinel: `isSupersededDetail` returns early for those,
+    // so a sentinel detail would take a gate three branches above the one under test and this row
+    // would pass without the proactive guard existing at all.
+    h.proactiveIds.add("0");
+    act(() => h.brain.error?.({ id: "0", detail: "boom" }));
+    await settle();
+    expect(
+      h.startConciergeTurn.mock.calls.length,
+      "a push's failure released the USER turn's slot and dispatched the queued message",
+    ).toBe(before);
+
+    // ══ AND THE GUARD IS NARROW, NOT A STALL ═════════════════════════════════════════════════════
+    // The mirror failure of an over-broad guard: the slot is never released on the error path at
+    // all, and one quota rejection strands every question queued behind it — the 2026-07-29 burst
+    // the drain-on-failure comment in the handler names. A USER turn's failure must still drain.
+    act(() => h.brain.error?.({ id: "1", detail: "boom" }));
+    await settle();
+    expect(h.startConciergeTurn.mock.calls.length).toBe(before + 1);
+    expect(String(h.startConciergeTurn.mock.calls.at(-1)?.[0])).toContain("M2");
+  });
+
   // Each refused path gets its OWN remedy, and the remedies genuinely differ: Retry for a pane that
   // gave up, "use its own pane" for a cloud agent. Falling back to the generic "I couldn't send the
   // approval to X." is the dead end these branches exist to remove — and it silently came back once

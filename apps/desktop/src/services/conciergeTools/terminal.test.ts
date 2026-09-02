@@ -135,6 +135,7 @@ import {
   noteAgentSessionId,
   noteAgentTranscriptPath,
   noteAgentTranscriptWorktree,
+  looksLikePager,
   readAgentTerminal,
   quitAlternateScreen,
   sendToAgentTerminal,
@@ -2619,6 +2620,33 @@ describe("quit_alternate_screen", () => {
     expect(submitPrompt).not.toHaveBeenCalled();
   });
 
+  // A SECOND MEMBER OF THE CLASS, THROUGH THE OP (bead sparkle-5fr554). The case above is the only
+  // positive this suite had, and it runs on `LESS_ON_A_MARKDOWN_FILE`, whose last row is the bare
+  // filename — the predicate's WEAK ARM. So "the op can press q" was proven on exactly one screen,
+  // recognised by the one matcher that is a fallback. `man` is a different program, identified by a
+  // different matcher, and it is the other thing agents on this fleet leave open. Without this, a
+  // change that kept only the bare-filename arm would pass every test here while the op stopped
+  // quitting every pager that prints a real status row.
+  it("presses q on a man page too, not only on the weak-arm less fixture", async () => {
+    const set = mountScreen(
+      [
+        "GIT-COMMIT(1)                     Git Manual                     GIT-COMMIT(1)",
+        "",
+        "NAME",
+        "       git-commit - Record changes to the repository",
+        "",
+        "Manual page git-commit(1) line 1",
+      ].join("\n"),
+      true,
+    );
+    vi.mocked(writePtyChainedStrict).mockImplementation(async () => {
+      set({ alternateBuffer: false, text: "$ " });
+    });
+    const r = await quitAlternateScreen(AGENT, ALLOWED);
+    expect(written()).toEqual([Q]);
+    expect([r.ok, r.cleared, r.sent]).toEqual([true, true, ["q"]]);
+  });
+
   // ── 2. A CLAUDE CODE PERMISSION DIALOG — NOTHING WRITTEN ────────────────────────────────────
   it("writes NOTHING into a Claude Code permission dialog", async () => {
     mountScreen(APPROVAL_2_1_220, true);
@@ -2944,5 +2972,89 @@ describe("quit_alternate_screen", () => {
     }
     // Subset, not equality, and deliberately so: the dispatcher refuses `vim` too, and this op does
     // write there. The invariant is one-directional.
+  });
+});
+
+// ══ POSITIVE IDENTIFICATION OF THE PAGER CLASS (bead sparkle-5fr554) ═══════════════════════════
+//
+// THE RULE THIS BLOCK EXISTS TO KEEP. Where a gate decides whether to write a DESTRUCTIVE keystroke,
+// the test set must contain at least one POSITIVE-identification case per member of the class it
+// claims to recognise — not only absence assertions. A suite made entirely of negative gates cannot
+// distinguish the target from every other member of its class: it goes green for a predicate that
+// says "no" to everything, which for `looksLikePager` means an op that can never quit anything,
+// silently, on every screen a human would expect it to work on.
+//
+// WHAT WAS MISSING, measured on this file before this block existed. `looksLikePager` had ZERO
+// importers outside its own module — no test anywhere called it — and the only screen the op was
+// ever proven to PRESS `q` on was `LESS_ON_A_MARKDOWN_FILE`, whose last row is the bare filename
+// `AGENTS.md`. That is the WEAK ARM: the fallback the doc comment describes as reachable "only
+// because the editor denylist above already ran". So seven of the eight `PAGER_STATUS_ROW` matchers
+// — `(END)`, less's `:` prompt, `--More--`, `lines n/m`, `byte n`, the `%` ruler, and both `man`
+// rows — had never identified anything in a test. Deleting any of them left the whole suite green,
+// while the op stopped recognising the pager that member exists for.
+//
+// So: one case per matcher, each naming the PROGRAM and the state it is in, asserted TRUE. The
+// negatives below are kept alongside deliberately — the discriminating power of the denylist is only
+// meaningful against a positive set this size.
+describe("looksLikePager — positive identification, one case per member of the pager class", () => {
+  /** A realistic pager body. The content is irrelevant to the predicate — which reads the LAST
+   *  non-empty row — and that is exactly why it is here: a positive case built from a status row
+   *  ALONE would also pass against a predicate that ignored the body, and would not show that the
+   *  row is being read in the position a pager puts it. */
+  const BODY = [
+    "# Reading a long file",
+    "",
+    "Some prose that a pager is showing, several rows of it, so the status",
+    "row below is genuinely the LAST row rather than the only one.",
+    "",
+  ];
+  const paging = (statusRow: string) => [...BODY, statusRow].join("\n");
+
+  it.each([
+    ["less, scrolled to the end", "(END)"],
+    ["less, waiting at its own command prompt", ":"],
+    ["more(1), part way through", "--More--(47%)"],
+    ["less -M, showing the line ruler", "lines 1-40/1061"],
+    ["less -M, showing the byte ruler", "byte 1234"],
+    ["less -m, the default trailing percentage", "AGENTS.md 47%"],
+    ["man(1), at its first page", "Manual page git-commit(1) line 1"],
+    ["man(1), showing its help hint", "(press h for help or q to quit)"],
+    ["less on a file it has not scrolled yet", "AGENTS.md"],
+  ])("identifies %s", (_name, statusRow) => {
+    expect(looksLikePager(paging(statusRow))).toBe(true);
+  });
+
+  // THE OTHER HALF OF "distinguish the target from every other member of its class": the programs
+  // where `q` is a keystroke in a file, not a quit. Each is a member of the EDITOR class and each
+  // must read false.
+  //
+  // EVERY ONE OF THESE PUTS A REAL PAGER RULER ON THE LAST ROW, and that is what makes the case
+  // mean anything. An editor screen with no pager row is refused by the POSITIVE matcher never
+  // firing, so the denylist entry for it is doing no work and could be deleted with this suite
+  // still green — measured: the vim-opening-ruler entry survived being commented out with all 222
+  // tests passing, until these fixtures grew the ruler. Putting the two families on screen at once
+  // is the only shape that isolates the denylist, and it is also the shape the doc comment claims
+  // ordering for: editor chrome ANYWHERE outranks a pager row at the bottom, because the
+  // conservative answer is the one whose false-accept does not corrupt a file.
+  it.each([
+    ["vim's opening ruler", '"AGENTS.md" 1061L, 78092B'],
+    ["vim in insert mode", "-- INSERT --"],
+    ["nano's footer", "^G Get Help  ^O WriteOut  ^X Exit  ^W Where Is  ^K Cut Text"],
+    ["an emacs mode line", "-UUU:----F1  AGENTS.md  (Text)"],
+    ["a helix status ruler", "NORMAL  AGENTS.md  40:12"],
+  ])("refuses %s, even under a pager ruler on the last row", (_name, chrome) => {
+    expect(looksLikePager([...BODY, chrome, "lines 1-40/1061"].join("\n"))).toBe(false);
+  });
+
+  // ABSENCE IS A REFUSAL, never a licence. Stated here as well as through the op, because this is
+  // the direction the gate is deliberately biased in and a positive suite this large is exactly
+  // what makes a reader want to relax it.
+  it.each([
+    ["an empty screen", ""],
+    ["whitespace only", "\n\n   \n"],
+    ["an unidentifiable TUI", ["┌─ some TUI ─┐", "│ working... │", "└────────────┘"].join("\n")],
+    ["prose whose last row is a sentence", [...BODY, "and then the paragraph simply ends."].join("\n")],
+  ])("refuses %s", (_name, screen) => {
+    expect(looksLikePager(screen)).toBe(false);
   });
 });

@@ -296,20 +296,47 @@ describe("every real roborev refusal string classifies as an internal gate", () 
 // the refusal `message` and `controlListener` settles it as the receipt's `reason`.
 import { sendDetail } from "../../services/conciergeTools/terminal";
 
+// ── AND THE POPULATION MOVED UNDER BOTH OF THEM (beads sparkle-d6a5r, sparkle-t9ujin) ──────────
+//
+// Everything above was true when it was written, and the `permission dialog` half of it is now
+// FALSE. `conciergeDispatch` classifies a Claude Code permission dialog as `blocked-prompt`, not
+// `alternate-screen`; its own comment on that branch says what is left over here: "A pager or editor
+// holds the alternate buffer with NO menu".
+//
+// This test used to assert the alternate-screen sentence CONTAINS "permission dialog", which pinned
+// the stale claim as correct and is why the drift survived the routing change — the copy and the
+// test agreed with each other and both disagreed with the dispatcher. The assertion is now the
+// other way round on that arm, and the claim has moved to the arm that owns it.
+//
+// The INVERSION property the block exists for is untouched: neither sentence may be withheld, and
+// both must reach the founder with no gist.
+//
+// `scripts/screen-refusal-copy-drift.sh` holds the cross-surface half, and its scope is NAMED rather
+// than implied: it reads `conciergeTools/terminal`, `Concierge/refusalCopy` and
+// `services/goalContinuationRunner` — the three modules that render these two paths — in both the
+// `switch` and the ternary shape they are written in. Read its header before assuming what it
+// covers: an `alternate-screen` sentence may not name a permission dialog (checked per SENTENCE),
+// and a `blocked-prompt` arm must name one somewhere (checked per ARM, for a reason the header
+// records). This test file owns only the `sendDetail` half.
 describe("both terminal screen guards reach the founder", () => {
-  it("does not withhold the alternate-screen refusal — it is usually an approval prompt", () => {
+  it("does not withhold the alternate-screen refusal — a pager or editor holds the screen", () => {
     const reason = sendDetail("alternate-screen", "agent-1");
-    // The corrected copy names the EVIDENCE and leads with the likelier cause, rather than asserting
-    // an editor or pager that is essentially never there.
     expect(reason).toContain("full-screen mode");
-    expect(reason).toContain("permission dialog");
+    // THE CLAIM THAT MOVED. Naming a permission dialog here sends the reader to a screen that is not
+    // there and offers a remedy — answer it — that is dead when nothing is asking.
+    expect(reason).not.toContain("permission dialog");
+    expect(reason).toContain("pager");
     expect(refusalAudience(reason)).toBe("founder");
     expect(refusalGist(reason)).toBeNull();
   });
 
-  it("does not withhold the sibling credential-field refusal either", () => {
+  it("does not withhold the sibling credential-field refusal either, and it owns the dialog claim", () => {
     const blocked = sendDetail("blocked-prompt", "agent-1");
     expect(blocked).toContain("credential");
+    // The other half of the move: this is the arm a permission dialog actually reaches now, so this
+    // is the sentence that has to name it. Asserting only the negative above would leave the claim
+    // homeless — every surface silent about the most common screen either path sees.
+    expect(blocked).toContain("permission dialog");
     expect(refusalAudience(blocked)).toBe("founder");
     expect(refusalGist(blocked)).toBeNull();
   });
