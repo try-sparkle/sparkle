@@ -2028,8 +2028,9 @@ impl ParkOutcome {
 }
 
 /// Tracked files that the agent's OWN session tooling rewrites, which are therefore never work in
-/// progress. Exact repo-relative paths, never prefixes: a directory rule would quietly grow to
-/// cover files that are genuine work.
+/// progress. Exact repo-relative paths: a directory rule would quietly grow to cover files that are
+/// genuine work, so a whole directory is eligible only through [`TOOLING_CHURN_PREFIXES`] below, which
+/// is reserved for directories holding nothing but tooling-owned files.
 ///
 /// `.beads/interactions.jsonl` is the whole list today. Beads is the work-tracker Sparkle installs
 /// hooks for, and those hooks append to this log on every agent session — so the file is modified
@@ -2040,6 +2041,33 @@ impl ParkOutcome {
 /// here means only that they can be moved OUT OF THE WAY without asking — which is why the park
 /// stashes them rather than restoring over them. See the call site.
 const TOOLING_CHURN_PATHS: &[&str] = &[".beads/interactions.jsonl"];
+
+/// Tracked-file DIRECTORY prefixes whose every member is session tooling, eligible for exactly the
+/// same set-aside as [`TOOLING_CHURN_PATHS`]. The exact-path doc above warns off prefixes because a
+/// directory rule can grow to cover genuine work — so this list is reserved for directories that hold
+/// ONLY tooling-owned files, where that growth is the point rather than the hazard.
+///
+/// `.beads/hooks/` is the whole list today. Every tracked file there is a git hook that beads,
+/// roborev, and the seed rewrite on their own schedule — `roborev install-hook --force` (a roborev
+/// self-update) rewrites `.beads/hooks/post-commit` back to its stub, then the seed re-installs the
+/// guarded wrapper, so the file is modified with no agent involvement, exactly like
+/// `interactions.jsonl`. Measured: a single ` M .beads/hooks/post-commit` — regenerated tooling dirt,
+/// not work in progress — declined the hourly park `dirty` and pinned an app-owned checkout thousands
+/// of commits behind `origin/main`, the precise fixed-point failure [`tooling_churn_to_restore`]
+/// exists to prevent. A PREFIX rather than the seven exact hook paths on purpose: the hook set is
+/// tooling-controlled and grows, and an exact list would silently miss the next hook beads adds —
+/// re-creating this bug for it. Nothing a user authors lives under this path; a hand-edited hook,
+/// once committed, is in HEAD and never shows as dirt here.
+const TOOLING_CHURN_PREFIXES: &[&str] = &[".beads/hooks/"];
+
+/// Whether a repo-relative path is session-tooling churn — an exact [`TOOLING_CHURN_PATHS`] member,
+/// or a file under a [`TOOLING_CHURN_PREFIXES`] directory. The status-code and rename/quote guards in
+/// [`tooling_churn_to_restore`] still run FIRST, so only an ordinary modification (` M`/`M `/`MM`) to
+/// such a path is ever eligible; an untracked, added, deleted, or renamed entry declines regardless.
+fn is_tooling_churn_path(path: &str) -> bool {
+    TOOLING_CHURN_PATHS.contains(&path)
+        || TOOLING_CHURN_PREFIXES.iter().any(|prefix| path.starts_with(prefix))
+}
 
 /// Stash message identifying a park's own churn entry, so the next park can retire it rather than
 /// stack another. Matched by substring against `git stash list`, so it must stay distinctive.
@@ -2207,7 +2235,7 @@ fn tooling_churn_to_restore(porcelain: &str) -> Option<Vec<String>> {
         if path.starts_with('"') || path.contains(" -> ") {
             return None;
         }
-        if !TOOLING_CHURN_PATHS.contains(&path) {
+        if !is_tooling_churn_path(path) {
             return None;
         }
         restore.push(path.to_string());
@@ -15811,6 +15839,70 @@ mod tests {
         );
     }
 
+    /// The MEASURED incident: an app-owned checkout drifted thousands of commits behind `origin/main`
+    /// — a clean fast-forward, 0 ahead — blocked the entire time by a single regenerated tracked file
+    /// under `.beads/hooks/`. beads/roborev/the seed rewrite those hooks with no agent involvement
+    /// (e.g. `roborev install-hook --force` on a self-update, then the seed re-installs its wrapper),
+    /// so a ` M .beads/hooks/post-commit` is tooling churn, not work in progress. It must park exactly
+    /// as `interactions.jsonl` does — set aside recoverably, then fast-forward — not decline `dirty`
+    /// every hour forever. This test FAILS against the pre-fix whitelist, which held only
+    /// `interactions.jsonl`.
+    #[test]
+    fn park_refreshes_a_worktree_dirtied_only_by_a_regenerated_beads_hook() {
+        let (r, wt, app_data) = init_repo_with_origin("park-beads-hook");
+        let hooks = Path::new(&wt).join(".beads").join("hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        std::fs::write(hooks.join("post-commit"), "#!/bin/sh\n# seed-owned wrapper\n").unwrap();
+        git(&wt, &["add", "."]).unwrap();
+        git(&wt, &["commit", "-q", "-m", "beads hook"]).unwrap();
+        git(&wt, &["push", "-q", "origin", "HEAD:refs/heads/main"]).unwrap();
+        advance_origin_main_elsewhere(&r, "park-beads-hook", "up1");
+        // What roborev's install-hook --force does: rewrite the tracked hook back to the bare stub,
+        // uncommitted. No agent touched it.
+        std::fs::write(hooks.join("post-commit"), "#!/bin/sh\nroborev post-commit\n").unwrap();
+
+        let out = park_worktree_on_base_at(&r, "p1", "a1", "main", &app_data, DirtyPolicy::Decline).unwrap();
+        assert!(out.parked, "a regenerated beads hook alone must not block parking: {out:?}");
+        assert!(
+            git(&wt, &["status", "--porcelain"]).unwrap().is_empty(),
+            "the hook churn must be cleared, not carried onto the fresh base"
+        );
+        // MOVED, NOT DESTROYED — recoverable exactly like the interactions.jsonl churn.
+        assert!(
+            git(&wt, &["stash", "list"]).unwrap().contains("session-tooling churn"),
+            "the hook churn must be recoverable from the stash"
+        );
+        assert!(
+            git(&wt, &["stash", "show", "-p", "stash@{0}"]).unwrap().contains("roborev post-commit"),
+            "the rewritten hook body must survive inside the stash"
+        );
+    }
+
+    /// The valve that keeps the prefix from becoming a hole: a tracked, MODIFIED file that merely
+    /// sits under `.beads/` but NOT under `.beads/hooks/` (here `.beads/config.yaml`) is genuine work
+    /// and still declines. Proves the fix widened the whitelist to the hooks directory only, not to
+    /// all of `.beads/`.
+    #[test]
+    fn park_still_declines_on_a_modified_beads_file_outside_hooks() {
+        let (r, wt, app_data) = init_repo_with_origin("park-beads-nonhook");
+        let beads = Path::new(&wt).join(".beads");
+        std::fs::create_dir_all(&beads).unwrap();
+        std::fs::write(beads.join("config.yaml"), "version: 1\n").unwrap();
+        git(&wt, &["add", "."]).unwrap();
+        git(&wt, &["commit", "-q", "-m", "beads config"]).unwrap();
+        git(&wt, &["push", "-q", "origin", "HEAD:refs/heads/main"]).unwrap();
+        advance_origin_main_elsewhere(&r, "park-beads-nonhook", "up1");
+        std::fs::write(beads.join("config.yaml"), "version: 1\nedited: true\n").unwrap();
+
+        let out = park_worktree_on_base_at(&r, "p1", "a1", "main", &app_data, DirtyPolicy::Decline).unwrap();
+        assert_eq!(out, ParkOutcome::declined("dirty"), "a non-hook .beads edit is work: {out:?}");
+        assert_eq!(
+            std::fs::read_to_string(beads.join("config.yaml")).unwrap(),
+            "version: 1\nedited: true\n",
+            "a decline must touch nothing"
+        );
+    }
+
     /// Reproduce the dirt the app-owned worktree was actually observed stuck on — the log line read
     /// `4 entries: 2×' M' 2×'??'`, i.e. a killed pass left uncommitted edits to tracked files AND
     /// untracked residue behind. The tracked baseline is committed and PUSHED first so the
@@ -16413,6 +16505,23 @@ mod tests {
         // A path outside the list — including a near-miss under the same directory — is work.
         assert_eq!(tooling_churn_to_restore(" M .beads/config.yaml"), None);
         assert_eq!(tooling_churn_to_restore(" M src/main.rs"), None);
+        // The DIRECTORY-PREFIX rule: any ordinary edit to a tracked file under `.beads/hooks/` is
+        // tooling churn, whichever hook and whichever modification code.
+        for code in [" M", "M ", "MM"] {
+            for hook in [".beads/hooks/post-commit", ".beads/hooks/pre-push"] {
+                assert_eq!(
+                    tooling_churn_to_restore(&format!("{code} {hook}")),
+                    Some(vec![hook.into()]),
+                    "{code} {hook} is a regenerated tooling hook"
+                );
+            }
+        }
+        // The prefix is anchored to the DIRECTORY: a sibling whose name merely starts with `hooks`
+        // (`.beads/hooksrc`) is not under it, and the same non-modification guards still apply to a
+        // real hook path.
+        assert_eq!(tooling_churn_to_restore(" M .beads/hooksrc"), None);
+        assert_eq!(tooling_churn_to_restore("?? .beads/hooks/post-commit"), None);
+        assert_eq!(tooling_churn_to_restore(" D .beads/hooks/post-commit"), None);
         // One ineligible entry declines the whole tree, whichever side it is on.
         assert_eq!(
             tooling_churn_to_restore(" M .beads/interactions.jsonl\n M src/main.rs"),
