@@ -100,6 +100,13 @@ import type { DeathCause } from "./deathTypes";
  * must remain subject to the rule — the founder's 17 measured orchestrators read `idle`, and a
  * working-tiers-only reading would exempt exactly the population this module exists to catch.
  */
+/** The pane status meaning "actively producing output" — a direct reading of NOW, which is why it
+ *  outranks the durable `metAt` latch in the staffing join below (roborev 74192). Typed as
+ *  `AgentTabStatus` so a renamed status becomes a compile error rather than a silently dead
+ *  comparison — note AGENT_STATUS.working is a STYLE object (color/label), not this string, and
+ *  comparing against it typechecks as an always-true mismatch under a looser signature. */
+const WORKING_STATUS: AgentTabStatus = "working";
+
 export const WAITING_ON_HUMAN: ReadonlySet<AgentTabStatus> = new Set<AgentTabStatus>([
   "questions",
   "waiting",
@@ -132,6 +139,40 @@ export const WAITING_ON_HUMAN: ReadonlySet<AgentTabStatus> = new Set<AgentTabSta
  * magnitude.
  */
 export const ORCHESTRATOR_SILENT_MS = 60 * 60 * 1000;
+
+/**
+ * The goal states that mean AN AGENT HAS NOTHING LEFT TO PURSUE — it is finished, not working.
+ *
+ * ── WHY A THIRD WITNESS WAS NEEDED AT ALL (bead `sparkle-70cu4y`) ─────────────────────────────
+ * Every witness this module joins answers a question about the PROCESS, and a finished agent
+ * passes all of them: its process is up (`observedAlive === true`), its pane reads `idle`, and its
+ * hook log is FRESH because it was committing work minutes before it stopped. So an orchestrator
+ * that marked its own goal `met` reads `true` — STAFFING — and the epic sweep answers
+ * `skip: orchestrator-alive` forever while nothing at all is being built on that epic.
+ *
+ * Measured on the night `sparkle-nu7gd9` was filed: ~30 build agents, ZERO working, almost all
+ * `goal.state: met` / stall `finished`, holding 79 of 81 slots against 2148 ready beads — and every
+ * epic they were bound to read staffed. `pusherMount.improveUnstaffedEpics` patched that for the
+ * NUDGE path with a local composition; the EPIC SWEEP, which is the thing that actually hands the
+ * epic back, never asked the question. This set is that patch moved into the one shared reading, so
+ * the two surfaces cannot answer differently about the same agent.
+ *
+ * ⚠️ `expired` AND `escalated` ARE DELIBERATELY OUT, matching `pusherMount`'s copy exactly. Those
+ * goals ended BADLY rather than being completed, and the agent may still be mid-turn on the work —
+ * so they are neither finished nor a licence to unstaff. `none` is out for the same reason a
+ * missing record is never evidence: most build agents carry no goal at all.
+ */
+export const QUIET_GOAL_STATES: ReadonlySet<string> = new Set([
+  "met",
+  "discharged",
+  "awaiting_close",
+]);
+
+/** Does this goal state mean the agent is finished? ONE definition, shared by the epic sweep's
+ *  staffing reading and the Pusher's reclaimable-slot count, so the two can never drift. */
+export function goalIsQuiet(state: string | undefined): boolean {
+  return state !== undefined && QUIET_GOAL_STATES.has(state);
+}
 
 /**
  * What this window can establish about one bound orchestrator, from BOTH witnesses.
@@ -179,6 +220,22 @@ export interface OrchestratorEvidence {
    */
   deathRecorded?: boolean;
   /**
+   * Does this agent's OWN GOAL RECORD say it has nothing left to pursue — `met`, `discharged` or
+   * `awaiting_close` (see {@link goalIsQuiet})? `undefined`/`false` for a live mandate, a goal that
+   * ended badly (`expired`/`escalated`), or no goal record at all.
+   *
+   * THE ONLY WITNESS HERE THAT IS NOT ABOUT THE PROCESS, and that is precisely why it was added:
+   * every other field answers "is it up", and a finished agent is up. See {@link QUIET_GOAL_STATES}.
+   *
+   * ⚠️ IT IS ONLY READ ALONGSIDE `observedAlive === true`, and that pairing is not optional
+   * (the lesson `pusherMount.agentIsFinished` records from roborev 72653). A goal is PERSISTED on
+   * the agent tab, so after an app restart every row in the store carries whatever `metAt` it had
+   * while `observedAlive` is `undefined` for all of them — reading the goal alone would unstaff the
+   * entire backlog at once on the strength of nobody having looked, which is the exact defect class
+   * this module exists to end.
+   */
+  goalQuiet?: boolean;
+  /**
    * `MovementEvidence.lastEventMs` for this agent — when its hook log last recorded ANY event —
    * or `null`/`undefined` when there is no reading at all (`fleet_digest` has not polled yet, the
    * agent is cloud or has no worktree so the digest skips it, or its hook log is empty).
@@ -203,6 +260,10 @@ export interface OrchestratorEvidence {
  *
  *   1. A window WATCHED it die (`observedAlive === false`) ⇒ `false`. The strongest possible
  *      reading; no artifact can overturn a witnessed death, and a stale hook log would only agree.
+ *   1b. THE AGENT ITSELF SAYS IT IS DONE — observed alive with a QUIET GOAL (`met`/`discharged`/
+ *      `awaiting_close`) ⇒ `false`. The one rule that is not about the process, and the one the
+ *      artifact witnesses structurally cannot answer: a finished agent is up, idle, and has a fresh
+ *      hook log. See {@link QUIET_GOAL_STATES} and bead `sparkle-70cu4y`.
  *   2. THE HOOK LOG IS OLDER THAN THE WINDOW ⇒ `false`, EVEN WHEN `observedAlive === true`. This is
  *      the arm that fixes the measured failure. A latched `idle` from a pane that mounted five days
  *      ago is not evidence about now; a timestamped absence of work is.
@@ -307,6 +368,62 @@ export function orchestratorLivenessOf(
     // the only witness left, and it is the one that recovers the batch-kill population.
     if (e.deathRecorded === true) return false;
     return null;
+  }
+
+  // ── A FINISHED AGENT IS NOT A WORKING AGENT (bead `sparkle-70cu4y`) ─────────────────────────
+  // READ BEFORE THE HOOK LOG, because the hook log is exactly what cannot see this: an orchestrator
+  // that marked its goal `met` five minutes ago has a hook log five minutes old, so rule 3 below
+  // returns `true` and the epic reads staffed while nobody is building it. A measurement of WORK
+  // THAT HAPPENED is not a claim that work is STILL happening once the agent has declared it done.
+  //
+  // READ AFTER the `awaiting` grid check and after the latched-wait arm, and both orderings are
+  // load-bearing rather than incidental. The consumer of a `false` here is a RESTART, and
+  // `sendToBuild` on an already-live orchestrator delivers its handoff as a bracketed paste plus
+  // Enter into that agent's PTY. A goal marked met is no evidence the PTY is gone, so it must never
+  // out-rank a witness that says a prompt is on screen: `awaiting` keeps the epic staffed, and a
+  // latched wait with no corroborating grid keeps its honest `null`. The status guard below is what
+  // actually restricts this to the population whose panes are NOT reading `working` — the comment
+  // used to assert that restriction while nothing in the chain enforced it (roborev 74192).
+  //
+  // POSITIVE OBSERVATION REQUIRED. See `goalQuiet` for why an unobserved row's persisted goal is
+  // not evidence about now.
+  //
+  // AND QUIESCENT, NOT MERELY QUIET-GOALED (roborev 74192, High). `metAt` is a DURABLE LATCH: an
+  // orchestrator that marked its goal met and was then handed more work — a founder reply, a nudge,
+  // a resume — reads `met` forever while it builds. Without the status check this rule outranked a
+  // FRESH measurement of that agent actively producing output, and the consequence is not a missed
+  // nudge: the consumer of `false` is a RESTART, so `sendToBuild` would paste a handoff into a live
+  // agent's PTY mid-turn, burn the epic's one `sweep-restarted` stamp, notify the founder of a
+  // restart that should not have happened, and park the epic in Blocked while it is being built.
+  // That is the outcome this bead's own test file calls "strictly worse than the bug".
+  //
+  // A quiet goal may therefore only convert a SILENT alive agent to `false`. When the pane says the
+  // agent is working, that is a direct reading of NOW and it wins over a latch describing THEN.
+  //
+  // BUT `working` MUST BE CORROBORATED, NEVER TAKEN ON THE LATCH ALONE (roborev 74412, High).
+  // `observedStatus` is `useRuntimeStore.status[agentId]`, and this module's own header says it is a
+  // NON-RETRACTING latch: `AgentPane` is its only writer and `close()` is the only thing that clears
+  // it — not unmount, not PTY death. `working` is also not in `processAliveFor`'s DEAD set, so an
+  // orchestrator killed mid-turn (the ENOTFOUND batch kill this module exists for) reads
+  // `observedAlive: true, observedStatus: "working"` FOREVER. Exempting on that latch alone would
+  // send such an agent to the fallthrough, and for a cloud agent or one with no worktree
+  // `lastHookEventMs` is permanently null — so it would return `true` on every tick with nothing
+  // able to retract it: `skip: orchestrator-alive` forever, which is the direction this file calls
+  // the expensive one ("a wrong `true` cost 25 epics 121 hours each").
+  //
+  // So `working` only defers to a FRESH hook measurement, and never past it. With no measurement to
+  // back it, the pane latch carries no information about now and the quiet goal decides.
+  if (e.observedAlive === true && e.goalQuiet === true) {
+    const stamp = e.lastHookEventMs;
+    const corroborated =
+      e.observedStatus === WORKING_STATUS &&
+      stamp !== null &&
+      stamp !== undefined &&
+      Number.isFinite(stamp) &&
+      stamp > 0 &&
+      stamp <= now &&
+      now - stamp <= silentMs;
+    if (!corroborated) return false;
   }
 
   const ts = e.lastHookEventMs;

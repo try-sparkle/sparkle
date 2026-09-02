@@ -75,6 +75,7 @@ import { boundAgentsFor } from "./epicSweepRunner";
 import {
   epicOrchestratorLiveness,
   orchestratorLivenessOf,
+  QUIET_GOAL_STATES,
 } from "../engine/orchestratorLiveness";
 import { getConfig, onConfigChanged, type BabysitConfigPayload } from "./config";
 import { startConflictFlags } from "./conflictFlags";
@@ -280,20 +281,34 @@ function neverIdleArmed(): boolean {
  *  of red beads rather than every tick. All read from the 5s beads poll's cached snapshot — no `bd`
  *  shell call on this 60s tick, which is what keeps the watcher cheap. */
 function improveReadyBacklog(): {
+  boardReadable: boolean;
   ready: number;
   p1PipelineHealth: number;
   p1PipelineHealthFingerprint: string | null;
   nextReadyBead: NextReadyBead | null;
 } {
   const snap = useBeadsStore.getState().byProject[SPARKLE_PROJECT_ID];
+  // NO SNAPSHOT IS NOT AN EMPTY BOARD (bead sparkle-hrzitj, P0). The poll that fills this is gated
+  // on this window owning the project and can fail to start at all — its own catch logs "never-idle
+  // backlog stays empty" — so `undefined` here is routine, not exotic. Returning 0 made that
+  // indistinguishable from a genuinely drained board and stood the watcher down against a live
+  // backlog. The counts stay 0 so no caller can accidentally read a number that means nothing;
+  // `boardReadable: false` is the fact that actually travels.
   if (snap === undefined)
-    return { ready: 0, p1PipelineHealth: 0, p1PipelineHealthFingerprint: null, nextReadyBead: null };
+    return {
+      boardReadable: false,
+      ready: 0,
+      p1PipelineHealth: 0,
+      p1PipelineHealthFingerprint: null,
+      nextReadyBead: null,
+    };
   const p1Beads = snap.beads.filter(
     (b) => b.status === "open" && b.priority === 1 && b.labels.includes(PIPELINE_HEALTH_LABEL),
   );
   const p1PipelineHealthFingerprint =
     p1Beads.length === 0 ? null : p1Beads.map((b) => b.id).sort().join(",");
   return {
+    boardReadable: true,
     ready: snap.board.backlog.length,
     p1PipelineHealth: p1Beads.length,
     p1PipelineHealthFingerprint,
@@ -331,13 +346,13 @@ function improveAdvanceFingerprint(agentId: string): string | null {
   return useRuntimeStore.getState().status[agentId] ?? null;
 }
 
-/** The goal states that mean "this agent is DONE and is not going to do more work".
- *
- *  Deliberately the SAME three tokens Rust's nudge ladder stands down on (`nudger.rs`
- *  `QUIET_GOAL_STATES`), so the pusher's idea of finished cannot drift from the nudger's. `expired`
- *  and `escalated` are NOT here on purpose: those are goals that ended BADLY, they may still need
- *  someone, and calling them finished would let a stalled fleet read as a reclaimable one. */
-const QUIET_GOAL_STATES: ReadonlySet<string> = new Set(["met", "discharged", "awaiting_close"]);
+// `QUIET_GOAL_STATES` — the goal states that mean "this agent is DONE and is not going to do more
+// work" — now lives in `engine/orchestratorLiveness` and is IMPORTED above rather than declared
+// here. It moved when the epic sweep needed the same rule (bead `sparkle-70cu4y`): the sweep asks
+// whether a finished orchestrator still staffs an epic, this file asks whether a finished agent
+// still holds a reclaimable slot, and two copies of that three-token set is exactly the drift the
+// engine module exists to prevent. It is still deliberately the SAME three tokens Rust's nudge
+// ladder stands down on (`nudger.rs` `QUIET_GOAL_STATES`).
 
 /**
  * Is this agent FINISHED — observed alive, but with nothing left to do?
@@ -497,9 +512,11 @@ function improveLocalCapacity(): {
  * the epic exactly as unstaffed as one that died, and the founder's erased-binding case and the
  * finished-agent case are the same fact wearing two faces.
  */
-function improveUnstaffedEpics(): { unstaffedBuildableEpicCount: number } {
+function improveUnstaffedEpics(): { unstaffedBuildableEpicCount: number | null } {
   const snap = useBeadsStore.getState().byProject[SPARKLE_PROJECT_ID];
-  if (snap === undefined) return { unstaffedBuildableEpicCount: 0 };
+  // `null`, never 0 — see improveReadyBacklog above and bead sparkle-hrzitj. 0 here asserts "every
+  // buildable epic is staffed", which is exactly the claim an absent board cannot make.
+  if (snap === undefined) return { unstaffedBuildableEpicCount: null };
   const beads = snap.beads;
   const agents =
     useProjectStore.getState().projects.find((p) => p.id === SPARKLE_PROJECT_ID)?.agents ?? [];

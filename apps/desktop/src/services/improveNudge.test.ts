@@ -23,6 +23,7 @@ import {
   type ImproveNudgeDeps,
   type ImproveNudgeInput,
   type NextReadyBead,
+  boardUnreadableNudgeText,
 } from "./improveNudge";
 import type { AgentTabStatus } from "../types";
 import type { Bead } from "./beads";
@@ -52,6 +53,9 @@ function makeDeps(
     unobservedAgents: number;
     unstaffedBuildableEpicCount: number;
     nextReadyBead: NextReadyBead | null;
+    /** False simulates a tick where the cached beads board could not be read at all — the
+     *  false-absence this suite's board-unreadable cases exist for (bead sparkle-hrzitj). */
+    boardReadable: boolean;
     sendResult: boolean;
   }> = {},
 ): { deps: ImproveNudgeDeps; sent: string[] } {
@@ -85,6 +89,7 @@ function makeDeps(
     // DEFAULT: no code-chosen ready bead, so the base idle-with-backlog case keeps the GENERIC
     // reminder. The self-feeding-pull suite overrides `nextReadyBead` to reach the named-pull path.
     nextReadyBead: null as NextReadyBead | null,
+    boardReadable: true,
     sendResult: true,
     ...overrides,
   };
@@ -98,6 +103,7 @@ function makeDeps(
       paneStatus: () => o.paneStatus,
       advanceFingerprint: () => o.fingerprint,
       readyBacklog: () => ({
+        boardReadable: o.boardReadable,
         ready: o.ready,
         p1PipelineHealth: o.p1PipelineHealth,
         p1PipelineHealthFingerprint: o.p1PipelineHealthFingerprint,
@@ -152,14 +158,14 @@ describe("sweepImproveNudge — the side effect, keyed off concrete advance not 
   //    slots + zero active workers, the SPECIFIC "spin a drain fleet NOW" message naming the numbers
   //    is what actually lands in the inbox, not the generic reminder. ───────────────────────────────
   it("idle + ready backlog + free slots + ZERO active workers → sends the SPECIFIC re-spin message with the numbers", async () => {
-    const sent = await sweepStaleThen(ADVANCE_IDLE_MS, { ready: 7, freeSlots: 5, activeWorkers: 0, workingAgents: 0 });
+    const sent = await sweepStaleThen(ADVANCE_IDLE_MS, { boardReadable: true, ready: 7, freeSlots: 5, activeWorkers: 0, workingAgents: 0 });
     expect(sent).toEqual([respinFleetNudgeText(7, 5)]);
     // and it is DISTINCT from the generic reminder — the whole point of the bead.
     expect(sent[0]).not.toBe(NEVER_IDLE_NUDGE_TEXT);
   });
 
   it("the re-spin message names the exact ready-bead and free-slot counts, and 0 workers", async () => {
-    const sent = await sweepStaleThen(ADVANCE_IDLE_MS, { ready: 4, freeSlots: 9, activeWorkers: 0, workingAgents: 0 });
+    const sent = await sweepStaleThen(ADVANCE_IDLE_MS, { boardReadable: true, ready: 4, freeSlots: 9, activeWorkers: 0, workingAgents: 0 });
     expect(sent[0]).toContain("4 ready beads");
     expect(sent[0]).toContain("9 free agent slots");
     expect(sent[0]).toContain("0 active workers");
@@ -167,12 +173,12 @@ describe("sweepImproveNudge — the side effect, keyed off concrete advance not 
   });
 
   it("idle + ready backlog + free slots but workers ALREADY draining → keeps the GENERIC reminder", async () => {
-    const sent = await sweepStaleThen(ADVANCE_IDLE_MS, { ready: 7, freeSlots: 5, activeWorkers: 3, workingAgents: 3 });
+    const sent = await sweepStaleThen(ADVANCE_IDLE_MS, { boardReadable: true, ready: 7, freeSlots: 5, activeWorkers: 3, workingAgents: 3 });
     expect(sent).toEqual([NEVER_IDLE_NUDGE_TEXT]);
   });
 
   it("idle + ready backlog + zero workers but NO free slots (machine full) → keeps the GENERIC reminder", async () => {
-    const sent = await sweepStaleThen(ADVANCE_IDLE_MS, { ready: 7, freeSlots: 0, activeWorkers: 0, workingAgents: 0 });
+    const sent = await sweepStaleThen(ADVANCE_IDLE_MS, { boardReadable: true, ready: 7, freeSlots: 0, activeWorkers: 0, workingAgents: 0 });
     expect(sent).toEqual([NEVER_IDLE_NUDGE_TEXT]);
   });
 
@@ -286,12 +292,12 @@ describe("sweepImproveNudge — the side effect, keyed off concrete advance not 
   });
 
   it("idle + FLAT fingerprint but EMPTY backlog → does NOT send (it may rest — guardrail a)", async () => {
-    const sent = await sweepStaleThen(ADVANCE_IDLE_MS, { ready: 0, p1PipelineHealth: 0 });
+    const sent = await sweepStaleThen(ADVANCE_IDLE_MS, { boardReadable: true, ready: 0, p1PipelineHealth: 0 });
     expect(sent).toEqual([]);
   });
 
   it("idle + FLAT fingerprint + no backlog but an open P1 pipeline-health bead → sends (the OR arm)", async () => {
-    const sent = await sweepStaleThen(ADVANCE_IDLE_MS, { ready: 0, p1PipelineHealth: 1 });
+    const sent = await sweepStaleThen(ADVANCE_IDLE_MS, { boardReadable: true, ready: 0, p1PipelineHealth: 1 });
     expect(sent).toEqual([NEVER_IDLE_NUDGE_TEXT]);
   });
 
@@ -702,6 +708,7 @@ describe("decideImproveNudge — the idle-and-has-backlog rule", () => {
     advancedRecently: false,
     // DEFAULT: not a resume tick — the resume-kick arm is exercised by its own suite below.
     justResumed: false,
+    boardReadable: true,
     readyBacklogCount: 2,
     p1PipelineHealthCount: 0,
     pipelineHealthFingerprint: null,
@@ -1017,6 +1024,7 @@ describe("decideImproveNudge — the self-feeding named-pull arm", () => {
     paneStatus: "idle",
     advancedRecently: false,
     justResumed: false,
+    boardReadable: true,
     readyBacklogCount: 2,
     p1PipelineHealthCount: 0,
     pipelineHealthFingerprint: null,
@@ -1223,4 +1231,110 @@ describe("sweepImproveNudge — the one-shot resume kick (auto-start on app rest
     await sweepImproveNudge(d2);
     expect(s2).toHaveLength(1);
   });
+
+  // ══ AN UNREADABLE BOARD IS NOT AN EMPTY ONE (bead sparkle-hrzitj, P0) ═══════════════════════════
+  // The measured defect: every count here comes from ONE cached snapshot, and when that snapshot is
+  // absent the readers returned 0 — so "I could not read the board" arrived at the stand-down gate
+  // wearing the costume of "there is nothing to do". Measured on this machine: 25 open epics, the
+  // Concierge idle, the watcher armed. The poll that fills the snapshot is gated on this window
+  // owning the project and logs "never-idle backlog stays empty" when it fails to start, so the
+  // absent-snapshot case is routine rather than exotic.
+  //
+  // These assert the SIDE EFFECT — what actually lands in the inbox — not an intermediate flag, and
+  // they come in a PAIR. Absence alone is ambiguous: a test showing "unreadable does not stand down"
+  // passes just as well if the gate were removed entirely. The second case pins that a genuinely
+  // EMPTY, READABLE board still stands down, so the unreadability is proven to be the cause.
+  it("board UNREADABLE while idle → nudges (does NOT stand down), and says the board could not be read", async () => {
+    const sent = await sweepStaleThen(ADVANCE_IDLE_MS, {
+      boardReadable: false,
+      ready: 0,
+      p1PipelineHealth: 0,
+      unstaffedBuildableEpicCount: 0,
+    });
+    expect(sent).toEqual([boardUnreadableNudgeText()]);
+  });
+
+  it("PAIRED: a READABLE but genuinely empty board still stands down — so unreadability is the cause", async () => {
+    const sent = await sweepStaleThen(ADVANCE_IDLE_MS, {
+      boardReadable: true,
+      ready: 0,
+      p1PipelineHealth: 0,
+      unstaffedBuildableEpicCount: 0,
+    });
+    expect(sent).toEqual([]);
+  });
+
+  it("the unreadable-board nudge carries NO fabricated counts and routes around the cache", async () => {
+    const sent = await sweepStaleThen(ADVANCE_IDLE_MS, { boardReadable: false, ready: 0, p1PipelineHealth: 0, unstaffedBuildableEpicCount: 0 });
+    // No fabricated COUNT. The literal remedy text legitimately contains digits (`bd ready
+    // --limit 0`, `P1`), so a blanket no-digit rule would be wrong — what must never appear is a
+    // claim ABOUT THE BACKLOG's size, because that is the number nothing read. Inventing "0 ready"
+    // is the exact confusion this bead is about.
+    expect(sent[0]).not.toMatch(/\d+\s+(ready|open|unstaffed|free)\b/i);
+    expect(sent[0]).not.toMatch(/\bno (ready|open|unstaffed) \w+/i);
+    // The remedy must be the one thing the failing path could not do: shell out instead of read cache.
+    expect(sent[0]).toContain("bd ready");
+    expect(sent[0]).not.toBe(NEVER_IDLE_NUDGE_TEXT);
+  });
+
+  it("an unreadable board does NOT override the earlier guards — a WORKING agent is still not nudged", async () => {
+    // The unreadable gate sits AFTER not-idle/armed/owner on purpose. If it had been placed above
+    // them, an unreadable board would nudge an agent that is mid-turn — a strictly worse bug than
+    // the one being fixed. This pins the ordering.
+    const sent = await sweepStaleThen(ADVANCE_IDLE_MS, { boardReadable: false, paneStatus: "working" });
+    expect(sent).toEqual([]);
+  });
+
+
+  it("an unreadable board respects the 10-minute cadence — it does NOT nudge on every 60s tick", async () => {
+    // roborev 74301. The unreadable state is PERSISTENT by construction: the backlog feed starts
+    // once, and if it fails the snapshot stays undefined for the LIFE OF THE WINDOW while
+    // armed/owner/consent all stay true. So a verdict returning above the rate limiter did not mean
+    // "nudge promptly" — it meant a nudge on EVERY 60s tick, forever, at an agent that may not even
+    // be draining its inbox. A persistent fault is exactly what a cadence exists to bound.
+    const unreadable = { boardReadable: false, ready: 0, p1PipelineHealth: 0, unstaffedBuildableEpicCount: 0 } as const;
+    const t0 = 5_000_000;
+    await sweepImproveNudge(makeDeps({ ...unreadable, now: t0 }).deps); // baseline
+    const first = makeDeps({ ...unreadable, now: t0 + ADVANCE_IDLE_MS });
+    await sweepImproveNudge(first.deps);
+    expect(first.sent).toEqual([boardUnreadableNudgeText()]); // it does fire once
+
+    // A tick later — one MIN_TICK_MS, far inside NEVER_IDLE_CADENCE_MS. Must stay silent.
+    const second = makeDeps({ ...unreadable, now: t0 + ADVANCE_IDLE_MS + 60_000 });
+    await sweepImproveNudge(second.deps);
+    expect(second.sent).toEqual([]);
+  });
+
+  it("a board-unreadable nudge does NOT advance the escalation streak — the fault is ours, not the agent's", async () => {
+    // The ladder means "the agent was nudged and did not ship". An unreadable board says nothing
+    // about the agent, so counting it would greet them at maximum harshness the moment the board
+    // recovered — for a streak they never earned.
+    //
+    // NEVER_IDLE_ESCALATE_AFTER is 2, so this must deliver TWO unreadable nudges to discriminate:
+    // with one, the streak would be 1 either way and the assertion would pass whether or not the
+    // guard existed. (It did, on the first draft — the mutation run caught it as vacuous.)
+    const t0 = 5_000_000;
+    const unreadable = { boardReadable: false, ready: 0, p1PipelineHealth: 0, unstaffedBuildableEpicCount: 0 } as const;
+    const C = NEVER_IDLE_CADENCE_MS;
+    await sweepImproveNudge(makeDeps({ ...unreadable, now: t0 }).deps); // baseline
+    const u1 = makeDeps({ ...unreadable, now: t0 + ADVANCE_IDLE_MS });
+    await sweepImproveNudge(u1.deps);
+    const u2 = makeDeps({ ...unreadable, now: t0 + ADVANCE_IDLE_MS + C + 1 });
+    await sweepImproveNudge(u2.deps);
+    expect(u1.sent).toEqual([boardUnreadableNudgeText()]);
+    expect(u2.sent).toEqual([boardUnreadableNudgeText()]);
+
+    // Board recovers WITH work, past the cadence. Two unreadable deliveries have happened, which
+    // under an unguarded counter would put the streak AT the escalation threshold — so the harder
+    // text would land. It must still be the SOFT reminder.
+    const back = makeDeps({
+      boardReadable: true,
+      ready: 5,
+      activeWorkers: 2,
+      now: t0 + ADVANCE_IDLE_MS + 2 * C + 2,
+    });
+    await sweepImproveNudge(back.deps);
+    expect(back.sent).toEqual([NEVER_IDLE_NUDGE_TEXT]);
+  });
+
 });

@@ -103,6 +103,25 @@ export function selectNextReadyBead(readyColumn: readonly Bead[]): NextReadyBead
 }
 
 /**
+ * THE BOARD COULD NOT BE READ (bead sparkle-hrzitj, P0).
+ *
+ * Deliberately carries NO digits: there are none to carry, and inventing one ("0 ready") is the
+ * very confusion this bead is about. It says what is not known and what to do about it, and the
+ * remedy is the one thing the failing path cannot do for itself — shell out to `bd` instead of
+ * reading a cache that never filled.
+ */
+export function boardUnreadableNudgeText(): string {
+  return (
+    "You are idle and the cached beads board could not be read this interval, so nothing here " +
+    "knows whether there is work — that is NOT the same as there being none, and it is not a " +
+    "reason to stand down. Do not end the turn idle. Read the backlog DIRECTLY with the shell " +
+    "rather than the cache: `bd ready --limit 0` for ready work, then open P1/blocking " +
+    "pipeline-health beads, then the agent-feedback inbox. If the board really is empty, say so " +
+    "explicitly and say how you established it. Account caps and token cost are NEVER a factor."
+  );
+}
+
+/**
  * The nudge text delivered into the Improve Sparkle agent's inbox. Carries NO digits, so it can never
  * trip the Pusher's citation gate even if it were ever routed through the challenge path (it is not —
  * `sweepImproveNudge` sends directly). It restates the persona's INTAKE→PULL loop in one line so a
@@ -244,6 +263,16 @@ export function respinFleetNudgeText(readyCount: number, freeSlots: number): str
  * the founder wants shouted about. The fix is one idea applied in both places: **a finished agent is
  * not a working agent**, so the judgment runs off `workingAgents` (alive AND not finished) rather than
  * off liveness or row count.
+ *
+ * ⚠️ THE TWO BULLETS ABOVE ARE A POST-MORTEM, NOT LIVE BEHAVIOUR — read them as history (bead
+ * `sparkle-70cu4y`). Both were fixed: `pusherMount.improveUnstaffedEpics` composes
+ * `agentIsFinished` with the liveness join, and the `respin` arm's replacement runs off
+ * `workingAgents`. This note exists because the stale bullet was later handed to an agent as a live
+ * lead and cost it a diagnosis round-trip. What was STILL live at that point was the third copy of
+ * the same question nobody had looked at: `epicSweepRunner.candidateFor` — the reading that decides
+ * whether the sweep actually HANDS THE EPIC BACK — asked only about the process, so a finished
+ * orchestrator held its epic forever there too. That is fixed in
+ * `engine/orchestratorLiveness.goalQuiet`, which is now the ONE place the rule lives.
  *
  * ── WHY THIS SHAPE IS NOT GATED ON `freeSlots > 0`, WHEN EVERY OTHER LOUD SHAPE IS ────────────────
  * The headroom gate is correct for a push that says SPAWN — escalating into a saturated machine only
@@ -437,7 +466,23 @@ export interface ImproveNudgeInput {
    * `false` once spent, so the normal grace/cadence governs steady-state — this only ever fires once.
    */
   justResumed: boolean;
-  /** How many open, unblocked improvement beads are ready (the board's `backlog` column). */
+  /**
+   * WAS THE BOARD READABLE AT ALL THIS TICK? (bead sparkle-hrzitj, P0.)
+   *
+   * Every count below is derived from ONE cached beads snapshot, and when that snapshot is absent
+   * the readers used to return 0 — so "I could not read the board" arrived here wearing the exact
+   * costume of "there is nothing to do", and the watcher stood down. That is the whole reason the
+   * Concierge can sit idle against a live backlog: the poll is gated on this window owning the
+   * project and can simply never start (its own failure log says "never-idle backlog stays empty"),
+   * and nothing downstream could tell that apart from a genuinely empty board.
+   *
+   * So the counts no longer carry the "unreadable" case at all — this flag does. `false` means the
+   * numbers below are NOT evidence of anything, and the one gate that stands down on them refuses
+   * to fire. Absence of a reading is not a reading of absence.
+   */
+  boardReadable: boolean;
+  /** How many open, unblocked improvement beads are ready (the board's `backlog` column). Meaningful
+   *  ONLY when {@link boardReadable} is true. */
   readyBacklogCount: number;
   /** How many open P1 pipeline-health beads exist — the highest-value ready work, counted separately
    *  so a blocked-but-open P1 still satisfies "there is work" even if the backlog column is empty. */
@@ -515,6 +560,7 @@ export type ImproveNudgeDecision =
   | { nudge: true; kind: "respin"; readyCount: number; freeSlots: number }
   | { nudge: true; kind: "concierge-notify"; fingerprint: string; count: number }
   | { nudge: true; kind: "unstaffed-epic-alarm"; epicCount: number; freeSlots: number }
+  | { nudge: true; kind: "board-unreadable" }
   | {
       nudge: true;
       kind: "fleet-idle-alarm";
@@ -563,8 +609,9 @@ export type ImproveNudgeRefusal =
  *      buildable work surfaced and staffed, not silently ignored. It is gated on `freeSlots > 0` on
  *      purpose: escalating into a saturated machine only produces admission refusals ("29 of 19 slots
  *      taken"), so with no headroom the alarm does not fire and the ordinary cadence resurfaces it once
- *      slots free. `unstaffedBuildableEpicCount === 0` (staffed, or no buildable epics, or unreadable)
- *      can never take this shape.
+ *      slots free. `unstaffedBuildableEpicCount === 0` (staffed, or no buildable epics)
+ *      can never take this shape. UNREADABLE is no longer folded in here — it is `boardReadable:
+ *      false` and refuses at its own gate above, because it is not evidence of an absence.
  *   1. `concierge-notify` — an OPEN P1 pipeline-health bead exists (a RED fleet signal a human must
  *      unblock) that the concierge has not been told about this window. This PRE-EMPTS re-spin and the
  *      generic reminder: the founder wants a red signal SURFACED to the concierge (the fleet hub, which
@@ -594,16 +641,39 @@ export function decideImproveNudge(input: ImproveNudgeInput): ImproveNudgeDecisi
   if (input.advancedRecently && !input.justResumed) {
     return { nudge: false, reason: "advanced-recently" };
   }
+  // AN UNREADABLE BOARD IS NOT AN EMPTY ONE (bead sparkle-hrzitj, P0).
+  //
+  // This count check is the ONLY gate that stands down on the bead numbers, so it is the only place
+  // the false-absence could do damage — and it did: with no snapshot every count reads 0, all three
+  // clauses hold, and the watcher refuses `no-ready-backlog` on a machine with 25 open epics. The
+  // founder's invariant is that the Concierge is never idle unless there is genuinely no unstaffed
+  // build work, and "genuinely" is a claim only a READING can support. So the stand-down now
+  // requires a READABLE board: unreadable falls through it rather than being absorbed by it.
   if (
+    input.boardReadable &&
     input.readyBacklogCount <= 0 &&
     input.p1PipelineHealthCount <= 0 &&
     input.unstaffedBuildableEpicCount <= 0
   ) {
     return { nudge: false, reason: "no-ready-backlog" };
   }
+  // THE RATE LIMIT BINDS EVERY SHAPE, INCLUDING THE UNREADABLE ONE (roborev 74301, High).
+  //
+  // The unreadable state is PERSISTENT by construction, not transient: `startPusher` starts the
+  // backlog feed once, and if `ensureSparkleRepo()` rejects, the snapshot stays `undefined` for the
+  // life of the window while armed/owner/consent all stay true. An unreadable verdict returning
+  // ABOVE this check therefore did not mean "nudge promptly" — it meant a nudge on every 60s tick,
+  // forever, against an agent whose inbox may not even be draining. It would also have run
+  // `consecutiveIdleNudges` to the top of the escalation ladder while the board was unreadable, so
+  // the FIRST real nudge after recovery would arrive at maximum harshness for a streak the agent
+  // never earned. A persistent fault is exactly the thing a cadence exists to bound.
   if (input.lastNudgedAt !== null && input.now - input.lastNudgedAt < input.cadenceMs) {
     return { nudge: false, reason: "rate-limited" };
   }
+  // Past the cadence and the board could not be read: nudge, and let the agent go read it directly.
+  // Ordered after the count check purely so the count check keeps its `boardReadable` guard legible;
+  // either position is correct now that the stand-down can no longer absorb an unreadable board.
+  if (!input.boardReadable) return { nudge: true, kind: "board-unreadable" };
   // Idle, with work, past the cadence. Choose the shape.
   //
   // HIGHEST PRIORITY — the three-alarm fire (bead sparkle-nu7gd9): an in_progress epic with children
@@ -734,6 +804,9 @@ export interface ImproveNudgeDeps {
    *  has chosen for the self-feeding pull nudge (`selectNextReadyBead`; `null` when the ready column is
    *  empty/unreadable). */
   readyBacklog(): {
+    /** False when the cached board could not be read at all this tick. The counts below are then
+     *  meaningless and MUST NOT be interpreted as zero — see `ImproveNudgeInput.boardReadable`. */
+    boardReadable: boolean;
     ready: number;
     p1PipelineHealth: number;
     p1PipelineHealthFingerprint: string | null;
@@ -755,8 +828,9 @@ export interface ImproveNudgeDeps {
   };
   /** How many `in_progress` epics have children (are buildable) but NO live orchestrator bound — the
    *  three-alarm-fire signal (bead sparkle-nu7gd9). Read from the cached beads board + agent roster +
-   *  runtime liveness, no `bd` shell call. 0 when unreadable (the fail-toward-silence direction). */
-  unstaffedBuildableEpics(): { unstaffedBuildableEpicCount: number };
+   *  runtime liveness, no `bd` shell call. `null` when the board was unreadable — NOT 0, which would
+   *  be the fail-toward-silence direction this bead (sparkle-hrzitj) exists to remove. */
+  unstaffedBuildableEpics(): { unstaffedBuildableEpicCount: number | null };
   /** Deliver the nudge to the improve agent's inbox; returns whether delivery was CONFIRMED. */
   send(text: string): Promise<boolean>;
 }
@@ -912,6 +986,7 @@ export async function sweepImproveNudge(deps: ImproveNudgeDeps): Promise<Improve
       paneStatus: deps.paneStatus(),
       advancedRecently,
       justResumed,
+      boardReadable: backlog.boardReadable,
       readyBacklogCount: backlog.ready,
       p1PipelineHealthCount: backlog.p1PipelineHealth,
       pipelineHealthFingerprint: backlog.p1PipelineHealthFingerprint,
@@ -923,7 +998,11 @@ export async function sweepImproveNudge(deps: ImproveNudgeDeps): Promise<Improve
       workingAgents: capacity.workingAgents,
       reclaimableAgents: capacity.reclaimableAgents,
       unobservedAgents: capacity.unobservedAgents,
-      unstaffedBuildableEpicCount: unstaffed.unstaffedBuildableEpicCount,
+      // `null` means unreadable, and that fact travels on `boardReadable` — which refuses at its own
+      // gate BEFORE any count is consulted. Coercing to 0 here is therefore safe and, unlike before,
+      // no longer the thing that hides an unreadable board: nothing downstream can reach this 0
+      // without having already passed a readable board.
+      unstaffedBuildableEpicCount: unstaffed.unstaffedBuildableEpicCount ?? 0,
       nextReadyBead: backlog.nextReadyBead,
       lastNudgedAt,
       now,
@@ -947,7 +1026,9 @@ export async function sweepImproveNudge(deps: ImproveNudgeDeps): Promise<Improve
     // hardens the more the agent answers the nudge instead of shipping. Keyed on the advance
     // fingerprint (what the agent DID), so a reworded deferral cannot dodge it.
     const text =
-      decision.kind === "unstaffed-epic-alarm"
+      decision.kind === "board-unreadable"
+        ? boardUnreadableNudgeText()
+        : decision.kind === "unstaffed-epic-alarm"
         ? unstaffedEpicAlarmNudgeText(decision.epicCount, decision.freeSlots)
         : decision.kind === "fleet-idle-alarm"
           ? fleetIdleAlarmNudgeText(
@@ -969,7 +1050,15 @@ export async function sweepImproveNudge(deps: ImproveNudgeDeps): Promise<Improve
     const delivered = await deps.send(text);
     if (delivered) {
       lastNudgedAt = now;
-      consecutiveIdleNudges += 1;
+      // THE STREAK MEASURES THE AGENT, NOT THE MACHINE (roborev 74301, High).
+      //
+      // `consecutiveIdleNudges` drives the escalation ladder, and its meaning is "the agent was
+      // nudged and did not ship". A board-unreadable nudge says nothing of the kind — it reports a
+      // fault on OUR side, and the agent may have answered every previous one perfectly. Counting it
+      // would harden the wording against someone who did nothing wrong, and because the unreadable
+      // state is persistent, it would arrive at maximum harshness the moment the board came back.
+      // The rate limit above already bounds how often this can fire; the ladder stays out of it.
+      if (decision.kind !== "board-unreadable") consecutiveIdleNudges += 1;
       // THE RESUME KICK IS SPENT HERE AND ONLY HERE — one delivered action per window mount. Beside
       // `lastNudgedAt` on purpose: both follow this function's stated "spend the budget against a
       // CONFIRMED delivery" discipline, so a send the transport could not confirm leaves the kick armed

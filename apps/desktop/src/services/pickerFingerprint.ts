@@ -67,6 +67,33 @@ import type { SuggestionButton } from "./suggestions/types";
  *  number applies only when it does not. It is deliberately unchanged: a dialog with no border is
  *  exactly the case nothing better is known about, and narrowing the fallback there would trade a
  *  churning fingerprint for a colliding one. */
+/**
+ * The moving selection pointer at the head of an option row, INCLUDING an optional box border
+ * before it (roborev 74270, High).
+ *
+ * Claude Code draws every dialog BOXED (`screenClassifier.ts`), so a real option row reads
+ * `│ ❯ 1. Local files` — and a strip anchored at `^\s*[❯›>]` never matches it. The pointer then
+ * stayed in the hashed material, so merely ARROWING changed two lines of the block and the
+ * fingerprint moved. That matters because `verifiedPickerPress` re-derives the fingerprint from the
+ * CURRENT screen and compares it to the one taken before the walk: on a boxed dialog the two
+ * disagreed, the press took the `blocked-prompt` arm, and the result was arrows landed, highlight
+ * moved, nothing ticked, press refused — the exact defect this bead exists to remove, now merely
+ * narrated rather than prevented. It is a race on the redraw reaching the store, so it presents as
+ * intermittent rather than absent, and the suite could not see it: the widget fixture renders
+ * UNBOXED rows, where the old strip does succeed.
+ *
+ * The `[│|┃]?` tolerance matches what `SELECTION_CURSOR` and `RENDERED_OPTION_ROW` already carry,
+ * so all three now agree about what a pointer row looks like.
+ *
+ * THE POINTER IS OPTIONAL, AND THAT IS THE LOAD-BEARING HALF. Stripping the border only from rows
+ * that HAVE a pointer just relocates the asymmetry: the pointed row normalises to `1. Local files`
+ * while its siblings keep `│   2. The web`, so moving the pointer still rewrites two lines of the
+ * block. Unboxed material never showed this because `.trim()` already erased the difference — the
+ * leading `│` is exactly what survives a trim. So the border is normalised off EVERY row, pointer
+ * or not, which is what actually makes the hash invariant under navigation.
+ */
+const POINTER_PREFIX = /^\s*[│|┃]?\s*(?:[❯›>]\s*)?/;
+
 const QUESTION_CONTEXT_LINES = 10;
 
 /** Hard ceiling on the block, whatever the anchors say. A fingerprint over hundreds of lines of live
@@ -144,7 +171,7 @@ function questionBlock(scrollback: string, yesNo: boolean): string {
         .slice(start, bounds.footer)
         // The pointer MOVES as the user arrows around without the question changing, so it is
         // normalised away — otherwise merely navigating a menu would invalidate a fingerprint.
-        .map((l) => steady(l.replace(/^\s*[❯›>]\s*/, "")).trim())
+        .map((l) => steady(l.replace(POINTER_PREFIX, "")).trim())
         .filter((l) => l !== "");
       // Cap from the START. The block runs question-first, option-rows-last, and the OPTIONS are
       // already in the fingerprint's `shape` half — the question is the only part this contributes.
@@ -164,7 +191,7 @@ function questionBlock(scrollback: string, yesNo: boolean): string {
     }
     return generic
       .slice(Math.max(0, first - QUESTION_CONTEXT_LINES), run.last + 1)
-      .map((l) => steady(l.replace(/^\s*[❯›>]\s*/, "")).trim())
+      .map((l) => steady(l.replace(POINTER_PREFIX, "")).trim())
       .filter((l) => l !== "")
       // Question-first: see the note in the picker branch above.
       .slice(0, QUESTION_BLOCK_MAX_LINES)

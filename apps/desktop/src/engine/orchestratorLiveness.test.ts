@@ -435,3 +435,189 @@ describe("epicRestartRemedy", () => {
     expect(epicRestartRemedy([])).toBe("restart");
   });
 });
+
+// ══ A FINISHED ORCHESTRATOR IS NOT A WORKING ONE (bead sparkle-70cu4y) ═════════════════════════
+// The second half of the same measured incident, and the half the hook-log join CANNOT see. An
+// orchestrator that marked its own goal `met` is very much alive — its process is up, its pane reads
+// `idle`, and its hook log is FRESH because it was writing commits minutes ago. So every witness
+// this module joins answers "staffing", the epic sweep skips `orchestrator-alive` forever, and the
+// three-alarm unstaffed count collapses to 0 while nothing at all is being built.
+//
+// `pusherMount.improveUnstaffedEpics` already fixed this for the NUDGE path with a local
+// `agentIsFinished ? false : liveness` composition. The EPIC SWEEP — the thing that actually hands
+// the epic back — never asked the question at all. These cases move the rule into the one shared
+// staffing reading so the two surfaces cannot answer differently.
+describe("a bound orchestrator that FINISHED is not staffing its epic", () => {
+  // THE BUG. Fresh hook log, observed alive, goal met ⇒ every existing rule says `true`.
+  it("a goal-quiet orchestrator with a FRESH hook log is NOT staffing", () => {
+    expect(
+      orchestratorLivenessOf(
+        { observedAlive: true, goalQuiet: true, lastHookEventMs: NOW - 60_000 },
+        NOW,
+      ),
+    ).toBe(false);
+  });
+
+  // ── A WORKING PANE OUTRANKS A MET GOAL (roborev 74192, High) ────────────────────────────────
+  // `metAt` is a DURABLE LATCH, not a moment: an orchestrator that marked its goal met and was then
+  // handed more work — a founder reply, a nudge, a resume — reads `met` forever while it builds.
+  // The rule above, unguarded, outranked a FRESH reading of that agent actively producing output.
+  //
+  // The consequence is not a missed nudge. The consumer of `false` is a RESTART: sendToBuild pastes
+  // a handoff into the live agent's PTY mid-turn, the epic burns its one sweep-restarted stamp, the
+  // founder is told of a restart that should not have happened, and the epic lands in Blocked while
+  // it is being actively built — "strictly worse than the bug", in this suite's own words.
+  it("a goal-quiet orchestrator whose pane says WORKING is still staffing — a reading of NOW beats a latch about THEN", () => {
+    expect(
+      orchestratorLivenessOf(
+        {
+          observedAlive: true,
+          goalQuiet: true,
+          observedStatus: "working",
+          lastHookEventMs: NOW - 60_000,
+        },
+        NOW,
+      ),
+    ).toBe(true);
+  });
+
+  // ── THE `working` LATCH ALONE IS NOT EVIDENCE (roborev 74412, High) ─────────────────────────
+  // `observedStatus` is a NON-RETRACTING latch: AgentPane is its only writer and only `close()`
+  // clears it — not unmount, not PTY death. `working` is not in processAliveFor's DEAD set either,
+  // so an orchestrator killed mid-turn reads alive+working FOREVER. And `lastHookEventMs` is
+  // PERMANENTLY null for a cloud agent or one with no worktree, so there is no clock to age it out.
+  //
+  // Exempting on the latch alone would therefore return `true` on every tick with nothing able to
+  // retract it — `skip: orchestrator-alive` forever, the direction this file calls the expensive
+  // one ("a wrong `true` cost 25 epics 121 hours each"). The exemption requires a FRESH measurement
+  // to corroborate the pane, and this is the case the first two tests could not reach: both supply
+  // a fresh hook stamp, so they exercise only the path that was already safe.
+  it("a WORKING pane with NO hook stamp at all is NOT staffing — the latch cannot outlive the process", () => {
+    expect(
+      orchestratorLivenessOf(
+        {
+          observedAlive: true,
+          goalQuiet: true,
+          observedStatus: "working",
+          lastHookEventMs: null,
+        },
+        NOW,
+      ),
+    ).toBe(false);
+  });
+
+  it("a WORKING pane whose hook stamp is STALE is NOT staffing — deferring to the log never goes past it", () => {
+    expect(
+      orchestratorLivenessOf(
+        {
+          observedAlive: true,
+          goalQuiet: true,
+          observedStatus: "working",
+          lastHookEventMs: NOW - 6 * 60 * 60 * 1000,
+        },
+        NOW,
+      ),
+    ).toBe(false);
+  });
+
+  // PAIRED with the case above: the SAME fixture with an idle pane must still unstaff, or the guard
+  // would just be switching the rule off rather than narrowing it to the silent population.
+  it("PAIRED: the identical fixture with an IDLE pane is NOT staffing, so the guard narrows the rule rather than disabling it", () => {
+    expect(
+      orchestratorLivenessOf(
+        {
+          observedAlive: true,
+          goalQuiet: true,
+          observedStatus: "idle",
+          lastHookEventMs: NOW - 60_000,
+        },
+        NOW,
+      ),
+    ).toBe(false);
+  });
+
+  // ── THE PAIRED CASE ─────────────────────────────────────────────────────────────────────────
+  // Identical fixture, ONE fact different: the goal is still live. Without this the case above
+  // passes for a module that calls every orchestrator dead — which would spawn a rival against
+  // every epic somebody is actually building, strictly worse than the bug.
+  it("the same orchestrator with a LIVE goal IS staffing", () => {
+    expect(
+      orchestratorLivenessOf(
+        { observedAlive: true, goalQuiet: false, lastHookEventMs: NOW - 60_000 },
+        NOW,
+      ),
+    ).toBe(true);
+  });
+
+  // NO GOAL RECORD IS NOT A QUIET GOAL. Most build agents carry no goal at all; reading an absent
+  // record as "finished" would unstaff the entire fleet on the first tick.
+  it("an orchestrator with no goal record at all is still staffing", () => {
+    expect(
+      orchestratorLivenessOf({ observedAlive: true, lastHookEventMs: NOW - 60_000 }, NOW),
+    ).toBe(true);
+  });
+
+  // POSITIVE OBSERVATION IS REQUIRED, exactly as `pusherMount.agentIsFinished` requires it
+  // (roborev 72653). `observedAlive` is `undefined` for every row after an app restart, and those
+  // rows still carry a PERSISTED `metAt` from before it. Reading that as finished would unstaff
+  // every epic in the store at once, on the strength of nobody having looked — which is the very
+  // defect class this module exists to end.
+  it("an UNOBSERVED orchestrator with a persisted quiet goal is judged by its hook log, not by the goal", () => {
+    expect(
+      orchestratorLivenessOf(
+        { observedAlive: undefined, goalQuiet: true, lastHookEventMs: NOW - 60_000 },
+        NOW,
+      ),
+    ).toBe(true);
+  });
+
+  // A LIVE PROMPT ON SCREEN OUTRANKS THE GOAL RECORD. `sendToBuild` on an already-live orchestrator
+  // pastes the handoff into its PTY, so a grid that is reporting a prompt RIGHT NOW must keep the
+  // epic staffed whatever the goal says — a goal marked met is not permission to answer a pending
+  // permission dialog on the human's behalf.
+  it("never unstaffs an orchestrator the grid sees sitting at a prompt", () => {
+    expect(
+      orchestratorLivenessOf(
+        {
+          observedAlive: true,
+          goalQuiet: true,
+          observedAttention: "awaiting",
+          lastHookEventMs: NOW - 121 * HOUR,
+        },
+        NOW,
+      ),
+    ).toBe(true);
+  });
+
+  // The WAITING_ON_HUMAN arm keeps its answer unchanged: a latched wait with no corroborating grid
+  // is `null` (`staffing-unknown`), which spends nothing. The goal record does not promote that to
+  // a confident `false`, because the hazard the arm prevents is a PTY write and a quiet goal is no
+  // evidence the PTY is gone.
+  it("does not override the latched-wait arm", () => {
+    expect(
+      orchestratorLivenessOf(
+        {
+          observedAlive: true,
+          goalQuiet: true,
+          observedStatus: "waiting",
+          lastHookEventMs: NOW - 60_000,
+        },
+        NOW,
+      ),
+    ).toBeNull();
+  });
+
+  // ANY genuinely working agent still staffs the epic. A finished orchestrator beside a live one is
+  // not an unstaffed epic, and restarting it would be the rival spawn the tri-state exists to avoid.
+  it("a finished orchestrator beside a working one leaves the epic staffed", () => {
+    const finished = orchestratorLivenessOf(
+      { observedAlive: true, goalQuiet: true, lastHookEventMs: NOW - 60_000 },
+      NOW,
+    );
+    const working = orchestratorLivenessOf(
+      { observedAlive: true, goalQuiet: false, lastHookEventMs: NOW - 60_000 },
+      NOW,
+    );
+    expect(epicOrchestratorLiveness([finished, working])).toBe(true);
+  });
+});

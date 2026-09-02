@@ -78,6 +78,9 @@ describe("buildImproveNudgeDeps — the real readers reach the live stores", () 
     // reader chose the highest-priority ready bead IN CODE (the P0 r1, ahead of the P1s) — the
     // self-feeding pick the never-idle nudge hands over by name (bead sparkle-n2feho.1).
     expect(got).toEqual({
+      // The READABLE half of the pair with the unpolled-board case below: a real snapshot reports
+      // true, so the flag distinguishes "read it, it has 4" from "could not read it" (sparkle-hrzitj).
+      boardReadable: true,
       ready: 4,
       p1PipelineHealth: 2,
       p1PipelineHealthFingerprint: "ph-a,ph-z",
@@ -85,14 +88,21 @@ describe("buildImproveNudgeDeps — the real readers reach the live stores", () 
     });
   });
 
-  it("readyBacklog() returns the fail-safe empty reading when the sparkle board is unpolled", () => {
-    // The absent-snapshot case: the poll has not populated the store yet. Must read as no-work (rest)
-    // with a NULL fingerprint (no red finding to surface), never as a spurious nudge.
+  it("readyBacklog() reports an unpolled sparkle board as UNREADABLE, not as an empty one", () => {
+    // THE ABSENT-SNAPSHOT CASE, and it is the P0 (bead sparkle-hrzitj). This used to read as
+    // "no work, rest" — the fail-toward-silence direction — which is exactly how the Concierge came
+    // to sit idle against 25 open epics: the ONE count-based stand-down downstream saw all zeros and
+    // could not tell them from a genuinely drained board.
+    //
+    // The counts stay 0 so no caller can read a number that means something it does not. What
+    // changed is that `boardReadable: false` now travels WITH them, and that is the fact the
+    // decision gates on. Absence of a reading is not a reading of absence.
     expect(buildImproveNudgeDeps().readyBacklog()).toEqual({
+      boardReadable: false,
       ready: 0,
       p1PipelineHealth: 0,
       p1PipelineHealthFingerprint: null,
-      // No snapshot → no ready column → no code-chosen next item (fail-toward-silence: never invent one).
+      // Still null: no snapshot → no ready column → never invent a next item to hand over.
       nextReadyBead: null,
     });
   });
@@ -582,9 +592,12 @@ describe("buildImproveNudgeDeps — the real readers reach the live stores", () 
     });
   });
 
-  it("returns the fail-safe zero when the sparkle board is unpolled", () => {
+  it("returns NULL — not zero — when the sparkle board is unpolled (bead sparkle-hrzitj)", () => {
+    // 0 here is not a neutral default: it is the positive assertion "every buildable epic is
+    // staffed", which is the one claim an unread board cannot make. That assertion is what silenced
+    // the unstaffed-epic alarm — the LOUDEST push there is — on a machine with 25 open epics.
     expect(buildImproveNudgeDeps().unstaffedBuildableEpics()).toEqual({
-      unstaffedBuildableEpicCount: 0,
+      unstaffedBuildableEpicCount: null,
     });
   });
 });

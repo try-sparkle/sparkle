@@ -58,9 +58,11 @@ import { freshnessControl, resolveProbe } from "../engine/probeOutcome";
 import {
   epicOrchestratorLiveness,
   epicRestartRemedy,
+  goalIsQuiet,
   orchestratorLivenessOf,
   ORCHESTRATOR_SILENT_MS,
 } from "../engine/orchestratorLiveness";
+import { goalStateOf } from "../engine/agentGoal";
 import { deathCauseForAgent } from "./deadSessionRegistry";
 import type { DeathCause } from "../engine/deathTypes";
 import type { AgentTabStatus } from "@sparkle/ui";
@@ -664,6 +666,17 @@ export function candidateFor(
                 observedAttention: staffing.attentionFor(a.id),
                 deathRecorded: staffing.deathRecordedFor(a.id),
                 lastHookEventMs: staffing.lastHookEventFor(a.id),
+                // THE AGENT'S OWN VERDICT ON ITSELF, and the only witness here that is not about
+                // the process (bead `sparkle-70cu4y`). An orchestrator that marked its goal `met`
+                // is up, idle, and has a fresh hook log, so every artifact reading above says
+                // STAFFING and the epic was skipped `orchestrator-alive` forever while nothing was
+                // being built. Read straight off the bound tab rather than through a seam: the goal
+                // is a persisted field of the roster this function was already handed, so there is
+                // no reading here that can fail independently and no second witness to inject.
+                //
+                // No `AwaitingCloseEvidence` is passed, which narrows `awaiting_close` out of reach
+                // — deliberately, and in the safe direction: fewer agents read finished, never more.
+                goalQuiet: goalIsQuiet(goalStateOf(a.goal, staffing.now)),
               },
               staffing.now,
               staffing.silentMs,

@@ -128,6 +128,9 @@ import { screenOffersAnswer } from "../../engine/screenAnswerable";
 import { isPlanExitDialog } from "../suggestions/planPrompt";
 import { isPlanModeDialog } from "../suggestions/conciergeEscalation";
 import { parsePickerOptions } from "../suggestions/heuristics";
+// The two facts a multi-select press needs that the option list does not carry (bead
+// sparkle-xkf6yl): is this the checkbox shape, and which row is highlighted.
+import { highlightedOptionIndex, isMultiSelectPicker } from "./pickerCursor";
 
 // ---------------------------------------------------------------------------------------------
 // Budgets
@@ -1324,7 +1327,7 @@ export const CONCIERGE_TERMINAL_TOOLS = [
   {
     name: "select_picker_option",
     description:
-      "Press one of an agent's live menu options. Takes the index AND the `fingerprint` from read_picker_options, and refuses if the menu changed underneath — pressing a button the human never read is not something to guess at. An EMPTY fingerprint is refused as `unreadable-picker`: the question could not be read, so there is nothing to match against. Requires an authorized tool policy, like any other write to a terminal.",
+      "Press one of an agent's live menu options. Takes the index AND the `fingerprint` from read_picker_options, and refuses if the menu changed underneath — pressing a button the human never read is not something to guess at. An EMPTY fingerprint is refused as `unreadable-picker`: the question could not be read, so there is nothing to match against. A MULTI-SELECT checkbox menu (every option reads `[ ] …`) is answered by moving the highlight to the requested row and toggling it, so the index is honoured there too — one call ticks ONE box and leaves the menu open, so call it again per box. IT CANNOT SUBMIT THE SET: there is no op that confirms a multi-select, and `send_control_key enter` is refused while any menu is up. So tick the boxes and then RELAY TO THE HUMAN to confirm — do not go looking for a submit route, there isn't one. If no row on that menu carries the selection cursor it is refused as `cursor-unknown` rather than toggling a checkbox on a guess. Requires an authorized tool policy, like any other write to a terminal.",
     write: true,
   },
   {
@@ -1414,9 +1417,24 @@ export interface SelectPickerResult {
   agentId: string;
   /** The label actually pressed, on success. */
   label?: string;
-  /** Why it was refused, machine-readable. */
-  reason?: "no-picker" | "out-of-range" | "changed" | "unreadable-picker" | ConciergeSendPath;
+  /** Why it was refused, machine-readable. `cursor-unknown` is the multi-select-only one: the
+   *  menu parsed and the fingerprint matched, but no row on screen carries the selection cursor,
+   *  so there is no way to know how far to walk to reach the requested index. See
+   *  {@link selectPickerOption}. */
+  reason?:
+    | "no-picker"
+    | "out-of-range"
+    | "changed"
+    | "unreadable-picker"
+    | "cursor-unknown"
+    | ConciergeSendPath;
   detail?: string;
+  /** TRUE when a multi-select cursor walk DID land and the press was then refused — the menu's
+   *  highlight moved and nothing was toggled. Reported because the caller cannot infer it: a
+   *  refusal otherwise reads as "nothing happened", and the next press built on an earlier read
+   *  would compute its walk from a highlight that has since moved (roborev 74100). Absent, never
+   *  `false`, so a caller cannot mistake "this build does not report it" for "it did not move". */
+  cursorMoved?: true;
 }
 
 /**
@@ -1479,6 +1497,101 @@ export async function selectPickerOption(
     };
   }
   const chosen = live[index]!;
+  // ── MULTI-SELECT: WALK THE CURSOR TO THE INDEX BEFORE PRESSING (bead sparkle-xkf6yl) ─────────
+  //
+  // THE DEFECT. `chosen.value` is the option's own keystroke — `"2\n"`, framed to `"2\r"` — and on
+  // a SINGLE-SELECT numbered picker the digit is what does the work: it jumps to that option and the
+  // return commits it. On a MULTI-SELECT CHECKBOX picker the digit is INERT and the return TOGGLES
+  // THE HIGHLIGHTED ROW. So the index was thrown away and some other row flipped, while this
+  // function returned `chosen.label` as though the requested option had been chosen. Measured twice
+  // in the field: `index=1` on a five-row wizard toggled row 1 back OFF and reported
+  // `2 · [ ] Already-hosted URLs`. That silent wrong-label report is the dangerous half — the
+  // concierge could not answer a multi-select question truthfully, and left agents blocked.
+  //
+  // THE REMEDY IS NAVIGATION, NOT A DIFFERENT KEYSTROKE. The arrows move the highlight and commit
+  // nothing, so walking `|index - highlighted|` rows and then pressing exactly as before makes the
+  // existing toggle land on the row that was asked for. The press itself is untouched: it is still
+  // the ordinary authority-gated send below, carrying the same re-derived fingerprint.
+  //
+  // ══ WHY THE ARROWS MAY BE WRITTEN HERE AT ALL ═════════════════════════════════════════════════
+  // `send_control_key` REFUSES the arrows while a menu is live (`ambiguous-picker`), and that
+  // refusal is not being walked around: its premise is that a raw arrow-then-enter reaches any
+  // option with nothing read and no fingerprint. Here the menu HAS been read, the caller echoed its
+  // fingerprint back, and this function has just re-derived and matched it — the exact evidence that
+  // refusal says is missing. The gate below re-asks every refusal this layer owns — see the block
+  // after next — so no write happens on a route that could not have carried the press either. On any
+  // of them we write NOTHING and fall through to the send, so the refusal the caller gets is still
+  // the send's own (`unauthorized`, `cloud-agent`, `unknown-agent`, `sparkle-busy`)
+  // rather than a second copy invented here.
+  //
+  // ══ AND WHY A MISSING CURSOR IS A REFUSAL, NOT A DEFAULT ══════════════════════════════════════
+  // Defaulting an unreadable highlight to row 0 would press blind on precisely the screens this
+  // cannot read — which is the defect, not a fallback for it. The bead's own wanted-outcome says a
+  // named refusal beats a selection that did not happen.
+  //
+  // ══ EVERY REFUSAL THIS LAYER OWNS RUNS BEFORE A BYTE IS WRITTEN (roborev 74100) ═══════════════
+  // The arrows are a real mutation of the agent's screen, and `sendToAgentTerminal`'s own contract
+  // three hundred lines up is that "a refusal never wrote a byte". A pre-check on authority alone
+  // was a strict SUBSET of what can still refuse: gate 2.5 (`sparkle-busy`) and the dispatcher's
+  // trial wall both fire after it, so a refused press would have left the menu highlighted on a row
+  // nobody chose — and the next Enter, from a human or from a later call built on a stale read,
+  // toggles the wrong box. That is the defect this change exists to remove, re-entered one step
+  // earlier.
+  //
+  // This calls the SAME predicate the send calls (`sparkleBusyNow`), not a restatement of it, and it
+  // does not decide the refusal: on a hit we simply write nothing and fall through, so the sentence
+  // the caller gets is still the send's own. The dispatcher's SCREEN-derived arms need no pre-check
+  // here — `verifiedPickerPress` waives them, on the very fingerprint match this function performed
+  // two statements ago.
+  //
+  // NOT THE TRIAL WALL, and that is a measured fact rather than an omission: `trial-spent` sits
+  // BELOW the dispatcher's picker block, which returns first, so a press is not subject to it at
+  // all. Pre-checking it here would refuse a navigation whose press would have succeeded — the
+  // second-copy drift these pre-checks are written to avoid. (A test asserting a trial-spent refusal
+  // was written and failed green-side: the press went through.)
+  let cursorMoved = false;
+  const navigable =
+    isMultiSelectPicker(live) &&
+    isDispatchAuthority(authority) &&
+    authority.kind === "concierge-tool" &&
+    agentCanAcceptInput(agentId) &&
+    // Truthiness, exactly as gate 2.5 tests it — not a re-spelling that could disagree with it.
+    !(isSparkleAgentId(agentId) && sparkleBusyNow(Date.now()));
+  if (navigable) {
+    const highlighted = highlightedOptionIndex(getAgentScrollback(agentId) ?? "");
+    if (highlighted === null || highlighted >= live.length) {
+      log.warn("concierge", "multi-select press refused — no row carries the cursor", {
+        agentId,
+        index,
+        options: live.length,
+      });
+      return {
+        ok: false,
+        agentId,
+        reason: "cursor-unknown",
+        detail:
+          "That's a multi-select menu, where the press toggles whichever row is highlighted — and " +
+          "I can't see which row that is, so I can't tell how far to move before pressing. I won't " +
+          "toggle a checkbox on a guess. Its terminal pane may not be mounted; open it and answer " +
+          "the question directly.",
+      };
+    }
+    if (highlighted !== index) {
+      const key = index > highlighted ? CONTROL_KEYS.down : CONTROL_KEYS.up;
+      try {
+        // ONE CHAINED WRITE, not one per row: the arrows and the press that follows share the
+        // per-agent queue, so nothing can land between them — and a single write cannot be
+        // interleaved with another operation's paste→CR window part-way through the walk.
+        await writePtyChainedStrict(agentId, key.repeat(Math.abs(index - highlighted)));
+        cursorMoved = true;
+      } catch (e) {
+        if (e instanceof PtyGoneError) {
+          return { ok: false, agentId, reason: "pty-gone", detail: sendDetail("pty-gone", agentId) };
+        }
+        throw e;
+      }
+    }
+  }
   // The option's own `value` is the exact string the human's click would inject, so this presses the
   // button the same way the UI does — through the ordinary authority-gated send, not a second path.
   //
@@ -1494,9 +1607,22 @@ export async function selectPickerOption(
   const sent = await sendToAgentTerminal(agentId, chosen.value, authority, {
     pickerPress: { fingerprint: now },
   });
-  return sent.ok
-    ? { ok: true, agentId, label: chosen.label }
-    : { ok: false, agentId, reason: sent.path, detail: sent.detail };
+  if (sent.ok) return { ok: true, agentId, label: chosen.label };
+  // SAY THAT THE HIGHLIGHT MOVED, when it did. The gates this layer owns run above the walk, so a
+  // refusal reaching here is one only the dispatcher could make — and the caller has to be told,
+  // or it re-reads the menu, sees the same options, and computes its next walk from the highlight
+  // it remembers rather than the one on screen.
+  return {
+    ok: false,
+    agentId,
+    reason: sent.path,
+    detail: cursorMoved
+      ? `${sent.detail} I had already moved that menu's highlight to the option you asked for, ` +
+        `so nothing was ticked but the highlighted row is no longer where you last read it — ` +
+        `read the options again before pressing anything.`
+      : sent.detail,
+    ...(cursorMoved ? { cursorMoved: true as const } : {}),
+  };
 }
 
 

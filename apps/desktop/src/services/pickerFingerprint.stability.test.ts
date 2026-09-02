@@ -323,3 +323,61 @@ describe("a borderless menu does not adopt the transcript divider as its border"
     expect(new Set(fingerprintsAcrossTicks(borderlessUnderDivider)).size).toBe(1);
   });
 });
+
+// ══ ARROWING A BOXED MENU MUST NOT MOVE THE FINGERPRINT (roborev 74270, High) ═══════════════════
+// Claude Code draws EVERY dialog boxed, so a real option row reads `│ ❯ 1. Local files`. The
+// pointer strip in `questionBlock` was anchored at `^\s*[❯›>]`, which never matches a row that
+// starts with `│` — so the moving pointer stayed in the hashed material and merely ARROWING changed
+// two lines of the block.
+//
+// That is not cosmetic. `verifiedPickerPress` re-derives the fingerprint from the CURRENT screen
+// and compares it to the one taken BEFORE the arrow walk, so on a boxed dialog the two disagreed
+// and the press took the `blocked-prompt` arm: arrows landed, highlight moved, nothing ticked,
+// press refused — the very defect the multi-select fix exists to remove.
+//
+// The existing suite could not see it: its widget fixture renders UNBOXED rows, where the old strip
+// does succeed. So this test asserts on BOXED material specifically.
+describe("a boxed menu's fingerprint survives the cursor walk", () => {
+  beforeEach(() => {
+    screen = "";
+  });
+
+  /** A boxed multi-select dialog with the pointer on `at`, drawn the way Claude Code draws it. */
+  const boxedMenu = (at: number): string =>
+    [
+      SATURATING_TRANSCRIPT,
+      "╭──────────────────────────────────────────╮",
+      "│ Which sources should I read?             │",
+      "│                                          │",
+      ...["Local files", "The web", "Both"].map(
+        (label, i) => `│ ${i === at ? "❯" : " "} ${i + 1}. [ ] ${label}`.padEnd(43) + "│",
+      ),
+      "╰──────────────────────────────────────────╯",
+    ].join("\n");
+
+  it("moving the pointer between boxed rows leaves the fingerprint UNCHANGED", () => {
+    screen = boxedMenu(0);
+    const options = detectTerminalPrompts(screen);
+    expect(options.length).toBeGreaterThan(0); // the fixture must actually parse, or this is vacuous
+
+    const atTop = pickerFingerprint("agent-1", options);
+    screen = boxedMenu(1);
+    const atSecond = pickerFingerprint("agent-1", options);
+    screen = boxedMenu(2);
+    const atThird = pickerFingerprint("agent-1", options);
+
+    expect(atSecond).toBe(atTop);
+    expect(atThird).toBe(atTop);
+  });
+
+  it("PAIRED: a changed QUESTION on the same boxed shape still moves the fingerprint", () => {
+    // Otherwise the assertion above would be satisfied by a fingerprint that ignores the box
+    // entirely — stability is only meaningful beside a demonstration that identity still bites.
+    screen = boxedMenu(0);
+    const options = detectTerminalPrompts(screen);
+    const before = pickerFingerprint("agent-1", options);
+    screen = boxedMenu(0).replace("Which sources should I read?", "Delete every source?        ");
+    const after = pickerFingerprint("agent-1", options);
+    expect(after).not.toBe(before);
+  });
+});
