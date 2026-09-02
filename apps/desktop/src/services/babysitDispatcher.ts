@@ -97,6 +97,21 @@ export const BABYSIT_LEASE_HEARTBEAT_COMMAND = "babysit_lease_heartbeat";
 export const BABYSIT_LEASE_REASON_HELD_LIVE = "held-live";
 
 /**
+ * MUST match `REASON_INVALID` / `LEASE_ERR_INVALID` in `babysit_lease.rs`.
+ *
+ * THE CALL WAS MALFORMED AND WILL NEVER SUCCEED AS WRITTEN. This is not the same fact as
+ * {@link BABYSIT_LEASE_REASON_UNKNOWN}, and the difference is what this sweep should do next: an
+ * unreadable store clears on its own and the next tick is the right answer, whereas arguments the
+ * validator rejects are rejected identically forever. Both used to arrive here spelled `unknown`,
+ * so a permanent caller bug was logged as a transient blip and retried every sweep
+ * (sparkle-nlxgd2, sparkle-wb5pqe).
+ */
+export const BABYSIT_LEASE_REASON_INVALID = "invalid";
+
+/** MUST match `REASON_UNKNOWN` in `babysit_lease.rs` — "I could not look; ask again". */
+export const BABYSIT_LEASE_REASON_UNKNOWN = "unknown";
+
+/**
  * THE CEILING `babysit_lease.rs::is_agent_id` ENFORCES. An id one byte over is rejected, and the
  * rejection is indistinguishable from "another driver holds it" to a caller reading `acquired`.
  */
@@ -1089,13 +1104,40 @@ async function dispatchOne(
         pr,
         detail: refusal.detail ?? null,
       });
+    } else if (refusal.reason === BABYSIT_LEASE_REASON_INVALID) {
+      // PERMANENT. The lease store rejected the arguments themselves, so every future sweep sends
+      // the same rejected call and gets the same answer. That is a bug HERE, and it is logged at
+      // error rather than warn so it does not sit in the same bucket as the store being busy for a
+      // moment — a distinction that only exists because the Rust side stopped spelling both
+      // `unknown` (sparkle-nlxgd2, sparkle-wb5pqe).
+      log.error("babysit", "lease acquire REFUSED as MALFORMED; retrying cannot help", {
+        repo,
+        pr,
+        holder,
+        reason: refusal.reason,
+        detail: refusal.detail ?? null,
+      });
     } else {
+      // TRANSIENT (or unreported). `unknown` means the store could not be read — the next sweep is
+      // the right response, so this stays a warning.
+      //
+      // RECOGNISED vs UNRECOGNISED is worth carrying, because this module is the consumer of a
+      // vocabulary that lives on the OTHER side of the wire. A reason that is neither `held-live`,
+      // `invalid` nor `unknown` means the Rust side grew a token this file has never heard of, and
+      // the safe reading of an unknown token is the retryable one — but reading it silently is how
+      // a vocabulary drifts apart unnoticed, which is the whole defect this split exists to fix
+      // (sparkle-nlxgd2, sparkle-wb5pqe). So say which of the two it was.
+      const recognised = refusal.reason === BABYSIT_LEASE_REASON_UNKNOWN;
       log.warn("babysit", "lease acquire REFUSED for a non-held reason; not dispatching", {
         repo,
         pr,
         holder,
         reason: refusal.reason ?? "unreported",
         detail: refusal.detail ?? null,
+        retryable: true,
+        // False means the token is outside this file's vocabulary — treated as retryable because
+        // that is the safe default, NOT because it was understood.
+        recognisedReason: recognised,
       });
     }
     return null;

@@ -32,6 +32,17 @@
 //!   * **HELD-LIVE** — a lease exists and its holder is still plausibly alive. Acquire REFUSES.
 //!   * **HELD-DEAD** — a lease exists but its holder is gone. Acquire TAKES IT OVER, and says so.
 //!   * **UNKNOWN** — the store could not be read or parsed. Acquire REFUSES, naming that reason.
+//!   * **INVALID** — the CALL was malformed (an unparseable repo slug, `pr == 0`, an agent id the
+//!     validator rejects). Acquire REFUSES, and this is a FOURTH reason, not a flavour of UNKNOWN.
+//!
+//! INVALID IS NOT UNKNOWN, AND THE DIFFERENCE IS THE CALLER'S NEXT MOVE. `unknown` means *"I could
+//! not look; ask again"* — the sweep runs on a timer, so retrying is exactly right. `invalid` means
+//! *"these arguments will never be accepted, however many times you send them"*: retrying is a
+//! busy-loop and the fix is in the caller. Collapsing the two hands a caller one word for two
+//! opposite instructions, which is the same trap [`LeaseError`] already avoids for the other three
+//! operations with [`LEASE_ERR_INVALID`] — acquire simply never grew the matching value
+//! (sparkle-nlxgd2, sparkle-wb5pqe). Note the harm is asymmetric to sparkle-2hsrlz's: there the
+//! validation bail was invisible; here it is visible but *mislabelled as retryable*.
 //!
 //! UNKNOWN MUST NEVER COLLAPSE INTO FREE. The harm being prevented is double-posting on a human's
 //! pull request, so "I could not tell whether a driver exists" has to fail CLOSED against dispatch.
@@ -120,6 +131,11 @@ const PRUNE_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 /// to anything but a human reading a log.
 pub const REASON_HELD_LIVE: &str = "held-live";
 pub const REASON_UNKNOWN: &str = "unknown";
+/// The call itself was malformed and will NEVER succeed as written — a bug in the caller, not a
+/// condition that clears. Deliberately the SAME token as [`LEASE_ERR_INVALID`]: one vocabulary
+/// across all four operations, so a consumer that learns `invalid` on heartbeat does not have to
+/// learn a second spelling for acquire.
+pub const REASON_INVALID: &str = LEASE_ERR_INVALID;
 
 /// The same discipline for the OTHER two operations, and for the same reason — here it is if
 /// anything sharper. A failed heartbeat is the only signal a running driver gets that it no longer
@@ -222,7 +238,10 @@ pub struct AcquireOutcome {
     /// Who holds it instead. `None` when `acquired`, or when the reason is `unknown` (we could not
     /// read the store, so we do not know who — and must not imply nobody).
     pub held_by: Option<BabysitLease>,
-    /// [`REASON_HELD_LIVE`] or [`REASON_UNKNOWN`]. `None` iff `acquired`.
+    /// [`REASON_HELD_LIVE`], [`REASON_UNKNOWN`] or [`REASON_INVALID`]. `None` iff `acquired`.
+    ///
+    /// The three are branched on, not logged: `held-live` is the ordinary one-driver-per-PR
+    /// outcome, `unknown` says retry, `invalid` says stop and fix the call.
     pub reason: Option<String>,
     /// True when the acquisition RECLAIMED a dead lease rather than starting from free.
     pub took_over: bool,
@@ -267,6 +286,20 @@ impl AcquireOutcome {
             lease: None,
             held_by: None,
             reason: Some(REASON_UNKNOWN.into()),
+            took_over: false,
+            previous_holder: None,
+            detail: Some(detail.into()),
+        }
+    }
+
+    /// The call was malformed. Same SHAPE as [`AcquireOutcome::unknown`] — refuse, write nothing,
+    /// name nobody — and a DIFFERENT `reason`, because the caller's next move is the opposite one.
+    fn invalid(detail: impl Into<String>) -> Self {
+        AcquireOutcome {
+            acquired: false,
+            lease: None,
+            held_by: None,
+            reason: Some(REASON_INVALID.into()),
             took_over: false,
             previous_holder: None,
             detail: Some(detail.into()),
@@ -745,13 +778,17 @@ pub fn acquire_at(
     now_ms: u64,
     stale_ms: u64,
 ) -> AcquireOutcome {
+    // ARGUMENT VALIDATION — `invalid`, NOT `unknown`. Both fail closed and both write nothing, so
+    // the SAFETY argument is identical; what differs is what the caller should do next. These
+    // arguments are wrong in the caller and re-sending them cannot start working, whereas the
+    // `unknown` bails below (lock, load, save) are all conditions that clear on their own and the
+    // sweep's next tick is the right response. Reporting a malformed call as `unknown` told the
+    // dispatcher to retry forever (sparkle-nlxgd2, sparkle-wb5pqe).
     let Some(repo) = normalize_repo(repo) else {
-        // Fails CLOSED, and reports `unknown` rather than inventing a third reason value: we truly
-        // cannot say whether a driver exists for a repository we cannot name.
-        return AcquireOutcome::unknown(format!("not a valid owner/name repo: {repo:?}"));
+        return AcquireOutcome::invalid(format!("not a valid owner/name repo: {repo:?}"));
     };
     if pr == 0 || !is_agent_id(agent_id) {
-        return AcquireOutcome::unknown(format!("invalid pr {pr} or agent id {agent_id:?}"));
+        return AcquireOutcome::invalid(format!("invalid pr {pr} or agent id {agent_id:?}"));
     }
 
     let _guard = match lock_store(app_data, epoch) {
@@ -1076,7 +1113,10 @@ mod tests {
         let d = tmp();
         let out = acquire_at(d.path(), "drodio/sparkle", 2658, broken, EPOCH_A, T0, STALE_MS_DEFAULT);
         assert!(!out.acquired);
-        assert_eq!(out.reason.as_deref(), Some(REASON_UNKNOWN));
+        // INVALID, not UNKNOWN. The id will never be accepted, so telling the dispatcher to retry
+        // is telling it to busy-loop; `unknown` is reserved for conditions that clear.
+        assert_eq!(out.reason.as_deref(), Some(REASON_INVALID));
+        assert_ne!(out.reason.as_deref(), Some(REASON_UNKNOWN));
         // AND THE STORE IS UNTOUCHED — this is where the silence came from: it bails before writing.
         assert!(stored(d.path(), "drodio/sparkle", 2658).is_none());
     }
@@ -1595,16 +1635,51 @@ mod tests {
         assert_eq!(normalize_repo("../../etc"), None);
         assert_eq!(normalize_repo(""), None);
 
-        // …and the refusal reaches the caller as UNKNOWN (fail closed), writing nothing.
+        // …and the refusal reaches the caller as INVALID (fail closed), writing nothing.
         let d = tmp();
         let out = acquire_at(d.path(), "a/b#9", 1, "driver", EPOCH_A, T0, STALE_MS_DEFAULT);
         assert!(!out.acquired);
-        assert_eq!(out.reason.as_deref(), Some(REASON_UNKNOWN));
+        assert_eq!(out.reason.as_deref(), Some(REASON_INVALID));
         assert!(!store_path(d.path()).exists(), "an invalid request must not create a store");
-        // A bogus PR number or agent id is refused the same way.
-        assert!(!acquire_at(d.path(), "a/b", 0, "driver", EPOCH_A, T0, STALE_MS_DEFAULT).acquired);
-        assert!(!acquire_at(d.path(), "a/b", 1, "bad id", EPOCH_A, T0, STALE_MS_DEFAULT).acquired);
-        assert!(!acquire_at(d.path(), "a/b", 1, "", EPOCH_A, T0, STALE_MS_DEFAULT).acquired);
+        // A bogus PR number or agent id is refused the same way — and the REASON is asserted on
+        // each, not just `acquired`: a bare `!acquired` is satisfied by the ordinary contended
+        // outcome, which is the very confusion this reason exists to end.
+        for (pr, id, why) in [
+            (0u64, "driver", "pr 0"),
+            (1, "bad id", "a space in the id"),
+            (1, "", "an empty id"),
+        ] {
+            let out = acquire_at(d.path(), "a/b", pr, id, EPOCH_A, T0, STALE_MS_DEFAULT);
+            assert!(!out.acquired, "{why} must be refused");
+            assert_eq!(out.reason.as_deref(), Some(REASON_INVALID), "{why} is a malformed call");
+            assert!(out.held_by.is_none(), "{why}: a malformed call must name no holder");
+        }
+    }
+
+    #[test]
+    fn a_malformed_call_and_an_unreadable_store_are_told_apart() {
+        // THE PAIRED HALF, and the whole point of the change. "Validation reports invalid" alone is
+        // satisfied by a function that reports `invalid` for EVERYTHING — which would relabel the
+        // retryable store failures as permanent and strand a PR that a retry would have picked up.
+        // Both directions have to hold at once, so both are asserted here in one test.
+        let d = tmp();
+        let malformed = acquire_at(d.path(), "a/b", 1, "bad id", EPOCH_A, T0, STALE_MS_DEFAULT);
+        assert_eq!(malformed.reason.as_deref(), Some(REASON_INVALID));
+
+        let corrupt = tmp();
+        std::fs::create_dir_all(corrupt.path()).unwrap();
+        std::fs::write(store_path(corrupt.path()), "{ not json").unwrap();
+        let unreadable = acquire(corrupt.path(), "driver-1", T0);
+        assert_eq!(
+            unreadable.reason.as_deref(),
+            Some(REASON_UNKNOWN),
+            "an unreadable store is RETRYABLE and must not be relabelled as a malformed call",
+        );
+
+        assert_ne!(
+            malformed.reason, unreadable.reason,
+            "these are opposite instructions to the caller and must not share one word",
+        );
     }
 
     #[test]

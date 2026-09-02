@@ -68,6 +68,8 @@ import {
   dispatchConciergeAnswer,
 } from "./conciergeDispatch";
 import type { ConciergeDispatchPath } from "./conciergeDispatch";
+import { altScreenRefusalVerdict, type AltScreenRefusalVerdict } from "../engine/screenReadability";
+import { getAgentViewport } from "./terminalViewport";
 import { getRelaySocket } from "./relayClient";
 import { log } from "../logger";
 import { findWindowForProject } from "./windowRegistry";
@@ -338,9 +340,21 @@ let idleClock: Map<string, number> = new Map();
  *  idle-clock re-arm below only lands after the await, so without this a second sweep starting
  *  while a slow PTY write is still pending would decide to send again off the pre-send clock. */
 const inFlight = new Set<string>();
-/** agentId → how many auto-continues IN A ROW never reached the terminal, and the path the last one
- *  refused on. See {@link MAX_UNDELIVERED_CONTINUES}. Cleared by a delivery and by an escalation. */
-const undelivered = new Map<string, { count: number; path: string }>();
+/** agentId → how many auto-continues IN A ROW never reached the terminal for the SAME REASON, and
+ *  what that reason was. See {@link MAX_UNDELIVERED_CONTINUES}. Cleared by a delivery and by an
+ *  escalation.
+ *
+ *  ── THE REASON IS PART OF THE STREAK, NOT A LABEL ON IT (bead sparkle-phb1h (d)) ───────────────
+ *  It used to be a label: the count advanced on ANY refusal and only the last path was remembered,
+ *  so three refusals with three different causes reached the bound and escalated with the reason of
+ *  whichever one happened to be third. That is not the fact the bound is meant to certify — its own
+ *  doc says "only a condition that holds across three consecutive settle windows escalates" — and it
+ *  meant a structural refusal that will never change (a dead PTY) shared its three strikes with a
+ *  transient one (a PTY still coming up). The count now RESETS when the reason changes, so each
+ *  reason gets its own budget and the escalation names a condition that actually held three times.
+ *
+ *  The key stays the agent id so the roster prune below still reaches every entry. */
+const undelivered = new Map<string, { count: number; reason: string }>();
 /** agentId → epoch ms until which this sweep must not type anything into it. See
  *  {@link suppressContinuation}. */
 const suppressedUntil = new Map<string, number>();
@@ -754,6 +768,12 @@ export function undeliveredStreakFor(agentId: string): number {
   return undelivered.get(agentId)?.count ?? 0;
 }
 
+/** The streak key: the dispatch path, plus the screen verdict when there is one. Two refusals with
+ *  the same path but different screens are different conditions and get different budgets. */
+function refusalReasonKey(path: UndeliveredPath, screenVerdict?: AltScreenRefusalVerdict): string {
+  return screenVerdict === undefined ? path : `${path}/${screenVerdict}`;
+}
+
 /** Quote up to the first few menu labels for the alternate-screen "a dialog is waiting" copy, so the
  *  human is told WHICH question is on the screen rather than being sent to hunt for it. Empty in →
  *  empty string out, so the caller can concatenate unconditionally. */
@@ -767,6 +787,30 @@ function namedMenuOptions(labels: string[]): string {
   const more = labels.length > shown.length ? ", …" : "";
   return ` — the options are ${quoted}${more}`;
 }
+
+/**
+ * WHY THERE IS NO SHARED BLOCKED-PROMPT SENTENCE HERE ANY MORE.
+ *
+ * There was one, read by two arms of {@link undeliverableReason}, and it was removed deliberately —
+ * twice over, for two independent reasons that point the same way:
+ *
+ *  1. THE COPY WAS WRONG WHEN BORROWED. The label-less form is a CLAIM (a password / a host-key /
+ *     a yes-no), true only on the path that positively identified a prompt by KIND. Reached from
+ *     `alternate-screen`, where all that was observed is a dialog frame, it told the human a
+ *     credential prompt was waiting on a screen where none was seen — and each false claim spends
+ *     one of the finite `MAX_CONCIERGE_REARMS`. (roborev 75882, High.)
+ *
+ *  2. THE COPY BECAME UNAUDITABLE. `scripts/screen-refusal-copy-drift.sh` grades these arms by
+ *     reading the ARM's own lines: RULE A forbids an `alternate-screen` sentence from claiming a
+ *     'permission dialog', RULE B requires the `blocked-prompt` arm to name one. With the
+ *     sentences behind a helper both arms read as empty, so BOTH rules passed vacuously on the one
+ *     file whose routing change (bead sparkle-d6a5r) they exist to police.
+ *
+ * De-duplicating founder-facing copy is normally right — AGENTS.md § User-facing copy is code. It
+ * is wrong HERE because the two arms are not saying the same thing: they describe screens observed
+ * by different probes, and the guard's whole job is to check that they keep describing them
+ * differently. Each arm spells its own sentences, at the arm.
+ */
 
 /**
  * What to tell the human when auto-continue could not DELIVER, keyed on the dispatch path.
@@ -788,6 +832,9 @@ function undeliverableReason(
    *  credential field, which never carries labels by construction). Undefined for every other path.
    *  See {@link ConciergeDispatchResult.liveMenuLabels} and beads sparkle-j2gase, sparkle-d6a5r. */
   liveMenuLabels?: string[],
+  /** For `alternate-screen` only: what {@link altScreenRefusalVerdict} made of the screen the
+   *  refusal was taken against. Undefined on every other path, and on a call that never asked. */
+  screenVerdict?: AltScreenRefusalVerdict,
 ): string {
   // THE SCREEN ARMS ARE RUNTIME-AWARE TOO, not just the closing sentence. Both of these fire for a
   // cloud agent — the guards that produce them run BEFORE the cloud branch and read the RELAYED
@@ -822,9 +869,45 @@ function undeliverableReason(
         // "answer what is on screen" is a dead instruction there, so say the true remedy: quitting it
         // is safe and will not lose the turn. Measured: four agents in one morning, every one a
         // no-menu pager, all told to go find a dialog that was not there.
-        liveMenuLabels && liveMenuLabels.length > 0
-          ? `${screen} has a dialog waiting for your answer${namedMenuOptions(liveMenuLabels)}. It is a menu the auto-resume cannot answer for you — open ${pane} and choose what is on screen, and the auto-resume will take over again`
-          : `${screen} is in full-screen mode with no menu on it — a pager or editor is holding the screen, so nothing is waiting on an answer. Quitting it is safe and will not lose the turn (the goal resumes where it left off): open ${pane} and quit the pager or editor, and the auto-resume will take over again`
+        //
+        // ── AND THE NO-MENU BRANCH IS GONE ENTIRELY (bead sparkle-phb1h) ─────────────────────
+        // It used to say "a pager or editor is holding the screen". That is the SAME class of
+        // unwarranted claim the comment above corrected once already, one branch further down:
+        // the refusal fires on `!isClaudeCodeScreen`, and a Claude Code screen that has merely
+        // lost its composer box fails that predicate. Measured three times on 2026-08-20 — every
+        // one an ordinary Claude Code pane answering `present=false, blind='no-menu'` live, one of
+        // them seconds after MERGING ITS PR. Two of the three were latched, and un-latching spends
+        // one of the finite `MAX_CONCIERGE_REARMS`.
+        //
+        // So the ladder no longer escalates that state at all — see `noteUndelivered`, which fails
+        // OPEN on every `alternate-screen` verdict but `claude-dialog`, on the founder's own
+        // instruction. This arm is what a `claude-dialog` verdict says, and it says it in the
+        // BLOCKED-PROMPT words: that copy already tells the human to answer the prompt in the pane,
+        // which is the true remedy for the one alternate-screen shape that still reaches a human.
+        // The second branch is defensive — reachable only if a future caller escalates a verdict
+        // this one does not — and it claims nothing it cannot see.
+        //
+        // ── THIS ARM OWNS ITS WORDS, AND MUST NOT BORROW THE OTHER PATH'S ───────────────────
+        // It used to call the shared `blockedPromptSentence`. That sharing was the roborev 75882
+        // defect — the label-less form leaked a credential claim onto a screen where none was
+        // observed — and patching it with a discriminator left a worse problem behind: with the
+        // copy living in a helper, `screen-refusal-copy-drift.sh` reads BOTH arms as empty, so
+        // RULE A (no `alternate-screen` sentence may claim a permission dialog) and RULE B
+        // (the `blocked-prompt` arm must name one) both went VACUOUS on this file. A guard that
+        // cannot see the copy it grades is worse than no guard, because it reports ok.
+        //
+        // So each arm spells its own sentences, and the two say DIFFERENT things because the two
+        // paths observed different things:
+        //   • WITH a menu — options were actually read off the viewport, so name them and ask for
+        //     an answer. It is a "dialog", NOT a "permission dialog": that phrase belongs to
+        //     `blocked-prompt`, whose classifier identified the prompt by KIND. All that was seen
+        //     here is a dialog frame (bead sparkle-d6a5r, and RULE A of the drift guard).
+        //   • WITHOUT one — say only that a dialog is there whose options could not be read.
+        screenVerdict === "claude-dialog" || (liveMenuLabels && liveMenuLabels.length > 0)
+          ? liveMenuLabels && liveMenuLabels.length > 0
+            ? `${screen} has a dialog waiting for your answer${namedMenuOptions(liveMenuLabels)}. It is a decision the auto-resume cannot make for you — open ${pane} and choose what is on screen, and the auto-resume will take over again`
+            : `${screen} has a dialog on it whose options the auto-resume could not read — open ${pane} and answer what is on screen, and the auto-resume will take over again`
+          : `${screen} is showing something the auto-resume could not recognise, and it found no menu on it — so nothing is known to be waiting on an answer. Open ${pane} to see what it is showing`
       : path === "blocked-prompt"
         ? // ── A PERMISSION DIALOG ARRIVES HERE NOW (bead sparkle-d6a5r) ─────────────────────────
           // It used to take `alternate-screen` and be described as an editor or a pager, which the
@@ -848,9 +931,15 @@ function undeliverableReason(
           // Neither branch may suggest restarting the agent: this bead exists because
           // `restart_agent` — which destroys in-flight context to deliver one message — was left as
           // the only route to the pane.
+          //
+          // ── SPELLED OUT HERE, NOT BEHIND A HELPER ────────────────────────────────────────────
+          // `screen-refusal-copy-drift.sh` RULE B greps THIS ARM for the words 'permission dialog'.
+          // While these two sentences lived in a shared function the grep found nothing and the
+          // rule passed vacuously — on the one file whose routing change (sparkle-d6a5r) the rule
+          // was written to police. Copy that a guard grades belongs where the guard reads it.
           liveMenuLabels && liveMenuLabels.length > 0
-          ? `${screen} has a permission dialog waiting for your answer${namedMenuOptions(liveMenuLabels)}. It is a decision the auto-resume cannot make for you — open ${pane} and choose what is on screen, and the auto-resume will take over again`
-          : `${screen} is waiting at a prompt that must not receive free text — a password, a host-key confirmation, or a yes/no. Answer that prompt in ${pane}`
+            ? `${screen} has a permission dialog waiting for your answer${namedMenuOptions(liveMenuLabels)}. It is a decision the auto-resume cannot make for you — open ${pane} and choose what is on screen, and the auto-resume will take over again`
+            : `${screen} is waiting at a prompt that must not receive free text — a password, a host-key confirmation, or a yes/no. Answer that prompt in ${pane}`
         : path === "pty-gone"
           ? "its process is gone. Restart the agent to pick the goal back up"
           : // SPLIT FROM `pty-gone`, because the remedies differ and this one already has an
@@ -1267,7 +1356,16 @@ async function continueAgent(
       // Undefined everywhere else, which is exactly what `undeliverableReason` wants for every
       // other arm. (It was `alternate-screen`-only until the permission dialog was reclassified
       // onto `blocked-prompt`; bead sparkle-d6a5r.)
-      noteUndelivered(projectId, agent, result.path, now, result.liveMenuLabels);
+      // ── CLASSIFY THE SCREEN BEFORE DECIDING WHAT TO SAY ABOUT IT (bead sparkle-phb1h) ────────
+      // Only for `alternate-screen`: that is the one path whose refusal used to be reported as a
+      // claim about a full-screen app, and the only one this verdict changes. Read from the same
+      // `TerminalViewport` registry every write guard reads, so the ladder cannot answer from
+      // different evidence than the refusal it is describing (see `engine/screenReadability`).
+      const screenVerdict =
+        result.path === "alternate-screen"
+          ? altScreenRefusalVerdict(getAgentViewport(agent.id), result.liveMenuLabels)
+          : undefined;
+      noteUndelivered(projectId, agent, result.path, now, result.liveMenuLabels, screenVerdict);
     }
   } catch (e) {
     outcome.detail = "threw";
@@ -1308,14 +1406,37 @@ function noteUndelivered(
    *  so this needs no persisting in the streak map: the sweep that trips the bound carries its own
    *  menu state. */
   liveMenuLabels?: string[],
+  /** For `alternate-screen`: what {@link altScreenRefusalVerdict} made of the screen. This decides
+   *  BOTH whether a human is told and what they are told — see the fail-open block below. */
+  screenVerdict?: AltScreenRefusalVerdict,
 ): void {
-  const count = (undelivered.get(agent.id)?.count ?? 0) + 1;
-  undelivered.set(agent.id, { count, path });
+  const reason = refusalReasonKey(path, screenVerdict);
+  const prior = undelivered.get(agent.id);
+  // A DIFFERENT REASON STARTS A NEW STREAK — see the map's own note. Three refusals with three
+  // different causes are not a condition that held three times.
+  const count = prior !== undefined && prior.reason === reason ? prior.count + 1 : 1;
+  undelivered.set(agent.id, { count, reason });
   log.warn("goals", "auto-continue did not reach the terminal", {
     agentId: agent.id,
     path,
+    ...(screenVerdict !== undefined ? { screenVerdict } : {}),
     consecutive: count,
   });
+  // ══ FAIL OPEN ON A SCREEN THE DETECTOR CANNOT RECOGNISE — bead sparkle-phb1h ═══════════════════
+  // The founder's own remedy, and the newest word on that bead: *"when it cannot recognise the
+  // screen, do not escalate; report 'unreadable' and let the nudge ladder continue."* It supersedes
+  // the bead body, which would have kept the escalation for the zero-evidence case.
+  //
+  // WHY IT IS SAFE TO GO NO FURTHER HERE, and not a hidden actionable row: a screen the app cannot
+  // read is ALREADY a red row reading "Can't read screen" (`engine/screenReadability`), and that row
+  // already pages the founder. This ladder escalating on top of it added no information and spent a
+  // finite budget — un-latching costs one of `MAX_CONCIERGE_REARMS`, which refills only when a human
+  // types. Measured three times: an ordinary Claude Code pane, no dialog on it, latched anyway; one
+  // of the three seconds after it MERGED ITS PR, another left with its last re-arm gone.
+  //
+  // The streak is still counted and still logged, so the condition is visible to anyone reading the
+  // log — what is withheld is only the claim that a human is needed.
+  if (path === "alternate-screen" && screenVerdict !== "claude-dialog") return;
   if (count < MAX_UNDELIVERED_CONTINUES) return;
   undelivered.delete(agent.id);
   escalateToHuman(
@@ -1326,6 +1447,7 @@ function noteUndelivered(
       path,
       agent.runtime === "cloud",
       liveMenuLabels,
+      screenVerdict,
     ),
     "escalate",
     now,

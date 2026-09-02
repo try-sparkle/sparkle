@@ -240,6 +240,7 @@ import {
   CONCIERGE_SELF_NAME,
   setChiefClient,
   controlExpiredSkipCounts,
+  controlLateAppliedCounts,
   _resetControlExpiredSkipsForTests,
   type ControlRequest,
 } from "./controlListener";
@@ -7624,6 +7625,141 @@ describe("controlListener", () => {
       } finally {
         off();
       }
+    });
+
+    // ── THE GOAL-LATCH CARVE-OUT (beads sparkle-cqrgup / sparkle-az599n / sparkle-c9ht67) ────────
+    //
+    // Every case above is about work that must NOT be done for a caller who gave up. These two ops
+    // are the measured exception, and the exception is decided by ARITHMETIC, not by taste.
+    //
+    // WHAT SKIPPING COSTS HERE. `metAt` is the only signal that separates an agent that FINISHED
+    // from one that stalled. Drop it and the agent is auto-resumed: a whole context re-billed, a
+    // fresh turn's load added to the machine that was already too loaded to answer within 10s — so
+    // the drop CAUSES more of the condition that caused the drop. Measured in one overnight session
+    // at load 130-372: 80 expired `set_agent_goal_met`, 3 expired `set_agent_goal`.
+    //
+    // WHAT RUNNING IT COSTS. A `setState`. `set_agent_goal_met`'s one expensive input — the git
+    // ancestry probe — is already gated to a `landed`-kind goal whose cheap reading came back
+    // non-true, for one agent, once, on the call it makes when it believes it is done.
+    //
+    // So the skip stays the default and these two are exempt. `set_agent_activity` and
+    // `rename_agent` are deliberately NOT exempt: losing them costs a stale status line, which is
+    // the trade sparkle-4rgb1 already priced — the cases above still pin that, and the contrast
+    // case below proves this carve-out is per-op rather than the expiry gate being switched off.
+    //
+    // THE CONCIERGE IS NOT EXEMPT, and that ordering is load-bearing: its second gate runs
+    // `appOpPolicy`, which RAISES AN APPROVAL CARD on an `ask` verdict. The existing "an expired
+    // CONCIERGE op settles no receipt" case above is this carve-out's other pair.
+    it("an EXPIRED set_agent_goal_met STILL LATCHES metAt — the drop is self-amplifying", async () => {
+      useProjectStore.getState().setAgentGoal(projectId, callerId, "land the retry PR");
+      expect(goalOf(callerId)!.metAt).toBeUndefined();
+      fire({
+        reqId: "xg1",
+        op: "set_agent_goal_met",
+        callerAgentId: callerId,
+        payload: { met: true },
+        deadlineAtMs: EXPIRED(),
+      });
+      await flush();
+      // THE STORE FACT. A reply asserts nothing here — the Rust pending entry is already gone, so
+      // the only thing that can still stop the next auto-resume is the latch itself.
+      expect(goalOf(callerId)!.metAt).toEqual(expect.any(Number));
+      expect(lastReply()).toMatchObject({ ok: true, met: true });
+    });
+
+    it("…and an EXPIRED set_agent_activity in the SAME setup is still skipped", async () => {
+      // The contrast pair. If this latched too, the case above would be proving that the expiry
+      // gate was removed rather than that these two ops are exempt from it.
+      useProjectStore.getState().setAgentGoal(projectId, callerId, "land the retry PR");
+      fire({
+        reqId: "xg2",
+        op: "set_agent_activity",
+        callerAgentId: callerId,
+        payload: { activity: "should never be written" },
+        deadlineAtMs: EXPIRED(),
+      });
+      await flush();
+      expect(activityOf(callerId)).toBeUndefined();
+      expect(lastReply()).toMatchObject({ ok: false, code: "request_expired" });
+    });
+
+    it("an EXPIRED set_agent_goal still records the goal", async () => {
+      fire({
+        reqId: "xg3",
+        op: "set_agent_goal",
+        callerAgentId: callerId,
+        payload: { goal: "the transport contract is typed" },
+        deadlineAtMs: EXPIRED(),
+      });
+      await flush();
+      expect(goalOf(callerId)?.text).toBe("the transport contract is typed");
+    });
+
+    // ── A REFUSAL IS NOT AN EXPIRY (bead sparkle-8lt32i) ─────────────────────────────────────────
+    //
+    // A goal a person must verify can NEVER be self-marked. Under the old gate that permanent `no`
+    // was answered with `request_expired` — the same code a merely-slow call gets — so the caller
+    // read "transient, try again", retried four times, and filed a bead about deadlines when the
+    // true answer was that it may never make this call at all. A refusal that teaches retrying is
+    // worse than no answer.
+    it("an EXPIRED set_agent_goal_met that policy REFUSES answers with the refusal, not request_expired", async () => {
+      useProjectStore
+        .getState()
+        .setAgentGoal(projectId, callerId, "the founder has signed this off", undefined, "agent", {
+          kind: "human",
+        });
+      fire({
+        reqId: "xg4",
+        op: "set_agent_goal_met",
+        callerAgentId: callerId,
+        payload: { met: true },
+        deadlineAtMs: EXPIRED(),
+      });
+      await flush();
+      // THE CODE IS THE WHOLE POINT: `goal_not_self_markable` says "never"; `request_expired` says
+      // "again". They send the caller in opposite directions.
+      expect(lastReply()).toMatchObject({ ok: false, code: "goal_not_self_markable" });
+      expect(lastReply().code).not.toBe("request_expired");
+      // …and the gate still holds. Running an expired op must not weaken what it decides.
+      expect(goalOf(callerId)!.metAt).toBeUndefined();
+    });
+
+    it("counts a late-applied latch as LATE-APPLIED, never as a skip", async () => {
+      // The two tallies must not be one number. A drop and a late application have opposite
+      // meanings for the auto-resume storm, so folding them would hide the fix from the only
+      // reader — a human asking how often this happens.
+      useProjectStore.getState().setAgentGoal(projectId, callerId, "land the retry PR");
+      fire({
+        reqId: "xg5a",
+        op: "set_agent_goal_met",
+        callerAgentId: callerId,
+        payload: { met: true },
+        deadlineAtMs: EXPIRED(),
+      });
+      fire({
+        reqId: "xg5b",
+        op: "set_agent_activity",
+        callerAgentId: callerId,
+        payload: { activity: "nope" },
+        deadlineAtMs: EXPIRED(),
+      });
+      await flush();
+      expect(controlLateAppliedCounts()).toEqual({ set_agent_goal_met: 1 });
+      expect(controlExpiredSkipCounts()).toEqual({ set_agent_activity: 1 });
+    });
+
+    it("counts NOTHING late-applied when every request was live (the tally's own pair)", async () => {
+      useProjectStore.getState().setAgentGoal(projectId, callerId, "land the retry PR");
+      fire({
+        reqId: "xg6",
+        op: "set_agent_goal_met",
+        callerAgentId: callerId,
+        payload: { met: true },
+        deadlineAtMs: LIVE(),
+      });
+      await flush();
+      expect(goalOf(callerId)!.metAt).toEqual(expect.any(Number));
+      expect(controlLateAppliedCounts()).toEqual({});
     });
   });
 });

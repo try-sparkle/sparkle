@@ -19,6 +19,11 @@ const logDebugMock = vi.fn();
 // this module's own arguments, and "it was reported at warn, naming the reason" is the assertion —
 // the previous silent `return null` is what hid a total outage (sparkle-2hsrlz).
 const logWarnMock = vi.fn();
+// Capturable for the same reason `logWarnMock` is, and it is a SEPARATE mock on purpose: a
+// malformed call and an unreadable store are opposite instructions to this sweep (never retry vs.
+// retry next tick), so "it was reported" is not the assertion — WHICH STREAM it was reported on is
+// (sparkle-nlxgd2, sparkle-wb5pqe). Folding them into one mock is what let one word carry both.
+const logErrorMock = vi.fn();
 
 // The logger is mocked so the sweep rollup's LEVEL is assertable. `logger.ts` does not forward
 // DEBUG to the persistent log in production, so "which hold fired" is only answerable if this line
@@ -28,7 +33,7 @@ vi.mock("../logger", () => ({
     info: (...a: unknown[]) => logInfoMock(...a),
     debug: (...a: unknown[]) => logDebugMock(...a),
     warn: (...a: unknown[]) => logWarnMock(...a),
-    error: vi.fn(),
+    error: (...a: unknown[]) => logErrorMock(...a),
   },
 }));
 
@@ -56,6 +61,8 @@ import {
   BABYSIT_LEASE_HEARTBEAT_COMMAND,
   BABYSIT_LEASE_LIST_COMMAND,
   BABYSIT_LEASE_REASON_HELD_LIVE,
+  BABYSIT_LEASE_REASON_INVALID,
+  BABYSIT_LEASE_REASON_UNKNOWN,
   BABYSIT_LEASE_RELEASE_COMMAND,
   mintDispatchHolderId,
   _resetBabysitDispatcherForTests,
@@ -1622,24 +1629,89 @@ describe("mintDispatchHolderId — the lease store has to ACCEPT it", () => {
 });
 
 describe("a refused acquire SAYS WHY — the silence is what made the outage invisible", () => {
-  it("reports a NON-held refusal at warn, naming the reason and the id it was refused for", async () => {
-    // `unknown` is what an id the validator rejects comes back as. That is a bug in this caller's
-    // own arguments, so it must not be swallowed the way the ordinary one-driver-per-PR case is.
+  it("reports a RETRYABLE refusal at warn, naming the reason and the id it was refused for", async () => {
+    // `unknown` is what an unreadable or locked store comes back as. It is not a decision, so it
+    // must not be swallowed the way the ordinary one-driver-per-PR case is — but it clears on its
+    // own, so it stays a WARNING and the next sweep is the right response.
     wireInvoke({
       leases: [],
       acquired: false,
-      acquireReason: "unknown",
-      acquireDetail: 'invalid pr 1251 or agent id "babysit-dispatch:drodio/sparkle#1251:1"',
+      acquireReason: BABYSIT_LEASE_REASON_UNKNOWN,
+      acquireDetail: "could not take the lease store lock",
     });
     const out = await sweepTwice();
     expect(out.dispatched).toHaveLength(0);
 
     const warned = logWarnMock.mock.calls.filter((c) => String(c[1]).includes("REFUSED"));
     expect(warned).toHaveLength(1);
-    const fields = warned[0]?.[2] as { reason: string; holder: string; detail: string | null };
+    const fields = warned[0]?.[2] as {
+      reason: string;
+      holder: string;
+      detail: string | null;
+      retryable?: boolean;
+      recognisedReason?: boolean;
+    };
     expect(fields.reason).toBe("unknown");
     expect(fields.holder).toBe(mintDispatchHolderId("drodio/sparkle", 1251, T0 + 60_000));
+    expect(fields.detail).toContain("lock");
+    expect(fields.retryable).toBe(true);
+    // `unknown` is IN this file's vocabulary, so the retry is a decision rather than a fallback.
+    expect(fields.recognisedReason).toBe(true);
+    // …and it is NOT on the permanent stream. Without this the split below is satisfied by a
+    // module that reports everything twice.
+    expect(logErrorMock.mock.calls.filter((c) => String(c[1]).includes("MALFORMED"))).toHaveLength(0);
+  });
+
+  it("marks a reason OUTSIDE its vocabulary as unrecognised, while still retrying it", async () => {
+    // THE PAIRED HALF. Asserting `recognisedReason: true` on `unknown` alone is satisfied by a
+    // module that hardcodes `true` — which would report a token this file has never heard of as
+    // one it understands, and a vocabulary that drifts apart silently is the entire defect this
+    // split exists to fix. A token from a FUTURE Rust version must read as unrecognised.
+    wireInvoke({
+      leases: [],
+      acquired: false,
+      acquireReason: "some-token-this-file-has-never-heard-of",
+      acquireDetail: "a reason added on the Rust side after this file was written",
+    });
+    const out = await sweepTwice();
+    expect(out.dispatched).toHaveLength(0);
+
+    const warned = logWarnMock.mock.calls.filter((c) => String(c[1]).includes("REFUSED"));
+    expect(warned).toHaveLength(1);
+    const fields = warned[0]?.[2] as { reason: string; retryable?: boolean; recognisedReason?: boolean };
+    expect(fields.reason).toBe("some-token-this-file-has-never-heard-of");
+    // Still retried — an unknown token is treated as transient because that is the SAFE default,
+    // not because it was understood. Both halves matter: dropping the retry would strand a PR.
+    expect(fields.retryable).toBe(true);
+    expect(fields.recognisedReason).toBe(false);
+    // And an unrecognised token is NOT escalated to the permanent stream — only `invalid` is.
+    expect(logErrorMock.mock.calls.filter((c) => String(c[1]).includes("MALFORMED"))).toHaveLength(0);
+  });
+
+  it("reports a MALFORMED call at error — a permanent refusal is not a transient one", async () => {
+    // THE SPLIT. `invalid` is the Rust side saying these arguments will never be accepted, so a
+    // retry is a busy-loop and the fix is in this module. Before the reason existed, this arrived
+    // spelled `unknown` — one word for "ask again" and "stop asking" (sparkle-nlxgd2,
+    // sparkle-wb5pqe). Assert the SIDE EFFECT: which stream carried it, and that it named the
+    // holder the call was refused for, so the bad argument is readable from the log alone.
+    wireInvoke({
+      leases: [],
+      acquired: false,
+      acquireReason: BABYSIT_LEASE_REASON_INVALID,
+      acquireDetail: 'invalid pr 1251 or agent id "babysit-dispatch:drodio/sparkle#1251:1"',
+    });
+    const out = await sweepTwice();
+    expect(out.dispatched).toHaveLength(0);
+
+    const errored = logErrorMock.mock.calls.filter((c) => String(c[1]).includes("MALFORMED"));
+    expect(errored).toHaveLength(1);
+    const fields = errored[0]?.[2] as { reason: string; holder: string; detail: string | null };
+    expect(fields.reason).toBe("invalid");
+    expect(fields.holder).toBe(mintDispatchHolderId("drodio/sparkle", 1251, T0 + 60_000));
     expect(fields.detail).toContain("invalid pr");
+    // A permanent refusal must not ALSO land on the retryable stream — that would put it back in
+    // the bucket a reader scans for blips, which is the confusion this whole split removes.
+    expect(logWarnMock.mock.calls.filter((c) => String(c[1]).includes("REFUSED"))).toHaveLength(0);
   });
 
   it("does NOT warn when another driver simply holds it — that one is a decision, not a bug", async () => {

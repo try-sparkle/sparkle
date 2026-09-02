@@ -24,8 +24,10 @@
 import {
   claudeCodeMarkerFamilies,
   hasClaudeCodeComposerBox,
+  hasClaudeCodeLiveTui,
   isClaudeCodeScreen,
 } from "./claudeCodeScreen";
+import { claudeCodeDialogOnScreen } from "./claudeCodeDialogScreen";
 import { getAgentViewport, type TerminalViewport } from "../services/terminalViewport";
 import { recordConciergeEvent } from "../stores/conciergeEventLog";
 import { accountedAgents, type ConciergeFeed } from "../services/conciergeFeed";
@@ -280,4 +282,83 @@ export function noteScreenReadability(
 /** Test seam — forget every latched agent, so one test's edge cannot suppress the next test's. */
 export function resetReadabilityAlarm(): void {
   blindAgents.clear();
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// THE THREE-WAY VERDICT AN `alternate-screen` REFUSAL NEEDS — bead sparkle-phb1h.
+//
+// ══ THE DEFECT ════════════════════════════════════════════════════════════════════════════════
+// `screenReadability` above answers a BINARY question, which is right for a row colour: either the
+// app can read the screen or it cannot. The auto-resume ladder inherited that binary and then said
+// something a binary cannot support — it escalated to a human with "its terminal is in full-screen
+// mode and I could not recognise it as Claude Code's own prompt", which asserts a full-screen app
+// is holding the pane. Measured three times on 2026-08-20: every one of those agents was checked
+// live and answered `present=false, blind='no-menu', freshness='live'` — an ordinary Claude Code
+// screen with no dialog on it at all. "Not confidently recognized" had been collapsed into "a pager
+// or an editor owns this terminal", which is a different and much stronger claim.
+//
+// ══ WHY IT COSTS MORE THAN A WRONG SENTENCE ═══════════════════════════════════════════════════
+// The escalation LATCHES the goal, and un-latching it spends one of `MAX_CONCIERGE_REARMS`, which
+// does not refill except by a human typing. One measured agent had just merged its PR; another was
+// left stranded with its last re-arm gone. A false verdict here therefore consumes the bounded
+// allowance that exists for real blockages.
+//
+// ══ THE SPLIT ═════════════════════════════════════════════════════════════════════════════════
+//   `claude-dialog`    — a live menu is on the screen. There IS a question and only a human can
+//                        answer it, so this is the one arm that may still escalate — through the
+//                        BLOCKED-PROMPT copy, which already says to answer the prompt in the pane.
+//   `agent-interface`  — the agent's own interface is on the screen (Claude Code marker families
+//                        are present) but nothing is waiting on an answer. This is the measured
+//                        false positive: the recognizer failed, not the agent.
+//   `unreadable`       — zero evidence either way, including "no viewport mounted in this window".
+//
+// ══ WHY THE LAST TWO BOTH FAIL OPEN ═══════════════════════════════════════════════════════════
+// The founder's own remedy on the bead, and the newest word on it: *"Recommend the detector fail
+// OPEN — when it cannot recognise the screen, do not escalate; report 'unreadable' and let the
+// nudge ladder continue."* That supersedes the bead body, which would have kept the full-screen
+// escalation for the zero-evidence case. It is not a licence to go quiet: `docs/never-hide-
+// actionable-rows.md` still applies, and it is honoured by the OTHER half of this module — a screen
+// the app cannot read is already a RED row saying "Can't read screen", and it already pages the
+// founder. What this removes is a second, weaker claim that spends a finite budget to repeat it.
+//
+// PURE, over the same `TerminalViewport` every write guard reads, for the reason the header above
+// gives: the row, the write guard and this ladder must not answer from different evidence.
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+export type AltScreenRefusalVerdict =
+  /** A live menu is on the screen — a real question, waiting on a human. */
+  | "claude-dialog"
+  /** The agent's own interface is on the screen, with no question on it. */
+  | "agent-interface"
+  /** Nothing recognisable, in either direction. Includes "no viewport in this window". */
+  | "unreadable";
+
+/**
+ * Classify the screen an `alternate-screen` refusal was taken against.
+ *
+ * NOT A PERMISSION, and it can never turn a refusal into a delivery — the refusal has already
+ * happened by the time this is asked. It decides only WHAT THE HUMAN IS TOLD, and whether they are
+ * told at all.
+ */
+export function altScreenRefusalVerdict(
+  viewport: TerminalViewport | null,
+  /** The live menu the REFUSING path's own screen read found, when it found one. Non-empty is
+   *  positive evidence of a question and outranks anything read here — that read happened at the
+   *  instant of the refusal, and this one happens a moment later. */
+  liveMenuLabels?: readonly string[],
+): AltScreenRefusalVerdict {
+  if (liveMenuLabels !== undefined && liveMenuLabels.length > 0) return "claude-dialog";
+  // NULL IS NOT "SAFE" AND IT IS NOT "A PAGER" EITHER — `terminalViewport`'s own rule. An unmounted
+  // terminal is a thing this window cannot see, which is exactly the fail-open case.
+  if (!viewport) return "unreadable";
+  if (claudeCodeDialogOnScreen(viewport.text)) return "claude-dialog";
+  // ONE FAMILY IS ENOUGH HERE, and deliberately weaker than `isClaudeCodeScreen`'s bar. The two
+  // predicates are asking opposite questions: that one asks "may I type into this?", where a false
+  // positive pastes a line into a pager, so it demands the composer box plus a corroborator. This
+  // one asks "am I entitled to tell a human a pager owns this screen?", where a false positive
+  // strands an agent — so ANY evidence of the agent's own interface is enough to withhold that
+  // claim. A pager showing a Claude transcript reaching `agent-interface` costs nothing: the arm
+  // does not escalate either way.
+  if (hasClaudeCodeLiveTui(viewport.text)) return "agent-interface";
+  return claudeCodeMarkerFamilies(viewport.text) >= 1 ? "agent-interface" : "unreadable";
 }

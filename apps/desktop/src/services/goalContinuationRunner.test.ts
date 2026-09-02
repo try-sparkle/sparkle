@@ -9,7 +9,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { burstsOf, progressMark } from "../engine/goalContinuation";
-import { MAX_CONCIERGE_REARMS } from "../engine/agentGoal";
+import { MAX_CONCIERGE_REARMS, rearmsRemaining } from "../engine/agentGoal";
 import {
   noteHooksLive,
   resetTurnEndAuthority,
@@ -64,6 +64,8 @@ vi.mock("./attention", async (importOriginal) => {
 
 import { notifyAttention } from "./attention";
 import { resetWindowRegistry, setWindowProject } from "./windowRegistry";
+import { registerViewport, resetViewportRegistry } from "./terminalViewport";
+import { VIM_ON_A_MARKDOWN_FILE } from "../engine/capturedScreens.fixture";
 import { dispatchConciergeAnswer } from "./conciergeDispatch";
 import { EXTERNAL_WAIT_GRACE_MS, IN_MOTION_GRACE_MS } from "../engine/goalContinuation";
 import {
@@ -157,6 +159,7 @@ beforeEach(() => {
     agentMovement: {},
   } as never);
   resetTurnEndAuthority();
+  resetViewportRegistry();
   _resetGoalContinuationRunnerForTests();
   _resetBackgroundTaskRegistryForTests();
   sendMock.mockClear();
@@ -563,7 +566,12 @@ describe("an auto-continue that never REACHES the terminal", () => {
   }
 
   it("stops retrying and tells the human after three refusals in a row", async () => {
-    alwaysRefuse("alternate-screen");
+    // `blocked-prompt`, not `alternate-screen`. This row is about the BOUND, and it needs a refusal
+    // the bound still acts on: since bead sparkle-phb1h the ladder fails OPEN on an unrecognised
+    // alternate screen (see "the full-screen refusal must not fire on the agent's own screen"), so
+    // driving this with that path would have pinned the bound against the one case that no longer
+    // reaches it — a test going green on the absence of the thing it is testing.
+    alwaysRefuse("blocked-prompt");
     const { projectId, agentId } = seed({ goal: "land the PR" });
 
     await sweepUntilEligible(MAX_UNDELIVERED_CONTINUES);
@@ -582,41 +590,29 @@ describe("an auto-continue that never REACHES the terminal", () => {
     expect(sendMock).toHaveBeenCalledTimes(MAX_UNDELIVERED_CONTINUES);
   });
 
-  it("NO-MENU alternate screen: says a pager/editor is holding it and quitting is safe, never that a dialog is waiting", async () => {
-    // `alwaysRefuse` sets no `liveMenuLabels`, which is the `blind:'no-menu'` case — a pager or
-    // editor holds the alternate buffer and there is NO question on the screen. Measured: four agents
-    // in one morning, every one a no-menu pager, all told "usually a permission dialog or menu
-    // waiting on an answer" — sending the founder to open a pane and hunt for a menu that was not
-    // there (bead sparkle-j2gase).
+  it("NO-MENU alternate screen: never claims a pager or editor is holding it, and never latches", async () => {
+    // ── THIS ROW USED TO ASSERT THE OPPOSITE, AND IT WAS WRONG (bead sparkle-phb1h) ─────────────
+    // It pinned "a pager or editor is holding the screen … quitting it is safe". Measured three
+    // times on 2026-08-20, that sentence was false every time: the agents were checked LIVE and
+    // answered `present=false, blind='no-menu', freshness='live'` — an ordinary Claude Code screen
+    // with no dialog on it. The refusal fires on `!isClaudeCodeScreen`, and a Claude Code screen
+    // that has merely lost its composer box fails that predicate, so the pager claim was never
+    // warranted by the evidence the path has. One of the three had merged its PR seconds earlier;
+    // another was left stranded with its last re-arm spent.
+    //
+    // What replaced it is the founder's own remedy — fail open — so there is no copy to assert
+    // here any more, only its absence and the absence of the latch. The side effects that make
+    // that safe (the ladder keeps sending, the re-arm allowance is untouched) are pinned in
+    // "the full-screen refusal must not fire on the agent's own screen".
     alwaysRefuse("alternate-screen");
     const { projectId, agentId } = seed({ goal: "land the PR" });
 
     await sweepUntilEligible(MAX_UNDELIVERED_CONTINUES);
 
-    const reason = goalOf(projectId, agentId)!.escalationReason!;
-    expect(reason).toContain("full-screen mode");
-    expect(reason).toContain("land the PR");
-    // ── AND IT MUST NOT NAME AN APP IT HAS NO EVIDENCE OF (bead sparkle-saoe3) ────────────────
-    // "a pager or editor" is a category, not a claim about WHICH one — naming vim/less/htop as fact
-    // is still unwarranted and sent the founder hunting for an app to quit.
-    expect(reason).not.toContain("vim");
-    expect(reason).not.toContain("htop");
-    // THE OLD, WRONG DIAGNOSIS for this state. There is no menu and no question, so "a permission
-    // dialog or menu waiting on an answer" is exactly the sentence that cost the four trips, and
-    // "answer what is on screen" is a dead instruction when nothing is on screen to answer.
-    expect(reason).not.toMatch(/permission dialog or menu/i);
-    expect(reason).not.toMatch(/answer what is on screen/i);
-    // THE TRUE REMEDY: quitting the pager/editor is safe and loses nothing. This is the assertion the
-    // change exists for.
-    expect(reason).toMatch(/pager or editor is holding the screen/i);
-    expect(reason).toMatch(/quitting it is safe/i);
-    expect(reason).toMatch(/will not lose the turn/i);
-    // The diagnosis the progress bound gives is WRONG here — nothing was ever typed, so there is no
-    // "restarting" that failed.
-    expect(reason).not.toContain("restarting cannot fix");
-    expect(reason).toContain("Nothing was typed into the terminal");
-    // The banner the human actually reads carries the same sentence, not a second one that drifts.
-    expect(notifyMock.mock.calls[0]![0].body).toBe(reason);
+    const goal = goalOf(projectId, agentId)!;
+    expect(goal.escalatedAt).toBeUndefined();
+    expect(goal.escalationReason).toBeUndefined();
+    expect(notifyMock).not.toHaveBeenCalled();
   });
 
   it("MENU-present alternate screen: names the waiting dialog and its options, never the pager remedy", async () => {
@@ -789,7 +785,9 @@ describe("an auto-continue that never REACHES the terminal", () => {
   it("keeps the absolute claim on paths where it IS true", async () => {
     // The control for the sentence above: a refused send wrote nothing and left nothing pending,
     // so weakening the copy everywhere would lose a guarantee that genuinely holds.
-    alwaysRefuse("alternate-screen");
+    // (`blocked-prompt` for the reason the bound row above gives — an unrecognised alternate screen
+    // no longer escalates at all, so it can no longer carry a copy assertion.)
+    alwaysRefuse("blocked-prompt");
     const { projectId, agentId } = seed({ goal: "land the PR" });
 
     await sweepUntilEligible(MAX_UNDELIVERED_CONTINUES);
@@ -854,6 +852,220 @@ describe("an auto-continue that never REACHES the terminal", () => {
     expect(goalOf(projectId, agentId)!.totalContinues).toBe(0);
   });
 });
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// BEAD sparkle-phb1h — "its terminal is in full-screen mode" ON A SCREEN THAT IS NOT.
+//
+// Measured three times (2026-08-20, by the concierge): agents escalated with
+//   "Auto-resume could not reach this agent 3 times in a row: its terminal is in full-screen mode
+//    and I could not recognise it as Claude Code's own prompt."
+// and then checked LIVE — `read_picker_options` answered `present=false, blind='no-menu'` and
+// `read_agent_terminal` answered `freshness='live'`. An ordinary Claude Code screen with no dialog
+// on it. One agent had merged its PR seconds earlier; another was left stranded on a human with its
+// LAST re-arm spent, and `rearmsRemaining` does not refill except by a human typing.
+//
+// The founder's remedy, and the newest word on the bead, is that the detector must FAIL OPEN: when
+// it cannot recognise the screen, do not escalate — report it unreadable and let the nudge ladder
+// keep going. So the assertions below are all about the SIDE EFFECT of not escalating: no latch, no
+// banner, no re-arm allowance spent, and the ladder still sending.
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+describe("the full-screen refusal must not fire on the agent's own screen", () => {
+  /** A Claude Code transcript tail with NO composer box — exactly the shape that makes
+   *  `isClaudeCodeScreen` answer false (the box is mandatory) while the screen is unmistakably the
+   *  agent's own interface: family B, the tool-call glyphs, is right there. This is the measured
+   *  false positive, reproduced. */
+  const CLAUDE_TAIL_WITHOUT_A_COMPOSER_BOX = [
+    "⏺ Bash(git status)",
+    "  ⎿  On branch sparkle/agent-1",
+    "     nothing to commit, working tree clean",
+    "",
+  ].join("\n");
+
+  /** Always refuse, on `path`. The condition does not clear by itself. */
+  function alwaysRefuse(path: string, liveMenuLabels?: string[]): void {
+    sendMock.mockImplementation(async (agentId: string) => ({
+      ok: false as const,
+      path: path as never,
+      agentId,
+      ...(liveMenuLabels ? { liveMenuLabels } : {}),
+    }));
+  }
+
+  async function sweepUntilEligible(n: number): Promise<void> {
+    await sweepGoalContinuations({ now: T0, ownsProject: ownsEverything });
+    for (let i = 0; i < n; i++) {
+      await sweepGoalContinuations({ now: SETTLED + i * 46_000, ownsProject: ownsEverything });
+    }
+  }
+
+  /** Put a screen in front of the runner the way a mounted terminal does. */
+  function showScreen(agentId: string, text: string): void {
+    registerViewport(agentId, () => ({ text, alternateBuffer: true }));
+  }
+
+  afterEach(() => {
+    sendMock.mockReset();
+  });
+
+  it("does NOT escalate an ordinary Claude Code screen, however many times the send is refused", async () => {
+    alwaysRefuse("alternate-screen");
+    const { projectId, agentId } = seed({ goal: "land the PR" });
+    showScreen(agentId, CLAUDE_TAIL_WITHOUT_A_COMPOSER_BOX);
+
+    // Twice the bound. Three consecutive refusals used to be enough to latch the goal.
+    await sweepUntilEligible(MAX_UNDELIVERED_CONTINUES * 2);
+
+    // ── THE SIDE EFFECTS, not the verdict object ────────────────────────────────────────────────
+    expect(goalOf(projectId, agentId)!.escalatedAt).toBeUndefined();
+    expect(notifyMock).not.toHaveBeenCalled();
+    // The cost the bead names: the bounded re-arm allowance is what a false escalation spends.
+    expect(rearmsRemaining(goalOf(projectId, agentId))).toBe(MAX_CONCIERGE_REARMS);
+    // ...and the ladder KEEPS GOING, which is the other half of failing open. A latched goal stops
+    // sending entirely, so a send count past the bound is the proof that it did not latch.
+    expect(sendMock.mock.calls.length).toBeGreaterThan(MAX_UNDELIVERED_CONTINUES);
+  });
+
+  it("does NOT escalate a screen it cannot read at all — the founder's fail-open rule", async () => {
+    // A REAL `less`/`vim` capture: zero Claude Code marker families. The body of the bead would have
+    // kept the full-screen escalation for exactly this screen; the founder's comment supersedes it.
+    // Being unable to see a question is not evidence that there IS one, and the row is already RED
+    // via `screenReadability` — this ladder does not have to burn a re-arm to say so a second time.
+    alwaysRefuse("alternate-screen");
+    const { projectId, agentId } = seed({ goal: "land the PR" });
+    showScreen(agentId, VIM_ON_A_MARKDOWN_FILE);
+
+    await sweepUntilEligible(MAX_UNDELIVERED_CONTINUES * 2);
+
+    expect(goalOf(projectId, agentId)!.escalatedAt).toBeUndefined();
+    expect(notifyMock).not.toHaveBeenCalled();
+    expect(rearmsRemaining(goalOf(projectId, agentId))).toBe(MAX_CONCIERGE_REARMS);
+    expect(sendMock.mock.calls.length).toBeGreaterThan(MAX_UNDELIVERED_CONTINUES);
+  });
+
+  it("does NOT escalate when no viewport is mounted — absence of evidence is not evidence", async () => {
+    alwaysRefuse("alternate-screen");
+    const { projectId, agentId } = seed({ goal: "land the PR" });
+    // No `showScreen`: this window has no reading of that terminal at all.
+
+    await sweepUntilEligible(MAX_UNDELIVERED_CONTINUES * 2);
+
+    expect(goalOf(projectId, agentId)!.escalatedAt).toBeUndefined();
+    expect(notifyMock).not.toHaveBeenCalled();
+  });
+
+  it("STILL escalates when a live menu is on the screen, with the blocked-prompt copy", async () => {
+    // The one alternate-screen shape that justifies a human: there IS a question, and only a human
+    // can answer it. This is the arm the bead says to keep — routed through the blocked-prompt copy,
+    // which already tells the human to answer the prompt in the pane.
+    alwaysRefuse("alternate-screen", ["Yes", "No, and tell Claude what to do differently"]);
+    const { projectId, agentId } = seed({ goal: "land the PR" });
+    showScreen(agentId, CLAUDE_TAIL_WITHOUT_A_COMPOSER_BOX);
+
+    await sweepUntilEligible(MAX_UNDELIVERED_CONTINUES);
+
+    const reason = goalOf(projectId, agentId)!.escalationReason!;
+    expect(goalOf(projectId, agentId)!.escalatedAt).toBeDefined();
+    expect(reason).toMatch(/dialog waiting for your answer/i);
+    expect(reason).toContain('"Yes"');
+    // NEVER the full-screen claim, and never an app it has no evidence of.
+    expect(reason).not.toMatch(/full-screen/i);
+    expect(reason).not.toMatch(/pager or editor/i);
+    expect(reason).not.toContain("vim");
+    expect(notifyMock).toHaveBeenCalledTimes(1);
+  });
+
+  /** A Claude Code permission dialog drawn on the screen. `claudeCodeDialogOnScreen` recognises the
+   *  frame, so `altScreenRefusalVerdict` answers `claude-dialog` — while the dispatcher's own
+   *  scrollback probe, a SEPARATE read, can still come back with no labels. That disagreement is
+   *  the reachable shape roborev 75882 named, and a pager showing a Claude transcript produces it. */
+  const DIALOG_FRAME_WITHOUT_READABLE_LABELS = [
+    "⏺ Bash(git status --short)",
+    "  ⎿  M apps/desktop/src/services/conciergeDispatch.ts",
+    "",
+    "╭───────────────────────────────────────────────╮",
+    "│ Bash command                                  │",
+    "│                                               │",
+    "│   git push origin HEAD                        │",
+    "│                                               │",
+    "│ Do you want to proceed?                       │",
+    "│ ❯ 1. Yes                                      │",
+    "│   2. No, and tell Claude what to do differently│",
+    "╰───────────────────────────────────────────────╯",
+  ].join("\n");
+
+  it("a dialog whose OPTIONS could not be read claims a dialog, never a credential prompt", async () => {
+    // roborev 75882 (High). The `claude-dialog` verdict and the live menu labels come from two
+    // DIFFERENT reads — the viewport frame vs. the dispatcher's scrollback probe — so a verdict with
+    // no labels is reachable. Borrowing the blocked-prompt sentence there told the human a password
+    // or host-key prompt was waiting on a screen where none was ever observed, and charged one of
+    // the finite re-arms for the privilege: the same unwarranted-claim defect this whole arm exists
+    // to remove, reintroduced through a shared string's fallback.
+    alwaysRefuse("alternate-screen"); // no liveMenuLabels — the probe found none
+    const { projectId, agentId } = seed({ goal: "land the PR" });
+    showScreen(agentId, DIALOG_FRAME_WITHOUT_READABLE_LABELS);
+
+    await sweepUntilEligible(MAX_UNDELIVERED_CONTINUES);
+
+    // It still escalates — a dialog IS on the screen and only a human can answer it. The bug was
+    // never that it escalated; it was what the escalation asserted.
+    const goal = goalOf(projectId, agentId)!;
+    expect(goal.escalatedAt).toBeDefined();
+    const reason = goal.escalationReason!;
+
+    // ── THE CLAIM, which is the whole finding ──────────────────────────────────────────────────
+    expect(reason).not.toMatch(/password/i);
+    expect(reason).not.toMatch(/host-key/i);
+    expect(reason).not.toMatch(/must not receive free text/i);
+    // …and it says what WAS observed, plus a remedy that works on this screen.
+    expect(reason).toMatch(/dialog on it whose options the auto-resume could not read/i);
+    // Never the claims the earlier arms already retired.
+    expect(reason).not.toMatch(/full-screen/i);
+    expect(reason).not.toMatch(/pager or editor/i);
+  });
+
+  it("…and the blocked-prompt path STILL names the prompt kind — the paired half", async () => {
+    // Without this, "never says password" is satisfied by deleting that sentence outright, which
+    // would strip the one path that DID identify the prompt by kind (`detectTerminalPrompts`) of
+    // the only copy that tells the human what they are being asked for.
+    alwaysRefuse("blocked-prompt");
+    const { projectId, agentId } = seed({ goal: "land the PR" });
+    showScreen(agentId, DIALOG_FRAME_WITHOUT_READABLE_LABELS);
+
+    await sweepUntilEligible(MAX_UNDELIVERED_CONTINUES);
+
+    const reason = goalOf(projectId, agentId)!.escalationReason!;
+    expect(reason).toMatch(/must not receive free text/i);
+    expect(reason).toMatch(/password/i);
+  });
+
+  it("gives each refusal REASON its own budget — alternating reasons never reach the bound", async () => {
+    // Bead sparkle-phb1h (d). A structural refusal that will never change must not consume the same
+    // three strikes as a transient one. The streak is per-REASON, so a pane that flaps between two
+    // different refusals is not three-of-a-kind and does not escalate.
+    const { projectId, agentId } = seed({ goal: "land the PR" });
+    showScreen(agentId, CLAUDE_TAIL_WITHOUT_A_COMPOSER_BOX);
+
+    const paths = ["pty-gone", "blocked-prompt", "pty-gone", "blocked-prompt", "pty-gone"];
+    await sweepGoalContinuations({ now: T0, ownsProject: ownsEverything });
+    for (let i = 0; i < paths.length; i++) {
+      alwaysRefuse(paths[i]!);
+      await sweepGoalContinuations({ now: SETTLED + i * 46_000, ownsProject: ownsEverything });
+    }
+
+    expect(sendMock.mock.calls.length).toBe(paths.length);
+    expect(goalOf(projectId, agentId)!.escalatedAt).toBeUndefined();
+    expect(notifyMock).not.toHaveBeenCalled();
+
+    // ...and the SAME reason three times in a row still escalates, so this is a narrower bound and
+    // not a disabled one.
+    alwaysRefuse("pty-gone");
+    for (let i = paths.length; i < paths.length + 3; i++) {
+      await sweepGoalContinuations({ now: SETTLED + i * 46_000, ownsProject: ownsEverything });
+    }
+    expect(goalOf(projectId, agentId)!.escalatedAt).toBeDefined();
+  });
+});
+
 
 describe("the concierge's re-arm actually puts the agent back to work", () => {
   /** Spend the consecutive-retry budget without moving the mark. */
@@ -1351,9 +1563,11 @@ describe("the unreachable-terminal escalation is untouched", () => {
   });
 
   it("still fires for an agent that ALSO has an open PR", async () => {
+    // `blocked-prompt` — a screen refusal the bound still acts on. `alternate-screen` fails open
+    // since bead sparkle-phb1h, so it would prove nothing about the open-PR gate here.
     sendMock.mockImplementation(async (agentId: string) => ({
       ok: false as const,
-      path: "alternate-screen" as never,
+      path: "blocked-prompt" as never,
       agentId,
     }));
     const { projectId, agentId } = seed({ goal: "land the PR" });
@@ -1368,7 +1582,7 @@ describe("the unreachable-terminal escalation is untouched", () => {
 
     expect(notifyMock).toHaveBeenCalledTimes(1);
     const reason = goalOf(projectId, agentId)!.escalationReason!;
-    expect(reason).toContain("full-screen mode");
+    expect(reason).toContain("waiting at a prompt that must not receive free text");
     // And it is NOT the diagnosis the gate suppresses — the two must stay distinguishable.
     expect(reason).not.toContain("no sign of progress");
   });

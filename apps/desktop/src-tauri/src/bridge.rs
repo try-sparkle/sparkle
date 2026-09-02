@@ -947,6 +947,215 @@ const CONTROL_OPS: &[&str] = &[
     "preview",
 ];
 
+// ─── THE CONTROL FAILURE VOCABULARY — three answers, because there are three next moves ────────
+//
+// Every control failure used to leave this bridge as `{ ok: false, error: "<prose>" }` and nothing
+// else, so the caller had one undifferentiated string for events that demand opposite responses.
+// The cost is measured in five beads (`sparkle-cqrgup`, `sparkle-az599n`, `sparkle-c9ht67`,
+// `sparkle-8lt32i`, `sparkle-bpj71e`) and is at its worst where the two extremes collide: a control
+// op REFUSED BY POLICY — a goal a person must verify cannot be self-marked — reached its caller as
+// a bridge timeout on four consecutive attempts. A permanent `no` and a slow `yes` rendered
+// identically, so the caller retried a call that could never succeed, and each retry emitted a
+// fresh frontend event at exactly the moment the frontend was starved.
+//
+// So a failure now also states WHICH of three things happened, as a token rather than as prose:
+//
+//   REASON_REFUSED     — a DEFINITIVE no. This request can never be accepted in this shape
+//                        (unknown op, bad token, malformed envelope, a reserved caller id claimed
+//                        by someone else). Nothing was emitted and nothing ran. Retrying it
+//                        unchanged is pointless, and re-sending is what turns one bad call into a
+//                        storm.
+//   REASON_UNDELIVERED — nothing reached the frontend: the pending map was saturated, there was no
+//                        app handle, the reqId could not be generated, or the emit itself failed.
+//                        The op PROVABLY did not run, so retrying is safe for ANY op, idempotent or
+//                        not — this is the one failure that carries that guarantee.
+//   REASON_EXPIRED     — the request WAS delivered and no reply came back within the caller's own
+//                        budget. THE OUTCOME IS UNKNOWN: the frontend may still run it (and for the
+//                        goal-latch family in `controlListener.dispatch` it deliberately does).
+//                        Safe to retry only for a last-write-wins op.
+//
+// This is the same split `babysit_lease` draws between `invalid` and `unknown`, deliberately worded
+// the same way, because it is the same fact: a caller on a timer cannot tell "ask again" from
+// "never" unless the wire says which it is.
+//
+// THE WIRE CONTRACT. `reason` is a top-level sibling of `error` on `ok: false` replies only, and
+// `delivered` rides beside it as the plainer half of the same fact — the question `sparkle-bpj71e`
+// asked and could not answer ("was my message actually sent?"). `delivered` is DERIVED, never
+// independently judged: only an expired request was ever handed to the frontend. An OLD client
+// ignores both fields harmlessly, and a NEW client treats a missing `reason` as a third state
+// ("this bridge does not classify") rather than as any value — see `bridgeFailureReason` in
+// `apps/mcp-control/src/bridgeClient.ts`, which is the only consumer.
+pub const REASON_REFUSED: &str = "refused";
+pub const REASON_UNDELIVERED: &str = "undelivered";
+pub const REASON_EXPIRED: &str = "expired";
+
+/// Build one classified control failure line. THE ONLY WAY a control failure is written, so the
+/// vocabulary cannot be half-applied: a bare `json!({"ok": false, ...})` on this path would be a
+/// silent regression to the undifferentiated string, and there is nothing left to copy it from.
+fn control_error(id: Value, error: impl std::fmt::Display, reason: &str) -> String {
+    json!({
+        "id": id,
+        "ok": false,
+        "error": error.to_string(),
+        "reason": reason,
+        // Derived from the reason, in one place. `expired` is the ONLY failure whose request
+        // reached the frontend; every other one names something that happened before the emit.
+        "delivered": reason == REASON_EXPIRED,
+    })
+    .to_string()
+}
+
+// ─── THE LATE-REFUSAL WINDOW — so a permanent `no` survives its own deadline ────────────────────
+//
+// THE HOLE THIS CLOSES (bead `sparkle-8lt32i`, the last part of it). Two fixes already landed:
+// `controlListener.dispatch` now RUNS an expired goal latch instead of dropping it, so the policy
+// refusal is COMPUTED where it previously was not; and a latch attempt gets 20s instead of 10s.
+// Neither changes where that refusal GOES. `wait_pending` drops the rendezvous entry the moment its
+// wait expires, so the frontend's answer — arriving a moment later — is delivered to nothing.
+//
+// Under sustained saturation that is not a rare edge: every attempt in a tool call can reach the
+// frontend late, compute the same refusal, and discard it. The caller sees three expiries and
+// learns nothing, which is exactly the four-attempts-then-the-reason sighting the bead reports.
+// The typed vocabulary above makes those expiries HONEST (`expired`, outcome unknown) but it cannot
+// manufacture an answer nobody kept.
+//
+// So the bridge keeps one. When a control round trip gives up, it notes the reqId as ORPHANED
+// (whose caller, which op). If `control_respond` later arrives for an orphaned reqId carrying a
+// DEFINITIVE refusal, that refusal is retained; the very next request for the same (caller, op)
+// takes it and answers instantly, before emitting anything at all.
+//
+// FIVE CONSTRAINTS, each load-bearing — this is a cache of NEGATIVE answers, and the failure modes
+// of getting it wrong are worse than the hole it fills:
+//
+//   • REFUSALS ONLY, NEVER A SUCCESS. A replayed `{ ok: true, met: true }` is a false "done" on a
+//     goal nobody closed — precisely what the self-report gate exists to prevent. `ok: false` plus a
+//     typed `code` is the whole admission test, and `request_expired` is excluded by name because it
+//     is the frontend saying "I did not run this", which is not a refusal at all.
+//   • ONE-SHOT. The entry is REMOVED as it is read. An agent that sets a NEW, self-markable goal
+//     inside the window gets at most ONE stale refusal, and its next attempt reaches the frontend
+//     normally. Without this, a cached `no` would outlive the state that justified it.
+//   • KEYED BY (caller, op), NOT BY op. A refusal belongs to the agent that earned it; a shared key
+//     would let one agent's policy refusal answer another agent's call.
+//   • BOUNDED IN TIME AND SIZE. `LATE_REFUSAL_TTL` and `LATE_REFUSAL_CAP`, pruned on every insert,
+//     so a frontend that stops answering cannot turn this into a leak.
+//   • MARKED AS STALE ON THE WIRE. The replay carries `staleFromExpiredAttempt: true`, so a reader
+//     can tell an answer to THIS call from an answer to the one before it. Silently presenting a
+//     previous attempt's verdict as this one's is the kind of quiet substitution this whole change
+//     exists to end.
+//
+// It is deliberately NOT a general reply cache: it holds nothing for an op that answered in time,
+// and nothing for an op that succeeded.
+
+/// How long a retained refusal may still answer for. Comfortably longer than one tool call's whole
+/// retry budget (`LATCH_TOTAL_TIMEOUT_MS` = 60s in `apps/mcp-control`), so the attempt that needs it
+/// is inside the window, and short enough that a refusal cannot outlive the goal that earned it by
+/// any margin a human would notice.
+const LATE_REFUSAL_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Hard cap on retained entries. Small: steady state is 0, and the only way to reach it is a
+/// frontend that has stopped answering — in which case dropping the oldest is right.
+const LATE_REFUSAL_CAP: usize = 64;
+
+/// The frontend `code` values that are NOT refusals, however they are shaped. `request_expired` is
+/// the frontend reporting that IT gave up before running the op — the opposite of a decision — so
+/// retaining it would replay "I did not look" as though it were "no".
+const NON_REFUSAL_CODES: &[&str] = &["request_expired"];
+
+/// One orphaned request: a round trip that timed out, and the refusal (if any) that arrived after.
+struct LateEntry {
+    caller: String,
+    op: String,
+    at: std::time::Instant,
+    refusal: Option<Value>,
+}
+
+/// reqId → orphaned request. Cloned into the serve threads exactly like `PendingMap`, and held on
+/// `ControlBridgeManager` so `control_respond` reaches the same one.
+pub type LateRefusalMap = Arc<Mutex<HashMap<String, LateEntry>>>;
+
+/// Is this frontend reply a DEFINITIVE refusal — one that retrying cannot turn into a yes?
+///
+/// The test is structural, not a list of app codes: an object, `ok: false`, and a non-empty typed
+/// `code` the frontend chose to attach. A refusal with no code is prose only, and this layer must
+/// not parse prose to decide whether an answer is permanent.
+fn is_definitive_refusal(v: &Value) -> bool {
+    if v.get("ok").and_then(Value::as_bool) != Some(false) {
+        return false;
+    }
+    match v.get("code").and_then(Value::as_str) {
+        Some(code) => !code.is_empty() && !NON_REFUSAL_CODES.contains(&code),
+        None => false,
+    }
+}
+
+/// Stamp a replayed refusal so a reader can tell it from an answer to the current call.
+fn mark_stale(mut v: Value) -> Value {
+    if let Some(map) = v.as_object_mut() {
+        map.insert("staleFromExpiredAttempt".to_string(), Value::Bool(true));
+    }
+    v
+}
+
+/// Drop entries past their TTL, then the oldest while still over cap. Called on every insert, so
+/// the map is bounded without a timer.
+fn prune_late(map: &mut HashMap<String, LateEntry>, now: std::time::Instant) {
+    map.retain(|_, e| now.duration_since(e.at) < LATE_REFUSAL_TTL);
+    while map.len() >= LATE_REFUSAL_CAP {
+        let oldest = map.iter().min_by_key(|(_, e)| e.at).map(|(k, _)| k.clone());
+        match oldest {
+            Some(k) => {
+                map.remove(&k);
+            }
+            None => break,
+        }
+    }
+}
+
+/// Note that this reqId's caller has stopped listening. Records WHO and WHICH OP so a later reply
+/// can be filed against the right key; the refusal itself is not known yet.
+fn note_orphaned_request(late: &LateRefusalMap, req_id: &str, caller: &str, op: &str) {
+    let now = std::time::Instant::now();
+    let mut map = late.lock().unwrap_or_else(|e| e.into_inner());
+    prune_late(&mut map, now);
+    map.insert(
+        req_id.to_string(),
+        LateEntry { caller: caller.to_string(), op: op.to_string(), at: now, refusal: None },
+    );
+}
+
+/// File a frontend reply that arrived after its caller gave up. Retains it only if it is a
+/// definitive refusal; anything else (a success, an untyped error, an expiry report) just clears the
+/// orphan. Returns whether it was retained — the side effect a test can assert.
+fn record_late_reply(late: &LateRefusalMap, req_id: &str, value: &Value) -> bool {
+    let mut map = late.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(entry) = map.get_mut(req_id) else { return false };
+    if is_definitive_refusal(value) {
+        entry.refusal = Some(mark_stale(value.clone()));
+        entry.at = std::time::Instant::now();
+        true
+    } else {
+        map.remove(req_id);
+        false
+    }
+}
+
+/// Take the retained refusal for this (caller, op), if one is waiting and still fresh. ONE-SHOT: the
+/// entry is removed as it is read, so a stale `no` can answer at most once.
+fn take_late_refusal(late: &LateRefusalMap, caller: &str, op: &str) -> Option<Value> {
+    let now = std::time::Instant::now();
+    let mut map = late.lock().unwrap_or_else(|e| e.into_inner());
+    let key = map
+        .iter()
+        .find(|(_, e)| {
+            e.caller == caller
+                && e.op == op
+                && e.refusal.is_some()
+                && now.duration_since(e.at) < LATE_REFUSAL_TTL
+        })
+        .map(|(k, _)| k.clone())?;
+    map.remove(&key).and_then(|e| e.refusal)
+}
+
 /// Fields the bridge owns on the wire; everything else in the request becomes the op `payload`.
 /// `deadlineMs` is envelope, not data: it is how long the CALLER will still be listening, which is
 /// the bridge's business and no frontend handler's — see `control_effective_wait`.
@@ -1027,6 +1236,10 @@ pub struct ControlBridgeManager {
     inner: Mutex<Option<ControlBridgeHandle>>,
     concierge: Mutex<Option<ControlBridgeHandle>>,
     pending: PendingMap,
+    /// Refusals that arrived after their caller stopped listening — see the late-refusal window
+    /// above. Shared by BOTH sockets for the same reason `pending` is: reqIds are unique across
+    /// them, and the retained entries are keyed by (callerAgentId, op), unique per agent.
+    late: LateRefusalMap,
 }
 
 /// The handle slot for a socket kind. Each kind is its own independent singleton: its own socket
@@ -1121,6 +1334,7 @@ fn start_control_bridge_kind(
     let alive_t = alive.clone();
     let app_t = app.clone();
     let pending_t = manager.pending.clone();
+    let late_t = manager.late.clone();
     std::thread::spawn(move || loop {
         if shutdown_t.load(Ordering::SeqCst) {
             alive_t.store(false, Ordering::SeqCst);
@@ -1131,7 +1345,8 @@ fn start_control_bridge_kind(
                 let token_c = token_t.clone();
                 let app_c = app_t.clone();
                 let pending_c = pending_t.clone();
-                std::thread::spawn(move || serve_control_conn(stream, &token_c, caller, app_c, pending_c));
+                let late_c = late_t.clone();
+                std::thread::spawn(move || serve_control_conn(stream, &token_c, caller, app_c, pending_c, late_c));
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(std::time::Duration::from_millis(25));
@@ -1187,6 +1402,7 @@ fn serve_control_conn(
     caller: ControlCaller,
     app: Option<AppHandle>,
     pending: PendingMap,
+    late: LateRefusalMap,
 ) {
     stream.set_nonblocking(false).ok();
     let peer = match stream.try_clone() {
@@ -1198,7 +1414,7 @@ fn serve_control_conn(
     for line in reader.lines() {
         let line = match line { Ok(l) => l, Err(_) => break };
         if line.trim().is_empty() { continue; }
-        let resp = handle_control_request_line(&line, token, caller, &app, &pending);
+        let resp = handle_control_request_line(&line, token, caller, &app, &pending, &late);
         if writeln!(writer, "{resp}").is_err() { break; }
     }
 }
@@ -1267,24 +1483,28 @@ fn decode_control_request(
 ) -> Result<ControlRequest, String> {
     let req: Value = match serde_json::from_str(line) {
         Ok(v) => v,
-        Err(e) => return Err(json!({ "id": Value::Null, "ok": false, "error": format!("bad json: {e}") }).to_string()),
+        Err(e) => return Err(control_error(Value::Null, format_args!("bad json: {e}"), REASON_REFUSED)),
     };
     let id = req.get("id").cloned().unwrap_or(Value::Null);
+    // EVERY BAIL IN THIS FUNCTION IS `refused`, and that is a claim worth stating once rather than
+    // four times: each of them is a fact about the REQUEST AS SENT — its bytes, its token, its op
+    // name, its claimed identity — none of which a retry changes. Re-sending an unknown op a second
+    // and third time is pure added load on a frontend that is already the bottleneck.
     if req.get("token").and_then(|t| t.as_str()) != Some(token) {
-        return Err(json!({ "id": id, "ok": false, "error": "unauthorized" }).to_string());
+        return Err(control_error(id, "unauthorized", REASON_REFUSED));
     }
     let op = match req.get("op").and_then(|o| o.as_str()) {
         Some(o) => o.to_string(),
-        None => return Err(json!({ "id": id, "ok": false, "error": "missing op" }).to_string()),
+        None => return Err(control_error(id, "missing op", REASON_REFUSED)),
     };
     if !CONTROL_OPS.contains(&op.as_str()) {
-        return Err(json!({ "id": id, "ok": false, "error": "unknown op" }).to_string());
+        return Err(control_error(id, "unknown op", REASON_REFUSED));
     }
     // Authoritative identity comes from the SOCKET (plus, on the shared socket only, the TOP-LEVEL
     // callerAgentId) — never from anything nested in payload, which build_control_payload strips.
     let caller_agent_id = match resolve_control_caller(&req, caller) {
         Ok(c) => c,
-        Err(e) => return Err(json!({ "id": id, "ok": false, "error": e }).to_string()),
+        Err(e) => return Err(control_error(id, e, REASON_REFUSED)),
     };
     Ok(ControlRequest {
         id,
@@ -1305,10 +1525,11 @@ fn handle_control_request_line(
     caller: ControlCaller,
     app: &Option<AppHandle>,
     pending: &PendingMap,
+    late: &LateRefusalMap,
 ) -> String {
     match decode_control_request(line, token, caller) {
         Err(resp) => resp,
-        Ok(r) => handle_control_op(r.id, &r.op, &r.caller_agent_id, r.payload, r.deadline_ms, app, pending),
+        Ok(r) => handle_control_op(r.id, &r.op, &r.caller_agent_id, r.payload, r.deadline_ms, app, pending, late),
     }
 }
 
@@ -1389,14 +1610,23 @@ fn control_round_trip<E>(
     payload: Value,
     deadline_ms: Option<i64>,
     pending: &PendingMap,
+    late: &LateRefusalMap,
     emit: E,
 ) -> String
 where
     E: FnOnce(Value) -> Result<(), String>,
 {
+    // BEFORE ANYTHING ELSE, and specifically before the emit: a refusal this caller already earned
+    // on an attempt it stopped listening for is the answer to this one too, and saying so costs no
+    // frontend hop. That is the whole point — the frontend is the starved resource, and re-asking
+    // it a question it has already answered is what turned a permanent `no` into four timeouts.
+    // See the late-refusal window above for why this is refusals only, one-shot, and marked stale.
+    if let Some(refusal) = take_late_refusal(late, caller_agent_id, op) {
+        return json!({ "id": id, "ok": true, "result": refusal }).to_string();
+    }
     let req_id = match generate_token() {
         Ok(t) => t,
-        Err(e) => return json!({ "id": id, "ok": false, "error": format!("reqId gen: {e}") }).to_string(),
+        Err(e) => return control_error(id, format_args!("reqId gen: {e}"), REASON_UNDELIVERED),
     };
     let wait = control_effective_wait(deadline_ms);
     // Owner = the calling agent, so a control-bridge teardown can release this agent's blocked ops
@@ -1406,12 +1636,15 @@ where
     let rx = match try_register_pending_capped(pending, &req_id, caller_agent_id, CONTROL_MAX_INFLIGHT) {
         Ok(rx) => rx,
         Err(depth) => {
-            return json!({
-                "id": id,
-                "ok": false,
-                "error": format!("control bridge saturated: {depth} requests already awaiting the frontend"),
-            })
-            .to_string();
+            // UNDELIVERED, not expired: nothing was registered and nothing was emitted on this
+            // path, so the op provably did not run. That is the strongest guarantee this bridge
+            // ever gives a caller, and it is exactly the one a saturated caller needs — it may
+            // retry anything, idempotent or not, once the queue drains.
+            return control_error(
+                id,
+                format_args!("control bridge saturated: {depth} requests already awaiting the frontend"),
+                REASON_UNDELIVERED,
+            );
         }
     };
     let event = control_request_event(
@@ -1423,11 +1656,24 @@ where
     );
     if let Err(e) = emit(event) {
         resolve_pending(pending, &req_id, Value::Null); // clean up the entry we just registered
-        return json!({ "id": id, "ok": false, "error": e }).to_string();
+        return control_error(id, e, REASON_UNDELIVERED);
     }
     match wait_pending(rx, pending, &req_id, wait) {
         Some(val) => json!({ "id": id, "ok": true, "result": val }).to_string(),
-        None => json!({ "id": id, "ok": false, "error": "frontend round-trip timeout" }).to_string(),
+        // THE ONE `delivered: true` FAILURE. The event was emitted, so the frontend has it and may
+        // act on it after this thread stops waiting — `controlListener.dispatch` skips most expired
+        // requests but deliberately applies the goal latches, whose loss is self-amplifying. So the
+        // honest answer is "unknown", never "it did not happen", and the reason token is what lets
+        // a caller act on that difference instead of guessing from prose.
+        //
+        // …and because the frontend may still answer, note the reqId as ORPHANED so a refusal
+        // arriving a moment from now is KEPT rather than handed to a rendezvous entry
+        // `wait_pending` has already dropped. That retention is what lets the NEXT attempt read the
+        // permanent `no` instead of collecting a third identical timeout.
+        None => {
+            note_orphaned_request(late, &req_id, caller_agent_id, op);
+            control_error(id, "frontend round-trip timeout", REASON_EXPIRED)
+        }
     }
 }
 
@@ -1442,12 +1688,15 @@ fn handle_control_op(
     deadline_ms: Option<i64>,
     app: &Option<AppHandle>,
     pending: &PendingMap,
+    late: &LateRefusalMap,
 ) -> String {
     let app = match app {
         Some(a) => a,
-        None => return json!({ "id": id, "ok": false, "error": "no app handle" }).to_string(),
+        // Nothing to emit through, so nothing was delivered. Transient (the window is still coming
+        // up), which is why it is not `refused`.
+        None => return control_error(id, "no app handle", REASON_UNDELIVERED),
     };
-    control_round_trip(id, op, caller_agent_id, payload, deadline_ms, pending, |event| {
+    control_round_trip(id, op, caller_agent_id, payload, deadline_ms, pending, late, |event| {
         app.emit("control:request", event).map_err(|e| format!("emit failed: {e}"))
     })
 }
@@ -1508,6 +1757,11 @@ pub fn control_respond(
     req_id: String,
     result: Value,
 ) -> Result<(), String> {
+    // FILE IT BEFORE RESOLVING. `record_late_reply` is a no-op unless this reqId was noted as
+    // orphaned — i.e. unless the round trip already gave up — so a reply that still has someone
+    // waiting retains nothing and takes the resolve path alone. See the late-refusal window for
+    // what qualifies as a refusal worth keeping.
+    record_late_reply(&manager.late, &req_id, &result);
     resolve_pending(&manager.pending, &req_id, result);
     Ok(())
 }
@@ -2037,6 +2291,7 @@ mod tests {
     fn pending_register_resolve_roundtrip_and_timeout() {
         use std::time::Duration;
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        let late: LateRefusalMap = Arc::new(Mutex::new(HashMap::new()));
 
         // Register, resolve from another thread, receive the value.
         let rx = register_pending(&pending, "req1", "b");
@@ -2061,6 +2316,7 @@ mod tests {
         // still work. Without poison-tolerant acquisition, every later bridge op would panic for the
         // rest of the process (the permanently-wedged-command bug this hardening closes).
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        let late: LateRefusalMap = Arc::new(Mutex::new(HashMap::new()));
         let p2 = pending.clone();
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _g = p2.lock().unwrap();
@@ -2077,6 +2333,7 @@ mod tests {
     fn wait_pending_resolves_then_times_out() {
         use std::time::Duration;
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        let late: LateRefusalMap = Arc::new(Mutex::new(HashMap::new()));
 
         // Resolved before the timeout → Some(value).
         let rx = register_pending(&pending, "rp1", "b");
@@ -2095,6 +2352,7 @@ mod tests {
     #[test]
     fn frontend_op_validates_required_fields() {
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        let late: LateRefusalMap = Arc::new(Mutex::new(HashMap::new()));
         // spawn_worker with missing task → fast-fail, no hang
         let resp = handle_request_line_ctx(
             r#"{"id":"8","token":"T","op":"spawn_worker"}"#,
@@ -2171,6 +2429,7 @@ mod tests {
     #[test]
     fn frontend_op_without_app_handle_errors() {
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        let late: LateRefusalMap = Arc::new(Mutex::new(HashMap::new()));
         let line = r#"{"id":"7","token":"T","op":"spawn_worker","task":"do it"}"#;
         let resp = handle_request_line_ctx(line, "T", &None, &pending, "build1", "proj1");
         let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
@@ -2197,6 +2456,7 @@ mod tests {
     #[test]
     fn ctx_serves_read_result_and_auth_with_none_app() {
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        let late: LateRefusalMap = Arc::new(Mutex::new(HashMap::new()));
         // Bad token → unauthorized even through the ctx path.
         let bad = handle_request_line_ctx(
             r#"{"id":"1","token":"WRONG","op":"read_result","worktree":"/x"}"#,
@@ -2235,9 +2495,11 @@ mod tests {
     #[test]
     fn control_rejects_bad_token() {
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        let late: LateRefusalMap = Arc::new(Mutex::new(HashMap::new()));
         let resp = handle_control_request_line(
             r#"{"id":"1","token":"WRONG","op":"get_state","callerAgentId":"a1"}"#,
             "RIGHT", ControlCaller::Shared, &None, &pending,
+            &late,
         );
         let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
         assert_eq!(v["id"], "1");
@@ -2248,13 +2510,15 @@ mod tests {
     #[test]
     fn control_missing_and_unknown_op() {
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        let late: LateRefusalMap = Arc::new(Mutex::new(HashMap::new()));
         let missing: serde_json::Value = serde_json::from_str(
-            &handle_control_request_line(r#"{"id":"2","token":"T"}"#, "T", ControlCaller::Shared, &None, &pending),
+            &handle_control_request_line(r#"{"id":"2","token":"T"}"#, "T", ControlCaller::Shared, &None, &pending, &late),
         ).unwrap();
         assert_eq!(missing["error"], "missing op");
         let unknown: serde_json::Value = serde_json::from_str(
             &handle_control_request_line(
                 r#"{"id":"3","token":"T","op":"rm_rf"}"#, "T", ControlCaller::Shared, &None, &pending,
+                &late,
             ),
         ).unwrap();
         assert_eq!(unknown["error"], "unknown op");
@@ -2354,9 +2618,11 @@ mod tests {
         // And it reaches the round-trip rather than being refused: with no app handle the only
         // remaining failure is the missing handle, NOT `unknown op`.
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        let late: LateRefusalMap = Arc::new(Mutex::new(HashMap::new()));
         let v: serde_json::Value = serde_json::from_str(&handle_control_request_line(
             r#"{"id":"2","token":"T","op":"preview","callerAgentId":"a1","previewOp":"list"}"#,
             "T", ControlCaller::Shared, &None, &pending,
+            &late,
         )).unwrap();
         assert_eq!(v["error"], "no app handle", "preview must reach dispatch, not the unknown-op gate");
     }
@@ -2364,9 +2630,11 @@ mod tests {
     #[test]
     fn control_op_without_app_handle_errors() {
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        let late: LateRefusalMap = Arc::new(Mutex::new(HashMap::new()));
         let resp = handle_control_request_line(
             r#"{"id":"7","token":"T","op":"set_theme","callerAgentId":"a1","theme":"dark"}"#,
             "T", ControlCaller::Shared, &None, &pending,
+            &late,
         );
         let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
         assert_eq!(v["id"], "7");
@@ -2480,11 +2748,13 @@ mod tests {
         // a token-AUTHORIZED request: holding the shared token still does not buy concierge
         // authority, which is the point of minting identity from the socket.
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        let late: LateRefusalMap = Arc::new(Mutex::new(HashMap::new()));
         let line = format!(
             r#"{{"id":"9","token":"T","op":"set_theme","callerAgentId":"{CONCIERGE_CALLER_AGENT_ID}","theme":"dark"}}"#
         );
         let v: Value = serde_json::from_str(&handle_control_request_line(
             &line, "T", ControlCaller::Shared, &None, &pending,
+            &late,
         )).unwrap();
         assert_eq!(v["id"], "9");
         assert_eq!(v["ok"], false);
@@ -2580,9 +2850,11 @@ mod tests {
         // reached the frontend round-trip (there is no app in tests); "unknown op" would mean the
         // spine is dead in production.
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        let late: LateRefusalMap = Arc::new(Mutex::new(HashMap::new()));
         let line = r#"{"id":"1","token":"T","op":"concierge_tool","domain":"workspace","op2":"x"}"#;
         let v: Value = serde_json::from_str(&handle_control_request_line(
             line, "T", ControlCaller::Concierge, &None, &pending,
+            &late,
         )).unwrap();
         assert_ne!(
             v["error"], "unknown op",
@@ -2610,6 +2882,7 @@ mod tests {
         // "no app handle" means the request got PAST the allowlist and reached the frontend
         // round-trip (there is no Tauri app in tests); "unknown op" would mean the spine is dead.
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        let late: LateRefusalMap = Arc::new(Mutex::new(HashMap::new()));
         for (caller, line) in [
             (
                 ControlCaller::Concierge,
@@ -2622,6 +2895,7 @@ mod tests {
         ] {
             let v: Value = serde_json::from_str(&handle_control_request_line(
                 line, "T", caller, &None, &pending,
+                &late,
             )).unwrap();
             assert_ne!(
                 v["error"], "unknown op",
@@ -2726,6 +3000,408 @@ mod tests {
         }
     }
 
+    // ========================================================================================
+    // THE FAILURE VOCABULARY — beads sparkle-cqrgup / sparkle-az599n / sparkle-c9ht67 /
+    // sparkle-8lt32i / sparkle-bpj71e.
+    //
+    // EVERY CASE IS A PAIR OR A PARTITION, deliberately. "reports refused" is satisfied by a
+    // function that reports `refused` for absolutely everything, so a lone assertion would pin
+    // nothing; each reason is therefore asserted alongside a sibling bail that must answer a
+    // DIFFERENT one. The `delivered` flag is checked with the reason for the same reason: the two
+    // must not be able to drift, because a caller reading `delivered: false` on an expired request
+    // would conclude an op did not run when it may have.
+    // ========================================================================================
+
+    /// The reason token on a failure line, or None when the line is a success or carries no reason.
+    fn reason_of(line: &str) -> Option<String> {
+        let v: Value = serde_json::from_str(line).expect("a control reply is always JSON");
+        v.get("reason").and_then(|r| r.as_str()).map(str::to_string)
+    }
+
+    fn delivered_of(line: &str) -> Option<bool> {
+        let v: Value = serde_json::from_str(line).expect("a control reply is always JSON");
+        v.get("delivered").and_then(|d| d.as_bool())
+    }
+
+    // ========================================================================================
+    // THE LATE-REFUSAL WINDOW — the last part of bead `sparkle-8lt32i`.
+    //
+    // The refusal for an expired request is now COMPUTED (controlListener runs an expired goal
+    // latch) but was still DISCARDED, because `wait_pending` drops the rendezvous entry at its
+    // deadline. Under saturation every attempt in a tool call could compute the same permanent `no`
+    // and lose it, so the caller collected three expiries and learned nothing.
+    //
+    // These drive `control_round_trip` and the retention helpers directly. The load-bearing
+    // assertion throughout is THE EMIT COUNT: a replay that still asks the frontend has saved
+    // nothing, since the frontend is the starved resource this exists to stop re-asking.
+    // ========================================================================================
+
+    fn late_map() -> LateRefusalMap {
+        Arc::new(Mutex::new(HashMap::new()))
+    }
+
+    /// The refusal shape `handleSetGoalMet` actually replies with (see controlListener.ts).
+    fn policy_refusal() -> Value {
+        json!({
+            "ok": false,
+            "code": "goal_not_self_markable",
+            "error": "this goal must be verified by a person",
+        })
+    }
+
+    #[test]
+    fn a_refusal_that_arrives_after_the_deadline_answers_the_NEXT_attempt_without_emitting() {
+        // THE WHOLE FIX, end to end, through the production round trip twice.
+        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        let late = late_map();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+
+        // ATTEMPT 1 — the frontend never answers in time, so this expires.
+        let first = control_round_trip(
+            json!("1"),
+            "set_agent_goal_met",
+            "a1",
+            json!({ "met": true }),
+            Some(1), // clamps up to CONTROL_MIN_WAIT — a real, short wait
+            &pending,
+            &late,
+            recording_emit(seen.clone()),
+        );
+        assert_eq!(reason_of(&first).as_deref(), Some(REASON_EXPIRED));
+        let req_id = seen.lock().unwrap()[0]["reqId"].as_str().unwrap().to_string();
+
+        // …and the frontend answers a moment later, into an entry nobody is holding. THIS is the
+        // reply that used to vanish.
+        assert!(
+            record_late_reply(&late, &req_id, &policy_refusal()),
+            "a definitive refusal for an orphaned reqId must be retained",
+        );
+
+        // ATTEMPT 2 — the same caller, the same op. It must be answered from the window.
+        let emits_before = seen.lock().unwrap().len();
+        let second = control_round_trip(
+            json!("2"),
+            "set_agent_goal_met",
+            "a1",
+            json!({ "met": true }),
+            Some(10_000),
+            &pending,
+            &late,
+            recording_emit(seen.clone()),
+        );
+        let v: Value = serde_json::from_str(&second).unwrap();
+        assert_eq!(v["ok"], true, "the transport succeeded; the REFUSAL rides in `result`");
+        assert_eq!(v["result"]["code"], "goal_not_self_markable");
+        assert_eq!(
+            v["result"]["staleFromExpiredAttempt"], true,
+            "a replayed verdict must say it answers a PREVIOUS attempt, not this one",
+        );
+        // THE SIDE EFFECT THAT MATTERS: the starved frontend was not asked again.
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            emits_before,
+            "answering from the window must emit NOTHING — re-asking saves nothing",
+        );
+    }
+
+    #[test]
+    fn the_window_is_ONE_SHOT_so_a_stale_no_can_answer_at_most_once() {
+        // The pair for the case above, and the guard that keeps a cached `no` from outliving the
+        // state that justified it: an agent that sets a NEW, self-markable goal inside the TTL pays
+        // at most one stale refusal, and its next attempt reaches the frontend normally.
+        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        let late = late_map();
+        note_orphaned_request(&late, "r1", "a1", "set_agent_goal_met");
+        assert!(record_late_reply(&late, "r1", &policy_refusal()));
+
+        assert!(take_late_refusal(&late, "a1", "set_agent_goal_met").is_some(), "first read serves");
+        assert!(
+            take_late_refusal(&late, "a1", "set_agent_goal_met").is_none(),
+            "the entry must be REMOVED as it is read",
+        );
+
+        // …so the next real round trip goes to the frontend, and reaches it.
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let resp = control_round_trip(
+            json!("9"),
+            "set_agent_goal_met",
+            "a1",
+            json!({ "met": true }),
+            Some(1),
+            &pending,
+            &late,
+            recording_emit(seen.clone()),
+        );
+        assert_eq!(reason_of(&resp).as_deref(), Some(REASON_EXPIRED));
+        assert_eq!(seen.lock().unwrap().len(), 1, "a consumed window must not suppress the emit");
+    }
+
+    #[test]
+    fn a_SUCCESS_is_never_retained_because_a_replayed_success_is_a_false_done() {
+        // The single most dangerous thing this could get wrong. `metAt` is the only signal that
+        // makes an idle agent count as done, so replaying `{ ok: true, met: true }` would close a
+        // goal nobody closed — exactly what the self-report gate exists to prevent.
+        let late = late_map();
+        note_orphaned_request(&late, "r1", "a1", "set_agent_goal_met");
+        assert!(!record_late_reply(&late, "r1", &json!({ "ok": true, "met": true })));
+        assert!(
+            take_late_refusal(&late, "a1", "set_agent_goal_met").is_none(),
+            "a success must never be replayed",
+        );
+    }
+
+    #[test]
+    fn only_a_TYPED_definitive_refusal_qualifies() {
+        // A partition, not a lone assertion. `request_expired` is the trap: it is the frontend
+        // saying it did NOT run the op, so retaining it would replay "I did not look" as "no".
+        // An untyped error is prose, and this layer must not parse prose to judge permanence.
+        for (what, v) in [
+            ("policy refusal", policy_refusal()),
+            ("another typed refusal", json!({ "ok": false, "code": "no_goal", "error": "x" })),
+        ] {
+            assert!(is_definitive_refusal(&v), "{what} must qualify");
+        }
+        for (what, v) in [
+            ("a success", json!({ "ok": true })),
+            ("a success with a code", json!({ "ok": true, "code": "fine" })),
+            ("an expiry report", json!({ "ok": false, "code": "request_expired", "error": "x" })),
+            ("an untyped error", json!({ "ok": false, "error": "unknown agent a9" })),
+            ("an empty code", json!({ "ok": false, "code": "" })),
+            ("a read reply", json!({ "agents": [] })),
+            ("a non-object", json!("nope")),
+        ] {
+            assert!(!is_definitive_refusal(&v), "{what} must NOT qualify");
+        }
+    }
+
+    #[test]
+    fn a_reply_for_a_reqId_that_was_never_orphaned_is_not_retained() {
+        // The ordinary path: a round trip that answered IN TIME still has a listener, so
+        // `control_respond` must retain nothing. Without this the window would fill on every
+        // healthy call and hand out replays nobody expired for.
+        let late = late_map();
+        assert!(!record_late_reply(&late, "never-seen", &policy_refusal()));
+        assert!(take_late_refusal(&late, "a1", "set_agent_goal_met").is_none());
+    }
+
+    #[test]
+    fn a_retained_refusal_belongs_to_ITS_OWN_caller_and_op() {
+        // Keyed by (caller, op), not by op: a refusal one agent earned must never answer another
+        // agent's call, and a refusal for one op must never answer a different one.
+        let late = late_map();
+        note_orphaned_request(&late, "r1", "a1", "set_agent_goal_met");
+        assert!(record_late_reply(&late, "r1", &policy_refusal()));
+
+        assert!(take_late_refusal(&late, "a2", "set_agent_goal_met").is_none(), "wrong caller");
+        assert!(take_late_refusal(&late, "a1", "set_agent_goal").is_none(), "wrong op");
+        assert!(take_late_refusal(&late, "a1", "set_agent_goal_met").is_some(), "the right key still serves");
+    }
+
+    #[test]
+    fn the_window_is_bounded_so_a_dead_frontend_cannot_leak() {
+        // Steady state is zero entries; the only way to reach the cap is a frontend that stopped
+        // answering, in which case dropping the oldest is the right thing.
+        let late = late_map();
+        let inserted = LATE_REFUSAL_CAP * 2;
+        for i in 0..inserted {
+            note_orphaned_request(&late, &format!("r{i}"), "a1", "set_agent_activity");
+        }
+        let held = late.lock().unwrap().len();
+        // The invariant is "never MORE than the cap": `prune_late` runs BEFORE each insert and
+        // leaves room for exactly one, so a steady stream settles at the cap rather than under it.
+        assert!(held <= LATE_REFUSAL_CAP, "prune must hold the map at or under the cap, got {held}");
+        // …and the pair that stops the assertion above passing for a map that simply grew: twice
+        // the cap went in, so a missing prune would show as `held == inserted`.
+        assert!(held < inserted, "prune must actually evict: held {held} of {inserted} inserted");
+    }
+
+    #[test]
+    fn every_decode_bail_is_refused_and_undelivered() {
+        // ALL FOUR AT ONCE, because the claim is a PARTITION: these are facts about the request as
+        // sent — its bytes, its token, its op name — and no retry changes any of them. A single
+        // case would pass against a function that stamped `refused` on the timeout too, which is
+        // the exact conflation bead sparkle-8lt32i is about.
+        let bails = [
+            ("bad json", r#"{not json"#),
+            ("unauthorized", r#"{"id":"1","token":"WRONG","op":"get_state","callerAgentId":"a"}"#),
+            ("missing op", r#"{"id":"1","token":"T","callerAgentId":"a"}"#),
+            ("unknown op", r#"{"id":"1","token":"T","op":"frobnicate","callerAgentId":"a"}"#),
+            (
+                "reserved caller id",
+                r#"{"id":"1","token":"T","op":"get_state","callerAgentId":"sparkle:concierge"}"#,
+            ),
+        ];
+        for (what, line) in bails {
+            // `expect_err` needs `ControlRequest: Debug`; a match keeps the struct free of a
+            // derive it has no other use for.
+            let resp = match decode_control_request(line, "T", ControlCaller::Shared) {
+                Err(resp) => resp,
+                Ok(_) => panic!("{what}: this request must be rejected"),
+            };
+            assert_eq!(reason_of(&resp).as_deref(), Some(REASON_REFUSED), "{what}");
+            // A refusal never reached the frontend, so the caller may state flatly that nothing ran.
+            assert_eq!(delivered_of(&resp), Some(false), "{what}");
+            // The prose is unchanged and still carries the detail — the token is an ADDITION, not a
+            // replacement, or every existing reader breaks.
+            let v: Value = serde_json::from_str(&resp).unwrap();
+            assert_eq!(v["ok"], false, "{what}");
+            assert!(v["error"].as_str().is_some_and(|e| !e.is_empty()), "{what}");
+        }
+    }
+
+    #[test]
+    fn a_valid_request_is_not_refused_at_all() {
+        // The partition's other half. Without it, "every bail is refused" is also satisfied by a
+        // decoder that refuses everything, including the requests that should go through.
+        let r = decode_control_request(
+            r#"{"id":"1","token":"T","op":"set_agent_goal_met","callerAgentId":"a1","met":true}"#,
+            "T",
+            ControlCaller::Shared,
+        );
+        assert!(r.is_ok(), "a well-formed request must decode, or the partition proves nothing");
+    }
+
+    #[test]
+    fn a_saturated_bridge_says_undelivered_so_any_op_may_be_retried() {
+        // UNDELIVERED IS THE STRONGEST GUARANTEE THIS BRIDGE GIVES: nothing was registered and
+        // nothing was emitted, so the op provably did not run and even a non-idempotent caller may
+        // retry once the queue drains. Distinguishing it from `expired` is the whole value — the
+        // same caller must NOT retry an expired create.
+        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        let late: LateRefusalMap = Arc::new(Mutex::new(HashMap::new()));
+        {
+            let mut map = pending.lock().unwrap();
+            for i in 0..CONTROL_MAX_INFLIGHT {
+                let (tx, _rx) = mpsc::channel();
+                map.insert(format!("filler-{i}"), PendingEntry { tx, build_agent_id: "x".into() });
+            }
+        }
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let resp = control_round_trip(
+            json!("1"),
+            "set_agent_goal_met",
+            "a1",
+            json!({ "met": true }),
+            Some(10_000),
+            &pending,
+            &late,
+            recording_emit(seen.clone()),
+        );
+        assert_eq!(reason_of(&resp).as_deref(), Some(REASON_UNDELIVERED));
+        assert_eq!(delivered_of(&resp), Some(false));
+        // …and the flag is not decoration: the emit really did not happen.
+        assert!(seen.lock().unwrap().is_empty(), "a saturated bridge must emit nothing");
+    }
+
+    #[test]
+    fn a_failed_emit_is_undelivered_and_leaves_no_pending_entry() {
+        // The other `undelivered` producer, and its side effect: the entry registered a moment
+        // earlier must be gone, or a saturated-bridge refusal follows from a leak rather than load.
+        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        let late: LateRefusalMap = Arc::new(Mutex::new(HashMap::new()));
+        let resp = control_round_trip(
+            json!("1"),
+            "rename_agent",
+            "a1",
+            json!({ "name": "Neo" }),
+            Some(10_000),
+            &pending,
+            &late,
+            |_event| Err("emit failed: no window".to_string()),
+        );
+        assert_eq!(reason_of(&resp).as_deref(), Some(REASON_UNDELIVERED));
+        assert_eq!(delivered_of(&resp), Some(false));
+        assert!(pending.lock().unwrap().is_empty(), "the registered entry must be cleaned up");
+    }
+
+    #[test]
+    fn a_frontend_that_never_answers_is_expired_and_DELIVERED() {
+        // THE CASE THE WHOLE VOCABULARY EXISTS FOR. This is the only failure whose request reached
+        // the frontend, so it is the only one whose outcome is UNKNOWN — the frontend may apply it
+        // after this thread stops waiting, which for the goal latches it deliberately does. Reading
+        // it as "did not happen" is how a caller re-sends a delivered write; reading it as
+        // "refused" is how a caller gives up on one that would have landed.
+        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        let late: LateRefusalMap = Arc::new(Mutex::new(HashMap::new()));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let resp = control_round_trip(
+            json!("1"),
+            "set_agent_goal_met",
+            "a1",
+            json!({ "met": true }),
+            Some(1), // clamps UP to CONTROL_MIN_WAIT — a real 1s wait, not an instant bail
+            &pending,
+            &late,
+            recording_emit(seen.clone()),
+        );
+        assert_eq!(reason_of(&resp).as_deref(), Some(REASON_EXPIRED));
+        assert_eq!(
+            delivered_of(&resp),
+            Some(true),
+            "an expired request WAS handed to the frontend — saying otherwise licenses a re-send",
+        );
+        // The `delivered: true` claim is not taken on trust: the event really was emitted.
+        assert_eq!(seen.lock().unwrap().len(), 1, "the deadline fired AFTER the emit, not before");
+    }
+
+    #[test]
+    fn a_frontend_that_answers_is_not_a_failure_at_all() {
+        // The pair for the case above: identical wiring, identical op, only the frontend differs.
+        // Without it, "expired carries delivered: true" would also hold for a round trip that
+        // expired unconditionally.
+        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        let late: LateRefusalMap = Arc::new(Mutex::new(HashMap::new()));
+        let pending_c = pending.clone();
+        let resp = control_round_trip(
+            json!("1"),
+            "set_agent_goal_met",
+            "a1",
+            json!({ "met": true }),
+            Some(10_000),
+            &pending,
+            &late,
+            move |event| {
+                let req_id = event["reqId"].as_str().expect("reqId is always a string").to_string();
+                resolve_pending(&pending_c, &req_id, json!({ "ok": true, "met": true }));
+                Ok(())
+            },
+        );
+        let v: Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v["ok"], true);
+        assert!(v.get("reason").is_none(), "a success carries no failure reason");
+        assert!(v.get("delivered").is_none(), "a success carries no delivery flag");
+        assert_eq!(v["result"]["met"], true);
+    }
+
+    #[test]
+    fn the_three_reasons_are_distinct_tokens() {
+        // The vocabulary is only useful if a caller can branch on it. Two reasons that collided
+        // would silently merge two different next moves — and this is cheap insurance against a
+        // future edit that "tidies" one of the literals.
+        let all = [REASON_REFUSED, REASON_UNDELIVERED, REASON_EXPIRED];
+        let uniq: std::collections::HashSet<&str> = all.iter().copied().collect();
+        assert_eq!(uniq.len(), all.len(), "reason tokens must be distinct: {all:?}");
+    }
+
+    #[test]
+    fn the_reason_tokens_are_mirrored_in_the_typescript_client() {
+        // The ONLY consumer is `apps/mcp-control/src/bridgeClient.ts`, which matches these literals
+        // against an allow-list — an unrecognised token there degrades to "unclassified", which is
+        // safe but silently discards the whole fix. Nothing else would catch a rename, because both
+        // sides keep compiling and every test on either side keeps passing.
+        let ts = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../mcp-control/src/bridgeClient.ts"),
+        )
+        .expect("bridgeClient.ts must be readable from the crate dir");
+        for token in [REASON_REFUSED, REASON_UNDELIVERED, REASON_EXPIRED] {
+            assert!(
+                ts.contains(&format!("\"{token}\"")),
+                "bridgeClient.ts must recognise the reason token {token:?}",
+            );
+        }
+    }
+
     #[test]
     fn control_effective_wait_clamps_the_callers_budget() {
         use std::time::Duration;
@@ -2788,6 +3464,7 @@ mod tests {
     fn control_round_trip_gives_up_at_the_callers_deadline_not_at_600s() {
         use std::time::Instant;
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        let late: LateRefusalMap = Arc::new(Mutex::new(HashMap::new()));
         let seen = Arc::new(Mutex::new(Vec::new()));
         let started = Instant::now();
         // 200ms is below CONTROL_MIN_WAIT, so the floor makes the real wait ~1s. That IS the
@@ -2800,6 +3477,7 @@ mod tests {
             json!({ "theme": "dark" }),
             Some(200),
             &pending,
+            &late,
             recording_emit(seen.clone()),
         );
         let elapsed = started.elapsed();
@@ -2824,6 +3502,7 @@ mod tests {
     fn control_saturation_refuses_instantly_without_registering_or_emitting() {
         use std::time::Instant;
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        let late: LateRefusalMap = Arc::new(Mutex::new(HashMap::new()));
         // Fill the queue to exactly the cap with requests nobody will ever answer.
         let mut held = Vec::new();
         for i in 0..CONTROL_MAX_INFLIGHT {
@@ -2840,6 +3519,7 @@ mod tests {
             json!({ "theme": "dark" }),
             Some(30_000),
             &pending,
+            &late,
             recording_emit(seen.clone()),
         );
         let elapsed = started.elapsed();
@@ -2875,6 +3555,7 @@ mod tests {
             json!({}),
             Some(1),
             &pending,
+            &late,
             recording_emit(seen2.clone()),
         );
         let v2: Value = serde_json::from_str(&resp2).unwrap();
@@ -2895,6 +3576,7 @@ mod tests {
         const DEADLINE_MS: i64 = 1_200;
 
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        let late: LateRefusalMap = Arc::new(Mutex::new(HashMap::new()));
         // A depth watcher, so "the queue did not grow unbounded" is observed rather than inferred
         // from the final state (which is empty either way once everything drains).
         let max_depth = Arc::new(AtomicUsize::new(0));
@@ -2914,6 +3596,7 @@ mod tests {
         let handles: Vec<_> = (0..FLOOD)
             .map(|i| {
                 let p = pending.clone();
+                let l = late.clone();
                 std::thread::spawn(move || {
                     let t0 = Instant::now();
                     // Nothing ever answers: the emit is a black hole, exactly like a starved frontend.
@@ -2924,6 +3607,7 @@ mod tests {
                         json!({}),
                         Some(DEADLINE_MS),
                         &p,
+                        &l,
                         |_event| Ok(()),
                     );
                     (t0.elapsed(), resp)
@@ -2983,6 +3667,7 @@ mod tests {
         // as soon as the frontend replies — the 600s fallback is a ceiling, never a delay.
         use std::time::Instant;
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        let late: LateRefusalMap = Arc::new(Mutex::new(HashMap::new()));
         let started = Instant::now();
         let p = pending.clone();
         let resp = control_round_trip(
@@ -2992,6 +3677,7 @@ mod tests {
             json!({}),
             None, // legacy client: no deadlineMs on the wire
             &pending,
+            &late,
             move |event: Value| {
                 // Stand in for the frontend: read the reqId off the envelope and answer it.
                 let req_id = event["reqId"].as_str().expect("envelope must carry reqId").to_string();
@@ -3028,6 +3714,8 @@ mod tests {
             [(Some(10_000i64), std::time::Duration::from_millis(10_000)), (None, ROUNDTRIP_TIMEOUT)]
         {
             let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+            let late: LateRefusalMap = Arc::new(Mutex::new(HashMap::new()));
+        let late: LateRefusalMap = Arc::new(Mutex::new(HashMap::new()));
             let seen = Arc::new(Mutex::new(Vec::new()));
             let p = pending.clone();
             let sink = seen.clone();
@@ -3039,6 +3727,7 @@ mod tests {
                 json!({}),
                 deadline_ms,
                 &pending,
+                &late,
                 move |event: Value| {
                     let req_id = event["reqId"].as_str().unwrap().to_string();
                     sink.lock().unwrap().push(event);
@@ -3084,6 +3773,7 @@ mod tests {
                 json!({}),
                 Some(30_000),
                 &ctrl.pending,
+                &ctrl.late,
                 |_e| panic!("a refused request must never emit"),
             ))
             .unwrap();

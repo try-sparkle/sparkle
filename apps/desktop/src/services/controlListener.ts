@@ -4444,9 +4444,50 @@ export function controlExpiredSkipCounts(): Record<string, number> {
   return Object.fromEntries(expiredSkipsByOp);
 }
 
-/** Zero the tally (test hook, mirroring `useSelfReportMetrics.reset`). */
+/** Zero both tallies (test hook, mirroring `useSelfReportMetrics.reset`). */
 export function _resetControlExpiredSkipsForTests(): void {
   expiredSkipsByOp.clear();
+  lateAppliedByOp.clear();
+}
+
+/**
+ * THE OPS AN EXPIRED REQUEST STILL RUNS — the carve-out from the skip above, and the ONLY one
+ * (beads `sparkle-cqrgup`, `sparkle-az599n`, `sparkle-c9ht67`).
+ *
+ * The gate's default is right and stays: work for a caller who has stopped listening is work done
+ * three times over, at the exact moment the frontend is most starved. These two ops are the
+ * measured exception, and the exception is decided by ARITHMETIC rather than by taste.
+ *
+ * WHAT DROPPING ONE COSTS. `metAt` is the only signal separating an agent that FINISHED from one
+ * that stalled. Lose it and the agent is auto-resumed — a whole context re-billed, a fresh turn's
+ * load added to the machine that was already too loaded to answer inside 10s. So the drop CAUSES
+ * more of the condition that produced it: a vicious cycle, not a one-off loss. Measured across one
+ * overnight session at load 130-372: 80 expired `set_agent_goal_met`, 3 expired `set_agent_goal`.
+ *
+ * WHAT RUNNING ONE COSTS. A `setState`. `set_agent_goal_met`'s single expensive input — the git
+ * ancestry probe — is already gated to a `landed`-kind goal whose cheap reading came back non-true,
+ * for one agent, once, on the call it makes when it believes it is done.
+ *
+ * WHY `set_agent_activity` AND `rename_agent` ARE NOT HERE, though they are equally idempotent and
+ * equally cheap: losing one costs a stale status line and nothing else. That is the trade
+ * `sparkle-4rgb1` already priced, and re-pricing it is not what these beads are about. Keeping the
+ * carve-out to the two ops with a self-amplifying loss is what makes it a fix rather than a repeal.
+ *
+ * THE CONCIERGE IS NOT COVERED — see the call site. Its second gate runs `appOpPolicy`, which
+ * RAISES AN APPROVAL CARD on an `ask` verdict, and the whole reason the expiry gate sits first is
+ * that a card must never be raised for a call nobody is waiting on.
+ */
+const EXPIRY_EXEMPT_OPS = new Set<ControlOp>(["set_agent_goal", "set_agent_goal_met"]);
+
+/** How many expired requests we RAN ANYWAY this session, by op — the other half of
+ *  `expiredSkipsByOp`. Two tallies, deliberately not one number: a drop and a late application mean
+ *  opposite things for the auto-resume storm, so folding them would hide the carve-out from the one
+ *  reader who needs it (a human asking how often the bridge misses its deadline). */
+const lateAppliedByOp = new Map<string, number>();
+
+/** How many expired requests we ran anyway this session, by op. A snapshot — mutating it is inert. */
+export function controlLateAppliedCounts(): Record<string, number> {
+  return Object.fromEntries(lateAppliedByOp);
 }
 
 /**
@@ -4485,8 +4526,23 @@ async function dispatch(req: ControlRequest): Promise<void> {
     // We still reply. The Rust pending entry is already gone, so `respond` is a harmless no-op — but
     // this function's contract is "reply EXACTLY once" on every path, and a silent early return is
     // how that invariant rots into a hang the next time the timing changes. It costs one IPC call.
+    //
+    // THE ONE CARVE-OUT: the goal-latch family, for a non-concierge caller. See
+    // `EXPIRY_EXEMPT_OPS` for the arithmetic, and note the concierge exclusion is what preserves
+    // the ordering claim above — its policy gate is the thing that raises cards, so it must keep
+    // being skipped. Everything past this point is the ordinary live path, gates included: running
+    // an expired op must not WEAKEN what it decides, only whether it is decided at all.
     const lateByMs = expiredBy(req, Date.now());
-    if (lateByMs !== null) {
+    const runAnyway =
+      lateByMs !== null &&
+      EXPIRY_EXEMPT_OPS.has(req.op as ControlOp) &&
+      req.callerAgentId !== CONCIERGE_CALLER_AGENT_ID;
+    if (runAnyway) {
+      lateAppliedByOp.set(req.op, (lateAppliedByOp.get(req.op) ?? 0) + 1);
+      // The op name and a duration only — never the payload, which is the identifying part.
+      console.warn(`[control] applying expired ${req.op} anyway: caller gave up ${lateByMs}ms ago`);
+    }
+    if (lateByMs !== null && !runAnyway) {
       reportControlOpExpired(req, lateByMs);
       await respond(req.reqId, {
         ok: false,
