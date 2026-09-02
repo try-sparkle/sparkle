@@ -32,6 +32,10 @@
 // FILE — a structural guarantee needs no guard. Until then this is what stops the regression
 // recurring silently.
 import { describe, expect, it } from "vitest";
+import {
+  assertBodyContains,
+  extractTopLevelFunctionBody,
+} from "@sparkle/core/testing/sourceGuards";
 import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -208,8 +212,8 @@ describe("both status chains apply the landed veto, at the same position", () =>
 // never tested, which is this repo's standing "asserts the precondition, not the side effect"
 // failure. Scope the search to the function that IS the chain, or the guard is decoration.
 //
-// ⚠️ AND WHY IT IS NOT BRACE-MATCHED EITHER. Two earlier cuts of this slice were BOTH wrong, in
-// OPPOSITE directions, and both read as obviously correct:
+// ⚠️ AND WHY IT IS NOT HAND-ROLLED BRACE-MATCHING EITHER. Two earlier cuts of this slice were BOTH
+// wrong, in OPPOSITE directions, and both read as obviously correct:
 //   • `ROLLUP.slice(at)` ran to EOF, swallowing `useAttentionNotifications`'s OWN call several
 //     hundred lines below — the body appeared to contain a call it does not make.
 //   • Counting braces from the first `{` after the NAME stopped inside the SIGNATURE, because
@@ -217,31 +221,37 @@ describe("both status chains apply the landed veto, at the same position", () =>
 //     balanced pair that closes two characters later. The slice was then the signature alone, so
 //     the zero-match assertion below could never fail: it stayed green on the very day the grace
 //     LANDED inside `composeRollup`, which is the single event this whole guard exists to catch.
-//     (Skipping the parameter list does not rescue that approach: the next `{` opens the RETURN
-//     TYPE, `): { published: StatusMap; own: StatusMap; … } {`, balanced on one line — the same
-//     silent truncation one step further along.)
-// `composeRollup` is a TOP-LEVEL declaration, so its closing brace is the first `}` in COLUMN 0
-// after it. That anchor is the one thing neither a defaulted parameter nor an inline object type
-// can forge. The anchor test below then proves the slice actually spans the body, so a future
-// reformat that breaks this fails LOUDLY rather than quietly reporting zero matches.
-const composeRollupBody = (() => {
-  const at = ROLLUP.indexOf("\nfunction composeRollup(");
-  if (at === -1) return "";
-  const end = ROLLUP.indexOf("\n}\n", at);
-  return end === -1 ? "" : ROLLUP.slice(at, end + 3);
-})();
+//     (Skipping the parameter list does not rescue that approach on its own: the next `{` opens the
+//     RETURN TYPE, `): { published: StatusMap; own: StatusMap; … } {`, balanced on one line — the
+//     same silent truncation one step further along.)
+//
+// Both cuts, and a third draft that grepped the whole file, are now bead `sparkle-7uh1v5` and the
+// slicing lives in ONE place: `@sparkle/core/testing/sourceGuards`. It skips the parameter list by
+// balancing PARENS, then takes the body from the brace whose match sits in COLUMN 0 on a line of
+// its own — an anchor neither a defaulted parameter nor an inline object return type can forge —
+// and it THROWS rather than returning "" when it cannot, because an empty slice is what makes every
+// downstream `not.toBe("")` anchor pass. Do not re-inline this; three drafts is the evidence.
+const COMPOSE_ROLLUP_ANCHORS = ["withObservedAttention(", "withNewAgentCalm("] as const;
+// The anchors are passed HERE as well as asserted in the `it` below, deliberately: this extraction
+// runs at MODULE LOAD, so a truncated or mis-anchored slice fails the whole file loudly at import
+// rather than reaching an assertion that might read plausibly on the wrong body (roborev 74090).
+// The `it` restates the rule where a reader and the test report will see it.
+const composeRollupBody = extractTopLevelFunctionBody(ROLLUP, "composeRollup", {
+  anchors: COMPOSE_ROLLUP_ANCHORS,
+});
 
 describe("the blocked-prompt grace is applied where the two chains can see it", () => {
   it("is anchored to a real composeRollup body — or every assertion below is vacuous", () => {
-    expect(composeRollupBody, "composeRollup not found in useAttentionNotifications").not.toBe("");
     // NOT MERELY NON-EMPTY. The truncation this replaces produced a seventeen-line, perfectly
     // non-empty SIGNATURE, which sailed through a `not.toBe("")` check while containing none of the
     // code it claimed to be searching. These two overlays are applied deep inside the body and
     // nowhere else in the file, so their presence is what proves the slice got past the parameter
-    // list and the return type and reached the chain itself.
-    for (const anchor of ["withObservedAttention(", "withNewAgentCalm("]) {
-      expect(composeRollupBody, `slice stopped short of composeRollup's body (no ${anchor})`).toContain(anchor);
-    }
+    // list and the return type and reached the chain itself. `assertBodyContains` throws with the
+    // rule's name and its reason — see `@sparkle/core/testing/sourceGuards`.
+    assertBodyContains(composeRollupBody, COMPOSE_ROLLUP_ANCHORS, "composeRollup");
+    // …and the slice really is the BODY, not the signature: the extractor returns the text between
+    // the body braces, so nothing from the parameter list can be in it.
+    expect(composeRollupBody).not.toContain("interaction: Record<string, number>");
   });
 
   // CURRENT, DELIBERATELY-PINNED STATE, NOT AN ENDORSEMENT. Landing the grace inside `composeRollup`

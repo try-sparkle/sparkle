@@ -15,7 +15,7 @@
 
 import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, posix, resolve } from "node:path";
 
 export interface OffScaleHit {
   /** Repo-relative path (already sliced to below the theme SRC root by the scanner). */
@@ -28,19 +28,97 @@ export interface OffScaleHit {
 // every distinct value is still listed with at least its first few files.
 const MAX_FILES_PER_VALUE = 6;
 
+// The most distinct IMPORT LINES we print before collapsing the tail. One line per distinct
+// relative specifier, so in practice this is 1-3: everything under `components/` shares one.
+const MAX_IMPORT_LINES = 4;
+
+/**
+ * WHERE THE TOKENS LIVE AND WHAT TO TYPE INSTEAD — the teaching half of a tripped ratchet.
+ *
+ * WHY THIS EXISTS (bead sparkle-qw9y62). The ratchet's message is, by construction, the ONLY place
+ * a newcomer learns these ratchets exist at all: nothing else in the loop mentions them, and the
+ * neighbouring files are full of the raw numbers the guard forbids, because ~250 of them predate
+ * it. So the message is not a diagnostic, it is the documentation — and a message that names only
+ * the token FAMILY ("use TYPE") still leaves the reader to work out which module TYPE comes from,
+ * what the relative path is from the file they are standing in, and which step to pick. That is
+ * three lookups spent on the one surface guaranteed to be read.
+ *
+ * Hence: the message prints the literal `import { … } from "…";` line to PASTE, computed for the
+ * offending file's own directory, and a concrete replacement expression. Copy-pasteable, not a
+ * description of something copy-pasteable.
+ */
+export interface OffScaleRemedy {
+  /** The named exports, exactly as they go inside the braces — e.g. `TYPE`, or `RADIUS, PILL`. */
+  named: string;
+  /** The token module, as a path relative to the desktop `src` root — e.g. `theme/scale`. */
+  module: string;
+  /** A concrete replacement for the raw number — e.g. `TYPE.body`. */
+  use: string;
+  /** Every step available, rendered for picking — e.g. `TYPE.micro=10 TYPE.small=12 …`. */
+  steps?: string;
+}
+
+/**
+ * The exact module specifier to import `module` from, as written INSIDE `file`.
+ *
+ * Both arguments are paths below the desktop `src` root, the same form the scanner already reports
+ * hits in (`components/appChrome.ts`), so this is pure string work with no filesystem access.
+ * A generic "import it from the scale module" is not paste-able; `"../theme/scale"` is, and it is
+ * different for a file in `components/` than for one in `theme/` or at the root — which is exactly
+ * the lookup the reader would otherwise do by hand at the moment they are least inclined to.
+ */
+export function importSpecifierFor(file: string, module: string): string {
+  const clean = file.replace(/^\/+/, "");
+  const fromDir = posix.dirname(clean);
+  const rel = posix.relative(fromDir, module);
+  return rel.startsWith(".") ? rel : `./${rel}`;
+}
+
+/** The paste-me block: one import line per distinct specifier, then what to write. */
+function remedyBlock(prop: string, hits: readonly OffScaleHit[], remedy: OffScaleRemedy): string {
+  const bySpecifier = new Map<string, string[]>();
+  for (const h of hits) {
+    const spec = importSpecifierFor(h.file, remedy.module);
+    const files = bySpecifier.get(spec) ?? [];
+    if (!files.includes(h.file)) files.push(h.file);
+    bySpecifier.set(spec, files);
+  }
+  const entries = [...bySpecifier.entries()];
+  const lines = entries.slice(0, MAX_IMPORT_LINES).map(([spec, files]) => {
+    const shown = files.slice(0, MAX_FILES_PER_VALUE).join(", ");
+    const extra =
+      files.length > MAX_FILES_PER_VALUE ? ` and ${files.length - MAX_FILES_PER_VALUE} more` : "";
+    return `    import { ${remedy.named} } from "${spec}";   // in ${shown}${extra}`;
+  });
+  const omitted = entries.length - lines.length;
+  if (omitted > 0) lines.push(`    …and ${omitted} more import path(s), one per directory depth.`);
+  // NOTE the template literal: this file is SCANNED by the very ratchet it reports for, and a
+  // literal `<prop>:` followed by a number anywhere in it — a comment included — would be counted
+  // as a violation of the guard it exists to serve. The prop name is always interpolated.
+  return (
+    `\nPASTE THIS IMPORT, then use the token in place of the raw number:\n` +
+    `${lines.join("\n")}\n` +
+    `    ${prop}: ${remedy.use}\n` +
+    (remedy.steps ? `  every step: ${remedy.steps}\n` : "")
+  );
+}
+
 /**
  * Build the assertion failure message for one off-scale ratchet.
  *
- * @param prop    the style prop being guarded, e.g. "fontSize" / "borderRadius" — shown verbatim.
+ * @param prop    the style prop being guarded, e.g. the font-size or corner-radius prop — verbatim.
  * @param advice  the migration guidance clause, e.g. "use TYPE" / "use RADIUS/PILL".
  * @param hits    every off-scale occurrence, each carrying the file it was found in.
  * @param ceiling the recorded ceiling the count is compared against.
+ * @param remedy  where the tokens live — REQUIRED, so a caller cannot build a message that names
+ *                the problem and withholds the fix. See {@link OffScaleRemedy}.
  */
 export function offScaleMessage(
   prop: string,
   advice: string,
   hits: readonly OffScaleHit[],
   ceiling: number,
+  remedy: OffScaleRemedy,
 ): string {
   const byValue = [...new Set(hits.map((h) => h.value))].sort((a, b) => a - b);
   const locations = byValue
@@ -56,7 +134,10 @@ export function offScaleMessage(
     `${hits.length} off-scale ${prop} values (${byValue.join(", ")}) vs recorded ceiling ${ceiling}. ` +
     `Locations — ${locations}. ` +
     `You added off-scale sprawl — ${advice}. ` +
-    `(If you MIGRATED some, this passes; lower the constant to ${hits.length} in this PR to keep the ceiling tight.)`
+    `(If you MIGRATED some, this passes; lower the constant to ${hits.length} in this PR to keep the ceiling tight.)` +
+    remedyBlock(prop, hits, remedy) +
+    `  Run this guard ALONE in ~25-40s, without the 22-minute unit suite:\n` +
+    `    bash scripts/design-token-ratchets.sh\n`
   );
 }
 

@@ -15,7 +15,34 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { ALLOWED_RADIUS, ALLOWED_TYPE, PILL, RADIUS, SPACE, TYPE } from "./scale";
-import { offScaleMessage } from "./scaleGuardTestUtils";
+import { type OffScaleRemedy, offScaleMessage } from "./scaleGuardTestUtils";
+
+// ── THE FAILURE MESSAGE IS THE DOCUMENTATION (bead sparkle-qw9y62) ─────────────────────────────
+// Nothing else in an agent's loop mentions these ratchets, and the neighbouring files are full of
+// the raw numbers they forbid — so the first time anyone learns the rule is when it fires. A
+// message naming only the token FAMILY ("use TYPE") leaves three lookups on the reader: which
+// module, what the relative path is from the file they are standing in, and which step to pick.
+// These remedies spend that surface on the literal import line instead, computed per offending
+// file. The steps are derived from the real scales, so a step added or renamed cannot leave a
+// stale list in the one place people read.
+const TYPE_REMEDY: OffScaleRemedy = {
+  named: "TYPE",
+  module: "theme/scale",
+  use: "TYPE.body",
+  steps: Object.entries(TYPE)
+    .map(([k, v]) => `TYPE.${k}=${v}`)
+    .join(" "),
+};
+
+const RADIUS_REMEDY: OffScaleRemedy = {
+  named: "RADIUS, PILL",
+  module: "theme/scale",
+  use: "RADIUS.input",
+  steps: [
+    ...Object.entries(RADIUS).map(([k, v]) => `RADIUS.${k}=${v}`),
+    `PILL=${PILL} (a capsule/circle, not a step)`,
+  ].join(" "),
+};
 
 // fileURLToPath, NOT `.pathname` — this repo's worktrees live under "Application Support", so the
 // URL form is percent-encoded and `.pathname` hands back a directory that does not exist.
@@ -171,7 +198,7 @@ describe("the type and radius scales are a ratchet", () => {
     const hits = offScale("fontSize", ALLOWED_TYPE);
     expect(
       hits.length,
-      offScaleMessage("fontSize", "use TYPE", hits, MAX_OFF_SCALE_TYPE),
+      offScaleMessage("fontSize", "use TYPE", hits, MAX_OFF_SCALE_TYPE, TYPE_REMEDY),
     ).toBeLessThanOrEqual(MAX_OFF_SCALE_TYPE);
   });
 
@@ -179,7 +206,7 @@ describe("the type and radius scales are a ratchet", () => {
     const hits = offScale("borderRadius", ALLOWED_RADIUS);
     expect(
       hits.length,
-      offScaleMessage("borderRadius", "use RADIUS/PILL", hits, MAX_OFF_SCALE_RADIUS),
+      offScaleMessage("borderRadius", "use RADIUS/PILL", hits, MAX_OFF_SCALE_RADIUS, RADIUS_REMEDY),
     ).toBeLessThanOrEqual(MAX_OFF_SCALE_RADIUS);
   });
 
@@ -216,7 +243,7 @@ describe("offScaleMessage names the files each off-scale value came from", () =>
       { file: "components/modal.tsx", value: 12.5 },
       { file: "components/badge.tsx", value: 17 },
     ];
-    const msg = offScaleMessage("fontSize", "use TYPE", hits, 0);
+    const msg = offScaleMessage("fontSize", "use TYPE", hits, 0, TYPE_REMEDY);
     // the distinct values still appear (the old behaviour, preserved)
     expect(msg).toContain("(12.5, 17)");
     // the FILES now appear — this is the enrichment, and the assertion that would fail if it were dropped
@@ -240,12 +267,84 @@ describe("offScaleMessage names the files each off-scale value came from", () =>
       ...Array.from({ length: 9 }, (_, i) => ({ file: `f${i}.tsx`, value: 5 })),
       { file: "f0.tsx", value: 5 },
     ];
-    const msg = offScaleMessage("borderRadius", "use RADIUS/PILL", hits, 0);
-    // f0.tsx appears exactly once despite being present twice in the hits
-    expect(msg.split("f0.tsx").length - 1).toBe(1);
+    const msg = offScaleMessage("borderRadius", "use RADIUS/PILL", hits, 0, RADIUS_REMEDY);
+    // f0.tsx appears exactly once in the LOCATIONS list despite being present twice in the hits.
+    // The import block names it a second time, deliberately — that line is the paste-me — so the
+    // dedupe assertion is scoped to the locations half rather than to the whole message.
+    const locationsHalf = msg.slice(0, msg.indexOf("PASTE THIS IMPORT"));
+    expect(locationsHalf.split("f0.tsx").length - 1).toBe(1);
     // the display is capped, but the header count reflects ALL ten hits, not the six shown
     expect(msg).toMatch(/and \d+ more/);
     expect(msg).toContain("10 off-scale borderRadius values");
     expect(msg).toContain("use RADIUS/PILL");
+  });
+});
+
+// ── THE MESSAGE MUST TEACH, NOT JUST ACCUSE (bead sparkle-qw9y62) ──────────────────────────────
+//
+// This is the half of the bead that is not about speed. The ratchet's message is the ONLY place a
+// newcomer learns these ratchets exist — nothing upstream of a tripped guard mentions them, and
+// every neighbouring file is full of the raw numbers it forbids. So "use TYPE" is not enough: it
+// names the family and leaves the reader to find the module, work out the relative path from
+// wherever they are standing, and guess a step.
+//
+// These assertions pin the LITERAL IMPORT STATEMENT, character for character, because a
+// description of a paste-able line is not a paste-able line. They are written against synthetic
+// hits for the reason the block above already gives: the real ratchets scan the real tree and
+// cannot be forced red on demand, so nothing else here can fail if the teaching is dropped.
+describe("a tripped ratchet prints the import line to paste, not a description of one", () => {
+  it("gives the exact specifier for a file in components/, plus the token to type", () => {
+    const msg = offScaleMessage(
+      "fontSize",
+      "use TYPE",
+      [{ file: "components/appChrome.ts", value: 12.5 }],
+      0,
+      TYPE_REMEDY,
+    );
+    // THE deliverable: a line that can be pasted at the top of components/appChrome.ts verbatim.
+    expect(msg, "the message must carry the literal import statement").toContain(
+      'import { TYPE } from "../theme/scale";',
+    );
+    // …and what to write where the raw number was.
+    expect(msg, "the message must name the replacement expression").toContain(
+      "fontSize: TYPE.body",
+    );
+    // …and every step, so picking one is not a fourth lookup.
+    expect(msg, "the message must list the steps available").toContain("TYPE.body=13");
+    // …and the cheap way to re-take the verdict once it is fixed.
+    expect(msg, "the message must name the standalone re-run").toContain(
+      "bash scripts/design-token-ratchets.sh",
+    );
+  });
+
+  it("computes the specifier from the OFFENDING FILE's own directory, not a fixed string", () => {
+    // The whole point of computing it: these three files need three different lines, and a
+    // hardcoded "../theme/scale" would be wrong for two of them. A constant would pass the test
+    // above and fail here, which is what makes that test non-vacuous.
+    const msg = offScaleMessage(
+      "borderRadius",
+      "use RADIUS/PILL",
+      [
+        { file: "theme/blueprintSpec.ts", value: 7 },
+        { file: "components/Concierge/ComposeBox.tsx", value: 7 },
+        { file: "App.tsx", value: 7 },
+      ],
+      0,
+      RADIUS_REMEDY,
+    );
+    expect(msg, "a sibling of scale.ts imports it as ./scale").toContain(
+      'import { RADIUS, PILL } from "./scale";',
+    );
+    expect(msg, "a file one directory deeper needs an extra ../").toContain(
+      'import { RADIUS, PILL } from "../../theme/scale";',
+    );
+    expect(msg, "a file at the src root needs ./theme/scale").toContain(
+      'import { RADIUS, PILL } from "./theme/scale";',
+    );
+    // Each import line names the file(s) it is for, so three lines are not three riddles.
+    expect(msg).toContain("// in theme/blueprintSpec.ts");
+    expect(msg).toContain("// in App.tsx");
+    // PILL is offered as the capsule shape rather than as a step to pick off the scale.
+    expect(msg).toContain("PILL=999");
   });
 });

@@ -18,6 +18,8 @@ import {
 } from "../theme/scaleGuardTestUtils";
 import { CHIP, COUNT, SECTION_LABEL, TAG, chip, tag } from "./labelTreatment";
 
+// fileURLToPath, NOT `.pathname` — this repo's worktrees live under "Application Support", so the
+// URL form is percent-encoded and `.pathname` hands back a directory that does not exist.
 const SRC = fileURLToPath(new URL("..", import.meta.url));
 
 /**
@@ -60,9 +62,40 @@ function sourceFiles(dir: string, out: string[] = []): string[] {
   return out;
 }
 
+// A scan that silently matched NOTHING would make every ceiling in this file vacuous. The ratchets
+// below all gate on `sites.length <= CEILING`, and zero satisfies that — forever, silently, over a
+// tree nobody opened. That is not hypothetical here: every agent worktree on this machine lives
+// under a path containing a space ("Application Support"), so a walk rooted on a
+// `new URL(..).pathname` reads a percent-encoded directory that does not exist. The
+// `fileURLToPath` above is what keeps SRC honest; this floor is what notices if anything ever
+// stops being honest.
+//
+// It THROWS rather than returning an empty list, so the vacuity is impossible rather than merely
+// detectable: one broken walk reds every ratchet that depends on it, not just whichever single
+// test happens to carry the assertion. This is the same floor, at the same number, that
+// theme/scale.test.ts, components/fontTokens.test.ts, components/cssTokens.test.ts and
+// components/glyphIcons.test.ts carry (bead sparkle-uabf2k) — a per-file copy rather than a shared
+// import because each of those files owns its own `sourceFiles` walk with its own exclusions, and
+// a helper hoisted out of them would have to take the walk as a parameter, which is the seam every
+// test injects past. The real count under this root is 1047; 200 is a floor, not an estimate, so a
+// legitimate deletion sweep cannot be what trips it.
+const MIN_SCANNED_FILES = 200;
+
+function scannedSourceFiles(): string[] {
+  const files = sourceFiles(SRC);
+  if (files.length < MIN_SCANNED_FILES) {
+    throw new Error(
+      `the source scan under ${SRC} found ${files.length} file(s), below the floor of ` +
+        `${MIN_SCANNED_FILES}. The ratchets in this file gate on a COUNT, so a truncated or empty ` +
+        `scan reports GREEN while guarding nothing. Fix the walk — do not lower this floor.`,
+    );
+  }
+  return files;
+}
+
 /** Every hand-typed tracking site in the whole tree — the ratchet's real scan, in one place. */
 function trackingSitesTreeWide(): GuardSite[] {
-  return sourceFiles(SRC).flatMap((f) =>
+  return scannedSourceFiles().flatMap((f) =>
     handTypedTracking(readFileSync(f, "utf8"), f.slice(SRC.length)),
   );
 }
@@ -248,7 +281,7 @@ describe("nothing in the tree reaches for a capsule where the spec draws a box",
   it("the count of literal `borderRadius: 999` never rises", () => {
     resetBlameInvocationCount();
     const sites: GuardSite[] = [];
-    for (const file of sourceFiles(SRC)) {
+    for (const file of scannedSourceFiles()) {
       readFileSync(file, "utf8").split("\n").forEach((line, i) => {
         if (/^\s*(\/\/|\/\*|\*)/.test(line)) return;
         if (/borderRadius:\s*999\b/.test(line)) {

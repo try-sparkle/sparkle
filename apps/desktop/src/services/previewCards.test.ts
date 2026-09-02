@@ -12,6 +12,7 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
+import { extractTopLevelFunctionBody } from "@sparkle/core/testing/sourceGuards";
 
 import {
   clampNoticeDetail,
@@ -273,22 +274,36 @@ describe("preview.rs's supervise loop, as the corrected comments describe it", (
     return whole.slice(0, cut);
   }
 
-  /** One top-level `fn`'s body, bounded by INDENTATION rather than by brace counting: the signature
-   *  starts at column 0 and the close is the next line that is exactly `}`. Brace counting would
-   *  have to reason about `format!("… {}s. {}", …)`, which is a parser this file has no business
-   *  growing. */
-  function topLevelFn(prod: string, signature: string): string {
-    const start = prod.indexOf(signature);
-    if (start < 0) throw new Error(`preview.rs no longer contains \`${signature}\``);
-    const rest = prod.slice(start);
-    const end = rest.indexOf("\n}\n");
-    if (end < 0) {
+  /** One deep-body marker per function this file slices: an identifier that appears only well
+   *  inside the body, never in the signature and never in the first statement.
+   *
+   *  THIS IS THE ANTI-VACUITY ANCHOR (bead `sparkle-7uh1v5`) and it is the half that a `!== ""`
+   *  check cannot do: a slice truncated into the SIGNATURE is perfectly non-empty, so every
+   *  assertion built on it goes quietly green. Each marker below also survives the two in-memory
+   *  MUTATIONS further down — the mutations must be caught by the assertions they target, not by
+   *  the anchor, or the negative controls would be proving the wrong thing. */
+  const DEEP_BODY_ANCHORS: Record<string, readonly string[]> = {
+    supervise: ["discover_port(", "std::thread::sleep("],
+    live_for_reattach: ["PreviewState::Crashed"],
+  };
+
+  /** One top-level `fn`'s body, via the ONE shared extractor
+   *  (`@sparkle/core/testing/sourceGuards`).
+   *
+   *  It skips the whole parameter list by balancing parens and bounds the body on the brace whose
+   *  match sits in COLUMN 0 on a line of its own, so `format!("… {}s. {}", …)` — braces inside a
+   *  STRING — is not structure it has to reason about, and neither is a defaulted parameter or an
+   *  inline return type. It THROWS, naming the function, rather than degrading to "" or to the rest
+   *  of the file: an empty slice is what turns a guard into a test that cannot fail. */
+  function topLevelFn(prod: string, name: string): string {
+    const anchors = DEEP_BODY_ANCHORS[name];
+    if (!anchors) {
       throw new Error(
-        `\`${signature}\` has no column-0 closing brace, so its body cannot be bounded — refusing ` +
-          "to scan the rest of the file in its name",
+        `no deep-body anchor is recorded for \`${name}\` — add one to DEEP_BODY_ANCHORS rather ` +
+          "than slicing without it, or this guard can go green on a truncated body",
       );
     }
-    return rest.slice(0, end);
+    return extractTopLevelFunctionBody(prod, name, { anchors });
   }
 
   /** The `if bound.is_none() { … }` block, bounded the same way one indent level in. */
@@ -338,7 +353,7 @@ describe("preview.rs's supervise loop, as the corrected comments describe it", (
         "`serving` has no production writer are now false and must be corrected in the same change. " +
         "If it is another predicate READING it, widen this expectation and say so here.",
     ).toBe(1);
-    const reader = topLevelFn(prod, "fn live_for_reattach(");
+    const reader = topLevelFn(prod, "live_for_reattach");
     expect(
       reader,
       "the one `PreviewState::Serving` site must be `live_for_reattach`'s match arm",
@@ -346,7 +361,7 @@ describe("preview.rs's supervise loop, as the corrected comments describe it", (
   });
 
   it("runs DISCOVERY at most once, and `listening` is the only transition inside that block", () => {
-    const body = topLevelFn(productionHalf(whole), "fn supervise(");
+    const body = topLevelFn(productionHalf(whole), "supervise");
     const { block, after } = onceOnlyBlock(body);
 
     // Two state ADVANCES in the whole loop, and exactly one of them is inside the once-only guard.
@@ -370,7 +385,7 @@ describe("preview.rs's supervise loop, as the corrected comments describe it", (
   });
 
   it("probes HTTP outside the once-only block and inside the loop, so it RETRIES", () => {
-    const body = topLevelFn(productionHalf(whole), "fn supervise(");
+    const body = topLevelFn(productionHalf(whole), "supervise");
     const { block, after } = onceOnlyBlock(body);
 
     // ONE call site, and it is not in the discovery block. This is the whole of `sparkle-dlrqb8.2`:
@@ -415,7 +430,7 @@ describe("preview.rs's supervise loop, as the corrected comments describe it", (
       "if http_probe(port) {",
     );
 
-    const body = topLevelFn(productionHalf(regressed), "fn supervise(");
+    const body = topLevelFn(productionHalf(regressed), "supervise");
     const { block, after } = onceOnlyBlock(body);
 
     // Each of the three claims, now false, and each detected by the assertion that guards it.
@@ -438,7 +453,7 @@ describe("preview.rs's supervise loop, as the corrected comments describe it", (
     expect(mutated, "the sleep line this mutation targets must still exist").not.toBe(whole);
 
     const prod = productionHalf(mutated);
-    const body = topLevelFn(prod, "fn supervise(");
+    const body = topLevelFn(prod, "supervise");
     const { block, after } = onceOnlyBlock(body);
 
     expect(count(prod, "PreviewState::Serving")).not.toBe(1);
