@@ -1349,16 +1349,33 @@ export function Terminal({
     // the cheap settle-refresh can't (a cell mis-rasterized mid-stream sticks under the WebGL per-
     // cell cache — see IDLE_SWEEP_MS). On its OWN, longer-debounced timer so it fires once when
     // streaming stops, not per chunk. Gated on IDLE_SWEEP_MIN_BYTES of accumulated output so routine
-    // interactive pauses don't pay the cold repaint. Skipped while the pane is hidden — the become-
-    // active reveal owns that repaint, and a full atlas clear on an off-screen pane is pure wasted
-    // GPU work (mirrors applyRepaintPlan's "skip"). disposedRef + forceFullRepaint's own try/catch
+    // interactive pauses don't pay the cold repaint. disposedRef + forceFullRepaint's own try/catch
     // keep a late timer off a torn-down term.
+    //
+    // GATED ON isOnScreen(), NOT isPaintable() — bead sparkle-7izq1, and the same defect
+    // applyRepaintPlan fixed one screen up (sparkle-nwpf). This guard used to read `!isPaintable()`
+    // while its comment claimed the sweep was "skipped while the pane is hidden", and those two
+    // things could not both be true: paneVisibility.ts keeps every backgrounded pane `display: flex`
+    // at full size (hidden with `visibility` + `content-visibility`), so `clientWidth > 0` — the
+    // whole of isPaintable() — is TRUE for all sixty of them. The guard was inert, and every hidden
+    // pane that streamed past the volume bar and went quiet paid a forceFullRepaint.
+    //
+    // That is the aggregate-render-storm half of the fleet-scale wedge, because the cost is per
+    // PANE and the panes are all streaming at once: measured through the real onOutput seam with one
+    // burst per pane, 1 visible + 1 hidden cost 3 full-viewport term.refresh() calls and 1 visible +
+    // 32 hidden cost 34 — exactly one extra whole-viewport repaint per additional hidden pane, per
+    // idle window. Past MAX_WEBGL_CONTEXTS a pane is on xterm's DOM renderer, so each of those is
+    // thousands of text spans rewritten for output nobody can see; `content-visibility: hidden`
+    // (sparkle-gw36j) drops that subtree out of LAYOUT but cannot stop the JS or the DOM mutation.
+    // The become-active reveal owns the repaint a hidden pane defers, exactly as it does for the
+    // settle path. Guarded by Terminal.hiddenIdleSweep.test.tsx, which asserts the repaint count is
+    // the SAME at N=1 and N=32 hidden panes.
     let idleSweepTimer: number | null = null;
     let bytesSinceSweep = 0;
     const scheduleIdleSweep = () => {
       if (idleSweepTimer) window.clearTimeout(idleSweepTimer);
       idleSweepTimer = window.setTimeout(() => {
-        if (disposedRef.current || !isPaintable()) return;
+        if (disposedRef.current || !isOnScreen()) return;
         // Below the volume bar: leave bytesSinceSweep intact so it accrues across bursts and a
         // series of small outputs still heals once cumulatively substantial — just not per pause.
         if (bytesSinceSweep < IDLE_SWEEP_MIN_BYTES) return;
