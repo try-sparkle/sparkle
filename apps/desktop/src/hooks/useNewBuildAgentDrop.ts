@@ -22,11 +22,61 @@ import {
   noteDropArrived,
   reportDropWithNoTarget,
 } from "../services/dndTargets";
+import { sideOf, type PairAssignment, type PairSide } from "../engine/pairs";
 import { safeUnlisten } from "../services/safeUnlisten";
 import { describePaths } from "../services/logSafePaths";
 import { withDropPaths } from "../services/dropPaths";
 import { log } from "../logger";
 import type { Project } from "../types";
+
+/**
+ * The epic a drop on "+ New Build Agent" is being made AGAINST, or `undefined` for none.
+ *
+ * ── WHY THE DROP HAD TO ASK THIS AT ALL (bead sparkle-70cu4y) ─────────────────────────────────
+ * One button, two gestures, and they disagreed. `AgentSidebar` renders the button with
+ * `onLocalClick={() => spawnBuildAgent(epicFocusId ?? undefined)}`, so a CLICK from an epic-focused
+ * sidebar reaches `spawnBuildAgentInProject` carrying the epic: the row's `epicId` is stamped and
+ * the auto-bead is minted as a CHILD of that epic. The DROP called `spawnRef.current()` with no
+ * arguments, so the epic the app already had in hand was discarded between the gesture and the
+ * shared spawn — and because an omitted `epicId` is also how an honestly epic-less spawn is spelled
+ * (the empty-state button, the babysit dispatcher), nothing downstream could tell the two apart.
+ *
+ * The cost is not cosmetic. `epicSweepRunner.boundAgentsFor` is `kind === "build" && epicId ===
+ * <epic>` and reads the ROW ALONE — no bead, no parent edge — and it is what every staffing reading
+ * asks: the sweep's watch gate, `pusherMount.improveUnstaffedEpics`, and
+ * `planView.orchestratorNameForEpic`. An agent dropped onto an epic therefore staffed nothing, and
+ * the epic sat unstaffed with a live agent working it.
+ *
+ * ── READ LIVE, AT THE DROP, AND FROM THE OWNING SIDE ─────────────────────────────────────────
+ * Two things this deliberately does NOT do:
+ *
+ *   1. It is not captured in the effect. The webview listener registers ONCE (its deps are
+ *      `[setBuildAgentHover]`) and the focus moves constantly, so a closed-over value would bind a
+ *      drop to whatever epic happened to be focused when the Workspace mounted. The focus at the
+ *      INSTANT OF THE DROP is the only answer that matches what the user was looking at, and it is
+ *      the same instant the click path reads its own.
+ *   2. It does not take `epicFocusBySide` whole. The focus is PER PAIR, and this listener is
+ *      window-global: the other column can be focused on an epic that has nothing to do with the
+ *      project being dropped into. Binding to it would attribute an agent to work nobody aimed it
+ *      at — the false-positive direction, and the one that cannot be walked back, since the epic
+ *      then reads STAFFED by an agent doing something else entirely. So the side is resolved from
+ *      the project, exactly as `AgentSidebar` resolves its own `pairSide`.
+ *
+ * A `null` project returns `undefined` and never consults the map: `sideOf(assignment, "")` answers
+ * `"right"` by design, so asking with no project would hand back the right pair's focus for a
+ * window that is rendering no button at all.
+ */
+export function epicFocusForDrop(
+  projectId: string | null,
+  pairAssignment: PairAssignment,
+  epicFocusBySide: Readonly<Record<PairSide, string | null>>,
+): string | undefined {
+  if (!projectId) return undefined;
+  // `?? undefined` rather than the raw value: `null` is how the store spells "nothing focused", and
+  // `SpawnBuildAgentOpts.epicId` spells the same state as ABSENT. Handing the spawn a `null` would
+  // be a third spelling of one fact, which is how a binding ends up written as a garbage id.
+  return epicFocusBySide[sideOf(pairAssignment, projectId)] ?? undefined;
+}
 
 export function useNewBuildAgentDrop(project: Project | null): void {
   const spawnBuildAgent = useSpawnBuildAgent(project);
@@ -34,6 +84,11 @@ export function useNewBuildAgentDrop(project: Project | null): void {
   // spawn closure in a ref so the handler never captures a stale project.
   const spawnRef = useRef(spawnBuildAgent);
   spawnRef.current = spawnBuildAgent;
+  // The project id travels the same way and for the same reason the spawn closure does: the
+  // listener registers once, and the drop must resolve the epic focus for whichever project is
+  // current AT THE DROP, not the one that was open when the Workspace mounted.
+  const projectIdRef = useRef(project?.id ?? null);
+  projectIdRef.current = project?.id ?? null;
   const setBuildAgentHover = useUiStore((s) => s.setBuildAgentHover);
   useEffect(() => {
     const unlistenPromise = getCurrentWebview()
@@ -59,7 +114,17 @@ export function useNewBuildAgentDrop(project: Project | null): void {
           // services/dropPaths. The spawn happens AFTER the paths resolve, deliberately: spawning
           // first would leave an empty agent behind for a drag that turns out to carry no file.
           withDropPaths(p.paths, "new-build-agent", (paths) => {
-            const id = spawnRef.current();
+            // JOIN THE FOCUSED EPIC, exactly as a CLICK on this same button does — see
+            // `epicFocusForDrop` for why the read is live and side-scoped. Read through
+            // `getState()` rather than a subscription: this is an imperative event handler, and a
+            // subscribed value would re-run the effect (re-registering the webview listener) every
+            // time the founder moved the epic focus, for a value only ever read on drop.
+            const ui = useUiStore.getState();
+            const epicId = epicFocusForDrop(projectIdRef.current, ui.pairAssignment, ui.epicFocusBySide);
+            // `undefined` is passed as NO OPTIONS AT ALL, so the honest epic-less drop is
+            // byte-for-byte the call it has always made: the row carries no `epicId`, the auto-bead
+            // stays top-level, and no staffing reader is told a binding exists.
+            const id = spawnRef.current(epicId ? { epicId } : undefined);
             if (!id) return; // no project open — no button rendered either; nothing to do
             // Kinds, never paths — the log ships with support tickets and crash reports
             // (see services/logSafePaths).
