@@ -1217,6 +1217,58 @@ const FIRST_HAND_EVIDENCE = new Set<string>([
 const notCurrent = (c: ConflictingPr): boolean => !FIRST_HAND_EVIDENCE.has(c.evidence);
 
 /**
+ * The `evidence` value that means NOTHING about this commit could be confirmed — no reading now,
+ * and no same-head verdict to fall back on. The producer's own three-way rule calls this the
+ * strongest unknown; see {@link ConflictingPr.evidence}.
+ */
+const NO_CONFIRMABLE_READING = "unknown";
+
+/**
+ * DID WE FAIL TO ASK, RATHER THAN GET A BAD ANSWER? (bead sparkle-y0wmnb)
+ *
+ * ── THE COLLAPSE THIS ENDS ───────────────────────────────────────────────────────────────────────
+ * A `gh` transport error — a logged-out CLI, a spent rate limit, one flaky call — is a fact about
+ * OUR read. It says nothing whatever about the pull request. But the producer is fail-closed by
+ * design: an unreadable look still raises a flag, carrying forward the LAST SUCCESSFUL read's
+ * `kind` and `commitsBehind` (`conflict_ladder::step`'s veto chain, where a refusal outranks every
+ * "it is fine" veto). So a PR that was green, mergeable and zero commits behind arrives here as
+ * `kind: "stale"`, and this function used to narrate it as *"behind main and drifting further with
+ * every merge"* — a confident verdict about a pull request nobody could reach. Measured: one such
+ * PR sat flagged for 22 minutes while it was in fact fully green and mergeable the whole time.
+ *
+ * That is the absence-vs-nonexistence bug (`sparkle-gazo4a`): reporting "I could not see it" as
+ * "it is not there". `kind` is only meaningful on a look that READ the PR —
+ * `conflict_ladder::kind`'s own contract says so — so the row's class here is not `kind` at all.
+ *
+ * ── WHY IT IS STILL REPORTED ─────────────────────────────────────────────────────────────────────
+ * Dropping or greying these rows is the opposite failure and is explicitly forbidden by the
+ * producer's contract: through a `gh` outage that suppresses a genuine, recent, still-standing
+ * conflict for the whole outage. So the row stays, keeps its number, keeps its age — and stops
+ * pretending to be a verdict.
+ *
+ * ── WHY `evidence`, NOT `blockedBy` ──────────────────────────────────────────────────────────────
+ * Both are set on this path (Rust reaches `"unknown"` only under a refusal, and a refusal is what
+ * writes `blocked_by`), so either would find the same rows today. `evidence` is the one that says
+ * WHAT WE KNOW rather than why we failed, and it is the field the producer documents as the
+ * three-way classifier. `blockedBy` is then free to do the job it is named for: quoting the reason.
+ */
+const couldNotAsk = (c: ConflictingPr): boolean => c.evidence === NO_CONFIRMABLE_READING;
+
+/**
+ * The WORDS a row nobody could read shows, and the sentence behind them.
+ *
+ * ONE VOCABULARY, deliberately. `openPrs.ts` already says "Conflicts — never tested" for the
+ * sibling case and `PrReadiness` says "Unverified" for a PR-list read that failed, so a reader who
+ * has learned one surface is not made to learn a third word for the same idea here. Exported so
+ * that vocabulary has a single home, NOT so a test can assert `label === COULD_NOT_ASK_LABEL` — an
+ * assertion against the constant it is checking cannot fail. The suite pins the rendered sentence.
+ */
+export const COULD_NOT_ASK_LABEL = "COULD NOT ASK GITHUB";
+export const COULD_NOT_ASK_SENTENCE =
+  "That is a fact about our own read, not a verdict about the pull request: it may be green and " +
+  "mergeable right now.";
+
+/**
  * A reading old enough to be worth saying out loud — one minute.
  *
  * Below it the phrase would render "last read 0h 0m ago", which is noise, and noise on a qualifier
@@ -1302,6 +1354,16 @@ function ownerPhrase(c: ConflictingPr, labels: ReadonlyMap<string, string | unde
  * the two would cost the headline exactly the credibility it is built on. They are still reported,
  * because the moment a drifting PR goes conflicting is the moment it is too late to have noticed.
  *
+ * ── A ROW NOBODY COULD READ IS A THIRD CLASS, AND THAT CLASS IS NOT FLAT ─────────────────────────
+ * `evidence: "unknown"` means the look was REFUSED, so the row is never counted into "N cannot
+ * merge" / "N are behind main" and its line makes no present-tense claim. But it is never dropped
+ * or greyed either, and — this is the half that was missed (roborev 75149) — the `kind` it carries
+ * is the verdict of the last look that GOT AN ANSWER. So the aggregate and the remedy split it:
+ * the half last known to be CONFLICTING keeps a count of its own and a CONDITIONED catch-up remedy,
+ * and the absolute "may be green and mergeable right now" / "nothing can be fixed by touching the
+ * branch" wording is reserved for the half last known to MERGE. `"unknown"` licenses "we cannot
+ * vouch for this verdict", never "there is no verdict".
+ *
  * ── WHAT IS NOT DECIDED HERE ─────────────────────────────────────────────────────────────────────
  * `kind` and `evidence` are the producer's classification and are taken as given. Re-deriving either
  * from `commitsBehind` would be a second opinion about the same PR, invisible to the tests that
@@ -1323,14 +1385,39 @@ export function conflictCondition(
     if (a.kind !== b.kind) return a.kind === "conflicting" ? -1 : 1;
     return b.commitsBehind - a.commitsBehind;
   });
-  const conflicting = ordered.filter((c) => c.kind === "conflicting");
-  const stale = ordered.filter((c) => c.kind === "stale");
+  // A THIRD CLASS, AND IT IS NOT A `kind` — see {@link couldNotAsk}. A row nobody could read is
+  // neither a conflicting PR nor a stale one; it is a failed READ wearing whatever word the last
+  // successful read left behind. Counting it as either is what let a green, mergeable PR be
+  // reported as "behind main and drifting" because one `gh` call exited non-zero.
+  const unread = ordered.filter(couldNotAsk);
+  // …AND THE UNREAD CLASS IS NOT FLAT (roborev 75149). `couldNotAsk` is reached only on a BLIND look
+  // over STORED facts — `conflict_watch::blind_facts` clones the last successful read, and
+  // `untested_evidence` returns `"unknown"` only under a refusal with nothing carried — so the word
+  // an unread row wears is the verdict of a look that DID get an answer: real, recent, and about
+  // this pull request. Treating every unread row alike was the OVER-CORRECTION of the fix above: it
+  // dropped a standing conflict out of the counts AND inverted its remedy, which suppresses that
+  // conflict exactly as effectively as dropping the row would. The producer's evidence contract
+  // names it: `"unknown"` licenses "we cannot vouch for this verdict", never "there is no verdict".
+  // So the class splits by the word the last successful read left behind, and only the half that
+  // said MERGEABLE may be told "nothing here can be fixed by touching the branch".
+  const unreadConflicting = unread.filter((c) => c.kind === "conflicting");
+  const unreadStale = unread.filter((c) => c.kind !== "conflicting");
+  const conflicting = ordered.filter((c) => c.kind === "conflicting" && !couldNotAsk(c));
+  const stale = ordered.filter((c) => c.kind === "stale" && !couldNotAsk(c));
 
   const ages = ordered.map((c) => splitHoursMinutes(Math.max(0, c.unresolvedSecs) * 1000));
 
   const lines = ordered.map((c, i) => {
     const { h, m } = ages[i]!;
-    const held = c.blockedBy ? ` Blocked by: ${c.blockedBy}.` : "";
+    // WHOSE HOLD IS THIS? `blockedBy` answers two different questions depending on the row, and one
+    // wording for both is the same collapse one size down: on a first-hand row it is something
+    // holding the PULL REQUEST, and on a row we could not re-read it is what stopped US. "Blocked
+    // by: sweep-budget" reads as a property of the PR, which it never is.
+    const held = c.blockedBy
+      ? notCurrent(c)
+        ? ` We could not re-read it: ${c.blockedBy}.`
+        : ` Blocked by: ${c.blockedBy}.`
+      : "";
     const who = ownerPhrase(c, labels);
     // CLAMPED AT ZERO, and this is a citation-safety rule rather than cosmetics. A negative count
     // renders as `-5`, from which `numbersIn` reads `5` — while `measured` would hold `-5`. The two
@@ -1339,6 +1426,25 @@ export function conflictCondition(
     // detector entirely. The parser rejects negatives at the boundary too; this is the half that
     // holds for any caller.
     const behind = `${behindOf(c)} commits behind main`;
+    // ── WE COULD NOT ASK — FIRST, BECAUSE IT DISQUALIFIES EVERY SENTENCE BELOW IT ───────────────
+    //
+    // Nothing on this row is a statement about the pull request, so it may not be introduced by
+    // one. The last successful read is still stated — that is the point of keeping the row — but in
+    // the past tense, behind the reason we could not confirm it, and with the age that says how far
+    // in the past. No remedy is offered here that touches the branch: see the report's `remedy`.
+    if (couldNotAsk(c)) {
+      const why = c.blockedBy ? ` (${c.blockedBy})` : "";
+      // The word the LAST SUCCESSFUL read used. `kind` is that read's verdict, not this look's —
+      // `conflict_ladder::kind` is documented as meaningful only on a look that read the PR.
+      const lastRead =
+        c.kind === "conflicting" ? "conflicting, and therefore untested" : "last known to be mergeable";
+      return (
+        `  - #${c.pr} ${c.branch} — ${COULD_NOT_ASK_LABEL}${why}. ${COULD_NOT_ASK_SENTENCE} ` +
+        `The last look that got an answer says ${lastRead} — that verdict is NOT current, because nothing ` +
+        `about this commit could be confirmed on the last look${agePhrase(c)}. ${behind} when we last ` +
+        `managed to look, flagged for ${h}h ${m}m. ${who}.`
+      );
+    }
     if (c.kind === "conflicting") {
       // The compound fact, in one clause, on every line — and never stronger than `evidence` allows.
       // See {@link testingPhrase}: `kind` alone cannot tell a directly-observed absence from an
@@ -1356,12 +1462,34 @@ export function conflictCondition(
 
   const nC = conflicting.length;
   const nS = stale.length;
+  const nU = unread.length;
+  const nUC = unreadConflicting.length;
+  const nUS = unreadStale.length;
   // AN AGGREGATE MAY BE NO STRONGER THAN THE WEAKEST ROW IT COVERS. "Never been tested" is licensed
   // by the directly-observed absence and nothing else: a `checks-are-stale` row DID run CI, and an
   // inherited or unread row is a verdict nobody re-read — so the old absolute headline contradicted
   // the very sentence `testingPhrase` composes one line below it.
   const neverRan = conflicting.every((c) => c.evidence === "no-checks-ran");
   const staleRead = stale.every((c) => !notCurrent(c));
+  // THE AGGREGATE MAY NOT COUNT A PR NOBODY READ. `nC`/`nS` are now counts of PRs we actually have
+  // a current-enough verdict for, so "N open PRs cannot merge" and "N open PRs are behind main" are
+  // claims the evidence licenses. The unread rows are disclosed as their own number instead of
+  // being folded into either — folding is what turned one `gh` error into a verdict.
+  // DISCLOSED BY COUNT, NOT FOLDED AWAY. An unread row whose last successful read said CONFLICTING
+  // still carries a verdict somebody actually obtained, and a reader told only "N could not be read"
+  // acts as though there is nothing there. The count is what makes it actionable; the past tense and
+  // the "could not re-check" are what keep it honest.
+  const lastKnownConflictingClause =
+    nUC > 0
+      ? ` Of the unread, ${nUC} ${nUC === 1 ? "was" : "were"} last known to be conflicting and therefore untested — ` +
+        `a verdict from a look that DID get an answer, which we could not re-check.`
+      : "";
+  const unreadClause =
+    nU > 0
+      ? ` ${nU} more could not be read at all — GitHub could not be asked, so ${nU === 1 ? "that row is" : "those rows are"} ` +
+        `the last answer we got and not a verdict about the pull ${nU === 1 ? "request" : "requests"}.` +
+        lastKnownConflictingClause
+      : "";
   const head =
     nC > 0
       ? `${nC} open ${nC === 1 ? "PR cannot" : "PRs cannot"} merge — and that means ${neverRan ? `${nC === 1 ? "it has" : "they have"} never been tested` : `nothing current has tested ${nC === 1 ? "it" : "them"}`}. ` +
@@ -1369,17 +1497,70 @@ export function conflictCondition(
         `are not failing, they are ABSENT. Conflicting and untested are one fact, not two.` +
         (nS > 0
           ? ` ${nS} more ${staleRead ? "can still merge" : `${nS === 1 ? "was" : "were"} last known to merge`}, but ${nS === 1 ? "is" : "are"} drifting behind main.`
-          : "")
-      : `${nS} open ${nS === 1 ? "PR is" : "PRs are"} behind main and drifting further with every merge. ` +
-        `Each ${staleRead ? "can still merge today" : "was last known to merge, on a reading that is NOT current"}; what grows is the rebase.`;
+          : "") +
+        unreadClause
+      : nS > 0
+        ? `${nS} open ${nS === 1 ? "PR is" : "PRs are"} behind main and drifting further with every merge. ` +
+          `Each ${staleRead ? "can still merge today" : "was last known to merge, on a reading that is NOT current"}; what grows is the rebase.` +
+          unreadClause
+        : nUC > 0
+          ? // NOTHING WAS READ ON THIS LOOK — WHICH IS NOT THE SAME AS NOTHING BEING KNOWN. Every row
+            // here is a failed read, so no count may be spoken in the present tense; but the rows that
+            // last read CONFLICTING carry a real, recent verdict, and the absolute "any of these may be
+            // green and mergeable right now" would contradict every one of them. The conflict keeps its
+            // count and, in `remedy`, its catch-up advice — conditioned, never withdrawn.
+            `${nU} open ${nU === 1 ? "PR" : "PRs"} could not be read — GitHub could not be asked, so nothing below is a ` +
+            `CURRENT verdict about the pull ${nU === 1 ? "request" : "requests"}. That is not the same as knowing nothing: ` +
+            `${nUC} ${nUC === 1 ? "was" : "were"} last known to be conflicting and therefore untested, on a look that DID ` +
+            `get an answer, and we could not re-check ${nUC === 1 ? "it" : "them"} — keep acting on that conflict until a ` +
+            `read says otherwise.` +
+            (nUS > 0
+              ? ` The other ${nUS} ${nUS === 1 ? "was" : "were"} last known to merge, and may be green right now.`
+              : "") +
+            ` A failed gh call is not evidence that something is wrong, and it is not evidence that nothing is.`
+          : // NOTHING WAS READ, AND THE LAST THING EVERY ROW SAID WAS "MERGEABLE". The report still goes
+            // out — silence here is the failure the producer's fail-closed path exists to prevent — but
+            // it says what it is: an outage on our side, and not one word about whether any of these
+            // pull requests can merge. THE ABSOLUTE WORDING BELONGS TO THIS SHAPE AND NO OTHER: it is
+            // only true when no unread row was last known to be conflicting.
+            `${nU} open ${nU === 1 ? "PR" : "PRs"} could not be read — GitHub could not be asked. ` +
+            `That is a fact about our own read, not about the pull ${nU === 1 ? "request" : "requests"}: nothing below is a ` +
+            `verdict, and ${nU === 1 ? "this PR" : "any of these"} may be green and mergeable right now. A failed gh call is ` +
+            `not evidence that something is wrong, and it is not evidence that nothing is.`;
 
   // Only when there IS a conflict to resolve. A remedy sentence about conflicts appended to a
   // stale-only report is advice about a situation the report just said does not hold.
   const remedy =
-    nC > 0
+    (nC > 0
       ? `\nA conflict on a branch that is only one commit ahead of main is usually resolvable without ` +
         `judgement: rebase onto main and push, and ${neverRan ? "the CI run it has never had" : "the CI run it is missing"} arrives with it.`
-      : "";
+      : "") +
+    // A REMEDY IS AN INSTRUCTION THE READER WILL FOLLOW, so it has to be safe under the very
+    // condition that produced it. The conflict remedy above says "rebase onto main and push" — on a
+    // PR we merely failed to READ that is advice to rewrite a branch that may be perfectly healthy,
+    // which is why the unread rows are excluded from `nC`. What they get instead is decided by the
+    // word their last successful read left behind, because the two halves need OPPOSITE advice.
+    //
+    // LAST KNOWN TO MERGE: the absolute sentence is true, and is reserved for exactly this shape.
+    (nUS > 0
+      ? `\nNothing on the ${nUS === 1 ? "unread PR" : `${nUS} unread PRs`} last known to merge can be fixed by touching ` +
+        `the branch: open ${nUS === 1 ? "it" : "them"} on GitHub to see the real state.`
+      : "") +
+    // LAST KNOWN TO BE CONFLICTING: that verdict is real and recent, and touching the branch is
+    // precisely what clears it — so the remedy is CONDITIONED, not withdrawn. Withdrawing it is what
+    // suppressed a standing conflict for a whole outage (roborev 75149). Look before you rewrite,
+    // and name BOTH catch-up verbs: a bare "rebase" drops the merge commits a branch may carry
+    // (sparkle-pxhaq), which is the same shape of unsafe advice one level down.
+    (nUC > 0
+      ? `\n${nUC} unread ${nUC === 1 ? "PR was" : "PRs were"} last known to be conflicting, and that verdict is real and ` +
+        `recent: open ${nUC === 1 ? "it" : "them"} on GitHub first, because we could not re-read ${nUC === 1 ? "it" : "them"} — ` +
+        `and if still conflicting, catching the branch up onto main is what clears it. Merge origin/main when the branch ` +
+        `carries merge commits; rebase onto it otherwise. Then push.`
+      : "") +
+    // TRUE OF EVERY UNREAD ROW, whichever half it fell in: the read itself is what broke.
+    (nU > 0
+      ? `\nAnd check gh itself — an expired login or a spent rate limit blinds every read until a person clears it.`
+      : "");
 
   return {
     id: "pr-conflicting",
@@ -1410,6 +1591,14 @@ export function conflictCondition(
     measured: [
       String(nC),
       String(nS),
+      // The unread count is rendered into the headline and the remedy, so it must be here too: a
+      // number in the text that is not in `measured` refuses the WHOLE report as
+      // `fabricated-citation`, and that refusal presents as SILENCE. Its two halves are rendered as
+      // numbers as well — the conflicting half is disclosed BY COUNT, which is the whole point of
+      // the split — so both are quoted here for the same reason.
+      String(nU),
+      String(nUC),
+      String(nUS),
       ...ordered.flatMap((c) => [String(c.pr), String(behindOf(c))]),
       ...ages.flatMap(({ h, m }) => [String(h), String(m)]),
       // The READING age, which is a DIFFERENT number from the conflict age above it. Emitted for

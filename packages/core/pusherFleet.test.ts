@@ -1372,7 +1372,12 @@ describe("pr-conflicting evidence", () => {
   });
 
   it("does not claim the fleet was NEVER tested over a verdict nobody re-read", () => {
-    const [c] = evaluateFleetConditions([], T0, [], [pr({ evidence: "unknown" }), pr({ pr: 92 })]);
+    // `last-known` IS the "verdict nobody re-read" case: a real, recent reading for this head that
+    // GitHub was still recomputing. It is counted in the conflicting aggregate — we have a verdict —
+    // so the headline must weaken. (`unknown` is the OTHER thing: no verdict at all. It is no longer
+    // in this aggregate, and the could-not-ask block below asserts that directly rather than by the
+    // absence of one phrase, which would pass against a headline that had dropped the row entirely.)
+    const [c] = evaluateFleetConditions([], T0, [], [pr({ evidence: "last-known" }), pr({ pr: 92 })]);
     const head = c!.text.split("\n")[0];
     expect(head).not.toContain("never been tested");
     expect(head).toContain("nothing current has tested them");
@@ -1428,6 +1433,277 @@ describe("pr-conflicting evidence", () => {
     expect(line).not.toContain("no CI has ever run on it");
     expect(line).toContain("NOT current");
     expect(citable(c!.text, c!.measured)).toBe(true);
+  });
+});
+
+// ── "WE COULD NOT ASK" IS NOT "THIS PR IS BLOCKED" (bead sparkle-y0wmnb) ────────────────────────
+//
+// THE MEASURED DEFECT. A pull request that was fully green, mergeable and level with main sat
+// flagged for 22 minutes because one `gh` call exited non-zero. The producer is fail-closed by
+// design — an unreadable look still raises a flag, carrying the LAST SUCCESSFUL read's `kind`
+// forward — so the row arrived here as `kind: "stale"` and was narrated "behind main and drifting
+// further with every merge". That sentence is a verdict about a pull request nobody could reach.
+//
+// EVERY CASE HERE MOUNTS THE THREE SHAPES TOGETHER, because asserting the new wording on the
+// could-not-ask row alone proves nothing about the shapes the rule did not pick: a rule that
+// stamped "could not ask" on EVERY row would satisfy a single-shape test while destroying the
+// report. The genuinely-conflicting row and the genuinely-stale row are here to fail if it does.
+describe("pr-conflicting could-not-ask", () => {
+  /** Fully confirmed, first-hand: this PR really is conflicting and really has never been tested. */
+  const REALLY_CONFLICTING: ConflictingPr = {
+    pr: 700,
+    projectId: "project-alpha",
+    branch: "sparkle/really-conflicting",
+    ownerAgentId: null,
+    kind: "conflicting",
+    commitsBehind: 220,
+    unresolvedSecs: 3 * 60 * 60 + 5 * 60,
+    evidence: "no-checks-ran",
+  };
+  /** Fully confirmed, first-hand: this PR really can merge and really is a long way behind. */
+  const REALLY_STALE: ConflictingPr = {
+    pr: 800,
+    projectId: "project-alpha",
+    branch: "sparkle/really-stale",
+    ownerAgentId: null,
+    kind: "stale",
+    commitsBehind: 40,
+    unresolvedSecs: 2 * 60 * 60,
+    evidence: "n/a",
+  };
+  /**
+   * THE BEAD'S PULL REQUEST, written the way the wire actually looks.
+   *
+   * `evidence: "unknown"` + `blockedBy` is what Rust emits when the look was REFUSED and there is no
+   * same-head verdict to fall back on: `kind` and `commitsBehind` here are the last successful
+   * read's values, and that read said green, mergeable, level with main.
+   */
+  const COULD_NOT_ASK: ConflictingPr = {
+    pr: 1953,
+    projectId: "project-alpha",
+    branch: "sparkle/green-and-mergeable",
+    ownerAgentId: null,
+    kind: "stale",
+    commitsBehind: 0,
+    unresolvedSecs: 22 * 60,
+    evidence: "unknown",
+    blockedBy: "gh-failed",
+    readingAgeSecs: 22 * 60,
+  };
+
+  const report = (...conflicts: ConflictingPr[]) =>
+    evaluateFleetConditions([], T0, [], conflicts)!.find((c) => c.id === "pr-conflicting")!;
+  const lineFor = (text: string, n: number) => text.split("\n").find((l) => l.includes(`#${n}`))!;
+
+  // THE CASE THE BEAD IS ABOUT. All three shapes in ONE report, and all three read differently.
+  it("renders could-not-ask, genuinely-conflicting and genuinely-stale as three different things", () => {
+    const c = report(REALLY_CONFLICTING, REALLY_STALE, COULD_NOT_ASK);
+    const unread = lineFor(c.text, 1953);
+    const conflicting = lineFor(c.text, 700);
+    const staleRow = lineFor(c.text, 800);
+
+    // 1. THE FAILED READ says so first, names the reason, and makes no claim about the PR.
+    expect(unread).toContain("COULD NOT ASK GITHUB");
+    expect(unread).toContain("gh-failed");
+    expect(unread).toContain("may be green and mergeable right now");
+    // THE COLLAPSE ITSELF: a transport error used to render as a present-tense verdict.
+    expect(unread).not.toContain("drifting further with every merge");
+    expect(unread).not.toContain("mergeable, but");
+
+    // 2. THE REAL CONFLICT keeps the strongest sentence it has earned, untouched.
+    expect(conflicting).toContain("conflicting, and therefore untested");
+    expect(conflicting).toContain("no CI has ever run on it");
+    expect(conflicting).not.toContain("COULD NOT ASK GITHUB");
+
+    // 3. THE REAL STALE ROW keeps its present-tense mergeability, untouched.
+    expect(staleRow).toContain("mergeable, but 40 commits behind main");
+    expect(staleRow).toContain("drifting further with every merge");
+    expect(staleRow).not.toContain("COULD NOT ASK GITHUB");
+
+    // And no two of them are the same sentence.
+    expect(new Set([unread, conflicting, staleRow]).size).toBe(3);
+    expect(citable(c.text, c.measured)).toBe(true);
+  });
+
+  // THE AGGREGATE IS A CLAIM TOO. A row nobody read may not be counted into "N cannot merge" or
+  // "N are behind main" — folding it in is the same collapse one level up.
+  it("counts the unread row separately from the PRs it actually has a verdict for", () => {
+    const head = report(REALLY_CONFLICTING, REALLY_STALE, COULD_NOT_ASK).text.split("\n")[0]!;
+    expect(head).toContain("1 open PR cannot merge");
+    expect(head).toContain("1 more can still merge");
+    expect(head).toContain("1 more could not be read at all");
+    expect(head).toContain("GitHub could not be asked");
+  });
+
+  // NOTHING BUT UNREAD ROWS. The report still goes out — silence is the failure the producer's
+  // fail-closed path exists to prevent — but the headline is about our read, not about the PR.
+  it("does not narrate an all-unread report as a fleet of stale PRs", () => {
+    const c = report(COULD_NOT_ASK);
+    const head = c.text.split("\n")[0]!;
+    expect(head).toContain("1 open PR could not be read");
+    expect(head).not.toContain("behind main and drifting");
+    expect(head).not.toContain("cannot merge");
+    expect(head).toContain("not evidence that something is wrong");
+    expect(citable(c.text, c.measured)).toBe(true);
+  });
+
+  // A REMEDY IS AN INSTRUCTION THE READER WILL FOLLOW, so it has to be safe under the condition
+  // that produced it. "Rebase onto main and push" is wrong advice for a PR that may be perfectly
+  // healthy and that we simply could not reach — and on a branch carrying merge commits a rebase
+  // drops them (AGENTS.md, sparkle-pxhaq). The unread remedy names the two things that are true.
+  it("never offers the rebase remedy over a PR nobody could read", () => {
+    const c = report(COULD_NOT_ASK);
+    expect(c.text).not.toMatch(/rebase/i);
+    expect(c.text).not.toMatch(/resolvable without judgement/);
+    expect(c.text).toContain("open it on GitHub to see the real state");
+    expect(c.text).toContain("an expired login or a spent rate limit");
+  });
+
+  // THE PAIRED DIRECTION — REQUIRED. The remedy that IS earned must survive: a fix that simply
+  // deleted the rebase sentence would pass the case above and cost the report its whole point.
+  it("still offers the rebase remedy for a conflict somebody actually read", () => {
+    const c = report(REALLY_CONFLICTING, COULD_NOT_ASK);
+    expect(c.text).toMatch(/rebase onto main and push/);
+    // …and the unread PR's own remedy is there beside it, not replaced by it.
+    expect(c.text).toContain("open it on GitHub to see the real state");
+    expect(citable(c.text, c.measured)).toBe(true);
+  });
+
+  // NEVER DROPPED. Greying out or omitting an unreadable row is the opposite failure, and the
+  // producer's contract forbids it by name: during a `gh` outage it would suppress a genuine,
+  // recent, still-standing conflict for the whole outage.
+  //
+  // THIS ONE CANNOT FAIL AGAINST THE CHANGE THAT ADDED IT, AND THAT IS DELIBERATE — it is a
+  // REGRESSION GUARD, not evidence for the fix. It passed before this change and passes after it;
+  // what it exists to catch is the obvious over-correction, a later edit that "fixes" the confident
+  // verdict by suppressing the row. `mutation-check` will call it vacuous against this diff; the
+  // six cases above are the ones that prove the behaviour.
+  it("still reports the PR, its number, its owner and how old the reading is", () => {
+    const c = report(COULD_NOT_ASK);
+    const line = lineFor(c.text, 1953);
+    expect(line).toContain("#1953");
+    expect(line).toContain("sparkle/green-and-mergeable");
+    expect(line).toContain("Owner unresolved");
+    expect(line).toContain("last read 0h 22m ago");
+    expect(citable(c.text, c.measured)).toBe(true);
+  });
+
+  // A LAST-KNOWN CONFLICT WE COULD NOT RE-READ still says what it last was — the failed read does
+  // not erase the verdict, it only stops it being spoken in the present tense.
+  it("keeps the last known conflicting verdict on an unreadable row, in the past tense", () => {
+    const c = report({ ...COULD_NOT_ASK, kind: "conflicting", commitsBehind: 12 });
+    const line = lineFor(c.text, 1953);
+    expect(line).toContain("COULD NOT ASK GITHUB");
+    expect(line).toContain("The last look that got an answer says conflicting, and therefore untested");
+    expect(line).toContain("12 commits behind main when we last managed to look");
+    expect(citable(c.text, c.measured)).toBe(true);
+  });
+
+  // ── THE OVER-CORRECTION, AND ITS PAIR (roborev 75149) ────────────────────────────────────────
+  //
+  // THE MEASURED DEFECT, one level up from the one this describe block was written for. `couldNotAsk`
+  // is reached only on a BLIND look over STORED facts — `conflict_watch::blind_facts` clones the last
+  // successful read — so an unread row's `kind` is the verdict of a look that DID get an answer. The
+  // first fix made the unread class FLAT: every unread row got the "any of these may be green and
+  // mergeable right now" headline and the "nothing can be fixed by touching the branch" remedy,
+  // whatever it last read. Through the six-hour `gh` outage this module documents — five PRs each
+  // read hours earlier as conflicting, 220 behind, never tested — that headline drops the conflict
+  // count entirely and that remedy tells the reader the one thing that WOULD clear it is the wrong
+  // thing to do, for six hours. Keeping the row while stripping its count and inverting its advice
+  // suppresses the conflict exactly as effectively as dropping the row would, which the producer's
+  // evidence contract forbids by name: `"unknown"` licenses "we cannot vouch for this verdict",
+  // never "there is no verdict".
+  //
+  // BOTH SHAPES ARE MOUNTED IN EVERY CASE BELOW, and the assertion is that they RENDER DIFFERENTLY.
+  // Asserting the new wording on the conflicting shape alone proves nothing about the shape the rule
+  // did not pick: a rule that stamped the conflicting wording on EVERY unread row would satisfy a
+  // single-shape test while destroying the report the cases above build.
+  const outage = (n: number, kind: ConflictingPr["kind"]) =>
+    Array.from({ length: n }, (_, i) => ({
+      ...COULD_NOT_ASK,
+      pr: 1900 + i,
+      branch: `sparkle/blinded-${i}`,
+      kind,
+      commitsBehind: 220,
+    }));
+
+  it("keeps the conflict count in an all-unread headline when that is what the rows last read", () => {
+    const conflictingOutage = report(...outage(5, "conflicting"));
+    const staleOutage = report(...outage(5, "stale"));
+    const headC = conflictingOutage.text.split("\n")[0]!;
+    const headS = staleOutage.text.split("\n")[0]!;
+
+    // 1. THE CONFLICT IS STILL COUNTED. Five rows nobody could re-read, five verdicts that were real
+    //    and recent when they were taken — the number IS the disclosure.
+    expect(headC).toContain("5 open PRs could not be read");
+    expect(headC).toContain("5 were last known to be conflicting and therefore untested");
+    // …and the sentence that would contradict all five is not said over them.
+    expect(headC).not.toContain("may be green and mergeable right now");
+    expect(headC).not.toContain("nothing below is a verdict");
+
+    // 2. THE STALE OUTAGE KEEPS THE ABSOLUTE WORDING, which is true of it and of nothing else.
+    expect(headS).toContain("5 open PRs could not be read");
+    expect(headS).toContain("nothing below is a verdict");
+    expect(headS).toContain("any of these may be green and mergeable right now");
+    expect(headS).not.toContain("conflicting");
+
+    // 3. AND THE TWO SHAPES ARE NOT THE SAME SENTENCE.
+    expect(headC).not.toEqual(headS);
+    expect(citable(conflictingOutage.text, conflictingOutage.measured)).toBe(true);
+    expect(citable(staleOutage.text, staleOutage.measured)).toBe(true);
+  });
+
+  it("still names a catch-up remedy for unread PRs that were last known to be conflicting", () => {
+    const conflictingOutage = report(...outage(5, "conflicting"));
+    const staleOutage = report(...outage(5, "stale"));
+
+    // CONDITIONED, NOT WITHDRAWN: act on the verdict, look before you rewrite anything, and name BOTH
+    // catch-up verbs — a bare "rebase" drops the merge commits a branch may carry (sparkle-pxhaq),
+    // which is the same shape of unsafe advice one size down.
+    expect(conflictingOutage.text).toContain("5 unread PRs were last known to be conflicting");
+    expect(conflictingOutage.text).toContain("open them on GitHub first, because we could not re-read them");
+    expect(conflictingOutage.text).toContain("catching the branch up onto main is what clears it");
+    expect(conflictingOutage.text).toContain(
+      "Merge origin/main when the branch carries merge commits; rebase onto it otherwise.",
+    );
+    // The absolute withdrawal is NOT said over them — that is the inversion this case exists to catch.
+    expect(conflictingOutage.text).not.toContain("can be fixed by touching the branch");
+    // Fixing `gh` is still true of every unread row, whichever half it fell in.
+    expect(conflictingOutage.text).toContain("an expired login or a spent rate limit");
+
+    // THE PAIR. The stale outage keeps the absolute remedy and is offered no catch-up verb at all —
+    // rewriting a branch we merely failed to reach is the advice the first fix correctly removed.
+    expect(staleOutage.text).toContain("can be fixed by touching the branch");
+    expect(staleOutage.text).toContain("an expired login or a spent rate limit");
+    expect(staleOutage.text).not.toMatch(/rebase/i);
+    expect(staleOutage.text).not.toContain("catching the branch up");
+    expect(conflictingOutage.text).not.toEqual(staleOutage.text);
+    expect(citable(conflictingOutage.text, conflictingOutage.measured)).toBe(true);
+    expect(citable(staleOutage.text, staleOutage.measured)).toBe(true);
+  });
+
+  // A MIXED REPORT DISCLOSES THE SAME FACT ONE LEVEL DOWN. When there IS a first-hand verdict to
+  // headline, the unread rows are a clause rather than the sentence — and the conflicting half of
+  // that clause is still counted, so it cannot be read as "N rows about which nothing is known".
+  it("counts the last-known-conflicting unread rows inside a mixed report's clause", () => {
+    const c = report(REALLY_STALE, ...outage(2, "conflicting"), COULD_NOT_ASK);
+    const head = c.text.split("\n")[0]!;
+    expect(head).toContain("3 more could not be read at all");
+    expect(head).toContain("Of the unread, 2 were last known to be conflicting and therefore untested");
+    // Both unread halves get their own remedy, and neither is spoken over the other's rows.
+    expect(c.text).toContain("2 unread PRs were last known to be conflicting");
+    expect(c.text).toContain("Nothing on the unread PR last known to merge can be fixed by touching the branch");
+    expect(citable(c.text, c.measured)).toBe(true);
+  });
+
+  // WHOSE HOLD IS IT? `blockedBy` on a row we could not re-read is what stopped US, and rendering it
+  // as "Blocked by: …" makes it read as a property of the pull request — the same collapse, smaller.
+  it("does not call our own failed read a hold on the pull request", () => {
+    const c = report({ ...COULD_NOT_ASK, evidence: "last-known-unconfirmed", blockedBy: "sweep-budget" });
+    const line = lineFor(c.text, 1953);
+    expect(line).toContain("We could not re-read it: sweep-budget.");
+    expect(line).not.toContain("Blocked by: sweep-budget.");
+    expect(citable(c.text, c.measured)).toBe(true);
   });
 });
 

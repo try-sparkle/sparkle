@@ -367,6 +367,17 @@ pub fn step(state: &mut PrState, obs: &Observation) -> Decision {
 /// confidently by mistake. (`evidence` exists BECAUSE this paragraph used to point at a Rust
 /// function no frontend consumer could call — roborev 57881.)
 ///
+/// ── THAT WARNING WAS A LIVE DEFECT, AND IT IS NOW CLOSED ON THE ONE RENDERING CONSUMER ────────
+/// The report is composed by `conflictCondition` in `packages/core/pusherFleet.ts`, and it did
+/// exactly what the paragraph above warns about: a green, mergeable, level-with-main PR whose look
+/// was REFUSED arrived there as `kind: "stale"` — the last successful read's word — and was
+/// narrated "behind main and drifting further with every merge" for 22 minutes (bead
+/// `sparkle-y0wmnb`). It now classifies off `evidence` FIRST: `"unknown"` means no confirmable
+/// verdict for this commit, so the row is rendered as COULD NOT ASK GITHUB, is excluded from the
+/// "N cannot merge" / "N are behind main" counts, and is never offered the rebase remedy. It is
+/// still reported — dropping it would suppress a genuine standing conflict for a whole outage,
+/// which is the failure this module's fail-closed path exists to prevent.
+///
 /// The two values are deliberately not joined by a third `"unreadable"` here: `kind` is a frozen
 /// contract with its consumer, and a value it has never seen would be a silent breakage on the
 /// other side of the boundary.
