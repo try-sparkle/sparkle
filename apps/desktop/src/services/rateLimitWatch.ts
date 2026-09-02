@@ -31,6 +31,8 @@
 // deliberately carries no date/time crate (it hand-rolls `days_from_civil`), so doing it in Rust
 // would mean vendoring the whole tz database for one string.
 
+import { getDateTimeFormat } from "./intlFormatCache";
+
 /** A structured rate-limit event read out of an account's transcript by the Rust side. */
 export interface LimitEvent {
   /** The account this event belongs to (derived from which config dir's transcripts held it). */
@@ -75,7 +77,7 @@ const WEEKDAYS: Readonly<Record<string, number>> = {
  *  `Intl` doesn't recognize (invalid name, or a runtime without full ICU data). */
 function tzOffsetMs(ms: number, tz: string): number | null {
   try {
-    const parts = new Intl.DateTimeFormat("en-US", {
+    const parts = getDateTimeFormat("en-US", {
       timeZone: tz,
       hour12: false,
       year: "numeric",

@@ -29,6 +29,7 @@ import {
   type Account,
 } from "../services/accountStore";
 import { invalidateAccountState } from "../services/accountSelection";
+import { getDateTimeFormat } from "../services/intlFormatCache";
 import { useAccountLimitStore } from "../stores/accountLimitStore";
 import { ClaudeSignIn } from "./ClaudeSignIn";
 import { ModalLayer } from "./ModalLayer";
@@ -52,7 +53,7 @@ export { PENDING_NICKNAME };
  *  rather than inventing a second format — the same instant should read the same everywhere. */
 export function resetLabel(until: number, now: number): string | null {
   if (until <= now) return null;
-  return new Date(until).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  return getDateTimeFormat(undefined, { hour: "numeric", minute: "2-digit" }).format(new Date(until));
 }
 
 /** The one-line outcome to show the user after a login completes. Pure, so the copy is testable

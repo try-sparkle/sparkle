@@ -4,6 +4,7 @@ import { C, DANGER } from "../theme/colors";
 import { FONT_WEIGHT } from "@sparkle/ui";
 import { FONT_MONO, FONT_UI } from "../theme/scale";
 import { SECTION_LABEL, tag } from "./labelTreatment";
+import { getDateTimeFormat } from "../services/intlFormatCache";
 import {
   listPairedDevices,
   mintPairCode,
@@ -337,7 +338,7 @@ function platformLabel(platform: string): string {
 function formatDate(iso: string): string {
   const t = Date.parse(iso);
   if (Number.isNaN(t)) return "recently";
-  return new Date(t).toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" });
+  return getDateTimeFormat(undefined, { year: "numeric", month: "short", day: "numeric" }).format(new Date(t));
 }
 
 /** Coarse relative time for "last seen" — falls back to the absolute date past ~30 days. */

@@ -9,6 +9,8 @@
  *  Anthropic usage + sign-in state. `sessionUsedPct` / `weeklyUsedPct` are the REAL used percents
  *  (0–100), or `null` when that window is unknown/unreadable. `usable` is false for a signed-out or
  *  otherwise unusable account. `alias` is the display name, used only as the final tie-break. */
+import { getDateTimeFormat } from "../services/intlFormatCache";
+
 export interface AccountSpaceInput {
   id: string;
   alias: string;
@@ -111,7 +113,7 @@ export function relativeResetPhrase(now: number, resetMs: number): string {
  *  Lowercase am/pm, no leading zero on the hour, always the PT label. Returned WITHOUT the parens.
  *  Pure (formats the given instant). */
 export function absolutePtPhrase(resetMs: number): string {
-  const parts = new Intl.DateTimeFormat("en-US", {
+  const parts = getDateTimeFormat("en-US", {
     timeZone: "America/Los_Angeles",
     month: "short",
     day: "numeric",

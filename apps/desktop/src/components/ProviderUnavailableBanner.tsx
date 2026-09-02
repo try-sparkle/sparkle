@@ -17,6 +17,7 @@ import {
 } from "../stores/aiProviderStore";
 import { currentUsageLimit, oneshotAccountId, USAGE_LIMIT_RECHECK_MS } from "../engine/usageLimit";
 import { loadAccountState, type AccountState } from "../services/accountSelection";
+import { getDateTimeFormat } from "../services/intlFormatCache";
 import {
   selectAiEnhancedBlocked,
   useBlockedSubsystemsStore,
@@ -60,7 +61,7 @@ const WARNING: Record<AiProviderOutageReason, string> = {
  * the paused features are Sparkle's own (suggestions, summaries).
  */
 export function usageLimitSentence(until: number): string {
-  const at = new Date(until).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  const at = getDateTimeFormat(undefined, { hour: "numeric", minute: "2-digit" }).format(new Date(until));
   return (
     `Your Claude usage limit has been reached, so Sparkle's AI features are paused until ${at}. ` +
     `Your agents keep running`

@@ -27,6 +27,7 @@ import { FiChevronDown, FiChevronRight, FiExternalLink, FiX } from "react-icons/
 import { C, ON_BRAND_FILL } from "../theme/colors";
 import { FONT_UI, LINE_READ, RADIUS, SPACE, TYPE, WEIGHT } from "../theme/scale";
 import { SECTION_LABEL } from "./labelTreatment";
+import { getDateTimeFormat } from "../services/intlFormatCache";
 import { ModalShell } from "./ModalShell";
 import { log } from "../logger";
 import { useSettingsStore } from "../stores/settingsStore";
@@ -81,11 +82,11 @@ const quietNote: CSSProperties = {
 function formatShippedAt(iso: string): string {
   const t = Date.parse(iso);
   if (!Number.isFinite(t)) return "";
-  return new Date(t).toLocaleDateString(undefined, {
+  return getDateTimeFormat(undefined, {
     month: "short",
     day: "numeric",
     year: "numeric",
-  });
+  }).format(new Date(t));
 }
 
 const CHANGE_TYPE_LABEL: Record<ChangelogEntry["changeType"], string> = {

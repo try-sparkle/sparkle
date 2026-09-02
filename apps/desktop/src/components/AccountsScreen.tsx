@@ -4,6 +4,7 @@ import { C, ON_BRAND_FILL } from "../theme/colors";
 import { FONT_UI, PILL, TYPE } from "../theme/scale";
 import { tag } from "./labelTreatment";
 import { AccountSpawnLog } from "./AccountSpawnLog";
+import { getDateTimeFormat } from "../services/intlFormatCache";
 import { MODAL_PADDING } from "./ModalShell";
 import { readSpawnLog } from "../services/accountLedger";
 import {
@@ -381,7 +382,7 @@ function errText(e: unknown, fallback: string): string {
 /** Wall-clock time in the user's own locale ("8:20 PM"). One formatter, so the per-account line and
  *  the all-exhausted banner can never quote the same instant two different ways. */
 function clockTime(epochMs: number): string {
-  return new Date(epochMs).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  return getDateTimeFormat(undefined, { hour: "numeric", minute: "2-digit" }).format(new Date(epochMs));
 }
 
 /** Fixed width of the metric-label column so the Session and Weekly bars line up vertically. */

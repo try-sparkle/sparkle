@@ -22,6 +22,8 @@
 // instead of being pinned to an end: a dot outside the axis has no position to draw at, and
 // clamping it to the top would draw a "prompt from a week ago" that is really a month old.
 
+import { getDateTimeFormat } from "../../services/intlFormatCache";
+
 /** The scope steps, exactly as the founder listed them in his originating message. */
 export type ScrubberScope =
   | "1h"
@@ -468,9 +470,7 @@ export function scopeMenuLabel(scope: ScrubberScope, oldestMs: number | null): s
 /** "Aug 12". Its own function so the menu label above stays one readable line. */
 export function shortDay(atMs: number): string {
   try {
-    return new Intl.DateTimeFormat("en-US", { month: "short", day: "numeric" }).format(
-      new Date(atMs),
-    );
+    return getDateTimeFormat("en-US", { month: "short", day: "numeric" }).format(new Date(atMs));
   } catch {
     // An environment with no `Intl` is not a reason for the menu to fail to render.
     return new Date(atMs).toDateString().slice(4, 10);

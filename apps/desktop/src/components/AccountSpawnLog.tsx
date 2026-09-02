@@ -3,6 +3,7 @@ import { FiRefreshCw } from "react-icons/fi";
 import { C } from "../theme/colors";
 import { FONT_UI, TYPE } from "../theme/scale";
 import { readSpawnLog, type SpawnLogEntry, type SelectionReason } from "../services/accountLedger";
+import { getDateTimeFormat } from "../services/intlFormatCache";
 
 // "Which account did my last N agents actually run on?" — rendered.
 //
@@ -103,12 +104,12 @@ const disclosureBtn: CSSProperties = {
 };
 
 function fmtTime(at: number): string {
-  return new Date(at).toLocaleString(undefined, {
+  return getDateTimeFormat(undefined, {
     month: "short",
     day: "numeric",
     hour: "numeric",
     minute: "2-digit",
-  });
+  }).format(new Date(at));
 }
 
 /** What this entry is a spawn OF, in the user's terms. The two app-owned keys are not agent ids and
