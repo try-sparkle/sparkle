@@ -369,7 +369,18 @@ import type { HistoryHit } from "../history";
 // The wire shapes
 // ---------------------------------------------------------------------------------------------
 
-/** The tool domains, exactly as they appear on the wire. */
+/** The tool domains, exactly as they appear on the wire.
+ *
+ *  ADDING ONE TOUCHES EIGHTEEN TABLES ACROSS TEN FILES, and half of them the compiler cannot reach
+ *  — so they fail one at a time, each costing a full suite run (bead `sparkle-lizrdm`; the measured
+ *  sequence was five serial discoveries for one additive change). Ask all eighteen at once BEFORE
+ *  you start, and again before you commit:
+ *
+ *      bash scripts/concierge-domain-sites.sh --domain <name>
+ *
+ *  It names the file and the line for every site the domain is missing from. Several of those
+ *  tables are hand-typed ON PURPOSE — `server.test.ts`'s registered-name array is a context BUDGET
+ *  — so the answer is to fill them in, never to derive them from this list. */
 export const CONCIERGE_TOOL_DOMAINS = [
   "lifecycle",
   "review",

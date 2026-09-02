@@ -40,9 +40,19 @@
 //      the scrollback, so this cannot be satisfied by a menu that has already scrolled away. This
 //      is the same one-source rule roborev 58562/58575 imposed on the credential waiver after four
 //      rounds of a scrollback-derived waiver disagreeing with a viewport-derived guard.
-//   2. AT LEAST ONE CLAUDE CODE MARKER FAMILY. A permission dialog scores exactly 1 — the tool-call
-//      glyphs — which is the measured value `claudeCodeScreen.test.ts` pins as
-//      `claudeCodeMarkerFamilies(APPROVAL_2_1_220) === 1`.
+//   2. AT LEAST ONE CLAUDE CODE MARKER FAMILY. ONE, not two, and that is the whole point of the
+//      threshold: the dialog states this exists for are the states that score lowest. A permission
+//      dialog whose footer TERMINATES the grid scores 2 (the tool-call glyphs, plus family E for
+//      the live dialog itself); one drawn without that footer — the shape this module was filed
+//      about — scores exactly 1 on the glyphs alone, which is the value
+//      `claudeCodeDialogScreen.test.ts` pins for `PERMISSION_DIALOG_NO_FOOTER`. Do not raise this
+//      to `>= 2`: that is the mandatory-family bar `isClaudeCodeScreen` already failed on, and
+//      re-imposing it here would make this module inert on the only screens it serves.
+//      (An earlier wording of this paragraph claimed `claudeCodeMarkerFamilies(APPROVAL_2_1_220)
+//      === 1`. Family E has since made that 2, and `claudeCodeScreen.test.ts` pins `>= 2` — bead
+//      sparkle-ekoeo. Every state's measured verdict now lives in
+//      `claudeCodeScreen.states.test.ts`, which is enumerated over the captured fixtures rather
+//      than quoted from memory here.)
 //
 // `vim` shows `~` filler and scores 0 on both. `less` and `man` draw a status row, not a
 // `<key> to <verb>` picker footer, and score 0 families. `htop`'s "F1Help F2Setup" carries no
@@ -74,9 +84,11 @@ export function claudeCodeDialogOnScreen(text: string): boolean {
 export interface AltScreenEvidence {
   /** The emulator's own mode bit — `term.buffer.active.type !== "normal"`, never a text heuristic. */
   alternateBuffer: boolean;
-  /** How many independent Claude Code marker families the screen shows. A permission dialog: 1. */
+  /** How many independent Claude Code marker families the screen shows. A permission dialog whose
+   *  footer terminates the grid: 2; one drawn without that footer: 1. */
   markerFamilies: number;
-  /** Family D, the mandatory one — and the one a dialog REPLACES, which is the whole defect. */
+  /** Family D — mandatory on `isClaudeCodeScreen`'s RESIDUAL path only, and the one a dialog
+   *  REPLACES, which is the whole defect. `false` here is expected on every dialog state. */
   composerBox: boolean;
   /** What `isClaudeCodeScreen` itself said. `false` here alongside `dialogOnScreen: true` is the
    *  exact signature of this bead's misclassification, and is the line to grep for. */

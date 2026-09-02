@@ -1034,8 +1034,18 @@ export function hasClaudeCodeComposerBox(snapshot: string): boolean {
 /**
  * Is this screen CONFIDENTLY Claude Code's own TUI?
  *
- * THE RULE: the live-TUI composer box is MANDATORY, plus at least one corroborating family. Not
- * "any two of four" — see the header for why a pasted transcript in a pager clears that lower bar.
+ * THE RULE, IN THE ORDER THE ARMS BELOW ASK IT — and read the first clause of it as the correction
+ * it is, because the sentence that stood here for months said only the second and that omission WAS
+ * the outage (bead sparkle-ekoeo):
+ *
+ *   1. A live DIALOG, a background TASK LIST, or a narrow chrome-proven composer box each STANDS
+ *      ALONE. Each is a state that REMOVES the composer box — the dialog is literally what replaces
+ *      it — so a rule holding that box mandatory is structurally incapable of serving them. The
+ *      states are enumerated, with a captured fixture apiece, in `claudeCodeScreen.states.test.ts`;
+ *      that file is the answer to "which screens must this return true for", and it is the guard
+ *      that goes red if an arm here is narrowed back.
+ *   2. OTHERWISE the composer box is mandatory, plus at least one corroborating family. Not "any
+ *      two of four" — see the header for why a pasted transcript in a pager clears that lower bar.
  *
  * THE PRICE OF A FALSE POSITIVE IS A PASTED *AND SUBMITTED* LINE, not a typed one: this predicate
  * gates `services/conciergeDispatch`, which finishes with `submitPrompt`. The header carries the
