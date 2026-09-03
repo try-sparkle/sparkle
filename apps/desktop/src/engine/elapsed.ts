@@ -28,6 +28,12 @@ export function formatElapsed(ms: number): string {
   const MIN = 60 * SEC;
   const HOUR = 60 * MIN;
   const DAY = 24 * HOUR;
+  // Fail safe on garbage input. Callers wrap this in `Math.max(0, …)` to keep clock skew from
+  // printing a negative age — but `Math.max(0, NaN)` is `NaN`, not `0`, so a missing/undefined
+  // timestamp (`now - undefined`) slips that guard and the last band below renders the literal
+  // "NaNd" into the UI. An infinite or negative duration is equally meaningless. Since this is the
+  // app's ONE elapsed vocabulary, the guard belongs here, once, not re-derived at every call site.
+  if (!Number.isFinite(ms) || ms < 0) return "0s";
   if (ms < 100 * SEC) return `${Math.floor(ms / SEC)}s`;
   const oneDp = (n: number) => {
     const s = n.toFixed(1);
