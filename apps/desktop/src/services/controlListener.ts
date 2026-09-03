@@ -31,6 +31,7 @@ import {
   // description drift was the downstream symptom, not the cause — so the lists are shared instead.
   type StateScope as CoreStateScope,
   isStateScope,
+  namesInboxDepth,
 } from "@sparkle/core";
 import { safeUnlisten } from "./safeUnlisten";
 import { peakSummary, type PeakSummary } from "./peakConcurrency";
@@ -4363,9 +4364,15 @@ async function handleSendPeerMessage(req: ControlRequest): Promise<Record<string
     // and succeeds", i.e. tell the sender to do the exact thing that just failed. That is the
     // `sparkle-8bvh` shape — a remedy that is unsafe under the very condition that triggered it —
     // and this commit exists partly to remove it, so it must not reintroduce it one layer out.
+    // KEYED ON A TAG THE MESSAGE CARRIES, NOT ON ITS PROSE. The first version of this suppression
+    // matched `/ceiling|undelivered|queued/i` against `inbox.rs`'s wording, and roborev graded it
+    // High: rewording either refusal — or raising a capacity refusal from a new path — silently
+    // flips it to `false` and re-appends the contradicting note, restoring the exact bug this
+    // branch exists to remove. Nothing pinned it either, and deleting the guard left the suite
+    // GREEN. `namesInboxDepth` reads `INBOX_CAPACITY_TAG`, one literal in `@sparkle/core` mirrored
+    // in `inbox.rs::CAPACITY_TAG`, with `scripts/inbox-capacity-tag-check.sh` failing CI on drift.
     const rawErr = errMsg(e);
-    const alreadyNamesDepth = /ceiling|undelivered|queued/i.test(rawErr);
-    const refusedQueue = alreadyNamesDepth ? null : await readRecipientQueue(targetId);
+    const refusedQueue = namesInboxDepth(rawErr) ? null : await readRecipientQueue(targetId);
     return peerRefusal("send_failed", refusedQueue ? `${rawErr} ${refusedQueue.note}` : rawErr);
   }
   // SHOW IT TO THE HUMAN. Until this call, a peer message went into the recipient's inbox and

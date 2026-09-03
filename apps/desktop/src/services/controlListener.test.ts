@@ -266,6 +266,7 @@ import {
   uncallableStateScopesIn,
   stateScopesNamedIn,
   STATE_SCOPES,
+  INBOX_CAPACITY_TAG,
 } from "@sparkle/core";
 // The FROZEN Chief contract. Imported for its types only — the cases below drive the real handler
 // through the real `dispatch`, and the stub they inject is the same seam production writes.
@@ -8810,6 +8811,81 @@ describe("send_peer_message", () => {
     expect(reply).toMatchObject({ ok: false, code: "send_failed" });
     expect(String(reply.error)).toContain("could not write");
     expect(String(reply.error), "the depth must reach the refused sender too").toContain("12");
+  });
+
+  // ── THE SUPPRESSION HALF, WHICH USED TO BE PINNED BY NOTHING ────────────────────────────────────
+  // The test above proves the note IS appended to an ordinary failure. On its own that is half a
+  // guard: deleting the suppression entirely left the whole suite green, and the append test passed
+  // only because its fixture said "queue" rather than "queued" — a one-character margin against the
+  // old prose regex. So this is the paired case, and it drives the REAL `inbox.rs` refusal text
+  // rather than an invented string, because the thing being asserted is that the two sides agree.
+  //
+  // Why it matters: a capacity refusal already tells the sender the depth AND that nothing was
+  // queued AND not to re-send. Appending "the next `fyi` evicts this agent's stalest `fyi` to make
+  // room" to that says the next send will succeed, which is the `sparkle-8bvh` shape — a remedy
+  // unsafe under exactly the condition that triggered the refusal. A peer cannot even act on it:
+  // `send_peer_message` is hardcoded `fyi` and cannot be escalated.
+  it("does NOT append its note to a capacity refusal, which already names the depth", async () => {
+    // The all-`act` refusal verbatim from `inbox.rs::enqueue`, tag included.
+    inboxSendError =
+      `${INBOX_CAPACITY_TAG} inbox: a1 has 40 message(s) pending against the 40-message ` +
+      "`fyi` ceiling and EVERY ONE of them is an `act`, which an `fyi` never evicts — so there is " +
+      "nothing to make room and nothing was queued. This clears only when that agent drains its " +
+      "queue: do not re-send.";
+    inboxStatusReply = [
+      {
+        agentId: otherId,
+        pending: 40,
+        delivered: 0,
+        acknowledged: 0,
+        awaitingAck: 0,
+        pendingIds: [],
+        fyiCeiling: 40,
+        actCeiling: 50,
+      },
+    ];
+    send({ to: otherId, message: "taking the Rust half" });
+    await flush();
+
+    const reply = lastReply() as Record<string, unknown>;
+    expect(reply).toMatchObject({ ok: false, code: "send_failed" });
+    const err = String(reply.error);
+    // Rust's own sentence survives intact — including the depth, which the sender still needs.
+    expect(err, "the refusal keeps Rust's own text").toContain("nothing was queued");
+    expect(err, "and Rust's own depth").toContain("40");
+    // THE ASSERTION THAT MATTERS: no clause promising the next send will succeed by eviction.
+    expect(err, "a capacity refusal must never be told its next `fyi` evicts and succeeds").not.toMatch(
+      /evicts this agent's stalest/,
+    );
+    expect(err).not.toMatch(/more `fyi` send\(s\) fit/);
+  });
+
+  it("keys that suppression on the TAG, not on the refusal's prose", async () => {
+    // The regression this pair exists for. The first implementation matched
+    // `/ceiling|undelivered|queued/i` against Rust's wording, so a reworded refusal — or a capacity
+    // refusal raised from a new path — silently lost its suppression. Here the prose is REWORDED
+    // beyond recognition and only the tag remains: the suppression must still fire.
+    inboxSendError = `${INBOX_CAPACITY_TAG} inbox: a1 is full right now; try later.`;
+    inboxStatusReply = [
+      {
+        agentId: otherId,
+        pending: 40,
+        delivered: 0,
+        acknowledged: 0,
+        awaitingAck: 0,
+        pendingIds: [],
+        fyiCeiling: 40,
+        actCeiling: 50,
+      },
+    ];
+    send({ to: otherId, message: "taking the Rust half" });
+    await flush();
+
+    const err = String((lastReply() as Record<string, unknown>).error);
+    expect(err).toContain("is full right now");
+    expect(err, "the tag alone must be enough to suppress the note").not.toMatch(
+      /evicts this agent's stalest/,
+    );
   });
 
   it("gives the CONCIERGE a verification pointer, spelled as the tool it actually invokes", async () => {

@@ -63,6 +63,7 @@ export * from "./babysitDispatch";
 // something" must not share a failure domain with the thing whose reliability is in question.
 export * from "./conciergeAsks";
 // The peer-messaging cap, shared because the app ENFORCES it and the MCP tool DESCRIBES it.
+export * from "./inboxCapacity";
 export * from "./peerMessageLimits";
 export * from "./stateScopes";
 // The research pool's shape, mirrored from `research.rs` and drift-tested against it. Shared

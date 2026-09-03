@@ -703,6 +703,29 @@ pub fn pending(app_data: &Path, agent_id: &str, now: i64) -> Vec<InboxMessage> {
         .collect()
 }
 
+/// MACHINE-READABLE MARKER ON EVERY CAPACITY REFUSAL — a prefix, not prose.
+///
+/// A capacity refusal ALREADY names the live depth and the ceiling it was judged against, so the
+/// TypeScript peer-send path must NOT append its own generic depth note on top: doing so answers
+/// this message's "nothing was queued, do not re-send" with "your next `fyi` evicts and succeeds",
+/// which is a remedy that is unsafe under exactly the condition that triggered the refusal (bead
+/// `sparkle-8bvh`).
+///
+/// THE FIRST VERSION OF THAT SUPPRESSION MATCHED ON PROSE — `/ceiling|undelivered|queued/i` over
+/// this module's wording — and roborev was right to call it a High: rewording either message below,
+/// or raising a new capacity refusal from another path, silently flips the test to `false` and
+/// re-appends the contradicting note. The one test in the area passed only because its fixture said
+/// "queue" rather than "queued", a one-character margin, and deleting the guard outright left the
+/// whole suite green.
+///
+/// So the signal is a TAG the message CARRIES rather than a shape a reader INFERS. Reword the
+/// sentences freely; keep the tag. It is deliberately human-readable, because it is shown to an
+/// agent and a bare error code would be one more thing a reader cannot act on.
+///
+/// MIRRORED IN TYPESCRIPT at `packages/core/inboxCapacity.ts` as `INBOX_CAPACITY_TAG`, and
+/// `scripts/inbox-capacity-tag-check.sh` fails CI if the two literals ever differ.
+pub const CAPACITY_TAG: &str = "[inbox-capacity]";
+
 /// Queue a message. Returns its id.
 ///
 /// CAPACITY IS SEVERITY-AWARE (see `FYI_CEILING`). `Act` is judged against the full `MAX_PER_AGENT`
@@ -769,7 +792,7 @@ pub fn enqueue(
                     None => {
                         let depth = queued.len();
                         return Err(format!(
-                            "inbox: {agent_id} has {depth} message(s) pending against the \
+                            "{CAPACITY_TAG} inbox: {agent_id} has {depth} message(s) pending against the \
                              {FYI_CEILING}-message `fyi` ceiling and EVERY ONE of them is an `act`, \
                              which an `fyi` never evicts — so there is nothing to make room and \
                              nothing was queued. This clears only when that agent drains its queue: \
@@ -785,7 +808,7 @@ pub fn enqueue(
             Severity::Act => {
                 let depth = queued.len();
                 return Err(format!(
-                    "inbox: {agent_id} already has {depth} undelivered messages, at the \
+                    "{CAPACITY_TAG} inbox: {agent_id} already has {depth} undelivered messages, at the \
                      {MAX_PER_AGENT}-message ceiling; it is not draining them — check its Level 0 \
                      verdict before sending more"
                 ));
@@ -2115,6 +2138,50 @@ mod tests {
     /// panics against it. Distinct `ts` per message makes "the oldest" unambiguous — the assertion
     /// is not resting on the file-order tie-break — and all three outcomes are pinned: newcomer
     /// present, stalest gone, count unchanged.
+    #[test]
+    fn every_capacity_refusal_carries_the_machine_readable_tag() {
+        // THE TYPESCRIPT SIDE KEYS ON THIS, so an untagged refusal is not a cosmetic slip: it reads
+        // to `controlListener` as a refusal that never named a depth, which re-appends the generic
+        // "your next `fyi` evicts and succeeds" note on top of "nothing was queued, do not
+        // re-send". That is the `sparkle-8bvh` contradiction — a remedy unsafe under exactly the
+        // condition that triggered the refusal — and a peer cannot act on it either way, because
+        // `send_peer_message` is hardcoded `fyi` and cannot be escalated.
+        //
+        // Asserted on BOTH refusals, because they are raised from different arms and the earlier
+        // prose-matching suppression broke precisely by covering one shape and not the other.
+        let base = tmp("capacity-tag");
+
+        // (1) the `act` ceiling: fill every slot with `act`, then send one more `act`.
+        for i in 0..MAX_PER_AGENT {
+            send_act(&base, "a1", &format!("m{i}"), 1_000 + i as i64, &format!("a{i}"))
+                .expect("seed act");
+        }
+        let act_err = send_act(&base, "a1", "one more", 9_000, "over")
+            .expect_err("an act at the ceiling is refused");
+        assert!(
+            act_err.starts_with(CAPACITY_TAG),
+            "the act-ceiling refusal must carry {CAPACITY_TAG}, got: {act_err}"
+        );
+
+        // (2) the all-`act` fyi case: an `fyi` has nothing it may evict, so it is refused too.
+        let fyi_err = send(&base, "a1", "context", 9_100, "f-new")
+            .expect_err("an fyi with only acts queued is refused");
+        assert!(
+            fyi_err.starts_with(CAPACITY_TAG),
+            "the all-act fyi refusal must carry {CAPACITY_TAG}, got: {fyi_err}"
+        );
+
+        // ...and the tag does NOT leak onto refusals that are not about capacity, or TypeScript
+        // would suppress a depth note that path genuinely needs.
+        let fresh = tmp("capacity-tag-empty");
+        let empty_err = send(&fresh, "a1", "   ", 1_000, "blank")
+            .expect_err("an empty message is refused");
+        assert!(
+            !empty_err.contains(CAPACITY_TAG),
+            "a non-capacity refusal must NOT carry the tag, got: {empty_err}"
+        );
+    }
+
     #[test]
     fn a_full_fyi_queue_evicts_the_oldest_fyi_to_admit_a_new_one() {
         let base = tmp("fyi-ring");
