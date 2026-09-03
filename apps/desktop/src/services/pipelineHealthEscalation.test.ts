@@ -12,6 +12,7 @@ import {
   escalatePipelineHealth,
   liveEscalationDeps,
   remediationFor,
+  roborevRemediation,
   type EscalationDeps,
   type EscalationEvent,
 } from "./pipelineHealthEscalation";
@@ -131,12 +132,100 @@ describe("detectEscalations (pure edges)", () => {
 
 describe("composeEscalationMessage + remediationFor", () => {
   it("names the component, the new severity, and the remediation on a blocking alarm", () => {
-    const ev = detectEscalations(snap("healthy"), snap("blocking", "roborev daemon down"))[0]!;
+    // The detail is REAL classifier output (the WEDGE arm of ph_classify_roborev_not_answering),
+    // not an invented phrase — the remedy is chosen from it, so a fabricated detail would assert
+    // the fallback and prove nothing about the arm it claims to cover.
+    const wedge = "the daemon process is ALIVE, and the store is only 12 MB — so this is a genuine WEDGE, not store slowness";
+    const ev = detectEscalations(snap("healthy"), snap("blocking", wedge))[0]!;
     const msg = composeEscalationMessage(ev);
     expect(msg).toContain("Code review (roborev)");
     expect(msg).toContain("BLOCKING");
-    expect(msg).toContain("roborev daemon down");
-    expect(msg).toContain("scripts/roborev-maintenance.sh --watchdog");
+    expect(msg).toContain("genuine WEDGE");
+    // A PROVEN wedge is the one reading where restarting is right — and it is kickstart, never
+    // --watchdog and never `roborev daemon stop && start`.
+    expect(msg).toContain("launchctl kickstart -k");
+  });
+
+  // ── THE REMEDY MUST AGREE WITH THE VERDICT (bead sparkle-ifs2cj) ────────────────────────────
+  // Measured defect: the alert body read "this is SLOW, not wedged ... the probe is reporting its
+  // own timeout" and the very next line read "run --watchdog to restart/compact the WEDGED daemon".
+  // Following that restarts a healthy daemon, and on this machine that orphans 127.0.0.1:7373 —
+  // which is the state that then blocks --compact entirely. A correct verdict with a wrong remedy
+  // has fixed nothing for the human reading it.
+  //
+  // These details are the REAL strings ph_classify_roborev_not_answering emits. Asserting on
+  // invented phrasing would exercise the fallback and silently stop covering the arms.
+  const ARMS = {
+    slow: "the daemon process is ALIVE and ~/.roborev/reviews.db is 975 MB — this is SLOW, not wedged: a store that size takes longer to open than the 8s probe waits, so the probe is reporting its own timeout",
+    contended: "the status read is being THROTTLED by lock contention, not answered by a wedged daemon",
+    undetermined: "and the cause is UNDETERMINED: the store size could not be read",
+    wedge: "the daemon process is ALIVE, and the store is only 12 MB — so this is a genuine WEDGE, not store slowness",
+    down: "there is no roborev daemon process — the review daemon is not running",
+  };
+  // Language that would send a reader to restart a daemon. `--watchdog` is included because that is
+  // the flag the defective string named, and it heals by calling `launchctl kickstart -k`.
+  //
+  // THE LOOKBEHINDS ARE LOAD-BEARING, and this suite got it wrong twice before getting it right —
+  // which is exactly AGENTS.md's "a copy ratchet that only bans a lie is half a ratchet". The
+  // honest remedy for a SLOW reading has to say "DO NOT RESTART IT", and the honest remedy for a
+  // wedge has to say "NOT `roborev daemon stop && roborev daemon start`". A bare banned-phrase
+  // regex matches those required DENIALS and reds the correct copy — the failure output then reads
+  // as if the assertion rejects the very sentence the fix exists to produce. So the ban is on
+  // PRESCRIBING a restart, not on the word appearing.
+  //
+  // A lookbehind is fine HERE and must never leak into the shipped module: it is a parse error in
+  // the safari14 WebView the desktop app pins.
+  const PRESCRIBES_RESTART =
+    /(?<!do )(?<!do not )(?<!never )(?<!not )(--watchdog|kickstart|roborev daemon stop|restart it|restart\/compact|restart the)/i;
+  // `roborev daemon stop`, not a bare `daemon stop`: the SLOW remedy legitimately states that "the
+  // VACUUM half needs the daemon stopped", which is a fact about the tool, not an instruction to
+  // go and stop it. A looser pattern reds that sentence and pushes the author toward vaguer copy.
+
+  it.each([
+    ["SLOW", ARMS.slow],
+    ["CONTENDED", ARMS.contended],
+    ["UNDETERMINED", ARMS.undetermined],
+    ["an unrecognised detail (the fail-safe default)", ""],
+  ])("emits NO restart language on a %s reading", (_label, detail) => {
+    const remedy = roborevRemediation(detail);
+    expect(remedy, `a non-wedge reading must never prescribe a restart:\n${remedy}`).not.toMatch(
+      PRESCRIBES_RESTART,
+    );
+    // Not merely silent about restarting — it must still say what TO do, or the alert is inert.
+    expect(remedy).toMatch(/--status|--report|diagnose/i);
+  });
+
+  it("a SLOW reading leads with the ONLINE retention pass, not with the offline VACUUM", () => {
+    // Compaction needs the fleet quiet and the daemon down, and on a busy machine that window may
+    // not exist. Retention is an online UPDATE that needs neither, and measured on a copy of the
+    // real store it reclaimed 72.4% in six seconds. So it has to come first in the sentence a
+    // human acts on.
+    const remedy = roborevRemediation(ARMS.slow);
+    expect(remedy).toContain("roborev-retention-sweep.sh --report");
+    expect(remedy).toMatch(/online/i);
+    expect(remedy).toMatch(/DO NOT RESTART/i);
+  });
+
+  it.each([
+    ["a proven WEDGE", ARMS.wedge],
+    ["a proven ABSENCE", ARMS.down],
+  ])("DOES prescribe launchd for %s — the split must not disarm the real cases", (_l, detail) => {
+    // The dangerous direction is over-suppression: a guard that never prescribes a restart is safe
+    // and useless. These two arms are the ones where acting is correct, and they must still say so.
+    expect(roborevRemediation(detail)).toMatch(/launchctl/i);
+    // ...but never PRESCRIBING the form this machine is documented as broken on.
+    //
+    // A bare `.not.toMatch(/roborev daemon start/)` is the wrong assertion and reds correct copy —
+    // AGENTS.md's negative-only-ratchet trap. The honest remedy has to NAME that command in order
+    // to warn the reader off it ("NOT `roborev daemon stop && roborev daemon start`"), so the
+    // banned-phrase test matches its own required denial. Assert the PAIRING instead: if the string
+    // mentions it at all, it must carry a negation cue in the same breath.
+    const r = roborevRemediation(detail);
+    if (/roborev daemon start/.test(r)) {
+      expect(r, `naming the broken command without warning the reader off it:\n${r}`).toMatch(
+        /NOT `roborev daemon|is broken/i,
+      );
+    }
   });
 
   it("has a codified remediation for every known pipeline component id", () => {
@@ -351,7 +440,10 @@ describe("escalatePipelineHealth — routing + gating side effects", () => {
     for (const t of [r.concierge[0]!, r.woke[0]!]) {
       expect(t).toContain("Code review (roborev)");
       expect(t).toContain("BLOCKING");
-      expect(t).toContain("scripts/roborev-maintenance.sh --watchdog");
+      // An actionable remedy still reaches BOTH channels — it is just the one that agrees with
+      // the reading. With no recognised detail that is the diagnose-first text, never a restart.
+      expect(t).toContain("diagnose before acting");
+      expect(t).not.toMatch(/--watchdog|restart the wedged|restart\/compact/i);
     }
     // Both channels succeeded → NO fail-safe bead.
     expect(r.beads).toHaveLength(0);

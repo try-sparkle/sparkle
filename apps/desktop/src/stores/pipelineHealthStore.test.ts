@@ -161,7 +161,10 @@ describe("refreshPipelineHealth → real-time escalation (driven through the rea
     expect(told).toHaveLength(1);
     expect(woke[0]).toContain("Code review (roborev)");
     expect(woke[0]).toContain("BLOCKING");
-    expect(woke[0]).toContain("scripts/roborev-maintenance.sh --watchdog");
+    // The remedy now agrees with the verdict (bead sparkle-ifs2cj): this fixture carries no
+    // recognised classifier detail, so it gets the diagnose-first text, never a restart.
+    expect(woke[0]).toContain("diagnose before acting");
+    expect(woke[0]).not.toMatch(/--watchdog|restart\/compact/i);
   });
 
   it("a steady blocking state across polls does NOT re-escalate", async () => {

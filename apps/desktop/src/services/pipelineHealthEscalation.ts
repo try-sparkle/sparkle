@@ -117,14 +117,114 @@ function isGoodState(s: HealthState): boolean {
 }
 
 /**
+ * THE ROBOREV REMEDY MUST AGREE WITH THE VERDICT IT IS APPENDED TO (bead `sparkle-ifs2cj`).
+ *
+ * This used to be one constant string — "run `scripts/roborev-maintenance.sh --watchdog` to
+ * restart/compact the wedged daemon" — returned for EVERY roborev reading. The classifier in
+ * `scripts/lib/pipeline-health.sh` distinguishes five cases, and that one string CONTRADICTS FOUR
+ * OF THEM. Measured on this machine, in a single alert:
+ *
+ *   body:   "the daemon process is ALIVE and ~/.roborev/reviews.db is 975 MB — this is SLOW, not
+ *            wedged: a store that size takes longer to open than the 8s probe waits, so the probe
+ *            is reporting its own timeout"
+ *   remedy: "... to restart/compact the WEDGED daemon."
+ *
+ * The body correctly diagnoses "slow, not wedged" and the very next line prescribes the wedge
+ * remedy, using the word its own body just disproved. AGENTS.md's rule is that a remedy is an
+ * instruction someone will follow — and following this one restarts a HEALTHY daemon. On this
+ * machine that is actively harmful: launchd restarts whatever you stop, and the failed start
+ * orphans a process holding 127.0.0.1:7373, which is the state that then blocks `--compact`
+ * entirely (bead `sparkle-t9b3k6`). So a correct verdict with a wrong remedy has fixed nothing for
+ * the human reading it; the COULD-NOT-LOOK / IS-DOWN split has to reach the REMEDY, not just the
+ * state.
+ *
+ * Keyed on stable phrases the classifier's own arms emit. `roborevRemediation` is exported so the
+ * suite can assert the one invariant that matters: NO restart/watchdog language on any arm that is
+ * not a proven wedge or a proven absence.
+ *
+ * THE DEFAULT IS THE SAFETY PROPERTY, not a fallback. An absent or unrecognised detail returns the
+ * DIAGNOSE-FIRST text, never the restart text, because the harm is asymmetric: withholding a
+ * restart from a genuinely wedged daemon costs a diagnostic round trip, while prescribing one for a
+ * merely-slow daemon orphans the port. A new classifier arm this function has never seen therefore
+ * degrades to "go and look", which is always safe to follow.
+ */
+export function roborevRemediation(detail?: string): string {
+  const d = detail ?? "";
+
+  // A PROVEN WEDGE is the ONE case a restart is right — and it is `launchctl kickstart`, never
+  // `--watchdog`, and never `roborev daemon stop && start`, which is broken on this machine.
+  if (/genuine WEDGE/i.test(d)) {
+    return (
+      "Code review is WEDGED (the store is small, so this is the daemon itself, not store slowness) — " +
+      "restart it with `launchctl kickstart -k gui/$(id -u)/co.plow.roborev-daemon`. " +
+      "NOT `roborev daemon stop && roborev daemon start`: it is broken on this machine and each failed " +
+      "start orphans a process holding 127.0.0.1:7373."
+    );
+  }
+
+  // ABSENT — nothing to restart; it has to be started, and only launchd can do it correctly.
+  if (/no roborev daemon process/i.test(d)) {
+    return (
+      "The review daemon is NOT RUNNING — start it with " +
+      "`launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/co.plow.roborev-daemon.plist` " +
+      "(or `launchctl kickstart -k gui/$(id -u)/co.plow.roborev-daemon` if it is already loaded). " +
+      "`roborev daemon start` is broken here — it needs setsid, and each failed attempt orphans a " +
+      "process holding 127.0.0.1:7373."
+    );
+  }
+
+  // SLOW — the store is the disease. NOTE WHAT THIS RECOMMENDS FIRST: the retention sweep's
+  // RETENTION half is an online UPDATE that needs NO quiet window and NO daemon downtime, and
+  // measured end to end on a copy of the real store it took the file from 955.7 MB to 264.1 MB
+  // (72.4%) in six seconds while keeping every one of 19,870 verdicts. That is the whole reason to
+  // lead with it rather than with `--compact`: compaction needs the fleet quiet and the daemon
+  // down, and on a busy machine that window may simply not exist.
+  if (/SLOW, not wedged/i.test(d)) {
+    return (
+      "Code review is SLOW, not wedged — the daemon is alive and the probe is reporting its own " +
+      "timeout against a bloated store. DO NOT RESTART IT. The store size is the disease: " +
+      "`scripts/roborev-retention-sweep.sh --report` (read-only) shows what is reclaimable, and its " +
+      "retention pass is an ONLINE update that needs no downtime and no quiet fleet. Only the " +
+      "VACUUM half needs the daemon stopped, and the sweep refuses cleanly when the queue is not idle."
+    );
+  }
+
+  // CONTENDED — a restart provably does not clear lock contention; it just re-contends within the hour.
+  if (/THROTTLED by lock contention/i.test(d)) {
+    return (
+      "Code review is THROTTLED by SQLite write-lock contention, not wedged — review is slowed, not " +
+      "stopped. A restart does NOT clear contention (the workers re-contend within the hour). Shrink " +
+      "the store instead: `scripts/roborev-retention-sweep.sh --report`, whose retention pass runs " +
+      "online against a live daemon."
+    );
+  }
+
+  // UNDETERMINED — the probe could not look. Say exactly that, and prescribe looking.
+  if (/UNDETERMINED/i.test(d)) {
+    return (
+      "The cause is UNDETERMINED — a daemon that is merely slow behind a bloated store and one that " +
+      "is genuinely wedged look identical from here and need OPPOSITE remedies. Do not restart blind. " +
+      "Diagnose first: `scripts/roborev-maintenance.sh --status` and `pgrep -fl \"roborev daemon\"`."
+    );
+  }
+
+  // DEFAULT — see the block comment: diagnose-first, never restart-first.
+  return (
+    "Code review is degraded — diagnose before acting, because slow and wedged look identical from " +
+    "the probe and need opposite remedies: `scripts/roborev-maintenance.sh --status`, and " +
+    "`scripts/roborev-retention-sweep.sh --report` for the store size. Do not restart blind."
+  );
+}
+
+/**
  * The codified remediation per component id (mirrors the ids in `pipeline_health.rs`). Returns the
  * concrete next action so the alert is actionable, not just a notification. `null` for an unknown id
  * — the message still names the component and severity, it simply has no canned fix to append.
  */
-export function remediationFor(componentId: string): string | null {
+export function remediationFor(componentId: string, detail?: string): string | null {
   switch (componentId) {
     case "roborev":
-      return "Code review is degraded — run `scripts/roborev-maintenance.sh --watchdog` to restart/compact the wedged daemon.";
+      return roborevRemediation(detail);
     case "ci_runners":
       // DO NOT PROMISE THE AUTOSCALER WILL ADD CAPACITY (bead `sparkle-ot4dxb`). This alarm now only
       // fires on a genuine backlog free runners are not draining, and the measured cause of that is a
@@ -258,7 +358,8 @@ export function detectEscalations(
         to,
         severity: to === "blocking" ? "blocking" : "warning",
         detail: cur.detail,
-        remediation: remediationFor(cur.id),
+        // The DETAIL is passed so the remedy can agree with the verdict — see roborevRemediation.
+        remediation: remediationFor(cur.id, cur.detail),
       });
     } else if (isAlarmState(from) && isGoodState(to)) {
       out.push({
