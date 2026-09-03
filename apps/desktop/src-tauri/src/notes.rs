@@ -695,8 +695,42 @@ pub fn write_prd(project_path: String, filename: String, content: String) -> Res
     let prd_dir = root.join("PRD");
     std::fs::create_dir_all(&prd_dir).map_err(|e| format!("create {}: {e}", prd_dir.display()))?;
     let path = prd_dir.join(&filename);
-    std::fs::write(&path, content.as_bytes()).map_err(|e| format!("write {}: {e}", path.display()))?;
+    // ATOMIC replace, not a bare `std::fs::write`. `write` truncates the target FIRST and then
+    // streams the new bytes, so a crash or a full disk mid-write leaves the existing markdown
+    // truncated — the doc the user was editing, gone. Every other persistence path in the crate
+    // uses tmp+fsync+rename; `write_prd` overwrites an existing file, so it must too.
+    write_atomic(&path, content.as_bytes())?;
     Ok(format!("PRD/{filename}"))
+}
+
+/// Replace `path` atomically: write a unique temp file in the SAME directory, fsync it, then
+/// rename over the target. `rename(2)` is atomic within a filesystem, so a reader (or a crash)
+/// never sees a half-written file under the real name; the fsync ensures the bytes are on disk
+/// before the rename publishes them, so a crash just after the rename cannot leave the name
+/// pointing at unwritten blocks. Mirrors `agent_life::write_record_at`.
+fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let dir = path
+        .parent()
+        .ok_or_else(|| format!("{}: no parent directory", path.display()))?;
+    // UNIQUE PER WRITE (pid + monotonic seq), so two concurrent writers into the same PRD dir
+    // cannot open the identical temp file and interleave their bytes before either renames.
+    static WRITE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = WRITE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let stem = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let tmp = dir.join(format!(".{stem}.{}.{seq}.tmp", std::process::id()));
+    {
+        let mut f = std::fs::File::create(&tmp).map_err(|e| format!("write {}: {e}", tmp.display()))?;
+        f.write_all(bytes).map_err(|e| format!("write {}: {e}", tmp.display()))?;
+        f.sync_all().map_err(|e| format!("fsync {}: {e}", tmp.display()))?;
+    }
+    std::fs::rename(&tmp, path).map_err(|e| {
+        // Best-effort cleanup so a failed publish does not strand the temp file.
+        let _ = std::fs::remove_file(&tmp);
+        format!("replace {}: {e}", path.display())
+    })
 }
 
 /// Read a markdown doc back out of the project's `PRD/` directory — the read counterpart of
@@ -1579,6 +1613,51 @@ mod tests {
         assert_eq!(rel, "PRD/branch.md");
         let written = std::fs::read_to_string(Path::new(&p).join("PRD").join("branch.md")).unwrap();
         assert_eq!(written, "# hello\n");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `write_prd` REPLACES an existing doc atomically — it never truncates the target in place.
+    ///
+    /// The distinguishing observable: an atomic tmp+rename publishes a NEW inode, so a pre-existing
+    /// hard link to the old file keeps pointing at the OLD inode with the OLD content. A bare
+    /// `std::fs::write` (the pre-fix code) opens the SAME inode with `O_TRUNC` and rewrites it in
+    /// place, so the hard link would observe the NEW bytes. Asserting the link still reads the old
+    /// content therefore FAILS against the non-atomic implementation and PASSES against this one —
+    /// and it stands in for the truncation a crash/full-disk mid-write would leave behind.
+    #[test]
+    #[cfg(unix)]
+    fn write_prd_replaces_atomically_not_in_place() {
+        let dir = std::env::temp_dir().join(format!("sparkle_prd_atomic_{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(dir.join(".git")).unwrap(); // a real project root is a git repo
+        let p = dir.to_string_lossy().to_string();
+
+        // Seed the target, then hard-link a witness to its inode.
+        write_prd(p.clone(), "branch.md".into(), "OLD\n".into()).unwrap();
+        let target = Path::new(&p).join("PRD").join("branch.md");
+        let witness = Path::new(&p).join("PRD").join("witness.md");
+        std::fs::hard_link(&target, &witness).unwrap();
+
+        // Overwrite through the real command.
+        write_prd(p.clone(), "branch.md".into(), "NEW\n".into()).unwrap();
+
+        // The target reflects the new content …
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "NEW\n");
+        // … while the witness (old inode) is untouched — proof the write did not truncate in place.
+        assert_eq!(
+            std::fs::read_to_string(&witness).unwrap(),
+            "OLD\n",
+            "write_prd truncated the existing inode in place instead of atomically renaming"
+        );
+        // No temp artifact stranded in the PRD dir.
+        let strays: Vec<_> = std::fs::read_dir(Path::new(&p).join("PRD"))
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(strays.is_empty(), "left temp files behind: {strays:?}");
 
         std::fs::remove_dir_all(&dir).ok();
     }

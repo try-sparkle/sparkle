@@ -1342,7 +1342,12 @@ impl DecodeWorker {
     /// It deliberately does NOT take `cloud_active`. It briefly did, to suppress the speech-end of a
     /// segment that drained after the cloud took over — see `plan_decode_emit` for why that guard was
     /// withdrawn (it had no successor arm and silently broke the hands-free path).
-    fn spawn(decoder: Arc<Decoder>, app: AppHandle) -> (SyncSender<Vec<f32>>, DecodeWorker) {
+    ///
+    /// Returns `Err` rather than panicking when the OS refuses the thread (EAGAIN/ENOMEM under
+    /// memory pressure). On-device dictation is an OPTIONAL feature, so a spawn failure must
+    /// DEGRADE — the caller (`build_capture`) surfaces the error and leaves the rest of the app
+    /// running — rather than take the whole process down with it.
+    fn spawn(decoder: Arc<Decoder>, app: AppHandle) -> Result<(SyncSender<Vec<f32>>, DecodeWorker), String> {
         let (tx, rx) = sync_channel::<Vec<f32>>(DECODE_QUEUE_CAP);
         let abort = Arc::new(AtomicBool::new(false));
         let abort_worker = abort.clone();
@@ -1351,7 +1356,7 @@ impl DecodeWorker {
         let emits_are_unsafe = Arc::new(AtomicBool::new(false));
         let emits_are_unsafe_worker = emits_are_unsafe.clone();
         let (exited_tx, exited) = channel::<()>();
-        let handle = std::thread::Builder::new()
+        let handle = match std::thread::Builder::new()
             .name("parakeet-decode".into())
             .spawn(move || {
                 let _exited_tx = exited_tx;
@@ -1395,9 +1400,20 @@ impl DecodeWorker {
                     // backlog was discarded via `abort()` or the worker was DETACHED.
                     |plan| apply_decode_plan(plan, &mut AppEmitSink(&app)),
                 );
-            })
-            .expect("spawn parakeet-decode worker");
-        (tx, DecodeWorker { handle: Some(handle), abort, emits_are_unsafe, exited })
+            }) {
+            Ok(handle) => handle,
+            Err(e) => {
+                // The OS refused the thread (EAGAIN/ENOMEM under memory pressure). Do NOT panic —
+                // on-device dictation is optional; degrade so the rest of the app keeps running.
+                tracing::warn!(
+                    target: "dictation",
+                    error = %e,
+                    "could not spawn parakeet-decode worker; disabling on-device dictation for this capture",
+                );
+                return Err(format!("spawn parakeet-decode worker: {e}"));
+            }
+        };
+        Ok((tx, DecodeWorker { handle: Some(handle), abort, emits_are_unsafe, exited }))
     }
 
     /// Signal the worker to abandon any queued decodes and EXIT — observed within one
@@ -2574,7 +2590,7 @@ fn build_capture(
     // decode locks only the recognizer — never the `transcriber` mutex the audio callback holds for
     // the VAD — and thus can't stall a capture frame.
     let decoder = transcriber.lock().unwrap_or_else(|p| p.into_inner()).decoder();
-    let (decode_tx, worker) = DecodeWorker::spawn(decoder, app.clone());
+    let (decode_tx, worker) = DecodeWorker::spawn(decoder, app.clone())?;
     // Last emitted speech-detection state, so we emit `dictation://speaking` only on the
     // rising/falling EDGE rather than ~60×/sec. Fresh per capture (starts false), so a newly
     // (re)built capture begins "silent" and the waveform stays flat until real speech lands.
@@ -3101,7 +3117,7 @@ pub fn start_audio_watchdog(app: AppHandle) {
         flag.store(true, Ordering::Release);
     });
 
-    std::thread::Builder::new()
+    let spawned = std::thread::Builder::new()
         .name("audio-watchdog".into())
         .spawn(move || {
             let _watcher = watcher; // keep the listeners registered for the loop's lifetime
@@ -3125,8 +3141,19 @@ pub fn start_audio_watchdog(app: AppHandle) {
                 }
                 state.watchdog_tick(&app);
             }
-        })
-        .expect("spawn audio-watchdog thread");
+        });
+    if let Err(e) = spawned {
+        // The OS refused the thread (EAGAIN/ENOMEM under memory pressure). Do NOT panic — the
+        // watchdog is a best-effort auto-recovery monitor, not a hard dependency. Degrade: the app
+        // keeps running (and dictation still functions), it just loses automatic device-change
+        // re-acquire until the next start. `watcher` was moved into the (dropped) closure, so its
+        // listeners unregister cleanly with it.
+        tracing::warn!(
+            target: "dictation",
+            error = %e,
+            "could not spawn audio-watchdog thread; device-change auto-recovery is disabled for this session",
+        );
+    }
 }
 
 impl DictationState {
