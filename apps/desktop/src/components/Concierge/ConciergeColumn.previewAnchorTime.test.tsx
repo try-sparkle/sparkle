@@ -124,6 +124,31 @@ function previewGoesLiveAt(at: number) {
   }
 }
 
+/**
+ * The phase BEFORE `previewGoesLiveAt`: the entry exists and is still building, so the transcript
+ * shows a NOTICE rather than a card. Driven through the same production writer, at a pinned clock,
+ * because the whole point of the case below is that `startedAt` and `surfacedAt` are stamped at
+ * DIFFERENT moments and only one of them is stable.
+ */
+function previewStartsBuildingAt(at: number) {
+  const clock = vi.spyOn(Date, "now").mockReturnValue(at);
+  try {
+    act(() => {
+      applyPreviewStatus({
+        id: "srv-1",
+        agentId: KRAKEN,
+        projectId: "p1",
+        url: null,
+        port: null,
+        state: "listening",
+        error: null,
+      });
+    });
+  } finally {
+    clock.mockRestore();
+  }
+}
+
 const column = (messages: ConciergeMessage[]) => (
   <ConciergeColumn
     model={model(messages)}
@@ -159,6 +184,33 @@ describe("the card lands where the preview happened, not where the render did", 
     render(column([EARLY, LATE]));
     previewGoesLiveAt(T_SURFACED);
 
+    expect(precedes(row("m1"), card())).toBe(true);
+    expect(precedes(card(), row("m2"))).toBe(true);
+  });
+
+  it("uses ONE clock across the notice and the card, so a build phase cannot move it", () => {
+    // THE LIFECYCLE THE FIX MISSED (roborev 77898). `pendingPreviewNotices` covers
+    // `installing`/`starting`/`listening` and `preview.rs`'s `supervise` drives `listening → ready`,
+    // so the ordinary fresh start is: entry at T_EARLY → notice → ready at T_LATE → card. Those are
+    // two different instants, separated by the whole dev-server startup — seconds for Vite, minutes
+    // for an install — and every other fixture in this file drives `ready` as its FIRST event, so
+    // T0 === T1 in all of them and none can see this.
+    //
+    // The anchor is captured once per mount. Read from the notice it is T_EARLY; read from the card
+    // it is T_LATE. So the first mount put the card above `m2` and any remount put it below —
+    // `m2` being any message sent while the server was still building, which is exactly when
+    // someone talks to that agent. Both projections now read `startedAt`, which `setPreview`
+    // preserves across every transition.
+    render(column([EARLY, LATE]));
+    previewStartsBuildingAt(T_EARLY);
+    previewGoesLiveAt(T_LATE);
+    expect(precedes(row("m1"), card())).toBe(true);
+    expect(precedes(card(), row("m2"))).toBe(true);
+
+    // The remount is where the two clocks diverge: the notice is gone, so the card is the only
+    // projection left to read an arrival instant from. With `surfacedAt` this assertion reds.
+    cleanup();
+    render(column([EARLY, LATE]));
     expect(precedes(row("m1"), card())).toBe(true);
     expect(precedes(card(), row("m2"))).toBe(true);
   });

@@ -47,6 +47,26 @@ export interface PreviewCardModel {
    * that is the only automatic refresh the store can honestly offer.
    */
   surfacedAt: number;
+  /**
+   * When this preview's ENTRY first appeared (`previewStore`'s `startedAt`), which is a different
+   * instant from `surfacedAt` and is the one a thread artifact must anchor on (bead sparkle-75fbot,
+   * roborev 77898).
+   *
+   * `surfacedAt` is stamped on the TRANSITION into a surfacing state, so for the ordinary
+   * fresh-start lifecycle — entry created at T0, notice shown, `ready` at T1, card shown — it is T1,
+   * later than T0 by the whole dev-server startup window: seconds for Vite, minutes for an install.
+   * A notice carries T0 and a card carried T1, so the SAME preview reported two different arrival
+   * instants depending on which projection the agent happened to be in. The anchor is captured once
+   * per mount, so the first mount recorded T0 and any remount recomputed from T1 — and every message
+   * that arrived in `(T0, T1]`, which is exactly the window in which someone chats to the agent
+   * whose server is still building, flipped from below the card to above it. That is the same "the
+   * card silently moved when I came back" symptom the stamp exists to remove.
+   *
+   * `startedAt` is preserved across every later transition (`setPreview` writes
+   * `prev?.startedAt ?? Date.now()`), so it is stable for the life of the entry and both projections
+   * can read the one clock. `surfacedAt` keeps the job it already had: driving snapshot recapture.
+   */
+  startedAt: number;
 }
 
 /**
@@ -95,7 +115,9 @@ export function livePreviewCards(byAgent: Record<string, PreviewEntry>): Preview
     const url = entry.url;
     if (!url) continue;
     const at = entry.surfacedAt ?? entry.startedAt;
-    cards.push({ card: { agentId, url, surfacedAt: at }, at });
+    // `at` orders the cards and drives snapshot recapture; `startedAt` is carried UNMODIFIED beside
+    // it because an anchor needs one instant per agent that does not move — see the field docstring.
+    cards.push({ card: { agentId, url, surfacedAt: at, startedAt: entry.startedAt }, at });
   }
   // NEWEST FIRST, because the newest preview is the one the reader has not seen yet. Ties fall back
   // to the agent id so the order is total and a re-render cannot shuffle two cards past each other.

@@ -1069,14 +1069,25 @@ export function PreviewThreadArtifacts({
 
   const anchors = useRef(new Map<string, string | null>());
   // WHEN each live artifact arrived, which is what {@link anchorableIdAt} compares messages against.
-  // A card's is `surfacedAt` — the TRANSITION into a surfacing state, never a last-seen-at (see
-  // `previewStore.PreviewEntry`) — and a notice's is `startedAt`, when its entry first appeared. The
-  // two projections are disjoint by construction (see the docstring below), so the card write below
-  // cannot actually be contending with a notice for an agent; it is ordered second so that if that
-  // ever stops being true the openable surface wins, matching which one the reader would be looking at.
+  //
+  // ONE CLOCK FOR BOTH PROJECTIONS, and it has to be `startedAt` (roborev 77898). This read
+  // `c.surfacedAt` for a card and `n.startedAt` for a notice, which are DIFFERENT INSTANTS for the
+  // same preview: `surfacedAt` is stamped on the transition into a surfacing state, so the ordinary
+  // fresh-start lifecycle — entry at T0, notice, `ready` at T1, card — puts them a whole dev-server
+  // startup apart. The anchor is captured once per mount, so the first mount recorded T0 and every
+  // remount recomputed from T1, and any message that arrived in `(T0, T1]` flipped from below the
+  // card to above it. That window is precisely when someone chats to the agent whose server is still
+  // building, so it was the common path, and the symptom was the one this whole surface exists to
+  // remove: the card silently moved when you came back. `startedAt` is preserved across every later
+  // transition, so it is stable for the life of the entry and both projections agree.
+  //
+  // The two projections are disjoint by construction (see the docstring below), so the card write
+  // below cannot actually be contending with a notice for an agent; it is ordered second so that if
+  // that ever stops being true the openable surface wins, matching what the reader would be looking
+  // at. With one clock the order no longer changes the VALUE either way — which is the point.
   const arrivedAt = new Map<string, number>();
   for (const n of notices) arrivedAt.set(n.agentId, n.startedAt);
-  for (const c of named) arrivedAt.set(c.agentId, c.surfacedAt);
+  for (const c of named) arrivedAt.set(c.agentId, c.startedAt);
   // FORGOTTEN WITH THE CARD. Retirement is derived (see the file header), so an agent that drops out
   // of both projections drops its anchor too — and a preview that comes back is news again and
   // anchors to wherever the conversation is then.
