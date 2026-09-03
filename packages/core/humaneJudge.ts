@@ -43,6 +43,9 @@ import {
   aggregateScore,
   isOrdinalScore,
 } from './humaneTypes';
+// The ONE secret redactor, shared with the transport's producer-side redaction. `humaneTransport`
+// is pure (no node built-ins), so importing it keeps this module model-free and side-effect-free.
+import { redactSecrets } from './humaneTransport.ts';
 import type {
   ComplianceCitation,
   DetectorFinding,
@@ -221,12 +224,9 @@ export function noVerdictDetailFrom(
 ): string | null {
   const first = failures.find((f) => (f.error ?? '').trim().length > 0);
   if (!first) return null;
-  const oneLine = first.error
-    .replace(/\s+/g, ' ')
-    // Anthropic-shaped keys and bearer tokens. Deliberately broad: a false redaction costs a
-    // reader nothing, and a missed one is published forever on a pull request.
-    .replace(/\b(?:sk-ant|sk|Bearer)[-_A-Za-z0-9]{8,}/g, '[redacted]')
-    .trim();
+  // Collapse to one line, then redact — the SHARED redactor (`redactSecrets`), so the transport's
+  // producer-side redaction and this publisher-side redaction cannot drift apart.
+  const oneLine = redactSecrets(first.error.replace(/\s+/g, ' ')).trim();
   return oneLine.length > NO_VERDICT_DETAIL_CHARS
     ? `${oneLine.slice(0, NO_VERDICT_DETAIL_CHARS - 1)}…`
     : oneLine;

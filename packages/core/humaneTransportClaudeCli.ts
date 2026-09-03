@@ -16,7 +16,7 @@
  * future edit cannot quietly drop one.
  */
 import { spawn } from 'node:child_process';
-import { describeThrown } from './humaneTransport.ts';
+import { describeThrown, redactSecrets } from './humaneTransport.ts';
 import type { JudgeReply, JudgeTransport, CredentialSource, JudgeUsage } from './humaneTransport.ts';
 
 /**
@@ -194,7 +194,9 @@ export function parseJudgeEnvelope(stdout: string): JudgeReply {
     }
     if (env.is_error === true) {
       const msg = typeof env.result === 'string' && env.result ? env.result : 'the judge CLI reported an error';
-      return { error: msg };
+      // The CLI's own error text may echo part of the offending request — redact at the producer
+      // so no sink of this `error` can publish a live credential. See `redactSecrets`.
+      return { error: redactSecrets(msg) };
     }
     const result = env.result;
     if (typeof result !== 'string' || result.trim() === '') {
@@ -204,7 +206,9 @@ export function parseJudgeEnvelope(stdout: string): JudgeReply {
   }
   // Not JSON at all. Quote what it DID say — that sentence is usually the whole diagnosis
   // ("Not logged in", "Credit balance too low"), and throwing it away is bead `sparkle-g6cc8q`.
-  return { error: `the judge CLI did not return JSON — ${oneLine(trimmed, 400)}` };
+  // Redact first: this quotes up to 400 chars of ARBITRARY CLI stdout, the widest secret-leak
+  // surface in this file, and its `error` is not guaranteed to reach a redacting publisher.
+  return { error: `the judge CLI did not return JSON — ${redactSecrets(oneLine(trimmed, 400))}` };
 }
 
 function readUsage(raw: unknown): JudgeUsage | undefined {

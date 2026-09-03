@@ -183,3 +183,24 @@ export function describeThrown(e: unknown): string {
   }
   return parts.join(': ') || String(e);
 }
+
+/**
+ * Replace any Anthropic-shaped API key or bearer token in `s` with `[redacted]`.
+ *
+ * THE ONE DEFINITION. Provider and CLI error text is quoted onto surfaces a human — and often a
+ * PUBLIC pull request — reads: `parseJudgeEnvelope` quotes raw `claude -p` stdout when it is not
+ * JSON, and `humaneJudge.noVerdictDetailFrom` quotes the first failure onto a check-run summary. A
+ * provider or proxy that echoes part of the offending request would otherwise publish a live
+ * credential, forever. Redacting at BOTH the producer (the transport) and the publisher (the
+ * verdict) is defence in depth: whichever sink a `JudgeReply.error` reaches, the secret is already
+ * gone. It lives here, in the neutral base both those modules already import, so the pattern cannot
+ * drift into two regexes that disagree.
+ *
+ * Deliberately BROAD — a false redaction costs a reader nothing, a missed one is published forever.
+ * It matches `sk-ant…`, a bare `sk…`, and `Bearer …` runs of at least eight key characters; the
+ * OAuth token the account fleet rotates (`sk-ant-oat01-…`) and classic API keys (`sk-ant-api03-…`)
+ * are both caught by the `sk-ant` arm.
+ */
+export function redactSecrets(s: string): string {
+  return s.replace(/\b(?:sk-ant|sk|Bearer)[-_A-Za-z0-9]{8,}/g, '[redacted]');
+}

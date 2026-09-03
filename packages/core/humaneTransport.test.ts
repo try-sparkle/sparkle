@@ -11,7 +11,7 @@
  * function ran.
  */
 import { describe, expect, it } from 'vitest';
-import { answered, CREDENTIAL_SOURCES, describeThrown, unreachableTransport } from './humaneTransport.ts';
+import { answered, CREDENTIAL_SOURCES, describeThrown, redactSecrets, unreachableTransport } from './humaneTransport.ts';
 import {
   ALLOWED_CLI_FLAGS,
   API_KEY_VARS,
@@ -213,6 +213,26 @@ describe('reading the CLI envelope', () => {
 
   it('says so when the CLI produced nothing at all', () => {
     expect((parseJudgeEnvelope('   ') as { error: string }).error).toContain('no output');
+  });
+
+  it('REDACTS a key leaked into non-JSON stdout before quoting it', () => {
+    // The widest leak surface: up to 400 chars of arbitrary CLI stdout, quoted into `.error`.
+    // A misconfigured CLI or proxy that echoes the request could put a live credential here.
+    const secret = 'sk-ant-api03-BBBBBBBBBBBBBBBBBBBB';
+    const r = parseJudgeEnvelope(`Auth failed for ${secret} — please re-login`);
+    expect((r as { error: string }).error).not.toContain(secret);
+    expect((r as { error: string }).error).toContain('[redacted]');
+    // The diagnosis around it still travels — redaction removes the secret, not the sentence.
+    expect((r as { error: string }).error).toContain('please re-login');
+  });
+
+  it('REDACTS a key echoed inside an is_error envelope', () => {
+    const secret = 'sk-ant-oat01-CCCCCCCCCCCCCCCCCCCC';
+    const out = JSON.stringify({ type: 'result', is_error: true, result: `bad token ${secret}` });
+    const r = parseJudgeEnvelope(out);
+    expect(answered(r)).toBe(false);
+    expect((r as { error: string }).error).not.toContain(secret);
+    expect((r as { error: string }).error).toContain('[redacted]');
   });
 
   it('refuses an envelope whose result is empty rather than scoring a blank answer', () => {
@@ -503,5 +523,26 @@ describe('describeThrown — keeping the cause, not just the wrapper', () => {
 
   it('handles a thrown non-Error', () => {
     expect(describeThrown('a bare string')).toBe('a bare string');
+  });
+});
+
+describe('redactSecrets — the ONE secret redactor', () => {
+  it('replaces an Anthropic API key with [redacted], keeping the surrounding sentence', () => {
+    const out = redactSecrets('invalid x-api-key sk-ant-api03-AAAAAAAAAAAAAAAAAAAA in header');
+    expect(out).not.toContain('sk-ant-api03-AAAAAAAAAAAAAAAAAAAA');
+    expect(out).toContain('[redacted]');
+    expect(out).toContain('invalid x-api-key');
+    expect(out).toContain('in header');
+  });
+
+  it('redacts the rotated OAuth token shape and a run-together Bearer token', () => {
+    expect(redactSecrets('token sk-ant-oat01-ZZZZZZZZZZZZZZZZ')).toBe('token [redacted]');
+    // The `Bearer` arm matches the token spelled onto the word, the shape a naive dump produces.
+    expect(redactSecrets('auth Bearerabcdefghij123456 end')).toBe('auth [redacted] end');
+  });
+
+  it('leaves ordinary text untouched — a false redaction would eat the diagnosis', () => {
+    expect(redactSecrets('Credit balance too low')).toBe('Credit balance too low');
+    expect(redactSecrets('Not logged in')).toBe('Not logged in');
   });
 });
