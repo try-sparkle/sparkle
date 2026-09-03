@@ -416,6 +416,77 @@ function buildFinding(
  *     a finding because we could not grade it would turn the worst-understood finding into no
  *     finding at all, which is the failure this parser exists to avoid.
  */
+/* The three body shapes that PROVE a review raised nothing, measured in the live review store.
+ *  Each is anchored, because an unanchored match would clear a real finding that merely mentions
+ *  one of these strings in passing. */
+
+// The sentinel the reviewer emits when every finding it found is below the severity floor. It must
+// stand ALONE on its line: prose ABOUT the sentinel is not the sentinel.
+const THRESHOLD_MET_LINE = /(?:^|\n)[ \t]*SEVERITY_THRESHOLD_MET[ \t]*(?:\n|$)/;
+// A review that ran and found nothing.
+const NO_ISSUES_OPENING = /^\s*(?:#+\s*)?no issues found/i;
+/* An AGENT SESSION-STATUS body: the review job executed a resume/status prompt instead of the review
+ *  prompt, so the session's own status report was stored as the review. Anchored at the START and
+ *  kept to three literal openings taken verbatim from the store, rather than anything fuzzy — this
+ *  arm makes the gate MORE permissive, so a loose pattern here would clear real findings. */
+const SESSION_STATUS_OPENING = /^\s*(?:working:|nothing to commit\b|review-only session\b)/i;
+
+/**
+ * Does this review body PROVE that the review raised no finding?
+ *
+ * WHY THIS EXISTS. The verdict is derived inside a prebuilt binary this repo cannot patch, and the
+ * derivation is INTERMITTENTLY wrong: measured in the live store, 1,649 bodies carry
+ * `SEVERITY_THRESHOLD_MET` and 74 of those were recorded as verdict `F`; 6,321 open with
+ * `No issues found` and 3 of those were recorded `F`. Those FAILs carry nothing to fix, so a gate
+ * keyed on `verdict === "F"` alone blocks a merge over a review that found nothing — and the
+ * commonest single instance, an empty merge diff, occurs 788 times all-time.
+ *
+ * NOT YET WIRED TO ANY GATE, DELIBERATELY — and do not wire it to one alone. Read this first.
+ * A first attempt applied it in `mergePrTool` only, and review showed that is worse than not
+ * applying it at all, for two independent reasons:
+ *
+ *   1. THE REAL SINK IS RUST. Every in-app merge reaches `merge_pr` -> `roborev_drain_gate`
+ *      (worktree.rs), which re-derives the blocking set itself from `roborev list --json` on
+ *      `verdict == "F" && !closed`, never reads a body, and has deliberately no override. So a
+ *      TypeScript-only reclassification is INERT in production: the pre-check passes and the sink
+ *      still refuses. Worse, the refusal then arrives through the catch chain, whose classifier does
+ *      not recognise the drain-refusal wording, so a coded `refused / roborev-unresolved` becomes an
+ *      uncoded `unknown-error` — the branch a concierge retries verbatim, in a loop.
+ *   2. `prRoborevStatusTool` documents an invariant that it and `merge_pr` "can never disagree about
+ *      what clean means". Applying this on one path and not the other breaks exactly that.
+ *
+ * So it lands together or not at all: the Rust gate, both TypeScript ops, a shared ordering for the
+ * read cap, and a classifier arm for the drain refusal. Tracked as its own bead; the unit tests
+ * below already pin the predicate's contract so that work starts from a settled definition.
+ *
+ * IT IS A SAFETY GATE, SO IT FAILS CLOSED IN EVERY DIRECTION. `true` is reachable only by PROOF,
+ * and it requires BOTH halves: the finding parser must come back empty AND the body must match a
+ * recognised no-finding shape. The parser alone is not enough — it returns `[]` for any prose
+ * without finding fields, including "permission denied" and a truncated review, which are reviews
+ * we could not read rather than reviews that found nothing. A `null` body is likewise "we could not
+ * read it", never "it was clean" — the same distinction the reporting path draws with
+ * `findings: null`.
+ */
+export function bodyCarriesNoFinding(body: string | null | undefined): boolean {
+  // NULLISH, not just null. `fetchRoborevReview` is typed `string | null`, but it exists precisely
+  // because a Tauri invoke can hand back a non-string — it narrows with
+  // `typeof body === "string" ? body : null`. Anything upstream of that narrowing (a stub, a future
+  // caller, a renamed command) can produce `undefined`, and a predicate that THROWS on it would
+  // take down the merge path from inside a safety check. Absent is "we could not read it", which is
+  // the blocking answer, so it is handled rather than trusted away.
+  if (body === null || body === undefined) return false;
+  const text = body.trim();
+  if (text.length === 0) return false;
+  // A parsed finding is a finding, whatever else the body also says. Checked FIRST so a body
+  // carrying both a real finding and the sentinel stays blocking regardless of their order.
+  if (parseRoborevFindings(body).length > 0) return false;
+  return (
+    THRESHOLD_MET_LINE.test(body) ||
+    NO_ISSUES_OPENING.test(text) ||
+    SESSION_STATUS_OPENING.test(text)
+  );
+}
+
 export function parseRoborevFindings(markdown: string): RoborevFinding[] {
   if (!markdown || markdown.trim().length === 0) return [];
 

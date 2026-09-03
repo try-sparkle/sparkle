@@ -17,6 +17,7 @@ vi.mock("@tauri-apps/api/core", () => ({
 import {
   fetchRoborevProbe,
   fetchRoborevReview,
+  bodyCarriesNoFinding,
   summarizeRoborev,
   roborevMergeGate,
   parseRoborevFindings,
@@ -405,6 +406,81 @@ describe("parseRoborevFindings", () => {
 
   it("a clean review is [] — 'No issues found.' is not a finding", () => {
     expect(parseRoborevFindings("No issues found.\n\nSummary: all good.")).toEqual([]);
+  });
+
+  /* bodyCarriesNoFinding — the predicate that stops a FAIL verdict with NOTHING IN IT blocking a
+   *  merge. The verdict is derived inside a prebuilt binary we cannot patch, and it is
+   *  INTERMITTENTLY wrong: measured in the live review store, 1,649 bodies carry
+   *  SEVERITY_THRESHOLD_MET and 74 of those were recorded F, with 11 open and blocking at the time
+   *  of writing. So the repo-side fix is to stop treating a bare verdict === "F" as blocking
+   *  without reading what the review actually says.
+   *
+   *  IT IS A SAFETY GATE, so every arm below fails CLOSED: the only way to reach `true` is to
+   *  PROVE the body carries no finding. Unreadable, empty, unrecognised — all keep blocking. */
+  describe("bodyCarriesNoFinding", () => {
+    it("the measured empty-merge body is provably no-finding", () => {
+      // 788 occurrences all-time, 54 since 2026-08-01 — the single most common wasted review.
+      expect(
+        bodyCarriesNoFinding(
+          "The diff is empty — this is a merge commit with no changes to review.\n\nSEVERITY_THRESHOLD_MET",
+        ),
+      ).toBe(true);
+    });
+
+    it("the threshold sentinel and a clean review are both no-finding", () => {
+      expect(bodyCarriesNoFinding("SEVERITY_THRESHOLD_MET")).toBe(true);
+      expect(bodyCarriesNoFinding("No issues found.\n\nSummary: all good.")).toBe(true);
+    });
+
+    it("an agent SESSION-STATUS body is no-finding — the job ran the wrong prompt", () => {
+      // Verbatim shapes from the store: the review job executed a resume/status prompt and the
+      // session's own status report was stored as the review body.
+      expect(
+        bodyCarriesNoFinding(
+          "Working: **yes** — branch sparkle/agent-9261ee4d; task = roborev code review of commit de93136",
+        ),
+      ).toBe(true);
+      expect(bodyCarriesNoFinding("NOTHING TO COMMIT")).toBe(true);
+      expect(
+        bodyCarriesNoFinding(
+          "Review-only session (roborev invoked me to review 2027d5c); I didn't commit, push or open a PR.",
+        ),
+      ).toBe(true);
+    });
+
+    /* THE PAIRED HALF, and the one that matters. Every case above makes the gate MORE permissive,
+     *  so on its own it is satisfied by a predicate that returns true unconditionally. These pin
+     *  that a real finding still blocks. */
+    it("a real finding still blocks, even beside the sentinel", () => {
+      const real =
+        "## Review Findings\n\n- **Severity**: High\n- **Location**: `src/a.ts:10`\n- **Problem**: leaks a credential\n";
+      expect(bodyCarriesNoFinding(real)).toBe(false);
+      // A body carrying BOTH a real finding and the sentinel is a finding. Order must not matter.
+      expect(bodyCarriesNoFinding(`${real}\nSEVERITY_THRESHOLD_MET`)).toBe(false);
+      expect(bodyCarriesNoFinding(`SEVERITY_THRESHOLD_MET\n\n${real}`)).toBe(false);
+    });
+
+    it("unreadable, empty and unrecognised bodies all keep blocking", () => {
+      // null is "we could not read the review", which is a DIFFERENT fact from a clean review —
+      // the same distinction the reporting path already draws with `findings: null`.
+      expect(bodyCarriesNoFinding(null)).toBe(false);
+      // undefined too, and not merely for tidiness: `fetchRoborevReview` exists because a Tauri
+      // invoke can return a non-string, and a predicate that THREW here would crash the merge path
+      // from inside a safety check. Caught by six existing merge tests when it did exactly that.
+      expect(bodyCarriesNoFinding(undefined)).toBe(false);
+      expect(bodyCarriesNoFinding("")).toBe(false);
+      expect(bodyCarriesNoFinding("   \n  \n")).toBe(false);
+      // Prose with no finding fields AND no recognised sentinel is not proof of anything. The
+      // parser alone would return [] here, which is exactly why the sentinel is also required.
+      expect(bodyCarriesNoFinding("the reviewer could not reach the model")).toBe(false);
+      expect(bodyCarriesNoFinding("Permission denied reading the diff.")).toBe(false);
+    });
+
+    it("the sentinel must stand alone on its line, not appear inside prose about it", () => {
+      expect(
+        bodyCarriesNoFinding("This review does not emit SEVERITY_THRESHOLD_MET because it found a bug"),
+      ).toBe(false);
+    });
   });
 
   it("empty or whitespace-only input is []", () => {
