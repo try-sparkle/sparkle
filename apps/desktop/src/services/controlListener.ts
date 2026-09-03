@@ -34,6 +34,7 @@ import {
   namesInboxDepth,
 } from "@sparkle/core";
 import { safeUnlisten } from "./safeUnlisten";
+import { safeTruncate, stripLoneSurrogates } from "./safeText";
 import { peakSummary, type PeakSummary } from "./peakConcurrency";
 import { startControlBridge, controlRespond } from "./orchestrationLaunch";
 import { useProjectStore } from "../stores/projectStore";
@@ -1115,8 +1116,15 @@ function isOrchestratorWorkerResume(req: ControlRequest): boolean {
  *  an ellipsis so a reader can tell a capped string from a short one and go ask `get_agent_status`. */
 const ROSTER_TEXT_CAP = 120;
 
-function capForRoster(text: string): string {
-  return text.length <= ROSTER_TEXT_CAP ? text : `${text.slice(0, ROSTER_TEXT_CAP - 1)}…`;
+export function capForRoster(text: string): string {
+  // Goal prose is author-supplied and this string crosses the Tauri IPC boundary via
+  // `control_respond` (see `respond`), whose args serde_json parses whole. A plain `.slice()` can cut
+  // BETWEEN a UTF-16 surrogate pair (an emoji, CJK-ext) and leave a lone surrogate, which serde_json
+  // rejects with "unexpected end of hex escape" — dropping the ENTIRE reply, silently. So truncate on
+  // a character boundary and repair any surrogate that arrived malformed in the source. For
+  // well-formed BMP text this is byte-identical to the old plain slice. See services/safeText.ts.
+  if (text.length <= ROSTER_TEXT_CAP) return stripLoneSurrogates(text);
+  return `${safeTruncate(text, ROSTER_TEXT_CAP - 1)}…`;
 }
 
 /**
