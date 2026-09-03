@@ -35,9 +35,11 @@ let projects: Array<{
 // the module boundary so a test can assert the WRITE happened — the read side of that marker lives
 // in `epicSweepRunner`, and asserting only there would leave the production write untested.
 const labelBeadMock = vi.fn(async () => {});
+const commentBeadMock = vi.fn(async () => {});
 vi.mock("./beads", async (orig) => ({
   ...(await orig<typeof import("./beads")>()),
   labelBead: (...a: unknown[]) => labelBeadMock(...(a as [])),
+  commentBead: (...a: unknown[]) => commentBeadMock(...(a as [])),
 }));
 
 vi.mock("../stores/projectStore", () => ({
@@ -184,6 +186,7 @@ describe("sendToBuild", () => {
     appendPromptMock.mockReturnValue("prompt-id");
     projects = [];
     labelBeadMock.mockClear();
+    commentBeadMock.mockClear();
     recordHistoryMock.mockClear();
   });
 
@@ -202,16 +205,93 @@ describe("sendToBuild", () => {
     expect(labelBeadMock).toHaveBeenCalledWith("/repo", "add", "epic-42", "promoted-to-build");
   });
 
-  it("does NOT stamp it for a single-task handoff", () => {
+  it("does NOT stamp the SWEEP marker for a single-task handoff", () => {
     // The paired negative, and it is a policy decision rather than an accident: "task" hands over
     // ONE bead to build on one worker, not a plan to be driven to completion. Stamping it would aim
-    // the sweep at ordinary tasks.
+    // the sweep — and its automatic restarts — at ordinary tasks.
+    //
+    // NARROWED from "labelBead was never called" (bead `sparkle-n2feho.8`). Task mode now writes its
+    // OWN durable marker, so the old blanket assertion would forbid the fix while claiming to pin
+    // this policy. What the policy actually says is that the SWEEP's label must not appear here, and
+    // that is what is asserted; the case below asserts the other half.
     projects = [{ id: "proj1", rootPath: "/repo", agents: [] }];
     addAgentMock.mockReturnValue("build-new");
 
     sendToBuild({ projectId: "proj1", epicId: "task-9", prdPath: null, mode: "task" });
 
-    expect(labelBeadMock).not.toHaveBeenCalled();
+    const labels = labelBeadMock.mock.calls.map((c) => (c as unknown as string[])[3]);
+    expect(labels).not.toContain("promoted-to-build");
+  });
+
+  // ── THE BINDING MUST SURVIVE A FLEET REFRESH (bead `sparkle-n2feho.8`) ─────────────────────────
+  //
+  // `sparkle-n2feho.1`'s acceptance names this outright. The binding is `AgentTab.epicId`, which
+  // lives in a per-window Zustand store persisted only to localStorage — nothing in `bd`, nothing on
+  // disk, nothing in Rust. An EPIC handoff leaves two durable traces behind it (the auto-bead's
+  // parent edge, and `promoted-to-build`), so it partly survives. A TASK handoff bound the
+  // human-filed bead directly and minted no auto-bead, so it left NOTHING: destroy the agent row and
+  // no reader could tell the task had ever been staffed.
+  //
+  // These assert on the DURABLE WRITE, not on the roster, because the roster is precisely the thing
+  // that does not survive. A test that read the binding back out of `projectStore` would pass
+  // whether or not anything durable was written.
+  it("stamps its OWN durable marker on a task handoff, so the binding outlives the roster row", () => {
+    projects = [{ id: "proj1", rootPath: "/repo", agents: [] }];
+    addAgentMock.mockReturnValue("build-new");
+
+    sendToBuild({ projectId: "proj1", epicId: "task-9", prdPath: null, mode: "task" });
+
+    expect(labelBeadMock).toHaveBeenCalledWith("/repo", "add", "task-9", "handed-to-build");
+  });
+
+  it("records WHICH orchestrator took it, because the label alone is one bit", () => {
+    // The binding is a PAIR — (agent, project) — and a bare "this was handed to Build" cannot
+    // reconstruct it. Caught by review (roborev 80525) against the first version of this fix, whose
+    // marker was write-only AND identity-free, so nothing could ever restore a binding from it.
+    //
+    // A COMMENT rather than a body edit: AGENTS.md is explicit that a bead's body is the original
+    // record and is not edited, and that comments are the shape that survives a shared
+    // single-writer store with many concurrent writers.
+    projects = [{ id: "proj1", rootPath: "/repo", agents: [] }];
+    addAgentMock.mockReturnValue("build-new");
+
+    sendToBuild({ projectId: "proj1", epicId: "task-9", prdPath: null, mode: "task" });
+
+    expect(commentBeadMock).toHaveBeenCalledTimes(1);
+    const [root, bead, text] = commentBeadMock.mock.calls[0] as unknown as string[];
+    expect(root).toBe("/repo");
+    expect(bead).toBe("task-9");
+    // BOTH halves of the pair, asserted by value — a comment naming only the agent would leave the
+    // project unrecoverable, and one naming neither would be the defect this replaces.
+    expect(text).toContain("build-new");
+    expect(text).toContain("proj1");
+  });
+
+  it("records no such identity for an EPIC handoff — that path already has durable traces", () => {
+    // The paired negative. An epic handoff mints an auto-bead parented to the epic AND takes
+    // `promoted-to-build`, so it is already recoverable; adding a third record there would be noise
+    // on every epic in the store.
+    projects = [{ id: "proj1", rootPath: "/repo", agents: [] }];
+    addAgentMock.mockReturnValue("build-new");
+
+    sendToBuild({ projectId: "proj1", epicId: "epic-42", prdPath: null, mode: "epic" });
+
+    expect(commentBeadMock).not.toHaveBeenCalled();
+  });
+
+  it("does NOT stamp that marker on a bead nobody handed to Build", () => {
+    // The paired negative that makes the case above non-vacuous: an implementation that stamped
+    // every bead it saw would satisfy the positive while destroying the marker's meaning. An
+    // EPIC-mode handoff is the nearest neighbour — it is a real handoff of a real bead, and it must
+    // still take the sweep's label and NOT this one.
+    projects = [{ id: "proj1", rootPath: "/repo", agents: [] }];
+    addAgentMock.mockReturnValue("build-new");
+
+    sendToBuild({ projectId: "proj1", epicId: "epic-42", prdPath: null, mode: "epic" });
+
+    const labels = labelBeadMock.mock.calls.map((c) => (c as unknown as string[])[3]);
+    expect(labels).toContain("promoted-to-build");
+    expect(labels).not.toContain("handed-to-build");
   });
 
   it("creates a build agent when the project has none, opens it, and seeds the prompt", () => {
@@ -1013,6 +1093,7 @@ describe("sendToBuild — the founder's caret is in a terminal", () => {
     appendPromptMock.mockReset();
     appendPromptMock.mockReturnValue("prompt-id");
     labelBeadMock.mockClear();
+    commentBeadMock.mockClear();
     document.body.innerHTML = "";
   });
 
@@ -1117,6 +1198,7 @@ describe("sendToBuild — the seed is DELIVERABLE as the launch's positional pro
     paneStateValue = "starting";
     projects = [];
     labelBeadMock.mockClear();
+    commentBeadMock.mockClear();
     // Module-level state in the REAL agentBrief — without this a held brief leaks into the next case
     // and a later assertion passes on the previous test's attachment.
     resetAgentBriefs();
@@ -1283,6 +1365,7 @@ describe("sendToBuild — epic goal laddering", () => {
     setAgentGoalMock.mockReset();
     markAgentGoalFromEpicMock.mockReset();
     labelBeadMock.mockClear();
+    commentBeadMock.mockClear();
     capacityMock.mockReturnValue({ atCapacity: false, used: 1, limit: 8, live: 1, basis: "test" });
     useBeadsStore.setState({ byProject: {} });
     projects = [];

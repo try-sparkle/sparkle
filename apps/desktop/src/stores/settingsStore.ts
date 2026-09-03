@@ -788,6 +788,16 @@ interface SettingsState {
    *  spawned. Mirrors [drainer].enabled. Config-backed, NOT persisted — re-read from the file each
    *  launch (so it is absent from `partialize`, exactly like `roborevEnabled`). */
   drainerEnabled: boolean;
+  /** ARMING for the backlog autoscaler's Phase 2 — the pass that actually SPAWNS agents against the
+   *  ready backlog. Mirrors `[autoscaler].armed`. Config-backed, NOT persisted.
+   *
+   *  DEFAULTS OFF, and that is not timidity — it is AGENTS.md's rule that DEPLOYING A HOOK IS
+   *  RUNNING IT. This flag gates a loop that already ticks every 60s in every mounted window, so
+   *  merging the wiring is the deployment; a feature once shipped on the plan that its first run
+   *  would be by hand with the fleet idle and a sibling worktree ran it immediately, making 236
+   *  state-changing writes. Unarmed, the sweep behaves EXACTLY as Phase 1 did: compute, log, spawn
+   *  nothing. A human arms it once, deliberately. */
+  autoscalerArmed: boolean;
   /** Builder Index (tokenmaxxing leaderboard) reporting. Mirrors [tools].builder_index — the ONE
    *  tool that defaults OFF, because it's the only one that publishes anything about you. Even
    *  when on, the Rust reporter posts nothing until consent + a username + an API key are stored
@@ -875,6 +885,7 @@ interface SettingsState {
   /** Toggle the backlog drainer. Optimistic store set; the config write + launchd install/uninstall
    *  side effect live in `configActions.setDrainerEnabled`. */
   setDrainerEnabled: (on: boolean) => void;
+  setAutoscalerArmed: (on: boolean) => void;
   /** Toggle auto-apply of desktop updates (the "Automatically apply updates" checkbox). */
   setAutoApplyUpdates: (on: boolean) => void;
   /** Toggle deleting a shipped agent's merged branch on close (optimistic; configActions persists). */
@@ -1035,6 +1046,9 @@ export const useSettingsStore = create<SettingsState>()(
       // Ships ON — the founder's directive (zero human steps, on by default); the shell engine's
       // worker cap + rest floor bound the worst case and `enabled=false` is the rebuild-free switch.
       drainerEnabled: true,
+      // OFF until a human says otherwise — see the field docs. Fail-closed: an absent or malformed
+      // config key leaves this false rather than arming a spawner by accident.
+      autoscalerArmed: false,
       // Default OFF — nothing is published until the user opts in AND consents.
       builderIndexEnabled: false,
       straudeEnabled: false,
@@ -1056,6 +1070,7 @@ export const useSettingsStore = create<SettingsState>()(
       setKeychainChiefPat: (pat) => set({ keychainChiefPat: pat.trim() }),
       setCloudDictation: (on) => set({ cloudDictation: on }),
       setDrainerEnabled: (on) => set({ drainerEnabled: on }),
+      setAutoscalerArmed: (on) => set({ autoscalerArmed: on }),
       setAutoApplyUpdates: (on) => set({ autoApplyUpdates: on }),
       setWindowSpanMode: (mode) => set({ windowSpanMode: mode }),
       setWindowAutoRespan: (on) => set({ windowAutoRespan: on }),
@@ -1380,6 +1395,9 @@ export const useSettingsStore = create<SettingsState>()(
           roborevEnabled: config.tools?.roborev ?? true,
           // `?? true` like its on-by-default siblings: an absent [drainer] (older backend) keeps ON.
           drainerEnabled: config.drainer?.enabled ?? true,
+          // `?? false` — the fail-closed default. Every other reading of a missing key in this
+          // block picks the shipped behaviour; here the shipped behaviour IS off.
+          autoscalerArmed: config.autoscaler?.armed ?? false,
           // `?? false` here, unlike its on-by-default siblings: an absent [tools] block (older
           // backend) must read as "not opted in", never as "publishing".
           builderIndexEnabled: config.tools?.builder_index ?? false,

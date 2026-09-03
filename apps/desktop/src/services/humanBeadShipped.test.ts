@@ -28,6 +28,13 @@ vi.mock("./beads", () => ({
   deleteBead: vi.fn(),
   labelBead: vi.fn(() => Promise.resolve()),
   PROMOTED_LABEL: "promoted-to-build",
+  // The TASK-mode durable trace (bead `sparkle-n2feho.8`), which THIS FILE'S cases do exercise —
+  // unlike `PROMOTED_LABEL` above, which is here only so an epic-mode case added later does not
+  // trip over a missing export. A `vi.mock` factory REPLACES the module wholesale, so any export
+  // `sendToBuild` reaches for and this object omits throws at call time rather than at import,
+  // which is why the omission surfaced as one red test in CI shard 2 and not as a type error.
+  commentBead: vi.fn(() => Promise.resolve()),
+  HANDED_TO_BUILD_LABEL: "handed-to-build",
 }));
 vi.mock("./worktree", () => ({ removeAgentWorkspace: vi.fn() }));
 

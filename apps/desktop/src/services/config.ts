@@ -212,6 +212,17 @@ export interface ImprovementConfig {
 export interface DrainerConfig {
   enabled: boolean;
 }
+/** ARMING for the backlog autoscaler's spawning pass (`[autoscaler]`). Machine-wide, like
+ *  `[drainer]`; ignored in a per-project file, because a cloned repo must not be able to arm a
+ *  spawner on someone else's machine.
+ *
+ *  SHIPS `armed: false`, and absent means false. This gates the loop that issues real agent spawns
+ *  against the ready backlog: merging its wiring IS deploying it (AGENTS.md), so the arming is a
+ *  deliberate one-time human act rather than a default. Config-backed and NOT persisted to
+ *  localStorage — re-read from the file each launch (see `settingsStore.ts` `autoscalerArmed`). */
+export interface AutoscalerConfig {
+  armed: boolean;
+}
 /** 1Password env-backup state (chosen vault + worktree seeding). Machine-wide; ignored in a
  *  per-project file — and here that's a security boundary, not just tidiness: a project-level
  *  value would let one repo redirect where another repo's secrets are written. */
@@ -372,6 +383,7 @@ export interface SparkleConfig {
    *  above: a payload from a Rust backend predating [drainer] omits it, so callers read
    *  `config.drainer?.enabled ?? true` — an absent section keeps the ON default, never "off". */
   drainer?: DrainerConfig;
+  autoscaler?: AutoscalerConfig;
   /** Optional for the same back-compat reason as `tools?`/`roborev?` above: a payload from a Rust
    *  backend predating [onepassword] omits it. Callers must guard and fall back to the off/unset
    *  defaults — never read an absent section as "enabled". */

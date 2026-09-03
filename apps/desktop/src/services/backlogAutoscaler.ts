@@ -47,6 +47,12 @@ import { selectNextReadyBead, type NextReadyBead } from "./improveNudge";
 import { useBeadsStore } from "../stores/beadsStore";
 import { SPARKLE_PROJECT_ID } from "./sparkleAgent";
 import { ownsProjectInThisWindow } from "./goalContinuationRunner";
+// PHASE 2 IMPORTS A WRITER, AND THAT IS THE REVIEWABLE ACT. Phase 1's ratchet asserted this module
+// imported nothing that could write, precisely so adding one could not be quiet. It is replaced by
+// a behavioural ratchet: DISARMED, the sweep must still call no spawn at all.
+import { spawnBuildAgentInProject } from "./buildAgentSpawn";
+import { useProjectStore } from "../stores/projectStore";
+import { useSettingsStore } from "../stores/settingsStore";
 import { log } from "../logger";
 
 /**
@@ -245,20 +251,90 @@ export function shouldReportAutoscale(
   return now - prev.at >= AUTOSCALE_REPORT_HEARTBEAT_MS;
 }
 
+/**
+ * What one spawn attempt actually did.
+ *
+ * `"refused"` means PROVABLY nothing was created — the callee turned the request down before doing
+ * anything. It is not an error condition and it must not blacklist the bead, or the likeliest
+ * production first tick (a background spawn into a project nobody has opened this session) burns the
+ * top bead and leaves the whole feature inert behind one warn line.
+ */
+export type SpawnOutcome = "spawned" | "refused";
+
 export interface BacklogAutoscalerDeps {
   /** Single-owner election — only one window reports, or N windows log N copies of one fact. */
   ownsProject: () => boolean;
   readBoard: () => { boardReadable: boolean; readyBacklog: readonly Bead[] };
   readCapacity: () => CapacityReading;
-  /** WHERE THE DECISION GOES. The only side effect this module has, and it is a log line. */
+  /** WHERE THE DECISION GOES. A log line, and — when ARMED — the spawns below. */
   report: (decision: AutoscaleDecision) => void;
   now: () => number;
+  /**
+   * IS THE SPAWNING PASS ARMED? Fail-closed: anything other than a definite `true` means NO SPAWN.
+   *
+   * AGENTS.md: DEPLOYING A HOOK IS RUNNING IT. This module already ticks every 60s in every mounted
+   * window, so merging Phase 2's wiring IS its deployment — there is no dormant state to land in. A
+   * feature once shipped on the stated plan that its first run would be by hand with the fleet idle,
+   * and a sibling worktree ran it immediately: ~30 minutes, 236 state-changing writes, silent. The
+   * writes here are heavier still — they are AGENTS, not rows.
+   *
+   * So the gate lives HERE, in the callee, rather than at the mount in `App.tsx`: the mount is the
+   * thing whose commit deploys it, and a gate at the call site is a gate the deployment skips.
+   */
+  isArmed: () => boolean;
+  /**
+   * START ONE AGENT on `bead`. Called at most `decision.target` times per pass, and ONLY when armed.
+   *
+   * Injected rather than imported so this module still imports nothing that can write — the Phase-1
+   * ratchet asserted exactly that and the replacement asserts it still holds while DISARMED.
+   *
+   * RETURNS AN OUTCOME, and the distinction is load-bearing rather than decorative.
+   * `spawnBuildAgentInProject` has four documented refusals — no Sparkle project row, at capacity, a
+   * torn-out project, and a project the human has not opened this session — and its own contract for
+   * those paths is explicit: IN EVERY CASE NO AGENT EXISTS. A `=> void` seam discarded that fact, so
+   * a bead was permanently blacklisted for a spawn that provably never happened. A `null` return is
+   * PROOF OF NON-CREATION; a THROW is ambiguous, because the call does real work before it can fail.
+   * Only the first is retried.
+   */
+  spawn: (bead: NextReadyBead) => SpawnOutcome;
+  /**
+   * RECORD THE INTENT BEFORE THE ATTEMPT. Called immediately before each `spawn`, never after.
+   *
+   * The 236-write incident was recoverable ONLY because every write had been journalled first. That
+   * property is the one worth copying, and it is worth more than the ordering costs: a journal
+   * entry with no spawn behind it is a readable over-count, while a spawn with no journal entry is
+   * an agent nobody can account for.
+   */
+  journal: (bead: NextReadyBead, index: number, of: number) => void;
 }
 
 /** The last decision computed in this window, for a surface that wants to render it. Read-only
  *  bookkeeping; nothing acts on it. `null` before the first pass, or in a non-owning window. */
 let lastDecision: AutoscaleDecision | null = null;
 let lastReport: { fingerprint: string; at: number } | null = null;
+
+/**
+ * BEADS THIS WINDOW HAS ALREADY STARTED AN AGENT ON, and why a per-pass cap was not enough.
+ *
+ * `PHASE2_MAX_SPAWNS_PER_PASS = 1` bounds ONE tick. It does nothing across ticks, and across ticks
+ * is where the duplication actually happens: nothing in this path marks the bead `in_progress` or
+ * writes a claim — `spawnBuildAgentInProject` mints its own `sparkle-auto` telemetry bead and never
+ * touches the target — so the bead is still `open` and unblocked on the next 60s tick, and
+ * `selectNextReadyBead` is deterministic. It therefore returns THE SAME BEAD, and an armed loop with
+ * free slots starts an agent on it every minute until something else moves it. Caught by review
+ * (roborev 80524) against tests that hid it by reassigning the board between ticks — the one shape
+ * the steady state never takes.
+ *
+ * PROCESS-LOCAL, AND THAT IS A KNOWN LIMIT RATHER THAN THE FIX. A second window runs its own module
+ * instance and its own 60s tick, so this cannot stop two windows double-booking one bead; only a
+ * DURABLE claim-at-spawn can, and that is Phase 3. It is still strictly better than nothing: the
+ * single-window case is the one the 60s cadence makes CERTAIN rather than merely possible.
+ *
+ * Never pruned. An armed session's spawn count is bounded by the ready backlog, and a bead that
+ * leaves the ready column never comes back to it — so this grows with work actually started, not
+ * with time.
+ */
+const spawnedBeads = new Set<string>();
 
 export function lastAutoscaleDecision(): AutoscaleDecision | null {
   return lastDecision;
@@ -269,6 +345,7 @@ export function lastAutoscaleDecision(): AutoscaleDecision | null {
 export function _resetBacklogAutoscalerForTests(): void {
   lastDecision = null;
   lastReport = null;
+  spawnedBeads.clear();
 }
 
 /**
@@ -288,6 +365,86 @@ export function sweepBacklogAutoscaler(deps: BacklogAutoscalerDeps): AutoscaleDe
   if (shouldReportAutoscale(lastReport, decision, now)) {
     deps.report(decision);
     lastReport = { fingerprint: autoscaleFingerprint(decision), at: now };
+  }
+
+  // ── PHASE 2: THE PASS ACTUALLY TAKES THE WORK, AND ONLY WHEN ARMED ───────────────────────────
+  //
+  // Everything above this line is Phase 1 and is unchanged, which is the contract: DISARMED, this
+  // function computes and logs and does nothing else, exactly as it did before Phase 2 existed.
+  //
+  // THE ORDER OF THESE GUARDS IS THE SAFETY ARGUMENT, so read them as one:
+  //   * `isArmed()` first, because a human's arming decision outranks every computed number, and
+  //     because it is the one guard whose absence is catastrophic rather than merely wrong.
+  //   * `target === null` next, and NOT folded into the `> 0` test. `null` is "the board could not
+  //     be read", which is a DIFFERENT FACT from "there is no work" — conflating them is the P0
+  //     this decision type was shaped to prevent, and a spawn issued on a board nobody could read
+  //     is a spawn against an unknown backlog.
+  //   * `nextBead` last: without a bead there is nothing to hand a spawn, and inventing one here
+  //     would be a second selector.
+  if (!deps.isArmed()) return decision;
+  if (decision.target === null || decision.target <= 0) return decision;
+  if (decision.nextBead === null) return decision;
+
+  // WHICH OF THESE THREE ACTUALLY STOPS A SPAWN — stated plainly, because guessing wrong about that
+  // is how a guard gets deleted as dead code later.
+  //
+  // ONLY `isArmed()` is independently load-bearing: mutating it away makes the disarmed cases spawn,
+  // and the tests catch it. The other two are DEFENCE IN DEPTH and mutation testing correctly fails
+  // to kill either, because the loop below is bounded by `Math.min(decision.target, …)` — an
+  // unreadable board (`target: null`) and a full machine (`target: 0`) both yield a zero-length
+  // loop on their own. `nextBead === null` is likewise covered, since the same unreadable board
+  // produces it.
+  //
+  // They stay anyway, and the reason is specific rather than superstitious: each states an intent
+  // the arithmetic only happens to satisfy right now. If `target` ever became non-null on an
+  // unreadable board, or the loop bound moved off `target`, the silent failure would be a spawn
+  // against an unknown backlog — the one outcome this pass must never produce. Cheap insurance
+  // against a future edit, and labelled so nobody mistakes it for the thing doing the work.
+
+  // ONE SPAWN PER PASS, journalled before each attempt, and the cap is deliberate.
+  //
+  // `target` is already `min(freeSlots, readyCount)`, so it never exceeds capacity — but
+  // `decideAutoscale` selects ONE next bead, and spawning `target` agents would hand that SAME bead
+  // to all of them. De-duplicating properly needs a DURABLE claim-at-spawn, which is PHASE 3 and
+  // explicitly not this bead: `orchestrationListener`'s existing `claimedBeads` set is
+  // process-local, so it cannot stop a second window double-booking the same work.
+  //
+  // So the honest bound until Phase 3 lands is one, and it is expressed as a `min` against `target`
+  // rather than a bare `1` — the cap is the thing that changes when Phase 3 arrives, and a reader
+  // should see which number is the policy and which is the arithmetic.
+  // SUPPRESS AT SELECTION, NOT AT THE GATE — and that distinction is the whole of this block.
+  //
+  // The first version tested `spawnedBeads.has(decision.nextBead.id)` and returned. That is a
+  // HEAD-OF-LINE BLOCK, not a de-duplication: `selectNextReadyBead` always returns the TOP of the
+  // ready column, and nothing here moves a bead out of it (`columnFor` keeps every open, unblocked
+  // bead, and `spawnBuildAgentInProject` never touches the target's status). So after one spawn every
+  // later tick re-selected the same bead, hit the guard and returned — one agent for the life of the
+  // window, then permanent idleness, against a machine with seven free slots and fifty ready beads.
+  // The exact opposite of what this loop exists for, and my own test pinned the stall as if it were
+  // the intent (roborev 80561).
+  //
+  // Selecting from the ready column MINUS what this window has already started fixes it while
+  // keeping the de-duplication: the same bead is never picked twice, and the NEXT one is.
+  const candidate = selectNextReadyBead(
+    board.readyBacklog.filter((b) => !spawnedBeads.has(b.id)),
+  );
+  // Every ready bead already has an agent from this window. Nothing to do — which is a real
+  // steady state, not an error.
+  if (candidate === null) return decision;
+
+  const toStart = Math.min(decision.target, PHASE2_MAX_SPAWNS_PER_PASS);
+  for (let i = 0; i < toStart; i += 1) {
+    // Recorded BEFORE the attempt: `spawnBuildAgentInProject` does real work before it can throw, so
+    // a throw does NOT prove nothing was created, and re-selecting the bead would double-book it.
+    // Over-suppressing costs one bead a human can re-queue; under-suppressing costs a rival worktree
+    // on the same work.
+    spawnedBeads.add(candidate.id);
+    deps.journal(candidate, i, toStart);
+    // ...but a REFUSAL is different in kind, and undoing the record is what keeps the loop alive. The
+    // callee's four refusal paths each guarantee no agent exists, so blacklisting the bead there
+    // would retire real work on the strength of a transient condition — at capacity now, or a
+    // project the human has not opened YET. Both clear on their own.
+    if (deps.spawn(candidate) === "refused") spawnedBeads.delete(candidate.id);
   }
   return decision;
 }
@@ -329,10 +486,71 @@ const PRODUCTION_DEPS: BacklogAutoscalerDeps = {
       dryRun: true,
     }),
   now: () => Date.now(),
+  // FAIL-CLOSED BY CONSTRUCTION: the store ships `autoscalerArmed: false` and the config reader
+  // defaults a missing `[autoscaler].armed` to false, so every way of NOT deciding lands on "do not
+  // spawn". `=== true` rather than a truthiness test, so an undefined slice (a store shape older
+  // than this field, which a persisted rehydration can produce) cannot arm it.
+  isArmed: () => useSettingsStore.getState().autoscalerArmed === true,
+  // JOURNAL BEFORE THE ATTEMPT — never after. The 236-write incident was recoverable only because
+  // every write had been journalled first, and this is the cheap half of that lesson.
+  journal: (bead, index, of) =>
+    log.info("backlog-autoscaler", `ARMED: about to spawn ${index + 1}/${of} on ${bead.id}`, {
+      bead: bead.id,
+      title: bead.title,
+      priority: bead.priority,
+      index,
+      of,
+    }),
+  spawn: (bead) => {
+    // The Sparkle repo's own project row. `drainerBridge` records that the sparkle-self clone is not
+    // a projectStore Project, and `pusherMount` looks this up defensively for the same reason — so
+    // ABSENCE IS A ROUTINE CASE, not an invariant violation, and it must refuse rather than throw.
+    const project = useProjectStore.getState().projects.find((p) => p.id === SPARKLE_PROJECT_ID);
+    if (project === undefined) {
+      log.warn("backlog-autoscaler", "ARMED but no Sparkle project row is loaded — not spawning", {
+        bead: bead.id,
+      });
+      return "refused";
+    }
+    // `background: true` is the machine-dispatch contract: it drops everything that would move the
+    // founder's attention (project selection, reveal, compose focus) while KEEPING the pane mount,
+    // because skipping that would make the spawn fictional — created and briefed on paper, never
+    // started, with every caller reporting success. It returns `null` on any of three documented
+    // refusals (capacity, a torn-out project, a project unvisited this session); a background caller
+    // must handle that like any other null, so this logs it rather than assuming a spawn happened.
+    const id = spawnBuildAgentInProject(project, {
+      background: true,
+      dispatchedBy: "machine",
+      name: bead.id,
+      prompt:
+        `You were started automatically by the backlog autoscaler to work bead ${bead.id}.\n\n` +
+        `Run \`bash scripts/bead-brief.sh ${bead.id}\` from the repo root for the full brief — its ` +
+        `description AND its comment thread, where the newest human note usually is.\n\n` +
+        `Follow AGENTS.md. Work on your own branch, commit every self-contained verified unit, and ` +
+        `update PRD/<branch>.md each commit.`,
+    });
+    if (id === null) {
+      log.warn("backlog-autoscaler", "spawn REFUSED — see buildAgentSpawn for which of the four", {
+        bead: bead.id,
+      });
+      return "refused";
+    }
+    log.info("backlog-autoscaler", "spawned", { bead: bead.id, agent: id });
+    return "spawned";
+  },
 };
 
 /** Matches the drain bridge's cadence — the same 60s tick the rest of the fleet plumbing runs on. */
 export const BACKLOG_AUTOSCALER_SWEEP_MS = 60_000;
+
+/**
+ * How many agents ONE armed pass may start. One, until Phase 3 makes the bead claim durable.
+ *
+ * Not a performance tuning knob: `decideAutoscale` names a single next bead, so anything above 1
+ * hands the same bead to every agent it starts. Raising this without a durable claim-at-spawn is
+ * how one unit of work becomes N worktrees on N branches doing identical work.
+ */
+export const PHASE2_MAX_SPAWNS_PER_PASS = 1;
 
 let timer: ReturnType<typeof setInterval> | null = null;
 

@@ -1711,6 +1711,34 @@ pub struct DrainerConfig {
     pub enabled: bool,
 }
 
+/// THE BACKLOG AUTOSCALER's arming switch (`[autoscaler]`) — the pass that SPAWNS agents against the
+/// ready backlog. Ships `armed = false`, and an absent section means false.
+///
+/// THE INVERSE OF `[drainer]`, DELIBERATELY. That switch ships ON and therefore guards the "off"
+/// spellings, because failing OPEN on a kill switch is the direction a user cannot recover from.
+/// This one ships OFF and guards the "on" spellings for the mirror-image reason: arming a loop that
+/// starts real agents on the founder's quota must be a thing a human did on purpose, so anything
+/// that is not an unambiguous true leaves it disarmed and says so.
+///
+/// AGENTS.md: DEPLOYING A HOOK IS RUNNING IT. `backlogAutoscaler` already ticks every 60s in every
+/// mounted window, so merging its spawn path IS the deployment — there is no dormant state to land
+/// in. A feature once shipped on the stated plan that its first run would be by hand with the fleet
+/// idle; a sibling worktree ran it immediately and made 236 state-changing writes.
+///
+/// MACHINE-WIDE, like `[drainer]`: whether this machine may start agents by itself is a property of
+/// the human sitting at it, not of a repo. An `[autoscaler]` in a per-project file is ignored — a
+/// cloned repo must never be able to arm a spawner on someone else's machine.
+///
+/// Config-backed and NOT persisted to localStorage (see `settingsStore.ts` `autoscalerArmed`), so it
+/// is re-read from the file each launch and cannot drift out of a stale browser store.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct AutoscalerConfig {
+    /// Arms the spawning pass. Ships FALSE. While false the loop computes and logs exactly as its
+    /// dry-run phase did, and starts nothing.
+    pub armed: bool,
+}
+
 /// Per-project STEERING FILES — the "where" and the "how" pushed into every agent at birth
 /// (`steering.rs`). Two documents, `architecture.md` and `standards.md` by default, resolved across
 /// a global / project / local stack, copied into each new worktree and injected at pre-flight as a
@@ -2445,6 +2473,8 @@ pub struct SparkleConfig {
     /// The in-app backlog drainer's kill switch. Machine-wide (see DrainerConfig). Placed at the end
     /// of the struct, well away from `improvement:`, so it does not textually collide with PR #2281.
     pub drainer: DrainerConfig,
+    /// The backlog autoscaler's arming switch. Machine-wide (see AutoscalerConfig).
+    pub autoscaler: AutoscalerConfig,
     /// The integration assistant's own switches (bead `.2`). Machine-wide, and OFF by
     /// default — see [`IntegrationAssistantConfig`].
     pub integration_assistant: IntegrationAssistantConfig,
@@ -2728,6 +2758,8 @@ impl Default for SparkleConfig {
             // false` (or SPARKLE_DRAINER_ENABLED=0) is the rebuild-free kill switch. Stated as a
             // literal so this line, the struct, and DEFAULT_TEMPLATE cannot drift apart.
             drainer: DrainerConfig { enabled: true },
+            // DISARMED on purpose — see AutoscalerConfig. Every way of not deciding lands here.
+            autoscaler: AutoscalerConfig { armed: false },
             // Ships OFF, unlike every neighbour here: this one merges pull requests. The remaining
             // values are the SAFE direction — roborev gates, and the only accepted strategy is the
             // merge commit that keeps `landed-by-ancestry` provable. Stated as literals so this
@@ -3052,6 +3084,17 @@ struct PartialDrainer {
     rest: std::collections::BTreeMap<String, toml::Value>,
 }
 
+/// `[autoscaler]` as read from TOML. `toml::Value` for the reason `PartialDrainer` records: a strong
+/// `Option<bool>` makes ONE hand-edit (`armed = "yes"`) fail the WHOLE global layer, which is then
+/// discarded — reverting every unrelated setting in the file. `#[serde(flatten)] rest` reports a
+/// misspelled key instead of swallowing it.
+#[derive(Debug, Default, Deserialize)]
+struct PartialAutoscaler {
+    armed: Option<toml::Value>,
+    #[serde(flatten)]
+    rest: std::collections::BTreeMap<String, toml::Value>,
+}
+
 /// `[integration_assistant]` as read from TOML. EVERY value is `toml::Value` for the reason
 /// `PartialDrainer` records: with a strong type, ONE hand-edit (`enabled = "yes"`,
 /// `merge_strategy = 3`) fails `toml::from_str` for the WHOLE global layer, which is then discarded
@@ -3313,6 +3356,7 @@ struct PartialConfig {
     steering: Option<PartialSteering>,
     fleet: Option<PartialFleet>,
     drainer: Option<PartialDrainer>,
+    autoscaler: Option<PartialAutoscaler>,
     integration_assistant: Option<PartialIntegrationAssistant>,
     cleared: Option<PartialCleared>,
 }
@@ -4460,6 +4504,60 @@ fn apply_improvement(into: &mut ImprovementConfig, p: Option<PartialImprovement>
     if let Some(v) = p.never_idle_armed {
         into.never_idle_armed = v;
     }
+}
+
+/// Overlay `[autoscaler]`. ARMS ONLY ON AN UNAMBIGUOUS TRUE.
+///
+/// The mirror image of `apply_drainer`, and the asymmetry is the whole point. That function ships ON
+/// and treats every plausible spelling of "off" as off, because failing OPEN on a kill switch is the
+/// direction a user cannot recover from by noticing later. This one ships OFF and treats everything
+/// that is not an unambiguous true as NOT ARMED, because failing open here means a loop starts real
+/// agents on the founder's quota that nobody asked for.
+///
+/// So a typo, a wrong type, a `armed = "maybe"` — all leave it disarmed, and all WARN, because the
+/// person who just hand-edited the TOML to turn this on is owed the news that it did not take.
+fn apply_autoscaler(into: &mut AutoscalerConfig, p: Option<PartialAutoscaler>) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let Some(p) = p else { return warnings };
+
+    if let Some(v) = p.armed {
+        let on = match &v {
+            toml::Value::Boolean(true) => true,
+            toml::Value::Integer(1) => true,
+            toml::Value::String(s) => {
+                matches!(s.trim().to_ascii_lowercase().as_str(), "true" | "on" | "yes" | "1")
+            }
+            _ => false,
+        };
+        if on {
+            into.armed = true;
+        } else {
+            // Anything that is neither an unambiguous TRUE nor a recognisable FALSE is a value the
+            // author meant something by and did not get. Say so — silence here reads as "it worked".
+            let recognised_false = match &v {
+                toml::Value::Boolean(false) => true,
+                toml::Value::Integer(0) => true,
+                toml::Value::String(s) => {
+                    matches!(s.trim().to_ascii_lowercase().as_str(), "false" | "off" | "no" | "0")
+                }
+                _ => false,
+            };
+            if !recognised_false {
+                warnings.push(format!(
+                    "[autoscaler].armed is a {}, not true or false, so it has no effect — the \
+                     backlog autoscaler is still DISARMED and will not start any agent. Use \
+                     `armed = true` to \
+                     arm it.",
+                    v.type_str()
+                ));
+            }
+        }
+    }
+
+    for k in p.rest.keys() {
+        warnings.push(format!("[autoscaler].{k} is not a setting and has no effect."));
+    }
+    warnings
 }
 
 fn apply_drainer(into: &mut DrainerConfig, p: Option<PartialDrainer>) -> Vec<String> {
@@ -6067,6 +6165,10 @@ fn build_effective_layered(
                 // autonomous drain loop may spend is a property of the human at the machine, not a
                 // repo, so it is overlaid only here and a [drainer] in a project file is ignored.
                 warnings.extend(apply_drainer(&mut cfg.drainer, p.drainer));
+                // Global-only for a sharper version of the drainer's reason: this section AUTHORIZES
+                // a loop to start agents by itself, so a cloned repo must never be able to arm it on
+                // someone else's machine. An `[autoscaler]` in a project layer is ignored.
+                warnings.extend(apply_autoscaler(&mut cfg.autoscaler, p.autoscaler));
                 // Global-only, and the strictest case of the rule: this section can authorize an
                 // automated `gh pr merge`, so a repo file must never be able to set it. An
                 // `[integration_assistant]` in a project layer is ignored (see below).
@@ -9631,6 +9733,66 @@ quit_app = 42
         // Ships LIVE, not commented out: this section is the only in-file place a human can turn the
         // loop off, so there must be something to edit.
         assert!(DEFAULT_TEMPLATE.contains("\n[drainer]\n"), "the block must ship uncommented");
+    }
+
+    #[test]
+    fn autoscaler_ships_disarmed_and_arms_only_on_an_unambiguous_true() {
+        // THE MIRROR IMAGE OF THE DRAINER TEST ABOVE, and the asymmetry is the point. That switch
+        // ships ON and must read every plausible "off"; this one ships OFF and must refuse every
+        // plausible-but-not-certain "on", because failing open here starts real agents on the
+        // founder's quota that nobody asked for.
+
+        // 1. ABSENT SECTION => DISARMED. The state the overwhelming majority of installs are in.
+        let (cfg, _w, hard) = build_effective(SparkleConfig::default(), Some(""), None);
+        assert!(!hard);
+        assert!(!cfg.autoscaler.armed, "an absent [autoscaler] must leave the loop disarmed");
+
+        // 2. THE ARMING PATH IS REACHABLE. Without this the whole feature is dead code — the exact
+        // defect roborev 80524 caught, where the TS read a config key Rust never produced.
+        for spelling in ["true", "\"true\"", "\"on\"", "\"yes\"", "1"] {
+            let toml = format!("[autoscaler]\narmed = {spelling}\n");
+            let (cfg, _w, hard) = build_effective(SparkleConfig::default(), Some(&toml), None);
+            assert!(!hard, "{spelling} must not be a hard error");
+            assert!(cfg.autoscaler.armed, "`armed = {spelling}` must arm the autoscaler");
+        }
+
+        // 3. EVERY OFF-SPELLING LEAVES IT DISARMED, silently — that is the shipped default, so there
+        //    is nothing to warn about.
+        for spelling in ["false", "\"false\"", "\"off\"", "\"no\"", "0"] {
+            let toml = format!("[autoscaler]\narmed = {spelling}\n");
+            let (cfg, warns, hard) = build_effective(SparkleConfig::default(), Some(&toml), None);
+            assert!(!hard);
+            assert!(!cfg.autoscaler.armed, "`armed = {spelling}` must not arm it");
+            assert!(
+                !warns.iter().any(|w| w.contains("[autoscaler].armed")),
+                "a recognised off-spelling is not worth a warning: {warns:?}"
+            );
+        }
+
+        // 4. NONSENSE LEAVES IT DISARMED **AND WARNS**. The person who hand-edited this to turn the
+        //    feature on is owed the news that it did not take; silence would read as success.
+        let (cfg, warns, hard) =
+            build_effective(SparkleConfig::default(), Some("[autoscaler]\narmed = \"maybe\"\n"), None);
+        assert!(!hard, "a wrong-typed arming flag must not discard the whole layer");
+        assert!(!cfg.autoscaler.armed, "an unreadable value must NEVER arm a spawner");
+        assert!(
+            warns.iter().any(|w| w.contains("[autoscaler].armed")),
+            "and it must SAY the edit did nothing: {warns:?}"
+        );
+
+        // 5. A MISSPELLED KEY is reported rather than swallowed, and is not fatal.
+        let (cfg, warns, hard) =
+            build_effective(SparkleConfig::default(), Some("[autoscaler]\narmd = true\n"), None);
+        assert!(!hard);
+        assert!(!cfg.autoscaler.armed, "a misspelled key must not arm it either");
+        assert!(warns.iter().any(|w| w.contains("[autoscaler].armd")), "{warns:?}");
+
+        // 6. A PROJECT LAYER CANNOT ARM IT. A cloned repo must never be able to start agents on
+        //    someone else's machine — the reason this section is machine-wide at all.
+        let (cfg, _w, hard) =
+            build_effective(SparkleConfig::default(), None, Some("[autoscaler]\narmed = true\n"));
+        assert!(!hard);
+        assert!(!cfg.autoscaler.armed, "a per-project [autoscaler] must be IGNORED");
     }
 
     #[test]

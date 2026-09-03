@@ -553,6 +553,34 @@ export function isPromotedToBuild(bead: Pick<Bead, "labels">): boolean {
 }
 
 /**
+ * "A build orchestrator was handed THIS BEAD" — the durable trace a `mode: "task"` handoff leaves
+ * (bead `sparkle-n2feho.8`).
+ *
+ * ══ WHY IT IS NOT {@link PROMOTED_LABEL} ══════════════════════════════════════════════════════
+ * `sendToBuild` deliberately EXCLUDES task mode from that label, and the exclusion is a decision
+ * rather than an oversight: the epic sweep's whole premise is "a plan with children that stopped
+ * moving", so stamping an ordinary task with it would aim the sweep — and its automatic restarts —
+ * at work that was never a plan. Reusing it here would cause precisely the bug that exclusion
+ * prevents. Hence a second, differently-named fact.
+ *
+ * ══ WHY IT EXISTS AT ALL ══════════════════════════════════════════════════════════════════════
+ * `sparkle-n2feho.1`'s acceptance says the binding must SURVIVE A FLEET REFRESH. The binding itself
+ * is `AgentTab.epicId` — a per-window Zustand field persisted only to localStorage, with nothing in
+ * `bd`, nothing on disk and nothing in Rust. An epic-mode handoff at least leaves two durable
+ * traces behind it (this bead's parent edge, and {@link PROMOTED_LABEL}); a TASK-mode handoff left
+ * NONE, because it binds the human-filed bead rather than minting an auto-bead, so there is no new
+ * parent edge either. Destroying the agent row therefore destroyed the only record that anyone had
+ * ever been put on that task, irrecoverably.
+ *
+ * ══ IT IS A RECORD, NOT A MEMBERSHIP RULE ═════════════════════════════════════════════════════
+ * `scripts/lib/epic-membership-guard.sh` fails CI on a SECOND definition of the membership edge, and
+ * this is deliberately not one: `AgentTab.epicId` remains THE BINDING and `epicLadder` remains the
+ * one resolver over it. This label answers a strictly narrower question — "was this bead ever handed
+ * to Build?" — which is a fact about the BEAD and survives every roster it outlives.
+ */
+export const HANDED_TO_BUILD_LABEL = "handed-to-build";
+
+/**
  * "Never restart this epic automatically" — the founder's explicit opt-out.
  *
  * ══ THIS EXISTS BECAUSE {@link PROMOTED_LABEL} TOOK THE OLD ONE AWAY ═══════════════════════════

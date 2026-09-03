@@ -18,7 +18,7 @@ import {
   mountedAwaited,
   type AwaitedMountResult,
 } from "./agentMount";
-import { labelBead, PROMOTED_LABEL } from "./beads";
+import { labelBead, commentBead, PROMOTED_LABEL, HANDED_TO_BUILD_LABEL } from "./beads";
 import { dispatchConciergeAnswer } from "./conciergeDispatch";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { log } from "../logger";
@@ -473,6 +473,59 @@ function prepareHandoff(args: SendToBuildArgs): PreparedHandoff {
   //   same sentence would call `setAgentGoal` with byte-identical text — which takes its
   //   unchanged-text branch and STRIPS `metAt`, reverting a met orchestrator to unmet and
   //   re-entering auto-continue because someone re-saved a field they had not changed.
+  // ── TASK MODE LEAVES ITS OWN DURABLE TRACE (bead `sparkle-n2feho.8`) ────────────────────────────
+  //
+  // Not `PROMOTED_LABEL` — see the exclusion below, and `HANDED_TO_BUILD_LABEL`'s own header. The
+  // epic label puts a bead in the SWEEP'S WATCH SET, which is exactly what an ordinary task must not
+  // join; this one records only that a build orchestrator was handed this bead.
+  //
+  // WHY IT MATTERS: the binding is `AgentTab.epicId`, which lives in localStorage and nowhere else.
+  // An epic handoff leaves a parent edge and the promoted label behind it, so it partly survives a
+  // fleet refresh. A task handoff bound the human-filed bead directly, minting no auto-bead, so it
+  // left NOTHING — destroy the row and no reader could tell the task had ever been staffed. That is
+  // the acceptance item `sparkle-n2feho.1` states as "binding survives a fleet refresh".
+  //
+  // Fire-and-forget for the same reason the epic stamp is: `labelBead` shells out to a single-writer
+  // store another worktree may hold the lock on, and blocking the handoff on it would stall the
+  // click. A missed label costs one un-recoverable binding, which is the pre-existing behaviour, not
+  // a regression. `labelBead` is idempotent, so a re-handoff re-stamps for free.
+  if ((args.mode ?? "epic") === "task") {
+    void labelBead(project.rootPath, "add", args.epicId, HANDED_TO_BUILD_LABEL).catch(
+      (e: unknown) => {
+        log.warn("epics", "could not mark a task as handed to build", {
+          bead: args.epicId,
+          error: String(e),
+        });
+      },
+    );
+
+    // ...AND THE IDENTITY, because the label alone is ONE BIT and the binding is a PAIR.
+    //
+    // Caught by review (roborev 80525): a bare "this was handed to Build" records THAT somebody was
+    // put on the bead, not WHICH agent in WHICH project, so nothing could reconstruct the binding
+    // from it — which is what "the binding survives a fleet refresh" actually asks for. The label
+    // stays because it is the cheap queryable index (`bd list --label handed-to-build`); this is
+    // the payload.
+    //
+    // A COMMENT rather than another label or an edit to the body: AGENTS.md is explicit that a
+    // bead's body is the original record and is not edited, and that comments are the shape that
+    // survives concurrency — one shared single-writer store with many agents writing at once makes
+    // a mutable body last-write-wins, which destroys somebody else's edit without saying so. A
+    // handoff is exactly the kind of accumulated fact that belongs in that thread.
+    void commentBead(
+      project.rootPath,
+      args.epicId,
+      `Handed to Build: orchestrator \`${agentId}\` in project \`${args.projectId}\`. ` +
+        `Recorded here because the binding itself (AgentTab.epicId) lives only in this window's ` +
+        `local store — this comment is what survives a fleet refresh (bead sparkle-n2feho.8).`,
+    ).catch((e: unknown) => {
+      log.warn("epics", "could not record the task handoff identity", {
+        bead: args.epicId,
+        error: String(e),
+      });
+    });
+  }
+
   if ((args.mode ?? "epic") === "epic") {
     const ladder = epicGoalLadder(args);
     const prior = existing?.goal;
