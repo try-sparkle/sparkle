@@ -113,4 +113,31 @@ describe("holdOrigin", () => {
     expect(holdOriginPending()).toBe(true);
     expect(peekHoldOriginAge(25)).toBe(25);
   });
+
+  it("peek and take agree on the reportable age for the SAME origin — at every bound, not just the sampled ones", () => {
+    // The two readers score the SAME keydown for two racing commands (arm vs cloud), so an aggregate
+    // over the cloud line must never admit a span the arm line rejected. The cases above pin that at
+    // hand-picked points; this pins it as an INVARIANT across the whole boundary, which is what a
+    // one-character drift in one function's bound (`>` → `>=`, a dropped `Number.isFinite`) would
+    // break — the failure that has no test between the two copies when the rule is duplicated.
+    //
+    // `peek` must not consume, so it is measured first each time and the slot re-stamped for `take`.
+    const origin = 1_000;
+    const ages = [
+      0,
+      1,
+      12.4,
+      12.6,
+      HOLD_ORIGIN_MAX_AGE_MS - 1,
+      HOLD_ORIGIN_MAX_AGE_MS, // accepted exactly at the cap
+      HOLD_ORIGIN_MAX_AGE_MS + 1, // rejected one past it
+      -1, // non-monotonic clock
+    ];
+    for (const age of ages) {
+      markHoldOrigin(origin);
+      const peeked = peekHoldOriginAge(origin + age);
+      const taken = takeHoldOriginAge(origin + age);
+      expect(peeked).toBe(taken);
+    }
+  });
 });

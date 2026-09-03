@@ -50,6 +50,25 @@ export const HOLD_ORIGIN_MAX_AGE_MS = 10_000;
 let pending: number | null = null;
 
 /**
+ * The ONE definition of "is this age reportable, and as what integer" — shared by both readers.
+ *
+ * `takeHoldOriginAge` and `peekHoldOriginAge` measure the SAME keydown for two racing commands
+ * (arm and cloud), so an aggregate over the cloud line must never include a span the arm line would
+ * have rejected. Keeping the rule in one place makes that agreement structural rather than a pair of
+ * hand-kept copies: a bound tightened in one function but not the other used to be a one-character
+ * drift with no test between the two, and the values it would let through are exactly the absurd
+ * ones both callers exist to suppress.
+ *
+ * `null` on a non-finite reading, a negative age (a non-monotonic clock, which `performance.now()`
+ * should make impossible), or an age past `HOLD_ORIGIN_MAX_AGE_MS`; otherwise the age in whole ms
+ * (Rust takes `Option<u64>`, so a fractional value would be rejected by serde and the origin lost).
+ */
+function reportableAgeMs(age: number): number | null {
+  if (!Number.isFinite(age) || age < 0 || age > HOLD_ORIGIN_MAX_AGE_MS) return null;
+  return Math.round(age);
+}
+
+/**
  * Stamp the gesture. Called from the push-to-talk keydown, on the same tick the hold begins.
  *
  * Overwrites any origin still pending rather than refusing: the newer gesture is the one whose arm
@@ -74,8 +93,7 @@ export function takeHoldOriginAge(now: number = performance.now()): number | nul
   if (pending === null) return null;
   const age = now - pending;
   pending = null;
-  if (!Number.isFinite(age) || age < 0 || age > HOLD_ORIGIN_MAX_AGE_MS) return null;
-  return Math.round(age);
+  return reportableAgeMs(age);
 }
 
 /**
@@ -96,9 +114,7 @@ export function takeHoldOriginAge(now: number = performance.now()): number | nul
  */
 export function peekHoldOriginAge(now: number = performance.now()): number | null {
   if (pending === null) return null;
-  const age = now - pending;
-  if (!Number.isFinite(age) || age < 0 || age > HOLD_ORIGIN_MAX_AGE_MS) return null;
-  return Math.round(age);
+  return reportableAgeMs(now - pending);
 }
 
 /** Is an origin waiting to be billed? For tests and for nothing else — reading it is not consuming it. */
