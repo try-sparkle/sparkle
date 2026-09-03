@@ -162,10 +162,22 @@ function wire(spec: SyncSpec, unsubs: Array<() => void>, isTorndown: () => boole
   unsubs.push(() => window.removeEventListener("storage", onStorage));
 
   if (inTauri()) {
-    void listen<string>(spec.event, (e) => rehydrate(e.payload)).then((u) => {
-      if (isTorndown()) void safeUnlisten(u);
-      else unsubs.push(u);
-    });
+    void listen<string>(spec.event, (e) => rehydrate(e.payload))
+      .then((u) => {
+        if (isTorndown()) void safeUnlisten(u);
+        else unsubs.push(u);
+      })
+      // The listen PROMISE ITSELF can reject, and without this its rejection leaks as an app-level
+      // unhandled rejection (bead sparkle-6csa). Tauri's subscribe/unlisten are async against the
+      // webview's listeners map, so a `listen` racing a teardown resolves to a REJECTED promise
+      // (the "…handlerId" family) rather than throwing. Every SIBLING of this exact idiom already
+      // carries this `.catch` — satelliteWindows.ts (whose comment cites THIS file as the idiom it
+      // copied), updaterService.ts and inputRelease.ts — and this one was the lone site that
+      // omitted it. A leaked rejection here is doubly invisible under test: the global
+      // `window.addEventListener("unhandledrejection")` mop-up in logger.ts that absorbs it in the
+      // real app is not installed in the vitest harness, so it surfaces on `process` and reddens an
+      // otherwise fully-passing shard. Benign and self-healing, so it is swallowed, not logged.
+      .catch(() => {});
   }
 
   const unsubStore = spec.store.subscribe(() => {
